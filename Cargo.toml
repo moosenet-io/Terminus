@@ -1,6 +1,6 @@
 [package]
 name = "terminus-rs"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 license = "MIT"
 description = "Rust fallback tool implementations for the Chord proxy"
@@ -84,3 +84,20 @@ path = "tests/intake/asmt09_runner.rs"
 [[test]]
 name = "intake_reporting"
 path = "tests/intake/reporting.rs"
+
+# S85 SRV-02: explicit integration-test target for the serving-profile runner
+# (Cargo does not auto-discover test files inside subdirectories).
+[[test]]
+name = "intake_serving_runner"
+path = "tests/intake/serving_runner.rs"
+
+# S85 SRV-07: explicit integration-test target for the serving control/status
+# tools (Cargo does not auto-discover test files inside subdirectories).
+[[test]]
+name = "tools_serving_tools"
+path = "tests/tools/serving_tools.rs"
+
+# S85 SRV-03: explicit integration-test target for the build-conditional recheck.
+[[test]]
+name = "intake_serving_recheck"
+path = "tests/intake/serving_recheck.rs"

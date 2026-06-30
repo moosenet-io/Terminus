@@ -7,7 +7,8 @@ pub mod ansible;
 pub mod approval;
 pub mod axon;
 pub mod commute;
-/// Vendored copies of the small lumina-core surfaces terminus depends on, so the
+/// Vendored byte-for-byte copies of the small lumina-core surfaces terminus
+/// references (the S84 assistant-sweep prompt/conversation types), so the
 /// crate builds standalone with no `lumina-core` dependency (see `compat`).
 pub mod compat;
 pub mod config;
@@ -39,6 +40,7 @@ pub mod reminder;
 pub mod seer;
 pub mod sysversion;
 pub mod tool;
+pub mod tools;
 pub mod vector;
 pub mod vitals;
 pub mod weather;
