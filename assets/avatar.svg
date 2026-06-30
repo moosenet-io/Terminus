@@ -1,0 +1,51 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="tbg" cx="50%" cy="44%" r="68%">
+      <stop offset="0%" stop-color="#2a1f4d"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <radialGradient id="thub" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#c9b8ff" stop-opacity="1"/><stop offset="38%" stop-color="#7c5cff" stop-opacity="0.7"/><stop offset="100%" stop-color="#7c5cff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#tbg)"/>
+  <g fill="#ffffff">
+    <circle cx="110" cy="120" r="2" opacity="0.4"/><circle cx="410" cy="150" r="1.6" opacity="0.35"/>
+    <circle cx="380" cy="400" r="2" opacity="0.35"/><circle cx="120" cy="390" r="1.6" opacity="0.3"/>
+  </g>
+  <!-- radial hub: 12 spokes to a ring of tool-nodes -->
+  <g transform="translate(256,256)">
+    <g stroke-width="2.6" opacity="0.5">
+      <g stroke="#7c5cff">
+        <line x1="0" y1="0" x2="0" y2="-150"/>
+        <line x1="0" y1="0" x2="130" y2="-75"/>
+        <line x1="0" y1="0" x2="150" y2="0"/>
+        <line x1="0" y1="0" x2="130" y2="75"/>
+        <line x1="0" y1="0" x2="0" y2="150"/>
+        <line x1="0" y1="0" x2="-130" y2="75"/>
+        <line x1="0" y1="0" x2="-150" y2="0"/>
+        <line x1="0" y1="0" x2="-130" y2="-75"/>
+      </g>
+      <g stroke="#4a6cf6" opacity="0.42">
+        <line x1="0" y1="0" x2="75" y2="-130"/>
+        <line x1="0" y1="0" x2="75" y2="130"/>
+        <line x1="0" y1="0" x2="-75" y2="130"/>
+        <line x1="0" y1="0" x2="-75" y2="-130"/>
+      </g>
+    </g>
+    <circle cx="0" cy="0" r="150" fill="none" stroke="#6b5bbf" stroke-width="2" opacity="0.2"/>
+    <!-- ring tool-nodes -->
+    <g>
+      <circle cx="130" cy="-75" r="13" fill="#8b5cf6"/><circle cx="150" cy="0" r="13" fill="#8b5cf6"/>
+      <circle cx="130" cy="75" r="13" fill="#8b5cf6"/><circle cx="0" cy="150" r="13" fill="#8b5cf6"/>
+      <circle cx="-130" cy="75" r="13" fill="#8b5cf6"/><circle cx="-150" cy="0" r="13" fill="#8b5cf6"/>
+      <circle cx="-130" cy="-75" r="13" fill="#8b5cf6"/>
+      <circle cx="75" cy="-130" r="11" fill="#4a6cf6"/><circle cx="75" cy="130" r="11" fill="#4a6cf6"/>
+      <circle cx="-75" cy="130" r="11" fill="#4a6cf6"/><circle cx="-75" cy="-130" r="11" fill="#4a6cf6"/>
+      <circle cx="0" cy="-150" r="12" fill="#10b981"/>
+    </g>
+    <!-- focal hub -->
+    <circle cx="0" cy="0" r="54" fill="url(#thub)"/>
+    <circle cx="0" cy="0" r="20" fill="#c9b8ff"/>
+    <circle cx="0" cy="0" r="9" fill="#ffffff"/>
+  </g>
+</svg>

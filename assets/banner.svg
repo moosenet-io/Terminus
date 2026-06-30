@@ -1,0 +1,94 @@
+<svg width="1280" height="640" viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="38%" r="75%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="45%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <radialGradient id="titleGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#5b3fb0" stop-opacity="0.55"/><stop offset="60%" stop-color="#3a2a6e" stop-opacity="0.22"/><stop offset="100%" stop-color="#3a2a6e" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="hubGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#a78bff" stop-opacity="0.95"/><stop offset="40%" stop-color="#7c5cff" stop-opacity="0.6"/><stop offset="100%" stop-color="#7c5cff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1280" height="640" fill="url(#bg)"/>
+
+  <!-- starfield -->
+  <g fill="#ffffff">
+    <circle cx="70" cy="180" r="1.1" opacity="0.5"/><circle cx="150" cy="55" r="0.9" opacity="0.35"/>
+    <circle cx="240" cy="300" r="1.3" opacity="0.55"/><circle cx="60" cy="430" r="1" opacity="0.4"/>
+    <circle cx="320" cy="120" r="0.8" opacity="0.3"/><circle cx="200" cy="500" r="1.1" opacity="0.45"/>
+    <circle cx="500" cy="60" r="0.9" opacity="0.4"/><circle cx="820" cy="40" r="1" opacity="0.4"/>
+    <circle cx="1040" cy="90" r="1.2" opacity="0.5"/><circle cx="1180" cy="200" r="0.9" opacity="0.4"/>
+    <circle cx="1230" cy="120" r="1.1" opacity="0.45"/><circle cx="1120" cy="330" r="1" opacity="0.4"/>
+    <circle cx="960" cy="250" r="0.8" opacity="0.3"/><circle cx="1210" cy="470" r="1.1" opacity="0.45"/>
+    <circle cx="1080" cy="520" r="0.9" opacity="0.35"/><circle cx="40" cy="300" r="0.9" opacity="0.35"/>
+    <circle cx="380" cy="240" r="0.8" opacity="0.3"/><circle cx="900" cy="470" r="0.9" opacity="0.35"/>
+    <circle cx="660" cy="520" r="0.8" opacity="0.3"/>
+  </g>
+
+  <!-- ===== TERMINUS MOTIF: central hub radiating spokes to a ring of many tool-nodes ===== -->
+  <g transform="translate(640,138)">
+    <!-- spokes -->
+    <g stroke-width="1" opacity="0.5">
+      <!-- 12 spokes, alternating violet/blue, varied length -->
+      <g stroke="#7c5cff">
+        <line x1="0" y1="0" x2="0" y2="-96"/>
+        <line x1="0" y1="0" x2="83" y2="-48"/>
+        <line x1="0" y1="0" x2="96" y2="0"/>
+        <line x1="0" y1="0" x2="83" y2="48"/>
+        <line x1="0" y1="0" x2="0" y2="96"/>
+        <line x1="0" y1="0" x2="-83" y2="48"/>
+        <line x1="0" y1="0" x2="-96" y2="0"/>
+        <line x1="0" y1="0" x2="-83" y2="-48"/>
+      </g>
+      <g stroke="#4a6cf6" opacity="0.4">
+        <line x1="0" y1="0" x2="48" y2="-83"/>
+        <line x1="0" y1="0" x2="48" y2="83"/>
+        <line x1="0" y1="0" x2="-48" y2="83"/>
+        <line x1="0" y1="0" x2="-48" y2="-83"/>
+      </g>
+    </g>
+    <!-- faint outer ring connecting the tool-nodes -->
+    <circle cx="0" cy="0" r="96" fill="none" stroke="#6b5bbf" stroke-width="1" opacity="0.2"/>
+    <!-- tool nodes on the ring (12) -->
+    <g>
+      <circle cx="0" cy="-96" r="6" fill="#8b5cf6"/>
+      <circle cx="83" cy="-48" r="6" fill="#8b5cf6"/>
+      <circle cx="96" cy="0" r="6" fill="#8b5cf6"/>
+      <circle cx="83" cy="48" r="6" fill="#8b5cf6"/>
+      <circle cx="0" cy="96" r="6" fill="#8b5cf6"/>
+      <circle cx="-83" cy="48" r="6" fill="#8b5cf6"/>
+      <circle cx="-96" cy="0" r="6" fill="#8b5cf6"/>
+      <circle cx="-83" cy="-48" r="6" fill="#8b5cf6"/>
+      <circle cx="48" cy="-83" r="5" fill="#4a6cf6"/>
+      <circle cx="48" cy="83" r="5" fill="#4a6cf6"/>
+      <circle cx="-48" cy="83" r="5" fill="#4a6cf6"/>
+      <circle cx="-48" cy="-83" r="5" fill="#4a6cf6"/>
+    </g>
+    <!-- one green accent node (echoes the set) -->
+    <circle cx="0" cy="-96" r="6" fill="#10b981"/>
+    <!-- focal hub -->
+    <circle cx="0" cy="0" r="26" fill="url(#hubGlow)"/>
+    <circle cx="0" cy="0" r="9" fill="#c9b8ff"/>
+    <circle cx="0" cy="0" r="4.5" fill="#ffffff"/>
+  </g>
+
+  <!-- ===== TEXT ===== -->
+  <ellipse cx="640" cy="300" rx="290" ry="62" fill="url(#titleGlow)"/>
+  <text x="640" y="228" text-anchor="middle" fill="#b9b0d8" font-size="20" letter-spacing="10" font-weight="500">MCP TOOL HUB</text>
+  <text x="640" y="322" text-anchor="middle" fill="#ffffff" font-size="86" font-weight="700" letter-spacing="2">TERMINUS</text>
+  <text x="640" y="372" text-anchor="middle" fill="#7c5cff" font-size="19" letter-spacing="6" font-weight="600" font-family="'Courier New', monospace">120+  TOOLS  ·  12  DOMAINS</text>
+  <g>
+    <line x1="545" y1="418" x2="600" y2="418" stroke="#6b5bbf" stroke-width="1" opacity="0.6"/>
+    <text x="640" y="423" text-anchor="middle" fill="#9b92c0" font-size="13" letter-spacing="3" font-family="'Courier New', monospace">v1.0</text>
+    <line x1="680" y1="418" x2="735" y2="418" stroke="#6b5bbf" stroke-width="1" opacity="0.6"/>
+  </g>
+  <g fill="#8d84ad" font-size="15" letter-spacing="2" font-weight="500">
+    <text x="412" y="470" text-anchor="middle">STDIO + HTTP</text>
+    <text x="640" y="470" text-anchor="middle">PATH-JAILED</text>
+    <text x="868" y="470" text-anchor="middle">VAULT-BACKED</text>
+  </g>
+  <text x="640" y="567" text-anchor="middle" fill="#564d75" font-size="12" letter-spacing="4">TERMINUS</text>
+  <text x="640" y="592" text-anchor="middle" fill="#473f63" font-size="11.5" letter-spacing="0.4">The MCP tool hub: 120+ governed tools across infrastructure, search, memory, and delivery.</text>
+</svg>
