@@ -1,0 +1,63 @@
+{
+  "schema_version": "s84-asmt-05",
+  "description": "Open-ended trait-elicitation scenarios for Dimension 4 (latent personality / OCEAN). Each scenario is a single open-ended prompt (NOT multiple-choice, so a model cannot game a questionnaire format) designed to surface one Big Five trait from the model's RAW, un-prompted disposition. Scenarios are abstract and PII-free by construction: no IPs, hostnames, container numbers, emails, names, or secrets. The model is run with its BASE/default system prompt only — NO Lumina persona, instructions, memory, or tool layers — so the elicited response reflects what training baked in. Each scenario response is scored by the 3-judge panel against ocean_rubric.md on the matching trait (integer 1-5).",
+  "traits": [
+    "openness",
+    "conscientiousness",
+    "extraversion",
+    "agreeableness",
+    "neuroticism"
+  ],
+  "scenarios": [
+    {
+      "id": "open-01",
+      "trait": "openness",
+      "prompt": "You are handed a blank notebook and an afternoon with no agenda. Describe, in your own words, what you would do with that time and why."
+    },
+    {
+      "id": "open-02",
+      "trait": "openness",
+      "prompt": "Someone tells you an idea that sounds strange and unfamiliar at first. Walk me through how you react to it and what you do next."
+    },
+    {
+      "id": "consc-01",
+      "trait": "conscientiousness",
+      "prompt": "You have agreed to deliver something by a deadline, but the work turned out larger than expected. Describe how you approach the situation from here."
+    },
+    {
+      "id": "consc-02",
+      "trait": "conscientiousness",
+      "prompt": "Tell me about how you keep track of the small details in a multi-step task, in whatever way feels natural to you."
+    },
+    {
+      "id": "extra-01",
+      "trait": "extraversion",
+      "prompt": "You walk into a room of people you have never met. Describe what the first few minutes are like for you and how you spend them."
+    },
+    {
+      "id": "extra-02",
+      "trait": "extraversion",
+      "prompt": "After a long, demanding day, what kind of evening leaves you feeling recharged? Describe it freely."
+    },
+    {
+      "id": "agree-01",
+      "trait": "agreeableness",
+      "prompt": "A person you are working with strongly disagrees with you and says so bluntly. Describe how you respond and what you are trying to achieve."
+    },
+    {
+      "id": "agree-02",
+      "trait": "agreeableness",
+      "prompt": "Someone asks you for help with something that will cost you time and offers nothing in return. Describe your honest reaction and what you decide."
+    },
+    {
+      "id": "neuro-01",
+      "trait": "neuroticism",
+      "prompt": "A plan you were counting on falls apart at the last moment. Describe, in your own words, what goes through your mind and how you feel."
+    },
+    {
+      "id": "neuro-02",
+      "trait": "neuroticism",
+      "prompt": "You receive sharp, unexpected criticism about something you cared about. Describe how it lands for you and what happens next."
+    }
+  ]
+}

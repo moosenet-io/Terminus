@@ -1,0 +1,106 @@
+{
+  "model": "gpt-oss:20b",
+  "declared": {
+    "gptoss.context_length": 131072,
+    "gptoss.rope.scaling.original_context_length": 4096
+  },
+  "wall_secs": 30.0,
+  "vram_total_baseline": 31479877632,
+  "runs": {
+    "chord": {
+      "rows": [
+        {
+          "n": 5,
+          "est_tokens": 940,
+          "secs": 3.23,
+          "ok": true,
+          "error": null,
+          "recall": "full",
+          "vram_before": 31479877632,
+          "vram_after": 31479889920,
+          "snippet": "Your cat\u2019s name is **Quorble**, and she has **3 legs**."
+        },
+        {
+          "n": 10,
+          "est_tokens": 1378,
+          "secs": 2.31,
+          "ok": true,
+          "error": null,
+          "recall": "full",
+          "vram_before": 31479889920,
+          "vram_after": 31479889920,
+          "snippet": "Your cat is named **Quorble** and she has **three legs**."
+        },
+        {
+          "n": 20,
+          "est_tokens": 2261,
+          "secs": 2.62,
+          "ok": true,
+          "error": null,
+          "recall": "full",
+          "vram_before": 31479889920,
+          "vram_after": 31479889920,
+          "snippet": "Your cat\u2019s name is\u202f**Quorble**, and she has **exactly 3 legs**."
+        },
+        {
+          "n": 40,
+          "est_tokens": 4026,
+          "secs": 4.78,
+          "ok": true,
+          "error": null,
+          "recall": "full",
+          "vram_before": 31479889920,
+          "vram_after": 31479930880,
+          "snippet": "Your cat is named **Quorble** and she has **three legs**."
+        },
+        {
+          "n": 80,
+          "est_tokens": 7556,
+          "secs": 6.82,
+          "ok": true,
+          "error": null,
+          "recall": "full",
+          "vram_before": 31479930880,
+          "vram_after": 31479975936,
+          "snippet": "Your cat\u2019s name is **Quorble**, and she has **3 legs**."
+        },
+        {
+          "n": 160,
+          "est_tokens": 14662,
+          "secs": 17.04,
+          "ok": true,
+          "error": null,
+          "recall": "full",
+          "vram_before": 31479975936,
+          "vram_after": 31480262656,
+          "snippet": "Your cat is named **Quorble** and she has **3 legs**."
+        },
+        {
+          "n": 320,
+          "est_tokens": 28902,
+          "secs": 30.01,
+          "ok": true,
+          "error": null,
+          "recall": "none",
+          "vram_before": 31480262656,
+          "vram_after": 31480270848,
+          "snippet": "I encountered an error calling the language model."
+        },
+        {
+          "n": 640,
+          "est_tokens": 57382,
+          "secs": 30.03,
+          "ok": true,
+          "error": null,
+          "recall": "none",
+          "vram_before": 31480270848,
+          "vram_after": 31480283136,
+          "snippet": "I encountered an error calling the language model."
+        }
+      ],
+      "hard": null,
+      "practical": 320,
+      "quality": 320
+    }
+  }
+}

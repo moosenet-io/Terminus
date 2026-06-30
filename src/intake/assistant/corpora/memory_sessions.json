@@ -1,0 +1,168 @@
+{
+  "schema_version": "s84-asmt-04",
+  "description": "Multi-session plant->summarize->recall scripts for Dimension 3 (memory integration). Facts are planted in session 1, an unrelated session 2 runs, and session 3 probes recall. Each script is replayed through the REAL S78 3-tier conversation pipeline (lumina-core ConversationBuffer: 20-turn verbatim buffer + progressive summarization). All content is PII-free by construction: no IPs, hostnames, emails, container ids, or secrets.",
+  "summarization_threshold": 4,
+  "scripts": [
+    {
+      "id": "ms-trip-planning-01",
+      "intent_summary": "Plant several trip-planning facts early, bury them under a summarization cycle, then probe recall after an unrelated session.",
+      "facts": [
+        {
+          "key": "destination",
+          "value": "Zubrovka",
+          "plant_turn": 1,
+          "tier": "summarized"
+        },
+        {
+          "key": "companion",
+          "value": "Agatha",
+          "plant_turn": 2,
+          "tier": "summarized"
+        },
+        {
+          "key": "lodging",
+          "value": "Grand Budapest",
+          "plant_turn": 3,
+          "tier": "buffer"
+        },
+        {
+          "key": "budget",
+          "value": "1200",
+          "plant_turn": 6,
+          "tier": "buffer"
+        }
+      ],
+      "session1": [
+        {
+          "user": "I'm planning a trip to Zubrovka. Please remember that.",
+          "assistant": "Got it, Zubrovka is the destination. What else should I track?"
+        },
+        {
+          "user": "I'll be travelling with my friend Agatha.",
+          "assistant": "Noted, Agatha is your travel companion."
+        },
+        {
+          "user": "We'll be staying at the Grand Budapest hotel.",
+          "assistant": "Logged the Grand Budapest as your lodging."
+        },
+        {
+          "user": "I want to visit the art museum while we're there.",
+          "assistant": "Added the art museum to the itinerary."
+        },
+        {
+          "user": "Let's plan a day hike in the mountains too.",
+          "assistant": "A mountain day hike is on the list."
+        },
+        {
+          "user": "My total budget for this trip is 1200 dollars.",
+          "assistant": "Recorded a 1200 dollar budget for the trip."
+        }
+      ],
+      "session2": [
+        {
+          "user": "Separately, can you recommend a good pasta recipe?",
+          "assistant": "Cacio e pepe is simple and reliable."
+        },
+        {
+          "user": "What's a quick warmup before a run?",
+          "assistant": "Leg swings and a brisk five-minute walk work well."
+        }
+      ],
+      "probes": [
+        {
+          "key": "destination",
+          "question": "Which city am I planning my trip around?",
+          "expect_substrings": ["zubrovka"]
+        },
+        {
+          "key": "companion",
+          "question": "Who did I say I'm travelling with?",
+          "expect_substrings": ["agatha"]
+        },
+        {
+          "key": "lodging",
+          "question": "Which hotel are we staying at?",
+          "expect_substrings": ["grand budapest"]
+        },
+        {
+          "key": "budget",
+          "question": "What total budget did I set for the trip?",
+          "expect_substrings": ["1200", "1,200"]
+        }
+      ]
+    },
+    {
+      "id": "ms-personal-prefs-01",
+      "intent_summary": "Plant personal preference facts, force summarization, then probe after unrelated chatter.",
+      "facts": [
+        {
+          "key": "pet_name",
+          "value": "Quorble",
+          "plant_turn": 1,
+          "tier": "summarized"
+        },
+        {
+          "key": "color",
+          "value": "teal",
+          "plant_turn": 2,
+          "tier": "summarized"
+        },
+        {
+          "key": "instrument",
+          "value": "cello",
+          "plant_turn": 5,
+          "tier": "buffer"
+        }
+      ],
+      "session1": [
+        {
+          "user": "My cat is named Quorble. Remember that for me.",
+          "assistant": "Quorble, your cat. Noted."
+        },
+        {
+          "user": "Also, my favorite color is teal.",
+          "assistant": "Teal it is."
+        },
+        {
+          "user": "I'm trying to read more this year.",
+          "assistant": "A great goal. Any genre in mind?"
+        },
+        {
+          "user": "Mostly science fiction.",
+          "assistant": "Science fiction noted."
+        },
+        {
+          "user": "I also play the cello on weekends.",
+          "assistant": "Cello on weekends, logged."
+        }
+      ],
+      "session2": [
+        {
+          "user": "Unrelated: what's the boiling point of water at sea level?",
+          "assistant": "100 degrees Celsius."
+        },
+        {
+          "user": "And how many days are in a leap year?",
+          "assistant": "366 days."
+        }
+      ],
+      "probes": [
+        {
+          "key": "pet_name",
+          "question": "What is my cat's name?",
+          "expect_substrings": ["quorble"]
+        },
+        {
+          "key": "color",
+          "question": "What did I say my favorite color is?",
+          "expect_substrings": ["teal"]
+        },
+        {
+          "key": "instrument",
+          "question": "Which instrument do I play on weekends?",
+          "expect_substrings": ["cello"]
+        }
+      ]
+    }
+  ]
+}

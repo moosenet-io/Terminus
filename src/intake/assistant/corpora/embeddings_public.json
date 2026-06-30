@@ -1,0 +1,43 @@
+{
+  "name": "public_ir_subset",
+  "description": "A small public-style IR benchmark subset (MTEB/BEIR-style query/relevant-doc pairs). Generic, domain-neutral retrieval items used to measure a candidate embedding model's BASELINE retrieval capability. Contains no private data of any kind: all text is generic encyclopedic/technical prose. The public-vs-Engram delta against this baseline is the calibration signal.",
+  "k": 5,
+  "docs": [
+    {"id": "d1", "text": "Photosynthesis is the process by which green plants convert light energy into chemical energy stored in glucose, releasing oxygen as a byproduct."},
+    {"id": "d2", "text": "Chlorophyll is the pigment in plant cells that absorbs light, primarily in the blue and red wavelengths, and reflects green light."},
+    {"id": "d3", "text": "The water cycle describes the continuous movement of water through evaporation, condensation, precipitation, and collection across the planet."},
+    {"id": "d4", "text": "A relational database stores data in tables of rows and columns and supports queries written in a structured query language."},
+    {"id": "d5", "text": "An index in a database is a data structure that speeds up row lookups at the cost of additional storage and slower writes."},
+    {"id": "d6", "text": "A hash table maps keys to values using a hash function and offers average constant-time insertion and lookup."},
+    {"id": "d7", "text": "The mitochondrion is an organelle that generates most of a cell's supply of chemical energy through respiration."},
+    {"id": "d8", "text": "Tectonic plates are large slabs of the planet's outer shell that move slowly and reshape continents and oceans over geological time."},
+    {"id": "d9", "text": "An earthquake occurs when stored stress along a fault is released suddenly, sending seismic waves through the surrounding rock."},
+    {"id": "d10", "text": "A compiler translates source code written in a high-level programming language into machine code that a processor can execute."},
+    {"id": "d11", "text": "An interpreter executes program instructions directly, line by line, without first producing a separate machine-code file."},
+    {"id": "d12", "text": "The greenhouse effect warms a planet when atmospheric gases trap outgoing infrared radiation near the surface."},
+    {"id": "d13", "text": "Vaccines train the immune system to recognize a pathogen by exposing it to a harmless fragment or weakened form of that pathogen."},
+    {"id": "d14", "text": "A neural network learns by adjusting connection weights to reduce the error between its predictions and labeled training examples."},
+    {"id": "d15", "text": "Gradient descent is an optimization method that iteratively moves parameters in the direction that most reduces a loss function."},
+    {"id": "d16", "text": "The speed of light in a vacuum is a fundamental constant and the maximum speed at which information can travel."},
+    {"id": "d17", "text": "Supply and demand describes how the price of a good settles where the quantity buyers want equals the quantity sellers offer."},
+    {"id": "d18", "text": "A glacier is a persistent body of dense ice that forms where snow accumulation exceeds melting over many years."},
+    {"id": "d19", "text": "DNA stores genetic information as a sequence of four nucleotide bases arranged along a double helix."},
+    {"id": "d20", "text": "A bridge distributes load to its supports through tension and compression in its structural members."}
+  ],
+  "queries": [
+    {"id": "q1", "text": "How do plants turn sunlight into energy?", "relevant": ["d1", "d2"]},
+    {"id": "q2", "text": "What makes leaves appear green?", "relevant": ["d2"]},
+    {"id": "q3", "text": "How does water move around the planet?", "relevant": ["d3"]},
+    {"id": "q4", "text": "How is structured data stored and queried?", "relevant": ["d4", "d5"]},
+    {"id": "q5", "text": "How can lookups in a table be made faster?", "relevant": ["d5", "d6"]},
+    {"id": "q6", "text": "Where does a cell get most of its energy?", "relevant": ["d7"]},
+    {"id": "q7", "text": "Why do earthquakes happen?", "relevant": ["d9", "d8"]},
+    {"id": "q8", "text": "What is the difference between compiling and interpreting code?", "relevant": ["d10", "d11"]},
+    {"id": "q9", "text": "Why is the planet getting warmer?", "relevant": ["d12"]},
+    {"id": "q10", "text": "How do vaccines protect against disease?", "relevant": ["d13"]},
+    {"id": "q11", "text": "How does a model learn from examples?", "relevant": ["d14", "d15"]},
+    {"id": "q12", "text": "How are prices set in a free market?", "relevant": ["d17"]},
+    {"id": "q13", "text": "How is genetic information encoded?", "relevant": ["d19"]},
+    {"id": "q14", "text": "How does a structure carry weight to the ground?", "relevant": ["d20"]}
+  ]
+}
