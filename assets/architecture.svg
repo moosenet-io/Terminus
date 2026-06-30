@@ -1,0 +1,101 @@
+<svg width="1280" height="760" viewBox="0 0 1280 760" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bg2" cx="50%" cy="30%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+
+  <rect width="1280" height="760" fill="url(#bg2)"/>
+
+  <text x="640" y="52" text-anchor="middle" fill="#b9b0d8" font-size="15" letter-spacing="7" font-weight="500">MCP TOOL HUB</text>
+  <text x="640" y="92" text-anchor="middle" fill="#ffffff" font-size="34" font-weight="700" letter-spacing="3">TERMINUS · SYSTEM ARCHITECTURE</text>
+  <line x1="470" y1="112" x2="810" y2="112" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <!-- ===== MCP CLIENTS (top) ===== -->
+  <g>
+    <rect x="360" y="142" width="240" height="56" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadow)"/>
+    <text x="480" y="166" text-anchor="middle" fill="#e8e3f7" font-size="15" font-weight="600">Lumina · Harmony</text>
+    <text x="480" y="185" text-anchor="middle" fill="#9b92c0" font-size="11" font-family="'Courier New',monospace">MCP clients</text>
+    <rect x="680" y="142" width="240" height="56" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadow)"/>
+    <text x="800" y="166" text-anchor="middle" fill="#e8e3f7" font-size="15" font-weight="600">Transports</text>
+    <text x="800" y="185" text-anchor="middle" fill="#9b92c0" font-size="11" font-family="'Courier New',monospace">stdio (ssh) · HTTP</text>
+  </g>
+  <line x1="480" y1="198" x2="560" y2="240" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow)" opacity="0.85"/>
+  <line x1="800" y1="198" x2="720" y2="240" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow)" opacity="0.85"/>
+
+  <!-- ===== TERMINUS CORE ===== -->
+  <rect x="290" y="246" width="700" height="92" rx="14" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6" opacity="0.96"/>
+  <text x="315" y="274" fill="#a78bff" font-size="13" letter-spacing="4" font-weight="600">TERMINUS CORE · MCP SERVER</text>
+  <circle cx="640" cy="268" r="5" fill="#c9b8ff"/>
+  <g fill="#a89fc8" font-size="11.5" font-weight="400" font-family="'Courier New',monospace">
+    <text x="315" y="312">tool registry · dispatch · schema · governance (path-jail · vault · PII gate · audit)</text>
+  </g>
+
+  <!-- ===== 12 DOMAIN MODULES (grid of tool groups) ===== -->
+  <text x="175" y="372" fill="#a78bff" font-size="13" letter-spacing="4" font-weight="600">120+ TOOLS · 12 DOMAIN MODULES</text>
+
+  <!-- helper: 4 cols x 3 rows of domain chips -->
+  <g font-size="12.5" font-weight="600">
+    <!-- row 1 -->
+    <g>
+      <rect x="150" y="386" width="232" height="78" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+      <circle cx="172" cy="410" r="5" fill="#8b5cf6"/><text x="186" y="414" fill="#e8e3f7">Infrastructure</text>
+      <text x="170" y="438" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">proxmox · ansible · <container-mgr></text>
+      <text x="170" y="454" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">prometheus</text>
+    </g>
+    <g>
+      <rect x="398" y="386" width="232" height="78" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+      <circle cx="420" cy="410" r="5" fill="#8b5cf6"/><text x="434" y="414" fill="#e8e3f7">Code &amp; Git</text>
+      <text x="418" y="438" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">gitea · github · dev</text>
+      <text x="418" y="454" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">code-server</text>
+    </g>
+    <g>
+      <rect x="646" y="386" width="232" height="78" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+      <circle cx="668" cy="410" r="5" fill="#4a6cf6"/><text x="682" y="414" fill="#e8e3f7">Search &amp; Memory</text>
+      <text x="666" y="438" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">searxng · engram</text>
+      <text x="666" y="454" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">knowledge digest</text>
+    </g>
+    <g>
+      <rect x="894" y="386" width="232" height="78" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+      <circle cx="916" cy="410" r="5" fill="#10b981"/><text x="930" y="414" fill="#e8e3f7">Review (local)</text>
+      <text x="914" y="438" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">dgem_review</text>
+      <text x="914" y="454" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">DiffusionGemma · $0</text>
+    </g>
+    <!-- row 2 -->
+    <g>
+      <rect x="150" y="474" width="232" height="78" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+      <circle cx="172" cy="498" r="5" fill="#8b5cf6"/><text x="186" y="502" fill="#e8e3f7">Models &amp; Inference</text>
+      <text x="170" y="526" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">litellm · system_version</text>
+      <text x="170" y="542" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">model_intake / profiling</text>
+    </g>
+    <g>
+      <rect x="398" y="474" width="232" height="78" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+      <circle cx="420" cy="498" r="5" fill="#4a6cf6"/><text x="434" y="502" fill="#e8e3f7">Calendar &amp; Comms</text>
+      <text x="418" y="526" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">caldav · email · matrix</text>
+      <text x="418" y="542" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">reminders</text>
+    </g>
+    <g>
+      <rect x="646" y="474" width="232" height="78" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+      <circle cx="668" cy="498" r="5" fill="#8b5cf6"/><text x="682" y="502" fill="#e8e3f7">Secrets &amp; Network</text>
+      <text x="666" y="526" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace"><secret-manager> · network</text>
+      <text x="666" y="542" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">vault-backed</text>
+    </g>
+    <g>
+      <rect x="894" y="474" width="232" height="78" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+      <circle cx="916" cy="498" r="5" fill="#4a6cf6"/><text x="930" y="502" fill="#e8e3f7">Media &amp; Project</text>
+      <text x="914" y="526" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace"><media-service> · plane</text>
+      <text x="914" y="542" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">weather · ...</text>
+    </g>
+  </g>
+
+  <!-- governance band -->
+  <rect x="150" y="566" width="976" height="58" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="592" text-anchor="middle" fill="#cbc4e6" font-size="13" font-weight="600">GOVERNANCE · path-jailed FS · vault-only secrets · mandatory PII gate · sanitized audit log</text>
+  <text x="640" y="612" text-anchor="middle" fill="#8d84ad" font-size="11" font-family="'Courier New',monospace">read-only by default · write scopes explicit · no raw std::env for secrets</text>
+
+  <text x="640" y="668" text-anchor="middle" fill="#564d75" font-size="11.5" letter-spacing="0.4">One MCP surface for the whole stack — every tool governed, sandboxed, and auditable.</text>
+</svg>
