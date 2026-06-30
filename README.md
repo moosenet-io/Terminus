@@ -67,6 +67,31 @@ a llama.cpp build bump should prompt a re-probe. The probe layer is trait-driven
 (launcher + VRAM-release gate) so the suite runs on CI with no real GPU. This
 profile is the contract Chord consumes to place and launch models.
 
+### Tool-selection subagent (context-churn reduction)
+
+A constellation this size carries ~100 tools across its modules. Dumping every
+schema into an orchestrator's prompt on every turn is expensive and actively
+harmful — more tools means more tokens, slower turns, and more chances for the
+model to pick the wrong one. Terminus is built to be narrowed instead of
+flooded: the `ToolRegistry` ([`src/registry.rs`](src/registry.rs)) keeps each
+tool's name, description, and JSON Schema as a first-class catalog entry rather
+than baking them into one giant prompt, so a caller can ask for *only the
+relevant few* per request.
+
+The selection itself is a deliberately cheap, model-free keyword matcher (no
+extra inference call to decide which tools to expose). Chord — the inference
+front door that fronts Terminus — exposes a `discover(query, max)` over the
+merged catalog: both the user's query and each tool's `name`+`description` are
+tokenized into lowercase words, stopwords are dropped (so `my` no longer matches
+**MY**elin and `in` no longer matches everything), matching is whole-word, and a
+hit in the tool *name* outscores a hit in the description. Chord's agentic loop
+uses exactly this to assemble a small per-turn toolset (~14 discovered tools
+plus a handful of always-on essentials) when the caller passes no explicit list.
+The payoff is structural: the orchestrator reasons over a handful of relevant
+tools per turn instead of the whole hub, which is cheaper, faster, and less
+error-prone — and because the scoring is plain tokens, it is deterministic and
+debuggable rather than another opaque LLM judgement.
+
 ### Governance
 
 Guarded tools (e.g. `openhands_run_task`, <secret-manager> secret access) pass through
