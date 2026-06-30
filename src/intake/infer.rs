@@ -1,0 +1,560 @@
+//! Backend-aware inference with normalized metrics (P5).
+//!
+//! `infer_with_metrics` resolves a model's tagged **backend** (from the chord
+//! model-registry file), runs the request against that backend's URL using the
+//! backend's wire protocol, and returns a single normalized [`InferMetrics`]
+//! (throughput, TTFT, tokens, VRAM, oom/error) regardless of backend kind.
+//!
+//! This is the shared function that both (a) the test harness calls in-process
+//! to profile each model on its **correct hardware**, and (b) chord exposes at
+//! `POST /v1/infer` so external clients get the same metrics. Keeping it in
+//! `terminus-rs` (the lower crate) lets chord-proxy call it without a dependency
+//! cycle.
+//!
+//! Step-2 scope: the **Ollama** wire path (parity with `context::generate`). The
+//! `llama-server` (GPU) path is added in step 5; until then a model tagged to a
+//! llama-server backend returns a clear, non-silent error.
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+use crate::intake::context;
+
+/// Default chord model-registry path (overridable via `MODEL_REGISTRY_PATH`).
+const DEFAULT_REGISTRY_PATH: &str = "<path>/model-registry.json";
+
+/// Normalized per-inference metrics, backend-agnostic.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InferMetrics {
+    pub response: String,
+    pub throughput_tok_per_sec: Option<f64>,
+    /// Time to first token (≈ prompt-eval/prefill duration), ms.
+    pub ttft_ms: Option<i32>,
+    pub total_time_ms: Option<i32>,
+    pub response_tokens: Option<i32>,
+    /// GPU VRAM in use on the device, MB (sysfs; None if unreadable / CPU host).
+    pub vram_mb: Option<u64>,
+    pub oom: bool,
+    pub error: Option<String>,
+    /// Backend that served the request (for attribution).
+    pub backend: Option<String>,
+    /// Hardware the backend runs on (`"gpu"` | `"cpu"`).
+    pub hardware: Option<String>,
+}
+
+/// How to spawn a unit-less on-demand backend (the generic `llama-gpu`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct LaunchSpec {
+    pub bin: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_model_arg")]
+    pub model_arg: String,
+}
+
+fn default_model_arg() -> String {
+    "-m".to_string()
+}
+
+/// A model's resolved backend (with the fields lifecycle needs).
+#[derive(Debug, Clone)]
+pub struct ResolvedBackend {
+    pub name: String,
+    pub url: String,
+    pub kind: String,     // "ollama" | "llama-server" | "daemon"
+    pub hardware: String, // "gpu" | "cpu"
+    pub always_on: bool,
+    pub unit: Option<String>,
+    pub launch: Option<LaunchSpec>,
+    /// The requesting model's local Ollama root (for blob resolution), if known.
+    pub model_local_path: Option<String>,
+    /// Direct GGUF path for a non-Ollama model (first shard if sharded); when set
+    /// it is used for `-m` instead of Ollama-blob resolution.
+    pub model_gguf_path: Option<String>,
+}
+
+// ── Minimal read-only view of the chord registry file (no chord-proxy dep) ──
+
+#[derive(Deserialize, Default)]
+struct RegFile {
+    #[serde(default)]
+    models: HashMap<String, RegModel>,
+    #[serde(default)]
+    backends: HashMap<String, RegBackend>,
+}
+
+#[derive(Deserialize, Default)]
+struct RegModel {
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    local_path: Option<String>,
+    #[serde(default)]
+    gguf_path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RegBackend {
+    url: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    hardware: Option<String>,
+    #[serde(default)]
+    always_on: bool,
+    #[serde(default)]
+    unit: Option<String>,
+    #[serde(default)]
+    launch: Option<LaunchSpec>,
+}
+
+fn registry_path() -> String {
+    std::env::var("MODEL_REGISTRY_PATH")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_REGISTRY_PATH.to_string())
+}
+
+/// Process-global backend override for profiling: when set, EVERY model resolves
+/// to this backend regardless of its tag. Lets the harness evaluate a model on a
+/// SPECIFIC hardware (e.g. the same model on `llama-gpu` AND `ollama`) for the
+/// both-CPU-and-GPU sizing comparison. Safe because intake runs are sequential;
+/// set it before a suite and clear it after.
+static BACKEND_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Set (or clear with `None`) the global backend override.
+pub fn set_backend_override(backend: Option<String>) {
+    if let Ok(mut g) = BACKEND_OVERRIDE.lock() {
+        *g = backend;
+    }
+}
+
+fn backend_override() -> Option<String> {
+    BACKEND_OVERRIDE.lock().ok().and_then(|g| g.clone())
+}
+
+/// Resolve a model's backend from the registry file. Falls back to the default
+/// Ollama base (`context::ollama_base`) when the file is absent, legacy-format,
+/// or the model/backend is untagged — so behavior is unchanged until models are
+/// tagged.
+pub fn resolve_backend(model: &str) -> ResolvedBackend {
+    resolve_backend_at(
+        model,
+        &registry_path(),
+        &context::ollama_base(),
+        backend_override().as_deref(),
+    )
+}
+
+/// Resolve against an explicit registry path + fallback URL (no env reads) —
+/// the testable core of [`resolve_backend`]. `override_backend`, when set, forces
+/// that backend for any model (the both-hardware profiling path).
+pub fn resolve_backend_at(
+    model: &str,
+    registry_path: &str,
+    fallback_url: &str,
+    override_backend: Option<&str>,
+) -> ResolvedBackend {
+    let fallback = || ResolvedBackend {
+        name: "ollama".to_string(),
+        url: fallback_url.trim_end_matches('/').to_string(),
+        kind: "ollama".to_string(),
+        hardware: "cpu".to_string(),
+        always_on: true,
+        unit: None,
+        launch: None,
+        model_local_path: None,
+        model_gguf_path: None,
+    };
+
+    let text = match std::fs::read_to_string(registry_path) {
+        Ok(t) => t,
+        Err(_) => return fallback(),
+    };
+    let reg: RegFile = match serde_json::from_str(&text) {
+        Ok(r) => r,
+        Err(_) => return fallback(),
+    };
+    let model_local_path = reg.models.get(model).and_then(|m| m.local_path.clone());
+    let model_gguf_path = reg.models.get(model).and_then(|m| m.gguf_path.clone());
+    // Override (forced backend) → model's tag → the primary "ollama" if defined.
+    let name = override_backend
+        .map(|s| s.to_string())
+        .or_else(|| reg.models.get(model).and_then(|m| m.backend.clone()))
+        .or_else(|| reg.backends.contains_key("ollama").then(|| "ollama".to_string()));
+
+    match name.and_then(|n| reg.backends.get(&n).map(|b| (n, b))) {
+        Some((n, b)) => ResolvedBackend {
+            name: n,
+            url: b.url.trim_end_matches('/').to_string(),
+            kind: b.kind.clone().unwrap_or_else(|| "ollama".to_string()),
+            hardware: b.hardware.clone().unwrap_or_else(|| "cpu".to_string()),
+            always_on: b.always_on,
+            unit: b.unit.clone(),
+            launch: b.launch.clone(),
+            model_local_path,
+            model_gguf_path,
+        },
+        None => fallback(),
+    }
+}
+
+/// All GPU-hardware backends defined in the registry, as `(name, unit)` pairs
+/// (unit `None` ⇒ spawned as a transient `chord-<name>` unit). Used by lifecycle
+/// GPU arbitration to free the single GPU before starting another GPU backend.
+pub fn gpu_backends() -> Vec<(String, Option<String>)> {
+    let text = match std::fs::read_to_string(registry_path()) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let reg: RegFile = match serde_json::from_str(&text) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    reg.backends
+        .into_iter()
+        .filter(|(_, b)| b.hardware.as_deref() == Some("gpu"))
+        .map(|(name, b)| (name, b.unit))
+        .collect()
+}
+
+/// Current GPU VRAM-in-use (MB) from sysfs (`mem_info_vram_used`). Best-effort;
+/// `None` on a host without an amdgpu card or when unreadable.
+pub fn vram_used_mb() -> Option<u64> {
+    for n in 0..4 {
+        let p = format!("/sys/class/drm/card{n}/device/mem_info_vram_used");
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(bytes) = s.trim().parse::<u64>() {
+                return Some(bytes / 1024 / 1024);
+            }
+        }
+    }
+    None
+}
+
+/// Run `model`/`prompt` on its tagged backend and return normalized metrics.
+/// Never panics — transport/HTTP/backend errors land in `InferMetrics::error`.
+pub async fn infer_with_metrics(
+    client: &reqwest::Client,
+    model: &str,
+    prompt: &str,
+    timeout: Duration,
+) -> InferMetrics {
+    let backend = resolve_backend(model);
+    let mut m = InferMetrics {
+        backend: Some(backend.name.clone()),
+        hardware: Some(backend.hardware.clone()),
+        ..Default::default()
+    };
+
+    // Start the backend on demand (GPU arbitration + model load) if needed.
+    if let Err(e) = crate::intake::lifecycle::ensure_up(&backend, model).await {
+        m.error = Some(format!("backend '{}' unavailable: {e}", backend.name));
+        return m;
+    }
+
+    match backend.kind.as_str() {
+        "ollama" => {
+            let g = context::generate_at(client, &backend.url, model, prompt, timeout).await;
+            m.response = g.response;
+            m.throughput_tok_per_sec = g.throughput_tok_per_sec;
+            m.total_time_ms = g.total_time_ms;
+            m.oom = g.oom;
+            m.error = g.error;
+            if !m.response.is_empty() {
+                m.response_tokens = Some(context::estimate_tokens(&m.response) as i32);
+            }
+        }
+        "llama-server" => llama_server_infer(client, &backend.url, prompt, timeout, &mut m).await,
+        other => {
+            m.error = Some(format!("backend '{}' has unsupported kind '{other}'", backend.name));
+        }
+    }
+    m.vram_mb = vram_used_mb();
+    m
+}
+
+/// Normalized result of a single embedding request via the unified path.
+///
+/// `embedding` is the dense vector; `dimensionality` is its length; `latency_ms`
+/// is the wall-clock round-trip. On any failure (transport, HTTP, parse, or a
+/// backend whose kind does not support embeddings) `error` is set and `embedding`
+/// is empty — callers never panic and never see a fabricated vector.
+#[derive(Debug, Clone, Default)]
+pub struct EmbedMetrics {
+    pub embedding: Vec<f32>,
+    pub dimensionality: usize,
+    pub latency_ms: i64,
+    pub error: Option<String>,
+    /// Backend that served the request (for attribution).
+    pub backend: Option<String>,
+    /// Hardware the backend runs on (`"gpu"` | `"cpu"`).
+    pub hardware: Option<String>,
+}
+
+/// Embed `text` for `model` through Chord's unified backend-routing path.
+///
+/// This is the embedding analogue of [`infer_with_metrics`]: it resolves the
+/// model's tagged backend via [`resolve_backend`] (P5 routing) and dispatches to
+/// that backend's embeddings endpoint. The dim-6 embeddings sub-harness is a
+/// *client* of this function — it NEVER opens an Ollama socket directly.
+///
+/// Backend support: the Ollama wire path (`/api/embeddings`) is implemented. A
+/// `llama-server` or otherwise non-embedding backend kind returns a clear,
+/// non-silent error (so a non-embedding candidate is skipped cleanly upstream,
+/// not crashed). Never panics — every failure lands in `EmbedMetrics::error`.
+pub async fn embed_with_metrics(
+    client: &reqwest::Client,
+    model: &str,
+    text: &str,
+    timeout: Duration,
+) -> EmbedMetrics {
+    let backend = resolve_backend(model);
+    let mut m = EmbedMetrics {
+        backend: Some(backend.name.clone()),
+        hardware: Some(backend.hardware.clone()),
+        ..Default::default()
+    };
+
+    if let Err(e) = crate::intake::lifecycle::ensure_up(&backend, model).await {
+        m.error = Some(format!("backend '{}' unavailable: {e}", backend.name));
+        return m;
+    }
+
+    match backend.kind.as_str() {
+        "ollama" => ollama_embed(client, &backend.url, model, text, timeout, &mut m).await,
+        other => {
+            // No embeddings wire path for this backend kind: a clear, non-silent
+            // error that the runner turns into a clean "skip" (not a crash).
+            m.error = Some(format!(
+                "backend '{}' kind '{other}' does not support embeddings",
+                backend.name
+            ));
+        }
+    }
+    m
+}
+
+/// Ollama `/api/embeddings` (non-streaming). Fills `m.embedding`/`dimensionality`
+/// and measures wall-clock latency. Errors (transport/HTTP/parse/empty vector)
+/// land in `m.error`; the vector is never fabricated.
+async fn ollama_embed(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    text: &str,
+    timeout: Duration,
+    m: &mut EmbedMetrics,
+) {
+    let body = serde_json::json!({ "model": model, "prompt": text });
+    let started = std::time::Instant::now();
+    let resp = client
+        .post(format!("{base}/api/embeddings"))
+        .json(&body)
+        .timeout(timeout)
+        .send()
+        .await;
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            m.error = Some(e.to_string());
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        let txt = resp.text().await.unwrap_or_default();
+        m.error = Some(format!("Ollama embeddings HTTP {code}: {txt}"));
+        return;
+    }
+    let latency_ms = started.elapsed().as_millis() as i64;
+    let parsed: OllamaEmbedResponse = match resp.json().await {
+        Ok(p) => p,
+        Err(e) => {
+            m.error = Some(format!("embeddings response parse error: {e}"));
+            return;
+        }
+    };
+    if let Some(err) = parsed.error {
+        m.error = Some(err);
+        return;
+    }
+    if parsed.embedding.is_empty() {
+        // A non-embedding model often returns 200 with an empty vector — treat
+        // that as "not an embedding model", not a usable result.
+        m.error = Some("embeddings endpoint returned an empty vector".to_string());
+        return;
+    }
+    m.dimensionality = parsed.embedding.len();
+    m.embedding = parsed.embedding;
+    m.latency_ms = latency_ms;
+}
+
+/// Subset of Ollama `/api/embeddings` response we consume.
+#[derive(Deserialize)]
+struct OllamaEmbedResponse {
+    #[serde(default)]
+    embedding: Vec<f32>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// llama.cpp `llama-server` `/completion` (the server is pinned to one model via
+/// `-m`, so no model name is sent). Fills `m` from the `timings` block.
+async fn llama_server_infer(
+    client: &reqwest::Client,
+    base: &str,
+    prompt: &str,
+    timeout: Duration,
+    m: &mut InferMetrics,
+) {
+    let body = serde_json::json!({
+        "prompt": prompt,
+        "n_predict": -1,      // until EOS/context; the request timeout bounds it
+        "stream": false,
+        "cache_prompt": true,
+    });
+    let resp = client
+        .post(format!("{base}/completion"))
+        .json(&body)
+        .timeout(timeout)
+        .send()
+        .await;
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = e.to_string();
+            m.oom = msg.to_lowercase().contains("memory") || msg.to_lowercase().contains("oom");
+            m.error = Some(msg);
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        let txt = resp.text().await.unwrap_or_default();
+        m.oom = code == 500 && txt.to_lowercase().contains("memory");
+        m.error = Some(format!("llama-server HTTP {code}: {txt}"));
+        return;
+    }
+    let parsed: LlamaCompletion = match resp.json().await {
+        Ok(p) => p,
+        Err(e) => {
+            m.error = Some(format!("llama-server response parse error: {e}"));
+            return;
+        }
+    };
+    m.response = parsed.content;
+    if !m.response.is_empty() {
+        m.response_tokens = Some(context::estimate_tokens(&m.response) as i32);
+    }
+    if let Some(t) = parsed.timings {
+        m.throughput_tok_per_sec = t.predicted_per_second;
+        m.ttft_ms = t.prompt_ms.map(|v| v as i32);
+        m.response_tokens = t.predicted_n.or(m.response_tokens);
+        let total = t.prompt_ms.unwrap_or(0.0) + t.predicted_ms.unwrap_or(0.0);
+        if total > 0.0 {
+            m.total_time_ms = Some(total as i32);
+        }
+    }
+}
+
+/// Subset of llama.cpp `/completion` response we consume.
+#[derive(Deserialize)]
+struct LlamaCompletion {
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    timings: Option<LlamaTimings>,
+}
+
+#[derive(Deserialize)]
+struct LlamaTimings {
+    #[serde(default)]
+    prompt_ms: Option<f64>,
+    #[serde(default)]
+    predicted_n: Option<i32>,
+    #[serde(default)]
+    predicted_ms: Option<f64>,
+    #[serde(default)]
+    predicted_per_second: Option<f64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::io::Write;
+
+    /// Write `body` to a unique temp file and return its path (avoids env-var
+    /// races between parallel tests).
+    fn tmp_registry(tag: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("infer-test-{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registry.json");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        path
+    }
+
+    #[test]
+    fn resolve_falls_back_when_no_registry() {
+        let b = resolve_backend_at(
+            "anything:latest",
+            "/nonexistent/registry.json",
+            "http://localhost:11434/",
+            None,
+        );
+        assert_eq!(b.kind, "ollama");
+        assert_eq!(b.url, "http://localhost:11434");
+    }
+
+    #[test]
+    fn override_forces_backend_regardless_of_tag() {
+        let dir = std::env::temp_dir().join("infer-test-override");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registry.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "models": { "m:1": { "backend": "ollama" } },
+                "backends": {
+                    "ollama": { "url": "http://localhost:11434", "kind": "ollama", "hardware": "cpu" },
+                    "llama-gpu": { "url": "http://localhost:8082", "kind": "llama-server", "hardware": "gpu" }
+                }
+            }"#,
+        )
+        .unwrap();
+        // Tagged ollama, but the override forces llama-gpu.
+        let b = resolve_backend_at("m:1", path.to_str().unwrap(), "http://fb", Some("llama-gpu"));
+        assert_eq!(b.name, "llama-gpu");
+        assert_eq!(b.hardware, "gpu");
+    }
+
+    #[test]
+    fn resolve_reads_tagged_backend() {
+        let path = tmp_registry(
+            "reg",
+            r#"{
+                "models": { "qwen3-coder:30b": { "backend": "llama-gpu" } },
+                "backends": { "llama-gpu": { "url": "http://localhost:8082/", "kind": "llama-server", "hardware": "gpu" } }
+            }"#,
+        );
+        let b = resolve_backend_at("qwen3-coder:30b", path.to_str().unwrap(), "http://fallback", None);
+        assert_eq!(b.name, "llama-gpu");
+        assert_eq!(b.kind, "llama-server");
+        assert_eq!(b.hardware, "gpu");
+        assert_eq!(b.url, "http://localhost:8082"); // trailing slash trimmed
+    }
+
+    #[test]
+    fn legacy_flat_registry_resolves_to_fallback() {
+        let path = tmp_registry(
+            "legacy",
+            r#"{"qwen3:8b":{"name":"qwen3:8b","tier":"warm"}}"#,
+        );
+        let b = resolve_backend_at("qwen3:8b", path.to_str().unwrap(), "http://localhost:11434", None);
+        assert_eq!(b.kind, "ollama"); // legacy format, no tag → fallback
+    }
+}

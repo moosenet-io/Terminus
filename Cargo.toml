@@ -1,0 +1,86 @@
+[package]
+name = "terminus-rs"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+description = "Rust fallback tool implementations for the Chord proxy"
+repository = "https://github.com/moosenet-io/terminus"
+readme = "README.md"
+
+[lib]
+name = "terminus_rs"
+path = "src/lib.rs"
+
+[dependencies]
+# terminus-rs is a STANDALONE crate with no lumina-core dependency. The small
+# set of types it once borrowed from lumina-core are vendored byte-for-byte into
+# `src/compat/`, keeping the chord -> terminus chain free of lumina-core.
+# `dirs` + `log` are the only transitive deps those vendored copies add.
+dirs = "5.0"
+log = "0.4"
+async-trait = "0.1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+uuid = { version = "1", features = ["v4"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid"], default-features = false }
+ssh2 = "0.9"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+thiserror = "1.0"
+tracing = "0.1"
+regex = "1"
+# Google tools: IMAP (read), SMTP (send), CalDAV uses reqwest (already present)
+async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["logging", "tls12", "ring", "std"] }
+rustls-native-certs = "0.8"
+lettre = { version = "0.11", default-features = false, features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "builder", "ring"] }
+
+[dev-dependencies]
+httpmock = "0.7"
+tokio-test = "0.4"
+serial_test = "3"
+tempfile = "3"
+
+# S84 ASMT-02: explicit integration-test target for the dim-1 conversation suite
+# (Cargo does not auto-discover test files inside subdirectories).
+[[test]]
+name = "intake_dim1_conversation"
+path = "tests/intake/dim1_conversation.rs"
+
+# S84 ASMT-03: explicit integration-test target for the dim-2 tool-chaining suite
+# (Cargo does not auto-discover test files inside subdirectories).
+[[test]]
+name = "intake_dim2_toolchain"
+path = "tests/intake/dim2_toolchain.rs"
+# S84 ASMT-04: explicit integration-test target for the dim-3 memory-integration suite
+# (Cargo does not auto-discover test files inside subdirectories).
+[[test]]
+name = "intake_dim3_memory"
+path = "tests/intake/dim3_memory.rs"
+# S84 ASMT-05: explicit integration-test target for the dim-4 OCEAN suite
+# (Cargo does not auto-discover test files inside subdirectories).
+[[test]]
+name = "intake_dim4_ocean"
+path = "tests/intake/dim4_ocean.rs"
+
+# S84 ASMT-07: explicit integration-test target for the dim-6 embeddings suite
+# (Cargo does not auto-discover test files inside subdirectories).
+[[test]]
+name = "intake_dim6_embeddings"
+path = "tests/intake/dim6_embeddings.rs"
+
+# S84 ASMT-09: explicit integration-test target for the consolidated runner
+# (Cargo does not auto-discover test files inside subdirectories).
+[[test]]
+name = "intake_asmt09_runner"
+path = "tests/intake/asmt09_runner.rs"
+
+# S84 ASMT-11: explicit integration-test target for the reporting / money-query
+# layer (Cargo does not auto-discover test files inside subdirectories).
+[[test]]
+name = "intake_reporting"
+path = "tests/intake/reporting.rs"

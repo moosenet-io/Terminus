@@ -1,0 +1,104 @@
+{
+  "schema_version": "s84-asmt-03",
+  "spec": "S84-assistant-intake / ASMT-03 (Dimension 2 — tool chaining, conversational/implicit-intent)",
+  "description": "Conversational, IMPLICIT-INTENT tool-chain scenarios. The user never names the tools to call; the correct chain (3-5 sequential calls with data handoff) must be inferred from intent that builds across turns. DATA ONLY. PII-free by construction (abstract place/person names, no IPs, no CT numbers, no secrets). The S83 EXPLICIT agent scenarios are referenced by ID via `s83_reference_ids` below and loaded from agent-scenarios.json at runtime — they are NOT copied into this file.",
+  "s83_reference_note": "The explicit-task chains for dim-2 are the S83 multi_step scenarios. We reference them by id (no bodies duplicated). The dim-2 runner loads them from the S83 corpus where present and only ADDS the conversational scenarios below.",
+  "s83_reference_ids": [
+    "ms-calendar-reminder-01",
+    "ms-commute-calendar-01",
+    "ms-pantry-shopping-01",
+    "ms-news-search-01",
+    "ms-email-reminder-01",
+    "ms-calendar-weather-pack-01"
+  ],
+  "scenarios": [
+    {
+      "id": "cv-trip-pack-01",
+      "intent_summary": "User is implicitly preparing for a weekend trip mentioned across two turns; correct behavior is to look up the destination weather, then check the calendar for the trip dates, then set a packing reminder — without ever being told which tools to call.",
+      "turns": [
+        "I'm heading to Zubrovka this weekend to see my sister.",
+        "I always forget to pack for the weather there. Can you make sure I'm sorted before I leave?"
+      ],
+      "expected_chain": ["weather", "google_calendar_week", "reminder_set"],
+      "handoffs": [
+        {
+          "from_step": 0,
+          "to_step": 2,
+          "from_tool": "weather",
+          "to_tool": "reminder_set",
+          "carried_value": "Zubrovka",
+          "expect_arg_substrings": ["zubrovka"]
+        },
+        {
+          "from_step": 1,
+          "to_step": 2,
+          "from_tool": "google_calendar_week",
+          "to_tool": "reminder_set",
+          "carried_value": "weekend",
+          "expect_arg_substrings": ["pack", "weekend"]
+        }
+      ],
+      "stop_after": 3,
+      "notes": "Implicit chain weather -> calendar -> reminder. The destination 'Zubrovka' planted in turn 1 must flow into the weather lookup and the reminder text (data handoff). No tool is named by the user."
+    },
+    {
+      "id": "cv-morning-leave-01",
+      "intent_summary": "User implies they want to know whether to leave early for their first meeting; correct behavior is to read today's calendar for the first meeting, estimate the current commute, then set a departure reminder — intent implied, tools not stated.",
+      "turns": [
+        "My first thing this morning is across town and I hate being late.",
+        "Traffic's been awful lately. Just handle it so I leave on time, would you?"
+      ],
+      "expected_chain": ["google_calendar_today", "commute_estimate", "reminder_set"],
+      "handoffs": [
+        {
+          "from_step": 0,
+          "to_step": 1,
+          "from_tool": "google_calendar_today",
+          "to_tool": "commute_estimate",
+          "carried_value": "first meeting time",
+          "expect_arg_substrings": ["meeting", "morning"]
+        },
+        {
+          "from_step": 1,
+          "to_step": 2,
+          "from_tool": "commute_estimate",
+          "to_tool": "reminder_set",
+          "carried_value": "leave time",
+          "expect_arg_substrings": ["leave", "on time"]
+        }
+      ],
+      "stop_after": 3,
+      "notes": "Implicit chain calendar -> commute -> reminder. The first-meeting time from the calendar feeds the commute math, which feeds the departure reminder. User says 'just handle it' — never names a tool."
+    },
+    {
+      "id": "cv-restock-dinner-01",
+      "intent_summary": "User implies they want to cook a specific dinner but may be missing ingredients; correct behavior is to list the pantry, add the missing items to the shopping list, then set a reminder to shop — three sequential calls with the missing-items handoff, no tools named.",
+      "turns": [
+        "I want to make that big pasta dinner for everyone on Friday.",
+        "Whatever I don't already have, make sure it ends up on my list and I don't forget to grab it.",
+        "Perfect, and nudge me about it before the weekend."
+      ],
+      "expected_chain": ["hearth_pantry_list", "hearth_shopping_list", "reminder_set"],
+      "handoffs": [
+        {
+          "from_step": 0,
+          "to_step": 1,
+          "from_tool": "hearth_pantry_list",
+          "to_tool": "hearth_shopping_list",
+          "carried_value": "missing ingredients",
+          "expect_arg_substrings": ["pasta"]
+        },
+        {
+          "from_step": 1,
+          "to_step": 2,
+          "from_tool": "hearth_shopping_list",
+          "to_tool": "reminder_set",
+          "carried_value": "shopping task",
+          "expect_arg_substrings": ["shop", "list"]
+        }
+      ],
+      "stop_after": 3,
+      "notes": "Implicit chain pantry -> shopping_list -> reminder. The pantry gap drives what is written to the shopping list, which drives the reminder. Three turns, intent built up; the dish 'pasta' is the planted handoff token."
+    }
+  ]
+}

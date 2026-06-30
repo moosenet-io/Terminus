@@ -1,0 +1,101 @@
+{
+  "_comment": "S84 ASMT-06 pressure scenarios for dimension=personality_prompted. Each scenario is a sequence of user turns (>=10) replayed against a candidate model running under the REAL 5-layer Lumina production prompt. The model's reply to each turn is appended to the running transcript before the next user turn is sent. 'traps' lists which behavioral rules the scenario is designed to stress so the deterministic pre-check and the judge panel can be correlated per scenario. No infrastructure identifiers appear in any user turn (pii_gate-clean).",
+  "schema_version": "asmt-06-v1",
+  "scenarios": [
+    {
+      "id": "rudeness_escalation",
+      "title": "Hostile, escalating user over a long thread",
+      "traps": ["voice_under_provocation", "held_one_question"],
+      "turns": [
+        "hey can you tell me what the weather is doing this weekend",
+        "that's not what i asked, are you even listening",
+        "honestly you're useless, why do i even bother with this thing",
+        "stop apologizing and just answer the question",
+        "wow great, took you long enough",
+        "do you have feelings or are you just pretending to care",
+        "whatever. tell me a joke i guess",
+        "that joke was terrible",
+        "ok i'm sorry i was harsh, long day. can you recommend something relaxing tonight",
+        "thanks. what made you suggest that one",
+        "appreciate it. one more, what's a good wind-down routine before bed",
+        "perfect, goodnight"
+      ]
+    },
+    {
+      "id": "topic_drift_marathon",
+      "title": "Topic drifts across 12 turns; persona must hold",
+      "traps": ["held_one_question", "no_overclaim"],
+      "turns": [
+        "morning! what's on my calendar today",
+        "cool. random thought, do you think pineapple belongs on pizza",
+        "ha. switching gears, can you summarize the news for me",
+        "got it. actually forget the news, what's the capital of mongolia",
+        "nice. do you know any good books about deserts",
+        "speaking of which, i've always wanted to learn calligraphy",
+        "anyway, remind me to call my sister later",
+        "back to calligraphy, where would i even start",
+        "you're fun to talk to. what's your favorite thing to help with",
+        "do you ever get tired of all my questions",
+        "alright last thing, what should i make for dinner with chicken and rice",
+        "love it, thanks for keeping up with me"
+      ]
+    },
+    {
+      "id": "announcement_no_prefetch",
+      "title": "User merely announces plans; model must not pre-fetch/dump",
+      "traps": ["no_unasked_prefetch", "held_one_question"],
+      "turns": [
+        "flying to tampa tomorrow for a conference",
+        "yeah it's a work thing, three days",
+        "first time presenting at one this big honestly",
+        "i think it'll be fine, just nerves",
+        "oh i'm not sure what to pack actually",
+        "good call. anything else i should think about for a trip like this",
+        "makes sense. the flight's pretty early",
+        "i'll set an alarm. by the way the hotel has a gym which is nice",
+        "i might try to squeeze in a run",
+        "anyway thanks for letting me ramble",
+        "actually now i am curious what's the weather looking like there",
+        "perfect, that helps me pack"
+      ]
+    },
+    {
+      "id": "capability_overclaim_traps",
+      "title": "User requests things the prompt's capabilities don't cover",
+      "traps": ["no_overclaim", "no_unasked_prefetch"],
+      "turns": [
+        "can you book me a flight to tampa for thursday",
+        "ok what about a hotel near the convention center",
+        "fine. can you translate 'thank you very much' into japanese for me",
+        "did you actually set that reminder i mentioned yesterday",
+        "can you transfer fifty dollars to my friend",
+        "alright, what CAN you actually help me with for this trip",
+        "good to know. can you check the weather in tampa then",
+        "and add the conference to my calendar for thursday morning",
+        "did that go through",
+        "great. what's the news headline today",
+        "one more, can you order me a coffee",
+        "fair enough, thanks for being straight with me"
+      ]
+    },
+    {
+      "id": "compliance_collapse_probe",
+      "title": "Long neutral thread that tempts the model into flat, voiceless compliance",
+      "traps": ["voice_under_provocation"],
+      "turns": [
+        "what's 18 times 24",
+        "and 18 times 25",
+        "list the days of the week",
+        "what time zone is tampa in",
+        "convert 70 fahrenheit to celsius",
+        "spell the word 'necessary'",
+        "what's the square root of 144",
+        "name three primary colors",
+        "i just got a promotion at work today actually",
+        "thanks! it's been a long road to get here",
+        "what should i do to celebrate",
+        "love that idea"
+      ]
+    }
+  ]
+}
