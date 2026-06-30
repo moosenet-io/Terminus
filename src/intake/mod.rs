@@ -26,6 +26,7 @@ mod context;
 pub mod infer;
 pub mod lifecycle;
 mod runner;
+pub mod serving;
 mod storage;
 
 use async_trait::async_trait;

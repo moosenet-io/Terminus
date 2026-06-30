@@ -9,7 +9,9 @@
 </p>
 
 <p align="center">
-  <img src="./assets/badges.svg" alt="build · tests · rust 2024 edition · MIT · v1.0"/>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"/></a>
+  <img src="https://img.shields.io/badge/language-Rust-orange" alt="Rust"/>
+  <img src="https://img.shields.io/badge/inference-local--first-7F77DD" alt="Local-first inference"/>
 </p>
 
 <p align="center">
@@ -69,11 +71,32 @@ small cluster if you want to spread the load.
 
 ## Architecture
 
-<p align="center">
-  <img src="./assets/architecture.svg" alt="Lumina architecture" width="100%"/>
-</p>
-
 Lumina is composed of three Rust crates plus local model serving:
+
+```
+                         You (chat channel)
+                                |
+                                v
+                +-------------------------------+
+                |          lumina-core          |
+                |  orchestrator . personality . |
+                |  memory subsystem . scheduler |
+                +---------------+---------------+
+                                |
+                                v
+                +-------------------------------+
+                |          chord-proxy          |
+                |  smart routing . cost tiers . |
+                |  model lifecycle (hot/warm/   |
+                |  cold) . agentic loop         |
+                +-------+---------------+-------+
+                        |               |
+              +---------v------+  +-----v--------------+
+              |  terminus-rs   |  |  local inference   |
+              |  MCP tool hub  |  |  (local models)    |
+              |  (100+ tools)  |  |  + cloud fallback  |
+              +----------------+  +--------------------+
+```
 
 - **`lumina-core`** — the orchestrator. Owns the chat channel(s), assembles the system
   prompt and persona, runs the scheduler, and manages the three-tier memory subsystem.
@@ -171,6 +194,12 @@ are clients of the proxy, never of a backend socket.
   chat-role routing guard. Answers *"is this model a good assistant, and should it be the
   chat alias?"*
 
+- **[Serving-profile routing](docs/harnesses/serving-routing.md)** — the third dimension:
+  per-model serving profiles over a three-tier runtime model (llama.cpp-rocm → ollama-rocm →
+  CPU), permanent-vs-build-conditional exclusions, and Chord's auto-launch with VRAM admission,
+  tier-aware eviction, and a never-evicted pinned chat model. Answers *"how do we launch this
+  model on this box, and what gives when two models want VRAM at once?"*
+
 ---
 
 ## Documentation
@@ -180,6 +209,7 @@ are clients of the proxy, never of a backend socket.
 - [Modules](docs/modules.md) — the module registry
 - [Coder intake harness](docs/harnesses/coder-intake.md) — builder-side model profiling (`model_intake`, MINT v2)
 - [Assistant intake harness](docs/harnesses/assistant-intake.md) — assistant-side model profiling (six dimensions)
+- [Serving-profile routing](docs/harnesses/serving-routing.md) — three-tier serving profiles, auto-launch, VRAM admission + tier-aware eviction
 - [Inference de-bloating](docs/inference-debloating.md) — the routing philosophy that keeps cost near zero
 - [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 

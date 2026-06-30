@@ -134,6 +134,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::vector::register(registry);
     crate::vitals::register(registry);
     crate::wizard::register(registry);
+    crate::tools::register(registry);
 }
 
 #[cfg(test)]
