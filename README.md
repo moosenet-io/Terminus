@@ -57,6 +57,16 @@ context, code, and agent suites against it, and stores a derived operational
 profile (safe/absolute context ceilings, throughput curve, recommended
 timeouts, degradation point) in Postgres for later comparison.
 
+As of **v1.1** this extends into a **serving-profile** dimension
+([`src/intake/serving`](src/intake/serving)): for each (model × serving backend)
+it records the chosen launch runtime and its env (gfx override, CPU lib, mmap /
+flash-attn flags), measured throughput / VRAM-or-RAM peak / cold-load time, a
+`keep_warm` hint for large slow-loading MoEs, and typed `exclusion_reason` /
+`recheck_trigger` enums explaining why a faster runtime was skipped and whether
+a llama.cpp build bump should prompt a re-probe. The probe layer is trait-driven
+(launcher + VRAM-release gate) so the suite runs on CI with no real GPU. This
+profile is the contract Chord consumes to place and launch models.
+
 ### Governance
 
 Guarded tools (e.g. `openhands_run_task`, Infisical secret access) pass through
@@ -75,6 +85,7 @@ their tools:
 | --- | --- | --- |
 | `approval` | Guarded-tool approval gate (internal) | `approval_grant`, `approval_deny` |
 | `intake` | Model profiling / inference primitives | `model_intake`, `model_intake_status`, `model_intake_compare`, `model_intake_fleet` |
+| `serving` | Serving-profile inspect / operate (v1.1) | `serving_profile_get`, `serving_residency_status`, `serving_profile_refresh` |
 | `dev` | Path-jailed dev workspace | `dev_read_file`, `dev_write_file`, `dev_run_command`, `dev_list_workspaces` |
 | `openhands` | Agentic coding runs (guarded) | `openhands_run_task`, `openhands_list_conversations`, `openhands_get_status` |
 | `gitea` | Gitea git forge | `gitea_create_repo`, `gitea_read_file`, `gitea_create_pr`, `gitea_merge_pr` |
