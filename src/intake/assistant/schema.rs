@@ -248,12 +248,35 @@ pub async fn insert_run(pool: &PgPool) -> Result<uuid::Uuid, ToolError> {
     Ok(id)
 }
 
-/// Insert one aggregated [`DimensionScore`] against a run. The canonical write
-/// path for ASMT-02..07.
+/// Insert one aggregated [`DimensionScore`] against a run, tagged with
+/// `task_category = "assistant"`. The canonical write path for ASMT-02..07.
+///
+/// Thin wrapper over [`insert_dimension_score_with_category`] — zero behavior
+/// change for every existing caller (dim1..dim6 runners), which never pass a
+/// category and always meant "assistant".
 pub async fn insert_dimension_score(
     pool: &PgPool,
     run_id: uuid::Uuid,
     score: &DimensionScore,
+) -> Result<(), ToolError> {
+    insert_dimension_score_with_category(pool, run_id, score, "assistant").await
+}
+
+/// Insert one aggregated [`DimensionScore`] against a run, tagged with an
+/// explicit `task_category` (MINT new-model-types extension).
+///
+/// The `assistant_dimension_score` table's `task_category` column is
+/// deliberately unconstrained (see [`migrate`]'s doc comment) so any new
+/// benchmarking category — `"document_parsing"`, `"image_parsing"`,
+/// `"image_generation"`, `"voice_transcription"`, etc. — writes through this
+/// same flexible (dimension, metric, value, judge, raw_json) shape without a
+/// schema change. [`insert_dimension_score`] is the `"assistant"`-tagged
+/// special case of this function, kept for source compatibility.
+pub async fn insert_dimension_score_with_category(
+    pool: &PgPool,
+    run_id: uuid::Uuid,
+    score: &DimensionScore,
+    task_category: &str,
 ) -> Result<(), ToolError> {
     let raw: Option<serde_json::Value> = match &score.raw_json {
         Some(s) => Some(
@@ -265,8 +288,8 @@ pub async fn insert_dimension_score(
     sqlx::query(
         "INSERT INTO assistant_dimension_score \
          (run_id, model_id, backend_tag, dimension, metric, value, std_dev, judge, \
-          low_confidence, raw_json) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+          low_confidence, raw_json, task_category) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(run_id)
     .bind(score.model_id.as_str())
@@ -278,6 +301,7 @@ pub async fn insert_dimension_score(
     .bind(&score.judge)
     .bind(score.low_confidence)
     .bind(raw)
+    .bind(task_category)
     .execute(pool)
     .await
     .map_err(|e| ToolError::Database(format!("insert assistant_dimension_score: {e}")))?;
