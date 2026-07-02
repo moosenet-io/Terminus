@@ -165,8 +165,9 @@ pub fn build_pipeline_prompt(
     p.push_str(
         "You are a senior engineer working in the lumina-constellation project. \
          You are given a build task (a spec item) and the CURRENT, COMPLETE \
-         contents of the file(s) you must modify. Implement the task by editing \
-         those files.\n\n",
+         contents of any existing file(s) it references. Implement the task by \
+         editing those files, or by creating the new file(s) named in the spec's \
+         FILES section when a target does not yet exist.\n\n",
     );
     p.push_str("=== PROJECT CONTEXT ===\n");
     p.push_str(&format!("Crate/workspace: {workspace}\n"));
@@ -178,8 +179,15 @@ pub fn build_pipeline_prompt(
     p.push_str("\n=== SPEC ITEM ===\n");
     p.push_str(spec.trim());
     p.push_str("\n\n=== CURRENT FILE CONTENTS ===\n");
-    for (name, body) in files {
-        p.push_str(&format!("\n----- {name} -----\n```\n{body}\n```\n"));
+    if files.is_empty() {
+        p.push_str(
+            "\n(No existing target files — every file named in the SPEC ITEM's \
+             FILES section is new; create it from scratch.)\n",
+        );
+    } else {
+        for (name, body) in files {
+            p.push_str(&format!("\n----- {name} -----\n```\n{body}\n```\n"));
+        }
     }
     p.push_str(
         "\n=== OUTPUT FORMAT ===\n\
@@ -551,11 +559,20 @@ async fn run_one_case_v2(
             return CaseV2Result { row, ..none() };
         }
     };
-    let (files, total_lines) = read_target_files(&ws_dir, &case.files);
-    if files.is_empty() {
-        row.error = Some(format!("no readable target files in workspace {}", case.workspace));
+    // An infra-broken workspace (bad corpus deploy, typo'd `workspace` field,
+    // etc.) means the whole case is unrunnable — that IS an infrastructure
+    // error. An EMPTY `files` result is NOT necessarily one: some `## FILES`
+    // entries name files the model must CREATE from scratch (e.g. ts-standard-t1
+    // targets `wx-ts/typed.ts` + `wx-ts/typed.test.ts`, neither of which exists
+    // on disk — the spec explicitly says "Create a new module"). Gating on
+    // `files.is_empty()` misclassified every such creation-style case as a
+    // "no readable target files" infra error, even though the workspace itself
+    // was present and fully readable (HFIX-03).
+    if !ws_dir.is_dir() {
+        row.error = Some(format!("workspace directory not found: {}", case.workspace));
         return CaseV2Result { row, spec, ..none() };
     }
+    let (files, total_lines) = read_target_files(&ws_dir, &case.files);
     row.file_count = Some(case.files.len() as i32);
     row.total_lines = Some(total_lines);
 
@@ -982,6 +999,50 @@ mod tests {
         assert!(p.contains("fn a(){}"));
         assert!(p.contains("CURRENT FILE CONTENTS"));
         assert!(p.contains("first line inside the code block") || p.contains("FIRST line"));
+    }
+
+    #[test]
+    fn read_target_files_empty_for_new_file_targets_not_missing_workspace() {
+        // Reproduces the HFIX-03 wx-ts bug: `ts-standard-t1` targets brand-new
+        // files (`typed.ts`, `typed.test.ts`) that the model must CREATE, in a
+        // workspace whose OTHER modules (querystring.ts, result.ts, ...) are
+        // genuinely present on disk — mirroring the real `_workspaces/wx-ts`
+        // layout. `read_target_files` must report an empty list here (nothing
+        // to read yet), NOT an error — the workspace itself is fine.
+        let dir = std::env::temp_dir().join(format!("wx-ts-hfix03-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("querystring.ts"), "export function parse() {}\n").unwrap();
+        std::fs::write(dir.join("result.ts"), "export function Ok(v) { return v; }\n").unwrap();
+
+        // Workspace directory is present and readable...
+        assert!(dir.is_dir());
+        // ...but the case's declared target files (a new module to create)
+        // don't exist yet — that's expected, not an infra failure.
+        let (files, total_lines) = read_target_files(
+            &dir,
+            &["typed.ts".to_string(), "typed.test.ts".to_string()],
+        );
+        assert!(files.is_empty(), "new-file targets should read as empty, not error");
+        assert_eq!(total_lines, 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn build_pipeline_prompt_handles_new_file_creation_case() {
+        // No CURRENT file contents at all (every target is new) must still
+        // produce a valid, non-panicking prompt that tells the model to
+        // create the file(s) rather than implying files were dropped/unreadable.
+        let p = build_pipeline_prompt(
+            "## Task\nCreate a new module `wx-ts/typed.ts`.\n\n## FILES\n- wx-ts/typed.ts\n- wx-ts/typed.test.ts",
+            "wx-ts",
+            &[],
+            "emitter.ts\nquerystring.ts\nresult.ts\nrouter.ts",
+        );
+        assert!(p.contains("wx-ts"));
+        assert!(p.contains("Create a new module"));
+        assert!(p.contains("create it from scratch"));
+        assert!(!p.contains("----- "), "no per-file blocks when there are no existing files");
     }
 
     #[test]
