@@ -155,6 +155,22 @@ async fn create_full_profile_view(pool: &PgPool) -> Result<(), ToolError> {
         "NULL::text"
     };
 
+    // Same defensive pattern as builder_has_backend_tag immediately above: guard
+    // `cpr.mem_config` too. Both `backend_tag` and `mem_config` are added to
+    // `code_profile_runs` ONLY inside `assistant::schema::migrate()`, and this
+    // module's own `migrate()` does not call that first — so on a DB where
+    // `code_profile_runs` exists but the assistant migration hasn't run yet,
+    // an unguarded `cpr.mem_config` reference would make `CREATE VIEW
+    // model_full_profile` hard-fail with "column cpr.mem_config does not
+    // exist" before the backend_tag degradation above even gets a chance to
+    // help.
+    let builder_has_mem_config = column_exists(pool, "code_profile_runs", "mem_config").await?;
+    let builder_mem_config_expr = if builder_has_mem_config {
+        "cpr.mem_config"
+    } else {
+        "NULL::text"
+    };
+
     // mem-config-tagging DECISION (documented here, not just in the build
     // report, so a future reader sees the reasoning at the code site):
     //
@@ -191,12 +207,12 @@ async fn create_full_profile_view(pool: &PgPool) -> Result<(), ToolError> {
          WITH builder AS ( \
              SELECT mp.model_name AS model_id, \
                     {backend} AS builder_backend_tag, \
-                    cpr.mem_config AS builder_mem_config, \
+                    {mem_config} AS builder_mem_config, \
                     count(cpr.*) AS builder_run_count, \
                     avg(cpr.code_quality_score) AS builder_avg_quality \
              FROM model_profiles mp \
              LEFT JOIN code_profile_runs cpr ON cpr.profile_id = mp.id \
-             GROUP BY mp.model_name, {backend}, cpr.mem_config \
+             GROUP BY mp.model_name, {backend}, {mem_config} \
          ), \
          assistant AS ( \
              SELECT model_id, \
@@ -239,6 +255,7 @@ async fn create_full_profile_view(pool: &PgPool) -> Result<(), ToolError> {
          LEFT JOIN assistant a ON a.model_id = k.model_id \
          LEFT JOIN serving s ON s.model_id = k.model_id",
         backend = builder_backend_expr,
+        mem_config = builder_mem_config_expr,
     );
 
     sqlx::query(&view_sql)
@@ -592,6 +609,79 @@ mod tests {
             .await;
         let _ = sqlx::query("DELETE FROM model_profiles WHERE id = $1")
             .bind(profile_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// Regression test for the `builder_has_mem_config` guard added alongside
+    /// this fix: `column_exists` must correctly report both "column absent"
+    /// and "column present" for `mem_config`, since `create_full_profile_view`
+    /// picks between `cpr.mem_config` and `NULL::text` based solely on that
+    /// probe. This is the same defensive pattern `builder_has_backend_tag`
+    /// already relies on (S84) — `mem_config` needed the identical guard
+    /// because `serving::schema::migrate()` never calls
+    /// `assistant::schema::migrate()` (the only place that adds the column to
+    /// `code_profile_runs`), so a DB that has run serving's migrate but not
+    /// assistant's would otherwise hit "column cpr.mem_config does not exist"
+    /// when `CREATE VIEW model_full_profile` runs.
+    ///
+    /// This deliberately probes a throwaway, uniquely-named scratch table
+    /// (created and dropped entirely within this test) rather than mutating
+    /// the shared `code_profile_runs` table: dropping/re-adding a column on
+    /// that table would risk clobbering real harness data for any other
+    /// concurrently-running test or process against the same DB. The
+    /// "column present" side of the view's behavior (mem_config correctly
+    /// populated / not blended) is already covered end-to-end by
+    /// `builder_mem_config_keeps_different_configs_from_blending` above.
+    ///
+    /// Gated on a reachable Postgres, same convention as the sibling tests.
+    #[tokio::test]
+    async fn column_exists_detects_absent_and_present_mem_config() {
+        let pool = match get_pool().await {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!(
+                    "skipping column_exists_detects_absent_and_present_mem_config: \
+                     no INTAKE_DATABASE_URL/DATABASE_URL configured"
+                );
+                return;
+            }
+        };
+
+        let table = format!("mem_config_guard_probe_{}", uuid::Uuid::new_v4().simple());
+
+        // Scratch table, no mem_config column yet — mirrors the pre-assistant-
+        // migrate shape of code_profile_runs that the guard must tolerate.
+        sqlx::query(&format!(
+            "CREATE TABLE {table} (id BIGSERIAL PRIMARY KEY, backend_tag TEXT)"
+        ))
+        .execute(&pool)
+        .await
+        .expect("create scratch table");
+
+        assert!(
+            !column_exists(&pool, &table, "mem_config")
+                .await
+                .expect("probe absent mem_config"),
+            "column_exists must report false before the column is added — this is the exact \
+             condition builder_has_mem_config guards against"
+        );
+
+        sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN mem_config TEXT"))
+            .execute(&pool)
+            .await
+            .expect("add mem_config column");
+
+        assert!(
+            column_exists(&pool, &table, "mem_config")
+                .await
+                .expect("probe present mem_config"),
+            "column_exists must report true once the column exists, so builder_mem_config_expr \
+             switches from NULL::text to cpr.mem_config"
+        );
+
+        // Cleanup: drop the scratch table entirely (nothing shared is touched).
+        let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
             .execute(&pool)
             .await;
     }
