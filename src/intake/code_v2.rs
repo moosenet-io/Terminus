@@ -528,10 +528,12 @@ async fn run_one_case_v2(
     model_name: &str,
     case: &CaseV2,
     corpus: &Path,
+    backend_tag: Option<&str>,
 ) -> CaseV2Result {
     let mut row = CodeRunRowV2 {
         language: case.language.clone(),
         task_type: case.task_type.clone().or_else(|| Some("build_modify".into())),
+        backend_tag: backend_tag.map(str::to_string),
         ..Default::default()
     };
     let none = CaseV2Result::default;
@@ -769,6 +771,7 @@ pub async fn run_code_suite_v2(
     languages: &[String],
     profile_id: uuid::Uuid,
     case_limit: Option<usize>,
+    backend_tag: Option<&str>,
 ) -> Result<CodeV2Outcome, ToolError> {
     sweep_stale_workspaces();
     let dir = corpus_v2_dir();
@@ -792,7 +795,7 @@ pub async fn run_code_suite_v2(
     // ---- Phase 1: inference, with the TEST model hot, NO judging --------
     let mut pending: Vec<CaseV2Result> = Vec::with_capacity(cases.len());
     for case in &cases {
-        pending.push(run_one_case_v2(&client, model_name, case, &dir).await);
+        pending.push(run_one_case_v2(&client, model_name, case, &dir, backend_tag).await);
     }
 
     // ---- Phase 2: batched idiom judge, with the JUDGE model hot ---------

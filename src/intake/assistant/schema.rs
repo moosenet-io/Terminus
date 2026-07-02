@@ -90,9 +90,40 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
     .await
     .map_err(|e| ToolError::Database(format!("create assistant_dimension_score: {e}")))?;
 
+    // `task_category` extends the flexible (dimension, metric, value, judge,
+    // raw_json) scoring mechanism to host benchmarking categories beyond the
+    // original "assistant" persona/quality evals — the operator is adding five
+    // more categories (document parsing/OCR, image parsing/vision-understanding,
+    // image generation, document generation, voice transcription/ASR) on top of
+    // "assistant" and "coder". `NOT NULL DEFAULT 'assistant'` back-fills every
+    // existing row with the value that already describes them, preserving
+    // current meaning exactly. Deliberately NO CHECK constraint: this is a
+    // living, non-exhaustive list — constraining it in the DB would force a
+    // migration every time a new category is added, defeating the point of the
+    // extension. Known values as of this writing (not exhaustive):
+    //   'assistant', 'coder' (coder mostly uses code_profile_runs already, but
+    //   may use this table for cross-cutting scores), 'document_parsing',
+    //   'image_parsing', 'image_generation', 'document_generation',
+    //   'voice_transcription'.
+    sqlx::query(
+        "ALTER TABLE assistant_dimension_score \
+         ADD COLUMN IF NOT EXISTS task_category TEXT NOT NULL DEFAULT 'assistant'",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| ToolError::Database(format!("add task_category column: {e}")))?;
+
+    // Recreated (not just created) so the index definition stays current even
+    // on a DB that already had the old (model_id, backend_tag) index from a
+    // prior migrate() run. Cheap: this table is intake-scale, not hot-path.
+    sqlx::query("DROP INDEX IF EXISTS idx_assistant_score_model")
+        .execute(pool)
+        .await
+        .map_err(|e| ToolError::Database(format!("drop idx_assistant_score_model: {e}")))?;
+
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_assistant_score_model \
-         ON assistant_dimension_score (model_id, backend_tag)",
+         ON assistant_dimension_score (model_id, backend_tag, task_category)",
     )
     .execute(pool)
     .await
@@ -105,6 +136,27 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
     .execute(pool)
     .await
     .map_err(|e| ToolError::Database(format!("create idx_assistant_score_run: {e}")))?;
+
+    // 2b. `code_profile_runs` is owned/created by `storage.rs` (NOT this
+    //     module — see that file's header comment: "tables already exist in the
+    //     shared DB, DO NOT create them here"), but `migrate()` already reaches
+    //     into it defensively via `column_exists` below to build the dual-profile
+    //     view. `backend_tag` is the coder-side twin of the assistant-side
+    //     column added above: the sweep tests every model on both GPU and CPU
+    //     backends, and until now `code_profile_runs` had nowhere to record
+    //     which one a given row came from — the view's builder-side backend
+    //     attribution has silently degraded to NULL because the column has
+    //     never existed. Adding it here (rather than in storage.rs) keeps the
+    //     "who creates schema" boundary consistent with the existing
+    //     `column_exists` probe below, which already anticipated this column's
+    //     eventual arrival. No CHECK constraint: conceptually 'gpu'/'cpu' (same
+    //     domain as `assistant_dimension_score.backend_tag`), but left
+    //     unconstrained in case a future third configuration (e.g.
+    //     'gpu-rocm' vs 'gpu-vulkan') is added without a migration.
+    sqlx::query("ALTER TABLE code_profile_runs ADD COLUMN IF NOT EXISTS backend_tag TEXT")
+        .execute(pool)
+        .await
+        .map_err(|e| ToolError::Database(format!("add code_profile_runs.backend_tag: {e}")))?;
 
     // 3. The dual-profile join view. Built so a model present in only ONE side
     //    still appears (key set = UNION of both sides' model_ids), and so a
@@ -170,7 +222,7 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
 /// whether S83's builder table already carries `backend_tag` (P5+) or not.
 async fn column_exists(pool: &PgPool, table: &str, column: &str) -> Result<bool, ToolError> {
     let row: Option<(i64,)> = sqlx::query_as(
-        "SELECT 1 FROM information_schema.columns \
+        "SELECT 1::bigint FROM information_schema.columns \
          WHERE table_name = $1 AND column_name = $2 LIMIT 1",
     )
     .bind(table)
