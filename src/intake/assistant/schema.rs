@@ -268,6 +268,21 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
         backend = builder_backend_expr,
     );
 
+    // `mem_config` (mem-config-tagging) is inserted into the SELECT list
+    // BEFORE the pre-existing `has_builder_profile`/`has_assistant_profile`
+    // columns, which shifts their ordinal position. `CREATE OR REPLACE VIEW`
+    // requires the existing columns to keep their name AND position (Postgres
+    // only allows appending new columns at the end), so on any DB that
+    // already has a pre-mem_config `model_dual_profile` view, `CREATE OR
+    // REPLACE` fails with "cannot change name of view column ... to ...".
+    // Drop-and-recreate is safe here: this is a computed, FK-free view (no
+    // data of its own), and every known reader selects columns by name, not
+    // position, so a full recreate is transparent to them.
+    sqlx::query("DROP VIEW IF EXISTS model_dual_profile")
+        .execute(pool)
+        .await
+        .map_err(|e| ToolError::Database(format!("drop model_dual_profile view: {e}")))?;
+
     sqlx::query(&view_sql)
         .execute(pool)
         .await
