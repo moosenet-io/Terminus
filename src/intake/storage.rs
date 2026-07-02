@@ -164,6 +164,10 @@ pub struct CodeRunRow {
     pub memory_usage_mb: Option<i32>,
     pub oom: bool,
     pub error: Option<String>,
+    /// Which system configuration ran this case: 'gpu' or 'cpu' (the coder-side
+    /// twin of `assistant_dimension_score.backend_tag`). `None` for rows written
+    /// before this column existed, or by callers that don't yet track it.
+    pub backend_tag: Option<String>,
 }
 
 /// Insert one `code_profile_runs` row.
@@ -176,8 +180,8 @@ pub async fn insert_code_run(
         "INSERT INTO code_profile_runs \
          (profile_id, language, context_tokens, file_count, total_lines, task_type, \
           compiles, tests_pass, planted_bug_found, code_quality_score, \
-          throughput_tok_per_sec, total_time_ms, memory_usage_mb, oom, error) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+          throughput_tok_per_sec, total_time_ms, memory_usage_mb, oom, error, backend_tag) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
     )
     .bind(profile_id)
     .bind(&row.language)
@@ -194,6 +198,7 @@ pub async fn insert_code_run(
     .bind(row.memory_usage_mb)
     .bind(row.oom)
     .bind(row.error.as_deref())
+    .bind(row.backend_tag.as_deref())
     .execute(pool)
     .await
     .map_err(|e| ToolError::Database(format!("Failed to insert code_profile_runs: {e}")))?;
@@ -225,6 +230,10 @@ pub struct CodeRunRowV2 {
     pub total_time_ms: Option<i32>,
     pub oom: bool,
     pub error: Option<String>,
+    /// Which system configuration ran this case: 'gpu' or 'cpu' (the coder-side
+    /// twin of `assistant_dimension_score.backend_tag`). `None` for rows written
+    /// before this column existed, or by callers that don't yet track it.
+    pub backend_tag: Option<String>,
 }
 
 /// Insert one v2 `code_profile_runs` row (harness_version='v2'). Additive — the
@@ -239,8 +248,8 @@ pub async fn insert_code_run_v2(
          (profile_id, harness_version, language, task_type, \
           first_pass_score, retry_score, compiles, tests_pass, change_correct, \
           code_quality_score, context_tokens, response_tokens, file_count, total_lines, \
-          throughput_tok_per_sec, total_time_ms, oom, error) \
-         VALUES ($1, 'v2', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+          throughput_tok_per_sec, total_time_ms, oom, error, backend_tag) \
+         VALUES ($1, 'v2', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
     )
     .bind(profile_id)
     .bind(&row.language)
@@ -259,6 +268,7 @@ pub async fn insert_code_run_v2(
     .bind(row.total_time_ms)
     .bind(row.oom)
     .bind(row.error.as_deref())
+    .bind(row.backend_tag.as_deref())
     .execute(pool)
     .await
     .map_err(|e| ToolError::Database(format!("Failed to insert code_profile_runs (v2): {e}")))?;

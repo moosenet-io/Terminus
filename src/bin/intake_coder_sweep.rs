@@ -304,7 +304,18 @@ async fn run_one_backend(
     // The suite persists one code_profile_runs row per case internally. Any
     // hang/unavailable/OOM surfaces as Err here → recorded as a skip-with-reason
     // (NOT propagated), so one wedged model never stalls the fleet.
-    let outcome = match intake::run_code_suite_v2(&model_id, langs, profile_id, case_limit).await {
+    // `backend.as_str()` yields the short 'gpu'/'cpu' tag (matching the
+    // assistant-side `backend_tag` convention), NOT `override_str` (which is
+    // the longer serving-backend name like "ollama"/"ollama-cpu").
+    let outcome = match intake::run_code_suite_v2(
+        &model_id,
+        langs,
+        profile_id,
+        case_limit,
+        Some(backend.as_str()),
+    )
+    .await
+    {
         Ok(res) => {
             // Durable checkpoint AFTER rows are persisted — resume-safe ordering.
             checkpoint.mark(&key)?;
