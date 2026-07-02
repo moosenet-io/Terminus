@@ -190,11 +190,15 @@ pub trait ScoreSink: Send + Sync {
 pub struct PgScoreSink {
     pool: PgPool,
     run_id: uuid::Uuid,
+    /// Memory-model configuration this run measured under (e.g. `dynamic_gtt`
+    /// vs the preserved `carveout` baseline). `None` writes SQL `NULL` — the
+    /// mem-config-tagging sprint's contract (see [`schema::insert_dimension_score_with_category_and_mem_config`]).
+    mem_config: Option<String>,
 }
 
 impl PgScoreSink {
-    pub fn new(pool: PgPool, run_id: uuid::Uuid) -> Self {
-        PgScoreSink { pool, run_id }
+    pub fn new(pool: PgPool, run_id: uuid::Uuid, mem_config: Option<String>) -> Self {
+        PgScoreSink { pool, run_id, mem_config }
     }
 }
 
@@ -202,9 +206,15 @@ impl PgScoreSink {
 impl ScoreSink for PgScoreSink {
     async fn write(&self, rows: &[DimensionScore]) -> Result<(), String> {
         for row in rows {
-            schema::insert_dimension_score(&self.pool, self.run_id, row)
-                .await
-                .map_err(|e| e.to_string())?;
+            schema::insert_dimension_score_with_category_and_mem_config(
+                &self.pool,
+                self.run_id,
+                row,
+                "assistant",
+                self.mem_config.as_deref(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -214,11 +224,13 @@ impl ScoreSink for PgScoreSink {
 pub struct PgFleetStore {
     pool: PgPool,
     run_id: uuid::Uuid,
+    /// See [`PgScoreSink::mem_config`] — same contract, same run.
+    mem_config: Option<String>,
 }
 
 impl PgFleetStore {
-    pub fn new(pool: PgPool, run_id: uuid::Uuid) -> Self {
-        PgFleetStore { pool, run_id }
+    pub fn new(pool: PgPool, run_id: uuid::Uuid, mem_config: Option<String>) -> Self {
+        PgFleetStore { pool, run_id, mem_config }
     }
 }
 
@@ -227,9 +239,15 @@ impl FleetStore for PgFleetStore {
     async fn insert_membership(&self, row: &DimensionScore) -> Result<(), String> {
         // A plain INSERT — never an UPDATE — so a Lumina row can never clobber a
         // Harmony row (see fleet.rs no-clobber invariant).
-        schema::insert_dimension_score(&self.pool, self.run_id, row)
-            .await
-            .map_err(|e| e.to_string())
+        schema::insert_dimension_score_with_category_and_mem_config(
+            &self.pool,
+            self.run_id,
+            row,
+            "assistant",
+            self.mem_config.as_deref(),
+        )
+        .await
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -442,16 +460,29 @@ pub async fn run() -> Result<RunReport, ToolError> {
     let run_id = schema::insert_run(&pool).await?;
 
     let nominations = Nominations::load().map_err(ToolError::NotConfigured)?;
+    let mem_config = mem_config_from_env();
 
     let acquirer = acquire::ShellAcquirer;
     let driver = LiveSuiteDriver::new();
-    let sink = PgScoreSink::new(pool.clone(), run_id);
+    let sink = PgScoreSink::new(pool.clone(), run_id, mem_config.clone());
     let checkpoint = FileCheckpoint::open()?;
-    let fleet_store = PgFleetStore::new(pool.clone(), run_id);
+    let fleet_store = PgFleetStore::new(pool.clone(), run_id, mem_config);
 
     run_with(&nominations, &acquirer, &driver, &sink, &checkpoint, &fleet_store)
         .await
         .map_err(ToolError::Execution)
+}
+
+/// Read the memory-model configuration tag from the SAME env var the coder
+/// sweep uses (`SWEEP_MEM_CONFIG`) — this describes the physical host's memory
+/// config (e.g. `dynamic_gtt` dynamic-GTT pool vs the preserved `carveout`
+/// baseline), not a sweep-specific setting, so both sweeps share the knob.
+/// A blank value is treated as unset (`None`), never as an empty-string tag.
+fn mem_config_from_env() -> Option<String> {
+    std::env::var("SWEEP_MEM_CONFIG")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Live suite driver: runs the bounded smoke and each real dimension runner under
@@ -627,6 +658,34 @@ mod tests {
         assert_eq!(SUITE_DIMENSIONS.len(), 6);
         assert_eq!(SUITE_DIMENSIONS[0], super::super::dim1_conversation::DIMENSION);
         assert_eq!(SUITE_DIMENSIONS[5], super::super::dim6_embeddings::DIMENSION);
+    }
+
+    // ── mem_config env wiring (mirrors the coder sweep's own test pair) ──
+    // #[serial]: both tests mutate the shared SWEEP_MEM_CONFIG process env var.
+
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn mem_config_from_env_reads_and_trims_set_value() {
+        std::env::set_var("SWEEP_MEM_CONFIG", "  dynamic_gtt  ");
+        assert_eq!(mem_config_from_env(), Some("dynamic_gtt".to_string()));
+        std::env::remove_var("SWEEP_MEM_CONFIG");
+    }
+
+    #[test]
+    #[serial]
+    fn mem_config_from_env_none_when_unset_or_blank() {
+        std::env::remove_var("SWEEP_MEM_CONFIG");
+        assert_eq!(mem_config_from_env(), None);
+
+        std::env::set_var("SWEEP_MEM_CONFIG", "   ");
+        assert_eq!(
+            mem_config_from_env(),
+            None,
+            "a blank value must be treated as unset, not as an empty-string mem_config"
+        );
+        std::env::remove_var("SWEEP_MEM_CONFIG");
     }
 
     // ── in-memory collaborators for hermetic orchestration tests ──

@@ -336,6 +336,49 @@ pub async fn insert_agent_run(
 /// Ensure an operational-profile row exists for `profile_id`. The context suite
 /// normally inserts it; code/agent-only runs need an empty row to patch.
 pub async fn ensure_operational_profile(pool: &PgPool, profile_id: Uuid) -> Result<(), ToolError> {
+    // Self-healing schema guard: `model_operational_profiles` was assumed to be
+    // an S83 pre-existing table (per this module's doc comment), but on at
+    // least one deployed DB it never actually existed — every call here
+    // silently errored, which made `update_op_code`/`update_op_agent` fail,
+    // which in turn made `run_code_suite_v2` return `Err` AFTER its rows were
+    // already durably persisted — so `intake_coder_sweep`'s resume checkpoint
+    // was never marked (S86 / ORC-297). Idempotent `CREATE TABLE IF NOT
+    // EXISTS`, so this is a no-op once the table exists.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS model_operational_profiles ( \
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+            profile_id UUID NOT NULL, \
+            max_context_safe INTEGER, \
+            max_context_absolute INTEGER, \
+            quality_degradation_point INTEGER, \
+            throughput_at_2k DOUBLE PRECISION, \
+            throughput_at_8k DOUBLE PRECISION, \
+            throughput_at_16k DOUBLE PRECISION, \
+            throughput_at_32k DOUBLE PRECISION, \
+            throughput_at_64k DOUBLE PRECISION, \
+            recommended_timeout_chat_sec INTEGER, \
+            recommended_timeout_build_sec INTEGER, \
+            recommended_timeout_deep_sec INTEGER, \
+            overall_tier TEXT, \
+            approved_languages TEXT[], \
+            max_files_good INTEGER, \
+            max_files_marginal INTEGER, \
+            agent_tool_accuracy DOUBLE PRECISION, \
+            agent_multistep_accuracy DOUBLE PRECISION, \
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now() \
+         )",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| ToolError::Database(format!("create model_operational_profiles: {e}")))?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_model_op_profiles_profile_id \
+         ON model_operational_profiles(profile_id)",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| ToolError::Database(format!("create idx_model_op_profiles_profile_id: {e}")))?;
+
     let exists: Option<(Uuid,)> = sqlx::query_as(
         "SELECT id FROM model_operational_profiles WHERE profile_id = $1 LIMIT 1",
     )
