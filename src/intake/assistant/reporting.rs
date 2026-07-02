@@ -113,6 +113,23 @@ impl ScoreRow {
 /// The (model_id, backend_tag) compound key every report row is keyed on — the
 /// SAME key S83 uses (`model_id` + `backend_tag`), so the dual-profile join lines
 /// up. Kept as owned strings to be byte-identical to the stored values.
+///
+/// INVARIANT (mem-config-tagging sprint): this key does **not** include
+/// `mem_config`. `rank_metric`/`best_*` (below) pick the single BEST value per
+/// `ModelKey` across whatever rows they're given. If ever called with rows
+/// that mix the preserved `carveout` baseline and a `dynamic_gtt` sweep for the
+/// SAME (model_id, backend_tag) — i.e. `fetch_scores(pool, None)` (unscoped,
+/// all-runs) with both datasets present — the ranking would silently pick
+/// whichever measurement (carveout or dynamic_gtt) happened to score higher,
+/// blending two different memory configurations into one "best" number.
+/// As of this writing `run_report`/`build_report` have NO live call sites
+/// anywhere in the binary (checked: only `runner.rs` generates a `run_id`, and
+/// it does not call `run_report`; no `bin/` entrypoint does either) — every
+/// path that writes rows always does so under one `run_id`, so this is
+/// currently unreachable in practice. Any FUTURE caller that invokes
+/// `run_report`/`fetch_scores` with `run_id = None` while both `carveout` and
+/// `dynamic_gtt` rows may coexist MUST either scope to a single run_id first,
+/// or extend `ModelKey` to include `mem_config` before doing so.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct ModelKey {
     pub model_id: String,
@@ -720,15 +737,40 @@ pub fn build_report(
 }
 
 /// One row of the `model_dual_profile` view — the S83 builder side and the S84
-/// assistant side joined on (model_id, backend_tag).
+/// assistant side joined on (model_id, backend_tag, mem_config).
+///
+/// `mem_config` is REQUIRED reading here, not cosmetic: the view now emits one
+/// row per (model_id, backend_tag, mem_config) (mem-config-tagging sprint), so
+/// once a model has been measured under both the preserved `carveout` baseline
+/// (`mem_config IS NULL`) and a new `dynamic_gtt` sweep, TWO rows with an
+/// otherwise-identical model/backend pair can appear here with different
+/// quality/value numbers. Without surfacing `mem_config`, those two rows are
+/// visually indistinguishable in the report — exactly the blending bug this
+/// column exists to prevent, relocated to the reporting layer.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DualProfileRow {
     pub model_id: String,
     pub backend_tag: Option<String>,
+    /// Which memory-model configuration this row was measured under
+    /// (`"dynamic_gtt"` etc.), or `None` for the preserved `carveout` baseline
+    /// (rows written before this column existed — see `schema.rs`'s migration
+    /// comment; NEVER backfilled/relabeled). Rendered as `"carveout"` in the
+    /// report, the same term used everywhere else in this codebase for the
+    /// unlabeled baseline dataset.
+    pub mem_config: Option<String>,
     pub has_builder_profile: bool,
     pub has_assistant_profile: bool,
     pub builder_avg_quality: Option<f64>,
     pub assistant_avg_value: Option<f64>,
+}
+
+/// Human-readable label for a `mem_config` value in report output. `None`
+/// (the preserved pre-mem-config-tagging baseline) renders as `"carveout"` —
+/// the same term `schema.rs`'s migration comments and `intake_coder_sweep.rs`
+/// use for that dataset, kept consistent here rather than inventing a new
+/// synonym like "unspecified".
+fn mem_config_label(mem_config: &Option<String>) -> &str {
+    mem_config.as_deref().unwrap_or("carveout")
 }
 
 // ===========================================================================
@@ -842,13 +884,18 @@ pub fn render_markdown(report: &AssistantReport) -> String {
     s.push('\n');
 
     // ── Dual-profile side-by-side ──
+    // `mem_config` is a required column here (not decoration): the view emits
+    // one row per (model_id, backend_tag, mem_config), so a model measured
+    // under both `carveout` and `dynamic_gtt` surfaces as two rows that would
+    // otherwise be indistinguishable in this table.
     s.push_str("## Builder vs assistant (model_dual_profile)\n\n");
-    s.push_str("| model | backend | builder? | assistant? | builder_avg_quality | assistant_avg_value |\n|---|---|---|---|---|---|\n");
+    s.push_str("| model | backend | mem_config | builder? | assistant? | builder_avg_quality | assistant_avg_value |\n|---|---|---|---|---|---|---|\n");
     for d in &report.dual_profile {
         s.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} |\n",
             d.model_id,
             d.backend_tag.as_deref().unwrap_or("—"),
+            mem_config_label(&d.mem_config),
             if d.has_builder_profile { "✓" } else { "—" },
             if d.has_assistant_profile { "✓" } else { "—" },
             d.builder_avg_quality
@@ -938,11 +985,15 @@ pub mod sql {
         ORDER BY value DESC, model_id ASC";
 
     /// The side-by-side builder-vs-assistant rows from the dual-profile view.
+    /// `mem_config` is selected and ordered on alongside `backend_tag` because
+    /// the view now emits one row per (model_id, backend_tag, mem_config) —
+    /// dropping it here would silently re-introduce the carveout/dynamic_gtt
+    /// blending bug at the reporting layer (see [`DualProfileRow`]).
     pub const FETCH_DUAL_PROFILE: &str = "\
-        SELECT model_id, backend_tag, has_builder_profile, has_assistant_profile, \
+        SELECT model_id, backend_tag, mem_config, has_builder_profile, has_assistant_profile, \
                builder_avg_quality, assistant_avg_value \
         FROM model_dual_profile \
-        ORDER BY model_id, backend_tag";
+        ORDER BY model_id, backend_tag, mem_config";
 }
 
 /// Fetch every assistant score row for a run (NULL ⇒ all runs) from the live DB.
@@ -981,6 +1032,7 @@ pub async fn fetch_dual_profile(pool: &PgPool) -> Result<Vec<DualProfileRow>, To
         .map(|r| DualProfileRow {
             model_id: r.get("model_id"),
             backend_tag: r.get("backend_tag"),
+            mem_config: r.get("mem_config"),
             has_builder_profile: r.get("has_builder_profile"),
             has_assistant_profile: r.get("has_assistant_profile"),
             builder_avg_quality: r.get("builder_avg_quality"),
@@ -1021,6 +1073,60 @@ mod tests {
         assert_eq!(dims::PROXIMITY_TO_LUMINA, "proximity_to_lumina");
         assert_eq!(dims::PERSONALITY_PROMPTED, "personality_prompted");
         assert_eq!(dims::EMBEDDINGS, "embeddings");
+    }
+
+    #[test]
+    fn dual_profile_report_keeps_carveout_and_dynamic_gtt_distinct() {
+        // Regression for the reporting-layer twin of the mem-config-tagging
+        // bug: `model_dual_profile` now emits one row per (model_id,
+        // backend_tag, mem_config), so the SAME model_id+backend_tag pair can
+        // legitimately appear twice — once under the preserved `carveout`
+        // baseline (mem_config = None) and once under a `dynamic_gtt` sweep.
+        // The report must show these as two distinct, labeled rows, never
+        // merge or silently pick one.
+        let dual_profile = vec![
+            DualProfileRow {
+                model_id: "qwen3-coder:30b".into(),
+                backend_tag: Some("gpu".into()),
+                mem_config: None, // preserved carveout baseline
+                has_builder_profile: true,
+                has_assistant_profile: true,
+                builder_avg_quality: Some(0.900),
+                assistant_avg_value: Some(4.10),
+            },
+            DualProfileRow {
+                model_id: "qwen3-coder:30b".into(),
+                backend_tag: Some("gpu".into()),
+                mem_config: Some("dynamic_gtt".into()),
+                has_builder_profile: true,
+                has_assistant_profile: true,
+                builder_avg_quality: Some(0.750),
+                assistant_avg_value: Some(3.20),
+            },
+        ];
+
+        let report = build_report(&[], dual_profile, &ReportConfig::default());
+        let md = render_markdown(&report);
+
+        // Both rows are present...
+        assert!(
+            md.contains("qwen3-coder:30b | gpu | carveout"),
+            "carveout row missing/mislabeled in report:\n{md}"
+        );
+        assert!(
+            md.contains("qwen3-coder:30b | gpu | dynamic_gtt"),
+            "dynamic_gtt row missing/mislabeled in report:\n{md}"
+        );
+        // ...and distinguishable — the carveout and dynamic_gtt lines carry
+        // their OWN numbers, not a blended/merged value.
+        assert!(
+            md.contains("qwen3-coder:30b | gpu | carveout | ✓ | ✓ | 0.900 | 4.100"),
+            "carveout row values not rendered distinctly:\n{md}"
+        );
+        assert!(
+            md.contains("qwen3-coder:30b | gpu | dynamic_gtt | ✓ | ✓ | 0.750 | 3.200"),
+            "dynamic_gtt row values not rendered distinctly:\n{md}"
+        );
     }
 
     #[test]

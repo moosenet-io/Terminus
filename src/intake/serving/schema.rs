@@ -155,16 +155,64 @@ async fn create_full_profile_view(pool: &PgPool) -> Result<(), ToolError> {
         "NULL::text"
     };
 
+    // Same defensive pattern as builder_has_backend_tag immediately above: guard
+    // `cpr.mem_config` too. Both `backend_tag` and `mem_config` are added to
+    // `code_profile_runs` ONLY inside `assistant::schema::migrate()`, and this
+    // module's own `migrate()` does not call that first — so on a DB where
+    // `code_profile_runs` exists but the assistant migration hasn't run yet,
+    // an unguarded `cpr.mem_config` reference would make `CREATE VIEW
+    // model_full_profile` hard-fail with "column cpr.mem_config does not
+    // exist" before the backend_tag degradation above even gets a chance to
+    // help.
+    let builder_has_mem_config = column_exists(pool, "code_profile_runs", "mem_config").await?;
+    let builder_mem_config_expr = if builder_has_mem_config {
+        "cpr.mem_config"
+    } else {
+        "NULL::text"
+    };
+
+    // mem-config-tagging DECISION (documented here, not just in the build
+    // report, so a future reader sees the reasoning at the code site):
+    //
+    //   `builder` (from `code_profile_runs`) DOES get `mem_config` added to
+    //   its GROUP BY, surfaced as `builder_mem_config`. This is SAFE because
+    //   this view's outer join keys ONLY on `model_id` (see the module doc
+    //   comment: the three sides use incompatible backend-tag vocabularies,
+    //   so keying is deliberately loose) and `assistant`/`serving` are each
+    //   single-row-per-model_id "broadcast" across however many `builder`
+    //   rows exist — exactly the same fan-out `builder_backend_tag` already
+    //   causes today when a model has both a gpu and a cpu builder row.
+    //   Adding `mem_config` is the same accepted pattern extended to a new
+    //   axis: it stops `builder_avg_quality` from silently blending the
+    //   preserved `carveout` baseline with tonight's `dynamic_gtt` rows.
+    //
+    //   `assistant` (from `assistant_dimension_score`) is DELIBERATELY LEFT
+    //   UNCHANGED — grouped by `model_id` only, still coarse. Splitting it by
+    //   `mem_config` too would NOT be safe here: it would turn `assistant`
+    //   from a single broadcast row into N rows per model_id, and because the
+    //   join key is `model_id` only (not mem_config), that would cross-join
+    //   against `builder`'s (also-now-multi-row) rows — pairing a
+    //   `dynamic_gtt` builder row with a `carveout` assistant row in some
+    //   output rows. That would be a NEW, worse blending bug (wrong-pairing),
+    //   not a fix. `model_dual_profile` (the granular, backend_tag- and now
+    //   mem_config-keyed view in `assistant::schema`) is the correct place
+    //   for exact per-mem_config assistant reconciliation; this view's job is
+    //   the coarser "does this model have ANY profile" rollup, and it already
+    //   accepted a coarser blend on the assistant side (across backend_tag)
+    //   before this change. Follow-up if per-mem_config assistant granularity
+    //   is ever needed here: promote `mem_config` (and `backend_tag`) to a
+    //   real join key across all three CTEs, not just `builder`.
     let view_sql = format!(
         "CREATE OR REPLACE VIEW model_full_profile AS \
          WITH builder AS ( \
              SELECT mp.model_name AS model_id, \
                     {backend} AS builder_backend_tag, \
+                    {mem_config} AS builder_mem_config, \
                     count(cpr.*) AS builder_run_count, \
                     avg(cpr.code_quality_score) AS builder_avg_quality \
              FROM model_profiles mp \
              LEFT JOIN code_profile_runs cpr ON cpr.profile_id = mp.id \
-             GROUP BY mp.model_name, {backend} \
+             GROUP BY mp.model_name, {backend}, {mem_config} \
          ), \
          assistant AS ( \
              SELECT model_id, \
@@ -194,6 +242,7 @@ async fn create_full_profile_view(pool: &PgPool) -> Result<(), ToolError> {
                 (a.model_id IS NOT NULL) AS has_assistant_profile, \
                 (s.model_id IS NOT NULL) AS has_serving_profile, \
                 b.builder_backend_tag, \
+                b.builder_mem_config, \
                 b.builder_run_count, \
                 b.builder_avg_quality, \
                 a.assistant_score_count, \
@@ -206,6 +255,7 @@ async fn create_full_profile_view(pool: &PgPool) -> Result<(), ToolError> {
          LEFT JOIN assistant a ON a.model_id = k.model_id \
          LEFT JOIN serving s ON s.model_id = k.model_id",
         backend = builder_backend_expr,
+        mem_config = builder_mem_config_expr,
     );
 
     sqlx::query(&view_sql)
@@ -446,6 +496,192 @@ mod tests {
             .await;
         let _ = sqlx::query("DELETE FROM assistant_profile_run WHERE id = $1")
             .bind(run_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// Regression test for mem-config-tagging: `model_full_profile`'s `builder`
+    /// CTE (over `code_profile_runs`) must key on `mem_config` in addition to
+    /// `backend_tag`, so two builder rows for the SAME model_id/backend but
+    /// DIFFERENT `mem_config` ("dynamic_gtt" vs "carveout") surface as
+    /// SEPARATE `builder_avg_quality` rows, never one blended average.
+    ///
+    /// Gated on a reachable Postgres, same convention as the sibling test.
+    #[tokio::test]
+    async fn builder_mem_config_keeps_different_configs_from_blending() {
+        let pool = match get_pool().await {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!(
+                    "skipping builder_mem_config_keeps_different_configs_from_blending: \
+                     no INTAKE_DATABASE_URL/DATABASE_URL configured"
+                );
+                return;
+            }
+        };
+        if crate::intake::assistant::schema::migrate(&pool).await.is_err() {
+            eprintln!(
+                "skipping builder_mem_config_keeps_different_configs_from_blending: \
+                 assistant schema migrate() failed (DB unreachable or not provisioned)"
+            );
+            return;
+        }
+        if migrate(&pool).await.is_err() {
+            eprintln!(
+                "skipping builder_mem_config_keeps_different_configs_from_blending: \
+                 serving schema migrate() failed (DB unreachable or not provisioned)"
+            );
+            return;
+        }
+
+        let model_name = format!("mem-config-full-profile-regress-{}", uuid::Uuid::new_v4());
+        let profile_id = crate::intake::storage::insert_model_profile(
+            &pool,
+            &model_name,
+            "test-provider",
+            None,
+            None,
+        )
+        .await
+        .expect("insert_model_profile");
+
+        // KNOWN-BAD scenario (must NOT blend): same model, same backend_tag,
+        // different mem_config, wildly different quality scores.
+        let dynamic_row = crate::intake::storage::CodeRunRow {
+            language: "rust".to_string(),
+            code_quality_score: Some(5.0),
+            backend_tag: Some("gpu".to_string()),
+            ..Default::default()
+        };
+        crate::intake::storage::insert_code_run(&pool, profile_id, &dynamic_row)
+            .await
+            .expect("insert dynamic_gtt code run");
+        sqlx::query("UPDATE code_profile_runs SET mem_config = 'dynamic_gtt' \
+                     WHERE profile_id = $1 AND code_quality_score = 5.0")
+            .bind(profile_id)
+            .execute(&pool)
+            .await
+            .expect("tag dynamic_gtt row");
+
+        let carveout_row = crate::intake::storage::CodeRunRow {
+            language: "rust".to_string(),
+            code_quality_score: Some(1.0),
+            backend_tag: Some("gpu".to_string()),
+            ..Default::default()
+        };
+        crate::intake::storage::insert_code_run(&pool, profile_id, &carveout_row)
+            .await
+            .expect("insert carveout code run");
+        sqlx::query("UPDATE code_profile_runs SET mem_config = 'carveout' \
+                     WHERE profile_id = $1 AND code_quality_score = 1.0")
+            .bind(profile_id)
+            .execute(&pool)
+            .await
+            .expect("tag carveout row");
+
+        let rows: Vec<(Option<String>, i64, f64)> = sqlx::query_as(
+            "SELECT builder_mem_config, builder_run_count, builder_avg_quality \
+             FROM model_full_profile WHERE model_id = $1 ORDER BY builder_mem_config",
+        )
+        .bind(&model_name)
+        .fetch_all(&pool)
+        .await
+        .expect("query model_full_profile");
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "expected two SEPARATE builder rows (one per mem_config), not one blended row — got {rows:?}"
+        );
+        for (mem_config, count, avg_quality) in &rows {
+            assert_eq!(*count, 1);
+            match mem_config.as_deref() {
+                Some("dynamic_gtt") => assert!((avg_quality - 5.0).abs() < 1e-9),
+                Some("carveout") => assert!((avg_quality - 1.0).abs() < 1e-9),
+                other => panic!("unexpected mem_config value: {other:?}"),
+            }
+        }
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM code_profile_runs WHERE profile_id = $1")
+            .bind(profile_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM model_profiles WHERE id = $1")
+            .bind(profile_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// Regression test for the `builder_has_mem_config` guard added alongside
+    /// this fix: `column_exists` must correctly report both "column absent"
+    /// and "column present" for `mem_config`, since `create_full_profile_view`
+    /// picks between `cpr.mem_config` and `NULL::text` based solely on that
+    /// probe. This is the same defensive pattern `builder_has_backend_tag`
+    /// already relies on (S84) — `mem_config` needed the identical guard
+    /// because `serving::schema::migrate()` never calls
+    /// `assistant::schema::migrate()` (the only place that adds the column to
+    /// `code_profile_runs`), so a DB that has run serving's migrate but not
+    /// assistant's would otherwise hit "column cpr.mem_config does not exist"
+    /// when `CREATE VIEW model_full_profile` runs.
+    ///
+    /// This deliberately probes a throwaway, uniquely-named scratch table
+    /// (created and dropped entirely within this test) rather than mutating
+    /// the shared `code_profile_runs` table: dropping/re-adding a column on
+    /// that table would risk clobbering real harness data for any other
+    /// concurrently-running test or process against the same DB. The
+    /// "column present" side of the view's behavior (mem_config correctly
+    /// populated / not blended) is already covered end-to-end by
+    /// `builder_mem_config_keeps_different_configs_from_blending` above.
+    ///
+    /// Gated on a reachable Postgres, same convention as the sibling tests.
+    #[tokio::test]
+    async fn column_exists_detects_absent_and_present_mem_config() {
+        let pool = match get_pool().await {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!(
+                    "skipping column_exists_detects_absent_and_present_mem_config: \
+                     no INTAKE_DATABASE_URL/DATABASE_URL configured"
+                );
+                return;
+            }
+        };
+
+        let table = format!("mem_config_guard_probe_{}", uuid::Uuid::new_v4().simple());
+
+        // Scratch table, no mem_config column yet — mirrors the pre-assistant-
+        // migrate shape of code_profile_runs that the guard must tolerate.
+        sqlx::query(&format!(
+            "CREATE TABLE {table} (id BIGSERIAL PRIMARY KEY, backend_tag TEXT)"
+        ))
+        .execute(&pool)
+        .await
+        .expect("create scratch table");
+
+        assert!(
+            !column_exists(&pool, &table, "mem_config")
+                .await
+                .expect("probe absent mem_config"),
+            "column_exists must report false before the column is added — this is the exact \
+             condition builder_has_mem_config guards against"
+        );
+
+        sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN mem_config TEXT"))
+            .execute(&pool)
+            .await
+            .expect("add mem_config column");
+
+        assert!(
+            column_exists(&pool, &table, "mem_config")
+                .await
+                .expect("probe present mem_config"),
+            "column_exists must report true once the column exists, so builder_mem_config_expr \
+             switches from NULL::text to cpr.mem_config"
+        );
+
+        // Cleanup: drop the scratch table entirely (nothing shared is touched).
+        let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
             .execute(&pool)
             .await;
     }

@@ -87,6 +87,19 @@ fn case_limit_from_env() -> Option<usize> {
         .filter(|n| *n > 0)
 }
 
+/// Which memory-model configuration THIS sweep run is executing against
+/// (e.g. `"dynamic_gtt"` or `"carveout"`), from `SWEEP_MEM_CONFIG`
+/// (mem-config-tagging sprint). `None` when unset — every row written by
+/// this run is then persisted with `mem_config = NULL`, same as any row
+/// written before this column existed. Trimmed and treated as unset when
+/// empty, matching `langs_from_env`'s tolerance for a blank env var.
+fn mem_config_from_env() -> Option<String> {
+    std::env::var("SWEEP_MEM_CONFIG")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 // ===========================================================================
 // Fleet (nominations) loading — reuses the assistant Nominations shape
 // ===========================================================================
@@ -256,6 +269,7 @@ async fn run_one_backend(
     case_limit: Option<usize>,
     checkpoint: &CodeCheckpoint,
     done: &BTreeSet<CodeCheckpointKey>,
+    mem_config: Option<&str>,
 ) -> Result<BackendReport, ToolError> {
     let model_id = nom.id.clone();
     let key = CodeCheckpointKey::new(&model_id, backend);
@@ -314,6 +328,7 @@ async fn run_one_backend(
         profile_id,
         case_limit,
         Some(backend.as_str()),
+        mem_config,
     )
     .await
     {
@@ -347,6 +362,7 @@ async fn run_fleet(
     langs: &[String],
     case_limit: Option<usize>,
     checkpoint: &CodeCheckpoint,
+    mem_config: Option<&str>,
 ) -> Result<Vec<BackendReport>, ToolError> {
     let done = checkpoint.done();
     let mut reports = Vec::new();
@@ -363,7 +379,7 @@ async fn run_fleet(
                 (_, other) => other,
             };
             let report = run_one_backend(
-                nom, backend_tag, override_str, langs, case_limit, checkpoint, &done,
+                nom, backend_tag, override_str, langs, case_limit, checkpoint, &done, mem_config,
             )
             .await?;
             reports.push(report);
@@ -441,6 +457,7 @@ fn print_report(reports: &[BackendReport]) {
 async fn main() -> std::process::ExitCode {
     let langs = langs_from_env();
     let case_limit = case_limit_from_env();
+    let mem_config = mem_config_from_env();
 
     let fleet = match load_fleet() {
         Ok(f) => f,
@@ -482,14 +499,15 @@ async fn main() -> std::process::ExitCode {
     }
 
     eprintln!(
-        "coder sweep starting: {} models, langs={}, case_limit={:?}, checkpoint={}",
+        "coder sweep starting: {} models, langs={}, case_limit={:?}, mem_config={}, checkpoint={}",
         fleet.nominations.len(),
         if langs.is_empty() { "all".into() } else { langs.join(",") },
         case_limit,
+        mem_config.as_deref().unwrap_or("(unset — rows land with mem_config=NULL)"),
         checkpoint.path,
     );
 
-    match run_fleet(&fleet, &langs, case_limit, &checkpoint).await {
+    match run_fleet(&fleet, &langs, case_limit, &checkpoint, mem_config.as_deref()).await {
         Ok(reports) => {
             print_report(&reports);
             std::process::ExitCode::SUCCESS
@@ -571,6 +589,29 @@ mod tests {
         assert_eq!(parse("5"), Some(5));
         assert_eq!(parse("0"), None);
         assert_eq!(parse("abc"), None);
+    }
+
+    // ---- mem_config env threading (mem-config-tagging) ----
+
+    #[test]
+    fn mem_config_from_env_reads_and_trims_set_value() {
+        std::env::set_var("SWEEP_MEM_CONFIG", "  dynamic_gtt  ");
+        assert_eq!(mem_config_from_env(), Some("dynamic_gtt".to_string()));
+        std::env::remove_var("SWEEP_MEM_CONFIG");
+    }
+
+    #[test]
+    fn mem_config_from_env_none_when_unset_or_blank() {
+        std::env::remove_var("SWEEP_MEM_CONFIG");
+        assert_eq!(mem_config_from_env(), None);
+
+        std::env::set_var("SWEEP_MEM_CONFIG", "   ");
+        assert_eq!(
+            mem_config_from_env(),
+            None,
+            "a blank value must be treated as unset, not as an empty-string mem_config"
+        );
+        std::env::remove_var("SWEEP_MEM_CONFIG");
     }
 
     // ---- pre-flight VRAM skip (pure) ----

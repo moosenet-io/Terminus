@@ -320,6 +320,7 @@ fn dual_profile_rows_render_in_report() {
         DualProfileRow {
             model_id: "alpha:8b".into(),
             backend_tag: Some("gpu".into()),
+            mem_config: None,
             has_builder_profile: true,
             has_assistant_profile: true,
             builder_avg_quality: Some(0.7),
@@ -328,6 +329,7 @@ fn dual_profile_rows_render_in_report() {
         DualProfileRow {
             model_id: "lonely:builder".into(),
             backend_tag: Some("cpu".into()),
+            mem_config: None,
             has_builder_profile: true,
             has_assistant_profile: false,
             builder_avg_quality: Some(0.6),
@@ -340,4 +342,46 @@ fn dual_profile_rows_render_in_report() {
     assert!(md.contains("lonely:builder"));
     // builder-only model shows builder ✓, assistant — (visible, not dropped).
     assert_eq!(report.dual_profile.len(), 2);
+}
+
+#[test]
+fn dual_profile_distinguishes_carveout_from_dynamic_gtt_for_same_model() {
+    // Twin of the mem-config-tagging bug at the reporting layer: the SAME
+    // (model_id, backend_tag) pair can appear twice in `model_dual_profile`
+    // once a model has been measured under both the preserved `carveout`
+    // baseline (mem_config = None) and a `dynamic_gtt` sweep. The report must
+    // render these as two distinct, labeled rows — never merged, never
+    // ambiguous.
+    let dual = vec![
+        DualProfileRow {
+            model_id: "alpha:8b".into(),
+            backend_tag: Some("gpu".into()),
+            mem_config: None,
+            has_builder_profile: true,
+            has_assistant_profile: true,
+            builder_avg_quality: Some(0.900),
+            assistant_avg_value: Some(4.10),
+        },
+        DualProfileRow {
+            model_id: "alpha:8b".into(),
+            backend_tag: Some("gpu".into()),
+            mem_config: Some("dynamic_gtt".into()),
+            has_builder_profile: true,
+            has_assistant_profile: true,
+            builder_avg_quality: Some(0.750),
+            assistant_avg_value: Some(3.20),
+        },
+    ];
+    let report = build_report(&[], dual, &ReportConfig::default());
+    let md = reporting::render_markdown(&report);
+
+    assert_eq!(report.dual_profile.len(), 2, "both rows must survive, not collapse into one");
+    assert!(
+        md.contains("alpha:8b | gpu | carveout | ✓ | ✓ | 0.900 | 4.100"),
+        "carveout row not rendered distinctly:\n{md}"
+    );
+    assert!(
+        md.contains("alpha:8b | gpu | dynamic_gtt | ✓ | ✓ | 0.750 | 3.200"),
+        "dynamic_gtt row not rendered distinctly:\n{md}"
+    );
 }
