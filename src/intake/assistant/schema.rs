@@ -222,7 +222,7 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
 /// whether S83's builder table already carries `backend_tag` (P5+) or not.
 async fn column_exists(pool: &PgPool, table: &str, column: &str) -> Result<bool, ToolError> {
     let row: Option<(i64,)> = sqlx::query_as(
-        "SELECT 1 FROM information_schema.columns \
+        "SELECT 1::bigint FROM information_schema.columns \
          WHERE table_name = $1 AND column_name = $2 LIMIT 1",
     )
     .bind(table)
