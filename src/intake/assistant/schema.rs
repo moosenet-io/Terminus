@@ -162,6 +162,16 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
     //    still appears (key set = UNION of both sides' model_ids), and so a
     //    missing builder `backend_tag` column degrades to NULL rather than
     //    erroring at view-create time.
+    //
+    //    CRITICAL (MINT new-model-types fix): the `assistant` CTE below filters
+    //    `WHERE task_category = 'assistant'`. `assistant_dimension_score` now
+    //    also hosts document_parsing/image_parsing/image_generation/
+    //    voice_transcription rows (see `newcats`), which use incompatible value
+    //    scales (0-1 accuracy vs. millisecond latencies vs. unbounded WER vs.
+    //    VRAM MB) and must NOT be folded into `assistant_score_count` /
+    //    `assistant_avg_value` — without this filter, a vision/ASR/image-gen-
+    //    only model would wrongly show `has_assistant_profile = true` and
+    //    `assistant_avg_value` would blend nonsense across scales.
     let builder_has_backend_tag = column_exists(pool, "code_profile_runs", "backend_tag").await?;
     let builder_backend_expr = if builder_has_backend_tag {
         "cpr.backend_tag"
@@ -185,6 +195,7 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
                     count(*) AS assistant_score_count, \
                     avg(value) AS assistant_avg_value \
              FROM assistant_dimension_score \
+             WHERE task_category = 'assistant' \
              GROUP BY model_id, backend_tag \
          ), \
          keys AS ( \
@@ -248,12 +259,35 @@ pub async fn insert_run(pool: &PgPool) -> Result<uuid::Uuid, ToolError> {
     Ok(id)
 }
 
-/// Insert one aggregated [`DimensionScore`] against a run. The canonical write
-/// path for ASMT-02..07.
+/// Insert one aggregated [`DimensionScore`] against a run, tagged with
+/// `task_category = "assistant"`. The canonical write path for ASMT-02..07.
+///
+/// Thin wrapper over [`insert_dimension_score_with_category`] — zero behavior
+/// change for every existing caller (dim1..dim6 runners), which never pass a
+/// category and always meant "assistant".
 pub async fn insert_dimension_score(
     pool: &PgPool,
     run_id: uuid::Uuid,
     score: &DimensionScore,
+) -> Result<(), ToolError> {
+    insert_dimension_score_with_category(pool, run_id, score, "assistant").await
+}
+
+/// Insert one aggregated [`DimensionScore`] against a run, tagged with an
+/// explicit `task_category` (MINT new-model-types extension).
+///
+/// The `assistant_dimension_score` table's `task_category` column is
+/// deliberately unconstrained (see [`migrate`]'s doc comment) so any new
+/// benchmarking category — `"document_parsing"`, `"image_parsing"`,
+/// `"image_generation"`, `"voice_transcription"`, etc. — writes through this
+/// same flexible (dimension, metric, value, judge, raw_json) shape without a
+/// schema change. [`insert_dimension_score`] is the `"assistant"`-tagged
+/// special case of this function, kept for source compatibility.
+pub async fn insert_dimension_score_with_category(
+    pool: &PgPool,
+    run_id: uuid::Uuid,
+    score: &DimensionScore,
+    task_category: &str,
 ) -> Result<(), ToolError> {
     let raw: Option<serde_json::Value> = match &score.raw_json {
         Some(s) => Some(
@@ -265,8 +299,8 @@ pub async fn insert_dimension_score(
     sqlx::query(
         "INSERT INTO assistant_dimension_score \
          (run_id, model_id, backend_tag, dimension, metric, value, std_dev, judge, \
-          low_confidence, raw_json) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+          low_confidence, raw_json, task_category) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(run_id)
     .bind(score.model_id.as_str())
@@ -278,6 +312,7 @@ pub async fn insert_dimension_score(
     .bind(&score.judge)
     .bind(score.low_confidence)
     .bind(raw)
+    .bind(task_category)
     .execute(pool)
     .await
     .map_err(|e| ToolError::Database(format!("insert assistant_dimension_score: {e}")))?;
@@ -343,6 +378,110 @@ mod tests {
     #[test]
     fn harness_version_is_stamped() {
         assert_eq!(HARNESS_VERSION, "s84-asmt-01");
+    }
+
+    /// Regression test for the MINT new-model-types fix: `model_dual_profile`'s
+    /// `assistant` CTE must filter `task_category = 'assistant'`, so a
+    /// non-assistant row (e.g. `document_parsing`) for the same
+    /// (model_id, backend_tag) does NOT get folded into
+    /// `assistant_score_count` / `assistant_avg_value`. Without the filter,
+    /// `assistant_score_count` would be 2 (not 1) and `assistant_avg_value`
+    /// would blend a 1-5 panel score with a millisecond latency into a
+    /// meaningless number.
+    ///
+    /// Gated on a reachable Postgres: skips (passes trivially) when neither
+    /// `INTAKE_DATABASE_URL` nor `DATABASE_URL` is configured, so it stays
+    /// green in environments (like tonight's) with no live DB, while still
+    /// running for real whenever one is available.
+    #[tokio::test]
+    async fn assistant_aggregate_excludes_other_task_categories() {
+        let pool = match get_pool().await {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!(
+                    "skipping assistant_aggregate_excludes_other_task_categories: \
+                     no INTAKE_DATABASE_URL/DATABASE_URL configured"
+                );
+                return;
+            }
+        };
+        if migrate(&pool).await.is_err() {
+            eprintln!(
+                "skipping assistant_aggregate_excludes_other_task_categories: \
+                 migrate() failed (DB unreachable or not provisioned)"
+            );
+            return;
+        }
+
+        let run_id = insert_run(&pool).await.expect("insert_run");
+        let model_id = ModelId::from(format!("mint-newcat-regress-test-{}", uuid::Uuid::new_v4()));
+        let backend = BackendTag::Gpu;
+
+        // One legitimate assistant-category row (panel-scored, 1-5 scale).
+        let assistant_row = DimensionScore {
+            model_id: model_id.clone(),
+            backend_tag: backend,
+            dimension: "instruction_following".to_string(),
+            metric: "concision".to_string(),
+            value: 4.0,
+            std_dev: None,
+            judge: "panel".to_string(),
+            low_confidence: false,
+            raw_json: None,
+        };
+        insert_dimension_score(&pool, run_id, &assistant_row)
+            .await
+            .expect("insert assistant row");
+
+        // One document_parsing row for the SAME (model_id, backend_tag), value
+        // on a totally different scale (a millisecond latency) — must NOT be
+        // folded into the assistant aggregate.
+        let docparse_row = DimensionScore {
+            model_id: model_id.clone(),
+            backend_tag: backend,
+            dimension: "ocr_extraction".to_string(),
+            metric: "latency_ms".to_string(),
+            value: 5000.0,
+            std_dev: None,
+            judge: "derived".to_string(),
+            low_confidence: false,
+            raw_json: None,
+        };
+        insert_dimension_score_with_category(&pool, run_id, &docparse_row, "document_parsing")
+            .await
+            .expect("insert document_parsing row");
+
+        let (count, avg_value): (i64, f64) = sqlx::query_as(
+            "SELECT assistant_score_count, assistant_avg_value FROM model_dual_profile \
+             WHERE model_id = $1 AND backend_tag = $2",
+        )
+        .bind(model_id.as_str())
+        .bind(backend.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("query model_dual_profile");
+
+        assert_eq!(
+            count, 1,
+            "assistant_score_count must only count the assistant-category row, not the \
+             document_parsing row"
+        );
+        assert!(
+            (avg_value - 4.0).abs() < 1e-9,
+            "assistant_avg_value must stay at the assistant row's own value (4.0), not blend in \
+             the document_parsing row's 5000.0 latency — got {avg_value}"
+        );
+
+        // Cleanup: this test's rows are scoped to a unique model_id, so this
+        // only ever removes what this test run inserted.
+        let _ = sqlx::query("DELETE FROM assistant_dimension_score WHERE model_id = $1")
+            .bind(model_id.as_str())
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM assistant_profile_run WHERE id = $1")
+            .bind(run_id)
+            .execute(&pool)
+            .await;
     }
 
     #[test]

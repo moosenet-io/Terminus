@@ -136,6 +136,16 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
 /// The key set is the UNION of every side's model_ids, so a model present in ANY
 /// subset (any one, any two, or all three) appears exactly once.
 async fn create_full_profile_view(pool: &PgPool) -> Result<(), ToolError> {
+    // CRITICAL (MINT new-model-types fix, twin of the model_dual_profile fix in
+    // `assistant::schema`): the `assistant` CTE below filters
+    // `WHERE task_category = 'assistant'`. `assistant_dimension_score` now also
+    // hosts document_parsing/image_parsing/image_generation/voice_transcription
+    // rows (see `intake::newcats`), whose values live on incompatible scales
+    // (0-1 accuracy vs. millisecond latencies vs. unbounded WER vs. VRAM MB) and
+    // must NOT be folded into `assistant_score_count` / `assistant_avg_value` —
+    // without this filter a vision/ASR/image-gen-only model would wrongly show
+    // `has_assistant_profile = true` here too.
+    //
     // Reuse S84's catalog probe so the builder backend tag degrades to NULL when
     // the early S83 schema lacks the column (same defensive pattern).
     let builder_has_backend_tag = column_exists(pool, "code_profile_runs", "backend_tag").await?;
@@ -161,6 +171,7 @@ async fn create_full_profile_view(pool: &PgPool) -> Result<(), ToolError> {
                     count(*) AS assistant_score_count, \
                     avg(value) AS assistant_avg_value \
              FROM assistant_dimension_score \
+             WHERE task_category = 'assistant' \
              GROUP BY model_id \
          ), \
          serving AS ( \
@@ -314,5 +325,128 @@ mod tests {
             provenance: None,
         };
         assert!(bad.validate().is_err());
+    }
+
+    /// Regression test for the MINT new-model-types fix, twin of
+    /// `assistant::schema::tests::assistant_aggregate_excludes_other_task_categories`:
+    /// `model_full_profile`'s `assistant` CTE must filter
+    /// `task_category = 'assistant'`, so a non-assistant row (e.g.
+    /// `document_parsing`) for the same `model_id` does NOT get folded into
+    /// `assistant_score_count` / `assistant_avg_value`. This is the template for
+    /// catching this bug class if a third view is ever added.
+    ///
+    /// Gated on a reachable Postgres: skips (passes trivially) when neither
+    /// `INTAKE_DATABASE_URL` nor `DATABASE_URL` is configured — view-level SQL
+    /// genuinely can only be verified against real Postgres, so there is no
+    /// DB-free equivalent of this assertion. Still wired to actually exercise
+    /// the fix end-to-end whenever a pool is reachable.
+    #[tokio::test]
+    async fn full_profile_view_excludes_other_task_categories_from_assistant_aggregate() {
+        let pool = match get_pool().await {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!(
+                    "skipping full_profile_view_excludes_other_task_categories_from_assistant_aggregate: \
+                     no INTAKE_DATABASE_URL/DATABASE_URL configured"
+                );
+                return;
+            }
+        };
+
+        // Bring up both schemas: assistant owns `assistant_dimension_score` (incl.
+        // `task_category`), serving owns `model_full_profile` (this module).
+        if crate::intake::assistant::schema::migrate(&pool).await.is_err() {
+            eprintln!(
+                "skipping full_profile_view_excludes_other_task_categories_from_assistant_aggregate: \
+                 assistant schema migrate() failed (DB unreachable or not provisioned)"
+            );
+            return;
+        }
+        if migrate(&pool).await.is_err() {
+            eprintln!(
+                "skipping full_profile_view_excludes_other_task_categories_from_assistant_aggregate: \
+                 serving schema migrate() failed (DB unreachable or not provisioned)"
+            );
+            return;
+        }
+
+        let run_id = crate::intake::assistant::schema::insert_run(&pool)
+            .await
+            .expect("insert_run");
+        let model_id = crate::intake::assistant::ModelId::from(format!(
+            "mint-newcat-regress-test-full-profile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let backend = crate::intake::assistant::BackendTag::Gpu;
+
+        // One legitimate assistant-category row (panel-scored, 1-5 scale).
+        let assistant_row = crate::intake::assistant::DimensionScore {
+            model_id: model_id.clone(),
+            backend_tag: backend,
+            dimension: "instruction_following".to_string(),
+            metric: "concision".to_string(),
+            value: 4.0,
+            std_dev: None,
+            judge: "panel".to_string(),
+            low_confidence: false,
+            raw_json: None,
+        };
+        crate::intake::assistant::schema::insert_dimension_score(&pool, run_id, &assistant_row)
+            .await
+            .expect("insert assistant row");
+
+        // One document_parsing row for the SAME model_id, value on a totally
+        // different scale (a millisecond latency) — must NOT be folded into the
+        // assistant aggregate.
+        let docparse_row = crate::intake::assistant::DimensionScore {
+            model_id: model_id.clone(),
+            backend_tag: backend,
+            dimension: "ocr_extraction".to_string(),
+            metric: "latency_ms".to_string(),
+            value: 5000.0,
+            std_dev: None,
+            judge: "derived".to_string(),
+            low_confidence: false,
+            raw_json: None,
+        };
+        crate::intake::assistant::schema::insert_dimension_score_with_category(
+            &pool,
+            run_id,
+            &docparse_row,
+            "document_parsing",
+        )
+        .await
+        .expect("insert document_parsing row");
+
+        let (count, avg_value): (i64, f64) = sqlx::query_as(
+            "SELECT assistant_score_count, assistant_avg_value FROM model_full_profile \
+             WHERE model_id = $1",
+        )
+        .bind(model_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("query model_full_profile");
+
+        assert_eq!(
+            count, 1,
+            "assistant_score_count must only count the assistant-category row, not the \
+             document_parsing row"
+        );
+        assert!(
+            (avg_value - 4.0).abs() < 1e-9,
+            "assistant_avg_value must stay at the assistant row's own value (4.0), not blend in \
+             the document_parsing row's 5000.0 latency — got {avg_value}"
+        );
+
+        // Cleanup: this test's rows are scoped to a unique model_id, so this only
+        // ever removes what this test run inserted.
+        let _ = sqlx::query("DELETE FROM assistant_dimension_score WHERE model_id = $1")
+            .bind(model_id.as_str())
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM assistant_profile_run WHERE id = $1")
+            .bind(run_id)
+            .execute(&pool)
+            .await;
     }
 }

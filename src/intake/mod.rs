@@ -25,6 +25,7 @@ mod code_v2;
 mod context;
 pub mod infer;
 pub mod lifecycle;
+pub mod newcats;
 mod runner;
 pub mod serving;
 mod storage;
