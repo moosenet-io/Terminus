@@ -1,0 +1,594 @@
+//! S86 live entrypoint: run the S83/MINT v2 **code** profiling suite across a
+//! fleet of models (the builder/coder counterpart to `intake_assistant_sweep`).
+//!
+//! Where the assistant sweep wraps a library `runner::run()`, the code suite has
+//! no fleet-level library driver — only the per-model `intake::code_v2::
+//! run_code_suite_v2` (driven once-per-model by `ModelIntake` in `intake::mod`).
+//! This binary IS that fleet driver: it loads the nominations (the fleet),
+//! iterates models × backends, and reuses the exact per-model flow `ModelIntake`
+//! uses for code:
+//!
+//!   create a `model_profiles` row  →  `run_code_suite_v2(model, langs, pid, …)`
+//!   (which persists one `code_profile_runs` row per case internally).
+//!
+//! The fleet, backend strategy, VRAM fit check, and the reboot-survivable
+//! checkpoint are all **reused from the assistant intake** (`intake::assistant::
+//! acquire::{Nomination, Nominations}` and `BackendTag`) so the two sweeps read
+//! the same `nominations.json` shape and share the same backend-override
+//! mechanism (`intake::infer::set_backend_override`). The only code-specific
+//! piece is the checkpoint granularity: the assistant sweep checkpoints
+//! per-(model, backend, dimension); the code suite is atomic per-(model,
+//! backend) (one `run_code_suite_v2` call runs all 40 cases), so the checkpoint
+//! key here is `(model, backend)`.
+//!
+//! ## Runtime configuration (all env-sourced, no literals — set before launch)
+//! - `INTAKE_DATABASE_URL` (or `DATABASE_URL`) — the intake Postgres (rows land
+//!   in `model_profiles` + `code_profile_runs`). Read by `storage::get_pool`.
+//! - `INTAKE_STAGING_DIR`  — the reliable NAS staging dir. Holds the fleet file
+//!   (`coder-nominations.json`, falling back to `nominations.json`) AND the
+//!   resume checkpoint (`coder-sweep-checkpoint.json`).
+//! - `MODEL_REGISTRY_PATH` — chord model→backend registry (read by `infer` to
+//!   route each backend pass). Set so the GPU/CPU override resolves.
+//! - `OLLAMA_URL` (or `_BASE_URL` / `_CPU_URL`) — the unified inference base.
+//! - `INTAKE_CORPUS_V2_DIR` — the v2 code corpus (defaults to the on-<host> path).
+//! - `INTAKE_CODE_LANGS` — optional comma list to NARROW the languages (corpus
+//!   tags: rust,typescript,python,bash,htmlcss,cpp,sql,config). Empty ⇒ all.
+//! - `INTAKE_CODE_CASE_LIMIT` — optional cap on cases per model (smoke/debug).
+//! - `INTAKE_VRAM_CEILING_GB` — over-ceiling models skip the GPU pass cleanly.
+//!
+//! ## Resume / skip-with-reason (the load-bearing 24h-run property)
+//! A reboot/disconnect RESUMES, never restarts: each completed `(model, backend)`
+//! is appended to the file checkpoint AFTER its rows are persisted, and a resume
+//! skips any `(model, backend)` already in the checkpoint. A model that hangs,
+//! is unavailable, over-VRAM, or errors is recorded as a skip-with-reason and the
+//! sweep CONTINUES — one bad model never wedges the fleet.
+
+use std::collections::BTreeSet;
+use std::fs::OpenOptions;
+use std::io::Write;
+
+use serde::{Deserialize, Serialize};
+
+use terminus_rs::config;
+use terminus_rs::error::ToolError;
+use terminus_rs::intake::assistant::acquire::{Nomination, Nominations};
+use terminus_rs::intake::assistant::BackendTag;
+use terminus_rs::intake::{self, infer};
+
+// ===========================================================================
+// Languages
+// ===========================================================================
+
+/// Resolve the suite languages from `INTAKE_CODE_LANGS` (comma-separated). An
+/// unset or empty value means "all languages in the corpus" (empty vec — the
+/// `run_code_suite_v2` convention). Pure over its input so it is unit-testable.
+fn parse_langs(raw: Option<&str>) -> Vec<String> {
+    match raw {
+        None => Vec::new(),
+        Some(s) => s
+            .split(',')
+            .map(|t| t.trim().to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect(),
+    }
+}
+
+/// Read the language narrowing from the environment.
+fn langs_from_env() -> Vec<String> {
+    parse_langs(std::env::var("INTAKE_CODE_LANGS").ok().as_deref())
+}
+
+/// Optional per-model case cap (smoke/debug), from `INTAKE_CODE_CASE_LIMIT`.
+fn case_limit_from_env() -> Option<usize> {
+    std::env::var("INTAKE_CODE_CASE_LIMIT")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+}
+
+// ===========================================================================
+// Fleet (nominations) loading — reuses the assistant Nominations shape
+// ===========================================================================
+
+/// Resolve the fleet file path inside `INTAKE_STAGING_DIR`, preferring a
+/// code-specific `coder-nominations.json` and falling back to the shared
+/// `nominations.json` (so a host already staged for the assistant sweep works
+/// unchanged). `None` ⇒ `INTAKE_STAGING_DIR` is unset.
+fn nominations_path() -> Option<String> {
+    let dir = config::intake_staging_dir()?;
+    let dir = dir.trim_end_matches('/');
+    let coder = format!("{dir}/coder-nominations.json");
+    if std::path::Path::new(&coder).exists() {
+        Some(coder)
+    } else {
+        Some(format!("{dir}/nominations.json"))
+    }
+}
+
+/// Load the fleet from the resolved nominations path. Reuses the assistant
+/// `Nominations` parser (identical JSON shape: `{"nominations":[{id, size_b,
+/// gfx1151_class, acquisition, backends?, …}]}`).
+fn load_fleet() -> Result<Nominations, ToolError> {
+    let path = nominations_path().ok_or_else(|| {
+        ToolError::NotConfigured(
+            "INTAKE_STAGING_DIR not set — cannot locate the coder fleet nominations".into(),
+        )
+    })?;
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| ToolError::NotConfigured(format!("cannot read nominations at {path}: {e}")))?;
+    Nominations::from_json(&raw).map_err(ToolError::NotConfigured)
+}
+
+// ===========================================================================
+// Resume checkpoint — keyed on (model, backend); atomic per code-suite run
+// ===========================================================================
+
+/// One completed unit of fleet work: a `(model, backend)` whose
+/// `code_profile_runs` rows are durably persisted. Mirrors the assistant
+/// runner's `CheckpointKey`, minus the dimension (the code suite is atomic per
+/// backend pass).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct CodeCheckpointKey {
+    model_id: String,
+    backend_tag: String,
+}
+
+impl CodeCheckpointKey {
+    fn new(model_id: &str, backend: BackendTag) -> Self {
+        CodeCheckpointKey {
+            model_id: model_id.to_string(),
+            backend_tag: backend.as_str().to_string(),
+        }
+    }
+}
+
+/// File-backed resume ledger on the reliable NAS staging dir. Append-on-mark,
+/// JSON-lines, survives a reboot — the same durability pattern as the assistant
+/// sweep's `FileCheckpoint`, with a distinct filename so the two sweeps never
+/// clobber each other's checkpoints.
+struct CodeCheckpoint {
+    path: String,
+}
+
+impl CodeCheckpoint {
+    /// Resolve the checkpoint path from `INTAKE_STAGING_DIR`. `Err` (not a
+    /// guess) when unset — the resume ledger MUST live on the reliable dir.
+    fn open() -> Result<Self, ToolError> {
+        let dir = config::intake_staging_dir().ok_or_else(|| {
+            ToolError::NotConfigured(
+                "INTAKE_STAGING_DIR not set — the resume checkpoint needs the reliable NAS staging dir"
+                    .into(),
+            )
+        })?;
+        let path = format!("{}/coder-sweep-checkpoint.json", dir.trim_end_matches('/'));
+        Ok(CodeCheckpoint { path })
+    }
+
+    /// All `(model, backend)` units already completed (empty on a fresh run).
+    fn done(&self) -> BTreeSet<CodeCheckpointKey> {
+        std::fs::read_to_string(&self.path)
+            .map(|s| {
+                s.lines()
+                    .filter_map(|l| serde_json::from_str::<CodeCheckpointKey>(l).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Record one completed `(model, backend)`. Durable BEFORE the next unit
+    /// starts (called only AFTER the suite's rows are persisted), so a crash
+    /// can never leave a checkpoint that claims work the DB doesn't have.
+    fn mark(&self, key: &CodeCheckpointKey) -> Result<(), ToolError> {
+        let line = serde_json::to_string(key)
+            .map_err(|e| ToolError::Execution(format!("serialize checkpoint key: {e}")))?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| ToolError::Execution(format!("open checkpoint {}: {e}", self.path)))?;
+        writeln!(f, "{line}")
+            .map_err(|e| ToolError::Execution(format!("append checkpoint: {e}")))?;
+        Ok(())
+    }
+}
+
+// ===========================================================================
+// Per-(model, backend) outcome reporting
+// ===========================================================================
+
+/// Why a `(model, backend)` pass did not produce a fresh score (so a 0-row run
+/// is diagnosable). `None` ⇒ the suite ran and persisted rows this run.
+#[derive(Debug, Clone, PartialEq)]
+enum BackendOutcome {
+    /// Already in the checkpoint — resumed, not re-run.
+    Resumed,
+    /// Ran this invocation; carries the suite summary.
+    Profiled {
+        cases_run: usize,
+        scored: usize,
+        errors: usize,
+        avg_first_pass: f64,
+        avg_effective: f64,
+        approved: Vec<String>,
+    },
+    /// Skipped cleanly with a reason (over-VRAM, hang, unavailable, …) — the
+    /// sweep continued.
+    Skipped(String),
+}
+
+/// One line of the end-of-run report: a `(model, backend)` and its outcome.
+struct BackendReport {
+    model_id: String,
+    backend_tag: BackendTag,
+    outcome: BackendOutcome,
+}
+
+// ===========================================================================
+// Skip decision (pure) — VRAM ceiling on the GPU pass
+// ===========================================================================
+
+/// Decide whether `(nomination, backend)` should be skipped BEFORE inference,
+/// returning the skip reason. Pure so it is unit-testable. A GPU pass for a
+/// model whose footprint exceeds the host VRAM ceiling is skipped (the big-model
+/// wedge guard); the CPU pass is always attempted (it has no VRAM ceiling).
+fn pre_skip_reason(nom: &Nomination, backend: BackendTag) -> Option<String> {
+    if backend == BackendTag::Gpu && nom.exceeds_vram() {
+        return Some(format!(
+            "over VRAM ceiling on GPU ({:.0}GB footprint > {:.0}GB ceiling)",
+            nom.vram_footprint_gb(),
+            terminus_rs::intake::assistant::acquire::vram_ceiling_gb()
+        ));
+    }
+    None
+}
+
+/// Run one `(model, backend)` code-suite pass under the P5 backend override,
+/// honoring the resume checkpoint. NEVER returns `Err` for a per-model failure —
+/// a hang/unavailable/OOM becomes a `Skipped` outcome so the fleet continues.
+/// `Err` is reserved for a checkpoint-write failure (a durability bug we must
+/// surface, not swallow).
+async fn run_one_backend(
+    nom: &Nomination,
+    backend: BackendTag,
+    override_str: &str,
+    langs: &[String],
+    case_limit: Option<usize>,
+    checkpoint: &CodeCheckpoint,
+    done: &BTreeSet<CodeCheckpointKey>,
+) -> Result<BackendReport, ToolError> {
+    let model_id = nom.id.clone();
+    let key = CodeCheckpointKey::new(&model_id, backend);
+
+    // ── resume: already complete → skip without touching the model ──
+    if done.contains(&key) {
+        return Ok(BackendReport {
+            model_id,
+            backend_tag: backend,
+            outcome: BackendOutcome::Resumed,
+        });
+    }
+
+    // ── pre-flight skip (over-VRAM on GPU) ──
+    if let Some(reason) = pre_skip_reason(nom, backend) {
+        return Ok(BackendReport {
+            model_id,
+            backend_tag: backend,
+            outcome: BackendOutcome::Skipped(reason),
+        });
+    }
+
+    // ── force the backend for this pass (process-global; intake runs are
+    //    sequential), cleared on every exit path via RAII ──
+    struct ClearOverride;
+    impl Drop for ClearOverride {
+        fn drop(&mut self) {
+            infer::set_backend_override(None);
+        }
+    }
+    infer::set_backend_override(Some(override_str.to_string()));
+    let _clear = ClearOverride;
+
+    // ── per-model flow, mirroring ModelIntake: profile row → suite → persist.
+    //    A fresh profile row scopes this (model, backend) pass's code rows. ──
+    let profile_id = match intake::create_profile_row(&model_id).await {
+        Ok(id) => id,
+        Err(e) => {
+            return Ok(BackendReport {
+                model_id,
+                backend_tag: backend,
+                outcome: BackendOutcome::Skipped(format!("profile row create failed: {e}")),
+            });
+        }
+    };
+
+    // The suite persists one code_profile_runs row per case internally. Any
+    // hang/unavailable/OOM surfaces as Err here → recorded as a skip-with-reason
+    // (NOT propagated), so one wedged model never stalls the fleet.
+    let outcome = match intake::run_code_suite_v2(&model_id, langs, profile_id, case_limit).await {
+        Ok(res) => {
+            // Durable checkpoint AFTER rows are persisted — resume-safe ordering.
+            checkpoint.mark(&key)?;
+            BackendOutcome::Profiled {
+                cases_run: res.cases_run,
+                scored: res.scored,
+                errors: res.errors,
+                avg_first_pass: res.avg_first_pass,
+                avg_effective: res.avg_effective,
+                approved: res.approved,
+            }
+        }
+        Err(e) => BackendOutcome::Skipped(format!("code suite did not complete: {e}")),
+    };
+
+    Ok(BackendReport {
+        model_id,
+        backend_tag: backend,
+        outcome,
+    })
+}
+
+/// Drive the whole fleet: for each nomination, for each backend in its strategy,
+/// run (or resume) one code-suite pass. Sequential — the backend override is
+/// process-global and inference is single-VRAM, exactly like the assistant sweep.
+async fn run_fleet(
+    fleet: &Nominations,
+    langs: &[String],
+    case_limit: Option<usize>,
+    checkpoint: &CodeCheckpoint,
+) -> Result<Vec<BackendReport>, ToolError> {
+    let done = checkpoint.done();
+    let mut reports = Vec::new();
+    for nom in &fleet.nominations {
+        for (backend_tag, override_str) in nom.backend_strategy() {
+            // S86 / gfx1151: serve GPU passes via ollama-rocm (the always-on
+            // `ollama` backend, :11434), NOT llama-server (`llama-gpu`), which
+            // wedges on MoE models on this Vulkan stack (S84: MiniMax/Ornith;
+            // S86: ornith-1.0). ollama-rocm serves dense AND MoE cleanly (proven
+            // on qwen3-coder). The CPU pass uses the genuine-CPU `ollama-cpu`.
+            let override_str = match (backend_tag, override_str) {
+                (BackendTag::Gpu, "llama-gpu") => "ollama",
+                (BackendTag::Cpu, "ollama") => "ollama-cpu",
+                (_, other) => other,
+            };
+            let report = run_one_backend(
+                nom, backend_tag, override_str, langs, case_limit, checkpoint, &done,
+            )
+            .await?;
+            reports.push(report);
+        }
+    }
+    Ok(reports)
+}
+
+// ===========================================================================
+// Reporting
+// ===========================================================================
+
+/// Print the end-of-run per-(model, backend) detail so a run with no score rows
+/// is diagnosable (which model skipped + why). Mirrors the assistant sweep's
+/// end-of-run dump.
+fn print_report(reports: &[BackendReport]) {
+    let profiled = reports
+        .iter()
+        .filter(|r| matches!(r.outcome, BackendOutcome::Profiled { .. }))
+        .count();
+    let resumed = reports
+        .iter()
+        .filter(|r| matches!(r.outcome, BackendOutcome::Resumed))
+        .count();
+    let skipped = reports
+        .iter()
+        .filter(|r| matches!(r.outcome, BackendOutcome::Skipped(_)))
+        .count();
+    eprintln!(
+        "coder sweep complete: {profiled} backend-passes profiled, {resumed} resumed, \
+         {skipped} skipped (rows persisted to the intake DB)"
+    );
+    for r in reports {
+        match &r.outcome {
+            BackendOutcome::Resumed => {
+                eprintln!(
+                    "MODEL {} backend={} RESUMED (already checkpointed)",
+                    r.model_id, r.backend_tag
+                );
+            }
+            BackendOutcome::Skipped(reason) => {
+                eprintln!(
+                    "MODEL {} backend={} SKIPPED: {reason}",
+                    r.model_id, r.backend_tag
+                );
+            }
+            BackendOutcome::Profiled {
+                cases_run,
+                scored,
+                errors,
+                avg_first_pass,
+                avg_effective,
+                approved,
+            } => {
+                eprintln!(
+                    "MODEL {} backend={} PROFILED cases={cases_run} scored={scored} errors={errors} \
+                     avg_first_pass={avg_first_pass:.2} avg_effective={avg_effective:.2} approved=[{}]",
+                    r.model_id,
+                    r.backend_tag,
+                    approved.join(", ")
+                );
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Entry point
+// ===========================================================================
+
+// Multi-threaded runtime: the suite mixes async IO with libraries that expect a
+// multi-thread scheduler (the same reason the assistant sweep uses it); a
+// current-thread runtime risks deadlocking the inner inference futures.
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> std::process::ExitCode {
+    let langs = langs_from_env();
+    let case_limit = case_limit_from_env();
+
+    let fleet = match load_fleet() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("coder sweep did not start: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let checkpoint = match CodeCheckpoint::open() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("coder sweep did not start: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    eprintln!(
+        "coder sweep starting: {} models, langs={}, case_limit={:?}, checkpoint={}",
+        fleet.nominations.len(),
+        if langs.is_empty() { "all".into() } else { langs.join(",") },
+        case_limit,
+        checkpoint.path,
+    );
+
+    match run_fleet(&fleet, &langs, case_limit, &checkpoint).await {
+        Ok(reports) => {
+            print_report(&reports);
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            // Only a durability (checkpoint-write) failure reaches here; a
+            // per-model failure is a recorded skip, not an error.
+            eprintln!("coder sweep aborted on a durability error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+// ===========================================================================
+// Unit / smoke tests — the bin's PURE helpers. The full fleet run is
+// integration (needs Postgres + corpus + live inference), not a unit test.
+// ===========================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- language parsing ----
+
+    #[test]
+    fn parse_langs_unset_means_all() {
+        assert!(parse_langs(None).is_empty());
+    }
+
+    #[test]
+    fn parse_langs_empty_means_all() {
+        assert!(parse_langs(Some("")).is_empty());
+        assert!(parse_langs(Some("   ,  , ")).is_empty());
+    }
+
+    #[test]
+    fn parse_langs_splits_trims_lowercases() {
+        assert_eq!(
+            parse_langs(Some("Rust, Python ,TS")),
+            vec!["rust".to_string(), "python".to_string(), "ts".to_string()]
+        );
+    }
+
+    // ---- checkpoint skip logic ----
+
+    #[test]
+    fn checkpoint_key_distinguishes_backends() {
+        let gpu = CodeCheckpointKey::new("qwen3:8b", BackendTag::Gpu);
+        let cpu = CodeCheckpointKey::new("qwen3:8b", BackendTag::Cpu);
+        assert_ne!(gpu, cpu);
+        assert_eq!(gpu.backend_tag, "gpu");
+        assert_eq!(cpu.backend_tag, "cpu");
+    }
+
+    #[test]
+    fn checkpoint_done_set_drives_resume_skip() {
+        // The exact skip predicate `run_one_backend` uses: a (model, backend)
+        // present in `done` is resumed (skipped), absent is run.
+        let mut done = BTreeSet::new();
+        done.insert(CodeCheckpointKey::new("m:8b", BackendTag::Gpu));
+        assert!(done.contains(&CodeCheckpointKey::new("m:8b", BackendTag::Gpu)));
+        assert!(!done.contains(&CodeCheckpointKey::new("m:8b", BackendTag::Cpu)));
+        assert!(!done.contains(&CodeCheckpointKey::new("other:8b", BackendTag::Gpu)));
+    }
+
+    #[test]
+    fn checkpoint_key_roundtrips_through_jsonlines() {
+        // The file ledger is JSON-lines; a written key must parse back identically
+        // (this is what makes a reboot resume rather than restart).
+        let key = CodeCheckpointKey::new("mixtral:8x7b", BackendTag::Cpu);
+        let line = serde_json::to_string(&key).unwrap();
+        let back: CodeCheckpointKey = serde_json::from_str(&line).unwrap();
+        assert_eq!(key, back);
+    }
+
+    #[test]
+    fn case_limit_parse_rejects_zero_and_garbage() {
+        // Mirrors case_limit_from_env's filter (no env access in the test).
+        let parse = |s: &str| s.trim().parse::<usize>().ok().filter(|n| *n > 0);
+        assert_eq!(parse("5"), Some(5));
+        assert_eq!(parse("0"), None);
+        assert_eq!(parse("abc"), None);
+    }
+
+    // ---- pre-flight VRAM skip (pure) ----
+
+    fn nom(json: &str) -> Nomination {
+        let wrapped = format!(r#"{{"nominations":[{json}]}}"#);
+        Nominations::from_json(&wrapped)
+            .unwrap()
+            .nominations
+            .pop()
+            .unwrap()
+    }
+
+    #[test]
+    fn small_model_runs_on_both_backends() {
+        let n = nom(r#"{"id":"qwen3:8b","size_b":8,"gfx1151_class":"confirmed","acquisition":"ollama_pull"}"#);
+        assert!(pre_skip_reason(&n, BackendTag::Gpu).is_none());
+        assert!(pre_skip_reason(&n, BackendTag::Cpu).is_none());
+    }
+
+    #[test]
+    fn oversized_model_skips_gpu_but_not_cpu() {
+        // 218B at ~0.6GB/B = ~131GB footprint — over any realistic ceiling, so
+        // the GPU pass is skipped with a reason while CPU is still attempted.
+        std::env::set_var("INTAKE_VRAM_CEILING_GB", "96");
+        let n = nom(r#"{"id":"command-a-plus:218b","size_b":218,"gfx1151_class":"experimental","acquisition":"hf_fetch","hf_repo":"cohere/command-a-plus"}"#);
+        let gpu = pre_skip_reason(&n, BackendTag::Gpu);
+        assert!(gpu.is_some(), "oversized model must skip GPU");
+        assert!(gpu.unwrap().contains("VRAM"));
+        assert!(
+            pre_skip_reason(&n, BackendTag::Cpu).is_none(),
+            "CPU pass has no VRAM ceiling"
+        );
+        std::env::remove_var("INTAKE_VRAM_CEILING_GB");
+    }
+
+    // ---- fleet shape reuse (assistant Nominations parser) ----
+
+    #[test]
+    fn fleet_parses_and_yields_backend_strategy() {
+        let fleet = Nominations::from_json(
+            r#"{"nominations":[
+                {"id":"qwen3-coder:30b","size_b":30,"gfx1151_class":"confirmed","acquisition":"ollama_pull"},
+                {"id":"cpu-only:8b","size_b":8,"gfx1151_class":"confirmed","acquisition":"ollama_pull","backends":["cpu"]}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(fleet.nominations.len(), 2);
+        // Default (no explicit backends) → both passes, GPU first.
+        let s0 = fleet.nominations[0].backend_strategy();
+        assert_eq!(s0.len(), 2);
+        assert_eq!(s0[0].0, BackendTag::Gpu);
+        // Explicit ["cpu"] → CPU-only.
+        let s1 = fleet.nominations[1].backend_strategy();
+        assert_eq!(s1, vec![(BackendTag::Cpu, "ollama")]);
+    }
+}
