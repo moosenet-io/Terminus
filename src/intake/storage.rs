@@ -168,6 +168,11 @@ pub struct CodeRunRow {
     /// twin of `assistant_dimension_score.backend_tag`). `None` for rows written
     /// before this column existed, or by callers that don't yet track it.
     pub backend_tag: Option<String>,
+    /// Which memory-model configuration ran this case, e.g. `"dynamic_gtt"`
+    /// or `"carveout"` (mem-config-tagging sprint). `None` for rows written
+    /// before this column existed (the preserved baseline) or by callers that
+    /// don't yet track it — NEVER assume `None` means a specific config.
+    pub mem_config: Option<String>,
 }
 
 /// Insert one `code_profile_runs` row.
@@ -180,8 +185,9 @@ pub async fn insert_code_run(
         "INSERT INTO code_profile_runs \
          (profile_id, language, context_tokens, file_count, total_lines, task_type, \
           compiles, tests_pass, planted_bug_found, code_quality_score, \
-          throughput_tok_per_sec, total_time_ms, memory_usage_mb, oom, error, backend_tag) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+          throughput_tok_per_sec, total_time_ms, memory_usage_mb, oom, error, backend_tag, \
+          mem_config) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
     )
     .bind(profile_id)
     .bind(&row.language)
@@ -199,6 +205,7 @@ pub async fn insert_code_run(
     .bind(row.oom)
     .bind(row.error.as_deref())
     .bind(row.backend_tag.as_deref())
+    .bind(row.mem_config.as_deref())
     .execute(pool)
     .await
     .map_err(|e| ToolError::Database(format!("Failed to insert code_profile_runs: {e}")))?;
@@ -234,6 +241,11 @@ pub struct CodeRunRowV2 {
     /// twin of `assistant_dimension_score.backend_tag`). `None` for rows written
     /// before this column existed, or by callers that don't yet track it.
     pub backend_tag: Option<String>,
+    /// Which memory-model configuration ran this case, e.g. `"dynamic_gtt"`
+    /// or `"carveout"` (mem-config-tagging sprint). `None` for rows written
+    /// before this column existed (the preserved baseline) or by callers that
+    /// don't yet track it — NEVER assume `None` means a specific config.
+    pub mem_config: Option<String>,
 }
 
 /// Insert one v2 `code_profile_runs` row (harness_version='v2'). Additive — the
@@ -248,8 +260,8 @@ pub async fn insert_code_run_v2(
          (profile_id, harness_version, language, task_type, \
           first_pass_score, retry_score, compiles, tests_pass, change_correct, \
           code_quality_score, context_tokens, response_tokens, file_count, total_lines, \
-          throughput_tok_per_sec, total_time_ms, oom, error, backend_tag) \
-         VALUES ($1, 'v2', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
+          throughput_tok_per_sec, total_time_ms, oom, error, backend_tag, mem_config) \
+         VALUES ($1, 'v2', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
     )
     .bind(profile_id)
     .bind(&row.language)
@@ -269,6 +281,7 @@ pub async fn insert_code_run_v2(
     .bind(row.oom)
     .bind(row.error.as_deref())
     .bind(row.backend_tag.as_deref())
+    .bind(row.mem_config.as_deref())
     .execute(pool)
     .await
     .map_err(|e| ToolError::Database(format!("Failed to insert code_profile_runs (v2): {e}")))?;
@@ -501,5 +514,32 @@ mod tests {
         std::env::remove_var("DATABASE_URL");
         let r = get_pool().await;
         assert!(matches!(r, Err(ToolError::NotConfigured(_))));
+    }
+
+    /// mem-config-tagging: `mem_config` defaults to `None` (never silently
+    /// mislabels a row written by a caller that doesn't set it) and is
+    /// settable like any other field on both row structs.
+    #[test]
+    fn code_run_row_mem_config_defaults_none_and_is_settable() {
+        let default_row = CodeRunRow::default();
+        assert_eq!(default_row.mem_config, None);
+
+        let tagged_row = CodeRunRow {
+            mem_config: Some("dynamic_gtt".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(tagged_row.mem_config.as_deref(), Some("dynamic_gtt"));
+    }
+
+    #[test]
+    fn code_run_row_v2_mem_config_defaults_none_and_is_settable() {
+        let default_row = CodeRunRowV2::default();
+        assert_eq!(default_row.mem_config, None);
+
+        let tagged_row = CodeRunRowV2 {
+            mem_config: Some("carveout".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(tagged_row.mem_config.as_deref(), Some("carveout"));
     }
 }

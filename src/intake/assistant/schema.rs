@@ -113,6 +113,20 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
     .await
     .map_err(|e| ToolError::Database(format!("add task_category column: {e}")))?;
 
+    // `mem_config` tags which memory-model configuration (e.g. `dynamic_gtt`
+    // vs `carveout`) a row was measured under (mem-config-tagging sprint).
+    // Deliberately NO backfill default and NO CHECK constraint (same
+    // unconstrained-living-list rationale as `task_category` above):
+    // existing rows PREDATE this column and are the PRESERVED `carveout`
+    // baseline dataset from an earlier run — defaulting them to
+    // 'dynamic_gtt' (or any other value) would silently mislabel that
+    // baseline. Left NULL for old rows; new rows set it explicitly via
+    // [`insert_dimension_score_with_category_and_mem_config`].
+    sqlx::query("ALTER TABLE assistant_dimension_score ADD COLUMN IF NOT EXISTS mem_config TEXT")
+        .execute(pool)
+        .await
+        .map_err(|e| ToolError::Database(format!("add mem_config column: {e}")))?;
+
     // Recreated (not just created) so the index definition stays current even
     // on a DB that already had the old (model_id, backend_tag) index from a
     // prior migrate() run. Cheap: this table is intake-scale, not hot-path.
@@ -158,6 +172,18 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
         .await
         .map_err(|e| ToolError::Database(format!("add code_profile_runs.backend_tag: {e}")))?;
 
+    // `mem_config` twin on the builder side: same rationale as the
+    // assistant-side column above — the coder sweep tests models against
+    // different memory-model configurations (tonight: `dynamic_gtt`), and
+    // `code_profile_runs` had nowhere to record which one produced a given
+    // row. NO backfill default: pre-existing rows are the preserved
+    // `carveout` baseline and must stay unlabeled-as-'dynamic_gtt' (NULL),
+    // never silently relabeled.
+    sqlx::query("ALTER TABLE code_profile_runs ADD COLUMN IF NOT EXISTS mem_config TEXT")
+        .execute(pool)
+        .await
+        .map_err(|e| ToolError::Database(format!("add code_profile_runs.mem_config: {e}")))?;
+
     // 3. The dual-profile join view. Built so a model present in only ONE side
     //    still appears (key set = UNION of both sides' model_ids), and so a
     //    missing builder `backend_tag` column degrades to NULL rather than
@@ -172,6 +198,23 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
     //    `assistant_avg_value` — without this filter, a vision/ASR/image-gen-
     //    only model would wrongly show `has_assistant_profile = true` and
     //    `assistant_avg_value` would blend nonsense across scales.
+    //
+    //    CRITICAL (mem-config-tagging): `mem_config` is now ALSO part of the
+    //    grouping/join key, alongside `backend_tag`. Rationale: tonight's
+    //    sweep runs the SAME models under a NEW `dynamic_gtt` memory config
+    //    while a PRESERVED `carveout` baseline already occupies these same
+    //    tables. If `mem_config` were left out of `GROUP BY`/the join key
+    //    (the way it's left out of `model_full_profile`'s coarse `assistant`
+    //    CTE — see that view's comment for why THAT omission is safe), a
+    //    model measured under both configs would silently average
+    //    `dynamic_gtt` and `carveout` rows together into one meaningless
+    //    number — exactly the blending this column exists to prevent. Both
+    //    the `builder` and `assistant` CTEs here already split by
+    //    `backend_tag`, so extending both to also split by `mem_config` is a
+    //    safe, symmetric extension of an existing 2-axis key to a 3-axis key
+    //    (model_id, backend_tag, mem_config) — no new fan-out/cross-join risk
+    //    is introduced (both sides gain the same axis, and the join adds the
+    //    matching `IS NOT DISTINCT FROM` predicate for it).
     let builder_has_backend_tag = column_exists(pool, "code_profile_runs", "backend_tag").await?;
     let builder_backend_expr = if builder_has_backend_tag {
         "cpr.backend_tag"
@@ -184,27 +227,29 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
          WITH builder AS ( \
              SELECT mp.model_name AS model_id, \
                     {backend} AS backend_tag, \
+                    cpr.mem_config AS mem_config, \
                     count(cpr.*) AS builder_run_count, \
                     avg(cpr.code_quality_score) AS builder_avg_quality \
              FROM model_profiles mp \
              LEFT JOIN code_profile_runs cpr ON cpr.profile_id = mp.id \
-             GROUP BY mp.model_name, {backend} \
+             GROUP BY mp.model_name, {backend}, cpr.mem_config \
          ), \
          assistant AS ( \
-             SELECT model_id, backend_tag, \
+             SELECT model_id, backend_tag, mem_config, \
                     count(*) AS assistant_score_count, \
                     avg(value) AS assistant_avg_value \
              FROM assistant_dimension_score \
              WHERE task_category = 'assistant' \
-             GROUP BY model_id, backend_tag \
+             GROUP BY model_id, backend_tag, mem_config \
          ), \
          keys AS ( \
-             SELECT model_id, backend_tag FROM builder \
+             SELECT model_id, backend_tag, mem_config FROM builder \
              UNION \
-             SELECT model_id, backend_tag FROM assistant \
+             SELECT model_id, backend_tag, mem_config FROM assistant \
          ) \
          SELECT k.model_id, \
                 k.backend_tag, \
+                k.mem_config, \
                 (b.model_id IS NOT NULL) AS has_builder_profile, \
                 (a.model_id IS NOT NULL) AS has_assistant_profile, \
                 b.builder_run_count, \
@@ -215,9 +260,11 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
          LEFT JOIN builder b \
              ON b.model_id = k.model_id \
             AND b.backend_tag IS NOT DISTINCT FROM k.backend_tag \
+            AND b.mem_config IS NOT DISTINCT FROM k.mem_config \
          LEFT JOIN assistant a \
              ON a.model_id = k.model_id \
-            AND a.backend_tag IS NOT DISTINCT FROM k.backend_tag",
+            AND a.backend_tag IS NOT DISTINCT FROM k.backend_tag \
+            AND a.mem_config IS NOT DISTINCT FROM k.mem_config",
         backend = builder_backend_expr,
     );
 
@@ -283,11 +330,34 @@ pub async fn insert_dimension_score(
 /// same flexible (dimension, metric, value, judge, raw_json) shape without a
 /// schema change. [`insert_dimension_score`] is the `"assistant"`-tagged
 /// special case of this function, kept for source compatibility.
+///
+/// Thin wrapper over [`insert_dimension_score_with_category_and_mem_config`]
+/// with `mem_config = None` — zero behavior change for every existing caller
+/// (dim1..dim6 runners, the `newcats` modules), none of which know about a
+/// memory-model configuration yet.
 pub async fn insert_dimension_score_with_category(
     pool: &PgPool,
     run_id: uuid::Uuid,
     score: &DimensionScore,
     task_category: &str,
+) -> Result<(), ToolError> {
+    insert_dimension_score_with_category_and_mem_config(pool, run_id, score, task_category, None)
+        .await
+}
+
+/// Insert one aggregated [`DimensionScore`] against a run, tagged with an
+/// explicit `task_category` AND an explicit `mem_config` (mem-config-tagging
+/// sprint). `mem_config` identifies which memory-model configuration (e.g.
+/// `"dynamic_gtt"` vs `"carveout"`) the score was measured under; `None`
+/// writes SQL `NULL` (used by every caller that predates or doesn't yet track
+/// this axis — see [`migrate`]'s doc comment on why old rows must stay NULL,
+/// not be back-filled).
+pub async fn insert_dimension_score_with_category_and_mem_config(
+    pool: &PgPool,
+    run_id: uuid::Uuid,
+    score: &DimensionScore,
+    task_category: &str,
+    mem_config: Option<&str>,
 ) -> Result<(), ToolError> {
     let raw: Option<serde_json::Value> = match &score.raw_json {
         Some(s) => Some(
@@ -299,8 +369,8 @@ pub async fn insert_dimension_score_with_category(
     sqlx::query(
         "INSERT INTO assistant_dimension_score \
          (run_id, model_id, backend_tag, dimension, metric, value, std_dev, judge, \
-          low_confidence, raw_json, task_category) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+          low_confidence, raw_json, task_category, mem_config) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(run_id)
     .bind(score.model_id.as_str())
@@ -313,6 +383,7 @@ pub async fn insert_dimension_score_with_category(
     .bind(score.low_confidence)
     .bind(raw)
     .bind(task_category)
+    .bind(mem_config)
     .execute(pool)
     .await
     .map_err(|e| ToolError::Database(format!("insert assistant_dimension_score: {e}")))?;
@@ -474,6 +545,171 @@ mod tests {
 
         // Cleanup: this test's rows are scoped to a unique model_id, so this
         // only ever removes what this test run inserted.
+        let _ = sqlx::query("DELETE FROM assistant_dimension_score WHERE model_id = $1")
+            .bind(model_id.as_str())
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM assistant_profile_run WHERE id = $1")
+            .bind(run_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// Regression test for mem-config-tagging: `model_dual_profile` must key
+    /// (GROUP BY + JOIN) on `mem_config` in addition to `backend_tag`, so two
+    /// rows for the SAME (model_id, backend_tag) but DIFFERENT `mem_config`
+    /// values ("dynamic_gtt" vs "carveout") produce SEPARATE aggregate rows,
+    /// never a blended average. This is the exact scenario the operator
+    /// flagged: a model re-tested under a new memory config while a
+    /// preserved baseline for the old config still occupies the same table.
+    ///
+    /// Gated on a reachable Postgres (same convention as the task_category
+    /// regression test above): skips (passes trivially) with no configured
+    /// DB, runs for real whenever one is reachable.
+    #[tokio::test]
+    async fn mem_config_keeps_different_configs_from_blending() {
+        let pool = match get_pool().await {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!(
+                    "skipping mem_config_keeps_different_configs_from_blending: \
+                     no INTAKE_DATABASE_URL/DATABASE_URL configured"
+                );
+                return;
+            }
+        };
+        if migrate(&pool).await.is_err() {
+            eprintln!(
+                "skipping mem_config_keeps_different_configs_from_blending: \
+                 migrate() failed (DB unreachable or not provisioned)"
+            );
+            return;
+        }
+
+        let run_id = insert_run(&pool).await.expect("insert_run");
+        let model_id = ModelId::from(format!(
+            "mem-config-regress-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let backend = BackendTag::Gpu;
+
+        // KNOWN-BAD scenario (must NOT blend): same (model_id, backend_tag),
+        // different mem_config, wildly different values (4.0 vs 1.0).
+        let dynamic_row = DimensionScore {
+            model_id: model_id.clone(),
+            backend_tag: backend,
+            dimension: "instruction_following".to_string(),
+            metric: "concision".to_string(),
+            value: 4.0,
+            std_dev: None,
+            judge: "panel".to_string(),
+            low_confidence: false,
+            raw_json: None,
+        };
+        insert_dimension_score_with_category_and_mem_config(
+            &pool,
+            run_id,
+            &dynamic_row,
+            "assistant",
+            Some("dynamic_gtt"),
+        )
+        .await
+        .expect("insert dynamic_gtt row");
+
+        let carveout_row = DimensionScore {
+            model_id: model_id.clone(),
+            backend_tag: backend,
+            dimension: "instruction_following".to_string(),
+            metric: "concision".to_string(),
+            value: 1.0,
+            std_dev: None,
+            judge: "panel".to_string(),
+            low_confidence: false,
+            raw_json: None,
+        };
+        insert_dimension_score_with_category_and_mem_config(
+            &pool,
+            run_id,
+            &carveout_row,
+            "assistant",
+            Some("carveout"),
+        )
+        .await
+        .expect("insert carveout row");
+
+        let rows: Vec<(Option<String>, i64, f64)> = sqlx::query_as(
+            "SELECT mem_config, assistant_score_count, assistant_avg_value \
+             FROM model_dual_profile \
+             WHERE model_id = $1 AND backend_tag = $2 \
+             ORDER BY mem_config",
+        )
+        .bind(model_id.as_str())
+        .bind(backend.as_str())
+        .fetch_all(&pool)
+        .await
+        .expect("query model_dual_profile");
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "expected two SEPARATE aggregate rows (one per mem_config), not one blended row — got {rows:?}"
+        );
+        for (mem_config, count, avg_value) in &rows {
+            assert_eq!(*count, 1, "each mem_config's aggregate must count only its own row");
+            match mem_config.as_deref() {
+                Some("dynamic_gtt") => assert!(
+                    (avg_value - 4.0).abs() < 1e-9,
+                    "dynamic_gtt aggregate must stay at 4.0, not blend with carveout's 1.0 — got {avg_value}"
+                ),
+                Some("carveout") => assert!(
+                    (avg_value - 1.0).abs() < 1e-9,
+                    "carveout aggregate must stay at 1.0, not blend with dynamic_gtt's 4.0 — got {avg_value}"
+                ),
+                other => panic!("unexpected mem_config value: {other:?}"),
+            }
+        }
+
+        // KNOWN-GOOD scenario: a THIRD row, same mem_config as the first
+        // ("dynamic_gtt"), must aggregate together with it (count=2), proving
+        // the fix doesn't over-split — only DIFFERENT mem_config values stay
+        // separate; SAME values still aggregate normally.
+        let dynamic_row_2 = DimensionScore {
+            model_id: model_id.clone(),
+            backend_tag: backend,
+            dimension: "instruction_following".to_string(),
+            metric: "concision".to_string(),
+            value: 2.0,
+            std_dev: None,
+            judge: "panel".to_string(),
+            low_confidence: false,
+            raw_json: None,
+        };
+        insert_dimension_score_with_category_and_mem_config(
+            &pool,
+            run_id,
+            &dynamic_row_2,
+            "assistant",
+            Some("dynamic_gtt"),
+        )
+        .await
+        .expect("insert second dynamic_gtt row");
+
+        let (count, avg_value): (i64, f64) = sqlx::query_as(
+            "SELECT assistant_score_count, assistant_avg_value FROM model_dual_profile \
+             WHERE model_id = $1 AND backend_tag = $2 AND mem_config = 'dynamic_gtt'",
+        )
+        .bind(model_id.as_str())
+        .bind(backend.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("query model_dual_profile for dynamic_gtt");
+        assert_eq!(count, 2, "same-mem_config rows must still aggregate together");
+        assert!(
+            (avg_value - 3.0).abs() < 1e-9,
+            "dynamic_gtt aggregate over (4.0, 2.0) must average to 3.0 — got {avg_value}"
+        );
+
+        // Cleanup.
         let _ = sqlx::query("DELETE FROM assistant_dimension_score WHERE model_id = $1")
             .bind(model_id.as_str())
             .execute(&pool)

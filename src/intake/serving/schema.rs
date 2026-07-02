@@ -155,16 +155,48 @@ async fn create_full_profile_view(pool: &PgPool) -> Result<(), ToolError> {
         "NULL::text"
     };
 
+    // mem-config-tagging DECISION (documented here, not just in the build
+    // report, so a future reader sees the reasoning at the code site):
+    //
+    //   `builder` (from `code_profile_runs`) DOES get `mem_config` added to
+    //   its GROUP BY, surfaced as `builder_mem_config`. This is SAFE because
+    //   this view's outer join keys ONLY on `model_id` (see the module doc
+    //   comment: the three sides use incompatible backend-tag vocabularies,
+    //   so keying is deliberately loose) and `assistant`/`serving` are each
+    //   single-row-per-model_id "broadcast" across however many `builder`
+    //   rows exist — exactly the same fan-out `builder_backend_tag` already
+    //   causes today when a model has both a gpu and a cpu builder row.
+    //   Adding `mem_config` is the same accepted pattern extended to a new
+    //   axis: it stops `builder_avg_quality` from silently blending the
+    //   preserved `carveout` baseline with tonight's `dynamic_gtt` rows.
+    //
+    //   `assistant` (from `assistant_dimension_score`) is DELIBERATELY LEFT
+    //   UNCHANGED — grouped by `model_id` only, still coarse. Splitting it by
+    //   `mem_config` too would NOT be safe here: it would turn `assistant`
+    //   from a single broadcast row into N rows per model_id, and because the
+    //   join key is `model_id` only (not mem_config), that would cross-join
+    //   against `builder`'s (also-now-multi-row) rows — pairing a
+    //   `dynamic_gtt` builder row with a `carveout` assistant row in some
+    //   output rows. That would be a NEW, worse blending bug (wrong-pairing),
+    //   not a fix. `model_dual_profile` (the granular, backend_tag- and now
+    //   mem_config-keyed view in `assistant::schema`) is the correct place
+    //   for exact per-mem_config assistant reconciliation; this view's job is
+    //   the coarser "does this model have ANY profile" rollup, and it already
+    //   accepted a coarser blend on the assistant side (across backend_tag)
+    //   before this change. Follow-up if per-mem_config assistant granularity
+    //   is ever needed here: promote `mem_config` (and `backend_tag`) to a
+    //   real join key across all three CTEs, not just `builder`.
     let view_sql = format!(
         "CREATE OR REPLACE VIEW model_full_profile AS \
          WITH builder AS ( \
              SELECT mp.model_name AS model_id, \
                     {backend} AS builder_backend_tag, \
+                    cpr.mem_config AS builder_mem_config, \
                     count(cpr.*) AS builder_run_count, \
                     avg(cpr.code_quality_score) AS builder_avg_quality \
              FROM model_profiles mp \
              LEFT JOIN code_profile_runs cpr ON cpr.profile_id = mp.id \
-             GROUP BY mp.model_name, {backend} \
+             GROUP BY mp.model_name, {backend}, cpr.mem_config \
          ), \
          assistant AS ( \
              SELECT model_id, \
@@ -194,6 +226,7 @@ async fn create_full_profile_view(pool: &PgPool) -> Result<(), ToolError> {
                 (a.model_id IS NOT NULL) AS has_assistant_profile, \
                 (s.model_id IS NOT NULL) AS has_serving_profile, \
                 b.builder_backend_tag, \
+                b.builder_mem_config, \
                 b.builder_run_count, \
                 b.builder_avg_quality, \
                 a.assistant_score_count, \
@@ -446,6 +479,119 @@ mod tests {
             .await;
         let _ = sqlx::query("DELETE FROM assistant_profile_run WHERE id = $1")
             .bind(run_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// Regression test for mem-config-tagging: `model_full_profile`'s `builder`
+    /// CTE (over `code_profile_runs`) must key on `mem_config` in addition to
+    /// `backend_tag`, so two builder rows for the SAME model_id/backend but
+    /// DIFFERENT `mem_config` ("dynamic_gtt" vs "carveout") surface as
+    /// SEPARATE `builder_avg_quality` rows, never one blended average.
+    ///
+    /// Gated on a reachable Postgres, same convention as the sibling test.
+    #[tokio::test]
+    async fn builder_mem_config_keeps_different_configs_from_blending() {
+        let pool = match get_pool().await {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!(
+                    "skipping builder_mem_config_keeps_different_configs_from_blending: \
+                     no INTAKE_DATABASE_URL/DATABASE_URL configured"
+                );
+                return;
+            }
+        };
+        if crate::intake::assistant::schema::migrate(&pool).await.is_err() {
+            eprintln!(
+                "skipping builder_mem_config_keeps_different_configs_from_blending: \
+                 assistant schema migrate() failed (DB unreachable or not provisioned)"
+            );
+            return;
+        }
+        if migrate(&pool).await.is_err() {
+            eprintln!(
+                "skipping builder_mem_config_keeps_different_configs_from_blending: \
+                 serving schema migrate() failed (DB unreachable or not provisioned)"
+            );
+            return;
+        }
+
+        let model_name = format!("mem-config-full-profile-regress-{}", uuid::Uuid::new_v4());
+        let profile_id = crate::intake::storage::insert_model_profile(
+            &pool,
+            &model_name,
+            "test-provider",
+            None,
+            None,
+        )
+        .await
+        .expect("insert_model_profile");
+
+        // KNOWN-BAD scenario (must NOT blend): same model, same backend_tag,
+        // different mem_config, wildly different quality scores.
+        let dynamic_row = crate::intake::storage::CodeRunRow {
+            language: "rust".to_string(),
+            code_quality_score: Some(5.0),
+            backend_tag: Some("gpu".to_string()),
+            ..Default::default()
+        };
+        crate::intake::storage::insert_code_run(&pool, profile_id, &dynamic_row)
+            .await
+            .expect("insert dynamic_gtt code run");
+        sqlx::query("UPDATE code_profile_runs SET mem_config = 'dynamic_gtt' \
+                     WHERE profile_id = $1 AND code_quality_score = 5.0")
+            .bind(profile_id)
+            .execute(&pool)
+            .await
+            .expect("tag dynamic_gtt row");
+
+        let carveout_row = crate::intake::storage::CodeRunRow {
+            language: "rust".to_string(),
+            code_quality_score: Some(1.0),
+            backend_tag: Some("gpu".to_string()),
+            ..Default::default()
+        };
+        crate::intake::storage::insert_code_run(&pool, profile_id, &carveout_row)
+            .await
+            .expect("insert carveout code run");
+        sqlx::query("UPDATE code_profile_runs SET mem_config = 'carveout' \
+                     WHERE profile_id = $1 AND code_quality_score = 1.0")
+            .bind(profile_id)
+            .execute(&pool)
+            .await
+            .expect("tag carveout row");
+
+        let rows: Vec<(Option<String>, i64, f64)> = sqlx::query_as(
+            "SELECT builder_mem_config, builder_run_count, builder_avg_quality \
+             FROM model_full_profile WHERE model_id = $1 ORDER BY builder_mem_config",
+        )
+        .bind(&model_name)
+        .fetch_all(&pool)
+        .await
+        .expect("query model_full_profile");
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "expected two SEPARATE builder rows (one per mem_config), not one blended row — got {rows:?}"
+        );
+        for (mem_config, count, avg_quality) in &rows {
+            assert_eq!(*count, 1);
+            match mem_config.as_deref() {
+                Some("dynamic_gtt") => assert!((avg_quality - 5.0).abs() < 1e-9),
+                Some("carveout") => assert!((avg_quality - 1.0).abs() < 1e-9),
+                other => panic!("unexpected mem_config value: {other:?}"),
+            }
+        }
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM code_profile_runs WHERE profile_id = $1")
+            .bind(profile_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM model_profiles WHERE id = $1")
+            .bind(profile_id)
             .execute(&pool)
             .await;
     }
