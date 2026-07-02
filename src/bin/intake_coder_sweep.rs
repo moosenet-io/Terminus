@@ -52,6 +52,7 @@ use serde::{Deserialize, Serialize};
 use terminus_rs::config;
 use terminus_rs::error::ToolError;
 use terminus_rs::intake::assistant::acquire::{Nomination, Nominations};
+use terminus_rs::intake::assistant::schema;
 use terminus_rs::intake::assistant::BackendTag;
 use terminus_rs::intake::{self, infer};
 
@@ -455,6 +456,30 @@ async fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+
+    // Schema-dependency ordering (NOT accidental -- flagged in review): the
+    // `backend_tag` column on the externally-managed `code_profile_runs` table
+    // (storage.rs: "tables already exist ... DO NOT create them here") is added
+    // ONLY by `assistant::schema::migrate()`. The assistant-side entry points
+    // (runner.rs::run(), reporting.rs) already call it before any DB work; this
+    // binary is a second, independent entry point into the SAME shared DB and
+    // must not assume the assistant sweep ran first (a fresh DB, or a host
+    // where the coder sweep is the first thing ever run, would otherwise fail
+    // every `insert_code_run_v2` with "column backend_tag does not exist" --
+    // silently swallowed by `run_one_backend`'s `?` into a skip-with-reason, so
+    // the sweep "succeeds" while persisting zero rows). migrate() is idempotent
+    // and cheap, so calling it here unconditionally is safe on every run.
+    let pool = match schema::get_pool().await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("coder sweep did not start: schema pool connect failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = schema::migrate(&pool).await {
+        eprintln!("coder sweep did not start: schema migrate failed: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
 
     eprintln!(
         "coder sweep starting: {} models, langs={}, case_limit={:?}, checkpoint={}",
