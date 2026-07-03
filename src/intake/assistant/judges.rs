@@ -93,18 +93,70 @@ impl Judge for CliJudge {
     }
 
     async fn invoke(&self, prompt: &str, _attempt: u8) -> JudgeReply {
+        let timeout = Duration::from_secs(config::judge_timeout_secs());
+        // Split-topology: invoke the judge CLI over ssh on the host where it's
+        // OAuth-logged-in (the inference host runs the sweep; the judge CLIs
+        // live on the dev host, per JUDGE_SSH_HOST); otherwise shell out locally.
+        if let Some(host) = config::judge_ssh_host() {
+            return run_cli_remote(self.provider, &host, prompt, timeout).await;
+        }
         let cli = config::judge_cli(self.provider);
         let model = config::judge_model(self.provider);
-        let timeout = Duration::from_secs(config::judge_timeout_secs());
-        run_cli(&cli, model.as_deref(), prompt, timeout).await
+        run_cli(self.provider, &cli, model.as_deref(), prompt, timeout).await
     }
 }
 
-/// Shell out to a provider CLI: `<cli> [--model <model>] --print`, prompt on
-/// stdin, stdout captured. Mirrors the `tokio::process::Command` pattern used by
-/// the `code_v2` validator. Classifies auth/missing-binary failures so the panel
-/// can degrade rather than crash.
+/// How a provider's CLI is driven in NON-INTERACTIVE (headless) mode. The harness
+/// originally hardcoded claude's `--print` + prompt-on-stdin, which does NOT drive
+/// gemini or codex (their headless invocations differ) — left unfixed, both would
+/// silently abstain and personality would score on claude alone. Each provider's
+/// real headless form is encoded here.
+struct CliInvocation {
+    /// A leading subcommand (codex needs `exec`); `None` for claude/gemini.
+    subcommand: Option<&'static str>,
+    /// The flag that carries the prompt. `Some("--print")` is a boolean flag and
+    /// the prompt goes on STDIN (claude); `Some("-p")` takes the prompt as the
+    /// flag's value (gemini); `None` ⇒ the prompt is a positional arg (codex exec).
+    prompt_flag: Option<&'static str>,
+    /// True ⇒ feed the prompt on stdin; false ⇒ pass it as an argument.
+    prompt_on_stdin: bool,
+}
+
+impl JudgeProvider {
+    /// The provider's verified non-interactive invocation:
+    ///   - claude → `claude [--model M] --print`           (prompt on stdin)
+    ///   - gemini → `gemini [--model M] -p "<prompt>"`      (prompt as flag value)
+    ///   - codex  → `codex exec [--model M] "<prompt>"`     (prompt positional)
+    fn invocation(self) -> CliInvocation {
+        match self {
+            JudgeProvider::Claude => CliInvocation {
+                subcommand: None,
+                prompt_flag: Some("--print"),
+                prompt_on_stdin: true,
+            },
+            JudgeProvider::Gemini => CliInvocation {
+                subcommand: None,
+                prompt_flag: Some("-p"),
+                prompt_on_stdin: false,
+            },
+            JudgeProvider::Codex => CliInvocation {
+                subcommand: Some("exec"),
+                prompt_flag: None,
+                prompt_on_stdin: false,
+            },
+        }
+    }
+}
+
+/// Monotonic nonce so concurrent codex judge calls never collide on the
+/// `--output-last-message` temp file path.
+static CODEX_OUT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Shell out to a provider CLI in its headless form (see [`JudgeProvider::invocation`]),
+/// prompt delivered on stdin or as an arg per provider, stdout captured. Classifies
+/// auth/missing-binary failures so the panel can degrade rather than crash.
 async fn run_cli(
+    provider: JudgeProvider,
     cli: &str,
     model: Option<&str>,
     prompt: &str,
@@ -113,14 +165,56 @@ async fn run_cli(
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
+    let inv = provider.invocation();
     let mut cmd = Command::new(cli);
+    if let Some(sub) = inv.subcommand {
+        cmd.arg(sub);
+    }
     if let Some(m) = model {
+        // `--model` is accepted by all three CLIs (claude / gemini / codex exec).
         cmd.arg("--model").arg(m);
     }
-    // `--print` (non-interactive, print result and exit) mirrors how the
-    // operator's reviewer CLIs are driven; prompt is fed on stdin.
-    cmd.arg("--print");
-    cmd.stdin(std::process::Stdio::piped());
+    match inv.prompt_flag {
+        // Boolean flag + prompt on stdin (claude `--print`).
+        Some(flag) if inv.prompt_on_stdin => {
+            cmd.arg(flag);
+        }
+        // Flag takes the prompt as its value (gemini `-p "<prompt>"`).
+        Some(flag) => {
+            cmd.arg(flag).arg(prompt);
+        }
+        // Positional prompt (codex `exec "<prompt>"`).
+        None => {
+            cmd.arg(prompt);
+        }
+    }
+
+    // codex `exec` echoes the FULL prompt + a token-usage footer on stdout, so a
+    // judging prompt that embeds the model's reply (which may contain braces) could
+    // defeat the first-balanced-object extractor. `--output-last-message <file>`
+    // writes ONLY the model's final message — the clean JSON — which we read back
+    // instead of stdout. Robust regardless of prompt content.
+    let codex_outfile: Option<std::path::PathBuf> = if matches!(provider, JudgeProvider::Codex) {
+        let nonce = CODEX_OUT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("codex-judge-{}-{}.txt", std::process::id(), nonce));
+        cmd.arg("--output-last-message").arg(&path);
+        cmd.arg("--color").arg("never");
+        // codex 0.142+ refuses to run outside a trusted git repo directory
+        // (a working-dir trust gate added after this harness was last
+        // validated) — the sweep's cwd is never a git repo, so this is
+        // required, not optional; confirmed live against codex-cli 0.142.3.
+        cmd.arg("--skip-git-repo-check");
+        Some(path)
+    } else {
+        None
+    };
+
+    cmd.stdin(if inv.prompt_on_stdin {
+        std::process::Stdio::piped()
+    } else {
+        std::process::Stdio::null()
+    });
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
@@ -131,10 +225,12 @@ async fn run_cli(
         }
     };
 
-    if let Some(mut stdin) = child.stdin.take() {
-        // Best-effort: a write failure becomes an empty-output abstain downstream.
-        let _ = stdin.write_all(prompt.as_bytes()).await;
-        let _ = stdin.shutdown().await;
+    if inv.prompt_on_stdin {
+        if let Some(mut stdin) = child.stdin.take() {
+            // Best-effort: a write failure becomes an empty-output abstain downstream.
+            let _ = stdin.write_all(prompt.as_bytes()).await;
+            let _ = stdin.shutdown().await;
+        }
     }
 
     let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
@@ -143,23 +239,100 @@ async fn run_cli(
         Err(_) => return JudgeReply::Unavailable(format!("'{cli}' timed out")),
     };
 
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    // For codex, prefer the clean final-message file over the noisy stdout.
+    let stdout = if let Some(path) = &codex_outfile {
+        let file_msg = tokio::fs::read_to_string(path).await.unwrap_or_default();
+        let _ = tokio::fs::remove_file(path).await;
+        if file_msg.trim().is_empty() {
+            String::from_utf8_lossy(&out.stdout).to_string()
+        } else {
+            file_msg
+        }
+    } else {
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    classify_judge_output(cli, out.status.success(), stdout, &stderr)
+}
 
-    if !out.status.success() {
-        if looks_like_auth_error(&stderr) || looks_like_auth_error(&stdout) {
-            return JudgeReply::AuthError(format!("'{cli}' not authenticated"));
+/// Classify a judge process's output into a [`JudgeReply`]: auth failure (so the
+/// panel degrades to abstain with an operator warning), unavailable (nonzero +
+/// empty output), or the raw text to parse. Shared by the local and remote paths.
+fn classify_judge_output(label: &str, success: bool, stdout: String, stderr: &str) -> JudgeReply {
+    if !success {
+        if looks_like_auth_error(stderr) || looks_like_auth_error(&stdout) {
+            return JudgeReply::AuthError(format!("'{label}' not authenticated"));
         }
         // Non-zero but produced stdout we can still try to parse; otherwise unavailable.
         if stdout.trim().is_empty() {
-            let snippet = redact(&stderr);
-            return JudgeReply::Unavailable(format!("'{cli}' exited nonzero: {snippet}"));
+            let snippet = redact(stderr);
+            return JudgeReply::Unavailable(format!("'{label}' exited nonzero: {snippet}"));
         }
     } else if looks_like_auth_error(&stdout) {
-        return JudgeReply::AuthError(format!("'{cli}' not authenticated"));
+        return JudgeReply::AuthError(format!("'{label}' not authenticated"));
     }
-
     JudgeReply::Text(stdout)
+}
+
+/// REMOTE-JUDGE hop: invoke the provider's CLI over `ssh <host>` (the runner is on
+/// the inference host; the judge CLIs are OAuth-logged-in on `host`). The prompt is
+/// piped on ssh stdin; the per-provider headless form runs in a single remote shell
+/// (so codex's `--output-last-message` temp file is created + read back ON the
+/// remote host, and no arg-quoting crosses the wire). `$HOME/.local/bin` is prepended
+/// to PATH because a non-interactive ssh shell does not load the login profile.
+async fn run_cli_remote(
+    provider: JudgeProvider,
+    host: &str,
+    prompt: &str,
+    timeout: Duration,
+) -> JudgeReply {
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+
+    let cli = config::judge_cli(provider);
+    // Per-provider headless form, prompt arriving on the remote shell's stdin.
+    let path = r#"export PATH="$HOME/.local/bin:/usr/local/bin:$PATH";"#;
+    let script = match provider {
+        // claude reads the prompt natively from stdin.
+        JudgeProvider::Claude => format!("{path} {cli} --print"),
+        // agy/--print takes the prompt as a VALUE → read it from stdin via cat.
+        JudgeProvider::Gemini => format!("{path} {cli} --print \"$(cat)\""),
+        // codex: clean final message via a remote temp file (brace-robust), echoed back.
+        // --skip-git-repo-check: codex 0.142+ refuses to run outside a trusted git
+        // repo dir (the remote shell's cwd is $HOME, never a git repo) -- confirmed
+        // live against codex-cli 0.142.3 over this exact ssh hop.
+        JudgeProvider::Codex => format!(
+            "{path} f=$(mktemp); {cli} exec --skip-git-repo-check --output-last-message \"$f\" \"$(cat)\" \
+             >/dev/null 2>&1; cat \"$f\"; rm -f \"$f\""
+        ),
+    };
+
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("BatchMode=yes")
+        .arg("-o").arg("StrictHostKeyChecking=accept-new")
+        .arg("-o").arg("ConnectTimeout=10")
+        .arg(host)
+        .arg(&script);
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return JudgeReply::Unavailable(format!("cannot ssh to judge host: {e}")),
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(prompt.as_bytes()).await;
+        let _ = stdin.shutdown().await;
+    }
+    let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return JudgeReply::Unavailable(format!("remote judge '{cli}' failed: {e}")),
+        Err(_) => return JudgeReply::Unavailable(format!("remote judge '{cli}' timed out")),
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    classify_judge_output(&cli, out.status.success(), stdout, &stderr)
 }
 
 /// Heuristic auth-failure detection across CLIs.

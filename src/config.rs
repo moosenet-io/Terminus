@@ -82,6 +82,14 @@ pub fn judge_model(provider: JudgeProvider) -> Option<String> {
     env_nonempty(&key)
 }
 
+/// Split-topology judge host from `JUDGE_SSH_HOST` (e.g. `user@judge-host`).
+/// `Some` ⇒ every judge CLI is invoked over `ssh <host>` instead of locally —
+/// the runner lives on the inference host, but the judge CLIs are OAuth-logged-in
+/// on `host`. `None` ⇒ shell out locally (single-host topology).
+pub fn judge_ssh_host() -> Option<String> {
+    env_nonempty("JUDGE_SSH_HOST")
+}
+
 /// Per-judge wall-clock timeout (seconds) from `JUDGE_TIMEOUT_SECS`, default 120.
 pub fn judge_timeout_secs() -> u64 {
     env_nonempty("JUDGE_TIMEOUT_SECS")
@@ -299,6 +307,24 @@ mod tests {
     #[test]
     fn provider_ids_stable() {
         assert_eq!(JudgeProvider::all().map(|p| p.id()), ["claude", "gemini", "codex"]);
+    }
+
+    #[test]
+    #[serial]
+    fn judge_ssh_host_none_when_unset_or_blank() {
+        std::env::remove_var("JUDGE_SSH_HOST");
+        assert_eq!(judge_ssh_host(), None);
+        std::env::set_var("JUDGE_SSH_HOST", "   ");
+        assert_eq!(judge_ssh_host(), None);
+        std::env::remove_var("JUDGE_SSH_HOST");
+    }
+
+    #[test]
+    #[serial]
+    fn judge_ssh_host_reads_and_trims_set_value() {
+        std::env::set_var("JUDGE_SSH_HOST", "  user@judge-host  ");
+        assert_eq!(judge_ssh_host(), Some("user@judge-host".to_string()));
+        std::env::remove_var("JUDGE_SSH_HOST");
     }
 
     #[test]
