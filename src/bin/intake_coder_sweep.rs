@@ -303,6 +303,20 @@ async fn run_one_backend(
     infer::set_backend_override(Some(override_str.to_string()));
     let _clear = ClearOverride;
 
+    // ── HFIX-05 pre-flight: skip cleanly (one reason) instead of persisting
+    //    a "model not found" 404 PER CASE (up to 200 wasted rows per model,
+    //    the dominant failure mode found auditing the dynamic_gtt run) ──
+    if !infer::model_available(&model_id).await {
+        let reason = format!(
+            "model '{model_id}' not present in the resolved backend's Ollama registry (not pulled)"
+        );
+        return Ok(BackendReport {
+            model_id,
+            backend_tag: backend,
+            outcome: BackendOutcome::Skipped(reason),
+        });
+    }
+
     // ── per-model flow, mirroring ModelIntake: profile row → suite → persist.
     //    A fresh profile row scopes this (model, backend) pass's code rows. ──
     let profile_id = match intake::create_profile_row(&model_id).await {

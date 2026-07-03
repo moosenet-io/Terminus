@@ -219,6 +219,11 @@ pub async fn insert_code_run(
 pub struct CodeRunRowV2 {
     pub language: String,
     pub task_type: Option<String>,
+    /// The v2 corpus manifest's unique case id (HFIX-06) — lets a gap audit
+    /// identify WHICH specific case a row came from, not just its
+    /// language/task_type. `None` for rows written before this column
+    /// existed.
+    pub case_id: Option<String>,
     /// Graduated 0-5 quality of the FIRST attempt.
     pub first_pass_score: Option<i32>,
     /// 0-5 score of the retry (only when first_pass was 1-2; else NULL).
@@ -260,8 +265,8 @@ pub async fn insert_code_run_v2(
          (profile_id, harness_version, language, task_type, \
           first_pass_score, retry_score, compiles, tests_pass, change_correct, \
           code_quality_score, context_tokens, response_tokens, file_count, total_lines, \
-          throughput_tok_per_sec, total_time_ms, oom, error, backend_tag, mem_config) \
-         VALUES ($1, 'v2', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
+          throughput_tok_per_sec, total_time_ms, oom, error, backend_tag, mem_config, case_id) \
+         VALUES ($1, 'v2', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)",
     )
     .bind(profile_id)
     .bind(&row.language)
@@ -282,6 +287,7 @@ pub async fn insert_code_run_v2(
     .bind(row.error.as_deref())
     .bind(row.backend_tag.as_deref())
     .bind(row.mem_config.as_deref())
+    .bind(row.case_id.as_deref())
     .execute(pool)
     .await
     .map_err(|e| ToolError::Database(format!("Failed to insert code_profile_runs (v2): {e}")))?;

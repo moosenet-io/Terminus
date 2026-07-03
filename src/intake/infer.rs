@@ -234,6 +234,58 @@ pub fn vram_used_mb() -> Option<u64> {
     None
 }
 
+/// Fast pre-flight: is `model` present in its resolved backend's Ollama
+/// registry (`/api/tags`)? HFIX-05: without this, a model missing from
+/// ollama's local registry (e.g. temporarily removed during disk cleanup)
+/// produced one "model not found" 404 PER CASE — up to 200 wasted rows for a
+/// single model — instead of one clean, diagnosable skip. Only meaningful
+/// for `kind == "ollama"` backends (a `llama-server` backend resolves a GGUF
+/// path directly, not a pull registry, so it always reports available here).
+/// Fail-open (`true`) on any transport/parse error — a flaky `/api/tags`
+/// must never wrongly skip a model that IS actually available; the existing
+/// per-case retry already covers real transient failures once inference is
+/// attempted.
+pub async fn model_available(model: &str) -> bool {
+    let backend = resolve_backend(model);
+    if backend.kind != "ollama" {
+        return true;
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return true,
+    };
+    let resp = match client
+        .get(format!("{}/api/tags", backend.url))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return true,
+    };
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return true,
+    };
+    tags_contains_model(&body, model)
+}
+
+/// Pure core of [`model_available`]: does a parsed `/api/tags` body list
+/// `model`? Tolerant of either `name` or `model` as the tag field (both
+/// appear across Ollama versions) and of a missing/malformed `models` array
+/// (treated as "can't tell" — `true`, matching the fail-open policy).
+fn tags_contains_model(body: &serde_json::Value, model: &str) -> bool {
+    let Some(models) = body.get("models").and_then(|m| m.as_array()) else {
+        return true;
+    };
+    models.iter().any(|m| {
+        m.get("name").and_then(|n| n.as_str()) == Some(model)
+            || m.get("model").and_then(|n| n.as_str()) == Some(model)
+    })
+}
+
 /// Run `model`/`prompt` on its tagged backend and return normalized metrics.
 /// Never panics — transport/HTTP/backend errors land in `InferMetrics::error`.
 pub async fn infer_with_metrics(
@@ -556,5 +608,39 @@ mod tests {
         );
         let b = resolve_backend_at("qwen3:8b", path.to_str().unwrap(), "http://localhost:11434", None);
         assert_eq!(b.kind, "ollama"); // legacy format, no tag → fallback
+    }
+
+    // ---- HFIX-05: /api/tags membership check (pure core) ----
+
+    #[test]
+    fn tags_contains_model_true_when_name_matches() {
+        let body = serde_json::json!({"models": [{"name": "gemma3:12b"}, {"name": "qwen3:32b"}]});
+        assert!(tags_contains_model(&body, "qwen3:32b"));
+    }
+
+    #[test]
+    fn tags_contains_model_true_when_model_field_matches() {
+        // Some Ollama versions key the tag as "model" instead of "name".
+        let body = serde_json::json!({"models": [{"model": "starcoder2:15b"}]});
+        assert!(tags_contains_model(&body, "starcoder2:15b"));
+    }
+
+    #[test]
+    fn tags_contains_model_false_when_absent() {
+        let body = serde_json::json!({"models": [{"name": "gemma3:12b"}]});
+        assert!(!tags_contains_model(&body, "qwen3-coder:30b"));
+    }
+
+    #[test]
+    fn tags_contains_model_fails_open_on_malformed_body() {
+        // No "models" array at all — can't tell, so don't wrongly skip.
+        let body = serde_json::json!({"unexpected": "shape"});
+        assert!(tags_contains_model(&body, "qwen3:32b"));
+    }
+
+    #[test]
+    fn tags_contains_model_empty_list_means_genuinely_absent() {
+        let body = serde_json::json!({"models": []});
+        assert!(!tags_contains_model(&body, "qwen3:32b"));
     }
 }

@@ -184,6 +184,19 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
         .await
         .map_err(|e| ToolError::Database(format!("add code_profile_runs.mem_config: {e}")))?;
 
+    // `case_id` (HFIX-06): the v2 corpus manifest's unique case identifier
+    // (e.g. "rust-blitz-a3"). Before this column existed, a row only carried
+    // `language`/`task_type` — not enough to identify WHICH specific case it
+    // came from when several cases share a language+task_type, so a gap
+    // audit could tell you a model's overall error rate but never which
+    // particular cases were missing/invalid, only "re-run the whole model"
+    // (exactly the workflow this column exists to end). NULL for rows
+    // written before this column existed — never backfilled/guessed.
+    sqlx::query("ALTER TABLE code_profile_runs ADD COLUMN IF NOT EXISTS case_id TEXT")
+        .execute(pool)
+        .await
+        .map_err(|e| ToolError::Database(format!("add code_profile_runs.case_id: {e}")))?;
+
     // 3. The dual-profile join view. Built so a model present in only ONE side
     //    still appears (key set = UNION of both sides' model_ids), and so a
     //    missing builder `backend_tag` column degrades to NULL rather than

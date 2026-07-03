@@ -147,6 +147,24 @@ pub fn filter_by_language(cases: &[CaseV2], languages: &[String]) -> Vec<CaseV2>
         .collect()
 }
 
+/// Filter cases down to an explicit id list (exact match); `None` or empty ⇒
+/// all. HFIX-06: lets a single case (or a small named set) be re-run to fill a
+/// specific result gap, instead of always re-running a model's entire suite.
+/// Pure, mirrors `filter_by_language`'s no-op-when-unset convention. Unknown
+/// ids are silently absent from the result (not an error) — the caller (the
+/// case-rerun tool) reports which requested ids were actually found.
+pub fn filter_by_ids(cases: &[CaseV2], ids: Option<&[String]>) -> Vec<CaseV2> {
+    let Some(ids) = ids else { return cases.to_vec() };
+    if ids.is_empty() {
+        return cases.to_vec();
+    }
+    cases
+        .iter()
+        .filter(|c| ids.iter().any(|w| w == &c.id))
+        .cloned()
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Build-pipeline prompt (pure)
 // ---------------------------------------------------------------------------
@@ -504,24 +522,42 @@ fn is_transport_error(e: &str) -> bool {
         || l.contains("eof")
 }
 
-/// Generate, retrying ONCE after 10s on a transport-style error. OOM and
-/// deterministic errors are not retried. Mirrors the plan's per-case error
-/// policy so a transient `error sending request` does not corrupt a row.
+/// Backoff delays (seconds) between retries of a transport-style error, in
+/// order. HFIX-04: a single fixed 10s retry did not survive the SUSTAINED
+/// (multi-minute) connectivity windows actually observed on <host> — ollama's
+/// own runner reloads are fast (all but 4 loads across the whole multi-day
+/// sweep history finished under 10s), so a lone 10s wait was retrying too
+/// early into a contention window that was still ongoing. Three escalating
+/// waits give a slow-clearing window real room to pass before the case is
+/// recorded as a hard failure.
+const TRANSPORT_RETRY_BACKOFF_SECS: [u64; 3] = [10, 20, 40];
+
+/// Generate, retrying on a transport-style error with escalating backoff
+/// (see `TRANSPORT_RETRY_BACKOFF_SECS`). OOM and deterministic errors are not
+/// retried. Mirrors the plan's per-case error policy so a transient
+/// `error sending request` does not corrupt a row.
 async fn generate_with_retry(
     client: &reqwest::Client,
     model: &str,
     prompt: &str,
     timeout: Duration,
 ) -> context::GenOutcome {
-    let g = context::generate(client, model, prompt, timeout).await;
-    if !g.oom {
-        if let Some(e) = &g.error {
-            if is_transport_error(e) {
-                tracing::warn!("intake v2: transient inference error ({e}); retrying once in 10s");
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                return context::generate(client, model, prompt, timeout).await;
-            }
+    let mut g = context::generate(client, model, prompt, timeout).await;
+    for (attempt, delay_secs) in TRANSPORT_RETRY_BACKOFF_SECS.iter().enumerate() {
+        if g.oom {
+            break;
         }
+        let Some(e) = &g.error else { break };
+        if !is_transport_error(e) {
+            break;
+        }
+        tracing::warn!(
+            "intake v2: transient inference error ({e}); retry {}/{} in {delay_secs}s",
+            attempt + 1,
+            TRANSPORT_RETRY_BACKOFF_SECS.len(),
+        );
+        tokio::time::sleep(Duration::from_secs(*delay_secs)).await;
+        g = context::generate(client, model, prompt, timeout).await;
     }
     g
 }
@@ -544,6 +580,7 @@ async fn run_one_case_v2(
         task_type: case.task_type.clone().or_else(|| Some("build_modify".into())),
         backend_tag: backend_tag.map(str::to_string),
         mem_config: mem_config.map(str::to_string),
+        case_id: Some(case.id.clone()),
         ..Default::default()
     };
     let none = CaseV2Result::default;
@@ -793,16 +830,43 @@ pub async fn run_code_suite_v2(
     backend_tag: Option<&str>,
     mem_config: Option<&str>,
 ) -> Result<CodeV2Outcome, ToolError> {
+    run_code_suite_v2_cases(
+        model_name,
+        languages,
+        None,
+        profile_id,
+        case_limit,
+        backend_tag,
+        mem_config,
+    )
+    .await
+}
+
+/// Like [`run_code_suite_v2`] but scoped to an explicit `case_ids` subset
+/// (HFIX-06). `None`/empty ⇒ every case matching `languages`, i.e. identical
+/// behavior to `run_code_suite_v2`. Lets a single case (or a small named set)
+/// be re-run to fill a specific result gap without re-running a model's
+/// entire suite — the case-rerun tool (`intake_coder_case`) is the intended
+/// caller; the fleet sweep (`intake_coder_sweep`) always passes `None`.
+pub async fn run_code_suite_v2_cases(
+    model_name: &str,
+    languages: &[String],
+    case_ids: Option<&[String]>,
+    profile_id: uuid::Uuid,
+    case_limit: Option<usize>,
+    backend_tag: Option<&str>,
+    mem_config: Option<&str>,
+) -> Result<CodeV2Outcome, ToolError> {
     sweep_stale_workspaces();
     let dir = corpus_v2_dir();
     let all = read_manifest_v2(&dir)?;
-    let mut cases = filter_by_language(&all, languages);
+    let mut cases = filter_by_ids(&filter_by_language(&all, languages), case_ids);
     if let Some(n) = case_limit {
         cases.truncate(n);
     }
     if cases.is_empty() {
         return Err(ToolError::NotConfigured(
-            "no v2 code cases match the requested languages".into(),
+            "no v2 code cases match the requested languages/case_ids".into(),
         ));
     }
 
@@ -940,6 +1004,17 @@ mod tests {
         assert!(!is_transport_error("model 'foo' not found"));
         assert!(!is_transport_error("invalid prompt"));
         assert!(!is_transport_error("out of memory"));
+    }
+
+    #[test]
+    fn transport_retry_backoff_escalates_across_three_attempts() {
+        // HFIX-04: a single fixed 10s wait did not survive the sustained
+        // (multi-minute) connectivity windows observed on <host>. Three
+        // escalating waits (not a single fixed one, not unbounded) is the
+        // load-bearing shape here.
+        assert_eq!(TRANSPORT_RETRY_BACKOFF_SECS, [10, 20, 40]);
+        assert_eq!(TRANSPORT_RETRY_BACKOFF_SECS.len(), 3);
+        assert!(TRANSPORT_RETRY_BACKOFF_SECS.windows(2).all(|w| w[1] > w[0]));
     }
 
     #[test]
@@ -1170,5 +1245,43 @@ mod tests {
         ];
         assert_eq!(filter_by_language(&cases, &[]).len(), 2);
         assert_eq!(filter_by_language(&cases, &["RUST".into()])[0].id, "a");
+    }
+
+    fn two_cases() -> Vec<CaseV2> {
+        vec![
+            CaseV2 { id: "a".into(), language: "rust".into(), tier: "blitz".into(),
+                spec: default_spec(), validate: default_validate(), dir: "rust/blitz/a".into(),
+                workspace: "wx-config".into(), files: vec![], timeout_s: None, task_type: None },
+            CaseV2 { id: "b".into(), language: "python".into(), tier: "blitz".into(),
+                spec: default_spec(), validate: default_validate(), dir: "python/blitz/b".into(),
+                workspace: "py".into(), files: vec![], timeout_s: None, task_type: None },
+        ]
+    }
+
+    #[test]
+    fn filter_by_ids_none_means_all() {
+        assert_eq!(filter_by_ids(&two_cases(), None).len(), 2);
+    }
+
+    #[test]
+    fn filter_by_ids_empty_means_all() {
+        assert_eq!(filter_by_ids(&two_cases(), Some(&[])).len(), 2);
+    }
+
+    #[test]
+    fn filter_by_ids_selects_exact_matches_only() {
+        let ids = vec!["b".to_string()];
+        let got = filter_by_ids(&two_cases(), Some(&ids));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "b");
+    }
+
+    #[test]
+    fn filter_by_ids_unknown_id_yields_empty_not_error() {
+        // Pure filter — the caller (case-rerun tool) is responsible for
+        // reporting which requested ids were not found; this function just
+        // filters.
+        let ids = vec!["nonexistent".to_string()];
+        assert!(filter_by_ids(&two_cases(), Some(&ids)).is_empty());
     }
 }
