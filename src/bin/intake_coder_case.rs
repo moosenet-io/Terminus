@@ -25,6 +25,7 @@
 //!   / `INTAKE_STAGING_DIR` / `INTAKE_CORPUS_V2_DIR` vars the fleet sweep uses.
 
 use terminus_rs::intake::assistant::schema;
+use terminus_rs::intake::gpu_authority::{self, GpuMode};
 use terminus_rs::intake::{self, infer};
 
 /// Read a required, trimmed, non-empty env var. `Err` names the var so a
@@ -125,6 +126,20 @@ async fn main() -> std::process::ExitCode {
         eprintln!("case rerun did not start: schema migrate failed: {e}");
         return std::process::ExitCode::FAILURE;
     }
+
+    // HFIX-07: exclusive GPU use, same as the fleet sweep — a gap-fill rerun
+    // is still live inference on the shared Ollama instance, and must not
+    // silently overlap with an active sweep (the exact incident that
+    // produced false "wedge" timeouts earlier — see gpu_authority's module
+    // doc). A DIFFERENT holder label than the sweep's means this correctly
+    // refuses to start while the sweep holds the GPU, rather than racing it.
+    let _gpu_guard = match gpu_authority::ExclusiveGuard::acquire(GpuMode::Exclusive, "intake_coder_case") {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("case rerun did not start: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
 
     struct ClearOverride;
     impl Drop for ClearOverride {

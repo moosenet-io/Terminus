@@ -54,6 +54,7 @@ use terminus_rs::error::ToolError;
 use terminus_rs::intake::assistant::acquire::{Nomination, Nominations};
 use terminus_rs::intake::assistant::schema;
 use terminus_rs::intake::assistant::BackendTag;
+use terminus_rs::intake::gpu_authority::{self, GpuMode};
 use terminus_rs::intake::{self, infer};
 
 // ===========================================================================
@@ -511,6 +512,21 @@ async fn main() -> std::process::ExitCode {
         eprintln!("coder sweep did not start: schema migrate failed: {e}");
         return std::process::ExitCode::FAILURE;
     }
+
+    // HFIX-07: proactively claim exclusive GPU use BEFORE running a single
+    // case — stops competing production services and brings Ollama's own
+    // runner config to a single-resident-model state, idempotently (a
+    // resumed run that's already exclusive touches nothing). Refuses to
+    // start rather than silently racing another exclusive holder for the
+    // GPU (the exact failure mode that produced false "wedge" timeouts
+    // earlier in this sweep — see the gpu_authority module doc).
+    let _gpu_guard = match gpu_authority::ExclusiveGuard::acquire(GpuMode::Exclusive, "intake_coder_sweep") {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("coder sweep did not start: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
 
     eprintln!(
         "coder sweep starting: {} models, langs={}, case_limit={:?}, mem_config={}, checkpoint={}",

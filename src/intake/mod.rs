@@ -23,6 +23,7 @@ pub mod assistant;
 mod code;
 mod code_v2;
 mod context;
+pub mod gpu_authority;
 pub mod infer;
 pub mod lifecycle;
 pub mod newcats;
