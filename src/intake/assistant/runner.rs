@@ -165,12 +165,17 @@ pub trait SuiteDriver: Send + Sync {
     /// implementation sets around the pass and clears after. `Err(reason)` ⇒ the
     /// dimension degraded/hung; the runner records the reason and continues to the
     /// next dimension.
+    ///
+    /// `yarn` is `Some` only when `dimension == dim7_yarn_depth::DIMENSION`
+    /// (the runner only ever passes it for a `yarn_capable` nomination's
+    /// extra dimension) — every other dimension ignores it.
     async fn run_dimension(
         &self,
         model_id: &ModelId,
         backend: BackendTag,
         backend_override: &str,
         dimension: &str,
+        yarn: Option<&super::acquire::YarnConfig>,
     ) -> Result<Vec<DimensionScore>, String>;
 }
 
@@ -364,10 +369,11 @@ pub async fn run_with(
     Ok(RunReport { models })
 }
 
-/// Run the smoke + six dimensions for one (model, backend), honoring resume.
+/// Run the smoke + six dimensions (plus the `yarn_context_depth` seventh, for a
+/// `yarn_capable` nomination) for one (model, backend), honoring resume.
 #[allow(clippy::too_many_arguments)]
 async fn run_one_backend(
-    _nom: &Nomination,
+    nom: &Nomination,
     model_id: &ModelId,
     backend_tag: BackendTag,
     override_str: &str,
@@ -380,9 +386,23 @@ async fn run_one_backend(
     let mut resumed = Vec::new();
     let mut dim_skips = Vec::new();
 
+    // ── this (model)'s dimension list: the fixed six, plus yarn_context_depth
+    //    when the nomination is yarn_capable with a config to act on ──
+    let mut dims: Vec<&str> = SUITE_DIMENSIONS.to_vec();
+    if nom.yarn_config().is_some() {
+        dims.push(super::dim7_yarn_depth::DIMENSION);
+    } else if nom.yarn_misconfigured() {
+        // yarn_capable but no yarn config — an authoring error, not silence.
+        dim_skips.push((
+            super::dim7_yarn_depth::DIMENSION.to_string(),
+            "yarn_capable is true but nominations.json has no `yarn` config for this model"
+                .to_string(),
+        ));
+    }
+
     // If EVERY dimension is already checkpointed, the backend is fully resumed —
     // we can skip the smoke entirely (the model already ran here).
-    let all_done = SUITE_DIMENSIONS
+    let all_done = dims
         .iter()
         .all(|d| done.contains(&CheckpointKey::new(model_id, backend_tag, d)));
 
@@ -401,15 +421,21 @@ async fn run_one_backend(
     }
 
     // ── full suite, dimension by dimension, persisting + checkpointing each ──
-    for dim in SUITE_DIMENSIONS {
+    for dim in dims {
         let key = CheckpointKey::new(model_id, backend_tag, dim);
         if done.contains(&key) {
-            resumed.push((*dim).to_string());
+            resumed.push(dim.to_string());
             continue; // already persisted on a prior run → resume past it
         }
 
+        let yarn = if dim == super::dim7_yarn_depth::DIMENSION {
+            nom.yarn_config()
+        } else {
+            None
+        };
+
         match driver
-            .run_dimension(model_id, backend_tag, override_str, dim)
+            .run_dimension(model_id, backend_tag, override_str, dim, yarn)
             .await
         {
             Ok(rows) => {
@@ -418,18 +444,18 @@ async fn run_one_backend(
                 // dimension whose rows already landed (idempotent enough), never a
                 // checkpoint that claims work the DB doesn't have.
                 if let Err(e) = sink.write(&rows).await {
-                    dim_skips.push(((*dim).to_string(), format!("persist failed: {e}")));
+                    dim_skips.push((dim.to_string(), format!("persist failed: {e}")));
                     continue;
                 }
                 if let Err(e) = checkpoint.mark(&key).await {
-                    dim_skips.push(((*dim).to_string(), format!("checkpoint failed: {e}")));
+                    dim_skips.push((dim.to_string(), format!("checkpoint failed: {e}")));
                     continue;
                 }
-                persisted.push((*dim).to_string());
+                persisted.push(dim.to_string());
             }
             Err(reason) => {
                 // Hanging/OOM/degraded dimension → record reason, keep going.
-                dim_skips.push(((*dim).to_string(), reason));
+                dim_skips.push((dim.to_string(), reason));
             }
         }
     }
@@ -558,12 +584,14 @@ impl SuiteDriver for LiveSuiteDriver {
         backend: BackendTag,
         override_str: &str,
         dimension: &str,
+        yarn: Option<&super::acquire::YarnConfig>,
     ) -> Result<Vec<DimensionScore>, String> {
         let client = self.client.clone();
         let timeout = self.timeout;
         let model_name = model_id.as_str().to_string();
         let model_id = model_id.clone();
         let judges = self.judges.clone();
+        let yarn = yarn.cloned();
 
         // Each arm constructs the dimension's LIVE model (unified proxy path),
         // runs the real `run_dimN`, and flattens to rows — all under the P5
@@ -639,6 +667,28 @@ impl SuiteDriver for LiveSuiteDriver {
                     let report =
                         dim6_embeddings::run_dim6(&embedder, public.as_ref(), &engram).await;
                     Ok(report.into_dimension_scores())
+                }
+                d if d == dim7_yarn_depth::DIMENSION => {
+                    let cfg = yarn.ok_or_else(|| {
+                        "yarn_context_depth dimension requested with no YarnConfig".to_string()
+                    })?;
+                    let corpus = dim7_yarn_depth::load_corpus()?;
+                    let model =
+                        dim1_conversation::LiveModel::new(client, model_name, timeout);
+                    let out = dim7_yarn_depth::run_yarn_depth(
+                        &model,
+                        &judges,
+                        &corpus,
+                        cfg.native_ctx,
+                        cfg.extended_ctx,
+                    )
+                    .await;
+                    Ok(out.into_dimension_scores(
+                        &model_id,
+                        backend,
+                        cfg.native_ctx,
+                        cfg.extended_ctx,
+                    ))
                 }
                 other => Err(format!("unknown dimension: {other}")),
             }
@@ -771,6 +821,7 @@ mod tests {
             backend: BackendTag,
             _o: &str,
             dimension: &str,
+            _yarn: Option<&super::acquire::YarnConfig>,
         ) -> Result<Vec<DimensionScore>, String> {
             self.dim_calls.lock().unwrap().push((
                 model_id.as_str().to_string(),
@@ -852,6 +903,74 @@ mod tests {
         assert!(m.acquisition_skip.is_none());
         assert_eq!(m.backends.len(), 2);
         assert!(m.backends.iter().all(|b| b.survived));
+    }
+
+    #[test]
+    fn yarn_capable_nomination_runs_the_seventh_dimension() {
+        // A yarn_capable model with a config gets 7 dims per backend, not 6 —
+        // and one of them is genuinely `yarn_context_depth` (S86), not just a
+        // count coincidence.
+        let n = noms(
+            r#"{"nominations":[{"id":"smollm3:3b","size_b":3,"gfx1151_class":"confirmed",
+                "acquisition":"ollama_pull","yarn_capable":true,
+                "yarn":{"native_ctx":65536,"extended_ctx":131072,"rope_scale":2.0,"yarn_orig_ctx":65536}}]}"#,
+        );
+        let acq = ScriptAcquirer { skip: BTreeSet::new() };
+        let driver = ScriptDriver::new();
+        let sink = MemSink::default();
+        let cp = MemCheckpoint::default();
+        let fleet = MemFleet::default();
+
+        let report = block(run_with(&n, &acq, &driver, &sink, &cp, &fleet)).unwrap();
+
+        // 7 dims × 2 backends = 14 rows persisted, 14 checkpoints.
+        assert_eq!(sink.rows.lock().unwrap().len(), 14);
+        assert_eq!(cp.keys.lock().unwrap().len(), 14);
+        assert!(
+            driver
+                .dim_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, _, dim)| dim == super::super::dim7_yarn_depth::DIMENSION),
+            "the driver must have actually been asked to run yarn_context_depth"
+        );
+        let m = &report.models[0];
+        assert!(m.backends.iter().all(|b| b.dim_skips.is_empty()));
+    }
+
+    #[test]
+    fn yarn_capable_without_config_is_a_visible_skip_not_silence() {
+        // yarn_capable:true with no `yarn` block is an authoring error — it
+        // must show up as a dim_skip, not vanish (and must not crash the run).
+        let n = noms(
+            r#"{"nominations":[{"id":"broken:1b","size_b":1,"gfx1151_class":"confirmed",
+                "acquisition":"ollama_pull","yarn_capable":true}]}"#,
+        );
+        let acq = ScriptAcquirer { skip: BTreeSet::new() };
+        let driver = ScriptDriver::new();
+        let sink = MemSink::default();
+        let cp = MemCheckpoint::default();
+        let fleet = MemFleet::default();
+
+        let report = block(run_with(&n, &acq, &driver, &sink, &cp, &fleet)).unwrap();
+
+        // Still only the standard 6 dims ran (dim7 never got invoked) ...
+        assert!(
+            !driver
+                .dim_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, _, dim)| dim == super::super::dim7_yarn_depth::DIMENSION),
+            "misconfigured yarn_capable must not invoke the dimension"
+        );
+        // ... but every backend surfaces the misconfiguration as a dim_skip.
+        let m = &report.models[0];
+        assert!(m.backends.iter().all(|b| b
+            .dim_skips
+            .iter()
+            .any(|(dim, _)| dim == super::super::dim7_yarn_depth::DIMENSION)));
     }
 
     #[test]

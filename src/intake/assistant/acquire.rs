@@ -85,6 +85,25 @@ pub enum AcquisitionPath {
     HfFetch,
 }
 
+/// YaRN (RoPE-scaling context extension) configuration for a nomination
+/// flagged `yarn_capable`. Drives [`super::dim7_yarn_depth::run_yarn_depth`]'s
+/// depth ladder (native / 30% / 60% / 100%-of-`extended_ctx`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct YarnConfig {
+    /// The model's un-extended (training) context window, in tokens.
+    pub native_ctx: usize,
+    /// The YaRN-extended target context window, in tokens.
+    pub extended_ctx: usize,
+    /// RoPE scaling factor (`extended_ctx / yarn_orig_ctx`, informational —
+    /// the harness derives its own depth targets from `native_ctx`/`extended_ctx`).
+    #[serde(default)]
+    pub rope_scale: f64,
+    /// The original context YaRN was computed against (may differ from
+    /// `native_ctx` for some quantizations; informational).
+    #[serde(default)]
+    pub yarn_orig_ctx: usize,
+}
+
 /// One nomination record from ASMT-08's `nominations.json`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Nomination {
@@ -97,6 +116,15 @@ pub struct Nomination {
     pub gfx1151_class: Gfx1151Class,
     /// How to acquire the weights.
     pub acquisition: AcquisitionPath,
+    /// True ⇒ also run the `yarn_context_depth` dimension (S86) for this
+    /// model, in addition to the standard six-dimension suite. Requires
+    /// `yarn` to be `Some` (a `true` flag with no config is a nominations.json
+    /// authoring error, not silently ignored — see [`Nomination::yarn_config`]).
+    #[serde(default)]
+    pub yarn_capable: bool,
+    /// The YaRN depth-ladder configuration, when `yarn_capable`.
+    #[serde(default)]
+    pub yarn: Option<YarnConfig>,
     /// Optional Hugging Face repo (required for `HfFetch`).
     #[serde(default)]
     pub hf_repo: Option<String>,
@@ -135,6 +163,24 @@ impl Nomination {
     /// The model id as the S83-byte-identical [`ModelId`] (pass-through).
     pub fn model_id(&self) -> ModelId {
         ModelId::from_registry_key(self.id.clone())
+    }
+
+    /// The effective YaRN config for this nomination, or `None` if it doesn't
+    /// run the `yarn_context_depth` dimension.
+    ///
+    /// `yarn_capable: true` with no `yarn` block is a nominations.json
+    /// authoring error (a flag with nothing to act on), not a silent skip —
+    /// callers get `None` here too, but [`Nomination::yarn_misconfigured`]
+    /// distinguishes the two so the runner can surface it instead of quietly
+    /// never measuring the model.
+    pub fn yarn_config(&self) -> Option<&YarnConfig> {
+        if self.yarn_capable { self.yarn.as_ref() } else { None }
+    }
+
+    /// True ⇒ `yarn_capable` is set but `yarn` is missing — an authoring
+    /// error worth surfacing (as a dim-skip reason), not a silent no-op.
+    pub fn yarn_misconfigured(&self) -> bool {
+        self.yarn_capable && self.yarn.is_none()
     }
 
     /// Ordered backend strategy for this nomination: the `(BackendTag, override)`
@@ -364,6 +410,8 @@ mod tests {
             hf_repo: None,
             backends: vec![],
             rationale: String::new(),
+            yarn_capable: false,
+            yarn: None,
         }
     }
 
