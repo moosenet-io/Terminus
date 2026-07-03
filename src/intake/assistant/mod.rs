@@ -30,6 +30,7 @@ pub mod dim2_toolchain;
 pub mod dim3_memory;
 pub mod dim4_ocean;
 pub mod dim6_embeddings;
+pub mod dim7_yarn_depth;
 pub mod fleet;
 pub mod judges;
 pub mod reporting;

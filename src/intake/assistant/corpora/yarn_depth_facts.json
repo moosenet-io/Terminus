@@ -1,0 +1,9 @@
+{
+  "schema_version": "s86-yarn-depth-01",
+  "description": "Single planted-fact + filler corpus for the YaRN context-depth degradation harness (dim7_yarn_depth). Unlike conversation_depth.json (turn-count depth, dim1), this corpus is padded with filler_paragraph to reach a TARGET CONTEXT-TOKEN depth per probe rung (native / 30% / 60% / 100% of a model's YaRN-extended context). The fact and filler are abstract and PII-free by construction: no IPs, hostnames, container numbers, emails, names, or secrets.",
+  "fact_key": "waypoint",
+  "fact_statement": "Before anything else in this message: the waypoint codeword you must remember for later is Halcyon-Reef-42. Keep it in mind no matter how much text follows.",
+  "expect_substrings": ["halcyon-reef-42", "halcyon reef 42"],
+  "probe_question": "One more thing: what was the exact waypoint codeword given to you at the very start of this message, before all the filler text?",
+  "filler_paragraph": "The regional logistics cooperative spent the quarter reorganizing its inventory rotation policy, shifting from a strict first-in-first-out schedule to a hybrid model that weighted both shelf age and seasonal demand curves. Analysts noted that the change reduced spoilage in perishable categories while modestly increasing handling costs in the short term, a trade-off the operations committee judged acceptable given the volatility in upstream supplier pricing. Meanwhile, a separate working group reviewed driver routing heuristics, comparing static zone assignments against a dynamic nearest-neighbor approach that recalculated stops each morning based on overnight order volume. Early results were mixed: the dynamic approach cut average delivery time in dense urban zones but added variance in rural routes where sparse stops made clustering less reliable. The committee agreed to keep both approaches running in parallel for another cycle before choosing one to standardize."
+}

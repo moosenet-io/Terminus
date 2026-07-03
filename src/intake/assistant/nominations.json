@@ -238,7 +238,42 @@
       "gfx1151_class": "confirmed",
       "availability": "HF (HuggingFaceTB/SmolLM3-3B) + official GGUF (ggml-org/SmolLM3-3B-GGUF); community Ollama (alibayram/smollm3) — NOT yet in the official Ollama library. Acquire via GGUF.",
       "rationale": "Transparent floor test for 'how small can the fast alias go.' Tiny dense → confirmed-class on Vulkan.",
-      "priority": 4
+      "priority": 4,
+      "yarn_capable": true,
+      "yarn": {
+        "native_ctx": 65536,
+        "extended_ctx": 131072,
+        "rope_scale": 2.0,
+        "yarn_orig_ctx": 65536,
+        "instruct_confidence": "confirmed",
+        "note": "HuggingFaceTB/SmolLM3-3B IS the instruct/chat checkpoint (base is the separately-named HuggingFaceTB/SmolLM3-3B-Base); YaRN 128k extension (factor 2.0 over the 64k training context) is natively documented in the model's own config, not a third-party rope-scaling graft. Good ASMT-yarn-depth candidate (src/intake/assistant/dim7_yarn_depth.rs) at low risk, since the base non-YaRN nomination above already has a fleet datapoint on this host."
+      }
+    },
+    {
+      "id": "qwen3:0.6b-yarn",
+      "display_name": "Qwen3 0.6B (YaRN-extended GGUF)",
+      "tier": "C",
+      "fleet": "lumina",
+      "new": true,
+      "size_params": "0.6B dense",
+      "active_params": "0.6B (dense)",
+      "vram_fit": "fits trivially (<1GB at Q4/Q8)",
+      "license": "Apache-2.0",
+      "source_leaderboard": "Qwen3 family evals (0.6B tier); no independent long-context leaderboard entry for this quant specifically.",
+      "score_note": "Not expected to be a quality contender at 0.6B — nominated specifically to validate the yarn_context_depth harness mechanics cheaply (fast, tiny, disposable) before spending time on larger YaRN candidates.",
+      "gfx1151_class": "confirmed",
+      "availability": "HF GGUF (jukofyork/Qwen3-0.6B-YaRN-GGUF, quantized at 32k/64k/128k/256k YaRN targets from base Qwen/Qwen3-0.6B). Not in the official Ollama library — acquire via gguf_path.",
+      "rationale": "Cheapest possible smoke test of the YaRN depth-degradation harness end-to-end (serving flags, padded-prompt probing, collapse detection) on real inference before committing GPU time to a larger, slower YaRN model.",
+      "priority": 10,
+      "yarn_capable": true,
+      "yarn": {
+        "native_ctx": 32768,
+        "extended_ctx": 131072,
+        "rope_scale": 4.0,
+        "yarn_orig_ctx": 32768,
+        "instruct_confidence": "likely_but_unverified",
+        "note": "Qwen/Qwen3-0.6B (the un-suffixed repo, as distinct from Qwen/Qwen3-0.6B-Base) is Qwen's chat/instruct checkpoint, and jukofyork's quant is a straightforward llama.cpp rope-scaling bake of that repo, not a separate fine-tune — so this is very likely instruct-tuned. NOT independently confirmed against the quantizer's own model card text at nomination time; verify the source repo's base-model line before trusting scores from this entry, per operator's guidance to flag rather than guess."
+      }
     },
     {
       "id": "command-a-plus:latest",
@@ -263,5 +298,26 @@
   "not_recommended_without_measurement": {
     "note": "Community persona fine-tunes flagged in the seed (single low-authority source). Measure, do not trust. Not added to the acquisition list.",
     "examples": ["Rocinante-12B-class", "Snowpiercer-15B-class"]
+  },
+  "yarn_candidates_excluded": {
+    "note": "S86 yarn_context_depth harness (dim7_yarn_depth.rs) survey of YaRN-family models on the model-storage host. Excluded from the assistant fleet with reasons — do NOT add without addressing the reason first.",
+    "examples": [
+      {
+        "family": "NousResearch/Yarn-Llama-2-{7b,13b,70b}-{32k,64k,128k}",
+        "reason": "Continued-pretraining BASE models (further pretrained on long-context data with the YaRN method), not instruct/chat fine-tuned — no chat template, not RLHF/SFT'd for assistant behavior. Confirmed via the NousResearch YaRN collection model cards. Wrong shape for an assistant-quality sweep; a coder/base-completion sweep might still want them, but this is the assistant fleet."
+      },
+      {
+        "family": "NousResearch/Yarn-Mistral-7b-{64k,128k}",
+        "reason": "Same as Yarn-Llama-2 — continued-pretraining extension of Mistral-7B-v0.1 base, not an instruct/chat checkpoint."
+      },
+      {
+        "family": "NousResearch/Yarn-Solar-10b-{32k,64k}",
+        "reason": "Same pattern — YaRN-extended continued-pretrain of the SOLAR-10.7B-v1.0 base model, not instruct-tuned."
+      },
+      {
+        "family": "Qwen2.5-Coder-32B-Instruct-128k-yarn (e.g. Sg-at-srijan-us-kg's GGUF quant)",
+        "reason": "IS instruct-tuned, but it is a CODER model (Qwen2.5-Coder line), not a general assistant model — belongs in the coder sweep's YaRN validation, not here. Excluded per the operator's explicit steer that coder-tuned YaRN variants don't belong in the assistant fleet even when instruct-tuned."
+      }
+    ]
   }
 }
