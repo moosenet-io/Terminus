@@ -643,6 +643,21 @@ async fn run_one_case_v2(
     // (`well_formed = true`, score still 0).
     row.well_formed = Some(produced);
 
+    // security-scan-signal: heuristic vulnerability-pattern scan over the
+    // materialized output files. NON-FATAL and SEPARATE from the correctness
+    // score — a finding never changes `first_pass_score`/`effective`. `None`
+    // (SQL NULL) when nothing was produced OR the language is unsupported by the
+    // heuristic; `Some(0)` when scanned clean; `Some(N)` for N findings. This is
+    // a coarse heuristic (see `intake::vuln_scan`), not a real SAST tool.
+    row.vuln_finding_count = if produced {
+        crate::intake::vuln_scan::scan_outputs(
+            &case.language,
+            outputs.values().map(String::as_str),
+        )
+    } else {
+        None
+    };
+
     // First-pass response to judge later (only when code was produced).
     let mut first_response: Option<String> = None;
     let mut retry_response: Option<String> = None;

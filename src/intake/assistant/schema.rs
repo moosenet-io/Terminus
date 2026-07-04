@@ -371,6 +371,25 @@ async fn migrate_locked(conn: &mut PgConnection) -> Result<(), ToolError> {
     .await
     .map_err(|e| ToolError::Database(format!("add code_profile_runs.sample_index: {e}")))?;
 
+    // `vuln_finding_count` (security-scan-signal): count of heuristic
+    // vulnerability-pattern findings in a case's generated output, from the
+    // dependency-free scanner in `intake::vuln_scan`. This is a SEPARATE signal
+    // from correctness — it is NEVER a gate on `first_pass_score`. Semantics:
+    //   NULL = not scanned (no code produced, or language unsupported by the
+    //          heuristic — bash/py/ts/rust are supported today),
+    //   0    = scanned, none of the known-bad patterns present,
+    //   N    = N pattern hits.
+    // Honest caveat (also documented in `vuln_scan`): the scanner is a coarse
+    // line-based heuristic, NOT a real SAST tool — a non-zero count means
+    // "worth a human look", never "confirmed exploitable"; a 0 means "none of
+    // THESE patterns", never "provably clean". Replace with a real tool
+    // (semgrep/bandit/cargo-audit/gosec) when one can be installed on the sweep
+    // host. NULL for every row written before this column existed.
+    sqlx::query("ALTER TABLE code_profile_runs ADD COLUMN IF NOT EXISTS vuln_finding_count INTEGER")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| ToolError::Database(format!("add code_profile_runs.vuln_finding_count: {e}")))?;
+
     // `run_score_points` (multi-point-score-tracking): a flexible, long-format
     // sidecar table capturing EVERY per-point measurement a suite computes
     // along an axis (context-length tiers, tool-count bands, …), not just the
@@ -432,8 +451,25 @@ async fn migrate_locked(conn: &mut PgConnection) -> Result<(), ToolError> {
 
     // `model_language_stats` (multi-point-score-tracking): a per-(model,
     // language) rollup of the `dynamic_gtt` code sweep — mean/stddev score,
-    // retry lift, throughput, latency (mean + p95), malformed rate (via the new
-    // `well_formed` column) and error rate. Pure SQL; no Rust writes to it.
+    // retry lift, throughput, latency (mean + p95), GPU-time cost
+    // (`total_gpu_seconds` + the `quality_per_gpu_second` composite), malformed
+    // rate (via the new `well_formed` column) and error rate. Pure SQL; no Rust
+    // writes to it.
+    //
+    // GPU-COST SIGNAL (gpu-cost-signal): a coder sweep runs under
+    // `gpu_authority`'s `Exclusive` mode — competing services stopped, one
+    // Ollama-resident model at a time — so per-case wall-clock `total_time_ms`
+    // IS the GPU-time cost of that case (nothing else contends for the GPU
+    // during the sweep). `total_gpu_seconds` = SUM(total_time_ms)/1000 per
+    // (model, language) is "how much GPU-time budget committing to this model
+    // for the whole batch would cost" — different information from the per-case
+    // `mean_latency_ms` already above. `quality_per_gpu_second` =
+    // mean_score / (total_gpu_seconds / n_scored) folds quality and that cost
+    // into one higher-is-better routing number (good quality bought cheaply).
+    // Both divisors are `NULLIF`-guarded: a model with zero scored cases or
+    // zero accumulated time yields NULL, never a divide-by-zero at view-create
+    // time. The pure-Rust twin (independently unit-tested) is
+    // `crate::intake::code::quality_per_gpu_second`.
     // Scoped to `mem_config = 'dynamic_gtt'` so it never blends the preserved
     // `carveout` baseline into the current config's numbers.
     //
@@ -441,9 +477,23 @@ async fn migrate_locked(conn: &mut PgConnection) -> Result<(), ToolError> {
     // snapshot frozen at creation/refresh time. Nothing in this change wires an
     // automatic refresh; refreshing it (`REFRESH MATERIALIZED VIEW
     // model_language_stats`) after a sweep is an explicit operational task.
-    // `CREATE MATERIALIZED VIEW IF NOT EXISTS` is a no-op once it exists, so a
-    // repeated `migrate()` never rebuilds/refreshes it (intentional — a rebuild
-    // here would surprise operators mid-sweep).
+    //
+    // DROP + CREATE, not `CREATE ... IF NOT EXISTS` (gpu-cost-signal fixup,
+    // caught in review): Postgres's `IF NOT EXISTS` only skips the CREATE if a
+    // relation with that name already exists — it does NOT compare or update
+    // the view's column list against the CREATE statement's current SELECT.
+    // The very first version of this view (multi-point-score-tracking) used
+    // `IF NOT EXISTS` and was deployed to production; every subsequent column
+    // this migration wants to add (e.g. `total_gpu_seconds`/
+    // `quality_per_gpu_second`) would therefore silently never appear on an
+    // already-migrated database — the CREATE would just no-op against the
+    // existing, older-shaped view. Since this is a pure derived/computed view
+    // (no source-of-truth data lives only here — dropping and recreating it
+    // loses nothing that isn't trivially recomputable from `code_profile_runs`
+    // in milliseconds at current row counts), DROP-then-CREATE on every
+    // `migrate_locked()` call is the correct, safe evolution strategy for a
+    // view whose definition needs to keep growing new columns, unlike the
+    // `ADD COLUMN IF NOT EXISTS` pattern used for actual tables above.
     //
     // MULTI-SAMPLE-CONSISTENCY: two extra columns, `pass_at_3` and `pass_hat_3`,
     // quantify a model's per-case reliability across the N repeats that
@@ -467,8 +517,12 @@ async fn migrate_locked(conn: &mut PgConnection) -> Result<(), ToolError> {
     // same clamp `pass_at_k`/`pass_hat_k` express by returning `None`), and
     // `avg()` skips those NULLs, so a (model, language) that was only ever run
     // single-sample reports NULL pass@3/pass^3 rather than a fabricated number.
+    sqlx::query("DROP MATERIALIZED VIEW IF EXISTS model_language_stats")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| ToolError::Database(format!("drop model_language_stats matview: {e}")))?;
     sqlx::query(
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS model_language_stats AS \
+        "CREATE MATERIALIZED VIEW model_language_stats AS \
          WITH case_counts AS ( \
              SELECT profile_id, language, case_id, \
                  count(*) AS n_samples, \
@@ -503,8 +557,15 @@ async fn migrate_locked(conn: &mut PgConnection) -> Result<(), ToolError> {
              avg(r.throughput_tok_per_sec) AS mean_throughput, \
              avg(r.total_time_ms) AS mean_latency_ms, \
              percentile_cont(0.95) WITHIN GROUP (ORDER BY r.total_time_ms) AS p95_latency_ms, \
+             sum(r.total_time_ms)::float / 1000.0 AS total_gpu_seconds, \
+             avg(r.first_pass_score) FILTER (WHERE r.error IS NULL) \
+                 / NULLIF( \
+                     (sum(r.total_time_ms)::float / 1000.0) \
+                         / NULLIF(count(*) FILTER (WHERE r.error IS NULL), 0)::float, \
+                     0) AS quality_per_gpu_second, \
              (count(*) FILTER (WHERE r.well_formed = false))::float / greatest(count(*),1)::float AS malformed_rate, \
              (count(*) FILTER (WHERE r.error IS NOT NULL))::float / greatest(count(*),1)::float AS error_rate, \
+             avg(r.vuln_finding_count) FILTER (WHERE r.vuln_finding_count IS NOT NULL) AS mean_vuln_findings, \
              pk.pass_at_3, \
              pk.pass_hat_3 \
          FROM code_profile_runs r \
