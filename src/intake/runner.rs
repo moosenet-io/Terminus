@@ -98,7 +98,7 @@ fn is_hot(loaded: &[(String, u64)], target: &str) -> bool {
 /// trivial generate with an empty prompt. Lazy-load brings the model hot.
 async fn load_model(client: &reqwest::Client, model: &str) -> Result<(), ToolError> {
     let base = context::ollama_base();
-    let body = serde_json::json!({ "model": model, "keep_alive": "30m" });
+    let body = serde_json::json!({ "model": model, "keep_alive": context::OLLAMA_KEEP_ALIVE });
     client
         .post(format!("{base}/api/generate"))
         .json(&body)
