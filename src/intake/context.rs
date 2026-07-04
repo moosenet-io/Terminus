@@ -20,6 +20,22 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+/// How long Ollama keeps a model resident after the last request, set
+/// explicitly on every `/api/generate` and `/api/chat` call in this module.
+///
+/// HFIX-03: without this, Ollama falls back to its server default (5 min),
+/// measured from the *start* of the previous request. A single slow
+/// generate call on a large model (dynamic GTT pool, cold reloads can run
+/// well past a minute) can itself take close to 5 minutes, so the model is
+/// evicted right before the next case's request arrives — forcing another
+/// cold reload, which is itself slow enough to trip the same eviction
+/// again. This created a self-reinforcing cold-load cycle that showed up
+/// as near-total per-case failure (timeouts, and historically some
+/// "model not found" 404s from a stale/racing unload) for the fleet's
+/// larger models, while small/fast-loading models were mostly unaffected.
+/// 30 minutes comfortably outlasts a single model's whole case suite.
+const OLLAMA_KEEP_ALIVE: &str = "30m";
+
 // ---------------------------------------------------------------------------
 // Embedded filler corpus (real repo files)
 // ---------------------------------------------------------------------------
@@ -367,6 +383,7 @@ pub async fn run_tier(
         "model": model_name,
         "prompt": prompt,
         "stream": false,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": { "num_ctx": next_pow2_ctx(actual_tokens) }
     });
 
@@ -494,6 +511,7 @@ pub async fn generate_at(
         "model": model_name,
         "prompt": prompt,
         "stream": false,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": { "num_ctx": next_pow2_ctx(estimate_tokens(prompt)) }
     });
     let started = Instant::now();
@@ -563,6 +581,7 @@ pub async fn chat_with_tools(
         "model": model_name,
         "messages": [ { "role": "user", "content": user_prompt } ],
         "stream": false,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
     });
     if tools.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
         body["tools"] = tools.clone();
@@ -644,6 +663,31 @@ pub fn next_pow2_ctx(prompt_tokens: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ollama_keep_alive_is_a_generous_nonzero_duration() {
+        // Guards against a future edit accidentally setting this to "0" or ""
+        // (both of which mean "unload immediately" / "use server default" in
+        // Ollama's API), which would silently reintroduce the eviction cycle
+        // this constant exists to prevent.
+        assert!(!OLLAMA_KEEP_ALIVE.is_empty());
+        assert_ne!(OLLAMA_KEEP_ALIVE, "0");
+    }
+
+    #[test]
+    fn all_three_ollama_request_builders_set_keep_alive() {
+        // HFIX-03: run_tier, generate_at, and chat_with_tools each build their
+        // own request body (no shared constructor), so nothing at the type
+        // level stops one of them from losing the field on a future edit.
+        // This test reads the source directly so it fails loudly if that
+        // happens, rather than only showing up as a live-fleet regression.
+        let src = include_str!("context.rs");
+        let call_sites = src.matches("\"keep_alive\": OLLAMA_KEEP_ALIVE").count();
+        assert_eq!(
+            call_sites, 3,
+            "expected run_tier, generate_at, and chat_with_tools to each set keep_alive"
+        );
+    }
 
     #[test]
     fn estimate_tokens_is_chars_over_four() {
