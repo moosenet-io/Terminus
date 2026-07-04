@@ -643,6 +643,21 @@ async fn run_one_case_v2(
     // (`well_formed = true`, score still 0).
     row.well_formed = Some(produced);
 
+    // security-scan-signal: heuristic vulnerability-pattern scan over the
+    // materialized output files. NON-FATAL and SEPARATE from the correctness
+    // score — a finding never changes `first_pass_score`/`effective`. `None`
+    // (SQL NULL) when nothing was produced OR the language is unsupported by the
+    // heuristic; `Some(0)` when scanned clean; `Some(N)` for N findings. This is
+    // a coarse heuristic (see `intake::vuln_scan`), not a real SAST tool.
+    row.vuln_finding_count = if produced {
+        crate::intake::vuln_scan::scan_outputs(
+            &case.language,
+            outputs.values().map(String::as_str),
+        )
+    } else {
+        None
+    };
+
     // First-pass response to judge later (only when code was produced).
     let mut first_response: Option<String> = None;
     let mut retry_response: Option<String> = None;
@@ -887,10 +902,34 @@ pub async fn run_code_suite_v2_cases(
     // the top, so a sufficiently slow model could never finish. Writing a row
     // per case (kept as `Some(id)` in `row_ids`) restores a steady trickle
     // matching actual progress, so row-age liveness checks stay accurate.
-    let mut pending: Vec<CaseV2Result> = Vec::with_capacity(cases.len());
-    let mut row_ids: Vec<uuid::Uuid> = Vec::with_capacity(cases.len());
-    for case in &cases {
-        let cr = run_one_case_v2(&client, model_name, case, &dir, backend_tag, mem_config).await;
+    // MULTI-SAMPLE-CONSISTENCY: expand the case list to `n_samples` repeats per
+    // case (each repeat carries its 0-based `sample_index`). `n_samples`
+    // defaults to 1 (`samples_per_case()`), so the flat `sampled` list is
+    // identical to `cases` unless `INTAKE_SAMPLES_PER_CASE` is set > 1 — Phases
+    // 1/2/3 below iterate `sampled` instead of `cases`, keeping the one-row-per
+    // (case, sample) structure that `row_ids`/`pending` are indexed by. Each
+    // repeat writes its OWN `code_profile_runs` row (same `case_id`,
+    // incrementing `sample_index`), so pass@k/pass^k can aggregate the repeats.
+    let n_samples = samples_per_case();
+    if n_samples > 1 {
+        tracing::info!(
+            "intake v2: multi-sample enabled (INTAKE_SAMPLES_PER_CASE={n_samples}) — \
+             running {} case(s) × {n_samples} = {} inference passes for model {model_name}",
+            cases.len(),
+            cases.len() * n_samples as usize,
+        );
+    }
+    let sampled: Vec<(&CaseV2, i16)> = cases
+        .iter()
+        .flat_map(|c| (0..n_samples).map(move |s| (c, s as i16)))
+        .collect();
+
+    let mut pending: Vec<CaseV2Result> = Vec::with_capacity(sampled.len());
+    let mut row_ids: Vec<uuid::Uuid> = Vec::with_capacity(sampled.len());
+    for &(case, sample_index) in &sampled {
+        let mut cr =
+            run_one_case_v2(&client, model_name, case, &dir, backend_tag, mem_config).await;
+        cr.row.sample_index = sample_index;
         let id = storage::insert_code_run_v2(&pool, profile_id, &cr.row).await?;
         row_ids.push(id);
         pending.push(cr);
@@ -901,7 +940,7 @@ pub async fn run_code_suite_v2_cases(
     // suite (one swap) instead of once — or twice, with retries — per case.
     // Each case's row already exists (Phase 1); patch in the judge score (and
     // the judge-driven 4→5 bump) via `update_code_run_v2_judge`.
-    for ((case, cr), &id) in cases.iter().zip(pending.iter_mut()).zip(row_ids.iter()) {
+    for ((&(case, _), cr), &id) in sampled.iter().zip(pending.iter_mut()).zip(row_ids.iter()) {
         if let Some(resp) = cr.first_response.clone() {
             let q = judge_idiom(&client, &cr.spec, &resp).await;
             cr.row.code_quality_score = q;
@@ -959,7 +998,7 @@ pub async fn run_code_suite_v2_cases(
     let mut per_case: Vec<(String, i32, Option<i32>)> = Vec::new();
     let mut errors = 0usize;
 
-    for (case, cr) in cases.iter().zip(pending.iter()) {
+    for (&(case, _), cr) in sampled.iter().zip(pending.iter()) {
         let is_toolchain = cr
             .row
             .error
@@ -1003,6 +1042,69 @@ pub async fn run_code_suite_v2_cases(
         errors,
         per_case,
     })
+}
+
+/// How many times to run each case (multi-sample-consistency). Read from
+/// `INTAKE_SAMPLES_PER_CASE`; defaults to `1` for exact backward compatibility
+/// — multi-sampling is strictly OPT-IN, so an unset/blank/invalid/`< 1` value
+/// never silently multiplies a production sweep's runtime. A caller that wants
+/// pass@k / pass^k must set it explicitly (e.g. `3`).
+pub fn samples_per_case() -> u32 {
+    std::env::var("INTAKE_SAMPLES_PER_CASE")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1)
+}
+
+/// Unbiased pass@k estimator (multi-sample-consistency): the probability that
+/// at least one of `k` samples drawn (without replacement) from `n` total
+/// samples — of which `c` succeeded — is a success. This is the numerically
+/// stable product form from the Codex/HumanEval paper,
+/// `1 - Π_{i=n-c+1}^{n} (1 - k/i)`, NOT the biased shortcut `1 - (1 - c/n)^k`.
+///
+/// Returns `None` when `k > n` (pass@k is undefined — you cannot draw `k`
+/// distinct samples from fewer than `k`); the caller decides how to surface an
+/// under-sampled case (the `model_language_stats` matview maps it to SQL NULL).
+/// Defensive against the impossible `c > n` (clamped to `c = n`, never panics).
+/// Boundaries: `pass_at_k(n, 0, k) = 0.0`, `pass_at_k(n, n, k) = 1.0`, and
+/// `pass_at_k(n, c, 1) = c / n`.
+pub fn pass_at_k(n: u32, c: u32, k: u32) -> Option<f64> {
+    if k == 0 || k > n {
+        return None;
+    }
+    let c = c.min(n); // defensive: c > n cannot happen, but never panic on it.
+    if n - c < k {
+        // Fewer than k failures ⇒ every k-subset contains a success.
+        return Some(1.0);
+    }
+    // Product over the `c` terms i = n-c+1 ..= n (equivalently, over the
+    // failures): 1 - Π (1 - k/i). Iterating the high `i` end keeps each factor
+    // close to 1 and the product numerically stable.
+    let mut prod = 1.0_f64;
+    for i in (n - c + 1)..=n {
+        prod *= 1.0 - (k as f64) / (i as f64);
+    }
+    Some(1.0 - prod)
+}
+
+/// Plug-in pass^k estimator (multi-sample-consistency): the probability that
+/// ALL `k` samples succeed, estimated as `(c/n)^k`. Anthropic's "flakiness"
+/// signal — high pass@k with low pass^k marks a model that is *capable but
+/// unreliable* (it can solve a case but not dependably).
+///
+/// CAVEAT: unlike [`pass_at_k`], this is a POINT ESTIMATE (the plug-in
+/// `(c/n)^k`), not the exact without-replacement expectation — matching the
+/// simpler estimator the research (Anthropic/community pass^k) uses. Returns
+/// `None` for the same `k > n` under-sampled case as [`pass_at_k`] so the two
+/// stay defined over an identical domain; `k = 0` also yields `None`.
+/// Defensive against `c > n` (clamped). `pass_hat_k(n, c, 1) = c / n`.
+pub fn pass_hat_k(n: u32, c: u32, k: u32) -> Option<f64> {
+    if k == 0 || k > n {
+        return None;
+    }
+    let c = c.min(n);
+    Some((c as f64 / n as f64).powi(k as i32))
 }
 
 /// Map approved tiers to file-count bands for the op profile. Pure.
@@ -1330,5 +1432,104 @@ mod tests {
         // filters.
         let ids = vec!["nonexistent".to_string()];
         assert!(filter_by_ids(&two_cases(), Some(&ids)).is_empty());
+    }
+
+    // ---- multi-sample-consistency: pass@k / pass^k estimators -----------
+
+    /// `samples_per_case()` is opt-in: unset/blank/invalid/`< 1` ⇒ 1, so a
+    /// production sweep never silently multiplies its runtime.
+    #[test]
+    fn samples_per_case_defaults_to_one_and_is_opt_in() {
+        std::env::remove_var("INTAKE_SAMPLES_PER_CASE");
+        assert_eq!(samples_per_case(), 1);
+        std::env::set_var("INTAKE_SAMPLES_PER_CASE", "3");
+        assert_eq!(samples_per_case(), 3);
+        std::env::set_var("INTAKE_SAMPLES_PER_CASE", "  ");
+        assert_eq!(samples_per_case(), 1);
+        std::env::set_var("INTAKE_SAMPLES_PER_CASE", "nonsense");
+        assert_eq!(samples_per_case(), 1);
+        std::env::set_var("INTAKE_SAMPLES_PER_CASE", "0");
+        assert_eq!(samples_per_case(), 1);
+        std::env::remove_var("INTAKE_SAMPLES_PER_CASE");
+    }
+
+    const EPS: f64 = 1e-12;
+
+    /// pass@1 == pass^1 == c/n (the k=1 boundary), for both estimators.
+    #[test]
+    fn pass_at_and_hat_k1_equal_c_over_n() {
+        for (n, c) in [(5u32, 0u32), (5, 2), (5, 5), (10, 3), (1, 0), (1, 1)] {
+            let expected = c as f64 / n as f64;
+            assert!((pass_at_k(n, c, 1).unwrap() - expected).abs() < EPS);
+            assert!((pass_hat_k(n, c, 1).unwrap() - expected).abs() < EPS);
+        }
+    }
+
+    /// Boundaries: all-fail ⇒ 0, all-pass ⇒ 1, for every k ≤ n.
+    #[test]
+    fn pass_at_k_boundaries_all_fail_and_all_pass() {
+        for k in 1..=5u32 {
+            assert!(pass_at_k(5, 0, k).unwrap().abs() < EPS, "all-fail pass@{k}");
+            assert!((pass_at_k(5, 5, k).unwrap() - 1.0).abs() < EPS, "all-pass pass@{k}");
+            assert!(pass_hat_k(5, 0, k).unwrap().abs() < EPS);
+            assert!((pass_hat_k(5, 5, k).unwrap() - 1.0).abs() < EPS);
+        }
+    }
+
+    /// Known value: the classic Codex-paper example n=10, c=3 gives an unbiased
+    /// pass@5 ≈ 0.9166666... Computed by hand from `1 - C(7,5)/C(10,5)` =
+    /// `1 - 21/252 = 1 - 0.08333... = 0.91666...`. pass^5 = (3/10)^5 = 0.00243.
+    #[test]
+    fn pass_at_k_known_codex_n10_c3_k5() {
+        let got = pass_at_k(10, 3, 5).unwrap();
+        assert!((got - (1.0 - 21.0 / 252.0)).abs() < 1e-9, "pass@5 was {got}");
+        let hat = pass_hat_k(10, 3, 5).unwrap();
+        assert!((hat - 0.3_f64.powi(5)).abs() < 1e-12, "pass^5 was {hat}");
+    }
+
+    /// Known value cross-check: n=3, c=1. pass@2 = 1 - C(2,2)/C(3,2) =
+    /// 1 - 1/3 = 0.6666...; pass@3 = 1 (only one failure, every 3-subset — the
+    /// whole set — contains the one success). pass^2 = (1/3)^2 = 0.1111...
+    #[test]
+    fn pass_at_k_known_small_n3_c1() {
+        assert!((pass_at_k(3, 1, 2).unwrap() - (1.0 - 1.0 / 3.0)).abs() < 1e-12);
+        assert!((pass_at_k(3, 1, 3).unwrap() - 1.0).abs() < EPS);
+        assert!((pass_hat_k(3, 1, 2).unwrap() - (1.0 / 9.0)).abs() < 1e-12);
+    }
+
+    /// pass@k is non-decreasing in k; pass^k is non-increasing in k; both stay
+    /// in [0, 1]. Checked across a spread of (n, c) with 1 ≤ k ≤ n.
+    #[test]
+    fn pass_at_k_monotone_up_pass_hat_k_monotone_down() {
+        for n in 1..=10u32 {
+            for c in 0..=n {
+                let mut prev_at = -1.0_f64;
+                let mut prev_hat = 2.0_f64;
+                for k in 1..=n {
+                    let at = pass_at_k(n, c, k).unwrap();
+                    let hat = pass_hat_k(n, c, k).unwrap();
+                    assert!((0.0..=1.0).contains(&at), "pass@{k}({n},{c})={at} out of [0,1]");
+                    assert!((0.0..=1.0).contains(&hat), "pass^{k}({n},{c})={hat} out of [0,1]");
+                    assert!(at >= prev_at - EPS, "pass@k not non-decreasing at n={n} c={c} k={k}");
+                    assert!(hat <= prev_hat + EPS, "pass^k not non-increasing at n={n} c={c} k={k}");
+                    prev_at = at;
+                    prev_hat = hat;
+                }
+            }
+        }
+    }
+
+    /// k > n is undefined (can't draw k distinct samples) ⇒ `None` for both;
+    /// k = 0 ⇒ `None`; c > n never happens but is clamped, never panics.
+    #[test]
+    fn pass_at_k_edge_cases_none_and_defensive_clamp() {
+        assert_eq!(pass_at_k(3, 1, 4), None);
+        assert_eq!(pass_hat_k(3, 1, 4), None);
+        assert_eq!(pass_at_k(0, 0, 1), None);
+        assert_eq!(pass_at_k(5, 3, 0), None);
+        assert_eq!(pass_hat_k(5, 3, 0), None);
+        // c > n (impossible in practice) is clamped to c = n, not a panic.
+        assert!((pass_at_k(3, 9, 2).unwrap() - 1.0).abs() < EPS);
+        assert!((pass_hat_k(3, 9, 2).unwrap() - 1.0).abs() < EPS);
     }
 }
