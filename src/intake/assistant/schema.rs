@@ -359,18 +359,31 @@ async fn migrate_locked(conn: &mut PgConnection) -> Result<(), ToolError> {
     // existing `model_operational_profiles` writes are UNCHANGED — this only
     // preserves what was previously discarded.
     //
-    // Exactly ONE of the three run-FK columns is non-NULL per row (enforced by
-    // the `one_parent` CHECK), identifying which suite produced the point;
-    // `profile_id` is always set (the model the point belongs to) for a cheap
-    // per-model rollup without a three-way join. All three run FKs use
-    // `ON DELETE CASCADE` so points vanish with their parent run (mirrors the
+    // Exactly ONE of the three run-parent columns is non-NULL per row
+    // (enforced by the `one_parent` CHECK), identifying which suite produced
+    // the point; `profile_id` is always set (the model the point belongs to)
+    // for a cheap per-model rollup without a three-way join.
+    //
+    // Only `code_run_id` gets a real FK: `code_profile_runs` is guaranteed to
+    // exist in every environment this migration runs in (this DB's live
+    // coder/assistant sweeps write to it directly). `context_profile_runs`
+    // and `agent_profile_runs` do NOT exist in this production database today
+    // — verified directly against `information_schema.tables` before this
+    // migration shipped — so a hard `REFERENCES` to either would make this
+    // `CREATE TABLE` fail outright (`relation does not exist`), breaking
+    // startup for every binary that calls `migrate_locked()`, coder-sweep and
+    // assistant-sweep included. `context_run_id`/`agent_run_id` are therefore
+    // plain UUIDs with no FK enforcement; correctness is carried by the
+    // `one_parent` CHECK plus application code only ever populating the field
+    // matching the suite that ran. `code_run_id` uses `ON DELETE CASCADE` so
+    // its points vanish with their parent run (mirrors the
     // `assistant_dimension_score` → `assistant_profile_run` cascade above).
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS run_score_points ( \
             id             BIGSERIAL PRIMARY KEY, \
             code_run_id    UUID REFERENCES code_profile_runs(id) ON DELETE CASCADE, \
-            context_run_id UUID REFERENCES context_profile_runs(id) ON DELETE CASCADE, \
-            agent_run_id   UUID REFERENCES agent_profile_runs(id) ON DELETE CASCADE, \
+            context_run_id UUID, \
+            agent_run_id   UUID, \
             profile_id     UUID NOT NULL REFERENCES model_profiles(id), \
             axis           TEXT NOT NULL, \
             x_value        DOUBLE PRECISION NOT NULL, \
