@@ -637,6 +637,12 @@ async fn run_one_case_v2(
     let outputs = map_outputs(&case.files, &extracted);
     let produced = !outputs.is_empty();
 
+    // multi-point-score-tracking: record well-formedness BEFORE the graduated
+    // score is computed, so a 0 score from "nothing extracted"
+    // (`well_formed = false`) is distinguishable from "extracted but wrong"
+    // (`well_formed = true`, score still 0).
+    row.well_formed = Some(produced);
+
     // First-pass response to judge later (only when code was produced).
     let mut first_response: Option<String> = None;
     let mut retry_response: Option<String> = None;

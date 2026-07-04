@@ -93,17 +93,23 @@ pub async fn insert_model_profile(
     Ok(id)
 }
 
-/// Insert one `context_profile_runs` row.
+/// Insert one `context_profile_runs` row, returning its generated id.
+///
+/// Returns the new row's `id` (multi-point-score-tracking) so a caller can
+/// attach per-tier [`ScorePoint`]s to it via [`insert_score_points`]. Same
+/// additive-return-of-id pattern as [`insert_code_run_v2`]. The insert itself
+/// is unchanged — only the return type gained the row id.
 pub async fn insert_context_run(
     pool: &PgPool,
     profile_id: Uuid,
     row: &ContextRunRow,
-) -> Result<(), ToolError> {
-    sqlx::query(
+) -> Result<Uuid, ToolError> {
+    let id = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO context_profile_runs \
          (profile_id, context_tokens, throughput_tok_per_sec, ttft_ms, total_time_ms, \
           recall_score, coherence_score, memory_usage_mb, oom, error) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+         RETURNING id",
     )
     .bind(profile_id)
     .bind(row.context_tokens)
@@ -115,10 +121,10 @@ pub async fn insert_context_run(
     .bind(row.memory_usage_mb)
     .bind(row.oom)
     .bind(row.error.as_deref())
-    .execute(pool)
+    .fetch_one(pool)
     .await
     .map_err(|e| ToolError::Database(format!("Failed to insert context_profile_runs: {e}")))?;
-    Ok(())
+    Ok(id)
 }
 
 /// Insert the derived `model_operational_profiles` row.
@@ -258,6 +264,13 @@ pub struct CodeRunRowV2 {
     /// before this column existed (the preserved baseline) or by callers that
     /// don't yet track it — NEVER assume `None` means a specific config.
     pub mem_config: Option<String>,
+    /// Whether the model produced at least one extractable/mapped output file
+    /// (multi-point-score-tracking). Set to `Some(produced)` by `code_v2.rs`
+    /// BEFORE the graduated score is computed, so a 0 score from "nothing
+    /// extracted" (`Some(false)`) is distinguishable from "extracted but wrong"
+    /// (`Some(true)`). `None` for rows written before this column existed or by
+    /// callers that don't track it.
+    pub well_formed: Option<bool>,
 }
 
 /// SQL for [`insert_code_run_v2`]. Pulled out to a const so a unit test can
@@ -272,8 +285,8 @@ const INSERT_CODE_RUN_V2_SQL: &str = "INSERT INTO code_profile_runs \
       first_pass_score, retry_score, compiles, tests_pass, change_correct, \
       code_quality_score, context_tokens, response_tokens, file_count, total_lines, \
       throughput_tok_per_sec, total_time_ms, oom, error, backend_tag, mem_config, case_id, \
-      finalized) \
-     VALUES ($1, 'v2', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, \
+      well_formed, finalized) \
+     VALUES ($1, 'v2', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, \
      false) \
      RETURNING id";
 
@@ -316,6 +329,7 @@ pub async fn insert_code_run_v2(
         .bind(row.backend_tag.as_deref())
         .bind(row.mem_config.as_deref())
         .bind(row.case_id.as_deref())
+        .bind(row.well_formed)
         .fetch_one(pool)
         .await
         .map_err(|e| ToolError::Database(format!("Failed to insert code_profile_runs (v2): {e}")))?;
@@ -452,18 +466,24 @@ pub struct AgentRunRow {
     pub error: Option<String>,
 }
 
-/// Insert one `agent_profile_runs` row.
+/// Insert one `agent_profile_runs` row, returning its generated id.
+///
+/// Returns the new row's `id` (multi-point-score-tracking) so a caller can
+/// attach per-band [`ScorePoint`]s to it via [`insert_score_points`]. Same
+/// additive-return-of-id pattern as [`insert_code_run_v2`]. The insert itself
+/// is unchanged — only the return type gained the row id.
 pub async fn insert_agent_run(
     pool: &PgPool,
     profile_id: Uuid,
     row: &AgentRunRow,
-) -> Result<(), ToolError> {
-    sqlx::query(
+) -> Result<Uuid, ToolError> {
+    let id = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO agent_profile_runs \
          (profile_id, test_name, tool_count_available, correct_tool_selected, tool_params_valid, \
           multi_step_completed, instruction_followed, hallucination_detected, \
           response_quality_score, total_time_ms, error) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+         RETURNING id",
     )
     .bind(profile_id)
     .bind(&row.test_name)
@@ -476,9 +496,107 @@ pub async fn insert_agent_run(
     .bind(row.response_quality_score)
     .bind(row.total_time_ms)
     .bind(row.error.as_deref())
-    .execute(pool)
+    .fetch_one(pool)
     .await
     .map_err(|e| ToolError::Database(format!("Failed to insert agent_profile_runs: {e}")))?;
+    Ok(id)
+}
+
+// ===========================================================================
+// Multi-point score tracking (`run_score_points`)
+//
+// A long-format sidecar: every per-point measurement a suite computes along an
+// axis (context-length tiers, tool-count bands, …) lands here, not just the
+// handful that fit a fixed `model_operational_profiles` column. Additive — the
+// operational-profile writes are unchanged.
+// ===========================================================================
+
+/// Which run a batch of [`ScorePoint`]s belongs to. Exactly one variant is
+/// chosen per `insert_score_points` call; it decides which of the mutually-
+/// exclusive `code_run_id` / `context_run_id` / `agent_run_id` FK columns is
+/// set (the `run_score_points.one_parent` CHECK enforces exactly-one at the DB
+/// layer). All three PKs are `UUID` (matching `code_profile_runs.id` and the
+/// UUID convention across `model_operational_profiles`/`model_profiles`).
+#[derive(Debug, Clone, Copy)]
+pub enum ScorePointParent {
+    Code(Uuid),
+    Context(Uuid),
+    Agent(Uuid),
+}
+
+/// One measured point along an axis (e.g. throughput at a context tier, tool
+/// accuracy at a tool-count band). `value = None` writes SQL NULL — callers
+/// skip a metric entirely rather than passing a `Some(0.0)` placeholder for a
+/// value that was never measured.
+#[derive(Debug, Clone)]
+pub struct ScorePoint {
+    pub axis: String,
+    pub x_value: f64,
+    pub x_label: Option<String>,
+    pub metric: String,
+    pub value: Option<f64>,
+}
+
+/// SQL for one `run_score_points` insert. A const so a unit test can assert its
+/// shape without a live DB (this crate's testing convention — see the sibling
+/// `INSERT_CODE_RUN_V2_SQL` tests). Batch inserts loop this inside one
+/// transaction (below).
+const INSERT_SCORE_POINT_SQL: &str = "INSERT INTO run_score_points \
+     (code_run_id, context_run_id, agent_run_id, profile_id, axis, x_value, x_label, metric, value) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)";
+
+/// Pure mapping from a [`ScorePointParent`] to the `(code_run_id,
+/// context_run_id, agent_run_id)` column triple: exactly one is `Some`, the
+/// other two `None`. Extracted so a unit test can prove the exactly-one
+/// invariant (which the DB's `one_parent` CHECK also enforces) without a live
+/// Postgres connection.
+fn score_point_parent_columns(
+    parent: ScorePointParent,
+) -> (Option<Uuid>, Option<Uuid>, Option<Uuid>) {
+    match parent {
+        ScorePointParent::Code(id) => (Some(id), None, None),
+        ScorePointParent::Context(id) => (None, Some(id), None),
+        ScorePointParent::Agent(id) => (None, None, Some(id)),
+    }
+}
+
+/// Batch-insert `points` against one parent run, all tagged with `profile_id`.
+/// Runs inside a single transaction so a batch either fully lands or not at all
+/// (never a half-written set of points for one tier/band). Empty `points` is a
+/// no-op (no transaction opened). Returns `Err` on any DB error, matching the
+/// idiom used by every other writer in this module.
+pub async fn insert_score_points(
+    pool: &PgPool,
+    parent: ScorePointParent,
+    profile_id: Uuid,
+    points: &[ScorePoint],
+) -> Result<(), ToolError> {
+    if points.is_empty() {
+        return Ok(());
+    }
+    let (code_run_id, context_run_id, agent_run_id) = score_point_parent_columns(parent);
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ToolError::Database(format!("Failed to begin run_score_points tx: {e}")))?;
+    for p in points {
+        sqlx::query(INSERT_SCORE_POINT_SQL)
+            .bind(code_run_id)
+            .bind(context_run_id)
+            .bind(agent_run_id)
+            .bind(profile_id)
+            .bind(&p.axis)
+            .bind(p.x_value)
+            .bind(p.x_label.as_deref())
+            .bind(&p.metric)
+            .bind(p.value)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ToolError::Database(format!("Failed to insert run_score_points: {e}")))?;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| ToolError::Database(format!("Failed to commit run_score_points tx: {e}")))?;
     Ok(())
 }
 
@@ -757,11 +875,12 @@ mod tests {
     #[test]
     fn insert_code_run_v2_sql_explicitly_sets_finalized_false() {
         assert!(INSERT_CODE_RUN_V2_SQL.contains("finalized"));
-        // The 21st bind param position ($20) is the last VALUES entry before
-        // the literal `false` for `finalized` — confirming the insert never
-        // falls through to the column's `DEFAULT true`.
+        // The last bind param ($21 = `well_formed`, multi-point-score-tracking)
+        // is the final VALUES entry before the literal `false` for `finalized`
+        // — confirming the insert never falls through to the column's
+        // `DEFAULT true`.
         assert!(
-            INSERT_CODE_RUN_V2_SQL.contains("$20, false) RETURNING id"),
+            INSERT_CODE_RUN_V2_SQL.contains("$21, false) RETURNING id"),
             "expected the VALUES list to end with an explicit `false` for \
              `finalized`, got: {INSERT_CODE_RUN_V2_SQL}"
         );
@@ -799,6 +918,53 @@ mod tests {
     #[test]
     fn update_code_run_v2_judge_ok_when_exactly_one_row_affected() {
         assert!(check_judge_update_affected_one_row(Uuid::new_v4(), 1).is_ok());
+    }
+
+    // ---- multi-point-score-tracking: `run_score_points` ----------------
+
+    /// `well_formed` defaults to `None` (never mislabels a row from a writer
+    /// that doesn't set it) and is settable like any other field.
+    #[test]
+    fn code_run_row_v2_well_formed_defaults_none_and_is_settable() {
+        assert_eq!(CodeRunRowV2::default().well_formed, None);
+        let row = CodeRunRowV2 { well_formed: Some(true), ..Default::default() };
+        assert_eq!(row.well_formed, Some(true));
+    }
+
+    /// The score-point insert must set `well_formed` as its final bind param
+    /// ($21) before the literal `false` for `finalized` — it never falls
+    /// through to a column default.
+    #[test]
+    fn insert_code_run_v2_sql_includes_well_formed_last() {
+        assert!(INSERT_CODE_RUN_V2_SQL.contains("well_formed, finalized)"));
+    }
+
+    /// The exactly-one-parent invariant (also enforced by the DB `one_parent`
+    /// CHECK): each `ScorePointParent` variant sets exactly one of the three FK
+    /// columns and leaves the other two NULL.
+    #[test]
+    fn score_point_parent_columns_sets_exactly_one() {
+        let id = Uuid::new_v4();
+        for (parent, which) in [
+            (ScorePointParent::Code(id), 0u8),
+            (ScorePointParent::Context(id), 1),
+            (ScorePointParent::Agent(id), 2),
+        ] {
+            let cols = score_point_parent_columns(parent);
+            let set = [cols.0, cols.1, cols.2];
+            assert_eq!(set.iter().filter(|c| c.is_some()).count(), 1);
+            assert_eq!(set[which as usize], Some(id));
+        }
+    }
+
+    /// The insert names all four write columns beyond the FK triple, in the
+    /// order the binds are supplied.
+    #[test]
+    fn insert_score_point_sql_shape() {
+        assert!(INSERT_SCORE_POINT_SQL.contains(
+            "(code_run_id, context_run_id, agent_run_id, profile_id, axis, x_value, x_label, metric, value)"
+        ));
+        assert!(INSERT_SCORE_POINT_SQL.contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"));
     }
 
     /// The startup-cleanup delete must scope by model_name + backend_tag +

@@ -603,6 +603,13 @@ pub async fn run(
         return std::process::ExitCode::FAILURE;
     }
 
+    // multi-point-score-tracking: corpus-coverage reconciliation. Read-only and
+    // log-only — surfaces any language that has a toolchain check in
+    // `code::required_toolchain` but ZERO corpus cases (so the gate exists but
+    // is never exercised). Does NOT change scheduling and NEVER fails startup:
+    // a missing/unparseable manifest just skips this diagnostic.
+    warn_uncovered_toolchain_languages();
+
     // HFIX-07: proactively claim exclusive GPU use BEFORE running a single
     // case — stops competing production services and brings Ollama's own
     // runner config to a single-resident-model state, idempotently (a
@@ -639,6 +646,38 @@ pub async fn run(
             eprintln!("coder sweep aborted on a durability error: {e}");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+/// Read the v2 corpus manifest and `tracing::warn!` once per toolchain-checked
+/// language that has zero corpus cases (multi-point-score-tracking corpus-
+/// coverage reconciliation). Read-only/log-only: any manifest read/parse error
+/// is itself warned and then swallowed — this diagnostic must never abort or
+/// change the sweep. The pure set-difference is
+/// [`crate::intake::code::toolchain_coverage_gaps`] (unit-tested there); this
+/// wrapper only does the I/O (manifest read) and logging.
+fn warn_uncovered_toolchain_languages() {
+    let dir = intake::code_v2::corpus_v2_dir();
+    let cases = match intake::code_v2::read_manifest_v2(&dir) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                "corpus-coverage check skipped: could not read v2 manifest at {}: {e}",
+                dir.display()
+            );
+            return;
+        }
+    };
+    let corpus_languages: BTreeSet<String> =
+        cases.iter().map(|c| c.language.to_lowercase()).collect();
+    let toolchain_languages: BTreeSet<String> = intake::code::toolchain_checked_languages()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for lang in intake::code::toolchain_coverage_gaps(&corpus_languages, &toolchain_languages) {
+        tracing::warn!(
+            "language {lang} has a toolchain check but 0 corpus cases — skipped, not tested"
+        );
     }
 }
 
