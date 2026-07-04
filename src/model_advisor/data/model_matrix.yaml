@@ -1,0 +1,227 @@
+# Lumina Constellation — Model Capability Matrix (DT.6)
+# Knowledge base for the Model Advisor tool.
+#
+# Fields:
+#   params_b: total parameters in billions
+#   active_b: active parameters (MoE models activate a subset per token)
+#   quants: available quantization levels with VRAM cost at 7B scale
+#   quality: 1-10 scale (10=frontier)
+#   speed: tokens/sec estimate on RTX 4090 or equivalent
+#   best_for: use cases where this model excels
+#   avoid_for: use cases where this model underperforms
+
+# ── Qwen3 / Qwen3.5 family ────────────────────────────────────────────────────
+
+qwen3.5:4b:
+  family: qwen
+  params_b: 4
+  active_b: 4
+  architecture: dense
+  quants:
+    Q4_K_M: {vram_gb: 3, quality_penalty: 0}
+    Q8_0:   {vram_gb: 5, quality_penalty: 0}
+  quality: 6
+  speed: fast
+  best_for: [routing, classification, extraction, short_tasks, embeddings]
+  avoid_for: [complex_reasoning, long_context, code_review]
+  ollama_name: qwen3.5:4b
+  notes: "Thinking mode supported with /no_think prefix for non-reasoning mode"
+
+qwen3.5:9b:
+  family: qwen
+  params_b: 9
+  active_b: 9
+  architecture: dense
+  quants:
+    Q4_K_M: {vram_gb: 6, quality_penalty: 0}
+    Q8_0:   {vram_gb: 10, quality_penalty: 0}
+    F16:    {vram_gb: 18, quality_penalty: 0}
+  quality: 7
+  speed: fast
+  best_for: [daily_tasks, code_generation, summarization, classification, vigil_briefings]
+  avoid_for: [frontier_reasoning, very_long_context]
+  ollama_name: qwen3.5:9b
+  notes: "Excellent quality-per-VRAM ratio. Primary model for 8-12GB discrete GPUs."
+
+qwen3.5:27b:
+  family: qwen
+  params_b: 27
+  active_b: 27
+  architecture: dense
+  quants:
+    Q4_K_M: {vram_gb: 18, quality_penalty: 0}
+    Q8_0:   {vram_gb: 28, quality_penalty: 0}
+  quality: 8
+  speed: medium
+  best_for: [code_generation, code_review, technical_analysis, cortex]
+  avoid_for: [very_fast_responses, simple_classification]
+  ollama_name: qwen3.5:27b
+  notes: "Best dense model for code-heavy workloads. Strong at technical analysis."
+
+qwen3.5:35b-a3b:
+  family: qwen
+  params_b: 35
+  active_b: 3
+  architecture: moe
+  quants:
+    Q4_K_M: {vram_gb: 20, quality_penalty: 0}
+    Q8_0:   {vram_gb: 35, quality_penalty: 0}
+  quality: 8
+  speed: fast  # MoE: activates only 3B, runs at ~9B speed
+  best_for: [general_tasks, agentic_coding, vector_loops, axon_dispatch, daily_driver]
+  avoid_for: [extreme_precision_code, frontier_math]
+  ollama_name: qwen3.5:35b-a3b
+  notes: "MoE architecture: 35B total params, 3B active per token. Fast and capable."
+
+qwen3.5:122b-a10b:
+  family: qwen
+  params_b: 122
+  active_b: 10
+  architecture: moe
+  quants:
+    Q4_K_M: {vram_gb: 45, quality_penalty: 0}
+    IQ4_XS: {vram_gb: 38, quality_penalty: 1}
+  quality: 9
+  speed: medium  # MoE: 10B active, good throughput despite parameter count
+  best_for: [complex_reasoning, obsidian_circle, mr_wizard, long_context, architecture]
+  avoid_for: [simple_tasks, 8-16gb_systems]
+  ollama_name: qwen3.5:122b-a10b
+  notes: "Flagship MoE. Best local option for frontier reasoning. Requires 45GB+ VRAM."
+
+qwen3.5:397b-a22b:
+  family: qwen
+  params_b: 397
+  active_b: 22
+  architecture: moe
+  quants:
+    Q4_K_M: {vram_gb: 120, quality_penalty: 0}
+    IQ3_M:  {vram_gb: 90, quality_penalty: 2}
+  quality: 10
+  speed: slow
+  best_for: [frontier_reasoning, replaces_cloud, apple_ultra_192gb]
+  avoid_for: [anything_under_128gb_vram]
+  ollama_name: qwen3.5:397b-a22b
+  notes: "Apple M4 Ultra only. Approaches GPT-4 class reasoning locally."
+
+# ── Llama 3.3 family ──────────────────────────────────────────────────────────
+
+llama3.3:8b:
+  family: llama
+  params_b: 8
+  active_b: 8
+  architecture: dense
+  quants:
+    Q4_K_M: {vram_gb: 6, quality_penalty: 0}
+    Q8_0:   {vram_gb: 9, quality_penalty: 0}
+  quality: 7
+  speed: fast
+  best_for: [general_tasks, instruction_following, multilingual]
+  avoid_for: [code_heavy, long_context]
+  ollama_name: llama3.3:8b
+
+llama3.3:70b:
+  family: llama
+  params_b: 70
+  active_b: 70
+  architecture: dense
+  quants:
+    Q4_K_M: {vram_gb: 43, quality_penalty: 0}
+    IQ2_M:  {vram_gb: 22, quality_penalty: 3}
+    Q8_0:   {vram_gb: 75, quality_penalty: 0}
+  quality: 9
+  speed: slow
+  best_for: [instruction_following, reasoning, obsidian_circle_member]
+  avoid_for: [speed_critical, systems_under_48gb]
+  ollama_name: llama3.3:70b
+
+# ── Phi-4 family ──────────────────────────────────────────────────────────────
+
+phi4-mini:
+  family: phi
+  params_b: 3.8
+  active_b: 3.8
+  architecture: dense
+  quants:
+    Q4_K_M: {vram_gb: 3, quality_penalty: 0}
+    Q8_0:   {vram_gb: 5, quality_penalty: 0}
+  quality: 7
+  speed: very_fast
+  best_for: [math, reasoning, small_footprint, embeddings]
+  avoid_for: [long_context, code_review]
+  ollama_name: phi4-mini
+  notes: "Surprisingly strong at math reasoning for its size."
+
+phi4:
+  family: phi
+  params_b: 14
+  active_b: 14
+  architecture: dense
+  quants:
+    Q4_K_M: {vram_gb: 9, quality_penalty: 0}
+    Q8_0:   {vram_gb: 15, quality_penalty: 0}
+  quality: 8
+  speed: fast
+  best_for: [STEM, code, structured_output]
+  avoid_for: [creative, multilingual]
+  ollama_name: phi4
+
+# ── DeepSeek family ───────────────────────────────────────────────────────────
+
+deepseek-v3:
+  family: deepseek
+  params_b: 671
+  active_b: 37
+  architecture: moe
+  quants:
+    IQ2_M: {vram_gb: 90, quality_penalty: 2}
+    Q4_K_M: {vram_gb: 200, quality_penalty: 0}
+  quality: 10
+  speed: medium
+  best_for: [coding, reasoning, obsidian_circle_code_seat]
+  avoid_for: [systems_under_96gb]
+  ollama_name: deepseek-v3
+  notes: "Open weights MoE. At IQ2_M, fits 96GB+ systems."
+
+deepseek-coder-v2:
+  family: deepseek
+  params_b: 16
+  active_b: 16
+  architecture: dense
+  quants:
+    Q4_K_M: {vram_gb: 10, quality_penalty: 0}
+    Q8_0:   {vram_gb: 17, quality_penalty: 0}
+  quality: 8
+  speed: fast
+  best_for: [code_completion, code_review, vector_loops]
+  avoid_for: [general_tasks, long_context]
+  ollama_name: deepseek-coder-v2
+
+# ── Mistral family ────────────────────────────────────────────────────────────
+
+mistral:7b:
+  family: mistral
+  params_b: 7
+  active_b: 7
+  architecture: dense
+  quants:
+    Q4_K_M: {vram_gb: 5, quality_penalty: 0}
+    Q8_0:   {vram_gb: 8, quality_penalty: 0}
+  quality: 6
+  speed: very_fast
+  best_for: [instruction_following, tool_use, function_calling]
+  avoid_for: [complex_reasoning, long_context]
+  ollama_name: mistral
+
+mistral-small3:
+  family: mistral
+  params_b: 22
+  active_b: 22
+  architecture: dense
+  quants:
+    Q4_K_M: {vram_gb: 14, quality_penalty: 0}
+    Q8_0:   {vram_gb: 24, quality_penalty: 0}
+  quality: 7
+  speed: medium
+  best_for: [multilingual, tool_use, function_calling, enterprise_tasks]
+  avoid_for: [frontier_reasoning]
+  ollama_name: mistral-small3

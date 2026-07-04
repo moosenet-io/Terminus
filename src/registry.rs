@@ -103,10 +103,12 @@ pub struct ToolInfo {
 pub fn register_all(registry: &mut ToolRegistry) {
     crate::ansible::register(registry);
     crate::approval::register(registry);
+    crate::council::register(registry);
     crate::dev::register(registry);
     crate::gateway::register(registry);
     crate::<secret-manager>::register(registry);
     crate::intake::register(registry);
+    crate::model_advisor::register(registry);
     crate::network::register(registry);
     crate::openhands::register(registry);
     crate::axon::register(registry);
@@ -130,8 +132,10 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::relay::register(registry);
     crate::reminder::register(registry);
     crate::seer::register(registry);
+    crate::sentinel::register(registry);
     crate::sysversion::register(registry);
     crate::vector::register(registry);
+    crate::vigil::register(registry);
     crate::vitals::register(registry);
     crate::wizard::register(registry);
     crate::tools::register(registry);
