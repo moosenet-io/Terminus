@@ -334,10 +334,15 @@ const UPDATE_CODE_RUN_V2_JUDGE_SQL: &str = "UPDATE code_profile_runs \
 /// completion marker regardless of whether judging applied to it (a case
 /// with no `first_response`/`retry_response` still needs `finalized = true`,
 /// or `coder_gaps.rs`'s gap audit would treat it as forever-incomplete even
-/// though the suite is done with it). No-op-safe: updates by primary key, so
-/// a row that no longer exists (should never happen in the normal single
-/// in-flight-attempt-at-a-time flow) simply matches zero rows rather than
-/// erroring.
+/// though the suite is done with it). Updates by primary key, so a row that
+/// no longer exists (should never happen in the normal single
+/// in-flight-attempt-at-a-time flow, but could follow some out-of-band
+/// deletion/race) is NOT treated as success: this returns `Err` unless
+/// exactly one row was affected, so a missing row can never silently
+/// "checkpoint as complete" with nothing actually persisted. The caller
+/// (`code_v2.rs`'s judge loop) treats that `Err` as a per-case skip, matching
+/// this codebase's skip-with-reason convention rather than aborting the
+/// whole model's sweep.
 pub async fn update_code_run_v2_judge(
     pool: &PgPool,
     id: Uuid,
@@ -345,7 +350,7 @@ pub async fn update_code_run_v2_judge(
     first_pass_score: Option<i32>,
     retry_score: Option<i32>,
 ) -> Result<(), ToolError> {
-    sqlx::query(UPDATE_CODE_RUN_V2_JUDGE_SQL)
+    let result = sqlx::query(UPDATE_CODE_RUN_V2_JUDGE_SQL)
         .bind(id)
         .bind(code_quality_score)
         .bind(first_pass_score)
@@ -353,6 +358,23 @@ pub async fn update_code_run_v2_judge(
         .execute(pool)
         .await
         .map_err(|e| ToolError::Database(format!("Failed to update code_profile_runs judge (v2): {e}")))?;
+    check_judge_update_affected_one_row(id, result.rows_affected())
+}
+
+/// Pure decision extracted from [`update_code_run_v2_judge`] so it can be
+/// unit-tested without a live Postgres connection (this crate has no
+/// integration-test DB harness — every other test on this function's
+/// neighbors asserts against SQL string constants for the same reason):
+/// exactly one row affected is success, anything else (0 = row
+/// missing/deleted, >1 would mean the `WHERE id = $1` predicate somehow
+/// matched more than the primary key) is an error, so the caller can never
+/// mistake a no-op for a completed checkpoint.
+fn check_judge_update_affected_one_row(id: Uuid, rows_affected: u64) -> Result<(), ToolError> {
+    if rows_affected != 1 {
+        return Err(ToolError::Database(format!(
+            "update_code_run_v2_judge: expected to update exactly 1 row for id={id}, but {rows_affected} rows were affected (row missing/deleted?)"
+        )));
+    }
     Ok(())
 }
 
@@ -730,6 +752,32 @@ mod tests {
     #[test]
     fn update_code_run_v2_judge_sql_sets_finalized_true() {
         assert!(UPDATE_CODE_RUN_V2_JUDGE_SQL.contains("finalized = true"));
+    }
+
+    /// Hardening (Codex review): a row that no longer exists — deleted out
+    /// from under the judge loop, or an id that was never inserted — must
+    /// surface as an `Err`, not silently succeed with zero effect. Exercised
+    /// via `check_judge_update_affected_one_row`, the pure decision
+    /// `update_code_run_v2_judge` delegates to after `.execute()`, since this
+    /// crate has no live-Postgres test harness (see the sibling SQL-constant
+    /// tests above for the same constraint).
+    #[test]
+    fn update_code_run_v2_judge_errors_when_zero_rows_affected() {
+        let id = Uuid::new_v4();
+        let r = check_judge_update_affected_one_row(id, 0);
+        assert!(matches!(r, Err(ToolError::Database(_))));
+        let msg = match r {
+            Err(ToolError::Database(m)) => m,
+            _ => unreachable!(),
+        };
+        assert!(msg.contains(&id.to_string()));
+    }
+
+    /// Sanity companion: the normal case (exactly one row touched) must stay
+    /// `Ok`, so this guard never false-positives on a healthy update.
+    #[test]
+    fn update_code_run_v2_judge_ok_when_exactly_one_row_affected() {
+        assert!(check_judge_update_affected_one_row(Uuid::new_v4(), 1).is_ok());
     }
 
     /// The startup-cleanup delete must scope by model_name + backend_tag +

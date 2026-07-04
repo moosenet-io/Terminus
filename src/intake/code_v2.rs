@@ -905,7 +905,7 @@ pub async fn run_code_suite_v2_cases(
     // suite (one swap) instead of once — or twice, with retries — per case.
     // Each case's row already exists (Phase 1); patch in the judge score (and
     // the judge-driven 4→5 bump) via `update_code_run_v2_judge`.
-    for (cr, &id) in pending.iter_mut().zip(row_ids.iter()) {
+    for ((case, cr), &id) in cases.iter().zip(pending.iter_mut()).zip(row_ids.iter()) {
         if let Some(resp) = cr.first_response.clone() {
             let q = judge_idiom(&client, &cr.spec, &resp).await;
             cr.row.code_quality_score = q;
@@ -930,14 +930,28 @@ pub async fn run_code_suite_v2_cases(
         // during inference) still needs to be marked complete, or
         // `coder_gaps.rs`'s gap audit would treat it as forever-incomplete
         // even though the suite is genuinely done with it.
-        storage::update_code_run_v2_judge(
+        // A missing/deleted row here is an infrastructure-level surprise, not
+        // a reason to abort the rest of this model's suite: record it as a
+        // per-case skip-with-reason (same convention as the toolchain/OOM/
+        // inference-error cases above) and keep going, so one bad row can't
+        // take down every other case still queued behind it.
+        if let Err(e) = storage::update_code_run_v2_judge(
             &pool,
             id,
             cr.row.code_quality_score,
             cr.row.first_pass_score,
             cr.row.retry_score,
         )
-        .await?;
+        .await
+        {
+            tracing::warn!(
+                "intake v2: judge checkpoint failed for case {} (row {id}): {e}; skipping",
+                case.id,
+            );
+            if cr.row.error.is_none() {
+                cr.row.error = Some(format!("judge checkpoint failed: {e}"));
+            }
+        }
     }
 
     // ---- Phase 3: aggregate (error rows excluded); rows already persisted ---
