@@ -35,6 +35,7 @@ mod runner;
 pub mod serving;
 mod storage;
 mod timeouts;
+pub mod vuln_scan;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
