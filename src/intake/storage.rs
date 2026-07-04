@@ -271,6 +271,13 @@ pub struct CodeRunRowV2 {
     /// (`Some(true)`). `None` for rows written before this column existed or by
     /// callers that don't track it.
     pub well_formed: Option<bool>,
+    /// Which repeat of a multi-sample case this row is (multi-sample-consistency).
+    /// When `INTAKE_SAMPLES_PER_CASE > 1`, the sweep runs each case N times and
+    /// writes N rows sharing the same `case_id` but incrementing `sample_index`
+    /// (0..N-1); the pass@k / pass^k estimators aggregate over the repeats of a
+    /// case. `0` for every single-sample row (the DB column defaults to `0`), so
+    /// legacy/single-run data reads as "sample 0 of 1" without a backfill.
+    pub sample_index: i16,
     /// Heuristic security signal (security-scan-signal): count of
     /// vulnerability-pattern findings in the case's generated output, from the
     /// dependency-free heuristic scanner in `intake::vuln_scan`. `Some(0)` =
@@ -293,8 +300,8 @@ const INSERT_CODE_RUN_V2_SQL: &str = "INSERT INTO code_profile_runs \
       first_pass_score, retry_score, compiles, tests_pass, change_correct, \
       code_quality_score, context_tokens, response_tokens, file_count, total_lines, \
       throughput_tok_per_sec, total_time_ms, oom, error, backend_tag, mem_config, case_id, \
-      well_formed, vuln_finding_count, finalized) \
-     VALUES ($1, 'v2', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, \
+      well_formed, sample_index, vuln_finding_count, finalized) \
+     VALUES ($1, 'v2', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, \
      false) \
      RETURNING id";
 
@@ -338,6 +345,7 @@ pub async fn insert_code_run_v2(
         .bind(row.mem_config.as_deref())
         .bind(row.case_id.as_deref())
         .bind(row.well_formed)
+        .bind(row.sample_index)
         .bind(row.vuln_finding_count)
         .fetch_one(pool)
         .await
@@ -884,12 +892,13 @@ mod tests {
     #[test]
     fn insert_code_run_v2_sql_explicitly_sets_finalized_false() {
         assert!(INSERT_CODE_RUN_V2_SQL.contains("finalized"));
-        // The last bind param ($22 = `vuln_finding_count`, security-scan-signal)
-        // is the final VALUES entry before the literal `false` for `finalized`
-        // — confirming the insert never falls through to the column's
+        // The last bind param ($23 = `vuln_finding_count`, security-scan-signal,
+        // itself preceded by $22 = `sample_index`, multi-sample-consistency) is
+        // the final VALUES entry before the literal `false` for `finalized` —
+        // confirming the insert never falls through to the column's
         // `DEFAULT true`.
         assert!(
-            INSERT_CODE_RUN_V2_SQL.contains("$22, false) RETURNING id"),
+            INSERT_CODE_RUN_V2_SQL.contains("$22, $23, false) RETURNING id"),
             "expected the VALUES list to end with an explicit `false` for \
              `finalized`, got: {INSERT_CODE_RUN_V2_SQL}"
         );
@@ -940,14 +949,31 @@ mod tests {
         assert_eq!(row.well_formed, Some(true));
     }
 
-    /// The score-point insert must set `well_formed` as its final bind param
-    /// ($21) before the literal `false` for `finalized` — it never falls
-    /// through to a column default.
+    /// The score-point insert must set `sample_index` then `vuln_finding_count`
+    /// as its final two bind params ($22, $23) before the literal `false` for
+    /// `finalized` — it never falls through to a column default.
     #[test]
-    fn insert_code_run_v2_sql_includes_well_formed_and_vuln_count() {
-        // `well_formed` then `vuln_finding_count` (security-scan-signal) are the
-        // last two data columns before `finalized`.
-        assert!(INSERT_CODE_RUN_V2_SQL.contains("well_formed, vuln_finding_count, finalized)"));
+    fn insert_code_run_v2_sql_includes_sample_index_and_vuln_count_last() {
+        assert!(INSERT_CODE_RUN_V2_SQL
+            .contains("well_formed, sample_index, vuln_finding_count, finalized)"));
+    }
+
+    /// `sample_index` defaults to `0` (single-sample / legacy rows read as
+    /// "sample 0") and is settable like any other field.
+    #[test]
+    fn code_run_row_v2_sample_index_defaults_zero_and_is_settable() {
+        assert_eq!(CodeRunRowV2::default().sample_index, 0);
+        let row = CodeRunRowV2 { sample_index: 2, ..Default::default() };
+        assert_eq!(row.sample_index, 2);
+    }
+
+    /// `vuln_finding_count` defaults to `None` (never mislabels a row from a
+    /// writer that doesn't set it) and is settable like any other field.
+    #[test]
+    fn code_run_row_v2_vuln_finding_count_defaults_none_and_is_settable() {
+        assert_eq!(CodeRunRowV2::default().vuln_finding_count, None);
+        let row = CodeRunRowV2 { vuln_finding_count: Some(2), ..Default::default() };
+        assert_eq!(row.vuln_finding_count, Some(2));
     }
 
     /// Column-count-vs-value-count guard (this file has a documented history of
@@ -973,8 +999,8 @@ mod tests {
         let vals = &sql[v_open + 1..v_close];
         let n_vals = vals.split(',').filter(|s| !s.trim().is_empty()).count();
 
-        // Sanity: placeholders run $1..$22 contiguously.
-        let max_placeholder = 22;
+        // Sanity: placeholders run $1..$23 contiguously.
+        let max_placeholder = 23;
         for n in 1..=max_placeholder {
             assert!(sql.contains(&format!("${n}")), "missing placeholder ${n}");
         }
