@@ -61,12 +61,24 @@ pub fn langs_from_env() -> Vec<String> {
     parse_langs(std::env::var("INTAKE_CODE_LANGS").ok().as_deref())
 }
 
+/// Normalize a raw case-limit value using the long-standing "0 means
+/// unset/no limit" convention: `Some(0)` collapses to `None` (no cap),
+/// same as the value never having been provided at all. Shared by the
+/// `INTAKE_CODE_CASE_LIMIT` env parser AND the `mint sweep coder
+/// --case-limit` CLI flag so the two input paths can't drift apart —
+/// `--case-limit 0` must behave identically to leaving the env var unset,
+/// not literally cap every model's run at zero cases.
+pub fn normalize_case_limit(raw: Option<usize>) -> Option<usize> {
+    raw.filter(|n| *n > 0)
+}
+
 /// Optional per-model case cap (smoke/debug), from `INTAKE_CODE_CASE_LIMIT`.
 pub fn case_limit_from_env() -> Option<usize> {
-    std::env::var("INTAKE_CODE_CASE_LIMIT")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
+    normalize_case_limit(
+        std::env::var("INTAKE_CODE_CASE_LIMIT")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok()),
+    )
 }
 
 /// Which memory-model configuration THIS sweep run is executing against
@@ -600,11 +612,22 @@ mod tests {
 
     #[test]
     fn case_limit_parse_rejects_zero_and_garbage() {
-        // Mirrors case_limit_from_env's filter (no env access in the test).
-        let parse = |s: &str| s.trim().parse::<usize>().ok().filter(|n| *n > 0);
+        // Mirrors case_limit_from_env's parse-then-normalize (no env access
+        // in the test).
+        let parse = |s: &str| normalize_case_limit(s.trim().parse::<usize>().ok());
         assert_eq!(parse("5"), Some(5));
         assert_eq!(parse("0"), None);
         assert_eq!(parse("abc"), None);
+    }
+
+    #[test]
+    fn normalize_case_limit_treats_zero_as_unset() {
+        // The shared "0 means no limit" convention both case_limit_from_env
+        // (env-var path) and `mint sweep coder --case-limit` (CLI path)
+        // delegate to, so the two input paths can't drift apart.
+        assert_eq!(normalize_case_limit(Some(0)), None);
+        assert_eq!(normalize_case_limit(Some(5)), Some(5));
+        assert_eq!(normalize_case_limit(None), None);
     }
 
     // ---- mem_config env threading (mem-config-tagging) ----

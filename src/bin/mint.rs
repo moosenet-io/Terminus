@@ -84,6 +84,7 @@ enum SweepTarget {
         #[arg(long)]
         langs: Option<String>,
         /// Per-model case cap (smoke/debug). Falls back to INTAKE_CODE_CASE_LIMIT.
+        /// `0` means "no limit" (same convention as leaving the env var unset).
         #[arg(long = "case-limit")]
         case_limit: Option<usize>,
         /// mem_config tag. Falls back to SWEEP_MEM_CONFIG.
@@ -153,7 +154,8 @@ async fn main() -> std::process::ExitCode {
                     Some(s) => coder_sweep::parse_langs(Some(&s)),
                     None => coder_sweep::langs_from_env(),
                 };
-                let case_limit = case_limit.or_else(coder_sweep::case_limit_from_env);
+                let case_limit =
+                    coder_sweep::normalize_case_limit(case_limit).or_else(coder_sweep::case_limit_from_env);
                 let mem_config = resolved_string(mem_config, coder_sweep::mem_config_from_env);
                 coder_sweep::run(&langs, case_limit, mem_config.as_deref()).await
             }
@@ -491,5 +493,37 @@ mod tests {
         };
         assert_eq!(model.as_deref(), Some("env-model:8b"));
         std::env::remove_var("INTAKE_CASE_MODEL");
+    }
+
+    #[test]
+    fn sweep_coder_case_limit_zero_means_no_limit_end_to_end() {
+        // Exercises the exact pattern `Command::Sweep(Coder)`'s arm uses:
+        // `--case-limit 0` must normalize to "no limit" (None), the SAME
+        // resolved value as never setting INTAKE_CODE_CASE_LIMIT at all —
+        // not a literal zero-case cap.
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("INTAKE_CODE_CASE_LIMIT");
+
+        let cli = Cli::try_parse_from(["mint", "sweep", "coder", "--case-limit", "0"]).expect("parses");
+        let case_limit = match cli.command {
+            Command::Sweep { target: SweepTarget::Coder { case_limit, .. } } => {
+                coder_sweep::normalize_case_limit(case_limit).or_else(coder_sweep::case_limit_from_env)
+            }
+            _ => panic!("expected Sweep(Coder)"),
+        };
+
+        let unset_env_cli = Cli::try_parse_from(["mint", "sweep", "coder"]).expect("parses");
+        let case_limit_when_env_unset = match unset_env_cli.command {
+            Command::Sweep { target: SweepTarget::Coder { case_limit, .. } } => {
+                coder_sweep::normalize_case_limit(case_limit).or_else(coder_sweep::case_limit_from_env)
+            }
+            _ => panic!("expected Sweep(Coder)"),
+        };
+
+        assert_eq!(case_limit, None, "--case-limit 0 must resolve to no limit");
+        assert_eq!(
+            case_limit, case_limit_when_env_unset,
+            "--case-limit 0 must resolve identically to INTAKE_CODE_CASE_LIMIT being unset"
+        );
     }
 }
