@@ -66,6 +66,7 @@ impl SuiteDriver for MockDriver {
         backend: BackendTag,
         _o: &str,
         dimension: &str,
+        _yarn: Option<&terminus_rs::intake::assistant::acquire::YarnConfig>,
     ) -> Result<Vec<DimensionScore>, String> {
         Ok(vec![DimensionScore {
             model_id: model_id.clone(),
