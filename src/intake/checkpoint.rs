@@ -88,15 +88,30 @@ where
     /// A key marked twice (e.g. a resumed unit re-marked) simply appears
     /// twice on disk; [`Self::done`]'s `BTreeSet` collapses duplicates on
     /// read, so double-marking is harmless.
+    ///
+    /// Writes the line + trailing newline as ONE `write_all` call over a
+    /// single pre-built buffer — both original implementations instead used
+    /// `writeln!(f, "{line}")`, which (via `fmt::Write`'s default
+    /// `write_fmt`) can issue TWO separate `write(2)` syscalls (one for the
+    /// line, one for the trailing `\n`), each individually atomic under
+    /// `O_APPEND` but NOT atomic as a pair — two concurrent marks could
+    /// interleave as `{...}{...}\n\n`, corrupting a line and silently
+    /// dropping it on the next `done()` read (parse failure ⇒ filtered out).
+    /// This was a latent bug in both originals, surfaced by this shared
+    /// type's concurrent-marks test; building one buffer and writing it in a
+    /// single syscall restores the atomicity the append-only design already
+    /// depended on.
     pub fn mark(&self, key: &K) -> Result<(), String> {
-        let line =
+        let mut line =
             serde_json::to_string(key).map_err(|e| format!("serialize checkpoint key: {e}"))?;
+        line.push('\n');
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
             .map_err(|e| format!("open checkpoint {}: {e}", self.path))?;
-        writeln!(f, "{line}").map_err(|e| format!("append checkpoint: {e}"))?;
+        f.write_all(line.as_bytes())
+            .map_err(|e| format!("append checkpoint: {e}"))?;
         Ok(())
     }
 }
