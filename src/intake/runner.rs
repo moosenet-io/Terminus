@@ -319,8 +319,46 @@ pub async fn run_context_suite(
             oom: tr.oom,
             error: tr.error.clone(),
         };
-        storage::insert_context_run(&pool, profile_id, &row).await?;
+        let context_run_id = storage::insert_context_run(&pool, profile_id, &row).await?;
         tiers_run += 1;
+
+        // multi-point-score-tracking: preserve this tier's per-point
+        // measurements (throughput + recall vs. context length) alongside the
+        // fixed `throughput_at_*` columns the operational profile keeps. A
+        // metric whose value is `None` for this tier (e.g. a tier that OOM'd
+        // before producing a throughput reading) is skipped — never written as
+        // a 0 placeholder. Best-effort: a score-point write failure must not
+        // abort the suite (the durable tier row is already persisted above), so
+        // it is logged and swallowed rather than `?`-propagated.
+        let mut points: Vec<storage::ScorePoint> = Vec::new();
+        if let Some(tp) = row.throughput_tok_per_sec {
+            points.push(storage::ScorePoint {
+                axis: "context_tokens".to_string(),
+                x_value: row.context_tokens as f64,
+                x_label: None,
+                metric: "throughput_tok_per_sec".to_string(),
+                value: Some(tp),
+            });
+        }
+        if let Some(recall) = row.recall_score {
+            points.push(storage::ScorePoint {
+                axis: "context_tokens".to_string(),
+                x_value: row.context_tokens as f64,
+                x_label: None,
+                metric: "recall_score".to_string(),
+                value: Some(recall as f64),
+            });
+        }
+        if let Err(e) = storage::insert_score_points(
+            &pool,
+            storage::ScorePointParent::Context(context_run_id),
+            profile_id,
+            &points,
+        )
+        .await
+        {
+            tracing::warn!("intake: failed to persist context score points: {e}");
+        }
 
         summaries.push(TierSummary {
             context_tokens: tr.context_tokens as i32,

@@ -334,6 +334,101 @@ async fn migrate_locked(conn: &mut PgConnection) -> Result<(), ToolError> {
         .await
         .map_err(|e| ToolError::Database(format!("add code_profile_runs.finalized: {e}")))?;
 
+    // `well_formed` (multi-point-score-tracking): distinguishes a code case
+    // that scored 0 because the model produced NOTHING extractable (no mapped
+    // output files) from one that scored 0 because it produced code that was
+    // simply wrong. `code_v2.rs` sets it to `produced` (= at least one mapped
+    // output file was extracted) BEFORE the graduated score is computed, so a
+    // downstream reader can separate "malformed / no output" from "well-formed
+    // but incorrect". NULL for rows written before this column existed, and for
+    // any writer (v1, agent, context) that never sets it — the `model_language_
+    // stats` matview below only counts `well_formed = false` toward its
+    // malformed rate, so a NULL never inflates that rate.
+    sqlx::query("ALTER TABLE code_profile_runs ADD COLUMN IF NOT EXISTS well_formed BOOLEAN")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| ToolError::Database(format!("add code_profile_runs.well_formed: {e}")))?;
+
+    // `run_score_points` (multi-point-score-tracking): a flexible, long-format
+    // sidecar table capturing EVERY per-point measurement a suite computes
+    // along an axis (context-length tiers, tool-count bands, …), not just the
+    // handful that happen to land on a fixed column of
+    // `model_operational_profiles` (throughput_at_2k/8k/…, tool_accuracy_at_200).
+    // A frontend can plot a line graph (value vs. x_value along `axis`) and a
+    // routing layer can pick a model on more than one scalar. Additive: the
+    // existing `model_operational_profiles` writes are UNCHANGED — this only
+    // preserves what was previously discarded.
+    //
+    // Exactly ONE of the three run-FK columns is non-NULL per row (enforced by
+    // the `one_parent` CHECK), identifying which suite produced the point;
+    // `profile_id` is always set (the model the point belongs to) for a cheap
+    // per-model rollup without a three-way join. All three run FKs use
+    // `ON DELETE CASCADE` so points vanish with their parent run (mirrors the
+    // `assistant_dimension_score` → `assistant_profile_run` cascade above).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS run_score_points ( \
+            id             BIGSERIAL PRIMARY KEY, \
+            code_run_id    UUID REFERENCES code_profile_runs(id) ON DELETE CASCADE, \
+            context_run_id UUID REFERENCES context_profile_runs(id) ON DELETE CASCADE, \
+            agent_run_id   UUID REFERENCES agent_profile_runs(id) ON DELETE CASCADE, \
+            profile_id     UUID NOT NULL REFERENCES model_profiles(id), \
+            axis           TEXT NOT NULL, \
+            x_value        DOUBLE PRECISION NOT NULL, \
+            x_label        TEXT, \
+            metric         TEXT NOT NULL, \
+            value          DOUBLE PRECISION, \
+            created_at     TIMESTAMPTZ NOT NULL DEFAULT now(), \
+            CONSTRAINT one_parent CHECK ( \
+                (code_run_id IS NOT NULL)::int + (context_run_id IS NOT NULL)::int + (agent_run_id IS NOT NULL)::int = 1 \
+            ) \
+         )",
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| ToolError::Database(format!("create run_score_points: {e}")))?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_rsp_profile_axis_metric \
+         ON run_score_points (profile_id, axis, metric)",
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| ToolError::Database(format!("create idx_rsp_profile_axis_metric: {e}")))?;
+
+    // `model_language_stats` (multi-point-score-tracking): a per-(model,
+    // language) rollup of the `dynamic_gtt` code sweep — mean/stddev score,
+    // retry lift, throughput, latency (mean + p95), malformed rate (via the new
+    // `well_formed` column) and error rate. Pure SQL; no Rust writes to it.
+    // Scoped to `mem_config = 'dynamic_gtt'` so it never blends the preserved
+    // `carveout` baseline into the current config's numbers.
+    //
+    // OPERATIONAL NOTE: this is a MATERIALIZED view — its contents are a
+    // snapshot frozen at creation/refresh time. Nothing in this change wires an
+    // automatic refresh; refreshing it (`REFRESH MATERIALIZED VIEW
+    // model_language_stats`) after a sweep is an explicit operational task.
+    // `CREATE MATERIALIZED VIEW IF NOT EXISTS` is a no-op once it exists, so a
+    // repeated `migrate()` never rebuilds/refreshes it (intentional — a rebuild
+    // here would surprise operators mid-sweep).
+    sqlx::query(
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS model_language_stats AS \
+         SELECT profile_id, language, \
+             count(*) FILTER (WHERE error IS NULL) AS n_scored, \
+             avg(first_pass_score) FILTER (WHERE error IS NULL) AS mean_score, \
+             stddev(first_pass_score) FILTER (WHERE error IS NULL) AS stddev_score, \
+             avg(retry_score - first_pass_score) FILTER (WHERE retry_score IS NOT NULL) AS retry_lift, \
+             avg(throughput_tok_per_sec) AS mean_throughput, \
+             avg(total_time_ms) AS mean_latency_ms, \
+             percentile_cont(0.95) WITHIN GROUP (ORDER BY total_time_ms) AS p95_latency_ms, \
+             (count(*) FILTER (WHERE well_formed = false))::float / greatest(count(*),1)::float AS malformed_rate, \
+             (count(*) FILTER (WHERE error IS NOT NULL))::float / greatest(count(*),1)::float AS error_rate \
+         FROM code_profile_runs \
+         WHERE mem_config = 'dynamic_gtt' \
+         GROUP BY profile_id, language",
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| ToolError::Database(format!("create model_language_stats matview: {e}")))?;
+
     // 3. The dual-profile join view. Built so a model present in only ONE side
     //    still appears (key set = UNION of both sides' model_ids), and so a
     //    missing builder `backend_tag` column degrades to NULL rather than

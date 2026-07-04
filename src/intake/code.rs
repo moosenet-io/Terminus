@@ -257,6 +257,39 @@ pub fn required_toolchain(language: &str) -> Option<&'static str> {
     }
 }
 
+/// The canonical (lowercase) language values that [`required_toolchain`] has an
+/// explicit toolchain-check arm for. Kept as an explicit list rather than
+/// derived from `required_toolchain` (which returns `None` for its catch-all,
+/// so its checked languages can't be enumerated by probing it) — the
+/// corpus-coverage reconciliation in `coder_sweep` needs the set, and this is
+/// the single place that must stay in sync with the match above. `"ts"` is an
+/// alias of `"typescript"` and is intentionally omitted (corpus cases use the
+/// canonical `"typescript"`); listing both would double-warn.
+pub fn toolchain_checked_languages() -> &'static [&'static str] {
+    &["rust", "typescript"]
+}
+
+/// Pure set-difference for the corpus-coverage reconciliation
+/// (multi-point-score-tracking): given the distinct languages actually present
+/// in the corpus and the languages that have a toolchain check, return the
+/// toolchain-checked languages with ZERO corpus cases — i.e. a validator gate
+/// exists for them but nothing exercises it. Both inputs are compared
+/// case-insensitively (lowercased) so a corpus `"Rust"` still covers a
+/// toolchain-checked `"rust"`. Result is sorted for deterministic,
+/// once-per-sweep warning order. Read-only: callers only log the gap.
+pub fn toolchain_coverage_gaps(
+    corpus_languages: &std::collections::BTreeSet<String>,
+    toolchain_languages: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let corpus_lc: std::collections::BTreeSet<String> =
+        corpus_languages.iter().map(|l| l.to_lowercase()).collect();
+    toolchain_languages
+        .iter()
+        .map(|l| l.to_lowercase())
+        .filter(|l| !corpus_lc.contains(l))
+        .collect()
+}
+
 /// Whether `bin` is on PATH (synchronous `which`-style check).
 pub fn have_tool(bin: &str) -> bool {
     std::process::Command::new("sh")
@@ -666,6 +699,45 @@ mod tests {
         assert_eq!(required_toolchain("python"), None);
         assert_eq!(required_toolchain("bash"), None);
         assert_eq!(required_toolchain("cpp"), None);
+    }
+
+    #[test]
+    fn toolchain_checked_languages_matches_required_toolchain_arms() {
+        // Every listed language must genuinely have a toolchain check, and the
+        // canonical spellings only (no `"ts"` alias).
+        for lang in toolchain_checked_languages() {
+            assert!(required_toolchain(lang).is_some(), "{lang} should be checked");
+        }
+        assert!(toolchain_checked_languages().contains(&"rust"));
+        assert!(toolchain_checked_languages().contains(&"typescript"));
+        assert!(!toolchain_checked_languages().contains(&"ts"));
+    }
+
+    #[test]
+    fn toolchain_coverage_gaps_flags_missing_and_sorts() {
+        use std::collections::BTreeSet;
+        let toolchain: BTreeSet<String> =
+            ["rust", "typescript"].iter().map(|s| s.to_string()).collect();
+
+        // typescript has zero corpus cases → reported; rust is covered.
+        let corpus: BTreeSet<String> =
+            ["rust", "python", "bash"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            toolchain_coverage_gaps(&corpus, &toolchain),
+            vec!["typescript".to_string()]
+        );
+
+        // Case-insensitive: "Rust" in the corpus still covers "rust".
+        let corpus_mixed: BTreeSet<String> =
+            ["Rust", "TypeScript"].iter().map(|s| s.to_string()).collect();
+        assert!(toolchain_coverage_gaps(&corpus_mixed, &toolchain).is_empty());
+
+        // Both missing → both reported, sorted.
+        let corpus_none: BTreeSet<String> = ["python"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            toolchain_coverage_gaps(&corpus_none, &toolchain),
+            vec!["rust".to_string(), "typescript".to_string()]
+        );
     }
 
     #[test]

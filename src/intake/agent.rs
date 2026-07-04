@@ -487,8 +487,32 @@ pub async fn run_agent_suite(
                         error: out.error.clone(),
                         ..Default::default()
                     };
-                    storage::insert_agent_run(&pool, profile_id, &row).await?;
+                    let agent_run_id = storage::insert_agent_run(&pool, profile_id, &row).await?;
                     rows_written += 1;
+
+                    // multi-point-score-tracking: preserve per-band tool
+                    // accuracy (pass=1.0/fail=0.0) vs. advertised tool count,
+                    // alongside the fixed `tool_accuracy_at_200` column the
+                    // operational profile keeps. Best-effort: the durable agent
+                    // row is already persisted, so a score-point failure is
+                    // logged and swallowed rather than aborting the suite.
+                    let points = vec![storage::ScorePoint {
+                        axis: "tool_count".to_string(),
+                        x_value: band as f64,
+                        x_label: None,
+                        metric: "tool_accuracy".to_string(),
+                        value: Some(if passed { 1.0 } else { 0.0 }),
+                    }];
+                    if let Err(e) = storage::insert_score_points(
+                        &pool,
+                        storage::ScorePointParent::Agent(agent_run_id),
+                        profile_id,
+                        &points,
+                    )
+                    .await
+                    {
+                        tracing::warn!("intake: failed to persist agent score points: {e}");
+                    }
                 }
             }
             "multi_step" => {
