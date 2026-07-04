@@ -410,8 +410,25 @@ async fn migrate_locked(conn: &mut PgConnection) -> Result<(), ToolError> {
 
     // `model_language_stats` (multi-point-score-tracking): a per-(model,
     // language) rollup of the `dynamic_gtt` code sweep — mean/stddev score,
-    // retry lift, throughput, latency (mean + p95), malformed rate (via the new
-    // `well_formed` column) and error rate. Pure SQL; no Rust writes to it.
+    // retry lift, throughput, latency (mean + p95), GPU-time cost
+    // (`total_gpu_seconds` + the `quality_per_gpu_second` composite), malformed
+    // rate (via the new `well_formed` column) and error rate. Pure SQL; no Rust
+    // writes to it.
+    //
+    // GPU-COST SIGNAL (gpu-cost-signal): a coder sweep runs under
+    // `gpu_authority`'s `Exclusive` mode — competing services stopped, one
+    // Ollama-resident model at a time — so per-case wall-clock `total_time_ms`
+    // IS the GPU-time cost of that case (nothing else contends for the GPU
+    // during the sweep). `total_gpu_seconds` = SUM(total_time_ms)/1000 per
+    // (model, language) is "how much GPU-time budget committing to this model
+    // for the whole batch would cost" — different information from the per-case
+    // `mean_latency_ms` already above. `quality_per_gpu_second` =
+    // mean_score / (total_gpu_seconds / n_scored) folds quality and that cost
+    // into one higher-is-better routing number (good quality bought cheaply).
+    // Both divisors are `NULLIF`-guarded: a model with zero scored cases or
+    // zero accumulated time yields NULL, never a divide-by-zero at view-create
+    // time. The pure-Rust twin (independently unit-tested) is
+    // `crate::intake::code::quality_per_gpu_second`.
     // Scoped to `mem_config = 'dynamic_gtt'` so it never blends the preserved
     // `carveout` baseline into the current config's numbers.
     //
@@ -432,6 +449,12 @@ async fn migrate_locked(conn: &mut PgConnection) -> Result<(), ToolError> {
              avg(throughput_tok_per_sec) AS mean_throughput, \
              avg(total_time_ms) AS mean_latency_ms, \
              percentile_cont(0.95) WITHIN GROUP (ORDER BY total_time_ms) AS p95_latency_ms, \
+             sum(total_time_ms)::float / 1000.0 AS total_gpu_seconds, \
+             avg(first_pass_score) FILTER (WHERE error IS NULL) \
+                 / NULLIF( \
+                     (sum(total_time_ms)::float / 1000.0) \
+                         / NULLIF(count(*) FILTER (WHERE error IS NULL), 0)::float, \
+                     0) AS quality_per_gpu_second, \
              (count(*) FILTER (WHERE well_formed = false))::float / greatest(count(*),1)::float AS malformed_rate, \
              (count(*) FILTER (WHERE error IS NOT NULL))::float / greatest(count(*),1)::float AS error_rate \
          FROM code_profile_runs \
