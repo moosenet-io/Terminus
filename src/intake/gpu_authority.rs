@@ -159,18 +159,25 @@ fn pid_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
-/// Decide whether an existing lock blocks a NEW acquire by `holder`. Pure —
-/// the actual PID-liveness/self-lock exceptions, separated from the file IO
-/// so the decision logic is unit-testable without `/proc` or `/run`.
+/// Decide whether an existing lock blocks a NEW acquire by `holder` running
+/// as `current_pid`. Pure — the actual PID-liveness/self-lock exceptions,
+/// separated from the file IO so the decision logic is unit-testable
+/// without `/proc` or `/run`.
 ///
-/// - No lock ⇒ not blocked.
-/// - Same holder ⇒ not blocked (idempotent re-acquire, e.g. a resumed run).
-/// - Different holder, but its recorded PID is no longer alive ⇒ not blocked
-///   (abandoned lock from a crashed process — self-healing, a dead process
-///   must never wedge the GPU forever).
-/// - Different holder, PID alive ⇒ blocked.
-fn is_blocked(existing: &LockState, holder: &str, pid_is_alive: bool) -> bool {
-    existing.holder != holder && pid_is_alive
+/// - No lock (caller doesn't even get here) / recorded PID no longer alive
+///   ⇒ not blocked (abandoned lock from a crashed process — self-healing, a
+///   dead process must never wedge the GPU forever). Holder string is
+///   irrelevant here: a dead PID's lock is up for grabs by anyone.
+/// - PID alive AND it's a genuine same-process reentrant acquire (see
+///   [`is_idempotent_reacquire`]) ⇒ not blocked.
+/// - PID alive, otherwise (different process — REGARDLESS of whether the
+///   holder STRING happens to match) ⇒ blocked. This is the PID-aware fix:
+///   two distinct OS processes that happen to share a holder label (e.g. two
+///   overlapping `intake_coder_sweep` invocations during a systemd restart
+///   window) must never be treated as the same reentrant caller just because
+///   the label matches.
+fn is_blocked(existing: &LockState, holder: &str, pid_is_alive: bool, current_pid: u32) -> bool {
+    pid_is_alive && !is_idempotent_reacquire(existing, holder, current_pid)
 }
 
 /// Current process id. Thin wrapper (not pure) so [`is_blocked`] itself stays
@@ -258,25 +265,34 @@ fn reconcile_ollama(desired: Option<u32>) -> Result<(), String> {
     run("systemctl", &["restart", "ollama"])
 }
 
-/// Whether a NEW acquire by `holder`, given an EXISTING (not blocking) lock,
-/// should be a pure no-op — the lock is already this exact holder's, so
-/// there is nothing to (re-)apply. `true` only for the exact-same-holder
-/// case.
+/// Whether a NEW acquire by `holder`, running as `current_pid`, given an
+/// EXISTING lock, should be a pure no-op — the lock is already held BY THIS
+/// EXACT PROCESS under this exact holder label, so there is nothing to
+/// (re-)apply.
 ///
 /// This is what makes nested acquisition SAFE (MINT Phase 2 item 7): `mint`'s
 /// dispatcher pre-acquires under the SAME holder label a subcommand's own
 /// library function acquires under internally (e.g. `"intake_coder_sweep"`),
-/// so the subcommand's own `ExclusiveGuard::acquire` call sees "already held
-/// by me" and takes this no-op path instead of re-deriving a FRESH
-/// `stopped_services` list (which would come back empty — the services are
-/// already stopped from the outer acquire — and silently overwrite/lose the
-/// record of what the outer acquire actually stopped, so `release` would
-/// restart nothing). A DIFFERENT holder whose PID has since died is NOT this
-/// case — that's a takeover, which must still go through the full apply path
-/// below (stop services, reconcile Ollama, write a fresh `LockState` under
-/// the NEW holder).
-fn is_idempotent_reacquire(existing: &LockState, holder: &str) -> bool {
-    existing.holder == holder
+/// so the subcommand's own `ExclusiveGuard::acquire` call — running in the
+/// SAME OS process — sees "already held by me" and takes this no-op path
+/// instead of re-deriving a FRESH `stopped_services` list (which would come
+/// back empty — the services are already stopped from the outer acquire —
+/// and silently overwrite/lose the record of what the outer acquire actually
+/// stopped, so `release` would restart nothing).
+///
+/// Requires BOTH the holder string AND the recorded PID to match. Matching
+/// only the holder string is NOT sufficient: two genuinely different OS
+/// processes can share a holder label (e.g. two overlapping
+/// `intake_coder_sweep` invocations in a narrow systemd-restart window), and
+/// that case must be BLOCKED (if the first is still alive) rather than
+/// silently treated as a no-op that skips stopping services / reconciling
+/// Ollama for the second process and corrupts whose `stopped_services` list
+/// `release` will use. A DIFFERENT holder (or the same holder but a
+/// different, dead PID) is NOT this case — that's a takeover, which must
+/// still go through the full apply path below (stop services, reconcile
+/// Ollama, write a fresh `LockState`).
+fn is_idempotent_reacquire(existing: &LockState, holder: &str, current_pid: u32) -> bool {
+    existing.holder == holder && existing.pid == current_pid
 }
 
 /// Acquire `mode` on behalf of `holder` (a short label, e.g. the binary
@@ -285,21 +301,28 @@ fn is_idempotent_reacquire(existing: &LockState, holder: &str) -> bool {
 /// Ollama's runner config — rather than merely checking it, so a test never
 /// has to discover contention after the fact.
 ///
-/// `Err` when a DIFFERENT, still-alive holder already has the lock — never
-/// silently races another exclusive user for the GPU. A re-acquire by the
-/// SAME holder while it already holds the lock is a noop (see
+/// `Err` when a DIFFERENT process still alive already has the lock — never
+/// silently races another exclusive user for the GPU. This is now
+/// PID-aware, not just holder-string-aware: a re-acquire is a noop ONLY when
+/// it's the SAME OS process re-acquiring under the SAME holder label (see
 /// [`is_idempotent_reacquire`]) — this is what makes a nested acquire (e.g.
 /// `mint`'s dispatcher, then the subcommand's own internal acquire, under the
-/// identical holder label) safe rather than a lost-state footgun.
+/// identical holder label, in the SAME process) safe rather than a
+/// lost-state footgun. A DIFFERENT process that happens to use the same
+/// holder LABEL (e.g. two overlapping invocations of the same binary in a
+/// systemd-restart window) is blocked like any other contender, never
+/// treated as idempotent just because the string matches.
 pub fn acquire(mode: GpuMode, holder: &str) -> Result<(), String> {
     if let Some(existing) = read_lock() {
-        if is_blocked(&existing, holder, pid_alive(existing.pid)) {
+        let alive = pid_alive(existing.pid);
+        let this_pid = my_pid();
+        if is_blocked(&existing, holder, alive, this_pid) {
             return Err(format!(
                 "GPU is held exclusively by '{}' (pid {}, mode {}, since epoch {}) — refusing to acquire for '{holder}'",
                 existing.holder, existing.pid, existing.mode, existing.acquired_at
             ));
         }
-        if is_idempotent_reacquire(&existing, holder) {
+        if is_idempotent_reacquire(&existing, holder, this_pid) {
             return Ok(());
         }
     }
@@ -415,20 +438,23 @@ mod tests {
     }
 
     #[test]
-    fn is_blocked_same_holder_never_blocks() {
+    fn is_blocked_same_holder_same_pid_never_blocks() {
+        // Case 2: genuine same-process reentrance (this test's own pid is
+        // the recorded pid) — never blocked, regardless of "alive".
+        let current = my_pid();
         let existing = LockState {
             holder: "sweep".into(),
             mode: "exclusive".into(),
-            pid: 1,
+            pid: current,
             acquired_at: 0,
             stopped_services: vec![],
         };
-        // Even if (hypothetically) alive, the SAME holder re-acquiring is fine.
-        assert!(!is_blocked(&existing, "sweep", true));
+        assert!(!is_blocked(&existing, "sweep", true, current));
     }
 
     #[test]
     fn is_blocked_different_holder_alive_pid_blocks() {
+        let current = my_pid();
         let existing = LockState {
             holder: "sweep".into(),
             mode: "exclusive".into(),
@@ -436,12 +462,13 @@ mod tests {
             acquired_at: 0,
             stopped_services: vec![],
         };
-        assert!(is_blocked(&existing, "case-rerun", true));
+        assert!(is_blocked(&existing, "case-rerun", true, current));
     }
 
     #[test]
     fn is_blocked_different_holder_dead_pid_self_heals() {
         // A crashed holder must never wedge the GPU forever.
+        let current = my_pid();
         let existing = LockState {
             holder: "sweep".into(),
             mode: "exclusive".into(),
@@ -449,13 +476,25 @@ mod tests {
             acquired_at: 0,
             stopped_services: vec![],
         };
-        assert!(!is_blocked(&existing, "case-rerun", false));
+        assert!(!is_blocked(&existing, "case-rerun", false, current));
     }
 
-    // ---- is_idempotent_reacquire (Phase 2 item 7: nested-acquire safety) ----
-
     #[test]
-    fn is_idempotent_reacquire_same_holder_is_a_noop() {
+    fn is_blocked_same_holder_string_different_alive_pid_still_blocks() {
+        // Case 3 (the gap this fix closes): a genuinely DIFFERENT, alive OS
+        // process using the SAME holder label (e.g. two overlapping
+        // `intake_coder_sweep` invocations that both happen to land in a
+        // narrow systemd-restart window) must be BLOCKED, not waved through
+        // as an idempotent reacquire just because the holder STRING matches.
+        //
+        // PID 1 (init) is guaranteed to exist/be alive on any running
+        // system or container, and is never this test process's own pid —
+        // same technique as the dead/alive-PID tests above, but backed by a
+        // real `/proc` check instead of a hardcoded bool.
+        let current = my_pid();
+        assert_ne!(current, 1, "test process must not itself be pid 1");
+        assert!(pid_alive(1), "pid 1 (init) must be alive for this test to be meaningful");
+
         let existing = LockState {
             holder: "intake_coder_sweep".into(),
             mode: "exclusive".into(),
@@ -463,7 +502,25 @@ mod tests {
             acquired_at: 0,
             stopped_services: vec!["chord.service".to_string()],
         };
-        assert!(is_idempotent_reacquire(&existing, "intake_coder_sweep"));
+
+        assert!(!is_idempotent_reacquire(&existing, "intake_coder_sweep", current));
+        assert!(is_blocked(&existing, "intake_coder_sweep", pid_alive(existing.pid), current));
+    }
+
+    // ---- is_idempotent_reacquire (Phase 2 item 7 + PID-aware fix) ----
+
+    #[test]
+    fn is_idempotent_reacquire_same_holder_same_pid_is_a_noop() {
+        // Case 2: genuine same-process reentrance.
+        let current = my_pid();
+        let existing = LockState {
+            holder: "intake_coder_sweep".into(),
+            mode: "exclusive".into(),
+            pid: current,
+            acquired_at: 0,
+            stopped_services: vec!["chord.service".to_string()],
+        };
+        assert!(is_idempotent_reacquire(&existing, "intake_coder_sweep", current));
     }
 
     #[test]
@@ -471,6 +528,7 @@ mod tests {
         // A DIFFERENT holder (even one whose PID has since died, the
         // self-heal takeover case) must still go through the full apply
         // path — it is taking over the lock, not resuming its own.
+        let current = my_pid();
         let existing = LockState {
             holder: "intake_coder_sweep".into(),
             mode: "exclusive".into(),
@@ -478,7 +536,24 @@ mod tests {
             acquired_at: 0,
             stopped_services: vec!["chord.service".to_string()],
         };
-        assert!(!is_idempotent_reacquire(&existing, "intake_coder_case"));
+        assert!(!is_idempotent_reacquire(&existing, "intake_coder_case", current));
+    }
+
+    #[test]
+    fn is_idempotent_reacquire_same_holder_different_pid_is_not_a_noop() {
+        // Case 3 (the gap this fix closes): same holder STRING, but the
+        // recorded pid belongs to a different process than the one calling
+        // now — must NOT be treated as idempotent.
+        let current = my_pid();
+        let existing = LockState {
+            holder: "intake_coder_sweep".into(),
+            mode: "exclusive".into(),
+            pid: 1,
+            acquired_at: 0,
+            stopped_services: vec!["chord.service".to_string()],
+        };
+        assert_ne!(existing.pid, current);
+        assert!(!is_idempotent_reacquire(&existing, "intake_coder_sweep", current));
     }
 
     #[test]
