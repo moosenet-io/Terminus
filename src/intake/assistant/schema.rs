@@ -436,11 +436,29 @@ async fn migrate_locked(conn: &mut PgConnection) -> Result<(), ToolError> {
     // snapshot frozen at creation/refresh time. Nothing in this change wires an
     // automatic refresh; refreshing it (`REFRESH MATERIALIZED VIEW
     // model_language_stats`) after a sweep is an explicit operational task.
-    // `CREATE MATERIALIZED VIEW IF NOT EXISTS` is a no-op once it exists, so a
-    // repeated `migrate()` never rebuilds/refreshes it (intentional — a rebuild
-    // here would surprise operators mid-sweep).
+    //
+    // DROP + CREATE, not `CREATE ... IF NOT EXISTS` (gpu-cost-signal fixup,
+    // caught in review): Postgres's `IF NOT EXISTS` only skips the CREATE if a
+    // relation with that name already exists — it does NOT compare or update
+    // the view's column list against the CREATE statement's current SELECT.
+    // The very first version of this view (multi-point-score-tracking) used
+    // `IF NOT EXISTS` and was deployed to production; every subsequent column
+    // this migration wants to add (this branch's `total_gpu_seconds`/
+    // `quality_per_gpu_second`) would therefore silently never appear on an
+    // already-migrated database — the CREATE would just no-op against the
+    // existing, older-shaped view. Since this is a pure derived/computed view
+    // (no source-of-truth data lives only here — dropping and recreating it
+    // loses nothing that isn't trivially recomputable from `code_profile_runs`
+    // in milliseconds at current row counts), DROP-then-CREATE on every
+    // `migrate_locked()` call is the correct, safe evolution strategy for a
+    // view whose definition needs to keep growing new columns, unlike the
+    // `ADD COLUMN IF NOT EXISTS` pattern used for actual tables above.
+    sqlx::query("DROP MATERIALIZED VIEW IF EXISTS model_language_stats")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| ToolError::Database(format!("drop model_language_stats matview: {e}")))?;
     sqlx::query(
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS model_language_stats AS \
+        "CREATE MATERIALIZED VIEW model_language_stats AS \
          SELECT profile_id, language, \
              count(*) FILTER (WHERE error IS NULL) AS n_scored, \
              avg(first_pass_score) FILTER (WHERE error IS NULL) AS mean_score, \
