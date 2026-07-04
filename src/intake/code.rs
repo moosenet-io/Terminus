@@ -290,6 +290,39 @@ pub fn toolchain_coverage_gaps(
         .collect()
 }
 
+/// Pure computation of the `quality_per_gpu_second` routing signal — the same
+/// number the `model_language_stats` matview derives in SQL, kept
+/// independently testable outside the DB (same split-pure-logic-from-DB-I/O
+/// pattern as [`toolchain_coverage_gaps`] above).
+///
+/// ## What it means
+/// On <host> a coder sweep runs under [`crate::intake::gpu_authority`]'s
+/// `Exclusive` mode — competing services stopped, one Ollama-resident model at
+/// a time — so wall-clock `total_time_ms` per case IS the GPU-time cost per
+/// case (no other job is contending for the GPU during the sweep). Summed
+/// across a model's cases and divided by 1000 that's `total_gpu_seconds`; per
+/// scored case that's a mean GPU-seconds cost. This ratio answers "how much
+/// quality did the model buy per GPU-second of budget it spent" — higher is
+/// better (good quality achieved cheaply), the single cost-aware signal Chord's
+/// batch-suitability score consumes.
+///
+/// `mean_score / (total_gpu_seconds / n_scored)`.
+///
+/// Returns `None` (not a panic, not an error) for the degenerate cases a real
+/// model row can hit — zero scored cases or zero accumulated time — mirroring
+/// the matview's `NULLIF` guards so a model that never produced a usable,
+/// timed result yields a NULL cost signal rather than crashing the rollup.
+pub fn quality_per_gpu_second(mean_score: f64, total_gpu_seconds: f64, n_scored: u64) -> Option<f64> {
+    if n_scored == 0 || total_gpu_seconds == 0.0 {
+        return None;
+    }
+    let cost_per_case_seconds = total_gpu_seconds / n_scored as f64;
+    if cost_per_case_seconds == 0.0 {
+        return None;
+    }
+    Some(mean_score / cost_per_case_seconds)
+}
+
 /// Whether `bin` is on PATH (synchronous `which`-style check).
 pub fn have_tool(bin: &str) -> bool {
     std::process::Command::new("sh")
@@ -738,6 +771,34 @@ mod tests {
             toolchain_coverage_gaps(&corpus_none, &toolchain),
             vec!["rust".to_string(), "typescript".to_string()]
         );
+    }
+
+    #[test]
+    fn quality_per_gpu_second_basic_ratio() {
+        // 4 cases, 20 GPU-seconds total ⇒ 5 s/case; mean_score 4.0 ⇒ 0.8.
+        let q = quality_per_gpu_second(4.0, 20.0, 4).unwrap();
+        assert!((q - 0.8).abs() < 1e-9, "got {q}");
+    }
+
+    #[test]
+    fn quality_per_gpu_second_higher_is_better_when_cheaper() {
+        // Same quality, less GPU time ⇒ a strictly higher (better) signal.
+        let cheap = quality_per_gpu_second(4.0, 10.0, 4).unwrap();
+        let dear = quality_per_gpu_second(4.0, 40.0, 4).unwrap();
+        assert!(cheap > dear, "cheaper model must score higher: {cheap} vs {dear}");
+    }
+
+    #[test]
+    fn quality_per_gpu_second_zero_scored_is_none() {
+        // A model with no scored cases yields NULL, not a divide-by-zero.
+        assert_eq!(quality_per_gpu_second(4.0, 20.0, 0), None);
+    }
+
+    #[test]
+    fn quality_per_gpu_second_zero_time_is_none() {
+        // Zero accumulated GPU time (e.g. every case errored before timing)
+        // yields NULL rather than an infinity/crash.
+        assert_eq!(quality_per_gpu_second(4.0, 0.0, 4), None);
     }
 
     #[test]
