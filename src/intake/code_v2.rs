@@ -877,15 +877,35 @@ pub async fn run_code_suite_v2_cases(
     let pool = storage::get_pool().await?;
 
     // ---- Phase 1: inference, with the TEST model hot, NO judging --------
+    // INCR-01: persist each case's row IMMEDIATELY after it runs (instead of
+    // deferring every insert to the very end of the model's full case suite).
+    // A ~40-case suite at real generate() latency (tens of seconds/case) can
+    // legitimately take 20-40+ minutes end to end; the old all-at-the-end
+    // write pattern meant `code_profile_runs` saw a single 40-row burst once
+    // per model and NOTHING in between, which made row-age-based liveness
+    // checks (e.g. the host sweep-watchdog, STUCK_THRESHOLD_SEC=360s) treat a
+    // healthy, progressing sweep as jammed and restart it mid-suite — and
+    // because there is no per-case checkpoint (only a per-MODEL one, written
+    // after this whole function returns `Ok`), every such restart discarded
+    // all of that model's in-flight progress and restarted its case loop from
+    // the top, so a sufficiently slow model could never finish. Writing a row
+    // per case (kept as `Some(id)` in `row_ids`) restores a steady trickle
+    // matching actual progress, so row-age liveness checks stay accurate.
     let mut pending: Vec<CaseV2Result> = Vec::with_capacity(cases.len());
+    let mut row_ids: Vec<uuid::Uuid> = Vec::with_capacity(cases.len());
     for case in &cases {
-        pending.push(run_one_case_v2(&client, model_name, case, &dir, backend_tag, mem_config).await);
+        let cr = run_one_case_v2(&client, model_name, case, &dir, backend_tag, mem_config).await;
+        let id = storage::insert_code_run_v2(&pool, profile_id, &cr.row).await?;
+        row_ids.push(id);
+        pending.push(cr);
     }
 
     // ---- Phase 2: batched idiom judge, with the JUDGE model hot ---------
     // Running the judge here evicts the test model exactly once for the whole
     // suite (one swap) instead of once — or twice, with retries — per case.
-    for cr in &mut pending {
+    // Each case's row already exists (Phase 1); patch in the judge score (and
+    // the judge-driven 4→5 bump) via `update_code_run_v2_judge`.
+    for (cr, &id) in pending.iter_mut().zip(row_ids.iter()) {
         if let Some(resp) = cr.first_response.clone() {
             let q = judge_idiom(&client, &cr.spec, &resp).await;
             cr.row.code_quality_score = q;
@@ -903,9 +923,24 @@ pub async fn run_code_suite_v2_cases(
         }
         let fp = cr.row.first_pass_score.unwrap_or(0);
         cr.effective_score = cr.row.retry_score.map(|r| r.max(fp)).unwrap_or(fp);
+        // S86 hardening: call this UNCONDITIONALLY for every case, not just
+        // the ones that got judged. This is the one place every case's row
+        // reaches `finalized = true` (see `update_code_run_v2_judge`'s doc) —
+        // a case with no first_response/retry_response (e.g. it errored
+        // during inference) still needs to be marked complete, or
+        // `coder_gaps.rs`'s gap audit would treat it as forever-incomplete
+        // even though the suite is genuinely done with it.
+        storage::update_code_run_v2_judge(
+            &pool,
+            id,
+            cr.row.code_quality_score,
+            cr.row.first_pass_score,
+            cr.row.retry_score,
+        )
+        .await?;
     }
 
-    // ---- Phase 3: aggregate (error rows excluded) + persist ------------
+    // ---- Phase 3: aggregate (error rows excluded); rows already persisted ---
     let mut results: Vec<(String, String, i32)> = Vec::new();
     let mut first_sum = 0i64;
     let mut first_n = 0i64;
@@ -939,7 +974,6 @@ pub async fn run_code_suite_v2_cases(
             Some(_) => {}
         }
         per_case.push((case.id.clone(), fp, cr.row.retry_score));
-        storage::insert_code_run_v2(&pool, profile_id, &cr.row).await?;
     }
 
     let approved = compute_approvals_v2(&results);

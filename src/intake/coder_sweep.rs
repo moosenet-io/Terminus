@@ -312,6 +312,46 @@ async fn run_one_backend(
         });
     }
 
+    // ── S86 hardening: reconcile orphaned incomplete rows from a prior
+    //    crashed/killed attempt at this EXACT (model, backend, mem_config)
+    //    BEFORE starting a fresh attempt. Without this, INCR-01's per-case
+    //    Phase-1 inserts left behind by a mid-suite kill (before the
+    //    per-model checkpoint mark below) just accumulate forever — every
+    //    restart claims a brand-new `profile_id` and re-runs every case from
+    //    scratch, never touching the old partial rows. Best-effort: a
+    //    failure here is logged and does NOT block the fresh attempt (worst
+    //    case, one more generation of orphaned rows sits alongside the new
+    //    one — no worse than before this hardening, and never blocks a run
+    //    over a cleanup hiccup). ──
+    match schema::get_pool().await {
+        Ok(pool) => {
+            match intake::storage::delete_unfinalized_code_runs_v2(
+                &pool,
+                &model_id,
+                backend.as_str(),
+                mem_config,
+            )
+            .await
+            {
+                Ok(0) => {}
+                Ok(n) => eprintln!(
+                    "coder sweep: reconciled {n} orphaned unfinalized code_profile_runs row(s) \
+                     for model={model_id} backend={} mem_config={} (prior crashed attempt)",
+                    backend.as_str(),
+                    mem_config.unwrap_or("(NULL)"),
+                ),
+                Err(e) => eprintln!(
+                    "coder sweep: orphaned-row cleanup failed for model={model_id} backend={} \
+                     (continuing anyway): {e}",
+                    backend.as_str(),
+                ),
+            }
+        }
+        Err(e) => eprintln!(
+            "coder sweep: orphaned-row cleanup skipped (pool connect failed, continuing anyway): {e}"
+        ),
+    }
+
     // ── per-model flow, mirroring ModelIntake: profile row → suite → persist.
     //    A fresh profile row scopes this (model, backend) pass's code rows. ──
     let profile_id = match intake::create_profile_row(&model_id).await {

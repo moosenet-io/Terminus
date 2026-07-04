@@ -302,6 +302,38 @@ async fn migrate_locked(conn: &mut PgConnection) -> Result<(), ToolError> {
         .await
         .map_err(|e| ToolError::Database(format!("add code_profile_runs.case_id: {e}")))?;
 
+    // `finalized` (S86 INCR-01 hardening): explicit completion marker for the
+    // incremental-persistence rework, where `code_v2::run_code_suite_v2_cases`
+    // now inserts each case's row at the END of Phase 1 (inference only) and
+    // patches it in place through Phase 2 (judge scoring), instead of
+    // inserting every row atomically at the very end of Phase 3 like before.
+    // That means a row can now exist in a genuinely incomplete state (Phase 1
+    // ran, but the process was killed/crashed before Phase 2/3 finished for
+    // that case) — and `error IS NULL AND case_id IS NOT NULL` alone (the
+    // predicate `coder_gaps.rs` used to call a row "valid/complete") cannot
+    // tell that apart from a real, fully-scored result. `finalized` closes
+    // that gap: `storage::insert_code_run_v2`'s Phase-1 insert EXPLICITLY
+    // writes `false` (never relies on the column default for new rows), and
+    // `storage::update_code_run_v2_judge` sets it to `true` once a case
+    // reaches its true end (called for every case, judged or not).
+    //
+    // DEFAULT TRUE (not false) is deliberate and easy to misread backwards:
+    // this column's default exists ONLY to correctly backfill PRE-EXISTING
+    // rows, which were all written by the OLD atomic Phase-3-inserts-
+    // everything code path and are therefore already complete/valid by
+    // construction. `ADD COLUMN ... DEFAULT true` makes every legacy row read
+    // as `finalized = true` without a rewrite, preserving `coder_gaps.rs`'s
+    // existing "no gap" verdicts for data collected before this column
+    // existed. Only the NEW incremental Phase-1 insert path overrides this
+    // default with an explicit `false`; every other/future writer that does
+    // not mention this column keeps defaulting to "already complete", which
+    // is the correct assumption for anything not going through the new
+    // incremental path.
+    sqlx::query("ALTER TABLE code_profile_runs ADD COLUMN IF NOT EXISTS finalized BOOLEAN NOT NULL DEFAULT true")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| ToolError::Database(format!("add code_profile_runs.finalized: {e}")))?;
+
     // 3. The dual-profile join view. Built so a model present in only ONE side
     //    still appears (key set = UNION of both sides' model_ids), and so a
     //    missing builder `backend_tag` column degrades to NULL rather than

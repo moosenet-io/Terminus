@@ -27,6 +27,33 @@ use std::collections::HashSet;
 use crate::intake::assistant::schema;
 use crate::intake::{corpus_v2_dir, filter_by_language, read_manifest_v2};
 
+/// SQL for the have-valid-row query when `mem_config` is `Some`. Pulled out
+/// to a const so a unit test can assert, without a live DB, that the S86
+/// hardening's `AND r.finalized` clause is actually present in the real
+/// query text (not just in the [`is_valid_complete_row`] mirror used to
+/// test the predicate's boundary behavior).
+const VALID_CASE_IDS_SQL_WITH_MEM_CONFIG: &str = "SELECT DISTINCT r.case_id FROM code_profile_runs r \
+     JOIN model_profiles p ON p.id = r.profile_id \
+     WHERE p.model_name = $1 AND r.mem_config = $2 AND r.error IS NULL \
+     AND r.case_id IS NOT NULL AND r.finalized";
+
+/// Same query, scoped to `mem_config IS NULL` instead of an explicit value.
+const VALID_CASE_IDS_SQL_NO_MEM_CONFIG: &str = "SELECT DISTINCT r.case_id FROM code_profile_runs r \
+     JOIN model_profiles p ON p.id = r.profile_id \
+     WHERE p.model_name = $1 AND r.mem_config IS NULL AND r.error IS NULL \
+     AND r.case_id IS NOT NULL AND r.finalized";
+
+/// Pure mirror of the "valid, complete" row predicate the two SQL constants
+/// above implement (`case_id IS NOT NULL AND error IS NULL AND finalized`).
+/// Exists so the predicate's boundary behavior — in particular, that a
+/// Phase-1-only row (inference succeeded, i.e. `error IS NULL`, but the
+/// process was killed before Phase 2/3 finalized it) is correctly excluded —
+/// can be unit tested without a live Postgres connection (this crate's test
+/// suite runs with no DB available). Keep in sync with the two consts above.
+fn is_valid_complete_row(case_id: Option<&str>, error: Option<&str>, finalized: bool) -> bool {
+    case_id.is_some() && error.is_none() && finalized
+}
+
 pub fn langs_from_env() -> Vec<String> {
     std::env::var("INTAKE_CODE_LANGS")
         .ok()
@@ -85,31 +112,33 @@ pub async fn run(
         }
     };
 
-    // Distinct case ids that have at least one VALID row (error IS NULL) —
-    // a hard-failed-then-fixed case still counts as a gap until a clean row
-    // exists for it. `case_id IS NOT NULL` rows only (see module doc).
+    // Distinct case ids that have at least one VALID, COMPLETE row
+    // (`error IS NULL AND finalized`) — a hard-failed-then-fixed case still
+    // counts as a gap until a clean row exists for it. `case_id IS NOT NULL`
+    // rows only (see module doc).
+    //
+    // `AND r.finalized` (S86 hardening): since INCR-01, `code_v2` persists a
+    // case's row at the end of Phase 1 (inference only, before judging/
+    // aggregation), so a row can now legitimately exist with `error IS NULL`
+    // while still being incomplete — e.g. the process was killed before
+    // Phase 2/3 ran for that case. Without this clause such a row would
+    // match this "valid" predicate exactly like a genuinely finished one,
+    // making this audit falsely report the case as done and permanently
+    // hide a real gap. `finalized` defaults to `true` for every row written
+    // before this column existed (the old atomic-insert path only ever wrote
+    // complete rows), so this clause changes nothing for legacy data.
     let rows: Vec<(Option<String>,)> = match mem_config {
-        Some(mc) => sqlx::query_as(
-            "SELECT DISTINCT r.case_id FROM code_profile_runs r \
-             JOIN model_profiles p ON p.id = r.profile_id \
-             WHERE p.model_name = $1 AND r.mem_config = $2 AND r.error IS NULL \
-             AND r.case_id IS NOT NULL",
-        )
-        .bind(&model_id)
-        .bind(mc)
-        .fetch_all(&pool)
-        .await
-        .unwrap_or_default(),
-        None => sqlx::query_as(
-            "SELECT DISTINCT r.case_id FROM code_profile_runs r \
-             JOIN model_profiles p ON p.id = r.profile_id \
-             WHERE p.model_name = $1 AND r.mem_config IS NULL AND r.error IS NULL \
-             AND r.case_id IS NOT NULL",
-        )
-        .bind(&model_id)
-        .fetch_all(&pool)
-        .await
-        .unwrap_or_default(),
+        Some(mc) => sqlx::query_as(VALID_CASE_IDS_SQL_WITH_MEM_CONFIG)
+            .bind(&model_id)
+            .bind(mc)
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_default(),
+        None => sqlx::query_as(VALID_CASE_IDS_SQL_NO_MEM_CONFIG)
+            .bind(&model_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_default(),
     };
     let have_valid: HashSet<String> = rows.into_iter().filter_map(|(c,)| c).collect();
 
@@ -179,4 +208,74 @@ pub async fn run_from_env() -> std::process::ExitCode {
     let mem_config = mem_config_from_env();
     let langs = langs_from_env();
     run(model_id.as_deref(), mem_config.as_deref(), &langs).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- S86 hardening: `finalized` predicate wiring + behavior --------
+
+    #[test]
+    fn valid_case_ids_sql_requires_finalized() {
+        assert!(VALID_CASE_IDS_SQL_WITH_MEM_CONFIG.contains("AND r.finalized"));
+        assert!(VALID_CASE_IDS_SQL_NO_MEM_CONFIG.contains("AND r.finalized"));
+    }
+
+    #[test]
+    fn non_finalized_error_null_row_is_not_valid_complete() {
+        // Phase-1-only row: inference succeeded (error IS NULL) but the
+        // process was killed before Phase 2/3 finalized it. Before this fix
+        // this predicate (minus `finalized`) would have wrongly called this
+        // "valid" — the exact false-negative-gap bug being hardened against.
+        assert!(!is_valid_complete_row(Some("rust-blitz-a3"), None, false));
+    }
+
+    #[test]
+    fn finalized_error_null_row_is_valid_complete() {
+        assert!(is_valid_complete_row(Some("rust-blitz-a3"), None, true));
+    }
+
+    #[test]
+    fn errored_row_is_never_valid_regardless_of_finalized() {
+        assert!(!is_valid_complete_row(Some("rust-blitz-a3"), Some("timeout"), true));
+        assert!(!is_valid_complete_row(Some("rust-blitz-a3"), Some("timeout"), false));
+    }
+
+    #[test]
+    fn row_without_case_id_is_never_valid_regardless_of_finalized() {
+        assert!(!is_valid_complete_row(None, None, true));
+    }
+
+    /// End-to-end (within the pure predicate) reproduction of the exact
+    /// scenario Codex's review flagged: a case whose ONLY row is a
+    /// Phase-1-only (non-finalized) row must still show up in `missing`,
+    /// not be silently treated as done.
+    #[test]
+    fn case_with_only_a_non_finalized_row_is_still_reported_as_a_gap() {
+        let all_ids: HashSet<String> = ["case-a".to_string(), "case-b".to_string()].into_iter().collect();
+
+        // Simulated code_profile_runs state: case-a has ONLY a non-finalized
+        // (crashed-mid-suite) row; case-b has a genuinely finalized row.
+        let simulated_rows: [(Option<&str>, Option<&str>, bool); 2] =
+            [(Some("case-a"), None, false), (Some("case-b"), None, true)];
+
+        let have_valid: HashSet<String> = simulated_rows
+            .iter()
+            .filter(|(case_id, error, finalized)| is_valid_complete_row(*case_id, *error, *finalized))
+            .filter_map(|(case_id, _, _)| case_id.map(|s| s.to_string()))
+            .collect();
+
+        let missing: Vec<&String> = all_ids.iter().filter(|id| !have_valid.contains(*id)).collect();
+
+        assert!(
+            missing.iter().any(|id| id.as_str() == "case-a"),
+            "case-a's only row is non-finalized (crashed mid-suite) — it must still be \
+             reported as a gap, not falsely treated as already done"
+        );
+        assert!(
+            !missing.iter().any(|id| id.as_str() == "case-b"),
+            "case-b has a genuinely finalized row — it must NOT be reported as a gap"
+        );
+    }
 }

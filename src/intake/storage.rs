@@ -253,45 +253,159 @@ pub struct CodeRunRowV2 {
     pub mem_config: Option<String>,
 }
 
+/// SQL for [`insert_code_run_v2`]. Pulled out to a const so a unit test can
+/// assert, without a live DB, that the Phase-1 insert explicitly writes
+/// `finalized = false` (S86 INCR-01 hardening) rather than silently relying
+/// on the column's `DEFAULT true` — which exists ONLY to backfill
+/// pre-existing (already-complete) legacy rows, not to describe a brand-new
+/// Phase-1-only row. See the `finalized` column's doc comment in
+/// `assistant/schema.rs::migrate_locked` for the full rationale.
+const INSERT_CODE_RUN_V2_SQL: &str = "INSERT INTO code_profile_runs \
+     (profile_id, harness_version, language, task_type, \
+      first_pass_score, retry_score, compiles, tests_pass, change_correct, \
+      code_quality_score, context_tokens, response_tokens, file_count, total_lines, \
+      throughput_tok_per_sec, total_time_ms, oom, error, backend_tag, mem_config, case_id, \
+      finalized) \
+     VALUES ($1, 'v2', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, \
+     false) \
+     RETURNING id";
+
 /// Insert one v2 `code_profile_runs` row (harness_version='v2'). Additive — the
 /// v1 columns it does not populate are left NULL.
+///
+/// INCR-01: returns the new row's id so a caller doing incremental
+/// (per-case, not per-model-batch) persistence can patch the row later
+/// (see `update_code_run_v2_judge`) once the deferred idiom judge runs. Also
+/// always writes `finalized = false` (S86 hardening) — this row is Phase-1
+/// only at insert time; `update_code_run_v2_judge` marks it `true` once the
+/// case reaches its true end.
+/// Kept as a thin, backwards-compatible wrapper is NOT done here — this
+/// function's signature changed (Result<Uuid, _> instead of Result<(), _>);
+/// its one caller (`code_v2.rs::run_code_suite_v2_cases`) is updated in the
+/// same change.
 pub async fn insert_code_run_v2(
     pool: &PgPool,
     profile_id: Uuid,
     row: &CodeRunRowV2,
+) -> Result<Uuid, ToolError> {
+    let rec = sqlx::query_scalar::<_, Uuid>(INSERT_CODE_RUN_V2_SQL)
+        .bind(profile_id)
+        .bind(&row.language)
+        .bind(row.task_type.as_deref())
+        .bind(row.first_pass_score)
+        .bind(row.retry_score)
+        .bind(row.compiles)
+        .bind(row.tests_pass)
+        .bind(row.change_correct)
+        .bind(row.code_quality_score)
+        .bind(row.context_tokens)
+        .bind(row.response_tokens)
+        .bind(row.file_count)
+        .bind(row.total_lines)
+        .bind(row.throughput_tok_per_sec)
+        .bind(row.total_time_ms)
+        .bind(row.oom)
+        .bind(row.error.as_deref())
+        .bind(row.backend_tag.as_deref())
+        .bind(row.mem_config.as_deref())
+        .bind(row.case_id.as_deref())
+        .fetch_one(pool)
+        .await
+        .map_err(|e| ToolError::Database(format!("Failed to insert code_profile_runs (v2): {e}")))?;
+    Ok(rec)
+}
+
+/// SQL for [`update_code_run_v2_judge`]. Pulled out to a const so a unit test
+/// can assert, without a live DB, that this statement ALWAYS sets
+/// `finalized = true` — this is the finalization point for every case (see
+/// the function doc below for why it must be unconditional).
+const UPDATE_CODE_RUN_V2_JUDGE_SQL: &str = "UPDATE code_profile_runs \
+     SET code_quality_score = $2, first_pass_score = $3, retry_score = $4, finalized = true \
+     WHERE id = $1";
+
+/// INCR-01 + S86 hardening: patch a previously-inserted v2 row with the
+/// batched idiom-judge result AND mark it `finalized = true`. Called from
+/// Phase 2 of `run_code_suite_v2_cases` for EVERY case (judged or not) —
+/// inference (Phase 1) now persists each case's row immediately (so
+/// `code_profile_runs` gets a steady trickle of rows instead of one 40-row
+/// burst at the very end of a model's suite), and this patches in
+/// `code_quality_score` plus the judge-driven 4→5 score bump when a judge
+/// pass ran, while ALSO being the one place every case's row reaches its true
+/// completion marker regardless of whether judging applied to it (a case
+/// with no `first_response`/`retry_response` still needs `finalized = true`,
+/// or `coder_gaps.rs`'s gap audit would treat it as forever-incomplete even
+/// though the suite is done with it). No-op-safe: updates by primary key, so
+/// a row that no longer exists (should never happen in the normal single
+/// in-flight-attempt-at-a-time flow) simply matches zero rows rather than
+/// erroring.
+pub async fn update_code_run_v2_judge(
+    pool: &PgPool,
+    id: Uuid,
+    code_quality_score: Option<f64>,
+    first_pass_score: Option<i32>,
+    retry_score: Option<i32>,
 ) -> Result<(), ToolError> {
-    sqlx::query(
-        "INSERT INTO code_profile_runs \
-         (profile_id, harness_version, language, task_type, \
-          first_pass_score, retry_score, compiles, tests_pass, change_correct, \
-          code_quality_score, context_tokens, response_tokens, file_count, total_lines, \
-          throughput_tok_per_sec, total_time_ms, oom, error, backend_tag, mem_config, case_id) \
-         VALUES ($1, 'v2', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)",
-    )
-    .bind(profile_id)
-    .bind(&row.language)
-    .bind(row.task_type.as_deref())
-    .bind(row.first_pass_score)
-    .bind(row.retry_score)
-    .bind(row.compiles)
-    .bind(row.tests_pass)
-    .bind(row.change_correct)
-    .bind(row.code_quality_score)
-    .bind(row.context_tokens)
-    .bind(row.response_tokens)
-    .bind(row.file_count)
-    .bind(row.total_lines)
-    .bind(row.throughput_tok_per_sec)
-    .bind(row.total_time_ms)
-    .bind(row.oom)
-    .bind(row.error.as_deref())
-    .bind(row.backend_tag.as_deref())
-    .bind(row.mem_config.as_deref())
-    .bind(row.case_id.as_deref())
-    .execute(pool)
-    .await
-    .map_err(|e| ToolError::Database(format!("Failed to insert code_profile_runs (v2): {e}")))?;
+    sqlx::query(UPDATE_CODE_RUN_V2_JUDGE_SQL)
+        .bind(id)
+        .bind(code_quality_score)
+        .bind(first_pass_score)
+        .bind(retry_score)
+        .execute(pool)
+        .await
+        .map_err(|e| ToolError::Database(format!("Failed to update code_profile_runs judge (v2): {e}")))?;
     Ok(())
+}
+
+/// SQL for [`delete_unfinalized_code_runs_v2`]. Pulled out to a const so a
+/// unit test can assert, without a live DB, the exact shape of this
+/// production-data-deleting statement: scoped by `model_profiles.model_name`
+/// (joined via `profile_id`), `code_profile_runs.backend_tag`, and
+/// `code_profile_runs.mem_config` (the last two compared with
+/// `IS NOT DISTINCT FROM` so a `NULL` `mem_config` matches `NULL`, not "no
+/// rows"), AND requiring `finalized = false` so an already-complete row —
+/// even one for this exact (model, backend, mem_config) from a genuinely
+/// finished prior run — is never touched. Also scoped to `harness_version =
+/// 'v2'` as a belt-and-suspenders guard (v1 rows are never written with
+/// `finalized = false` in the first place, since only `insert_code_run_v2`
+/// sets that column explicitly).
+const DELETE_UNFINALIZED_CODE_RUNS_V2_SQL: &str = "DELETE FROM code_profile_runs r \
+     USING model_profiles p \
+     WHERE r.profile_id = p.id \
+       AND p.model_name = $1 \
+       AND r.harness_version = 'v2' \
+       AND r.backend_tag = $2 \
+       AND r.mem_config IS NOT DISTINCT FROM $3 \
+       AND r.finalized = false";
+
+/// S86 hardening: reconcile orphaned incomplete rows left behind by a prior
+/// crashed/killed attempt at this EXACT `(model_id, backend_tag, mem_config)`
+/// combination, before `run_one_backend` creates a fresh `profile_id` and
+/// starts a brand-new attempt. Without this, a process kill between Phase 1
+/// (row insert) and the per-model checkpoint mark (written only after the
+/// WHOLE suite returns `Ok`) leaves those Phase-1-only rows sitting in
+/// `code_profile_runs` forever — every restart starts a fresh `profile_id`
+/// and re-runs every case from scratch, so the orphaned rows just accumulate
+/// with each crash/restart instead of ever being cleaned up or reconciled.
+///
+/// Deliberately narrow: only rows for THIS model/backend/mem_config AND only
+/// `finalized = false` rows are deleted. Returns the number of rows deleted
+/// (for logging/observability — callers are not required to act on it).
+pub async fn delete_unfinalized_code_runs_v2(
+    pool: &PgPool,
+    model_id: &str,
+    backend_tag: &str,
+    mem_config: Option<&str>,
+) -> Result<u64, ToolError> {
+    let result = sqlx::query(DELETE_UNFINALIZED_CODE_RUNS_V2_SQL)
+        .bind(model_id)
+        .bind(backend_tag)
+        .bind(mem_config)
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            ToolError::Database(format!("Failed to delete orphaned unfinalized code_profile_runs rows: {e}"))
+        })?;
+    Ok(result.rows_affected())
 }
 
 /// One measured agent scenario. Mirrors `agent_profile_runs` columns.
@@ -590,5 +704,49 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(tagged_row.mem_config.as_deref(), Some("carveout"));
+    }
+
+    // ---- S86 INCR-01 hardening: `finalized` column wiring -------------
+
+    /// Phase-1 insert must explicitly write `finalized = false` (never rely
+    /// on the column's `DEFAULT true`, which exists only to backfill
+    /// pre-existing legacy rows as already-complete).
+    #[test]
+    fn insert_code_run_v2_sql_explicitly_sets_finalized_false() {
+        assert!(INSERT_CODE_RUN_V2_SQL.contains("finalized"));
+        // The 21st bind param position ($20) is the last VALUES entry before
+        // the literal `false` for `finalized` — confirming the insert never
+        // falls through to the column's `DEFAULT true`.
+        assert!(
+            INSERT_CODE_RUN_V2_SQL.contains("$20, false) RETURNING id"),
+            "expected the VALUES list to end with an explicit `false` for \
+             `finalized`, got: {INSERT_CODE_RUN_V2_SQL}"
+        );
+    }
+
+    /// The judge-patch statement is the finalization point for every case —
+    /// it must set `finalized = true` unconditionally (the caller now invokes
+    /// it for every case, judged or not).
+    #[test]
+    fn update_code_run_v2_judge_sql_sets_finalized_true() {
+        assert!(UPDATE_CODE_RUN_V2_JUDGE_SQL.contains("finalized = true"));
+    }
+
+    /// The startup-cleanup delete must scope by model_name + backend_tag +
+    /// mem_config (NULL-safe) AND only ever touch `finalized = false` rows —
+    /// this is the exact predicate that keeps it from ever deleting a
+    /// genuinely-completed row, even one for the same model/backend/mem_config.
+    #[test]
+    fn delete_unfinalized_sql_scopes_by_key_and_only_targets_unfinalized_rows() {
+        let sql = DELETE_UNFINALIZED_CODE_RUNS_V2_SQL;
+        assert!(sql.contains("p.model_name = $1"));
+        assert!(sql.contains("r.backend_tag = $2"));
+        assert!(sql.contains("r.mem_config IS NOT DISTINCT FROM $3"));
+        assert!(sql.contains("r.finalized = false"));
+        assert!(sql.contains("harness_version = 'v2'"));
+        // Must join through model_profiles so the DELETE cannot match rows
+        // belonging to a different model_id sharing the same backend/mem_config.
+        assert!(sql.contains("USING model_profiles p"));
+        assert!(sql.contains("r.profile_id = p.id"));
     }
 }
