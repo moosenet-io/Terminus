@@ -20,7 +20,7 @@
 //! - `mint gpu acquire`      — proactively claim exclusive (or hand back shared) GPU use.
 //! - `mint gpu release`      — release a held GPU-authority lock.
 
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use terminus_rs::intake::{assistant::runner, coder_case, coder_gaps, coder_sweep, gpu_authority};
 
@@ -252,6 +252,7 @@ async fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use std::sync::Mutex;
 
     // Serializes tests that touch process-global env vars — `cargo test`
