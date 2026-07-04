@@ -26,12 +26,10 @@ pub const SMOKE_TIERS: [usize; 3] = [2000, 8000, 16000];
 
 /// Per-tier inference timeout. Generous so a slow large-context generation
 /// isn't mistaken for an OOM. Overridable via `INTAKE_TIER_TIMEOUT_SEC`.
+/// Delegates to the canonical resolver (Phase 2 item 3) — same default
+/// (600s), same env var, same behavior.
 fn tier_timeout() -> Duration {
-    let secs = std::env::var("INTAKE_TIER_TIMEOUT_SEC")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(600);
-    Duration::from_secs(secs)
+    super::timeouts::env_timeout("INTAKE_TIER_TIMEOUT_SEC", 600)
 }
 
 // ---------------------------------------------------------------------------

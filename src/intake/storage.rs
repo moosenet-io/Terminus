@@ -8,20 +8,27 @@
 //!   - `context_profile_runs`         — one row per context tier
 //!   - `model_operational_profiles`   — one derived row computed after all tiers
 //!
-//! `get_pool()` mirrors the reminder module: reads `DATABASE_URL`, connects a
-//! fresh `PgPool`. The intake run is infrequent (manual / onboarding), so a
-//! per-call pool is acceptable.
+//! `get_pool()` connects a fresh `PgPool`. The intake run is infrequent
+//! (manual / onboarding), so a per-call pool is acceptable.
 
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::config;
 use crate::error::ToolError;
 
-/// Connect a Postgres pool from `DATABASE_URL` (same pattern as reminder::get_pool).
+/// Connect a Postgres pool. Prefers `INTAKE_DATABASE_URL`, falls back to
+/// `DATABASE_URL` — Phase 2 item 6: this now matches
+/// `assistant::schema::get_pool()`'s (the production-confirmed) precedence
+/// via the SAME `config::intake_database_url()` resolver, instead of reading
+/// `DATABASE_URL` only. Before this fix, a host with ONLY
+/// `INTAKE_DATABASE_URL` set (no `DATABASE_URL`) would have this module's
+/// callers fail to connect while `assistant::schema`'s callers, on the exact
+/// same shared DB, connected fine.
 pub async fn get_pool() -> Result<PgPool, ToolError> {
-    let url = std::env::var("DATABASE_URL").map_err(|_| {
+    let url = config::intake_database_url().ok_or_else(|| {
         ToolError::NotConfigured(
-            "DATABASE_URL not set — model intake requires a Postgres connection".into(),
+            "neither INTAKE_DATABASE_URL nor DATABASE_URL set — model intake requires a Postgres connection".into(),
         )
     })?;
     PgPool::connect(&url)
@@ -694,12 +701,26 @@ pub async fn read_latest_profile(
 mod tests {
     use super::*;
 
+    // Serializes tests that mutate the shared DATABASE_URL/INTAKE_DATABASE_URL
+    // process env vars — `cargo test` runs tests in the same process on
+    // multiple threads by default.
+    use serial_test::serial;
+
     #[tokio::test]
+    #[serial]
     async fn get_pool_missing_db_url_errors() {
         std::env::remove_var("DATABASE_URL");
+        std::env::remove_var("INTAKE_DATABASE_URL");
         let r = get_pool().await;
         assert!(matches!(r, Err(ToolError::NotConfigured(_))));
     }
+
+    // The env-var PRECEDENCE order itself (INTAKE_DATABASE_URL wins, falls
+    // back to DATABASE_URL) is exercised as a pure, network-free test against
+    // `config::intake_database_url()` in `config.rs` — the exact resolver
+    // `get_pool()` now delegates to (Phase 2 item 6) — rather than here via a
+    // real `PgPool::connect()` attempt against a fake host, which would incur
+    // a real (possibly slow/hanging) network/DNS round trip in this test.
 
     /// mem-config-tagging: `mem_config` defaults to `None` (never silently
     /// mislabels a row written by a caller that doesn't set it) and is

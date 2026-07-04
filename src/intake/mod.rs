@@ -20,6 +20,7 @@
 
 mod agent;
 pub mod assistant;
+pub mod checkpoint;
 mod code;
 mod code_v2;
 pub mod coder_case;
@@ -33,6 +34,7 @@ pub mod newcats;
 mod runner;
 pub mod serving;
 mod storage;
+mod timeouts;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};

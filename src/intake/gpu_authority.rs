@@ -258,6 +258,27 @@ fn reconcile_ollama(desired: Option<u32>) -> Result<(), String> {
     run("systemctl", &["restart", "ollama"])
 }
 
+/// Whether a NEW acquire by `holder`, given an EXISTING (not blocking) lock,
+/// should be a pure no-op — the lock is already this exact holder's, so
+/// there is nothing to (re-)apply. `true` only for the exact-same-holder
+/// case.
+///
+/// This is what makes nested acquisition SAFE (MINT Phase 2 item 7): `mint`'s
+/// dispatcher pre-acquires under the SAME holder label a subcommand's own
+/// library function acquires under internally (e.g. `"intake_coder_sweep"`),
+/// so the subcommand's own `ExclusiveGuard::acquire` call sees "already held
+/// by me" and takes this no-op path instead of re-deriving a FRESH
+/// `stopped_services` list (which would come back empty — the services are
+/// already stopped from the outer acquire — and silently overwrite/lose the
+/// record of what the outer acquire actually stopped, so `release` would
+/// restart nothing). A DIFFERENT holder whose PID has since died is NOT this
+/// case — that's a takeover, which must still go through the full apply path
+/// below (stop services, reconcile Ollama, write a fresh `LockState` under
+/// the NEW holder).
+fn is_idempotent_reacquire(existing: &LockState, holder: &str) -> bool {
+    existing.holder == holder
+}
+
 /// Acquire `mode` on behalf of `holder` (a short label, e.g. the binary
 /// name). Proactively APPLIES the mode's policy — stops the mode's declared
 /// competing services (recording which were actually active) and reconciles
@@ -265,7 +286,11 @@ fn reconcile_ollama(desired: Option<u32>) -> Result<(), String> {
 /// has to discover contention after the fact.
 ///
 /// `Err` when a DIFFERENT, still-alive holder already has the lock — never
-/// silently races another exclusive user for the GPU.
+/// silently races another exclusive user for the GPU. A re-acquire by the
+/// SAME holder while it already holds the lock is a noop (see
+/// [`is_idempotent_reacquire`]) — this is what makes a nested acquire (e.g.
+/// `mint`'s dispatcher, then the subcommand's own internal acquire, under the
+/// identical holder label) safe rather than a lost-state footgun.
 pub fn acquire(mode: GpuMode, holder: &str) -> Result<(), String> {
     if let Some(existing) = read_lock() {
         if is_blocked(&existing, holder, pid_alive(existing.pid)) {
@@ -273,6 +298,9 @@ pub fn acquire(mode: GpuMode, holder: &str) -> Result<(), String> {
                 "GPU is held exclusively by '{}' (pid {}, mode {}, since epoch {}) — refusing to acquire for '{holder}'",
                 existing.holder, existing.pid, existing.mode, existing.acquired_at
             ));
+        }
+        if is_idempotent_reacquire(&existing, holder) {
+            return Ok(());
         }
     }
 
@@ -422,6 +450,35 @@ mod tests {
             stopped_services: vec![],
         };
         assert!(!is_blocked(&existing, "case-rerun", false));
+    }
+
+    // ---- is_idempotent_reacquire (Phase 2 item 7: nested-acquire safety) ----
+
+    #[test]
+    fn is_idempotent_reacquire_same_holder_is_a_noop() {
+        let existing = LockState {
+            holder: "intake_coder_sweep".into(),
+            mode: "exclusive".into(),
+            pid: 1,
+            acquired_at: 0,
+            stopped_services: vec!["chord.service".to_string()],
+        };
+        assert!(is_idempotent_reacquire(&existing, "intake_coder_sweep"));
+    }
+
+    #[test]
+    fn is_idempotent_reacquire_different_holder_is_not_a_noop() {
+        // A DIFFERENT holder (even one whose PID has since died, the
+        // self-heal takeover case) must still go through the full apply
+        // path — it is taking over the lock, not resuming its own.
+        let existing = LockState {
+            holder: "intake_coder_sweep".into(),
+            mode: "exclusive".into(),
+            pid: 1,
+            acquired_at: 0,
+            stopped_services: vec!["chord.service".to_string()],
+        };
+        assert!(!is_idempotent_reacquire(&existing, "intake_coder_case"));
     }
 
     #[test]

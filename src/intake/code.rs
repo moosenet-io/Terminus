@@ -272,12 +272,10 @@ pub fn have_tool(bin: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Per-case inference timeout (overridable via `INTAKE_CODE_TIMEOUT_SEC`).
+/// Delegates to the canonical resolver (Phase 2 item 3) — same default
+/// (300s), same env var, same behavior.
 fn code_timeout() -> Duration {
-    let secs = std::env::var("INTAKE_CODE_TIMEOUT_SEC")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(300);
-    Duration::from_secs(secs)
+    super::timeouts::env_timeout("INTAKE_CODE_TIMEOUT_SEC", 300)
 }
 
 /// Result of running one code case (before DB insert).

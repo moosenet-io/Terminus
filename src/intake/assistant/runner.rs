@@ -97,8 +97,13 @@ pub trait Checkpoint: Send + Sync {
 /// ([`config::intake_checkpoint_path`]). Small-file IO, append-on-mark. Survives
 /// reboots because the GGUFs (the expensive thing) are staged separately and the
 /// per-dimension rows are already in Postgres.
+///
+/// Wraps the generic [`crate::intake::checkpoint::FileCheckpoint`] (MINT Phase
+/// 2 item 1) — this type now just adapts that shared, key-agnostic file
+/// ledger onto the async [`Checkpoint`] trait this module's callers expect;
+/// the on-disk format and every read/append semantic are unchanged.
 pub struct FileCheckpoint {
-    path: String,
+    inner: crate::intake::checkpoint::FileCheckpoint<CheckpointKey>,
 }
 
 impl FileCheckpoint {
@@ -111,37 +116,20 @@ impl FileCheckpoint {
                     .into(),
             )
         })?;
-        Ok(FileCheckpoint { path })
-    }
-
-    fn read_all(&self) -> Vec<CheckpointKey> {
-        match std::fs::read_to_string(&self.path) {
-            Ok(s) => s
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .filter_map(|l| serde_json::from_str::<CheckpointKey>(l).ok())
-                .collect(),
-            Err(_) => Vec::new(), // absent ledger ⇒ fresh run
-        }
+        Ok(FileCheckpoint {
+            inner: crate::intake::checkpoint::FileCheckpoint::at(path),
+        })
     }
 }
 
 #[async_trait::async_trait]
 impl Checkpoint for FileCheckpoint {
     async fn done(&self) -> Result<BTreeSet<CheckpointKey>, String> {
-        Ok(self.read_all().into_iter().collect())
+        Ok(self.inner.done())
     }
 
     async fn mark(&self, key: &CheckpointKey) -> Result<(), String> {
-        use std::io::Write;
-        let line = serde_json::to_string(key).map_err(|e| e.to_string())?;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|e| format!("open checkpoint {}: {e}", self.path))?;
-        writeln!(f, "{line}").map_err(|e| format!("append checkpoint: {e}"))?;
-        Ok(())
+        self.inner.mark(key)
     }
 }
 
@@ -476,6 +464,14 @@ async fn run_one_backend(
 // Live entry point — wires the production collaborators
 // ===========================================================================
 
+/// GPU-authority holder label this suite acquires under (see
+/// [`gpu_authority::ExclusiveGuard`]). `pub` so `mint`'s dispatcher can
+/// pre-acquire under the IDENTICAL label before calling [`run`] (MINT Phase 2
+/// item 7) — see [`crate::intake::coder_sweep::GPU_HOLDER`]'s doc comment for
+/// why the label must match exactly, not just be "some guard for this
+/// subcommand".
+pub const GPU_HOLDER: &str = "intake_assistant_sweep";
+
 /// Production entry: connect the intake DB, migrate, open a run, load nominations
 /// from the NAS staging dir, and run the suite with the live collaborators.
 ///
@@ -502,7 +498,7 @@ pub async fn run() -> Result<RunReport, ToolError> {
     // sweep for the GPU. Held for the duration of `run()` via the
     // `_gpu_guard` binding's scope; released on drop (including on early
     // return via `?` below).
-    let _gpu_guard = match gpu_authority::ExclusiveGuard::acquire(GpuMode::Exclusive, "intake_assistant_sweep") {
+    let _gpu_guard = match gpu_authority::ExclusiveGuard::acquire(GpuMode::Exclusive, GPU_HOLDER) {
         Ok(g) => g,
         Err(e) => return Err(ToolError::Execution(format!("assistant sweep did not start: {e}"))),
     };

@@ -292,6 +292,60 @@ pub fn is_oom_like(msg: &str, status: Option<u16>) -> bool {
         || lc.contains("failed to allocate")
 }
 
+/// Whether an inference error is a transport/connection failure worth one
+/// retry (vs. a deterministic model/server rejection). Pure. Originally
+/// private to `code_v2.rs`'s retry loop; promoted here (Phase 2 item 4) as the
+/// `Transport` half of [`ErrorClass`], alongside [`is_oom_like`]'s `Oom` half,
+/// so both live next to each other as the two heuristic error predicates the
+/// intake suites share.
+pub fn is_transport_error(msg: &str) -> bool {
+    let l = msg.to_lowercase();
+    l.contains("error sending request")
+        || l.contains("connection")
+        || l.contains("timed out")
+        || l.contains("timeout")
+        || l.contains("broken pipe")
+        || l.contains("reset by peer")
+        || l.contains("eof")
+}
+
+/// Coarse classification of an inference error, unifying the two ad hoc
+/// predicates ([`is_oom_like`], [`is_transport_error`]) into one public
+/// vocabulary (Phase 2 item 4). Named `ErrorClass` — not `RetryReason` or
+/// similar — because its use isn't limited to "should I retry?": it is also
+/// meant as a stable trigger condition a future automated "breakfix"
+/// subagent can match on (e.g. "escalate `Oom` classifications to a
+/// GPU-authority alert", "silently retry `Transport`", "surface `Other` for
+/// human review").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// Out-of-memory / overload — the model process was killed, or the host
+    /// rejected the request outright ([`is_oom_like`]'s conditions).
+    Oom,
+    /// A transient connection failure worth one retry, not a deterministic
+    /// model/server rejection ([`is_transport_error`]'s conditions).
+    Transport,
+    /// Deterministic failure (bad prompt, model not found, validation error,
+    /// unrecognized dimension, …) — neither of the above.
+    Other,
+}
+
+/// Classify an inference error/status into an [`ErrorClass`]. `Oom` is
+/// checked first: an error whose text matches BOTH `is_oom_like` and
+/// `is_transport_error` (e.g. a message mentioning both "connection" and
+/// "killed") classifies as `Oom`, not `Transport` — a message that reads as
+/// possibly-OOM should never be silently retried as if it were a plain
+/// transient network blip.
+pub fn classify_error(msg: &str, status: Option<u16>) -> ErrorClass {
+    if is_oom_like(msg, status) {
+        ErrorClass::Oom
+    } else if is_transport_error(msg) {
+        ErrorClass::Transport
+    } else {
+        ErrorClass::Other
+    }
+}
+
 /// Run a single context tier against the model via Ollama `/api/generate`
 /// (non-streaming — Ollama returns `prompt_eval_duration` and `eval_duration`
 /// which give us TTFT and throughput without needing a stream).
@@ -690,6 +744,60 @@ mod tests {
         assert!(is_oom_like("", Some(503)));
         assert!(!is_oom_like("model not found", Some(404)));
         assert!(!is_oom_like("ok", None));
+    }
+
+    // ---- ErrorClass (Phase 2 item 4): unifies is_oom_like + is_transport_error ----
+
+    #[test]
+    fn is_transport_error_detects() {
+        // Preserves code_v2.rs's original test cases for the predicate this
+        // module now owns.
+        assert!(is_transport_error("error sending request for url"));
+        assert!(is_transport_error("connection refused"));
+        assert!(is_transport_error("operation timed out"));
+        assert!(is_transport_error("unexpected EOF"));
+        assert!(!is_transport_error("model 'foo' not found"));
+        assert!(!is_transport_error("invalid prompt"));
+        assert!(!is_transport_error("out of memory"));
+    }
+
+    #[test]
+    fn classify_error_oom_cases() {
+        assert_eq!(classify_error("CUDA out of memory", None), ErrorClass::Oom);
+        assert_eq!(classify_error("process killed", None), ErrorClass::Oom);
+        assert_eq!(classify_error("", Some(500)), ErrorClass::Oom);
+        assert_eq!(classify_error("", Some(503)), ErrorClass::Oom);
+    }
+
+    #[test]
+    fn classify_error_transport_cases() {
+        assert_eq!(
+            classify_error("error sending request for url", None),
+            ErrorClass::Transport
+        );
+        assert_eq!(classify_error("connection refused", None), ErrorClass::Transport);
+        assert_eq!(classify_error("operation timed out", None), ErrorClass::Transport);
+        assert_eq!(classify_error("unexpected EOF", None), ErrorClass::Transport);
+    }
+
+    #[test]
+    fn classify_error_other_cases() {
+        assert_eq!(classify_error("model not found", Some(404)), ErrorClass::Other);
+        assert_eq!(classify_error("ok", None), ErrorClass::Other);
+        assert_eq!(classify_error("model 'foo' not found", None), ErrorClass::Other);
+        assert_eq!(classify_error("invalid prompt", None), ErrorClass::Other);
+    }
+
+    #[test]
+    fn classify_error_oom_wins_over_transport_on_a_dual_match() {
+        // A message matching BOTH predicates (e.g. mentions "connection" AND
+        // "killed") must classify as Oom, not Transport: an error that reads
+        // as possibly-OOM should never be silently retried as if it were a
+        // plain transient network blip. Documents the deliberate precedence
+        // (see `classify_error`'s doc comment).
+        let dual = "connection to worker lost: process killed";
+        assert!(is_transport_error(dual), "sanity: message DOES match the transport predicate too");
+        assert_eq!(classify_error(dual, None), ErrorClass::Oom);
     }
 
     #[test]

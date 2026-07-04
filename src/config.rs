@@ -274,6 +274,64 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    // ---- intake_database_url precedence (Phase 2 item 6) ----
+    // `storage::get_pool()` (S83's model-intake pool) and
+    // `assistant::schema::get_pool()` (S84's) both now delegate to this ONE
+    // resolver, so its precedence order — INTAKE_DATABASE_URL wins,
+    // DATABASE_URL is the fallback, a blank value counts as unset — is the
+    // single source of truth for both. Tested here, pure and network-free
+    // (no `PgPool::connect` attempt), rather than by observing a connection
+    // failure against a fake host from each pool's own test module.
+
+    #[test]
+    #[serial]
+    fn intake_database_url_prefers_intake_over_database_url() {
+        std::env::set_var("INTAKE_DATABASE_URL", "postgres://intake-wins/db");
+        std::env::set_var("DATABASE_URL", "postgres://database-url-loses/db");
+        assert_eq!(
+            intake_database_url().as_deref(),
+            Some("postgres://intake-wins/db")
+        );
+        std::env::remove_var("INTAKE_DATABASE_URL");
+        std::env::remove_var("DATABASE_URL");
+    }
+
+    #[test]
+    #[serial]
+    fn intake_database_url_falls_back_to_database_url() {
+        std::env::remove_var("INTAKE_DATABASE_URL");
+        std::env::set_var("DATABASE_URL", "postgres://database-url-fallback/db");
+        assert_eq!(
+            intake_database_url().as_deref(),
+            Some("postgres://database-url-fallback/db")
+        );
+        std::env::remove_var("DATABASE_URL");
+    }
+
+    #[test]
+    #[serial]
+    fn intake_database_url_none_when_both_unset() {
+        std::env::remove_var("INTAKE_DATABASE_URL");
+        std::env::remove_var("DATABASE_URL");
+        assert_eq!(intake_database_url(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn intake_database_url_blank_intake_value_falls_back() {
+        // A blank INTAKE_DATABASE_URL must be treated as unset, not as a
+        // literal empty-string DB URL — same tolerance `env_nonempty` gives
+        // every other setting in this module.
+        std::env::set_var("INTAKE_DATABASE_URL", "   ");
+        std::env::set_var("DATABASE_URL", "postgres://database-url-fallback/db");
+        assert_eq!(
+            intake_database_url().as_deref(),
+            Some("postgres://database-url-fallback/db")
+        );
+        std::env::remove_var("INTAKE_DATABASE_URL");
+        std::env::remove_var("DATABASE_URL");
+    }
+
     #[test]
     #[serial]
     fn judge_cli_defaults_to_bare_name() {

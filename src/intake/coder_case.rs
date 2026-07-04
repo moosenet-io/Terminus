@@ -84,6 +84,13 @@ pub fn mem_config_from_env() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// GPU-authority holder label this rerun acquires under (see
+/// [`gpu_authority::ExclusiveGuard`]). `pub` so `mint`'s dispatcher can
+/// pre-acquire under the IDENTICAL label before calling [`run`] (MINT Phase 2
+/// item 7) — see [`crate::intake::coder_sweep::GPU_HOLDER`]'s doc comment for
+/// why the label must match exactly.
+pub const GPU_HOLDER: &str = "intake_coder_case";
+
 /// Run one ad hoc `(model, backend, case_ids)` rerun end to end. `model_id`
 /// and `case_ids` are the CALLER's already-resolved values (env read + any
 /// CLI-flag override already applied — `None`/empty is treated as "not
@@ -136,7 +143,7 @@ pub async fn run(
     // produced false "wedge" timeouts earlier — see gpu_authority's module
     // doc). A DIFFERENT holder label than the sweep's means this correctly
     // refuses to start while the sweep holds the GPU, rather than racing it.
-    let _gpu_guard = match gpu_authority::ExclusiveGuard::acquire(GpuMode::Exclusive, "intake_coder_case") {
+    let _gpu_guard = match gpu_authority::ExclusiveGuard::acquire(GpuMode::Exclusive, GPU_HOLDER) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("case rerun did not start: {e}");

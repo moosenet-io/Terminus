@@ -115,13 +115,10 @@ impl CaseV2 {
 }
 
 /// Default inference timeout per tier (blitz 60s, standard 120s, deep 300s).
+/// Delegates to the canonical resolver (Phase 2 item 3) — same table, same
+/// behavior.
 pub fn tier_default_timeout(tier: &str) -> u64 {
-    match tier.to_lowercase().as_str() {
-        "blitz" => 60,
-        "standard" => 120,
-        "deep" => 300,
-        _ => 120,
-    }
+    super::timeouts::tier_default_secs(tier)
 }
 
 /// Read + parse `manifest.json` from the v2 corpus.
@@ -509,19 +506,6 @@ async fn apply_and_validate(
     res
 }
 
-/// Whether an inference error is a transport/connection failure worth one
-/// retry (vs. a deterministic model/server rejection). Pure.
-fn is_transport_error(e: &str) -> bool {
-    let l = e.to_lowercase();
-    l.contains("error sending request")
-        || l.contains("connection")
-        || l.contains("timed out")
-        || l.contains("timeout")
-        || l.contains("broken pipe")
-        || l.contains("reset by peer")
-        || l.contains("eof")
-}
-
 /// Backoff delays (seconds) between retries of a transport-style error, in
 /// order. HFIX-04: a single fixed 10s retry did not survive the SUSTAINED
 /// (multi-minute) connectivity windows actually observed on <host> — ollama's
@@ -548,7 +532,13 @@ async fn generate_with_retry(
             break;
         }
         let Some(e) = &g.error else { break };
-        if !is_transport_error(e) {
+        // Phase 2 item 4: routed through the shared `ErrorClass` classifier
+        // instead of an ad hoc `is_transport_error` call — `g.oom` above
+        // already gates the OOM case for THIS outcome (set at generation
+        // time from a live status code), so only `Transport` should retry
+        // here; anything else (including `Other`) falls through to the
+        // existing "stop retrying" behavior, unchanged.
+        if context::classify_error(e, None) != context::ErrorClass::Transport {
             break;
         }
         tracing::warn!(
@@ -1044,14 +1034,17 @@ mod tests {
 
     #[test]
     fn transport_errors_retry_deterministic_ones_dont() {
-        assert!(is_transport_error("error sending request for url"));
-        assert!(is_transport_error("connection refused"));
-        assert!(is_transport_error("operation timed out"));
-        assert!(is_transport_error("unexpected EOF"));
+        // `is_transport_error` moved to `context.rs` (Phase 2 item 4, the
+        // `ErrorClass::Transport` half of the shared classifier); these are
+        // the ORIGINAL test cases, preserved verbatim against the new home.
+        assert!(context::is_transport_error("error sending request for url"));
+        assert!(context::is_transport_error("connection refused"));
+        assert!(context::is_transport_error("operation timed out"));
+        assert!(context::is_transport_error("unexpected EOF"));
         // Deterministic / model-level failures must NOT trigger a retry.
-        assert!(!is_transport_error("model 'foo' not found"));
-        assert!(!is_transport_error("invalid prompt"));
-        assert!(!is_transport_error("out of memory"));
+        assert!(!context::is_transport_error("model 'foo' not found"));
+        assert!(!context::is_transport_error("invalid prompt"));
+        assert!(!context::is_transport_error("out of memory"));
     }
 
     #[test]

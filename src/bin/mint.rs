@@ -22,7 +22,10 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use terminus_rs::intake::{assistant::runner, coder_case, coder_gaps, coder_sweep, gpu_authority};
+use terminus_rs::intake::{
+    assistant::{runner, schema},
+    coder_case, coder_gaps, coder_sweep, gpu_authority,
+};
 
 #[derive(Parser)]
 #[command(name = "mint", about = "MINT model-intake profiling CLI (sweep/case/gaps/gpu)")]
@@ -143,9 +146,43 @@ fn env_opt(key: &str) -> Option<String> {
     std::env::var(key).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
+/// MINT Phase 2 item 5: connect + migrate the shared intake schema ONCE,
+/// explicitly, at `mint`'s own entry point — in ADDITION to (not instead of)
+/// each library `run` function's own defensive `migrate()` call, so the
+/// standalone legacy binaries (`intake_coder_sweep`, `intake_assistant_sweep`,
+/// …) keep working unchanged when invoked directly, without going through
+/// `mint` at all. `migrate()` is idempotent and lock-safe (advisory-lock
+/// serialized — see `dd44eaf`), so calling it here as well as inside the
+/// dispatched subcommand is always safe, never a double-migration hazard.
+async fn ensure_schema_migrated() -> Result<(), String> {
+    let pool = schema::get_pool().await.map_err(|e| e.to_string())?;
+    schema::migrate(&pool).await.map_err(|e| e.to_string())
+}
+
+/// Item 5: does `cmd` need the shared intake schema migrated before it runs?
+/// Every subcommand EXCEPT `gpu ...` touches the shared intake DB (directly,
+/// or via the library function it dispatches to). `gpu status`/`acquire`/
+/// `release` manage the GPU-authority FILE lock only and have no Postgres
+/// dependency at all — forcing a DB connection on them would make a pure
+/// lock query/release fail on a host with no DB reachable, which is not this
+/// item's intent. Pure/extracted so this decision is unit-testable without
+/// a live Postgres connection.
+fn needs_schema_migrate(cmd: &Command) -> bool {
+    !matches!(cmd, Command::Gpu { .. })
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+
+    // Item 5: migrate once, explicitly, here — before dispatching — for
+    // every subcommand `needs_schema_migrate` says needs it.
+    if needs_schema_migrate(&cli.command) {
+        if let Err(e) = ensure_schema_migrated().await {
+            eprintln!("mint: schema migrate failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
 
     match cli.command {
         Command::Sweep { target } => match target {
@@ -157,28 +194,68 @@ async fn main() -> std::process::ExitCode {
                 let case_limit =
                     coder_sweep::normalize_case_limit(case_limit).or_else(coder_sweep::case_limit_from_env);
                 let mem_config = resolved_string(mem_config, coder_sweep::mem_config_from_env);
+
+                // Item 7: `mint`'s dispatcher pre-acquires the GPU-authority
+                // guard under the EXACT SAME holder label `coder_sweep::run`
+                // acquires internally (`coder_sweep::GPU_HOLDER`). This is
+                // safe (not a double-acquisition deadlock/footgun) BECAUSE
+                // `gpu_authority::acquire` treats a re-acquire by the SAME
+                // holder as an idempotent no-op (see
+                // `gpu_authority::is_idempotent_reacquire`) — the inner
+                // acquire inside `coder_sweep::run` sees the lock already
+                // held by its own label and does nothing further, and the
+                // inner guard's `Drop` (at the end of `coder_sweep::run`)
+                // performs the actual release + service-restart; THIS outer
+                // guard's later `Drop` then finds no lock left and is a
+                // no-op too. A DIFFERENT holder currently holding the lock
+                // still correctly fails HERE, before any sweep work starts.
+                let _gpu_guard = match gpu_authority::ExclusiveGuard::acquire(
+                    gpu_authority::GpuMode::Exclusive,
+                    coder_sweep::GPU_HOLDER,
+                ) {
+                    Ok(g) => g,
+                    Err(e) => {
+                        eprintln!("mint: GPU acquire failed: {e}");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                };
                 coder_sweep::run(&langs, case_limit, mem_config.as_deref()).await
             }
-            SweepTarget::Assistant => match runner::run().await {
-                Ok(report) => {
-                    let total = report.models.len();
-                    let profiled = report
-                        .models
-                        .iter()
-                        .filter(|m| m.acquisition_skip.is_none() && m.backends.iter().any(|b| b.survived))
-                        .count();
-                    let skipped = report.models.iter().filter(|m| m.acquisition_skip.is_some()).count();
-                    eprintln!(
-                        "assistant sweep complete: {profiled}/{total} models profiled, \
-                         {skipped} acquisition-skipped (scores persisted to the intake DB)"
-                    );
-                    std::process::ExitCode::SUCCESS
+            SweepTarget::Assistant => {
+                // Item 7: same pattern as `Sweep::Coder`, under
+                // `runner::GPU_HOLDER` — the exact label `runner::run`
+                // acquires internally.
+                let _gpu_guard = match gpu_authority::ExclusiveGuard::acquire(
+                    gpu_authority::GpuMode::Exclusive,
+                    runner::GPU_HOLDER,
+                ) {
+                    Ok(g) => g,
+                    Err(e) => {
+                        eprintln!("mint: GPU acquire failed: {e}");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                };
+                match runner::run().await {
+                    Ok(report) => {
+                        let total = report.models.len();
+                        let profiled = report
+                            .models
+                            .iter()
+                            .filter(|m| m.acquisition_skip.is_none() && m.backends.iter().any(|b| b.survived))
+                            .count();
+                        let skipped = report.models.iter().filter(|m| m.acquisition_skip.is_some()).count();
+                        eprintln!(
+                            "assistant sweep complete: {profiled}/{total} models profiled, \
+                             {skipped} acquisition-skipped (scores persisted to the intake DB)"
+                        );
+                        std::process::ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("assistant sweep did not complete: {e}");
+                        std::process::ExitCode::FAILURE
+                    }
                 }
-                Err(e) => {
-                    eprintln!("assistant sweep did not complete: {e}");
-                    std::process::ExitCode::FAILURE
-                }
-            },
+            }
         },
 
         Command::Case { model, ids, backend, langs, mem_config } => {
@@ -194,10 +271,25 @@ async fn main() -> std::process::ExitCode {
                 None => coder_case::langs_from_env(),
             };
             let mem_config = resolved_string(mem_config, coder_case::mem_config_from_env);
+
+            // Item 7: same pattern, under `coder_case::GPU_HOLDER`.
+            let _gpu_guard = match gpu_authority::ExclusiveGuard::acquire(
+                gpu_authority::GpuMode::Exclusive,
+                coder_case::GPU_HOLDER,
+            ) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("mint: GPU acquire failed: {e}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
             coder_case::run(model.as_deref(), &case_ids, backend.as_deref(), &langs, mem_config.as_deref()).await
         }
 
         Command::Gaps { model, mem_config, langs } => {
+            // No GPU guard here: `coder_gaps::run` is a read-only audit
+            // against already-persisted rows, never runs inference, and
+            // never acquires the GPU-authority lock itself either.
             let model = resolved_string(model, || env_opt("INTAKE_CASE_MODEL"));
             let mem_config = resolved_string(mem_config, coder_gaps::mem_config_from_env);
             let langs = match langs {
@@ -551,5 +643,62 @@ mod tests {
             Some(5),
             "--case-limit 0 with INTAKE_CODE_CASE_LIMIT=5 set must defer to the env value"
         );
+    }
+
+    // ---- needs_schema_migrate (item 5) ----
+
+    #[test]
+    fn needs_schema_migrate_true_for_every_non_gpu_subcommand() {
+        let sweep_coder = Cli::try_parse_from(["mint", "sweep", "coder"]).unwrap().command;
+        let sweep_assistant = Cli::try_parse_from(["mint", "sweep", "assistant"]).unwrap().command;
+        let case = Cli::try_parse_from(["mint", "case"]).unwrap().command;
+        let gaps = Cli::try_parse_from(["mint", "gaps"]).unwrap().command;
+
+        assert!(needs_schema_migrate(&sweep_coder));
+        assert!(needs_schema_migrate(&sweep_assistant));
+        assert!(needs_schema_migrate(&case));
+        assert!(needs_schema_migrate(&gaps));
+    }
+
+    #[test]
+    fn needs_schema_migrate_false_for_every_gpu_action() {
+        let status = Cli::try_parse_from(["mint", "gpu", "status"]).unwrap().command;
+        let acquire = Cli::try_parse_from(["mint", "gpu", "acquire"]).unwrap().command;
+        let release = Cli::try_parse_from(["mint", "gpu", "release"]).unwrap().command;
+
+        assert!(!needs_schema_migrate(&status));
+        assert!(!needs_schema_migrate(&acquire));
+        assert!(!needs_schema_migrate(&release));
+    }
+
+    // ---- item 7: mint's pre-acquired GPU-authority holder labels must match
+    //      each library function's OWN internal acquire() call EXACTLY, or
+    //      the inner acquire (a DIFFERENT holder, same live process/pid)
+    //      would see a live competing holder and fail outright instead of
+    //      taking the same-holder no-op path. These constants are `pub` on
+    //      the library side specifically so the two acquisition points can
+    //      never drift apart via a copy-pasted literal. ----
+
+    #[test]
+    fn gpu_holder_labels_are_stable_and_distinct_per_subcommand() {
+        use std::collections::BTreeSet;
+        let labels: BTreeSet<&str> = [
+            terminus_rs::intake::coder_sweep::GPU_HOLDER,
+            terminus_rs::intake::assistant::runner::GPU_HOLDER,
+            terminus_rs::intake::coder_case::GPU_HOLDER,
+        ]
+        .into_iter()
+        .collect();
+        // Three subcommands, three DISTINCT holder labels — if two ever
+        // collapsed to the same string, a coder sweep and an assistant
+        // sweep (say) could run concurrently under an identical label and
+        // never detect the collision via gpu_authority's is_blocked check.
+        assert_eq!(labels.len(), 3);
+        assert_eq!(terminus_rs::intake::coder_sweep::GPU_HOLDER, "intake_coder_sweep");
+        assert_eq!(
+            terminus_rs::intake::assistant::runner::GPU_HOLDER,
+            "intake_assistant_sweep"
+        );
+        assert_eq!(terminus_rs::intake::coder_case::GPU_HOLDER, "intake_coder_case");
     }
 }
