@@ -526,4 +526,30 @@ mod tests {
             "--case-limit 0 must resolve identically to INTAKE_CODE_CASE_LIMIT being unset"
         );
     }
+
+    #[test]
+    fn case_limit_zero_defers_to_env_when_env_is_set() {
+        // `--case-limit 0` means "no CLI preference expressed" — when
+        // INTAKE_CODE_CASE_LIMIT is ALSO set, the flag must defer to it
+        // exactly as an omitted flag would, not force None and not impose
+        // a literal zero-case limit.
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("INTAKE_CODE_CASE_LIMIT", "5");
+
+        let cli = Cli::try_parse_from(["mint", "sweep", "coder", "--case-limit", "0"]).expect("parses");
+        let case_limit = match cli.command {
+            Command::Sweep { target: SweepTarget::Coder { case_limit, .. } } => {
+                coder_sweep::normalize_case_limit(case_limit).or_else(coder_sweep::case_limit_from_env)
+            }
+            _ => panic!("expected Sweep(Coder)"),
+        };
+
+        std::env::remove_var("INTAKE_CODE_CASE_LIMIT");
+
+        assert_eq!(
+            case_limit,
+            Some(5),
+            "--case-limit 0 with INTAKE_CODE_CASE_LIMIT=5 set must defer to the env value"
+        );
+    }
 }
