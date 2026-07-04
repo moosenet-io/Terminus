@@ -22,7 +22,7 @@
 //! The intake DB URL is sourced from [`crate::config::intake_database_url`]
 //! (NO literals).
 
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 use crate::config;
 use crate::error::ToolError;
@@ -31,6 +31,44 @@ use super::{BackendTag, DimensionScore, ModelId};
 
 /// Schema/harness version stamped onto every `assistant_profile_run` row.
 pub const HARNESS_VERSION: &str = "s84-asmt-01";
+
+/// Postgres advisory-lock key serializing concurrent [`migrate`] callers.
+///
+/// `intake_coder_sweep` and `intake_assistant_sweep` are separate binaries
+/// that each call `migrate()` defensively at their own startup (either might
+/// be first on a fresh host). Several of the statements below are NOT safe
+/// against concurrent execution even though each is individually guarded
+/// with `IF NOT EXISTS`/`IF EXISTS` — most notably the `DROP INDEX IF EXISTS
+/// idx_assistant_score_model` + `CREATE INDEX IF NOT EXISTS
+/// idx_assistant_score_model ...` pair: two processes can both pass the
+/// "does it exist" check before either finishes creating it, and the loser
+/// gets `duplicate key value violates unique constraint
+/// "pg_class_relname_nsp_index"`. This was observed live in production (a
+/// host-level watchdog restarting both services around the same time),
+/// surfacing as `coder sweep did not start: schema migrate failed: ...` and
+/// costing hours of lost sweep progress before this race was identified as
+/// the root cause.
+///
+/// The fix wraps the whole migration body in a session-scoped
+/// `pg_advisory_lock`/`pg_advisory_unlock` pair (see [`migrate`]) so
+/// concurrent callers serialize instead of racing. Postgres advisory locks
+/// are tied to the connection/session that took them: if a process crashes
+/// mid-migration, its connection drops and Postgres releases the lock
+/// automatically — there is no persistent lock state to get stuck, so this
+/// cannot deadlock a future run.
+///
+/// The value is the first 8 bytes (big-endian, signed) of
+/// `sha256("terminus_assistant_schema_migrate")`, i.e. a fixed, stable,
+/// human-traceable constant rather than an arbitrary literal — recompute
+/// with:
+/// ```text
+/// python3 -c "import hashlib; h = hashlib.sha256(b'terminus_assistant_schema_migrate').digest(); print(int.from_bytes(h[:8], 'big', signed=True))"
+/// ```
+/// to verify it if this constant is ever in doubt. Advisory lock keys are a
+/// single global i64 namespace per Postgres cluster, so this MUST stay
+/// unique among any other advisory locks Terminus/Lumina ever introduces —
+/// grep for `pg_advisory_lock` before reusing or changing it.
+const ADVISORY_LOCK_KEY: i64 = -5322992491554488081;
 
 /// Connect a pool to the intake/assistant DB. Prefers `INTAKE_DATABASE_URL`,
 /// falls back to `DATABASE_URL` (same shared DB S83 uses).
@@ -55,6 +93,73 @@ pub async fn get_pool() -> Result<PgPool, ToolError> {
 /// on `model_id` only, and the builder `backend_tag` is surfaced as `NULL` when
 /// the column is absent (resolved at view-creation time via a catalog probe).
 pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
+    // Serialize concurrent callers (see `ADVISORY_LOCK_KEY`'s doc comment for
+    // the full race this guards against). The lock is connection-scoped, so
+    // it MUST be taken and held on one dedicated connection checked out of
+    // the pool — taking it via `pool` directly would acquire it on whichever
+    // connection the pool happens to hand out per-query, and release it
+    // (implicitly, by the connection going back into the pool's idle set)
+    // before the migration body below even runs.
+    let mut conn = pool.acquire().await.map_err(|e| {
+        ToolError::Database(format!(
+            "acquire dedicated connection for schema migrate: {e}"
+        ))
+    })?;
+
+    // Mark this connection to be closed rather than returned to the pool
+    // once it drops, no matter how it drops. `PoolConnection`'s `Drop` impl
+    // checks this flag directly (see sqlx `pool/connection.rs`), so it takes
+    // effect on every exit path from this function — normal return, an early
+    // `?`-propagated error below, or (hypothetically) a panic unwinding
+    // through this frame — not just the two `result`/unlock code paths
+    // written out explicitly further down. This closes the gap where a
+    // session-scoped advisory lock could otherwise survive on a connection
+    // that goes back into the pool's idle set: `pg_advisory_lock` is
+    // re-entrant per-session, so a future borrower of this exact physical
+    // connection would silently inherit an already-held lock instead of
+    // acquiring a fresh one.
+    conn.close_on_drop();
+
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(ADVISORY_LOCK_KEY)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| ToolError::Database(format!("acquire schema migrate advisory lock: {e}")))?;
+
+    let result = migrate_locked(&mut conn).await;
+
+    // Always attempt the unlock, on both the success and error paths. This is
+    // now belt-and-suspenders rather than load-bearing: `close_on_drop()`
+    // above already guarantees this exact connection is discarded (never
+    // returned to the pool) once it drops, so there is no other caller left
+    // that could inherit a stuck lock from it. We still unlock explicitly
+    // (rather than relying solely on connection-close to release it) so the
+    // advisory lock is freed for the *next* `migrate()` caller as soon as
+    // possible, instead of only when this connection's close completes.
+    // sqlx has no `finally`, so this is structured explicitly: run the
+    // unlock after capturing `result`, log-not-swallow any unlock failure,
+    // then return the migration's own `result` either way.
+    if let Err(unlock_err) = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(ADVISORY_LOCK_KEY)
+        .execute(&mut *conn)
+        .await
+    {
+        tracing::warn!(
+            "assistant schema migrate: failed to release advisory lock {}: {unlock_err} \
+             (harmless — the lock is released automatically when this connection closes)",
+            ADVISORY_LOCK_KEY
+        );
+    }
+
+    result
+}
+
+/// The actual migration body, run on the same dedicated, advisory-locked
+/// connection acquired by [`migrate`]. Split out purely so [`migrate`] can
+/// wrap it in a lock/unlock pair without duplicating the lock handling
+/// around every early return — behavior is unchanged from the previous
+/// single-function `migrate()`.
+async fn migrate_locked(conn: &mut PgConnection) -> Result<(), ToolError> {
     // 1. Runs.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS assistant_profile_run ( \
@@ -63,7 +168,7 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
             harness_version TEXT NOT NULL \
          )",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await
     .map_err(|e| ToolError::Database(format!("create assistant_profile_run: {e}")))?;
 
@@ -86,7 +191,7 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
             created_at TIMESTAMPTZ NOT NULL DEFAULT now() \
          )",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await
     .map_err(|e| ToolError::Database(format!("create assistant_dimension_score: {e}")))?;
 
@@ -109,7 +214,7 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
         "ALTER TABLE assistant_dimension_score \
          ADD COLUMN IF NOT EXISTS task_category TEXT NOT NULL DEFAULT 'assistant'",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await
     .map_err(|e| ToolError::Database(format!("add task_category column: {e}")))?;
 
@@ -123,7 +228,7 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
     // baseline. Left NULL for old rows; new rows set it explicitly via
     // [`insert_dimension_score_with_category_and_mem_config`].
     sqlx::query("ALTER TABLE assistant_dimension_score ADD COLUMN IF NOT EXISTS mem_config TEXT")
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .map_err(|e| ToolError::Database(format!("add mem_config column: {e}")))?;
 
@@ -131,7 +236,7 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
     // on a DB that already had the old (model_id, backend_tag) index from a
     // prior migrate() run. Cheap: this table is intake-scale, not hot-path.
     sqlx::query("DROP INDEX IF EXISTS idx_assistant_score_model")
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .map_err(|e| ToolError::Database(format!("drop idx_assistant_score_model: {e}")))?;
 
@@ -139,7 +244,7 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
         "CREATE INDEX IF NOT EXISTS idx_assistant_score_model \
          ON assistant_dimension_score (model_id, backend_tag, task_category)",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await
     .map_err(|e| ToolError::Database(format!("create idx_assistant_score_model: {e}")))?;
 
@@ -147,7 +252,7 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
         "CREATE INDEX IF NOT EXISTS idx_assistant_score_run \
          ON assistant_dimension_score (run_id)",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await
     .map_err(|e| ToolError::Database(format!("create idx_assistant_score_run: {e}")))?;
 
@@ -168,7 +273,7 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
     //     unconstrained in case a future third configuration (e.g.
     //     'gpu-rocm' vs 'gpu-vulkan') is added without a migration.
     sqlx::query("ALTER TABLE code_profile_runs ADD COLUMN IF NOT EXISTS backend_tag TEXT")
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .map_err(|e| ToolError::Database(format!("add code_profile_runs.backend_tag: {e}")))?;
 
@@ -180,7 +285,7 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
     // `carveout` baseline and must stay unlabeled-as-'dynamic_gtt' (NULL),
     // never silently relabeled.
     sqlx::query("ALTER TABLE code_profile_runs ADD COLUMN IF NOT EXISTS mem_config TEXT")
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .map_err(|e| ToolError::Database(format!("add code_profile_runs.mem_config: {e}")))?;
 
@@ -193,7 +298,7 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
     // (exactly the workflow this column exists to end). NULL for rows
     // written before this column existed — never backfilled/guessed.
     sqlx::query("ALTER TABLE code_profile_runs ADD COLUMN IF NOT EXISTS case_id TEXT")
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .map_err(|e| ToolError::Database(format!("add code_profile_runs.case_id: {e}")))?;
 
@@ -228,7 +333,7 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
     //    (model_id, backend_tag, mem_config) — no new fan-out/cross-join risk
     //    is introduced (both sides gain the same axis, and the join adds the
     //    matching `IS NOT DISTINCT FROM` predicate for it).
-    let builder_has_backend_tag = column_exists(pool, "code_profile_runs", "backend_tag").await?;
+    let builder_has_backend_tag = column_exists(conn, "code_profile_runs", "backend_tag").await?;
     let builder_backend_expr = if builder_has_backend_tag {
         "cpr.backend_tag"
     } else {
@@ -292,12 +397,12 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
     // data of its own), and every known reader selects columns by name, not
     // position, so a full recreate is transparent to them.
     sqlx::query("DROP VIEW IF EXISTS model_dual_profile")
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .map_err(|e| ToolError::Database(format!("drop model_dual_profile view: {e}")))?;
 
     sqlx::query(&view_sql)
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .map_err(|e| ToolError::Database(format!("create model_dual_profile view: {e}")))?;
 
@@ -306,14 +411,18 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
 
 /// Probe `information_schema` for a column. Used so the view definition adapts to
 /// whether S83's builder table already carries `backend_tag` (P5+) or not.
-async fn column_exists(pool: &PgPool, table: &str, column: &str) -> Result<bool, ToolError> {
+async fn column_exists(
+    conn: &mut PgConnection,
+    table: &str,
+    column: &str,
+) -> Result<bool, ToolError> {
     let row: Option<(i64,)> = sqlx::query_as(
         "SELECT 1::bigint FROM information_schema.columns \
          WHERE table_name = $1 AND column_name = $2 LIMIT 1",
     )
     .bind(table)
     .bind(column)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await
     .map_err(|e| ToolError::Database(format!("probe column {table}.{column}: {e}")))?;
     Ok(row.is_some())
