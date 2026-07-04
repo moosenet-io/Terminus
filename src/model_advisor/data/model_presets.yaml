@@ -1,0 +1,284 @@
+strix_halo_64:
+  description: AMD Strix Halo, 64GB unified memory
+  vram_allocation_gb: 48
+  kernel_params:
+    amdgpu.gttsize: 49152
+    ttm.page_pool_size: 12800000
+    ttm.pages_limit: 12800000
+  ollama_env:
+    HSA_OVERRIDE_GFX_VERSION: 11.5.1
+    OLLAMA_KEEP_ALIVE: '-1'
+    OLLAMA_FLASH_ATTENTION: '1'
+    OLLAMA_NUM_PARALLEL: '2'
+  models:
+  - name: qwen3.5:35b-a3b
+    role: primary
+    quant: Q4_K_M
+    vram_gb: 20
+    description: MoE daily driver — agentic coding, general tasks
+  - name: qwen3.5:9b
+    role: fast
+    quant: Q4_K_M
+    vram_gb: 6
+    description: Quick responses, classification, extraction
+  - name: qwen3.5:4b
+    role: embeddings
+    quant: Q4_K_M
+    vram_gb: 3
+    description: Lightest tasks, routing decisions
+strix_halo_96:
+  description: AMD Strix Halo, 96GB unified memory
+  vram_allocation_gb: 72
+  kernel_params:
+    amdgpu.gttsize: 73728
+    ttm.page_pool_size: 19200000
+    ttm.pages_limit: 19200000
+  ollama_env:
+    HSA_OVERRIDE_GFX_VERSION: 11.5.1
+    OLLAMA_KEEP_ALIVE: '-1'
+    OLLAMA_FLASH_ATTENTION: '1'
+    OLLAMA_NUM_PARALLEL: '3'
+  models:
+  - name: qwen3.5:122b-a10b
+    role: reasoning
+    quant: Q4_K_M
+    vram_gb: 45
+    description: Heavy reasoning — Mr. Wizard / Obsidian Circle
+  - name: qwen3.5:35b-a3b
+    role: primary
+    quant: Q4_K_M
+    vram_gb: 20
+    description: MoE daily driver
+  - name: qwen3.5:9b
+    role: fast
+    quant: Q4_K_M
+    vram_gb: 6
+    description: Quick tasks, classification
+strix_halo_128:
+  description: AMD Strix Halo, 128GB unified memory (Framework Desktop)
+  vram_allocation_gb: 96
+  kernel_params:
+    amdgpu.gttsize: 98304
+    ttm.page_pool_size: 25600000
+    ttm.pages_limit: 25600000
+  ollama_env:
+    HSA_OVERRIDE_GFX_VERSION: 11.5.1
+    OLLAMA_KEEP_ALIVE: '-1'
+    OLLAMA_FLASH_ATTENTION: '1'
+    OLLAMA_NUM_PARALLEL: '4'
+  models:
+  - name: qwen3.5:122b-a10b
+    role: reasoning
+    quant: Q4_K_M
+    vram_gb: 45
+    description: Heavy reasoning — Mr. Wizard / Obsidian Circle
+  - name: qwen3.5:35b-a3b
+    role: primary
+    quant: Q4_K_M
+    vram_gb: 20
+    description: MoE daily driver for all agents
+  - name: qwen3.5:27b
+    role: code
+    quant: Q4_K_M
+    vram_gb: 18
+    description: Dense model for precise code gen + analysis
+  - name: qwen3.5:9b
+    role: fast
+    quant: Q4_K_M
+    vram_gb: 6
+    description: Routing, classification, embeddings
+apple_silicon_32:
+  description: Apple M4 Mini / M1-M3 base, 32GB
+  vram_allocation_gb: 28
+  kernel_params: {}
+  ollama_env:
+    OLLAMA_KEEP_ALIVE: '-1'
+    OLLAMA_NUM_PARALLEL: '2'
+  models:
+  - name: qwen3.5:9b
+    role: primary
+    quant: Q4_K_M
+    vram_gb: 6
+    description: Daily driver at 32GB
+  - name: qwen3.5:4b
+    role: fast
+    quant: Q4_K_M
+    vram_gb: 3
+    description: Quick tasks
+  - name: phi4-mini
+    role: embeddings
+    quant: Q4_K_M
+    vram_gb: 3
+    description: Efficient small model
+apple_silicon_64:
+  description: Apple M3/M4 Pro, 64GB
+  vram_allocation_gb: 60
+  kernel_params: {}
+  ollama_env:
+    OLLAMA_KEEP_ALIVE: '-1'
+    OLLAMA_NUM_PARALLEL: '3'
+  models:
+  - name: qwen3.5:35b-a3b
+    role: primary
+    quant: Q4_K_M
+    vram_gb: 20
+    description: MoE daily driver
+  - name: qwen3.5:9b
+    role: fast
+    quant: Q4_K_M
+    vram_gb: 6
+    description: Quick tasks
+  - name: qwen3.5:4b
+    role: embeddings
+    quant: Q4_K_M
+    vram_gb: 3
+    description: Routing, classification
+apple_silicon_96:
+  description: Apple M4 Max, 96GB
+  vram_allocation_gb: 90
+  kernel_params: {}
+  ollama_env:
+    OLLAMA_KEEP_ALIVE: '-1'
+    OLLAMA_NUM_PARALLEL: '4'
+  models:
+  - name: qwen3.5:122b-a10b
+    role: reasoning
+    quant: Q4_K_M
+    vram_gb: 45
+    description: Heavy reasoning — Mr. Wizard
+  - name: qwen3.5:35b-a3b
+    role: primary
+    quant: Q4_K_M
+    vram_gb: 20
+    description: MoE daily driver
+  - name: qwen3.5:9b
+    role: fast
+    quant: Q4_K_M
+    vram_gb: 6
+    description: Quick tasks
+apple_silicon_128:
+  description: Apple M4 Max, 128GB
+  vram_allocation_gb: 120
+  kernel_params: {}
+  ollama_env:
+    OLLAMA_KEEP_ALIVE: '-1'
+    OLLAMA_NUM_PARALLEL: '4'
+  models:
+  - name: qwen3.5:122b-a10b
+    role: reasoning
+    quant: Q4_K_M
+    vram_gb: 45
+    description: Heavy reasoning — Mr. Wizard / Circle
+  - name: qwen3.5:35b-a3b
+    role: primary
+    quant: Q4_K_M
+    vram_gb: 20
+    description: MoE daily driver
+  - name: qwen3.5:27b
+    role: code
+    quant: Q4_K_M
+    vram_gb: 18
+    description: Dense code model
+  - name: qwen3.5:9b
+    role: fast
+    quant: Q4_K_M
+    vram_gb: 6
+    description: Routing, classification
+apple_silicon_192:
+  description: Apple M4 Ultra, 192GB
+  vram_allocation_gb: 180
+  kernel_params: {}
+  ollama_env:
+    OLLAMA_KEEP_ALIVE: '-1'
+    OLLAMA_NUM_PARALLEL: '6'
+  models:
+  - name: qwen3.5:397b-a22b
+    role: frontier
+    quant: Q4_K_M
+    vram_gb: 120
+    description: Frontier-class MoE — replaces cloud for heavy reasoning
+  - name: qwen3.5:35b-a3b
+    role: primary
+    quant: Q4_K_M
+    vram_gb: 20
+    description: MoE daily driver
+  - name: qwen3.5:27b
+    role: code
+    quant: Q4_K_M
+    vram_gb: 18
+    description: Dense code model
+  - name: qwen3.5:9b
+    role: fast
+    quant: Q4_K_M
+    vram_gb: 6
+    description: Quick tasks
+discrete_8gb:
+  description: Discrete GPU — 8GB VRAM (RTX 4060, RX 7600, etc.)
+  vram_allocation_gb: 7
+  kernel_params: {}
+  ollama_env:
+    OLLAMA_KEEP_ALIVE: '-1'
+    OLLAMA_NUM_PARALLEL: '1'
+  models:
+  - name: qwen3.5:9b
+    role: primary
+    quant: Q4_K_M
+    vram_gb: 6
+    description: Best single model for 8GB VRAM
+discrete_12gb:
+  description: Discrete GPU — 12GB VRAM (RTX 3060, 4070, etc.)
+  vram_allocation_gb: 11
+  kernel_params: {}
+  ollama_env:
+    OLLAMA_KEEP_ALIVE: '-1'
+    OLLAMA_NUM_PARALLEL: '1'
+  models:
+  - name: qwen3.5:9b
+    role: primary
+    quant: Q8_0
+    vram_gb: 10
+    description: High quality 9B at 12GB
+discrete_16gb:
+  description: Discrete GPU — 16GB VRAM (RTX 4080, RX 7900 GRE)
+  vram_allocation_gb: 15
+  kernel_params: {}
+  ollama_env:
+    OLLAMA_KEEP_ALIVE: '-1'
+    OLLAMA_NUM_PARALLEL: '2'
+  models:
+  - name: qwen3.5:9b
+    role: primary
+    quant: Q8_0
+    vram_gb: 10
+    description: High quality 9B — use cloud for heavy reasoning at 16GB
+  - name: qwen3.5:4b
+    role: fast
+    quant: Q4_K_M
+    vram_gb: 3
+    description: Quick tasks
+discrete_24gb:
+  description: Discrete GPU — 24GB VRAM (RTX 3090, 4090, RX 7900 XTX)
+  vram_allocation_gb: 22
+  kernel_params: {}
+  ollama_env:
+    OLLAMA_KEEP_ALIVE: '-1'
+    OLLAMA_NUM_PARALLEL: '2'
+  models:
+  - name: qwen3.5:35b-a3b
+    role: primary
+    quant: Q4_K_M
+    vram_gb: 20
+    description: MoE daily driver — fits in 24GB VRAM
+cpu_only:
+  description: No GPU — CPU-only inference (slow but functional)
+  vram_allocation_gb: 0
+  kernel_params: {}
+  ollama_env:
+    OLLAMA_KEEP_ALIVE: '-1'
+    OLLAMA_NUM_PARALLEL: '1'
+  models:
+  - name: qwen3.5:4b
+    role: primary
+    quant: Q4_K_M
+    vram_gb: 0
+    description: Smallest model for CPU inference

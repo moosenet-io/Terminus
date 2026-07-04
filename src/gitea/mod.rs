@@ -280,6 +280,26 @@ impl GiteaClient {
         Ok(content.sha)
     }
 
+    /// Fetch a file's decoded text content from the configured owner's repo.
+    ///
+    /// Used by tool modules (sentinel, vigil) that need to read a Gitea-hosted
+    /// status/briefing file directly rather than exposing a full `RustTool`
+    /// (like [`ReadFile`]) for it. Returns `Err(ToolError::NotFound(_))` when
+    /// the file does not exist — callers typically treat that as "no data yet"
+    /// rather than a hard failure.
+    pub async fn fetch_file_text(&self, repo: &str, path: &str) -> Result<String, ToolError> {
+        let endpoint = format!("/repos/{}/{}/contents/{}", self.owner, repo, path);
+        let fc: GiteaFileContent = self.get(&endpoint).await?;
+
+        let raw_content = fc.content.unwrap_or_default();
+        // Gitea wraps lines with newlines in the base64 — strip them.
+        let clean = raw_content.replace('\n', "").replace('\r', "");
+        let decoded = B64
+            .decode(&clean)
+            .map_err(|e| ToolError::Http(format!("Failed to decode file content: {e}")))?;
+        Ok(String::from_utf8_lossy(&decoded).to_string())
+    }
+
     /// Resolve `owner` field: use explicit override or fall back to configured default.
     fn resolve_owner<'a>(&'a self, override_owner: Option<&'a str>) -> &'a str {
         override_owner.unwrap_or(&self.owner)
@@ -1424,6 +1444,54 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ToolError::NotFound(_)));
         assert!(err.to_string().contains("ghost.txt"));
+    }
+
+    // ── fetch_file_text (GiteaClient helper used by sentinel/vigil) ────────
+
+    #[tokio::test]
+    async fn test_fetch_file_text_decodes_base64() {
+        let server = MockServer::start();
+        let encoded = base64::engine::general_purpose::STANDARD.encode("status: ok\n");
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/repos/testorg/lumina-sentinel/contents/checks/latest-self-health.md");
+            then.status(200).json_body(serde_json::json!({
+                "type": "file",
+                "encoding": "base64",
+                "size": 11,
+                "name": "latest-self-health.md",
+                "path": "checks/latest-self-health.md",
+                "content": encoded,
+                "sha": "deadbeef",
+                "url": "http://example.com",
+                "html_url": "http://example.com"
+            }));
+        });
+
+        let client = mock_client(&server);
+        let text = client
+            .fetch_file_text("lumina-sentinel", "checks/latest-self-health.md")
+            .await
+            .unwrap();
+        mock.assert();
+        assert_eq!(text, "status: ok\n");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_file_text_404_returns_not_found() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/repos/testorg/lumina-vigil/contents/briefings/latest-morning.md");
+            then.status(404).json_body(serde_json::json!({"message": "Not Found"}));
+        });
+
+        let client = mock_client(&server);
+        let err = client
+            .fetch_file_text("lumina-vigil", "briefings/latest-morning.md")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
     }
 
     // ── update_file ───────────────────────────────────────────────────────
