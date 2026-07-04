@@ -253,6 +253,8 @@ pub fn required_toolchain(language: &str) -> Option<&'static str> {
     match language.to_lowercase().as_str() {
         "rust" => Some("cargo"),
         "typescript" | "ts" => Some("node"),
+        "java" => Some("javac"),
+        "go" => Some("go"),
         _ => None, // bash, python, cpp, sql, htmlcss, config
     }
 }
@@ -266,7 +268,7 @@ pub fn required_toolchain(language: &str) -> Option<&'static str> {
 /// alias of `"typescript"` and is intentionally omitted (corpus cases use the
 /// canonical `"typescript"`); listing both would double-warn.
 pub fn toolchain_checked_languages() -> &'static [&'static str] {
-    &["rust", "typescript"]
+    &["rust", "typescript", "java", "go"]
 }
 
 /// Pure set-difference for the corpus-coverage reconciliation
@@ -729,6 +731,10 @@ mod tests {
     fn required_toolchain_mapping() {
         assert_eq!(required_toolchain("rust"), Some("cargo"));
         assert_eq!(required_toolchain("TypeScript"), Some("node"));
+        assert_eq!(required_toolchain("java"), Some("javac"));
+        assert_eq!(required_toolchain("Java"), Some("javac"));
+        assert_eq!(required_toolchain("go"), Some("go"));
+        assert_eq!(required_toolchain("Go"), Some("go"));
         assert_eq!(required_toolchain("python"), None);
         assert_eq!(required_toolchain("bash"), None);
         assert_eq!(required_toolchain("cpp"), None);
@@ -743,6 +749,8 @@ mod tests {
         }
         assert!(toolchain_checked_languages().contains(&"rust"));
         assert!(toolchain_checked_languages().contains(&"typescript"));
+        assert!(toolchain_checked_languages().contains(&"java"));
+        assert!(toolchain_checked_languages().contains(&"go"));
         assert!(!toolchain_checked_languages().contains(&"ts"));
     }
 
