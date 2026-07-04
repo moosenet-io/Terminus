@@ -464,6 +464,14 @@ async fn run_one_backend(
 // Live entry point — wires the production collaborators
 // ===========================================================================
 
+/// GPU-authority holder label this suite acquires under (see
+/// [`gpu_authority::ExclusiveGuard`]). `pub` so `mint`'s dispatcher can
+/// pre-acquire under the IDENTICAL label before calling [`run`] (MINT Phase 2
+/// item 7) — see [`crate::intake::coder_sweep::GPU_HOLDER`]'s doc comment for
+/// why the label must match exactly, not just be "some guard for this
+/// subcommand".
+pub const GPU_HOLDER: &str = "intake_assistant_sweep";
+
 /// Production entry: connect the intake DB, migrate, open a run, load nominations
 /// from the NAS staging dir, and run the suite with the live collaborators.
 ///
@@ -490,7 +498,7 @@ pub async fn run() -> Result<RunReport, ToolError> {
     // sweep for the GPU. Held for the duration of `run()` via the
     // `_gpu_guard` binding's scope; released on drop (including on early
     // return via `?` below).
-    let _gpu_guard = match gpu_authority::ExclusiveGuard::acquire(GpuMode::Exclusive, "intake_assistant_sweep") {
+    let _gpu_guard = match gpu_authority::ExclusiveGuard::acquire(GpuMode::Exclusive, GPU_HOLDER) {
         Ok(g) => g,
         Err(e) => return Err(ToolError::Execution(format!("assistant sweep did not start: {e}"))),
     };
