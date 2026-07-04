@@ -41,6 +41,7 @@ use sqlx::PgPool;
 
 use crate::config;
 use crate::error::ToolError;
+use crate::intake::gpu_authority::{self, GpuMode};
 
 use super::acquire::{self, Acquirer, AcquisitionOutcome, Nomination, Nominations};
 use super::fleet::{self, FleetStore};
@@ -487,6 +488,24 @@ pub async fn run() -> Result<RunReport, ToolError> {
 
     let nominations = Nominations::load().map_err(ToolError::NotConfigured)?;
     let mem_config = mem_config_from_env();
+
+    // HFIX-08: proactively claim exclusive GPU use BEFORE running a single
+    // model — mirrors intake_coder_sweep.rs exactly (same GpuMode::Exclusive,
+    // same holder-label-per-binary convention, same lock file at
+    // /run/gpu-authority.lock via gpu_authority::ExclusiveGuard). Prior to this,
+    // the assistant sweep never checked or acquired this lock at all, so it
+    // could — and in production did — fire its own Ollama requests while the
+    // coder sweep held exclusive use, evicting the coder sweep's resident
+    // model out from under it (and vice versa) under the host's
+    // OLLAMA_MAX_LOADED_MODELS=1 policy, causing continuous model-reload
+    // thrashing. Refuses to start rather than silently racing the other
+    // sweep for the GPU. Held for the duration of `run()` via the
+    // `_gpu_guard` binding's scope; released on drop (including on early
+    // return via `?` below).
+    let _gpu_guard = match gpu_authority::ExclusiveGuard::acquire(GpuMode::Exclusive, "intake_assistant_sweep") {
+        Ok(g) => g,
+        Err(e) => return Err(ToolError::Execution(format!("assistant sweep did not start: {e}"))),
+    };
 
     let acquirer = acquire::ShellAcquirer;
     let driver = LiveSuiteDriver::new();
