@@ -1,0 +1,122 @@
+[
+  {
+    "id": "java-blitz-j1",
+    "language": "java",
+    "tier": "blitz",
+    "spec": "spec.md",
+    "validate": "validate.sh",
+    "dir": "java/blitz/j1",
+    "workspace": "wx-java",
+    "files": ["Validate.java"],
+    "timeout_s": 60,
+    "task_type": "build_modify"
+  },
+  {
+    "id": "java-blitz-j2",
+    "language": "java",
+    "tier": "blitz",
+    "spec": "spec.md",
+    "validate": "validate.sh",
+    "dir": "java/blitz/j2",
+    "workspace": "wx-java",
+    "files": ["Validate.java"],
+    "timeout_s": 60,
+    "task_type": "build_modify"
+  },
+  {
+    "id": "java-blitz-j3",
+    "language": "java",
+    "tier": "blitz",
+    "spec": "spec.md",
+    "validate": "validate.sh",
+    "dir": "java/blitz/j3",
+    "workspace": "wx-java",
+    "files": ["Slug.java"],
+    "timeout_s": 60,
+    "task_type": "build_modify"
+  },
+  {
+    "id": "java-standard-j1",
+    "language": "java",
+    "tier": "standard",
+    "spec": "spec.md",
+    "validate": "validate.sh",
+    "dir": "java/standard/j1",
+    "workspace": "wx-java",
+    "files": ["RingBuffer.java"],
+    "timeout_s": 120,
+    "task_type": "build_modify"
+  },
+  {
+    "id": "java-standard-j2",
+    "language": "java",
+    "tier": "standard",
+    "spec": "spec.md",
+    "validate": "validate.sh",
+    "dir": "java/standard/j2",
+    "workspace": "wx-java",
+    "files": ["WordCount.java"],
+    "timeout_s": 120,
+    "task_type": "build_modify"
+  },
+  {
+    "id": "go-blitz-g1",
+    "language": "go",
+    "tier": "blitz",
+    "spec": "spec.md",
+    "validate": "validate.sh",
+    "dir": "go/blitz/g1",
+    "workspace": "wx-go",
+    "files": ["validate.go"],
+    "timeout_s": 60,
+    "task_type": "build_modify"
+  },
+  {
+    "id": "go-blitz-g2",
+    "language": "go",
+    "tier": "blitz",
+    "spec": "spec.md",
+    "validate": "validate.sh",
+    "dir": "go/blitz/g2",
+    "workspace": "wx-go",
+    "files": ["validate.go"],
+    "timeout_s": 60,
+    "task_type": "build_modify"
+  },
+  {
+    "id": "go-blitz-g3",
+    "language": "go",
+    "tier": "blitz",
+    "spec": "spec.md",
+    "validate": "validate.sh",
+    "dir": "go/blitz/g3",
+    "workspace": "wx-go",
+    "files": ["slug.go"],
+    "timeout_s": 60,
+    "task_type": "build_modify"
+  },
+  {
+    "id": "go-standard-g1",
+    "language": "go",
+    "tier": "standard",
+    "spec": "spec.md",
+    "validate": "validate.sh",
+    "dir": "go/standard/g1",
+    "workspace": "wx-go",
+    "files": ["ring.go"],
+    "timeout_s": 120,
+    "task_type": "build_modify"
+  },
+  {
+    "id": "go-standard-g2",
+    "language": "go",
+    "tier": "standard",
+    "spec": "spec.md",
+    "validate": "validate.sh",
+    "dir": "go/standard/g2",
+    "workspace": "wx-go",
+    "files": ["wordcount.go"],
+    "timeout_s": 120,
+    "task_type": "build_modify"
+  }
+]
