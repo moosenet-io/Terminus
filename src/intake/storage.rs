@@ -271,6 +271,13 @@ pub struct CodeRunRowV2 {
     /// (`Some(true)`). `None` for rows written before this column existed or by
     /// callers that don't track it.
     pub well_formed: Option<bool>,
+    /// Which repeat of a multi-sample case this row is (multi-sample-consistency).
+    /// When `INTAKE_SAMPLES_PER_CASE > 1`, the sweep runs each case N times and
+    /// writes N rows sharing the same `case_id` but incrementing `sample_index`
+    /// (0..N-1); the pass@k / pass^k estimators aggregate over the repeats of a
+    /// case. `0` for every single-sample row (the DB column defaults to `0`), so
+    /// legacy/single-run data reads as "sample 0 of 1" without a backfill.
+    pub sample_index: i16,
 }
 
 /// SQL for [`insert_code_run_v2`]. Pulled out to a const so a unit test can
@@ -285,8 +292,8 @@ const INSERT_CODE_RUN_V2_SQL: &str = "INSERT INTO code_profile_runs \
       first_pass_score, retry_score, compiles, tests_pass, change_correct, \
       code_quality_score, context_tokens, response_tokens, file_count, total_lines, \
       throughput_tok_per_sec, total_time_ms, oom, error, backend_tag, mem_config, case_id, \
-      well_formed, finalized) \
-     VALUES ($1, 'v2', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, \
+      well_formed, sample_index, finalized) \
+     VALUES ($1, 'v2', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, \
      false) \
      RETURNING id";
 
@@ -330,6 +337,7 @@ pub async fn insert_code_run_v2(
         .bind(row.mem_config.as_deref())
         .bind(row.case_id.as_deref())
         .bind(row.well_formed)
+        .bind(row.sample_index)
         .fetch_one(pool)
         .await
         .map_err(|e| ToolError::Database(format!("Failed to insert code_profile_runs (v2): {e}")))?;
@@ -875,12 +883,12 @@ mod tests {
     #[test]
     fn insert_code_run_v2_sql_explicitly_sets_finalized_false() {
         assert!(INSERT_CODE_RUN_V2_SQL.contains("finalized"));
-        // The last bind param ($21 = `well_formed`, multi-point-score-tracking)
+        // The last bind param ($22 = `sample_index`, multi-sample-consistency)
         // is the final VALUES entry before the literal `false` for `finalized`
         // — confirming the insert never falls through to the column's
         // `DEFAULT true`.
         assert!(
-            INSERT_CODE_RUN_V2_SQL.contains("$21, false) RETURNING id"),
+            INSERT_CODE_RUN_V2_SQL.contains("$22, false) RETURNING id"),
             "expected the VALUES list to end with an explicit `false` for \
              `finalized`, got: {INSERT_CODE_RUN_V2_SQL}"
         );
@@ -931,12 +939,21 @@ mod tests {
         assert_eq!(row.well_formed, Some(true));
     }
 
-    /// The score-point insert must set `well_formed` as its final bind param
-    /// ($21) before the literal `false` for `finalized` — it never falls
+    /// The score-point insert must set `sample_index` as its final bind param
+    /// ($22) before the literal `false` for `finalized` — it never falls
     /// through to a column default.
     #[test]
-    fn insert_code_run_v2_sql_includes_well_formed_last() {
-        assert!(INSERT_CODE_RUN_V2_SQL.contains("well_formed, finalized)"));
+    fn insert_code_run_v2_sql_includes_sample_index_last() {
+        assert!(INSERT_CODE_RUN_V2_SQL.contains("well_formed, sample_index, finalized)"));
+    }
+
+    /// `sample_index` defaults to `0` (single-sample / legacy rows read as
+    /// "sample 0") and is settable like any other field.
+    #[test]
+    fn code_run_row_v2_sample_index_defaults_zero_and_is_settable() {
+        assert_eq!(CodeRunRowV2::default().sample_index, 0);
+        let row = CodeRunRowV2 { sample_index: 2, ..Default::default() };
+        assert_eq!(row.sample_index, 2);
     }
 
     /// The exactly-one-parent invariant (also enforced by the DB `one_parent`

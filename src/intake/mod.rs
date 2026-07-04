@@ -46,8 +46,8 @@ use crate::tool::RustTool;
 // Re-export pure pieces for cross-module/integration reference.
 pub use runner::{FULL_TIERS, SMOKE_TIERS};
 pub use code_v2::{
-    corpus_v2_dir, filter_by_language, read_manifest_v2, run_code_suite_v2,
-    run_code_suite_v2_cases, CaseV2, CodeV2Outcome,
+    corpus_v2_dir, filter_by_language, pass_at_k, pass_hat_k, read_manifest_v2,
+    run_code_suite_v2, run_code_suite_v2_cases, samples_per_case, CaseV2, CodeV2Outcome,
 };
 pub use runner::create_profile_row;
 
