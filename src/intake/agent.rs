@@ -417,12 +417,11 @@ pub fn recommend_role(a: &AgentAggregate) -> String {
 // Suite driver (live)
 // ---------------------------------------------------------------------------
 
+/// Per-scenario inference timeout (overridable via `INTAKE_AGENT_TIMEOUT_SEC`).
+/// Delegates to the canonical resolver (Phase 2 item 3) — same default
+/// (180s), same env var, same behavior.
 fn agent_timeout() -> Duration {
-    let secs = std::env::var("INTAKE_AGENT_TIMEOUT_SEC")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(180);
-    Duration::from_secs(secs)
+    super::timeouts::env_timeout("INTAKE_AGENT_TIMEOUT_SEC", 180)
 }
 
 /// Tool-count bands used for tool_selection when a scenario omits its own band.

@@ -115,13 +115,10 @@ impl CaseV2 {
 }
 
 /// Default inference timeout per tier (blitz 60s, standard 120s, deep 300s).
+/// Delegates to the canonical resolver (Phase 2 item 3) — same table, same
+/// behavior.
 pub fn tier_default_timeout(tier: &str) -> u64 {
-    match tier.to_lowercase().as_str() {
-        "blitz" => 60,
-        "standard" => 120,
-        "deep" => 300,
-        _ => 120,
-    }
+    super::timeouts::tier_default_secs(tier)
 }
 
 /// Read + parse `manifest.json` from the v2 corpus.
