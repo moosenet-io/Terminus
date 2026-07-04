@@ -24,8 +24,6 @@
 //! - `INTAKE_VRAM_CEILING_GB` — over-ceiling models skip the GPU pass cleanly.
 
 use std::collections::BTreeSet;
-use std::fs::OpenOptions;
-use std::io::Write;
 
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +32,7 @@ use crate::error::ToolError;
 use crate::intake::assistant::acquire::{Nomination, Nominations};
 use crate::intake::assistant::schema;
 use crate::intake::assistant::BackendTag;
+use crate::intake::checkpoint::FileCheckpoint;
 use crate::intake::gpu_authority::{self, GpuMode};
 use crate::intake::{self, infer};
 
@@ -152,52 +151,25 @@ impl CodeCheckpointKey {
 
 /// File-backed resume ledger on the reliable NAS staging dir. Append-on-mark,
 /// JSON-lines, survives a reboot — the same durability pattern as the assistant
-/// sweep's `FileCheckpoint`, with a distinct filename so the two sweeps never
-/// clobber each other's checkpoints.
-struct CodeCheckpoint {
-    path: String,
-}
+/// sweep's checkpoint (both now share [`crate::intake::checkpoint::FileCheckpoint`]),
+/// with a distinct filename so the two sweeps never clobber each other's
+/// checkpoints.
+type CodeCheckpoint = FileCheckpoint<CodeCheckpointKey>;
 
-impl CodeCheckpoint {
-    /// Resolve the checkpoint path from `INTAKE_STAGING_DIR`. `Err` (not a
-    /// guess) when unset — the resume ledger MUST live on the reliable dir.
-    fn open() -> Result<Self, ToolError> {
-        let dir = config::intake_staging_dir().ok_or_else(|| {
-            ToolError::NotConfigured(
-                "INTAKE_STAGING_DIR not set — the resume checkpoint needs the reliable NAS staging dir"
-                    .into(),
-            )
-        })?;
-        let path = format!("{}/coder-sweep-checkpoint.json", dir.trim_end_matches('/'));
-        Ok(CodeCheckpoint { path })
-    }
-
-    /// All `(model, backend)` units already completed (empty on a fresh run).
-    fn done(&self) -> BTreeSet<CodeCheckpointKey> {
-        std::fs::read_to_string(&self.path)
-            .map(|s| {
-                s.lines()
-                    .filter_map(|l| serde_json::from_str::<CodeCheckpointKey>(l).ok())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Record one completed `(model, backend)`. Durable BEFORE the next unit
-    /// starts (called only AFTER the suite's rows are persisted), so a crash
-    /// can never leave a checkpoint that claims work the DB doesn't have.
-    fn mark(&self, key: &CodeCheckpointKey) -> Result<(), ToolError> {
-        let line = serde_json::to_string(key)
-            .map_err(|e| ToolError::Execution(format!("serialize checkpoint key: {e}")))?;
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|e| ToolError::Execution(format!("open checkpoint {}: {e}", self.path)))?;
-        writeln!(f, "{line}")
-            .map_err(|e| ToolError::Execution(format!("append checkpoint: {e}")))?;
-        Ok(())
-    }
+/// Resolve the checkpoint path from `INTAKE_STAGING_DIR`. `Err` (not a guess)
+/// when unset — the resume ledger MUST live on the reliable dir. A free
+/// function (not an inherent `open()`) since `CodeCheckpoint` is now a type
+/// alias over the shared generic checkpoint, which knows nothing about
+/// `config.rs`'s env-resolution conventions.
+fn open_code_checkpoint() -> Result<CodeCheckpoint, ToolError> {
+    let dir = config::intake_staging_dir().ok_or_else(|| {
+        ToolError::NotConfigured(
+            "INTAKE_STAGING_DIR not set — the resume checkpoint needs the reliable NAS staging dir"
+                .into(),
+        )
+    })?;
+    let path = format!("{}/coder-sweep-checkpoint.json", dir.trim_end_matches('/'));
+    Ok(CodeCheckpoint::at(path))
 }
 
 // ===========================================================================
@@ -250,6 +222,77 @@ fn pre_skip_reason(nom: &Nomination, backend: BackendTag) -> Option<String> {
     None
 }
 
+// ===========================================================================
+// Suite driver — makes the coder fleet loop driver-agnostic/testable
+// ===========================================================================
+//
+// Mirrors `assistant::runner::SuiteDriver` (item 2, MINT Phase 2): the coder
+// loop was a monolithic function that called `infer::model_available`,
+// `intake::create_profile_row`, and `intake::run_code_suite_v2` directly,
+// making it untestable without a network/DB/GPU — the same gap the
+// assistant runner already closed with its `SuiteDriver` trait. This brings
+// the coder side up to the SAME abstraction level: `run_one_backend`/
+// `run_fleet` depend only on the trait object, the live impl wires the real
+// calls, and tests inject a scripted fake (see `mod tests`'s `ScriptDriver`,
+// which intentionally mirrors `assistant::runner::tests::ScriptDriver`'s
+// shape). Unlike the assistant driver, this trait does NOT take a
+// `backend_override` parameter on each method — the coder loop sets the P5
+// override ONCE per `(model, backend)` pass (via an RAII guard spanning
+// `model_available` + `create_profile_row` + `run_suite`), not once per
+// individual call, so the override stays exactly where it already was: in
+// the orchestrator (`run_one_backend`), not the driver.
+#[async_trait::async_trait]
+pub trait CoderSuiteDriver: Send + Sync {
+    /// HFIX-05 pre-flight: is `model_id` present in the CURRENTLY-overridden
+    /// backend's Ollama registry? Assumes the caller has already applied the
+    /// backend override for the pass being checked.
+    async fn model_available(&self, model_id: &str) -> bool;
+
+    /// Create a fresh profile row scoping one `(model, backend)` pass's rows.
+    async fn create_profile_row(&self, model_id: &str) -> Result<uuid::Uuid, ToolError>;
+
+    /// Run the v2 code suite for `model_id` under `profile_id`, against the
+    /// currently-overridden backend. Persists one `code_profile_runs` row per
+    /// case internally (the canonical write path, unchanged by this trait).
+    #[allow(clippy::too_many_arguments)]
+    async fn run_suite(
+        &self,
+        model_id: &str,
+        langs: &[String],
+        profile_id: uuid::Uuid,
+        case_limit: Option<usize>,
+        backend_tag: &str,
+        mem_config: Option<&str>,
+    ) -> Result<intake::CodeV2Outcome, ToolError>;
+}
+
+/// Live driver: the real inference/DB calls, unchanged from what
+/// `run_one_backend` called directly before this refactor.
+pub struct LiveCoderDriver;
+
+#[async_trait::async_trait]
+impl CoderSuiteDriver for LiveCoderDriver {
+    async fn model_available(&self, model_id: &str) -> bool {
+        infer::model_available(model_id).await
+    }
+
+    async fn create_profile_row(&self, model_id: &str) -> Result<uuid::Uuid, ToolError> {
+        intake::create_profile_row(model_id).await
+    }
+
+    async fn run_suite(
+        &self,
+        model_id: &str,
+        langs: &[String],
+        profile_id: uuid::Uuid,
+        case_limit: Option<usize>,
+        backend_tag: &str,
+        mem_config: Option<&str>,
+    ) -> Result<intake::CodeV2Outcome, ToolError> {
+        intake::run_code_suite_v2(model_id, langs, profile_id, case_limit, Some(backend_tag), mem_config).await
+    }
+}
+
 /// Run one `(model, backend)` code-suite pass under the P5 backend override,
 /// honoring the resume checkpoint. NEVER returns `Err` for a per-model failure —
 /// a hang/unavailable/OOM becomes a `Skipped` outcome so the fleet continues.
@@ -265,6 +308,7 @@ async fn run_one_backend(
     checkpoint: &CodeCheckpoint,
     done: &BTreeSet<CodeCheckpointKey>,
     mem_config: Option<&str>,
+    driver: &dyn CoderSuiteDriver,
 ) -> Result<BackendReport, ToolError> {
     let model_id = nom.id.clone();
     let key = CodeCheckpointKey::new(&model_id, backend);
@@ -301,7 +345,7 @@ async fn run_one_backend(
     // ── HFIX-05 pre-flight: skip cleanly (one reason) instead of persisting
     //    a "model not found" 404 PER CASE (up to 200 wasted rows per model,
     //    the dominant failure mode found auditing the dynamic_gtt run) ──
-    if !infer::model_available(&model_id).await {
+    if !driver.model_available(&model_id).await {
         let reason = format!(
             "model '{model_id}' not present in the resolved backend's Ollama registry (not pulled)"
         );
@@ -314,7 +358,7 @@ async fn run_one_backend(
 
     // ── per-model flow, mirroring ModelIntake: profile row → suite → persist.
     //    A fresh profile row scopes this (model, backend) pass's code rows. ──
-    let profile_id = match intake::create_profile_row(&model_id).await {
+    let profile_id = match driver.create_profile_row(&model_id).await {
         Ok(id) => id,
         Err(e) => {
             return Ok(BackendReport {
@@ -331,19 +375,15 @@ async fn run_one_backend(
     // `backend.as_str()` yields the short 'gpu'/'cpu' tag (matching the
     // assistant-side `backend_tag` convention), NOT `override_str` (which is
     // the longer serving-backend name like "ollama"/"ollama-cpu").
-    let outcome = match intake::run_code_suite_v2(
-        &model_id,
-        langs,
-        profile_id,
-        case_limit,
-        Some(backend.as_str()),
-        mem_config,
-    )
-    .await
+    let outcome = match driver
+        .run_suite(&model_id, langs, profile_id, case_limit, backend.as_str(), mem_config)
+        .await
     {
         Ok(res) => {
             // Durable checkpoint AFTER rows are persisted — resume-safe ordering.
-            checkpoint.mark(&key)?;
+            checkpoint
+                .mark(&key)
+                .map_err(|e| ToolError::Execution(format!("mark checkpoint: {e}")))?;
             BackendOutcome::Profiled {
                 cases_run: res.cases_run,
                 scored: res.scored,
@@ -372,6 +412,7 @@ async fn run_fleet(
     case_limit: Option<usize>,
     checkpoint: &CodeCheckpoint,
     mem_config: Option<&str>,
+    driver: &dyn CoderSuiteDriver,
 ) -> Result<Vec<BackendReport>, ToolError> {
     let done = checkpoint.done();
     let mut reports = Vec::new();
@@ -389,6 +430,7 @@ async fn run_fleet(
             };
             let report = run_one_backend(
                 nom, backend_tag, override_str, langs, case_limit, checkpoint, &done, mem_config,
+                driver,
             )
             .await?;
             reports.push(report);
@@ -459,6 +501,16 @@ fn print_report(reports: &[BackendReport]) {
 // Entry point — shared by `bin/intake_coder_sweep.rs` and `mint sweep coder`
 // ===========================================================================
 
+/// GPU-authority holder label this suite acquires under (see
+/// [`gpu_authority::ExclusiveGuard`]). `pub` so `mint`'s dispatcher can
+/// pre-acquire under the IDENTICAL label before calling [`run`] (MINT Phase 2
+/// item 7) — `ExclusiveGuard::acquire` treats a re-acquire by the SAME holder
+/// as an idempotent no-op, but a DIFFERENT holder (even from the same
+/// process) is treated as a live competing holder and rejected, so the two
+/// acquisition points MUST agree on the exact label, not just both be
+/// "some GPU guard for this subcommand".
+pub const GPU_HOLDER: &str = "intake_coder_sweep";
+
 /// Run the whole coder fleet sweep end to end: load the fleet, open the
 /// resume checkpoint, migrate the shared schema, claim exclusive GPU use, run
 /// every `(model, backend)` pass, and print the end-of-run report.
@@ -479,7 +531,7 @@ pub async fn run(
             return std::process::ExitCode::FAILURE;
         }
     };
-    let checkpoint = match CodeCheckpoint::open() {
+    let checkpoint = match open_code_checkpoint() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("coder sweep did not start: {e}");
@@ -518,7 +570,7 @@ pub async fn run(
     // start rather than silently racing another exclusive holder for the
     // GPU (the exact failure mode that produced false "wedge" timeouts
     // earlier in this sweep — see the gpu_authority module doc).
-    let _gpu_guard = match gpu_authority::ExclusiveGuard::acquire(GpuMode::Exclusive, "intake_coder_sweep") {
+    let _gpu_guard = match gpu_authority::ExclusiveGuard::acquire(GpuMode::Exclusive, GPU_HOLDER) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("coder sweep did not start: {e}");
@@ -532,10 +584,11 @@ pub async fn run(
         if langs.is_empty() { "all".into() } else { langs.join(",") },
         case_limit,
         mem_config.unwrap_or("(unset — rows land with mem_config=NULL)"),
-        checkpoint.path,
+        checkpoint.path(),
     );
 
-    match run_fleet(&fleet, langs, case_limit, &checkpoint, mem_config).await {
+    let driver = LiveCoderDriver;
+    match run_fleet(&fleet, langs, case_limit, &checkpoint, mem_config, &driver).await {
         Ok(reports) => {
             print_report(&reports);
             std::process::ExitCode::SUCCESS
@@ -706,5 +759,188 @@ mod tests {
         // Explicit ["cpu"] → CPU-only.
         let s1 = fleet.nominations[1].backend_strategy();
         assert_eq!(s1, vec![(BackendTag::Cpu, "ollama")]);
+    }
+
+    // ---- CoderSuiteDriver: hermetic orchestration tests (item 2) ----
+    // Mirrors `assistant::runner::tests::ScriptDriver`/`block` in shape, so the
+    // coder loop's test-facing abstraction level matches the assistant side's.
+
+    use std::sync::Mutex;
+
+    fn block<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    fn tmp_checkpoint(name: &str) -> CodeCheckpoint {
+        let path = format!(
+            "{}/terminus-coder-sweep-test-{name}-{}.jsonl",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_file(&path);
+        CodeCheckpoint::at(path)
+    }
+
+    /// Scriptable driver mirroring `assistant::runner::tests::ScriptDriver`:
+    /// `model_available` returns a fixed answer; `run_suite` either succeeds
+    /// with a canned outcome or fails with a canned reason, per model.
+    struct ScriptDriver {
+        available: BTreeSet<String>,
+        suite_fail: BTreeSet<String>,
+        profile_calls: Mutex<Vec<String>>,
+        suite_calls: Mutex<Vec<(String, String)>>,
+    }
+
+    impl ScriptDriver {
+        fn new() -> Self {
+            ScriptDriver {
+                available: BTreeSet::new(),
+                suite_fail: BTreeSet::new(),
+                profile_calls: Mutex::new(Vec::new()),
+                suite_calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn available(mut self, model: &str) -> Self {
+            self.available.insert(model.to_string());
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CoderSuiteDriver for ScriptDriver {
+        async fn model_available(&self, model_id: &str) -> bool {
+            self.available.contains(model_id)
+        }
+
+        async fn create_profile_row(&self, model_id: &str) -> Result<uuid::Uuid, ToolError> {
+            self.profile_calls.lock().unwrap().push(model_id.to_string());
+            Ok(uuid::Uuid::nil())
+        }
+
+        async fn run_suite(
+            &self,
+            model_id: &str,
+            _langs: &[String],
+            _profile_id: uuid::Uuid,
+            _case_limit: Option<usize>,
+            backend_tag: &str,
+            _mem_config: Option<&str>,
+        ) -> Result<intake::CodeV2Outcome, ToolError> {
+            self.suite_calls
+                .lock()
+                .unwrap()
+                .push((model_id.to_string(), backend_tag.to_string()));
+            if self.suite_fail.contains(model_id) {
+                return Err(ToolError::Execution("model hung mid-suite".to_string()));
+            }
+            Ok(intake::CodeV2Outcome {
+                cases_run: 3,
+                avg_first_pass: 4.0,
+                avg_effective: 4.5,
+                approved: vec!["rust:blitz".to_string()],
+                scored: 3,
+                errors: 0,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[test]
+    fn driver_profiles_an_available_model_on_both_backends() {
+        let fleet = Nominations::from_json(
+            r#"{"nominations":[{"id":"qwen3-coder:30b","size_b":30,"gfx1151_class":"confirmed","acquisition":"ollama_pull"}]}"#,
+        )
+        .unwrap();
+        let driver = ScriptDriver::new().available("qwen3-coder:30b");
+        let checkpoint = tmp_checkpoint("profiles-both");
+
+        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver)).unwrap();
+
+        assert_eq!(reports.len(), 2);
+        for r in &reports {
+            assert!(matches!(r.outcome, BackendOutcome::Profiled { cases_run: 3, .. }));
+        }
+        // Both (model, backend) suite calls actually reached the driver.
+        let calls = driver.suite_calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().any(|(_, b)| b == "gpu"));
+        assert!(calls.iter().any(|(_, b)| b == "cpu"));
+        // Both passes checkpointed (durable-after-persist).
+        assert_eq!(checkpoint.done().len(), 2);
+    }
+
+    #[test]
+    fn driver_unavailable_model_skips_with_reason_and_never_reaches_suite() {
+        let fleet = Nominations::from_json(
+            r#"{"nominations":[{"id":"ghost:8b","size_b":8,"gfx1151_class":"confirmed","acquisition":"ollama_pull","backends":["gpu"]}]}"#,
+        )
+        .unwrap();
+        let driver = ScriptDriver::new(); // nothing marked available
+        let checkpoint = tmp_checkpoint("unavailable");
+
+        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver)).unwrap();
+
+        assert_eq!(reports.len(), 1);
+        match &reports[0].outcome {
+            BackendOutcome::Skipped(reason) => assert!(reason.contains("not present")),
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        assert!(
+            driver.suite_calls.lock().unwrap().is_empty(),
+            "an unavailable model must never reach run_suite (HFIX-05)"
+        );
+        assert!(checkpoint.done().is_empty(), "a skip must never be checkpointed");
+    }
+
+    #[test]
+    fn driver_suite_failure_is_a_recorded_skip_not_a_propagated_error() {
+        let fleet = Nominations::from_json(
+            r#"{"nominations":[{"id":"hangy:32b","size_b":32,"gfx1151_class":"experimental","acquisition":"ollama_pull","backends":["gpu"]}]}"#,
+        )
+        .unwrap();
+        let mut driver = ScriptDriver::new().available("hangy:32b");
+        driver.suite_fail.insert("hangy:32b".to_string());
+        let checkpoint = tmp_checkpoint("suite-fail");
+
+        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver)).unwrap();
+
+        assert_eq!(reports.len(), 1);
+        match &reports[0].outcome {
+            BackendOutcome::Skipped(reason) => assert!(reason.contains("code suite did not complete")),
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        assert!(checkpoint.done().is_empty());
+    }
+
+    #[test]
+    fn driver_resume_skips_already_checkpointed_backend_without_touching_driver() {
+        let fleet = Nominations::from_json(
+            r#"{"nominations":[{"id":"m:8b","size_b":8,"gfx1151_class":"confirmed","acquisition":"ollama_pull"}]}"#,
+        )
+        .unwrap();
+        let checkpoint = tmp_checkpoint("resume");
+        // Pre-seed as if the gpu pass already completed on a prior run.
+        checkpoint
+            .mark(&CodeCheckpointKey::new("m:8b", BackendTag::Gpu))
+            .unwrap();
+        let driver = ScriptDriver::new().available("m:8b");
+
+        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver)).unwrap();
+
+        assert_eq!(reports.len(), 2);
+        let gpu = reports.iter().find(|r| r.backend_tag == BackendTag::Gpu).unwrap();
+        assert!(matches!(gpu.outcome, BackendOutcome::Resumed));
+        let cpu = reports.iter().find(|r| r.backend_tag == BackendTag::Cpu).unwrap();
+        assert!(matches!(cpu.outcome, BackendOutcome::Profiled { .. }));
+
+        // The driver was asked about ONLY the cpu pass — resume never touches
+        // an already-checkpointed backend's model_available/run_suite calls.
+        let suite_calls = driver.suite_calls.lock().unwrap();
+        assert_eq!(suite_calls.len(), 1);
+        assert_eq!(suite_calls[0], ("m:8b".to_string(), "cpu".to_string()));
     }
 }
