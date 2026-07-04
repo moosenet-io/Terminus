@@ -20,6 +20,29 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+/// How long Ollama keeps a model resident after a request completes, set
+/// explicitly on every `/api/generate` and `/api/chat` call in this module.
+///
+/// HFIX-03: `runner.rs`'s warm-up call sets a generous keep_alive before a
+/// model's suite starts, but every actual inference request that followed
+/// (through this module) omitted the field — and each request's keep_alive
+/// (or its absence, which falls back to Ollama's 5-minute server default)
+/// determines the model's *new* expiry once that request finishes. So the
+/// very first real inference call silently downgraded the session from the
+/// warm-up's generous window back down to 5 minutes. For a large model
+/// (dynamic GTT pool; cold reloads can run well past a minute) a single
+/// slow generate call can itself take close to 5 minutes, evicting the
+/// model right before the next case's request arrives — forcing another
+/// cold reload, which is itself slow enough to repeat the cycle. This
+/// showed up as near-total per-case failure (timeouts, and historically
+/// some "model not found" 404s from a stale/racing unload) for the fleet's
+/// larger models, while small/fast-loading models were mostly unaffected.
+/// Matches `runner.rs`'s warm-up value; 30 minutes comfortably outlasts a
+/// single model's whole case suite, and `runner.rs` explicitly evicts
+/// (`keep_alive: 0`) once that suite is done, so it never strands
+/// residency into the next model's run.
+pub(crate) const OLLAMA_KEEP_ALIVE: &str = "30m";
+
 // ---------------------------------------------------------------------------
 // Embedded filler corpus (real repo files)
 // ---------------------------------------------------------------------------
@@ -367,6 +390,7 @@ pub async fn run_tier(
         "model": model_name,
         "prompt": prompt,
         "stream": false,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": { "num_ctx": next_pow2_ctx(actual_tokens) }
     });
 
@@ -494,6 +518,7 @@ pub async fn generate_at(
         "model": model_name,
         "prompt": prompt,
         "stream": false,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": { "num_ctx": next_pow2_ctx(estimate_tokens(prompt)) }
     });
     let started = Instant::now();
@@ -563,6 +588,7 @@ pub async fn chat_with_tools(
         "model": model_name,
         "messages": [ { "role": "user", "content": user_prompt } ],
         "stream": false,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
     });
     if tools.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
         body["tools"] = tools.clone();
@@ -644,6 +670,31 @@ pub fn next_pow2_ctx(prompt_tokens: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ollama_keep_alive_matches_runner_warmup_value() {
+        // Guards against a future edit accidentally setting this to "0" or ""
+        // (both of which mean "unload immediately" / "use server default" in
+        // Ollama's API), which would silently reintroduce the eviction cycle
+        // this constant exists to prevent. Also pinned to match runner.rs's
+        // warm-up literal ("30m") so the two never drift apart.
+        assert_eq!(OLLAMA_KEEP_ALIVE, "30m");
+    }
+
+    #[test]
+    fn all_three_ollama_request_builders_set_keep_alive() {
+        // HFIX-03: run_tier, generate_at, and chat_with_tools each build their
+        // own request body (no shared constructor), so nothing at the type
+        // level stops one of them from losing the field on a future edit.
+        // This test reads the source directly so it fails loudly if that
+        // happens, rather than only showing up as a live-fleet regression.
+        let src = include_str!("context.rs");
+        let call_sites = src.matches("\"keep_alive\": OLLAMA_KEEP_ALIVE").count();
+        assert_eq!(
+            call_sites, 3,
+            "expected run_tier, generate_at, and chat_with_tools to each set keep_alive"
+        );
+    }
 
     #[test]
     fn estimate_tokens_is_chars_over_four() {
