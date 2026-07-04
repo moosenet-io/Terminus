@@ -349,6 +349,25 @@ async fn migrate_locked(conn: &mut PgConnection) -> Result<(), ToolError> {
         .await
         .map_err(|e| ToolError::Database(format!("add code_profile_runs.well_formed: {e}")))?;
 
+    // `vuln_finding_count` (security-scan-signal): count of heuristic
+    // vulnerability-pattern findings in a case's generated output, from the
+    // dependency-free scanner in `intake::vuln_scan`. This is a SEPARATE signal
+    // from correctness — it is NEVER a gate on `first_pass_score`. Semantics:
+    //   NULL = not scanned (no code produced, or language unsupported by the
+    //          heuristic — bash/py/ts/rust are supported today),
+    //   0    = scanned, none of the known-bad patterns present,
+    //   N    = N pattern hits.
+    // Honest caveat (also documented in `vuln_scan`): the scanner is a coarse
+    // line-based heuristic, NOT a real SAST tool — a non-zero count means
+    // "worth a human look", never "confirmed exploitable"; a 0 means "none of
+    // THESE patterns", never "provably clean". Replace with a real tool
+    // (semgrep/bandit/cargo-audit/gosec) when one can be installed on the sweep
+    // host. NULL for every row written before this column existed.
+    sqlx::query("ALTER TABLE code_profile_runs ADD COLUMN IF NOT EXISTS vuln_finding_count INTEGER")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| ToolError::Database(format!("add code_profile_runs.vuln_finding_count: {e}")))?;
+
     // `run_score_points` (multi-point-score-tracking): a flexible, long-format
     // sidecar table capturing EVERY per-point measurement a suite computes
     // along an axis (context-length tiers, tool-count bands, …), not just the
@@ -474,7 +493,8 @@ async fn migrate_locked(conn: &mut PgConnection) -> Result<(), ToolError> {
                          / NULLIF(count(*) FILTER (WHERE error IS NULL), 0)::float, \
                      0) AS quality_per_gpu_second, \
              (count(*) FILTER (WHERE well_formed = false))::float / greatest(count(*),1)::float AS malformed_rate, \
-             (count(*) FILTER (WHERE error IS NOT NULL))::float / greatest(count(*),1)::float AS error_rate \
+             (count(*) FILTER (WHERE error IS NOT NULL))::float / greatest(count(*),1)::float AS error_rate, \
+             avg(vuln_finding_count) FILTER (WHERE vuln_finding_count IS NOT NULL) AS mean_vuln_findings \
          FROM code_profile_runs \
          WHERE mem_config = 'dynamic_gtt' \
          GROUP BY profile_id, language",
