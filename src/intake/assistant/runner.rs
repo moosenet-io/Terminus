@@ -497,11 +497,20 @@ pub const GPU_HOLDER: &str = "intake_assistant_sweep";
 /// seconds; non-positive or unparsable values fall back to the default).
 pub const ACQUIRE_MAX_WAIT_ENV: &str = "INTAKE_ASSISTANT_ACQUIRE_MAX_WAIT_SECS";
 
-/// Default max wait: 4 hours. Long enough to outlast a single coder-sweep
-/// model's acquisition + full ASMT-02..07 suite run (observed on the order of
-/// tens of minutes per model, per S83/HFIX timings) without waiting so long
-/// that a genuinely wedged GPU (e.g. a crashed holder whose lock never
-/// clears) goes unreported for the better part of a day.
+/// Default max wait: 4 hours. `intake_coder_sweep` holds ONE guard for its
+/// ENTIRE multi-day run (all models, by design — see coder_sweep.rs), so
+/// this cap does NOT guarantee the assistant sweep gets in during a single
+/// wait; it bounds each systemd restart cycle. The practical effect: instead
+/// of `intake_assistant_sweep`'s unit crash-looping every ~5 minutes
+/// (`RestartSec`) for the ENTIRE multi-day duration of a coder-sweep run, it
+/// now retries silently every `ACQUIRE_POLL_INTERVAL` and only exits/restarts
+/// roughly every 4 hours — a large reduction in restart frequency and log
+/// noise, not a guarantee of getting in within 4 hours. 4h is long enough to
+/// outlast a single coder-sweep model's acquisition + full ASMT-02..07 suite
+/// run (observed on the order of tens of minutes per model, per S83/HFIX
+/// timings) without waiting so long that a genuinely wedged GPU (e.g. a
+/// crashed holder whose lock never clears) goes unreported for the better
+/// part of a day.
 const ACQUIRE_MAX_WAIT_DEFAULT_SECS: u64 = 4 * 60 * 60;
 
 /// How often to retry a refused acquire.
@@ -552,12 +561,41 @@ impl AcquireClock for RealClock {
 /// `Restart=on-failure` remains the ultimate safety net, just at a much
 /// lower frequency than every retry.
 ///
-/// Generic over the acquired value `T` and the clock so this is testable
-/// with a fake acquire function and a fake (instant) clock — no real
-/// `sleep()` in tests.
+/// Only retry a refusal that looks like "someone else currently, actively
+/// holds the exclusive lock" (the local lock file per [`gpu_authority`]'s
+/// `is_blocked` path, OR Chord's own remote lock via `ChordCall::Held`) —
+/// the actual coder-sweep-is-mid-run scenario this backoff exists for. Both
+/// of those refusal paths return `Err` BEFORE `gpu_authority::acquire()`
+/// stops any services, so retrying them is side-effect-free.
+///
+/// Deliberately NOT retried: a misconfigured `CHORD_JWT` (`Unauthorized`), a
+/// generic Chord/network failure (`Failed`), or a `systemctl`/lock-file-write
+/// failure inside `acquire()` — those are NOT "someone else has it right
+/// now," they're a broken acquire, and `acquire()` stops
+/// `policy.stop_services` (e.g. `lemonade-coder.service`) BEFORE it can fail
+/// on those paths. Retrying one of those every `poll_interval` for up to
+/// `max_wait` would repeatedly stop/restart a production serving unit for
+/// hours on a persistent, non-transient error instead of failing fast and
+/// visibly the way the pre-HFIX-09 one-shot acquire did. So those fail
+/// immediately, same as before this change — systemd's crash-loop remains
+/// the (louder, faster) safety net for a genuinely broken acquire, while the
+/// bounded wait only kicks in for the expected "coder-sweep has it" case.
+///
+/// Matching is by substring against `gpu_authority`'s current error text —
+/// deliberately fail-CLOSED (an unrecognized message is treated as
+/// NON-retryable) so a message-format drift in `gpu_authority.rs` degrades to
+/// "fail fast, like before," never to "silently retry forever."
+pub(crate) fn is_live_holder_refusal(err: &str) -> bool {
+    err.contains("held exclusively by")
+}
+
+/// Generic over the acquired value `T`, the clock, and the retry predicate
+/// so this is testable with a fake acquire function, a fake (instant) clock,
+/// and an arbitrary `is_retryable` — no real `sleep()` in tests.
 pub(crate) async fn acquire_with_backoff<T, F, C>(
     clock: &C,
     mut try_acquire: F,
+    is_retryable: impl Fn(&str) -> bool,
     poll_interval: Duration,
     progress_log_interval: Duration,
     max_wait: Duration,
@@ -582,6 +620,14 @@ where
                 return Ok(v);
             }
             Err(e) => {
+                if !is_retryable(&e) {
+                    tracing::error!(
+                        "intake_assistant_sweep: GPU acquire failed with a non-transient error \
+                         ({e}) — not retrying (this is not the \"another holder has it right \
+                         now\" case; waiting would just repeatedly bounce production services)"
+                    );
+                    return Err(e);
+                }
                 let elapsed = clock.now().duration_since(start);
                 if elapsed >= max_wait {
                     tracing::error!(
@@ -648,6 +694,7 @@ pub async fn run() -> Result<RunReport, ToolError> {
     let _gpu_guard = match acquire_with_backoff(
         &RealClock,
         || gpu_authority::ExclusiveGuard::acquire(GpuMode::Exclusive, GPU_HOLDER),
+        is_live_holder_refusal,
         ACQUIRE_POLL_INTERVAL,
         ACQUIRE_PROGRESS_LOG_INTERVAL,
         acquire_max_wait(),
@@ -937,6 +984,7 @@ mod tests {
                     Ok(*n)
                 }
             },
+            |_| true, // treat every refusal as retryable for this test
             Duration::from_secs(60),
             Duration::from_secs(600),
             Duration::from_secs(3600),
@@ -958,6 +1006,7 @@ mod tests {
         let result: Result<u32, String> = acquire_with_backoff(
             &clock,
             || Ok(42),
+            |_| true,
             Duration::from_secs(60),
             Duration::from_secs(600),
             Duration::from_secs(3600),
@@ -978,6 +1027,7 @@ mod tests {
                 *attempts.lock().unwrap() += 1;
                 Err("GPU is held exclusively by 'intake_coder_sweep'".to_string())
             },
+            is_live_holder_refusal,
             Duration::from_secs(60),
             Duration::from_secs(600),
             Duration::from_secs(300), // max_wait: 5 poll intervals
@@ -1013,6 +1063,7 @@ mod tests {
                 *attempts.lock().unwrap() += 1;
                 Err("refused".to_string())
             },
+            |_| true,
             Duration::from_secs(60),
             Duration::from_secs(600),
             Duration::ZERO,
@@ -1022,6 +1073,76 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(*attempts.lock().unwrap(), 1, "max_wait=0 must not retry at all");
         assert_eq!(clock.sleep_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn acquire_with_backoff_fails_fast_on_a_non_retryable_error_without_sleeping() {
+        // The masking hazard this predicate exists to prevent: a persistent,
+        // non-transient acquire failure (e.g. misconfigured CHORD_JWT) must
+        // NOT be retried for up to max_wait — gpu_authority::acquire() stops
+        // production services (e.g. lemonade-coder.service) before it can
+        // fail on that path, so retrying it every poll_interval would bounce
+        // that service repeatedly for hours instead of failing immediately.
+        let clock = FakeClock::new();
+        let attempts = Mutex::new(0u32);
+        let result: Result<(), String> = acquire_with_backoff(
+            &clock,
+            || {
+                *attempts.lock().unwrap() += 1;
+                Err("chord rejected the GPU-exclusive acquire (401/403) — set CHORD_JWT \
+                     to a valid lumina token for this harness host"
+                    .to_string())
+            },
+            is_live_holder_refusal,
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+            Duration::from_secs(3600 * 4),
+        )
+        .await;
+
+        assert!(result.is_err(), "a non-retryable refusal must still fail");
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            1,
+            "must try exactly once and give up immediately, not retry a non-transient error"
+        );
+        assert_eq!(
+            clock.sleep_call_count(),
+            0,
+            "must never sleep before failing fast on a non-retryable error"
+        );
+        assert!(
+            result.unwrap_err().contains("CHORD_JWT"),
+            "the original error detail must be preserved for diagnosis"
+        );
+    }
+
+    #[test]
+    fn is_live_holder_refusal_recognizes_both_local_and_chord_held_messages() {
+        // These are gpu_authority.rs's ACTUAL current error strings (local
+        // lock block, and Chord's remote `Held` refusal) — if that wording
+        // ever drifts, this test should be updated alongside it so the
+        // predicate keeps recognizing the retryable case rather than
+        // silently falling back to "fail fast" for the expected scenario.
+        assert!(is_live_holder_refusal(
+            "GPU is held exclusively by 'intake_coder_sweep' (pid 123, mode exclusive, \
+             since epoch 100) — refusing to acquire for 'intake_assistant_sweep'"
+        ));
+        assert!(is_live_holder_refusal(
+            "chord reports the GPU is already held exclusively by 'intake_coder_sweep' \
+             — refusing to start"
+        ));
+    }
+
+    #[test]
+    fn is_live_holder_refusal_rejects_non_transient_errors() {
+        assert!(!is_live_holder_refusal(
+            "chord rejected the GPU-exclusive acquire (401/403) — set CHORD_JWT to a valid \
+             lumina token for this harness host"
+        ));
+        assert!(!is_live_holder_refusal("chord GPU-exclusive acquire failed: connection reset"));
+        assert!(!is_live_holder_refusal("failed to write GPU lock file: permission denied"));
+        assert!(!is_live_holder_refusal("some entirely unrecognized message"));
     }
 
     #[test]
