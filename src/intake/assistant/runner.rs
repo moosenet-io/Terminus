@@ -472,6 +472,148 @@ async fn run_one_backend(
 /// subcommand".
 pub const GPU_HOLDER: &str = "intake_assistant_sweep";
 
+// ===========================================================================
+// HFIX-09: bounded acquire-retry backoff
+// ===========================================================================
+//
+// Root cause this section fixes: `intake_coder_sweep` intentionally holds its
+// `ExclusiveGuard` for its ENTIRE multi-day run (one guard for the whole
+// sweep, by design — see coder_sweep.rs). Before this fix, the assistant
+// sweep's one-shot `ExclusiveGuard::acquire()` above would see that refusal,
+// return `Err` immediately, and `intake_assistant_sweep`'s `main()` would
+// exit `FAILURE`. With systemd's `Restart=on-failure` + a ~5min `RestartSec`,
+// that meant the assistant-sweep unit crash-looped every ~5 minutes for the
+// ENTIRE duration of a coder-sweep run (observed: ~2 days straight in
+// production), producing zero data the whole time.
+//
+// The fix is caller-side only: instead of failing on the first refusal, poll
+// for the GPU to free up, bounded by a max total wait so systemd's restart
+// cycle remains the ultimate safety net (just at a far lower frequency, not
+// every 5 minutes forever) if something is truly wedged rather than merely
+// "coder-sweep is mid-model". `gpu_authority.rs` itself is untouched.
+
+/// Env var overriding the max total time [`acquire_with_backoff`] will spend
+/// retrying a refused GPU acquire before giving up and returning `Err` (whole
+/// seconds; non-positive or unparsable values fall back to the default).
+pub const ACQUIRE_MAX_WAIT_ENV: &str = "INTAKE_ASSISTANT_ACQUIRE_MAX_WAIT_SECS";
+
+/// Default max wait: 4 hours. Long enough to outlast a single coder-sweep
+/// model's acquisition + full ASMT-02..07 suite run (observed on the order of
+/// tens of minutes per model, per S83/HFIX timings) without waiting so long
+/// that a genuinely wedged GPU (e.g. a crashed holder whose lock never
+/// clears) goes unreported for the better part of a day.
+const ACQUIRE_MAX_WAIT_DEFAULT_SECS: u64 = 4 * 60 * 60;
+
+/// How often to retry a refused acquire.
+const ACQUIRE_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How often to re-log while still waiting, so a long wait is observable in
+/// the log file / journalctl without spamming a line every poll (60s).
+const ACQUIRE_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// Read [`ACQUIRE_MAX_WAIT_ENV`], falling back to
+/// [`ACQUIRE_MAX_WAIT_DEFAULT_SECS`] when unset, unparsable, or non-positive.
+fn acquire_max_wait() -> Duration {
+    std::env::var(ACQUIRE_MAX_WAIT_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(ACQUIRE_MAX_WAIT_DEFAULT_SECS))
+}
+
+/// Injectable clock so [`acquire_with_backoff`] is unit-testable without
+/// real time passing. Production uses [`RealClock`] (real `Instant` +
+/// `tokio::time::sleep`); tests use a fake that advances a virtual clock
+/// instantly.
+#[async_trait::async_trait]
+pub(crate) trait AcquireClock: Send + Sync {
+    fn now(&self) -> std::time::Instant;
+    async fn sleep(&self, dur: Duration);
+}
+
+pub(crate) struct RealClock;
+
+#[async_trait::async_trait]
+impl AcquireClock for RealClock {
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
+    async fn sleep(&self, dur: Duration) {
+        tokio::time::sleep(dur).await;
+    }
+}
+
+/// Acquire via `try_acquire`, retrying with backoff instead of failing
+/// immediately when it returns `Err` (e.g. the GPU is exclusively held by
+/// another sweep) — bounded by `max_wait`. Returns the same `Err` shape a
+/// one-shot acquire would once the cap is hit, so systemd's
+/// `Restart=on-failure` remains the ultimate safety net, just at a much
+/// lower frequency than every retry.
+///
+/// Generic over the acquired value `T` and the clock so this is testable
+/// with a fake acquire function and a fake (instant) clock — no real
+/// `sleep()` in tests.
+pub(crate) async fn acquire_with_backoff<T, F, C>(
+    clock: &C,
+    mut try_acquire: F,
+    poll_interval: Duration,
+    progress_log_interval: Duration,
+    max_wait: Duration,
+) -> Result<T, String>
+where
+    F: FnMut() -> Result<T, String>,
+    C: AcquireClock,
+{
+    let start = clock.now();
+    let mut waiting = false;
+    let mut last_progress_log = start;
+
+    loop {
+        match try_acquire() {
+            Ok(v) => {
+                if waiting {
+                    tracing::info!(
+                        "intake_assistant_sweep: GPU acquired after waiting {:.0?} for another holder to release it",
+                        clock.now().duration_since(start)
+                    );
+                }
+                return Ok(v);
+            }
+            Err(e) => {
+                let elapsed = clock.now().duration_since(start);
+                if elapsed >= max_wait {
+                    tracing::error!(
+                        "intake_assistant_sweep: giving up waiting for the GPU after {:.0?} \
+                         (cap {:.0?}); last refusal: {e}",
+                        elapsed,
+                        max_wait
+                    );
+                    return Err(format!(
+                        "gave up waiting for the GPU after {elapsed:.0?} (cap {max_wait:.0?}): {e}"
+                    ));
+                }
+                if !waiting {
+                    waiting = true;
+                    last_progress_log = start;
+                    tracing::warn!(
+                        "intake_assistant_sweep: GPU acquire refused ({e}) — waiting for it to \
+                         free up, retrying every {poll_interval:.0?} (giving up after {max_wait:.0?})"
+                    );
+                } else if clock.now().duration_since(last_progress_log) >= progress_log_interval {
+                    last_progress_log = clock.now();
+                    tracing::warn!(
+                        "intake_assistant_sweep: still waiting for the GPU after {:.0?} ({e})",
+                        elapsed
+                    );
+                }
+                clock.sleep(poll_interval).await;
+            }
+        }
+    }
+}
+
 /// Production entry: connect the intake DB, migrate, open a run, load nominations
 /// from the NAS staging dir, and run the suite with the live collaborators.
 ///
@@ -485,20 +627,33 @@ pub async fn run() -> Result<RunReport, ToolError> {
     let nominations = Nominations::load().map_err(ToolError::NotConfigured)?;
     let mem_config = mem_config_from_env();
 
-    // HFIX-08: proactively claim exclusive GPU use BEFORE running a single
-    // model — mirrors intake_coder_sweep.rs exactly (same GpuMode::Exclusive,
-    // same holder-label-per-binary convention, same lock file at
-    // /run/gpu-authority.lock via gpu_authority::ExclusiveGuard). Prior to this,
-    // the assistant sweep never checked or acquired this lock at all, so it
-    // could — and in production did — fire its own Ollama requests while the
-    // coder sweep held exclusive use, evicting the coder sweep's resident
-    // model out from under it (and vice versa) under the host's
-    // OLLAMA_MAX_LOADED_MODELS=1 policy, causing continuous model-reload
-    // thrashing. Refuses to start rather than silently racing the other
-    // sweep for the GPU. Held for the duration of `run()` via the
+    // HFIX-08/HFIX-09: proactively claim exclusive GPU use BEFORE running a
+    // single model — mirrors intake_coder_sweep.rs exactly (same
+    // GpuMode::Exclusive, same holder-label-per-binary convention, same lock
+    // file at /run/gpu-authority.lock via gpu_authority::ExclusiveGuard).
+    // Prior to HFIX-08, the assistant sweep never checked or acquired this
+    // lock at all, so it could — and in production did — fire its own Ollama
+    // requests while the coder sweep held exclusive use, evicting the coder
+    // sweep's resident model out from under it (and vice versa) under the
+    // host's OLLAMA_MAX_LOADED_MODELS=1 policy, causing continuous
+    // model-reload thrashing.
+    //
+    // HFIX-09: a refusal no longer fails `run()` immediately — coder-sweep
+    // legitimately holds this guard for its entire multi-day run, so an
+    // immediate `Err` here crash-looped the whole unit every ~5 minutes for
+    // days. Instead we wait (bounded — see `acquire_with_backoff`) for the
+    // other holder to release it. Held for the duration of `run()` via the
     // `_gpu_guard` binding's scope; released on drop (including on early
     // return via `?` below).
-    let _gpu_guard = match gpu_authority::ExclusiveGuard::acquire(GpuMode::Exclusive, GPU_HOLDER) {
+    let _gpu_guard = match acquire_with_backoff(
+        &RealClock,
+        || gpu_authority::ExclusiveGuard::acquire(GpuMode::Exclusive, GPU_HOLDER),
+        ACQUIRE_POLL_INTERVAL,
+        ACQUIRE_PROGRESS_LOG_INTERVAL,
+        acquire_max_wait(),
+    )
+    .await
+    {
         Ok(g) => g,
         Err(e) => return Err(ToolError::Execution(format!("assistant sweep did not start: {e}"))),
     };
@@ -723,6 +878,204 @@ mod tests {
         assert_eq!(SUITE_DIMENSIONS.len(), 6);
         assert_eq!(SUITE_DIMENSIONS[0], super::super::dim1_conversation::DIMENSION);
         assert_eq!(SUITE_DIMENSIONS[5], super::super::dim6_embeddings::DIMENSION);
+    }
+
+    // ── HFIX-09 acquire-retry backoff ──
+
+    /// A fake clock: `now()` returns a virtual instant that only advances
+    /// when `sleep()` is called (by the amount requested) — no real time
+    /// passes. Also records how many times `sleep` was called and the total
+    /// requested sleep duration, so tests can assert on retry counts without
+    /// depending on wall-clock timing at all.
+    struct FakeClock {
+        elapsed: Mutex<Duration>,
+        sleep_calls: Mutex<u32>,
+    }
+
+    impl FakeClock {
+        fn new() -> Self {
+            FakeClock { elapsed: Mutex::new(Duration::ZERO), sleep_calls: Mutex::new(0) }
+        }
+
+        fn sleep_call_count(&self) -> u32 {
+            *self.sleep_calls.lock().unwrap()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AcquireClock for FakeClock {
+        fn now(&self) -> std::time::Instant {
+            // `Instant` cannot be constructed at an arbitrary offset directly,
+            // so anchor a fixed base instant once and add the virtual elapsed
+            // duration recorded so far.
+            use std::sync::OnceLock;
+            static BASE: OnceLock<std::time::Instant> = OnceLock::new();
+            let base = *BASE.get_or_init(std::time::Instant::now);
+            base + *self.elapsed.lock().unwrap()
+        }
+
+        async fn sleep(&self, dur: Duration) {
+            *self.sleep_calls.lock().unwrap() += 1;
+            *self.elapsed.lock().unwrap() += dur;
+            // Deliberately NOT a real sleep — the whole point of the fake
+            // clock is that tests run instantly regardless of `dur`.
+        }
+    }
+
+    #[tokio::test]
+    async fn acquire_with_backoff_retries_then_succeeds() {
+        let clock = FakeClock::new();
+        let attempts = Mutex::new(0u32);
+        let result = acquire_with_backoff(
+            &clock,
+            || {
+                let mut n = attempts.lock().unwrap();
+                *n += 1;
+                if *n < 4 {
+                    Err(format!("refused (attempt {n})"))
+                } else {
+                    Ok(*n)
+                }
+            },
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+            Duration::from_secs(3600),
+        )
+        .await;
+
+        assert_eq!(result, Ok(4), "must return the value from the attempt that finally succeeded");
+        assert_eq!(*attempts.lock().unwrap(), 4, "must have tried exactly 4 times (3 refusals + 1 success)");
+        assert_eq!(
+            clock.sleep_call_count(),
+            3,
+            "must sleep between refusals only, never after a success"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_with_backoff_succeeds_immediately_without_sleeping() {
+        let clock = FakeClock::new();
+        let result: Result<u32, String> = acquire_with_backoff(
+            &clock,
+            || Ok(42),
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+            Duration::from_secs(3600),
+        )
+        .await;
+
+        assert_eq!(result, Ok(42));
+        assert_eq!(clock.sleep_call_count(), 0, "a first-try success must never sleep");
+    }
+
+    #[tokio::test]
+    async fn acquire_with_backoff_gives_up_after_max_wait_and_stops_retrying() {
+        let clock = FakeClock::new();
+        let attempts = Mutex::new(0u32);
+        let result: Result<(), String> = acquire_with_backoff(
+            &clock,
+            || {
+                *attempts.lock().unwrap() += 1;
+                Err("GPU is held exclusively by 'intake_coder_sweep'".to_string())
+            },
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+            Duration::from_secs(300), // max_wait: 5 poll intervals
+        )
+        .await;
+
+        assert!(result.is_err(), "must give up rather than retry forever");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("gave up waiting for the GPU"),
+            "give-up error must be self-explanatory in a log/journalctl, got: {msg}"
+        );
+        assert!(
+            msg.contains("intake_coder_sweep"),
+            "give-up error should carry the last underlying refusal for diagnosis, got: {msg}"
+        );
+
+        // With a 60s poll interval and a 300s cap, the loop must terminate
+        // (bounded attempts), not spin unboundedly.
+        let tries = *attempts.lock().unwrap();
+        assert!(tries >= 5 && tries <= 6, "expected roughly max_wait/poll_interval attempts, got {tries}");
+    }
+
+    #[tokio::test]
+    async fn acquire_with_backoff_never_retries_a_first_try_beyond_max_wait_zero() {
+        // A max_wait of 0 means: try once, and if it fails, give up immediately
+        // (no sleep at all) — the cap is honored even on the very first refusal.
+        let clock = FakeClock::new();
+        let attempts = Mutex::new(0u32);
+        let result: Result<(), String> = acquire_with_backoff(
+            &clock,
+            || {
+                *attempts.lock().unwrap() += 1;
+                Err("refused".to_string())
+            },
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+            Duration::ZERO,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(*attempts.lock().unwrap(), 1, "max_wait=0 must not retry at all");
+        assert_eq!(clock.sleep_call_count(), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn acquire_max_wait_defaults_when_env_unset_or_invalid() {
+        let _guard = EnvVarGuard::unset(ACQUIRE_MAX_WAIT_ENV);
+        assert_eq!(acquire_max_wait(), Duration::from_secs(ACQUIRE_MAX_WAIT_DEFAULT_SECS));
+    }
+
+    #[test]
+    #[serial]
+    fn acquire_max_wait_defaults_on_non_positive_or_unparsable() {
+        {
+            let _guard = EnvVarGuard::set(ACQUIRE_MAX_WAIT_ENV, "0");
+            assert_eq!(acquire_max_wait(), Duration::from_secs(ACQUIRE_MAX_WAIT_DEFAULT_SECS));
+        }
+        {
+            let _guard = EnvVarGuard::set(ACQUIRE_MAX_WAIT_ENV, "not-a-number");
+            assert_eq!(acquire_max_wait(), Duration::from_secs(ACQUIRE_MAX_WAIT_DEFAULT_SECS));
+        }
+        {
+            let _guard = EnvVarGuard::set(ACQUIRE_MAX_WAIT_ENV, "-5");
+            assert_eq!(acquire_max_wait(), Duration::from_secs(ACQUIRE_MAX_WAIT_DEFAULT_SECS));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn acquire_max_wait_honors_a_valid_override() {
+        let _guard = EnvVarGuard::set(ACQUIRE_MAX_WAIT_ENV, "120");
+        assert_eq!(acquire_max_wait(), Duration::from_secs(120));
+    }
+
+    /// RAII helper so env-var tests can't leak state into other tests even on
+    /// panic (mirrors the pattern already used for `SWEEP_MEM_CONFIG` above,
+    /// generalized). All three `acquire_max_wait_*` tests mutate the SAME
+    /// process env var, so they are `#[serial]` alongside the mem_config pair.
+    struct EnvVarGuard {
+        key: &'static str,
+    }
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            std::env::set_var(key, value);
+            EnvVarGuard { key }
+        }
+        fn unset(key: &'static str) -> Self {
+            std::env::remove_var(key);
+            EnvVarGuard { key }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.key);
+        }
     }
 
     // ── mem_config env wiring (mirrors the coder sweep's own test pair) ──
