@@ -78,9 +78,22 @@ pub struct ModePolicy {
     /// Desired `OLLAMA_MAX_LOADED_MODELS`. `None` ⇒ don't manage Ollama's
     /// drop-in at all for this mode (leave whatever is currently in place).
     pub ollama_max_loaded_models: Option<u32>,
-    /// Services to stop while this mode is held (only ones found ACTIVE at
-    /// acquire time are recorded for restart on release).
+    /// Services to stop via `systemctl` while this mode is held (only ones found
+    /// ACTIVE at acquire time are recorded for restart on release).
+    ///
+    /// NOTE: `chord.service` is DELIBERATELY NOT here anymore. Chord is the
+    /// always-on fleet backbone; stopping it left it `inactive (dead)` for a
+    /// full multi-day sweep. Chord now yields the GPU via its own
+    /// `/v1/gpu-exclusive/{acquire,release}` HTTP API (see
+    /// [`notify_chord_exclusive`]) — it STAYS UP and only gates its inference
+    /// paths. `lemonade-coder.service` (a simple llama-server serving process
+    /// with no stay-alive/coordinate requirement) keeps the systemctl mechanism.
     pub stop_services: Vec<String>,
+    /// Whether to take Chord's GPU via its HTTP acquire/release API (instead of
+    /// killing `chord.service`). `true` for [`GpuMode::Exclusive`]. On acquire
+    /// this POSTs `/v1/gpu-exclusive/acquire` and starts a background heartbeat;
+    /// on release it stops the heartbeat and POSTs `/v1/gpu-exclusive/release`.
+    pub notify_chord_exclusive: bool,
 }
 
 /// The policy for a given mode. Pure — the ONE place these values are
@@ -89,7 +102,9 @@ pub fn policy_for(mode: GpuMode) -> ModePolicy {
     match mode {
         GpuMode::Exclusive => ModePolicy {
             ollama_max_loaded_models: Some(1),
-            stop_services: vec!["chord.service".to_string(), "lemonade-coder.service".to_string()],
+            // chord is handled over HTTP (notify_chord_exclusive), NOT stopped.
+            stop_services: vec!["lemonade-coder.service".to_string()],
+            notify_chord_exclusive: true,
         },
         GpuMode::Shared => ModePolicy {
             // `None`: reverting to "shared" means REMOVING the exclusive-mode
@@ -98,6 +113,7 @@ pub fn policy_for(mode: GpuMode) -> ModePolicy {
             // single source of truth for production tuning.
             ollama_max_loaded_models: None,
             stop_services: vec![],
+            notify_chord_exclusive: false,
         },
     }
 }
@@ -129,6 +145,14 @@ struct LockState {
     /// `release` restarts exactly these, never a service that was already
     /// stopped for an unrelated operator reason.
     stopped_services: Vec<String>,
+    /// Whether THIS acquire successfully took Chord's GPU over its
+    /// `/v1/gpu-exclusive/acquire` HTTP API (and started a heartbeat). `release`
+    /// posts `/v1/gpu-exclusive/release` (and stops the heartbeat) iff this is
+    /// true — so a run where Chord was unreachable (nothing acquired) never
+    /// tries to release a lock it never took. `#[serde(default)]` so a lock file
+    /// written by a pre-this-change binary still deserializes (as `false`).
+    #[serde(default)]
+    chord_notified: bool,
 }
 
 fn now_epoch() -> u64 {
@@ -295,6 +319,228 @@ fn is_idempotent_reacquire(existing: &LockState, holder: &str, current_pid: u32)
     existing.holder == holder && existing.pid == current_pid
 }
 
+// ── Chord GPU-exclusive HTTP coordination ────────────────────────────────────
+//
+// Instead of `systemctl stop chord.service` (which left the fleet backbone dead
+// for days), Chord yields the GPU via its authenticated
+// `/v1/gpu-exclusive/{acquire,release}` endpoints and STAYS UP. Chord auto-clears
+// an abandoned lock via a wall-clock TTL, so this side must HEARTBEAT (re-acquire)
+// periodically to hold the GPU across a long sweep; a crashed sweep simply stops
+// heartbeating and Chord resumes serving on its own.
+
+/// Base URL of Chord's proxy port (where the gpu-exclusive endpoints live).
+/// Prefers `CHORD_GPU_EXCLUSIVE_URL`, then `CHORD_PROXY_URL`, else the local
+/// loopback default (co-located with Chord on the same host). Loopback default,
+/// not an infra literal — same convention as `sysversion::chord_control_base`.
+fn chord_base_url() -> String {
+    for key in ["CHORD_GPU_EXCLUSIVE_URL", "CHORD_PROXY_URL"] {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return v.trim_end_matches('/').to_string();
+            }
+        }
+    }
+    "http://127.0.0.1:8099".to_string()
+}
+
+/// Optional bearer token for Chord's JWT auth (`CHORD_JWT`). When Chord runs
+/// with `CHORD_JWT_SECRET` set, the harness host must supply a valid
+/// lumina-subject token here or acquire returns 401. When Chord's secret is
+/// empty (single-tenant dev/bench posture) no token is needed.
+fn chord_auth_token() -> Option<String> {
+    std::env::var("CHORD_JWT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Heartbeat interval (seconds) — how often to re-`acquire` (refresh) Chord's
+/// lock while held. From `CHORD_GPU_EXCLUSIVE_HEARTBEAT_SECS`, default 120.
+/// Must be comfortably under Chord's TTL (default 600s) so a brief stall never
+/// lets the lock expire mid-sweep.
+fn chord_heartbeat_secs() -> u64 {
+    std::env::var("CHORD_GPU_EXCLUSIVE_HEARTBEAT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(120)
+}
+
+/// Outcome of a single Chord gpu-exclusive HTTP call. Split from interpretation
+/// so the decision logic ([`interpret_chord_acquire`]) is unit-testable without
+/// a network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChordCall {
+    /// 2xx — Chord acknowledged (granted / refreshed / released).
+    Acknowledged,
+    /// Transport failure (connection refused/timeout) — Chord is not serving, so
+    /// there is nothing contending for the GPU; safe to proceed without it.
+    Unreachable,
+    /// 409 — Chord reports the GPU is already held by a DIFFERENT holder.
+    Held { holder: String },
+    /// 401/403 — auth rejected (missing/invalid `CHORD_JWT`).
+    Unauthorized,
+    /// Any other non-2xx / unexpected condition.
+    Failed(String),
+}
+
+/// The path segment under `/v1/gpu-exclusive/`.
+fn chord_url(base: &str, action: &str) -> String {
+    format!("{}/v1/gpu-exclusive/{action}", base.trim_end_matches('/'))
+}
+
+/// Perform one gpu-exclusive HTTP call synchronously, safe to call from BOTH a
+/// sync `Drop` and inside a running tokio runtime: the async reqwest call runs
+/// on a fresh current-thread runtime in a dedicated OS thread, so there is never
+/// a "runtime within a runtime" panic. Never itself panics — a thread/runtime
+/// failure degrades to [`ChordCall::Failed`].
+fn chord_call(action: &str, holder: &str) -> ChordCall {
+    let url = chord_url(&chord_base_url(), action);
+    let token = chord_auth_token();
+    let holder = holder.to_string();
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => return ChordCall::Failed(format!("runtime build: {e}")),
+            };
+            rt.block_on(async move {
+                let client = match reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build()
+                {
+                    Ok(c) => c,
+                    Err(e) => return ChordCall::Failed(format!("client build: {e}")),
+                };
+                let mut req = client
+                    .post(&url)
+                    .json(&serde_json::json!({ "holder": holder }));
+                if let Some(t) = &token {
+                    req = req.header("authorization", format!("Bearer {t}"));
+                }
+                match req.send().await {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            ChordCall::Acknowledged
+                        } else if status.as_u16() == 409 {
+                            // Body carries the current holder; best-effort parse.
+                            let holder = resp
+                                .json::<serde_json::Value>()
+                                .await
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("holder").and_then(|h| h.as_str()).map(String::from)
+                                })
+                                .unwrap_or_else(|| "unknown".to_string());
+                            ChordCall::Held { holder }
+                        } else if matches!(status.as_u16(), 401 | 403) {
+                            ChordCall::Unauthorized
+                        } else {
+                            ChordCall::Failed(format!("HTTP {}", status.as_u16()))
+                        }
+                    }
+                    // Any transport-level error ⇒ treat Chord as not serving.
+                    Err(_) => ChordCall::Unreachable,
+                }
+            })
+        })
+        .join()
+        .unwrap_or_else(|_| ChordCall::Failed("chord call thread panicked".into()))
+    })
+}
+
+/// Pure: map an acquire-time [`ChordCall`] to "did we take Chord's GPU?"
+/// (`Ok(chord_notified)`) or a hard refusal (`Err`). Separated from the HTTP so
+/// the policy is unit-testable.
+///
+/// - `Acknowledged` ⇒ `Ok(true)`  — Chord yielded; we must heartbeat + release.
+/// - `Unreachable`  ⇒ `Ok(false)` — Chord isn't up; nothing to coordinate, but
+///   the sweep can still run (matches the old `systemctl_is_active`-gated
+///   "only stop it if it's actually running" behaviour).
+/// - `Held`         ⇒ `Err`       — someone else already holds Chord's GPU;
+///   never silently race (same discipline as the local-lock block).
+/// - `Unauthorized` ⇒ `Err`       — misconfig; fail loudly with the fix.
+/// - `Failed`       ⇒ `Err`.
+fn interpret_chord_acquire(outcome: ChordCall) -> Result<bool, String> {
+    match outcome {
+        ChordCall::Acknowledged => Ok(true),
+        ChordCall::Unreachable => Ok(false),
+        ChordCall::Held { holder } => Err(format!(
+            "chord reports the GPU is already held exclusively by '{holder}' — refusing to start"
+        )),
+        ChordCall::Unauthorized => Err(
+            "chord rejected the GPU-exclusive acquire (401/403) — set CHORD_JWT to a valid \
+             lumina token for this harness host"
+                .to_string(),
+        ),
+        ChordCall::Failed(e) => Err(format!("chord GPU-exclusive acquire failed: {e}")),
+    }
+}
+
+/// A running heartbeat: a stop flag + the thread refreshing Chord's lock.
+struct ChordHeartbeat {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+/// Process-global heartbeat handle. There is one GPU / one exclusive lock per
+/// process, so one heartbeat. Managed by [`start_chord_heartbeat`] /
+/// [`stop_chord_heartbeat`] (called from `acquire`/`release`), NOT by the guard
+/// struct — so a nested-guard release (see `is_idempotent_reacquire`) that runs
+/// on whichever guard drops first still tears the heartbeat down correctly.
+static CHORD_HEARTBEAT: std::sync::Mutex<Option<ChordHeartbeat>> =
+    std::sync::Mutex::new(None);
+
+/// Start (or restart) the background heartbeat that re-`acquire`s Chord's lock
+/// every [`chord_heartbeat_secs`] so it never hits Chord's abandoned-lock TTL
+/// while the sweep is running.
+fn start_chord_heartbeat(holder: &str) {
+    stop_chord_heartbeat(); // never stack two heartbeats
+    let holder = holder.to_string();
+    let interval = chord_heartbeat_secs();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let handle = std::thread::spawn(move || {
+        use std::sync::atomic::Ordering;
+        loop {
+            // Sleep the interval in 1s slices so a release() tears the heartbeat
+            // down promptly rather than after a full interval.
+            for _ in 0..interval {
+                if stop_thread.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            if stop_thread.load(Ordering::Relaxed) {
+                return;
+            }
+            match chord_call("acquire", &holder) {
+                ChordCall::Acknowledged => {}
+                other => tracing::warn!(
+                    "gpu_authority: chord heartbeat re-acquire returned {other:?} (will retry next interval)"
+                ),
+            }
+        }
+    });
+    if let Ok(mut guard) = CHORD_HEARTBEAT.lock() {
+        *guard = Some(ChordHeartbeat { stop, handle });
+    }
+}
+
+/// Stop the background heartbeat (if any), joining its thread.
+fn stop_chord_heartbeat() {
+    let hb = CHORD_HEARTBEAT.lock().ok().and_then(|mut g| g.take());
+    if let Some(hb) = hb {
+        hb.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = hb.handle.join();
+    }
+}
+
 /// Acquire `mode` on behalf of `holder` (a short label, e.g. the binary
 /// name). Proactively APPLIES the mode's policy — stops the mode's declared
 /// competing services (recording which were actually active) and reconciles
@@ -341,12 +587,31 @@ pub fn acquire(mode: GpuMode, holder: &str) -> Result<(), String> {
         reconcile_ollama(Some(n))?;
     }
 
+    // Take Chord's GPU over HTTP (instead of killing chord.service) and, on
+    // success, start the heartbeat that holds it across a long sweep. A refusal
+    // (409/auth/failure) aborts the acquire BEFORE the lock is written — the
+    // caller sees the error and does not start the sweep. Chord being
+    // unreachable is NOT an error (nothing is contending for the GPU).
+    let mut chord_notified = false;
+    if policy.notify_chord_exclusive {
+        chord_notified = interpret_chord_acquire(chord_call("acquire", holder))?;
+        if chord_notified {
+            start_chord_heartbeat(holder);
+        } else {
+            tracing::warn!(
+                "gpu_authority: chord unreachable at acquire — proceeding without it (it is not \
+                 serving, so nothing is contending for the GPU)"
+            );
+        }
+    }
+
     write_lock(&LockState {
         holder: holder.to_string(),
         mode: mode.as_str().to_string(),
         pid: my_pid(),
         acquired_at: now_epoch(),
         stopped_services: stopped,
+        chord_notified,
     })
 }
 
@@ -366,6 +631,20 @@ pub fn release(holder: &str) -> Result<(), String> {
             "lock is held by '{}', not '{holder}' — refusing to release someone else's lock",
             existing.holder
         ));
+    }
+    // Hand Chord's GPU back FIRST (stop the heartbeat, then release) — only if
+    // THIS acquire actually took it. Best-effort: a release must never fail just
+    // because Chord is momentarily unreachable (it will TTL-expire the lock on
+    // its own). Order matters: stop the heartbeat before releasing so a
+    // heartbeat re-acquire can't race in after the release.
+    if existing.chord_notified {
+        stop_chord_heartbeat();
+        match chord_call("release", holder) {
+            ChordCall::Acknowledged | ChordCall::Unreachable => {}
+            other => tracing::warn!(
+                "gpu_authority: chord GPU-exclusive release returned {other:?} (lock will TTL-expire on Chord's side)"
+            ),
+        }
     }
     for svc in &existing.stopped_services {
         let _ = run("systemctl", &["start", svc]);
@@ -423,10 +702,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn policy_exclusive_forces_single_model_and_stops_competitors() {
+    fn policy_exclusive_forces_single_model_and_handles_chord_over_http() {
         let p = policy_for(GpuMode::Exclusive);
         assert_eq!(p.ollama_max_loaded_models, Some(1));
-        assert!(p.stop_services.contains(&"chord.service".to_string()));
+        // chord is NO LONGER stopped via systemctl — it yields the GPU over HTTP.
+        assert!(!p.stop_services.contains(&"chord.service".to_string()));
+        assert!(p.notify_chord_exclusive);
+        // lemonade-coder keeps the simple systemctl stop/start mechanism.
         assert!(p.stop_services.contains(&"lemonade-coder.service".to_string()));
     }
 
@@ -435,6 +717,7 @@ mod tests {
         let p = policy_for(GpuMode::Shared);
         assert_eq!(p.ollama_max_loaded_models, None);
         assert!(p.stop_services.is_empty());
+        assert!(!p.notify_chord_exclusive);
     }
 
     #[test]
@@ -448,6 +731,7 @@ mod tests {
             pid: current,
             acquired_at: 0,
             stopped_services: vec![],
+            chord_notified: false,
         };
         assert!(!is_blocked(&existing, "sweep", true, current));
     }
@@ -461,6 +745,7 @@ mod tests {
             pid: 1,
             acquired_at: 0,
             stopped_services: vec![],
+            chord_notified: false,
         };
         assert!(is_blocked(&existing, "case-rerun", true, current));
     }
@@ -475,6 +760,7 @@ mod tests {
             pid: 1,
             acquired_at: 0,
             stopped_services: vec![],
+            chord_notified: false,
         };
         assert!(!is_blocked(&existing, "case-rerun", false, current));
     }
@@ -500,7 +786,8 @@ mod tests {
             mode: "exclusive".into(),
             pid: 1,
             acquired_at: 0,
-            stopped_services: vec!["chord.service".to_string()],
+            stopped_services: vec!["lemonade-coder.service".to_string()],
+            chord_notified: false,
         };
 
         assert!(!is_idempotent_reacquire(&existing, "intake_coder_sweep", current));
@@ -518,7 +805,8 @@ mod tests {
             mode: "exclusive".into(),
             pid: current,
             acquired_at: 0,
-            stopped_services: vec!["chord.service".to_string()],
+            stopped_services: vec!["lemonade-coder.service".to_string()],
+            chord_notified: false,
         };
         assert!(is_idempotent_reacquire(&existing, "intake_coder_sweep", current));
     }
@@ -534,7 +822,8 @@ mod tests {
             mode: "exclusive".into(),
             pid: 1,
             acquired_at: 0,
-            stopped_services: vec!["chord.service".to_string()],
+            stopped_services: vec!["lemonade-coder.service".to_string()],
+            chord_notified: false,
         };
         assert!(!is_idempotent_reacquire(&existing, "intake_coder_case", current));
     }
@@ -550,7 +839,8 @@ mod tests {
             mode: "exclusive".into(),
             pid: 1,
             acquired_at: 0,
-            stopped_services: vec!["chord.service".to_string()],
+            stopped_services: vec!["lemonade-coder.service".to_string()],
+            chord_notified: false,
         };
         assert_ne!(existing.pid, current);
         assert!(!is_idempotent_reacquire(&existing, "intake_coder_sweep", current));
@@ -570,5 +860,92 @@ mod tests {
     fn gpu_mode_as_str_matches_lock_state_convention() {
         assert_eq!(GpuMode::Exclusive.as_str(), "exclusive");
         assert_eq!(GpuMode::Shared.as_str(), "shared");
+    }
+
+    // ── Chord GPU-exclusive HTTP coordination ────────────────────────────────
+
+    #[test]
+    fn chord_url_builds_the_v1_gpu_exclusive_path() {
+        assert_eq!(
+            chord_url("http://127.0.0.1:8099", "acquire"),
+            "http://127.0.0.1:8099/v1/gpu-exclusive/acquire"
+        );
+        // Trailing slash on the base is normalized away (no double slash).
+        assert_eq!(
+            chord_url("http://host:8099/", "release"),
+            "http://host:8099/v1/gpu-exclusive/release"
+        );
+    }
+
+    #[test]
+    fn interpret_chord_acquire_acknowledged_notifies() {
+        assert_eq!(interpret_chord_acquire(ChordCall::Acknowledged), Ok(true));
+    }
+
+    #[test]
+    fn interpret_chord_acquire_unreachable_proceeds_without_chord() {
+        // Chord not serving ⇒ nothing contends for the GPU ⇒ proceed, but we did
+        // NOT take (and must not later release) a Chord lock.
+        assert_eq!(interpret_chord_acquire(ChordCall::Unreachable), Ok(false));
+    }
+
+    #[test]
+    fn interpret_chord_acquire_held_refuses() {
+        let r = interpret_chord_acquire(ChordCall::Held {
+            holder: "someone_else".into(),
+        });
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("someone_else"));
+    }
+
+    #[test]
+    fn interpret_chord_acquire_unauthorized_refuses_with_fix() {
+        let r = interpret_chord_acquire(ChordCall::Unauthorized);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("CHORD_JWT"));
+    }
+
+    #[test]
+    fn interpret_chord_acquire_failed_refuses() {
+        assert!(interpret_chord_acquire(ChordCall::Failed("HTTP 500".into())).is_err());
+    }
+
+    #[test]
+    fn chord_base_url_prefers_explicit_then_proxy_then_loopback() {
+        // Clean slate.
+        std::env::remove_var("CHORD_GPU_EXCLUSIVE_URL");
+        std::env::remove_var("CHORD_PROXY_URL");
+        assert_eq!(chord_base_url(), "http://127.0.0.1:8099");
+
+        std::env::set_var("CHORD_PROXY_URL", "http://proxy:9099/");
+        assert_eq!(chord_base_url(), "http://proxy:9099");
+
+        std::env::set_var("CHORD_GPU_EXCLUSIVE_URL", "http://explicit:1234");
+        assert_eq!(chord_base_url(), "http://explicit:1234");
+
+        std::env::remove_var("CHORD_GPU_EXCLUSIVE_URL");
+        std::env::remove_var("CHORD_PROXY_URL");
+    }
+
+    #[test]
+    fn chord_heartbeat_secs_defaults_and_overrides() {
+        std::env::remove_var("CHORD_GPU_EXCLUSIVE_HEARTBEAT_SECS");
+        assert_eq!(chord_heartbeat_secs(), 120);
+        std::env::set_var("CHORD_GPU_EXCLUSIVE_HEARTBEAT_SECS", "0");
+        assert_eq!(chord_heartbeat_secs(), 120); // zero rejected
+        std::env::set_var("CHORD_GPU_EXCLUSIVE_HEARTBEAT_SECS", "45");
+        assert_eq!(chord_heartbeat_secs(), 45);
+        std::env::remove_var("CHORD_GPU_EXCLUSIVE_HEARTBEAT_SECS");
+    }
+
+    #[test]
+    fn lock_state_deserializes_without_chord_notified_field() {
+        // A lock file written by a pre-this-change binary has no chord_notified
+        // key; serde(default) must still parse it (as false) so an in-flight
+        // upgrade never wedges on an unparseable lock.
+        let legacy = r#"{"holder":"intake_coder_sweep","mode":"exclusive","pid":123,"acquired_at":42,"stopped_services":["lemonade-coder.service"]}"#;
+        let parsed: LockState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.holder, "intake_coder_sweep");
+        assert!(!parsed.chord_notified);
     }
 }
