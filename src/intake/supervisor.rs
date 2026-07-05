@@ -684,9 +684,14 @@ pub async fn run() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    // MINT Phase 4: the real breakfix handler (was `LoggingBreakfixHandler`,
+    // Phase 3's logging-only default). `SubagentBreakfix` needs its own pool
+    // handle for DB reads/writes (diagnostic context + `mint_dropped_configs`)
+    // independent of `LiveEnv`'s — `PgPool` is a cheap `Arc`-backed clone, not
+    // a second connection storm.
+    let breakfix = super::breakfix::SubagentBreakfix::new(pool.clone());
     let env = LiveEnv::new(pool);
     let mut state = SupervisorState::new(LiveEnv::load_last_recovery());
-    let breakfix = LoggingBreakfixHandler;
 
     env.log_line(&format!(
         "{} mint-supervisor started (tick={TICK_INTERVAL_SEC}s, stuck_threshold={STUCK_THRESHOLD_SEC}s, \

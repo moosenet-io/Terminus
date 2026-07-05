@@ -20,6 +20,7 @@
 
 mod agent;
 pub mod assistant;
+pub mod breakfix;
 pub mod checkpoint;
 mod code;
 mod code_v2;
