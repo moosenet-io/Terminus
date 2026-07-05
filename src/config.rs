@@ -269,6 +269,77 @@ pub fn llama_cpp_build_id() -> Option<String> {
     env_nonempty("LLAMA_CPP_BUILD_ID")
 }
 
+// ── MINT Phase 4: breakfix reasoning backend ─────────────────────────────────
+//
+// The breakfix subagent's PRIMARY reasoning backend is a headless `claude` CLI
+// subprocess; its FALLBACK is a local CPU-backed Ollama (deliberately NOT the
+// GPU backend — the whole point of breakfix is diagnosing a possibly-wedged
+// GPU, so the diagnostic reasoning itself must never compete for that same
+// GPU). All four knobs below are env-sourced, mirroring the judge-CLI
+// convention above (no literals in `intake::breakfix`).
+
+/// The `claude` CLI binary name/path, from `MINT_BREAKFIX_CLAUDE_CLI`. Falls
+/// back to the bare `claude` name (assumed on `PATH` for a logged-in operator,
+/// same convention as [`judge_cli`]).
+pub fn breakfix_claude_cli() -> String {
+    env_nonempty("MINT_BREAKFIX_CLAUDE_CLI").unwrap_or_else(|| "claude".to_string())
+}
+
+/// Model passed to the primary `claude` CLI via `--model`, from
+/// `MINT_BREAKFIX_CLAUDE_MODEL`. Defaults to `sonnet` (a bare model alias
+/// rather than a dated snapshot id, so this stays valid as the CLI's aliases
+/// roll forward).
+pub fn breakfix_claude_model() -> String {
+    env_nonempty("MINT_BREAKFIX_CLAUDE_MODEL").unwrap_or_else(|| "sonnet".to_string())
+}
+
+/// Base URL of the local CPU-backed Ollama fallback, from the SAME
+/// `OLLAMA_CPU_URL` var [`ollama_secondary_url`] reads (one env var, one
+/// meaning: the fleet's CPU-backed Ollama). Unlike that sibling accessor
+/// (which returns `None` on unset — its callers raise `NotConfigured`), this
+/// one defaults to `http://127.0.0.1:11435` per the Phase-4 spec: breakfix's
+/// fallback reasoning must degrade gracefully even on a host where the var
+/// was never set, rather than failing the whole breakfix attempt over a
+/// missing config for what is already a best-effort fallback path.
+/// Deliberately NOT the GPU-serving Ollama's port/backend (see module doc
+/// above — the whole point of breakfix is diagnosing a possibly-wedged GPU,
+/// so its own reasoning must never contend for that GPU).
+pub fn breakfix_ollama_cpu_url() -> String {
+    env_nonempty("OLLAMA_CPU_URL").unwrap_or_else(|| "http://127.0.0.1:11435".to_string())
+}
+
+/// Model requested from the CPU Ollama fallback, from
+/// `MINT_BREAKFIX_FALLBACK_MODEL`. Defaults to a small/fast model already
+/// referenced elsewhere in this fleet's serving stack.
+pub fn breakfix_fallback_model() -> String {
+    env_nonempty("MINT_BREAKFIX_FALLBACK_MODEL").unwrap_or_else(|| "qwen2.5:7b".to_string())
+}
+
+/// Wall-clock timeout (seconds) for a single reasoning-backend call, from
+/// `MINT_BREAKFIX_TIMEOUT_SECS`. Default 120 — mirrors [`judge_timeout_secs`].
+pub fn breakfix_timeout_secs() -> u64 {
+    env_nonempty("MINT_BREAKFIX_TIMEOUT_SECS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120)
+}
+
+/// Wall-clock cap (seconds) on a single-case retest's GPU-authority acquire,
+/// from `MINT_BREAKFIX_GPU_ACQUIRE_TIMEOUT_SECS`. Default 60.
+///
+/// Caught in review: `gpu_authority::acquire`'s reconciliation path shells out
+/// to `systemctl restart`/`stop` with NO timeout of its own, and breakfix
+/// calls it from INSIDE the supervisor daemon's single tick loop (via
+/// `block_in_place` + `Handle::current().block_on`) — precisely in the
+/// scenario (a GPU already pegged/jammed) where a `systemctl` operation is
+/// most likely to itself hang. Without a bound here, that would wedge the
+/// ENTIRE daemon forever (no further ticks, no prompt SIGTERM response) —
+/// see `breakfix::bounded_blocking`, which this value feeds.
+pub fn breakfix_gpu_acquire_timeout_secs() -> u64 {
+    env_nonempty("MINT_BREAKFIX_GPU_ACQUIRE_TIMEOUT_SECS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,5 +532,60 @@ mod tests {
         );
         std::env::remove_var("CHORD_RESIDENCY_STATE_PATH");
         std::env::remove_var("CHORD_CONTROL_URL");
+    }
+
+    // ---- MINT Phase 4 breakfix config ----
+
+    #[test]
+    #[serial]
+    fn breakfix_claude_defaults_and_overrides() {
+        std::env::remove_var("MINT_BREAKFIX_CLAUDE_CLI");
+        std::env::remove_var("MINT_BREAKFIX_CLAUDE_MODEL");
+        assert_eq!(breakfix_claude_cli(), "claude");
+        assert_eq!(breakfix_claude_model(), "sonnet");
+        std::env::set_var("MINT_BREAKFIX_CLAUDE_CLI", "/opt/bin/claude-wrapper");
+        std::env::set_var("MINT_BREAKFIX_CLAUDE_MODEL", "opus");
+        assert_eq!(breakfix_claude_cli(), "/opt/bin/claude-wrapper");
+        assert_eq!(breakfix_claude_model(), "opus");
+        std::env::remove_var("MINT_BREAKFIX_CLAUDE_CLI");
+        std::env::remove_var("MINT_BREAKFIX_CLAUDE_MODEL");
+    }
+
+    #[test]
+    #[serial]
+    fn breakfix_ollama_fallback_defaults_unlike_sibling_accessor() {
+        std::env::remove_var("OLLAMA_CPU_URL");
+        std::env::remove_var("MINT_BREAKFIX_FALLBACK_MODEL");
+        // Unlike `ollama_secondary_url()` (None on unset), the breakfix
+        // accessor for the SAME var defaults rather than failing.
+        assert_eq!(ollama_secondary_url(), None);
+        assert_eq!(breakfix_ollama_cpu_url(), "http://127.0.0.1:11435");
+        assert_eq!(breakfix_fallback_model(), "qwen2.5:7b");
+        std::env::set_var("OLLAMA_CPU_URL", "http://<internal-ip>:11435");
+        std::env::set_var("MINT_BREAKFIX_FALLBACK_MODEL", "phi3:mini");
+        assert_eq!(breakfix_ollama_cpu_url(), "http://<internal-ip>:11435");
+        assert_eq!(breakfix_fallback_model(), "phi3:mini");
+        std::env::remove_var("OLLAMA_CPU_URL");
+        std::env::remove_var("MINT_BREAKFIX_FALLBACK_MODEL");
+    }
+
+    #[test]
+    #[serial]
+    fn breakfix_timeout_defaults_and_parses() {
+        std::env::remove_var("MINT_BREAKFIX_TIMEOUT_SECS");
+        assert_eq!(breakfix_timeout_secs(), 120);
+        std::env::set_var("MINT_BREAKFIX_TIMEOUT_SECS", "45");
+        assert_eq!(breakfix_timeout_secs(), 45);
+        std::env::remove_var("MINT_BREAKFIX_TIMEOUT_SECS");
+    }
+
+    #[test]
+    #[serial]
+    fn breakfix_gpu_acquire_timeout_defaults_and_parses() {
+        std::env::remove_var("MINT_BREAKFIX_GPU_ACQUIRE_TIMEOUT_SECS");
+        assert_eq!(breakfix_gpu_acquire_timeout_secs(), 60);
+        std::env::set_var("MINT_BREAKFIX_GPU_ACQUIRE_TIMEOUT_SECS", "15");
+        assert_eq!(breakfix_gpu_acquire_timeout_secs(), 15);
+        std::env::remove_var("MINT_BREAKFIX_GPU_ACQUIRE_TIMEOUT_SECS");
     }
 }

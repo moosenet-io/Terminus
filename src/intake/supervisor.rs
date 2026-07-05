@@ -39,12 +39,15 @@
 //! `code_profile_runs` row at recovery time). If the SAME combo produces
 //! [`REPEAT_STUCK_THRESHOLD`]+ recoveries within [`REPEAT_STUCK_WINDOW_SEC`],
 //! that is "repeat-stuck": a plain restart clearly is not fixing it, so this is
-//! where Phase 4 (breakfix — NOT YET BUILT) will plug in. For now the
-//! [`BreakfixHandler`] seam has a logging-only default
-//! ([`LoggingBreakfixHandler`]) that records a structured `ESCALATION` line and
-//! defers, so the daemon still performs the normal restart-recovery as a safe
-//! fallback. Phase 4 supplies a real `BreakfixHandler` impl without touching
-//! this loop.
+//! where breakfix plugs in via the [`BreakfixHandler`] seam. Phase 3 shipped
+//! only a logging-only default ([`LoggingBreakfixHandler`]) that records a
+//! structured `ESCALATION` line and defers, so the daemon still performs the
+//! normal restart-recovery as a safe fallback; [`run`] now wires in the real
+//! MINT Phase 4 implementation (`breakfix::SubagentBreakfix`) instead,
+//! WITHOUT this loop itself changing at all — [`tick`] still only depends on
+//! the `BreakfixHandler` trait object, never a concrete handler, and still
+//! restart-recovers regardless of what the handler decides (see
+//! [`BreakfixOutcome`]'s doc).
 //!
 //! ## Log-line compatibility (load-bearing)
 //! Tick lines are written to the SAME log file (`/var/log/sweep-watchdog.log`)
@@ -270,19 +273,23 @@ impl SupervisorState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BreakfixOutcome {
     /// Handler took no corrective action of its own; the daemon must fall back
-    /// to its normal restart-recovery. This is the Phase-3 default (Phase 4 not
-    /// built) — the loop ALWAYS restart-recovers after a `Deferred`.
+    /// to its normal restart-recovery. This was the ONLY outcome Phase 3 ever
+    /// produced ([`LoggingBreakfixHandler`], still used as a no-op default in
+    /// tests) — the loop ALWAYS restart-recovers after a `Deferred`.
     Deferred,
-    /// Handler performed its own remediation (Phase 4). The daemon still
+    /// Handler performed its own remediation (MINT Phase 4's
+    /// `breakfix::SubagentBreakfix`, wired in by [`run`]). The daemon still
     /// restart-recovers as a safe backstop — a handler signalling `Handled`
-    /// changes the LOGS, not (yet) the fallback, so a buggy future handler can
-    /// never leave a jammed sweep un-restarted.
+    /// changes the LOGS, not the fallback, so a buggy handler can never leave
+    /// a jammed sweep un-restarted.
     Handled,
 }
 
-/// The Phase-4 plug point. Phase 3 ships only [`LoggingBreakfixHandler`]; Phase
-/// 4 supplies a real impl (invoke breakfix) WITHOUT editing [`tick`] — the loop
-/// depends on this trait object, never a concrete handler.
+/// The breakfix plug point. Phase 3 shipped only [`LoggingBreakfixHandler`]
+/// (still available as a no-op default for tests); MINT Phase 4's
+/// `breakfix::SubagentBreakfix` is the real implementation [`run`] wires in
+/// now, WITHOUT editing [`tick`] at all — the loop depends on this trait
+/// object, never a concrete handler.
 pub trait BreakfixHandler: Send + Sync {
     /// Called when `combo` has crossed the repeat-stuck threshold
     /// (`recovery_count` recoveries within the window). Returns what it did so
@@ -290,15 +297,18 @@ pub trait BreakfixHandler: Send + Sync {
     fn handle_repeat_stuck(&self, combo: &ComboKey, recovery_count: usize) -> BreakfixOutcome;
 }
 
-/// Phase-3 default: log a structured escalation and defer. No-op remediation —
-/// the clean seam Phase 4 replaces.
+/// Phase-3 default: log a structured escalation and defer. No-op remediation
+/// — kept as the seam's original, dependency-free default (used by this
+/// module's own tests); production now wires `breakfix::SubagentBreakfix` in
+/// its place (see [`run`]).
 pub struct LoggingBreakfixHandler;
 
 impl BreakfixHandler for LoggingBreakfixHandler {
     fn handle_repeat_stuck(&self, combo: &ComboKey, recovery_count: usize) -> BreakfixOutcome {
         tracing::warn!(
             "ESCALATION: repeat-stuck combo {} ({recovery_count} recoveries within {}s) — \
-             would invoke breakfix here (Phase 4 not yet built); falling back to restart-recovery",
+             this no-op default handler defers (see breakfix::SubagentBreakfix for the real \
+             handler production wires in); falling back to restart-recovery",
             combo.label(),
             REPEAT_STUCK_WINDOW_SEC
         );
@@ -684,9 +694,14 @@ pub async fn run() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    // MINT Phase 4: the real breakfix handler (was `LoggingBreakfixHandler`,
+    // Phase 3's logging-only default). `SubagentBreakfix` needs its own pool
+    // handle for DB reads/writes (diagnostic context + `mint_dropped_configs`)
+    // independent of `LiveEnv`'s — `PgPool` is a cheap `Arc`-backed clone, not
+    // a second connection storm.
+    let breakfix = super::breakfix::SubagentBreakfix::new(pool.clone());
     let env = LiveEnv::new(pool);
     let mut state = SupervisorState::new(LiveEnv::load_last_recovery());
-    let breakfix = LoggingBreakfixHandler;
 
     env.log_line(&format!(
         "{} mint-supervisor started (tick={TICK_INTERVAL_SEC}s, stuck_threshold={STUCK_THRESHOLD_SEC}s, \
