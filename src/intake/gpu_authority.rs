@@ -587,17 +587,30 @@ pub fn acquire(mode: GpuMode, holder: &str) -> Result<(), String> {
         reconcile_ollama(Some(n))?;
     }
 
-    // Take Chord's GPU over HTTP (instead of killing chord.service) and, on
-    // success, start the heartbeat that holds it across a long sweep. A refusal
-    // (409/auth/failure) aborts the acquire BEFORE the lock is written — the
-    // caller sees the error and does not start the sweep. Chord being
-    // unreachable is NOT an error (nothing is contending for the GPU).
+    // Take Chord's GPU over HTTP (instead of killing chord.service). A refusal
+    // (409/auth/failure) aborts the acquire — the caller sees the error and
+    // does not start the sweep. Chord being unreachable is NOT an error
+    // (nothing is contending for the GPU).
+    //
+    // On a refusal we must restore any services already stopped above
+    // (`stopped`) before returning — otherwise a rejected acquire leaves
+    // e.g. lemonade-coder.service down with no caller in a position to know
+    // it needs restarting (the caller sees `Err`, i.e. "you never acquired,"
+    // not "acquire partially ran and left the host mutated"). Mirrors the
+    // exact restart step `release()` performs for a successful acquire's
+    // `stopped_services`.
     let mut chord_notified = false;
     if policy.notify_chord_exclusive {
-        chord_notified = interpret_chord_acquire(chord_call("acquire", holder))?;
-        if chord_notified {
-            start_chord_heartbeat(holder);
-        } else {
+        chord_notified = match interpret_chord_acquire(chord_call("acquire", holder)) {
+            Ok(v) => v,
+            Err(e) => {
+                for svc in &stopped {
+                    let _ = run("systemctl", &["start", svc]);
+                }
+                return Err(e);
+            }
+        };
+        if !chord_notified {
             tracing::warn!(
                 "gpu_authority: chord unreachable at acquire — proceeding without it (it is not \
                  serving, so nothing is contending for the GPU)"
@@ -605,14 +618,38 @@ pub fn acquire(mode: GpuMode, holder: &str) -> Result<(), String> {
         }
     }
 
-    write_lock(&LockState {
+    // Write the lock BEFORE starting the heartbeat: if `write_lock` itself
+    // fails, the caller's `Err` must mean "no lock, no heartbeat, no
+    // ongoing side effects" — starting the heartbeat first would otherwise
+    // leave an orphaned background thread heartbeating Chord's lock for a
+    // holder that, per this function's return value, never acquired it.
+    if let Err(e) = write_lock(&LockState {
         holder: holder.to_string(),
         mode: mode.as_str().to_string(),
         pid: my_pid(),
         acquired_at: now_epoch(),
-        stopped_services: stopped,
+        stopped_services: stopped.clone(),
         chord_notified,
-    })
+    }) {
+        // Full rollback: Chord's remote lock (if we just took it) and any
+        // services stopped above must not outlive this failed acquire —
+        // otherwise Chord sits exclusively held (until its own TTL expiry)
+        // and/or lemonade-coder stays down for a holder that never actually
+        // acquired anything locally.
+        if chord_notified {
+            let _ = chord_call("release", holder);
+        }
+        for svc in &stopped {
+            let _ = run("systemctl", &["start", svc]);
+        }
+        return Err(e);
+    }
+
+    if chord_notified {
+        start_chord_heartbeat(holder);
+    }
+
+    Ok(())
 }
 
 /// Release `holder`'s lock, restarting exactly the services THIS acquire
