@@ -34,6 +34,7 @@ pub mod newcats;
 mod runner;
 pub mod serving;
 mod storage;
+pub mod supervisor;
 mod timeouts;
 pub mod vuln_scan;
 

@@ -24,7 +24,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use terminus_rs::intake::{
     assistant::{runner, schema},
-    coder_case, coder_gaps, coder_sweep, gpu_authority,
+    coder_case, coder_gaps, coder_sweep, gpu_authority, supervisor,
 };
 
 #[derive(Parser)]
@@ -77,6 +77,23 @@ enum Command {
         #[command(subcommand)]
         action: GpuAction,
     },
+    /// MINT Phase 3 permanent sweep supervisor: run / install / uninstall.
+    Supervisor {
+        #[command(subcommand)]
+        action: SupervisorAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SupervisorAction {
+    /// Run the permanent jam-detect + auto-recover daemon (tokio loop, 90s
+    /// tick, SIGTERM-graceful). This is what the systemd unit's ExecStart runs.
+    Run,
+    /// Write + enable the `mint-supervisor.service` systemd unit. (Not run in
+    /// the Phase-3 build; deploy-time only.)
+    Install,
+    /// Disable + remove the `mint-supervisor.service` systemd unit.
+    Uninstall,
 }
 
 #[derive(Subcommand)]
@@ -160,15 +177,19 @@ async fn ensure_schema_migrated() -> Result<(), String> {
 }
 
 /// Item 5: does `cmd` need the shared intake schema migrated before it runs?
-/// Every subcommand EXCEPT `gpu ...` touches the shared intake DB (directly,
-/// or via the library function it dispatches to). `gpu status`/`acquire`/
-/// `release` manage the GPU-authority FILE lock only and have no Postgres
-/// dependency at all — forcing a DB connection on them would make a pure
-/// lock query/release fail on a host with no DB reachable, which is not this
-/// item's intent. Pure/extracted so this decision is unit-testable without
-/// a live Postgres connection.
+/// Every subcommand EXCEPT `gpu ...` and `supervisor ...` touches the shared
+/// intake DB (directly, or via the library function it dispatches to). `gpu
+/// status`/`acquire`/`release` manage the GPU-authority FILE lock only and have
+/// no Postgres dependency at all. `supervisor` is an OBSERVER of tables the
+/// sweeps own — it must never migrate the schema (it doesn't write those
+/// tables), and its `run` daemon must start even when the DB is momentarily
+/// unreachable (it retries per tick), so a startup migrate would wrongly make
+/// the daemon refuse to start; `install`/`uninstall` have no DB dependency at
+/// all. Forcing a DB connection on any of these would make them fail on a host
+/// with no DB reachable, which is not this item's intent. Pure/extracted so
+/// this decision is unit-testable without a live Postgres connection.
 fn needs_schema_migrate(cmd: &Command) -> bool {
-    !matches!(cmd, Command::Gpu { .. })
+    !matches!(cmd, Command::Gpu { .. } | Command::Supervisor { .. })
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -333,6 +354,15 @@ async fn main() -> std::process::ExitCode {
                     std::process::ExitCode::FAILURE
                 }
             },
+        },
+
+        Command::Supervisor { action } => match action {
+            // The long-running daemon — observes the sweeps and restart-recovers
+            // a jam; it manages its OWN DB lifecycle (reconnect/retry per tick),
+            // which is why `needs_schema_migrate` excludes it above.
+            SupervisorAction::Run => supervisor::run().await,
+            SupervisorAction::Install => supervisor::install(),
+            SupervisorAction::Uninstall => supervisor::uninstall(),
         },
     }
 }
@@ -669,6 +699,35 @@ mod tests {
         assert!(!needs_schema_migrate(&status));
         assert!(!needs_schema_migrate(&acquire));
         assert!(!needs_schema_migrate(&release));
+    }
+
+    #[test]
+    fn needs_schema_migrate_false_for_every_supervisor_action() {
+        // The supervisor is a DB observer with its own reconnect/retry lifecycle
+        // — it must never migrate the shared schema at startup (see the fn doc).
+        let run = Cli::try_parse_from(["mint", "supervisor", "run"]).unwrap().command;
+        let install = Cli::try_parse_from(["mint", "supervisor", "install"]).unwrap().command;
+        let uninstall = Cli::try_parse_from(["mint", "supervisor", "uninstall"]).unwrap().command;
+
+        assert!(!needs_schema_migrate(&run));
+        assert!(!needs_schema_migrate(&install));
+        assert!(!needs_schema_migrate(&uninstall));
+    }
+
+    #[test]
+    fn supervisor_actions_parse() {
+        assert!(matches!(
+            Cli::try_parse_from(["mint", "supervisor", "run"]).unwrap().command,
+            Command::Supervisor { action: SupervisorAction::Run }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["mint", "supervisor", "install"]).unwrap().command,
+            Command::Supervisor { action: SupervisorAction::Install }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["mint", "supervisor", "uninstall"]).unwrap().command,
+            Command::Supervisor { action: SupervisorAction::Uninstall }
+        ));
     }
 
     // ---- item 7: mint's pre-acquired GPU-authority holder labels must match
