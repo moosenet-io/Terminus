@@ -135,17 +135,63 @@ fn backend_override() -> Option<String> {
     BACKEND_OVERRIDE.lock().ok().and_then(|g| g.clone())
 }
 
+/// MINT Phase 6 (`--remote`): process-global remote Ollama base-URL override.
+/// When set, redirects ONLY the default primary Ollama backend's base URL to a
+/// different host (for cross-host inference comparison — e.g. profiling the
+/// same model served on another GPU host) — see [`apply_remote_override`] for
+/// the exact composition rule. Same lifecycle contract as [`set_backend_override`]:
+/// intake runs are sequential, so set it before a suite and clear it after.
+/// It does NOT touch `gpu_authority`'s host-local lock — the harness still runs
+/// on (and locks) its own GPU; only the inference target URL moves.
+static REMOTE_OLLAMA_URL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Set (or clear with `None`) the global remote-Ollama-URL override.
+pub fn set_remote_ollama_url(url: Option<String>) {
+    if let Ok(mut g) = REMOTE_OLLAMA_URL.lock() {
+        *g = url;
+    }
+}
+
+fn remote_ollama_url() -> Option<String> {
+    REMOTE_OLLAMA_URL.lock().ok().and_then(|g| g.clone())
+}
+
+/// Compose the MINT Phase 6 `--remote` override onto an already-resolved
+/// backend. The override redirects ONLY the default primary Ollama backend —
+/// the one untagged models and the registry-absent fallback resolve to,
+/// identified by `name == "ollama"` AND `kind == "ollama"`. A model pinned to
+/// ANY other backend — a differently-named ollama backend (e.g. `ollama-cpu`)
+/// or a non-ollama kind (e.g. `llama-server`) — keeps its own registry routing
+/// untouched, so `--remote` never silently reroutes a llama-server model or a
+/// deliberately-pinned CPU pass onto a remote host. A blank/whitespace remote
+/// URL is a no-op. Pure (no globals/env) so the rule is unit-testable.
+pub fn apply_remote_override(mut backend: ResolvedBackend, remote: Option<&str>) -> ResolvedBackend {
+    if let Some(url) = remote {
+        let url = url.trim().trim_end_matches('/');
+        if !url.is_empty() && backend.name == "ollama" && backend.kind == "ollama" {
+            backend.url = url.to_string();
+        }
+    }
+    backend
+}
+
 /// Resolve a model's backend from the registry file. Falls back to the default
 /// Ollama base (`context::ollama_base`) when the file is absent, legacy-format,
 /// or the model/backend is untagged — so behavior is unchanged until models are
 /// tagged.
 pub fn resolve_backend(model: &str) -> ResolvedBackend {
-    resolve_backend_at(
+    let resolved = resolve_backend_at(
         model,
         &registry_path(),
         &context::ollama_base(),
         backend_override().as_deref(),
-    )
+    );
+    // MINT Phase 6: redirect the default primary ollama backend to the remote
+    // inference target when `--remote`/`MINT_REMOTE_OLLAMA_URL` is active. This
+    // is the single choke point every dispatch path (infer_with_metrics,
+    // embed_with_metrics, model_available) already funnels through, so the
+    // override reaches them all without threading a new param through each.
+    apply_remote_override(resolved, remote_ollama_url().as_deref())
 }
 
 /// Resolve against an explicit registry path + fallback URL (no env reads) —
@@ -608,6 +654,91 @@ mod tests {
         );
         let b = resolve_backend_at("qwen3:8b", path.to_str().unwrap(), "http://localhost:11434", None);
         assert_eq!(b.kind, "ollama"); // legacy format, no tag → fallback
+    }
+
+    // ---- MINT Phase 6: --remote composition rule (pure core) ----
+
+    fn ollama_backend(url: &str) -> ResolvedBackend {
+        ResolvedBackend {
+            name: "ollama".to_string(),
+            url: url.to_string(),
+            kind: "ollama".to_string(),
+            hardware: "gpu".to_string(),
+            always_on: true,
+            unit: None,
+            launch: None,
+            model_local_path: None,
+            model_gguf_path: None,
+        }
+    }
+
+    #[test]
+    fn remote_override_redirects_default_ollama_backend() {
+        let b = apply_remote_override(ollama_backend("http://127.0.0.1:11434"), Some("http://pvf2:11434"));
+        assert_eq!(b.url, "http://pvf2:11434");
+        assert_eq!(b.name, "ollama");
+        assert_eq!(b.kind, "ollama");
+    }
+
+    #[test]
+    fn remote_override_trims_trailing_slash() {
+        let b = apply_remote_override(ollama_backend("http://127.0.0.1:11434"), Some("http://pvf2:11434/"));
+        assert_eq!(b.url, "http://pvf2:11434");
+    }
+
+    #[test]
+    fn remote_override_none_leaves_backend_untouched() {
+        let b = apply_remote_override(ollama_backend("http://127.0.0.1:11434"), None);
+        assert_eq!(b.url, "http://127.0.0.1:11434");
+    }
+
+    #[test]
+    fn remote_override_blank_is_noop() {
+        let b = apply_remote_override(ollama_backend("http://127.0.0.1:11434"), Some("   "));
+        assert_eq!(b.url, "http://127.0.0.1:11434");
+    }
+
+    #[test]
+    fn remote_override_skips_pinned_non_default_ollama_backend() {
+        // A model pinned to a differently-named ollama backend (e.g. the CPU
+        // pass) keeps its own routing — --remote only moves the default GPU
+        // "ollama" backend.
+        let mut cpu = ollama_backend("http://127.0.0.1:11434");
+        cpu.name = "ollama-cpu".to_string();
+        let b = apply_remote_override(cpu, Some("http://pvf2:11434"));
+        assert_eq!(b.url, "http://127.0.0.1:11434", "pinned ollama-cpu must not be rerouted");
+    }
+
+    #[test]
+    fn remote_override_skips_llama_server_backend() {
+        let mut ls = ollama_backend("http://127.0.0.1:8082");
+        ls.name = "llama-gpu".to_string();
+        ls.kind = "llama-server".to_string();
+        let b = apply_remote_override(ls, Some("http://pvf2:11434"));
+        assert_eq!(b.url, "http://127.0.0.1:8082", "llama-server backend must not be rerouted");
+    }
+
+    #[test]
+    fn remote_override_reaches_resolve_backend_choke_point() {
+        // End-to-end through the single resolution choke point every dispatch
+        // path funnels through: with the global set, an untagged model (which
+        // resolves to the default "ollama" backend) comes out pointed at the
+        // remote URL — proving the override reaches where a request dispatches
+        // without needing a live remote Ollama.
+        let path = tmp_registry(
+            "remote-choke",
+            r#"{
+                "models": {},
+                "backends": { "ollama": { "url": "http://127.0.0.1:11434", "kind": "ollama", "hardware": "gpu" } }
+            }"#,
+        );
+        std::env::set_var("MODEL_REGISTRY_PATH", &path);
+        set_remote_ollama_url(Some("http://pvf2:11434".to_string()));
+        let b = resolve_backend("untagged:latest");
+        set_remote_ollama_url(None);
+        std::env::remove_var("MODEL_REGISTRY_PATH");
+        assert_eq!(b.name, "ollama");
+        assert_eq!(b.url, "http://pvf2:11434");
     }
 
     // ---- HFIX-05: /api/tags membership check (pure core) ----
