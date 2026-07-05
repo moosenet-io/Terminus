@@ -373,7 +373,18 @@ fn chord_heartbeat_secs() -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChordCall {
     /// 2xx — Chord acknowledged (granted / refreshed / released).
-    Acknowledged,
+    ///
+    /// `new_grant` mirrors the JSON body's own `new_grant` field (best-effort
+    /// parsed; `false` if the body is missing/unparseable — never a false
+    /// alarm from a body-parse hiccup). On the INITIAL acquire this is
+    /// expected to be `true` (a fresh grant) and is not itself meaningful.
+    /// On a HEARTBEAT re-acquire of an ALREADY-held lock, `true` here is an
+    /// anomaly: it means Chord's own lock state was reset (restart/crash)
+    /// since the last successful heartbeat, so Chord served ungated for
+    /// some window between then and now — the exact VRAM-contention gap
+    /// this whole mechanism exists to prevent. See `start_chord_heartbeat`
+    /// for where this is checked.
+    Acknowledged { new_grant: bool },
     /// Transport failure (connection refused/timeout) — Chord is not serving, so
     /// there is nothing contending for the GPU; safe to proceed without it.
     Unreachable,
@@ -426,7 +437,16 @@ fn chord_call(action: &str, holder: &str) -> ChordCall {
                     Ok(resp) => {
                         let status = resp.status();
                         if status.is_success() {
-                            ChordCall::Acknowledged
+                            // Best-effort parse of `new_grant`; a missing/malformed
+                            // body degrades to `false` (never a false alarm from a
+                            // parse hiccup — see the variant's doc comment).
+                            let new_grant = resp
+                                .json::<serde_json::Value>()
+                                .await
+                                .ok()
+                                .and_then(|v| v.get("new_grant").and_then(|g| g.as_bool()))
+                                .unwrap_or(false);
+                            ChordCall::Acknowledged { new_grant }
                         } else if status.as_u16() == 409 {
                             // Body carries the current holder; best-effort parse.
                             let holder = resp
@@ -468,7 +488,10 @@ fn chord_call(action: &str, holder: &str) -> ChordCall {
 /// - `Failed`       ⇒ `Err`.
 fn interpret_chord_acquire(outcome: ChordCall) -> Result<bool, String> {
     match outcome {
-        ChordCall::Acknowledged => Ok(true),
+        // `new_grant` is not meaningful on the initial acquire (a fresh grant
+        // is exactly what's expected here) — see `ChordCall::Acknowledged`'s
+        // doc comment for why it DOES matter on a heartbeat re-acquire.
+        ChordCall::Acknowledged { .. } => Ok(true),
         ChordCall::Unreachable => Ok(false),
         ChordCall::Held { holder } => Err(format!(
             "chord reports the GPU is already held exclusively by '{holder}' — refusing to start"
@@ -496,6 +519,73 @@ struct ChordHeartbeat {
 static CHORD_HEARTBEAT: std::sync::Mutex<Option<ChordHeartbeat>> =
     std::sync::Mutex::new(None);
 
+/// Fast-retry backoff (seconds) tried on a failed heartbeat before falling
+/// back to waiting the full interval — a transient blip (one dropped
+/// connection, a GC pause) should not need to wait the full interval and eat
+/// into Chord's TTL margin. Three short retries (10s apart, 30s total) is
+/// comfortably inside a 120s default interval and a 600s default TTL.
+const HEARTBEAT_RETRY_DELAYS_SECS: &[u64] = &[10, 10, 10];
+
+/// Handle one heartbeat call's outcome: log the anomaly if Chord unexpectedly
+/// re-granted (see [`ChordCall::Acknowledged`]'s doc comment for why that
+/// matters on a heartbeat, unlike on the initial acquire), and fast-retry a
+/// failed call a few times (respecting `stop`, so a `release()` mid-retry
+/// still tears the heartbeat down promptly) before giving up until the next
+/// full interval.
+fn handle_heartbeat_outcome(
+    outcome: ChordCall,
+    holder: &str,
+    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    match outcome {
+        ChordCall::Acknowledged { new_grant: false } => {}
+        ChordCall::Acknowledged { new_grant: true } => {
+            tracing::error!(
+                "gpu_authority: CHORD LOCK GAP DETECTED — heartbeat re-acquire for '{holder}' \
+                 came back as a NEW grant, not a refresh of an existing one. This means Chord's \
+                 own lock state was reset (restart/crash) since the last successful heartbeat, \
+                 and Chord served ungated for some window between then and now — samples \
+                 recorded in that window may have contended with Chord for the GPU. Investigate \
+                 chord.service's uptime/logs around this time."
+            );
+        }
+        other => {
+            tracing::warn!(
+                "gpu_authority: chord heartbeat re-acquire returned {other:?} — fast-retrying"
+            );
+            for delay in HEARTBEAT_RETRY_DELAYS_SECS {
+                for _ in 0..*delay {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+                match chord_call("acquire", holder) {
+                    ChordCall::Acknowledged { new_grant: false } => return,
+                    ChordCall::Acknowledged { new_grant: true } => {
+                        tracing::error!(
+                            "gpu_authority: CHORD LOCK GAP DETECTED — heartbeat re-acquire for \
+                             '{holder}' came back as a NEW grant during fast-retry, not a \
+                             refresh. Chord's lock state was reset since the last successful \
+                             heartbeat; investigate chord.service's uptime/logs around this time."
+                        );
+                        return;
+                    }
+                    retry_outcome => tracing::warn!(
+                        "gpu_authority: chord heartbeat retry still failing: {retry_outcome:?}"
+                    ),
+                }
+            }
+            tracing::warn!(
+                "gpu_authority: chord heartbeat re-acquire for '{holder}' still failing after \
+                 {} fast retries — will try again next full interval",
+                HEARTBEAT_RETRY_DELAYS_SECS.len()
+            );
+        }
+    }
+}
+
 /// Start (or restart) the background heartbeat that re-`acquire`s Chord's lock
 /// every [`chord_heartbeat_secs`] so it never hits Chord's abandoned-lock TTL
 /// while the sweep is running.
@@ -519,12 +609,7 @@ fn start_chord_heartbeat(holder: &str) {
             if stop_thread.load(Ordering::Relaxed) {
                 return;
             }
-            match chord_call("acquire", &holder) {
-                ChordCall::Acknowledged => {}
-                other => tracing::warn!(
-                    "gpu_authority: chord heartbeat re-acquire returned {other:?} (will retry next interval)"
-                ),
-            }
+            handle_heartbeat_outcome(chord_call("acquire", &holder), &holder, &stop_thread);
         }
     });
     if let Ok(mut guard) = CHORD_HEARTBEAT.lock() {
@@ -677,7 +762,7 @@ pub fn release(holder: &str) -> Result<(), String> {
     if existing.chord_notified {
         stop_chord_heartbeat();
         match chord_call("release", holder) {
-            ChordCall::Acknowledged | ChordCall::Unreachable => {}
+            ChordCall::Acknowledged { .. } | ChordCall::Unreachable => {}
             other => tracing::warn!(
                 "gpu_authority: chord GPU-exclusive release returned {other:?} (lock will TTL-expire on Chord's side)"
             ),
@@ -916,7 +1001,44 @@ mod tests {
 
     #[test]
     fn interpret_chord_acquire_acknowledged_notifies() {
-        assert_eq!(interpret_chord_acquire(ChordCall::Acknowledged), Ok(true));
+        assert_eq!(
+            interpret_chord_acquire(ChordCall::Acknowledged { new_grant: true }),
+            Ok(true)
+        );
+        // `new_grant` isn't meaningful on the initial acquire either way.
+        assert_eq!(
+            interpret_chord_acquire(ChordCall::Acknowledged { new_grant: false }),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn handle_heartbeat_outcome_new_grant_true_logs_but_does_not_panic() {
+        // The anomaly path must never panic or block — it only logs.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        handle_heartbeat_outcome(ChordCall::Acknowledged { new_grant: true }, "test", &stop);
+    }
+
+    #[test]
+    fn handle_heartbeat_outcome_normal_refresh_is_a_silent_noop() {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        handle_heartbeat_outcome(ChordCall::Acknowledged { new_grant: false }, "test", &stop);
+    }
+
+    #[test]
+    fn handle_heartbeat_outcome_failure_stops_fast_retry_promptly_when_stop_flag_set() {
+        // If `stop` is already set, the retry loop's sleep-in-1s-slices must
+        // return almost immediately rather than blocking through a full
+        // HEARTBEAT_RETRY_DELAYS_SECS cycle (release() tearing the heartbeat
+        // down must be prompt, not delayed by an in-flight retry backoff).
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let started = std::time::Instant::now();
+        handle_heartbeat_outcome(ChordCall::Unreachable, "test", &stop);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "expected a near-immediate return when stop is already set, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
