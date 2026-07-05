@@ -323,6 +323,23 @@ pub fn breakfix_timeout_secs() -> u64 {
         .unwrap_or(120)
 }
 
+/// Wall-clock cap (seconds) on a single-case retest's GPU-authority acquire,
+/// from `MINT_BREAKFIX_GPU_ACQUIRE_TIMEOUT_SECS`. Default 60.
+///
+/// Caught in review: `gpu_authority::acquire`'s reconciliation path shells out
+/// to `systemctl restart`/`stop` with NO timeout of its own, and breakfix
+/// calls it from INSIDE the supervisor daemon's single tick loop (via
+/// `block_in_place` + `Handle::current().block_on`) — precisely in the
+/// scenario (a GPU already pegged/jammed) where a `systemctl` operation is
+/// most likely to itself hang. Without a bound here, that would wedge the
+/// ENTIRE daemon forever (no further ticks, no prompt SIGTERM response) —
+/// see `breakfix::bounded_blocking`, which this value feeds.
+pub fn breakfix_gpu_acquire_timeout_secs() -> u64 {
+    env_nonempty("MINT_BREAKFIX_GPU_ACQUIRE_TIMEOUT_SECS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,5 +577,15 @@ mod tests {
         std::env::set_var("MINT_BREAKFIX_TIMEOUT_SECS", "45");
         assert_eq!(breakfix_timeout_secs(), 45);
         std::env::remove_var("MINT_BREAKFIX_TIMEOUT_SECS");
+    }
+
+    #[test]
+    #[serial]
+    fn breakfix_gpu_acquire_timeout_defaults_and_parses() {
+        std::env::remove_var("MINT_BREAKFIX_GPU_ACQUIRE_TIMEOUT_SECS");
+        assert_eq!(breakfix_gpu_acquire_timeout_secs(), 60);
+        std::env::set_var("MINT_BREAKFIX_GPU_ACQUIRE_TIMEOUT_SECS", "15");
+        assert_eq!(breakfix_gpu_acquire_timeout_secs(), 15);
+        std::env::remove_var("MINT_BREAKFIX_GPU_ACQUIRE_TIMEOUT_SECS");
     }
 }

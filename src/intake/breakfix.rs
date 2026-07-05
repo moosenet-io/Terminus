@@ -37,7 +37,12 @@
 //! config, verify it with a single-case retest, repeat up to
 //! [`MAX_ATTEMPTS`] times, then MUST resolve to `drop` or `escalate` — see
 //! that function's doc for the exact termination argument (this is also
-//! covered by an adversarial "always retry" test in this module).
+//! covered by an adversarial "always retry" test in this module). That proof
+//! covers the PURE loop over trait objects; the CONCRETE [`LiveRetestHook`]
+//! it is wired to in production does real, synchronous, potentially-blocking
+//! I/O (`gpu_authority::acquire`'s `systemctl` shell-outs have no timeout of
+//! their own) — [`bounded_blocking`] closes that gap (caught in review) so
+//! the loop's bound holds end to end, not just on paper.
 //!
 //! ## `codefix` — DELIBERATE SCOPE NARROWING
 //! A `codefix(...)` verdict is logged clearly as "requested but not yet
@@ -243,7 +248,18 @@ fn redact(s: &str) -> String {
         .collect();
     let trimmed = cleaned.trim();
     if trimmed.len() > RAW_AUDIT_MAX {
-        format!("{}…[truncated]", &trimmed[..RAW_AUDIT_MAX])
+        // Byte-index slicing panics unless the index lands on a UTF-8 char
+        // boundary (caught in review: subprocess stderr containing
+        // non-ASCII — smart quotes, em-dashes, non-English text — straddling
+        // byte offset 2000 would panic here and take down the whole handler,
+        // since this runs inside the supervisor's own tick loop via
+        // `block_in_place`). Walk BACKWARD from the raw byte cutoff to the
+        // nearest char boundary so truncation never splits a multi-byte char.
+        let mut cut = RAW_AUDIT_MAX;
+        while cut > 0 && !trimmed.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}…[truncated]", &trimmed[..cut])
     } else {
         trimmed.to_string()
     }
@@ -312,13 +328,21 @@ impl ReasoningBackend for ClaudeCliBackend {
             if looks_like_auth_error(&stderr) || looks_like_auth_error(&stdout) {
                 return BackendReply::Unavailable(format!("'{}' not authenticated", self.cli));
             }
-            if stdout.trim().is_empty() {
-                return BackendReply::Unavailable(format!(
-                    "'{}' exited nonzero: {}",
-                    self.cli,
-                    redact(&stderr)
-                ));
-            }
+            // Caught in review: this used to fall through to `Text(stdout)`
+            // whenever stdout was non-empty, even on a NON-ZERO exit — a CLI
+            // that crashes/errors but still writes a partial answer or a
+            // warning banner to stdout would then be treated as a legitimate
+            // reply (fed straight into `parse_verdict`, which — lacking a
+            // real VERDICT line — silently escalates) instead of being
+            // classified `Unavailable` and given a real chance to fall back
+            // to the CPU-Ollama backend via `ChainedBackend`. A non-zero exit
+            // is ALWAYS `Unavailable` now, regardless of stdout content.
+            return BackendReply::Unavailable(format!(
+                "'{}' exited nonzero ({}): {}",
+                self.cli,
+                out.status,
+                redact(if stdout.trim().is_empty() { &stderr } else { &stdout })
+            ));
         } else if looks_like_auth_error(&stdout) {
             return BackendReply::Unavailable(format!("'{}' not authenticated", self.cli));
         }
@@ -464,6 +488,47 @@ fn parse_alt_config(raw: &str) -> AltConfig {
 /// holds the GPU.
 pub const BREAKFIX_GPU_HOLDER: &str = "mint_breakfix";
 
+/// Generic bounded-blocking bridge: runs `f` (a synchronous, potentially
+/// long-blocking closure) on tokio's blocking-thread pool via
+/// `spawn_blocking`, racing it against a wall-clock `timeout`. If `f`
+/// finishes first, its result is returned. If `timeout` elapses first, this
+/// returns `Err` IMMEDIATELY — `f` is NOT cancelled (there is no safe way to
+/// interrupt a running `systemctl` subprocess mid-syscall); it keeps running
+/// detached on the blocking pool and its eventual result/panic is silently
+/// discarded (for `ExclusiveGuard::acquire` specifically, this is actually
+/// benign: if it eventually succeeds, the guard's own `Drop` releases the
+/// lock the moment the abandoned `JoinHandle`'s output is dropped).
+///
+/// ## Why this exists (real hang caught in review)
+/// `gpu_authority::acquire`'s reconciliation path (`systemctl restart
+/// ollama.service` / `stop <competing units>`) has NO timeout of its own.
+/// [`LiveRetestHook::retest`] calls it from INSIDE the supervisor daemon's
+/// single tick loop — [`super::supervisor::tick`] is invoked via
+/// `block_in_place` + `Handle::current().block_on` from the daemon's ONLY
+/// task ([`super::supervisor::run`]'s `tokio::select!` loop) — precisely in
+/// the scenario (a GPU already pegged/jammed, which is the exact
+/// precondition for `handle_repeat_stuck` firing at all) where a `systemctl`
+/// operation is most likely to itself hang. Without this wrapper, a hung
+/// `systemctl` call would wedge the daemon FOREVER: no further ticks for any
+/// combo, and no prompt SIGTERM response either (the same task drives both).
+/// Bounding just this one call caps the damage at `timeout`, regardless of
+/// what the synchronous call underneath actually does.
+async fn bounded_blocking<T, F>(timeout: Duration, f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let handle = tokio::task::spawn_blocking(f);
+    match tokio::time::timeout(timeout, handle).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(join_err)) => Err(format!("blocking task panicked: {join_err}")),
+        Err(_elapsed) => Err(format!(
+            "timed out after {}s (task left running detached; systemctl-hang guard)",
+            timeout.as_secs()
+        )),
+    }
+}
+
 /// Live [`RetestHook`]: acquires the GPU exclusively under
 /// [`BREAKFIX_GPU_HOLDER`], picks the FIRST case in the v2 corpus manifest as
 /// a stable, fast representative case (a full diagnostic corpus sweep is out
@@ -496,11 +561,24 @@ impl RetestHook for LiveRetestHook {
         };
         let case_id = cases[0].id.clone();
 
-        let _guard = match gpu_authority::ExclusiveGuard::acquire(GpuMode::Exclusive, BREAKFIX_GPU_HOLDER) {
-            Ok(g) => g,
-            Err(e) => {
+        // Bounded — see `bounded_blocking`'s doc for the exact hang this
+        // guards against (an unbounded `systemctl` call inside `acquire`,
+        // called from the daemon's single tick task).
+        let acquire_timeout = Duration::from_secs(config::breakfix_gpu_acquire_timeout_secs());
+        let _guard = match bounded_blocking(acquire_timeout, || {
+            gpu_authority::ExclusiveGuard::acquire(GpuMode::Exclusive, BREAKFIX_GPU_HOLDER)
+        })
+        .await
+        {
+            Ok(Ok(g)) => g,
+            Ok(Err(e)) => {
                 return RetestResult::Failure {
                     error_class: format!("gpu_authority_unavailable: {e}"),
+                }
+            }
+            Err(bound_err) => {
+                return RetestResult::Failure {
+                    error_class: format!("gpu_authority_acquire_{bound_err}"),
                 }
             }
         };
@@ -841,6 +919,26 @@ fn log_breakfix(line: &str) {
 /// The Phase-4 [`BreakfixHandler`] implementation. Constructed once at daemon
 /// startup ([`SubagentBreakfix::new`]) with the real reasoning-backend chain
 /// and a live Postgres pool.
+///
+/// ## Known scope limitation (flagged for the operator, not fixed here)
+/// `supervisor::tick` calls `handle_repeat_stuck` (this handler) BEFORE its
+/// own normal restart-recovery block for the SAME stuck event — that
+/// ordering predates Phase 4 and this change does not reorder it (`tick`'s
+/// own module doc explicitly says Phase 4 plugs into the existing seam
+/// "without touching this loop"). [`bounded_blocking`] caps how long this
+/// handler itself can block that ordering on, but a reviewer's suggestion to
+/// ALSO refuse to retest while `gpu_busy_percent` still reads pegged
+/// (extra defense against retrying onto an actually-wedged GPU, on top of
+/// the existing GPU-authority advisory lock) was deliberately NOT added:
+/// `handle_repeat_stuck` only ever fires from a tick that JUST measured
+/// `gpu_busy >= GPU_BUSY_MIN` (that reading is literally why this tick is
+/// `Stuck` in the first place, per `compute_verdict`) and BEFORE this same
+/// tick's own restart-recovery has run — so a naive "skip if busy" gate would
+/// misfire and skip EVERY retest attempt on the very first repeat-stuck tick,
+/// defeating the whole mechanism. Correctly implementing that extra defense
+/// needs the retest to happen AFTER a restart has had a chance to settle
+/// (i.e. reordering `tick`, a bigger change with its own test surface) —
+/// left as a follow-up rather than risking an always-skip regression here.
 pub struct SubagentBreakfix {
     backend: Arc<dyn ReasoningBackend>,
     pool: PgPool,
@@ -1067,8 +1165,14 @@ mod tests {
     }
 
     // ---- Env sanitization ----
+    //
+    // Both tests mutate PROCESS-GLOBAL env vars via `std::env::set_var`, which
+    // races other tests under cargo's default parallel execution — `#[serial]`
+    // (already used for exactly this hazard by the analogous new tests in
+    // `config.rs` from this same change) forces them to run one at a time.
 
     #[test]
+    #[serial_test::serial]
     fn sanitized_env_never_includes_secret_shaped_keys() {
         std::env::set_var("SOME_API_TOKEN", "leaked-if-present");
         std::env::set_var("INFISICAL_CLIENT_SECRET", "leaked-if-present");
@@ -1089,6 +1193,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn sanitized_env_only_contains_allowlisted_keys() {
         std::env::set_var("SOME_RANDOM_HARMLESS_VAR", "value");
         let env = sanitized_child_env();
@@ -1343,6 +1448,46 @@ mod tests {
             }
             other => panic!("expected escalate on double-unavailable, got {other:?}"),
         }
+    }
+
+    // ---- bounded_blocking (systemctl-hang guard) ----
+
+    #[tokio::test]
+    async fn bounded_blocking_returns_promptly_even_if_closure_keeps_running() {
+        // The closure "hangs" for 2s (standing in for a wedged `systemctl`
+        // call); the timeout is 50ms. The wrapper must return in well under
+        // the closure's full duration — proving a hung synchronous call
+        // cannot block the caller past `timeout`, which is the entire point
+        // (see module doc: this runs inside the daemon's single tick task).
+        let start = std::time::Instant::now();
+        let result: Result<u32, String> = bounded_blocking(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_secs(2));
+            42
+        })
+        .await;
+        assert!(
+            start.elapsed() < Duration::from_millis(1000),
+            "must return promptly on timeout, not wait for the full 2s closure (took {:?})",
+            start.elapsed()
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn bounded_blocking_returns_value_when_closure_finishes_before_timeout() {
+        let result = bounded_blocking(Duration::from_secs(5), || 7u32).await;
+        assert_eq!(result, Ok(7));
+    }
+
+    #[tokio::test]
+    async fn bounded_blocking_surfaces_panic_as_err_not_a_crash() {
+        let result: Result<u32, String> = bounded_blocking(Duration::from_secs(5), || {
+            panic!("boom");
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("panicked"));
     }
 
     // ---- mint_dropped_configs write path (SQL-shape unit test — no live DB) ----
