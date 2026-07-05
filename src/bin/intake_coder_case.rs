@@ -23,5 +23,6 @@ use terminus_rs::intake::coder_case;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> std::process::ExitCode {
+    terminus_rs::intake::init_tracing();
     coder_case::run_from_env().await
 }

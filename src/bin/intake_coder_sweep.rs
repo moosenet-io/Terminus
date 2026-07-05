@@ -36,6 +36,7 @@ use terminus_rs::intake::coder_sweep;
 // current-thread runtime risks deadlocking the inner inference futures.
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> std::process::ExitCode {
+    terminus_rs::intake::init_tracing();
     let langs = coder_sweep::langs_from_env();
     let case_limit = coder_sweep::case_limit_from_env();
     let mem_config = coder_sweep::mem_config_from_env();

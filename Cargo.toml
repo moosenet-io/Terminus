@@ -33,6 +33,11 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 thiserror = "1.0"
 tracing = "0.1"
+# Installed by intake::init_tracing() -- without a subscriber, tracing::{info,
+# warn,error}! calls are silently dropped (no panic, no error, just nowhere to
+# go), which is exactly what made the acquire-backoff fix's progress logging
+# invisible in production. env-filter lets RUST_LOG tune verbosity per unit.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1"
 # MINT Phase 1: the unified `mint` CLI binary (src/bin/mint.rs) uses clap's
 # derive API for its subcommand tree.

@@ -34,6 +34,7 @@ fn print_usage() {
 }
 
 fn main() -> std::process::ExitCode {
+    terminus_rs::intake::init_tracing();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("status") => {

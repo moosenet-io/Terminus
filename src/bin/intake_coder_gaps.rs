@@ -24,5 +24,6 @@ use terminus_rs::intake::coder_gaps;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> std::process::ExitCode {
+    terminus_rs::intake::init_tracing();
     coder_gaps::run_from_env().await
 }
