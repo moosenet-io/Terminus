@@ -24,7 +24,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use terminus_rs::intake::{
     assistant::{runner, schema},
-    coder_case, coder_gaps, coder_sweep, gpu_authority,
+    coder_case, coder_gaps, coder_sweep, gpu_authority, infer,
 };
 
 #[derive(Parser)]
@@ -59,6 +59,13 @@ enum Command {
         /// mem_config tag. Falls back to SWEEP_MEM_CONFIG.
         #[arg(long = "mem-config")]
         mem_config: Option<String>,
+        /// MINT Phase 6: redirect the default ollama backend's inference to a
+        /// remote host (`host:port` or full URL). Falls back to
+        /// MINT_REMOTE_OLLAMA_URL. The harness still runs (and locks the GPU)
+        /// locally; only the inference target moves. Models pinned to a
+        /// non-default backend keep their own routing.
+        #[arg(long)]
+        remote: Option<String>,
     },
     /// Find which v2 code-suite case ids a model is missing valid data for.
     Gaps {
@@ -93,9 +100,21 @@ enum SweepTarget {
         /// mem_config tag. Falls back to SWEEP_MEM_CONFIG.
         #[arg(long = "mem-config")]
         mem_config: Option<String>,
+        /// MINT Phase 6: redirect the default ollama backend's inference to a
+        /// remote host (`host:port` or full URL). Falls back to
+        /// MINT_REMOTE_OLLAMA_URL. See `mint case --help` for the composition
+        /// rule with per-model backend routing.
+        #[arg(long)]
+        remote: Option<String>,
     },
     /// The S84 consolidated assistant profiling sweep.
-    Assistant,
+    Assistant {
+        /// MINT Phase 6: redirect the default ollama backend's inference to a
+        /// remote host (`host:port` or full URL). Falls back to
+        /// MINT_REMOTE_OLLAMA_URL.
+        #[arg(long)]
+        remote: Option<String>,
+    },
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -146,6 +165,31 @@ fn env_opt(key: &str) -> Option<String> {
     std::env::var(key).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
+/// MINT Phase 6: normalize a `--remote` value to an Ollama base URL. A bare
+/// `host:port` (no scheme) becomes an `http://` URL (`pvf2:11434` ⇒
+/// `http://pvf2:11434`); an explicit `http://`/`https://` value passes through.
+/// A trailing slash is trimmed (matching `context::ollama_base`).
+fn normalize_remote_url(raw: &str) -> String {
+    let s = raw.trim().trim_end_matches('/');
+    if s.starts_with("http://") || s.starts_with("https://") {
+        s.to_string()
+    } else {
+        format!("http://{s}")
+    }
+}
+
+/// MINT Phase 6: resolve the remote inference-target override. The CLI `--remote`
+/// flag wins over the `MINT_REMOTE_OLLAMA_URL` env var (same flag-wins precedent
+/// as [`resolved_string`]); a blank value from either source is treated as unset.
+/// The resolved value is normalized via [`normalize_remote_url`]. `None` means
+/// "no override" — inference targets the default `context::ollama_base()`.
+fn resolve_remote_url(cli: Option<String>) -> Option<String> {
+    resolved_string(cli, || env_opt("MINT_REMOTE_OLLAMA_URL"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| normalize_remote_url(&s))
+}
+
 /// MINT Phase 2 item 5: connect + migrate the shared intake schema ONCE,
 /// explicitly, at `mint`'s own entry point — in ADDITION to (not instead of)
 /// each library `run` function's own defensive `migrate()` call, so the
@@ -186,7 +230,7 @@ async fn main() -> std::process::ExitCode {
 
     match cli.command {
         Command::Sweep { target } => match target {
-            SweepTarget::Coder { langs, case_limit, mem_config } => {
+            SweepTarget::Coder { langs, case_limit, mem_config, remote } => {
                 let langs = match langs {
                     Some(s) => coder_sweep::parse_langs(Some(&s)),
                     None => coder_sweep::langs_from_env(),
@@ -194,6 +238,9 @@ async fn main() -> std::process::ExitCode {
                 let case_limit =
                     coder_sweep::normalize_case_limit(case_limit).or_else(coder_sweep::case_limit_from_env);
                 let mem_config = resolved_string(mem_config, coder_sweep::mem_config_from_env);
+                // Phase 6: install the remote inference-target override (if any)
+                // before the sweep runs. Process-global; intake runs sequentially.
+                infer::set_remote_ollama_url(resolve_remote_url(remote));
 
                 // Item 7: `mint`'s dispatcher pre-acquires the GPU-authority
                 // guard under the EXACT SAME holder label `coder_sweep::run`
@@ -221,7 +268,9 @@ async fn main() -> std::process::ExitCode {
                 };
                 coder_sweep::run(&langs, case_limit, mem_config.as_deref()).await
             }
-            SweepTarget::Assistant => {
+            SweepTarget::Assistant { remote } => {
+                // Phase 6: install the remote inference-target override (if any).
+                infer::set_remote_ollama_url(resolve_remote_url(remote));
                 // Item 7: same pattern as `Sweep::Coder`, under
                 // `runner::GPU_HOLDER` — the exact label `runner::run`
                 // acquires internally.
@@ -258,7 +307,9 @@ async fn main() -> std::process::ExitCode {
             }
         },
 
-        Command::Case { model, ids, backend, langs, mem_config } => {
+        Command::Case { model, ids, backend, langs, mem_config, remote } => {
+            // Phase 6: install the remote inference-target override (if any).
+            infer::set_remote_ollama_url(resolve_remote_url(remote));
             let model = resolved_string(model, || env_opt("INTAKE_CASE_MODEL"));
             let ids_raw = resolved_string(ids, || env_opt("INTAKE_CASE_IDS"));
             let case_ids = match ids_raw {
@@ -378,11 +429,12 @@ mod tests {
         .expect("parses");
         match cli.command {
             Command::Sweep {
-                target: SweepTarget::Coder { langs, case_limit, mem_config },
+                target: SweepTarget::Coder { langs, case_limit, mem_config, remote },
             } => {
                 assert_eq!(langs.as_deref(), Some("rust,python"));
                 assert_eq!(case_limit, Some(5));
                 assert_eq!(mem_config.as_deref(), Some("carveout"));
+                assert!(remote.is_none());
             }
             _ => panic!("expected Sweep(Coder)"),
         }
@@ -393,11 +445,12 @@ mod tests {
         let cli = Cli::try_parse_from(["mint", "sweep", "coder"]).expect("parses");
         match cli.command {
             Command::Sweep {
-                target: SweepTarget::Coder { langs, case_limit, mem_config },
+                target: SweepTarget::Coder { langs, case_limit, mem_config, remote },
             } => {
                 assert!(langs.is_none());
                 assert!(case_limit.is_none());
                 assert!(mem_config.is_none());
+                assert!(remote.is_none());
             }
             _ => panic!("expected Sweep(Coder)"),
         }
@@ -406,10 +459,34 @@ mod tests {
     #[test]
     fn sweep_assistant_parses_with_no_flags() {
         let cli = Cli::try_parse_from(["mint", "sweep", "assistant"]).expect("parses");
-        assert!(matches!(
-            cli.command,
-            Command::Sweep { target: SweepTarget::Assistant }
-        ));
+        match cli.command {
+            Command::Sweep { target: SweepTarget::Assistant { remote } } => assert!(remote.is_none()),
+            _ => panic!("expected Sweep(Assistant)"),
+        }
+    }
+
+    #[test]
+    fn sweep_assistant_parses_remote_flag() {
+        let cli = Cli::try_parse_from(["mint", "sweep", "assistant", "--remote", "pvf2:11434"])
+            .expect("parses");
+        match cli.command {
+            Command::Sweep { target: SweepTarget::Assistant { remote } } => {
+                assert_eq!(remote.as_deref(), Some("pvf2:11434"));
+            }
+            _ => panic!("expected Sweep(Assistant)"),
+        }
+    }
+
+    #[test]
+    fn sweep_coder_parses_remote_flag() {
+        let cli = Cli::try_parse_from(["mint", "sweep", "coder", "--remote", "http://pvf2:11434"])
+            .expect("parses");
+        match cli.command {
+            Command::Sweep { target: SweepTarget::Coder { remote, .. } } => {
+                assert_eq!(remote.as_deref(), Some("http://pvf2:11434"));
+            }
+            _ => panic!("expected Sweep(Coder)"),
+        }
     }
 
     #[test]
@@ -430,12 +507,13 @@ mod tests {
         ])
         .expect("parses");
         match cli.command {
-            Command::Case { model, ids, backend, langs, mem_config } => {
+            Command::Case { model, ids, backend, langs, mem_config, remote } => {
                 assert_eq!(model.as_deref(), Some("qwen3-coder:30b"));
                 assert_eq!(ids.as_deref(), Some("r-001,r-002"));
                 assert_eq!(backend.as_deref(), Some("cpu"));
                 assert_eq!(langs.as_deref(), Some("rust"));
                 assert_eq!(mem_config.as_deref(), Some("dynamic_gtt"));
+                assert!(remote.is_none());
             }
             _ => panic!("expected Case"),
         }
@@ -445,13 +523,23 @@ mod tests {
     fn case_flags_default_to_none() {
         let cli = Cli::try_parse_from(["mint", "case"]).expect("parses");
         match cli.command {
-            Command::Case { model, ids, backend, langs, mem_config } => {
+            Command::Case { model, ids, backend, langs, mem_config, remote } => {
                 assert!(model.is_none());
                 assert!(ids.is_none());
                 assert!(backend.is_none());
                 assert!(langs.is_none());
                 assert!(mem_config.is_none());
+                assert!(remote.is_none());
             }
+            _ => panic!("expected Case"),
+        }
+    }
+
+    #[test]
+    fn case_parses_remote_flag() {
+        let cli = Cli::try_parse_from(["mint", "case", "--remote", "pvf2:11434"]).expect("parses");
+        match cli.command {
+            Command::Case { remote, .. } => assert_eq!(remote.as_deref(), Some("pvf2:11434")),
             _ => panic!("expected Case"),
         }
     }
@@ -643,6 +731,57 @@ mod tests {
             Some(5),
             "--case-limit 0 with INTAKE_CODE_CASE_LIMIT=5 set must defer to the env value"
         );
+    }
+
+    // ---- MINT Phase 6: --remote resolution + normalization ----
+
+    #[test]
+    fn normalize_remote_url_adds_scheme_to_bare_host_port() {
+        assert_eq!(normalize_remote_url("pvf2:11434"), "http://pvf2:11434");
+    }
+
+    #[test]
+    fn normalize_remote_url_passes_through_explicit_scheme() {
+        assert_eq!(normalize_remote_url("http://pvf2:11434"), "http://pvf2:11434");
+        assert_eq!(normalize_remote_url("https://gpu.host:443"), "https://gpu.host:443");
+    }
+
+    #[test]
+    fn normalize_remote_url_trims_trailing_slash_and_whitespace() {
+        assert_eq!(normalize_remote_url("  http://pvf2:11434/  "), "http://pvf2:11434");
+        assert_eq!(normalize_remote_url("pvf2:11434/"), "http://pvf2:11434");
+    }
+
+    #[test]
+    fn resolve_remote_url_cli_wins_over_env_and_normalizes() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("MINT_REMOTE_OLLAMA_URL", "env-host:11434");
+        let got = resolve_remote_url(Some("pvf2:11434".to_string()));
+        std::env::remove_var("MINT_REMOTE_OLLAMA_URL");
+        assert_eq!(got.as_deref(), Some("http://pvf2:11434"));
+    }
+
+    #[test]
+    fn resolve_remote_url_falls_back_to_env_when_flag_omitted() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("MINT_REMOTE_OLLAMA_URL", "http://env-host:11434");
+        let got = resolve_remote_url(None);
+        std::env::remove_var("MINT_REMOTE_OLLAMA_URL");
+        assert_eq!(got.as_deref(), Some("http://env-host:11434"));
+    }
+
+    #[test]
+    fn resolve_remote_url_none_when_both_absent() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("MINT_REMOTE_OLLAMA_URL");
+        assert!(resolve_remote_url(None).is_none());
+    }
+
+    #[test]
+    fn resolve_remote_url_blank_flag_treated_as_unset() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("MINT_REMOTE_OLLAMA_URL");
+        assert!(resolve_remote_url(Some("   ".to_string())).is_none());
     }
 
     // ---- needs_schema_migrate (item 5) ----
