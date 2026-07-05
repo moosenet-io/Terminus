@@ -94,7 +94,17 @@ pub const TICK_INTERVAL_SEC: u64 = 90;
 // ── NEW: repeat-stuck escalation window ──────────────────────────────────────
 
 /// Rolling window over which repeat-stuck recoveries for one combo are counted.
-pub const REPEAT_STUCK_WINDOW_SEC: u64 = 3600;
+///
+/// Caught in review: this MUST be meaningfully larger than
+/// [`RECOVERY_COOLDOWN_SEC`], not equal to it. `RECOVERY_COOLDOWN_SEC` forces
+/// at least a 1-hour gap between any two recoveries, so getting
+/// [`REPEAT_STUCK_THRESHOLD`] (3) recoveries for the SAME combo takes at
+/// least 2 full cooldown gaps end-to-end (~2h) before the 3rd fires — if the
+/// window were also 1h, the 1st recovery would already have aged out of the
+/// window by the time the 2nd is even allowed to happen, making escalation
+/// mathematically unreachable. Four hours gives a full cooldown's worth of
+/// slack beyond the ~2h physical minimum.
+pub const REPEAT_STUCK_WINDOW_SEC: u64 = 4 * RECOVERY_COOLDOWN_SEC;
 
 /// How many stuck-recoveries of the SAME combo within
 /// [`REPEAT_STUCK_WINDOW_SEC`] constitute "repeat-stuck" (escalation).
@@ -1189,5 +1199,43 @@ mod tests {
         // AND the safe-fallback restart-recovery still happened.
         assert_eq!(rec.restarted_ollama, 1);
         assert_eq!(rec.restarted_sweep, 1);
+    }
+
+    #[test]
+    fn repeat_stuck_is_reachable_via_realistic_cooldown_spaced_recoveries() {
+        // Caught in review: the OTHER repeat-stuck test above seeds recoveries
+        // only 50-100s apart, a sequence `should_recover`'s cooldown gate would
+        // never actually produce (recoveries for a combo are always >=
+        // RECOVERY_COOLDOWN_SEC apart in real ticks). That let the window
+        // constant regress to a value (equal to the cooldown) that made
+        // 3-in-a-row escalation mathematically unreachable in the real daemon
+        // even though the isolated unit test still passed. This test instead
+        // seeds two PRIOR recoveries at the minimum spacing `should_recover`
+        // actually permits (just over `RECOVERY_COOLDOWN_SEC` apart, folded
+        // back from `now`) and asserts they are BOTH still inside
+        // `REPEAT_STUCK_WINDOW_SEC` — i.e. that the window is wide enough for
+        // a real, cooldown-respecting sequence to reach the 3rd recovery
+        // before the 1st ages out.
+        let now = 10_000_000u64;
+        let recovery_2 = now - (RECOVERY_COOLDOWN_SEC + 1); // just past cooldown before now
+        let recovery_1 = recovery_2 - (RECOVERY_COOLDOWN_SEC + 1); // just past cooldown before recovery_2
+        assert!(
+            should_recover(recovery_2, recovery_1),
+            "recovery_2 must be a real, cooldown-permitted recovery after recovery_1"
+        );
+        assert!(
+            should_recover(now, recovery_2),
+            "the 3rd (current) recovery must be cooldown-permitted after recovery_2"
+        );
+        // With realistically-spaced history, the 3rd recovery at `now` must
+        // actually be classified repeat-stuck — this is the exact scenario
+        // that was unreachable before REPEAT_STUCK_WINDOW_SEC was widened.
+        // All three recoveries (the two prior plus the current one at `now`)
+        // must fall within REPEAT_STUCK_WINDOW_SEC for this to trip.
+        assert!(
+            is_repeat_stuck(&[recovery_1, recovery_2, now], now),
+            "REPEAT_STUCK_WINDOW_SEC ({REPEAT_STUCK_WINDOW_SEC}s) must be wide enough to still \
+             count a recovery from ~2 cooldown-periods ago"
+        );
     }
 }
