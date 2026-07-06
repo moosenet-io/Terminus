@@ -87,6 +87,12 @@ pub enum Verdict {
     Codefix { detail: String },
     /// Hand off to a human; no further automated action.
     Escalate { reason: String },
+    /// MINT Phase 5: the combo may be jammed because the model itself is
+    /// missing/corrupt on this host (not a config problem) — re-pull it via
+    /// Chord's `PullCoordinator` before retesting. Takes no arguments: unlike
+    /// `retry(config=...)`, there is nothing to parametrize (the model id is
+    /// already known from `combo`).
+    FetchModel,
 }
 
 /// Parse the backend's structured verdict. Deterministic: scans for a line
@@ -120,6 +126,11 @@ pub fn parse_verdict(text: &str) -> Verdict {
         if let Some(inner) = strip_call(rest, "escalate") {
             let reason = extract_kv(inner, "reason").unwrap_or_else(|| inner.to_string());
             return Verdict::Escalate { reason };
+        }
+        if strip_call(rest, "fetch_model").is_some() {
+            // Takes no meaningful args — any inner content is ignored (the
+            // model id comes from `combo`, not the verdict payload).
+            return Verdict::FetchModel;
         }
         // A `VERDICT:` line IS present but doesn't match any known form —
         // still a deterministic, clearly-labeled escalate, not a silent guess.
@@ -625,6 +636,89 @@ impl RetestHook for LiveRetestHook {
     }
 }
 
+// ── MINT Phase 5: fetch-model tool ───────────────────────────────────────────
+
+/// What a [`FetchModelHook`] call resolved to. Collapses
+/// [`super::chord_pull::PullOutcome`]'s several failure variants into one
+/// labeled `Failed` — same shape discipline as [`RetestResult`] (a success
+/// sentinel + a short, stable label fed back into the next reasoning-backend
+/// prompt as evidence), not a raw error string threaded deep into the loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchModelOutcome {
+    /// Chord reports the model is now warm (present locally) — covers both a
+    /// freshly completed pull and a model that was already warm (see
+    /// `chord_pull`'s module doc: Chord's own response does not distinguish
+    /// the two, so neither does this).
+    Warmed,
+    /// Anything else (unknown model, disk space, auth, unreachable, generic
+    /// failure) — `reason` is a short, stable classification for the prompt.
+    Failed { reason: String },
+}
+
+/// Abstracted so tests inject a scripted mock and never make a real HTTP call
+/// to Chord — same reasoning as [`RetestHook`].
+#[async_trait::async_trait]
+pub trait FetchModelHook: Send + Sync {
+    async fn fetch_model(&self, model: &str) -> FetchModelOutcome;
+}
+
+/// Live [`FetchModelHook`]: delegates straight to
+/// [`super::chord_pull::fetch_model`]. No GPU-authority acquire here — unlike
+/// [`LiveRetestHook`], pulling a model from Chord's archive does not touch
+/// this host's GPU at all; only the RETEST step that follows a successful
+/// fetch needs (and takes) the GPU lock.
+pub struct LiveFetchModelHook;
+
+#[async_trait::async_trait]
+impl FetchModelHook for LiveFetchModelHook {
+    async fn fetch_model(&self, model: &str) -> FetchModelOutcome {
+        match super::chord_pull::fetch_model(model).await {
+            Ok(super::chord_pull::PullOutcome::Warmed { .. }) => FetchModelOutcome::Warmed,
+            Ok(other) => FetchModelOutcome::Failed {
+                reason: format!("{other:?}"),
+            },
+            Err(e) => FetchModelOutcome::Failed {
+                reason: e.to_string(),
+            },
+        }
+    }
+}
+
+/// Bound a [`FetchModelHook`] call with a DEDICATED, tighter timeout
+/// (`config::breakfix_fetch_model_timeout_secs`, default 120s) than
+/// `chord_pull::fetch_model`'s own generous HTTP timeout
+/// (`MINT_FETCH_MODEL_TIMEOUT_SECS`, default 600s — sized for an operator's
+/// CLI call legitimately waiting out a large archive copy).
+///
+/// ## Why this exists (adversarial-review finding, MINT Phase 5)
+/// [`decide_breakfix`] runs inside the supervisor daemon's single tick task
+/// (the same `block_in_place` + `block_on` bridge [`bounded_blocking`]
+/// documents). A merely SLOW — not even fully hung — Chord could otherwise
+/// stall that task, and therefore every other combo's tick, for up to the
+/// full 600s HTTP timeout, per attempt, up to [`MAX_ATTEMPTS`] times. Unlike
+/// [`bounded_blocking`] (which exists for a TRULY synchronous, unawaitable
+/// blocking call — `gpu_authority::acquire`'s `systemctl` shell-out — and so
+/// needs `spawn_blocking` to escape it), a [`FetchModelHook`] call is already
+/// a plain `async fn`; a `tokio::time::timeout` alone is sufficient to bound
+/// it without a dedicated OS thread.
+///
+/// A timeout here is NOT treated as fatal — it resolves to
+/// [`FetchModelOutcome::Failed`], exactly like any other fetch failure, so
+/// the existing "skip the retest, feed the failure back as evidence for the
+/// next attempt" handling in [`decide_breakfix`] applies unchanged. A pull
+/// that genuinely needs more than this bound simply isn't finished THIS
+/// attempt — the next attempt (if the reasoning backend asks for one) tries
+/// again, rather than the daemon being stuck waiting for it.
+async fn fetch_model_bounded(fetch_hook: &dyn FetchModelHook, model: &str) -> FetchModelOutcome {
+    let bound = Duration::from_secs(config::breakfix_fetch_model_timeout_secs());
+    match tokio::time::timeout(bound, fetch_hook.fetch_model(model)).await {
+        Ok(outcome) => outcome,
+        Err(_elapsed) => FetchModelOutcome::Failed {
+            reason: format!("fetch_model timed out after {}s", bound.as_secs()),
+        },
+    }
+}
+
 // ── Bounded decision loop (pure over traits — the tested core) ──────────────
 
 /// The handler's final decision for one repeat-stuck escalation.
@@ -679,10 +773,13 @@ fn build_prompt(
     p.push_str(
         "\nDecide one of: retry an alternate config (propose backend and/or mem_config \
          overrides, format `key:value[,key:value]`, e.g. `backend:cpu,mem_config:carveout`), \
-         drop this config permanently, request a code fix (out of scope for automatic \
-         execution this phase — will be logged and escalated), or escalate to a human.\n\
+         re-pull the model itself from the archive if it may be missing or corrupt on this \
+         host (not a config problem), drop this config permanently, request a code fix (out \
+         of scope for automatic execution this phase — will be logged and escalated), or \
+         escalate to a human.\n\
          Your reply MUST end with EXACTLY one line in this format (nothing after it):\n\
-         VERDICT: retry(config=...) | drop(reason=...) | codefix(...) | escalate(reason=...)\n",
+         VERDICT: retry(config=...) | fetch_model() | drop(reason=...) | codefix(...) | \
+         escalate(reason=...)\n",
     );
     p
 }
@@ -692,26 +789,42 @@ fn build_prompt(
 ///
 /// ## Termination argument (why this can never loop unbounded)
 /// The `for attempt in 1..=MAX_ATTEMPTS` loop only continues past an
-/// iteration on `Verdict::Retry` + `RetestResult::Failure` — every OTHER
-/// combination (`Drop`, `Escalate`, `Codefix`, a `Retry` whose retest
-/// SUCCEEDS, or the backend itself being `Unavailable`) returns immediately.
-/// So the only way to reach `attempt == MAX_ATTEMPTS` without returning is an
-/// adversarial (or genuinely persistent) backend that says `retry` every
-/// single time AND every retest fails — and even then, the loop body itself
-/// is bounded by the `for` range: after the `MAX_ATTEMPTS`-th iteration the
-/// loop simply ends, and the function falls through to a forced `Drop`
-/// below. There is no recursion, no unbounded `loop {}`, and no path that
-/// re-enters the loop after it ends — this is proven by
-/// `tests::adversarial_always_retry_backend_terminates_at_budget`, which
-/// injects a mock backend that ALWAYS replies `retry` and a mock retest hook
-/// that ALWAYS fails, and asserts both that the backend/retest were each
-/// called exactly [`MAX_ATTEMPTS`] times and that the function returns
-/// (rather than hanging) with a `Drop` decision.
+/// iteration on `Verdict::Retry` + `RetestResult::Failure`, or
+/// `Verdict::FetchModel` + a failed fetch/retest (MINT Phase 5 — see below)
+/// — every OTHER combination (`Drop`, `Escalate`, `Codefix`, a `Retry`/
+/// `FetchModel` whose retest SUCCEEDS, or the backend itself being
+/// `Unavailable`) returns immediately. So the only way to reach `attempt ==
+/// MAX_ATTEMPTS` without returning is an adversarial (or genuinely
+/// persistent) backend that says `retry`/`fetch_model` every single time AND
+/// every retest fails — and even then, the loop body itself is bounded by
+/// the `for` range: after the `MAX_ATTEMPTS`-th iteration the loop simply
+/// ends, and the function falls through to a forced `Drop` below. There is
+/// no recursion, no unbounded `loop {}`, and no path that re-enters the loop
+/// after it ends — this is proven by
+/// `tests::adversarial_always_retry_backend_terminates_at_budget` (the
+/// `retry` path) and
+/// `tests::adversarial_always_fetch_model_backend_terminates_at_budget` (the
+/// `fetch_model` path), which each inject a mock backend that ALWAYS replies
+/// with the verdict under test and a mock hook that ALWAYS fails, and assert
+/// both that the backend/hook were each called exactly [`MAX_ATTEMPTS`]
+/// times and that the function returns (rather than hanging) with a `Drop`
+/// decision.
+///
+/// ## MINT Phase 5: `fetch_model` verdict handling
+/// One attempt to re-pull the model via [`FetchModelHook::fetch_model`],
+/// THEN one single-case retest to actually verify the fix — never trusts a
+/// successful pull blindly, same discipline as a config `retry`. If the pull
+/// itself fails (unknown model, disk space, auth, unreachable Chord, ...),
+/// the retest is skipped (nothing on this host could plausibly have changed)
+/// and the pull failure is fed back directly as evidence for the next
+/// attempt — avoiding a wasted, potentially GPU-acquiring retest whose
+/// outcome is already known.
 pub async fn decide_breakfix(
     combo: &ComboKey,
     recovery_count: usize,
     backend: &dyn ReasoningBackend,
     retest: &dyn RetestHook,
+    fetch_hook: &dyn FetchModelHook,
     context: &str,
 ) -> Decision {
     let mut last_error_class: Option<String> = None;
@@ -752,16 +865,34 @@ pub async fn decide_breakfix(
             Verdict::Escalate { reason } => {
                 return Decision::Escalate { reason, attempts: attempt };
             }
+            Verdict::FetchModel => match fetch_model_bounded(fetch_hook, &combo.model).await {
+                FetchModelOutcome::Warmed => match retest.retest(combo, "").await {
+                    RetestResult::Success => return Decision::Resolved,
+                    RetestResult::Failure { error_class } => {
+                        last_error_class =
+                            Some(format!("post-fetch_model retest failed: {error_class}"));
+                        continue;
+                    }
+                },
+                FetchModelOutcome::Failed { reason } => {
+                    // The pull itself didn't happen — nothing on this host
+                    // could plausibly have changed, so skip the (potentially
+                    // GPU-acquiring) retest and feed the pull failure back
+                    // directly as evidence for the next attempt.
+                    last_error_class = Some(format!("fetch_model failed: {reason}"));
+                    continue;
+                }
+            },
         }
     }
 
-    // Budget exhausted: every attempt proposed `retry` and every retest
-    // failed. MUST resolve now — never loop unbounded. A `Drop` (not
-    // `Escalate`) because we have concrete, repeated retest-failure evidence
-    // that this exact combo does not work; that is exactly what
-    // `mint_dropped_configs` exists to record.
+    // Budget exhausted: every attempt proposed `retry`/`fetch_model` and every
+    // retest (or the fetch itself) failed. MUST resolve now — never loop
+    // unbounded. A `Drop` (not `Escalate`) because we have concrete, repeated
+    // failure evidence that this exact combo does not work; that is exactly
+    // what `mint_dropped_configs` exists to record.
     Decision::Drop {
-        reason: "attempt budget exhausted: all retry attempts' retests failed".to_string(),
+        reason: "attempt budget exhausted: all retry/fetch_model attempts failed".to_string(),
         attempts: MAX_ATTEMPTS,
         last_error_class: last_error_class.unwrap_or_else(|| "none".to_string()),
     }
@@ -966,6 +1097,7 @@ impl SubagentBreakfix {
             recovery_count,
             self.backend.as_ref(),
             &LiveRetestHook,
+            &LiveFetchModelHook,
             &context,
         )
         .await;
@@ -1054,6 +1186,17 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// A [`FetchModelHook`] that panics if invoked — used by every test whose
+    /// mock backend never emits a `fetch_model` verdict, to prove the loop
+    /// truly never calls it for those paths.
+    struct NeverCalledFetch;
+    #[async_trait::async_trait]
+    impl FetchModelHook for NeverCalledFetch {
+        async fn fetch_model(&self, _model: &str) -> FetchModelOutcome {
+            panic!("fetch_model must not be called for this verdict path");
+        }
+    }
+
     // ---- VERDICT-line parsing: all 4 variants + malformed/missing ----
 
     #[test]
@@ -1108,6 +1251,16 @@ mod tests {
             Verdict::Escalate {
                 reason: "needs operator judgment".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn parses_fetch_model_verdict() {
+        assert_eq!(parse_verdict("VERDICT: fetch_model()"), Verdict::FetchModel);
+        // Any inner content is ignored — the model id comes from `combo`.
+        assert_eq!(
+            parse_verdict("some reasoning\nVERDICT: fetch_model(model may be corrupt)"),
+            Verdict::FetchModel
         );
     }
 
@@ -1253,7 +1406,7 @@ mod tests {
         let retest = AlwaysFailRetest { calls: Mutex::new(0) };
         let combo = test_combo();
 
-        let decision = decide_breakfix(&combo, 3, &backend, &retest, "ctx").await;
+        let decision = decide_breakfix(&combo, 3, &backend, &retest, &NeverCalledFetch, "ctx").await;
 
         assert_eq!(*backend.calls.lock().unwrap(), MAX_ATTEMPTS as u32);
         assert_eq!(*retest.calls.lock().unwrap(), MAX_ATTEMPTS as u32);
@@ -1286,7 +1439,7 @@ mod tests {
         let retest = SucceedOnThirdRetest { calls: Mutex::new(0) };
         let combo = test_combo();
 
-        let decision = decide_breakfix(&combo, 3, &backend, &retest, "ctx").await;
+        let decision = decide_breakfix(&combo, 3, &backend, &retest, &NeverCalledFetch, "ctx").await;
 
         assert_eq!(*retest.calls.lock().unwrap(), 3, "should stop retrying once resolved");
         assert_eq!(*backend.calls.lock().unwrap(), 3);
@@ -1310,7 +1463,7 @@ mod tests {
             }
         }
         let combo = test_combo();
-        let decision = decide_breakfix(&combo, 3, &DropBackend, &NeverCalledRetest, "ctx").await;
+        let decision = decide_breakfix(&combo, 3, &DropBackend, &NeverCalledRetest, &NeverCalledFetch, "ctx").await;
         match decision {
             Decision::Drop { attempts, reason, .. } => {
                 assert_eq!(attempts, 1);
@@ -1337,7 +1490,7 @@ mod tests {
             }
         }
         let combo = test_combo();
-        let decision = decide_breakfix(&combo, 3, &EscalateBackend, &NeverCalledRetest, "ctx").await;
+        let decision = decide_breakfix(&combo, 3, &EscalateBackend, &NeverCalledRetest, &NeverCalledFetch, "ctx").await;
         assert_eq!(
             decision,
             Decision::Escalate {
@@ -1364,13 +1517,146 @@ mod tests {
             }
         }
         let combo = test_combo();
-        let decision = decide_breakfix(&combo, 3, &CodefixBackend, &NeverCalledRetest, "ctx").await;
+        let decision = decide_breakfix(&combo, 3, &CodefixBackend, &NeverCalledRetest, &NeverCalledFetch, "ctx").await;
         match decision {
             Decision::CodefixDeferred { attempts, detail } => {
                 assert_eq!(attempts, 1);
                 assert!(detail.contains("context clamp"));
             }
             other => panic!("expected CodefixDeferred, got {other:?}"),
+        }
+    }
+
+    // ---- MINT Phase 5: fetch_model verdict handling ----
+
+    struct FetchModelBackend;
+    #[async_trait::async_trait]
+    impl ReasoningBackend for FetchModelBackend {
+        async fn ask(&self, _prompt: &str) -> BackendReply {
+            BackendReply::Text("VERDICT: fetch_model()".to_string())
+        }
+    }
+
+    struct AlwaysWarmFetch {
+        calls: Mutex<u32>,
+    }
+    #[async_trait::async_trait]
+    impl FetchModelHook for AlwaysWarmFetch {
+        async fn fetch_model(&self, _model: &str) -> FetchModelOutcome {
+            *self.calls.lock().unwrap() += 1;
+            FetchModelOutcome::Warmed
+        }
+    }
+
+    struct AlwaysFailFetch {
+        calls: Mutex<u32>,
+    }
+    #[async_trait::async_trait]
+    impl FetchModelHook for AlwaysFailFetch {
+        async fn fetch_model(&self, _model: &str) -> FetchModelOutcome {
+            *self.calls.lock().unwrap() += 1;
+            FetchModelOutcome::Failed {
+                reason: "unknown model".to_string(),
+            }
+        }
+    }
+
+    struct AlwaysSucceedRetest {
+        calls: Mutex<u32>,
+    }
+    #[async_trait::async_trait]
+    impl RetestHook for AlwaysSucceedRetest {
+        async fn retest(&self, _combo: &ComboKey, _alt: &str) -> RetestResult {
+            *self.calls.lock().unwrap() += 1;
+            RetestResult::Success
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_model_then_successful_retest_resolves() {
+        let fetch = AlwaysWarmFetch { calls: Mutex::new(0) };
+        let retest = AlwaysSucceedRetest { calls: Mutex::new(0) };
+        let combo = test_combo();
+
+        let decision =
+            decide_breakfix(&combo, 3, &FetchModelBackend, &retest, &fetch, "ctx").await;
+
+        assert_eq!(*fetch.calls.lock().unwrap(), 1, "one fetch-model attempt");
+        assert_eq!(*retest.calls.lock().unwrap(), 1, "one retest to VERIFY the fetch, never trusted blindly");
+        assert_eq!(decision, Decision::Resolved);
+    }
+
+    #[tokio::test]
+    async fn fetch_model_success_but_retest_still_fails_feeds_back_and_continues() {
+        let fetch = AlwaysWarmFetch { calls: Mutex::new(0) };
+        let retest = AlwaysFailRetest { calls: Mutex::new(0) };
+        let combo = test_combo();
+
+        let decision =
+            decide_breakfix(&combo, 3, &FetchModelBackend, &retest, &fetch, "ctx").await;
+
+        // The model was successfully re-pulled every attempt but the combo
+        // still doesn't work — budget exhausts to a forced Drop, same
+        // termination guarantee as the plain-retry adversarial case.
+        assert_eq!(*fetch.calls.lock().unwrap(), MAX_ATTEMPTS as u32);
+        assert_eq!(*retest.calls.lock().unwrap(), MAX_ATTEMPTS as u32);
+        match decision {
+            Decision::Drop { attempts, last_error_class, .. } => {
+                assert_eq!(attempts, MAX_ATTEMPTS);
+                assert!(last_error_class.contains("post-fetch_model retest failed"));
+            }
+            other => panic!("expected forced Drop at budget exhaustion, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_model_failure_skips_retest_and_feeds_back_directly() {
+        // The pull itself failed (e.g. unknown model) — retesting cannot
+        // plausibly help, so it must be skipped entirely, not just failed.
+        let fetch = AlwaysFailFetch { calls: Mutex::new(0) };
+        struct NeverCalledRetest;
+        #[async_trait::async_trait]
+        impl RetestHook for NeverCalledRetest {
+            async fn retest(&self, _combo: &ComboKey, _alt: &str) -> RetestResult {
+                panic!("retest must not be called when fetch_model itself failed");
+            }
+        }
+        let retest = NeverCalledRetest;
+        let combo = test_combo();
+
+        let decision =
+            decide_breakfix(&combo, 3, &FetchModelBackend, &retest, &fetch, "ctx").await;
+
+        assert_eq!(*fetch.calls.lock().unwrap(), MAX_ATTEMPTS as u32);
+        match decision {
+            Decision::Drop { attempts, last_error_class, .. } => {
+                assert_eq!(attempts, MAX_ATTEMPTS);
+                assert!(last_error_class.contains("fetch_model failed"));
+                assert!(last_error_class.contains("unknown model"));
+            }
+            other => panic!("expected forced Drop at budget exhaustion, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn adversarial_always_fetch_model_backend_terminates_at_budget() {
+        // Mirrors `adversarial_always_retry_backend_terminates_at_budget` for
+        // the fetch_model path — a persistent backend requesting fetch_model
+        // every time, with a fetch hook that always "succeeds" but a retest
+        // that always fails, must still terminate at MAX_ATTEMPTS with a
+        // forced Drop (proof this path can never loop unbounded either).
+        let fetch = AlwaysWarmFetch { calls: Mutex::new(0) };
+        let retest = AlwaysFailRetest { calls: Mutex::new(0) };
+        let combo = test_combo();
+
+        let decision =
+            decide_breakfix(&combo, 3, &FetchModelBackend, &retest, &fetch, "ctx").await;
+
+        assert_eq!(*fetch.calls.lock().unwrap(), MAX_ATTEMPTS as u32);
+        assert_eq!(*retest.calls.lock().unwrap(), MAX_ATTEMPTS as u32);
+        match decision {
+            Decision::Drop { attempts, .. } => assert_eq!(attempts, MAX_ATTEMPTS),
+            other => panic!("expected forced Drop at budget exhaustion, got {other:?}"),
         }
     }
 
@@ -1440,7 +1726,7 @@ mod tests {
             }
         }
         let combo = test_combo();
-        let decision = decide_breakfix(&combo, 3, &chain, &NeverCalledRetest, "ctx").await;
+        let decision = decide_breakfix(&combo, 3, &chain, &NeverCalledRetest, &NeverCalledFetch, "ctx").await;
         match decision {
             Decision::Escalate { reason, attempts } => {
                 assert!(reason.contains("fallback down too"));
@@ -1488,6 +1774,87 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("panicked"));
+    }
+
+    // ---- fetch_model_bounded (MINT Phase 5 adversarial-review fix: a merely
+    //      SLOW, not fully hung, Chord must not stall the supervisor's single
+    //      tick task for the full 600s HTTP timeout) ----
+
+    struct SlowFetch {
+        delay: Duration,
+    }
+    #[async_trait::async_trait]
+    impl FetchModelHook for SlowFetch {
+        async fn fetch_model(&self, _model: &str) -> FetchModelOutcome {
+            tokio::time::sleep(self.delay).await;
+            FetchModelOutcome::Warmed
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn fetch_model_bounded_returns_promptly_on_a_slow_hook() {
+        // A 1s bound (rather than the 120s default) so the test itself stays
+        // fast — `fetch_model_bounded` reads the bound from the config
+        // function, not a parameter, so the env var is how a test controls it.
+        std::env::set_var("MINT_BREAKFIX_FETCH_MODEL_TIMEOUT_SECS", "1");
+        let hook = SlowFetch { delay: Duration::from_secs(5) };
+        let start = std::time::Instant::now();
+        let outcome = fetch_model_bounded(&hook, "m:1").await;
+        std::env::remove_var("MINT_BREAKFIX_FETCH_MODEL_TIMEOUT_SECS");
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "must return promptly on timeout, not wait for the full 5s hook (took {:?})",
+            start.elapsed()
+        );
+        match outcome {
+            FetchModelOutcome::Failed { reason } => assert!(reason.contains("timed out")),
+            other => panic!("expected Failed(timed out), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn fetch_model_bounded_returns_value_when_hook_finishes_before_timeout() {
+        std::env::remove_var("MINT_BREAKFIX_FETCH_MODEL_TIMEOUT_SECS"); // default 120s
+        let hook = SlowFetch { delay: Duration::from_millis(10) };
+        let outcome = fetch_model_bounded(&hook, "m:1").await;
+        assert_eq!(outcome, FetchModelOutcome::Warmed);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn fetch_model_timeout_in_decide_breakfix_is_treated_as_a_failure_not_fatal() {
+        // End-to-end through the loop: a fetch_model verdict whose fetch call
+        // hangs past the bound must feed back as evidence (skip retest,
+        // continue) exactly like any other fetch failure — never propagate
+        // the timeout as a crash or a hang of the whole decision loop.
+        std::env::set_var("MINT_BREAKFIX_FETCH_MODEL_TIMEOUT_SECS", "1");
+        struct NeverCalledRetest;
+        #[async_trait::async_trait]
+        impl RetestHook for NeverCalledRetest {
+            async fn retest(&self, _combo: &ComboKey, _alt: &str) -> RetestResult {
+                panic!("retest must not be called when fetch_model itself times out");
+            }
+        }
+        let fetch = SlowFetch { delay: Duration::from_secs(10) };
+        let combo = test_combo();
+        let start = std::time::Instant::now();
+        let decision =
+            decide_breakfix(&combo, 3, &FetchModelBackend, &NeverCalledRetest, &fetch, "ctx").await;
+        std::env::remove_var("MINT_BREAKFIX_FETCH_MODEL_TIMEOUT_SECS");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the whole bounded loop (up to MAX_ATTEMPTS timeouts) must still finish well under \
+             the hook's 10s-per-call delay, took {:?}",
+            start.elapsed()
+        );
+        match decision {
+            Decision::Drop { last_error_class, .. } => {
+                assert!(last_error_class.contains("timed out"));
+            }
+            other => panic!("expected forced Drop at budget exhaustion, got {other:?}"),
+        }
     }
 
     // ---- mint_dropped_configs write path (SQL-shape unit test — no live DB) ----
