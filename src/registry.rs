@@ -104,6 +104,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::ansible::register(registry);
     crate::approval::register(registry);
     crate::council::register(registry);
+    crate::crucible::register(registry);
     crate::dev::register(registry);
     crate::gateway::register(registry);
     crate::<secret-manager>::register(registry);

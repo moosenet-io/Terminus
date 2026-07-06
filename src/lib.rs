@@ -13,6 +13,7 @@ pub mod commute;
 pub mod compat;
 pub mod config;
 pub mod council;
+pub mod crucible;
 pub mod dgem;
 pub mod dura;
 pub mod error;
