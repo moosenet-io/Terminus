@@ -293,6 +293,123 @@ impl CoderSuiteDriver for LiveCoderDriver {
     }
 }
 
+// ===========================================================================
+// S86: GPU-lock fairness — acquire/release PER (model, backend) pass
+// ===========================================================================
+//
+// Root cause + full design: see `gpu_authority.rs`'s "Fairness" module
+// section. Short version: this sweep used to acquire ONE
+// `gpu_authority::ExclusiveGuard` at the top of `run()` and hold it for the
+// ENTIRE multi-day fleet run (by design — a 3-day autonomous run genuinely
+// needs the GPU for most of that time). That starved `intake_assistant_sweep`
+// completely for as long as this sweep ran (confirmed in production: 2+ days,
+// zero `assistant_dimension_score` rows). Giving ONLY the assistant sweep a
+// bounded backoff (HFIX-09) fixed ITS crash-loop but not the starvation — the
+// lock was still held continuously by whichever sweep got there first. This
+// sweep now acquires/releases the SAME exclusive lock per (model, backend)
+// pass — the natural unit `run_fleet`'s loop already iterates over — using
+// the identical bounded-backoff reacquire and the identical
+// `gpu_authority::INTER_UNIT_RELEASE_PAUSE` the assistant sweep uses (same
+// module, not a duplicate), so real alternation happens in practice, not
+// just in theory.
+
+/// Per-unit-of-work GPU lock, injected into [`run_fleet`] so the
+/// acquire-per-pass / release-per-pass fairness policy is unit-testable
+/// without a real lock file or GPU — mirrors [`CoderSuiteDriver`]'s existing
+/// trait-injection pattern (see `mod tests`'s `ScriptGpuLock`).
+#[async_trait::async_trait]
+pub trait GpuLock: Send + Sync {
+    /// Acquire for the next (model, backend) pass. `Err` only after a
+    /// bounded wait gives up (see `gpu_authority::acquire_with_backoff`).
+    async fn acquire(&self) -> Result<(), String>;
+    /// Release. Only ever called after a successful `acquire`.
+    fn release(&self);
+    /// How long to pause after a release before the NEXT acquire is
+    /// attempted — see `gpu_authority::INTER_UNIT_RELEASE_PAUSE`. Test fakes
+    /// return `Duration::ZERO`.
+    fn release_pause(&self) -> std::time::Duration;
+}
+
+/// Env var overriding the max total time a bounded GPU-(re)acquire wait will
+/// spend retrying a refused acquire before giving up (whole seconds;
+/// non-positive/unparsable falls back to the default). Distinct from the
+/// assistant sweep's own env var (`INTAKE_ASSISTANT_ACQUIRE_MAX_WAIT_SECS`)
+/// so each binary's operator-facing knob is unambiguous about which sweep it
+/// tunes.
+pub const CODER_ACQUIRE_MAX_WAIT_ENV: &str = "INTAKE_CODER_ACQUIRE_MAX_WAIT_SECS";
+
+/// Default max wait: 4 hours — same reasoning as the assistant sweep's
+/// default (see `assistant::runner::ACQUIRE_MAX_WAIT_DEFAULT_SECS`): a
+/// per-pass reacquire should only ever wait for the OTHER sweep's single
+/// current model to finish (minutes, not hours); this is the safety net for
+/// a genuinely wedged GPU, not the expected wait.
+const CODER_ACQUIRE_MAX_WAIT_DEFAULT_SECS: u64 = 4 * 60 * 60;
+
+fn coder_acquire_max_wait() -> std::time::Duration {
+    std::env::var(CODER_ACQUIRE_MAX_WAIT_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(CODER_ACQUIRE_MAX_WAIT_DEFAULT_SECS))
+}
+
+/// Live [`GpuLock`]: the real `gpu_authority` lock file, gated by the shared
+/// bounded-backoff retry (the SAME implementation the assistant sweep uses).
+pub struct LiveGpuLock {
+    holder: &'static str,
+}
+
+impl LiveGpuLock {
+    pub fn new(holder: &'static str) -> Self {
+        LiveGpuLock { holder }
+    }
+}
+
+#[async_trait::async_trait]
+impl GpuLock for LiveGpuLock {
+    async fn acquire(&self) -> Result<(), String> {
+        gpu_authority::acquire_with_backoff(
+            &gpu_authority::RealClock,
+            || gpu_authority::acquire(GpuMode::Exclusive, self.holder),
+            gpu_authority::is_live_holder_refusal,
+            gpu_authority::ACQUIRE_POLL_INTERVAL,
+            gpu_authority::ACQUIRE_PROGRESS_LOG_INTERVAL,
+            coder_acquire_max_wait(),
+            self.holder,
+        )
+        .await
+    }
+
+    fn release(&self) {
+        if let Err(e) = gpu_authority::release(self.holder) {
+            tracing::warn!(
+                "{}: release between (model, backend) passes failed for '{}': {e}",
+                self.holder,
+                self.holder
+            );
+        }
+    }
+
+    fn release_pause(&self) -> std::time::Duration {
+        gpu_authority::INTER_UNIT_RELEASE_PAUSE
+    }
+}
+
+/// RAII: releases `lock` on drop, exactly once — so a checkpoint-write
+/// failure (`?` early return out of `run_one_backend`) or a panic mid-pass
+/// still releases the GPU rather than leaking it for the rest of this
+/// process's life.
+struct ReleaseOnDrop<'a> {
+    lock: &'a dyn GpuLock,
+}
+
+impl Drop for ReleaseOnDrop<'_> {
+    fn drop(&mut self) {
+        self.lock.release();
+    }
+}
+
 /// Run one `(model, backend)` code-suite pass under the P5 backend override,
 /// honoring the resume checkpoint. NEVER returns `Err` for a per-model failure —
 /// a hang/unavailable/OOM becomes a `Skipped` outcome so the fleet continues.
@@ -446,6 +563,13 @@ async fn run_one_backend(
 /// Drive the whole fleet: for each nomination, for each backend in its strategy,
 /// run (or resume) one code-suite pass. Sequential — the backend override is
 /// process-global and inference is single-VRAM, exactly like the assistant sweep.
+///
+/// S86: `gpu_lock` is acquired fresh for EACH `(model, backend)` pass and
+/// released at the end of that same pass — never held for the whole fleet
+/// run — so `intake_assistant_sweep` gets real turns instead of starving for
+/// this sweep's entire multi-day duration. See `gpu_authority.rs`'s
+/// "Fairness" section for the full design.
+#[allow(clippy::too_many_arguments)]
 async fn run_fleet(
     fleet: &Nominations,
     langs: &[String],
@@ -453,9 +577,16 @@ async fn run_fleet(
     checkpoint: &CodeCheckpoint,
     mem_config: Option<&str>,
     driver: &dyn CoderSuiteDriver,
+    gpu_lock: &dyn GpuLock,
 ) -> Result<Vec<BackendReport>, ToolError> {
     let done = checkpoint.done();
     let mut reports = Vec::new();
+    // Whether the PREVIOUS pass actually took (and released) the GPU lock —
+    // only then must we pause before the next real acquire attempt (see
+    // `gpu_authority::INTER_UNIT_RELEASE_PAUSE`'s doc for why the pause must
+    // follow a genuine release, not just any loop iteration).
+    let mut did_prior_unit = false;
+
     for nom in &fleet.nominations {
         for (backend_tag, override_str) in nom.backend_strategy() {
             // S86 / gfx1151: serve GPU passes via ollama-rocm (the always-on
@@ -468,12 +599,56 @@ async fn run_fleet(
                 (BackendTag::Cpu, "ollama") => "ollama-cpu",
                 (_, other) => other,
             };
+
+            let model_id = nom.id.clone();
+            let key = CodeCheckpointKey::new(&model_id, backend_tag);
+
+            // ── cheap, GPU-free pre-check: a resumed or pre-flight VRAM
+            //    skip never touches the model at all (mirrors the checks
+            //    `run_one_backend` repeats internally as defense-in-depth) —
+            //    so free work costs zero lock churn and zero pause. ──
+            if done.contains(&key) {
+                reports.push(BackendReport { model_id, backend_tag, outcome: BackendOutcome::Resumed });
+                continue;
+            }
+            if let Some(reason) = pre_skip_reason(nom, backend_tag) {
+                reports.push(BackendReport { model_id, backend_tag, outcome: BackendOutcome::Skipped(reason) });
+                continue;
+            }
+
+            // ── fairness: pause AFTER a real release, BEFORE the next real
+            //    acquire, so the other sweep's poll loop gets a genuine
+            //    window to notice the gap. ──
+            if did_prior_unit {
+                tokio::time::sleep(gpu_lock.release_pause()).await;
+            }
+
+            if let Err(e) = gpu_lock.acquire().await {
+                eprintln!(
+                    "coder sweep: could not reacquire the GPU for model={model_id} backend={} \
+                     — skipping this pass this run (resumable next run): {e}",
+                    backend_tag.as_str()
+                );
+                reports.push(BackendReport {
+                    model_id,
+                    backend_tag,
+                    outcome: BackendOutcome::Skipped(format!("GPU reacquire failed: {e}")),
+                });
+                did_prior_unit = false; // never took the lock — no pause owed before the next try
+                continue;
+            }
+            let _release_guard = ReleaseOnDrop { lock: gpu_lock };
+
             let report = run_one_backend(
                 nom, backend_tag, override_str, langs, case_limit, checkpoint, &done, mem_config,
                 driver,
             )
             .await?;
             reports.push(report);
+            did_prior_unit = true;
+            // `_release_guard` drops here, at the end of this pass's scope —
+            // AFTER `run_one_backend` has persisted rows and marked the
+            // checkpoint internally, never mid-write.
         }
     }
     Ok(reports)
@@ -610,21 +785,18 @@ pub async fn run(
     // a missing/unparseable manifest just skips this diagnostic.
     warn_uncovered_toolchain_languages();
 
-    // HFIX-07: proactively claim exclusive GPU use BEFORE running a single
-    // case — stops competing production services and brings Ollama's own
-    // runner config to a single-resident-model state, idempotently (a
-    // resumed run that's already exclusive touches nothing). Refuses to
-    // start rather than silently racing another exclusive holder for the
-    // GPU (the exact failure mode that produced false "wedge" timeouts
-    // earlier in this sweep — see the gpu_authority module doc).
-    let _gpu_guard = match gpu_authority::ExclusiveGuard::acquire(GpuMode::Exclusive, GPU_HOLDER) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("coder sweep did not start: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-
+    // S86: exclusive GPU use is now claimed PER (model, backend) PASS inside
+    // `run_fleet`'s loop (see `GpuLock`/`LiveGpuLock` above), NOT once here
+    // for the whole multi-day run. HFIX-07's original one-shot, whole-run
+    // guard was correct in spirit (never silently race another exclusive
+    // holder — the exact failure mode that produced false "wedge" timeouts
+    // earlier in this sweep) but, held for the ENTIRE run, it starved
+    // `intake_assistant_sweep` completely for as long as this sweep ran
+    // (confirmed in production: 2+ days straight, zero
+    // `assistant_dimension_score` rows). `LiveGpuLock` still refuses to
+    // silently race another holder — it waits, bounded, via the shared
+    // `gpu_authority::acquire_with_backoff` — it just does so freshly per
+    // pass instead of once for days.
     eprintln!(
         "coder sweep starting: {} models, langs={}, case_limit={:?}, mem_config={}, checkpoint={}",
         fleet.nominations.len(),
@@ -635,7 +807,8 @@ pub async fn run(
     );
 
     let driver = LiveCoderDriver;
-    match run_fleet(&fleet, langs, case_limit, &checkpoint, mem_config, &driver).await {
+    let gpu_lock = LiveGpuLock::new(GPU_HOLDER);
+    match run_fleet(&fleet, langs, case_limit, &checkpoint, mem_config, &driver, &gpu_lock).await {
         Ok(reports) => {
             print_report(&reports);
             std::process::ExitCode::SUCCESS
@@ -847,7 +1020,12 @@ mod tests {
     use std::sync::Mutex;
 
     fn block<F: std::future::Future>(f: F) -> F::Output {
+        // `enable_time()`: S86's `run_fleet` uses `tokio::time::sleep` for the
+        // inter-unit release pause (real GpuLock impls use 90s;
+        // NoopGpuLock/ScriptGpuLock return `Duration::ZERO`, but the sleep
+        // call itself still needs a timer-enabled runtime to resolve at all).
         tokio::runtime::Builder::new_current_thread()
+            .enable_time()
             .build()
             .unwrap()
             .block_on(f)
@@ -928,6 +1106,73 @@ mod tests {
         }
     }
 
+    // ── S86: GpuLock fakes (mock the lock, never a real lock file / GPU) ──
+
+    /// Grants immediately, zero pause — for tests exercising `run_fleet`'s
+    /// resume/skip/driver orchestration, where the GPU-lock fairness
+    /// mechanism itself is not under test (that has its own dedicated tests
+    /// below, plus `gpu_authority.rs`'s alternation simulation).
+    struct NoopGpuLock;
+    #[async_trait::async_trait]
+    impl GpuLock for NoopGpuLock {
+        async fn acquire(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn release(&self) {}
+        fn release_pause(&self) -> std::time::Duration {
+            std::time::Duration::ZERO
+        }
+    }
+
+    /// Scriptable GpuLock: counts acquire/release/pause calls, and can be
+    /// told to refuse specific (1-based) acquire attempts — so tests can
+    /// assert `run_fleet` acquires exactly ONCE PER (model, backend) PASS
+    /// (not once for the whole run), pauses only BETWEEN passes that
+    /// actually touched the GPU (never before the first, never for a
+    /// resumed/pre-skipped pass), and treats a reacquire failure as a
+    /// per-pass skip that does not abort the rest of the fleet.
+    #[derive(Default)]
+    struct ScriptGpuLock {
+        fail_on_call: BTreeSet<u32>,
+        call_no: Mutex<u32>,
+        acquire_calls: Mutex<u32>,
+        release_calls: Mutex<u32>,
+        pause_calls: Mutex<u32>,
+    }
+
+    impl ScriptGpuLock {
+        fn failing_on(call_no: u32) -> Self {
+            let mut s = ScriptGpuLock::default();
+            s.fail_on_call.insert(call_no);
+            s
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GpuLock for ScriptGpuLock {
+        async fn acquire(&self) -> Result<(), String> {
+            let n = {
+                let mut c = self.call_no.lock().unwrap();
+                *c += 1;
+                *c
+            };
+            if self.fail_on_call.contains(&n) {
+                return Err(format!(
+                    "GPU is held exclusively by 'other-sweep' (scripted refusal on attempt {n})"
+                ));
+            }
+            *self.acquire_calls.lock().unwrap() += 1;
+            Ok(())
+        }
+        fn release(&self) {
+            *self.release_calls.lock().unwrap() += 1;
+        }
+        fn release_pause(&self) -> std::time::Duration {
+            *self.pause_calls.lock().unwrap() += 1;
+            std::time::Duration::ZERO
+        }
+    }
+
     #[test]
     fn driver_profiles_an_available_model_on_both_backends() {
         let fleet = Nominations::from_json(
@@ -937,7 +1182,7 @@ mod tests {
         let driver = ScriptDriver::new().available("qwen3-coder:30b");
         let checkpoint = tmp_checkpoint("profiles-both");
 
-        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver)).unwrap();
+        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &NoopGpuLock)).unwrap();
 
         assert_eq!(reports.len(), 2);
         for r in &reports {
@@ -961,7 +1206,7 @@ mod tests {
         let driver = ScriptDriver::new(); // nothing marked available
         let checkpoint = tmp_checkpoint("unavailable");
 
-        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver)).unwrap();
+        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &NoopGpuLock)).unwrap();
 
         assert_eq!(reports.len(), 1);
         match &reports[0].outcome {
@@ -985,7 +1230,7 @@ mod tests {
         driver.suite_fail.insert("hangy:32b".to_string());
         let checkpoint = tmp_checkpoint("suite-fail");
 
-        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver)).unwrap();
+        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &NoopGpuLock)).unwrap();
 
         assert_eq!(reports.len(), 1);
         match &reports[0].outcome {
@@ -1008,7 +1253,7 @@ mod tests {
             .unwrap();
         let driver = ScriptDriver::new().available("m:8b");
 
-        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver)).unwrap();
+        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &NoopGpuLock)).unwrap();
 
         assert_eq!(reports.len(), 2);
         let gpu = reports.iter().find(|r| r.backend_tag == BackendTag::Gpu).unwrap();
@@ -1021,5 +1266,97 @@ mod tests {
         let suite_calls = driver.suite_calls.lock().unwrap();
         assert_eq!(suite_calls.len(), 1);
         assert_eq!(suite_calls[0], ("m:8b".to_string(), "cpu".to_string()));
+    }
+
+    // ── S86: GPU lock acquired/released PER (model, backend) pass ──
+
+    #[test]
+    fn gpu_lock_acquired_and_released_once_per_backend_pass_not_once_for_the_whole_run() {
+        // One model with BOTH backends must take the GPU lock twice — once
+        // per (model, backend) pass — not once for the whole fleet run.
+        let fleet = Nominations::from_json(
+            r#"{"nominations":[{"id":"qwen3-coder:30b","size_b":30,"gfx1151_class":"confirmed","acquisition":"ollama_pull"}]}"#,
+        )
+        .unwrap();
+        let driver = ScriptDriver::new().available("qwen3-coder:30b");
+        let checkpoint = tmp_checkpoint("gpu-lock-both-backends");
+        let gpu = ScriptGpuLock::default();
+
+        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &gpu)).unwrap();
+
+        assert_eq!(reports.len(), 2);
+        assert_eq!(*gpu.acquire_calls.lock().unwrap(), 2, "one acquire per backend pass");
+        assert_eq!(*gpu.release_calls.lock().unwrap(), 2, "one release per backend pass");
+        // Pause happens exactly once — BETWEEN the two passes, never before the first.
+        assert_eq!(*gpu.pause_calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn gpu_lock_never_touched_for_resumed_or_pre_skipped_passes() {
+        // gpu backend already checkpointed (resume) AND the model is tagged
+        // gpu-only via backend_strategy for the skip case below — use two
+        // separate nominations to isolate "resumed" from "pre-skip" cleanly.
+        let fleet = Nominations::from_json(
+            r#"{"nominations":[
+                {"id":"resumed:8b","size_b":8,"gfx1151_class":"confirmed","acquisition":"ollama_pull","backends":["gpu"]},
+                {"id":"huge:400b","size_b":400,"gfx1151_class":"confirmed","acquisition":"ollama_pull","backends":["gpu"]}
+            ]}"#,
+        )
+        .unwrap();
+        let checkpoint = tmp_checkpoint("gpu-lock-skip-cases");
+        checkpoint
+            .mark(&CodeCheckpointKey::new("resumed:8b", BackendTag::Gpu))
+            .unwrap();
+        let driver = ScriptDriver::new(); // nothing marked available — irrelevant, never reached
+        let gpu = ScriptGpuLock::default();
+
+        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &gpu)).unwrap();
+
+        assert_eq!(reports.len(), 2);
+        assert!(matches!(reports[0].outcome, BackendOutcome::Resumed));
+        assert!(matches!(reports[1].outcome, BackendOutcome::Skipped(_))); // over-VRAM
+
+        assert_eq!(*gpu.acquire_calls.lock().unwrap(), 0, "resume/pre-skip must never touch the GPU lock");
+        assert_eq!(*gpu.release_calls.lock().unwrap(), 0);
+        assert_eq!(*gpu.pause_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn gpu_lock_reacquire_failure_is_a_recorded_skip_and_the_fleet_continues() {
+        // First (model, backend) pass's acquire is scripted to be refused (as
+        // if the assistant sweep's own unit is mid-run). This must NOT abort
+        // the multi-day fleet run — it must be recorded as this pass's
+        // Skipped outcome and the fleet must continue to the next pass,
+        // which succeeds normally.
+        let fleet = Nominations::from_json(
+            r#"{"nominations":[{"id":"stuck:8b","size_b":8,"gfx1151_class":"confirmed","acquisition":"ollama_pull","backends":["gpu","cpu"]}]}"#,
+        )
+        .unwrap();
+        let driver = ScriptDriver::new().available("stuck:8b");
+        let checkpoint = tmp_checkpoint("gpu-lock-reacquire-fail");
+        let gpu = ScriptGpuLock::failing_on(1); // refuse the very first acquire (the gpu pass)
+
+        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &gpu)).unwrap();
+
+        assert_eq!(reports.len(), 2);
+        let gpu_report = reports.iter().find(|r| r.backend_tag == BackendTag::Gpu).unwrap();
+        match &gpu_report.outcome {
+            BackendOutcome::Skipped(reason) => assert!(
+                reason.contains("GPU reacquire failed"),
+                "got: {reason}"
+            ),
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        // The NEXT pass (cpu) must still run normally — no fatal abort of the sweep.
+        let cpu_report = reports.iter().find(|r| r.backend_tag == BackendTag::Cpu).unwrap();
+        assert!(matches!(cpu_report.outcome, BackendOutcome::Profiled { .. }));
+
+        // The driver was only ever asked about the surviving (cpu) pass.
+        let suite_calls = driver.suite_calls.lock().unwrap();
+        assert_eq!(suite_calls.len(), 1);
+        assert_eq!(suite_calls[0], ("stuck:8b".to_string(), "cpu".to_string()));
+
+        // A refused pass was never checkpointed (durability: only real progress is marked).
+        assert!(!checkpoint.done().contains(&CodeCheckpointKey::new("stuck:8b", BackendTag::Gpu)));
     }
 }

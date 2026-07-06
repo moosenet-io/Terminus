@@ -302,14 +302,23 @@ pub async fn run_with(
     sink: &dyn ScoreSink,
     checkpoint: &dyn Checkpoint,
     fleet_store: &dyn FleetStore,
+    gpu_lock: &dyn GpuLock,
 ) -> Result<RunReport, String> {
     let done = checkpoint.done().await?;
     let mut models = Vec::with_capacity(nominations.nominations.len());
+    // Whether the PREVIOUS model actually took (and released) the GPU lock —
+    // only then must we pause before the next real acquire attempt (see
+    // `gpu_authority::INTER_UNIT_RELEASE_PAUSE`'s doc for why the pause must
+    // follow a genuine release, not just any loop iteration).
+    let mut did_prior_unit = false;
 
     for nom in &nominations.nominations {
         let model_id = nom.model_id();
 
         // ── acquire (over-VRAM / broken fetch → skip-with-reason, keep going) ──
+        // This is the VRAM/fetch-feasibility check ([`Acquirer`]), NOT the GPU
+        // exclusive lock — a model that fails HERE never touches the GPU at
+        // all, so it costs nothing to check before ever taking the lock.
         let acq = acquirer.acquire(nom).await;
         if let AcquisitionOutcome::Skipped { reason } = &acq {
             models.push(ModelRunReport {
@@ -320,6 +329,28 @@ pub async fn run_with(
             });
             continue;
         }
+
+        // ── S86 fairness: acquire the exclusive GPU lock for THIS model
+        //    (both its backend passes) instead of holding one guard for the
+        //    whole run — see gpu_authority.rs's "Fairness" section for why. ──
+        if did_prior_unit {
+            tokio::time::sleep(gpu_lock.release_pause()).await;
+        }
+        if let Err(e) = gpu_lock.acquire().await {
+            tracing::error!(
+                "intake_assistant_sweep: could not reacquire the GPU for model={model_id} — \
+                 skipping this model this run (resumable next run): {e}"
+            );
+            models.push(ModelRunReport {
+                model_id,
+                acquisition_skip: Some(format!("GPU reacquire failed: {e}")),
+                backends: Vec::new(),
+                fleet_rows: Vec::new(),
+            });
+            did_prior_unit = false; // never took the lock — no pause owed before the next try
+            continue;
+        }
+        let _release_guard = ReleaseOnDrop { lock: gpu_lock };
 
         // ── per backend (the both-hardware passes), P5 override per pass ──
         let mut backend_reports = Vec::new();
@@ -353,6 +384,11 @@ pub async fn run_with(
             backends: backend_reports,
             fleet_rows,
         });
+        did_prior_unit = true;
+        // `_release_guard` drops here, at the end of this model's scope —
+        // AFTER both backend passes' rows are persisted and checkpoints
+        // written (`run_one_backend` persists-then-checkpoints internally),
+        // never mid-write.
     }
 
     Ok(RunReport { models })
@@ -473,52 +509,47 @@ async fn run_one_backend(
 pub const GPU_HOLDER: &str = "intake_assistant_sweep";
 
 // ===========================================================================
-// HFIX-09: bounded acquire-retry backoff
+// HFIX-09 / S86: bounded acquire-retry backoff + release-between-units
 // ===========================================================================
 //
-// Root cause this section fixes: `intake_coder_sweep` intentionally holds its
-// `ExclusiveGuard` for its ENTIRE multi-day run (one guard for the whole
-// sweep, by design — see coder_sweep.rs). Before this fix, the assistant
-// sweep's one-shot `ExclusiveGuard::acquire()` above would see that refusal,
-// return `Err` immediately, and `intake_assistant_sweep`'s `main()` would
-// exit `FAILURE`. With systemd's `Restart=on-failure` + a ~5min `RestartSec`,
-// that meant the assistant-sweep unit crash-looped every ~5 minutes for the
-// ENTIRE duration of a coder-sweep run (observed: ~2 days straight in
-// production), producing zero data the whole time.
+// Root cause this section addresses: `intake_coder_sweep` intentionally
+// holds its `ExclusiveGuard` for its ENTIRE multi-day run (one guard for the
+// whole sweep, by design — see coder_sweep.rs). HFIX-09 stopped the
+// assistant sweep's one-shot acquire from crash-looping on refusal (it used
+// to `Err` immediately, and with systemd's `Restart=on-failure` +
+// `RestartSec≈5min` that meant the unit crash-looped for the ENTIRE duration
+// of a coder-sweep run — observed ~2 days straight in production, zero data
+// the whole time) by waiting (bounded) instead of failing immediately.
 //
-// The fix is caller-side only: instead of failing on the first refusal, poll
-// for the GPU to free up, bounded by a max total wait so systemd's restart
-// cycle remains the ultimate safety net (just at a far lower frequency, not
-// every 5 minutes forever) if something is truly wedged rather than merely
-// "coder-sweep is mid-model". `gpu_authority.rs` itself is untouched.
+// That fixed the crash-loop but NOT the underlying starvation: coder-sweep
+// still held the lock for its whole multi-day run, so the assistant sweep's
+// bounded wait just... waited, quietly, for as long as coder-sweep ran.
+// Confirmed in production: 2+ days with zero `assistant_dimension_score`
+// rows for the live `mem_config='dynamic_gtt'` run.
+//
+// S86 fixes the actual root cause: BOTH sweeps now acquire the exclusive
+// lock fresh per unit of work (here: per model, mirroring `run_with`'s own
+// loop granularity) and release it at the end of that unit, instead of
+// holding one guard for the whole run — see `gpu_authority.rs`'s "Fairness"
+// module section for the full design (including why the release pause is
+// 90s, not the "1-2s" first considered). `acquire_with_backoff`,
+// `AcquireClock`, `RealClock`, `is_live_holder_refusal`, and the shared poll
+// constants now live in `gpu_authority.rs` — reused here AND by
+// `coder_sweep.rs`, not duplicated.
 
-/// Env var overriding the max total time [`acquire_with_backoff`] will spend
-/// retrying a refused GPU acquire before giving up and returning `Err` (whole
-/// seconds; non-positive or unparsable values fall back to the default).
+/// Env var overriding the max total time a bounded GPU-acquire wait will
+/// spend retrying a refused acquire before giving up and returning `Err`
+/// (whole seconds; non-positive or unparsable values fall back to the
+/// default). Applies to BOTH the initial acquire and every per-model
+/// reacquire.
 pub const ACQUIRE_MAX_WAIT_ENV: &str = "INTAKE_ASSISTANT_ACQUIRE_MAX_WAIT_SECS";
 
-/// Default max wait: 4 hours. `intake_coder_sweep` holds ONE guard for its
-/// ENTIRE multi-day run (all models, by design — see coder_sweep.rs), so
-/// this cap does NOT guarantee the assistant sweep gets in during a single
-/// wait; it bounds each systemd restart cycle. The practical effect: instead
-/// of `intake_assistant_sweep`'s unit crash-looping every ~5 minutes
-/// (`RestartSec`) for the ENTIRE multi-day duration of a coder-sweep run, it
-/// now retries silently every `ACQUIRE_POLL_INTERVAL` and only exits/restarts
-/// roughly every 4 hours — a large reduction in restart frequency and log
-/// noise, not a guarantee of getting in within 4 hours. 4h is long enough to
-/// outlast a single coder-sweep model's acquisition + full ASMT-02..07 suite
-/// run (observed on the order of tens of minutes per model, per S83/HFIX
-/// timings) without waiting so long that a genuinely wedged GPU (e.g. a
-/// crashed holder whose lock never clears) goes unreported for the better
-/// part of a day.
+/// Default max wait: 4 hours. In practice a per-model reacquire should only
+/// ever wait for coder-sweep's CURRENT (model, backend) pass to finish
+/// (observed on the order of tens of minutes per model, per S83/HFIX
+/// timings) — this cap is the safety net for a genuinely wedged GPU (e.g. a
+/// crashed holder whose lock never clears), not the expected wait.
 const ACQUIRE_MAX_WAIT_DEFAULT_SECS: u64 = 4 * 60 * 60;
-
-/// How often to retry a refused acquire.
-const ACQUIRE_POLL_INTERVAL: Duration = Duration::from_secs(60);
-
-/// How often to re-log while still waiting, so a long wait is observable in
-/// the log file / journalctl without spamming a line every poll (60s).
-const ACQUIRE_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// Read [`ACQUIRE_MAX_WAIT_ENV`], falling back to
 /// [`ACQUIRE_MAX_WAIT_DEFAULT_SECS`] when unset, unparsable, or non-positive.
@@ -531,132 +562,83 @@ fn acquire_max_wait() -> Duration {
         .unwrap_or(Duration::from_secs(ACQUIRE_MAX_WAIT_DEFAULT_SECS))
 }
 
-/// Injectable clock so [`acquire_with_backoff`] is unit-testable without
-/// real time passing. Production uses [`RealClock`] (real `Instant` +
-/// `tokio::time::sleep`); tests use a fake that advances a virtual clock
-/// instantly.
+/// Per-unit-of-work GPU lock, injected into [`run_with`] so the
+/// acquire-per-model / release-per-model fairness policy is unit-testable
+/// without a real lock file or GPU — mirrors [`Acquirer`]/[`SuiteDriver`]'s
+/// existing trait-injection pattern. The live impl bounds every acquire with
+/// [`gpu_authority::acquire_with_backoff`]; test fakes grant/refuse on a
+/// script and record calls.
 #[async_trait::async_trait]
-pub(crate) trait AcquireClock: Send + Sync {
-    fn now(&self) -> std::time::Instant;
-    async fn sleep(&self, dur: Duration);
+pub trait GpuLock: Send + Sync {
+    /// Acquire for the next unit of work (one model). `Err` only after a
+    /// bounded wait gives up (see `gpu_authority::acquire_with_backoff`).
+    async fn acquire(&self) -> Result<(), String>;
+    /// Release. Only ever called after a successful `acquire`.
+    fn release(&self);
+    /// How long to pause after a release before the NEXT acquire is
+    /// attempted — see `gpu_authority::INTER_UNIT_RELEASE_PAUSE` for why
+    /// this must be longer than the shared poll interval for real
+    /// alternation to happen. Test fakes return `Duration::ZERO`.
+    fn release_pause(&self) -> Duration;
 }
 
-pub(crate) struct RealClock;
+/// Live [`GpuLock`]: the real `gpu_authority` lock file, gated by the shared
+/// bounded-backoff retry.
+pub struct LiveGpuLock {
+    holder: &'static str,
+}
+
+impl LiveGpuLock {
+    pub fn new(holder: &'static str) -> Self {
+        LiveGpuLock { holder }
+    }
+}
 
 #[async_trait::async_trait]
-impl AcquireClock for RealClock {
-    fn now(&self) -> std::time::Instant {
-        std::time::Instant::now()
+impl GpuLock for LiveGpuLock {
+    async fn acquire(&self) -> Result<(), String> {
+        gpu_authority::acquire_with_backoff(
+            &gpu_authority::RealClock,
+            || gpu_authority::acquire(GpuMode::Exclusive, self.holder),
+            gpu_authority::is_live_holder_refusal,
+            gpu_authority::ACQUIRE_POLL_INTERVAL,
+            gpu_authority::ACQUIRE_PROGRESS_LOG_INTERVAL,
+            acquire_max_wait(),
+            self.holder,
+        )
+        .await
     }
 
-    async fn sleep(&self, dur: Duration) {
-        tokio::time::sleep(dur).await;
-    }
-}
-
-/// Acquire via `try_acquire`, retrying with backoff instead of failing
-/// immediately when it returns `Err` (e.g. the GPU is exclusively held by
-/// another sweep) — bounded by `max_wait`. Returns the same `Err` shape a
-/// one-shot acquire would once the cap is hit, so systemd's
-/// `Restart=on-failure` remains the ultimate safety net, just at a much
-/// lower frequency than every retry.
-///
-/// Only retry a refusal that looks like "someone else currently, actively
-/// holds the exclusive lock" (the local lock file per [`gpu_authority`]'s
-/// `is_blocked` path, OR Chord's own remote lock via `ChordCall::Held`) —
-/// the actual coder-sweep-is-mid-run scenario this backoff exists for. Both
-/// of those refusal paths return `Err` BEFORE `gpu_authority::acquire()`
-/// stops any services, so retrying them is side-effect-free.
-///
-/// Deliberately NOT retried: a misconfigured `CHORD_JWT` (`Unauthorized`), a
-/// generic Chord/network failure (`Failed`), or a `systemctl`/lock-file-write
-/// failure inside `acquire()` — those are NOT "someone else has it right
-/// now," they're a broken acquire, and `acquire()` stops
-/// `policy.stop_services` (e.g. `lemonade-coder.service`) BEFORE it can fail
-/// on those paths. Retrying one of those every `poll_interval` for up to
-/// `max_wait` would repeatedly stop/restart a production serving unit for
-/// hours on a persistent, non-transient error instead of failing fast and
-/// visibly the way the pre-HFIX-09 one-shot acquire did. So those fail
-/// immediately, same as before this change — systemd's crash-loop remains
-/// the (louder, faster) safety net for a genuinely broken acquire, while the
-/// bounded wait only kicks in for the expected "coder-sweep has it" case.
-///
-/// Matching is by substring against `gpu_authority`'s current error text —
-/// deliberately fail-CLOSED (an unrecognized message is treated as
-/// NON-retryable) so a message-format drift in `gpu_authority.rs` degrades to
-/// "fail fast, like before," never to "silently retry forever."
-pub(crate) fn is_live_holder_refusal(err: &str) -> bool {
-    err.contains("held exclusively by")
-}
-
-/// Generic over the acquired value `T`, the clock, and the retry predicate
-/// so this is testable with a fake acquire function, a fake (instant) clock,
-/// and an arbitrary `is_retryable` — no real `sleep()` in tests.
-pub(crate) async fn acquire_with_backoff<T, F, C>(
-    clock: &C,
-    mut try_acquire: F,
-    is_retryable: impl Fn(&str) -> bool,
-    poll_interval: Duration,
-    progress_log_interval: Duration,
-    max_wait: Duration,
-) -> Result<T, String>
-where
-    F: FnMut() -> Result<T, String>,
-    C: AcquireClock,
-{
-    let start = clock.now();
-    let mut waiting = false;
-    let mut last_progress_log = start;
-
-    loop {
-        match try_acquire() {
-            Ok(v) => {
-                if waiting {
-                    tracing::info!(
-                        "intake_assistant_sweep: GPU acquired after waiting {:.0?} for another holder to release it",
-                        clock.now().duration_since(start)
-                    );
-                }
-                return Ok(v);
-            }
-            Err(e) => {
-                if !is_retryable(&e) {
-                    tracing::error!(
-                        "intake_assistant_sweep: GPU acquire failed with a non-transient error \
-                         ({e}) — not retrying (this is not the \"another holder has it right \
-                         now\" case; waiting would just repeatedly bounce production services)"
-                    );
-                    return Err(e);
-                }
-                let elapsed = clock.now().duration_since(start);
-                if elapsed >= max_wait {
-                    tracing::error!(
-                        "intake_assistant_sweep: giving up waiting for the GPU after {:.0?} \
-                         (cap {:.0?}); last refusal: {e}",
-                        elapsed,
-                        max_wait
-                    );
-                    return Err(format!(
-                        "gave up waiting for the GPU after {elapsed:.0?} (cap {max_wait:.0?}): {e}"
-                    ));
-                }
-                if !waiting {
-                    waiting = true;
-                    last_progress_log = start;
-                    tracing::warn!(
-                        "intake_assistant_sweep: GPU acquire refused ({e}) — waiting for it to \
-                         free up, retrying every {poll_interval:.0?} (giving up after {max_wait:.0?})"
-                    );
-                } else if clock.now().duration_since(last_progress_log) >= progress_log_interval {
-                    last_progress_log = clock.now();
-                    tracing::warn!(
-                        "intake_assistant_sweep: still waiting for the GPU after {:.0?} ({e})",
-                        elapsed
-                    );
-                }
-                clock.sleep(poll_interval).await;
-            }
+    fn release(&self) {
+        if let Err(e) = gpu_authority::release(self.holder) {
+            tracing::warn!(
+                "{}: release between units failed for '{}': {e}",
+                self.holder,
+                self.holder
+            );
         }
+    }
+
+    fn release_pause(&self) -> Duration {
+        gpu_authority::INTER_UNIT_RELEASE_PAUSE
+    }
+}
+
+/// RAII: releases `lock` on drop, exactly once — so a checkpoint-mark
+/// failure (`?` early return) or a panic mid-unit still releases the GPU
+/// rather than leaking it for the rest of this process's life. Deliberately
+/// NOT `gpu_authority::ExclusiveGuard` itself: that type owns a `holder`
+/// `String` and calls the raw (non-backoff) `release` directly, which is
+/// fine, but keeping the release path behind the SAME [`GpuLock`] trait the
+/// acquire path uses keeps both sides of one unit's lifecycle mockable
+/// through one seam in tests.
+struct ReleaseOnDrop<'a> {
+    lock: &'a dyn GpuLock,
+}
+
+impl Drop for ReleaseOnDrop<'_> {
+    fn drop(&mut self) {
+        self.lock.release();
     }
 }
 
@@ -673,37 +655,17 @@ pub async fn run() -> Result<RunReport, ToolError> {
     let nominations = Nominations::load().map_err(ToolError::NotConfigured)?;
     let mem_config = mem_config_from_env();
 
-    // HFIX-08/HFIX-09: proactively claim exclusive GPU use BEFORE running a
-    // single model — mirrors intake_coder_sweep.rs exactly (same
-    // GpuMode::Exclusive, same holder-label-per-binary convention, same lock
-    // file at /run/gpu-authority.lock via gpu_authority::ExclusiveGuard).
-    // Prior to HFIX-08, the assistant sweep never checked or acquired this
-    // lock at all, so it could — and in production did — fire its own Ollama
-    // requests while the coder sweep held exclusive use, evicting the coder
-    // sweep's resident model out from under it (and vice versa) under the
-    // host's OLLAMA_MAX_LOADED_MODELS=1 policy, causing continuous
-    // model-reload thrashing.
-    //
-    // HFIX-09: a refusal no longer fails `run()` immediately — coder-sweep
-    // legitimately holds this guard for its entire multi-day run, so an
-    // immediate `Err` here crash-looped the whole unit every ~5 minutes for
-    // days. Instead we wait (bounded — see `acquire_with_backoff`) for the
-    // other holder to release it. Held for the duration of `run()` via the
-    // `_gpu_guard` binding's scope; released on drop (including on early
-    // return via `?` below).
-    let _gpu_guard = match acquire_with_backoff(
-        &RealClock,
-        || gpu_authority::ExclusiveGuard::acquire(GpuMode::Exclusive, GPU_HOLDER),
-        is_live_holder_refusal,
-        ACQUIRE_POLL_INTERVAL,
-        ACQUIRE_PROGRESS_LOG_INTERVAL,
-        acquire_max_wait(),
-    )
-    .await
-    {
-        Ok(g) => g,
-        Err(e) => return Err(ToolError::Execution(format!("assistant sweep did not start: {e}"))),
-    };
+    // S86: exclusive GPU use is now claimed PER MODEL (see `run_with`'s loop),
+    // not once for this whole multi-hour run — HFIX-08/HFIX-09's one-shot,
+    // whole-run guard fixed the crash-loop (a refusal no longer fails `run()`
+    // immediately; it waits, bounded) but NOT the underlying starvation:
+    // `intake_coder_sweep` legitimately holds ITS guard for its entire
+    // multi-day run, so a whole-run guard here just waited quietly for as
+    // long as coder-sweep ran, producing zero data for 2+ days straight in
+    // production. `LiveGpuLock` (below) reuses the exact same
+    // `gpu_authority::acquire_with_backoff` bounded-wait for every per-model
+    // (re)acquire.
+    let gpu_lock = LiveGpuLock::new(GPU_HOLDER);
 
     let acquirer = acquire::ShellAcquirer;
     let driver = LiveSuiteDriver::new();
@@ -711,7 +673,7 @@ pub async fn run() -> Result<RunReport, ToolError> {
     let checkpoint = FileCheckpoint::open()?;
     let fleet_store = PgFleetStore::new(pool.clone(), run_id, mem_config);
 
-    run_with(&nominations, &acquirer, &driver, &sink, &checkpoint, &fleet_store)
+    run_with(&nominations, &acquirer, &driver, &sink, &checkpoint, &fleet_store, &gpu_lock)
         .await
         .map_err(ToolError::Execution)
 }
@@ -925,224 +887,6 @@ mod tests {
         assert_eq!(SUITE_DIMENSIONS.len(), 6);
         assert_eq!(SUITE_DIMENSIONS[0], super::super::dim1_conversation::DIMENSION);
         assert_eq!(SUITE_DIMENSIONS[5], super::super::dim6_embeddings::DIMENSION);
-    }
-
-    // ── HFIX-09 acquire-retry backoff ──
-
-    /// A fake clock: `now()` returns a virtual instant that only advances
-    /// when `sleep()` is called (by the amount requested) — no real time
-    /// passes. Also records how many times `sleep` was called and the total
-    /// requested sleep duration, so tests can assert on retry counts without
-    /// depending on wall-clock timing at all.
-    struct FakeClock {
-        elapsed: Mutex<Duration>,
-        sleep_calls: Mutex<u32>,
-    }
-
-    impl FakeClock {
-        fn new() -> Self {
-            FakeClock { elapsed: Mutex::new(Duration::ZERO), sleep_calls: Mutex::new(0) }
-        }
-
-        fn sleep_call_count(&self) -> u32 {
-            *self.sleep_calls.lock().unwrap()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl AcquireClock for FakeClock {
-        fn now(&self) -> std::time::Instant {
-            // `Instant` cannot be constructed at an arbitrary offset directly,
-            // so anchor a fixed base instant once and add the virtual elapsed
-            // duration recorded so far.
-            use std::sync::OnceLock;
-            static BASE: OnceLock<std::time::Instant> = OnceLock::new();
-            let base = *BASE.get_or_init(std::time::Instant::now);
-            base + *self.elapsed.lock().unwrap()
-        }
-
-        async fn sleep(&self, dur: Duration) {
-            *self.sleep_calls.lock().unwrap() += 1;
-            *self.elapsed.lock().unwrap() += dur;
-            // Deliberately NOT a real sleep — the whole point of the fake
-            // clock is that tests run instantly regardless of `dur`.
-        }
-    }
-
-    #[tokio::test]
-    async fn acquire_with_backoff_retries_then_succeeds() {
-        let clock = FakeClock::new();
-        let attempts = Mutex::new(0u32);
-        let result = acquire_with_backoff(
-            &clock,
-            || {
-                let mut n = attempts.lock().unwrap();
-                *n += 1;
-                if *n < 4 {
-                    Err(format!("refused (attempt {n})"))
-                } else {
-                    Ok(*n)
-                }
-            },
-            |_| true, // treat every refusal as retryable for this test
-            Duration::from_secs(60),
-            Duration::from_secs(600),
-            Duration::from_secs(3600),
-        )
-        .await;
-
-        assert_eq!(result, Ok(4), "must return the value from the attempt that finally succeeded");
-        assert_eq!(*attempts.lock().unwrap(), 4, "must have tried exactly 4 times (3 refusals + 1 success)");
-        assert_eq!(
-            clock.sleep_call_count(),
-            3,
-            "must sleep between refusals only, never after a success"
-        );
-    }
-
-    #[tokio::test]
-    async fn acquire_with_backoff_succeeds_immediately_without_sleeping() {
-        let clock = FakeClock::new();
-        let result: Result<u32, String> = acquire_with_backoff(
-            &clock,
-            || Ok(42),
-            |_| true,
-            Duration::from_secs(60),
-            Duration::from_secs(600),
-            Duration::from_secs(3600),
-        )
-        .await;
-
-        assert_eq!(result, Ok(42));
-        assert_eq!(clock.sleep_call_count(), 0, "a first-try success must never sleep");
-    }
-
-    #[tokio::test]
-    async fn acquire_with_backoff_gives_up_after_max_wait_and_stops_retrying() {
-        let clock = FakeClock::new();
-        let attempts = Mutex::new(0u32);
-        let result: Result<(), String> = acquire_with_backoff(
-            &clock,
-            || {
-                *attempts.lock().unwrap() += 1;
-                Err("GPU is held exclusively by 'intake_coder_sweep'".to_string())
-            },
-            is_live_holder_refusal,
-            Duration::from_secs(60),
-            Duration::from_secs(600),
-            Duration::from_secs(300), // max_wait: 5 poll intervals
-        )
-        .await;
-
-        assert!(result.is_err(), "must give up rather than retry forever");
-        let msg = result.unwrap_err();
-        assert!(
-            msg.contains("gave up waiting for the GPU"),
-            "give-up error must be self-explanatory in a log/journalctl, got: {msg}"
-        );
-        assert!(
-            msg.contains("intake_coder_sweep"),
-            "give-up error should carry the last underlying refusal for diagnosis, got: {msg}"
-        );
-
-        // With a 60s poll interval and a 300s cap, the loop must terminate
-        // (bounded attempts), not spin unboundedly.
-        let tries = *attempts.lock().unwrap();
-        assert!(tries >= 5 && tries <= 6, "expected roughly max_wait/poll_interval attempts, got {tries}");
-    }
-
-    #[tokio::test]
-    async fn acquire_with_backoff_never_retries_a_first_try_beyond_max_wait_zero() {
-        // A max_wait of 0 means: try once, and if it fails, give up immediately
-        // (no sleep at all) — the cap is honored even on the very first refusal.
-        let clock = FakeClock::new();
-        let attempts = Mutex::new(0u32);
-        let result: Result<(), String> = acquire_with_backoff(
-            &clock,
-            || {
-                *attempts.lock().unwrap() += 1;
-                Err("refused".to_string())
-            },
-            |_| true,
-            Duration::from_secs(60),
-            Duration::from_secs(600),
-            Duration::ZERO,
-        )
-        .await;
-
-        assert!(result.is_err());
-        assert_eq!(*attempts.lock().unwrap(), 1, "max_wait=0 must not retry at all");
-        assert_eq!(clock.sleep_call_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn acquire_with_backoff_fails_fast_on_a_non_retryable_error_without_sleeping() {
-        // The masking hazard this predicate exists to prevent: a persistent,
-        // non-transient acquire failure (e.g. misconfigured CHORD_JWT) must
-        // NOT be retried for up to max_wait — gpu_authority::acquire() stops
-        // production services (e.g. lemonade-coder.service) before it can
-        // fail on that path, so retrying it every poll_interval would bounce
-        // that service repeatedly for hours instead of failing immediately.
-        let clock = FakeClock::new();
-        let attempts = Mutex::new(0u32);
-        let result: Result<(), String> = acquire_with_backoff(
-            &clock,
-            || {
-                *attempts.lock().unwrap() += 1;
-                Err("chord rejected the GPU-exclusive acquire (401/403) — set CHORD_JWT \
-                     to a valid lumina token for this harness host"
-                    .to_string())
-            },
-            is_live_holder_refusal,
-            Duration::from_secs(60),
-            Duration::from_secs(600),
-            Duration::from_secs(3600 * 4),
-        )
-        .await;
-
-        assert!(result.is_err(), "a non-retryable refusal must still fail");
-        assert_eq!(
-            *attempts.lock().unwrap(),
-            1,
-            "must try exactly once and give up immediately, not retry a non-transient error"
-        );
-        assert_eq!(
-            clock.sleep_call_count(),
-            0,
-            "must never sleep before failing fast on a non-retryable error"
-        );
-        assert!(
-            result.unwrap_err().contains("CHORD_JWT"),
-            "the original error detail must be preserved for diagnosis"
-        );
-    }
-
-    #[test]
-    fn is_live_holder_refusal_recognizes_both_local_and_chord_held_messages() {
-        // These are gpu_authority.rs's ACTUAL current error strings (local
-        // lock block, and Chord's remote `Held` refusal) — if that wording
-        // ever drifts, this test should be updated alongside it so the
-        // predicate keeps recognizing the retryable case rather than
-        // silently falling back to "fail fast" for the expected scenario.
-        assert!(is_live_holder_refusal(
-            "GPU is held exclusively by 'intake_coder_sweep' (pid 123, mode exclusive, \
-             since epoch 100) — refusing to acquire for 'intake_assistant_sweep'"
-        ));
-        assert!(is_live_holder_refusal(
-            "chord reports the GPU is already held exclusively by 'intake_coder_sweep' \
-             — refusing to start"
-        ));
-    }
-
-    #[test]
-    fn is_live_holder_refusal_rejects_non_transient_errors() {
-        assert!(!is_live_holder_refusal(
-            "chord rejected the GPU-exclusive acquire (401/403) — set CHORD_JWT to a valid \
-             lumina token for this harness host"
-        ));
-        assert!(!is_live_holder_refusal("chord GPU-exclusive acquire failed: connection reset"));
-        assert!(!is_live_holder_refusal("failed to write GPU lock file: permission denied"));
-        assert!(!is_live_holder_refusal("some entirely unrecognized message"));
     }
 
     #[test]
@@ -1359,10 +1103,82 @@ mod tests {
     }
 
     fn block<F: std::future::Future>(f: F) -> F::Output {
+        // `enable_time()`: S86's `run_with` uses `tokio::time::sleep` for the
+        // inter-unit release pause (the live `GpuLock` impl uses 90s;
+        // `NoopGpuLock`/`ScriptGpuLock` return `Duration::ZERO`, but the
+        // sleep call itself still needs a timer-enabled runtime to resolve).
         tokio::runtime::Builder::new_current_thread()
+            .enable_time()
             .build()
             .unwrap()
             .block_on(f)
+    }
+
+    // ── S86: GpuLock fakes (mock the lock, never a real lock file / GPU) ──
+
+    /// Grants immediately, zero pause — for tests exercising `run_with`'s
+    /// acquisition/backend/checkpoint orchestration, where the GPU-lock
+    /// fairness mechanism itself is not under test (that has its own
+    /// dedicated tests below, plus `gpu_authority.rs`'s alternation
+    /// simulation).
+    struct NoopGpuLock;
+    #[async_trait::async_trait]
+    impl GpuLock for NoopGpuLock {
+        async fn acquire(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn release(&self) {}
+        fn release_pause(&self) -> Duration {
+            Duration::ZERO
+        }
+    }
+
+    /// Scriptable GpuLock: counts acquire/release/pause calls, and can be
+    /// told to refuse specific (1-based) acquire attempts — so tests can
+    /// assert `run_with` acquires exactly ONCE PER MODEL (not per backend,
+    /// not once for the whole run), pauses only BETWEEN models (never
+    /// before the first), and treats a reacquire failure as a per-model
+    /// skip that does not abort the rest of the fleet.
+    #[derive(Default)]
+    struct ScriptGpuLock {
+        fail_on_call: BTreeSet<u32>,
+        call_no: Mutex<u32>,
+        acquire_calls: Mutex<u32>,
+        release_calls: Mutex<u32>,
+        pause_calls: Mutex<u32>,
+    }
+
+    impl ScriptGpuLock {
+        fn failing_on(call_no: u32) -> Self {
+            let mut s = ScriptGpuLock::default();
+            s.fail_on_call.insert(call_no);
+            s
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GpuLock for ScriptGpuLock {
+        async fn acquire(&self) -> Result<(), String> {
+            let n = {
+                let mut c = self.call_no.lock().unwrap();
+                *c += 1;
+                *c
+            };
+            if self.fail_on_call.contains(&n) {
+                return Err(format!(
+                    "GPU is held exclusively by 'other-sweep' (scripted refusal on attempt {n})"
+                ));
+            }
+            *self.acquire_calls.lock().unwrap() += 1;
+            Ok(())
+        }
+        fn release(&self) {
+            *self.release_calls.lock().unwrap() += 1;
+        }
+        fn release_pause(&self) -> Duration {
+            *self.pause_calls.lock().unwrap() += 1;
+            Duration::ZERO
+        }
     }
 
     #[test]
@@ -1377,7 +1193,7 @@ mod tests {
         let cp = MemCheckpoint::default();
         let fleet = MemFleet::default();
 
-        let report = block(run_with(&n, &acq, &driver, &sink, &cp, &fleet)).unwrap();
+        let report = block(run_with(&n, &acq, &driver, &sink, &cp, &fleet, &NoopGpuLock)).unwrap();
 
         // 6 dims × 2 backends = 12 rows persisted, 12 checkpoints.
         assert_eq!(sink.rows.lock().unwrap().len(), 12);
@@ -1410,7 +1226,7 @@ mod tests {
         let cp = MemCheckpoint::default();
         let fleet = MemFleet::default();
 
-        let report = block(run_with(&n, &acq, &driver, &sink, &cp, &fleet)).unwrap();
+        let report = block(run_with(&n, &acq, &driver, &sink, &cp, &fleet, &NoopGpuLock)).unwrap();
 
         // 7 dims × 2 backends = 14 rows persisted, 14 checkpoints.
         assert_eq!(sink.rows.lock().unwrap().len(), 14);
@@ -1442,7 +1258,7 @@ mod tests {
         let cp = MemCheckpoint::default();
         let fleet = MemFleet::default();
 
-        let report = block(run_with(&n, &acq, &driver, &sink, &cp, &fleet)).unwrap();
+        let report = block(run_with(&n, &acq, &driver, &sink, &cp, &fleet, &NoopGpuLock)).unwrap();
 
         // Still only the standard 6 dims ran (dim7 never got invoked) ...
         assert!(
@@ -1479,7 +1295,7 @@ mod tests {
         let cp = MemCheckpoint::default();
         let fleet = MemFleet::default();
 
-        let report = block(run_with(&n, &acq, &driver, &sink, &cp, &fleet)).unwrap();
+        let report = block(run_with(&n, &acq, &driver, &sink, &cp, &fleet, &NoopGpuLock)).unwrap();
 
         let big = &report.models[0];
         assert_eq!(big.model_id.as_str(), "command-a-plus:218b");
@@ -1503,7 +1319,7 @@ mod tests {
         let cp = MemCheckpoint::default();
         let fleet = MemFleet::default();
 
-        let report = block(run_with(&n, &acq, &driver, &sink, &cp, &fleet)).unwrap();
+        let report = block(run_with(&n, &acq, &driver, &sink, &cp, &fleet, &NoopGpuLock)).unwrap();
 
         // No dimensions ran (smoke gate), no rows, no fleet membership.
         assert!(sink.rows.lock().unwrap().is_empty());
@@ -1528,7 +1344,7 @@ mod tests {
         let cp = MemCheckpoint::default();
         let fleet = MemFleet::default();
 
-        let report = block(run_with(&n, &acq, &driver, &sink, &cp, &fleet)).unwrap();
+        let report = block(run_with(&n, &acq, &driver, &sink, &cp, &fleet, &NoopGpuLock)).unwrap();
         let b = &report.models[0].backends[0];
         // 5 dims persisted, dim3 recorded as a skip with reason, run continued.
         assert_eq!(b.persisted_dims.len(), 5);
@@ -1561,7 +1377,7 @@ mod tests {
         let sink = MemSink::default();
         let fleet = MemFleet::default();
 
-        let report = block(run_with(&n, &acq, &driver, &sink, &cp, &fleet)).unwrap();
+        let report = block(run_with(&n, &acq, &driver, &sink, &cp, &fleet, &NoopGpuLock)).unwrap();
 
         let gpu = report.models[0]
             .backends
@@ -1606,12 +1422,130 @@ mod tests {
         let sink = MemSink::default();
         let fleet = MemFleet::default();
 
-        block(run_with(&n, &acq, &driver, &sink, &cp, &fleet)).unwrap();
+        block(run_with(&n, &acq, &driver, &sink, &cp, &fleet, &NoopGpuLock)).unwrap();
 
         // Smoke was never called for the fully-resumed gpu backend.
         assert!(driver.smoke_calls.lock().unwrap().is_empty());
         // No new rows; still a survivor (resumed) → still gets a fleet row.
         assert!(sink.rows.lock().unwrap().is_empty());
         assert_eq!(fleet.rows.lock().unwrap().len(), 1);
+    }
+
+    // ── S86: GPU lock acquired/released PER MODEL, not once per whole run ──
+
+    #[test]
+    fn gpu_lock_acquired_and_released_exactly_once_per_model_not_per_backend() {
+        // One model with BOTH backends (gpu + cpu) must take the GPU lock
+        // exactly once, covering both backend passes — not once per backend,
+        // and not held for the (in this test, single-model) whole run either;
+        // the two are indistinguishable with one model, so see the two-model
+        // test below for that distinction.
+        let n = noms(
+            r#"{"nominations":[{"id":"command-r:35b","size_b":35,"gfx1151_class":"confirmed","acquisition":"ollama_pull"}]}"#,
+        );
+        let acq = ScriptAcquirer { skip: BTreeSet::new() };
+        let driver = ScriptDriver::new();
+        let sink = MemSink::default();
+        let cp = MemCheckpoint::default();
+        let fleet = MemFleet::default();
+        let gpu = ScriptGpuLock::default();
+
+        block(run_with(&n, &acq, &driver, &sink, &cp, &fleet, &gpu)).unwrap();
+
+        assert_eq!(*gpu.acquire_calls.lock().unwrap(), 1);
+        assert_eq!(*gpu.release_calls.lock().unwrap(), 1);
+        // Both backend passes actually ran (proves the lock covered both).
+        assert_eq!(driver.smoke_calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn gpu_lock_pauses_between_models_but_never_before_the_first() {
+        let n = noms(
+            r#"{"nominations":[
+                {"id":"a:8b","size_b":8,"gfx1151_class":"confirmed","acquisition":"ollama_pull","backends":["gpu"]},
+                {"id":"b:8b","size_b":8,"gfx1151_class":"confirmed","acquisition":"ollama_pull","backends":["gpu"]}
+            ]}"#,
+        );
+        let acq = ScriptAcquirer { skip: BTreeSet::new() };
+        let driver = ScriptDriver::new();
+        let sink = MemSink::default();
+        let cp = MemCheckpoint::default();
+        let fleet = MemFleet::default();
+        let gpu = ScriptGpuLock::default();
+
+        block(run_with(&n, &acq, &driver, &sink, &cp, &fleet, &gpu)).unwrap();
+
+        assert_eq!(*gpu.acquire_calls.lock().unwrap(), 2, "one acquire per model");
+        assert_eq!(*gpu.release_calls.lock().unwrap(), 2, "one release per model");
+        assert_eq!(
+            *gpu.pause_calls.lock().unwrap(),
+            1,
+            "pause happens BETWEEN the two models' units of work, never before the first"
+        );
+    }
+
+    #[test]
+    fn gpu_lock_reacquire_failure_is_a_recorded_skip_and_the_fleet_continues() {
+        // First model's acquire is scripted to be refused (as if the OTHER
+        // sweep's own unit is still running and this side's bounded backoff
+        // gave up). This must NOT abort the whole multi-model run — it must
+        // be recorded as this model's acquisition_skip (mirroring the
+        // existing over-VRAM skip path) and the fleet must continue to the
+        // next model, which succeeds normally.
+        let n = noms(
+            r#"{"nominations":[
+                {"id":"stuck:8b","size_b":8,"gfx1151_class":"confirmed","acquisition":"ollama_pull","backends":["gpu"]},
+                {"id":"fine:8b","size_b":8,"gfx1151_class":"confirmed","acquisition":"ollama_pull","backends":["gpu"]}
+            ]}"#,
+        );
+        let acq = ScriptAcquirer { skip: BTreeSet::new() };
+        let driver = ScriptDriver::new();
+        let sink = MemSink::default();
+        let cp = MemCheckpoint::default();
+        let fleet = MemFleet::default();
+        let gpu = ScriptGpuLock::failing_on(1); // refuse the very first acquire
+
+        let report = block(run_with(&n, &acq, &driver, &sink, &cp, &fleet, &gpu)).unwrap();
+
+        assert_eq!(report.models.len(), 2);
+        let stuck = &report.models[0];
+        assert_eq!(stuck.model_id.as_str(), "stuck:8b");
+        assert!(
+            stuck.acquisition_skip.as_deref().unwrap_or("").contains("GPU reacquire failed"),
+            "got: {:?}",
+            stuck.acquisition_skip
+        );
+        assert!(stuck.backends.is_empty(), "a GPU-refused model must never reach the driver");
+
+        let fine = &report.models[1];
+        assert_eq!(fine.model_id.as_str(), "fine:8b");
+        assert!(fine.acquisition_skip.is_none());
+        assert!(!fine.backends.is_empty(), "the NEXT model must still run normally — no fatal abort");
+
+        // The driver was only ever asked about the surviving model.
+        assert_eq!(driver.smoke_calls.lock().unwrap().len(), 1);
+        assert_eq!(driver.smoke_calls.lock().unwrap()[0].0, "fine:8b");
+    }
+
+    #[test]
+    fn gpu_lock_never_acquired_for_a_vram_skipped_model() {
+        // A model skipped by the (unrelated) VRAM/fetch Acquirer must never
+        // touch the GPU lock at all — no needless acquire/release churn for
+        // work that was never going to happen.
+        let n = noms(
+            r#"{"nominations":[{"id":"huge:400b","size_b":400,"gfx1151_class":"confirmed","acquisition":"ollama_pull"}]}"#,
+        );
+        let acq = ScriptAcquirer { skip: BTreeSet::from(["huge:400b".to_string()]) };
+        let driver = ScriptDriver::new();
+        let sink = MemSink::default();
+        let cp = MemCheckpoint::default();
+        let fleet = MemFleet::default();
+        let gpu = ScriptGpuLock::default();
+
+        block(run_with(&n, &acq, &driver, &sink, &cp, &fleet, &gpu)).unwrap();
+
+        assert_eq!(*gpu.acquire_calls.lock().unwrap(), 0);
+        assert_eq!(*gpu.release_calls.lock().unwrap(), 0);
+        assert_eq!(*gpu.pause_calls.lock().unwrap(), 0);
     }
 }
