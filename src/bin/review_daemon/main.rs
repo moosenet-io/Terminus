@@ -126,6 +126,46 @@ fn sanitize_env_once() -> HashMap<String, String> {
     sanitize::sanitized_env()
 }
 
+/// Constant-time byte comparison for the bearer token check -- avoids a
+/// timing side-channel that a byte-by-byte `==`/short-circuit comparison
+/// would leak (low severity here given loopback-only binding + a random
+/// token, but a one-line fix for an auth check).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+#[cfg(test)]
+mod constant_time_eq_tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn equal_slices_match() {
+        assert!(constant_time_eq(b"abc123", b"abc123"));
+    }
+
+    #[test]
+    fn different_content_same_length_does_not_match() {
+        assert!(!constant_time_eq(b"abc123", b"abc124"));
+    }
+
+    #[test]
+    fn different_length_does_not_match() {
+        assert!(!constant_time_eq(b"short", b"longerstring"));
+    }
+
+    #[test]
+    fn empty_slices_match() {
+        assert!(constant_time_eq(b"", b""));
+    }
+}
+
 async fn handle_connection(mut stream: TcpStream, state: Arc<AppState>) -> Result<(), String> {
     let req = match http::read_request(&mut stream, config::MAX_PROMPT_BYTES + 8192).await {
         Ok(r) => r,
@@ -155,10 +195,14 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<AppState>) -> Resul
     }
 
     // Bearer-token auth FIRST, before any body parsing / provider logic.
+    // `constant_time_eq` avoids a timing side-channel on the token comparison
+    // (loopback-only + a random 24-byte token makes this low-severity, but
+    // it's a one-line fix for a bearer-auth check).
     let auth_ok = req
         .headers
         .get("authorization")
-        .map(|v| v.trim() == format!("Bearer {}", state.token))
+        .and_then(|v| v.trim().strip_prefix("Bearer "))
+        .map(|presented| constant_time_eq(presented.as_bytes(), state.token.as_bytes()))
         .unwrap_or(false);
     if !auth_ok {
         http::write_json_response(
@@ -260,7 +304,27 @@ async fn run_provider(
     env: &HashMap<String, String>,
 ) -> Result<String, (&'static str, String)> {
     let built = provider::build_command(provider, prompt);
+    let result = run_built_command(&built, timeout_secs, env).await;
 
+    // Clean up the codex --output-last-message temp file on EVERY exit path
+    // (timeout, spawn failure, non-zero exit, empty output, success) -- not
+    // just the success path -- so a failing codex run never leaks a file
+    // under the daemon's temp dir.
+    if let Some(path) = &built.output_path {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    result
+}
+
+/// Core spawn-and-collect logic, split out from [`run_provider`] so the
+/// caller can run cleanup (temp-file removal) unconditionally on every exit
+/// path, including the early-return error cases here.
+async fn run_built_command(
+    built: &provider::BuiltCommand,
+    timeout_secs: u64,
+    env: &HashMap<String, String>,
+) -> Result<String, (&'static str, String)> {
     let mut command = tokio::process::Command::new(built.binary);
     command
         .args(&built.args)
@@ -286,9 +350,7 @@ async fn run_provider(
     }
 
     let text = if let Some(path) = &built.output_path {
-        let contents = tokio::fs::read_to_string(path).await.unwrap_or_default();
-        let _ = tokio::fs::remove_file(path).await;
-        contents.trim().to_string()
+        tokio::fs::read_to_string(path).await.unwrap_or_default().trim().to_string()
     } else {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     };

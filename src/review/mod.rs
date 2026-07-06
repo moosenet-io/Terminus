@@ -201,31 +201,44 @@ provider's failure degrades that entry rather than failing the whole call."
         let cfg = ReviewConfig::from_env();
 
         let mut set = tokio::task::JoinSet::new();
+        // Tracks each spawned task's tokio::task::Id back to its (index,
+        // provider name), so a task panic (JoinError) can still be attributed
+        // to the RIGHT slot instead of a fabricated trailing index -- which
+        // matters for adversarial_pair, where index 0/1 = defend/attack.
+        let mut id_to_slot: std::collections::HashMap<tokio::task::Id, (usize, String)> =
+            std::collections::HashMap::with_capacity(providers.len());
         for (idx, provider) in providers.iter().enumerate() {
             let role = role_for(structure, idx);
             let prompt_text = build_prompt(role, &criteria, &context);
             let cfg = cfg.clone();
             let provider = provider.clone();
-            set.spawn(async move {
+            let provider_for_map = provider.clone();
+            let handle = set.spawn(async move {
                 let result = run_one_provider(cfg, provider, prompt_text).await;
                 (idx, result)
             });
+            id_to_slot.insert(handle.id(), (idx, provider_for_map));
         }
 
         let mut indexed: Vec<(usize, ProviderResult)> = Vec::with_capacity(providers.len());
-        while let Some(joined) = set.join_next().await {
+        while let Some(joined) = set.join_next_with_id().await {
             match joined {
-                Ok(pair) => indexed.push(pair),
-                Err(e) => {
+                Ok((_id, pair)) => indexed.push(pair),
+                Err(join_err) => {
                     // A spawned task panicking is not expected, but must not
-                    // take the whole tool call down -- degrade instead.
+                    // take the whole tool call down -- degrade instead, at
+                    // the correct (idx, provider) slot.
+                    let (idx, provider) = id_to_slot
+                        .get(&join_err.id())
+                        .cloned()
+                        .unwrap_or((indexed.len(), "unknown".to_string()));
                     indexed.push((
-                        indexed.len(),
+                        idx,
                         ProviderResult {
-                            provider: "unknown".to_string(),
+                            provider,
                             verdict: "UNKNOWN".to_string(),
                             reasoning: String::new(),
-                            error: Some(format!("unavailable: task join error: {e}")),
+                            error: Some(format!("unavailable: task join error: {join_err}")),
                         },
                     ));
                 }

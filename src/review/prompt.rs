@@ -115,7 +115,16 @@ impl Verdict {
 /// its instructions-echo earlier in the response doesn't get picked up
 /// instead of its actual final answer.
 pub fn parse_verdict(raw: &str) -> (Verdict, String) {
-    let upper = raw.to_uppercase();
+    // ASCII-only uppercasing (not `to_uppercase()`): some Unicode uppercasing
+    // is NOT byte-length-preserving (e.g. U+01F0 'ǰ' -> "J" + combining caron
+    // grows from 2 bytes to 3), which would desync `pos` (a byte offset into
+    // `upper`) from `raw`'s byte offsets -- best case mis-sliced reasoning,
+    // worst case an out-of-bounds/non-char-boundary slice panic on
+    // model-generated prose containing such characters. `to_ascii_uppercase`
+    // only remaps ASCII bytes (0x00-0x7F) and passes every other byte through
+    // unchanged, so it's exactly byte-length-preserving and `VERDICT:` is
+    // itself pure ASCII, so the search is unaffected.
+    let upper = raw.to_ascii_uppercase();
     let anchor = upper.rfind("VERDICT:");
 
     let Some(pos) = anchor else {
@@ -216,6 +225,21 @@ mod tests {
         let (v, reasoning) = parse_verdict("I have thoughts but no marker.");
         assert_eq!(v, Verdict::Unknown);
         assert_eq!(reasoning, "I have thoughts but no marker.");
+    }
+
+    #[test]
+    fn parse_verdict_handles_non_length_preserving_uppercase_chars_without_panicking() {
+        // U+01F0 'ǰ' (2 bytes in UTF-8) uppercases via `str::to_uppercase()` to
+        // "J\u{30C}" (3 bytes) -- NOT byte-length-preserving. A byte offset
+        // found in a `to_uppercase()`'d copy would desync from the original
+        // string's byte offsets here, corrupting the slice or panicking on a
+        // non-char-boundary. `to_ascii_uppercase()` must be used instead so
+        // this reasoning text (before the verdict marker) doesn't break
+        // parsing. This is a regression test for that bug.
+        let raw = "The character \u{1F0} appears in this review.\nVERDICT: APPROVE";
+        let (v, reasoning) = parse_verdict(raw);
+        assert_eq!(v, Verdict::Approve);
+        assert!(reasoning.contains('\u{1F0}'));
     }
 
     #[test]
