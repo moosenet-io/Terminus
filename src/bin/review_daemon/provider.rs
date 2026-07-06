@@ -102,6 +102,16 @@ pub fn build_command(provider: Provider, prompt: &str) -> BuiltCommand {
                     "--sandbox".into(), "read-only".into(),
                     "-m".into(), CODEX_MODEL.into(),
                     "--output-last-message".into(), output_path.clone().into(),
+                    // "--" is the standard clap argv terminator: without it, a
+                    // prompt starting with '-' (e.g. "-not-a-flag ...") is
+                    // parsed as another `codex exec` option rather than the
+                    // positional prompt -- confirmed live: codex errors with
+                    // "unexpected argument '-n' found" on such a prompt
+                    // without this separator. This is not shell injection
+                    // (argv is still a fixed array, never a shell string),
+                    // but caller-controlled prompt text could otherwise
+                    // influence codex's own flag parsing.
+                    "--".into(),
                     prompt.to_string(),
                 ],
                 output_path: Some(output_path),
@@ -159,6 +169,24 @@ mod tests {
         assert_eq!(cmd.args.last().map(String::as_str), Some(prompt));
         assert_eq!(cmd.binary, "codex");
         assert!(cmd.output_path.is_some());
+    }
+
+    #[test]
+    fn codex_prompt_is_preceded_by_argv_terminator_even_when_flag_like() {
+        // A prompt starting with '-' must not be parsed as a codex CLI flag.
+        // Confirmed live: without the "--" terminator, codex errors with
+        // "unexpected argument '-n' found" on a prompt starting with '-n...'.
+        // The second-to-last argv element must be the literal "--" terminator
+        // immediately before the prompt.
+        let prompt = "-not-a-flag, reply with the word HELLO";
+        let cmd = build_command(Provider::Codex, prompt);
+        assert_eq!(cmd.args.last().map(String::as_str), Some(prompt));
+        assert_eq!(
+            cmd.args.get(cmd.args.len() - 2).map(String::as_str),
+            Some("--"),
+            "expected the argv terminator immediately before the prompt, got {:?}",
+            cmd.args
+        );
     }
 
     #[test]

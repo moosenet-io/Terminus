@@ -10,18 +10,25 @@
 
 use std::path::PathBuf;
 
-/// Return `true` if `name` resolves to an executable file somewhere on `$PATH`.
-pub fn resolve_on_path(name: &str) -> bool {
-    let Some(path_var) = std::env::var_os("PATH") else {
-        return false;
-    };
+/// Resolve `name` to an absolute path of an executable file somewhere on
+/// `$PATH`, or `None` if it isn't found. Returning (and the caller caching)
+/// the absolute path -- rather than just a found/not-found boolean -- matters:
+/// if only a boolean were cached, `Command::new(name)` would re-run PATH
+/// search AGAIN at spawn time, re-opening the exact TOCTOU/PATH-mutation
+/// window the "resolve once at startup" design is meant to close (a
+/// directory could be added/reordered on PATH, or a file swapped in, between
+/// startup and a later request). Spawning the cached absolute path instead
+/// means the binary actually resolved at boot is the one that runs, every
+/// time.
+pub fn resolve_on_path(name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         let candidate: PathBuf = dir.join(name);
         if is_executable_file(&candidate) {
-            return true;
+            return Some(candidate);
         }
     }
-    false
+    None
 }
 
 #[cfg(unix)]
@@ -45,11 +52,13 @@ mod tests {
     #[test]
     fn finds_a_binary_known_to_exist() {
         // `ls` exists on every unix CI/dev box this daemon targets.
-        assert!(resolve_on_path("ls"), "expected `ls` to resolve on PATH");
+        let resolved = resolve_on_path("ls");
+        assert!(resolved.is_some(), "expected `ls` to resolve on PATH");
+        assert!(resolved.unwrap().is_absolute());
     }
 
     #[test]
     fn does_not_find_a_nonexistent_binary() {
-        assert!(!resolve_on_path("definitely-not-a-real-binary-xyz-123"));
+        assert!(resolve_on_path("definitely-not-a-real-binary-xyz-123").is_none());
     }
 }

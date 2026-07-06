@@ -57,7 +57,14 @@ use tokio::sync::Semaphore;
 struct AppState {
     token: String,
     sanitized_env: HashMap<String, String>,
-    resolved: HashMap<&'static str, bool>,
+    /// Each provider's ABSOLUTE resolved binary path, cached once at startup.
+    /// `None` means the binary wasn't found on PATH at boot -- reported as
+    /// `binary_not_found` for every request without re-checking the
+    /// filesystem. Spawning always uses this cached absolute path (never
+    /// `Command::new("claude")` by bare name), so PATH mutations or
+    /// TOCTOU-style swaps after startup can't change which binary actually
+    /// runs.
+    resolved: HashMap<&'static str, Option<std::path::PathBuf>>,
     semaphore: Arc<Semaphore>,
 }
 
@@ -80,8 +87,13 @@ async fn main() {
     for p in [Provider::Opus, Provider::Codex, Provider::Agy] {
         resolved.insert(p.as_str(), resolve::resolve_on_path(p.binary()));
     }
-    for (name, found) in &resolved {
-        tracing::info!(provider = name, found, "review-daemon: startup binary resolution");
+    for (name, path) in &resolved {
+        tracing::info!(
+            provider = name,
+            found = path.is_some(),
+            resolved_path = ?path,
+            "review-daemon: startup binary resolution"
+        );
     }
 
     let state = Arc::new(AppState {
@@ -269,7 +281,7 @@ async fn handle_dispatch(
 
     let timeout_secs = config::clamp_timeout(parsed.timeout_secs);
 
-    if !state.resolved.get(parsed.provider.as_str()).copied().unwrap_or(false) {
+    let Some(Some(resolved_path)) = state.resolved.get(parsed.provider.as_str()) else {
         return (
             502,
             "Bad Gateway",
@@ -278,12 +290,12 @@ async fn handle_dispatch(
                 "detail": format!("'{}' binary was not found on PATH at daemon startup", parsed.provider.binary()),
             }),
         );
-    }
+    };
 
     // Bounded concurrency: at most MAX_CONCURRENCY subprocesses in flight.
     let _permit = state.semaphore.acquire().await;
 
-    match run_provider(parsed.provider, &parsed.prompt, timeout_secs, &state.sanitized_env).await {
+    match run_provider(parsed.provider, resolved_path, &parsed.prompt, timeout_secs, &state.sanitized_env).await {
         Ok(text) => (200, "OK", serde_json::json!({"text": text})),
         Err((kind, detail)) => (
             502,
@@ -297,14 +309,19 @@ async fn handle_dispatch(
 /// `(error_kind, detail)` pair. `error_kind` is one of
 /// `"timeout"|"empty_output"|"other"` (`"binary_not_found"` is handled by the
 /// caller before this is invoked, and `"auth_required"` before that).
+///
+/// `resolved_path` is the ABSOLUTE path cached in `AppState` at startup --
+/// spawning always uses this, never `Command::new(provider.binary())` by bare
+/// name, so PATH changes after startup can't change which binary runs.
 async fn run_provider(
     provider: Provider,
+    resolved_path: &std::path::Path,
     prompt: &str,
     timeout_secs: u64,
     env: &HashMap<String, String>,
 ) -> Result<String, (&'static str, String)> {
     let built = provider::build_command(provider, prompt);
-    let result = run_built_command(&built, timeout_secs, env).await;
+    let result = run_built_command(&built, resolved_path, timeout_secs, env).await;
 
     // Clean up the codex --output-last-message temp file on EVERY exit path
     // (timeout, spawn failure, non-zero exit, empty output, success) -- not
@@ -322,17 +339,24 @@ async fn run_provider(
 /// path, including the early-return error cases here.
 async fn run_built_command(
     built: &provider::BuiltCommand,
+    resolved_path: &std::path::Path,
     timeout_secs: u64,
     env: &HashMap<String, String>,
 ) -> Result<String, (&'static str, String)> {
-    let mut command = tokio::process::Command::new(built.binary);
+    let mut command = tokio::process::Command::new(resolved_path);
     command
         .args(&built.args)
         .env_clear()
         .envs(env)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        // On a timeout below, the `command.output()` future is dropped.
+        // Without kill_on_drop, tokio's Child does NOT kill the underlying
+        // process on drop -- it would keep running as an orphan after the
+        // daemon has already returned a "timeout" error and released its
+        // concurrency-cap permit, silently defeating MAX_CONCURRENCY.
+        .kill_on_drop(true);
 
     let output = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), command.output())
         .await
@@ -388,7 +412,7 @@ mod tests {
         let state = Arc::new(AppState {
             token: "t".into(),
             sanitized_env: HashMap::new(),
-            resolved: HashMap::from([("opus", true)]),
+            resolved: HashMap::from([("opus", Some(std::path::PathBuf::from("/bin/true")))]),
             semaphore: Arc::new(Semaphore::new(4)),
         });
         let huge = "a".repeat(config::MAX_PROMPT_BYTES + 1);
@@ -403,7 +427,7 @@ mod tests {
         let state = Arc::new(AppState {
             token: "t".into(),
             sanitized_env: HashMap::new(),
-            resolved: HashMap::from([("opus", false)]),
+            resolved: HashMap::from([("opus", None)]),
             semaphore: Arc::new(Semaphore::new(4)),
         });
         let body = serde_json::json!({"provider": "opus", "prompt": "hello"}).to_string();
