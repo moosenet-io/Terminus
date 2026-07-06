@@ -72,7 +72,12 @@
 //!   existed in the source Python (e.g. an `agent_id` of `../../something`
 //!   could not have been used to escape the intended path segment).
 //! - `soma_rename_agent` additionally rejects an empty or excessively long
-//!   `display_name` before sending the config-write PUT.
+//!   `display_name`, and (per adversarial review) bidi-control / invisible
+//!   Unicode format characters (e.g. right-to-left override, zero-width
+//!   joiners) that could visually spoof another agent's name in any UI that
+//!   renders `display_name` raw — before sending the config-write PUT. Full
+//!   mixed-script/homoglyph detection is a known follow-up, not attempted
+//!   here.
 
 use std::env;
 use std::time::Duration;
@@ -157,6 +162,33 @@ fn validate_path_segment(value: &str, field: &str) -> Result<(), ToolError> {
 
 /// Validate a display_name payload value (not a path segment — a JSON body
 /// field — so we only bound its length and reject empty/control characters).
+/// Unicode bidi-control / invisible-format characters that can be used to
+/// visually spoof a display name (e.g. a right-to-left override making text
+/// render reversed/misleadingly, or zero-width joiners hiding characters)
+/// without tripping `char::is_control()`, which only covers the Cc category.
+/// This list covers the bidi-control block plus common zero-width/format
+/// characters; it is not a full Unicode "Cf" category table, but it closes
+/// the concrete spoofing vectors these characters enable (adversarial review
+/// finding — a full mixed-script/confusable-homoglyph defense is a known
+/// follow-up, not attempted here).
+const DISALLOWED_FORMAT_CHARS: &[char] = &[
+    '\u{200B}', // zero width space
+    '\u{200C}', // zero width non-joiner
+    '\u{200D}', // zero width joiner
+    '\u{200E}', // left-to-right mark
+    '\u{200F}', // right-to-left mark
+    '\u{202A}', // left-to-right embedding
+    '\u{202B}', // right-to-left embedding
+    '\u{202C}', // pop directional formatting
+    '\u{202D}', // left-to-right override
+    '\u{202E}', // right-to-left override
+    '\u{2060}', // word joiner
+    '\u{2061}', '\u{2062}', '\u{2063}', '\u{2064}', // invisible math operators
+    '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', // directional isolates
+    '\u{FEFF}', // BOM / zero width no-break space
+    '\u{061C}', // Arabic letter mark
+];
+
 fn validate_display_name(value: &str) -> Result<(), ToolError> {
     if value.trim().is_empty() {
         return Err(ToolError::InvalidArgument("display_name must not be empty".into()));
@@ -167,6 +199,11 @@ fn validate_display_name(value: &str) -> Result<(), ToolError> {
     if value.chars().any(|c| c.is_control()) {
         return Err(ToolError::InvalidArgument(
             "display_name must not contain control characters".into(),
+        ));
+    }
+    if value.chars().any(|c| DISALLOWED_FORMAT_CHARS.contains(&c)) {
+        return Err(ToolError::InvalidArgument(
+            "display_name must not contain bidi-control or invisible formatting characters".into(),
         ));
     }
     Ok(())
@@ -758,6 +795,31 @@ mod tests {
     fn validate_display_name_rejects_control_chars() {
         assert!(validate_display_name("Vigil\n\rEvil").is_err());
         assert!(validate_display_name("Vigil\0").is_err());
+    }
+
+    #[test]
+    fn validate_display_name_rejects_bidi_override() {
+        // Adversarial review finding: right-to-left override can make a
+        // display name render reversed/misleadingly in any UI that shows it
+        // raw. This must be rejected even though it isn't a Cc control char.
+        assert!(validate_display_name("Vigil\u{202E}reversed").is_err());
+        assert!(validate_display_name("\u{202D}Axon\u{202C}").is_err());
+    }
+
+    #[test]
+    fn validate_display_name_rejects_invisible_format_chars() {
+        assert!(validate_display_name("Vigil\u{200B}").is_err()); // zero width space
+        assert!(validate_display_name("Vigil\u{FEFF}").is_err()); // BOM
+        assert!(validate_display_name("Vi\u{200D}gil").is_err()); // zero width joiner
+    }
+
+    #[test]
+    fn validate_display_name_still_allows_normal_unicode_letters() {
+        // This fix targets bidi-control/invisible-format characters, not
+        // legitimate non-ASCII letters (accents, other scripts written
+        // left-to-right/right-to-left normally without override controls).
+        assert!(validate_display_name("Séance").is_ok());
+        assert!(validate_display_name("日本語").is_ok());
     }
 
     #[test]
