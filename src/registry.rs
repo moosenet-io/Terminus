@@ -111,6 +111,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::lumina_ext::register(registry);
     crate::model_advisor::register(registry);
     crate::network::register(registry);
+    crate::odyssey::register(registry);
     crate::openhands::register(registry);
     crate::axon::register(registry);
     crate::commute::register(registry);
