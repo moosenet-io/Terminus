@@ -136,6 +136,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::plane::register(registry);
     crate::relay::register(registry);
     crate::reminder::register(registry);
+    crate::review::register(registry);
     crate::routines::register(registry);
     crate::seer::register(registry);
     crate::sentinel::register(registry);
