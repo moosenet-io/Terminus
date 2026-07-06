@@ -33,7 +33,7 @@ use crate::intake::assistant::acquire::{Nomination, Nominations};
 use crate::intake::assistant::schema;
 use crate::intake::assistant::BackendTag;
 use crate::intake::checkpoint::FileCheckpoint;
-use crate::intake::gpu_authority::{self, GpuMode};
+use crate::intake::gpu_authority;
 use crate::intake::{self, infer};
 
 // ===========================================================================
@@ -254,6 +254,15 @@ pub trait CoderSuiteDriver: Send + Sync {
     /// Run the v2 code suite for `model_id` under `profile_id`, against the
     /// currently-overridden backend. Persists one `code_profile_runs` row per
     /// case internally (the canonical write path, unchanged by this trait).
+    ///
+    /// `gpu_lock` (S86 max-lock-hold safety valve): the SAME [`GpuLock`] this
+    /// pass is already held under. The live implementation threads it into
+    /// the per-case loop (`code_v2::run_code_suite_v2`) so a pass that runs
+    /// unusually long (e.g. a model with a high transport-error retry rate)
+    /// yields the lock mid-pass instead of holding it for the pass's entire,
+    /// potentially hours-long duration. Test fakes ignore it — the fairness
+    /// timing itself is tested in `gpu_authority.rs` and via `ScriptGpuLock`
+    /// below, not by re-simulating the real per-case loop.
     #[allow(clippy::too_many_arguments)]
     async fn run_suite(
         &self,
@@ -263,6 +272,7 @@ pub trait CoderSuiteDriver: Send + Sync {
         case_limit: Option<usize>,
         backend_tag: &str,
         mem_config: Option<&str>,
+        gpu_lock: &dyn GpuLock,
     ) -> Result<intake::CodeV2Outcome, ToolError>;
 }
 
@@ -288,8 +298,18 @@ impl CoderSuiteDriver for LiveCoderDriver {
         case_limit: Option<usize>,
         backend_tag: &str,
         mem_config: Option<&str>,
+        gpu_lock: &dyn GpuLock,
     ) -> Result<intake::CodeV2Outcome, ToolError> {
-        intake::run_code_suite_v2(model_id, langs, profile_id, case_limit, Some(backend_tag), mem_config).await
+        intake::run_code_suite_v2(
+            model_id,
+            langs,
+            profile_id,
+            case_limit,
+            Some(backend_tag),
+            mem_config,
+            Some(gpu_lock),
+        )
+        .await
     }
 }
 
@@ -314,21 +334,16 @@ impl CoderSuiteDriver for LiveCoderDriver {
 // just in theory.
 
 /// Per-unit-of-work GPU lock, injected into [`run_fleet`] so the
-/// acquire-per-pass / release-per-pass fairness policy is unit-testable
-/// without a real lock file or GPU — mirrors [`CoderSuiteDriver`]'s existing
-/// trait-injection pattern (see `mod tests`'s `ScriptGpuLock`).
-#[async_trait::async_trait]
-pub trait GpuLock: Send + Sync {
-    /// Acquire for the next (model, backend) pass. `Err` only after a
-    /// bounded wait gives up (see `gpu_authority::acquire_with_backoff`).
-    async fn acquire(&self) -> Result<(), String>;
-    /// Release. Only ever called after a successful `acquire`.
-    fn release(&self);
-    /// How long to pause after a release before the NEXT acquire is
-    /// attempted — see `gpu_authority::INTER_UNIT_RELEASE_PAUSE`. Test fakes
-    /// return `Duration::ZERO`.
-    fn release_pause(&self) -> std::time::Duration;
-}
+/// acquire-per-pass / release-per-pass fairness policy (including the S86
+/// max-lock-hold safety valve, `check_max_hold`) is unit-testable without a
+/// real lock file or GPU — mirrors [`CoderSuiteDriver`]'s existing
+/// trait-injection pattern (see `mod tests`'s `ScriptGpuLock`). The trait
+/// itself, and its live implementation, now live in `gpu_authority.rs`
+/// (formerly duplicated near-identically here and in
+/// `assistant/runner.rs` — consolidated so both sweeps share one
+/// implementation of the safety-valve semantics rather than two copies that
+/// could drift apart).
+pub use gpu_authority::{GpuLock, LiveGpuLock};
 
 /// Env var overriding the max total time a bounded GPU-(re)acquire wait will
 /// spend retrying a refused acquire before giving up (whole seconds;
@@ -352,48 +367,6 @@ fn coder_acquire_max_wait() -> std::time::Duration {
         .filter(|secs| *secs > 0)
         .map(std::time::Duration::from_secs)
         .unwrap_or(std::time::Duration::from_secs(CODER_ACQUIRE_MAX_WAIT_DEFAULT_SECS))
-}
-
-/// Live [`GpuLock`]: the real `gpu_authority` lock file, gated by the shared
-/// bounded-backoff retry (the SAME implementation the assistant sweep uses).
-pub struct LiveGpuLock {
-    holder: &'static str,
-}
-
-impl LiveGpuLock {
-    pub fn new(holder: &'static str) -> Self {
-        LiveGpuLock { holder }
-    }
-}
-
-#[async_trait::async_trait]
-impl GpuLock for LiveGpuLock {
-    async fn acquire(&self) -> Result<(), String> {
-        gpu_authority::acquire_with_backoff(
-            &gpu_authority::RealClock,
-            || gpu_authority::acquire(GpuMode::Exclusive, self.holder),
-            gpu_authority::is_live_holder_refusal,
-            gpu_authority::ACQUIRE_POLL_INTERVAL,
-            gpu_authority::ACQUIRE_PROGRESS_LOG_INTERVAL,
-            coder_acquire_max_wait(),
-            self.holder,
-        )
-        .await
-    }
-
-    fn release(&self) {
-        if let Err(e) = gpu_authority::release(self.holder) {
-            tracing::warn!(
-                "{}: release between (model, backend) passes failed for '{}': {e}",
-                self.holder,
-                self.holder
-            );
-        }
-    }
-
-    fn release_pause(&self) -> std::time::Duration {
-        gpu_authority::INTER_UNIT_RELEASE_PAUSE
-    }
 }
 
 /// RAII: releases `lock` on drop, exactly once — so a checkpoint-write
@@ -426,6 +399,7 @@ async fn run_one_backend(
     done: &BTreeSet<CodeCheckpointKey>,
     mem_config: Option<&str>,
     driver: &dyn CoderSuiteDriver,
+    gpu_lock: &dyn GpuLock,
 ) -> Result<BackendReport, ToolError> {
     let model_id = nom.id.clone();
     let key = CodeCheckpointKey::new(&model_id, backend);
@@ -533,7 +507,15 @@ async fn run_one_backend(
     // assistant-side `backend_tag` convention), NOT `override_str` (which is
     // the longer serving-backend name like "ollama"/"ollama-cpu").
     let outcome = match driver
-        .run_suite(&model_id, langs, profile_id, case_limit, backend.as_str(), mem_config)
+        .run_suite(
+            &model_id,
+            langs,
+            profile_id,
+            case_limit,
+            backend.as_str(),
+            mem_config,
+            gpu_lock,
+        )
         .await
     {
         Ok(res) => {
@@ -641,7 +623,7 @@ async fn run_fleet(
 
             let report = run_one_backend(
                 nom, backend_tag, override_str, langs, case_limit, checkpoint, &done, mem_config,
-                driver,
+                driver, gpu_lock,
             )
             .await?;
             reports.push(report);
@@ -807,7 +789,7 @@ pub async fn run(
     );
 
     let driver = LiveCoderDriver;
-    let gpu_lock = LiveGpuLock::new(GPU_HOLDER);
+    let gpu_lock = LiveGpuLock::new(GPU_HOLDER, coder_acquire_max_wait());
     match run_fleet(&fleet, langs, case_limit, &checkpoint, mem_config, &driver, &gpu_lock).await {
         Ok(reports) => {
             print_report(&reports);
@@ -1086,6 +1068,7 @@ mod tests {
             _case_limit: Option<usize>,
             backend_tag: &str,
             _mem_config: Option<&str>,
+            _gpu_lock: &dyn GpuLock,
         ) -> Result<intake::CodeV2Outcome, ToolError> {
             self.suite_calls
                 .lock()
@@ -1111,7 +1094,8 @@ mod tests {
     /// Grants immediately, zero pause — for tests exercising `run_fleet`'s
     /// resume/skip/driver orchestration, where the GPU-lock fairness
     /// mechanism itself is not under test (that has its own dedicated tests
-    /// below, plus `gpu_authority.rs`'s alternation simulation).
+    /// below, plus `gpu_authority.rs`'s alternation simulation, and the
+    /// safety-valve-specific tests further down this module).
     struct NoopGpuLock;
     #[async_trait::async_trait]
     impl GpuLock for NoopGpuLock {
@@ -1121,6 +1105,9 @@ mod tests {
         fn release(&self) {}
         fn release_pause(&self) -> std::time::Duration {
             std::time::Duration::ZERO
+        }
+        async fn check_max_hold(&self) -> Result<bool, String> {
+            Ok(false)
         }
     }
 
@@ -1170,6 +1157,9 @@ mod tests {
         fn release_pause(&self) -> std::time::Duration {
             *self.pause_calls.lock().unwrap() += 1;
             std::time::Duration::ZERO
+        }
+        async fn check_max_hold(&self) -> Result<bool, String> {
+            Ok(false)
         }
     }
 
@@ -1358,5 +1348,179 @@ mod tests {
 
         // A refused pass was never checkpointed (durability: only real progress is marked).
         assert!(!checkpoint.done().contains(&CodeCheckpointKey::new("stuck:8b", BackendTag::Gpu)));
+    }
+
+    // ── S86 max-lock-hold safety valve: wiring tests ────────────────────────
+    //
+    // The safety valve's own trigger-timing/reacquire-correctness logic is
+    // fully unit-tested (with a fake clock) in `gpu_authority.rs`. These
+    // tests cover the OTHER half: does `run_one_backend`/`CoderSuiteDriver`
+    // correctly plumb the SAME `GpuLock` a pass acquired into its `run_suite`
+    // call, so the real per-case loop (`code_v2.rs`) can call
+    // `check_max_hold()` after each case — and does a mid-pass valve firing
+    // (or failing) behave correctly from the pass's point of view: it must
+    // NOT restart/abandon the in-progress model (a real per-case loop simply
+    // keeps iterating its existing case list — nothing here re-derives or
+    // truncates it), and a reacquire that ultimately fails must surface as
+    // this pass's ordinary Skipped-with-reason outcome (resumable next run),
+    // exactly like any other GPU reacquire failure already does.
+
+    /// Scriptable driver whose `run_suite` simulates a per-case loop by
+    /// calling `gpu_lock.check_max_hold()` `calls_per_suite` times in a row —
+    /// standing in for `code_v2.rs`'s real Phase-1 loop calling it once per
+    /// case — WITHOUT touching a real corpus/DB/network. Proves the exact
+    /// property that matters here: every scripted "case" call happens, in
+    /// order, and a `check_max_hold` failure aborts the REST of this SAME
+    /// `run_suite` call (mirroring `code_v2.rs`'s `?` propagation) rather than
+    /// silently continuing without the lock.
+    struct MidUnitScriptDriver {
+        calls_per_suite: u32,
+        hold_check_calls: Mutex<u32>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoderSuiteDriver for MidUnitScriptDriver {
+        async fn model_available(&self, _model_id: &str) -> bool {
+            true
+        }
+
+        async fn create_profile_row(&self, _model_id: &str) -> Result<uuid::Uuid, ToolError> {
+            Ok(uuid::Uuid::nil())
+        }
+
+        async fn run_suite(
+            &self,
+            _model_id: &str,
+            _langs: &[String],
+            _profile_id: uuid::Uuid,
+            _case_limit: Option<usize>,
+            _backend_tag: &str,
+            _mem_config: Option<&str>,
+            gpu_lock: &dyn GpuLock,
+        ) -> Result<intake::CodeV2Outcome, ToolError> {
+            // Mirrors `code_v2.rs`'s Phase-1 loop: for each "case", do the
+            // (here: no-op) work, then check the safety valve, propagating a
+            // failure immediately — never skipping ahead, never repeating a
+            // "case" already done.
+            for _ in 0..self.calls_per_suite {
+                *self.hold_check_calls.lock().unwrap() += 1;
+                gpu_lock.check_max_hold().await.map_err(|e| {
+                    ToolError::Execution(format!("mid-unit GPU safety-valve reacquire failed: {e}"))
+                })?;
+            }
+            Ok(intake::CodeV2Outcome {
+                cases_run: self.calls_per_suite as usize,
+                avg_first_pass: 4.0,
+                avg_effective: 4.0,
+                scored: self.calls_per_suite as usize,
+                ..Default::default()
+            })
+        }
+    }
+
+    /// A `GpuLock` whose `check_max_hold` fires (returns `Ok(true)`) on a
+    /// scripted call number, `Ok(false)` otherwise, or a scripted `Err` — so
+    /// tests can simulate "the safety valve triggers partway through this
+    /// pass's case loop" without any real lock file, GPU, or sleeping.
+    #[derive(Default)]
+    struct ScriptMaxHoldLock {
+        fire_on_call: Option<u32>,
+        fail_on_call: Option<u32>,
+        call_no: Mutex<u32>,
+        acquire_calls: Mutex<u32>,
+        release_calls: Mutex<u32>,
+    }
+
+    #[async_trait::async_trait]
+    impl GpuLock for ScriptMaxHoldLock {
+        async fn acquire(&self) -> Result<(), String> {
+            *self.acquire_calls.lock().unwrap() += 1;
+            Ok(())
+        }
+        fn release(&self) {
+            *self.release_calls.lock().unwrap() += 1;
+        }
+        fn release_pause(&self) -> std::time::Duration {
+            std::time::Duration::ZERO
+        }
+        async fn check_max_hold(&self) -> Result<bool, String> {
+            let n = {
+                let mut c = self.call_no.lock().unwrap();
+                *c += 1;
+                *c
+            };
+            if self.fail_on_call == Some(n) {
+                return Err("gave up waiting for the GPU after 4h (cap 4h): scripted failure".into());
+            }
+            if self.fire_on_call == Some(n) {
+                *self.release_calls.lock().unwrap() += 1;
+                *self.acquire_calls.lock().unwrap() += 1;
+                return Ok(true);
+            }
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn well_behaved_pass_never_triggers_the_safety_valve() {
+        // 5 fast "cases", never crossing the max-hold threshold — the
+        // overwhelmingly common case must see zero valve activity.
+        let driver = MidUnitScriptDriver { calls_per_suite: 5, hold_check_calls: Mutex::new(0) };
+        let lock = ScriptMaxHoldLock::default(); // never fires, never fails
+
+        let outcome = block(driver.run_suite(
+            "m:8b", &[], uuid::Uuid::nil(), None, "gpu", None, &lock,
+        ))
+        .unwrap();
+
+        assert_eq!(outcome.cases_run, 5);
+        assert_eq!(*driver.hold_check_calls.lock().unwrap(), 5, "checked after EVERY case");
+        assert_eq!(*lock.acquire_calls.lock().unwrap(), 0, "well-behaved: never released/reacquired");
+        assert_eq!(*lock.release_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn slow_unreliable_pass_triggers_the_valve_once_and_resumes_the_same_suite() {
+        // The valve fires on the 3rd of 6 scripted "cases" — the pass must
+        // still process ALL 6, in order, neither skipping ahead past the
+        // firing case nor re-running an earlier one (there is no case-index
+        // bookkeeping at all in this loop shape — it simply keeps iterating,
+        // which this asserts by checking the exact call count).
+        let driver = MidUnitScriptDriver { calls_per_suite: 6, hold_check_calls: Mutex::new(0) };
+        let lock = ScriptMaxHoldLock { fire_on_call: Some(3), ..Default::default() };
+
+        let outcome = block(driver.run_suite(
+            "unreliable:32b", &[], uuid::Uuid::nil(), None, "gpu", None, &lock,
+        ))
+        .unwrap();
+
+        assert_eq!(outcome.cases_run, 6, "the suite must run to completion after the valve fires");
+        assert_eq!(*driver.hold_check_calls.lock().unwrap(), 6, "no case skipped or duplicated");
+        assert_eq!(*lock.release_calls.lock().unwrap(), 1, "fired exactly once");
+        assert_eq!(*lock.acquire_calls.lock().unwrap(), 1, "reacquired exactly once, to resume");
+    }
+
+    #[test]
+    fn a_reacquire_that_ultimately_fails_aborts_this_pass_only_as_a_recorded_skip() {
+        // If the mid-unit reacquire itself exhausts ITS bounded wait (the
+        // same shape any other GPU reacquire failure takes), this pass must
+        // abort — but ONLY this pass: the caller (`run_one_backend`) already
+        // treats any `run_suite` `Err` as a Skipped-with-reason outcome, safe
+        // to resume next run. It must never silently continue running
+        // inference without the lock.
+        let driver = MidUnitScriptDriver { calls_per_suite: 6, hold_check_calls: Mutex::new(0) };
+        let lock = ScriptMaxHoldLock { fail_on_call: Some(2), ..Default::default() };
+
+        let err = block(driver.run_suite(
+            "wedged:70b", &[], uuid::Uuid::nil(), None, "gpu", None, &lock,
+        ))
+        .unwrap_err();
+
+        assert!(
+            format!("{err}").contains("mid-unit GPU safety-valve reacquire failed"),
+            "got: {err}"
+        );
+        // Aborted immediately after the 2nd case's check — cases 3-6 never ran.
+        assert_eq!(*driver.hold_check_calls.lock().unwrap(), 2);
     }
 }

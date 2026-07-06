@@ -53,6 +53,7 @@ use serde::Deserialize;
 use crate::error::ToolError;
 use crate::intake::code::{extract_files, have_tool, required_toolchain};
 use crate::intake::context;
+use crate::intake::gpu_authority::GpuLock;
 use crate::intake::storage::{self, CodeRunRowV2};
 
 /// Default v2 corpus location on <host>; overridable via `INTAKE_CORPUS_V2_DIR`.
@@ -833,6 +834,17 @@ pub struct CodeV2Outcome {
 /// Run the realistic build-scenario code suite. Stores one v2
 /// `code_profile_runs` row per case and patches the operational profile's
 /// approved_languages with the approved "lang:tier" tags.
+///
+/// `gpu_lock` (S86 max-lock-hold safety valve): `Some` when the CALLER
+/// already holds an exclusive [`GpuLock`] across this whole call (the fleet
+/// sweep's per-(model, backend) pass) — after each case in Phase 1 below,
+/// `gpu_lock.check_max_hold()` is called so a pass that runs unusually long
+/// (e.g. a model with a high transport-error retry rate) yields the lock
+/// MID-PASS instead of holding it for the pass's entire, potentially
+/// hours-long duration. `None` for callers that don't manage a fleet-level
+/// GPU lock around this call at all (the case-rerun tool, breakfix, the
+/// legacy single-model path) — the safety valve is purely additive and never
+/// activates unless a caller opts in.
 pub async fn run_code_suite_v2(
     model_name: &str,
     languages: &[String],
@@ -840,6 +852,7 @@ pub async fn run_code_suite_v2(
     case_limit: Option<usize>,
     backend_tag: Option<&str>,
     mem_config: Option<&str>,
+    gpu_lock: Option<&dyn GpuLock>,
 ) -> Result<CodeV2Outcome, ToolError> {
     run_code_suite_v2_cases(
         model_name,
@@ -849,6 +862,7 @@ pub async fn run_code_suite_v2(
         case_limit,
         backend_tag,
         mem_config,
+        gpu_lock,
     )
     .await
 }
@@ -859,6 +873,11 @@ pub async fn run_code_suite_v2(
 /// be re-run to fill a specific result gap without re-running a model's
 /// entire suite — the case-rerun tool (`intake_coder_case`) is the intended
 /// caller; the fleet sweep (`intake_coder_sweep`) always passes `None`.
+///
+/// `gpu_lock`: see [`run_code_suite_v2`]'s doc — the case-rerun tool passes
+/// `None` (it holds its OWN `ExclusiveGuard` for its typically-small, bounded
+/// rerun and has no need for a mid-unit safety valve).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_code_suite_v2_cases(
     model_name: &str,
     languages: &[String],
@@ -867,6 +886,7 @@ pub async fn run_code_suite_v2_cases(
     case_limit: Option<usize>,
     backend_tag: Option<&str>,
     mem_config: Option<&str>,
+    gpu_lock: Option<&dyn GpuLock>,
 ) -> Result<CodeV2Outcome, ToolError> {
     sweep_stale_workspaces();
     let dir = corpus_v2_dir();
@@ -933,6 +953,30 @@ pub async fn run_code_suite_v2_cases(
         let id = storage::insert_code_run_v2(&pool, profile_id, &cr.row).await?;
         row_ids.push(id);
         pending.push(cr);
+
+        // S86 max-lock-hold safety valve: checked HERE — AFTER this case's
+        // inference (`run_one_case_v2`, which already ran its own bounded
+        // transport-error retries to completion) and its row is durably
+        // persisted, BEFORE the next case's `run_one_case_v2` call starts.
+        // This is a safe request boundary by construction: no inference call
+        // is ever in flight when this runs, and it reuses the exact
+        // between-cases point INCR-01 already established as
+        // durable/resumable for the ORIGINAL per-case persistence (see this
+        // function's module-level doc above). A failure here (the mid-unit
+        // reacquire itself exhausted its bounded wait) aborts the REST of
+        // this suite via `?` — the caller records that as this pass's
+        // ordinary Skipped-with-reason outcome (resumable next run, same as
+        // any other GPU reacquire failure), never silently continuing
+        // inference without the lock.
+        if let Some(lock) = gpu_lock {
+            lock.check_max_hold().await.map_err(|e| {
+                ToolError::Execution(format!(
+                    "mid-unit GPU safety-valve reacquire failed for {model_name} after case \
+                     {}: {e}",
+                    case.id
+                ))
+            })?;
+        }
     }
 
     // ---- Phase 2: batched idiom judge, with the JUDGE model hot ---------

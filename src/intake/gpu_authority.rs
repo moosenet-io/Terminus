@@ -898,6 +898,311 @@ pub const ACQUIRE_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10 * 60)
 /// window.
 pub const INTER_UNIT_RELEASE_PAUSE: Duration = Duration::from_secs(90);
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Max lock-hold safety valve (S86 follow-up)
+//
+// ## The gap the release-between-units fix left open
+// The release-between-units fix above (`INTER_UNIT_RELEASE_PAUSE`,
+// `acquire_with_backoff`) releases the exclusive lock at the END of each
+// unit of work (one (model, backend) pass for coder-sweep, one model for
+// assistant-sweep) — correct in the common case, where a unit finishes in
+// bounded time. It silently assumes every unit DOES finish in bounded time.
+//
+// That assumption breaks for a model with a high transport-error rate.
+// `code_v2.rs`'s per-case retry (`TRANSPORT_RETRY_BACKOFF_SECS = [10, 20,
+// 40]`) means one failed case costs ~70s of pure retry overhead on top of its
+// own inference latency. Observed in production after deploying the
+// release-between-units fix: `qwen2.5-coder:32b-instruct` (a long-standing,
+// pre-existing ~50%-failure-rate model on this transport-error class) held
+// the exclusive lock continuously for 80+ minutes and climbing on a SINGLE
+// (model, backend) pass (15 attempts, 8 succeeded — matching the known ~50%
+// rate) — with no natural end in sight for potentially hours. Because the
+// lock is only released at the END of a unit, `intake_assistant_sweep`'s
+// bounded wait (`max_wait`, default 4h) could exhaust ENTIRELY waiting for
+// this one pass, without ever getting a turn — defeating the fairness fix's
+// intent for any similarly unreliable model.
+//
+// ## The fix: a hard ceiling on continuous hold time, checked mid-unit
+// [`MaxHoldConfig::max_hold`] (via [`max_lock_hold_duration`]) is a SECOND,
+// time-based release point, layered ON TOP of the existing end-of-unit
+// release — checked after each discrete SUB-unit within a unit (one case for
+// coder-sweep, one dimension for assistant-sweep; see `GpuLock::check_max_hold`
+// and its call sites in `coder_sweep.rs`'s per-case loop / `assistant/runner.rs`'s
+// per-dimension loop). If the CURRENT continuous hold has crossed the
+// threshold, [`maybe_release_for_max_hold`] releases the lock, pauses (the
+// SAME `INTER_UNIT_RELEASE_PAUSE` the end-of-unit release uses, for the SAME
+// alternation-guarantee reasoning above), and reacquires (the SAME bounded
+// `acquire_with_backoff`) — then the CALLER resumes the SAME in-progress unit
+// exactly where it left off (the next case/dimension in its existing loop;
+// nothing is abandoned, restarted, skipped, or duplicated).
+//
+// ## Why 45 minutes
+// - A well-behaved (all-success, zero retries) `(model, backend)` pass over
+//   the ~40-case v2 corpus, at real `generate()` latency, is documented (see
+//   `code_v2.rs`'s Phase-1 comment) to legitimately take 20-40 minutes END TO
+//   END. 45 minutes gives ~12% margin above that documented normal ceiling,
+//   so the valve stays SILENT for the overwhelmingly common case — it must
+//   not fire on every ordinary model, only on genuinely slow/unreliable ones.
+// - The incident this closes held the lock 80+ minutes and climbing with no
+//   end in sight. 45 minutes fires well before that point, and well before
+//   `intake_assistant_sweep`'s own typical per-model duration, so the other
+//   sweep gets a REAL, early window instead of waiting out most of a 4-hour
+//   `max_wait` cap.
+// - Comfortably above `INTER_UNIT_RELEASE_PAUSE` (90s) and
+//   `ACQUIRE_POLL_INTERVAL` (60s) so it can never be confused with, or made
+//   to thrash against, the per-unit release cadence — this is a rare safety
+//   net for the tail, not a routine cadence for the common case.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Env var overriding the max lock-hold duration (whole seconds;
+/// non-positive/unparsable falls back to the default). ONE shared knob for
+/// both sweeps (like `ACQUIRE_POLL_INTERVAL`/`INTER_UNIT_RELEASE_PAUSE` above,
+/// not a per-binary env var like the `*_ACQUIRE_MAX_WAIT_SECS` pair) — this is
+/// a property of the shared exclusive-lock module, not something the two
+/// sweeps have any reason to tune differently.
+pub const MAX_LOCK_HOLD_ENV: &str = "INTAKE_GPU_MAX_LOCK_HOLD_SECS";
+
+/// Default max continuous hold before the safety valve forces a mid-unit
+/// release+reacquire cycle. See the module section doc above for the full
+/// reasoning (20-40min documented normal pass duration + margin, vs. the 80+
+/// minute incident this closes).
+const MAX_LOCK_HOLD_DEFAULT_SECS: u64 = 45 * 60;
+
+/// Read [`MAX_LOCK_HOLD_ENV`], falling back to [`MAX_LOCK_HOLD_DEFAULT_SECS`]
+/// when unset, unparsable, or non-positive.
+pub fn max_lock_hold_duration() -> Duration {
+    std::env::var(MAX_LOCK_HOLD_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(MAX_LOCK_HOLD_DEFAULT_SECS))
+}
+
+/// Bundled config for [`maybe_release_for_max_hold`] — one value per knob it
+/// needs, so call sites (and tests) pass ONE struct instead of five
+/// positional `Duration`s that are easy to transpose by accident.
+#[derive(Debug, Clone, Copy)]
+pub struct MaxHoldConfig {
+    /// Ceiling on continuous hold time before the valve fires.
+    pub max_hold: Duration,
+    /// Poll cadence for the bounded reacquire (see [`acquire_with_backoff`]).
+    pub poll_interval: Duration,
+    /// Progress-log cadence for the bounded reacquire.
+    pub progress_log_interval: Duration,
+    /// Bound on the reacquire's total wait (same cap the unit's own initial/
+    /// per-unit acquire uses — a mid-unit reacquire is no more "owed" success
+    /// than any other acquire attempt).
+    pub max_wait: Duration,
+    /// Pause between release and the reacquire attempt — [`INTER_UNIT_RELEASE_PAUSE`],
+    /// for the identical alternation-guarantee reasoning as the end-of-unit release.
+    pub release_pause: Duration,
+}
+
+/// Pure: given the CURRENT continuous hold duration (`None` ⇒ this caller does
+/// not currently hold the lock at all — nothing to do), should the safety
+/// valve fire? Separated from the IO (reading the lock file / the real clock)
+/// so this decision is unit-testable in isolation.
+pub fn should_yield_for_max_hold(held: Option<Duration>, max_hold: Duration) -> bool {
+    held.map(|h| h >= max_hold).unwrap_or(false)
+}
+
+/// The max lock-hold safety valve. Called after each discrete sub-unit of
+/// work (one case, one dimension, ...) completes. If `held_duration()`
+/// reports this caller has continuously held the lock for at least
+/// `cfg.max_hold`, this releases (via `release`), pauses `cfg.release_pause`,
+/// and reacquires via the SAME bounded [`acquire_with_backoff`] every other
+/// acquire in this module uses — then returns `Ok(true)`. Otherwise a no-op,
+/// `Ok(false)` — BY FAR the common case; a well-behaved unit never crosses
+/// `cfg.max_hold` (see the module section doc above for why 45 minutes is
+/// comfortably above the documented normal case).
+///
+/// `Err` only if the reacquire itself exhausts its bounded wait — the same
+/// failure shape a normal per-unit (re)acquire produces, so callers handle it
+/// identically (typically: abort the current unit as a recorded skip, safe to
+/// resume next run — never silently proceed without the lock).
+///
+/// Generic over the clock, the held-duration probe, the release action, and
+/// the acquire action — exactly like [`acquire_with_backoff`] itself — so
+/// this is unit-testable with a fake `AcquireClock` and scripted
+/// probes/actions, with no real lock file or GPU involved. Production wiring
+/// lives in [`GpuLock::check_max_hold`] / [`LiveGpuLock`] below, which supply
+/// the real lock-file-backed probe/actions.
+pub async fn maybe_release_for_max_hold<C, H, R, F>(
+    clock: &C,
+    held_duration: H,
+    mut release_action: R,
+    try_acquire: F,
+    cfg: MaxHoldConfig,
+    label: &str,
+) -> Result<bool, String>
+where
+    C: AcquireClock,
+    H: Fn() -> Option<Duration>,
+    R: FnMut(),
+    F: FnMut() -> Result<(), String>,
+{
+    if !should_yield_for_max_hold(held_duration(), cfg.max_hold) {
+        return Ok(false);
+    }
+
+    tracing::warn!(
+        "{label}: SAFETY VALVE — held the exclusive GPU lock beyond the configured max \
+         ({:.0?}) with the current unit of work still in progress — releasing MID-UNIT to give \
+         any other waiting sweep a real turn, then reacquiring to resume the SAME unit of work \
+         where it left off (this is distinct from the normal end-of-unit release — see \
+         gpu_authority.rs's \"Max lock-hold safety valve\" module section for why).",
+        cfg.max_hold
+    );
+
+    release_action();
+    clock.sleep(cfg.release_pause).await;
+
+    acquire_with_backoff(
+        clock,
+        try_acquire,
+        is_live_holder_refusal,
+        cfg.poll_interval,
+        cfg.progress_log_interval,
+        cfg.max_wait,
+        label,
+    )
+    .await?;
+
+    tracing::info!(
+        "{label}: safety valve reacquired the GPU lock — resuming the same unit of work"
+    );
+    Ok(true)
+}
+
+/// Pure: THIS `holder`'s continuous hold duration recorded in `existing`, as
+/// of `now_epoch_secs` (`None` if `existing` belongs to a different holder —
+/// the safety valve only ever acts on a lock THIS caller holds). Split from
+/// the file IO (`current_hold_duration`) so the holder-matching guard and the
+/// duration arithmetic are unit-testable without a real lock file.
+fn hold_duration_for(existing: &LockState, holder: &str, now_epoch_secs: u64) -> Option<Duration> {
+    if existing.holder != holder {
+        return None;
+    }
+    Some(Duration::from_secs(now_epoch_secs.saturating_sub(existing.acquired_at)))
+}
+
+/// THIS `holder`'s current continuous hold duration, if it currently owns the
+/// lock (`None` if there is no lock at all, or it is held by a different
+/// holder — the safety valve only ever acts on a lock THIS caller holds).
+/// Impure (reads the lock file + the real clock) — kept separate from
+/// [`maybe_release_for_max_hold`] so that function stays fully unit-testable
+/// via injected closures. Used only by [`LiveGpuLock`]'s real wiring.
+fn current_hold_duration(holder: &str) -> Option<Duration> {
+    let existing = read_lock()?;
+    hold_duration_for(&existing, holder, now_epoch())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GpuLock: the injectable interface both sweeps drive their fairness policy
+// through. Previously duplicated near-identically in `coder_sweep.rs` and
+// `assistant/runner.rs`; consolidated here so the new `check_max_hold` method
+// (the safety valve above) has ONE home, and both sweeps automatically share
+// its exact semantics rather than risking two copies drifting apart.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Per-unit-of-work GPU lock. Both sweeps drive their release-between-units
+/// (and now release-mid-unit-if-it-runs-long) fairness policy through this
+/// trait so the policy is unit-testable without a real lock file or GPU (see
+/// each caller's `NoopGpuLock`/`ScriptGpuLock` test fakes).
+#[async_trait::async_trait]
+pub trait GpuLock: Send + Sync {
+    /// Acquire for the next unit of work. `Err` only after a bounded wait
+    /// gives up (see [`acquire_with_backoff`]).
+    async fn acquire(&self) -> Result<(), String>;
+    /// Release. Only ever called after a successful `acquire`.
+    fn release(&self);
+    /// How long to pause after a release before the NEXT acquire is
+    /// attempted — see [`INTER_UNIT_RELEASE_PAUSE`].
+    fn release_pause(&self) -> Duration;
+    /// Max lock-hold safety valve: call after each discrete sub-unit of work
+    /// within a unit (one case, one dimension, ...) completes. See
+    /// [`maybe_release_for_max_hold`] for the full behavior. `Ok(true)` if it
+    /// fired (rare); `Ok(false)` the overwhelming common case.
+    async fn check_max_hold(&self) -> Result<bool, String>;
+}
+
+/// Live [`GpuLock`]: the real `gpu_authority` lock file, gated by the shared
+/// bounded-backoff retry — used by both `intake_coder_sweep` and
+/// `intake_assistant_sweep`.
+pub struct LiveGpuLock {
+    holder: &'static str,
+    /// Max total time a bounded (re)acquire wait will spend retrying a
+    /// refused acquire before giving up — the caller's own operator-facing
+    /// knob (`INTAKE_CODER_ACQUIRE_MAX_WAIT_SECS` /
+    /// `INTAKE_ASSISTANT_ACQUIRE_MAX_WAIT_SECS`), injected here rather than
+    /// read directly so this module stays agnostic of which binary is
+    /// calling it.
+    max_wait: Duration,
+}
+
+impl LiveGpuLock {
+    pub fn new(holder: &'static str, max_wait: Duration) -> Self {
+        LiveGpuLock { holder, max_wait }
+    }
+}
+
+#[async_trait::async_trait]
+impl GpuLock for LiveGpuLock {
+    async fn acquire(&self) -> Result<(), String> {
+        acquire_with_backoff(
+            &RealClock,
+            || acquire(GpuMode::Exclusive, self.holder),
+            is_live_holder_refusal,
+            ACQUIRE_POLL_INTERVAL,
+            ACQUIRE_PROGRESS_LOG_INTERVAL,
+            self.max_wait,
+            self.holder,
+        )
+        .await
+    }
+
+    fn release(&self) {
+        if let Err(e) = release(self.holder) {
+            tracing::warn!(
+                "{}: release between units of work failed for '{}': {e}",
+                self.holder,
+                self.holder
+            );
+        }
+    }
+
+    fn release_pause(&self) -> Duration {
+        INTER_UNIT_RELEASE_PAUSE
+    }
+
+    async fn check_max_hold(&self) -> Result<bool, String> {
+        let holder = self.holder;
+        maybe_release_for_max_hold(
+            &RealClock,
+            || current_hold_duration(holder),
+            || {
+                if let Err(e) = release(holder) {
+                    tracing::warn!(
+                        "{holder}: safety-valve release failed (will still attempt to \
+                         reacquire): {e}"
+                    );
+                }
+            },
+            || acquire(GpuMode::Exclusive, holder),
+            MaxHoldConfig {
+                max_hold: max_lock_hold_duration(),
+                poll_interval: ACQUIRE_POLL_INTERVAL,
+                progress_log_interval: ACQUIRE_PROGRESS_LOG_INTERVAL,
+                max_wait: self.max_wait,
+                release_pause: INTER_UNIT_RELEASE_PAUSE,
+            },
+            holder,
+        )
+        .await
+    }
+}
+
 /// Injectable clock so [`acquire_with_backoff`] is unit-testable without real
 /// time passing. Shared by every caller of the bounded-backoff retry
 /// (assistant sweep's initial+per-model acquire, coder sweep's per-(model,
@@ -1699,5 +2004,258 @@ mod tests {
 
         assert!(a_turns > 3);
         assert!(b_turns > 3, "must NOT reproduce the phase-lock starvation seen with a too-short pause");
+    }
+
+    // ── Max lock-hold safety valve ──────────────────────────────────────────
+
+    #[test]
+    fn max_lock_hold_env_default_and_override() {
+        std::env::remove_var(MAX_LOCK_HOLD_ENV);
+        assert_eq!(max_lock_hold_duration(), Duration::from_secs(MAX_LOCK_HOLD_DEFAULT_SECS));
+        assert_eq!(max_lock_hold_duration(), Duration::from_secs(45 * 60));
+
+        std::env::set_var(MAX_LOCK_HOLD_ENV, "0");
+        assert_eq!(max_lock_hold_duration(), Duration::from_secs(MAX_LOCK_HOLD_DEFAULT_SECS), "zero rejected");
+
+        std::env::set_var(MAX_LOCK_HOLD_ENV, "not-a-number");
+        assert_eq!(max_lock_hold_duration(), Duration::from_secs(MAX_LOCK_HOLD_DEFAULT_SECS));
+
+        std::env::set_var(MAX_LOCK_HOLD_ENV, "600");
+        assert_eq!(max_lock_hold_duration(), Duration::from_secs(600));
+
+        std::env::remove_var(MAX_LOCK_HOLD_ENV);
+    }
+
+    #[test]
+    fn max_lock_hold_default_is_comfortably_above_the_documented_normal_pass_duration() {
+        // `code_v2.rs`'s Phase-1 comment documents a well-behaved ~40-case
+        // pass legitimately taking 20-40 minutes end to end with ZERO
+        // retries. The default must sit ABOVE that documented ceiling (with
+        // margin) so the valve stays silent for the common case, while still
+        // being comfortably BELOW the hours a genuinely unreliable model can
+        // run unbounded (the production incident: 80+ minutes and climbing).
+        let default = max_lock_hold_duration();
+        assert!(
+            default > Duration::from_secs(40 * 60),
+            "must sit above the documented normal-case ceiling (40min), got {default:?}"
+        );
+        assert!(
+            default < Duration::from_secs(70 * 60),
+            "must fire well before the observed incident's 80+ minute mark, got {default:?}"
+        );
+        // Must never be confused with, or thrash against, the per-unit release
+        // cadence — it is a rare safety net, not a routine cadence.
+        assert!(default > INTER_UNIT_RELEASE_PAUSE * 10);
+        assert!(default > ACQUIRE_POLL_INTERVAL * 10);
+    }
+
+    #[test]
+    fn should_yield_for_max_hold_pure_decision() {
+        assert!(!should_yield_for_max_hold(None, Duration::from_secs(60)), "no hold at all ⇒ never yield");
+        assert!(!should_yield_for_max_hold(Some(Duration::from_secs(59)), Duration::from_secs(60)));
+        assert!(should_yield_for_max_hold(Some(Duration::from_secs(60)), Duration::from_secs(60)), "boundary is inclusive");
+        assert!(should_yield_for_max_hold(Some(Duration::from_secs(600)), Duration::from_secs(60)));
+    }
+
+    #[tokio::test]
+    async fn well_behaved_unit_never_triggers_the_valve() {
+        // Held duration always well under the max — the overwhelmingly common
+        // case must see ZERO release/reacquire activity.
+        let clock = FakeClock::new();
+        let release_calls = StdMutex::new(0u32);
+        let acquire_calls = StdMutex::new(0u32);
+
+        let fired = maybe_release_for_max_hold(
+            &clock,
+            || Some(Duration::from_secs(120)), // well under the 1800s max below
+            || *release_calls.lock().unwrap() += 1,
+            || {
+                *acquire_calls.lock().unwrap() += 1;
+                Ok(())
+            },
+            MaxHoldConfig {
+                max_hold: Duration::from_secs(1800),
+                poll_interval: Duration::from_secs(60),
+                progress_log_interval: Duration::from_secs(600),
+                max_wait: Duration::from_secs(4 * 3600),
+                release_pause: Duration::from_secs(90),
+            },
+            "test",
+        )
+        .await
+        .unwrap();
+
+        assert!(!fired);
+        assert_eq!(*release_calls.lock().unwrap(), 0);
+        assert_eq!(*acquire_calls.lock().unwrap(), 0);
+        assert_eq!(clock.sleep_call_count(), 0, "no pause without a release");
+    }
+
+    #[tokio::test]
+    async fn slow_unreliable_unit_triggers_the_valve_and_reacquires() {
+        // Held duration has crossed the max — the valve must release, pause,
+        // then reacquire (in that exact order), and report that it fired.
+        let clock = FakeClock::new();
+        let calls = StdMutex::new(Vec::<&'static str>::new());
+
+        let fired = maybe_release_for_max_hold(
+            &clock,
+            || Some(Duration::from_secs(2000)), // over the 1800s max
+            || calls.lock().unwrap().push("release"),
+            || {
+                calls.lock().unwrap().push("acquire");
+                Ok(())
+            },
+            MaxHoldConfig {
+                max_hold: Duration::from_secs(1800),
+                poll_interval: Duration::from_secs(60),
+                progress_log_interval: Duration::from_secs(600),
+                max_wait: Duration::from_secs(4 * 3600),
+                release_pause: Duration::from_secs(90),
+            },
+            "test",
+        )
+        .await
+        .unwrap();
+
+        assert!(fired);
+        assert_eq!(*calls.lock().unwrap(), vec!["release", "acquire"], "release must happen BEFORE reacquire");
+        // The pause between release and reacquire went through the clock
+        // (fake/instant — no real time elapses in the test), never a raw
+        // real sleep.
+        assert_eq!(clock.sleep_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn valve_reacquire_retries_through_transient_refusals_then_succeeds() {
+        // The reacquire after a mid-unit release goes through the SAME
+        // bounded `acquire_with_backoff` as any other acquire — a transient
+        // refusal (the other sweep briefly holding it) must be retried, not
+        // treated as a hard failure.
+        let clock = FakeClock::new();
+        let attempts = StdMutex::new(0u32);
+
+        let fired = maybe_release_for_max_hold(
+            &clock,
+            || Some(Duration::from_secs(2000)),
+            || {},
+            || {
+                let mut n = attempts.lock().unwrap();
+                *n += 1;
+                if *n < 3 {
+                    Err("GPU is held exclusively by 'other-sweep'".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            MaxHoldConfig {
+                max_hold: Duration::from_secs(1800),
+                poll_interval: Duration::from_secs(60),
+                progress_log_interval: Duration::from_secs(600),
+                max_wait: Duration::from_secs(4 * 3600),
+                release_pause: Duration::from_secs(90),
+            },
+            "test",
+        )
+        .await
+        .unwrap();
+
+        assert!(fired);
+        assert_eq!(*attempts.lock().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn valve_reacquire_failure_after_max_wait_surfaces_as_err() {
+        // If the reacquire itself exhausts its bounded wait, the caller must
+        // see `Err` (never silently proceed as if it still holds the lock).
+        let clock = FakeClock::new();
+
+        let result = maybe_release_for_max_hold(
+            &clock,
+            || Some(Duration::from_secs(2000)),
+            || {},
+            || Err("GPU is held exclusively by 'other-sweep'".to_string()),
+            MaxHoldConfig {
+                max_hold: Duration::from_secs(1800),
+                poll_interval: Duration::from_secs(60),
+                progress_log_interval: Duration::from_secs(600),
+                max_wait: Duration::from_secs(300), // small cap for a fast test
+                release_pause: Duration::from_secs(90),
+            },
+            "test",
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("gave up waiting for the GPU"));
+    }
+
+    #[tokio::test]
+    async fn valve_never_acts_on_a_lock_this_caller_does_not_hold() {
+        // `held_duration` returning `None` (not the current holder / no lock
+        // at all) must be a pure no-op — the valve only ever acts on a lock
+        // THIS caller holds.
+        let clock = FakeClock::new();
+        let release_calls = StdMutex::new(0u32);
+
+        let fired = maybe_release_for_max_hold(
+            &clock,
+            || None,
+            || *release_calls.lock().unwrap() += 1,
+            || Ok(()),
+            MaxHoldConfig {
+                max_hold: Duration::from_secs(1), // trivially small — would fire if held_duration were Some
+                poll_interval: Duration::from_secs(60),
+                progress_log_interval: Duration::from_secs(600),
+                max_wait: Duration::from_secs(3600),
+                release_pause: Duration::from_secs(90),
+            },
+            "test",
+        )
+        .await
+        .unwrap();
+
+        assert!(!fired);
+        assert_eq!(*release_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn hold_duration_for_ignores_a_lock_held_by_someone_else() {
+        // `current_hold_duration`'s holder-matching guard, tested via its
+        // pure half (`hold_duration_for`) — no real lock file needed. Must
+        // never report a hold duration for a lock some OTHER holder owns,
+        // even if the recorded `acquired_at` would otherwise compute a huge
+        // duration.
+        let existing = LockState {
+            holder: "some-other-process".into(),
+            mode: "exclusive".into(),
+            pid: 1,
+            acquired_at: 0,
+            stopped_services: vec![],
+            chord_notified: false,
+        };
+        assert_eq!(hold_duration_for(&existing, "intake_coder_sweep", 100_000), None);
+    }
+
+    #[test]
+    fn hold_duration_for_computes_elapsed_when_the_holder_matches() {
+        let existing = LockState {
+            holder: "intake_coder_sweep".into(),
+            mode: "exclusive".into(),
+            pid: 1,
+            acquired_at: 1_000,
+            stopped_services: vec![],
+            chord_notified: false,
+        };
+        assert_eq!(
+            hold_duration_for(&existing, "intake_coder_sweep", 1_500),
+            Some(Duration::from_secs(500))
+        );
+        // Never underflows/panics even if `now` somehow lands before
+        // `acquired_at` (clock skew) — saturates to zero instead.
+        assert_eq!(
+            hold_duration_for(&existing, "intake_coder_sweep", 500),
+            Some(Duration::ZERO)
+        );
     }
 }

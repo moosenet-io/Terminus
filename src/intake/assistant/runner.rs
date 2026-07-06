@@ -41,7 +41,7 @@ use sqlx::PgPool;
 
 use crate::config;
 use crate::error::ToolError;
-use crate::intake::gpu_authority::{self, GpuMode};
+use crate::intake::gpu_authority;
 
 use super::acquire::{self, Acquirer, AcquisitionOutcome, Nomination, Nominations};
 use super::fleet::{self, FleetStore};
@@ -357,7 +357,7 @@ pub async fn run_with(
         let mut fleet_rows = Vec::new();
         for (backend_tag, override_str) in nom.backend_strategy() {
             let report = run_one_backend(
-                nom, &model_id, backend_tag, override_str, driver, sink, checkpoint, &done,
+                nom, &model_id, backend_tag, override_str, driver, sink, checkpoint, &done, gpu_lock,
             )
             .await;
 
@@ -406,6 +406,7 @@ async fn run_one_backend(
     sink: &dyn ScoreSink,
     checkpoint: &dyn Checkpoint,
     done: &BTreeSet<CheckpointKey>,
+    gpu_lock: &dyn GpuLock,
 ) -> BackendRunReport {
     let mut persisted = Vec::new();
     let mut resumed = Vec::new();
@@ -482,6 +483,23 @@ async fn run_one_backend(
                 // Hanging/OOM/degraded dimension → record reason, keep going.
                 dim_skips.push((dim.to_string(), reason));
             }
+        }
+
+        // S86 max-lock-hold safety valve: checked after EACH dimension (this
+        // backend pass's actual unit-of-work granularity) — between discrete
+        // `run_dimension` calls, never mid-call — mirroring `code_v2.rs`'s
+        // identical per-case check on the coder-sweep side. `Ok(_)` is the
+        // overwhelming common case (the valve rarely fires at all, per
+        // `gpu_authority`'s max-lock-hold module doc). A reacquire failure
+        // aborts the REMAINING dimensions of THIS backend pass only —
+        // resumable next run via whatever already persisted/checkpointed
+        // above — never silently continuing without the lock.
+        if let Err(e) = gpu_lock.check_max_hold().await {
+            dim_skips.push((
+                dim.to_string(),
+                format!("GPU safety-valve reacquire failed after this dimension: {e}"),
+            ));
+            break;
         }
     }
 
@@ -563,66 +581,15 @@ fn acquire_max_wait() -> Duration {
 }
 
 /// Per-unit-of-work GPU lock, injected into [`run_with`] so the
-/// acquire-per-model / release-per-model fairness policy is unit-testable
-/// without a real lock file or GPU — mirrors [`Acquirer`]/[`SuiteDriver`]'s
-/// existing trait-injection pattern. The live impl bounds every acquire with
-/// [`gpu_authority::acquire_with_backoff`]; test fakes grant/refuse on a
-/// script and record calls.
-#[async_trait::async_trait]
-pub trait GpuLock: Send + Sync {
-    /// Acquire for the next unit of work (one model). `Err` only after a
-    /// bounded wait gives up (see `gpu_authority::acquire_with_backoff`).
-    async fn acquire(&self) -> Result<(), String>;
-    /// Release. Only ever called after a successful `acquire`.
-    fn release(&self);
-    /// How long to pause after a release before the NEXT acquire is
-    /// attempted — see `gpu_authority::INTER_UNIT_RELEASE_PAUSE` for why
-    /// this must be longer than the shared poll interval for real
-    /// alternation to happen. Test fakes return `Duration::ZERO`.
-    fn release_pause(&self) -> Duration;
-}
-
-/// Live [`GpuLock`]: the real `gpu_authority` lock file, gated by the shared
-/// bounded-backoff retry.
-pub struct LiveGpuLock {
-    holder: &'static str,
-}
-
-impl LiveGpuLock {
-    pub fn new(holder: &'static str) -> Self {
-        LiveGpuLock { holder }
-    }
-}
-
-#[async_trait::async_trait]
-impl GpuLock for LiveGpuLock {
-    async fn acquire(&self) -> Result<(), String> {
-        gpu_authority::acquire_with_backoff(
-            &gpu_authority::RealClock,
-            || gpu_authority::acquire(GpuMode::Exclusive, self.holder),
-            gpu_authority::is_live_holder_refusal,
-            gpu_authority::ACQUIRE_POLL_INTERVAL,
-            gpu_authority::ACQUIRE_PROGRESS_LOG_INTERVAL,
-            acquire_max_wait(),
-            self.holder,
-        )
-        .await
-    }
-
-    fn release(&self) {
-        if let Err(e) = gpu_authority::release(self.holder) {
-            tracing::warn!(
-                "{}: release between units failed for '{}': {e}",
-                self.holder,
-                self.holder
-            );
-        }
-    }
-
-    fn release_pause(&self) -> Duration {
-        gpu_authority::INTER_UNIT_RELEASE_PAUSE
-    }
-}
+/// acquire-per-model / release-per-model fairness policy (including the S86
+/// max-lock-hold safety valve, `check_max_hold`) is unit-testable without a
+/// real lock file or GPU — mirrors [`Acquirer`]/[`SuiteDriver`]'s existing
+/// trait-injection pattern. The trait itself, and its live implementation,
+/// now live in `gpu_authority.rs` (formerly duplicated near-identically here
+/// and in `coder_sweep.rs` — consolidated so both sweeps share one
+/// implementation of the fairness/safety-valve semantics rather than two
+/// copies that could drift apart).
+pub use gpu_authority::{GpuLock, LiveGpuLock};
 
 /// RAII: releases `lock` on drop, exactly once — so a checkpoint-mark
 /// failure (`?` early return) or a panic mid-unit still releases the GPU
@@ -665,7 +632,7 @@ pub async fn run() -> Result<RunReport, ToolError> {
     // production. `LiveGpuLock` (below) reuses the exact same
     // `gpu_authority::acquire_with_backoff` bounded-wait for every per-model
     // (re)acquire.
-    let gpu_lock = LiveGpuLock::new(GPU_HOLDER);
+    let gpu_lock = LiveGpuLock::new(GPU_HOLDER, acquire_max_wait());
 
     let acquirer = acquire::ShellAcquirer;
     let driver = LiveSuiteDriver::new();
@@ -1131,6 +1098,9 @@ mod tests {
         fn release_pause(&self) -> Duration {
             Duration::ZERO
         }
+        async fn check_max_hold(&self) -> Result<bool, String> {
+            Ok(false)
+        }
     }
 
     /// Scriptable GpuLock: counts acquire/release/pause calls, and can be
@@ -1179,6 +1149,155 @@ mod tests {
             *self.pause_calls.lock().unwrap() += 1;
             Duration::ZERO
         }
+        async fn check_max_hold(&self) -> Result<bool, String> {
+            Ok(false)
+        }
+    }
+
+    // ── S86 max-lock-hold safety valve: wiring tests ────────────────────────
+    //
+    // The safety valve's own trigger-timing/reacquire-correctness logic is
+    // fully unit-tested (with a fake clock) in `gpu_authority.rs`. These
+    // tests cover the OTHER half: does `run_one_backend`'s per-dimension loop
+    // correctly call `check_max_hold()` after each dimension, does a firing
+    // (or failing) valve leave every OTHER dimension/backend unaffected, and
+    // does a mid-loop reacquire failure abort only the REMAINING dimensions
+    // of the CURRENT backend pass (recorded as a diagnosable skip), not the
+    // whole model or fleet.
+
+    /// A `GpuLock` whose `check_max_hold` fires (`Ok(true)`) or fails
+    /// (`Err`) on a scripted call number, `Ok(false)` otherwise — mirrors
+    /// `coder_sweep.rs::tests::ScriptMaxHoldLock`.
+    #[derive(Default)]
+    struct ScriptMaxHoldLock {
+        fire_on_call: Option<u32>,
+        fail_on_call: Option<u32>,
+        call_no: Mutex<u32>,
+        acquire_calls: Mutex<u32>,
+        release_calls: Mutex<u32>,
+    }
+
+    #[async_trait::async_trait]
+    impl GpuLock for ScriptMaxHoldLock {
+        async fn acquire(&self) -> Result<(), String> {
+            *self.acquire_calls.lock().unwrap() += 1;
+            Ok(())
+        }
+        fn release(&self) {
+            *self.release_calls.lock().unwrap() += 1;
+        }
+        fn release_pause(&self) -> Duration {
+            Duration::ZERO
+        }
+        async fn check_max_hold(&self) -> Result<bool, String> {
+            let n = {
+                let mut c = self.call_no.lock().unwrap();
+                *c += 1;
+                *c
+            };
+            if self.fail_on_call == Some(n) {
+                return Err("gave up waiting for the GPU after 4h (cap 4h): scripted failure".into());
+            }
+            if self.fire_on_call == Some(n) {
+                *self.release_calls.lock().unwrap() += 1;
+                *self.acquire_calls.lock().unwrap() += 1;
+                return Ok(true);
+            }
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn well_behaved_model_never_triggers_the_dimension_level_safety_valve() {
+        // 6 dims × 2 backends = 12 `check_max_hold` calls, never crossing the
+        // (scripted-absent) threshold — zero valve activity for the common
+        // case, and every dimension still persists normally.
+        let n = noms(
+            r#"{"nominations":[{"id":"command-r:35b","size_b":35,"gfx1151_class":"confirmed","acquisition":"ollama_pull"}]}"#,
+        );
+        let acq = ScriptAcquirer { skip: BTreeSet::new() };
+        let driver = ScriptDriver::new();
+        let sink = MemSink::default();
+        let cp = MemCheckpoint::default();
+        let fleet = MemFleet::default();
+        let gpu = ScriptMaxHoldLock::default(); // never fires, never fails
+
+        let report = block(run_with(&n, &acq, &driver, &sink, &cp, &fleet, &gpu)).unwrap();
+
+        assert_eq!(sink.rows.lock().unwrap().len(), 12);
+        assert_eq!(driver.dim_calls.lock().unwrap().len(), 12, "no dimension skipped");
+        assert!(report.models[0].backends.iter().all(|b| b.survived));
+        // Only the ordinary per-model acquire/release (1 model → 1 acquire, 1
+        // release at model-end) — the safety valve never fired.
+        assert_eq!(*gpu.acquire_calls.lock().unwrap(), 1);
+        assert_eq!(*gpu.release_calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn slow_unreliable_model_triggers_the_valve_once_and_all_dimensions_still_run() {
+        // The valve fires on the 3rd of 12 total `check_max_hold` calls (mid
+        // first backend's dimension loop) — every dimension, on BOTH
+        // backends, must still be attempted; nothing is skipped/duplicated
+        // because the valve fired.
+        let n = noms(
+            r#"{"nominations":[{"id":"unreliable:32b","size_b":32,"gfx1151_class":"confirmed","acquisition":"ollama_pull"}]}"#,
+        );
+        let acq = ScriptAcquirer { skip: BTreeSet::new() };
+        let driver = ScriptDriver::new();
+        let sink = MemSink::default();
+        let cp = MemCheckpoint::default();
+        let fleet = MemFleet::default();
+        let gpu = ScriptMaxHoldLock { fire_on_call: Some(3), ..Default::default() };
+
+        let report = block(run_with(&n, &acq, &driver, &sink, &cp, &fleet, &gpu)).unwrap();
+
+        assert_eq!(sink.rows.lock().unwrap().len(), 12, "every dimension on both backends still ran");
+        assert_eq!(driver.dim_calls.lock().unwrap().len(), 12);
+        assert!(report.models[0].backends.iter().all(|b| b.survived));
+        // 1 ordinary acquire/release (model-level) + 1 extra pair from the
+        // valve firing once.
+        assert_eq!(*gpu.acquire_calls.lock().unwrap(), 2);
+        assert_eq!(*gpu.release_calls.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn mid_dimension_reacquire_failure_aborts_only_the_remaining_dimensions_of_that_backend() {
+        // Fails on the 2nd `check_max_hold` call (mid first backend's loop).
+        // The first backend pass must abort its REMAINING dimensions (a
+        // recorded skip, not silently continuing without the lock) while the
+        // model's SECOND backend pass still runs its full 6 dims normally —
+        // proving the failure is scoped to the current backend pass, not the
+        // whole model or fleet.
+        let n = noms(
+            r#"{"nominations":[{"id":"wedged:70b","size_b":70,"gfx1151_class":"confirmed","acquisition":"ollama_pull"}]}"#,
+        );
+        let acq = ScriptAcquirer { skip: BTreeSet::new() };
+        let driver = ScriptDriver::new();
+        let sink = MemSink::default();
+        let cp = MemCheckpoint::default();
+        let fleet = MemFleet::default();
+        let gpu = ScriptMaxHoldLock { fail_on_call: Some(2), ..Default::default() };
+
+        let report = block(run_with(&n, &acq, &driver, &sink, &cp, &fleet, &gpu)).unwrap();
+
+        let backends = &report.models[0].backends;
+        assert_eq!(backends.len(), 2);
+        // First backend: aborted after its 2nd dimension — only 2 persisted,
+        // one dim_skip carrying the safety-valve failure reason.
+        let aborted = &backends[0];
+        assert_eq!(aborted.persisted_dims.len(), 2);
+        assert!(
+            aborted
+                .dim_skips
+                .iter()
+                .any(|(_, reason)| reason.contains("GPU safety-valve reacquire failed")),
+            "got: {:?}",
+            aborted.dim_skips
+        );
+        // Second backend: unaffected, all 6 dims run normally.
+        let unaffected = &backends[1];
+        assert_eq!(unaffected.persisted_dims.len(), 6);
+        assert!(unaffected.dim_skips.is_empty());
     }
 
     #[test]

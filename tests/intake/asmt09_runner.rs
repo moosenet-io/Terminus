@@ -173,6 +173,9 @@ impl GpuLock for NoopGpuLock {
     fn release_pause(&self) -> std::time::Duration {
         std::time::Duration::ZERO
     }
+    async fn check_max_hold(&self) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 fn run(
