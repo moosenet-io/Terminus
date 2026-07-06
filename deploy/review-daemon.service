@@ -1,0 +1,25 @@
+[Unit]
+Description=Terminus review-daemon (CLI-backed code review provider dispatcher)
+After=network.target
+
+[Service]
+Type=simple
+# REVIEW_DAEMON_TOKEN is fail-closed at startup -- the process refuses to run
+# without it (see src/bin/review_daemon/config.rs). Provide both vars via an
+# EnvironmentFile (not committed) or a systemd credential, never hardcoded here.
+EnvironmentFile=/etc/terminus/review-daemon.env
+# Example /etc/terminus/review-daemon.env contents (0600, root:root):
+#   REVIEW_DAEMON_TOKEN=<openssl rand -hex 24>
+#   REVIEW_DAEMON_PORT=8790
+ExecStart=/opt/terminus/bin/review_daemon
+Restart=on-failure
+RestartSec=5
+# Binds 127.0.0.1 only (see main.rs) -- no network exposure needed/expected.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/tmp
+
+[Install]
+WantedBy=multi-user.target

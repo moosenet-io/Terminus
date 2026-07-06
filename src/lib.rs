@@ -44,6 +44,7 @@ pub mod plane;
 pub mod registry;
 pub mod relay;
 pub mod reminder;
+pub mod review;
 pub mod routines;
 pub mod seer;
 pub mod sentinel;
