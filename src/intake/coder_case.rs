@@ -182,6 +182,10 @@ pub async fn run(
         None,
         Some(&backend),
         mem_config,
+        // No mid-unit safety valve: this tool holds its own `ExclusiveGuard`
+        // for its typically-small, bounded rerun (see `GPU_HOLDER` above),
+        // not a fleet-level per-pass `GpuLock`.
+        None,
     )
     .await;
 

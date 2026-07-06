@@ -367,7 +367,7 @@ impl RustTool for ModelIntake {
                 }
                 out.push('\n');
             } else {
-                let res = code_v2::run_code_suite_v2(model_name, &code_langs, pid, case_limit, None, None).await?;
+                let res = code_v2::run_code_suite_v2(model_name, &code_langs, pid, case_limit, None, None, None).await?;
                 out.push_str("=== Code suite (v2: realistic build scenario) ===\n");
                 out.push_str(&format!(
                     "languages: {}\ncases run: {} ({} scored, {} errored)\navg first_pass: {:.2} | avg effective (incl retry): {:.2}\n",

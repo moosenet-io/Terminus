@@ -621,6 +621,8 @@ impl RetestHook for LiveRetestHook {
             None,
             Some(&backend),
             mem_config.as_deref(),
+            // No fleet-level GpuLock held around this single-case retest.
+            None,
         )
         .await;
 
