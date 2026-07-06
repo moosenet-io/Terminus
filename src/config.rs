@@ -340,6 +340,31 @@ pub fn breakfix_gpu_acquire_timeout_secs() -> u64 {
         .unwrap_or(60)
 }
 
+/// Wall-clock cap (seconds) on breakfix's OWN `fetch_model` tool call (MINT
+/// Phase 5), from `MINT_BREAKFIX_FETCH_MODEL_TIMEOUT_SECS`. Default 120.
+///
+/// Flagged in adversarial review: `chord_pull::fetch_model` already carries
+/// its own generous HTTP timeout (`MINT_FETCH_MODEL_TIMEOUT_SECS`, default
+/// 600s — sized for an operator's `mint fetch-model` CLI call legitimately
+/// waiting out a multi-GB archive copy). But breakfix's call to the SAME
+/// function runs inside the supervisor daemon's single tick task (same
+/// `block_in_place` + `block_on` bridge documented on
+/// `breakfix::bounded_blocking`), where a merely-slow-but-alive Chord — not
+/// even fully hung, just slow — would otherwise stall EVERY combo's tick for
+/// up to the full 600s per attempt (up to `MAX_ATTEMPTS` times). This value
+/// is deliberately its OWN, TIGHTER knob rather than reusing
+/// `MINT_FETCH_MODEL_TIMEOUT_SECS`: breakfix's bounded diagnostic loop values
+/// staying responsive over letting one slow pull run to completion — a
+/// timeout here is not treated as fatal, just as evidence fed back into the
+/// next reasoning-backend attempt (see `breakfix::decide_breakfix`'s
+/// `Verdict::FetchModel` arm), so a real pull that needs more than 120s isn't
+/// lost — the next attempt tries again.
+pub fn breakfix_fetch_model_timeout_secs() -> u64 {
+    env_nonempty("MINT_BREAKFIX_FETCH_MODEL_TIMEOUT_SECS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,5 +612,15 @@ mod tests {
         std::env::set_var("MINT_BREAKFIX_GPU_ACQUIRE_TIMEOUT_SECS", "15");
         assert_eq!(breakfix_gpu_acquire_timeout_secs(), 15);
         std::env::remove_var("MINT_BREAKFIX_GPU_ACQUIRE_TIMEOUT_SECS");
+    }
+
+    #[test]
+    #[serial]
+    fn breakfix_fetch_model_timeout_defaults_and_parses() {
+        std::env::remove_var("MINT_BREAKFIX_FETCH_MODEL_TIMEOUT_SECS");
+        assert_eq!(breakfix_fetch_model_timeout_secs(), 120);
+        std::env::set_var("MINT_BREAKFIX_FETCH_MODEL_TIMEOUT_SECS", "30");
+        assert_eq!(breakfix_fetch_model_timeout_secs(), 30);
+        std::env::remove_var("MINT_BREAKFIX_FETCH_MODEL_TIMEOUT_SECS");
     }
 }

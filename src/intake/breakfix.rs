@@ -684,6 +684,41 @@ impl FetchModelHook for LiveFetchModelHook {
     }
 }
 
+/// Bound a [`FetchModelHook`] call with a DEDICATED, tighter timeout
+/// (`config::breakfix_fetch_model_timeout_secs`, default 120s) than
+/// `chord_pull::fetch_model`'s own generous HTTP timeout
+/// (`MINT_FETCH_MODEL_TIMEOUT_SECS`, default 600s — sized for an operator's
+/// CLI call legitimately waiting out a large archive copy).
+///
+/// ## Why this exists (adversarial-review finding, MINT Phase 5)
+/// [`decide_breakfix`] runs inside the supervisor daemon's single tick task
+/// (the same `block_in_place` + `block_on` bridge [`bounded_blocking`]
+/// documents). A merely SLOW — not even fully hung — Chord could otherwise
+/// stall that task, and therefore every other combo's tick, for up to the
+/// full 600s HTTP timeout, per attempt, up to [`MAX_ATTEMPTS`] times. Unlike
+/// [`bounded_blocking`] (which exists for a TRULY synchronous, unawaitable
+/// blocking call — `gpu_authority::acquire`'s `systemctl` shell-out — and so
+/// needs `spawn_blocking` to escape it), a [`FetchModelHook`] call is already
+/// a plain `async fn`; a `tokio::time::timeout` alone is sufficient to bound
+/// it without a dedicated OS thread.
+///
+/// A timeout here is NOT treated as fatal — it resolves to
+/// [`FetchModelOutcome::Failed`], exactly like any other fetch failure, so
+/// the existing "skip the retest, feed the failure back as evidence for the
+/// next attempt" handling in [`decide_breakfix`] applies unchanged. A pull
+/// that genuinely needs more than this bound simply isn't finished THIS
+/// attempt — the next attempt (if the reasoning backend asks for one) tries
+/// again, rather than the daemon being stuck waiting for it.
+async fn fetch_model_bounded(fetch_hook: &dyn FetchModelHook, model: &str) -> FetchModelOutcome {
+    let bound = Duration::from_secs(config::breakfix_fetch_model_timeout_secs());
+    match tokio::time::timeout(bound, fetch_hook.fetch_model(model)).await {
+        Ok(outcome) => outcome,
+        Err(_elapsed) => FetchModelOutcome::Failed {
+            reason: format!("fetch_model timed out after {}s", bound.as_secs()),
+        },
+    }
+}
+
 // ── Bounded decision loop (pure over traits — the tested core) ──────────────
 
 /// The handler's final decision for one repeat-stuck escalation.
@@ -830,7 +865,7 @@ pub async fn decide_breakfix(
             Verdict::Escalate { reason } => {
                 return Decision::Escalate { reason, attempts: attempt };
             }
-            Verdict::FetchModel => match fetch_hook.fetch_model(&combo.model).await {
+            Verdict::FetchModel => match fetch_model_bounded(fetch_hook, &combo.model).await {
                 FetchModelOutcome::Warmed => match retest.retest(combo, "").await {
                     RetestResult::Success => return Decision::Resolved,
                     RetestResult::Failure { error_class } => {
@@ -1739,6 +1774,87 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("panicked"));
+    }
+
+    // ---- fetch_model_bounded (MINT Phase 5 adversarial-review fix: a merely
+    //      SLOW, not fully hung, Chord must not stall the supervisor's single
+    //      tick task for the full 600s HTTP timeout) ----
+
+    struct SlowFetch {
+        delay: Duration,
+    }
+    #[async_trait::async_trait]
+    impl FetchModelHook for SlowFetch {
+        async fn fetch_model(&self, _model: &str) -> FetchModelOutcome {
+            tokio::time::sleep(self.delay).await;
+            FetchModelOutcome::Warmed
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn fetch_model_bounded_returns_promptly_on_a_slow_hook() {
+        // A 1s bound (rather than the 120s default) so the test itself stays
+        // fast — `fetch_model_bounded` reads the bound from the config
+        // function, not a parameter, so the env var is how a test controls it.
+        std::env::set_var("MINT_BREAKFIX_FETCH_MODEL_TIMEOUT_SECS", "1");
+        let hook = SlowFetch { delay: Duration::from_secs(5) };
+        let start = std::time::Instant::now();
+        let outcome = fetch_model_bounded(&hook, "m:1").await;
+        std::env::remove_var("MINT_BREAKFIX_FETCH_MODEL_TIMEOUT_SECS");
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "must return promptly on timeout, not wait for the full 5s hook (took {:?})",
+            start.elapsed()
+        );
+        match outcome {
+            FetchModelOutcome::Failed { reason } => assert!(reason.contains("timed out")),
+            other => panic!("expected Failed(timed out), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn fetch_model_bounded_returns_value_when_hook_finishes_before_timeout() {
+        std::env::remove_var("MINT_BREAKFIX_FETCH_MODEL_TIMEOUT_SECS"); // default 120s
+        let hook = SlowFetch { delay: Duration::from_millis(10) };
+        let outcome = fetch_model_bounded(&hook, "m:1").await;
+        assert_eq!(outcome, FetchModelOutcome::Warmed);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn fetch_model_timeout_in_decide_breakfix_is_treated_as_a_failure_not_fatal() {
+        // End-to-end through the loop: a fetch_model verdict whose fetch call
+        // hangs past the bound must feed back as evidence (skip retest,
+        // continue) exactly like any other fetch failure — never propagate
+        // the timeout as a crash or a hang of the whole decision loop.
+        std::env::set_var("MINT_BREAKFIX_FETCH_MODEL_TIMEOUT_SECS", "1");
+        struct NeverCalledRetest;
+        #[async_trait::async_trait]
+        impl RetestHook for NeverCalledRetest {
+            async fn retest(&self, _combo: &ComboKey, _alt: &str) -> RetestResult {
+                panic!("retest must not be called when fetch_model itself times out");
+            }
+        }
+        let fetch = SlowFetch { delay: Duration::from_secs(10) };
+        let combo = test_combo();
+        let start = std::time::Instant::now();
+        let decision =
+            decide_breakfix(&combo, 3, &FetchModelBackend, &NeverCalledRetest, &fetch, "ctx").await;
+        std::env::remove_var("MINT_BREAKFIX_FETCH_MODEL_TIMEOUT_SECS");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the whole bounded loop (up to MAX_ATTEMPTS timeouts) must still finish well under \
+             the hook's 10s-per-call delay, took {:?}",
+            start.elapsed()
+        );
+        match decision {
+            Decision::Drop { last_error_class, .. } => {
+                assert!(last_error_class.contains("timed out"));
+            }
+            other => panic!("expected forced Drop at budget exhaustion, got {other:?}"),
+        }
     }
 
     // ---- mint_dropped_configs write path (SQL-shape unit test — no live DB) ----

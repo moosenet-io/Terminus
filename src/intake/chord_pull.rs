@@ -108,6 +108,33 @@ fn fetch_timeout() -> Duration {
 }
 
 /// Best-effort parse of Chord's `{"error": "..."}` error body. `None` if the
+/// Percent-encode `s` for safe use as exactly ONE path segment in a URL —
+/// flagged in adversarial review: without this, a `model` id containing `/`,
+/// `?`, `#`, or whitespace would silently misroute (extra path segments, a
+/// truncated-at-`?` request) instead of reaching `/api/models/<model>/pull`
+/// as intended. Only RFC 3986's unreserved set (`A-Za-z0-9-_.~`) passes
+/// through unescaped; everything else — INCLUDING `:`, which this fleet's
+/// model ids conventionally contain (`qwen3-coder:30b`) — is escaped.
+/// Escaping the colon is safe: axum's `Path` extractor (what Chord's
+/// `/api/models/:name/pull` route uses) percent-DEcodes each segment before
+/// handing it to the handler, so Chord still sees the exact original model
+/// id. Written inline rather than pulling in a new crate dependency for this
+/// one call site (the `url`/`percent-encoding` crates are only present here
+/// transitively, via `reqwest`).
+fn percent_encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &byte in s.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// Best-effort parse of Chord's `{"error": "..."}` error body. `None` if the
 /// body is missing/unparseable/lacks the field — callers fall back to a
 /// generic message rather than failing on a body-parse hiccup.
 fn parse_error_detail(body: &serde_json::Value) -> Option<String> {
@@ -129,7 +156,7 @@ pub async fn fetch_model(model: &str) -> Result<PullOutcome, NotConfigured> {
     let url = format!(
         "{}/api/models/{}/pull",
         base.trim_end_matches('/'),
-        model
+        percent_encode_path_segment(model)
     );
     let token = chord_auth_token();
 
@@ -187,6 +214,34 @@ fn interpret_response(status: u16, body: &serde_json::Value, model: &str) -> Pul
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ---- percent_encode_path_segment ----
+
+    #[test]
+    fn percent_encode_leaves_unreserved_chars_and_colon_tag_ids_readable_but_escapes_colon() {
+        // Ordinary fleet model ids (name:tag) round-trip through Chord's axum
+        // `Path` extractor (which percent-decodes), so escaping the colon
+        // here is safe even though it makes the raw URL slightly less
+        // readable.
+        assert_eq!(percent_encode_path_segment("qwen3-coder:30b"), "qwen3-coder%3A30b");
+        assert_eq!(percent_encode_path_segment("abc-123_ABC.~"), "abc-123_ABC.~");
+    }
+
+    #[test]
+    fn percent_encode_escapes_path_and_query_breaking_characters() {
+        // These are exactly the characters that would otherwise silently
+        // misroute the request (extra path segments / query truncation) if
+        // left unescaped — the bug flagged in adversarial review.
+        assert_eq!(percent_encode_path_segment("a/b"), "a%2Fb");
+        assert_eq!(percent_encode_path_segment("a?b"), "a%3Fb");
+        assert_eq!(percent_encode_path_segment("a#b"), "a%23b");
+        assert_eq!(percent_encode_path_segment("a b"), "a%20b");
+    }
+
+    #[test]
+    fn percent_encode_empty_string_is_empty() {
+        assert_eq!(percent_encode_path_segment(""), "");
+    }
 
     // ---- interpret_response: pure status/body → outcome mapping ----
 
