@@ -253,6 +253,12 @@ fn test_vitals_all_tools_registered() {
         "vitals_summary",
         "vitals_log_exercise",
         "vitals_log_sleep",
+        "vitals_trends",
+        "vitals_log",
+        "vitals_recent",
+        "vitals_import",
+        "vitals_program_create",
+        "vitals_dashboard",
     ] {
         assert!(reg.contains(tool), "Vitals tool '{tool}' must be registered");
     }
