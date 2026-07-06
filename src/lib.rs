@@ -41,6 +41,10 @@ pub mod relay;
 pub mod reminder;
 pub mod seer;
 pub mod sentinel;
+/// Trivial one-off tools ported from <host> that don't warrant their own
+/// module (health, echo, utc_now, constellation_version, vector_onboard,
+/// searxng_search).
+pub mod sundry;
 pub mod sysversion;
 pub mod tool;
 pub mod tools;

@@ -133,6 +133,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::reminder::register(registry);
     crate::seer::register(registry);
     crate::sentinel::register(registry);
+    crate::sundry::register(registry);
     crate::sysversion::register(registry);
     crate::vector::register(registry);
     crate::vigil::register(registry);
