@@ -129,6 +129,21 @@ fn test_wizard_tools_registered() {
     );
 }
 
+#[test]
+fn test_sundry_tools_registered() {
+    let reg = full_registry();
+    for name in [
+        "health",
+        "echo",
+        "utc_now",
+        "constellation_version",
+        "vector_onboard",
+        "searxng_search",
+    ] {
+        assert!(reg.contains(name), "{name} must be registered");
+    }
+}
+
 // ── complete module tool sets ─────────────────────────────────────────────────
 
 #[test]

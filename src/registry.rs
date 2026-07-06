@@ -142,6 +142,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::soma::register(registry);
     crate::skills::register(registry);
     crate::synapse::register(registry);
+    crate::sundry::register(registry);
     crate::sysversion::register(registry);
     crate::vector::register(registry);
     crate::vigil::register(registry);
