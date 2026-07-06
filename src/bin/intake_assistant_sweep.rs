@@ -23,6 +23,7 @@ use terminus_rs::intake::assistant::runner;
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    terminus_rs::intake::init_tracing();
     match runner::run().await {
         Ok(report) => {
             let total = report.models.len();

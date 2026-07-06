@@ -238,6 +238,7 @@ fn needs_schema_migrate(cmd: &Command) -> bool {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> std::process::ExitCode {
+    terminus_rs::intake::init_tracing();
     let cli = Cli::parse();
 
     // Item 5: migrate once, explicitly, here — before dispatching — for

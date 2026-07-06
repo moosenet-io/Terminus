@@ -46,6 +46,35 @@ use crate::error::ToolError;
 use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
+/// Install a global `tracing` subscriber so `tracing::{info,warn,error}!` calls
+/// throughout the intake sweeps actually go somewhere.
+///
+/// Every intake binary (`intake_coder_sweep`, `intake_assistant_sweep`,
+/// `mint`, ...) previously called into library code that logs exclusively via
+/// `tracing` macros, but no binary ever installed a subscriber — with no
+/// subscriber registered, `tracing` events are silently dropped (this is not
+/// a crash or an error, just a no-op), so the periodic "still waiting for the
+/// GPU" progress logs added alongside the acquire-backoff fix never appeared
+/// anywhere, even though the code emitting them was correct. Only the
+/// top-level `eprintln!` of the final `Result` in each binary's `main` was
+/// ever actually visible in the systemd-redirected log files.
+///
+/// Writes to stderr (already captured by each unit's `StandardError=append:
+/// ...` systemd config), honors `RUST_LOG` for verbosity (defaulting to
+/// `info` — the tier `tracing::warn!`/`tracing::error!` and the sweeps'
+/// occasional `tracing::info!` calls need to actually surface without
+/// requiring an operator to know to set `RUST_LOG=debug`), and is safe to
+/// call more than once per process (`try_init` — a second call, e.g. from a
+/// test harness that already installed its own, is a harmless no-op).
+pub fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 // Re-export pure pieces for cross-module/integration reference.
 pub use runner::{FULL_TIERS, SMOKE_TIERS};
 pub use code_v2::{
@@ -716,6 +745,15 @@ mod tests {
     fn parse_suites_explicit_and_normalized() {
         let s = parse_suites(&json!({"suites": ["Context", " CODE "]}), "anything");
         assert_eq!(s, vec!["context", "code"]);
+    }
+
+    #[test]
+    fn init_tracing_is_safe_to_call_more_than_once() {
+        // Guards against a regression where a second call (e.g. a binary's
+        // main() plus a test harness that also installs a subscriber) would
+        // panic instead of being a harmless no-op via try_init.
+        init_tracing();
+        init_tracing();
     }
 
     #[test]
