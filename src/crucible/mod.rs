@@ -483,9 +483,9 @@ impl RustTool for CrucibleLog {
         validate_text_len(track, "track")?;
         validate_text_len(progress, "progress")?;
         validate_text_len(notes, "notes")?;
-        if duration_min < 0 {
+        if !(0..=1440).contains(&duration_min) {
             return Err(ToolError::InvalidArgument(
-                "'duration_min' must be non-negative".into(),
+                "'duration_min' must be between 0 and 1440 (minutes in a day)".into(),
             ));
         }
 
@@ -1089,6 +1089,21 @@ mod tests {
         };
         let err = tool
             .execute(json!({"track": "rust", "progress": "did stuff", "duration_min": -5}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn test_log_rejects_absurdly_large_duration() {
+        // Defense-in-depth: an unbounded duration_min would reach the remote
+        // script unchecked (flagged by adversarial review). Cap at 1440
+        // (minutes in a day).
+        let tool = CrucibleLog {
+            config: test_config(),
+        };
+        let err = tool
+            .execute(json!({"track": "rust", "progress": "did stuff", "duration_min": i64::MAX}))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
