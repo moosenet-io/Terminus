@@ -134,6 +134,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::reminder::register(registry);
     crate::seer::register(registry);
     crate::sentinel::register(registry);
+    crate::soma::register(registry);
     crate::sysversion::register(registry);
     crate::vector::register(registry);
     crate::vigil::register(registry);
@@ -225,5 +226,21 @@ mod tests {
         let mut reg = ToolRegistry::new();
         reg.register(Box::new(TestTool { name: "t", desc: "d" })).unwrap();
         assert!(!reg.is_empty());
+    }
+
+    #[test]
+    fn test_soma_tools_registered() {
+        let mut reg = ToolRegistry::new();
+        crate::soma::register(&mut reg);
+        assert!(reg.contains("soma_status"));
+        assert!(reg.contains("soma_rename_agent"));
+        assert!(reg.contains("soma_constellation_config"));
+        assert!(reg.contains("soma_inference_status"));
+        assert!(reg.contains("soma_cost_summary"));
+        assert!(reg.contains("soma_backup_status"));
+        assert!(reg.contains("soma_run_validation"));
+        assert!(reg.contains("soma_skills_list"));
+        assert!(reg.contains("soma_skill_approve"));
+        assert!(reg.contains("soma_modules"));
     }
 }
