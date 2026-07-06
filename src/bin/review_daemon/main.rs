@@ -44,9 +44,11 @@
 //!     error response.
 
 mod config;
+mod egress_proxy;
 mod http;
 mod provider;
 mod resolve;
+mod sandbox;
 
 use provider::Provider;
 use std::collections::HashMap;
@@ -63,9 +65,21 @@ struct AppState {
     /// filesystem. Spawning always uses this cached absolute path (never
     /// `Command::new("claude")` by bare name), so PATH mutations or
     /// TOCTOU-style swaps after startup can't change which binary actually
-    /// runs.
+    /// runs. Also holds the resolved path for [`sandbox::BWRAP_BIN`], keyed
+    /// the same way -- `agy` dispatch is unavailable (fail-closed) if that
+    /// key is `None`.
     resolved: HashMap<&'static str, Option<std::path::PathBuf>>,
     semaphore: Arc<Semaphore>,
+    /// Loopback port of the `egress_proxy` accept loop spawned at startup.
+    /// `None` means the proxy failed to bind -- `agy` dispatch must be
+    /// treated as unavailable in that case (fail-closed: agy is never
+    /// dispatched unproxied). Not used by `opus`/`codex`.
+    agy_proxy_port: Option<u16>,
+    /// `$HOME` at daemon startup, used only to scope the two filesystem
+    /// binds the `agy` sandbox needs (see `sandbox.rs`). Never caller input.
+    home_dir: String,
+    /// `$HOME/.gemini/antigravity-cli` (agy's own app-data/cache dir).
+    gemini_cache_dir: String,
 }
 
 #[tokio::main]
@@ -87,6 +101,9 @@ async fn main() {
     for p in [Provider::Opus, Provider::Codex, Provider::Agy] {
         resolved.insert(p.as_str(), resolve::resolve_on_path(p.binary()));
     }
+    // bwrap is agy's sandbox wrapper -- resolved once at startup exactly like
+    // the provider binaries, never re-resolved per request.
+    resolved.insert(sandbox::BWRAP_BIN, resolve::resolve_on_path(sandbox::BWRAP_BIN));
     for (name, path) in &resolved {
         tracing::info!(
             provider = name,
@@ -96,11 +113,31 @@ async fn main() {
         );
     }
 
+    // The agy egress proxy (see egress_proxy.rs) is started once, for the
+    // life of the process. If it fails to bind, agy dispatch fails closed
+    // (reports unavailable) rather than ever running agy unproxied.
+    let agy_proxy_port = match egress_proxy::spawn().await {
+        Ok(port) => {
+            tracing::info!(port, "review-daemon: agy egress proxy listening");
+            Some(port)
+        }
+        Err(e) => {
+            tracing::error!("review-daemon: agy egress proxy failed to bind: {e} -- agy dispatch will report unavailable");
+            None
+        }
+    };
+
+    let home_dir = std::env::var("HOME").unwrap_or_default();
+    let gemini_cache_dir = format!("{home_dir}/.gemini/antigravity-cli");
+
     let state = Arc::new(AppState {
         token: cfg.token,
         sanitized_env: sanitize_env_once(),
         resolved,
         semaphore: Arc::new(Semaphore::new(config::MAX_CONCURRENCY)),
+        agy_proxy_port,
+        home_dir,
+        gemini_cache_dir,
     });
 
     // Bind loopback ONLY -- never 0.0.0.0. Port is operator-controlled via
@@ -295,7 +332,7 @@ async fn handle_dispatch(
     // Bounded concurrency: at most MAX_CONCURRENCY subprocesses in flight.
     let _permit = state.semaphore.acquire().await;
 
-    match run_provider(parsed.provider, resolved_path, &parsed.prompt, timeout_secs, &state.sanitized_env).await {
+    match run_provider(parsed.provider, resolved_path, &parsed.prompt, timeout_secs, &state.sanitized_env, &state).await {
         Ok(text) => (200, "OK", serde_json::json!({"text": text})),
         Err((kind, detail)) => (
             502,
@@ -319,15 +356,61 @@ async fn run_provider(
     prompt: &str,
     timeout_secs: u64,
     env: &HashMap<String, String>,
+    state: &AppState,
 ) -> Result<String, (&'static str, String)> {
     let built = provider::build_command(provider, prompt);
-    let result = run_built_command(&built, resolved_path, timeout_secs, env).await;
+
+    // agy is the only provider that runs inside the bwrap sandbox (see
+    // sandbox.rs / egress_proxy.rs for why: agy's own tool-approval gate is
+    // bypassed by --dangerously-skip-permissions, so adversarial prompt
+    // content could otherwise trick it into a real file/network action).
+    // opus (--tools "") and codex (--sandbox read-only) already close this
+    // off for their own providers and are spawned directly, unchanged.
+    let (spawn_binary_path, spawn_built): (std::borrow::Cow<'_, std::path::Path>, provider::BuiltCommand) =
+        if matches!(provider, Provider::Agy) {
+            let Some(Some(bwrap_path)) = state.resolved.get(sandbox::BWRAP_BIN) else {
+                return Err((
+                    "binary_not_found",
+                    "'bwrap' sandbox helper was not found on PATH at daemon startup -- agy dispatch is unavailable without it".to_string(),
+                ));
+            };
+            let Some(proxy_port) = state.agy_proxy_port else {
+                return Err((
+                    "other",
+                    "agy egress proxy is unavailable (failed to bind at startup) -- refusing to dispatch agy unproxied".to_string(),
+                ));
+            };
+            let wrapped_args = sandbox::wrap_agy(
+                resolved_path,
+                &built.args,
+                &state.home_dir,
+                &state.gemini_cache_dir,
+                proxy_port,
+            );
+            (
+                std::borrow::Cow::Borrowed(bwrap_path.as_path()),
+                provider::BuiltCommand {
+                    binary: sandbox::BWRAP_BIN,
+                    args: wrapped_args,
+                    // Preserve whatever build_command(Agy) actually produced
+                    // (currently always None -- agy has no --output-* temp
+                    // file the way codex does) rather than hardcoding None,
+                    // so this doesn't silently stop cleaning up such a file
+                    // if a future agy provider variant ever gains one.
+                    output_path: built.output_path.clone(),
+                },
+            )
+        } else {
+            (std::borrow::Cow::Borrowed(resolved_path), built)
+        };
+
+    let result = run_built_command(&spawn_built, &spawn_binary_path, timeout_secs, env).await;
 
     // Clean up the codex --output-last-message temp file on EVERY exit path
     // (timeout, spawn failure, non-zero exit, empty output, success) -- not
     // just the success path -- so a failing codex run never leaks a file
     // under the daemon's temp dir.
-    if let Some(path) = &built.output_path {
+    if let Some(path) = &spawn_built.output_path {
         let _ = tokio::fs::remove_file(path).await;
     }
 
@@ -393,14 +476,24 @@ async fn run_built_command(
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn unrecognized_provider_string_is_a_clean_400_never_reaches_dispatch() {
-        let state = Arc::new(AppState {
+    /// Shared test-state builder so each test only specifies what it cares
+    /// about; defaults leave agy's sandbox prerequisites absent (bwrap
+    /// unresolved, no proxy port) since most tests aren't exercising agy.
+    fn test_state(resolved: HashMap<&'static str, Option<std::path::PathBuf>>) -> AppState {
+        AppState {
             token: "t".into(),
             sanitized_env: HashMap::new(),
-            resolved: HashMap::new(),
+            resolved,
             semaphore: Arc::new(Semaphore::new(4)),
-        });
+            agy_proxy_port: None,
+            home_dir: "/tmp/test-home".into(),
+            gemini_cache_dir: "/tmp/test-home/.gemini/antigravity-cli".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn unrecognized_provider_string_is_a_clean_400_never_reaches_dispatch() {
+        let state = Arc::new(test_state(HashMap::new()));
         let body = br#"{"provider": "gpt5", "prompt": "hi"}"#;
         let (status, _, json) = handle_dispatch(body, &state).await;
         assert_eq!(status, 400);
@@ -409,12 +502,10 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_prompt_is_rejected_before_dispatch() {
-        let state = Arc::new(AppState {
-            token: "t".into(),
-            sanitized_env: HashMap::new(),
-            resolved: HashMap::from([("opus", Some(std::path::PathBuf::from("/bin/true")))]),
-            semaphore: Arc::new(Semaphore::new(4)),
-        });
+        let state = Arc::new(test_state(HashMap::from([(
+            "opus",
+            Some(std::path::PathBuf::from("/bin/true")),
+        )])));
         let huge = "a".repeat(config::MAX_PROMPT_BYTES + 1);
         let body = serde_json::json!({"provider": "opus", "prompt": huge}).to_string();
         let (status, _, json) = handle_dispatch(body.as_bytes(), &state).await;
@@ -424,15 +515,47 @@ mod tests {
 
     #[tokio::test]
     async fn missing_binary_reports_binary_not_found_without_spawning() {
-        let state = Arc::new(AppState {
-            token: "t".into(),
-            sanitized_env: HashMap::new(),
-            resolved: HashMap::from([("opus", None)]),
-            semaphore: Arc::new(Semaphore::new(4)),
-        });
+        let state = Arc::new(test_state(HashMap::from([("opus", None)])));
         let body = serde_json::json!({"provider": "opus", "prompt": "hello"}).to_string();
         let (status, _, json) = handle_dispatch(body.as_bytes(), &state).await;
         assert_eq!(status, 502);
         assert_eq!(json["error"], "binary_not_found");
+    }
+
+    // ── agy sandbox fail-closed paths ────────────────────────────────────
+
+    #[tokio::test]
+    async fn agy_dispatch_fails_closed_when_bwrap_is_not_resolved() {
+        // agy binary itself resolves fine, but bwrap does not -- agy
+        // dispatch must refuse (fail-closed), never fall back to spawning
+        // agy unsandboxed.
+        let mut state = test_state(HashMap::from([(
+            "agy",
+            Some(std::path::PathBuf::from("/bin/true")),
+        )]));
+        state.agy_proxy_port = Some(12345);
+        let state = Arc::new(state);
+        let body = serde_json::json!({"provider": "agy", "prompt": "hello"}).to_string();
+        let (status, _, json) = handle_dispatch(body.as_bytes(), &state).await;
+        assert_eq!(status, 502);
+        assert_eq!(json["error"], "binary_not_found");
+        assert!(json["detail"].as_str().unwrap().contains("bwrap"));
+    }
+
+    #[tokio::test]
+    async fn agy_dispatch_fails_closed_when_egress_proxy_is_unavailable() {
+        // Both agy and bwrap resolve, but the egress proxy never bound --
+        // agy must never be dispatched unproxied.
+        let mut state = test_state(HashMap::from([
+            ("agy", Some(std::path::PathBuf::from("/bin/true"))),
+            (sandbox::BWRAP_BIN, Some(std::path::PathBuf::from("/usr/bin/bwrap"))),
+        ]));
+        state.agy_proxy_port = None;
+        let state = Arc::new(state);
+        let body = serde_json::json!({"provider": "agy", "prompt": "hello"}).to_string();
+        let (status, _, json) = handle_dispatch(body.as_bytes(), &state).await;
+        assert_eq!(status, 502);
+        assert_eq!(json["error"], "other");
+        assert!(json["detail"].as_str().unwrap().contains("proxy"));
     }
 }

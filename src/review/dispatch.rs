@@ -16,10 +16,19 @@ use serde_json::{json, Value};
 
 use crate::error::ToolError;
 
-/// nemotron's fixed, verified-live OpenRouter model tag.
+/// nemotron's fixed, verified-live OpenRouter model tag. Re-confirmed live
+/// against `GET https://openrouter.ai/api/v1/models` -- still present,
+/// still free-tier.
 pub const NEMOTRON_MODEL: &str = "nvidia/nemotron-nano-9b-v2:free";
-/// deepseek's fixed, verified-live OpenRouter model tag.
-pub const DEEPSEEK_MODEL: &str = "deepseek/deepseek-r1:free";
+/// deepseek's fixed OpenRouter model tag. `deepseek/deepseek-r1:free` (the
+/// slug this constant held at merge time) is GONE from OpenRouter's live
+/// model list as of this fix -- OpenRouter has no free-tier deepseek model
+/// at all anymore (checked the full `deepseek/*` listing). This points at
+/// the direct successor, `deepseek/deepseek-r1`, which is real but NOT
+/// free: ~$0.70/$2.50 per million prompt/completion tokens at the time of
+/// this fix. Flagging for operator awareness -- using this provider now has
+/// a small real cost per `review_run` call, unlike nemotron.
+pub const DEEPSEEK_MODEL: &str = "deepseek/deepseek-r1";
 
 pub const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:8790";
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
