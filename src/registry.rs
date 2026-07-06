@@ -129,6 +129,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::myelin::register(registry);
     crate::news::register(registry);
     crate::nexus::register(registry);
+    crate::odyssey::register(registry);
     crate::plane::register(registry);
     crate::relay::register(registry);
     crate::reminder::register(registry);

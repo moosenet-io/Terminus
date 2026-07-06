@@ -36,6 +36,7 @@ pub mod ledger;
 pub mod myelin;
 pub mod news;
 pub mod nexus;
+pub mod odyssey;
 pub mod plane;
 pub mod registry;
 pub mod relay;
