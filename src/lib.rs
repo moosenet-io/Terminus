@@ -12,6 +12,7 @@ pub mod commute;
 /// crate builds standalone with no `lumina-core` dependency (see `compat`).
 pub mod compat;
 pub mod config;
+pub mod cortex;
 pub mod council;
 pub mod dgem;
 pub mod dura;
