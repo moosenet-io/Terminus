@@ -154,55 +154,80 @@ fn validate_mute_hours(hours: u64) -> Result<(), ToolError> {
 /// Open an SSH session, run a single command, and return combined stdout
 /// (the Python original merged stdout/stderr from its ssh subprocess into a
 /// single text blob, which this mirrors by reading stdout and stderr and
-/// concatenating them the same way). Mirrors `sentinel::ssh_exec` /
-/// `vigil::ssh_exec` — generic, non-infra-leaking error messages for
-/// *connection*-level failures; remote command output (including the
-/// remote's own error text) is returned as-is since that is the tool's
-/// actual documented payload.
+/// concatenating them the same way).
+///
+/// Unlike `sentinel::ssh_exec` / `vigil::ssh_exec` (which genericize
+/// *connection*-level failures into an opaque error to avoid leaking infra
+/// details), this deliberately does NOT do that: the live Python
+/// `synapse_trigger`/`synapse_mute` tools shell out to a bare `ssh`
+/// subprocess and pass its stderr straight back as the tool's normal text
+/// output (`isError: false`) — confirmed live: `"[synapse_trigger DRY
+/// RUN]\nssh: connect to host <fleet-host> port 22: No route to host"`. A
+/// generic `ToolError` here would surface as an MCP-level `isError: true`,
+/// which is NOT what <host> does. So connection/handshake/auth failures are
+/// folded into `Ok(String)` as an ssh-style message, matching the real
+/// tool's documented and observed payload shape. Only `NotConfigured`
+/// (missing `SYNAPSE_SSH_HOST`/`SYNAPSE_SSH_KEY_PATH`) remains a hard
+/// error — there is no equivalent Python failure mode since the live
+/// server always has its ssh target configured.
 fn ssh_exec(config: &SynapseConfig, command: &str, timeout_secs: u64) -> Result<String, ToolError> {
     let host = config.require_host()?;
     let key_path = config.require_key()?;
 
     let addr = format!("{host}:22");
-    let tcp = TcpStream::connect(&addr).map_err(|e| {
-        warn!("synapse: cannot reach fleet host {host}: {e}");
-        ToolError::Execution("The fleet server is unreachable.".into())
-    })?;
+    let tcp = match TcpStream::connect(&addr) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("synapse: cannot reach fleet host {host}: {e}");
+            return Ok(format!("ssh: connect to host {host} port 22: {e}"));
+        }
+    };
 
     let _ = tcp.set_read_timeout(Some(Duration::from_secs(timeout_secs)));
     let _ = tcp.set_write_timeout(Some(Duration::from_secs(timeout_secs)));
 
-    let mut sess = Session::new().map_err(|e| {
-        warn!("synapse: session init failed: {e}");
-        ToolError::Execution("Could not complete the operation on the fleet server.".into())
-    })?;
+    let mut sess = match Session::new() {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("synapse: session init failed: {e}");
+            return Ok(format!("ssh: could not initialize session with {host}: {e}"));
+        }
+    };
     sess.set_tcp_stream(tcp);
-    sess.handshake().map_err(|e| {
+    if let Err(e) = sess.handshake() {
         warn!("synapse: handshake failed with {host}: {e}");
-        ToolError::Execution("The fleet server is unreachable.".into())
-    })?;
+        return Ok(format!("ssh: connect to host {host} port 22: {e}"));
+    }
 
-    sess.userauth_pubkey_file(&config.ssh_user, None, key_path.as_ref(), None)
-        .map_err(|e| {
-            warn!("synapse: auth failed for {}@{host}: {e}", config.ssh_user);
-            ToolError::Execution("Could not connect to the fleet server.".into())
-        })?;
+    if let Err(e) = sess.userauth_pubkey_file(&config.ssh_user, None, key_path.as_ref(), None) {
+        warn!("synapse: auth failed for {}@{host}: {e}", config.ssh_user);
+        return Ok(format!(
+            "ssh: {}@{host}: Permission denied (publickey): {e}",
+            config.ssh_user
+        ));
+    }
 
     if !sess.authenticated() {
         warn!("synapse: authentication failed for {}@{host}", config.ssh_user);
-        return Err(ToolError::Execution("Could not connect to the fleet server.".into()));
+        return Ok(format!(
+            "ssh: {}@{host}: Permission denied (publickey)",
+            config.ssh_user
+        ));
     }
 
-    let mut channel = sess.channel_session().map_err(|e| {
-        warn!("synapse: channel open failed on {host}: {e}");
-        ToolError::Execution("Could not complete the operation on the fleet server.".into())
-    })?;
+    let mut channel = match sess.channel_session() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("synapse: channel open failed on {host}: {e}");
+            return Ok(format!("ssh: channel open failed on {host}: {e}"));
+        }
+    };
 
     debug!("synapse ssh_exec: {command}");
-    channel.exec(command).map_err(|e| {
+    if let Err(e) = channel.exec(command) {
         warn!("synapse: command exec failed on {host}: {e}");
-        ToolError::Execution("Could not complete the operation on the fleet server.".into())
-    })?;
+        return Ok(format!("ssh: command exec failed on {host}: {e}"));
+    }
 
     let mut output = String::new();
     channel.read_to_string(&mut output).map_err(|e| {
@@ -440,10 +465,13 @@ impl RustTool for SynapseMute {
         let command = format!("{} mute --hours {hours}", self.config.script);
         let output = run_ssh(Arc::clone(&self.config), command, 30).await?;
 
-        if output.to_lowercase().contains("error")
-            || output.to_lowercase().contains("no route to host")
-            || output.to_lowercase().contains("connection refused")
-            || output.to_lowercase().contains("failed")
+        let lower = output.to_lowercase();
+        if lower.contains("error")
+            || lower.contains("no route to host")
+            || lower.contains("connection refused")
+            || lower.contains("failed")
+            || lower.contains("permission denied")
+            || lower.starts_with("ssh:")
         {
             return Ok(format!("[synapse_mute] Failed: {}", output.trim_end()));
         }
@@ -631,6 +659,42 @@ mod tests {
             ToolError::NotConfigured(msg) => assert!(msg.contains("SYNAPSE_SSH_HOST")),
             other => panic!("expected NotConfigured, got {other:?}"),
         }
+    }
+
+    // --- connection-level SSH failures surface as text, not ToolError ------
+    //
+    // Regression test for a correctness-review finding: the live Python
+    // synapse_trigger/synapse_mute embed the underlying ssh failure text in
+    // a normal (isError: false) response rather than raising. Confirm this
+    // port does the same for a configured-but-unreachable host, instead of
+    // converting the connection failure into a generic ToolError.
+
+    fn configured_unreachable_config() -> Arc<SynapseConfig> {
+        Arc::new(SynapseConfig {
+            ssh_host: Some("127.0.0.1".into()),
+            ssh_user: "root".into(),
+            ssh_key_path: Some("/nonexistent/key".into()),
+            script: DEFAULT_SCRIPT.into(),
+            config_path: "/nonexistent/path/config.yaml".into(),
+            log_path: "/nonexistent/path/pulse.log".into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_synapse_trigger_connection_failure_is_ok_text_not_error() {
+        let tool = SynapseTrigger { config: configured_unreachable_config() };
+        let result = tool.execute(json!({"dry_run": true})).await;
+        let text = result.expect("connection failure must surface as Ok(text), not Err");
+        assert!(text.contains("[synapse_trigger DRY RUN]"));
+        assert!(text.to_lowercase().contains("ssh:"));
+    }
+
+    #[tokio::test]
+    async fn test_synapse_mute_connection_failure_is_ok_text_not_error() {
+        let tool = SynapseMute { config: configured_unreachable_config() };
+        let result = tool.execute(json!({"hours": 1})).await;
+        let text = result.expect("connection failure must surface as Ok(text), not Err");
+        assert!(text.starts_with("[synapse_mute] Failed:"));
     }
 
     // --- registration ----------------------------------------------------
