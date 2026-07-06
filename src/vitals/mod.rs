@@ -682,6 +682,13 @@ impl RustTool for VitalsRecent {
 
 const VALID_IMPORT_FORMATS: &[&str] = &["samsung_health", "strava", "apple_health"];
 
+/// Only files under this directory may be imported. This is the directory
+/// the tool's own description tells <operator> to upload CSVs to, so it doubles
+/// as an explicit containment boundary (defense in depth): even though the
+/// backend does the actual file read/parse, the Rust tool never forwards a
+/// path outside the intended drop directory.
+const VITALS_IMPORT_DIR: &str = "<path>/vitals/data/";
+
 fn validate_import_path(raw: &str) -> Result<String, ToolError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -698,6 +705,15 @@ fn validate_import_path(raw: &str) -> Result<String, ToolError> {
     }
     if trimmed.split('/').any(|seg| seg == "..") {
         return Err(ToolError::InvalidArgument("file_path must not contain '..' path traversal".into()));
+    }
+    // Containment: reject anything outside the designated drop directory
+    // outright, rather than relying solely on the absence of literal ".."
+    // segments (which a caller could route around with an unrelated
+    // absolute path, e.g. "/etc/passwd" or "/root/.ssh/id_rsa").
+    if !trimmed.starts_with(VITALS_IMPORT_DIR) {
+        return Err(ToolError::InvalidArgument(format!(
+            "file_path must be under {VITALS_IMPORT_DIR}"
+        )));
     }
     Ok(trimmed.to_string())
 }
@@ -1519,6 +1535,25 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn test_vitals_import_rejects_path_outside_data_dir_without_dotdot() {
+        // No literal ".." segment here at all — this must still be rejected
+        // by the directory-containment check, not just the traversal check.
+        let _lock = ENV_LOCK.lock().unwrap();
+        set_env("http://localhost:9");
+        let tool = VitalsImport;
+        for bad in ["/etc/passwd", "/root/.ssh/id_rsa", "<path>/other/activities.csv"] {
+            let err = tool
+                .execute(json!({"file_path": bad, "format": "strava"}))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ToolError::InvalidArgument(_)),
+                "expected {bad} to be rejected"
+            );
+        }
     }
 
     #[tokio::test]
