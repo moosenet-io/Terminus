@@ -3,7 +3,7 @@
 //! `opus`/`codex`/`agy` are CLI-backed providers reached over loopback HTTP via
 //! the `review-daemon` binary (`src/bin/review_daemon/`) -- per `src/tool.rs`'s
 //! no-subprocess-in-tool contract, this module NEVER spawns a process itself.
-//! `nemotron`/`deepseek` are dispatched directly to OpenRouter's chat-completions
+//! `nemotron`/`qwen_coder` are dispatched directly to OpenRouter's chat-completions
 //! endpoint via `reqwest`.
 //!
 //! Every function here returns `Result<String, String>` where the `Err` is a
@@ -16,19 +16,20 @@ use serde_json::{json, Value};
 
 use crate::error::ToolError;
 
-/// nemotron's fixed, verified-live OpenRouter model tag. Re-confirmed live
-/// against `GET https://openrouter.ai/api/v1/models` -- still present,
-/// still free-tier.
-pub const NEMOTRON_MODEL: &str = "nvidia/nemotron-nano-9b-v2:free";
-/// deepseek's fixed OpenRouter model tag. `deepseek/deepseek-r1:free` (the
-/// slug this constant held at merge time) is GONE from OpenRouter's live
-/// model list as of this fix -- OpenRouter has no free-tier deepseek model
-/// at all anymore (checked the full `deepseek/*` listing). This points at
-/// the direct successor, `deepseek/deepseek-r1`, which is real but NOT
-/// free: ~$0.70/$2.50 per million prompt/completion tokens at the time of
-/// this fix. Flagging for operator awareness -- using this provider now has
-/// a small real cost per `review_run` call, unlike nemotron.
-pub const DEEPSEEK_MODEL: &str = "deepseek/deepseek-r1";
+/// nemotron's fixed, verified-live OpenRouter model tag. Upgraded from the
+/// nano-tier `nvidia/nemotron-nano-9b-v2:free` (real but not frontier-class)
+/// to NVIDIA's largest free-tier model, re-confirmed live against
+/// `GET https://openrouter.ai/api/v1/models` -- present, free-tier, 550B
+/// total params, 1M token context.
+pub const NEMOTRON_MODEL: &str = "nvidia/nemotron-3-ultra-550b-a55b:free";
+/// qwen_coder's fixed OpenRouter model tag. Replaces the former `deepseek`
+/// slot: `deepseek/deepseek-r1:free` no longer exists on OpenRouter (no
+/// free-tier deepseek model remains at all), and its would-be successor
+/// `deepseek/deepseek-r1` is a paid model -- unacceptable for a slot meant to
+/// be free. `qwen/qwen3-coder:free` is re-confirmed live, genuinely
+/// free-tier, and frontier-class (480B total params, 1M token context),
+/// with a code-specialization that fits this tool's review use case well.
+pub const QWEN_CODER_MODEL: &str = "qwen/qwen3-coder:free";
 
 pub const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:8790";
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
@@ -151,7 +152,7 @@ impl ReviewConfig {
 pub fn openrouter_model_for(provider: &str) -> Option<&'static str> {
     match provider {
         "nemotron" => Some(NEMOTRON_MODEL),
-        "deepseek" => Some(DEEPSEEK_MODEL),
+        "qwen_coder" => Some(QWEN_CODER_MODEL),
         _ => None,
     }
 }
@@ -227,7 +228,7 @@ mod tests {
     #[test]
     fn openrouter_model_for_maps_known_providers() {
         assert_eq!(openrouter_model_for("nemotron"), Some(NEMOTRON_MODEL));
-        assert_eq!(openrouter_model_for("deepseek"), Some(DEEPSEEK_MODEL));
+        assert_eq!(openrouter_model_for("qwen_coder"), Some(QWEN_CODER_MODEL));
         assert_eq!(openrouter_model_for("opus"), None);
     }
 
@@ -237,6 +238,6 @@ mod tests {
         assert!(is_daemon_provider("codex"));
         assert!(is_daemon_provider("agy"));
         assert!(!is_daemon_provider("nemotron"));
-        assert!(!is_daemon_provider("deepseek"));
+        assert!(!is_daemon_provider("qwen_coder"));
     }
 }
