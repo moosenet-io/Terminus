@@ -13,6 +13,19 @@
 //! shared between <host> (this crate) and <host> (lumina-core). The LLM cannot forge
 //! an approval: only a row it never wrote, flipped to `approved` by the operator's
 //! out-of-band command, lets a call through.
+//!
+//! ## Content-binding
+//! A code is scoped to `(tool_name, args)`, not just `tool_name`: consumption
+//! requires the args presented now (with `_approval_code` stripped) to match,
+//! as JSON, the args that were pending when the operator saw the summary and
+//! approved it. Without this, a code approved for one call could be redeemed
+//! against a *different* set of args for the same tool — e.g. a single-slot
+//! staging file (as `routines_approve` uses) gets overwritten with a more
+//! destructive proposal between approval and redemption, or any other guarded
+//! tool is re-invoked with different arguments in that window — executing
+//! something the operator never actually saw or approved. Flagged by an
+//! adversarial review of the routines-tools port and fixed here so every
+//! guarded tool gets the protection, not just routines.
 
 use serde_json::Value;
 use sqlx::PgPool;
@@ -64,6 +77,18 @@ fn gen_code(seed: &str, salt: u8) -> String {
     s
 }
 
+/// Remove the `_approval_code` field (if any) from `args`, returning the
+/// content that is actually bound to a grant — both when a pending row is
+/// first written and when a code is later redeemed. Kept as one function so
+/// the two call sites can never drift out of sync with each other.
+fn content_of(args: &Value) -> Value {
+    let mut stored = args.clone();
+    if let Some(obj) = stored.as_object_mut() {
+        obj.remove(APPROVAL_ARG);
+    }
+    stored
+}
+
 /// Gate a guarded tool call. See module docs.
 pub async fn gate(tool_name: &str, args: &Value, summary: &str) -> Gate {
     let pool = match pool().await {
@@ -71,23 +96,31 @@ pub async fn gate(tool_name: &str, args: &Value, summary: &str) -> Gate {
         Err(e) => return Gate::Denied(format!("Approval system unavailable: {e}")),
     };
 
+    let stored = content_of(args);
+
     if let Some(code) = args.get(APPROVAL_ARG).and_then(Value::as_str) {
-        // Atomically consume an approved, unexpired, unused grant for this exact tool.
+        // Atomically consume an approved, unexpired, unused grant for this
+        // exact tool AND this exact content — a code approved for one set of
+        // args cannot be redeemed against a different set (see "Content-
+        // binding" in the module docs).
         let consumed: Result<Option<String>, _> = sqlx::query_scalar(
             "UPDATE tool_approvals SET status = 'consumed', consumed_at = now() \
              WHERE code = $1 AND tool_name = $2 AND status = 'approved' \
                AND expires_at > now() AND consumed_at IS NULL \
+               AND args_json = $3 \
              RETURNING code",
         )
         .bind(code)
         .bind(tool_name)
+        .bind(&stored)
         .fetch_optional(&pool)
         .await;
 
         return match consumed {
             Ok(Some(_)) => Gate::Granted,
             Ok(None) => Gate::Denied(format!(
-                "Approval code {code} is invalid, not yet approved, already used, or expired. \
+                "Approval code {code} is invalid, not yet approved, already used, expired, or \
+                 was approved for different arguments than this call is making. \
                  Re-run the tool without a code to request a fresh approval."
             )),
             Err(e) => Gate::Denied(format!("Approval check failed: {e}")),
@@ -95,10 +128,6 @@ pub async fn gate(tool_name: &str, args: &Value, summary: &str) -> Gate {
     }
 
     // No code — create a pending request and tell the operator how to approve.
-    let mut stored = args.clone();
-    if let Some(obj) = stored.as_object_mut() {
-        obj.remove(APPROVAL_ARG);
-    }
     for salt in 0..6u8 {
         let code = gen_code(&format!("{tool_name}|{summary}"), salt);
         let res = sqlx::query(
@@ -226,6 +255,37 @@ mod tests {
         let a = gen_code("same", 0);
         let b = gen_code("same", 1);
         assert_ne!(a, b);
+    }
+
+    // ------------------------------------------------------------------
+    // content_of — the content-binding fix. Same function computes what's
+    // stored at proposal time and what's compared at redemption time, so a
+    // grant for one set of args can never match a different set.
+    // ------------------------------------------------------------------
+    #[test]
+    fn content_of_strips_approval_code_only() {
+        let args = json!({ "name": "x", "_approval_code": "ABC123" });
+        assert_eq!(content_of(&args), json!({ "name": "x" }));
+    }
+
+    #[test]
+    fn content_of_different_args_are_not_equal() {
+        let approved_for = content_of(&json!({ "name": "safe-thing", "_approval_code": "CODE01" }));
+        let redeemed_with = content_of(&json!({ "name": "dangerous-thing", "_approval_code": "CODE01" }));
+        assert_ne!(
+            approved_for, redeemed_with,
+            "content_of must distinguish different payloads so a code can't be replayed against them"
+        );
+    }
+
+    #[test]
+    fn content_of_identical_args_are_equal_regardless_of_code_value() {
+        // Same real content, code stripped either way — this is what lets a
+        // legitimate re-dispatch (same args, code attached) match the row
+        // that was inserted (same args, no code).
+        let a = content_of(&json!({ "name": "x", "n": 3 }));
+        let b = content_of(&json!({ "name": "x", "n": 3, "_approval_code": "ANYCODE" }));
+        assert_eq!(a, b);
     }
 
     #[tokio::test]
