@@ -374,6 +374,65 @@ impl RustTool for RelayOdometer {
 }
 
 // ──────────────────────────────────────────────
+// Tool: relay_mileage_update
+// ──────────────────────────────────────────────
+
+pub struct RelayMileageUpdate;
+
+#[async_trait]
+impl RustTool for RelayMileageUpdate {
+    fn name(&self) -> &str { "relay_mileage_update" }
+
+    fn description(&self) -> &str {
+        "Update the current odometer reading for a vehicle. Records a new odometer entry dated today; mileage must be a non-negative number."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "vehicle_id": { "type": "string", "description": "Vehicle identifier" },
+                "mileage":    { "type": "number", "description": "New odometer reading (non-negative)" }
+            },
+            "required": ["vehicle_id", "mileage"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let vehicle_id = sanitize_string(
+            args["vehicle_id"].as_str().ok_or_else(|| {
+                ToolError::InvalidArgument("vehicle_id is required".into())
+            })?,
+        )?;
+        let mileage = parse_positive_f64(&args["mileage"], "mileage")?;
+
+        let cfg = RelayConfig::from_env()?;
+        let client = cfg.client()?;
+        let url = format!("{}/api/vehicles/{}/odometerrecords", cfg.base_url, vehicle_id);
+        let today = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
+        let payload = json!({
+            "date":     today,
+            "mileage":  mileage
+        });
+        let resp = client
+            .post(&url)
+            .header("Authorization", cfg.auth_header())
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| ToolError::Http(format!("LubeLogger unreachable: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(ToolError::Http(format!(
+                "LubeLogger returned {}", resp.status()
+            )));
+        }
+        Ok(format!(
+            "Odometer updated for vehicle {vehicle_id}: {mileage:.0} miles on {today}"
+        ))
+    }
+}
+
+// ──────────────────────────────────────────────
 // Tool: relay_cost_summary
 // ──────────────────────────────────────────────
 
@@ -490,6 +549,7 @@ pub fn register(registry: &mut ToolRegistry) {
     registry.register_or_replace(Box::new(RelayServiceLog));
     registry.register_or_replace(Box::new(RelayNextDue));
     registry.register_or_replace(Box::new(RelayOdometer));
+    registry.register_or_replace(Box::new(RelayMileageUpdate));
     registry.register_or_replace(Box::new(RelayCostSummary));
     registry.register_or_replace(Box::new(RelayMaintenanceHistory));
 }
@@ -729,6 +789,74 @@ mod tests {
         mock.assert();
     }
 
+    // ── relay_mileage_update HTTP ──
+
+    #[tokio::test]
+    async fn test_relay_mileage_update_sends_correct_request() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let server = MockServer::start();
+        let (url, key) = mock_cfg(&server);
+        set_env(&url, &key);
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/vehicles/11/odometerrecords")
+                .header("authorization", format!("Bearer {key}"));
+            then.status(200).json_body(json!({"id": "o1"}));
+        });
+
+        let tool = RelayMileageUpdate;
+        let result = tool.execute(json!({
+            "vehicle_id": "11",
+            "mileage":    75000
+        })).await.unwrap();
+        assert!(result.contains("11"));
+        assert!(result.contains("75000"));
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_relay_mileage_update_negative_rejected() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // Validation happens before any HTTP call; set a dummy URL to get past NotConfigured.
+        set_env("http://localhost:9", "x");
+        let tool = RelayMileageUpdate;
+        let err = tool.execute(json!({
+            "vehicle_id": "11",
+            "mileage":    -500
+        })).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn test_relay_mileage_update_zero_accepted() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let server = MockServer::start();
+        let (url, key) = mock_cfg(&server);
+        set_env(&url, &key);
+
+        server.mock(|when, then| {
+            when.method(POST).path("/api/vehicles/12/odometerrecords");
+            then.status(200).json_body(json!({"id": "o2"}));
+        });
+
+        let tool = RelayMileageUpdate;
+        let result = tool.execute(json!({
+            "vehicle_id": "12",
+            "mileage":    0
+        })).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_relay_mileage_update_missing_vehicle_id_rejected() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        set_env("http://localhost:9", "x");
+        let tool = RelayMileageUpdate;
+        let err = tool.execute(json!({ "mileage": 1000 })).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
     // ── relay_cost_summary HTTP ──
 
     #[tokio::test]
@@ -805,15 +933,16 @@ mod tests {
     // ── register ──
 
     #[test]
-    fn test_register_adds_seven_tools() {
+    fn test_register_adds_eight_tools() {
         let mut reg = ToolRegistry::new();
         register(&mut reg);
-        assert_eq!(reg.len(), 7);
+        assert_eq!(reg.len(), 8);
         assert!(reg.contains("relay_vehicles"));
         assert!(reg.contains("relay_fuel_log"));
         assert!(reg.contains("relay_service_log"));
         assert!(reg.contains("relay_next_due"));
         assert!(reg.contains("relay_odometer"));
+        assert!(reg.contains("relay_mileage_update"));
         assert!(reg.contains("relay_cost_summary"));
         assert!(reg.contains("relay_maintenance_history"));
     }

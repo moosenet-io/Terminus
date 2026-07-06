@@ -457,6 +457,66 @@ impl RustTool for LedgerCategorySpend {
 }
 
 // ──────────────────────────────────────────────
+// Tool: ledger_categories
+// ──────────────────────────────────────────────
+
+pub struct LedgerCategories;
+
+#[async_trait]
+impl RustTool for LedgerCategories {
+    fn name(&self) -> &str { "ledger_categories" }
+
+    fn description(&self) -> &str {
+        "List budget categories with their IDs, for use with ledger_add_transaction and ledger_category_spend."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        })
+    }
+
+    async fn execute(&self, _args: Value) -> Result<String, ToolError> {
+        let cfg = LedgerConfig::from_env()?;
+        let client = cfg.client()?;
+        let (key, val) = cfg.auth_header();
+        let url = format!("{}/v1/budgets/{}/categories", cfg.base_url, cfg.budget_id);
+        let resp = client
+            .get(&url)
+            .header(key, val)
+            .send()
+            .await
+            .map_err(|e| ToolError::Http(format!("Actual Budget unreachable: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(ToolError::Http(format!(
+                "Actual Budget returned {}", resp.status()
+            )));
+        }
+        let body: Value = resp.json().await.map_err(|e| ToolError::Http(e.to_string()))?;
+        let cats = body["data"].as_array().cloned().unwrap_or_default();
+        if cats.is_empty() {
+            return Ok("No categories set up yet. Create categories in Actual Budget.".to_string());
+        }
+
+        let mut lines = vec!["Categories (use ID when logging transactions):".to_string()];
+        for cat in &cats {
+            let id = cat["id"].as_str().unwrap_or("?");
+            let name = cat["name"].as_str().unwrap_or("?");
+            let budgeted = cat["budgeted"].as_f64().unwrap_or(0.0);
+            let bstr = if budgeted != 0.0 {
+                format!(" [budget: ${:.2}]", budgeted / 1000.0)
+            } else {
+                String::new()
+            };
+            lines.push(format!("  {name}: {id}{bstr}"));
+        }
+        Ok(lines.join("\n"))
+    }
+}
+
+// ──────────────────────────────────────────────
 // Tool: ledger_balance
 // ──────────────────────────────────────────────
 
@@ -618,6 +678,7 @@ pub fn register(registry: &mut ToolRegistry) {
     registry.register_or_replace(Box::new(LedgerAddTransaction));
     registry.register_or_replace(Box::new(LedgerBudgetSummary));
     registry.register_or_replace(Box::new(LedgerCategorySpend));
+    registry.register_or_replace(Box::new(LedgerCategories));
     registry.register_or_replace(Box::new(LedgerBalance));
     registry.register_or_replace(Box::new(LedgerRecent));
 }
@@ -847,6 +908,51 @@ mod tests {
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
+    // ── ledger_categories ──
+
+    #[tokio::test]
+    #[serial]
+    async fn test_ledger_categories_sends_correct_request() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let server = MockServer::start();
+        set_env(&server.base_url());
+
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/budgets/budget-123/categories")
+                .header("x-api-key", "test-key");
+            then.status(200).json_body(json!({"data": [
+                {"id": "cat1", "name": "Groceries", "budgeted": 50000},
+                {"id": "cat2", "name": "Rent", "budgeted": 0}
+            ]}));
+        });
+
+        let tool = LedgerCategories;
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(result.contains("Groceries"));
+        assert!(result.contains("cat1"));
+        assert!(result.contains("Rent"));
+        assert!(result.contains("cat2"));
+        mock.assert();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_ledger_categories_empty_list() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let server = MockServer::start();
+        set_env(&server.base_url());
+
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/budgets/budget-123/categories");
+            then.status(200).json_body(json!({"data": []}));
+        });
+
+        let tool = LedgerCategories;
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(result.contains("No categories"));
+    }
+
     // ── ledger_balance ──
 
     #[tokio::test]
@@ -903,15 +1009,16 @@ mod tests {
     // ── register ──
 
     #[test]
-    fn test_register_adds_seven_tools() {
+    fn test_register_adds_eight_tools() {
         let mut reg = ToolRegistry::new();
         register(&mut reg);
-        assert_eq!(reg.len(), 7);
+        assert_eq!(reg.len(), 8);
         assert!(reg.contains("ledger_accounts"));
         assert!(reg.contains("ledger_transactions"));
         assert!(reg.contains("ledger_add_transaction"));
         assert!(reg.contains("ledger_budget_summary"));
         assert!(reg.contains("ledger_category_spend"));
+        assert!(reg.contains("ledger_categories"));
         assert!(reg.contains("ledger_balance"));
         assert!(reg.contains("ledger_recent"));
     }
