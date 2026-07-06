@@ -108,6 +108,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::gateway::register(registry);
     crate::<secret-manager>::register(registry);
     crate::intake::register(registry);
+    crate::lumina_ext::register(registry);
     crate::model_advisor::register(registry);
     crate::network::register(registry);
     crate::openhands::register(registry);

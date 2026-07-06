@@ -27,6 +27,7 @@ pub mod openhands;
 pub mod google;
 pub mod <media-service>;
 pub mod litellm;
+pub mod lumina_ext;
 pub mod model_advisor;
 pub mod <container-mgr>;
 pub mod prometheus;
