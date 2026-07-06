@@ -10,8 +10,10 @@
 //!     place in this codebase permitted to spawn these processes (see
 //!     `src/tool.rs`'s no-subprocess-in-tool contract, and `src/dgem/mod.rs`
 //!     for the established precedent of this daemon-over-loopback-HTTP shape).
-//!   - `nemotron`, `deepseek` — dispatched directly to OpenRouter's
-//!     chat-completions endpoint via `reqwest`.
+//!   - `nemotron`, `qwen_coder` — dispatched directly to OpenRouter's
+//!     chat-completions endpoint via `reqwest`. Both are genuinely
+//!     frontier-class free-tier models (see `dispatch.rs` for the current
+//!     model tags and the rationale for each).
 //!
 //! A single provider's failure/timeout/auth-error degrades that provider's
 //! entry to `"unavailable: <reason>"` rather than failing the whole tool call;
@@ -23,7 +25,7 @@
 //!   - `REVIEW_DAEMON_TOKEN` — bearer token matching the daemon's own config;
 //!                             if unset, `opus`/`codex`/`agy` all degrade to
 //!                             `"unavailable: REVIEW_DAEMON_TOKEN not configured"`
-//!   - `OPENROUTER_API_KEY`  — OpenRouter key for `nemotron`/`deepseek`; if
+//!   - `OPENROUTER_API_KEY`  — OpenRouter key for `nemotron`/`qwen_coder`; if
 //!                             unset, those two degrade similarly
 
 mod aggregate;
@@ -41,7 +43,7 @@ pub use aggregate::{aggregate, ProviderResult};
 pub use dispatch::ReviewConfig;
 pub use prompt::{build_prompt, parse_verdict, Role, Structure};
 
-const ALLOWED_PROVIDERS: &[&str] = &["opus", "codex", "agy", "nemotron", "deepseek"];
+const ALLOWED_PROVIDERS: &[&str] = &["opus", "codex", "agy", "nemotron", "qwen_coder"];
 const MAX_PROVIDERS: usize = 5;
 
 pub struct ReviewRun;
@@ -160,10 +162,11 @@ impl RustTool for ReviewRun {
     fn description(&self) -> &str {
         "Run a multi-provider code/change review. 'structure' is one of single, \
 adversarial_pair, panel_majority, panel_unanimous. 'providers' (1-5) picks from \
-opus, codex, agy (CLI-backed via review-daemon), nemotron, deepseek (OpenRouter). \
-'criteria' is the acceptance criteria text; 'context' is a free-form JSON object \
-(diff/files/description). Providers are dispatched concurrently; a single \
-provider's failure degrades that entry rather than failing the whole call."
+opus, codex, agy (CLI-backed via review-daemon), nemotron, qwen_coder (OpenRouter, \
+frontier-class free-tier models). 'criteria' is the acceptance criteria text; \
+'context' is a free-form JSON object (diff/files/description). Providers are \
+dispatched concurrently; a single provider's failure degrades that entry rather \
+than failing the whole call."
     }
 
     fn parameters(&self) -> Value {
@@ -298,7 +301,7 @@ mod tests {
     async fn rejects_too_many_providers() {
         let args = json!({
             "structure": "panel_majority",
-            "providers": ["opus", "codex", "agy", "nemotron", "deepseek", "opus"],
+            "providers": ["opus", "codex", "agy", "nemotron", "qwen_coder", "opus"],
             "criteria": "x"
         });
         let err = tool().execute(args).await.unwrap_err();
