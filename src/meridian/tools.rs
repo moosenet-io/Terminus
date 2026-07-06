@@ -37,7 +37,14 @@ struct ValuedPosition {
     quantity: f64,
     avg_price: f64,
     current_price: Option<f64>,
+    /// `false` when `current_price` is a stale fallback (avg cost, because a
+    /// live quote wasn't available) rather than a fresh market quote — so a
+    /// caller can tell "flat position" apart from "no quote available".
+    price_is_live: bool,
     market_value: Option<f64>,
+    /// `None` (not `Some(0.0)`) when no live quote was available — a missing
+    /// quote must never be reported as "zero P&L", which would be
+    /// indistinguishable from a genuinely flat position.
     unrealized_pnl: Option<f64>,
 }
 
@@ -76,13 +83,16 @@ async fn value_portfolio(p: Portfolio) -> PortfolioReport {
     let mut positions_value = 0.0;
     let mut valued = Vec::with_capacity(p.positions.len());
     for pos in &p.positions {
-        let current_price = live_prices
+        let live_price = live_prices
             .get(&pos.symbol.to_ascii_uppercase())
-            .and_then(|cp| cp.usd)
-            .or(Some(pos.avg_price));
+            .and_then(|cp| cp.usd);
+        let current_price = live_price.or(Some(pos.avg_price));
         let market_value = current_price.map(|price| price * pos.quantity);
-        let unrealized_pnl =
-            market_value.map(|mv| mv - pos.avg_price * pos.quantity);
+        // Only compute P&L off a genuine live quote -- falling back to
+        // avg_price (below) makes market_value/total_value stay sane when a
+        // quote is missing, but must NOT be presented as "0 unrealized P&L",
+        // which would be indistinguishable from a real flat position.
+        let unrealized_pnl = live_price.map(|price| (price - pos.avg_price) * pos.quantity);
         if let Some(mv) = market_value {
             positions_value += mv;
         }
@@ -91,6 +101,7 @@ async fn value_portfolio(p: Portfolio) -> PortfolioReport {
             quantity: pos.quantity,
             avg_price: pos.avg_price,
             current_price,
+            price_is_live: live_price.is_some(),
             market_value,
             unrealized_pnl,
         });
@@ -557,7 +568,15 @@ impl RustTool for MeridianReset {
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        let balance = args["balance"].as_f64().unwrap_or(state::DEFAULT_STARTING_BALANCE);
+        // Absent/null `balance` means "use the default"; a present-but-wrong-type
+        // value (e.g. a string) is a caller error and must surface as such rather
+        // than silently substituting the default (masks bad input otherwise).
+        let balance = match args.get("balance") {
+            None | Some(Value::Null) => state::DEFAULT_STARTING_BALANCE,
+            Some(v) => v
+                .as_f64()
+                .ok_or_else(|| ToolError::InvalidArgument("balance must be a number".into()))?,
+        };
 
         if !balance.is_finite() || balance < MIN_BALANCE || balance > MAX_BALANCE {
             let body = json!({
@@ -683,20 +702,18 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn meridian_reset_falls_back_to_default_balance_on_non_numeric_input() {
+    async fn meridian_reset_rejects_non_numeric_balance_as_invalid_argument() {
         // `f64::NAN`/`INFINITY` can't survive a real JSON round-trip (serde_json
-        // has no representation for them, so a malformed/non-numeric `balance`
-        // is the realistic "bad input" shape from an actual MCP caller). The
-        // `is_finite()` guard in `execute` is defense-in-depth for anything
-        // that *did* slip through as a non-finite f64; this test exercises the
-        // realistic non-numeric-argument path and confirms it degrades to the
-        // documented default rather than panicking.
+        // has no representation for them), so a non-numeric `balance` (e.g. a
+        // string) is the realistic "bad input" shape from an actual MCP caller.
+        // A present-but-wrong-type value must surface as InvalidArgument, not
+        // silently substitute the default -- that would mask genuinely bad
+        // caller input as a successful reset.
         let path = tmp_state_path();
         std::env::set_var("MERIDIAN_STATE_PATH", &path);
         let tool = MeridianReset;
-        let result = tool.execute(json!({"balance": "not-a-number"})).await.unwrap();
-        assert!(result.contains("\"status\": \"reset\""));
-        assert!(result.contains(&format!("{}", state::DEFAULT_STARTING_BALANCE)));
+        let result = tool.execute(json!({"balance": "not-a-number"})).await;
+        assert!(matches!(result, Err(ToolError::InvalidArgument(_))));
         std::env::remove_var("MERIDIAN_STATE_PATH");
         std::fs::remove_file(&path).ok();
     }
