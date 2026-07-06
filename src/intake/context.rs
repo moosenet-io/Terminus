@@ -16,6 +16,7 @@
 //! call) is pure and unit-tested: corpus proportions, token-target sizing,
 //! planted-fact insertion at correct depths, and recall scoring.
 
+use std::error::Error as _;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -369,6 +370,102 @@ pub fn classify_error(msg: &str, status: Option<u16>) -> ErrorClass {
     }
 }
 
+/// Failure-class for a `reqwest::Error` on the request path (as opposed to an
+/// HTTP-level error status, which is handled separately). reqwest's own
+/// `Display` for a `Kind::Request` error never surfaces WHY the request
+/// failed — confirmed by reading reqwest 0.12.28's own source
+/// (`error.rs` ~line 227-272): it renders only `"error sending request for
+/// url (...)"`, with the real cause (timeout vs. connection failure vs.
+/// body-read failure) reachable ONLY via `.is_timeout()`/`.is_connect()`/
+/// `.is_body()`/`.source()`. Every `Err(e) => { let msg = e.to_string(); ... }`
+/// site in this module discarded all of that before this type existed,
+/// which is exactly what turned the `qwen2.5-coder:32b-instruct` production
+/// stall into a multi-hour blind-diagnosis cycle: the stored error text gave
+/// no way to tell "timed out after Xs" from "connection reset" from "TCP
+/// connect failed" without live reproduction. This is NOT deliberate S77
+/// error-genericization (see `describe_request_error`'s doc) — it's just
+/// reqwest's default `Display`, unpreserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestFailureClass {
+    /// `.is_timeout()` — the request (or the tier/case timeout wrapping it)
+    /// elapsed before a response came back.
+    Timeout,
+    /// `.is_connect()` — the TCP/TLS connect itself failed (refused, reset,
+    /// unreachable, DNS, etc.), before any request bytes were exchanged.
+    Connect,
+    /// `.is_body()` — reqwest's `Kind::Body`: an error streaming the
+    /// REQUEST body while sending it. Distinct from a failure reading the
+    /// RESPONSE body (that's `Kind::Decode`, surfaced by `.is_decode()`,
+    /// not tracked by this enum — see `classify_request_error_response_
+    /// read_failure_is_not_misclassified` in this module's tests). In
+    /// practice unreachable from this module's calls: every request body
+    /// here is a fully-buffered `serde_json::json!` value, never a stream,
+    /// so `Kind::Body` cannot occur today — tracked anyway per the fix's
+    /// spec (capture `is_body()` alongside the other two) and so it's ready
+    /// if a future call site ever streams a request body.
+    Body,
+    /// None of the above — reqwest didn't classify it as one of its three
+    /// named kinds (rare for a plain request-path error, but not impossible).
+    Other,
+}
+
+impl RequestFailureClass {
+    /// Short, generic label safe for an operator-facing error column. Adds
+    /// failure-CLASS detail only — no hostnames, ports, or other internals
+    /// beyond what reqwest's own message (still included alongside this
+    /// label by `describe_request_error`) already carries.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Timeout => "timed out",
+            Self::Connect => "connection failed",
+            Self::Body => "response read failed",
+            Self::Other => "request failed",
+        }
+    }
+}
+
+/// Classify a `reqwest::Error` from the request path into a
+/// [`RequestFailureClass`]. Checked in `is_timeout` → `is_connect` →
+/// `is_body` order (reqwest guarantees these are mutually exclusive for a
+/// `Kind::Request` error, so order does not matter for correctness, but this
+/// matches the order they're documented in reqwest's own API).
+pub fn classify_request_error(e: &reqwest::Error) -> RequestFailureClass {
+    if e.is_timeout() {
+        RequestFailureClass::Timeout
+    } else if e.is_connect() {
+        RequestFailureClass::Connect
+    } else if e.is_body() {
+        RequestFailureClass::Body
+    } else {
+        RequestFailureClass::Other
+    }
+}
+
+/// Build the stored error string for a failed request-path `reqwest::Error`:
+/// the existing message (`e.to_string()`, unchanged — so this never leaks
+/// anything the pre-existing behavior didn't already leak) plus a `(class:
+/// ...)` suffix distinguishing WHY it failed. The full picture — message,
+/// all three predicates, and the underlying `.source()` (e.g. the OS-level
+/// connect-refused detail, or the inner timer-elapsed error) — is logged via
+/// `tracing::warn!`, NEVER returned, so it never lands in an operator-facing
+/// report row; an operator debugging a stuck sweep gets it from the logs
+/// instead of another multi-hour blind-diagnosis cycle. `context` is a short
+/// caller tag (e.g. `"run_tier"`, `"generate_at"`) so the log line identifies
+/// which call site failed.
+pub fn describe_request_error(context: &str, e: &reqwest::Error) -> String {
+    let class = classify_request_error(e);
+    let msg = e.to_string();
+    tracing::warn!(
+        "{context}: inference request failed ({}); is_timeout={} is_connect={} is_body={} msg={msg} cause={:?}",
+        class.label(),
+        e.is_timeout(),
+        e.is_connect(),
+        e.is_body(),
+        e.source().map(|s| s.to_string()),
+    );
+    format!("{msg} (class: {})", class.label())
+}
+
 /// Run a single context tier against the model via Ollama `/api/generate`
 /// (non-streaming — Ollama returns `prompt_eval_duration` and `eval_duration`
 /// which give us TTFT and throughput without needing a stream).
@@ -418,9 +515,8 @@ pub async fn run_tier(
     let resp = match resp {
         Ok(r) => r,
         Err(e) => {
-            let msg = e.to_string();
-            result.oom = is_oom_like(&msg, None);
-            result.error = Some(msg);
+            result.oom = is_oom_like(&e.to_string(), None);
+            result.error = Some(describe_request_error("run_tier", &e));
             return result;
         }
     };
@@ -532,9 +628,8 @@ pub async fn generate_at(
     let resp = match resp {
         Ok(r) => r,
         Err(e) => {
-            let msg = e.to_string();
-            out.oom = is_oom_like(&msg, None);
-            out.error = Some(msg);
+            out.oom = is_oom_like(&e.to_string(), None);
+            out.error = Some(describe_request_error("generate_at", &e));
             return out;
         }
     };
@@ -604,9 +699,8 @@ pub async fn chat_with_tools(
     let resp = match resp {
         Ok(r) => r,
         Err(e) => {
-            let msg = e.to_string();
-            out.oom = is_oom_like(&msg, None);
-            out.error = Some(msg);
+            out.oom = is_oom_like(&e.to_string(), None);
+            out.error = Some(describe_request_error("chat_with_tools", &e));
             return out;
         }
     };
@@ -670,6 +764,138 @@ pub fn next_pow2_ctx(prompt_tokens: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- RequestFailureClass / describe_request_error: real reqwest errors ----
+    //
+    // reqwest::Error has no public constructor, so these inject REAL failures
+    // of each kind over loopback TCP rather than mocking the type: a
+    // connect-refused port, a listener that accepts but never responds
+    // (client-side timeout), and a listener that sends a truncated body (a
+    // body-read failure) — the three classes `describe_request_error` exists
+    // to distinguish.
+
+    /// Spawn a one-shot TCP helper on an ephemeral loopback port; returns the
+    /// port. `handler` runs once, on its own thread, when a connection
+    /// arrives.
+    fn spawn_tcp_helper<F: FnOnce(std::net::TcpStream) + Send + 'static>(handler: F) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                handler(stream);
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn classify_request_error_connect_refused() {
+        // Port 1 on loopback is a real "nothing listening" target — an
+        // instant TCP connect-refused, no server needed.
+        let client = reqwest::Client::new();
+        let err = client
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("connecting to a closed port must fail");
+        assert!(err.is_connect(), "sanity: reqwest must classify this is_connect()");
+        assert!(!err.is_timeout());
+        assert_eq!(classify_request_error(&err), RequestFailureClass::Connect);
+        let desc = describe_request_error("test", &err);
+        assert!(desc.contains("connection failed"), "got: {desc}");
+        assert!(
+            desc.starts_with(&err.to_string()),
+            "must preserve the original message verbatim, got: {desc}"
+        );
+    }
+
+    #[tokio::test]
+    async fn classify_request_error_timeout() {
+        // A listener that accepts the TCP connection (so this is NOT a
+        // connect failure) but never writes a response — the client's short
+        // timeout must fire.
+        let port = spawn_tcp_helper(|stream| {
+            std::thread::sleep(Duration::from_secs(2));
+            drop(stream);
+        });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(80))
+            .build()
+            .unwrap();
+        let err = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect_err("a server that never responds must time out");
+        assert!(err.is_timeout(), "sanity: reqwest must classify this is_timeout()");
+        assert!(!err.is_connect());
+        assert_eq!(classify_request_error(&err), RequestFailureClass::Timeout);
+        let desc = describe_request_error("test", &err);
+        assert!(desc.contains("timed out"), "got: {desc}");
+    }
+
+    #[tokio::test]
+    async fn classify_request_error_response_read_failure_is_not_misclassified() {
+        // A server that promises a Content-Length it doesn't deliver, then
+        // closes the connection — headers arrive fine (so `.send()` itself
+        // succeeds), but reading the body fails partway through. reqwest
+        // surfaces this as `Kind::Decode` (`.is_decode()`), NOT `Kind::Body`
+        // (`.is_body()` is reserved for errors streaming the REQUEST body on
+        // the way out — unreachable from this codebase's fully-buffered
+        // `serde_json::json!` bodies). This test exists to pin that fact so
+        // a future reqwest upgrade that changes it doesn't silently make
+        // `classify_request_error` miscategorize a real response-read
+        // failure as `Other` without anyone noticing: today it correctly
+        // falls into `Other` (not `Timeout`/`Connect`/`Body`), which is
+        // still a truthful, non-misleading bucket — just not as specific as
+        // it could be if a future iteration adds `is_decode()` tracking.
+        use std::io::{Read, Write};
+        let port = spawn_tcp_helper(|mut stream| {
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf); // drain the request
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nshort");
+            let _ = stream.flush();
+            // Dropping here closes the socket before the promised 1000 bytes
+            // arrive, so the client's body read fails.
+        });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect("headers arrive fine; only the body read should fail");
+        let err = resp
+            .bytes()
+            .await
+            .expect_err("a truncated body (short of Content-Length) must fail to read");
+        assert!(err.is_decode(), "sanity: reqwest classifies a truncated response body as is_decode()");
+        assert!(!err.is_timeout());
+        assert!(!err.is_connect());
+        assert!(!err.is_body(), "is_body() is the REQUEST-body-streaming kind, distinct from is_decode()");
+        assert_eq!(
+            classify_request_error(&err),
+            RequestFailureClass::Other,
+            "a decode failure isn't Timeout/Connect/Body, so Other is correct (not silently swallowed as one of those)"
+        );
+    }
+
+    #[test]
+    fn request_failure_class_labels_are_distinct() {
+        // Each class must be genuinely distinguishable in the stored text —
+        // the whole point of this fix — not just internally different enum
+        // variants that render to the same string.
+        let labels = [
+            RequestFailureClass::Timeout.label(),
+            RequestFailureClass::Connect.label(),
+            RequestFailureClass::Body.label(),
+            RequestFailureClass::Other.label(),
+        ];
+        let unique: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(unique.len(), labels.len(), "each class must have a distinct label");
+    }
 
     #[test]
     fn ollama_keep_alive_matches_runner_warmup_value() {

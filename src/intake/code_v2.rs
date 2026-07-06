@@ -108,9 +108,16 @@ fn default_spec() -> String { "spec.md".to_string() }
 fn default_validate() -> String { "validate.sh".to_string() }
 
 impl CaseV2 {
-    /// Effective inference timeout (per-case override → tier default).
-    pub fn timeout(&self) -> Duration {
+    /// Effective inference timeout (per-case override → tier default), with
+    /// an additive reload-cost allowance layered on top for large models
+    /// (`super::timeouts::reload_adjusted_timeout_secs` — see that module's
+    /// doc for the root cause and reasoning: this DOES NOT change what the
+    /// tier/override means for difficulty, it compensates for a separate,
+    /// orthogonal Ollama-runner-reload cost this tier table was never
+    /// designed to capture).
+    pub fn timeout(&self, model_name: &str) -> Duration {
         let secs = self.timeout_s.unwrap_or_else(|| tier_default_timeout(&self.tier));
+        let secs = super::timeouts::reload_adjusted_timeout_secs(secs, model_name);
         Duration::from_secs(secs)
     }
 }
@@ -609,7 +616,7 @@ async fn run_one_case_v2(
     row.context_tokens = Some(context::estimate_tokens(&prompt) as i32);
 
     // First inference (transient errors retried once).
-    let gen = generate_with_retry(client, model_name, &prompt, case.timeout()).await;
+    let gen = generate_with_retry(client, model_name, &prompt, case.timeout(model_name)).await;
     row.throughput_tok_per_sec = gen.throughput_tok_per_sec;
     row.total_time_ms = gen.total_time_ms;
     row.response_tokens = Some(context::estimate_tokens(&gen.response) as i32);
@@ -704,7 +711,7 @@ async fn run_one_case_v2(
     if should_retry(first_pass) && produced {
         let err_excerpt = last_error_excerpt(&ws_dir, &case.workspace, &validate_script, &outputs).await;
         let retry_prompt = build_retry_prompt(&prompt, &gen.response, &err_excerpt);
-        let gen2 = generate_with_retry(client, model_name, &retry_prompt, case.timeout()).await;
+        let gen2 = generate_with_retry(client, model_name, &retry_prompt, case.timeout(model_name)).await;
         if gen2.error.is_none() && !gen2.oom {
             let extracted2 = extract_files(&gen2.response);
             let outputs2 = map_outputs(&case.files, &extracted2);
@@ -1216,6 +1223,51 @@ mod tests {
         assert_eq!(tier_default_timeout("standard"), 120);
         assert_eq!(tier_default_timeout("deep"), 300);
         assert_eq!(tier_default_timeout("other"), 120);
+    }
+
+    fn blitz_case(timeout_s: Option<u64>) -> CaseV2 {
+        CaseV2 {
+            id: "a".into(), language: "rust".into(), tier: "blitz".into(),
+            spec: default_spec(), validate: default_validate(), dir: "rust/blitz/a".into(),
+            workspace: "wx-config".into(), files: vec![], timeout_s, task_type: None,
+        }
+    }
+
+    // ---- CaseV2::timeout(model_name) — reload-cost allowance wiring ----
+
+    #[test]
+    #[serial_test::serial(intake_env)]
+    fn case_v2_timeout_unchanged_for_small_model() {
+        // The production-stall fix must not touch the common case: a small
+        // model on the blitz tier still gets exactly 60s, as before.
+        std::env::remove_var("INTAKE_LARGE_MODEL_PARAMS_B");
+        std::env::remove_var("INTAKE_RELOAD_TIMEOUT_ALLOWANCE_SEC");
+        let case = blitz_case(None);
+        assert_eq!(case.timeout("qwen2.5-coder:14b-instruct"), Duration::from_secs(60));
+    }
+
+    #[test]
+    #[serial_test::serial(intake_env)]
+    fn case_v2_timeout_adds_reload_allowance_for_large_model() {
+        // The exact production scenario: qwen2.5-coder:32b-instruct on a
+        // blitz-tier (60s) case. Default allowance is 45s -> 105s effective.
+        std::env::remove_var("INTAKE_LARGE_MODEL_PARAMS_B");
+        std::env::remove_var("INTAKE_RELOAD_TIMEOUT_ALLOWANCE_SEC");
+        let case = blitz_case(None);
+        assert_eq!(case.timeout("qwen2.5-coder:32b-instruct"), Duration::from_secs(105));
+    }
+
+    #[test]
+    #[serial_test::serial(intake_env)]
+    fn case_v2_timeout_allowance_applies_on_top_of_per_case_override_too() {
+        // A per-case `timeout_s` override is still the base the allowance
+        // layers onto — the allowance is orthogonal to WHERE the base
+        // difficulty timeout came from.
+        std::env::remove_var("INTAKE_LARGE_MODEL_PARAMS_B");
+        std::env::remove_var("INTAKE_RELOAD_TIMEOUT_ALLOWANCE_SEC");
+        let case = blitz_case(Some(200));
+        assert_eq!(case.timeout("qwen2.5-coder:32b-instruct"), Duration::from_secs(245));
+        assert_eq!(case.timeout("qwen3:8b"), Duration::from_secs(200));
     }
 
     /// The in-repo v2 corpus manifest must parse, hit the expected case counts,
