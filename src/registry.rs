@@ -140,6 +140,8 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::seer::register(registry);
     crate::sentinel::register(registry);
     crate::soma::register(registry);
+    crate::skills::register(registry);
+    crate::synapse::register(registry);
     crate::sysversion::register(registry);
     crate::vector::register(registry);
     crate::vigil::register(registry);
@@ -247,5 +249,23 @@ mod tests {
         assert!(reg.contains("soma_skills_list"));
         assert!(reg.contains("soma_skill_approve"));
         assert!(reg.contains("soma_modules"));
+    }
+
+    #[test]
+    fn test_skills_tools_registered() {
+        let mut reg = ToolRegistry::new();
+        crate::skills::register(&mut reg);
+        assert!(reg.contains("skills_list"));
+        assert!(reg.contains("skills_read"));
+        assert!(reg.contains("skills_create"));
+    }
+
+    #[test]
+    fn test_synapse_tools_registered() {
+        let mut reg = ToolRegistry::new();
+        crate::synapse::register(&mut reg);
+        assert!(reg.contains("synapse_status"));
+        assert!(reg.contains("synapse_trigger"));
+        assert!(reg.contains("synapse_mute"));
     }
 }

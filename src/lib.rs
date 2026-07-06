@@ -48,6 +48,8 @@ pub mod routines;
 pub mod seer;
 pub mod sentinel;
 pub mod soma;
+pub mod skills;
+pub mod synapse;
 pub mod sysversion;
 pub mod tool;
 pub mod tools;
