@@ -277,6 +277,17 @@ pub struct BackendRunReport {
     /// True ⇒ at least one dimension persisted/resumed ⇒ eligible for the Lumina
     /// fleet on this backend.
     pub survived: bool,
+    /// S86 max-lock-hold safety valve: `true` ⇒ this backend pass ended
+    /// because `gpu_lock.check_max_hold()` failed to REACQUIRE the lock after
+    /// releasing it mid-pass (its bounded wait was exhausted) — meaning this
+    /// process no longer holds the exclusive GPU lock at all. The CALLER
+    /// (`run_with`) MUST treat this as "stop processing this model" and skip
+    /// any remaining backend passes rather than running them unlocked — see
+    /// `run_with`'s per-backend loop. Distinct from an ordinary `dim_skips`
+    /// entry (a single dimension degrading) precisely because it means the
+    /// mutual-exclusion invariant this whole module exists to enforce no
+    /// longer holds for the rest of this model.
+    pub lock_lost: bool,
 }
 
 /// The whole run's report.
@@ -355,6 +366,7 @@ pub async fn run_with(
         // ── per backend (the both-hardware passes), P5 override per pass ──
         let mut backend_reports = Vec::new();
         let mut fleet_rows = Vec::new();
+        let mut lock_lost_mid_model = false;
         for (backend_tag, override_str) in nom.backend_strategy() {
             let report = run_one_backend(
                 nom, &model_id, backend_tag, override_str, driver, sink, checkpoint, &done, gpu_lock,
@@ -375,7 +387,31 @@ pub async fn run_with(
                     fleet_rows.push(row);
                 }
             }
+            let lock_lost = report.lock_lost;
             backend_reports.push(report);
+
+            // S86 max-lock-hold safety valve, correctness fix (independent
+            // review finding): this model's GPU lock is held ONCE across
+            // BOTH backend passes (see the acquire above) — if the mid-pass
+            // safety valve inside `run_one_backend` failed to REACQUIRE it
+            // (its bounded wait exhausted), this process no longer holds the
+            // exclusive lock at all. Running the NEXT backend pass here
+            // would do so with NO lock held — silently violating the exact
+            // mutual-exclusion invariant this whole module exists to
+            // enforce. Stop processing further backends for this model; the
+            // next MODEL's iteration freshly re-acquires (or waits, bounded)
+            // before touching the GPU again, same as any other reacquire
+            // failure already does at the model level.
+            if lock_lost {
+                tracing::error!(
+                    "intake_assistant_sweep: GPU lock lost mid-model for {model_id} (backend \
+                     {backend_tag}) and could not be reacquired — skipping this model's \
+                     remaining backend pass(es) rather than running them without the lock \
+                     (resumable next run)"
+                );
+                lock_lost_mid_model = true;
+                break;
+            }
         }
 
         models.push(ModelRunReport {
@@ -384,7 +420,12 @@ pub async fn run_with(
             backends: backend_reports,
             fleet_rows,
         });
-        did_prior_unit = true;
+        // If the lock was lost mid-model, no pause is owed before the next
+        // model's acquire attempt (there is no lock currently held to have
+        // just been released-and-paused-after); otherwise this model's
+        // normal end-of-unit release just happened (via `_release_guard`
+        // below) and the usual inter-unit pause applies.
+        did_prior_unit = !lock_lost_mid_model;
         // `_release_guard` drops here, at the end of this model's scope —
         // AFTER both backend passes' rows are persisted and checkpoints
         // written (`run_one_backend` persists-then-checkpoints internally),
@@ -411,6 +452,14 @@ async fn run_one_backend(
     let mut persisted = Vec::new();
     let mut resumed = Vec::new();
     let mut dim_skips = Vec::new();
+    // S86 max-lock-hold safety valve, correctness fix: `true` only when a
+    // mid-pass `check_max_hold` reacquire genuinely failed (its bounded wait
+    // exhausted) — meaning this process no longer holds the exclusive GPU
+    // lock at all. The caller (`run_with`) MUST stop processing any further
+    // backend passes for this model when this is set (see `BackendRunReport`'s
+    // doc) — this model's lock is acquired ONCE, covering BOTH backend
+    // passes, so losing it mid-pass-1 must not let pass-2 run unlocked.
+    let mut lock_lost = false;
 
     // ── this (model)'s dimension list: the fixed six, plus yarn_context_depth
     //    when the nomination is yarn_capable with a config to act on ──
@@ -442,6 +491,7 @@ async fn run_one_backend(
                 resumed_dims: resumed,
                 dim_skips,
                 survived: false,
+                lock_lost: false,
             };
         }
     }
@@ -499,6 +549,7 @@ async fn run_one_backend(
                 dim.to_string(),
                 format!("GPU safety-valve reacquire failed after this dimension: {e}"),
             ));
+            lock_lost = true;
             break;
         }
     }
@@ -511,6 +562,7 @@ async fn run_one_backend(
         resumed_dims: resumed,
         dim_skips,
         survived,
+        lock_lost,
     }
 }
 
@@ -1261,13 +1313,19 @@ mod tests {
     }
 
     #[test]
-    fn mid_dimension_reacquire_failure_aborts_only_the_remaining_dimensions_of_that_backend() {
+    fn mid_dimension_reacquire_failure_aborts_the_rest_of_this_model_not_just_this_backend() {
         // Fails on the 2nd `check_max_hold` call (mid first backend's loop).
-        // The first backend pass must abort its REMAINING dimensions (a
-        // recorded skip, not silently continuing without the lock) while the
-        // model's SECOND backend pass still runs its full 6 dims normally —
-        // proving the failure is scoped to the current backend pass, not the
-        // whole model or fleet.
+        //
+        // CORRECTNESS FIX (found independently by both reviewers of this
+        // safety valve): this model's GPU lock is acquired ONCE, covering
+        // BOTH backend passes (`run_with` acquires per-MODEL, not
+        // per-backend — see its own doc comment). If the mid-pass reacquire
+        // genuinely fails, this process no longer holds the exclusive lock
+        // AT ALL — so the model's SECOND backend pass must NOT run (it would
+        // run unlocked, silently violating the exact mutual-exclusion
+        // invariant this whole module exists to enforce). An earlier version
+        // of this test asserted the opposite ("second backend still runs
+        // normally") — that was the bug, not a verified-safe behavior.
         let n = noms(
             r#"{"nominations":[{"id":"wedged:70b","size_b":70,"gfx1151_class":"confirmed","acquisition":"ollama_pull"}]}"#,
         );
@@ -1281,10 +1339,13 @@ mod tests {
         let report = block(run_with(&n, &acq, &driver, &sink, &cp, &fleet, &gpu)).unwrap();
 
         let backends = &report.models[0].backends;
-        assert_eq!(backends.len(), 2);
-        // First backend: aborted after its 2nd dimension — only 2 persisted,
-        // one dim_skip carrying the safety-valve failure reason.
+        // Only the FIRST backend was ever attempted — the second is skipped
+        // entirely, never touching the driver.
+        assert_eq!(backends.len(), 1, "the second backend pass must be SKIPPED, not run unlocked");
         let aborted = &backends[0];
+        assert!(aborted.lock_lost, "must be flagged as having lost the lock");
+        // Aborted after its 2nd dimension — only 2 persisted, one dim_skip
+        // carrying the safety-valve failure reason.
         assert_eq!(aborted.persisted_dims.len(), 2);
         assert!(
             aborted
@@ -1294,10 +1355,13 @@ mod tests {
             "got: {:?}",
             aborted.dim_skips
         );
-        // Second backend: unaffected, all 6 dims run normally.
-        let unaffected = &backends[1];
-        assert_eq!(unaffected.persisted_dims.len(), 6);
-        assert!(unaffected.dim_skips.is_empty());
+        // The driver was NEVER asked to run anything for the second backend —
+        // proof this isn't just an empty report, the pass genuinely never started.
+        assert!(
+            driver.dim_calls.lock().unwrap().iter().all(|(_, b, _)| b == "gpu"),
+            "no 'cpu' backend dimension call should have happened: {:?}",
+            driver.dim_calls.lock().unwrap()
+        );
     }
 
     #[test]
