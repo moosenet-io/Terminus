@@ -66,6 +66,28 @@
 //!    code-based, single-use grant that the model cannot forge or self-issue.
 //!    `routines_batch_edit_notify_channel` — the single most destructive tool
 //!    here — goes through the exact same gate, keyed on its own arguments.
+//!
+//! ### Findings from the required two-reviewer pass, and how they were fixed
+//! - **Approval content-binding.** An adversarial review found that
+//!   `crate::approval::gate` originally scoped a grant to `(code, tool_name)`
+//!   only, not to the actual args — so a code approved for one staged
+//!   proposal (or one set of `routines_edit`/`routines_batch_edit_notify_channel`
+//!   arguments) could be redeemed against *different* args for the same tool,
+//!   e.g. if the single-slot staging file was overwritten by a second
+//!   `routines_propose` between approval and redemption. Fixed in
+//!   `crate::approval` itself (not just here) by binding the grant to a
+//!   content hash: consumption now requires the current args (approval code
+//!   stripped) to match the args that were pending when the human approved.
+//!   This benefits every guarded tool, not only routines.
+//! - **Shell-injection via free-text fields.** A correctness review found
+//!   that `schedule`/`timezone`/`description`/`prompt`/`cooldown` were
+//!   interpolated into the remote SSH command via Rust's `{:?}` (Debug)
+//!   formatting, which only escapes `"`/`\` — not `$(...)`, backticks, or a
+//!   bare `$VAR` — while `ssh2::Channel::exec` hands the string straight to a
+//!   remote shell. `prompt`/`description` are LLM-authored free text, exactly
+//!   where this would bite. Fixed by routing every free-text field through
+//!   [`shell_quote`] (POSIX single-quoting), while `name`/`channel` continue
+//!   to go through the stricter [`is_safe_identifier`] allowlist.
 
 use std::env;
 use std::fs;
@@ -162,6 +184,33 @@ fn is_safe_identifier(s: &str) -> bool {
         && s.len() <= 200
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// POSIX single-quote a string for safe interpolation into a remote shell
+/// command line. `ssh2::Channel::exec` hands the command string straight to
+/// the remote shell, so free-text fields (routine `prompt`, `description`,
+/// `schedule`, `timezone`, `cooldown` — LLM-authored text, not restricted to
+/// an identifier charset) must NEVER be interpolated via `Debug` (`{:?}`)
+/// formatting: Rust's debug-quoting only escapes `"`/`\`, it does not
+/// neutralize `$(...)`, backticks, or a bare `$VAR`, all of which a POSIX
+/// shell still expands even inside double quotes.
+///
+/// Single-quoting is unconditionally safe in POSIX shells — nothing inside
+/// `'...'` is expanded — with one exception (an embedded `'`), handled here
+/// by closing the quote, emitting an escaped literal quote, and reopening:
+/// `it's` -> `'it'\''s'`.
+fn shell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -496,12 +545,22 @@ impl RustTool for RoutinesApprove {
 
         let command = match proposal.action.as_str() {
             "create" => format!(
-                "{} routines create {} --schedule {:?} --timezone {:?} --description {:?} --prompt {:?} --json",
-                self.config.cli, proposal.name, proposal.schedule, proposal.timezone, proposal.description, proposal.prompt
+                "{} routines create {} --schedule {} --timezone {} --description {} --prompt {} --json",
+                self.config.cli,
+                proposal.name,
+                shell_quote(&proposal.schedule),
+                shell_quote(&proposal.timezone),
+                shell_quote(&proposal.description),
+                shell_quote(&proposal.prompt),
             ),
             "update" => format!(
-                "{} routines update {} --schedule {:?} --timezone {:?} --description {:?} --prompt {:?} --json",
-                self.config.cli, proposal.name, proposal.schedule, proposal.timezone, proposal.description, proposal.prompt
+                "{} routines update {} --schedule {} --timezone {} --description {} --prompt {} --json",
+                self.config.cli,
+                proposal.name,
+                shell_quote(&proposal.schedule),
+                shell_quote(&proposal.timezone),
+                shell_quote(&proposal.description),
+                shell_quote(&proposal.prompt),
             ),
             "delete" => format!("{} routines delete {} --json", self.config.cli, proposal.name),
             other => {
@@ -579,7 +638,7 @@ impl RustTool for RoutinesEdit {
         for field in ["schedule", "prompt", "description", "timezone", "cooldown"] {
             if let Some(v) = args[field].as_str() {
                 if !v.is_empty() {
-                    cmd.push_str(&format!(" --{field} {v:?}"));
+                    cmd.push_str(&format!(" --{field} {}", shell_quote(v)));
                 }
             }
         }
@@ -741,6 +800,36 @@ mod tests {
         assert!(!is_safe_identifier("foo bar"));
         assert!(!is_safe_identifier("$(whoami)"));
         assert!(!is_safe_identifier(&"a".repeat(201)));
+    }
+
+    // ------------------------------------------------------------------
+    // shell_quote — free-text fields must never let a remote shell expand
+    // command substitution / variables, unlike `{:?}` (Debug) formatting.
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_shell_quote_wraps_in_single_quotes() {
+        assert_eq!(shell_quote("hello"), "'hello'");
+    }
+
+    #[test]
+    fn test_shell_quote_neutralizes_command_substitution() {
+        // A POSIX shell never expands anything inside single quotes.
+        let quoted = shell_quote("$(rm -rf /) `whoami` $HOME");
+        assert_eq!(quoted, "'$(rm -rf /) `whoami` $HOME'");
+        // Sanity: Debug formatting (the old, unsafe approach) would NOT have
+        // neutralized this — it leaves `$(...)` untouched.
+        let debug_quoted = format!("{:?}", "$(rm -rf /) `whoami` $HOME");
+        assert!(debug_quoted.contains("$(rm -rf /)"), "debug-format leaves shell metachars live");
+    }
+
+    #[test]
+    fn test_shell_quote_escapes_embedded_single_quote() {
+        assert_eq!(shell_quote("it's a test"), "'it'\\''s a test'");
+    }
+
+    #[test]
+    fn test_shell_quote_empty_string() {
+        assert_eq!(shell_quote(""), "''");
     }
 
     // ------------------------------------------------------------------
