@@ -365,6 +365,65 @@ pub fn breakfix_fetch_model_timeout_secs() -> u64 {
         .unwrap_or(120)
 }
 
+// ── Meridian (SIMULATED paper-trading sandbox) ────────────────────────────
+//
+// Ported from <host>'s Python `meridian_tools.py`, which SSH'd to <host> and
+// shelled out to a `meridian.py` / `market_data.py` pair under
+// `<path>/meridian/`. That directory does not exist on <host> (nor
+// anywhere else reachable) — there was never a real backend to port state
+// persistence *from*. This module introduces its own local JSON-file
+// persistence (whole-document load/save, mirroring `intake`'s
+// `Nominations::load()` shape) rather than guessing at a Postgres schema that
+// was never observed running.
+
+/// Path to the local JSON file holding the (single, `"default"`) SIMULATED
+/// portfolio state. From `MERIDIAN_STATE_PATH`; defaults to a relative file
+/// in the process's working directory (this is low-stakes local sandbox
+/// state, not shared infra, so a sensible default — rather than a hard
+/// `NotConfigured` error — keeps the tool usable out of the box).
+pub fn meridian_state_path() -> String {
+    env_nonempty("MERIDIAN_STATE_PATH").unwrap_or_else(|| "meridian_portfolio.json".to_string())
+}
+
+/// Path the `meridian_report` tool writes its generated HTML dashboard to.
+/// From `MERIDIAN_REPORT_PATH`; defaults to a relative file. The Python
+/// original published to a fixed docroot on an internal host — no infra
+/// literal is hardcoded here; an operator points this at their own docroot
+/// via env var, same as every other infra path in this repo.
+pub fn meridian_report_path() -> String {
+    env_nonempty("MERIDIAN_REPORT_PATH").unwrap_or_else(|| "meridian_report.html".to_string())
+}
+
+/// URL reported back to the caller as "where the report was published".
+/// From `MERIDIAN_REPORT_URL`; `None` when unset (no infra literal is
+/// guessed) — the caller should treat this as "ask the operator where
+/// reports are served from" rather than a real published location.
+pub fn meridian_report_url() -> Option<String> {
+    env_nonempty("MERIDIAN_REPORT_URL")
+}
+
+/// Base URL for the CoinGecko public API. From `MERIDIAN_COINGECKO_URL`
+/// (test/override hook); defaults to the real public endpoint.
+pub fn meridian_coingecko_url() -> String {
+    env_nonempty("MERIDIAN_COINGECKO_URL")
+        .unwrap_or_else(|| "https://api.coingecko.com".to_string())
+}
+
+/// Base URL for the alternative.me Fear & Greed Index API. From
+/// `MERIDIAN_FEARGREED_URL` (test/override hook); defaults to the real public
+/// endpoint.
+pub fn meridian_feargreed_url() -> String {
+    env_nonempty("MERIDIAN_FEARGREED_URL")
+        .unwrap_or_else(|| "https://api.alternative.me".to_string())
+}
+
+/// Base URL for the Stooq quote CSV API (used for the SPY spot quote). From
+/// `MERIDIAN_STOOQ_URL` (test/override hook); defaults to the real public
+/// endpoint.
+pub fn meridian_stooq_url() -> String {
+    env_nonempty("MERIDIAN_STOOQ_URL").unwrap_or_else(|| "https://stooq.com".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,5 +681,53 @@ mod tests {
         std::env::set_var("MINT_BREAKFIX_FETCH_MODEL_TIMEOUT_SECS", "30");
         assert_eq!(breakfix_fetch_model_timeout_secs(), 30);
         std::env::remove_var("MINT_BREAKFIX_FETCH_MODEL_TIMEOUT_SECS");
+    }
+
+    #[test]
+    #[serial]
+    fn meridian_state_path_defaults_and_overrides() {
+        std::env::remove_var("MERIDIAN_STATE_PATH");
+        assert_eq!(meridian_state_path(), "meridian_portfolio.json");
+        std::env::set_var("MERIDIAN_STATE_PATH", "/tmp/custom.json");
+        assert_eq!(meridian_state_path(), "/tmp/custom.json");
+        std::env::remove_var("MERIDIAN_STATE_PATH");
+    }
+
+    #[test]
+    #[serial]
+    fn meridian_report_path_and_url_default_and_override() {
+        std::env::remove_var("MERIDIAN_REPORT_PATH");
+        std::env::remove_var("MERIDIAN_REPORT_URL");
+        assert_eq!(meridian_report_path(), "meridian_report.html");
+        assert_eq!(meridian_report_url(), None);
+        std::env::set_var("MERIDIAN_REPORT_PATH", "/tmp/report.html");
+        std::env::set_var("MERIDIAN_REPORT_URL", "http://example.test/trading/");
+        assert_eq!(meridian_report_path(), "/tmp/report.html");
+        assert_eq!(
+            meridian_report_url().as_deref(),
+            Some("http://example.test/trading/")
+        );
+        std::env::remove_var("MERIDIAN_REPORT_PATH");
+        std::env::remove_var("MERIDIAN_REPORT_URL");
+    }
+
+    #[test]
+    #[serial]
+    fn meridian_external_api_urls_default_and_override() {
+        std::env::remove_var("MERIDIAN_COINGECKO_URL");
+        std::env::remove_var("MERIDIAN_FEARGREED_URL");
+        std::env::remove_var("MERIDIAN_STOOQ_URL");
+        assert_eq!(meridian_coingecko_url(), "https://api.coingecko.com");
+        assert_eq!(meridian_feargreed_url(), "https://api.alternative.me");
+        assert_eq!(meridian_stooq_url(), "https://stooq.com");
+        std::env::set_var("MERIDIAN_COINGECKO_URL", "http://mock/cg");
+        std::env::set_var("MERIDIAN_FEARGREED_URL", "http://mock/fg");
+        std::env::set_var("MERIDIAN_STOOQ_URL", "http://mock/st");
+        assert_eq!(meridian_coingecko_url(), "http://mock/cg");
+        assert_eq!(meridian_feargreed_url(), "http://mock/fg");
+        assert_eq!(meridian_stooq_url(), "http://mock/st");
+        std::env::remove_var("MERIDIAN_COINGECKO_URL");
+        std::env::remove_var("MERIDIAN_FEARGREED_URL");
+        std::env::remove_var("MERIDIAN_STOOQ_URL");
     }
 }
