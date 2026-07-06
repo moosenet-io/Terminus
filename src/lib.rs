@@ -46,6 +46,7 @@ pub mod reminder;
 pub mod routines;
 pub mod seer;
 pub mod sentinel;
+pub mod soma;
 pub mod sysversion;
 pub mod tool;
 pub mod tools;
