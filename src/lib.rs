@@ -24,6 +24,7 @@ pub mod github;
 pub mod <secret-manager>;
 pub mod intake;
 pub mod network;
+pub mod odyssey;
 pub mod openhands;
 pub mod google;
 pub mod <media-service>;
