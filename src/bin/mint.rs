@@ -24,7 +24,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use terminus_rs::intake::{
     assistant::{runner, schema},
-    coder_case, coder_gaps, coder_sweep, gpu_authority, infer, supervisor,
+    chord_pull, coder_case, coder_gaps, coder_sweep, gpu_authority, infer, supervisor,
 };
 
 #[derive(Parser)]
@@ -88,6 +88,15 @@ enum Command {
     Supervisor {
         #[command(subcommand)]
         action: SupervisorAction,
+    },
+    /// MINT Phase 5: delegate a model re-pull/re-quantize to Chord's
+    /// PullCoordinator (`POST /api/models/:name/pull`).
+    FetchModel {
+        /// Model id to (re-)pull. Falls back to INTAKE_CASE_MODEL when omitted
+        /// (same env var `mint case`/`mint gaps` fall back to — this is an ad
+        /// hoc operator invocation, not a fleet-sweep target).
+        #[arg(long)]
+        model: Option<String>,
     },
 }
 
@@ -233,7 +242,10 @@ async fn ensure_schema_migrated() -> Result<(), String> {
 /// with no DB reachable, which is not this item's intent. Pure/extracted so
 /// this decision is unit-testable without a live Postgres connection.
 fn needs_schema_migrate(cmd: &Command) -> bool {
-    !matches!(cmd, Command::Gpu { .. } | Command::Supervisor { .. })
+    !matches!(
+        cmd,
+        Command::Gpu { .. } | Command::Supervisor { .. } | Command::FetchModel { .. }
+    )
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -416,6 +428,61 @@ async fn main() -> std::process::ExitCode {
             SupervisorAction::Install => supervisor::install(),
             SupervisorAction::Uninstall => supervisor::uninstall(),
         },
+
+        Command::FetchModel { model } => {
+            let model = match resolved_string(model, || env_opt("INTAKE_CASE_MODEL")) {
+                Some(m) => m,
+                None => {
+                    eprintln!(
+                        "mint fetch-model: no model specified (pass --model or set INTAKE_CASE_MODEL)"
+                    );
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            match chord_pull::fetch_model(&model).await {
+                Ok(outcome) => report_fetch_model_outcome(&model, outcome),
+                Err(e) => {
+                    eprintln!("mint fetch-model: {e}");
+                    std::process::ExitCode::FAILURE
+                }
+            }
+        }
+    }
+}
+
+/// Print `outcome` and translate it to a process exit code. Split out from
+/// the `main()` match arm so a unit test can assert on the exit-code mapping
+/// for every [`chord_pull::PullOutcome`] variant without invoking `main`.
+fn report_fetch_model_outcome(model: &str, outcome: chord_pull::PullOutcome) -> std::process::ExitCode {
+    use chord_pull::PullOutcome;
+    match outcome {
+        PullOutcome::Warmed { .. } => {
+            println!("fetch-model: {model} is now warm (present locally)");
+            std::process::ExitCode::SUCCESS
+        }
+        PullOutcome::NotFound { detail } => {
+            eprintln!("fetch-model: {model} not found: {detail}");
+            std::process::ExitCode::FAILURE
+        }
+        PullOutcome::InsufficientDiskSpace { detail } => {
+            eprintln!("fetch-model: {model}: {detail}");
+            std::process::ExitCode::FAILURE
+        }
+        PullOutcome::Unauthorized => {
+            eprintln!(
+                "fetch-model: chord rejected the pull request (401/403) — set CHORD_JWT to a \
+                 valid lumina token for this harness host"
+            );
+            std::process::ExitCode::FAILURE
+        }
+        PullOutcome::Unreachable { detail } => {
+            eprintln!("fetch-model: chord control endpoint unreachable: {detail}");
+            std::process::ExitCode::FAILURE
+        }
+        PullOutcome::Failed { detail } => {
+            eprintln!("fetch-model: {model}: {detail}");
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
@@ -593,6 +660,76 @@ mod tests {
                 assert!(langs.is_none());
             }
             _ => panic!("expected Gaps"),
+        }
+    }
+
+    // ---- MINT Phase 5: fetch-model CLI wiring ----
+
+    #[test]
+    fn fetch_model_parses_model_flag() {
+        let cli = Cli::try_parse_from(["mint", "fetch-model", "--model", "qwen3-coder:30b"])
+            .expect("parses");
+        match cli.command {
+            Command::FetchModel { model } => assert_eq!(model.as_deref(), Some("qwen3-coder:30b")),
+            _ => panic!("expected FetchModel"),
+        }
+    }
+
+    #[test]
+    fn fetch_model_flag_defaults_to_none() {
+        let cli = Cli::try_parse_from(["mint", "fetch-model"]).expect("parses");
+        match cli.command {
+            Command::FetchModel { model } => assert!(model.is_none()),
+            _ => panic!("expected FetchModel"),
+        }
+    }
+
+    #[test]
+    fn fetch_model_falls_back_to_env_when_flag_omitted() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("INTAKE_CASE_MODEL", "env-model:8b");
+        let cli = Cli::try_parse_from(["mint", "fetch-model"]).expect("parses");
+        let model = match cli.command {
+            Command::FetchModel { model } => resolved_string(model, || env_opt("INTAKE_CASE_MODEL")),
+            _ => panic!("expected FetchModel"),
+        };
+        assert_eq!(model.as_deref(), Some("env-model:8b"));
+        std::env::remove_var("INTAKE_CASE_MODEL");
+    }
+
+    #[test]
+    fn needs_schema_migrate_false_for_fetch_model() {
+        // fetch-model only talks to Chord over HTTP; it never touches the
+        // shared intake schema itself.
+        let cmd = Cli::try_parse_from(["mint", "fetch-model", "--model", "m:1"])
+            .unwrap()
+            .command;
+        assert!(!needs_schema_migrate(&cmd));
+    }
+
+    // ---- MINT Phase 5: fetch-model outcome → exit code mapping ----
+
+    #[test]
+    fn report_fetch_model_outcome_warmed_is_success() {
+        let code = report_fetch_model_outcome(
+            "m:1",
+            chord_pull::PullOutcome::Warmed { model: "m:1".to_string() },
+        );
+        assert_eq!(code, std::process::ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn report_fetch_model_outcome_every_other_variant_is_failure() {
+        let variants = vec![
+            chord_pull::PullOutcome::NotFound { detail: "x".to_string() },
+            chord_pull::PullOutcome::InsufficientDiskSpace { detail: "x".to_string() },
+            chord_pull::PullOutcome::Unauthorized,
+            chord_pull::PullOutcome::Unreachable { detail: "x".to_string() },
+            chord_pull::PullOutcome::Failed { detail: "x".to_string() },
+        ];
+        for v in variants {
+            let code = report_fetch_model_outcome("m:1", v.clone());
+            assert_eq!(code, std::process::ExitCode::FAILURE, "expected FAILURE for {v:?}");
         }
     }
 
