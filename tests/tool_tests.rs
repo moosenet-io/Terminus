@@ -236,6 +236,9 @@ fn test_relay_all_tools_registered() {
         "relay_service_log",
         "relay_next_due",
         "relay_odometer",
+        "relay_mileage_update",
+        "relay_cost_summary",
+        "relay_maintenance_history",
     ] {
         assert!(reg.contains(tool), "Relay tool '{tool}' must be registered");
     }
