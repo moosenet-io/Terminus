@@ -23,7 +23,7 @@ use terminus_rs::intake::assistant::acquire::{
 };
 use terminus_rs::intake::assistant::fleet::{self, Fleet, FleetStore};
 use terminus_rs::intake::assistant::runner::{
-    self, Checkpoint, CheckpointKey, RunReport, ScoreSink, SuiteDriver, SUITE_DIMENSIONS,
+    self, Checkpoint, CheckpointKey, GpuLock, RunReport, ScoreSink, SuiteDriver, SUITE_DIMENSIONS,
 };
 use terminus_rs::intake::assistant::{BackendTag, DimensionScore, ModelId};
 
@@ -159,6 +159,22 @@ fn noms(json: &str) -> Nominations {
     Nominations::from_json(json).expect("nominations parse")
 }
 
+/// S86: grants immediately, zero pause — these tests exercise `run_with`'s
+/// acquire/smoke/suite/fleet orchestration through its public surface, not
+/// the GPU-lock fairness mechanism itself (that has dedicated unit tests in
+/// `runner.rs` and `gpu_authority.rs`).
+struct NoopGpuLock;
+#[async_trait]
+impl GpuLock for NoopGpuLock {
+    async fn acquire(&self) -> Result<(), String> {
+        Ok(())
+    }
+    fn release(&self) {}
+    fn release_pause(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+}
+
 fn run(
     n: &Nominations,
     acq: &dyn Acquirer,
@@ -168,9 +184,10 @@ fn run(
     fleet: &dyn FleetStore,
 ) -> RunReport {
     tokio::runtime::Builder::new_current_thread()
+        .enable_time()
         .build()
         .unwrap()
-        .block_on(runner::run_with(n, acq, driver, sink, cp, fleet))
+        .block_on(runner::run_with(n, acq, driver, sink, cp, fleet, &NoopGpuLock))
         .expect("run ok")
 }
 

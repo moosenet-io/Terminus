@@ -263,48 +263,31 @@ async fn main() -> std::process::ExitCode {
                 // before the sweep runs. Process-global; intake runs sequentially.
                 infer::set_remote_ollama_url(resolve_remote_url(remote));
 
-                // Item 7: `mint`'s dispatcher pre-acquires the GPU-authority
-                // guard under the EXACT SAME holder label `coder_sweep::run`
-                // acquires internally (`coder_sweep::GPU_HOLDER`). This is
-                // safe (not a double-acquisition deadlock/footgun) BECAUSE
-                // `gpu_authority::acquire` treats a re-acquire by the SAME
-                // holder as an idempotent no-op (see
-                // `gpu_authority::is_idempotent_reacquire`) — the inner
-                // acquire inside `coder_sweep::run` sees the lock already
-                // held by its own label and does nothing further, and the
-                // inner guard's `Drop` (at the end of `coder_sweep::run`)
-                // performs the actual release + service-restart; THIS outer
-                // guard's later `Drop` then finds no lock left and is a
-                // no-op too. A DIFFERENT holder currently holding the lock
-                // still correctly fails HERE, before any sweep work starts.
-                let _gpu_guard = match gpu_authority::ExclusiveGuard::acquire(
-                    gpu_authority::GpuMode::Exclusive,
-                    coder_sweep::GPU_HOLDER,
-                ) {
-                    Ok(g) => g,
-                    Err(e) => {
-                        eprintln!("mint: GPU acquire failed: {e}");
-                        return std::process::ExitCode::FAILURE;
-                    }
-                };
+                // S86: `mint` no longer pre-acquires a whole-run outer guard
+                // here (item 7's original reasoning — a SAME-holder nested
+                // acquire is an idempotent no-op, so an outer guard "for the
+                // whole subcommand" was harmless — no longer holds: since
+                // `coder_sweep::run` now acquires/releases the exclusive
+                // lock freshly PER (model, backend) pass instead of once for
+                // the whole run (see `gpu_authority.rs`'s "Fairness"
+                // section), an outer guard held here would make the FIRST
+                // pass's acquire a no-op (fine) but then get its OWN release
+                // torn out from under it by the inner per-pass release after
+                // just one pass — AND, worse, its one-shot/no-backoff
+                // acquire would fail this whole subcommand immediately on a
+                // transient refusal, defeating the bounded-backoff wait
+                // `coder_sweep::run` now does for EVERY pass, including the
+                // first. `coder_sweep::run` handles its own acquisition
+                // (fail-fast is no longer correct at any layer here).
                 coder_sweep::run(&langs, case_limit, mem_config.as_deref()).await
             }
             SweepTarget::Assistant { remote } => {
                 // Phase 6: install the remote inference-target override (if any).
                 infer::set_remote_ollama_url(resolve_remote_url(remote));
-                // Item 7: same pattern as `Sweep::Coder`, under
-                // `runner::GPU_HOLDER` — the exact label `runner::run`
-                // acquires internally.
-                let _gpu_guard = match gpu_authority::ExclusiveGuard::acquire(
-                    gpu_authority::GpuMode::Exclusive,
-                    runner::GPU_HOLDER,
-                ) {
-                    Ok(g) => g,
-                    Err(e) => {
-                        eprintln!("mint: GPU acquire failed: {e}");
-                        return std::process::ExitCode::FAILURE;
-                    }
-                };
+                // S86: same reasoning as `Sweep::Coder` above — `runner::run`
+                // now acquires/releases the exclusive lock per model (with
+                // bounded backoff on every acquire, including the first), so
+                // `mint` no longer pre-acquires a whole-run outer guard here.
                 match runner::run().await {
                     Ok(report) => {
                         let total = report.models.len();

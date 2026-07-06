@@ -47,7 +47,7 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -819,6 +819,223 @@ impl Drop for ExclusiveGuard {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Fairness: bounded-backoff acquire retry, shared by every caller of this
+// module, and the release-between-units-of-work timing constant.
+//
+// ## Root cause (S86 GPU-lock starvation)
+// `intake_coder_sweep` and `intake_assistant_sweep` both need this module's
+// exclusive lock, but for years (well, weeks) each one's `run()` acquired
+// ONE [`ExclusiveGuard`] at the very top and held it for its ENTIRE
+// multi-hour/multi-day fleet run — by design, because the lock genuinely
+// must be held while a case is mid-inference. HFIX-09 gave the assistant
+// sweep's *initial* acquire a bounded retry/backoff (see
+// [`acquire_with_backoff`]) instead of crash-looping on refusal, which fixed
+// the crash-loop but NOT the underlying starvation: whichever sweep is
+// already running still holds the lock for its ENTIRE run, so the other
+// sweep's backoff loop just waits (quietly, no longer crash-looping) for up
+// to its `max_wait` cap and then gives up — for as long as the first sweep
+// runs, which for `intake_coder_sweep` is DAYS. Confirmed in production: zero
+// `assistant_dimension_score` rows for 2+ days straight for `mem_config =
+// 'dynamic_gtt'`, the live run, once `intake_coder_sweep` started.
+//
+// A one-sided fix (e.g. giving `intake_coder_sweep` the SAME bounded backoff
+// on refusal, but still one acquire for its whole run) would not fix
+// anything — it would just flip who starves: whichever sweep starts running
+// first still holds the lock uninterrupted for its whole run, no matter how
+// gracefully the OTHER side backs off while waiting.
+//
+// ## The fix: release-between-units-of-work
+// Both `coder_sweep.rs` and `assistant/runner.rs` now acquire the exclusive
+// lock freshly at the START of each unit of work (one (model, backend) pass —
+// the natural iteration boundary each fleet loop already has) and RELEASE it
+// at the END of that same unit, instead of holding one guard for the whole
+// run. Reacquiring after a release goes through the SAME
+// [`acquire_with_backoff`] used for the initial acquire, so a unit that
+// starts while the other sweep is mid-unit waits (bounded) rather than
+// racing/erroring.
+//
+// ## Avoiding "release-and-immediately-regrab" thrashing
+// Releasing and instantly trying to reacquire achieves nothing if the OTHER
+// sweep's backoff loop doesn't get a real chance to notice the gap before
+// this side grabs it back. The other side, while waiting, only re-checks
+// once every [`ACQUIRE_POLL_INTERVAL`] (60s) — so if this side pauses for
+// less than that after releasing (the originally-considered "1-2s" pause),
+// the worst case is: the other side's last check landed just before this
+// side released, so its NEXT check won't happen for up to 60s — comfortably
+// longer than a 1-2s gap — and this side will have already reacquired and
+// moved on to its next unit before the other side ever sees the lock free.
+// That is real, provable starvation-through-thrashing, not a hypothetical:
+// see the `alternation_actually_happens_with_the_chosen_pause` /
+// `..._starves_the_other_side_with_a_too_short_pause` tests below, which
+// simulate the exact timeline and demonstrate both outcomes.
+//
+// [`INTER_UNIT_RELEASE_PAUSE`] is therefore set to 90s: strictly LONGER than
+// [`ACQUIRE_POLL_INTERVAL`] (60s), so ANY sweep that has been waiting for
+// even one full poll interval is GUARANTEED to observe the lock free at some
+// point during the pause window and win the race — genuine alternation, not
+// just a released-then-reacquired lock that never had a real window. The
+// extra 30s beyond the bare minimum is safety margin for scheduling jitter
+// (tokio/systemd scheduling, the Chord HTTP round trip inside `acquire`).
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// How often a caller waiting in [`acquire_with_backoff`] retries a refused
+/// acquire. Shared by every caller — the [`INTER_UNIT_RELEASE_PAUSE`] timing
+/// argument above only holds if all callers poll at the same cadence.
+pub const ACQUIRE_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How often [`acquire_with_backoff`] re-logs progress while still waiting
+/// (so a long wait is observable in the log without spamming a line every
+/// `ACQUIRE_POLL_INTERVAL`).
+pub const ACQUIRE_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// How long to pause AFTER releasing the exclusive lock between units of
+/// work, before attempting to reacquire it for the next unit. See the module
+/// section doc above ("Avoiding release-and-immediately-regrab thrashing")
+/// for the full timing reasoning: this MUST be longer than
+/// [`ACQUIRE_POLL_INTERVAL`] for real alternation to happen, not just a
+/// released-then-reacquired lock that never gave the other side a real
+/// window.
+pub const INTER_UNIT_RELEASE_PAUSE: Duration = Duration::from_secs(90);
+
+/// Injectable clock so [`acquire_with_backoff`] is unit-testable without real
+/// time passing. Shared by every caller of the bounded-backoff retry
+/// (assistant sweep's initial+per-model acquire, coder sweep's per-(model,
+/// backend) reacquire) — one implementation, not copy-pasted per caller.
+/// Production uses [`RealClock`]; tests use a fake that advances a virtual
+/// clock instantly.
+#[async_trait::async_trait]
+pub trait AcquireClock: Send + Sync {
+    fn now(&self) -> std::time::Instant;
+    async fn sleep(&self, dur: Duration);
+}
+
+pub struct RealClock;
+
+#[async_trait::async_trait]
+impl AcquireClock for RealClock {
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
+    async fn sleep(&self, dur: Duration) {
+        tokio::time::sleep(dur).await;
+    }
+}
+
+/// Is `err` (a failure string from [`acquire`] or [`acquire_with_backoff`])
+/// the "a live holder currently, actively holds the exclusive lock" refusal —
+/// the only refusal worth retrying. Both the local lock-file block (this
+/// module's `is_blocked` path) and Chord's own remote lock (`ChordCall::Held`)
+/// produce a message containing this phrase.
+///
+/// Deliberately NOT retried by [`acquire_with_backoff`]: a misconfigured
+/// `CHORD_JWT` (`Unauthorized`), a generic Chord/network failure (`Failed`),
+/// or a `systemctl`/lock-file-write failure inside [`acquire`] — those are NOT
+/// "someone else has it right now," they're a broken acquire, and [`acquire`]
+/// stops `policy.stop_services` (e.g. `lemonade-coder.service`) BEFORE it can
+/// fail on those paths. Retrying one of those every `poll_interval` for up to
+/// `max_wait` would repeatedly stop/restart a production serving unit for
+/// hours on a persistent, non-transient error instead of failing fast and
+/// visibly. So those fail immediately — systemd's crash-loop remains the
+/// (louder, faster) safety net for a genuinely broken acquire, while the
+/// bounded wait only kicks in for the expected "the other sweep has it"
+/// case.
+///
+/// Matching is by substring against this module's CURRENT error text —
+/// deliberately fail-CLOSED (an unrecognized message is treated as
+/// NON-retryable) so a message-format drift here degrades to "fail fast, like
+/// before," never to "silently retry forever."
+pub fn is_live_holder_refusal(err: &str) -> bool {
+    err.contains("held exclusively by")
+}
+
+/// Acquire via `try_acquire`, retrying with backoff instead of failing
+/// immediately when it returns `Err` (e.g. the GPU is exclusively held by
+/// another sweep) — bounded by `max_wait`. Returns the same `Err` shape a
+/// one-shot acquire would once the cap is hit, so systemd's
+/// `Restart=on-failure` remains the ultimate safety net for a caller that
+/// treats exhaustion as fatal, just at a much lower frequency than every
+/// retry — a caller that treats a per-unit reacquire failure as a
+/// recorded skip (not fatal) still benefits from the same bounded,
+/// non-spinning wait.
+///
+/// `label` is used only in log lines (so a coder-sweep caller's logs say
+/// `intake_coder_sweep: ...` and an assistant-sweep caller's say
+/// `intake_assistant_sweep: ...`) — it carries no behavioral meaning.
+///
+/// Generic over the acquired value `T`, the clock, and the retry predicate so
+/// this is testable with a fake acquire function, a fake (instant) clock, and
+/// an arbitrary `is_retryable` — no real `sleep()` in tests.
+pub async fn acquire_with_backoff<T, F, C>(
+    clock: &C,
+    mut try_acquire: F,
+    is_retryable: impl Fn(&str) -> bool,
+    poll_interval: Duration,
+    progress_log_interval: Duration,
+    max_wait: Duration,
+    label: &str,
+) -> Result<T, String>
+where
+    F: FnMut() -> Result<T, String>,
+    C: AcquireClock,
+{
+    let start = clock.now();
+    let mut waiting = false;
+    let mut last_progress_log = start;
+
+    loop {
+        match try_acquire() {
+            Ok(v) => {
+                if waiting {
+                    tracing::info!(
+                        "{label}: GPU acquired after waiting {:.0?} for another holder to release it",
+                        clock.now().duration_since(start)
+                    );
+                }
+                return Ok(v);
+            }
+            Err(e) => {
+                if !is_retryable(&e) {
+                    tracing::error!(
+                        "{label}: GPU acquire failed with a non-transient error ({e}) — not \
+                         retrying (this is not the \"another holder has it right now\" case; \
+                         waiting would just repeatedly bounce production services)"
+                    );
+                    return Err(e);
+                }
+                let elapsed = clock.now().duration_since(start);
+                if elapsed >= max_wait {
+                    tracing::error!(
+                        "{label}: giving up waiting for the GPU after {:.0?} (cap {:.0?}); last \
+                         refusal: {e}",
+                        elapsed,
+                        max_wait
+                    );
+                    return Err(format!(
+                        "gave up waiting for the GPU after {elapsed:.0?} (cap {max_wait:.0?}): {e}"
+                    ));
+                }
+                if !waiting {
+                    waiting = true;
+                    last_progress_log = start;
+                    tracing::warn!(
+                        "{label}: GPU acquire refused ({e}) — waiting for it to free up, \
+                         retrying every {poll_interval:.0?} (giving up after {max_wait:.0?})"
+                    );
+                } else if clock.now().duration_since(last_progress_log) >= progress_log_interval {
+                    last_progress_log = clock.now();
+                    tracing::warn!(
+                        "{label}: still waiting for the GPU after {:.0?} ({e})",
+                        elapsed
+                    );
+                }
+                clock.sleep(poll_interval).await;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1106,5 +1323,381 @@ mod tests {
         let parsed: LockState = serde_json::from_str(legacy).unwrap();
         assert_eq!(parsed.holder, "intake_coder_sweep");
         assert!(!parsed.chord_notified);
+    }
+
+    // ── S86 GPU-lock fairness: shared bounded-backoff retry ─────────────────
+    // (moved here from `assistant/runner.rs` so `coder_sweep.rs` can reuse the
+    // SAME implementation for its between-units reacquire, rather than a
+    // copy-paste — see the module section doc above `ACQUIRE_POLL_INTERVAL`.)
+
+    use std::sync::Mutex as StdMutex;
+
+    /// A fake clock: `now()` returns a virtual instant that only advances
+    /// when `sleep()` is called (by the amount requested) — no real time
+    /// passes. Also records how many times `sleep` was called, so tests can
+    /// assert on retry counts without depending on wall-clock timing at all.
+    struct FakeClock {
+        elapsed: StdMutex<Duration>,
+        sleep_calls: StdMutex<u32>,
+    }
+
+    impl FakeClock {
+        fn new() -> Self {
+            FakeClock { elapsed: StdMutex::new(Duration::ZERO), sleep_calls: StdMutex::new(0) }
+        }
+
+        fn sleep_call_count(&self) -> u32 {
+            *self.sleep_calls.lock().unwrap()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AcquireClock for FakeClock {
+        fn now(&self) -> std::time::Instant {
+            // `Instant` cannot be constructed at an arbitrary offset directly,
+            // so anchor a fixed base instant once and add the virtual elapsed
+            // duration recorded so far.
+            use std::sync::OnceLock;
+            static BASE: OnceLock<std::time::Instant> = OnceLock::new();
+            let base = *BASE.get_or_init(std::time::Instant::now);
+            base + *self.elapsed.lock().unwrap()
+        }
+
+        async fn sleep(&self, dur: Duration) {
+            *self.sleep_calls.lock().unwrap() += 1;
+            *self.elapsed.lock().unwrap() += dur;
+            // Deliberately NOT a real sleep — the whole point of the fake
+            // clock is that tests run instantly regardless of `dur`.
+        }
+    }
+
+    #[tokio::test]
+    async fn acquire_with_backoff_retries_then_succeeds() {
+        let clock = FakeClock::new();
+        let attempts = StdMutex::new(0u32);
+        let result = acquire_with_backoff(
+            &clock,
+            || {
+                let mut n = attempts.lock().unwrap();
+                *n += 1;
+                if *n < 4 {
+                    Err(format!("refused (attempt {n})"))
+                } else {
+                    Ok(*n)
+                }
+            },
+            |_| true, // treat every refusal as retryable for this test
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+            Duration::from_secs(3600),
+            "test",
+        )
+        .await;
+
+        assert_eq!(result, Ok(4), "must return the value from the attempt that finally succeeded");
+        assert_eq!(*attempts.lock().unwrap(), 4, "must have tried exactly 4 times (3 refusals + 1 success)");
+        assert_eq!(
+            clock.sleep_call_count(),
+            3,
+            "must sleep between refusals only, never after a success"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_with_backoff_succeeds_immediately_without_sleeping() {
+        let clock = FakeClock::new();
+        let result: Result<u32, String> = acquire_with_backoff(
+            &clock,
+            || Ok(42),
+            |_| true,
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+            Duration::from_secs(3600),
+            "test",
+        )
+        .await;
+
+        assert_eq!(result, Ok(42));
+        assert_eq!(clock.sleep_call_count(), 0, "a first-try success must never sleep");
+    }
+
+    #[tokio::test]
+    async fn acquire_with_backoff_gives_up_after_max_wait_and_stops_retrying() {
+        let clock = FakeClock::new();
+        let attempts = StdMutex::new(0u32);
+        let result: Result<(), String> = acquire_with_backoff(
+            &clock,
+            || {
+                *attempts.lock().unwrap() += 1;
+                Err("GPU is held exclusively by 'intake_coder_sweep'".to_string())
+            },
+            is_live_holder_refusal,
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+            Duration::from_secs(300), // max_wait: 5 poll intervals
+            "test",
+        )
+        .await;
+
+        assert!(result.is_err(), "must give up rather than retry forever");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("gave up waiting for the GPU"),
+            "give-up error must be self-explanatory in a log/journalctl, got: {msg}"
+        );
+        assert!(
+            msg.contains("intake_coder_sweep"),
+            "give-up error should carry the last underlying refusal for diagnosis, got: {msg}"
+        );
+
+        // With a 60s poll interval and a 300s cap, the loop must terminate
+        // (bounded attempts), not spin unboundedly.
+        let tries = *attempts.lock().unwrap();
+        assert!(tries >= 5 && tries <= 6, "expected roughly max_wait/poll_interval attempts, got {tries}");
+    }
+
+    #[tokio::test]
+    async fn acquire_with_backoff_never_retries_a_first_try_beyond_max_wait_zero() {
+        // A max_wait of 0 means: try once, and if it fails, give up immediately
+        // (no sleep at all) — the cap is honored even on the very first refusal.
+        let clock = FakeClock::new();
+        let attempts = StdMutex::new(0u32);
+        let result: Result<(), String> = acquire_with_backoff(
+            &clock,
+            || {
+                *attempts.lock().unwrap() += 1;
+                Err("refused".to_string())
+            },
+            |_| true,
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+            Duration::ZERO,
+            "test",
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(*attempts.lock().unwrap(), 1, "max_wait=0 must not retry at all");
+        assert_eq!(clock.sleep_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn acquire_with_backoff_fails_fast_on_a_non_retryable_error_without_sleeping() {
+        // The masking hazard this predicate exists to prevent: a persistent,
+        // non-transient acquire failure (e.g. misconfigured CHORD_JWT) must
+        // NOT be retried for up to max_wait — gpu_authority::acquire() stops
+        // production services (e.g. lemonade-coder.service) before it can
+        // fail on that path, so retrying it every poll_interval would bounce
+        // that service repeatedly for hours instead of failing immediately.
+        let clock = FakeClock::new();
+        let attempts = StdMutex::new(0u32);
+        let result: Result<(), String> = acquire_with_backoff(
+            &clock,
+            || {
+                *attempts.lock().unwrap() += 1;
+                Err("chord rejected the GPU-exclusive acquire (401/403) — set CHORD_JWT \
+                     to a valid lumina token for this harness host"
+                    .to_string())
+            },
+            is_live_holder_refusal,
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+            Duration::from_secs(3600 * 4),
+            "test",
+        )
+        .await;
+
+        assert!(result.is_err(), "a non-retryable refusal must still fail");
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            1,
+            "must try exactly once and give up immediately, not retry a non-transient error"
+        );
+        assert_eq!(
+            clock.sleep_call_count(),
+            0,
+            "must never sleep before failing fast on a non-retryable error"
+        );
+        assert!(
+            result.unwrap_err().contains("CHORD_JWT"),
+            "the original error detail must be preserved for diagnosis"
+        );
+    }
+
+    #[test]
+    fn is_live_holder_refusal_recognizes_both_local_and_chord_held_messages() {
+        // These are this module's ACTUAL current error strings (local lock
+        // block, and Chord's remote `Held` refusal) — if that wording ever
+        // drifts, this test should be updated alongside it so the predicate
+        // keeps recognizing the retryable case rather than silently falling
+        // back to "fail fast" for the expected scenario.
+        assert!(is_live_holder_refusal(
+            "GPU is held exclusively by 'intake_coder_sweep' (pid 123, mode exclusive, \
+             since epoch 100) — refusing to acquire for 'intake_assistant_sweep'"
+        ));
+        assert!(is_live_holder_refusal(
+            "chord reports the GPU is already held exclusively by 'intake_coder_sweep' \
+             — refusing to start"
+        ));
+    }
+
+    #[test]
+    fn is_live_holder_refusal_rejects_non_transient_errors() {
+        assert!(!is_live_holder_refusal(
+            "chord rejected the GPU-exclusive acquire (401/403) — set CHORD_JWT to a valid \
+             lumina token for this harness host"
+        ));
+        assert!(!is_live_holder_refusal("chord GPU-exclusive acquire failed: connection reset"));
+        assert!(!is_live_holder_refusal("failed to write GPU lock file: permission denied"));
+        assert!(!is_live_holder_refusal("some entirely unrecognized message"));
+    }
+
+    // ── S86: does the release-between-units fix actually achieve alternation? ──
+    //
+    // A synchronous, deterministic discrete-event simulation of two "sweeps"
+    // (A = coder-sweep-like, long per-unit work; B = assistant-sweep-like,
+    // shorter per-unit work) sharing one lock, each following the EXACT
+    // policy this fix implements: hold the lock for `unit_secs`, release,
+    // wait `pause_secs`, then try to reacquire; while NOT holding it and
+    // refused, retry every `poll_secs`. No real async/tokio scheduling is
+    // involved — this is a plain second-by-second state walk, so it is fully
+    // deterministic and fast, and it directly encodes the timing argument
+    // from the module doc rather than merely asserting on `acquire_with_backoff`
+    // in isolation.
+    struct SweepSim {
+        unit_secs: u64,
+        pause_secs: u64,
+        poll_secs: u64,
+        next_attempt: u64,
+        release_at: Option<u64>,
+        turns: u32,
+    }
+
+    impl SweepSim {
+        fn new(unit_secs: u64, pause_secs: u64, poll_secs: u64) -> Self {
+            SweepSim { unit_secs, pause_secs, poll_secs, next_attempt: 0, release_at: None, turns: 0 }
+        }
+    }
+
+    /// Runs the simulation for `total_secs` virtual seconds; returns (a_turns, b_turns).
+    fn simulate_alternation(total_secs: u64, mut a: SweepSim, mut b: SweepSim) -> (u32, u32) {
+        let mut holder: Option<u8> = None; // 1 = A, 2 = B
+
+        for now in 0..total_secs {
+            // Releases due this tick free the lock and schedule this sweep's
+            // next attempt AFTER its post-release pause.
+            if holder == Some(1) && a.release_at == Some(now) {
+                holder = None;
+                a.release_at = None;
+                a.next_attempt = now + a.pause_secs;
+            }
+            if holder == Some(2) && b.release_at == Some(now) {
+                holder = None;
+                b.release_at = None;
+                b.next_attempt = now + b.pause_secs;
+            }
+
+            // A's attempt this tick (arbitrary tie-break: A acts first).
+            if holder.is_none() && now >= a.next_attempt {
+                holder = Some(1);
+                a.release_at = Some(now + a.unit_secs);
+                a.turns += 1;
+            } else if holder.is_some() && holder != Some(1) && now >= a.next_attempt {
+                a.next_attempt = now + a.poll_secs;
+            }
+
+            // B's attempt this tick (checked after A's, so if A just took the
+            // lock this very tick, B correctly sees it as unavailable).
+            if holder.is_none() && now >= b.next_attempt {
+                holder = Some(2);
+                b.release_at = Some(now + b.unit_secs);
+                b.turns += 1;
+            } else if holder.is_some() && holder != Some(2) && now >= b.next_attempt {
+                b.next_attempt = now + b.poll_secs;
+            }
+        }
+
+        (a.turns, b.turns)
+    }
+
+    #[test]
+    fn alternation_actually_happens_with_the_chosen_pause() {
+        // A = coder-sweep-like (long units, e.g. ~10min per model+backend
+        // pass), B = assistant-sweep-like (shorter units, e.g. ~2min per
+        // model). Both poll every ACQUIRE_POLL_INTERVAL (60s) while waiting,
+        // and both pause INTER_UNIT_RELEASE_PAUSE (90s) after releasing
+        // before trying to reacquire — the ACTUAL policy this fix
+        // implements.
+        let poll = ACQUIRE_POLL_INTERVAL.as_secs();
+        let pause = INTER_UNIT_RELEASE_PAUSE.as_secs();
+        assert!(pause > poll, "the whole proof below depends on pause > poll_interval");
+
+        let a = SweepSim::new(600, pause, poll);
+        let b = SweepSim::new(120, pause, poll);
+
+        // 3 hours of virtual time — long enough for many alternations.
+        let (a_turns, b_turns) = simulate_alternation(3 * 60 * 60, a, b);
+
+        assert!(a_turns > 3, "coder-sweep-like side must get multiple real turns, got {a_turns}");
+        assert!(
+            b_turns > 3,
+            "assistant-sweep-like side must ALSO get multiple real turns (not starved), got {b_turns}"
+        );
+    }
+
+    #[test]
+    fn a_too_short_pause_reproduces_the_starvation_this_fix_must_avoid() {
+        // The originally-considered "1-2s" pause: strictly SHORTER than the
+        // 60s poll interval. B's poll checks land at a FIXED phase relative
+        // to A's release/reacquire cycle whenever that cycle length (unit +
+        // pause) is an exact multiple of the poll interval — 598 + 2 = 600 =
+        // 10 * 60 here — so if B's check misses the 2s window once, it
+        // misses on EVERY subsequent cycle too, not just "usually": this
+        // demonstrates the worst case is not a rare edge case but a stable,
+        // reproducible starvation for as long as the two sweeps' cadences
+        // stay in that phase relationship (exactly the kind of clean integer
+        // cadence real systemd-timer-driven poll loops actually have). This
+        // is WHY INTER_UNIT_RELEASE_PAUSE was set to 90s instead of 1-2s — a
+        // short pause releases and reacquires the lock on paper, but never
+        // gives the other side a REAL window, so it can achieve nothing in
+        // practice for as long as the run lasts.
+        let poll = ACQUIRE_POLL_INTERVAL.as_secs();
+        let too_short_pause = 2u64;
+        assert!(too_short_pause < poll);
+
+        let a = SweepSim::new(598, too_short_pause, poll); // 598 + 2 = 600 = 10 * poll
+        let b = SweepSim::new(120, too_short_pause, poll);
+
+        // 24h of virtual time — long enough that "B eventually gets lucky"
+        // would have shown up if it were going to.
+        let (a_turns, b_turns) = simulate_alternation(24 * 60 * 60, a, b);
+
+        assert!(a_turns > 0, "sanity: A still runs");
+        assert_eq!(
+            b_turns, 0,
+            "with a too-short pause whose cycle phase-locks against the poll interval, B never \
+             wins the race even once in 24 hours — proving a brief-but-inadequate pause is worse \
+             than no fix at all (it LOOKS like fairness in the code but delivers none in practice)"
+        );
+    }
+
+    #[test]
+    fn alternation_holds_regardless_of_the_exact_unit_lengths() {
+        // Unlike the too-short-pause case above, a pause LONGER than the
+        // poll interval guarantees alternation for ANY unit lengths — not
+        // just ones that happen to avoid an unlucky phase lock. Re-run the
+        // "chosen pause" proof with the SAME unit length (598s) that phase-
+        // locked the too-short-pause test into total starvation, to show the
+        // 90s pause is not itself relying on a lucky phase relationship.
+        let poll = ACQUIRE_POLL_INTERVAL.as_secs();
+        let pause = INTER_UNIT_RELEASE_PAUSE.as_secs();
+
+        let a = SweepSim::new(598, pause, poll);
+        let b = SweepSim::new(120, pause, poll);
+
+        let (a_turns, b_turns) = simulate_alternation(3 * 60 * 60, a, b);
+
+        assert!(a_turns > 3);
+        assert!(b_turns > 3, "must NOT reproduce the phase-lock starvation seen with a too-short pause");
     }
 }
