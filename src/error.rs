@@ -19,4 +19,7 @@ pub enum ToolError {
 
     #[error("Not found: {0}")]
     NotFound(String),
+
+    #[error("Conflict: {0}")]
+    Conflict(String),
 }
