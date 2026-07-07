@@ -18,13 +18,18 @@
 //!     validated against subsequent requests — this server is stateless tool
 //!     dispatch, matching the legacy Python host's practical behavior even
 //!     though it also emits a session id).
-//!   - `notifications/initialized` — accepted, no result (per JSON-RPC,
-//!     notifications get no response body; we return an empty 202).
+//!   - Any request with no `"id"` (a JSON-RPC notification, e.g.
+//!     `notifications/initialized`) — accepted, no response body (empty 202),
+//!     per JSON-RPC notification semantics.
 //!   - `tools/list` — returns the full registry catalog as MCP `Tool` objects
 //!     (`name`, `description`, `inputSchema` sourced from `parameters()`).
 //!   - `tools/call` — `{name, arguments}` → registry dispatch → MCP
-//!     `CallToolResult` (`content: [{type: "text", text: ...}]`).
-//!   - anything else → JSON-RPC `-32601 Method not found`.
+//!     `CallToolResult` (`content: [{type: "text", text: ...}]`). An unknown
+//!     tool name or a tool execution error both surface as `isError: true`
+//!     in the result (a tool-call failure, not a JSON-RPC protocol error —
+//!     `tools/call` itself is a valid method).
+//!   - anything else (an unrecognized method, with an `"id"` present) →
+//!     JSON-RPC `-32601 Method not found`.
 //! - `GET /healthz` — plain-text liveness probe for systemd/monitoring (not
 //!   part of the MCP wire protocol; a separate convenience route).
 //!
@@ -66,6 +71,10 @@ pub fn build_router(state: Arc<McpServerState>) -> Router {
         .route("/mcp", post(handle_mcp))
         .route("/healthz", get(handle_healthz))
         .with_state(state)
+        // Request-level tracing (method/path/status/latency) via RUST_LOG —
+        // useful for an admin-tools endpoint where knowing who called what,
+        // when, matters operationally.
+        .layer(tower_http::trace::TraceLayer::new_for_http())
 }
 
 async fn handle_healthz(State(state): State<Arc<McpServerState>>) -> impl IntoResponse {
@@ -131,8 +140,13 @@ async fn handle_mcp(
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
 
-    // Notifications (no "id") get no JSON-RPC response body at all.
+    // Notifications (no "id") get no JSON-RPC response body at all — true for
+    // `notifications/initialized` and, per spec, for any other id-less
+    // request a client might send.
     let is_notification = req.get("id").is_none();
+    if is_notification {
+        return StatusCode::ACCEPTED.into_response();
+    }
 
     match method {
         "initialize" => {
@@ -144,10 +158,6 @@ async fn handle_mcp(
             });
             info!("terminus_personal: initialize -> session {session_id}");
             sse_response(id, Ok(result), &session_id)
-        }
-        "notifications/initialized" => {
-            let _ = is_notification;
-            StatusCode::ACCEPTED.into_response()
         }
         "tools/list" => {
             let tools: Vec<Value> = state
@@ -185,9 +195,16 @@ async fn handle_mcp(
                     })),
                     "",
                 ),
+                // Per MCP convention, an unknown tool is a *tool-call* failure
+                // (`isError: true` in the result), not a JSON-RPC protocol
+                // error — `tools/call` itself is a valid method, so `-32601
+                // Method not found` would be a misleading code here.
                 None => sse_response(
                     id,
-                    Err((-32601, format!("Unknown tool: {name}"))),
+                    Ok(json!({
+                        "content": [{"type": "text", "text": format!("Unknown tool: {name}")}],
+                        "isError": true
+                    })),
                     "",
                 ),
             }
@@ -223,7 +240,10 @@ fn sse_response(id: Value, result: Result<Value, (i64, String)>, session_id: &st
 
     if !session_id.is_empty() {
         if let Ok(hv) = HeaderValue::from_str(session_id) {
-            resp.headers_mut().insert("Mcp-Session-Id", hv);
+            // HTTP header *names* inserted via a `&'static str` literal must
+            // be lowercase (case-insensitive lookup/matching is unaffected;
+            // this is purely about the insertion-side literal).
+            resp.headers_mut().insert("mcp-session-id", hv);
         }
     }
     resp
@@ -344,7 +364,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tools_call_unknown_tool_is_jsonrpc_error() {
+    async fn test_tools_call_unknown_tool_is_error_result() {
         let router = build_router(test_state());
         let (status, body, _) = post_mcp(
             router,
@@ -355,7 +375,58 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["error"]["code"], -32601);
+        // Unknown tool is a tool-call failure (isError: true in the result),
+        // not a JSON-RPC protocol error -- tools/call itself is a real method.
+        assert_eq!(body["result"]["isError"], true);
+        assert!(body["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("does_not_exist"));
+    }
+
+    struct AlwaysFailTool;
+
+    #[async_trait]
+    impl RustTool for AlwaysFailTool {
+        fn name(&self) -> &str {
+            "always_fail"
+        }
+        fn description(&self) -> &str {
+            "Always fails"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: Value) -> Result<String, ToolError> {
+            Err(ToolError::Execution("boom".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_tool_error_is_error_result() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(AlwaysFailTool)).unwrap();
+        let state = Arc::new(McpServerState {
+            registry,
+            server_name: "terminus-personal-test".to_string(),
+            server_version: "0.0.0-test".to_string(),
+            auth_token: None,
+        });
+        let router = build_router(state);
+        let (status, body, _) = post_mcp(
+            router,
+            json!({
+                "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                "params": {"name": "always_fail", "arguments": {}}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["isError"], true);
+        assert!(body["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("boom"));
     }
 
     #[tokio::test]

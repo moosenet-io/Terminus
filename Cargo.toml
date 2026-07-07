@@ -53,7 +53,7 @@ lettre = { version = "0.11", default-features = false, features = ["tokio1", "to
 # Same axum/tower versions Chord (moosenet/Chord) pins, for convention parity.
 axum = { version = "0.7", features = ["json", "macros"] }
 tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower-http = { version = "0.5", features = ["trace"] }
 
 [dev-dependencies]
 # mcp_server tests drive the axum Router directly via `ServiceExt::oneshot`.
