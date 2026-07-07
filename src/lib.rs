@@ -45,6 +45,7 @@ pub mod nexus;
 pub mod plane;
 pub mod registry;
 pub mod relay;
+pub mod scribe;
 pub mod reminder;
 pub mod review;
 pub mod routines;
