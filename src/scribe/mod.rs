@@ -13,7 +13,10 @@
 //! the SAME single registration path `plane`/`gitea`/`github` already use.
 //! As of this scaffold, `terminus-rs` has exactly one registration function;
 //! there is no separate "personal-only" registry to accidentally register
-//! into (see `docs/scribe.md` for the full note on this).
+//! into. (Confirmed by repo-wide search: no `register_personal` exists in
+//! this crate. `chord-proxy`'s `src/fallback.rs` calls this same
+//! `register_all()` to build its fallback tool registry — see that file for
+//! the calling side.)
 //!
 //! ## Tool surface (stubs in this item; bodies land in SCRB-02..05)
 //!   - `scribe_generate_readme`   — generate/refresh a module README (SCRB-02/03)
