@@ -36,6 +36,8 @@
 //!   -- read via `crate::review::ReviewConfig::from_env()`, never duplicated
 //!   here.
 
+pub mod inspect;
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
