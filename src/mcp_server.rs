@@ -152,7 +152,7 @@ async fn handle_mcp(
         "initialize" => {
             let session_id = uuid::Uuid::new_v4().to_string();
             let result = json!({
-                "protocolVersion": "2024-11-05", // pii-test-fixture (MCP spec date-version, not a phone number)
+                "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {"listChanged": false}},
                 "serverInfo": {"name": state.server_name, "version": state.server_version}
             });
