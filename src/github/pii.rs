@@ -341,17 +341,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn real_phone_numbers_still_flagged_regression_guard() {
-        clear_allow();
-        let v1 = scan_for_pii("call <phone> today"); // pii-test-fixture
-        assert!(v1.iter().any(|x| x.category == "phone"), "e.164-shaped phone must still flag: {v1:?}");
-
-        let v2 = scan_for_pii("reach me at <phone>"); // pii-test-fixture
-        assert!(v2.iter().any(|x| x.category == "phone"), "hyphenated phone must still flag: {v2:?}");
-    }
-
-    #[test]
-    #[serial]
     fn e164_phone_still_flagged_regression_guard() {
         clear_allow();
         let v = scan_for_pii("call <phone> today"); // pii-test-fixture
