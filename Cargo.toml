@@ -48,8 +48,16 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["loggin
 rustls = { version = "0.23", default-features = false, features = ["logging", "tls12", "ring", "std"] }
 rustls-native-certs = "0.8"
 lettre = { version = "0.11", default-features = false, features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "builder", "ring"] }
+# <host> personal MCP server (src/bin/terminus_personal.rs): a standalone
+# streamable-HTTP MCP server exposing the personal-utility tool subset.
+# Same axum/tower versions Chord (moosenet/Chord) pins, for convention parity.
+axum = { version = "0.7", features = ["json", "macros"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["trace"] }
 
 [dev-dependencies]
+# mcp_server tests drive the axum Router directly via `ServiceExt::oneshot`.
+tower = { version = "0.4", features = ["util"] }
 httpmock = "0.7"
 tokio-test = "0.4"
 serial_test = "3"

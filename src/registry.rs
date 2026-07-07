@@ -152,6 +152,51 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::tools::register(registry);
 }
 
+/// Register the personal/admin tool subset served by the `terminus_personal`
+/// binary — the genuine personal-utility / admin modules with no static call
+/// sites in Lumina-core (ledger, vitals, crucible, relay, meridian, odyssey,
+/// gateway, cortex, soma, skills, council, network, ansible, dev), plus
+/// plane/gitea/github (direct personal/admin access — a separate consumer
+/// base from Chord's build-pipeline-scoped serving of the same modules) and
+/// the sundry grab-bag (health, echo, utc_now, constellation_version,
+/// vector_onboard, searxng_search).
+///
+/// Deliberately EXCLUDED from this subset (see `terminus_personal` bin docs
+/// for the full rationale):
+///   - axon, vigil, sentinel, routines — flagged pending the operator's
+///     archival decision (Lumina-core already reimplements sentinel/vigil
+///     natively); left out of v1, NOT dropped/archived.
+///   - a set of modules that mirror integrations already deliberately
+///     retired on the legacy fleet host's Python side (secret-store
+///     queries, monitoring/metrics, LLM-proxy admin, container-admin,
+///     media-request, generic web-search-adjacent, agentic-coding-session,
+///     onboarding-flow, cross-agent inbox, research, deep-reasoning-council,
+///     knowledge-base, commute, cost-tracking, news) — not resurrected here.
+///   - intake, approval, model_advisor, lumina_ext, dgem, weather, reminder,
+///     review, synapse, sysversion, tools — core build-pipeline / model-
+///     routing tooling already served by Chord; not duplicated on this
+///     binary.
+pub fn register_personal(registry: &mut ToolRegistry) {
+    crate::ledger::register(registry);
+    crate::vitals::register(registry);
+    crate::crucible::register(registry);
+    crate::relay::register(registry);
+    crate::meridian::register(registry);
+    crate::odyssey::register(registry);
+    crate::gateway::register(registry);
+    crate::cortex::register(registry);
+    crate::soma::register(registry);
+    crate::skills::register(registry);
+    crate::council::register(registry);
+    crate::network::register(registry);
+    crate::ansible::register(registry);
+    crate::dev::register(registry);
+    crate::plane::register(registry);
+    crate::gitea::register(registry);
+    crate::github::register(registry);
+    crate::sundry::register(registry);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
