@@ -41,7 +41,7 @@ use crate::tool::RustTool;
 
 pub use aggregate::{aggregate, ProviderResult};
 pub use dispatch::ReviewConfig;
-pub use prompt::{build_prompt, parse_verdict, Role, Structure};
+pub use prompt::{build_docs_prompt, build_prompt, parse_verdict, Role, Structure};
 
 const ALLOWED_PROVIDERS: &[&str] = &["opus", "codex", "agy", "nemotron", "qwen_coder"];
 const MAX_PROVIDERS: usize = 5;
