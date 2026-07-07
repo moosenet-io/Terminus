@@ -352,6 +352,41 @@ mod tests {
 
     #[test]
     #[serial]
+    fn e164_phone_still_flagged_regression_guard() {
+        clear_allow();
+        let v = scan_for_pii("call <phone> today"); // pii-test-fixture
+        assert!(v.iter().any(|x| x.category == "phone"), "e.164-shaped phone must still flag: {v:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn hyphenated_phone_still_flagged_regression_guard() {
+        clear_allow();
+        let v = scan_for_pii("reach me at <phone>"); // pii-test-fixture
+        assert!(v.iter().any(|x| x.category == "phone"), "hyphenated phone must still flag: {v:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn date_suppression_is_span_scoped_not_whole_line() {
+        clear_allow();
+        // A date and a genuine phone number on the SAME line: suppression must be
+        // scoped to the date's own span, not blanket-suppress the whole line.
+        let v = scan_for_pii("released 2024-11-05, call <phone>"); // pii-test-fixture
+        assert!(
+            v.iter().any(|x| x.category == "phone"),
+            "a real phone elsewhere on a line containing a date must still flag: {v:?}"
+        );
+        // And the date itself must still not be flagged as a phone.
+        let date_only = scan_for_pii("released 2024-11-05 today"); // pii-test-fixture
+        assert!(
+            !date_only.iter().any(|x| x.category == "phone"),
+            "the date span itself must not be flagged: {date_only:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn allowed_author_email_is_permitted() {
         std::env::set_var("GITHUB_ALLOWED_AUTHORS", "<email>, Moose"); // pii-test-fixture
         let v = scan_for_pii("Co-Authored-By: <email>"); // pii-test-fixture
