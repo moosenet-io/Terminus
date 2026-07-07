@@ -37,6 +37,7 @@ struct Patterns {
     local_url: Regex,
     infra_service: Regex,
     uuid: Regex,
+    date_like: Regex,
 }
 
 fn patterns() -> &'static Patterns {
@@ -66,6 +67,7 @@ fn patterns() -> &'static Patterns {
             r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
         )
         .expect("uuid regex"),
+        date_like: Regex::new(r"\b\d{4}-\d{2}-\d{2}\b").expect("date_like regex"),
     })
 }
 
@@ -194,13 +196,22 @@ pub fn scan_for_pii(content: &str) -> Vec<PiiViolation> {
             }
         }
 
+        // Bare ISO dates (YYYY-MM-DD, e.g. an MCP protocolVersion string) share
+        // the phone regex's digit/hyphen shape. Collect their spans so the
+        // phone matcher can skip them the same way it already skips UUIDs.
+        let date_spans: Vec<(usize, usize)> =
+            p.date_like.find_iter(line).map(|m| (m.start(), m.end())).collect();
+
         // Phone: skip any match that overlaps a UUID span (those digits belong
-        // to the UUID, not a phone number).
+        // to the UUID, not a phone number) or a bare ISO-date span.
         for m in p.phone.find_iter(line) {
             let overlaps_uuid = uuid_spans
                 .iter()
                 .any(|&(s, e)| m.start() < e && s < m.end());
-            if !overlaps_uuid {
+            let overlaps_date = date_spans
+                .iter()
+                .any(|&(s, e)| m.start() < e && s < m.end());
+            if !overlaps_uuid && !overlaps_date {
                 push("phone", m.as_str());
             }
         }
@@ -303,6 +314,64 @@ mod tests {
         let v = scan_for_pii("call <phone> now"); // pii-test-fixture
         assert!(v.iter().any(|x| x.category == "phone"));
         assert!(pii_gate("<phone>").is_err()); // pii-test-fixture
+    }
+
+    #[test]
+    #[serial]
+    fn bare_iso_date_is_not_flagged_as_phone() {
+        clear_allow();
+        let v = scan_for_pii("2024-11-05"); // pii-test-fixture (ISO date, not a phone number)
+        assert!(
+            !v.iter().any(|x| x.category == "phone"),
+            "bare ISO date must not be flagged as phone: {v:?}"
+        );
+        assert!(pii_gate("2024-11-05").is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn iso_date_embedded_in_sentence_is_not_flagged_as_phone() {
+        clear_allow();
+        let v = scan_for_pii("protocolVersion: 2024-11-05 was negotiated"); // pii-test-fixture
+        assert!(
+            !v.iter().any(|x| x.category == "phone"),
+            "embedded ISO date must not be flagged as phone: {v:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn e164_phone_still_flagged_regression_guard() {
+        clear_allow();
+        let v = scan_for_pii("call <phone> today"); // pii-test-fixture
+        assert!(v.iter().any(|x| x.category == "phone"), "e.164-shaped phone must still flag: {v:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn hyphenated_phone_still_flagged_regression_guard() {
+        clear_allow();
+        let v = scan_for_pii("reach me at <phone>"); // pii-test-fixture
+        assert!(v.iter().any(|x| x.category == "phone"), "hyphenated phone must still flag: {v:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn date_suppression_is_span_scoped_not_whole_line() {
+        clear_allow();
+        // A date and a genuine phone number on the SAME line: suppression must be
+        // scoped to the date's own span, not blanket-suppress the whole line.
+        let v = scan_for_pii("released 2024-11-05, call <phone>"); // pii-test-fixture
+        assert!(
+            v.iter().any(|x| x.category == "phone"),
+            "a real phone elsewhere on a line containing a date must still flag: {v:?}"
+        );
+        // And the date itself must still not be flagged as a phone.
+        let date_only = scan_for_pii("released 2024-11-05 today"); // pii-test-fixture
+        assert!(
+            !date_only.iter().any(|x| x.category == "phone"),
+            "the date span itself must not be flagged: {date_only:?}"
+        );
     }
 
     #[test]
