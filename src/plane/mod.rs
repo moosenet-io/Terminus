@@ -727,7 +727,10 @@ impl PlaneCreateWorkItem {
     /// hop through the MCP registry -- the "ONE sanctioned path" for Plane
     /// access still applies (this IS that path, called in-process, same
     /// crate), it just isn't going through `register()`'s registry lookup.
-    pub fn new(client: Arc<PlaneClient>) -> Self {
+    /// `pub(crate)` (not `pub`, per cycle 1 review): only an in-crate caller
+    /// is a legitimate use case; no external API surface should be able to
+    /// construct these tools directly, bypassing `register()`'s catalog.
+    pub(crate) fn new(client: Arc<PlaneClient>) -> Self {
         Self { client }
     }
 }
@@ -1554,8 +1557,9 @@ pub struct PlaneListWorkItemsFiltered {
 }
 
 impl PlaneListWorkItemsFiltered {
-    /// See `PlaneCreateWorkItem::new`'s doc comment -- same rationale.
-    pub fn new(client: Arc<PlaneClient>) -> Self {
+    /// See `PlaneCreateWorkItem::new`'s doc comment -- same rationale, and
+    /// same `pub(crate)` tightening (cycle 1 review).
+    pub(crate) fn new(client: Arc<PlaneClient>) -> Self {
         Self { client }
     }
 }

@@ -452,14 +452,32 @@ fn build_discrepancy_title(module_path: &str, signature: &str) -> String {
     format!("Scribe discrepancy: {module_path} -- doc vs. code mismatch [scribe-disc:{signature}]")
 }
 
+/// Escape the five HTML-significant characters. `doc_claim`/`code_behavior`
+/// come from Scribe's own doc/code inspection (docstrings, source snippets),
+/// not a fully trusted operator -- they can legitimately contain `<`, `>`,
+/// `&`, or quote characters (e.g. a docstring literally saying `returns
+/// Option<T>` or containing `</p>`), and `description_html` is rendered as
+/// raw HTML by Plane, so unescaped interpolation is a real HTML-injection
+/// risk into that view, not merely cosmetic (cycle 1 review finding).
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
 fn build_discrepancy_description(module_path: &str, doc_claim: &str, code_behavior: &str) -> String {
     format!(
-        "<p><strong>Module:</strong> {module_path}</p>\
-<p><strong>Documentation claims:</strong> {doc_claim}</p>\
-<p><strong>Code actually does:</strong> {code_behavior}</p>\
+        "<p><strong>Module:</strong> {module}</p>\
+<p><strong>Documentation claims:</strong> {claim}</p>\
+<p><strong>Code actually does:</strong> {behavior}</p>\
 <p><em>Filed automatically by Scribe. No code fix has been attempted -- Scribe's \
 inspection module has no commit/push capability by design; a human triages \
-severity and decides the fix.</em></p>"
+severity and decides the fix.</em></p>",
+        module = html_escape(module_path),
+        claim = html_escape(doc_claim),
+        behavior = html_escape(code_behavior),
     )
 }
 
@@ -1036,6 +1054,26 @@ mod tests {
     }
 
     #[test]
+    fn discrepancy_description_html_escapes_injected_markup_in_doc_claim() {
+        // Cycle 1 review finding: doc_claim/code_behavior come from Scribe's
+        // own inspection (docstrings, source snippets), not a fully trusted
+        // operator, and description_html is rendered as raw HTML by Plane --
+        // a claim containing `</p>` or `<script>` must not break the
+        // description's HTML structure or inject markup.
+        let desc = build_discrepancy_description(
+            "src/sundry",
+            "claims </p><script>alert(1)</script>",
+            "returns Option<T> & does \"weird\" things",
+        );
+        assert!(!desc.contains("<script>"));
+        assert!(desc.contains("&lt;script&gt;"));
+        assert!(desc.contains("&lt;/p&gt;"));
+        assert!(desc.contains("Option&lt;T&gt;"));
+        assert!(desc.contains("&amp;"));
+        assert!(desc.contains("&quot;weird&quot;"));
+    }
+
+    #[test]
     fn find_duplicate_by_signature_finds_a_matching_line() {
         let sig = "abc123";
         let listing = "Filtered work items (1):\n  [uuid-1] Scribe discrepancy: src/x [scribe-disc:abc123] (priority: medium)\n";
@@ -1262,7 +1300,13 @@ mod tests {
         // matches the first-registered mock for overlapping method+path, so
         // reusing `server` here would keep hitting `list_empty` instead of a
         // newly added mock -- a fresh server sidesteps that ambiguity
-        // entirely) whose issues-list now returns the "already reported"
+        // entirely). Note this does NOT test client/cache reuse across
+        // calls, because there isn't any to test: execute() constructs a
+        // brand-new PlaneClient::from_env() (and therefore a brand-new,
+        // empty GetCache) on every invocation -- production has no
+        // cross-call caching to invalidate either, so two independent
+        // servers accurately model two independent real calls. This
+        // server's issues-list now returns the "already reported"
         // issue -- must detect the duplicate and NOT call create at all (no
         // create mock registered on `server2`; if the tool tried to create
         // anyway, that request simply wouldn't match anything).
