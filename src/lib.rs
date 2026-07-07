@@ -31,6 +31,8 @@ pub mod google;
 pub mod <media-service>; // pii-test-fixture
 pub mod litellm;
 pub mod lumina_ext;
+/// Standalone streamable-HTTP MCP server (backs the `terminus_personal` bin).
+pub mod mcp_server;
 pub mod meridian;
 pub mod model_advisor;
 pub mod <container-mgr>; // pii-test-fixture
@@ -65,5 +67,5 @@ pub mod weather;
 pub mod wizard;
 
 pub use error::ToolError;
-pub use registry::{register_all, ToolInfo, ToolRegistry};
+pub use registry::{register_all, register_personal, ToolInfo, ToolRegistry};
 pub use tool::RustTool;
