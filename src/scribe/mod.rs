@@ -570,10 +570,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generate_readme_without_repo_path_configured_is_a_clean_error_not_panic() {
-        // No `repo_path` argument and (within this test process) no
-        // SCRIBE_REPO_PATH env var -- must fail with NotConfigured, not panic
-        // and not silently fabricate content.
+    async fn generate_readme_with_no_repo_path_and_no_optin_is_a_clean_error_not_panic() {
+        // Reviewer nit (SCRB-02 cycle 2, non-blocking): this test's original
+        // name claimed to exercise the "no repo_path configured" branch, but
+        // since `allow_subprocess_inspection` defaults false and that gate
+        // runs FIRST in execute(), it actually hits the same NotConfigured
+        // as `generate_readme_execute_is_disabled_by_default_pending_operator_optin`
+        // -- same enum variant, so it still passed, but didn't prove what its
+        // name claimed. Renamed to describe what it actually verifies (no
+        // panic, no fabricated content, clean error) rather than a specific
+        // branch; the opt-in-gate branch has its own dedicated test above.
         let generate = ScribeGenerateReadme;
         let result = generate.execute(json!({"module_path": "src/sundry"})).await;
         assert!(matches!(result, Err(ToolError::NotConfigured(_))));
