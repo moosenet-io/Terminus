@@ -16,6 +16,13 @@
 //!   port in front of it — this binary gets deployed behind its own,
 //!   separate reverse-proxy location/port during the deploy phase, run
 //!   side-by-side, never replacing the Python service).
+//! - `TERMINUS_PERSONAL_BIND` — bind address. Defaults to `127.0.0.1`: since
+//!   `/mcp` is unauthenticated by default (see below) and exposes admin-grade
+//!   tools (ansible, dev, gitea/github/plane writes, ...), the process binds
+//!   loopback-only by default and relies on a reverse proxy for LAN
+//!   reachability — the same defense-in-depth shape the legacy Python host
+//!   gets from its own reverse-proxy front door. Set to `0.0.0.0` explicitly
+//!   if a deployment genuinely wants the raw port LAN-reachable.
 //! - `TERMINUS_PERSONAL_TOKEN` — optional. If set, `/mcp` requires
 //!   `Authorization: Bearer <value>`. If unset, `/mcp` is unauthenticated,
 //!   matching the confirmed posture of the existing legacy Python host.
@@ -41,6 +48,11 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(8300);
 
+    let bind_addr = std::env::var("TERMINUS_PERSONAL_BIND")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+
     let auth_token = std::env::var("TERMINUS_PERSONAL_TOKEN")
         .ok()
         .filter(|v| !v.is_empty());
@@ -49,7 +61,7 @@ async fn main() {
     register_personal(&mut registry);
 
     tracing::info!(
-        "terminus_personal: {} tools registered, binding 0.0.0.0:{port} (auth: {})",
+        "terminus_personal: {} tools registered, binding {bind_addr}:{port} (auth: {})",
         registry.len(),
         if auth_token.is_some() { "token" } else { "none" }
     );
@@ -63,9 +75,9 @@ async fn main() {
 
     let router = build_router(state);
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+    let listener = tokio::net::TcpListener::bind(format!("{bind_addr}:{port}"))
         .await
-        .unwrap_or_else(|e| panic!("terminus_personal: failed to bind 0.0.0.0:{port}: {e}"));
+        .unwrap_or_else(|e| panic!("terminus_personal: failed to bind {bind_addr}:{port}: {e}"));
 
     axum::serve(listener, router)
         .await
