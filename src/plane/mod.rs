@@ -1,24 +1,45 @@
-//! Plane CE tool implementations (CHORD-06).
+//! Plane CE tool implementations (CHORD-06, hardened per the plane-helper port).
 //!
-//! Provides 24 Rust tools that wrap the Plane CE REST API via reqwest.
+//! Provides 27 Rust tools that wrap the Plane CE REST API via reqwest.
 //! All configuration comes from environment variables — no hardcoded URLs or tokens.
 //!
 //! ## Configuration
 //! - `PLANE_API_URL` — base URL of the Plane CE instance (required at call time)
-//! - `PLANE_API_KEY` — API key for authentication (required at call time)
+//! - `PLANE_API_KEY` — default API key/token for authentication (required at call time)
+//! - `PLANE_API_KEY_<NAME>` — additional named identities (e.g. `PLANE_API_KEY_AXON`),
+//!   see "Multi-identity" below
+//! - `PLANE_IDENTITY_NAME` — human name for the default `PLANE_API_KEY` identity
 //! - `PLANE_WORKSPACE` — workspace slug (default: "moosenet")
+//! - `PLANE_RPM` / `PLANE_RATE_SHARE` — proactive pacing, default 60 RPM / share of 3
+//!   (60/3 = 20 effective RPM = 3s minimum interval between requests, shared across
+//!   every tool call in this process via a single in-process rate limiter)
+//! - `PLANE_CACHE_TTL_SECS` — in-memory GET response cache TTL, default 5s
 //!
 //! When `PLANE_API_URL` is not set the tools register normally but return
 //! `ToolError::NotConfigured` on every call.
+//!
+//! ## Multi-identity
+//! This is a *replacement*, not a port, of the Python `plane_client.py`
+//! `whoami()` design, which resolved identity by scanning other agents'
+//! plaintext `.env` files for a matching token substring — a credential-sprawl
+//! anti-pattern. Instead, named identities are configured explicitly via
+//! `PLANE_API_KEY_<NAME>` secrets (injected into this process's environment at
+//! start by the operator's secret manager, never read from another process's
+//! files at call time). [`PlaneClient::for_identity`]
+//! returns a clone of the client scoped to a named identity's token, sharing the
+//! HTTP client, rate limiter, and GET cache. [`PlaneWhoami`] (`plane_whoami`)
+//! reports the active identity, or resolves whether a named identity is configured.
 
 pub mod types;
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use reqwest::{Client, Response, StatusCode};
 use serde_json::{json, Value};
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, warn};
 
 use crate::error::ToolError;
@@ -50,6 +71,90 @@ fn is_uuid(s: &str) -> bool {
     true
 }
 
+// ─── In-process rate limiter ─────────────────────────────────────────────────
+//
+// Replaces the Python client's `fcntl.flock`-guarded `/tmp/plane-helper.lock` +
+// `/tmp/plane-helper.last` pacing. This service is a single long-running
+// process (not many independent CLI invocations), so a `tokio::sync::Mutex`
+// guarding a shared "last request" timestamp is the correct equivalent: every
+// call — across every tool, every identity — passes through the same gate.
+
+#[derive(Debug)]
+struct RateLimiter {
+    last: AsyncMutex<Option<Instant>>,
+    min_interval: Duration,
+}
+
+impl RateLimiter {
+    /// Build from `PLANE_RPM` / `PLANE_RATE_SHARE` (defaults: 60 / 3, i.e. a
+    /// 3-second minimum interval), matching the Python client's env-var names.
+    fn from_env() -> Self {
+        let rpm: f64 = std::env::var("PLANE_RPM").ok().and_then(|v| v.parse().ok()).unwrap_or(60.0);
+        let share: f64 = std::env::var("PLANE_RATE_SHARE").ok().and_then(|v| v.parse().ok()).unwrap_or(3.0);
+        Self::new(rpm, share)
+    }
+
+    fn new(rpm: f64, share: f64) -> Self {
+        let effective_rpm = if share > 0.0 { rpm / share } else { rpm };
+        let min_interval = if effective_rpm > 0.0 {
+            Duration::from_secs_f64(60.0 / effective_rpm)
+        } else {
+            Duration::ZERO
+        };
+        Self { last: AsyncMutex::new(None), min_interval }
+    }
+
+    /// Block until at least `min_interval` has elapsed since the previous
+    /// call made through this limiter (shared across every clone of the owning
+    /// `PlaneClient` and every identity, since it lives behind an `Arc`).
+    async fn acquire(&self) {
+        let mut last = self.last.lock().await;
+        if let Some(prev) = *last {
+            let elapsed = prev.elapsed();
+            if elapsed < self.min_interval {
+                tokio::time::sleep(self.min_interval - elapsed).await;
+            }
+        }
+        *last = Some(Instant::now());
+    }
+}
+
+// ─── In-memory GET cache ──────────────────────────────────────────────────────
+//
+// Replaces the Python client's shared `/tmp/plane-helper-cache.json` file.
+// Keyed by full request URL, TTL-based, in-process only (this service doesn't
+// span multiple OS processes the way the CLI-invocation Python client did).
+
+#[derive(Debug)]
+struct GetCache {
+    entries: AsyncMutex<HashMap<String, (Instant, String)>>,
+    ttl: Duration,
+}
+
+impl GetCache {
+    /// Build from `PLANE_CACHE_TTL_SECS` (default 5s, matching the Python client).
+    fn from_env() -> Self {
+        let ttl_secs: u64 = std::env::var("PLANE_CACHE_TTL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+        Self::new(Duration::from_secs(ttl_secs))
+    }
+
+    fn new(ttl: Duration) -> Self {
+        Self { entries: AsyncMutex::new(HashMap::new()), ttl }
+    }
+
+    async fn get(&self, key: &str) -> Option<String> {
+        let entries = self.entries.lock().await;
+        entries.get(key).and_then(|(ts, body)| {
+            if ts.elapsed() < self.ttl { Some(body.clone()) } else { None }
+        })
+    }
+
+    async fn set(&self, key: String, body: String) {
+        let mut entries = self.entries.lock().await;
+        entries.insert(key, (Instant::now(), body));
+    }
+}
+
 // ─── PlaneClient ─────────────────────────────────────────────────────────────
 
 /// Shared HTTP client for the Plane CE API.
@@ -60,24 +165,84 @@ fn is_uuid(s: &str) -> bool {
 pub struct PlaneClient {
     http: Client,
     base_url: Option<String>,
+    /// Active token used for requests made directly through this client
+    /// instance (the default identity, unless [`PlaneClient::for_identity`]
+    /// produced this instance).
     api_key: Option<String>,
+    /// Human name for the active token, if resolvable (see [`PlaneClient::from_env`]).
+    identity_name: Option<String>,
+    /// All configured named identities: lowercased name -> token. Populated
+    /// from `PLANE_API_KEY_<NAME>` env vars only — never from another
+    /// process's files.
+    identities: Arc<HashMap<String, String>>,
     workspace: String,
+    rate_limiter: Arc<RateLimiter>,
+    cache: Arc<GetCache>,
+}
+
+/// Hand-written `Debug` impl: never prints `api_key` or `identities` (both
+/// hold live credentials). Redacted as `Some(<redacted>)` / a bare count so
+/// logs/panics/`{:?}` formatting can never leak a token.
+impl std::fmt::Debug for PlaneClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlaneClient")
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("identity_name", &self.identity_name)
+            .field("identities", &format!("<{} configured, redacted>", self.identities.len()))
+            .field("workspace", &self.workspace)
+            .finish()
+    }
 }
 
 impl PlaneClient {
     /// Build a `PlaneClient` from environment variables.
     pub fn from_env() -> Self {
         let base_url = std::env::var("PLANE_API_URL").ok().map(|u| u.trim_end_matches('/').to_string());
-        let api_key = std::env::var("PLANE_API_KEY").ok();
+        let api_key = std::env::var("PLANE_API_KEY").ok().filter(|v| !v.is_empty());
         let workspace = std::env::var("PLANE_WORKSPACE")
             .unwrap_or_else(|_| "moosenet".into());
+
+        // Named identities: PLANE_API_KEY_<NAME> for any agent that needs its
+        // own token (e.g. PLANE_API_KEY_AXON, PLANE_API_KEY_VIGIL). Read once
+        // at process start from this process's own environment (populated by
+        // the operator's secret manager) — never from another process's files.
+        let mut identities: HashMap<String, String> = HashMap::new();
+        for (k, v) in std::env::vars() {
+            if let Some(name) = k.strip_prefix("PLANE_API_KEY_") {
+                if !v.is_empty() {
+                    identities.insert(name.to_lowercase(), v);
+                }
+            }
+        }
+
+        // Resolve a human name for the default PLANE_API_KEY token: prefer an
+        // explicit PLANE_IDENTITY_NAME, else look for a PLANE_API_KEY_<NAME>
+        // whose value happens to equal the default token.
+        let identity_name = std::env::var("PLANE_IDENTITY_NAME")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                api_key.as_ref().and_then(|tok| {
+                    identities.iter().find(|(_, v)| *v == tok).map(|(k, _)| k.clone())
+                })
+            });
 
         let http = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .expect("failed to build reqwest client");
 
-        Self { http, base_url, api_key, workspace }
+        Self {
+            http,
+            base_url,
+            api_key,
+            identity_name,
+            identities: Arc::new(identities),
+            workspace,
+            rate_limiter: Arc::new(RateLimiter::from_env()),
+            cache: Arc::new(GetCache::from_env()),
+        }
     }
 
     /// Returns true if both PLANE_API_URL and PLANE_API_KEY are configured.
@@ -90,6 +255,39 @@ impl PlaneClient {
         ToolError::NotConfigured(
             "PLANE_API_URL and PLANE_API_KEY must be set to use Plane tools".into(),
         )
+    }
+
+    /// Return a clone of this client scoped to a named identity's token
+    /// (from `PLANE_API_KEY_<NAME>`) instead of the default. The HTTP client,
+    /// rate limiter, and GET cache are shared (same `Arc`s) — only the active
+    /// token and its resolved name differ, so identities never contend for
+    /// separate rate budgets and never leak each other's tokens.
+    pub fn for_identity(&self, name: &str) -> Result<Self, ToolError> {
+        let key = name.trim().to_lowercase();
+        let token = self.identities.get(&key).cloned().ok_or_else(|| {
+            ToolError::InvalidArgument(format!(
+                "No Plane identity named '{name}' is configured (expected PLANE_API_KEY_{})",
+                key.to_uppercase()
+            ))
+        })?;
+        Ok(Self {
+            api_key: Some(token),
+            identity_name: Some(key),
+            ..self.clone()
+        })
+    }
+
+    /// The active identity's resolved name, if known.
+    pub fn identity_name(&self) -> Option<&str> {
+        self.identity_name.as_deref()
+    }
+
+    /// Build a GET-cache key that is unique per active token, not just per
+    /// URL — see the doc comment on `get_json_cached` for why. Uses the raw
+    /// token as part of an in-memory-only key (never logged, never printed:
+    /// this struct's `Debug` impl is hand-written to redact it).
+    fn cache_key(&self, url: &str) -> String {
+        format!("{}\u{0}{}", self.api_key.as_deref().unwrap_or(""), url)
     }
 
     /// Build the base URL for workspace-scoped endpoints.
@@ -113,11 +311,8 @@ impl PlaneClient {
             return Ok(project_id.to_string());
         }
         let url = format!("{}projects/", self.workspace_url());
-        let resp = self.get_with_retry(&url).await?;
-        let resp = Self::check_status(resp).await?;
-        let list: ApiList<Project> = resp
-            .json()
-            .await
+        let body = self.get_json_cached(&url).await?;
+        let list: ApiList<Project> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse projects: {e}")))?;
         list.into_items()
             .into_iter()
@@ -140,6 +335,34 @@ impl PlaneClient {
                 .header("Content-Type", "application/json")
         })
         .await
+    }
+
+    /// GET `url` as raw JSON text, serving from the in-memory TTL cache when
+    /// available. On a cache miss, performs the request (through the same
+    /// rate-limited, retrying transport as every other call) and populates the
+    /// cache with the response body on success. Callers deserialize the
+    /// returned string with `serde_json::from_str`.
+    ///
+    /// The cache key includes the active token, not just the URL: Plane GET
+    /// responses are not uniformly workspace-scoped (e.g. `plane_list_projects`
+    /// only returns projects the calling token's user belongs to, and member
+    /// listings can vary by role), so two [`PlaneClient::for_identity`] clones
+    /// sharing this cache's `Arc` must never be served each other's cached
+    /// response for the same URL.
+    async fn get_json_cached(&self, url: &str) -> Result<String, ToolError> {
+        let cache_key = self.cache_key(url);
+        if let Some(body) = self.cache.get(&cache_key).await {
+            debug!("Plane GET cache hit: {url}");
+            return Ok(body);
+        }
+        let resp = self.get_with_retry(url).await?;
+        let resp = Self::check_status(resp).await?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| ToolError::Http(format!("Failed to read response body: {e}")))?;
+        self.cache.set(cache_key, body.clone()).await;
+        Ok(body)
     }
 
     /// Execute a POST request with rate-limit retry.
@@ -180,29 +403,81 @@ impl PlaneClient {
         .await
     }
 
-    /// Core retry loop: respects 429 with 3-second back-off, max 3 attempts.
+    /// Core retry loop, ported from the Python client's semantics:
+    /// - every attempt is paced by the shared [`RateLimiter`] first
+    /// - 401/403 are never retried (auth failures are terminal)
+    /// - 429 respects a `Retry-After` header, falling back to the backoff table
+    /// - 5xx and network errors retry with the same backoff table
+    /// - max 3 attempts total
     async fn request_with_retry<F>(&self, build: F) -> Result<Response, ToolError>
     where
         F: Fn() -> reqwest::RequestBuilder,
     {
+        const MAX_ATTEMPTS: u8 = 3;
+        const BACKOFF: [u64; 3] = [2, 5, 15];
+        // A hostile or misconfigured server can send an arbitrarily large
+        // `Retry-After`; without a ceiling that would hang a tool call far
+        // beyond what "max 3 attempts" implies. Clamp to a sane upper bound.
+        const MAX_RETRY_AFTER_SECS: u64 = 60;
+
         let mut attempts = 0u8;
         loop {
             attempts += 1;
-            let resp = build()
-                .send()
-                .await
-                .map_err(|e| ToolError::Http(format!("Request failed: {e}")))?;
+            self.rate_limiter.acquire().await;
 
-            if resp.status() == StatusCode::TOO_MANY_REQUESTS {
-                if attempts >= 3 {
+            let sent = build().send().await;
+            let resp = match sent {
+                Ok(r) => r,
+                Err(e) => {
+                    if attempts >= MAX_ATTEMPTS {
+                        return Err(ToolError::Http(format!(
+                            "Request failed after {attempts} attempts: {e}"
+                        )));
+                    }
+                    let delay = BACKOFF[(attempts - 1) as usize];
+                    warn!("Plane network error ({e}), retrying in {delay}s (attempt {attempts}/{MAX_ATTEMPTS})");
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    continue;
+                }
+            };
+
+            let status = resp.status();
+
+            // Auth failures are terminal — never retried.
+            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                return Ok(resp);
+            }
+
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                if attempts >= MAX_ATTEMPTS {
                     return Err(ToolError::Http(
                         "Plane rate limit exceeded — try again later".into(),
                     ));
                 }
-                warn!("Plane 429 received, retrying in 3 s (attempt {attempts}/3)");
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                let retry_after = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(BACKOFF[(attempts - 1) as usize])
+                    .min(MAX_RETRY_AFTER_SECS);
+                warn!("Plane 429 received, retrying in {retry_after}s (attempt {attempts}/{MAX_ATTEMPTS})");
+                tokio::time::sleep(Duration::from_secs(retry_after)).await;
                 continue;
             }
+
+            if status.is_server_error() {
+                if attempts >= MAX_ATTEMPTS {
+                    // Exhausted retries — return the response as-is so
+                    // check_status() surfaces a proper Http error with body.
+                    return Ok(resp);
+                }
+                let delay = BACKOFF[(attempts - 1) as usize];
+                warn!("Plane server error {status}, retrying in {delay}s (attempt {attempts}/{MAX_ATTEMPTS})");
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+                continue;
+            }
+
             return Ok(resp);
         }
     }
@@ -267,9 +542,8 @@ impl RustTool for PlaneListProjects {
         require_configured!(self);
         let url = format!("{}projects/", self.client.workspace_url());
         debug!("plane_list_projects GET {url}");
-        let resp = self.client.get_with_retry(&url).await?;
-        let resp = PlaneClient::check_status(resp).await?;
-        let list: ApiList<Project> = resp.json().await
+        let body = self.client.get_json_cached(&url).await?;
+        let list: ApiList<Project> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse projects: {e}")))?;
         let items = list.into_items();
         if items.is_empty() {
@@ -309,9 +583,8 @@ impl RustTool for PlaneGetProject {
         let project_id = self.client.resolve_project_id(project_id_arg).await?;
         let url = format!("{}projects/{project_id}/", self.client.workspace_url());
         debug!("plane_get_project GET {url}");
-        let resp = self.client.get_with_retry(&url).await?;
-        let resp = PlaneClient::check_status(resp).await?;
-        let p: Project = resp.json().await
+        let body = self.client.get_json_cached(&url).await?;
+        let p: Project = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse project: {e}")))?;
         Ok(format!(
             "Project: {name}\nID: {id}\nIdentifier: {identifier}\nDescription: {desc}",
@@ -353,9 +626,8 @@ impl RustTool for PlaneListWorkItems {
             self.client.workspace_url()
         );
         debug!("plane_list_work_items GET {url}");
-        let resp = self.client.get_with_retry(&url).await?;
-        let resp = PlaneClient::check_status(resp).await?;
-        let list: ApiList<Issue> = resp.json().await
+        let body = self.client.get_json_cached(&url).await?;
+        let list: ApiList<Issue> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse issues: {e}")))?;
         let total = list.total_count();
         let items: Vec<Issue> = list.into_items().into_iter().take(limit).collect();
@@ -403,9 +675,8 @@ impl RustTool for PlaneGetWorkItem {
             self.client.workspace_url()
         );
         debug!("plane_get_work_item GET {url}");
-        let resp = self.client.get_with_retry(&url).await?;
-        let resp = PlaneClient::check_status(resp).await?;
-        let i: Issue = resp.json().await
+        let body = self.client.get_json_cached(&url).await?;
+        let i: Issue = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse issue: {e}")))?;
         Ok(format!(
             "Issue: {name}\nID: {id}\nSequence: {seq}\nPriority: {priority}\nState: {state}\nDescription: {desc}",
@@ -438,7 +709,9 @@ impl RustTool for PlaneCreateWorkItem {
                 "description_html": { "type": "string", "description": "Issue description (HTML)" },
                 "state": { "type": "string", "description": "State UUID" },
                 "priority": { "type": "string", "description": "Priority: urgent/high/medium/low/none" },
-                "due_date": { "type": "string", "description": "Due date (YYYY-MM-DD)" }
+                "due_date": { "type": "string", "description": "Due date (YYYY-MM-DD)" },
+                "parent": { "type": "string", "description": "Parent issue UUID (for sub-issues)" },
+                "label_ids": { "type": "array", "items": { "type": "string" }, "description": "Label UUIDs to attach" }
             },
             "required": ["project_id", "name"]
         })
@@ -460,6 +733,12 @@ impl RustTool for PlaneCreateWorkItem {
         }
         if let Some(v) = args.get("due_date").and_then(|v| v.as_str()) {
             body["due_date"] = json!(v);
+        }
+        if let Some(v) = args.get("parent").and_then(|v| v.as_str()) {
+            body["parent"] = json!(v);
+        }
+        if let Some(v) = args.get("label_ids").and_then(|v| v.as_array()) {
+            body["label_ids"] = json!(v);
         }
         let url = format!(
             "{}projects/{project_id}/issues/",
@@ -496,7 +775,9 @@ impl RustTool for PlaneUpdateWorkItem {
                 "description_html": { "type": "string", "description": "New description (HTML)" },
                 "state": { "type": "string", "description": "New state UUID" },
                 "priority": { "type": "string", "description": "New priority" },
-                "due_date": { "type": "string", "description": "New due date (YYYY-MM-DD)" }
+                "due_date": { "type": "string", "description": "New due date (YYYY-MM-DD)" },
+                "parent": { "type": "string", "description": "New parent issue UUID" },
+                "label_ids": { "type": "array", "items": { "type": "string" }, "description": "New label UUIDs (replaces existing set)" }
             },
             "required": ["project_id", "issue_id"]
         })
@@ -507,10 +788,13 @@ impl RustTool for PlaneUpdateWorkItem {
         let project_id = self.client.resolve_project_id(project_id_arg).await?;
         let issue_id = require_arg!(args, "issue_id", as_str);
         let mut body = json!({});
-        for field in &["name", "description_html", "state", "priority", "due_date"] {
+        for field in &["name", "description_html", "state", "priority", "due_date", "parent"] {
             if let Some(v) = args.get(field).and_then(|v| v.as_str()) {
                 body[*field] = json!(v);
             }
+        }
+        if let Some(v) = args.get("label_ids").and_then(|v| v.as_array()) {
+            body["label_ids"] = json!(v);
         }
         if body.as_object().map(|m| m.is_empty()).unwrap_or(true) {
             return Err(ToolError::InvalidArgument("No fields to update provided".into()));
@@ -592,9 +876,8 @@ impl RustTool for PlaneListCycles {
             self.client.workspace_url()
         );
         debug!("plane_list_cycles GET {url}");
-        let resp = self.client.get_with_retry(&url).await?;
-        let resp = PlaneClient::check_status(resp).await?;
-        let list: ApiList<Cycle> = resp.json().await
+        let body = self.client.get_json_cached(&url).await?;
+        let list: ApiList<Cycle> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse cycles: {e}")))?;
         let items = list.into_items();
         if items.is_empty() {
@@ -642,9 +925,8 @@ impl RustTool for PlaneGetCycle {
             self.client.workspace_url()
         );
         debug!("plane_get_cycle GET {url}");
-        let resp = self.client.get_with_retry(&url).await?;
-        let resp = PlaneClient::check_status(resp).await?;
-        let c: Cycle = resp.json().await
+        let body = self.client.get_json_cached(&url).await?;
+        let c: Cycle = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse cycle: {e}")))?;
         Ok(format!(
             "Cycle: {name}\nID: {id}\nStatus: {status}\nDates: {start} to {end}",
@@ -686,9 +968,8 @@ impl RustTool for PlaneListCycleIssues {
             self.client.workspace_url()
         );
         debug!("plane_list_cycle_issues GET {url}");
-        let resp = self.client.get_with_retry(&url).await?;
-        let resp = PlaneClient::check_status(resp).await?;
-        let list: ApiList<Issue> = resp.json().await
+        let body = self.client.get_json_cached(&url).await?;
+        let list: ApiList<Issue> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse cycle issues: {e}")))?;
         let items = list.into_items();
         if items.is_empty() {
@@ -730,9 +1011,8 @@ impl RustTool for PlaneListModules {
             self.client.workspace_url()
         );
         debug!("plane_list_modules GET {url}");
-        let resp = self.client.get_with_retry(&url).await?;
-        let resp = PlaneClient::check_status(resp).await?;
-        let list: ApiList<Module> = resp.json().await
+        let body = self.client.get_json_cached(&url).await?;
+        let list: ApiList<Module> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse modules: {e}")))?;
         let items = list.into_items();
         if items.is_empty() {
@@ -778,9 +1058,8 @@ impl RustTool for PlaneGetModule {
             self.client.workspace_url()
         );
         debug!("plane_get_module GET {url}");
-        let resp = self.client.get_with_retry(&url).await?;
-        let resp = PlaneClient::check_status(resp).await?;
-        let m: Module = resp.json().await
+        let body = self.client.get_json_cached(&url).await?;
+        let m: Module = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse module: {e}")))?;
         Ok(format!(
             "Module: {name}\nID: {id}\nStatus: {status}\nDates: {start} to {end}",
@@ -870,9 +1149,8 @@ impl RustTool for PlaneListModuleIssues {
             self.client.workspace_url()
         );
         debug!("plane_list_module_issues GET {url}");
-        let resp = self.client.get_with_retry(&url).await?;
-        let resp = PlaneClient::check_status(resp).await?;
-        let list: ApiList<Issue> = resp.json().await
+        let body = self.client.get_json_cached(&url).await?;
+        let list: ApiList<Issue> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse module issues: {e}")))?;
         let items = list.into_items();
         if items.is_empty() {
@@ -914,9 +1192,8 @@ impl RustTool for PlaneListStates {
             self.client.workspace_url()
         );
         debug!("plane_list_states GET {url}");
-        let resp = self.client.get_with_retry(&url).await?;
-        let resp = PlaneClient::check_status(resp).await?;
-        let list: ApiList<State> = resp.json().await
+        let body = self.client.get_json_cached(&url).await?;
+        let list: ApiList<State> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse states: {e}")))?;
         let items = list.into_items();
         if items.is_empty() {
@@ -959,9 +1236,8 @@ impl RustTool for PlaneListLabels {
             self.client.workspace_url()
         );
         debug!("plane_list_labels GET {url}");
-        let resp = self.client.get_with_retry(&url).await?;
-        let resp = PlaneClient::check_status(resp).await?;
-        let list: ApiList<Label> = resp.json().await
+        let body = self.client.get_json_cached(&url).await?;
+        let list: ApiList<Label> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse labels: {e}")))?;
         let items = list.into_items();
         if items.is_empty() {
@@ -1005,9 +1281,8 @@ impl RustTool for PlaneListMembers {
             self.client.workspace_url()
         );
         debug!("plane_list_members GET {url}");
-        let resp = self.client.get_with_retry(&url).await?;
-        let resp = PlaneClient::check_status(resp).await?;
-        let list: ApiList<Member> = resp.json().await
+        let body = self.client.get_json_cached(&url).await?;
+        let list: ApiList<Member> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse members: {e}")))?;
         let items = list.into_items();
         if items.is_empty() {
@@ -1055,9 +1330,8 @@ impl RustTool for PlaneListComments {
             self.client.workspace_url()
         );
         debug!("plane_list_comments GET {url}");
-        let resp = self.client.get_with_retry(&url).await?;
-        let resp = PlaneClient::check_status(resp).await?;
-        let list: ApiList<Comment> = resp.json().await
+        let body = self.client.get_json_cached(&url).await?;
+        let list: ApiList<Comment> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse comments: {e}")))?;
         let items = list.into_items();
         if items.is_empty() {
@@ -1157,9 +1431,8 @@ impl RustTool for PlaneListIssuesByState {
             self.client.workspace_url()
         );
         debug!("plane_list_issues_by_state GET {url}");
-        let resp = self.client.get_with_retry(&url).await?;
-        let resp = PlaneClient::check_status(resp).await?;
-        let list: ApiList<Issue> = resp.json().await
+        let body = self.client.get_json_cached(&url).await?;
+        let list: ApiList<Issue> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse issues: {e}")))?;
 
         let filtered: Vec<Issue> = list.into_items()
@@ -1216,9 +1489,8 @@ impl RustTool for PlaneGetIssueBySequence {
             self.client.workspace_url()
         );
         debug!("plane_get_issue_by_sequence GET {url}");
-        let resp = self.client.get_with_retry(&url).await?;
-        let resp = PlaneClient::check_status(resp).await?;
-        let list: ApiList<Issue> = resp.json().await
+        let body = self.client.get_json_cached(&url).await?;
+        let list: ApiList<Issue> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse issues: {e}")))?;
 
         let found = list.into_items()
@@ -1274,9 +1546,8 @@ impl RustTool for PlaneListWorkItemsFiltered {
             self.client.workspace_url()
         );
         debug!("plane_list_work_items_filtered GET {url}");
-        let resp = self.client.get_with_retry(&url).await?;
-        let resp = PlaneClient::check_status(resp).await?;
-        let list: ApiList<Issue> = resp.json().await
+        let body = self.client.get_json_cached(&url).await?;
+        let list: ApiList<Issue> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse issues: {e}")))?;
 
         let filtered: Vec<Issue> = list.into_items()
@@ -1338,9 +1609,8 @@ impl RustTool for PlaneListRecentActivity {
             self.client.workspace_url()
         );
         debug!("plane_list_recent_activity GET {url}");
-        let resp = self.client.get_with_retry(&url).await?;
-        let resp = PlaneClient::check_status(resp).await?;
-        let list: ApiList<Activity> = resp.json().await
+        let body = self.client.get_json_cached(&url).await?;
+        let list: ApiList<Activity> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse activities: {e}")))?;
         let items: Vec<Activity> = list.into_items().into_iter().take(limit).collect();
         if items.is_empty() {
@@ -1394,9 +1664,8 @@ impl RustTool for PlaneCloseWorkItem {
             self.client.workspace_url()
         );
         debug!("plane_close_work_item: fetching states from {states_url}");
-        let resp = self.client.get_with_retry(&states_url).await?;
-        let resp = PlaneClient::check_status(resp).await?;
-        let list: ApiList<State> = resp.json().await
+        let body = self.client.get_json_cached(&states_url).await?;
+        let list: ApiList<State> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse states: {e}")))?;
 
         let completed_state = list.into_items()
@@ -1423,9 +1692,188 @@ impl RustTool for PlaneCloseWorkItem {
     }
 }
 
+// ─── 25. plane_get_state_by_name ─────────────────────────────────────────────
+
+pub struct PlaneGetStateByName {
+    client: Arc<PlaneClient>,
+}
+
+#[async_trait]
+impl RustTool for PlaneGetStateByName {
+    fn name(&self) -> &str { "plane_get_state_by_name" }
+    fn description(&self) -> &str {
+        "Resolve a Plane workflow state UUID by its human name (e.g. \"Backlog\", \"Done\"), case-insensitive"
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
+                "name": { "type": "string", "description": "State name to match, case-insensitive (e.g. \"Backlog\", \"Done\")" }
+            },
+            "required": ["project_id", "name"]
+        })
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        require_configured!(self);
+        let project_id_arg = require_arg!(args, "project_id", as_str);
+        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let name = require_arg!(args, "name", as_str);
+        let url = format!(
+            "{}projects/{project_id}/states/",
+            self.client.workspace_url()
+        );
+        debug!("plane_get_state_by_name GET {url}");
+        let body = self.client.get_json_cached(&url).await?;
+        let list: ApiList<State> = serde_json::from_str(&body)
+            .map_err(|e| ToolError::Http(format!("Failed to parse states: {e}")))?;
+        list.into_items()
+            .into_iter()
+            .find(|s| s.name.eq_ignore_ascii_case(name))
+            .map(|s| format!("State '{}': {}", s.name, s.id))
+            .ok_or_else(|| ToolError::NotFound(format!("No state named '{name}' in this project")))
+    }
+}
+
+// ─── 26. plane_batch_create_work_items ───────────────────────────────────────
+
+pub struct PlaneBatchCreateWorkItems {
+    client: Arc<PlaneClient>,
+}
+
+#[async_trait]
+impl RustTool for PlaneBatchCreateWorkItems {
+    fn name(&self) -> &str { "plane_batch_create_work_items" }
+    fn description(&self) -> &str {
+        "Create multiple work items in a Plane project sequentially, returning each result"
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
+                "items": {
+                    "type": "array",
+                    "description": "Issues to create",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "description_html": { "type": "string" },
+                            "priority": { "type": "string" },
+                            "state": { "type": "string" }
+                        },
+                        "required": ["name"]
+                    }
+                }
+            },
+            "required": ["project_id", "items"]
+        })
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        require_configured!(self);
+        let project_id_arg = require_arg!(args, "project_id", as_str);
+        let items = args
+            .get("items")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| ToolError::InvalidArgument("missing required argument: items".into()))?;
+        if items.is_empty() {
+            return Err(ToolError::InvalidArgument("items must not be empty".into()));
+        }
+        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+
+        let url = format!(
+            "{}projects/{project_id}/issues/",
+            self.client.workspace_url()
+        );
+        let mut out = format!("Batch-created {} issue(s):\n", items.len());
+        for (index, item) in items.iter().enumerate() {
+            let name = item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    ToolError::InvalidArgument(format!("items[{index}] missing required field: name"))
+                })?;
+            let mut body = json!({ "name": name });
+            if let Some(v) = item.get("description_html").and_then(|v| v.as_str()) {
+                body["description_html"] = json!(v);
+            }
+            if let Some(v) = item.get("priority").and_then(|v| v.as_str()) {
+                body["priority"] = json!(v);
+            }
+            if let Some(v) = item.get("state").and_then(|v| v.as_str()) {
+                body["state"] = json!(v);
+            }
+            debug!("plane_batch_create_work_items [{index}] POST {url}");
+            let resp = self.client.post_with_retry(&url, &body).await?;
+            let resp = PlaneClient::check_status(resp).await?;
+            let created: Issue = resp
+                .json()
+                .await
+                .map_err(|e| ToolError::Http(format!("Failed to parse created issue [{index}]: {e}")))?;
+            out.push_str(&format!(
+                "  {}/{}: [{}] {} (#{})\n",
+                index + 1,
+                items.len(),
+                created.id,
+                created.name,
+                created.sequence_id.unwrap_or(0)
+            ));
+        }
+        Ok(out)
+    }
+}
+
+// ─── 27. plane_whoami ────────────────────────────────────────────────────────
+
+pub struct PlaneWhoami {
+    client: Arc<PlaneClient>,
+}
+
+#[async_trait]
+impl RustTool for PlaneWhoami {
+    fn name(&self) -> &str { "plane_whoami" }
+    fn description(&self) -> &str {
+        "Report which configured Plane identity is active, or check whether a named identity is configured. Never inspects other processes' files — identities come only from this process's own PLANE_API_KEY_<NAME> environment."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "identity": { "type": "string", "description": "Optional identity name to check (e.g. \"axon\"). Omit to report the active default identity." }
+            },
+            "required": []
+        })
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        if let Some(identity) = args.get("identity").and_then(|v| v.as_str()) {
+            let key = identity.trim().to_lowercase();
+            let is_active_default = self.client.identity_name() == Some(key.as_str());
+            if self.client.identities.contains_key(&key) || is_active_default {
+                return Ok(format!("Identity '{identity}' is configured (token present)."));
+            }
+            return Err(ToolError::NotFound(format!(
+                "No Plane identity named '{identity}' is configured (expected PLANE_API_KEY_{})",
+                key.to_uppercase()
+            )));
+        }
+        if !self.client.configured() {
+            return Err(self.client.not_configured());
+        }
+        match self.client.identity_name() {
+            Some(name) => Ok(format!("Active Plane identity: {name}")),
+            None => Ok(
+                "Active Plane identity: unknown (a default token is set but no PLANE_IDENTITY_NAME \
+                 or matching PLANE_API_KEY_<NAME> is configured for it)"
+                    .into(),
+            ),
+        }
+    }
+}
+
 // ─── Register all plane tools ─────────────────────────────────────────────────
 
-/// Register all 24 Plane CE tools into the given registry.
+/// Register all 27 Plane CE tools into the given registry.
 pub fn register(registry: &mut ToolRegistry) {
     let client = Arc::new(PlaneClient::from_env());
 
@@ -1454,6 +1902,9 @@ pub fn register(registry: &mut ToolRegistry) {
         Box::new(PlaneListWorkItemsFiltered { client: client.clone() }),
         Box::new(PlaneListRecentActivity { client: client.clone() }),
         Box::new(PlaneCloseWorkItem { client: client.clone() }),
+        Box::new(PlaneGetStateByName { client: client.clone() }),
+        Box::new(PlaneBatchCreateWorkItems { client: client.clone() }),
+        Box::new(PlaneWhoami { client: client.clone() }),
     ];
 
     for tool in tools {
@@ -1469,8 +1920,12 @@ pub fn register(registry: &mut ToolRegistry) {
 mod tests {
     use super::*;
     use httpmock::prelude::*;
+    use serial_test::serial;
 
-    /// Build a PlaneClient pointing at the given mock server URL.
+    /// Build a PlaneClient pointing at the given mock server URL. Uses a
+    /// zero-interval rate limiter so functional tests aren't slowed down by
+    /// pacing — dedicated rate-limiting tests build their own `RateLimiter`
+    /// with a real interval.
     fn mock_client(server: &MockServer) -> Arc<PlaneClient> {
         Arc::new(PlaneClient {
             http: Client::builder()
@@ -1479,7 +1934,11 @@ mod tests {
                 .unwrap(),
             base_url: Some(server.base_url()),
             api_key: Some("test-api-key".into()),
+            identity_name: None,
+            identities: Arc::new(HashMap::new()),
             workspace: "testws".into(),
+            rate_limiter: Arc::new(RateLimiter { last: AsyncMutex::new(None), min_interval: Duration::ZERO }),
+            cache: Arc::new(GetCache::new(Duration::from_secs(5))),
         })
     }
 
@@ -1541,7 +2000,11 @@ mod tests {
             http: Client::new(),
             base_url: None,
             api_key: None,
+            identity_name: None,
+            identities: Arc::new(HashMap::new()),
             workspace: "moosenet".into(),
+            rate_limiter: Arc::new(RateLimiter { last: AsyncMutex::new(None), min_interval: Duration::ZERO }),
+            cache: Arc::new(GetCache::new(Duration::from_secs(5))),
         });
         let tool = PlaneListProjects { client };
         let result = tool.execute(json!({})).await;
@@ -1688,32 +2151,6 @@ mod tests {
     // ── 429 retry logic ───────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_429_retry_succeeds_on_second_attempt() {
-        let server = MockServer::start();
-        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let call_count_clone = call_count.clone();
-
-        // First call → 429; second call → 200
-        let mock429 = server.mock(|when, then| {
-            when.method(GET).path("/api/v1/workspaces/testws/projects/");
-            then.status(429);
-        });
-
-        // We can't do conditional per-call responses easily with httpmock,
-        // so instead test the client's retry by checking it sends more than 1 request.
-        // We use a workaround: mock returns 429 up to 2 times, then 200.
-        // httpmock doesn't support dynamic responses, so we verify error after 3 attempts.
-        let client = mock_client(&server);
-        let tool = PlaneListProjects { client };
-        let result = tool.execute(json!({})).await;
-        // After 3 x 429s the tool should return an error
-        assert!(result.is_err());
-        let _ = call_count_clone; // used above
-        // 3 retries means the mock was hit at least once
-        assert!(mock429.hits() >= 1, "Expected at least 1 hit, got {}", mock429.hits());
-    }
-
-    #[tokio::test]
     async fn test_429_returns_rate_limit_error_after_3_attempts() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
@@ -1794,8 +2231,8 @@ mod tests {
         // (not required for registration, only for execution)
         let mut registry = ToolRegistry::new();
         register(&mut registry);
-        assert_eq!(registry.len(), 24,
-            "Expected 24 plane tools, got {}", registry.len());
+        assert_eq!(registry.len(), 27,
+            "Expected 27 plane tools, got {}", registry.len());
     }
 
     #[test]
@@ -1942,5 +2379,400 @@ mod tests {
         let result = tool.execute(json!({"project_id": "p1", "sequence_id": 99})).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ToolError::NotFound(_)));
+    }
+
+    // ── New tools: state-by-name, batch create, whoami ───────────────────────
+
+    #[tokio::test]
+    async fn test_get_state_by_name_case_insensitive() {
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/workspaces/testws/projects/p1/states/");
+            then.status(200).json_body(json!([
+                {"id": "s-done", "name": "Done", "color": "#0f0", "group": "completed", "project": "p1"}
+            ]));
+        });
+        let client = mock_client(&server);
+        let tool = PlaneGetStateByName { client };
+        let result = tool.execute(json!({"project_id": "p1", "name": "done"})).await.unwrap();
+        assert!(result.contains("s-done"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn test_batch_create_work_items_creates_each_and_reports_all() {
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        let post_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/workspaces/testws/projects/p1/issues/");
+            then.status(201).json_body(json!({
+                "id": "generated", "name": "generated", "project": "p1", "workspace": "testws", "sequence_id": 1
+            }));
+        });
+        let client = mock_client(&server);
+        let tool = PlaneBatchCreateWorkItems { client };
+        let result = tool.execute(json!({
+            "project_id": "p1",
+            "items": [{"name": "Task A"}, {"name": "Task B"}, {"name": "Task C"}]
+        })).await.unwrap();
+        assert!(result.contains("Batch-created 3"), "{result}");
+        assert_eq!(post_mock.hits(), 3, "Expected one POST per item");
+    }
+
+    #[tokio::test]
+    async fn test_batch_create_rejects_empty_items() {
+        let server = MockServer::start();
+        let client = mock_client(&server);
+        let tool = PlaneBatchCreateWorkItems { client };
+        let result = tool.execute(json!({"project_id": "p1", "items": []})).await;
+        assert!(matches!(result.unwrap_err(), ToolError::InvalidArgument(_)));
+    }
+
+    // ── Rate limiting: proves actual pacing, not just that a sleep call exists ──
+
+    #[tokio::test]
+    async fn test_rate_limiter_enforces_minimum_interval_between_calls() {
+        let interval = Duration::from_millis(250);
+        let limiter = RateLimiter { last: AsyncMutex::new(None), min_interval: interval };
+
+        let start = Instant::now();
+        for _ in 0..4 {
+            limiter.acquire().await;
+        }
+        let elapsed = start.elapsed();
+
+        // 4 calls through the gate = 3 enforced gaps of `interval`.
+        let expected_min = interval * 3;
+        assert!(
+            elapsed >= expected_min,
+            "Expected at least {expected_min:?} elapsed across 4 paced calls, got {elapsed:?}"
+        );
+        // Generous ceiling to catch a limiter that isn't pacing at all (e.g. sleeping way too long).
+        assert!(
+            elapsed < expected_min + Duration::from_millis(500),
+            "Elapsed {elapsed:?} far exceeds expected pacing — limiter may be broken"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_paces_real_http_calls_through_client() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/workspaces/testws/projects/");
+            then.status(200).json_body(json!([]));
+        });
+        let client = PlaneClient {
+            http: Client::builder().timeout(Duration::from_secs(5)).build().unwrap(),
+            base_url: Some(server.base_url()),
+            api_key: Some("test-api-key".into()),
+            identity_name: None,
+            identities: Arc::new(HashMap::new()),
+            workspace: "testws".into(),
+            rate_limiter: Arc::new(RateLimiter { last: AsyncMutex::new(None), min_interval: Duration::from_millis(200) }),
+            cache: Arc::new(GetCache::new(Duration::from_millis(1))), // effectively disabled
+        };
+
+        let start = Instant::now();
+        for _ in 0..3 {
+            let url = format!("{}projects/", client.workspace_url());
+            let _ = client.get_with_retry(&url).await.unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "3 real HTTP calls through a 200ms-paced client should take >= 400ms, got {elapsed:?}"
+        );
+    }
+
+    // ── GET caching: proves a second call within TTL skips the network ───────
+
+    #[tokio::test]
+    async fn test_get_json_cached_serves_second_call_from_cache_within_ttl() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/workspaces/testws/projects/");
+            then.status(200).json_body(json!([{"id": "p1", "name": "Alpha", "identifier": "AL", "network": 0}]));
+        });
+        let client = PlaneClient {
+            http: Client::builder().timeout(Duration::from_secs(5)).build().unwrap(),
+            base_url: Some(server.base_url()),
+            api_key: Some("test-api-key".into()),
+            identity_name: None,
+            identities: Arc::new(HashMap::new()),
+            workspace: "testws".into(),
+            rate_limiter: Arc::new(RateLimiter { last: AsyncMutex::new(None), min_interval: Duration::ZERO }),
+            cache: Arc::new(GetCache::new(Duration::from_millis(300))),
+        };
+        let url = format!("{}projects/", client.workspace_url());
+
+        let first = client.get_json_cached(&url).await.unwrap();
+        let second = client.get_json_cached(&url).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(mock.hits(), 1, "Second call within TTL must be served from cache, not the network");
+    }
+
+    #[tokio::test]
+    async fn test_get_json_cached_refetches_after_ttl_expiry() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/workspaces/testws/projects/");
+            then.status(200).json_body(json!([{"id": "p1", "name": "Alpha", "identifier": "AL", "network": 0}]));
+        });
+        let client = PlaneClient {
+            http: Client::builder().timeout(Duration::from_secs(5)).build().unwrap(),
+            base_url: Some(server.base_url()),
+            api_key: Some("test-api-key".into()),
+            identity_name: None,
+            identities: Arc::new(HashMap::new()),
+            workspace: "testws".into(),
+            rate_limiter: Arc::new(RateLimiter { last: AsyncMutex::new(None), min_interval: Duration::ZERO }),
+            cache: Arc::new(GetCache::new(Duration::from_millis(100))),
+        };
+        let url = format!("{}projects/", client.workspace_url());
+
+        let _ = client.get_json_cached(&url).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let _ = client.get_json_cached(&url).await.unwrap();
+
+        assert_eq!(mock.hits(), 2, "A GET after TTL expiry must hit the network again");
+    }
+
+    // ── Retry/backoff: real mocked failure modes ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_429_respects_retry_after_header() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/workspaces/testws/projects/");
+            then.status(429).header("Retry-After", "1");
+        });
+        let client = mock_client(&server);
+        let tool = PlaneListProjects { client };
+
+        let start = Instant::now();
+        let result = tool.execute(json!({})).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err());
+        assert_eq!(mock.hits(), 3, "Expected exactly 3 attempts");
+        // 2 waits of 1s (Retry-After) between the 3 attempts.
+        assert!(elapsed >= Duration::from_millis(1900), "Expected >= ~2s from Retry-After pacing, got {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(8), "Retry-After should be used instead of the larger backoff table, got {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn test_5xx_retries_then_fails() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/workspaces/testws/projects/");
+            then.status(503);
+        });
+        let client = mock_client(&server);
+        let tool = PlaneListProjects { client };
+        let result = tool.execute(json!({})).await;
+        assert!(result.is_err());
+        assert_eq!(mock.hits(), 3, "Expected 3 attempts on repeated 5xx");
+    }
+
+    #[tokio::test]
+    async fn test_network_error_retries_then_fails() {
+        // Nothing is listening on this port — every attempt is a connection error.
+        let client = PlaneClient {
+            http: Client::builder().timeout(Duration::from_millis(300)).build().unwrap(),
+            base_url: Some("http://127.0.0.1:1".into()),
+            api_key: Some("test-api-key".into()),
+            identity_name: None,
+            identities: Arc::new(HashMap::new()),
+            workspace: "testws".into(),
+            rate_limiter: Arc::new(RateLimiter { last: AsyncMutex::new(None), min_interval: Duration::ZERO }),
+            cache: Arc::new(GetCache::new(Duration::from_secs(5))),
+        };
+        let tool = PlaneListProjects { client: Arc::new(client) };
+        let result = tool.execute(json!({})).await;
+        let err = result.unwrap_err();
+        assert!(matches!(err, ToolError::Http(_)), "{err:?}");
+        assert!(err.to_string().contains("3 attempts"), "Expected retry-exhaustion message, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_401_does_not_retry() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/workspaces/testws/projects/");
+            then.status(401);
+        });
+        let client = mock_client(&server);
+        let tool = PlaneListProjects { client };
+        let result = tool.execute(json!({})).await;
+        assert!(matches!(result.unwrap_err(), ToolError::Http(_)));
+        assert_eq!(mock.hits(), 1, "401 must never be retried");
+    }
+
+    #[tokio::test]
+    async fn test_403_does_not_retry() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/workspaces/testws/projects/");
+            then.status(403);
+        });
+        let client = mock_client(&server);
+        let tool = PlaneListProjects { client };
+        let result = tool.execute(json!({})).await;
+        assert!(matches!(result.unwrap_err(), ToolError::Http(_)));
+        assert_eq!(mock.hits(), 1, "403 must never be retried");
+    }
+
+    // ── Multi-identity: no cross-contamination, correct attribution ──────────
+
+    /// Build a client with a default token plus two named identities, all
+    /// sharing one mock server.
+    fn multi_identity_client(server: &MockServer) -> Arc<PlaneClient> {
+        let mut identities = HashMap::new();
+        identities.insert("axon".to_string(), "token-axon".to_string());
+        identities.insert("vigil".to_string(), "token-vigil".to_string());
+        Arc::new(PlaneClient {
+            http: Client::builder().timeout(Duration::from_secs(5)).build().unwrap(),
+            base_url: Some(server.base_url()),
+            api_key: Some("token-default".into()),
+            identity_name: Some("default".into()),
+            identities: Arc::new(identities),
+            workspace: "testws".into(),
+            rate_limiter: Arc::new(RateLimiter { last: AsyncMutex::new(None), min_interval: Duration::ZERO }),
+            cache: Arc::new(GetCache::new(Duration::from_secs(5))),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_for_identity_uses_correct_token_per_identity_no_cross_contamination() {
+        let server = MockServer::start();
+        let axon_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/workspaces/testws/projects/")
+                .header("x-api-key", "token-axon");
+            then.status(200).json_body(json!([]));
+        });
+        let vigil_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/workspaces/testws/projects/")
+                .header("x-api-key", "token-vigil");
+            then.status(200).json_body(json!([]));
+        });
+
+        let base = multi_identity_client(&server);
+        let axon_client = base.for_identity("axon").unwrap();
+        let vigil_client = base.for_identity("VIGIL").unwrap(); // case-insensitive lookup
+
+        assert_eq!(axon_client.identity_name(), Some("axon"));
+        assert_eq!(vigil_client.identity_name(), Some("vigil"));
+
+        let axon_url = format!("{}projects/", axon_client.workspace_url());
+        let _ = axon_client.get_with_retry(&axon_url).await.unwrap();
+        let vigil_url = format!("{}projects/", vigil_client.workspace_url());
+        let _ = vigil_client.get_with_retry(&vigil_url).await.unwrap();
+
+        // Each identity's request must have hit ONLY the mock matching its own
+        // token — proving no cross-identity token leakage.
+        assert_eq!(axon_mock.hits(), 1);
+        assert_eq!(vigil_mock.hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_for_identity_shared_cache_does_not_leak_across_identities() {
+        // Two identities sharing the same GetCache Arc (as for_identity always
+        // shares it) must never be served each other's cached response for the
+        // same URL — Plane GET responses are not uniformly workspace-scoped
+        // (e.g. project visibility varies by the calling token's membership),
+        // so this exercises the exact path a URL-only cache key would leak.
+        let server = MockServer::start();
+        let axon_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/workspaces/testws/projects/")
+                .header("x-api-key", "token-axon");
+            then.status(200).json_body(json!([
+                {"id": "axon-only-project", "name": "Axon's Project", "identifier": "AX", "network": 0}
+            ]));
+        });
+        let vigil_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/workspaces/testws/projects/")
+                .header("x-api-key", "token-vigil");
+            then.status(200).json_body(json!([
+                {"id": "vigil-only-project", "name": "Vigil's Project", "identifier": "VG", "network": 0}
+            ]));
+        });
+
+        let base = multi_identity_client(&server);
+        let axon_client = base.for_identity("axon").unwrap();
+        let vigil_client = base.for_identity("vigil").unwrap();
+        assert!(Arc::ptr_eq(&axon_client.cache, &vigil_client.cache), "test setup must share one cache Arc");
+
+        let url = format!("{}projects/", axon_client.workspace_url());
+
+        // Axon populates the shared cache first.
+        let axon_body = axon_client.get_json_cached(&url).await.unwrap();
+        assert!(axon_body.contains("Axon's Project"));
+
+        // Vigil requests the SAME url within the same TTL window. A URL-only
+        // cache key would return Axon's cached body here without ever
+        // reaching the network with Vigil's own token.
+        let vigil_body = vigil_client.get_json_cached(&url).await.unwrap();
+        assert!(vigil_body.contains("Vigil's Project"), "Vigil must get its own data, got: {vigil_body}");
+        assert!(!vigil_body.contains("Axon's Project"), "Vigil must never see Axon's cached response");
+
+        assert_eq!(axon_mock.hits(), 1, "Axon's own request should hit the network once");
+        assert_eq!(vigil_mock.hits(), 1, "Vigil must make its own network request, not reuse Axon's cache entry");
+    }
+
+    #[tokio::test]
+    async fn test_for_identity_unknown_name_returns_error() {
+        let server = MockServer::start();
+        let base = multi_identity_client(&server);
+        let result = base.for_identity("nonexistent-agent");
+        assert!(matches!(result.unwrap_err(), ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn test_plane_whoami_reports_active_default_identity() {
+        let server = MockServer::start();
+        let client = multi_identity_client(&server);
+        let tool = PlaneWhoami { client };
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(result.contains("default"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn test_plane_whoami_checks_named_identity_configured() {
+        let server = MockServer::start();
+        let client = multi_identity_client(&server);
+        let tool = PlaneWhoami { client };
+        let result = tool.execute(json!({"identity": "axon"})).await.unwrap();
+        assert!(result.contains("configured"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn test_plane_whoami_unknown_identity_not_found() {
+        let server = MockServer::start();
+        let client = multi_identity_client(&server);
+        let tool = PlaneWhoami { client };
+        let result = tool.execute(json!({"identity": "ghost"})).await;
+        assert!(matches!(result.unwrap_err(), ToolError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_from_env_resolves_identity_name_from_matching_token() {
+        // Isolate from other tests / the real environment via serial_test,
+        // since PlaneClient::from_env() reads process-wide env vars.
+        std::env::set_var("PLANE_API_URL", "http://example.invalid");
+        std::env::set_var("PLANE_API_KEY", "shared-token-value");
+        std::env::set_var("PLANE_API_KEY_SEER", "shared-token-value");
+        std::env::remove_var("PLANE_IDENTITY_NAME");
+
+        let client = PlaneClient::from_env();
+        assert_eq!(client.identity_name(), Some("seer"));
+
+        std::env::remove_var("PLANE_API_URL");
+        std::env::remove_var("PLANE_API_KEY");
+        std::env::remove_var("PLANE_API_KEY_SEER");
     }
 }
