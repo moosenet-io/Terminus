@@ -250,6 +250,30 @@ impl PlaneClient {
         self.base_url.is_some() && self.api_key.is_some()
     }
 
+    /// Test-only constructor for other in-crate modules that call this
+    /// module's tools in-process (e.g. `scribe::mod::ScribeReportDiscrepancy`,
+    /// SCRB-04) and need a `PlaneClient` pointed at a local mock server.
+    /// Mirrors this module's own `tests::mock_client` exactly (zero-interval
+    /// rate limiter so tests aren't paced, a short-lived GET cache). Only
+    /// compiled for test builds -- never available to production code, and
+    /// never reads real credentials.
+    #[cfg(test)]
+    pub(crate) fn test_client_with_base_url(base_url: String) -> Arc<Self> {
+        Arc::new(Self {
+            http: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("failed to build reqwest client"),
+            base_url: Some(base_url),
+            api_key: Some("test-api-key".into()),
+            identity_name: None,
+            identities: Arc::new(HashMap::new()),
+            workspace: "testws".into(),
+            rate_limiter: Arc::new(RateLimiter { last: AsyncMutex::new(None), min_interval: Duration::ZERO }),
+            cache: Arc::new(GetCache::new(Duration::from_secs(5))),
+        })
+    }
+
     /// Return a `ToolError::NotConfigured` with helpful message.
     fn not_configured(&self) -> ToolError {
         ToolError::NotConfigured(
@@ -694,6 +718,18 @@ impl RustTool for PlaneGetWorkItem {
 
 pub struct PlaneCreateWorkItem {
     client: Arc<PlaneClient>,
+}
+
+impl PlaneCreateWorkItem {
+    /// Construct directly for an in-process, in-crate caller (e.g.
+    /// `scribe::mod::ScribeReportDiscrepancy`, SCRB-04) that calls this
+    /// tool's `execute()` as a plain function call rather than a second HTTP
+    /// hop through the MCP registry -- the "ONE sanctioned path" for Plane
+    /// access still applies (this IS that path, called in-process, same
+    /// crate), it just isn't going through `register()`'s registry lookup.
+    pub fn new(client: Arc<PlaneClient>) -> Self {
+        Self { client }
+    }
 }
 
 #[async_trait]
@@ -1515,6 +1551,13 @@ impl RustTool for PlaneGetIssueBySequence {
 
 pub struct PlaneListWorkItemsFiltered {
     client: Arc<PlaneClient>,
+}
+
+impl PlaneListWorkItemsFiltered {
+    /// See `PlaneCreateWorkItem::new`'s doc comment -- same rationale.
+    pub fn new(client: Arc<PlaneClient>) -> Self {
+        Self { client }
+    }
 }
 
 #[async_trait]
