@@ -22,20 +22,30 @@
 //! against the enum itself (so it can never silently go stale), not against
 //! today's call sites.
 //!
-//! ## A note on `src/tool.rs`'s no-subprocess contract
-//! This module shells out to the `git` binary via `std::process::Command`
-//! (there is no vendored git library in this crate, and this sandbox has no
-//! registry access to add one). `src/tool.rs`'s `RustTool` contract states
-//! `execute()` must never use shell commands or subprocess calls. This
-//! module is a **plain helper**, not itself a `RustTool` impl, so it is
-//! self-contained and independently testable for SCRB-03. Flagging for
-//! whoever wires it into a live `RustTool::execute()` body (SCRB-02's
-//! `scribe_generate_readme` et al.): that integration must resolve the same
-//! tension `review_daemon`/`src/dgem/mod.rs` already solved for LLM-CLI
-//! dispatch -- wrap the subprocess-needing call behind a small local daemon
-//! reached over loopback HTTP, rather than calling `Command` directly from
-//! `execute()`. Out of scope here: SCRB-03's own FILES section is
-//! `inspect.rs` only.
+//! ## A note on `src/tool.rs`'s no-subprocess contract (resolution, SCRB-02)
+//! This module shells out to the `git` binary via `std::process::Command`.
+//! `src/tool.rs`'s `RustTool` contract states `execute()` must never use
+//! shell commands or subprocess calls. SCRB-03 (this file's original item)
+//! flagged the tension and deferred its resolution to whichever item first
+//! wired this module into a live `execute()` body -- that was SCRB-02
+//! (`scribe_generate_readme`).
+//!
+//! Reviewed resolution: unlike `review_daemon`/`src/dgem/mod.rs`'s LLM-CLI
+//! dispatch (which has NO non-subprocess alternative -- there is no Rust API
+//! for `claude`/`codex`/`agy`), git has a real pure-Rust alternative:
+//! the `git2` crate (libgit2 bindings). The correct fix is a **library
+//! swap** (`std::process::Command` -> `git2`), not a **process-isolation
+//! daemon-wrap** -- daemon-wrapping is the right tool when subprocess is the
+//! only option; it's over-engineering when a native library already exists.
+//! `git2` isn't vendored in this crate and this sandbox has no
+//! crates.io/registry access to add it.
+//!
+//! Until that swap lands, `scribe_generate_readme`'s `execute()`
+//! (`src/scribe/mod.rs`) gates this module's checkout path behind
+//! `ScribeConfig::allow_subprocess_inspection`, off by default -- an
+//! operator must explicitly set `SCRIBE_ALLOW_SUBPROCESS_INSPECTION=true` to
+//! accept the interim contract deviation, rather than it being silently
+//! baked into the default code path. See that field's doc comment.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

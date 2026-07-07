@@ -152,6 +152,49 @@ pub fn parse_verdict(raw: &str) -> (Verdict, String) {
     (verdict, reasoning)
 }
 
+// ─── SCRB-02: docs-generation prompt (Scribe) ───────────────────────────────
+//
+// A second prompt *shape*, alongside `build_prompt`'s review-role framing --
+// still dispatched through the exact same `ReviewConfig::dispatch_daemon`
+// HTTP call (see `src/scribe/mod.rs`), so no daemon-side change was needed:
+// `POST /dispatch` already accepts any opaque `prompt` string (verified by
+// reading `src/bin/review_daemon/main.rs`'s `DispatchBody` -- it has no
+// prompt-shape/kind field at all, the daemon is prompt-shape-agnostic). The
+// original spec's FILES section named `src/bin/review_daemon/provider.rs` as
+// the likely home for a `PromptKind::Docs` variant; that assumption doesn't
+// match the verified architecture -- prompt *construction* lives here,
+// client-side, next to `build_prompt`, and the daemon only ever sees a
+// finished string. Kept as a distinct function (not a new `Structure`/`Role`
+// variant on `build_prompt`) because a docs-generation prompt needs full
+// file contents + existing-doc content, not a diff -- a genuinely different
+// shape, not a role variant of review.
+/// Build a documentation-generation prompt for one module. `context` is the
+/// module's bundled source excerpts (doc comments, public signatures) plus
+/// any existing README, serialized as JSON -- see
+/// `crate::scribe::inspect::ModuleBundle`. Ends with an explicit instruction
+/// to write the README as plain Markdown only, so the daemon's raw text
+/// response can be used directly without further extraction (unlike
+/// `build_prompt`'s `VERDICT:` sentinel, there is no structured sentinel to
+/// parse out of a docs-generation response).
+pub fn build_docs_prompt(module_path: &str, git_ref: &str, context: &Value) -> String {
+    let context_str = serde_json::to_string_pretty(context).unwrap_or_else(|_| context.to_string());
+    format!(
+        "You are a technical documentation writer generating a README for a single \
+source module in a Rust codebase.\n\n\
+Module path: {module_path}\n\
+Git ref this content was generated against: {git_ref}\n\n\
+Module context (doc comments, public function/struct/enum signatures, and any \
+existing README content, extracted from the real source files):\n{context_str}\n\n\
+Write a README for this module: what it does, its public API surface, and any \
+configuration (env vars) it reads. Base every claim ONLY on the context above --\
+ never invent behavior that isn't evidenced by the doc comments or signatures \
+shown. If the existing README content (if any) contradicts what the signatures \
+show, prefer the signatures (the code is truth) and note the discrepancy rather \
+than silently reconciling it. Respond with ONLY the README's Markdown content -- \
+no preamble, no meta-commentary, no code fences wrapping the whole response.\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +294,31 @@ mod tests {
                    After review, my actual answer is:\nVERDICT: REQUEST_CHANGES";
         let (v, _) = parse_verdict(raw);
         assert_eq!(v, Verdict::RequestChanges);
+    }
+
+    #[test]
+    fn docs_prompt_contains_module_path_ref_and_context() {
+        let ctx = serde_json::json!({"doc_comments": ["//! a module"], "existing_readme": null});
+        let prompt = build_docs_prompt("src/sundry", "abc123", &ctx);
+        assert!(prompt.contains("src/sundry"));
+        assert!(prompt.contains("abc123"));
+        assert!(prompt.contains("a module"));
+    }
+
+    #[test]
+    fn docs_prompt_instructs_markdown_only_no_fabrication() {
+        let ctx = serde_json::json!({});
+        let prompt = build_docs_prompt("src/x", "HEAD", &ctx);
+        assert!(prompt.to_lowercase().contains("markdown"));
+        assert!(prompt.to_lowercase().contains("never invent"));
+    }
+
+    #[test]
+    fn docs_prompt_has_no_verdict_sentinel_unlike_review_prompts() {
+        // Docs generation has no structured sentinel to parse back out --
+        // distinguishes this prompt shape from build_prompt's review roles.
+        let ctx = serde_json::json!({});
+        let prompt = build_docs_prompt("src/x", "HEAD", &ctx);
+        assert!(!prompt.contains("VERDICT:"));
     }
 }

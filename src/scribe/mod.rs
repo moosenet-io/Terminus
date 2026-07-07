@@ -40,6 +40,7 @@ pub mod inspect;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::path::Path;
 
 use crate::error::ToolError;
 use crate::registry::ToolRegistry;
@@ -54,6 +55,31 @@ use crate::tool::RustTool;
 pub struct ScribeConfig {
     /// Root directory for read-only inspection worktrees (SCRB-03).
     pub worktree_root: String,
+    /// Local path to the repo Scribe inspects by default when a tool call
+    /// doesn't specify one explicitly (SCRB-02/03). Not a secret -- a
+    /// filesystem path, same convention as `worktree_root`.
+    pub repo_path: Option<String>,
+    /// Closed allowlist of local filesystem roots a `repo_path` (argument or
+    /// default) must resolve under. Default-deny: empty means NO repo_path
+    /// is permitted at all, not "anything goes" -- an operator must
+    /// explicitly configure this before `scribe_generate_readme` can inspect
+    /// anything (see review finding, SCRB-02 cycle 1: an unconfined
+    /// `repo_path` would let a caller point Scribe at an arbitrary local
+    /// repo and have its contents shipped to an external LLM provider).
+    pub allowed_repo_roots: Vec<String>,
+    /// Explicit, off-by-default opt-in for subprocess-based worktree
+    /// inspection (SCRB-02 cycle 1 review finding: `inspect::checkout`
+    /// shells out to `git`, which `src/tool.rs`'s `RustTool` contract bans
+    /// from `execute()`). The real fix is swapping `std::process::Command`
+    /// for the `git2` crate (a pure-Rust libgit2 binding -- unlike the
+    /// review-daemon's LLM-CLI dispatch, which has NO non-subprocess
+    /// alternative at all, git has one; this is a library swap, not a
+    /// process-isolation problem needing a daemon-wrap) -- not done in this
+    /// item because this sandbox has no crates.io/registry access to add
+    /// it. Until that swap lands, this flag makes the interim contract
+    /// deviation an explicit, reviewable, default-off operator decision
+    /// rather than a silent one baked into the code path.
+    pub allow_subprocess_inspection: bool,
     /// Git remote URL for the Obsidian-compatible vault repo (SCRB-05).
     /// `None` until the vault repo exists / is configured.
     pub vault_remote: Option<String>,
@@ -71,13 +97,111 @@ impl ScribeConfig {
                     .to_string_lossy()
                     .to_string()
             });
+        let repo_path = std::env::var("SCRIBE_REPO_PATH")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let allowed_repo_roots = std::env::var("SCRIBE_ALLOWED_REPO_ROOTS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(|part| part.trim().to_string())
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let allow_subprocess_inspection = std::env::var("SCRIBE_ALLOW_SUBPROCESS_INSPECTION")
+            .ok()
+            .map(|s| s.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let vault_remote = std::env::var("SCRIBE_VAULT_REMOTE")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        Self { worktree_root, vault_remote }
+        Self {
+            worktree_root,
+            repo_path,
+            allowed_repo_roots,
+            allow_subprocess_inspection,
+            vault_remote,
+        }
     }
+}
+
+/// Closed, ordered fallback chain of review-daemon providers for docs
+/// generation. `agy` (Gemini) first -- largest context window, already
+/// proven strong at structured writing per this session's live-verified
+/// review use (per the spec's own rationale) -- falling back to `codex` then
+/// `opus` if the primary is unavailable/rate-limited. Mirrors
+/// `review_daemon::provider::Provider`'s closed-enum spirit: this is the only
+/// place the fallback order is defined, and it's a fixed constant, not
+/// caller-influenced.
+const DOCS_PROVIDER_CHAIN: &[&str] = &["agy", "codex", "opus"];
+
+/// Dispatch a documentation-generation prompt through the review-daemon,
+/// trying each provider in [`DOCS_PROVIDER_CHAIN`] in order until one
+/// succeeds. Reuses `review::ReviewConfig::dispatch_daemon` directly -- the
+/// exact same hardened HTTP call the `review_run` tool uses, no new
+/// subprocess/HTTP-client code. Returns the aggregated errors from every
+/// attempted provider if all fail (so a caller sees why, not just "failed").
+/// Takes `cfg` by reference (dependency-injected, not read from the
+/// environment internally) so tests can point it at a mock HTTP server via
+/// `ReviewConfig { daemon_url: mock.base_url(), .. }` without ever mutating
+/// process-wide environment variables (which would race against other tests
+/// running concurrently in the same test binary).
+async fn dispatch_docs_generation(
+    cfg: &crate::review::ReviewConfig,
+    prompt: &str,
+) -> Result<String, ToolError> {
+    let mut errors = Vec::new();
+    for provider in DOCS_PROVIDER_CHAIN {
+        match cfg.dispatch_daemon(provider, prompt).await {
+            Ok(text) => return Ok(text),
+            Err(e) => errors.push(format!("{provider}: {e}")),
+        }
+    }
+    Err(ToolError::Execution(format!(
+        "all docs-generation providers unavailable: {}",
+        errors.join("; ")
+    )))
+}
+
+/// Default-deny confinement check: `repo_path` must canonicalize to a path
+/// under one of `allowed_roots` (also canonicalized, so symlinks/relative
+/// segments can't be used to appear inside an allowed root without actually
+/// being there). An empty `allowed_roots` means nothing is allowed -- this
+/// is NOT "unset = anything goes"; an operator must explicitly list the
+/// repos Scribe may inspect (SCRB-02 cycle 1 review finding: an unconfined
+/// `repo_path` would let a caller point Scribe at an arbitrary local repo
+/// and have its contents shipped to an external LLM provider).
+fn is_repo_path_allowed(repo_path: &Path, allowed_roots: &[String]) -> bool {
+    if allowed_roots.is_empty() {
+        return false;
+    }
+    let Ok(canon_target) = repo_path.canonicalize() else {
+        return false;
+    };
+    allowed_roots.iter().any(|root| {
+        Path::new(root)
+            .canonicalize()
+            .map(|canon_root| canon_target.starts_with(canon_root))
+            .unwrap_or(false)
+    })
+}
+
+/// Build the JSON context `build_docs_prompt` embeds, from a real
+/// [`inspect::ModuleBundle`]. Kept as its own function so prompt-context
+/// shaping is unit-testable independent of a real worktree checkout.
+fn docs_prompt_context(bundle: &inspect::ModuleBundle) -> Value {
+    json!({
+        "files": bundle.files.iter().map(|f| json!({
+            "path": f.path,
+            "doc_comments": f.doc_comments,
+            "public_signatures": f.public_signatures,
+        })).collect::<Vec<_>>(),
+        "existing_readme": bundle.existing_readme,
+    })
 }
 
 /// Stub result shared by every not-yet-implemented tool in this scaffold.
@@ -93,6 +217,26 @@ fn not_yet_implemented(tool: &str) -> Result<String, ToolError> {
 // Tool: scribe_generate_readme
 // ---------------------------------------------------------------------------
 
+/// ## A note on the `RustTool` no-subprocess contract (resolved here, SCRB-02)
+/// `execute()` below calls `inspect::checkout`, which shells out to `git` via
+/// `std::process::Command` (see `src/scribe/inspect.rs`). `src/tool.rs`'s
+/// `RustTool` contract states `execute()` must never use shell commands or
+/// subprocess calls -- SCRB-03 flagged this tension and deferred its
+/// resolution to whichever item first wires `inspect.rs` into a live
+/// `execute()` body. That's this item. Decision, made explicitly rather than
+/// silently: `inspect.rs`'s git invocations are NOT an arbitrary/unsanitized
+/// shell surface -- they're built exclusively from a closed
+/// `ReadOnlyGitOp` enum, argv-array (never shell-string) construction, an
+/// explicit `--` end-of-options separator, and a runtime
+/// `assert_read_only_argv` check on every invocation (all peer-reviewed
+/// twice in SCRB-03). The contract's underlying security concern --
+/// caller-controlled/injectable shell execution -- is what SCRB-03 already
+/// closed. Building a full daemon-wrap (matching `review_daemon`/`dgem`'s
+/// precedent for LLM-CLI dispatch) to satisfy the contract's letter as well
+/// as its spirit is real follow-up work, out of proportion for this item's
+/// scope and blocked in this environment by having no crates.io/registry
+/// access to add the tooling such a daemon would need; tracked as residual
+/// architecture debt rather than silently accepted.
 pub struct ScribeGenerateReadme;
 
 #[async_trait]
@@ -102,9 +246,11 @@ impl RustTool for ScribeGenerateReadme {
     }
 
     fn description(&self) -> &str {
-        "Generate or refresh a module's README by inspecting its source via a \
-read-only worktree and dispatching a documentation-generation prompt through \
-the review-daemon. Stub only in this scaffold; implemented in SCRB-02/03."
+        "Generate a module's README content by inspecting its real source (via a \
+read-only worktree checkout) and dispatching a documentation-generation prompt \
+through the review-daemon (agy, falling back to codex then opus). Returns the \
+generated Markdown as this tool's result; does not write or commit anything -- \
+persisting it into a vault/repo is a separate concern (SCRB-05)."
     }
 
     fn parameters(&self) -> Value {
@@ -117,15 +263,67 @@ the review-daemon. Stub only in this scaffold; implemented in SCRB-02/03."
                 },
                 "repo_ref": {
                     "type": "string",
-                    "description": "Git ref to inspect (branch, tag, or commit). Defaults to the repo's default branch."
+                    "description": "Git ref to inspect (branch, tag, or commit). Defaults to 'HEAD'."
+                },
+                "repo_path": {
+                    "type": "string",
+                    "description": "Local filesystem path to the repo to inspect. Defaults to SCRIBE_REPO_PATH if unset."
                 }
             },
             "required": ["module_path"]
         })
     }
 
-    async fn execute(&self, _args: Value) -> Result<String, ToolError> {
-        not_yet_implemented(self.name())
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let module_path = args
+            .get("module_path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ToolError::InvalidArgument("module_path is required and must not be empty".into()))?;
+        let repo_ref = args.get("repo_ref").and_then(Value::as_str).unwrap_or("HEAD");
+
+        let cfg = ScribeConfig::from_env();
+
+        if !cfg.allow_subprocess_inspection {
+            return Err(ToolError::NotConfigured(
+                "subprocess-based worktree inspection is disabled by default (see \
+ScribeConfig::allow_subprocess_inspection's doc comment for why); set \
+SCRIBE_ALLOW_SUBPROCESS_INSPECTION=true to enable it explicitly"
+                    .into(),
+            ));
+        }
+
+        let repo_path_str = args
+            .get("repo_path")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty())
+            .or(cfg.repo_path.clone())
+            .ok_or_else(|| {
+                ToolError::NotConfigured(
+                    "no repo_path argument given and SCRIBE_REPO_PATH is not set".into(),
+                )
+            })?;
+
+        let repo_path = std::path::Path::new(&repo_path_str);
+        if !is_repo_path_allowed(repo_path, &cfg.allowed_repo_roots) {
+            return Err(ToolError::InvalidArgument(format!(
+                "repo_path '{}' is not under any root in SCRIBE_ALLOWED_REPO_ROOTS \
+(default-deny: this env var must list the specific repos Scribe may inspect)",
+                repo_path.display()
+            )));
+        }
+
+        let worktree_root = std::path::Path::new(&cfg.worktree_root);
+
+        let wt = inspect::checkout(repo_path, repo_ref, worktree_root)?;
+        let bundle = inspect::inspect_module(&wt, module_path)?;
+        let context = docs_prompt_context(&bundle);
+        let prompt = crate::review::build_docs_prompt(module_path, repo_ref, &context);
+
+        let review_cfg = crate::review::ReviewConfig::from_env();
+        dispatch_docs_generation(&review_cfg, &prompt).await
     }
 }
 
@@ -362,9 +560,99 @@ mod tests {
 
     #[tokio::test]
     async fn stub_tools_return_execution_error_not_panic() {
+        // scribe_generate_readme is real as of SCRB-02 (see the dedicated
+        // tests below); the remaining three are still scaffold stubs.
+        let wiki = ScribeUpdateWikiPage;
+        let result = wiki
+            .execute(json!({"module_path": "src/sundry", "title": "Sundry"}))
+            .await;
+        assert!(matches!(result, Err(ToolError::Execution(_))));
+    }
+
+    #[tokio::test]
+    async fn generate_readme_with_no_repo_path_and_no_optin_is_a_clean_error_not_panic() {
+        // Reviewer nit (SCRB-02 cycle 2, non-blocking): this test's original
+        // name claimed to exercise the "no repo_path configured" branch, but
+        // since `allow_subprocess_inspection` defaults false and that gate
+        // runs FIRST in execute(), it actually hits the same NotConfigured
+        // as `generate_readme_execute_is_disabled_by_default_pending_operator_optin`
+        // -- same enum variant, so it still passed, but didn't prove what its
+        // name claimed. Renamed to describe what it actually verifies (no
+        // panic, no fabricated content, clean error) rather than a specific
+        // branch; the opt-in-gate branch has its own dedicated test above.
         let generate = ScribeGenerateReadme;
         let result = generate.execute(json!({"module_path": "src/sundry"})).await;
-        assert!(matches!(result, Err(ToolError::Execution(_))));
+        assert!(matches!(result, Err(ToolError::NotConfigured(_))));
+    }
+
+    #[tokio::test]
+    async fn generate_readme_missing_module_path_is_invalid_argument() {
+        let generate = ScribeGenerateReadme;
+        let result = generate
+            .execute(json!({"repo_path": env!("CARGO_MANIFEST_DIR")}))
+            .await;
+        assert!(matches!(result, Err(ToolError::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn generate_readme_empty_module_path_is_invalid_argument_not_a_whole_repo_walk() {
+        // Cycle 1 review finding: an empty (not missing) module_path used to
+        // pass the presence check and silently expand to a full-repo walk
+        // via `wt.path.join("")` == `wt.path`. Must now be rejected up front.
+        let generate = ScribeGenerateReadme;
+        let result = generate
+            .execute(json!({"module_path": "", "repo_path": env!("CARGO_MANIFEST_DIR")}))
+            .await;
+        assert!(matches!(result, Err(ToolError::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn generate_readme_execute_is_disabled_by_default_pending_operator_optin() {
+        // Cycle 1 review finding: execute() called inspect::checkout
+        // unconditionally, keeping a live RustTool no-subprocess-contract
+        // deviation with no operator opt-in. Default (SCRIBE_ALLOW_SUBPROCESS_
+        // INSPECTION unset in this test process) must be a clean NotConfigured,
+        // not a checkout attempt.
+        let generate = ScribeGenerateReadme;
+        let result = generate
+            .execute(json!({"module_path": "src/sundry", "repo_path": env!("CARGO_MANIFEST_DIR")}))
+            .await;
+        match result {
+            Err(ToolError::NotConfigured(msg)) => {
+                assert!(msg.contains("SCRIBE_ALLOW_SUBPROCESS_INSPECTION"));
+            }
+            other => panic!("expected NotConfigured pending opt-in, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_repo_path_allowed_denies_by_default_with_no_roots_configured() {
+        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert!(!is_repo_path_allowed(&repo, &[]));
+    }
+
+    #[test]
+    fn is_repo_path_allowed_allows_a_path_under_a_configured_root() {
+        let repo = env!("CARGO_MANIFEST_DIR").to_string();
+        let allowed = vec![repo.clone()];
+        assert!(is_repo_path_allowed(std::path::Path::new(&repo), &allowed));
+    }
+
+    #[test]
+    fn is_repo_path_allowed_denies_a_path_outside_every_configured_root() {
+        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let unrelated_root = std::env::temp_dir();
+        // temp_dir is very unlikely to be an ancestor of CARGO_MANIFEST_DIR.
+        assert!(!is_repo_path_allowed(&repo, &[unrelated_root.to_string_lossy().into_owned()]));
+    }
+
+    #[test]
+    fn is_repo_path_allowed_denies_a_nonexistent_path() {
+        // canonicalize() fails for a path that doesn't exist -- must deny,
+        // not panic or silently pass.
+        let bogus = std::path::PathBuf::from("/tmp/scribe-test-does-not-exist-xyz-123");
+        let allowed = vec![std::env::temp_dir().to_string_lossy().into_owned()];
+        assert!(!is_repo_path_allowed(&bogus, &allowed));
     }
 
     #[tokio::test]
@@ -385,9 +673,145 @@ mod tests {
                 .join("scribe-inspect")
                 .to_string_lossy()
                 .to_string(),
+            repo_path: None,
+            allowed_repo_roots: Vec::new(),
+            allow_subprocess_inspection: false,
             vault_remote: None,
         };
         assert!(cfg.worktree_root.contains("scribe-inspect"));
+        assert!(cfg.repo_path.is_none());
         assert!(cfg.vault_remote.is_none());
+    }
+
+    // ─── SCRB-02: LLM-backend dispatch tests ────────────────────────────────
+
+    #[test]
+    fn docs_prompt_context_serializes_files_and_readme() {
+        let bundle = inspect::ModuleBundle {
+            module_path: "src/sundry".to_string(),
+            git_ref: "HEAD".to_string(),
+            files: vec![inspect::FileExcerpt {
+                path: "src/sundry/mod.rs".to_string(),
+                doc_comments: vec!["//! Sundry tools".to_string()],
+                public_signatures: vec!["pub struct Health;".to_string()],
+            }],
+            existing_readme: Some("# Old README".to_string()),
+        };
+        let ctx = docs_prompt_context(&bundle);
+        assert_eq!(ctx["files"][0]["path"], "src/sundry/mod.rs");
+        assert_eq!(ctx["existing_readme"], "# Old README");
+    }
+
+    #[tokio::test]
+    async fn dispatch_docs_generation_tries_agy_first_and_returns_on_success() {
+        let server = httpmock::MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/dispatch")
+                .header("authorization", "Bearer testtoken")
+                .json_body(json!({"provider": "agy", "prompt": "doc this", "timeout_secs": 120}));
+            then.status(200).json_body(json!({"text": "# Generated README"}));
+        });
+        let cfg = crate::review::ReviewConfig {
+            daemon_url: server.base_url(),
+            daemon_token: Some("testtoken".to_string()),
+            openrouter_key: None,
+        };
+        let result = dispatch_docs_generation(&cfg, "doc this").await.unwrap();
+        assert_eq!(result, "# Generated README");
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn dispatch_docs_generation_falls_back_through_the_provider_chain() {
+        let server = httpmock::MockServer::start();
+        // agy and codex both report unavailable; opus (last in the chain)
+        // succeeds -- proves the fallback chain, not just the happy path.
+        let agy_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/dispatch")
+                .json_body(json!({"provider": "agy", "prompt": "doc this", "timeout_secs": 120}));
+            then.status(502).json_body(json!({"error": "binary_not_found", "detail": "agy not found"}));
+        });
+        let codex_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/dispatch")
+                .json_body(json!({"provider": "codex", "prompt": "doc this", "timeout_secs": 120}));
+            then.status(502).json_body(json!({"error": "timeout", "detail": "codex timed out"}));
+        });
+        let opus_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/dispatch")
+                .json_body(json!({"provider": "opus", "prompt": "doc this", "timeout_secs": 120}));
+            then.status(200).json_body(json!({"text": "# Fallback README"}));
+        });
+        let cfg = crate::review::ReviewConfig {
+            daemon_url: server.base_url(),
+            daemon_token: Some("testtoken".to_string()),
+            openrouter_key: None,
+        };
+        let result = dispatch_docs_generation(&cfg, "doc this").await.unwrap();
+        assert_eq!(result, "# Fallback README");
+        agy_mock.assert();
+        codex_mock.assert();
+        opus_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn dispatch_docs_generation_aggregates_errors_when_every_provider_fails() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/dispatch");
+            then.status(502).json_body(json!({"error": "binary_not_found", "detail": "not found"}));
+        });
+        let cfg = crate::review::ReviewConfig {
+            daemon_url: server.base_url(),
+            daemon_token: Some("testtoken".to_string()),
+            openrouter_key: None,
+        };
+        let err = dispatch_docs_generation(&cfg, "doc this").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("agy"));
+        assert!(msg.contains("codex"));
+        assert!(msg.contains("opus"));
+    }
+
+    /// Full, real-checkout-plus-mocked-dispatch flow: real worktree checkout
+    /// and real source inspection against this crate's own repo
+    /// (src/sundry), with only the review-daemon HTTP call mocked (there is
+    /// no running review-daemon/agy in this environment -- see the module
+    /// doc comment's note on the live test being environment-blocked).
+    #[tokio::test]
+    async fn generate_readme_full_flow_with_mocked_daemon() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/dispatch")
+                .json_body_partial(json!({"provider": "agy"}).to_string());
+            then.status(200).json_body(json!({"text": "# Sundry\n\nUtility tools."}));
+        });
+
+        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let worktree_root = std::env::temp_dir().join(format!(
+            "scribe-scrb02-fullflow-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&worktree_root);
+
+        let wt = inspect::checkout(&repo, "HEAD", &worktree_root).expect("checkout should succeed");
+        let bundle = inspect::inspect_module(&wt, "src/sundry").expect("inspect should succeed");
+        let context = docs_prompt_context(&bundle);
+        let prompt = crate::review::build_docs_prompt("src/sundry", "HEAD", &context);
+
+        let cfg = crate::review::ReviewConfig {
+            daemon_url: server.base_url(),
+            daemon_token: Some("testtoken".to_string()),
+            openrouter_key: None,
+        };
+        let result = dispatch_docs_generation(&cfg, &prompt).await.unwrap();
+        assert_eq!(result, "# Sundry\n\nUtility tools.");
+
+        inspect::cleanup(&wt).ok();
+        let _ = std::fs::remove_dir_all(&worktree_root);
     }
 }
