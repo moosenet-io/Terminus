@@ -1540,30 +1540,14 @@ mod tests {
     #[serial]
     async fn build_diary_entry_end_to_end_writes_and_pushes_a_real_note() {
         // Real local bare repo standing in for the vault remote (see
-        // vault::tests::write_note_and_push_is_verifiable_via_a_fresh_clone
-        // for why this environment can't reach the real Gitea remote).
+        // vault::test_setup_bare_vault's doc comment for why this
+        // environment can't reach the real Gitea remote; this helper is
+        // shared with vault.rs's own tests -- cycle 1 review finding: the
+        // ~30-line setup was previously duplicated near-verbatim here).
         let base = std::env::temp_dir().join(format!("scribe-diary-e2e-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
-        let bare_remote = base.join("remote.git");
-        let working_copy = base.join("working");
-        std::fs::create_dir_all(&bare_remote).unwrap();
-
-        let run = |dir: &std::path::Path, args: &[&str]| {
-            let output = std::process::Command::new("git").current_dir(dir).args(args).output().unwrap();
-            assert!(output.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&output.stderr));
-        };
-        run(&bare_remote, &["init", "--bare", "-q"]);
-        run(&base, &["clone", "-q", bare_remote.to_str().unwrap(), working_copy.to_str().unwrap()]);
-        run(&working_copy, &["checkout", "-q", "-B", "main"]);
-        std::fs::write(working_copy.join("README.md"), "# Scribe Vault\n").unwrap();
-        run(&working_copy, &["config", "user.email", "<email>"]);  // pii-test-fixture
-        run(&working_copy, &["config", "user.name", "Scribe"]);
-        run(&working_copy, &["add", "README.md"]);
-        run(&working_copy, &["commit", "-q", "-m", "init"]);
-        run(&working_copy, &["push", "-q", "origin", "HEAD:main"]);
-        run(&working_copy, &["branch", "-q", "--set-upstream-to=origin/main", "main"]);
-        run(&bare_remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        let (bare_remote, working_copy) = vault::test_setup_bare_vault(&base);
 
         std::env::set_var("SCRIBE_ALLOW_SUBPROCESS_VAULT_WRITE", "true");
         std::env::set_var("SCRIBE_VAULT_LOCAL_DIR", working_copy.to_string_lossy().into_owned());
@@ -1587,7 +1571,12 @@ inspection, Plane discrepancy reporting, and this vault -- in that order.",
 
         // Verify via a fresh, independent clone.
         let fresh_clone = base.join("fresh-clone");
-        run(&base, &["clone", "-q", bare_remote.to_str().unwrap(), fresh_clone.to_str().unwrap()]);
+        let clone_output = std::process::Command::new("git")
+            .current_dir(&base)
+            .args(["clone", "-q", bare_remote.to_str().unwrap(), fresh_clone.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(clone_output.status.success(), "fresh clone failed: {}", String::from_utf8_lossy(&clone_output.stderr));
         let entries: Vec<_> = std::fs::read_dir(fresh_clone.join("build-diaries"))
             .expect("build-diaries/ should exist in the fresh clone")
             .filter_map(|e| e.ok())

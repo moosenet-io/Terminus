@@ -86,7 +86,20 @@ pub struct NoteFrontmatter {
 /// quote character can never break the YAML block's structure.
 fn render_frontmatter(fm: &NoteFrontmatter) -> String {
     fn yaml_quote(s: &str) -> String {
-        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+        // Order matters: backslash first (so later escapes' own backslashes
+        // don't get re-escaped), then the other YAML-double-quoted-scalar
+        // escapes. Cycle 1 review finding: the original version escaped
+        // only `\` and `"` -- a title/spec_id containing an embedded
+        // literal newline (not stripped by `.trim()`, which only strips
+        // leading/trailing whitespace) would land unescaped inside the
+        // quoted scalar, changing how a YAML parser folds it.
+        let escaped = s
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t");
+        format!("\"{escaped}\"")
     }
     format!(
         "---\ntitle: {title}\nmodule: {module}\ngenerated_at: {generated_at}\nsource_commit: {source_commit}\ntype: {note_type}\n---\n\n",
@@ -142,6 +155,20 @@ pub fn slugify(input: &str) -> String {
     while out.ends_with('-') {
         out.pop();
     }
+    if out.is_empty() {
+        // Cycle 1 review finding: input with no ASCII alphanumerics at all
+        // (pure non-ASCII -- Cyrillic, emoji, etc.) previously produced an
+        // empty string, and note_path() would then build a collision-prone
+        // path like `modules//README.md` (every such module colliding on
+        // the same path) or `build-diaries/.md`. A short, stable hash of
+        // the ORIGINAL input guarantees a non-empty, deterministic,
+        // collision-resistant slug instead.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        input.hash(&mut hasher);
+        return format!("untitled-{:08x}", hasher.finish() as u32);
+    }
     out
 }
 
@@ -164,11 +191,22 @@ pub fn note_path(vault_root: &Path, note_type: NoteType, module: &str, slug: &st
 
 /// Closed set of git operations vault writing can ever perform. No variant
 /// here can force-push or force-overwrite history -- see the module doc
-/// comment.
+/// comment. `Add` exists so `write_note_and_push`'s `git add <path>` call
+/// goes through the SAME guardrail as every other vault git invocation
+/// (cycle 1 review finding: it previously used a raw `Command::new("git")`
+/// call, bypassing `argv_for`/`assert_never_force_push` entirely).
 #[derive(Debug, Clone, Copy)]
 enum VaultGitOp<'a> {
+    Add { vault_dir: &'a Path, path: &'a Path },
     Pull { vault_dir: &'a Path },
     AddCommitAll { vault_dir: &'a Path, message: &'a str },
+    /// Soft-reset the most recent commit, keeping its changes staged.
+    /// Used ONLY to recover the working copy after a push failure (see
+    /// `write_note_and_push`) so a retry isn't permanently wedged behind an
+    /// orphaned local commit -- never used to rewrite already-pushed
+    /// history (it only ever targets a commit `write_note_and_push` itself
+    /// just made and confirmed was never pushed).
+    SoftResetLastCommit { vault_dir: &'a Path },
     Push { vault_dir: &'a Path },
 }
 
@@ -189,6 +227,10 @@ fn assert_never_force_push(argv: &[String]) {
 
 fn argv_for(op: &VaultGitOp) -> (PathBuf, Vec<String>) {
     let (cwd, argv) = match op {
+        VaultGitOp::Add { vault_dir, path } => (
+            vault_dir.to_path_buf(),
+            vec!["add".into(), path.to_string_lossy().into_owned()],
+        ),
         VaultGitOp::Pull { vault_dir } => (
             vault_dir.to_path_buf(),
             vec!["pull".into(), "--ff-only".into()],
@@ -196,6 +238,10 @@ fn argv_for(op: &VaultGitOp) -> (PathBuf, Vec<String>) {
         VaultGitOp::AddCommitAll { vault_dir, message } => (
             vault_dir.to_path_buf(),
             vec!["commit".into(), "-a".into(), "-m".into(), message.to_string()],
+        ),
+        VaultGitOp::SoftResetLastCommit { vault_dir } => (
+            vault_dir.to_path_buf(),
+            vec!["reset".into(), "--soft".into(), "HEAD~1".into()],
         ),
         VaultGitOp::Push { vault_dir } => (
             vault_dir.to_path_buf(),
@@ -206,30 +252,50 @@ fn argv_for(op: &VaultGitOp) -> (PathBuf, Vec<String>) {
     (cwd, argv)
 }
 
+/// Runs a git op and returns `(success, stdout_or_stderr)` instead of
+/// `Result` -- some callers (see `write_note_and_push`'s commit step) need
+/// to distinguish "genuinely nothing to commit" (a clean, expected outcome)
+/// from a real failure without losing the raw output to classify it.
+fn run_raw(op: VaultGitOp) -> (bool, String, String) {
+    let (cwd, args) = argv_for(&op);
+    match Command::new("git").current_dir(&cwd).args(&args).output() {
+        Ok(output) => (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ),
+        Err(e) => (false, String::new(), format!("failed to spawn git: {e}")),
+    }
+}
+
 fn run(op: VaultGitOp) -> Result<String, ToolError> {
     let (cwd, args) = argv_for(&op);
-    let output = Command::new("git")
-        .current_dir(&cwd)
-        .args(&args)
-        .output()
-        .map_err(|e| ToolError::Execution(format!("failed to spawn git: {e}")))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    let (ok, stdout, stderr) = run_raw(op);
+    if ok {
+        Ok(stdout)
     } else {
-        Err(ToolError::Execution(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )))
+        Err(ToolError::Execution(format!("git {} (in {}) failed: {}", args.join(" "), cwd.display(), stderr.trim())))
     }
 }
 
 /// Write `content` to `path` within an already-cloned vault working
-/// directory (creating parent directories as needed), then `git add -A`
-/// implicitly via `commit -a` is NOT sufficient for a brand-new untracked
-/// file -- `git add` the specific path explicitly first, then commit, then
-/// pull (fast-forward only, never a merge commit) before push, and finally
-/// push. Never force-pushes (structurally, see [`VaultGitOp`]).
+/// directory (creating parent directories as needed), add, commit, pull
+/// (fast-forward only), then push. Never force-pushes (structurally, see
+/// [`VaultGitOp`]).
+///
+/// ## Failure recovery (cycle 1 review finding)
+/// If `push` fails after a local commit was made (e.g. a concurrent Scribe
+/// run won the race and pushed first), the local commit is soft-reset
+/// (changes kept staged, commit undone) before returning the error -- so
+/// the working copy is left retry-friendly rather than wedged behind an
+/// orphaned local commit that would make every subsequent `--ff-only` pull
+/// fail forever.
+///
+/// ## "Nothing to commit" (cycle 1 review finding)
+/// If `content` is byte-identical to what's already committed (Scribe
+/// re-run against unchanged source), `git commit` reports "nothing to
+/// commit" -- this is treated as a clean, successful no-op (no error), not
+/// a failure, since the vault already reflects the desired state.
 pub fn write_note_and_push(
     vault_dir: &Path,
     note_path: &Path,
@@ -240,34 +306,108 @@ pub fn write_note_and_push(
         std::fs::create_dir_all(parent)
             .map_err(|e| ToolError::Execution(format!("failed to create {}: {e}", parent.display())))?;
     }
+
+    // If the file already exists with byte-identical content, there is
+    // nothing to do -- short-circuit before ever touching git, so a
+    // no-change re-run never even attempts add/commit/push.
+    if std::fs::read(note_path).ok().as_deref() == Some(content.as_bytes()) {
+        return Ok(());
+    }
+
     std::fs::write(note_path, content)
         .map_err(|e| ToolError::Execution(format!("failed to write {}: {e}", note_path.display())))?;
 
     // `git add <path>` explicitly -- a brand-new file has no index entry yet
     // for `commit -a` (which only stages already-tracked modifications) to
-    // pick up.
-    let add_output = Command::new("git")
-        .current_dir(vault_dir)
-        .args(["add", &note_path.to_string_lossy()])
-        .output()
-        .map_err(|e| ToolError::Execution(format!("failed to spawn git add: {e}")))?;
-    if !add_output.status.success() {
-        return Err(ToolError::Execution(format!(
-            "git add failed: {}",
-            String::from_utf8_lossy(&add_output.stderr).trim()
-        )));
-    }
+    // pick up. Routed through VaultGitOp/argv_for like every other
+    // invocation here (cycle 1 review finding: this previously bypassed the
+    // closed-enum guardrail via a raw Command call).
+    run(VaultGitOp::Add { vault_dir, path: note_path })?;
 
-    run(VaultGitOp::AddCommitAll { vault_dir, message: commit_message })?;
+    let (committed, _commit_stdout, commit_stderr) =
+        run_raw(VaultGitOp::AddCommitAll { vault_dir, message: commit_message });
+    if !committed {
+        // "nothing to commit" is a clean no-op (content matched what's
+        // already staged/tracked after the add above, e.g. line-ending
+        // normalization made the write byte-identical after all) -- any
+        // OTHER commit failure is a real error.
+        if commit_stderr.to_lowercase().contains("nothing to commit") {
+            return Ok(());
+        }
+        return Err(ToolError::Execution(format!("git commit failed: {}", commit_stderr.trim())));
+    }
 
     // Pull (fast-forward only) before push, per the spec's edge case:
     // concurrent Scribe runs use normal git conflict handling, never force.
     // A `--ff-only` pull failing (real divergent history) surfaces as a
-    // clean error here rather than being silently forced through.
-    run(VaultGitOp::Pull { vault_dir })?;
-    run(VaultGitOp::Push { vault_dir })?;
+    // clean error here rather than being silently forced through -- the
+    // commit we just made stays local (not lost), ready for a manual or
+    // automated retry after a rebase/merge.
+    if let Err(e) = run(VaultGitOp::Pull { vault_dir }) {
+        return Err(e);
+    }
+
+    if let Err(e) = run(VaultGitOp::Push { vault_dir }) {
+        // Recover the working copy: undo our local commit (keeping changes
+        // staged) so the NEXT attempt starts from a clean, retry-able state
+        // instead of being wedged behind a commit that can never
+        // fast-forward-pull again.
+        let _ = run(VaultGitOp::SoftResetLastCommit { vault_dir });
+        return Err(e);
+    }
 
     Ok(())
+}
+
+/// Test-only helper (cycle 1 review finding: this ~30-line local-bare-repo
+/// setup was duplicated near-verbatim in this module's own tests AND in
+/// `scribe::mod::tests`'s end-to-end `scribe_build_diary_entry` test --
+/// factored out here, `pub(crate)` so both test modules share one copy).
+///
+/// Sets up a bare repo (standing in for the real Gitea vault remote) plus a
+/// working-copy clone with an initial commit already pushed to `main`,
+/// upstream tracking configured, and the bare repo's own HEAD symref fixed
+/// to point at `main` (a fresh bare repo's HEAD defaults to whatever
+/// `init.defaultBranch` is, typically "master", which never gets a branch
+/// pushed to it in this setup -- without fixing this, a later `git clone`
+/// warns "remote HEAD refers to nonexistent ref" and checks out nothing).
+/// Returns `(bare_remote_path, working_copy_path)`.
+#[cfg(test)]
+pub(crate) fn test_setup_bare_vault(base: &Path) -> (PathBuf, PathBuf) {
+    fn run_git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn git {args:?} in {}: {e}", dir.display()));
+        assert!(
+            output.status.success(),
+            "git {args:?} in {} failed: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let bare_remote = base.join("remote.git");
+    let working_copy = base.join("working");
+    std::fs::create_dir_all(&bare_remote).unwrap();
+    run_git(&bare_remote, &["init", "--bare", "-q"]);
+    run_git(base, &["clone", "-q", bare_remote.to_str().unwrap(), working_copy.to_str().unwrap()]);
+    // Force the local branch to be named "main" regardless of this
+    // environment's `init.defaultBranch` (git's compiled-in default is
+    // "master", not "main"), so the push/upstream refspecs below are
+    // unambiguous.
+    run_git(&working_copy, &["checkout", "-q", "-B", "main"]);
+    std::fs::write(working_copy.join("README.md"), "# Scribe Vault\n").unwrap();
+    run_git(&working_copy, &["config", "user.email", "<email>"]); // pii-test-fixture
+    run_git(&working_copy, &["config", "user.name", "Scribe"]);
+    run_git(&working_copy, &["add", "README.md"]);
+    run_git(&working_copy, &["commit", "-q", "-m", "init"]);
+    run_git(&working_copy, &["push", "-q", "origin", "HEAD:main"]);
+    run_git(&working_copy, &["branch", "-q", "--set-upstream-to=origin/main", "main"]);
+    run_git(&bare_remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+    (bare_remote, working_copy)
 }
 
 #[cfg(test)]
@@ -291,6 +431,33 @@ mod tests {
         let slug = slugify("../../etc/passwd");
         assert!(!slug.contains(".."));
         assert!(!slug.contains('/'));
+    }
+
+    #[test]
+    fn slugify_never_returns_empty_even_for_all_non_ascii_input() {
+        // Cycle 1 review finding: pure non-ASCII input (no ASCII
+        // alphanumerics at all) previously produced an empty string, and
+        // note_path() would then build a collision-prone path like
+        // `modules//README.md` (every such module colliding on the same
+        // path). A deterministic fallback slug must be non-empty instead.
+        let cyrillic = slugify("Модуль");
+        let emoji = slugify("🎉🎊");
+        assert!(!cyrillic.is_empty());
+        assert!(!emoji.is_empty());
+        // Different inputs still produce different fallback slugs.
+        assert_ne!(cyrillic, emoji);
+        // The fallback is stable across repeated calls (deterministic, not
+        // e.g. time- or randomness-based).
+        assert_eq!(slugify("Модуль"), cyrillic);
+    }
+
+    #[test]
+    fn note_path_never_collides_for_distinct_all_non_ascii_modules() {
+        let root = Path::new("/vault");
+        let p1 = note_path(root, NoteType::Readme, "Модуль", "ignored");
+        let p2 = note_path(root, NoteType::Readme, "モジュール", "ignored");
+        assert_ne!(p1, p2, "distinct non-ASCII module names must not collide on the same path");
+        assert!(!p1.to_string_lossy().contains("//"), "must never produce an empty path segment");
     }
 
     #[test]
@@ -341,6 +508,38 @@ mod tests {
         };
         let note = render_note(&fm, "body", &[]);
         assert!(note.contains("title: \"A \\\"quoted\\\" title\""));
+    }
+
+    #[test]
+    fn render_note_frontmatter_escapes_embedded_newlines_and_control_chars() {
+        // Cycle 1 review finding: an embedded literal newline (not stripped
+        // by .trim(), which only strips leading/trailing whitespace) must
+        // not land unescaped inside the quoted YAML scalar -- it would
+        // change how a parser folds the value, or in the worst case let a
+        // crafted title inject additional-looking frontmatter lines.
+        let fm = NoteFrontmatter {
+            title: "line one\nmodule: fake\ntype: blog".to_string(),
+            module: "x".to_string(),
+            generated_at: "2026-07-07T00:00:00Z".to_string(), // pii-test-fixture
+            source_commit: "abc".to_string(),
+            note_type: NoteType::Wiki,
+        };
+        let note = render_note(&fm, "body", &[]);
+        // The whole title, newlines included, must appear as ONE escaped
+        // scalar on the `title:` line -- not as literal newlines that would
+        // start what looks like new frontmatter keys.
+        let title_line = note.lines().find(|l| l.starts_with("title:")).expect("a title: line");
+        assert!(title_line.contains("\\n"), "expected an escaped \\n, got: {title_line}");
+        // The injected-looking content is present only as escaped text
+        // WITHIN the title's quoted scalar, never as a separate real line
+        // of its own (which is what an actual injection would produce).
+        assert!(
+            !note.lines().any(|l| l == "module: fake"),
+            "embedded newline must never produce a standalone 'module: fake' line"
+        );
+        // Only one frontmatter `type:` line exists, and it's the real one.
+        assert_eq!(note.lines().filter(|l| l.starts_with("type:")).count(), 1);
+        assert!(note.lines().any(|l| l == "type: wiki"));
     }
 
     #[test]
@@ -424,41 +623,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
 
-        let bare_remote = base.join("remote.git");
-        let working_copy = base.join("working");
+        let (bare_remote, working_copy) = test_setup_bare_vault(&base);
         let fresh_clone = base.join("fresh-clone");
-
-        // A bare repo stands in for the Gitea vault remote.
-        std::fs::create_dir_all(&bare_remote).unwrap();
-        run_git(&bare_remote, &["init", "--bare", "-q"]);
-
-        // Clone it as the working copy Scribe writes into (mirrors "vault
-        // repo doesn't exist yet" being out of scope here -- SCRB-05 assumes
-        // an already-cloned working copy, per vault.rs's module doc comment;
-        // an empty bare repo has no commits/branch yet, so this test seeds
-        // one initial commit exactly as a real first-time vault setup would).
-        run_git(&base, &["clone", "-q", bare_remote.to_str().unwrap(), working_copy.to_str().unwrap()]);
-        // Force the local branch to be named "main" regardless of this
-        // environment's `init.defaultBranch` (git's compiled-in default is
-        // "master", not "main"), so the push/upstream refspecs below are
-        // unambiguous.
-        run_git(&working_copy, &["checkout", "-q", "-B", "main"]);
-        std::fs::write(working_copy.join("README.md"), "# Scribe Vault\n").unwrap();
-        run_git(&working_copy, &["add", "README.md"]);
-        run_git(&working_copy, &["-c", "user.email=<email>", "-c", "user.name=Scribe", "commit", "-q", "-m", "init"]);  // pii-test-fixture
-        run_git(&working_copy, &["push", "-q", "origin", "HEAD:main"]);
-        // Set the working copy's branch to track origin/main so a plain
-        // `git pull`/`git push` (no refspec) -- exactly what
-        // `write_note_and_push` runs -- resolves unambiguously.
-        run_git(&working_copy, &["branch", "-q", "--set-upstream-to=origin/main", "main"]);
-        // The bare repo's own HEAD symref still points at whatever
-        // `init.defaultBranch` was at `git init --bare` time (typically
-        // "master"), which never got a branch pushed to it -- without
-        // fixing this, a later `git clone` of the bare repo warns "remote
-        // HEAD refers to nonexistent ref" and checks out nothing, even
-        // though the "main" branch and its commits are genuinely present.
-        // A real first-time vault setup would do the same repair.
-        run_git(&bare_remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 
         let fm = NoteFrontmatter {
             title: "Sundry".to_string(),
@@ -469,12 +635,8 @@ mod tests {
         };
         let content = render_note(&fm, "Sundry tools live here.", &[]);
         let note_path_in_vault = note_path(&working_copy, NoteType::Readme, "sundry", "ignored");
-
-        // write_note_and_push needs a committer identity -- set it on the
-        // working copy before calling (production deploys configure this
-        // once; a test harness does the same).
-        run_git(&working_copy, &["config", "user.email", "<email>"]);  // pii-test-fixture
-        run_git(&working_copy, &["config", "user.name", "Scribe"]);
+        // test_setup_bare_vault already configured a committer identity on
+        // the working copy.
 
         write_note_and_push(
             &working_copy,
@@ -503,20 +665,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
 
-        let bare_remote = base.join("remote.git");
-        let working_copy = base.join("working");
-        std::fs::create_dir_all(&bare_remote).unwrap();
-        run_git(&bare_remote, &["init", "--bare", "-q"]);
-        run_git(&base, &["clone", "-q", bare_remote.to_str().unwrap(), working_copy.to_str().unwrap()]);
-        run_git(&working_copy, &["checkout", "-q", "-B", "main"]);
-        std::fs::write(working_copy.join("README.md"), "# Vault\n").unwrap();
-        run_git(&working_copy, &["config", "user.email", "<email>"]);  // pii-test-fixture
-        run_git(&working_copy, &["config", "user.name", "Scribe"]);
-        run_git(&working_copy, &["add", "README.md"]);
-        run_git(&working_copy, &["commit", "-q", "-m", "init"]);
-        run_git(&working_copy, &["push", "-q", "origin", "HEAD:main"]);
-        run_git(&working_copy, &["branch", "-q", "--set-upstream-to=origin/main", "main"]);
-        run_git(&bare_remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        let (_bare_remote, working_copy) = test_setup_bare_vault(&base);
 
         let nested_path = working_copy.join("build-diaries/2026-07-07-s91.md");  // pii-test-fixture
         assert!(!nested_path.parent().unwrap().exists());
@@ -533,6 +682,64 @@ mod tests {
         write_note_and_push(&working_copy, &nested_path, &content, "scribe: diary entry")
             .expect("should create build-diaries/ and succeed");
         assert!(nested_path.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn write_note_and_push_against_a_non_repo_dir_is_a_clean_error_not_panic() {
+        // Direct test of write_note_and_push's own defense (cycle 1 review
+        // finding: previously relied entirely on the caller's separate
+        // `.git`-existence check in mod.rs; this confirms the function
+        // itself degrades cleanly -- via git's own "not a git repository"
+        // error -- when called directly against a non-repo path.
+        let dir = std::env::temp_dir().join(format!("scribe-vault-test-nonrepo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let fm = NoteFrontmatter {
+            title: "X".to_string(),
+            module: "x".to_string(),
+            generated_at: "2026-07-07T00:00:00Z".to_string(), // pii-test-fixture
+            source_commit: "n/a".to_string(),
+            note_type: NoteType::BuildDiary,
+        };
+        let content = render_note(&fm, "body", &[]);
+        let note_path_in_dir = dir.join("build-diaries/x.md");
+
+        let result = write_note_and_push(&dir, &note_path_in_dir, &content, "scribe: test");
+        assert!(matches!(result, Err(ToolError::Execution(_))));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_note_and_push_is_a_clean_noop_when_content_is_unchanged() {
+        // Cycle 1 review finding: re-running Scribe against unchanged
+        // source (byte-identical content) must be a clean success, not a
+        // confusing "nothing to commit" Execution error.
+        let base = std::env::temp_dir().join(format!("scribe-vault-test-noop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let (_bare_remote, working_copy) = test_setup_bare_vault(&base);
+
+        let fm = NoteFrontmatter {
+            title: "Sundry".to_string(),
+            module: "sundry".to_string(),
+            generated_at: "2026-07-07T00:00:00Z".to_string(), // pii-test-fixture
+            source_commit: "abc".to_string(),
+            note_type: NoteType::Readme,
+        };
+        let content = render_note(&fm, "Sundry tools.", &[]);
+        let note_path_in_vault = note_path(&working_copy, NoteType::Readme, "sundry", "ignored");
+
+        write_note_and_push(&working_copy, &note_path_in_vault, &content, "scribe: first write")
+            .expect("first write should succeed");
+
+        // Second call with IDENTICAL content -- must be a clean no-op, not
+        // an error.
+        write_note_and_push(&working_copy, &note_path_in_vault, &content, "scribe: second write")
+            .expect("re-running with unchanged content should be a clean no-op");
 
         let _ = std::fs::remove_dir_all(&base);
     }
