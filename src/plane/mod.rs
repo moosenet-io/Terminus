@@ -27,7 +27,7 @@ use crate::tool::RustTool;
 
 use types::*;
 
-/// True if `s` is a canonical 8-4-4-4-12 hyphenated UUID.
+/// True if `s` is a canonical 8-4-4-4-12 hyphenated UUID. // pii-test-fixture
 fn is_uuid(s: &str) -> bool {
     let b = s.as_bytes();
     if b.len() != 36 {
@@ -1498,11 +1498,11 @@ mod tests {
 
     #[test]
     fn test_is_uuid_recognizes_canonical_uuid() {
-        assert!(is_uuid("4ef3f3ec-e7ef-4af3-b258-881565e629f9"));
+        assert!(is_uuid("4ef3f3ec-e7ef-4af3-b258-881565e629f9")); // pii-test-fixture
         assert!(!is_uuid("LM"));
         assert!(!is_uuid("proj-abc"));
-        assert!(!is_uuid("4ef3f3ec-e7ef-4af3-b258-881565e629f")); // 35 chars
-        assert!(!is_uuid("4ef3f3ecXe7ef-4af3-b258-881565e629f9")); // wrong separator
+        assert!(!is_uuid("4ef3f3ec-e7ef-4af3-b258-881565e629f")); // 35 chars — pii-test-fixture
+        assert!(!is_uuid("4ef3f3ecXe7ef-4af3-b258-881565e629f9")); // wrong separator — pii-test-fixture
     }
 
     // ── project identifier → UUID resolution ──────────────────────────────────

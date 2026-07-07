@@ -233,7 +233,7 @@ mod tests {
         );
         for var in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
             let idx = args.iter().position(|a| a == var).unwrap_or_else(|| panic!("expected {var} to be set"));
-            assert_eq!(args[idx + 1], "http://127.0.0.1:54321", "wrong value for {var}");
+            assert_eq!(args[idx + 1], "http://127.0.0.1:54321", "wrong value for {var}"); // pii-test-fixture
         }
         for var in ["NO_PROXY", "no_proxy"] {
             let idx = args.iter().position(|a| a == var).unwrap_or_else(|| panic!("expected {var} to be set"));

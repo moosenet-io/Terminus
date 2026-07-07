@@ -1,6 +1,6 @@
 //! Prometheus tools — read-only PromQL queries against a LAN Prometheus server.
 //!
-//! Mirrors the Python prometheus_tools.py on <host> exactly. Six tools:
+//! Mirrors the Python prometheus_tools.py on the fleet host exactly. Six tools:
 //!   prometheus_status         — health check + target summary
 //!   prometheus_query          — arbitrary PromQL instant query
 //!   prometheus_query_range    — PromQL range query over a time window
@@ -731,9 +731,9 @@ mod tests {
                 "resultType": "vector",
                 "result": [
                     { "metric": { "__name__": "up", "instance": "node1", "job": "node" },
-                      "value": [1717000000.0, "1"] },
+                      "value": [1717000000.0, "1"] }, // pii-test-fixture
                     { "metric": { "instance": "node2", "job": "node" },
-                      "value": [1717000000.0, "0"] }
+                      "value": [1717000000.0, "0"] } // pii-test-fixture
                 ]
             }
         });

@@ -1,11 +1,12 @@
 //! Local JSON-file persistence for the SIMULATED Meridian paper-trading
 //! portfolio.
 //!
-//! <host>'s Python `meridian_tools.py` SSH'd to <host> and shelled out to
-//! `<path>/meridian/meridian.py`. That directory never existed on
-//! <host> (verified live: every real call returned an SSH/shell error, and a
-//! filesystem search of <host> turned up no `meridian.py` or `market_data.py`
-//! anywhere) — there is no prior persistence design to port faithfully. This
+//! The fleet host's Python `meridian_tools.py` SSH'd to the agent-fleet
+//! container and shelled out to the fleet's `meridian/meridian.py`. That path
+//! never existed on the agent-fleet container (verified live: every real call
+//! returned an SSH/shell error, and a filesystem search of the agent-fleet
+//! container turned up no `meridian.py` or `market_data.py` anywhere) — there
+//! is no prior persistence design to port faithfully. This
 //! module is a new, from-scratch design: a single whole-document JSON file
 //! (one portfolio, id `"default"`), guarded by an in-process mutex and
 //! written atomically (temp file + rename) so a reset can never be observed

@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::error::ToolError;
 
 /// A Rust tool implementation that can be registered in the ToolRegistry
-/// and used as a fallback when the <host> MCP backend is unavailable.
+/// and used as a fallback when the fleet-host MCP backend is unavailable.
 ///
 /// ## Contract
 /// - `name()` must be stable across restarts — it is the dispatch key

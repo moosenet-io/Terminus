@@ -1,16 +1,16 @@
 //! Cortex tools — code-graph / blast-radius / risk-scoring system, ported
-//! from the Python `cortex_tools.py` on <host> (ai-terminus,
-//! the <host> host's MCP endpoint).
+//! from the Python `cortex_tools.py` on the source host (the legacy Python
+//! MCP host, the source host's MCP endpoint).
 //!
 //! ## Verified transport (IMPORTANT — read before touching this module)
 //!
-//! Every `cortex_*` tool was called live against <host>'s MCP endpoint before
+//! Every `cortex_*` tool was called live against the source host's MCP endpoint before
 //! writing this port (`tools/list` for exact names/descriptions/schemas, then
 //! `tools/call` for each of the 10 tools against real args — `repo:
 //! "lumina-terminus"` for the graph-shaped tools, and
 //! `https://github.com/octocat/Hello-World` — a tiny, well-known, harmless
-//! public repo — for `cortex_audit`). The fleet host (the fleet host, <host>,
-//! same host `crucible`/`sentinel`/`vigil` already documented as SSH-exec
+//! public repo — for `cortex_audit`). The fleet host (the same host
+//! `crucible`/`sentinel`/`vigil` already documented as SSH-exec
 //! targets in this crate) was unreachable for the entire porting session, so
 //! every one of the 10 tools failed. The failure shapes are decisive and
 //! come in two flavors:
@@ -34,7 +34,7 @@
 //! cortex_flows        -> {"repo":"lumina-terminus","entry_point":"main","stats":{"error":"ssh: ..."},"note":"Flow tracing uses graph FTS — search for entry_point in graph for full call chain"}
 //! ```
 //! This is the same *decisive* evidence crucible's port relied on: **Cortex
-//! does not build or query the code graph locally in <host>'s Python process.
+//! does not build or query the code graph locally in the source host's Python process.
 //! It SSHes into the fleet host and runs a script there** — exactly the
 //! `sentinel`/`vigil`/`crucible` pattern, not a local graph engine, not an
 //! HTTP client, and (critically for `cortex_audit`) not a local `git clone`
@@ -46,12 +46,12 @@
 //!
 //! ## What this means for graph persistence / community detection
 //!
-//! The task brief asked me to determine "how <host> persists the code graph"
+//! The task brief asked me to determine "how the source host persists the code graph"
 //! and whether community detection uses a real algorithm (Louvain or
 //! similar) vs. something simpler, and to reach for a Rust graph/community
 //! crate only if warranted. Given the verified transport above, **the graph
 //! is built, persisted, and queried entirely on the fleet host — never in
-//! this Rust process, exactly as it is never in <host>'s Python process
+//! this Rust process, exactly as it is never in the source host's Python process
 //! either.** There is no local graph data structure to design, no
 //! persistence format to choose, and no community-detection algorithm to
 //! implement or select a crate for: this crate does not have the graph, the
@@ -80,9 +80,9 @@
 //!   `entry_point`, `note`).
 //!
 //! NOT verified (the fleet host was unreachable for the whole porting
-//! session, and <host> itself has no SSH reachable from this dev box; Gitea
+//! session, and the source host itself has no SSH reachable from this dev box; Gitea
 //! search for a `cortex`-named repo/module also returned nothing):
-//! - The exact remote script path/invocation <host> uses per tool.
+//! - The exact remote script path/invocation the source host uses per tool.
 //! - The exact JSON shape of a *successful* response for any of the 10
 //!   tools (Flavor A tools reveal nothing about their success shape; Flavor
 //!   B tools reveal only their *outer* shape, not what a populated `stats`
@@ -153,7 +153,7 @@
 //! no local sandbox directory, no local cleanup path, and therefore nothing
 //! in this crate that can be *this port's* isolation guarantee for the
 //! clone step, because the clone does not happen in this process, exactly
-//! as it does not happen in <host>'s Python process either. The operator's
+//! as it does not happen in the source host's Python process either. The operator's
 //! brief specifically asked for "a git clone into an isolated temp dir that
 //! gets cleaned up after" as the expected shape — **that is not what the
 //! live system does**; it delegates the entire operation to a remote script
@@ -181,7 +181,7 @@
 //!   resolver that runs project code) — again, unobservable from here.
 //!
 //! **Recommendation to the operator:** audit the fleet-host `cortex` script
-//! directly (path assumed `<path>/cortex/ops.py`, unverified) for
+//! directly (path assumed to be the fleet host's `cortex/ops.py`, unverified) for
 //! actual sandbox isolation and guaranteed cleanup before treating
 //! `cortex_audit` as safe to run against arbitrary operator-supplied URLs in
 //! production. This Rust port is, at best, as safe as that remote script —
@@ -213,13 +213,6 @@ use audit::validate_repo_url;
 const KNOWN_REPOS: &[&str] = &["lumina-fleet", "lumina-terminus"];
 const MAX_TEXT_LEN: usize = 2000;
 
-/// Assumed remote invocation shape, mirroring `sentinel::DEFAULT_SCRIPT` /
-/// `crucible::DEFAULT_SCRIPT`'s one-script-many-subcommands convention.
-/// **Not observed on the wire** — the fleet host was unreachable for the
-/// whole porting session. Audit against the real <host> source before relying
-/// on this in production.
-const DEFAULT_SCRIPT: &str = "/usr/bin/python3 <path>/cortex/ops.py";
-
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -229,7 +222,10 @@ pub struct CortexConfig {
     pub ssh_host: Option<String>,
     pub ssh_user: String,
     pub ssh_key_path: Option<String>,
-    pub script: String,
+    /// Remote script invocation — from `CORTEX_SCRIPT`. No compiled-in
+    /// default (PII remediation 2026-07): required at runtime, see
+    /// [`CortexConfig::require_script`].
+    pub script: Option<String>,
 }
 
 impl CortexConfig {
@@ -240,10 +236,7 @@ impl CortexConfig {
             ssh_key_path: env::var("CORTEX_SSH_KEY_PATH")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            script: env::var("CORTEX_SCRIPT")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DEFAULT_SCRIPT.into()),
+            script: env::var("CORTEX_SCRIPT").ok().filter(|s| !s.is_empty()),
         }
     }
 
@@ -257,6 +250,14 @@ impl CortexConfig {
         self.ssh_key_path
             .as_deref()
             .ok_or_else(|| ToolError::NotConfigured("CORTEX_SSH_KEY_PATH is not set".into()))
+    }
+
+    /// PII remediation (2026-07): `CORTEX_SCRIPT` no longer has a
+    /// compiled-in fleet-host script path fallback.
+    fn require_script(&self) -> Result<&str, ToolError> {
+        self.script
+            .as_deref()
+            .ok_or_else(|| ToolError::NotConfigured("CORTEX_SCRIPT is not set".into()))
     }
 }
 
@@ -406,7 +407,8 @@ async fn run_subcommand(
     timeout_secs: u64,
 ) -> Result<String, ToolError> {
     let cfg = Arc::clone(config);
-    let command = build_command(&cfg.script, subcommand, &payload);
+    let script = cfg.require_script()?.to_string();
+    let command = build_command(&script, subcommand, &payload);
     let output = tokio::task::spawn_blocking(move || ssh_exec(&cfg, &command, timeout_secs))
         .await
         .map_err(|e| ToolError::Execution(format!("Task join error: {e}")))??;
@@ -424,7 +426,7 @@ async fn run_subcommand(
 ///
 /// A `NotConfigured` error (missing `CORTEX_SSH_HOST`/`CORTEX_SSH_KEY_PATH`)
 /// is deliberately **not** degraded here — that's a local deployment
-/// misconfiguration, not something the live <host>/fleet-host pair would ever
+/// misconfiguration, not something the live source-host/fleet-host pair would ever
 /// actually experience in production (they're always configured), so
 /// masking it behind a degrade shape that looks like a mostly-empty-but-
 /// valid response would hide an operator setup mistake rather than surface
@@ -437,7 +439,8 @@ async fn run_subcommand_degrading(
     on_degrade: impl FnOnce(String) -> Value,
 ) -> Result<String, ToolError> {
     let cfg = Arc::clone(config);
-    let command = build_command(&cfg.script, subcommand, &payload);
+    let script = cfg.require_script()?.to_string();
+    let command = build_command(&script, subcommand, &payload);
     let result = tokio::task::spawn_blocking(move || ssh_exec(&cfg, &command, timeout_secs))
         .await
         .map_err(|e| ToolError::Execution(format!("Task join error: {e}")))?;
@@ -958,12 +961,16 @@ pub fn register(registry: &mut ToolRegistry) {
 mod tests {
     use super::*;
 
+    /// Test-fixture value standing in for `CORTEX_SCRIPT`, which has no
+    /// compiled-in default (PII remediation 2026-07).
+    const TEST_SCRIPT: &str = "/opt/test-fixture/cortex/ops.py";
+
     fn test_config() -> Arc<CortexConfig> {
         Arc::new(CortexConfig {
             ssh_host: None,
             ssh_user: "root".into(),
             ssh_key_path: None,
-            script: DEFAULT_SCRIPT.into(),
+            script: Some(TEST_SCRIPT.into()),
         })
     }
 
@@ -1126,7 +1133,7 @@ mod tests {
     async fn test_audit_rejects_ssh_scheme_url() {
         let tool = CortexAudit { config: test_config() };
         let err = tool
-            .execute(json!({"url": "ssh://<email>/owner/repo"}))
+            .execute(json!({"url": "ssh://<email>/owner/repo"})) // pii-test-fixture
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
@@ -1171,11 +1178,32 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_stats_not_configured_without_script() {
+        // PII remediation (2026-07): CORTEX_SCRIPT has no compiled-in
+        // default — missing it must fail clean with NotConfigured.
+        let cfg = Arc::new(CortexConfig {
+            ssh_host: Some("127.0.0.1".into()),
+            ssh_user: "root".into(),
+            ssh_key_path: Some("/tmp/nonexistent-key".into()),
+            script: None,
+        });
+        let tool = CortexStats { config: cfg };
+        let err = tool
+            .execute(json!({"repo": "lumina-terminus"}))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::NotConfigured(msg) => assert!(msg.contains("CORTEX_SCRIPT")),
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
+    }
+
     // --- Flavor-B degrade shape: verified-live-shape reproduction ------------
     // These exercise `run_subcommand_degrading`'s fallback branch directly by
     // driving it through a tool whose backend is unreachable (no SSH host
     // configured), proving the degrade JSON matches the exact shape observed
-    // live against <host>.
+    // live against the source host.
 
     #[tokio::test]
     async fn test_architecture_degrades_to_verified_shape_when_unreachable() {
@@ -1202,7 +1230,7 @@ mod tests {
             ssh_host: Some("127.0.0.1".into()),
             ssh_user: "root".into(),
             ssh_key_path: Some("/nonexistent/cortex-test-key".into()),
-            script: DEFAULT_SCRIPT.into(),
+            script: Some(TEST_SCRIPT.into()),
         })
     }
 
@@ -1279,7 +1307,7 @@ mod tests {
             ssh_host: Some("127.0.0.1".into()),
             ssh_user: "root".into(),
             ssh_key_path: Some("/tmp/nonexistent-key".into()),
-            script: DEFAULT_SCRIPT.into(),
+            script: Some(TEST_SCRIPT.into()),
         };
         let msg = match ssh_exec(&cfg, "true", 2).expect_err("unroutable host must error") {
             ToolError::Execution(m) => m,

@@ -1,9 +1,10 @@
 //! The 5 `meridian_*` MCP tools — SIMULATED paper-trading sandbox.
 //!
-//! Ported from <host>'s `meridian_tools.py`, which SSH'd to <host> and shelled
-//! out to a `meridian.py` there. That backend does not exist (verified live
-//! against the running <host> MCP server — every call returned an SSH/shell
-//! error — and a filesystem search of <host> found no `meridian.py` or
+//! Ported from the fleet host's `meridian_tools.py`, which SSH'd to the
+//! agent-fleet container and shelled out to a `meridian.py` there. That backend
+//! does not exist (verified live against the running fleet-host MCP server —
+//! every call returned an SSH/shell error — and a filesystem search of the
+//! agent-fleet container found no `meridian.py` or
 //! `market_data.py` anywhere). This is a from-scratch re-implementation that
 //! honors the 5 tools' documented contracts (see each tool's `description()`,
 //! copied near-verbatim from the Python originals' docstrings) using this

@@ -1,8 +1,8 @@
-//! Synapse tools — ported from the Python `synapse_tools.py` on <host>.
+//! Synapse tools — ported from the Python `synapse_tools.py` on the fleet host.
 //!
 //! Synapse is a fleet-host process that watches for proactive-message
 //! candidates ("Pulse") and gates them against config (enabled/strength/
-//! quiet hours) before sending. Confirmed live against <host> via
+//! quiet hours) before sending. Confirmed live against the fleet host via
 //! `tools/call`:
 //!   - `synapse_status` returned instantly and successfully even while the
 //!     fleet host was unreachable — text: `"Synapse: DISABLED\nStrength:
@@ -16,7 +16,7 @@
 //!   - `synapse_mute` (hours=1, and also tried with hours=0 and hours=100)
 //!     returned `"[synapse_mute] Failed: ssh: connect to host <fleet-host>
 //!     port 22: No route to host"` in all three cases — the fleet host was
-//!     unreachable from <host> at test time, so we could not observe a
+//!     unreachable from the test host at test time, so we could not observe a
 //!     success-path response or confirm whether the documented 1-72 hour
 //!     bound is enforced client-side (in the Python tool) or only in the
 //!     remote script. **This port enforces the bound before attempting the
@@ -46,9 +46,9 @@
 //!   SYNAPSE_SSH_KEY_PATH  — path to the SSH private key file.
 //!   SYNAPSE_SCRIPT        — remote synapse script, default mirrors the Python.
 //!   SYNAPSE_CONFIG_PATH   — local config file path (YAML), default
-//!                           "<path>/synapse/config.yaml".
+//!                           a config file under the fleet host's Synapse directory.
 //!   SYNAPSE_LOG_PATH      — local log file path (last-sent marker source),
-//!                           default "<path>/synapse/pulse.log".
+//!                           default a log file under the fleet host's Synapse directory.
 //!
 //! ## Security model
 //! - `hours` is validated to the documented 1-72 range before it is ever
@@ -74,9 +74,6 @@ use crate::tool::RustTool;
 // Constants
 // ---------------------------------------------------------------------------
 
-const DEFAULT_SCRIPT: &str = "/usr/bin/python3 <path>/synapse/synapse.py";
-const DEFAULT_CONFIG_PATH: &str = "<path>/synapse/config.yaml";
-const DEFAULT_LOG_PATH: &str = "<path>/synapse/pulse.log";
 const MIN_MUTE_HOURS: u64 = 1;
 const MAX_MUTE_HOURS: u64 = 72;
 const DEFAULT_MUTE_HOURS: u64 = 4;
@@ -94,12 +91,15 @@ pub struct SynapseConfig {
     pub ssh_user: String,
     /// Path to the SSH private key file — from `SYNAPSE_SSH_KEY_PATH`.
     pub ssh_key_path: Option<String>,
-    /// Remote synapse script invocation — from `SYNAPSE_SCRIPT`.
-    pub script: String,
-    /// Local config file path — from `SYNAPSE_CONFIG_PATH`.
-    pub config_path: String,
-    /// Local log file path — from `SYNAPSE_LOG_PATH`.
-    pub log_path: String,
+    /// Remote synapse script invocation — from `SYNAPSE_SCRIPT`. No
+    /// compiled-in default (PII remediation 2026-07): required at runtime.
+    pub script: Option<String>,
+    /// Local config file path — from `SYNAPSE_CONFIG_PATH`. No compiled-in
+    /// default (PII remediation 2026-07): required at runtime.
+    pub config_path: Option<String>,
+    /// Local log file path — from `SYNAPSE_LOG_PATH`. No compiled-in default
+    /// (PII remediation 2026-07): required at runtime.
+    pub log_path: Option<String>,
 }
 
 impl SynapseConfig {
@@ -108,18 +108,9 @@ impl SynapseConfig {
             ssh_host: env::var("SYNAPSE_SSH_HOST").ok().filter(|s| !s.is_empty()),
             ssh_user: env::var("SYNAPSE_SSH_USER").unwrap_or_else(|_| "root".into()),
             ssh_key_path: env::var("SYNAPSE_SSH_KEY_PATH").ok().filter(|s| !s.is_empty()),
-            script: env::var("SYNAPSE_SCRIPT")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DEFAULT_SCRIPT.into()),
-            config_path: env::var("SYNAPSE_CONFIG_PATH")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DEFAULT_CONFIG_PATH.into()),
-            log_path: env::var("SYNAPSE_LOG_PATH")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DEFAULT_LOG_PATH.into()),
+            script: env::var("SYNAPSE_SCRIPT").ok().filter(|s| !s.is_empty()),
+            config_path: env::var("SYNAPSE_CONFIG_PATH").ok().filter(|s| !s.is_empty()),
+            log_path: env::var("SYNAPSE_LOG_PATH").ok().filter(|s| !s.is_empty()),
         }
     }
 
@@ -133,6 +124,30 @@ impl SynapseConfig {
         self.ssh_key_path
             .as_deref()
             .ok_or_else(|| ToolError::NotConfigured("SYNAPSE_SSH_KEY_PATH is not set".into()))
+    }
+
+    /// PII remediation (2026-07): `SYNAPSE_SCRIPT` no longer has a
+    /// compiled-in fleet-host script path fallback.
+    fn require_script(&self) -> Result<&str, ToolError> {
+        self.script
+            .as_deref()
+            .ok_or_else(|| ToolError::NotConfigured("SYNAPSE_SCRIPT is not set".into()))
+    }
+
+    /// PII remediation (2026-07): `SYNAPSE_CONFIG_PATH` no longer has a
+    /// compiled-in fleet-host config path fallback.
+    fn require_config_path(&self) -> Result<&str, ToolError> {
+        self.config_path
+            .as_deref()
+            .ok_or_else(|| ToolError::NotConfigured("SYNAPSE_CONFIG_PATH is not set".into()))
+    }
+
+    /// PII remediation (2026-07): `SYNAPSE_LOG_PATH` no longer has a
+    /// compiled-in fleet-host log path fallback.
+    fn require_log_path(&self) -> Result<&str, ToolError> {
+        self.log_path
+            .as_deref()
+            .ok_or_else(|| ToolError::NotConfigured("SYNAPSE_LOG_PATH is not set".into()))
     }
 }
 
@@ -164,7 +179,7 @@ fn validate_mute_hours(hours: u64) -> Result<(), ToolError> {
 /// output (`isError: false`) — confirmed live: `"[synapse_trigger DRY
 /// RUN]\nssh: connect to host <fleet-host> port 22: No route to host"`. A
 /// generic `ToolError` here would surface as an MCP-level `isError: true`,
-/// which is NOT what <host> does. So connection/handshake/auth failures are
+/// which is NOT what the live server does. So connection/handshake/auth failures are
 /// folded into `Ok(String)` as an ssh-style message, matching the real
 /// tool's documented and observed payload shape. Only `NotConfigured`
 /// (missing `SYNAPSE_SSH_HOST`/`SYNAPSE_SSH_KEY_PATH`) remains a hard
@@ -364,10 +379,11 @@ impl RustTool for SynapseStatus {
     }
 
     async fn execute(&self, _args: Value) -> Result<String, ToolError> {
-        let cfg = Arc::clone(&self.config);
+        let config_path = self.config.require_config_path()?.to_string();
+        let log_path = self.config.require_log_path()?.to_string();
         let (status_cfg, last_sent) = tokio::task::spawn_blocking(move || {
-            let status_cfg = load_status_config(&cfg.config_path);
-            let last_sent = last_sent_marker(&cfg.log_path);
+            let status_cfg = load_status_config(&config_path);
+            let last_sent = last_sent_marker(&log_path);
             (status_cfg, last_sent)
         })
         .await
@@ -415,7 +431,8 @@ impl RustTool for SynapseTrigger {
         let dry_run = args["dry_run"].as_bool().unwrap_or(true);
 
         let flag = if dry_run { "--dry-run" } else { "--live" };
-        let command = format!("{} trigger {flag}", self.config.script);
+        let script = self.config.require_script()?;
+        let command = format!("{script} trigger {flag}");
 
         let output = run_ssh(Arc::clone(&self.config), command, 60).await?;
 
@@ -462,7 +479,8 @@ impl RustTool for SynapseMute {
         let hours = args["hours"].as_u64().unwrap_or(DEFAULT_MUTE_HOURS);
         validate_mute_hours(hours)?;
 
-        let command = format!("{} mute --hours {hours}", self.config.script);
+        let script = self.config.require_script()?;
+        let command = format!("{script} mute --hours {hours}");
         let output = run_ssh(Arc::clone(&self.config), command, 30).await?;
 
         let lower = output.to_lowercase();
@@ -505,14 +523,18 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Test-fixture value standing in for `SYNAPSE_SCRIPT`, which has no
+    /// compiled-in default (PII remediation 2026-07).
+    const TEST_SCRIPT: &str = "/opt/test-fixture/synapse/synapse.py";
+
     fn test_config() -> Arc<SynapseConfig> {
         Arc::new(SynapseConfig {
             ssh_host: None,
             ssh_user: "root".into(),
             ssh_key_path: None,
-            script: DEFAULT_SCRIPT.into(),
-            config_path: "/nonexistent/path/config.yaml".into(),
-            log_path: "/nonexistent/path/pulse.log".into(),
+            script: Some(TEST_SCRIPT.into()),
+            config_path: Some("/nonexistent/path/config.yaml".into()),
+            log_path: Some("/nonexistent/path/pulse.log".into()),
         })
     }
 
@@ -578,10 +600,10 @@ mod tests {
     fn test_last_sent_marker_returns_last_line() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("pulse.log");
-        fs::write(&path, "2026-07-01T08:00:00Z sent\n2026-07-02T08:00:00Z sent\n").unwrap();
+        fs::write(&path, "2026-07-01T08:00:00Z sent\n2026-07-02T08:00:00Z sent\n").unwrap(); // pii-test-fixture
         assert_eq!(
             last_sent_marker(path.to_str().unwrap()),
-            "2026-07-02T08:00:00Z sent"
+            "2026-07-02T08:00:00Z sent" // pii-test-fixture
         );
     }
 
@@ -661,6 +683,62 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_synapse_trigger_not_configured_without_script() {
+        // PII remediation (2026-07): SYNAPSE_SCRIPT has no compiled-in
+        // default — missing it must fail clean with NotConfigured.
+        let cfg = Arc::new(SynapseConfig {
+            ssh_host: Some("127.0.0.1".into()),
+            ssh_user: "root".into(),
+            ssh_key_path: Some("/nonexistent/key".into()),
+            script: None,
+            config_path: Some("/nonexistent/path/config.yaml".into()),
+            log_path: Some("/nonexistent/path/pulse.log".into()),
+        });
+        let tool = SynapseTrigger { config: cfg };
+        let err = tool.execute(json!({})).await.unwrap_err();
+        match err {
+            ToolError::NotConfigured(msg) => assert!(msg.contains("SYNAPSE_SCRIPT")),
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_synapse_status_not_configured_without_config_path() {
+        let cfg = Arc::new(SynapseConfig {
+            ssh_host: None,
+            ssh_user: "root".into(),
+            ssh_key_path: None,
+            script: Some(TEST_SCRIPT.into()),
+            config_path: None,
+            log_path: Some("/nonexistent/path/pulse.log".into()),
+        });
+        let tool = SynapseStatus { config: cfg };
+        let err = tool.execute(json!({})).await.unwrap_err();
+        match err {
+            ToolError::NotConfigured(msg) => assert!(msg.contains("SYNAPSE_CONFIG_PATH")),
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_synapse_status_not_configured_without_log_path() {
+        let cfg = Arc::new(SynapseConfig {
+            ssh_host: None,
+            ssh_user: "root".into(),
+            ssh_key_path: None,
+            script: Some(TEST_SCRIPT.into()),
+            config_path: Some("/nonexistent/path/config.yaml".into()),
+            log_path: None,
+        });
+        let tool = SynapseStatus { config: cfg };
+        let err = tool.execute(json!({})).await.unwrap_err();
+        match err {
+            ToolError::NotConfigured(msg) => assert!(msg.contains("SYNAPSE_LOG_PATH")),
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
+    }
+
     // --- connection-level SSH failures surface as text, not ToolError ------
     //
     // Regression test for a correctness-review finding: the live Python
@@ -674,9 +752,9 @@ mod tests {
             ssh_host: Some("127.0.0.1".into()),
             ssh_user: "root".into(),
             ssh_key_path: Some("/nonexistent/key".into()),
-            script: DEFAULT_SCRIPT.into(),
-            config_path: "/nonexistent/path/config.yaml".into(),
-            log_path: "/nonexistent/path/pulse.log".into(),
+            script: Some(TEST_SCRIPT.into()),
+            config_path: Some("/nonexistent/path/config.yaml".into()),
+            log_path: Some("/nonexistent/path/pulse.log".into()),
         })
     }
 

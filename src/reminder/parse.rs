@@ -392,7 +392,7 @@ mod tests {
     use super::*;
     use chrono_tz::America::Los_Angeles;
 
-    /// Reference now: 2026-06-12 15:00:00 PDT == 2026-06-12 22:00:00 UTC.
+    /// Reference now: 2026-06-12 15:00:00 PDT == 2026-06-12 22:00:00 UTC. // pii-test-fixture
     /// (PDT = UTC-7 in summer.)
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 6, 12, 22, 0, 0).unwrap()
@@ -496,17 +496,17 @@ mod tests {
     // ── weekday ───────────────────────────────────────────────────────────
     #[test]
     fn next_monday_10am() {
-        // 2026-06-12 is a Friday. Next Monday is 2026-06-15.
+        // 2026-06-12 is a Friday. Next Monday is 2026-06-15. // pii-test-fixture
         assert_eq!(parse("next Monday at 10am"), la_to_utc(2026, 6, 15, 10, 0));
     }
     #[test]
     fn weekday_this_week() {
-        // Saturday is tomorrow (2026-06-13).
+        // Saturday is tomorrow (2026-06-13). // pii-test-fixture
         assert_eq!(parse("saturday at 10am"), la_to_utc(2026, 6, 13, 10, 0));
     }
     #[test]
     fn next_friday_is_a_week_out() {
-        // Today is Friday; "next friday" forces +7 days → 2026-06-19.
+        // Today is Friday; "next friday" forces +7 days → 2026-06-19. // pii-test-fixture
         assert_eq!(parse("next friday at 9am"), la_to_utc(2026, 6, 19, 9, 0));
     }
 

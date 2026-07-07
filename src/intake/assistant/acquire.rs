@@ -35,7 +35,7 @@ use super::{BackendTag, ModelId};
 
 /// Host VRAM ceiling (GB) used for the fit check. Read from `INTAKE_VRAM_CEILING_GB`
 /// via [`vram_ceiling_gb`]; the constant is only the documented default for the
-/// current host class (<host> ~96GB), not an infra literal pinned into logic.
+/// current host class (~96GB in this environment), not an infra literal pinned into logic.
 const DEFAULT_VRAM_CEILING_GB: f64 = 96.0;
 
 /// Host VRAM ceiling in GB for the fit check (from `INTAKE_VRAM_CEILING_GB`,

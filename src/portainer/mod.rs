@@ -1,15 +1,15 @@
-//! <container-mgr> tools — read-only Docker container management queries via the
-//! <container-mgr> API on an internal host (self-signed TLS).
+//! <container-mgr> tools — read-only Docker container management queries via the // pii-test-fixture
+//! <container-mgr> API on an internal host (self-signed TLS). // pii-test-fixture
 //!
-//! Four tools mirroring the Python portainer_tools.py on <host> exactly:
-//!   portainer_status            — <container-mgr> server health and version
+//! Four tools mirroring the Python portainer_tools.py on the MCP hub host exactly:
+//!   portainer_status            — <container-mgr> server health and version // pii-test-fixture
 //!   portainer_list_environments — list managed Docker endpoints
 //!   portainer_list_containers   — list containers in an environment
 //!   portainer_container_logs    — tail logs from a specific container
 //!
 //! Required env vars:
-//!   PORTAINER_URL        — e.g. https://<container-mgr>.example:9443 (self-signed cert)
-//!   PORTAINER_API_TOKEN  — <container-mgr> access token (sent as X-API-Key header)
+//!   PORTAINER_URL        — e.g. https://<container-mgr>.example:9443 (self-signed cert) // pii-test-fixture
+//!   PORTAINER_API_TOKEN  — <container-mgr> access token (sent as X-API-Key header) // pii-test-fixture
 //!
 //! If either is unset, register() registers stub tools that return a clear
 //! NotConfigured error.
@@ -45,7 +45,7 @@ impl PortainerConfig {
         Ok(Self { url, token })
     }
 
-    /// <container-mgr> runs with a self-signed cert on an internal host, so we accept
+    /// <container-mgr> runs with a self-signed cert on an internal host, so we accept // pii-test-fixture
     /// invalid certs for this client only (matches the Python ssl.CERT_NONE).
     fn client() -> Result<reqwest::Client, ToolError> {
         reqwest::Client::builder()
@@ -55,7 +55,7 @@ impl PortainerConfig {
             .map_err(|e| ToolError::Http(e.to_string()))
     }
 
-    /// Authenticated GET against the <container-mgr> API. `path` begins with `/`
+    /// Authenticated GET against the <container-mgr> API. `path` begins with `/` // pii-test-fixture
     /// (e.g. "/status") and is appended after the "/api" prefix.
     async fn api_get(
         &self,
@@ -72,18 +72,18 @@ impl PortainerConfig {
             .send()
             .await
             .map_err(|e| {
-                warn!("<container-mgr>: request to {url} failed: {e}");
-                ToolError::Http("The container service (<container-mgr>) is unreachable.".into())
+                warn!("<container-mgr>: request to {url} failed: {e}"); // pii-test-fixture
+                ToolError::Http("The container service (<container-mgr>) is unreachable.".into()) // pii-test-fixture
             })?;
 
         let status = resp.status();
         let raw = resp.text().await.map_err(|e| {
-            warn!("<container-mgr>: reading response from {url} failed: {e}");
-            ToolError::Http("The container service (<container-mgr>) is unreachable.".into())
+            warn!("<container-mgr>: reading response from {url} failed: {e}"); // pii-test-fixture
+            ToolError::Http("The container service (<container-mgr>) is unreachable.".into()) // pii-test-fixture
         })?;
         if !status.is_success() {
             return Err(ToolError::Http(format!(
-                "<container-mgr> HTTP {status}: {}",
+                "<container-mgr> HTTP {status}: {}", // pii-test-fixture
                 raw.chars().take(200).collect::<String>()
             )));
         }
@@ -254,7 +254,7 @@ impl RustTool for PortainerStatus {
     fn name(&self) -> &str { "portainer_status" }
 
     fn description(&self) -> &str {
-        "Check <container-mgr> server health and version."
+        "Check <container-mgr> server health and version." // pii-test-fixture
     }
 
     fn parameters(&self) -> Value {
@@ -273,8 +273,7 @@ impl RustTool for PortainerListEnvironments {
     fn name(&self) -> &str { "portainer_list_environments" }
 
     fn description(&self) -> &str {
-        "List all Docker environments (endpoints) managed by <container-mgr>. \
-Returns each environment's name, ID, URL, and status."
+        "List all Docker environments (endpoints) managed by <container-mgr>. Returns each environment's name, ID, URL, and status." // pii-test-fixture
     }
 
     fn parameters(&self) -> Value {
@@ -293,16 +292,14 @@ impl RustTool for PortainerListContainers {
     fn name(&self) -> &str { "portainer_list_containers" }
 
     fn description(&self) -> &str {
-        "List Docker containers in a <container-mgr> environment. environment_id is the \
-<container-mgr> endpoint ID (0 = auto-detect the first environment). all_containers \
-(default true) includes stopped containers. Returns name, image, state, status, ports."
+        "List Docker containers in a <container-mgr> environment. environment_id is the <container-mgr> endpoint ID (0 = auto-detect the first environment). all_containers (default true) includes stopped containers. Returns name, image, state, status, ports." // pii-test-fixture
     }
 
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "environment_id": { "type": "integer", "description": "<container-mgr> endpoint ID; 0 = auto-detect first environment (default 0)" },
+                "environment_id": { "type": "integer", "description": "<container-mgr> endpoint ID; 0 = auto-detect first environment (default 0)" }, // pii-test-fixture
                 "all_containers": { "type": "boolean", "description": "Include stopped containers (default true)" }
             }
         })
@@ -330,9 +327,7 @@ impl RustTool for PortainerContainerLogs {
     fn name(&self) -> &str { "portainer_container_logs" }
 
     fn description(&self) -> &str {
-        "Get logs from a Docker container via <container-mgr>. container_id is the \
-container ID or name. environment_id (0 = auto-detect first). tail = number of \
-log lines from the end (default 100)."
+        "Get logs from a Docker container via <container-mgr>. container_id is the container ID or name. environment_id (0 = auto-detect first). tail = number of log lines from the end (default 100)." // pii-test-fixture
     }
 
     fn parameters(&self) -> Value {
@@ -340,7 +335,7 @@ log lines from the end (default 100)."
             "type": "object",
             "properties": {
                 "container_id":   { "type": "string",  "description": "Container ID or name (required)" },
-                "environment_id": { "type": "integer", "description": "<container-mgr> endpoint ID; 0 = auto-detect first (default 0)" },
+                "environment_id": { "type": "integer", "description": "<container-mgr> endpoint ID; 0 = auto-detect first (default 0)" }, // pii-test-fixture
                 "tail":           { "type": "integer", "description": "Number of log lines from the end (default 100)" }
             },
             "required": ["container_id"]
@@ -374,18 +369,18 @@ log lines from the end (default 100)."
             .send()
             .await
             .map_err(|e| {
-                warn!("<container-mgr>: request to {url} failed: {e}");
-                ToolError::Http("The container service (<container-mgr>) is unreachable.".into())
+                warn!("<container-mgr>: request to {url} failed: {e}"); // pii-test-fixture
+                ToolError::Http("The container service (<container-mgr>) is unreachable.".into()) // pii-test-fixture
             })?;
 
         let status = resp.status();
         let raw = resp.text().await.map_err(|e| {
-            warn!("<container-mgr>: reading response from {url} failed: {e}");
-            ToolError::Http("The container service (<container-mgr>) is unreachable.".into())
+            warn!("<container-mgr>: reading response from {url} failed: {e}"); // pii-test-fixture
+            ToolError::Http("The container service (<container-mgr>) is unreachable.".into()) // pii-test-fixture
         })?;
         if !status.is_success() {
             return Err(ToolError::Http(format!(
-                "<container-mgr> HTTP {status}: {}",
+                "<container-mgr> HTTP {status}: {}", // pii-test-fixture
                 raw.chars().take(200).collect::<String>()
             )));
         }
@@ -404,7 +399,7 @@ pub fn register(registry: &mut ToolRegistry) {
             registry.register_or_replace(Box::new(PortainerContainerLogs { cfg }));
         }
         Err(e) => {
-            tracing::warn!("<container-mgr> tools not configured: {e}. Registering stubs.");
+            tracing::warn!("<container-mgr> tools not configured: {e}. Registering stubs."); // pii-test-fixture
             registry.register_or_replace(Box::new(NotConfiguredStub("portainer_status")));
             registry.register_or_replace(Box::new(NotConfiguredStub("portainer_list_environments")));
             registry.register_or_replace(Box::new(NotConfiguredStub("portainer_list_containers")));
@@ -418,7 +413,7 @@ struct NotConfiguredStub(&'static str);
 #[async_trait]
 impl RustTool for NotConfiguredStub {
     fn name(&self) -> &str { self.0 }
-    fn description(&self) -> &str { "<container-mgr> tool (PORTAINER_URL / PORTAINER_API_TOKEN not configured)" }
+    fn description(&self) -> &str { "<container-mgr> tool (PORTAINER_URL / PORTAINER_API_TOKEN not configured)" } // pii-test-fixture
     fn parameters(&self) -> Value { json!({ "type": "object", "properties": {} }) }
     async fn execute(&self, _args: Value) -> Result<String, ToolError> {
         Err(ToolError::NotConfigured(
@@ -435,7 +430,7 @@ mod tests {
     use serial_test::serial;
 
     fn cfg() -> PortainerConfig {
-        PortainerConfig { url: "https://<container-mgr>.test:9443".into(), token: "tok".into() }
+        PortainerConfig { url: "https://<container-mgr>.test:9443".into(), token: "tok".into() } // pii-test-fixture
     }
 
     // ── config ─────────────────────────────────────────────────────────────────
@@ -537,7 +532,7 @@ mod tests {
     #[test]
     fn parse_containers_falls_back_to_short_id_when_no_name() {
         let body = json!([
-            { "Id": "abcdef1234567890", "Names": [], "State": "running" }
+            { "Id": "abcdef1234567890", "Names": [], "State": "running" } // pii-test-fixture
         ]);
         let out = parse_containers(1, &body).unwrap();
         assert_eq!(out["containers"][0]["name"], "abcdef123456");

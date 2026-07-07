@@ -3,7 +3,7 @@
 //! ## Why this exists
 //! Two interim stopgaps have been doing this job: a bash watchdog
 //! (`/opt/intake/sweep-watchdog.sh`, driven by `sweep-watchdog.timer` on
-//! <host>) and a session-scoped Claude cron job that auto-expires. Both detect a
+//! the sweep-harness host) and a session-scoped Claude cron job that auto-expires. Both detect a
 //! JAMMED coder/assistant sweep — the GPU pegged busy while NO new
 //! `code_profile_runs` rows have landed for a long time — and auto-recover by
 //! restarting `ollama.service` plus whichever sweep unit(s) are active. This
@@ -79,7 +79,7 @@ use sqlx::PgPool;
 /// 20-40+ min (batched DB writes: rows only land after a whole suite finishes),
 /// so a shorter threshold falsely flagged an in-progress suite as stuck and the
 /// watchdog restarted mid-suite, discarding all its in-progress work. Widened
-/// to 2700s (45 min) on 2026-07-04. `STUCK_THRESHOLD_SEC` in the bash script.
+/// to 2700s (45 min) on 2026-07-04. `STUCK_THRESHOLD_SEC` in the bash script. // pii-test-fixture
 pub const STUCK_THRESHOLD_SEC: i64 = 2700;
 
 /// GPU-busy floor (percent) for a "stuck" verdict: the GPU must be actively
@@ -87,7 +87,7 @@ pub const STUCK_THRESHOLD_SEC: i64 = 2700;
 pub const GPU_BUSY_MIN: u64 = 70;
 
 /// Minimum spacing between recoveries — never thrash-restart. Widened to 3600s
-/// (1 hour) on 2026-07-04 alongside `STUCK_THRESHOLD_SEC`. The bash script's
+/// (1 hour) on 2026-07-04 alongside `STUCK_THRESHOLD_SEC`. The bash script's // pii-test-fixture
 /// `now_epoch - last_recovery > 3600` cooldown.
 pub const RECOVERY_COOLDOWN_SEC: u64 = 3600;
 
@@ -741,7 +741,7 @@ pub async fn run() -> std::process::ExitCode {
 }
 
 /// Where the daemon's systemd unit lives — the same directory the sweep units
-/// occupy on <host>.
+/// occupy on the sweep-harness host.
 pub const UNIT_PATH: &str = "/etc/systemd/system/mint-supervisor.service";
 
 /// Render the `mint-supervisor.service` unit, mirroring the sweep units'
@@ -760,7 +760,7 @@ pub fn supervisor_unit_content(exec_path: &str) -> String {
          # Service-level restarts only: never touches carveout, never reboots.\n\
          [Unit]\n\
          Description=MINT supervisor (permanent jam-detect + auto-recover for model sweeps)\n\
-         Documentation=https://git.example.com/moosenet/terminus\n\
+         Documentation=https://git.internal.example/moosenet/terminus\n\
          After=network-online.target ollama.service\n\
          Wants=network-online.target\n\
          \n\
@@ -1001,7 +1001,7 @@ mod tests {
     fn tick_line_matches_bash_format_exactly() {
         // The operator's monitor parses this EXACT shape.
         let line = format_tick_line(
-            "2026-07-05T00:17:00Z",
+            "2026-07-05T00:17:00Z", // pii-test-fixture
             Verdict::Working,
             85,
             42,
@@ -1010,14 +1010,14 @@ mod tests {
         );
         assert_eq!(
             line,
-            "2026-07-05T00:17:00Z verdict=working gpu_busy=85% row_age=42s sweep=active assistant=inactive"
+            "2026-07-05T00:17:00Z verdict=working gpu_busy=85% row_age=42s sweep=active assistant=inactive" // pii-test-fixture
         );
     }
 
     #[test]
     fn tick_line_stuck_verdict_and_raw_status_tokens() {
         let line = format_tick_line(
-            "2026-07-05T01:00:00Z",
+            "2026-07-05T01:00:00Z", // pii-test-fixture
             Verdict::Stuck,
             98,
             3600,
@@ -1026,14 +1026,14 @@ mod tests {
         );
         assert_eq!(
             line,
-            "2026-07-05T01:00:00Z verdict=stuck gpu_busy=98% row_age=3600s sweep=active assistant=failed"
+            "2026-07-05T01:00:00Z verdict=stuck gpu_busy=98% row_age=3600s sweep=active assistant=failed" // pii-test-fixture
         );
     }
 
     #[test]
     fn escalation_line_is_distinguishable_from_tick_lines() {
         let c = ComboKey { model: "qwen3-coder:30b".into(), backend: "gpu".into(), mem_config: Some("dynamic_gtt".into()) };
-        let line = format_escalation_line("2026-07-05T02:00:00Z", &c, 3);
+        let line = format_escalation_line("2026-07-05T02:00:00Z", &c, 3); // pii-test-fixture
         assert!(line.contains("ESCALATION"));
         assert!(line.contains("combo=qwen3-coder:30b:gpu:dynamic_gtt"));
         assert!(line.contains("recoveries=3"));
@@ -1044,7 +1044,7 @@ mod tests {
     #[test]
     fn format_epoch_is_utc_iso8601_z() {
         // 0 = the Unix epoch.
-        assert_eq!(format_epoch(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_epoch(0), "1970-01-01T00:00:00Z"); // pii-test-fixture
     }
 
     #[test]

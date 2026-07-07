@@ -1,4 +1,4 @@
-//! OpenHands tools — ported from the Python `openhands_tools.py` on <host>.
+//! OpenHands tools — ported from the Python `openhands_tools.py` on the fleet host.
 //!
 //! Three tools driving the OpenHands agent runtime over its HTTP API:
 //!   openhands_run_task          — start a conversation/task, return its conversation_id
@@ -10,11 +10,14 @@
 //! so the operator must approve each call out of band. Without `DATABASE_URL`
 //! (the gate's Postgres) the gate denies the call before any HTTP is performed.
 //!
-//! Required env var:
-//!   OPENHANDS_URL — base URL of the OpenHands API (e.g. http://openhands.example:3000)
+//! Required env vars:
+//!   OPENHANDS_URL                 — base URL of the OpenHands API (e.g. http://openhands.example:3000)
+//!   OPENHANDS_DEFAULT_WORKING_DIR — default working directory used when a call
+//!                                   omits `working_dir` (PII remediation 2026-07:
+//!                                   no compiled-in default — must be set).
 //!
-//! Mirrors the Python source exactly: same tool names, same params, same default
-//! working_dir, and the same response field shapes.
+//! Mirrors the Python source exactly: same tool names, same params, same
+//! default-working-dir semantics, and the same response field shapes.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -24,13 +27,17 @@ use crate::error::ToolError;
 use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
-const DEFAULT_WORKING_DIR: &str = "<path>/arcade";
-
 // ── Config ────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct OpenHandsConfig {
     base_url: Option<String>,
+    /// Default `working_dir` used when a call omits it, and the sentinel
+    /// `build_full_task` compares against to decide whether to prepend a
+    /// "Working directory: ..." line. From `OPENHANDS_DEFAULT_WORKING_DIR`.
+    /// No compiled-in default (PII remediation 2026-07): required at
+    /// runtime, see [`OpenHandsConfig::default_working_dir`].
+    default_working_dir: Option<String>,
 }
 
 impl OpenHandsConfig {
@@ -39,13 +46,24 @@ impl OpenHandsConfig {
             .ok()
             .map(|s| s.trim().trim_end_matches('/').to_string())
             .filter(|s| !s.is_empty());
-        Self { base_url }
+        let default_working_dir = std::env::var("OPENHANDS_DEFAULT_WORKING_DIR")
+            .ok()
+            .filter(|s| !s.is_empty());
+        Self { base_url, default_working_dir }
     }
 
     fn url(&self) -> Result<&str, ToolError> {
         self.base_url
             .as_deref()
             .ok_or_else(|| ToolError::NotConfigured("OPENHANDS_URL not set".into()))
+    }
+
+    /// PII remediation (2026-07): `OPENHANDS_DEFAULT_WORKING_DIR` no longer
+    /// has a compiled-in fallback (a real dev-workstation path).
+    fn default_working_dir(&self) -> Result<&str, ToolError> {
+        self.default_working_dir
+            .as_deref()
+            .ok_or_else(|| ToolError::NotConfigured("OPENHANDS_DEFAULT_WORKING_DIR not set".into()))
     }
 
     fn client() -> Result<reqwest::Client, ToolError> {
@@ -108,8 +126,8 @@ async fn oh_post(
 
 /// Build the full task string: prepend the working dir line only when it differs
 /// from the default, exactly as the Python does.
-fn build_full_task(task: &str, working_dir: &str) -> String {
-    if !working_dir.is_empty() && working_dir != DEFAULT_WORKING_DIR {
+fn build_full_task(task: &str, working_dir: &str, default_working_dir: &str) -> String {
+    if !working_dir.is_empty() && working_dir != default_working_dir {
         format!("Working directory: {working_dir}\n\n{task}")
     } else {
         task.to_string()
@@ -219,8 +237,9 @@ impl RustTool for OpenHandsRunTask {
     fn description(&self) -> &str {
         "Send a task to OpenHands and return the conversation_id. OpenHands handles \
 scaffolding, file gen, builds, and format conversion. working_dir: directory context \
-for the task (default: <path>/arcade). model: optional model override. Returns \
-conversation_id for polling via openhands_get_status. GUARDED: requires operator approval."
+for the task (defaults to this deployment's configured OPENHANDS_DEFAULT_WORKING_DIR). \
+model: optional model override. Returns conversation_id for polling via \
+openhands_get_status. GUARDED: requires operator approval."
     }
 
     fn parameters(&self) -> Value {
@@ -228,7 +247,7 @@ conversation_id for polling via openhands_get_status. GUARDED: requires operator
             "type": "object",
             "properties": {
                 "task":        { "type": "string", "description": "The task to send to OpenHands (required)" },
-                "working_dir": { "type": "string", "description": "Directory context for the task (default: <path>/arcade)" },
+                "working_dir": { "type": "string", "description": "Directory context for the task (defaults to this deployment's configured working directory)" },
                 "model":       { "type": "string", "description": "Optional model override (default: OpenHands default-coder via LiteLLM)" }
             },
             "required": ["task"]
@@ -242,15 +261,14 @@ conversation_id for polling via openhands_get_status. GUARDED: requires operator
             .unwrap_or("")
             .trim()
             .to_string();
-        let working_dir = args
-            .get("working_dir")
-            .and_then(Value::as_str)
-            .unwrap_or(DEFAULT_WORKING_DIR)
-            .to_string();
-
+        // Pre-gate: use the caller-supplied working_dir verbatim for the
+        // approval summary (falls back to an empty placeholder — resolving
+        // the deployment's actual default is deferred until after the gate,
+        // matching how `config.url()` is resolved below).
+        let working_dir_arg = args.get("working_dir").and_then(Value::as_str).map(str::to_string);
         let summary = format!(
             "OpenHands: start a new task in '{}' — task: {}",
-            working_dir,
+            working_dir_arg.as_deref().unwrap_or("(default working directory)"),
             task.chars().take(120).collect::<String>()
         );
         match gate(self.name(), &args, &summary).await {
@@ -263,9 +281,11 @@ conversation_id for polling via openhands_get_status. GUARDED: requires operator
         }
 
         let base = self.config.url()?;
+        let default_working_dir = self.config.default_working_dir()?;
+        let working_dir = working_dir_arg.unwrap_or_else(|| default_working_dir.to_string());
         let client = OpenHandsConfig::client()?;
 
-        let full_task = build_full_task(&task, &working_dir);
+        let full_task = build_full_task(&task, &working_dir, default_working_dir);
         let body = json!({ "initial_user_msg": full_task });
 
         let result = oh_post(&client, base, "/api/conversations", &body).await?;
@@ -409,9 +429,14 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    /// Test-fixture value standing in for `OPENHANDS_DEFAULT_WORKING_DIR`,
+    /// which has no compiled-in default (PII remediation 2026-07).
+    const TEST_DEFAULT_WORKING_DIR: &str = "/opt/test-fixture/openhands-workspace";
+
     fn cfg(url: Option<&str>) -> OpenHandsConfig {
         OpenHandsConfig {
             base_url: url.map(str::to_string),
+            default_working_dir: Some(TEST_DEFAULT_WORKING_DIR.to_string()),
         }
     }
 
@@ -451,20 +476,41 @@ mod tests {
 
     #[test]
     fn full_task_default_dir_is_passthrough() {
-        let out = build_full_task("do the thing", DEFAULT_WORKING_DIR);
+        let out = build_full_task("do the thing", TEST_DEFAULT_WORKING_DIR, TEST_DEFAULT_WORKING_DIR);
         assert_eq!(out, "do the thing");
     }
 
     #[test]
     fn full_task_custom_dir_prepends_line() {
-        let out = build_full_task("do the thing", "/srv/proj");
+        let out = build_full_task("do the thing", "/srv/proj", TEST_DEFAULT_WORKING_DIR);
         assert_eq!(out, "Working directory: /srv/proj\n\ndo the thing");
     }
 
     #[test]
     fn full_task_empty_dir_is_passthrough() {
-        let out = build_full_task("task", "");
+        let out = build_full_task("task", "", TEST_DEFAULT_WORKING_DIR);
         assert_eq!(out, "task");
+    }
+
+    #[test]
+    #[serial]
+    fn config_default_working_dir_unset_is_not_configured() {
+        // PII remediation (2026-07): OPENHANDS_DEFAULT_WORKING_DIR has no
+        // compiled-in default (the real dev-workstation path) anymore —
+        // missing it must fail clean with NotConfigured.
+        std::env::remove_var("OPENHANDS_DEFAULT_WORKING_DIR");
+        let c = OpenHandsConfig::from_env();
+        assert!(c.default_working_dir.is_none());
+        assert!(matches!(c.default_working_dir(), Err(ToolError::NotConfigured(_))));
+    }
+
+    #[test]
+    #[serial]
+    fn config_default_working_dir_from_env() {
+        std::env::set_var("OPENHANDS_DEFAULT_WORKING_DIR", "/srv/some-project");
+        let c = OpenHandsConfig::from_env();
+        assert_eq!(c.default_working_dir().unwrap(), "/srv/some-project");
+        std::env::remove_var("OPENHANDS_DEFAULT_WORKING_DIR");
     }
 
     // ── response shaping on samples ──────────────────────────────────────────
@@ -496,7 +542,7 @@ mod tests {
             "status": "STOPPED",
             "runtime_status": "ready",
             "title": "T",
-            "last_updated_at": "2026-06-08T00:00:00Z"
+            "last_updated_at": "2026-06-08T00:00:00Z" // pii-test-fixture
         });
         let out = shape_status("cid", &conv, false, None);
         assert_eq!(out["conversation_id"], "cid");
@@ -551,7 +597,7 @@ mod tests {
                 "title": format!("T{i}"),
                 "status": "STOPPED",
                 "runtime_status": "ready",
-                "last_updated_at": "2026-06-08"
+                "last_updated_at": "2026-06-08" // pii-test-fixture
             }));
         }
         let body = json!({ "results": results });

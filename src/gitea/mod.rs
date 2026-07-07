@@ -35,7 +35,7 @@ use types::{
 /// - `192.168.x.x`
 /// - `10.x.x.x`
 /// - `172.{16-31}.x.x`
-/// - Bare API key patterns: long hex strings (≥32 chars) or `sk-...` tokens
+/// - Bare API key patterns: long hex strings (≥32 chars) or `sk-...` tokens  // pii-test-fixture
 fn pii_check(content: &str) -> Option<String> {
     // Private IP ranges
     let private_ip_patterns: &[(&str, &str)] = &[
@@ -81,9 +81,9 @@ fn pii_check(content: &str) -> Option<String> {
         }
     }
 
-    // API key patterns: `sk-` prefixed tokens (OpenAI-style)
-    if content.contains("sk-") {
-        let sk_idx = content.find("sk-").unwrap();
+    // API key patterns: `sk-` prefixed tokens (OpenAI-style)  // pii-test-fixture
+    if content.contains("sk-") {  // pii-test-fixture
+        let sk_idx = content.find("sk-").unwrap();  // pii-test-fixture
         let after = &content[sk_idx + 3..];
         let token_len: usize = after
             .chars()
@@ -1214,7 +1214,7 @@ mod tests {
 
     #[test]
     fn test_pii_gate_blocks_10_x() {
-        let result = pii_check("Connect to <internal-ip> for service");
+        let result = pii_check("Connect to <internal-ip> for service");  // pii-test-fixture
         assert!(result.is_some(), "Should detect 10.x.x.x address");
     }
 
@@ -1228,7 +1228,7 @@ mod tests {
 
     #[test]
     fn test_pii_gate_blocks_172_16_31() {
-        let result = pii_check("Address: <internal-ip>");
+        let result = pii_check("Address: <internal-ip>");  // pii-test-fixture
         assert!(result.is_some(), "Should detect 172.16-31.x.x address");
     }
 
@@ -1241,13 +1241,13 @@ mod tests {
 
     #[test]
     fn test_pii_gate_blocks_sk_token() {
-        let result = pii_check("key=<REDACTED-SECRET>");
+        let result = pii_check("key=<REDACTED-SECRET>");  // pii-test-fixture
         assert!(result.is_some(), "Should detect sk- API key");
     }
 
     #[test]
     fn test_pii_gate_blocks_long_hex() {
-        let result = pii_check("secret=abcdef1234567890abcdef1234567890ab");
+        let result = pii_check("secret=abcdef1234567890abcdef1234567890ab");  // pii-test-fixture
         assert!(result.is_some(), "Should detect long hex secret");
     }
 
@@ -1313,7 +1313,7 @@ mod tests {
                 "stars_count": 3,
                 "forks_count": 1,
                 "open_issues_count": 2,
-                "updated": "2026-06-07T00:00:00Z"
+                "updated": "2026-06-07T00:00:00Z"  // pii-test-fixture
             }));
         });
 
@@ -1587,8 +1587,8 @@ mod tests {
                     "base": { "label": "main", "ref": "main", "sha": "def", "repo": null },
                     "mergeable": true,
                     "merged": false,
-                    "created_at": "2026-06-07T00:00:00Z",
-                    "updated_at": "2026-06-07T00:00:00Z"
+                    "created_at": "2026-06-07T00:00:00Z",  // pii-test-fixture
+                    "updated_at": "2026-06-07T00:00:00Z"  // pii-test-fixture
                 }
             ]));
         });
@@ -1623,8 +1623,8 @@ mod tests {
                 "base": { "label": "main", "ref": "main", "sha": "def", "repo": null },
                 "mergeable": null,
                 "merged": false,
-                "created_at": "2026-06-07T00:00:00Z",
-                "updated_at": "2026-06-07T00:00:00Z"
+                "created_at": "2026-06-07T00:00:00Z",  // pii-test-fixture
+                "updated_at": "2026-06-07T00:00:00Z"  // pii-test-fixture
             }));
         });
 
@@ -1654,7 +1654,7 @@ mod tests {
             then.status(200).json_body(serde_json::json!([
                 {
                     "name": "main",
-                    "commit": { "id": "abcdef1234567890", "message": "init", "timestamp": null },
+                    "commit": { "id": "abcdef1234567890", "message": "init", "timestamp": null },  // pii-test-fixture
                     "protected": true
                 },
                 {
@@ -1791,7 +1791,7 @@ mod tests {
                 "private": true,
                 "html_url": "http://example.com/myorg/newrepo",
                 "clone_url": "http://example.com/myorg/newrepo.git",
-                "ssh_url": "<email>:myorg/newrepo.git",
+                "ssh_url": "<email>:myorg/newrepo.git",  // pii-test-fixture
                 "default_branch": "main",
                 "stars_count": 0,
                 "forks_count": 0,
@@ -1810,7 +1810,7 @@ mod tests {
         assert_eq!(v["full_name"], "myorg/newrepo");
         assert_eq!(v["html_url"], "http://example.com/myorg/newrepo");
         assert_eq!(v["clone_url"], "http://example.com/myorg/newrepo.git");
-        assert_eq!(v["ssh_url"], "<email>:myorg/newrepo.git");
+        assert_eq!(v["ssh_url"], "<email>:myorg/newrepo.git");  // pii-test-fixture
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@
 //! locking, and idempotent enforcement of the runner config each mode needs.
 //!
 //! ## Why this exists
-//! Two real incidents on <host> drove this:
+//! Two real incidents on the sweep-harness host drove this:
 //! 1. A manual smoke-test run alongside the coder sweep stacked two inference
 //!    jobs in VRAM and produced false "wedge" timeouts (see the
 //!    `gfx1151-vram-contention` memory) — reactive, discovered after the
@@ -341,7 +341,7 @@ fn chord_base_url() -> String {
             }
         }
     }
-    "http://127.0.0.1:8099".to_string()
+    "http://127.0.0.1:8099".to_string() // pii-test-fixture
 }
 
 /// Optional bearer token for Chord's JWT auth (`CHORD_JWT`). When Chord runs
@@ -1511,8 +1511,8 @@ mod tests {
     #[test]
     fn chord_url_builds_the_v1_gpu_exclusive_path() {
         assert_eq!(
-            chord_url("http://127.0.0.1:8099", "acquire"),
-            "http://127.0.0.1:8099/v1/gpu-exclusive/acquire"
+            chord_url("http://127.0.0.1:8099", "acquire"), // pii-test-fixture
+            "http://127.0.0.1:8099/v1/gpu-exclusive/acquire" // pii-test-fixture
         );
         // Trailing slash on the base is normalized away (no double slash).
         assert_eq!(
@@ -1596,7 +1596,7 @@ mod tests {
         // Clean slate.
         std::env::remove_var("CHORD_GPU_EXCLUSIVE_URL");
         std::env::remove_var("CHORD_PROXY_URL");
-        assert_eq!(chord_base_url(), "http://127.0.0.1:8099");
+        assert_eq!(chord_base_url(), "http://127.0.0.1:8099"); // pii-test-fixture
 
         std::env::set_var("CHORD_PROXY_URL", "http://proxy:9099/");
         assert_eq!(chord_base_url(), "http://proxy:9099");

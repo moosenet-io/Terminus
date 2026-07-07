@@ -1,10 +1,10 @@
 //! Crucible tools — learning-tracker system, ported from the Python
-//! `crucible_tools.py` on <host> (ai-terminus, streamable-HTTP MCP).
+//! `crucible_tools.py` on the legacy Terminus host (the legacy Python MCP host, streamable-HTTP MCP).
 //!
 //! ## Verified transport (IMPORTANT — read before touching this module)
 //!
 //! Before writing this port, every `crucible_*` tool was called live against
-//! <host>'s MCP endpoint. The fleet host (<host>, where the Engram
+//! the legacy Terminus host's MCP endpoint. The fleet host (where the Engram
 //! knowledge-store lives per the fleet layout) was down at porting time, so
 //! every call failed identically:
 //!
@@ -15,7 +15,7 @@
 //! That failure signature is decisive: **Crucible does not talk to Engram over
 //! HTTP.** It SSHes into the fleet host and runs a script there, exactly like
 //! the already-ported `sentinel` and `vigil` modules in this crate (both also
-//! <host>-hosted dashboard-style tools, both SSH-exec, neither HTTP). No
+//! fleet-host-hosted dashboard-style tools, both SSH-exec, neither HTTP). No
 //! `EngramClient`/HTTP client exists anywhere in this repo (grepped
 //! case-insensitively for "engram" — the only hits are unrelated ASMT/S84
 //! corpora and doc files), which is consistent with there being no HTTP
@@ -38,10 +38,10 @@
 //!   "output", ...}`).
 //!
 //! NOT verified (the fleet host was unreachable for the entire porting
-//! session, and no other route to <host>'s Python source was available —
-//! <host> itself has no SSH reachable from this dev box, and Gitea returned no
+//! session, and no other route to the legacy host's Python source was available —
+//! the legacy host itself has no SSH reachable from this dev box, and Gitea returned no
 //! repos to an unauthenticated search):
-//! - The exact remote script path/invocation <host> uses per tool.
+//! - The exact remote script path/invocation the legacy host uses per tool.
 //! - The exact JSON shape of a *successful* response for any of the 10 tools.
 //!
 //! Given that, this module:
@@ -140,12 +140,6 @@ const READING_STATUS_FILTERS: &[&str] = &["unread", "read", ""];
 
 const MAX_TEXT_LEN: usize = 2000;
 
-/// Assumed remote invocation shape, mirroring `sentinel::DEFAULT_SCRIPT`'s
-/// one-script-many-subcommands convention. **Not observed on the wire** — the
-/// fleet host was unreachable for the whole porting session. Audit against
-/// the real <host> source before relying on this in production.
-const DEFAULT_SCRIPT: &str = "/usr/bin/python3 <path>/crucible/ops.py";
-
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -159,8 +153,10 @@ pub struct CrucibleConfig {
     pub ssh_user: String,
     /// Path to the SSH private key file — from `CRUCIBLE_SSH_KEY_PATH`.
     pub ssh_key_path: Option<String>,
-    /// Remote script invocation — from `CRUCIBLE_SCRIPT`.
-    pub script: String,
+    /// Remote script invocation — from `CRUCIBLE_SCRIPT`. No compiled-in
+    /// default (PII remediation 2026-07): required at runtime, see
+    /// [`CrucibleConfig::require_script`].
+    pub script: Option<String>,
 }
 
 impl CrucibleConfig {
@@ -171,10 +167,7 @@ impl CrucibleConfig {
             ssh_key_path: env::var("CRUCIBLE_SSH_KEY_PATH")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            script: env::var("CRUCIBLE_SCRIPT")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DEFAULT_SCRIPT.into()),
+            script: env::var("CRUCIBLE_SCRIPT").ok().filter(|s| !s.is_empty()),
         }
     }
 
@@ -188,6 +181,14 @@ impl CrucibleConfig {
         self.ssh_key_path
             .as_deref()
             .ok_or_else(|| ToolError::NotConfigured("CRUCIBLE_SSH_KEY_PATH is not set".into()))
+    }
+
+    /// PII remediation (2026-07): `CRUCIBLE_SCRIPT` no longer has a
+    /// compiled-in fleet-host script path fallback.
+    fn require_script(&self) -> Result<&str, ToolError> {
+        self.script
+            .as_deref()
+            .ok_or_else(|| ToolError::NotConfigured("CRUCIBLE_SCRIPT is not set".into()))
     }
 }
 
@@ -377,7 +378,8 @@ async fn run_subcommand(
     payload: Value,
 ) -> Result<String, ToolError> {
     let cfg = Arc::clone(config);
-    let command = build_command(&cfg.script, subcommand, &payload);
+    let script = cfg.require_script()?.to_string();
+    let command = build_command(&script, subcommand, &payload);
     let output = tokio::task::spawn_blocking(move || ssh_exec(&cfg, &command, 60))
         .await
         .map_err(|e| ToolError::Execution(format!("Task join error: {e}")))??;
@@ -890,13 +892,34 @@ pub fn register(registry: &mut ToolRegistry) {
 mod tests {
     use super::*;
 
+    /// Test-fixture value standing in for `CRUCIBLE_SCRIPT`, which has no
+    /// compiled-in default (PII remediation 2026-07).
+    const TEST_SCRIPT: &str = "/opt/test-fixture/crucible/ops.py";
+
     fn test_config() -> Arc<CrucibleConfig> {
         Arc::new(CrucibleConfig {
             ssh_host: None,
             ssh_user: "root".into(),
             ssh_key_path: None,
-            script: DEFAULT_SCRIPT.into(),
+            script: Some(TEST_SCRIPT.into()),
         })
+    }
+
+    #[tokio::test]
+    async fn test_run_subcommand_not_configured_without_script() {
+        // PII remediation (2026-07): CRUCIBLE_SCRIPT has no compiled-in
+        // default — missing it must fail clean with NotConfigured.
+        let cfg = Arc::new(CrucibleConfig {
+            ssh_host: Some("127.0.0.1".into()),
+            ssh_user: "root".into(),
+            ssh_key_path: Some("/tmp/nonexistent-key".into()),
+            script: None,
+        });
+        let err = run_subcommand(&cfg, "list", json!({})).await.unwrap_err();
+        match err {
+            ToolError::NotConfigured(msg) => assert!(msg.contains("CRUCIBLE_SCRIPT")),
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
     }
 
     // --- pure helpers: command construction & response parsing -----------
@@ -957,7 +980,7 @@ mod tests {
     #[test]
     fn test_validate_date_allows_empty_and_rejects_malformed() {
         assert!(validate_date("").is_ok());
-        assert!(validate_date("2026-07-06").is_ok());
+        assert!(validate_date("2026-07-06").is_ok()); // pii-test-fixture
         assert!(validate_date("07/06/2026").is_err());
         assert!(validate_date("not-a-date").is_err());
     }
@@ -1191,7 +1214,7 @@ mod tests {
             ssh_host: Some("127.0.0.1".into()),
             ssh_user: "root".into(),
             ssh_key_path: Some("/tmp/nonexistent-key".into()),
-            script: DEFAULT_SCRIPT.into(),
+            script: Some(TEST_SCRIPT.into()),
         };
         let msg = match ssh_exec(&cfg, "true", 2).expect_err("unroutable host must error") {
             ToolError::Execution(m) => m,

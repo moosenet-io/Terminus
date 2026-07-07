@@ -678,10 +678,10 @@ mod tests {
         let r = RouteResult {
             travel_min: 35.0, no_traffic_min: 33.0, delay_min: 2.0,
             distance_miles: 22.0,
-            departure: "2026-06-09T08:24:00-07:00".into(),
-            arrival: "2026-06-09T09:00:00-07:00".into(),
+            departure: "2026-06-09T08:24:00-07:00".into(), // pii-test-fixture
+            arrival: "2026-06-09T09:00:00-07:00".into(), // pii-test-fixture
         };
-        let out = format_route("Home", "Work", &r, Some("2026-06-09T09:00:00-07:00"));
+        let out = format_route("Home", "Work", &r, Some("2026-06-09T09:00:00-07:00")); // pii-test-fixture
         assert!(out.contains("Leave by"));
         assert!(out.contains("35 min"));
     }

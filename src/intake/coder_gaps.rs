@@ -89,7 +89,13 @@ pub async fn run(
         }
     };
 
-    let dir = corpus_v2_dir();
+    let dir = match corpus_v2_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("gap audit did not start: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
     let all = match read_manifest_v2(&dir) {
         Ok(c) => c,
         Err(e) => {

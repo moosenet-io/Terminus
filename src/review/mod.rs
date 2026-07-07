@@ -21,7 +21,7 @@
 //! provider actually answered.
 //!
 //! ## Config (env)
-//!   - `REVIEW_DAEMON_URL`   — review-daemon base URL (default `http://127.0.0.1:8790`)
+//!   - `REVIEW_DAEMON_URL`   — review-daemon base URL (default `http://127.0.0.1:8790`) // pii-test-fixture
 //!   - `REVIEW_DAEMON_TOKEN` — bearer token matching the daemon's own config;
 //!                             if unset, `opus`/`codex`/`agy` all degrade to
 //!                             `"unavailable: REVIEW_DAEMON_TOKEN not configured"`

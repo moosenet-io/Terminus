@@ -481,7 +481,7 @@ impl RustTool for VitalsTrends {
 // Tool: vitals_log
 // ──────────────────────────────────────────────
 //
-// <host>'s Python original is a single generic/multi-source logger with a
+// The legacy Python original is a single generic/multi-source logger with a
 // `source` tag (manual / samsung_health / strava / apple_health) that can
 // write `steps` and `resting_hr` in the same call — neither of which any of
 // the split tools above (log_weight / log_exercise / log_sleep) accept. That
@@ -667,7 +667,7 @@ impl RustTool for VitalsRecent {
 // Tool: vitals_import
 // ──────────────────────────────────────────────
 //
-// NOTE ON DESIGN: live-probing <host>'s `vitals_import` (and `vitals_dashboard`,
+// NOTE ON DESIGN: live-probing the legacy Python `vitals_import` (and `vitals_dashboard`,
 // below) against the real backend showed it currently shells out over SSH to
 // the fleet box ("ssh: connect to host <fleet-host> port 22: No route to
 // host") — i.e. the legacy Python tool builds a remote command from
@@ -683,11 +683,23 @@ impl RustTool for VitalsRecent {
 const VALID_IMPORT_FORMATS: &[&str] = &["samsung_health", "strava", "apple_health"];
 
 /// Only files under this directory may be imported. This is the directory
-/// the tool's own description tells <operator> to upload CSVs to, so it doubles
-/// as an explicit containment boundary (defense in depth): even though the
-/// backend does the actual file read/parse, the Rust tool never forwards a
-/// path outside the intended drop directory.
-const VITALS_IMPORT_DIR: &str = "<path>/vitals/data/";
+/// the tool's own description tells the operator to upload CSVs to, so it
+/// doubles as an explicit containment boundary (defense in depth): even
+/// though the backend does the actual file read/parse, the Rust tool never
+/// forwards a path outside the intended drop directory.
+///
+/// PII remediation (2026-07): per explicit operator decision, the compiled-in
+/// real fleet-host directory has been removed from source. The containment
+/// boundary is now required from `VITALS_IMPORT_DIR` at runtime — deployments
+/// MUST set it, and this tool fails clean with `NotConfigured` if it's unset,
+/// rather than silently allowing an unbounded path or falling back to a
+/// guessed directory.
+fn vitals_import_dir() -> Result<String, ToolError> {
+    std::env::var("VITALS_IMPORT_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ToolError::NotConfigured("VITALS_IMPORT_DIR is not set".into()))
+}
 
 fn validate_import_path(raw: &str) -> Result<String, ToolError> {
     let trimmed = raw.trim();
@@ -710,9 +722,10 @@ fn validate_import_path(raw: &str) -> Result<String, ToolError> {
     // outright, rather than relying solely on the absence of literal ".."
     // segments (which a caller could route around with an unrelated
     // absolute path, e.g. "/etc/passwd" or "/root/.ssh/id_rsa").
-    if !trimmed.starts_with(VITALS_IMPORT_DIR) {
+    let import_dir = vitals_import_dir()?;
+    if !trimmed.starts_with(import_dir.as_str()) {
         return Err(ToolError::InvalidArgument(format!(
-            "file_path must be under {VITALS_IMPORT_DIR}"
+            "file_path must be under {import_dir}"
         )));
     }
     Ok(trimmed.to_string())
@@ -725,10 +738,10 @@ impl RustTool for VitalsImport {
     fn name(&self) -> &str { "vitals_import" }
 
     fn description(&self) -> &str {
-        "Import health data from a CSV file on <host>. file_path: absolute path to the \
-         CSV on <host> (e.g. <path>/vitals/data/activities.csv). format: \
+        "Import health data from a CSV file on the fleet host. file_path: absolute path to the \
+         CSV, under the fleet host's designated vitals-import directory. format: \
          'samsung_health', 'strava', or 'apple_health'. Returns count of imported and \
-         skipped rows. <operator>: upload your CSV to <path>/vitals/data/ first."
+         skipped rows. Upload your CSV to the vitals-import directory first."
     }
 
     fn parameters(&self) -> Value {
@@ -737,7 +750,7 @@ impl RustTool for VitalsImport {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Absolute path to the CSV on <host>, e.g. <path>/vitals/data/activities.csv"
+                    "description": "Absolute path to the CSV, under the fleet host's designated vitals-import directory"
                 },
                 "format": {
                     "type": "string",
@@ -1011,18 +1024,31 @@ mod tests {
         std::env::remove_var("VITALS_API_URL");
     }
 
+    /// Test-only import directory — set for every test that exercises the
+    /// "path is inside the allowed directory" path, so `VITALS_IMPORT_DIR`
+    /// (required, no compiled-in default) is always present.
+    const TEST_IMPORT_DIR: &str = "/opt/test-fixture/vitals-import/";
+
+    fn set_import_dir() {
+        std::env::set_var("VITALS_IMPORT_DIR", TEST_IMPORT_DIR);
+    }
+
+    fn clear_import_dir() {
+        std::env::remove_var("VITALS_IMPORT_DIR");
+    }
+
     // ── date validation ──
 
     #[test]
     fn test_valid_date_accepted() {
-        assert!(validate_date("2026-06-07").is_ok());
+        assert!(validate_date("2026-06-07").is_ok());  // pii-test-fixture
     }
 
     #[test]
     fn test_invalid_date_rejected() {
         assert!(validate_date("2026/06/07").is_err());
         assert!(validate_date("not-a-date").is_err());
-        assert!(validate_date("06-07-2026").is_err());
+        assert!(validate_date("06-07-2026").is_err());  // pii-test-fixture
     }
 
     // ── numeric validation ──
@@ -1066,7 +1092,7 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         clear_env();
         let tool = VitalsLogWeight;
-        let err = tool.execute(json!({"date": "2026-06-07", "kg": 80.0})).await.unwrap_err();
+        let err = tool.execute(json!({"date": "2026-06-07", "kg": 80.0})).await.unwrap_err();  // pii-test-fixture
         assert!(matches!(err, ToolError::NotConfigured(_)));
     }
 
@@ -1084,9 +1110,9 @@ mod tests {
         });
 
         let tool = VitalsLogWeight;
-        let result = tool.execute(json!({"date": "2026-06-07", "kg": 82.5})).await.unwrap();
+        let result = tool.execute(json!({"date": "2026-06-07", "kg": 82.5})).await.unwrap();  // pii-test-fixture
         assert!(result.contains("82.5"));
-        assert!(result.contains("2026-06-07"));
+        assert!(result.contains("2026-06-07"));  // pii-test-fixture
         mock.assert();
     }
 
@@ -1104,7 +1130,7 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         set_env("http://localhost:9");
         let tool = VitalsLogWeight;
-        let err = tool.execute(json!({"date": "2026-06-07", "kg": 0.0})).await.unwrap_err();
+        let err = tool.execute(json!({"date": "2026-06-07", "kg": 0.0})).await.unwrap_err();  // pii-test-fixture
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
@@ -1181,7 +1207,7 @@ mod tests {
 
         let tool = VitalsLogExercise;
         let result = tool.execute(json!({
-            "date":         "2026-06-07",
+            "date":         "2026-06-07",  // pii-test-fixture
             "type":         "running",
             "duration_min": 30.0,
             "calories":     300.0
@@ -1210,7 +1236,7 @@ mod tests {
         set_env("http://localhost:9");
         let tool = VitalsLogExercise;
         let err = tool.execute(json!({
-            "date":         "2026-06-07",
+            "date":         "2026-06-07",  // pii-test-fixture
             "type":         "cycling",
             "duration_min": -5.0
         })).await.unwrap_err();
@@ -1232,7 +1258,7 @@ mod tests {
 
         let tool = VitalsLogSleep;
         let result = tool.execute(json!({
-            "date":    "2026-06-07",
+            "date":    "2026-06-07",  // pii-test-fixture
             "hours":   7.5,
             "quality": 8
         })).await.unwrap();
@@ -1247,7 +1273,7 @@ mod tests {
         set_env("http://localhost:9");
         let tool = VitalsLogSleep;
         let err = tool.execute(json!({
-            "date":  "2026-06-07",
+            "date":  "2026-06-07",  // pii-test-fixture
             "hours": 25.0
         })).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
@@ -1259,7 +1285,7 @@ mod tests {
         set_env("http://localhost:9");
         let tool = VitalsLogSleep;
         let err = tool.execute(json!({
-            "date":    "2026-06-07",
+            "date":    "2026-06-07",  // pii-test-fixture
             "hours":   7.0,
             "quality": 11
         })).await.unwrap_err();
@@ -1279,7 +1305,7 @@ mod tests {
                 .path("/api/trends")
                 .query_param("metric", "weight")
                 .query_param("days", "30");
-            then.status(200).json_body(json!([{"date": "2026-06-01", "value": 82.0}]));
+            then.status(200).json_body(json!([{"date": "2026-06-01", "value": 82.0}]));  // pii-test-fixture
         });
 
         let tool = VitalsTrends;
@@ -1346,7 +1372,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(POST).path("/api/log");
-            then.status(201).json_body(json!({"date": "2026-07-06", "source": "manual"}));
+            then.status(201).json_body(json!({"date": "2026-07-06", "source": "manual"}));  // pii-test-fixture
         });
 
         let tool = VitalsLog;
@@ -1369,7 +1395,7 @@ mod tests {
         let tool = VitalsLog;
         let result = tool
             .execute(json!({
-                "date": "2026-07-01",
+                "date": "2026-07-01",  // pii-test-fixture
                 "steps": 9000,
                 "resting_hr": 58,
                 "source": "samsung_health"
@@ -1492,6 +1518,7 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let server = MockServer::start();
         set_env(&server.base_url());
+        set_import_dir();
 
         let mock = server.mock(|when, then| {
             when.method(POST).path("/api/import");
@@ -1501,40 +1528,45 @@ mod tests {
         let tool = VitalsImport;
         let result = tool
             .execute(json!({
-                "file_path": "<path>/vitals/data/activities.csv",
+                "file_path": format!("{TEST_IMPORT_DIR}activities.csv"),
                 "format": "strava"
             }))
             .await
             .unwrap();
         assert!(result.contains("12"));
         mock.assert();
+        clear_import_dir();
     }
 
     #[tokio::test]
     async fn test_vitals_import_rejects_relative_path() {
         let _lock = ENV_LOCK.lock().unwrap();
         set_env("http://localhost:9");
+        set_import_dir();
         let tool = VitalsImport;
         let err = tool
             .execute(json!({"file_path": "relative/path.csv", "format": "strava"}))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
+        clear_import_dir();
     }
 
     #[tokio::test]
     async fn test_vitals_import_rejects_path_traversal() {
         let _lock = ENV_LOCK.lock().unwrap();
         set_env("http://localhost:9");
+        set_import_dir();
         let tool = VitalsImport;
         let err = tool
             .execute(json!({
-                "file_path": "<path>/vitals/data/../../etc/passwd",
+                "file_path": format!("{TEST_IMPORT_DIR}../../etc/passwd"),
                 "format": "strava"
             }))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
+        clear_import_dir();
     }
 
     #[tokio::test]
@@ -1543,8 +1575,9 @@ mod tests {
         // by the directory-containment check, not just the traversal check.
         let _lock = ENV_LOCK.lock().unwrap();
         set_env("http://localhost:9");
+        set_import_dir();
         let tool = VitalsImport;
-        for bad in ["/etc/passwd", "/root/.ssh/id_rsa", "<path>/other/activities.csv"] {
+        for bad in ["/etc/passwd", "/root/.ssh/id_rsa", "/opt/test-fixture/other/activities.csv"] { // pii-test-fixture
             let err = tool
                 .execute(json!({"file_path": bad, "format": "strava"}))
                 .await
@@ -1554,45 +1587,71 @@ mod tests {
                 "expected {bad} to be rejected"
             );
         }
+        clear_import_dir();
     }
 
     #[tokio::test]
     async fn test_vitals_import_rejects_control_chars_in_path() {
         let _lock = ENV_LOCK.lock().unwrap();
         set_env("http://localhost:9");
+        set_import_dir();
         let tool = VitalsImport;
         let err = tool
             .execute(json!({"file_path": "/opt/data/foo\n.csv", "format": "strava"}))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
+        clear_import_dir();
     }
 
     #[tokio::test]
     async fn test_vitals_import_rejects_bad_format() {
         let _lock = ENV_LOCK.lock().unwrap();
         set_env("http://localhost:9");
+        set_import_dir();
         let tool = VitalsImport;
         let err = tool
             .execute(json!({
-                "file_path": "<path>/vitals/data/activities.csv",
+                "file_path": format!("{TEST_IMPORT_DIR}activities.csv"),
                 "format": "garmin"
             }))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
+        clear_import_dir();
     }
 
     #[tokio::test]
     async fn test_vitals_import_rejects_empty_path() {
         let _lock = ENV_LOCK.lock().unwrap();
         set_env("http://localhost:9");
+        set_import_dir();
         let tool = VitalsImport;
         let err = tool
             .execute(json!({"file_path": "", "format": "strava"}))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
+        clear_import_dir();
+    }
+
+    #[tokio::test]
+    async fn test_vitals_import_not_configured_without_import_dir() {
+        // PII remediation (2026-07): VITALS_IMPORT_DIR has no compiled-in
+        // default anymore — missing it must fail clean with NotConfigured,
+        // not silently accept an unbounded path.
+        let _lock = ENV_LOCK.lock().unwrap();
+        set_env("http://localhost:9");
+        clear_import_dir();
+        let tool = VitalsImport;
+        let err = tool
+            .execute(json!({
+                "file_path": format!("{TEST_IMPORT_DIR}activities.csv"),
+                "format": "strava"
+            }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotConfigured(_)));
     }
 
     // ── vitals_program_create ──

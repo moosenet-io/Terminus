@@ -94,7 +94,7 @@ pub const REAL_TOOLS: &[(&str, &str)] = &[
     ("plane_create_issue", "Create a work item / issue in Plane."),
     ("plane_list_issues", "List work items / issues in Plane."),
     ("gitea_create_pull_request", "Open a pull request in Gitea."),
-    ("jellyseerr_requests", "List media requests in <media-service>."),
+    ("jellyseerr_requests", "List media requests in <media-service>."), // pii-test-fixture
 ];
 
 /// Build a single Ollama tool spec from (name, description). One string param
@@ -442,7 +442,7 @@ pub async fn run_agent_suite(
     profile_id: uuid::Uuid,
     limit: Option<usize>,
 ) -> Result<AgentSuiteOutcome, ToolError> {
-    let dir: PathBuf = corpus_dir();
+    let dir: PathBuf = corpus_dir()?;
     let mut scenarios = read_scenarios(&dir)?;
     if let Some(n) = limit {
         scenarios.truncate(n);

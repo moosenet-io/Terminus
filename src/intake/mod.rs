@@ -7,8 +7,8 @@
 //!   - `model_intake_status`  — return the stored operational profile.
 //!   - `model_intake_compare` — comparison table across models for one metric.
 //!
-//! The context suite embeds real repo files as filler (the tool runs on <host>
-//! with no repo checkout), plants three recall facts at 25/50/75% depth, runs
+//! The context suite embeds real repo files as filler (the tool runs on the
+//! sweep-harness host with no repo checkout), plants three recall facts at 25/50/75% depth, runs
 //! the model through Ollama's `/api/generate`, and measures throughput, TTFT,
 //! recall, and VRAM per graduated context tier. A derived operational profile
 //! (safe/absolute context, degradation point, recommended timeouts) is computed

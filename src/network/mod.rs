@@ -1,4 +1,4 @@
-//! Network diagnostic tools — ported from the Python `network_tools.py` on <host>.
+//! Network diagnostic tools — ported from the Python `network_tools.py` on the MCP hub host.
 //!
 //! Mirrors the five Python tools with identical names and parameters:
 //!   net_ping         — ping a host and report latency (SSH-based, fixed command)
@@ -24,7 +24,7 @@
 //!   NET_SSH_USER       — SSH user, default "root"
 //!   NET_SSH_KEY_PATH   — path to the SSH private key (required for SSH tools)
 //!   NET_SERVICES       — comma-separated `name=host:port` list used by
-//!                        net_check_services (e.g. "Gitea=<internal-ip>:3000,..").
+//!                        net_check_services (e.g. "Gitea=<internal-ip>:3000,.."). // pii-test-fixture
 //!                        If unset, net_check_services returns NotConfigured.
 
 use std::env;
@@ -462,7 +462,7 @@ impl RustTool for NetDnsLookup {
         json!({
             "type": "object",
             "properties": {
-                "hostname": { "type": "string", "description": "Hostname to resolve (e.g. 'search.example.com')" }
+                "hostname": { "type": "string", "description": "Hostname to resolve (e.g. 'www.example.com')" }
             },
             "required": ["hostname"]
         })
@@ -726,8 +726,8 @@ mod tests {
 
     #[test]
     fn validate_host_token_accepts_ip_and_hostname() {
-        assert!(validate_host_token("<internal-ip>").is_ok());
-        assert!(validate_host_token("search.example.com").is_ok());
+        assert!(validate_host_token("<internal-ip>").is_ok()); // pii-test-fixture
+        assert!(validate_host_token("search.example.com").is_ok()); // pii-test-fixture
         assert!(validate_host_token("host-1").is_ok());
         assert!(validate_host_token("fe80::1").is_ok());
     }
@@ -755,7 +755,7 @@ mod tests {
 
     #[test]
     fn validate_subnet_prefix_rejects_invalid() {
-        assert!(validate_subnet_prefix("<internal-ip>").is_err()); // 4 octets
+        assert!(validate_subnet_prefix("<internal-ip>").is_err()); // 4 octets — pii-test-fixture
         assert!(validate_subnet_prefix("999.0.0").is_err()); // >255
         assert!(validate_subnet_prefix("10.0.x").is_err()); // non-numeric
         assert!(validate_subnet_prefix("10.0.0; ls").is_err());
@@ -766,10 +766,10 @@ mod tests {
 
     #[test]
     fn parse_services_parses_well_formed_list() {
-        let svcs = parse_services("Gitea=<internal-ip>:3000,Plane=<internal-ip>:80");
+        let svcs = parse_services("Gitea=<internal-ip>:3000,Plane=<internal-ip>:80"); // pii-test-fixture
         assert_eq!(svcs.len(), 2);
         assert_eq!(svcs[0].name, "Gitea");
-        assert_eq!(svcs[0].host, "<internal-ip>");
+        assert_eq!(svcs[0].host, "<internal-ip>"); // pii-test-fixture
         assert_eq!(svcs[0].port, 3000);
         assert_eq!(svcs[1].name, "Plane");
         assert_eq!(svcs[1].port, 80);
@@ -777,7 +777,7 @@ mod tests {
 
     #[test]
     fn parse_services_skips_malformed_entries() {
-        let svcs = parse_services("Good=<internal-ip>:22, ,Bad,NoPort=<internal-ip>,BadPort=<internal-ip>:abc");
+        let svcs = parse_services("Good=<internal-ip>:22, ,Bad,NoPort=<internal-ip>,BadPort=<internal-ip>:abc"); // pii-test-fixture
         assert_eq!(svcs.len(), 1);
         assert_eq!(svcs[0].name, "Good");
         assert_eq!(svcs[0].port, 22);
@@ -785,10 +785,10 @@ mod tests {
 
     #[test]
     fn parse_services_handles_whitespace() {
-        let svcs = parse_services(" Web = <internal-ip> : 8080 ");
+        let svcs = parse_services(" Web = <internal-ip> : 8080 "); // pii-test-fixture
         assert_eq!(svcs.len(), 1);
         assert_eq!(svcs[0].name, "Web");
-        assert_eq!(svcs[0].host, "<internal-ip>");
+        assert_eq!(svcs[0].host, "<internal-ip>"); // pii-test-fixture
         assert_eq!(svcs[0].port, 8080);
     }
 
@@ -796,12 +796,13 @@ mod tests {
 
     #[test]
     fn parse_ping_output_extracts_stats_and_rtt() {
+        // Sample uses a documentation-range address (RFC 5737), not a real host.
         let sample = "\
-PING <internal-ip> (<internal-ip>) 56(84) bytes of data.
-64 bytes from <internal-ip>: icmp_seq=1 ttl=64 time=0.45 ms
-64 bytes from <internal-ip>: icmp_seq=2 ttl=64 time=0.50 ms
+PING 203.0.113.10 (203.0.113.10) 56(84) bytes of data.
+64 bytes from 203.0.113.10: icmp_seq=1 ttl=64 time=0.45 ms
+64 bytes from 203.0.113.10: icmp_seq=2 ttl=64 time=0.50 ms
 
---- <internal-ip> ping statistics ---
+--- 203.0.113.10 ping statistics ---
 3 packets transmitted, 3 received, 0% packet loss, time 2003ms
 rtt min/avg/max/mdev = 0.450/0.475/0.500/0.025 ms";
         let (stats, rtt) = parse_ping_output(sample);
@@ -811,10 +812,11 @@ rtt min/avg/max/mdev = 0.450/0.475/0.500/0.025 ms";
 
     #[test]
     fn parse_ping_output_handles_unreachable() {
+        // Sample uses a documentation-range address (RFC 5737), not a real host.
         let sample = "\
-PING <internal-ip> (<internal-ip>) 56(84) bytes of data.
+PING 203.0.113.99 (203.0.113.99) 56(84) bytes of data.
 
---- <internal-ip> ping statistics ---
+--- 203.0.113.99 ping statistics ---
 3 packets transmitted, 0 received, 100% packet loss, time 2034ms";
         let (stats, rtt) = parse_ping_output(sample);
         assert!(stats.contains("100% packet loss"));
@@ -825,15 +827,15 @@ PING <internal-ip> (<internal-ip>) 56(84) bytes of data.
 
     #[test]
     fn parse_subnet_hosts_sorts_by_last_octet() {
-        let sample = "<internal-ip>\n<internal-ip>\n<internal-ip>\n\n<internal-ip>\n";
+        let sample = "<internal-ip>\n<internal-ip>\n<internal-ip>\n\n<internal-ip>\n"; // pii-test-fixture
         let hosts = parse_subnet_hosts(sample);
         assert_eq!(
             hosts,
             vec![
-                "<internal-ip>",
-                "<internal-ip>",
-                "<internal-ip>",
-                "<internal-ip>",
+                "<internal-ip>",   // pii-test-fixture
+                "<internal-ip>",   // pii-test-fixture
+                "<internal-ip>",  // pii-test-fixture
+                "<internal-ip>", // pii-test-fixture
             ]
         );
     }
@@ -847,10 +849,10 @@ PING <internal-ip> (<internal-ip>) 56(84) bytes of data.
 
     #[test]
     fn ping_command_is_fixed_form() {
-        let host = "<internal-ip>";
+        let host = "<internal-ip>"; // pii-test-fixture
         let count = 5u64;
         let cmd = format!("ping -c {count} -W 3 {host}");
-        assert_eq!(cmd, "ping -c 5 -W 3 <internal-ip>");
+        assert_eq!(cmd, "ping -c 5 -W 3 <internal-ip>"); // pii-test-fixture
         assert!(!cmd.contains(';'));
         assert!(!cmd.contains("$("));
         assert!(!cmd.contains('`'));
@@ -890,7 +892,7 @@ PING <internal-ip> (<internal-ip>) 56(84) bytes of data.
     async fn net_ping_valid_host_no_ssh_config_is_not_configured() {
         // Valid host passes validation; then SSH config is missing → NotConfigured.
         let tool = NetPing { config: empty_config() };
-        let result = tool.execute(json!({"host": "<internal-ip>", "count": 2})).await;
+        let result = tool.execute(json!({"host": "<internal-ip>", "count": 2})).await; // pii-test-fixture
         match result {
             Err(ToolError::NotConfigured(msg)) => assert!(msg.contains("NET_SSH_HOST")),
             other => panic!("expected NotConfigured, got {other:?}"),
@@ -909,16 +911,16 @@ PING <internal-ip> (<internal-ip>) 56(84) bytes of data.
     #[tokio::test]
     async fn net_port_check_missing_port_is_invalid() {
         let tool = NetPortCheck;
-        let result = tool.execute(json!({"host": "<internal-ip>"})).await;
+        let result = tool.execute(json!({"host": "<internal-ip>"})).await; // pii-test-fixture
         assert!(matches!(result, Err(ToolError::InvalidArgument(_))));
     }
 
     #[tokio::test]
     async fn net_port_check_out_of_range_port_is_invalid() {
         let tool = NetPortCheck;
-        let result = tool.execute(json!({"host": "<internal-ip>", "port": 70000})).await;
+        let result = tool.execute(json!({"host": "<internal-ip>", "port": 70000})).await; // pii-test-fixture
         assert!(matches!(result, Err(ToolError::InvalidArgument(_))));
-        let result0 = tool.execute(json!({"host": "<internal-ip>", "port": 0})).await;
+        let result0 = tool.execute(json!({"host": "<internal-ip>", "port": 0})).await; // pii-test-fixture
         assert!(matches!(result0, Err(ToolError::InvalidArgument(_))));
     }
 
@@ -958,7 +960,7 @@ PING <internal-ip> (<internal-ip>) 56(84) bytes of data.
     #[tokio::test]
     async fn net_subnet_scan_bad_prefix_is_invalid() {
         let tool = NetSubnetScan { config: empty_config() };
-        let result = tool.execute(json!({"subnet_prefix": "<internal-ip>"})).await;
+        let result = tool.execute(json!({"subnet_prefix": "<internal-ip>"})).await; // pii-test-fixture
         assert!(matches!(result, Err(ToolError::InvalidArgument(_))));
     }
 

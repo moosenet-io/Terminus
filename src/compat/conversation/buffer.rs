@@ -522,7 +522,7 @@ mod tests {
     #[test]
     fn matrix_user_id_with_special_chars() {
         let mut b = buf();
-        let uid = "@claude.livetest:example.com";
+        let uid = "@claude.livetest:example.com"; // pii-test-fixture
         b.push(uid, "hi", "hello", T);
         assert_eq!(b.get_context(uid, T).len(), 1);
     }

@@ -1,6 +1,6 @@
 //! Google tools — Calendar (CalDAV) + Email (IMAP read / SMTP send).
 //!
-//! Eight tools, ported from the Python google_tools.py on <host>:
+//! Eight tools, ported from the Python google_tools.py on the legacy Terminus host:
 //!   google_calendar_today / _week    — read events across all calendars (caldav.rs)
 //!   google_calendar_add              — create an event (caldav.rs)
 //!   google_calendar_conflicts        — check a slot for conflicts (caldav.rs)
@@ -15,7 +15,7 @@
 //!   GOOGLE_LUMINA_EMAIL   — the account address (also IMAP/SMTP/CalDAV username)
 //!   GOOGLE_APP_PASSWORD   — Gmail App Password
 //! Optional env:
-//!   GOOGLE_PETER_EMAIL          — operator's personal calendar (default <email>)
+//!   GOOGLE_PETER_EMAIL          — operator's personal calendar (default <email>) // pii-test-fixture
 //!   GOOGLE_LUMINA_CALENDAR_ID   — extra group calendar id to include
 //!   GOOGLE_EXTRA_CALENDARS      — comma-separated extra calendar ids
 
@@ -53,7 +53,7 @@ impl GoogleConfig {
         let peter_email = std::env::var("GOOGLE_PETER_EMAIL")
             .ok()
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "<email>".into());
+            .unwrap_or_else(|| "<email>".into()); // pii-test-fixture
         let lumina_calendar_id =
             std::env::var("GOOGLE_LUMINA_CALENDAR_ID").ok().filter(|s| !s.is_empty());
         let extra_calendars = std::env::var("GOOGLE_EXTRA_CALENDARS")
@@ -139,10 +139,10 @@ mod tests {
 
     fn cfg() -> GoogleConfig {
         GoogleConfig {
-            email: "<email>".into(),
+            email: "<email>".into(), // pii-test-fixture
             app_password: "x".into(),
-            peter_email: "<email>".into(),
-            lumina_calendar_id: Some("<email>".into()),
+            peter_email: "<email>".into(), // pii-test-fixture
+            lumina_calendar_id: Some("<email>".into()), // pii-test-fixture
             extra_calendars: vec![],
         }
     }
@@ -150,9 +150,9 @@ mod tests {
     #[test]
     fn all_calendar_ids_dedups_and_orders() {
         let ids = cfg().all_calendar_ids();
-        assert_eq!(ids[0], "<email>");
-        assert_eq!(ids[1], "<email>");
-        assert!(ids.contains(&"<email>".to_string()));
+        assert_eq!(ids[0], "<email>"); // pii-test-fixture
+        assert_eq!(ids[1], "<email>"); // pii-test-fixture
+        assert!(ids.contains(&"<email>".to_string())); // pii-test-fixture
         let mut sorted = ids.clone();
         sorted.sort();
         sorted.dedup();

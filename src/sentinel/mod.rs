@@ -1,20 +1,20 @@
-//! Sentinel tools — ported from the Python `sentinel_tools.py` on <host>.
+//! Sentinel tools — ported from the Python `sentinel_tools.py` on the fleet host.
 //!
 //! Sentinel triggers operational checks and logging on the fleet host and
 //! refreshes the live MooseNet status page. The Python original shelled out
 //! via `ssh ... '<cmd>'` with `subprocess.run(shell=True)`, and its
 //! `sentinel_status` tool additionally SSHed to the fleet host to run an
-//! inline <secret-manager>-auth + `curl` pipeline against the Gitea contents API.
+//! inline <secret-manager>-auth + `curl` pipeline against the Gitea contents API. // pii-test-fixture
 //!
 //! This port:
 //! - Uses the `ssh2` crate for typed SSH execution (no `shell=True`, no
 //!   subprocess), mirroring `gateway/mod.rs` and `ansible/mod.rs`.
-//! - Replaces the Python `sentinel_status` SSH+<secret-manager>+curl chain with a
+//! - Replaces the Python `sentinel_status` SSH+<secret-manager>+curl chain with a // pii-test-fixture
 //!   direct call into this crate's own `gitea` module. Terminus already holds
 //!   `GITEA_URL`/`GITEA_TOKEN` locally (see `gitea/mod.rs`) — the Python
 //!   version only detoured through fleet-host because the *Python* MCP
 //!   process didn't have those credentials. The Rust process does, so the
-//!   extra SSH hop plus an inline shell script that logs in to <secret-manager> and
+//!   extra SSH hop plus an inline shell script that logs in to <secret-manager> and // pii-test-fixture
 //!   shells out to `curl`/`python3 -c` is unnecessary — and is exactly the
 //!   kind of subprocess/shell chain the `RustTool` contract forbids. Same
 //!   end result (latest check content from Gitea), simpler and testable.
@@ -87,10 +87,6 @@ const CHECK_CATEGORY_OPS: &[&str] = &[
     "commute-tracker",
 ];
 
-const DEFAULT_SCRIPT: &str = "/usr/bin/python3 <path>/sentinel/ops.py";
-const DEFAULT_STATUS_GENERATOR_CMD: &str = "source <path>/axon/.env && \
-     export INBOX_DB_PASS PLANE_TOKEN_LUMINA && \
-     /usr/bin/python3 <path>/sentinel/status_generator.py 2>&1";
 const DEFAULT_REPO: &str = "lumina-sentinel";
 
 // ---------------------------------------------------------------------------
@@ -106,11 +102,15 @@ pub struct SentinelConfig {
     pub ssh_user: String,
     /// Path to the SSH private key file — from `SENTINEL_SSH_KEY_PATH`.
     pub ssh_key_path: Option<String>,
-    /// Remote ops script invocation — from `SENTINEL_SCRIPT`.
-    pub script: String,
+    /// Remote ops script invocation — from `SENTINEL_SCRIPT`. No compiled-in
+    /// default (PII remediation 2026-07): required at runtime, see
+    /// [`SentinelConfig::require_script`].
+    pub script: Option<String>,
     /// Remote command used by `sentinel_refresh_status` — from
-    /// `SENTINEL_STATUS_GENERATOR_CMD`.
-    pub status_generator_cmd: String,
+    /// `SENTINEL_STATUS_GENERATOR_CMD`. No compiled-in default (PII
+    /// remediation 2026-07): required at runtime, see
+    /// [`SentinelConfig::require_status_generator_cmd`].
+    pub status_generator_cmd: Option<String>,
     /// Live status page URL — from `SENTINEL_STATUS_PAGE_URL` (optional).
     pub status_page_url: Option<String>,
     /// Gitea repo Sentinel results live in — from `SENTINEL_REPO`.
@@ -123,14 +123,10 @@ impl SentinelConfig {
             ssh_host: env::var("SENTINEL_SSH_HOST").ok().filter(|s| !s.is_empty()),
             ssh_user: env::var("SENTINEL_SSH_USER").unwrap_or_else(|_| "root".into()),
             ssh_key_path: env::var("SENTINEL_SSH_KEY_PATH").ok().filter(|s| !s.is_empty()),
-            script: env::var("SENTINEL_SCRIPT")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DEFAULT_SCRIPT.into()),
+            script: env::var("SENTINEL_SCRIPT").ok().filter(|s| !s.is_empty()),
             status_generator_cmd: env::var("SENTINEL_STATUS_GENERATOR_CMD")
                 .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DEFAULT_STATUS_GENERATOR_CMD.into()),
+                .filter(|s| !s.is_empty()),
             status_page_url: env::var("SENTINEL_STATUS_PAGE_URL").ok().filter(|s| !s.is_empty()),
             repo: env::var("SENTINEL_REPO")
                 .ok()
@@ -149,6 +145,23 @@ impl SentinelConfig {
         self.ssh_key_path
             .as_deref()
             .ok_or_else(|| ToolError::NotConfigured("SENTINEL_SSH_KEY_PATH is not set".into()))
+    }
+
+    /// PII remediation (2026-07): `SENTINEL_SCRIPT` no longer has a
+    /// compiled-in fleet-host script path fallback.
+    fn require_script(&self) -> Result<&str, ToolError> {
+        self.script
+            .as_deref()
+            .ok_or_else(|| ToolError::NotConfigured("SENTINEL_SCRIPT is not set".into()))
+    }
+
+    /// PII remediation (2026-07): `SENTINEL_STATUS_GENERATOR_CMD` no longer
+    /// has a compiled-in fallback command (which embedded real fleet paths
+    /// and secret env var names).
+    fn require_status_generator_cmd(&self) -> Result<&str, ToolError> {
+        self.status_generator_cmd.as_deref().ok_or_else(|| {
+            ToolError::NotConfigured("SENTINEL_STATUS_GENERATOR_CMD is not set".into())
+        })
     }
 }
 
@@ -253,7 +266,13 @@ fn ssh_exec(config: &SentinelConfig, command: &str, timeout_secs: u64) -> Result
 /// `_trigger_status_page`, which backgrounds the command and ignores the
 /// result. We spawn a blocking task and detach it (do not await).
 fn trigger_status_page(config: Arc<SentinelConfig>) {
-    let cmd = config.status_generator_cmd.clone();
+    let cmd = match config.require_status_generator_cmd() {
+        Ok(cmd) => cmd.to_string(),
+        Err(e) => {
+            warn!("sentinel: background status refresh skipped: {e}");
+            return;
+        }
+    };
     tokio::task::spawn_blocking(move || {
         if let Err(e) = ssh_exec(&config, &cmd, 10) {
             warn!("sentinel: background status refresh failed: {e}");
@@ -317,7 +336,8 @@ impl RustTool for SentinelRun {
         }
         validate_args(op_args)?;
 
-        let mut command = format!("{} {}", self.config.script, operation);
+        let script = self.config.require_script()?;
+        let mut command = format!("{script} {operation}");
         if !op_args.is_empty() {
             command.push(' ');
             command.push_str(op_args);
@@ -459,7 +479,7 @@ impl RustTool for SentinelRefreshStatus {
 
     async fn execute(&self, _args: Value) -> Result<String, ToolError> {
         let cfg = Arc::clone(&self.config);
-        let cmd = cfg.status_generator_cmd.clone();
+        let cmd = cfg.require_status_generator_cmd()?.to_string();
         let result = tokio::task::spawn_blocking(move || ssh_exec(&cfg, &cmd, 60))
             .await
             .map_err(|e| ToolError::Execution(format!("Task join error: {e}")))?;
@@ -507,13 +527,19 @@ pub fn register(registry: &mut ToolRegistry) {
 mod tests {
     use super::*;
 
+    /// Test-fixture values standing in for `SENTINEL_SCRIPT` /
+    /// `SENTINEL_STATUS_GENERATOR_CMD`, which have no compiled-in default
+    /// (PII remediation 2026-07).
+    const TEST_SCRIPT: &str = "/opt/test-fixture/sentinel/ops.py";
+    const TEST_STATUS_GENERATOR_CMD: &str = "/opt/test-fixture/sentinel/status_generator.sh";
+
     fn test_config() -> Arc<SentinelConfig> {
         Arc::new(SentinelConfig {
             ssh_host: None,
             ssh_user: "root".into(),
             ssh_key_path: None,
-            script: DEFAULT_SCRIPT.into(),
-            status_generator_cmd: DEFAULT_STATUS_GENERATOR_CMD.into(),
+            script: Some(TEST_SCRIPT.into()),
+            status_generator_cmd: Some(TEST_STATUS_GENERATOR_CMD.into()),
             status_page_url: None,
             repo: DEFAULT_REPO.into(),
         })
@@ -631,6 +657,51 @@ mod tests {
         assert!(result.contains("valid_operations"));
     }
 
+    #[tokio::test]
+    async fn test_sentinel_run_not_configured_without_script() {
+        // PII remediation (2026-07): SENTINEL_SCRIPT has no compiled-in
+        // default — missing it must fail clean with NotConfigured.
+        let cfg = Arc::new(SentinelConfig {
+            ssh_host: Some("127.0.0.1".into()),
+            ssh_user: "root".into(),
+            ssh_key_path: Some("/tmp/nonexistent-key".into()),
+            script: None,
+            status_generator_cmd: Some(TEST_STATUS_GENERATOR_CMD.into()),
+            status_page_url: None,
+            repo: DEFAULT_REPO.into(),
+        });
+        let tool = SentinelRun { config: cfg };
+        let err = tool
+            .execute(json!({"operation": "self-health"}))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::NotConfigured(msg) => assert!(msg.contains("SENTINEL_SCRIPT")),
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sentinel_refresh_status_not_configured_without_generator_cmd() {
+        // PII remediation (2026-07): SENTINEL_STATUS_GENERATOR_CMD has no
+        // compiled-in default — missing it must fail clean with NotConfigured.
+        let cfg = Arc::new(SentinelConfig {
+            ssh_host: Some("127.0.0.1".into()),
+            ssh_user: "root".into(),
+            ssh_key_path: Some("/tmp/nonexistent-key".into()),
+            script: Some(TEST_SCRIPT.into()),
+            status_generator_cmd: None,
+            status_page_url: None,
+            repo: DEFAULT_REPO.into(),
+        });
+        let tool = SentinelRefreshStatus { config: cfg };
+        let err = tool.execute(json!({})).await.unwrap_err();
+        match err {
+            ToolError::NotConfigured(msg) => assert!(msg.contains("SENTINEL_STATUS_GENERATOR_CMD")),
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
+    }
+
     // --- infra-leak genericization (mirrors gateway's test) --------------
 
     #[test]
@@ -639,8 +710,8 @@ mod tests {
             ssh_host: Some("127.0.0.1".into()),
             ssh_user: "root".into(),
             ssh_key_path: Some("/tmp/nonexistent-key".into()),
-            script: DEFAULT_SCRIPT.into(),
-            status_generator_cmd: DEFAULT_STATUS_GENERATOR_CMD.into(),
+            script: Some(TEST_SCRIPT.into()),
+            status_generator_cmd: Some(TEST_STATUS_GENERATOR_CMD.into()),
             status_page_url: None,
             repo: DEFAULT_REPO.into(),
         };

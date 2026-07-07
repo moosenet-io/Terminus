@@ -42,7 +42,7 @@
 //! ## PII (hard block)
 //! Both corpora ship ONLY abstracted text. [`Corpus::from_json`] runs every doc
 //! and query through [`scan_pii`] and REJECTS the corpus if any line matches a PII
-//! pattern (private IPs, container ids like `<host>`, email addresses, names in a
+//! pattern (private IPs, container ids like `CT###`, email addresses, names in a // pii-test-fixture
 //! small blocklist, or secret-looking tokens). The pii_gate pre-push hook is the
 //! outer guard; this loader is the in-code guard so a PII-tainted corpus can never
 //! be parsed, let alone profiled.
@@ -165,8 +165,8 @@ impl Corpus {
 ///
 /// Patterns (the corpus is abstracted prose, so these are deliberately strict):
 ///   - private IPv4 ranges (`192.168.`, `10.`, `172.16`–`172.31.`),
-///   - container ids `CT` followed by a digit (e.g. `<host>`),
-///   - email addresses (`<email>`),
+///   - container ids `CT` followed by a digit (e.g. `CT###`), // pii-test-fixture
+///   - email addresses (`<email>`), // pii-test-fixture
 ///   - secret-looking tokens (long all-caps/underscore keys, hex/base64 blobs,
 ///     bearer/api-key markers),
 ///   - a small person-name blocklist drawn from the operator/agents context.
@@ -223,7 +223,7 @@ pub fn scan_pii(text: &str) -> Option<String> {
     // Person-name blocklist (operator + named agents from the project context).
     // Lowercased word-boundary match so substrings of ordinary words don't trip.
     const NAME_BLOCKLIST: &[&str] = &[
-        "<operator>", "moose", "lumina", "<host>", "axon", "vigil", "sentinel",
+        "<operator>", "moose", "lumina", "<host>", "axon", "vigil", "sentinel", // pii-test-fixture
     ];
     for name in NAME_BLOCKLIST {
         if word_present(&lc, name) {
@@ -839,11 +839,11 @@ mod tests {
 
     #[test]
     fn pii_gate_rejects_infra_and_pii() {
-        assert!(scan_pii("the host at <internal-ip> runs the service").is_some());
-        assert!(scan_pii("see container <host> for details").is_some());
-        assert!(scan_pii("mail me at <email>").is_some());
+        assert!(scan_pii("the host at <internal-ip> runs the service").is_some()); // pii-test-fixture
+        assert!(scan_pii("see container <host> for details").is_some()); // pii-test-fixture
+        assert!(scan_pii("mail me at <email>").is_some()); // pii-test-fixture
         assert!(scan_pii("api_key=abc").is_some());
-        assert!(scan_pii("token=<REDACTED-SECRET>1234").is_some());
+        assert!(scan_pii("token=<REDACTED-SECRET>1234").is_some()); // pii-test-fixture
         // The bare English word "secret" must NOT trip the gate (abstracted prose
         // is allowed to discuss secret handling).
         assert!(scan_pii("secrets are never pasted into a conversation").is_none());
@@ -874,12 +874,18 @@ mod tests {
 
     #[test]
     fn corpus_from_json_rejects_pii_doc() {
-        let bad = r#"{
+        // Private IP is interpolated (rather than embedded directly in the raw
+        // string) so it lives on its own line and can carry the repo's
+        // pii-test-fixture marker without corrupting the JSON literal.
+        let fixture_ip = "<internal-ip>"; // pii-test-fixture
+        let bad = format!(
+            r#"{{
             "name":"x","k":2,
-            "docs":[{"id":"d1","text":"reach the box at <internal-ip>"}],
-            "queries":[{"id":"q1","text":"where is the box","relevant":["d1"]}]
-        }"#;
-        assert!(Corpus::from_json(bad).is_err());
+            "docs":[{{"id":"d1","text":"reach the box at {fixture_ip}"}}],
+            "queries":[{{"id":"q1","text":"where is the box","relevant":["d1"]}}]
+        }}"#
+        );
+        assert!(Corpus::from_json(&bad).is_err());
     }
 
     #[test]

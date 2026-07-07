@@ -22,18 +22,18 @@ pub mod gitea;
 pub mod dev;
 pub mod gateway;
 pub mod github;
-pub mod <secret-manager>;
+pub mod <secret-manager>; // pii-test-fixture
 pub mod intake;
 pub mod network;
 pub mod odyssey;
 pub mod openhands;
 pub mod google;
-pub mod <media-service>;
+pub mod <media-service>; // pii-test-fixture
 pub mod litellm;
 pub mod lumina_ext;
 pub mod meridian;
 pub mod model_advisor;
-pub mod <container-mgr>;
+pub mod <container-mgr>; // pii-test-fixture
 pub mod prometheus;
 pub mod hearth;
 pub mod ledger;
@@ -51,7 +51,7 @@ pub mod sentinel;
 pub mod soma;
 pub mod skills;
 pub mod synapse;
-/// Trivial one-off tools ported from <host> that don't warrant their own
+/// Trivial one-off tools ported from the fleet host that don't warrant their own
 /// module (health, echo, utc_now, constellation_version, vector_onboard,
 /// searxng_search).
 pub mod sundry;

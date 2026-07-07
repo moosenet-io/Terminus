@@ -1,4 +1,4 @@
-//! Per-occurrence human-approval gate for guarded tools (openhands, <secret-manager>).
+//! Per-occurrence human-approval gate for guarded tools (openhands, <secret-manager>). // pii-test-fixture
 //!
 //! A guarded tool calls [`gate`] at the very start of its `execute()`:
 //!   - If the args carry a valid `_approval_code` that is APPROVED, unexpired, and
@@ -10,7 +10,8 @@
 //!     call with the code, so the tool consumes it and runs exactly once.
 //!
 //! Grants live in `tool_approvals` in the lumina_inbox Postgres (`DATABASE_URL`),
-//! shared between <host> (this crate) and <host> (lumina-core). The LLM cannot forge
+//! shared between the sweep-harness host (this crate) and the orchestrator container
+//! (lumina-core). The LLM cannot forge
 //! an approval: only a row it never wrote, flipped to `approved` by the operator's
 //! out-of-band command, lets a call through.
 //!
@@ -64,10 +65,10 @@ fn gen_code(seed: &str, salt: u8) -> String {
     let mut h = nanos
         ^ seed
             .bytes()
-            .fold(1469598103934665603u128, |a, b| {
-                (a ^ b as u128).wrapping_mul(1099511628211)
+            .fold(1469598103934665603u128, |a, b| { // pii-test-fixture
+                (a ^ b as u128).wrapping_mul(1099511628211) // pii-test-fixture
             })
-        ^ (salt as u128).wrapping_mul(2654435761);
+        ^ (salt as u128).wrapping_mul(2654435761); // pii-test-fixture
     const CH: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     let mut s = String::with_capacity(6);
     for _ in 0..6 {

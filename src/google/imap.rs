@@ -729,9 +729,9 @@ mod tests {
 
     fn cfg() -> GoogleConfig {
         GoogleConfig {
-            email: "<email>".into(),
+            email: "<email>".into(),  // pii-test-fixture
             app_password: "x".into(),
-            peter_email: "<email>".into(),
+            peter_email: "<email>".into(),  // pii-test-fixture
             lumina_calendar_id: None,
             extra_calendars: vec![],
         }
@@ -764,8 +764,8 @@ mod tests {
 
     #[test]
     fn extract_header_simple_and_case_insensitive() {
-        let h = "From: <email>\r\nSubject: Hello\r\nDate: Mon, 01 Jun 2026 09:00:00 +0000\r\n";
-        assert_eq!(extract_header(h, "From").as_deref(), Some("<email>"));
+        let h = "From: <email>\r\nSubject: Hello\r\nDate: Mon, 01 Jun 2026 09:00:00 +0000\r\n";  // pii-test-fixture
+        assert_eq!(extract_header(h, "From").as_deref(), Some("<email>"));  // pii-test-fixture
         assert_eq!(extract_header(h, "subject").as_deref(), Some("Hello"));
         assert_eq!(
             extract_header(h, "DATE").as_deref(),
@@ -775,12 +775,12 @@ mod tests {
 
     #[test]
     fn extract_header_missing_is_none() {
-        assert!(extract_header("From: <email>\r\n", "Subject").is_none());
+        assert!(extract_header("From: <email>\r\n", "Subject").is_none());  // pii-test-fixture
     }
 
     #[test]
     fn extract_header_unfolds_continuation() {
-        let h = "Subject: A very long subject\r\n that wraps here\r\nFrom: <email>\r\n";
+        let h = "Subject: A very long subject\r\n that wraps here\r\nFrom: <email>\r\n";  // pii-test-fixture
         let v = extract_header(h, "Subject").unwrap();
         assert!(v.contains("very long subject"));
         assert!(v.contains("that wraps here"));
@@ -788,8 +788,8 @@ mod tests {
 
     #[test]
     fn header_or_dash_falls_back() {
-        assert_eq!(header_or_dash("From: <email>\r\n", "Cc"), "—");
-        assert_eq!(header_or_dash("Cc: <email>\r\n", "Cc"), "<email>");
+        assert_eq!(header_or_dash("From: <email>\r\n", "Cc"), "—");  // pii-test-fixture
+        assert_eq!(header_or_dash("Cc: <email>\r\n", "Cc"), "<email>");  // pii-test-fixture
     }
 
     // ── body extraction ───────────────────────────────────────────────────────────
@@ -862,7 +862,7 @@ mod tests {
         let attrs = vec![
             AttributeValue::Uid(42),
             AttributeValue::Rfc822Header(Some(Cow::Borrowed(
-                b"From: <email>\r\nSubject: Hi\r\n" as &[u8],
+                b"From: <email>\r\nSubject: Hi\r\n" as &[u8],  // pii-test-fixture
             ))),
             AttributeValue::BodySection {
                 section: None,
@@ -882,7 +882,7 @@ mod tests {
         let attrs = vec![
             AttributeValue::Uid(7),
             AttributeValue::Rfc822(Some(Cow::Borrowed(
-                b"From: <email>\r\nSubject: Full\r\n\r\nThe body text." as &[u8],
+                b"From: <email>\r\nSubject: Full\r\n\r\nThe body text." as &[u8],  // pii-test-fixture
             ))),
         ];
         let msg = FetchedMessage::from_attrs(&attrs);
@@ -939,7 +939,7 @@ mod tests {
         assert!(parse_email_id(&json!({"email_id": ""})).is_err());
         assert!(parse_email_id(&json!({"email_id": "abc"})).is_err());
         assert!(parse_email_id(&json!({"email_id": "1 LOGOUT"})).is_err());
-        assert!(parse_email_id(&json!({"email_id": "12345678901"})).is_err());
+        assert!(parse_email_id(&json!({"email_id": "12345678901"})).is_err());  // pii-test-fixture
     }
 
     // ── newest_n ordering ─────────────────────────────────────────────────────────
@@ -984,7 +984,7 @@ mod tests {
         let fetched = vec![FetchedMessage {
             uid: Some(5),
             header:
-                "From: Alice <<email>>\r\nSubject: Hello\r\nDate: Mon, 01 Jun 2026 09:00:00 +0000\r\n"
+                "From: Alice <<email>>\r\nSubject: Hello\r\nDate: Mon, 01 Jun 2026 09:00:00 +0000\r\n"  // pii-test-fixture
                     .to_string(),
             body: String::new(),
         }];
@@ -992,19 +992,19 @@ mod tests {
         assert!(out.contains("showing 1 of 7 total"));
         assert!(out.contains("[id 5]"));
         assert!(out.contains("Hello"));
-        assert!(out.contains("Alice <<email>>"));
+        assert!(out.contains("Alice <<email>>"));  // pii-test-fixture
     }
 
     #[test]
     fn format_read_renders_message() {
         let msg = FetchedMessage {
             uid: Some(9),
-            header: "From: <email>\r\nTo: <email>\r\nSubject: Test\r\nDate: today\r\n".to_string(),
+            header: "From: <email>\r\nTo: <email>\r\nSubject: Test\r\nDate: today\r\n".to_string(),  // pii-test-fixture
             body: "Hello body.".to_string(),
         };
         let out = format_read(&msg);
-        assert!(out.contains("From: <email>"));
-        assert!(out.contains("To: <email>"));
+        assert!(out.contains("From: <email>"));  // pii-test-fixture
+        assert!(out.contains("To: <email>"));  // pii-test-fixture
         assert!(out.contains("Subject: Test"));
         assert!(out.contains("Hello body."));
     }
