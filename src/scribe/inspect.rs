@@ -2,8 +2,12 @@
 //!
 //! Scribe needs to read real source code to verify/discover functionality
 //! before writing docs about it -- via a git worktree, matching the build
-//! pipeline's own Stage 2 convention (`git worktree add <path> -b <branch>
-//! <ref>`) -- but must NEVER commit or push code changes itself.
+//! pipeline's own Stage 2 convention in spirit (`git worktree add <path> -b
+//! <branch> <ref>`). This module's checkouts are read-only inspections of an
+//! *existing* ref, not new work -- so unlike Stage 2, it never creates a new
+//! branch; it runs the simpler `git worktree add <path> -- <ref>` (checked
+//! out detached/on the existing ref). It must NEVER commit or push code
+//! changes itself.
 //!
 //! ## Structural no-commit/no-push guarantee
 //! Every git invocation this module can ever construct comes from
@@ -58,18 +62,51 @@ enum ReadOnlyGitOp<'a> {
     Fetch { repo_path: &'a Path, git_ref: &'a str },
 }
 
+/// Exact argv tokens that must never appear in a read-only git invocation.
+/// Checked at runtime for EVERY argv this module ever builds (not just in a
+/// unit test that happens to enumerate today's variants) -- see
+/// `argv_for`'s trailing call to this. Compared as whole tokens, not
+/// substrings, so a file path that merely contains the word "push" is never
+/// affected.
+const BANNED_EXACT_TOKENS: &[&str] = &["commit", "push", "remote", "config", "reset"];
+
+/// Runtime, always-on guard: panics if `argv` contains a banned verb as an
+/// exact token. `ReadOnlyGitOp`'s closed variant set (matched exhaustively in
+/// `argv_for`) should make this unreachable -- this assertion exists so that
+/// if a future edit to `argv_for` ever produced one anyway (e.g. a copy-paste
+/// mistake extending an existing arm), it fails loudly at the moment of
+/// construction, for every real call, not only for instances a test happens
+/// to build.
+fn assert_read_only_argv(argv: &[String]) {
+    for token in argv {
+        let lower = token.to_lowercase();
+        assert!(
+            !BANNED_EXACT_TOKENS.contains(&lower.as_str()),
+            "read-only git argv contained banned verb '{token}': {argv:?}"
+        );
+    }
+}
+
 /// Build the argv (excluding the `git` binary name itself) for a read-only
 /// git operation. Pure and side-effect-free -- unit tested without ever
 /// spawning a process, matching the `review_daemon::provider::build_command`
 /// precedent (argv-array builders, never a shell string).
+///
+/// A caller-influenced `git_ref` is passed to `git` after an explicit `--`
+/// end-of-options separator (belt-and-suspenders alongside
+/// `sanitize_ref_for_dirname`'s leading-`-` rejection): even if a ref value
+/// somehow reached this function unsanitized, `git` would parse it as a
+/// positional argument, never as a flag like `--upload-pack=...` (a known
+/// git option-injection primitive on `fetch`/`clone`-family commands).
 fn argv_for(op: &ReadOnlyGitOp) -> (PathBuf, Vec<String>) {
-    match op {
+    let (cwd, argv) = match op {
         ReadOnlyGitOp::WorktreeAdd { repo_path, worktree_path, git_ref } => (
             repo_path.to_path_buf(),
             vec![
                 "worktree".into(),
                 "add".into(),
                 worktree_path.to_string_lossy().into_owned(),
+                "--".into(),
                 git_ref.to_string(),
             ],
         ),
@@ -84,9 +121,11 @@ fn argv_for(op: &ReadOnlyGitOp) -> (PathBuf, Vec<String>) {
         ),
         ReadOnlyGitOp::Fetch { repo_path, git_ref } => (
             repo_path.to_path_buf(),
-            vec!["fetch".into(), "origin".into(), git_ref.to_string()],
+            vec!["fetch".into(), "origin".into(), "--".into(), git_ref.to_string()],
         ),
-    }
+    };
+    assert_read_only_argv(&argv);
+    (cwd, argv)
 }
 
 fn run(op: ReadOnlyGitOp) -> Result<String, ToolError> {
@@ -145,9 +184,21 @@ pub struct ModuleBundle {
 
 // ─── Checkout / cleanup ──────────────────────────────────────────────────────
 
-/// Turn a git ref into a filesystem-safe directory name component. Rejects
-/// path traversal (`..`) and path separators so a caller-influenced ref can
-/// never escape `worktree_root`.
+/// Validate a git ref before it is ever used to build a directory name OR
+/// passed to `git` (this function gates both `checkout` and `fetch_ref` --
+/// there is no code path that uses a `git_ref` without going through it
+/// first). Rejects:
+///   - empty
+///   - `..` (path traversal) or path separators `/`/`\` (this pass only
+///     supports bare branch names / full SHAs, not slash-containing branch
+///     names like `feature/foo` -- an intentional scope limit, not an
+///     oversight)
+///   - a leading `-` (defense in depth against git flag/option injection,
+///     e.g. `--upload-pack=...`, on top of the `--` end-of-options separator
+///     `argv_for` also inserts before every ref argument)
+///   - exactly `.` or `.git` (would otherwise resolve to `worktree_root`
+///     itself or its metadata directory, silently reusing/colliding instead
+///     of checking out the requested ref)
 fn sanitize_ref_for_dirname(git_ref: &str) -> Result<String, ToolError> {
     if git_ref.is_empty() {
         return Err(ToolError::InvalidArgument("git_ref must not be empty".into()));
@@ -155,6 +206,16 @@ fn sanitize_ref_for_dirname(git_ref: &str) -> Result<String, ToolError> {
     if git_ref.contains("..") || git_ref.contains('/') || git_ref.contains('\\') {
         return Err(ToolError::InvalidArgument(format!(
             "git_ref '{git_ref}' must not contain '..' or path separators"
+        )));
+    }
+    if git_ref.starts_with('-') {
+        return Err(ToolError::InvalidArgument(format!(
+            "git_ref '{git_ref}' must not start with '-' (would risk being parsed as a git option)"
+        )));
+    }
+    if git_ref == "." || git_ref == ".git" {
+        return Err(ToolError::InvalidArgument(format!(
+            "git_ref '{git_ref}' is not a valid ref (resolves to the worktree root/metadata dir)"
         )));
     }
     Ok(git_ref.to_string())
@@ -230,6 +291,12 @@ pub fn cleanup(wt: &InspectionWorktree) -> Result<(), ToolError> {
 /// out. Never pushes; only ever updates this local checkout's view of the
 /// remote.
 pub fn fetch_ref(repo_path: &Path, git_ref: &str) -> Result<(), ToolError> {
+    // Same validation `checkout` requires -- a bare `git_ref` reaching this
+    // function unvalidated was the gap flagged in review (option-injection
+    // via a leading `-`, e.g. `--upload-pack=...`, is a real primitive on
+    // `fetch`). `argv_for`'s `--` separator is defense in depth on top of
+    // this, not a substitute for it.
+    sanitize_ref_for_dirname(git_ref)?;
     run(ReadOnlyGitOp::Fetch { repo_path, git_ref }).map(|_| ())
 }
 
@@ -313,10 +380,16 @@ mod tests {
     use super::*;
     use std::process::Command as StdCommand;
 
-    /// Every `ReadOnlyGitOp` variant's generated argv, enumerated exhaustively
-    /// (the `match` in `argv_for` won't compile if a variant is added and
-    /// left unhandled) -- this is what makes the no-commit/no-push guarantee
-    /// structural rather than a snapshot of today's behavior.
+    /// Regression coverage for today's three `ReadOnlyGitOp` variants.
+    ///
+    /// IMPORTANT (per review, cycle 1): this test enumerating "all" variants
+    /// is a hand-maintained list -- adding a hypothetical fourth variant to
+    /// the enum does NOT make the compiler force an entry here, only in
+    /// `argv_for`'s own match. The real, always-on guarantee is
+    /// `assert_read_only_argv`, called from inside `argv_for` itself for
+    /// EVERY real invocation (not just instances this test happens to
+    /// construct) -- see that function. This test is regression coverage on
+    /// top of that runtime guard, not the guard itself.
     #[test]
     fn structural_read_only_guarantees() {
         let repo = PathBuf::from("/tmp/does-not-need-to-exist-for-this-test");
@@ -326,21 +399,26 @@ mod tests {
             ReadOnlyGitOp::WorktreeRemove { repo_path: &repo, worktree_path: &wt },
             ReadOnlyGitOp::Fetch { repo_path: &repo, git_ref: "main" },
         ];
-        const BANNED_VERBS: &[&str] = &["commit", "push", "remote", "config", "reset", "checkout", "-f", "--force-with-lease"];
+        // argv_for() itself calls assert_read_only_argv() on every branch,
+        // so simply calling it here already exercises the real guard; this
+        // loop is redundant-by-design regression coverage, spelled out
+        // explicitly rather than relying only on the side effect.
         for op in &ops {
             let (_, argv) = argv_for(op);
             for token in &argv {
-                let lower = token.to_lowercase();
-                for banned in BANNED_VERBS {
-                    // "--force" on worktree remove is fine (removing a local
-                    // dir, not a git-history-mutating force); only reject
-                    // exact banned verbs as their own argv token.
-                    if lower == *banned && *banned != "-f" && *banned != "--force-with-lease" {
-                        panic!("argv token '{token}' matches banned write/publish verb '{banned}' in {argv:?}");
-                    }
-                }
+                assert!(!BANNED_EXACT_TOKENS.contains(&token.to_lowercase().as_str()));
             }
         }
+    }
+
+    /// The runtime guard fires for a hypothetical write-shaped argv even if
+    /// it didn't come from a real `ReadOnlyGitOp` variant -- proving the
+    /// check itself is real (not a no-op) independent of what variants exist
+    /// today.
+    #[test]
+    #[should_panic(expected = "banned verb")]
+    fn assert_read_only_argv_actually_rejects_a_write_verb() {
+        assert_read_only_argv(&["commit".to_string(), "-m".to_string(), "oops".to_string()]);
     }
 
     #[test]
@@ -350,6 +428,24 @@ mod tests {
         assert!(sanitize_ref_for_dirname("").is_err());
         assert!(sanitize_ref_for_dirname("main").is_ok());
         assert!(sanitize_ref_for_dirname("SCRB-03-worktree-inspection").is_ok());
+    }
+
+    /// Cycle 1 review findings: option-injection via a leading `-`, and the
+    /// `.`/`.git` cases that would otherwise silently resolve to
+    /// `worktree_root` itself rather than erroring.
+    #[test]
+    fn sanitize_rejects_option_injection_and_dot_refs() {
+        assert!(sanitize_ref_for_dirname("--upload-pack=/tmp/evil.sh").is_err());
+        assert!(sanitize_ref_for_dirname("-x").is_err());
+        assert!(sanitize_ref_for_dirname(".").is_err());
+        assert!(sanitize_ref_for_dirname(".git").is_err());
+    }
+
+    #[test]
+    fn fetch_ref_rejects_an_unsanitized_ref_before_spawning_git() {
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let result = fetch_ref(&repo, "--upload-pack=/tmp/evil.sh");
+        assert!(matches!(result, Err(ToolError::InvalidArgument(_))));
     }
 
     #[test]
@@ -369,6 +465,30 @@ mod tests {
         let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let result = checkout(&repo, "../escape", Path::new("/tmp/scribe-test-worktrees-badref"));
         assert!(matches!(result, Err(ToolError::InvalidArgument(_))));
+    }
+
+    /// Cycle 1 review finding: the two existing "clean error" tests both
+    /// short-circuit *before* git is ever spawned (bad repo path, bad ref
+    /// syntax). This one is real repo + syntactically valid ref that simply
+    /// doesn't exist -- the actual path through `run()`'s
+    /// `output.status.success() == false` branch the acceptance criterion is
+    /// about.
+    #[test]
+    fn checkout_of_syntactically_valid_but_nonexistent_ref_is_a_clean_error() {
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let worktree_root = std::env::temp_dir().join(format!(
+            "scribe-inspect-test-badref-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&worktree_root);
+
+        let result = checkout(&repo, "totally-bogus-branch-xyz-does-not-exist", &worktree_root);
+        assert!(
+            matches!(result, Err(ToolError::Execution(_))),
+            "expected a git-reported Execution error, got: {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&worktree_root);
     }
 
     /// Real worktree checkout + file walk against a real small repo: this
