@@ -1546,7 +1546,7 @@ mod tests {
         ));
 
         let mut only_email = base.clone();
-        only_email["committer_email"] = json!("<email>");
+        only_email["committer_email"] = json!("<email>"); // pii-test-fixture
         assert!(matches!(
             tool.execute(only_email).await,
             Err(ToolError::InvalidArgument(_))
@@ -1559,7 +1559,7 @@ mod tests {
         // The PII gate blocks bare emails by default; allow-list this test's
         // fixture address so we're exercising the author/committer wiring,
         // not re-testing the (already covered) PII gate itself.
-        std::env::set_var("GITHUB_ALLOWED_AUTHORS", "<email>");
+        std::env::set_var("GITHUB_ALLOWED_AUTHORS", "<email>"); // pii-test-fixture
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(GET).path("/repos/moosenet-io/r/git/ref/heads/main");
@@ -1584,8 +1584,8 @@ mod tests {
                     "message": "m",
                     "tree": "treesha1",
                     "parents": ["basesha1"],
-                    "author": { "name": "Someone", "email": "<email>" },
-                    "committer": { "name": "Someone", "email": "<email>" }
+                    "author": { "name": "Someone", "email": "<email>" }, // pii-test-fixture
+                    "committer": { "name": "Someone", "email": "<email>" } // pii-test-fixture
                 }));
             then.status(201).json_body(json!({ "sha": "commitsha6" }));
         });
@@ -1600,7 +1600,7 @@ mod tests {
                 "repo": "r", "branch": "main", "base_sha": "basesha1", "message": "m",
                 "files": [{ "path": "a.txt", "content": "x" }],
                 "committer_name": "Someone",
-                "committer_email": "<email>"
+                "committer_email": "<email>" // pii-test-fixture
             }))
             .await
             .unwrap();
