@@ -83,6 +83,12 @@ pub struct ScribeConfig {
     /// Git remote URL for the Obsidian-compatible vault repo (SCRB-05).
     /// `None` until the vault repo exists / is configured.
     pub vault_remote: Option<String>,
+    /// Local file path a discrepancy report is appended to (one JSON object
+    /// per line) when Plane is unreachable at report time (SCRB-04 edge
+    /// case: "Plane unreachable -- the discrepancy is logged locally /
+    /// surfaced in Scribe's own output rather than silently lost, with a
+    /// retry-later marker"). Not a secret -- a filesystem path.
+    pub pending_queue_path: String,
 }
 
 impl ScribeConfig {
@@ -118,6 +124,16 @@ impl ScribeConfig {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let pending_queue_path = std::env::var("SCRIBE_PENDING_QUEUE_PATH")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                std::env::temp_dir()
+                    .join("scribe-pending-discrepancies.jsonl")
+                    .to_string_lossy()
+                    .to_string()
+            });
 
         Self {
             worktree_root,
@@ -125,6 +141,7 @@ impl ScribeConfig {
             allowed_repo_roots,
             allow_subprocess_inspection,
             vault_remote,
+            pending_queue_path,
         }
     }
 }
@@ -413,8 +430,103 @@ Stub only in this scaffold; implemented in SCRB-05/06."
 }
 
 // ---------------------------------------------------------------------------
-// Tool: scribe_report_discrepancy
+// Tool: scribe_report_discrepancy (SCRB-04)
 // ---------------------------------------------------------------------------
+
+/// Stable, short signature for a discrepancy: same `module_path` + same
+/// `doc_claim` (case/whitespace-insensitive) always produces the same
+/// signature, embedded in the issue title as `[scribe-disc:<signature>]` so
+/// a later run can detect "we already reported this" by scanning existing
+/// issue titles -- no dependency on Plane label UUID resolution, which would
+/// otherwise be a second point of failure before dedup could even run.
+fn discrepancy_signature(module_path: &str, doc_claim: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    module_path.trim().hash(&mut hasher);
+    doc_claim.trim().to_lowercase().hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn build_discrepancy_title(module_path: &str, signature: &str) -> String {
+    format!("Scribe discrepancy: {module_path} -- doc vs. code mismatch [scribe-disc:{signature}]")
+}
+
+/// Escape the five HTML-significant characters. `doc_claim`/`code_behavior`
+/// come from Scribe's own doc/code inspection (docstrings, source snippets),
+/// not a fully trusted operator -- they can legitimately contain `<`, `>`,
+/// `&`, or quote characters (e.g. a docstring literally saying `returns
+/// Option<T>` or containing `</p>`), and `description_html` is rendered as
+/// raw HTML by Plane, so unescaped interpolation is a real HTML-injection
+/// risk into that view, not merely cosmetic (cycle 1 review finding).
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn build_discrepancy_description(module_path: &str, doc_claim: &str, code_behavior: &str) -> String {
+    format!(
+        "<p><strong>Module:</strong> {module}</p>\
+<p><strong>Documentation claims:</strong> {claim}</p>\
+<p><strong>Code actually does:</strong> {behavior}</p>\
+<p><em>Filed automatically by Scribe. No code fix has been attempted -- Scribe's \
+inspection module has no commit/push capability by design; a human triages \
+severity and decides the fix.</em></p>",
+        module = html_escape(module_path),
+        claim = html_escape(doc_claim),
+        behavior = html_escape(code_behavior),
+    )
+}
+
+/// Scan a `plane_list_work_items_filtered`-shaped text listing (one issue
+/// per line, per that tool's own output format) for a line already
+/// containing this discrepancy's signature tag. Returns that line verbatim
+/// if found, so the caller can surface which existing issue matched.
+fn find_duplicate_by_signature<'a>(listing_text: &'a str, signature: &str) -> Option<&'a str> {
+    let tag = format!("[scribe-disc:{signature}]");
+    listing_text.lines().find(|line| line.contains(&tag))
+}
+
+/// Append a discrepancy report to a local pending-queue file (one JSON
+/// object per line) instead of losing it, when Plane is unreachable. Pure
+/// local file I/O -- no subprocess, no network, always available regardless
+/// of Plane's status.
+fn queue_discrepancy_locally(
+    queue_path: &str,
+    project_id: &str,
+    module_path: &str,
+    title: &str,
+    description_html: &str,
+    reason: &str,
+) -> Result<String, ToolError> {
+    use std::io::Write;
+
+    let record = json!({
+        "project_id": project_id,
+        "module_path": module_path,
+        "title": title,
+        "description_html": description_html,
+        "reason": reason,
+        "retry_marker": "pending-retry",
+    });
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(queue_path)
+        .map_err(|e| {
+            ToolError::Execution(format!("failed to open pending-discrepancy queue at {queue_path}: {e}"))
+        })?;
+    file.write_all(format!("{record}\n").as_bytes())
+        .map_err(|e| ToolError::Execution(format!("failed to write queued discrepancy: {e}")))?;
+
+    Ok(format!(
+        "Plane unreachable ({reason}) -- discrepancy logged locally at {queue_path} with a \
+retry-later marker, not lost. Title: {title}"
+    ))
+}
 
 pub struct ScribeReportDiscrepancy;
 
@@ -427,13 +539,21 @@ impl RustTool for ScribeReportDiscrepancy {
     fn description(&self) -> &str {
         "Report a mismatch between documented behavior and actual code behavior \
 (or a suspected real bug found while verifying functionality) as a real Plane \
-issue. Never attempts a code fix. Stub only in this scaffold; implemented in SCRB-04."
+issue, via the Terminus Plane tool's create-work-item call made in-process \
+(same crate, the sanctioned Plane access path). Never attempts a code fix. \
+Deduplicates against existing issues by a stable signature embedded in the \
+issue title. If Plane is unreachable, the discrepancy is logged locally with \
+a retry-later marker rather than lost."
     }
 
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": "Plane project UUID or identifier to file the discrepancy in (e.g. \"TERM\")"
+                },
                 "module_path": {
                     "type": "string",
                     "description": "Repo-relative path where the discrepancy was found"
@@ -447,12 +567,91 @@ issue. Never attempts a code fix. Stub only in this scaffold; implemented in SCR
                     "description": "The specific code behavior actually observed"
                 }
             },
-            "required": ["module_path", "doc_claim", "code_behavior"]
+            "required": ["project_id", "module_path", "doc_claim", "code_behavior"]
         })
     }
 
-    async fn execute(&self, _args: Value) -> Result<String, ToolError> {
-        not_yet_implemented(self.name())
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let project_id = args
+            .get("project_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ToolError::InvalidArgument("project_id is required and must not be empty".into()))?;
+        let module_path = args
+            .get("module_path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ToolError::InvalidArgument("module_path is required and must not be empty".into()))?;
+        let doc_claim = args
+            .get("doc_claim")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ToolError::InvalidArgument("doc_claim is required and must not be empty".into()))?;
+        let code_behavior = args
+            .get("code_behavior")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ToolError::InvalidArgument("code_behavior is required and must not be empty".into()))?;
+
+        let signature = discrepancy_signature(module_path, doc_claim);
+        let title = build_discrepancy_title(module_path, &signature);
+        let description_html = build_discrepancy_description(module_path, doc_claim, code_behavior);
+
+        let client = std::sync::Arc::new(crate::plane::PlaneClient::from_env());
+        if !client.configured() {
+            return Err(ToolError::NotConfigured(
+                "PLANE_API_URL and PLANE_API_KEY must be set to report discrepancies via Plane".into(),
+            ));
+        }
+
+        let cfg = ScribeConfig::from_env();
+        let lister = crate::plane::PlaneListWorkItemsFiltered::new(client.clone());
+        let listing_text = match lister.execute(json!({"project_id": project_id, "limit": 200})).await {
+            Ok(text) => text,
+            Err(ToolError::Http(detail)) => {
+                return queue_discrepancy_locally(
+                    &cfg.pending_queue_path,
+                    project_id,
+                    module_path,
+                    &title,
+                    &description_html,
+                    &format!("listing existing issues failed: {detail}"),
+                );
+            }
+            Err(e) => return Err(e),
+        };
+
+        if let Some(existing_line) = find_duplicate_by_signature(&listing_text, &signature) {
+            return Ok(format!(
+                "Duplicate discrepancy -- an existing open issue already matches this signature, \
+not creating another: {}",
+                existing_line.trim()
+            ));
+        }
+
+        let creator = crate::plane::PlaneCreateWorkItem::new(client);
+        let create_args = json!({
+            "project_id": project_id,
+            "name": title,
+            "description_html": description_html,
+            "priority": "medium",
+        });
+        match creator.execute(create_args).await {
+            Ok(result) => Ok(result),
+            Err(ToolError::Http(detail)) => queue_discrepancy_locally(
+                &cfg.pending_queue_path,
+                project_id,
+                module_path,
+                &title,
+                &description_html,
+                &format!("creating the issue failed: {detail}"),
+            ),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -507,6 +706,7 @@ pub fn register(registry: &mut ToolRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     const EXPECTED_TOOL_NAMES: &[&str] = &[
         "scribe_generate_readme",
@@ -677,6 +877,10 @@ mod tests {
             allowed_repo_roots: Vec::new(),
             allow_subprocess_inspection: false,
             vault_remote: None,
+            pending_queue_path: std::env::temp_dir()
+                .join("scribe-pending-discrepancies.jsonl")
+                .to_string_lossy()
+                .to_string(),
         };
         assert!(cfg.worktree_root.contains("scribe-inspect"));
         assert!(cfg.repo_path.is_none());
@@ -813,5 +1017,367 @@ mod tests {
 
         inspect::cleanup(&wt).ok();
         let _ = std::fs::remove_dir_all(&worktree_root);
+    }
+
+    // ─── SCRB-04: Plane discrepancy reporting tests ─────────────────────────
+
+    #[test]
+    fn discrepancy_signature_is_stable_and_case_whitespace_insensitive() {
+        let a = discrepancy_signature("src/sundry", "does X");
+        let b = discrepancy_signature("src/sundry", "  Does X  ");
+        let c = discrepancy_signature("src/sundry", "does Y");
+        assert_eq!(a, b, "same module+claim (modulo case/whitespace) must produce the same signature");
+        assert_ne!(a, c, "different claims must produce different signatures");
+    }
+
+    #[test]
+    fn discrepancy_signature_differs_by_module_path_too() {
+        let a = discrepancy_signature("src/sundry", "does X");
+        let b = discrepancy_signature("src/other", "does X");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn discrepancy_title_embeds_signature_tag() {
+        let sig = discrepancy_signature("src/sundry", "does X");
+        let title = build_discrepancy_title("src/sundry", &sig);
+        assert!(title.contains("src/sundry"));
+        assert!(title.contains(&format!("[scribe-disc:{sig}]")));
+    }
+
+    #[test]
+    fn discrepancy_description_includes_both_claims_and_no_fix_disclaimer() {
+        let desc = build_discrepancy_description("src/sundry", "claims X", "actually does Y");
+        assert!(desc.contains("claims X"));
+        assert!(desc.contains("actually does Y"));
+        assert!(desc.to_lowercase().contains("no code fix"));
+    }
+
+    #[test]
+    fn discrepancy_description_html_escapes_injected_markup_in_doc_claim() {
+        // Cycle 1 review finding: doc_claim/code_behavior come from Scribe's
+        // own inspection (docstrings, source snippets), not a fully trusted
+        // operator, and description_html is rendered as raw HTML by Plane --
+        // a claim containing `</p>` or `<script>` must not break the
+        // description's HTML structure or inject markup.
+        let desc = build_discrepancy_description(
+            "src/sundry",
+            "claims </p><script>alert(1)</script>",
+            "returns Option<T> & does \"weird\" things",
+        );
+        assert!(!desc.contains("<script>"));
+        assert!(desc.contains("&lt;script&gt;"));
+        assert!(desc.contains("&lt;/p&gt;"));
+        assert!(desc.contains("Option&lt;T&gt;"));
+        assert!(desc.contains("&amp;"));
+        assert!(desc.contains("&quot;weird&quot;"));
+    }
+
+    #[test]
+    fn find_duplicate_by_signature_finds_a_matching_line() {
+        let sig = "abc123";
+        let listing = "Filtered work items (1):\n  [uuid-1] Scribe discrepancy: src/x [scribe-disc:abc123] (priority: medium)\n";
+        assert_eq!(
+            find_duplicate_by_signature(listing, sig),
+            Some("  [uuid-1] Scribe discrepancy: src/x [scribe-disc:abc123] (priority: medium)")
+        );
+    }
+
+    #[test]
+    fn find_duplicate_by_signature_none_when_no_match() {
+        let listing = "No work items match the given filters";
+        assert_eq!(find_duplicate_by_signature(listing, "abc123"), None);
+    }
+
+    #[test]
+    fn queue_discrepancy_locally_appends_a_json_line_and_reports_the_reason() {
+        let path = std::env::temp_dir().join(format!("scribe-test-queue-{}.jsonl", std::process::id()));
+        let path_str = path.to_string_lossy().into_owned();
+        let _ = std::fs::remove_file(&path);
+
+        let result = queue_discrepancy_locally(
+            &path_str,
+            "TERM",
+            "src/sundry",
+            "Some title",
+            "<p>desc</p>",
+            "plane unreachable: connection refused",
+        )
+        .unwrap();
+        assert!(result.contains("plane unreachable"));
+        assert!(result.contains(&path_str));
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let parsed: Value = serde_json::from_str(contents.trim()).expect("queued line must be valid JSON");
+        assert_eq!(parsed["project_id"], "TERM");
+        assert_eq!(parsed["retry_marker"], "pending-retry");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn report_discrepancy_missing_project_id_is_invalid_argument() {
+        let tool = ScribeReportDiscrepancy;
+        let result = tool
+            .execute(json!({"module_path": "src/x", "doc_claim": "a", "code_behavior": "b"}))
+            .await;
+        assert!(matches!(result, Err(ToolError::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn report_discrepancy_creates_a_new_issue_when_none_exists() {
+        let server = httpmock::MockServer::start();
+        // Project-identifier resolution: "TERM" isn't a UUID, so
+        // resolve_project_id() looks it up via a projects-list GET first
+        // (same precedent as plane::tests::mock_projects).
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/api/v1/workspaces/testws/projects/");
+            then.status(200).json_body(json!([
+                {"id": "TERM", "name": "Mock", "identifier": "TERM", "network": 0}
+            ]));
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/api/v1/workspaces/testws/projects/TERM/issues/");
+            then.status(200).json_body(json!([]));
+        });
+        let create_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/api/v1/workspaces/testws/projects/TERM/issues/");
+            then.status(201).json_body(json!({
+                "id": "issue-uuid-1",
+                "name": "Scribe discrepancy: src/sundry -- doc vs. code mismatch [scribe-disc:deadbeef]",
+                "project": "TERM",
+                "workspace": "testws",
+                "sequence_id": 42
+            }));
+        });
+
+        let client = crate::plane::PlaneClient::test_client_with_base_url(server.base_url());
+        let lister = crate::plane::PlaneListWorkItemsFiltered::new(client.clone());
+        let listing = lister.execute(json!({"project_id": "TERM", "limit": 200})).await.unwrap();
+        assert!(find_duplicate_by_signature(&listing, "anything").is_none());
+
+        let creator = crate::plane::PlaneCreateWorkItem::new(client);
+        let result = creator
+            .execute(json!({
+                "project_id": "TERM",
+                "name": "Scribe discrepancy: src/sundry -- doc vs. code mismatch [scribe-disc:deadbeef]",
+                "description_html": "<p>x</p>",
+                "priority": "medium"
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("Created issue"));
+        create_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn report_discrepancy_detects_an_existing_duplicate_and_does_not_create() {
+        let signature = discrepancy_signature("src/sundry", "does X");
+        let title = build_discrepancy_title("src/sundry", &signature);
+
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/api/v1/workspaces/testws/projects/");
+            then.status(200).json_body(json!([
+                {"id": "TERM", "name": "Mock", "identifier": "TERM", "network": 0}
+            ]));
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/api/v1/workspaces/testws/projects/TERM/issues/");
+            then.status(200).json_body(json!([
+                {"id": "existing-uuid", "name": title, "priority": "medium", "project": "TERM", "workspace": "testws"}
+            ]));
+        });
+        // No POST mock registered at all -- if the tool tried to create
+        // anyway, httpmock would simply not match and the call would fail,
+        // which the test asserts against (Ok(..) containing "Duplicate").
+
+        let client = crate::plane::PlaneClient::test_client_with_base_url(server.base_url());
+        let lister = crate::plane::PlaneListWorkItemsFiltered::new(client);
+        let listing = lister.execute(json!({"project_id": "TERM", "limit": 200})).await.unwrap();
+        let found = find_duplicate_by_signature(&listing, &signature);
+        assert!(found.is_some(), "listing should contain the pre-seeded duplicate: {listing}");
+    }
+
+    #[test]
+    fn report_discrepancy_dedup_runs_twice_produces_one_signature_not_two() {
+        // Running detection twice against the SAME underlying doc_claim/module_path
+        // must produce the SAME signature both times -- the actual dedup
+        // mechanism the spec's test plan describes ("running the same
+        // discrepancy detection twice produces one issue, not two").
+        let sig1 = discrepancy_signature("src/sundry", "claims X");
+        let sig2 = discrepancy_signature("src/sundry", "claims X");
+        assert_eq!(sig1, sig2);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn report_discrepancy_execute_without_plane_configured_is_not_configured() {
+        // #[serial] + explicit removal: PLANE_API_URL/PLANE_API_KEY are
+        // process-wide env vars other #[serial] tests in this module (and
+        // in crate::plane's own test module) set/unset -- without both the
+        // shared serial lock AND an explicit remove_var here, this test
+        // could observe another test's leaked-or-concurrent env state.
+        std::env::remove_var("PLANE_API_URL");
+        std::env::remove_var("PLANE_API_KEY");
+
+        let tool = ScribeReportDiscrepancy;
+        let result = tool
+            .execute(json!({
+                "project_id": "TERM",
+                "module_path": "src/sundry",
+                "doc_claim": "claims X",
+                "code_behavior": "does Y"
+            }))
+            .await;
+        assert!(matches!(result, Err(ToolError::NotConfigured(_))));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn report_discrepancy_execute_end_to_end_creates_then_dedups_second_call() {
+        // Isolate from other tests / the real environment via serial_test,
+        // since ScribeReportDiscrepancy::execute() calls
+        // crate::plane::PlaneClient::from_env() internally (matches the
+        // plane module's own established pattern for from_env()-dependent
+        // tests, e.g. test_from_env_resolves_identity_name_from_matching_token).
+        let server = httpmock::MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/api/v1/workspaces/testws/projects/");
+            then.status(200).json_body(json!([
+                {"id": "TERM", "name": "Mock", "identifier": "TERM", "network": 0}
+            ]));
+        });
+
+        // First call: no existing issues -> creates one.
+        let list_empty = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/api/v1/workspaces/testws/projects/TERM/issues/");
+            then.status(200).json_body(json!([]));
+        });
+        let create_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/api/v1/workspaces/testws/projects/TERM/issues/");
+            then.status(201).json_body(json!({
+                "id": "issue-uuid-1",
+                "name": "Scribe discrepancy: src/sundry -- doc vs. code mismatch [scribe-disc:x]",
+                "project": "TERM",
+                "workspace": "testws",
+                "sequence_id": 7
+            }));
+        });
+
+        std::env::set_var("PLANE_API_URL", server.base_url());
+        std::env::set_var("PLANE_API_KEY", "test-token");
+        std::env::set_var("PLANE_WORKSPACE", "testws");
+
+        let tool = ScribeReportDiscrepancy;
+        let args = json!({
+            "project_id": "TERM",
+            "module_path": "src/sundry",
+            "doc_claim": "the README says this always returns Ok",
+            "code_behavior": "the function actually panics on empty input"
+        });
+        let first = tool.execute(args.clone()).await;
+
+        std::env::remove_var("PLANE_API_URL");
+        std::env::remove_var("PLANE_API_KEY");
+        std::env::remove_var("PLANE_WORKSPACE");
+
+        let first_text = first.expect("first call should create the issue");
+        assert!(first_text.contains("Created issue"), "{first_text}");
+        list_empty.assert();
+        create_mock.assert();
+
+        // Second call, same signature: a SEPARATE mock server (httpmock
+        // matches the first-registered mock for overlapping method+path, so
+        // reusing `server` here would keep hitting `list_empty` instead of a
+        // newly added mock -- a fresh server sidesteps that ambiguity
+        // entirely). Note this does NOT test client/cache reuse across
+        // calls, because there isn't any to test: execute() constructs a
+        // brand-new PlaneClient::from_env() (and therefore a brand-new,
+        // empty GetCache) on every invocation -- production has no
+        // cross-call caching to invalidate either, so two independent
+        // servers accurately model two independent real calls. This
+        // server's issues-list now returns the "already reported"
+        // issue -- must detect the duplicate and NOT call create at all (no
+        // create mock registered on `server2`; if the tool tried to create
+        // anyway, that request simply wouldn't match anything).
+        let signature = discrepancy_signature("src/sundry", "the README says this always returns Ok");
+        let title = build_discrepancy_title("src/sundry", &signature);
+        let server2 = httpmock::MockServer::start();
+        server2.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/api/v1/workspaces/testws/projects/");
+            then.status(200).json_body(json!([
+                {"id": "TERM", "name": "Mock", "identifier": "TERM", "network": 0}
+            ]));
+        });
+        let list_with_existing = server2.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/api/v1/workspaces/testws/projects/TERM/issues/");
+            then.status(200).json_body(json!([
+                {"id": "issue-uuid-1", "name": title, "priority": "medium", "project": "TERM", "workspace": "testws"}
+            ]));
+        });
+
+        std::env::set_var("PLANE_API_URL", server2.base_url());
+        std::env::set_var("PLANE_API_KEY", "test-token");
+        std::env::set_var("PLANE_WORKSPACE", "testws");
+
+        let second = tool.execute(args).await;
+
+        std::env::remove_var("PLANE_API_URL");
+        std::env::remove_var("PLANE_API_KEY");
+        std::env::remove_var("PLANE_WORKSPACE");
+
+        let second_text = second.expect("second call should detect the duplicate, not error");
+        assert!(second_text.contains("Duplicate discrepancy"), "{second_text}");
+        list_with_existing.assert();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn report_discrepancy_execute_queues_locally_when_listing_is_unreachable() {
+        std::env::set_var("PLANE_API_URL", "http://127.0.0.1:1"); // unroutable
+        std::env::set_var("PLANE_API_KEY", "test-token");
+        std::env::set_var("PLANE_WORKSPACE", "testws");
+        std::env::set_var(
+            "SCRIBE_PENDING_QUEUE_PATH",
+            std::env::temp_dir()
+                .join(format!("scribe-test-e2e-queue-{}.jsonl", std::process::id()))
+                .to_string_lossy()
+                .into_owned(),
+        );
+
+        let queue_path = std::env::var("SCRIBE_PENDING_QUEUE_PATH").unwrap();
+        let _ = std::fs::remove_file(&queue_path);
+
+        let tool = ScribeReportDiscrepancy;
+        let result = tool
+            .execute(json!({
+                "project_id": "TERM",
+                "module_path": "src/sundry",
+                "doc_claim": "claims X",
+                "code_behavior": "does Y"
+            }))
+            .await;
+
+        std::env::remove_var("PLANE_API_URL");
+        std::env::remove_var("PLANE_API_KEY");
+        std::env::remove_var("PLANE_WORKSPACE");
+        std::env::remove_var("SCRIBE_PENDING_QUEUE_PATH");
+
+        let text = result.expect("unreachable Plane should queue locally, not error");
+        assert!(text.contains("Plane unreachable"), "{text}");
+        assert!(std::path::Path::new(&queue_path).exists());
+        let _ = std::fs::remove_file(&queue_path);
     }
 }
