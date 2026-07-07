@@ -1,6 +1,6 @@
 //! Cortex tools — code-graph / blast-radius / risk-scoring system, ported
-//! from the Python `cortex_tools.py` on the source host (ai-terminus,
-//! the source host's MCP endpoint).
+//! from the Python `cortex_tools.py` on the source host (the legacy Python
+//! MCP host, the source host's MCP endpoint).
 //!
 //! ## Verified transport (IMPORTANT — read before touching this module)
 //!
@@ -181,7 +181,7 @@
 //!   resolver that runs project code) — again, unobservable from here.
 //!
 //! **Recommendation to the operator:** audit the fleet-host `cortex` script
-//! directly (path assumed `<path>/cortex/ops.py`, unverified) for
+//! directly (path assumed to be the fleet host's `cortex/ops.py`, unverified) for
 //! actual sandbox isolation and guaranteed cleanup before treating
 //! `cortex_audit` as safe to run against arbitrary operator-supplied URLs in
 //! production. This Rust port is, at best, as safe as that remote script —
@@ -218,6 +218,10 @@ const MAX_TEXT_LEN: usize = 2000;
 /// **Not observed on the wire** — the fleet host was unreachable for the
 /// whole porting session. Audit against the real source-host implementation before relying
 /// on this in production.
+///
+/// PII remediation note (2026-07): real functional default (remote script
+/// path on the fleet host) — left unchanged, not guess-redacted; flagged for
+/// operator review before any public release.
 const DEFAULT_SCRIPT: &str = "/usr/bin/python3 <path>/cortex/ops.py";
 
 // ---------------------------------------------------------------------------

@@ -22,7 +22,7 @@
 //!
 //! ## What was verified live vs. inferred
 //! The exact tool names, descriptions, and JSON Schemas below were pulled
-//! directly from the scheduler host's live MCP endpoint (server `ai-mcp` 1.26.0) via
+//! directly from the scheduler host's live MCP endpoint (the legacy tool set, v1.26.0) via
 //! `initialize` + `tools/list`. `routines_pending`'s exact response shape
 //! (`{"pending": bool, "proposal": {...}}`) was also verified live — that host had
 //! a stale test proposal sitting in its staging file at the time of the port:
@@ -135,6 +135,10 @@ impl RoutinesConfig {
             ssh_host: env::var("ROUTINES_SSH_HOST").ok(),
             ssh_user: env::var("ROUTINES_SSH_USER").unwrap_or_else(|_| "root".into()),
             ssh_key_path: env::var("ROUTINES_SSH_KEY_PATH").ok(),
+            // PII remediation note (2026-07): "<host>" is a real, functional
+            // default CLI binary name — left unchanged rather than
+            // guess-redacted; flagged for operator review before any public
+            // release.
             cli: env::var("ROUTINES_CLI").unwrap_or_else(|_| "<host>".into()),
             staging_path: env::var("ROUTINES_STAGING_PATH")
                 .map(PathBuf::from)

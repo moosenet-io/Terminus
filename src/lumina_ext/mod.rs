@@ -1,5 +1,5 @@
-//! `lumina_*` tools — ported from the legacy Python MCP host's server ("ai-terminus",
-//! streamable-HTTP MCP endpoint, tool set `ai-mcp` v1.26.0). This module
+//! `lumina_*` tools — ported from the legacy Python MCP host's server (the
+//! legacy Python MCP host, streamable-HTTP MCP endpoint, legacy tool set v1.26.0). This module
 //! groups the six remaining `lumina_*` tools that had not yet been ported to
 //! Rust (`lumina_weather` was already ported separately, as `weather::mod`).
 //!
@@ -67,7 +67,7 @@ use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
 // ---------------------------------------------------------------------------
-// Targets (verified live against the legacy host's `ai-mcp` on a recent date)
+// Targets (verified live against the legacy host's MCP tool set on a recent date)
 // ---------------------------------------------------------------------------
 
 const CLAWHUB_SEARCH_URL: &str = "https://clawhub.ai/api/search";

@@ -1,5 +1,5 @@
 //! Sundry trivial tools — ported 1:1 from the Python MCP server on the legacy
-//! Terminus host (`ai-terminus`, streamable-HTTP MCP endpoint). These are small
+//! Terminus host (the legacy Python MCP host, streamable-HTTP MCP endpoint). These are small
 //! utility/one-liner tools that don't warrant a dedicated module of their own.
 //!
 //! Verified against the live legacy Terminus server via `tools/list` (for schema) and

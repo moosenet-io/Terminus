@@ -683,10 +683,16 @@ impl RustTool for VitalsRecent {
 const VALID_IMPORT_FORMATS: &[&str] = &["samsung_health", "strava", "apple_health"];
 
 /// Only files under this directory may be imported. This is the directory
-/// the tool's own description tells <operator> to upload CSVs to, so it doubles
-/// as an explicit containment boundary (defense in depth): even though the
-/// backend does the actual file read/parse, the Rust tool never forwards a
-/// path outside the intended drop directory.
+/// the tool's own description tells the operator to upload CSVs to, so it
+/// doubles as an explicit containment boundary (defense in depth): even
+/// though the backend does the actual file read/parse, the Rust tool never
+/// forwards a path outside the intended drop directory.
+///
+/// PII remediation note (2026-07): this is a real, functional security
+/// boundary — the exact prefix the containment check matches on the real
+/// fleet host. Left unchanged rather than guess-redacted (renaming it would
+/// silently change what this gate actually permits); flagged for operator
+/// review before any public release.
 const VITALS_IMPORT_DIR: &str = "<path>/vitals/data/";
 
 fn validate_import_path(raw: &str) -> Result<String, ToolError> {
@@ -726,9 +732,9 @@ impl RustTool for VitalsImport {
 
     fn description(&self) -> &str {
         "Import health data from a CSV file on the fleet host. file_path: absolute path to the \
-         CSV on the fleet host (e.g. <path>/vitals/data/activities.csv). format: \
+         CSV, under the fleet host's designated vitals-import directory. format: \
          'samsung_health', 'strava', or 'apple_health'. Returns count of imported and \
-         skipped rows. <operator>: upload your CSV to <path>/vitals/data/ first."
+         skipped rows. Upload your CSV to the vitals-import directory first."
     }
 
     fn parameters(&self) -> Value {
@@ -737,7 +743,7 @@ impl RustTool for VitalsImport {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Absolute path to the CSV on the fleet host, e.g. <path>/vitals/data/activities.csv"
+                    "description": "Absolute path to the CSV, under the fleet host's designated vitals-import directory"
                 },
                 "format": {
                     "type": "string",
@@ -1501,7 +1507,7 @@ mod tests {
         let tool = VitalsImport;
         let result = tool
             .execute(json!({
-                "file_path": "<path>/vitals/data/activities.csv",
+                "file_path": "<path>/vitals/data/activities.csv", // pii-test-fixture
                 "format": "strava"
             }))
             .await
@@ -1529,7 +1535,7 @@ mod tests {
         let tool = VitalsImport;
         let err = tool
             .execute(json!({
-                "file_path": "<path>/vitals/data/../../etc/passwd",
+                "file_path": "<path>/vitals/data/../../etc/passwd", // pii-test-fixture
                 "format": "strava"
             }))
             .await
@@ -1544,7 +1550,7 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         set_env("http://localhost:9");
         let tool = VitalsImport;
-        for bad in ["/etc/passwd", "/root/.ssh/id_rsa", "<path>/other/activities.csv"] {
+        for bad in ["/etc/passwd", "/root/.ssh/id_rsa", "<path>/other/activities.csv"] { // pii-test-fixture
             let err = tool
                 .execute(json!({"file_path": bad, "format": "strava"}))
                 .await
@@ -1575,7 +1581,7 @@ mod tests {
         let tool = VitalsImport;
         let err = tool
             .execute(json!({
-                "file_path": "<path>/vitals/data/activities.csv",
+                "file_path": "<path>/vitals/data/activities.csv", // pii-test-fixture
                 "format": "garmin"
             }))
             .await

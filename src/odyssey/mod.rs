@@ -13,9 +13,9 @@
 //! ## Backend assumption (CRUD tools) — FLAG FOR HUMAN AUDIT
 //! The live source-host implementation does **not** talk to Engram over HTTP. It
 //! SSHes from the source host to a fleet host (`root@YOUR_FLEET_SERVER_IP`) and runs
-//! `<path>/odyssey/odyssey.py <subcommand>`, which in turn imports
-//! `<path>/engram/engram.py` and/or opens
-//! `<path>/engram/engram.db` (SQLite) directly. There is no HTTP
+//! the fleet host's `odyssey/odyssey.py <subcommand>`, which in turn imports
+//! the fleet host's `engram/engram.py` and/or opens
+//! the fleet host's `engram/engram.db` (SQLite) directly. There is no HTTP
 //! wire protocol to observe or replicate — confirmed by reading the live
 //! `odyssey_tools.py` off the source host and the canonical `odyssey.py` / `engram.py`
 //! sources in this monorepo (`src/fleet/odyssey/odyssey.py`,

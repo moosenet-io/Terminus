@@ -371,8 +371,8 @@ pub fn breakfix_fetch_model_timeout_secs() -> u64 {
 // ── Meridian (SIMULATED paper-trading sandbox) ────────────────────────────
 //
 // Ported from the legacy host's Python `meridian_tools.py`, which SSH'd to the fleet
-// host and shelled out to a `meridian.py` / `market_data.py` pair under
-// `<path>/meridian/`. That directory does not exist on the fleet host (nor
+// host and shelled out to a `meridian.py` / `market_data.py` pair under the
+// fleet host's Meridian directory. That directory does not exist on the fleet host (nor
 // anywhere else reachable) — there was never a real backend to port state
 // persistence *from*. This module introduces its own local JSON-file
 // persistence (whole-document load/save, mirroring `intake`'s

@@ -56,7 +56,7 @@ fn patterns() -> &'static Patterns {
         phone: Regex::new(r"\+?\d[\d\s\-]{8,}\d").expect("phone regex"),
         api_key: Regex::new(r"\b(?:sk-|ghp_|gsk_|glpat-|xox[bpasr]-)\S+") // pii-test-fixture
             .expect("api_key regex"),
-        internal_path: Regex::new(r"<path>/|<path>/|<path>/|<path>/") // pii-test-fixture
+        internal_path: Regex::new(r"<path>/|<path>/|<path>/|/opt/lumina[a-z0-9-]*/") // pii-test-fixture
             .expect("internal_path regex"),
         local_url: Regex::new(r"(?:localhost|127\.0\.0\.1|0\.0\.0\.0):\d{4,5}")
             .expect("local_url regex"),

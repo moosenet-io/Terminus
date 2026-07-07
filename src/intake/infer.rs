@@ -23,6 +23,10 @@ use serde::{Deserialize, Serialize};
 use crate::intake::context;
 
 /// Default chord model-registry path (overridable via `MODEL_REGISTRY_PATH`).
+///
+/// PII remediation note (2026-07): real, functional default path on the
+/// sweep-harness host — left unchanged rather than guess-redacted; flagged
+/// for operator review before any public release.
 const DEFAULT_REGISTRY_PATH: &str = "<path>/model-registry.json";
 
 /// Normalized per-inference metrics, backend-agnostic.
@@ -639,7 +643,7 @@ mod tests {
 
     #[test]
     fn resolve_reads_tagged_backend() {
-        // Loopback URL interpolated onto its own tggable line — see comment in
+        // Loopback URL interpolated onto its own taggable line — see comment in
         // `override_forces_backend_regardless_of_tag` above for why.
         let llama_gpu_url = "http://localhost:8082/"; // pii-test-fixture
         let path = tmp_registry(
@@ -737,7 +741,7 @@ mod tests {
         // resolves to the default "ollama" backend) comes out pointed at the
         // remote URL — proving the override reaches where a request dispatches
         // without needing a live remote Ollama.
-        // Loopback URL interpolated onto its own tggable line — see comment in
+        // Loopback URL interpolated onto its own taggable line — see comment in
         // `override_forces_backend_regardless_of_tag` above for why.
         let ollama_url = "http://127.0.0.1:11434"; // pii-test-fixture
         let path = tmp_registry(

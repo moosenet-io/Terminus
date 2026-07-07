@@ -46,9 +46,9 @@
 //!   SYNAPSE_SSH_KEY_PATH  — path to the SSH private key file.
 //!   SYNAPSE_SCRIPT        — remote synapse script, default mirrors the Python.
 //!   SYNAPSE_CONFIG_PATH   — local config file path (YAML), default
-//!                           "<path>/synapse/config.yaml".
+//!                           a config file under the fleet host's Synapse directory.
 //!   SYNAPSE_LOG_PATH      — local log file path (last-sent marker source),
-//!                           default "<path>/synapse/pulse.log".
+//!                           default a log file under the fleet host's Synapse directory.
 //!
 //! ## Security model
 //! - `hours` is validated to the documented 1-72 range before it is ever
@@ -74,6 +74,9 @@ use crate::tool::RustTool;
 // Constants
 // ---------------------------------------------------------------------------
 
+// PII remediation note (2026-07): these three are real functional defaults
+// (remote script/config/log paths on the fleet host) — left unchanged, not
+// guess-redacted; flagged for operator review before any public release.
 const DEFAULT_SCRIPT: &str = "/usr/bin/python3 <path>/synapse/synapse.py";
 const DEFAULT_CONFIG_PATH: &str = "<path>/synapse/config.yaml";
 const DEFAULT_LOG_PATH: &str = "<path>/synapse/pulse.log";

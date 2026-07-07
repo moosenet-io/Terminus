@@ -87,6 +87,9 @@ const CHECK_CATEGORY_OPS: &[&str] = &[
     "commute-tracker",
 ];
 
+// PII remediation note (2026-07): these two are real functional defaults
+// (remote script/command paths on the fleet host) — left unchanged, not
+// guess-redacted; flagged for operator review before any public release.
 const DEFAULT_SCRIPT: &str = "/usr/bin/python3 <path>/sentinel/ops.py";
 const DEFAULT_STATUS_GENERATOR_CMD: &str = "source <path>/axon/.env && \
      export INBOX_DB_PASS PLANE_TOKEN_LUMINA && \

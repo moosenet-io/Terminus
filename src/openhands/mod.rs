@@ -24,6 +24,9 @@ use crate::error::ToolError;
 use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
+// PII remediation note (2026-07): real, functional default working
+// directory on the dev workstation — left unchanged rather than
+// guess-redacted; flagged for operator review before any public release.
 const DEFAULT_WORKING_DIR: &str = "<path>/arcade";
 
 // ── Config ────────────────────────────────────────────────────────────────────

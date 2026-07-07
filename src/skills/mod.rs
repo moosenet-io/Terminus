@@ -2,10 +2,10 @@
 //!
 //! Skills are filesystem CRUD over `active/`/`proposed/` skill directories in
 //! agentskills.io markdown format (YAML frontmatter + Markdown body), rooted
-//! at `<path>/skills/` on the fleet host — confirmed live against
+//! at the fleet host's skills directory — confirmed live against
 //! the fleet host via `tools/call`:
 //!   - `skills_create` (proposed=true, default) returned
-//!     `"path": "<path>/skills/proposed/<name>/SKILL.md"`.
+//!     `"path": "<fleet skills dir>/proposed/<name>/SKILL.md"`.
 //!   - `skills_list` reads the `active/` directory (returns
 //!     `{"count": 0, "skills": []}` when empty — confirmed empty on the live
 //!     server at port time).
@@ -24,8 +24,8 @@
 //!   subprocess), mirroring `dev/mod.rs`'s read/write file pattern and
 //!   `sentinel/mod.rs` / `vigil/mod.rs`'s fleet-host script convention —
 //!   Terminus itself does not run on the fleet host, so reaching
-//!   `<path>/skills/` means an SSH hop, exactly like every other
-//!   module that touches fleet-host paths.
+//!   the fleet host's skills directory means an SSH hop, exactly like every
+//!   other module that touches fleet-host paths.
 //! - Adds a strict `skill_name` allowlist (kebab-case: lowercase letters,
 //!   digits, hyphens only) before it is ever placed into a remote path or
 //!   shell command. The Python docstring says "kebab-case" but the live
@@ -41,8 +41,8 @@
 //!   SKILLS_SSH_HOST      — SSH host of the fleet box (e.g. "192.168.0.X").
 //!   SKILLS_SSH_USER      — SSH user, default "root".
 //!   SKILLS_SSH_KEY_PATH  — path to the SSH private key file.
-//!   SKILLS_ACTIVE_DIR    — default "<path>/skills/active".
-//!   SKILLS_PROPOSED_DIR  — default "<path>/skills/proposed".
+//!   SKILLS_ACTIVE_DIR    — default a directory under the fleet host's skills directory.
+//!   SKILLS_PROPOSED_DIR  — default a directory under the fleet host's skills directory.
 //!
 //! ## Security model
 //! - `skill_name` must match `^[a-z0-9][a-z0-9-]*$` — no path separators,
@@ -70,6 +70,9 @@ use crate::tool::RustTool;
 // Constants
 // ---------------------------------------------------------------------------
 
+// PII remediation note (2026-07): these two are real functional defaults
+// (skill directories on the fleet host) — left unchanged, not guess-redacted;
+// flagged for operator review before any public release.
 const DEFAULT_ACTIVE_DIR: &str = "<path>/skills/active";
 const DEFAULT_PROPOSED_DIR: &str = "<path>/skills/proposed";
 const DEFAULT_AGENT: &str = "lumina";

@@ -46,6 +46,12 @@ use crate::tool::RustTool;
 /// The default allowlist — byte-for-byte the same set the Python source ships.
 /// Overridable via `ANSIBLE_PLAYBOOK_ALLOWLIST` (comma-separated) for ops, but the
 /// default exactly matches the Python so behaviour is identical out of the box.
+///
+/// PII remediation note (2026-07): these are real, functional security-gate
+/// values (the exact playbook names this allowlist matches against on the
+/// real ops control node). Left unchanged rather than guess-redacted —
+/// renaming them would silently change what this gate actually permits;
+/// flagged for operator review before any public release.
 const DEFAULT_ALLOWLIST: &[&str] = &[
     "deploy-<host>-db",
     "deploy-<host>-ct",

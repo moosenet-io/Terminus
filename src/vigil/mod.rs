@@ -54,6 +54,9 @@ use crate::tool::RustTool;
 // ---------------------------------------------------------------------------
 
 const VALID_BRIEFING_TYPES: &[&str] = &["morning", "afternoon"];
+// PII remediation note (2026-07): real functional default (the remote script
+// path this tool SSHes to and executes on the fleet host) — left unchanged,
+// not guess-redacted; flagged for operator review before any public release.
 const DEFAULT_SCRIPT: &str = "/usr/bin/python3 <path>/vigil/briefing.py";
 const DEFAULT_REPO: &str = "lumina-vigil";
 

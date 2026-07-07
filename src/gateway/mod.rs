@@ -51,6 +51,9 @@ use crate::tool::RustTool;
 // ---------------------------------------------------------------------------
 
 const DEFAULT_GATEWAY_URL: &str = "http://localhost:8080"; // pii-test-fixture
+// PII remediation note (2026-07): real functional default (remote command
+// path on the fleet host) — left unchanged, not guess-redacted; flagged for
+// operator review before any public release.
 const DEFAULT_COMPOSER_CMD: &str = "set -a && . <path>/axon/.env && set +a && \
      python3 <path>/dashboard/composer.py 2>&1 | tail -10";
 

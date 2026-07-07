@@ -5,14 +5,14 @@
 //! `meridian_market_data`, `meridian_reset`). The Python original was a thin
 //! wrapper that SSH'd from the legacy host to the fleet host (`pct exec <id> ...`) and shelled
 //! out to a `meridian.py` / `market_data.py` pair under
-//! `<path>/meridian/` on the fleet host.
+//! the fleet host's Meridian directory.
 //!
 //! ## What was actually observed (live, 2026-07-06) — pii-test-fixture
 //! Calling the live legacy-host tools returned SSH/shell errors (`ssh: Could not
 //! resolve hostname <redacted-host>`, shell syntax errors) rather than portfolio data. A
 //! filesystem search of the fleet host (`find / -iname 'meridian*' -o -iname
 //! 'market_data*'`) found **no** `meridian.py`, `market_data.py`, or
-//! `<path>/meridian/` directory anywhere. The backend this wrapper
+//! Meridian directory anywhere. The backend this wrapper
 //! called was never deployed — there is no real prior behavior or
 //! persistence design to port faithfully, only the Python wrapper's
 //! documented *contract* (its docstrings, argument shapes, and the

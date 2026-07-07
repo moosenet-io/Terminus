@@ -1,5 +1,5 @@
 //! Crucible tools — learning-tracker system, ported from the Python
-//! `crucible_tools.py` on the legacy Terminus host (ai-terminus, streamable-HTTP MCP).
+//! `crucible_tools.py` on the legacy Terminus host (the legacy Python MCP host, streamable-HTTP MCP).
 //!
 //! ## Verified transport (IMPORTANT — read before touching this module)
 //!
@@ -144,6 +144,10 @@ const MAX_TEXT_LEN: usize = 2000;
 /// one-script-many-subcommands convention. **Not observed on the wire** — the
 /// fleet host was unreachable for the whole porting session. Audit against
 /// the real legacy-host source before relying on this in production.
+///
+/// PII remediation note (2026-07): real functional default (remote script
+/// path on the fleet host) — left unchanged, not guess-redacted; flagged for
+/// operator review before any public release.
 const DEFAULT_SCRIPT: &str = "/usr/bin/python3 <path>/crucible/ops.py";
 
 // ---------------------------------------------------------------------------

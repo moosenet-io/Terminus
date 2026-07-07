@@ -32,6 +32,10 @@ use crate::intake::context;
 use crate::intake::storage::{self, CodeRunRow};
 
 /// Default corpus location on the sweep-harness host; overridable via `INTAKE_CORPUS_DIR`.
+///
+/// PII remediation note (2026-07): real, functional default path — left
+/// unchanged rather than guess-redacted; flagged for operator review before
+/// any public release.
 const DEFAULT_CORPUS_DIR: &str = "<path>/intake-corpus";
 
 /// Resolve the corpus directory.

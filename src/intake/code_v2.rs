@@ -57,6 +57,10 @@ use crate::intake::gpu_authority::GpuLock;
 use crate::intake::storage::{self, CodeRunRowV2};
 
 /// Default v2 corpus location on the sweep-harness host; overridable via `INTAKE_CORPUS_V2_DIR`.
+///
+/// PII remediation note (2026-07): real, functional default path — left
+/// unchanged rather than guess-redacted; flagged for operator review before
+/// any public release.
 const DEFAULT_CORPUS_V2_DIR: &str = "<path>/intake-corpus-v2";
 
 /// Resolve the v2 corpus directory.
