@@ -37,6 +37,7 @@
 //!   here.
 
 pub mod inspect;
+pub mod vault;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -83,6 +84,17 @@ pub struct ScribeConfig {
     /// Git remote URL for the Obsidian-compatible vault repo (SCRB-05).
     /// `None` until the vault repo exists / is configured.
     pub vault_remote: Option<String>,
+    /// Local working-copy directory for the vault repo (already cloned from
+    /// `vault_remote`; SCRB-05 does not clone-on-demand -- see `vault.rs`'s
+    /// module doc comment). Not a secret -- a filesystem path.
+    pub vault_local_dir: String,
+    /// Explicit, off-by-default opt-in for subprocess-based vault
+    /// commit/push (same rationale as `allow_subprocess_inspection`: `git2`
+    /// is the real fix, unavailable here for lack of registry access; kept
+    /// as a SEPARATE flag from inspection's so an operator can enable
+    /// read-only inspection without also enabling vault writes, or vice
+    /// versa).
+    pub allow_subprocess_vault_write: bool,
     /// Local file path a discrepancy report is appended to (one JSON object
     /// per line) when Plane is unreachable at report time (SCRB-04 edge
     /// case: "Plane unreachable -- the discrepancy is logged locally /
@@ -124,6 +136,20 @@ impl ScribeConfig {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let vault_local_dir = std::env::var("SCRIBE_VAULT_LOCAL_DIR")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                std::env::temp_dir()
+                    .join("scribe-vault")
+                    .to_string_lossy()
+                    .to_string()
+            });
+        let allow_subprocess_vault_write = std::env::var("SCRIBE_ALLOW_SUBPROCESS_VAULT_WRITE")
+            .ok()
+            .map(|s| s.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let pending_queue_path = std::env::var("SCRIBE_PENDING_QUEUE_PATH")
             .ok()
             .map(|s| s.trim().to_string())
@@ -141,6 +167,8 @@ impl ScribeConfig {
             allowed_repo_roots,
             allow_subprocess_inspection,
             vault_remote,
+            vault_local_dir,
+            allow_subprocess_vault_write,
             pending_queue_path,
         }
     }
@@ -399,7 +427,8 @@ impl RustTool for ScribeBuildDiaryEntry {
     fn description(&self) -> &str {
         "Write a build-diary (or, for notable builds, a longer-form blog) entry \
 to the Obsidian-compatible vault, summarizing a spec's real execution narrative. \
-Stub only in this scaffold; implemented in SCRB-05/06."
+Requires an already-cloned vault working copy and an explicit operator opt-in \
+(SCRIBE_ALLOW_SUBPROCESS_VAULT_WRITE=true) before it will commit/push anything."
     }
 
     fn parameters(&self) -> Value {
@@ -417,15 +446,73 @@ Stub only in this scaffold; implemented in SCRB-05/06."
                 "entry_type": {
                     "type": "string",
                     "enum": ["build-diary", "blog"],
-                    "description": "Entry type; 'blog' is for especially notable builds (operator judgment or >3 items / security-relevant)"
+                    "description": "Entry type; 'blog' is for especially notable builds (operator judgment or >3 items / security-relevant). Defaults to 'build-diary'."
                 }
             },
             "required": ["spec_id", "narrative"]
         })
     }
 
-    async fn execute(&self, _args: Value) -> Result<String, ToolError> {
-        not_yet_implemented(self.name())
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let spec_id = args
+            .get("spec_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ToolError::InvalidArgument("spec_id is required and must not be empty".into()))?;
+        let narrative = args
+            .get("narrative")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ToolError::InvalidArgument("narrative is required and must not be empty".into()))?;
+        let entry_type_str = args.get("entry_type").and_then(Value::as_str).unwrap_or("build-diary");
+        let note_type = match entry_type_str {
+            "blog" => vault::NoteType::Blog,
+            "build-diary" => vault::NoteType::BuildDiary,
+            other => {
+                return Err(ToolError::InvalidArgument(format!(
+                    "entry_type must be 'build-diary' or 'blog', got '{other}'"
+                )))
+            }
+        };
+
+        let cfg = ScribeConfig::from_env();
+        if !cfg.allow_subprocess_vault_write {
+            return Err(ToolError::NotConfigured(
+                "vault commit/push is disabled by default (see \
+ScribeConfig::allow_subprocess_vault_write's doc comment); set \
+SCRIBE_ALLOW_SUBPROCESS_VAULT_WRITE=true to enable it explicitly"
+                    .into(),
+            ));
+        }
+
+        let vault_dir = std::path::Path::new(&cfg.vault_local_dir);
+        if !vault_dir.join(".git").exists() {
+            return Err(ToolError::NotConfigured(format!(
+                "no vault working copy found at {} -- clone SCRIBE_VAULT_REMOTE there first \
+(SCRB-05 does not clone-on-demand)",
+                vault_dir.display()
+            )));
+        }
+
+        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let slug = format!("{date}-{}", vault::slugify(spec_id));
+        let note_path = vault::note_path(vault_dir, note_type, "", &slug);
+
+        let fm = vault::NoteFrontmatter {
+            title: format!("{spec_id} -- {entry_type_str}"),
+            module: "build-pipeline".to_string(),
+            generated_at: chrono::Utc::now().to_rfc3339(),
+            source_commit: "n/a (spans the whole spec, not one module commit)".to_string(),
+            note_type,
+        };
+        let content = vault::render_note(&fm, narrative, &[]);
+        let commit_message = format!("scribe: {entry_type_str} entry for {spec_id}");
+
+        vault::write_note_and_push(vault_dir, &note_path, &content, &commit_message)?;
+
+        Ok(format!("Wrote {entry_type_str} entry to vault: {}", note_path.display()))
     }
 }
 
@@ -877,6 +964,11 @@ mod tests {
             allowed_repo_roots: Vec::new(),
             allow_subprocess_inspection: false,
             vault_remote: None,
+            vault_local_dir: std::env::temp_dir()
+                .join("scribe-vault")
+                .to_string_lossy()
+                .to_string(),
+            allow_subprocess_vault_write: false,
             pending_queue_path: std::env::temp_dir()
                 .join("scribe-pending-discrepancies.jsonl")
                 .to_string_lossy()
@@ -1379,5 +1471,132 @@ mod tests {
         assert!(text.contains("Plane unreachable"), "{text}");
         assert!(std::path::Path::new(&queue_path).exists());
         let _ = std::fs::remove_file(&queue_path);
+    }
+
+    // ─── SCRB-05: scribe_build_diary_entry tests ────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn build_diary_entry_disabled_by_default_pending_operator_optin() {
+        std::env::remove_var("SCRIBE_ALLOW_SUBPROCESS_VAULT_WRITE");
+        let tool = ScribeBuildDiaryEntry;
+        let result = tool
+            .execute(json!({"spec_id": "S91-test", "narrative": "did things"}))
+            .await;
+        match result {
+            Err(ToolError::NotConfigured(msg)) => {
+                assert!(msg.contains("SCRIBE_ALLOW_SUBPROCESS_VAULT_WRITE"));
+            }
+            other => panic!("expected NotConfigured pending opt-in, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_diary_entry_missing_spec_id_is_invalid_argument() {
+        let tool = ScribeBuildDiaryEntry;
+        let result = tool.execute(json!({"narrative": "did things"})).await;
+        assert!(matches!(result, Err(ToolError::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn build_diary_entry_missing_narrative_is_invalid_argument() {
+        let tool = ScribeBuildDiaryEntry;
+        let result = tool.execute(json!({"spec_id": "S91-test"})).await;
+        assert!(matches!(result, Err(ToolError::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn build_diary_entry_bad_entry_type_is_invalid_argument() {
+        let tool = ScribeBuildDiaryEntry;
+        let result = tool
+            .execute(json!({"spec_id": "S91-test", "narrative": "x", "entry_type": "poem"}))
+            .await;
+        assert!(matches!(result, Err(ToolError::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn build_diary_entry_without_a_cloned_vault_is_not_configured() {
+        std::env::set_var("SCRIBE_ALLOW_SUBPROCESS_VAULT_WRITE", "true");
+        std::env::set_var(
+            "SCRIBE_VAULT_LOCAL_DIR",
+            std::env::temp_dir()
+                .join(format!("scribe-vault-not-cloned-{}", std::process::id()))
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let tool = ScribeBuildDiaryEntry;
+        let result = tool
+            .execute(json!({"spec_id": "S91-test", "narrative": "did things"}))
+            .await;
+
+        std::env::remove_var("SCRIBE_ALLOW_SUBPROCESS_VAULT_WRITE");
+        std::env::remove_var("SCRIBE_VAULT_LOCAL_DIR");
+
+        assert!(matches!(result, Err(ToolError::NotConfigured(_))));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn build_diary_entry_end_to_end_writes_and_pushes_a_real_note() {
+        // Real local bare repo standing in for the vault remote (see
+        // vault::tests::write_note_and_push_is_verifiable_via_a_fresh_clone
+        // for why this environment can't reach the real Gitea remote).
+        let base = std::env::temp_dir().join(format!("scribe-diary-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let bare_remote = base.join("remote.git");
+        let working_copy = base.join("working");
+        std::fs::create_dir_all(&bare_remote).unwrap();
+
+        let run = |dir: &std::path::Path, args: &[&str]| {
+            let output = std::process::Command::new("git").current_dir(dir).args(args).output().unwrap();
+            assert!(output.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&output.stderr));
+        };
+        run(&bare_remote, &["init", "--bare", "-q"]);
+        run(&base, &["clone", "-q", bare_remote.to_str().unwrap(), working_copy.to_str().unwrap()]);
+        run(&working_copy, &["checkout", "-q", "-B", "main"]);
+        std::fs::write(working_copy.join("README.md"), "# Scribe Vault\n").unwrap();
+        run(&working_copy, &["config", "user.email", "<email>"]);  // pii-test-fixture
+        run(&working_copy, &["config", "user.name", "Scribe"]);
+        run(&working_copy, &["add", "README.md"]);
+        run(&working_copy, &["commit", "-q", "-m", "init"]);
+        run(&working_copy, &["push", "-q", "origin", "HEAD:main"]);
+        run(&working_copy, &["branch", "-q", "--set-upstream-to=origin/main", "main"]);
+        run(&bare_remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        std::env::set_var("SCRIBE_ALLOW_SUBPROCESS_VAULT_WRITE", "true");
+        std::env::set_var("SCRIBE_VAULT_LOCAL_DIR", working_copy.to_string_lossy().into_owned());
+
+        let tool = ScribeBuildDiaryEntry;
+        let result = tool
+            .execute(json!({
+                "spec_id": "S91-scribe-knowledge-infrastructure",
+                "narrative": "Built the Scribe module scaffold, wired LLM dispatch, worktree \
+inspection, Plane discrepancy reporting, and this vault -- in that order.",
+                "entry_type": "build-diary"
+            }))
+            .await;
+
+        std::env::remove_var("SCRIBE_ALLOW_SUBPROCESS_VAULT_WRITE");
+        std::env::remove_var("SCRIBE_VAULT_LOCAL_DIR");
+
+        let text = result.expect("build diary entry should write and push successfully");
+        assert!(text.contains("build-diary"), "{text}");
+        assert!(text.contains("build-diaries"), "{text}");
+
+        // Verify via a fresh, independent clone.
+        let fresh_clone = base.join("fresh-clone");
+        run(&base, &["clone", "-q", bare_remote.to_str().unwrap(), fresh_clone.to_str().unwrap()]);
+        let entries: Vec<_> = std::fs::read_dir(fresh_clone.join("build-diaries"))
+            .expect("build-diaries/ should exist in the fresh clone")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1, "expected exactly one build-diary entry");
+        let content = std::fs::read_to_string(entries[0].path()).unwrap();
+        assert!(content.contains("Built the Scribe module scaffold"));
+        assert!(content.contains("type: build-diary"));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
