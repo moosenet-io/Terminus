@@ -40,6 +40,7 @@ pub mod inspect;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::path::Path;
 
 use crate::error::ToolError;
 use crate::registry::ToolRegistry;
@@ -58,6 +59,27 @@ pub struct ScribeConfig {
     /// doesn't specify one explicitly (SCRB-02/03). Not a secret -- a
     /// filesystem path, same convention as `worktree_root`.
     pub repo_path: Option<String>,
+    /// Closed allowlist of local filesystem roots a `repo_path` (argument or
+    /// default) must resolve under. Default-deny: empty means NO repo_path
+    /// is permitted at all, not "anything goes" -- an operator must
+    /// explicitly configure this before `scribe_generate_readme` can inspect
+    /// anything (see review finding, SCRB-02 cycle 1: an unconfined
+    /// `repo_path` would let a caller point Scribe at an arbitrary local
+    /// repo and have its contents shipped to an external LLM provider).
+    pub allowed_repo_roots: Vec<String>,
+    /// Explicit, off-by-default opt-in for subprocess-based worktree
+    /// inspection (SCRB-02 cycle 1 review finding: `inspect::checkout`
+    /// shells out to `git`, which `src/tool.rs`'s `RustTool` contract bans
+    /// from `execute()`). The real fix is swapping `std::process::Command`
+    /// for the `git2` crate (a pure-Rust libgit2 binding -- unlike the
+    /// review-daemon's LLM-CLI dispatch, which has NO non-subprocess
+    /// alternative at all, git has one; this is a library swap, not a
+    /// process-isolation problem needing a daemon-wrap) -- not done in this
+    /// item because this sandbox has no crates.io/registry access to add
+    /// it. Until that swap lands, this flag makes the interim contract
+    /// deviation an explicit, reviewable, default-off operator decision
+    /// rather than a silent one baked into the code path.
+    pub allow_subprocess_inspection: bool,
     /// Git remote URL for the Obsidian-compatible vault repo (SCRB-05).
     /// `None` until the vault repo exists / is configured.
     pub vault_remote: Option<String>,
@@ -79,12 +101,31 @@ impl ScribeConfig {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let allowed_repo_roots = std::env::var("SCRIBE_ALLOWED_REPO_ROOTS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(|part| part.trim().to_string())
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let allow_subprocess_inspection = std::env::var("SCRIBE_ALLOW_SUBPROCESS_INSPECTION")
+            .ok()
+            .map(|s| s.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let vault_remote = std::env::var("SCRIBE_VAULT_REMOTE")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        Self { worktree_root, repo_path, vault_remote }
+        Self {
+            worktree_root,
+            repo_path,
+            allowed_repo_roots,
+            allow_subprocess_inspection,
+            vault_remote,
+        }
     }
 }
 
@@ -124,6 +165,29 @@ async fn dispatch_docs_generation(
         "all docs-generation providers unavailable: {}",
         errors.join("; ")
     )))
+}
+
+/// Default-deny confinement check: `repo_path` must canonicalize to a path
+/// under one of `allowed_roots` (also canonicalized, so symlinks/relative
+/// segments can't be used to appear inside an allowed root without actually
+/// being there). An empty `allowed_roots` means nothing is allowed -- this
+/// is NOT "unset = anything goes"; an operator must explicitly list the
+/// repos Scribe may inspect (SCRB-02 cycle 1 review finding: an unconfined
+/// `repo_path` would let a caller point Scribe at an arbitrary local repo
+/// and have its contents shipped to an external LLM provider).
+fn is_repo_path_allowed(repo_path: &Path, allowed_roots: &[String]) -> bool {
+    if allowed_roots.is_empty() {
+        return false;
+    }
+    let Ok(canon_target) = repo_path.canonicalize() else {
+        return false;
+    };
+    allowed_roots.iter().any(|root| {
+        Path::new(root)
+            .canonicalize()
+            .map(|canon_root| canon_target.starts_with(canon_root))
+            .unwrap_or(false)
+    })
 }
 
 /// Build the JSON context `build_docs_prompt` embeds, from a real
@@ -214,14 +278,27 @@ persisting it into a vault/repo is a separate concern (SCRB-05)."
         let module_path = args
             .get("module_path")
             .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidArgument("module_path is required".into()))?;
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ToolError::InvalidArgument("module_path is required and must not be empty".into()))?;
         let repo_ref = args.get("repo_ref").and_then(Value::as_str).unwrap_or("HEAD");
 
         let cfg = ScribeConfig::from_env();
+
+        if !cfg.allow_subprocess_inspection {
+            return Err(ToolError::NotConfigured(
+                "subprocess-based worktree inspection is disabled by default (see \
+ScribeConfig::allow_subprocess_inspection's doc comment for why); set \
+SCRIBE_ALLOW_SUBPROCESS_INSPECTION=true to enable it explicitly"
+                    .into(),
+            ));
+        }
+
         let repo_path_str = args
             .get("repo_path")
             .and_then(Value::as_str)
             .map(str::to_string)
+            .filter(|s| !s.trim().is_empty())
             .or(cfg.repo_path.clone())
             .ok_or_else(|| {
                 ToolError::NotConfigured(
@@ -230,6 +307,14 @@ persisting it into a vault/repo is a separate concern (SCRB-05)."
             })?;
 
         let repo_path = std::path::Path::new(&repo_path_str);
+        if !is_repo_path_allowed(repo_path, &cfg.allowed_repo_roots) {
+            return Err(ToolError::InvalidArgument(format!(
+                "repo_path '{}' is not under any root in SCRIBE_ALLOWED_REPO_ROOTS \
+(default-deny: this env var must list the specific repos Scribe may inspect)",
+                repo_path.display()
+            )));
+        }
+
         let worktree_root = std::path::Path::new(&cfg.worktree_root);
 
         let wt = inspect::checkout(repo_path, repo_ref, worktree_root)?;
@@ -504,6 +589,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generate_readme_empty_module_path_is_invalid_argument_not_a_whole_repo_walk() {
+        // Cycle 1 review finding: an empty (not missing) module_path used to
+        // pass the presence check and silently expand to a full-repo walk
+        // via `wt.path.join("")` == `wt.path`. Must now be rejected up front.
+        let generate = ScribeGenerateReadme;
+        let result = generate
+            .execute(json!({"module_path": "", "repo_path": env!("CARGO_MANIFEST_DIR")}))
+            .await;
+        assert!(matches!(result, Err(ToolError::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn generate_readme_execute_is_disabled_by_default_pending_operator_optin() {
+        // Cycle 1 review finding: execute() called inspect::checkout
+        // unconditionally, keeping a live RustTool no-subprocess-contract
+        // deviation with no operator opt-in. Default (SCRIBE_ALLOW_SUBPROCESS_
+        // INSPECTION unset in this test process) must be a clean NotConfigured,
+        // not a checkout attempt.
+        let generate = ScribeGenerateReadme;
+        let result = generate
+            .execute(json!({"module_path": "src/sundry", "repo_path": env!("CARGO_MANIFEST_DIR")}))
+            .await;
+        match result {
+            Err(ToolError::NotConfigured(msg)) => {
+                assert!(msg.contains("SCRIBE_ALLOW_SUBPROCESS_INSPECTION"));
+            }
+            other => panic!("expected NotConfigured pending opt-in, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_repo_path_allowed_denies_by_default_with_no_roots_configured() {
+        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert!(!is_repo_path_allowed(&repo, &[]));
+    }
+
+    #[test]
+    fn is_repo_path_allowed_allows_a_path_under_a_configured_root() {
+        let repo = env!("CARGO_MANIFEST_DIR").to_string();
+        let allowed = vec![repo.clone()];
+        assert!(is_repo_path_allowed(std::path::Path::new(&repo), &allowed));
+    }
+
+    #[test]
+    fn is_repo_path_allowed_denies_a_path_outside_every_configured_root() {
+        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let unrelated_root = std::env::temp_dir();
+        // temp_dir is very unlikely to be an ancestor of CARGO_MANIFEST_DIR.
+        assert!(!is_repo_path_allowed(&repo, &[unrelated_root.to_string_lossy().into_owned()]));
+    }
+
+    #[test]
+    fn is_repo_path_allowed_denies_a_nonexistent_path() {
+        // canonicalize() fails for a path that doesn't exist -- must deny,
+        // not panic or silently pass.
+        let bogus = std::path::PathBuf::from("/tmp/scribe-test-does-not-exist-xyz-123");
+        let allowed = vec![std::env::temp_dir().to_string_lossy().into_owned()];
+        assert!(!is_repo_path_allowed(&bogus, &allowed));
+    }
+
+    #[tokio::test]
     async fn status_tool_never_leaks_a_secret_value() {
         let status = ScribeStatus;
         let result = status.execute(json!({})).await.expect("status should not fail");
@@ -522,6 +668,8 @@ mod tests {
                 .to_string_lossy()
                 .to_string(),
             repo_path: None,
+            allowed_repo_roots: Vec::new(),
+            allow_subprocess_inspection: false,
             vault_remote: None,
         };
         assert!(cfg.worktree_root.contains("scribe-inspect"));
