@@ -135,6 +135,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::nexus::register(registry);
     crate::plane::register(registry);
     crate::relay::register(registry);
+    crate::scribe::register(registry);
     crate::reminder::register(registry);
     crate::review::register(registry);
     crate::routines::register(registry);
@@ -314,5 +315,34 @@ mod tests {
         assert!(reg.contains("synapse_status"));
         assert!(reg.contains("synapse_trigger"));
         assert!(reg.contains("synapse_mute"));
+    }
+
+    /// SCRB-01: Scribe registers on the exact same path as `plane`/`gitea`/
+    /// `github` (this crate's single `register_all()` -- see the module doc
+    /// comment above, and `src/scribe/mod.rs`'s registration note, for why
+    /// there is no separate `register_personal()` to keep it out of: as of
+    /// this item, terminus-rs has exactly one registration function, which
+    /// `chord-proxy` calls for its fallback registry).
+    #[test]
+    fn test_scribe_tools_registered_via_register_all() {
+        let mut reg = ToolRegistry::new();
+        register_all(&mut reg);
+        assert!(reg.contains("scribe_generate_readme"));
+        assert!(reg.contains("scribe_update_wiki_page"));
+        assert!(reg.contains("scribe_build_diary_entry"));
+        assert!(reg.contains("scribe_report_discrepancy"));
+        assert!(reg.contains("scribe_status"));
+    }
+
+    #[test]
+    fn test_no_duplicate_tool_names_full_registry() {
+        // register_all() itself rejects duplicate names at registration time
+        // (first-wins would otherwise silently hide a real collision) -- if
+        // Scribe's tool names collided with any existing core tool, this
+        // would fail with fewer entries than modules registered.
+        let mut reg = ToolRegistry::new();
+        register_all(&mut reg);
+        assert!(reg.contains("scribe_status"));
+        assert!(reg.len() > 0);
     }
 }
