@@ -30,6 +30,7 @@
 //! (`github_list_repos`) are not gated.
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde_json::{json, Value};
 
 use crate::error::ToolError;
@@ -402,6 +403,13 @@ fn parse_files(args: &Value) -> Result<Vec<FileWrite>, ToolError> {
                     "file '{path}' has unsupported encoding '{encoding}' (expected 'utf-8' or 'base64')"
                 )));
             }
+            if encoding == "base64" {
+                // Reject undecodable base64 up front — before the PII gate or
+                // any network call — rather than letting GitHub fail later.
+                B64.decode(&content).map_err(|e| {
+                    ToolError::InvalidArgument(format!("file '{path}' has invalid base64 content: {e}"))
+                })?;
+            }
             let mode = f
                 .get("mode")
                 .and_then(Value::as_str)
@@ -412,13 +420,35 @@ fn parse_files(args: &Value) -> Result<Vec<FileWrite>, ToolError> {
         .collect()
 }
 
-fn parse_deletions(args: &Value) -> Vec<String> {
-    args.get("deletions")
+/// The text the PII gate should scan for a given file: for base64-encoded
+/// files this is the *decoded* bytes (lossily as UTF-8), not the base64
+/// ciphertext-looking string itself — otherwise PII inside a base64 blob
+/// would sail through the gate undetected. `parse_files` already validated
+/// decodability, so this only fails if that invariant is ever violated.
+fn scan_text_for_file(f: &FileWrite) -> Result<String, ToolError> {
+    if f.encoding == "base64" {
+        let bytes = B64
+            .decode(&f.content)
+            .map_err(|e| ToolError::InvalidArgument(format!("file '{}' has invalid base64 content: {e}", f.path)))?;
+        Ok(String::from_utf8_lossy(&bytes).to_string())
+    } else {
+        Ok(f.content.clone())
+    }
+}
+
+fn parse_deletions(args: &Value) -> Result<Vec<String>, ToolError> {
+    let arr = args
+        .get("deletions")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    arr.into_iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| ToolError::InvalidArgument("each 'deletions' entry must be a non-empty string path".into()))
+        })
         .collect()
 }
 
@@ -463,8 +493,8 @@ Less destructive than github_push_repo (which mirrors an entire repo's history).
                     "description": "Paths to remove from the tree",
                     "items": { "type": "string" }
                 },
-                "committer_name":  { "type": "string" },
-                "committer_email": { "type": "string" },
+                "committer_name":  { "type": "string", "description": "Must be paired with committer_email, or omit both" },
+                "committer_email": { "type": "string", "description": "Must be paired with committer_name, or omit both" },
                 "force": { "type": "boolean", "description": "Force-update even if base_sha is not the branch's current tip. Default false.", "default": false }
             },
             "required": ["repo", "branch", "base_sha", "message"]
@@ -508,10 +538,16 @@ Less destructive than github_push_repo (which mirrors an entire repo's history).
             .to_string();
         let committer_name = args.get("committer_name").and_then(Value::as_str).map(str::to_string);
         let committer_email = args.get("committer_email").and_then(Value::as_str).map(str::to_string);
+        if committer_name.is_some() != committer_email.is_some() {
+            return Err(ToolError::InvalidArgument(
+                "'committer_name' and 'committer_email' must be supplied together, or not at all \
+(no mixing a caller-supplied name with a default email or vice versa)".into(),
+            ));
+        }
         let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
 
         let files = parse_files(&args)?;
-        let deletions = parse_deletions(&args);
+        let deletions = parse_deletions(&args)?;
         if files.is_empty() && deletions.is_empty() {
             return Err(ToolError::InvalidArgument(
                 "at least one of 'files' or 'deletions' is required".into(),
@@ -519,14 +555,16 @@ Less destructive than github_push_repo (which mirrors an entire repo's history).
         }
 
         // MANDATORY PII gate — scan every piece of operator-supplied content
-        // that will land on GitHub BEFORE any network request fires.
+        // that will land on GitHub BEFORE any network request fires. Base64
+        // files are decoded first (scan_text_for_file) so PII hidden inside
+        // an encoded blob can't sail through the gate undetected.
         let mut scan_buf = format!("{owner}\n{repo}\n{branch}\n{base_sha}\n{message}\n");
         if let Some(n) = &committer_name { scan_buf.push_str(n); scan_buf.push('\n'); }
         if let Some(e) = &committer_email { scan_buf.push_str(e); scan_buf.push('\n'); }
         for f in &files {
             scan_buf.push_str(&f.path);
             scan_buf.push('\n');
-            scan_buf.push_str(&f.content);
+            scan_buf.push_str(&scan_text_for_file(f)?);
             scan_buf.push('\n');
         }
         for d in &deletions {
@@ -554,10 +592,21 @@ Less destructive than github_push_repo (which mirrors an entire repo's history).
         } else if ref_status.is_success() {
             let data: Value = serde_json::from_str(&ref_body)
                 .map_err(|e| ToolError::Http(format!("Invalid JSON from GitHub: {e}")))?;
-            data.get("object")
+            // A 2xx here MUST carry object.sha — GitHub's ref-get response
+            // shape guarantees it. A 2xx with no sha is a malformed/unexpected
+            // response (e.g. an array from an ambiguous ref match), not "the
+            // branch doesn't exist" — treating it as None would silently
+            // route into the create-new-branch path against a real object.
+            let sha = data
+                .get("object")
                 .and_then(|o| o.get("sha"))
                 .and_then(Value::as_str)
-                .map(str::to_string)
+                .ok_or_else(|| {
+                    ToolError::Http(format!(
+                        "unexpected ref response shape for '{branch}' (missing object.sha): {ref_body}"
+                    ))
+                })?;
+            Some(sha.to_string())
         } else {
             return Err(ToolError::Http(format!(
                 "HTTP {}: {}",
@@ -566,7 +615,16 @@ Less destructive than github_push_repo (which mirrors an entire repo's history).
             )));
         };
 
-        // 2. Fast-forward guard — reject BEFORE creating any objects.
+        // 2. Fast-forward guard — reject BEFORE creating any objects. Note this
+        // check is advisory, not the sole safety net: a concurrent move of
+        // `branch` between this GET and the final ref update in step 7 is
+        // still possible (classic TOCTOU). The real atomicity guarantee comes
+        // from GitHub itself — the non-force PATCH in step 7 sends
+        // `force: false`, so GitHub's own ref-update endpoint re-checks
+        // fast-forward server-side and rejects with a non-2xx (surfaced here
+        // as `ToolError::Http`) if the branch moved in the meantime. This
+        // early check exists purely to fail fast and avoid the wasted
+        // blob/tree/commit calls in the common (non-racy) case.
         if let Some(current) = &existing_sha {
             if current != &base_sha && !force {
                 return Err(ToolError::Conflict(format!(
@@ -672,11 +730,10 @@ Less destructive than github_push_repo (which mirrors an entire repo's history).
             "tree": new_tree_sha,
             "parents": [base_sha],
         });
-        if committer_name.is_some() || committer_email.is_some() {
-            commit_payload["author"] = json!({
-                "name": committer_name.clone().unwrap_or_else(|| "Terminus".to_string()),
-                "email": committer_email.clone().unwrap_or_else(|| "<email>".to_string()),
-            });
+        // Guaranteed both-or-neither by the validation above — no silent
+        // mixing of a caller-supplied name with a default email.
+        if let (Some(name), Some(email)) = (&committer_name, &committer_email) {
+            commit_payload["author"] = json!({ "name": name, "email": email });
             commit_payload["committer"] = commit_payload["author"].clone();
         }
         let commit_url = format!("{api}/repos/{owner}/{repo}/git/commits");
@@ -724,11 +781,19 @@ Less destructive than github_push_repo (which mirrors an entire repo's history).
         let ref_update_status = ref_update_resp.status();
         let ref_update_body = ref_update_resp.text().await.map_err(|e| ToolError::Http(e.to_string()))?;
         if !ref_update_status.is_success() {
-            return Err(ToolError::Http(format!(
-                "HTTP {}: {}",
-                ref_update_status.as_u16(),
-                ref_update_body
-            )));
+            let code = ref_update_status.as_u16();
+            // 409/422 here means the branch moved between our step-1 GET and
+            // this final ref update (the residual TOCTOU window) and GitHub's
+            // own fast-forward check rejected it server-side — report this as
+            // the same Conflict a caller would get from the early guard, not
+            // a generic Http error, so retry logic can treat them alike.
+            if !force && (code == 409 || code == 422) {
+                return Err(ToolError::Conflict(format!(
+                    "non-fast-forward: '{branch}' moved concurrently before the ref update landed \
+(HTTP {code}: {ref_update_body})"
+                )));
+            }
+            return Err(ToolError::Http(format!("HTTP {code}: {ref_update_body}")));
         }
 
         Ok(json!({
@@ -1391,5 +1456,320 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["commit_sha"], "commitsha4");
         tree.assert();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn push_branch_commit_and_tree_bodies_are_exact() {
+        // Asserts the two invariants a regression could silently break:
+        // the new commit's parent chain, and the tree's file-entry shape
+        // (path/mode/type/blob-sha) — neither was covered by the other tests.
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/moosenet-io/r/git/ref/heads/main");
+            then.status(200).json_body(json!({ "object": { "sha": "basesha1" } }));
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/moosenet-io/r/git/commits/basesha1");
+            then.status(200).json_body(json!({ "sha": "basesha1", "tree": { "sha": "basetree1" } }));
+        });
+        let blob = server.mock(|when, then| {
+            when.method(POST)
+                .path("/repos/moosenet-io/r/git/blobs")
+                .json_body(json!({ "content": "hello", "encoding": "utf-8" }));
+            then.status(201).json_body(json!({ "sha": "blobsha1" }));
+        });
+        let tree = server.mock(|when, then| {
+            when.method(POST)
+                .path("/repos/moosenet-io/r/git/trees")
+                .json_body(json!({
+                    "base_tree": "basetree1",
+                    "tree": [{ "path": "a.txt", "mode": "100644", "type": "blob", "sha": "blobsha1" }]
+                }));
+            then.status(201).json_body(json!({ "sha": "treesha1" }));
+        });
+        let commit = server.mock(|when, then| {
+            when.method(POST)
+                .path("/repos/moosenet-io/r/git/commits")
+                .json_body(json!({
+                    "message": "add file",
+                    "tree": "treesha1",
+                    "parents": ["basesha1"]
+                }));
+            then.status(201).json_body(json!({ "sha": "commitsha5" }));
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::PATCH).path("/repos/moosenet-io/r/git/refs/heads/main");
+            then.status(200).json_body(json!({ "ref": "refs/heads/main" }));
+        });
+
+        let tool = GitHubPushBranch { cfg: cfg_with_base(server.base_url()) };
+        let out = tool
+            .execute(json!({
+                "repo": "r",
+                "branch": "main",
+                "base_sha": "basesha1",
+                "message": "add file",
+                "files": [{ "path": "a.txt", "content": "hello" }]
+            }))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["commit_sha"], "commitsha5");
+        blob.assert();
+        tree.assert();
+        commit.assert();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn push_branch_committer_name_and_email_must_be_paired() {
+        let tool = GitHubPushBranch { cfg: cfg() };
+        let base = json!({
+            "repo": "r", "branch": "b", "base_sha": "abc", "message": "m",
+            "files": [{ "path": "a.txt", "content": "x" }]
+        });
+
+        let mut only_name = base.clone();
+        only_name["committer_name"] = json!("Someone");
+        assert!(matches!(
+            tool.execute(only_name).await,
+            Err(ToolError::InvalidArgument(_))
+        ));
+
+        let mut only_email = base.clone();
+        only_email["committer_email"] = json!("<email>");
+        assert!(matches!(
+            tool.execute(only_email).await,
+            Err(ToolError::InvalidArgument(_))
+        ));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn push_branch_sends_paired_committer_as_author_and_committer() {
+        // The PII gate blocks bare emails by default; allow-list this test's
+        // fixture address so we're exercising the author/committer wiring,
+        // not re-testing the (already covered) PII gate itself.
+        std::env::set_var("GITHUB_ALLOWED_AUTHORS", "<email>");
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/moosenet-io/r/git/ref/heads/main");
+            then.status(404);
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/moosenet-io/r/git/commits/basesha1");
+            then.status(200).json_body(json!({ "sha": "basesha1", "tree": { "sha": "basetree1" } }));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/repos/moosenet-io/r/git/blobs");
+            then.status(201).json_body(json!({ "sha": "blobsha1" }));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/repos/moosenet-io/r/git/trees");
+            then.status(201).json_body(json!({ "sha": "treesha1" }));
+        });
+        let commit = server.mock(|when, then| {
+            when.method(POST)
+                .path("/repos/moosenet-io/r/git/commits")
+                .json_body(json!({
+                    "message": "m",
+                    "tree": "treesha1",
+                    "parents": ["basesha1"],
+                    "author": { "name": "Someone", "email": "<email>" },
+                    "committer": { "name": "Someone", "email": "<email>" }
+                }));
+            then.status(201).json_body(json!({ "sha": "commitsha6" }));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/repos/moosenet-io/r/git/refs");
+            then.status(201).json_body(json!({ "ref": "refs/heads/main" }));
+        });
+
+        let tool = GitHubPushBranch { cfg: cfg_with_base(server.base_url()) };
+        let out = tool
+            .execute(json!({
+                "repo": "r", "branch": "main", "base_sha": "basesha1", "message": "m",
+                "files": [{ "path": "a.txt", "content": "x" }],
+                "committer_name": "Someone",
+                "committer_email": "<email>"
+            }))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["commit_sha"], "commitsha6");
+        commit.assert();
+        std::env::remove_var("GITHUB_ALLOWED_AUTHORS");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn push_branch_maps_ref_update_422_rejection_to_conflict() {
+        // Simulates the residual TOCTOU case: the fast-forward pre-check
+        // passes, but the branch moved concurrently and GitHub's own
+        // server-side ref-update check rejects the non-force PATCH with a
+        // non-fast-forward status. This must surface as the SAME error kind
+        // (Conflict) as the early pre-check, not a generic Http error.
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/moosenet-io/r/git/ref/heads/main");
+            then.status(200).json_body(json!({ "object": { "sha": "basesha1" } }));
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/moosenet-io/r/git/commits/basesha1");
+            then.status(200).json_body(json!({ "sha": "basesha1", "tree": { "sha": "basetree1" } }));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/repos/moosenet-io/r/git/blobs");
+            then.status(201).json_body(json!({ "sha": "blobsha1" }));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/repos/moosenet-io/r/git/trees");
+            then.status(201).json_body(json!({ "sha": "treesha1" }));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/repos/moosenet-io/r/git/commits");
+            then.status(201).json_body(json!({ "sha": "commitsha7" }));
+        });
+        let ref_patch = server.mock(|when, then| {
+            when.method(httpmock::Method::PATCH).path("/repos/moosenet-io/r/git/refs/heads/main");
+            then.status(422).json_body(json!({ "message": "Update is not a fast forward" }));
+        });
+
+        let tool = GitHubPushBranch { cfg: cfg_with_base(server.base_url()) };
+        let result = tool
+            .execute(json!({
+                "repo": "r", "branch": "main", "base_sha": "basesha1", "message": "m",
+                "files": [{ "path": "a.txt", "content": "x" }]
+            }))
+            .await;
+        assert!(matches!(result, Err(ToolError::Conflict(_))));
+        ref_patch.assert();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn push_branch_maps_other_ref_update_failures_to_http_error() {
+        // A non-409/422 failure (e.g. 500, or a 403 permissions error) is a
+        // genuine failure, not a fast-forward conflict — must stay Http.
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/moosenet-io/r/git/ref/heads/main");
+            then.status(200).json_body(json!({ "object": { "sha": "basesha1" } }));
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/moosenet-io/r/git/commits/basesha1");
+            then.status(200).json_body(json!({ "sha": "basesha1", "tree": { "sha": "basetree1" } }));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/repos/moosenet-io/r/git/blobs");
+            then.status(201).json_body(json!({ "sha": "blobsha1" }));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/repos/moosenet-io/r/git/trees");
+            then.status(201).json_body(json!({ "sha": "treesha1" }));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/repos/moosenet-io/r/git/commits");
+            then.status(201).json_body(json!({ "sha": "commitsha8" }));
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::PATCH).path("/repos/moosenet-io/r/git/refs/heads/main");
+            then.status(403).body("Forbidden");
+        });
+
+        let tool = GitHubPushBranch { cfg: cfg_with_base(server.base_url()) };
+        let result = tool
+            .execute(json!({
+                "repo": "r", "branch": "main", "base_sha": "basesha1", "message": "m",
+                "files": [{ "path": "a.txt", "content": "x" }]
+            }))
+            .await;
+        assert!(matches!(result, Err(ToolError::Http(_))));
+    }
+
+    #[tokio::test]
+    async fn push_branch_rejects_invalid_base64_before_any_network_call() {
+        // No mock server at all — if this hits the network it panics on
+        // connection refused, proving rejection happens before any request.
+        let tool = GitHubPushBranch { cfg: cfg_with_base("http://127.0.0.1:1".to_string()) };
+        let result = tool
+            .execute(json!({
+                "repo": "r", "branch": "main", "base_sha": "basesha1", "message": "m",
+                "files": [{ "path": "a.bin", "content": "not-valid-base64!!", "encoding": "base64" }]
+            }))
+            .await;
+        assert!(matches!(result, Err(ToolError::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn push_branch_scans_decoded_base64_content_for_pii() {
+        // A base64 blob whose *decoded* bytes contain a blocked pattern (a
+        // private IP) must be rejected by the PII gate even though the raw
+        // base64 text itself doesn't look like a private IP.
+        let encoded = B64.encode("visit <internal-ip> for details"); // pii-test-fixture
+        let tool = GitHubPushBranch { cfg: cfg_with_base("http://127.0.0.1:1".to_string()) };
+        let result = tool
+            .execute(json!({
+                "repo": "r", "branch": "main", "base_sha": "basesha1", "message": "m",
+                "files": [{ "path": "a.bin", "content": encoded, "encoding": "base64" }]
+            }))
+            .await;
+        assert!(matches!(result, Err(ToolError::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn push_branch_rejects_blank_deletion_entries() {
+        let tool = GitHubPushBranch { cfg: cfg() };
+        let result = tool
+            .execute(json!({
+                "repo": "r", "branch": "main", "base_sha": "basesha1", "message": "m",
+                "deletions": ["good.txt", ""]
+            }))
+            .await;
+        assert!(matches!(result, Err(ToolError::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn push_branch_rejects_malformed_successful_ref_response() {
+        // A 2xx ref-get with no object.sha is malformed/unexpected — must be
+        // treated as an error, not silently routed into "branch doesn't exist".
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/moosenet-io/r/git/ref/heads/main");
+            then.status(200).json_body(json!({ "no_object_field": true }));
+        });
+
+        let tool = GitHubPushBranch { cfg: cfg_with_base(server.base_url()) };
+        let result = tool
+            .execute(json!({
+                "repo": "r", "branch": "main", "base_sha": "basesha1", "message": "m",
+                "files": [{ "path": "a.txt", "content": "x" }]
+            }))
+            .await;
+        assert!(matches!(result, Err(ToolError::Http(_))));
+    }
+
+    #[test]
+    #[serial]
+    fn register_adds_github_push_branch_with_token() {
+        let mut reg = ToolRegistry::new();
+        let backup = std::env::var("GITHUB_TOKEN").ok();
+        std::env::set_var("GITHUB_TOKEN", "testtoken");
+        register(&mut reg);
+        if let Some(v) = backup { std::env::set_var("GITHUB_TOKEN", v); } else { std::env::remove_var("GITHUB_TOKEN"); }
+        assert!(reg.contains("github_push_branch"));
+    }
+
+    #[test]
+    #[serial]
+    fn register_adds_github_push_branch_stub_without_token() {
+        let mut reg = ToolRegistry::new();
+        let backup = std::env::var("GITHUB_TOKEN").ok();
+        std::env::remove_var("GITHUB_TOKEN");
+        register(&mut reg);
+        if let Some(v) = backup { std::env::set_var("GITHUB_TOKEN", v); }
+        assert!(reg.contains("github_push_branch"));
     }
 }
