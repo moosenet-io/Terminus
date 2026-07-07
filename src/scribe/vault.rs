@@ -340,10 +340,19 @@ pub fn write_note_and_push(
     // Pull (fast-forward only) before push, per the spec's edge case:
     // concurrent Scribe runs use normal git conflict handling, never force.
     // A `--ff-only` pull failing (real divergent history) surfaces as a
-    // clean error here rather than being silently forced through -- the
-    // commit we just made stays local (not lost), ready for a manual or
-    // automated retry after a rebase/merge.
+    // clean error -- but (cycle 2 review finding) this is the SAME
+    // underlying condition as a push failure (genuine concurrent
+    // divergence) with the SAME unpushed local commit sitting on top of
+    // it. Without the identical soft-reset recovery here, the next
+    // invocation would add another local commit on top and `pull --ff-only`
+    // would keep failing forever -- the original wedge bug, just triggered
+    // via this branch instead of the push-failure branch. Soft-resetting
+    // undoes our not-yet-pushed commit (changes stay staged), which puts
+    // local HEAD purely BEHIND origin (no longer diverged by our own
+    // commit), so the next `--ff-only` pull can succeed as a genuine
+    // fast-forward.
     if let Err(e) = run(VaultGitOp::Pull { vault_dir }) {
+        let _ = run(VaultGitOp::SoftResetLastCommit { vault_dir });
         return Err(e);
     }
 
@@ -740,6 +749,74 @@ mod tests {
         // an error.
         write_note_and_push(&working_copy, &note_path_in_vault, &content, "scribe: second write")
             .expect("re-running with unchanged content should be a clean no-op");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Cycle 2 review finding: the soft-reset recovery previously only ran
+    /// on a Push failure; a `pull --ff-only` failure is the SAME underlying
+    /// condition (genuine concurrent divergence) with the SAME unpushed
+    /// local commit on top, and without the identical recovery there it
+    /// accumulates the exact same wedge, just triggered via a different
+    /// branch. This forces a real non-fast-forwardable remote (a second,
+    /// independent "concurrent writer" clone pushes first) and asserts the
+    /// working copy is genuinely usable again afterward -- not just that an
+    /// `Err` was returned.
+    #[test]
+    fn write_note_and_push_recovers_after_a_pull_failure_from_concurrent_divergence() {
+        let base = std::env::temp_dir().join(format!("scribe-vault-test-divergence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let (bare_remote, working_copy_a) = test_setup_bare_vault(&base);
+
+        // Simulate a concurrent writer: an independent clone that commits
+        // and pushes BEFORE working_copy_a does, so origin advances past
+        // what working_copy_a's local history knows.
+        let working_copy_b = base.join("working-b");
+        run_git(&base, &["clone", "-q", bare_remote.to_str().unwrap(), working_copy_b.to_str().unwrap()]);
+        run_git(&working_copy_b, &["config", "user.email", "<email>"]); // pii-test-fixture
+        run_git(&working_copy_b, &["config", "user.name", "Scribe"]);
+        std::fs::write(working_copy_b.join("concurrent.md"), "concurrent writer content\n").unwrap();
+        run_git(&working_copy_b, &["add", "concurrent.md"]);
+        run_git(&working_copy_b, &["commit", "-q", "-m", "concurrent write"]);
+        run_git(&working_copy_b, &["push", "-q"]);
+
+        // working_copy_a doesn't know about the concurrent commit yet.
+        // write_note_and_push makes its OWN local commit, which now
+        // diverges from the (already-advanced) remote -- its
+        // `pull --ff-only` step must genuinely fail.
+        let fm = NoteFrontmatter {
+            title: "Sundry".to_string(),
+            module: "sundry".to_string(),
+            generated_at: "2026-07-07T00:00:00Z".to_string(), // pii-test-fixture
+            source_commit: "abc".to_string(),
+            note_type: NoteType::Readme,
+        };
+        let content = render_note(&fm, "Sundry tools.", &[]);
+        let note_path_in_vault = note_path(&working_copy_a, NoteType::Readme, "sundry", "ignored");
+
+        let result = write_note_and_push(&working_copy_a, &note_path_in_vault, &content, "scribe: diverged write");
+        assert!(result.is_err(), "expected a pull failure from genuine concurrent divergence, got: {result:?}");
+
+        // Recovery check: a PLAIN `git pull --ff-only` (bypassing
+        // write_note_and_push entirely) must now succeed -- proving the
+        // soft-reset actually left local HEAD purely BEHIND origin (a
+        // clean fast-forward target) rather than still diverged.
+        let pull_output = StdCommand::new("git")
+            .current_dir(&working_copy_a)
+            .args(["pull", "--ff-only"])
+            .output()
+            .unwrap();
+        assert!(
+            pull_output.status.success(),
+            "recovery pull should succeed (working copy should no longer be wedged): {}",
+            String::from_utf8_lossy(&pull_output.stderr)
+        );
+
+        // And the vault is fully usable again: a second write_note_and_push
+        // call now succeeds cleanly, not just "pull works" in isolation.
+        write_note_and_push(&working_copy_a, &note_path_in_vault, &content, "scribe: retry after recovery")
+            .expect("retry after recovery should succeed");
 
         let _ = std::fs::remove_dir_all(&base);
     }
