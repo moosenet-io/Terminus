@@ -832,11 +832,11 @@ mod tests {
     fn forecast_body() -> Value {
         json!({
             "list": [
-                { "dt_txt": "2026-06-09 12:00:00", "main": { "temp": 19.0, "temp_min": 17.0, "temp_max": 21.0 }, "weather": [{ "description": "clear sky" }] },
-                { "dt_txt": "2026-06-09 15:00:00", "main": { "temp": 20.0, "temp_min": 18.0, "temp_max": 22.0 }, "weather": [{ "description": "clear sky" }] },
-                { "dt_txt": "2026-06-10 09:00:00", "main": { "temp": 14.0, "temp_min": 12.0, "temp_max": 16.0 }, "weather": [{ "description": "light rain" }], "pop": 0.4, "rain": { "3h": 1.0 } },
-                { "dt_txt": "2026-06-10 18:00:00", "main": { "temp": 16.0, "temp_min": 13.0, "temp_max": 19.0 }, "weather": [{ "description": "light rain" }], "pop": 0.8, "rain": { "3h": 1.5 } },
-                { "dt_txt": "2026-06-11 12:00:00", "main": { "temp": 22.0, "temp_min": 19.0, "temp_max": 25.0 }, "weather": [{ "description": "few clouds" }] }
+                { "dt_txt": "2026-06-09 12:00:00", "main": { "temp": 19.0, "temp_min": 17.0, "temp_max": 21.0 }, "weather": [{ "description": "clear sky" }] },  // pii-test-fixture
+                { "dt_txt": "2026-06-09 15:00:00", "main": { "temp": 20.0, "temp_min": 18.0, "temp_max": 22.0 }, "weather": [{ "description": "clear sky" }] },  // pii-test-fixture
+                { "dt_txt": "2026-06-10 09:00:00", "main": { "temp": 14.0, "temp_min": 12.0, "temp_max": 16.0 }, "weather": [{ "description": "light rain" }], "pop": 0.4, "rain": { "3h": 1.0 } },  // pii-test-fixture
+                { "dt_txt": "2026-06-10 18:00:00", "main": { "temp": 16.0, "temp_min": 13.0, "temp_max": 19.0 }, "weather": [{ "description": "light rain" }], "pop": 0.8, "rain": { "3h": 1.5 } },  // pii-test-fixture
+                { "dt_txt": "2026-06-11 12:00:00", "main": { "temp": 22.0, "temp_min": 19.0, "temp_max": 25.0 }, "weather": [{ "description": "few clouds" }] }  // pii-test-fixture
             ]
         })
     }
@@ -983,9 +983,9 @@ mod tests {
         assert_eq!(wx.hits(), 0, "days>=2 must not hit the current endpoint");
         assert!(out.contains("3-day forecast"));
         // every distinct day present
-        assert!(out.contains("2026-06-09"));
-        assert!(out.contains("2026-06-10"));
-        assert!(out.contains("2026-06-11"));
+        assert!(out.contains("2026-06-09"));  // pii-test-fixture
+        assert!(out.contains("2026-06-10"));  // pii-test-fixture
+        assert!(out.contains("2026-06-11"));  // pii-test-fixture
     }
 
     #[tokio::test]
@@ -1185,7 +1185,7 @@ mod tests {
         });
         let tool = Weather { cfg: cfg_for(&server, None) };
         let out = tool.execute(json!({"location": "SF", "days": 3})).await.unwrap();
-        // dual range, e.g. 2026-06-10 12–16C → 54–61F
+        // dual range, e.g. 2026-06-10 12–16C → 54–61F  // pii-test-fixture
         assert!(out.contains("°F") && out.contains("°C"), "{out}");
         // precipitation probability surfaced for the rainy day (max pop 0.8)
         assert!(out.contains("80% chance"), "{out}");
@@ -1255,12 +1255,12 @@ mod tests {
         let tool = Weather { cfg: cfg_for(&server, None) };
         let out = tool.execute(json!({"location": "SF", "when": "tomorrow"})).await.unwrap();
         fc.assert();
-        // Second distinct date is 2026-06-10 with "light rain", 12–19.
-        assert!(out.contains("2026-06-10"));
+        // Second distinct date is 2026-06-10 with "light rain", 12–19.  // pii-test-fixture
+        assert!(out.contains("2026-06-10"));  // pii-test-fixture
         assert!(out.contains("light rain"));
         assert!(out.contains("12") && out.contains("19"));
         // must NOT report today's clear sky as tomorrow
-        assert!(!out.contains("2026-06-09"));
+        assert!(!out.contains("2026-06-09"));  // pii-test-fixture
     }
 
     // ── week → /data/2.5/forecast, full outlook ──────────────────────────────
@@ -1281,9 +1281,9 @@ mod tests {
         fc.assert();
         // Three distinct days present (clamped to what the mock returns).
         assert!(out.contains("3-day forecast"));
-        assert!(out.contains("2026-06-09"));
-        assert!(out.contains("2026-06-10"));
-        assert!(out.contains("2026-06-11"));
+        assert!(out.contains("2026-06-09"));  // pii-test-fixture
+        assert!(out.contains("2026-06-10"));  // pii-test-fixture
+        assert!(out.contains("2026-06-11"));  // pii-test-fixture
         assert!(out.contains("few clouds"));
     }
 
@@ -1330,9 +1330,9 @@ mod tests {
         let list = body.get("list").and_then(Value::as_array).unwrap();
         let grouped = group_by_date(list);
         assert_eq!(grouped.len(), 3);
-        assert_eq!(grouped[0].0, "2026-06-09");
+        assert_eq!(grouped[0].0, "2026-06-09");  // pii-test-fixture
         assert_eq!(grouped[0].1.len(), 2);
-        assert_eq!(grouped[1].0, "2026-06-10");
+        assert_eq!(grouped[1].0, "2026-06-10");  // pii-test-fixture
         assert_eq!(grouped[1].1.len(), 2);
         assert_eq!(grouped[2].1.len(), 1);
     }

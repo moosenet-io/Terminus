@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn parse_stooq_close_normal_row() {
-        let csv = "Symbol,Date,Time,Open,High,Low,Close,Volume\nSPY.US,2024-01-01,21:00:00,470.1,472.0,469.5,471.3,12345678\n";
+        let csv = "Symbol,Date,Time,Open,High,Low,Close,Volume\nSPY.US,2024-01-01,21:00:00,470.1,472.0,469.5,471.3,12345678\n"; // pii-test-fixture
         assert_eq!(parse_stooq_close(csv), Some(471.3));
     }
 
@@ -383,7 +383,7 @@ mod tests {
             when.method(GET).path("/q/l/");
             then.status(200)
                 .header("content-type", "text/csv")
-                .body("Symbol,Date,Time,Open,High,Low,Close,Volume\nSPY.US,2024-01-01,21:00:00,470.1,472.0,469.5,471.3,12345678\n");
+                .body("Symbol,Date,Time,Open,High,Low,Close,Volume\nSPY.US,2024-01-01,21:00:00,470.1,472.0,469.5,471.3,12345678\n"); // pii-test-fixture
         });
 
         let quote = get_stock_quote("SPY").await.unwrap();

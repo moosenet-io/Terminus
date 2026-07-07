@@ -279,7 +279,7 @@ fn redact(s: &str) -> String {
 /// Primary reasoning backend: a headless `claude` CLI subprocess —
 /// `claude --model <model> -p <prompt> --output-format text --tools ""`.
 /// Spawned with a SANITIZED environment (see [`sanitized_child_env`]) so no
-/// operator secret (<secret-manager> tokens, Chord JWTs, API keys, ...) can leak to
+/// operator secret (<secret-manager> tokens, Chord JWTs, API keys, ...) can leak to // pii-test-fixture
 /// the child process.
 pub struct ClaudeCliBackend {
     cli: String,

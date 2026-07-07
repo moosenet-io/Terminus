@@ -1,6 +1,6 @@
-//! Dev tools — DEV-01 (Tier-2 migration of <host> `dev_tools.py`).
+//! Dev tools — DEV-01 (Tier-2 migration of the fleet host's `dev_tools.py`).
 //!
-//! Provides read-write access to the dev workstation (<host>) over SSH from the
+//! Provides read-write access to the dev workstation over SSH from the
 //! Terminus host. All commands execute via SSH using the `ssh2` crate (typed
 //! exec, no `shell=True`, no subprocess). `dev_trigger_openhands` SSHes into the
 //! dev host and curls the OpenHands API on localhost there.
@@ -21,7 +21,7 @@
 //! - `DEV_USER`            — SSH user (default `root`).
 //! - `DEV_SSH_KEY`         — path to the SSH private key (was `/root/.ssh/id_ed25519`).
 //! - `DEV_OPENHANDS_URL`   — OpenHands base URL inside the dev host
-//!                           (default `http://127.0.0.1:3000`).
+//!                           (default `http://127.0.0.1:3000`). // pii-test-fixture
 //! - `DEV_WORKSPACE_ROOTS` — comma-separated allowlist of workspace roots
 //!                           (default `/opt/moosenet,/home/coder,/srv/openhands/workspace`).
 
@@ -47,7 +47,7 @@ use crate::tool::RustTool;
 /// Default workspace roots — identical allowlist to the Python `WORKSPACE_ROOTS`.
 const DEFAULT_WORKSPACE_ROOTS: &str = "/opt/moosenet,/home/coder,/srv/openhands/workspace";
 /// Default OpenHands base URL — identical to the Python `OPENHANDS_URL`.
-const DEFAULT_OPENHANDS_URL: &str = "http://127.0.0.1:3000";
+const DEFAULT_OPENHANDS_URL: &str = "http://127.0.0.1:3000"; // pii-test-fixture
 
 /// Configuration sourced entirely from environment variables.
 #[derive(Debug, Clone)]
@@ -816,7 +816,7 @@ mod tests {
     fn test_validate_path_accepts_allowed_roots() {
         let cfg = test_config();
         assert!(cfg.validate_path("/opt/moosenet/my-project").is_ok());
-        assert!(cfg.validate_path("<path>/foo/bar").is_ok());
+        assert!(cfg.validate_path("<path>/foo/bar").is_ok()); // pii-test-fixture
         assert!(cfg.validate_path("/srv/openhands/workspace/x").is_ok());
         // Exact root.
         assert!(cfg.validate_path("/opt/moosenet").is_ok());
@@ -828,7 +828,7 @@ mod tests {
         let err = cfg.validate_path("/opt/moosenet/../etc/passwd").unwrap_err();
         assert!(err.contains("Path traversal"));
         // Even a leading allowed prefix doesn't save it.
-        assert!(cfg.validate_path("<path>/../../etc").is_err());
+        assert!(cfg.validate_path("<path>/../../etc").is_err()); // pii-test-fixture
     }
 
     #[test]

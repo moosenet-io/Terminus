@@ -1,6 +1,6 @@
 //! News tools — headlines, search, and topic feeds.
 //!
-//! Three tools mirroring the Python news_tools.py on <host> exactly:
+//! Three tools mirroring the Python news_tools.py on the fleet host exactly:
 //!   news_headlines  — top headlines (NewsAPI primary, GNews fallback)
 //!   news_search     — keyword search (NewsAPI primary, GNews fallback)
 //!   news_topic      — topic feed (GNews topic endpoint)
@@ -495,7 +495,7 @@ mod tests {
             "description": format!("Desc {i}"),
             "source": { "name": "BBC" },
             "url": format!("https://bbc.com/{i}"),
-            "publishedAt": "2026-06-08T07:00:00Z"
+            "publishedAt": "2026-06-08T07:00:00Z" // pii-test-fixture
         })).collect();
         json!({ "status": "ok", "totalResults": count, "articles": articles })
     }
@@ -506,7 +506,7 @@ mod tests {
             "description": format!("GDesc {i}"),
             "source": { "name": "Reuters" },
             "url": format!("https://reuters.com/{i}"),
-            "publishedAt": "2026-06-08T07:00:00Z"
+            "publishedAt": "2026-06-08T07:00:00Z" // pii-test-fixture
         })).collect();
         json!({ "totalArticles": count, "articles": articles })
     }
@@ -605,8 +605,8 @@ mod tests {
             "status": "ok",
             "totalResults": 2,
             "articles": [
-                { "title": "T1", "description": "D1", "source": {"name": "CNN"}, "url": "https://cnn.com/1", "publishedAt": "2026-06-08" },
-                { "title": "T2", "description": "D2", "source": {"name": "Fox"}, "url": "https://fox.com/2", "publishedAt": "2026-06-07" }
+                { "title": "T1", "description": "D1", "source": {"name": "CNN"}, "url": "https://cnn.com/1", "publishedAt": "2026-06-08" }, // pii-test-fixture
+                { "title": "T2", "description": "D2", "source": {"name": "Fox"}, "url": "https://fox.com/2", "publishedAt": "2026-06-07" } // pii-test-fixture
             ]
         });
         let articles = body.get("articles").and_then(Value::as_array).unwrap();

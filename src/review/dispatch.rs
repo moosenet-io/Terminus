@@ -31,7 +31,7 @@ pub const NEMOTRON_MODEL: &str = "nvidia/nemotron-3-ultra-550b-a55b:free";
 /// with a code-specialization that fits this tool's review use case well.
 pub const QWEN_CODER_MODEL: &str = "qwen/qwen3-coder:free";
 
-pub const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:8790";
+pub const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:8790"; // pii-test-fixture
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
 /// Config for reaching the review-daemon and OpenRouter. Follows this repo's

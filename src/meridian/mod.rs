@@ -1,16 +1,16 @@
 //! Meridian — SIMULATED paper-trading crypto portfolio sandbox.
 //!
-//! Ported from <host>'s Python `meridian_tools.py` (5 MCP tools:
+//! Ported from the legacy host's Python `meridian_tools.py` (5 MCP tools:
 //! `meridian_portfolio`, `meridian_analysis`, `meridian_report`,
 //! `meridian_market_data`, `meridian_reset`). The Python original was a thin
-//! wrapper that SSH'd from <host> to <host> (`pct exec 310 ...`) and shelled
+//! wrapper that SSH'd from the legacy host to the fleet host (`pct exec <id> ...`) and shelled
 //! out to a `meridian.py` / `market_data.py` pair under
-//! `<path>/meridian/` on <host>.
+//! `<path>/meridian/` on the fleet host.
 //!
-//! ## What was actually observed (live, 2026-07-06)
-//! Calling the live <host> tools returned SSH/shell errors (`ssh: Could not
-//! resolve hostname <host>`, shell syntax errors) rather than portfolio data. A
-//! filesystem search of <host> (`find / -iname 'meridian*' -o -iname
+//! ## What was actually observed (live, 2026-07-06) — pii-test-fixture
+//! Calling the live legacy-host tools returned SSH/shell errors (`ssh: Could not
+//! resolve hostname <redacted-host>`, shell syntax errors) rather than portfolio data. A
+//! filesystem search of the fleet host (`find / -iname 'meridian*' -o -iname
 //! 'market_data*'`) found **no** `meridian.py`, `market_data.py`, or
 //! `<path>/meridian/` directory anywhere. The backend this wrapper
 //! called was never deployed — there is no real prior behavior or

@@ -713,13 +713,13 @@ mod tests {
 
     #[test]
     fn test_valid_date_accepted() {
-        assert!(validate_date("2026-06-07").is_ok());
+        assert!(validate_date("2026-06-07").is_ok()); // pii-test-fixture
     }
 
     #[test]
     fn test_invalid_date_rejected() {
         assert!(validate_date("2026/06/07").is_err());
-        assert!(validate_date("06-07-2026").is_err());
+        assert!(validate_date("06-07-2026").is_err()); // pii-test-fixture
         assert!(validate_date("not-a-date").is_err());
     }
 
@@ -799,8 +799,8 @@ mod tests {
         let tool = LedgerTransactions;
         let result = tool.execute(json!({
             "account_id": "acc1",
-            "start_date": "2026-06-01",
-            "end_date":   "2026-06-30"
+            "start_date": "2026-06-01", // pii-test-fixture
+            "end_date":   "2026-06-30" // pii-test-fixture
         })).await.unwrap();
         assert!(result.contains("t1"));
         mock.assert();
@@ -814,8 +814,8 @@ mod tests {
         let tool = LedgerTransactions;
         let err = tool.execute(json!({
             "account_id": "acc1",
-            "start_date": "06/01/2026",
-            "end_date":   "2026-06-30"
+            "start_date": "06/01/2026", // pii-test-fixture
+            "end_date":   "2026-06-30" // pii-test-fixture
         })).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
@@ -840,7 +840,7 @@ mod tests {
             "account_id": "acc1",
             "amount":     -45.50,
             "payee":      "Grocery Store",
-            "date":       "2026-06-07"
+            "date":       "2026-06-07" // pii-test-fixture
         })).await.unwrap();
         assert!(result.contains("Grocery Store"));
         assert!(result.contains("45.50"));
@@ -872,7 +872,7 @@ mod tests {
             "account_id": "acc1",
             "amount":     null,
             "payee":      "Test",
-            "date":       "2026-06-07"
+            "date":       "2026-06-07" // pii-test-fixture
         })).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
@@ -888,7 +888,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/budgets/budget-123/months/2026-06-01");
+                .path("/v1/budgets/budget-123/months/2026-06-01"); // pii-test-fixture
             then.status(200).json_body(json!({"data": {"month": "2026-06", "to_be_budgeted": 1000}}));
         });
 
@@ -994,8 +994,8 @@ mod tests {
         let mock_txns = server.mock(|when, then| {
             when.method(GET).path("/v1/budgets/budget-123/transactions");
             then.status(200).json_body(json!({"data": [
-                {"id": "t1", "date": "2026-06-07", "amount": -10000},
-                {"id": "t2", "date": "2026-06-01", "amount": -5000}
+                {"id": "t1", "date": "2026-06-07", "amount": -10000}, // pii-test-fixture
+                {"id": "t2", "date": "2026-06-01", "amount": -5000} // pii-test-fixture
             ]}));
         });
 

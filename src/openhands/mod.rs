@@ -1,4 +1,4 @@
-//! OpenHands tools — ported from the Python `openhands_tools.py` on <host>.
+//! OpenHands tools — ported from the Python `openhands_tools.py` on the fleet host.
 //!
 //! Three tools driving the OpenHands agent runtime over its HTTP API:
 //!   openhands_run_task          — start a conversation/task, return its conversation_id
@@ -496,7 +496,7 @@ mod tests {
             "status": "STOPPED",
             "runtime_status": "ready",
             "title": "T",
-            "last_updated_at": "2026-06-08T00:00:00Z"
+            "last_updated_at": "2026-06-08T00:00:00Z" // pii-test-fixture
         });
         let out = shape_status("cid", &conv, false, None);
         assert_eq!(out["conversation_id"], "cid");
@@ -551,7 +551,7 @@ mod tests {
                 "title": format!("T{i}"),
                 "status": "STOPPED",
                 "runtime_status": "ready",
-                "last_updated_at": "2026-06-08"
+                "last_updated_at": "2026-06-08" // pii-test-fixture
             }));
         }
         let body = json!({ "results": results });

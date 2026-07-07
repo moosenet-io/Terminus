@@ -47,20 +47,20 @@ fn patterns() -> &'static Patterns {
         )
         .expect("private_ip regex"),
         container_id: Regex::new(r"\bCT\d{3}\b").expect("container_id regex"),
-        internal_host: Regex::new(r"(?i)\b(?:<host>|<host>|<host>|<host>|<host>)\b")
+        internal_host: Regex::new(r"(?i)\b(?:<host>|<host>|<host>|<host>|<host>)\b") // pii-test-fixture
             .expect("internal_host regex"),
         internal_domain: Regex::new(r"moosenet\.online|moosenet\.local")
             .expect("internal_domain regex"),
         email: Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
             .expect("email regex"),
         phone: Regex::new(r"\+?\d[\d\s\-]{8,}\d").expect("phone regex"),
-        api_key: Regex::new(r"\b(?:sk-|ghp_|gsk_|glpat-|xox[bpasr]-)\S+")
+        api_key: Regex::new(r"\b(?:sk-|ghp_|gsk_|glpat-|xox[bpasr]-)\S+") // pii-test-fixture
             .expect("api_key regex"),
-        internal_path: Regex::new(r"<path>/|<path>/|<path>/|<path>/")
+        internal_path: Regex::new(r"<path>/|<path>/|<path>/|<path>/") // pii-test-fixture
             .expect("internal_path regex"),
         local_url: Regex::new(r"(?:localhost|127\.0\.0\.1|0\.0\.0\.0):\d{4,5}")
             .expect("local_url regex"),
-        infra_service: Regex::new(r"(?i)\b(?:<matrix-server>|<secret-manager>|<media-service>|<container-mgr>)\b")
+        infra_service: Regex::new(r"(?i)\b(?:<matrix-server>|<secret-manager>|<media-service>|<container-mgr>)\b") // pii-test-fixture
             .expect("infra_service regex"),
         uuid: Regex::new(
             r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
@@ -100,10 +100,10 @@ fn redact(matched: &str) -> String {
 }
 
 /// Whether a UUID match should be blocked: only when its line contains an
-/// infra-secret cue (`<secret-manager>`, `project_id`, `workspace_id`,
+/// infra-secret cue (`<secret-manager>`, `project_id`, `workspace_id`, // pii-test-fixture
 /// `machine_identity`) within ~40 chars of the match. Bare UUIDs are allowed.
 fn uuid_is_sensitive(line: &str, m_start: usize, m_end: usize) -> bool {
-    let cues = ["<secret-manager>", "project_id", "workspace_id", "machine_identity"];
+    let cues = ["<secret-manager>", "project_id", "workspace_id", "machine_identity"]; // pii-test-fixture
     let lower = line.to_lowercase();
     // Window: 40 chars before the match start through 40 chars after the end.
     let win_start = m_start.saturating_sub(40);
@@ -253,63 +253,63 @@ mod tests {
     #[serial]
     fn private_ip_is_blocked() {
         clear_allow();
-        let v = scan_for_pii("server at <internal-ip> listening");
+        let v = scan_for_pii("server at <internal-ip> listening"); // pii-test-fixture
         assert!(v.iter().any(|x| x.category == "private_ip"));
-        assert!(pii_gate("<internal-ip>").is_err());
+        assert!(pii_gate("<internal-ip>").is_err()); // pii-test-fixture
     }
 
     #[test]
     #[serial]
     fn container_id_is_blocked() {
         clear_allow();
-        let v = scan_for_pii("deployed to <host> today");
+        let v = scan_for_pii("deployed to <host> today"); // pii-test-fixture
         assert!(v.iter().any(|x| x.category == "container_id"));
-        assert!(pii_gate("<host>").is_err());
+        assert!(pii_gate("<host>").is_err()); // pii-test-fixture
     }
 
     #[test]
     #[serial]
     fn internal_hostname_is_blocked() {
         clear_allow();
-        let v = scan_for_pii("ran on <host> build host");
+        let v = scan_for_pii("ran on <host> build host"); // pii-test-fixture
         assert!(v.iter().any(|x| x.category == "internal_hostname"));
-        assert!(pii_gate("<host>").is_err());
+        assert!(pii_gate("<host>").is_err()); // pii-test-fixture
         // case-insensitive
-        assert!(!scan_for_pii("<host>").is_empty());
+        assert!(!scan_for_pii("<host>").is_empty()); // pii-test-fixture
     }
 
     #[test]
     #[serial]
     fn internal_domain_is_blocked() {
         clear_allow();
-        let v = scan_for_pii("visit git.example.com for repos");
+        let v = scan_for_pii("visit git.example.com for repos"); // pii-test-fixture
         assert!(v.iter().any(|x| x.category == "internal_domain"));
-        assert!(pii_gate("example.com").is_err());
+        assert!(pii_gate("example.com").is_err()); // pii-test-fixture
     }
 
     #[test]
     #[serial]
     fn api_key_is_blocked() {
         clear_allow();
-        let v = scan_for_pii("token <REDACTED-SECRET> here");
+        let v = scan_for_pii("token <REDACTED-SECRET> here"); // pii-test-fixture
         assert!(v.iter().any(|x| x.category == "api_key"));
-        assert!(pii_gate("<REDACTED-SECRET>").is_err());
+        assert!(pii_gate("<REDACTED-SECRET>").is_err()); // pii-test-fixture
     }
 
     #[test]
     #[serial]
     fn phone_is_blocked() {
         clear_allow();
-        let v = scan_for_pii("call <phone> now");
+        let v = scan_for_pii("call <phone> now"); // pii-test-fixture
         assert!(v.iter().any(|x| x.category == "phone"));
-        assert!(pii_gate("<phone>").is_err());
+        assert!(pii_gate("<phone>").is_err()); // pii-test-fixture
     }
 
     #[test]
     #[serial]
     fn allowed_author_email_is_permitted() {
-        std::env::set_var("GITHUB_ALLOWED_AUTHORS", "<email>, Moose");
-        let v = scan_for_pii("Co-Authored-By: <email>");
+        std::env::set_var("GITHUB_ALLOWED_AUTHORS", "<email>, Moose"); // pii-test-fixture
+        let v = scan_for_pii("Co-Authored-By: <email>"); // pii-test-fixture
         assert!(
             !v.iter().any(|x| x.category == "email"),
             "allow-listed author email must not be flagged: {v:?}"
@@ -321,7 +321,7 @@ mod tests {
     #[serial]
     fn non_allowed_email_is_blocked() {
         clear_allow();
-        let v = scan_for_pii("contact <email>");
+        let v = scan_for_pii("contact <email>"); // pii-test-fixture
         assert!(v.iter().any(|x| x.category == "email"));
     }
 
@@ -329,7 +329,7 @@ mod tests {
     #[serial]
     fn bare_uuid_is_allowed() {
         clear_allow();
-        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let uuid = "550e8400-e29b-41d4-a716-446655440000"; // pii-test-fixture
         let v = scan_for_pii(&format!("request id {uuid} completed"));
         assert!(
             !v.iter().any(|x| x.category == "uuid_secret"),
@@ -342,11 +342,11 @@ mod tests {
     #[serial]
     fn infisical_uuid_is_blocked() {
         clear_allow();
-        let line = "<secret-manager> project fc51cfe1-0000-0000-0000-000000000000";
+        let line = "<secret-manager> project fc51cfe1-0000-0000-0000-000000000000"; // pii-test-fixture
         let v = scan_for_pii(line);
         assert!(
             v.iter().any(|x| x.category == "uuid_secret"),
-            "<secret-manager>-cued UUID must be blocked: {v:?}"
+            "<secret-manager>-cued UUID must be blocked: {v:?}" // pii-test-fixture
         );
         assert!(pii_gate(line).is_err());
     }
@@ -355,7 +355,7 @@ mod tests {
     #[serial]
     fn project_id_uuid_is_blocked() {
         clear_allow();
-        let line = "project_id: <uuid>";
+        let line = "project_id: <uuid>"; // pii-test-fixture
         let v = scan_for_pii(line);
         assert!(v.iter().any(|x| x.category == "uuid_secret"));
     }
@@ -384,7 +384,7 @@ fn it_works() {
     fn batch_with_one_dirty_content_is_rejected() {
         clear_allow();
         let mut contents: Vec<String> = (0..9).map(|i| format!("clean line {i}\n")).collect();
-        contents.push("oops <internal-ip> leaked".to_string());
+        contents.push("oops <internal-ip> leaked".to_string()); // pii-test-fixture
         assert_eq!(contents.len(), 10);
 
         // Mirror the batch semantics used by write tools: any violation rejects all.
@@ -403,7 +403,7 @@ fn it_works() {
     fn gate_returns_err_not_ok_on_violation() {
         clear_allow();
         // The API path is only reachable on Ok(()); prove a violation yields Err.
-        let r = pii_gate("host <host> at <internal-ip>");
+        let r = pii_gate("host <host> at <internal-ip>"); // pii-test-fixture
         assert!(r.is_err());
         match r {
             Err(ToolError::InvalidArgument(msg)) => {
@@ -418,7 +418,7 @@ fn it_works() {
     #[serial]
     fn context_is_redacted_not_full_secret() {
         clear_allow();
-        let secret = "<REDACTED-SECRET>";
+        let secret = "<REDACTED-SECRET>"; // pii-test-fixture
         let v = scan_for_pii(secret);
         let api = v.iter().find(|x| x.category == "api_key").unwrap();
         assert!(
@@ -432,7 +432,7 @@ fn it_works() {
     #[serial]
     fn line_numbers_are_one_based() {
         clear_allow();
-        let content = "clean\nclean\nCT327\n";
+        let content = "clean\nclean\nCT327\n"; // pii-test-fixture
         let v = scan_for_pii(content);
         let ct = v.iter().find(|x| x.category == "container_id").unwrap();
         assert_eq!(ct.line, 3);
@@ -442,7 +442,7 @@ fn it_works() {
     #[serial]
     fn internal_path_is_blocked() {
         clear_allow();
-        let v = scan_for_pii("see <path>/repos/x for details");
+        let v = scan_for_pii("see <path>/repos/x for details"); // pii-test-fixture
         assert!(v.iter().any(|x| x.category == "internal_path"));
     }
 
@@ -450,7 +450,7 @@ fn it_works() {
     #[serial]
     fn local_url_is_blocked() {
         clear_allow();
-        let v = scan_for_pii("proxy on localhost:4000 active");
+        let v = scan_for_pii("proxy on localhost:4000 active"); // pii-test-fixture
         assert!(v.iter().any(|x| x.category == "local_url"));
     }
 
@@ -458,7 +458,108 @@ fn it_works() {
     #[serial]
     fn infra_service_is_blocked() {
         clear_allow();
-        let v = scan_for_pii("secrets in <secret-manager> vault");
+        let v = scan_for_pii("secrets in <secret-manager> vault"); // pii-test-fixture
         assert!(v.iter().any(|x| x.category == "infra_service"));
+    }
+
+    /// Root-cause regression guard: walk this crate's own `src/` tree and run
+    /// [`scan_for_pii`] against every `.rs` file, exactly as it would be run
+    /// against outbound content before a GitHub write. Lines carrying the
+    /// `pii-test-fixture` marker (the repo-wide convention for deliberate
+    /// PII-shaped test literals — see `src/cortex/mod.rs`, `src/cortex/audit.rs`,
+    /// `src/bin/review_daemon/sandbox.rs`, `src/bin/review_daemon/egress_proxy.rs`,
+    /// and this file's own test module) are stripped before scanning.
+    ///
+    /// This is the self-check for the 2026-07 PII comment-scrub remediation:
+    /// it must fail loudly, with exact file:line:category detail, if a future
+    /// change reintroduces a real infra identifier (container ID, `<host>`-style // pii-test-fixture
+    /// hostname, private IP, internal path, etc.) into a doc/code comment
+    /// anywhere in the crate.
+    #[test]
+    #[serial]
+    fn no_pii_in_own_source_tree() {
+        clear_allow();
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src_dir = manifest_dir.join("src");
+        assert!(
+            src_dir.is_dir(),
+            "expected {src_dir:?} to exist — self-check is walking the wrong tree"
+        );
+
+        let mut rs_files = Vec::new();
+        collect_rs_files(&src_dir, &mut rs_files);
+        assert!(
+            rs_files.len() > 50,
+            "expected to find a substantial number of .rs files under {src_dir:?}, \
+             found {} — self-check may be misconfigured",
+            rs_files.len()
+        );
+
+        let mut findings: Vec<String> = Vec::new();
+
+        for path in &rs_files {
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(e) => {
+                    findings.push(format!("{}: <unreadable: {e}>", path.display()));
+                    continue;
+                }
+            };
+
+            // Strip any line carrying the exemption marker before scanning,
+            // exactly as production PII-gate callers are expected to do for
+            // deliberate test fixtures.
+            let scrubbed: String = content
+                .lines()
+                .map(|line| {
+                    if line.contains("pii-test-fixture") {
+                        ""
+                    } else {
+                        line
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            for v in scan_for_pii(&scrubbed) {
+                findings.push(format!(
+                    "{}:{}:{}: {}",
+                    path.display(),
+                    v.line,
+                    v.category,
+                    v.context
+                ));
+            }
+        }
+
+        assert!(
+            findings.is_empty(),
+            "PII self-check found {} violation(s) in this crate's own source tree \
+             (file:line:category:context) — tag deliberate test fixtures with \
+             `// pii-test-fixture` or rewrite the offending comment generically:\n{}",
+            findings.len(),
+            findings.join("\n")
+        );
+    }
+
+    /// Recursively collect `.rs` file paths under `dir`, skipping any
+    /// `target/` build-output directory.
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().and_then(|n| n.to_str()) == Some("target") {
+                    continue;
+                }
+                collect_rs_files(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
     }
 }

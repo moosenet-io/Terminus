@@ -1,9 +1,9 @@
-//! Sundry trivial tools — ported 1:1 from the Python MCP server on <host>
-//! (`ai-terminus`, streamable-HTTP MCP endpoint). These are small utility/one-liner
-//! tools that don't warrant a dedicated module of their own.
+//! Sundry trivial tools — ported 1:1 from the Python MCP server on the legacy
+//! Terminus host (`ai-terminus`, streamable-HTTP MCP endpoint). These are small
+//! utility/one-liner tools that don't warrant a dedicated module of their own.
 //!
-//! Verified against the live <host> server via `tools/list` (for schema) and
-//! `tools/call` (for real output shape) on 2026-07-06:
+//! Verified against the live legacy Terminus server via `tools/list` (for schema) and
+//! `tools/call` (for real output shape) on 2026-07-06: — pii-test-fixture
 //!
 //!   - `health`                — static `{"ok": true}` liveness ping.
 //!   - `echo`                  — returns the `text` argument verbatim.
@@ -59,8 +59,8 @@ impl RustTool for Health {
     }
 
     fn description(&self) -> &str {
-        // <host>'s live docstring is empty; the terminus-rs registry requires a
-        // non-empty description for every tool, so a short one is supplied here.
+        // The legacy Python tool's live docstring is empty; the terminus-rs registry
+        // requires a non-empty description for every tool, so a short one is supplied here.
         "Liveness ping. Returns {\"ok\": true} if the server is responding."
     }
 
@@ -87,8 +87,8 @@ impl RustTool for Echo {
     }
 
     fn description(&self) -> &str {
-        // <host>'s live docstring is empty; supplying a short one to satisfy
-        // the terminus-rs non-empty-description invariant.
+        // The legacy Python tool's live docstring is empty; supplying a short one to
+        // satisfy the terminus-rs non-empty-description invariant.
         "Echo the given text back verbatim. Useful for connectivity checks."
     }
 
@@ -124,8 +124,8 @@ impl RustTool for UtcNow {
     }
 
     fn description(&self) -> &str {
-        // <host>'s live docstring is empty; supplying a short one to satisfy
-        // the terminus-rs non-empty-description invariant.
+        // The legacy Python tool's live docstring is empty; supplying a short one to
+        // satisfy the terminus-rs non-empty-description invariant.
         "Return the current UTC time as an ISO-8601 timestamp."
     }
 
@@ -164,9 +164,9 @@ impl RustTool for ConstellationVersion {
             "constellation": "Lumina Constellation",
             "version": "0.12.0",
             "session": 12,
-            "mcp_hub": "<host> (Terminus)",
-            "agent_fleet": "<host>",
-            "orchestrator": "<host> (<host> v0.24.0)",
+            "mcp_hub": "the Terminus MCP hub container",
+            "agent_fleet": "the agent fleet host",
+            "orchestrator": "the orchestrator container (agent runtime v0.24.0)",
             "plugin_architecture": true,
             "skills_standard": "agentskills.io",
             "timestamp": timestamp,

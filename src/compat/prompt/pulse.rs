@@ -107,7 +107,7 @@ fn to_12h(hour24: u32) -> (u32, &'static str) {
 
 /// Decompose a (possibly negative) local epoch into (weekday, hour, minute).
 ///
-/// 1970-01-01 was a Thursday.  We compute the day index relative to the epoch,
+/// 1970-01-01 was a Thursday.  We compute the day index relative to the epoch, // pii-test-fixture
 /// flooring toward negative infinity so pre-epoch times (never expected, but
 /// safe) still produce a valid weekday.
 fn civil_time(local_secs: i64) -> (&'static str, u32, u32) {
@@ -115,7 +115,7 @@ fn civil_time(local_secs: i64) -> (&'static str, u32, u32) {
     let secs_of_day = local_secs.rem_euclid(86_400);
     let hour = (secs_of_day / 3600) as u32;
     let minute = ((secs_of_day % 3600) / 60) as u32;
-    // 1970-01-01 = Thursday (index 4 with Sunday=0).
+    // 1970-01-01 = Thursday (index 4 with Sunday=0). // pii-test-fixture
     let wd = (day.rem_euclid(7) + 4).rem_euclid(7) as usize;
     const NAMES: [&str; 7] = [
         "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
@@ -127,7 +127,7 @@ fn civil_time(local_secs: i64) -> (&'static str, u32, u32) {
 mod tests {
     use super::*;
 
-    // 2021-01-04 is a Monday.  21:15:00 UTC → epoch 1609794900.
+    // 2021-01-04 is a Monday.  21:15:00 UTC → epoch 1609794900. // pii-test-fixture
     const MON_2115_UTC: i64 = 1_609_794_900;
 
     #[test]
@@ -206,11 +206,11 @@ mod tests {
 
     #[test]
     fn weekday_algorithm_known_dates() {
-        // 1970-01-01 Thursday
+        // 1970-01-01 Thursday // pii-test-fixture
         assert_eq!(civil_time(0).0, "Thursday");
         // +1 day → Friday
         assert_eq!(civil_time(86_400).0, "Friday");
-        // 2021-01-04 Monday
+        // 2021-01-04 Monday // pii-test-fixture
         assert_eq!(civil_time(MON_2115_UTC).0, "Monday");
     }
 

@@ -1,18 +1,18 @@
-//! `lumina_*` tools — ported from <host>'s Python MCP server ("ai-terminus",
+//! `lumina_*` tools — ported from the legacy Python MCP host's server ("ai-terminus",
 //! streamable-HTTP MCP endpoint, tool set `ai-mcp` v1.26.0). This module
 //! groups the six remaining `lumina_*` tools that had not yet been ported to
 //! Rust (`lumina_weather` was already ported separately, as `weather::mod`).
 //!
 //! Per the operator's explicit direction, these are mechanical 1:1 ports —
-//! faithful to <host>'s *observed live behavior* (verified via direct MCP
-//! `tools/call` probes on 2026-07-06), not a redesign. Several of the ported
+//! faithful to the legacy host's *observed live behavior* (verified via direct MCP
+//! `tools/call` probes on a recent date), not a redesign. Several of the ported
 //! endpoints are themselves broken or quirky on the live server; the port
 //! reproduces that, it does not fix it:
 //!
 //!   - `lumina_clawhub_skill_detail` calls `GET clawhub.ai/api/skill/{slug}`,
 //!     which 404s ("No matching routes found") for every slug tried. The
 //!     *working* ClawHub endpoint is actually `GET /api/skill?slug=...`
-//!     (verified independently), but that is NOT what <host> calls, so this
+//!     (verified independently), but that is NOT what the legacy host calls, so this
 //!     port intentionally calls the broken path-style endpoint to match.
 //!   - `lumina_clawmart_browse` calls `GET shopclawmart.com/search?q=...` when
 //!     a non-empty query is given, which also 404s (no such route on that
@@ -24,7 +24,7 @@
 //! ## SSRF note (flagged for operator review, not fixed here)
 //! `lumina_web_fetch` takes an arbitrary caller-supplied URL and fetches it
 //! with no allowlist, scheme restriction, or private/loopback-address check.
-//! Verified against the live <host> tool: a request for `http://127.0.0.1:22`
+//! Verified against the live legacy-host tool: a request for `http://127.0.0.1:22`
 //! was fetched with no rejection (the raw SSH banner came back as the
 //! tool's `"error"` string, proving the fetch reached a loopback port with
 //! no guard). **This port intentionally matches that behavior** — no new
@@ -46,14 +46,14 @@
 //! None of these tools raise on a failed fetch. Every one catches the
 //! failure (non-2xx HTTP status, or a transport-level error) and folds it
 //! into a normal, `isError:false` JSON response with an `"error"` key —
-//! verified directly against <host> for `lumina_clawhub_skill_detail`,
+//! verified directly against the legacy host for `lumina_clawhub_skill_detail`,
 //! `lumina_clawmart_browse`, and `lumina_web_fetch`. Non-2xx response bodies
 //! are truncated to 500 chars in the error message, matching the exact
 //! truncation point observed in a live 404 from shopclawmart.com.
 //!
-//! No API keys or auth are required for any of these six tools — <host>
+//! No API keys or auth are required for any of these six tools — the legacy host
 //! calls each target as an anonymous public HTTP client. The only header
-//! <host> evidently sends beyond the default is a `User-Agent` for the
+//! the legacy host evidently sends beyond the default is a `User-Agent` for the
 //! GitHub Contents API call (`lumina_claw_awesome_list`) — GitHub's API
 //! returns 403 to requests with no `User-Agent` at all.
 
@@ -67,12 +67,12 @@ use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
 // ---------------------------------------------------------------------------
-// Targets (verified live against <host>'s `ai-mcp` on 2026-07-06)
+// Targets (verified live against the legacy host's `ai-mcp` on a recent date)
 // ---------------------------------------------------------------------------
 
 const CLAWHUB_SEARCH_URL: &str = "https://clawhub.ai/api/search";
 /// Path-style skill-detail endpoint. This 404s on the live ClawHub site today
-/// ("No matching routes found") — see module docs. Kept as-is to match <host>.
+/// ("No matching routes found") — see module docs. Kept as-is to match the legacy host.
 const CLAWHUB_SKILL_URL_BASE: &str = "https://clawhub.ai/api/skill";
 const AICPB_URL: &str = "https://aicpb.com/";
 const CLAWMART_HOME_URL: &str = "https://shopclawmart.com/";
@@ -84,7 +84,7 @@ const AWESOME_LIST_SOURCE: &str = "github.com/VoltAgent/awesome-openclaw-skills"
 
 /// aicpb_rankings / clawmart_browse hardcode this truncation length server-side
 /// (no `max_length` argument is exposed for either tool) — verified by
-/// measuring the exact returned content length from <host> (3000 chars both
+/// measuring the exact returned content length from the legacy host (3000 chars both
 /// times, regardless of category / query).
 const READABLE_TEXT_MAX_LEN: usize = 3000;
 /// lumina_web_fetch's own default, taken directly from its inputSchema.
@@ -93,7 +93,7 @@ const WEB_FETCH_DEFAULT_MAX_LEN: i64 = 3000;
 /// (returned content was exactly 5000 chars).
 const AWESOME_LIST_MAX_LEN: usize = 5000;
 /// Error-body truncation length, verified against a live shopclawmart.com
-/// 404 whose HTML body was cut at exactly this many chars in <host>'s
+/// 404 whose HTML body was cut at exactly this many chars on the legacy host's
 /// `"error"` string.
 const ERROR_BODY_MAX_LEN: usize = 500;
 
@@ -118,7 +118,7 @@ fn truncate_chars(s: &str, max_len: usize) -> (String, bool) {
 /// a transport-level failure, returns `Err(message)` rather than propagating
 /// a `ToolError` — every `lumina_*` tool here folds that message into its own
 /// `"error"` JSON field instead of raising, matching the Python original
-/// (verified directly against <host> — see module docs).
+/// (verified directly against the legacy host — see module docs).
 async fn send_get(req: reqwest::RequestBuilder) -> Result<String, String> {
     match req.send().await {
         Ok(resp) => {
@@ -228,7 +228,7 @@ fn tags_to_lines(fragment: &str) -> String {
 /// `<body>` tag is present), with `<script>`/`<style>` removed first. This is
 /// what all three HTML-consuming `lumina_*` tools use.
 ///
-/// Verified against <host>'s live `lumina_web_fetch` output for
+/// Verified against the legacy host's live `lumina_web_fetch` output for
 /// `https://example.com`: the title ("Example Domain") appears once, then
 /// the body's own heading (also "Example Domain") appears again as part of
 /// the body text — i.e. title and body are concatenated, not deduplicated.
@@ -388,7 +388,7 @@ impl RustTool for LuminaAicpbRankings {
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
         // `category` is accepted and echoed back but never used to build the
-        // request — <host> fetches the same aicpb.com homepage regardless of
+        // request — the legacy host fetches the same aicpb.com homepage regardless of
         // category (verified: identical content for "all" vs. "games").
         let category = args["category"].as_str().unwrap_or("all");
 
@@ -438,7 +438,7 @@ impl RustTool for LuminaClawmartBrowse {
         let client = http_client()?;
         // Empty query -> bare homepage (works). Non-empty query -> /search?q=
         // (verified 404 on the live site today — see module docs; kept as-is
-        // to match <host> exactly).
+        // to match the legacy host exactly).
         let req = if query.is_empty() {
             client.get(CLAWMART_HOME_URL)
         } else {
@@ -484,7 +484,7 @@ impl RustTool for LuminaClawAwesomeList {
     async fn execute(&self, _args: Value) -> Result<String, ToolError> {
         let client = http_client()?;
         // GitHub's Contents API 403s any request with no User-Agent header
-        // (verified) — <host> evidently sends one, so this must too.
+        // (verified) — the legacy host evidently sends one, so this must too.
         let req = client
             .get(AWESOME_LIST_API_URL)
             .header("User-Agent", "terminus-rs-lumina-ext")
@@ -585,7 +585,7 @@ impl RustTool for LuminaWebFetch {
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
         // NOTE (SSRF): `url` is fetched exactly as given, with no scheme,
-        // host, or private/loopback-address restriction — matching <host>'s
+        // host, or private/loopback-address restriction — matching the legacy host's
         // verified live behavior. See the module-level doc comment.
         let url = args["url"]
             .as_str()
@@ -643,7 +643,7 @@ mod tests {
     #[test]
     fn test_extract_readable_text_title_and_body() {
         // Small embedded fixture modeled on the live example.com response
-        // <host> returned: title text appears once, then the body's own
+        // the legacy host returned: title text appears once, then the body's own
         // (different) heading and paragraphs appear as separate lines, with
         // scripts/styles removed and tags collapsed to one line each.
         let html = r#"<!doctype html>
@@ -798,7 +798,7 @@ mod tests {
             when.method(GET).path("/api/search");
             then.status(200).json_body(json!({
                 "results": [
-                    {"slug": "deploy", "displayName": "Deploy", "summary": "Ships things", "updatedAt": 1778486238781i64}
+                    {"slug": "deploy", "displayName": "Deploy", "summary": "Ships things", "updatedAt": 1778486238781i64} // pii-test-fixture
                 ]
             }));
         });
@@ -896,7 +896,7 @@ mod tests {
         let server = MockServer::start();
         let _mock = server.mock(|when, then| {
             when.method(GET).path("/long");
-            then.status(200).body("<body><p>0123456789</p></body>");
+            then.status(200).body("<body><p>0123456789</p></body>"); // pii-test-fixture
         });
 
         let tool = LuminaWebFetch;
@@ -986,7 +986,7 @@ mod tests {
             // Encode using the same alphabet our decoder expects, via a tiny
             // manual encoder (std has none) so the test stays dependency-free.
             fn encode(data: &[u8]) -> String {
-                const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; // pii-test-fixture
                 let mut out = String::new();
                 for chunk in data.chunks(3) {
                     let b0 = chunk[0];

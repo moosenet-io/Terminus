@@ -1,10 +1,10 @@
 //! Crucible tools — learning-tracker system, ported from the Python
-//! `crucible_tools.py` on <host> (ai-terminus, streamable-HTTP MCP).
+//! `crucible_tools.py` on the legacy Terminus host (ai-terminus, streamable-HTTP MCP).
 //!
 //! ## Verified transport (IMPORTANT — read before touching this module)
 //!
 //! Before writing this port, every `crucible_*` tool was called live against
-//! <host>'s MCP endpoint. The fleet host (<host>, where the Engram
+//! the legacy Terminus host's MCP endpoint. The fleet host (where the Engram
 //! knowledge-store lives per the fleet layout) was down at porting time, so
 //! every call failed identically:
 //!
@@ -15,7 +15,7 @@
 //! That failure signature is decisive: **Crucible does not talk to Engram over
 //! HTTP.** It SSHes into the fleet host and runs a script there, exactly like
 //! the already-ported `sentinel` and `vigil` modules in this crate (both also
-//! <host>-hosted dashboard-style tools, both SSH-exec, neither HTTP). No
+//! fleet-host-hosted dashboard-style tools, both SSH-exec, neither HTTP). No
 //! `EngramClient`/HTTP client exists anywhere in this repo (grepped
 //! case-insensitively for "engram" — the only hits are unrelated ASMT/S84
 //! corpora and doc files), which is consistent with there being no HTTP
@@ -38,10 +38,10 @@
 //!   "output", ...}`).
 //!
 //! NOT verified (the fleet host was unreachable for the entire porting
-//! session, and no other route to <host>'s Python source was available —
-//! <host> itself has no SSH reachable from this dev box, and Gitea returned no
+//! session, and no other route to the legacy host's Python source was available —
+//! the legacy host itself has no SSH reachable from this dev box, and Gitea returned no
 //! repos to an unauthenticated search):
-//! - The exact remote script path/invocation <host> uses per tool.
+//! - The exact remote script path/invocation the legacy host uses per tool.
 //! - The exact JSON shape of a *successful* response for any of the 10 tools.
 //!
 //! Given that, this module:
@@ -143,7 +143,7 @@ const MAX_TEXT_LEN: usize = 2000;
 /// Assumed remote invocation shape, mirroring `sentinel::DEFAULT_SCRIPT`'s
 /// one-script-many-subcommands convention. **Not observed on the wire** — the
 /// fleet host was unreachable for the whole porting session. Audit against
-/// the real <host> source before relying on this in production.
+/// the real legacy-host source before relying on this in production.
 const DEFAULT_SCRIPT: &str = "/usr/bin/python3 <path>/crucible/ops.py";
 
 // ---------------------------------------------------------------------------
@@ -957,7 +957,7 @@ mod tests {
     #[test]
     fn test_validate_date_allows_empty_and_rejects_malformed() {
         assert!(validate_date("").is_ok());
-        assert!(validate_date("2026-07-06").is_ok());
+        assert!(validate_date("2026-07-06").is_ok()); // pii-test-fixture
         assert!(validate_date("07/06/2026").is_err());
         assert!(validate_date("not-a-date").is_err());
     }

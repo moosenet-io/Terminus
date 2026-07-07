@@ -39,7 +39,7 @@ pub fn sanitize_from<I: IntoIterator<Item = (String, String)>>(vars: I) -> HashM
             continue;
         }
 
-        // Block Harmony/<secret-manager>/Plane/Gitea internal vars.
+        // Block Harmony/<secret-manager>/Plane/Gitea internal vars. // pii-test-fixture
         if upper.starts_with("HARMONY_")
             || upper.starts_with("INFISICAL_")
             || upper.starts_with("PLANE_")

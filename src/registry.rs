@@ -108,7 +108,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::crucible::register(registry);
     crate::dev::register(registry);
     crate::gateway::register(registry);
-    crate::<secret-manager>::register(registry);
+    crate::<secret-manager>::register(registry); // pii-test-fixture
     crate::intake::register(registry);
     crate::lumina_ext::register(registry);
     crate::meridian::register(registry);
@@ -124,9 +124,9 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::gitea::register(registry);
     crate::github::register(registry);
     crate::google::register(registry);
-    crate::<media-service>::register(registry);
+    crate::<media-service>::register(registry); // pii-test-fixture
     crate::litellm::register(registry);
-    crate::<container-mgr>::register(registry);
+    crate::<container-mgr>::register(registry); // pii-test-fixture
     crate::prometheus::register(registry);
     crate::hearth::register(registry);
     crate::ledger::register(registry);

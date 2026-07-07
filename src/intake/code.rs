@@ -1,7 +1,7 @@
 //! Per-language code profiling suite (S83 MINT-02).
 //!
 //! Runs the model against the reusable test corpus under `INTAKE_CORPUS_DIR`
-//! (default `<path>/intake-corpus`). For each selected case it:
+//! (default: the deployed intake-corpus directory). For each selected case it:
 //!   1. builds a prompt from `task.md` + the case's `input/` file(s),
 //!   2. calls the model via the SAME Ollama path the context suite uses
 //!      (`context::generate`), non-streaming,
@@ -13,7 +13,7 @@
 //!      (`code_quality_score`; NULL if the judge is unavailable),
 //!   6. stores one `code_profile_runs` row per case.
 //!
-//! Toolchain reality: <host> has python3/g++/bash/sqlite3 but may lack cargo/node.
+//! Toolchain reality: the sweep-harness host has python3/g++/bash/sqlite3 but may lack cargo/node.
 //! When a language's validator can't run for lack of a toolchain we DEGRADE
 //! GRACEFULLY — record "toolchain unavailable: <lang>" in the row's error,
 //! still store the LLM quality score, and never crash the run.
@@ -31,7 +31,7 @@ use crate::error::ToolError;
 use crate::intake::context;
 use crate::intake::storage::{self, CodeRunRow};
 
-/// Default corpus location on <host>; overridable via `INTAKE_CORPUS_DIR`.
+/// Default corpus location on the sweep-harness host; overridable via `INTAKE_CORPUS_DIR`.
 const DEFAULT_CORPUS_DIR: &str = "<path>/intake-corpus";
 
 /// Resolve the corpus directory.
@@ -248,7 +248,7 @@ pub fn primary_input(input_files: &[String]) -> String {
 // ---------------------------------------------------------------------------
 
 /// Map a language to the executable its validator needs. `None` = always
-/// runnable with bash/python/g++/sqlite3 (assumed present on <host>).
+/// runnable with bash/python/g++/sqlite3 (assumed present on the sweep-harness host).
 pub fn required_toolchain(language: &str) -> Option<&'static str> {
     match language.to_lowercase().as_str() {
         "rust" => Some("cargo"),
@@ -298,7 +298,7 @@ pub fn toolchain_coverage_gaps(
 /// pattern as [`toolchain_coverage_gaps`] above).
 ///
 /// ## What it means
-/// On <host> a coder sweep runs under [`crate::intake::gpu_authority`]'s
+/// On the sweep-harness host a coder sweep runs under [`crate::intake::gpu_authority`]'s
 /// `Exclusive` mode — competing services stopped, one Ollama-resident model at
 /// a time — so wall-clock `total_time_ms` per case IS the GPU-time cost per
 /// case (no other job is contending for the GPU during the sweep). Summed

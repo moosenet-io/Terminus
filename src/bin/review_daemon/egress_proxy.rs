@@ -402,7 +402,7 @@ mod tests {
         let port = spawn().await.expect("proxy should bind");
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         stream
-            .write_all(b"CONNECT 127.0.0.1:9999 HTTP/1.1\r\n\r\n")
+            .write_all(b"CONNECT 127.0.0.1:9999 HTTP/1.1\r\n\r\n") // pii-test-fixture
             .await
             .unwrap();
         let mut buf = [0u8; 64];

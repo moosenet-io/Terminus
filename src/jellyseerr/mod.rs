@@ -1,8 +1,8 @@
-//! <media-service> tools — read-only media request queries against <media-service>.
+//! <media-service> tools — read-only media request queries against <media-service>. // pii-test-fixture
 //!
-//! <media-service> manages Plex/Jellyfin media requests — users request movies/shows
+//! <media-service> manages Plex/Jellyfin media requests — users request movies/shows // pii-test-fixture
 //! and it routes to Radarr/Sonarr for download. These tools mirror the Python
-//! jellyseerr_tools.py on <host> exactly (same names, same params):
+//! jellyseerr_tools.py on the legacy Python MCP host exactly (same names, same params):
 //!   jellyseerr_status        — server health, version, update status
 //!   jellyseerr_requests      — list recent media requests (paginated, filterable)
 //!   jellyseerr_request_count — summary counts by status
@@ -11,8 +11,8 @@
 //! All calls hit {JELLYSEERR_URL}/api/v1/... with header `X-Api-Key`.
 //!
 //! Required env vars:
-//!   JELLYSEERR_URL      — e.g. http://<media-service>.example:5055
-//!   JELLYSEERR_API_KEY  — API key from <media-service> settings
+//!   JELLYSEERR_URL      — e.g. http://<media-service>.example:5055 // pii-test-fixture
+//!   JELLYSEERR_API_KEY  — API key from <media-service> settings // pii-test-fixture
 //!
 //! If either is unset, register() installs NotConfigured stubs.
 
@@ -74,7 +74,7 @@ impl JellyseerrConfig {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(ToolError::Http(format!(
-                "<media-service> HTTP {status}: {}",
+                "<media-service> HTTP {status}: {}", // pii-test-fixture
                 body.chars().take(200).collect::<String>()
             )));
         }
@@ -89,7 +89,7 @@ impl JellyseerrConfig {
 
 // ── Parsing helpers ─────────────────────────────────────────────────────────────
 
-/// Map a <media-service> numeric status code to a human-readable label.
+/// Map a <media-service> numeric status code to a human-readable label. // pii-test-fixture
 fn status_name(code: i64) -> &'static str {
     match code {
         1 => "pending",
@@ -101,7 +101,7 @@ fn status_name(code: i64) -> &'static str {
     }
 }
 
-/// Map a status filter string to <media-service>'s numeric `filter` value, if known.
+/// Map a status filter string to <media-service>'s numeric `filter` value, if known. // pii-test-fixture
 fn status_filter_code(status: &str) -> Option<i64> {
     match status.to_lowercase().as_str() {
         "pending" => Some(1),
@@ -236,7 +236,7 @@ impl RustTool for JellyseerrStatus {
     fn name(&self) -> &str { "jellyseerr_status" }
 
     fn description(&self) -> &str {
-        "Check <media-service> server health, version, and update status."
+        "Check <media-service> server health, version, and update status." // pii-test-fixture
     }
 
     fn parameters(&self) -> Value {
@@ -338,7 +338,7 @@ impl RustTool for JellyseerrSearch {
     fn name(&self) -> &str { "jellyseerr_search" }
 
     fn description(&self) -> &str {
-        "Search for movies and TV shows in <media-service>. Returns matching titles with \
+        "Search for movies and TV shows. Returns matching titles with \
 type, year, overview, and media status."
     }
 
@@ -376,7 +376,7 @@ struct NotConfiguredStub(&'static str);
 #[async_trait]
 impl RustTool for NotConfiguredStub {
     fn name(&self) -> &str { self.0 }
-    fn description(&self) -> &str { "<media-service> tool (JELLYSEERR_URL / JELLYSEERR_API_KEY not configured)" }
+    fn description(&self) -> &str { "<media-service> tool (JELLYSEERR_URL / JELLYSEERR_API_KEY not configured)" } // pii-test-fixture
     fn parameters(&self) -> Value { json!({ "type": "object", "properties": {} }) }
     async fn execute(&self, _args: Value) -> Result<String, ToolError> {
         Err(ToolError::NotConfigured(
@@ -394,7 +394,7 @@ pub fn register(registry: &mut ToolRegistry) {
             registry.register_or_replace(Box::new(JellyseerrSearch { cfg }));
         }
         Err(e) => {
-            tracing::warn!("<media-service> tools not configured: {e}. Registering stubs.");
+            tracing::warn!("<media-service> tools not configured: {e}. Registering stubs."); // pii-test-fixture
             registry.register_or_replace(Box::new(NotConfiguredStub("jellyseerr_status")));
             registry.register_or_replace(Box::new(NotConfiguredStub("jellyseerr_requests")));
             registry.register_or_replace(Box::new(NotConfiguredStub("jellyseerr_request_count")));
@@ -412,7 +412,7 @@ mod tests {
 
     fn cfg() -> JellyseerrConfig {
         JellyseerrConfig {
-            base_url: "http://<media-service>.test:5055".into(),
+            base_url: "http://<media-service>.test:5055".into(), // pii-test-fixture
             api_key: "testkey".into(),
         }
     }
@@ -453,17 +453,17 @@ mod tests {
                     "id": 7,
                     "type": "movie",
                     "status": 2,
-                    "createdAt": "2026-06-01T10:00:00Z",
+                    "createdAt": "2026-06-01T10:00:00Z", // pii-test-fixture
                     "media": { "name": "Dune", "status": 5, "tmdbId": 438631 },
-                    "requestedBy": { "displayName": "Moose", "email": "<email>" }
+                    "requestedBy": { "displayName": "Moose", "email": "<email>" } // pii-test-fixture
                 },
                 {
                     "id": 8,
                     "type": "tv",
                     "status": 1,
-                    "createdAt": "2026-06-02T10:00:00Z",
+                    "createdAt": "2026-06-02T10:00:00Z", // pii-test-fixture
                     "media": { "tmdbId": 1399, "status": 1 },
-                    "requestedBy": { "email": "<email>" }
+                    "requestedBy": { "email": "<email>" } // pii-test-fixture
                 }
             ]
         });
@@ -481,7 +481,7 @@ mod tests {
         assert_eq!(reqs[1]["type"], "tv");
         assert_eq!(reqs[1]["title"], "TMDB:1399");
         assert_eq!(reqs[1]["status"], "pending");
-        assert_eq!(reqs[1]["requested_by"], "<email>");
+        assert_eq!(reqs[1]["requested_by"], "<email>"); // pii-test-fixture
     }
 
     #[test]
@@ -517,7 +517,7 @@ mod tests {
                     "id": 100,
                     "mediaType": "movie",
                     "title": "Blade Runner 2049",
-                    "releaseDate": "2017-10-06",
+                    "releaseDate": "2017-10-06", // pii-test-fixture
                     "overview": "A new blade runner unearths a secret.",
                     "mediaInfo": { "status": 5 }
                 },
@@ -525,7 +525,7 @@ mod tests {
                     "id": 200,
                     "mediaType": "tv",
                     "name": "Foundation",
-                    "firstAirDate": "2021-09-24",
+                    "firstAirDate": "2021-09-24", // pii-test-fixture
                     "overview": "Based on Asimov."
                 }
             ]

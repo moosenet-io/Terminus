@@ -1,5 +1,5 @@
 //! Model Advisor tools — ported from the Python `model_advisor_tools.py` on
-//! <host> (DT.7). Recommends model fleets based on available VRAM/unified
+//! the fleet host (DT.7). Recommends model fleets based on available VRAM/unified
 //! memory and use case, checks whether a specific model+quant fits a given
 //! VRAM budget, and cross-references an Ollama instance's installed models
 //! against the capability matrix.
@@ -21,7 +21,7 @@
 //!                         Unset -> use the bundled default.
 //!   OLLAMA_HOST         — default Ollama base URL for `model_advisor_query_ollama`
 //!                         when the `ollama_host` argument is empty. Default
-//!                         "http://localhost:11434" (matches the Python source;
+//!                         "http://localhost:11434" (matches the Python source; // pii-test-fixture
 //!                         this is a well-known local-loopback default, not an
 //!                         infra secret).
 //!
@@ -428,7 +428,7 @@ impl RustTool for ModelAdvisorQueryOllama {
             "properties": {
                 "ollama_host": {
                     "type": "string",
-                    "description": "Ollama API base URL (default: OLLAMA_HOST env var or http://localhost:11434)",
+                    "description": "Ollama API base URL (default: OLLAMA_HOST env var or http://localhost:11434)", // pii-test-fixture
                     "default": ""
                 },
                 "vram_gb": {
@@ -448,7 +448,7 @@ impl RustTool for ModelAdvisorQueryOllama {
         let host = if !host_arg.is_empty() {
             host_arg.to_string()
         } else {
-            env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string())
+            env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string()) // pii-test-fixture
         };
         let host = host.trim_end_matches('/').to_string();
 

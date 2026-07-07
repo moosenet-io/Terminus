@@ -1,20 +1,20 @@
-//! Sentinel tools — ported from the Python `sentinel_tools.py` on <host>.
+//! Sentinel tools — ported from the Python `sentinel_tools.py` on the fleet host.
 //!
 //! Sentinel triggers operational checks and logging on the fleet host and
 //! refreshes the live MooseNet status page. The Python original shelled out
 //! via `ssh ... '<cmd>'` with `subprocess.run(shell=True)`, and its
 //! `sentinel_status` tool additionally SSHed to the fleet host to run an
-//! inline <secret-manager>-auth + `curl` pipeline against the Gitea contents API.
+//! inline <secret-manager>-auth + `curl` pipeline against the Gitea contents API. // pii-test-fixture
 //!
 //! This port:
 //! - Uses the `ssh2` crate for typed SSH execution (no `shell=True`, no
 //!   subprocess), mirroring `gateway/mod.rs` and `ansible/mod.rs`.
-//! - Replaces the Python `sentinel_status` SSH+<secret-manager>+curl chain with a
+//! - Replaces the Python `sentinel_status` SSH+<secret-manager>+curl chain with a // pii-test-fixture
 //!   direct call into this crate's own `gitea` module. Terminus already holds
 //!   `GITEA_URL`/`GITEA_TOKEN` locally (see `gitea/mod.rs`) — the Python
 //!   version only detoured through fleet-host because the *Python* MCP
 //!   process didn't have those credentials. The Rust process does, so the
-//!   extra SSH hop plus an inline shell script that logs in to <secret-manager> and
+//!   extra SSH hop plus an inline shell script that logs in to <secret-manager> and // pii-test-fixture
 //!   shells out to `curl`/`python3 -c` is unnecessary — and is exactly the
 //!   kind of subprocess/shell chain the `RustTool` contract forbids. Same
 //!   end result (latest check content from Gitea), simpler and testable.

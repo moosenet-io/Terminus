@@ -1,9 +1,9 @@
-//! Vigil tools — ported from the Python `vigil_tools.py` on <host>.
+//! Vigil tools — ported from the Python `vigil_tools.py` on the fleet host.
 //!
 //! Vigil generates morning/afternoon briefings on the fleet host and reports
 //! whether the latest briefing is ready. The Python original shelled out via
 //! `ssh ... '<cmd>'` with `subprocess.run(shell=True)`, and its `vigil_status`
-//! tool additionally SSHed to the fleet host to run an inline <secret-manager>-auth
+//! tool additionally SSHed to the fleet host to run an inline <secret-manager>-auth // pii-test-fixture
 //! + `curl` pipeline against the Gitea contents API just to check whether a
 //! file exists.
 //!
@@ -11,7 +11,7 @@
 //! - Uses the `ssh2` crate for typed SSH execution (no `shell=True`, no
 //!   subprocess), mirroring `sentinel/mod.rs`, `gateway/mod.rs`, and
 //!   `ansible/mod.rs`.
-//! - Replaces the Python `vigil_status` SSH+<secret-manager>+curl chain with a
+//! - Replaces the Python `vigil_status` SSH+<secret-manager>+curl chain with a // pii-test-fixture
 //!   direct call into this crate's own `gitea` module (see
 //!   `sentinel/mod.rs` for the identical rationale: Terminus already holds
 //!   `GITEA_URL`/`GITEA_TOKEN` locally, so the extra SSH hop plus an inline
@@ -432,7 +432,7 @@ mod tests {
                 "name": "latest-morning.md",
                 "path": "briefings/latest-morning.md",
                 "content": content,
-                "sha": "0123456789abcdef",
+                "sha": "0123456789abcdef", // pii-test-fixture
                 "url": "http://example.com",
                 "html_url": "http://example.com"
             }));

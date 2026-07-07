@@ -1,16 +1,16 @@
 //! Cortex tools — code-graph / blast-radius / risk-scoring system, ported
-//! from the Python `cortex_tools.py` on <host> (ai-terminus,
-//! the <host> host's MCP endpoint).
+//! from the Python `cortex_tools.py` on the source host (ai-terminus,
+//! the source host's MCP endpoint).
 //!
 //! ## Verified transport (IMPORTANT — read before touching this module)
 //!
-//! Every `cortex_*` tool was called live against <host>'s MCP endpoint before
+//! Every `cortex_*` tool was called live against the source host's MCP endpoint before
 //! writing this port (`tools/list` for exact names/descriptions/schemas, then
 //! `tools/call` for each of the 10 tools against real args — `repo:
 //! "lumina-terminus"` for the graph-shaped tools, and
 //! `https://github.com/octocat/Hello-World` — a tiny, well-known, harmless
-//! public repo — for `cortex_audit`). The fleet host (the fleet host, <host>,
-//! same host `crucible`/`sentinel`/`vigil` already documented as SSH-exec
+//! public repo — for `cortex_audit`). The fleet host (the same host
+//! `crucible`/`sentinel`/`vigil` already documented as SSH-exec
 //! targets in this crate) was unreachable for the entire porting session, so
 //! every one of the 10 tools failed. The failure shapes are decisive and
 //! come in two flavors:
@@ -34,7 +34,7 @@
 //! cortex_flows        -> {"repo":"lumina-terminus","entry_point":"main","stats":{"error":"ssh: ..."},"note":"Flow tracing uses graph FTS — search for entry_point in graph for full call chain"}
 //! ```
 //! This is the same *decisive* evidence crucible's port relied on: **Cortex
-//! does not build or query the code graph locally in <host>'s Python process.
+//! does not build or query the code graph locally in the source host's Python process.
 //! It SSHes into the fleet host and runs a script there** — exactly the
 //! `sentinel`/`vigil`/`crucible` pattern, not a local graph engine, not an
 //! HTTP client, and (critically for `cortex_audit`) not a local `git clone`
@@ -46,12 +46,12 @@
 //!
 //! ## What this means for graph persistence / community detection
 //!
-//! The task brief asked me to determine "how <host> persists the code graph"
+//! The task brief asked me to determine "how the source host persists the code graph"
 //! and whether community detection uses a real algorithm (Louvain or
 //! similar) vs. something simpler, and to reach for a Rust graph/community
 //! crate only if warranted. Given the verified transport above, **the graph
 //! is built, persisted, and queried entirely on the fleet host — never in
-//! this Rust process, exactly as it is never in <host>'s Python process
+//! this Rust process, exactly as it is never in the source host's Python process
 //! either.** There is no local graph data structure to design, no
 //! persistence format to choose, and no community-detection algorithm to
 //! implement or select a crate for: this crate does not have the graph, the
@@ -80,9 +80,9 @@
 //!   `entry_point`, `note`).
 //!
 //! NOT verified (the fleet host was unreachable for the whole porting
-//! session, and <host> itself has no SSH reachable from this dev box; Gitea
+//! session, and the source host itself has no SSH reachable from this dev box; Gitea
 //! search for a `cortex`-named repo/module also returned nothing):
-//! - The exact remote script path/invocation <host> uses per tool.
+//! - The exact remote script path/invocation the source host uses per tool.
 //! - The exact JSON shape of a *successful* response for any of the 10
 //!   tools (Flavor A tools reveal nothing about their success shape; Flavor
 //!   B tools reveal only their *outer* shape, not what a populated `stats`
@@ -153,7 +153,7 @@
 //! no local sandbox directory, no local cleanup path, and therefore nothing
 //! in this crate that can be *this port's* isolation guarantee for the
 //! clone step, because the clone does not happen in this process, exactly
-//! as it does not happen in <host>'s Python process either. The operator's
+//! as it does not happen in the source host's Python process either. The operator's
 //! brief specifically asked for "a git clone into an isolated temp dir that
 //! gets cleaned up after" as the expected shape — **that is not what the
 //! live system does**; it delegates the entire operation to a remote script
@@ -216,7 +216,7 @@ const MAX_TEXT_LEN: usize = 2000;
 /// Assumed remote invocation shape, mirroring `sentinel::DEFAULT_SCRIPT` /
 /// `crucible::DEFAULT_SCRIPT`'s one-script-many-subcommands convention.
 /// **Not observed on the wire** — the fleet host was unreachable for the
-/// whole porting session. Audit against the real <host> source before relying
+/// whole porting session. Audit against the real source-host implementation before relying
 /// on this in production.
 const DEFAULT_SCRIPT: &str = "/usr/bin/python3 <path>/cortex/ops.py";
 
@@ -424,7 +424,7 @@ async fn run_subcommand(
 ///
 /// A `NotConfigured` error (missing `CORTEX_SSH_HOST`/`CORTEX_SSH_KEY_PATH`)
 /// is deliberately **not** degraded here — that's a local deployment
-/// misconfiguration, not something the live <host>/fleet-host pair would ever
+/// misconfiguration, not something the live source-host/fleet-host pair would ever
 /// actually experience in production (they're always configured), so
 /// masking it behind a degrade shape that looks like a mostly-empty-but-
 /// valid response would hide an operator setup mistake rather than surface
@@ -1126,7 +1126,7 @@ mod tests {
     async fn test_audit_rejects_ssh_scheme_url() {
         let tool = CortexAudit { config: test_config() };
         let err = tool
-            .execute(json!({"url": "ssh://<email>/owner/repo"}))
+            .execute(json!({"url": "ssh://<email>/owner/repo"})) // pii-test-fixture
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
@@ -1175,7 +1175,7 @@ mod tests {
     // These exercise `run_subcommand_degrading`'s fallback branch directly by
     // driving it through a tool whose backend is unreachable (no SSH host
     // configured), proving the degrade JSON matches the exact shape observed
-    // live against <host>.
+    // live against the source host.
 
     #[tokio::test]
     async fn test_architecture_degrades_to_verified_shape_when_unreachable() {

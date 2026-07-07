@@ -21,7 +21,7 @@ const SMTP_PORT: u16 = 587;
 
 /// Validate that a string looks like an email address: a single `@`, with a
 /// non-empty local part and a domain that contains a dot positioned after the
-/// `@` (so `<email>` passes but `a@b` and `a.b@c` fail).
+/// `@` (so `<email>` passes but `a@b` and `a.b@c` fail). // pii-test-fixture
 fn looks_like_email(s: &str) -> bool {
     let s = s.trim();
     let at = match s.find('@') {
@@ -144,9 +144,9 @@ mod tests {
 
     fn cfg() -> GoogleConfig {
         GoogleConfig {
-            email: "<email>".into(),
+            email: "<email>".into(), // pii-test-fixture
             app_password: "secret".into(),
-            peter_email: "<email>".into(),
+            peter_email: "<email>".into(), // pii-test-fixture
             lumina_calendar_id: None,
             extra_calendars: vec![],
         }
@@ -154,9 +154,9 @@ mod tests {
 
     #[test]
     fn accepts_valid_emails() {
-        assert!(looks_like_email("<email>"));
-        assert!(looks_like_email("<email>"));
-        assert!(looks_like_email("  <email>  "));
+        assert!(looks_like_email("<email>")); // pii-test-fixture
+        assert!(looks_like_email("<email>")); // pii-test-fixture
+        assert!(looks_like_email("  <email>  ")); // pii-test-fixture
     }
 
     #[test]
@@ -170,7 +170,7 @@ mod tests {
         assert!(!looks_like_email("user@.com")); // dot at start of domain
         assert!(!looks_like_email("user@example.")); // dot at end of domain
         assert!(!looks_like_email("two@@example.com")); // double @
-        assert!(!looks_like_email("a@<email>")); // two @
+        assert!(!looks_like_email("a@<email>")); // two @ — pii-test-fixture
     }
 
     #[test]
@@ -189,7 +189,7 @@ mod tests {
     fn message_construction_succeeds() {
         // Build a Message exactly as execute() does — no network involved.
         let from: Mailbox = cfg().email.parse().expect("sender parses");
-        let to: Mailbox = "<email>".parse().expect("recipient parses");
+        let to: Mailbox = "<email>".parse().expect("recipient parses"); // pii-test-fixture
         let msg = Message::builder()
             .from(from)
             .to(to)
@@ -200,7 +200,7 @@ mod tests {
         let raw = String::from_utf8_lossy(&bytes);
         assert!(raw.contains("Subject: Hello"));
         assert!(raw.contains("Body text"));
-        assert!(raw.contains("<email>"));
+        assert!(raw.contains("<email>")); // pii-test-fixture
     }
 
     #[tokio::test]
@@ -221,8 +221,8 @@ mod tests {
         let tool = GoogleEmailSend { cfg: cfg() };
         for bad in [
             json!({"subject": "s", "body": "b"}),
-            json!({"to": "<email>", "body": "b"}),
-            json!({"to": "<email>", "subject": "s"}),
+            json!({"to": "<email>", "body": "b"}), // pii-test-fixture
+            json!({"to": "<email>", "subject": "s"}), // pii-test-fixture
         ] {
             let err = tool.execute(bad).await.expect_err("missing arg must fail");
             assert!(matches!(err, ToolError::InvalidArgument(_)));

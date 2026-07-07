@@ -1,5 +1,5 @@
 //! LiteLLM tools — read-only status and model queries against the LiteLLM
-//! proxy (Refractor, <host>). Ports the Python litellm_tools.py on <host> exactly.
+//! proxy (Refractor). Ports the Python litellm_tools.py on the legacy Terminus host exactly.
 //!
 //! Three tools, identical names and params to the Python source:
 //!   litellm_list_models   — list all configured model routes
@@ -372,7 +372,7 @@ mod tests {
     fn cfg() -> LiteLLMConfig {
         LiteLLMConfig {
             base_url: "http://litellm.test:4000".into(),
-            master_key: "sk-test".into(),
+            master_key: "sk-test".into(), // pii-test-fixture
         }
     }
 
@@ -499,7 +499,7 @@ mod tests {
     #[test]
     fn parse_spend_logs_bare_array() {
         let body = json!([
-            { "model": "claude", "total_tokens": 1500, "spend": 0.045, "status": "success", "startTime": "2026-06-08T07:00:00Z", "api_key_alias": "lumina" },
+            { "model": "claude", "total_tokens": 1500, "spend": 0.045, "status": "success", "startTime": "2026-06-08T07:00:00Z", "api_key_alias": "lumina" }, // pii-test-fixture
             { "model": "qwen", "total_tokens": 200, "spend": 0.0, "status": "success" }
         ]);
         let out = parse_spend_logs(&body, 20);
@@ -507,7 +507,7 @@ mod tests {
         assert_eq!(out["logs"][0]["model"], "claude");
         assert_eq!(out["logs"][0]["tokens"], 1500);
         assert_eq!(out["logs"][0]["cost"], 0.045);
-        assert_eq!(out["logs"][0]["timestamp"], "2026-06-08T07:00:00Z");
+        assert_eq!(out["logs"][0]["timestamp"], "2026-06-08T07:00:00Z"); // pii-test-fixture
         assert_eq!(out["logs"][0]["api_key_alias"], "lumina");
         // missing fields default
         assert_eq!(out["logs"][1]["api_key_alias"], "");
@@ -529,9 +529,9 @@ mod tests {
 
     #[test]
     fn parse_spend_logs_created_at_fallback() {
-        let body = json!([ { "model": "m", "created_at": "2026-01-01" } ]);
+        let body = json!([ { "model": "m", "created_at": "2026-01-01" } ]); // pii-test-fixture
         let out = parse_spend_logs(&body, 20);
-        assert_eq!(out["logs"][0]["timestamp"], "2026-01-01");
+        assert_eq!(out["logs"][0]["timestamp"], "2026-01-01"); // pii-test-fixture
     }
 
     #[test]
@@ -608,7 +608,7 @@ mod tests {
         let url = std::env::var("LITELLM_URL").ok();
         let key = std::env::var("LITELLM_MASTER_KEY").ok();
         std::env::set_var("LITELLM_URL", "http://x:4000");
-        std::env::set_var("LITELLM_MASTER_KEY", "sk-test");
+        std::env::set_var("LITELLM_MASTER_KEY", "sk-test"); // pii-test-fixture
 
         register(&mut reg);
 

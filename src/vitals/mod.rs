@@ -481,7 +481,7 @@ impl RustTool for VitalsTrends {
 // Tool: vitals_log
 // ──────────────────────────────────────────────
 //
-// <host>'s Python original is a single generic/multi-source logger with a
+// The legacy Python original is a single generic/multi-source logger with a
 // `source` tag (manual / samsung_health / strava / apple_health) that can
 // write `steps` and `resting_hr` in the same call — neither of which any of
 // the split tools above (log_weight / log_exercise / log_sleep) accept. That
@@ -667,7 +667,7 @@ impl RustTool for VitalsRecent {
 // Tool: vitals_import
 // ──────────────────────────────────────────────
 //
-// NOTE ON DESIGN: live-probing <host>'s `vitals_import` (and `vitals_dashboard`,
+// NOTE ON DESIGN: live-probing the legacy Python `vitals_import` (and `vitals_dashboard`,
 // below) against the real backend showed it currently shells out over SSH to
 // the fleet box ("ssh: connect to host <fleet-host> port 22: No route to
 // host") — i.e. the legacy Python tool builds a remote command from
@@ -725,8 +725,8 @@ impl RustTool for VitalsImport {
     fn name(&self) -> &str { "vitals_import" }
 
     fn description(&self) -> &str {
-        "Import health data from a CSV file on <host>. file_path: absolute path to the \
-         CSV on <host> (e.g. <path>/vitals/data/activities.csv). format: \
+        "Import health data from a CSV file on the fleet host. file_path: absolute path to the \
+         CSV on the fleet host (e.g. <path>/vitals/data/activities.csv). format: \
          'samsung_health', 'strava', or 'apple_health'. Returns count of imported and \
          skipped rows. <operator>: upload your CSV to <path>/vitals/data/ first."
     }
@@ -737,7 +737,7 @@ impl RustTool for VitalsImport {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Absolute path to the CSV on <host>, e.g. <path>/vitals/data/activities.csv"
+                    "description": "Absolute path to the CSV on the fleet host, e.g. <path>/vitals/data/activities.csv"
                 },
                 "format": {
                     "type": "string",
@@ -1015,14 +1015,14 @@ mod tests {
 
     #[test]
     fn test_valid_date_accepted() {
-        assert!(validate_date("2026-06-07").is_ok());
+        assert!(validate_date("2026-06-07").is_ok());  // pii-test-fixture
     }
 
     #[test]
     fn test_invalid_date_rejected() {
         assert!(validate_date("2026/06/07").is_err());
         assert!(validate_date("not-a-date").is_err());
-        assert!(validate_date("06-07-2026").is_err());
+        assert!(validate_date("06-07-2026").is_err());  // pii-test-fixture
     }
 
     // ── numeric validation ──
@@ -1066,7 +1066,7 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         clear_env();
         let tool = VitalsLogWeight;
-        let err = tool.execute(json!({"date": "2026-06-07", "kg": 80.0})).await.unwrap_err();
+        let err = tool.execute(json!({"date": "2026-06-07", "kg": 80.0})).await.unwrap_err();  // pii-test-fixture
         assert!(matches!(err, ToolError::NotConfigured(_)));
     }
 
@@ -1084,9 +1084,9 @@ mod tests {
         });
 
         let tool = VitalsLogWeight;
-        let result = tool.execute(json!({"date": "2026-06-07", "kg": 82.5})).await.unwrap();
+        let result = tool.execute(json!({"date": "2026-06-07", "kg": 82.5})).await.unwrap();  // pii-test-fixture
         assert!(result.contains("82.5"));
-        assert!(result.contains("2026-06-07"));
+        assert!(result.contains("2026-06-07"));  // pii-test-fixture
         mock.assert();
     }
 
@@ -1104,7 +1104,7 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         set_env("http://localhost:9");
         let tool = VitalsLogWeight;
-        let err = tool.execute(json!({"date": "2026-06-07", "kg": 0.0})).await.unwrap_err();
+        let err = tool.execute(json!({"date": "2026-06-07", "kg": 0.0})).await.unwrap_err();  // pii-test-fixture
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
@@ -1181,7 +1181,7 @@ mod tests {
 
         let tool = VitalsLogExercise;
         let result = tool.execute(json!({
-            "date":         "2026-06-07",
+            "date":         "2026-06-07",  // pii-test-fixture
             "type":         "running",
             "duration_min": 30.0,
             "calories":     300.0
@@ -1210,7 +1210,7 @@ mod tests {
         set_env("http://localhost:9");
         let tool = VitalsLogExercise;
         let err = tool.execute(json!({
-            "date":         "2026-06-07",
+            "date":         "2026-06-07",  // pii-test-fixture
             "type":         "cycling",
             "duration_min": -5.0
         })).await.unwrap_err();
@@ -1232,7 +1232,7 @@ mod tests {
 
         let tool = VitalsLogSleep;
         let result = tool.execute(json!({
-            "date":    "2026-06-07",
+            "date":    "2026-06-07",  // pii-test-fixture
             "hours":   7.5,
             "quality": 8
         })).await.unwrap();
@@ -1247,7 +1247,7 @@ mod tests {
         set_env("http://localhost:9");
         let tool = VitalsLogSleep;
         let err = tool.execute(json!({
-            "date":  "2026-06-07",
+            "date":  "2026-06-07",  // pii-test-fixture
             "hours": 25.0
         })).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
@@ -1259,7 +1259,7 @@ mod tests {
         set_env("http://localhost:9");
         let tool = VitalsLogSleep;
         let err = tool.execute(json!({
-            "date":    "2026-06-07",
+            "date":    "2026-06-07",  // pii-test-fixture
             "hours":   7.0,
             "quality": 11
         })).await.unwrap_err();
@@ -1279,7 +1279,7 @@ mod tests {
                 .path("/api/trends")
                 .query_param("metric", "weight")
                 .query_param("days", "30");
-            then.status(200).json_body(json!([{"date": "2026-06-01", "value": 82.0}]));
+            then.status(200).json_body(json!([{"date": "2026-06-01", "value": 82.0}]));  // pii-test-fixture
         });
 
         let tool = VitalsTrends;
@@ -1346,7 +1346,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(POST).path("/api/log");
-            then.status(201).json_body(json!({"date": "2026-07-06", "source": "manual"}));
+            then.status(201).json_body(json!({"date": "2026-07-06", "source": "manual"}));  // pii-test-fixture
         });
 
         let tool = VitalsLog;
@@ -1369,7 +1369,7 @@ mod tests {
         let tool = VitalsLog;
         let result = tool
             .execute(json!({
-                "date": "2026-07-01",
+                "date": "2026-07-01",  // pii-test-fixture
                 "steps": 9000,
                 "resting_hr": 58,
                 "source": "samsung_health"

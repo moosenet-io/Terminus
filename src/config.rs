@@ -297,7 +297,7 @@ pub fn breakfix_claude_model() -> String {
 /// `OLLAMA_CPU_URL` var [`ollama_secondary_url`] reads (one env var, one
 /// meaning: the fleet's CPU-backed Ollama). Unlike that sibling accessor
 /// (which returns `None` on unset — its callers raise `NotConfigured`), this
-/// one defaults to `http://127.0.0.1:11435` per the Phase-4 spec: breakfix's
+/// one defaults to a local loopback address on port 11435 per the Phase-4 spec: breakfix's
 /// fallback reasoning must degrade gracefully even on a host where the var
 /// was never set, rather than failing the whole breakfix attempt over a
 /// missing config for what is already a best-effort fallback path.
@@ -305,6 +305,9 @@ pub fn breakfix_claude_model() -> String {
 /// above — the whole point of breakfix is diagnosing a possibly-wedged GPU,
 /// so its own reasoning must never contend for that GPU).
 pub fn breakfix_ollama_cpu_url() -> String {
+    // NOTE: hardcoded loopback fallback (functional default, not a comment/test
+    // literal) — left unchanged per remediation policy on suspected real runtime
+    // literals; flagged in the remediation report rather than guessed at.
     env_nonempty("OLLAMA_CPU_URL").unwrap_or_else(|| "http://127.0.0.1:11435".to_string())
 }
 
@@ -367,9 +370,9 @@ pub fn breakfix_fetch_model_timeout_secs() -> u64 {
 
 // ── Meridian (SIMULATED paper-trading sandbox) ────────────────────────────
 //
-// Ported from <host>'s Python `meridian_tools.py`, which SSH'd to <host> and
-// shelled out to a `meridian.py` / `market_data.py` pair under
-// `<path>/meridian/`. That directory does not exist on <host> (nor
+// Ported from the legacy host's Python `meridian_tools.py`, which SSH'd to the fleet
+// host and shelled out to a `meridian.py` / `market_data.py` pair under
+// `<path>/meridian/`. That directory does not exist on the fleet host (nor
 // anywhere else reachable) — there was never a real backend to port state
 // persistence *from*. This module introduces its own local JSON-file
 // persistence (whole-document load/save, mirroring `intake`'s
@@ -643,11 +646,11 @@ mod tests {
         // Unlike `ollama_secondary_url()` (None on unset), the breakfix
         // accessor for the SAME var defaults rather than failing.
         assert_eq!(ollama_secondary_url(), None);
-        assert_eq!(breakfix_ollama_cpu_url(), "http://127.0.0.1:11435");
+        assert_eq!(breakfix_ollama_cpu_url(), "http://127.0.0.1:11435"); // pii-test-fixture
         assert_eq!(breakfix_fallback_model(), "qwen2.5:7b");
-        std::env::set_var("OLLAMA_CPU_URL", "http://<internal-ip>:11435");
+        std::env::set_var("OLLAMA_CPU_URL", "http://<internal-ip>:11435"); // pii-test-fixture
         std::env::set_var("MINT_BREAKFIX_FALLBACK_MODEL", "phi3:mini");
-        assert_eq!(breakfix_ollama_cpu_url(), "http://<internal-ip>:11435");
+        assert_eq!(breakfix_ollama_cpu_url(), "http://<internal-ip>:11435"); // pii-test-fixture
         assert_eq!(breakfix_fallback_model(), "phi3:mini");
         std::env::remove_var("OLLAMA_CPU_URL");
         std::env::remove_var("MINT_BREAKFIX_FALLBACK_MODEL");

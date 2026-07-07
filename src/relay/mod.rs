@@ -586,8 +586,8 @@ mod tests {
 
     #[test]
     fn test_valid_date_accepted() {
-        assert!(validate_date("2026-06-07").is_ok());
-        assert!(validate_date("2000-01-01").is_ok());
+        assert!(validate_date("2026-06-07").is_ok()); // pii-test-fixture
+        assert!(validate_date("2000-01-01").is_ok()); // pii-test-fixture
     }
 
     #[test]
@@ -698,7 +698,7 @@ mod tests {
         let tool = RelayFuelLog;
         let result = tool.execute(json!({
             "vehicle_id": "42",
-            "date":       "2026-06-07",
+            "date":       "2026-06-07", // pii-test-fixture
             "gallons":    12.5,
             "miles":      45000.0,
             "price":      3.499
@@ -741,7 +741,7 @@ mod tests {
         let tool = RelayServiceLog;
         let result = tool.execute(json!({
             "vehicle_id":  "7",
-            "date":        "2026-05-01",
+            "date":        "2026-05-01", // pii-test-fixture
             "description": "Oil change",
             "mileage":     50000.0
         })).await.unwrap();

@@ -601,11 +601,11 @@ mod tests {
         let b = resolve_backend_at(
             "anything:latest",
             "/nonexistent/registry.json",
-            "http://localhost:11434/",
+            "http://localhost:11434/",  // pii-test-fixture
             None,
         );
         assert_eq!(b.kind, "ollama");
-        assert_eq!(b.url, "http://localhost:11434");
+        assert_eq!(b.url, "http://localhost:11434");  // pii-test-fixture
     }
 
     #[test]
@@ -613,15 +613,22 @@ mod tests {
         let dir = std::env::temp_dir().join("infer-test-override");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("registry.json");
+        // Loopback URLs are interpolated (rather than embedded directly in the
+        // raw string) so each can carry the repo's pii-test-fixture marker on
+        // its own line without corrupting the JSON this gets parsed as.
+        let ollama_url = "http://localhost:11434"; // pii-test-fixture
+        let llama_gpu_url = "http://localhost:8082"; // pii-test-fixture
         std::fs::write(
             &path,
-            r#"{
-                "models": { "m:1": { "backend": "ollama" } },
-                "backends": {
-                    "ollama": { "url": "http://localhost:11434", "kind": "ollama", "hardware": "cpu" },
-                    "llama-gpu": { "url": "http://localhost:8082", "kind": "llama-server", "hardware": "gpu" }
-                }
-            }"#,
+            format!(
+                r#"{{
+                "models": {{ "m:1": {{ "backend": "ollama" }} }},
+                "backends": {{
+                    "ollama": {{ "url": "{ollama_url}", "kind": "ollama", "hardware": "cpu" }},
+                    "llama-gpu": {{ "url": "{llama_gpu_url}", "kind": "llama-server", "hardware": "gpu" }}
+                }}
+            }}"#
+            ),
         )
         .unwrap();
         // Tagged ollama, but the override forces llama-gpu.
@@ -632,18 +639,23 @@ mod tests {
 
     #[test]
     fn resolve_reads_tagged_backend() {
+        // Loopback URL interpolated onto its own tggable line — see comment in
+        // `override_forces_backend_regardless_of_tag` above for why.
+        let llama_gpu_url = "http://localhost:8082/"; // pii-test-fixture
         let path = tmp_registry(
             "reg",
-            r#"{
-                "models": { "qwen3-coder:30b": { "backend": "llama-gpu" } },
-                "backends": { "llama-gpu": { "url": "http://localhost:8082/", "kind": "llama-server", "hardware": "gpu" } }
-            }"#,
+            &format!(
+                r#"{{
+                "models": {{ "qwen3-coder:30b": {{ "backend": "llama-gpu" }} }},
+                "backends": {{ "llama-gpu": {{ "url": "{llama_gpu_url}", "kind": "llama-server", "hardware": "gpu" }} }}
+            }}"#
+            ),
         );
         let b = resolve_backend_at("qwen3-coder:30b", path.to_str().unwrap(), "http://fallback", None);
         assert_eq!(b.name, "llama-gpu");
         assert_eq!(b.kind, "llama-server");
         assert_eq!(b.hardware, "gpu");
-        assert_eq!(b.url, "http://localhost:8082"); // trailing slash trimmed
+        assert_eq!(b.url, "http://localhost:8082"); // trailing slash trimmed // pii-test-fixture
     }
 
     #[test]
@@ -652,7 +664,7 @@ mod tests {
             "legacy",
             r#"{"qwen3:8b":{"name":"qwen3:8b","tier":"warm"}}"#,
         );
-        let b = resolve_backend_at("qwen3:8b", path.to_str().unwrap(), "http://localhost:11434", None);
+        let b = resolve_backend_at("qwen3:8b", path.to_str().unwrap(), "http://localhost:11434", None);  // pii-test-fixture
         assert_eq!(b.kind, "ollama"); // legacy format, no tag → fallback
     }
 
@@ -674,7 +686,7 @@ mod tests {
 
     #[test]
     fn remote_override_redirects_default_ollama_backend() {
-        let b = apply_remote_override(ollama_backend("http://127.0.0.1:11434"), Some("http://pvf2:11434"));
+        let b = apply_remote_override(ollama_backend("http://127.0.0.1:11434"), Some("http://pvf2:11434"));  // pii-test-fixture
         assert_eq!(b.url, "http://pvf2:11434");
         assert_eq!(b.name, "ollama");
         assert_eq!(b.kind, "ollama");
@@ -682,20 +694,20 @@ mod tests {
 
     #[test]
     fn remote_override_trims_trailing_slash() {
-        let b = apply_remote_override(ollama_backend("http://127.0.0.1:11434"), Some("http://pvf2:11434/"));
+        let b = apply_remote_override(ollama_backend("http://127.0.0.1:11434"), Some("http://pvf2:11434/"));  // pii-test-fixture
         assert_eq!(b.url, "http://pvf2:11434");
     }
 
     #[test]
     fn remote_override_none_leaves_backend_untouched() {
-        let b = apply_remote_override(ollama_backend("http://127.0.0.1:11434"), None);
-        assert_eq!(b.url, "http://127.0.0.1:11434");
+        let b = apply_remote_override(ollama_backend("http://127.0.0.1:11434"), None);  // pii-test-fixture
+        assert_eq!(b.url, "http://127.0.0.1:11434");  // pii-test-fixture
     }
 
     #[test]
     fn remote_override_blank_is_noop() {
-        let b = apply_remote_override(ollama_backend("http://127.0.0.1:11434"), Some("   "));
-        assert_eq!(b.url, "http://127.0.0.1:11434");
+        let b = apply_remote_override(ollama_backend("http://127.0.0.1:11434"), Some("   "));  // pii-test-fixture
+        assert_eq!(b.url, "http://127.0.0.1:11434");  // pii-test-fixture
     }
 
     #[test]
@@ -703,19 +715,19 @@ mod tests {
         // A model pinned to a differently-named ollama backend (e.g. the CPU
         // pass) keeps its own routing — --remote only moves the default GPU
         // "ollama" backend.
-        let mut cpu = ollama_backend("http://127.0.0.1:11434");
+        let mut cpu = ollama_backend("http://127.0.0.1:11434");  // pii-test-fixture
         cpu.name = "ollama-cpu".to_string();
         let b = apply_remote_override(cpu, Some("http://pvf2:11434"));
-        assert_eq!(b.url, "http://127.0.0.1:11434", "pinned ollama-cpu must not be rerouted");
+        assert_eq!(b.url, "http://127.0.0.1:11434", "pinned ollama-cpu must not be rerouted");  // pii-test-fixture
     }
 
     #[test]
     fn remote_override_skips_llama_server_backend() {
-        let mut ls = ollama_backend("http://127.0.0.1:8082");
+        let mut ls = ollama_backend("http://127.0.0.1:8082");  // pii-test-fixture
         ls.name = "llama-gpu".to_string();
         ls.kind = "llama-server".to_string();
         let b = apply_remote_override(ls, Some("http://pvf2:11434"));
-        assert_eq!(b.url, "http://127.0.0.1:8082", "llama-server backend must not be rerouted");
+        assert_eq!(b.url, "http://127.0.0.1:8082", "llama-server backend must not be rerouted");  // pii-test-fixture
     }
 
     #[test]
@@ -725,12 +737,17 @@ mod tests {
         // resolves to the default "ollama" backend) comes out pointed at the
         // remote URL — proving the override reaches where a request dispatches
         // without needing a live remote Ollama.
+        // Loopback URL interpolated onto its own tggable line — see comment in
+        // `override_forces_backend_regardless_of_tag` above for why.
+        let ollama_url = "http://127.0.0.1:11434"; // pii-test-fixture
         let path = tmp_registry(
             "remote-choke",
-            r#"{
-                "models": {},
-                "backends": { "ollama": { "url": "http://127.0.0.1:11434", "kind": "ollama", "hardware": "gpu" } }
-            }"#,
+            &format!(
+                r#"{{
+                "models": {{}},
+                "backends": {{ "ollama": {{ "url": "{ollama_url}", "kind": "ollama", "hardware": "gpu" }} }}
+            }}"#
+            ),
         );
         std::env::set_var("MODEL_REGISTRY_PATH", &path);
         set_remote_ollama_url(Some("http://pvf2:11434".to_string()));

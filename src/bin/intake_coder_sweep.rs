@@ -16,7 +16,7 @@
 //! - `MODEL_REGISTRY_PATH` — chord model→backend registry (read by `infer` to
 //!   route each backend pass). Set so the GPU/CPU override resolves.
 //! - `OLLAMA_URL` (or `_BASE_URL` / `_CPU_URL`) — the unified inference base.
-//! - `INTAKE_CORPUS_V2_DIR` — the v2 code corpus (defaults to the on-<host> path).
+//! - `INTAKE_CORPUS_V2_DIR` — the v2 code corpus (defaults to the deployed path).
 //! - `INTAKE_CODE_LANGS` — optional comma list to NARROW the languages (corpus
 //!   tags: rust,typescript,python,bash,htmlcss,cpp,sql,config). Empty ⇒ all.
 //! - `INTAKE_CODE_CASE_LIMIT` — optional cap on cases per model (smoke/debug).

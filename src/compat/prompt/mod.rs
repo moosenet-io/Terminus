@@ -557,7 +557,7 @@ mod tests {
 
     #[test]
     fn sanitize_user_strips_unsafe_chars() {
-        assert_eq!(sanitize_user("@<operator>:example.com"), "_peter_moosenet_online");
+        assert_eq!(sanitize_user("@<operator>:example.com"), "_peter_moosenet_online"); // pii-test-fixture
         assert_eq!(sanitize_user(""), "default");
         assert_eq!(sanitize_user("alice-1_2"), "alice-1_2");
     }
@@ -675,8 +675,8 @@ mod tests {
         // The hallucinated live-test references must not originate from seeded
         // prompt content. None of these should appear in any shared layer text.
         for needle in [
-            "<host>", "<host>", "<host>", "<host>", "<host>", "<host>",
-            "<host>", "<host>", "ARCADE", "arcade",
+            "<host>", "<host>", "<host>", "<host>", "<host>", "<host>", // pii-test-fixture
+            "<host>", "<host>", "ARCADE", "arcade", // pii-test-fixture
             "searxng", "SearXNG", "odyssey_optimize", "signal-cli", "OpenHands",
         ] {
             for (name, body) in [

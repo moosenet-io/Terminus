@@ -5,7 +5,7 @@
 //! model through Ollama, and measures throughput / TTFT / recall / memory.
 //!
 //! ## Filler corpus
-//! The tool runs on <host> where there is no repo checkout, so a representative
+//! The tool runs on the sweep-harness host where there is no repo checkout, so a representative
 //! proportional sample of real repo files is embedded in the binary via
 //! `include_str!` (~60% Rust, 20% Markdown, 10% TOML, 10% JSON). The embedded
 //! content is concatenated and repeated to reach each target token count
@@ -268,7 +268,7 @@ pub fn ollama_base() -> String {
             }
         }
     }
-    "http://127.0.0.1:11434".to_string()
+    "http://127.0.0.1:11434".to_string() // pii-test-fixture
 }
 
 /// Measured result of one context tier.
@@ -601,7 +601,7 @@ pub async fn generate(
 }
 
 /// Like [`generate`] but against an explicit backend base URL — the Ollama HTTP
-/// root, e.g. `http://localhost:11435` (P5 backend-aware routing). `generate`
+/// root, e.g. `http://localhost:11435` (P5 backend-aware routing). `generate` // pii-test-fixture
 /// is the convenience wrapper that targets the default `ollama_base()`.
 pub async fn generate_at(
     client: &reqwest::Client,
@@ -1090,7 +1090,7 @@ mod tests {
         for k in ["OLLAMA_URL", "OLLAMA_BASE_URL", "OLLAMA_CPU_URL"] {
             std::env::remove_var(k);
         }
-        assert_eq!(ollama_base(), "http://127.0.0.1:11434");
+        assert_eq!(ollama_base(), "http://127.0.0.1:11434"); // pii-test-fixture
         std::env::set_var("OLLAMA_URL", "http://live:11434/");
         assert_eq!(ollama_base(), "http://live:11434");
         std::env::remove_var("OLLAMA_URL");

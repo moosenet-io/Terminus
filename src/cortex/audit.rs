@@ -122,7 +122,7 @@ pub fn validate_repo_url(url: &str) -> Result<(), ToolError> {
 ///
 /// A real HTTP/git client resolves far more host shapes to an IPv4 address
 /// than a plain 4-octet decimal dotted-quad: bare decimal integers
-/// (`2130706433` == `127.0.0.1`), hex (`0x7f000001`), octal-by-leading-zero
+/// (`2130706433` == `127.0.0.1`), hex (`0x7f000001`), octal-by-leading-zero — pii-test-fixture
 /// (`0177.0.0.1` — glibc's `inet_aton` reads the leading zero as octal `127`,
 /// i.e. loopback, even though it parses as decimal `177` under a naive
 /// string-to-u8 parse), 2/3-part shorthand (`127.1`), and IPv4-mapped IPv6
@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn test_rejects_ssh_scheme() {
-        let err = validate_repo_url("ssh://<email>/owner/repo.git").unwrap_err();
+        let err = validate_repo_url("ssh://<email>/owner/repo.git").unwrap_err(); // pii-test-fixture
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn test_rejects_embedded_credentials() {
-        assert!(validate_repo_url("https://user:<email>/owner/repo").is_err());
+        assert!(validate_repo_url("https://user:<email>/owner/repo").is_err()); // pii-test-fixture
     }
 
     #[test]
@@ -284,8 +284,8 @@ mod tests {
     #[test]
     fn test_rejects_private_ipv4_ranges() {
         // test fixtures: RFC 1918 class A, B, and C private ranges
-        assert!(validate_repo_url("https://<internal-ip>/owner/repo").is_err());
-        assert!(validate_repo_url("https://<internal-ip>/owner/repo").is_err());
+        assert!(validate_repo_url("https://<internal-ip>/owner/repo").is_err()); // pii-test-fixture
+        assert!(validate_repo_url("https://<internal-ip>/owner/repo").is_err()); // pii-test-fixture
         assert!(validate_repo_url("https://<internal-ip>/owner/repo").is_err()); // pii-test-fixture
     }
 
@@ -332,8 +332,8 @@ mod tests {
 
     #[test]
     fn test_rejects_decimal_integer_ipv4() {
-        // 2130706433 == 127.0.0.1 as a big-endian u32.
-        assert!(validate_repo_url("http://2130706433/owner/repo").is_err());
+        // 2130706433 == 127.0.0.1 as a big-endian u32. — pii-test-fixture
+        assert!(validate_repo_url("http://2130706433/owner/repo").is_err()); // pii-test-fixture
     }
 
     #[test]

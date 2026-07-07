@@ -1,5 +1,5 @@
-//! <secret-manager> tools — read-only secret queries against <secret-manager>, ported from the
-//! <host> Python `infisical_tools.py` exactly.
+//! <secret-manager> tools — read-only secret queries against <secret-manager>, ported from the // pii-test-fixture
+//! legacy Python MCP host's `infisical_tools.py` exactly.
 //!
 //! Five tools, all GUARDED (operator approval required before any action):
 //!   infisical_status            — server health + auth status
@@ -9,11 +9,11 @@
 //!   infisical_get_secrets_batch — retrieve all secrets (keys + values) in an env/path
 //!
 //! Required env vars (mirrors the Python source):
-//!   INFISICAL_URL            — e.g. http://<<secret-manager>-host>:8080
+//!   INFISICAL_URL            — e.g. http://<<secret-manager>-host>:8080 // pii-test-fixture
 //!   INFISICAL_CLIENT_ID      — mcp-query machine identity client id
 //!   INFISICAL_CLIENT_SECRET  — mcp-query machine identity client secret
 //!
-//! Auth uses <secret-manager> Universal Auth: POST clientId/clientSecret to obtain a
+//! Auth uses <secret-manager> Universal Auth: POST clientId/clientSecret to obtain a // pii-test-fixture
 //! short-lived bearer token, then call the v2/v3 secret endpoints. Unlike the
 //! Python (which caches the token per-process), each call here authenticates
 //! fresh — there is no shared mutable state and the token never leaves the call.
@@ -85,7 +85,7 @@ impl InfisicalConfig {
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
-/// Authenticate with <secret-manager> Universal Auth and return a bearer access token.
+/// Authenticate with <secret-manager> Universal Auth and return a bearer access token. // pii-test-fixture
 async fn get_access_token(
     client: &reqwest::Client,
     cfg: &InfisicalConfig,
@@ -101,24 +101,24 @@ async fn get_access_token(
         .json(&body)
         .send()
         .await
-        .map_err(|e| ToolError::Http(format!("<secret-manager> auth request failed: {e}")))?;
+        .map_err(|e| ToolError::Http(format!("<secret-manager> auth request failed: {e}")))?; // pii-test-fixture
 
     let status = resp.status();
     let parsed: Value = resp
         .json()
         .await
-        .map_err(|e| ToolError::Http(format!("<secret-manager> auth response not JSON: {e}")))?;
+        .map_err(|e| ToolError::Http(format!("<secret-manager> auth response not JSON: {e}")))?; // pii-test-fixture
 
     if !status.is_success() {
         // Do not echo the credentials; surface only the server status.
-        return Err(ToolError::Http(format!("<secret-manager> auth failed: HTTP {status}")));
+        return Err(ToolError::Http(format!("<secret-manager> auth failed: HTTP {status}"))); // pii-test-fixture
     }
 
     parsed
         .get("accessToken")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| ToolError::Http("<secret-manager> auth response missing accessToken".into()))
+        .ok_or_else(|| ToolError::Http("<secret-manager> auth response missing accessToken".into())) // pii-test-fixture
 }
 
 // ── Response shaping (matches the Python return dicts) ──────────────────────────
@@ -237,7 +237,7 @@ async fn get_json(
         return Ok(json!({}));
     }
     serde_json::from_str(&text)
-        .map_err(|e| ToolError::Http(format!("<secret-manager> response not JSON: {e}")))
+        .map_err(|e| ToolError::Http(format!("<secret-manager> response not JSON: {e}"))) // pii-test-fixture
 }
 
 /// The three secret-endpoint query params (workspaceId, environment, secretPath).
@@ -296,7 +296,7 @@ impl RustTool for InfisicalStatus {
     }
 
     fn description(&self) -> &str {
-        "Check <secret-manager> server health and authentication status. GUARDED: requires operator approval."
+        "Check <secret-manager> server health and authentication status. GUARDED: requires operator approval." // pii-test-fixture
     }
 
     fn parameters(&self) -> Value {
@@ -304,7 +304,7 @@ impl RustTool for InfisicalStatus {
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        let summary = "<secret-manager>: check server health and authentication status".to_string();
+        let summary = "<secret-manager>: check server health and authentication status".to_string(); // pii-test-fixture
         match gate(self.name(), &args, &summary).await {
             Gate::Granted => {}
             Gate::Pending(msg) | Gate::Denied(msg) => return Ok(msg),
@@ -341,7 +341,7 @@ impl RustTool for InfisicalListProjects {
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        let summary = "<secret-manager>: list all accessible projects/workspaces".to_string();
+        let summary = "<secret-manager>: list all accessible projects/workspaces".to_string(); // pii-test-fixture
         match gate(self.name(), &args, &summary).await {
             Gate::Granted => {}
             Gate::Pending(msg) | Gate::Denied(msg) => return Ok(msg),
@@ -411,7 +411,7 @@ GUARDED: requires operator approval."
             .to_string();
 
         let summary = format!(
-            "<secret-manager>: list secret KEYS (names only) in project '{project_id}' env '{environment}' path '{secret_path}'"
+            "<secret-manager>: list secret KEYS (names only) in project '{project_id}' env '{environment}' path '{secret_path}'" // pii-test-fixture
         );
         match gate(self.name(), &args, &summary).await {
             Gate::Granted => {}
@@ -495,7 +495,7 @@ Use infisical_list_secrets first to discover key names. GUARDED: requires operat
 
         // Summary names the key being fetched but NEVER its value.
         let summary = format!(
-            "<secret-manager>: retrieve secret VALUE for key '{secret_key}' in project '{project_id}' env '{environment}' path '{secret_path}'"
+            "<secret-manager>: retrieve secret VALUE for key '{secret_key}' in project '{project_id}' env '{environment}' path '{secret_path}'" // pii-test-fixture
         );
         match gate(self.name(), &args, &summary).await {
             Gate::Granted => {}
@@ -575,7 +575,7 @@ secret values — use for bulk injection, not browsing. GUARDED: requires operat
             .to_string();
 
         let summary = format!(
-            "<secret-manager>: retrieve ALL secret values (bulk) in project '{project_id}' env '{environment}' path '{secret_path}'"
+            "<secret-manager>: retrieve ALL secret values (bulk) in project '{project_id}' env '{environment}' path '{secret_path}'" // pii-test-fixture
         );
         match gate(self.name(), &args, &summary).await {
             Gate::Granted => {}
@@ -612,8 +612,7 @@ pub fn register(registry: &mut ToolRegistry) {
     let config = InfisicalConfig::from_env();
     if !config.is_configured() {
         tracing::warn!(
-            "<secret-manager> tools not fully configured (INFISICAL_URL / INFISICAL_CLIENT_ID / \
-INFISICAL_CLIENT_SECRET). Tools registered; calls will return NotConfigured until set."
+            "<secret-manager> tools not fully configured (INFISICAL_URL / INFISICAL_CLIENT_ID / INFISICAL_CLIENT_SECRET). Tools registered; calls will return NotConfigured until set." // pii-test-fixture
         );
     }
     registry.register_or_replace(Box::new(InfisicalStatus {
@@ -647,7 +646,7 @@ mod tests {
     }
 
     fn full_cfg() -> InfisicalConfig {
-        cfg(Some("http://<secret-manager>.test:8080/"), Some("cid"), Some("csecret"))
+        cfg(Some("http://<secret-manager>.test:8080/"), Some("cid"), Some("csecret")) // pii-test-fixture
     }
 
     // ── config ────────────────────────────────────────────────────────────────
@@ -655,7 +654,7 @@ mod tests {
     #[test]
     fn base_url_strips_trailing_slash() {
         let c = full_cfg();
-        assert_eq!(c.base_url().unwrap(), "http://<secret-manager>.test:8080");
+        assert_eq!(c.base_url().unwrap(), "http://<secret-manager>.test:8080"); // pii-test-fixture
     }
 
     #[test]

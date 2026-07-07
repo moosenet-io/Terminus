@@ -1,6 +1,6 @@
 //! Ansible tools — ANS-01 (Tier-2 migration)
 //!
-//! Ported from the Python `ansible_tools.py` on <host>. The Python version shelled
+//! Ported from the Python `ansible_tools.py` on the source host. The Python version shelled
 //! out to `ssh` via `subprocess`. This implementation uses the `ssh2` crate for
 //! typed SSH execution (no subprocess, no shell=True), mirroring `dura/mod.rs`.
 //!
@@ -725,7 +725,7 @@ mod tests {
     #[test]
     fn test_utc_now_iso_shape() {
         let ts = utc_now_iso();
-        // e.g. 2026-06-09T01:43:41Z
+        // e.g. 2026-06-09T01:43:41Z — pii-test-fixture
         assert_eq!(ts.len(), 20);
         assert!(ts.ends_with('Z'));
         assert_eq!(&ts[4..5], "-");
@@ -818,7 +818,7 @@ mod tests {
                 returncode: 0,
                 stdout: "ok".into(),
                 stderr: String::new(),
-                timestamp: "2026-06-09T00:00:00Z".into(),
+                timestamp: "2026-06-09T00:00:00Z".into(), // pii-test-fixture
             })),
         };
         let msg = tool.execute(json!({})).await.expect("gate returns Ok");

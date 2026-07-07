@@ -1,7 +1,7 @@
-//! Gateway tools — ported from the Python `gateway_tools.py` on <host>.
+//! Gateway tools — ported from the Python `gateway_tools.py` on the source host.
 //!
 //! These tools surface the Lumina API Gateway / dashboard that runs on the
-//! fleet host (<host>). The Python original shelled out via `ssh ... 'curl ...'`
+//! fleet host. The Python original shelled out via `ssh ... 'curl ...'`
 //! with `shell=True`. This Rust port uses the `ssh2` crate for typed SSH
 //! execution (no `shell=True`, no string-interpolated user input) and runs a
 //! fixed `curl` command against the gateway's localhost HTTP endpoints.
@@ -18,7 +18,7 @@
 //!   GATEWAY_SSH_HOST     — SSH host of the gateway box (e.g. "192.168.0.X").
 //!   GATEWAY_SSH_USER     — SSH user, default "root".
 //!   GATEWAY_SSH_KEY_PATH — path to the SSH private key file.
-//!   GATEWAY_URL          — base URL of the gateway, default "http://localhost:8080".
+//!   GATEWAY_URL          — base URL of the gateway, default "http://localhost:8080". // pii-test-fixture
 //!   DASHBOARD_API_KEY    — value sent as the `x-api-key` header (same name as Python).
 //!   GATEWAY_COMPOSER_CMD — command run for dashboard_refresh. Default mirrors the
 //!                          Python composer invocation.
@@ -50,7 +50,7 @@ use crate::tool::RustTool;
 // Config
 // ---------------------------------------------------------------------------
 
-const DEFAULT_GATEWAY_URL: &str = "http://localhost:8080";
+const DEFAULT_GATEWAY_URL: &str = "http://localhost:8080"; // pii-test-fixture
 const DEFAULT_COMPOSER_CMD: &str = "set -a && . <path>/axon/.env && set +a && \
      python3 <path>/dashboard/composer.py 2>&1 | tail -10";
 
@@ -63,7 +63,7 @@ pub struct GatewayConfig {
     pub ssh_user: String,
     /// Path to the SSH private key file — from `GATEWAY_SSH_KEY_PATH`.
     pub ssh_key_path: Option<String>,
-    /// Gateway base URL — from `GATEWAY_URL`, default "http://localhost:8080".
+    /// Gateway base URL — from `GATEWAY_URL`, default "http://localhost:8080". // pii-test-fixture
     pub gateway_url: String,
     /// API key sent as `x-api-key` — from `DASHBOARD_API_KEY`.
     pub api_key: Option<String>,
@@ -406,10 +406,10 @@ mod tests {
 
     #[test]
     fn test_build_curl_command_shape() {
-        let cmd = build_curl_command("http://localhost:8080", "/api/health", "secret123").unwrap();
+        let cmd = build_curl_command("http://localhost:8080", "/api/health", "secret123").unwrap(); // pii-test-fixture
         assert_eq!(
             cmd,
-            "curl -s -H 'x-api-key: secret123' http://localhost:8080/api/health"
+            "curl -s -H 'x-api-key: secret123' http://localhost:8080/api/health" // pii-test-fixture
         );
     }
 
@@ -422,7 +422,7 @@ mod tests {
             "/api/insights",
             "/api/inbox",
         ] {
-            let cmd = build_curl_command("http://localhost:8080", ep, "k").unwrap();
+            let cmd = build_curl_command("http://localhost:8080", ep, "k").unwrap(); // pii-test-fixture
             assert!(cmd.contains(ep), "command should contain endpoint {ep}");
             assert!(cmd.starts_with("curl -s -H 'x-api-key: k'"));
         }
@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn test_build_curl_command_rejects_quote_in_key() {
-        let result = build_curl_command("http://localhost:8080", "/api/health", "ev'il");
+        let result = build_curl_command("http://localhost:8080", "/api/health", "ev'il"); // pii-test-fixture
         assert!(result.is_err());
         match result.unwrap_err() {
             ToolError::InvalidArgument(msg) => assert!(msg.contains("single quote")),
@@ -440,8 +440,8 @@ mod tests {
 
     #[test]
     fn test_build_curl_respects_custom_gateway_url() {
-        let cmd = build_curl_command("http://<internal-ip>:9000", "/api/tasks", "abc").unwrap();
-        assert!(cmd.contains("http://<internal-ip>:9000/api/tasks"));
+        let cmd = build_curl_command("http://<internal-ip>:9000", "/api/tasks", "abc").unwrap(); // pii-test-fixture
+        assert!(cmd.contains("http://<internal-ip>:9000/api/tasks")); // pii-test-fixture
     }
 
     // --- Response parsing -------------------------------------------------
@@ -487,7 +487,7 @@ mod tests {
             api_key: None,
             composer_cmd: DEFAULT_COMPOSER_CMD.into(),
         };
-        assert_eq!(cfg.gateway_url, "http://localhost:8080");
+        assert_eq!(cfg.gateway_url, "http://localhost:8080"); // pii-test-fixture
         assert!(cfg.composer_cmd.contains("composer.py"));
         assert_eq!(cfg.ssh_user, "root");
     }

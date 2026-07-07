@@ -122,7 +122,7 @@ impl DgemConfig {
     /// without a live daemon.
     #[cfg(test)]
     pub(crate) fn test_default() -> Self {
-        Self::test_with_url("http://127.0.0.1:8877")
+        Self::test_with_url("http://127.0.0.1:8877") // pii-test-fixture
     }
 
     #[cfg(test)]
@@ -137,8 +137,9 @@ impl DgemConfig {
     }
 
     /// Pre-flight guard: refuse inputs whose estimated token count exceeds the configured ceiling,
-    /// so we fail fast with a clear message instead of OOM-ing the daemon host (~12K-token ceiling on
-    /// <host>'s 31GB RAM). Estimate is the standard chars/4 heuristic. Applies to all tools
+    /// so we fail fast with a clear message instead of OOM-ing the daemon host (~12K-token ceiling
+    /// given the daemon host's available RAM, ~31GB in this environment). Estimate is the standard
+    /// chars/4 heuristic. Applies to all tools
     /// (generate/review/batch) as the hard safety cap.
     fn check_input_size(&self, text: &str) -> Result<(), ToolError> {
         let est = estimate_tokens(text);
@@ -361,7 +362,7 @@ mod tests {
     #[test]
     fn check_input_size_rejects_oversized() {
         let cfg = DgemConfig {
-            base_url: "http://127.0.0.1:8877".into(),
+            base_url: "http://127.0.0.1:8877".into(), // pii-test-fixture
             client_timeout_secs: 600,
             max_input_tokens: 100,
             latency_fallback_tokens: 50,
@@ -397,7 +398,7 @@ mod tests {
 
     #[test]
     fn split_thinking_channel_format() {
-        // The real DiffusionGemma format observed on <host>.
+        // The real DiffusionGemma format observed on the daemon host. // pii-test-fixture
         let raw = "<|channel>thought\n*   reasoning here\n    *   \"Hello\"<channel|>Hello";
         let (think, answer) = split_thinking(raw);
         assert_eq!(answer, "Hello");
@@ -421,14 +422,14 @@ mod tests {
         // Default base_url derives from bind/port when DGEM_BASE_URL is unset.
         // (Not asserting against process env to avoid cross-test interference; construct directly.)
         let cfg = DgemConfig {
-            base_url: "http://127.0.0.1:8877".into(),
+            base_url: "http://127.0.0.1:8877".into(), // pii-test-fixture
             client_timeout_secs: DEFAULT_CLIENT_TIMEOUT_SECS,
             max_input_tokens: DEFAULT_MAX_INPUT_TOKENS,
             latency_fallback_tokens: DEFAULT_LATENCY_FALLBACK_TOKENS,
             default_max_tokens: DEFAULT_MAX_TOKENS,
         };
         assert_eq!(cfg.default_max_tokens(), 1024);
-        assert_eq!(cfg.base_url, "http://127.0.0.1:8877");
+        assert_eq!(cfg.base_url, "http://127.0.0.1:8877"); // pii-test-fixture
     }
 
     #[test]
@@ -461,7 +462,7 @@ mod tests {
     fn check_review_size_respects_configured_latency_threshold() {
         // Raise the latency threshold so a mid-size diff is reviewed locally instead of falling back.
         let cfg = DgemConfig {
-            base_url: "http://127.0.0.1:8877".into(),
+            base_url: "http://127.0.0.1:8877".into(), // pii-test-fixture
             client_timeout_secs: 600,
             max_input_tokens: 10_000,
             latency_fallback_tokens: 8_000,

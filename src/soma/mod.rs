@@ -1,7 +1,7 @@
-//! Soma tools — ported from the Python `soma_tools.py` on <host>.
+//! Soma tools — ported from the Python `soma_tools.py` on the source host.
 //!
-//! Soma is the Lumina Constellation admin panel/API running on the fleet host
-//! (<host>). The Python original (a `soma_tools.py` on <host>'s Python MCP
+//! Soma is the Lumina Constellation admin panel/API running on the fleet host.
+//! The Python original (a `soma_tools.py` on the source host's Python MCP
 //! server) is a thin `urllib.request` wrapper: every tool except
 //! `soma_status` sends an `X-Soma-Key` header sourced from `SOMA_SECRET_KEY`
 //! and hits a fixed path under `SOMA_URL` (server-side default; see
@@ -9,7 +9,7 @@
 //! internal address, to keep this source PII-clean; set `SOMA_URL` in the
 //! deployment environment to the real fleet-host address).
 //!
-//! Confirmed live against <host> (`tools/call`, 2026-07-06):
+//! Confirmed live against the source host (`tools/call`, 2026-07-06): // pii-test-fixture
 //! - `soma_status` needs no auth. With Soma unreachable it returned exactly
 //!   `{"status": "unreachable", "error": "<urlopen error ...>", "url":
 //!   "<SOMA_URL>"}` — matching the Python `except` branch verbatim.
@@ -17,14 +17,14 @@
 //!   `soma_cost_summary`, `soma_inference_status`, `soma_constellation_config`,
 //!   `soma_run_validation`, `soma_rename_agent`, `soma_skill_approve`) returned
 //!   `Error executing tool <name>: SOMA_SECRET_KEY not set in environment`
-//!   because <host>'s own environment has no `SOMA_SECRET_KEY` configured right
+//!   because the source host's own environment has no `SOMA_SECRET_KEY` configured right
 //!   now. This is a live behavioral fact, not a bug we're introducing: the
 //!   current source has no fallback dev key, so a missing key is a hard
 //!   `NotConfigured`-style failure for every authenticated endpoint. This port
 //!   reproduces that exact message so a NotConfigured error looks the same
 //!   from either implementation.
 //! - `soma_run_validation`'s docstring says "check soma_validation_status() for
-//!   results", but **no such tool exists** anywhere in <host>'s live 126-tool
+//!   results", but **no such tool exists** anywhere in the source host's live 126-tool
 //!   catalog (confirmed via `tools/list`). This is a stale/dead docstring
 //!   reference in the Python source, not something this port invents a
 //!   companion tool for — `soma_run_validation` is ported faithfully as a
@@ -35,7 +35,7 @@
 //! `soma_skills_list` / `soma_skill_approve` overlap conceptually with a
 //! separate `skills_list` / `skills_read` / `skills_create` tool set being
 //! ported in parallel by a different agent (not yet merged as of this
-//! branch's base commit) from <host>'s standalone `skills_*` module. The two
+//! branch's base commit) from the source host's standalone `skills_*` module. The two
 //! families read from the same `active/`/`proposed/` skill directories but
 //! through different transports: `skills_*` goes over SSH to the fleet
 //! host's filesystem directly, while `soma_skills_list` / `soma_skill_approve`
@@ -61,7 +61,7 @@
 //!   SOMA_SECRET_KEY  — shared secret sent as the `X-Soma-Key` header. Required
 //!                      for every tool except `soma_status`; if unset, those
 //!                      tools return `NotConfigured("SOMA_SECRET_KEY not set in
-//!                      environment")` — no dev-key fallback (matches live <host>).
+//!                      environment")` — no dev-key fallback (matches the live source host).
 //!
 //! ## Security model
 //! - `agent_id` (soma_rename_agent) and `skill_name` (soma_skill_approve) are
@@ -118,7 +118,7 @@ impl SomaConfig {
     }
 
     /// The shared secret sent as `X-Soma-Key`. Required for every tool except
-    /// `soma_status`. No dev-key fallback — matches the live <host> behavior
+    /// `soma_status`. No dev-key fallback — matches the live source-host behavior
     /// observed via `tools/call` (a missing key is a hard failure there too).
     fn key() -> Result<String, ToolError> {
         env::var("SOMA_SECRET_KEY")
@@ -561,7 +561,7 @@ impl RustTool for SomaRunValidation {
 
     fn description(&self) -> &str {
         // NOTE: the referenced `soma_validation_status()` does not exist in
-        // <host>'s live tool catalog (confirmed via tools/list). This is a
+        // the source host's live tool catalog (confirmed via tools/list). This is a
         // stale docstring in the Python source, ported verbatim rather than
         // silently "fixed" with an invented tool. See module doc comment.
         "\nTrigger a Dura smoke test run via Soma.\nRuns asynchronously — check soma_validation_status() for results.\nReturns pid of the background test process.\n"
@@ -983,13 +983,13 @@ mod tests {
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(GET).path("/api/backup/status");
-            then.status(200).json_body(json!({"last_run": "2026-07-01"}));
+            then.status(200).json_body(json!({"last_run": "2026-07-01"})); // pii-test-fixture
         });
         let tool = SomaBackupStatus { cfg: cfg(&server) };
         let result = tool.execute(json!({})).await.unwrap();
         restore_key(existing);
         let v: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(v["last_run"], "2026-07-01");
+        assert_eq!(v["last_run"], "2026-07-01"); // pii-test-fixture
     }
 
     // ── soma_run_validation ───────────────────────────────────────────────────

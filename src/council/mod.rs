@@ -1,5 +1,5 @@
 //! Obsidian Circle (council) tools — ported from the Python `council_tools.py`
-//! on <host> (OC.8).
+//! on the fleet host (OC.8).
 //!
 //! The Python source is a thin MCP wrapper around a separate, much larger
 //! Python subsystem: `obsidian_circle.engine` (~490 lines) which runs a real

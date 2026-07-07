@@ -1,8 +1,8 @@
-//! Synapse tools — ported from the Python `synapse_tools.py` on <host>.
+//! Synapse tools — ported from the Python `synapse_tools.py` on the fleet host.
 //!
 //! Synapse is a fleet-host process that watches for proactive-message
 //! candidates ("Pulse") and gates them against config (enabled/strength/
-//! quiet hours) before sending. Confirmed live against <host> via
+//! quiet hours) before sending. Confirmed live against the fleet host via
 //! `tools/call`:
 //!   - `synapse_status` returned instantly and successfully even while the
 //!     fleet host was unreachable — text: `"Synapse: DISABLED\nStrength:
@@ -16,7 +16,7 @@
 //!   - `synapse_mute` (hours=1, and also tried with hours=0 and hours=100)
 //!     returned `"[synapse_mute] Failed: ssh: connect to host <fleet-host>
 //!     port 22: No route to host"` in all three cases — the fleet host was
-//!     unreachable from <host> at test time, so we could not observe a
+//!     unreachable from the test host at test time, so we could not observe a
 //!     success-path response or confirm whether the documented 1-72 hour
 //!     bound is enforced client-side (in the Python tool) or only in the
 //!     remote script. **This port enforces the bound before attempting the
@@ -164,7 +164,7 @@ fn validate_mute_hours(hours: u64) -> Result<(), ToolError> {
 /// output (`isError: false`) — confirmed live: `"[synapse_trigger DRY
 /// RUN]\nssh: connect to host <fleet-host> port 22: No route to host"`. A
 /// generic `ToolError` here would surface as an MCP-level `isError: true`,
-/// which is NOT what <host> does. So connection/handshake/auth failures are
+/// which is NOT what the live server does. So connection/handshake/auth failures are
 /// folded into `Ok(String)` as an ssh-style message, matching the real
 /// tool's documented and observed payload shape. Only `NotConfigured`
 /// (missing `SYNAPSE_SSH_HOST`/`SYNAPSE_SSH_KEY_PATH`) remains a hard
@@ -578,10 +578,10 @@ mod tests {
     fn test_last_sent_marker_returns_last_line() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("pulse.log");
-        fs::write(&path, "2026-07-01T08:00:00Z sent\n2026-07-02T08:00:00Z sent\n").unwrap();
+        fs::write(&path, "2026-07-01T08:00:00Z sent\n2026-07-02T08:00:00Z sent\n").unwrap(); // pii-test-fixture
         assert_eq!(
             last_sent_marker(path.to_str().unwrap()),
-            "2026-07-02T08:00:00Z sent"
+            "2026-07-02T08:00:00Z sent" // pii-test-fixture
         );
     }
 

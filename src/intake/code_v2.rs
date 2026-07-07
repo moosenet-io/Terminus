@@ -12,7 +12,7 @@
 //! workspace and validate (compile → tests → independent change check), with a
 //! graduated 0-5 score and a retry pass when the first attempt nearly works.
 //!
-//! ## Corpus layout (`INTAKE_CORPUS_V2_DIR`, default `<path>/intake-corpus-v2`)
+//! ## Corpus layout (`INTAKE_CORPUS_V2_DIR`, defaults to the deployed intake-corpus-v2 directory)
 //!   manifest.json                 — array of CaseV2 entries
 //!   _workspaces/<ws>/             — standalone, dep-minimal real-derived crates
 //!   <lang>/<tier>/<case>/spec.md  — the build-pipeline spec item
@@ -40,7 +40,7 @@
 //!   `TOOLCHAIN:missing <bin>` — degrade gracefully (exit 3, score NULL)
 //! and exits 0 on full pass, 3 when a toolchain is missing, non-zero otherwise.
 //!
-//! Toolchains live under `/opt/chord-data/toolchains` on <host>; the deploy script
+//! Toolchains live under the deploy tree's toolchains directory on the sweep-harness host; the deploy script
 //! puts cargo/node on PATH. Missing toolchain → row error set, score NULL, run
 //! continues.
 
@@ -56,7 +56,7 @@ use crate::intake::context;
 use crate::intake::gpu_authority::GpuLock;
 use crate::intake::storage::{self, CodeRunRowV2};
 
-/// Default v2 corpus location on <host>; overridable via `INTAKE_CORPUS_V2_DIR`.
+/// Default v2 corpus location on the sweep-harness host; overridable via `INTAKE_CORPUS_V2_DIR`.
 const DEFAULT_CORPUS_V2_DIR: &str = "<path>/intake-corpus-v2";
 
 /// Resolve the v2 corpus directory.
@@ -516,7 +516,7 @@ async fn apply_and_validate(
 
 /// Backoff delays (seconds) between retries of a transport-style error, in
 /// order. HFIX-04: a single fixed 10s retry did not survive the SUSTAINED
-/// (multi-minute) connectivity windows actually observed on <host> — ollama's
+/// (multi-minute) connectivity windows actually observed on the sweep-harness host — ollama's
 /// own runner reloads are fast (all but 4 loads across the whole multi-day
 /// sweep history finished under 10s), so a lone 10s wait was retrying too
 /// early into a contention window that was still ongoing. Three escalating
@@ -1209,7 +1209,7 @@ mod tests {
     #[test]
     fn transport_retry_backoff_escalates_across_three_attempts() {
         // HFIX-04: a single fixed 10s wait did not survive the sustained
-        // (multi-minute) connectivity windows observed on <host>. Three
+        // (multi-minute) connectivity windows observed on <host>. Three // pii-test-fixture
         // escalating waits (not a single fixed one, not unbounded) is the
         // load-bearing shape here.
         assert_eq!(TRANSPORT_RETRY_BACKOFF_SECS, [10, 20, 40]);

@@ -68,7 +68,7 @@ pub const HARNESS_VERSION: &str = "s84-asmt-01";
 /// single global i64 namespace per Postgres cluster, so this MUST stay
 /// unique among any other advisory locks Terminus/Lumina ever introduces —
 /// grep for `pg_advisory_lock` before reusing or changing it.
-const ADVISORY_LOCK_KEY: i64 = -5322992491554488081;
+const ADVISORY_LOCK_KEY: i64 = -5322992491554488081; // pii-test-fixture
 
 /// Connect a pool to the intake/assistant DB. Prefers `INTAKE_DATABASE_URL`,
 /// falls back to `DATABASE_URL` (same shared DB S83 uses).

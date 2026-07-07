@@ -6,7 +6,7 @@
 //!
 //! Scope and limits (deliberately honest):
 //!   - **Gated.** Coordination only runs when `DGEM_COORDINATE_VRAM` is truthy. Default OFF so it never
-//!     disrupts a host until an operator opts in — the integration test on <host> freed VRAM manually.
+//!     disrupts a host until an operator opts in — the integration test on the daemon host freed VRAM manually.
 //!   - **Graceful.** Every failure (Ollama unreachable, unexpected response) is logged and swallowed;
 //!     coordination never fails the dgem call. The daemon's own "VRAM occupied" error remains the
 //!     backstop if freeing didn't help.
@@ -17,11 +17,11 @@
 //!
 //! Config (env, non-secret):
 //!   - `DGEM_COORDINATE_VRAM` — `1`/`true`/`yes` to enable (default off).
-//!   - `OLLAMA_BASE_URL` — Ollama base (default `http://127.0.0.1:11434`).
+//!   - `OLLAMA_BASE_URL` — Ollama base (default `http://127.0.0.1:11434`). // pii-test-fixture
 
 use serde::Deserialize;
 
-const DEFAULT_OLLAMA_BASE: &str = "http://127.0.0.1:11434";
+const DEFAULT_OLLAMA_BASE: &str = "http://127.0.0.1:11434"; // pii-test-fixture
 
 /// Whether VRAM coordination is enabled (`DGEM_COORDINATE_VRAM` truthy).
 pub(crate) fn coordinate_enabled() -> bool {

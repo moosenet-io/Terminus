@@ -1,5 +1,5 @@
 //! Odyssey tools — trip planning (bucket list, loyalty cards, trip log,
-//! deals, research, optimize), ported from <host>'s `odyssey_tools.py`.
+//! deals, research, optimize), ported from the source host's `odyssey_tools.py`.
 //!
 //! This module carries two families of tools:
 //! - **CRUD** (`odyssey_bucket_add`, `odyssey_bucket_list`,
@@ -11,13 +11,13 @@
 //!   take longer than an instant round trip.
 //!
 //! ## Backend assumption (CRUD tools) — FLAG FOR HUMAN AUDIT
-//! The live <host> implementation does **not** talk to Engram over HTTP. It
-//! SSHes from <host> to a fleet host (`root@YOUR_FLEET_SERVER_IP`) and runs
+//! The live source-host implementation does **not** talk to Engram over HTTP. It
+//! SSHes from the source host to a fleet host (`root@YOUR_FLEET_SERVER_IP`) and runs
 //! `<path>/odyssey/odyssey.py <subcommand>`, which in turn imports
 //! `<path>/engram/engram.py` and/or opens
 //! `<path>/engram/engram.db` (SQLite) directly. There is no HTTP
 //! wire protocol to observe or replicate — confirmed by reading the live
-//! `odyssey_tools.py` off <host> and the canonical `odyssey.py` / `engram.py`
+//! `odyssey_tools.py` off the source host and the canonical `odyssey.py` / `engram.py`
 //! sources in this monorepo (`src/fleet/odyssey/odyssey.py`,
 //! `src/engram/engram.py`). Additionally, at port time the fleet server is
 //! unreachable ("no route to host") and its successor (per current topology)
@@ -53,17 +53,17 @@
 //! filter is passed as an HTTP query parameter and parameterization is the
 //! (assumed) backend's responsibility.
 //!
-//! ## Observed <host> behavior (async tools, verified 2026-07-06 via a live
-//! `tools/call` against <host>'s MCP endpoint)
+//! ## Observed source-host behavior (async tools, verified 2026-07-06 via a live // pii-test-fixture
+//! `tools/call` against the source host's MCP endpoint)
 //!
-//! `odyssey_research` and `odyssey_optimize` are **synchronous** on <host>: a
+//! `odyssey_research` and `odyssey_optimize` are **synchronous** on the source host: a
 //! single `tools/call` request blocks for the full duration of the
 //! underlying work and returns one result — there is no separate
 //! "submit"/"poll"/"cancel" tool triple for Odyssey (contrast with
-//! `axon_submit` / `axon_status` / `axon_cancel`, which <host> *does* expose
+//! `axon_submit` / `axon_status` / `axon_cancel`, which the source host *does* expose
 //! for genuinely async work). A live call to each tool returned promptly
 //! with a JSON body shaped `{"status": "failed"|"success", "output": ...,
-//! "error": ...}`, which is <host>'s own SSH-to-fleet-host wrapper shape (it
+//! "error": ...}`, which is the source host's own SSH-to-fleet-host wrapper shape (it
 //! shells out to the agent fleet host) — plumbing this Rust port does not
 //! replicate, since `RustTool::execute` must never use shell/subprocess
 //! calls (see `crate::tool`) and this repo already has a native HTTP-based
@@ -71,7 +71,7 @@
 //! reach the same underlying capability. This port reuses those clients'
 //! patterns (their env var names, sanitization approach, and `reqwest` +
 //! timeout shape) rather than inventing a new async job/handle abstraction
-//! that neither <host> nor this repo's existing seer/wizard modules actually
+//! that neither the source host nor this repo's existing seer/wizard modules actually
 //! use.
 //!
 //! Both async tools are therefore implemented the same way: bounded
@@ -282,11 +282,11 @@ struct WizardToolCallResponse {
 // Timeouts (async tools)
 // ---------------------------------------------------------------------------
 
-/// <host>'s docstring says "Takes 2-5 minutes"; bound generously but finitely
+/// The source host's docstring says "Takes 2-5 minutes"; bound generously but finitely
 /// so a wedged Seer backend cannot hang the calling MCP server forever.
 const RESEARCH_TIMEOUT_SECS: u64 = 300;
 
-/// <host>'s docstring says "Takes up to 60 seconds"; give some headroom over
+/// The source host's docstring says "Takes up to 60 seconds"; give some headroom over
 /// that for a slower-than-usual Wizard council round, still bounded.
 const OPTIMIZE_TIMEOUT_SECS: u64 = 90;
 

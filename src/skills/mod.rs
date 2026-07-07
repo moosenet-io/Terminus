@@ -1,9 +1,9 @@
-//! Skills tools — ported from the Python `skills_tools.py` on <host>.
+//! Skills tools — ported from the Python `skills_tools.py` on the fleet host.
 //!
 //! Skills are filesystem CRUD over `active/`/`proposed/` skill directories in
 //! agentskills.io markdown format (YAML frontmatter + Markdown body), rooted
 //! at `<path>/skills/` on the fleet host — confirmed live against
-//! <host> via `tools/call`:
+//! the fleet host via `tools/call`:
 //!   - `skills_create` (proposed=true, default) returned
 //!     `"path": "<path>/skills/proposed/<name>/SKILL.md"`.
 //!   - `skills_list` reads the `active/` directory (returns

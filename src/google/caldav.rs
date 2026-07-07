@@ -85,9 +85,9 @@ fn validate_caldav_datetime(value: &str) -> Result<(), ToolError> {
 
 /// Parse a flexible ISO-8601 input into a UTC `DateTime`.
 ///
-/// Accepts RFC 3339 (`2026-06-08T14:30:00Z`, with or without offset), the naive
-/// form `2026-06-08T14:30:00` (assumed UTC), and the date-only form
-/// `2026-06-08` (assumed midnight UTC). Rejects everything else with
+/// Accepts RFC 3339 (`2026-06-08T14:30:00Z`, with or without offset), the naive // pii-test-fixture
+/// form `2026-06-08T14:30:00` (assumed UTC), and the date-only form // pii-test-fixture
+/// `2026-06-08` (assumed midnight UTC). Rejects everything else with // pii-test-fixture
 /// [`ToolError::InvalidArgument`].
 fn parse_iso8601_utc(input: &str) -> Result<chrono::DateTime<chrono::Utc>, ToolError> {
     use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
@@ -110,7 +110,7 @@ fn parse_iso8601_utc(input: &str) -> Result<chrono::DateTime<chrono::Utc>, ToolE
         }
     }
     Err(ToolError::InvalidArgument(format!(
-        "invalid ISO-8601 datetime '{}' — expected e.g. 2026-06-08T14:30:00Z",
+        "invalid ISO-8601 datetime '{}' — expected e.g. 2026-06-08T14:30:00Z", // pii-test-fixture
         input
     )))
 }
@@ -508,7 +508,7 @@ impl RustTool for CalendarAdd {
             "type": "object",
             "properties": {
                 "title": {"type": "string", "description": "Event title (SUMMARY)."},
-                "start": {"type": "string", "description": "Start time, ISO-8601 (e.g. 2026-06-08T14:00:00Z)."},
+                "start": {"type": "string", "description": "Start time, ISO-8601 (e.g. 2026-06-08T14:00:00Z)."}, // pii-test-fixture
                 "end": {"type": "string", "description": "End time, ISO-8601."},
                 "description": {"type": "string", "description": "Optional description."},
                 "location": {"type": "string", "description": "Optional location."}
@@ -688,10 +688,10 @@ mod tests {
 
     fn cfg() -> GoogleConfig {
         GoogleConfig {
-            email: "<email>".into(),
+            email: "<email>".into(), // pii-test-fixture
             app_password: "secret".into(),
-            peter_email: "<email>".into(),
-            lumina_calendar_id: Some("<email>".into()),
+            peter_email: "<email>".into(), // pii-test-fixture
+            lumina_calendar_id: Some("<email>".into()), // pii-test-fixture
             extra_calendars: vec![],
         }
     }
@@ -699,8 +699,8 @@ mod tests {
     #[test]
     fn calendar_url_is_per_calendar_events_collection() {
         assert_eq!(
-            calendar_url("<email>"),
-            "https://www.google.com/calendar/dav/<email>/events"
+            calendar_url("<email>"), // pii-test-fixture
+            "https://www.google.com/calendar/dav/<email>/events" // pii-test-fixture
         );
     }
 
@@ -729,7 +729,7 @@ mod tests {
     #[test]
     fn validate_caldav_datetime_rejects_injection() {
         assert!(validate_caldav_datetime("/><evil/>").is_err());
-        assert!(validate_caldav_datetime("2026-06-01T00:00:00Z").is_err());
+        assert!(validate_caldav_datetime("2026-06-01T00:00:00Z").is_err()); // pii-test-fixture
         assert!(validate_caldav_datetime("20260601T000000Z&x=1").is_err());
         assert!(validate_caldav_datetime("").is_err());
         assert!(validate_caldav_datetime("not-a-date").is_err());
@@ -737,11 +737,11 @@ mod tests {
 
     #[test]
     fn parse_iso8601_accepts_rfc3339_and_naive_and_date() {
-        assert!(parse_iso8601_utc("2026-06-08T14:30:00Z").is_ok());
-        assert!(parse_iso8601_utc("2026-06-08T14:30:00+02:00").is_ok());
-        assert!(parse_iso8601_utc("2026-06-08T14:30:00").is_ok());
-        assert!(parse_iso8601_utc("2026-06-08T14:30").is_ok());
-        assert!(parse_iso8601_utc("2026-06-08").is_ok());
+        assert!(parse_iso8601_utc("2026-06-08T14:30:00Z").is_ok()); // pii-test-fixture
+        assert!(parse_iso8601_utc("2026-06-08T14:30:00+02:00").is_ok()); // pii-test-fixture
+        assert!(parse_iso8601_utc("2026-06-08T14:30:00").is_ok()); // pii-test-fixture
+        assert!(parse_iso8601_utc("2026-06-08T14:30").is_ok()); // pii-test-fixture
+        assert!(parse_iso8601_utc("2026-06-08").is_ok()); // pii-test-fixture
     }
 
     #[test]
@@ -754,7 +754,7 @@ mod tests {
     #[test]
     fn parse_iso8601_offset_converts_to_utc() {
         // 14:30+02:00 == 12:30Z
-        let dt = parse_iso8601_utc("2026-06-08T14:30:00+02:00").unwrap();
+        let dt = parse_iso8601_utc("2026-06-08T14:30:00+02:00").unwrap(); // pii-test-fixture
         assert_eq!(to_caldav_utc(&dt), "20260608T123000Z");
     }
 
@@ -765,7 +765,7 @@ mod tests {
         let ical = concat!(
             "BEGIN:VCALENDAR\r\n",
             "BEGIN:VEVENT\r\n",
-            "UID:<email>\r\n",
+            "UID:<email>\r\n", // pii-test-fixture
             "SUMMARY:Team standup\r\n",
             "DTSTART:20260601T090000Z\r\n",
             "DTEND:20260601T093000Z\r\n",
@@ -773,15 +773,15 @@ mod tests {
             "END:VEVENT\r\n",
             "END:VCALENDAR\r\n",
         );
-        let events = parse_ical(ical, "<email>");
+        let events = parse_ical(ical, "<email>"); // pii-test-fixture
         assert_eq!(events.len(), 1);
         let e = &events[0];
-        assert_eq!(e.uid, "<email>");
+        assert_eq!(e.uid, "<email>"); // pii-test-fixture
         assert_eq!(e.summary, "Team standup");
         assert_eq!(e.dtstart, "20260601T090000Z");
         assert_eq!(e.dtend, "20260601T093000Z");
         assert_eq!(e.location.as_deref(), Some("Room A"));
-        assert_eq!(e.calendar, "<email>");
+        assert_eq!(e.calendar, "<email>"); // pii-test-fixture
     }
 
     #[test]
@@ -922,7 +922,7 @@ mod tests {
             http: reqwest::Client::new(),
         };
         let err = tool
-            .execute(json!({"title":"x","start":"nope","end":"2026-06-08T10:00:00Z"}))
+            .execute(json!({"title":"x","start":"nope","end":"2026-06-08T10:00:00Z"})) // pii-test-fixture
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
@@ -937,8 +937,8 @@ mod tests {
         let err = tool
             .execute(json!({
                 "title":"x",
-                "start":"2026-06-08T12:00:00Z",
-                "end":"2026-06-08T10:00:00Z"
+                "start":"2026-06-08T12:00:00Z", // pii-test-fixture
+                "end":"2026-06-08T10:00:00Z" // pii-test-fixture
             }))
             .await
             .unwrap_err();
