@@ -365,7 +365,10 @@ impl ReasoningBackend for ClaudeCliBackend {
 /// deliberately NOT the GPU backend). Used only when the primary is
 /// unavailable (missing binary / spawn failure / auth error / timeout).
 pub struct OllamaCpuBackend {
-    url: String,
+    /// `None` when `OLLAMA_CPU_URL` isn't set — [`ask`] then reports
+    /// `Unavailable` rather than guessing a local address (PII remediation
+    /// 2026-07: no compiled-in fallback host).
+    url: Option<String>,
     model: String,
     timeout: Duration,
 }
@@ -383,6 +386,11 @@ impl OllamaCpuBackend {
 #[async_trait::async_trait]
 impl ReasoningBackend for OllamaCpuBackend {
     async fn ask(&self, prompt: &str) -> BackendReply {
+        let Some(base_url) = self.url.as_deref() else {
+            return BackendReply::Unavailable(
+                "OLLAMA_CPU_URL is not set — CPU-backed Ollama fallback unavailable".to_string(),
+            );
+        };
         let client = match reqwest::Client::builder().timeout(self.timeout).build() {
             Ok(c) => c,
             Err(e) => return BackendReply::Unavailable(format!("ollama client build failed: {e}")),
@@ -392,7 +400,7 @@ impl ReasoningBackend for OllamaCpuBackend {
             "prompt": prompt,
             "stream": false,
         });
-        let url = format!("{}/api/generate", self.url.trim_end_matches('/'));
+        let url = format!("{}/api/generate", base_url.trim_end_matches('/'));
         match client.post(&url).json(&body).send().await {
             Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
                 Ok(v) => {
@@ -556,7 +564,14 @@ impl RetestHook for LiveRetestHook {
         let backend = overrides.backend.unwrap_or_else(|| combo.backend.clone());
         let mem_config = overrides.mem_config.or_else(|| combo.mem_config.clone());
 
-        let dir = super::corpus_v2_dir();
+        let dir = match super::corpus_v2_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                return RetestResult::Failure {
+                    error_class: format!("corpus_v2_dir_not_configured: {e}"),
+                }
+            }
+        };
         let cases = match super::read_manifest_v2(&dir) {
             Ok(c) if !c.is_empty() => c,
             Ok(_) => {

@@ -54,10 +54,6 @@ use crate::tool::RustTool;
 // ---------------------------------------------------------------------------
 
 const VALID_BRIEFING_TYPES: &[&str] = &["morning", "afternoon"];
-// PII remediation note (2026-07): real functional default (the remote script
-// path this tool SSHes to and executes on the fleet host) — left unchanged,
-// not guess-redacted; flagged for operator review before any public release.
-const DEFAULT_SCRIPT: &str = "/usr/bin/python3 <path>/vigil/briefing.py";
 const DEFAULT_REPO: &str = "lumina-vigil";
 
 fn validate_briefing_type(briefing_type: &str) -> Result<(), ToolError> {
@@ -83,8 +79,10 @@ pub struct VigilConfig {
     pub ssh_user: String,
     /// Path to the SSH private key file — from `VIGIL_SSH_KEY_PATH`.
     pub ssh_key_path: Option<String>,
-    /// Remote briefing script invocation — from `VIGIL_SCRIPT`.
-    pub script: String,
+    /// Remote briefing script invocation — from `VIGIL_SCRIPT`. No compiled-in
+    /// default (PII remediation 2026-07): required at runtime, see
+    /// [`VigilConfig::require_script`].
+    pub script: Option<String>,
     /// Gitea repo Vigil briefings live in — from `VIGIL_REPO`.
     pub repo: String,
 }
@@ -95,10 +93,7 @@ impl VigilConfig {
             ssh_host: env::var("VIGIL_SSH_HOST").ok().filter(|s| !s.is_empty()),
             ssh_user: env::var("VIGIL_SSH_USER").unwrap_or_else(|_| "root".into()),
             ssh_key_path: env::var("VIGIL_SSH_KEY_PATH").ok().filter(|s| !s.is_empty()),
-            script: env::var("VIGIL_SCRIPT")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DEFAULT_SCRIPT.into()),
+            script: env::var("VIGIL_SCRIPT").ok().filter(|s| !s.is_empty()),
             repo: env::var("VIGIL_REPO")
                 .ok()
                 .filter(|s| !s.is_empty())
@@ -116,6 +111,14 @@ impl VigilConfig {
         self.ssh_key_path
             .as_deref()
             .ok_or_else(|| ToolError::NotConfigured("VIGIL_SSH_KEY_PATH is not set".into()))
+    }
+
+    /// PII remediation (2026-07): `VIGIL_SCRIPT` no longer has a compiled-in
+    /// fleet-host script path fallback — it must be set, or this fails clean.
+    fn require_script(&self) -> Result<&str, ToolError> {
+        self.script
+            .as_deref()
+            .ok_or_else(|| ToolError::NotConfigured("VIGIL_SCRIPT is not set".into()))
     }
 }
 
@@ -229,7 +232,8 @@ impl RustTool for VigilGenerate {
         let briefing_type = args["briefing_type"].as_str().unwrap_or("morning");
         validate_briefing_type(briefing_type)?;
 
-        let command = format!("{} {}", self.config.script, briefing_type);
+        let script = self.config.require_script()?;
+        let command = format!("{script} {briefing_type}");
         let cfg = Arc::clone(&self.config);
         let output = tokio::task::spawn_blocking(move || ssh_exec(&cfg, &command, 120))
             .await
@@ -347,12 +351,16 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    /// Test-fixture script path — stands in for the real `VIGIL_SCRIPT` value,
+    /// which has no compiled-in default (PII remediation 2026-07).
+    const TEST_SCRIPT: &str = "/opt/test-fixture/vigil/briefing.py";
+
     fn test_config() -> Arc<VigilConfig> {
         Arc::new(VigilConfig {
             ssh_host: None,
             ssh_user: "root".into(),
             ssh_key_path: None,
-            script: DEFAULT_SCRIPT.into(),
+            script: Some(TEST_SCRIPT.into()),
             repo: DEFAULT_REPO.into(),
         })
     }
@@ -485,6 +493,29 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_vigil_generate_not_configured_without_script() {
+        // PII remediation (2026-07): VIGIL_SCRIPT has no compiled-in default —
+        // missing it must fail clean with NotConfigured, not panic or run a
+        // guessed command.
+        let cfg = Arc::new(VigilConfig {
+            ssh_host: Some("127.0.0.1".into()),
+            ssh_user: "root".into(),
+            ssh_key_path: Some("/tmp/nonexistent-key".into()),
+            script: None,
+            repo: DEFAULT_REPO.into(),
+        });
+        let tool = VigilGenerate { config: cfg };
+        let err = tool
+            .execute(json!({"briefing_type": "morning"}))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::NotConfigured(msg) => assert!(msg.contains("VIGIL_SCRIPT")),
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
+    }
+
     // --- infra-leak genericization ----------------------------------------
 
     #[test]
@@ -493,7 +524,7 @@ mod tests {
             ssh_host: Some("127.0.0.1".into()),
             ssh_user: "root".into(),
             ssh_key_path: Some("/tmp/nonexistent-key".into()),
-            script: DEFAULT_SCRIPT.into(),
+            script: Some(TEST_SCRIPT.into()),
             repo: DEFAULT_REPO.into(),
         };
         let msg = match ssh_exec(&cfg, "true", 2).expect_err("unroutable host must error") {

@@ -635,7 +635,14 @@ pub async fn run_dim2(
 pub fn load_s83_referenced_explicit_scenarios(
     reference_ids: &[String],
 ) -> (Vec<crate::intake::agent::Scenario>, Vec<String>) {
-    let dir = crate::intake::code::corpus_dir();
+    let dir = match crate::intake::code::corpus_dir() {
+        Ok(d) => d,
+        Err(_) => {
+            // INTAKE_CORPUS_DIR not configured → all referenced ids are
+            // "missing"; conversational chains still run. Not a crash.
+            return (Vec::new(), reference_ids.to_vec());
+        }
+    };
     let all = match crate::intake::agent::read_scenarios(&dir) {
         Ok(s) => s,
         Err(_) => {

@@ -256,18 +256,18 @@ async fn probe_dgem(client: &Client) -> Value {
     }
 }
 
-/// Resolve the chord proxy base URL. Co-located with this tool, so when
-/// `CHORD_PROXY_URL` is unset we default to the local chord port (8099).
-fn chord_proxy_base() -> String {
-    // NOTE: hardcoded loopback fallback (functional default, not a comment/test
-    // literal) — left unchanged per remediation policy on suspected real runtime
-    // literals; flagged in the remediation report rather than guessed at.
-    env_url("CHORD_PROXY_URL").unwrap_or_else(|| "http://127.0.0.1:8099".to_string())
+/// Resolve the chord proxy base URL from `CHORD_PROXY_URL`. `None` when unset
+/// — PII remediation (2026-07): the compiled-in local-loopback fallback was
+/// removed; callers now report `not_configured` instead of guessing a host.
+fn chord_proxy_base() -> Option<String> {
+    env_url("CHORD_PROXY_URL")
 }
 
 /// Chord proxy `/health` — includes version/commit/terminus_rs after step 5.
 async fn probe_chord(client: &Client) -> Value {
-    let base = chord_proxy_base();
+    let Some(base) = chord_proxy_base() else {
+        return not_configured();
+    };
     match get_json(client, &format!("{base}/health")).await {
         Some(v) => json!({
             "status": "reachable",
@@ -281,34 +281,31 @@ async fn probe_chord(client: &Client) -> Value {
 
 /// Resolve the chord control API base URL. Prefers `CHORD_CONTROL_URL`; else
 /// derives from `CHORD_PROXY_URL` host with the control port
-/// (`CHORD_CONTROL_PORT`, default 8090). Co-located with this tool, so when no
-/// env is set / derivation fails we default to the local control port
-/// (local loopback, port 8090).
-fn chord_control_base() -> String {
+/// (`CHORD_CONTROL_PORT`, default 8090). `None` when neither yields a usable
+/// base — PII remediation (2026-07): the compiled-in local-loopback fallback
+/// was removed; callers now report `not_configured` instead of guessing a
+/// host.
+fn chord_control_base() -> Option<String> {
     if let Some(url) = env_url("CHORD_CONTROL_URL") {
-        return url;
+        return Some(url);
     }
     let port = env::var("CHORD_CONTROL_PORT")
         .ok()
         .and_then(|s| s.trim().parse::<u16>().ok())
         .unwrap_or(8090);
-    let local = format!("http://127.0.0.1:{port}");
-    let Some(proxy) = env_url("CHORD_PROXY_URL") else {
-        return local;
-    };
+    let proxy = env_url("CHORD_PROXY_URL")?;
     // Swap the port on the proxy URL host. Best-effort string surgery.
-    if let Ok(mut url) = reqwest::Url::parse(&proxy) {
-        if url.set_port(Some(port)).is_ok() {
-            return url.as_str().trim_end_matches('/').to_string();
-        }
-    }
-    local
+    let mut url = reqwest::Url::parse(&proxy).ok()?;
+    url.set_port(Some(port)).ok()?;
+    Some(url.as_str().trim_end_matches('/').to_string())
 }
 
 /// Inference state from the chord control model registry (`GET /api/models`).
 /// Reports hot_model / warm_models / vram where derivable, never erroring.
 async fn probe_inference(client: &Client) -> Value {
-    let base = chord_control_base();
+    let Some(base) = chord_control_base() else {
+        return not_configured();
+    };
     let Some(body) = get_json(client, &format!("{base}/api/models")).await else {
         return json!({"status": "unreachable"});
     };
@@ -572,19 +569,20 @@ mod tests {
     }
 
     #[test]
-    fn chord_defaults_to_localhost_when_unset() {
+    fn chord_is_not_configured_when_unset() {
         std::env::remove_var("CHORD_PROXY_URL");
         std::env::remove_var("CHORD_CONTROL_URL");
         std::env::remove_var("CHORD_CONTROL_PORT");
-        // Co-located defaults.
-        assert_eq!(chord_proxy_base(), "http://127.0.0.1:8099"); // pii-test-fixture
-        assert_eq!(chord_control_base(), "http://127.0.0.1:8090"); // pii-test-fixture
+        // PII remediation (2026-07): no compiled-in loopback fallback anymore —
+        // both resolve to None (callers report `not_configured`).
+        assert_eq!(chord_proxy_base(), None);
+        assert_eq!(chord_control_base(), None);
 
         // Explicit env still honoured.
         std::env::set_var("CHORD_PROXY_URL", "http://chord:9000");
-        assert_eq!(chord_proxy_base(), "http://chord:9000");
+        assert_eq!(chord_proxy_base(), Some("http://chord:9000".to_string()));
         // Control derived from proxy host + control port.
-        assert_eq!(chord_control_base(), "http://chord:8090");
+        assert_eq!(chord_control_base(), Some("http://chord:8090".to_string()));
         std::env::remove_var("CHORD_PROXY_URL");
     }
 

@@ -70,11 +70,6 @@ use crate::tool::RustTool;
 // Constants
 // ---------------------------------------------------------------------------
 
-// PII remediation note (2026-07): these two are real functional defaults
-// (skill directories on the fleet host) — left unchanged, not guess-redacted;
-// flagged for operator review before any public release.
-const DEFAULT_ACTIVE_DIR: &str = "<path>/skills/active";
-const DEFAULT_PROPOSED_DIR: &str = "<path>/skills/proposed";
 const DEFAULT_AGENT: &str = "lumina";
 const DEFAULT_LICENSE: &str = "MIT";
 const DEFAULT_VERSION: &str = "1.0";
@@ -117,9 +112,12 @@ pub struct SkillsConfig {
     /// Path to the SSH private key file — from `SKILLS_SSH_KEY_PATH`.
     pub ssh_key_path: Option<String>,
     /// Directory containing approved/live skills — from `SKILLS_ACTIVE_DIR`.
-    pub active_dir: String,
-    /// Directory containing skills pending review — from `SKILLS_PROPOSED_DIR`.
-    pub proposed_dir: String,
+    /// No compiled-in default (PII remediation 2026-07): required at runtime.
+    pub active_dir: Option<String>,
+    /// Directory containing skills pending review — from
+    /// `SKILLS_PROPOSED_DIR`. No compiled-in default (PII remediation
+    /// 2026-07): required at runtime.
+    pub proposed_dir: Option<String>,
 }
 
 impl SkillsConfig {
@@ -128,14 +126,8 @@ impl SkillsConfig {
             ssh_host: env::var("SKILLS_SSH_HOST").ok().filter(|s| !s.is_empty()),
             ssh_user: env::var("SKILLS_SSH_USER").unwrap_or_else(|_| "root".into()),
             ssh_key_path: env::var("SKILLS_SSH_KEY_PATH").ok().filter(|s| !s.is_empty()),
-            active_dir: env::var("SKILLS_ACTIVE_DIR")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DEFAULT_ACTIVE_DIR.into()),
-            proposed_dir: env::var("SKILLS_PROPOSED_DIR")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DEFAULT_PROPOSED_DIR.into()),
+            active_dir: env::var("SKILLS_ACTIVE_DIR").ok().filter(|s| !s.is_empty()),
+            proposed_dir: env::var("SKILLS_PROPOSED_DIR").ok().filter(|s| !s.is_empty()),
         }
     }
 
@@ -149,6 +141,22 @@ impl SkillsConfig {
         self.ssh_key_path
             .as_deref()
             .ok_or_else(|| ToolError::NotConfigured("SKILLS_SSH_KEY_PATH is not set".into()))
+    }
+
+    /// PII remediation (2026-07): `SKILLS_ACTIVE_DIR` no longer has a
+    /// compiled-in fleet-host directory fallback.
+    fn require_active_dir(&self) -> Result<&str, ToolError> {
+        self.active_dir
+            .as_deref()
+            .ok_or_else(|| ToolError::NotConfigured("SKILLS_ACTIVE_DIR is not set".into()))
+    }
+
+    /// PII remediation (2026-07): `SKILLS_PROPOSED_DIR` no longer has a
+    /// compiled-in fleet-host directory fallback.
+    fn require_proposed_dir(&self) -> Result<&str, ToolError> {
+        self.proposed_dir
+            .as_deref()
+            .ok_or_else(|| ToolError::NotConfigured("SKILLS_PROPOSED_DIR is not set".into()))
     }
 }
 
@@ -312,7 +320,7 @@ impl RustTool for SkillsList {
     }
 
     async fn execute(&self, _args: Value) -> Result<String, ToolError> {
-        let active_dir = self.config.active_dir.clone();
+        let active_dir = self.config.require_active_dir()?.to_string();
         let safe_dir = escape_single_quotes(&active_dir);
         // List immediate subdirectories, then cat each SKILL.md preceded by a
         // unique marker so we can split the combined stdout back into
@@ -418,8 +426,8 @@ impl RustTool for SkillsRead {
         // Check active/ first, then fall back to proposed/ — matches the
         // live server, which found a proposed-only skill via skills_read.
         for (dir, status) in [
-            (self.config.active_dir.clone(), "active"),
-            (self.config.proposed_dir.clone(), "proposed"),
+            (self.config.require_active_dir()?.to_string(), "active"),
+            (self.config.require_proposed_dir()?.to_string(), "proposed"),
         ] {
             let path = format!("{dir}/{skill_name}/SKILL.md");
             let safe_path = escape_single_quotes(&path);
@@ -529,9 +537,9 @@ impl RustTool for SkillsCreate {
         validate_skill_name(skill_name)?;
 
         let (dir, location) = if proposed {
-            (self.config.proposed_dir.clone(), "proposed")
+            (self.config.require_proposed_dir()?.to_string(), "proposed")
         } else {
-            (self.config.active_dir.clone(), "active")
+            (self.config.require_active_dir()?.to_string(), "active")
         };
 
         let skill_dir = format!("{dir}/{skill_name}");
@@ -646,14 +654,39 @@ pub fn register(registry: &mut ToolRegistry) {
 mod tests {
     use super::*;
 
+    /// Test-fixture values standing in for `SKILLS_ACTIVE_DIR` /
+    /// `SKILLS_PROPOSED_DIR`, which have no compiled-in default (PII
+    /// remediation 2026-07).
+    const TEST_ACTIVE_DIR: &str = "/opt/test-fixture/skills/active";
+    const TEST_PROPOSED_DIR: &str = "/opt/test-fixture/skills/proposed";
+
     fn test_config() -> Arc<SkillsConfig> {
         Arc::new(SkillsConfig {
             ssh_host: None,
             ssh_user: "root".into(),
             ssh_key_path: None,
-            active_dir: DEFAULT_ACTIVE_DIR.into(),
-            proposed_dir: DEFAULT_PROPOSED_DIR.into(),
+            active_dir: Some(TEST_ACTIVE_DIR.into()),
+            proposed_dir: Some(TEST_PROPOSED_DIR.into()),
         })
+    }
+
+    #[tokio::test]
+    async fn test_skills_list_not_configured_without_active_dir() {
+        // PII remediation (2026-07): SKILLS_ACTIVE_DIR has no compiled-in
+        // default — missing it must fail clean with NotConfigured.
+        let cfg = Arc::new(SkillsConfig {
+            ssh_host: Some("127.0.0.1".into()),
+            ssh_user: "root".into(),
+            ssh_key_path: Some("/tmp/nonexistent-key".into()),
+            active_dir: None,
+            proposed_dir: Some(TEST_PROPOSED_DIR.into()),
+        });
+        let tool = SkillsList { config: cfg };
+        let err = tool.execute(json!({})).await.unwrap_err();
+        match err {
+            ToolError::NotConfigured(msg) => assert!(msg.contains("SKILLS_ACTIVE_DIR")),
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
     }
 
     // --- validate_skill_name ---------------------------------------------

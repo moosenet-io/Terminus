@@ -812,7 +812,13 @@ pub async fn run(
 /// [`crate::intake::code::toolchain_coverage_gaps`] (unit-tested there); this
 /// wrapper only does the I/O (manifest read) and logging.
 fn warn_uncovered_toolchain_languages() {
-    let dir = intake::code_v2::corpus_v2_dir();
+    let dir = match intake::code_v2::corpus_v2_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("corpus-coverage check skipped: {e}");
+            return;
+        }
+    };
     let cases = match intake::code_v2::read_manifest_v2(&dir) {
         Ok(c) => c,
         Err(e) => {

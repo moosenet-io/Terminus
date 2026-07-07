@@ -43,27 +43,6 @@ use crate::tool::RustTool;
 // Allowlist (identical to the Python PLAYBOOK_ALLOWLIST)
 // ---------------------------------------------------------------------------
 
-/// The default allowlist — byte-for-byte the same set the Python source ships.
-/// Overridable via `ANSIBLE_PLAYBOOK_ALLOWLIST` (comma-separated) for ops, but the
-/// default exactly matches the Python so behaviour is identical out of the box.
-///
-/// PII remediation note (2026-07): these are real, functional security-gate
-/// values (the exact playbook names this allowlist matches against on the
-/// real ops control node). Left unchanged rather than guess-redacted —
-/// renaming them would silently change what this gate actually permits;
-/// flagged for operator review before any public release.
-const DEFAULT_ALLOWLIST: &[&str] = &[
-    "deploy-<host>-db",
-    "deploy-<host>-ct",
-    "ping",
-    "deploy-<secret-manager>",
-    "install-node-exporter",
-    "generate-prometheus-targets",
-    "rotate-<matrix-server>-token",
-    "deploy-plane",
-    "restart-<host>",
-];
-
 // ---------------------------------------------------------------------------
 // AnsibleConfig
 // ---------------------------------------------------------------------------
@@ -82,9 +61,13 @@ pub struct AnsibleConfig {
     pub playbook_root: Option<String>,
     /// Inventory file path on the host — from `ANSIBLE_INVENTORY_PATH`.
     pub inventory_path: Option<String>,
-    /// Names of allowlisted playbooks. Defaults to [`DEFAULT_ALLOWLIST`]; can be
-    /// overridden via `ANSIBLE_PLAYBOOK_ALLOWLIST` (comma-separated).
-    pub allowlist: Vec<String>,
+    /// Names of allowlisted playbooks — from `ANSIBLE_PLAYBOOK_ALLOWLIST`
+    /// (comma-separated). No compiled-in default (PII remediation 2026-07):
+    /// required at runtime, see [`AnsibleConfig::require_allowlist`]. `None`
+    /// when the var is unset or empty — every playbook is refused (fail
+    /// closed), never a guessed or silently-substituted set of real
+    /// playbook names.
+    pub allowlist: Option<Vec<String>>,
 }
 
 impl AnsibleConfig {
@@ -97,12 +80,13 @@ impl AnsibleConfig {
         let inventory_path = env::var("ANSIBLE_INVENTORY_PATH").ok();
 
         let allowlist = match env::var("ANSIBLE_PLAYBOOK_ALLOWLIST") {
-            Ok(raw) if !raw.trim().is_empty() => raw
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
-            _ => DEFAULT_ALLOWLIST.iter().map(|s| s.to_string()).collect(),
+            Ok(raw) if !raw.trim().is_empty() => Some(
+                raw.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            ),
+            _ => None,
         };
 
         AnsibleConfig {
@@ -115,9 +99,20 @@ impl AnsibleConfig {
         }
     }
 
-    /// Returns `true` if `name` is an allowlisted playbook.
+    /// Returns `true` if `name` is an allowlisted playbook. Always `false`
+    /// when `ANSIBLE_PLAYBOOK_ALLOWLIST` is unset (fail closed).
     pub fn is_allowed(&self, name: &str) -> bool {
-        self.allowlist.iter().any(|p| p == name)
+        self.allowlist
+            .as_ref()
+            .is_some_and(|list| list.iter().any(|p| p == name))
+    }
+
+    /// PII remediation (2026-07): `ANSIBLE_PLAYBOOK_ALLOWLIST` no longer has
+    /// a compiled-in fallback list of real playbook names.
+    fn require_allowlist(&self) -> Result<&[String], ToolError> {
+        self.allowlist
+            .as_deref()
+            .ok_or_else(|| ToolError::NotConfigured("ANSIBLE_PLAYBOOK_ALLOWLIST is not set".into()))
     }
 }
 
@@ -295,6 +290,10 @@ impl RustTool for AnsibleRunPlaybook {
         }
 
         // --- Enforce the allowlist (same refusal shape as Python) ---
+        // PII remediation (2026-07): no compiled-in allowlist to fall back
+        // to — require the operator to have actually configured one, rather
+        // than silently refusing every playbook forever with no diagnostic.
+        let allowlist = self.config.require_allowlist()?;
         if !self.config.is_allowed(&playbook_name) {
             return Ok(json!({
                 "allowed": false,
@@ -302,8 +301,7 @@ impl RustTool for AnsibleRunPlaybook {
                 "returncode": Value::Null,
                 "stdout": "",
                 "stderr": format!(
-                    "Playbook '{}' is not on the allowlist: {:?}",
-                    playbook_name, self.config.allowlist
+                    "Playbook '{playbook_name}' is not on the allowlist: {allowlist:?}"
                 ),
             })
             .to_string());
@@ -445,7 +443,8 @@ impl RustTool for AnsibleListPlaybooks {
             .to_string());
         }
 
-        let playbooks = parse_playbook_listing(&result.stdout, &self.config.allowlist);
+        let allowlist = self.config.require_allowlist()?;
+        let playbooks = parse_playbook_listing(&result.stdout, allowlist);
         let allowed_count = playbooks
             .iter()
             .filter(|p| p["allowed"].as_bool().unwrap_or(false))
@@ -454,7 +453,7 @@ impl RustTool for AnsibleListPlaybooks {
         Ok(json!({
             "total": playbooks.len(),
             "allowed_count": allowed_count,
-            "allowlist": self.config.allowlist,
+            "allowlist": allowlist,
             "playbooks": playbooks,
         })
         .to_string())
@@ -620,6 +619,10 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    /// Test-fixture allowlist standing in for the real playbook names, which
+    /// have no compiled-in default (PII remediation 2026-07).
+    const TEST_ALLOWLIST: &[&str] = &["test-playbook-a", "test-playbook-b", "ping"];
+
     fn test_config() -> Arc<AnsibleConfig> {
         Arc::new(AnsibleConfig {
             host: None,
@@ -627,7 +630,7 @@ mod tests {
             ssh_key: None,
             playbook_root: None,
             inventory_path: None,
-            allowlist: DEFAULT_ALLOWLIST.iter().map(|s| s.to_string()).collect(),
+            allowlist: Some(TEST_ALLOWLIST.iter().map(|s| s.to_string()).collect()),
         })
     }
 
@@ -637,22 +640,36 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 1: default allowlist matches the Python source exactly
+    // 1: ANSIBLE_PLAYBOOK_ALLOWLIST has no compiled-in default (PII
+    // remediation 2026-07) — missing it must resolve to `None` (fail
+    // closed), and `from_env` must parse it correctly when present.
     // ------------------------------------------------------------------
     #[test]
-    fn test_default_allowlist_matches_python() {
-        let expected = [
-            "deploy-<host>-db",
-            "deploy-<host>-ct",
-            "ping",
-            "deploy-<secret-manager>",
-            "install-node-exporter",
-            "generate-prometheus-targets",
-            "rotate-<matrix-server>-token",
-            "deploy-plane",
-            "restart-<host>",
-        ];
-        assert_eq!(DEFAULT_ALLOWLIST, &expected);
+    #[serial]
+    fn test_allowlist_not_configured_without_env() {
+        std::env::remove_var("ANSIBLE_PLAYBOOK_ALLOWLIST");
+        let cfg = AnsibleConfig::from_env();
+        assert_eq!(cfg.allowlist, None);
+        match cfg.require_allowlist() {
+            Err(ToolError::NotConfigured(msg)) => assert!(msg.contains("ANSIBLE_PLAYBOOK_ALLOWLIST")),
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
+        // Fail-closed: no playbook is allowed when unconfigured.
+        assert!(!cfg.is_allowed("ping"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_allowlist_parses_from_env() {
+        std::env::set_var("ANSIBLE_PLAYBOOK_ALLOWLIST", "alpha, beta ,gamma");
+        let cfg = AnsibleConfig::from_env();
+        assert_eq!(
+            cfg.allowlist,
+            Some(vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()])
+        );
+        assert!(cfg.is_allowed("beta"));
+        assert!(!cfg.is_allowed("ping"));
+        std::env::remove_var("ANSIBLE_PLAYBOOK_ALLOWLIST");
     }
 
     // ------------------------------------------------------------------
@@ -662,7 +679,7 @@ mod tests {
     fn test_is_allowed() {
         let cfg = test_config();
         assert!(cfg.is_allowed("ping"));
-        assert!(cfg.is_allowed("restart-<host>"));
+        assert!(cfg.is_allowed("test-playbook-a"));
         assert!(!cfg.is_allowed("rm-rf"));
         assert!(!cfg.is_allowed("ping; rm -rf /"));
         assert!(!cfg.is_allowed(""));
@@ -680,7 +697,7 @@ mod tests {
             ssh_key: None,
             playbook_root: None,
             inventory_path: None,
-            allowlist: vec!["alpha".into(), "beta".into()],
+            allowlist: Some(vec!["alpha".into(), "beta".into()]),
         };
         assert!(cfg.is_allowed("alpha"));
         assert!(cfg.is_allowed("beta"));

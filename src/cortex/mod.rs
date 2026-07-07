@@ -213,17 +213,6 @@ use audit::validate_repo_url;
 const KNOWN_REPOS: &[&str] = &["lumina-fleet", "lumina-terminus"];
 const MAX_TEXT_LEN: usize = 2000;
 
-/// Assumed remote invocation shape, mirroring `sentinel::DEFAULT_SCRIPT` /
-/// `crucible::DEFAULT_SCRIPT`'s one-script-many-subcommands convention.
-/// **Not observed on the wire** — the fleet host was unreachable for the
-/// whole porting session. Audit against the real source-host implementation before relying
-/// on this in production.
-///
-/// PII remediation note (2026-07): real functional default (remote script
-/// path on the fleet host) — left unchanged, not guess-redacted; flagged for
-/// operator review before any public release.
-const DEFAULT_SCRIPT: &str = "/usr/bin/python3 <path>/cortex/ops.py";
-
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -233,7 +222,10 @@ pub struct CortexConfig {
     pub ssh_host: Option<String>,
     pub ssh_user: String,
     pub ssh_key_path: Option<String>,
-    pub script: String,
+    /// Remote script invocation — from `CORTEX_SCRIPT`. No compiled-in
+    /// default (PII remediation 2026-07): required at runtime, see
+    /// [`CortexConfig::require_script`].
+    pub script: Option<String>,
 }
 
 impl CortexConfig {
@@ -244,10 +236,7 @@ impl CortexConfig {
             ssh_key_path: env::var("CORTEX_SSH_KEY_PATH")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            script: env::var("CORTEX_SCRIPT")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DEFAULT_SCRIPT.into()),
+            script: env::var("CORTEX_SCRIPT").ok().filter(|s| !s.is_empty()),
         }
     }
 
@@ -261,6 +250,14 @@ impl CortexConfig {
         self.ssh_key_path
             .as_deref()
             .ok_or_else(|| ToolError::NotConfigured("CORTEX_SSH_KEY_PATH is not set".into()))
+    }
+
+    /// PII remediation (2026-07): `CORTEX_SCRIPT` no longer has a
+    /// compiled-in fleet-host script path fallback.
+    fn require_script(&self) -> Result<&str, ToolError> {
+        self.script
+            .as_deref()
+            .ok_or_else(|| ToolError::NotConfigured("CORTEX_SCRIPT is not set".into()))
     }
 }
 
@@ -410,7 +407,8 @@ async fn run_subcommand(
     timeout_secs: u64,
 ) -> Result<String, ToolError> {
     let cfg = Arc::clone(config);
-    let command = build_command(&cfg.script, subcommand, &payload);
+    let script = cfg.require_script()?.to_string();
+    let command = build_command(&script, subcommand, &payload);
     let output = tokio::task::spawn_blocking(move || ssh_exec(&cfg, &command, timeout_secs))
         .await
         .map_err(|e| ToolError::Execution(format!("Task join error: {e}")))??;
@@ -441,7 +439,8 @@ async fn run_subcommand_degrading(
     on_degrade: impl FnOnce(String) -> Value,
 ) -> Result<String, ToolError> {
     let cfg = Arc::clone(config);
-    let command = build_command(&cfg.script, subcommand, &payload);
+    let script = cfg.require_script()?.to_string();
+    let command = build_command(&script, subcommand, &payload);
     let result = tokio::task::spawn_blocking(move || ssh_exec(&cfg, &command, timeout_secs))
         .await
         .map_err(|e| ToolError::Execution(format!("Task join error: {e}")))?;
@@ -962,12 +961,16 @@ pub fn register(registry: &mut ToolRegistry) {
 mod tests {
     use super::*;
 
+    /// Test-fixture value standing in for `CORTEX_SCRIPT`, which has no
+    /// compiled-in default (PII remediation 2026-07).
+    const TEST_SCRIPT: &str = "/opt/test-fixture/cortex/ops.py";
+
     fn test_config() -> Arc<CortexConfig> {
         Arc::new(CortexConfig {
             ssh_host: None,
             ssh_user: "root".into(),
             ssh_key_path: None,
-            script: DEFAULT_SCRIPT.into(),
+            script: Some(TEST_SCRIPT.into()),
         })
     }
 
@@ -1175,6 +1178,27 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_stats_not_configured_without_script() {
+        // PII remediation (2026-07): CORTEX_SCRIPT has no compiled-in
+        // default — missing it must fail clean with NotConfigured.
+        let cfg = Arc::new(CortexConfig {
+            ssh_host: Some("127.0.0.1".into()),
+            ssh_user: "root".into(),
+            ssh_key_path: Some("/tmp/nonexistent-key".into()),
+            script: None,
+        });
+        let tool = CortexStats { config: cfg };
+        let err = tool
+            .execute(json!({"repo": "lumina-terminus"}))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::NotConfigured(msg) => assert!(msg.contains("CORTEX_SCRIPT")),
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
+    }
+
     // --- Flavor-B degrade shape: verified-live-shape reproduction ------------
     // These exercise `run_subcommand_degrading`'s fallback branch directly by
     // driving it through a tool whose backend is unreachable (no SSH host
@@ -1206,7 +1230,7 @@ mod tests {
             ssh_host: Some("127.0.0.1".into()),
             ssh_user: "root".into(),
             ssh_key_path: Some("/nonexistent/cortex-test-key".into()),
-            script: DEFAULT_SCRIPT.into(),
+            script: Some(TEST_SCRIPT.into()),
         })
     }
 
@@ -1283,7 +1307,7 @@ mod tests {
             ssh_host: Some("127.0.0.1".into()),
             ssh_user: "root".into(),
             ssh_key_path: Some("/tmp/nonexistent-key".into()),
-            script: DEFAULT_SCRIPT.into(),
+            script: Some(TEST_SCRIPT.into()),
         };
         let msg = match ssh_exec(&cfg, "true", 2).expect_err("unroutable host must error") {
             ToolError::Execution(m) => m,

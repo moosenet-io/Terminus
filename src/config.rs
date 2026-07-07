@@ -295,20 +295,19 @@ pub fn breakfix_claude_model() -> String {
 
 /// Base URL of the local CPU-backed Ollama fallback, from the SAME
 /// `OLLAMA_CPU_URL` var [`ollama_secondary_url`] reads (one env var, one
-/// meaning: the fleet's CPU-backed Ollama). Unlike that sibling accessor
-/// (which returns `None` on unset — its callers raise `NotConfigured`), this
-/// one defaults to a local loopback address on port 11435 per the Phase-4 spec: breakfix's
-/// fallback reasoning must degrade gracefully even on a host where the var
-/// was never set, rather than failing the whole breakfix attempt over a
-/// missing config for what is already a best-effort fallback path.
+/// meaning: the fleet's CPU-backed Ollama).
+///
+/// PII remediation (2026-07): this used to default to a compiled-in loopback
+/// address when unset. Per explicit operator decision, that real-value
+/// fallback has been removed. This is now a thin, `None`-on-unset alias for
+/// [`ollama_secondary_url`] (kept as a distinct name for readability at
+/// breakfix call sites) — callers must treat `None` as "this fallback
+/// backend is unavailable," not substitute a guessed local address.
 /// Deliberately NOT the GPU-serving Ollama's port/backend (see module doc
 /// above — the whole point of breakfix is diagnosing a possibly-wedged GPU,
 /// so its own reasoning must never contend for that GPU).
-pub fn breakfix_ollama_cpu_url() -> String {
-    // NOTE: hardcoded loopback fallback (functional default, not a comment/test
-    // literal) — left unchanged per remediation policy on suspected real runtime
-    // literals; flagged in the remediation report rather than guessed at.
-    env_nonempty("OLLAMA_CPU_URL").unwrap_or_else(|| "http://127.0.0.1:11435".to_string())
+pub fn breakfix_ollama_cpu_url() -> Option<String> {
+    ollama_secondary_url()
 }
 
 /// Model requested from the CPU Ollama fallback, from
@@ -640,17 +639,16 @@ mod tests {
 
     #[test]
     #[serial]
-    fn breakfix_ollama_fallback_defaults_unlike_sibling_accessor() {
+    fn breakfix_ollama_fallback_matches_sibling_accessor() {
         std::env::remove_var("OLLAMA_CPU_URL");
         std::env::remove_var("MINT_BREAKFIX_FALLBACK_MODEL");
-        // Unlike `ollama_secondary_url()` (None on unset), the breakfix
-        // accessor for the SAME var defaults rather than failing.
+        // Both accessors now agree: None on unset, no compiled-in fallback.
         assert_eq!(ollama_secondary_url(), None);
-        assert_eq!(breakfix_ollama_cpu_url(), "http://127.0.0.1:11435"); // pii-test-fixture
+        assert_eq!(breakfix_ollama_cpu_url(), None);
         assert_eq!(breakfix_fallback_model(), "qwen2.5:7b");
-        std::env::set_var("OLLAMA_CPU_URL", "http://<internal-ip>:11435"); // pii-test-fixture
+        std::env::set_var("OLLAMA_CPU_URL", "http://198.51.100.5:11435"); // pii-test-fixture
         std::env::set_var("MINT_BREAKFIX_FALLBACK_MODEL", "phi3:mini");
-        assert_eq!(breakfix_ollama_cpu_url(), "http://<internal-ip>:11435"); // pii-test-fixture
+        assert_eq!(breakfix_ollama_cpu_url(), Some("http://198.51.100.5:11435".to_string())); // pii-test-fixture
         assert_eq!(breakfix_fallback_model(), "phi3:mini");
         std::env::remove_var("OLLAMA_CPU_URL");
         std::env::remove_var("MINT_BREAKFIX_FALLBACK_MODEL");

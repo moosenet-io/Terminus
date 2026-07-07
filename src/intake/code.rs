@@ -31,20 +31,16 @@ use crate::error::ToolError;
 use crate::intake::context;
 use crate::intake::storage::{self, CodeRunRow};
 
-/// Default corpus location on the sweep-harness host; overridable via `INTAKE_CORPUS_DIR`.
-///
-/// PII remediation note (2026-07): real, functional default path — left
-/// unchanged rather than guess-redacted; flagged for operator review before
-/// any public release.
-const DEFAULT_CORPUS_DIR: &str = "<path>/intake-corpus";
-
-/// Resolve the corpus directory.
-pub fn corpus_dir() -> PathBuf {
+/// Resolve the corpus directory from `INTAKE_CORPUS_DIR`. No compiled-in
+/// default (PII remediation 2026-07): required at runtime — fails clean
+/// with `NotConfigured` rather than silently pointing at a real
+/// sweep-harness host path.
+pub fn corpus_dir() -> Result<PathBuf, ToolError> {
     std::env::var("INTAKE_CORPUS_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CORPUS_DIR))
+        .ok_or_else(|| ToolError::NotConfigured("INTAKE_CORPUS_DIR is not set".into()))
 }
 
 /// One manifest entry. Mirrors `tests/intake-corpus/manifest.json`.
@@ -624,7 +620,7 @@ pub async fn run_code_suite_limited(
     profile_id: uuid::Uuid,
     case_limit: Option<usize>,
 ) -> Result<CodeSuiteOutcome, ToolError> {
-    let dir = corpus_dir();
+    let dir = corpus_dir()?;
     let all = read_manifest(&dir)?;
     let mut cases = filter_cases(&all, languages);
     if let Some(n) = case_limit {
@@ -679,9 +675,14 @@ mod tests {
     #[test]
     fn corpus_dir_env_override() {
         std::env::set_var("INTAKE_CORPUS_DIR", "/tmp/corpus-x");
-        assert_eq!(corpus_dir(), PathBuf::from("/tmp/corpus-x"));
+        assert_eq!(corpus_dir().unwrap(), PathBuf::from("/tmp/corpus-x"));
         std::env::remove_var("INTAKE_CORPUS_DIR");
-        assert_eq!(corpus_dir(), PathBuf::from(DEFAULT_CORPUS_DIR));
+        // PII remediation (2026-07): INTAKE_CORPUS_DIR has no compiled-in
+        // default anymore — missing it must fail clean with NotConfigured.
+        match corpus_dir() {
+            Err(ToolError::NotConfigured(msg)) => assert!(msg.contains("INTAKE_CORPUS_DIR")),
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
     }
 
     #[test]

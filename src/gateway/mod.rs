@@ -51,11 +51,6 @@ use crate::tool::RustTool;
 // ---------------------------------------------------------------------------
 
 const DEFAULT_GATEWAY_URL: &str = "http://localhost:8080"; // pii-test-fixture
-// PII remediation note (2026-07): real functional default (remote command
-// path on the fleet host) — left unchanged, not guess-redacted; flagged for
-// operator review before any public release.
-const DEFAULT_COMPOSER_CMD: &str = "set -a && . <path>/axon/.env && set +a && \
-     python3 <path>/dashboard/composer.py 2>&1 | tail -10";
 
 /// Configuration sourced entirely from environment variables.
 #[derive(Debug, Clone)]
@@ -70,8 +65,10 @@ pub struct GatewayConfig {
     pub gateway_url: String,
     /// API key sent as `x-api-key` — from `DASHBOARD_API_KEY`.
     pub api_key: Option<String>,
-    /// Command used by `dashboard_refresh` — from `GATEWAY_COMPOSER_CMD`.
-    pub composer_cmd: String,
+    /// Command used by `dashboard_refresh` — from `GATEWAY_COMPOSER_CMD`. No
+    /// compiled-in default (PII remediation 2026-07): required at runtime,
+    /// see [`GatewayConfig::require_composer_cmd`].
+    pub composer_cmd: Option<String>,
 }
 
 impl GatewayConfig {
@@ -85,10 +82,7 @@ impl GatewayConfig {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_GATEWAY_URL.into());
         let api_key = env::var("DASHBOARD_API_KEY").ok().filter(|s| !s.is_empty());
-        let composer_cmd = env::var("GATEWAY_COMPOSER_CMD")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| DEFAULT_COMPOSER_CMD.into());
+        let composer_cmd = env::var("GATEWAY_COMPOSER_CMD").ok().filter(|s| !s.is_empty());
 
         GatewayConfig {
             ssh_host,
@@ -121,6 +115,14 @@ impl GatewayConfig {
         self.api_key
             .as_deref()
             .ok_or_else(|| ToolError::NotConfigured("DASHBOARD_API_KEY is not set".into()))
+    }
+
+    /// PII remediation (2026-07): `GATEWAY_COMPOSER_CMD` no longer has a
+    /// compiled-in fallback command (which embedded a real fleet-host path).
+    fn require_composer_cmd(&self) -> Result<&str, ToolError> {
+        self.composer_cmd
+            .as_deref()
+            .ok_or_else(|| ToolError::NotConfigured("GATEWAY_COMPOSER_CMD is not set".into()))
     }
 }
 
@@ -312,7 +314,7 @@ impl RustTool for DashboardRefresh {
 
     async fn execute(&self, _args: Value) -> Result<String, ToolError> {
         let cfg = Arc::clone(&self.config);
-        let command = cfg.composer_cmd.clone();
+        let command = cfg.require_composer_cmd()?.to_string();
         // 60s timeout to match the Python composer invocation.
         let stdout = tokio::task::spawn_blocking(move || ssh_exec(&cfg, &command, 60))
             .await
@@ -394,6 +396,10 @@ pub fn register(registry: &mut ToolRegistry) {
 mod tests {
     use super::*;
 
+    /// Test-fixture value standing in for `GATEWAY_COMPOSER_CMD`, which has
+    /// no compiled-in default (PII remediation 2026-07).
+    const TEST_COMPOSER_CMD: &str = "/opt/test-fixture/dashboard/composer.py";
+
     fn test_config() -> Arc<GatewayConfig> {
         Arc::new(GatewayConfig {
             ssh_host: None,
@@ -401,7 +407,7 @@ mod tests {
             ssh_key_path: None,
             gateway_url: DEFAULT_GATEWAY_URL.into(),
             api_key: None,
-            composer_cmd: DEFAULT_COMPOSER_CMD.into(),
+            composer_cmd: Some(TEST_COMPOSER_CMD.into()),
         })
     }
 
@@ -488,11 +494,29 @@ mod tests {
             ssh_key_path: None,
             gateway_url: DEFAULT_GATEWAY_URL.into(),
             api_key: None,
-            composer_cmd: DEFAULT_COMPOSER_CMD.into(),
+            composer_cmd: Some(TEST_COMPOSER_CMD.into()),
         };
         assert_eq!(cfg.gateway_url, "http://localhost:8080"); // pii-test-fixture
-        assert!(cfg.composer_cmd.contains("composer.py"));
+        assert!(cfg.composer_cmd.as_deref().unwrap().contains("composer.py"));
         assert_eq!(cfg.ssh_user, "root");
+    }
+
+    #[test]
+    fn test_dashboard_refresh_not_configured_without_composer_cmd() {
+        // PII remediation (2026-07): GATEWAY_COMPOSER_CMD has no compiled-in
+        // default — missing it must fail clean with NotConfigured.
+        let cfg = GatewayConfig {
+            ssh_host: Some("127.0.0.1".into()),
+            ssh_user: "root".into(),
+            ssh_key_path: Some("/tmp/nonexistent-key".into()),
+            gateway_url: DEFAULT_GATEWAY_URL.into(),
+            api_key: None,
+            composer_cmd: None,
+        };
+        match cfg.require_composer_cmd() {
+            Err(ToolError::NotConfigured(msg)) => assert!(msg.contains("GATEWAY_COMPOSER_CMD")),
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
     }
 
     #[test]
@@ -552,7 +576,7 @@ mod tests {
             ssh_key_path: Some("/tmp/key".into()),
             gateway_url: DEFAULT_GATEWAY_URL.into(),
             api_key: Some("k".into()),
-            composer_cmd: DEFAULT_COMPOSER_CMD.into(),
+            composer_cmd: Some(TEST_COMPOSER_CMD.into()),
         });
         let tool = DashboardEndpointTool {
             config: cfg,
@@ -588,7 +612,7 @@ mod tests {
             ssh_key_path: Some("/tmp/nonexistent-key".into()),
             gateway_url: DEFAULT_GATEWAY_URL.into(),
             api_key: Some("k".into()),
-            composer_cmd: DEFAULT_COMPOSER_CMD.into(),
+            composer_cmd: Some(TEST_COMPOSER_CMD.into()),
         };
         let msg = match ssh_exec(&cfg, "true", 2).expect_err("unroutable host must error") {
             ToolError::Execution(m) => m,

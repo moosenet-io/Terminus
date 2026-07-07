@@ -140,16 +140,6 @@ const READING_STATUS_FILTERS: &[&str] = &["unread", "read", ""];
 
 const MAX_TEXT_LEN: usize = 2000;
 
-/// Assumed remote invocation shape, mirroring `sentinel::DEFAULT_SCRIPT`'s
-/// one-script-many-subcommands convention. **Not observed on the wire** — the
-/// fleet host was unreachable for the whole porting session. Audit against
-/// the real legacy-host source before relying on this in production.
-///
-/// PII remediation note (2026-07): real functional default (remote script
-/// path on the fleet host) — left unchanged, not guess-redacted; flagged for
-/// operator review before any public release.
-const DEFAULT_SCRIPT: &str = "/usr/bin/python3 <path>/crucible/ops.py";
-
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -163,8 +153,10 @@ pub struct CrucibleConfig {
     pub ssh_user: String,
     /// Path to the SSH private key file — from `CRUCIBLE_SSH_KEY_PATH`.
     pub ssh_key_path: Option<String>,
-    /// Remote script invocation — from `CRUCIBLE_SCRIPT`.
-    pub script: String,
+    /// Remote script invocation — from `CRUCIBLE_SCRIPT`. No compiled-in
+    /// default (PII remediation 2026-07): required at runtime, see
+    /// [`CrucibleConfig::require_script`].
+    pub script: Option<String>,
 }
 
 impl CrucibleConfig {
@@ -175,10 +167,7 @@ impl CrucibleConfig {
             ssh_key_path: env::var("CRUCIBLE_SSH_KEY_PATH")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            script: env::var("CRUCIBLE_SCRIPT")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DEFAULT_SCRIPT.into()),
+            script: env::var("CRUCIBLE_SCRIPT").ok().filter(|s| !s.is_empty()),
         }
     }
 
@@ -192,6 +181,14 @@ impl CrucibleConfig {
         self.ssh_key_path
             .as_deref()
             .ok_or_else(|| ToolError::NotConfigured("CRUCIBLE_SSH_KEY_PATH is not set".into()))
+    }
+
+    /// PII remediation (2026-07): `CRUCIBLE_SCRIPT` no longer has a
+    /// compiled-in fleet-host script path fallback.
+    fn require_script(&self) -> Result<&str, ToolError> {
+        self.script
+            .as_deref()
+            .ok_or_else(|| ToolError::NotConfigured("CRUCIBLE_SCRIPT is not set".into()))
     }
 }
 
@@ -381,7 +378,8 @@ async fn run_subcommand(
     payload: Value,
 ) -> Result<String, ToolError> {
     let cfg = Arc::clone(config);
-    let command = build_command(&cfg.script, subcommand, &payload);
+    let script = cfg.require_script()?.to_string();
+    let command = build_command(&script, subcommand, &payload);
     let output = tokio::task::spawn_blocking(move || ssh_exec(&cfg, &command, 60))
         .await
         .map_err(|e| ToolError::Execution(format!("Task join error: {e}")))??;
@@ -894,13 +892,34 @@ pub fn register(registry: &mut ToolRegistry) {
 mod tests {
     use super::*;
 
+    /// Test-fixture value standing in for `CRUCIBLE_SCRIPT`, which has no
+    /// compiled-in default (PII remediation 2026-07).
+    const TEST_SCRIPT: &str = "/opt/test-fixture/crucible/ops.py";
+
     fn test_config() -> Arc<CrucibleConfig> {
         Arc::new(CrucibleConfig {
             ssh_host: None,
             ssh_user: "root".into(),
             ssh_key_path: None,
-            script: DEFAULT_SCRIPT.into(),
+            script: Some(TEST_SCRIPT.into()),
         })
+    }
+
+    #[tokio::test]
+    async fn test_run_subcommand_not_configured_without_script() {
+        // PII remediation (2026-07): CRUCIBLE_SCRIPT has no compiled-in
+        // default — missing it must fail clean with NotConfigured.
+        let cfg = Arc::new(CrucibleConfig {
+            ssh_host: Some("127.0.0.1".into()),
+            ssh_user: "root".into(),
+            ssh_key_path: Some("/tmp/nonexistent-key".into()),
+            script: None,
+        });
+        let err = run_subcommand(&cfg, "list", json!({})).await.unwrap_err();
+        match err {
+            ToolError::NotConfigured(msg) => assert!(msg.contains("CRUCIBLE_SCRIPT")),
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
     }
 
     // --- pure helpers: command construction & response parsing -----------
@@ -1195,7 +1214,7 @@ mod tests {
             ssh_host: Some("127.0.0.1".into()),
             ssh_user: "root".into(),
             ssh_key_path: Some("/tmp/nonexistent-key".into()),
-            script: DEFAULT_SCRIPT.into(),
+            script: Some(TEST_SCRIPT.into()),
         };
         let msg = match ssh_exec(&cfg, "true", 2).expect_err("unroutable host must error") {
             ToolError::Execution(m) => m,

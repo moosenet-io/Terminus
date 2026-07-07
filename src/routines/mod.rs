@@ -122,8 +122,10 @@ pub struct RoutinesConfig {
     pub ssh_user: String,
     /// Path to the SSH private key file — from `ROUTINES_SSH_KEY_PATH`.
     pub ssh_key_path: Option<String>,
-    /// Name of the remote scheduler CLI binary — from `ROUTINES_CLI` (defaults to the scheduler's standard binary name).
-    pub cli: String,
+    /// Name of the remote scheduler CLI binary — from `ROUTINES_CLI`. No
+    /// compiled-in default (PII remediation 2026-07): required at runtime,
+    /// see [`RoutinesConfig::require_cli`].
+    pub cli: Option<String>,
     /// Path to the local single-slot staging file — from `ROUTINES_STAGING_PATH`,
     /// default "/var/lib/terminus/routines_staging.json".
     pub staging_path: PathBuf,
@@ -135,15 +137,19 @@ impl RoutinesConfig {
             ssh_host: env::var("ROUTINES_SSH_HOST").ok(),
             ssh_user: env::var("ROUTINES_SSH_USER").unwrap_or_else(|_| "root".into()),
             ssh_key_path: env::var("ROUTINES_SSH_KEY_PATH").ok(),
-            // PII remediation note (2026-07): "<host>" is a real, functional
-            // default CLI binary name — left unchanged rather than
-            // guess-redacted; flagged for operator review before any public
-            // release.
-            cli: env::var("ROUTINES_CLI").unwrap_or_else(|_| "<host>".into()),
+            cli: env::var("ROUTINES_CLI").ok().filter(|s| !s.is_empty()),
             staging_path: env::var("ROUTINES_STAGING_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("/var/lib/terminus/routines_staging.json")),
         }
+    }
+
+    /// PII remediation (2026-07): `ROUTINES_CLI` no longer has a compiled-in
+    /// fallback binary name.
+    fn require_cli(&self) -> Result<&str, ToolError> {
+        self.cli
+            .as_deref()
+            .ok_or_else(|| ToolError::NotConfigured("ROUTINES_CLI is not set".into()))
     }
 }
 
@@ -335,7 +341,8 @@ impl RustTool for RoutinesList {
     }
 
     async fn execute(&self, _args: Value) -> Result<String, ToolError> {
-        let command = format!("{} routines list --json", self.config.cli);
+        let cli = self.config.require_cli()?;
+        let command = format!("{cli} routines list --json");
         let result = run_remote(&self.config, command, 30).await;
         Ok(result.to_string())
     }
@@ -385,10 +392,8 @@ impl RustTool for RoutinesHistory {
             .to_string());
         }
 
-        let command = format!(
-            "{} routines history {} --limit {} --json",
-            self.config.cli, name, limit
-        );
+        let cli = self.config.require_cli()?;
+        let command = format!("{cli} routines history {name} --limit {limit} --json");
         let mut result = run_remote(&self.config, command, 30).await;
         // Match the Python source's observed behaviour: error responses carry
         // the requested name back alongside the error.
@@ -547,10 +552,10 @@ impl RustTool for RoutinesApprove {
             .to_string());
         }
 
+        let cli = self.config.require_cli()?;
         let command = match proposal.action.as_str() {
             "create" => format!(
-                "{} routines create {} --schedule {} --timezone {} --description {} --prompt {} --json",
-                self.config.cli,
+                "{cli} routines create {} --schedule {} --timezone {} --description {} --prompt {} --json",
                 proposal.name,
                 shell_quote(&proposal.schedule),
                 shell_quote(&proposal.timezone),
@@ -558,15 +563,14 @@ impl RustTool for RoutinesApprove {
                 shell_quote(&proposal.prompt),
             ),
             "update" => format!(
-                "{} routines update {} --schedule {} --timezone {} --description {} --prompt {} --json",
-                self.config.cli,
+                "{cli} routines update {} --schedule {} --timezone {} --description {} --prompt {} --json",
                 proposal.name,
                 shell_quote(&proposal.schedule),
                 shell_quote(&proposal.timezone),
                 shell_quote(&proposal.description),
                 shell_quote(&proposal.prompt),
             ),
-            "delete" => format!("{} routines delete {} --json", self.config.cli, proposal.name),
+            "delete" => format!("{cli} routines delete {} --json", proposal.name),
             other => {
                 return Ok(json!({
                     "executed": false,
@@ -638,7 +642,8 @@ impl RustTool for RoutinesEdit {
             .to_string());
         }
 
-        let mut cmd = format!("{} routines edit {}", self.config.cli, name);
+        let cli = self.config.require_cli()?;
+        let mut cmd = format!("{cli} routines edit {name}");
         for field in ["schedule", "prompt", "description", "timezone", "cooldown"] {
             if let Some(v) = args[field].as_str() {
                 if !v.is_empty() {
@@ -702,10 +707,8 @@ impl RustTool for RoutinesBatchEditNotifyChannel {
             .to_string());
         }
 
-        let command = format!(
-            "{} routines batch-edit-notify-channel --channel {} --json",
-            self.config.cli, channel
-        );
+        let cli = self.config.require_cli()?;
+        let command = format!("{cli} routines batch-edit-notify-channel --channel {channel} --json");
         let result = run_remote(&self.config, command, 120).await;
         Ok(result.to_string())
     }
@@ -750,7 +753,7 @@ mod tests {
             ssh_host: None,
             ssh_user: "root".into(),
             ssh_key_path: None,
-            cli: "<host>".into(), // pii-test-fixture
+            cli: Some("<host>".into()), // pii-test-fixture
             staging_path,
         })
     }
@@ -1034,5 +1037,26 @@ mod tests {
         let result = tool.execute(json!({})).await.unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert!(parsed.get("error").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_list_not_configured_without_cli() {
+        // PII remediation (2026-07): ROUTINES_CLI has no compiled-in default
+        // anymore — missing it must fail clean with NotConfigured, not
+        // silently substitute the real scheduler binary name.
+        let dir = tempdir().unwrap();
+        let cfg = Arc::new(RoutinesConfig {
+            ssh_host: None,
+            ssh_user: "root".into(),
+            ssh_key_path: None,
+            cli: None,
+            staging_path: dir.path().join("staging.json"),
+        });
+        let tool = RoutinesList { config: cfg };
+        let err = tool.execute(json!({})).await.unwrap_err();
+        match err {
+            ToolError::NotConfigured(msg) => assert!(msg.contains("ROUTINES_CLI")),
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
     }
 }

@@ -22,13 +22,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::intake::context;
 
-/// Default chord model-registry path (overridable via `MODEL_REGISTRY_PATH`).
-///
-/// PII remediation note (2026-07): real, functional default path on the
-/// sweep-harness host — left unchanged rather than guess-redacted; flagged
-/// for operator review before any public release.
-const DEFAULT_REGISTRY_PATH: &str = "<path>/model-registry.json";
-
 /// Normalized per-inference metrics, backend-agnostic.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InferMetrics {
@@ -114,11 +107,15 @@ struct RegBackend {
     launch: Option<LaunchSpec>,
 }
 
-fn registry_path() -> String {
-    std::env::var("MODEL_REGISTRY_PATH")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_REGISTRY_PATH.to_string())
+/// Chord model-registry path, from `MODEL_REGISTRY_PATH`. No compiled-in
+/// default (PII remediation 2026-07: the old fallback was a real
+/// sweep-harness host path). `None` when unset is treated exactly like the
+/// pre-existing "registry file absent" case below (same graceful-degrade
+/// fallback to the default Ollama backend) — this is not a security
+/// boundary, just a discovery path, so there is no new failure mode here,
+/// only the removal of a compiled-in real path.
+fn registry_path() -> Option<String> {
+    std::env::var("MODEL_REGISTRY_PATH").ok().filter(|s| !s.trim().is_empty())
 }
 
 /// Process-global backend override for profiling: when set, EVERY model resolves
@@ -186,7 +183,7 @@ pub fn apply_remote_override(mut backend: ResolvedBackend, remote: Option<&str>)
 pub fn resolve_backend(model: &str) -> ResolvedBackend {
     let resolved = resolve_backend_at(
         model,
-        &registry_path(),
+        registry_path().as_deref().unwrap_or(""),
         &context::ollama_base(),
         backend_override().as_deref(),
     );
@@ -255,7 +252,10 @@ pub fn resolve_backend_at(
 /// (unit `None` ⇒ spawned as a transient `chord-<name>` unit). Used by lifecycle
 /// GPU arbitration to free the single GPU before starting another GPU backend.
 pub fn gpu_backends() -> Vec<(String, Option<String>)> {
-    let text = match std::fs::read_to_string(registry_path()) {
+    let Some(path) = registry_path() else {
+        return Vec::new();
+    };
+    let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(_) => return Vec::new(),
     };

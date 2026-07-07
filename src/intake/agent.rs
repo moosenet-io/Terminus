@@ -442,7 +442,7 @@ pub async fn run_agent_suite(
     profile_id: uuid::Uuid,
     limit: Option<usize>,
 ) -> Result<AgentSuiteOutcome, ToolError> {
-    let dir: PathBuf = corpus_dir();
+    let dir: PathBuf = corpus_dir()?;
     let mut scenarios = read_scenarios(&dir)?;
     if let Some(n) = limit {
         scenarios.truncate(n);

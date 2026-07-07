@@ -56,30 +56,25 @@ use crate::intake::context;
 use crate::intake::gpu_authority::GpuLock;
 use crate::intake::storage::{self, CodeRunRowV2};
 
-/// Default v2 corpus location on the sweep-harness host; overridable via `INTAKE_CORPUS_V2_DIR`.
-///
-/// PII remediation note (2026-07): real, functional default path — left
-/// unchanged rather than guess-redacted; flagged for operator review before
-/// any public release.
-const DEFAULT_CORPUS_V2_DIR: &str = "<path>/intake-corpus-v2";
-
-/// Resolve the v2 corpus directory.
-pub fn corpus_v2_dir() -> PathBuf {
+/// Resolve the v2 corpus directory from `INTAKE_CORPUS_V2_DIR`. No
+/// compiled-in default (PII remediation 2026-07): required at runtime —
+/// fails clean with `NotConfigured` rather than silently pointing at a real
+/// sweep-harness host path.
+pub fn corpus_v2_dir() -> Result<PathBuf, ToolError> {
     std::env::var("INTAKE_CORPUS_V2_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CORPUS_V2_DIR))
+        .ok_or_else(|| ToolError::NotConfigured("INTAKE_CORPUS_V2_DIR is not set".into()))
 }
 
 /// Persistent build-cache root (pre-warmed deps) passed to validators as
 /// `MINT_TARGET_CACHE`. Defaults next to the corpus so it survives across runs.
-pub fn target_cache_dir() -> PathBuf {
-    std::env::var("INTAKE_TARGET_CACHE")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| corpus_v2_dir().join("_target-cache"))
+pub fn target_cache_dir() -> Result<PathBuf, ToolError> {
+    if let Some(dir) = std::env::var("INTAKE_TARGET_CACHE").ok().filter(|s| !s.trim().is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    Ok(corpus_v2_dir()?.join("_target-cache"))
 }
 
 /// One v2 manifest entry.
@@ -492,7 +487,7 @@ async fn apply_and_validate(
         std::fs::write(&dest, body)
             .map_err(|e| ToolError::Execution(format!("write output {rel}: {e}")))?;
     }
-    let cache = target_cache_dir();
+    let cache = target_cache_dir()?;
     let _ = std::fs::create_dir_all(&cache);
 
     let out = tokio::process::Command::new("bash")
@@ -900,7 +895,7 @@ pub async fn run_code_suite_v2_cases(
     gpu_lock: Option<&dyn GpuLock>,
 ) -> Result<CodeV2Outcome, ToolError> {
     sweep_stale_workspaces();
-    let dir = corpus_v2_dir();
+    let dir = corpus_v2_dir()?;
     let all = read_manifest_v2(&dir)?;
     let mut cases = filter_by_ids(&filter_by_language(&all, languages), case_ids);
     if let Some(n) = case_limit {
@@ -1188,11 +1183,17 @@ mod tests {
     use super::*;
 
     #[test]
+    #[serial_test::serial(intake_env)]
     fn corpus_v2_dir_env_override() {
         std::env::set_var("INTAKE_CORPUS_V2_DIR", "/tmp/corpus-v2-x");
-        assert_eq!(corpus_v2_dir(), PathBuf::from("/tmp/corpus-v2-x"));
+        assert_eq!(corpus_v2_dir().unwrap(), PathBuf::from("/tmp/corpus-v2-x"));
         std::env::remove_var("INTAKE_CORPUS_V2_DIR");
-        assert_eq!(corpus_v2_dir(), PathBuf::from(DEFAULT_CORPUS_V2_DIR));
+        // PII remediation (2026-07): INTAKE_CORPUS_V2_DIR has no compiled-in
+        // default anymore — missing it must fail clean with NotConfigured.
+        match corpus_v2_dir() {
+            Err(ToolError::NotConfigured(msg)) => assert!(msg.contains("INTAKE_CORPUS_V2_DIR")),
+            other => panic!("expected NotConfigured, got {other:?}"),
+        }
     }
 
     #[test]
