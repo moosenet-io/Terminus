@@ -95,6 +95,12 @@ pub enum ForgeEndpoint {
     BranchesDelete,
     BranchesProtection,
     BranchesDefault,
+    // Generic refs (non-branch refs: `refs/tags/*`, custom refs) — distinct from
+    // the branch-specific operations above.
+    RefsList,
+    RefsGet,
+    RefsCreate,
+    RefsDelete,
     // ── Commits ───────────────────────────────────────────────────────────────
     CommitsList,
     CommitsGet,
@@ -125,6 +131,12 @@ pub enum ForgeEndpoint {
     ReleasesUpdate,
     ReleasesDelete,
     ReleasesAssets,
+    // Tag operations independent of releases (forge APIs create/list/delete tags
+    // without an associated release).
+    TagsList,
+    TagsGet,
+    TagsCreate,
+    TagsDelete,
     // ── Webhooks ──────────────────────────────────────────────────────────────
     WebhooksList,
     WebhooksCreate,
@@ -158,6 +170,7 @@ impl ForgeEndpoint {
             ReposMirrorConfig, ReposVisibility, ReposMetadata,
             BranchesList, BranchesGet, BranchesCreate, BranchesDelete,
             BranchesProtection, BranchesDefault,
+            RefsList, RefsGet, RefsCreate, RefsDelete,
             CommitsList, CommitsGet, CommitsCompareDiff, CommitsStatus,
             PullRequestsList, PullRequestsGet, PullRequestsCreate, PullRequestsUpdate,
             PullRequestsReview, PullRequestsComment, PullRequestsMerge, PullRequestsClose,
@@ -165,6 +178,7 @@ impl ForgeEndpoint {
             IssuesLabel, IssuesAssign, IssuesClose,
             ReleasesList, ReleasesGet, ReleasesCreate, ReleasesUpdate, ReleasesDelete,
             ReleasesAssets,
+            TagsList, TagsGet, TagsCreate, TagsDelete,
             WebhooksList, WebhooksCreate, WebhooksUpdate, WebhooksDelete, WebhooksTest,
             PackagesList, PackagesGet, PackagesPublish, PackagesDelete,
             ContentReadFile, ContentWriteFile, ContentListTree, ContentRawFetch,
@@ -179,7 +193,8 @@ impl ForgeEndpoint {
             ReposList | ReposGet | ReposCreate | ReposUpdate | ReposDelete | ReposFork
             | ReposMirrorConfig | ReposVisibility | ReposMetadata => ForgeDomain::Repos,
             BranchesList | BranchesGet | BranchesCreate | BranchesDelete
-            | BranchesProtection | BranchesDefault => ForgeDomain::Branches,
+            | BranchesProtection | BranchesDefault | RefsList | RefsGet | RefsCreate
+            | RefsDelete => ForgeDomain::Branches,
             CommitsList | CommitsGet | CommitsCompareDiff | CommitsStatus => ForgeDomain::Commits,
             PullRequestsList | PullRequestsGet | PullRequestsCreate | PullRequestsUpdate
             | PullRequestsReview | PullRequestsComment | PullRequestsMerge | PullRequestsClose => {
@@ -188,7 +203,9 @@ impl ForgeEndpoint {
             IssuesList | IssuesGet | IssuesCreate | IssuesUpdate | IssuesComment | IssuesLabel
             | IssuesAssign | IssuesClose => ForgeDomain::Issues,
             ReleasesList | ReleasesGet | ReleasesCreate | ReleasesUpdate | ReleasesDelete
-            | ReleasesAssets => ForgeDomain::Releases,
+            | ReleasesAssets | TagsList | TagsGet | TagsCreate | TagsDelete => {
+                ForgeDomain::Releases
+            }
             WebhooksList | WebhooksCreate | WebhooksUpdate | WebhooksDelete | WebhooksTest => {
                 ForgeDomain::Webhooks
             }
@@ -220,6 +237,10 @@ impl ForgeEndpoint {
             BranchesDelete => "branches_delete",
             BranchesProtection => "branches_protection",
             BranchesDefault => "branches_default",
+            RefsList => "refs_list",
+            RefsGet => "refs_get",
+            RefsCreate => "refs_create",
+            RefsDelete => "refs_delete",
             CommitsList => "commits_list",
             CommitsGet => "commits_get",
             CommitsCompareDiff => "commits_compare_diff",
@@ -246,6 +267,10 @@ impl ForgeEndpoint {
             ReleasesUpdate => "releases_update",
             ReleasesDelete => "releases_delete",
             ReleasesAssets => "releases_assets",
+            TagsList => "tags_list",
+            TagsGet => "tags_get",
+            TagsCreate => "tags_create",
+            TagsDelete => "tags_delete",
             WebhooksList => "webhooks_list",
             WebhooksCreate => "webhooks_create",
             WebhooksUpdate => "webhooks_update",
