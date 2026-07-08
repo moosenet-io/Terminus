@@ -60,7 +60,7 @@
 //! command is configured, [`dispatch_cleaning`] escalates immediately (0 rounds)
 //! rather than silently passing residuals through.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::{json, Value};
@@ -395,14 +395,32 @@ pub fn dispatch_cleaning(
 
 // ── `.git` protection around a cleaner round ────────────────────────────────
 
-/// Run `f` (a cleaner round) with the work dir's `.git` metadata protected:
-/// snapshot it first, then restore it afterward regardless of `f`'s outcome, so a
-/// cleaner can only affect work-TREE files, never git metadata that a later
-/// `finalize` trusts. The snapshot lives OUTSIDE the work dir (a sibling temp dir),
-/// so the cleaner — whose cwd is the work dir — cannot reach it, and it is on the
-/// same filesystem so the restore is an atomic rename. A missing `.git` (defensive;
-/// prepare's `run` always creates it before any residual) skips protection and
-/// just runs `f`.
+/// One captured `.git` entry, held IN MEMORY (see [`with_protected_git_dir`]).
+enum GitEntry {
+    Dir,
+    File { bytes: Vec<u8>, mode: u32 },
+    Symlink { target: PathBuf },
+}
+
+/// Run `f` (a cleaner round) with the work dir's `.git` metadata protected: capture
+/// it into an **in-memory** snapshot first, then rebuild `.git` from that snapshot
+/// afterward regardless of `f`'s outcome. The cleaner can therefore only affect
+/// work-TREE files; nothing it writes under `.git` (hooks, a `core.worktree`
+/// redirect, clean/smudge filters, `gpg.program`) survives into the later
+/// `finalize` that trusts that metadata.
+///
+/// The snapshot lives in process memory — NOT on disk — precisely because a cleaner
+/// is not confined to its cwd: an on-disk snapshot (even a sibling temp dir) could
+/// be located and tampered with by a filesystem-writing cleaner before the restore,
+/// whereas an in-memory copy is unreachable by any filesystem operation. The work
+/// dir's `.git` is a small swept linear history, so holding it in memory briefly is
+/// cheap. A missing `.git` (defensive; prepare's `run` always creates it before any
+/// residual) skips protection and just runs `f`.
+///
+/// NOTE: this enforces GIT-METADATA integrity in-process; it does not stop a cleaner
+/// from writing to unrelated ABSOLUTE paths (e.g. the source checkout) — that
+/// requires an OS filesystem sandbox around the configured command, which is the
+/// operator's deployment responsibility (documented on the module).
 fn with_protected_git_dir<F>(work_dir: &Path, f: F) -> Result<(), ToolError>
 where
     F: FnOnce() -> Result<(), ToolError>,
@@ -411,64 +429,96 @@ where
     if !git_dir.exists() {
         return f();
     }
-    // Sibling snapshot (outside the cleaner-writable work dir, same filesystem).
-    let parent = work_dir.parent().unwrap_or_else(|| Path::new("."));
-    let snapshot = parent.join(format!(
-        ".ghmr05-gitsnap-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    // Best-effort clear of a stale snapshot path, then copy `.git` into it.
-    let _ = std::fs::remove_dir_all(&snapshot);
-    copy_dir_all(&git_dir, &snapshot).map_err(|e| {
-        ToolError::Execution(format!("failed snapshotting .git before cleaning: {e}"))
-    })?;
+    let snapshot = snapshot_git_dir(&git_dir)
+        .map_err(|e| ToolError::Execution(format!("failed snapshotting .git before cleaning: {e}")))?;
 
     let result = f();
 
-    // Restore the pristine `.git` regardless of the cleaner's result: drop the
-    // (possibly tampered) live `.git` and move the snapshot back into place.
-    if let Err(e) = std::fs::remove_dir_all(&git_dir) {
-        let _ = std::fs::remove_dir_all(&snapshot);
-        return Err(ToolError::Execution(format!(
-            "failed removing tampered .git during restore: {e}"
-        )));
-    }
-    std::fs::rename(&snapshot, &git_dir).map_err(|e| {
-        ToolError::Execution(format!("failed restoring pristine .git after cleaning: {e}"))
-    })?;
+    // Rebuild the pristine `.git` from the in-memory snapshot regardless of the
+    // cleaner's result and regardless of what it did to the live `.git` (deleted,
+    // replaced with a file, tampered).
+    restore_git_dir(&git_dir, &snapshot)
+        .map_err(|e| ToolError::Execution(format!("failed restoring pristine .git after cleaning: {e}")))?;
 
     result
 }
 
-/// Recursively copy a directory tree (files, subdirs, and symlinks — symlinks are
-/// recreated as symlinks, never followed). Used to snapshot `.git`; git's own
-/// objects are plain files, so this preserves the history faithfully.
-fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ft = entry.file_type()?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if ft.is_symlink() {
-            #[cfg(unix)]
-            {
-                let target = std::fs::read_link(&from)?;
-                std::os::unix::fs::symlink(target, &to)?;
+/// Read an entire `.git` tree into an in-memory snapshot (relative path → entry).
+/// Directories precede their contents (so restore creates parents first). Symlinks
+/// are captured as their target, never followed.
+fn snapshot_git_dir(git_dir: &Path) -> std::io::Result<Vec<(PathBuf, GitEntry)>> {
+    fn walk(base: &Path, cur: &Path, out: &mut Vec<(PathBuf, GitEntry)>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(cur)? {
+            let entry = entry?;
+            let path = entry.path();
+            let rel = path.strip_prefix(base).unwrap_or(&path).to_path_buf();
+            let ft = entry.file_type()?;
+            if ft.is_symlink() {
+                let target = std::fs::read_link(&path)?;
+                out.push((rel, GitEntry::Symlink { target }));
+            } else if ft.is_dir() {
+                out.push((rel, GitEntry::Dir));
+                walk(base, &path, out)?;
+            } else {
+                let bytes = std::fs::read(&path)?;
+                #[cfg(unix)]
+                let mode = {
+                    use std::os::unix::fs::MetadataExt;
+                    entry.metadata()?.mode()
+                };
+                #[cfg(not(unix))]
+                let mode = 0o644;
+                out.push((rel, GitEntry::File { bytes, mode }));
             }
-            #[cfg(not(unix))]
-            {
-                // On non-unix, fall back to copying the link's target contents.
-                std::fs::copy(&from, &to)?;
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(git_dir, git_dir, &mut out)?;
+    Ok(out)
+}
+
+/// Rebuild `.git` from an in-memory snapshot. Robustly removes whatever the cleaner
+/// left at `git_dir` first — a directory, a file/symlink it was replaced with, or
+/// nothing at all (`NotFound` is fine) — then recreates every captured entry.
+fn restore_git_dir(git_dir: &Path, snapshot: &[(PathBuf, GitEntry)]) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(git_dir) {
+        Ok(md) => {
+            if md.file_type().is_dir() {
+                std::fs::remove_dir_all(git_dir)?;
+            } else {
+                std::fs::remove_file(git_dir)?;
             }
-        } else if ft.is_dir() {
-            copy_dir_all(&from, &to)?;
-        } else {
-            std::fs::copy(&from, &to)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::create_dir_all(git_dir)?;
+    for (rel, entry) in snapshot {
+        let dst = git_dir.join(rel);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match entry {
+            GitEntry::Dir => {
+                std::fs::create_dir_all(&dst)?;
+            }
+            GitEntry::Symlink { target } => {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(target, &dst)?;
+                #[cfg(not(unix))]
+                std::fs::write(&dst, target.to_string_lossy().as_bytes())?;
+            }
+            GitEntry::File { bytes, mode } => {
+                std::fs::write(&dst, bytes)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(*mode))?;
+                }
+                #[cfg(not(unix))]
+                let _ = mode;
+            }
         }
     }
     Ok(())
@@ -1016,6 +1066,42 @@ mod tests {
         assert!(cfg.is_err() || cfg.unwrap().trim().is_empty(), "core.worktree redirect must be gone");
 
         cleanup(&[&src, &wd_path, &external]);
+    }
+
+    // ── restore rebuilds .git even when a cleaner DELETES it (codex r5 P2) ────
+    #[test]
+    #[serial]
+    fn restore_rebuilds_git_when_cleaner_removes_it() {
+        clear_env();
+        let src = init_source(&[(
+            "config.txt",
+            "token = \"<REDACTED-SECRET>\"\n", // pii-test-fixture
+        )]);
+        let wd_path = unique("wd");
+        let mgr = MirrorWorkDir::new("Terminus", &src, &wd_path);
+        let sha = run_git(&src, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let report = mgr.run().unwrap();
+        assert!(!report.residual_violations.is_empty());
+
+        // A cleaner that fixes the file but then blows away .git entirely.
+        struct GitDeleter;
+        impl ResidualCleaner for GitDeleter {
+            fn clean_round(&self, work_dir: &Path, _r: &[TreeViolation]) -> Result<(), ToolError> {
+                write_file(work_dir, "config.txt", "cleaned\n");
+                std::fs::remove_dir_all(work_dir.join(".git")).unwrap();
+                Ok(())
+            }
+        }
+
+        let outcome =
+            run_cleaning_pass(&mgr, &sha, report.residual_violations.clone(), &GitDeleter, MAX_CLEAN_ROUNDS)
+                .unwrap();
+        // .git was rebuilt from the in-memory snapshot → finalize commits + tags.
+        assert!(outcome.is_cleaned(), "restore-regardless must survive .git deletion: {outcome:?}");
+        assert!(wd_path.join(".git").is_dir(), ".git rebuilt");
+        assert!(tag_list(&wd_path).contains(&approved_tag(&sha)));
+
+        cleanup(&[&src, &wd_path]);
     }
 
     // ── the cleaner does NOT inherit parent service credentials ───────────────
