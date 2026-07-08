@@ -1119,6 +1119,458 @@ impl RustTool for ListBranches {
     }
 }
 
+// ─── Cargo registry publish ──────────────────────────────────────────────────
+//
+// `cargo publish` is, on the wire, an authenticated HTTP PUT of a packaged
+// `.crate` file to the registry's publish endpoint. Gitea implements the Cargo
+// registry API, so we recreate that PUT here and route it through Terminus's own
+// `GITEA_TOKEN` — meaning no `cargo publish` token ever has to live on the dev
+// box or be spread across build/serving hosts. There is exactly ONE publisher
+// identity (Terminus's configured token); this is deliberately single-identity,
+// not a multi-user path.
+//
+// Endpoint (verified against Gitea 1.25.x):
+//   PUT {GITEA_URL}/api/packages/{owner}/cargo/api/v1/crates/new
+//   Authorization: token <GITEA_TOKEN>   (the PAT scheme all GiteaClient calls
+//                                          use; a `Bearer` prefix would make
+//                                          Gitea treat the PAT as OAuth2)
+//   Body: the standard Cargo publish binary frame —
+//     u32-LE(metadata_json_len) || metadata_json || u32-LE(crate_len) || crate_bytes
+//
+// Note this endpoint lives under `/api/packages/...`, NOT the `/api/v1/...`
+// Gitea REST surface used by every other tool in this module, so it builds its
+// URL directly from `base_url` rather than via `GiteaClient::api()`.
+
+/// Assemble the Cargo publish request body: the standard length-prefixed binary
+/// frame that `cargo publish` sends and that the registry expects.
+///
+/// Layout (all lengths little-endian u32):
+///   `u32(metadata_json.len) || metadata_json || u32(crate_bytes.len) || crate_bytes`
+fn build_cargo_publish_body(metadata_json: &[u8], crate_bytes: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8 + metadata_json.len() + crate_bytes.len());
+    body.extend_from_slice(&(metadata_json.len() as u32).to_le_bytes());
+    body.extend_from_slice(metadata_json);
+    body.extend_from_slice(&(crate_bytes.len() as u32).to_le_bytes());
+    body.extend_from_slice(crate_bytes);
+    body
+}
+
+/// Build the Cargo publish metadata JSON.
+///
+/// The registry publish API requires a metadata object whose only truly
+/// mandatory fields are `name` and `vers`; every other field has a well-defined
+/// empty default (arrays → `[]`, maps → `{}`, optional strings → `null`). We
+/// emit the full field set with those defaults so lenient and strict registries
+/// alike accept it.
+///
+/// The caller supplies a `provided` metadata object — REQUIRED at the tool
+/// boundary, extracted on the dev box (deps/features/... included) — whose keys
+/// are layered over the defaults; defaulting `deps` to empty for a crate that
+/// actually has dependencies would make Gitea write an incorrect registry index.
+/// `name` and `vers` are then force-set from the explicit `name`/`vers`
+/// arguments so the framed metadata can never disagree with the tool's stated
+/// target. (`provided: None` is retained only for helper-level unit tests.)
+fn build_cargo_metadata(name: &str, vers: &str, provided: Option<&Value>) -> Value {
+    let mut meta = json!({
+        "name": name,
+        "vers": vers,
+        "deps": [],
+        "features": {},
+        "authors": [],
+        "description": Value::Null,
+        "documentation": Value::Null,
+        "homepage": Value::Null,
+        "readme": Value::Null,
+        "readme_file": Value::Null,
+        "keywords": [],
+        "categories": [],
+        "license": Value::Null,
+        "license_file": Value::Null,
+        "repository": Value::Null,
+        "badges": {},
+        "links": Value::Null,
+    });
+
+    if let (Some(Value::Object(src)), Value::Object(dst)) = (provided, &mut meta) {
+        for (k, v) in src {
+            dst.insert(k.clone(), v.clone());
+        }
+    }
+
+    // Force name + vers to the explicit arguments — the framed metadata must
+    // always match the target the tool was asked to publish.
+    meta["name"] = json!(name);
+    meta["vers"] = json!(vers);
+    meta
+}
+
+/// Default upper bound on the `.crate` artifact size (64 MiB). A packaged crate
+/// is normally well under a few MiB; this cap exists purely to stop a caller
+/// from pointing the tool at an unbounded/huge file and exhausting memory.
+/// Overridable via `CARGO_PUBLISH_MAX_CRATE_BYTES`.
+const DEFAULT_MAX_CRATE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// True if `owner` is a single, safe registry path segment.
+///
+/// The owner is interpolated into the publish URL and paired with a privileged
+/// bearer token, so a value like `../../other-org` (or one containing a slash)
+/// must never be allowed to re-target the request at a different endpoint.
+/// Gitea org/user names are alphanumeric plus `-`, `_`, `.`; we additionally
+/// require a non-empty value that is not `.`/`..` and contains no path
+/// separators.
+fn is_valid_owner_segment(owner: &str) -> bool {
+    if owner.is_empty() || owner == "." || owner == ".." {
+        return false;
+    }
+    owner
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// Open a `.crate` once and read it under all safety constraints against THAT
+/// handle, so no time-of-check/time-of-use gap can be exploited between checks
+/// and the read:
+/// - the open handle must refer to a **regular file** (rejects directories and
+///   unbounded devices such as `/dev/zero`);
+/// - when `artifact_dir` is `Some`, the *actually opened* file (resolved from
+///   the file descriptor, not the caller's path string) must live inside the
+///   canonicalized artifact directory — this defeats a symlink swapped in after
+///   an earlier path-level check;
+/// - at most `max_bytes + 1` bytes are read, so an oversized or growing source
+///   can never exhaust memory, and the size bound is enforced on what was read.
+fn read_bounded_crate(
+    path: &std::path::Path,
+    raw: &str,
+    max_bytes: u64,
+    artifact_dir: Option<&str>,
+) -> Result<Vec<u8>, ToolError> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| {
+        ToolError::InvalidArgument(format!("Failed to read .crate file at '{raw}': {e}"))
+    })?;
+    let meta = file.metadata().map_err(|e| {
+        ToolError::InvalidArgument(format!("Failed to stat .crate file at '{raw}': {e}"))
+    })?;
+    if !meta.is_file() {
+        return Err(ToolError::InvalidArgument(format!(
+            "crate_path '{raw}' is not a regular file (directories and devices are refused)."
+        )));
+    }
+
+    // Jail check against the OPEN handle, closing the resolve→open race.
+    if let Some(dir) = artifact_dir {
+        let root = std::path::Path::new(dir).canonicalize().map_err(|e| {
+            ToolError::InvalidArgument(format!(
+                "Configured artifact directory could not be resolved: {e}"
+            ))
+        })?;
+        let opened = opened_file_real_path(&file, path);
+        if !opened.starts_with(&root) {
+            return Err(ToolError::InvalidArgument(format!(
+                "crate_path '{raw}' resolves outside the permitted artifact directory."
+            )));
+        }
+    }
+
+    let mut buf = Vec::new();
+    file.take(max_bytes + 1).read_to_end(&mut buf).map_err(|e| {
+        ToolError::InvalidArgument(format!("Failed to read .crate file at '{raw}': {e}"))
+    })?;
+    if buf.len() as u64 > max_bytes {
+        return Err(ToolError::InvalidArgument(format!(
+            "crate_path '{raw}' exceeds the {max_bytes}-byte publish limit."
+        )));
+    }
+    Ok(buf)
+}
+
+/// Resolve the real filesystem path of an already-open file from its descriptor,
+/// so a jail check reflects the inode that was actually opened rather than a
+/// caller-supplied path that may have been swapped. On Linux this reads
+/// `/proc/self/fd/<fd>`; if that is unavailable it falls back to canonicalizing
+/// the original path (still symlink-resolved, just without the fd guarantee).
+fn opened_file_real_path(file: &std::fs::File, fallback: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let link = format!("/proc/self/fd/{}", file.as_raw_fd());
+        if let Ok(real) = std::fs::read_link(&link) {
+            return real;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+    }
+    fallback
+        .canonicalize()
+        .unwrap_or_else(|_| fallback.to_path_buf())
+}
+
+/// Validate and canonicalize the caller-supplied `crate_path` before any bytes
+/// are read, so `gitea_cargo_publish` cannot be turned into an arbitrary
+/// host-file exfiltration or a memory-exhaustion primitive.
+///
+/// Enforced unconditionally:
+/// - the path must end in `.crate` (case-insensitive);
+/// - it must resolve (`canonicalize`, which also follows symlinks) to an
+///   existing **regular file** — rejecting directories, and character/block
+///   devices such as `/dev/zero` that would otherwise stream forever;
+/// - its size must be `<= max_bytes` — checked via metadata BEFORE reading, so
+///   an oversized file is refused without ever being buffered.
+///
+/// Enforced when `artifact_dir` is `Some` (operator opt-in via
+/// `CARGO_PUBLISH_ARTIFACT_DIR`): the canonicalized crate path must live inside
+/// the canonicalized artifact directory — a path jail that confines reads to a
+/// dedicated staging area, matching the path-jailed posture of the `dev` tools.
+fn resolve_crate_path(
+    raw: &str,
+    max_bytes: u64,
+    artifact_dir: Option<&str>,
+) -> Result<std::path::PathBuf, ToolError> {
+    let path = std::path::Path::new(raw);
+
+    // Extension gate first — cheap, and blocks the obvious "read /etc/passwd"
+    // shape before touching the filesystem.
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("crate"));
+    if !ext_ok {
+        return Err(ToolError::InvalidArgument(format!(
+            "crate_path '{raw}' must point to a .crate file (produced by `cargo package`)."
+        )));
+    }
+
+    // Canonicalize: resolves symlinks and requires the file to exist. A path
+    // that cannot be resolved (missing, unreadable parent) is refused here.
+    let canonical = path.canonicalize().map_err(|e| {
+        ToolError::InvalidArgument(format!("Failed to access .crate file at '{raw}': {e}"))
+    })?;
+
+    let meta = std::fs::metadata(&canonical).map_err(|e| {
+        ToolError::InvalidArgument(format!("Failed to stat .crate file at '{raw}': {e}"))
+    })?;
+    if !meta.is_file() {
+        return Err(ToolError::InvalidArgument(format!(
+            "crate_path '{raw}' is not a regular file (directories and devices are refused)."
+        )));
+    }
+    if meta.len() > max_bytes {
+        return Err(ToolError::InvalidArgument(format!(
+            "crate_path '{raw}' is {} bytes, exceeding the {max_bytes}-byte publish limit.",
+            meta.len()
+        )));
+    }
+
+    if let Some(dir) = artifact_dir {
+        let root = std::path::Path::new(dir).canonicalize().map_err(|e| {
+            ToolError::InvalidArgument(format!(
+                "Configured artifact directory could not be resolved: {e}"
+            ))
+        })?;
+        if !canonical.starts_with(&root) {
+            return Err(ToolError::InvalidArgument(format!(
+                "crate_path '{raw}' resolves outside the permitted artifact directory."
+            )));
+        }
+    }
+
+    Ok(canonical)
+}
+
+/// `gitea_cargo_publish` — publish a packaged `.crate` to the Gitea Cargo
+/// registry using Terminus's own token.
+pub struct CargoPublish {
+    client: GiteaClient,
+}
+
+#[async_trait]
+impl RustTool for CargoPublish {
+    fn name(&self) -> &str { "gitea_cargo_publish" }
+
+    fn description(&self) -> &str {
+        "Publish a packaged Rust .crate file (from token-less `cargo package`) to the Gitea \
+         Cargo registry using Terminus's own GITEA_TOKEN, so no cargo-publish token lives on the \
+         dev box. Single-identity publisher. Inputs: crate_path, name, version, metadata (the full \
+         Cargo publish metadata incl. deps — extract it on the dev box) and optional owner."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "crate_path": {
+                    "type": "string",
+                    "description": "Path (on the host running Terminus) to the local .crate file produced by `cargo package`. Must be an existing regular .crate file within the size limit; when CARGO_PUBLISH_ARTIFACT_DIR is configured it must reside inside that directory."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Crate name being published"
+                },
+                "version": {
+                    "type": "string",
+                    "description": "Crate version being published (e.g. 1.2.0)"
+                },
+                "owner": {
+                    "type": "string",
+                    "description": "Registry owner/org (optional; defaults to the configured GITEA_OWNER, normally 'moosenet')"
+                },
+                "metadata": {
+                    "type": "object",
+                    "description": "Required. The Cargo *publish-wire* metadata object (the exact schema cargo PUTs to a registry — NOT `cargo metadata` output, whose schema differs). Key fields: deps [{name, version_req, features, optional, default_features, target, kind}], features {}, and optional authors/description/license/repository/... Defaulting deps to empty would write an INCORRECT registry index for a crate with dependencies, so pass the real deps. name/vers are always overridden from the explicit arguments; any omitted optional fields are filled with empty defaults."
+                }
+            },
+            "required": ["crate_path", "name", "version", "metadata"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let crate_path = args["crate_path"].as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ToolError::InvalidArgument("'crate_path' is required".to_string()))?;
+        let name = args["name"].as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ToolError::InvalidArgument("'name' is required".to_string()))?;
+        let version = args["version"].as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ToolError::InvalidArgument("'version' is required".to_string()))?;
+        let owner = self.client.resolve_owner(args["owner"].as_str());
+        // Reject an owner that could re-target the URL (path traversal / slash)
+        // — it is interpolated into the endpoint alongside the bearer token.
+        if !is_valid_owner_segment(owner) {
+            return Err(ToolError::InvalidArgument(format!(
+                "Invalid registry owner '{owner}': must be a single Gitea org/user name \
+                 (alphanumerics, '-', '_', '.')."
+            )));
+        }
+        // Full publish metadata is REQUIRED: defaulting deps to empty would make
+        // Gitea write an incorrect registry index for any crate with
+        // dependencies, breaking downstream consumers. The dev box extracts the
+        // real metadata (deps/features/...) and passes it here.
+        let provided_metadata = args.get("metadata").filter(|v| v.is_object()).ok_or_else(|| {
+            ToolError::InvalidArgument(
+                "'metadata' (the full Cargo publish metadata object, including deps) is required. \
+                 Extract it on the dev box — a name+version-only publish would write an incorrect \
+                 registry index for any crate with dependencies.".to_string(),
+            )
+        })?;
+
+        // Validate the path BEFORE reading: `.crate` extension, existing regular
+        // file (rejects dirs and unbounded devices like /dev/zero), size bound,
+        // and an optional artifact-directory jail. This stops the tool being
+        // used to read arbitrary host files or exhaust memory.
+        let max_bytes = env::var("CARGO_PUBLISH_MAX_CRATE_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_MAX_CRATE_BYTES);
+        let artifact_dir = env::var("CARGO_PUBLISH_ARTIFACT_DIR").ok();
+        let canonical_path = resolve_crate_path(crate_path, max_bytes, artifact_dir.as_deref())?;
+
+        // Read the packaged .crate (an opaque gzip tarball), enforcing the size
+        // bound and the artifact-dir jail against the OPEN handle to close the
+        // resolve→open TOCTOU gap.
+        let crate_bytes =
+            read_bounded_crate(&canonical_path, crate_path, max_bytes, artifact_dir.as_deref())?;
+        if crate_bytes.is_empty() {
+            return Err(ToolError::InvalidArgument(format!(
+                "The .crate file at '{crate_path}' is empty — nothing to publish."
+            )));
+        }
+
+        // Build the length-prefixed publish frame. NOTE: no PII gate runs over
+        // the crate bytes — the artifact is an opaque binary and the publish
+        // target is the INTERNAL Gitea registry (legitimately holding internal
+        // repository URLs), not the public GitHub mirror. Scanning it would only
+        // false-positive on binary content or block valid internal references.
+        let metadata = build_cargo_metadata(name, version, Some(provided_metadata));
+        let metadata_json = serde_json::to_vec(&metadata)
+            .map_err(|e| ToolError::Execution(format!("Failed to serialize crate metadata: {e}")))?;
+        let body = build_cargo_publish_body(&metadata_json, &crate_bytes);
+
+        let url = format!(
+            "{}/api/packages/{}/cargo/api/v1/crates/new",
+            self.client.base_url.trim_end_matches('/'),
+            owner,
+        );
+        debug!("PUT {url} ({}-byte crate)", crate_bytes.len());
+
+        // Single sanctioned publisher identity: Terminus's own GITEA_TOKEN.
+        // Use the SAME `Authorization: token <PAT>` scheme every other
+        // GiteaClient request uses (a Gitea PAT under a `Bearer` prefix is
+        // treated as an OAuth2 credential and rejected). The token is NEVER
+        // logged or echoed into any result/error below.
+        let resp = self
+            .client
+            .http
+            .put(&url)
+            .header("Authorization", self.client.auth_header())
+            .header("Content-Type", "application/octet-stream")
+            .header("Accept", "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| ToolError::Http(format!("Publish request failed: {e}")))?;
+
+        let status = resp.status();
+        if status == StatusCode::UNAUTHORIZED {
+            return Err(ToolError::Http(
+                "Gitea Cargo publish returned 401 Unauthorized — the configured GITEA_TOKEN is \
+                 missing or invalid.".to_string(),
+            ));
+        }
+        if status == StatusCode::FORBIDDEN {
+            return Err(ToolError::Http(format!(
+                "Gitea Cargo publish returned 403 Forbidden for {owner}/{name}@{version}. The \
+                 GITEA_TOKEN almost certainly lacks the `write:package` scope required to publish \
+                 to the Cargo registry — regenerate the token in the runtime secret store with \
+                 that scope."
+            )));
+        }
+        if status == StatusCode::CONFLICT {
+            return Err(ToolError::Conflict(format!(
+                "Crate {name}@{version} already exists in the {owner} Cargo registry (Gitea \
+                 returned 409). Bump the version to publish."
+            )));
+        }
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(ToolError::Http(format!(
+                "Gitea Cargo publish returned {status} for {owner}/{name}@{version}: {body_text}"
+            )));
+        }
+
+        // Success. The Cargo publish API returns a JSON body that may carry a
+        // `warnings` object; surface it if present.
+        let warnings = resp
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("warnings").cloned());
+
+        let registry_url = format!(
+            "{}/{}/-/packages/cargo/{}/{}",
+            self.client.base_url.trim_end_matches('/'),
+            owner,
+            name,
+            version,
+        );
+
+        Ok(json!({
+            "published": true,
+            "name": name,
+            "version": version,
+            "owner": owner,
+            "registry_url": registry_url,
+            "warnings": warnings.unwrap_or(Value::Null),
+        })
+        .to_string())
+    }
+}
+
 // ─── Registration ────────────────────────────────────────────────────────────
 
 /// Register all Gitea tools into the global ToolRegistry.
@@ -1139,6 +1591,7 @@ pub fn register(registry: &mut ToolRegistry) {
             let _ = registry.register(Box::new(CreatePr { client: client.clone() }));
             let _ = registry.register(Box::new(MergePr { client: client.clone() }));
             let _ = registry.register(Box::new(ListBranches { client: client.clone() }));
+            let _ = registry.register(Box::new(CargoPublish { client: client.clone() }));
             let _ = registry.register(Box::new(ListDirectory { client }));
         }
         Err(e) => {
@@ -1164,6 +1617,7 @@ pub fn register(registry: &mut ToolRegistry) {
             stub!("gitea_create_pr", "Create Gitea pull request (not configured)");
             stub!("gitea_merge_pr", "Merge Gitea pull request (not configured)");
             stub!("gitea_list_branches", "List Gitea branches (not configured)");
+            stub!("gitea_cargo_publish", "Publish a .crate to the Gitea Cargo registry (not configured)");
             stub!("gitea_list_directory", "List directory contents in Gitea (not configured)");
         }
     }
@@ -1886,5 +2340,435 @@ mod tests {
         if let Some(v) = url_backup { std::env::set_var("GITEA_URL", v); }
         // Stub registered so the tool still appears and returns NotConfigured.
         assert!(reg.contains("gitea_create_repo"));
+    }
+
+    // ── cargo publish: body framing ────────────────────────────────────────
+
+    #[test]
+    fn test_build_cargo_publish_body_exact_bytes() {
+        // Known metadata `{}` (2 bytes) + crate payload `CRATE` (5 bytes) must
+        // frame to: u32-LE(2) || "{}" || u32-LE(5) || "CRATE".
+        let body = build_cargo_publish_body(b"{}", b"CRATE");
+        let expected: Vec<u8> = vec![
+            0x02, 0x00, 0x00, 0x00, // metadata length = 2, little-endian
+            b'{', b'}', // metadata bytes
+            0x05, 0x00, 0x00, 0x00, // crate length = 5, little-endian
+            b'C', b'R', b'A', b'T', b'E', // crate bytes
+        ];
+        assert_eq!(body, expected, "publish frame must be exactly length-prefixed");
+    }
+
+    #[test]
+    fn test_build_cargo_publish_body_empty_metadata_and_crate() {
+        let body = build_cargo_publish_body(b"", b"");
+        assert_eq!(body, vec![0, 0, 0, 0, 0, 0, 0, 0], "two zero-length u32 prefixes");
+    }
+
+    // ── cargo publish: metadata construction ───────────────────────────────
+
+    #[test]
+    fn test_build_cargo_metadata_minimal_defaults() {
+        let m = build_cargo_metadata("terminus-rs", "1.2.0", None);
+        assert_eq!(m["name"], serde_json::json!("terminus-rs"));
+        assert_eq!(m["vers"], serde_json::json!("1.2.0"));
+        // Empty defaults for every optional field.
+        assert_eq!(m["deps"], serde_json::json!([]));
+        assert_eq!(m["features"], serde_json::json!({}));
+        assert_eq!(m["authors"], serde_json::json!([]));
+        assert_eq!(m["keywords"], serde_json::json!([]));
+        assert_eq!(m["categories"], serde_json::json!([]));
+        assert_eq!(m["badges"], serde_json::json!({}));
+        assert!(m["description"].is_null());
+        assert!(m["license"].is_null());
+        assert!(m["repository"].is_null());
+    }
+
+    #[test]
+    fn test_build_cargo_metadata_merges_provided_and_forces_name_vers() {
+        // Provided metadata carries real fields AND a stale name/vers that must
+        // be overridden by the explicit arguments.
+        let provided = serde_json::json!({
+            "name": "WRONG-NAME",
+            "vers": "9.9.9",
+            "description": "a test crate",
+            "license": "MIT",
+            "repository": "http://gitea.example.com/moosenet/Terminus",
+            "deps": [{ "name": "serde", "version_req": "^1" }]
+        });
+        let m = build_cargo_metadata("terminus-rs", "1.2.0", Some(&provided));
+        // name/vers forced to explicit args, not the provided stale values.
+        assert_eq!(m["name"], serde_json::json!("terminus-rs"));
+        assert_eq!(m["vers"], serde_json::json!("1.2.0"));
+        // Provided fields layered over defaults.
+        assert_eq!(m["description"], serde_json::json!("a test crate"));
+        assert_eq!(m["license"], serde_json::json!("MIT"));
+        assert_eq!(m["deps"][0]["name"], serde_json::json!("serde"));
+    }
+
+    // ── cargo publish: HTTP behavior ───────────────────────────────────────
+
+    fn write_temp_crate(bytes: &[u8]) -> std::path::PathBuf {
+        let p = std::env::temp_dir()
+            .join(format!("gcargo_test_{}.crate", uuid::Uuid::new_v4()));
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn test_cargo_publish_correct_url_bearer_auth_and_success() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(PUT)
+                // Cargo publish endpoint lives under /api/packages, not /api/v1.
+                .path("/api/packages/testorg/cargo/api/v1/crates/new")
+                // Terminus's own token, sent with Gitea's PAT `token` scheme.
+                .header("Authorization", "token test-token");
+            then.status(200)
+                .json_body(serde_json::json!({ "warnings": { "other": [] } }));
+        });
+
+        let tmp = write_temp_crate(b"fake-crate-bytes");
+        let tool = CargoPublish { client: mock_client(&server) };
+        let result = tool
+            .execute(serde_json::json!({
+                "crate_path": tmp.to_str().unwrap(),
+                "name": "terminus-rs",
+                "version": "1.2.0",
+                "metadata": { "deps": [], "features": {} }
+            }))
+            .await
+            .unwrap();
+        std::fs::remove_file(&tmp).ok();
+
+        mock.assert();
+        assert!(result.contains("terminus-rs"));
+        assert!(result.contains("1.2.0"));
+        assert!(result.contains("/testorg/-/packages/cargo/terminus-rs/1.2.0"));
+        assert!(result.contains("\"published\":true"));
+    }
+
+    #[tokio::test]
+    async fn test_cargo_publish_owner_override() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(PUT)
+                .path("/api/packages/otherorg/cargo/api/v1/crates/new");
+            then.status(200).json_body(serde_json::json!({}));
+        });
+
+        let tmp = write_temp_crate(b"bytes");
+        let tool = CargoPublish { client: mock_client(&server) };
+        let result = tool
+            .execute(serde_json::json!({
+                "crate_path": tmp.to_str().unwrap(),
+                "name": "foo",
+                "version": "0.1.0",
+                "owner": "otherorg",
+                "metadata": {}
+            }))
+            .await
+            .unwrap();
+        std::fs::remove_file(&tmp).ok();
+        mock.assert();
+        assert!(result.contains("/otherorg/-/packages/cargo/foo/0.1.0"));
+    }
+
+    #[tokio::test]
+    async fn test_cargo_publish_403_surfaces_write_package_scope() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(PUT);
+            then.status(403).body("permission denied");
+        });
+
+        let tmp = write_temp_crate(b"bytes");
+        let tool = CargoPublish { client: mock_client(&server) };
+        let err = tool
+            .execute(serde_json::json!({
+                "crate_path": tmp.to_str().unwrap(),
+                "name": "foo",
+                "version": "1.0.0",
+                "metadata": {}
+            }))
+            .await
+            .unwrap_err();
+        std::fs::remove_file(&tmp).ok();
+        let msg = err.to_string();
+        assert!(msg.contains("403"), "should surface the 403");
+        assert!(msg.contains("write:package"), "should name the missing scope");
+    }
+
+    #[tokio::test]
+    async fn test_cargo_publish_409_already_exists() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(PUT);
+            then.status(409).body("crate version already exists");
+        });
+
+        let tmp = write_temp_crate(b"bytes");
+        let tool = CargoPublish { client: mock_client(&server) };
+        let err = tool
+            .execute(serde_json::json!({
+                "crate_path": tmp.to_str().unwrap(),
+                "name": "foo",
+                "version": "1.0.0",
+                "metadata": {}
+            }))
+            .await
+            .unwrap_err();
+        std::fs::remove_file(&tmp).ok();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_cargo_publish_missing_crate_file() {
+        let server = MockServer::start();
+        let tool = CargoPublish { client: mock_client(&server) };
+        let err = tool
+            .execute(serde_json::json!({
+                "crate_path": "/definitely/not/here/nope.crate",
+                "name": "foo",
+                "version": "1.0.0",
+                "metadata": {}
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Failed to access .crate file"));
+    }
+
+    #[tokio::test]
+    async fn test_cargo_publish_requires_metadata() {
+        let server = MockServer::start();
+        let tmp = write_temp_crate(b"bytes");
+        let tool = CargoPublish { client: mock_client(&server) };
+        let err = tool
+            .execute(serde_json::json!({
+                "crate_path": tmp.to_str().unwrap(),
+                "name": "foo",
+                "version": "1.0.0"
+            }))
+            .await
+            .unwrap_err();
+        std::fs::remove_file(&tmp).ok();
+        assert!(err.to_string().contains("'metadata'"));
+    }
+
+    // ── cargo publish: crate_path guard (resolve_crate_path) ───────────────
+
+    #[test]
+    fn test_resolve_crate_path_rejects_non_crate_extension() {
+        let tmp = std::env::temp_dir()
+            .join(format!("gcargo_notcrate_{}.txt", uuid::Uuid::new_v4()));
+        std::fs::write(&tmp, b"data").unwrap();
+        let err = resolve_crate_path(tmp.to_str().unwrap(), DEFAULT_MAX_CRATE_BYTES, None)
+            .unwrap_err();
+        std::fs::remove_file(&tmp).ok();
+        assert!(err.to_string().contains("must point to a .crate file"));
+    }
+
+    #[test]
+    fn test_resolve_crate_path_rejects_missing_file() {
+        let err = resolve_crate_path("/no/such/thing.crate", DEFAULT_MAX_CRATE_BYTES, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("Failed to access .crate file"));
+    }
+
+    #[test]
+    fn test_resolve_crate_path_rejects_directory() {
+        // A directory renamed with a .crate suffix must still be refused.
+        let dir = std::env::temp_dir()
+            .join(format!("gcargo_dir_{}.crate", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let err = resolve_crate_path(dir.to_str().unwrap(), DEFAULT_MAX_CRATE_BYTES, None)
+            .unwrap_err();
+        std::fs::remove_dir(&dir).ok();
+        assert!(err.to_string().contains("not a regular file"));
+    }
+
+    #[test]
+    fn test_resolve_crate_path_rejects_oversized() {
+        let tmp = std::env::temp_dir()
+            .join(format!("gcargo_big_{}.crate", uuid::Uuid::new_v4()));
+        std::fs::write(&tmp, vec![0u8; 4096]).unwrap();
+        // max_bytes below the file size → refused before any read.
+        let err = resolve_crate_path(tmp.to_str().unwrap(), 1024, None).unwrap_err();
+        std::fs::remove_file(&tmp).ok();
+        assert!(err.to_string().contains("exceeding"));
+    }
+
+    #[test]
+    fn test_resolve_crate_path_jail_allows_inside_and_rejects_outside() {
+        let root = std::env::temp_dir()
+            .join(format!("gcargo_jail_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+
+        // Inside the jail → accepted.
+        let inside = root.join("pkg.crate");
+        std::fs::write(&inside, b"data").unwrap();
+        let ok = resolve_crate_path(
+            inside.to_str().unwrap(),
+            DEFAULT_MAX_CRATE_BYTES,
+            Some(root.to_str().unwrap()),
+        );
+        assert!(ok.is_ok(), "file inside the artifact dir should be allowed");
+
+        // Outside the jail → refused.
+        let outside = std::env::temp_dir()
+            .join(format!("gcargo_outside_{}.crate", uuid::Uuid::new_v4()));
+        std::fs::write(&outside, b"data").unwrap();
+        let err = resolve_crate_path(
+            outside.to_str().unwrap(),
+            DEFAULT_MAX_CRATE_BYTES,
+            Some(root.to_str().unwrap()),
+        )
+        .unwrap_err();
+
+        std::fs::remove_file(&inside).ok();
+        std::fs::remove_dir(&root).ok();
+        std::fs::remove_file(&outside).ok();
+        assert!(err.to_string().contains("outside the permitted artifact directory"));
+    }
+
+    #[test]
+    fn test_is_valid_owner_segment() {
+        assert!(is_valid_owner_segment("moosenet"));
+        assert!(is_valid_owner_segment("my-org_1.x"));
+        assert!(!is_valid_owner_segment(""));
+        assert!(!is_valid_owner_segment("."));
+        assert!(!is_valid_owner_segment(".."));
+        assert!(!is_valid_owner_segment("../other"));
+        assert!(!is_valid_owner_segment("a/b"));
+        assert!(!is_valid_owner_segment("a\\b"));
+        assert!(!is_valid_owner_segment("org space"));
+    }
+
+    #[tokio::test]
+    async fn test_cargo_publish_rejects_traversal_owner() {
+        let server = MockServer::start();
+        let tmp = write_temp_crate(b"bytes");
+        let tool = CargoPublish { client: mock_client(&server) };
+        let err = tool
+            .execute(serde_json::json!({
+                "crate_path": tmp.to_str().unwrap(),
+                "name": "foo",
+                "version": "1.0.0",
+                "owner": "../../secret-org"
+            }))
+            .await
+            .unwrap_err();
+        std::fs::remove_file(&tmp).ok();
+        assert!(err.to_string().contains("Invalid registry owner"));
+    }
+
+    #[test]
+    fn test_read_bounded_crate_enforces_limit_during_read() {
+        let tmp = std::env::temp_dir()
+            .join(format!("gcargo_bounded_{}.crate", uuid::Uuid::new_v4()));
+        std::fs::write(&tmp, vec![7u8; 4096]).unwrap();
+
+        // Within the limit → full bytes returned.
+        let ok = read_bounded_crate(&tmp, tmp.to_str().unwrap(), 8192, None).unwrap();
+        assert_eq!(ok.len(), 4096);
+
+        // Below the size → refused without buffering more than max_bytes+1.
+        let err = read_bounded_crate(&tmp, tmp.to_str().unwrap(), 1024, None).unwrap_err();
+        std::fs::remove_file(&tmp).ok();
+        assert!(err.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn test_read_bounded_crate_jail_rejects_outside_via_open_handle() {
+        // A file outside the jail must be refused by the fd-based containment
+        // check, not merely by the earlier path-level pre-check.
+        let root = std::env::temp_dir()
+            .join(format!("gcargo_rbjail_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let outside = std::env::temp_dir()
+            .join(format!("gcargo_rboutside_{}.crate", uuid::Uuid::new_v4()));
+        std::fs::write(&outside, b"data").unwrap();
+
+        let err = read_bounded_crate(
+            &outside,
+            outside.to_str().unwrap(),
+            DEFAULT_MAX_CRATE_BYTES,
+            Some(root.to_str().unwrap()),
+        )
+        .unwrap_err();
+
+        // A file inside the jail is accepted.
+        let inside = root.join("ok.crate");
+        std::fs::write(&inside, b"data").unwrap();
+        let ok = read_bounded_crate(
+            &inside,
+            inside.to_str().unwrap(),
+            DEFAULT_MAX_CRATE_BYTES,
+            Some(root.to_str().unwrap()),
+        );
+
+        std::fs::remove_file(&outside).ok();
+        std::fs::remove_file(&inside).ok();
+        std::fs::remove_dir(&root).ok();
+        assert!(err.to_string().contains("outside the permitted artifact directory"));
+        assert!(ok.is_ok(), "file inside the jail should be read");
+    }
+
+    #[tokio::test]
+    async fn test_cargo_publish_requires_name_and_version() {
+        let server = MockServer::start();
+        let tmp = write_temp_crate(b"bytes");
+        let tool = CargoPublish { client: mock_client(&server) };
+        let err = tool
+            .execute(serde_json::json!({ "crate_path": tmp.to_str().unwrap(), "version": "1.0.0" }))
+            .await
+            .unwrap_err();
+        std::fs::remove_file(&tmp).ok();
+        assert!(err.to_string().contains("'name' is required"));
+    }
+
+    #[tokio::test]
+    async fn test_cargo_publish_never_leaks_token_in_error() {
+        // Token sourced from the GiteaClient (populated at startup from the
+        // runtime secret store, never read raw here). On failure it must NEVER
+        // appear in the surfaced error.
+        let secret_token = "<REDACTED-SECRET>"; // pii-test-fixture
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(PUT);
+            then.status(500).body("internal error");
+        });
+        let client = GiteaClient {
+            http: Client::new(),
+            base_url: server.base_url(),
+            token: secret_token.to_string(),
+            owner: "testorg".to_string(),
+        };
+        let tmp = write_temp_crate(b"bytes");
+        let tool = CargoPublish { client };
+        let err = tool
+            .execute(serde_json::json!({
+                "crate_path": tmp.to_str().unwrap(),
+                "name": "foo",
+                "version": "1.0.0",
+                "metadata": {}
+            }))
+            .await
+            .unwrap_err();
+        std::fs::remove_file(&tmp).ok();
+        assert!(
+            !err.to_string().contains(secret_token),
+            "token must never appear in an error message"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_register_adds_cargo_publish_with_url() {
+        let url_backup = std::env::var("GITEA_URL").ok();
+        std::env::set_var("GITEA_URL", "http://example.com");
+        let mut reg = ToolRegistry::new();
+        register(&mut reg);
+        if let Some(v) = url_backup { std::env::set_var("GITEA_URL", v); } else { std::env::remove_var("GITEA_URL"); }
+        assert!(reg.contains("gitea_cargo_publish"));
     }
 }
