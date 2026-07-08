@@ -42,12 +42,34 @@
 //! layers: (1) it is handed ONLY the work-dir path + a redacted residual list,
 //! never the source; (2) it runs with a **cleared environment** (only `PATH`,
 //! `HOME`, and the two `MIRROR_*` handoff vars — no service credentials); and
-//! (3) all mirror-engine git ops disable hooks (`core.hooksPath=/dev/null` — see
-//! [`workdir`](super::workdir)), so a `.git/hooks/pre-commit` a cleaner might plant
-//! can never execute under `finalize`'s commit and re-capture the parent's env.
-//! A full filesystem sandbox (preventing absolute-path writes outside the work dir)
-//! is the operator's deployment responsibility for the configured command — out of
-//! scope for this in-process orchestration.
+//! (3) the work dir's `.git` metadata is **snapshotted and restored around every
+//! cleaner round** ([`with_protected_git_dir`]), so nothing a cleaner writes under
+//! `.git` survives into `finalize` — a planted `.git/hooks/*`, a `.git/config`
+//! `core.worktree` redirect that would make `git add`/`commit` approve an UNSCANNED
+//! external tree, or clean/smudge filters / `gpg.program` that would run under
+//! finalize are all discarded; only work-TREE edits persist, and those are re-
+//! scanned by the gate. (All mirror-engine git ops ALSO disable hooks on the
+//! command line via `core.hooksPath=/dev/null` in [`workdir`](super::workdir) as a
+//! second layer.) A full filesystem sandbox (preventing absolute-path writes
+//! OUTSIDE the work dir) is the operator's deployment responsibility for the
+//! configured command — out of scope for this in-process orchestration.
+//!
+//! ## The security boundary is the operator's OS sandbox (authoritative)
+//! The in-process measures above (redacted inputs only, cleared env, in-memory
+//! `.git` snapshot/restore, command-line hook disabling, own-process-group +
+//! group-kill of the cleaner) are **defense-in-depth** — they contain buggy or
+//! casually-hostile cleaners. They do NOT, and structurally CANNOT, fully contain a
+//! cleaner that executes arbitrary local code: such a cleaner can write to arbitrary
+//! ABSOLUTE paths (including the source checkout), or double-fork into a new session
+//! to escape its process group and race `.git`/the work tree during finalize. There
+//! is no in-process defense against arbitrary local code execution — that is a
+//! fundamental property, not a fixable bug here. **The configured cleaning command
+//! MUST therefore be run under an OS filesystem/process sandbox (bwrap / nsjail /
+//! container with the work dir bind-mounted and nothing else, no network, killed as
+//! a unit), which is the operator's deployment responsibility and the real trust
+//! boundary.** This module enforces the git-metadata-integrity property to the
+//! extent an in-process orchestration can and defers the rest to that sandbox by
+//! design.
 //!
 //! In production the cleaner is dispatched through a config-driven command hook
 //! ([`CommandCleaner`], from [`CLEAN_CMD_ENV`]) with that cleared environment.
@@ -55,7 +77,7 @@
 //! command is configured, [`dispatch_cleaning`] escalates immediately (0 rounds)
 //! rather than silently passing residuals through.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::{json, Value};
@@ -169,7 +191,42 @@ impl ResidualCleaner for CommandCleaner {
         if let Ok(home) = std::env::var("HOME") {
             cmd.env("HOME", home);
         }
+
+        // On unix, run the cleaner in its OWN process group and reap any surviving
+        // descendants when it returns. A cleaner could otherwise fork a background
+        // process that outlives the shell (`Command::wait` reaps only the shell) and
+        // re-tamper with `.git` AFTER the caller restores it. Putting the child in a
+        // fresh group (pgid == child pid) and `killpg(pgid, SIGKILL)`-ing that group
+        // after it exits kills such forked descendants before `.git` is restored and
+        // finalize runs. (A cleaner that deliberately double-forks into a NEW SESSION
+        // to escape its process group, or writes to arbitrary absolute paths, is
+        // beyond any in-process measure and is contained only by the operator's OS
+        // sandbox — the documented security boundary on this module.)
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    let pgid = child.id() as libc::pid_t;
+                    let st = child.wait();
+                    // Terminate the whole group via a direct killpg(2) syscall — no
+                    // reliance on an external `pkill` binary (absent in minimal
+                    // containers). The group leader (the shell) has already exited;
+                    // this reaches any forked children still alive. ESRCH (empty
+                    // group) is a harmless no-op. Safe: killpg takes plain integers
+                    // and has no memory effects.
+                    unsafe {
+                        libc::killpg(pgid, libc::SIGKILL);
+                    }
+                    st
+                }
+                Err(e) => Err(e),
+            }
+        };
+        #[cfg(not(unix))]
         let status = cmd.status();
+
         let _ = std::fs::remove_file(&residuals_file);
 
         match status {
@@ -302,8 +359,19 @@ pub fn run_cleaning_pass(
     let mut residuals = initial_residuals;
 
     for round in 1..=rounds {
-        // Dispatch one cleaning round INTO THE WORK DIR ONLY.
-        cleaner.clean_round(wd.path(), &residuals)?;
+        // Dispatch one cleaning round INTO THE WORK DIR ONLY, with the `.git`
+        // metadata PROTECTED: it is snapshotted before the cleaner runs and
+        // restored after, so nothing the cleaner writes under `.git` survives into
+        // finalize. This closes the whole class of git-metadata attacks a
+        // work-dir-writable cleaner could otherwise mount — a planted
+        // `.git/hooks/*`, a `.git/config` `core.worktree` redirect that would make
+        // `git add`/`commit` approve an UNSCANNED external tree, or executable
+        // clean/smudge filters / `gpg.program` that run under finalize. Only the
+        // cleaner's work-TREE edits persist, and those are re-scanned by the gate
+        // below, preserving the "nothing is committed that the gate did not scan"
+        // guarantee. (`.git` command-line hardening in `run_git` remains a second
+        // layer.)
+        with_protected_git_dir(wd.path(), || cleaner.clean_round(wd.path(), &residuals))?;
 
         // Re-sweep + authoritative gate on the current (cleaned) work-dir tree.
         // finalize commits + tags iff the gate is now 0; it never re-syncs from
@@ -375,6 +443,137 @@ pub fn dispatch_cleaning(
             ),
         }),
     }
+}
+
+// ── `.git` protection around a cleaner round ────────────────────────────────
+
+/// One captured `.git` entry, held IN MEMORY (see [`with_protected_git_dir`]).
+enum GitEntry {
+    Dir,
+    File { bytes: Vec<u8>, mode: u32 },
+    Symlink { target: PathBuf },
+}
+
+/// Run `f` (a cleaner round) with the work dir's `.git` metadata protected: capture
+/// it into an **in-memory** snapshot first, then rebuild `.git` from that snapshot
+/// afterward regardless of `f`'s outcome. The cleaner can therefore only affect
+/// work-TREE files; nothing it writes under `.git` (hooks, a `core.worktree`
+/// redirect, clean/smudge filters, `gpg.program`) survives into the later
+/// `finalize` that trusts that metadata.
+///
+/// The snapshot lives in process memory — NOT on disk — precisely because a cleaner
+/// is not confined to its cwd: an on-disk snapshot (even a sibling temp dir) could
+/// be located and tampered with by a filesystem-writing cleaner before the restore,
+/// whereas an in-memory copy is unreachable by any filesystem operation. The work
+/// dir's `.git` is a small swept linear history, so holding it in memory briefly is
+/// cheap. A missing `.git` (defensive; prepare's `run` always creates it before any
+/// residual) skips protection and just runs `f`.
+///
+/// NOTE: this enforces GIT-METADATA integrity in-process; it does not stop a cleaner
+/// from writing to unrelated ABSOLUTE paths (e.g. the source checkout) — that
+/// requires an OS filesystem sandbox around the configured command, which is the
+/// operator's deployment responsibility (documented on the module).
+fn with_protected_git_dir<F>(work_dir: &Path, f: F) -> Result<(), ToolError>
+where
+    F: FnOnce() -> Result<(), ToolError>,
+{
+    let git_dir = work_dir.join(".git");
+    if !git_dir.exists() {
+        return f();
+    }
+    let snapshot = snapshot_git_dir(&git_dir)
+        .map_err(|e| ToolError::Execution(format!("failed snapshotting .git before cleaning: {e}")))?;
+
+    let result = f();
+
+    // Rebuild the pristine `.git` from the in-memory snapshot regardless of the
+    // cleaner's result and regardless of what it did to the live `.git` (deleted,
+    // replaced with a file, tampered).
+    restore_git_dir(&git_dir, &snapshot)
+        .map_err(|e| ToolError::Execution(format!("failed restoring pristine .git after cleaning: {e}")))?;
+
+    result
+}
+
+/// Read an entire `.git` tree into an in-memory snapshot (relative path → entry).
+/// Directories precede their contents (so restore creates parents first). Symlinks
+/// are captured as their target, never followed.
+fn snapshot_git_dir(git_dir: &Path) -> std::io::Result<Vec<(PathBuf, GitEntry)>> {
+    fn walk(base: &Path, cur: &Path, out: &mut Vec<(PathBuf, GitEntry)>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(cur)? {
+            let entry = entry?;
+            let path = entry.path();
+            let rel = path.strip_prefix(base).unwrap_or(&path).to_path_buf();
+            let ft = entry.file_type()?;
+            if ft.is_symlink() {
+                let target = std::fs::read_link(&path)?;
+                out.push((rel, GitEntry::Symlink { target }));
+            } else if ft.is_dir() {
+                out.push((rel, GitEntry::Dir));
+                walk(base, &path, out)?;
+            } else {
+                let bytes = std::fs::read(&path)?;
+                #[cfg(unix)]
+                let mode = {
+                    use std::os::unix::fs::MetadataExt;
+                    entry.metadata()?.mode()
+                };
+                #[cfg(not(unix))]
+                let mode = 0o644;
+                out.push((rel, GitEntry::File { bytes, mode }));
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(git_dir, git_dir, &mut out)?;
+    Ok(out)
+}
+
+/// Rebuild `.git` from an in-memory snapshot. Robustly removes whatever the cleaner
+/// left at `git_dir` first — a directory, a file/symlink it was replaced with, or
+/// nothing at all (`NotFound` is fine) — then recreates every captured entry.
+fn restore_git_dir(git_dir: &Path, snapshot: &[(PathBuf, GitEntry)]) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(git_dir) {
+        Ok(md) => {
+            if md.file_type().is_dir() {
+                std::fs::remove_dir_all(git_dir)?;
+            } else {
+                std::fs::remove_file(git_dir)?;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::create_dir_all(git_dir)?;
+    for (rel, entry) in snapshot {
+        let dst = git_dir.join(rel);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match entry {
+            GitEntry::Dir => {
+                std::fs::create_dir_all(&dst)?;
+            }
+            GitEntry::Symlink { target } => {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(target, &dst)?;
+                #[cfg(not(unix))]
+                std::fs::write(&dst, target.to_string_lossy().as_bytes())?;
+            }
+            GitEntry::File { bytes, mode } => {
+                std::fs::write(&dst, bytes)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(*mode))?;
+                }
+                #[cfg(not(unix))]
+                let _ = mode;
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -855,6 +1054,106 @@ mod tests {
         );
 
         cleanup(&[&src, &wd_path, &sentinel]);
+    }
+
+    // ── a cleaner's .git tampering does NOT survive into finalize ─────────────
+    // (codex round 4 P1) A cleaner could set core.worktree in .git/config to an
+    // EXTERNAL tree so `git add`/commit approve unscanned content, or plant filters
+    // / gpg programs. with_protected_git_dir must snapshot+restore .git so only the
+    // work-TREE edits (re-scanned by the gate) survive.
+    #[test]
+    #[serial]
+    fn cleaner_git_config_tampering_does_not_survive() {
+        clear_env();
+        let src = init_source(&[(
+            "config.txt",
+            "token = \"<REDACTED-SECRET>\"\n", // pii-test-fixture
+        )]);
+        let wd_path = unique("wd");
+        let mgr = MirrorWorkDir::new("Terminus", &src, &wd_path);
+        let sha = run_git(&src, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let report = mgr.run().unwrap();
+        assert!(!report.residual_violations.is_empty());
+
+        // An EXTERNAL tree the attacker wants committed instead — it carries PII
+        // that the gate would flag if it were ever scanned/committed.
+        let external = unique("external-worktree");
+        std::fs::create_dir_all(&external).unwrap();
+        write_file(&external, "leak.txt", "<internal-ip> secret host\n"); // pii-test-fixture
+        let external_s = external.display().to_string();
+
+        // Cleaner: fix the real work-tree file, but ALSO redirect core.worktree and
+        // append a hostile config stanza.
+        struct ConfigTamperer {
+            external: String,
+        }
+        impl ResidualCleaner for ConfigTamperer {
+            fn clean_round(&self, work_dir: &Path, _r: &[TreeViolation]) -> Result<(), ToolError> {
+                write_file(work_dir, "config.txt", "cleaned\n");
+                // Point core.worktree at the external (PII-bearing) tree.
+                run_git(work_dir, &["config", "core.worktree", &self.external]).unwrap();
+                Ok(())
+            }
+        }
+
+        let outcome = run_cleaning_pass(
+            &mgr,
+            &sha,
+            report.residual_violations.clone(),
+            &ConfigTamperer { external: external_s },
+            MAX_CLEAN_ROUNDS,
+        )
+        .unwrap();
+
+        // The .git restore drops the core.worktree redirect, so finalize commits the
+        // real work dir's CLEANED file and the gate stays satisfied.
+        assert!(outcome.is_cleaned(), "cleaned work-tree file → approved: {outcome:?}");
+
+        // The committed tree is the work dir's cleaned file — NOT the external leak.
+        let tracked = run_git(&wd_path, &["ls-tree", "-r", "--name-only", "HEAD"]).unwrap();
+        assert!(tracked.lines().any(|l| l.trim() == "config.txt"), "work file committed: {tracked}");
+        assert!(!tracked.lines().any(|l| l.trim() == "leak.txt"), "external leak NOT committed: {tracked}");
+        // core.worktree tampering did not persist in the restored .git.
+        let cfg = run_git(&wd_path, &["config", "--get", "core.worktree"]);
+        assert!(cfg.is_err() || cfg.unwrap().trim().is_empty(), "core.worktree redirect must be gone");
+
+        cleanup(&[&src, &wd_path, &external]);
+    }
+
+    // ── restore rebuilds .git even when a cleaner DELETES it (codex r5 P2) ────
+    #[test]
+    #[serial]
+    fn restore_rebuilds_git_when_cleaner_removes_it() {
+        clear_env();
+        let src = init_source(&[(
+            "config.txt",
+            "token = \"<REDACTED-SECRET>\"\n", // pii-test-fixture
+        )]);
+        let wd_path = unique("wd");
+        let mgr = MirrorWorkDir::new("Terminus", &src, &wd_path);
+        let sha = run_git(&src, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let report = mgr.run().unwrap();
+        assert!(!report.residual_violations.is_empty());
+
+        // A cleaner that fixes the file but then blows away .git entirely.
+        struct GitDeleter;
+        impl ResidualCleaner for GitDeleter {
+            fn clean_round(&self, work_dir: &Path, _r: &[TreeViolation]) -> Result<(), ToolError> {
+                write_file(work_dir, "config.txt", "cleaned\n");
+                std::fs::remove_dir_all(work_dir.join(".git")).unwrap();
+                Ok(())
+            }
+        }
+
+        let outcome =
+            run_cleaning_pass(&mgr, &sha, report.residual_violations.clone(), &GitDeleter, MAX_CLEAN_ROUNDS)
+                .unwrap();
+        // .git was rebuilt from the in-memory snapshot → finalize commits + tags.
+        assert!(outcome.is_cleaned(), "restore-regardless must survive .git deletion: {outcome:?}");
+        assert!(wd_path.join(".git").is_dir(), ".git rebuilt");
+        assert!(tag_list(&wd_path).contains(&approved_tag(&sha)));
+
+        cleanup(&[&src, &wd_path]);
     }
 
     // ── the cleaner does NOT inherit parent service credentials ───────────────
