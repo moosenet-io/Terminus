@@ -251,10 +251,14 @@ pub fn scan_for_pii(content: &str) -> Vec<PiiViolation> {
 /// line/category. Logs a one-line audit record (pass/fail + count) without
 /// ever logging secret values.
 pub fn pii_gate(content: &str) -> Result<(), ToolError> {
-    // Use the full authoritative rule set (built-in patterns + extension rules +
-    // any `TERMINUS_PII_CONFIG` terms/patterns), so the mandatory write gate has
-    // the same coverage the tree-sweep hook advertises — JWTs, PEM keys, cloud
-    // keys, quoted secrets, and configured terms are all blocked here too.
+    // Full authoritative rule set: built-in patterns + extension rules (JWTs,
+    // PEM keys, cloud keys, quoted secrets) + any `TERMINUS_PII_CONFIG` terms.
+    // The runtime service has no repo checkout, so config comes from the
+    // `TERMINUS_PII_CONFIG` env var (the service's materialized config), not a
+    // repo-root `pii-gate.toml` — hence `None`. The pre-push hook, which DOES
+    // run in a checkout, additionally reads `<root>/pii-gate.toml`; both surfaces
+    // resolve through the same `ruleset_from_config` so the built-in + extension
+    // coverage is identical and any env-configured terms apply everywhere.
     let violations = ruleset_from_config(None).scan_content(content);
 
     if violations.is_empty() {

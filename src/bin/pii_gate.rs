@@ -37,7 +37,9 @@
 //! # (or copy the binary and point core.hooksPath at it)
 //! ```
 
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -64,14 +66,40 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Read a git blob (`<rev>:<path>`, or `:<path>` for the index) as text.
-/// Returns `None` for binary (NUL-containing) or unreadable blobs.
-fn read_blob(root: &Path, rev: &str, rel: &str) -> Option<Vec<u8>> {
-    let spec = format!("{rev}:{rel}");
+/// Run a git command in `root`, returning raw stdout bytes. Used for `-z`
+/// (NUL-delimited) path listings, where a filename may contain a newline, tab,
+/// quote, backslash, or non-UTF-8 byte that a line-based / UTF-8-lossy parse
+/// would corrupt — silently dropping the file and creating a detection bypass.
+fn git_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["show", &spec])
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to execute git {args:?}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(out.stdout)
+}
+
+/// Read a git blob (`<rev>:<path>`, or `:<path>` for the index) as raw bytes.
+/// `rel` is the exact path bytes as git reported them (`-z` output), so
+/// filenames containing shell/UTF-8-hostile bytes resolve correctly instead of
+/// failing `git show` and being skipped. Returns `None` for unreadable blobs.
+fn read_blob(root: &Path, rev: &str, rel: &[u8]) -> Option<Vec<u8>> {
+    // Build the `<rev>:<path>` pathspec as an OsString so non-UTF-8 path bytes
+    // round-trip exactly, rather than going through a lossy String.
+    let mut spec = OsString::from(format!("{rev}:"));
+    spec.push(OsStr::from_bytes(rel));
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("show")
+        .arg(&spec)
         .output()
         .ok()?;
     if !out.status.success() {
@@ -80,10 +108,23 @@ fn read_blob(root: &Path, rev: &str, rel: &str) -> Option<Vec<u8>> {
     Some(out.stdout)
 }
 
+/// Split line-based git output (SHAs — always ASCII-safe) into trimmed,
+/// non-empty entries.
 fn names(out: &str) -> Vec<String> {
     out.lines()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Split NUL-delimited (`-z`) git output into raw path byte-strings, dropping
+/// empties. Paths are kept as bytes (never line-split, never UTF-8-lossied) so
+/// no filename can smuggle content past the gate.
+fn paths_z(bytes: &[u8]) -> Vec<Vec<u8>> {
+    bytes
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_vec())
         .collect()
 }
 
@@ -107,12 +148,14 @@ fn load_ruleset(root: &Path) -> PiiRuleSet {
     ruleset_from_config(Some(root))
 }
 
-/// Scan a set of `(rev, path)` blobs, honoring exclusions and the
-/// `pii-test-fixture` line-exact exemption.
-fn scan_blobs(root: &Path, rs: &PiiRuleSet, entries: &[(String, String)]) -> Vec<TreeViolation> {
+/// Scan a set of `(rev, path-bytes)` blobs, honoring exclusions and the
+/// `pii-test-fixture` line-exact exemption. Paths are raw bytes so no filename
+/// can evade the scan.
+fn scan_blobs(root: &Path, rs: &PiiRuleSet, entries: &[(String, Vec<u8>)]) -> Vec<TreeViolation> {
     let mut out = Vec::new();
     for (rev, rel) in entries {
-        if rs.is_excluded(Path::new(rel)) {
+        let rel_path = Path::new(OsStr::from_bytes(rel));
+        if rs.is_excluded(rel_path) {
             continue;
         }
         let bytes = match read_blob(root, rev, rel) {
@@ -128,9 +171,10 @@ fn scan_blobs(root: &Path, rs: &PiiRuleSet, entries: &[(String, String)]) -> Vec
             .map(|l| if l.contains("pii-test-fixture") { "" } else { l })
             .collect::<Vec<_>>()
             .join("\n");
+        let file = String::from_utf8_lossy(rel).into_owned();
         for v in rs.scan_content(&scrubbed) {
             out.push(TreeViolation {
-                file: rel.clone(),
+                file: file.clone(),
                 line: v.line,
                 pattern_kind: v.category,
                 context: v.context,
@@ -144,7 +188,7 @@ fn scan_blobs(root: &Path, rs: &PiiRuleSet, entries: &[(String, String)]) -> Vec
 /// push introduces — not just the tip — so a secret added in an intermediate
 /// commit and removed by the tip is still caught (it would otherwise enter
 /// permanent remote history). Fails closed on any git error.
-fn prepush_entries(root: &Path) -> Result<Vec<(String, String)>, String> {
+fn prepush_entries(root: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut stdin = String::new();
     std::io::stdin()
         .read_to_string(&mut stdin)
@@ -164,13 +208,17 @@ fn prepush_entries(root: &Path) -> Result<Vec<(String, String)>, String> {
         // Commits introduced by this push. For an existing remote ref that is an
         // exact range; for a new branch, everything reachable from the tip that
         // is not already on a remote-tracking branch (fail-safe: if no remotes
-        // are tracked this scans full history rather than nothing).
+        // are tracked this scans full history rather than nothing). rev-list
+        // emits SHAs (ASCII), so line parsing is safe here.
         let commits = if remote_sha == NULL_SHA {
             let listed = names(&git(root, &["rev-list", local_sha, "--not", "--remotes"])?);
             if listed.is_empty() {
                 // Nothing unique found — fall back to the full tip tree so we
-                // never scan an empty set on a first push.
-                for f in names(&git(root, &["ls-tree", "-r", "--name-only", local_sha])?) {
+                // never scan an empty set on a first push. `-z` keeps paths raw.
+                for f in paths_z(&git_bytes(
+                    root,
+                    &["ls-tree", "-r", "--name-only", "-z", local_sha],
+                )?) {
                     entries.push((local_sha.to_string(), f));
                 }
                 continue;
@@ -182,10 +230,12 @@ fn prepush_entries(root: &Path) -> Result<Vec<(String, String)>, String> {
 
         for c in commits {
             // Files changed by commit `c` (vs its parent; `--root` so the repo's
-            // first commit lists all its files). Blob is read at `c` in scan_blobs.
-            let files = names(&git(
+            // first commit lists all its files). `-z` emits raw NUL-delimited
+            // paths so no filename can smuggle a blob past the gate. Blob is read
+            // at `c` in scan_blobs.
+            let files = paths_z(&git_bytes(
                 root,
-                &["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", &c],
+                &["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "-z", &c],
             )?);
             for f in files {
                 entries.push((c.clone(), f));
@@ -198,8 +248,9 @@ fn prepush_entries(root: &Path) -> Result<Vec<(String, String)>, String> {
 }
 
 /// Enumerate `("", path)` staged (index) blobs. Fails closed on git error.
-fn staged_entries(root: &Path) -> Result<Vec<(String, String)>, String> {
-    let files = names(&git(root, &["diff", "--cached", "--name-only"])?);
+/// `-z` keeps paths raw so hostile filenames cannot evade the staged scan.
+fn staged_entries(root: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let files = paths_z(&git_bytes(root, &["diff", "--cached", "--name-only", "-z"])?);
     Ok(files.into_iter().map(|f| (String::new(), f)).collect())
 }
 
