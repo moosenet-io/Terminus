@@ -508,47 +508,52 @@ impl RateLimiter {
 
     /// Block until this call may proceed.
     ///
-    /// Two gates combine, and the caller waits for the LARGER:
-    /// - the shared Redis reservation (cross-process coordination), best-effort:
-    ///   a Redis failure/timeout/outage simply yields a zero cross-process wait
-    ///   (fail-open) — it never blocks or fails the call;
-    /// - the per-process local gate (`min_interval` since this process's last
-    ///   ACTUAL issue), ALWAYS applied as a safety floor.
+    /// Two gates apply IN ORDER, and the local lock is held across both so a
+    /// process's Plane calls are strictly serialised:
+    /// 1. The per-process floor (`min_interval` since this process's last ACTUAL
+    ///    issue) is enforced FIRST. This is always applied, so pacing holds no
+    ///    matter how Redis behaves.
+    /// 2. Only THEN is the shared Redis slot reserved — at ~the actual send time,
+    ///    best-effort. Reserving after the local wait (rather than before) means
+    ///    the Redis key records the real send time, so other processes reserve
+    ///    subsequent slots correctly even right after a Redis flush/recovery; a
+    ///    Redis failure/timeout/outage just yields a zero wait (fail-open) and
+    ///    never blocks or fails the call.
     ///
-    /// The local lock is held across the Redis reservation AND the sleep, so this
-    /// process's Plane calls are strictly serialised and spaced by at least
-    /// `min_interval` no matter how Redis behaves — down, dying mid-flight, or a
-    /// restart/flush that resets its key can never produce an intra-process burst.
-    /// (Serialising a process's own Plane calls is exactly the intended pacing:
-    /// the whole point is to not hammer Plane, so there is nothing to pipeline.)
+    /// Serialising a process's own Plane calls is exactly the intended pacing —
+    /// the whole point is to not hammer Plane, so there is nothing to pipeline —
+    /// and no Redis state (down, mid-flight death, restart/flush) can produce an
+    /// intra-process burst.
     async fn acquire(&self) {
         // Pacing disabled → nothing to gate (and no Redis round-trip).
         if self.min_interval.is_zero() {
             return;
         }
-        // Held across the reservation + sleep → per-process serialisation.
+        // Held across both waits → per-process serialisation.
         let mut last = self.last.lock().await;
 
-        // Cross-process pacing (best-effort). `None` (unconfigured OR any Redis
-        // failure) collapses to a zero wait; the local floor below still applies.
-        let redis_wait = match &self.redis {
-            Some(backend) => backend.rate_reserve(self.min_interval).await.unwrap_or(Duration::ZERO),
-            None => Duration::ZERO,
-        };
-
-        // Per-process floor from the last ACTUAL issue time.
-        let now = Instant::now();
-        let local_wait = match *last {
-            Some(prev) => (prev + self.min_interval).saturating_duration_since(now),
-            None => Duration::ZERO,
-        };
-
-        let wait = local_wait.max(redis_wait);
-        if !wait.is_zero() {
-            tokio::time::sleep(wait).await;
+        // 1. Per-process floor from the last ACTUAL issue time, enforced first so
+        //    we never reserve a shared slot earlier than this process can send.
+        if let Some(prev) = *last {
+            let now = Instant::now();
+            let floor = prev + self.min_interval;
+            if floor > now {
+                tokio::time::sleep(floor - now).await;
+            }
         }
+
+        // 2. Reserve the shared cross-process slot at ~the actual send time
+        //    (best-effort). `None` (unconfigured OR any Redis failure) = zero wait.
+        if let Some(backend) = &self.redis {
+            if let Some(redis_wait) = backend.rate_reserve(self.min_interval).await {
+                if !redis_wait.is_zero() {
+                    tokio::time::sleep(redis_wait).await;
+                }
+            }
+        }
+
         // Record the ACTUAL issue time (post-sleep) so the next caller is spaced
-        // from when this request really went out, even if the wakeup overslept.
+        // from when this request really went out, even if a wakeup overslept.
         *last = Some(Instant::now());
     }
 }
@@ -591,6 +596,10 @@ impl GetCache {
         // a Redis failure both fall through to the in-process map (fail-open).
         if let Some(backend) = &self.redis {
             if let Some(body) = backend.cache_get(&redis_cache_key(key)).await {
+                // Warm the in-process fallback so a Redis outage within the TTL
+                // still serves this entry instead of refetching from Plane —
+                // important for instances that mostly consume shared cache hits.
+                self.entries.lock().await.insert(key.to_string(), (Instant::now(), body.clone()));
                 return Some(body);
             }
         }
