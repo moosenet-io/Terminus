@@ -1,0 +1,458 @@
+# Plane prefix registry — reviewed baseline (source of truth).
+#
+# A queryable library of USED/ACTIVE sub-project + issue prefixes (the 2-8 char
+# item-ID prefixes like SCRB, ROUT, RMDR — NOT the per-repo Plane *project*
+# prefixes HARM/LUM/CHRD/TERM/RAIL/HW/PSH).
+#
+# This file is the git-versioned baseline half of the hybrid prefix store
+# (see src/plane/prefix.rs). It is compiled into the terminus binary via
+# `include_str!`, so baseline reads always work even with no Redis and no cwd.
+# Runtime claims land in the shared Redis overlay first (via
+# `plane_prefix_register`); promotion of an overlay claim into this file happens
+# later through a small reviewed PR (add a `[[prefix]]` block here, drop the
+# overlay claim).
+#
+# Fields per entry:
+#   prefix       required, 2-8 chars, starts with a letter, [A-Z0-9]
+#   name         full human-readable name/title
+#   project      owning Plane project (HARM/LUM/CHRD/TERM/RAIL/HW/PSH); some
+#                pre-consolidation entries are best-effort ("inferred")
+#   spec_id      originating spec id (S{session}-{slug}) when known
+#   status       active | retired | ingested | complete
+#   description  one-line summary
+#   created      ISO date (YYYY-MM-DD) when known, else empty
+#
+# Seeded (S101) from: the moosenet-spec SKILL.md Spec Registry table, a scan of
+# scratch/spec-staging spec frontmatter + item headers, and known recent
+# session prefixes. De-duped.
+
+# ── Harmony-era Spec Registry (from moosenet-spec SKILL.md) ──────────────────
+
+[[prefix]]
+prefix = "HAR"
+name = "Harmony v3"
+project = "HARM"
+spec_id = "S24-harmony-v3"
+status = "complete"
+description = "Harmony orchestrator v3 baseline."
+created = ""
+
+[[prefix]]
+prefix = "ENR"
+name = "Enrichment multi-mode"
+project = "HARM"
+spec_id = "S26-enrichment-multimode"
+status = "complete"
+description = "Local/cloud/auto enrichment mode selection for task ingest."
+created = ""
+
+[[prefix]]
+prefix = "VEC"
+name = "Vector integration"
+project = "HARM"
+spec_id = "S27-vector-integration"
+status = "complete"
+description = "Vector agent-loop integration into Harmony."
+created = ""
+
+[[prefix]]
+prefix = "TUI"
+name = "TUI Rust cache"
+project = "HARM"
+spec_id = "S28-tui-rust-cache"
+status = "complete"
+description = "Rust TUI state cache."
+created = ""
+
+[[prefix]]
+prefix = "PRE"
+name = "Pre-enrichment"
+project = "HARM"
+spec_id = "S28-pre-enrichment"
+status = "complete"
+description = "Pre-enriched item format eliminating the enrichment queue."
+created = ""
+
+[[prefix]]
+prefix = "RST"
+name = "Rust migration"
+project = "HARM"
+spec_id = "S30-rust-migration"
+status = "complete"
+description = "Python-to-Rust migration of Harmony core."
+created = ""
+
+[[prefix]]
+prefix = "API"
+name = "API clients"
+project = "HARM"
+spec_id = "S30-api-clients"
+status = "complete"
+description = "Typed API clients for external services."
+created = ""
+
+[[prefix]]
+prefix = "SEC"
+name = "Security hardening"
+project = "HARM"
+spec_id = "S31-security-hardening"
+status = "complete"
+description = "Security hardening pass."
+created = ""
+
+[[prefix]]
+prefix = "INS"
+name = "Installer onboarding"
+project = "HARM"
+spec_id = "S31-installer-onboarding"
+status = "complete"
+description = "Installer and onboarding flow."
+created = ""
+
+[[prefix]]
+prefix = "TRIAL"
+name = "Pipeline trial"
+project = "HARM"
+spec_id = "S32-pipeline-trial"
+status = "complete"
+description = "End-to-end build-pipeline trial run."
+created = ""
+
+[[prefix]]
+prefix = "TOOL"
+name = "Tool calling"
+project = "HARM"
+spec_id = "S32-tool-calling"
+status = "complete"
+description = "Tool-calling support."
+created = ""
+
+[[prefix]]
+prefix = "COND"
+name = "Conductor"
+project = "HARM"
+spec_id = "S33-conductor"
+status = "complete"
+description = "Conductor dispatch/routing."
+created = ""
+
+[[prefix]]
+prefix = "DREAM"
+name = "Dream engram"
+project = "LUM"
+spec_id = "S33-dream-engram"
+status = "complete"
+description = "Dream-phase engram consolidation (Engram module; project inferred)."
+created = ""
+
+[[prefix]]
+prefix = "BEH"
+name = "Behavioral verification"
+project = "HARM"
+spec_id = "S34-behavioral-verification"
+status = "complete"
+description = "Behavior-spec verification harness."
+created = ""
+
+[[prefix]]
+prefix = "INF"
+name = "Inference scheduler"
+project = "HARM"
+spec_id = "S34-inference-scheduler"
+status = "complete"
+description = "Inference scheduling (Synapse module; project inferred)."
+created = ""
+
+[[prefix]]
+prefix = "COND2"
+name = "Conductor enhancements"
+project = "HARM"
+spec_id = "S34-conductor-enhancements"
+status = "complete"
+description = "Conductor enhancements follow-up."
+created = ""
+
+[[prefix]]
+prefix = "DURA"
+name = "Dura v2"
+project = "HARM"
+spec_id = "S25-dura-v2"
+status = "ingested"
+description = "System-admin/DR module v2 (Dura module; project inferred)."
+created = ""
+
+[[prefix]]
+prefix = "SYN"
+name = "Synapse"
+project = "HARM"
+spec_id = "S25-synapse"
+status = "ingested"
+description = "Inference orchestration / VRAM scheduling (Synapse module; project inferred)."
+created = ""
+
+[[prefix]]
+prefix = "LEDGER"
+name = "Ledger"
+project = "HARM"
+spec_id = "S25-ledger"
+status = "ingested"
+description = "Finance/budgeting module (Ledger module; project inferred)."
+created = ""
+
+[[prefix]]
+prefix = "S35"
+name = "Deferred completion"
+project = "HARM"
+spec_id = "S35-deferred-completion"
+status = "complete"
+description = "Deferred-completion handling."
+created = ""
+
+[[prefix]]
+prefix = "VAULT"
+name = "Encrypted vault"
+project = "HARM"
+spec_id = "S36-encrypted-vault"
+status = "complete"
+description = "Encrypted secret vault replacing plaintext env files."
+created = ""
+
+# ── Recent sprint prefixes (S70–S85) ─────────────────────────────────────────
+
+[[prefix]]
+prefix = "EMEM"
+name = "Engram v2 memory"
+project = "LUM"
+spec_id = "S70-engram-v2"
+status = "complete"
+description = "Engram v2 agent-memory build."
+created = ""
+
+[[prefix]]
+prefix = "ESEC"
+name = "Engram security"
+project = "LUM"
+spec_id = "S70-security-sprint"
+status = "complete"
+description = "Engram security-sprint hardening."
+created = ""
+
+[[prefix]]
+prefix = "WEB"
+name = "Web / APIs / Skills"
+project = "LUM"
+spec_id = "S71-web-apis-skills"
+status = "complete"
+description = "Web fetch, APIs, and skills tooling sprint."
+created = ""
+
+[[prefix]]
+prefix = "CHORD"
+name = "Chord expansion"
+project = "CHRD"
+spec_id = "S72-chord-expansion"
+status = "complete"
+description = "Chord proxy/orchestrator expansion sprint."
+created = ""
+
+[[prefix]]
+prefix = "LIVE"
+name = "Agentic execution live fixes"
+project = "CHRD"
+spec_id = "S73-agentic-execution"
+status = "complete"
+description = "Chat-completions proxy + model-alias resolution live fixes."
+created = ""
+
+[[prefix]]
+prefix = "HRNS"
+name = "Harness-1"
+project = "CHRD"
+spec_id = "S74-harness-1"
+status = "complete"
+description = "Harness-1 model harness sprint."
+created = ""
+
+[[prefix]]
+prefix = "DPROMPT"
+name = "Dynamic prompt"
+project = "LUM"
+spec_id = "S75-dynamic-prompt"
+status = "complete"
+description = "Dynamic prompt assembler + orchestrator."
+created = ""
+
+[[prefix]]
+prefix = "RESP"
+name = "Response fidelity"
+project = "LUM"
+spec_id = "S77-response-fidelity"
+status = "complete"
+description = "SSE tool-dispatch ack + anti-fabrication + capability accuracy."
+created = ""
+
+[[prefix]]
+prefix = "CONV"
+name = "Conversation context"
+project = "LUM"
+spec_id = "S78-conversation-context"
+status = "complete"
+description = "Tier-1 conversation working-memory context."
+created = ""
+
+[[prefix]]
+prefix = "DGEM"
+name = "DiffusionGemma review tool"
+project = "TERM"
+spec_id = "S80-diffusiongemma-tool"
+status = "complete"
+description = "Local DiffusionGemma secondary-reviewer tool (dgem_review)."
+created = ""
+
+[[prefix]]
+prefix = "PUB"
+name = "Public release"
+project = "TERM"
+spec_id = "S81-public-release"
+status = "complete"
+description = "Public-release gate hardening + clean exports + docs."
+created = ""
+
+[[prefix]]
+prefix = "ASMT"
+name = "Assistant sweep"
+project = "HARM"
+spec_id = "S84-assistant-sweep"
+status = "active"
+description = "Assistant judge/sweep pipeline (runtime staging gap, ASMT-10)."
+created = ""
+
+[[prefix]]
+prefix = "SRV"
+name = "Serving profile"
+project = "CHRD"
+spec_id = "S85-serving-profile"
+status = "active"
+description = "Model serving-profile pins + docs."
+created = ""
+
+# ── Recent scratch/staging specs (S90–S99) ───────────────────────────────────
+
+[[prefix]]
+prefix = "PLM"
+name = "Harmony Plane access consolidation"
+project = "HARM"
+spec_id = "S90-harmony-plane-consolidation"
+status = "active"
+description = "Route Harmony Plane access through the single sanctioned Terminus path."
+created = "2026-07-07"
+
+[[prefix]]
+prefix = "SCRB"
+name = "Scribe: agentic knowledge infrastructure"
+project = "TERM"
+spec_id = "S91-scribe-knowledge-infrastructure"
+status = "active"
+description = "Scribe build-diary/blog vault tooling (SCRB-01..06)."
+created = "2026-07-07"
+
+[[prefix]]
+prefix = "ROUT"
+name = "Hybrid model routing"
+project = "CHRD"
+spec_id = "S92-hybrid-model-routing"
+status = "ingested"
+description = "Hybrid deterministic + local-reasoning model routing."
+created = "2026-07-07"
+
+[[prefix]]
+prefix = "ALGN"
+name = "Harmony/Terminus/Chord alignment"
+project = "HARM"
+spec_id = "S93-harmony-terminus-chord-alignment"
+status = "ingested"
+description = "Align Harmony to route Plane/Git/Gitea via Terminus, defer model selection to Chord."
+created = "2026-07-07"
+
+[[prefix]]
+prefix = "PPAT"
+name = "Plane PAT identity convention"
+project = "TERM"
+spec_id = "S94-plane-pat-identity-convention"
+status = "complete"
+description = "Per-agent PLANE_PAT_<NAME> multi-identity support (shipped, main 806e701)."
+created = "2026-07-08"
+
+[[prefix]]
+prefix = "MEDIA"
+name = "Media domain orchestration"
+project = "LUM"
+spec_id = "S94-media-domain"
+status = "ingested"
+description = "Sovereign media-domain orchestration with Lumina as the surface (staging)."
+created = ""
+
+[[prefix]]
+prefix = "RMDR"
+name = "Reminder scheduler client"
+project = "LUM"
+spec_id = "S95-lumina-core-direct-terminus-reminder-client"
+status = "active"
+description = "Direct lumina-core -> Terminus client for the reminder scheduler."
+created = "2026-07-07"
+
+[[prefix]]
+prefix = "PSEC"
+name = "terminus_personal runtime secret fetch"
+project = "TERM"
+spec_id = "S96-terminus-personal-runtime-secret-fetch"
+status = "complete"
+description = "terminus_personal fetches downstream secrets from the secret manager at runtime."
+created = "2026-07-08"
+
+[[prefix]]
+prefix = "CSEC"
+name = "Chord runtime secret client"
+project = "CHRD"
+spec_id = "S97-chord-<secret-manager>-client"
+status = "complete"
+description = "Chord runtime secret-manager client."
+created = "2026-07-08"
+
+[[prefix]]
+prefix = "LSEC"
+name = "Lumina-core runtime secret client"
+project = "LUM"
+spec_id = "S98-lumina-core-<secret-manager>-client"
+status = "complete"
+description = "lumina-core runtime secret-manager client alongside the local vault."
+created = "2026-07-08"
+
+[[prefix]]
+prefix = "TINF"
+name = "Terminus-wide secret wiring"
+project = "TERM"
+spec_id = "S99-terminus-wide-<secret-manager>-wiring"
+status = "ingested"
+description = "Wire the runtime secret client into gitea/plane/github modules, MCP server, review daemon."
+created = "2026-07-08"
+
+# ── Cross-cutting / component prefixes (in active use, session inferred) ──────
+
+[[prefix]]
+prefix = "WTYPE"
+name = "Work-type / test-outcome gating"
+project = "HARM"
+spec_id = ""
+status = "active"
+description = "Per-project work-type detection and test-outcome gating (project inferred)."
+created = ""
+
+[[prefix]]
+prefix = "CPROX"
+name = "Chord coding-proxy endpoint"
+project = "CHRD"
+spec_id = ""
+status = "active"
+description = "Chord coding-proxy model-selection endpoint wiring (project inferred)."
+created = ""

@@ -58,6 +58,7 @@
 //! additionally perform a real authenticated read (`verify: true`) to prove a
 //! given identity's token is currently accepted (200) versus rejected (401/403).
 
+pub mod prefix;
 pub mod types;
 
 use std::borrow::Cow;
@@ -2649,6 +2650,11 @@ pub fn register(registry: &mut ToolRegistry) {
             tracing::warn!("Failed to register plane tool: {e}");
         }
     }
+
+    // Prefix-registry sub-tools (plane_prefix_*), a SUB-MODULE of this helper —
+    // registered through the same single entry point so they surface in BOTH
+    // the core Chord registry and the personal registry alongside `plane_*`.
+    prefix::register(registry);
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -2960,7 +2966,7 @@ mod tests {
         assert!(result.contains("No projects"), "{result}");
     }
 
-    // ── register() populates 28 tools ─────────────────────────────────────────
+    // ── register() populates 28 core plane tools + 5 prefix sub-tools ─────────
 
     #[test]
     fn test_register_all_plane_tools() {
@@ -2968,8 +2974,9 @@ mod tests {
         // (not required for registration, only for execution)
         let mut registry = ToolRegistry::new();
         register(&mut registry);
-        assert_eq!(registry.len(), 28,
-            "Expected 28 plane tools, got {}", registry.len());
+        // 28 core plane_* tools + 5 plane_prefix_* sub-tools (see prefix::register).
+        assert_eq!(registry.len(), 33,
+            "Expected 33 plane tools (28 core + 5 prefix), got {}", registry.len());
     }
 
     #[test]
