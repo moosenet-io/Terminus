@@ -12,8 +12,22 @@
 //! - `PLANE_WORKSPACE` — workspace slug (default: "moosenet")
 //! - `PLANE_RPM` / `PLANE_RATE_SHARE` — proactive pacing, default 60 RPM / share of 3
 //!   (60/3 = 20 effective RPM = 3s minimum interval between requests, shared across
-//!   every tool call in this process via a single in-process rate limiter)
-//! - `PLANE_CACHE_TTL_SECS` — in-memory GET response cache TTL, default 5s
+//!   every tool call via a single rate limiter)
+//! - `PLANE_CACHE_TTL_SECS` — GET response cache TTL, default 5s
+//!
+//! ### Optional shared Redis backend
+//! When `PLANE_REDIS_URL` (e.g. `redis://host:port/0`) is set, the GET cache AND
+//! the rate limiter are coordinated through one shared Redis instance, so every
+//! terminus process that talks to Plane shares a single cache and a single
+//! coordinated rate budget instead of each keeping a private in-process copy.
+//! This is robustly fail-open: every Redis op is short-timeout-bounded and
+//! circuit-breaker-guarded, and on any Redis error/timeout/outage the call
+//! transparently falls back to the in-process cache/limiter — Redis being down
+//! never blocks or fails a Plane call. When `PLANE_REDIS_URL` is unset/empty the
+//! behaviour is identical to a pure in-process cache + limiter (the default).
+//! - `PLANE_REDIS_URL` — Redis endpoint; unset/empty disables the shared backend
+//! - `PLANE_REDIS_PASSWORD` — optional AUTH password (kept out of the URL)
+//! - `PLANE_REDIS_TIMEOUT_MS` — per-op Redis timeout, default 200ms
 //!
 //! When `PLANE_API_URL` is not set the tools register normally but return
 //! `ToolError::NotConfigured` on every call.
@@ -49,12 +63,16 @@ pub mod types;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use redis::aio::ConnectionManager;
+use redis::IntoConnectionInfo;
 use reqwest::{Client, Response, StatusCode};
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::OnceCell;
 use tracing::{debug, warn};
 
 use crate::error::ToolError;
@@ -86,78 +104,535 @@ fn is_uuid(s: &str) -> bool {
     true
 }
 
-// ─── In-process rate limiter ─────────────────────────────────────────────────
+// ─── Shared Redis backend (optional, fail-open) ──────────────────────────────
+//
+// When `PLANE_REDIS_URL` is set, the GET cache and the rate limiter below both
+// coordinate through ONE shared Redis instance so that every terminus process
+// talking to Plane (e.g. the standalone personal server and the proxy-embedded
+// registry on the GPU host) shares a single cache and a single coordinated rate
+// budget, instead of each keeping its own private in-process copy.
+//
+// Robustness is the whole point: every Redis operation is wrapped in a short
+// timeout and guarded by a circuit breaker. On ANY error / timeout / breaker-open
+// state the backend returns "not available" and the caller transparently falls
+// back to its in-process cache / limiter for that one operation — a Redis outage
+// NEVER blocks, slows (beyond one short timeout), or fails a Plane call. When
+// Redis recovers the breaker half-opens, a probe succeeds, and coordination
+// resumes with no restart.
+
+/// Consecutive Redis-op failures that trip the circuit breaker open.
+const REDIS_FAILURE_THRESHOLD: u32 = 3;
+/// How long the breaker stays open before allowing a single half-open probe.
+const REDIS_BREAKER_COOLDOWN: Duration = Duration::from_secs(5);
+/// Default per-op Redis timeout (ms) — over/underridable via `PLANE_REDIS_TIMEOUT_MS`.
+const REDIS_DEFAULT_TIMEOUT_MS: u64 = 200;
+
+/// Atomic distributed rate-limiter reservation. Uses the Redis server's own
+/// clock (`TIME`) so all instances agree on "now" regardless of client clock
+/// skew, then reserves the next monotonically-increasing slot spaced by
+/// `min_interval`. Returns how many milliseconds THIS caller must wait before
+/// issuing its request. One coordinated budget, shared across every instance
+/// and every identity — exactly the single-gate semantics the in-process
+/// limiter has, lifted to the whole fleet.
+const RATE_RESERVE_LUA: &str = r#"
+local t = redis.call('TIME')
+local now = (tonumber(t[1]) * 1000) + math.floor(tonumber(t[2]) / 1000)
+local interval = tonumber(ARGV[1])
+local buffer = tonumber(ARGV[2])
+local last = tonumber(redis.call('GET', KEYS[1]) or '0')
+local slot = now
+if last + interval > now then slot = last + interval end
+-- Key TTL must outlive the FULL reserved backlog (slot may be many intervals
+-- ahead under a burst), else the key could expire before the last reserved slot
+-- is reached and a later caller would see no prior slot and release too soon.
+local ttl = (slot - now) + buffer
+redis.call('SET', KEYS[1], slot, 'PX', ttl)
+local wait = slot - now
+if wait < 0 then wait = 0 end
+return wait
+"#;
+
+/// A lightweight failure-tracking gate so a Redis outage doesn't mean paying a
+/// timeout on every single call. Closed → attempts proceed. After
+/// `REDIS_FAILURE_THRESHOLD` consecutive failures it opens for
+/// `REDIS_BREAKER_COOLDOWN`, during which attempts are skipped outright (instant
+/// fall-back to in-process). After the cooldown one half-open probe is allowed;
+/// a success closes it, a failure re-opens it. Exactly one degradation warning
+/// is logged per outage episode (reset on the next success), never one per call.
+#[derive(Debug)]
+struct CircuitBreaker {
+    inner: StdMutex<BreakerInner>,
+}
+
+#[derive(Debug)]
+struct BreakerInner {
+    consecutive_failures: u32,
+    open_until: Option<Instant>,
+    warned: bool,
+}
+
+impl CircuitBreaker {
+    fn new() -> Self {
+        Self { inner: StdMutex::new(BreakerInner { consecutive_failures: 0, open_until: None, warned: false }) }
+    }
+
+    /// True if a Redis op should be attempted now. When the cooldown has
+    /// elapsed the breaker half-opens for exactly ONE probe: this caller
+    /// *reserves* the probe by pushing `open_until` forward (so concurrent
+    /// callers keep seeing it open and fall back instead of a thundering herd),
+    /// and the probe's own `record_success`/`record_failure` then closes or
+    /// re-opens the breaker.
+    fn allow(&self) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        match g.open_until {
+            Some(t) if Instant::now() < t => false,
+            Some(_) => {
+                // Cooldown elapsed: reserve a single half-open probe for THIS
+                // caller. Re-arm the window so any concurrent caller still sees
+                // an open breaker until this probe records its result.
+                g.open_until = Some(Instant::now() + REDIS_BREAKER_COOLDOWN);
+                true
+            }
+            None => true,
+        }
+    }
+
+    fn record_success(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.consecutive_failures = 0;
+        g.open_until = None;
+        g.warned = false;
+    }
+
+    /// Record a failure. Returns true exactly once per outage episode — when the
+    /// breaker first trips open — so the caller emits a SINGLE degradation warning.
+    fn record_failure(&self) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        g.consecutive_failures = g.consecutive_failures.saturating_add(1);
+        let tripped = g.consecutive_failures >= REDIS_FAILURE_THRESHOLD;
+        if tripped {
+            g.open_until = Some(Instant::now() + REDIS_BREAKER_COOLDOWN);
+        }
+        if tripped && !g.warned {
+            g.warned = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Test hook: force the open cooldown to have already elapsed so half-open
+    /// behaviour can be exercised deterministically without a real 5s wait.
+    #[cfg(test)]
+    fn test_expire_cooldown(&self) {
+        let mut g = self.inner.lock().unwrap();
+        if g.open_until.is_some() {
+            g.open_until = Some(Instant::now() - Duration::from_millis(1));
+        }
+    }
+}
+
+/// Shared, optional Redis backend for the Plane GET cache + rate limiter.
+/// Constructed once (via [`RedisBackend::from_env`]) and shared by `Arc` between
+/// the `GetCache` and `RateLimiter` on a `PlaneClient`, so a single breaker
+/// governs both and a single connection is multiplexed across all Plane traffic.
+struct RedisBackend {
+    /// Parsed client (holds the connection target + optional password). Opening
+    /// it does not connect; the async connection is established lazily below.
+    client: redis::Client,
+    /// Lazily-initialised multiplexed connection manager (auto-reconnecting).
+    /// Built on first use so construction stays synchronous and a Redis that is
+    /// down at startup never blocks boot.
+    conn: OnceCell<ConnectionManager>,
+    /// Per-op timeout; a hung Redis can never stall a Plane call longer than this.
+    op_timeout: Duration,
+    breaker: CircuitBreaker,
+    /// Key namespace prefix (e.g. `plane:`) so Plane keys never collide with any
+    /// other tenant of the same Redis.
+    key_prefix: String,
+    /// Pre-built reservation script (SHA computed once, EVALSHA on the hot path).
+    rate_script: redis::Script,
+}
+
+/// Hand-written `Debug`: never prints `client` (redis::Client's own `Debug`
+/// includes the ConnectionInfo, which can carry the Redis password) or any
+/// live connection. Only inert config is shown.
+impl std::fmt::Debug for RedisBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisBackend")
+            .field("op_timeout", &self.op_timeout)
+            .field("key_prefix", &self.key_prefix)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RedisBackend {
+    /// Build from `PLANE_REDIS_URL` (+ optional `PLANE_REDIS_PASSWORD`,
+    /// `PLANE_REDIS_TIMEOUT_MS`). Returns `None` when `PLANE_REDIS_URL` is
+    /// unset/empty (→ pure in-process behaviour, identical to before this
+    /// backend existed) or when the URL is unparseable (logged once, then the
+    /// same in-process fallback). Never panics, never blocks on the network.
+    fn from_env() -> Option<Arc<Self>> {
+        let url = std::env::var("PLANE_REDIS_URL").ok().filter(|v| !v.trim().is_empty())?;
+        let password = std::env::var("PLANE_REDIS_PASSWORD").ok().filter(|v| !v.is_empty());
+
+        // Parse the URL, then layer the password from its own env var (kept out
+        // of the URL so it never lands in a log line or process listing).
+        let mut info = match url.as_str().into_connection_info() {
+            Ok(i) => i,
+            Err(e) => {
+                warn!(
+                    "PLANE_REDIS_URL is set but not a valid Redis URL ({:?}); Plane cache + rate limiter stay in-process",
+                    e.kind()
+                );
+                return None;
+            }
+        };
+        if let Some(pw) = password {
+            info.redis.password = Some(pw);
+        }
+        let client = match redis::Client::open(info) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    "Failed to construct Plane Redis client ({:?}); cache + rate limiter stay in-process",
+                    e.kind()
+                );
+                return None;
+            }
+        };
+
+        let timeout_ms: u64 = std::env::var("PLANE_REDIS_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(REDIS_DEFAULT_TIMEOUT_MS)
+            .max(1);
+
+        Some(Arc::new(Self {
+            client,
+            conn: OnceCell::new(),
+            op_timeout: Duration::from_millis(timeout_ms),
+            breaker: CircuitBreaker::new(),
+            key_prefix: "plane:".to_string(),
+            rate_script: redis::Script::new(RATE_RESERVE_LUA),
+        }))
+    }
+
+    /// Obtain a cloned connection manager, initialising it on first use.
+    /// `ConnectionManager` is cheap to clone (internally `Arc`-shared) and
+    /// reconnects on its own; a failed init is not cached, so a later call
+    /// retries once Redis is reachable. Returns `None` on init failure.
+    async fn conn(&self) -> Option<ConnectionManager> {
+        let init = self
+            .conn
+            .get_or_try_init(|| ConnectionManager::new(self.client.clone()))
+            .await;
+        match init {
+            Ok(m) => Some(m.clone()),
+            Err(_) => None,
+        }
+    }
+
+    /// Log a single degradation warning if this failure tripped the breaker.
+    /// Never includes the error value/target — only that Redis is degraded — so
+    /// no connection string or credential can leak into logs.
+    fn note_failure(&self) {
+        if self.breaker.record_failure() {
+            warn!(
+                "Plane Redis backend degraded; falling back to in-process cache + rate limiter until it recovers"
+            );
+        }
+    }
+
+    /// GET a namespaced cache key together with its remaining TTL. `None` = not
+    /// present OR Redis unavailable — the caller treats both identically (fall
+    /// through to in-process). The remaining TTL (from a single pipelined `PTTL`)
+    /// lets the caller warm its local fallback WITHOUT extending the entry's
+    /// lifetime past the shared key's expiry. Zero remaining ⇒ effectively about
+    /// to expire (caller should not keep it warm).
+    async fn cache_get(&self, key: &str) -> Option<(String, Duration)> {
+        if !self.breaker.allow() {
+            return None;
+        }
+        let fut = async {
+            let mut conn = self
+                .conn()
+                .await
+                .ok_or_else(|| redis::RedisError::from((redis::ErrorKind::IoError, "redis unavailable")))?;
+            // One round-trip: value + remaining TTL in ms (PTTL: -1 no expiry,
+            // -2 no key). A present value always has a positive PTTL here since
+            // it was written with PX.
+            redis::pipe()
+                .cmd("GET").arg(key)
+                .cmd("PTTL").arg(key)
+                .query_async::<_, (Option<String>, i64)>(&mut conn)
+                .await
+        };
+        match tokio::time::timeout(self.op_timeout, fut).await {
+            Ok(Ok((Some(body), pttl_ms))) => {
+                self.breaker.record_success();
+                let remaining = if pttl_ms > 0 {
+                    Duration::from_millis(pttl_ms as u64)
+                } else {
+                    Duration::ZERO
+                };
+                Some((body, remaining))
+            }
+            Ok(Ok((None, _))) => {
+                self.breaker.record_success();
+                None
+            }
+            _ => {
+                self.note_failure();
+                None
+            }
+        }
+    }
+
+    /// SET a namespaced cache key with a millisecond TTL. Best-effort: a failure
+    /// is swallowed (logged once via the breaker) — the in-process cache still
+    /// holds the value, so a failed Redis write never affects correctness.
+    async fn cache_set(&self, key: &str, body: &str, ttl: Duration) {
+        if !self.breaker.allow() {
+            return;
+        }
+        let ttl_ms = (ttl.as_millis() as u64).max(1);
+        let fut = async {
+            let mut conn = self
+                .conn()
+                .await
+                .ok_or_else(|| redis::RedisError::from((redis::ErrorKind::IoError, "redis unavailable")))?;
+            redis::cmd("SET")
+                .arg(key)
+                .arg(body)
+                .arg("PX")
+                .arg(ttl_ms)
+                .query_async::<_, ()>(&mut conn)
+                .await
+        };
+        match tokio::time::timeout(self.op_timeout, fut).await {
+            Ok(Ok(())) => self.breaker.record_success(),
+            _ => self.note_failure(),
+        }
+    }
+
+    /// Atomically reserve the next slot in the shared rate budget. `Some(wait)` =
+    /// sleep `wait` then proceed; `None` = Redis unavailable, caller should fall
+    /// back to its in-process limiter.
+    async fn rate_reserve(&self, min_interval: Duration) -> Option<Duration> {
+        if !self.breaker.allow() {
+            return None;
+        }
+        let interval_ms = min_interval.as_millis() as i64;
+        // Buffer added ON TOP of the reserved backlog (slot - now) inside the
+        // script, so an idle key still self-expires cleanly (a missing key =
+        // "no prior slot") without ever expiring mid-backlog under a burst.
+        let ttl_buffer_ms = (interval_ms.saturating_mul(4)).max(1000);
+        let key = format!("{}ratelimit:global", self.key_prefix);
+        let fut = async {
+            let mut conn = self
+                .conn()
+                .await
+                .ok_or_else(|| redis::RedisError::from((redis::ErrorKind::IoError, "redis unavailable")))?;
+            self.rate_script
+                .key(key)
+                .arg(interval_ms)
+                .arg(ttl_buffer_ms)
+                .invoke_async::<_, i64>(&mut conn)
+                .await
+        };
+        match tokio::time::timeout(self.op_timeout, fut).await {
+            Ok(Ok(wait_ms)) => {
+                self.breaker.record_success();
+                Some(Duration::from_millis(wait_ms.max(0) as u64))
+            }
+            _ => {
+                self.note_failure();
+                None
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl RedisBackend {
+    /// A backend pointed at an address that refuses connections (port 1), used
+    /// to exercise the fail-open path deterministically without a live Redis.
+    /// Short op timeout so the tests stay fast.
+    fn test_unreachable() -> Arc<Self> {
+        let client = redis::Client::open("redis://localhost:1/0").expect("valid url");
+        Arc::new(Self {
+            client,
+            conn: OnceCell::new(),
+            op_timeout: Duration::from_millis(120),
+            breaker: CircuitBreaker::new(),
+            key_prefix: "plane:".to_string(),
+            rate_script: redis::Script::new(RATE_RESERVE_LUA),
+        })
+    }
+}
+
+/// Namespace + hash a raw cache key (`token\0url`) into a Redis key. Hashing
+/// keeps the raw token OUT of Redis keys entirely (no credential material in
+/// key space, bounded key length) while preserving per-active-token isolation:
+/// two identities requesting the same URL hash to different keys, so a shared
+/// Redis cache can never serve one identity another's response. Uses a stable
+/// SHA-1 digest (fixed algorithm, identical output across Rust versions/builds)
+/// so processes on different builds sharing one Redis map the same token+URL to
+/// the same key — a `std` `DefaultHasher` is explicitly NOT stable across
+/// versions and would silently fragment the shared cache during rolling upgrades.
+fn redis_cache_key(raw: &str) -> String {
+    let mut h = sha1_smol::Sha1::new();
+    h.update(raw.as_bytes());
+    format!("plane:cache:{}", h.digest())
+}
+
+// ─── Rate limiter (in-process, optionally Redis-coordinated) ─────────────────
 //
 // Replaces the Python client's `fcntl.flock`-guarded `/tmp/plane-helper.lock` +
-// `/tmp/plane-helper.last` pacing. This service is a single long-running
-// process (not many independent CLI invocations), so a `tokio::sync::Mutex`
-// guarding a shared "last request" timestamp is the correct equivalent: every
-// call — across every tool, every identity — passes through the same gate.
+// `/tmp/plane-helper.last` pacing. Every call — across every tool, every
+// identity — passes through the same gate. When a shared `RedisBackend` is
+// configured the gate is the fleet-wide reservation slot (so BOTH terminus
+// instances pace against ONE coordinated budget); otherwise, and on any Redis
+// failure, it is the local `min_interval`-since-last-call gate.
 
 #[derive(Debug)]
 struct RateLimiter {
     last: AsyncMutex<Option<Instant>>,
     min_interval: Duration,
+    /// Shared distributed backend; `None` = purely in-process (the default and
+    /// the fail-open fallback).
+    redis: Option<Arc<RedisBackend>>,
 }
 
 impl RateLimiter {
     /// Build from `PLANE_RPM` / `PLANE_RATE_SHARE` (defaults: 60 / 3, i.e. a
     /// 3-second minimum interval), matching the Python client's env-var names.
-    fn from_env() -> Self {
+    /// `redis` (when `Some`) makes the budget fleet-wide; otherwise pacing is
+    /// per-process.
+    fn from_env(redis: Option<Arc<RedisBackend>>) -> Self {
         let rpm: f64 = std::env::var("PLANE_RPM").ok().and_then(|v| v.parse().ok()).unwrap_or(60.0);
         let share: f64 = std::env::var("PLANE_RATE_SHARE").ok().and_then(|v| v.parse().ok()).unwrap_or(3.0);
-        Self::new(rpm, share)
-    }
-
-    fn new(rpm: f64, share: f64) -> Self {
         let effective_rpm = if share > 0.0 { rpm / share } else { rpm };
         let min_interval = if effective_rpm > 0.0 {
             Duration::from_secs_f64(60.0 / effective_rpm)
         } else {
             Duration::ZERO
         };
-        Self { last: AsyncMutex::new(None), min_interval }
+        Self { last: AsyncMutex::new(None), min_interval, redis }
     }
 
-    /// Block until at least `min_interval` has elapsed since the previous
-    /// call made through this limiter (shared across every clone of the owning
-    /// `PlaneClient` and every identity, since it lives behind an `Arc`).
+    /// A purely in-process limiter (no Redis backend), used by tests. The
+    /// production Redis-unconfigured path is `from_env` with `redis: None`.
+    #[cfg(test)]
+    fn local(min_interval: Duration) -> Self {
+        Self { last: AsyncMutex::new(None), min_interval, redis: None }
+    }
+
+    /// Block until this call may proceed.
+    ///
+    /// Two gates apply IN ORDER, and the local lock is held across both so a
+    /// process's Plane calls are strictly serialised:
+    /// 1. The per-process floor (`min_interval` since this process's last ACTUAL
+    ///    issue) is enforced FIRST. This is always applied, so pacing holds no
+    ///    matter how Redis behaves.
+    /// 2. Only THEN is the shared Redis slot reserved — at ~the actual send time,
+    ///    best-effort. Reserving after the local wait (rather than before) means
+    ///    the Redis key records the real send time, so other processes reserve
+    ///    subsequent slots correctly even right after a Redis flush/recovery; a
+    ///    Redis failure/timeout/outage just yields a zero wait (fail-open) and
+    ///    never blocks or fails the call.
+    ///
+    /// Serialising a process's own Plane calls is exactly the intended pacing —
+    /// the whole point is to not hammer Plane, so there is nothing to pipeline —
+    /// and no Redis state (down, mid-flight death, restart/flush) can produce an
+    /// intra-process burst.
     async fn acquire(&self) {
+        // Pacing disabled → nothing to gate (and no Redis round-trip).
+        if self.min_interval.is_zero() {
+            return;
+        }
+        // Held across both waits → per-process serialisation.
         let mut last = self.last.lock().await;
+
+        // 1. Per-process floor from the last ACTUAL issue time, enforced first so
+        //    we never reserve a shared slot earlier than this process can send.
         if let Some(prev) = *last {
-            let elapsed = prev.elapsed();
-            if elapsed < self.min_interval {
-                tokio::time::sleep(self.min_interval - elapsed).await;
+            let now = Instant::now();
+            let floor = prev + self.min_interval;
+            if floor > now {
+                tokio::time::sleep(floor - now).await;
             }
         }
+
+        // 2. Reserve the shared cross-process slot at ~the actual send time
+        //    (best-effort). `None` (unconfigured OR any Redis failure) = zero wait.
+        if let Some(backend) = &self.redis {
+            if let Some(redis_wait) = backend.rate_reserve(self.min_interval).await {
+                if !redis_wait.is_zero() {
+                    tokio::time::sleep(redis_wait).await;
+                }
+            }
+        }
+
+        // Record the ACTUAL issue time (post-sleep) so the next caller is spaced
+        // from when this request really went out, even if a wakeup overslept.
         *last = Some(Instant::now());
     }
 }
 
-// ─── In-memory GET cache ──────────────────────────────────────────────────────
+// ─── GET cache (in-process, optionally Redis-backed + shared) ────────────────
 //
-// Replaces the Python client's shared `/tmp/plane-helper-cache.json` file.
-// Keyed by full request URL, TTL-based, in-process only (this service doesn't
-// span multiple OS processes the way the CLI-invocation Python client did).
+// Replaces the Python client's shared `/tmp/plane-helper-cache.json` file. When
+// a `RedisBackend` is configured the cache is shared across every terminus
+// instance (one cache, keyed per active token + URL); on any Redis failure it
+// transparently serves and populates the in-process map instead. The in-process
+// map is ALWAYS written through on `set`, so it stays warm as an instant
+// fail-open fallback whether or not Redis is currently reachable.
 
 #[derive(Debug)]
 struct GetCache {
     entries: AsyncMutex<HashMap<String, (Instant, String)>>,
     ttl: Duration,
+    /// Shared distributed backend; `None` = purely in-process (the default and
+    /// the fail-open fallback).
+    redis: Option<Arc<RedisBackend>>,
 }
 
 impl GetCache {
     /// Build from `PLANE_CACHE_TTL_SECS` (default 5s, matching the Python client).
-    fn from_env() -> Self {
+    /// `redis` (when `Some`) makes the cache shared across instances.
+    fn from_env(redis: Option<Arc<RedisBackend>>) -> Self {
         let ttl_secs: u64 = std::env::var("PLANE_CACHE_TTL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
-        Self::new(Duration::from_secs(ttl_secs))
+        Self { entries: AsyncMutex::new(HashMap::new()), ttl: Duration::from_secs(ttl_secs), redis }
     }
 
+    /// A purely in-process cache (no Redis backend), used by tests. The
+    /// production Redis-unconfigured path is `from_env` with `redis: None`.
+    #[cfg(test)]
     fn new(ttl: Duration) -> Self {
-        Self { entries: AsyncMutex::new(HashMap::new()), ttl }
+        Self { entries: AsyncMutex::new(HashMap::new()), ttl, redis: None }
     }
 
     async fn get(&self, key: &str) -> Option<String> {
+        // Prefer the shared Redis cache; a hit there is authoritative. A miss OR
+        // a Redis failure both fall through to the in-process map (fail-open).
+        if let Some(backend) = &self.redis {
+            if let Some((body, remaining)) = backend.cache_get(&redis_cache_key(key)).await {
+                // Warm the in-process fallback so a Redis outage within the TTL
+                // still serves this entry instead of refetching from Plane —
+                // important for instances that mostly consume shared cache hits.
+                // Back-date the insertion by (full_ttl - remaining) so the local
+                // copy expires in step with the shared key, never doubling the
+                // effective TTL. If nothing meaningful remains, skip warming.
+                if !remaining.is_zero() {
+                    let age = self.ttl.saturating_sub(remaining);
+                    let ts = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+                    self.entries.lock().await.insert(key.to_string(), (ts, body.clone()));
+                }
+                return Some(body);
+            }
+        }
         let entries = self.entries.lock().await;
         entries.get(key).and_then(|(ts, body)| {
             if ts.elapsed() < self.ttl { Some(body.clone()) } else { None }
@@ -165,6 +640,11 @@ impl GetCache {
     }
 
     async fn set(&self, key: String, body: String) {
+        // Write through to Redis (best-effort) AND always to the in-process map,
+        // so the local fallback is warm the instant Redis becomes unreachable.
+        if let Some(backend) = &self.redis {
+            backend.cache_set(&redis_cache_key(&key), &body, self.ttl).await;
+        }
         let mut entries = self.entries.lock().await;
         entries.insert(key, (Instant::now(), body));
     }
@@ -281,6 +761,11 @@ impl PlaneClient {
             .build()
             .expect("failed to build reqwest client");
 
+        // Optional shared Redis backend (PLANE_REDIS_URL). One `Arc` is shared by
+        // the cache and the limiter so a single circuit breaker governs both.
+        // `None` (unset URL) → identical in-process behaviour as before.
+        let redis_backend = RedisBackend::from_env();
+
         Self {
             http,
             base_url,
@@ -288,8 +773,8 @@ impl PlaneClient {
             identity_name,
             identities: Arc::new(identities),
             workspace,
-            rate_limiter: Arc::new(RateLimiter::from_env()),
-            cache: Arc::new(GetCache::from_env()),
+            rate_limiter: Arc::new(RateLimiter::from_env(redis_backend.clone())),
+            cache: Arc::new(GetCache::from_env(redis_backend)),
         }
     }
 
@@ -317,7 +802,7 @@ impl PlaneClient {
             identity_name: None,
             identities: Arc::new(HashMap::new()),
             workspace: "testws".into(),
-            rate_limiter: Arc::new(RateLimiter { last: AsyncMutex::new(None), min_interval: Duration::ZERO }),
+            rate_limiter: Arc::new(RateLimiter::local(Duration::ZERO)),
             cache: Arc::new(GetCache::new(Duration::from_secs(5))),
         })
     }
@@ -2189,7 +2674,7 @@ mod tests {
             identity_name: None,
             identities: Arc::new(HashMap::new()),
             workspace: "testws".into(),
-            rate_limiter: Arc::new(RateLimiter { last: AsyncMutex::new(None), min_interval: Duration::ZERO }),
+            rate_limiter: Arc::new(RateLimiter::local(Duration::ZERO)),
             cache: Arc::new(GetCache::new(Duration::from_secs(5))),
         })
     }
@@ -2255,7 +2740,7 @@ mod tests {
             identity_name: None,
             identities: Arc::new(HashMap::new()),
             workspace: "moosenet".into(),
-            rate_limiter: Arc::new(RateLimiter { last: AsyncMutex::new(None), min_interval: Duration::ZERO }),
+            rate_limiter: Arc::new(RateLimiter::local(Duration::ZERO)),
             cache: Arc::new(GetCache::new(Duration::from_secs(5))),
         });
         let tool = PlaneListProjects { client };
@@ -2685,7 +3170,7 @@ mod tests {
     #[tokio::test]
     async fn test_rate_limiter_enforces_minimum_interval_between_calls() {
         let interval = Duration::from_millis(250);
-        let limiter = RateLimiter { last: AsyncMutex::new(None), min_interval: interval };
+        let limiter = RateLimiter::local(interval);
 
         let start = Instant::now();
         for _ in 0..4 {
@@ -2720,7 +3205,7 @@ mod tests {
             identity_name: None,
             identities: Arc::new(HashMap::new()),
             workspace: "testws".into(),
-            rate_limiter: Arc::new(RateLimiter { last: AsyncMutex::new(None), min_interval: Duration::from_millis(200) }),
+            rate_limiter: Arc::new(RateLimiter::local(Duration::from_millis(200))),
             cache: Arc::new(GetCache::new(Duration::from_millis(1))), // effectively disabled
         };
 
@@ -2752,7 +3237,7 @@ mod tests {
             identity_name: None,
             identities: Arc::new(HashMap::new()),
             workspace: "testws".into(),
-            rate_limiter: Arc::new(RateLimiter { last: AsyncMutex::new(None), min_interval: Duration::ZERO }),
+            rate_limiter: Arc::new(RateLimiter::local(Duration::ZERO)),
             cache: Arc::new(GetCache::new(Duration::from_millis(300))),
         };
         let url = format!("{}projects/", client.workspace_url());
@@ -2777,7 +3262,7 @@ mod tests {
             identity_name: None,
             identities: Arc::new(HashMap::new()),
             workspace: "testws".into(),
-            rate_limiter: Arc::new(RateLimiter { last: AsyncMutex::new(None), min_interval: Duration::ZERO }),
+            rate_limiter: Arc::new(RateLimiter::local(Duration::ZERO)),
             cache: Arc::new(GetCache::new(Duration::from_millis(100))),
         };
         let url = format!("{}projects/", client.workspace_url());
@@ -2836,7 +3321,7 @@ mod tests {
             identity_name: None,
             identities: Arc::new(HashMap::new()),
             workspace: "testws".into(),
-            rate_limiter: Arc::new(RateLimiter { last: AsyncMutex::new(None), min_interval: Duration::ZERO }),
+            rate_limiter: Arc::new(RateLimiter::local(Duration::ZERO)),
             cache: Arc::new(GetCache::new(Duration::from_secs(5))),
         };
         let tool = PlaneListProjects { client: Arc::new(client) };
@@ -2889,7 +3374,7 @@ mod tests {
             identity_name: Some("default".into()),
             identities: Arc::new(identities),
             workspace: "testws".into(),
-            rate_limiter: Arc::new(RateLimiter { last: AsyncMutex::new(None), min_interval: Duration::ZERO }),
+            rate_limiter: Arc::new(RateLimiter::local(Duration::ZERO)),
             cache: Arc::new(GetCache::new(Duration::from_secs(5))),
         })
     }
@@ -3143,7 +3628,7 @@ mod tests {
             identity_name: None,
             identities: Arc::new(HashMap::new()),
             workspace: "testws".into(),
-            rate_limiter: Arc::new(RateLimiter { last: AsyncMutex::new(None), min_interval: Duration::ZERO }),
+            rate_limiter: Arc::new(RateLimiter::local(Duration::ZERO)),
             cache: Arc::new(GetCache::new(Duration::from_secs(5))),
         });
         let tool = PlaneListIdentities { client };
@@ -3476,5 +3961,216 @@ mod tests {
         let tool = PlaneWhoami { client };
         let out = tool.execute(json!({"identity": "axon", "verify": true})).await.unwrap();
         assert!(!out.contains("token-axon"), "verify output must never leak a token value: {out}");
+    }
+
+    // ── S100: Redis-backed cache + rate limiter ──────────────────────────────
+
+    // Namespaced key hashing: no credential/URL plaintext, per-token isolation.
+    #[test]
+    fn test_redis_cache_key_namespaced_and_hides_token_and_url() {
+        // Raw key mirrors PlaneClient::cache_key: token + NUL + url.
+        let raw = format!("{}\u{0}{}", "super-secret-token-value", "http://example.invalid/api/v1/projects/");
+        let k = redis_cache_key(&raw);
+        assert!(k.starts_with("plane:cache:"), "must be namespaced: {k}");
+        assert!(!k.contains("super-secret-token-value"), "must not leak the token: {k}");
+        assert!(!k.contains("example.invalid"), "must not leak the URL: {k}");
+        assert!(!k.contains('/'), "hashed key must contain no URL path chars: {k}");
+    }
+
+    #[test]
+    fn test_redis_cache_key_isolates_per_token() {
+        let url = "http://example.invalid/api/v1/workspaces/testws/projects/";
+        let a = redis_cache_key(&format!("{}\u{0}{}", "token-axon", url));
+        let b = redis_cache_key(&format!("{}\u{0}{}", "token-vigil", url));
+        assert_ne!(a, b, "same URL under two identities must hash to different keys");
+        // Same token + url is stable (a real cache hit for the same identity).
+        let a2 = redis_cache_key(&format!("{}\u{0}{}", "token-axon", url));
+        assert_eq!(a, a2);
+    }
+
+    // Circuit breaker: opens after threshold, half-opens after cooldown, warns once.
+    #[test]
+    fn test_circuit_breaker_opens_after_threshold_then_half_opens() {
+        let cb = CircuitBreaker::new();
+        assert!(cb.allow(), "starts closed");
+        // Below threshold: stays closed, no warning yet.
+        for _ in 0..(REDIS_FAILURE_THRESHOLD - 1) {
+            assert!(!cb.record_failure());
+            assert!(cb.allow());
+        }
+        // The threshold-th failure trips it open and returns true exactly once.
+        assert!(cb.record_failure(), "tripping failure warns once");
+        assert!(!cb.allow(), "open breaker blocks attempts during cooldown");
+        // A success closes it and re-arms the single-warning latch.
+        cb.record_success();
+        assert!(cb.allow(), "success closes the breaker");
+    }
+
+    #[test]
+    fn test_circuit_breaker_half_open_allows_only_one_probe() {
+        let cb = CircuitBreaker::new();
+        for _ in 0..REDIS_FAILURE_THRESHOLD {
+            cb.record_failure();
+        }
+        assert!(!cb.allow(), "open during cooldown");
+        // Simulate the cooldown elapsing.
+        cb.test_expire_cooldown();
+        // Exactly ONE caller gets the half-open probe; concurrent callers that
+        // race in before the probe records its result stay blocked (no herd).
+        assert!(cb.allow(), "first caller after cooldown gets the single probe");
+        assert!(!cb.allow(), "concurrent caller must NOT also probe");
+        assert!(!cb.allow(), "still single-probe reserved");
+        // A successful probe fully closes the breaker again.
+        cb.record_success();
+        assert!(cb.allow());
+    }
+
+    #[test]
+    fn test_circuit_breaker_warns_once_per_episode() {
+        let cb = CircuitBreaker::new();
+        let mut warns = 0;
+        // Many consecutive failures must warn exactly once (until a success).
+        for _ in 0..(REDIS_FAILURE_THRESHOLD + 5) {
+            if cb.record_failure() {
+                warns += 1;
+            }
+        }
+        assert_eq!(warns, 1, "exactly one degradation warning per outage episode");
+    }
+
+    // from_env: unset PLANE_REDIS_URL → no backend (pure in-process default).
+    #[tokio::test]
+    #[serial]
+    async fn test_redis_backend_from_env_none_when_unset() {
+        std::env::remove_var("PLANE_REDIS_URL");
+        assert!(RedisBackend::from_env().is_none(), "no backend without PLANE_REDIS_URL");
+        std::env::set_var("PLANE_REDIS_URL", "   ");
+        assert!(RedisBackend::from_env().is_none(), "blank PLANE_REDIS_URL is treated as unset");
+        std::env::remove_var("PLANE_REDIS_URL");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_redis_backend_from_env_rejects_invalid_url() {
+        std::env::set_var("PLANE_REDIS_URL", "not a redis url");
+        assert!(RedisBackend::from_env().is_none(), "invalid URL falls back to in-process, no panic");
+        std::env::remove_var("PLANE_REDIS_URL");
+    }
+
+    // Debug must never leak the client/ConnectionInfo (which can carry a password).
+    #[test]
+    fn test_redis_backend_debug_redacts_client() {
+        let backend = RedisBackend::test_unreachable();
+        let dbg = format!("{backend:?}");
+        assert!(dbg.contains("RedisBackend"));
+        assert!(!dbg.to_lowercase().contains("password"), "Debug must not mention a password field: {dbg}");
+        assert!(!dbg.contains("localhost"), "Debug must not print the connection target: {dbg}");
+    }
+
+    // Fail-open: a configured-but-unreachable Redis must never block a cache op —
+    // cache_get returns None fast, and GetCache serves/populates in-process.
+    #[tokio::test]
+    async fn test_get_cache_fails_open_when_redis_unreachable() {
+        let cache = GetCache {
+            entries: AsyncMutex::new(HashMap::new()),
+            ttl: Duration::from_secs(5),
+            redis: Some(RedisBackend::test_unreachable()),
+        };
+        // set() must not hang or panic even though Redis is down; it writes
+        // through to the in-process map, which get() then serves.
+        let start = Instant::now();
+        cache.set("tok\u{0}http://example.invalid/x".to_string(), "cached-body".to_string()).await;
+        let got = cache.get("tok\u{0}http://example.invalid/x").await;
+        assert_eq!(got.as_deref(), Some("cached-body"), "in-process fallback must serve the value");
+        assert!(start.elapsed() < Duration::from_secs(2), "fail-open must be fast, not blocking on Redis");
+    }
+
+    // Fail-open: an unreachable Redis rate reservation must fall through to the
+    // in-process gate — acquire() still paces correctly, never blocks forever.
+    #[tokio::test]
+    async fn test_rate_limiter_fails_open_to_local_when_redis_unreachable() {
+        let interval = Duration::from_millis(150);
+        let limiter = RateLimiter {
+            last: AsyncMutex::new(None),
+            min_interval: interval,
+            redis: Some(RedisBackend::test_unreachable()),
+        };
+        // Two paced calls: Redis is down, so each acquire pays at most one short
+        // op timeout then uses the local gate — total is bounded and the local
+        // min_interval spacing is still enforced on the second call.
+        let start = Instant::now();
+        limiter.acquire().await;
+        limiter.acquire().await;
+        let elapsed = start.elapsed();
+        assert!(elapsed >= interval, "local pacing must still apply on fallback, got {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(3), "fail-open must not hang on a dead Redis, got {elapsed:?}");
+    }
+
+    // End-to-end fail-open through the real GET path: a client whose cache has a
+    // dead Redis backend still fetches over the network and returns data.
+    #[tokio::test]
+    async fn test_get_json_cached_works_with_dead_redis_backend() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/workspaces/testws/projects/");
+            then.status(200).json_body(json!([{"id": "p1", "name": "Alpha", "identifier": "AL", "network": 0}]));
+        });
+        let client = PlaneClient {
+            http: Client::builder().timeout(Duration::from_secs(5)).build().unwrap(),
+            base_url: Some(server.base_url()),
+            api_key: Some("test-api-key".into()),
+            identity_name: None,
+            identities: Arc::new(HashMap::new()),
+            workspace: "testws".into(),
+            rate_limiter: Arc::new(RateLimiter::local(Duration::ZERO)),
+            cache: Arc::new(GetCache {
+                entries: AsyncMutex::new(HashMap::new()),
+                ttl: Duration::from_millis(300),
+                redis: Some(RedisBackend::test_unreachable()),
+            }),
+        };
+        let url = format!("{}projects/", client.workspace_url());
+        let first = client.get_json_cached(&url).await.unwrap();
+        assert!(first.contains("Alpha"), "{first}");
+        // Second call within TTL is served by the in-process fallback (Redis is
+        // dead), so the network is not hit again.
+        let second = client.get_json_cached(&url).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(mock.hits(), 1, "in-process fallback must cache within TTL despite dead Redis");
+    }
+
+    // Optional live-Redis distributed test: only runs when PLANE_TEST_REDIS_URL
+    // points at a real Redis (ops defer provisioning per S100), else it is a
+    // no-op. Proves the shared rate budget actually spaces calls across two
+    // independent limiters sharing one Redis, and the shared cache round-trips.
+    #[tokio::test]
+    #[serial]
+    async fn test_distributed_shared_budget_and_cache_live_redis() {
+        let Some(url) = std::env::var("PLANE_TEST_REDIS_URL").ok().filter(|v| !v.is_empty()) else {
+            eprintln!("skipping: PLANE_TEST_REDIS_URL not set (no live Redis in this env)");
+            return;
+        };
+        std::env::set_var("PLANE_REDIS_URL", &url);
+        let backend = RedisBackend::from_env().expect("live backend");
+        std::env::remove_var("PLANE_REDIS_URL");
+
+        // Two limiters (simulating two instances) sharing ONE backend/budget.
+        let interval = Duration::from_millis(200);
+        let a = RateLimiter { last: AsyncMutex::new(None), min_interval: interval, redis: Some(backend.clone()) };
+        let b = RateLimiter { last: AsyncMutex::new(None), min_interval: interval, redis: Some(backend.clone()) };
+        // Prime the shared slot, then two more reservations across both
+        // instances must be spaced by the shared interval, not run back-to-back.
+        a.acquire().await;
+        let start = Instant::now();
+        b.acquire().await;
+        a.acquire().await;
+        assert!(start.elapsed() >= interval, "shared budget must pace across instances");
+
+        // Shared cache round-trip.
+        let key = redis_cache_key("tok\u{0}http://example.invalid/shared");
+        backend.cache_set(&key, "shared-value", Duration::from_secs(5)).await;
+        let got = backend.cache_get(&key).await;
+        assert_eq!(got.as_ref().map(|(b, _)| b.as_str()), Some("shared-value"));
+        assert!(got.map(|(_, ttl)| !ttl.is_zero()).unwrap_or(false), "remaining TTL must be positive");
     }
 }
