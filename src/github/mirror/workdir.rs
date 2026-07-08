@@ -39,7 +39,7 @@ use std::process::{Command, Stdio};
 use serde_json::json;
 
 use crate::error::ToolError;
-use crate::github::pii::{active_gate_config_relpath, TreeViolation};
+use crate::github::pii::{active_gate_config_relpaths, TreeViolation};
 
 use super::sweep::{active_config_relpath, sweep_tree_with_resolved_config, SweepReport};
 
@@ -299,7 +299,7 @@ impl MirrorWorkDir {
         // images) are legitimate mirror content and must still ship.
         let mirror_excluded: Vec<String> = active_config_relpath(&self.work_dir)
             .into_iter()
-            .chain(active_gate_config_relpath(&self.work_dir))
+            .chain(active_gate_config_relpaths(&self.work_dir))
             .collect();
         for rel in &mirror_excluded {
             let cfg_path = self.work_dir.join(rel);
@@ -1077,6 +1077,41 @@ mod tests {
         // ordinary content is not).
         assert!(tracked.lines().any(|l| l.trim() == "doc.txt"), "doc mirrored");
         assert!(src.join("pii-gate.toml").exists(), "source gate config untouched");
+
+        cleanup(&[&src, &wd]);
+    }
+
+    // ── empty TERMINUS_PII_CONFIG still drops the local gate config (round 4 P1)
+    // A set-but-empty env value makes `ruleset_from_config` fall back to defaults,
+    // which still base-name-exclude `pii-gate.toml` from scanning — so the drop
+    // logic must catch the local file even when the env resolver contributes
+    // nothing.
+    #[test]
+    #[serial]
+    fn empty_pii_config_env_still_drops_local_gate_config() {
+        clear_env();
+        std::env::set_var("TERMINUS_PII_CONFIG", ""); // set-but-empty
+        let src = init_source(&[
+            ("pii-gate.toml", "extra_terms = [\"acme-internal-vault-02\"]\n"),
+            ("doc.txt", "clean\n"),
+        ]);
+        let wd = unique("wd");
+        let mgr = MirrorWorkDir::new("Terminus", &src, &wd);
+        let report = mgr.run().unwrap();
+        std::env::remove_var("TERMINUS_PII_CONFIG");
+
+        assert!(report.committed && report.tagged, "clean tree approved");
+        let tracked = run_git(&wd, &["ls-tree", "-r", "--name-only", "HEAD"]).unwrap();
+        assert!(
+            !tracked.lines().any(|l| l.trim() == "pii-gate.toml"),
+            "empty TERMINUS_PII_CONFIG must still drop the local gate config: {tracked}"
+        );
+        assert!(!wd.join("pii-gate.toml").exists(), "local gate config dropped from work dir");
+        let head_grep = run_git(&wd, &["grep", "-l", "acme-internal-vault-02", "HEAD"]);
+        assert!(
+            head_grep.is_err() || head_grep.as_deref().map(str::trim).unwrap_or("").is_empty(),
+            "no committed blob may carry the gate-config term: {head_grep:?}"
+        );
 
         cleanup(&[&src, &wd]);
     }
