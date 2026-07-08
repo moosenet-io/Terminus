@@ -18,6 +18,7 @@ pub mod crucible;
 pub mod dgem;
 pub mod dura;
 pub mod error;
+pub mod forge;
 pub mod gitea;
 pub mod dev;
 pub mod gateway;
