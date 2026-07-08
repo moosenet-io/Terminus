@@ -1,12 +1,12 @@
 //! Plane CE tool implementations (CHORD-06, hardened per the plane-helper port).
 //!
-//! Provides 27 Rust tools that wrap the Plane CE REST API via reqwest.
+//! Provides 28 Rust tools that wrap the Plane CE REST API via reqwest.
 //! All configuration comes from environment variables — no hardcoded URLs or tokens.
 //!
 //! ## Configuration
 //! - `PLANE_API_URL` — base URL of the Plane CE instance (required at call time)
 //! - `PLANE_API_KEY` — default API key/token for authentication (required at call time)
-//! - `PLANE_API_KEY_<NAME>` — additional named identities (e.g. `PLANE_API_KEY_AXON`),
+//! - `PLANE_PAT_<NAME>` — additional named identities (e.g. `PLANE_PAT_CLAUDE`),
 //!   see "Multi-identity" below
 //! - `PLANE_IDENTITY_NAME` — human name for the default `PLANE_API_KEY` identity
 //! - `PLANE_WORKSPACE` — workspace slug (default: "moosenet")
@@ -23,7 +23,7 @@
 //! `whoami()` design, which resolved identity by scanning other agents'
 //! plaintext `.env` files for a matching token substring — a credential-sprawl
 //! anti-pattern. Instead, named identities are configured explicitly via
-//! `PLANE_API_KEY_<NAME>` secrets (injected into this process's environment at
+//! `PLANE_PAT_<NAME>` secrets (injected into this process's environment at
 //! start by the operator's secret manager, never read from another process's
 //! files at call time). [`PlaneClient::for_identity`]
 //! returns a clone of the client scoped to a named identity's token, sharing the
@@ -157,6 +157,33 @@ impl GetCache {
 
 // ─── PlaneClient ─────────────────────────────────────────────────────────────
 
+/// Env-var prefix that marks a per-agent named-identity token. A variable
+/// `PLANE_PAT_<NAME>` registers the identity `<name>` (lowercased). This is the
+/// single source of truth for the prefix — the `from_env` scan and the
+/// `plane_list_identities` tool both derive from it, so the two can never drift.
+/// The unsuffixed default token `PLANE_API_KEY` is deliberately NOT this prefix
+/// and is handled on its own path.
+const PLANE_IDENTITY_PREFIX: &str = "PLANE_PAT_";
+
+/// Scan this process's own environment for `PLANE_PAT_<NAME>` named-identity
+/// tokens, returning a `lowercased-name -> token` map. This is the ONLY place
+/// the prefix is matched against the environment. Empty-valued vars are
+/// skipped (a set-but-empty secret is treated as absent), and names are
+/// lowercased so a later duplicate differing only by case collapses onto the
+/// same entry — matching how [`PlaneClient::for_identity`] lowercases on
+/// lookup. Never reads another process's files.
+fn scan_named_identities() -> HashMap<String, String> {
+    let mut identities: HashMap<String, String> = HashMap::new();
+    for (k, v) in std::env::vars() {
+        if let Some(name) = k.strip_prefix(PLANE_IDENTITY_PREFIX) {
+            if !v.is_empty() {
+                identities.insert(name.to_lowercase(), v);
+            }
+        }
+    }
+    identities
+}
+
 /// Shared HTTP client for the Plane CE API.
 ///
 /// Constructed from environment variables. When `PLANE_API_URL` is absent,
@@ -172,7 +199,7 @@ pub struct PlaneClient {
     /// Human name for the active token, if resolvable (see [`PlaneClient::from_env`]).
     identity_name: Option<String>,
     /// All configured named identities: lowercased name -> token. Populated
-    /// from `PLANE_API_KEY_<NAME>` env vars only — never from another
+    /// from `PLANE_PAT_<NAME>` env vars only — never from another
     /// process's files.
     identities: Arc<HashMap<String, String>>,
     workspace: String,
@@ -203,21 +230,14 @@ impl PlaneClient {
         let workspace = std::env::var("PLANE_WORKSPACE")
             .unwrap_or_else(|_| "moosenet".into());
 
-        // Named identities: PLANE_API_KEY_<NAME> for any agent that needs its
-        // own token (e.g. PLANE_API_KEY_AXON, PLANE_API_KEY_VIGIL). Read once
+        // Named identities: PLANE_PAT_<NAME> for any agent that needs its
+        // own token (e.g. PLANE_PAT_CLAUDE, PLANE_PAT_HARMONY). Read once
         // at process start from this process's own environment (populated by
         // the operator's secret manager) — never from another process's files.
-        let mut identities: HashMap<String, String> = HashMap::new();
-        for (k, v) in std::env::vars() {
-            if let Some(name) = k.strip_prefix("PLANE_API_KEY_") {
-                if !v.is_empty() {
-                    identities.insert(name.to_lowercase(), v);
-                }
-            }
-        }
+        let identities = scan_named_identities();
 
         // Resolve a human name for the default PLANE_API_KEY token: prefer an
-        // explicit PLANE_IDENTITY_NAME, else look for a PLANE_API_KEY_<NAME>
+        // explicit PLANE_IDENTITY_NAME, else look for a PLANE_PAT_<NAME>
         // whose value happens to equal the default token.
         let identity_name = std::env::var("PLANE_IDENTITY_NAME")
             .ok()
@@ -282,7 +302,7 @@ impl PlaneClient {
     }
 
     /// Return a clone of this client scoped to a named identity's token
-    /// (from `PLANE_API_KEY_<NAME>`) instead of the default. The HTTP client,
+    /// (from `PLANE_PAT_<NAME>`) instead of the default. The HTTP client,
     /// rate limiter, and GET cache are shared (same `Arc`s) — only the active
     /// token and its resolved name differ, so identities never contend for
     /// separate rate budgets and never leak each other's tokens.
@@ -290,7 +310,7 @@ impl PlaneClient {
         let key = name.trim().to_lowercase();
         let token = self.identities.get(&key).cloned().ok_or_else(|| {
             ToolError::InvalidArgument(format!(
-                "No Plane identity named '{name}' is configured (expected PLANE_API_KEY_{})",
+                "No Plane identity named '{name}' is configured (expected {PLANE_IDENTITY_PREFIX}{})",
                 key.to_uppercase()
             ))
         })?;
@@ -304,6 +324,15 @@ impl PlaneClient {
     /// The active identity's resolved name, if known.
     pub fn identity_name(&self) -> Option<&str> {
         self.identity_name.as_deref()
+    }
+
+    /// Names of all configured named identities (lowercased, sorted for stable
+    /// output). These are exactly the names [`PlaneClient::for_identity`] can
+    /// resolve. Never returns — and cannot be used to recover — token values.
+    pub fn identity_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.identities.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     /// Build a GET-cache key that is unique per active token, not just per
@@ -1881,7 +1910,7 @@ pub struct PlaneWhoami {
 impl RustTool for PlaneWhoami {
     fn name(&self) -> &str { "plane_whoami" }
     fn description(&self) -> &str {
-        "Report which configured Plane identity is active, or check whether a named identity is configured. Never inspects other processes' files — identities come only from this process's own PLANE_API_KEY_<NAME> environment."
+        "Report which configured Plane identity is active, or check whether a named identity is configured. Never inspects other processes' files — identities come only from this process's own PLANE_PAT_<NAME> environment."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -1900,7 +1929,7 @@ impl RustTool for PlaneWhoami {
                 return Ok(format!("Identity '{identity}' is configured (token present)."));
             }
             return Err(ToolError::NotFound(format!(
-                "No Plane identity named '{identity}' is configured (expected PLANE_API_KEY_{})",
+                "No Plane identity named '{identity}' is configured (expected {PLANE_IDENTITY_PREFIX}{})",
                 key.to_uppercase()
             )));
         }
@@ -1911,16 +1940,70 @@ impl RustTool for PlaneWhoami {
             Some(name) => Ok(format!("Active Plane identity: {name}")),
             None => Ok(
                 "Active Plane identity: unknown (a default token is set but no PLANE_IDENTITY_NAME \
-                 or matching PLANE_API_KEY_<NAME> is configured for it)"
+                 or matching PLANE_PAT_<NAME> is configured for it)"
                     .into(),
             ),
         }
     }
 }
 
+// ─── 28. plane_list_identities ───────────────────────────────────────────────
+
+/// Lists the names of every configured `PLANE_PAT_<NAME>` identity so a caller
+/// can see which identity it may act as before creating or assigning Plane work.
+/// Names only — never token values, matching `plane_whoami`'s safety posture.
+pub struct PlaneListIdentities {
+    client: Arc<PlaneClient>,
+}
+
+#[async_trait]
+impl RustTool for PlaneListIdentities {
+    fn name(&self) -> &str { "plane_list_identities" }
+    fn description(&self) -> &str {
+        "List the names of all configured Plane identities (from PLANE_PAT_<NAME> environment vars) so you can see which identity to act as before creating or assigning Plane work. Returns names only, never token values. Use the identity matching who should act on an item rather than always your own."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        })
+    }
+    async fn execute(&self, _args: Value) -> Result<String, ToolError> {
+        // Derived from the client's already-scanned identities map (populated
+        // once at start via `scan_named_identities`), so the list is exactly
+        // what `for_identity()` can resolve — never a fresh, divergent env scan.
+        let names = self.client.identity_names();
+        let count = names.len();
+        let active_default = self.client.identity_name().map(|s| s.to_string());
+        let mut out = json!({
+            "identities": names,
+            "count": count,
+            "active_default": active_default,
+            "prefix": PLANE_IDENTITY_PREFIX,
+        });
+        if count == 0 {
+            let note = if self.client.configured() {
+                format!(
+                    "No named identities configured; only the default PLANE_API_KEY identity is set. \
+                     Provision named identities as {PLANE_IDENTITY_PREFIX}<NAME>."
+                )
+            } else {
+                format!(
+                    "No Plane identities configured. Provision named identities as \
+                     {PLANE_IDENTITY_PREFIX}<NAME>."
+                )
+            };
+            out["note"] = json!(note);
+        }
+        serde_json::to_string(&out)
+            .map_err(|e| ToolError::Execution(format!("failed to serialize identity list: {e}")))
+    }
+}
+
 // ─── Register all plane tools ─────────────────────────────────────────────────
 
-/// Register all 27 Plane CE tools into the given registry.
+/// Register all 28 Plane CE tools into the given registry.
 pub fn register(registry: &mut ToolRegistry) {
     let client = Arc::new(PlaneClient::from_env());
 
@@ -1952,6 +2035,7 @@ pub fn register(registry: &mut ToolRegistry) {
         Box::new(PlaneGetStateByName { client: client.clone() }),
         Box::new(PlaneBatchCreateWorkItems { client: client.clone() }),
         Box::new(PlaneWhoami { client: client.clone() }),
+        Box::new(PlaneListIdentities { client: client.clone() }),
     ];
 
     for tool in tools {
@@ -2270,7 +2354,7 @@ mod tests {
         assert!(result.contains("No projects"), "{result}");
     }
 
-    // ── register() populates 24 tools ─────────────────────────────────────────
+    // ── register() populates 28 tools ─────────────────────────────────────────
 
     #[test]
     fn test_register_all_plane_tools() {
@@ -2278,8 +2362,8 @@ mod tests {
         // (not required for registration, only for execution)
         let mut registry = ToolRegistry::new();
         register(&mut registry);
-        assert_eq!(registry.len(), 27,
-            "Expected 27 plane tools, got {}", registry.len());
+        assert_eq!(registry.len(), 28,
+            "Expected 28 plane tools, got {}", registry.len());
     }
 
     #[test]
@@ -2812,7 +2896,7 @@ mod tests {
         // since PlaneClient::from_env() reads process-wide env vars.
         std::env::set_var("PLANE_API_URL", "http://example.invalid");
         std::env::set_var("PLANE_API_KEY", "shared-token-value");
-        std::env::set_var("PLANE_API_KEY_SEER", "shared-token-value");
+        std::env::set_var("PLANE_PAT_SEER", "shared-token-value");
         std::env::remove_var("PLANE_IDENTITY_NAME");
 
         let client = PlaneClient::from_env();
@@ -2820,6 +2904,132 @@ mod tests {
 
         std::env::remove_var("PLANE_API_URL");
         std::env::remove_var("PLANE_API_KEY");
-        std::env::remove_var("PLANE_API_KEY_SEER");
+        std::env::remove_var("PLANE_PAT_SEER");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_from_env_registers_plane_pat_named_identity() {
+        // Positive: a PLANE_PAT_<NAME> var IS recognized as a named identity.
+        std::env::set_var("PLANE_API_URL", "http://example.invalid");
+        std::env::set_var("PLANE_API_KEY", "default-token");
+        std::env::set_var("PLANE_PAT_CLAUDE", "claude-token");
+        std::env::remove_var("PLANE_IDENTITY_NAME");
+
+        let client = PlaneClient::from_env();
+        assert!(client.for_identity("claude").is_ok());
+        assert!(
+            client.identity_names().contains(&"claude".to_string()),
+            "PLANE_PAT_CLAUDE must register the 'claude' identity, got {:?}",
+            client.identity_names()
+        );
+
+        std::env::remove_var("PLANE_API_URL");
+        std::env::remove_var("PLANE_API_KEY");
+        std::env::remove_var("PLANE_PAT_CLAUDE");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_from_env_ignores_retired_plane_api_key_prefix() {
+        // Negative (breaking-rename proof): the OLD named-identity prefix must
+        // NO LONGER be recognized — this proves the old behavior is gone, not
+        // merely that the new behavior works. The retired var name is assembled
+        // from parts on purpose: the literal retired prefix must not appear
+        // verbatim anywhere in the source tree (the rename is complete).
+        let retired_var = format!("{}{}", "PLANE_API_KEY", "_FOO");
+        std::env::set_var("PLANE_API_URL", "http://example.invalid");
+        std::env::set_var("PLANE_API_KEY", "default-token");
+        std::env::set_var(&retired_var, "should-be-ignored");
+        std::env::remove_var("PLANE_PAT_FOO");
+        std::env::remove_var("PLANE_IDENTITY_NAME");
+
+        let client = PlaneClient::from_env();
+        assert!(
+            matches!(client.for_identity("foo").unwrap_err(), ToolError::InvalidArgument(_)),
+            "retired prefix must not resolve as a named identity"
+        );
+        assert!(
+            !client.identity_names().contains(&"foo".to_string()),
+            "retired prefix must not populate the identities map, got {:?}",
+            client.identity_names()
+        );
+
+        std::env::remove_var("PLANE_API_URL");
+        std::env::remove_var("PLANE_API_KEY");
+        std::env::remove_var(&retired_var);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_from_env_default_plane_api_key_is_not_a_named_identity() {
+        // Edge case: the unsuffixed default PLANE_API_KEY (no trailing '_')
+        // and unrelated PLANE_* vars must never be mis-scanned as identities.
+        std::env::set_var("PLANE_API_URL", "http://example.invalid");
+        std::env::set_var("PLANE_API_KEY", "default-token");
+        std::env::remove_var("PLANE_IDENTITY_NAME");
+        // Ensure no stray PAT vars from other tests remain.
+        std::env::remove_var("PLANE_PAT_CLAUDE");
+        std::env::remove_var("PLANE_PAT_SEER");
+
+        let client = PlaneClient::from_env();
+        // With only the default configured and no PLANE_PAT_* set, there must
+        // be no named identity derived from PLANE_API_KEY / PLANE_API_URL.
+        assert!(
+            client.for_identity("api").is_err() && client.for_identity("url").is_err(),
+            "default/URL vars must not leak in as named identities"
+        );
+
+        std::env::remove_var("PLANE_API_URL");
+        std::env::remove_var("PLANE_API_KEY");
+    }
+
+    // ── plane_list_identities (PPAT-02) ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_plane_list_identities_lists_sorted_names() {
+        let server = MockServer::start();
+        let client = multi_identity_client(&server);
+        let tool = PlaneListIdentities { client };
+        let out = tool.execute(json!({})).await.unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["identities"], json!(["axon", "vigil"]), "names must be sorted/stable");
+        assert_eq!(v["count"], 2);
+        assert_eq!(v["active_default"], "default");
+    }
+
+    #[tokio::test]
+    async fn test_plane_list_identities_never_leaks_token_values() {
+        // The multi_identity_client's tokens are token-axon/token-vigil/
+        // token-default — none may appear in the serialized output.
+        let server = MockServer::start();
+        let client = multi_identity_client(&server);
+        let tool = PlaneListIdentities { client };
+        let out = tool.execute(json!({})).await.unwrap();
+        assert!(!out.contains("token-axon"), "must not leak a token value: {out}");
+        assert!(!out.contains("token-vigil"), "must not leak a token value: {out}");
+        assert!(!out.contains("token-default"), "must not leak a token value: {out}");
+    }
+
+    #[tokio::test]
+    async fn test_plane_list_identities_empty_returns_note_not_error() {
+        // 0 named identities but a default token set: empty list + note, not error.
+        let server = MockServer::start();
+        let client = Arc::new(PlaneClient {
+            http: Client::builder().timeout(Duration::from_secs(5)).build().unwrap(),
+            base_url: Some(server.base_url()),
+            api_key: Some("token-default".into()),
+            identity_name: None,
+            identities: Arc::new(HashMap::new()),
+            workspace: "testws".into(),
+            rate_limiter: Arc::new(RateLimiter { last: AsyncMutex::new(None), min_interval: Duration::ZERO }),
+            cache: Arc::new(GetCache::new(Duration::from_secs(5))),
+        });
+        let tool = PlaneListIdentities { client };
+        let out = tool.execute(json!({})).await.unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["count"], 0);
+        assert_eq!(v["identities"], json!([]));
+        assert!(v.get("note").is_some(), "0-case must carry a note, got {out}");
     }
 }
