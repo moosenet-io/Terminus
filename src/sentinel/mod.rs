@@ -11,7 +11,7 @@
 //!   subprocess), mirroring `gateway/mod.rs` and `ansible/mod.rs`.
 //! - Replaces the Python `sentinel_status` SSH+<secret-manager>+curl chain with a // pii-test-fixture
 //!   direct call into this crate's own `gitea` module. Terminus already holds
-//!   `GITEA_URL`/`GITEA_TOKEN` locally (see `gitea/mod.rs`) — the Python
+//!   `GITEA_URL` plus the resolved `GITEA_PAT_<NAME>` identity token locally (see `gitea/mod.rs`) — the Python
 //!   version only detoured through fleet-host because the *Python* MCP
 //!   process didn't have those credentials. The Rust process does, so the
 //!   extra SSH hop plus an inline shell script that logs in to <secret-manager> and // pii-test-fixture

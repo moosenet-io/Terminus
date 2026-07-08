@@ -125,8 +125,13 @@ fn repo_summary(r: &Value) -> Value {
 
 /// Build the `git clone --mirror … && git push --mirror …` command string that
 /// github_push_repo returns. Tokens are referenced as shell variables
-/// ($GITEA_TOKEN, $GITHUB_TOKEN) and are NOT interpolated, so they never appear
-/// in tool output — identical to the Python behaviour.
+/// ($GITEA_PAT_MOOSE, $GITHUB_TOKEN) and are NOT interpolated, so they never
+/// appear in tool output — identical to the Python behaviour.
+///
+/// **S105/GPAT:** the Gitea clone uses `$GITEA_PAT_MOOSE`, the default `moose`
+/// gitea identity's token — the unsuffixed `GITEA_TOKEN` was retired fleet-wide
+/// (deleted from the secret store), so the dev box that runs this command now
+/// exports `GITEA_PAT_MOOSE` for its git transport, never a bare `GITEA_TOKEN`.
 fn build_mirror_cmd(
     gitea_host: &str,
     gitea_owner: &str,
@@ -150,7 +155,7 @@ fn build_mirror_cmd(
     format!(
         "cd /tmp && \
 rm -rf _mirror_tmp && \
-git clone --mirror http://oauth2:$GITEA_TOKEN@{gitea_host}/{gitea_owner}/{gitea_repo}.git _mirror_tmp && \
+git clone --mirror http://oauth2:$GITEA_PAT_MOOSE@{gitea_host}/{gitea_owner}/{gitea_repo}.git _mirror_tmp && \
 cd _mirror_tmp && \
 {push_line}\
 cd /tmp && rm -rf _mirror_tmp && \
@@ -1072,8 +1077,11 @@ mod tests {
             "lumina-constellation",
             false,
         );
-        // Token placeholders, never literal secrets
-        assert!(cmd.contains("$GITEA_TOKEN"));
+        // Token placeholders, never literal secrets. S105/GPAT: the Gitea side
+        // is the default `moose` identity token ($GITEA_PAT_MOOSE), never the
+        // retired bare $GITEA_TOKEN.
+        assert!(cmd.contains("$GITEA_PAT_MOOSE"));
+        assert!(!cmd.contains("$GITEA_TOKEN"));
         assert!(cmd.contains("$GITHUB_TOKEN"));
         assert!(cmd.contains("git clone --mirror"));
         assert!(cmd.contains("git push --mirror"));

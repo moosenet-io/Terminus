@@ -6,7 +6,15 @@
 //!
 //! ## Configuration (env vars)
 //! - `GITEA_URL`   — base URL, e.g. `https://gitea.example.com` (required)
-//! - `GITEA_TOKEN` — personal access token (required)
+//! - `GITEA_PAT_<NAME>` — a **named identity** personal access token (e.g.
+//!   `GITEA_PAT_MOOSE`, `GITEA_PAT_HARMONY`, `GITEA_PAT_LUMINA`). This is the
+//!   multi-identity model that replaced the single unsuffixed `GITEA_TOKEN`
+//!   (mirrors the Plane `PLANE_PAT_<NAME>` convention). **BREAKING:** the tool
+//!   no longer reads an unsuffixed `GITEA_TOKEN` — the effective token is the
+//!   resolved identity's `GITEA_PAT_<NAME>`.
+//! - `GITEA_IDENTITY_NAME` — which named identity is the active default when a
+//!   call passes no `identity` argument (default `"moose"` — Gitea is the
+//!   operator's infra git storage; NOTE this differs from Plane's `lumina`).
 //! - `GITEA_OWNER` — default repo owner/organisation (default: `"moosenet"`)
 
 pub mod types;
@@ -15,7 +23,10 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::env;
+use std::sync::Arc;
 use tracing::{debug, warn};
 
 use crate::error::ToolError;
@@ -118,31 +129,173 @@ fn pii_check(content: &str) -> Option<String> {
 
 // ─── GiteaClient ─────────────────────────────────────────────────────────────
 
+/// Env-var prefix that marks a per-agent named-identity token. A variable
+/// `GITEA_PAT_<NAME>` registers the identity `<name>` (lowercased). This is the
+/// single source of truth for the prefix — the `from_env` scan and the
+/// `gitea_list_identities` tool both derive from it, so the two can never drift.
+/// Mirrors Plane's `PLANE_IDENTITY_PREFIX` exactly.
+const GITEA_IDENTITY_PREFIX: &str = "GITEA_PAT_";
+
+/// The active-default identity used when neither `GITEA_IDENTITY_NAME` nor a
+/// per-call `identity` argument selects one. Per the S105/GPAT consolidation the
+/// operator persona `moose` is the default — Gitea is the operator's infra git
+/// storage, so a no-`identity` call acts as `GITEA_PAT_MOOSE`. This deliberately
+/// DIFFERS from Plane (whose default is `lumina`).
+const DEFAULT_GITEA_IDENTITY: &str = "moose";
+
+/// Scan this process's own environment for `GITEA_PAT_<NAME>` named-identity
+/// tokens, returning a `lowercased-name -> token` map. This is the ONLY place
+/// the prefix is matched against the environment. Empty-valued vars are skipped
+/// (a set-but-empty secret is treated as absent), and names are lowercased so a
+/// later duplicate differing only by case collapses onto the same entry —
+/// matching how [`GiteaClient::for_identity`] lowercases on lookup. Never reads
+/// another process's files. Mirrors Plane's `scan_named_identities`.
+fn scan_gitea_identities() -> HashMap<String, String> {
+    let mut identities: HashMap<String, String> = HashMap::new();
+    for (k, v) in env::vars() {
+        if let Some(name) = k.strip_prefix(GITEA_IDENTITY_PREFIX) {
+            if !v.is_empty() {
+                identities.insert(name.to_lowercase(), v);
+            }
+        }
+    }
+    identities
+}
+
 #[derive(Clone)]
 pub struct GiteaClient {
     http: Client,
     base_url: String,
+    /// Active token used for requests made directly through this client
+    /// instance (the resolved active-default identity, unless
+    /// [`GiteaClient::for_identity`] produced this instance).
     token: String,
+    /// Human name for the active token (the active-default identity name, or the
+    /// name passed to [`GiteaClient::for_identity`]).
+    identity_name: Option<String>,
+    /// All configured named identities: lowercased name -> token. Populated from
+    /// `GITEA_PAT_<NAME>` env vars only — never from another process's files.
+    identities: Arc<HashMap<String, String>>,
     owner: String,
+}
+
+/// Hand-written `Debug` impl: never prints `token` or `identities` (both hold
+/// live credentials). Redacted so logs/panics/`{:?}` can never leak a token.
+impl std::fmt::Debug for GiteaClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GiteaClient")
+            .field("base_url", &self.base_url)
+            .field("token", &if self.token.is_empty() { "<empty>" } else { "<redacted>" })
+            .field("identity_name", &self.identity_name)
+            .field("identities", &format!("<{} configured, redacted>", self.identities.len()))
+            .field("owner", &self.owner)
+            .finish()
+    }
 }
 
 impl GiteaClient {
     /// Build from environment variables.
     ///
     /// Returns `Err(ToolError::NotConfigured)` if `GITEA_URL` is not set.
+    ///
+    /// **BREAKING (S105/GPAT):** no longer reads an unsuffixed `GITEA_TOKEN`.
+    /// The active-default token is the `GITEA_PAT_<NAME>` selected by
+    /// `GITEA_IDENTITY_NAME` (default `moose`); a per-call `identity` argument
+    /// overrides it via [`GiteaClient::resolve_identity`].
     pub fn from_env() -> Result<Self, ToolError> {
         let base_url = env::var("GITEA_URL").map_err(|_| {
             ToolError::NotConfigured("GITEA_URL environment variable is not set".to_string())
         })?;
-        let token = env::var("GITEA_TOKEN").unwrap_or_default();
         let owner = env::var("GITEA_OWNER").unwrap_or_else(|_| "moosenet".to_string());
+
+        // Named identities: GITEA_PAT_<NAME> for any agent that needs its own
+        // token (e.g. GITEA_PAT_MOOSE, GITEA_PAT_HARMONY, GITEA_PAT_LUMINA).
+        // Read once at process start from this process's own environment.
+        let identities = scan_gitea_identities();
+
+        // Active-default identity name: explicit GITEA_IDENTITY_NAME, else the
+        // built-in default `moose`. Lowercased to match the identities map /
+        // `for_identity` lookup.
+        let identity_name = env::var("GITEA_IDENTITY_NAME")
+            .ok()
+            .map(|v| v.trim().to_lowercase())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_GITEA_IDENTITY.to_string());
+
+        // Resolve the active-default TOKEN so a named default genuinely ACTS as
+        // that identity. If the default name has no configured GITEA_PAT_<NAME>,
+        // the token is empty and calls fail with a clear auth error from Gitea —
+        // the operator must provision the identity's PAT.
+        let token = identities.get(&identity_name).cloned().unwrap_or_default();
 
         let http = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| ToolError::Http(format!("Failed to build HTTP client: {e}")))?;
 
-        Ok(Self { http, base_url, token, owner })
+        Ok(Self {
+            http,
+            base_url,
+            token,
+            identity_name: Some(identity_name),
+            identities: Arc::new(identities),
+            owner,
+        })
+    }
+
+    /// Return a clone of this client scoped to a named identity's token (from
+    /// `GITEA_PAT_<NAME>`) instead of the active default. The HTTP client and
+    /// identities map are shared (clone of `Arc`) — only the active token and
+    /// its resolved name differ, so identities never leak each other's tokens.
+    /// Mirrors Plane's `for_identity`.
+    pub fn for_identity(&self, name: &str) -> Result<Self, ToolError> {
+        let key = name.trim().to_lowercase();
+        let token = self.identities.get(&key).cloned().ok_or_else(|| {
+            ToolError::InvalidArgument(format!(
+                "No Gitea identity named '{name}' is configured (expected {GITEA_IDENTITY_PREFIX}{})",
+                key.to_uppercase()
+            ))
+        })?;
+        Ok(Self {
+            token,
+            identity_name: Some(key),
+            ..self.clone()
+        })
+    }
+
+    /// Resolve the effective client for a single tool invocation from its raw
+    /// args. This is the ONE shared dispatch point every Gitea CRUD tool uses to
+    /// pick the token it authenticates with, so the selection rule lives in one
+    /// place rather than at every call site.
+    ///
+    /// - A non-empty `identity` string argument selects that named
+    ///   `GITEA_PAT_<NAME>` identity (via [`GiteaClient::for_identity`]),
+    ///   returning an owned, token-scoped clone.
+    /// - Otherwise the call acts as this client's **active default** identity
+    ///   (returned borrowed, no clone), resolved at construction from
+    ///   `GITEA_IDENTITY_NAME` (default `moose`).
+    ///
+    /// The `identity` argument is consumed here for token selection only — it is
+    /// never placed into a request body and never logged.
+    fn resolve_identity<'a>(&'a self, args: &Value) -> Result<Cow<'a, Self>, ToolError> {
+        match args.get("identity").and_then(|v| v.as_str()) {
+            Some(name) if !name.trim().is_empty() => Ok(Cow::Owned(self.for_identity(name)?)),
+            _ => Ok(Cow::Borrowed(self)),
+        }
+    }
+
+    /// The active identity's resolved name, if known.
+    pub fn identity_name(&self) -> Option<&str> {
+        self.identity_name.as_deref()
+    }
+
+    /// Names of all configured named identities (lowercased, sorted for stable
+    /// output). These are exactly the names [`GiteaClient::for_identity`] can
+    /// resolve. Never returns — and cannot be used to recover — token values.
+    pub fn identity_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.identities.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     fn api(&self, path: &str) -> String {
@@ -306,6 +459,35 @@ impl GiteaClient {
     }
 }
 
+// ─── Shared optional `identity` argument ─────────────────────────────────────
+//
+// Every Gitea CRUD tool exposes the same optional `identity` argument, resolved
+// centrally by `GiteaClient::resolve_identity`. These two helpers keep the
+// schema fragment and its documentation in a single source of truth so all
+// tools describe it identically and can never drift. Mirrors the Plane tool.
+
+/// JSON-schema fragment for the optional `identity` argument.
+fn identity_param_schema() -> Value {
+    json!({
+        "type": "string",
+        "description": "Optional Gitea identity to act as: a configured GITEA_PAT_<NAME> \
+                        identity name (e.g. \"moose\", \"harmony\", \"lumina\"). Omit to use the \
+                        active default identity (GITEA_IDENTITY_NAME, default \"moose\"). Call \
+                        gitea_list_identities to see the configured names."
+    })
+}
+
+/// Add the shared optional `identity` property to a tool's parameter schema.
+/// Idempotent and safe on any `{ "type": "object", "properties": { .. } }`
+/// schema — inserts the `identity` property without disturbing the tool's own
+/// arguments or its `required` list (identity is always optional).
+fn with_identity_param(mut schema: Value) -> Value {
+    if let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) {
+        props.insert("identity".to_string(), identity_param_schema());
+    }
+    schema
+}
+
 // ─── Tool implementations ────────────────────────────────────────────────────
 
 // 1. list_repos
@@ -322,7 +504,7 @@ impl RustTool for ListRepos {
     }
 
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "limit": {
@@ -337,18 +519,19 @@ impl RustTool for ListRepos {
                 }
             },
             "required": []
-        })
+        }))
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let client = self.client.resolve_identity(&args)?;
         let limit = args["limit"].as_u64().unwrap_or(50).min(50);
         let page = args["page"].as_u64().unwrap_or(1).max(1);
 
         let path = format!(
             "/repos/search?owner={}&limit={}&page={}",
-            self.client.owner, limit, page
+            client.owner, limit, page
         );
-        let raw: Value = self.client.get(&path).await?;
+        let raw: Value = client.get(&path).await?;
         // Gitea search returns {"data": [...], "ok": true}
         let repos: Vec<GiteaRepo> = serde_json::from_value(
             raw["data"].clone(),
@@ -356,12 +539,12 @@ impl RustTool for ListRepos {
         .map_err(|e| ToolError::Http(format!("Failed to parse repo list: {e}")))?;
 
         if repos.is_empty() {
-            return Ok(format!("No repositories found for '{}'.", self.client.owner));
+            return Ok(format!("No repositories found for '{}'.", client.owner));
         }
 
         let mut out = format!(
             "Repositories for '{}' (page {}, showing {}):\n\n",
-            self.client.owner,
+            client.owner,
             page,
             repos.len()
         );
@@ -392,7 +575,7 @@ impl RustTool for GetRepo {
     }
 
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "repo": {
@@ -405,17 +588,18 @@ impl RustTool for GetRepo {
                 }
             },
             "required": ["repo"]
-        })
+        }))
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let client = self.client.resolve_identity(&args)?;
         let repo = args["repo"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
-        let owner = self.client.resolve_owner(args["owner"].as_str());
+        let owner = client.resolve_owner(args["owner"].as_str());
 
         let path = format!("/repos/{}/{}", owner, repo);
-        let r: GiteaRepo = self.client.get(&path).await.map_err(|e| match e {
+        let r: GiteaRepo = client.get(&path).await.map_err(|e| match e {
             ToolError::NotFound(_) => ToolError::NotFound(format!("Repository '{owner}/{repo}' not found")),
             other => other,
         })?;
@@ -440,7 +624,8 @@ impl RustTool for GetRepo {
 // Wraps POST {GITEA_URL}/api/v1/orgs/{org}/repos. Uses a direct reqwest call
 // (rather than GiteaClient::post) so we can surface 422 (already exists) and
 // 401/403 (auth) as clear, distinct errors. Credentials come from the shared
-// GiteaClient (GITEA_URL/GITEA_TOKEN), never std::env::var here or hardcoded.
+// GiteaClient (GITEA_URL + the resolved GITEA_PAT_<NAME> identity token), never
+// std::env::var here or hardcoded.
 pub struct CreateRepo {
     client: GiteaClient,
 }
@@ -454,7 +639,7 @@ impl RustTool for CreateRepo {
     }
 
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "org":         { "type": "string",  "description": "Organisation to create the repo under" },
@@ -463,10 +648,11 @@ impl RustTool for CreateRepo {
                 "private":     { "type": "boolean", "description": "Private repo? Default true", "default": true }
             },
             "required": ["org", "name"]
-        })
+        }))
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let client = self.client.resolve_identity(&args)?;
         let org = args["org"].as_str()
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -486,13 +672,12 @@ impl RustTool for CreateRepo {
         });
 
         let endpoint = format!("/orgs/{}/repos", org);
-        let url = self.client.api(&endpoint);
+        let url = client.api(&endpoint);
         debug!("POST {url}");
-        let resp = self
-            .client
+        let resp = client
             .http
             .post(&url)
-            .header("Authorization", self.client.auth_header())
+            .header("Authorization", client.auth_header())
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .json(&payload)
@@ -508,8 +693,8 @@ impl RustTool for CreateRepo {
         }
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
             return Err(ToolError::Http(format!(
-                "Gitea authentication/authorisation failed ({}). Check GITEA_TOKEN scope \
-                 (needs write:organization for org repos).",
+                "Gitea authentication/authorisation failed ({}). Check the resolved \
+                 GITEA_PAT_<NAME> identity's token scope (needs write:organization for org repos).",
                 status.as_u16()
             )));
         }
@@ -549,7 +734,7 @@ impl RustTool for CreateFile {
     }
 
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "repo":    { "type": "string", "description": "Repository name" },
@@ -560,10 +745,11 @@ impl RustTool for CreateFile {
                 "owner":   { "type": "string", "description": "Owner override (optional)" }
             },
             "required": ["repo", "path", "content", "message"]
-        })
+        }))
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let client = self.client.resolve_identity(&args)?;
         let repo = args["repo"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
         let path = args["path"].as_str()
@@ -572,7 +758,7 @@ impl RustTool for CreateFile {
             .ok_or_else(|| ToolError::InvalidArgument("'content' is required".to_string()))?;
         let message = args["message"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'message' is required".to_string()))?;
-        let owner = self.client.resolve_owner(args["owner"].as_str());
+        let owner = client.resolve_owner(args["owner"].as_str());
 
         // PII gate
         if let Some(reason) = pii_check(content) {
@@ -591,7 +777,7 @@ impl RustTool for CreateFile {
         };
 
         let endpoint = format!("/repos/{}/{}/contents/{}", owner, repo, path);
-        let resp: GiteaFileResponse = self.client.post(&endpoint, &body).await?;
+        let resp: GiteaFileResponse = client.post(&endpoint, &body).await?;
 
         Ok(format!(
             "File created: {}/{}/{}\nCommit: {}",
@@ -617,7 +803,7 @@ impl RustTool for ReadFile {
     }
 
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "repo":   { "type": "string", "description": "Repository name" },
@@ -626,22 +812,23 @@ impl RustTool for ReadFile {
                 "owner":  { "type": "string", "description": "Owner override (optional)" }
             },
             "required": ["repo", "path"]
-        })
+        }))
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let client = self.client.resolve_identity(&args)?;
         let repo = args["repo"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
         let path = args["path"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'path' is required".to_string()))?;
-        let owner = self.client.resolve_owner(args["owner"].as_str());
+        let owner = client.resolve_owner(args["owner"].as_str());
 
         let mut endpoint = format!("/repos/{}/{}/contents/{}", owner, repo, path);
         if let Some(git_ref) = args["ref"].as_str() {
             endpoint.push_str(&format!("?ref={}", git_ref));
         }
 
-        let fc: GiteaFileContent = self.client.get(&endpoint).await.map_err(|e| match e {
+        let fc: GiteaFileContent = client.get(&endpoint).await.map_err(|e| match e {
             ToolError::NotFound(_) => ToolError::NotFound(format!("File not found in repo: {owner}/{repo}/{path}")),
             other => other,
         })?;
@@ -677,7 +864,7 @@ impl RustTool for UpdateFile {
     }
 
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "repo":    { "type": "string", "description": "Repository name" },
@@ -688,10 +875,11 @@ impl RustTool for UpdateFile {
                 "owner":   { "type": "string", "description": "Owner override (optional)" }
             },
             "required": ["repo", "path", "content", "message"]
-        })
+        }))
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let client = self.client.resolve_identity(&args)?;
         let repo = args["repo"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
         let path = args["path"].as_str()
@@ -700,7 +888,7 @@ impl RustTool for UpdateFile {
             .ok_or_else(|| ToolError::InvalidArgument("'content' is required".to_string()))?;
         let message = args["message"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'message' is required".to_string()))?;
-        let owner = self.client.resolve_owner(args["owner"].as_str());
+        let owner = client.resolve_owner(args["owner"].as_str());
 
         // PII gate before fetching SHA (fail fast)
         if let Some(reason) = pii_check(content) {
@@ -711,7 +899,7 @@ impl RustTool for UpdateFile {
         }
 
         // Fetch current SHA — required by Gitea for updates
-        let sha = self.client.get_file_sha(repo, path).await.map_err(|e| match e {
+        let sha = client.get_file_sha(repo, path).await.map_err(|e| match e {
             ToolError::NotFound(_) => ToolError::NotFound(
                 format!("File not found in repo: {owner}/{repo}/{path}. Use create_file for new files.")
             ),
@@ -727,7 +915,7 @@ impl RustTool for UpdateFile {
         };
 
         let endpoint = format!("/repos/{}/{}/contents/{}", owner, repo, path);
-        let resp: GiteaFileResponse = self.client.put(&endpoint, &body).await?;
+        let resp: GiteaFileResponse = client.put(&endpoint, &body).await?;
 
         Ok(format!(
             "File updated: {owner}/{repo}/{path}\nCommit: {}",
@@ -750,7 +938,7 @@ impl RustTool for DeleteFile {
     }
 
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "repo":    { "type": "string", "description": "Repository name" },
@@ -760,20 +948,21 @@ impl RustTool for DeleteFile {
                 "owner":   { "type": "string", "description": "Owner override (optional)" }
             },
             "required": ["repo", "path", "message"]
-        })
+        }))
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let client = self.client.resolve_identity(&args)?;
         let repo = args["repo"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
         let path = args["path"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'path' is required".to_string()))?;
         let message = args["message"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'message' is required".to_string()))?;
-        let owner = self.client.resolve_owner(args["owner"].as_str());
+        let owner = client.resolve_owner(args["owner"].as_str());
 
         // Fetch current SHA — required by Gitea
-        let sha = self.client.get_file_sha(repo, path).await.map_err(|e| match e {
+        let sha = client.get_file_sha(repo, path).await.map_err(|e| match e {
             ToolError::NotFound(_) => ToolError::NotFound(format!("File not found in repo: {owner}/{repo}/{path}")),
             other => other,
         })?;
@@ -785,7 +974,7 @@ impl RustTool for DeleteFile {
         };
 
         let endpoint = format!("/repos/{}/{}/contents/{}", owner, repo, path);
-        self.client.delete_with_body(&endpoint, &body).await?;
+        client.delete_with_body(&endpoint, &body).await?;
 
         Ok(format!("File deleted: {owner}/{repo}/{path}"))
     }
@@ -805,7 +994,7 @@ impl RustTool for ListPrs {
     }
 
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "repo":  { "type": "string", "description": "Repository name" },
@@ -815,22 +1004,23 @@ impl RustTool for ListPrs {
                 "owner": { "type": "string", "description": "Owner override (optional)" }
             },
             "required": ["repo"]
-        })
+        }))
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let client = self.client.resolve_identity(&args)?;
         let repo = args["repo"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
         let state = args["state"].as_str().unwrap_or("open");
         let limit = args["limit"].as_u64().unwrap_or(20).min(50);
         let page = args["page"].as_u64().unwrap_or(1).max(1);
-        let owner = self.client.resolve_owner(args["owner"].as_str());
+        let owner = client.resolve_owner(args["owner"].as_str());
 
         let endpoint = format!(
             "/repos/{}/{}/pulls?state={}&limit={}&page={}",
             owner, repo, state, limit, page
         );
-        let prs: Vec<GiteaPullRequest> = self.client.get(&endpoint).await?;
+        let prs: Vec<GiteaPullRequest> = client.get(&endpoint).await?;
 
         if prs.is_empty() {
             return Ok(format!("No {} pull requests in {owner}/{repo}.", state));
@@ -869,7 +1059,7 @@ impl RustTool for CreatePr {
     }
 
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "repo":  { "type": "string", "description": "Repository name" },
@@ -880,10 +1070,11 @@ impl RustTool for CreatePr {
                 "owner": { "type": "string", "description": "Owner override (optional)" }
             },
             "required": ["repo", "title", "head", "base"]
-        })
+        }))
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let client = self.client.resolve_identity(&args)?;
         let repo = args["repo"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
         let title = args["title"].as_str()
@@ -892,7 +1083,7 @@ impl RustTool for CreatePr {
             .ok_or_else(|| ToolError::InvalidArgument("'head' is required".to_string()))?;
         let base = args["base"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'base' is required".to_string()))?;
-        let owner = self.client.resolve_owner(args["owner"].as_str());
+        let owner = client.resolve_owner(args["owner"].as_str());
 
         // PII gate on PR body if provided
         if let Some(body_text) = args["body"].as_str() {
@@ -912,7 +1103,7 @@ impl RustTool for CreatePr {
         };
 
         let endpoint = format!("/repos/{}/{}/pulls", owner, repo);
-        let pr: GiteaPullRequest = self.client.post(&endpoint, &body).await?;
+        let pr: GiteaPullRequest = client.post(&endpoint, &body).await?;
 
         Ok(format!(
             "Pull request created: #{} — {}\nURL: {}\n{} → {}",
@@ -935,7 +1126,7 @@ impl RustTool for MergePr {
     }
 
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "repo":   { "type": "string", "description": "Repository name" },
@@ -945,16 +1136,17 @@ impl RustTool for MergePr {
                 "owner":  { "type": "string", "description": "Owner override (optional)" }
             },
             "required": ["repo", "pr"]
-        })
+        }))
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let client = self.client.resolve_identity(&args)?;
         let repo = args["repo"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
         let pr_num = args["pr"].as_u64()
             .ok_or_else(|| ToolError::InvalidArgument("'pr' must be an integer".to_string()))?;
         let style = args["style"].as_str().unwrap_or("merge");
-        let owner = self.client.resolve_owner(args["owner"].as_str());
+        let owner = client.resolve_owner(args["owner"].as_str());
 
         let mut body = json!({ "Do": style });
         if let Some(msg) = args["message"].as_str() {
@@ -963,12 +1155,11 @@ impl RustTool for MergePr {
 
         let endpoint = format!("/repos/{}/{}/pulls/{}/merge", owner, repo, pr_num);
         // Merge endpoint returns 200 with no body on success
-        let url = self.client.api(&endpoint);
-        let resp = self
-            .client
+        let url = client.api(&endpoint);
+        let resp = client
             .http
             .post(&url)
-            .header("Authorization", self.client.auth_header())
+            .header("Authorization", client.auth_header())
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
@@ -1007,7 +1198,7 @@ Returns entries with name, type (file/dir), path, and SHA."
     }
 
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "repo":  { "type": "string", "description": "Repository name" },
@@ -1016,14 +1207,15 @@ Returns entries with name, type (file/dir), path, and SHA."
                 "owner": { "type": "string", "description": "Owner override (optional)" }
             },
             "required": ["repo"]
-        })
+        }))
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let client = self.client.resolve_identity(&args)?;
         let repo  = args["repo"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
         let path  = args["path"].as_str().unwrap_or("").trim_matches('/');
-        let owner = self.client.resolve_owner(args["owner"].as_str());
+        let owner = client.resolve_owner(args["owner"].as_str());
 
         let mut endpoint = if path.is_empty() {
             format!("/repos/{owner}/{repo}/contents/")
@@ -1042,7 +1234,7 @@ Returns entries with name, type (file/dir), path, and SHA."
             endpoint.push_str(&format!("?ref={encoded}"));
         }
 
-        let entries: Vec<Value> = self.client.get(&endpoint).await
+        let entries: Vec<Value> = client.get(&endpoint).await
             .map_err(|e| match e {
                 ToolError::NotFound(_) => ToolError::NotFound(
                     format!("Path not found: {owner}/{repo}/{path}")),
@@ -1074,7 +1266,7 @@ impl RustTool for ListBranches {
     }
 
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "repo":  { "type": "string", "description": "Repository name" },
@@ -1083,21 +1275,22 @@ impl RustTool for ListBranches {
                 "owner": { "type": "string", "description": "Owner override (optional)" }
             },
             "required": ["repo"]
-        })
+        }))
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let client = self.client.resolve_identity(&args)?;
         let repo = args["repo"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
         let limit = args["limit"].as_u64().unwrap_or(30).min(50);
         let page = args["page"].as_u64().unwrap_or(1).max(1);
-        let owner = self.client.resolve_owner(args["owner"].as_str());
+        let owner = client.resolve_owner(args["owner"].as_str());
 
         let endpoint = format!(
             "/repos/{}/{}/branches?limit={}&page={}",
             owner, repo, limit, page
         );
-        let branches: Vec<GiteaBranchInfo> = self.client.get(&endpoint).await?;
+        let branches: Vec<GiteaBranchInfo> = client.get(&endpoint).await?;
 
         if branches.is_empty() {
             return Ok(format!("No branches found in {owner}/{repo}."));
@@ -1123,15 +1316,16 @@ impl RustTool for ListBranches {
 //
 // `cargo publish` is, on the wire, an authenticated HTTP PUT of a packaged
 // `.crate` file to the registry's publish endpoint. Gitea implements the Cargo
-// registry API, so we recreate that PUT here and route it through Terminus's own
-// `GITEA_TOKEN` — meaning no `cargo publish` token ever has to live on the dev
-// box or be spread across build/serving hosts. There is exactly ONE publisher
-// identity (Terminus's configured token); this is deliberately single-identity,
-// not a multi-user path.
+// registry API, so we recreate that PUT here and route it through a resolved
+// `GITEA_PAT_<NAME>` identity token (the active default GITEA_IDENTITY_NAME, or
+// the optional `identity` argument) — meaning no `cargo publish` token ever has
+// to live on the dev box or be spread across build/serving hosts. Publishing
+// honours the same identity model as every other Gitea tool (S105/GPAT); it is
+// no longer a single fixed publisher identity.
 //
 // Endpoint (verified against Gitea 1.25.x):
 //   PUT {GITEA_URL}/api/packages/{owner}/cargo/api/v1/crates/new
-//   Authorization: token <GITEA_TOKEN>   (the PAT scheme all GiteaClient calls
+//   Authorization: token <GITEA_PAT_NAME>  (the PAT scheme all GiteaClient calls
 //                                          use; a `Bearer` prefix would make
 //                                          Gitea treat the PAT as OAuth2)
 //   Body: the standard Cargo publish binary frame —
@@ -1391,13 +1585,14 @@ impl RustTool for CargoPublish {
 
     fn description(&self) -> &str {
         "Publish a packaged Rust .crate file (from token-less `cargo package`) to the Gitea \
-         Cargo registry using Terminus's own GITEA_TOKEN, so no cargo-publish token lives on the \
-         dev box. Single-identity publisher. Inputs: crate_path, name, version, metadata (the full \
-         Cargo publish metadata incl. deps — extract it on the dev box) and optional owner."
+         Cargo registry using a resolved GITEA_PAT_<NAME> identity's token (the active default \
+         GITEA_IDENTITY_NAME, or the optional `identity` argument), so no cargo-publish token \
+         lives on the dev box. Inputs: crate_path, name, version, metadata (the full Cargo \
+         publish metadata incl. deps — extract it on the dev box), optional owner and identity."
     }
 
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "crate_path": {
@@ -1422,10 +1617,11 @@ impl RustTool for CargoPublish {
                 }
             },
             "required": ["crate_path", "name", "version", "metadata"]
-        })
+        }))
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let client = self.client.resolve_identity(&args)?;
         let crate_path = args["crate_path"].as_str()
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -1438,7 +1634,7 @@ impl RustTool for CargoPublish {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| ToolError::InvalidArgument("'version' is required".to_string()))?;
-        let owner = self.client.resolve_owner(args["owner"].as_str());
+        let owner = client.resolve_owner(args["owner"].as_str());
         // Reject an owner that could re-target the URL (path traversal / slash)
         // — it is interpolated into the endpoint alongside the bearer token.
         if !is_valid_owner_segment(owner) {
@@ -1493,21 +1689,21 @@ impl RustTool for CargoPublish {
 
         let url = format!(
             "{}/api/packages/{}/cargo/api/v1/crates/new",
-            self.client.base_url.trim_end_matches('/'),
+            client.base_url.trim_end_matches('/'),
             owner,
         );
         debug!("PUT {url} ({}-byte crate)", crate_bytes.len());
 
-        // Single sanctioned publisher identity: Terminus's own GITEA_TOKEN.
-        // Use the SAME `Authorization: token <PAT>` scheme every other
-        // GiteaClient request uses (a Gitea PAT under a `Bearer` prefix is
-        // treated as an OAuth2 credential and rejected). The token is NEVER
-        // logged or echoed into any result/error below.
-        let resp = self
-            .client
+        // Publisher identity: the resolved GITEA_PAT_<NAME> token (active default
+        // GITEA_IDENTITY_NAME, or the optional `identity` argument). Use the SAME
+        // `Authorization: token <PAT>` scheme every other GiteaClient request uses
+        // (a Gitea PAT under a `Bearer` prefix is treated as an OAuth2 credential
+        // and rejected). The token is NEVER logged or echoed into any
+        // result/error below.
+        let resp = client
             .http
             .put(&url)
-            .header("Authorization", self.client.auth_header())
+            .header("Authorization", client.auth_header())
             .header("Content-Type", "application/octet-stream")
             .header("Accept", "application/json")
             .body(body)
@@ -1518,16 +1714,16 @@ impl RustTool for CargoPublish {
         let status = resp.status();
         if status == StatusCode::UNAUTHORIZED {
             return Err(ToolError::Http(
-                "Gitea Cargo publish returned 401 Unauthorized — the configured GITEA_TOKEN is \
-                 missing or invalid.".to_string(),
+                "Gitea Cargo publish returned 401 Unauthorized — the resolved GITEA_PAT_<NAME> \
+                 identity token is missing or invalid.".to_string(),
             ));
         }
         if status == StatusCode::FORBIDDEN {
             return Err(ToolError::Http(format!(
                 "Gitea Cargo publish returned 403 Forbidden for {owner}/{name}@{version}. The \
-                 GITEA_TOKEN almost certainly lacks the `write:package` scope required to publish \
-                 to the Cargo registry — regenerate the token in the runtime secret store with \
-                 that scope."
+                 resolved GITEA_PAT_<NAME> identity token almost certainly lacks the \
+                 `write:package` scope required to publish to the Cargo registry — regenerate the \
+                 token in the runtime secret store with that scope."
             )));
         }
         if status == StatusCode::CONFLICT {
@@ -1553,7 +1749,7 @@ impl RustTool for CargoPublish {
 
         let registry_url = format!(
             "{}/{}/-/packages/cargo/{}/{}",
-            self.client.base_url.trim_end_matches('/'),
+            client.base_url.trim_end_matches('/'),
             owner,
             name,
             version,
@@ -1568,6 +1764,55 @@ impl RustTool for CargoPublish {
             "warnings": warnings.unwrap_or(Value::Null),
         })
         .to_string())
+    }
+}
+
+// ─── gitea_list_identities ────────────────────────────────────────────────────
+
+/// Lists the names of every configured `GITEA_PAT_<NAME>` identity so a caller
+/// can see which identity it may act as before performing Gitea work. Names only
+/// — never token values. Mirrors `plane_list_identities`.
+pub struct GiteaListIdentities {
+    client: GiteaClient,
+}
+
+#[async_trait]
+impl RustTool for GiteaListIdentities {
+    fn name(&self) -> &str { "gitea_list_identities" }
+
+    fn description(&self) -> &str {
+        "List the names of all configured Gitea identities (from GITEA_PAT_<NAME> environment vars) so you can see which identity to act as before performing Gitea work. Returns names only, never token values, plus the active_default identity. Every Gitea tool takes an optional `identity` argument set to one of these names to act AS that identity; omitting it uses the active default (GITEA_IDENTITY_NAME, default \"moose\"). Use the identity matching who should act on the repo rather than always the default."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        })
+    }
+
+    async fn execute(&self, _args: Value) -> Result<String, ToolError> {
+        // Derived from the client's already-scanned identities map (populated
+        // once at start via `scan_gitea_identities`), so the list is exactly
+        // what `for_identity()` can resolve — never a fresh, divergent env scan.
+        let names = self.client.identity_names();
+        let count = names.len();
+        let active_default = self.client.identity_name().map(|s| s.to_string());
+        let mut out = json!({
+            "identities": names,
+            "count": count,
+            "active_default": active_default,
+            "prefix": GITEA_IDENTITY_PREFIX,
+        });
+        if count == 0 {
+            out["note"] = json!(format!(
+                "No named Gitea identities configured. Provision named identities as \
+                 {GITEA_IDENTITY_PREFIX}<NAME> (e.g. {GITEA_IDENTITY_PREFIX}MOOSE)."
+            ));
+        }
+        serde_json::to_string(&out)
+            .map_err(|e| ToolError::Execution(format!("failed to serialize identity list: {e}")))
     }
 }
 
@@ -1592,6 +1837,7 @@ pub fn register(registry: &mut ToolRegistry) {
             let _ = registry.register(Box::new(MergePr { client: client.clone() }));
             let _ = registry.register(Box::new(ListBranches { client: client.clone() }));
             let _ = registry.register(Box::new(CargoPublish { client: client.clone() }));
+            let _ = registry.register(Box::new(GiteaListIdentities { client: client.clone() }));
             let _ = registry.register(Box::new(ListDirectory { client }));
         }
         Err(e) => {
@@ -1618,6 +1864,7 @@ pub fn register(registry: &mut ToolRegistry) {
             stub!("gitea_merge_pr", "Merge Gitea pull request (not configured)");
             stub!("gitea_list_branches", "List Gitea branches (not configured)");
             stub!("gitea_cargo_publish", "Publish a .crate to the Gitea Cargo registry (not configured)");
+            stub!("gitea_list_identities", "List configured Gitea identities (not configured)");
             stub!("gitea_list_directory", "List directory contents in Gitea (not configured)");
         }
     }
@@ -1652,6 +1899,31 @@ mod tests {
             http: Client::new(),
             base_url: server.base_url(),
             token: "<REDACTED-SECRET>".to_string(),
+            identity_name: Some("moose".to_string()),
+            identities: Arc::new(HashMap::new()),
+            owner: "testorg".to_string(),
+        }
+    }
+
+    /// Like `mock_client` but with a set of named `GITEA_PAT_<NAME>` identities
+    /// pre-loaded (name -> token), so identity-resolution paths can be exercised
+    /// without mutating the process environment.
+    fn mock_client_with_identities(
+        server: &MockServer,
+        default_name: &str,
+        identities: &[(&str, &str)],
+    ) -> GiteaClient {
+        let map: HashMap<String, String> = identities
+            .iter()
+            .map(|(n, t)| (n.to_lowercase(), t.to_string()))
+            .collect();
+        let token = map.get(default_name).cloned().unwrap_or_default();
+        GiteaClient {
+            http: Client::new(),
+            base_url: server.base_url(),
+            token,
+            identity_name: Some(default_name.to_string()),
+            identities: Arc::new(map),
             owner: "testorg".to_string(),
         }
     }
@@ -2300,7 +2572,7 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("authentication") || msg.contains("401"));
-        assert!(msg.contains("GITEA_TOKEN"));
+        assert!(msg.contains("GITEA_PAT"));
     }
 
     #[tokio::test]
@@ -2741,6 +3013,8 @@ mod tests {
             http: Client::new(),
             base_url: server.base_url(),
             token: secret_token.to_string(),
+            identity_name: Some("moose".to_string()),
+            identities: Arc::new(HashMap::new()),
             owner: "testorg".to_string(),
         };
         let tmp = write_temp_crate(b"bytes");
@@ -2770,5 +3044,259 @@ mod tests {
         register(&mut reg);
         if let Some(v) = url_backup { std::env::set_var("GITEA_URL", v); } else { std::env::remove_var("GITEA_URL"); }
         assert!(reg.contains("gitea_cargo_publish"));
+    }
+
+    // ── GPAT (S105): multi-identity (GITEA_PAT_<NAME>) ─────────────────────────
+    //
+    // These mirror the Plane PPAT tests. Env-var tests run #[serial] and clear
+    // the relevant keys before AND after, since env mutation is process-global.
+
+    const GPAT_TEST_ENV_KEYS: &[&str] = &[
+        "GITEA_URL",
+        "GITEA_OWNER",
+        "GITEA_IDENTITY_NAME",
+        "GITEA_PAT_MOOSE",
+        "GITEA_PAT_HARMONY",
+        "GITEA_PAT_LUMINA",
+        "GITEA_PAT_BLANK",
+    ];
+
+    fn clear_gpat_env() {
+        for k in GPAT_TEST_ENV_KEYS {
+            std::env::remove_var(k);
+        }
+    }
+
+    // 1. Identity scan: GITEA_PAT_<NAME> vars populate the identities map
+    //    (lowercased), a blank value is treated as absent, and no unrelated key
+    //    is imported.
+    #[test]
+    #[serial_test::serial]
+    fn test_from_env_scans_gitea_pat_identities() {
+        clear_gpat_env();
+        std::env::set_var("GITEA_URL", "http://example.com");
+        std::env::set_var("GITEA_PAT_MOOSE", "tok-moose"); // pii-test-fixture
+        std::env::set_var("GITEA_PAT_HARMONY", "tok-harmony"); // pii-test-fixture
+        std::env::set_var("GITEA_PAT_LUMINA", "tok-lumina"); // pii-test-fixture
+        std::env::set_var("GITEA_PAT_BLANK", ""); // set-but-empty → absent
+
+        let client = GiteaClient::from_env().unwrap();
+        let mut names = client.identity_names();
+        names.sort();
+        assert_eq!(names, vec!["harmony", "lumina", "moose"]);
+        // A blank PAT is never registered.
+        assert!(client.for_identity("blank").is_err());
+
+        clear_gpat_env();
+    }
+
+    // 2. Default identity is MOOSE (differs from Plane's lumina) when
+    //    GITEA_IDENTITY_NAME is unset — the active-default token IS moose's.
+    #[test]
+    #[serial_test::serial]
+    fn test_default_identity_is_moose() {
+        clear_gpat_env();
+        std::env::set_var("GITEA_URL", "http://example.com");
+        std::env::set_var("GITEA_PAT_MOOSE", "tok-moose"); // pii-test-fixture
+        std::env::set_var("GITEA_PAT_LUMINA", "tok-lumina"); // pii-test-fixture
+
+        let client = GiteaClient::from_env().unwrap();
+        assert_eq!(client.identity_name(), Some("moose"));
+        assert_eq!(client.token, "tok-moose");
+
+        clear_gpat_env();
+    }
+
+    // 3. GITEA_IDENTITY_NAME selects the active-default identity's token.
+    #[test]
+    #[serial_test::serial]
+    fn test_gitea_identity_name_selects_default_token() {
+        clear_gpat_env();
+        std::env::set_var("GITEA_URL", "http://example.com");
+        std::env::set_var("GITEA_IDENTITY_NAME", "Harmony"); // case-insensitive
+        std::env::set_var("GITEA_PAT_MOOSE", "tok-moose"); // pii-test-fixture
+        std::env::set_var("GITEA_PAT_HARMONY", "tok-harmony"); // pii-test-fixture
+
+        let client = GiteaClient::from_env().unwrap();
+        assert_eq!(client.identity_name(), Some("harmony"));
+        assert_eq!(client.token, "tok-harmony");
+
+        clear_gpat_env();
+    }
+
+    // 4. gitea_list_identities: 3 identities, sorted, active_default present,
+    //    and NO token value ever appears in the output (no-leak).
+    #[tokio::test]
+    async fn test_gitea_list_identities_lists_names_no_value_leak() {
+        let server = MockServer::start();
+        let client = mock_client_with_identities(
+            &server,
+            "moose",
+            &[
+                ("moose", "SECRET-MOOSE-TOKEN"),     // pii-test-fixture
+                ("harmony", "SECRET-HARMONY-TOKEN"), // pii-test-fixture
+                ("lumina", "SECRET-LUMINA-TOKEN"),   // pii-test-fixture
+            ],
+        );
+        let tool = GiteaListIdentities { client };
+        let out = tool.execute(serde_json::json!({})).await.unwrap();
+
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            parsed["identities"],
+            serde_json::json!(["harmony", "lumina", "moose"])
+        );
+        assert_eq!(parsed["count"], 3);
+        assert_eq!(parsed["active_default"], "moose");
+        assert_eq!(parsed["prefix"], "GITEA_PAT_");
+        // No token value may leak into the listing output.
+        for secret in ["SECRET-MOOSE-TOKEN", "SECRET-HARMONY-TOKEN", "SECRET-LUMINA-TOKEN"] {
+            assert!(!out.contains(secret), "identity listing leaked a token value");
+        }
+    }
+
+    // 5. resolve_identity dispatch: the optional `identity` arg selects that
+    //    identity's token for the request. We assert the request carried the
+    //    SELECTED identity's `Authorization: token <pat>` header, not the
+    //    default's — proving the arg is threaded through a CRUD tool.
+    #[tokio::test]
+    async fn test_identity_arg_dispatches_selected_token() {
+        let server = MockServer::start();
+        // Endpoint accepts ONLY harmony's token.
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/repos/testorg/somerepo")
+                .header("Authorization", "token tok-harmony");
+            then.status(200).json_body(serde_json::json!({
+                "id": 1,
+                "name": "somerepo",
+                "full_name": "testorg/somerepo",
+                "description": "",
+                "html_url": "http://example.com/testorg/somerepo",
+                "clone_url": "http://example.com/testorg/somerepo.git",
+                "default_branch": "main",
+                "private": true,
+                "stars_count": 0,
+                "forks_count": 0,
+                "open_issues_count": 0,
+                "updated": null
+            }));
+        });
+        let client = mock_client_with_identities(
+            &server,
+            "moose",
+            &[("moose", "tok-moose"), ("harmony", "tok-harmony")], // pii-test-fixture
+        );
+        let tool = GetRepo { client };
+        let result = tool
+            .execute(serde_json::json!({ "repo": "somerepo", "identity": "harmony" }))
+            .await
+            .unwrap();
+        mock.assert();
+        assert!(result.contains("testorg/somerepo"));
+    }
+
+    // 5b. resolve_identity default path: with NO `identity` arg, the request
+    //     carries the active-default (moose) token.
+    #[tokio::test]
+    async fn test_default_identity_used_when_no_identity_arg() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/repos/testorg/r2")
+                .header("Authorization", "token tok-moose");
+            then.status(200).json_body(serde_json::json!({
+                "id": 2, "name": "r2", "full_name": "testorg/r2", "description": "",
+                "html_url": "http://example.com/r2", "clone_url": "http://example.com/r2.git",
+                "default_branch": "main", "private": true, "stars_count": 0,
+                "forks_count": 0, "open_issues_count": 0, "updated": null
+            }));
+        });
+        let client = mock_client_with_identities(
+            &server,
+            "moose",
+            &[("moose", "tok-moose"), ("harmony", "tok-harmony")], // pii-test-fixture
+        );
+        let tool = GetRepo { client };
+        tool.execute(serde_json::json!({ "repo": "r2" })).await.unwrap();
+        mock.assert();
+    }
+
+    // 6. Unknown identity → InvalidArgument (from resolve_identity), before any
+    //    network call. Also proves cargo_publish is wired to resolve_identity.
+    #[tokio::test]
+    async fn test_unknown_identity_is_rejected() {
+        let server = MockServer::start();
+        let client = mock_client_with_identities(
+            &server,
+            "moose",
+            &[("moose", "tok-moose")], // pii-test-fixture
+        );
+        let tool = GetRepo { client };
+        let err = tool
+            .execute(serde_json::json!({ "repo": "r", "identity": "ghost" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+        assert!(err.to_string().contains("GITEA_PAT_GHOST"));
+    }
+
+    // 7. gitea_cargo_publish uses the RESOLVED identity's token: publishing with
+    //    identity=harmony must authenticate with harmony's PAT.
+    #[tokio::test]
+    async fn test_cargo_publish_uses_resolved_identity_token() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(PUT)
+                .path("/api/packages/testorg/cargo/api/v1/crates/new")
+                .header("Authorization", "token tok-harmony");
+            then.status(200).json_body(serde_json::json!({}));
+        });
+        let client = mock_client_with_identities(
+            &server,
+            "moose",
+            &[("moose", "tok-moose"), ("harmony", "tok-harmony")], // pii-test-fixture
+        );
+        let tmp = write_temp_crate(b"crate-bytes");
+        let tool = CargoPublish { client };
+        let result = tool
+            .execute(serde_json::json!({
+                "crate_path": tmp.to_str().unwrap(),
+                "name": "foo",
+                "version": "0.1.0",
+                "identity": "harmony",
+                "metadata": {}
+            }))
+            .await
+            .unwrap();
+        std::fs::remove_file(&tmp).ok();
+        mock.assert();
+        assert!(result.contains("\"published\":true"));
+    }
+
+    // 8. Backward-compat / no-leak: a client with no GITEA_PAT_* configured still
+    //    constructs (URL only) with an empty default token, lists zero
+    //    identities, and its Debug output never reveals the token.
+    #[test]
+    #[serial_test::serial]
+    fn test_no_identities_configured_is_empty_and_debug_redacts() {
+        clear_gpat_env();
+        std::env::set_var("GITEA_URL", "http://example.com");
+
+        let client = GiteaClient::from_env().unwrap();
+        assert!(client.identity_names().is_empty());
+        assert_eq!(client.identity_name(), Some("moose")); // default name still set
+        assert_eq!(client.token, ""); // no GITEA_PAT_MOOSE → empty token
+
+        // Debug must never print a real token; with a token set, it is redacted.
+        let with_tok = GiteaClient {
+            token: "<REDACTED-SECRET>".to_string(), // pii-test-fixture
+            ..client.clone()
+        };
+        let dbg = format!("{with_tok:?}");
+        assert!(!dbg.contains("SUPER-SECRET"), "Debug leaked the token");
+        assert!(dbg.contains("<redacted>"));
+
+        clear_gpat_env();
     }
 }

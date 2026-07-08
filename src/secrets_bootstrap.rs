@@ -38,14 +38,35 @@ use crate::<secret-manager>::{fetch_secrets_batch, InfisicalConfig}; // pii-test
 /// Deliberately a fixed, named allowlist (not "apply every key found at this
 /// path") so a shared store path holding secrets for other services can never
 /// leak into this process's environment.
+///
+/// **BREAKING (S105/GPAT):** the unsuffixed `GITEA_TOKEN` was removed here — the
+/// Gitea tool now authenticates solely via per-identity `GITEA_PAT_<NAME>`
+/// tokens, materialized dynamically through [`PAT_KEY_PREFIXES`] below (default
+/// identity `moose` → `GITEA_PAT_MOOSE`). There is no single unsuffixed Gitea
+/// token to materialize any more, so nothing in this fixed allowlist reads one.
 pub const GITEA_PLANE_GITHUB_SECRET_KEYS: &[&str] = &[
     "PLANE_API_URL",
     "PLANE_API_KEY",
     "PLANE_WORKSPACE",
     "GITEA_URL",
-    "GITEA_TOKEN",
     "GITHUB_TOKEN",
 ];
+
+/// Prefixes for named-identity Personal Access Tokens. In addition to the fixed
+/// [`GITEA_PLANE_GITHUB_SECRET_KEYS`] above, any secret key at the fetch path
+/// beginning with one of these prefixes is materialized into the process
+/// environment too, so the per-identity token resolution in each tool
+/// (`PlaneClient::for_identity` / `GiteaClient::for_identity`) can see it:
+///
+/// - `PLANE_PAT_*` — Plane identities (`PLANE_PAT_CLAUDE`, `PLANE_PAT_MOOSE`, …).
+/// - `GITEA_PAT_*` — Gitea identities (`GITEA_PAT_MOOSE`, `GITEA_PAT_HARMONY`,
+///   `GITEA_PAT_LUMINA`, …) — S105/GPAT, replacing the retired `GITEA_TOKEN`.
+///
+/// A *dynamic prefix match*, not another fixed list: a newly-provisioned
+/// identity becomes usable on the next restart with no code change. Matching is
+/// scoped to exactly these prefixes (never "set every key found at the path"),
+/// preserving the same anti-leak property as the fixed allowlist above.
+pub const PAT_KEY_PREFIXES: &[&str] = &["PLANE_PAT_", "GITEA_PAT_"];
 
 /// Outcome of the startup bootstrap attempt. Returned to the caller so it can
 /// log the result (via [`log_secret_bootstrap_outcome`]) and so tests can
@@ -58,7 +79,15 @@ pub enum SecretBootstrapOutcome {
     /// The fetch succeeded; `count` downstream keys were found and applied to
     /// the process environment. `missing` names (never values) any of
     /// [`GITEA_PLANE_GITHUB_SECRET_KEYS`] the store did not have at this path.
-    Fetched { count: usize, missing: Vec<String> },
+    /// `identities` is how many of `count` are named-identity PATs
+    /// (`PLANE_PAT_*` / `GITEA_PAT_*`, picked up dynamically via
+    /// [`PAT_KEY_PREFIXES`]) — a set-but-blank value is treated as missing for
+    /// both counters, never set.
+    Fetched {
+        count: usize,
+        missing: Vec<String>,
+        identities: usize,
+    },
     /// The fetch was attempted but failed (auth failure, network error,
     /// malformed response, ...) — the caller falls back to whatever is already
     /// in the process environment. `reason` is a display-formatted error,
@@ -100,8 +129,12 @@ pub async fn bootstrap_gitea_plane_github_secrets(
         Ok(fetched) => {
             let mut count = 0usize;
             let mut missing = Vec::new();
+            // Fixed downstream allowlist: the base connection secrets. A
+            // present-but-blank value is treated as MISSING (never set into the
+            // environment) so a blank provider value can never silently clobber
+            // a valid static-env fallback with an empty string.
             for key in GITEA_PLANE_GITHUB_SECRET_KEYS {
-                match fetched.get(*key) {
+                match fetched.get(*key).filter(|v| !v.is_empty()) {
                     Some(value) => {
                         std::env::set_var(key, value);
                         count += 1;
@@ -109,7 +142,26 @@ pub async fn bootstrap_gitea_plane_github_secrets(
                     None => missing.push((*key).to_string()),
                 }
             }
-            SecretBootstrapOutcome::Fetched { count, missing }
+            // Named-identity PATs: materialize every non-blank `PLANE_PAT_*` /
+            // `GITEA_PAT_*` key found at this path (dynamic prefix match — a
+            // newly-provisioned identity works with no code change). Same
+            // blank-as-missing rule. Not tracked in `missing`: identities are
+            // provisioned ad hoc, so there is no fixed expected set for one to
+            // be "missing" from.
+            let mut identities = 0usize;
+            for (key, value) in &fetched {
+                let is_pat = PAT_KEY_PREFIXES.iter().any(|p| key.starts_with(p));
+                if is_pat && !value.is_empty() {
+                    std::env::set_var(key, value);
+                    count += 1;
+                    identities += 1;
+                }
+            }
+            SecretBootstrapOutcome::Fetched {
+                count,
+                missing,
+                identities,
+            }
         }
         Err(e) => SecretBootstrapOutcome::Failed {
             reason: e.to_string(),
@@ -128,8 +180,8 @@ pub fn log_secret_bootstrap_outcome(outcome: &SecretBootstrapOutcome) {
                 "secret bootstrap skipped: bootstrap credential or project id not configured, using static environment"
             );
         }
-        SecretBootstrapOutcome::Fetched { count, missing } => {
-            tracing::info!("secret bootstrap: applied {count} downstream secrets to the process environment");
+        SecretBootstrapOutcome::Fetched { count, missing, identities } => {
+            tracing::info!("secret bootstrap: applied {count} downstream secrets ({identities} named PAT identities) to the process environment");
             if !missing.is_empty() {
                 tracing::warn!(
                     "secret bootstrap: store did not include: {} (using static environment for these, if present)",
@@ -167,8 +219,13 @@ mod tests {
         "PLANE_API_KEY",
         "PLANE_WORKSPACE",
         "GITEA_URL",
-        "GITEA_TOKEN",
         "GITHUB_TOKEN",
+        "PLANE_PAT_CLAUDE",
+        "GITEA_PAT_MOOSE",
+        "GITEA_PAT_HARMONY",
+        "GITEA_PAT_FUTURE",
+        "GITEA_PAT_BLANK",
+        "SOME_OTHER_SERVICE_SECRET",
     ];
 
     fn clear_all_env() {
@@ -242,7 +299,7 @@ mod tests {
             then.status(200).json_body(json!({
                 "secrets": [
                     { "secretKey": "PLANE_API_KEY", "secretValue": "fixture-plane-key" },
-                    { "secretKey": "GITEA_TOKEN", "secretValue": "fixture-gitea-token" }
+                    { "secretKey": "GITHUB_TOKEN", "secretValue": "fixture-github-token" }
                 ]
             }));
         });
@@ -251,14 +308,67 @@ mod tests {
         let outcome =
             bootstrap_gitea_plane_github_secrets(Some("proj1"), "prod", "/").await;
         match outcome {
-            SecretBootstrapOutcome::Fetched { count, missing } => {
+            SecretBootstrapOutcome::Fetched { count, missing, identities } => {
                 assert_eq!(count, 2);
                 assert_eq!(missing.len(), GITEA_PLANE_GITHUB_SECRET_KEYS.len() - 2);
+                assert_eq!(identities, 0);
             }
             other => panic!("expected Fetched, got {other:?}"),
         }
         assert_eq!(std::env::var("PLANE_API_KEY").unwrap(), "fixture-plane-key");
-        assert_eq!(std::env::var("GITEA_TOKEN").unwrap(), "fixture-gitea-token");
+        assert_eq!(std::env::var("GITHUB_TOKEN").unwrap(), "fixture-github-token");
+
+        clear_all_env();
+    }
+
+    // ── Named-identity PATs (S105/GPAT): dynamic PLANE_PAT_* / GITEA_PAT_*
+    //    pickup, blank-as-missing, and no leakage of unrelated keys. ───────────
+    #[tokio::test]
+    #[serial]
+    async fn named_identity_pats_are_materialized_dynamically() {
+        clear_all_env();
+        let server = MockServer::start();
+        mock_login(&server, "tok-pat"); // pii-test-fixture
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v3/secrets/raw");
+            then.status(200).json_body(json!({
+                "secrets": [
+                    // A base allowlist key (not a PAT) to prove coexistence.
+                    { "secretKey": "GITEA_URL", "secretValue": "http://gitea.example.com" },
+                    // Plane + Gitea PATs must BOTH be picked up dynamically.
+                    { "secretKey": "PLANE_PAT_CLAUDE", "secretValue": "fixture-plane-claude" },
+                    { "secretKey": "GITEA_PAT_MOOSE", "secretValue": "fixture-gitea-moose" },
+                    { "secretKey": "GITEA_PAT_HARMONY", "secretValue": "fixture-gitea-harmony" },
+                    // An identity the code has never heard of — picked up by prefix.
+                    { "secretKey": "GITEA_PAT_FUTURE", "secretValue": "fixture-gitea-future" },
+                    // A set-but-blank PAT must be treated as missing (not set).
+                    { "secretKey": "GITEA_PAT_BLANK", "secretValue": "" },
+                    // Unrelated secret sharing the path must NEVER be imported.
+                    { "secretKey": "SOME_OTHER_SERVICE_SECRET", "secretValue": "should-not-leak" }
+                ]
+            }));
+        });
+        configure_bootstrap_credential(&server.base_url());
+
+        let outcome =
+            bootstrap_gitea_plane_github_secrets(Some("proj1"), "prod", "/").await;
+        match outcome {
+            SecretBootstrapOutcome::Fetched { count, identities, .. } => {
+                // 1 base key (GITEA_URL) + 4 non-blank PATs (1 plane + 3 gitea) = 5.
+                assert_eq!(count, 5, "expected 1 base + 4 non-blank PATs");
+                assert_eq!(identities, 4, "blank PAT must not count; plane+gitea both count");
+            }
+            other => panic!("expected Fetched, got {other:?}"),
+        }
+
+        assert_eq!(std::env::var("GITEA_PAT_MOOSE").unwrap(), "fixture-gitea-moose");
+        assert_eq!(std::env::var("GITEA_PAT_HARMONY").unwrap(), "fixture-gitea-harmony");
+        assert_eq!(std::env::var("GITEA_PAT_FUTURE").unwrap(), "fixture-gitea-future");
+        assert_eq!(std::env::var("PLANE_PAT_CLAUDE").unwrap(), "fixture-plane-claude");
+        // Blank PAT is treated as missing, never set...
+        assert!(std::env::var("GITEA_PAT_BLANK").is_err());
+        // ...and an unrelated key never leaks in.
+        assert!(std::env::var("SOME_OTHER_SERVICE_SECRET").is_err());
 
         clear_all_env();
     }
@@ -278,9 +388,10 @@ mod tests {
         let outcome =
             bootstrap_gitea_plane_github_secrets(Some("proj1"), "prod", "/").await;
         match outcome {
-            SecretBootstrapOutcome::Fetched { count, missing } => {
+            SecretBootstrapOutcome::Fetched { count, missing, identities } => {
                 assert_eq!(count, 0);
                 assert_eq!(missing.len(), GITEA_PLANE_GITHUB_SECRET_KEYS.len());
+                assert_eq!(identities, 0);
             }
             other => panic!("expected Fetched{{count:0,..}}, got {other:?}"),
         }
@@ -304,12 +415,12 @@ mod tests {
         // Pre-seed a static fallback value to prove a failed fetch leaves it
         // untouched (this is what a static `.env`-sourced value looks like in
         // production).
-        std::env::set_var("GITEA_TOKEN", "static-fallback-token"); // pii-test-fixture
+        std::env::set_var("GITEA_PAT_MOOSE", "static-fallback-token"); // pii-test-fixture
 
         let outcome =
             bootstrap_gitea_plane_github_secrets(Some("proj1"), "prod", "/").await;
         assert!(matches!(outcome, SecretBootstrapOutcome::Failed { .. }));
-        assert_eq!(std::env::var("GITEA_TOKEN").unwrap(), "static-fallback-token");
+        assert_eq!(std::env::var("GITEA_PAT_MOOSE").unwrap(), "static-fallback-token");
 
         clear_all_env();
     }

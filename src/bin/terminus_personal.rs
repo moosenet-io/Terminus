@@ -28,7 +28,7 @@
 //!   matching the confirmed posture of the existing legacy Python host.
 //! - Individual tool modules (plane, gitea, github, ansible, network, ...)
 //!   each read their own env vars directly (e.g. `PLANE_API_URL`,
-//!   `GITEA_TOKEN`) exactly as they already do for every other Terminus bin —
+//!   `GITEA_PAT_<NAME>`) exactly as they already do for every other Terminus bin —
 //!   this binary does no special config wiring beyond the two vars above,
 //!   PLUS the startup-time <secret-manager> fetch described below. // pii-test-fixture
 //!
@@ -38,16 +38,19 @@
 //! `INFISICAL_URL`/`INFISICAL_CLIENT_ID`/`INFISICAL_CLIENT_SECRET` (the one
 //! bootstrap credential) are configured — fetches this process's downstream
 //! secrets (`PLANE_API_URL`, `PLANE_API_KEY`, `PLANE_WORKSPACE`, `GITEA_URL`,
-//! `GITEA_TOKEN`, `GITHUB_TOKEN`) fresh from <secret-manager> and sets them into the // pii-test-fixture
+//! `GITHUB_TOKEN`) fresh from <secret-manager> and sets them into the // pii-test-fixture
 //! process environment via `std::env::set_var`, so every `X::from_env()`-style
 //! tool client constructed afterward transparently picks up the CURRENT
 //! value — never a stale one left behind in a static `.env` after a rotation.
-//! The named-identity Plane PATs (`PLANE_PAT_*` — CLAUDE/HARMONY/MOOSE/GEMINI/
-//! CODEX/LUMINA, plus any provisioned later) are materialized the same way, but
-//! via a dynamic `PLANE_PAT_` prefix match rather than a fixed list, so a
-//! newly-added identity becomes usable on the next restart with no code change;
-//! this is what lets `plane_list_identities` actually report the operator's
-//! configured identities instead of an empty set. See `PLANE_PAT_KEY_PREFIX`.
+//! The named-identity PATs — both Plane (`PLANE_PAT_*` — CLAUDE/HARMONY/MOOSE/
+//! GEMINI/CODEX/LUMINA) and Gitea (`GITEA_PAT_*` — MOOSE/HARMONY/LUMINA), plus // pii-test-fixture
+//! any provisioned later — are materialized the same way, but via a dynamic
+//! `*_PAT_` prefix match rather than a fixed list, so a newly-added identity
+//! becomes usable on the next restart with no code change; this is what lets
+//! `plane_list_identities` / `gitea_list_identities` actually report the
+//! operator's configured identities instead of an empty set. The unsuffixed
+//! `GITEA_TOKEN` is intentionally GONE (S105/GPAT) — Gitea auth is now solely
+//! per-identity `GITEA_PAT_<NAME>`. See `PAT_KEY_PREFIXES`.
 //! This closes a real recurring operational problem: a rotated Plane
 //! credential previously required someone to notice, manually re-run a
 //! fetch-and-splice script, and restart the service before writes worked
@@ -88,28 +91,38 @@ use terminus_rs::registry::{register_personal, ToolRegistry};
 /// named allowlist (not "set every key found at this path") so a shared
 /// <secret-manager> path containing secrets for other services never leaks into // pii-test-fixture
 /// this process's environment.
+///
+/// **BREAKING (S105/GPAT):** the unsuffixed `GITEA_TOKEN` was removed here — the
+/// Gitea tool now authenticates solely via per-identity `GITEA_PAT_<NAME>`
+/// tokens (picked up dynamically via `PAT_KEY_PREFIXES` below), so there is no
+/// single unsuffixed Gitea token to materialize any more.
 const DOWNSTREAM_SECRET_KEYS: &[&str] = &[
     "PLANE_API_URL",
     "PLANE_API_KEY",
     "PLANE_WORKSPACE",
     "GITEA_URL",
-    "GITEA_TOKEN",
     "GITHUB_TOKEN",
 ];
 
-/// Prefix for named-identity Plane Personal Access Tokens. In addition to the
-/// fixed `DOWNSTREAM_SECRET_KEYS` above, any secret key at the fetch path that
-/// begins with this prefix — `PLANE_PAT_CLAUDE`, `PLANE_PAT_HARMONY`,
-/// `PLANE_PAT_MOOSE`, `PLANE_PAT_GEMINI`, `PLANE_PAT_CODEX`, `PLANE_PAT_LUMINA`,
-/// and any identity provisioned later — is materialized into the process
-/// environment too, so the Plane tool's per-identity resolution
-/// (`plane_list_identities` / `for_identity()`) can see it. This is deliberately
-/// a *dynamic prefix match*, not another fixed list: a newly-provisioned
-/// identity becomes usable on the next restart with no code change. Matching is
-/// scoped to exactly this prefix (never "set every key found at the path"),
-/// preserving the same anti-leak property as the fixed allowlist above — an
-/// unrelated secret for another service sharing the path is never imported.
-const PLANE_PAT_KEY_PREFIX: &str = "PLANE_PAT_";
+/// Prefixes for named-identity Personal Access Tokens. In addition to the fixed
+/// `DOWNSTREAM_SECRET_KEYS` above, any secret key at the fetch path that begins
+/// with one of these prefixes is materialized into the process environment too,
+/// so the per-identity resolution in each tool can see it:
+///
+/// - `PLANE_PAT_*` — Plane identities (`PLANE_PAT_CLAUDE`, `PLANE_PAT_HARMONY`,
+///   `PLANE_PAT_MOOSE`, `PLANE_PAT_GEMINI`, `PLANE_PAT_CODEX`, `PLANE_PAT_LUMINA`,
+///   …) for `plane_list_identities` / `PlaneClient::for_identity`.
+/// - `GITEA_PAT_*` — Gitea identities (`GITEA_PAT_MOOSE`, `GITEA_PAT_HARMONY`,
+///   `GITEA_PAT_LUMINA`, …) for `gitea_list_identities` / `GiteaClient::for_identity`
+///   (S105/GPAT — replaces the retired unsuffixed `GITEA_TOKEN`).
+///
+/// This is deliberately a *dynamic prefix match*, not another fixed list: a
+/// newly-provisioned identity becomes usable on the next restart with no code
+/// change. Matching is scoped to exactly these prefixes (never "set every key
+/// found at the path"), preserving the same anti-leak property as the fixed
+/// allowlist above — an unrelated secret for another service sharing the path is
+/// never imported.
+const PAT_KEY_PREFIXES: &[&str] = &["PLANE_PAT_", "GITEA_PAT_"];
 
 /// Outcome of the startup <secret-manager> fetch attempt, for the caller (`main()`) // pii-test-fixture
 /// to log and for tests to assert on directly rather than scraping log text.
@@ -121,9 +134,9 @@ enum SecretFetchOutcome {
     /// The fetch succeeded; `count` non-blank keys were found and set into
     /// the process environment. `missing` names (never values) any of
     /// `DOWNSTREAM_SECRET_KEYS` that <secret-manager> didn't have at this path. // pii-test-fixture
-    /// `identities` is how many of `count` are named-identity Plane PATs
-    /// (`PLANE_PAT_*`, picked up dynamically) — a set-but-blank value is
-    /// treated as missing for both, never set.
+    /// `identities` is how many of `count` are named-identity PATs
+    /// (`PLANE_PAT_*` / `GITEA_PAT_*`, picked up dynamically) — a set-but-blank
+    /// value is treated as missing for both, never set.
     Fetched {
         count: usize,
         missing: Vec<String>,
@@ -185,14 +198,16 @@ async fn fetch_downstream_secrets_from_infisical() -> SecretFetchOutcome {
                     None => missing.push((*key).to_string()),
                 }
             }
-            // Named-identity Plane PATs: materialize every non-blank `PLANE_PAT_*`
-            // key found at this path (dynamic prefix match — a newly-provisioned
-            // identity works with no code change). Same blank-as-missing rule as
-            // above. Not tracked in `missing`: identities are provisioned ad hoc,
-            // so there is no fixed expected set for one to be "missing" from.
+            // Named-identity PATs: materialize every non-blank `PLANE_PAT_*` /
+            // `GITEA_PAT_*` key found at this path (dynamic prefix match — a
+            // newly-provisioned identity works with no code change). Same
+            // blank-as-missing rule as above. Not tracked in `missing`:
+            // identities are provisioned ad hoc, so there is no fixed expected
+            // set for one to be "missing" from.
             let mut identities = 0usize;
             for (key, value) in &fetched {
-                if key.starts_with(PLANE_PAT_KEY_PREFIX) && !value.is_empty() {
+                let is_pat = PAT_KEY_PREFIXES.iter().any(|p| key.starts_with(p));
+                if is_pat && !value.is_empty() {
                     std::env::set_var(key, value);
                     count += 1;
                     identities += 1;
@@ -225,7 +240,7 @@ fn log_secret_fetch_outcome(outcome: &SecretFetchOutcome) {
             missing,
             identities,
         } => {
-            tracing::info!("terminus_personal: fetched {count} secrets ({identities} named Plane identities) from <secret-manager>"); // pii-test-fixture
+            tracing::info!("terminus_personal: fetched {count} secrets ({identities} named PAT identities) from <secret-manager>"); // pii-test-fixture
             if !missing.is_empty() {
                 tracing::warn!(
                     "terminus_personal: <secret-manager> fetch did not include: {} (using static environment for these, if present)", // pii-test-fixture
@@ -320,6 +335,10 @@ mod tests {
         "PLANE_PAT_HARMONY",
         "PLANE_PAT_FUTURE",
         "PLANE_PAT_BLANK",
+        "GITEA_PAT_MOOSE",
+        "GITEA_PAT_HARMONY",
+        "GITEA_PAT_FUTURE",
+        "GITEA_PAT_BLANK",
         "SOME_OTHER_SERVICE_SECRET",
     ];
 
@@ -389,7 +408,7 @@ mod tests {
             then.status(200).json_body(json!({
                 "secrets": [
                     { "secretKey": "PLANE_API_KEY", "secretValue": "fixture-plane-key" },
-                    { "secretKey": "GITEA_TOKEN", "secretValue": "fixture-gitea-token" }
+                    { "secretKey": "GITHUB_TOKEN", "secretValue": "fixture-github-token" }
                 ]
             }));
         });
@@ -413,8 +432,8 @@ mod tests {
             "fixture-plane-key"
         );
         assert_eq!(
-            std::env::var("GITEA_TOKEN").unwrap(),
-            "fixture-gitea-token"
+            std::env::var("GITHUB_TOKEN").unwrap(),
+            "fixture-github-token"
         );
 
         clear_all_env();
@@ -476,6 +495,61 @@ mod tests {
         clear_all_env();
     }
 
+    // ── GITEA_PAT_* (S105/GPAT): the dynamic PAT pickup covers Gitea identities
+    //    too, alongside Plane's, with the same blank-as-missing + anti-leak rules.
+    #[tokio::test]
+    #[serial]
+    async fn gitea_pat_named_identities_are_materialized_dynamically() {
+        clear_all_env();
+        let server = MockServer::start();
+        mock_login(&server, "tok-gitea-pat"); // pii-test-fixture
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v3/secrets/raw");
+            then.status(200).json_body(json!({
+                "secrets": [
+                    // A base allowlist key (not a PAT) to prove coexistence.
+                    { "secretKey": "GITEA_URL", "secretValue": "http://gitea.example.com" },
+                    // A Plane PAT and Gitea PATs must BOTH be picked up dynamically.
+                    { "secretKey": "PLANE_PAT_HARMONY", "secretValue": "fixture-plane-harmony" },
+                    { "secretKey": "GITEA_PAT_MOOSE", "secretValue": "fixture-gitea-moose" },
+                    { "secretKey": "GITEA_PAT_HARMONY", "secretValue": "fixture-gitea-harmony" },
+                    // An identity the code has never heard of — picked up purely by prefix.
+                    { "secretKey": "GITEA_PAT_FUTURE", "secretValue": "fixture-gitea-future" },
+                    // A set-but-blank Gitea PAT must be treated as missing (not set).
+                    { "secretKey": "GITEA_PAT_BLANK", "secretValue": "" },
+                    // Unrelated secret sharing the path must NEVER be imported.
+                    { "secretKey": "SOME_OTHER_SERVICE_SECRET", "secretValue": "should-not-leak" }
+                ]
+            }));
+        });
+        configure_bootstrap(&server.base_url());
+
+        let outcome = fetch_downstream_secrets_from_infisical().await;
+        match outcome {
+            SecretFetchOutcome::Fetched {
+                count,
+                identities,
+                ..
+            } => {
+                // 1 base key (GITEA_URL) + 4 non-blank PATs (1 plane + 3 gitea) = 5.
+                assert_eq!(count, 5, "expected 1 base + 4 non-blank PATs");
+                assert_eq!(identities, 4, "blank PAT must not count; plane+gitea both count");
+            }
+            other => panic!("expected Fetched, got {other:?}"),
+        }
+
+        assert_eq!(std::env::var("GITEA_PAT_MOOSE").unwrap(), "fixture-gitea-moose");
+        assert_eq!(std::env::var("GITEA_PAT_HARMONY").unwrap(), "fixture-gitea-harmony");
+        assert_eq!(std::env::var("GITEA_PAT_FUTURE").unwrap(), "fixture-gitea-future");
+        assert_eq!(std::env::var("PLANE_PAT_HARMONY").unwrap(), "fixture-plane-harmony");
+        // Blank Gitea PAT is treated as missing, never set...
+        assert!(std::env::var("GITEA_PAT_BLANK").is_err());
+        // ...and an unrelated key never leaks in.
+        assert!(std::env::var("SOME_OTHER_SERVICE_SECRET").is_err());
+
+        clear_all_env();
+    }
+
     #[tokio::test]
     #[serial]
     async fn empty_infisical_response_is_fetched_zero_not_an_error() {
@@ -520,12 +594,12 @@ mod tests {
         // Pre-seed a static fallback value to prove a failed fetch leaves it
         // untouched (this is what a static `.env`-sourced value would look
         // like in production).
-        std::env::set_var("GITEA_TOKEN", "static-fallback-token"); // pii-test-fixture
+        std::env::set_var("GITHUB_TOKEN", "static-fallback-token"); // pii-test-fixture
 
         let outcome = fetch_downstream_secrets_from_infisical().await;
         assert!(matches!(outcome, SecretFetchOutcome::Failed { .. }));
         assert_eq!(
-            std::env::var("GITEA_TOKEN").unwrap(),
+            std::env::var("GITHUB_TOKEN").unwrap(),
             "static-fallback-token"
         );
 

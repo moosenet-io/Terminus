@@ -14,7 +14,7 @@
 //! - Replaces the Python `vigil_status` SSH+<secret-manager>+curl chain with a // pii-test-fixture
 //!   direct call into this crate's own `gitea` module (see
 //!   `sentinel/mod.rs` for the identical rationale: Terminus already holds
-//!   `GITEA_URL`/`GITEA_TOKEN` locally, so the extra SSH hop plus an inline
+//!   `GITEA_URL` plus the resolved `GITEA_PAT_<NAME>` identity token locally, so the extra SSH hop plus an inline
 //!   shell script is unnecessary and is exactly the kind of subprocess/shell
 //!   chain the `RustTool` contract forbids).
 //!
@@ -450,14 +450,16 @@ mod tests {
         });
 
         std::env::set_var("GITEA_URL", server.base_url());
-        std::env::set_var("GITEA_TOKEN", "test-token");
+        // S105/GPAT: Gitea auth is the default `moose` identity's GITEA_PAT_MOOSE,
+        // not the retired unsuffixed GITEA_TOKEN.
+        std::env::set_var("GITEA_PAT_MOOSE", "test-token");
         std::env::set_var("GITEA_OWNER", "moosenet");
 
         let tool = VigilStatus { config: test_config() };
         let result = tool.execute(json!({"briefing_type": "morning"})).await.unwrap();
 
         std::env::remove_var("GITEA_URL");
-        std::env::remove_var("GITEA_TOKEN");
+        std::env::remove_var("GITEA_PAT_MOOSE");
         std::env::remove_var("GITEA_OWNER");
 
         mock.assert_hits(2); // fetch_file_text + get_file_sha
