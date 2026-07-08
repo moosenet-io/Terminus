@@ -506,52 +506,49 @@ impl RateLimiter {
         Self { last: AsyncMutex::new(None), min_interval, redis: None }
     }
 
-    /// Block until this call may proceed. With a shared backend, reserve the next
-    /// coordinated slot in Redis and sleep for the returned wait; on ANY Redis
-    /// failure (or when unconfigured) fall through to the in-process
-    /// `min_interval`-since-last-call gate. Never fails a Plane call.
+    /// Block until this call may proceed.
+    ///
+    /// Two gates combine, and the caller waits for the LARGER:
+    /// - the shared Redis reservation (cross-process coordination), best-effort:
+    ///   a Redis failure/timeout/outage simply yields a zero cross-process wait
+    ///   (fail-open) — it never blocks or fails the call;
+    /// - the per-process local gate (`min_interval` since this process's last
+    ///   ACTUAL issue), ALWAYS applied as a safety floor.
+    ///
+    /// The local lock is held across the Redis reservation AND the sleep, so this
+    /// process's Plane calls are strictly serialised and spaced by at least
+    /// `min_interval` no matter how Redis behaves — down, dying mid-flight, or a
+    /// restart/flush that resets its key can never produce an intra-process burst.
+    /// (Serialising a process's own Plane calls is exactly the intended pacing:
+    /// the whole point is to not hammer Plane, so there is nothing to pipeline.)
     async fn acquire(&self) {
         // Pacing disabled → nothing to gate (and no Redis round-trip).
         if self.min_interval.is_zero() {
             return;
         }
-        if let Some(backend) = &self.redis {
-            if let Some(wait) = backend.rate_reserve(self.min_interval).await {
-                let reserved_slot = Instant::now() + wait;
-                // Record the reserved (possibly future) slot into the local gate
-                // BEFORE sleeping. If Redis drops mid-sleep, a concurrent caller
-                // that falls back to the local limiter then serialises AFTER this
-                // reserved request (its next-allowed = reserved_slot + interval)
-                // instead of racing to the same instant — no failover burst.
-                {
-                    let mut last = self.last.lock().await;
-                    if last.is_none_or(|prev| reserved_slot > prev) {
-                        *last = Some(reserved_slot);
-                    }
-                }
-                if !wait.is_zero() {
-                    tokio::time::sleep(wait).await;
-                }
-                return;
-            }
-            // Redis unavailable → fall through to the in-process gate below.
-        }
-        // In-process gate (default + fail-open fallback). Absolute-time based so
-        // a future `last` (a slot reserved via Redis just above) is honoured:
-        // next-allowed = last + min_interval. The lock is held across the sleep
-        // so concurrent callers queue and pace one after another.
+        // Held across the reservation + sleep → per-process serialisation.
         let mut last = self.last.lock().await;
+
+        // Cross-process pacing (best-effort). `None` (unconfigured OR any Redis
+        // failure) collapses to a zero wait; the local floor below still applies.
+        let redis_wait = match &self.redis {
+            Some(backend) => backend.rate_reserve(self.min_interval).await.unwrap_or(Duration::ZERO),
+            None => Duration::ZERO,
+        };
+
+        // Per-process floor from the last ACTUAL issue time.
         let now = Instant::now();
-        if let Some(next_allowed) = last.map(|prev| prev + self.min_interval) {
-            if next_allowed > now {
-                tokio::time::sleep(next_allowed - now).await;
-            }
+        let local_wait = match *last {
+            Some(prev) => (prev + self.min_interval).saturating_duration_since(now),
+            None => Duration::ZERO,
+        };
+
+        let wait = local_wait.max(redis_wait);
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
         }
-        // Record the ACTUAL issue time (post-sleep). If the wakeup overslept
-        // `next_allowed`, this stays accurate so the next caller still gets a
-        // full `min_interval` from when this request really went out — storing
-        // `next_allowed` (possibly now in the past) would let the next call fire
-        // back-to-back.
+        // Record the ACTUAL issue time (post-sleep) so the next caller is spaced
+        // from when this request really went out, even if the wakeup overslept.
         *last = Some(Instant::now());
     }
 }
