@@ -456,12 +456,15 @@ impl RedisBackend {
 /// keeps the raw token OUT of Redis keys entirely (no credential material in
 /// key space, bounded key length) while preserving per-active-token isolation:
 /// two identities requesting the same URL hash to different keys, so a shared
-/// Redis cache can never serve one identity another's response.
+/// Redis cache can never serve one identity another's response. Uses a stable
+/// SHA-1 digest (fixed algorithm, identical output across Rust versions/builds)
+/// so processes on different builds sharing one Redis map the same token+URL to
+/// the same key — a `std` `DefaultHasher` is explicitly NOT stable across
+/// versions and would silently fragment the shared cache during rolling upgrades.
 fn redis_cache_key(raw: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    raw.hash(&mut h);
-    format!("plane:cache:{:016x}", h.finish())
+    let mut h = sha1_smol::Sha1::new();
+    h.update(raw.as_bytes());
+    format!("plane:cache:{}", h.digest())
 }
 
 // ─── Rate limiter (in-process, optionally Redis-coordinated) ─────────────────

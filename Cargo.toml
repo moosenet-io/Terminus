@@ -62,6 +62,11 @@ tower-http = { version = "0.5", features = ["trace"] }
 # for a `rediss://` URL later, add "tokio-rustls-comp" to the feature list — no
 # code change is required (the URL scheme drives TLS in the redis client).
 redis = { version = "0.24", default-features = false, features = ["tokio-comp", "connection-manager", "script", "keep-alive"] }
+# Stable SHA-1 digest for the shared Redis cache keys: a fixed algorithm whose
+# output is identical across Rust versions / builds, so processes on different
+# builds sharing one Redis never fragment the cache (unlike std DefaultHasher).
+# Already in the tree (redis uses it for EVALSHA), so no new build cost.
+sha1_smol = "1"
 
 [dev-dependencies]
 # mcp_server tests drive the axum Router directly via `ServiceExt::oneshot`.
