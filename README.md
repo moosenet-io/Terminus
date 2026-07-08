@@ -309,6 +309,17 @@ immediately (0 rounds) rather than silently passing residual PII through. The ga
 is re-verified after every round, so a cleaner that under-delivers can never
 smuggle residual PII into an approved tag.
 
+**Security boundary.** The engine applies in-process defense-in-depth around the
+cleaner (redacted inputs only, cleared environment, an in-memory `.git`
+snapshot/restore around each round, command-line hook disabling, and running the
+cleaner in its own process group which is killed as a unit afterward). These
+contain buggy or casually-hostile cleaners but cannot fully contain arbitrary local
+code execution — that is a fundamental limit, not a fixable bug. **The configured
+cleaning command MUST be run under an OS filesystem/process sandbox** (e.g. `bwrap`
+/ `nsjail` / a container with only the work dir bind-mounted, no network, killed as
+a unit). That sandbox is the operator's deployment responsibility and the real
+trust boundary.
+
 ## Plane identities (`PLANE_PAT_<NAME>` convention)
 
 The Plane tool module supports multiple **named identities** so a call can act

@@ -54,6 +54,23 @@
 //! OUTSIDE the work dir) is the operator's deployment responsibility for the
 //! configured command — out of scope for this in-process orchestration.
 //!
+//! ## The security boundary is the operator's OS sandbox (authoritative)
+//! The in-process measures above (redacted inputs only, cleared env, in-memory
+//! `.git` snapshot/restore, command-line hook disabling, own-process-group +
+//! group-kill of the cleaner) are **defense-in-depth** — they contain buggy or
+//! casually-hostile cleaners. They do NOT, and structurally CANNOT, fully contain a
+//! cleaner that executes arbitrary local code: such a cleaner can write to arbitrary
+//! ABSOLUTE paths (including the source checkout), or double-fork into a new session
+//! to escape its process group and race `.git`/the work tree during finalize. There
+//! is no in-process defense against arbitrary local code execution — that is a
+//! fundamental property, not a fixable bug here. **The configured cleaning command
+//! MUST therefore be run under an OS filesystem/process sandbox (bwrap / nsjail /
+//! container with the work dir bind-mounted and nothing else, no network, killed as
+//! a unit), which is the operator's deployment responsibility and the real trust
+//! boundary.** This module enforces the git-metadata-integrity property to the
+//! extent an in-process orchestration can and defers the rest to that sandbox by
+//! design.
+//!
 //! In production the cleaner is dispatched through a config-driven command hook
 //! ([`CommandCleaner`], from [`CLEAN_CMD_ENV`]) with that cleared environment.
 //! Tests inject a mock. When no
@@ -174,7 +191,40 @@ impl ResidualCleaner for CommandCleaner {
         if let Ok(home) = std::env::var("HOME") {
             cmd.env("HOME", home);
         }
+
+        // On unix, run the cleaner in its OWN process group and reap any surviving
+        // descendants when it returns. A cleaner could otherwise fork a background
+        // process that outlives the shell (`Command::wait` reaps only the shell) and
+        // re-tamper with `.git` AFTER the caller restores it. Putting the child in a
+        // fresh group (pgid == child pid) and `pkill -KILL -g <pgid>`-ing that group
+        // after it exits kills such forked descendants before `.git` is restored and
+        // finalize runs. (A cleaner that deliberately double-forks into a NEW SESSION
+        // to escape its process group, or writes to arbitrary absolute paths, is
+        // beyond any in-process measure and is contained only by the operator's OS
+        // sandbox — the documented security boundary on this module.)
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    let pgid = child.id();
+                    let st = child.wait();
+                    // Best-effort: terminate the whole group (the shell is already
+                    // gone; this catches any forked children still alive).
+                    let _ = Command::new("pkill")
+                        .arg("-KILL")
+                        .arg("-g")
+                        .arg(pgid.to_string())
+                        .status();
+                    st
+                }
+                Err(e) => Err(e),
+            }
+        };
+        #[cfg(not(unix))]
         let status = cmd.status();
+
         let _ = std::fs::remove_file(&residuals_file);
 
         match status {
