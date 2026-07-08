@@ -37,6 +37,7 @@ use crate::error::ToolError;
 use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
+pub mod mirror;
 pub mod pii;
 use pii::pii_gate;
 use pii::{ruleset_from_config, violations_to_json};

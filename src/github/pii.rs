@@ -487,6 +487,15 @@ impl PiiRuleSet {
         false
     }
 
+    /// Whether a directory base-name is pruned from the walk by this rule set
+    /// (the built-in defaults plus any config `excluded_dirs`). Lets an external
+    /// walker — the GHMR-02 mirror sweep — honor exactly the same directory
+    /// exclusion posture as [`Self::scan_tree`], so a rewrite pass and the
+    /// residual scan can never diverge on which directories they touch.
+    pub fn is_excluded_dir(&self, name: &str) -> bool {
+        self.excluded_dirs.contains(name)
+    }
+
     /// Walk the directory tree rooted at `root` and return every violation,
     /// honoring the `// pii-test-fixture` line exemption exactly as the crate's
     /// own self-check does. Binary / oversized / unreadable files are skipped
