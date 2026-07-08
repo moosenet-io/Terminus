@@ -280,6 +280,34 @@ fn encode_key(key: &str) -> String {
 
 // ── Internal batch-fetch (shared by the guarded tool AND terminus_personal startup) ──
 
+/// Perform the raw batch-secret HTTP fetch (auth + `GET /api/v3/secrets/raw`)
+/// and return the parsed JSON body exactly as <secret-manager> returned it — // pii-test-fixture
+/// including its own `{"error":true,"status":...,"message":...}` passthrough
+/// shape for a non-2xx response (mirrors `get_json`'s existing behavior for
+/// every other tool in this module). This is the SINGLE place the auth+HTTP
+/// logic lives: both `fetch_secrets_batch` below (used by `terminus_personal`'s
+/// startup, PSEC-02) and `InfisicalGetSecretsBatch::execute()` (the guarded
+/// MCP tool) build on this — neither duplicates it.
+async fn fetch_secrets_raw(
+    config: &InfisicalConfig,
+    project_id: &str,
+    environment: &str,
+    secret_path: &str,
+) -> Result<Value, ToolError> {
+    let base = config.base_url()?;
+    let client = InfisicalConfig::client()?;
+    let token = get_access_token(&client, config).await?;
+
+    let qs = secret_query(project_id, environment, secret_path);
+    get_json(
+        &client,
+        &format!("{base}/api/v3/secrets/raw"),
+        &qs,
+        Some(&token),
+    )
+    .await
+}
+
 /// Fetch all secrets (keys + values) for a project/environment/path from
 /// <secret-manager>, as a plain key→value map. This is the reusable core extracted // pii-test-fixture
 /// from `InfisicalGetSecretsBatch::execute()` (PSEC-01) — it has NO approval
@@ -287,6 +315,12 @@ fn encode_key(key: &str) -> String {
 /// guarded MCP tool surface; this function is also called directly by
 /// `terminus_personal`'s own startup-time secret bootstrap (PSEC-02), which
 /// is a process-internal action, not an operator-invoked one.
+///
+/// Unlike the guarded tool (which passes an <secret-manager>-side error straight // pii-test-fixture
+/// through as an `Ok` response body, matching its pre-extraction behavior),
+/// this function turns a non-2xx <secret-manager> response into a typed `Err` — // pii-test-fixture
+/// callers like PSEC-02's startup bootstrap need a clean pass/fail signal to
+/// decide whether to fall back to the static environment.
 ///
 /// Never logs or echoes any fetched value — callers must uphold the same
 /// discipline (log key names/counts only, never values).
@@ -296,18 +330,7 @@ pub async fn fetch_secrets_batch(
     environment: &str,
     secret_path: &str,
 ) -> Result<HashMap<String, String>, ToolError> {
-    let base = config.base_url()?;
-    let client = InfisicalConfig::client()?;
-    let token = get_access_token(&client, config).await?;
-
-    let qs = secret_query(project_id, environment, secret_path);
-    let result = get_json(
-        &client,
-        &format!("{base}/api/v3/secrets/raw"),
-        &qs,
-        Some(&token),
-    )
-    .await?;
+    let result = fetch_secrets_raw(config, project_id, environment, secret_path).await?;
 
     if let Some(true) = result.get("error").and_then(Value::as_bool) {
         let status = result.get("status").and_then(Value::as_u64).unwrap_or(0);
@@ -650,17 +673,19 @@ secret values — use for bulk injection, not browsing. GUARDED: requires operat
         }
 
         // Delegate the actual HTTP/auth fetch to the shared internal function
-        // (PSEC-01); reshape the resulting map through the existing
-        // `shape_get_secrets_batch` helper so the tool's external output is
-        // byte-for-byte identical to before the extraction.
-        let map = fetch_secrets_batch(&self.config, &project_id, &environment, &secret_path)
-            .await?;
-        let secrets_arr: Vec<Value> = map
-            .into_iter()
-            .map(|(k, v)| json!({ "secretKey": k, "secretValue": v }))
-            .collect();
-        let body = json!({ "secrets": secrets_arr });
-        Ok(shape_get_secrets_batch(&body, &environment, &secret_path).to_string())
+        // (PSEC-01) — the SAME `fetch_secrets_raw` that `fetch_secrets_batch`
+        // (used by terminus_personal's startup, PSEC-02) builds on. Unlike
+        // `fetch_secrets_batch`, this tool preserves its pre-extraction
+        // behavior byte-for-byte: an <secret-manager>-side error is passed straight // pii-test-fixture
+        // through as an `Ok` response body (never turned into an `Err`),
+        // exactly as it was before this refactor.
+        let result =
+            fetch_secrets_raw(&self.config, &project_id, &environment, &secret_path).await?;
+
+        if result.get("error").is_some() {
+            return Ok(result.to_string());
+        }
+        Ok(shape_get_secrets_batch(&result, &environment, &secret_path).to_string())
     }
 }
 
@@ -1075,12 +1100,25 @@ mod tests {
         assert!(matches!(result, Err(ToolError::Http(_))));
     }
 
-    #[test]
-    fn fetch_secrets_batch_output_never_contains_test_fixture_marker_in_debug_repr() {
-        // Sanity check on our own test fixtures: this is a compile-time reminder,
-        // not a network test — the real "never logged" guarantee is verified at
-        // the terminus_personal level (PSEC-02), where actual logging happens.
-        let map: HashMap<String, String> = HashMap::new();
-        assert!(map.is_empty());
+    #[tokio::test]
+    #[serial]
+    async fn fetch_secrets_raw_passes_through_error_shape_for_non_2xx() {
+        // Confirms the byte-for-byte-preserved behavior of the guarded tool's
+        // pre-extraction code path: `fetch_secrets_raw` (which
+        // `InfisicalGetSecretsBatch::execute()` calls directly) returns
+        // <secret-manager>'s `{"error":true,...}` body as an `Ok(Value)`, NOT an // pii-test-fixture
+        // `Err` — only `fetch_secrets_batch` (the PSEC-02 startup caller)
+        // converts that into a typed `Err`.
+        let server = MockServer::start();
+        mock_login(&server, "tok-4"); // pii-test-fixture
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v3/secrets/raw");
+            then.status(403).json_body(json!({ "message": "Forbidden" }));
+        });
+
+        let cfg = cfg_for(server.base_url());
+        let result = fetch_secrets_raw(&cfg, "proj1", "prod", "/").await.unwrap();
+        assert_eq!(result["error"], true);
+        assert_eq!(result["status"], 403);
     }
 }
