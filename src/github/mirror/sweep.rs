@@ -176,8 +176,29 @@ fn compile_rules(cfg: &PlaceholderConfig) -> Vec<CompiledRule> {
     let mut rules = if cfg.include_builtins { builtin_rules() } else { Vec::new() };
     for r in &cfg.placeholder {
         let compiled = if let Some(pat) = &r.pattern {
+            // An empty `pattern` compiles to a zero-length matcher that fires at
+            // every position in every file — injecting the token everywhere and
+            // corrupting the tree. Reject it like any other invalid rule.
+            if pat.is_empty() {
+                tracing::warn!(
+                    target: "github.mirror",
+                    "placeholder rule for token {:?} has an empty 'pattern' — skipping",
+                    r.token
+                );
+                continue;
+            }
             Regex::new(pat)
         } else if let Some(term) = &r.term {
+            // An empty `term` escapes to nothing, leaving `(?i)\b\b` — a zero-width
+            // word-boundary match that likewise fires everywhere. Reject it too.
+            if term.is_empty() {
+                tracing::warn!(
+                    target: "github.mirror",
+                    "placeholder rule for token {:?} has an empty 'term' — skipping",
+                    r.token
+                );
+                continue;
+            }
             Regex::new(&format!(r"(?i)\b{}\b", regex::escape(term)))
         } else {
             tracing::warn!(
@@ -1010,6 +1031,44 @@ mod tests {
             "nested same-named file must be swept, not exempt"
         );
         assert!(report.is_clean(), "swept nested file must not remain residual: {report:?}");
+    }
+
+    // ── Empty placeholder matchers are rejected, not applied everywhere ──────
+
+    #[test]
+    #[serial]
+    fn empty_pattern_or_term_is_rejected_not_applied() {
+        clear_env();
+        let dir = temp_tree("emptyrule");
+        write_file(&dir, "doc.txt", "plain content with no pii here\n");
+        // A malformed config: one rule with an empty pattern, one with an empty
+        // term. A naive Regex::new("") / (?i)\b\b matches at every boundary and
+        // would splatter the token across the whole file. Both must be skipped.
+        let cfg = PlaceholderConfig {
+            include_builtins: false,
+            placeholder: vec![
+                PlaceholderRule {
+                    pattern: Some(String::new()),
+                    term: None,
+                    token: "<REDACTED-SECRET>".to_string(),
+                    distinct: false,
+                    kind: None,
+                },
+                PlaceholderRule {
+                    pattern: None,
+                    term: Some(String::new()),
+                    token: "<REDACTED-SECRET>".to_string(),
+                    distinct: false,
+                    kind: None,
+                },
+            ],
+        };
+        let report = sweep_tree(&dir, &cfg).unwrap();
+        let after = read(&dir, "doc.txt");
+        assert_eq!(after, "plain content with no pii here\n", "empty rules must not touch content");
+        assert!(!after.contains("<EMPTYPAT>"), "empty-pattern token must not be injected: {after}");
+        assert!(!after.contains("<EMPTYTERM>"), "empty-term token must not be injected: {after}");
+        assert_eq!(report.replacements, 0, "no replacements from empty rules");
     }
 
     #[test]
