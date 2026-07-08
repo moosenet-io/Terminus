@@ -289,7 +289,36 @@ impl PrefixOverlay {
         }
     }
 
-    /// Write/replace one claim. `Err(Unavailable)` if the write did not land.
+    /// Atomically create a claim only if the field does not already exist
+    /// (single `HSETNX`). `Ok(true)` = created, `Ok(false)` = a claim was
+    /// already there (lost a concurrent race — caller reports a collision),
+    /// `Err(Unavailable)` = the write did not land. This closes the TOCTOU gap
+    /// between the `merged()` collision read and the write for overlay-only
+    /// prefixes, so two concurrent registrations of the same free prefix cannot
+    /// both succeed.
+    async fn put_new(&self, entry: &PrefixEntry) -> Result<bool, OverlayError> {
+        let field = entry.prefix.to_uppercase();
+        let payload = serde_json::to_string(entry).map_err(|_| OverlayError::Unavailable)?;
+        let fut = async {
+            let mut conn = self.conn().await.ok_or(OverlayError::Unavailable)?;
+            let created: i64 = redis::cmd("HSETNX")
+                .arg(OVERLAY_HASH_KEY)
+                .arg(&field)
+                .arg(&payload)
+                .query_async(&mut conn)
+                .await
+                .map_err(|_| OverlayError::Unavailable)?;
+            Ok(created == 1)
+        };
+        match tokio::time::timeout(self.op_timeout, fut).await {
+            Ok(res) => res,
+            Err(_) => Err(OverlayError::Unavailable),
+        }
+    }
+
+    /// Write/replace one claim (overwrite). Used by retire, which intentionally
+    /// overrides an existing entry's status (or writes a retire override for a
+    /// baseline-only prefix). `Err(Unavailable)` if the write did not land.
     async fn put(&self, entry: &PrefixEntry) -> Result<(), OverlayError> {
         let field = entry.prefix.to_uppercase();
         let payload = serde_json::to_string(entry).map_err(|_| OverlayError::Unavailable)?;
@@ -771,8 +800,10 @@ impl RustTool for PlanePrefixRegister {
                 "entry": entry_json(&entry),
             })
             .to_string()),
-            Some(ov) => match ov.put(&entry).await {
-                Ok(()) => Ok(json!({
+            // Atomic create-if-absent so a concurrent claim of the same free
+            // prefix cannot double-succeed (codex P2).
+            Some(ov) => match ov.put_new(&entry).await {
+                Ok(true) => Ok(json!({
                     "ok": true,
                     "persisted": true,
                     "pending_promotion": true,
@@ -781,6 +812,17 @@ impl RustTool for PlanePrefixRegister {
                          Promote it into data/prefix_registry.toml via a later small PR."
                     ),
                     "entry": entry_json(&entry),
+                })
+                .to_string()),
+                Ok(false) => Ok(json!({
+                    "ok": false,
+                    "persisted": false,
+                    "reason": "collision",
+                    "message": format!(
+                        "prefix '{key}' was just claimed concurrently in the overlay — pick another"
+                    ),
+                    "suggestions": PlanePrefixCheck::suggest(&key, &map, 3),
+                    "overlay": overlay_note(reachable),
                 })
                 .to_string()),
                 Err(OverlayError::Unavailable) => Ok(json!({
@@ -1163,6 +1205,7 @@ mod tests {
             created: "2026-07-08".into(),
         };
         assert_eq!(ov.put(&entry).await, Err(OverlayError::Unavailable));
+        assert_eq!(ov.put_new(&entry).await, Err(OverlayError::Unavailable));
 
         // And the store built on it still lists the baseline (reachable=false).
         let store = Arc::new(PrefixStore { overlay: Some(ov) });
