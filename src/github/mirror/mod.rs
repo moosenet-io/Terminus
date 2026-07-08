@@ -24,4 +24,5 @@
 //! concern; the sweep here operates on whatever tree path it is handed.
 
 pub mod sweep;
+pub mod tools;
 pub mod workdir;

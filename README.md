@@ -114,7 +114,7 @@ their tools:
 | `dev` | Path-jailed dev workspace | `dev_read_file`, `dev_write_file`, `dev_run_command`, `dev_list_workspaces` |
 | `openhands` | Agentic coding runs (guarded) | `openhands_run_task`, `openhands_list_conversations`, `openhands_get_status` |
 | `gitea` | Gitea git forge | `gitea_create_repo`, `gitea_read_file`, `gitea_create_pr`, `gitea_merge_pr`, `gitea_cargo_publish` |
-| `github` | GitHub | `github_create_repo`, `github_list_repos`, `github_push_repo`, `github_pii_scan` |
+| `github` | GitHub | `github_create_repo`, `github_list_repos`, `github_push_repo`, `github_pii_scan`, `github_mirror_status`, `github_mirror_prepare`, `github_mirror_approve`, `github_mirror_push` |
 | `plane` | Plane work management | `plane_create_work_item`, `plane_list_issues_by_state`, `plane_update_work_item`, `plane_create_module`, `plane_update_module`, `plane_delete_module`, `plane_add_issue_to_module`, `plane_remove_issue_from_module`, `plane_list_identities`, `plane_whoami`, `plane_prefix_check`, `plane_prefix_register` |
 | `nexus` | Inter-agent inbox | `nexus_send`, `nexus_check`, `nexus_read`, `nexus_ack`, `nexus_history` |
 | `axon` | Work-queue agent control | `axon_submit`, `axon_status`, `axon_list`, `axon_cancel` |
@@ -251,6 +251,35 @@ pii_gate --staged        # git pre-commit: scans staged files
 pii_gate --tree [PATH]   # full-tree sweep (defaults to repo root) — used by the mirror engine
 pii_gate --json          # machine-readable JSON report
 ```
+
+### GitHub mirror engine subtools (GHMR-04)
+
+The public `moosenet-io/*` mirrors are **PII-swept derivatives** of internal
+`main` with their own linear history (they share no ancestor with internal main).
+Four github **core-tool** subtools drive that engine over a per-repo *clean work
+dir* (`<TERMINUS_MIRROR_WORKDIR_ROOT>/<repo>`). All git operations run **on the
+dev box** — the sanctioned git-transport host — while the logic lives in
+terminus-rs; no other host holds a GitHub credential.
+
+| Tool | Posture | What it does |
+| --- | --- | --- |
+| `github_mirror_status` | read-only | Reports internal-main HEAD, whether it is already approved, work-dir HEAD, and the set of `mirror-approved/*` tags (divergence + last-approved). |
+| `github_mirror_prepare` | write (work dir only) | Syncs internal main's committed tree into the work dir, runs the mechanical sweep + PII gate, commits the swept derivative, and tags `mirror-approved/<internal-sha>` **only** when 0 residual violations remain. Residuals are returned for GHMR-05 cleaning; nothing is tagged. |
+| `github_mirror_approve` | **guarded** | Operator authorisation of a clean snapshot. Refuses (without prompting the operator) while residual violations are pending; on a clean tree it confirms the tag and, after the one-time approval code, blesses the snapshot for push. |
+| `github_mirror_push` | **guarded**, ff-only | Publishes the approved commit to the repo's GitHub remote — **fast-forward only**. Refuses any non-fast-forward (and an un-bootstrapped remote), pointing at the GHMR-07 bootstrap; **never force-pushes**. |
+
+Common args: `repo` (logical name) and `source` (the dev-box internal-`main`
+checkout path). `github_mirror_push` also takes `github_remote` (or
+`TERMINUS_MIRROR_REMOTE_<REPO>` / `TERMINUS_MIRROR_REMOTE`). The push reads
+`GITHUB_TOKEN` (materialised from <secret-manager> into the process env at startup) only
+at the moment of transport and injects it via `GIT_ASKPASS` — the token is never
+placed in the remote URL or argv, and never logged.
+
+The guarded tools use the same per-occurrence approval gate as `openhands` /
+<secret-manager>: the first call returns an `APPROVAL REQUIRED` code, and the operator
+authorises the single call out of band. The one-time force re-baseline that
+establishes shared lineage with each public mirror is **GHMR-07's**
+operator-blessed bootstrap — never performed by these tools.
 
 ## Plane identities (`PLANE_PAT_<NAME>` convention)
 
