@@ -151,11 +151,12 @@ See [`src/lib.rs`](src/lib.rs) for the full module list and
 Publishing a Rust crate to the Gitea Cargo registry goes **through Terminus**,
 not through a `cargo publish` token on a build or dev host. `cargo publish` is,
 on the wire, an authenticated HTTP `PUT` of a packaged `.crate` to the registry;
-`gitea_cargo_publish` recreates exactly that request and signs it with
-**Terminus's own `GITEA_TOKEN`**, so the publish credential lives in one place
-(the runtime secret store that materializes `GITEA_TOKEN`) and never has to be
-copied onto the dev box or spread across containers. There is a **single
-publisher identity** — this is deliberately not a multi-user path.
+`gitea_cargo_publish` recreates exactly that request and signs it with the
+**resolved `GITEA_PAT_<NAME>` identity token** (the active default
+`GITEA_IDENTITY_NAME`, or the optional `identity` argument — see
+[Gitea identities](#gitea-identities-gitea_pat_name-convention) below), so the
+publish credential lives in the runtime secret store and never has to be copied
+onto the dev box or spread across containers.
 
 Workflow:
 
@@ -175,18 +176,20 @@ Workflow:
    | `name` | yes | Crate name. |
    | `version` | yes | Crate version. |
    | `owner` | no | Registry owner/org (defaults to `GITEA_OWNER`, normally `moosenet`). |
+   | `identity` | no | Which `GITEA_PAT_<NAME>` identity to publish as (defaults to the active default `GITEA_IDENTITY_NAME`, normally `moose`). |
    | `metadata` | yes | Cargo **publish-wire** metadata object (the schema cargo PUTs: `deps` with `version_req`, `features`, license, repository, ...) — not `cargo metadata` output. `name`/`vers` are forced to the explicit arguments. Required because a name+version-only publish would write an incorrect registry index for any crate with dependencies. |
 
    It frames the standard Cargo publish body
    (`u32-LE(len)‖metadata_json‖u32-LE(len)‖crate_bytes`) and `PUT`s it to
    `{GITEA_URL}/api/packages/{owner}/cargo/api/v1/crates/new` with
-   `Authorization: token <GITEA_TOKEN>` (the same PAT scheme every other Gitea
+   `Authorization: token <GITEA_PAT_NAME>` (the same PAT scheme every other Gitea
    call uses). On success it returns the published
    name/version and the registry package URL; a `403` is surfaced explicitly as
    a likely missing `write:package` token scope.
 
-> The publishing `GITEA_TOKEN` must carry the **`write:package`** scope. Without
-> it the registry returns `403` and the tool reports the missing scope.
+> The publishing identity's `GITEA_PAT_<NAME>` token must carry the
+> **`write:package`** scope. Without it the registry returns `403` and the tool
+> reports the missing scope.
 
 **Input safety.** `crate_path` is validated before any bytes are read: it must
 be an existing **regular** `.crate` file (directories and devices such as
@@ -409,6 +412,58 @@ path. This convention is the same one carried normatively by the moosenet-spec
 build pipeline (v3.8, "Plane access — ONE sanctioned path" / "Plane identity
 convention"); this section is the Terminus-local, discoverable copy of it, not a
 competing source of truth.
+
+## Gitea identities (`GITEA_PAT_<NAME>` convention)
+
+The Gitea tool module is **multi-identity, exactly like Plane** (S105/GPAT). A
+call can act as whichever agent should own the resulting commit/PR/publish,
+rather than always using one shared token. Identities are configured purely
+through this process's own environment — the tool never reads another process's
+files.
+
+**BREAKING:** the tool **no longer reads an unsuffixed `GITEA_TOKEN`** — that key
+is gone. The effective token is always a `GITEA_PAT_<NAME>` identity token.
+
+### Configuration
+
+| Variable | Purpose |
+| --- | --- |
+| `GITEA_URL` | Base URL of the Gitea instance (required — the only hard-required Gitea var). |
+| `GITEA_OWNER` | Default repo owner/organisation (default `moosenet`). |
+| `GITEA_IDENTITY_NAME` | Which named identity is the **active default** when a call passes no `identity` argument. **Default `moose`** — Gitea is the operator's infra git storage. (This differs from Plane, whose default is `lumina`.) |
+| `GITEA_PAT_<NAME>` | A **named identity**. Each such variable registers the identity `<name>` (lowercased) with its own token — e.g. `GITEA_PAT_MOOSE`, `GITEA_PAT_HARMONY`, `GITEA_PAT_LUMINA`. |
+
+Named identities are matched only by the `GITEA_PAT_` prefix; a set-but-empty
+`GITEA_PAT_<NAME>` is treated as absent. These values are provisioned into the
+running process by the deployment's own secret-materialization step (the
+vault-backed store, surfaced as `INFISICAL_*`-configured fetches at startup) —
+never hardcoded into a unit file or committed anywhere.
+
+### Acting as an identity: the `identity` argument
+
+Every Gitea tool (`gitea_list_repos`, `gitea_create_file`, `gitea_update_file`,
+`gitea_create_pr`, `gitea_merge_pr`, `gitea_cargo_publish`, …) accepts an
+**optional `identity` argument**. Set it to a configured `GITEA_PAT_<NAME>` name
+(e.g. `"moose"`, `"harmony"`, `"lumina"`) and that single call is authenticated
+as that identity's token. Omit it and the call acts as the **active default**
+identity (`GITEA_IDENTITY_NAME`, default `moose`).
+
+Selection is centralized: all tools route through the same
+`GiteaClient::resolve_identity` → `for_identity` dispatch, so the rule lives in
+one place. The `identity` argument is used only to pick the token — it is never
+written into a request body and never logged.
+
+### Listing identities: `gitea_list_identities`
+
+`gitea_list_identities` returns the names of every configured `GITEA_PAT_<NAME>`
+identity (sorted, stable), the active default, and the prefix — **names only,
+never token values**. Call it to see which identity you can act as before
+performing Gitea work. With no named identities configured it returns an empty
+list plus an explanatory note (not an error).
+
+Select the identity through the tool's own mechanism (`gitea_list_identities` /
+the client's `for_identity()` resolution) — **never** fetch a `GITEA_PAT_*` value
+yourself to make a raw API/git call; that is a second, unsanctioned access path.
 
 ## Plane module management
 
