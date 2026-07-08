@@ -102,6 +102,12 @@ impl MirrorWorkDir {
         &self.work_dir
     }
 
+    /// The logical repo name (the work-dir subdirectory + commit label). Exposed
+    /// for GHMR-05's cleaning orchestration, which stamps escalation payloads.
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+
     /// The internal source checkout path.
     pub fn source(&self) -> &Path {
         &self.source

@@ -281,6 +281,32 @@ authorises the single call out of band. The one-time force re-baseline that
 establishes shared lineage with each public mirror is **GHMR-07's**
 operator-blessed bootstrap — never performed by these tools.
 
+#### Residual cleaning (GHMR-05)
+
+The mechanical sweep rewrites deterministically-fixable PII (private IPs,
+container IDs, config-mapped hosts) to placeholder tokens, but leaves **residual**
+violations that need judgment — a raw leaked secret, prose embedding an infra
+fact. When `github_mirror_prepare` finds residuals it runs an **operationalized,
+bounded cleaning pass** rather than just returning them:
+
+1. Dispatch a scoped **cleaning subagent** — a command configured in
+   `TERMINUS_MIRROR_CLEAN_CMD`, run once per round with `MIRROR_WORK_DIR` (the
+   work dir it may edit) and `MIRROR_RESIDUALS_FILE` (a JSON list of the residual
+   `{file, line, pattern_kind, context}` spots) in its environment, cwd set to the
+   work dir. It remediates the flagged spots **in the work dir only** — the source
+   repo is never handed to it and never touched.
+2. Re-run the sweep + authoritative gate. If 0 residuals remain, the cleaned tree
+   is committed and tagged `mirror-approved/<sha>` (tag-able).
+3. Repeat up to **3 rounds** (the infinite-loop guard, which also stops early on a
+   round that makes no progress). On exhaustion, the exact `file:line` spots are
+   **escalated to the operator** (`cleaning.escalated: true`,
+   `cleaning.escalation_spots: [...]`); nothing is committed or tagged.
+
+When `TERMINUS_MIRROR_CLEAN_CMD` is unset, prepare escalates the residual spots
+immediately (0 rounds) rather than silently passing residual PII through. The gate
+is re-verified after every round, so a cleaner that under-delivers can never
+smuggle residual PII into an approved tag.
+
 ## Plane identities (`PLANE_PAT_<NAME>` convention)
 
 The Plane tool module supports multiple **named identities** so a call can act

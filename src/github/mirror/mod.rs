@@ -17,12 +17,19 @@
 //!     syncs internal `main`'s tree content in, runs the [`sweep`], commits the
 //!     swept state, and — iff the gate reports 0 residual violations — tags it
 //!     `mirror-approved/<internal-sha>`.
+//!   * [`clean`] (GHMR-05) — the **operationalized residual-cleaning pass**: when
+//!     the sweep leaves residual (non-mechanical) violations, a bounded (≤3 rounds)
+//!     loop dispatches a scoped cleaning subagent that remediates the flagged spots
+//!     IN THE WORK DIR ONLY, re-runs the gate each round, and either drives the
+//!     residuals to 0 (tag-able) or escalates the exact `file:line` spots to the
+//!     operator. Wired into `github_mirror_prepare` (GHMR-04).
 //!   * mirror subtools (GHMR-04) build on top.
 //!
 //! The mechanical rewrite writes ONLY into a provided work-dir copy — never the
 //! source repo. Producing and syncing that copy is GHMR-03's ([`workdir`])
 //! concern; the sweep here operates on whatever tree path it is handed.
 
+pub mod clean;
 pub mod sweep;
 pub mod tools;
 pub mod workdir;
