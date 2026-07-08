@@ -113,7 +113,7 @@ their tools:
 | `serving` | Serving-profile inspect / operate (v1.1) | `serving_profile_get`, `serving_residency_status`, `serving_profile_refresh` |
 | `dev` | Path-jailed dev workspace | `dev_read_file`, `dev_write_file`, `dev_run_command`, `dev_list_workspaces` |
 | `openhands` | Agentic coding runs (guarded) | `openhands_run_task`, `openhands_list_conversations`, `openhands_get_status` |
-| `gitea` | Gitea git forge | `gitea_create_repo`, `gitea_read_file`, `gitea_create_pr`, `gitea_merge_pr` |
+| `gitea` | Gitea git forge | `gitea_create_repo`, `gitea_read_file`, `gitea_create_pr`, `gitea_merge_pr`, `gitea_cargo_publish` |
 | `github` | GitHub | `github_create_repo`, `github_list_repos`, `github_push_repo` |
 | `plane` | Plane work management | `plane_create_work_item`, `plane_list_issues_by_state`, `plane_update_work_item`, `plane_create_module`, `plane_update_module`, `plane_delete_module`, `plane_add_issue_to_module`, `plane_remove_issue_from_module`, `plane_list_identities`, `plane_whoami`, `plane_prefix_check`, `plane_prefix_register` |
 | `nexus` | Inter-agent inbox | `nexus_send`, `nexus_check`, `nexus_read`, `nexus_ack`, `nexus_history` |
@@ -145,6 +145,60 @@ their tools:
 
 See [`src/lib.rs`](src/lib.rs) for the full module list and
 [`src/registry.rs`](src/registry.rs) for the registration order.
+
+## Cargo registry publishing (`gitea_cargo_publish`)
+
+Publishing a Rust crate to the Gitea Cargo registry goes **through Terminus**,
+not through a `cargo publish` token on a build or dev host. `cargo publish` is,
+on the wire, an authenticated HTTP `PUT` of a packaged `.crate` to the registry;
+`gitea_cargo_publish` recreates exactly that request and signs it with
+**Terminus's own `GITEA_TOKEN`**, so the publish credential lives in one place
+(the runtime secret store that materializes `GITEA_TOKEN`) and never has to be
+copied onto the dev box or spread across containers. There is a **single
+publisher identity** — this is deliberately not a multi-user path.
+
+Workflow:
+
+1. On the dev box, package token-lessly: `cargo package -p <crate>` produces
+   `target/package/<name>-<version>.crate`. Also assemble the crate's Cargo
+   **publish-wire** metadata for the required `metadata` argument — the exact
+   object cargo PUTs to a registry (`deps` with `version_req`, `features`, ...),
+   **not** `cargo metadata` output (a different schema). The most reliable source
+   is the normalized `Cargo.toml` cargo embeds in the `.crate`, mapped to the
+   publish schema.
+2. Relay that `.crate` to the host running Terminus.
+3. Call `gitea_cargo_publish`:
+
+   | Input | Required | Meaning |
+   | --- | --- | --- |
+   | `crate_path` | yes | Path to the local `.crate` file on the Terminus host. |
+   | `name` | yes | Crate name. |
+   | `version` | yes | Crate version. |
+   | `owner` | no | Registry owner/org (defaults to `GITEA_OWNER`, normally `moosenet`). |
+   | `metadata` | yes | Cargo **publish-wire** metadata object (the schema cargo PUTs: `deps` with `version_req`, `features`, license, repository, ...) — not `cargo metadata` output. `name`/`vers` are forced to the explicit arguments. Required because a name+version-only publish would write an incorrect registry index for any crate with dependencies. |
+
+   It frames the standard Cargo publish body
+   (`u32-LE(len)‖metadata_json‖u32-LE(len)‖crate_bytes`) and `PUT`s it to
+   `{GITEA_URL}/api/packages/{owner}/cargo/api/v1/crates/new` with
+   `Authorization: token <GITEA_TOKEN>` (the same PAT scheme every other Gitea
+   call uses). On success it returns the published
+   name/version and the registry package URL; a `403` is surfaced explicitly as
+   a likely missing `write:package` token scope.
+
+> The publishing `GITEA_TOKEN` must carry the **`write:package`** scope. Without
+> it the registry returns `403` and the tool reports the missing scope.
+
+**Input safety.** `crate_path` is validated before any bytes are read: it must
+be an existing **regular** `.crate` file (directories and devices such as
+`/dev/zero` are refused) no larger than `CARGO_PUBLISH_MAX_CRATE_BYTES` (default
+64 MiB). Set `CARGO_PUBLISH_ARTIFACT_DIR` to confine reads to a dedicated
+staging directory — the canonicalized crate path must then live inside it — so
+the tool cannot be turned into an arbitrary host-file read.
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `CARGO_PUBLISH_MAX_CRATE_BYTES` | `67108864` (64 MiB) | Reject artifacts larger than this before reading. |
+| `CARGO_PUBLISH_ARTIFACT_DIR` | unset | When set, `crate_path` must resolve inside this directory (path jail). |
 
 ## Plane identities (`PLANE_PAT_<NAME>` convention)
 
