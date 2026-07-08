@@ -196,7 +196,7 @@ impl ResidualCleaner for CommandCleaner {
         // descendants when it returns. A cleaner could otherwise fork a background
         // process that outlives the shell (`Command::wait` reaps only the shell) and
         // re-tamper with `.git` AFTER the caller restores it. Putting the child in a
-        // fresh group (pgid == child pid) and `pkill -KILL -g <pgid>`-ing that group
+        // fresh group (pgid == child pid) and `killpg(pgid, SIGKILL)`-ing that group
         // after it exits kills such forked descendants before `.git` is restored and
         // finalize runs. (A cleaner that deliberately double-forks into a NEW SESSION
         // to escape its process group, or writes to arbitrary absolute paths, is
@@ -208,15 +208,17 @@ impl ResidualCleaner for CommandCleaner {
             cmd.process_group(0);
             match cmd.spawn() {
                 Ok(mut child) => {
-                    let pgid = child.id();
+                    let pgid = child.id() as libc::pid_t;
                     let st = child.wait();
-                    // Best-effort: terminate the whole group (the shell is already
-                    // gone; this catches any forked children still alive).
-                    let _ = Command::new("pkill")
-                        .arg("-KILL")
-                        .arg("-g")
-                        .arg(pgid.to_string())
-                        .status();
+                    // Terminate the whole group via a direct killpg(2) syscall — no
+                    // reliance on an external `pkill` binary (absent in minimal
+                    // containers). The group leader (the shell) has already exited;
+                    // this reaches any forked children still alive. ESRCH (empty
+                    // group) is a harmless no-op. Safe: killpg takes plain integers
+                    // and has no memory effects.
+                    unsafe {
+                        libc::killpg(pgid, libc::SIGKILL);
+                    }
                     st
                 }
                 Err(e) => Err(e),
