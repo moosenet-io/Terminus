@@ -429,7 +429,7 @@ impl MirrorWorkDir {
     }
 
     /// Whether `mirror-approved/<internal-sha>` already exists in the work dir.
-    fn approved_tag_exists(&self, internal_sha: &str) -> Result<bool, ToolError> {
+    pub fn approved_tag_exists(&self, internal_sha: &str) -> Result<bool, ToolError> {
         if !self.is_initialised() {
             return Ok(false);
         }
@@ -437,10 +437,60 @@ impl MirrorWorkDir {
         let out = run_git(&self.work_dir, &["tag", "-l", &tag])?;
         Ok(out.lines().any(|l| l.trim() == tag))
     }
+
+    // ── Read-only queries for GHMR-04's mirror subtools ──────────────────────
+    //
+    // These expose the existing private git reads (HEAD shas, tag resolution)
+    // as a public, side-effect-free surface so `mirror::tools` can build the
+    // `github_mirror_{status,push}` reports without duplicating the force-guarded
+    // git runner. All are pure reads — none mutate the work dir or source.
+
+    /// The internal source's current `main` HEAD sha (full 40-char).
+    pub fn source_head_sha(&self) -> Result<String, ToolError> {
+        self.internal_head_sha()
+    }
+
+    /// The work dir's current HEAD sha, or `None` when the work dir has no commit
+    /// yet (uninitialised, or a residual-only first run that never committed).
+    pub fn head_sha_opt(&self) -> Option<String> {
+        if !self.is_initialised() {
+            return None;
+        }
+        self.work_head_sha().ok()
+    }
+
+    /// The work-dir commit the `mirror-approved/<internal_sha>` tag points at, or
+    /// `None` when that internal sha has not been approved (no tag). This is the
+    /// exact commit GHMR-04's `github_mirror_push` publishes.
+    pub fn approved_commit(&self, internal_sha: &str) -> Result<Option<String>, ToolError> {
+        if !self.approved_tag_exists(internal_sha)? {
+            return Ok(None);
+        }
+        // `<tag>^{commit}` dereferences the annotated tag object to the commit it
+        // marks (a plain `rev-parse <tag>` would yield the tag object's own sha).
+        let spec = format!("{}^{{commit}}", approved_tag(internal_sha));
+        let out = run_git(&self.work_dir, &["rev-parse", "--verify", "-q", &spec])?;
+        Ok(Some(out.trim().to_string()))
+    }
+
+    /// Every `mirror-approved/*` tag currently in the work dir (the full set of
+    /// vetted snapshots), newest git-tag-order last. Empty when none exist.
+    pub fn approved_tags(&self) -> Result<Vec<String>, ToolError> {
+        if !self.is_initialised() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("{APPROVED_TAG_PREFIX}*");
+        let out = run_git(&self.work_dir, &["tag", "-l", &pattern])?;
+        Ok(out
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect())
+    }
 }
 
 /// The approval tag name for an internal sha.
-fn approved_tag(internal_sha: &str) -> String {
+pub(crate) fn approved_tag(internal_sha: &str) -> String {
     format!("{APPROVED_TAG_PREFIX}{internal_sha}")
 }
 
@@ -603,7 +653,7 @@ const BANNED_FORCE_TOKENS: &[&str] = &["--force", "-f", "--force-with-lease", "-
 /// `scribe::vault::assert_never_force_push`: this module's git ops only ever move
 /// the work dir's own linear history FORWARD; the one sanctioned re-baseline
 /// `--force` is GHMR-07's operator-blessed bootstrap, never performed here.
-fn assert_never_force(argv: &[&str]) {
+pub(crate) fn assert_never_force(argv: &[&str]) {
     for token in argv {
         let lower = token.to_lowercase();
         assert!(
@@ -615,7 +665,7 @@ fn assert_never_force(argv: &[&str]) {
 
 /// Run a git command in `cwd`, returning stdout on success or an `Execution`
 /// error carrying stderr on failure.
-fn run_git(cwd: &Path, args: &[&str]) -> Result<String, ToolError> {
+pub(crate) fn run_git(cwd: &Path, args: &[&str]) -> Result<String, ToolError> {
     assert_never_force(args);
     let output = Command::new("git")
         .current_dir(cwd)
@@ -637,7 +687,7 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<String, ToolError> {
 /// Run a git command purely for its exit status (used for `diff --cached
 /// --quiet`, where non-zero is a meaningful "there are staged changes" signal,
 /// not a failure). Returns `true` iff git exited 0.
-fn git_ok(cwd: &Path, args: &[&str]) -> bool {
+pub(crate) fn git_ok(cwd: &Path, args: &[&str]) -> bool {
     assert_never_force(args);
     Command::new("git")
         .current_dir(cwd)

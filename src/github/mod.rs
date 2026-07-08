@@ -95,6 +95,21 @@ impl GitHubConfig {
     }
 }
 
+/// Resolve the `GITHUB_TOKEN` credential — the single sanctioned read point the
+/// mirror push tool (GHMR-04) shares with the rest of the github module. In this
+/// crate secrets are materialised into the process environment at startup by
+/// `secrets_bootstrap` (fetched from the fleet secret store), so this env read IS
+/// the vault access path, centralised here so token handling never sprawls into raw
+/// `std::env::var` calls scattered across the mirror code. Returns
+/// `NotConfigured` (never a panic, never a partial value) when the token is
+/// absent, and the caller must NEVER log or echo the returned string.
+pub(crate) fn github_token() -> Result<String, ToolError> {
+    std::env::var("GITHUB_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ToolError::NotConfigured("GITHUB_TOKEN not set".into()))
+}
+
 // ── Response shaping ──────────────────────────────────────────────────────────
 
 /// Map one GitHub repo object to the compact shape the Python tool returns.
@@ -899,6 +914,14 @@ pub fn register(registry: &mut ToolRegistry) {
     // github_pii_scan is a pure, read-only diagnostic — always available,
     // independent of whether GitHub write credentials are configured.
     registry.register_or_replace(Box::new(GitHubPiiScan));
+    // GHMR-04 mirror engine subtools (status/prepare/approve/push). Registered
+    // unconditionally — status/prepare/approve are local git + sweep operations
+    // that need no GitHub credential; only `github_mirror_push` reads GITHUB_TOKEN,
+    // and it does so lazily at call time (a clear NotConfigured if it is unset)
+    // rather than being stubbed out at startup. They land on whichever registry
+    // `github::register` is invoked against — the CORE registry in `register_all`
+    // and the personal registry in `register_personal` (github is a core tool).
+    mirror::tools::register(registry);
     match GitHubConfig::from_env() {
         Ok(cfg) => {
             registry.register_or_replace(Box::new(GitHubListRepos { cfg: cfg.clone() }));
