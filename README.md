@@ -115,7 +115,7 @@ their tools:
 | `openhands` | Agentic coding runs (guarded) | `openhands_run_task`, `openhands_list_conversations`, `openhands_get_status` |
 | `gitea` | Gitea git forge | `gitea_create_repo`, `gitea_read_file`, `gitea_create_pr`, `gitea_merge_pr` |
 | `github` | GitHub | `github_create_repo`, `github_list_repos`, `github_push_repo` |
-| `plane` | Plane work management | `plane_create_work_item`, `plane_list_issues_by_state`, `plane_update_work_item`, `plane_list_identities`, `plane_whoami` |
+| `plane` | Plane work management | `plane_create_work_item`, `plane_list_issues_by_state`, `plane_update_work_item`, `plane_list_identities`, `plane_whoami`, `plane_prefix_check`, `plane_prefix_register` |
 | `nexus` | Inter-agent inbox | `nexus_send`, `nexus_check`, `nexus_read`, `nexus_ack`, `nexus_history` |
 | `axon` | Work-queue agent control | `axon_submit`, `axon_status`, `axon_list`, `axon_cancel` |
 | `vector` | Dev-loop agent control | `vector_submit`, `vector_status`, `vector_queue_depth`, `vector_halt` |
@@ -263,6 +263,46 @@ path. This convention is the same one carried normatively by the moosenet-spec
 build pipeline (v3.8, "Plane access — ONE sanctioned path" / "Plane identity
 convention"); this section is the Terminus-local, discoverable copy of it, not a
 competing source of truth.
+
+## Prefix registry (`plane_prefix_*`)
+
+A queryable, maintainable library of the **USED/ACTIVE sub-project + issue
+prefixes** — the 2–8 char item-ID prefixes like `SCRB`, `ROUT`, `RMDR`, `LSEC`.
+These are the per-spec item prefixes, **not** the per-repo Plane *project*
+prefixes (`HARM`/`LUM`/`CHRD`/`TERM`/`RAIL`/`HW`/`PSH`). It gives the
+"a prefix must be unique — check the registry" rule real programmatic backing
+instead of a stale hand-maintained doc table. It is a **sub-module of the Plane
+helper** (`src/plane/prefix.rs`), so its tools register alongside `plane_*` in
+both the core Chord registry and the personal registry.
+
+**Hybrid store.**
+
+- **Baseline** — a git-versioned TOML file (`data/prefix_registry.toml`), the
+  reviewed source of truth. It is compiled into the binary via `include_str!`,
+  so baseline reads always succeed regardless of working directory or Redis
+  state.
+- **Overlay** — a runtime claim store in the **same shared Plane Redis**
+  (`PLANE_REDIS_URL`; see the pacing/caching section above). `plane_prefix_register`
+  writes a claim here immediately (fast, cross-instance-visible). Promotion of an
+  overlay claim into the baseline TOML happens later via a small reviewed PR (add
+  a `[[prefix]]` block, drop the overlay claim).
+- **Fail-open** — every overlay op is short-timeout-bounded. If Redis is
+  unconfigured or unreachable, reads fall back to the baseline alone, and
+  register/retire return a clear "overlay unavailable — use the file/PR path"
+  result rather than erroring.
+
+**Tools.**
+
+| Tool | Purpose |
+| --- | --- |
+| `plane_prefix_list` | List/filter all known prefixes (baseline + overlay). Filters: `status`, `project`, `source` (`baseline`/`overlay`/`pending`), `include_retired`. Reports which claims are overlay-only (pending promotion). |
+| `plane_prefix_check` | Is-free check for a candidate prefix + a few next-available suggestions. **Run this before writing a new spec** to satisfy the uniqueness rule. |
+| `plane_prefix_register` | Claim a new prefix. Rejects on collision with the baseline **or** overlay; on success writes the claim to the overlay (flagged pending promotion). |
+| `plane_prefix_get` | Fetch one prefix's merged metadata (with source flags). |
+| `plane_prefix_retire` | Mark a prefix retired via an overlay status override. |
+
+Metadata per prefix: `prefix`, `name`, `project`, `spec_id`, `status`
+(`active`/`retired`/`ingested`/`complete`), `description`, `created`.
 
 ## License
 
