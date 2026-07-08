@@ -138,10 +138,14 @@ const RATE_RESERVE_LUA: &str = r#"
 local t = redis.call('TIME')
 local now = (tonumber(t[1]) * 1000) + math.floor(tonumber(t[2]) / 1000)
 local interval = tonumber(ARGV[1])
-local ttl = tonumber(ARGV[2])
+local buffer = tonumber(ARGV[2])
 local last = tonumber(redis.call('GET', KEYS[1]) or '0')
 local slot = now
 if last + interval > now then slot = last + interval end
+-- Key TTL must outlive the FULL reserved backlog (slot may be many intervals
+-- ahead under a burst), else the key could expire before the last reserved slot
+-- is reached and a later caller would see no prior slot and release too soon.
+local ttl = (slot - now) + buffer
 redis.call('SET', KEYS[1], slot, 'PX', ttl)
 local wait = slot - now
 if wait < 0 then wait = 0 end
@@ -383,9 +387,10 @@ impl RedisBackend {
             return None;
         }
         let interval_ms = min_interval.as_millis() as i64;
-        // TTL well above the interval so an idle key self-expires without ever
-        // over-throttling a later request (a missing key = "no prior slot").
-        let ttl_ms = (interval_ms.saturating_mul(4)).max(1000);
+        // Buffer added ON TOP of the reserved backlog (slot - now) inside the
+        // script, so an idle key still self-expires cleanly (a missing key =
+        // "no prior slot") without ever expiring mid-backlog under a burst.
+        let ttl_buffer_ms = (interval_ms.saturating_mul(4)).max(1000);
         let key = format!("{}ratelimit:global", self.key_prefix);
         let fut = async {
             let mut conn = self
@@ -395,7 +400,7 @@ impl RedisBackend {
             self.rate_script
                 .key(key)
                 .arg(interval_ms)
-                .arg(ttl_ms)
+                .arg(ttl_buffer_ms)
                 .invoke_async::<_, i64>(&mut conn)
                 .await
         };
@@ -498,6 +503,11 @@ impl RateLimiter {
                 if !wait.is_zero() {
                     tokio::time::sleep(wait).await;
                 }
+                // Warm the local gate too: if Redis becomes unavailable right
+                // after this reservation, the first in-process fallback call
+                // still sees a recent request and enforces spacing rather than
+                // firing immediately (no burst across the outage transition).
+                *self.last.lock().await = Some(Instant::now());
                 return;
             }
             // Redis unavailable → fall through to the in-process gate below.
