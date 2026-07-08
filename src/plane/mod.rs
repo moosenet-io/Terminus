@@ -177,13 +177,20 @@ impl CircuitBreaker {
     }
 
     /// True if a Redis op should be attempted now. When the cooldown has
-    /// elapsed the breaker half-opens (clears `open_until`) to allow one probe.
+    /// elapsed the breaker half-opens for exactly ONE probe: this caller
+    /// *reserves* the probe by pushing `open_until` forward (so concurrent
+    /// callers keep seeing it open and fall back instead of a thundering herd),
+    /// and the probe's own `record_success`/`record_failure` then closes or
+    /// re-opens the breaker.
     fn allow(&self) -> bool {
         let mut g = self.inner.lock().unwrap();
         match g.open_until {
             Some(t) if Instant::now() < t => false,
             Some(_) => {
-                g.open_until = None; // half-open: allow a single probe
+                // Cooldown elapsed: reserve a single half-open probe for THIS
+                // caller. Re-arm the window so any concurrent caller still sees
+                // an open breaker until this probe records its result.
+                g.open_until = Some(Instant::now() + REDIS_BREAKER_COOLDOWN);
                 true
             }
             None => true,
@@ -211,6 +218,16 @@ impl CircuitBreaker {
             true
         } else {
             false
+        }
+    }
+
+    /// Test hook: force the open cooldown to have already elapsed so half-open
+    /// behaviour can be exercised deterministically without a real 5s wait.
+    #[cfg(test)]
+    fn test_expire_cooldown(&self) {
+        let mut g = self.inner.lock().unwrap();
+        if g.open_until.is_some() {
+            g.open_until = Some(Instant::now() - Duration::from_millis(1));
         }
     }
 }
@@ -3935,6 +3952,25 @@ mod tests {
         // A success closes it and re-arms the single-warning latch.
         cb.record_success();
         assert!(cb.allow(), "success closes the breaker");
+    }
+
+    #[test]
+    fn test_circuit_breaker_half_open_allows_only_one_probe() {
+        let cb = CircuitBreaker::new();
+        for _ in 0..REDIS_FAILURE_THRESHOLD {
+            cb.record_failure();
+        }
+        assert!(!cb.allow(), "open during cooldown");
+        // Simulate the cooldown elapsing.
+        cb.test_expire_cooldown();
+        // Exactly ONE caller gets the half-open probe; concurrent callers that
+        // race in before the probe records its result stay blocked (no herd).
+        assert!(cb.allow(), "first caller after cooldown gets the single probe");
+        assert!(!cb.allow(), "concurrent caller must NOT also probe");
+        assert!(!cb.allow(), "still single-probe reserved");
+        // A successful probe fully closes the breaker again.
+        cb.record_success();
+        assert!(cb.allow());
     }
 
     #[test]
