@@ -446,12 +446,13 @@ fn collect_files(root: &Path, rs: &PiiRuleSet, skip: &[PathBuf]) -> Vec<PathBuf>
                     walk(&path, rs, skip, out);
                 }
             } else if ft.is_file() {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if name == CONFIG_BASENAME || rs.is_excluded(&path) {
+                if rs.is_excluded(&path) {
                     continue;
                 }
-                // Skip a config file pointed at by env (compared canonically so
-                // relative/symlinked paths still match). `skip` is usually empty.
+                // Skip the single active placeholder config (compared canonically
+                // so relative/symlinked paths still match). ONLY the exact resolved
+                // config path is exempt — a same-named file nested elsewhere in the
+                // tree is ordinary content and is swept normally.
                 if !skip.is_empty() {
                     if let Ok(canon) = path.canonicalize() {
                         if skip.contains(&canon) {
@@ -468,15 +469,25 @@ fn collect_files(root: &Path, rs: &PiiRuleSet, skip: &[PathBuf]) -> Vec<PathBuf>
     out
 }
 
-/// The canonicalized path of a `TERMINUS_MIRROR_PLACEHOLDERS`-pointed config
-/// file, when set and resolvable — so the rewrite walk never rewrites the active
-/// config even when it is named something other than `mirror-placeholders.toml`.
-/// The repo-root `mirror-placeholders.toml` case is already covered by base-name.
-fn env_config_skip() -> Vec<PathBuf> {
-    match std::env::var("TERMINUS_MIRROR_PLACEHOLDERS") {
-        Ok(p) if !p.is_empty() => Path::new(&p).canonicalize().ok().into_iter().collect(),
-        _ => Vec::new(),
+/// The canonicalized path of the single active placeholder config that must
+/// never be rewritten or counted as residual PII — mirroring
+/// `placeholder_config_from`'s resolution exactly: the
+/// `TERMINUS_MIRROR_PLACEHOLDERS`-pointed file when set, otherwise the repo-root
+/// `<work_dir>/mirror-placeholders.toml`. Returns the exact path (not a
+/// base-name), so a same-named file nested elsewhere in the tree is NOT exempt
+/// and is swept/scanned as ordinary content.
+fn active_config_skip(work_dir: &Path) -> Vec<PathBuf> {
+    if let Ok(p) = std::env::var("TERMINUS_MIRROR_PLACEHOLDERS") {
+        if !p.is_empty() {
+            return Path::new(&p).canonicalize().ok().into_iter().collect();
+        }
     }
+    work_dir
+        .join(CONFIG_BASENAME)
+        .canonicalize()
+        .ok()
+        .into_iter()
+        .collect()
 }
 
 /// The `skip` config paths (canonical) expressed relative to `work_dir`, so they
@@ -515,9 +526,9 @@ pub fn sweep_tree(work_dir: &Path, cfg: &PlaceholderConfig) -> Result<SweepRepor
     // detection — the two surfaces can never diverge on what they touch.
     let ruleset = ruleset_from_config(Some(work_dir));
     // Never rewrite the active config file itself (its `term`/`pattern` values
-    // are exactly what the matchers would corrupt). CONFIG_BASENAME covers the
-    // repo-root case; also skip a `TERMINUS_MIRROR_PLACEHOLDERS`-pointed file.
-    let skip = env_config_skip();
+    // are exactly what the matchers would corrupt). This is the one exact
+    // resolved config path — env-pointed, else repo-root mirror-placeholders.toml.
+    let skip = active_config_skip(work_dir);
     let files = collect_files(work_dir, &ruleset, &skip);
 
     // Read every candidate once (strict UTF-8; binaries/oversized skipped).
@@ -558,18 +569,14 @@ pub fn sweep_tree(work_dir: &Path, cfg: &PlaceholderConfig) -> Result<SweepRepor
     // config is excluded (as GHMR-01 already excludes its own pii-gate.toml):
     // it legitimately holds the real values the matchers map, is never rewritten,
     // and is not content shipped to the public mirror — so it must not make an
-    // otherwise-clean tree look dirty and block the GHMR-03 approval tag.
+    // otherwise-clean tree look dirty and block the GHMR-03 approval tag. Only the
+    // exact active-config path is dropped (via skip_rels), never a same-named
+    // nested file, which stays visible in the residual report.
     let skip_rels = skip_relative_names(work_dir, &skip);
     let residual_violations: Vec<TreeViolation> = ruleset
         .scan_tree(work_dir)
         .into_iter()
-        .filter(|v| {
-            let base = Path::new(&v.file)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-            base != CONFIG_BASENAME && !skip_rels.contains(&v.file)
-        })
+        .filter(|v| !skip_rels.contains(&v.file))
         .collect();
 
     Ok(SweepReport {
@@ -975,6 +982,34 @@ mod tests {
             "config-only real value must not surface as residual: {:?}",
             report.residual_violations
         );
+    }
+
+    // ── Only the EXACT active config is exempt, not a same-named nested file ──
+
+    #[test]
+    #[serial]
+    fn nested_same_named_config_is_swept_not_exempt() {
+        clear_env();
+        let dir = temp_tree("nestedcfg");
+        // The real active config lives at the repo root and is exempt.
+        write_file(
+            &dir,
+            "mirror-placeholders.toml",
+            "[[placeholder]]\npattern = '10\\.10\\.0\\.9'\ntoken = \"<REDACTED_LAN_IP>\"\n",
+        );
+        // A DIFFERENT file that merely shares the base-name, nested under docs/,
+        // holding a real mechanical value. It is NOT the active config, so it must
+        // be swept like any other content — not silently exempted.
+        write_file(&dir, "docs/mirror-placeholders.toml", "sample host <internal-ip>\n"); // pii-test-fixture
+        let cfg = placeholder_config_from(Some(dir.as_path()));
+        let report = sweep_tree(&dir, &cfg).unwrap();
+        // Root config untouched; nested same-named file swept; tree clean.
+        assert!(read(&dir, "mirror-placeholders.toml").contains("10\\.10\\.0\\.9"), "root config kept");
+        assert!(
+            !read(&dir, "docs/mirror-placeholders.toml").contains("<internal-ip>"), // pii-test-fixture
+            "nested same-named file must be swept, not exempt"
+        );
+        assert!(report.is_clean(), "swept nested file must not remain residual: {report:?}");
     }
 
     #[test]
