@@ -115,7 +115,7 @@ their tools:
 | `openhands` | Agentic coding runs (guarded) | `openhands_run_task`, `openhands_list_conversations`, `openhands_get_status` |
 | `gitea` | Gitea git forge | `gitea_create_repo`, `gitea_read_file`, `gitea_create_pr`, `gitea_merge_pr` |
 | `github` | GitHub | `github_create_repo`, `github_list_repos`, `github_push_repo` |
-| `plane` | Plane work management | `plane_create_work_item`, `plane_list_issues_by_state`, `plane_update_work_item` |
+| `plane` | Plane work management | `plane_create_work_item`, `plane_list_issues_by_state`, `plane_update_work_item`, `plane_list_identities`, `plane_whoami` |
 | `nexus` | Inter-agent inbox | `nexus_send`, `nexus_check`, `nexus_read`, `nexus_ack`, `nexus_history` |
 | `axon` | Work-queue agent control | `axon_submit`, `axon_status`, `axon_list`, `axon_cancel` |
 | `vector` | Dev-loop agent control | `vector_submit`, `vector_status`, `vector_queue_depth`, `vector_halt` |
@@ -145,6 +145,61 @@ their tools:
 
 See [`src/lib.rs`](src/lib.rs) for the full module list and
 [`src/registry.rs`](src/registry.rs) for the registration order.
+
+## Plane identities (`PLANE_PAT_<NAME>` convention)
+
+The Plane tool module supports multiple **named identities** so a call can act
+as whichever agent should own the resulting work item, rather than always using
+one shared token. Identities are configured purely through this process's own
+environment — the tool never reads another process's files.
+
+### Configuration
+
+| Variable | Purpose |
+| --- | --- |
+| `PLANE_API_URL` | Base URL of the Plane instance (required at call time). |
+| `PLANE_API_KEY` | The **default** (unsuffixed) token, used when no named identity is selected. |
+| `PLANE_WORKSPACE` | Workspace slug. |
+| `PLANE_IDENTITY_NAME` | Optional human name for the default `PLANE_API_KEY` token. |
+| `PLANE_PAT_<NAME>` | A **named identity**. Each such variable registers the identity `<name>` (lowercased) with its own token — e.g. `PLANE_PAT_CLAUDE`, `PLANE_PAT_HARMONY`. |
+
+Named identities are matched only by the `PLANE_PAT_` prefix; the unsuffixed
+`PLANE_API_KEY` default and unrelated `PLANE_*` variables are never scanned as
+identities, and a set-but-empty `PLANE_PAT_<NAME>` is treated as absent. These
+values are provisioned into the running process by each deployment's own
+secret-materialization step (the vault-backed secret store, surfaced as
+`INFISICAL_*`-configured fetches at startup) — never hardcoded into a unit file
+or committed anywhere.
+
+### Listing identities: `plane_list_identities`
+
+`plane_list_identities` returns the names of every configured `PLANE_PAT_<NAME>`
+identity (sorted, stable), the active default, and the prefix — **names only,
+never token values**, matching `plane_whoami`'s safety posture. Call it to see
+which identity you can act as before creating or assigning Plane work. With no
+named identities configured it returns an empty list plus an explanatory note
+(not an error).
+
+### Which identity to use (assignment convention)
+
+Create or transition a work item under the identity of whoever should **act on**
+it, mapped from a spec item's `Agent:` field, rather than always using the
+ingesting agent's own identity:
+
+- `PLANE_PAT_CLAUDE` — this agent's own identity; use for all Claude-driven
+  create/update/comment work unless explicitly assigning to another actor.
+- `PLANE_PAT_HARMONY` — work intended for Harmony's own dispatch to pick up.
+- `PLANE_PAT_MOOSE` — operator human-action items.
+- `PLANE_PAT_GEMINI` / `PLANE_PAT_CODEX` — work intended for those agent types.
+- `PLANE_PAT_LUMINA` — reserved for the assistant persona (future use).
+
+Select the identity through the tool's own mechanism (`plane_list_identities` /
+the client's `for_identity()` resolution) — **never** fetch a `PLANE_PAT_*`
+value yourself to make a raw API call; that is a second, unsanctioned access
+path. This convention is the same one carried normatively by the moosenet-spec
+build pipeline (v3.8, "Plane access — ONE sanctioned path" / "Plane identity
+convention"); this section is the Terminus-local, discoverable copy of it, not a
+competing source of truth.
 
 ## License
 
