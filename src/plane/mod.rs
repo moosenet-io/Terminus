@@ -3309,7 +3309,7 @@ mod tests {
         })).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("issue-42"), "error must preserve created id: {msg}");
-        assert!(msg.contains("42"), "error must preserve sequence: {msg}");
+        assert!(msg.contains("#42"), "error must preserve sequence (as #seq): {msg}");
         assert!(msg.contains("plane_add_issue_to_module"), "error must steer to link, not recreate: {msg}");
         create_mock.assert();
         link_mock.assert();
