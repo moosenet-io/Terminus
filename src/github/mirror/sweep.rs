@@ -239,6 +239,44 @@ fn indexed_token(base: &str, n: usize) -> String {
     }
 }
 
+/// A regex that matches the already-minted indexed tokens for `base` and captures
+/// the numeric suffix — e.g. base `<REDACTED_LAN_IP>` matches
+/// `<REDACTED_LAN_IP_7>` capturing `7`. Used to seed the counter so incremental
+/// sweeps continue numbering past existing placeholders (never reusing `_1`).
+fn index_regex(base: &str) -> Regex {
+    let pat = if let Some(stem) = base.strip_suffix('>') {
+        format!(r"{}_(\d+)>", regex::escape(stem))
+    } else {
+        format!(r"{}_(\d+)", regex::escape(base))
+    };
+    Regex::new(&pat).expect("index regex")
+}
+
+/// Seed the token counters from placeholders ALREADY present in the tree so a
+/// subsequent (incremental) sweep assigns fresh indices instead of restarting at
+/// `_1` and colliding a new distinct value with an existing token. Only distinct
+/// rules carry indices; the counter is set to the max existing suffix per base.
+fn seed_token_state(contents: &[(PathBuf, String, String)], rules: &[CompiledRule], state: &mut TokenState) {
+    for rule in rules {
+        if !rule.distinct {
+            continue;
+        }
+        let idx_re = index_regex(&rule.token);
+        let mut max = 0usize;
+        for (_, _, content) in contents {
+            for caps in idx_re.captures_iter(content) {
+                if let Some(n) = caps.get(1).and_then(|m| m.as_str().parse::<usize>().ok()) {
+                    max = max.max(n);
+                }
+            }
+        }
+        if max > 0 {
+            let entry = state.counters.entry(rule.token.clone()).or_insert(0);
+            *entry = (*entry).max(max);
+        }
+    }
+}
+
 /// One mechanical replacement applied to the work dir.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Replacement {
@@ -333,12 +371,13 @@ fn rewrite_content(
 /// Max file size to rewrite; larger files are skipped (matches GHMR-01's cap).
 const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 
-/// Directory base-names never descended into during the rewrite walk. Generic
-/// VCS/build dirs — the same set GHMR-01's tree sweep prunes.
-const EXCLUDED_DIRS: &[&str] = &[".git", "target", "node_modules", ".cargo"];
-
-/// Read a file as UTF-8 (lossily), skipping binaries (NUL byte) and oversized
-/// files by returning `None`.
+/// Read a file as text for rewriting, returning `None` (skip) when it is
+/// oversized, binary (contains a NUL byte), OR not valid UTF-8. The strict
+/// UTF-8 requirement matters here (unlike GHMR-01's read-only lossy scan): the
+/// sweep WRITES the result back, and lossily decoding invalid bytes to U+FFFD
+/// then rewriting would silently corrupt the file's unrelated bytes. Such a file
+/// is left byte-for-byte intact and still surfaces via the (read-only) residual
+/// scan — "flag rather than silently break".
 fn read_text(path: &Path) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
     if meta.len() > MAX_FILE_BYTES {
@@ -348,16 +387,24 @@ fn read_text(path: &Path) -> Option<String> {
     if bytes.contains(&0) {
         return None;
     }
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    String::from_utf8(bytes).ok()
 }
 
+/// Base-name of the active placeholder configuration. Never rewritten: the
+/// config legitimately holds the real values a matcher would otherwise rewrite
+/// inside its own `term`/`pattern`, which would corrupt the config and break
+/// later incremental sweeps.
+const CONFIG_BASENAME: &str = "mirror-placeholders.toml";
+
 /// Collect the files to rewrite under `root`, honoring the ruleset's file-level
-/// exclusions (name/extension) and the generic dir exclusions. Symlinks are
-/// skipped (no traversal outside `root`, no symlink-cycle recursion) — matching
-/// GHMR-01's walker. Returned sorted for deterministic token assignment.
-fn collect_files(root: &Path, rs: &PiiRuleSet) -> Vec<PathBuf> {
+/// exclusions (name/extension) AND its configured directory exclusions — the
+/// same posture `scan_tree` uses — plus any `skip` paths (the resolved config
+/// file) and the active-config base-name. Symlinks are skipped (no traversal
+/// outside `root`, no symlink-cycle recursion). Returned sorted for deterministic
+/// token assignment.
+fn collect_files(root: &Path, rs: &PiiRuleSet, skip: &[PathBuf]) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    fn walk(dir: &Path, rs: &PiiRuleSet, out: &mut Vec<PathBuf>) {
+    fn walk(dir: &Path, rs: &PiiRuleSet, skip: &[PathBuf], out: &mut Vec<PathBuf>) {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return,
@@ -372,22 +419,48 @@ fn collect_files(root: &Path, rs: &PiiRuleSet) -> Vec<PathBuf> {
             }
             let path = entry.path();
             if ft.is_dir() {
-                let skip = path
+                // Honor the ruleset's configured dir exclusions (defaults +
+                // pii-gate.toml `excluded_dirs`), matching scan_tree exactly.
+                let excluded = path
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .map(|n| EXCLUDED_DIRS.contains(&n))
+                    .map(|n| rs.is_excluded_dir(n))
                     .unwrap_or(false);
-                if !skip {
-                    walk(&path, rs, out);
+                if !excluded {
+                    walk(&path, rs, skip, out);
                 }
-            } else if ft.is_file() && !rs.is_excluded(&path) {
+            } else if ft.is_file() {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name == CONFIG_BASENAME || rs.is_excluded(&path) {
+                    continue;
+                }
+                // Skip a config file pointed at by env (compared canonically so
+                // relative/symlinked paths still match). `skip` is usually empty.
+                if !skip.is_empty() {
+                    if let Ok(canon) = path.canonicalize() {
+                        if skip.contains(&canon) {
+                            continue;
+                        }
+                    }
+                }
                 out.push(path);
             }
         }
     }
-    walk(root, rs, &mut out);
+    walk(root, rs, skip, &mut out);
     out.sort();
     out
+}
+
+/// The canonicalized path of a `TERMINUS_MIRROR_PLACEHOLDERS`-pointed config
+/// file, when set and resolvable — so the rewrite walk never rewrites the active
+/// config even when it is named something other than `mirror-placeholders.toml`.
+/// The repo-root `mirror-placeholders.toml` case is already covered by base-name.
+fn env_config_skip() -> Vec<PathBuf> {
+    match std::env::var("TERMINUS_MIRROR_PLACEHOLDERS") {
+        Ok(p) if !p.is_empty() => Path::new(&p).canonicalize().ok().into_iter().collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Run the mechanical sweep over `work_dir` in place, using `cfg`'s placeholder
@@ -406,36 +479,46 @@ pub fn sweep_tree(work_dir: &Path, cfg: &PlaceholderConfig) -> Result<SweepRepor
     }
 
     let rules = compile_rules(cfg);
-    // Reuse GHMR-01's ruleset (incl. any repo pii-gate.toml) for file exclusions
-    // during the walk AND, below, for the authoritative residual detection.
+    // Reuse GHMR-01's ruleset (incl. any repo pii-gate.toml) for file/dir
+    // exclusions during the walk AND, below, for the authoritative residual
+    // detection — the two surfaces can never diverge on what they touch.
     let ruleset = ruleset_from_config(Some(work_dir));
-    let files = collect_files(work_dir, &ruleset);
+    // Never rewrite the active config file itself (its `term`/`pattern` values
+    // are exactly what the matchers would corrupt). CONFIG_BASENAME covers the
+    // repo-root case; also skip a `TERMINUS_MIRROR_PLACEHOLDERS`-pointed file.
+    let skip = env_config_skip();
+    let files = collect_files(work_dir, &ruleset, &skip);
+
+    // Read every candidate once (strict UTF-8; binaries/oversized skipped).
+    let contents: Vec<(PathBuf, String, String)> = files
+        .into_iter()
+        .filter_map(|path| {
+            let content = read_text(&path)?;
+            let rel = path
+                .strip_prefix(work_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            Some((path, rel, content))
+        })
+        .collect();
 
     let mut state = TokenState::default();
+    // Seed BEFORE any assignment so a new distinct value in one file cannot
+    // collide with an existing indexed token elsewhere in the tree.
+    seed_token_state(&contents, &rules, &mut state);
+
     let mut records: Vec<Replacement> = Vec::new();
     let mut files_rewritten = 0usize;
 
-    for path in &files {
-        let content = match read_text(path) {
-            Some(c) => c,
-            None => continue,
-        };
-        let rel = path
-            .strip_prefix(work_dir)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .into_owned();
-        let before = records.len();
-        let rewritten = rewrite_content(&content, &rules, &mut state, &rel, &mut records);
-        if rewritten != content {
+    for (path, rel, content) in &contents {
+        let rewritten = rewrite_content(content, &rules, &mut state, rel, &mut records);
+        if &rewritten != content {
             std::fs::write(path, &rewritten).map_err(|e| {
                 ToolError::Execution(format!("failed writing swept file {}: {e}", path.display()))
             })?;
             files_rewritten += 1;
         }
-        // Belt-and-braces: a rule may match but replace with an identical token
-        // (never happens for our inert tokens) — keep record/content in lockstep.
-        debug_assert!(records.len() >= before);
     }
 
     // Residual = whatever the authoritative gate STILL flags after the mechanical
@@ -713,6 +796,85 @@ mod tests {
     fn indexed_token_inserts_before_bracket() {
         assert_eq!(indexed_token("<REDACTED_LAN_IP>", 3), "<REDACTED_LAN_IP_3>");
         assert_eq!(indexed_token("PLACEHOLDER", 2), "PLACEHOLDER_2");
+    }
+
+    // ── Incremental sweep: no cross-run token collision (codex P1) ───────────
+
+    #[test]
+    #[serial]
+    fn incremental_sweep_does_not_reuse_existing_index() {
+        clear_env();
+        let dir = temp_tree("incr");
+        // Tree already carries a swept token for some prior value, and a NEW raw
+        // IP arrives. The new value must NOT reuse `_1` (which already means the
+        // prior value) — it must continue past the existing max index.
+        write_file(&dir, "old.txt", "old node at <REDACTED_LAN_IP_1>\n");
+        write_file(&dir, "new.txt", "new node at <internal-ip>\n"); // pii-test-fixture
+        let report = sweep_tree(&dir, &PlaceholderConfig::default()).unwrap();
+        let new = read(&dir, "new.txt");
+        assert!(
+            new.contains("<REDACTED_LAN_IP_2>"),
+            "new distinct value must get a fresh index, not collide with _1: {new}"
+        );
+        assert!(!new.contains("<REDACTED_LAN_IP_1>"), "must not reuse _1: {new}");
+        // The pre-existing token is left untouched.
+        assert_eq!(read(&dir, "old.txt"), "old node at <REDACTED_LAN_IP_1>\n");
+        assert!(report.is_clean());
+    }
+
+    // ── Active config file is never rewritten (codex P1) ─────────────────────
+
+    #[test]
+    #[serial]
+    fn active_config_file_is_not_rewritten() {
+        clear_env();
+        let dir = temp_tree("cfgfile");
+        let toml = "[[placeholder]]\nterm = \"WidgetInc\"\ntoken = \"<ORG>\"\n";
+        write_file(&dir, "mirror-placeholders.toml", toml);
+        write_file(&dir, "readme.md", "By WidgetInc.\n");
+        let cfg = placeholder_config_from(Some(dir.as_path()));
+        let _ = sweep_tree(&dir, &cfg).unwrap();
+        // The matcher rewrote the doc but left its own config intact.
+        assert!(!read(&dir, "readme.md").contains("WidgetInc"));
+        assert_eq!(read(&dir, "mirror-placeholders.toml"), toml, "config must be untouched");
+    }
+
+    // ── Configured excluded_dirs honored by the rewrite walk (codex P2) ──────
+
+    #[test]
+    #[serial]
+    fn configured_excluded_dir_is_not_rewritten() {
+        clear_env();
+        let dir = temp_tree("excldir");
+        // pii-gate.toml (GHMR-01 config) prunes `vendor/`; the sweep walk must
+        // honor the same posture and leave files there untouched.
+        write_file(&dir, "pii-gate.toml", "excluded_dirs = [\"vendor\"]\n");
+        write_file(&dir, "vendor/lib.txt", "vendored <internal-ip>\n"); // pii-test-fixture
+        write_file(&dir, "app.txt", "app at <internal-ip>\n"); // pii-test-fixture
+        let report = sweep_tree(&dir, &PlaceholderConfig::default()).unwrap();
+        assert_eq!(
+            read(&dir, "vendor/lib.txt"),
+            "vendored <internal-ip>\n", // pii-test-fixture
+            "excluded dir must be left untouched"
+        );
+        assert!(!read(&dir, "app.txt").contains("<internal-ip>"), "non-excluded file swept"); // pii-test-fixture
+        // Residual scan also skips the excluded dir → tree is clean.
+        assert!(report.is_clean(), "excluded-dir content must not surface as residual: {report:?}");
+    }
+
+    // ── Non-UTF-8 files are not corrupted (codex P2) ─────────────────────────
+
+    #[test]
+    #[serial]
+    fn invalid_utf8_file_is_left_intact() {
+        clear_env();
+        let dir = temp_tree("badutf8");
+        // NUL-free but invalid UTF-8 (0xFF 0xFE), plus a mechanical-looking IP.
+        let raw = b"start \xff\xfe <internal-ip> end\n"; // pii-test-fixture
+        std::fs::write(dir.join("bin.txt"), raw).unwrap();
+        let _ = sweep_tree(&dir, &PlaceholderConfig::default()).unwrap();
+        let after = std::fs::read(dir.join("bin.txt")).unwrap();
+        assert_eq!(after, raw, "invalid-UTF-8 file must be byte-for-byte intact");
     }
 
     #[test]
