@@ -619,6 +619,35 @@ pub fn ruleset_from_config(root: Option<&Path>) -> PiiRuleSet {
     PiiRuleSet::new()
 }
 
+/// The active PII gate config's path RELATIVE to `work_dir`, iff it resolves to a
+/// file that lives INSIDE `work_dir`. Resolution mirrors [`ruleset_from_config`]
+/// exactly: the `TERMINUS_PII_CONFIG`-pointed file when set, else
+/// `<work_dir>/pii-gate.toml`.
+///
+/// The gate config catalogs the REAL private matcher values (`extra_terms` /
+/// `extra_patterns`) the gate maps, and the gate deliberately excludes its own
+/// config from scanning ([`default_excluded_files`]) — so committing it into the
+/// approved mirror would ship those raw values into public history even though the
+/// gate reports 0 residuals. GHMR-03 uses this to drop the gate config from the
+/// mirror tree, exactly as it drops the placeholder config. Returns `None` when the
+/// config is env-pointed OUTSIDE the work dir (nothing in the tree to drop) or
+/// absent.
+pub fn active_gate_config_relpath(work_dir: &Path) -> Option<String> {
+    let resolved = if let Ok(p) = std::env::var("TERMINUS_PII_CONFIG") {
+        if p.is_empty() {
+            return None;
+        }
+        Path::new(&p).canonicalize().ok()?
+    } else {
+        work_dir.join("pii-gate.toml").canonicalize().ok()?
+    };
+    let work_canon = work_dir.canonicalize().ok()?;
+    resolved
+        .strip_prefix(&work_canon)
+        .ok()
+        .map(|r| r.to_string_lossy().into_owned())
+}
+
 /// Render a list of tree violations as a stable machine-readable JSON report.
 pub fn violations_to_json(violations: &[TreeViolation]) -> serde_json::Value {
     serde_json::json!({

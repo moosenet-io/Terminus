@@ -39,7 +39,7 @@ use std::process::{Command, Stdio};
 use serde_json::json;
 
 use crate::error::ToolError;
-use crate::github::pii::TreeViolation;
+use crate::github::pii::{active_gate_config_relpath, TreeViolation};
 
 use super::sweep::{active_config_relpath, sweep_tree_with_resolved_config, SweepReport};
 
@@ -285,21 +285,28 @@ impl MirrorWorkDir {
     /// exception: with no HEAD yet, an initial `--allow-empty` commit is made so a
     /// valid empty mirror snapshot still gets a committable, taggable HEAD.
     fn commit_swept(&self, internal_sha: &str, sweep: &SweepReport) -> Result<bool, ToolError> {
-        // PUBLICATION SAFETY: never commit the active placeholder config into the
-        // approved mirror tree. The sweep exempts it from rewriting + residual
-        // detection precisely because it legitimately holds the REAL infra values
-        // its matchers map — so an otherwise-clean tree would still ship those raw
-        // literals inside the config file, leaking PII into public history under an
-        // approved tag. It is a build-time input, not mirror content; drop it from
-        // the work dir before staging (a no-op if it resolves outside the work dir,
-        // e.g. an env-pointed config). It is re-synced from source next run, so its
-        // removal here is never destructive.
-        if let Some(rel) = active_config_relpath(&self.work_dir) {
-            let cfg_path = self.work_dir.join(&rel);
+        // PUBLICATION SAFETY: never commit a matcher-config file into the approved
+        // mirror tree. Both the placeholder config (`mirror-placeholders.toml`) and
+        // the PII gate config (`pii-gate.toml`) exist to CATALOG the real infra
+        // values the sweep/gate map, and each surface deliberately excludes its own
+        // config from rewriting + residual detection. An otherwise-clean tree would
+        // therefore still ship those raw literals inside the config file, leaking
+        // PII into public history under an approved tag. They are build-time inputs,
+        // not mirror content; drop each (that resolves INSIDE the work dir) before
+        // staging. A no-op when env-pointed outside the work dir; re-synced from
+        // source next run, so removal here is never destructive. Only these two
+        // catalog files are dropped — other gate-excluded files (source, Cargo.lock,
+        // images) are legitimate mirror content and must still ship.
+        let mirror_excluded: Vec<String> = active_config_relpath(&self.work_dir)
+            .into_iter()
+            .chain(active_gate_config_relpath(&self.work_dir))
+            .collect();
+        for rel in &mirror_excluded {
+            let cfg_path = self.work_dir.join(rel);
             if cfg_path.exists() {
                 std::fs::remove_file(&cfg_path).map_err(|e| {
                     ToolError::Execution(format!(
-                        "failed excluding active placeholder config {} from mirror commit: {e}",
+                        "failed excluding matcher config {} from mirror commit: {e}",
                         cfg_path.display()
                     ))
                 })?;
@@ -1028,6 +1035,48 @@ mod tests {
         });
         // Source repo keeps its config untouched.
         assert!(src.join("mirror-placeholders.toml").exists(), "source config untouched");
+
+        cleanup(&[&src, &wd]);
+    }
+
+    // ── active PII gate config is NOT committed into the approved tree ────────
+    // (codex round 2 P1) `pii-gate.toml` catalogs the REAL private matcher values
+    // (extra_terms/extra_patterns) and the gate excludes its OWN config from
+    // scanning, so — like the placeholder config — it must be dropped from the
+    // approved mirror tree or its raw literals ship into public history.
+    #[test]
+    #[serial]
+    fn active_gate_config_excluded_from_approved_commit() {
+        clear_env();
+        // Internal main ships a pii-gate.toml cataloging a private internal host,
+        // plus otherwise-clean content.
+        let src = init_source(&[
+            ("pii-gate.toml", "extra_terms = [\"acme-internal-vault-01\"]\n"),
+            ("doc.txt", "nothing sensitive here\n"),
+        ]);
+        let wd = unique("wd");
+        let mgr = MirrorWorkDir::new("Terminus", &src, &wd);
+        let report = mgr.run().unwrap();
+
+        assert!(report.committed && report.tagged, "clean tree approved");
+        assert!(report.residual_violations.is_empty());
+
+        let tracked = run_git(&wd, &["ls-tree", "-r", "--name-only", "HEAD"]).unwrap();
+        assert!(
+            !tracked.lines().any(|l| l.trim() == "pii-gate.toml"),
+            "gate config must not be in the approved tree: {tracked}"
+        );
+        assert!(!wd.join("pii-gate.toml").exists(), "gate config dropped from the work dir");
+        // The private term never reaches any committed blob.
+        let head_grep = run_git(&wd, &["grep", "-l", "acme-internal-vault-01", "HEAD"]);
+        assert!(
+            head_grep.is_err() || head_grep.as_deref().map(str::trim).unwrap_or("").is_empty(),
+            "no committed file may contain the raw gate-config term: {head_grep:?}"
+        );
+        // The clean doc IS still mirrored (a gate-excluded matcher config is dropped,
+        // ordinary content is not).
+        assert!(tracked.lines().any(|l| l.trim() == "doc.txt"), "doc mirrored");
+        assert!(src.join("pii-gate.toml").exists(), "source gate config untouched");
 
         cleanup(&[&src, &wd]);
     }
