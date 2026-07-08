@@ -920,6 +920,30 @@ impl PlaneClient {
             })
     }
 
+    /// Attach one or more work items to a module via Plane CE's
+    /// `module-issues` endpoint (POST `{"issues": [<uuid>, …]}`). This is the
+    /// single shared path used by `plane_add_issue_to_module` and by the
+    /// optional `module_id` field on `plane_create_work_item` /
+    /// `plane_update_work_item`, so the link semantics live in exactly one
+    /// place. `project_id` must already be a resolved UUID; `module_id` and the
+    /// issue ids are Plane UUIDs. Returns the parsed error body on non-2xx.
+    async fn add_issues_to_module(
+        &self,
+        project_id: &str,
+        module_id: &str,
+        issue_ids: &[String],
+    ) -> Result<(), ToolError> {
+        let url = format!(
+            "{}projects/{project_id}/modules/{module_id}/module-issues/",
+            self.workspace_url()
+        );
+        let body = json!({ "issues": issue_ids });
+        debug!("add_issues_to_module POST {url}");
+        let resp = self.post_with_retry(&url, &body).await?;
+        PlaneClient::check_status(resp).await?;
+        Ok(())
+    }
+
     /// Execute a GET request with rate-limit retry (max 3 attempts, 3 s delay).
     async fn get_with_retry(&self, url: &str) -> Result<Response, ToolError> {
         self.request_with_retry(|| {
@@ -1344,7 +1368,8 @@ impl RustTool for PlaneCreateWorkItem {
                 "priority": { "type": "string", "description": "Priority: urgent/high/medium/low/none" },
                 "due_date": { "type": "string", "description": "Due date (YYYY-MM-DD)" },
                 "parent": { "type": "string", "description": "Parent issue UUID (for sub-issues)" },
-                "label_ids": { "type": "array", "items": { "type": "string" }, "description": "Label UUIDs to attach" }
+                "label_ids": { "type": "array", "items": { "type": "string" }, "description": "Label UUIDs to attach" },
+                "module_id": { "type": "string", "description": "Optional module UUID to add the new issue to (linked via the module-issues endpoint after creation)" }
             },
             "required": ["project_id", "name"]
         }))
@@ -1382,7 +1407,16 @@ impl RustTool for PlaneCreateWorkItem {
         let resp = PlaneClient::check_status(resp).await?;
         let i: Issue = resp.json().await
             .map_err(|e| ToolError::Http(format!("Failed to parse created issue: {e}")))?;
-        Ok(format!("Created issue: {name}\nID: {id}\nSequence: #{seq}",
+        // Optional module link: Plane CE's issue-create endpoint does not accept
+        // a module field, so membership is established as a second call against
+        // the module-issues endpoint once the issue id is known.
+        let module_note = if let Some(module_id) = args.get("module_id").and_then(|v| v.as_str()) {
+            client.add_issues_to_module(&project_id, module_id, &[i.id.clone()]).await?;
+            format!("\nModule: {module_id}")
+        } else {
+            String::new()
+        };
+        Ok(format!("Created issue: {name}\nID: {id}\nSequence: #{seq}{module_note}",
             name = i.name, id = i.id,
             seq = i.sequence_id.unwrap_or(0)))
     }
@@ -1410,7 +1444,8 @@ impl RustTool for PlaneUpdateWorkItem {
                 "priority": { "type": "string", "description": "New priority" },
                 "due_date": { "type": "string", "description": "New due date (YYYY-MM-DD)" },
                 "parent": { "type": "string", "description": "New parent issue UUID" },
-                "label_ids": { "type": "array", "items": { "type": "string" }, "description": "New label UUIDs (replaces existing set)" }
+                "label_ids": { "type": "array", "items": { "type": "string" }, "description": "New label UUIDs (replaces existing set)" },
+                "module_id": { "type": "string", "description": "Optional module UUID to add this issue to (linked via the module-issues endpoint)" }
             },
             "required": ["project_id", "issue_id"]
         }))
@@ -1420,6 +1455,7 @@ impl RustTool for PlaneUpdateWorkItem {
         let project_id_arg = require_arg!(args, "project_id", as_str);
         let project_id = client.resolve_project_id(project_id_arg).await?;
         let issue_id = require_arg!(args, "issue_id", as_str);
+        let module_id = args.get("module_id").and_then(|v| v.as_str());
         let mut body = json!({});
         for field in &["name", "description_html", "state", "priority", "due_date", "parent"] {
             if let Some(v) = args.get(field).and_then(|v| v.as_str()) {
@@ -1429,19 +1465,36 @@ impl RustTool for PlaneUpdateWorkItem {
         if let Some(v) = args.get("label_ids").and_then(|v| v.as_array()) {
             body["label_ids"] = json!(v);
         }
-        if body.as_object().map(|m| m.is_empty()).unwrap_or(true) {
+        // A module-only update is valid: setting `module_id` alone with no other
+        // field is an intentional "move this issue into that module" operation,
+        // so an empty PATCH body is only an error when no module link is set either.
+        let has_fields = !body.as_object().map(|m| m.is_empty()).unwrap_or(true);
+        if !has_fields && module_id.is_none() {
             return Err(ToolError::InvalidArgument("No fields to update provided".into()));
         }
-        let url = format!(
-            "{}projects/{project_id}/issues/{issue_id}/",
-            client.workspace_url()
-        );
-        debug!("plane_update_work_item PATCH {url}");
-        let resp = client.patch_with_retry(&url, &body).await?;
-        let resp = PlaneClient::check_status(resp).await?;
-        let i: Issue = resp.json().await
-            .map_err(|e| ToolError::Http(format!("Failed to parse updated issue: {e}")))?;
-        Ok(format!("Updated issue: {name} (ID: {id})", name = i.name, id = i.id))
+        let mut updated_name = None;
+        if has_fields {
+            let url = format!(
+                "{}projects/{project_id}/issues/{issue_id}/",
+                client.workspace_url()
+            );
+            debug!("plane_update_work_item PATCH {url}");
+            let resp = client.patch_with_retry(&url, &body).await?;
+            let resp = PlaneClient::check_status(resp).await?;
+            let i: Issue = resp.json().await
+                .map_err(|e| ToolError::Http(format!("Failed to parse updated issue: {e}")))?;
+            updated_name = Some(i.name);
+        }
+        // Optional module link (module membership is a separate endpoint, not an
+        // issue field), applied after any field PATCH.
+        let module_note = if let Some(module_id) = module_id {
+            client.add_issues_to_module(&project_id, module_id, &[issue_id.to_string()]).await?;
+            format!(" — added to module {module_id}")
+        } else {
+            String::new()
+        };
+        let name = updated_name.as_deref().unwrap_or("(unchanged)");
+        Ok(format!("Updated issue: {name} (ID: {issue_id}){module_note}"))
     }
 }
 
@@ -1794,6 +1847,182 @@ impl RustTool for PlaneListModuleIssues {
             out.push_str(&format!("  [{id}] {name}\n", id = i.id, name = i.name));
         }
         Ok(out)
+    }
+}
+
+// ─── 14a. plane_update_module ────────────────────────────────────────────────
+
+pub struct PlaneUpdateModule {
+    client: Arc<PlaneClient>,
+}
+
+#[async_trait]
+impl RustTool for PlaneUpdateModule {
+    fn name(&self) -> &str { "plane_update_module" }
+    fn description(&self) -> &str { "Update fields (name, description, status, dates) on an existing Plane module" }
+    fn parameters(&self) -> Value {
+        with_identity_param(json!({
+            "type": "object",
+            "properties": {
+                "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
+                "module_id": { "type": "string", "description": "Module UUID to update" },
+                "name": { "type": "string", "description": "New module name" },
+                "description": { "type": "string", "description": "New module description" },
+                "status": { "type": "string", "description": "New module status (e.g. backlog/planned/in-progress/paused/completed/cancelled)" },
+                "start_date": { "type": "string", "description": "New start date (YYYY-MM-DD)" },
+                "target_date": { "type": "string", "description": "New target date (YYYY-MM-DD)" }
+            },
+            "required": ["project_id", "module_id"]
+        }))
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let client = self.client.resolve_identity(&args)?;
+        let project_id_arg = require_arg!(args, "project_id", as_str);
+        let project_id = client.resolve_project_id(project_id_arg).await?;
+        let module_id = require_arg!(args, "module_id", as_str);
+        let mut body = json!({});
+        for field in &["name", "description", "status", "start_date", "target_date"] {
+            if let Some(v) = args.get(field).and_then(|v| v.as_str()) {
+                body[*field] = json!(v);
+            }
+        }
+        if body.as_object().map(|m| m.is_empty()).unwrap_or(true) {
+            return Err(ToolError::InvalidArgument("No fields to update provided".into()));
+        }
+        let url = format!(
+            "{}projects/{project_id}/modules/{module_id}/",
+            client.workspace_url()
+        );
+        debug!("plane_update_module PATCH {url}");
+        let resp = client.patch_with_retry(&url, &body).await?;
+        let resp = PlaneClient::check_status(resp).await?;
+        let m: Module = resp.json().await
+            .map_err(|e| ToolError::Http(format!("Failed to parse updated module: {e}")))?;
+        Ok(format!("Updated module: {name} (ID: {id})", name = m.name, id = m.id))
+    }
+}
+
+// ─── 14b. plane_delete_module ────────────────────────────────────────────────
+
+pub struct PlaneDeleteModule {
+    client: Arc<PlaneClient>,
+}
+
+#[async_trait]
+impl RustTool for PlaneDeleteModule {
+    fn name(&self) -> &str { "plane_delete_module" }
+    fn description(&self) -> &str { "Delete a Plane module permanently (does not delete the issues it contained)" }
+    fn parameters(&self) -> Value {
+        with_identity_param(json!({
+            "type": "object",
+            "properties": {
+                "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
+                "module_id": { "type": "string", "description": "Module UUID to delete" }
+            },
+            "required": ["project_id", "module_id"]
+        }))
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let client = self.client.resolve_identity(&args)?;
+        let project_id_arg = require_arg!(args, "project_id", as_str);
+        let project_id = client.resolve_project_id(project_id_arg).await?;
+        let module_id = require_arg!(args, "module_id", as_str);
+        let url = format!(
+            "{}projects/{project_id}/modules/{module_id}/",
+            client.workspace_url()
+        );
+        debug!("plane_delete_module DELETE {url}");
+        let resp = client.delete_with_retry(&url).await?;
+        PlaneClient::check_status(resp).await?;
+        Ok(format!("Deleted module {module_id}"))
+    }
+}
+
+// ─── 14c. plane_add_issue_to_module ──────────────────────────────────────────
+
+pub struct PlaneAddIssueToModule {
+    client: Arc<PlaneClient>,
+}
+
+#[async_trait]
+impl RustTool for PlaneAddIssueToModule {
+    fn name(&self) -> &str { "plane_add_issue_to_module" }
+    fn description(&self) -> &str { "Add one or more work items to a Plane module (module-issues membership)" }
+    fn parameters(&self) -> Value {
+        with_identity_param(json!({
+            "type": "object",
+            "properties": {
+                "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
+                "module_id": { "type": "string", "description": "Module UUID" },
+                "issue_id": { "type": "string", "description": "A single issue UUID to add (use this or issue_ids)" },
+                "issue_ids": { "type": "array", "items": { "type": "string" }, "description": "Multiple issue UUIDs to add (use this or issue_id)" }
+            },
+            "required": ["project_id", "module_id"]
+        }))
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let client = self.client.resolve_identity(&args)?;
+        let project_id_arg = require_arg!(args, "project_id", as_str);
+        let project_id = client.resolve_project_id(project_id_arg).await?;
+        let module_id = require_arg!(args, "module_id", as_str);
+        // Accept either a single `issue_id` or an `issue_ids` array; the union
+        // of both is de-duplicated implicitly by callers passing one form.
+        let mut ids: Vec<String> = Vec::new();
+        if let Some(v) = args.get("issue_id").and_then(|v| v.as_str()) {
+            ids.push(v.to_string());
+        }
+        if let Some(arr) = args.get("issue_ids").and_then(|v| v.as_array()) {
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    ids.push(s.to_string());
+                }
+            }
+        }
+        if ids.is_empty() {
+            return Err(ToolError::InvalidArgument(
+                "Provide issue_id or a non-empty issue_ids array".into(),
+            ));
+        }
+        client.add_issues_to_module(&project_id, module_id, &ids).await?;
+        Ok(format!("Added {n} issue(s) to module {module_id}", n = ids.len()))
+    }
+}
+
+// ─── 14d. plane_remove_issue_from_module ─────────────────────────────────────
+
+pub struct PlaneRemoveIssueFromModule {
+    client: Arc<PlaneClient>,
+}
+
+#[async_trait]
+impl RustTool for PlaneRemoveIssueFromModule {
+    fn name(&self) -> &str { "plane_remove_issue_from_module" }
+    fn description(&self) -> &str { "Remove a work item from a Plane module (keeps the item in the project)" }
+    fn parameters(&self) -> Value {
+        with_identity_param(json!({
+            "type": "object",
+            "properties": {
+                "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
+                "module_id": { "type": "string", "description": "Module UUID" },
+                "issue_id": { "type": "string", "description": "Issue UUID to remove from the module" }
+            },
+            "required": ["project_id", "module_id", "issue_id"]
+        }))
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let client = self.client.resolve_identity(&args)?;
+        let project_id_arg = require_arg!(args, "project_id", as_str);
+        let project_id = client.resolve_project_id(project_id_arg).await?;
+        let module_id = require_arg!(args, "module_id", as_str);
+        let issue_id = require_arg!(args, "issue_id", as_str);
+        let url = format!(
+            "{}projects/{project_id}/modules/{module_id}/module-issues/{issue_id}/",
+            client.workspace_url()
+        );
+        debug!("plane_remove_issue_from_module DELETE {url}");
+        let resp = client.delete_with_retry(&url).await?;
+        PlaneClient::check_status(resp).await?;
+        Ok(format!("Removed issue {issue_id} from module {module_id}"))
     }
 }
 
@@ -2628,6 +2857,10 @@ pub fn register(registry: &mut ToolRegistry) {
         Box::new(PlaneListModules { client: client.clone() }),
         Box::new(PlaneGetModule { client: client.clone() }),
         Box::new(PlaneCreateModule { client: client.clone() }),
+        Box::new(PlaneUpdateModule { client: client.clone() }),
+        Box::new(PlaneDeleteModule { client: client.clone() }),
+        Box::new(PlaneAddIssueToModule { client: client.clone() }),
+        Box::new(PlaneRemoveIssueFromModule { client: client.clone() }),
         Box::new(PlaneListModuleIssues { client: client.clone() }),
         Box::new(PlaneListStates { client: client.clone() }),
         Box::new(PlaneListLabels { client: client.clone() }),
@@ -2891,6 +3124,230 @@ mod tests {
         mock.assert();
     }
 
+    // ── S102: module management (update / delete / issue↔module link) ─────────
+
+    #[tokio::test]
+    async fn test_update_module_patch_request() {
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::PATCH)
+                .path("/api/v1/workspaces/testws/projects/p1/modules/m1/")
+                .json_body(json!({"name": "Renamed", "status": "completed"}));
+            then.status(200).json_body(json!({
+                "id": "m1", "name": "Renamed",
+                "project": "p1", "workspace": "testws", "status": "completed"
+            }));
+        });
+        let client = mock_client(&server);
+        let tool = PlaneUpdateModule { client };
+        let result = tool.execute(json!({
+            "project_id": "p1", "module_id": "m1",
+            "name": "Renamed", "status": "completed"
+        })).await.unwrap();
+        assert!(result.contains("Renamed"), "{result}");
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_update_module_no_fields_returns_error() {
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        let client = mock_client(&server);
+        let tool = PlaneUpdateModule { client };
+        let result = tool.execute(json!({"project_id": "p1", "module_id": "m1"})).await;
+        assert!(matches!(result.unwrap_err(), ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn test_delete_module_delete_request() {
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE)
+                .path("/api/v1/workspaces/testws/projects/p1/modules/m1/");
+            then.status(204);
+        });
+        let client = mock_client(&server);
+        let tool = PlaneDeleteModule { client };
+        let result = tool.execute(json!({"project_id": "p1", "module_id": "m1"})).await.unwrap();
+        assert!(result.contains("m1"), "{result}");
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_add_issue_to_module_single() {
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/workspaces/testws/projects/p1/modules/m1/module-issues/")
+                .json_body(json!({"issues": ["i1"]}));
+            then.status(201).json_body(json!([{"id": "mi1", "module": "m1", "issue": "i1"}]));
+        });
+        let client = mock_client(&server);
+        let tool = PlaneAddIssueToModule { client };
+        let result = tool.execute(json!({
+            "project_id": "p1", "module_id": "m1", "issue_id": "i1"
+        })).await.unwrap();
+        assert!(result.contains("1 issue"), "{result}");
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_add_issue_to_module_multiple() {
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/workspaces/testws/projects/p1/modules/m1/module-issues/")
+                .json_body(json!({"issues": ["i1", "i2"]}));
+            then.status(201).json_body(json!([]));
+        });
+        let client = mock_client(&server);
+        let tool = PlaneAddIssueToModule { client };
+        let result = tool.execute(json!({
+            "project_id": "p1", "module_id": "m1", "issue_ids": ["i1", "i2"]
+        })).await.unwrap();
+        assert!(result.contains("2 issue"), "{result}");
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_add_issue_to_module_missing_ids_returns_error() {
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        let client = mock_client(&server);
+        let tool = PlaneAddIssueToModule { client };
+        let result = tool.execute(json!({"project_id": "p1", "module_id": "m1"})).await;
+        assert!(matches!(result.unwrap_err(), ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn test_remove_issue_from_module_delete_request() {
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE)
+                .path("/api/v1/workspaces/testws/projects/p1/modules/m1/module-issues/i1/");
+            then.status(204);
+        });
+        let client = mock_client(&server);
+        let tool = PlaneRemoveIssueFromModule { client };
+        let result = tool.execute(json!({
+            "project_id": "p1", "module_id": "m1", "issue_id": "i1"
+        })).await.unwrap();
+        assert!(result.contains("i1") && result.contains("m1"), "{result}");
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_create_work_item_with_module_id_links_module() {
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        let create_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/workspaces/testws/projects/p1/issues/");
+            then.status(201).json_body(json!({
+                "id": "issue-7", "name": "Task", "project": "p1",
+                "workspace": "testws", "sequence_id": 7
+            }));
+        });
+        // module_id triggers a second POST to link the created issue.
+        let link_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/workspaces/testws/projects/p1/modules/m1/module-issues/")
+                .json_body(json!({"issues": ["issue-7"]}));
+            then.status(201).json_body(json!([{"id": "mi", "module": "m1", "issue": "issue-7"}]));
+        });
+        let client = mock_client(&server);
+        let tool = PlaneCreateWorkItem { client };
+        let result = tool.execute(json!({
+            "project_id": "p1", "name": "Task", "module_id": "m1"
+        })).await.unwrap();
+        assert!(result.contains("Task") && result.contains("m1"), "{result}");
+        create_mock.assert();
+        link_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_update_work_item_module_only_link_no_patch() {
+        // module_id alone (no other field) must NOT error and must NOT PATCH the
+        // issue — it only links via module-issues.
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        let patch_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::PATCH)
+                .path("/api/v1/workspaces/testws/projects/p1/issues/i1/");
+            then.status(200).json_body(json!({"id": "i1", "name": "x", "project": "p1", "workspace": "testws"}));
+        });
+        let link_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/workspaces/testws/projects/p1/modules/m1/module-issues/")
+                .json_body(json!({"issues": ["i1"]}));
+            then.status(201).json_body(json!([]));
+        });
+        let client = mock_client(&server);
+        let tool = PlaneUpdateWorkItem { client };
+        let result = tool.execute(json!({
+            "project_id": "p1", "issue_id": "i1", "module_id": "m1"
+        })).await.unwrap();
+        assert!(result.contains("m1"), "{result}");
+        assert_eq!(patch_mock.hits(), 0, "module-only update must not PATCH the issue");
+        link_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_module_write_tool_acts_as_explicit_identity() {
+        // Identity dispatch (S94) must be honored by the new module tools too:
+        // both the project-resolution GET and the module PATCH carry the acting
+        // identity's token, never the default and never a leaked one.
+        let server = MockServer::start();
+        let projects_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/workspaces/testws/projects/")
+                .header("x-api-key", "token-axon");
+            then.status(200).json_body(json!([
+                {"id": "p1", "name": "Mock", "identifier": "p1", "network": 0}
+            ]));
+        });
+        let patch_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::PATCH)
+                .path("/api/v1/workspaces/testws/projects/p1/modules/m1/")
+                .header("x-api-key", "token-axon");
+            then.status(200).json_body(json!({
+                "id": "m1", "name": "R", "project": "p1", "workspace": "testws"
+            }));
+        });
+        let client = multi_identity_client(&server);
+        let tool = PlaneUpdateModule { client };
+        let _ = tool.execute(json!({
+            "project_id": "p1", "module_id": "m1", "name": "R", "identity": "axon"
+        })).await.unwrap();
+        projects_mock.assert();
+        patch_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_module_tools_expose_optional_identity_param() {
+        let server = MockServer::start();
+        let client = multi_identity_client(&server);
+        let update = PlaneUpdateModule { client: client.clone() };
+        let delete = PlaneDeleteModule { client: client.clone() };
+        let add = PlaneAddIssueToModule { client: client.clone() };
+        let remove = PlaneRemoveIssueFromModule { client: client.clone() };
+        for schema in [update.parameters(), delete.parameters(), add.parameters(), remove.parameters()] {
+            assert_eq!(
+                schema["properties"]["identity"]["type"], "string",
+                "every new module tool must expose a string `identity` param: {schema}"
+            );
+            let required = schema["required"].as_array().unwrap();
+            assert!(
+                !required.iter().any(|r| r == "identity"),
+                "`identity` must remain optional: {schema}"
+            );
+        }
+    }
+
     // ── 429 retry logic ───────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -2966,7 +3423,7 @@ mod tests {
         assert!(result.contains("No projects"), "{result}");
     }
 
-    // ── register() populates 28 core plane tools + 5 prefix sub-tools ─────────
+    // ── register() populates 32 core plane tools + 5 prefix sub-tools ─────────
 
     #[test]
     fn test_register_all_plane_tools() {
@@ -2974,9 +3431,11 @@ mod tests {
         // (not required for registration, only for execution)
         let mut registry = ToolRegistry::new();
         register(&mut registry);
-        // 28 core plane_* tools + 5 plane_prefix_* sub-tools (see prefix::register).
-        assert_eq!(registry.len(), 33,
-            "Expected 33 plane tools (28 core + 5 prefix), got {}", registry.len());
+        // 32 core plane_* tools + 5 plane_prefix_* sub-tools (see prefix::register).
+        // S102 added 4 module-management tools (update/delete module,
+        // add/remove issue↔module) to the prior 28 core tools.
+        assert_eq!(registry.len(), 37,
+            "Expected 37 plane tools (32 core + 5 prefix), got {}", registry.len());
     }
 
     #[test]

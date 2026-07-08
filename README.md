@@ -115,7 +115,7 @@ their tools:
 | `openhands` | Agentic coding runs (guarded) | `openhands_run_task`, `openhands_list_conversations`, `openhands_get_status` |
 | `gitea` | Gitea git forge | `gitea_create_repo`, `gitea_read_file`, `gitea_create_pr`, `gitea_merge_pr` |
 | `github` | GitHub | `github_create_repo`, `github_list_repos`, `github_push_repo` |
-| `plane` | Plane work management | `plane_create_work_item`, `plane_list_issues_by_state`, `plane_update_work_item`, `plane_list_identities`, `plane_whoami`, `plane_prefix_check`, `plane_prefix_register` |
+| `plane` | Plane work management | `plane_create_work_item`, `plane_list_issues_by_state`, `plane_update_work_item`, `plane_create_module`, `plane_update_module`, `plane_delete_module`, `plane_add_issue_to_module`, `plane_remove_issue_from_module`, `plane_list_identities`, `plane_whoami`, `plane_prefix_check`, `plane_prefix_register` |
 | `nexus` | Inter-agent inbox | `nexus_send`, `nexus_check`, `nexus_read`, `nexus_ack`, `nexus_history` |
 | `axon` | Work-queue agent control | `axon_submit`, `axon_status`, `axon_list`, `axon_cancel` |
 | `vector` | Dev-loop agent control | `vector_submit`, `vector_status`, `vector_queue_depth`, `vector_halt` |
@@ -214,6 +214,35 @@ never token values**, matching `plane_whoami`'s safety posture. Call it to see
 which identity you can act as before creating or assigning Plane work. With no
 named identities configured it returns an empty list plus an explanatory note
 (not an error).
+
+## Plane module management
+
+Modules (sprint/epic groupings inside a project) have a full CRUD + membership
+surface, all through the single sanctioned Plane tool path:
+
+| Tool | Endpoint | Purpose |
+| --- | --- | --- |
+| `plane_list_modules` | `GET …/modules/` | List a project's modules |
+| `plane_get_module` | `GET …/modules/{id}/` | One module's detail |
+| `plane_create_module` | `POST …/modules/` | Create a module |
+| `plane_update_module` | `PATCH …/modules/{id}/` | Rename / re-describe / re-status / re-date |
+| `plane_delete_module` | `DELETE …/modules/{id}/` | Delete the module (its issues stay in the project) |
+| `plane_list_module_issues` | `GET …/modules/{id}/module-issues/` | Issues currently in a module |
+| `plane_add_issue_to_module` | `POST …/modules/{id}/module-issues/` | Add one (`issue_id`) or many (`issue_ids`) issues |
+| `plane_remove_issue_from_module` | `DELETE …/modules/{id}/module-issues/{issue}/` | Remove an issue from a module (issue kept in project) |
+
+Issue↔module membership is a **separate endpoint** in Plane CE, not an issue
+field, so `plane_create_work_item` and `plane_update_work_item` each accept an
+optional **`module_id`**: the issue is created/updated first, then linked to the
+module via `module-issues` in the same call. On `plane_update_work_item`,
+`module_id` may be supplied **alone** (no other field) as a pure "move this issue
+into that module" operation — that skips the issue PATCH entirely and only links.
+
+Every one of these tools honors the optional `identity` argument (the same
+`PLANE_PAT_<NAME>` dispatch as the rest of the Plane CRUD surface), and
+`plane_delete_module` follows the same posture as `plane_delete_work_item` — a
+direct destructive call, guarded (if at all) by the registry's guarded-tool layer,
+not re-implemented in the tool.
 
 ## Plane request pacing & caching (optional shared Redis)
 
