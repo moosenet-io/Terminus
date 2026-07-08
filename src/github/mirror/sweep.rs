@@ -511,6 +511,26 @@ fn active_config_skip(work_dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The active placeholder config's path RELATIVE to `work_dir`, iff it resolves
+/// to a file that lives INSIDE `work_dir`.
+///
+/// The active config (`mirror-placeholders.toml`, or a `TERMINUS_MIRROR_PLACEHOLDERS`-
+/// pointed file) legitimately holds the *real* infra values its matchers map, and
+/// the sweep deliberately exempts it from rewriting AND from residual detection
+/// (see [`sweep_tree`]). It is a build-time input, never public-mirror content —
+/// so GHMR-03 must EXCLUDE it from the approved/committed mirror tree, otherwise an
+/// otherwise-clean approval would ship those raw values in the config file and leak
+/// PII into public history.
+///
+/// Returns `None` when the config is env-pointed OUTSIDE the work dir (nothing in
+/// the tree to exclude) or does not exist. Only the exact resolved path is
+/// reported; a same-named file nested elsewhere is ordinary content and is NOT
+/// returned here (it is swept/scanned normally).
+pub fn active_config_relpath(work_dir: &Path) -> Option<String> {
+    let skip = active_config_skip(work_dir);
+    skip_relative_names(work_dir, &skip).into_iter().next()
+}
+
 /// The `skip` config paths (canonical) expressed relative to `work_dir`, so they
 /// can be matched against `TreeViolation.file` (a work-dir-relative path) to drop
 /// the active config from residual results.

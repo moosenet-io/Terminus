@@ -41,7 +41,7 @@ use serde_json::json;
 use crate::error::ToolError;
 use crate::github::pii::TreeViolation;
 
-use super::sweep::{sweep_tree_with_resolved_config, SweepReport};
+use super::sweep::{active_config_relpath, sweep_tree_with_resolved_config, SweepReport};
 
 /// Environment variable naming the parent directory that holds every repo's
 /// clean mirror work dir (one subdirectory per repo). The per-repo work dir is
@@ -285,6 +285,27 @@ impl MirrorWorkDir {
     /// exception: with no HEAD yet, an initial `--allow-empty` commit is made so a
     /// valid empty mirror snapshot still gets a committable, taggable HEAD.
     fn commit_swept(&self, internal_sha: &str, sweep: &SweepReport) -> Result<bool, ToolError> {
+        // PUBLICATION SAFETY: never commit the active placeholder config into the
+        // approved mirror tree. The sweep exempts it from rewriting + residual
+        // detection precisely because it legitimately holds the REAL infra values
+        // its matchers map — so an otherwise-clean tree would still ship those raw
+        // literals inside the config file, leaking PII into public history under an
+        // approved tag. It is a build-time input, not mirror content; drop it from
+        // the work dir before staging (a no-op if it resolves outside the work dir,
+        // e.g. an env-pointed config). It is re-synced from source next run, so its
+        // removal here is never destructive.
+        if let Some(rel) = active_config_relpath(&self.work_dir) {
+            let cfg_path = self.work_dir.join(&rel);
+            if cfg_path.exists() {
+                std::fs::remove_file(&cfg_path).map_err(|e| {
+                    ToolError::Execution(format!(
+                        "failed excluding active placeholder config {} from mirror commit: {e}",
+                        cfg_path.display()
+                    ))
+                })?;
+            }
+        }
+
         run_git(&self.work_dir, &["add", "-A"])?;
 
         // `--cached --quiet` exits non-zero iff there is something staged.
@@ -950,6 +971,63 @@ mod tests {
         // Source repo was never modified by the cleaning.
         let src_cfg = std::fs::read_to_string(src.join("config.txt")).unwrap();
         assert!(src_cfg.contains("ghp_"), "source repo untouched"); // pii-test-fixture
+
+        cleanup(&[&src, &wd]);
+    }
+
+    // ── active placeholder config is NOT committed into the approved tree ─────
+    // (codex P1) The sweep exempts the active `mirror-placeholders.toml` from
+    // rewriting + residual because it legitimately holds the REAL infra values its
+    // matchers map. If that exempt file were committed, an otherwise-clean approval
+    // would ship those raw literals in public history. It must be dropped from the
+    // approved mirror tree.
+    #[test]
+    #[serial]
+    fn active_placeholder_config_excluded_from_approved_commit() {
+        clear_env();
+        // Internal main ships a placeholder config whose matcher embeds a real LAN
+        // IP, plus a doc that references it (mechanically swept to the token).
+        let src = init_source(&[
+            (
+                "mirror-placeholders.toml",
+                "[[placeholder]]\npattern = '10\\.10\\.0\\.9'\ntoken = \"<REDACTED_LAN_IP>\"\n",
+            ),
+            ("doc.txt", "reaches <internal-ip> internally\n"), // pii-test-fixture
+        ]);
+        let wd = unique("wd");
+        let mgr = MirrorWorkDir::new("Terminus", &src, &wd);
+        let report = mgr.run().unwrap();
+
+        // Tree is clean (config exempt, doc swept) → committed + tagged.
+        assert!(report.committed, "clean tree committed");
+        assert!(report.tagged, "clean tree tagged");
+        assert!(report.residual_violations.is_empty());
+
+        // The config file must NOT be present in the committed work-dir tree (nor
+        // on disk after the run) — otherwise its raw private-IP matcher would ship.
+        let tracked = run_git(&wd, &["ls-tree", "-r", "--name-only", "HEAD"]).unwrap();
+        assert!(
+            !tracked.lines().any(|l| l.trim() == "mirror-placeholders.toml"),
+            "active placeholder config must not be in the approved tree: {tracked}"
+        );
+        assert!(
+            !wd.join("mirror-placeholders.toml").exists(),
+            "config dropped from the work dir on commit"
+        );
+        // The real value never reaches the committed HEAD via any file.
+        let head_blob = run_git(&wd, &["grep", "-l", "<internal-ip>", "HEAD"]); // pii-test-fixture
+        assert!(
+            head_blob.is_err() || head_blob.as_deref().map(str::trim).unwrap_or("").is_empty(),
+            "no committed file may contain the raw config value: {head_blob:?}"
+        );
+        // The doc IS mirrored, with its IP swept to the token.
+        assert!(tracked.lines().any(|l| l.trim() == "doc.txt"), "doc mirrored");
+        assert!(!wd.join("doc.txt").exists() || {
+            let d = std::fs::read_to_string(wd.join("doc.txt")).unwrap();
+            !d.contains("<internal-ip>") // pii-test-fixture
+        });
+        // Source repo keeps its config untouched.
+        assert!(src.join("mirror-placeholders.toml").exists(), "source config untouched");
 
         cleanup(&[&src, &wd]);
     }
