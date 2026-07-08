@@ -1,0 +1,62 @@
+# mirror-placeholders.toml — schema for the GHMR-02 mechanical sweep
+# =====================================================================
+#
+# The mechanical mirror sweep (`src/github/mirror/sweep.rs`) rewrites
+# deterministically-fixable PII in a work-dir copy of internal `main` into inert
+# placeholder tokens, and reports everything the GHMR-01 PII gate STILL flags as
+# residual (needs judgment cleaning, GHMR-05).
+#
+# Resolution order (see `placeholder_config_from`):
+#   1. $TERMINUS_MIRROR_PLACEHOLDERS — a path to this file, or
+#   2. <repo-root>/mirror-placeholders.toml, else
+#   3. built-in generic rules only.
+#
+# Copy this file to `mirror-placeholders.toml` and fill in your org-specific
+# terms. Keep REAL infra values ONLY here (config), never in source.
+#
+# ---------------------------------------------------------------------
+# Built-in generic mechanical rules (always on unless include_builtins = false).
+# These are GENERIC shapes, defined in source, with NO org-specific literal:
+#   private_ip     RFC-1918 ranges (192.168/16, 10/8, 172.16-31)  -> <REDACTED_LAN_IP_n>
+#   container_id   CT### container ids                            -> <REDACTED_CONTAINER_n>
+#   local_url      localhost/127.0.0.1/0.0.0.0:PORT               -> <REDACTED_LOCAL_URL_n>
+#   internal_path  known internal filesystem path prefixes        -> <REDACTED_PATH_n>
+#
+# Secrets (API keys, JWTs, private keys, quoted secrets, phone numbers) are
+# DELIBERATELY NOT mechanical: a raw secret cannot be meaningfully placeholdered,
+# so it is left in place and reported as residual for judgment cleaning.
+# ---------------------------------------------------------------------
+
+# Set false to run ONLY the config `[[placeholder]]` rules below (default: true).
+include_builtins = true
+
+# --- Config rules: org-specific terms → placeholder tokens ------------
+# Each rule has a `token` (the inert placeholder) plus exactly one matcher:
+#   term    = a literal, matched case-insensitively on a word boundary
+#   pattern = a raw regex (use for structured host/URL/domain shapes)
+# Optional:
+#   distinct = true   mint a distinct suffixed token per distinct real value
+#                     (e.g. two hostnames -> <REDACTED_HOST_1>, <REDACTED_HOST_2>);
+#                     default false (all matches -> the same token)
+#   kind     = a label shown in the rewrite report (default "config")
+#
+# A token MUST be inert — it must not itself match any rule, or the sweep would
+# not be idempotent. `<REDACTED_...>` style tokens are safe.
+
+# Example: your org / product name.
+[[placeholder]]
+term  = "AcmeCorp"          # example only — replace with your real org name
+token = "<ORG>"
+kind  = "org"
+
+# Example: an internal domain suffix.
+[[placeholder]]
+pattern = 'acme\.internal'  # example only — replace with your real internal domain
+token   = "<REDACTED-SECRET>"
+
+# Example: named infra hosts, kept distinct so the mapping is not lossy.
+[[placeholder]]
+pattern  = '\b(?:buildhost|gpuhost|vaulthost)\b'  # example only
+token    = "<REDACTED-SECRET>"
+distinct = true
+kind     = "hostname"
