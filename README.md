@@ -215,6 +215,27 @@ which identity you can act as before creating or assigning Plane work. With no
 named identities configured it returns an empty list plus an explanatory note
 (not an error).
 
+### Which identity to use (assignment convention)
+
+Create or transition a work item under the identity of whoever should **act on**
+it, mapped from a spec item's `Agent:` field, rather than always using the
+ingesting agent's own identity:
+
+- `PLANE_PAT_CLAUDE` — this agent's own identity; use for all Claude-driven
+  create/update/comment work unless explicitly assigning to another actor.
+- `PLANE_PAT_HARMONY` — work intended for Harmony's own dispatch to pick up.
+- `PLANE_PAT_MOOSE` — operator human-action items.
+- `PLANE_PAT_GEMINI` / `PLANE_PAT_CODEX` — work intended for those agent types.
+- `PLANE_PAT_LUMINA` — the assistant persona (the default identity).
+
+Select the identity through the tool's own mechanism (`plane_list_identities` /
+the client's `for_identity()` resolution) — **never** fetch a `PLANE_PAT_*`
+value yourself to make a raw API call; that is a second, unsanctioned access
+path. This convention is the same one carried normatively by the moosenet-spec
+build pipeline (v3.8, "Plane access — ONE sanctioned path" / "Plane identity
+convention"); this section is the Terminus-local, discoverable copy of it, not a
+competing source of truth.
+
 ## Plane module management
 
 Modules (sprint/epic groupings inside a project) have a full CRUD + membership
@@ -271,27 +292,6 @@ Cache keys are namespaced and hashed (`plane:cache:<hash>` of active-token + URL
 so no token material lands in Redis keys and one identity never sees another's
 cached response. TLS is not required on the internal LAN; a `rediss://` URL door
 is documented in `Cargo.toml`.
-
-### Which identity to use (assignment convention)
-
-Create or transition a work item under the identity of whoever should **act on**
-it, mapped from a spec item's `Agent:` field, rather than always using the
-ingesting agent's own identity:
-
-- `PLANE_PAT_CLAUDE` — this agent's own identity; use for all Claude-driven
-  create/update/comment work unless explicitly assigning to another actor.
-- `PLANE_PAT_HARMONY` — work intended for Harmony's own dispatch to pick up.
-- `PLANE_PAT_MOOSE` — operator human-action items.
-- `PLANE_PAT_GEMINI` / `PLANE_PAT_CODEX` — work intended for those agent types.
-- `PLANE_PAT_LUMINA` — reserved for the assistant persona (future use).
-
-Select the identity through the tool's own mechanism (`plane_list_identities` /
-the client's `for_identity()` resolution) — **never** fetch a `PLANE_PAT_*`
-value yourself to make a raw API call; that is a second, unsanctioned access
-path. This convention is the same one carried normatively by the moosenet-spec
-build pipeline (v3.8, "Plane access — ONE sanctioned path" / "Plane identity
-convention"); this section is the Terminus-local, discoverable copy of it, not a
-competing source of truth.
 
 ## Prefix registry (`plane_prefix_*`)
 
