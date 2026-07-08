@@ -29,19 +29,171 @@
 //! - Individual tool modules (plane, gitea, github, ansible, network, ...)
 //!   each read their own env vars directly (e.g. `PLANE_API_URL`,
 //!   `GITEA_TOKEN`) exactly as they already do for every other Terminus bin —
-//!   this binary does no special config wiring beyond the two vars above.
-//!   Secrets are expected to be sourced from the fleet's secret store into
-//!   the process environment by the systemd unit's `ExecStartPre` (see
-//!   deploy docs), not committed to any file.
+//!   this binary does no special config wiring beyond the two vars above,
+//!   PLUS the startup-time <secret-manager> fetch described below. // pii-test-fixture
+//!
+//! ## Downstream secrets: fetched fresh from <secret-manager> at every startup (PSEC-02) // pii-test-fixture
+//! Before building the tool registry, `main()` calls
+//! `fetch_downstream_secrets_from_infisical()`, which — when
+//! `INFISICAL_URL`/`INFISICAL_CLIENT_ID`/`INFISICAL_CLIENT_SECRET` (the one
+//! bootstrap credential) are configured — fetches this process's downstream
+//! secrets (`PLANE_API_URL`, `PLANE_API_KEY`, `PLANE_WORKSPACE`, `GITEA_URL`,
+//! `GITEA_TOKEN`, `GITHUB_TOKEN`) fresh from <secret-manager> and sets them into the // pii-test-fixture
+//! process environment via `std::env::set_var`, so every `X::from_env()`-style
+//! tool client constructed afterward transparently picks up the CURRENT
+//! value — never a stale one left behind in a static `.env` after a rotation.
+//! This closes a real recurring operational problem: a rotated Plane
+//! credential previously required someone to notice, manually re-run a
+//! fetch-and-splice script, and restart the service before writes worked
+//! again; now the next restart alone picks up the rotation.
+//!
+//! If <secret-manager> isn't configured, or the fetch fails for any reason (auth // pii-test-fixture
+//! failure, network error, unreachable host), this falls back cleanly to
+//! whatever is already in the process environment (e.g. a static `.env`
+//! loaded by the systemd unit's `EnvironmentFile=`) — it is NEVER a hard
+//! startup failure. No secret value is ever logged; only counts and (for
+//! missing keys) key names are logged.
+//!
+//! Reuses the <secret-manager> Universal Auth client already shared with the guarded // pii-test-fixture
+//! `infisical_get_secrets_batch` MCP tool (`src/<secret-manager>/mod.rs`, // pii-test-fixture
+//! `fetch_secrets_batch()`, extracted in PSEC-01) — this startup call has no
+//! approval gate of its own, since it's a process-internal bootstrap action,
+//! not an operator-invoked one; the gate stays exactly where it was, on the
+//! MCP tool surface only.
+//!
+//! Additional env vars for this fetch (all optional; the fetch is skipped —
+//! falling back to the static environment — unless the bootstrap credential
+//! AND the project id are both present):
+//! - `TERMINUS_PERSONAL_INFISICAL_PROJECT_ID` — the <secret-manager> workspace/project // pii-test-fixture
+//!   ID to fetch from. No default (deliberately not hardcoded — see S1).
+//! - `TERMINUS_PERSONAL_INFISICAL_ENVIRONMENT` — <secret-manager> environment slug. // pii-test-fixture
+//!   Defaults to `prod`.
+//! - `TERMINUS_PERSONAL_INFISICAL_SECRET_PATH` — folder path within the
+//!   environment. Defaults to `/`.
 
 use std::sync::Arc;
 
+use terminus_rs::<secret-manager>::{fetch_secrets_batch, InfisicalConfig}; // pii-test-fixture
 use terminus_rs::mcp_server::{build_router, McpServerState};
 use terminus_rs::registry::{register_personal, ToolRegistry};
+
+/// The downstream secret keys this process needs, fetched from <secret-manager> at // pii-test-fixture
+/// startup rather than relying on a static `.env`. Deliberately a fixed,
+/// named allowlist (not "set every key found at this path") so a shared
+/// <secret-manager> path containing secrets for other services never leaks into // pii-test-fixture
+/// this process's environment.
+const DOWNSTREAM_SECRET_KEYS: &[&str] = &[
+    "PLANE_API_URL",
+    "PLANE_API_KEY",
+    "PLANE_WORKSPACE",
+    "GITEA_URL",
+    "GITEA_TOKEN",
+    "GITHUB_TOKEN",
+];
+
+/// Outcome of the startup <secret-manager> fetch attempt, for the caller (`main()`) // pii-test-fixture
+/// to log and for tests to assert on directly rather than scraping log text.
+#[derive(Debug, PartialEq, Eq)]
+enum SecretFetchOutcome {
+    /// `INFISICAL_URL`/`INFISICAL_CLIENT_ID`/`INFISICAL_CLIENT_SECRET` or the
+    /// project-id env var aren't configured — nothing was attempted.
+    NotConfigured,
+    /// The fetch succeeded; `count` downstream keys were found and set into
+    /// the process environment. `missing` names (never values) any of
+    /// `DOWNSTREAM_SECRET_KEYS` that <secret-manager> didn't have at this path. // pii-test-fixture
+    Fetched { count: usize, missing: Vec<String> },
+    /// The fetch was attempted but failed (auth failure, network error,
+    /// malformed response, ...) — callers fall back to whatever is already
+    /// in the process environment. `reason` is a display-formatted
+    /// `ToolError` — never a secret value.
+    Failed { reason: String },
+}
+
+/// Attempt to fetch this process's downstream secrets (Plane/Gitea/GitHub
+/// credentials) fresh from <secret-manager> and set them into the process // pii-test-fixture
+/// environment, so every `X::from_env()`-style client constructed after this
+/// point sees the current value. Falls back cleanly (never panics, never
+/// hangs, never hard-fails startup) when <secret-manager> isn't configured or the // pii-test-fixture
+/// fetch fails — see the module doc comment above for the full rationale.
+///
+/// Never logs or echoes any fetched secret value — only counts and, for
+/// missing keys, key NAMES (never values).
+async fn fetch_downstream_secrets_from_infisical() -> SecretFetchOutcome {
+    let config = InfisicalConfig::from_env();
+    if !config.is_configured() {
+        return SecretFetchOutcome::NotConfigured;
+    }
+
+    let project_id = match std::env::var("TERMINUS_PERSONAL_INFISICAL_PROJECT_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        Some(p) => p,
+        None => return SecretFetchOutcome::NotConfigured,
+    };
+    let environment = std::env::var("TERMINUS_PERSONAL_INFISICAL_ENVIRONMENT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "prod".to_string());
+    let secret_path = std::env::var("TERMINUS_PERSONAL_INFISICAL_SECRET_PATH")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/".to_string());
+
+    match fetch_secrets_batch(&config, &project_id, &environment, &secret_path).await {
+        Ok(fetched) => {
+            let mut count = 0usize;
+            let mut missing = Vec::new();
+            for key in DOWNSTREAM_SECRET_KEYS {
+                match fetched.get(*key) {
+                    Some(value) => {
+                        std::env::set_var(key, value);
+                        count += 1;
+                    }
+                    None => missing.push((*key).to_string()),
+                }
+            }
+            SecretFetchOutcome::Fetched { count, missing }
+        }
+        Err(e) => SecretFetchOutcome::Failed {
+            reason: e.to_string(),
+        },
+    }
+}
+
+/// Log the outcome of the startup <secret-manager> fetch. Split out from // pii-test-fixture
+/// `fetch_downstream_secrets_from_infisical()` so tests can assert on the
+/// returned enum directly without needing to capture tracing output.
+fn log_secret_fetch_outcome(outcome: &SecretFetchOutcome) {
+    match outcome {
+        SecretFetchOutcome::NotConfigured => {
+            tracing::info!(
+                "terminus_personal: <secret-manager> not configured (INFISICAL_URL/INFISICAL_CLIENT_ID/INFISICAL_CLIENT_SECRET/TERMINUS_PERSONAL_INFISICAL_PROJECT_ID unset), using static environment" // pii-test-fixture
+            );
+        }
+        SecretFetchOutcome::Fetched { count, missing } => {
+            tracing::info!("terminus_personal: fetched {count} secrets from <secret-manager>"); // pii-test-fixture
+            if !missing.is_empty() {
+                tracing::warn!(
+                    "terminus_personal: <secret-manager> fetch did not include: {} (using static environment for these, if present)", // pii-test-fixture
+                    missing.join(", ")
+                );
+            }
+        }
+        SecretFetchOutcome::Failed { reason } => {
+            tracing::warn!(
+                "terminus_personal: <secret-manager> fetch failed ({reason}), falling back to static environment" // pii-test-fixture
+            );
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
     terminus_rs::intake::init_tracing();
+
+    let secret_outcome = fetch_downstream_secrets_from_infisical().await;
+    log_secret_fetch_outcome(&secret_outcome);
 
     let port: u16 = std::env::var("TERMINUS_PERSONAL_PORT")
         .ok()
@@ -82,4 +234,255 @@ async fn main() {
     axum::serve(listener, router)
         .await
         .expect("terminus_personal: server error");
+}
+
+// ── Tests (PSEC-02): startup-time <secret-manager> secret fetch ─────────────────────── // pii-test-fixture
+//
+// All env-var mutation is process-global, so every test clears the full set
+// of relevant keys before AND after itself and runs #[serial] (matching the
+// convention already used by src/<secret-manager>/mod.rs's own tests). // pii-test-fixture
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use httpmock::prelude::*;
+    use serde_json::json;
+    use serial_test::serial;
+    use std::sync::{Arc, Mutex};
+
+    const ALL_TEST_ENV_KEYS: &[&str] = &[
+        "INFISICAL_URL",
+        "INFISICAL_CLIENT_ID",
+        "INFISICAL_CLIENT_SECRET",
+        "TERMINUS_PERSONAL_INFISICAL_PROJECT_ID",
+        "TERMINUS_PERSONAL_INFISICAL_ENVIRONMENT",
+        "TERMINUS_PERSONAL_INFISICAL_SECRET_PATH",
+        "PLANE_API_URL",
+        "PLANE_API_KEY",
+        "PLANE_WORKSPACE",
+        "GITEA_URL",
+        "GITEA_TOKEN",
+        "GITHUB_TOKEN",
+    ];
+
+    fn clear_all_env() {
+        for key in ALL_TEST_ENV_KEYS {
+            std::env::remove_var(key);
+        }
+    }
+
+    fn configure_bootstrap(base_url: &str) {
+        std::env::set_var("INFISICAL_URL", base_url);
+        std::env::set_var("INFISICAL_CLIENT_ID", "cid"); // pii-test-fixture
+        std::env::set_var("INFISICAL_CLIENT_SECRET", "csecret"); // pii-test-fixture
+        std::env::set_var("TERMINUS_PERSONAL_INFISICAL_PROJECT_ID", "proj1");
+    }
+
+    fn mock_login(server: &MockServer, token: &str) {
+        server.mock(|when, then| {
+            when.method(POST).path("/api/v1/auth/universal-auth/login");
+            then.status(200).json_body(json!({ "accessToken": token }));
+        });
+    }
+
+    // ── NotConfigured: proceeds cleanly, no crash, no hang, no env mutation ──────
+
+    #[tokio::test]
+    #[serial]
+    async fn not_configured_falls_back_without_crash_or_env_mutation() {
+        clear_all_env();
+
+        let outcome = fetch_downstream_secrets_from_infisical().await;
+        assert_eq!(outcome, SecretFetchOutcome::NotConfigured);
+        for key in DOWNSTREAM_SECRET_KEYS {
+            assert!(std::env::var(key).is_err(), "{key} should not have been set");
+        }
+
+        clear_all_env();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bootstrap_configured_but_project_id_missing_is_not_configured() {
+        clear_all_env();
+        // Deliberately never dialed: TERMINUS_PERSONAL_INFISICAL_PROJECT_ID is
+        // left unset, so fetch_downstream_secrets_from_infisical() must return
+        // before attempting any network call.
+        std::env::set_var("INFISICAL_URL", "http://127.0.0.1:1");
+        std::env::set_var("INFISICAL_CLIENT_ID", "cid"); // pii-test-fixture
+        std::env::set_var("INFISICAL_CLIENT_SECRET", "csecret"); // pii-test-fixture
+
+        let outcome = fetch_downstream_secrets_from_infisical().await;
+        assert_eq!(outcome, SecretFetchOutcome::NotConfigured);
+
+        clear_all_env();
+    }
+
+    // ── Fetched: values actually set into the process environment ───────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn fetched_secrets_are_set_into_process_environment() {
+        clear_all_env();
+        let server = MockServer::start();
+        mock_login(&server, "tok-1"); // pii-test-fixture
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v3/secrets/raw");
+            then.status(200).json_body(json!({
+                "secrets": [
+                    { "secretKey": "PLANE_API_KEY", "secretValue": "fixture-plane-key" },
+                    { "secretKey": "GITEA_TOKEN", "secretValue": "fixture-gitea-token" }
+                ]
+            }));
+        });
+        configure_bootstrap(&server.base_url());
+
+        let outcome = fetch_downstream_secrets_from_infisical().await;
+        match outcome {
+            SecretFetchOutcome::Fetched { count, missing } => {
+                assert_eq!(count, 2);
+                assert_eq!(missing.len(), DOWNSTREAM_SECRET_KEYS.len() - 2);
+            }
+            other => panic!("expected Fetched, got {other:?}"),
+        }
+        assert_eq!(
+            std::env::var("PLANE_API_KEY").unwrap(),
+            "fixture-plane-key"
+        );
+        assert_eq!(
+            std::env::var("GITEA_TOKEN").unwrap(),
+            "fixture-gitea-token"
+        );
+
+        clear_all_env();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn empty_infisical_response_is_fetched_zero_not_an_error() {
+        clear_all_env();
+        let server = MockServer::start();
+        mock_login(&server, "tok-2"); // pii-test-fixture
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v3/secrets/raw");
+            then.status(200).json_body(json!({ "secrets": [] }));
+        });
+        configure_bootstrap(&server.base_url());
+
+        let outcome = fetch_downstream_secrets_from_infisical().await;
+        match outcome {
+            SecretFetchOutcome::Fetched { count, missing } => {
+                assert_eq!(count, 0);
+                assert_eq!(missing.len(), DOWNSTREAM_SECRET_KEYS.len());
+            }
+            other => panic!("expected Fetched{{count:0,..}}, got {other:?}"),
+        }
+
+        clear_all_env();
+    }
+
+    // ── Failed: falls back cleanly, never panics, never touches existing env ────
+
+    #[tokio::test]
+    #[serial]
+    async fn fetch_failure_falls_back_cleanly_without_panic() {
+        clear_all_env();
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/api/v1/auth/universal-auth/login");
+            then.status(401).json_body(json!({ "message": "invalid credentials" }));
+        });
+        configure_bootstrap(&server.base_url());
+        // Pre-seed a static fallback value to prove a failed fetch leaves it
+        // untouched (this is what a static `.env`-sourced value would look
+        // like in production).
+        std::env::set_var("GITEA_TOKEN", "static-fallback-token"); // pii-test-fixture
+
+        let outcome = fetch_downstream_secrets_from_infisical().await;
+        assert!(matches!(outcome, SecretFetchOutcome::Failed { .. }));
+        assert_eq!(
+            std::env::var("GITEA_TOKEN").unwrap(),
+            "static-fallback-token"
+        );
+
+        clear_all_env();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn malformed_infisical_response_falls_back_cleanly() {
+        clear_all_env();
+        let server = MockServer::start();
+        mock_login(&server, "tok-3"); // pii-test-fixture
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v3/secrets/raw");
+            then.status(200).body("not valid json {{{");
+        });
+        configure_bootstrap(&server.base_url());
+
+        let outcome = fetch_downstream_secrets_from_infisical().await;
+        assert!(matches!(outcome, SecretFetchOutcome::Failed { .. }));
+        for key in DOWNSTREAM_SECRET_KEYS {
+            assert!(std::env::var(key).is_err());
+        }
+
+        clear_all_env();
+    }
+
+    // ── Never logs a secret value ────────────────────────────────────────────────
+
+    #[derive(Clone)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn no_secret_value_ever_appears_in_log_output() {
+        clear_all_env();
+        let server = MockServer::start();
+        mock_login(&server, "tok-4"); // pii-test-fixture
+        const SECRET_MARKER: &str = "TOTALLY-SECRET-FIXTURE-VALUE-DO-NOT-LOG"; // pii-test-fixture
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v3/secrets/raw");
+            then.status(200).json_body(json!({
+                "secrets": [
+                    { "secretKey": "PLANE_API_KEY", "secretValue": SECRET_MARKER }
+                ]
+            }));
+        });
+        configure_bootstrap(&server.base_url());
+
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let buf_for_writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || SharedBuf(buf_for_writer.clone()))
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let guard = tracing::dispatcher::set_default(&dispatch);
+
+        let outcome = fetch_downstream_secrets_from_infisical().await;
+        log_secret_fetch_outcome(&outcome);
+
+        drop(guard);
+
+        let captured = String::from_utf8(buf.lock().unwrap().clone()).unwrap_or_default();
+        assert!(
+            !captured.contains(SECRET_MARKER),
+            "log output must never contain a fetched secret value, got: {captured}"
+        );
+        // Sanity: the fetch actually happened (otherwise this test would pass
+        // trivially by never logging anything at all).
+        assert!(matches!(outcome, SecretFetchOutcome::Fetched { count: 1, .. }));
+
+        clear_all_env();
+    }
 }
