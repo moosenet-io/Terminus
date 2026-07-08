@@ -251,7 +251,11 @@ pub fn scan_for_pii(content: &str) -> Vec<PiiViolation> {
 /// line/category. Logs a one-line audit record (pass/fail + count) without
 /// ever logging secret values.
 pub fn pii_gate(content: &str) -> Result<(), ToolError> {
-    let violations = scan_for_pii(content);
+    // Use the full authoritative rule set (built-in patterns + extension rules +
+    // any `TERMINUS_PII_CONFIG` terms/patterns), so the mandatory write gate has
+    // the same coverage the tree-sweep hook advertises — JWTs, PEM keys, cloud
+    // keys, quoted secrets, and configured terms are all blocked here too.
+    let violations = ruleset_from_config(None).scan_content(content);
 
     if violations.is_empty() {
         tracing::info!(target: "github.pii", outcome = "pass", count = 0, "PII gate scan passed");
@@ -582,6 +586,24 @@ fn strip_fixture_lines(content: &str) -> String {
 /// Convenience: sweep a tree with the default rule set.
 pub fn scan_tree(root: &Path) -> Vec<TreeViolation> {
     PiiRuleSet::new().scan_tree(root)
+}
+
+/// Resolve a rule set from configuration: `TERMINUS_PII_CONFIG` (a config file
+/// path) takes precedence; otherwise `<root>/pii-gate.toml` when `root` is
+/// given; otherwise the built-in default rule set. This is the single place
+/// every surface (runtime write gate, the `github_pii_scan` tool, and the
+/// pre-push hook binary) loads config, so they stay in lockstep.
+pub fn ruleset_from_config(root: Option<&Path>) -> PiiRuleSet {
+    if let Ok(p) = std::env::var("TERMINUS_PII_CONFIG") {
+        return PiiRuleSet::from_config_file(Path::new(&p));
+    }
+    if let Some(r) = root {
+        let cfg = r.join("pii-gate.toml");
+        if cfg.is_file() {
+            return PiiRuleSet::from_config_file(&cfg);
+        }
+    }
+    PiiRuleSet::new()
 }
 
 /// Render a list of tree violations as a stable machine-readable JSON report.

@@ -41,7 +41,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use terminus_rs::github::pii::{violations_to_json, PiiRuleSet, TreeViolation};
+use terminus_rs::github::pii::{ruleset_from_config, violations_to_json, PiiRuleSet, TreeViolation};
 
 const NULL_SHA: &str = "0000000000000000000000000000000000000000"; // pii-test-fixture
 
@@ -103,15 +103,8 @@ fn repo_root() -> PathBuf {
 }
 
 fn load_ruleset(root: &Path) -> PiiRuleSet {
-    if let Ok(p) = std::env::var("TERMINUS_PII_CONFIG") {
-        return PiiRuleSet::from_config_file(Path::new(&p));
-    }
-    let cfg = root.join("pii-gate.toml");
-    if cfg.is_file() {
-        PiiRuleSet::from_config_file(&cfg)
-    } else {
-        PiiRuleSet::new()
-    }
+    // Shared resolver: TERMINUS_PII_CONFIG, else <root>/pii-gate.toml, else default.
+    ruleset_from_config(Some(root))
 }
 
 /// Scan a set of `(rev, path)` blobs, honoring exclusions and the
@@ -147,7 +140,10 @@ fn scan_blobs(root: &Path, rs: &PiiRuleSet, entries: &[(String, String)]) -> Vec
     out
 }
 
-/// Enumerate `(tip_sha, path)` blobs being pushed. Fails closed on any git error.
+/// Enumerate `(commit_sha, path)` blobs being pushed, across EVERY commit the
+/// push introduces — not just the tip — so a secret added in an intermediate
+/// commit and removed by the tip is still caught (it would otherwise enter
+/// permanent remote history). Fails closed on any git error.
 fn prepush_entries(root: &Path) -> Result<Vec<(String, String)>, String> {
     let mut stdin = String::new();
     std::io::stdin()
@@ -164,15 +160,36 @@ fn prepush_entries(root: &Path) -> Result<Vec<(String, String)>, String> {
         if local_sha == NULL_SHA {
             continue; // branch deletion — nothing to scan
         }
-        let files = if remote_sha == NULL_SHA {
-            // New branch on the remote: no merge base known, so scan every file
-            // in the pushed tip tree (fail-safe, over-inclusive).
-            names(&git(root, &["ls-tree", "-r", "--name-only", local_sha])?)
+
+        // Commits introduced by this push. For an existing remote ref that is an
+        // exact range; for a new branch, everything reachable from the tip that
+        // is not already on a remote-tracking branch (fail-safe: if no remotes
+        // are tracked this scans full history rather than nothing).
+        let commits = if remote_sha == NULL_SHA {
+            let listed = names(&git(root, &["rev-list", local_sha, "--not", "--remotes"])?);
+            if listed.is_empty() {
+                // Nothing unique found — fall back to the full tip tree so we
+                // never scan an empty set on a first push.
+                for f in names(&git(root, &["ls-tree", "-r", "--name-only", local_sha])?) {
+                    entries.push((local_sha.to_string(), f));
+                }
+                continue;
+            }
+            listed
         } else {
-            names(&git(root, &["diff", "--name-only", remote_sha, local_sha])?)
+            names(&git(root, &["rev-list", &format!("{remote_sha}..{local_sha}")])?)
         };
-        for f in files {
-            entries.push((local_sha.to_string(), f));
+
+        for c in commits {
+            // Files changed by commit `c` (vs its parent; `--root` so the repo's
+            // first commit lists all its files). Blob is read at `c` in scan_blobs.
+            let files = names(&git(
+                root,
+                &["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", &c],
+            )?);
+            for f in files {
+                entries.push((c.clone(), f));
+            }
         }
     }
     entries.sort();

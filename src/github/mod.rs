@@ -39,7 +39,7 @@ use crate::tool::RustTool;
 
 pub mod pii;
 use pii::pii_gate;
-use pii::{scan_tree, violations_to_json, PiiRuleSet};
+use pii::{ruleset_from_config, violations_to_json};
 
 const DEFAULT_ORG: &str = "moosenet-io";
 const DEFAULT_GITEA_URL: &str = "https://gitea.example.com";
@@ -191,9 +191,9 @@ impl RustTool for GitHubPiiScan {
         let tree_path = args.get("tree_path").and_then(Value::as_str);
         match (content, tree_path) {
             (Some(text), _) => {
-                // Use the full rule set (built-ins + extension rules) so content
-                // mode and tree mode report identical coverage.
-                let vs = PiiRuleSet::new().scan_content(text);
+                // Full rule set incl. any TERMINUS_PII_CONFIG, so the diagnostic
+                // matches what the configured write gate / hook would block.
+                let vs = ruleset_from_config(None).scan_content(text);
                 Ok(json!({
                     "clean": vs.is_empty(),
                     "count": vs.len(),
@@ -206,7 +206,8 @@ impl RustTool for GitHubPiiScan {
                 .to_string())
             }
             (None, Some(path)) => {
-                let vs = scan_tree(std::path::Path::new(path));
+                let root = std::path::Path::new(path);
+                let vs = ruleset_from_config(Some(root)).scan_tree(root);
                 Ok(violations_to_json(&vs).to_string())
             }
             (None, None) => Err(ToolError::InvalidArgument(
