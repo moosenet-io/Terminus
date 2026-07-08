@@ -10,9 +10,12 @@
 //!
 //! Patterns are compiled once via [`OnceLock`] and reused.
 
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use regex::Regex;
+use serde::Deserialize;
 
 use crate::error::ToolError;
 
@@ -135,88 +138,111 @@ fn byte_ceil(s: &str, mut i: usize) -> usize {
     i
 }
 
+/// Scan a single `line` (1-based `line_no`) for every built-in PII pattern plus
+/// any `extra` rules, appending one [`PiiViolation`] per match into `out`.
+///
+/// This is the single source of truth for per-line PII detection — both the
+/// legacy [`scan_for_pii`] content gate and the tree-sweep [`PiiRuleSet`] route
+/// through here, so their coverage can never silently diverge.
+fn scan_line(
+    p: &Patterns,
+    extra: &[(String, Regex)],
+    allow: &[String],
+    line_no: usize,
+    line: &str,
+    out: &mut Vec<PiiViolation>,
+) {
+    let mut push = |category: &str, matched: &str| {
+        out.push(PiiViolation {
+            line: line_no,
+            category: category.to_string(),
+            context: redact(matched),
+        });
+    };
+
+    for m in p.private_ip.find_iter(line) {
+        push("private_ip", m.as_str());
+    }
+    for m in p.container_id.find_iter(line) {
+        push("container_id", m.as_str());
+    }
+    for m in p.internal_host.find_iter(line) {
+        push("internal_hostname", m.as_str());
+    }
+    for m in p.internal_domain.find_iter(line) {
+        push("internal_domain", m.as_str());
+    }
+    for m in p.api_key.find_iter(line) {
+        push("api_key", m.as_str());
+    }
+    for m in p.internal_path.find_iter(line) {
+        push("internal_path", m.as_str());
+    }
+    for m in p.local_url.find_iter(line) {
+        push("local_url", m.as_str());
+    }
+    for m in p.infra_service.find_iter(line) {
+        push("infra_service", m.as_str());
+    }
+
+    // Emails: allow-list exception for author attribution.
+    for m in p.email.find_iter(line) {
+        if !email_is_allowed(m.as_str(), allow) {
+            push("email", m.as_str());
+        }
+    }
+
+    // UUIDs first: context-dependent — only block near an infra-secret cue.
+    // Collect their spans so the phone matcher (digit/hyphen runs) does not
+    // misfire on a UUID's hex+hyphen segments and flag a bare UUID as a phone.
+    let uuid_spans: Vec<(usize, usize)> =
+        p.uuid.find_iter(line).map(|m| (m.start(), m.end())).collect();
+    for &(s, e) in &uuid_spans {
+        if uuid_is_sensitive(line, s, e) {
+            push("uuid_secret", &line[s..e]);
+        }
+    }
+
+    // Bare ISO dates (YYYY-MM-DD, e.g. an MCP protocolVersion string) share
+    // the phone regex's digit/hyphen shape. Collect their spans so the
+    // phone matcher can skip them the same way it already skips UUIDs.
+    let date_spans: Vec<(usize, usize)> =
+        p.date_like.find_iter(line).map(|m| (m.start(), m.end())).collect();
+
+    // Phone: skip any match that overlaps a UUID span (those digits belong
+    // to the UUID, not a phone number) or a bare ISO-date span.
+    for m in p.phone.find_iter(line) {
+        let overlaps_uuid = uuid_spans
+            .iter()
+            .any(|&(s, e)| m.start() < e && s < m.end());
+        let overlaps_date = date_spans
+            .iter()
+            .any(|&(s, e)| m.start() < e && s < m.end());
+        if !overlaps_uuid && !overlaps_date {
+            push("phone", m.as_str());
+        }
+    }
+
+    // Extension / config-supplied rules (JWTs, SSH keys, cloud keys, quoted
+    // secrets, and any repo-configured terms). Kept out of the built-in set so
+    // the legacy content gate's behavior is unchanged; the tree-sweep ruleset
+    // opts in via its `extra` list.
+    for (kind, re) in extra {
+        for m in re.find_iter(line) {
+            push(kind, m.as_str());
+        }
+    }
+}
+
 /// Scan `content` for PII, returning one [`PiiViolation`] per match with a
 /// 1-based line number and a redacted context snippet.
 pub fn scan_for_pii(content: &str) -> Vec<PiiViolation> {
     let p = patterns();
     let allow = allowed_authors();
     let mut out = Vec::new();
-
     for (idx, line) in content.lines().enumerate() {
-        let line_no = idx + 1;
-
-        let mut push = |category: &str, matched: &str| {
-            out.push(PiiViolation {
-                line: line_no,
-                category: category.to_string(),
-                context: redact(matched),
-            });
-        };
-
-        for m in p.private_ip.find_iter(line) {
-            push("private_ip", m.as_str());
-        }
-        for m in p.container_id.find_iter(line) {
-            push("container_id", m.as_str());
-        }
-        for m in p.internal_host.find_iter(line) {
-            push("internal_hostname", m.as_str());
-        }
-        for m in p.internal_domain.find_iter(line) {
-            push("internal_domain", m.as_str());
-        }
-        for m in p.api_key.find_iter(line) {
-            push("api_key", m.as_str());
-        }
-        for m in p.internal_path.find_iter(line) {
-            push("internal_path", m.as_str());
-        }
-        for m in p.local_url.find_iter(line) {
-            push("local_url", m.as_str());
-        }
-        for m in p.infra_service.find_iter(line) {
-            push("infra_service", m.as_str());
-        }
-
-        // Emails: allow-list exception for author attribution.
-        for m in p.email.find_iter(line) {
-            if !email_is_allowed(m.as_str(), &allow) {
-                push("email", m.as_str());
-            }
-        }
-
-        // UUIDs first: context-dependent — only block near an infra-secret cue.
-        // Collect their spans so the phone matcher (digit/hyphen runs) does not
-        // misfire on a UUID's hex+hyphen segments and flag a bare UUID as a phone.
-        let uuid_spans: Vec<(usize, usize)> =
-            p.uuid.find_iter(line).map(|m| (m.start(), m.end())).collect();
-        for &(s, e) in &uuid_spans {
-            if uuid_is_sensitive(line, s, e) {
-                push("uuid_secret", &line[s..e]);
-            }
-        }
-
-        // Bare ISO dates (YYYY-MM-DD, e.g. an MCP protocolVersion string) share
-        // the phone regex's digit/hyphen shape. Collect their spans so the
-        // phone matcher can skip them the same way it already skips UUIDs.
-        let date_spans: Vec<(usize, usize)> =
-            p.date_like.find_iter(line).map(|m| (m.start(), m.end())).collect();
-
-        // Phone: skip any match that overlaps a UUID span (those digits belong
-        // to the UUID, not a phone number) or a bare ISO-date span.
-        for m in p.phone.find_iter(line) {
-            let overlaps_uuid = uuid_spans
-                .iter()
-                .any(|&(s, e)| m.start() < e && s < m.end());
-            let overlaps_date = date_spans
-                .iter()
-                .any(|&(s, e)| m.start() < e && s < m.end());
-            if !overlaps_uuid && !overlaps_date {
-                push("phone", m.as_str());
-            }
-        }
+        scan_line(p, &[], &allow, idx + 1, line, &mut out);
     }
-
     out
 }
 
@@ -225,7 +251,15 @@ pub fn scan_for_pii(content: &str) -> Vec<PiiViolation> {
 /// line/category. Logs a one-line audit record (pass/fail + count) without
 /// ever logging secret values.
 pub fn pii_gate(content: &str) -> Result<(), ToolError> {
-    let violations = scan_for_pii(content);
+    // Full authoritative rule set: built-in patterns + extension rules (JWTs,
+    // PEM keys, cloud keys, quoted secrets) + any `TERMINUS_PII_CONFIG` terms.
+    // The runtime service has no repo checkout, so config comes from the
+    // `TERMINUS_PII_CONFIG` env var (the service's materialized config), not a
+    // repo-root `pii-gate.toml` — hence `None`. The pre-push hook, which DOES
+    // run in a checkout, additionally reads `<root>/pii-gate.toml`; both surfaces
+    // resolve through the same `ruleset_from_config` so the built-in + extension
+    // coverage is identical and any env-configured terms apply everywhere.
+    let violations = ruleset_from_config(None).scan_content(content);
 
     if violations.is_empty() {
         tracing::info!(target: "github.pii", outcome = "pass", count = 0, "PII gate scan passed");
@@ -249,6 +283,345 @@ pub fn pii_gate(content: &str) -> Result<(), ToolError> {
         violations.len(),
         detail.join("; ")
     )))
+}
+
+// ── Tree-sweep engine (GHMR-01) ───────────────────────────────────────────────
+//
+// The functions above ([`scan_for_pii`] / [`pii_gate`]) are the runtime WRITE
+// gate: they scan a single outbound content string before a GitHub API call.
+// The engine below is the authoritative *tree* sweep — it walks a directory of
+// a candidate mirror derivative and returns structured, per-file violations. It
+// is the Rust replacement for the legacy `.githooks/pii_gate.py` pre-push hook
+// and the library surface consumed by the mirror engine (GHMR-03/04).
+
+/// One violation located during a tree sweep. `pattern_kind` is the rule that
+/// fired; `context` is a short redacted snippet — the full matched secret is
+/// NEVER stored or echoed (same discipline as [`PiiViolation`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeViolation {
+    pub file: String,
+    pub line: usize,
+    pub pattern_kind: String,
+    pub context: String,
+}
+
+/// Repo-root configuration for the sweep. Loaded from a TOML file
+/// (`pii-gate.toml` at the repo root, or a path in `TERMINUS_PII_CONFIG`).
+///
+/// The built-in *patterns* are generic (RFC-1918 ranges, key prefixes, email/
+/// phone shapes); any repo-specific *terms* (infra hostnames, service names)
+/// live here in config, not hardcoded in this source file.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct PiiConfig {
+    /// Literal terms (hostnames, service names, org names) matched
+    /// case-insensitively on a word boundary. Escaped before compiling.
+    pub extra_terms: Vec<String>,
+    /// Raw additional regexes. Invalid patterns are logged and skipped.
+    pub extra_patterns: Vec<String>,
+    /// Emails permitted in addition to `GITHUB_ALLOWED_AUTHORS` (e.g. bot
+    /// no-reply author addresses, or placeholder example-domain addresses).
+    pub allowed_emails: Vec<String>,
+    /// File base-names to skip entirely (added to the built-in defaults).
+    pub excluded_files: Vec<String>,
+    /// File extensions (without the dot) to skip (added to defaults).
+    pub excluded_extensions: Vec<String>,
+    /// Directory base-names to prune from the walk (added to defaults).
+    pub excluded_dirs: Vec<String>,
+}
+
+/// Built-in extension rules layered on top of [`patterns`] for the tree sweep.
+/// These are all GENERIC shapes (no infra-specific literals) that the Python
+/// gate covered but the runtime content gate historically did not: JWTs, PEM
+/// private keys, cloud provider keys, Slack user tokens, and quoted secrets.
+/// Kept as ruleset extras (not in `patterns()`) so the write gate's behavior is
+/// byte-for-byte unchanged.
+fn extension_rules() -> Vec<(String, Regex)> {
+    let raw: &[(&str, &str)] = &[
+        ("jwt", r"\beyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]*"),
+        ("ssh_key", r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+        ("aws_access_key", r"\bAKIA[A-Z0-9]{16}\b"),
+        ("google_api_key", r"\bAIza[a-zA-Z0-9_-]{35}\b"),
+        ("slack_user_token", r"\bxoxp-[a-zA-Z0-9-]{10,}"),
+        (
+            "generic_secret",
+            r#"(?i)(?:password|secret|token)\s*[=:]\s*["'][^"']{8,}["']"#,
+        ),
+    ];
+    raw.iter()
+        .map(|(k, p)| ((*k).to_string(), Regex::new(p).expect("extension rule regex")))
+        .collect()
+}
+
+/// Default file base-names never scanned (the scanner sources themselves, lock
+/// files, the config, and the audit log). Mirrors the Python gate's list.
+fn default_excluded_files() -> HashSet<String> {
+    [
+        "Cargo.lock",
+        ".gitignore",
+        "pii.rs",       // the scanner itself — holds pattern strings
+        "pii_gate.rs",  // the hook binary — holds pattern strings
+        "pii_gate.py",  // the retired Python gate, if still present
+        "pii-gate.toml",
+        ".moosenet-repo.toml",
+        "pii-gate-audit.jsonl",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+fn default_excluded_exts() -> HashSet<String> {
+    [
+        "png", "jpg", "jpeg", "gif", "bmp", "ico", "pdf", "doc", "docx", "zip",
+        "tar", "gz", "exe", "dll", "so", "dylib", "bin", "lock", "crate",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+fn default_excluded_dirs() -> HashSet<String> {
+    [".git", "target", "node_modules", ".cargo"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+/// A configured PII rule set: the built-in [`patterns`] plus extension rules and
+/// any repo-configured terms/patterns, with the file/dir exclusion posture used
+/// when walking a tree.
+pub struct PiiRuleSet {
+    extra: Vec<(String, Regex)>,
+    allow_emails: Vec<String>,
+    excluded_files: HashSet<String>,
+    excluded_exts: HashSet<String>,
+    excluded_dirs: HashSet<String>,
+    max_file_bytes: u64,
+}
+
+impl PiiRuleSet {
+    /// The default rule set: built-in patterns + extension rules, default
+    /// exclusions, no repo-specific config.
+    pub fn new() -> Self {
+        Self {
+            extra: extension_rules(),
+            allow_emails: Vec::new(),
+            excluded_files: default_excluded_files(),
+            excluded_exts: default_excluded_exts(),
+            excluded_dirs: default_excluded_dirs(),
+            max_file_bytes: 5 * 1024 * 1024,
+        }
+    }
+
+    /// Build a rule set from repo config, layering the config's extras and
+    /// exclusions on top of the defaults. Invalid `extra_patterns` are skipped
+    /// with a warning rather than aborting the whole sweep.
+    pub fn from_config(cfg: &PiiConfig) -> Self {
+        let mut rs = Self::new();
+        for term in &cfg.extra_terms {
+            let pat = format!(r"(?i)\b{}\b", regex::escape(term));
+            match Regex::new(&pat) {
+                Ok(re) => rs.extra.push(("config_term".to_string(), re)),
+                Err(e) => tracing::warn!(target: "github.pii", "invalid config term {term:?}: {e}"),
+            }
+        }
+        for pat in &cfg.extra_patterns {
+            match Regex::new(pat) {
+                Ok(re) => rs.extra.push(("config_pattern".to_string(), re)),
+                Err(e) => {
+                    tracing::warn!(target: "github.pii", "invalid extra_pattern {pat:?}: {e}")
+                }
+            }
+        }
+        rs.allow_emails = cfg.allowed_emails.clone();
+        rs.excluded_files
+            .extend(cfg.excluded_files.iter().cloned());
+        rs.excluded_exts
+            .extend(cfg.excluded_extensions.iter().map(|e| e.trim_start_matches('.').to_string()));
+        rs.excluded_dirs.extend(cfg.excluded_dirs.iter().cloned());
+        rs
+    }
+
+    /// Load config from `path` (TOML) and build a rule set. A missing file
+    /// yields the default rule set (not an error).
+    pub fn from_config_file(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(text) => match toml::from_str::<PiiConfig>(&text) {
+                Ok(cfg) => Self::from_config(&cfg),
+                Err(e) => {
+                    tracing::warn!(target: "github.pii", "malformed {}: {e} — using defaults", path.display());
+                    Self::new()
+                }
+            },
+            Err(_) => Self::new(),
+        }
+    }
+
+    /// Scan a single content string with this rule set (built-ins + extras).
+    pub fn scan_content(&self, content: &str) -> Vec<PiiViolation> {
+        let p = patterns();
+        let mut allow = allowed_authors();
+        allow.extend(self.allow_emails.iter().cloned());
+        let mut out = Vec::new();
+        for (idx, line) in content.lines().enumerate() {
+            scan_line(p, &self.extra, &allow, idx + 1, line, &mut out);
+        }
+        out
+    }
+
+    /// Whether `path` is excluded from scanning by base-name or extension. Used
+    /// by [`Self::scan_tree`] and by the pre-push hook binary so hook modes and
+    /// tree mode honor exactly the same exclusion posture.
+    pub fn is_excluded(&self, path: &Path) -> bool {
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if self.excluded_files.contains(name) {
+                return true;
+            }
+        }
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if self.excluded_exts.contains(ext) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Walk the directory tree rooted at `root` and return every violation,
+    /// honoring the `// pii-test-fixture` line exemption exactly as the crate's
+    /// own self-check does. Binary / oversized / unreadable files are skipped
+    /// without panicking.
+    pub fn scan_tree(&self, root: &Path) -> Vec<TreeViolation> {
+        let mut files = Vec::new();
+        self.collect_files(root, &mut files);
+        let mut out = Vec::new();
+        for path in files {
+            if self.is_excluded(&path) {
+                continue;
+            }
+            let content = match read_text_lossy(&path, self.max_file_bytes) {
+                Some(c) => c,
+                None => continue, // binary / oversized / unreadable — skip
+            };
+            let scrubbed = strip_fixture_lines(&content);
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            for v in self.scan_content(&scrubbed) {
+                out.push(TreeViolation {
+                    file: rel.clone(),
+                    line: v.line,
+                    pattern_kind: v.category,
+                    context: v.context,
+                });
+            }
+        }
+        out
+    }
+
+    fn collect_files(&self, dir: &Path, out: &mut Vec<PathBuf>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            // Use the entry's own file type (does NOT follow symlinks). Skipping
+            // symlinks prevents both traversal outside the requested root and
+            // unbounded recursion on a symlink cycle.
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if ft.is_dir() {
+                let skip = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| self.excluded_dirs.contains(n))
+                    .unwrap_or(false);
+                if skip {
+                    continue;
+                }
+                self.collect_files(&path, out);
+            } else if ft.is_file() {
+                out.push(path);
+            }
+        }
+    }
+}
+
+impl Default for PiiRuleSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Read a file as UTF-8 (lossily), skipping it entirely when it is larger than
+/// `max_bytes` or looks binary (contains a NUL byte). Returns `None` to skip.
+fn read_text_lossy(path: &Path, max_bytes: u64) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > max_bytes {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.contains(&0) {
+        return None; // binary
+    }
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Replace any line carrying the `pii-test-fixture` exemption marker with an
+/// empty line, preserving line numbering. This is the ONLY exemption path — it
+/// is line-exact (a tagged line is cleared; untagged lines are always scanned),
+/// so it can never become a blanket bypass.
+fn strip_fixture_lines(content: &str) -> String {
+    content
+        .lines()
+        .map(|line| if line.contains("pii-test-fixture") { "" } else { line })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Convenience: sweep a tree with the default rule set.
+pub fn scan_tree(root: &Path) -> Vec<TreeViolation> {
+    PiiRuleSet::new().scan_tree(root)
+}
+
+/// Resolve a rule set from configuration: `TERMINUS_PII_CONFIG` (a config file
+/// path) takes precedence; otherwise `<root>/pii-gate.toml` when `root` is
+/// given; otherwise the built-in default rule set. This is the single place
+/// every surface (runtime write gate, the `github_pii_scan` tool, and the
+/// pre-push hook binary) loads config, so they stay in lockstep.
+pub fn ruleset_from_config(root: Option<&Path>) -> PiiRuleSet {
+    if let Ok(p) = std::env::var("TERMINUS_PII_CONFIG") {
+        return PiiRuleSet::from_config_file(Path::new(&p));
+    }
+    if let Some(r) = root {
+        let cfg = r.join("pii-gate.toml");
+        if cfg.is_file() {
+            return PiiRuleSet::from_config_file(&cfg);
+        }
+    }
+    PiiRuleSet::new()
+}
+
+/// Render a list of tree violations as a stable machine-readable JSON report.
+pub fn violations_to_json(violations: &[TreeViolation]) -> serde_json::Value {
+    serde_json::json!({
+        "clean": violations.is_empty(),
+        "count": violations.len(),
+        "violations": violations.iter().map(|v| serde_json::json!({
+            "file": v.file,
+            "line": v.line,
+            "pattern_kind": v.pattern_kind,
+            "context": v.context,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 #[cfg(test)]
@@ -630,5 +1003,188 @@ fn it_works() {
                 out.push(path);
             }
         }
+    }
+
+    // ── Tree-sweep engine tests (GHMR-01) ────────────────────────────────────
+
+    use std::io::Write;
+
+    fn write_file(dir: &std::path::Path, rel: &str, content: &str) {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+    }
+
+    /// A fresh temp dir under the OS temp root, unique per test.
+    fn temp_tree(tag: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "ghmr01-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[test]
+    #[serial]
+    fn scan_tree_flags_each_pattern_kind() {
+        clear_allow();
+        let dir = temp_tree("kinds");
+        write_file(&dir, "a.txt", "server at <internal-ip> listening\n"); // pii-test-fixture
+        write_file(&dir, "b.txt", "deployed to <host> build\n"); // pii-test-fixture
+        write_file(&dir, "sub/c.md", "ran on <host> host\n"); // pii-test-fixture
+        write_file(&dir, "d.txt", "contact <email> now\n"); // pii-test-fixture
+
+        let v = scan_tree(&dir);
+        let kinds: HashSet<&str> = v.iter().map(|x| x.pattern_kind.as_str()).collect();
+        assert!(kinds.contains("private_ip"), "{v:?}");
+        assert!(kinds.contains("container_id"), "{v:?}");
+        assert!(kinds.contains("internal_hostname"), "{v:?}");
+        assert!(kinds.contains("email"), "{v:?}");
+        // file/line are populated
+        assert!(v.iter().all(|x| !x.file.is_empty() && x.line >= 1));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[serial]
+    fn scan_tree_covers_python_gate_extension_patterns() {
+        clear_allow();
+        let dir = temp_tree("parity");
+        // The pattern kinds the legacy pii_gate.py covered — assert parity.
+        write_file(&dir, "ip.txt", "<internal-ip>\n"); // pii-test-fixture
+        write_file(&dir, "ghp.txt", "<REDACTED-SECRET>\n"); // pii-test-fixture
+        write_file(&dir, "sk.txt", "<REDACTED-SECRET>\n"); // pii-test-fixture
+        write_file(&dir, "glpat.txt", "<REDACTED-SECRET>\n"); // pii-test-fixture
+        write_file(&dir, "aws.txt", "<REDACTED-SECRET>\n"); // pii-test-fixture
+        write_file(&dir, "goog.txt", "<REDACTED-SECRET>\n"); // pii-test-fixture
+        write_file(&dir, "slack.txt", "<REDACTED-SECRET>\n"); // pii-test-fixture
+        write_file(&dir, "jwt.txt", "<REDACTED-SECRET>\n"); // pii-test-fixture
+        write_file(&dir, "pem.txt", "<REDACTED-SECRET>\n"); // pii-test-fixture
+        write_file(&dir, "sec.txt", "password = \"hunter2hunter2\"\n"); // pii-test-fixture
+        write_file(&dir, "host.txt", "example.com\n"); // pii-test-fixture
+        write_file(&dir, "path.txt", "see <path>/repos/x\n"); // pii-test-fixture
+        write_file(&dir, "phone.txt", "call <phone> now\n"); // pii-test-fixture
+
+        let v = scan_tree(&dir);
+        let kinds: HashSet<&str> = v.iter().map(|x| x.pattern_kind.as_str()).collect();
+        for expect in [
+            "private_ip",
+            "api_key",
+            "aws_access_key",
+            "google_api_key",
+            "slack_user_token",
+            "jwt",
+            "ssh_key",
+            "generic_secret",
+            "internal_domain",
+            "internal_path",
+            "phone",
+        ] {
+            assert!(kinds.contains(expect), "missing parity kind {expect}: {kinds:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[serial]
+    fn fixture_tag_is_line_exact_not_a_blanket_bypass() {
+        clear_allow();
+        let dir = temp_tree("fixture");
+        // First line tagged (exempt), second line an untagged REAL violation.
+        write_file(
+            &dir,
+            "mix.txt",
+            "host <host> fixture line // pii-test-fixture\nleaked <internal-ip> here\n",
+        );
+        let v = scan_tree(&dir);
+        // The tagged line's hostname token must be exempt...
+        assert!(
+            !v.iter().any(|x| x.pattern_kind == "internal_hostname"),
+            "tagged line must be exempt: {v:?}"
+        );
+        // ...but the untagged private IP on the next line must still flag.
+        assert!(
+            v.iter().any(|x| x.pattern_kind == "private_ip"),
+            "untagged violation must still flag: {v:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[serial]
+    fn clean_tree_yields_zero() {
+        clear_allow();
+        let dir = temp_tree("clean");
+        write_file(&dir, "ok.rs", "fn add(a: usize, b: usize) -> usize { a + b }\n");
+        write_file(&dir, "readme.md", "# Title\n\nJust prose, nothing secret.\n");
+        let v = scan_tree(&dir);
+        assert!(v.is_empty(), "clean tree must be empty: {v:?}");
+        assert!(violations_to_json(&v)["clean"].as_bool().unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[serial]
+    fn excluded_files_dirs_and_binaries_are_skipped() {
+        clear_allow();
+        let dir = temp_tree("excl");
+        // Excluded by dir (target/), by ext (.png), by name (Cargo.lock).
+        write_file(&dir, "target/gen.txt", "leak <internal-ip>\n"); // pii-test-fixture
+        write_file(&dir, "img.png", "<internal-ip> inside a png-named file\n"); // pii-test-fixture
+        write_file(&dir, "Cargo.lock", "<internal-ip> lockfile\n"); // pii-test-fixture
+        // Binary file (NUL byte) must be skipped, not panic.
+        write_file(&dir, "blob.dat", "start\0\x01\x02<internal-ip> end\n"); // pii-test-fixture
+        let v = scan_tree(&dir);
+        assert!(v.is_empty(), "excluded/binary content must be skipped: {v:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[serial]
+    fn config_driven_terms_and_allowed_emails() {
+        clear_allow();
+        let dir = temp_tree("config");
+        write_file(&dir, "svc.txt", "the frobnicator service is down\n");
+        write_file(&dir, "mail.txt", "reach <email> today\n"); // pii-test-fixture
+
+        let cfg = PiiConfig {
+            extra_terms: vec!["frobnicator".to_string()],
+            allowed_emails: vec!["@placeholder.test".to_string()],
+            ..Default::default()
+        };
+        let rs = PiiRuleSet::from_config(&cfg);
+        let v = rs.scan_tree(&dir);
+        let kinds: HashSet<&str> = v.iter().map(|x| x.pattern_kind.as_str()).collect();
+        assert!(kinds.contains("config_term"), "config term must flag: {v:?}");
+        // The allow-listed placeholder email must NOT flag.
+        assert!(
+            !v.iter().any(|x| x.pattern_kind == "email"),
+            "allow-listed email must be permitted: {v:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[serial]
+    fn scan_content_matches_legacy_gate_for_builtins() {
+        clear_allow();
+        // The ruleset's built-in coverage must be a superset of the legacy gate.
+        let sample = "host <host> at <internal-ip> <host>"; // pii-test-fixture
+        let legacy: HashSet<String> =
+            scan_for_pii(sample).into_iter().map(|v| v.category).collect();
+        let rs: HashSet<String> = PiiRuleSet::new()
+            .scan_content(sample)
+            .into_iter()
+            .map(|v| v.category)
+            .collect();
+        assert!(legacy.is_subset(&rs), "legacy {legacy:?} not subset of ruleset {rs:?}");
     }
 }
