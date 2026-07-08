@@ -42,6 +42,12 @@
 //! process environment via `std::env::set_var`, so every `X::from_env()`-style
 //! tool client constructed afterward transparently picks up the CURRENT
 //! value — never a stale one left behind in a static `.env` after a rotation.
+//! The named-identity Plane PATs (`PLANE_PAT_*` — CLAUDE/HARMONY/MOOSE/GEMINI/
+//! CODEX/LUMINA, plus any provisioned later) are materialized the same way, but
+//! via a dynamic `PLANE_PAT_` prefix match rather than a fixed list, so a
+//! newly-added identity becomes usable on the next restart with no code change;
+//! this is what lets `plane_list_identities` actually report the operator's
+//! configured identities instead of an empty set. See `PLANE_PAT_KEY_PREFIX`.
 //! This closes a real recurring operational problem: a rotated Plane
 //! credential previously required someone to notice, manually re-run a
 //! fetch-and-splice script, and restart the service before writes worked
@@ -91,6 +97,20 @@ const DOWNSTREAM_SECRET_KEYS: &[&str] = &[
     "GITHUB_TOKEN",
 ];
 
+/// Prefix for named-identity Plane Personal Access Tokens. In addition to the
+/// fixed `DOWNSTREAM_SECRET_KEYS` above, any secret key at the fetch path that
+/// begins with this prefix — `PLANE_PAT_CLAUDE`, `PLANE_PAT_HARMONY`,
+/// `PLANE_PAT_MOOSE`, `PLANE_PAT_GEMINI`, `PLANE_PAT_CODEX`, `PLANE_PAT_LUMINA`,
+/// and any identity provisioned later — is materialized into the process
+/// environment too, so the Plane tool's per-identity resolution
+/// (`plane_list_identities` / `for_identity()`) can see it. This is deliberately
+/// a *dynamic prefix match*, not another fixed list: a newly-provisioned
+/// identity becomes usable on the next restart with no code change. Matching is
+/// scoped to exactly this prefix (never "set every key found at the path"),
+/// preserving the same anti-leak property as the fixed allowlist above — an
+/// unrelated secret for another service sharing the path is never imported.
+const PLANE_PAT_KEY_PREFIX: &str = "PLANE_PAT_";
+
 /// Outcome of the startup <secret-manager> fetch attempt, for the caller (`main()`) // pii-test-fixture
 /// to log and for tests to assert on directly rather than scraping log text.
 #[derive(Debug, PartialEq, Eq)]
@@ -98,10 +118,17 @@ enum SecretFetchOutcome {
     /// `INFISICAL_URL`/`INFISICAL_CLIENT_ID`/`INFISICAL_CLIENT_SECRET` or the
     /// project-id env var aren't configured — nothing was attempted.
     NotConfigured,
-    /// The fetch succeeded; `count` downstream keys were found and set into
+    /// The fetch succeeded; `count` non-blank keys were found and set into
     /// the process environment. `missing` names (never values) any of
     /// `DOWNSTREAM_SECRET_KEYS` that <secret-manager> didn't have at this path. // pii-test-fixture
-    Fetched { count: usize, missing: Vec<String> },
+    /// `identities` is how many of `count` are named-identity Plane PATs
+    /// (`PLANE_PAT_*`, picked up dynamically) — a set-but-blank value is
+    /// treated as missing for both, never set.
+    Fetched {
+        count: usize,
+        missing: Vec<String>,
+        identities: usize,
+    },
     /// The fetch was attempted but failed (auth failure, network error,
     /// malformed response, ...) — callers fall back to whatever is already
     /// in the process environment. `reason` is a display-formatted
@@ -144,8 +171,13 @@ async fn fetch_downstream_secrets_from_infisical() -> SecretFetchOutcome {
         Ok(fetched) => {
             let mut count = 0usize;
             let mut missing = Vec::new();
+            // Fixed downstream allowlist: the six base connection secrets. A
+            // present-but-blank value is treated as MISSING (never set into the
+            // environment), so a blank provider value can never silently clobber
+            // a valid static-env fallback with an empty string (the CSEC-02
+            // lesson learned in the sibling Chord client).
             for key in DOWNSTREAM_SECRET_KEYS {
-                match fetched.get(*key) {
+                match fetched.get(*key).filter(|v| !v.is_empty()) {
                     Some(value) => {
                         std::env::set_var(key, value);
                         count += 1;
@@ -153,7 +185,24 @@ async fn fetch_downstream_secrets_from_infisical() -> SecretFetchOutcome {
                     None => missing.push((*key).to_string()),
                 }
             }
-            SecretFetchOutcome::Fetched { count, missing }
+            // Named-identity Plane PATs: materialize every non-blank `PLANE_PAT_*`
+            // key found at this path (dynamic prefix match — a newly-provisioned
+            // identity works with no code change). Same blank-as-missing rule as
+            // above. Not tracked in `missing`: identities are provisioned ad hoc,
+            // so there is no fixed expected set for one to be "missing" from.
+            let mut identities = 0usize;
+            for (key, value) in &fetched {
+                if key.starts_with(PLANE_PAT_KEY_PREFIX) && !value.is_empty() {
+                    std::env::set_var(key, value);
+                    count += 1;
+                    identities += 1;
+                }
+            }
+            SecretFetchOutcome::Fetched {
+                count,
+                missing,
+                identities,
+            }
         }
         Err(e) => SecretFetchOutcome::Failed {
             reason: e.to_string(),
@@ -171,8 +220,12 @@ fn log_secret_fetch_outcome(outcome: &SecretFetchOutcome) {
                 "terminus_personal: <secret-manager> not configured (INFISICAL_URL/INFISICAL_CLIENT_ID/INFISICAL_CLIENT_SECRET/TERMINUS_PERSONAL_INFISICAL_PROJECT_ID unset), using static environment" // pii-test-fixture
             );
         }
-        SecretFetchOutcome::Fetched { count, missing } => {
-            tracing::info!("terminus_personal: fetched {count} secrets from <secret-manager>"); // pii-test-fixture
+        SecretFetchOutcome::Fetched {
+            count,
+            missing,
+            identities,
+        } => {
+            tracing::info!("terminus_personal: fetched {count} secrets ({identities} named Plane identities) from <secret-manager>"); // pii-test-fixture
             if !missing.is_empty() {
                 tracing::warn!(
                     "terminus_personal: <secret-manager> fetch did not include: {} (using static environment for these, if present)", // pii-test-fixture
@@ -263,6 +316,11 @@ mod tests {
         "GITEA_URL",
         "GITEA_TOKEN",
         "GITHUB_TOKEN",
+        "PLANE_PAT_CLAUDE",
+        "PLANE_PAT_HARMONY",
+        "PLANE_PAT_FUTURE",
+        "PLANE_PAT_BLANK",
+        "SOME_OTHER_SERVICE_SECRET",
     ];
 
     fn clear_all_env() {
@@ -339,9 +397,14 @@ mod tests {
 
         let outcome = fetch_downstream_secrets_from_infisical().await;
         match outcome {
-            SecretFetchOutcome::Fetched { count, missing } => {
+            SecretFetchOutcome::Fetched {
+                count,
+                missing,
+                identities,
+            } => {
                 assert_eq!(count, 2);
                 assert_eq!(missing.len(), DOWNSTREAM_SECRET_KEYS.len() - 2);
+                assert_eq!(identities, 0);
             }
             other => panic!("expected Fetched, got {other:?}"),
         }
@@ -353,6 +416,62 @@ mod tests {
             std::env::var("GITEA_TOKEN").unwrap(),
             "fixture-gitea-token"
         );
+
+        clear_all_env();
+    }
+
+    // ── Named-identity PATs: dynamic PLANE_PAT_* pickup, blank-as-missing,
+    //    and no leakage of unrelated keys sharing the path ───────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn plane_pat_named_identities_are_materialized_dynamically() {
+        clear_all_env();
+        let server = MockServer::start();
+        mock_login(&server, "tok-pat"); // pii-test-fixture
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v3/secrets/raw");
+            then.status(200).json_body(json!({
+                "secrets": [
+                    // A base allowlist key (not a PAT) to prove the two paths coexist.
+                    { "secretKey": "PLANE_API_KEY", "secretValue": "fixture-plane-key" },
+                    // Known named identities.
+                    { "secretKey": "PLANE_PAT_CLAUDE", "secretValue": "fixture-pat-claude" },
+                    { "secretKey": "PLANE_PAT_HARMONY", "secretValue": "fixture-pat-harmony" },
+                    // An identity the code has never heard of — must still be picked
+                    // up purely by the PLANE_PAT_ prefix (future-proofing).
+                    { "secretKey": "PLANE_PAT_FUTURE", "secretValue": "fixture-pat-future" },
+                    // A set-but-blank PAT must be treated as missing (not set).
+                    { "secretKey": "PLANE_PAT_BLANK", "secretValue": "" },
+                    // An unrelated secret sharing the path must NEVER be imported.
+                    { "secretKey": "SOME_OTHER_SERVICE_SECRET", "secretValue": "should-not-leak" }
+                ]
+            }));
+        });
+        configure_bootstrap(&server.base_url());
+
+        let outcome = fetch_downstream_secrets_from_infisical().await;
+        match outcome {
+            SecretFetchOutcome::Fetched {
+                count,
+                identities,
+                ..
+            } => {
+                // 1 base key (PLANE_API_KEY) + 3 non-blank PATs = 4 set.
+                assert_eq!(count, 4, "expected 1 base + 3 non-blank PATs");
+                assert_eq!(identities, 3, "blank PAT must not count as an identity");
+            }
+            other => panic!("expected Fetched, got {other:?}"),
+        }
+
+        // Known + future identities are materialized into the environment...
+        assert_eq!(std::env::var("PLANE_PAT_CLAUDE").unwrap(), "fixture-pat-claude");
+        assert_eq!(std::env::var("PLANE_PAT_HARMONY").unwrap(), "fixture-pat-harmony");
+        assert_eq!(std::env::var("PLANE_PAT_FUTURE").unwrap(), "fixture-pat-future");
+        // ...a blank PAT value is treated as missing, never set...
+        assert!(std::env::var("PLANE_PAT_BLANK").is_err());
+        // ...and a non-PLANE_PAT_ key for another service never leaks in.
+        assert!(std::env::var("SOME_OTHER_SERVICE_SECRET").is_err());
 
         clear_all_env();
     }
@@ -371,9 +490,14 @@ mod tests {
 
         let outcome = fetch_downstream_secrets_from_infisical().await;
         match outcome {
-            SecretFetchOutcome::Fetched { count, missing } => {
+            SecretFetchOutcome::Fetched {
+                count,
+                missing,
+                identities,
+            } => {
                 assert_eq!(count, 0);
                 assert_eq!(missing.len(), DOWNSTREAM_SECRET_KEYS.len());
+                assert_eq!(identities, 0);
             }
             other => panic!("expected Fetched{{count:0,..}}, got {other:?}"),
         }
