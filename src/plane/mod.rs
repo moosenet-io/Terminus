@@ -344,9 +344,13 @@ impl RedisBackend {
         }
     }
 
-    /// GET a namespaced cache key. `None` = not present OR Redis unavailable —
-    /// the caller treats both identically (fall through to in-process).
-    async fn cache_get(&self, key: &str) -> Option<String> {
+    /// GET a namespaced cache key together with its remaining TTL. `None` = not
+    /// present OR Redis unavailable — the caller treats both identically (fall
+    /// through to in-process). The remaining TTL (from a single pipelined `PTTL`)
+    /// lets the caller warm its local fallback WITHOUT extending the entry's
+    /// lifetime past the shared key's expiry. Zero remaining ⇒ effectively about
+    /// to expire (caller should not keep it warm).
+    async fn cache_get(&self, key: &str) -> Option<(String, Duration)> {
         if !self.breaker.allow() {
             return None;
         }
@@ -355,12 +359,28 @@ impl RedisBackend {
                 .conn()
                 .await
                 .ok_or_else(|| redis::RedisError::from((redis::ErrorKind::IoError, "redis unavailable")))?;
-            redis::cmd("GET").arg(key).query_async::<_, Option<String>>(&mut conn).await
+            // One round-trip: value + remaining TTL in ms (PTTL: -1 no expiry,
+            // -2 no key). A present value always has a positive PTTL here since
+            // it was written with PX.
+            redis::pipe()
+                .cmd("GET").arg(key)
+                .cmd("PTTL").arg(key)
+                .query_async::<_, (Option<String>, i64)>(&mut conn)
+                .await
         };
         match tokio::time::timeout(self.op_timeout, fut).await {
-            Ok(Ok(v)) => {
+            Ok(Ok((Some(body), pttl_ms))) => {
                 self.breaker.record_success();
-                v
+                let remaining = if pttl_ms > 0 {
+                    Duration::from_millis(pttl_ms as u64)
+                } else {
+                    Duration::ZERO
+                };
+                Some((body, remaining))
+            }
+            Ok(Ok((None, _))) => {
+                self.breaker.record_success();
+                None
             }
             _ => {
                 self.note_failure();
@@ -598,11 +618,18 @@ impl GetCache {
         // Prefer the shared Redis cache; a hit there is authoritative. A miss OR
         // a Redis failure both fall through to the in-process map (fail-open).
         if let Some(backend) = &self.redis {
-            if let Some(body) = backend.cache_get(&redis_cache_key(key)).await {
+            if let Some((body, remaining)) = backend.cache_get(&redis_cache_key(key)).await {
                 // Warm the in-process fallback so a Redis outage within the TTL
                 // still serves this entry instead of refetching from Plane —
                 // important for instances that mostly consume shared cache hits.
-                self.entries.lock().await.insert(key.to_string(), (Instant::now(), body.clone()));
+                // Back-date the insertion by (full_ttl - remaining) so the local
+                // copy expires in step with the shared key, never doubling the
+                // effective TTL. If nothing meaningful remains, skip warming.
+                if !remaining.is_zero() {
+                    let age = self.ttl.saturating_sub(remaining);
+                    let ts = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+                    self.entries.lock().await.insert(key.to_string(), (ts, body.clone()));
+                }
                 return Some(body);
             }
         }
@@ -4142,6 +4169,8 @@ mod tests {
         // Shared cache round-trip.
         let key = redis_cache_key("tok\u{0}http://example.invalid/shared");
         backend.cache_set(&key, "shared-value", Duration::from_secs(5)).await;
-        assert_eq!(backend.cache_get(&key).await.as_deref(), Some("shared-value"));
+        let got = backend.cache_get(&key).await;
+        assert_eq!(got.as_ref().map(|(b, _)| b.as_str()), Some("shared-value"));
+        assert!(got.map(|(_, ttl)| !ttl.is_zero()).unwrap_or(false), "remaining TTL must be positive");
     }
 }
