@@ -669,12 +669,25 @@ pub(crate) fn assert_never_force(argv: &[&str]) {
     }
 }
 
+/// Command-line flags injected before EVERY git subcommand in the mirror engine to
+/// DISABLE repo hooks. The work dir is populated from internal main's tree AND
+/// edited by an (operator-configured, but not fully sandboxed) cleaning subagent
+/// (GHMR-05), so it could contain a hostile `.git/hooks/pre-commit`. Without this,
+/// `finalize`'s `git commit` would execute that hook — running arbitrary code in
+/// the parent's process tree and defeating the cleaner's env-isolation. Passing
+/// `core.hooksPath` on the command line overrides any repo-config value the cleaner
+/// might plant, so no hook under `.git/hooks` (or a redirected path) ever runs.
+/// `/dev/null` is a non-directory, so git finds no hook there and silently skips
+/// them (the dev box — the sole host these git ops run on — is Linux).
+const HOOKS_OFF: &[&str] = &["-c", "core.hooksPath=/dev/null"];
+
 /// Run a git command in `cwd`, returning stdout on success or an `Execution`
-/// error carrying stderr on failure.
+/// error carrying stderr on failure. Hooks are disabled (see [`HOOKS_OFF`]).
 pub(crate) fn run_git(cwd: &Path, args: &[&str]) -> Result<String, ToolError> {
     assert_never_force(args);
     let output = Command::new("git")
         .current_dir(cwd)
+        .args(HOOKS_OFF)
         .args(args)
         .output()
         .map_err(|e| ToolError::Execution(format!("failed to spawn git {}: {e}", args.join(" "))))?;

@@ -700,7 +700,10 @@ fn perform_ff_push(
     // Refspec `<sha>:refs/heads/main` with NO leading `+` — git refuses a
     // non-fast-forward update, a second safety net beneath our ff pre-check.
     let refspec = format!("{approved_commit}:refs/heads/main");
-    let argv = ["push", "--", remote, &refspec];
+    // `-c core.hooksPath=/dev/null` disables hooks (e.g. a planted pre-push) for the
+    // same reason GHMR-03's run_git does: the work dir is cleaner-writable and must
+    // never execute a hook under the parent's environment during transport.
+    let argv = ["-c", "core.hooksPath=/dev/null", "push", "--", remote, &refspec];
     assert_never_force(&argv);
 
     // GIT_ASKPASS script reads the token from a private env var passed only to

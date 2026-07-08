@@ -36,11 +36,22 @@
 //! cleaner that lies about success simply fails to drive the gate to 0 and is
 //! escalated — it can never smuggle residual PII into an approved tag.
 //!
+//! ## Trust boundary / defense-in-depth
+//! The cleaner is OPERATOR-CONFIGURED (via [`CLEAN_CMD_ENV`]), not arbitrary
+//! network input, but it is treated as only semi-trusted and confined by several
+//! layers: (1) it is handed ONLY the work-dir path + a redacted residual list,
+//! never the source; (2) it runs with a **cleared environment** (only `PATH`,
+//! `HOME`, and the two `MIRROR_*` handoff vars — no service credentials); and
+//! (3) all mirror-engine git ops disable hooks (`core.hooksPath=/dev/null` — see
+//! [`workdir`](super::workdir)), so a `.git/hooks/pre-commit` a cleaner might plant
+//! can never execute under `finalize`'s commit and re-capture the parent's env.
+//! A full filesystem sandbox (preventing absolute-path writes outside the work dir)
+//! is the operator's deployment responsibility for the configured command — out of
+//! scope for this in-process orchestration.
+//!
 //! In production the cleaner is dispatched through a config-driven command hook
-//! ([`CommandCleaner`], from [`CLEAN_CMD_ENV`]) with a **cleared environment** —
-//! only `PATH`, `HOME`, and the `MIRROR_WORK_DIR` / `MIRROR_RESIDUALS_FILE` handoff
-//! vars are passed, so the external subagent never inherits the parent's service
-//! credentials (GitHub / Plane PATs, DB URLs). Tests inject a mock. When no
+//! ([`CommandCleaner`], from [`CLEAN_CMD_ENV`]) with that cleared environment.
+//! Tests inject a mock. When no
 //! command is configured, [`dispatch_cleaning`] escalates immediately (0 rounds)
 //! rather than silently passing residuals through.
 
@@ -788,6 +799,62 @@ mod tests {
         assert!(!real.join("real-wd").exists() && !real.join("link-wd").exists(), "no nested dir");
 
         cleanup(&[&real, &link]);
+    }
+
+    // ── a git hook planted by a cleaner does NOT execute during finalize ──────
+    // (codex round 3 P1) The work dir is cleaner-writable, so a hostile
+    // .git/hooks/pre-commit could run arbitrary code under the parent env when
+    // finalize commits. HOOKS_OFF (core.hooksPath=/dev/null) must neutralize it.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn planted_git_hook_does_not_run_during_finalize() {
+        use std::os::unix::fs::PermissionsExt;
+        clear_env();
+        let src = init_source(&[(
+            "config.txt",
+            "token = \"<REDACTED-SECRET>\"\n", // pii-test-fixture
+        )]);
+        let wd_path = unique("wd");
+        let mgr = MirrorWorkDir::new("Terminus", &src, &wd_path);
+        let sha = run_git(&src, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let report = mgr.run().unwrap(); // work dir now has a .git
+        assert!(!report.residual_violations.is_empty());
+
+        // A sentinel path the malicious hook would touch if it ran.
+        let sentinel = unique("hook-fired");
+        let sentinel_s = sentinel.display().to_string();
+
+        // A cleaner that fixes the residual BUT also plants a pre-commit hook.
+        struct HookPlanter {
+            sentinel: String,
+        }
+        impl ResidualCleaner for HookPlanter {
+            fn clean_round(&self, work_dir: &Path, _r: &[TreeViolation]) -> Result<(), ToolError> {
+                write_file(work_dir, "config.txt", "cleaned\n");
+                let hook = work_dir.join(".git/hooks/pre-commit");
+                std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+                std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", self.sentinel)).unwrap();
+                std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+                Ok(())
+            }
+        }
+
+        let outcome = run_cleaning_pass(
+            &mgr,
+            &sha,
+            report.residual_violations.clone(),
+            &HookPlanter { sentinel: sentinel_s.clone() },
+            MAX_CLEAN_ROUNDS,
+        )
+        .unwrap();
+        assert!(outcome.is_cleaned(), "residual fixed → commit happens (which would fire the hook if enabled)");
+        assert!(
+            !sentinel.exists(),
+            "planted pre-commit hook must NOT have executed during finalize's commit"
+        );
+
+        cleanup(&[&src, &wd_path, &sentinel]);
     }
 
     // ── the cleaner does NOT inherit parent service credentials ───────────────
