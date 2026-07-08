@@ -46,6 +46,7 @@ pub mod plane;
 pub mod registry;
 pub mod relay;
 pub mod scribe;
+pub mod secrets_bootstrap;
 pub mod reminder;
 pub mod review;
 pub mod routines;
