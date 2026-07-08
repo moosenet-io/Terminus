@@ -13,11 +13,15 @@
 //!     when gate-clean), via GHMR-03's [`MirrorWorkDir::run`]. Returns residual
 //!     violations for GHMR-05 when the tree is not yet clean.
 //!   * `github_mirror_approve` — **guarded** operator authorisation of a prepared,
-//!     gate-clean snapshot. Refuses (without bothering the operator) when residual
-//!     violations are still pending; otherwise idempotently confirms the
-//!     `mirror-approved` tag and blesses the snapshot for push.
+//!     gate-clean snapshot. Requires prepare's `mirror-approved/<sha>` tag for the
+//!     CURRENT internal sha (refusing, without bothering the operator, a residual or
+//!     un-prepared snapshot); on the operator's grant it records a DISTINCT
+//!     `mirror-blessed/<sha>` marker. It never syncs/finalizes here, so it can never
+//!     tag a stale work tree under a newer sha.
 //!   * `github_mirror_push`    — **guarded**, **fast-forward-only** publish of the
-//!     approved work-dir commit to the repo's `github_remote`, using `GITHUB_TOKEN`
+//!     OPERATOR-BLESSED work-dir commit (the `mirror-blessed/<sha>` marker — NOT
+//!     prepare's machine tag, so a prepare→push shortcut cannot skip approve) to the
+//!     repo's `github_remote`, using `GITHUB_TOKEN`
 //!     (via [`crate::github::github_token`], never raw-logged, injected through
 //!     `GIT_ASKPASS` — never embedded in the remote URL or argv). Refuses any
 //!     non-fast-forward move and points at the GHMR-07 bootstrap; NEVER force-pushes.
@@ -50,13 +54,19 @@ use crate::github::github_token;
 use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
-use super::workdir::{assert_never_force, MirrorWorkDir};
+use super::workdir::{assert_never_force, run_git, MirrorWorkDir};
 
 /// Environment variable holding the target GitHub mirror remote URL when a call
 /// does not pass one explicitly. Checked per-repo first
 /// (`TERMINUS_MIRROR_REMOTE_<REPO_UPPER>`) then as a single fallback
 /// (`TERMINUS_MIRROR_REMOTE`). NEVER a literal in code — the remote is infra.
 const REMOTE_ENV: &str = "TERMINUS_MIRROR_REMOTE";
+
+/// Tag namespace marking a snapshot the OPERATOR has authorised for push. Created
+/// ONLY by `github_mirror_approve` after the approval gate grants — distinct from
+/// GHMR-03's `mirror-approved/*` (gate-clean, but machine-created by prepare). Push
+/// requires THIS marker, so a prepare→push shortcut cannot skip operator approval.
+const BLESSED_TAG_PREFIX: &str = "mirror-blessed/";
 
 // ── Shared argument parsing ────────────────────────────────────────────────
 
@@ -69,13 +79,74 @@ fn req_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, ToolError> {
         .ok_or_else(|| ToolError::InvalidArgument(format!("'{key}' is required")))
 }
 
+/// Reject a `repo` value that is anything but a single safe path component. It is
+/// joined onto `TERMINUS_MIRROR_WORKDIR_ROOT` to locate the work dir, and prepare
+/// then CLEARS that work dir's tree — so a traversal (`../../checkout`) or absolute
+/// path would let the engine wipe an unrelated repository. Allow only
+/// `[A-Za-z0-9._-]`, and never `.` / `..` / a path separator / an absolute path.
+fn validate_repo(repo: &str) -> Result<(), ToolError> {
+    let safe = !repo.is_empty()
+        && repo != "."
+        && repo != ".."
+        && !repo.contains('/')
+        && !repo.contains('\\')
+        && !repo.contains('\0')
+        && !Path::new(repo).is_absolute()
+        && repo.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if safe {
+        Ok(())
+    } else {
+        Err(ToolError::InvalidArgument(format!(
+            "'repo' must be a single safe path component (letters/digits/.-_, no '/', '..', \
+             or absolute path): got {repo:?}"
+        )))
+    }
+}
+
 /// Build a [`MirrorWorkDir`] for `(repo, source)` with the work dir resolved from
 /// [`WORKDIR_ROOT_ENV`](super::workdir::WORKDIR_ROOT_ENV). `repo` and `source`
 /// (the dev-box internal-`main` checkout) are required args on every mirror tool.
 fn workdir_from_args(args: &Value) -> Result<MirrorWorkDir, ToolError> {
     let repo = req_str(args, "repo")?;
+    validate_repo(repo)?;
     let source = req_str(args, "source")?;
     MirrorWorkDir::from_config(repo, source)
+}
+
+/// The operator-blessed marker tag for an internal sha.
+fn blessed_tag(internal_sha: &str) -> String {
+    format!("{BLESSED_TAG_PREFIX}{internal_sha}")
+}
+
+/// The commit the `mirror-blessed/<sha>` marker points at (the operator-authorised
+/// commit), or `None` when the snapshot has not been blessed by an approved
+/// `github_mirror_approve` call.
+fn blessed_commit(work_dir: &Path, internal_sha: &str) -> Result<Option<String>, ToolError> {
+    if !work_dir.join(".git").exists() {
+        return Ok(None);
+    }
+    let tag = blessed_tag(internal_sha);
+    let listed = run_git(work_dir, &["tag", "-l", &tag])?;
+    if !listed.lines().any(|l| l.trim() == tag) {
+        return Ok(None);
+    }
+    let spec = format!("{tag}^{{commit}}");
+    let out = run_git(work_dir, &["rev-parse", "--verify", "-q", &spec])?;
+    Ok(Some(out.trim().to_string()))
+}
+
+/// Create the `mirror-blessed/<sha>` marker at `commit` (idempotent — a no-op if it
+/// already exists). A lightweight tag: it needs no committer identity and never
+/// moves an existing marker (git refuses to re-tag without force, which the guard
+/// forbids anyway).
+fn create_blessed_tag(work_dir: &Path, internal_sha: &str, commit: &str) -> Result<(), ToolError> {
+    let tag = blessed_tag(internal_sha);
+    let listed = run_git(work_dir, &["tag", "-l", &tag])?;
+    if listed.lines().any(|l| l.trim() == tag) {
+        return Ok(());
+    }
+    run_git(work_dir, &["tag", &tag, commit])?;
+    Ok(())
 }
 
 /// Resolve the GitHub mirror remote: explicit `github_remote` arg wins, then
@@ -232,55 +303,61 @@ impl RustTool for GitHubMirrorApprove {
                 "work dir not initialised — run github_mirror_prepare first".into(),
             ));
         }
+        let repo = req_str(&args, "repo")?.to_string();
         let internal_sha = wd.source_head_sha()?;
 
-        // Authoritative clean/dirty check via GHMR-03's finalize (idempotent after
-        // prepare: re-sweeps the current work-dir tree, commits + tags iff clean).
-        // Done BEFORE the guard so a residual snapshot is refused without ever
-        // bothering the operator with an approval request for something un-pushable.
-        let report = wd.finalize(&internal_sha)?;
-        if !report.residual_violations.is_empty() {
-            return Ok(json!({
-                "approved": false,
-                "repo": report.repo,
-                "internal_sha": internal_sha,
-                "reason": "residual PII violations pending — clean them (GHMR-05) and re-prepare before approving",
-                "residual_count": report.residual_violations.len(),
-                "residual_violations": report.residual_violations.iter().map(|v| json!({
-                    "file": v.file,
-                    "line": v.line,
-                    "pattern_kind": v.pattern_kind,
-                    "context": v.context,
-                })).collect::<Vec<_>>(),
-            })
-            .to_string());
-        }
-
-        let tag = report.tag.clone().unwrap_or_else(|| format!("mirror-approved/{internal_sha}"));
-        let commit_sha = report.commit_sha.clone();
+        // Approve blesses an ALREADY-PREPARED, gate-clean snapshot for the CURRENT
+        // internal sha — it never syncs or finalizes here. Requiring prepare's
+        // `mirror-approved/<sha>` tag (a) refuses a residual/un-prepared snapshot
+        // without bothering the operator, and (b) avoids the stale-tree hazard of
+        // finalizing a work tree that was synced at a DIFFERENT (older) internal sha
+        // than the current HEAD: the tag pins a specific committed swept tree to
+        // this exact sha, so blessing the commit it points at is always accurate.
+        let approved_commit = match wd.approved_commit(&internal_sha)? {
+            Some(c) => c,
+            None => {
+                return Ok(json!({
+                    "approved": false,
+                    "repo": repo,
+                    "internal_sha": internal_sha,
+                    "reason": "no gate-clean approved snapshot for this internal sha — run \
+                               github_mirror_prepare first (and clean any residual PII violations \
+                               via GHMR-05 before it can be approved)",
+                })
+                .to_string());
+            }
+        };
 
         // GUARDED: the operator must bless this snapshot out of band. The gate is
         // content-bound to (repo, source) so a code approved for one repo can't be
         // redeemed against another. The approval code is stripped before matching.
         let summary = format!(
-            "Approve mirror snapshot for '{}' (internal main {}) for public GitHub push",
-            report.repo, internal_sha
+            "Approve mirror snapshot for '{repo}' (internal main {internal_sha}, commit \
+             {approved_commit}) for public GitHub push"
         );
         match approval::gate(self.name(), &args, &summary).await {
-            Gate::Granted => Ok(json!({
-                "approved": true,
-                "repo": report.repo,
-                "internal_sha": internal_sha,
-                "tag": tag,
-                "commit_sha": commit_sha,
-                "message": "snapshot blessed — run github_mirror_push to publish (fast-forward only)",
-            })
-            .to_string()),
+            Gate::Granted => {
+                // Record the operator's authorisation as a distinct marker that ONLY
+                // this granted path creates — github_mirror_push requires it, so a
+                // prepare→push shortcut can never bypass this approval step.
+                create_blessed_tag(wd.path(), &internal_sha, &approved_commit)?;
+                Ok(json!({
+                    "approved": true,
+                    "repo": repo,
+                    "internal_sha": internal_sha,
+                    "approved_tag": format!("mirror-approved/{internal_sha}"),
+                    "blessed_tag": blessed_tag(&internal_sha),
+                    "commit_sha": approved_commit,
+                    "message": "snapshot blessed — run github_mirror_push to publish (fast-forward only)",
+                })
+                .to_string())
+            }
             Gate::Pending(m) | Gate::Denied(m) => Ok(json!({
                 "approved": false,
-                "repo": report.repo,
+                "repo": repo,
                 "internal_sha": internal_sha,
-                "tag": tag,
+                "approved_tag": format!("mirror-approved/{internal_sha}"),
+                "commit_sha": approved_commit,
                 "approval_required": true,
                 "message": m,
             })
@@ -345,12 +422,16 @@ impl RustTool for GitHubMirrorPush {
         let repo = req_str(&args, "repo")?.to_string();
         let internal_sha = wd.source_head_sha()?;
 
-        // The approved commit is the SOLE thing publishable — refuse if the current
-        // internal main is not approved (no mirror-approved tag).
-        let approved_commit = wd.approved_commit(&internal_sha)?.ok_or_else(|| {
+        // The SOLE publishable commit is the one the OPERATOR blessed via
+        // github_mirror_approve (the `mirror-blessed/<sha>` marker) — NOT prepare's
+        // machine-created `mirror-approved` tag. This closes the prepare→push
+        // shortcut: without a granted approve there is no blessed marker, so push
+        // refuses even on a gate-clean prepared snapshot.
+        let approved_commit = blessed_commit(wd.path(), &internal_sha)?.ok_or_else(|| {
             ToolError::Conflict(format!(
-                "internal main {internal_sha} is not approved — run github_mirror_prepare + \
-                 github_mirror_approve first (no mirror-approved tag)"
+                "internal main {internal_sha} is not approved for push — run \
+                 github_mirror_approve first (it requires a github_mirror_prepare'd, gate-clean \
+                 snapshot and the operator's approval; no mirror-blessed marker present)"
             ))
         })?;
 
@@ -619,7 +700,9 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    use super::super::workdir::{git_ok, run_git};
+    // `run_git` is already in scope via `use super::*` (imported at module level);
+    // pull in only `git_ok` for the reachability check.
+    use super::super::workdir::git_ok;
 
     // ── local git repo fixtures (mirror the GHMR-03 test helpers) ────────────
 
@@ -697,6 +780,16 @@ mod tests {
     fn set_root(root: &Path) {
         std::fs::create_dir_all(root).unwrap();
         std::env::set_var("TERMINUS_MIRROR_WORKDIR_ROOT", root);
+    }
+
+    /// Stand in for a granted `github_mirror_approve`: bless the current internal
+    /// sha's approved commit (what the guarded grant path does after the operator
+    /// approves). Requires TERMINUS_MIRROR_WORKDIR_ROOT already set.
+    fn bless(repo: &str, src: &Path) {
+        let wd = MirrorWorkDir::from_config(repo, src).unwrap();
+        let sha = wd.source_head_sha().unwrap();
+        let commit = wd.approved_commit(&sha).unwrap().unwrap();
+        create_blessed_tag(wd.path(), &sha, &commit).unwrap();
     }
 
     // ── schema / naming ──────────────────────────────────────────────────────
@@ -892,7 +985,7 @@ mod tests {
         // so approval is required (not an outright residual refusal).
         assert_eq!(v["approved"], false);
         assert_eq!(v["approval_required"], true);
-        assert!(v["tag"].as_str().unwrap().starts_with("mirror-approved/"));
+        assert!(v["approved_tag"].as_str().unwrap().starts_with("mirror-approved/"));
 
         cleanup(&[&src, &root]);
     }
@@ -946,6 +1039,50 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn push_refuses_when_prepared_but_not_blessed() {
+        // P1-3 regression: a gate-clean prepared snapshot with a bootstrapped,
+        // fast-forwardable remote must STILL refuse push until github_mirror_approve
+        // has blessed it — prepare's machine tag alone is not push authorisation.
+        clear_env();
+        let src = init_source(&[("a.txt", "v1 clean\n")]);
+        let root = unique("root");
+        set_root(&root);
+        GitHubMirrorPrepare
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        // Bootstrap a remote so ff would otherwise be fine, and advance so there is
+        // a real ff to do — none of which should matter without a blessing.
+        let wd = MirrorWorkDir::from_config("Terminus", &src).unwrap();
+        let c1 = wd.approved_commit(&wd.source_head_sha().unwrap()).unwrap().unwrap();
+        let bare = init_bare();
+        run_git(wd.path(), &["push", &bare.display().to_string(), &format!("{c1}:refs/heads/main")]).unwrap();
+        write_file(&src, "a.txt", "v2 clean\n");
+        commit_all(&src, "v2");
+        GitHubMirrorPrepare
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+
+        let res = GitHubMirrorPush
+            .execute(json!({
+                "repo": "Terminus",
+                "source": src.display().to_string(),
+                "github_remote": bare.display().to_string()
+            }))
+            .await;
+        match res {
+            Err(ToolError::Conflict(m)) => assert!(
+                m.contains("github_mirror_approve"),
+                "unblessed push must point at approve: {m}"
+            ),
+            other => panic!("expected Conflict requiring approve, got {other:?}"),
+        }
+        cleanup(&[&src, &root, &bare]);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn push_refuses_unbootstrapped_remote() {
         clear_env();
         let src = init_source(&[("a.txt", "clean content\n")]);
@@ -956,6 +1093,7 @@ mod tests {
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
+        bless("Terminus", &src); // operator-approve stand-in
 
         let res = GitHubMirrorPush
             .execute(json!({
@@ -983,12 +1121,104 @@ mod tests {
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
-        // approved, but no github_remote arg and no env → NotConfigured.
+        bless("Terminus", &src); // operator-approve stand-in
+        // blessed, but no github_remote arg and no env → NotConfigured.
         let res = GitHubMirrorPush
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await;
         assert!(matches!(res, Err(ToolError::NotConfigured(_))));
         cleanup(&[&src, &root]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn push_blessed_and_fast_forwardable_reaches_the_guard() {
+        // Blessed + a real fast-forward available → validation passes and the
+        // GUARDED gate is reached (no DB → approval_required, real push withheld).
+        clear_env();
+        let src = init_source(&[("a.txt", "v1 clean\n")]);
+        let root = unique("root");
+        set_root(&root);
+        GitHubMirrorPrepare
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        let wd = MirrorWorkDir::from_config("Terminus", &src).unwrap();
+        let c1 = wd.approved_commit(&wd.source_head_sha().unwrap()).unwrap().unwrap();
+        let bare = init_bare();
+        run_git(wd.path(), &["push", &bare.display().to_string(), &format!("{c1}:refs/heads/main")]).unwrap();
+        // Advance + prepare + bless c2 (a genuine ff over the remote's c1).
+        write_file(&src, "a.txt", "v2 clean\n");
+        commit_all(&src, "v2");
+        GitHubMirrorPrepare
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        bless("Terminus", &src);
+
+        let out = GitHubMirrorPush
+            .execute(json!({
+                "repo": "Terminus",
+                "source": src.display().to_string(),
+                "github_remote": bare.display().to_string()
+            }))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["pushed"], false);
+        assert_eq!(v["approval_required"], true);
+        // The remote must NOT have advanced — the real push was gated.
+        let tip = run_git(&bare, &["rev-parse", "refs/heads/main"]).unwrap().trim().to_string();
+        assert_eq!(tip, c1, "unapproved push must not move the mirror");
+        cleanup(&[&src, &root, &bare]);
+    }
+
+    #[test]
+    #[serial]
+    fn blessed_tag_round_trips_and_is_idempotent() {
+        clear_env();
+        let src = init_source(&[("a.txt", "clean\n")]);
+        let root = unique("root");
+        set_root(&root);
+        let wd = MirrorWorkDir::from_config("Terminus", &src).unwrap();
+        wd.run().unwrap();
+        let sha = wd.source_head_sha().unwrap();
+        let commit = wd.approved_commit(&sha).unwrap().unwrap();
+        assert!(blessed_commit(wd.path(), &sha).unwrap().is_none(), "not blessed initially");
+        create_blessed_tag(wd.path(), &sha, &commit).unwrap();
+        create_blessed_tag(wd.path(), &sha, &commit).unwrap(); // idempotent
+        assert_eq!(blessed_commit(wd.path(), &sha).unwrap().as_deref(), Some(commit.as_str()));
+        cleanup(&[&src, &root]);
+    }
+
+    // ── repo path-component validation (traversal guard) ─────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn tools_reject_unsafe_repo_component() {
+        clear_env();
+        let root = unique("root");
+        set_root(&root);
+        for bad in ["../escape", "a/b", "..", ".", "/abs", "a\\b"] {
+            let res = GitHubMirrorStatus
+                .execute(json!({ "repo": bad, "source": "/tmp/whatever" }))
+                .await;
+            assert!(
+                matches!(res, Err(ToolError::InvalidArgument(_))),
+                "unsafe repo {bad:?} must be rejected"
+            );
+        }
+        cleanup(&[&root]);
+    }
+
+    #[test]
+    fn validate_repo_accepts_safe_and_rejects_traversal() {
+        for ok in ["Terminus", "lumina-constellation", "Chord", "a.b_c-1"] {
+            assert!(validate_repo(ok).is_ok(), "{ok} should be valid");
+        }
+        for bad in ["..", ".", "a/b", "../x", "/abs", "a\\b", "", "a b"] {
+            assert!(validate_repo(bad).is_err(), "{bad:?} should be rejected");
+        }
     }
 
     // ── ff_state classification (the core safety logic) ──────────────────────
