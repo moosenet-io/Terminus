@@ -462,7 +462,10 @@ impl PiiRuleSet {
         out
     }
 
-    fn is_excluded_file(&self, path: &Path) -> bool {
+    /// Whether `path` is excluded from scanning by base-name or extension. Used
+    /// by [`Self::scan_tree`] and by the pre-push hook binary so hook modes and
+    /// tree mode honor exactly the same exclusion posture.
+    pub fn is_excluded(&self, path: &Path) -> bool {
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
             if self.excluded_files.contains(name) {
                 return true;
@@ -485,7 +488,7 @@ impl PiiRuleSet {
         self.collect_files(root, &mut files);
         let mut out = Vec::new();
         for path in files {
-            if self.is_excluded_file(&path) {
+            if self.is_excluded(&path) {
                 continue;
             }
             let content = match read_text_lossy(&path, self.max_file_bytes) {
@@ -516,8 +519,18 @@ impl PiiRuleSet {
             Err(_) => return,
         };
         for entry in entries.flatten() {
+            // Use the entry's own file type (does NOT follow symlinks). Skipping
+            // symlinks prevents both traversal outside the requested root and
+            // unbounded recursion on a symlink cycle.
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if ft.is_symlink() {
+                continue;
+            }
             let path = entry.path();
-            if path.is_dir() {
+            if ft.is_dir() {
                 let skip = path
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -527,7 +540,7 @@ impl PiiRuleSet {
                     continue;
                 }
                 self.collect_files(&path, out);
-            } else if path.is_file() {
+            } else if ft.is_file() {
                 out.push(path);
             }
         }

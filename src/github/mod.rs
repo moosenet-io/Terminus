@@ -39,7 +39,7 @@ use crate::tool::RustTool;
 
 pub mod pii;
 use pii::pii_gate;
-use pii::{scan_for_pii, scan_tree, violations_to_json};
+use pii::{scan_tree, violations_to_json, PiiRuleSet};
 
 const DEFAULT_ORG: &str = "moosenet-io";
 const DEFAULT_GITEA_URL: &str = "https://gitea.example.com";
@@ -191,7 +191,9 @@ impl RustTool for GitHubPiiScan {
         let tree_path = args.get("tree_path").and_then(Value::as_str);
         match (content, tree_path) {
             (Some(text), _) => {
-                let vs = scan_for_pii(text);
+                // Use the full rule set (built-ins + extension rules) so content
+                // mode and tree mode report identical coverage.
+                let vs = PiiRuleSet::new().scan_content(text);
                 Ok(json!({
                     "clean": vs.is_empty(),
                     "count": vs.len(),
