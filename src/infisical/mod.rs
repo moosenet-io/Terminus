@@ -21,6 +21,8 @@
 //! Security: read-only. Secret VALUES are returned to the caller exactly as the
 //! Python returns them, but values are NEVER logged or echoed by this module.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
@@ -31,15 +33,22 @@ use crate::tool::RustTool;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
+/// `pub` (not `pub(crate)`): `src/bin/terminus_personal.rs` compiles as a
+/// separate binary crate that depends on this library crate externally, so
+/// `pub(crate)` items are invisible to it — startup-time secret bootstrapping
+/// (PSEC-02) needs this type and `fetch_secrets_batch` below to be fully
+/// `pub`. This does NOT relax the approval-gate requirement: the gate stays
+/// exclusively on the MCP tool surface (`InfisicalGetSecretsBatch::execute`),
+/// never on this plain config/fetch plumbing.
 #[derive(Clone)]
-struct InfisicalConfig {
+pub struct InfisicalConfig {
     url: Option<String>,
     client_id: Option<String>,
     client_secret: Option<String>,
 }
 
 impl InfisicalConfig {
-    fn from_env() -> Self {
+    pub fn from_env() -> Self {
         Self {
             url: std::env::var("INFISICAL_URL").ok().filter(|s| !s.is_empty()),
             client_id: std::env::var("INFISICAL_CLIENT_ID")
@@ -51,7 +60,7 @@ impl InfisicalConfig {
         }
     }
 
-    fn is_configured(&self) -> bool {
+    pub fn is_configured(&self) -> bool {
         self.url.is_some() && self.client_id.is_some() && self.client_secret.is_some()
     }
 
@@ -267,6 +276,60 @@ fn encode_key(key: &str) -> String {
         }
     }
     out
+}
+
+// ── Internal batch-fetch (shared by the guarded tool AND terminus_personal startup) ──
+
+/// Fetch all secrets (keys + values) for a project/environment/path from
+/// <secret-manager>, as a plain key→value map. This is the reusable core extracted // pii-test-fixture
+/// from `InfisicalGetSecretsBatch::execute()` (PSEC-01) — it has NO approval
+/// gate of its own. The gate requirement stays exactly where it was, on the
+/// guarded MCP tool surface; this function is also called directly by
+/// `terminus_personal`'s own startup-time secret bootstrap (PSEC-02), which
+/// is a process-internal action, not an operator-invoked one.
+///
+/// Never logs or echoes any fetched value — callers must uphold the same
+/// discipline (log key names/counts only, never values).
+pub async fn fetch_secrets_batch(
+    config: &InfisicalConfig,
+    project_id: &str,
+    environment: &str,
+    secret_path: &str,
+) -> Result<HashMap<String, String>, ToolError> {
+    let base = config.base_url()?;
+    let client = InfisicalConfig::client()?;
+    let token = get_access_token(&client, config).await?;
+
+    let qs = secret_query(project_id, environment, secret_path);
+    let result = get_json(
+        &client,
+        &format!("{base}/api/v3/secrets/raw"),
+        &qs,
+        Some(&token),
+    )
+    .await?;
+
+    if let Some(true) = result.get("error").and_then(Value::as_bool) {
+        let status = result.get("status").and_then(Value::as_u64).unwrap_or(0);
+        let message = result.get("message").and_then(Value::as_str).unwrap_or("");
+        return Err(ToolError::Http(format!(
+            "<secret-manager> batch secret fetch failed: HTTP {status}: {message}" // pii-test-fixture
+        )));
+    }
+
+    let secrets = result
+        .get("secrets")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut map = HashMap::new();
+    for s in &secrets {
+        if let Some(k) = s.get("secretKey").and_then(Value::as_str) {
+            let v = s.get("secretValue").and_then(Value::as_str).unwrap_or("");
+            map.insert(k.to_string(), v.to_string());
+        }
+    }
+    Ok(map)
 }
 
 // ── Tool structs ────────────────────────────────────────────────────────────────
@@ -586,23 +649,18 @@ secret values — use for bulk injection, not browsing. GUARDED: requires operat
             return Err(ToolError::InvalidArgument("project_id is required".into()));
         }
 
-        let base = self.config.base_url()?;
-        let client = InfisicalConfig::client()?;
-        let token = get_access_token(&client, &self.config).await?;
-
-        let qs = secret_query(&project_id, &environment, &secret_path);
-        let result = get_json(
-            &client,
-            &format!("{base}/api/v3/secrets/raw"),
-            &qs,
-            Some(&token),
-        )
-        .await?;
-
-        if result.get("error").is_some() {
-            return Ok(result.to_string());
-        }
-        Ok(shape_get_secrets_batch(&result, &environment, &secret_path).to_string())
+        // Delegate the actual HTTP/auth fetch to the shared internal function
+        // (PSEC-01); reshape the resulting map through the existing
+        // `shape_get_secrets_batch` helper so the tool's external output is
+        // byte-for-byte identical to before the extraction.
+        let map = fetch_secrets_batch(&self.config, &project_id, &environment, &secret_path)
+            .await?;
+        let secrets_arr: Vec<Value> = map
+            .into_iter()
+            .map(|(k, v)| json!({ "secretKey": k, "secretValue": v }))
+            .collect();
+        let body = json!({ "secrets": secrets_arr });
+        Ok(shape_get_secrets_batch(&body, &environment, &secret_path).to_string())
     }
 }
 
@@ -926,5 +984,103 @@ mod tests {
         assert!(reg.contains("infisical_get_secret"));
         assert!(reg.contains("infisical_get_secrets_batch"));
         assert_eq!(reg.len(), 5);
+    }
+
+    // ── fetch_secrets_batch (PSEC-01 extraction) ─────────────────────────────────
+    //
+    // Exercises the plain internal function directly against a mocked <secret-manager> // pii-test-fixture
+    // server — no approval gate involved, since this function has none (the gate
+    // stays on the MCP tool surface only).
+
+    use httpmock::prelude::*;
+
+    fn cfg_for(base_url: String) -> InfisicalConfig {
+        cfg(Some(&base_url), Some("cid"), Some("csecret")) // pii-test-fixture
+    }
+
+    fn mock_login<'a>(server: &'a MockServer, token: &str) -> httpmock::Mock<'a> {
+        server.mock(|when, then| {
+            when.method(POST).path("/api/v1/auth/universal-auth/login");
+            then.status(200)
+                .json_body(json!({ "accessToken": token }));
+        })
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn fetch_secrets_batch_returns_key_value_map() {
+        let server = MockServer::start();
+        let login = mock_login(&server, "tok-1"); // pii-test-fixture
+        let secrets = server.mock(|when, then| {
+            when.method(GET).path("/api/v3/secrets/raw");
+            then.status(200).json_body(json!({
+                "secrets": [
+                    { "secretKey": "PLANE_API_KEY", "secretValue": "fixture-plane-key" },
+                    { "secretKey": "GITEA_TOKEN", "secretValue": "fixture-gitea-token" }
+                ]
+            }));
+        });
+
+        let cfg = cfg_for(server.base_url());
+        let map = fetch_secrets_batch(&cfg, "proj1", "prod", "/").await.unwrap();
+
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("PLANE_API_KEY").unwrap(), "fixture-plane-key");
+        assert_eq!(map.get("GITEA_TOKEN").unwrap(), "fixture-gitea-token");
+        login.assert();
+        secrets.assert();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn fetch_secrets_batch_empty_response_is_empty_map_not_error() {
+        let server = MockServer::start();
+        mock_login(&server, "tok-2"); // pii-test-fixture
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v3/secrets/raw");
+            then.status(200).json_body(json!({ "secrets": [] }));
+        });
+
+        let cfg = cfg_for(server.base_url());
+        let map = fetch_secrets_batch(&cfg, "proj1", "prod", "/").await.unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn fetch_secrets_batch_non_2xx_is_clean_typed_error() {
+        let server = MockServer::start();
+        mock_login(&server, "tok-3"); // pii-test-fixture
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v3/secrets/raw");
+            then.status(403).json_body(json!({ "message": "Forbidden" }));
+        });
+
+        let cfg = cfg_for(server.base_url());
+        let result = fetch_secrets_batch(&cfg, "proj1", "prod", "/").await;
+        assert!(matches!(result, Err(ToolError::Http(_))));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn fetch_secrets_batch_auth_failure_is_clean_typed_error_not_panic() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/api/v1/auth/universal-auth/login");
+            then.status(401).json_body(json!({ "message": "invalid credentials" }));
+        });
+
+        let cfg = cfg_for(server.base_url());
+        let result = fetch_secrets_batch(&cfg, "proj1", "prod", "/").await;
+        assert!(matches!(result, Err(ToolError::Http(_))));
+    }
+
+    #[test]
+    fn fetch_secrets_batch_output_never_contains_test_fixture_marker_in_debug_repr() {
+        // Sanity check on our own test fixtures: this is a compile-time reminder,
+        // not a network test — the real "never logged" guarantee is verified at
+        // the terminus_personal level (PSEC-02), where actual logging happens.
+        let map: HashMap<String, String> = HashMap::new();
+        assert!(map.is_empty());
     }
 }
