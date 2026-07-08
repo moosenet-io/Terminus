@@ -114,7 +114,7 @@ their tools:
 | `dev` | Path-jailed dev workspace | `dev_read_file`, `dev_write_file`, `dev_run_command`, `dev_list_workspaces` |
 | `openhands` | Agentic coding runs (guarded) | `openhands_run_task`, `openhands_list_conversations`, `openhands_get_status` |
 | `gitea` | Gitea git forge | `gitea_create_repo`, `gitea_read_file`, `gitea_create_pr`, `gitea_merge_pr`, `gitea_cargo_publish` |
-| `github` | GitHub | `github_create_repo`, `github_list_repos`, `github_push_repo` |
+| `github` | GitHub | `github_create_repo`, `github_list_repos`, `github_push_repo`, `github_pii_scan` |
 | `plane` | Plane work management | `plane_create_work_item`, `plane_list_issues_by_state`, `plane_update_work_item`, `plane_create_module`, `plane_update_module`, `plane_delete_module`, `plane_add_issue_to_module`, `plane_remove_issue_from_module`, `plane_list_identities`, `plane_whoami`, `plane_prefix_check`, `plane_prefix_register` |
 | `nexus` | Inter-agent inbox | `nexus_send`, `nexus_check`, `nexus_read`, `nexus_ack`, `nexus_history` |
 | `axon` | Work-queue agent control | `axon_submit`, `axon_status`, `axon_list`, `axon_cancel` |
@@ -199,6 +199,58 @@ the tool cannot be turned into an arbitrary host-file read.
 | --- | --- | --- |
 | `CARGO_PUBLISH_MAX_CRATE_BYTES` | `67108864` (64 MiB) | Reject artifacts larger than this before reading. |
 | `CARGO_PUBLISH_ARTIFACT_DIR` | unset | When set, `crate_path` must resolve inside this directory (path jail). |
+
+## PII gate (Rust, authoritative)
+
+PII/secret detection is a single Rust engine in
+[`src/github/pii.rs`](src/github/pii.rs). It serves three surfaces from one rule
+set, so their coverage can never drift apart:
+
+- **Runtime write gate** — `pii_gate(content)` hard-blocks every GitHub write
+  tool before any network request fires. No flag or env var disables it.
+- **Tree sweep** — `PiiRuleSet::scan_tree(path)` walks a directory and returns
+  structured `TreeViolation { file, line, pattern_kind, context }`. `context` is
+  always a redacted snippet — the full matched secret is never stored or logged.
+- **`github_pii_scan` tool** — a read-only diagnostic (core registry) that scans
+  a `content` string or a `tree_path` and returns the same structured findings.
+
+The rule set combines generic built-in patterns (RFC-1918 ranges, API-key
+prefixes, JWTs, PEM keys, cloud keys, emails, phones) with **config-driven**
+repo-specific terms — no repo's hostnames or service names are hardcoded in the
+engine. Config is an optional repo-root `pii-gate.toml` (or a path in
+`TERMINUS_PII_CONFIG`):
+
+```toml
+extra_terms        = ["my-internal-host", "my-service"]   # word-boundary, case-insensitive
+extra_patterns     = ['''AKIA[A-Z0-9]{16}''']              # raw regexes; invalid ones are skipped
+allowed_emails     = ["@example.com"]                       # allow-listed author/placeholder emails
+excluded_files     = ["generated.rs"]
+excluded_extensions = ["snap"]
+excluded_dirs      = ["vendor"]
+```
+
+The `// pii-test-fixture` marker is the only exemption: it clears a **single
+tagged line** (never a blanket bypass) so deliberate PII-shaped test literals
+pass, exactly as the crate's own `no_pii_in_own_source_tree` self-check does.
+
+### Pre-push hook binary
+
+[`src/bin/pii_gate.rs`](src/bin/pii_gate.rs) is the Rust pre-push/pre-commit
+hook that replaces the legacy Python `.githooks/pii_gate.py`. It exits `0` when
+clean and `1` on any violation (hard block).
+
+```sh
+cargo build --release --bin pii_gate
+
+# install as the git pre-push hook (replacing the Python gate)
+ln -sf ../../target/release/pii_gate .git/hooks/pre-push
+
+# modes
+pii_gate                 # git pre-push: scans the pushed commit range (stdin protocol)
+pii_gate --staged        # git pre-commit: scans staged files
+pii_gate --tree [PATH]   # full-tree sweep (defaults to repo root) — used by the mirror engine
+pii_gate --json          # machine-readable JSON report
+```
 
 ## Plane identities (`PLANE_PAT_<NAME>` convention)
 

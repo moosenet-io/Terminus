@@ -39,6 +39,7 @@ use crate::tool::RustTool;
 
 pub mod pii;
 use pii::pii_gate;
+use pii::{scan_for_pii, scan_tree, violations_to_json};
 
 const DEFAULT_ORG: &str = "moosenet-io";
 const DEFAULT_GITEA_URL: &str = "https://gitea.example.com";
@@ -157,6 +158,61 @@ struct GitHubListRepos { cfg: GitHubConfig }
 struct GitHubCreateRepo { cfg: GitHubConfig }
 struct GitHubPushRepo { cfg: GitHubConfig }
 struct GitHubPushBranch { cfg: GitHubConfig }
+
+/// Read-only diagnostic: run the authoritative PII rule set over a text blob or
+/// a directory tree and return structured violations. This is the same engine
+/// that hard-blocks every GitHub write; exposing it as a tool lets agents and
+/// the mirror pipeline pre-check content without attempting a write.
+struct GitHubPiiScan;
+
+#[async_trait]
+impl RustTool for GitHubPiiScan {
+    fn name(&self) -> &str { "github_pii_scan" }
+
+    fn description(&self) -> &str {
+        "Scan text content or a local directory tree for PII / secret violations \
+         using the mandatory GitHub PII rule set. Read-only; returns structured \
+         violations (file, line, pattern_kind, redacted context). Provide either \
+         'content' or 'tree_path'."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "content":   { "type": "string", "description": "Text to scan for PII" },
+                "tree_path": { "type": "string", "description": "Local directory tree to sweep" }
+            }
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let content = args.get("content").and_then(Value::as_str);
+        let tree_path = args.get("tree_path").and_then(Value::as_str);
+        match (content, tree_path) {
+            (Some(text), _) => {
+                let vs = scan_for_pii(text);
+                Ok(json!({
+                    "clean": vs.is_empty(),
+                    "count": vs.len(),
+                    "violations": vs.iter().map(|v| json!({
+                        "line": v.line,
+                        "pattern_kind": v.category,
+                        "context": v.context,
+                    })).collect::<Vec<_>>(),
+                })
+                .to_string())
+            }
+            (None, Some(path)) => {
+                let vs = scan_tree(std::path::Path::new(path));
+                Ok(violations_to_json(&vs).to_string())
+            }
+            (None, None) => Err(ToolError::InvalidArgument(
+                "provide either 'content' or 'tree_path'".into(),
+            )),
+        }
+    }
+}
 
 #[async_trait]
 impl RustTool for GitHubListRepos {
@@ -836,6 +892,9 @@ impl RustTool for NotConfiguredStub {
 // ── Registration ──────────────────────────────────────────────────────────────
 
 pub fn register(registry: &mut ToolRegistry) {
+    // github_pii_scan is a pure, read-only diagnostic — always available,
+    // independent of whether GitHub write credentials are configured.
+    registry.register_or_replace(Box::new(GitHubPiiScan));
     match GitHubConfig::from_env() {
         Ok(cfg) => {
             registry.register_or_replace(Box::new(GitHubListRepos { cfg: cfg.clone() }));
