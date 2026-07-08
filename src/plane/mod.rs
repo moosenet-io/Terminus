@@ -542,15 +542,17 @@ impl RateLimiter {
         // so concurrent callers queue and pace one after another.
         let mut last = self.last.lock().await;
         let now = Instant::now();
-        match last.map(|prev| prev + self.min_interval) {
-            Some(next_allowed) if next_allowed > now => {
+        if let Some(next_allowed) = last.map(|prev| prev + self.min_interval) {
+            if next_allowed > now {
                 tokio::time::sleep(next_allowed - now).await;
-                *last = Some(next_allowed);
-            }
-            _ => {
-                *last = Some(now);
             }
         }
+        // Record the ACTUAL issue time (post-sleep). If the wakeup overslept
+        // `next_allowed`, this stays accurate so the next caller still gets a
+        // full `min_interval` from when this request really went out — storing
+        // `next_allowed` (possibly now in the past) would let the next call fire
+        // back-to-back.
+        *last = Some(Instant::now());
     }
 }
 
