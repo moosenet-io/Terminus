@@ -54,6 +54,14 @@ lettre = { version = "0.11", default-features = false, features = ["tokio1", "to
 axum = { version = "0.7", features = ["json", "macros"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["trace"] }
+# S100 (TERM): distributed Redis-backed Plane GET cache + rate limiter.
+# connection-manager gives a multiplexed, auto-reconnecting async connection;
+# `script` powers the atomic distributed rate-limiter Lua reservation.
+# TLS door: internal LAN needs none, so the second rustls stack that
+# `tokio-rustls-comp` pulls is deliberately NOT compiled in. To open the door
+# for a `rediss://` URL later, add "tokio-rustls-comp" to the feature list — no
+# code change is required (the URL scheme drives TLS in the redis client).
+redis = { version = "0.24", default-features = false, features = ["tokio-comp", "connection-manager", "script", "keep-alive"] }
 
 [dev-dependencies]
 # mcp_server tests drive the axum Router directly via `ServiceExt::oneshot`.

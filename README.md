@@ -215,6 +215,34 @@ which identity you can act as before creating or assigning Plane work. With no
 named identities configured it returns an empty list plus an explanatory note
 (not an error).
 
+## Plane request pacing & caching (optional shared Redis)
+
+The Plane tool paces its own outbound requests (a shared rate limiter) and caches
+GET responses briefly (per active token + URL). By default both live purely
+**in-process**. Point them at a Redis instance and they become **shared across
+every terminus process** that talks to Plane — one GET cache and one coordinated
+rate budget against Plane's API, instead of each process keeping its own copy and
+independently hammering the API.
+
+| Variable | Purpose |
+| --- | --- |
+| `PLANE_RPM` / `PLANE_RATE_SHARE` | Proactive pacing (default 60 RPM / share of 3 = a 3s minimum interval). |
+| `PLANE_CACHE_TTL_SECS` | GET response cache TTL (default 5s). |
+| `PLANE_REDIS_URL` | Redis endpoint (`redis://host:port/db`). **Unset/empty ⇒ pure in-process cache + limiter** (default; unchanged behavior). |
+| `PLANE_REDIS_PASSWORD` | Optional Redis AUTH password, kept out of the URL (materialized from the vault at runtime, never hardcoded). |
+| `PLANE_REDIS_TIMEOUT_MS` | Per-op Redis timeout (default 200ms). |
+
+**Robust fail-open.** Every Redis operation is bounded by a short timeout and
+guarded by a circuit breaker. On any Redis error, timeout, or outage the call
+transparently falls back to the in-process cache/limiter for that operation — a
+Redis outage never blocks, never slows (beyond one short timeout), and never
+fails a Plane call. When Redis recovers, coordination resumes automatically with
+no restart. The in-process cache is always kept warm as the instant fallback.
+Cache keys are namespaced and hashed (`plane:cache:<hash>` of active-token + URL),
+so no token material lands in Redis keys and one identity never sees another's
+cached response. TLS is not required on the internal LAN; a `rediss://` URL door
+is documented in `Cargo.toml`.
+
 ### Which identity to use (assignment convention)
 
 Create or transition a work item under the identity of whoever should **act on**
