@@ -619,32 +619,41 @@ pub fn ruleset_from_config(root: Option<&Path>) -> PiiRuleSet {
     PiiRuleSet::new()
 }
 
-/// The gate-config file paths (relative to `work_dir`) that GHMR-03 must DROP from
-/// an approved mirror commit — those that live INSIDE `work_dir`.
+/// Base-names the gate ALWAYS excludes from scanning ([`default_excluded_files`])
+/// that hold REAL sensitive values BY CONSTRUCTION — the gate config (its
+/// `extra_terms`/`extra_patterns` catalog) and the gate's audit log (which records
+/// the flagged PII contexts verbatim). Because they are base-name-excluded, a
+/// nested instance at ANY depth is skipped by the scanner too, so every in-tree
+/// instance must be dropped from the approved mirror rather than shipped unscanned.
 ///
-/// A gate config catalogs the REAL private matcher values (`extra_terms` /
-/// `extra_patterns`) the gate maps, and the gate deliberately excludes it from
-/// scanning — so committing it into the approved mirror would ship those raw
-/// values into public history even though the gate reports 0 residuals. Two
-/// distinct exclusion paths exist and BOTH must be covered:
+/// Deliberately NOT the other excluded base-names: `pii.rs`/`pii_gate.rs`/
+/// `pii_gate.py` hold only GENERIC pattern shapes (no real infra literals, per the
+/// spec), and `Cargo.lock`/`.gitignore`/`.moosenet-repo.toml`/images are ordinary
+/// repo content — all legitimate mirror content that must still ship.
+const MIRROR_DROP_BASENAMES: &[&str] = &["pii-gate.toml", "pii-gate-audit.jsonl"];
+
+/// The gate-internal file paths (relative to `work_dir`) that GHMR-03 must DROP
+/// from an approved mirror commit — every one that lives INSIDE `work_dir`.
+///
+/// A gate config catalogs the REAL private matcher values the gate maps, and the
+/// gate deliberately excludes it (and its audit log) from scanning — so committing
+/// them into the approved mirror would ship raw values into public history even
+/// though the gate reports 0 residuals. Coverage:
 ///
 ///  1. An explicit, non-empty `TERMINUS_PII_CONFIG` pointing inside the work dir —
-///     the active gate config (any base-name), loaded by [`ruleset_from_config`].
-///  2. A work-tree `pii-gate.toml`, which is ALWAYS base-name-excluded from
-///     scanning ([`default_excluded_files`]) regardless of the env var. An unset,
-///     empty, or externally-pointed `TERMINUS_PII_CONFIG` all leave such a file
-///     unscanned, so it must be dropped whenever present — this is the case codex
-///     flagged: an empty env value made the earlier single-path resolver return
-///     nothing while the file stayed unscanned-yet-committed.
+///     the active gate config (ANY base-name), loaded by [`ruleset_from_config`].
+///  2. EVERY in-tree file whose base-name is in [`MIRROR_DROP_BASENAMES`], at any
+///     depth — all are base-name-excluded from scanning regardless of the env var
+///     (unset / empty / externally-pointed all leave them unscanned), so a nested
+///     `subdir/pii-gate.toml` (or an audit log) would otherwise ship unscanned.
 ///
-/// A same-name env-pointed file (case 1 == case 2) is de-duplicated. An env var
-/// pointing at a DIFFERENTLY-named file inside the tree is NOT base-name-excluded,
-/// so it is scanned normally and its residual (if any) blocks approval on its own
-/// — nothing to special-case there.
+/// Paths are de-duplicated. An env var pointing at a DIFFERENTLY-named file inside
+/// the tree that is NOT base-name-excluded is scanned normally and blocks approval
+/// on its own residual — nothing to special-case there.
 pub fn active_gate_config_relpaths(work_dir: &Path) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let work_canon = work_dir.canonicalize().ok();
-    // Case 1: explicit non-empty env config resolving inside the work dir.
+    // Case 1: explicit non-empty env config resolving inside the work dir (any name).
     if let Ok(p) = std::env::var("TERMINUS_PII_CONFIG") {
         if !p.is_empty() {
             if let (Some(w), Some(abs)) = (work_canon.as_ref(), Path::new(&p).canonicalize().ok()) {
@@ -654,11 +663,49 @@ pub fn active_gate_config_relpaths(work_dir: &Path) -> Vec<String> {
             }
         }
     }
-    // Case 2: the always-base-name-excluded local `pii-gate.toml`.
-    if work_dir.join("pii-gate.toml").is_file() && !out.iter().any(|r| r == "pii-gate.toml") {
-        out.push("pii-gate.toml".to_string());
-    }
+    // Case 2: every base-name-excluded gate-internal file at any depth.
+    collect_mirror_drop_files(work_dir, work_dir, &mut out);
+    out.sort();
+    out.dedup();
     out
+}
+
+/// Recursively collect (relative to `root`) every file under `dir` whose base-name
+/// is in [`MIRROR_DROP_BASENAMES`]. Prunes the same directories the scanner does
+/// ([`default_excluded_dirs`], e.g. `.git`/`target`) and never follows symlinks.
+fn collect_mirror_drop_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
+    let excluded_dirs = default_excluded_dirs();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if ft.is_dir() {
+            let prune = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| excluded_dirs.contains(n))
+                .unwrap_or(false);
+            if !prune {
+                collect_mirror_drop_files(root, &path, out);
+            }
+        } else if ft.is_file() {
+            let base = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if MIRROR_DROP_BASENAMES.contains(&base) {
+                if let Ok(rel) = path.strip_prefix(root) {
+                    out.push(rel.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
 }
 
 /// Render a list of tree violations as a stable machine-readable JSON report.

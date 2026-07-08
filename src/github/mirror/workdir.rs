@@ -119,6 +119,7 @@ impl MirrorWorkDir {
     /// internal `main` (its sha already carries a `mirror-approved` tag) short-
     /// circuits to a no-op that keeps the existing tag.
     pub fn run(&self) -> Result<WorkDirRunReport, ToolError> {
+        self.ensure_disjoint_paths()?;
         let internal_sha = self.internal_head_sha()?;
 
         // Unchanged internal main → no-op, keep the existing approval tag. We key
@@ -171,6 +172,7 @@ impl MirrorWorkDir {
     /// The returned report's `synced` is `false` and `first_run` is `false`;
     /// [`run`](Self::run) overrides both when it drives the sync itself.
     pub fn finalize(&self, internal_sha: &str) -> Result<WorkDirRunReport, ToolError> {
+        self.ensure_disjoint_paths()?;
         // Mechanical sweep → residual detection via GHMR-01's gate.
         let sweep: SweepReport = sweep_tree_with_resolved_config(&self.work_dir)?;
         let residual = sweep.residual_violations.clone();
@@ -224,6 +226,43 @@ impl MirrorWorkDir {
     }
 
     // ── Steps ──────────────────────────────────────────────────────────────
+
+    /// Reject a source / work-dir configuration where the two paths equal or
+    /// contain one another. This is a hard SOURCE-ISOLATION guardrail: `sync_content`
+    /// starts by CLEARING the work-dir tree, so if the work dir equaled or contained
+    /// the source checkout that clear would delete internal `main`; and an equal path
+    /// would also make the mirror reuse the source's own history instead of the
+    /// promised independent lineage. [`MirrorWorkDir::new`] accepts arbitrary explicit
+    /// paths, so this is validated before ANY mutation (at the top of [`Self::run`] and
+    /// [`Self::finalize`]).
+    fn ensure_disjoint_paths(&self) -> Result<(), ToolError> {
+        // Canonicalize the longest existing prefix of each path so a not-yet-created
+        // work dir (first run) still resolves symlinks/`..` on its existing parent.
+        fn resolve(p: &Path) -> PathBuf {
+            if let Ok(c) = p.canonicalize() {
+                return c;
+            }
+            match (p.parent(), p.file_name()) {
+                (Some(parent), Some(name)) => match parent.canonicalize() {
+                    Ok(pc) => pc.join(name),
+                    Err(_) => p.to_path_buf(),
+                },
+                _ => p.to_path_buf(),
+            }
+        }
+        let src = resolve(&self.source);
+        let wd = resolve(&self.work_dir);
+        // `starts_with` is component-wise, so `/a/bc` does not "contain" `/a/b`.
+        if src == wd || src.starts_with(&wd) || wd.starts_with(&src) {
+            return Err(ToolError::InvalidArgument(format!(
+                "mirror work dir and internal source must be disjoint paths (neither equal \
+                 nor nested): source={}, work_dir={}",
+                src.display(),
+                wd.display()
+            )));
+        }
+        Ok(())
+    }
 
     /// The internal source's current `main` HEAD sha (full 40-char).
     fn internal_head_sha(&self) -> Result<String, ToolError> {
@@ -1114,6 +1153,78 @@ mod tests {
         );
 
         cleanup(&[&src, &wd]);
+    }
+
+    // ── a NESTED pii-gate.toml is also dropped from the approved tree (round 5 P1)
+    // is_excluded matches by base-name at ANY depth, so a nested gate config is
+    // unscanned too and must not ship.
+    #[test]
+    #[serial]
+    fn nested_gate_config_excluded_from_approved_commit() {
+        clear_env();
+        let src = init_source(&[
+            ("sub/pii-gate.toml", "extra_terms = [\"acme-nested-secret-host\"]\n"),
+            ("readme.md", "ordinary content\n"),
+        ]);
+        let wd = unique("wd");
+        let mgr = MirrorWorkDir::new("Terminus", &src, &wd);
+        let report = mgr.run().unwrap();
+
+        assert!(report.committed && report.tagged, "clean tree approved");
+        let tracked = run_git(&wd, &["ls-tree", "-r", "--name-only", "HEAD"]).unwrap();
+        assert!(
+            !tracked.lines().any(|l| l.trim() == "sub/pii-gate.toml"),
+            "nested gate config must not be in the approved tree: {tracked}"
+        );
+        assert!(!wd.join("sub/pii-gate.toml").exists(), "nested gate config dropped from work dir");
+        let head_grep = run_git(&wd, &["grep", "-l", "acme-nested-secret-host", "HEAD"]);
+        assert!(
+            head_grep.is_err() || head_grep.as_deref().map(str::trim).unwrap_or("").is_empty(),
+            "no committed blob may carry the nested gate-config term: {head_grep:?}"
+        );
+        assert!(tracked.lines().any(|l| l.trim() == "readme.md"), "ordinary content mirrored");
+
+        cleanup(&[&src, &wd]);
+    }
+
+    // ── source / work-dir path overlap is rejected before any mutation (round 5 P1)
+    #[test]
+    #[serial]
+    fn overlapping_source_and_workdir_paths_are_rejected() {
+        clear_env();
+        let src = init_source(&[("f.txt", "content\n")]);
+
+        // work_dir == source: clearing the work dir would delete the source checkout.
+        let same = MirrorWorkDir::new("Terminus", &src, &src);
+        assert!(
+            matches!(same.run(), Err(ToolError::InvalidArgument(_))),
+            "equal source/work_dir must be rejected"
+        );
+        // Source still intact — no mutation happened.
+        assert!(src.join(".git").exists() && src.join("f.txt").exists(), "source untouched");
+
+        // work_dir nested INSIDE source.
+        let nested_wd = src.join("mirror-out");
+        let wd_in_src = MirrorWorkDir::new("Terminus", &src, &nested_wd);
+        assert!(
+            matches!(wd_in_src.run(), Err(ToolError::InvalidArgument(_))),
+            "work_dir nested in source must be rejected"
+        );
+
+        // source nested INSIDE work_dir.
+        let outer_wd = unique("outer");
+        std::fs::create_dir_all(&outer_wd).unwrap();
+        let inner_src = init_source(&[("g.txt", "content\n")]);
+        // Move inner_src under outer_wd to make source a descendant of work_dir.
+        let src_under_wd = outer_wd.join("inner-src");
+        std::fs::rename(&inner_src, &src_under_wd).unwrap();
+        let src_in_wd = MirrorWorkDir::new("Terminus", &src_under_wd, &outer_wd);
+        assert!(
+            matches!(src_in_wd.run(), Err(ToolError::InvalidArgument(_))),
+            "source nested in work_dir must be rejected"
+        );
+
+        cleanup(&[&src, &outer_wd]);
     }
 
     // ── empty source repo → valid approved empty snapshot (P3) ────────────────
