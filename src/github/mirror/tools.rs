@@ -113,6 +113,23 @@ fn workdir_from_args(args: &Value) -> Result<MirrorWorkDir, ToolError> {
     MirrorWorkDir::from_config(repo, source)
 }
 
+/// Build the value handed to [`approval::gate`] so the approval code is bound to
+/// the FRESHLY-RESOLVED snapshot, not just the caller's `repo`/`source`. The gate
+/// content-binds on the whole args object (minus the approval code); injecting the
+/// recomputed `internal_sha` (and, for push, `approved_commit`) means a code
+/// approved while main was at commit A cannot be redeemed once the tool recomputes
+/// a different identity at commit B — the pending row no longer matches.
+fn gate_content_binding(args: &Value, internal_sha: &str, approved_commit: Option<&str>) -> Value {
+    let mut a = args.clone();
+    if let Some(obj) = a.as_object_mut() {
+        obj.insert("internal_sha".into(), json!(internal_sha));
+        if let Some(c) = approved_commit {
+            obj.insert("approved_commit".into(), json!(c));
+        }
+    }
+    a
+}
+
 /// The operator-blessed marker tag for an internal sha.
 fn blessed_tag(internal_sha: &str) -> String {
     format!("{BLESSED_TAG_PREFIX}{internal_sha}")
@@ -264,42 +281,35 @@ impl RustTool for GitHubMirrorStatus {
         let approved_tags = wd.approved_tags()?;
         let work_head = wd.head_sha_opt();
 
-        // Last-approved baseline: the mirror-approved tag sitting on the work-dir
-        // HEAD (the tip of the swept derivative is, by construction, the most
-        // recently approved snapshot). Its `<sha>` names the internal-main commit
-        // that snapshot was taken from — the divergence baseline.
-        let last_approved_internal_sha = match &work_head {
-            Some(head) => {
-                let at_head = run_git(wd.path(), &["tag", "--points-at", head])?;
-                at_head
-                    .lines()
-                    .map(str::trim)
-                    .find(|t| t.starts_with("mirror-approved/"))
-                    .map(|t| t.trim_start_matches("mirror-approved/").to_string())
-            }
-            None => None,
-        };
-
-        // Divergence: how many internal-main commits have landed since that
-        // baseline. 0 when the current sha IS the baseline; `null` when there is no
-        // baseline yet or the baseline is not an ancestor of HEAD (history rewrite).
-        let commits_since_last_approved: Option<u64> = match &last_approved_internal_sha {
-            Some(s) if *s == internal_sha => Some(0),
-            Some(s) => {
-                // Only a meaningful count when the baseline is genuinely an ANCESTOR
-                // of the current tip. After an internal history rewrite it is not,
-                // and `rev-list --count old..new` would still return a (misleading)
-                // number; report `null` in that case, per the documented contract.
-                if git_exit_ok(wd.source(), &["merge-base", "--is-ancestor", s, &internal_sha]) {
-                    run_git(wd.source(), &["rev-list", "--count", &format!("{s}..{internal_sha}")])
-                        .ok()
-                        .and_then(|o| o.trim().parse::<u64>().ok())
-                } else {
-                    None
+        // Last-approved baseline + divergence. The baseline is the approved internal
+        // sha CLOSEST to the current tip — the most recent approved snapshot that is
+        // still an ancestor of internal main. Computed over EVERY `mirror-approved`
+        // tag (not just those on the work-dir HEAD): when several internal commits
+        // produce byte-identical swept content, `commit_swept` reuses one work commit
+        // and stacks multiple tags on it, so a name-sorted `--points-at` pick could
+        // return an arbitrary (older) sha. Ranking every candidate by ancestor
+        // distance instead always lands on the true latest baseline, and yields
+        // `null` when NO approved sha is an ancestor (a history rewrite).
+        let mut baseline: Option<(u64, String)> = None;
+        for tag in &approved_tags {
+            let sha = tag.trim_start_matches("mirror-approved/").to_string();
+            let dist = if sha == internal_sha {
+                Some(0u64)
+            } else if git_exit_ok(wd.source(), &["merge-base", "--is-ancestor", &sha, &internal_sha]) {
+                run_git(wd.source(), &["rev-list", "--count", &format!("{sha}..{internal_sha}")])
+                    .ok()
+                    .and_then(|o| o.trim().parse::<u64>().ok())
+            } else {
+                None
+            };
+            if let Some(d) = dist {
+                if baseline.as_ref().map_or(true, |(bd, _)| d < *bd) {
+                    baseline = Some((d, sha));
                 }
             }
-            None => None,
-        };
+        }
+        let last_approved_internal_sha = baseline.as_ref().map(|(_, s)| s.clone());
+        let commits_since_last_approved: Option<u64> = baseline.as_ref().map(|(d, _)| *d);
 
         Ok(json!({
             "repo": args.get("repo").and_then(Value::as_str).unwrap_or(""),
@@ -430,13 +440,18 @@ impl RustTool for GitHubMirrorApprove {
         };
 
         // GUARDED: the operator must bless this snapshot out of band. The gate is
-        // content-bound to (repo, source) so a code approved for one repo can't be
-        // redeemed against another. The approval code is stripped before matching.
+        // content-bound to the FRESHLY-RESOLVED identity — repo, source, AND the
+        // recomputed internal_sha + approved_commit — so a code approved for one
+        // snapshot can never bless a different one: if internal main advances (or
+        // the resolved commit changes) between request and redemption, the tool
+        // recomputes a different internal_sha here, the gate content no longer
+        // matches the pending row, and the stale code is refused.
+        let gate_args = gate_content_binding(&args, &internal_sha, Some(&approved_commit));
         let summary = format!(
             "Approve mirror snapshot for '{repo}' (internal main {internal_sha}, commit \
              {approved_commit}) for public GitHub push"
         );
-        match approval::gate(self.name(), &args, &summary).await {
+        match approval::gate(self.name(), &gate_args, &summary).await {
             Gate::Granted => {
                 // Record the operator's authorisation as a distinct marker that ONLY
                 // this granted path creates — github_mirror_push requires it, so a
@@ -575,11 +590,16 @@ impl RustTool for GitHubMirrorPush {
         // GUARDED: the actual mutation of public state requires an operator blessing.
         // The summary names the RESOLVED remote so the operator authorises the exact
         // destination (the remote is caller-selectable) — not a generic "GitHub".
+        // The gate content is bound to the freshly-resolved internal_sha,
+        // approved_commit AND remote, so a pending code cannot authorise a different
+        // commit or a different destination if state changes before redemption.
+        let mut gate_args = gate_content_binding(&args, &internal_sha, Some(&approved_commit));
+        gate_args["github_remote"] = json!(remote);
         let summary = format!(
             "Fast-forward push approved mirror commit {approved_commit} (internal main \
              {internal_sha}) for '{repo}' to remote: {remote}"
         );
-        match approval::gate(self.name(), &args, &summary).await {
+        match approval::gate(self.name(), &gate_args, &summary).await {
             Gate::Granted => {}
             Gate::Pending(m) | Gate::Denied(m) => {
                 return Ok(json!({
@@ -1052,9 +1072,56 @@ mod tests {
             .await
             .unwrap();
         let sv: Value = serde_json::from_str(&st).unwrap();
-        // Baseline is still recorded, but c1 is no longer an ancestor → null count.
-        assert_eq!(sv["last_approved_internal_sha"], c1);
+        // c1 is no longer an ancestor of the rewritten HEAD → no valid baseline.
+        let _ = c1;
+        assert!(sv["last_approved_internal_sha"].is_null(), "rewritten history → no baseline");
         assert!(sv["commits_since_last_approved"].is_null(), "rewritten history → null divergence");
+
+        cleanup(&[&src, &root]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn status_picks_closest_baseline_when_multiple_tags_share_a_commit() {
+        // P2 regression: when two internal commits yield byte-identical swept content
+        // (here: c2 changes only the dropped pii-gate.toml), both mirror-approved tags
+        // land on ONE work commit. Status must rank by ancestor distance, not tag
+        // name-sort, so the CLOSEST approved sha is the baseline.
+        clear_env();
+        let src = init_source(&[
+            ("README.md", "clean content\n"),
+            ("pii-gate.toml", "extra_terms = [\"host-a\"]\n"),
+        ]);
+        let root = unique("root");
+        set_root(&root);
+        GitHubMirrorPrepare
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        // c2 changes ONLY the gate config (dropped from the mirror commit) → the
+        // swept tree is identical → a second mirror-approved tag on the same commit.
+        write_file(&src, "pii-gate.toml", "extra_terms = [\"host-b\"]\n");
+        commit_all(&src, "config only");
+        let c2 = run_git(&src, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        GitHubMirrorPrepare
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        // Two mirror-approved tags now exist on one work commit.
+        let wd = MirrorWorkDir::from_config("Terminus", &src).unwrap();
+        assert_eq!(wd.approved_tags().unwrap().len(), 2, "two tags share one work commit");
+
+        // Advance with a REAL content change → c3, unapproved.
+        write_file(&src, "README.md", "clean content 2\n");
+        commit_all(&src, "readme change");
+        let st = GitHubMirrorStatus
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        let sv: Value = serde_json::from_str(&st).unwrap();
+        // Baseline must be the CLOSEST approved ancestor (c2, dist 1), not c1 (dist 2).
+        assert_eq!(sv["last_approved_internal_sha"], c2, "closest approved baseline wins");
+        assert_eq!(sv["commits_since_last_approved"], 1);
 
         cleanup(&[&src, &root]);
     }
@@ -1381,6 +1448,23 @@ mod tests {
             );
         }
         cleanup(&[&root]);
+    }
+
+    #[test]
+    fn gate_content_binding_injects_resolved_identity() {
+        let args = json!({ "repo": "Terminus", "source": "/x", "_approval_code": "Z" });
+        let b = gate_content_binding(&args, "abc123", Some("commitxyz"));
+        assert_eq!(b["internal_sha"], "abc123");
+        assert_eq!(b["approved_commit"], "commitxyz");
+        assert_eq!(b["repo"], "Terminus");
+        // A different resolved sha yields different gate content → a stale code
+        // (bound to the old sha) cannot match.
+        let other = gate_content_binding(&args, "def456", Some("commitxyz"));
+        assert_ne!(b["internal_sha"], other["internal_sha"]);
+        // approved_commit omitted for the approve-without-commit shape.
+        let b2 = gate_content_binding(&args, "abc123", None);
+        assert!(b2.get("approved_commit").is_none());
+        assert_eq!(b2["internal_sha"], "abc123");
     }
 
     #[test]
