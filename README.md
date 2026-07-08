@@ -562,6 +562,59 @@ both the core Chord registry and the personal registry.
 Metadata per prefix: `prefix`, `name`, `project`, `spec_id`, `status`
 (`active`/`retired`/`ingested`/`complete`), `description`, `created`.
 
+## Forge provider abstraction (`src/forge/`)
+
+Terminus's git tooling is being reshaped from provider-specific tools (a "Gitea
+tool", a "GitHub tool") into two provider-**agnostic** domains that share one
+comprehensive endpoint surface and differ only by provider pool and governance
+posture:
+
+- **git-private** — self-hosted source-of-truth forges (full operator R/W).
+- **git-public** — public/mirror forges (the outbound exfiltration surface,
+  where the PII gate is load-bearing on every write).
+
+Both expose the **same** endpoint vocabulary — a forge is a forge. The split is
+provider pool + posture, not capability. `src/forge/` is the foundation both
+tools sit on (GITX-01); the concrete adapters and the two-tool assembly land in
+later items.
+
+### One surface: the endpoint vocabulary
+
+`forge::capability` defines the shared surface as a constant, machine-enumerable
+vocabulary (`ForgeEndpoint`, grouped by `ForgeDomain`): repos, branches/refs,
+commits, pull/merge requests, issues, releases/tags, webhooks,
+packages/registry, content, and org/collaboration. `ForgeEndpoint::all()`
+iterates the whole vocabulary. The vocabulary is constant across providers; only
+availability varies.
+
+### Availability varies: capability introspection
+
+Each adapter advertises which endpoints it supports via a `CapabilityMap`
+(per-endpoint `SupportLevel`: `supported` / `experimental` / `unsupported`; an
+absent entry defaults to `unsupported`). `CapabilityMap::report()` /
+`ForgeProvider::capability_report()` return the per-adapter support map as JSON,
+grouped by domain — the introspection surface both forge tools expose so callers
+can see what a given provider can and cannot do.
+
+### The trait and the "unsupported" negative path
+
+Every adapter implements `ForgeProvider` (`forge::provider`). The trait pairs the
+vocabulary with a capability-gated `dispatch`: an endpoint the adapter does not
+advertise returns a clean `ForgeError::Unsupported` naming the provider
+(`"endpoint 'repos_delete' is unsupported by provider 'sourcehut'"`), and an
+advertised-but-unwired endpoint returns `ForgeError::NotImplemented` — the
+surface **never fabricates** a result for a call it cannot make. Adapters
+implement `execute_endpoint` for the endpoints they support and declare them in
+`capabilities()`.
+
+### Credentials
+
+`CredentialRef` references a credential by its runtime secret **key name**
+(e.g. `GITEA_PAT_<NAME>`, `GITHUB_PAT_<NAME>`) — never the secret value. Adapters
+resolve the actual token at call time from the secret store via
+`SecretManager` / `vault::manager().get(key_name)`, so no credential literal ever
+appears in source, config, or logs.
+
 ## License
 
 MIT
