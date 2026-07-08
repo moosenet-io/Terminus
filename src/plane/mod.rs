@@ -1410,8 +1410,21 @@ impl RustTool for PlaneCreateWorkItem {
         // Optional module link: Plane CE's issue-create endpoint does not accept
         // a module field, so membership is established as a second call against
         // the module-issues endpoint once the issue id is known.
+        //
+        // Partial-success handling (codex P2): the issue is already created at
+        // this point. If the link fails, DO NOT return a bare error that hides
+        // the created id — that loses the id and invites a retry that creates a
+        // duplicate issue. Instead surface an error that carries the created
+        // id/sequence and tells the caller to link (not recreate) it.
         let module_note = if let Some(module_id) = args.get("module_id").and_then(|v| v.as_str()) {
-            client.add_issues_to_module(&project_id, module_id, &[i.id.clone()]).await?;
+            if let Err(e) = client.add_issues_to_module(&project_id, module_id, &[i.id.clone()]).await {
+                return Err(ToolError::Http(format!(
+                    "Issue was created (ID: {id}, #{seq}) but adding it to module {module_id} \
+                     failed: {e}. The issue exists — link it with plane_add_issue_to_module \
+                     (do NOT re-run plane_create_work_item, which would create a duplicate).",
+                    id = i.id, seq = i.sequence_id.unwrap_or(0)
+                )));
+            }
             format!("\nModule: {module_id}")
         } else {
             String::new()
@@ -3265,6 +3278,39 @@ mod tests {
             "project_id": "p1", "name": "Task", "module_id": "m1"
         })).await.unwrap();
         assert!(result.contains("Task") && result.contains("m1"), "{result}");
+        create_mock.assert();
+        link_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_create_work_item_module_link_failure_preserves_issue_id() {
+        // codex P2: when the issue is created but the module link fails, the
+        // error must carry the created issue id/sequence and steer the caller
+        // to link (not recreate) — so a retry can't duplicate the issue.
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        let create_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/workspaces/testws/projects/p1/issues/");
+            then.status(201).json_body(json!({
+                "id": "issue-42", "name": "Task", "project": "p1",
+                "workspace": "testws", "sequence_id": 42
+            }));
+        });
+        // The module-issues link fails (module gone / bad id).
+        let link_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/workspaces/testws/projects/p1/modules/bad/module-issues/");
+            then.status(404).body("module not found");
+        });
+        let client = mock_client(&server);
+        let tool = PlaneCreateWorkItem { client };
+        let err = tool.execute(json!({
+            "project_id": "p1", "name": "Task", "module_id": "bad"
+        })).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("issue-42"), "error must preserve created id: {msg}");
+        assert!(msg.contains("42"), "error must preserve sequence: {msg}");
+        assert!(msg.contains("plane_add_issue_to_module"), "error must steer to link, not recreate: {msg}");
         create_mock.assert();
         link_mock.assert();
     }
