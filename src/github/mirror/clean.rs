@@ -37,7 +37,10 @@
 //! escalated — it can never smuggle residual PII into an approved tag.
 //!
 //! In production the cleaner is dispatched through a config-driven command hook
-//! ([`CommandCleaner`], from [`CLEAN_CMD_ENV`]); tests inject a mock. When no
+//! ([`CommandCleaner`], from [`CLEAN_CMD_ENV`]) with a **cleared environment** —
+//! only `PATH`, `HOME`, and the `MIRROR_WORK_DIR` / `MIRROR_RESIDUALS_FILE` handoff
+//! vars are passed, so the external subagent never inherits the parent's service
+//! credentials (GitHub / Plane PATs, DB URLs). Tests inject a mock. When no
 //! command is configured, [`dispatch_cleaning`] escalates immediately (0 rounds)
 //! rather than silently passing residuals through.
 
@@ -134,13 +137,28 @@ impl ResidualCleaner for CommandCleaner {
             ToolError::Execution(format!("failed writing residuals file for cleaning command: {e}"))
         })?;
 
-        let status = Command::new("sh")
-            .arg("-c")
+        // Least-privilege: CLEAR the inherited environment before launching the
+        // cleaner. The parent (terminus / the dev-box mirror invocation) holds
+        // service credentials — GITHUB_TOKEN, PLANE_PAT_*, DATABASE_URL — that an
+        // external cleaning subagent has no business seeing; inheriting them would
+        // contradict the scoped-cleaner contract and leak unrelated secrets. Pass
+        // only what the hook legitimately needs: PATH + HOME (so the shell resolves
+        // binaries / a home-relative toolchain — neither is a secret) and the two
+        // MIRROR_* handoff vars.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
             .arg(&self.cmd)
             .current_dir(work_dir)
+            .env_clear()
             .env("MIRROR_WORK_DIR", work_dir)
-            .env("MIRROR_RESIDUALS_FILE", &residuals_file)
-            .status();
+            .env("MIRROR_RESIDUALS_FILE", &residuals_file);
+        if let Ok(path) = std::env::var("PATH") {
+            cmd.env("PATH", path);
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            cmd.env("HOME", home);
+        }
+        let status = cmd.status();
         let _ = std::fs::remove_file(&residuals_file);
 
         match status {
@@ -770,6 +788,37 @@ mod tests {
         assert!(!real.join("real-wd").exists() && !real.join("link-wd").exists(), "no nested dir");
 
         cleanup(&[&real, &link]);
+    }
+
+    // ── the cleaner does NOT inherit parent service credentials ───────────────
+    // (codex round 2 P1) env_clear + explicit allowlist: a secret-shaped var in the
+    // parent must not reach the external cleaning subagent, but the MIRROR_* handoff
+    // vars must.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn command_cleaner_does_not_inherit_parent_secrets() {
+        clear_env();
+        let wd = unique("wd");
+        std::fs::create_dir_all(&wd).unwrap();
+        // A secret-shaped var set in the PARENT process env.
+        std::env::set_var("GITHUB_TOKEN", "<REDACTED-SECRET>"); // pii-test-fixture
+        std::env::set_var(
+            CLEAN_CMD_ENV,
+            // Dump what the child can see for the two vars.
+            "printf 'tok=[%s] wd=[%s]' \"$GITHUB_TOKEN\" \"$MIRROR_WORK_DIR\" > \"$MIRROR_WORK_DIR/env.txt\"",
+        );
+        let cleaner = CommandCleaner::from_env().unwrap();
+        cleaner.clean_round(&wd, &[]).unwrap();
+        std::env::remove_var(CLEAN_CMD_ENV);
+        std::env::remove_var("GITHUB_TOKEN");
+
+        let seen = std::fs::read_to_string(wd.join("env.txt")).unwrap();
+        assert!(seen.contains("tok=[]"), "parent secret must NOT reach the cleaner: {seen}");
+        assert!(!seen.contains("<REDACTED-SECRET>"), "no secret leaked: {seen}"); // pii-test-fixture
+        assert!(seen.contains("wd=[/"), "MIRROR_WORK_DIR must be passed (absolute): {seen}");
+
+        cleanup(&[&wd]);
     }
 
     // ── cleaning NEVER touches the source repo ────────────────────────────────

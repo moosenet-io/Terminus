@@ -294,7 +294,9 @@ bounded cleaning pass** rather than just returning them:
    work dir it may edit) and `MIRROR_RESIDUALS_FILE` (a JSON list of the residual
    `{file, line, pattern_kind, context}` spots) in its environment, cwd set to the
    work dir. It remediates the flagged spots **in the work dir only** — the source
-   repo is never handed to it and never touched.
+   repo is never handed to it and never touched. The command runs with a **cleared
+   environment** (only `PATH`, `HOME`, and the two `MIRROR_*` vars are passed), so
+   the external subagent never inherits the parent's service credentials.
 2. Re-run the sweep + authoritative gate. If 0 residuals remain, the cleaned tree
    is committed and tagged `mirror-approved/<sha>` (tag-able).
 3. Repeat up to **3 rounds** (the infinite-loop guard, which also stops early on a
