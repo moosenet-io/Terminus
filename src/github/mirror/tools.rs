@@ -54,6 +54,7 @@ use crate::github::github_token;
 use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
+use super::clean::dispatch_cleaning;
 use super::workdir::{assert_never_force, run_git, MirrorWorkDir};
 
 /// Environment variable holding the target GitHub mirror remote URL when a call
@@ -351,9 +352,12 @@ impl RustTool for GitHubMirrorPrepare {
          tree content in, run the mechanical PII sweep, run the authoritative PII gate, \
          and commit the swept derivative to the work dir's own linear history — creating \
          a mirror-approved/<internal-sha> tag ONLY when the gate reports 0 residual \
-         violations. When residual (non-mechanical) violations remain, nothing is tagged \
-         and they are returned for GHMR-05 subagent cleaning. Requires 'repo' and 'source' \
-         (the dev-box internal-main checkout). Writes ONLY to the work dir, never the source."
+         violations. When residual (non-mechanical) violations remain, it runs the \
+         operationalized bounded cleaning pass (GHMR-05): a configured cleaning subagent \
+         remediates the flagged spots in the work dir and re-gates, up to 3 rounds — driving \
+         the gate to 0 (then committed + tagged) or escalating the exact file:line spots to \
+         the operator. Requires 'repo' and 'source' (the dev-box internal-main checkout). \
+         Writes ONLY to the work dir, never the source."
     }
 
     fn parameters(&self) -> Value {
@@ -371,6 +375,17 @@ impl RustTool for GitHubMirrorPrepare {
         let wd = workdir_from_args(&args)?;
         ensure_source_is_main(wd.source())?;
         let report = wd.run()?;
+
+        // GHMR-05: when the mechanical sweep leaves residual (non-mechanical)
+        // violations, run the operationalized, bounded cleaning pass (a configured
+        // cleaning subagent editing the work dir only) instead of just returning the
+        // residuals. It drives the gate to 0 (→ committed + tagged) or escalates the
+        // exact spots to the operator. No cleaner configured → immediate escalation,
+        // never a silent pass-through.
+        if !report.residual_violations.is_empty() {
+            let outcome = dispatch_cleaning(&wd, &report)?;
+            return Ok(outcome.to_json().to_string());
+        }
         Ok(report.to_json().to_string())
     }
 }
@@ -685,7 +700,10 @@ fn perform_ff_push(
     // Refspec `<sha>:refs/heads/main` with NO leading `+` — git refuses a
     // non-fast-forward update, a second safety net beneath our ff pre-check.
     let refspec = format!("{approved_commit}:refs/heads/main");
-    let argv = ["push", "--", remote, &refspec];
+    // `-c core.hooksPath=/dev/null` disables hooks (e.g. a planted pre-push) for the
+    // same reason GHMR-03's run_git does: the work dir is cleaner-writable and must
+    // never execute a hook under the parent's environment during transport.
+    let argv = ["-c", "core.hooksPath=/dev/null", "push", "--", remote, &refspec];
     assert_never_force(&argv);
 
     // GIT_ASKPASS script reads the token from a private env var passed only to
