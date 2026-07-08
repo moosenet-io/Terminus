@@ -517,26 +517,40 @@ impl RateLimiter {
         }
         if let Some(backend) = &self.redis {
             if let Some(wait) = backend.rate_reserve(self.min_interval).await {
+                let reserved_slot = Instant::now() + wait;
+                // Record the reserved (possibly future) slot into the local gate
+                // BEFORE sleeping. If Redis drops mid-sleep, a concurrent caller
+                // that falls back to the local limiter then serialises AFTER this
+                // reserved request (its next-allowed = reserved_slot + interval)
+                // instead of racing to the same instant — no failover burst.
+                {
+                    let mut last = self.last.lock().await;
+                    if last.is_none_or(|prev| reserved_slot > prev) {
+                        *last = Some(reserved_slot);
+                    }
+                }
                 if !wait.is_zero() {
                     tokio::time::sleep(wait).await;
                 }
-                // Warm the local gate too: if Redis becomes unavailable right
-                // after this reservation, the first in-process fallback call
-                // still sees a recent request and enforces spacing rather than
-                // firing immediately (no burst across the outage transition).
-                *self.last.lock().await = Some(Instant::now());
                 return;
             }
             // Redis unavailable → fall through to the in-process gate below.
         }
+        // In-process gate (default + fail-open fallback). Absolute-time based so
+        // a future `last` (a slot reserved via Redis just above) is honoured:
+        // next-allowed = last + min_interval. The lock is held across the sleep
+        // so concurrent callers queue and pace one after another.
         let mut last = self.last.lock().await;
-        if let Some(prev) = *last {
-            let elapsed = prev.elapsed();
-            if elapsed < self.min_interval {
-                tokio::time::sleep(self.min_interval - elapsed).await;
+        let now = Instant::now();
+        match last.map(|prev| prev + self.min_interval) {
+            Some(next_allowed) if next_allowed > now => {
+                tokio::time::sleep(next_allowed - now).await;
+                *last = Some(next_allowed);
+            }
+            _ => {
+                *last = Some(now);
             }
         }
-        *last = Some(Instant::now());
     }
 }
 
