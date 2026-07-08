@@ -171,6 +171,41 @@ secret-materialization step (the vault-backed secret store, surfaced as
 `INFISICAL_*`-configured fetches at startup) — never hardcoded into a unit file
 or committed anywhere.
 
+### Acting as an identity: the `identity` argument
+
+Every Plane **CRUD tool** (`plane_list_projects`, `plane_create_work_item`,
+`plane_update_work_item`, `plane_close_work_item`, `plane_create_comment`, …)
+accepts an **optional `identity` argument**. Set it to a configured
+`PLANE_PAT_<NAME>` name (e.g. `"claude"`, `"harmony"`) and that single call is
+authenticated as that identity's token — so the work item is created/updated
+under the right actor. Omit it and the call acts as the **active default**
+identity.
+
+The active default is resolved once at startup:
+
+- If `PLANE_IDENTITY_NAME` names a configured `PLANE_PAT_<NAME>` identity, the
+  default token **is that identity's token** — e.g. `PLANE_IDENTITY_NAME=lumina`
+  makes every no-`identity` call genuinely act as `PLANE_PAT_LUMINA`, not just
+  display the label.
+- Otherwise it falls back to the unsuffixed `PLANE_API_KEY`. A deployment that
+  configures only `PLANE_API_KEY` (no named default) behaves exactly as before —
+  full backward compatibility.
+
+Selection is centralized: all CRUD tools route through the same
+`PlaneClient::resolve_identity` → `for_identity` dispatch, so the rule lives in
+one place. The `identity` argument is used only to pick the token — it is never
+written into a request body and never logged, and switching identity never
+crosses the per-token GET cache.
+
+### Checking a token's health: `plane_whoami` with `verify`
+
+`plane_whoami` reports the active identity and, given `identity`, whether that
+name is configured. Pass **`verify: true`** to make a real authenticated read as
+the selected identity (explicit `identity`, else the active default) and report
+whether its token is currently **valid (200)** or **rejected (401/403 — likely
+expired or revoked)**. This is the per-identity health check a future audit uses
+to find expired PATs. It reports the auth outcome only — never a token value.
+
 ### Listing identities: `plane_list_identities`
 
 `plane_list_identities` returns the names of every configured `PLANE_PAT_<NAME>`
