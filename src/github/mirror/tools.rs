@@ -264,6 +264,33 @@ impl RustTool for GitHubMirrorStatus {
         let approved_tags = wd.approved_tags()?;
         let work_head = wd.head_sha_opt();
 
+        // Last-approved baseline: the mirror-approved tag sitting on the work-dir
+        // HEAD (the tip of the swept derivative is, by construction, the most
+        // recently approved snapshot). Its `<sha>` names the internal-main commit
+        // that snapshot was taken from — the divergence baseline.
+        let last_approved_internal_sha = match &work_head {
+            Some(head) => {
+                let at_head = run_git(wd.path(), &["tag", "--points-at", head])?;
+                at_head
+                    .lines()
+                    .map(str::trim)
+                    .find(|t| t.starts_with("mirror-approved/"))
+                    .map(|t| t.trim_start_matches("mirror-approved/").to_string())
+            }
+            None => None,
+        };
+
+        // Divergence: how many internal-main commits have landed since that
+        // baseline. 0 when the current sha IS the baseline; `null` when there is no
+        // baseline yet or the baseline is not an ancestor of HEAD (history rewrite).
+        let commits_since_last_approved: Option<u64> = match &last_approved_internal_sha {
+            Some(s) if *s == internal_sha => Some(0),
+            Some(s) => run_git(wd.source(), &["rev-list", "--count", &format!("{s}..{internal_sha}")])
+                .ok()
+                .and_then(|o| o.trim().parse::<u64>().ok()),
+            None => None,
+        };
+
         Ok(json!({
             "repo": args.get("repo").and_then(Value::as_str).unwrap_or(""),
             "work_dir": wd.path().display().to_string(),
@@ -275,6 +302,13 @@ impl RustTool for GitHubMirrorStatus {
             "internal_main_approved": approved,
             "needs_prepare": !approved,
             "work_head": work_head,
+            // The last approved snapshot (baseline) + how far internal main has
+            // diverged past it.
+            "last_approved_internal_sha": last_approved_internal_sha,
+            "last_approved_tag": last_approved_internal_sha
+                .as_ref()
+                .map(|s| format!("mirror-approved/{s}")),
+            "commits_since_last_approved": commits_since_last_approved,
             "approved_tag_count": approved_tags.len(),
             "approved_tags": approved_tags,
         })
@@ -941,6 +975,40 @@ mod tests {
         assert_eq!(sv["needs_prepare"], false);
         assert_eq!(sv["approved_tag_count"], 1);
         assert_eq!(sv["internal_sha"], run_git(&src, &["rev-parse", "HEAD"]).unwrap().trim());
+        // Current sha IS the baseline → 0 divergence.
+        assert_eq!(sv["commits_since_last_approved"], 0);
+        assert_eq!(sv["last_approved_internal_sha"], sv["internal_sha"]);
+
+        cleanup(&[&src, &root]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn status_reports_divergence_since_last_approved() {
+        clear_env();
+        let src = init_source(&[("a.txt", "v1 clean\n")]);
+        let root = unique("root");
+        set_root(&root);
+        GitHubMirrorPrepare
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        let c1 = run_git(&src, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        // Advance internal main by two commits WITHOUT re-preparing.
+        write_file(&src, "a.txt", "v2 clean\n");
+        commit_all(&src, "v2");
+        write_file(&src, "a.txt", "v3 clean\n");
+        commit_all(&src, "v3");
+
+        let st = GitHubMirrorStatus
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        let sv: Value = serde_json::from_str(&st).unwrap();
+        assert_eq!(sv["internal_main_approved"], false);
+        assert_eq!(sv["needs_prepare"], true);
+        assert_eq!(sv["last_approved_internal_sha"], c1, "baseline is the first approved snapshot");
+        assert_eq!(sv["commits_since_last_approved"], 2, "internal main advanced two commits");
 
         cleanup(&[&src, &root]);
     }
