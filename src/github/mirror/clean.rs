@@ -101,6 +101,15 @@ impl CommandCleaner {
 
 impl ResidualCleaner for CommandCleaner {
     fn clean_round(&self, work_dir: &Path, residuals: &[TreeViolation]) -> Result<(), ToolError> {
+        // Resolve the work dir to an ABSOLUTE path before handing it to the child.
+        // TERMINUS_MIRROR_WORKDIR_ROOT may be relative, so `work_dir` can be too;
+        // once it is the child's cwd, a relative `MIRROR_WORK_DIR` would make a
+        // contract-following cleaner (`$MIRROR_WORK_DIR/<file>`) resolve BENEATH the
+        // work dir (cwd/work_dir/…) rather than at the file. Canonicalising fixes
+        // both cwd and the env var (and resolves symlinks). The work dir exists here
+        // (prepare's `run` created it before any residual), so canonicalize succeeds.
+        let work_dir = work_dir.canonicalize().unwrap_or_else(|_| work_dir.to_path_buf());
+        let work_dir = work_dir.as_path();
         // Serialize the residual spots to a temp JSON file the command reads. The
         // context snippets are already redacted by the gate; no full secret is
         // written here.
@@ -327,8 +336,13 @@ pub fn dispatch_cleaning(
             residual_violations: residuals,
             reason: format!(
                 "residual PII violations remain and no cleaning command is configured \
-                 ({CLEAN_CMD_ENV} unset) — clean the flagged spots in the work dir (or configure \
-                 the cleaning subagent) then re-run github_mirror_prepare"
+                 ({CLEAN_CMD_ENV} unset). Configure the cleaning-subagent command so the bounded \
+                 pass runs INSIDE prepare (its work-dir edits survive via finalize), or remediate \
+                 the flagged spots at their source (internal main / the placeholder+gate config) \
+                 and re-run github_mirror_prepare. NOTE: hand-editing the work dir and re-running \
+                 prepare does NOT work — prepare re-syncs internal main's tree and discards those \
+                 edits; only the in-prepare cleaning pass (which finalizes without re-syncing) or \
+                 a source-side fix is a valid remediation path."
             ),
         }),
     }
@@ -718,6 +732,44 @@ mod tests {
         assert!(std::fs::read_to_string(src.join("config.txt")).unwrap().contains("ghp_")); // pii-test-fixture
 
         cleanup(&[&src, &wd_path]);
+    }
+
+    // ── CommandCleaner hands the cleaner an ABSOLUTE, symlink-resolved path ────
+    // (codex P2) A relative/symlinked work dir would make a contract-following
+    // `$MIRROR_WORK_DIR/<file>` cleaner target the wrong path once cwd is the work
+    // dir. clean_round must canonicalize before setting cwd + MIRROR_WORK_DIR.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn command_cleaner_passes_absolute_workdir() {
+        clear_env();
+        // A real work dir reached through a SYMLINK — canonicalize must resolve it.
+        let real = unique("real-wd");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = unique("link-wd");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // The command records the MIRROR_WORK_DIR it received into the work dir.
+        std::env::set_var(
+            CLEAN_CMD_ENV,
+            "printf '%s' \"$MIRROR_WORK_DIR\" > \"$MIRROR_WORK_DIR/seen_path.txt\"",
+        );
+        let cleaner = CommandCleaner::from_env().unwrap();
+        cleaner.clean_round(&link, &[]).unwrap();
+        std::env::remove_var(CLEAN_CMD_ENV);
+
+        // The file landed in the REAL dir (not real/real or link/link), and the
+        // path the cleaner saw is absolute + symlink-resolved.
+        let seen = std::fs::read_to_string(real.join("seen_path.txt")).unwrap();
+        assert!(Path::new(&seen).is_absolute(), "MIRROR_WORK_DIR must be absolute: {seen}");
+        assert_eq!(
+            Path::new(&seen).canonicalize().unwrap(),
+            real.canonicalize().unwrap(),
+            "cleaner path must resolve to the real work dir"
+        );
+        assert!(!real.join("real-wd").exists() && !real.join("link-wd").exists(), "no nested dir");
+
+        cleanup(&[&real, &link]);
     }
 
     // ── cleaning NEVER touches the source repo ────────────────────────────────
