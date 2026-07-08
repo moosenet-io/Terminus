@@ -1128,6 +1128,35 @@ mod tests {
         cleanup(&[&src, &wd]);
     }
 
+    // ── a symlink whose target embeds PII blocks approval (codex round 2 P1) ──
+    // git archive preserves a tracked symlink as a blob whose content IS the raw
+    // target path; the sweep + gate skip symlink bodies, so a PII-bearing target
+    // must be caught as residual, or it ships unscanned into an approved commit.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn symlink_target_with_pii_blocks_approval() {
+        clear_env();
+        let src = init_source(&[("readme.txt", "clean content\n")]);
+        // Tracked symlink whose TARGET embeds a private infra IP.
+        std::os::unix::fs::symlink("/mnt/<internal-ip>/share", src.join("data")).unwrap(); // pii-test-fixture
+        commit_source(&src, &[], &[], "add pii symlink");
+
+        let wd = unique("wd");
+        let mgr = MirrorWorkDir::new("Terminus", &src, &wd);
+        let report = mgr.run().unwrap();
+
+        assert!(
+            report.residual_violations.iter().any(|v| v.file == "data"),
+            "symlink target PII must surface as residual: {:?}",
+            report.residual_violations
+        );
+        assert!(!report.committed, "dirty symlink target blocks the approval commit");
+        assert!(!report.tagged, "no mirror-approved tag while a symlink target leaks PII");
+        assert!(tag_list(&wd).is_empty(), "no approval tag created");
+        cleanup(&[&src, &wd]);
+    }
+
     // ── force/hard tokens are structurally rejected ──────────────────────────
     #[test]
     #[should_panic(expected = "force/hard token")]

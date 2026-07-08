@@ -490,6 +490,64 @@ fn collect_files(root: &Path, rs: &PiiRuleSet, skip: &[PathBuf]) -> Vec<PathBuf>
     out
 }
 
+/// Scan tracked-symlink TARGETS for PII. Both the mechanical sweep and
+/// [`PiiRuleSet::scan_tree`] skip symlinks entirely (correct for traversal
+/// safety), but `git archive` preserves a tracked symlink as a blob whose CONTENT
+/// is the raw target path string. A target embedding PII — an internal absolute
+/// path, a real username, an infra host — would therefore ship into an approved
+/// mirror commit completely unscanned. Fold each such target into residual so a
+/// dirty symlink BLOCKS the approval tag: a symlink target cannot be mechanically
+/// rewritten without risking a broken link, so (like other residual) it is left
+/// for GHMR-05 / human judgment rather than silently rewritten.
+///
+/// Honors the ruleset's directory exclusions (matching the walk posture of the
+/// sweep and `scan_tree`). `context` is intentionally omitted (the raw target
+/// could itself be the PII); the file path + category are enough to locate it.
+fn symlink_target_violations(root: &Path, rs: &PiiRuleSet) -> Vec<TreeViolation> {
+    let mut out = Vec::new();
+    fn walk(dir: &Path, root: &Path, rs: &PiiRuleSet, out: &mut Vec<TreeViolation>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if ft.is_symlink() {
+                // The link target string is the published blob content.
+                let target = match std::fs::read_link(&path) {
+                    Ok(t) => t.to_string_lossy().into_owned(),
+                    Err(_) => continue,
+                };
+                let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
+                for v in rs.scan_content(&target) {
+                    out.push(TreeViolation {
+                        file: rel.clone(),
+                        line: v.line,
+                        pattern_kind: v.category,
+                        // The target itself may be the secret — don't echo it back.
+                        context: "<symlink target>".to_string(),
+                    });
+                }
+            } else if ft.is_dir() {
+                let excluded = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| rs.is_excluded_dir(n))
+                    .unwrap_or(false);
+                if !excluded {
+                    walk(&path, root, rs, out);
+                }
+            }
+        }
+    }
+    walk(root, root, rs, &mut out);
+    out
+}
+
 /// The canonicalized path of the single active placeholder config that must
 /// never be rewritten or counted as residual PII — mirroring
 /// `placeholder_config_from`'s resolution exactly: the
@@ -614,11 +672,15 @@ pub fn sweep_tree(work_dir: &Path, cfg: &PlaceholderConfig) -> Result<SweepRepor
     // exact active-config path is dropped (via skip_rels), never a same-named
     // nested file, which stays visible in the residual report.
     let skip_rels = skip_relative_names(work_dir, &skip);
-    let residual_violations: Vec<TreeViolation> = ruleset
+    let mut residual_violations: Vec<TreeViolation> = ruleset
         .scan_tree(work_dir)
         .into_iter()
         .filter(|v| !skip_rels.contains(&v.file))
         .collect();
+    // `scan_tree` skips symlinks, but a tracked symlink's target string is
+    // published verbatim as its blob — scan those targets too so a symlink
+    // pointing at a PII-bearing path blocks approval instead of leaking silently.
+    residual_violations.extend(symlink_target_violations(work_dir, &ruleset));
 
     Ok(SweepReport {
         files_rewritten,
