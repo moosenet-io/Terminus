@@ -349,6 +349,22 @@ fn rewrite_content(
         let mut result = String::with_capacity(current.len());
         let mut last = 0usize;
         for m in rule.re.find_iter(&current) {
+            // Honor the `// pii-test-fixture` exemption exactly as GHMR-01's
+            // scan_tree does: a match on a fixture-marked line is left intact,
+            // so the rewrite pass and the authoritative residual scan agree on
+            // which literals are deliberately preserved (test expectations,
+            // rule-definition fixtures) rather than the sweep mangling them.
+            let line_start = current[..m.start()].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let line_end = current[m.end()..]
+                .find('\n')
+                .map(|i| m.end() + i)
+                .unwrap_or(current.len());
+            if current[line_start..line_end].contains("pii-test-fixture") {
+                // Pass the matched span through unchanged.
+                result.push_str(&current[last..m.end()]);
+                last = m.end();
+                continue;
+            }
             result.push_str(&current[last..m.start()]);
             let token = state.token_for(&rule.token, rule.distinct, m.as_str());
             // 1-based line of the match start within the current buffer.
@@ -463,6 +479,21 @@ fn env_config_skip() -> Vec<PathBuf> {
     }
 }
 
+/// The `skip` config paths (canonical) expressed relative to `work_dir`, so they
+/// can be matched against `TreeViolation.file` (a work-dir-relative path) to drop
+/// the active config from residual results.
+fn skip_relative_names(work_dir: &Path, skip: &[PathBuf]) -> Vec<String> {
+    let work_canon = work_dir.canonicalize().ok();
+    skip.iter()
+        .filter_map(|p| {
+            work_canon
+                .as_ref()
+                .and_then(|w| p.strip_prefix(w).ok())
+                .map(|r| r.to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
 /// Run the mechanical sweep over `work_dir` in place, using `cfg`'s placeholder
 /// map layered on the built-in rules. Rewrites deterministically-fixable PII into
 /// inert placeholder tokens, then returns the residual (non-mechanical) violations
@@ -523,8 +554,23 @@ pub fn sweep_tree(work_dir: &Path, cfg: &PlaceholderConfig) -> Result<SweepRepor
 
     // Residual = whatever the authoritative gate STILL flags after the mechanical
     // pass. This is the single source of "what is still PII", so mechanical vs
-    // residual can never drift from GHMR-01's coverage.
-    let residual_violations = ruleset.scan_tree(work_dir);
+    // residual can never drift from GHMR-01's coverage. The active placeholder
+    // config is excluded (as GHMR-01 already excludes its own pii-gate.toml):
+    // it legitimately holds the real values the matchers map, is never rewritten,
+    // and is not content shipped to the public mirror — so it must not make an
+    // otherwise-clean tree look dirty and block the GHMR-03 approval tag.
+    let skip_rels = skip_relative_names(work_dir, &skip);
+    let residual_violations: Vec<TreeViolation> = ruleset
+        .scan_tree(work_dir)
+        .into_iter()
+        .filter(|v| {
+            let base = Path::new(&v.file)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            base != CONFIG_BASENAME && !skip_rels.contains(&v.file)
+        })
+        .collect();
 
     Ok(SweepReport {
         files_rewritten,
@@ -875,6 +921,60 @@ mod tests {
         let _ = sweep_tree(&dir, &PlaceholderConfig::default()).unwrap();
         let after = std::fs::read(dir.join("bin.txt")).unwrap();
         assert_eq!(after, raw, "invalid-UTF-8 file must be byte-for-byte intact");
+    }
+
+    // ── Fixture-marked lines are preserved, not rewritten (codex P1) ─────────
+
+    #[test]
+    #[serial]
+    fn fixture_marked_line_is_not_rewritten() {
+        clear_env();
+        let dir = temp_tree("fixture");
+        // A line carrying the exemption marker (a deliberate test literal) plus a
+        // separate untagged line with a real value. The gate exempts the first;
+        // the sweep must do the same, but still rewrite the untagged one.
+        write_file(
+            &dir,
+            "scanner_test.txt",
+            "expect <internal-ip> flagged // pii-test-fixture\nreal host <internal-ip> here\n",
+        );
+        let report = sweep_tree(&dir, &PlaceholderConfig::default()).unwrap();
+        let content = read(&dir, "scanner_test.txt");
+        // Fixture line preserved verbatim...
+        assert!(
+            content.contains("expect <internal-ip> flagged // pii-test-fixture"),
+            "fixture-marked literal must be preserved: {content}"
+        );
+        // ...untagged value rewritten...
+        assert!(!content.contains("<internal-ip>"), "untagged value must be swept: {content}"); // pii-test-fixture
+        // ...and the tree is clean (the fixture line is exempt from residual too).
+        assert!(report.is_clean(), "fixture exemption must match residual scan: {report:?}");
+    }
+
+    // ── Config holding a real value doesn't become residual (codex P1) ───────
+
+    #[test]
+    #[serial]
+    fn config_with_real_value_is_not_residual() {
+        clear_env();
+        let dir = temp_tree("cfgresidual");
+        // The active config legitimately holds a real private IP inside a matcher.
+        write_file(
+            &dir,
+            "mirror-placeholders.toml",
+            "[[placeholder]]\npattern = '10\\.10\\.0\\.9'\ntoken = \"<REDACTED_LAN_IP>\"\n",
+        );
+        write_file(&dir, "doc.txt", "reaches <internal-ip> internally\n"); // pii-test-fixture
+        let cfg = placeholder_config_from(Some(dir.as_path()));
+        let report = sweep_tree(&dir, &cfg).unwrap();
+        // Doc swept, config preserved, and the config's own IP is NOT residual.
+        assert!(!read(&dir, "doc.txt").contains("<internal-ip>"), "doc swept"); // pii-test-fixture
+        assert!(read(&dir, "mirror-placeholders.toml").contains("10\\.10\\.0\\.9"), "config kept");
+        assert!(
+            report.is_clean(),
+            "config-only real value must not surface as residual: {:?}",
+            report.residual_violations
+        );
     }
 
     #[test]
