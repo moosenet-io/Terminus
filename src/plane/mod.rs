@@ -29,9 +29,24 @@
 //! returns a clone of the client scoped to a named identity's token, sharing the
 //! HTTP client, rate limiter, and GET cache. [`PlaneWhoami`] (`plane_whoami`)
 //! reports the active identity, or resolves whether a named identity is configured.
+//!
+//! ### Acting as an identity
+//! Every Plane CRUD tool accepts an OPTIONAL `identity` string argument. When
+//! present, that call is authenticated as the matching `PLANE_PAT_<NAME>`
+//! identity via [`PlaneClient::resolve_identity`] → [`PlaneClient::for_identity`];
+//! when omitted, the call acts as the **active default** identity. The active
+//! default is resolved once at construction ([`PlaneClient::from_env`]): if
+//! `PLANE_IDENTITY_NAME` names a configured `PLANE_PAT_<NAME>` identity, the
+//! default token IS that identity's token (so e.g. `PLANE_IDENTITY_NAME=lumina`
+//! genuinely routes to `PLANE_PAT_LUMINA`); otherwise it falls back to the
+//! unsuffixed `PLANE_API_KEY`, preserving backward compatibility for
+//! deployments that configure only `PLANE_API_KEY`. `plane_whoami` can
+//! additionally perform a real authenticated read (`verify: true`) to prove a
+//! given identity's token is currently accepted (200) versus rejected (401/403).
 
 pub mod types;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -226,7 +241,7 @@ impl PlaneClient {
     /// Build a `PlaneClient` from environment variables.
     pub fn from_env() -> Self {
         let base_url = std::env::var("PLANE_API_URL").ok().map(|u| u.trim_end_matches('/').to_string());
-        let api_key = std::env::var("PLANE_API_KEY").ok().filter(|v| !v.is_empty());
+        let default_api_key = std::env::var("PLANE_API_KEY").ok().filter(|v| !v.is_empty());
         let workspace = std::env::var("PLANE_WORKSPACE")
             .unwrap_or_else(|_| "moosenet".into());
 
@@ -236,17 +251,30 @@ impl PlaneClient {
         // the operator's secret manager) — never from another process's files.
         let identities = scan_named_identities();
 
-        // Resolve a human name for the default PLANE_API_KEY token: prefer an
-        // explicit PLANE_IDENTITY_NAME, else look for a PLANE_PAT_<NAME>
-        // whose value happens to equal the default token.
+        // Resolve the active-default identity NAME (lowercased to match the
+        // identities map / `for_identity` lookup): prefer an explicit
+        // PLANE_IDENTITY_NAME, else the name of a PLANE_PAT_<NAME> whose value
+        // happens to equal the unsuffixed default token.
         let identity_name = std::env::var("PLANE_IDENTITY_NAME")
             .ok()
+            .map(|v| v.trim().to_lowercase())
             .filter(|v| !v.is_empty())
             .or_else(|| {
-                api_key.as_ref().and_then(|tok| {
+                default_api_key.as_ref().and_then(|tok| {
                     identities.iter().find(|(_, v)| *v == tok).map(|(k, _)| k.clone())
                 })
             });
+
+        // Resolve the active-default TOKEN so a named default genuinely ACTS as
+        // that identity: when the active-default name matches a configured
+        // PLANE_PAT_<NAME>, use THAT identity's token; otherwise fall back to the
+        // unsuffixed PLANE_API_KEY. This makes `PLANE_IDENTITY_NAME=lumina`
+        // route real calls through PLANE_PAT_LUMINA, while a deployment with only
+        // PLANE_API_KEY (no named default) is unaffected — full backward compat.
+        let api_key = identity_name
+            .as_ref()
+            .and_then(|name| identities.get(name).cloned())
+            .or_else(|| default_api_key.clone());
 
         let http = Client::builder()
             .timeout(Duration::from_secs(30))
@@ -319,6 +347,34 @@ impl PlaneClient {
             identity_name: Some(key),
             ..self.clone()
         })
+    }
+
+    /// Resolve the effective client for a single tool invocation from its raw
+    /// args. This is the ONE shared dispatch point every Plane CRUD tool uses
+    /// to pick the token it authenticates with, so the selection rule lives in
+    /// exactly one place rather than 28 call sites.
+    ///
+    /// - A non-empty `identity` string argument selects that named
+    ///   `PLANE_PAT_<NAME>` identity (via [`PlaneClient::for_identity`]),
+    ///   returning an owned, token-scoped clone.
+    /// - Otherwise the call acts as this client's **active default** identity —
+    ///   returned borrowed (no clone) — which was already resolved at
+    ///   construction to the named-default token when `PLANE_IDENTITY_NAME`
+    ///   matches a configured identity, else the unsuffixed `PLANE_API_KEY`.
+    ///
+    /// The resolved client is configuration-checked so callers get a single,
+    /// consistent `ToolError::NotConfigured` when `PLANE_API_URL`/token are
+    /// absent. The `identity` argument is consumed here for token selection
+    /// only — it is never placed into a request body and never logged.
+    fn resolve_identity<'a>(&'a self, args: &Value) -> Result<Cow<'a, Self>, ToolError> {
+        let client = match args.get("identity").and_then(|v| v.as_str()) {
+            Some(name) if !name.trim().is_empty() => Cow::Owned(self.for_identity(name)?),
+            _ => Cow::Borrowed(self),
+        };
+        if !client.configured() {
+            return Err(client.not_configured());
+        }
+        Ok(client)
     }
 
     /// The active identity's resolved name, if known.
@@ -557,13 +613,6 @@ impl PlaneClient {
 
 // ─── Helper macro for guard boilerplate ──────────────────────────────────────
 
-macro_rules! require_configured {
-    ($self:expr) => {
-        if !$self.client.configured() {
-            return Err($self.client.not_configured());
-        }
-    };
-}
 
 macro_rules! require_arg {
     ($args:expr, $field:literal, $type:ident) => {
@@ -572,6 +621,36 @@ macro_rules! require_arg {
             .and_then(|v| v.$type())
             .ok_or_else(|| ToolError::InvalidArgument(format!("missing required argument: {}", $field)))?
     };
+}
+
+// ─── Shared optional `identity` argument ─────────────────────────────────────
+//
+// Every Plane CRUD tool exposes the same optional `identity` argument, resolved
+// centrally by `PlaneClient::resolve_identity`. These two helpers keep the
+// schema fragment and its documentation in a single source of truth so all
+// tools describe it identically and can never drift.
+
+/// JSON-schema fragment for the optional `identity` argument.
+fn identity_param_schema() -> Value {
+    json!({
+        "type": "string",
+        "description": "Optional Plane identity to act as: a configured PLANE_PAT_<NAME> \
+                        identity name (e.g. \"claude\", \"harmony\"). Omit to use the active \
+                        default identity (PLANE_IDENTITY_NAME when it names a configured \
+                        identity, otherwise the default PLANE_API_KEY). Call \
+                        plane_list_identities to see the configured names."
+    })
+}
+
+/// Add the shared optional `identity` property to a tool's parameter schema.
+/// Idempotent and safe on any `{ "type": "object", "properties": { .. } }`
+/// schema — inserts the `identity` property without disturbing the tool's own
+/// arguments or its `required` list (identity is always optional).
+fn with_identity_param(mut schema: Value) -> Value {
+    if let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) {
+        props.insert("identity".to_string(), identity_param_schema());
+    }
+    schema
 }
 
 // ─── 1. plane_list_projects ──────────────────────────────────────────────────
@@ -585,17 +664,17 @@ impl RustTool for PlaneListProjects {
     fn name(&self) -> &str { "plane_list_projects" }
     fn description(&self) -> &str { "List all projects in the Plane workspace" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {},
             "required": []
-        })
+        }))
     }
-    async fn execute(&self, _args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
-        let url = format!("{}projects/", self.client.workspace_url());
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let client = self.client.resolve_identity(&args)?;
+        let url = format!("{}projects/", client.workspace_url());
         debug!("plane_list_projects GET {url}");
-        let body = self.client.get_json_cached(&url).await?;
+        let body = client.get_json_cached(&url).await?;
         let list: ApiList<Project> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse projects: {e}")))?;
         let items = list.into_items();
@@ -622,21 +701,21 @@ impl RustTool for PlaneGetProject {
     fn name(&self) -> &str { "plane_get_project" }
     fn description(&self) -> &str { "Get details for a specific Plane project by ID" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" }
             },
             "required": ["project_id"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
-        let url = format!("{}projects/{project_id}/", self.client.workspace_url());
+        let project_id = client.resolve_project_id(project_id_arg).await?;
+        let url = format!("{}projects/{project_id}/", client.workspace_url());
         debug!("plane_get_project GET {url}");
-        let body = self.client.get_json_cached(&url).await?;
+        let body = client.get_json_cached(&url).await?;
         let p: Project = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse project: {e}")))?;
         Ok(format!(
@@ -660,26 +739,26 @@ impl RustTool for PlaneListWorkItems {
     fn name(&self) -> &str { "plane_list_work_items" }
     fn description(&self) -> &str { "List work items (issues) in a Plane project" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
                 "limit": { "type": "integer", "description": "Max results to return (default 50)" }
             },
             "required": ["project_id"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
         let url = format!(
             "{}projects/{project_id}/issues/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_list_work_items GET {url}");
-        let body = self.client.get_json_cached(&url).await?;
+        let body = client.get_json_cached(&url).await?;
         let list: ApiList<Issue> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse issues: {e}")))?;
         let total = list.total_count();
@@ -709,26 +788,26 @@ impl RustTool for PlaneGetWorkItem {
     fn name(&self) -> &str { "plane_get_work_item" }
     fn description(&self) -> &str { "Get details for a specific work item by ID" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
                 "issue_id": { "type": "string", "description": "Issue UUID" }
             },
             "required": ["project_id", "issue_id"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let issue_id = require_arg!(args, "issue_id", as_str);
         let url = format!(
             "{}projects/{project_id}/issues/{issue_id}/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_get_work_item GET {url}");
-        let body = self.client.get_json_cached(&url).await?;
+        let body = client.get_json_cached(&url).await?;
         let i: Issue = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse issue: {e}")))?;
         Ok(format!(
@@ -769,7 +848,7 @@ impl RustTool for PlaneCreateWorkItem {
     fn name(&self) -> &str { "plane_create_work_item" }
     fn description(&self) -> &str { "Create a new work item (issue) in a Plane project" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
@@ -782,12 +861,12 @@ impl RustTool for PlaneCreateWorkItem {
                 "label_ids": { "type": "array", "items": { "type": "string" }, "description": "Label UUIDs to attach" }
             },
             "required": ["project_id", "name"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let name = require_arg!(args, "name", as_str);
         let mut body = json!({ "name": name });
         if let Some(v) = args.get("description_html").and_then(|v| v.as_str()) {
@@ -810,10 +889,10 @@ impl RustTool for PlaneCreateWorkItem {
         }
         let url = format!(
             "{}projects/{project_id}/issues/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_create_work_item POST {url}");
-        let resp = self.client.post_with_retry(&url, &body).await?;
+        let resp = client.post_with_retry(&url, &body).await?;
         let resp = PlaneClient::check_status(resp).await?;
         let i: Issue = resp.json().await
             .map_err(|e| ToolError::Http(format!("Failed to parse created issue: {e}")))?;
@@ -834,7 +913,7 @@ impl RustTool for PlaneUpdateWorkItem {
     fn name(&self) -> &str { "plane_update_work_item" }
     fn description(&self) -> &str { "Update fields on an existing Plane work item" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
@@ -848,12 +927,12 @@ impl RustTool for PlaneUpdateWorkItem {
                 "label_ids": { "type": "array", "items": { "type": "string" }, "description": "New label UUIDs (replaces existing set)" }
             },
             "required": ["project_id", "issue_id"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let issue_id = require_arg!(args, "issue_id", as_str);
         let mut body = json!({});
         for field in &["name", "description_html", "state", "priority", "due_date", "parent"] {
@@ -869,10 +948,10 @@ impl RustTool for PlaneUpdateWorkItem {
         }
         let url = format!(
             "{}projects/{project_id}/issues/{issue_id}/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_update_work_item PATCH {url}");
-        let resp = self.client.patch_with_retry(&url, &body).await?;
+        let resp = client.patch_with_retry(&url, &body).await?;
         let resp = PlaneClient::check_status(resp).await?;
         let i: Issue = resp.json().await
             .map_err(|e| ToolError::Http(format!("Failed to parse updated issue: {e}")))?;
@@ -891,26 +970,26 @@ impl RustTool for PlaneDeleteWorkItem {
     fn name(&self) -> &str { "plane_delete_work_item" }
     fn description(&self) -> &str { "Delete a Plane work item permanently" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
                 "issue_id": { "type": "string", "description": "Issue UUID to delete" }
             },
             "required": ["project_id", "issue_id"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let issue_id = require_arg!(args, "issue_id", as_str);
         let url = format!(
             "{}projects/{project_id}/issues/{issue_id}/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_delete_work_item DELETE {url}");
-        let resp = self.client.delete_with_retry(&url).await?;
+        let resp = client.delete_with_retry(&url).await?;
         PlaneClient::check_status(resp).await?;
         Ok(format!("Deleted work item {issue_id}"))
     }
@@ -927,24 +1006,24 @@ impl RustTool for PlaneListCycles {
     fn name(&self) -> &str { "plane_list_cycles" }
     fn description(&self) -> &str { "List cycles (sprints) in a Plane project" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" }
             },
             "required": ["project_id"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let url = format!(
             "{}projects/{project_id}/cycles/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_list_cycles GET {url}");
-        let body = self.client.get_json_cached(&url).await?;
+        let body = client.get_json_cached(&url).await?;
         let list: ApiList<Cycle> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse cycles: {e}")))?;
         let items = list.into_items();
@@ -974,26 +1053,26 @@ impl RustTool for PlaneGetCycle {
     fn name(&self) -> &str { "plane_get_cycle" }
     fn description(&self) -> &str { "Get details for a specific Plane cycle" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
                 "cycle_id": { "type": "string", "description": "Cycle UUID" }
             },
             "required": ["project_id", "cycle_id"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let cycle_id = require_arg!(args, "cycle_id", as_str);
         let url = format!(
             "{}projects/{project_id}/cycles/{cycle_id}/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_get_cycle GET {url}");
-        let body = self.client.get_json_cached(&url).await?;
+        let body = client.get_json_cached(&url).await?;
         let c: Cycle = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse cycle: {e}")))?;
         Ok(format!(
@@ -1017,26 +1096,26 @@ impl RustTool for PlaneListCycleIssues {
     fn name(&self) -> &str { "plane_list_cycle_issues" }
     fn description(&self) -> &str { "List issues in a specific Plane cycle" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
                 "cycle_id": { "type": "string", "description": "Cycle UUID" }
             },
             "required": ["project_id", "cycle_id"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let cycle_id = require_arg!(args, "cycle_id", as_str);
         let url = format!(
             "{}projects/{project_id}/cycles/{cycle_id}/cycle-issues/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_list_cycle_issues GET {url}");
-        let body = self.client.get_json_cached(&url).await?;
+        let body = client.get_json_cached(&url).await?;
         let list: ApiList<Issue> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse cycle issues: {e}")))?;
         let items = list.into_items();
@@ -1062,24 +1141,24 @@ impl RustTool for PlaneListModules {
     fn name(&self) -> &str { "plane_list_modules" }
     fn description(&self) -> &str { "List modules in a Plane project" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" }
             },
             "required": ["project_id"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let url = format!(
             "{}projects/{project_id}/modules/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_list_modules GET {url}");
-        let body = self.client.get_json_cached(&url).await?;
+        let body = client.get_json_cached(&url).await?;
         let list: ApiList<Module> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse modules: {e}")))?;
         let items = list.into_items();
@@ -1107,26 +1186,26 @@ impl RustTool for PlaneGetModule {
     fn name(&self) -> &str { "plane_get_module" }
     fn description(&self) -> &str { "Get details for a specific Plane module" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
                 "module_id": { "type": "string", "description": "Module UUID" }
             },
             "required": ["project_id", "module_id"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let module_id = require_arg!(args, "module_id", as_str);
         let url = format!(
             "{}projects/{project_id}/modules/{module_id}/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_get_module GET {url}");
-        let body = self.client.get_json_cached(&url).await?;
+        let body = client.get_json_cached(&url).await?;
         let m: Module = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse module: {e}")))?;
         Ok(format!(
@@ -1150,7 +1229,7 @@ impl RustTool for PlaneCreateModule {
     fn name(&self) -> &str { "plane_create_module" }
     fn description(&self) -> &str { "Create a new module in a Plane project" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
@@ -1161,12 +1240,12 @@ impl RustTool for PlaneCreateModule {
                 "target_date": { "type": "string", "description": "Target date (YYYY-MM-DD)" }
             },
             "required": ["project_id", "name"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let name = require_arg!(args, "name", as_str);
         let mut body = json!({ "name": name });
         for field in &["description", "status", "start_date", "target_date"] {
@@ -1176,10 +1255,10 @@ impl RustTool for PlaneCreateModule {
         }
         let url = format!(
             "{}projects/{project_id}/modules/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_create_module POST {url}");
-        let resp = self.client.post_with_retry(&url, &body).await?;
+        let resp = client.post_with_retry(&url, &body).await?;
         let resp = PlaneClient::check_status(resp).await?;
         let m: Module = resp.json().await
             .map_err(|e| ToolError::Http(format!("Failed to parse created module: {e}")))?;
@@ -1198,26 +1277,26 @@ impl RustTool for PlaneListModuleIssues {
     fn name(&self) -> &str { "plane_list_module_issues" }
     fn description(&self) -> &str { "List issues in a specific Plane module" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
                 "module_id": { "type": "string", "description": "Module UUID" }
             },
             "required": ["project_id", "module_id"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let module_id = require_arg!(args, "module_id", as_str);
         let url = format!(
             "{}projects/{project_id}/modules/{module_id}/module-issues/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_list_module_issues GET {url}");
-        let body = self.client.get_json_cached(&url).await?;
+        let body = client.get_json_cached(&url).await?;
         let list: ApiList<Issue> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse module issues: {e}")))?;
         let items = list.into_items();
@@ -1243,24 +1322,24 @@ impl RustTool for PlaneListStates {
     fn name(&self) -> &str { "plane_list_states" }
     fn description(&self) -> &str { "List workflow states in a Plane project" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" }
             },
             "required": ["project_id"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let url = format!(
             "{}projects/{project_id}/states/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_list_states GET {url}");
-        let body = self.client.get_json_cached(&url).await?;
+        let body = client.get_json_cached(&url).await?;
         let list: ApiList<State> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse states: {e}")))?;
         let items = list.into_items();
@@ -1287,24 +1366,24 @@ impl RustTool for PlaneListLabels {
     fn name(&self) -> &str { "plane_list_labels" }
     fn description(&self) -> &str { "List labels in a Plane project" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" }
             },
             "required": ["project_id"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let url = format!(
             "{}projects/{project_id}/labels/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_list_labels GET {url}");
-        let body = self.client.get_json_cached(&url).await?;
+        let body = client.get_json_cached(&url).await?;
         let list: ApiList<Label> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse labels: {e}")))?;
         let items = list.into_items();
@@ -1332,24 +1411,24 @@ impl RustTool for PlaneListMembers {
     fn name(&self) -> &str { "plane_list_members" }
     fn description(&self) -> &str { "List members of a Plane project" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" }
             },
             "required": ["project_id"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let url = format!(
             "{}projects/{project_id}/members/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_list_members GET {url}");
-        let body = self.client.get_json_cached(&url).await?;
+        let body = client.get_json_cached(&url).await?;
         let list: ApiList<Member> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse members: {e}")))?;
         let items = list.into_items();
@@ -1379,26 +1458,26 @@ impl RustTool for PlaneListComments {
     fn name(&self) -> &str { "plane_list_comments" }
     fn description(&self) -> &str { "List comments on a Plane work item" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
                 "issue_id": { "type": "string", "description": "Issue UUID" }
             },
             "required": ["project_id", "issue_id"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let issue_id = require_arg!(args, "issue_id", as_str);
         let url = format!(
             "{}projects/{project_id}/issues/{issue_id}/comments/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_list_comments GET {url}");
-        let body = self.client.get_json_cached(&url).await?;
+        let body = client.get_json_cached(&url).await?;
         let list: ApiList<Comment> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse comments: {e}")))?;
         let items = list.into_items();
@@ -1431,7 +1510,7 @@ impl RustTool for PlaneCreateComment {
     fn name(&self) -> &str { "plane_create_comment" }
     fn description(&self) -> &str { "Add a comment to a Plane work item" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
@@ -1439,21 +1518,21 @@ impl RustTool for PlaneCreateComment {
                 "comment": { "type": "string", "description": "Comment text" }
             },
             "required": ["project_id", "issue_id", "comment"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let issue_id = require_arg!(args, "issue_id", as_str);
         let comment_text = require_arg!(args, "comment", as_str);
         let body = json!({ "comment_html": format!("<p>{comment_text}</p>") });
         let url = format!(
             "{}projects/{project_id}/issues/{issue_id}/comments/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_create_comment POST {url}");
-        let resp = self.client.post_with_retry(&url, &body).await?;
+        let resp = client.post_with_retry(&url, &body).await?;
         let resp = PlaneClient::check_status(resp).await?;
         let c: Comment = resp.json().await
             .map_err(|e| ToolError::Http(format!("Failed to parse created comment: {e}")))?;
@@ -1472,7 +1551,7 @@ impl RustTool for PlaneListIssuesByState {
     fn name(&self) -> &str { "plane_list_issues_by_state" }
     fn description(&self) -> &str { "List work items filtered by state group (backlog/unstarted/started/completed/cancelled)" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
@@ -1484,22 +1563,22 @@ impl RustTool for PlaneListIssuesByState {
                 "limit": { "type": "integer", "description": "Max results (default 50)" }
             },
             "required": ["project_id", "state_group"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let state_group = require_arg!(args, "state_group", as_str);
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
 
         // Fetch all issues then filter client-side (state_group query param is broken in Plane CE)
         let url = format!(
             "{}projects/{project_id}/issues/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_list_issues_by_state GET {url}");
-        let body = self.client.get_json_cached(&url).await?;
+        let body = client.get_json_cached(&url).await?;
         let list: ApiList<Issue> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse issues: {e}")))?;
 
@@ -1535,29 +1614,29 @@ impl RustTool for PlaneGetIssueBySequence {
     fn name(&self) -> &str { "plane_get_issue_by_sequence" }
     fn description(&self) -> &str { "Get a work item by its human-readable sequence number (e.g. LM-42)" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
                 "sequence_id": { "type": "integer", "description": "Sequence number (numeric part of LM-42 etc.)" }
             },
             "required": ["project_id", "sequence_id"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let sequence_id = args.get("sequence_id").and_then(|v| v.as_u64())
             .ok_or_else(|| ToolError::InvalidArgument("missing required argument: sequence_id".into()))?;
 
         // Fetch all and filter by sequence_id
         let url = format!(
             "{}projects/{project_id}/issues/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_get_issue_by_sequence GET {url}");
-        let body = self.client.get_json_cached(&url).await?;
+        let body = client.get_json_cached(&url).await?;
         let list: ApiList<Issue> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse issues: {e}")))?;
 
@@ -1598,7 +1677,7 @@ impl RustTool for PlaneListWorkItemsFiltered {
     fn name(&self) -> &str { "plane_list_work_items_filtered" }
     fn description(&self) -> &str { "List work items with optional priority and/or label filters" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
@@ -1607,22 +1686,22 @@ impl RustTool for PlaneListWorkItemsFiltered {
                 "limit": { "type": "integer", "description": "Max results (default 50)" }
             },
             "required": ["project_id"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let priority_filter = args.get("priority").and_then(|v| v.as_str());
         let label_filter = args.get("label_id").and_then(|v| v.as_str());
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
 
         let url = format!(
             "{}projects/{project_id}/issues/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_list_work_items_filtered GET {url}");
-        let body = self.client.get_json_cached(&url).await?;
+        let body = client.get_json_cached(&url).await?;
         let list: ApiList<Issue> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse issues: {e}")))?;
 
@@ -1664,7 +1743,7 @@ impl RustTool for PlaneListRecentActivity {
     fn name(&self) -> &str { "plane_list_recent_activity" }
     fn description(&self) -> &str { "List recent activity/audit events for a Plane work item" }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
@@ -1672,20 +1751,20 @@ impl RustTool for PlaneListRecentActivity {
                 "limit": { "type": "integer", "description": "Max results (default 20)" }
             },
             "required": ["project_id", "issue_id"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let issue_id = require_arg!(args, "issue_id", as_str);
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
         let url = format!(
             "{}projects/{project_id}/issues/{issue_id}/activities/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_list_recent_activity GET {url}");
-        let body = self.client.get_json_cached(&url).await?;
+        let body = client.get_json_cached(&url).await?;
         let list: ApiList<Activity> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse activities: {e}")))?;
         let items: Vec<Activity> = list.into_items().into_iter().take(limit).collect();
@@ -1719,28 +1798,28 @@ impl RustTool for PlaneCloseWorkItem {
         "Close a work item by moving it to the first available 'completed' state"
     }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
                 "issue_id": { "type": "string", "description": "Issue UUID to close" }
             },
             "required": ["project_id", "issue_id"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let issue_id = require_arg!(args, "issue_id", as_str);
 
         // Fetch states to find the 'completed' group
         let states_url = format!(
             "{}projects/{project_id}/states/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_close_work_item: fetching states from {states_url}");
-        let body = self.client.get_json_cached(&states_url).await?;
+        let body = client.get_json_cached(&states_url).await?;
         let list: ApiList<State> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse states: {e}")))?;
 
@@ -1753,10 +1832,10 @@ impl RustTool for PlaneCloseWorkItem {
         let body = json!({ "state": completed_state.id });
         let issue_url = format!(
             "{}projects/{project_id}/issues/{issue_id}/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_close_work_item PATCH {issue_url}");
-        let resp = self.client.patch_with_retry(&issue_url, &body).await?;
+        let resp = client.patch_with_retry(&issue_url, &body).await?;
         let resp = PlaneClient::check_status(resp).await?;
         let i: Issue = resp.json().await
             .map_err(|e| ToolError::Http(format!("Failed to parse updated issue: {e}")))?;
@@ -1781,26 +1860,26 @@ impl RustTool for PlaneGetStateByName {
         "Resolve a Plane workflow state UUID by its human name (e.g. \"Backlog\", \"Done\"), case-insensitive"
     }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
                 "name": { "type": "string", "description": "State name to match, case-insensitive (e.g. \"Backlog\", \"Done\")" }
             },
             "required": ["project_id", "name"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
         let name = require_arg!(args, "name", as_str);
         let url = format!(
             "{}projects/{project_id}/states/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         debug!("plane_get_state_by_name GET {url}");
-        let body = self.client.get_json_cached(&url).await?;
+        let body = client.get_json_cached(&url).await?;
         let list: ApiList<State> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse states: {e}")))?;
         list.into_items()
@@ -1824,7 +1903,7 @@ impl RustTool for PlaneBatchCreateWorkItems {
         "Create multiple work items in a Plane project sequentially, returning each result"
     }
     fn parameters(&self) -> Value {
-        json!({
+        with_identity_param(json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
@@ -1844,10 +1923,10 @@ impl RustTool for PlaneBatchCreateWorkItems {
                 }
             },
             "required": ["project_id", "items"]
-        })
+        }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        require_configured!(self);
+        let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
         let items = args
             .get("items")
@@ -1856,11 +1935,11 @@ impl RustTool for PlaneBatchCreateWorkItems {
         if items.is_empty() {
             return Err(ToolError::InvalidArgument("items must not be empty".into()));
         }
-        let project_id = self.client.resolve_project_id(project_id_arg).await?;
+        let project_id = client.resolve_project_id(project_id_arg).await?;
 
         let url = format!(
             "{}projects/{project_id}/issues/",
-            self.client.workspace_url()
+            client.workspace_url()
         );
         let mut out = format!("Batch-created {} issue(s):\n", items.len());
         for (index, item) in items.iter().enumerate() {
@@ -1881,7 +1960,7 @@ impl RustTool for PlaneBatchCreateWorkItems {
                 body["state"] = json!(v);
             }
             debug!("plane_batch_create_work_items [{index}] POST {url}");
-            let resp = self.client.post_with_retry(&url, &body).await?;
+            let resp = client.post_with_retry(&url, &body).await?;
             let resp = PlaneClient::check_status(resp).await?;
             let created: Issue = resp
                 .json()
@@ -1910,18 +1989,60 @@ pub struct PlaneWhoami {
 impl RustTool for PlaneWhoami {
     fn name(&self) -> &str { "plane_whoami" }
     fn description(&self) -> &str {
-        "Report which configured Plane identity is active, or check whether a named identity is configured. Never inspects other processes' files — identities come only from this process's own PLANE_PAT_<NAME> environment."
+        "Report which configured Plane identity is active, or check whether a named identity is configured. With verify=true, performs a real authenticated read as the selected identity (explicit `identity`, else the active default) to prove its token is currently accepted (200) or rejected (401/403 — likely expired). Never inspects other processes' files — identities come only from this process's own PLANE_PAT_<NAME> environment; never returns a token value."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "identity": { "type": "string", "description": "Optional identity name to check (e.g. \"axon\"). Omit to report the active default identity." }
+                "identity": { "type": "string", "description": "Optional identity name (e.g. \"claude\"). Omit to report/verify the active default identity." },
+                "verify": { "type": "boolean", "description": "When true, make a real authenticated Plane read as the selected identity and report whether its token is currently valid (200) or rejected (401/403). Default false (config-only check, no network call)." }
             },
             "required": []
         })
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let verify = args.get("verify").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        // verify=true: a real authenticated health check. Resolve the selected
+        // identity (explicit `identity`, else the active default) and make one
+        // lightweight read to prove the token is accepted vs rejected. The
+        // response body is discarded — only the auth outcome is reported, never
+        // a token value.
+        if verify {
+            let client = self.client.resolve_identity(&args)?;
+            let name = client
+                .identity_name()
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    args.get("identity")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_lowercase())
+                })
+                .unwrap_or_else(|| "default".to_string());
+            // Bypass the GET cache so an expired token can't be masked by a
+            // recent success within the cache TTL — always hit the network.
+            let url = format!("{}projects/", client.workspace_url());
+            let resp = client.get_with_retry(&url).await?;
+            // Discriminate on the HTTP status itself (not on error-message text)
+            // so only a genuine auth status reads as REJECTED; any other
+            // non-success is surfaced as its real error.
+            let status = resp.status();
+            return if status.is_success() {
+                Ok(format!(
+                    "Plane identity '{name}': token VALID (authenticated read succeeded, 200)."
+                ))
+            } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                Ok(format!(
+                    "Plane identity '{name}': token REJECTED (Plane returned {status} — the token \
+                     is likely expired or revoked)."
+                ))
+            } else {
+                // Non-auth failure (5xx, 422, …): surface the real ToolError.
+                Err(PlaneClient::check_status(resp).await.unwrap_err())
+            };
+        }
+
         if let Some(identity) = args.get("identity").and_then(|v| v.as_str()) {
             let key = identity.trim().to_lowercase();
             let is_active_default = self.client.identity_name() == Some(key.as_str());
@@ -1960,7 +2081,7 @@ pub struct PlaneListIdentities {
 impl RustTool for PlaneListIdentities {
     fn name(&self) -> &str { "plane_list_identities" }
     fn description(&self) -> &str {
-        "List the names of all configured Plane identities (from PLANE_PAT_<NAME> environment vars) so you can see which identity to act as before creating or assigning Plane work. Returns names only, never token values. Use the identity matching who should act on an item rather than always your own."
+        "List the names of all configured Plane identities (from PLANE_PAT_<NAME> environment vars) so you can see which identity to act as before creating or assigning Plane work. Returns names only, never token values, plus the active_default identity. Every Plane CRUD tool takes an optional `identity` argument set to one of these names to act AS that identity; omitting it uses the active default (PLANE_IDENTITY_NAME when it names a configured identity, otherwise the default PLANE_API_KEY). Use plane_whoami with verify=true to check whether a given identity's token is currently valid. Use the identity matching who should act on an item rather than always your own."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -3031,5 +3152,329 @@ mod tests {
         assert_eq!(v["count"], 0);
         assert_eq!(v["identities"], json!([]));
         assert!(v.get("note").is_some(), "0-case must carry a note, got {out}");
+    }
+
+    // ── Acting AS an identity through CRUD tools (identity arg dispatch) ───────
+
+    #[tokio::test]
+    async fn test_crud_tool_acts_as_explicit_identity() {
+        // A CRUD call with `identity` must authenticate as that PLANE_PAT_<NAME>
+        // token, NOT the default — the core of the multi-identity requirement.
+        let server = MockServer::start();
+        let axon_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/workspaces/testws/projects/")
+                .header("x-api-key", "token-axon");
+            then.status(200).json_body(json!([]));
+        });
+        let default_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/workspaces/testws/projects/")
+                .header("x-api-key", "token-default");
+            then.status(200).json_body(json!([]));
+        });
+        let client = multi_identity_client(&server);
+        let tool = PlaneListProjects { client };
+        let _ = tool.execute(json!({"identity": "axon"})).await.unwrap();
+        assert_eq!(axon_mock.hits(), 1, "explicit identity must act as PLANE_PAT_AXON");
+        assert_eq!(default_mock.hits(), 0, "explicit identity must NOT use the default token");
+    }
+
+    #[tokio::test]
+    async fn test_crud_tool_explicit_identity_is_case_insensitive() {
+        let server = MockServer::start();
+        let vigil_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/workspaces/testws/projects/")
+                .header("x-api-key", "token-vigil");
+            then.status(200).json_body(json!([]));
+        });
+        let client = multi_identity_client(&server);
+        let tool = PlaneListProjects { client };
+        let _ = tool.execute(json!({"identity": "VIGIL"})).await.unwrap();
+        assert_eq!(vigil_mock.hits(), 1, "identity lookup must be case-insensitive");
+    }
+
+    #[tokio::test]
+    async fn test_crud_tool_default_identity_uses_default_token() {
+        // Omitting `identity` must use the active default token — backward compat.
+        let server = MockServer::start();
+        let default_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/workspaces/testws/projects/")
+                .header("x-api-key", "token-default");
+            then.status(200).json_body(json!([]));
+        });
+        let client = multi_identity_client(&server);
+        let tool = PlaneListProjects { client };
+        let _ = tool.execute(json!({})).await.unwrap();
+        assert_eq!(default_mock.hits(), 1, "omitting identity must use the active default token");
+    }
+
+    #[tokio::test]
+    async fn test_crud_tool_empty_identity_falls_back_to_default() {
+        // A present-but-empty `identity` string must behave like omitting it.
+        let server = MockServer::start();
+        let default_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/workspaces/testws/projects/")
+                .header("x-api-key", "token-default");
+            then.status(200).json_body(json!([]));
+        });
+        let client = multi_identity_client(&server);
+        let tool = PlaneListProjects { client };
+        let _ = tool.execute(json!({"identity": "  "})).await.unwrap();
+        assert_eq!(default_mock.hits(), 1, "blank identity must fall back to the default");
+    }
+
+    #[tokio::test]
+    async fn test_crud_tool_unknown_identity_returns_invalid_argument() {
+        let server = MockServer::start();
+        let client = multi_identity_client(&server);
+        let tool = PlaneListProjects { client };
+        let result = tool.execute(json!({"identity": "ghost"})).await;
+        assert!(matches!(result.unwrap_err(), ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn test_crud_write_tool_acts_as_explicit_identity() {
+        // The identity dispatch also covers write tools (POST), not just reads.
+        let server = MockServer::start();
+        // resolve_project_id lists projects with the acting identity's token.
+        let projects_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/workspaces/testws/projects/")
+                .header("x-api-key", "token-axon");
+            then.status(200).json_body(json!([
+                {"id": "proj-1", "name": "Mock", "identifier": "proj-1", "network": 0}
+            ]));
+        });
+        let create_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/workspaces/testws/projects/proj-1/issues/")
+                .header("x-api-key", "token-axon");
+            then.status(201).json_body(json!({
+                "id": "issue-1", "name": "T", "project": "proj-1",
+                "workspace": "testws", "sequence_id": 1
+            }));
+        });
+        let client = multi_identity_client(&server);
+        let tool = PlaneCreateWorkItem { client };
+        let _ = tool
+            .execute(json!({"project_id": "proj-1", "name": "T", "identity": "axon"}))
+            .await
+            .unwrap();
+        projects_mock.assert();
+        create_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_crud_tools_expose_optional_identity_param() {
+        let server = MockServer::start();
+        let client = multi_identity_client(&server);
+        // Representative sample across list/create/update tools.
+        let create = PlaneCreateWorkItem { client: client.clone() };
+        let list = PlaneListProjects { client: client.clone() };
+        let update = PlaneUpdateWorkItem { client: client.clone() };
+        for schema in [create.parameters(), list.parameters(), update.parameters()] {
+            assert_eq!(
+                schema["properties"]["identity"]["type"], "string",
+                "every CRUD tool must expose a string `identity` param: {schema}"
+            );
+            let required = schema["required"].as_array().unwrap();
+            assert!(
+                !required.iter().any(|r| r == "identity"),
+                "`identity` must remain optional (never in `required`): {schema}"
+            );
+        }
+    }
+
+    // ── Default routing via PLANE_IDENTITY_NAME (from_env) ────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn test_from_env_default_identity_name_routes_to_named_token() {
+        // 'default = lumina' must make the DEFAULT (no-identity-arg) path
+        // genuinely authenticate with PLANE_PAT_LUMINA's token, not PLANE_API_KEY.
+        let server = MockServer::start();
+        let lumina_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/workspaces/testws/projects/")
+                .header("x-api-key", "lumina-token");
+            then.status(200).json_body(json!([]));
+        });
+        std::env::set_var("PLANE_API_URL", server.base_url());
+        std::env::set_var("PLANE_WORKSPACE", "testws");
+        std::env::set_var("PLANE_API_KEY", "default-token");
+        std::env::set_var("PLANE_PAT_LUMINA", "lumina-token");
+        std::env::set_var("PLANE_IDENTITY_NAME", "lumina");
+
+        let client = Arc::new(PlaneClient::from_env());
+        assert_eq!(client.identity_name(), Some("lumina"));
+        let tool = PlaneListProjects { client };
+        let _ = tool.execute(json!({})).await.unwrap();
+        lumina_mock.assert();
+
+        std::env::remove_var("PLANE_API_URL");
+        std::env::remove_var("PLANE_WORKSPACE");
+        std::env::remove_var("PLANE_API_KEY");
+        std::env::remove_var("PLANE_PAT_LUMINA");
+        std::env::remove_var("PLANE_IDENTITY_NAME");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_from_env_identity_name_without_matching_pat_falls_back_to_default() {
+        // PLANE_IDENTITY_NAME set as a pure label with NO matching PLANE_PAT_
+        // must still authenticate with the unsuffixed PLANE_API_KEY (back-compat).
+        let server = MockServer::start();
+        let default_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/workspaces/testws/projects/")
+                .header("x-api-key", "default-token");
+            then.status(200).json_body(json!([]));
+        });
+        std::env::set_var("PLANE_API_URL", server.base_url());
+        std::env::set_var("PLANE_WORKSPACE", "testws");
+        std::env::set_var("PLANE_API_KEY", "default-token");
+        std::env::set_var("PLANE_IDENTITY_NAME", "nobody");
+        std::env::remove_var("PLANE_PAT_NOBODY");
+        std::env::remove_var("PLANE_PAT_LUMINA");
+        std::env::remove_var("PLANE_PAT_CLAUDE");
+        std::env::remove_var("PLANE_PAT_SEER");
+
+        let client = Arc::new(PlaneClient::from_env());
+        let tool = PlaneListProjects { client };
+        let _ = tool.execute(json!({})).await.unwrap();
+        default_mock.assert();
+
+        std::env::remove_var("PLANE_API_URL");
+        std::env::remove_var("PLANE_WORKSPACE");
+        std::env::remove_var("PLANE_API_KEY");
+        std::env::remove_var("PLANE_IDENTITY_NAME");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_from_env_backward_compat_only_default_key_acts_as_default() {
+        // The classic single-token deployment (only PLANE_API_KEY, no named
+        // default) must be completely unchanged.
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/workspaces/testws/projects/")
+                .header("x-api-key", "only-default-token");
+            then.status(200).json_body(json!([]));
+        });
+        std::env::set_var("PLANE_API_URL", server.base_url());
+        std::env::set_var("PLANE_WORKSPACE", "testws");
+        std::env::set_var("PLANE_API_KEY", "only-default-token");
+        std::env::remove_var("PLANE_IDENTITY_NAME");
+        std::env::remove_var("PLANE_PAT_LUMINA");
+        std::env::remove_var("PLANE_PAT_CLAUDE");
+        std::env::remove_var("PLANE_PAT_SEER");
+
+        let client = Arc::new(PlaneClient::from_env());
+        assert_eq!(client.identity_name(), None, "no named default without PLANE_IDENTITY_NAME");
+        assert!(client.identity_names().is_empty(), "no named identities configured");
+        let tool = PlaneListProjects { client };
+        let _ = tool.execute(json!({})).await.unwrap();
+        mock.assert();
+
+        std::env::remove_var("PLANE_API_URL");
+        std::env::remove_var("PLANE_WORKSPACE");
+        std::env::remove_var("PLANE_API_KEY");
+    }
+
+    // ── plane_whoami verify=true: real per-identity health check ──────────────
+
+    #[tokio::test]
+    async fn test_plane_whoami_verify_reports_valid_for_accepted_token() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/workspaces/testws/projects/")
+                .header("x-api-key", "token-axon");
+            then.status(200).json_body(json!([]));
+        });
+        let client = multi_identity_client(&server);
+        let tool = PlaneWhoami { client };
+        let out = tool.execute(json!({"identity": "axon", "verify": true})).await.unwrap();
+        assert!(out.contains("VALID"), "{out}");
+        assert!(out.contains("axon"), "{out}");
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_plane_whoami_verify_reports_rejected_for_403() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/workspaces/testws/projects/")
+                .header("x-api-key", "token-vigil");
+            then.status(403);
+        });
+        let client = multi_identity_client(&server);
+        let tool = PlaneWhoami { client };
+        let out = tool.execute(json!({"identity": "vigil", "verify": true})).await.unwrap();
+        assert!(out.contains("REJECTED"), "an expired/revoked token must read as REJECTED: {out}");
+    }
+
+    #[tokio::test]
+    async fn test_plane_whoami_verify_default_identity_no_arg() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/workspaces/testws/projects/")
+                .header("x-api-key", "token-default");
+            then.status(200).json_body(json!([]));
+        });
+        let client = multi_identity_client(&server);
+        let tool = PlaneWhoami { client };
+        let out = tool.execute(json!({"verify": true})).await.unwrap();
+        assert!(out.contains("VALID"), "{out}");
+        assert!(out.contains("default"), "{out}");
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_plane_whoami_verify_unknown_identity_returns_invalid_argument() {
+        let server = MockServer::start();
+        let client = multi_identity_client(&server);
+        let tool = PlaneWhoami { client };
+        let result = tool.execute(json!({"identity": "ghost", "verify": true})).await;
+        assert!(matches!(result.unwrap_err(), ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn test_plane_whoami_verify_non_auth_failure_is_error_not_rejected() {
+        // A 5xx during verify must surface as a real error, never be mislabeled
+        // as a REJECTED (expired-token) result — status-based discrimination.
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/workspaces/testws/projects/")
+                .header("x-api-key", "token-axon");
+            then.status(500);
+        });
+        let client = multi_identity_client(&server);
+        let tool = PlaneWhoami { client };
+        let result = tool.execute(json!({"identity": "axon", "verify": true})).await;
+        assert!(matches!(result.unwrap_err(), ToolError::Http(_)), "5xx must be an error, not REJECTED");
+    }
+
+    #[tokio::test]
+    async fn test_plane_whoami_verify_never_leaks_token_value() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/workspaces/testws/projects/")
+                .header("x-api-key", "token-axon");
+            then.status(200).json_body(json!([]));
+        });
+        let client = multi_identity_client(&server);
+        let tool = PlaneWhoami { client };
+        let out = tool.execute(json!({"identity": "axon", "verify": true})).await.unwrap();
+        assert!(!out.contains("token-axon"), "verify output must never leak a token value: {out}");
     }
 }
