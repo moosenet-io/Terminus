@@ -285,9 +285,19 @@ impl RustTool for GitHubMirrorStatus {
         // baseline yet or the baseline is not an ancestor of HEAD (history rewrite).
         let commits_since_last_approved: Option<u64> = match &last_approved_internal_sha {
             Some(s) if *s == internal_sha => Some(0),
-            Some(s) => run_git(wd.source(), &["rev-list", "--count", &format!("{s}..{internal_sha}")])
-                .ok()
-                .and_then(|o| o.trim().parse::<u64>().ok()),
+            Some(s) => {
+                // Only a meaningful count when the baseline is genuinely an ANCESTOR
+                // of the current tip. After an internal history rewrite it is not,
+                // and `rev-list --count old..new` would still return a (misleading)
+                // number; report `null` in that case, per the documented contract.
+                if git_exit_ok(wd.source(), &["merge-base", "--is-ancestor", s, &internal_sha]) {
+                    run_git(wd.source(), &["rev-list", "--count", &format!("{s}..{internal_sha}")])
+                        .ok()
+                        .and_then(|o| o.trim().parse::<u64>().ok())
+                } else {
+                    None
+                }
+            }
             None => None,
         };
 
@@ -563,9 +573,11 @@ impl RustTool for GitHubMirrorPush {
         }
 
         // GUARDED: the actual mutation of public state requires an operator blessing.
+        // The summary names the RESOLVED remote so the operator authorises the exact
+        // destination (the remote is caller-selectable) — not a generic "GitHub".
         let summary = format!(
             "Fast-forward push approved mirror commit {approved_commit} (internal main \
-             {internal_sha}) for '{repo}' to its GitHub remote"
+             {internal_sha}) for '{repo}' to remote: {remote}"
         );
         match approval::gate(self.name(), &args, &summary).await {
             Gate::Granted => {}
@@ -1009,6 +1021,40 @@ mod tests {
         assert_eq!(sv["needs_prepare"], true);
         assert_eq!(sv["last_approved_internal_sha"], c1, "baseline is the first approved snapshot");
         assert_eq!(sv["commits_since_last_approved"], 2, "internal main advanced two commits");
+
+        cleanup(&[&src, &root]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn status_divergence_is_null_after_history_rewrite() {
+        clear_env();
+        let src = init_source(&[("a.txt", "v1 clean\n")]);
+        let root = unique("root");
+        set_root(&root);
+        GitHubMirrorPrepare
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        let c1 = run_git(&src, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        // Rewrite internal history: a fresh root commit with NO ancestry to c1.
+        run_git(&src, &["checkout", "-q", "--orphan", "rewritten"]).unwrap();
+        write_file(&src, "a.txt", "rewritten clean\n");
+        run_git(&src, &["add", "-A"]).unwrap();
+        run_git(&src, &["-c", "user.name=src", "-c", "user.email=<email>", "commit", "-q", "-m", "rewrite"]).unwrap(); // pii-test-fixture
+        // Make it the new main so ensure_source_is_main passes.
+        run_git(&src, &["branch", "-M", "main"]).unwrap();
+        let new_head = run_git(&src, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        assert_ne!(new_head, c1);
+
+        let st = GitHubMirrorStatus
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        let sv: Value = serde_json::from_str(&st).unwrap();
+        // Baseline is still recorded, but c1 is no longer an ancestor → null count.
+        assert_eq!(sv["last_approved_internal_sha"], c1);
+        assert!(sv["commits_since_last_approved"].is_null(), "rewritten history → null divergence");
 
         cleanup(&[&src, &root]);
     }
