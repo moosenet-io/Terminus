@@ -150,9 +150,12 @@ fn create_blessed_tag(work_dir: &Path, internal_sha: &str, commit: &str) -> Resu
 }
 
 /// Resolve the GitHub mirror remote: explicit `github_remote` arg wins, then
-/// `TERMINUS_MIRROR_REMOTE_<REPO_UPPER>`, then `TERMINUS_MIRROR_REMOTE`.
+/// `TERMINUS_MIRROR_REMOTE_<REPO_UPPER>`, then `TERMINUS_MIRROR_REMOTE`. The
+/// resolved value is validated to NOT look like a git option (see
+/// [`validate_remote`]).
 fn resolve_remote(args: &Value, repo: &str) -> Result<String, ToolError> {
     if let Some(r) = args.get("github_remote").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+        validate_remote(r)?;
         return Ok(r.to_string());
     }
     let per_repo = format!(
@@ -163,6 +166,7 @@ fn resolve_remote(args: &Value, repo: &str) -> Result<String, ToolError> {
         if let Ok(v) = std::env::var(key) {
             let v = v.trim().to_string();
             if !v.is_empty() {
+                validate_remote(&v)?;
                 return Ok(v);
             }
         }
@@ -170,6 +174,56 @@ fn resolve_remote(args: &Value, repo: &str) -> Result<String, ToolError> {
     Err(ToolError::NotConfigured(format!(
         "no GitHub mirror remote for '{repo}': pass 'github_remote' or set {per_repo} / {REMOTE_ENV}"
     )))
+}
+
+/// Reject a remote that git would parse as an OPTION rather than a repository. A
+/// value beginning with `-` (e.g. `--upload-pack=<cmd>` / `--receive-pack=<cmd>`)
+/// would let a caller run an arbitrary command during `ls-remote` / `push`. Every
+/// git invocation here ALSO puts `--` before the remote as a second guard, but a
+/// clear up-front rejection is better than relying on `--` alone.
+fn validate_remote(remote: &str) -> Result<(), ToolError> {
+    if remote.starts_with('-') {
+        return Err(ToolError::InvalidArgument(format!(
+            "refusing an option-like git remote (starts with '-'): {remote:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Verify the internal source checkout's HEAD is actually the tip of its `main`
+/// branch (overridable via `TERMINUS_MIRROR_SOURCE_BRANCH`). The mirror publishes
+/// a derivative of INTERNAL MAIN; if the dev-box checkout sits on a feature branch,
+/// a detached HEAD, or a stale HEAD, `git archive HEAD` would silently mirror THAT
+/// tree while every tag/label still claims it is internal main. Refuse before any
+/// prepare/approve/push acts on such a checkout.
+fn ensure_source_is_main(source: &Path) -> Result<(), ToolError> {
+    let branch = std::env::var("TERMINUS_MIRROR_SOURCE_BRANCH")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "main".to_string());
+    if !source.join(".git").exists() {
+        return Err(ToolError::InvalidArgument(format!(
+            "source is not a git repo: {}",
+            source.display()
+        )));
+    }
+    let head = run_git(source, &["rev-parse", "HEAD"])?.trim().to_string();
+    let main_ref = format!("refs/heads/{branch}");
+    let main_sha = run_git(source, &["rev-parse", "--verify", "-q", &main_ref]).map_err(|_| {
+        ToolError::InvalidArgument(format!(
+            "source has no {main_ref} — not an internal-{branch} checkout: {}",
+            source.display()
+        ))
+    })?;
+    let main_sha = main_sha.trim();
+    if head != main_sha {
+        return Err(ToolError::InvalidArgument(format!(
+            "source HEAD is not at the {branch} tip (HEAD={head}, {branch}={main_sha}) — refusing \
+             to mirror a non-{branch} checkout (feature branch / detached / stale HEAD)"
+        )));
+    }
+    Ok(())
 }
 
 // ── github_mirror_status ────────────────────────────────────────────────────
@@ -203,6 +257,7 @@ impl RustTool for GitHubMirrorStatus {
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
         let wd = workdir_from_args(&args)?;
+        ensure_source_is_main(wd.source())?;
         let initialised = wd.is_initialised();
         let internal_sha = wd.source_head_sha()?;
         let approved = wd.approved_tag_exists(&internal_sha)?;
@@ -260,6 +315,7 @@ impl RustTool for GitHubMirrorPrepare {
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
         let wd = workdir_from_args(&args)?;
+        ensure_source_is_main(wd.source())?;
         let report = wd.run()?;
         Ok(report.to_json().to_string())
     }
@@ -298,6 +354,7 @@ impl RustTool for GitHubMirrorApprove {
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
         let wd = workdir_from_args(&args)?;
+        ensure_source_is_main(wd.source())?;
         if !wd.is_initialised() {
             return Err(ToolError::InvalidArgument(
                 "work dir not initialised — run github_mirror_prepare first".into(),
@@ -414,6 +471,7 @@ impl RustTool for GitHubMirrorPush {
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
         let wd = workdir_from_args(&args)?;
+        ensure_source_is_main(wd.source())?;
         if !wd.is_initialised() {
             return Err(ToolError::InvalidArgument(
                 "work dir not initialised — run github_mirror_prepare first".into(),
@@ -515,7 +573,7 @@ impl RustTool for GitHubMirrorPush {
 /// GIT_ASKPASS path the push uses, but ls-remote of a public mirror is anonymous).
 fn remote_main_tip(remote: &str) -> Result<Option<String>, ToolError> {
     // `--` guards against a remote value that looks like an option.
-    let out = run_git_plain(&["ls-remote", "--heads", remote, "refs/heads/main"])?;
+    let out = run_git_plain(&["ls-remote", "--heads", "--", remote, "refs/heads/main"])?;
     let sha = out
         .lines()
         .find_map(|l| l.split_whitespace().next().map(str::to_string))
@@ -561,7 +619,7 @@ fn perform_ff_push(
     // Refspec `<sha>:refs/heads/main` with NO leading `+` — git refuses a
     // non-fast-forward update, a second safety net beneath our ff pre-check.
     let refspec = format!("{approved_commit}:refs/heads/main");
-    let argv = ["push", remote, &refspec];
+    let argv = ["push", "--", remote, &refspec];
     assert_never_force(&argv);
 
     // GIT_ASKPASS script reads the token from a private env var passed only to
@@ -1219,6 +1277,89 @@ mod tests {
         for bad in ["..", ".", "a/b", "../x", "/abs", "a\\b", "", "a b"] {
             assert!(validate_repo(bad).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    // ── option-injection guard on the remote ─────────────────────────────────
+
+    #[test]
+    fn validate_remote_rejects_option_like_values() {
+        assert!(validate_remote("https://github.com/moosenet-io/Terminus.git").is_ok());
+        assert!(validate_remote("/srv/mirrors/Terminus.git").is_ok());
+        for bad in ["--upload-pack=evil", "--receive-pack=evil", "-oProxyCommand=x"] {
+            assert!(validate_remote(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn push_rejects_option_like_remote() {
+        clear_env();
+        let src = init_source(&[("a.txt", "clean\n")]);
+        let root = unique("root");
+        set_root(&root);
+        GitHubMirrorPrepare
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        bless("Terminus", &src);
+        let res = GitHubMirrorPush
+            .execute(json!({
+                "repo": "Terminus",
+                "source": src.display().to_string(),
+                "github_remote": "--upload-pack=touch /tmp/pwned"
+            }))
+            .await;
+        assert!(matches!(res, Err(ToolError::InvalidArgument(_))));
+        cleanup(&[&src, &root]);
+    }
+
+    // ── source-HEAD-must-be-main guard ───────────────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn prepare_and_status_refuse_source_not_on_main() {
+        clear_env();
+        let src = init_source(&[("a.txt", "on main\n")]);
+        let root = unique("root");
+        set_root(&root);
+        // Move source onto a feature branch whose tip differs from main's tip.
+        run_git(&src, &["checkout", "-q", "-b", "feature"]).unwrap();
+        write_file(&src, "a.txt", "on feature\n");
+        commit_all(&src, "feature commit");
+
+        for res in [
+            GitHubMirrorStatus
+                .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+                .await,
+            GitHubMirrorPrepare
+                .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+                .await,
+        ] {
+            assert!(
+                matches!(res, Err(ToolError::InvalidArgument(_))),
+                "a non-main source HEAD must be refused: {res:?}"
+            );
+        }
+
+        // Back on main → prepare succeeds.
+        run_git(&src, &["checkout", "-q", "main"]).unwrap();
+        let ok = GitHubMirrorPrepare
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await;
+        assert!(ok.is_ok(), "main-tip source must be accepted: {ok:?}");
+        cleanup(&[&src, &root]);
+    }
+
+    #[test]
+    #[serial]
+    fn ensure_source_is_main_accepts_detached_at_main_tip() {
+        clear_env();
+        let src = init_source(&[("a.txt", "clean\n")]);
+        // Detach HEAD exactly at main's tip — same commit, so it IS internal main.
+        let sha = run_git(&src, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        run_git(&src, &["checkout", "-q", &sha]).unwrap();
+        assert!(ensure_source_is_main(&src).is_ok(), "detached at main tip is fine");
+        cleanup(&[&src]);
     }
 
     // ── ff_state classification (the core safety logic) ──────────────────────
