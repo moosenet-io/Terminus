@@ -121,6 +121,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::dgem::register(registry);
     crate::weather::register(registry);
     crate::dura::register(registry);
+    crate::forge::register_public(registry); // S106/GITX-05: git-public, CORE only
     crate::gitea::register(registry);
     crate::github::register(registry);
     crate::google::register(registry);
@@ -193,6 +194,7 @@ pub fn register_personal(registry: &mut ToolRegistry) {
     crate::ansible::register(registry);
     crate::dev::register(registry);
     crate::plane::register(registry);
+    crate::forge::register_private(registry); // S106/GITX-05: git-private, PERSONAL only
     crate::gitea::register(registry);
     crate::github::register(registry);
     crate::sundry::register(registry);

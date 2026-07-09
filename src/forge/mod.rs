@@ -31,14 +31,34 @@
 //! (GITX-05) build on this trait in later items.
 
 pub mod capability;
+pub mod git_private;
+pub mod git_public;
 pub mod gitea_family;
+pub mod posture;
 pub mod provider;
+pub mod registry;
 
 pub use capability::{CapabilityMap, ForgeDomain, ForgeEndpoint, SupportLevel};
 pub use gitea_family::{gitea_family_capabilities, GiteaForge};
 pub use provider::{
     CredentialRef, ForgeError, ForgeProvider, ForgeRequest, ForgeResponse, ProviderId,
 };
+pub use registry::{ForgePool, ForgeRegistry};
+
+/// Register the git-private tool (full operator R/W over the self-hosted
+/// pool) — PERSONAL placement only, per the S106 taxonomy: this is the
+/// operator's own source-of-truth git access, not a Chord-served
+/// build-pipeline surface. Called from `crate::registry::register_personal`.
+pub fn register_private(registry: &mut crate::registry::ToolRegistry) {
+    git_private::register(registry);
+}
+
+/// Register the git-public tool (PII-gated, first-publish-gated, egress-
+/// isolated writes over the hosted/mirror pool) — CORE placement only, per
+/// the S106 taxonomy. Called from `crate::registry::register_all`.
+pub fn register_public(registry: &mut crate::registry::ToolRegistry) {
+    git_public::register(registry);
+}
 
 #[cfg(test)]
 mod tests {

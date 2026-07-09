@@ -703,6 +703,100 @@ single dispatch path drives all of them; nothing branches on provider.
   `ForgeError::Transport` (not a panic or fabricated result); a missing/invalid
   or under-scoped credential yields `ForgeError::Auth`.
 
+### Tool assembly: `git_private` + `git_public` (GITX-05)
+
+The two MCP tools that make the "one surface, two pools, two postures" model
+real. Both dispatch onto `ForgeProvider::dispatch` for the shared
+`ForgeEndpoint` vocabulary (`endpoint` + `params`, optional `provider` +
+`identity`), so capability introspection ("unsupported by provider X") is
+inherited from GITX-01 for free — these tools add only the governance posture
+layer. Provider→pool routing lives in `forge::registry::ForgeRegistry`
+(`ForgeRegistry::from_env()`): it tries every known adapter constructor and
+activates whichever are actually configured — an unconfigured provider is a
+clean, silent skip, never a hard failure, so the registry always builds even
+with zero credentials. Adding GitLab (GITX-04) or a GITX-06 stub is one
+`try_insert` call in `registry.rs`, not a rewrite.
+
+#### `git_private` — self-hosted pool, PERSONAL placement
+
+Registered **only** on the `terminus_personal` registry
+(`crate::registry::register_personal` → `forge::register_private`) — this is
+the operator's own source-of-truth git access, not a Chord-served
+build-pipeline surface. Pool members today: `gitea`, `forgejo` (GitLab CE /
+Gogs / OneDev register into the same pool as their adapters land).
+
+Posture: full operator R/W — ordinary reads and writes dispatch straight
+through. **Destructive operations** — `repos_delete`, `branches_delete`,
+`refs_delete`, `releases_delete`, `tags_delete`, `webhooks_delete`,
+`packages_delete`, or **any** write whose `params` carries
+`force`/`force_push`/`rewrite_history`/`history_rewrite`: `true` (force-push,
+history rewrite) — are refused before any transport unless the call also sets
+`confirm: true`. A companion read-only tool, `git_private_capabilities`,
+reports each configured provider's per-endpoint support map.
+
+#### `git_public` — hosted/mirror pool, CORE placement
+
+Registered **only** on the CORE registry (`crate::registry::register_all` →
+`forge::register_public`) — never on `terminus_personal`. Pool members today:
+`codeberg`, `github` (GitLab SaaS / Bitbucket / SourceHut / Radicle register
+into the same pool as their adapters land). This is the **exfiltration
+surface** — every write is gated, in order, before any network call:
+
+1. **Egress isolation.** A write whose `params` carries `api_base` /
+   `base_url` / `host` / `endpoint_override` / `url_override` is refused
+   outright — each adapter's own compiled-in host allowlist (e.g.
+   `GitHubAdapter::host_allowed`) is the sole routing authority; the tool
+   layer refuses even the *attempt* to override it. Reads are unrestricted.
+2. **Unconditional PII gate.** Every write's `params` (all string values,
+   flattened, keys included) is scanned by the same Rust sweep engine the
+   GHMR mirror uses (`github::pii::pii_gate`). A failing scan **withholds**
+   the operation — nothing is sent to the provider — and is logged; there is
+   no bypass flag and no cadence fast-path, matching the GHMR discipline.
+3. **First-publish human gate.** The first write to a given `(provider,
+   repo)` pair requires `confirm_first_publish: true`; once granted it is
+   recorded in a small on-disk ledger
+   (`TERMINUS_GIT_PUBLIC_ACTIVATED_STATE`, default a temp-dir JSON file — no
+   secrets, so a plain file, not the vault) and never re-asked for that pair
+   (the `mirror_activated` model). Different repos and different providers
+   get independent gates.
+
+A companion read-only tool, `git_public_capabilities`, mirrors
+`git_private_capabilities` for the public pool.
+
+#### Mirror engine integration — `mirror_action`
+
+For a **full repo mirror sync** (as opposed to a single API write like a PR
+comment), `git_public` accepts `mirror_action: "status" | "prepare" |
+"approve" | "push"` instead of `endpoint`, forwarding verbatim to the
+existing GHMR core tools (`github_mirror_status` / `_prepare` / `_approve` /
+`_push`, `github::mirror::tools::dispatch_mirror_action`) — the exact same
+`RustTool::execute` those four tools already run, so none of the engine's own
+PII-gate / fast-forward-only / no-force transport logic is duplicated. This
+*is* "mirror = git-private source → PII-gated git-public push" — git-public's
+swept-clean-tree write path. A successful `push` additionally activates that
+`(provider, repo)` pair in `git_public`'s first-publish ledger, so a
+subsequent direct API write to the newly-mirrored repo is not re-asked.
+
+The mirror engine's transport is **provider-routable**, not hardcoded to
+GitHub: `github_mirror_push` (and `mirror_action: "push"`) takes an optional
+`provider` field (default `"github"`), resolved to a transport credential via
+`mirror_provider_token()` — a routing table, not an assumption. GitHub is the
+only configured target today (the only resolver wired in that table); adding
+a second mirror target is one more match arm there, not a rewrite of the
+prepare/push transport.
+
+#### Config summary
+
+| Var | Purpose |
+|---|---|
+| `GIT_PRIVATE_DEFAULT_PROVIDER` | Default `git_private` pool member when `provider` is omitted (else `gitea`, else the sole configured provider) |
+| `GIT_PUBLIC_DEFAULT_PROVIDER` | Default `git_public` pool member when `provider` is omitted (else `github`, else the sole configured provider) |
+| `TERMINUS_GIT_PUBLIC_ACTIVATED_STATE` | Path to the first-publish activation ledger (JSON, no secrets); defaults under the temp dir |
+
+No new secret env vars — providers resolve credentials exactly as documented
+above (`GITEA_PAT_<NAME>`, `FORGEJO_TOKEN`, `CODEBERG_TOKEN`,
+`GITHUB_PAT_<NAME>`/`GITHUB_TOKEN`).
+
 ## License
 
 MIT
