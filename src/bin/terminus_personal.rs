@@ -306,6 +306,9 @@ async fn main() {
         mtls_bind: terminus_rs::config::mtls_bind_addr(),
         mtls_port: terminus_rs::config::mtls_port(),
         mtls_server_identity: terminus_rs::config::mtls_server_identity(),
+        // TGW-02: terminus_personal never federates to itself -- it already
+        // IS the personal-registry deployment.
+        personal_federation: None,
     };
 
     // TCLI-02: the enrollment endpoint is a fully separate, additive router

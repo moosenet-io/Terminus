@@ -45,7 +45,7 @@
 
 use axum::{
     body::Bytes,
-    extract::State,
+    extract::{Extension, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -55,6 +55,8 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use crate::federation::PersonalFederationClient;
+use crate::pki::mtls::ClientIdentity;
 use crate::registry::ToolRegistry;
 
 /// Shared server state.
@@ -64,6 +66,15 @@ pub struct McpServerState {
     pub server_version: String,
     /// If set, `Authorization: Bearer <token>` is required on `/mcp`.
     pub auth_token: Option<String>,
+    /// TGW-02: when set, a tool name not found in `registry` (i.e. not a
+    /// core tool) is proxied to Chord's `/v1/personal/tools/call` relay
+    /// instead of being reported as an unknown tool, and `tools/list`
+    /// includes the personal-registry tool set
+    /// (`crate::registry::personal_only_tool_metadata`) alongside the local
+    /// core catalog. `None` (the default for `terminus_personal`, which has
+    /// no need to federate to itself) preserves the exact pre-TGW-02
+    /// behavior: unknown tool names are just unknown.
+    pub personal_federation: Option<PersonalFederationClient>,
 }
 
 pub fn build_router(state: Arc<McpServerState>) -> Router {
@@ -111,6 +122,11 @@ fn is_authorized(state: &McpServerState, headers: &HeaderMap) -> bool {
 async fn handle_mcp(
     State(state): State<Arc<McpServerState>>,
     headers: HeaderMap,
+    // Present only on requests that arrived over the mTLS listener
+    // (`crate::pki::mtls::run_listener` inserts it into the connection's
+    // request extensions post-handshake) -- absent on the plain HTTP+JWT
+    // listener, in which case federated calls forward no caller identity.
+    identity: Option<Extension<ClientIdentity>>,
     body: Bytes,
 ) -> Response {
     if !is_authorized(&state, &headers) {
@@ -160,7 +176,7 @@ async fn handle_mcp(
             sse_response(id, Ok(result), &session_id)
         }
         "tools/list" => {
-            let tools: Vec<Value> = state
+            let mut tools: Vec<Value> = state
                 .registry
                 .list()
                 .into_iter()
@@ -172,13 +188,26 @@ async fn handle_mcp(
                     })
                 })
                 .collect();
+            // TGW-02: aggregate in the personal-registry tool set (metadata
+            // only, no network call -- see
+            // `crate::registry::personal_only_tool_metadata`'s doc) when
+            // this process is configured to federate personal-tool calls.
+            if state.personal_federation.is_some() {
+                tools.extend(crate::registry::personal_only_tool_metadata().into_iter().map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "inputSchema": t.parameters,
+                    })
+                }));
+            }
             sse_response(id, Ok(json!({"tools": tools})), "")
         }
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
-            match state.registry.call(name, arguments).await {
+            match state.registry.call(name, arguments.clone()).await {
                 Some(Ok(text)) => sse_response(
                     id,
                     Ok(json!({
@@ -195,18 +224,57 @@ async fn handle_mcp(
                     })),
                     "",
                 ),
-                // Per MCP convention, an unknown tool is a *tool-call* failure
-                // (`isError: true` in the result), not a JSON-RPC protocol
-                // error — `tools/call` itself is a valid method, so `-32601
-                // Method not found` would be a misleading code here.
-                None => sse_response(
-                    id,
-                    Ok(json!({
-                        "content": [{"type": "text", "text": format!("Unknown tool: {name}")}],
-                        "isError": true
-                    })),
-                    "",
-                ),
+                // Not a core tool -- TGW-02: if this process federates
+                // personal-tool calls, proxy to Chord's
+                // `/v1/personal/tools/call` relay before giving up. Core
+                // dispatch above is completely unchanged by this branch.
+                None => match &state.personal_federation {
+                    Some(client) => {
+                        let caller_identity = identity.as_ref().map(|Extension(i)| i.as_str());
+                        match client.call_tool(name, arguments, caller_identity).await {
+                            Ok(outcome) => sse_response(
+                                id,
+                                Ok(json!({
+                                    "content": [{"type": "text", "text": outcome.text}],
+                                    "isError": outcome.is_error
+                                })),
+                                "",
+                            ),
+                            Err(fed_err) => {
+                                warn!(
+                                    "terminus_primary: federation error calling {name}: {fed_err}"
+                                );
+                                sse_response(
+                                    id,
+                                    Ok(json!({
+                                        "content": [{
+                                            "type": "text",
+                                            "text": format!(
+                                                "federation error: could not reach personal-tool \
+                                                 backend via chord relay ({fed_err})"
+                                            )
+                                        }],
+                                        "isError": true
+                                    })),
+                                    "",
+                                )
+                            }
+                        }
+                    }
+                    // Per MCP convention, an unknown tool is a *tool-call*
+                    // failure (`isError: true` in the result), not a
+                    // JSON-RPC protocol error — `tools/call` itself is a
+                    // valid method, so `-32601 Method not found` would be a
+                    // misleading code here.
+                    None => sse_response(
+                        id,
+                        Ok(json!({
+                            "content": [{"type": "text", "text": format!("Unknown tool: {name}")}],
+                            "isError": true
+                        })),
+                        "",
+                    ),
+                },
             }
         }
         other => {
@@ -285,6 +353,7 @@ mod tests {
             server_name: "terminus-personal-test".to_string(),
             server_version: "0.0.0-test".to_string(),
             auth_token: None,
+            personal_federation: None,
         })
     }
 
@@ -411,6 +480,7 @@ mod tests {
             server_name: "terminus-personal-test".to_string(),
             server_version: "0.0.0-test".to_string(),
             auth_token: None,
+            personal_federation: None,
         });
         let router = build_router(state);
         let (status, body, _) = post_mcp(
@@ -454,6 +524,7 @@ mod tests {
             server_name: "terminus-personal-test".to_string(),
             server_version: "0.0.0-test".to_string(),
             auth_token: Some("secret-abc".to_string()),
+            personal_federation: None,
         });
         let router = build_router(state);
         let req = Request::builder()
@@ -477,6 +548,7 @@ mod tests {
             server_name: "terminus-personal-test".to_string(),
             server_version: "0.0.0-test".to_string(),
             auth_token: Some("secret-abc".to_string()),
+            personal_federation: None,
         });
         let router = build_router(state);
         let req = Request::builder()

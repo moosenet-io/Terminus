@@ -56,6 +56,14 @@ pub struct GatewayServerConfig {
     pub mtls_bind: String,
     pub mtls_port: u16,
     pub mtls_server_identity: String,
+    /// TGW-02: when `Some`, a tool name not found in the local registry is
+    /// proxied to Chord's `/v1/personal/tools/call` relay and the personal
+    /// tool set is included in `tools/list` — see
+    /// `crate::mcp_server::McpServerState::personal_federation`'s doc.
+    /// `terminus_personal` passes `None` (it never needs to federate to
+    /// itself); `terminus_primary` (TGW-01/02) passes
+    /// `Some(crate::federation::PersonalFederationClient::from_env())`.
+    pub personal_federation: Option<crate::federation::PersonalFederationClient>,
 }
 
 /// Build the shared MCP (`/mcp`, `/healthz`) + `/enroll` router for
@@ -71,6 +79,7 @@ pub fn build_gateway_router(registry: ToolRegistry, config: &GatewayServerConfig
         server_name: config.server_name.clone(),
         server_version: config.server_version.clone(),
         auth_token: config.auth_token.clone(),
+        personal_federation: config.personal_federation.clone(),
     });
 
     build_router(state).merge(build_enroll_router())
@@ -164,6 +173,7 @@ mod tests {
             mtls_bind: "127.0.0.1".to_string(),
             mtls_port,
             mtls_server_identity: "terminus-server-test".to_string(),
+            personal_federation: None,
         }
     }
 

@@ -582,10 +582,79 @@ pub fn mtls_primary_server_identity() -> String {
         .unwrap_or_else(|| "terminus-primary".to_string())
 }
 
+// ── TGW-02: personal-tool federation via Chord's `/v1/personal/tools/*` ────
+//
+// Per the S108 spec's RESOLVED design decision (2): `terminus-primary`
+// reaches the personal-registry-exclusive tools (the `git_private` set, and
+// any other tool name not in its local `register_all` registry) by proxying
+// through Chord's EXISTING `/v1/personal/tools/*` relay (already federates
+// to the personal-registry deployment's `terminus_personal` — see
+// `moosenet/Chord`'s `src/routes.rs`
+// `personal_tools_list`/`personal_tools_call`), not a new direct
+// primary→personal-registry path. This section resolves the non-secret knobs
+// for that hop: Chord's base URL and the federation HTTP client's timeout.
+// The JWT SIGNING SECRET used to authenticate to Chord's relay is
+// intentionally NOT resolved here (it's read next to its one caller in
+// `crate::federation` rather than mixed in with these plain env-var knobs —
+// same "PKI/secret material gets its own section" convention this file
+// already uses for `crate::pki`).
+
+/// Base URL `terminus-primary` calls to reach Chord's personal-tool relay
+/// (`{base}/v1/personal/tools/list`, `{base}/v1/personal/tools/call`). From
+/// `TERMINUS_PRIMARY_CHORD_URL`; defaults to Chord's loopback proxy port for
+/// a co-located deploy — a loopback default only, never a real non-loopback
+/// host baked in. An operator overrides this if Chord is not co-located with
+/// `terminus-primary`.
+pub fn chord_personal_federation_url() -> String {
+    // Loopback default (precedent: `crate::intake::gpu_authority`'s own
+    // chord-base-url helper uses the same literal).
+    env_nonempty("TERMINUS_PRIMARY_CHORD_URL")
+        .unwrap_or_else(|| "http://127.0.0.1:8099".to_string()) // pii-test-fixture
+}
+
+/// Timeout, in milliseconds, for a single federated tool call to Chord's
+/// `/v1/personal/tools/call`. From `TERMINUS_PRIMARY_CHORD_FEDERATION_TIMEOUT_MS`;
+/// defaults to 30000 (30s) — generous enough for a real personal-tool call
+/// (Chord itself hops on to the personal-registry deployment), but bounded so
+/// a dead/unreachable Chord process fails a caller's request instead of
+/// hanging it indefinitely (see TGW-02's spec item edge cases).
+pub fn chord_personal_federation_timeout_ms() -> u64 {
+    env_nonempty("TERMINUS_PRIMARY_CHORD_FEDERATION_TIMEOUT_MS")
+        .and_then(|v| v.parse().ok())
+        .filter(|ms: &u64| *ms > 0)
+        .unwrap_or(30_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    // ── TGW-02: Chord federation config ─────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn chord_personal_federation_url_defaults_and_overrides() {
+        std::env::remove_var("TERMINUS_PRIMARY_CHORD_URL");
+        assert_eq!(chord_personal_federation_url(), "http://127.0.0.1:8099"); // pii-test-fixture
+        std::env::set_var("TERMINUS_PRIMARY_CHORD_URL", "http://127.0.0.1:9999"); // pii-test-fixture
+        assert_eq!(chord_personal_federation_url(), "http://127.0.0.1:9999"); // pii-test-fixture
+        std::env::remove_var("TERMINUS_PRIMARY_CHORD_URL");
+    }
+
+    #[test]
+    #[serial]
+    fn chord_personal_federation_timeout_ms_defaults_and_overrides() {
+        std::env::remove_var("TERMINUS_PRIMARY_CHORD_FEDERATION_TIMEOUT_MS");
+        assert_eq!(chord_personal_federation_timeout_ms(), 30_000);
+        std::env::set_var("TERMINUS_PRIMARY_CHORD_FEDERATION_TIMEOUT_MS", "5000");
+        assert_eq!(chord_personal_federation_timeout_ms(), 5_000);
+        // Non-positive values fall back to the default rather than producing
+        // a zero-duration (instant-timeout) client.
+        std::env::set_var("TERMINUS_PRIMARY_CHORD_FEDERATION_TIMEOUT_MS", "0");
+        assert_eq!(chord_personal_federation_timeout_ms(), 30_000);
+        std::env::remove_var("TERMINUS_PRIMARY_CHORD_FEDERATION_TIMEOUT_MS");
+    }
 
     // ---- intake_database_url precedence (Phase 2 item 6) ----
     // `storage::get_pool()` (S83's model-intake pool) and
