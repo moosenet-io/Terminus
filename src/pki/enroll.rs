@@ -334,7 +334,17 @@ fn mint_jwt(identity: &str) -> Result<(String, i64), EnrollError> {
 /// problems rather than deferring that failure to the first enrollment
 /// request.
 pub fn build_enroll_router() -> axum::Router {
-    axum::Router::new().route(&crate::config::enrollment_path(), axum::routing::post(handle_enroll_http))
+    // Bound the request body to a few KB (TCLI-02 hardening): the enrollment
+    // payload is two short JSON strings, so a tight limit cheaply removes a
+    // trivial DoS vector on this public-facing, pre-auth route without ever
+    // constraining a legitimate request. Overrides axum's larger default
+    // body limit for this router only.
+    axum::Router::new()
+        .route(
+            &crate::config::enrollment_path(),
+            axum::routing::post(handle_enroll_http),
+        )
+        .layer(axum::extract::DefaultBodyLimit::max(4096))
 }
 
 async fn handle_enroll_http(
@@ -767,5 +777,39 @@ mod tests {
 
         clear_secrets();
         std::env::remove_var("TERMINUS_CA_STORE_PATH");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn http_route_rejects_oversize_body() {
+        clear_secrets();
+        set_secrets("correct-horse-battery-staple", "jwt-signing-key-for-tests-only");
+
+        // A body well past the 4KB limit (a padded shared_secret) must be
+        // rejected by the DefaultBodyLimit layer before the handler ever runs
+        // — 413 Payload Too Large, not a 200/401 from the auth path. The
+        // rejection body is plain text (not JSON), so this checks status
+        // directly rather than via the JSON-parsing `post_enroll` helper.
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let oversize = serde_json::json!({
+            "identity": "dev-box-claude-code",
+            "shared_secret": "x".repeat(8192)
+        })
+        .to_string();
+        let router = build_enroll_router();
+        let req = Request::builder()
+            .method("POST")
+            .uri(crate::config::enrollment_path())
+            .header("content-type", "application/json")
+            .body(Body::from(oversize))
+            .unwrap();
+        let status = router.oneshot(req).await.unwrap().status().as_u16();
+
+        assert_eq!(status, 413, "oversize enrollment body must be rejected");
+
+        clear_secrets();
     }
 }
