@@ -73,6 +73,7 @@
 //!   unlikely) — a documented known limitation, not a silent race.
 
 pub mod ca;
+pub mod enroll;
 
 pub use ca::CertificateAuthority;
 

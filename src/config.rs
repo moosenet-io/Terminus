@@ -451,6 +451,47 @@ fn default_ca_store_path() -> String {
         .unwrap_or_else(|| ".terminus/pki/ca_store.json".to_string())
 }
 
+// ── TCLI-02: enrollment endpoint config (non-secret) ──────────────────────────
+//
+// The enrollment BOOTSTRAP SECRET (`TERMINUS_ENROLLMENT_SHARED_SECRET`) and the
+// JWT signing key (`TERMINUS_JWT_SIGNING_KEY`) are secret material and are read
+// directly from the env-materialized runtime secret store inside
+// `crate::pki::enroll` (same convention as `crate::pki`'s CA material — see
+// that module's doc comment for why this crate has no separate
+// `SecretManager`/`vault` API of its own). This section only resolves
+// non-secret knobs: path, TTLs.
+
+/// HTTP path the enrollment endpoint is mounted at (merged into whichever
+/// router a binary builds — see `crate::pki::enroll::build_enroll_router`).
+/// From `TERMINUS_ENROLLMENT_PATH`; defaults to `/enroll`.
+pub fn enrollment_path() -> String {
+    env_nonempty("TERMINUS_ENROLLMENT_PATH").unwrap_or_else(|| "/enroll".to_string())
+}
+
+/// Issued client-cert TTL, in hours. Deliberately short-lived compared to the
+/// CA's multi-year validity (see `crate::pki::ca::CA_FORWARD_YEARS`) — this is
+/// a leaf cert meant to be re-enrolled periodically, not a long-lived
+/// credential. From `TERMINUS_ENROLLMENT_CERT_TTL_HOURS`; defaults to 24h.
+pub fn enrollment_cert_ttl_hours() -> i64 {
+    env_nonempty("TERMINUS_ENROLLMENT_CERT_TTL_HOURS")
+        .and_then(|v| v.parse().ok())
+        .filter(|h: &i64| *h > 0)
+        .unwrap_or(24)
+}
+
+/// Issued JWT TTL, in seconds. Matching-or-shorter than the paired cert's TTL
+/// per the TCLI-02 spec item (belt-and-suspenders: the JWT is the
+/// application-layer claim, the cert is the transport-layer identity — the
+/// JWT should never outlive the cert it's paired with). From
+/// `TERMINUS_ENROLLMENT_JWT_TTL_SECONDS`; defaults to 1800s (30 minutes),
+/// comfortably shorter than the default 24h cert TTL.
+pub fn enrollment_jwt_ttl_seconds() -> i64 {
+    env_nonempty("TERMINUS_ENROLLMENT_JWT_TTL_SECONDS")
+        .and_then(|v| v.parse().ok())
+        .filter(|s: &i64| *s > 0)
+        .unwrap_or(1800)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
