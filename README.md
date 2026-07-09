@@ -1151,6 +1151,43 @@ clean `ToolError::NotConfigured` if it's missing or blank. None of these
 tokens are added to `secrets_bootstrap::PAT_KEY_PREFIXES` — that multi-identity
 scan is reserved for providers that actually need it.
 
+## Embedded CA (`crate::pki`) — zero-standup PKI (TCLI-01)
+
+Terminus is being repositioned as the single mTLS front door for MCP tool
+traffic (Gateway P2). The first building block is a self-contained
+certificate authority: `src/pki/` uses `rcgen` to generate a private root CA
+on first run, and load it (never regenerate) on every run after that — no
+manual `step-ca`/OpenSSL standup required.
+
+**Load-or-generate precedence**, checked in this order by `pki::ca()`:
+
+1. `TERMINUS_CA_CERT` + `TERMINUS_CA_KEY` in the process environment — the
+   same "runtime secret store materialized into env at startup" pattern this
+   crate already uses for Gitea/Plane/GitHub tokens (see
+   `secrets_bootstrap`). If an operator provisions these directly, they take
+   precedence over anything else.
+2. A local store file at `ca_store_path()` (config helper; from
+   `TERMINUS_CA_STORE_PATH`, default `~/.terminus/pki/ca_store.json`) —
+   written with `0600` permissions, never world-readable. This is the
+   fallback tier used when no centralized secret-store material is
+   provisioned yet, since this crate has no write path back to the secret
+   store (by design).
+3. Neither present (true first run): generate a brand-new CA and persist it
+   to the local store file for next time.
+
+Corrupt/unparseable material at either tier 1 or tier 2 is a **hard startup
+error**, never a silent regeneration — a silent regen would invalidate every
+certificate this CA has already issued to enrolled clients. CA key material
+is never logged, printed, or written anywhere outside the tier-2 store file;
+`pki::CertificateAuthority` has a hand-written `Debug` impl that only prints
+`<redacted>` placeholders.
+
+`pki::ca()` is the single accessor — the enrollment endpoint (TCLI-02) and
+the mTLS listener (TCLI-03) call it rather than constructing or loading CA
+material themselves. Known limitation (P2, not yet solved): two terminus
+processes bootstrapping concurrently against the same local store can race;
+documented, not handled, given P2's single-primary topology.
+
 ## License
 
 MIT

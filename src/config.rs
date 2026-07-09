@@ -426,6 +426,31 @@ pub fn meridian_stooq_url() -> String {
     env_nonempty("MERIDIAN_STOOQ_URL").unwrap_or_else(|| "https://stooq.com".to_string())
 }
 
+// ── TCLI-01: embedded CA (`crate::pki`) storage — non-secret path only ────────
+//
+// The CA key/cert MATERIAL always goes through `crate::pki`'s own
+// load-or-generate logic (env-materialized secret store first, this local
+// path as the fallback tier) — this helper only resolves a *path name*, never
+// the material itself. See `crate::pki` module docs for the full precedence
+// and the "no secret-store write path in this crate" rationale for why a
+// local store tier exists at all.
+
+/// Local fallback persistence path for the embedded CA when no
+/// `TERMINUS_CA_CERT`/`TERMINUS_CA_KEY` are provisioned via the runtime
+/// secret store. From `TERMINUS_CA_STORE_PATH`; defaults to
+/// `~/.terminus/pki/ca_store.json` (or a relative fallback if the home
+/// directory can't be resolved). This is a path name only — non-secret.
+pub fn ca_store_path() -> String {
+    env_nonempty("TERMINUS_CA_STORE_PATH").unwrap_or_else(default_ca_store_path)
+}
+
+fn default_ca_store_path() -> String {
+    dirs::home_dir()
+        .map(|home| home.join(".terminus").join("pki").join("ca_store.json"))
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_else(|| ".terminus/pki/ca_store.json".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,5 +755,17 @@ mod tests {
         std::env::remove_var("MERIDIAN_COINGECKO_URL");
         std::env::remove_var("MERIDIAN_FEARGREED_URL");
         std::env::remove_var("MERIDIAN_STOOQ_URL");
+    }
+
+    #[test]
+    #[serial]
+    fn ca_store_path_defaults_and_overrides() {
+        std::env::remove_var("TERMINUS_CA_STORE_PATH");
+        let default_path = ca_store_path();
+        assert!(default_path.ends_with(".terminus/pki/ca_store.json"));
+
+        std::env::set_var("TERMINUS_CA_STORE_PATH", "/tmp/example-ca-store.json");
+        assert_eq!(ca_store_path(), "/tmp/example-ca-store.json");
+        std::env::remove_var("TERMINUS_CA_STORE_PATH");
     }
 }

@@ -44,6 +44,13 @@ use crate::<secret-manager>::{fetch_secrets_batch, InfisicalConfig}; // pii-test
 /// tokens, materialized dynamically through [`PAT_KEY_PREFIXES`] below (default
 /// identity `moose` → `GITEA_PAT_MOOSE`). There is no single unsuffixed Gitea
 /// token to materialize any more, so nothing in this fixed allowlist reads one.
+///
+/// **TCLI-01:** also carries `TERMINUS_CA_CERT`/`TERMINUS_CA_KEY` — the
+/// embedded CA's PEM material (`crate::pki`). Not a Gitea/Plane/GitHub
+/// credential, but this is the crate's only startup materialization point,
+/// so `crate::pki::bootstrap`'s "check the process env first" tier relies on
+/// this fetch to have populated them from the runtime secret store, exactly
+/// like every other key here.
 pub const GITEA_PLANE_GITHUB_SECRET_KEYS: &[&str] = &[
     "PLANE_API_URL",
     "PLANE_API_KEY",
@@ -52,6 +59,8 @@ pub const GITEA_PLANE_GITHUB_SECRET_KEYS: &[&str] = &[
     "GITHUB_TOKEN",
     "GITLAB_URL",
     "GITLAB_TOKEN",
+    "TERMINUS_CA_CERT",
+    "TERMINUS_CA_KEY",
 ];
 
 /// Prefixes for named-identity Personal Access Tokens. In addition to the fixed
