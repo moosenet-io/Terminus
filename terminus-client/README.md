@@ -116,6 +116,57 @@ The local client then sees the primary's full tool catalog (aggregated via
 `tools/list`) and every `tools/call` is round-tripped to the primary over
 mTLS and relayed back unchanged.
 
+## Dev-box cutover (TCLI-06) — STAGED, not yet the default
+
+TCLI-06 wires a dev box's MCP configuration (that box's `.mcp.json`, in
+`moosenet/lumina-constellation`) to this daemon instead of that box's prior
+direct-to-Chord/direct-to-primary JSON+JWT path. **As of the TCLI-06 change,
+this cutover is staged but NOT live** — it requires the `terminus_personal`
+mTLS-enabled primary deploy and per-identity
+`TERMINUS_ENROLLMENT_SHARED_SECRET` provisioning first (both operator-gated,
+outside this crate's or this repo's scope). The staged artifacts (candidate
+`.mcp.json`, launch unit, swap/rollback scripts, validation script,
+activation runbook) live on the dev box itself, not in this repo, because
+`.mcp.json` there is dev-box-local config — see that box's own
+`ACTIVATION_RUNBOOK.md` (created alongside the candidate config) for the
+exact ordered steps.
+
+### Verification procedure (run before flipping any default)
+
+Use `terminus-client/scripts/validate-daemon.sh` (this directory) once the
+daemon is running:
+
+```sh
+TERMINUS_CLIENT_LOCAL_PORT=8310 ./scripts/validate-daemon.sh
+```
+
+It checks, in order:
+1. `GET /healthz` returns 2xx (daemon process is up; per the fail-fast
+   startup contract above, this already implies the initial mTLS handshake
+   to the primary succeeded at daemon startup).
+2. `POST /mcp` `tools/list` round-trips and returns a non-empty catalog
+   (proves the *current* forwarding path, not just startup, is working).
+3. A representative read-only `tools/call` (default probe tool name:
+   `health`; override via `TERMINUS_CLIENT_VALIDATE_TOOL` if the deployed
+   catalog names it differently) succeeds and does not return
+   `isError: true`.
+
+Only proceed to point a local MCP client's default entry at this daemon
+after all three checks pass. A nonzero exit means: do not cut over yet.
+
+### Rollback (config-only, no code change)
+
+Cutover here means editing `.mcp.json`'s `mcpServers` map on the dev box to
+add a `terminus-client`-pointed entry (`http://127.0.0.1:8310/mcp`) — see
+that box's swap script. Rolling back means restoring the prior `.mcp.json`
+(the swap script's own backup, or the `terminus`-direct entry that stays
+present, clearly marked as the fallback, until the new path has proven
+itself across multiple fresh sessions). No `terminus-client` or `terminus-rs`
+code needs to change to roll back — it is purely a dev-box config edit, and
+per MCP client semantics, `.mcp.json` is read at session start, so a
+rollback (like the cutover itself) only takes effect for the **next** fresh
+session, never retroactively for one already running.
+
 ## Errors
 
 Every enrollment/connection failure is a typed [`error::ClientError`]
