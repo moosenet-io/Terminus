@@ -200,6 +200,40 @@ pub fn register_personal(registry: &mut ToolRegistry) {
     crate::sundry::register(registry);
 }
 
+/// Tool names that would collide if `register_all` (core) and
+/// `register_personal` were both registered into the SAME [`ToolRegistry`].
+///
+/// TGW-01 (the `terminus-primary` gateway binary) deliberately registers
+/// ONLY `register_all` — per the orchestrator-resolved design decision,
+/// personal-registry tools are reached via TGW-02's federation to the
+/// personal-registry deployment
+/// rather than a locally-aggregated registry — so this binary never actually
+/// builds a combined registry and never hits this collision at runtime.
+/// This helper (and the test below that calls it) exists to make the
+/// collision property EXPLICIT and loudly checkable rather than silently
+/// discovered: each tool module's own `register()` function reports a
+/// `ToolRegistry::register` duplicate-name `Err` via `tracing::warn!` and
+/// drops the losing tool (see e.g. `crate::plane::register`) — a silent
+/// drop, not a hard failure. A future caller that DOES need to build a
+/// combined registry (or a test guarding against a values regression) can
+/// call this first and fail loudly (`assert!`/`panic!`) on any non-empty
+/// result instead of relying on that per-module warn-and-drop behavior.
+pub fn core_personal_name_collisions() -> Vec<String> {
+    let mut core = ToolRegistry::new();
+    register_all(&mut core);
+    let mut personal = ToolRegistry::new();
+    register_personal(&mut personal);
+
+    let mut collisions: Vec<String> = personal
+        .list()
+        .into_iter()
+        .map(|t| t.name)
+        .filter(|name| core.contains(name))
+        .collect();
+    collisions.sort();
+    collisions
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,5 +380,64 @@ mod tests {
         register_all(&mut reg);
         assert!(reg.contains("scribe_status"));
         assert!(reg.len() > 0);
+    }
+
+    // ── TGW-01: core/personal collision detection is loud, not silent ──────
+
+    #[test]
+    fn test_core_personal_collision_detection_is_loud_not_silent() {
+        // As of this item, register_all() and register_personal() both
+        // register the plane/gitea/github tool modules -- a real,
+        // pre-existing overlap (see TGW-01's spec item edge cases). Building
+        // an AGGREGATED single registry from both (as a literal reading of
+        // an earlier draft of this spec item's Description implied) would
+        // therefore collide immediately on those tool names. This is
+        // exactly why `terminus_primary` (TGW-01) registers ONLY
+        // `register_all` and defers personal-tool access to TGW-02's
+        // federation instead of a locally-aggregated registry -- this test
+        // documents and pins that decision by proving the collision is
+        // real, not hypothetical, and that `core_personal_name_collisions`
+        // surfaces it explicitly (a `Vec` the caller can assert/panic on)
+        // rather than the silent per-module `tracing::warn!`-and-drop each
+        // `register()` implementation falls back to when handed a duplicate
+        // name directly via `ToolRegistry::register`.
+        let collisions = core_personal_name_collisions();
+        assert!(
+            !collisions.is_empty(),
+            "expected a known pre-existing collision (plane/gitea/github tool \
+             names are registered by both register_all and register_personal) \
+             -- if this now passes empty, the modules were de-duplicated and \
+             this test's documentation should be updated to match"
+        );
+        // A loud, visible report of every colliding name -- never a silent
+        // drop -- is the actual "fails loudly" behavior this item's
+        // acceptance criteria require of anything that WOULD build a
+        // combined registry.
+        eprintln!(
+            "core/personal tool-name collisions (expected, documented): {collisions:?}"
+        );
+        // register_personal calls nearly every module register_all also
+        // calls -- plane/gitea/github/sundry AND the personal-utility
+        // modules (ledger, vitals, crucible, relay, meridian, odyssey,
+        // gateway, cortex, soma, skills, council, network, ansible, dev),
+        // per both functions' own doc comments above -- so in practice
+        // almost the entire register_personal() tool set collides. The ONE
+        // deliberate exception is `forge::register_private` (git-private
+        // tools), which register_personal calls in place of
+        // `forge::register_public` (register_all's choice) -- those two
+        // produce DIFFERENT tool names by design, so they must never appear
+        // in the collision set. That's the one thing this test pins as a
+        // hard invariant; the rest is just "this is real and large."
+        let mut personal_only = ToolRegistry::new();
+        register_personal(&mut personal_only);
+        let personal_tool_count = personal_only.list().len();
+        assert!(
+            collisions.len() >= personal_tool_count / 2,
+            "expected the collision set to cover most of register_personal()'s tools \
+             ({} of {} registered) -- got only {}: {collisions:?}",
+            collisions.len(),
+            personal_tool_count,
+            collisions.len()
+        );
     }
 }

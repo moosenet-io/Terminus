@@ -1329,6 +1329,56 @@ material (S6).
   connect-per-tool-call usage pattern. Flagged for the reviewer; a future item could add
   periodic re-handshake if usage changes.
 
+## `terminus-primary` — the <host> gateway binary (TGW-01, S108)
+
+`src/bin/terminus_primary.rs` is a **new, third** Terminus binary (alongside `terminus_personal`
+and the embedded Chord-side fallback registry): the <host>-deployed gateway that serves the
+**core** tool set (`registry::register_all` — git-public, plane, gitea, github, and every other
+core module) over the same mTLS/`enroll` front door TCLI-01..03 built for `terminus_personal`.
+
+**How it differs from `terminus_personal`:**
+
+| | `terminus_personal` | `terminus_primary` |
+|---|---|---|
+| Tool set | `register_personal` (personal/admin subset: ledger, vitals, crucible, relay, meridian, odyssey, gateway, cortex, soma, skills, council, network, ansible, dev, plane, git-private, gitea, github, sundry) | `register_all` (the full core set: every build-pipeline/tool module) |
+| Deployment target | <host> | <host>, co-located with `chord.service` |
+| Plain listener config | `TERMINUS_PERSONAL_BIND`/`TERMINUS_PERSONAL_PORT`/`TERMINUS_PERSONAL_TOKEN` | `TERMINUS_PRIMARY_BIND`/`TERMINUS_PRIMARY_PORT`/`TERMINUS_PRIMARY_TOKEN` (default port `8310`, vs. `terminus_personal`'s `8300`) |
+| mTLS listener config | `TERMINUS_MTLS_BIND`/`TERMINUS_MTLS_PORT`/`TERMINUS_MTLS_SERVER_IDENTITY` | `TERMINUS_PRIMARY_MTLS_BIND`/`TERMINUS_PRIMARY_MTLS_PORT`/`TERMINUS_PRIMARY_MTLS_SERVER_IDENTITY` (default port `8311`, vs. `terminus_personal`'s `8301`) |
+| CA material | Whatever <host>'s environment/local store provisions | Independently auto-generated/provisioned on <host> — same `crate::pki::ca()` load-or-generate precedence, just a separate host's own environment/local store, so the two processes get independent CAs with no special-casing in code |
+| Startup <secret-manager> fetch | Yes (`fetch_downstream_secrets_from_infisical`, PSEC-02) | Not in this item — <host> deployment (TGW-05) provisions its environment directly; can be added later without touching the shared setup below |
+
+**Deliberately NOT included in this item** (see the TGW-01 spec item's scope boundary, S108):
+inference proxying to Chord (TGW-03), personal-tool federation to <host> (TGW-02), and the
+per-user auth/audit/rate-limit pipeline (TGW-04). At the end of this item, `terminus-primary`
+serves the core tool set over mTLS with `/enroll` wired — nothing more.
+
+**Why no combined core+personal registry:** `register_all` and `register_personal` both
+register the `plane`/`gitea`/`github`/`sundry` tool modules under the SAME tool names — a real,
+pre-existing collision (see `crate::registry::core_personal_name_collisions` and its test in
+`src/registry.rs`). Each module's own `register()` handles a duplicate name by logging a
+`tracing::warn!` and silently dropping the losing tool — not a loud failure. Rather than build a
+combined registry that would immediately hit this collision, `terminus-primary` registers
+`register_all` only; personal-tool reachability is planned via federation in TGW-02, not local
+aggregation.
+
+### Shared mTLS/enroll server-setup (`crate::pki::server`)
+
+Both `terminus_personal` and `terminus_primary` now call the SAME extracted helper
+(`src/pki/server.rs`, added by TGW-01) to build their `/mcp`+`/enroll` router and spawn their
+mTLS listener, instead of each binary inlining its own copy of that sequence:
+
+- `pki::server::build_gateway_router(registry, &GatewayServerConfig)` — builds `McpServerState`
+  and merges `crate::mcp_server::build_router` with `crate::pki::enroll::build_enroll_router()`.
+- `pki::server::spawn_mtls_listener(router, &GatewayServerConfig)` — the CA load
+  (`crate::pki::ca()`) → server cert issuance → TLS config build → `pki::mtls::run_listener`
+  sequence, spawned as a background task; a bootstrap failure disables only the mTLS listener,
+  never the caller's own plain listener.
+
+`terminus_personal`'s behavior is unchanged by this refactor — same `McpServerState` fields, same
+router merge, same mTLS bootstrap sequence, on the same `TERMINUS_MTLS_*`/`TERMINUS_PERSONAL_*`
+config it always used. Binding+serving the plain HTTP+JWT listener itself stays in each binary's
+own `main()`, since their bind addr/port/token config differs.
+
 ## License
 
 MIT
