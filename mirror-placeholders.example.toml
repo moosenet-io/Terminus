@@ -1,7 +1,7 @@
 # mirror-placeholders.toml — schema for the GHMR-02 mechanical sweep
 # =====================================================================
 #
-# The mechanical mirror sweep (`src/github/mirror/sweep.rs`) rewrites
+# The mechanical mirror sweep (`src/forge/mirror/sweep.rs`) rewrites
 # deterministically-fixable PII in a work-dir copy of internal `main` into inert
 # placeholder tokens, and reports everything the GHMR-01 PII gate STILL flags as
 # residual (needs judgment cleaning, GHMR-05).

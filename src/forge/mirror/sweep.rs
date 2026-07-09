@@ -91,7 +91,7 @@ impl PlaceholderConfig {
                 Ok(cfg) => cfg,
                 Err(e) => {
                     tracing::warn!(
-                        target: "github.mirror",
+                        target: "forge.mirror",
                         "malformed {}: {e} — using built-in placeholder rules only",
                         path.display()
                     );
@@ -181,7 +181,7 @@ fn compile_rules(cfg: &PlaceholderConfig) -> Vec<CompiledRule> {
             // corrupting the tree. Reject it like any other invalid rule.
             if pat.is_empty() {
                 tracing::warn!(
-                    target: "github.mirror",
+                    target: "forge.mirror",
                     "placeholder rule for token {:?} has an empty 'pattern' — skipping",
                     r.token
                 );
@@ -193,7 +193,7 @@ fn compile_rules(cfg: &PlaceholderConfig) -> Vec<CompiledRule> {
             // word-boundary match that likewise fires everywhere. Reject it too.
             if term.is_empty() {
                 tracing::warn!(
-                    target: "github.mirror",
+                    target: "forge.mirror",
                     "placeholder rule for token {:?} has an empty 'term' — skipping",
                     r.token
                 );
@@ -202,7 +202,7 @@ fn compile_rules(cfg: &PlaceholderConfig) -> Vec<CompiledRule> {
             Regex::new(&format!(r"(?i)\b{}\b", regex::escape(term)))
         } else {
             tracing::warn!(
-                target: "github.mirror",
+                target: "forge.mirror",
                 "placeholder rule for token {:?} has neither 'pattern' nor 'term' — skipping",
                 r.token
             );
@@ -216,7 +216,7 @@ fn compile_rules(cfg: &PlaceholderConfig) -> Vec<CompiledRule> {
                 kind: r.kind.clone().unwrap_or_else(|| "config".to_string()),
             }),
             Err(e) => tracing::warn!(
-                target: "github.mirror",
+                target: "forge.mirror",
                 "invalid placeholder rule {:?}: {e} — skipping",
                 r.token
             ),
