@@ -45,7 +45,12 @@ const DEFAULT_ENROLLMENT_PATH: &str = "/enroll";
 const DEFAULT_RENEWAL_MARGIN_SECS: i64 = 300;
 
 /// Configuration for one [`enroll`] call.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented by hand (not derived) so the caller-supplied
+/// bootstrap `shared_secret` is redacted -- a derived `Debug` would print it
+/// verbatim on any `{:?}`/`tracing::debug!(?cfg)`, defeating this crate's
+/// secret-hygiene posture (same convention as [`EnrolledCredential`]).
+#[derive(Clone)]
 pub struct EnrollConfig {
     /// Base URL of the terminus primary's plain HTTP+JWT listener, e.g.
     /// `"http://127.0.0.1:8300"`. The enrollment path is appended to this
@@ -69,6 +74,19 @@ pub struct EnrollConfig {
     pub enrollment_path: String,
     /// Renewal margin, in seconds -- see [`DEFAULT_RENEWAL_MARGIN_SECS`].
     pub renewal_margin_secs: i64,
+}
+
+impl std::fmt::Debug for EnrollConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnrollConfig")
+            .field("primary_url", &self.primary_url)
+            .field("identity", &self.identity)
+            .field("shared_secret", &"<redacted>")
+            .field("store_path", &self.store_path)
+            .field("enrollment_path", &self.enrollment_path)
+            .field("renewal_margin_secs", &self.renewal_margin_secs)
+            .finish()
+    }
 }
 
 impl EnrollConfig {
@@ -260,11 +278,16 @@ fn persist_local_credential(path: &Path, credential: &EnrolledCredential) -> Res
 
     let mut file = open_restrictive(path)
         .map_err(|e| ClientError::Store(format!("failed opening credential store file: {e}")))?;
+    // Tighten to 0600 BEFORE any secret bytes are written: `.mode(0o600)` in
+    // `open_restrictive` only takes effect when the file is newly created, so
+    // an overwrite of a pre-existing file left world/group-readable by
+    // something else would otherwise expose `key_pem`/`jwt` during the write
+    // window. Setting perms on the open handle first closes that window.
+    tighten_permissions(&file)
+        .map_err(|e| ClientError::Store(format!("failed to set credential store file permissions: {e}")))?;
     use std::io::Write;
     file.write_all(json.as_bytes())
         .map_err(|e| ClientError::Store(format!("failed writing credential store file: {e}")))?;
-    tighten_permissions(&file)
-        .map_err(|e| ClientError::Store(format!("failed to set credential store file permissions: {e}")))?;
     Ok(())
 }
 
@@ -460,6 +483,17 @@ mod tests {
         assert_eq!(got.jwt, fresh.jwt);
 
         std::fs::remove_dir_all(store_path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn enroll_config_debug_redacts_shared_secret() {
+        let cfg = EnrollConfig::new("http://127.0.0.1:8300", "dev-box-claude-code", "super-secret-value");
+        let rendered = format!("{cfg:?}");
+        assert!(
+            !rendered.contains("super-secret-value"),
+            "EnrollConfig Debug must never print the bootstrap shared secret: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "expected redaction marker in {rendered}");
     }
 
     #[tokio::test]
