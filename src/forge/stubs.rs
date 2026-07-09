@@ -168,32 +168,43 @@ impl ForgeProvider for StubForge {
 // ─── Capability maps ──────────────────────────────────────────────────────────
 
 /// Bitbucket Cloud REST 2.0: broad surface, but no GitHub-style Releases
-/// feature and no generic package registry — both honestly `Unsupported`.
+/// feature, no generic package registry, no repo mirror-config endpoint (that
+/// exists on Bitbucket Data Center, not Cloud), and no webhook test-delivery
+/// endpoint — all honestly `Unsupported`. Bitbucket's PR "approve"/"request
+/// changes" calls are a reduced review model (no per-line review threads like
+/// GitHub/Gitea), so `PullRequestsReview` is declared `Experimental` rather
+/// than fully `Supported`.
 fn bitbucket_capabilities() -> CapabilityMap {
     use ForgeEndpoint::*;
     let mut m = CapabilityMap::new();
     for ep in [
         ReposList, ReposGet, ReposCreate, ReposUpdate, ReposDelete, ReposFork,
-        ReposMirrorConfig, ReposVisibility, ReposMetadata,
+        ReposVisibility, ReposMetadata,
         BranchesList, BranchesGet, BranchesCreate, BranchesDelete, BranchesProtection,
         BranchesDefault, RefsList, RefsGet, RefsCreate, RefsDelete,
         CommitsList, CommitsGet, CommitsCompareDiff, CommitsStatus,
         PullRequestsList, PullRequestsGet, PullRequestsCreate, PullRequestsUpdate,
-        PullRequestsReview, PullRequestsComment, PullRequestsMerge, PullRequestsClose,
+        PullRequestsComment, PullRequestsMerge, PullRequestsClose,
         IssuesList, IssuesGet, IssuesCreate, IssuesUpdate, IssuesComment, IssuesLabel,
         IssuesAssign, IssuesClose,
         // Bitbucket Cloud has no "Releases" object; git tags exist independently.
         TagsList, TagsGet, TagsCreate, TagsDelete,
-        WebhooksList, WebhooksCreate, WebhooksUpdate, WebhooksDelete, WebhooksTest,
+        WebhooksList, WebhooksCreate, WebhooksUpdate, WebhooksDelete,
         ContentReadFile, ContentWriteFile, ContentListTree, ContentRawFetch,
         // "Org" maps to Bitbucket workspaces/groups.
         OrgMembers, OrgTeams, OrgPermissions,
     ] {
         m.set(ep, SupportLevel::Supported);
     }
+    // Approve/unapprove + request-changes exist, but not a full per-line
+    // review-thread workflow — declared, not claimed as fully Supported.
+    m.set(PullRequestsReview, SupportLevel::Experimental);
     for ep in [
         ReleasesList, ReleasesGet, ReleasesCreate, ReleasesUpdate, ReleasesDelete, ReleasesAssets,
         PackagesList, PackagesGet, PackagesPublish, PackagesDelete,
+        // Cloud REST 2.0 has no pull/push mirror-configuration endpoint (a
+        // Bitbucket Data Center feature) and no webhook test-delivery call.
+        ReposMirrorConfig, WebhooksTest,
     ] {
         m.set(ep, SupportLevel::Unsupported);
     }
@@ -203,21 +214,24 @@ fn bitbucket_capabilities() -> CapabilityMap {
 /// SourceHut (sr.ht): patch-email workflow, not web PRs, and no package
 /// registry — `PullRequests*` and `Packages*` are honestly `Unsupported`.
 /// sr.ht's webhook model is per-service (todo.sr.ht, meta.sr.ht, ...) rather
-/// than one generic surface, so `Webhooks*` is `Experimental`.
+/// than one generic surface, so `Webhooks*` is `Experimental`. sr.ht has no
+/// org/group-membership concept, so `OrgMembers`/`OrgTeams`/`OrgPermissions`
+/// are `Unsupported`. Refs and tags on sr.ht are written ONLY via a `git push`
+/// (there is no ref/tag-mutation REST/GraphQL call) — read (`list`/`get`) is
+/// `Supported`, but `*Create`/`*Delete` are `Unsupported`.
 fn sourcehut_capabilities() -> CapabilityMap {
     use ForgeEndpoint::*;
     let mut m = CapabilityMap::new();
     for ep in [
         ReposList, ReposGet, ReposCreate, ReposUpdate, ReposDelete, ReposVisibility, ReposMetadata,
         BranchesList, BranchesGet, BranchesDefault,
-        RefsList, RefsGet, RefsCreate, RefsDelete,
-        CommitsList, CommitsGet, CommitsCompareDiff, CommitsStatus,
+        RefsList, RefsGet,
+        CommitsList, CommitsGet,
         // Issues via todo.sr.ht.
         IssuesList, IssuesGet, IssuesCreate, IssuesUpdate, IssuesComment, IssuesLabel,
         IssuesAssign, IssuesClose,
-        TagsList, TagsGet, TagsCreate, TagsDelete,
+        TagsList, TagsGet,
         ContentReadFile, ContentListTree, ContentRawFetch,
-        OrgMembers,
     ] {
         m.set(ep, SupportLevel::Supported);
     }
@@ -234,43 +248,62 @@ fn sourcehut_capabilities() -> CapabilityMap {
         ReleasesList, ReleasesGet, ReleasesCreate, ReleasesUpdate, ReleasesDelete, ReleasesAssets,
         // No branch-protection or fork/mirror-config API, no team/permission API.
         BranchesCreate, BranchesDelete, BranchesProtection, ReposFork, ReposMirrorConfig,
-        ContentWriteFile, OrgTeams, OrgPermissions,
+        ContentWriteFile,
+        // Refs/tags are mutated only via `git push`, never a REST/GraphQL call.
+        RefsCreate, RefsDelete, TagsCreate, TagsDelete,
+        // No org/group-membership concept.
+        OrgMembers, OrgTeams, OrgPermissions,
+        // No commit compare/diff or commit status APIs.
+        CommitsCompareDiff, CommitsStatus,
     ] {
         m.set(ep, SupportLevel::Unsupported);
     }
     m
 }
 
-/// Gogs: a deliberately minimal Gitea-lineage fork. No branch-protection API,
-/// no package registry, and no webhook test-delivery endpoint.
+/// Gogs: a deliberately minimal Gitea-lineage fork, well predating Gitea's
+/// modern feature set. Its documented REST surface
+/// (`https://github.com/gogs/docs-api`) covers repos, branches (read-only —
+/// no create/delete), commits (list/get only — no compare/diff, no commit
+/// status), issues, webhooks (no test-delivery), and basic
+/// content/org/collaboration — but has NO generic git-refs API, NO pull
+/// request API at all (Gogs never shipped one, unlike Gitea which added it
+/// after the fork), NO dedicated tag endpoints, NO release-asset uploads, NO
+/// branch-protection API, and NO repo mirror-config API. Everything in that
+/// list is honestly `Unsupported`; content write and org teams are less
+/// certain across Gogs versions, so both are declared `Experimental` rather
+/// than `Supported`.
 fn gogs_capabilities() -> CapabilityMap {
     use ForgeEndpoint::*;
     let mut m = CapabilityMap::new();
     for ep in [
         ReposList, ReposGet, ReposCreate, ReposUpdate, ReposDelete, ReposFork,
-        ReposMirrorConfig, ReposVisibility, ReposMetadata,
-        BranchesList, BranchesGet, BranchesCreate, BranchesDelete, BranchesDefault,
-        RefsList, RefsGet, RefsCreate, RefsDelete,
-        CommitsList, CommitsGet, CommitsCompareDiff, CommitsStatus,
-        PullRequestsList, PullRequestsGet, PullRequestsCreate, PullRequestsUpdate,
-        PullRequestsComment, PullRequestsMerge, PullRequestsClose,
+        ReposVisibility, ReposMetadata,
+        BranchesList, BranchesGet, BranchesDefault,
+        CommitsList, CommitsGet,
         IssuesList, IssuesGet, IssuesCreate, IssuesUpdate, IssuesComment, IssuesLabel,
         IssuesAssign, IssuesClose,
-        ReleasesList, ReleasesGet, ReleasesCreate, ReleasesUpdate, ReleasesDelete, ReleasesAssets,
-        TagsList, TagsGet, TagsCreate, TagsDelete,
+        ReleasesList,
         WebhooksList, WebhooksCreate, WebhooksUpdate, WebhooksDelete,
-        ContentReadFile, ContentWriteFile, ContentListTree, ContentRawFetch,
-        OrgMembers, OrgTeams,
+        ContentReadFile, ContentRawFetch,
+        OrgMembers,
     ] {
         m.set(ep, SupportLevel::Supported);
     }
-    // Older Gitea-lineage API; formal review sign-off is thinner than upstream
-    // Gitea, so treat it as declared-but-partial rather than fully supported.
-    m.set(PullRequestsReview, SupportLevel::Experimental);
+    for ep in [ContentWriteFile, ContentListTree, OrgTeams] {
+        m.set(ep, SupportLevel::Experimental);
+    }
     for ep in [
-        BranchesProtection,
+        BranchesCreate, BranchesDelete, BranchesProtection,
+        RefsList, RefsGet, RefsCreate, RefsDelete,
+        CommitsCompareDiff, CommitsStatus,
+        PullRequestsList, PullRequestsGet, PullRequestsCreate, PullRequestsUpdate,
+        PullRequestsReview, PullRequestsComment, PullRequestsMerge, PullRequestsClose,
+        TagsList, TagsGet, TagsCreate, TagsDelete,
+        ReleasesGet, ReleasesCreate, ReleasesUpdate, ReleasesDelete, ReleasesAssets,
         WebhooksTest,
         PackagesList, PackagesGet, PackagesPublish, PackagesDelete,
+        ReposMirrorConfig,
         OrgPermissions,
     ] {
         m.set(ep, SupportLevel::Unsupported);
@@ -341,17 +374,31 @@ mod tests {
     use serial_test::serial;
     use serde_json::json;
 
+    const STUB_ENV_KEYS: &[&str] =
+        &["BITBUCKET_TOKEN", "SOURCEHUT_TOKEN", "GOGS_TOKEN", "ONEDEV_TOKEN", "RADICLE_TOKEN"];
+
     fn clear_stub_env() {
-        for k in [
-            "BITBUCKET_TOKEN", "SOURCEHUT_TOKEN", "GOGS_TOKEN", "ONEDEV_TOKEN", "RADICLE_TOKEN",
-        ] {
+        for k in STUB_ENV_KEYS {
             env::remove_var(k);
+        }
+    }
+
+    /// RAII guard that removes every stub env var on drop, including on a
+    /// test panic (e.g. a failed `assert_eq!` partway through a case loop).
+    /// Without this, a panic mid-test would leak a `set_var` past the test
+    /// boundary and could contaminate a later `#[serial]` test that assumes a
+    /// clean environment (codex/agy P2).
+    struct EnvCleanup;
+    impl Drop for EnvCleanup {
+        fn drop(&mut self) {
+            clear_stub_env();
         }
     }
 
     #[test]
     #[serial]
     fn from_env_requires_its_token() {
+        let _cleanup = EnvCleanup;
         clear_stub_env();
         assert!(StubForge::bitbucket_from_env().is_err());
         assert!(StubForge::sourcehut_from_env().is_err());
@@ -363,12 +410,12 @@ mod tests {
         assert!(StubForge::bitbucket_from_env().is_err());
         env::set_var("BITBUCKET_TOKEN", "tok");
         assert!(StubForge::bitbucket_from_env().is_ok());
-        clear_stub_env();
     }
 
     #[test]
     #[serial]
     fn each_stub_advertises_its_id_and_credential_key() {
+        let _cleanup = EnvCleanup;
         clear_stub_env();
         let cases: Vec<(fn() -> Result<StubForge, ToolError>, &str, &str)> = vec![
             (StubForge::bitbucket_from_env, "bitbucket", "BITBUCKET_TOKEN"),
@@ -395,12 +442,24 @@ mod tests {
             ForgeEndpoint::PullRequestsMerge,
             ForgeEndpoint::PackagesPublish,
             ForgeEndpoint::PackagesList,
+            // sr.ht has no org/group-membership listing endpoint either.
+            ForgeEndpoint::OrgMembers,
+            // Refs/tags are pushed via git only — no mutation REST/GraphQL call.
+            ForgeEndpoint::RefsCreate,
+            ForgeEndpoint::RefsDelete,
+            ForgeEndpoint::TagsCreate,
+            ForgeEndpoint::TagsDelete,
+            // No commit compare/diff or commit status APIs.
+            ForgeEndpoint::CommitsCompareDiff,
+            ForgeEndpoint::CommitsStatus,
         ] {
             assert_eq!(caps.level(ep), SupportLevel::Unsupported, "{ep:?}");
         }
-        // But issues (todo.sr.ht) and repos ARE real.
+        // But issues (todo.sr.ht), read-only refs/tags, and repos ARE real.
         assert_eq!(caps.level(ForgeEndpoint::IssuesCreate), SupportLevel::Supported);
         assert_eq!(caps.level(ForgeEndpoint::ReposGet), SupportLevel::Supported);
+        assert_eq!(caps.level(ForgeEndpoint::RefsList), SupportLevel::Supported);
+        assert_eq!(caps.level(ForgeEndpoint::TagsList), SupportLevel::Supported);
     }
 
     #[test]
@@ -420,25 +479,52 @@ mod tests {
             ForgeEndpoint::ReleasesCreate,
             ForgeEndpoint::ReleasesList,
             ForgeEndpoint::PackagesPublish,
+            // Cloud REST 2.0 has no mirror-config or webhook-test endpoint.
+            ForgeEndpoint::ReposMirrorConfig,
+            ForgeEndpoint::WebhooksTest,
         ] {
             assert_eq!(caps.level(ep), SupportLevel::Unsupported, "{ep:?}");
         }
-        // But tags and PRs ARE real on Bitbucket Cloud.
+        // Tags and PR create/comment/merge ARE real on Bitbucket Cloud, but
+        // "review" is only approve/request-changes, not per-line threads.
         assert_eq!(caps.level(ForgeEndpoint::TagsCreate), SupportLevel::Supported);
         assert_eq!(caps.level(ForgeEndpoint::PullRequestsCreate), SupportLevel::Supported);
+        assert_eq!(caps.level(ForgeEndpoint::PullRequestsReview), SupportLevel::Experimental);
     }
 
     #[test]
-    fn gogs_lacks_branch_protection_and_packages_and_webhook_test() {
+    fn gogs_lacks_pull_requests_refs_tags_and_diff_status() {
         let caps = gogs_capabilities();
         for ep in [
             ForgeEndpoint::BranchesProtection,
+            ForgeEndpoint::BranchesCreate,
+            ForgeEndpoint::BranchesDelete,
             ForgeEndpoint::WebhooksTest,
             ForgeEndpoint::PackagesPublish,
+            // No repo mirror-config API and no PR API at all (never shipped).
+            ForgeEndpoint::ReposMirrorConfig,
+            ForgeEndpoint::PullRequestsReview,
+            ForgeEndpoint::PullRequestsList,
+            ForgeEndpoint::PullRequestsCreate,
+            // No generic git-refs API, no dedicated tag endpoints.
+            ForgeEndpoint::RefsList,
+            ForgeEndpoint::RefsCreate,
+            ForgeEndpoint::TagsList,
+            ForgeEndpoint::TagsCreate,
+            // No compare/diff or commit-status API.
+            ForgeEndpoint::CommitsCompareDiff,
+            ForgeEndpoint::CommitsStatus,
+            // Gogs lacks single-release API and mutation API.
+            ForgeEndpoint::ReleasesGet,
+            ForgeEndpoint::ReleasesCreate,
+            ForgeEndpoint::ReleasesUpdate,
+            ForgeEndpoint::ReleasesDelete,
+            ForgeEndpoint::ReleasesAssets,
         ] {
             assert_eq!(caps.level(ep), SupportLevel::Unsupported, "{ep:?}");
         }
         assert_eq!(caps.level(ForgeEndpoint::IssuesCreate), SupportLevel::Supported);
+        assert_eq!(caps.level(ForgeEndpoint::CommitsList), SupportLevel::Supported);
     }
 
     #[test]
@@ -455,6 +541,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn sourcehut_pull_request_create_is_cleanly_unsupported() {
+        let _cleanup = EnvCleanup;
         env::set_var("SOURCEHUT_TOKEN", "tok");
         let forge = StubForge::sourcehut_from_env().expect("configured");
         let err = forge
@@ -468,7 +555,6 @@ mod tests {
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
-        env::remove_var("SOURCEHUT_TOKEN");
     }
 
     /// Negative test: an endpoint a stub DOES advertise (declared) but has not
@@ -478,6 +564,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn advertised_but_unwired_endpoint_reports_not_implemented() {
+        let _cleanup = EnvCleanup;
         env::set_var("BITBUCKET_TOKEN", "tok");
         let forge = StubForge::bitbucket_from_env().expect("configured");
         assert!(forge.supports(ForgeEndpoint::ReposGet));
@@ -492,7 +579,6 @@ mod tests {
             }
             other => panic!("expected NotImplemented, got {other:?}"),
         }
-        env::remove_var("BITBUCKET_TOKEN");
     }
 
     #[test]

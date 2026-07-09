@@ -717,9 +717,9 @@ paths every other adapter uses.
 
 | Provider id | Pool | Credential | Capability posture |
 |---|---|---|---|
-| `bitbucket` | git-public | `BITBUCKET_TOKEN` | Broad REST 2.0 surface, but no GitHub-style Releases object and no generic package registry — `releases_*`/`packages_*` `unsupported`. |
-| `sourcehut` | git-public | `SOURCEHUT_TOKEN` | **Reduced by design**: sr.ht is a patch-email workflow — no web pull-request surface and no package registry (`pull_requests_*`/`packages_*` `unsupported`); its per-service webhook model is advertised `experimental`. |
-| `gogs` | git-private | `GOGS_TOKEN` | Minimal Gitea-lineage fork — no branch-protection API, no package registry, no webhook test-delivery endpoint (`unsupported`); PR review is `experimental`. |
+| `bitbucket` | git-public | `BITBUCKET_TOKEN` | Broad REST 2.0 surface, but no GitHub-style Releases object, no generic package registry, no repo mirror-config endpoint (Data Center-only), and no webhook test-delivery call — all `unsupported`; PR approve/request-changes exists but isn't a full per-line review workflow, so `pull_requests_review` is `experimental`. |
+| `sourcehut` | git-public | `SOURCEHUT_TOKEN` | **Reduced by design**: sr.ht is a patch-email workflow — no web pull-request surface, no package registry, and no org/group-membership listing (`pull_requests_*`/`packages_*`/`org_members` `unsupported`); refs/tags are mutated only via `git push`, so their `*_create`/`*_delete` are `unsupported` too (list/get stay `supported`); its per-service webhook model is advertised `experimental`. |
+| `gogs` | git-private | `GOGS_TOKEN` | Minimal Gitea-lineage fork — no branch-protection API, no package registry, no webhook test-delivery endpoint, and no pull requests API (`unsupported`). |
 | `onedev` | git-private | `ONEDEV_TOKEN` | Modern self-hosted forge, near-full vocabulary `supported`; generic package publish (Maven/npm/Docker differ per-protocol) is `experimental`. |
 | `radicle` | git-public-ish/experimental | `RADICLE_TOKEN` | **Peer-to-peer, experimental.** Writes happen over the `rad`/git protocol, not REST, and there's no central org/membership concept. Only the read-only `radicle-httpd` surface (repos/branches/refs/commits, read-only patches/issues, content read) is advertised `experimental`; everything else — all writes, releases, webhooks, packages, org — is `unsupported`. |
 
