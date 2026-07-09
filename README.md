@@ -694,9 +694,13 @@ id/display-name/pool/default-base differ.
   the group projects path and falls back to the user projects path; webhook
   bodies accept GitHub's nested `config.url`+`events[]` shape and are translated
   to GitLab's flat `url`+per-event-boolean form (a GitLab-native flat body
-  passes through verbatim); `content_write_file` infers POST (create) vs PUT
-  (update) from the absence/presence of `sha`/`last_commit_id` (an explicit
-  `create` bool overrides).
+  passes through verbatim; GitHub's `active` is deliberately NOT mapped — GitLab
+  has no equivalent, and mapping it onto `enable_ssl_verification` would be a TLS
+  security regression); MR/issue `updates` bodies remap `body`→`description` and
+  `state`→`state_event` so a GitHub-shaped update is not silently ignored;
+  `content_write_file` infers POST (create) vs PUT (update) from the
+  absence/presence of `sha`/`last_commit_id` (an explicit `create` bool
+  overrides).
 - **Capability map — honest gaps AND an honest advantage over GitHub.** Left
   `unsupported`: `refs_list`/`refs_get`/`refs_create`/`refs_delete` (GitLab v4 has
   no generic ref-namespace API like GitHub's `git/refs` — only the concrete
@@ -732,7 +736,11 @@ id/display-name/pool/default-base differ.
   `MAX_REDIRECT_HOPS`, and never followed across an `https`→`http` downgrade.
 - **Pagination + binary-safe raw fetch.** List endpoints follow GitLab's
   `Link: rel="next"` header (the same RFC 5988 shape GitHub emits), bounded by a
-  `MAX_PAGES` runaway guard. `content_raw_fetch` returns UTF-8 content as
+  `MAX_PAGES` runaway guard. Each server-supplied `next` URL is pinned to the
+  INITIAL request's origin (a hostile forge cannot redirect pagination — and the
+  `PRIVATE-TOKEN` — to a different allowlisted host), and hitting `MAX_PAGES`
+  with a further page still pending is a hard error rather than a silently
+  truncated success. `content_raw_fetch` returns UTF-8 content as
   `{ path, encoding: "utf-8", raw }` and non-UTF-8 (binary) content losslessly as
   `{ path, encoding: "base64", raw_base64 }`.
 - **Error mapping.** `401`/`403` → `ForgeError::Auth`; other non-2xx →

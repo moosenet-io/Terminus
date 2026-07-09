@@ -473,11 +473,35 @@ impl GitLabAdapter {
     /// GET a list endpoint, following GitLab's `Link: rel="next"` pagination and
     /// concatenating the array pages into one result (bounded by [`MAX_PAGES`]).
     /// A non-array first page (e.g. an error object shape) is returned as-is.
+    ///
+    /// Two safety properties beyond a naive follow-the-`next`-link loop:
+    /// - **Same-origin pagination.** The server supplies each `next` URL in its
+    ///   `Link` header; the loop refuses any whose normalized origin differs from
+    ///   the INITIAL request's origin. Without this, a compromised/hostile forge
+    ///   could point pagination at another allowlisted host (e.g. a
+    ///   `GITLAB_EGRESS_ALLOWLIST` entry) and receive the `PRIVATE-TOKEN`.
+    /// - **No silent truncation.** Hitting [`MAX_PAGES`] while a further page
+    ///   still exists is a hard [`ForgeError::Transport`], not a quietly
+    ///   truncated "success" — the caller is told the result is incomplete.
     async fn call_paginated(&self, token: &str, url: &str) -> Result<Value, ForgeError> {
+        let provider = self.variant.provider_id();
+        let origin = host_of(url);
         let mut next = Some(url.to_string());
         let mut items: Vec<Value> = Vec::new();
         let mut pages: u32 = 0;
         while let Some(u) = next.take() {
+            // Every hop after the first comes from a server-controlled `Link`
+            // header — pin it to the initial origin so the credential can never
+            // be redirected to a different (even allowlisted) host.
+            if host_of(&u) != origin {
+                return Err(ForgeError::Transport {
+                    provider: provider.into(),
+                    message: format!(
+                        "egress blocked: paginated 'next' host '{}' differs from the request origin",
+                        host_of(&u).unwrap_or_default()
+                    ),
+                });
+            }
             let (body, nxt) = self.get_page(token, &u).await?;
             match body {
                 Value::Array(mut a) => items.append(&mut a),
@@ -485,6 +509,14 @@ impl GitLabAdapter {
             }
             pages += 1;
             if pages >= MAX_PAGES {
+                if nxt.is_some() {
+                    return Err(ForgeError::Transport {
+                        provider: provider.into(),
+                        message: format!(
+                            "result exceeded MAX_PAGES ({MAX_PAGES}); refusing to return a truncated list"
+                        ),
+                    });
+                }
                 break;
             }
             next = nxt;
@@ -756,9 +788,12 @@ fn translate_webhook(hook: &Value) -> Value {
     if let Some(secret) = hook.pointer("/config/secret").and_then(Value::as_str) {
         out.insert("token".into(), json!(secret));
     }
-    if let Some(active) = hook.get("active").and_then(Value::as_bool) {
-        out.insert("enable_ssl_verification".into(), json!(active));
-    }
+    // NB: GitHub's `active` (hook enabled/disabled) has NO GitLab equivalent —
+    // deliberately NOT mapped. Mapping it onto `enable_ssl_verification` (a
+    // previous mistake) would make `active: false` silently DISABLE TLS
+    // certificate verification, a security regression. A caller wanting to set
+    // GitLab's TLS flag passes native `enable_ssl_verification` (preserved below
+    // via the config passthrough of already-flat bodies).
     if let Some(events) = hook.get("events").and_then(Value::as_array) {
         for ev in events.iter().filter_map(Value::as_str) {
             let flag = match ev {
@@ -775,6 +810,42 @@ fn translate_webhook(hook: &Value) -> Value {
         }
     }
     Value::Object(out)
+}
+
+/// Normalize a shared-surface `updates` object for an issue or merge request
+/// into GitLab's field names, so a provider-agnostic (GitHub-shaped) update body
+/// isn't forwarded verbatim (where `body`/`state` would be ignored). Recognized
+/// remappings — anything else passes through untouched, and a value already in
+/// GitLab's spelling is never clobbered:
+/// - `body` → `description`
+/// - `state` (`open`/`closed`) → `state_event` (`reopen`/`close`)
+/// - `labels` (array) → comma-separated string
+fn normalize_issue_updates(updates: &Value) -> Value {
+    let mut map = match updates {
+        Value::Object(m) => m.clone(),
+        _ => return updates.clone(),
+    };
+    if let Some(body) = map.remove("body") {
+        map.entry("description").or_insert(body);
+    }
+    if !map.contains_key("state_event") {
+        if let Some(state) = map.remove("state").as_ref().and_then(Value::as_str) {
+            let ev = match state {
+                "closed" | "close" => Some("close"),
+                "open" | "opened" | "reopen" => Some("reopen"),
+                _ => None,
+            };
+            if let Some(ev) = ev {
+                map.insert("state_event".into(), json!(ev));
+            }
+        }
+    }
+    if let Some(labels) = map.get("labels").cloned() {
+        if labels.is_array() {
+            map.insert("labels".into(), json!(labels_string(&labels)));
+        }
+    }
+    Value::Object(map)
 }
 
 /// Percent-encode a string for safe interpolation into a URL. Unreserved
@@ -1122,7 +1193,7 @@ impl ForgeProvider for GitLabAdapter {
             PullRequestsUpdate => {
                 let pid = self.project_ref(p)?;
                 let iid = Self::req_num(p, "number")?;
-                let body = p.get("updates").cloned().unwrap_or_else(|| json!({}));
+                let body = normalize_issue_updates(&p.get("updates").cloned().unwrap_or_else(|| json!({})));
                 let url = format!("{api}/projects/{pid}/merge_requests/{iid}");
                 ok(self.call(&token, Method::PUT, &url, Some(&body)).await?)
             }
@@ -1225,7 +1296,7 @@ impl ForgeProvider for GitLabAdapter {
             IssuesUpdate => {
                 let pid = self.project_ref(p)?;
                 let iid = Self::req_num(p, "number")?;
-                let body = p.get("updates").cloned().unwrap_or_else(|| json!({}));
+                let body = normalize_issue_updates(&p.get("updates").cloned().unwrap_or_else(|| json!({})));
                 let url = format!("{api}/projects/{pid}/issues/{iid}");
                 ok(self.call(&token, Method::PUT, &url, Some(&body)).await?)
             }
@@ -2368,7 +2439,8 @@ mod tests {
         assert_eq!(gl["push_events"], true);
         assert_eq!(gl["merge_requests_events"], true);
         assert_eq!(gl["issues_events"], true);
-        assert_eq!(gl["enable_ssl_verification"], true);
+        // GitHub `active` must NOT be mapped (never onto enable_ssl_verification).
+        assert!(gl.get("enable_ssl_verification").is_none());
     }
 
     #[test]
@@ -2478,6 +2550,63 @@ mod tests {
         assert_eq!(resp.body.as_array().unwrap().len(), 1);
         group.assert();
         user.assert();
+    }
+
+    #[test]
+    fn normalize_issue_updates_maps_github_fields() {
+        let out = normalize_issue_updates(&json!({ "body": "b", "state": "closed", "labels": ["x", "y"] }));
+        assert_eq!(out["description"], "b");
+        assert!(out.get("body").is_none());
+        assert_eq!(out["state_event"], "close");
+        assert!(out.get("state").is_none());
+        assert_eq!(out["labels"], "x,y");
+        // open -> reopen
+        let reopen = normalize_issue_updates(&json!({ "state": "open" }));
+        assert_eq!(reopen["state_event"], "reopen");
+        // GitLab-native fields untouched
+        let native = normalize_issue_updates(&json!({ "description": "d", "state_event": "close" }));
+        assert_eq!(native["description"], "d");
+        assert_eq!(native["state_event"], "close");
+    }
+
+    #[tokio::test]
+    async fn issues_update_translates_body_and_state() {
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(PUT)
+                .path("/projects/moosenet%2Fdemo/issues/4") // pii-test-fixture
+                .json_body(json!({ "description": "new text", "state_event": "close" }));
+            then.status(200).json_body(json!({ "iid": 4 }));
+        });
+        let a = test_adapter(&server.base_url());
+        a.dispatch(
+            ForgeEndpoint::IssuesUpdate,
+            req(json!({ "repo": "demo", "number": 4, "updates": { "body": "new text", "state": "closed" } })),
+        )
+        .await
+        .unwrap();
+        m.assert();
+    }
+
+    #[tokio::test]
+    async fn paginated_next_to_different_origin_is_blocked() {
+        // A server-supplied `Link: next` pointing at a DIFFERENT host must be
+        // refused — otherwise the PRIVATE-TOKEN would be sent there. Surfaces as
+        // a Transport egress-blocked error.
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(GET).path("/projects/moosenet%2Fdemo/repository/branches"); // pii-test-fixture
+            then.status(200)
+                .header("Link", "<https://gitlab.com/api/v4/projects/1/repository/branches?page=2>; rel=\"next\"")
+                .json_body(json!([{ "name": "a" }]));
+        });
+        let a = test_adapter_variant(&server.base_url(), GitLabVariant::Saas);
+        let err = a
+            .dispatch(ForgeEndpoint::BranchesList, req(json!({ "repo": "demo" })))
+            .await
+            .expect_err("cross-origin pagination must be blocked");
+        assert!(matches!(err, ForgeError::Transport { .. }), "got {err:?}");
+        m.assert();
     }
 
     #[tokio::test]
