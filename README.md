@@ -578,14 +578,12 @@ provider pool + posture, not capability. `src/forge/` is the foundation both
 tools sit on (GITX-01); the concrete adapters and the two-tool assembly land in
 later items.
 
-<!-- GITX-07 reconcile: verify tool/domain names below against merged GITX-05 assembly -->
-
 ### The two domains
 
 | Domain | Replaces | Provider pool | Placement | Posture |
 | --- | --- | --- | --- | --- |
-| **git-private** | the old `gitea` tool | self-hosted forges (Gitea, Forgejo, GitLab CE, Gogs, OneDev) | **PERSONAL** registry (`terminus_personal`) | full operator R/W; source of truth; destructive/history-rewrite ops human-gated |
-| **git-public** | the old `github` tool | hosted/public forges (GitHub, Codeberg, GitLab SaaS, Bitbucket, SourceHut, Radicle) | **CORE** registry (Chord-embedded) | the outbound exfiltration surface — the PII gate is an unconditional hard block on every write |
+| **git-private** | the old `gitea` tool | self-hosted forges (Gitea, Forgejo, GitLab CE, Gogs, OneDev) | **PERSONAL** registry (`terminus_personal`, via `register_personal`) | full operator R/W; source of truth; destructive/history-rewrite ops human-gated |
+| **git-public** | the old `github` tool | hosted/public forges (GitHub, Codeberg, GitLab SaaS, Bitbucket, SourceHut, Radicle) | **CORE** registry (Chord-embedded, via `register_all`) | the outbound exfiltration surface — the PII gate is an unconditional hard block on every write |
 
 git-private sits on `terminus_personal` because it is the operator's own
 infra-credentialed door to self-hosted source control — the same placement
@@ -593,9 +591,12 @@ rationale as the existing Gitea identity model. git-public stays a **CORE**
 tool (Chord-embedded, alongside the GHMR mirror engine subtools already listed
 above) because publishing to a public host is a shared, governed, PII-gated
 operation every agent in the constellation goes through the same way, not a
-personal credential a single operator identity holds. Confirm this exact
-placement at the GITX-05 assembly step — it is the design intent from the
-spec, not yet load-bearing code.
+personal credential a single operator identity holds. This placement is now
+load-bearing in merged code: `git_private` (and its `git_private_capabilities`
+companion) registers ONLY through `registry::register_personal`
+(`forge::register_private`), and `git_public` (with `git_public_capabilities`)
+ONLY through `registry::register_all` (`forge::register_public`) — neither tool
+crosses into the other registry.
 
 Per the spec's **"one surface, two pools, two postures"** principle: the
 endpoint vocabulary a caller can *name* is identical on both tools (see "One
@@ -606,30 +607,32 @@ surface" below); what differs is *which providers* answer to a given tool and
 
 One Gitea-compatible client (`GiteaForge`, GITX-02) serves Gitea, Forgejo, and
 Codeberg — they speak the same REST v1 API and differ only by base URL +
-credential. One GitLab v4 client (GITX-04, in progress) will similarly serve
+credential. One GitLab v4 client (`GitLabAdapter`, GITX-04) similarly serves
 both the CE (self-hosted) and SaaS (hosted) variants by config, mapping GitLab's
 merge-request/project terminology onto the shared pull-request/repo vocabulary.
+All eleven providers below are now merged and wired into
+`forge::registry::ForgeRegistry::from_env` — each one activates only when its
+credential/URL is present, so the "shipped" rows still register lazily, not
+unconditionally.
 
 | Provider id | Pool | Adapter | Status | Notes |
 | --- | --- | --- | --- | --- |
 | `gitea` | git-private | Gitea-family client (`forge::gitea_family::GiteaForge`) | **shipped** (GITX-02) | current source-of-truth; reuses the existing `GiteaClient` and S105 `GITEA_PAT_<NAME>` identity model wholesale |
 | `forgejo` | git-private | Gitea-family client | **shipped** (GITX-02) | single `FORGEJO_TOKEN` credential |
-| `gitlab_ce` | git-private | GitLab v4 client | pending (GITX-04) | optional; shares the v4 client with `gitlab_saas` |
-| `gogs` | git-private | — | pending (GITX-06 stub) | optional/minimal reduced surface |
-| `onedev` | git-private | — | pending (GITX-06 stub) | optional/minimal reduced surface |
+| `gitlab_ce` | git-private | GitLab v4 client (`forge::gitlab::GitLabAdapter`, `from_env_ce`) | **shipped** (GITX-04) | optional; shares the v4 client with `gitlab_saas` |
+| `gogs` | git-private | stub (`forge::stubs::StubForge`) | **shipped** (GITX-06 stub) | optional/minimal reduced surface; endpoints report cleanly `unsupported`/`not implemented` |
+| `onedev` | git-private | stub (`forge::stubs::StubForge`) | **shipped** (GITX-06 stub) | optional/minimal reduced surface |
 | `github` | git-public | `github::adapter::GitHubAdapter` | **shipped** (GITX-03) | current mirror target; REST v3 + a GraphQL v4 helper; egress-isolated |
 | `codeberg` | git-public | Gitea-family client | **shipped** (GITX-02) | recommended public target — non-profit/EU/no-AI-training, Forgejo lineage, reuses the Gitea-compatible client; single `CODEBERG_TOKEN` |
-| `gitlab_saas` | git-public | GitLab v4 client | pending (GITX-04) | shares the v4 client with `gitlab_ce` |
-| `bitbucket` | git-public | — | pending (GITX-06 stub), optional | Cloud REST 2.0 |
-| `sourcehut` | git-public | — | pending (GITX-06 stub), optional | REST+GraphQL; **reduced capability set** — no web-PR flow, no package registry, so its capability map will mark `pull_requests_*` and `packages_*` `unsupported` rather than claim a surface it cannot offer |
-| `radicle` | git-public | — | pending (GITX-06 stub), experimental/future | p2p forge; every endpoint expected `experimental` at best until the adapter matures |
+| `gitlab_saas` | git-public | GitLab v4 client (`forge::gitlab::GitLabAdapter`, `from_env_saas`) | **shipped** (GITX-04) | shares the v4 client with `gitlab_ce` |
+| `bitbucket` | git-public | stub (`forge::stubs::StubForge`) | **shipped** (GITX-06 stub), optional | Cloud REST 2.0 |
+| `sourcehut` | git-public | stub (`forge::stubs::StubForge`) | **shipped** (GITX-06 stub), optional | REST+GraphQL; **reduced capability set** — no web-PR flow, no package registry, so its capability map marks `pull_requests_*` and `packages_*` `unsupported` rather than claim a surface it cannot offer |
+| `radicle` | git-public | stub (`forge::stubs::StubForge`) | **shipped** (GITX-06 stub), experimental/future | p2p forge; endpoints are `experimental` at best until the adapter matures |
 
 Adapter reuse is deliberate: three providers (`gitea`/`forgejo`/`codeberg`)
-share one Gitea-compatible client today, and two more (`gitlab_ce`/
-`gitlab_saas`) will share one GitLab v4 client — a forge's *wire protocol*, not
-its pool membership, decides which client implements it.
-
-<!-- GITX-07 reconcile: confirm final gitlab_ce/gitlab_saas provider ids and any GITX-06 stub capability-map specifics against merged GITX-04/GITX-06 code -->
+share one Gitea-compatible client, and two more (`gitlab_ce`/`gitlab_saas`)
+share one GitLab v4 client — a forge's *wire protocol*, not its pool membership,
+decides which client implements it.
 
 ### Capability introspection — reading the per-provider map
 
@@ -667,32 +670,40 @@ each pool is *for*:
 
 **git-private — operator source-of-truth.** Full operator read/write against
 self-hosted forges; per-provider vault credentials (see "Operator: adding or
-activating a provider" below); every write is audit-logged (sanitized per the
-standing audit rules — tokens and secrets redacted, large payloads truncated).
-Destructive operations — repository delete, force-push, history rewrite —
-require confirmation and are human-gated, mirroring the posture the guarded
-`openhands`/<secret-manager> tools already use (a pending request with a single-use
-code that only an out-of-band operator approval releases).
+activating a provider" below). Destructive operations — repository delete;
+branch/ref/tag/release/webhook/package delete; or ANY write whose params carry a
+`force`/`force_push`/`rewrite_history`/`history_rewrite: true` flag — require the
+caller to pass `confirm: true`. `GitPrivateTool::execute` classifies the call via
+`forge::posture::is_destructive_endpoint` + `requests_force_or_rewrite` and, when
+destructive-without-confirm, refuses it **before any transport**, naming exactly
+what confirmation would unlock. (This is an inline confirm-flag gate, not the
+out-of-band single-use-code approver the `openhands`/<secret-manager> guarded tools use;
+ordinary non-destructive writes dispatch straight through.)
 
-**git-public — the exfiltration surface.** Every write/push/publish passes an
-**unconditional** PII gate — the same Rust engine documented above under "PII
-gate (Rust, authoritative)" — before anything reaches the network. A failing
-sweep **withholds** the push (the content stays private; nothing partial is
-sent), logs the finding, and flags it. There is no bypass flag, no env var
-override, and no cadence fast-path — the gate always wins over "we're behind
-on publishing." Reads are unrestricted (a public forge's read surface is, by
-definition, already public). Beyond the gate, egress isolation applies (see
-the GitHub adapter's `host_allowed` allowlist above; each public provider
-gets its own host allowlist) so a public-pool adapter cannot be pointed at an
-arbitrary endpoint. **First publish is human-gated**: the first time any
-repo is published to a given public provider, an explicit, once-per-
-repo/provider operator confirmation (the `mirror_activated` model) is
-required before subsequent pushes proceed automatically — this mirrors the
-GHMR mirror engine's one-time bootstrap force re-baseline (see "GitHub mirror
-engine subtools" above), generalized to every git-public provider rather than
-just GitHub.
+**git-public — the exfiltration surface.** Every WRITE endpoint (everything
+`forge::posture::is_write_endpoint` classifies as not a pure read) runs a fixed
+gate chain in `GitPublicTool::execute` **before anything reaches the network** —
+a call that fails an earlier check never reaches a later one:
 
-<!-- GITX-07 reconcile: confirm the exact posture-enforcement mechanism (where in the call path the PII gate + first-publish gate are wired) against the merged GITX-05 tool assembly -->
+1. **Egress isolation** — the write is refused outright if its params carry any
+   host/base-URL override (`api_base`/`base_url`/`host`/`endpoint_override`/
+   `url_override`); each adapter's own compiled-in allowlist (e.g. the GitHub
+   adapter's `host_allowed`) is the sole routing authority.
+2. **Unconditional PII gate** — the same Rust sweep engine documented above
+   (`github::pii::pii_gate`) scans the flattened outbound content. A failing
+   sweep **withholds** the operation (content stays private; nothing partial is
+   sent), logs, and flags. There is no bypass flag, no env-var override, and no
+   cadence fast-path — the gate always wins over "we're behind on publishing."
+3. **First-publish human gate** — the first write to a given `(provider, repo)`
+   pair requires `confirm_first_publish: true`; once granted it is recorded in a
+   persisted activation ledger (a token-free JSON file, the `mirror_activated`
+   model) and never re-asked for that pair. Independent per repo and per
+   provider.
+
+Reads are unrestricted (a public forge's read surface is, by definition, already
+public). A completed full-tree `mirror_action: push` also activates that
+`(provider, repo)` pair, so a subsequent direct API write on the freshly-mirrored
+repo is not re-asked.
 
 ### The mirror engine as git-public's swept-write path
 
@@ -727,24 +738,24 @@ already established by Gitea/GitHub/Plane (S105/S94):
 | `<PROVIDER>_URL` | the provider's base API URL, where it is not a fixed public host | `GITEA_URL`, `FORGEJO_URL`, `CODEBERG_URL` (optional — defaults to Codeberg's own host) |
 
 None of these are ever literals in source, config, or `.moosenet-pipeline.yaml`.
-As actually wired in the merged `gitea_from_env()` / `forgejo_from_env()` /
-`codeberg_from_env()` / `GitHubAdapter::from_env()` constructors (GITX-02/03),
-tokens and URLs are both read via `std::env::var(...)` at adapter-construction
-time — this crate's sanctioned vault path is that
+As actually wired in the merged adapter constructors —
+`GiteaForge::{gitea,forgejo,codeberg}_from_env()` (GITX-02),
+`GitHubAdapter::from_env()` (GITX-03), `GitLabAdapter::{from_env_ce,from_env_saas}()`
+(GITX-04), and the `StubForge::*_from_env()` constructors (GITX-06) — tokens and
+URLs are both read via `std::env::var(...)` at adapter-construction time. This
+crate's sanctioned vault path is that
 [`crate::secrets_bootstrap`](src/secrets_bootstrap.rs) materializes the runtime
 secret store into this process's own environment at startup, so that env read
 IS the vault read (never another process's files, never a literal). This is
 the same posture the pre-existing Gitea/GitHub/Plane identity docs above use.
-`CredentialRef` (`forge::provider::CredentialRef`, see "Credentials" above) is
-GITX-01's key-name-reference *type* for the trait; the concrete GITX-02/03
-adapters do not yet route through it end-to-end — they resolve directly via
-`env::var` in their `*_from_env` constructors. `config.rs` does not currently
-carry forge-specific URL helpers; base URLs are read the same way as tokens,
+The GITX-05 assembly did **not** change this: `forge::registry::ForgeRegistry::from_env`
+simply calls each of those same `*_from_env` constructors and inserts whichever
+succeed — it adds no new credential-resolution path. `CredentialRef`
+(`forge::provider::CredentialRef`, see "Credentials" above) remains GITX-01's
+key-name-reference *type* for the trait; the concrete adapters do not route
+through it end-to-end — they resolve directly via `env::var`. `config.rs` carries
+no forge-specific URL helpers; base URLs are read the same way as tokens,
 directly via `env::var` in each adapter's constructor.
-
-<!-- GITX-07 reconcile: if GITX-05's assembly wires adapters through
-     CredentialRef / adds config.rs helpers for forge URLs, tighten this
-     paragraph to match — flagged by agy review during GITX-07's own gate. -->
 
 **Steps to add a new provider to an existing adapter family** (e.g. pointing
 the Gitea-family client at a second self-hosted Forgejo instance, or turning
@@ -770,7 +781,25 @@ and the governance posture (private vs. public pool) all apply automatically
 once a provider is configured — there is no separate "wire up this provider's
 posture" step per provider.
 
-<!-- GITX-07 reconcile: verify the exact MCP tool names/config-key spellings the operator actually calls (e.g. `git_private_*`/`git_public_*` vs retained `gitea_*`/`github_*` names, and any new env-var names for provider selection) against the merged GITX-05 assembly — this section documents the spec's design intent, not yet-merged code. -->
+**The merged MCP tool + config surface** (what an operator actually calls, as
+wired by GITX-05). The two domains are exactly four registered tools:
+
+| Tool name | Purpose |
+| --- | --- |
+| `git_private` | provider-agnostic R/W dispatch on the self-hosted pool; params `endpoint` + `params`, optional `provider`/`identity`, `confirm: true` for destructive ops |
+| `git_private_capabilities` | read-only per-provider capability report for the private pool |
+| `git_public` | provider-agnostic dispatch on the public/mirror pool; same params plus `confirm_first_publish: true` and the `mirror_action` (status/prepare/approve/push) route |
+| `git_public_capabilities` | read-only per-provider capability report for the public pool |
+
+These replace the per-provider `gitea_*`/`github_*` tool names as the caller's
+door to those forges. The one set retained under the old names is the GHMR
+mirror engine's own subtools (`github_mirror_status`/`_prepare`/`_approve`/
+`_push`) — `git_public`'s `mirror_action` delegates to them rather than
+renaming them. Provider selection within a pool is behavioral config, never a
+secret: an explicit `provider` param wins, else the pool's canonical default
+(`gitea` / `github`), overridable via the `GIT_PRIVATE_DEFAULT_PROVIDER` /
+`GIT_PUBLIC_DEFAULT_PROVIDER` env vars; when only one provider is configured it
+is the implicit default.
 
 ### One surface: the endpoint vocabulary
 
