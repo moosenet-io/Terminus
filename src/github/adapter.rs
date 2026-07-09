@@ -68,6 +68,9 @@ const DEFAULT_GITHUB_IDENTITY: &str = "moose";
 
 /// Hosts always permitted for outbound GitHub traffic, independent of config.
 const DEFAULT_ALLOWED_HOSTS: &[&str] = &["api.github.com", "github.com", "uploads.github.com"];
+/// Runaway guard on `Link`-header pagination: never follow more than this many
+/// pages for a single list call (100 pages × 100 items = 10k entries).
+const MAX_PAGES: u32 = 100;
 
 /// Scan this process's own environment for `GITHUB_PAT_<NAME>` tokens, returning
 /// a `lowercased-name -> token` map. The ONLY place the prefix is matched.
@@ -335,9 +338,11 @@ impl GitHubAdapter {
         })
     }
 
-    /// Fetch a file's *raw* bytes via the contents API (`Accept: raw`), returning
-    /// the text wrapped as `{ "path": …, "raw": … }`. Egress-checked like
-    /// [`GitHubAdapter::call`]. Non-2xx maps the same way.
+    /// Fetch a file's *raw* bytes via the contents API (`Accept: raw`). Binary-
+    /// safe: UTF-8 content is returned as `{ path, encoding: "utf-8", raw }`;
+    /// non-UTF-8 (binary) content is returned losslessly as
+    /// `{ path, encoding: "base64", raw_base64 }` rather than being lossily
+    /// decoded. Egress-checked; non-2xx maps like [`GitHubAdapter::call`].
     async fn raw_fetch(&self, token: &str, url: &str, path: &str) -> Result<Value, ForgeError> {
         if !self.host_allowed(url) {
             return Err(ForgeError::Transport {
@@ -358,6 +363,57 @@ impl GitHubAdapter {
             .await
             .map_err(|e| ForgeError::Transport { provider: "github".into(), message: e.to_string() })?;
         let status = resp.status();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ForgeError::Transport { provider: "github".into(), message: e.to_string() })?;
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            return Err(ForgeError::Auth {
+                provider: "github".into(),
+                message: format!("HTTP {}: {}", status.as_u16(), String::from_utf8_lossy(&bytes)),
+            });
+        }
+        if !status.is_success() {
+            return Err(ForgeError::Transport {
+                provider: "github".into(),
+                message: format!("HTTP {}: {}", status.as_u16(), String::from_utf8_lossy(&bytes)),
+            });
+        }
+        match std::str::from_utf8(&bytes) {
+            Ok(text) => Ok(json!({ "path": path, "encoding": "utf-8", "raw": text })),
+            Err(_) => Ok(json!({ "path": path, "encoding": "base64", "raw_base64": B64.encode(&bytes) })),
+        }
+    }
+
+    /// GET a single page: parsed JSON body plus the `rel="next"` URL from the
+    /// `Link` header, if any. Egress-checked; auth/transport-mapped like
+    /// [`GitHubAdapter::call`]. Used by [`GitHubAdapter::call_paginated`].
+    async fn get_page(&self, token: &str, url: &str) -> Result<(Value, Option<String>), ForgeError> {
+        if !self.host_allowed(url) {
+            return Err(ForgeError::Transport {
+                provider: "github".into(),
+                message: format!(
+                    "egress blocked: host of '{}' is not on the GitHub allowlist",
+                    host_of(url).unwrap_or_default()
+                ),
+            });
+        }
+        let resp = self
+            .http
+            .get(url)
+            .header("Authorization", format!("token {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28") // pii-test-fixture
+            .send()
+            .await
+            .map_err(|e| ForgeError::Transport { provider: "github".into(), message: e.to_string() })?;
+        let status = resp.status();
+        // Extract the next link BEFORE consuming the body.
+        let next = resp
+            .headers()
+            .get(reqwest::header::LINK)
+            .and_then(|h| h.to_str().ok())
+            .and_then(parse_next_link);
         let text = resp
             .text()
             .await
@@ -368,7 +424,39 @@ impl GitHubAdapter {
         if !status.is_success() {
             return Err(ForgeError::Transport { provider: "github".into(), message: format!("HTTP {}: {}", status.as_u16(), text) });
         }
-        Ok(json!({ "path": path, "raw": text }))
+        let body = if text.trim().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&text).map_err(|e| ForgeError::Transport {
+                provider: "github".into(),
+                message: format!("invalid JSON from GitHub: {e}"),
+            })?
+        };
+        Ok((body, next))
+    }
+
+    /// GET a list endpoint, following GitHub's `Link: rel="next"` pagination and
+    /// concatenating the array pages into one result (bounded by [`MAX_PAGES`] as
+    /// a runaway guard). A non-array first page (e.g. an error object shape) is
+    /// returned as-is. Each `next` hop is egress-checked in [`GitHubAdapter::get_page`].
+    async fn call_paginated(&self, token: &str, url: &str) -> Result<Value, ForgeError> {
+        let mut next = Some(url.to_string());
+        let mut items: Vec<Value> = Vec::new();
+        let mut pages: u32 = 0;
+        while let Some(u) = next.take() {
+            let (body, nxt) = self.get_page(token, &u).await?;
+            match body {
+                Value::Array(mut a) => items.append(&mut a),
+                // First (and only) page is not a list — hand it back unchanged.
+                other => return Ok(other),
+            }
+            pages += 1;
+            if pages >= MAX_PAGES {
+                break;
+            }
+            next = nxt;
+        }
+        Ok(Value::Array(items))
     }
 
     /// Minimal GraphQL v4 helper for the endpoints REST v3 cannot express (kept
@@ -478,6 +566,23 @@ fn pct(s: &str, keep_slash: bool) -> String {
     out
 }
 
+/// Parse a GitHub `Link` header, returning the URL marked `rel="next"` if any.
+/// Format: `<https://api.github.com/…?page=2>; rel="next", <…>; rel="last"`.
+fn parse_next_link(link: &str) -> Option<String> {
+    for part in link.split(',') {
+        let seg = part.trim();
+        if let Some((url_part, params)) = seg.split_once(';') {
+            if params.contains("rel=\"next\"") {
+                let u = url_part.trim().trim_start_matches('<').trim_end_matches('>');
+                if !u.is_empty() {
+                    return Some(u.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Extract the host (host or host:port) from a URL string, without pulling in a
 /// URL-parsing crate: strip scheme, take up to the first `/`, drop any userinfo.
 fn host_of(url: &str) -> Option<String> {
@@ -566,7 +671,7 @@ impl ForgeProvider for GitHubAdapter {
             ReposList => {
                 let owner = self.owner(p);
                 let url = format!("{api}/orgs/{owner}/repos?per_page=100&sort=updated");
-                ok(self.call(&token, Method::GET, &url, None).await?)
+                ok(self.call_paginated(&token, &url).await?)
             }
             ReposGet => {
                 let (owner, repo) = self.owner_repo(p)?;
@@ -630,7 +735,7 @@ impl ForgeProvider for GitHubAdapter {
             BranchesList => {
                 let (owner, repo) = self.owner_repo(p)?;
                 let url = format!("{api}/repos/{owner}/{repo}/branches?per_page=100");
-                ok(self.call(&token, Method::GET, &url, None).await?)
+                ok(self.call_paginated(&token, &url).await?)
             }
             BranchesGet => {
                 let (owner, repo) = self.owner_repo(p)?;
@@ -672,11 +777,14 @@ impl ForgeProvider for GitHubAdapter {
                     Some(r) => format!("{api}/repos/{owner}/{repo}/git/matching-refs/{}", pct(r, true)),
                     None => format!("{api}/repos/{owner}/{repo}/git/refs"),
                 };
-                ok(self.call(&token, Method::GET, &url, None).await?)
+                ok(self.call_paginated(&token, &url).await?)
             }
             RefsGet => {
                 let (owner, repo) = self.owner_repo(p)?;
+                // Accept both `heads/main` and the canonical `refs/heads/main`;
+                // GitHub's git/ref/{ref} endpoint wants the `refs/`-less form.
                 let r = Self::req_path(p, "ref")?;
+                let r = r.strip_prefix("refs/").unwrap_or(&r);
                 let url = format!("{api}/repos/{owner}/{repo}/git/ref/{r}");
                 ok(self.call(&token, Method::GET, &url, None).await?)
             }
@@ -707,7 +815,7 @@ impl ForgeProvider for GitHubAdapter {
                 if let Some(path) = p.get("path").and_then(Value::as_str) {
                     url.push_str(&format!("&path={}", pct(path, false)));
                 }
-                ok(self.call(&token, Method::GET, &url, None).await?)
+                ok(self.call_paginated(&token, &url).await?)
             }
             CommitsGet => {
                 let (owner, repo) = self.owner_repo(p)?;
@@ -733,7 +841,7 @@ impl ForgeProvider for GitHubAdapter {
                 let (owner, repo) = self.owner_repo(p)?;
                 let state = pct(p.get("state").and_then(Value::as_str).unwrap_or("open"), false);
                 let url = format!("{api}/repos/{owner}/{repo}/pulls?state={state}&per_page=100");
-                ok(self.call(&token, Method::GET, &url, None).await?)
+                ok(self.call_paginated(&token, &url).await?)
             }
             PullRequestsGet => {
                 let (owner, repo) = self.owner_repo(p)?;
@@ -803,7 +911,7 @@ impl ForgeProvider for GitHubAdapter {
                 let (owner, repo) = self.owner_repo(p)?;
                 let state = pct(p.get("state").and_then(Value::as_str).unwrap_or("open"), false);
                 let url = format!("{api}/repos/{owner}/{repo}/issues?state={state}&per_page=100");
-                let body = self.call(&token, Method::GET, &url, None).await?;
+                let body = self.call_paginated(&token, &url).await?;
                 // GitHub's /issues endpoint returns pull requests too (each PR
                 // carries a `pull_request` field). This adapter exposes PRs via
                 // the separate pull_requests_* endpoints, so filter them out here
@@ -871,7 +979,7 @@ impl ForgeProvider for GitHubAdapter {
             ReleasesList => {
                 let (owner, repo) = self.owner_repo(p)?;
                 let url = format!("{api}/repos/{owner}/{repo}/releases?per_page=100");
-                ok(self.call(&token, Method::GET, &url, None).await?)
+                ok(self.call_paginated(&token, &url).await?)
             }
             ReleasesGet => {
                 let (owner, repo) = self.owner_repo(p)?;
@@ -908,12 +1016,12 @@ impl ForgeProvider for GitHubAdapter {
                 let (owner, repo) = self.owner_repo(p)?;
                 let id = Self::req_num(p, "id")?;
                 let url = format!("{api}/repos/{owner}/{repo}/releases/{id}/assets?per_page=100");
-                ok(self.call(&token, Method::GET, &url, None).await?)
+                ok(self.call_paginated(&token, &url).await?)
             }
             TagsList => {
                 let (owner, repo) = self.owner_repo(p)?;
                 let url = format!("{api}/repos/{owner}/{repo}/tags?per_page=100");
-                ok(self.call(&token, Method::GET, &url, None).await?)
+                ok(self.call_paginated(&token, &url).await?)
             }
             TagsGet => {
                 let (owner, repo) = self.owner_repo(p)?;
@@ -941,7 +1049,7 @@ impl ForgeProvider for GitHubAdapter {
             WebhooksList => {
                 let (owner, repo) = self.owner_repo(p)?;
                 let url = format!("{api}/repos/{owner}/{repo}/hooks?per_page=100");
-                ok(self.call(&token, Method::GET, &url, None).await?)
+                ok(self.call_paginated(&token, &url).await?)
             }
             WebhooksCreate => {
                 let (owner, repo) = self.owner_repo(p)?;
@@ -974,7 +1082,7 @@ impl ForgeProvider for GitHubAdapter {
                 let owner = self.owner(p);
                 let ptype = pct(p.get("package_type").and_then(Value::as_str).unwrap_or("container"), false);
                 let url = format!("{api}/orgs/{owner}/packages?package_type={ptype}&per_page=100");
-                ok(self.call(&token, Method::GET, &url, None).await?)
+                ok(self.call_paginated(&token, &url).await?)
             }
             PackagesGet => {
                 let owner = self.owner(p);
@@ -1053,12 +1161,12 @@ impl ForgeProvider for GitHubAdapter {
             OrgMembers => {
                 let owner = self.owner(p);
                 let url = format!("{api}/orgs/{owner}/members?per_page=100");
-                ok(self.call(&token, Method::GET, &url, None).await?)
+                ok(self.call_paginated(&token, &url).await?)
             }
             OrgTeams => {
                 let owner = self.owner(p);
                 let url = format!("{api}/orgs/{owner}/teams?per_page=100");
-                ok(self.call(&token, Method::GET, &url, None).await?)
+                ok(self.call_paginated(&token, &url).await?)
             }
             OrgPermissions => {
                 let (owner, repo) = self.owner_repo(p)?;
@@ -1455,7 +1563,81 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.body["raw"], "# raw markdown");
+        assert_eq!(resp.body["encoding"], "utf-8");
         assert_eq!(resp.body["path"], "README.md");
+        m.assert();
+    }
+
+    #[tokio::test]
+    async fn raw_fetch_binary_content_is_base64_lossless() {
+        // Non-UTF-8 bytes must be returned losslessly as base64, not lossily
+        // decoded via String::from_utf8_lossy.
+        let raw_bytes: Vec<u8> = vec![0xff, 0xfe, 0x00, 0x01, 0x80];
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/moosenet-io/r/contents/logo.png");
+            then.status(200).body(raw_bytes.clone());
+        });
+        let a = test_adapter(&server.base_url());
+        let resp = a
+            .dispatch(ForgeEndpoint::ContentRawFetch, req(json!({ "repo": "r", "path": "logo.png" })))
+            .await
+            .unwrap();
+        assert_eq!(resp.body["encoding"], "base64");
+        let decoded = B64.decode(resp.body["raw_base64"].as_str().unwrap()).unwrap();
+        assert_eq!(decoded, raw_bytes);
+    }
+
+    #[tokio::test]
+    async fn list_endpoint_follows_link_pagination() {
+        // ReposList must follow the `Link: rel="next"` header and concatenate
+        // pages, not silently return only the first page.
+        let server = MockServer::start();
+        let next = format!("{}/orgs/moosenet-io/repos?page=2", server.base_url());
+        let page1 = server.mock(|when, then| {
+            when.method(GET).path("/orgs/moosenet-io/repos").query_param("sort", "updated");
+            then.status(200)
+                .header("link", format!("<{next}>; rel=\"next\""))
+                .json_body(json!([{ "name": "a" }]));
+        });
+        let page2 = server.mock(|when, then| {
+            when.method(GET).path("/orgs/moosenet-io/repos").query_param("page", "2");
+            then.status(200).json_body(json!([{ "name": "b" }]));
+        });
+        let a = test_adapter(&server.base_url());
+        let resp = a.dispatch(ForgeEndpoint::ReposList, req(json!({}))).await.unwrap();
+        let arr = resp.body.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "both pages should be concatenated");
+        assert_eq!(arr[0]["name"], "a");
+        assert_eq!(arr[1]["name"], "b");
+        page1.assert();
+        page2.assert();
+    }
+
+    #[test]
+    fn parse_next_link_extracts_next_only() {
+        let link = "<https://api.github.com/x?page=2>; rel=\"next\", <https://api.github.com/x?page=9>; rel=\"last\""; // pii-test-fixture
+        assert_eq!(parse_next_link(link).as_deref(), Some("https://api.github.com/x?page=2")); // pii-test-fixture
+        // Last page: no next.
+        let last = "<https://api.github.com/x?page=1>; rel=\"prev\""; // pii-test-fixture
+        assert_eq!(parse_next_link(last), None);
+    }
+
+    #[tokio::test]
+    async fn refs_get_accepts_canonical_refs_prefix() {
+        // A caller passing `refs/heads/main` must hit /git/ref/heads/main, not
+        // /git/ref/refs/heads/main (which 404s).
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(GET).path("/repos/moosenet-io/r/git/ref/heads/main");
+            then.status(200).json_body(json!({ "ref": "refs/heads/main", "object": { "sha": "s" } }));
+        });
+        let a = test_adapter(&server.base_url());
+        let resp = a
+            .dispatch(ForgeEndpoint::RefsGet, req(json!({ "repo": "r", "ref": "refs/heads/main" })))
+            .await
+            .unwrap();
+        assert_eq!(resp.body["object"]["sha"], "s");
         m.assert();
     }
 
