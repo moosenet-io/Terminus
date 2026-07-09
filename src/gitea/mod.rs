@@ -1563,6 +1563,13 @@ pub(crate) fn build_cargo_publish_body(metadata_json: &[u8], crate_bytes: &[u8])
     body
 }
 
+/// Index URL for the public crates.io registry. This is the Cargo registry
+/// index's own convention for identifying crates.io as a dependency's source
+/// (see the `registry` field in the Cargo registry API's publish metadata
+/// format) — NOT an infra value of ours, so it is not subject to the S1
+/// hardcoded-infra-value rule.
+pub(crate) const CRATES_IO_INDEX_URL: &str = "https://github.com/rust-lang/crates.io-index";
+
 /// Build the Cargo publish metadata JSON.
 ///
 /// The registry publish API requires a metadata object whose only truly
@@ -1609,6 +1616,32 @@ pub(crate) fn build_cargo_metadata(name: &str, vers: &str, provided: Option<&Val
     // always match the target the tool was asked to publish.
     meta["name"] = json!(name);
     meta["vers"] = json!(vers);
+
+    // Default each dependency's `registry` field to crates.io when the caller
+    // didn't specify one at all. In a Cargo registry index entry, an omitted
+    // `registry` field means "this dep lives in the SAME registry as the
+    // crate being published" — i.e. this private Gitea registry. A crate
+    // published here (terminus-rs) almost always depends on ordinary
+    // crates.io crates (tokio, serde, async-imap, ...), so leaving `registry`
+    // unset on those deps makes cargo try to resolve them against this
+    // private index and fail unresolvable. This bit terminus-rs 1.3.0, whose
+    // deps were indexed with `registry: null` (all-crates.io-deps).
+    //
+    // A dep that explicitly sets `registry` — to a real value OR to `null` —
+    // is left untouched: that's how an advanced caller expresses "this dep
+    // really is in the same registry as the crate being published" (e.g. an
+    // intra-gitea dependency), and we must not overwrite an intentional
+    // choice.
+    if let Some(deps) = meta.get_mut("deps").and_then(Value::as_array_mut) {
+        for dep in deps.iter_mut() {
+            if let Value::Object(dep_obj) = dep {
+                if !dep_obj.contains_key("registry") {
+                    dep_obj.insert("registry".to_string(), json!(CRATES_IO_INDEX_URL));
+                }
+            }
+        }
+    }
+
     meta
 }
 
@@ -2976,6 +3009,66 @@ mod tests {
         assert_eq!(m["description"], serde_json::json!("a test crate"));
         assert_eq!(m["license"], serde_json::json!("MIT"));
         assert_eq!(m["deps"][0]["name"], serde_json::json!("serde"));
+    }
+
+    // ── cargo publish: dep registry defaulting (TERM-73) ────────────────────
+    //
+    // Regression coverage for the 1.3.0 publish defect: a dep with no
+    // `registry` key must be indexed as crates.io, never left `null`
+    // (`null`/omitted means "same registry as this crate" — the private
+    // Gitea index — which crates.io deps can never resolve against).
+
+    #[test]
+    fn test_build_cargo_metadata_dep_without_registry_gets_crates_io_default() {
+        let provided = serde_json::json!({
+            "deps": [{ "name": "tokio", "version_req": "^1" }]
+        });
+        let m = build_cargo_metadata("terminus-rs", "1.3.1", Some(&provided));
+        assert_eq!(
+            m["deps"][0]["registry"],
+            serde_json::json!(CRATES_IO_INDEX_URL),
+            "a dep with no registry key must default to the crates.io index"
+        );
+    }
+
+    #[test]
+    fn test_build_cargo_metadata_dep_with_explicit_registry_is_untouched() {
+        let provided = serde_json::json!({
+            "deps": [{
+                "name": "internal-crate",
+                "version_req": "^1",
+                "registry": "https://example.invalid/private-index"
+            }]
+        });
+        let m = build_cargo_metadata("terminus-rs", "1.3.1", Some(&provided));
+        assert_eq!(
+            m["deps"][0]["registry"],
+            serde_json::json!("https://example.invalid/private-index"),
+            "an explicit registry value must be preserved, not overwritten"
+        );
+    }
+
+    #[test]
+    fn test_build_cargo_metadata_dep_with_explicit_null_registry_stays_null() {
+        let provided = serde_json::json!({
+            "deps": [{
+                "name": "same-registry-dep",
+                "version_req": "^1",
+                "registry": Value::Null
+            }]
+        });
+        let m = build_cargo_metadata("terminus-rs", "1.3.1", Some(&provided));
+        assert!(
+            m["deps"][0]["registry"].is_null(),
+            "an explicit null registry (intra-gitea dep) must be left as null, not defaulted"
+        );
+    }
+
+    #[test]
+    fn test_build_cargo_metadata_empty_deps_stays_empty() {
+        let provided = serde_json::json!({ "deps": [] });
+        let m = build_cargo_metadata("terminus-rs", "1.3.1", Some(&provided));
+        assert_eq!(m["deps"], serde_json::json!([]));
     }
 
     // ── cargo publish: HTTP behavior ───────────────────────────────────────
