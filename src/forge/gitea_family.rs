@@ -39,10 +39,69 @@
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use reqwest::{Method, StatusCode};
 use serde_json::{json, Value};
 use std::borrow::Cow;
 use std::env;
+
+/// Characters that must never appear *literally* inside a single URL path
+/// segment or query value built from caller-supplied input. Everything here is a
+/// URL-structural or delimiter character: leaving any of them unescaped would let
+/// a crafted `repo`/`branch`/`path`/`ref`/`sha` value break out of its slot and
+/// redirect the authenticated request to a different — possibly destructive —
+/// endpoint, or inject/truncate query parameters. RFC 3986 "unreserved"
+/// characters (`A-Za-z0-9-._~`) are intentionally left un-encoded so ordinary
+/// identifiers (e.g. the tag `v1.2.3`) pass through unchanged.
+const URL_UNSAFE: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'/')
+    .add(b'?')
+    .add(b'\\')
+    .add(b'<')
+    .add(b'>')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'|')
+    .add(b'^')
+    .add(b'[')
+    .add(b']')
+    .add(b'&')
+    .add(b'=')
+    .add(b'+')
+    .add(b';')
+    .add(b'@')
+    .add(b'$')
+    .add(b',')
+    .add(b'\'')
+    .add(b'(')
+    .add(b')')
+    .add(b'*')
+    .add(b'!');
+
+/// Percent-encode one URL path segment or query value from caller input so it
+/// cannot alter the request's structure. A bare `.` / `..` segment (path
+/// traversal) is escaped to its percent form so WHATWG URL normalisation cannot
+/// collapse it and climb the path.
+fn enc(v: &str) -> Cow<'_, str> {
+    match v {
+        "." => Cow::Borrowed("%2E"),
+        ".." => Cow::Borrowed("%2E%2E"),
+        _ => utf8_percent_encode(v, URL_UNSAFE).into(),
+    }
+}
+
+/// Percent-encode a multi-segment path (e.g. `dir/sub/file.bin`): the `/`
+/// separators are preserved, but each individual segment is encoded via [`enc`]
+/// so an embedded `..` or reserved character in any segment cannot traverse or
+/// break out of the intended `contents`/`raw`/`trees` route.
+fn enc_path(v: &str) -> String {
+    v.split('/').map(enc).collect::<Vec<_>>().join("/")
+}
 use tracing::warn;
 
 use crate::error::ToolError;
@@ -197,7 +256,15 @@ impl GiteaForge {
             body["branch"] = json!(branch);
         }
 
-        let endpoint = format!("/repos/{owner}/{repo}/contents/{path}");
+        // `owner`, `repo`, and `path` are interpolated into the request URL, so
+        // percent-encode them (path preserves `/` separators) — the raw values
+        // above are used only for the PII log line, never for transport.
+        let endpoint = format!(
+            "/repos/{}/{}/contents/{}",
+            enc(owner),
+            enc(repo),
+            enc_path(path)
+        );
         // A supplied `sha` means "update an existing file" (PUT); its absence
         // means "create" (POST) — matching Gitea's contents API contract.
         let (method, sha) = match params.get("sha").and_then(Value::as_str) {
@@ -311,10 +378,13 @@ impl GiteaForge {
         let client = self.client_for(&req)?;
         let client = client.as_ref();
         let params = &req.params;
-        let owner = self.owner(params).to_string();
+        // `owner` and `repo` are interpolated into the request URL, so they are
+        // percent-encoded here (once) — every path built below uses these safe
+        // forms, never raw caller input.
+        let owner = enc(self.owner(params)).into_owned();
 
         // Helpers scoped to this call for the common param shapes.
-        let repo = || req_str(params, "repo").map_err(|e| map_tool_err(p, e));
+        let repo = || req_str(params, "repo").map(|r| enc(r).into_owned()).map_err(|e| map_tool_err(p, e));
         let idx = |k: &str| req_u64(params, k).map_err(|e| map_tool_err(p, e));
         let s = |k: &str| req_str(params, k).map_err(|e| map_tool_err(p, e));
         let get = |path: String| async move {
@@ -335,7 +405,7 @@ impl GiteaForge {
         match endpoint {
             // ── Repos ──────────────────────────────────────────────────────────
             ReposList => {
-                let q = params.get("q").and_then(Value::as_str).unwrap_or("");
+                let q = enc(params.get("q").and_then(Value::as_str).unwrap_or(""));
                 get(format!("/repos/search?q={q}&limit={limit}&page={page}")).await
             }
             ReposGet | ReposMetadata => get(format!("/repos/{owner}/{}", repo()?)).await,
@@ -352,7 +422,7 @@ impl GiteaForge {
                 // Create under an org if `owner` was explicitly given, else under
                 // the authenticated user.
                 let path = match params.get("owner").and_then(Value::as_str) {
-                    Some(o) if !o.trim().is_empty() => format!("/orgs/{o}/repos"),
+                    Some(o) if !o.trim().is_empty() => format!("/orgs/{}/repos", enc(o.trim())),
                     _ => "/user/repos".to_string(),
                 };
                 with_body(Method::POST, path, body).await
@@ -376,7 +446,7 @@ impl GiteaForge {
 
             // ── Branches / refs ─────────────────────────────────────────────────
             BranchesList => get(format!("/repos/{owner}/{}/branches?limit={limit}&page={page}", repo()?)).await,
-            BranchesGet => get(format!("/repos/{owner}/{}/branches/{}", repo()?, s("branch")?)).await,
+            BranchesGet => get(format!("/repos/{owner}/{}/branches/{}", repo()?, enc(s("branch")?))).await,
             BranchesCreate => {
                 let mut body = json!({ "new_branch_name": s("branch")? });
                 if let Some(old) = params.get("old_branch").and_then(Value::as_str) {
@@ -384,32 +454,32 @@ impl GiteaForge {
                 }
                 with_body(Method::POST, format!("/repos/{owner}/{}/branches", repo()?), body).await
             }
-            BranchesDelete => del(format!("/repos/{owner}/{}/branches/{}", repo()?, s("branch")?)).await,
+            BranchesDelete => del(format!("/repos/{owner}/{}/branches/{}", repo()?, enc(s("branch")?))).await,
             BranchesProtection => get(format!("/repos/{owner}/{}/branch_protections", repo()?)).await,
             BranchesDefault => {
                 let branch = s("branch")?;
                 with_body(Method::PATCH, format!("/repos/{owner}/{}", repo()?), json!({"default_branch": branch})).await
             }
             RefsList => get(format!("/repos/{owner}/{}/git/refs", repo()?)).await,
-            RefsGet => get(format!("/repos/{owner}/{}/git/refs/{}", repo()?, s("ref")?)).await,
+            RefsGet => get(format!("/repos/{owner}/{}/git/refs/{}", repo()?, enc_path(s("ref")?))).await,
             RefsCreate => {
                 let body = json!({ "ref": s("ref")?, "sha": s("sha")? });
                 with_body(Method::POST, format!("/repos/{owner}/{}/git/refs", repo()?), body).await
             }
-            RefsDelete => del(format!("/repos/{owner}/{}/git/refs/{}", repo()?, s("ref")?)).await,
+            RefsDelete => del(format!("/repos/{owner}/{}/git/refs/{}", repo()?, enc_path(s("ref")?))).await,
 
             // ── Commits ─────────────────────────────────────────────────────────
             CommitsList => {
-                let sha = params.get("sha").and_then(Value::as_str).unwrap_or("");
+                let sha = enc(params.get("sha").and_then(Value::as_str).unwrap_or(""));
                 get(format!("/repos/{owner}/{}/commits?sha={sha}&limit={limit}&page={page}", repo()?)).await
             }
-            CommitsGet => get(format!("/repos/{owner}/{}/git/commits/{}", repo()?, s("sha")?)).await,
-            CommitsCompareDiff => get(format!("/repos/{owner}/{}/compare/{}", repo()?, s("basehead")?)).await,
-            CommitsStatus => get(format!("/repos/{owner}/{}/commits/{}/status", repo()?, s("sha")?)).await,
+            CommitsGet => get(format!("/repos/{owner}/{}/git/commits/{}", repo()?, enc(s("sha")?))).await,
+            CommitsCompareDiff => get(format!("/repos/{owner}/{}/compare/{}", repo()?, enc_path(s("basehead")?))).await,
+            CommitsStatus => get(format!("/repos/{owner}/{}/commits/{}/status", repo()?, enc(s("sha")?))).await,
 
             // ── Pull / merge requests ───────────────────────────────────────────
             PullRequestsList => {
-                let state = params.get("state").and_then(Value::as_str).unwrap_or("open");
+                let state = enc(params.get("state").and_then(Value::as_str).unwrap_or("open"));
                 get(format!("/repos/{owner}/{}/pulls?state={state}&limit={limit}&page={page}", repo()?)).await
             }
             PullRequestsGet => get(format!("/repos/{owner}/{}/pulls/{}", repo()?, idx("index")?)).await,
@@ -447,7 +517,7 @@ impl GiteaForge {
 
             // ── Issues ──────────────────────────────────────────────────────────
             IssuesList => {
-                let state = params.get("state").and_then(Value::as_str).unwrap_or("open");
+                let state = enc(params.get("state").and_then(Value::as_str).unwrap_or("open"));
                 get(format!("/repos/{owner}/{}/issues?state={state}&limit={limit}&page={page}", repo()?)).await
             }
             IssuesGet => get(format!("/repos/{owner}/{}/issues/{}", repo()?, idx("index")?)).await,
@@ -497,7 +567,7 @@ impl GiteaForge {
             ReleasesDelete => del(format!("/repos/{owner}/{}/releases/{}", repo()?, idx("id")?)).await,
             ReleasesAssets => get(format!("/repos/{owner}/{}/releases/{}/assets", repo()?, idx("id")?)).await,
             TagsList => get(format!("/repos/{owner}/{}/tags?limit={limit}&page={page}", repo()?)).await,
-            TagsGet => get(format!("/repos/{owner}/{}/tags/{}", repo()?, s("tag")?)).await,
+            TagsGet => get(format!("/repos/{owner}/{}/tags/{}", repo()?, enc(s("tag")?))).await,
             TagsCreate => {
                 let mut body = json!({ "tag_name": s("tag")? });
                 if let Some(t) = params.get("target").and_then(Value::as_str) {
@@ -505,7 +575,7 @@ impl GiteaForge {
                 }
                 with_body(Method::POST, format!("/repos/{owner}/{}/tags", repo()?), body).await
             }
-            TagsDelete => del(format!("/repos/{owner}/{}/tags/{}", repo()?, s("tag")?)).await,
+            TagsDelete => del(format!("/repos/{owner}/{}/tags/{}", repo()?, enc(s("tag")?))).await,
 
             // ── Webhooks ────────────────────────────────────────────────────────
             WebhooksList => get(format!("/repos/{owner}/{}/hooks", repo()?)).await,
@@ -516,23 +586,23 @@ impl GiteaForge {
 
             // ── Packages / registry ─────────────────────────────────────────────
             PackagesList => {
-                let ptype = params.get("type").and_then(Value::as_str).unwrap_or("");
+                let ptype = enc(params.get("type").and_then(Value::as_str).unwrap_or(""));
                 get(format!("/packages/{owner}?type={ptype}&page={page}")).await
             }
-            PackagesGet => get(format!("/packages/{owner}/{}/{}/{}", s("type")?, s("name")?, s("version")?)).await,
+            PackagesGet => get(format!("/packages/{owner}/{}/{}/{}", enc(s("type")?), enc(s("name")?), enc(s("version")?))).await,
             PackagesPublish => self.packages_publish(client, params).await,
-            PackagesDelete => del(format!("/packages/{owner}/{}/{}/{}", s("type")?, s("name")?, s("version")?)).await,
+            PackagesDelete => del(format!("/packages/{owner}/{}/{}/{}", enc(s("type")?), enc(s("name")?), enc(s("version")?))).await,
 
             // ── Content ─────────────────────────────────────────────────────────
             ContentReadFile => {
                 let git_ref = params.get("ref").and_then(Value::as_str).unwrap_or("");
-                let q = if git_ref.is_empty() { String::new() } else { format!("?ref={git_ref}") };
-                get(format!("/repos/{owner}/{}/contents/{}{q}", repo()?, s("path")?)).await
+                let q = if git_ref.is_empty() { String::new() } else { format!("?ref={}", enc(git_ref)) };
+                get(format!("/repos/{owner}/{}/contents/{}{q}", repo()?, enc_path(s("path")?))).await
             }
             ContentWriteFile => self.content_write(client, params).await,
             ContentListTree => {
                 let recursive = params.get("recursive").and_then(Value::as_bool).unwrap_or(false);
-                get(format!("/repos/{owner}/{}/git/trees/{}?recursive={recursive}", repo()?, s("sha")?)).await
+                get(format!("/repos/{owner}/{}/git/trees/{}?recursive={recursive}", repo()?, enc(s("sha")?))).await
             }
             ContentRawFetch => {
                 // The Gitea `/raw/` endpoint serves EXACT FILE BYTES, not JSON —
@@ -545,9 +615,12 @@ impl GiteaForge {
                 // inverse direction.
                 let path = s("path")?;
                 let git_ref = params.get("ref").and_then(Value::as_str).unwrap_or("");
-                let q = if git_ref.is_empty() { String::new() } else { format!("?ref={git_ref}") };
+                let q = if git_ref.is_empty() { String::new() } else { format!("?ref={}", enc(git_ref)) };
                 let bytes = client
-                    .request_raw(Method::GET, &format!("/repos/{owner}/{}/raw/{path}{q}", repo()?))
+                    .request_raw(
+                        Method::GET,
+                        &format!("/repos/{owner}/{}/raw/{}{q}", repo()?, enc_path(path)),
+                    )
                     .await
                     .map_err(|e| map_tool_err(p, e))?;
                 Ok(json!({
@@ -560,15 +633,17 @@ impl GiteaForge {
 
             // ── Org / collaboration ─────────────────────────────────────────────
             OrgMembers => {
-                let org = params.get("org").and_then(Value::as_str).unwrap_or(&owner);
+                // `owner` is already encoded; an explicit `org` override is
+                // encoded here before use.
+                let org = params.get("org").and_then(Value::as_str).map(enc).map(Cow::into_owned).unwrap_or_else(|| owner.clone());
                 get(format!("/orgs/{org}/members")).await
             }
             OrgTeams => {
-                let org = params.get("org").and_then(Value::as_str).unwrap_or(&owner);
+                let org = params.get("org").and_then(Value::as_str).map(enc).map(Cow::into_owned).unwrap_or_else(|| owner.clone());
                 get(format!("/orgs/{org}/teams")).await
             }
             OrgPermissions => {
-                let collaborator = s("collaborator")?;
+                let collaborator = enc(s("collaborator")?);
                 get(format!("/repos/{owner}/{}/collaborators/{collaborator}/permission", repo()?)).await
             }
         }
@@ -853,6 +928,42 @@ mod tests {
                 .expect("branches list");
             assert_eq!(resp.provider, pid);
         }
+    }
+
+    #[test]
+    fn enc_neutralizes_path_traversal_and_reserved_chars() {
+        // A `.`/`..` whole segment is escaped so URL normalization can't climb.
+        assert_eq!(enc(".."), "%2E%2E");
+        assert_eq!(enc("."), "%2E");
+        // Structural characters that would break out of a segment or into the
+        // query/fragment are percent-encoded; ordinary unreserved chars are not.
+        assert_eq!(enc("a/b"), "a%2Fb");
+        assert_eq!(enc("x?y#z"), "x%3Fy%23z");
+        assert_eq!(enc("v1.2.3"), "v1.2.3");
+        // enc_path preserves `/` separators but escapes each traversal segment.
+        assert_eq!(enc_path("dir/../etc/passwd"), "dir/%2E%2E/etc/passwd"); // pii-test-fixture
+        assert_eq!(enc_path("a/b/c.txt"), "a/b/c.txt");
+    }
+
+    #[tokio::test]
+    async fn crafted_repo_param_cannot_escape_the_intended_route() {
+        // A `repo` value carrying `/` + `?` must NOT redirect the authenticated
+        // request to a different endpoint — it stays a single, encoded segment.
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            // The whole crafted value lands as ONE encoded path segment.
+            when.method(GET).path("/api/v1/repos/moosenet/evil%2F..%2Fadmin%3Ffoo");
+            then.status(200).json_body(json!({"ok": true}));
+        });
+        let forge = mock_gitea(&server);
+        forge
+            .dispatch(
+                ForgeEndpoint::ReposGet,
+                ForgeRequest::new(json!({"repo": "evil/../admin?foo"})),
+            )
+            .await
+            .expect("crafted repo must be encoded, not routed elsewhere");
+        m.assert();
     }
 
     #[tokio::test]

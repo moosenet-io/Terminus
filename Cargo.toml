@@ -39,6 +39,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chron
 ssh2 = "0.9"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+percent-encoding = "2.3"
 thiserror = "1.0"
 tracing = "0.1"
 # Installed by intake::init_tracing() -- without a subscriber, tracing::{info,
