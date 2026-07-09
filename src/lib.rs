@@ -23,6 +23,7 @@ pub mod forge;
 pub mod gitea;
 pub mod dev;
 pub mod gateway;
+pub mod gateway_framework;
 pub mod github;
 pub mod <secret-manager>; // pii-test-fixture
 pub mod inference_proxy;

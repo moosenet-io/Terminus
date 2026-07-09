@@ -72,6 +72,14 @@ pub struct GatewayServerConfig {
     /// `terminus_primary` (TGW-03) passes
     /// `Some(crate::inference_proxy::InferenceProxyClient::from_env())`.
     pub inference_proxy: Option<crate::inference_proxy::InferenceProxyClient>,
+    /// TGW-04: when `Some`, every request path this router serves (tool
+    /// calls and the inference-proxy routes) is gated by the shared
+    /// identity → allowlist → rate-limit → dispatch → audit pipeline — see
+    /// `crate::gateway_framework`'s module doc for the full contract.
+    /// `terminus_personal` passes `None` (predates this item, not this
+    /// spec's deployment target); `terminus_primary` (TGW-04) passes
+    /// `Some(crate::gateway_framework::GatewayFramework::from_env())`.
+    pub gateway: Option<crate::gateway_framework::GatewayFramework>,
 }
 
 /// Build the shared MCP (`/mcp`, `/healthz`) + `/enroll` router for
@@ -89,6 +97,7 @@ pub fn build_gateway_router(registry: ToolRegistry, config: &GatewayServerConfig
         auth_token: config.auth_token.clone(),
         personal_federation: config.personal_federation.clone(),
         inference_proxy: config.inference_proxy.clone(),
+        gateway: config.gateway.clone(),
     });
 
     build_router(state).merge(build_enroll_router())
@@ -184,6 +193,7 @@ mod tests {
             mtls_server_identity: "terminus-server-test".to_string(),
             personal_federation: None,
             inference_proxy: None,
+            gateway: None,
         }
     }
 

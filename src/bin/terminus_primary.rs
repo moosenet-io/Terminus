@@ -158,6 +158,16 @@ async fn main() {
     // TGW-02's federation client uses).
     let inference_proxy = Some(terminus_rs::inference_proxy::InferenceProxyClient::from_env());
 
+    // TGW-04: the uniform identity → allowlist → rate-limit → dispatch →
+    // audit pipeline -- wraps BOTH the tool-dispatch routes (core +
+    // TGW-02's federated-personal) and TGW-03's inference-proxy routes, via
+    // `McpServerState::gateway` (set inside `build_gateway_router` from this
+    // config) -- see `terminus_rs::gateway_framework`'s module doc for the
+    // full contract (fail-closed on missing mTLS identity, config-driven
+    // per-identity allowlist, interim in-process rate-limit, S6-sanitized
+    // audit log).
+    let gateway = Some(terminus_rs::gateway_framework::GatewayFramework::from_env());
+
     let gateway_config = GatewayServerConfig {
         server_name: "terminus-primary".to_string(),
         server_version: terminus_rs::VERSION.to_string(),
@@ -167,6 +177,7 @@ async fn main() {
         mtls_server_identity: terminus_rs::config::mtls_primary_server_identity(),
         personal_federation,
         inference_proxy,
+        gateway,
     };
 
     // Same shared setup `terminus_personal` uses (TGW-01 extraction, see
@@ -191,9 +202,14 @@ mod tests {
     use serde_json::json;
     use serial_test::serial;
     use terminus_rs::federation::PersonalFederationClient;
+    use terminus_rs::gateway_framework::rate_limit::InProcessRateLimiter;
+    use terminus_rs::gateway_framework::{AllowlistPolicy, GatewayFramework};
     use terminus_rs::inference_proxy::InferenceProxyClient;
+    use terminus_rs::pki::mtls::ClientIdentity;
     use terminus_rs::pki::server::{build_gateway_router, GatewayServerConfig};
     use terminus_rs::registry::{register_all, ToolRegistry};
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     /// `terminus_primary`'s registry-building step, exercised directly
     /// (mirrors the exact call `main()` makes) -- confirms core tools land
@@ -238,6 +254,30 @@ mod tests {
             mtls_server_identity: "terminus-primary-test".to_string(),
             personal_federation: Some(PersonalFederationClient::with_base_url(chord_base_url)),
             inference_proxy: None,
+            gateway: None,
+        };
+        build_gateway_router(registry, &config)
+    }
+
+    /// TGW-04: same shape as `primary_router_with_federation`, but with a
+    /// `GatewayFramework` wired in -- used by the gating tests below to
+    /// exercise the tool-call path through the shared pipeline.
+    fn primary_router_with_federation_and_gateway(
+        chord_base_url: String,
+        gateway: terminus_rs::gateway_framework::GatewayFramework,
+    ) -> axum::Router {
+        let mut registry = ToolRegistry::new();
+        register_all(&mut registry);
+        let config = GatewayServerConfig {
+            server_name: "terminus-primary-test".to_string(),
+            server_version: "0.0.0-test".to_string(),
+            auth_token: None,
+            mtls_bind: "127.0.0.1".to_string(),
+            mtls_port: 0,
+            mtls_server_identity: "terminus-primary-test".to_string(),
+            personal_federation: Some(PersonalFederationClient::with_base_url(chord_base_url)),
+            inference_proxy: None,
+            gateway: Some(gateway),
         };
         build_gateway_router(registry, &config)
     }
@@ -258,18 +298,59 @@ mod tests {
             mtls_server_identity: "terminus-primary-test".to_string(),
             personal_federation: None,
             inference_proxy: Some(InferenceProxyClient::with_base_url(chord_base_url)),
+            gateway: None,
+        };
+        build_gateway_router(registry, &config)
+    }
+
+    /// TGW-04: same shape as `primary_router_with_inference_proxy`, but with
+    /// a `GatewayFramework` wired in -- used by the gating tests below to
+    /// exercise the inference-proxy path through the shared pipeline.
+    fn primary_router_with_inference_proxy_and_gateway(
+        chord_base_url: String,
+        gateway: terminus_rs::gateway_framework::GatewayFramework,
+    ) -> axum::Router {
+        let mut registry = ToolRegistry::new();
+        register_all(&mut registry);
+        let config = GatewayServerConfig {
+            server_name: "terminus-primary-test".to_string(),
+            server_version: "0.0.0-test".to_string(),
+            auth_token: None,
+            mtls_bind: "127.0.0.1".to_string(),
+            mtls_port: 0,
+            mtls_server_identity: "terminus-primary-test".to_string(),
+            personal_federation: None,
+            inference_proxy: Some(InferenceProxyClient::with_base_url(chord_base_url)),
+            gateway: Some(gateway),
         };
         build_gateway_router(registry, &config)
     }
 
     async fn post_mcp(router: axum::Router, body: serde_json::Value) -> serde_json::Value {
+        post_mcp_as(router, body, None).await
+    }
+
+    /// Same as `post_mcp`, but with an optional `ClientIdentity` inserted
+    /// into the request's extensions -- exactly what
+    /// `crate::pki::mtls::run_listener` does post-handshake on a real mTLS
+    /// connection (see that module's doc), reproduced by hand here since
+    /// these tests drive the router directly via `tower::ServiceExt::oneshot`
+    /// rather than through a real TLS handshake.
+    async fn post_mcp_as(
+        router: axum::Router,
+        body: serde_json::Value,
+        identity: Option<&str>,
+    ) -> serde_json::Value {
         use tower::ServiceExt;
-        let req = axum::http::Request::builder()
+        let mut req = axum::http::Request::builder()
             .method("POST")
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(axum::body::Body::from(body.to_string()))
             .unwrap();
+        if let Some(id) = identity {
+            req.extensions_mut().insert(ClientIdentity(id.to_string()));
+        }
         let resp = router.oneshot(req).await.unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let raw = String::from_utf8(bytes.to_vec()).unwrap();
@@ -388,6 +469,7 @@ mod tests {
             mtls_server_identity: "terminus-primary-test".to_string(),
             personal_federation: None,
             inference_proxy: None,
+            gateway: None,
         };
         let router = build_gateway_router(registry, &config);
         let body = post_mcp(
@@ -467,13 +549,27 @@ mod tests {
         uri: &str,
         body: serde_json::Value,
     ) -> (axum::http::StatusCode, serde_json::Value, axum::http::HeaderMap) {
+        post_json_as(router, uri, body, None).await
+    }
+
+    /// Same as `post_json`, but with an optional `ClientIdentity` inserted
+    /// into the request's extensions -- see `post_mcp_as`'s doc for why.
+    async fn post_json_as(
+        router: axum::Router,
+        uri: &str,
+        body: serde_json::Value,
+        identity: Option<&str>,
+    ) -> (axum::http::StatusCode, serde_json::Value, axum::http::HeaderMap) {
         use tower::ServiceExt;
-        let req = axum::http::Request::builder()
+        let mut req = axum::http::Request::builder()
             .method("POST")
             .uri(uri)
             .header("content-type", "application/json")
             .body(axum::body::Body::from(body.to_string()))
             .unwrap();
+        if let Some(id) = identity {
+            req.extensions_mut().insert(ClientIdentity(id.to_string()));
+        }
         let resp = router.oneshot(req).await.unwrap();
         let status = resp.status();
         let headers = resp.headers().clone();
@@ -637,9 +733,232 @@ mod tests {
             mtls_server_identity: "terminus-primary-test".to_string(),
             personal_federation: None,
             inference_proxy: None,
+            gateway: None,
         };
         let router = build_gateway_router(registry, &config);
         let (status, _, _) = post_json(router, "/v1/chat/completions", json!({})).await;
         assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ── TGW-04: uniform identity → allowlist → rate-limit → dispatch →
+    // audit pipeline, exercised through the actual router `terminus_primary`
+    // builds -- both the tool-call path (this section) and the
+    // inference-proxy path (further below) go through the SAME
+    // `GatewayFramework::guard` call (see
+    // `terminus_rs::gateway_framework`'s own unit tests for a direct proof
+    // of that at the framework level); these tests confirm it's actually
+    // wired into both routes end to end, not just correct in isolation.
+
+    fn allow_policy(identity: &str, actions: &[&str]) -> AllowlistPolicy {
+        let mut map = HashMap::new();
+        map.insert(identity.to_string(), actions.iter().map(|s| s.to_string()).collect());
+        AllowlistPolicy::new(map)
+    }
+
+    /// A gateway with a fast, deterministic-for-tests token bucket (high
+    /// refill rate so back-to-back calls in one test don't flake on timing,
+    /// same pattern `gateway_framework`'s own unit tests use).
+    fn test_gateway(policy: AllowlistPolicy, burst: u32) -> GatewayFramework {
+        GatewayFramework::new(policy, Arc::new(InProcessRateLimiter::new(burst, 1000.0)))
+    }
+
+    fn tool_call_body(name: &str) -> serde_json::Value {
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": name, "arguments": {}}
+        })
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn gate_allowed_identity_dispatches_core_tool_and_is_audited() {
+        let server = MockServer::start();
+        let gateway = test_gateway(allow_policy("dev-box", &["gitea_list_identities"]), 10);
+        let router = primary_router_with_federation_and_gateway(server.base_url(), gateway);
+
+        let body = post_mcp_as(router, tool_call_body("gitea_list_identities"), Some("dev-box")).await;
+        let text = body["result"]["content"][0]["text"].as_str().unwrap_or("");
+        // A real, allowlisted, identified call reaches actual tool dispatch
+        // -- it must never carry a gate-denial message, whatever the tool
+        // itself returns (success or its own NotConfigured-style error).
+        assert!(!text.contains("no mTLS-verified"), "got: {text}");
+        assert!(!text.contains("not allowlisted"), "got: {text}");
+        assert!(!text.contains("rate limit"), "got: {text}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn gate_denies_tool_call_when_identity_not_allowlisted() {
+        let server = MockServer::start();
+        // Empty policy -- "dev-box" has no configured entry at all.
+        let gateway = test_gateway(AllowlistPolicy::default(), 10);
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/personal/tools/call");
+            then.status(200).json_body(json!({"result": "should never be reached"}));
+        });
+        let router = primary_router_with_federation_and_gateway(server.base_url(), gateway);
+
+        let body = post_mcp_as(router, tool_call_body("gitea_list_identities"), Some("dev-box")).await;
+        assert_eq!(body["result"]["isError"], true);
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("not allowlisted") || text.contains("no allowlist entries"),
+            "expected a denial message, got: {text}"
+        );
+        // The gate denied before dispatch -- core dispatch never even had a
+        // chance to try federation.
+        mock.assert_hits(0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn gate_missing_identity_fails_closed_on_tool_call() {
+        let server = MockServer::start();
+        let gateway = test_gateway(allow_policy("dev-box", &["*"]), 10);
+        let router = primary_router_with_federation_and_gateway(server.base_url(), gateway);
+
+        // No identity attached -- the plain HTTP+JWT listener never
+        // populates `ClientIdentity` (see `handle_mcp`'s doc), so this
+        // reproduces exactly what a request lacking a real mTLS handshake
+        // looks like.
+        let body = post_mcp(router, tool_call_body("gitea_list_identities")).await;
+        assert_eq!(body["result"]["isError"], true);
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("no mTLS-verified"), "expected fail-closed denial, got: {text}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn gate_rate_limit_trips_after_burst_on_tool_call() {
+        let server = MockServer::start();
+        let gateway = test_gateway(allow_policy("dev-box", &["*"]), 2);
+        let router = primary_router_with_federation_and_gateway(server.base_url(), gateway);
+
+        let b1 = post_mcp_as(router.clone(), tool_call_body("gitea_list_identities"), Some("dev-box")).await;
+        let t1 = b1["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(!t1.contains("rate limit"), "1st call within burst should not be limited: {t1}");
+
+        let b2 = post_mcp_as(router.clone(), tool_call_body("gitea_list_identities"), Some("dev-box")).await;
+        let t2 = b2["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(!t2.contains("rate limit"), "2nd call within burst should not be limited: {t2}");
+
+        let b3 = post_mcp_as(router, tool_call_body("gitea_list_identities"), Some("dev-box")).await;
+        assert_eq!(b3["result"]["isError"], true);
+        let t3 = b3["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(t3.contains("rate limit"), "3rd call should exceed the burst of 2: {t3}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn gate_allowed_inference_request_forwards_to_chord() {
+        set_jwt_secret();
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            then.status(200).json_body(json!({"ok": true}));
+        });
+        let gateway = test_gateway(allow_policy("dev-box", &["/v1/chat/completions"]), 10);
+        let router = primary_router_with_inference_proxy_and_gateway(server.base_url(), gateway);
+
+        let (status, body, _) = post_json_as(
+            router,
+            "/v1/chat/completions",
+            json!({"model": "test-model"}),
+            Some("dev-box"),
+        )
+        .await;
+
+        mock.assert();
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        clear_jwt_secret();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn gate_denies_inference_request_when_not_allowlisted() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            then.status(200).json_body(json!({"ok": true}));
+        });
+        let gateway = test_gateway(AllowlistPolicy::default(), 10);
+        let router = primary_router_with_inference_proxy_and_gateway(server.base_url(), gateway);
+
+        let (status, body, _) = post_json_as(
+            router,
+            "/v1/chat/completions",
+            json!({"model": "test-model"}),
+            Some("dev-box"),
+        )
+        .await;
+
+        // Denied before ever reaching Chord.
+        mock.assert_hits(0);
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        let msg = body["error"].as_str().unwrap();
+        assert!(msg.contains("not allowlisted") || msg.contains("no allowlist entries"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn gate_missing_identity_fails_closed_on_inference_proxy() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            then.status(200).json_body(json!({"ok": true}));
+        });
+        let gateway = test_gateway(allow_policy("dev-box", &["*"]), 10);
+        let router = primary_router_with_inference_proxy_and_gateway(server.base_url(), gateway);
+
+        // No identity attached this time.
+        let (status, body, _) =
+            post_json(router, "/v1/chat/completions", json!({"model": "test-model"})).await;
+
+        mock.assert_hits(0);
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        let msg = body["error"].as_str().unwrap().to_lowercase();
+        assert!(msg.contains("mtls") || msg.contains("identity"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn gate_rate_limit_trips_for_inference_proxy_burst() {
+        set_jwt_secret();
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            then.status(200).json_body(json!({"ok": true}));
+        });
+        // A near-zero refill rate here (unlike `test_gateway`'s fast refill,
+        // fine for the in-process JSON-RPC path above) -- this test drives a
+        // real loopback HTTP round trip to the mocked Chord, which can take
+        // longer than a millisecond, so a fast refill could mask the limit
+        // tripping.
+        let gateway = GatewayFramework::new(
+            allow_policy("dev-box", &["/v1/chat/completions"]),
+            Arc::new(InProcessRateLimiter::new(1, 0.0001)),
+        );
+        let router = primary_router_with_inference_proxy_and_gateway(server.base_url(), gateway);
+
+        let (status1, _, _) = post_json_as(
+            router.clone(),
+            "/v1/chat/completions",
+            json!({"model": "test-model"}),
+            Some("dev-box"),
+        )
+        .await;
+        assert_eq!(status1, axum::http::StatusCode::OK, "1st call within burst of 1 should succeed");
+
+        let (status2, body2, _) = post_json_as(
+            router,
+            "/v1/chat/completions",
+            json!({"model": "test-model"}),
+            Some("dev-box"),
+        )
+        .await;
+        assert_eq!(status2, axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert!(body2["error"].as_str().unwrap().contains("rate limit"));
+        clear_jwt_secret();
     }
 }
