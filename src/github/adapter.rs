@@ -156,15 +156,42 @@ impl GitHubAdapter {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        let allowlist = Arc::new(build_allowlist(&api_base));
+
+        // Egress isolation must survive redirects: reqwest follows 3xx by default
+        // and would NOT re-check `host_allowed`, so an allowed endpoint that
+        // redirects to an off-allowlist host could otherwise smuggle a request
+        // out. This custom policy re-validates every redirect hop against the
+        // SAME allowlist and stops (fail-closed) on any non-allowlisted target;
+        // the stopped 3xx then surfaces as a non-2xx Transport error.
+        let redirect_allow = allowlist.clone();
+        let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+            let url = attempt.url();
+            let authority = match url.host_str() {
+                Some(h) => match url.port() {
+                    Some(port) => format!("{h}:{port}"),
+                    None => h.to_string(),
+                },
+                None => return attempt.stop(),
+            };
+            let authority = authority.to_lowercase();
+            if redirect_allow.iter().any(|a| a == &authority) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        });
+
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
             .user_agent("MooseNet-MCP/1.0")
+            .redirect(redirect_policy)
             .build()
             .map_err(|e| ForgeError::Transport { provider: "github".into(), message: e.to_string() })?;
 
         Ok(Self {
             http,
-            allowlist: Arc::new(build_allowlist(&api_base)),
+            allowlist,
             api_base,
             default_owner,
             default_identity,
@@ -362,17 +389,20 @@ impl GitHubAdapter {
 
     // ── param helpers ────────────────────────────────────────────────────────
 
-    /// The `owner` for a request (`params.owner`, else the configured default).
-    fn owner<'a>(&'a self, p: &'a Value) -> String {
-        p.get("owner")
+    /// The URL-encoded `owner` path segment for a request (`params.owner`, else
+    /// the configured default). Encoded here so every URL built from it is safe.
+    fn owner(&self, p: &Value) -> String {
+        let raw = p
+            .get("owner")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or(&self.default_owner)
-            .to_string()
+            .unwrap_or(&self.default_owner);
+        pct(raw, false)
     }
 
-    /// A required, non-empty string param.
+    /// A required, non-empty string param, returned VERBATIM (trimmed). For
+    /// values that go into a JSON body or are not URL path/query components.
     fn req_str(p: &Value, key: &str) -> Result<String, ForgeError> {
         p.get(key)
             .and_then(Value::as_str)
@@ -382,9 +412,21 @@ impl GitHubAdapter {
             .ok_or_else(|| ForgeError::InvalidRequest(format!("'{key}' is required")))
     }
 
-    /// `(owner, repo)` — repo required.
+    /// A required param, percent-encoded as a single URL path segment (reserved
+    /// chars incl. `/` escaped) — for owner/repo/username/sha/tag/id segments.
+    fn req_seg(p: &Value, key: &str) -> Result<String, ForgeError> {
+        Ok(pct(&Self::req_str(p, key)?, false))
+    }
+
+    /// A required param, percent-encoded as a URL path preserving `/` — for
+    /// hierarchical values (content path, ref, branch, tag paths).
+    fn req_path(p: &Value, key: &str) -> Result<String, ForgeError> {
+        Ok(pct(&Self::req_str(p, key)?, true))
+    }
+
+    /// `(owner, repo)` — both URL-encoded as single path segments; repo required.
     fn owner_repo(&self, p: &Value) -> Result<(String, String), ForgeError> {
-        Ok((self.owner(p), Self::req_str(p, "repo")?))
+        Ok((self.owner(p), Self::req_seg(p, "repo")?))
     }
 
     fn base(&self) -> &str {
@@ -414,6 +456,26 @@ fn build_allowlist(api_base: &str) -> Vec<String> {
     hosts.sort();
     hosts.dedup();
     hosts
+}
+
+/// Percent-encode a string for safe interpolation into a URL, without pulling in
+/// an encoding crate. Unreserved characters (`A-Z a-z 0-9 - . _ ~`) pass through;
+/// everything else becomes `%XX`. When `keep_slash` is set, `/` also passes
+/// through — used for hierarchical path/ref/branch values (e.g. a content path
+/// `docs/a b.md` or a branch `feature/x`) where the slashes are structural but
+/// spaces, `#`, `?`, `%`, `&` etc. must be escaped so they address the intended
+/// resource rather than silently splitting the URL.
+fn pct(s: &str, keep_slash: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let unreserved = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~');
+        if unreserved || (keep_slash && b == b'/') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// Extract the host (host or host:port) from a URL string, without pulling in a
@@ -572,7 +634,7 @@ impl ForgeProvider for GitHubAdapter {
             }
             BranchesGet => {
                 let (owner, repo) = self.owner_repo(p)?;
-                let branch = Self::req_str(p, "branch")?;
+                let branch = Self::req_path(p, "branch")?;
                 let url = format!("{api}/repos/{owner}/{repo}/branches/{branch}");
                 ok(self.call(&token, Method::GET, &url, None).await?)
             }
@@ -586,13 +648,13 @@ impl ForgeProvider for GitHubAdapter {
             }
             BranchesDelete => {
                 let (owner, repo) = self.owner_repo(p)?;
-                let branch = Self::req_str(p, "branch")?;
+                let branch = Self::req_path(p, "branch")?;
                 let url = format!("{api}/repos/{owner}/{repo}/git/refs/heads/{branch}");
                 ok(self.call(&token, Method::DELETE, &url, None).await?)
             }
             BranchesProtection => {
                 let (owner, repo) = self.owner_repo(p)?;
-                let branch = Self::req_str(p, "branch")?;
+                let branch = Self::req_path(p, "branch")?;
                 let body = Self::req_value(p, "protection")?;
                 let url = format!("{api}/repos/{owner}/{repo}/branches/{branch}/protection");
                 ok(self.call(&token, Method::PUT, &url, Some(&body)).await?)
@@ -607,14 +669,14 @@ impl ForgeProvider for GitHubAdapter {
             RefsList => {
                 let (owner, repo) = self.owner_repo(p)?;
                 let url = match p.get("ref").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
-                    Some(r) => format!("{api}/repos/{owner}/{repo}/git/matching-refs/{r}"),
+                    Some(r) => format!("{api}/repos/{owner}/{repo}/git/matching-refs/{}", pct(r, true)),
                     None => format!("{api}/repos/{owner}/{repo}/git/refs"),
                 };
                 ok(self.call(&token, Method::GET, &url, None).await?)
             }
             RefsGet => {
                 let (owner, repo) = self.owner_repo(p)?;
-                let r = Self::req_str(p, "ref")?;
+                let r = Self::req_path(p, "ref")?;
                 let url = format!("{api}/repos/{owner}/{repo}/git/ref/{r}");
                 ok(self.call(&token, Method::GET, &url, None).await?)
             }
@@ -629,7 +691,7 @@ impl ForgeProvider for GitHubAdapter {
             }
             RefsDelete => {
                 let (owner, repo) = self.owner_repo(p)?;
-                let r = Self::req_str(p, "ref")?;
+                let r = Self::req_path(p, "ref")?;
                 let r = r.strip_prefix("refs/").unwrap_or(&r);
                 let url = format!("{api}/repos/{owner}/{repo}/git/refs/{r}");
                 ok(self.call(&token, Method::DELETE, &url, None).await?)
@@ -640,28 +702,28 @@ impl ForgeProvider for GitHubAdapter {
                 let (owner, repo) = self.owner_repo(p)?;
                 let mut url = format!("{api}/repos/{owner}/{repo}/commits?per_page=100");
                 if let Some(sha) = p.get("sha").and_then(Value::as_str) {
-                    url.push_str(&format!("&sha={sha}"));
+                    url.push_str(&format!("&sha={}", pct(sha, false)));
                 }
                 if let Some(path) = p.get("path").and_then(Value::as_str) {
-                    url.push_str(&format!("&path={path}"));
+                    url.push_str(&format!("&path={}", pct(path, false)));
                 }
                 ok(self.call(&token, Method::GET, &url, None).await?)
             }
             CommitsGet => {
                 let (owner, repo) = self.owner_repo(p)?;
-                let sha = Self::req_str(p, "sha")?;
+                let sha = Self::req_seg(p, "sha")?;
                 let url = format!("{api}/repos/{owner}/{repo}/commits/{sha}");
                 ok(self.call(&token, Method::GET, &url, None).await?)
             }
             CommitsCompareDiff => {
                 let (owner, repo) = self.owner_repo(p)?;
-                let basehead = format!("{}...{}", Self::req_str(p, "base")?, Self::req_str(p, "head")?);
+                let basehead = format!("{}...{}", Self::req_seg(p, "base")?, Self::req_seg(p, "head")?);
                 let url = format!("{api}/repos/{owner}/{repo}/compare/{basehead}");
                 ok(self.call(&token, Method::GET, &url, None).await?)
             }
             CommitsStatus => {
                 let (owner, repo) = self.owner_repo(p)?;
-                let r = Self::req_str(p, "ref")?;
+                let r = Self::req_path(p, "ref")?;
                 let url = format!("{api}/repos/{owner}/{repo}/commits/{r}/status");
                 ok(self.call(&token, Method::GET, &url, None).await?)
             }
@@ -669,7 +731,7 @@ impl ForgeProvider for GitHubAdapter {
             // ── Pull requests ───────────────────────────────────────────────────
             PullRequestsList => {
                 let (owner, repo) = self.owner_repo(p)?;
-                let state = p.get("state").and_then(Value::as_str).unwrap_or("open");
+                let state = pct(p.get("state").and_then(Value::as_str).unwrap_or("open"), false);
                 let url = format!("{api}/repos/{owner}/{repo}/pulls?state={state}&per_page=100");
                 ok(self.call(&token, Method::GET, &url, None).await?)
             }
@@ -739,9 +801,20 @@ impl ForgeProvider for GitHubAdapter {
             // ── Issues ──────────────────────────────────────────────────────────
             IssuesList => {
                 let (owner, repo) = self.owner_repo(p)?;
-                let state = p.get("state").and_then(Value::as_str).unwrap_or("open");
+                let state = pct(p.get("state").and_then(Value::as_str).unwrap_or("open"), false);
                 let url = format!("{api}/repos/{owner}/{repo}/issues?state={state}&per_page=100");
-                ok(self.call(&token, Method::GET, &url, None).await?)
+                let body = self.call(&token, Method::GET, &url, None).await?;
+                // GitHub's /issues endpoint returns pull requests too (each PR
+                // carries a `pull_request` field). This adapter exposes PRs via
+                // the separate pull_requests_* endpoints, so filter them out here
+                // to keep IssuesList issues-only.
+                let filtered = match body {
+                    Value::Array(items) => Value::Array(
+                        items.into_iter().filter(|it| it.get("pull_request").is_none()).collect(),
+                    ),
+                    other => other,
+                };
+                ok(filtered)
             }
             IssuesGet => {
                 let (owner, repo) = self.owner_repo(p)?;
@@ -844,7 +917,7 @@ impl ForgeProvider for GitHubAdapter {
             }
             TagsGet => {
                 let (owner, repo) = self.owner_repo(p)?;
-                let tag = Self::req_str(p, "tag")?;
+                let tag = Self::req_path(p, "tag")?;
                 let url = format!("{api}/repos/{owner}/{repo}/git/ref/tags/{tag}");
                 ok(self.call(&token, Method::GET, &url, None).await?)
             }
@@ -859,7 +932,7 @@ impl ForgeProvider for GitHubAdapter {
             }
             TagsDelete => {
                 let (owner, repo) = self.owner_repo(p)?;
-                let tag = Self::req_str(p, "tag")?;
+                let tag = Self::req_path(p, "tag")?;
                 let url = format!("{api}/repos/{owner}/{repo}/git/refs/tags/{tag}");
                 ok(self.call(&token, Method::DELETE, &url, None).await?)
             }
@@ -899,21 +972,21 @@ impl ForgeProvider for GitHubAdapter {
             // ── Packages ────────────────────────────────────────────────────────
             PackagesList => {
                 let owner = self.owner(p);
-                let ptype = p.get("package_type").and_then(Value::as_str).unwrap_or("container");
+                let ptype = pct(p.get("package_type").and_then(Value::as_str).unwrap_or("container"), false);
                 let url = format!("{api}/orgs/{owner}/packages?package_type={ptype}&per_page=100");
                 ok(self.call(&token, Method::GET, &url, None).await?)
             }
             PackagesGet => {
                 let owner = self.owner(p);
-                let ptype = Self::req_str(p, "package_type")?;
-                let name = Self::req_str(p, "package_name")?;
+                let ptype = Self::req_seg(p, "package_type")?;
+                let name = Self::req_seg(p, "package_name")?;
                 let url = format!("{api}/orgs/{owner}/packages/{ptype}/{name}");
                 ok(self.call(&token, Method::GET, &url, None).await?)
             }
             PackagesDelete => {
                 let owner = self.owner(p);
-                let ptype = Self::req_str(p, "package_type")?;
-                let name = Self::req_str(p, "package_name")?;
+                let ptype = Self::req_seg(p, "package_type")?;
+                let name = Self::req_seg(p, "package_name")?;
                 let url = format!("{api}/orgs/{owner}/packages/{ptype}/{name}");
                 ok(self.call(&token, Method::DELETE, &url, None).await?)
             }
@@ -921,22 +994,32 @@ impl ForgeProvider for GitHubAdapter {
             // ── Content ─────────────────────────────────────────────────────────
             ContentReadFile => {
                 let (owner, repo) = self.owner_repo(p)?;
-                let path = Self::req_str(p, "path")?;
+                let path = Self::req_path(p, "path")?;
                 let mut url = format!("{api}/repos/{owner}/{repo}/contents/{path}");
                 if let Some(r) = p.get("ref").and_then(Value::as_str) {
-                    url.push_str(&format!("?ref={r}"));
+                    url.push_str(&format!("?ref={}", pct(r, false)));
                 }
                 ok(self.call(&token, Method::GET, &url, None).await?)
             }
             ContentWriteFile => {
                 let (owner, repo) = self.owner_repo(p)?;
-                let path = Self::req_str(p, "path")?;
+                let path = Self::req_path(p, "path")?;
                 let message = Self::req_str(p, "message")?;
                 // Content may be given raw (utf-8) or already base64; GitHub wants
-                // base64. Default: base64-encode the provided utf-8 `content`.
+                // base64. Default: base64-encode the provided utf-8 `content`
+                // VERBATIM — never trim it. Trimming would silently drop
+                // meaningful leading/trailing whitespace and newlines (changing
+                // the file's bytes) and would reject a legitimately empty file.
                 let content_b64 = match p.get("content_base64").and_then(Value::as_str) {
                     Some(b64) => b64.to_string(),
-                    None => B64.encode(Self::req_str(p, "content")?.as_bytes()),
+                    None => {
+                        let raw = p.get("content").and_then(Value::as_str).ok_or_else(|| {
+                            ForgeError::InvalidRequest(
+                                "'content' (or 'content_base64') is required".into(),
+                            )
+                        })?;
+                        B64.encode(raw.as_bytes())
+                    }
                 };
                 let mut body = json!({ "message": message, "content": content_b64 });
                 for k in ["sha", "branch"] {
@@ -947,7 +1030,7 @@ impl ForgeProvider for GitHubAdapter {
             }
             ContentListTree => {
                 let (owner, repo) = self.owner_repo(p)?;
-                let tree_sha = Self::req_str(p, "tree_sha")?;
+                let tree_sha = Self::req_seg(p, "tree_sha")?;
                 let recursive = p.get("recursive").and_then(Value::as_bool).unwrap_or(false);
                 let mut url = format!("{api}/repos/{owner}/{repo}/git/trees/{tree_sha}");
                 if recursive { url.push_str("?recursive=1"); }
@@ -955,12 +1038,15 @@ impl ForgeProvider for GitHubAdapter {
             }
             ContentRawFetch => {
                 let (owner, repo) = self.owner_repo(p)?;
-                let path = Self::req_str(p, "path")?;
+                // The RAW path is reported back verbatim; the ENCODED path builds
+                // the URL.
+                let raw_path = Self::req_str(p, "path")?;
+                let path = pct(&raw_path, true);
                 let mut url = format!("{api}/repos/{owner}/{repo}/contents/{path}");
                 if let Some(r) = p.get("ref").and_then(Value::as_str) {
-                    url.push_str(&format!("?ref={r}"));
+                    url.push_str(&format!("?ref={}", pct(r, false)));
                 }
-                ok(self.raw_fetch(&token, &url, &path).await?)
+                ok(self.raw_fetch(&token, &url, &raw_path).await?)
             }
 
             // ── Org / collaboration ─────────────────────────────────────────────
@@ -976,7 +1062,7 @@ impl ForgeProvider for GitHubAdapter {
             }
             OrgPermissions => {
                 let (owner, repo) = self.owner_repo(p)?;
-                let username = Self::req_str(p, "username")?;
+                let username = Self::req_seg(p, "username")?;
                 let url = format!("{api}/repos/{owner}/{repo}/collaborators/{username}/permission");
                 ok(self.call(&token, Method::GET, &url, None).await?)
             }
@@ -1028,14 +1114,33 @@ mod tests {
     fn test_adapter(base: &str) -> GitHubAdapter {
         let mut identities = HashMap::new();
         identities.insert("moose".to_string(), "testtoken".to_string());
+        let allowlist = Arc::new(build_allowlist(base));
+        // Mirror from_env's allowlist-validating redirect policy so tests exercise
+        // the real redirect behavior.
+        let redirect_allow = allowlist.clone();
+        let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+            let url = attempt.url();
+            let authority = match url.host_str() {
+                Some(h) => match url.port() {
+                    Some(port) => format!("{h}:{port}"),
+                    None => h.to_string(),
+                },
+                None => return attempt.stop(),
+            };
+            if redirect_allow.iter().any(|a| a == &authority.to_lowercase()) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        });
         GitHubAdapter {
-            http: reqwest::Client::builder().build().unwrap(),
+            http: reqwest::Client::builder().redirect(redirect_policy).build().unwrap(),
             api_base: base.to_string(),
             default_owner: "moosenet-io".to_string(),
             default_identity: "moose".to_string(),
             identities: Arc::new(identities),
             fallback_token: None,
-            allowlist: Arc::new(build_allowlist(base)),
+            allowlist,
             caps: Arc::new(github_capabilities()),
         }
     }
@@ -1119,6 +1224,25 @@ mod tests {
         assert!(a.host_allowed("http://127.0.0.1:34567/repos/x/y")); // pii-test-fixture
         // A different port on the same address is NOT the same authority.
         assert!(!a.host_allowed("http://127.0.0.1:99/other"));
+    }
+
+    #[tokio::test]
+    async fn redirect_to_non_allowlisted_host_is_not_followed() {
+        // An allowlisted endpoint that 302s to an off-allowlist host must NOT be
+        // followed — the redirect policy fails closed, so the 3xx surfaces as a
+        // non-2xx Transport error rather than a request smuggled to the target.
+        let server = MockServer::start();
+        let redirect = server.mock(|when, then| {
+            when.method(GET).path("/repos/moosenet-io/r");
+            then.status(302).header("location", "https://evil.example.com/stolen"); // pii-test-fixture
+        });
+        let a = test_adapter(&server.base_url());
+        let err = a
+            .dispatch(ForgeEndpoint::ReposGet, req(json!({ "repo": "r" })))
+            .await
+            .expect_err("cross-host redirect must not be followed");
+        assert!(matches!(err, ForgeError::Transport { .. }), "got {err:?}");
+        redirect.assert();
     }
 
     #[tokio::test]
@@ -1268,6 +1392,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn content_write_preserves_raw_bytes_and_allows_empty() {
+        // Regression (codex P1): content must be encoded VERBATIM — leading/
+        // trailing whitespace and newlines preserved — and an empty file must be
+        // writable, not rejected.
+        let server = MockServer::start();
+        let padded = "  leading and trailing \n";
+        let padded_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::PUT).path("/repos/moosenet-io/r/contents/x")
+                .json_body(json!({ "message": "m", "content": B64.encode(padded.as_bytes()) }));
+            then.status(201).json_body(json!({ "commit": { "sha": "p" } }));
+        });
+        let empty_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::PUT).path("/repos/moosenet-io/r/contents/empty")
+                .json_body(json!({ "message": "m", "content": B64.encode(b"") }));
+            then.status(201).json_body(json!({ "commit": { "sha": "e" } }));
+        });
+        let a = test_adapter(&server.base_url());
+        a.dispatch(ForgeEndpoint::ContentWriteFile, req(json!({ "repo": "r", "path": "x", "message": "m", "content": padded }))).await.unwrap();
+        a.dispatch(ForgeEndpoint::ContentWriteFile, req(json!({ "repo": "r", "path": "empty", "message": "m", "content": "" }))).await.unwrap();
+        padded_mock.assert();
+        empty_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn content_write_requires_some_content() {
+        let a = test_adapter("http://127.0.0.1:1"); // pii-test-fixture
+        let err = a
+            .dispatch(ForgeEndpoint::ContentWriteFile, req(json!({ "repo": "r", "path": "x", "message": "m" })))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ForgeError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
     async fn refs_delete_strips_refs_prefix() {
         let server = MockServer::start();
         let m = server.mock(|when, then| {
@@ -1313,6 +1471,56 @@ mod tests {
         let v = a.graphql(Some("moose"), "query{viewer{login}}", json!({})).await.unwrap();
         assert_eq!(v["data"]["viewer"]["login"], "moose");
         m.assert();
+    }
+
+    #[test]
+    fn pct_encodes_reserved_keeps_slash_optionally() {
+        // Hierarchical: slash preserved, space/# escaped.
+        assert_eq!(pct("docs/a b#c.md", true), "docs/a%20b%23c.md");
+        // Single segment: slash escaped too.
+        assert_eq!(pct("a/b", false), "a%2Fb");
+        // Unreserved untouched.
+        assert_eq!(pct("Feature-1.0_x~y", true), "Feature-1.0_x~y");
+    }
+
+    #[tokio::test]
+    async fn content_path_with_reserved_chars_is_encoded() {
+        // A path with a space and a '#' must address the real file, not split
+        // the URL at the fragment. The mock matches only the encoded path.
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(GET).path("/repos/moosenet-io/r/contents/docs/a%20b%23c.md");
+            then.status(200).json_body(json!({ "name": "a b#c.md" }));
+        });
+        let a = test_adapter(&server.base_url());
+        let resp = a
+            .dispatch(ForgeEndpoint::ContentReadFile, req(json!({ "repo": "r", "path": "docs/a b#c.md" })))
+            .await
+            .unwrap();
+        assert_eq!(resp.body["name"], "a b#c.md");
+        m.assert();
+    }
+
+    #[tokio::test]
+    async fn issues_list_filters_out_pull_requests() {
+        // GitHub's /issues returns PRs too (they carry a `pull_request` field);
+        // IssuesList must drop them so it stays issues-only.
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/moosenet-io/r/issues");
+            then.status(200).json_body(json!([
+                { "number": 1, "title": "a real issue" },
+                { "number": 2, "title": "a PR", "pull_request": { "url": "..." } },
+                { "number": 3, "title": "another issue" }
+            ]));
+        });
+        let a = test_adapter(&server.base_url());
+        let resp = a.dispatch(ForgeEndpoint::IssuesList, req(json!({ "repo": "r" }))).await.unwrap();
+        let arr = resp.body.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "PR entry should be filtered out");
+        assert!(arr.iter().all(|it| it.get("pull_request").is_none()));
+        assert_eq!(arr[0]["number"], 1);
+        assert_eq!(arr[1]["number"], 3);
     }
 
     // ── NEGATIVE: auth / scope failure (required by AC) ─────────────────────────
