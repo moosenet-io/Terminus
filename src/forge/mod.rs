@@ -21,15 +21,21 @@
 //!   the request/response/error types and the [`CredentialRef`] vault-key
 //!   abstraction (secrets resolved via `SecretManager`/vault, never literals).
 //!
-//! No concrete provider adapters live here yet — the Gitea-family, GitHub, and
-//! GitLab adapters (GITX-02/03/04), the optional stubs (GITX-06), and the
-//! git-private/git-public tool assembly with posture enforcement (GITX-05) build
-//! on this trait in later items.
+//! - [`gitea_family`] (GITX-02) — the first concrete adapter: ONE
+//!   Gitea-compatible-REST-API client ([`GiteaForge`]) implementing
+//!   [`ForgeProvider`], parameterised by base-URL + credentials to serve three
+//!   providers — Gitea + Forgejo (git-private) and Codeberg (git-public).
+//!
+//! The GitHub and GitLab adapters (GITX-03/04), the optional stubs (GITX-06),
+//! and the git-private/git-public tool assembly with posture enforcement
+//! (GITX-05) build on this trait in later items.
 
 pub mod capability;
+pub mod gitea_family;
 pub mod provider;
 
 pub use capability::{CapabilityMap, ForgeDomain, ForgeEndpoint, SupportLevel};
+pub use gitea_family::{gitea_family_capabilities, GiteaForge};
 pub use provider::{
     CredentialRef, ForgeError, ForgeProvider, ForgeRequest, ForgeResponse, ProviderId,
 };

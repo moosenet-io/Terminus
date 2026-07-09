@@ -47,7 +47,7 @@ use types::{
 /// - `10.x.x.x`
 /// - `172.{16-31}.x.x`
 /// - Bare API key patterns: long hex strings (≥32 chars) or `sk-...` tokens  // pii-test-fixture
-fn pii_check(content: &str) -> Option<String> {
+pub(crate) fn pii_check(content: &str) -> Option<String> {
     // Private IP ranges
     let private_ip_patterns: &[(&str, &str)] = &[
         ("192.168.", "RFC-1918 192.168.x.x address"),
@@ -150,12 +150,22 @@ const DEFAULT_GITEA_IDENTITY: &str = "moose";
 /// later duplicate differing only by case collapses onto the same entry —
 /// matching how [`GiteaClient::for_identity`] lowercases on lookup. Never reads
 /// another process's files. Mirrors Plane's `scan_named_identities`.
+///
+/// Token values are `.trim()`-ed before storage: a stored PAT that arrives with
+/// a trailing newline or surrounding whitespace (a common shape when a secret is
+/// materialised from a file or `echo`-ed into the runtime store) would otherwise
+/// be interpolated verbatim into the `Authorization: token <PAT>` header and make
+/// Gitea reject every request as unauthenticated. Trimming here means a stray
+/// newline in the credential value can never break the auth header again
+/// (this bit us on `GITEA_PAT_MOOSE`). A value that is only whitespace trims to
+/// empty and is treated as absent, exactly like an unset var.
 fn scan_gitea_identities() -> HashMap<String, String> {
     let mut identities: HashMap<String, String> = HashMap::new();
     for (k, v) in env::vars() {
         if let Some(name) = k.strip_prefix(GITEA_IDENTITY_PREFIX) {
-            if !v.is_empty() {
-                identities.insert(name.to_lowercase(), v);
+            let token = v.trim();
+            if !token.is_empty() {
+                identities.insert(name.to_lowercase(), token.to_string());
             }
         }
     }
@@ -240,6 +250,42 @@ impl GiteaClient {
             identity_name: Some(identity_name),
             identities: Arc::new(identities),
             owner,
+        })
+    }
+
+    /// Build a client from an explicit base URL + single token, for a
+    /// single-credential provider in the Gitea family (Forgejo `FORGEJO_TOKEN`,
+    /// Codeberg `CODEBERG_TOKEN`) that does NOT use the `GITEA_PAT_<NAME>`
+    /// multi-identity model. The token is `.trim()`-ed for the same reason
+    /// [`scan_gitea_identities`] trims (a trailing newline in a materialised
+    /// secret must never reach the auth header). `identity_name` is a display
+    /// label only (e.g. the provider id); no named-identity map is populated, so
+    /// [`GiteaClient::for_identity`] on such a client resolves nothing.
+    ///
+    /// Returns `Err(ToolError::NotConfigured)` if the trimmed token is empty.
+    pub fn with_token(
+        base_url: impl Into<String>,
+        token: impl AsRef<str>,
+        owner: impl Into<String>,
+        identity_name: impl Into<String>,
+    ) -> Result<Self, ToolError> {
+        let token = token.as_ref().trim().to_string();
+        if token.is_empty() {
+            return Err(ToolError::NotConfigured(
+                "Gitea-family provider token is empty".to_string(),
+            ));
+        }
+        let http = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| ToolError::Http(format!("Failed to build HTTP client: {e}")))?;
+        Ok(Self {
+            http,
+            base_url: base_url.into(),
+            token,
+            identity_name: Some(identity_name.into()),
+            identities: Arc::new(HashMap::new()),
+            owner: owner.into(),
         })
     }
 
@@ -456,6 +502,90 @@ impl GiteaClient {
     /// Resolve `owner` field: use explicit override or fall back to configured default.
     fn resolve_owner<'a>(&'a self, override_owner: Option<&'a str>) -> &'a str {
         override_owner.unwrap_or(&self.owner)
+    }
+
+    // ── Accessors + generic transport for the forge adapter (GITX-02) ──────────
+    //
+    // The Gitea-family `ForgeProvider` adapter (`crate::forge::gitea_family`)
+    // drives the SAME client — base URL, resolved `GITEA_PAT_<NAME>` token, HTTP
+    // pool, and PAT auth scheme — so Gitea/Forgejo/Codeberg all authenticate
+    // exactly the way the concrete `gitea_*` tools do. These accessors keep the
+    // token private (only an opaque `Authorization` header is exposed) while
+    // giving the adapter a single generic request path for the full shared
+    // endpoint surface.
+
+    /// The configured base URL (e.g. `https://gitea.example.com`), no trailing
+    /// `/api/v1`. Used by the adapter for the Cargo publish endpoint, which lives
+    /// under `/api/packages/...` rather than the `/api/v1/...` REST surface.
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// The configured default owner/organisation.
+    pub(crate) fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    /// The shared `reqwest` client (connection pool + timeout).
+    pub(crate) fn http(&self) -> &Client {
+        &self.http
+    }
+
+    /// The `Authorization` header value for the active identity's token. Kept as
+    /// an opaque header string so the token itself never leaves the client.
+    pub(crate) fn authorization(&self) -> String {
+        self.auth_header()
+    }
+
+    /// Build a `/api/v1`-relative endpoint into a full URL.
+    pub(crate) fn api_url(&self, path: &str) -> String {
+        self.api(path)
+    }
+
+    /// Generic JSON request against the Gitea REST API (`/api/v1` surface),
+    /// returning the parsed response body (or [`Value::Null`] for an empty
+    /// success body, e.g. a `204`). Reuses the client's auth header, base URL,
+    /// and HTTP pool so the adapter's dispatch is a thin mapping layer over the
+    /// exact same transport the concrete `gitea_*` tools use.
+    ///
+    /// A `404` maps to [`ToolError::NotFound`]; any other non-2xx maps to
+    /// [`ToolError::Http`] carrying the status + body. A `body` of `None` sends
+    /// no request body (GET/DELETE); `Some(_)` sends it as JSON.
+    pub(crate) async fn request_value(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value, ToolError> {
+        let url = self.api(path);
+        debug!("{method} {url}");
+        let mut rb = self
+            .http
+            .request(method, &url)
+            .header("Authorization", self.auth_header())
+            .header("Accept", "application/json");
+        if let Some(b) = body {
+            rb = rb.header("Content-Type", "application/json").json(b);
+        }
+        let resp = rb
+            .send()
+            .await
+            .map_err(|e| ToolError::Http(format!("Request failed: {e}")))?;
+
+        let status = resp.status();
+        if status == StatusCode::NOT_FOUND {
+            return Err(ToolError::NotFound("Resource not found in Gitea".to_string()));
+        }
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(ToolError::Http(format!("Gitea returned {status}: {body_text}")));
+        }
+        let text = resp.text().await.unwrap_or_default();
+        if text.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_str(&text)
+            .map_err(|e| ToolError::Http(format!("JSON parse error: {e}")))
     }
 }
 
@@ -1340,7 +1470,7 @@ impl RustTool for ListBranches {
 ///
 /// Layout (all lengths little-endian u32):
 ///   `u32(metadata_json.len) || metadata_json || u32(crate_bytes.len) || crate_bytes`
-fn build_cargo_publish_body(metadata_json: &[u8], crate_bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn build_cargo_publish_body(metadata_json: &[u8], crate_bytes: &[u8]) -> Vec<u8> {
     let mut body = Vec::with_capacity(8 + metadata_json.len() + crate_bytes.len());
     body.extend_from_slice(&(metadata_json.len() as u32).to_le_bytes());
     body.extend_from_slice(metadata_json);
@@ -1364,7 +1494,7 @@ fn build_cargo_publish_body(metadata_json: &[u8], crate_bytes: &[u8]) -> Vec<u8>
 /// `name` and `vers` are then force-set from the explicit `name`/`vers`
 /// arguments so the framed metadata can never disagree with the tool's stated
 /// target. (`provided: None` is retained only for helper-level unit tests.)
-fn build_cargo_metadata(name: &str, vers: &str, provided: Option<&Value>) -> Value {
+pub(crate) fn build_cargo_metadata(name: &str, vers: &str, provided: Option<&Value>) -> Value {
     let mut meta = json!({
         "name": name,
         "vers": vers,
@@ -1412,7 +1542,7 @@ const DEFAULT_MAX_CRATE_BYTES: u64 = 64 * 1024 * 1024;
 /// Gitea org/user names are alphanumeric plus `-`, `_`, `.`; we additionally
 /// require a non-empty value that is not `.`/`..` and contains no path
 /// separators.
-fn is_valid_owner_segment(owner: &str) -> bool {
+pub(crate) fn is_valid_owner_segment(owner: &str) -> bool {
     if owner.is_empty() || owner == "." || owner == ".." {
         return false;
     }
