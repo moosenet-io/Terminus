@@ -797,6 +797,131 @@ No new secret env vars — providers resolve credentials exactly as documented
 above (`GITEA_PAT_<NAME>`, `FORGEJO_TOKEN`, `CODEBERG_TOKEN`,
 `GITHUB_PAT_<NAME>`/`GITHUB_TOKEN`).
 
+### GitLab adapter (`gitlab_ce` / `gitlab_saas`, v4) — GITX-04
+
+`forge::gitlab::GitLabAdapter` is ONE `ForgeProvider` implementation over the
+GitLab v4 REST API, parameterized by [`forge::gitlab::GitLabVariant`] to serve
+BOTH provider pool members named in the S106 provider list — not two separate
+clients:
+
+- **`gitlab_ce`** — self-hosted GitLab CE/EE, base URL from `GITLAB_URL`
+  (`{GITLAB_URL}/api/v4`). **git-private** pool (source-of-truth posture).
+- **`gitlab_saas`** — hosted `gitlab.com` (fixed default base). **git-public**
+  pool (the exfiltration surface; GITX-05 makes the PII gate load-bearing on its
+  writes — this adapter only advertises the pool via `is_public_pool()`).
+
+Build either with `GitLabAdapter::from_env_ce()` / `GitLabAdapter::from_env_saas()`
+(or `GitLabAdapter::from_env(variant)` directly); both share identical HTTP
+logic, pagination, credential resolution, and capability map — only
+id/display-name/pool/default-base differ.
+
+- **Terminology mapping to the shared surface.** GitLab has no "pull request" —
+  its **Merge Request (MR) is the shared surface's PR**; every `PullRequests*`
+  endpoint dispatches to GitLab's `merge_requests` API, and request params use
+  the shared `number` key even though GitLab's own API calls this an `iid`
+  (project-scoped, distinct from the global numeric `id`). GitLab's **project is
+  the shared surface's repo**; a project is addressed by GitLab's `:id` path
+  segment, which this adapter always builds as a URL-encoded
+  `namespace/project` path (`{owner}%2F{repo}`, via `GitLabAdapter::project_ref`)
+  rather than requiring a numeric-ID lookup. Further shared-surface adaptations,
+  so a caller need not special-case GitLab: MR/issue list `state` maps
+  `open`→`opened`; `pull_requests_review` maps `event` `APPROVE`→approve and
+  `REQUEST_CHANGES`/`DISMISS`→unapprove (any other event is a clean
+  `InvalidRequest`, never a fabricated approval); `labels` accept an array or a
+  comma-string; **assignees** accept either GitLab-native `assignee_ids`
+  (numeric, verbatim) or GitHub-style `assignees` usernames (resolved via
+  `GET /users?username=`); `org_permissions` accepts either `user_id` or a
+  `username` (resolved likewise); `repos_create` resolves `owner`→`namespace_id`
+  (so the project lands in the intended group, not the caller's personal
+  namespace) and maps `auto_init`→`initialize_with_readme`; `repos_list` tries
+  the group projects path and falls back to the user projects path; webhook
+  bodies accept GitHub's nested `config.url`+`events[]` shape and are translated
+  to GitLab's flat `url`+per-event-boolean form (a GitLab-native flat body
+  passes through verbatim; GitHub's `active` is deliberately NOT mapped — GitLab
+  has no equivalent, and mapping it onto `enable_ssl_verification` would be a TLS
+  security regression); MR/issue `updates` bodies remap `body`→`description` and
+  `state`→`state_event` so a GitHub-shaped update is not silently ignored;
+  `content_write_file` infers POST (create) vs PUT (update) from the
+  absence/presence of `sha`/`last_commit_id` (an explicit `create` bool
+  overrides).
+- **Capability map — honest gaps AND an honest advantage over GitHub.** Left
+  `unsupported`: `refs_list`/`refs_get`/`refs_create`/`refs_delete` (GitLab v4 has
+  no generic ref-namespace API like GitHub's `git/refs` — only the concrete
+  `branches` and `tags` namespaces, both covered by their own endpoints) and
+  `org_teams` (GitLab has no GitHub-style "team" resource; its subgroup concept
+  is structurally different enough that claiming this endpoint would misrepresent
+  the API). Marked `supported` where GitHub's adapter honestly could not:
+  `repos_mirror_config` (GitLab project `import_url`/`mirror` settings are a real
+  REST-settable pull-mirror config) and `packages_publish` (GitLab's generic
+  packages registry is a direct REST `PUT` upload, not a separate wire protocol).
+- **Per-identity credentials.** Tokens resolve, in order: a request's `identity`
+  → `GITLAB_PAT_<NAME>`; else the active-default identity (`GITLAB_IDENTITY_NAME`,
+  default `moose`) → its `GITLAB_PAT_<NAME>`; else the unsuffixed `GITLAB_TOKEN`
+  fallback. The `GITLAB_PAT_<NAME>` identity namespace is shared across both
+  variants — deployments needing distinct CE/SaaS credentials for the same name
+  should provision distinct identities. Mirrors the Gitea (S105) / GitHub
+  (GITX-03) model: every resolved token is `.trim()`-ed and never logged (the
+  `Debug` impl redacts it). `startup` materializes `GITLAB_PAT_*` (and the fixed
+  `GITLAB_URL`/`GITLAB_TOKEN` keys) from the secret store via
+  `secrets_bootstrap::PAT_KEY_PREFIXES`.
+- **Public-pool marker.** `GitLabAdapter::is_public_pool()` returns `true` for
+  `gitlab_saas`, `false` for `gitlab_ce` — GITX-05's tool assembly applies the
+  exfiltration-surface posture only to the former.
+- **Egress isolation.** Every outbound call passes `GitLabAdapter::host_allowed`
+  first: the configured API base authority (default ports normalized), plus (for
+  `gitlab_saas` only) the `gitlab.com` family, extendable via
+  `GITLAB_EGRESS_ALLOWLIST`. A self-hosted `gitlab_ce` adapter does NOT
+  implicitly trust `gitlab.com`, and construction **fails closed** if a CE
+  adapter has no `GITLAB_URL`/`GITLAB_API_BASE` (never silently defaulting a
+  self-hosted credential to the public API). Redirects are **same-origin only**
+  (the `PRIVATE-TOKEN` credential is a custom header `reqwest` does not strip
+  cross-origin, so even an allowlisted different host is refused), bounded to
+  `MAX_REDIRECT_HOPS`, and never followed across an `https`→`http` downgrade.
+- **Pagination + binary-safe raw fetch.** List endpoints follow GitLab's
+  `Link: rel="next"` header (the same RFC 5988 shape GitHub emits), bounded by a
+  `MAX_PAGES` runaway guard. Each server-supplied `next` URL is pinned to the
+  INITIAL request's origin (a hostile forge cannot redirect pagination — and the
+  `PRIVATE-TOKEN` — to a different allowlisted host), and hitting `MAX_PAGES`
+  with a further page still pending is a hard error rather than a silently
+  truncated success. `content_raw_fetch` returns UTF-8 content as
+  `{ path, encoding: "utf-8", raw }` and non-UTF-8 (binary) content losslessly as
+  `{ path, encoding: "base64", raw_base64 }`.
+- **Error mapping.** `401`/`403` → `ForgeError::Auth`; other non-2xx →
+  `ForgeError::Transport`; an unsupported endpoint is rejected by `dispatch`
+  before any transport.
+- **Config.** `GITLAB_URL` (CE instance base), `GITLAB_API_BASE` (direct
+  override for either variant, test), `GITLAB_GROUP` (default namespace,
+  `moosenet`), `GITLAB_IDENTITY_NAME` (default identity), `GITLAB_EGRESS_ALLOWLIST`
+  (extra hosts). None are required — capability introspection needs no credential.
+
+### Optional/experimental provider stubs (`forge::stubs`, GITX-06)
+
+Five providers named in the S106 provider list are **stubs**, not full
+adapters: structure + an honest, provider-specific `CapabilityMap` so the
+git-private/git-public tools KNOW these providers exist and can report their
+real (often reduced) surfaces via capability introspection — never a
+fabricated call or a claimed capability the provider doesn't have. No stub
+overrides `execute_endpoint`, so every dispatched endpoint honestly falls
+through to `ForgeError::NotImplemented` (declared-but-unwired) or
+`ForgeError::Unsupported` (not declared at all) — the same two clean negative
+paths every other adapter uses.
+
+| Provider id | Pool | Credential | Capability posture |
+|---|---|---|---|
+| `bitbucket` | git-public | `BITBUCKET_TOKEN` | Broad REST 2.0 surface, but no GitHub-style Releases object, no generic package registry, no repo mirror-config endpoint (Data Center-only), and no webhook test-delivery call — all `unsupported`; PR approve/request-changes exists but isn't a full per-line review workflow, so `pull_requests_review` is `experimental`. |
+| `sourcehut` | git-public | `SOURCEHUT_TOKEN` | **Reduced by design**: sr.ht is a patch-email workflow — no web pull-request surface, no package registry, and no org/group-membership listing (`pull_requests_*`/`packages_*`/`org_members` `unsupported`); refs/tags are mutated only via `git push`, so their `*_create`/`*_delete` are `unsupported` too (list/get stay `supported`); its per-service webhook model is advertised `experimental`. |
+| `gogs` | git-private | `GOGS_TOKEN` | Minimal Gitea-lineage fork — no branch-protection API, no package registry, no webhook test-delivery endpoint, and no pull requests API (`unsupported`). |
+| `onedev` | git-private | `ONEDEV_TOKEN` | Modern self-hosted forge, near-full vocabulary `supported`; generic package publish (Maven/npm/Docker differ per-protocol) is `experimental`. |
+| `radicle` | git-public-ish/experimental | `RADICLE_TOKEN` | **Peer-to-peer, experimental.** Writes happen over the `rad`/git protocol, not REST, and there's no central org/membership concept. Only the read-only `radicle-httpd` surface (repos/branches/refs/commits, read-only patches/issues, content read) is advertised `experimental`; everything else — all writes, releases, webhooks, packages, org — is `unsupported`. |
+
+Construct with `StubForge::bitbucket_from_env()` / `sourcehut_from_env()` /
+`gogs_from_env()` / `onedev_from_env()` / `radicle_from_env()` — each checks
+that its one credential key is present in the runtime secret store (never
+reads the value itself; a stub has no wired transport yet) and fails with a
+clean `ToolError::NotConfigured` if it's missing or blank. None of these
+tokens are added to `secrets_bootstrap::PAT_KEY_PREFIXES` — that multi-identity
+scan is reserved for providers that actually need it.
+
 ## License
 
 MIT

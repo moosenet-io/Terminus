@@ -10,12 +10,20 @@
 //!
 //! ## Extensibility contract
 //! [`ForgeRegistry::from_env`] tries to construct every KNOWN provider adapter
-//! and inserts whichever succeed. A provider adapter that does not exist yet in
-//! this build (e.g. `gitlab_ce`/`gitlab_saas` before GITX-04 lands, or the
-//! GITX-06 stubs) simply has no construction attempt here yet — its absence is
-//! not a build or runtime failure for the providers that DO exist. Landing a
-//! new adapter is: implement [`crate::forge::ForgeProvider`] for it, add one
-//! `try_insert` call in the appropriate pool section below, done.
+//! and inserts whichever succeed. As of GITX-05's provider integration the
+//! wired pools are:
+//! - **private:** `gitea`, `forgejo` (gitea-family), `gitlab_ce` (GitLab CE),
+//!   `gogs`, `onedev` (stubs).
+//! - **public:** `github`, `codeberg` (gitea-family public), `gitlab_saas`
+//!   (GitLab SaaS), `bitbucket`, `sourcehut`, `radicle` (stubs).
+//!
+//! Activation is purely config-driven: a provider whose credential/URL is not
+//! present in the runtime secret store's materialized env is a clean skip
+//! (logged at `debug`), never a build or runtime failure for the providers that
+//! ARE configured. Landing a further adapter is: implement
+//! [`crate::forge::ForgeProvider`] for it, add one `match … from_env()` insert
+//! in the appropriate pool section below, done — no change to the
+//! dispatch/posture code in `git_private.rs` / `git_public.rs`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,7 +31,9 @@ use std::sync::Arc;
 use crate::error::ToolError;
 
 use super::gitea_family::GiteaForge;
+use super::gitlab::GitLabAdapter;
 use super::provider::ForgeProvider;
+use super::stubs::StubForge;
 use crate::github::adapter::GitHubAdapter;
 
 /// Which pool a provider belongs to. Mirrors the spec's "two pools, two
@@ -104,10 +114,20 @@ impl ForgeRegistry {
             Ok(forgejo) => reg.insert(ForgePool::Private, Arc::new(forgejo)),
             Err(e) => tracing::debug!(target: "forge.registry", provider = "forgejo", error = %e, "provider not configured, skipping"),
         }
-        // GITX-04 (gitlab_ce): once the GitLab adapter lands, add
-        //   reg.insert(ForgePool::Private, Arc::new(GitLabForge::ce_from_env()?));
-        // here. Not present in this build — deliberately not attempted.
-        // GITX-06 (gogs, onedev): same pattern once their stubs land.
+        // GITX-04 (gitlab_ce): self-hosted GitLab CE/EE, git-private pool.
+        match GitLabAdapter::from_env_ce() {
+            Ok(gitlab_ce) => reg.insert(ForgePool::Private, Arc::new(gitlab_ce)),
+            Err(e) => tracing::debug!(target: "forge.registry", provider = "gitlab_ce", error = %e, "provider not configured, skipping"),
+        }
+        // GITX-06 (gogs, onedev): optional/experimental stubs, git-private pool.
+        match StubForge::gogs_from_env() {
+            Ok(gogs) => reg.insert(ForgePool::Private, Arc::new(gogs)),
+            Err(e) => tracing::debug!(target: "forge.registry", provider = "gogs", error = %e, "provider not configured, skipping"),
+        }
+        match StubForge::onedev_from_env() {
+            Ok(onedev) => reg.insert(ForgePool::Private, Arc::new(onedev)),
+            Err(e) => tracing::debug!(target: "forge.registry", provider = "onedev", error = %e, "provider not configured, skipping"),
+        }
 
         // ── git-public pool: hosted/mirror forges (exfiltration surface) ───
         match GiteaForge::codeberg_from_env() {
@@ -118,10 +138,26 @@ impl ForgeRegistry {
             Ok(github) => reg.insert(ForgePool::Public, Arc::new(github)),
             Err(e) => tracing::debug!(target: "forge.registry", provider = "github", error = %e, "provider not configured, skipping"),
         }
-        // GITX-04 (gitlab_saas): reg.insert(ForgePool::Public, Arc::new(GitLabForge::saas_from_env()?));
-        // GITX-06 (bitbucket, sourcehut, radicle): same pattern once their
-        // stubs land — each is a single `try_insert` call, no change to the
+        // GITX-04 (gitlab_saas): hosted gitlab.com, git-public pool.
+        match GitLabAdapter::from_env_saas() {
+            Ok(gitlab_saas) => reg.insert(ForgePool::Public, Arc::new(gitlab_saas)),
+            Err(e) => tracing::debug!(target: "forge.registry", provider = "gitlab_saas", error = %e, "provider not configured, skipping"),
+        }
+        // GITX-06 (bitbucket, sourcehut, radicle): optional/experimental stubs,
+        // git-public pool. Each is a single insert, no change to the
         // dispatch/posture code in git_private.rs / git_public.rs.
+        match StubForge::bitbucket_from_env() {
+            Ok(bitbucket) => reg.insert(ForgePool::Public, Arc::new(bitbucket)),
+            Err(e) => tracing::debug!(target: "forge.registry", provider = "bitbucket", error = %e, "provider not configured, skipping"),
+        }
+        match StubForge::sourcehut_from_env() {
+            Ok(sourcehut) => reg.insert(ForgePool::Public, Arc::new(sourcehut)),
+            Err(e) => tracing::debug!(target: "forge.registry", provider = "sourcehut", error = %e, "provider not configured, skipping"),
+        }
+        match StubForge::radicle_from_env() {
+            Ok(radicle) => reg.insert(ForgePool::Public, Arc::new(radicle)),
+            Err(e) => tracing::debug!(target: "forge.registry", provider = "radicle", error = %e, "provider not configured, skipping"),
+        }
 
         reg
     }
@@ -296,5 +332,63 @@ mod tests {
         // assert emptiness since the test may run alongside other env-mutating
         // tests in the same process; the point is `from_env` never panics/errors.
         let _ = ForgeRegistry::from_env();
+    }
+
+    /// GITX-05 provider integration: every configured provider must activate
+    /// into the CORRECT pool (private vs public). Uses the config-driven
+    /// activation path (`from_env`) with the newly-merged GITX-04 (gitlab) and
+    /// GITX-06 (stub) providers configured, and asserts the pool split matches
+    /// the S106 provider list. Serialized because it mutates process env.
+    #[test]
+    #[serial_test::serial]
+    fn configured_providers_activate_into_the_correct_pool() {
+        use std::env;
+
+        // Providers this test configures, with the vars that activate them.
+        // gitlab_saas needs no var (fixed public base); gitlab_ce needs
+        // GITLAB_URL; each stub needs its one token.
+        let vars = [
+            ("GITLAB_URL", "https://gitlab.example.invalid"),
+            ("GOGS_TOKEN", "tok"),
+            ("ONEDEV_TOKEN", "tok"),
+            ("BITBUCKET_TOKEN", "tok"),
+            ("SOURCEHUT_TOKEN", "tok"),
+            ("RADICLE_TOKEN", "tok"),
+        ];
+
+        struct Cleanup<'a>(&'a [(&'a str, &'a str)]);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                for (k, _) in self.0 {
+                    env::remove_var(k);
+                }
+            }
+        }
+        let _cleanup = Cleanup(&vars);
+        for (k, v) in &vars {
+            env::set_var(k, v);
+        }
+
+        let reg = ForgeRegistry::from_env();
+        let private = reg.providers(ForgePool::Private);
+        let public = reg.providers(ForgePool::Public);
+
+        // Each configured provider lands in its expected pool …
+        for id in ["gitlab_ce", "gogs", "onedev"] {
+            assert!(private.contains(&id.to_string()), "{id} missing from private pool: {private:?}");
+            assert!(reg.get(ForgePool::Private, id).is_some());
+        }
+        for id in ["gitlab_saas", "bitbucket", "sourcehut", "radicle"] {
+            assert!(public.contains(&id.to_string()), "{id} missing from public pool: {public:?}");
+            assert!(reg.get(ForgePool::Public, id).is_some());
+        }
+        // … and never leaks into the opposite pool (pool isolation holds for
+        // the config-driven wiring, not just manual inserts).
+        for id in ["gitlab_ce", "gogs", "onedev"] {
+            assert!(reg.get(ForgePool::Public, id).is_none(), "{id} leaked into public pool");
+        }
+        for id in ["gitlab_saas", "bitbucket", "sourcehut", "radicle"] {
+            assert!(reg.get(ForgePool::Private, id).is_none(), "{id} leaked into private pool");
+        }
     }
 }
