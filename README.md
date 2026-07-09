@@ -1248,6 +1248,58 @@ mTLS-only transport for everything else is TCLI-03's job.
 the issued cert's serial — never the shared secret, the private key, or the
 JWT.
 
+## mTLS transport (`crate::pki::mtls`) — TCLI-03
+
+Given the TCLI-01 embedded CA and TCLI-02 client-cert enrollment, `src/pki/mtls.rs`
+adds a **second, additive listener** that speaks mutually-authenticated TLS. It is a
+strictly separate listener from the plain HTTP+JWT `/mcp`/`/enroll` one — **the existing
+plain listener's bind/router/serve is unchanged**, and if the mTLS listener fails to
+bootstrap (CA/server-cert/TLS-config error) that failure is logged and the plain listener
+keeps serving normally. The mTLS listener serves a *clone of the same* `axum::Router`, so
+tool-dispatch allowlist/audit code is reused, never forked into an mTLS-only path.
+
+**Listener config (non-secret knobs only; PKI material comes from the CA, not env):**
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `TERMINUS_MTLS_BIND` | `127.0.0.1` | mTLS listener bind address |
+| `TERMINUS_MTLS_PORT` | `8301` | mTLS listener port — deliberately never `TERMINUS_PERSONAL_PORT`'s `8300` |
+| `TERMINUS_MTLS_SERVER_IDENTITY` | `terminus-primary` | CN/SAN on the primary's own server cert (operator label only; not client authz input) |
+| `TERMINUS_MTLS_SERVER_CERT_TTL_DAYS` | `365` | Validity window for the primary's server cert (longer-lived than a client leaf; the server key never leaves the host) |
+
+**How a client authenticates:**
+
+1. Enroll once via the TCLI-02 `/enroll` endpoint (shared-secret gated) to obtain a
+   short-lived client cert + key chained to the TCLI-01 CA. As of TCLI-03 the issued leaf
+   carries the `clientAuth` extended key usage + a `DigitalSignature` key usage.
+2. Dial `TERMINUS_MTLS_PORT` presenting that client cert. The handshake requires it: the
+   server presents its own CA-signed leaf and its `WebPkiClientVerifier` validates the
+   client cert chains to the same CA (and is within its validity window) during the
+   handshake itself.
+3. On success the server extracts the identity from the client cert's Subject CN — the
+   same value embedded at enrollment — and attaches it to each request's extensions as a
+   `ClientIdentity`, consumed by existing authz/audit exactly as a JWT `sub` would be.
+
+**Fail-closed validation, two independent layers.** (1) `rustls`'s `WebPkiClientVerifier`
+rejects a missing cert, a cert not chaining to the CA, or one outside its validity window
+during the handshake — such a connection never reaches application code. (2) A second,
+independently-tested post-handshake check re-verifies the validity window and additionally
+enforces the `clientAuth` EKU (which `WebPkiClientVerifier` does not check by default),
+rejecting the connection before any request is dispatched. Rejections log only a sanitized
+"identity unknown/rejected" line plus the peer address — never raw certificate or key
+material (S6).
+
+**Known limitations (P2):**
+
+- **No CA rotation.** Single embedded CA with no rotation plan; a compromise/rotation is an
+  out-of-scope follow-up item, not silently unhandled.
+- **A connection outliving its client cert's TTL is not force-closed mid-connection.** The
+  chain/validity check is at CONNECT time; a long-held connection whose short-lived cert
+  expires in-flight finishes its current requests rather than being severed — consistent
+  with HTTP keep-alive not re-validating per request, and low-risk given the short-lived,
+  connect-per-tool-call usage pattern. Flagged for the reviewer; a future item could add
+  periodic re-handshake if usage changes.
+
 ## License
 
 MIT
