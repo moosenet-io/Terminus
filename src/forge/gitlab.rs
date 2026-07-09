@@ -175,11 +175,16 @@ impl GitLabAdapter {
     ///
     /// Never fails on missing credentials: capability introspection needs none,
     /// and each write resolves its token lazily (returning a clean
-    /// [`ForgeError::Auth`] if unconfigured).
+    /// [`ForgeError::Auth`] if unconfigured). It DOES fail on a missing base URL
+    /// for [`GitLabVariant::Ce`] — see below.
     ///
-    /// Config (all optional):
+    /// Config:
     /// - `GITLAB_URL` — the CE instance base (e.g. `https://gitlab.example.com`);
-    ///   the adapter appends `/api/v4`. Only consulted for [`GitLabVariant::Ce`].
+    ///   the adapter appends `/api/v4`. **Required** for [`GitLabVariant::Ce`]
+    ///   (unless `GITLAB_API_BASE` is set): a self-hosted adapter must never
+    ///   silently default to the public `gitlab.com` API, which would send a
+    ///   CE-scoped credential to the wrong host. Returns
+    ///   [`ForgeError::InvalidRequest`] if neither is configured.
     /// - `GITLAB_API_BASE` — direct API-base override for either variant (test
     ///   points at httpmock; takes priority over `GITLAB_URL`).
     /// - `GITLAB_GROUP` — default namespace/group (defaults to `moosenet`).
@@ -187,17 +192,28 @@ impl GitLabAdapter {
     /// - `GITLAB_EGRESS_ALLOWLIST` — extra comma-separated allowlisted hosts.
     pub fn from_env(variant: GitLabVariant) -> Result<Self, ForgeError> {
         let provider = variant.provider_id();
-        let api_base = std::env::var("GITLAB_API_BASE")
+        let explicit_base = std::env::var("GITLAB_API_BASE")
             .ok()
             .map(|s| s.trim().trim_end_matches('/').to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| match variant {
+            .filter(|s| !s.is_empty());
+        let api_base = match explicit_base {
+            Some(b) => b,
+            None => match variant {
                 GitLabVariant::Saas => GITLAB_SAAS_API.to_string(),
+                // Fail CLOSED, never silently default a self-hosted CE adapter
+                // to the public gitlab.com API: that would send a CE-scoped
+                // credential to the wrong (public) host. `GITLAB_URL` is
+                // mandatory for the CE variant.
                 GitLabVariant::Ce => std::env::var("GITLAB_URL")
                     .ok()
-                    .map(|s| format!("{}/api/v4", s.trim().trim_end_matches('/')))
-                    .unwrap_or_else(|| GITLAB_SAAS_API.to_string()),
-            });
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| format!("{}/api/v4", s.trim_end_matches('/')))
+                    .ok_or_else(|| ForgeError::InvalidRequest(
+                        "gitlab_ce requires GITLAB_URL (or GITLAB_API_BASE) to be configured; refusing to default a self-hosted adapter to the public gitlab.com API".into()
+                    ))?,
+            },
+        };
         let default_group = std::env::var("GITLAB_GROUP")
             .ok()
             .map(|s| s.trim().to_string())
@@ -216,26 +232,7 @@ impl GitLabAdapter {
 
         let allowlist = Arc::new(build_allowlist(&api_base, variant));
 
-        // Egress isolation must survive redirects (see GitHub adapter for the
-        // same rationale): re-validate every redirect hop against the SAME
-        // allowlist, fail-closed on any non-allowlisted target.
-        let redirect_allow = allowlist.clone();
-        let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
-            let url = attempt.url();
-            let authority = match url.host_str() {
-                Some(h) => match url.port() {
-                    Some(port) => format!("{h}:{port}"),
-                    None => h.to_string(),
-                },
-                None => return attempt.stop(),
-            };
-            let authority = authority.to_lowercase();
-            if redirect_allow.iter().any(|a| a == &authority) {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        });
+        let redirect_policy = build_redirect_policy(allowlist.clone());
 
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
@@ -559,6 +556,32 @@ impl GitLabAdapter {
     fn base(&self) -> &str {
         self.api_base.trim_end_matches('/')
     }
+
+    /// Resolve a group/org path (the shared surface's `owner`) to GitLab's
+    /// numeric namespace id, required by `POST /projects` (`ReposCreate`) —
+    /// without it, GitLab creates the project in the caller's PERSONAL
+    /// namespace rather than the intended group, silently misplacing it.
+    /// Queries `GET /namespaces?search=<owner>` and requires an EXACT
+    /// case-insensitive match on `full_path` (falling back to `path`), so an
+    /// ambiguous/partial search match is never picked implicitly.
+    async fn resolve_namespace_id(&self, token: &str, owner: &str) -> Result<i64, ForgeError> {
+        let url = format!("{}/namespaces?search={}&per_page=100", self.base(), pct(owner, false));
+        let body = self.call(token, reqwest::Method::GET, &url, None).await?;
+        let items = body.as_array().cloned().unwrap_or_default();
+        let owner_lc = owner.to_lowercase();
+        let hit = items.iter().find(|ns| {
+            let full_path = ns.get("full_path").and_then(Value::as_str).unwrap_or("");
+            let path = ns.get("path").and_then(Value::as_str).unwrap_or("");
+            full_path.eq_ignore_ascii_case(&owner_lc) || path.eq_ignore_ascii_case(&owner_lc)
+        });
+        match hit.and_then(|ns| ns.get("id")).and_then(Value::as_i64) {
+            Some(id) => Ok(id),
+            None => Err(ForgeError::InvalidRequest(format!(
+                "no GitLab namespace found matching owner/group '{owner}' \
+                 (pass an explicit 'namespace_id' to bypass this lookup)"
+            ))),
+        }
+    }
 }
 
 /// Build the egress allowlist: the API base host, plus (for `gitlab_saas`) the
@@ -582,6 +605,80 @@ fn build_allowlist(api_base: &str, variant: GitLabVariant) -> Vec<String> {
     hosts.sort();
     hosts.dedup();
     hosts
+}
+
+/// Maximum redirect hops followed for a single request. Bounds an allowlisted
+/// redirect loop (each hop still re-validated) to a small, finite chain rather
+/// than running until the client's overall request timeout.
+const MAX_REDIRECT_HOPS: usize = 5;
+
+/// Build the egress-aware redirect policy shared by [`GitLabAdapter::from_env`]
+/// and the test adapter constructor. Every hop is re-validated against the SAME
+/// allowlist (fail-closed on any non-allowlisted target — egress isolation must
+/// survive redirects, matching the GitHub adapter's posture), PLUS two
+/// additions this adapter tightens over a bare authority check:
+/// - **Bounded hop count** — [`MAX_REDIRECT_HOPS`] caps a redirect chain so an
+///   allowlisted redirect loop cannot run until the client timeout.
+/// - **No scheme downgrade** — a chain that started `https` may never follow a
+///   `http` hop, even to an allowlisted host: silently dropping to plaintext
+///   would leak the `PRIVATE-TOKEN` credential header over an unencrypted
+///   connection.
+fn build_redirect_policy(allowlist: Arc<Vec<String>>) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= MAX_REDIRECT_HOPS {
+            return attempt.stop();
+        }
+        let url = attempt.url();
+        if let Some(first) = attempt.previous().first() {
+            if first.scheme() == "https" && url.scheme() != "https" {
+                return attempt.stop();
+            }
+        }
+        let authority = match url.host_str() {
+            Some(h) => match url.port() {
+                Some(port) => format!("{h}:{port}"),
+                None => h.to_string(),
+            },
+            None => return attempt.stop(),
+        };
+        let authority = authority.to_lowercase();
+        if allowlist.iter().any(|a| a == &authority) {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+/// Map the shared surface's GitHub-style `state` values (`open`/`closed`, the
+/// vocabulary GitHub's adapter and most shared-surface callers use) onto
+/// GitLab's own state values (`opened`/`closed`) for MR and issue listing.
+/// Anything already spelled GitLab's way (`opened`, `merged`, `all`, …) — or
+/// any value this adapter doesn't recognize — passes through unchanged, so a
+/// caller using GitLab-native state names is never silently rejected.
+fn map_state(state: Option<&str>) -> &str {
+    match state {
+        Some("open") => "opened",
+        Some(other) => other,
+        None => "opened",
+    }
+}
+
+/// Normalize a `labels` param into the comma-separated string GitLab's REST v4
+/// API expects (an empty string clears all labels). Accepts either the shared
+/// surface's JSON array of strings (`["a", "b"]`, e.g. as produced by the
+/// GitHub adapter's `labels` param) or an already-comma-separated string,
+/// passed through as-is.
+fn labels_string(v: &Value) -> String {
+    match v {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(","),
+        Value::String(s) => s.clone(),
+        _ => String::new(),
+    }
 }
 
 /// Percent-encode a string for safe interpolation into a URL. Unreserved
@@ -725,15 +822,26 @@ impl ForgeProvider for GitLabAdapter {
             ReposCreate => {
                 let owner = self.owner(p);
                 let name = Self::req_str(p, "name")?;
-                let body = json!({
+                // GitLab's POST /projects places a NEW project in the
+                // authenticated user's personal namespace unless `namespace_id`
+                // is given — passing `owner`/the default group through
+                // unresolved would silently create in the wrong namespace. An
+                // explicit `namespace_id` is used verbatim; otherwise resolve
+                // `owner` (the shared surface's group/org) to its numeric id.
+                let namespace_id = match p.get("namespace_id").and_then(Value::as_i64) {
+                    Some(id) => Some(id),
+                    None => Some(self.resolve_namespace_id(&token, &owner).await?),
+                };
+                let mut body = json!({
                     "name": name,
-                    "namespace_id": p.get("namespace_id"),
                     "description": p.get("description").and_then(Value::as_str).unwrap_or(""),
                     "visibility": p.get("visibility").and_then(Value::as_str)
                         .unwrap_or(if p.get("private").and_then(Value::as_bool).unwrap_or(false) { "private" } else { "public" }),
                     "path": p.get("path").and_then(Value::as_str).unwrap_or(&name),
                 });
-                let _ = &owner; // namespace resolved via namespace_id/path when provided; group listing above uses owner for reads
+                if let Some(id) = namespace_id {
+                    body["namespace_id"] = json!(id);
+                }
                 let url = format!("{api}/projects");
                 ok(self.call(&token, Method::POST, &url, Some(&body)).await?)
             }
@@ -864,7 +972,7 @@ impl ForgeProvider for GitLabAdapter {
             // ── Pull / merge requests ────────────────────────────────────────────
             PullRequestsList => {
                 let pid = self.project_ref(p)?;
-                let state = pct(p.get("state").and_then(Value::as_str).unwrap_or("opened"), false);
+                let state = pct(map_state(p.get("state").and_then(Value::as_str)), false);
                 let url = format!("{api}/projects/{pid}/merge_requests?state={state}&per_page=100");
                 ok(self.call_paginated(&token, &url).await?)
             }
@@ -894,16 +1002,34 @@ impl ForgeProvider for GitLabAdapter {
             }
             PullRequestsReview => {
                 // GitLab has no GitHub-shaped "review" object; the closest REST
-                // equivalent is the approvals endpoint. `event` values other than
-                // an implicit approve (e.g. GitHub's REQUEST_CHANGES) have no
-                // GitLab equivalent and fall back to a plain approve.
+                // equivalents are the approve/unapprove endpoints. Map ONLY the
+                // event values that have a real, unambiguous GitLab counterpart
+                // — silently treating every event as an approval would perform
+                // the OPPOSITE of a caller's intent for e.g. REQUEST_CHANGES.
+                // `APPROVE` (or an omitted `event`, matching GitHub's default)
+                // -> approve; `REQUEST_CHANGES`/`DISMISS` -> unapprove (the
+                // closest "withdraw approval" honest mapping); anything else
+                // (e.g. `COMMENT`, which has no dedicated GitLab review action —
+                // use `pull_requests_comment` instead) is a clean rejection
+                // rather than a fabricated approval.
                 let pid = self.project_ref(p)?;
                 let iid = Self::req_num(p, "number")?;
+                let event = p.get("event").and_then(Value::as_str).unwrap_or("APPROVE").to_uppercase();
+                let action = match event.as_str() {
+                    "APPROVE" => "approve",
+                    "REQUEST_CHANGES" | "DISMISS" => "unapprove",
+                    other => {
+                        return Err(ForgeError::InvalidRequest(format!(
+                            "GitLab pull_requests_review has no equivalent for event '{other}'; \
+                             supported: APPROVE, REQUEST_CHANGES, DISMISS (use pull_requests_comment for a plain comment)"
+                        )));
+                    }
+                };
                 let mut body = json!({});
                 if let Some(sha) = p.get("sha").and_then(Value::as_str) {
                     body["sha"] = json!(sha);
                 }
-                let url = format!("{api}/projects/{pid}/merge_requests/{iid}/approve");
+                let url = format!("{api}/projects/{pid}/merge_requests/{iid}/{action}");
                 ok(self.call(&token, Method::POST, &url, Some(&body)).await?)
             }
             PullRequestsComment => {
@@ -937,7 +1063,7 @@ impl ForgeProvider for GitLabAdapter {
             // ── Issues ──────────────────────────────────────────────────────────
             IssuesList => {
                 let pid = self.project_ref(p)?;
-                let state = pct(p.get("state").and_then(Value::as_str).unwrap_or("opened"), false);
+                let state = pct(map_state(p.get("state").and_then(Value::as_str)), false);
                 let url = format!("{api}/projects/{pid}/issues?state={state}&per_page=100");
                 ok(self.call_paginated(&token, &url).await?)
             }
@@ -951,7 +1077,7 @@ impl ForgeProvider for GitLabAdapter {
                 let pid = self.project_ref(p)?;
                 let mut body = json!({ "title": Self::req_str(p, "title")? });
                 if let Some(b) = p.get("body").and_then(Value::as_str) { body["description"] = json!(b); }
-                if let Some(l) = p.get("labels") { body["labels"] = l.clone(); }
+                if let Some(l) = p.get("labels") { body["labels"] = json!(labels_string(l)); }
                 if let Some(a) = p.get("assignee_ids") { body["assignee_ids"] = a.clone(); }
                 let url = format!("{api}/projects/{pid}/issues");
                 ok(self.call(&token, Method::POST, &url, Some(&body)).await?)
@@ -973,7 +1099,11 @@ impl ForgeProvider for GitLabAdapter {
             IssuesLabel => {
                 let pid = self.project_ref(p)?;
                 let iid = Self::req_num(p, "number")?;
-                let body = json!({ "labels": p.get("labels").cloned().unwrap_or_else(|| json!([])) });
+                // An absent/empty `labels` clears all labels — GitLab's own
+                // "empty string" semantics, which `labels_string` naturally
+                // produces for an empty or missing array.
+                let labels = p.get("labels").map(labels_string).unwrap_or_default();
+                let body = json!({ "labels": labels });
                 let url = format!("{api}/projects/{pid}/issues/{iid}");
                 ok(self.call(&token, Method::PUT, &url, Some(&body)).await?)
             }
@@ -1272,22 +1402,7 @@ mod tests {
         let mut identities = HashMap::new();
         identities.insert("moose".to_string(), "testtoken".to_string());
         let allowlist = Arc::new(build_allowlist(base, variant));
-        let redirect_allow = allowlist.clone();
-        let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
-            let url = attempt.url();
-            let authority = match url.host_str() {
-                Some(h) => match url.port() {
-                    Some(port) => format!("{h}:{port}"),
-                    None => h.to_string(),
-                },
-                None => return attempt.stop(),
-            };
-            if redirect_allow.iter().any(|a| a == &authority.to_lowercase()) {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        });
+        let redirect_policy = build_redirect_policy(allowlist.clone());
         GitLabAdapter {
             http: reqwest::Client::builder().redirect(redirect_policy).build().unwrap(),
             variant,
@@ -1333,6 +1448,22 @@ mod tests {
         std::env::remove_var("GITLAB_URL");
         let saas = GitLabAdapter::from_env_saas().unwrap();
         assert_eq!(saas.api_base, GITLAB_SAAS_API);
+        match url { Some(v) => std::env::set_var("GITLAB_URL", v), None => std::env::remove_var("GITLAB_URL") }
+        match api { Some(v) => std::env::set_var("GITLAB_API_BASE", v), None => std::env::remove_var("GITLAB_API_BASE") }
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_ce_fails_closed_without_base_url() {
+        // A self-hosted CE adapter must NEVER silently default to the public
+        // gitlab.com API — that would send a CE-scoped credential to the wrong
+        // host. Missing both GITLAB_URL and GITLAB_API_BASE is a hard error.
+        let url = std::env::var("GITLAB_URL").ok();
+        let api = std::env::var("GITLAB_API_BASE").ok();
+        std::env::remove_var("GITLAB_URL");
+        std::env::remove_var("GITLAB_API_BASE");
+        let err = GitLabAdapter::from_env_ce().expect_err("CE without a base URL must fail closed");
+        assert!(matches!(err, ForgeError::InvalidRequest(_)), "got {err:?}");
         match url { Some(v) => std::env::set_var("GITLAB_URL", v), None => std::env::remove_var("GITLAB_URL") }
         match api { Some(v) => std::env::set_var("GITLAB_API_BASE", v), None => std::env::remove_var("GITLAB_API_BASE") }
     }
@@ -1596,6 +1727,202 @@ mod tests {
             .await
             .unwrap();
         m.assert();
+    }
+
+    #[tokio::test]
+    async fn pull_requests_list_maps_github_style_open_to_opened() {
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(GET)
+                .path("/projects/moosenet%2Fdemo/merge_requests") // pii-test-fixture
+                .query_param("state", "opened");
+            then.status(200).json_body(json!([]));
+        });
+        let a = test_adapter(&server.base_url());
+        a.dispatch(ForgeEndpoint::PullRequestsList, req(json!({ "repo": "demo", "state": "open" })))
+            .await
+            .unwrap();
+        m.assert();
+    }
+
+    #[tokio::test]
+    async fn issues_list_maps_github_style_open_to_opened() {
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(GET)
+                .path("/projects/moosenet%2Fdemo/issues") // pii-test-fixture
+                .query_param("state", "opened");
+            then.status(200).json_body(json!([]));
+        });
+        let a = test_adapter(&server.base_url());
+        a.dispatch(ForgeEndpoint::IssuesList, req(json!({ "repo": "demo", "state": "open" })))
+            .await
+            .unwrap();
+        m.assert();
+    }
+
+    #[test]
+    fn labels_string_normalizes_array_and_string_and_empty() {
+        assert_eq!(labels_string(&json!(["a", "b", "c"])), "a,b,c");
+        assert_eq!(labels_string(&json!("a,b")), "a,b");
+        assert_eq!(labels_string(&json!([])), "");
+        assert_eq!(labels_string(&Value::Null), "");
+    }
+
+    #[tokio::test]
+    async fn issues_label_sends_comma_separated_string() {
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(PUT)
+                .path("/projects/moosenet%2Fdemo/issues/9") // pii-test-fixture
+                .json_body(json!({ "labels": "bug,urgent" }));
+            then.status(200).json_body(json!({}));
+        });
+        let a = test_adapter(&server.base_url());
+        a.dispatch(
+            ForgeEndpoint::IssuesLabel,
+            req(json!({ "repo": "demo", "number": 9, "labels": ["bug", "urgent"] })),
+        )
+        .await
+        .unwrap();
+        m.assert();
+    }
+
+    #[tokio::test]
+    async fn issues_label_absent_clears_to_empty_string() {
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(PUT)
+                .path("/projects/moosenet%2Fdemo/issues/9") // pii-test-fixture
+                .json_body(json!({ "labels": "" }));
+            then.status(200).json_body(json!({}));
+        });
+        let a = test_adapter(&server.base_url());
+        a.dispatch(ForgeEndpoint::IssuesLabel, req(json!({ "repo": "demo", "number": 9 })))
+            .await
+            .unwrap();
+        m.assert();
+    }
+
+    #[tokio::test]
+    async fn pull_requests_review_approve_hits_approve_endpoint() {
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(POST).path("/projects/moosenet%2Fdemo/merge_requests/5/approve"); // pii-test-fixture
+            then.status(201).json_body(json!({ "approved": true }));
+        });
+        let a = test_adapter(&server.base_url());
+        a.dispatch(ForgeEndpoint::PullRequestsReview, req(json!({ "repo": "demo", "number": 5, "event": "APPROVE" })))
+            .await
+            .unwrap();
+        m.assert();
+    }
+
+    #[tokio::test]
+    async fn pull_requests_review_request_changes_hits_unapprove_endpoint() {
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(POST).path("/projects/moosenet%2Fdemo/merge_requests/5/unapprove"); // pii-test-fixture
+            then.status(201).json_body(json!({ "approved": false }));
+        });
+        let a = test_adapter(&server.base_url());
+        a.dispatch(
+            ForgeEndpoint::PullRequestsReview,
+            req(json!({ "repo": "demo", "number": 5, "event": "REQUEST_CHANGES" })),
+        )
+        .await
+        .unwrap();
+        m.assert();
+    }
+
+    #[tokio::test]
+    async fn pull_requests_review_unmapped_event_is_invalid_request_not_a_fabricated_approval() {
+        let a = test_adapter("http://127.0.0.1:1");
+        let err = a
+            .dispatch(
+                ForgeEndpoint::PullRequestsReview,
+                req(json!({ "repo": "demo", "number": 5, "event": "COMMENT" })),
+            )
+            .await
+            .expect_err("COMMENT has no GitLab review-endpoint equivalent");
+        assert!(matches!(err, ForgeError::InvalidRequest(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn repos_create_resolves_namespace_id_from_owner() {
+        let server = MockServer::start();
+        let ns = server.mock(|when, then| {
+            when.method(GET).path("/namespaces").query_param("search", "moosenet");
+            then.status(200).json_body(json!([
+                { "id": 77, "path": "moosenet", "full_path": "moosenet" }
+            ]));
+        });
+        let create = server.mock(|when, then| {
+            when.method(POST).path("/projects").json_body_partial(json!({ "namespace_id": 77 }).to_string());
+            then.status(201).json_body(json!({ "id": 1, "namespace_id": 77 }));
+        });
+        let a = test_adapter(&server.base_url());
+        let resp = a
+            .dispatch(ForgeEndpoint::ReposCreate, req(json!({ "name": "demo" })))
+            .await
+            .unwrap();
+        assert_eq!(resp.body["namespace_id"], 77);
+        ns.assert();
+        create.assert();
+    }
+
+    #[tokio::test]
+    async fn repos_create_explicit_namespace_id_skips_lookup() {
+        let server = MockServer::start();
+        // No /namespaces mock registered — a call to it would 404 and fail the
+        // whole dispatch, proving the explicit id bypassed the lookup.
+        let create = server.mock(|when, then| {
+            when.method(POST).path("/projects").json_body_partial(json!({ "namespace_id": 42 }).to_string());
+            then.status(201).json_body(json!({ "id": 1, "namespace_id": 42 }));
+        });
+        let a = test_adapter(&server.base_url());
+        a.dispatch(ForgeEndpoint::ReposCreate, req(json!({ "name": "demo", "namespace_id": 42 })))
+            .await
+            .unwrap();
+        create.assert();
+    }
+
+    #[tokio::test]
+    async fn repos_create_unknown_namespace_is_invalid_request() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/namespaces");
+            then.status(200).json_body(json!([]));
+        });
+        let a = test_adapter(&server.base_url());
+        let err = a
+            .dispatch(ForgeEndpoint::ReposCreate, req(json!({ "name": "demo" })))
+            .await
+            .expect_err("no matching namespace");
+        assert!(matches!(err, ForgeError::InvalidRequest(_)), "got {err:?}");
+    }
+
+    // ── redirect hop bound / scheme downgrade (P1 hardening) ─────────────────
+
+    #[tokio::test]
+    async fn redirect_chain_is_bounded() {
+        // Every hop stays on the same allowlisted host, so only the hop-count
+        // cap can stop this chain — an unbounded policy would loop until the
+        // client timeout instead of failing fast.
+        let server = MockServer::start();
+        let base = server.base_url();
+        for i in 0..10u32 {
+            server.mock(|when, then| {
+                when.method(GET).path(format!("/loop{i}"));
+                then.status(302).header("location", format!("{base}/loop{}", i + 1));
+            });
+        }
+        let a = test_adapter(&base);
+        let err = a
+            .call("t", reqwest::Method::GET, &format!("{base}/loop0"), None)
+            .await
+            .expect_err("unbounded redirect loop must be capped");
+        assert!(matches!(err, ForgeError::Transport { .. }), "got {err:?}");
     }
 
     // ── pagination ────────────────────────────────────────────────────────────
