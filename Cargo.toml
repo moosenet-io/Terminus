@@ -62,6 +62,20 @@ rustls-native-certs = "0.8"
 # into a signer on restart. Default features (crypto+pem+ring) cover
 # generation/PEM (de)serialization.
 rcgen = { version = "0.14", features = ["x509-parser"] }
+# TCLI-02: enrollment-issued application-layer JWT (paired with the TCLI-01
+# CA-signed transport-layer client cert). No JWT crate existed anywhere in
+# this repo prior to this item (the "Chord JWT workaround" the TCLI-02 spec
+# item references lives in the separate moosenet/Chord repo, out of reach
+# here) -- this is the ONE JWT library terminus-rs now uses; later Gateway-P2
+# items (TCLI-03/04/05) reuse it rather than adding a second one.
+jsonwebtoken = "9"
+# TCLI-02: `rcgen::CertificateParams::not_before`/`not_after` take
+# `time::OffsetDateTime`, not `chrono` -- needed for hour-granularity leaf
+# cert TTLs (TCLI-01's CA only needed day granularity, via
+# `rcgen::date_time_ymd`, so it never needed this directly). Already in the
+# tree transitively via rcgen; pinned directly here for the same reason
+# `rcgen` was pinned to `x509-parser`'s feature above.
+time = { version = "0.3", default-features = false }
 lettre = { version = "0.11", default-features = false, features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "builder", "ring"] }
 # <host> personal MCP server (src/bin/terminus_personal.rs): a standalone
 # streamable-HTTP MCP server exposing the personal-utility tool subset.
@@ -90,6 +104,10 @@ httpmock = "0.7"
 tokio-test = "0.4"
 serial_test = "3"
 tempfile = "3"
+# TCLI-02: chain-of-trust + TTL assertions on issued leaf certs. Already a
+# transitive dependency (rcgen's "x509-parser" feature); pinned directly
+# here so pki::enroll's tests can parse issued/CA cert DER themselves.
+x509-parser = { version = "0.18", features = ["verify"] }
 
 # S84 ASMT-02: explicit integration-test target for the dim-1 conversation suite
 # (Cargo does not auto-discover test files inside subdirectories).

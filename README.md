@@ -1188,6 +1188,66 @@ material themselves. Known limitation (P2, not yet solved): two terminus
 processes bootstrapping concurrently against the same local store can race;
 documented, not handled, given P2's single-primary topology.
 
+## Client-cert enrollment (`crate::pki::enroll`) — TCLI-02
+
+Given the TCLI-01 embedded CA, `src/pki/enroll.rs` adds a new, purely
+additive HTTP endpoint that issues short-lived client credentials to a
+first-time (or re-enrolling) identity. **This endpoint is separate from, and
+does not change the behavior of,** the existing `/mcp` JSON-RPC route or its
+bearer-token auth (`crate::mcp_server`) — `build_enroll_router()` returns its
+own standalone `axum::Router`, merged alongside `crate::mcp_server`'s router
+by whichever binary wants it (see `src/bin/terminus_personal.rs`'s `main()`).
+
+**Protocol** — `POST` to the path from `config::enrollment_path()` (default
+`/enroll`):
+
+```json
+// request
+{ "identity": "dev-box-claude-code", "shared_secret": "..." }
+
+// response (200)
+{
+  "cert_pem": "-----BEGIN CERTIFICATE-----...",
+  "key_pem": "<REDACTED-SECRET>...",
+  "ca_cert_pem": "-----BEGIN CERTIFICATE-----...",
+  "jwt": "eyJ...",
+  "expires_at": 1700000000
+}
+```
+
+- `identity` must match a DNS-label-like naming pattern (lowercase
+  alphanumerics + hyphens, 2-63 chars, no leading/trailing hyphen) — this
+  keeps the identity namespace bounded and safe to embed directly in the
+  cert's CN/SAN, per the TCLI-02 edge cases.
+- `shared_secret` is compared against `TERMINUS_ENROLLMENT_SHARED_SECRET`
+  (env-materialized runtime secret store, per-identity rotatable) in constant
+  time — never a plain `==` on secret bytes.
+- On success: a fresh keypair is generated, signed into a leaf cert by the
+  TCLI-01 CA (`ca.issuer()`), with `identity` embedded as CN + DNS SAN. TTL
+  is short — `config::enrollment_cert_ttl_hours()` (default 24h), nowhere
+  close to the CA's multi-year validity. A paired JWT
+  (`config::enrollment_jwt_ttl_seconds()`, default 1800s / 30 min) carries
+  the same identity as its `sub` claim, HS256-signed with
+  `TERMINUS_JWT_SIGNING_KEY` — the one JWT signing key this crate now uses
+  (no other JWT library exists in this repo; later Gateway-P2 items reuse
+  this one rather than adding a second).
+- Re-enrolling an already-enrolled identity is NOT an error — it simply
+  issues a fresh cert/JWT pair, since short-lived certs are expected to be
+  refreshed periodically.
+- Rejections: `401` (wrong/missing shared secret), `400` (identity name
+  fails the naming pattern), `503` (enrollment not configured — the shared
+  secret itself is unset on this instance).
+
+**Bootstrap chicken-and-egg:** at enrollment time the caller has no client
+cert yet — that's the point of this endpoint — so its own transport is plain
+TLS at minimum for P2; it cannot require the client cert it's about to issue.
+Deploy it behind the same TLS termination as the rest of the binary. Full
+mTLS-only transport for everything else is TCLI-03's job.
+
+**Audit logging (S6):** enrollment log lines carry only the identity name and
+the issued cert's serial — never the shared secret, the private key, or the
+JWT.
+
 ## License
 
 MIT

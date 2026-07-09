@@ -84,6 +84,7 @@ use std::sync::Arc;
 
 use terminus_rs::<secret-manager>::{fetch_secrets_batch, InfisicalConfig}; // pii-test-fixture
 use terminus_rs::mcp_server::{build_router, McpServerState};
+use terminus_rs::pki::enroll::build_enroll_router;
 use terminus_rs::registry::{register_personal, ToolRegistry};
 
 /// The downstream secret keys this process needs, fetched from <secret-manager> at // pii-test-fixture
@@ -293,7 +294,12 @@ async fn main() {
         auth_token,
     });
 
-    let router = build_router(state);
+    // TCLI-02: the enrollment endpoint is a fully separate, additive router
+    // (its own request/response shape + auth model — see
+    // `terminus_rs::pki::enroll` module docs) merged alongside the existing
+    // `/mcp`/`/healthz` router. `build_router`/`McpServerState` above are
+    // untouched by this merge -- existing clients see no behavior change.
+    let router = build_router(state).merge(build_enroll_router());
 
     let listener = tokio::net::TcpListener::bind(format!("{bind_addr}:{port}"))
         .await
