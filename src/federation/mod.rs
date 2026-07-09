@@ -110,8 +110,10 @@ const CHORD_SERVICE_SUBJECT: &str = "lumina";
 /// Header the caller's mTLS-derived identity (if any) is forwarded under,
 /// alongside the service JWT — additive audit/identity metadata, not a
 /// second auth mechanism (Chord's own JWT check is what actually gates the
-/// request).
-const CLIENT_IDENTITY_HEADER: &str = "x-terminus-client-identity";
+/// request). `pub(crate)`: `crate::inference_proxy` (TGW-03) reuses this same
+/// header name/convention for its own hop to Chord's inference routes, so
+/// both federation hops present caller identity to Chord identically.
+pub(crate) const CLIENT_IDENTITY_HEADER: &str = "x-terminus-client-identity";
 
 /// Errors from the federation hop itself (terminus-primary ⇄ Chord, or
 /// Chord ⇄ the personal-registry host as reported by Chord) — distinct from a tool-level failure
@@ -296,7 +298,15 @@ fn classify_transport_error(e: &reqwest::Error) -> FederationError {
 /// (`CHORD_JWT_SECRET` on Chord's side), provisioned into terminus-primary's
 /// own environment at deploy time. See the module doc's "Auth" section for
 /// why the subject is pinned and why this isn't the caller's own identity.
-fn mint_service_jwt() -> Result<String, FederationError> {
+///
+/// `pub(crate)`: TGW-03's `crate::inference_proxy` reuses this exact minting
+/// logic for its own hop to Chord's inference routes (`/v1/chat/completions`
+/// et al.), which gate on the SAME `auth_check`/`CHORD_JWT_SECRET` scheme as
+/// `/v1/personal/tools/*` (confirmed by reading Chord's `src/routes.rs` —
+/// every Chord route this crate proxies to shares one `auth_check` call) —
+/// factored here rather than duplicated, per the TGW-03 spec item's "reuse
+/// that machinery" instruction.
+pub(crate) fn mint_service_jwt() -> Result<String, FederationError> {
     let signing_key = env_nonempty("TERMINUS_PRIMARY_CHORD_JWT_SECRET").ok_or_else(|| {
         FederationError::JwtSigning("TERMINUS_PRIMARY_CHORD_JWT_SECRET is unset".to_string())
     })?;

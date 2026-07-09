@@ -56,6 +56,10 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::federation::PersonalFederationClient;
+use crate::inference_proxy::{
+    InferenceProxyClient, AGENT_EXECUTE_PATH, CHAT_COMPLETIONS_PATH, CODING_SELECT_PATH,
+    INFER_PATH,
+};
 use crate::pki::mtls::ClientIdentity;
 use crate::registry::ToolRegistry;
 
@@ -75,17 +79,100 @@ pub struct McpServerState {
     /// no need to federate to itself) preserves the exact pre-TGW-02
     /// behavior: unknown tool names are just unknown.
     pub personal_federation: Option<PersonalFederationClient>,
+    /// TGW-03: when set, `/v1/chat/completions`, `/v1/infer`,
+    /// `/v1/agent/execute`, and `/v1/coding/select` are forwarded to Chord's
+    /// co-located inference backend — see `crate::inference_proxy`'s module
+    /// doc for the full contract. `None` (the default for
+    /// `terminus_personal`, which has no inference-proxy role) means those
+    /// routes are not mounted at all.
+    pub inference_proxy: Option<InferenceProxyClient>,
 }
 
 pub fn build_router(state: Arc<McpServerState>) -> Router {
     Router::new()
         .route("/mcp", post(handle_mcp))
         .route("/healthz", get(handle_healthz))
+        // TGW-03: inference-proxy routes forwarded to Chord — mounted
+        // unconditionally; `handle_inference_proxy` itself returns a clean
+        // 503 when `state.inference_proxy` is `None` (e.g. on
+        // `terminus_personal`, which never sets it), rather than 404 (a
+        // clearer signal than "route doesn't exist" for a route the binary
+        // knows about but isn't configured to serve).
+        .route(CHAT_COMPLETIONS_PATH, post(handle_chat_completions))
+        .route(INFER_PATH, post(handle_infer))
+        .route(AGENT_EXECUTE_PATH, post(handle_agent_execute))
+        .route(CODING_SELECT_PATH, post(handle_coding_select))
         .with_state(state)
         // Request-level tracing (method/path/status/latency) via RUST_LOG —
         // useful for an admin-tools endpoint where knowing who called what,
         // when, matters operationally.
         .layer(tower_http::trace::TraceLayer::new_for_http())
+}
+
+/// Shared dispatch for all four TGW-03 inference-proxy routes: if this
+/// process is configured to proxy inference (`state.inference_proxy ==
+/// Some`), forward to Chord at `path` via
+/// `crate::inference_proxy::InferenceProxyClient::forward`, carrying the
+/// mTLS-derived caller identity (if present) exactly as
+/// `handle_mcp`'s personal-tool federation branch already does. Otherwise
+/// (this binary has no inference-proxy role configured), return a clean
+/// `503` rather than silently 404ing or hanging.
+async fn handle_inference_proxy(
+    state: Arc<McpServerState>,
+    path: &'static str,
+    identity: Option<Extension<ClientIdentity>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match &state.inference_proxy {
+        Some(client) => {
+            let caller_identity = identity.as_ref().map(|Extension(i)| i.as_str());
+            client.forward(path, headers, body, caller_identity).await
+        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("content-type", "application/json")],
+            json!({"error": "inference proxy not configured on this terminus process"})
+                .to_string(),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_chat_completions(
+    State(state): State<Arc<McpServerState>>,
+    identity: Option<Extension<ClientIdentity>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_inference_proxy(state, CHAT_COMPLETIONS_PATH, identity, headers, body).await
+}
+
+async fn handle_infer(
+    State(state): State<Arc<McpServerState>>,
+    identity: Option<Extension<ClientIdentity>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_inference_proxy(state, INFER_PATH, identity, headers, body).await
+}
+
+async fn handle_agent_execute(
+    State(state): State<Arc<McpServerState>>,
+    identity: Option<Extension<ClientIdentity>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_inference_proxy(state, AGENT_EXECUTE_PATH, identity, headers, body).await
+}
+
+async fn handle_coding_select(
+    State(state): State<Arc<McpServerState>>,
+    identity: Option<Extension<ClientIdentity>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_inference_proxy(state, CODING_SELECT_PATH, identity, headers, body).await
 }
 
 async fn handle_healthz(State(state): State<Arc<McpServerState>>) -> impl IntoResponse {
@@ -354,6 +441,7 @@ mod tests {
             server_version: "0.0.0-test".to_string(),
             auth_token: None,
             personal_federation: None,
+            inference_proxy: None,
         })
     }
 
@@ -481,6 +569,7 @@ mod tests {
             server_version: "0.0.0-test".to_string(),
             auth_token: None,
             personal_federation: None,
+            inference_proxy: None,
         });
         let router = build_router(state);
         let (status, body, _) = post_mcp(
@@ -525,6 +614,7 @@ mod tests {
             server_version: "0.0.0-test".to_string(),
             auth_token: Some("secret-abc".to_string()),
             personal_federation: None,
+            inference_proxy: None,
         });
         let router = build_router(state);
         let req = Request::builder()
@@ -549,6 +639,7 @@ mod tests {
             server_version: "0.0.0-test".to_string(),
             auth_token: Some("secret-abc".to_string()),
             personal_federation: None,
+            inference_proxy: None,
         });
         let router = build_router(state);
         let req = Request::builder()

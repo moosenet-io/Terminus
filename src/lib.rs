@@ -25,6 +25,7 @@ pub mod dev;
 pub mod gateway;
 pub mod github;
 pub mod <secret-manager>; // pii-test-fixture
+pub mod inference_proxy;
 pub mod intake;
 pub mod network;
 pub mod odyssey;

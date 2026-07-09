@@ -309,6 +309,9 @@ async fn main() {
         // TGW-02: terminus_personal never federates to itself -- it already
         // IS the personal-registry deployment.
         personal_federation: None,
+        // TGW-03: terminus_personal has no inference-proxy role -- that's
+        // terminus_primary's job.
+        inference_proxy: None,
     };
 
     // TCLI-02: the enrollment endpoint is a fully separate, additive router
