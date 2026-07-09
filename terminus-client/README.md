@@ -64,6 +64,58 @@ let transport = connect(&credential, &connect_cfg).await?;
 let tls_stream = transport.into_io(); // AsyncRead + AsyncWrite, ready for an HTTP client
 ```
 
+## Running the daemon (`terminus-client-daemon`, TCLI-05)
+
+The `terminus-client-daemon` binary is the runnable half of this crate: it
+presents a **plain, loopback-only** MCP endpoint (`POST /mcp`, JSON-RPC 2.0,
+SSE-framed responses — the same wire protocol a terminus primary serves) and
+forwards every `tools/list` / `tools/call` it receives to the primary over the
+mTLS transport above. The local endpoint is plaintext, which is only safe
+because it **never leaves loopback**: the bind address is the hardcoded
+constant `127.0.0.1` (never sourced from an env var, so no config typo can
+widen it to a LAN/internet-reachable bind), while the outbound hop to the
+primary is mTLS the whole way.
+
+On startup it enrolls (or reuses a valid cached credential) and completes one
+mTLS handshake against the primary **before** accepting any local connection;
+if that fails it prints a sanitized error to stderr and exits non-zero
+(fail-fast, no partial startup, no hang). Forwarding re-dials a fresh mTLS
+connection per request, attaching the enrolled JWT as `Authorization: Bearer`,
+so the primary always sees the daemon's enrolled identity.
+
+### Configuration (all env-sourced; no literals baked in)
+
+| Env var | Required | Default | Meaning |
+|---|---|---|---|
+| `TERMINUS_CLIENT_IDENTITY` | **yes** | — | This daemon's enrollment identity (embedded in its cert CN/SAN and JWT `sub`). |
+| `TERMINUS_ENROLLMENT_SHARED_SECRET` | **yes** | — | Bootstrap secret for that identity, materialized into the process env at deploy time — never hardcoded. |
+| `TERMINUS_PRIMARY_URL` | no | `http://127.0.0.1:8300` | Primary's plain HTTP+JWT base URL, used only for the one-shot `/enroll` call. |
+| `TERMINUS_MTLS_HOST` | no | `127.0.0.1` | Host of the primary's mTLS listener. |
+| `TERMINUS_MTLS_PORT` | no | `8301` | Port of the primary's mTLS listener (matches `terminus_rs::config::mtls_port`). |
+| `TERMINUS_MTLS_SERVER_IDENTITY` | no | `terminus-primary` | Primary's mTLS server-cert identity, used as the TLS `ServerName`. |
+| `TERMINUS_CLIENT_LOCAL_PORT` | no | `8310` | Loopback port this daemon serves its local MCP endpoint on. |
+| `TERMINUS_CLIENT_FORWARD_TIMEOUT_SECS` | no | `15` | Per-forwarded-request timeout. |
+| `TERMINUS_CLIENT_CATALOG_TTL_SECS` | no | `60` | Tool-catalog cache TTL (refresh-on-miss, else on next access past the TTL). |
+
+The daemon serves `POST /mcp` (MCP) and `GET /healthz` on
+`127.0.0.1:${TERMINUS_CLIENT_LOCAL_PORT}`. To point a local MCP client
+(Claude Code, per TCLI-06) at it, give the client an HTTP MCP server URL of
+`http://127.0.0.1:8310/mcp`. Example invocation (the two required secrets are
+materialized into the process environment by the deploy tooling / vault-agent
+beforehand — never written inline into a script or unit file):
+
+```sh
+# TERMINUS_CLIENT_IDENTITY and TERMINUS_ENROLLMENT_SHARED_SECRET are already
+# exported into this process's environment by the deploy step (from the vault).
+export TERMINUS_PRIMARY_URL=http://<primary-host>:8300
+export TERMINUS_MTLS_HOST=<primary-host>
+terminus-client-daemon
+```
+
+The local client then sees the primary's full tool catalog (aggregated via
+`tools/list`) and every `tools/call` is round-tripped to the primary over
+mTLS and relayed back unchanged.
+
 ## Errors
 
 Every enrollment/connection failure is a typed [`error::ClientError`]

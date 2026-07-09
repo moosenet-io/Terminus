@@ -53,4 +53,17 @@ pub enum ClientError {
     /// identity/store.
     #[error("no enrolled credential available; call enroll() first")]
     NotEnrolled,
+    /// TCLI-05: the primary's `/mcp` endpoint responded to a forwarded
+    /// request with a non-2xx HTTP status. Distinct from
+    /// [`ClientError::EnrollmentRejected`] (which is specific to `/enroll`)
+    /// -- this is the forwarding-path equivalent for tool-call/tool-list
+    /// traffic over the mTLS transport.
+    #[error("primary rejected forwarded MCP request (HTTP {status}): {body}")]
+    ForwardRejected { status: u16, body: String },
+    /// TCLI-05: a forwarded request (enroll-check + dial + HTTP round-trip)
+    /// did not complete within the configured timeout -- the daemon's
+    /// EDGE CASE requirement that an in-flight call during an outage
+    /// returns a clear error rather than hanging indefinitely.
+    #[error("forwarded MCP request to {0} timed out after {1:?}")]
+    ForwardTimeout(String, std::time::Duration),
 }
