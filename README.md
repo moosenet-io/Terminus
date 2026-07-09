@@ -703,6 +703,34 @@ single dispatch path drives all of them; nothing branches on provider.
   `ForgeError::Transport` (not a panic or fabricated result); a missing/invalid
   or under-scoped credential yields `ForgeError::Auth`.
 
+### Optional/experimental provider stubs (`forge::stubs`, GITX-06)
+
+Five providers named in the S106 provider list are **stubs**, not full
+adapters: structure + an honest, provider-specific `CapabilityMap` so the
+git-private/git-public tools KNOW these providers exist and can report their
+real (often reduced) surfaces via capability introspection — never a
+fabricated call or a claimed capability the provider doesn't have. No stub
+overrides `execute_endpoint`, so every dispatched endpoint honestly falls
+through to `ForgeError::NotImplemented` (declared-but-unwired) or
+`ForgeError::Unsupported` (not declared at all) — the same two clean negative
+paths every other adapter uses.
+
+| Provider id | Pool | Credential | Capability posture |
+|---|---|---|---|
+| `bitbucket` | git-public | `BITBUCKET_TOKEN` | Broad REST 2.0 surface, but no GitHub-style Releases object and no generic package registry — `releases_*`/`packages_*` `unsupported`. |
+| `sourcehut` | git-public | `SOURCEHUT_TOKEN` | **Reduced by design**: sr.ht is a patch-email workflow — no web pull-request surface and no package registry (`pull_requests_*`/`packages_*` `unsupported`); its per-service webhook model is advertised `experimental`. |
+| `gogs` | git-private | `GOGS_TOKEN` | Minimal Gitea-lineage fork — no branch-protection API, no package registry, no webhook test-delivery endpoint (`unsupported`); PR review is `experimental`. |
+| `onedev` | git-private | `ONEDEV_TOKEN` | Modern self-hosted forge, near-full vocabulary `supported`; generic package publish (Maven/npm/Docker differ per-protocol) is `experimental`. |
+| `radicle` | git-public-ish/experimental | `RADICLE_TOKEN` | **Peer-to-peer, experimental.** Writes happen over the `rad`/git protocol, not REST, and there's no central org/membership concept. Only the read-only `radicle-httpd` surface (repos/branches/refs/commits, read-only patches/issues, content read) is advertised `experimental`; everything else — all writes, releases, webhooks, packages, org — is `unsupported`. |
+
+Construct with `StubForge::bitbucket_from_env()` / `sourcehut_from_env()` /
+`gogs_from_env()` / `onedev_from_env()` / `radicle_from_env()` — each checks
+that its one credential key is present in the runtime secret store (never
+reads the value itself; a stub has no wired transport yet) and fails with a
+clean `ToolError::NotConfigured` if it's missing or blank. None of these
+tokens are added to `secrets_bootstrap::PAT_KEY_PREFIXES` — that multi-identity
+scan is reserved for providers that actually need it.
+
 ## License
 
 MIT
