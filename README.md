@@ -114,7 +114,7 @@ their tools:
 | `dev` | Path-jailed dev workspace | `dev_read_file`, `dev_write_file`, `dev_run_command`, `dev_list_workspaces` |
 | `openhands` | Agentic coding runs (guarded) | `openhands_run_task`, `openhands_list_conversations`, `openhands_get_status` |
 | `gitea` | Gitea git forge | `gitea_create_repo`, `gitea_read_file`, `gitea_create_pr`, `gitea_merge_pr`, `gitea_cargo_publish` |
-| `github` | GitHub | `github_create_repo`, `github_list_repos`, `github_push_repo`, `github_pii_scan`, `github_mirror_status`, `github_mirror_prepare`, `github_mirror_approve`, `github_mirror_push` |
+| `github` | GitHub | `github_create_repo`, `github_list_repos`, `github_push_repo`, `github_pii_scan`, `git_public_mirror_status`, `git_public_mirror_prepare`, `git_public_mirror_approve`, `git_public_mirror_push` |
 | `plane` | Plane work management | `plane_create_work_item`, `plane_list_issues_by_state`, `plane_update_work_item`, `plane_create_module`, `plane_update_module`, `plane_delete_module`, `plane_add_issue_to_module`, `plane_remove_issue_from_module`, `plane_list_identities`, `plane_whoami`, `plane_prefix_check`, `plane_prefix_register` |
 | `nexus` | Inter-agent inbox | `nexus_send`, `nexus_check`, `nexus_read`, `nexus_ack`, `nexus_history` |
 | `axon` | Work-queue agent control | `axon_submit`, `axon_status`, `axon_list`, `axon_cancel` |
@@ -255,24 +255,28 @@ pii_gate --tree [PATH]   # full-tree sweep (defaults to repo root) — used by t
 pii_gate --json          # machine-readable JSON report
 ```
 
-### GitHub mirror engine subtools (GHMR-04)
+### git-public mirror engine subtools (GHMR-04, renamed at GITX-08)
 
 The public `moosenet-io/*` mirrors are **PII-swept derivatives** of internal
 `main` with their own linear history (they share no ancestor with internal main).
-Four github **core-tool** subtools drive that engine over a per-repo *clean work
-dir* (`<TERMINUS_MIRROR_WORKDIR_ROOT>/<repo>`). All git operations run **on the
+Four `github` **core-tool** subtools drive that engine — now living at
+`crate::forge::mirror` (moved and renamed from `crate::github::mirror` /
+`github_mirror_*` at GITX-08; behavior is unchanged and the engine has been
+provider-agnostic since GITX-05's routing — GitHub remains the only currently
+configured mirror target) — over a per-repo *clean work dir*
+(`<TERMINUS_MIRROR_WORKDIR_ROOT>/<repo>`). All git operations run **on the
 dev box** — the sanctioned git-transport host — while the logic lives in
 terminus-rs; no other host holds a GitHub credential.
 
 | Tool | Posture | What it does |
 | --- | --- | --- |
-| `github_mirror_status` | read-only | Reports internal-main HEAD, whether it is already approved, work-dir HEAD, and the set of `mirror-approved/*` tags (divergence + last-approved). |
-| `github_mirror_prepare` | write (work dir only) | Syncs internal main's committed tree into the work dir, runs the mechanical sweep + PII gate, commits the swept derivative, and tags `mirror-approved/<internal-sha>` **only** when 0 residual violations remain. Residuals are returned for GHMR-05 cleaning; nothing is tagged. |
-| `github_mirror_approve` | **guarded** | Operator authorisation of a clean snapshot. Refuses (without prompting the operator) while residual violations are pending; on a clean tree it confirms the tag and, after the one-time approval code, blesses the snapshot for push. |
-| `github_mirror_push` | **guarded**, ff-only | Publishes the approved commit to the repo's GitHub remote — **fast-forward only**. Refuses any non-fast-forward (and an un-bootstrapped remote), pointing at the GHMR-07 bootstrap; **never force-pushes**. |
+| `git_public_mirror_status` | read-only | Reports internal-main HEAD, whether it is already approved, work-dir HEAD, and the set of `mirror-approved/*` tags (divergence + last-approved). |
+| `git_public_mirror_prepare` | write (work dir only) | Syncs internal main's committed tree into the work dir, runs the mechanical sweep + PII gate, commits the swept derivative, and tags `mirror-approved/<internal-sha>` **only** when 0 residual violations remain. Residuals are returned for GHMR-05 cleaning; nothing is tagged. |
+| `git_public_mirror_approve` | **guarded** | Operator authorisation of a clean snapshot. Refuses (without prompting the operator) while residual violations are pending; on a clean tree it confirms the tag and, after the one-time approval code, blesses the snapshot for push. |
+| `git_public_mirror_push` | **guarded**, ff-only | Publishes the approved commit to the repo's GitHub remote — **fast-forward only**. Refuses any non-fast-forward (and an un-bootstrapped remote), pointing at the GHMR-07 bootstrap; **never force-pushes**. |
 
 Common args: `repo` (logical name) and `source` (the dev-box internal-`main`
-checkout path). `github_mirror_push` also takes `github_remote` (or
+checkout path). `git_public_mirror_push` also takes `github_remote` (or
 `TERMINUS_MIRROR_REMOTE_<REPO>` / `TERMINUS_MIRROR_REMOTE`). The push reads
 `GITHUB_TOKEN` (materialised from <secret-manager> into the process env at startup) only
 at the moment of transport and injects it via `GIT_ASKPASS` — the token is never
@@ -289,7 +293,7 @@ operator-blessed bootstrap — never performed by these tools.
 The mechanical sweep rewrites deterministically-fixable PII (private IPs,
 container IDs, config-mapped hosts) to placeholder tokens, but leaves **residual**
 violations that need judgment — a raw leaked secret, prose embedding an infra
-fact. When `github_mirror_prepare` finds residuals it runs an **operationalized,
+fact. When `git_public_mirror_prepare` finds residuals it runs an **operationalized,
 bounded cleaning pass** rather than just returning them:
 
 1. Dispatch a scoped **cleaning subagent** — a command configured in
@@ -707,9 +711,9 @@ repo is not re-asked.
 
 ### The mirror engine as git-public's swept-write path
 
-The already-shipped GHMR mirror engine (see "GitHub mirror engine subtools
-(GHMR-04)" above — `github_mirror_status` / `_prepare` / `_approve` / `_push`,
-the per-repo clean work-dir derivative, the mechanical sweep + Rust PII gate,
+The already-shipped GHMR mirror engine (see "git-public mirror engine subtools
+(GHMR-04, renamed at GITX-08)" above — `git_public_mirror_status` / `_prepare` /
+`_approve` / `_push`, the per-repo clean work-dir derivative, the mechanical sweep + Rust PII gate,
 the bounded residual-cleaning pass) is **not rebuilt** for this overhaul. It
 becomes git-public's general **provider-agnostic swept-write path**: the
 engine's clean work-dir + PII-gate model is how git-public reconciles "the
@@ -792,10 +796,12 @@ wired by GITX-05). The two domains are exactly four registered tools:
 | `git_public_capabilities` | read-only per-provider capability report for the public pool |
 
 These replace the per-provider `gitea_*`/`github_*` tool names as the caller's
-door to those forges. The one set retained under the old names is the GHMR
-mirror engine's own subtools (`github_mirror_status`/`_prepare`/`_approve`/
-`_push`) — `git_public`'s `mirror_action` delegates to them rather than
-renaming them. Provider selection within a pool is behavioral config, never a
+door to those forges. The one set retained as separate core-tool subtools
+(rather than folded into `git_public` itself) is the GHMR mirror engine's own
+subtools (`git_public_mirror_status`/`_prepare`/`_approve`/`_push`, renamed
+from `github_mirror_*` at GITX-08) — `git_public`'s `mirror_action` delegates
+to them rather than reimplementing them. Provider selection within a pool is
+behavioral config, never a
 secret: an explicit `provider` param wins, else the pool's canonical default
 (`gitea` / `github`), overridable via the `GIT_PRIVATE_DEFAULT_PROVIDER` /
 `GIT_PUBLIC_DEFAULT_PROVIDER` env vars; when only one provider is configured it
@@ -991,8 +997,8 @@ A companion read-only tool, `git_public_capabilities`, mirrors
 For a **full repo mirror sync** (as opposed to a single API write like a PR
 comment), `git_public` accepts `mirror_action: "status" | "prepare" |
 "approve" | "push"` instead of `endpoint`, forwarding verbatim to the
-existing GHMR core tools (`github_mirror_status` / `_prepare` / `_approve` /
-`_push`, `github::mirror::tools::dispatch_mirror_action`) — the exact same
+existing GHMR core tools (`git_public_mirror_status` / `_prepare` / `_approve` /
+`_push`, `forge::mirror::tools::dispatch_mirror_action`) — the exact same
 `RustTool::execute` those four tools already run, so none of the engine's own
 PII-gate / fast-forward-only / no-force transport logic is duplicated. This
 *is* "mirror = git-private source → PII-gated git-public push" — git-public's
@@ -1001,7 +1007,7 @@ swept-clean-tree write path. A successful `push` additionally activates that
 subsequent direct API write to the newly-mirrored repo is not re-asked.
 
 The mirror engine's transport is **provider-routable**, not hardcoded to
-GitHub: `github_mirror_push` (and `mirror_action: "push"`) takes an optional
+GitHub: `git_public_mirror_push` (and `mirror_action: "push"`) takes an optional
 `provider` field (default `"github"`), resolved to a transport credential via
 `mirror_provider_token()` — a routing table, not an assumption. GitHub is the
 only configured target today (the only resolver wired in that table); adding

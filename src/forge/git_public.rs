@@ -31,19 +31,20 @@
 //! `crate::registry::register_all`. Not on `terminus_personal`.
 //!
 //! ## Mirror engine integration
-//! The GHMR mirror engine (`crate::github::mirror`) is git-public's
-//! swept-clean-tree write path for a FULL repo mirror sync (as opposed to a
-//! single API write like a PR comment): `git_public` exposes a
-//! `mirror_action` request (`status`/`prepare`/`approve`/`push`) that forwards
-//! to the existing `github_mirror_*` core tools' logic
-//! ([`crate::github::mirror::tools::dispatch_mirror_action`]), which already
-//! carries its own unconditional PII gate and fast-forward-only, no-force
-//! transport. `git_public` additionally treats a successful `push` as
-//! activating that `(provider, repo)` pair for the first-publish gate, so a
-//! subsequent direct API write (e.g. a PR comment on the newly-mirrored repo)
-//! is not re-asked. The mirror dispatch is provider-routable (a `provider`
-//! field, default `github`) — see the `tools.rs` doc comment for why only
-//! `github` is wired today without hardcoding it as the only possible target.
+//! The git-public mirror engine (`crate::forge::mirror`, renamed at GITX-08
+//! from `crate::github::mirror` / GHMR) is git-public's swept-clean-tree
+//! write path for a FULL repo mirror sync (as opposed to a single API write
+//! like a PR comment): `git_public` exposes a `mirror_action` request
+//! (`status`/`prepare`/`approve`/`push`) that forwards to the mirror engine's
+//! core-tool logic ([`crate::forge::mirror::tools::dispatch_mirror_action`]),
+//! which already carries its own unconditional PII gate and
+//! fast-forward-only, no-force transport. `git_public` additionally treats a
+//! successful `push` as activating that `(provider, repo)` pair for the
+//! first-publish gate, so a subsequent direct API write (e.g. a PR comment on
+//! the newly-mirrored repo) is not re-asked. The mirror dispatch is
+//! provider-routable (a `provider` field, default `github`) — see the
+//! `tools.rs` doc comment for why only `github` is wired today without
+//! hardcoding it as the only possible target.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -219,7 +220,7 @@ impl RustTool for GitPublicTool {
          'provider' selects a pool member (default: github or the sole configured \
          provider); optional 'identity' selects a named credential. Full-tree mirror \
          sync (git-private -> PII-gated git-public) routes through 'mirror_action' \
-         (status/prepare/approve/push), delegating to the GHMR mirror engine."
+         (status/prepare/approve/push), delegating to the git-public mirror engine."
     }
 
     fn parameters(&self) -> Value {
@@ -233,7 +234,7 @@ impl RustTool for GitPublicTool {
                 "mirror_action": {
                     "type": "string",
                     "enum": ["status", "prepare", "approve", "push"],
-                    "description": "Route to the GHMR mirror engine instead of a direct endpoint call"
+                    "description": "Route to the git-public mirror engine instead of a direct endpoint call"
                 },
                 "provider": {
                     "type": "string",
@@ -260,7 +261,7 @@ impl RustTool for GitPublicTool {
         if let Some(action) = args.get("mirror_action").and_then(Value::as_str) {
             let mirror_args = args.get("params").cloned().unwrap_or_else(|| json!({}));
             let result =
-                crate::github::mirror::tools::dispatch_mirror_action(action, mirror_args.clone())
+                crate::forge::mirror::tools::dispatch_mirror_action(action, mirror_args.clone())
                     .await?;
             // A completed push activates the (provider, repo) pair for the
             // first-publish gate on subsequent direct API writes.

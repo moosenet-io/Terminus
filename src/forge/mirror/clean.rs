@@ -9,7 +9,7 @@
 //! un-excisable ancestor of a later approved commit) and returns those residuals.
 //!
 //! This module turns "hand the residuals to a subagent" into a **repeatable,
-//! bounded harness step** invoked by `github_mirror_prepare` (GHMR-04) whenever
+//! bounded harness step** invoked by `git_public_mirror_prepare` (GHMR-04) whenever
 //! residuals remain — not an ad hoc one-off:
 //!
 //!   1. Dispatch a scoped [`ResidualCleaner`] that remediates the flagged spots
@@ -273,7 +273,7 @@ impl CleaningOutcome {
         matches!(self, CleaningOutcome::Cleaned { .. })
     }
 
-    /// Stable machine-readable JSON for `github_mirror_prepare`.
+    /// Stable machine-readable JSON for `git_public_mirror_prepare`.
     pub fn to_json(&self) -> Value {
         match self {
             CleaningOutcome::Cleaned { report, rounds_used } => {
@@ -436,7 +436,7 @@ pub fn dispatch_cleaning(
                  ({CLEAN_CMD_ENV} unset). Configure the cleaning-subagent command so the bounded \
                  pass runs INSIDE prepare (its work-dir edits survive via finalize), or remediate \
                  the flagged spots at their source (internal main / the placeholder+gate config) \
-                 and re-run github_mirror_prepare. NOTE: hand-editing the work dir and re-running \
+                 and re-run git_public_mirror_prepare. NOTE: hand-editing the work dir and re-running \
                  prepare does NOT work — prepare re-syncs internal main's tree and discards those \
                  edits; only the in-prepare cleaning pass (which finalizes without re-syncing) or \
                  a source-side fix is a valid remediation path."

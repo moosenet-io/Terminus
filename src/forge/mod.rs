@@ -34,12 +34,21 @@
 //!
 //! The GitLab adapter (GITX-04) and the git-private/git-public tool assembly
 //! with posture enforcement (GITX-05) build on this trait in later items.
+//!
+//! - [`mirror`] (GITX-08, renamed from the GitHub-specific `github::mirror`) —
+//!   the git-public mirror engine: a per-`mirror_ready`-repo clean work-dir
+//!   derivative of internal `main`, PII-swept and pushed to a public forge.
+//!   Behaviorally provider-agnostic since GITX-05 (routed via
+//!   `git_public`'s `mirror_action` and `mirror_provider_token()`); this
+//!   module is now named to match — GitHub remains the only currently
+//!   configured mirror target, but the engine itself is not GitHub-specific.
 
 pub mod capability;
 pub mod git_private;
 pub mod git_public;
 pub mod gitea_family;
 pub mod gitlab;
+pub mod mirror;
 pub mod posture;
 pub mod provider;
 pub mod registry;
