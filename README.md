@@ -654,6 +654,55 @@ git-public MCP *tool* and its PII-gate write posture are assembled later (GITX-0
   `moosenet-io`), `GITHUB_IDENTITY_NAME` (default identity), `GITHUB_EGRESS_ALLOWLIST`
   (extra hosts). None are required — capability introspection needs no credential.
 
+### Gitea-family adapter (`forge::gitea_family`, GITX-02)
+
+The first concrete adapter — `GiteaForge` — is **one** Gitea-compatible-REST-API
+client that implements `ForgeProvider` and, parameterised by base URL +
+credentials, serves **three** providers that all speak the Gitea REST v1 API:
+
+| Provider id | Pool | Config | Credential model |
+|---|---|---|---|
+| `gitea` | git-private | `GITEA_URL` + `GITEA_PAT_<NAME>` | S105/GPAT multi-identity (default identity `moose`) |
+| `forgejo` | git-private | `FORGEJO_URL` + `FORGEJO_TOKEN` | single token |
+| `codeberg` | git-public | `CODEBERG_URL` (defaults to Codeberg's host) + `CODEBERG_TOKEN` | single token |
+
+Construct with `GiteaForge::gitea_from_env()` / `forgejo_from_env()` /
+`codeberg_from_env()` (only configured providers activate). The three differ
+**only** by base URL + credential source — the wire protocol is identical, so a
+single dispatch path drives all of them; nothing branches on provider.
+
+- **Reuses the existing Gitea client wholesale.** The `gitea` provider wraps the
+  very same `GiteaClient` the concrete `gitea_*` tools use, so the S105
+  `GITEA_PAT_<NAME>` identity model, `gitea_cargo_publish`, and the dev-box
+  git-relay posture all carry forward unchanged. The existing `gitea_*` tools
+  remain registered and behave exactly as before — this adapter is additive
+  (the git-private/git-public tool assembly, provider routing, and the
+  unconditional PII gate on public writes land later in GITX-05).
+- **Full capability set.** Gitea REST v1 covers essentially the entire shared
+  vocabulary, so the Gitea-family `CapabilityMap` advertises **every**
+  `ForgeEndpoint` as `supported` (Forgejo/Codeberg share the same API and map).
+  `capability_report()` returns the complete grouped map.
+- **Endpoints.** Repos (list/get/create/update/delete/fork/mirror-config/
+  visibility/metadata), branches + generic refs, commits (list/get/compare/
+  status), pull requests (list/get/create/update/review/comment/merge/close),
+  issues (list/get/create/update/comment/label/assign/close), releases + tags,
+  webhooks (incl. test), packages (list/get/publish/delete — publish reuses the
+  shared Cargo publish framing), content (read/write file, list tree, raw
+  fetch), and org/collaboration — each mapped to its Gitea REST path.
+- **Content writes run the content PII gate** (same check as `gitea_create_file`
+  / `gitea_update_file`); a `sha` argument routes an update (`PUT`) versus a
+  create (`POST`).
+- **Token hygiene — the `.trim()` fix.** Every token-loading path trims the
+  credential value: `scan_gitea_identities` (for `GITEA_PAT_<NAME>`) and
+  `GiteaClient::with_token` (for `FORGEJO_TOKEN` / `CODEBERG_TOKEN`) both
+  `.trim()` before storage, so a trailing newline or surrounding whitespace in a
+  stored PAT can never corrupt the `Authorization: token <PAT>` header again (a
+  whitespace-only value trims to empty and is treated as absent). This closes a
+  real failure mode previously hit on `GITEA_PAT_MOOSE`.
+- **Honest failure surfaces.** An unreachable instance yields a clean
+  `ForgeError::Transport` (not a panic or fabricated result); a missing/invalid
+  or under-scoped credential yields `ForgeError::Auth`.
+
 ## License
 
 MIT
