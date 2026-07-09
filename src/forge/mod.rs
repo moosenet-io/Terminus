@@ -27,6 +27,7 @@
 //! on this trait in later items.
 
 pub mod capability;
+pub mod gitlab;
 pub mod provider;
 
 pub use capability::{CapabilityMap, ForgeDomain, ForgeEndpoint, SupportLevel};
