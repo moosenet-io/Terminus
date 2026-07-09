@@ -680,7 +680,23 @@ id/display-name/pool/default-base differ.
   the shared surface's repo**; a project is addressed by GitLab's `:id` path
   segment, which this adapter always builds as a URL-encoded
   `namespace/project` path (`{owner}%2F{repo}`, via `GitLabAdapter::project_ref`)
-  rather than requiring a numeric-ID lookup.
+  rather than requiring a numeric-ID lookup. Further shared-surface adaptations,
+  so a caller need not special-case GitLab: MR/issue list `state` maps
+  `open`→`opened`; `pull_requests_review` maps `event` `APPROVE`→approve and
+  `REQUEST_CHANGES`/`DISMISS`→unapprove (any other event is a clean
+  `InvalidRequest`, never a fabricated approval); `labels` accept an array or a
+  comma-string; **assignees** accept either GitLab-native `assignee_ids`
+  (numeric, verbatim) or GitHub-style `assignees` usernames (resolved via
+  `GET /users?username=`); `org_permissions` accepts either `user_id` or a
+  `username` (resolved likewise); `repos_create` resolves `owner`→`namespace_id`
+  (so the project lands in the intended group, not the caller's personal
+  namespace) and maps `auto_init`→`initialize_with_readme`; `repos_list` tries
+  the group projects path and falls back to the user projects path; webhook
+  bodies accept GitHub's nested `config.url`+`events[]` shape and are translated
+  to GitLab's flat `url`+per-event-boolean form (a GitLab-native flat body
+  passes through verbatim); `content_write_file` infers POST (create) vs PUT
+  (update) from the absence/presence of `sha`/`last_commit_id` (an explicit
+  `create` bool overrides).
 - **Capability map — honest gaps AND an honest advantage over GitHub.** Left
   `unsupported`: `refs_list`/`refs_get`/`refs_create`/`refs_delete` (GitLab v4 has
   no generic ref-namespace API like GitHub's `git/refs` — only the concrete
@@ -705,10 +721,15 @@ id/display-name/pool/default-base differ.
   `gitlab_saas`, `false` for `gitlab_ce` — GITX-05's tool assembly applies the
   exfiltration-surface posture only to the former.
 - **Egress isolation.** Every outbound call passes `GitLabAdapter::host_allowed`
-  first: the configured API base authority, plus (for `gitlab_saas` only) the
-  `gitlab.com` family, extendable via `GITLAB_EGRESS_ALLOWLIST`. A self-hosted
-  `gitlab_ce` adapter does NOT implicitly trust `gitlab.com`. Redirects are
-  re-validated against the same allowlist on every hop (fail-closed).
+  first: the configured API base authority (default ports normalized), plus (for
+  `gitlab_saas` only) the `gitlab.com` family, extendable via
+  `GITLAB_EGRESS_ALLOWLIST`. A self-hosted `gitlab_ce` adapter does NOT
+  implicitly trust `gitlab.com`, and construction **fails closed** if a CE
+  adapter has no `GITLAB_URL`/`GITLAB_API_BASE` (never silently defaulting a
+  self-hosted credential to the public API). Redirects are **same-origin only**
+  (the `PRIVATE-TOKEN` credential is a custom header `reqwest` does not strip
+  cross-origin, so even an allowlisted different host is refused), bounded to
+  `MAX_REDIRECT_HOPS`, and never followed across an `https`→`http` downgrade.
 - **Pagination + binary-safe raw fetch.** List endpoints follow GitLab's
   `Link: rel="next"` header (the same RFC 5988 shape GitHub emits), bounded by a
   `MAX_PAGES` runaway guard. `content_raw_fetch` returns UTF-8 content as

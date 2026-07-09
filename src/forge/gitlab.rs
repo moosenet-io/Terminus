@@ -66,7 +66,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::forge::provider::{ForgeError, ForgeProvider, ForgeRequest, ForgeResponse};
 use crate::forge::{CapabilityMap, ForgeEndpoint, SupportLevel};
@@ -582,6 +582,45 @@ impl GitLabAdapter {
             ))),
         }
     }
+
+    /// Resolve a GitLab username to its numeric user id via
+    /// `GET /users?username=<name>` (exact match). GitLab's membership and
+    /// assignment APIs key off numeric ids, whereas the shared surface (like
+    /// GitHub's adapter) speaks usernames — this bridges the two so a caller can
+    /// pass a `username`/`assignees` of names and have them resolved here.
+    async fn resolve_user_id(&self, token: &str, username: &str) -> Result<i64, ForgeError> {
+        let url = format!("{}/users?username={}", self.base(), pct(username, false));
+        let body = self.call(token, reqwest::Method::GET, &url, None).await?;
+        body.as_array()
+            .and_then(|a| a.first())
+            .and_then(|u| u.get("id"))
+            .and_then(Value::as_i64)
+            .ok_or_else(|| ForgeError::InvalidRequest(format!(
+                "no GitLab user found matching username '{username}'"
+            )))
+    }
+
+    /// Resolve the shared surface's assignee selection into GitLab's
+    /// `assignee_ids` (numeric). Accepts EITHER `assignee_ids` (numeric array,
+    /// GitLab-native — used verbatim) OR `assignees` (array of username strings,
+    /// GitHub-style — each resolved via [`GitLabAdapter::resolve_user_id`]).
+    /// Returns `None` when neither is present so the caller can omit the field.
+    async fn resolve_assignee_ids(&self, token: &str, p: &Value) -> Result<Option<Vec<i64>>, ForgeError> {
+        if let Some(ids) = p.get("assignee_ids").and_then(Value::as_array) {
+            let out: Vec<i64> = ids.iter().filter_map(Value::as_i64).collect();
+            return Ok(Some(out));
+        }
+        if let Some(names) = p.get("assignees").and_then(Value::as_array) {
+            let mut out = Vec::with_capacity(names.len());
+            for n in names {
+                if let Some(name) = n.as_str() {
+                    out.push(self.resolve_user_id(token, name).await?);
+                }
+            }
+            return Ok(Some(out));
+        }
+        Ok(None)
+    }
 }
 
 /// Build the egress allowlist: the API base host, plus (for `gitlab_saas`) the
@@ -612,40 +651,53 @@ fn build_allowlist(api_base: &str, variant: GitLabVariant) -> Vec<String> {
 /// than running until the client's overall request timeout.
 const MAX_REDIRECT_HOPS: usize = 5;
 
+/// Authority (host or host:port, default ports dropped) of a [`url::Url`] from
+/// the redirect policy — mirrors [`host_of`]'s normalization so the two agree
+/// (the `url` crate already returns `None` from `port()` for a scheme's default
+/// port, matching `host_of`'s default-port stripping).
+fn url_authority(url: &reqwest::Url) -> Option<String> {
+    let host = url.host_str()?;
+    let authority = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    Some(authority.to_lowercase())
+}
+
 /// Build the egress-aware redirect policy shared by [`GitLabAdapter::from_env`]
-/// and the test adapter constructor. Every hop is re-validated against the SAME
-/// allowlist (fail-closed on any non-allowlisted target — egress isolation must
-/// survive redirects, matching the GitHub adapter's posture), PLUS two
-/// additions this adapter tightens over a bare authority check:
-/// - **Bounded hop count** — [`MAX_REDIRECT_HOPS`] caps a redirect chain so an
-///   allowlisted redirect loop cannot run until the client timeout.
+/// and the test adapter constructor. The posture is deliberately stricter than a
+/// bare allowlist check, because the credential travels in a CUSTOM header
+/// (`PRIVATE-TOKEN`) that `reqwest` — unlike the standard `Authorization` header
+/// — does NOT strip across a cross-origin redirect:
+/// - **Same-origin only.** A redirect is followed ONLY when its authority equals
+///   the ORIGINAL request's authority. A different (even allowlisted) host — a
+///   CDN/asset host, another pool member — would otherwise silently receive the
+///   `PRIVATE-TOKEN`; refusing cross-origin redirects closes that credential-leak
+///   path entirely. (The allowlist still gates the initial request in
+///   [`GitLabAdapter::call`]/etc.)
+/// - **Bounded hop count** — [`MAX_REDIRECT_HOPS`] caps a same-origin redirect
+///   loop so it cannot run until the client timeout.
 /// - **No scheme downgrade** — a chain that started `https` may never follow a
-///   `http` hop, even to an allowlisted host: silently dropping to plaintext
-///   would leak the `PRIVATE-TOKEN` credential header over an unencrypted
-///   connection.
-fn build_redirect_policy(allowlist: Arc<Vec<String>>) -> reqwest::redirect::Policy {
+///   `http` hop: dropping to plaintext would leak the credential header over an
+///   unencrypted connection.
+fn build_redirect_policy(_allowlist: Arc<Vec<String>>) -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() >= MAX_REDIRECT_HOPS {
             return attempt.stop();
         }
         let url = attempt.url();
-        if let Some(first) = attempt.previous().first() {
-            if first.scheme() == "https" && url.scheme() != "https" {
-                return attempt.stop();
-            }
-        }
-        let authority = match url.host_str() {
-            Some(h) => match url.port() {
-                Some(port) => format!("{h}:{port}"),
-                None => h.to_string(),
-            },
+        // The original request URL is the first entry in `previous()`.
+        let origin = match attempt.previous().first() {
+            Some(first) => first,
             None => return attempt.stop(),
         };
-        let authority = authority.to_lowercase();
-        if allowlist.iter().any(|a| a == &authority) {
-            attempt.follow()
-        } else {
-            attempt.stop()
+        if origin.scheme() == "https" && url.scheme() != "https" {
+            return attempt.stop();
+        }
+        match (url_authority(url), url_authority(origin)) {
+            (Some(target), Some(source)) if target == source => attempt.follow(),
+            // Cross-origin (or unparseable) — never forward the credential header.
+            _ => attempt.stop(),
         }
     })
 }
@@ -679,6 +731,50 @@ fn labels_string(v: &Value) -> String {
         Value::String(s) => s.clone(),
         _ => String::new(),
     }
+}
+
+/// Normalize a webhook body to GitLab's flat v4 shape. GitLab expects a
+/// top-level `url` plus per-event boolean flags (`push_events`,
+/// `merge_requests_events`, …) and a `token` secret — NOT GitHub's nested
+/// `config: { url, secret }` + `events: [ "push", "pull_request", … ]` array.
+///
+/// - A body that is already GitLab-flat (has a top-level `url`) passes through
+///   VERBATIM, so a caller supplying native GitLab fields is never mangled.
+/// - A GitHub-style body (`config.url` and/or an `events` array) is translated:
+///   `config.url`→`url`, `config.secret`→`token`, and each recognized GitHub
+///   event name is mapped to its GitLab boolean flag. Unknown event names are
+///   ignored rather than guessed.
+fn translate_webhook(hook: &Value) -> Value {
+    // Already GitLab-native (flat url) — pass through untouched.
+    if hook.get("url").and_then(Value::as_str).is_some() {
+        return hook.clone();
+    }
+    let mut out = Map::new();
+    if let Some(url) = hook.pointer("/config/url").and_then(Value::as_str) {
+        out.insert("url".into(), json!(url));
+    }
+    if let Some(secret) = hook.pointer("/config/secret").and_then(Value::as_str) {
+        out.insert("token".into(), json!(secret));
+    }
+    if let Some(active) = hook.get("active").and_then(Value::as_bool) {
+        out.insert("enable_ssl_verification".into(), json!(active));
+    }
+    if let Some(events) = hook.get("events").and_then(Value::as_array) {
+        for ev in events.iter().filter_map(Value::as_str) {
+            let flag = match ev {
+                "push" => "push_events",
+                "pull_request" => "merge_requests_events",
+                "issues" => "issues_events",
+                "issue_comment" | "commit_comment" => "note_events",
+                "release" => "releases_events",
+                "pipeline" | "status" => "pipeline_events",
+                "deployment" => "deployment_events",
+                _ => continue,
+            };
+            out.insert(flag.into(), json!(true));
+        }
+    }
+    Value::Object(out)
 }
 
 /// Percent-encode a string for safe interpolation into a URL. Unreserved
@@ -716,16 +812,29 @@ fn parse_next_link(link: &str) -> Option<String> {
     None
 }
 
-/// Extract the host (host or host:port) from a URL string.
+/// Extract the host (host or host:port) from a URL string, dropping a scheme's
+/// DEFAULT port so matching agrees with the `url` crate (which reports `None`
+/// for `port()` on a default port). Without this, a base configured as
+/// `https://gitlab.example.com:443` would fail to match a redirect `Location`
+/// of `https://gitlab.example.com` (no port), causing a false egress block.
 fn host_of(url: &str) -> Option<String> {
-    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let (scheme, rest) = match url.split_once("://") {
+        Some((s, r)) => (Some(s.to_ascii_lowercase()), r),
+        None => (None, url),
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     let authority = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
     if authority.is_empty() {
-        None
-    } else {
-        Some(authority.to_string())
+        return None;
     }
+    // Strip the scheme's default port so `host:443`(https)/`host:80`(http)
+    // normalize to bare `host`. A non-default explicit port is preserved.
+    let normalized = match (scheme.as_deref(), authority.rsplit_once(':')) {
+        (Some("https"), Some((h, "443"))) => h,
+        (Some("http"), Some((h, "80"))) => h,
+        _ => authority,
+    };
+    Some(normalized.to_string())
 }
 
 /// GitLab's advertised support for the shared vocabulary. GitLab v4 covers most
@@ -810,9 +919,21 @@ impl ForgeProvider for GitLabAdapter {
             // ── Repos (project) ─────────────────────────────────────────────────
             ReposList => {
                 let owner = self.owner(p);
-                let group = pct(&owner, false);
-                let url = format!("{api}/groups/{group}/projects?per_page=100&order_by=updated_at");
-                ok(self.call_paginated(&token, &url).await?)
+                let enc = pct(&owner, false);
+                // A GitLab namespace is either a GROUP or a USER, and they list
+                // projects under different paths (`/groups/{id}/projects` vs
+                // `/users/{id}/projects`). Try the group path first (the common
+                // org case), and on a not-found/forbidden fall back to the user
+                // path so an `owner` that is a personal namespace still lists.
+                let group_url = format!("{api}/groups/{enc}/projects?per_page=100&order_by=updated_at");
+                match self.call_paginated(&token, &group_url).await {
+                    Ok(body) => ok(body),
+                    Err(ForgeError::Transport { .. }) | Err(ForgeError::Auth { .. }) => {
+                        let user_url = format!("{api}/users/{enc}/projects?per_page=100&order_by=updated_at");
+                        ok(self.call_paginated(&token, &user_url).await?)
+                    }
+                    Err(e) => Err(e),
+                }
             }
             ReposGet => {
                 let pid = self.project_ref(p)?;
@@ -841,6 +962,11 @@ impl ForgeProvider for GitLabAdapter {
                 });
                 if let Some(id) = namespace_id {
                     body["namespace_id"] = json!(id);
+                }
+                // Map the shared surface's `auto_init` (GitHub's "seed a README")
+                // onto GitLab's equivalent `initialize_with_readme`.
+                if let Some(init) = p.get("auto_init").and_then(Value::as_bool) {
+                    body["initialize_with_readme"] = json!(init);
                 }
                 let url = format!("{api}/projects");
                 ok(self.call(&token, Method::POST, &url, Some(&body)).await?)
@@ -1043,8 +1169,20 @@ impl ForgeProvider for GitLabAdapter {
                 let pid = self.project_ref(p)?;
                 let iid = Self::req_num(p, "number")?;
                 let mut body = json!({});
-                if let Some(t) = p.get("commit_title").and_then(Value::as_str) {
-                    body["merge_commit_message"] = json!(t);
+                // GitLab's merge takes a single `merge_commit_message`; the
+                // shared surface may carry `commit_title` and/or `commit_message`
+                // (GitHub-style). Combine both when present, else use whichever
+                // is given, so neither is silently dropped.
+                let title = p.get("commit_title").and_then(Value::as_str);
+                let msg = p.get("commit_message").and_then(Value::as_str);
+                let merge_msg = match (title, msg) {
+                    (Some(t), Some(m)) => Some(format!("{t}\n\n{m}")),
+                    (Some(t), None) => Some(t.to_string()),
+                    (None, Some(m)) => Some(m.to_string()),
+                    (None, None) => None,
+                };
+                if let Some(m) = merge_msg {
+                    body["merge_commit_message"] = json!(m);
                 }
                 if let Some(sq) = p.get("squash").and_then(Value::as_bool) {
                     body["squash"] = json!(sq);
@@ -1078,7 +1216,9 @@ impl ForgeProvider for GitLabAdapter {
                 let mut body = json!({ "title": Self::req_str(p, "title")? });
                 if let Some(b) = p.get("body").and_then(Value::as_str) { body["description"] = json!(b); }
                 if let Some(l) = p.get("labels") { body["labels"] = json!(labels_string(l)); }
-                if let Some(a) = p.get("assignee_ids") { body["assignee_ids"] = a.clone(); }
+                if let Some(ids) = self.resolve_assignee_ids(&token, p).await? {
+                    body["assignee_ids"] = json!(ids);
+                }
                 let url = format!("{api}/projects/{pid}/issues");
                 ok(self.call(&token, Method::POST, &url, Some(&body)).await?)
             }
@@ -1110,7 +1250,10 @@ impl ForgeProvider for GitLabAdapter {
             IssuesAssign => {
                 let pid = self.project_ref(p)?;
                 let iid = Self::req_num(p, "number")?;
-                let body = json!({ "assignee_ids": p.get("assignee_ids").cloned().unwrap_or_else(|| json!([])) });
+                // Absent selection clears assignees (empty array), matching the
+                // clear-semantics of the other issue mutators.
+                let ids = self.resolve_assignee_ids(&token, p).await?.unwrap_or_default();
+                let body = json!({ "assignee_ids": ids });
                 let url = format!("{api}/projects/{pid}/issues/{iid}");
                 ok(self.call(&token, Method::PUT, &url, Some(&body)).await?)
             }
@@ -1198,14 +1341,17 @@ impl ForgeProvider for GitLabAdapter {
             }
             WebhooksCreate => {
                 let pid = self.project_ref(p)?;
-                let body = Self::req_value(p, "hook")?;
+                let body = translate_webhook(&Self::req_value(p, "hook")?);
                 let url = format!("{api}/projects/{pid}/hooks");
                 ok(self.call(&token, Method::POST, &url, Some(&body)).await?)
             }
             WebhooksUpdate => {
                 let pid = self.project_ref(p)?;
                 let id = Self::req_num(p, "id")?;
-                let body = p.get("updates").cloned().unwrap_or_else(|| json!({}));
+                // Accept either a GitHub-style `hook`/`updates` body (translated)
+                // or GitLab-native fields (passed through by translate_webhook).
+                let raw = p.get("hook").or_else(|| p.get("updates")).cloned().unwrap_or_else(|| json!({}));
+                let body = translate_webhook(&raw);
                 let url = format!("{api}/projects/{pid}/hooks/{id}");
                 ok(self.call(&token, Method::PUT, &url, Some(&body)).await?)
             }
@@ -1324,26 +1470,42 @@ impl ForgeProvider for GitLabAdapter {
                         (B64.encode(raw.as_bytes()), "base64")
                     }
                 };
-                let body = json!({
+                let mut body = json!({
                     "branch": branch,
                     "content": content,
                     "encoding": encoding,
                     "commit_message": message,
                 });
-                let url = format!("{api}/projects/{pid}/repository/files/{path}");
-                // GitLab uses POST to create a new file and PUT to update an
-                // existing one at the SAME path — an explicit `create` flag
-                // selects create; the default is update (the common
-                // upsert-style write path most callers want).
-                let create = p.get("create").and_then(Value::as_bool).unwrap_or(false);
+                // GitLab splits file writes into POST (create a new file, fails
+                // if it exists) and PUT (update an existing file, fails if it
+                // does not) — there is no single upsert verb. Infer the method
+                // the same way the GitHub adapter keys off `sha`: an explicit
+                // `create` bool wins; otherwise treat the presence of a prior
+                // blob reference (`sha`/`last_commit_id`) as "this is an update"
+                // (PUT) and its ABSENCE as "this is a new file" (POST). This
+                // lets a generic caller create a new file with no extra flag,
+                // which the previous PUT-by-default could not.
+                if let Some(id) = p.get("last_commit_id").and_then(Value::as_str) {
+                    body["last_commit_id"] = json!(id);
+                }
+                let create = match p.get("create").and_then(Value::as_bool) {
+                    Some(explicit) => explicit,
+                    None => p.get("sha").and_then(Value::as_str).is_none()
+                        && p.get("last_commit_id").and_then(Value::as_str).is_none(),
+                };
                 let method = if create { Method::POST } else { Method::PUT };
+                let url = format!("{api}/projects/{pid}/repository/files/{path}");
                 ok(self.call(&token, method, &url, Some(&body)).await?)
             }
             ContentListTree => {
                 let pid = self.project_ref(p)?;
                 let mut url = format!("{api}/projects/{pid}/repository/tree?per_page=100");
                 if let Some(path) = p.get("path").and_then(Value::as_str) {
-                    url.push_str(&format!("&path={}", pct(path, false)));
+                    // The tree `path` is a QUERY param and GitLab resolves it as
+                    // a hierarchical directory path — keep its `/` separators
+                    // (only escape truly reserved chars) so `docs/sub` addresses
+                    // the intended subtree rather than a literal `docs%2Fsub`.
+                    url.push_str(&format!("&path={}", pct(path, true)));
                 }
                 if let Some(r) = p.get("ref").and_then(Value::as_str) {
                     url.push_str(&format!("&ref={}", pct(r, false)));
@@ -1371,7 +1533,18 @@ impl ForgeProvider for GitLabAdapter {
             }
             OrgPermissions => {
                 let pid = self.project_ref(p)?;
-                let user_id = Self::req_num(p, "user_id")?;
+                // Accept EITHER a GitLab-native numeric `user_id` or a
+                // GitHub-style `username` (resolved to an id here), so the shared
+                // surface's username-keyed permission check works against GitLab.
+                let user_id = match Self::req_num(p, "user_id") {
+                    Ok(id) => id,
+                    Err(_) => {
+                        let username = Self::req_str(p, "username").map_err(|_| {
+                            ForgeError::InvalidRequest("'user_id' or 'username' is required".into())
+                        })?;
+                        self.resolve_user_id(&token, &username).await?
+                    }
+                };
                 let url = format!("{api}/projects/{pid}/members/all/{user_id}");
                 ok(self.call(&token, Method::GET, &url, None).await?)
             }
@@ -2003,7 +2176,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn content_write_base64_encodes_utf8_content_default_update() {
+    async fn content_write_base64_encodes_utf8_content_no_sha_defaults_to_create_post() {
+        // No `sha`/`last_commit_id`/`create` -> inferred as a NEW file (POST),
+        // so a generic caller can create a file without an extra flag.
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(POST)
+                .path("/projects/moosenet%2Fdemo/repository/files/a.md") // pii-test-fixture
+                .json_body(json!({
+                    "branch": "main",
+                    "content": B64.encode("hello"),
+                    "encoding": "base64",
+                    "commit_message": "create",
+                }));
+            then.status(201).json_body(json!({ "file_path": "a.md" }));
+        });
+        let a = test_adapter(&server.base_url());
+        a.dispatch(
+            ForgeEndpoint::ContentWriteFile,
+            req(json!({ "repo": "demo", "path": "a.md", "content": "hello", "message": "create", "branch": "main" })),
+        )
+        .await
+        .unwrap();
+        m.assert();
+    }
+
+    #[tokio::test]
+    async fn content_write_with_last_commit_id_infers_update_put() {
+        // Presence of a prior-blob reference -> inferred as an UPDATE (PUT), and
+        // the reference is forwarded to GitLab for optimistic concurrency.
         let server = MockServer::start();
         let m = server.mock(|when, then| {
             when.method(PUT)
@@ -2013,13 +2214,14 @@ mod tests {
                     "content": B64.encode("hello"),
                     "encoding": "base64",
                     "commit_message": "update",
+                    "last_commit_id": "abc123",
                 }));
             then.status(200).json_body(json!({ "file_path": "a.md" }));
         });
         let a = test_adapter(&server.base_url());
         a.dispatch(
             ForgeEndpoint::ContentWriteFile,
-            req(json!({ "repo": "demo", "path": "a.md", "content": "hello", "message": "update", "branch": "main" })),
+            req(json!({ "repo": "demo", "path": "a.md", "content": "hello", "message": "update", "branch": "main", "last_commit_id": "abc123" })),
         )
         .await
         .unwrap();
@@ -2027,16 +2229,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn content_write_create_uses_post() {
+    async fn content_write_explicit_create_false_forces_put() {
         let server = MockServer::start();
         let m = server.mock(|when, then| {
-            when.method(POST).path("/projects/moosenet%2Fdemo/repository/files/new.md"); // pii-test-fixture
-            then.status(201).json_body(json!({ "file_path": "new.md" }));
+            when.method(PUT).path("/projects/moosenet%2Fdemo/repository/files/a.md"); // pii-test-fixture
+            then.status(200).json_body(json!({ "file_path": "a.md" }));
         });
         let a = test_adapter(&server.base_url());
         a.dispatch(
             ForgeEndpoint::ContentWriteFile,
-            req(json!({ "repo": "demo", "path": "new.md", "content": "x", "message": "create", "create": true })),
+            req(json!({ "repo": "demo", "path": "a.md", "content": "x", "message": "m", "create": false })),
         )
         .await
         .unwrap();
@@ -2111,5 +2313,189 @@ mod tests {
         let dbg = format!("{a:?}");
         assert!(!dbg.contains("testtoken"));
         assert!(dbg.contains("redacted"));
+    }
+
+    // ── secondary-review hardening (agy P1/P2) ───────────────────────────────
+
+    #[test]
+    fn host_of_strips_default_ports() {
+        // https:443 and http:80 normalize to bare host (matches url crate).
+        assert_eq!(host_of("https://gitlab.example.com:443/api/v4/x").as_deref(), Some("gitlab.example.com")); // pii-test-fixture
+        assert_eq!(host_of("http://gitlab.example.com:80/x").as_deref(), Some("gitlab.example.com")); // pii-test-fixture
+        // A non-default explicit port is preserved.
+        assert_eq!(host_of("https://gitlab.example.com:8443/x").as_deref(), Some("gitlab.example.com:8443")); // pii-test-fixture
+    }
+
+    #[test]
+    fn allowlist_with_explicit_443_matches_bare_host() {
+        // A base configured with an explicit :443 must still allow the bare-host
+        // form (and vice versa) — no false egress block from default-port drift.
+        let a = test_adapter("https://gitlab.example.internal:443/api/v4"); // pii-test-fixture
+        assert!(a.host_allowed("https://gitlab.example.internal/api/v4/projects/x")); // pii-test-fixture
+        assert!(a.host_allowed("https://gitlab.example.internal:443/api/v4/projects/x")); // pii-test-fixture
+    }
+
+    #[tokio::test]
+    async fn cross_origin_redirect_to_allowlisted_host_is_not_followed() {
+        // SaaS allowlists gitlab.com in addition to the mock base. A redirect
+        // from the base to gitlab.com is CROSS-ORIGIN and must NOT be followed —
+        // otherwise the PRIVATE-TOKEN (a custom header reqwest does not strip)
+        // would be sent to a different host. It surfaces as a Transport error.
+        let server = MockServer::start();
+        let redirect = server.mock(|when, then| {
+            when.method(GET).path_contains("/projects/");
+            then.status(302).header("location", "https://gitlab.com/api/v4/projects/stolen");
+        });
+        let a = test_adapter_variant(&server.base_url(), GitLabVariant::Saas);
+        let err = a
+            .dispatch(ForgeEndpoint::ReposGet, req(json!({ "repo": "r" })))
+            .await
+            .expect_err("cross-origin redirect (even to an allowlisted host) must not be followed");
+        assert!(matches!(err, ForgeError::Transport { .. }), "got {err:?}");
+        redirect.assert();
+    }
+
+    #[test]
+    fn translate_webhook_maps_github_shape_to_gitlab_flat() {
+        let gh = json!({
+            "config": { "url": "https://hook.example/x", "secret": "s3cr3t" }, // pii-test-fixture
+            "events": ["push", "pull_request", "issues"],
+            "active": true
+        });
+        let gl = translate_webhook(&gh);
+        assert_eq!(gl["url"], "https://hook.example/x"); // pii-test-fixture
+        assert_eq!(gl["token"], "s3cr3t");
+        assert_eq!(gl["push_events"], true);
+        assert_eq!(gl["merge_requests_events"], true);
+        assert_eq!(gl["issues_events"], true);
+        assert_eq!(gl["enable_ssl_verification"], true);
+    }
+
+    #[test]
+    fn translate_webhook_passes_gitlab_native_verbatim() {
+        let gl_native = json!({ "url": "https://hook.example/y", "push_events": true }); // pii-test-fixture
+        assert_eq!(translate_webhook(&gl_native), gl_native);
+    }
+
+    #[tokio::test]
+    async fn webhooks_create_translates_github_hook() {
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(POST)
+                .path("/projects/moosenet%2Fdemo/hooks") // pii-test-fixture
+                .json_body_partial(json!({ "url": "https://hook.example/x", "push_events": true }).to_string()); // pii-test-fixture
+            then.status(201).json_body(json!({ "id": 1 }));
+        });
+        let a = test_adapter(&server.base_url());
+        a.dispatch(
+            ForgeEndpoint::WebhooksCreate,
+            req(json!({ "repo": "demo", "hook": { "config": { "url": "https://hook.example/x" }, "events": ["push"] } })), // pii-test-fixture
+        )
+        .await
+        .unwrap();
+        m.assert();
+    }
+
+    #[tokio::test]
+    async fn issues_create_resolves_assignee_usernames_to_ids() {
+        let server = MockServer::start();
+        let users = server.mock(|when, then| {
+            when.method(GET).path("/users").query_param("username", "alice");
+            then.status(200).json_body(json!([{ "id": 501, "username": "alice" }]));
+        });
+        let create = server.mock(|when, then| {
+            when.method(POST)
+                .path("/projects/moosenet%2Fdemo/issues") // pii-test-fixture
+                .json_body_partial(json!({ "assignee_ids": [501] }).to_string());
+            then.status(201).json_body(json!({ "iid": 1 }));
+        });
+        let a = test_adapter(&server.base_url());
+        a.dispatch(
+            ForgeEndpoint::IssuesCreate,
+            req(json!({ "repo": "demo", "title": "t", "assignees": ["alice"] })),
+        )
+        .await
+        .unwrap();
+        users.assert();
+        create.assert();
+    }
+
+    #[tokio::test]
+    async fn issues_create_accepts_native_assignee_ids_without_lookup() {
+        let server = MockServer::start();
+        // No /users mock — a lookup would 404 and fail the dispatch.
+        let create = server.mock(|when, then| {
+            when.method(POST)
+                .path("/projects/moosenet%2Fdemo/issues") // pii-test-fixture
+                .json_body_partial(json!({ "assignee_ids": [7, 8] }).to_string());
+            then.status(201).json_body(json!({ "iid": 1 }));
+        });
+        let a = test_adapter(&server.base_url());
+        a.dispatch(
+            ForgeEndpoint::IssuesCreate,
+            req(json!({ "repo": "demo", "title": "t", "assignee_ids": [7, 8] })),
+        )
+        .await
+        .unwrap();
+        create.assert();
+    }
+
+    #[tokio::test]
+    async fn org_permissions_resolves_username() {
+        let server = MockServer::start();
+        let users = server.mock(|when, then| {
+            when.method(GET).path("/users").query_param("username", "bob");
+            then.status(200).json_body(json!([{ "id": 99, "username": "bob" }]));
+        });
+        let perm = server.mock(|when, then| {
+            when.method(GET).path("/projects/moosenet%2Fdemo/members/all/99"); // pii-test-fixture
+            then.status(200).json_body(json!({ "access_level": 40 }));
+        });
+        let a = test_adapter(&server.base_url());
+        a.dispatch(ForgeEndpoint::OrgPermissions, req(json!({ "repo": "demo", "username": "bob" })))
+            .await
+            .unwrap();
+        users.assert();
+        perm.assert();
+    }
+
+    #[tokio::test]
+    async fn repos_list_falls_back_to_user_namespace() {
+        let server = MockServer::start();
+        let group = server.mock(|when, then| {
+            when.method(GET).path("/groups/someuser/projects");
+            then.status(404).body("{\"message\":\"404 Group Not Found\"}");
+        });
+        let user = server.mock(|when, then| {
+            when.method(GET).path("/users/someuser/projects");
+            then.status(200).json_body(json!([{ "id": 1, "path": "p" }]));
+        });
+        let a = test_adapter(&server.base_url());
+        let resp = a
+            .dispatch(ForgeEndpoint::ReposList, req(json!({ "owner": "someuser" })))
+            .await
+            .unwrap();
+        assert_eq!(resp.body.as_array().unwrap().len(), 1);
+        group.assert();
+        user.assert();
+    }
+
+    #[tokio::test]
+    async fn pull_requests_merge_combines_title_and_message() {
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(PUT)
+                .path("/projects/moosenet%2Fdemo/merge_requests/2/merge") // pii-test-fixture
+                .json_body_partial(json!({ "merge_commit_message": "T\n\nBody" }).to_string());
+            then.status(200).json_body(json!({ "state": "merged" }));
+        });
+        let a = test_adapter(&server.base_url());
+        a.dispatch(
+            ForgeEndpoint::PullRequestsMerge,
+            req(json!({ "repo": "demo", "number": 2, "commit_title": "T", "commit_message": "Body" })),
+        )
+        .await
+        .unwrap();
+        m.assert();
     }
 }
