@@ -541,6 +541,47 @@ pub fn mtls_server_cert_ttl_days() -> i64 {
         .unwrap_or(365)
 }
 
+// ── TGW-01: terminus-primary mTLS listener config (non-secret) ────────────
+//
+// The new `terminus-primary` binary (aggregated-core-registry gateway)
+// needs its OWN bind/port/identity config, deliberately NOT reusing
+// `TERMINUS_MTLS_*` (terminus_personal's own var family) — the two binaries
+// are meant to be able to run side by side (see the TGW-01 spec item's
+// design decision #1, "ALONGSIDE"), including on the same host during
+// testing/dev, so sharing a var family would make their default ports
+// collide. CA/PKI material itself is still resolved the normal way
+// (`crate::pki::ca()`'s env-then-local-store-then-generate precedence,
+// unchanged) — each process's own environment naturally gives it its own
+// independently-provisioned CA (TGW-01 design decision #3), no special
+// casing needed here.
+
+/// Bind address for `terminus-primary`'s mTLS listener. From
+/// `TERMINUS_PRIMARY_MTLS_BIND`; defaults to `127.0.0.1`, matching the same
+/// "opt into a wider bind explicitly" posture as every other listener in
+/// this crate.
+pub fn mtls_primary_bind_addr() -> String {
+    env_nonempty("TERMINUS_PRIMARY_MTLS_BIND").unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
+/// Bind port for `terminus-primary`'s mTLS listener. From
+/// `TERMINUS_PRIMARY_MTLS_PORT`; defaults to `8311` — distinct from
+/// `terminus_personal`'s own `TERMINUS_MTLS_PORT` default (`8301`) so both
+/// binaries can run concurrently on the same host without a port collision.
+pub fn mtls_primary_port() -> u16 {
+    env_nonempty("TERMINUS_PRIMARY_MTLS_PORT")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8311)
+}
+
+/// `terminus-primary`'s own mTLS server-cert identity name, embedded in
+/// CN/SAN at issuance. From `TERMINUS_PRIMARY_MTLS_SERVER_IDENTITY`;
+/// defaults to `terminus-primary`. Purely an operator-facing label — plays
+/// no role in client-side authz.
+pub fn mtls_primary_server_identity() -> String {
+    env_nonempty("TERMINUS_PRIMARY_MTLS_SERVER_IDENTITY")
+        .unwrap_or_else(|| "terminus-primary".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -857,5 +898,52 @@ mod tests {
         std::env::set_var("TERMINUS_CA_STORE_PATH", "/tmp/example-ca-store.json");
         assert_eq!(ca_store_path(), "/tmp/example-ca-store.json");
         std::env::remove_var("TERMINUS_CA_STORE_PATH");
+    }
+
+    // ── TGW-01: terminus-primary mTLS config defaults + overrides, and that
+    //    they never collide with terminus_personal's own TERMINUS_MTLS_*
+    //    family (the whole point of a separate var family). ─────────────────
+
+    #[test]
+    #[serial]
+    fn mtls_primary_bind_addr_defaults_and_overrides() {
+        std::env::remove_var("TERMINUS_PRIMARY_MTLS_BIND");
+        assert_eq!(mtls_primary_bind_addr(), "127.0.0.1");
+        std::env::set_var("TERMINUS_PRIMARY_MTLS_BIND", "0.0.0.0");
+        assert_eq!(mtls_primary_bind_addr(), "0.0.0.0");
+        std::env::remove_var("TERMINUS_PRIMARY_MTLS_BIND");
+    }
+
+    #[test]
+    #[serial]
+    fn mtls_primary_port_defaults_and_overrides() {
+        std::env::remove_var("TERMINUS_PRIMARY_MTLS_PORT");
+        assert_eq!(mtls_primary_port(), 8311);
+        std::env::set_var("TERMINUS_PRIMARY_MTLS_PORT", "9911");
+        assert_eq!(mtls_primary_port(), 9911);
+        std::env::remove_var("TERMINUS_PRIMARY_MTLS_PORT");
+    }
+
+    #[test]
+    #[serial]
+    fn mtls_primary_server_identity_defaults_and_overrides() {
+        std::env::remove_var("TERMINUS_PRIMARY_MTLS_SERVER_IDENTITY");
+        assert_eq!(mtls_primary_server_identity(), "terminus-primary");
+        std::env::set_var("TERMINUS_PRIMARY_MTLS_SERVER_IDENTITY", "custom-primary");
+        assert_eq!(mtls_primary_server_identity(), "custom-primary");
+        std::env::remove_var("TERMINUS_PRIMARY_MTLS_SERVER_IDENTITY");
+    }
+
+    #[test]
+    #[serial]
+    fn mtls_primary_defaults_never_collide_with_terminus_personal_mtls_defaults() {
+        std::env::remove_var("TERMINUS_PRIMARY_MTLS_PORT");
+        std::env::remove_var("TERMINUS_MTLS_PORT");
+        assert_ne!(
+            mtls_primary_port(),
+            mtls_port(),
+            "terminus-primary and terminus_personal must default to different mTLS ports \
+             so both can run alongside each other on the same host"
+        );
     }
 }

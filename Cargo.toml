@@ -23,6 +23,15 @@ readme = "README.md"
 name = "terminus_rs"
 path = "src/lib.rs"
 
+# TGW-01: `terminus-primary`, the <host> aggregated-core-registry gateway
+# binary, joins `terminus_personal` (already auto-discovered via
+# `src/bin/*.rs`) as an explicit `[[bin]]` entry for clarity. Cargo's
+# `src/bin/` autodiscovery already covers this path implicitly; this entry
+# is documentation-equivalent, not a behavior change.
+[[bin]]
+name = "terminus_primary"
+path = "src/bin/terminus_primary.rs"
+
 [dependencies]
 # terminus-rs is a STANDALONE crate with no lumina-core dependency. The small
 # set of types it once borrowed from lumina-core are vendored byte-for-byte into

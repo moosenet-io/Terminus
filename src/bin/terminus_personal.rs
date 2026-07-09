@@ -80,11 +80,8 @@
 //! - `TERMINUS_PERSONAL_INFISICAL_SECRET_PATH` — folder path within the
 //!   environment. Defaults to `/`.
 
-use std::sync::Arc;
-
 use terminus_rs::<secret-manager>::{fetch_secrets_batch, InfisicalConfig}; // pii-test-fixture
-use terminus_rs::mcp_server::{build_router, McpServerState};
-use terminus_rs::pki::enroll::build_enroll_router;
+use terminus_rs::pki::server::{build_gateway_router, spawn_mtls_listener, GatewayServerConfig};
 use terminus_rs::registry::{register_personal, ToolRegistry};
 
 /// The downstream secret keys this process needs, fetched from <secret-manager> at // pii-test-fixture
@@ -296,19 +293,26 @@ async fn main() {
         if auth_token.is_some() { "token" } else { "none" }
     );
 
-    let state = Arc::new(McpServerState {
-        registry,
+    // TGW-01: this binary's mTLS/enroll server-setup (previously inlined
+    // here) now lives in `terminus_rs::pki::server`, shared with the new
+    // `terminus_primary` binary — see that module's doc comment. Behavior
+    // for THIS binary is unchanged: same `McpServerState` fields, same
+    // `/mcp`+`/enroll` router merge, same mTLS bootstrap sequence on the
+    // same `TERMINUS_MTLS_*`-derived config, spawned the same way.
+    let gateway_config = GatewayServerConfig {
         server_name: "terminus-personal".to_string(),
         server_version: terminus_rs::VERSION.to_string(),
         auth_token,
-    });
+        mtls_bind: terminus_rs::config::mtls_bind_addr(),
+        mtls_port: terminus_rs::config::mtls_port(),
+        mtls_server_identity: terminus_rs::config::mtls_server_identity(),
+    };
 
     // TCLI-02: the enrollment endpoint is a fully separate, additive router
     // (its own request/response shape + auth model — see
     // `terminus_rs::pki::enroll` module docs) merged alongside the existing
-    // `/mcp`/`/healthz` router. `build_router`/`McpServerState` above are
-    // untouched by this merge -- existing clients see no behavior change.
-    let router = build_router(state).merge(build_enroll_router());
+    // `/mcp`/`/healthz` router. Existing clients see no behavior change.
+    let router = build_gateway_router(registry, &gateway_config);
 
     // TCLI-03: the mTLS listener is a SECOND, additive listener on a
     // separate port (`crate::config::mtls_port`, default 8301 — never
@@ -318,56 +322,7 @@ async fn main() {
     // completely unchanged by its presence — this task failing to start
     // (e.g. CA/server-cert bootstrap failure) is logged as an error and
     // does not prevent the existing plain listener from serving normally.
-    {
-        let mtls_router = router.clone();
-        tokio::spawn(async move {
-            let ca = match terminus_rs::pki::ca() {
-                Ok(ca) => ca,
-                Err(e) => {
-                    tracing::error!(
-                        "terminus_personal: mTLS listener disabled -- CA bootstrap failed: {e}"
-                    );
-                    return;
-                }
-            };
-            let server_identity = terminus_rs::config::mtls_server_identity();
-            let (server_cert_pem, server_key_pem) =
-                match terminus_rs::pki::mtls::issue_server_cert(ca, &server_identity) {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        tracing::error!(
-                            "terminus_personal: mTLS listener disabled -- server cert issuance failed: {e}"
-                        );
-                        return;
-                    }
-                };
-            let tls_config = match terminus_rs::pki::mtls::build_server_config(
-                ca.cert_pem(),
-                &server_cert_pem,
-                &server_key_pem,
-            ) {
-                Ok(cfg) => cfg,
-                Err(e) => {
-                    tracing::error!(
-                        "terminus_personal: mTLS listener disabled -- TLS config build failed: {e}"
-                    );
-                    return;
-                }
-            };
-
-            let mtls_bind = terminus_rs::config::mtls_bind_addr();
-            let mtls_port = terminus_rs::config::mtls_port();
-            tracing::info!(
-                "terminus_personal: starting mTLS listener on {mtls_bind}:{mtls_port} (identity={server_identity})"
-            );
-            if let Err(e) =
-                terminus_rs::pki::mtls::run_listener(&mtls_bind, mtls_port, tls_config, mtls_router)
-                    .await
-            {
-                tracing::error!("terminus_personal: mTLS listener stopped: {e}");
-            }
-        });
-    }
+    spawn_mtls_listener(router.clone(), &gateway_config);
 
     let listener = tokio::net::TcpListener::bind(format!("{bind_addr}:{port}"))
         .await
