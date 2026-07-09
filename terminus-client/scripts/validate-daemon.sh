@@ -55,14 +55,21 @@ list_raw="$(curl -fsS --max-time 15 -X POST "${BASE}/mcp" \
     || fail "POST /mcp tools/list request failed"
 
 # Response is SSE-framed: "event: message\ndata: {...}\n\n" -- extract the
-# data: line's JSON payload, same framing terminus_rs's own /mcp serves.
-list_json="$(printf '%s' "${list_raw}" | grep '^data:' | head -1 | sed 's/^data: *//')"
+# first data: line's JSON payload, same framing terminus_rs's own /mcp serves.
+# NOTE: this must use sed (not `grep | head`) inside the command substitution:
+# under `set -euo pipefail`, a grep that finds no match exits nonzero, which
+# would abort the whole script via set -e BEFORE the descriptive `fail` below
+# ever runs. sed exits 0 even on no match, so an empty result reaches the
+# `[ -n ... ]` guard and produces the intended diagnostic.
+list_json="$(printf '%s' "${list_raw}" | sed -n '/^data:/{s/^data: *//;p;q;}')"
 [ -n "${list_json}" ] || fail "could not find an SSE 'data:' line in the tools/list response: ${list_raw}"
 
 echo "${list_json}" | grep -q '"error"' && fail "tools/list returned a JSON-RPC error: ${list_json}"
 echo "${list_json}" | grep -q '"tools"' || fail "tools/list response has no 'tools' field: ${list_json}"
 
-tool_count="$(echo "${list_json}" | grep -o '"name"' | wc -l | tr -d ' ')"
+# `|| true`: grep -o exits nonzero on zero matches; without this, set -e +
+# pipefail would abort before the "returned zero tools" fail below can fire.
+tool_count="$(echo "${list_json}" | grep -o '"name"' | wc -l | tr -d ' ' || true)"
 echo "   OK: tools/list returned ${tool_count} tool name occurrences (catalog forwarded from the primary)"
 [ "${tool_count}" -gt 0 ] || fail "tools/list returned zero tools -- catalog forward is not actually working"
 
@@ -78,7 +85,8 @@ if echo "${list_json}" | grep -q "\"name\":\"${TOOL_NAME}\""; then
         -H 'Accept: application/json, text/event-stream' \
         -d "{\"jsonrpc\":\"2.0\",\"id\":\"tcli06-validate-call\",\"method\":\"tools/call\",\"params\":{\"name\":\"${TOOL_NAME}\",\"arguments\":{}}}")" \
         || fail "POST /mcp tools/call (${TOOL_NAME}) request failed"
-    call_json="$(printf '%s' "${call_raw}" | grep '^data:' | head -1 | sed 's/^data: *//')"
+    # sed (not grep|head) for the same set -e/pipefail reason as tools/list above.
+    call_json="$(printf '%s' "${call_raw}" | sed -n '/^data:/{s/^data: *//;p;q;}')"
     [ -n "${call_json}" ] || fail "could not find an SSE 'data:' line in the tools/call response: ${call_raw}"
     echo "${call_json}" | grep -q '"isError":true' && fail "tools/call ${TOOL_NAME} returned isError=true: ${call_json}"
     echo "   OK: tools/call ${TOOL_NAME} round-tripped through the daemon to the primary and back"
