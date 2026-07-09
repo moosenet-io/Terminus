@@ -97,12 +97,21 @@ use terminus_rs::registry::{register_personal, ToolRegistry};
 /// Gitea tool now authenticates solely via per-identity `GITEA_PAT_<NAME>`
 /// tokens (picked up dynamically via `PAT_KEY_PREFIXES` below), so there is no
 /// single unsuffixed Gitea token to materialize any more.
+///
+/// **TCLI-02:** `TERMINUS_ENROLLMENT_SHARED_SECRET` and
+/// `TERMINUS_JWT_SIGNING_KEY` are here so the `/enroll` endpoint's
+/// `env_nonempty(...)` checks see them at startup — without both present in
+/// the process env, `/enroll` reports `503 not configured` even when the
+/// operator has provisioned the values in <secret-manager>. Same anti-leak property // pii-test-fixture
+/// as every other entry: named allowlist, never "set every key found here".
 const DOWNSTREAM_SECRET_KEYS: &[&str] = &[
     "PLANE_API_URL",
     "PLANE_API_KEY",
     "PLANE_WORKSPACE",
     "GITEA_URL",
     "GITHUB_TOKEN",
+    "TERMINUS_ENROLLMENT_SHARED_SECRET",
+    "TERMINUS_JWT_SIGNING_KEY",
 ];
 
 /// Prefixes for named-identity Personal Access Tokens. In addition to the fixed
@@ -396,6 +405,8 @@ mod tests {
         "GITEA_URL",
         "GITEA_TOKEN",
         "GITHUB_TOKEN",
+        "TERMINUS_ENROLLMENT_SHARED_SECRET",
+        "TERMINUS_JWT_SIGNING_KEY",
         "PLANE_PAT_CLAUDE",
         "PLANE_PAT_HARMONY",
         "PLANE_PAT_FUTURE",
@@ -425,6 +436,22 @@ mod tests {
             when.method(POST).path("/api/v1/auth/universal-auth/login");
             then.status(200).json_body(json!({ "accessToken": token }));
         });
+    }
+
+    // ── TCLI-02: enrollment secrets present in the allowlist ─────────────────────
+
+    #[test]
+    fn downstream_allowlist_includes_enrollment_secrets() {
+        assert!(
+            DOWNSTREAM_SECRET_KEYS.contains(&"TERMINUS_ENROLLMENT_SHARED_SECRET"),
+            "TERMINUS_ENROLLMENT_SHARED_SECRET must be in DOWNSTREAM_SECRET_KEYS so /enroll \
+             can see it after startup fetch"
+        );
+        assert!(
+            DOWNSTREAM_SECRET_KEYS.contains(&"TERMINUS_JWT_SIGNING_KEY"),
+            "TERMINUS_JWT_SIGNING_KEY must be in DOWNSTREAM_SECRET_KEYS so /enroll \
+             can see it after startup fetch"
+        );
     }
 
     // ── NotConfigured: proceeds cleanly, no crash, no hang, no env mutation ──────
