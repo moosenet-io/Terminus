@@ -615,6 +615,45 @@ resolve the actual token at call time from the secret store via
 `SecretManager` / `vault::manager().get(key_name)`, so no credential literal ever
 appears in source, config, or logs.
 
+### GitHub adapter (`github`, git-public pool) — GITX-03
+
+`github::adapter::GitHubAdapter` is the first concrete adapter: the **git-public**
+pool's GitHub provider, implementing `ForgeProvider` over the GitHub REST v3 API
+(with a `GitHubAdapter::graphql` v4 helper for the endpoints REST cannot express).
+It carries the existing `github_*` tool logic into the trait shape; the standalone
+`github_list_repos` / `github_create_repo` / `github_push_branch` tools and the
+GHMR mirror engine keep working unchanged. This item builds only the adapter — the
+git-public MCP *tool* and its PII-gate write posture are assembled later (GITX-05).
+
+- **Capability map.** GitHub advertises nearly the whole vocabulary as
+  `supported`. The two honest gaps are left `unsupported` so the map never claims a
+  call the adapter cannot make: `repos_mirror_config` (GitHub has no pull-mirror
+  configuration REST endpoint) and `packages_publish` (publishing goes through a
+  registry wire protocol — npm/Cargo/OCI — not a single REST call).
+- **Per-identity credentials.** Tokens resolve, in order: a request's `identity`
+  → `GITHUB_PAT_<NAME>`; else the active-default identity (`GITHUB_IDENTITY_NAME`,
+  default `moose`) → its `GITHUB_PAT_<NAME>`; else the unsuffixed `GITHUB_TOKEN`
+  fallback. This mirrors the Gitea `GITEA_PAT_<NAME>` model (S105). Every resolved
+  token is `.trim()`-ed (a trailing newline is a classic silent-`401`) and is never
+  logged — the `Debug` impl redacts it. Missing/blank credential → a clean
+  `ForgeError::Auth`, never an empty `Authorization` header. `startup` materializes
+  `GITHUB_PAT_*` from the secret store alongside `GITEA_PAT_*`/`PLANE_PAT_*` (the
+  env read is this crate's sanctioned vault path).
+- **Public-pool marker.** `GitHubAdapter::is_public_pool()` returns `true` so the
+  GITX-05 tool assembly applies the exfiltration-surface posture (unconditional PII
+  gate on writes). The adapter itself does not gate — it advertises the pool.
+- **Egress isolation.** Every outbound call passes `GitHubAdapter::host_allowed`
+  first: only the configured API base authority plus the `github.com` family
+  (extendable via `GITHUB_EGRESS_ALLOWLIST`) may be dialed. Exact-authority
+  matching — a non-allowlisted host is refused locally rather than dialed, so the
+  adapter cannot be pointed at an arbitrary exfil endpoint.
+- **Error mapping.** `401`/`403` → `ForgeError::Auth` (the auth/scope-failure
+  surface); other non-2xx → `ForgeError::Transport`; an unsupported endpoint is
+  rejected by `dispatch` before any transport.
+- **Config.** `GITHUB_API_BASE` (override, test), `GITHUB_ORG` (default owner,
+  `moosenet-io`), `GITHUB_IDENTITY_NAME` (default identity), `GITHUB_EGRESS_ALLOWLIST`
+  (extra hosts). None are required — capability introspection needs no credential.
+
 ## License
 
 MIT

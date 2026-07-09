@@ -61,12 +61,15 @@ pub const GITEA_PLANE_GITHUB_SECRET_KEYS: &[&str] = &[
 /// - `PLANE_PAT_*` — Plane identities (`PLANE_PAT_CLAUDE`, `PLANE_PAT_MOOSE`, …).
 /// - `GITEA_PAT_*` — Gitea identities (`GITEA_PAT_MOOSE`, `GITEA_PAT_HARMONY`,
 ///   `GITEA_PAT_LUMINA`, …) — S105/GPAT, replacing the retired `GITEA_TOKEN`.
+/// - `GITHUB_PAT_*` — GitHub identities (`GITHUB_PAT_MOOSE`, …) — S106/GITX-03,
+///   the git-public `github` adapter's per-identity model, alongside the
+///   unsuffixed `GITHUB_TOKEN` fallback in the fixed allowlist above.
 ///
 /// A *dynamic prefix match*, not another fixed list: a newly-provisioned
 /// identity becomes usable on the next restart with no code change. Matching is
 /// scoped to exactly these prefixes (never "set every key found at the path"),
 /// preserving the same anti-leak property as the fixed allowlist above.
-pub const PAT_KEY_PREFIXES: &[&str] = &["PLANE_PAT_", "GITEA_PAT_"];
+pub const PAT_KEY_PREFIXES: &[&str] = &["PLANE_PAT_", "GITEA_PAT_", "GITHUB_PAT_"];
 
 /// Outcome of the startup bootstrap attempt. Returned to the caller so it can
 /// log the result (via [`log_secret_bootstrap_outcome`]) and so tests can
