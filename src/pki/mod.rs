@@ -74,6 +74,7 @@
 
 pub mod ca;
 pub mod enroll;
+pub mod mtls;
 
 pub use ca::CertificateAuthority;
 

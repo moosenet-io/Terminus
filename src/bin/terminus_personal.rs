@@ -301,6 +301,65 @@ async fn main() {
     // untouched by this merge -- existing clients see no behavior change.
     let router = build_router(state).merge(build_enroll_router());
 
+    // TCLI-03: the mTLS listener is a SECOND, additive listener on a
+    // separate port (`crate::config::mtls_port`, default 8301 — never
+    // `TERMINUS_PERSONAL_PORT`'s 8300) serving the SAME `router` built
+    // above. It is spawned as its own background task; the plain
+    // HTTP+JWT listener below (`axum::serve(listener, router)`) is
+    // completely unchanged by its presence — this task failing to start
+    // (e.g. CA/server-cert bootstrap failure) is logged as an error and
+    // does not prevent the existing plain listener from serving normally.
+    {
+        let mtls_router = router.clone();
+        tokio::spawn(async move {
+            let ca = match terminus_rs::pki::ca() {
+                Ok(ca) => ca,
+                Err(e) => {
+                    tracing::error!(
+                        "terminus_personal: mTLS listener disabled -- CA bootstrap failed: {e}"
+                    );
+                    return;
+                }
+            };
+            let server_identity = terminus_rs::config::mtls_server_identity();
+            let (server_cert_pem, server_key_pem) =
+                match terminus_rs::pki::mtls::issue_server_cert(ca, &server_identity) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::error!(
+                            "terminus_personal: mTLS listener disabled -- server cert issuance failed: {e}"
+                        );
+                        return;
+                    }
+                };
+            let tls_config = match terminus_rs::pki::mtls::build_server_config(
+                ca.cert_pem(),
+                &server_cert_pem,
+                &server_key_pem,
+            ) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    tracing::error!(
+                        "terminus_personal: mTLS listener disabled -- TLS config build failed: {e}"
+                    );
+                    return;
+                }
+            };
+
+            let mtls_bind = terminus_rs::config::mtls_bind_addr();
+            let mtls_port = terminus_rs::config::mtls_port();
+            tracing::info!(
+                "terminus_personal: starting mTLS listener on {mtls_bind}:{mtls_port} (identity={server_identity})"
+            );
+            if let Err(e) =
+                terminus_rs::pki::mtls::run_listener(&mtls_bind, mtls_port, tls_config, mtls_router)
+                    .await
+            {
+                tracing::error!("terminus_personal: mTLS listener stopped: {e}");
+            }
+        });
+    }
+
     let listener = tokio::net::TcpListener::bind(format!("{bind_addr}:{port}"))
         .await
         .unwrap_or_else(|e| panic!("terminus_personal: failed to bind {bind_addr}:{port}: {e}"));

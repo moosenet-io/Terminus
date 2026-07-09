@@ -47,7 +47,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{Duration as ChronoDuration, Utc};
 use jsonwebtoken::{encode, EncodingKey, Header};
-use rcgen::{CertificateParams, DnType, KeyPair, SanType};
+use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose, SanType};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -258,6 +258,17 @@ fn issue_leaf_cert(
             .try_into()
             .map_err(|e| EnrollError::CertIssuance(format!("SAN encoding: {e:?}")))?,
     )];
+    // TCLI-03 follow-up (from the TCLI-02 review): this leaf is presented as
+    // the CLIENT cert in the mTLS handshake (`crate::pki::mtls`), so it must
+    // carry the clientAuth EKU + a DigitalSignature KeyUsage or a strict TLS
+    // stack (and `crate::pki::mtls`'s own explicit, independent EKU check)
+    // will reject the handshake. Previously unset -- enrollment issued a
+    // cert with no EKU at all, which happened to be harmless before TCLI-03
+    // existed but silently would not have worked as a client-auth cert.
+    params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+    params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ClientAuth);
 
     let key_pair =
         KeyPair::generate().map_err(|e| EnrollError::CertIssuance(format!("leaf keypair: {e}")))?;
@@ -596,6 +607,47 @@ mod tests {
             leaf.verify_signature(Some(ca_cert.public_key())).is_ok(),
             "leaf cert's signature must cryptographically validate against the CA's public key"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn issued_cert_has_client_auth_eku_and_digital_signature_key_usage() {
+        // TCLI-03 follow-up: the enrollment leaf is the client cert an mTLS
+        // handshake presents (`crate::pki::mtls`); it must carry the
+        // clientAuth EKU (+ DigitalSignature KeyUsage) or a strict TLS stack
+        // rejects it. Regression test for the previously-missing EKU.
+        clear_secrets();
+        set_secrets("correct-horse-battery-staple", "jwt-signing-key-for-tests-only");
+        let ca = CertificateAuthority::generate().expect("generate CA");
+
+        let req = EnrollmentRequest {
+            identity: "harmony-primary".to_string(),
+            shared_secret: "<REDACTED-SECRET>".to_string(),
+        };
+        let resp = handle_enrollment(&ca, &req).expect("enrollment succeeds");
+
+        let leaf_der = parse_cert_der(&resp.cert_pem);
+        let (_, leaf) = x509_parser::parse_x509_certificate(&leaf_der).expect("parse leaf");
+
+        let eku = leaf
+            .extended_key_usage()
+            .expect("EKU extension parses")
+            .expect("EKU extension is present");
+        assert!(
+            eku.value.client_auth,
+            "issued client cert must carry the clientAuth extended key usage"
+        );
+
+        let ku = leaf
+            .key_usage()
+            .expect("KeyUsage extension parses")
+            .expect("KeyUsage extension is present");
+        assert!(
+            ku.value.digital_signature(),
+            "issued client cert must carry the DigitalSignature key usage"
+        );
+
+        clear_secrets();
     }
 
     #[test]
