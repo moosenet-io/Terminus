@@ -886,43 +886,38 @@ fn parse_next_link(link: &str) -> Option<String> {
     None
 }
 
-/// Extract the host (host or host:port) from a URL string, dropping a scheme's
-/// DEFAULT port so matching agrees with the `url` crate (which reports `None`
-/// for `port()` on a default port). Without this, a base configured as
-/// `https://gitlab.example.com:443` would fail to match a redirect `Location`
-/// of `https://gitlab.example.com` (no port), causing a false egress block.
+/// Extract the host (host or host:port) from a URL string, using the SAME
+/// parser (`reqwest::Url`, i.e. the `url` crate) that reqwest uses to actually
+/// dial — never a hand-rolled split. A bespoke parser diverges from reqwest on
+/// adversarial inputs (backslashes, embedded `@`/userinfo, etc.), which would
+/// let an egress check pass on one host while the request is sent to another —
+/// an SSRF/credential-leak bypass. Parsing once here keeps the decision and the
+/// dial in agreement. The `url` crate reports `None` from `port()` for a
+/// scheme's default port, so `:443`(https)/`:80`(http) normalize to a bare host
+/// automatically; a non-default explicit port is preserved.
 fn host_of(url: &str) -> Option<String> {
-    let (scheme, rest) = match url.split_once("://") {
-        Some((s, r)) => (Some(s.to_ascii_lowercase()), r),
-        None => (None, url),
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let authority = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
-    if authority.is_empty() {
-        return None;
-    }
-    // Strip the scheme's default port so `host:443`(https)/`host:80`(http)
-    // normalize to bare `host`. A non-default explicit port is preserved.
-    let normalized = match (scheme.as_deref(), authority.rsplit_once(':')) {
-        (Some("https"), Some((h, "443"))) => h,
-        (Some("http"), Some((h, "80"))) => h,
-        _ => authority,
-    };
-    Some(normalized.to_string())
-}
-
-/// The full origin (`scheme://normalized-authority`) of a URL string, or `None`
-/// if the host can't be parsed. Unlike [`host_of`], this INCLUDES the scheme, so
-/// an origin comparison distinguishes `https://h` from `http://h` — the check
-/// pagination uses so a same-host `https`→`http` `next` link (a plaintext
-/// credential downgrade) is rejected, not just a different host.
-fn origin_of(url: &str) -> Option<String> {
-    let scheme = url.split_once("://").map(|(s, _)| s.to_ascii_lowercase());
-    let host = host_of(url)?;
-    match scheme {
-        Some(s) => Some(format!("{s}://{host}")),
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_lowercase();
+    match parsed.port() {
+        Some(port) => Some(format!("{host}:{port}")),
         None => Some(host),
     }
+}
+
+/// The full origin (`scheme://normalized-authority`) of a URL string, parsed
+/// with `reqwest::Url` for the same reason as [`host_of`]. Unlike `host_of`,
+/// this INCLUDES the scheme, so an origin comparison distinguishes `https://h`
+/// from `http://h` — the check pagination uses so a same-host `https`→`http`
+/// `next` link (a plaintext credential downgrade) is rejected, not just a
+/// cross-host redirect.
+fn origin_of(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_lowercase();
+    let authority = match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    };
+    Some(format!("{}://{}", parsed.scheme(), authority))
 }
 
 /// GitLab's advertised support for the shared vocabulary. GitLab v4 covers most
@@ -2632,6 +2627,26 @@ mod tests {
         assert_eq!(origin_of("https://h.example:443/x").as_deref(), Some("https://h.example")); // pii-test-fixture
         // Same host, different scheme -> different origin (downgrade guard).
         assert_ne!(origin_of("https://h.example/x"), origin_of("http://h.example/x")); // pii-test-fixture
+    }
+
+    #[test]
+    fn host_of_agrees_with_reqwest_on_adversarial_urls() {
+        // A hand-rolled parser could read the host as `gitlab.example` while
+        // reqwest dials `evil.example` (backslash treated as a path separator).
+        // Because host_of parses with reqwest::Url, the egress decision matches
+        // what actually gets dialed — no SSRF/credential-leak differential.
+        let tricky = "https://evil.example\\@gitlab.example/api/v4/projects"; // pii-test-fixture
+        let via_host_of = host_of(tricky);
+        let via_reqwest = reqwest::Url::parse(tricky).ok().and_then(|u| {
+            u.host_str().map(|h| match u.port() {
+                Some(p) => format!("{}:{}", h.to_lowercase(), p),
+                None => h.to_lowercase(),
+            })
+        });
+        assert_eq!(via_host_of, via_reqwest);
+        // And such a host is NOT on a normal allowlist -> refused.
+        let a = test_adapter("https://gitlab.example.internal/api/v4"); // pii-test-fixture
+        assert!(!a.host_allowed(tricky));
     }
 
     #[tokio::test]
