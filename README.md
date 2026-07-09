@@ -726,12 +726,25 @@ already established by Gitea/GitHub/Plane (S105/S94):
 | `<PROVIDER>_TOKEN` | a single unsuffixed token (single-credential providers, or the legacy fallback identity) | `FORGEJO_TOKEN`, `CODEBERG_TOKEN` |
 | `<PROVIDER>_URL` | the provider's base API URL, where it is not a fixed public host | `GITEA_URL`, `FORGEJO_URL`, `CODEBERG_URL` (optional — defaults to Codeberg's own host) |
 
-None of these are ever literals in source, config, or `.moosenet-pipeline.yaml`
-— they are resolved at call time via `SecretManager` / `vault::manager().get()`
-(for tokens) or the crate's `config.rs` helpers (for non-secret URLs), exactly
-as every other Terminus credential is. See "Credentials" above for the
-`CredentialRef` abstraction adapters use to reference a key name without ever
-holding its value outside the resolution call.
+None of these are ever literals in source, config, or `.moosenet-pipeline.yaml`.
+As actually wired in the merged `gitea_from_env()` / `forgejo_from_env()` /
+`codeberg_from_env()` / `GitHubAdapter::from_env()` constructors (GITX-02/03),
+tokens and URLs are both read via `std::env::var(...)` at adapter-construction
+time — this crate's sanctioned vault path is that
+[`crate::secrets_bootstrap`](src/secrets_bootstrap.rs) materializes the runtime
+secret store into this process's own environment at startup, so that env read
+IS the vault read (never another process's files, never a literal). This is
+the same posture the pre-existing Gitea/GitHub/Plane identity docs above use.
+`CredentialRef` (`forge::provider::CredentialRef`, see "Credentials" above) is
+GITX-01's key-name-reference *type* for the trait; the concrete GITX-02/03
+adapters do not yet route through it end-to-end — they resolve directly via
+`env::var` in their `*_from_env` constructors. `config.rs` does not currently
+carry forge-specific URL helpers; base URLs are read the same way as tokens,
+directly via `env::var` in each adapter's constructor.
+
+<!-- GITX-07 reconcile: if GITX-05's assembly wires adapters through
+     CredentialRef / adds config.rs helpers for forge URLs, tighten this
+     paragraph to match — flagged by agy review during GITX-07's own gate. -->
 
 **Steps to add a new provider to an existing adapter family** (e.g. pointing
 the Gitea-family client at a second self-hosted Forgejo instance, or turning
