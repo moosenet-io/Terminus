@@ -84,23 +84,51 @@ const URL_UNSAFE: &AsciiSet = &CONTROLS
     .add(b'!');
 
 /// Percent-encode one URL path segment or query value from caller input so it
-/// cannot alter the request's structure. A bare `.` / `..` segment (path
-/// traversal) is escaped to its percent form so WHATWG URL normalisation cannot
-/// collapse it and climb the path.
+/// cannot alter the request's structure. Path-traversal `.`/`..` segments are
+/// NOT encoded here (percent-encoding does not help — WHATWG URL parsing treats
+/// `%2e%2e` as a double-dot segment and still collapses it); they are rejected
+/// up-front by [`reject_traversal`] / [`has_traversal_segment`] before any value
+/// reaches this encoder, so the only remaining job here is to neutralise the
+/// URL-structural / delimiter characters in [`URL_UNSAFE`]. RFC 3986 unreserved
+/// characters pass through unchanged.
 fn enc(v: &str) -> Cow<'_, str> {
-    match v {
-        "." => Cow::Borrowed("%2E"),
-        ".." => Cow::Borrowed("%2E%2E"),
-        _ => utf8_percent_encode(v, URL_UNSAFE).into(),
-    }
+    utf8_percent_encode(v, URL_UNSAFE).into()
 }
 
 /// Percent-encode a multi-segment path (e.g. `dir/sub/file.bin`): the `/`
-/// separators are preserved, but each individual segment is encoded via [`enc`]
-/// so an embedded `..` or reserved character in any segment cannot traverse or
-/// break out of the intended `contents`/`raw`/`trees` route.
+/// separators are preserved, but each individual segment is encoded via [`enc`].
+/// Callers MUST have already rejected traversal via [`reject_traversal`] — this
+/// helper assumes no `.`/`..` segment survives.
 fn enc_path(v: &str) -> String {
     v.split('/').map(enc).collect::<Vec<_>>().join("/")
+}
+
+/// True if `v`, interpreted as a URL path, contains a `.`/`..` traversal segment
+/// in either raw OR percent-encoded form. Splits on both `/` and `\` because
+/// WHATWG URL normalisation for http(s) schemes treats a backslash as a segment
+/// separator, and matches the percent-encoded dot forms (`%2e`, `%2e%2e`, …)
+/// case-insensitively because URL parsers decode those before the dot-segment
+/// check. Any such value must be rejected — it cannot be safely encoded.
+fn has_traversal_segment(v: &str) -> bool {
+    v.split(['/', '\\']).any(|seg| {
+        matches!(
+            seg.to_ascii_lowercase().as_str(),
+            "." | ".." | "%2e" | "%2e." | ".%2e" | "%2e%2e"
+        )
+    })
+}
+
+/// Reject a caller-supplied path value that carries a traversal segment, mapping
+/// it to a clean [`ForgeError::InvalidRequest`] rather than letting it reach the
+/// URL builder.
+fn reject_traversal(provider: &str, key: &str, v: &str) -> Result<(), ForgeError> {
+    if has_traversal_segment(v) {
+        let _ = provider;
+        return Err(ForgeError::InvalidRequest(format!(
+            "'{key}' contains a path-traversal segment ('.'/'..') and was refused"
+        )));
+    }
+    Ok(())
 }
 use tracing::warn;
 
@@ -234,6 +262,13 @@ impl GiteaForge {
         let owner = self.owner(params);
         let repo = req_str(params, "repo").map_err(|e| map_tool_err(self.provider_id, e))?;
         let path = req_str(params, "path").map_err(|e| map_tool_err(self.provider_id, e))?;
+        // Traversal guard (this write path bypasses `call`): refuse any `.`/`..`
+        // segment in the caller-supplied repo/path before building the URL.
+        reject_traversal(self.provider_id, "repo", repo)?;
+        reject_traversal(self.provider_id, "path", path)?;
+        if let Some(o) = params.get("owner").and_then(Value::as_str) {
+            reject_traversal(self.provider_id, "owner", o)?;
+        }
         let content = req_str(params, "content").map_err(|e| map_tool_err(self.provider_id, e))?;
         let message = params
             .get("message")
@@ -378,6 +413,21 @@ impl GiteaForge {
         let client = self.client_for(&req)?;
         let client = client.as_ref();
         let params = &req.params;
+        // Traversal guard: every caller-supplied value that can land in a URL
+        // PATH segment is checked for `.`/`..` traversal (raw or percent-encoded)
+        // and rejected before it reaches the URL builder. Percent-encoding alone
+        // is insufficient for dot segments (URL parsers normalise `%2e%2e` too),
+        // so these must be refused, not escaped. Query-only params are exempt
+        // (they cannot traverse the path). The configured default owner is
+        // trusted (from the secret-materialised env, not the caller).
+        for key in [
+            "owner", "repo", "branch", "tag", "ref", "sha", "basehead", "path",
+            "collaborator", "type", "name", "version", "org", "old_branch",
+        ] {
+            if let Some(v) = params.get(key).and_then(Value::as_str) {
+                reject_traversal(p, key, v)?;
+            }
+        }
         // `owner` and `repo` are interpolated into the request URL, so they are
         // percent-encoded here (once) — every path built below uses these safe
         // forms, never raw caller input.
@@ -931,39 +981,78 @@ mod tests {
     }
 
     #[test]
-    fn enc_neutralizes_path_traversal_and_reserved_chars() {
-        // A `.`/`..` whole segment is escaped so URL normalization can't climb.
-        assert_eq!(enc(".."), "%2E%2E");
-        assert_eq!(enc("."), "%2E");
+    fn enc_neutralizes_reserved_chars_but_leaves_unreserved() {
         // Structural characters that would break out of a segment or into the
         // query/fragment are percent-encoded; ordinary unreserved chars are not.
         assert_eq!(enc("a/b"), "a%2Fb");
         assert_eq!(enc("x?y#z"), "x%3Fy%23z");
         assert_eq!(enc("v1.2.3"), "v1.2.3");
-        // enc_path preserves `/` separators but escapes each traversal segment.
-        assert_eq!(enc_path("dir/../etc/passwd"), "dir/%2E%2E/etc/passwd"); // pii-test-fixture
         assert_eq!(enc_path("a/b/c.txt"), "a/b/c.txt");
     }
 
+    #[test]
+    fn traversal_detection_covers_raw_encoded_and_backslash_forms() {
+        // Dot segments cannot be safely encoded (URL parsers normalise `%2e%2e`
+        // too) — they must be detected and rejected, in raw + percent + `\` forms.
+        assert!(has_traversal_segment(".."));
+        assert!(has_traversal_segment("dir/../etc")); // pii-test-fixture
+        assert!(has_traversal_segment("dir/%2e%2e/etc")); // pii-test-fixture
+        assert!(has_traversal_segment("%2E%2E/x"));
+        assert!(has_traversal_segment("a\\..\\b"));
+        assert!(has_traversal_segment("."));
+        // Legitimate paths / refs / dotted names are NOT traversal.
+        assert!(!has_traversal_segment("a/b/c.txt"));
+        assert!(!has_traversal_segment("v1.2.3"));
+        assert!(!has_traversal_segment("heads/main"));
+        assert!(!has_traversal_segment("base...head"));
+    }
+
     #[tokio::test]
-    async fn crafted_repo_param_cannot_escape_the_intended_route() {
-        // A `repo` value carrying `/` + `?` must NOT redirect the authenticated
-        // request to a different endpoint — it stays a single, encoded segment.
+    async fn crafted_repo_slash_query_stays_one_encoded_segment() {
+        // A `repo` value carrying `/` + `?` (but no dot segment) must NOT redirect
+        // the authenticated request — it stays a single, encoded path segment.
         let server = MockServer::start();
         let m = server.mock(|when, then| {
-            // The whole crafted value lands as ONE encoded path segment.
-            when.method(GET).path("/api/v1/repos/moosenet/evil%2F..%2Fadmin%3Ffoo");
+            when.method(GET).path("/api/v1/repos/moosenet/evil%2Fadmin%3Ffoo");
             then.status(200).json_body(json!({"ok": true}));
         });
         let forge = mock_gitea(&server);
         forge
             .dispatch(
                 ForgeEndpoint::ReposGet,
-                ForgeRequest::new(json!({"repo": "evil/../admin?foo"})),
+                ForgeRequest::new(json!({"repo": "evil/admin?foo"})),
             )
             .await
             .expect("crafted repo must be encoded, not routed elsewhere");
         m.assert();
+    }
+
+    #[tokio::test]
+    async fn crafted_repo_traversal_is_rejected_before_transport() {
+        // A `..` traversal segment must be REFUSED before any HTTP call (no mock
+        // registered — the request must never leave the process).
+        let forge = mock_gitea(&MockServer::start());
+        let err = forge
+            .dispatch(
+                ForgeEndpoint::ReposGet,
+                ForgeRequest::new(json!({"repo": "evil/../admin"})),
+            )
+            .await
+            .expect_err("traversal repo must be rejected");
+        assert!(matches!(err, ForgeError::InvalidRequest(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn raw_fetch_traversal_path_is_rejected() {
+        let forge = mock_gitea(&MockServer::start());
+        let err = forge
+            .dispatch(
+                ForgeEndpoint::ContentRawFetch,
+                ForgeRequest::new(json!({"repo": "demo", "path": "../../etc/passwd"})), // pii-test-fixture
+            )
+            .await
+            .expect_err("traversal path must be rejected");
+        assert!(matches!(err, ForgeError::InvalidRequest(_)), "{err:?}");
     }
 
     #[tokio::test]
