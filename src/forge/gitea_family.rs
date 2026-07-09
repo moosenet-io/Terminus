@@ -476,8 +476,26 @@ impl GiteaForge {
             client.request_value(Method::DELETE, &path, None).await.map_err(|e| map_tool_err(p, e))
         };
         // Pass through any caller-provided `body` object for update-shaped
-        // endpoints, defaulting to an empty object.
-        let passthrough = || params.get("body").cloned().unwrap_or_else(|| json!({}));
+        // endpoints, defaulting to an empty object. NOTE: `body` here names the
+        // whole update-fields OBJECT (e.g. `{"body": {"title": "...", "state":
+        // "closed"}}`), not Gitea's own `body` text field on issues/PRs/releases
+        // — that field, if the caller wants to set it, is one KEY *inside* this
+        // object. A caller who instead passes a bare string (mistaking this for
+        // "the description text") would otherwise have that string forwarded
+        // verbatim as the entire JSON PATCH payload — Gitea then rejects it with
+        // an opaque deserialize error far from the actual mistake (codex P2). Fail
+        // clearly here instead.
+        let passthrough = || -> Result<Value, ForgeError> {
+            match params.get("body") {
+                None => Ok(json!({})),
+                Some(v) if v.is_object() => Ok(v.clone()),
+                Some(_) => Err(ForgeError::InvalidRequest(
+                    "'body' must be a JSON object containing the fields to update (e.g. \
+                     {\"title\": \"...\", \"body\": \"...\", \"state\": \"closed\"}) — a bare \
+                     string is not a valid update payload for this endpoint".to_string(),
+                )),
+            }
+        };
         let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20).min(50);
         let page = params.get("page").and_then(Value::as_u64).unwrap_or(1).max(1);
 
@@ -506,7 +524,7 @@ impl GiteaForge {
                 };
                 with_body(Method::POST, path, body).await
             }
-            ReposUpdate => with_body(Method::PATCH, format!("/repos/{owner}/{}", repo()?), passthrough()).await,
+            ReposUpdate => with_body(Method::PATCH, format!("/repos/{owner}/{}", repo()?), passthrough()?).await,
             ReposDelete => del(format!("/repos/{owner}/{}", repo()?)).await,
             ReposFork => {
                 let mut body = json!({});
@@ -572,7 +590,7 @@ impl GiteaForge {
                 }
                 with_body(Method::POST, format!("/repos/{owner}/{}/pulls", repo()?), body).await
             }
-            PullRequestsUpdate => with_body(Method::PATCH, format!("/repos/{owner}/{}/pulls/{}", repo()?, idx("index")?), passthrough()).await,
+            PullRequestsUpdate => with_body(Method::PATCH, format!("/repos/{owner}/{}/pulls/{}", repo()?, idx("index")?), passthrough()?).await,
             PullRequestsReview => {
                 let mut body = json!({ "event": params.get("event").and_then(Value::as_str).unwrap_or("COMMENT") });
                 if let Some(b) = params.get("body").and_then(Value::as_str) {
@@ -616,7 +634,7 @@ impl GiteaForge {
                 }
                 with_body(Method::POST, format!("/repos/{owner}/{}/issues", repo()?), body).await
             }
-            IssuesUpdate => with_body(Method::PATCH, format!("/repos/{owner}/{}/issues/{}", repo()?, idx("index")?), passthrough()).await,
+            IssuesUpdate => with_body(Method::PATCH, format!("/repos/{owner}/{}/issues/{}", repo()?, idx("index")?), passthrough()?).await,
             IssuesComment => {
                 let body = json!({ "body": s("comment")? });
                 with_body(Method::POST, format!("/repos/{owner}/{}/issues/{}/comments", repo()?, idx("index")?), body).await
@@ -648,7 +666,7 @@ impl GiteaForge {
                 }
                 with_body(Method::POST, format!("/repos/{owner}/{}/releases", repo()?), body).await
             }
-            ReleasesUpdate => with_body(Method::PATCH, format!("/repos/{owner}/{}/releases/{}", repo()?, idx("id")?), passthrough()).await,
+            ReleasesUpdate => with_body(Method::PATCH, format!("/repos/{owner}/{}/releases/{}", repo()?, idx("id")?), passthrough()?).await,
             ReleasesDelete => del(format!("/repos/{owner}/{}/releases/{}", repo()?, idx("id")?)).await,
             ReleasesAssets => get(format!("/repos/{owner}/{}/releases/{}/assets", repo()?, idx("id")?)).await,
             TagsList => get(format!("/repos/{owner}/{}/tags?limit={limit}&page={page}", repo()?)).await,
@@ -664,8 +682,8 @@ impl GiteaForge {
 
             // ── Webhooks ────────────────────────────────────────────────────────
             WebhooksList => get(format!("/repos/{owner}/{}/hooks", repo()?)).await,
-            WebhooksCreate => with_body(Method::POST, format!("/repos/{owner}/{}/hooks", repo()?), passthrough()).await,
-            WebhooksUpdate => with_body(Method::PATCH, format!("/repos/{owner}/{}/hooks/{}", repo()?, idx("id")?), passthrough()).await,
+            WebhooksCreate => with_body(Method::POST, format!("/repos/{owner}/{}/hooks", repo()?), passthrough()?).await,
+            WebhooksUpdate => with_body(Method::PATCH, format!("/repos/{owner}/{}/hooks/{}", repo()?, idx("id")?), passthrough()?).await,
             WebhooksDelete => del(format!("/repos/{owner}/{}/hooks/{}", repo()?, idx("id")?)).await,
             WebhooksTest => with_body(Method::POST, format!("/repos/{owner}/{}/hooks/{}/tests", repo()?, idx("id")?), json!({})).await,
 
@@ -963,6 +981,50 @@ mod tests {
             .expect("small crate under the default limit should publish");
         m.assert();
         assert_eq!(resp.body["published"], true);
+    }
+
+    #[tokio::test]
+    async fn issues_update_rejects_bare_string_body() {
+        // codex P2: a caller who mistakes the update `body` param for Gitea's own
+        // issue "body" text field (a bare string) must get a clear
+        // InvalidRequest, not have that string silently forwarded as the whole
+        // PATCH payload. No mock is registered — the request must never reach
+        // the HTTP layer.
+        let server = MockServer::start();
+        let forge = mock_gitea(&server);
+        let err = forge
+            .dispatch(
+                ForgeEndpoint::IssuesUpdate,
+                ForgeRequest::new(json!({
+                    "repo": "demo", "index": 3,
+                    "body": "new description text",
+                })),
+            )
+            .await
+            .expect_err("bare string body must be rejected");
+        assert!(matches!(err, ForgeError::InvalidRequest(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn issues_update_accepts_object_body() {
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(httpmock::Method::PATCH).path("/api/v1/repos/moosenet/demo/issues/3");
+            then.status(200).json_body(json!({"number": 3, "state": "closed"}));
+        });
+        let forge = mock_gitea(&server);
+        let resp = forge
+            .dispatch(
+                ForgeEndpoint::IssuesUpdate,
+                ForgeRequest::new(json!({
+                    "repo": "demo", "index": 3,
+                    "body": {"state": "closed", "body": "new description text"},
+                })),
+            )
+            .await
+            .expect("object body should update");
+        m.assert();
+        assert_eq!(resp.body["state"], "closed");
     }
 
     #[tokio::test]
