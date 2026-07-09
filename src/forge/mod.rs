@@ -32,6 +32,7 @@
 
 pub mod capability;
 pub mod gitea_family;
+pub mod gitlab;
 pub mod provider;
 
 pub use capability::{CapabilityMap, ForgeDomain, ForgeEndpoint, SupportLevel};
