@@ -1347,10 +1347,9 @@ core module) over the same mTLS/`enroll` front door TCLI-01..03 built for `termi
 | CA material | Whatever <host>'s environment/local store provisions | Independently auto-generated/provisioned on <host> — same `crate::pki::ca()` load-or-generate precedence, just a separate host's own environment/local store, so the two processes get independent CAs with no special-casing in code |
 | Startup <secret-manager> fetch | Yes (`fetch_downstream_secrets_from_infisical`, PSEC-02) | Not in this item — <host> deployment (TGW-05) provisions its environment directly; can be added later without touching the shared setup below |
 
-**Still NOT included** (see the TGW-01/02/03 spec items' scope boundary, S108): the per-user
-auth/audit/rate-limit pipeline (TGW-04) — every route below is reachable by any caller who
-reaches the mTLS front door at all. Personal-tool federation (TGW-02) and the inference proxy to
-Chord (TGW-03) are now wired — see the next two sections.
+Personal-tool federation (TGW-02) and the inference proxy to Chord (TGW-03) are wired — see the
+next two sections. The per-user identity → allowlist → rate-limit → audit pipeline (TGW-04) that
+gates every route below is documented in its own section further down.
 
 **Why no combined core+personal registry:** `register_all` and `register_personal` both
 register the `plane`/`gitea`/`github`/`sundry` tool modules under the SAME tool names — a real,
@@ -1456,6 +1455,77 @@ the four routes still exist but return a clean `503` rather than a bare `404` or
 is kept a separate process) surfaces to the caller as a truncated/interrupted stream or a
 transport error partway through, not a clean retry — no in-flight-request recovery is built here;
 a caller-side retry is the expected mitigation, same as any other proxy hop.
+
+### Uniform gateway pipeline: identity → allowlist → rate-limit → audit (TGW-04, `crate::gateway_framework`)
+
+Every request `terminus-primary` serves — tool calls (core, dispatched locally, and
+personal-registry calls federated via TGW-02) **and** the four inference-proxy routes (TGW-03) —
+now passes through one shared pipeline before dispatch runs:
+
+```
+mTLS identity (ClientIdentity extension)
+  → per-identity allowlist check
+  → interim in-process rate-limit check
+  → [caller's own dispatch: local tool call / federation / inference forward]
+  → S6-sanitized audit log entry
+```
+
+`terminus_personal` is unaffected — it predates this item and is not this spec's deployment
+target, so its `McpServerState.gateway`/`GatewayServerConfig.gateway` stay `None`, preserving its
+exact pre-TGW-04 (ungated) behavior.
+
+**Identity.** Sourced *only* from the mTLS-verified `ClientIdentity` request extension
+`crate::pki::mtls::run_listener` attaches post-handshake (see TCLI-03) — never a client-supplied
+header/field. A request with no `ClientIdentity` at all (e.g. one that reached the plain HTTP+JWT
+listener rather than the mTLS one) is **fail-closed**: denied before any allowlist or rate-limit
+check even runs, audited under the synthetic `anonymous` label.
+
+**Allowlist (`gateway_framework::AllowlistPolicy`).** Per-identity, config-driven, **default-deny**:
+an identity with no configured entry at all is denied every action — there was no prior
+identity-scoped tool/route allowlist in this codebase to reuse (the other "allowlist" hits in the
+tree are unrelated: SSH command allowlists, <secret-manager> secret-key allowlists). Configured via
+`TERMINUS_GATEWAY_ALLOWLIST_JSON`, a JSON object:
+
+```json
+{
+  "dev-box":        ["*"],
+  "harmony-primary": ["ledger_accounts", "gitea_list_identities", "/v1/chat/completions"]
+}
+```
+
+A `"*"` entry allows every action for that identity. Malformed JSON degrades to an empty
+(deny-everyone) policy with a loud `tracing::error!`, rather than panicking the process at startup.
+
+**Rate limit (`gateway_framework::rate_limit`).** An explicitly **interim, single-process** token
+bucket per `(identity, action)` key (`InProcessRateLimiter`) — burst capacity
+`TERMINUS_GATEWAY_RATE_LIMIT_BURST` (default 20), refill rate
+`TERMINUS_GATEWAY_RATE_LIMIT_REFILL_PER_SEC` tokens/sec (default 5). This is **not** the
+shared-egress Redis-backed limiter the design doc's Phase P4 (S100 relocation) calls for — that's a
+separate, later migration, explicitly out of scope for this item. The seam for that swap is the
+`RateLimiter` trait (`async fn check(&self, key: &str) -> RateLimitDecision`); a Redis-backed type
+implementing that trait is a drop-in replacement for `InProcessRateLimiter` in
+`GatewayFramework::new`/`from_env` — no call-site changes needed in `crate::gateway_framework` or
+either binary.
+
+**Audit (`gateway_framework::audit`).** One structured `tracing` event (target `gateway_audit`) per
+request — identity, action (tool name or route path), kind (`tool` / `inference`), result
+(`success` / `failure` / `denied_no_identity` / `denied_not_allowlisted` / `denied_rate_limited`),
+and an optional sanitized detail string. Sanitization (`audit::sanitize`) redacts secret-shaped
+`key=value`/`key: "value"` pairs (token/key/secret/password/credential/auth, case-insensitive) and
+`Bearer <token>` values to `***REDACTED***`, then truncates to 200 chars +
+`...(truncated)`. Denials are logged inside `GatewayFramework::guard` itself (the request never
+reaches dispatch, so there's no later point to log from); a request that clears the gate is logged
+exactly once more, by the caller, via `GatewayContext::record_result` after its own dispatch
+completes — one audit entry per request either way. `tracing` events are fire-and-forget: an
+audit-write failure downstream (e.g. a subscriber that can't flush to disk) can never fail or block
+the underlying tool/inference response.
+
+**Transport note on denials.** The inference-proxy routes are plain HTTP, so a denial is a real
+`403 Forbidden` (missing/not-allowlisted identity) or `429 Too Many Requests` (rate-limited) JSON
+response. The tool-call path is JSON-RPC-over-HTTP (`POST /mcp`), which — like the pre-existing
+"Unknown tool" case — always answers `200 OK` with the outcome encoded in the JSON-RPC result body
+(`isError: true` and a denial message), since JSON-RPC has no distinct status-code channel; this
+mirrors the codebase's existing convention for tool-call outcomes rather than inventing a new one.
 
 ### Shared mTLS/enroll server-setup (`crate::pki::server`)
 

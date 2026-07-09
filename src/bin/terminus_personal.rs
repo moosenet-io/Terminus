@@ -312,6 +312,10 @@ async fn main() {
         // TGW-03: terminus_personal has no inference-proxy role -- that's
         // terminus_primary's job.
         inference_proxy: None,
+        // TGW-04: the uniform gateway pipeline is scoped to terminus_primary
+        // (this spec item's deployment target) -- terminus_personal predates
+        // it and keeps its pre-existing ungated behavior.
+        gateway: None,
     };
 
     // TCLI-02: the enrollment endpoint is a fully separate, additive router

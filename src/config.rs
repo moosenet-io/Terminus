@@ -657,6 +657,48 @@ pub fn chord_inference_connect_timeout_ms() -> u64 {
         .unwrap_or(5_000)
 }
 
+// ── TGW-04: gateway framework (identity → allowlist → rate-limit → audit) ──
+//
+// The uniform per-request pipeline (`crate::gateway_framework`) wraps every
+// request path on `terminus-primary` (tool-dispatch AND inference-proxy).
+// These are its non-secret config knobs; the allowlist policy itself is
+// data (identity -> allowed actions), not a credential, so it's read here
+// like any other config, not through the secret-env convention `crate::pki`
+// documents.
+
+/// Per-identity allowlist policy, as a JSON object string: `{"<identity>":
+/// ["<tool-or-route>", ...], ...}`. A `"*"` entry in an identity's array
+/// allows every action for that identity. From
+/// `TERMINUS_GATEWAY_ALLOWLIST_JSON`; defaults to `"{}"` (empty policy) — per
+/// the TGW-04 spec item's edge case, an identity with NO configured entry is
+/// denied, not allowed by default (default-deny), so an empty policy denies
+/// every identity until the operator provisions entries.
+pub fn gateway_allowlist_json() -> String {
+    env_nonempty("TERMINUS_GATEWAY_ALLOWLIST_JSON").unwrap_or_else(|| "{}".to_string())
+}
+
+/// Token-bucket burst capacity for the interim in-process rate limiter, per
+/// `(identity, action)` key. From `TERMINUS_GATEWAY_RATE_LIMIT_BURST`;
+/// defaults to 20 — generous enough for a legitimate multi-tool-call
+/// workflow (see the TGW-04 spec item's edge case) while still bounding a
+/// runaway burst.
+pub fn gateway_rate_limit_burst() -> u32 {
+    env_nonempty("TERMINUS_GATEWAY_RATE_LIMIT_BURST")
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &u32| *n > 0)
+        .unwrap_or(20)
+}
+
+/// Token-bucket refill rate, in tokens per second, for the interim
+/// in-process rate limiter. From
+/// `TERMINUS_GATEWAY_RATE_LIMIT_REFILL_PER_SEC`; defaults to 5.
+pub fn gateway_rate_limit_refill_per_sec() -> f64 {
+    env_nonempty("TERMINUS_GATEWAY_RATE_LIMIT_REFILL_PER_SEC")
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &f64| *n > 0.0)
+        .unwrap_or(5.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

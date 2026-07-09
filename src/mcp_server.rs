@@ -56,6 +56,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::federation::PersonalFederationClient;
+use crate::gateway_framework::{ActionKind, GatewayFramework};
 use crate::inference_proxy::{
     InferenceProxyClient, AGENT_EXECUTE_PATH, CHAT_COMPLETIONS_PATH, CODING_SELECT_PATH,
     INFER_PATH,
@@ -86,6 +87,16 @@ pub struct McpServerState {
     /// `terminus_personal`, which has no inference-proxy role) means those
     /// routes are not mounted at all.
     pub inference_proxy: Option<InferenceProxyClient>,
+    /// TGW-04: when set, EVERY request through this server (tool calls —
+    /// core and federated-personal — AND the four inference-proxy routes
+    /// below) is gated by the shared identity → allowlist → rate-limit →
+    /// dispatch → audit pipeline (`crate::gateway_framework`) before
+    /// dispatch runs. `None` (the default for `terminus_personal`, which
+    /// predates this item and is not this spec's deployment target)
+    /// preserves the exact pre-TGW-04 behavior: no gating at all, every
+    /// request that reaches the router dispatches unconditionally.
+    /// `terminus_primary` (TGW-04) sets `Some(GatewayFramework::from_env())`.
+    pub gateway: Option<GatewayFramework>,
 }
 
 pub fn build_router(state: Arc<McpServerState>) -> Router {
@@ -124,7 +135,25 @@ async fn handle_inference_proxy(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    match &state.inference_proxy {
+    // TGW-04: gate every inference-proxy request through the same
+    // identity → allowlist → rate-limit pipeline the tool-call path uses
+    // (see `handle_mcp`'s `tools/call` branch) — `guard()` returns a ready
+    // 403/429 response (already audited) on denial, or a context this
+    // handler must `record_result` on once dispatch completes. `None`
+    // (`state.gateway` unset, e.g. `terminus_personal`) preserves the exact
+    // pre-TGW-04 ungated behavior.
+    let gate_ctx = match &state.gateway {
+        Some(gateway) => {
+            let client_identity = identity.as_ref().map(|Extension(i)| i.clone());
+            match gateway.guard(client_identity.as_ref(), path, ActionKind::Inference).await {
+                Ok(ctx) => Some(ctx),
+                Err(denial) => return denial,
+            }
+        }
+        None => None,
+    };
+
+    let response = match &state.inference_proxy {
         Some(client) => {
             let caller_identity = identity.as_ref().map(|Extension(i)| i.as_str());
             client.forward(path, headers, body, caller_identity).await
@@ -136,7 +165,19 @@ async fn handle_inference_proxy(
                 .to_string(),
         )
             .into_response(),
+    };
+
+    if let Some(ctx) = gate_ctx {
+        let success = response.status().is_success();
+        let detail = if success {
+            None
+        } else {
+            Some(format!("upstream status {}", response.status()))
+        };
+        ctx.record_result(success, detail.as_deref());
     }
+
+    response
 }
 
 async fn handle_chat_completions(
@@ -173,6 +214,26 @@ async fn handle_coding_select(
     body: Bytes,
 ) -> Response {
     handle_inference_proxy(state, CODING_SELECT_PATH, identity, headers, body).await
+}
+
+/// Extract a human-readable denial message from a `GatewayFramework::guard`
+/// denial response (a JSON `{"error": "..."}` body per
+/// `gateway_framework::denied_response`) — used to surface the SAME denial
+/// text the inference-proxy path returns as an HTTP status/body into the
+/// `tools/call` JSON-RPC result's `isError: true` text, since JSON-RPC has
+/// no distinct status-code channel to carry it in.
+async fn response_body_text(resp: Response) -> String {
+    let bytes = axum::body::to_bytes(resp.into_body(), 4096)
+        .await
+        .unwrap_or_default();
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(v) => v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned()),
+        Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
+    }
 }
 
 async fn handle_healthz(State(state): State<Arc<McpServerState>>) -> impl IntoResponse {
@@ -294,23 +355,67 @@ async fn handle_mcp(
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
-            match state.registry.call(name, arguments.clone()).await {
-                Some(Ok(text)) => sse_response(
-                    id,
-                    Ok(json!({
-                        "content": [{"type": "text", "text": text}],
-                        "isError": false
-                    })),
-                    "",
+            // TGW-04: gate every tool call -- core (local) AND
+            // personal-federated -- through the same identity → allowlist →
+            // rate-limit pipeline the inference-proxy routes use (see
+            // `handle_inference_proxy`), keyed by tool NAME regardless of
+            // which branch below ultimately dispatches it. A denial here
+            // returns a JSON-RPC `tools/call` *result* with `isError: true`
+            // (there is no distinct "403" concept in JSON-RPC-over-HTTP —
+            // this server always answers `200 OK` with the outcome encoded
+            // in the result body, exactly like the pre-existing "Unknown
+            // tool" case below), but the underlying gate decision and its
+            // sanitized audit entry are identical to the inference-proxy
+            // path's real `403`/`429` HTTP responses.
+            let gate_ctx = if let Some(gateway) = &state.gateway {
+                let client_identity = identity.as_ref().map(|Extension(i)| i.clone());
+                match gateway.guard(client_identity.as_ref(), name, ActionKind::Tool).await {
+                    Ok(ctx) => Some(ctx),
+                    Err(denial) => {
+                        let denial_text = response_body_text(denial).await;
+                        return sse_response(
+                            id,
+                            Ok(json!({
+                                "content": [{"type": "text", "text": denial_text}],
+                                "isError": true
+                            })),
+                            "",
+                        );
+                    }
+                }
+            } else {
+                None
+            };
+
+            let (response, success, detail) = match state.registry.call(name, arguments.clone()).await
+            {
+                Some(Ok(text)) => (
+                    sse_response(
+                        id,
+                        Ok(json!({
+                            "content": [{"type": "text", "text": text}],
+                            "isError": false
+                        })),
+                        "",
+                    ),
+                    true,
+                    None,
                 ),
-                Some(Err(e)) => sse_response(
-                    id,
-                    Ok(json!({
-                        "content": [{"type": "text", "text": e.to_string()}],
-                        "isError": true
-                    })),
-                    "",
-                ),
+                Some(Err(e)) => {
+                    let msg = e.to_string();
+                    (
+                        sse_response(
+                            id,
+                            Ok(json!({
+                                "content": [{"type": "text", "text": msg.clone()}],
+                                "isError": true
+                            })),
+                            "",
+                        ),
+                        false,
+                        Some(msg),
+                    )
+                }
                 // Not a core tool -- TGW-02: if this process federates
                 // personal-tool calls, proxy to Chord's
                 // `/v1/personal/tools/call` relay before giving up. Core
@@ -319,31 +424,37 @@ async fn handle_mcp(
                     Some(client) => {
                         let caller_identity = identity.as_ref().map(|Extension(i)| i.as_str());
                         match client.call_tool(name, arguments, caller_identity).await {
-                            Ok(outcome) => sse_response(
-                                id,
-                                Ok(json!({
-                                    "content": [{"type": "text", "text": outcome.text}],
-                                    "isError": outcome.is_error
-                                })),
-                                "",
+                            Ok(outcome) => (
+                                sse_response(
+                                    id,
+                                    Ok(json!({
+                                        "content": [{"type": "text", "text": outcome.text}],
+                                        "isError": outcome.is_error
+                                    })),
+                                    "",
+                                ),
+                                !outcome.is_error,
+                                None,
                             ),
                             Err(fed_err) => {
                                 warn!(
                                     "terminus_primary: federation error calling {name}: {fed_err}"
                                 );
-                                sse_response(
-                                    id,
-                                    Ok(json!({
-                                        "content": [{
-                                            "type": "text",
-                                            "text": format!(
-                                                "federation error: could not reach personal-tool \
-                                                 backend via chord relay ({fed_err})"
-                                            )
-                                        }],
-                                        "isError": true
-                                    })),
-                                    "",
+                                let msg = format!(
+                                    "federation error: could not reach personal-tool backend via \
+                                     chord relay ({fed_err})"
+                                );
+                                (
+                                    sse_response(
+                                        id,
+                                        Ok(json!({
+                                            "content": [{"type": "text", "text": msg.clone()}],
+                                            "isError": true
+                                        })),
+                                        "",
+                                    ),
+                                    false,
+                                    Some(msg),
                                 )
                             }
                         }
@@ -353,16 +464,28 @@ async fn handle_mcp(
                     // JSON-RPC protocol error — `tools/call` itself is a
                     // valid method, so `-32601 Method not found` would be a
                     // misleading code here.
-                    None => sse_response(
-                        id,
-                        Ok(json!({
-                            "content": [{"type": "text", "text": format!("Unknown tool: {name}")}],
-                            "isError": true
-                        })),
-                        "",
-                    ),
+                    None => {
+                        let msg = format!("Unknown tool: {name}");
+                        (
+                            sse_response(
+                                id,
+                                Ok(json!({
+                                    "content": [{"type": "text", "text": msg.clone()}],
+                                    "isError": true
+                                })),
+                                "",
+                            ),
+                            false,
+                            Some(msg),
+                        )
+                    }
                 },
+            };
+
+            if let Some(ctx) = gate_ctx {
+                ctx.record_result(success, detail.as_deref());
             }
+            response
         }
         other => {
             warn!("terminus_personal: unhandled method {other}");
@@ -442,6 +565,7 @@ mod tests {
             auth_token: None,
             personal_federation: None,
             inference_proxy: None,
+            gateway: None,
         })
     }
 
@@ -570,6 +694,7 @@ mod tests {
             auth_token: None,
             personal_federation: None,
             inference_proxy: None,
+            gateway: None,
         });
         let router = build_router(state);
         let (status, body, _) = post_mcp(
@@ -615,6 +740,7 @@ mod tests {
             auth_token: Some("secret-abc".to_string()),
             personal_federation: None,
             inference_proxy: None,
+            gateway: None,
         });
         let router = build_router(state);
         let req = Request::builder()
@@ -640,6 +766,7 @@ mod tests {
             auth_token: Some("secret-abc".to_string()),
             personal_federation: None,
             inference_proxy: None,
+            gateway: None,
         });
         let router = build_router(state);
         let req = Request::builder()
