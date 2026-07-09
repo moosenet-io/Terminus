@@ -26,20 +26,27 @@
 //!   [`ForgeProvider`], parameterised by base-URL + credentials to serve three
 //!   providers — Gitea + Forgejo (git-private) and Codeberg (git-public).
 //!
-//! The GitHub and GitLab adapters (GITX-03/04), the optional stubs (GITX-06),
-//! and the git-private/git-public tool assembly with posture enforcement
-//! (GITX-05) build on this trait in later items.
+//! - [`stubs`] (GITX-06) — optional/experimental adapter STUBS (Bitbucket,
+//!   SourceHut, Gogs, OneDev, Radicle): structure + an honest per-provider
+//!   [`CapabilityMap`] so the tool KNOWS these providers and reports their real
+//!   (often reduced) surfaces, with every dispatched endpoint honestly falling
+//!   through to [`ForgeError::NotImplemented`] rather than a fabricated call.
+//!
+//! The GitLab adapter (GITX-04) and the git-private/git-public tool assembly
+//! with posture enforcement (GITX-05) build on this trait in later items.
 
 pub mod capability;
 pub mod gitea_family;
 pub mod gitlab;
 pub mod provider;
+pub mod stubs;
 
 pub use capability::{CapabilityMap, ForgeDomain, ForgeEndpoint, SupportLevel};
 pub use gitea_family::{gitea_family_capabilities, GiteaForge};
 pub use provider::{
     CredentialRef, ForgeError, ForgeProvider, ForgeRequest, ForgeResponse, ProviderId,
 };
+pub use stubs::StubForge;
 
 #[cfg(test)]
 mod tests {
