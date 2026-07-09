@@ -11,17 +11,24 @@
 //!    that enrolled identity, trusting only the CA cert pinned at
 //!    enrollment time.
 //!
-//! It deliberately does NOT build a local MCP endpoint, forward tool calls,
-//! or expose a daemon binary -- that's TCLI-05, layered on top of this
-//! crate's public API.
+//! TCLI-05 layers a local MCP-forwarding daemon on top of this crate's
+//! public API: [`forward`] drives one HTTP/1.1 request/response over a
+//! [`connect`]-established mTLS session, and [`mcp_server`] presents a
+//! plain, loopback-only MCP endpoint that dispatches to it -- see the
+//! `terminus-client-daemon` binary (`src/bin/terminus-client-daemon.rs`)
+//! for how those two are wired into a runnable daemon.
 //!
 //! See `README.md` for the embedding story (how another Rust program, e.g.
 //! Harmony/Lumina/Scribe, is meant to pull this crate in).
 
 pub mod enroll;
 pub mod error;
+pub mod forward;
+pub mod mcp_server;
 pub mod transport;
 
 pub use enroll::{enroll, EnrollConfig, EnrolledCredential};
 pub use error::ClientError;
+pub use forward::{forward, PrimaryConfig};
+pub use mcp_server::DaemonState;
 pub use transport::{connect, ConnectConfig, MtlsTransport};

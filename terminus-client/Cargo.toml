@@ -18,15 +18,33 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 rustls = { version = "0.23", default-features = false, features = ["logging", "tls12", "ring", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
 rustls-pemfile = "2"
-tokio = { version = "1", features = ["net", "rt", "macros", "time", "io-util"] }
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "macros", "time", "io-util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1.0"
 tracing = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5.0"
+# TCLI-05: drives one HTTP/1.1 request/response over the raw
+# `tokio_rustls::client::TlsStream` `MtlsTransport::into_io()` hands back --
+# matches the exact `hyper` major version (1.x) + client-conn usage pattern
+# `terminus_rs::pki::mtls` already uses server-side, so this isn't a second
+# HTTP-stack convention in the workspace.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+# TCLI-05: the daemon's local loopback MCP endpoint (`terminus-client-daemon`
+# bin) -- same axum major version the rest of the workspace (`terminus-rs`)
+# already uses for its own `/mcp` listener.
+axum = { version = "0.7" }
+uuid = { version = "1", features = ["v4"] }
+# `terminus-client-daemon` bin's own tracing init -- same crate/version the
+# rest of the workspace (`terminus-rs`) already uses.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 # Test-only: build a mock enrollment HTTP endpoint and a mock mTLS server
 # (both a CA-chained one and a foreign-CA one) to exercise enroll()/connect()
 # without needing a live terminus primary. `x509-parser` isn't needed here --
