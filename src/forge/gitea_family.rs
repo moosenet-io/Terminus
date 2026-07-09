@@ -586,6 +586,12 @@ impl GiteaForge {
                 with_body(Method::POST, format!("/repos/{owner}/{}/issues/{}/comments", repo()?, idx("index")?), body).await
             }
             PullRequestsMerge => {
+                // `Do` / `MergeMessageField` (PascalCase) are NOT a typo: Gitea's
+                // merge endpoint (structs.MergePullRequestOption) genuinely uses
+                // these exact JSON tags, unlike the rest of its snake_case API.
+                // Mirrors the pre-existing `gitea_pull_request_merge` tool
+                // (src/gitea/mod.rs, `body["MergeMessageField"]`, predates this
+                // adapter) so both call sites agree with Gitea's real contract.
                 let mut body = json!({ "Do": params.get("style").and_then(Value::as_str).unwrap_or("merge") });
                 if let Some(m) = params.get("message").and_then(Value::as_str) {
                     body["MergeMessageField"] = json!(m);
