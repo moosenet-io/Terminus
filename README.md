@@ -113,7 +113,7 @@ their tools:
 | `serving` | Serving-profile inspect / operate (v1.1) | `serving_profile_get`, `serving_residency_status`, `serving_profile_refresh` |
 | `dev` | Path-jailed dev workspace | `dev_read_file`, `dev_write_file`, `dev_run_command`, `dev_list_workspaces` |
 | `openhands` | Agentic coding runs (guarded) | `openhands_run_task`, `openhands_list_conversations`, `openhands_get_status` |
-| `gitea` | Gitea git forge | `gitea_create_repo`, `gitea_read_file`, `gitea_create_pr`, `gitea_merge_pr`, `gitea_cargo_publish` |
+| `gitea` | Gitea git forge | `gitea_create_repo`, `gitea_read_file`, `gitea_create_pr`, `gitea_merge_pr`, `gitea_cargo_publish`, `gitea_cargo_yank` |
 | `github` | GitHub | `github_create_repo`, `github_list_repos`, `github_push_repo`, `github_pii_scan`, `git_public_mirror_status`, `git_public_mirror_prepare`, `git_public_mirror_approve`, `git_public_mirror_push` |
 | `plane` | Plane work management | `plane_create_work_item`, `plane_list_issues_by_state`, `plane_update_work_item`, `plane_create_module`, `plane_update_module`, `plane_delete_module`, `plane_add_issue_to_module`, `plane_remove_issue_from_module`, `plane_list_identities`, `plane_whoami`, `plane_prefix_check`, `plane_prefix_register` |
 | `nexus` | Inter-agent inbox | `nexus_send`, `nexus_check`, `nexus_read`, `nexus_ack`, `nexus_history` |
@@ -202,6 +202,35 @@ the tool cannot be turned into an arbitrary host-file read.
 | --- | --- | --- |
 | `CARGO_PUBLISH_MAX_CRATE_BYTES` | `67108864` (64 MiB) | Reject artifacts larger than this before reading. |
 | `CARGO_PUBLISH_ARTIFACT_DIR` | unset | When set, `crate_path` must resolve inside this directory (path jail). |
+
+## Retiring a broken crate version (`gitea_cargo_yank`)
+
+If a published version turns out to be broken (bad metadata, unresolvable
+dependencies, etc.) it must never be deleted outright — Cargo's registry
+protocol has a **reversible** primitive for exactly this: **yank**. A yanked
+version is refused for any *new* dependency resolution, but a `Cargo.lock`
+that already pins it keeps building unchanged, so existing consumers aren't
+broken by the retirement.
+
+`gitea_cargo_yank` calls Gitea's Cargo registry web API, signed with the
+**resolved `GITEA_PAT_<NAME>` identity token** — the same identity model
+`gitea_cargo_publish` uses, so no separate credential path is introduced.
+
+| Input | Required | Meaning |
+| --- | --- | --- |
+| `crate` | yes | Crate name in the registry. |
+| `version` | yes | Version to yank or unyank (e.g. `1.3.0`). |
+| `unyank` | no | `true` clears the yank (makes the version resolvable again); default `false` yanks it. |
+| `owner` | no | Registry owner/org (defaults to `GITEA_OWNER`, normally `moosenet`). |
+| `identity` | no | Which `GITEA_PAT_<NAME>` identity to act as (defaults to the active default `GITEA_IDENTITY_NAME`, normally `moose`). |
+
+It issues `DELETE {GITEA_URL}/api/packages/{owner}/cargo/api/v1/crates/{crate}/{version}/yank`
+to yank, or `PUT .../unyank` to clear the yank — both with
+`Authorization: token <GITEA_PAT_NAME>`. A `403` is surfaced explicitly as a
+likely missing `write:package` token scope; a `404` means the crate/version
+doesn't exist in the registry. **Prefer yank over a hard package delete** —
+delete is destructive and irreversible, while yank can always be undone with
+`unyank: true`.
 
 ## PII gate (Rust, authoritative)
 

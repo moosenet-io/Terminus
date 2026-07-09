@@ -1,4 +1,4 @@
-//! Gitea tools: 10 RustTool implementations for the Gitea source-control API.
+//! Gitea tools: 15 RustTool implementations for the Gitea source-control API.
 //!
 //! All tools use `reqwest` for typed HTTP calls. Write operations include a PII
 //! gate that scans content for private IP ranges and API-key patterns before
@@ -2028,6 +2028,161 @@ impl RustTool for CargoPublish {
     }
 }
 
+// ─── gitea_cargo_yank ──────────────────────────────────────────────────────
+
+/// `gitea_cargo_yank` — yank (or unyank) a crate version in the Gitea Cargo
+/// registry using Terminus's own resolved-identity token.
+///
+/// Yank is the REVERSIBLE Cargo registry primitive: it marks a version
+/// unusable for NEW dependency resolution while `Cargo.lock` files that
+/// already pin it continue to work unchanged. This is the correct tool for
+/// retiring a broken/poisoned release (e.g. bad metadata that resolves to
+/// `registry:null` dependencies) — prefer it over a hard package delete,
+/// which is destructive and irreversible. Gitea's Cargo package registry
+/// implements the standard Cargo registry web API
+/// (<https://doc.rust-lang.org/cargo/reference/registry-web-api.html#yank>):
+/// `DELETE .../crates/{crate}/{version}/yank` sets `yanked = true`, and
+/// `PUT .../crates/{crate}/{version}/unyank` clears it.
+pub struct CargoYank {
+    client: GiteaClient,
+}
+
+#[async_trait]
+impl RustTool for CargoYank {
+    fn name(&self) -> &str { "gitea_cargo_yank" }
+
+    fn description(&self) -> &str {
+        "Yank (or unyank) a crate version in the Gitea Cargo registry using a resolved \
+         GITEA_PAT_<NAME> identity's token (the active default GITEA_IDENTITY_NAME, or the \
+         optional `identity` argument). Yanking marks the version unusable for NEW dependency \
+         resolution while Cargo.lock files that already reference it keep working — the \
+         reversible primitive to retire a broken/poisoned release without deleting it. Inputs: \
+         crate, version, optional unyank (default false = yank; true clears the yank), \
+         optional owner, optional identity."
+    }
+
+    fn parameters(&self) -> Value {
+        with_identity_param(json!({
+            "type": "object",
+            "properties": {
+                "crate": {
+                    "type": "string",
+                    "description": "Crate name in the registry"
+                },
+                "version": {
+                    "type": "string",
+                    "description": "Crate version to yank or unyank (e.g. 1.3.0)"
+                },
+                "unyank": {
+                    "type": "boolean",
+                    "description": "If true, CLEAR the yank (make the version resolvable again). Default false = yank (mark the version unusable for new resolution)."
+                },
+                "owner": {
+                    "type": "string",
+                    "description": "Registry owner/org (optional; defaults to the configured GITEA_OWNER, normally 'moosenet')"
+                }
+            },
+            "required": ["crate", "version"]
+        }))
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let client = self.client.resolve_identity(&args)?;
+        let name = args["crate"].as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ToolError::InvalidArgument("'crate' is required".to_string()))?;
+        let version = args["version"].as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ToolError::InvalidArgument("'version' is required".to_string()))?;
+        let unyank = args["unyank"].as_bool().unwrap_or(false);
+        let owner = client.resolve_owner(args["owner"].as_str());
+
+        // The owner, crate name, and version are all interpolated into the
+        // request URL alongside a privileged bearer token, so each must be
+        // validated as a single, safe path segment before use — the same
+        // defense `gitea_cargo_publish` applies to `owner`.
+        if !is_valid_owner_segment(owner) {
+            return Err(ToolError::InvalidArgument(format!(
+                "Invalid registry owner '{owner}': must be a single Gitea org/user name \
+                 (alphanumerics, '-', '_', '.')."
+            )));
+        }
+        if !is_valid_owner_segment(name) {
+            return Err(ToolError::InvalidArgument(format!(
+                "Invalid crate name '{name}': must contain only alphanumerics, '-', '_', '.'."
+            )));
+        }
+        if !is_valid_owner_segment(version) {
+            return Err(ToolError::InvalidArgument(format!(
+                "Invalid version '{version}': must contain only alphanumerics, '-', '_', '.'."
+            )));
+        }
+
+        let action = if unyank { "unyank" } else { "yank" };
+        let url = format!(
+            "{}/api/packages/{}/cargo/api/v1/crates/{}/{}/{}",
+            client.base_url.trim_end_matches('/'),
+            owner,
+            name,
+            version,
+            action,
+        );
+        debug!("{} {url}", if unyank { "PUT" } else { "DELETE" });
+
+        let req = if unyank {
+            client.http.put(&url)
+        } else {
+            client.http.delete(&url)
+        };
+
+        let resp = req
+            .header("Authorization", client.auth_header())
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| ToolError::Http(format!("Cargo {action} request failed: {e}")))?;
+
+        let status = resp.status();
+        if status == StatusCode::UNAUTHORIZED {
+            return Err(ToolError::Http(format!(
+                "Gitea Cargo {action} returned 401 Unauthorized — the resolved GITEA_PAT_<NAME> \
+                 identity token is missing or invalid."
+            )));
+        }
+        if status == StatusCode::FORBIDDEN {
+            return Err(ToolError::Http(format!(
+                "Gitea Cargo {action} returned 403 Forbidden for {owner}/{name}@{version}. The \
+                 resolved GITEA_PAT_<NAME> identity token almost certainly lacks the \
+                 `write:package` scope required to {action} a Cargo registry version — \
+                 regenerate the token in the runtime secret store with that scope."
+            )));
+        }
+        if status == StatusCode::NOT_FOUND {
+            return Err(ToolError::NotFound(format!(
+                "Crate {owner}/{name}@{version} was not found in the Cargo registry (Gitea \
+                 returned 404) — cannot {action} a version that doesn't exist."
+            )));
+        }
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(ToolError::Http(format!(
+                "Gitea Cargo {action} returned {status} for {owner}/{name}@{version}: {body_text}"
+            )));
+        }
+
+        Ok(json!({
+            "action": action,
+            "yanked": !unyank,
+            "name": name,
+            "version": version,
+            "owner": owner,
+        })
+        .to_string())
+    }
+}
+
 // ─── gitea_list_identities ────────────────────────────────────────────────────
 
 /// Lists the names of every configured `GITEA_PAT_<NAME>` identity so a caller
@@ -2098,6 +2253,7 @@ pub fn register(registry: &mut ToolRegistry) {
             let _ = registry.register(Box::new(MergePr { client: client.clone() }));
             let _ = registry.register(Box::new(ListBranches { client: client.clone() }));
             let _ = registry.register(Box::new(CargoPublish { client: client.clone() }));
+            let _ = registry.register(Box::new(CargoYank { client: client.clone() }));
             let _ = registry.register(Box::new(GiteaListIdentities { client: client.clone() }));
             let _ = registry.register(Box::new(ListDirectory { client }));
         }
@@ -2125,6 +2281,7 @@ pub fn register(registry: &mut ToolRegistry) {
             stub!("gitea_merge_pr", "Merge Gitea pull request (not configured)");
             stub!("gitea_list_branches", "List Gitea branches (not configured)");
             stub!("gitea_cargo_publish", "Publish a .crate to the Gitea Cargo registry (not configured)");
+            stub!("gitea_cargo_yank", "Yank/unyank a crate version in the Gitea Cargo registry (not configured)");
             stub!("gitea_list_identities", "List configured Gitea identities (not configured)");
             stub!("gitea_list_directory", "List directory contents in Gitea (not configured)");
         }
@@ -3438,6 +3595,235 @@ mod tests {
         register(&mut reg);
         if let Some(v) = url_backup { std::env::set_var("GITEA_URL", v); } else { std::env::remove_var("GITEA_URL"); }
         assert!(reg.contains("gitea_cargo_publish"));
+    }
+
+    // ── gitea_cargo_yank ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_cargo_yank_correct_url_method_and_bearer_auth() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(DELETE)
+                .path("/api/packages/testorg/cargo/api/v1/crates/terminus-rs/1.3.0/yank")
+                .header("Authorization", "token test-token");
+            then.status(200).json_body(serde_json::json!({ "ok": true }));
+        });
+
+        let tool = CargoYank { client: mock_client(&server) };
+        let result = tool
+            .execute(serde_json::json!({ "crate": "terminus-rs", "version": "1.3.0" }))
+            .await
+            .unwrap();
+
+        mock.assert();
+        assert!(result.contains("\"action\":\"yank\""));
+        assert!(result.contains("\"yanked\":true"));
+        assert!(result.contains("terminus-rs"));
+        assert!(result.contains("1.3.0"));
+    }
+
+    #[tokio::test]
+    async fn test_cargo_unyank_uses_put_and_clears_yank() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(PUT)
+                .path("/api/packages/testorg/cargo/api/v1/crates/terminus-rs/1.3.0/unyank")
+                .header("Authorization", "token test-token");
+            then.status(200).json_body(serde_json::json!({ "ok": true }));
+        });
+
+        let tool = CargoYank { client: mock_client(&server) };
+        let result = tool
+            .execute(serde_json::json!({
+                "crate": "terminus-rs",
+                "version": "1.3.0",
+                "unyank": true
+            }))
+            .await
+            .unwrap();
+
+        mock.assert();
+        assert!(result.contains("\"action\":\"unyank\""));
+        assert!(result.contains("\"yanked\":false"));
+    }
+
+    #[tokio::test]
+    async fn test_cargo_yank_owner_override() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(DELETE)
+                .path("/api/packages/otherorg/cargo/api/v1/crates/foo/0.1.0/yank");
+            then.status(200).json_body(serde_json::json!({}));
+        });
+
+        let tool = CargoYank { client: mock_client(&server) };
+        let result = tool
+            .execute(serde_json::json!({
+                "crate": "foo",
+                "version": "0.1.0",
+                "owner": "otherorg"
+            }))
+            .await
+            .unwrap();
+        mock.assert();
+        assert!(result.contains("\"owner\":\"otherorg\""));
+    }
+
+    #[tokio::test]
+    async fn test_cargo_yank_requires_crate_and_version() {
+        let server = MockServer::start();
+        let tool = CargoYank { client: mock_client(&server) };
+
+        let err = tool
+            .execute(serde_json::json!({ "version": "1.0.0" }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("'crate' is required"));
+
+        let err = tool
+            .execute(serde_json::json!({ "crate": "foo" }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("'version' is required"));
+    }
+
+    #[tokio::test]
+    async fn test_cargo_yank_rejects_traversal_owner_crate_and_version() {
+        let server = MockServer::start();
+        let tool = CargoYank { client: mock_client(&server) };
+
+        let err = tool
+            .execute(serde_json::json!({
+                "crate": "foo",
+                "version": "1.0.0",
+                "owner": "../../secret-org"
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid registry owner"));
+
+        let err = tool
+            .execute(serde_json::json!({ "crate": "../foo", "version": "1.0.0" }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid crate name"));
+
+        let err = tool
+            .execute(serde_json::json!({ "crate": "foo", "version": "../1.0.0" }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid version"));
+    }
+
+    #[tokio::test]
+    async fn test_cargo_yank_404_missing_crate_or_version() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(DELETE);
+            then.status(404).body("not found");
+        });
+
+        let tool = CargoYank { client: mock_client(&server) };
+        let err = tool
+            .execute(serde_json::json!({ "crate": "nope", "version": "9.9.9" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+        assert!(err.to_string().contains("was not found"));
+    }
+
+    #[tokio::test]
+    async fn test_cargo_yank_403_surfaces_write_package_scope() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(DELETE);
+            then.status(403).body("permission denied");
+        });
+
+        let tool = CargoYank { client: mock_client(&server) };
+        let err = tool
+            .execute(serde_json::json!({ "crate": "foo", "version": "1.0.0" }))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("403"));
+        assert!(msg.contains("write:package"));
+    }
+
+    #[tokio::test]
+    async fn test_cargo_yank_never_leaks_token_in_error() {
+        let secret_token = "<REDACTED-SECRET>"; // pii-test-fixture
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(DELETE);
+            then.status(500).body("internal error");
+        });
+        let client = GiteaClient {
+            http: Client::new(),
+            base_url: server.base_url(),
+            token: secret_token.to_string(),
+            identity_name: Some("moose".to_string()),
+            identities: Arc::new(HashMap::new()),
+            owner: "testorg".to_string(),
+        };
+        let tool = CargoYank { client };
+        let err = tool
+            .execute(serde_json::json!({ "crate": "foo", "version": "1.0.0" }))
+            .await
+            .unwrap_err();
+        assert!(
+            !err.to_string().contains(secret_token),
+            "token must never appear in an error message"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cargo_yank_uses_resolved_identity_token() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(DELETE)
+                .path("/api/packages/testorg/cargo/api/v1/crates/foo/0.1.0/yank")
+                .header("Authorization", "token tok-harmony");
+            then.status(200).json_body(serde_json::json!({}));
+        });
+        let client = mock_client_with_identities(
+            &server,
+            "moose",
+            &[("moose", "tok-moose"), ("harmony", "tok-harmony")], // pii-test-fixture
+        );
+        let tool = CargoYank { client };
+        let result = tool
+            .execute(serde_json::json!({
+                "crate": "foo",
+                "version": "0.1.0",
+                "identity": "harmony"
+            }))
+            .await
+            .unwrap();
+        mock.assert();
+        assert!(result.contains("\"yanked\":true"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_register_adds_cargo_yank_with_url() {
+        let url_backup = std::env::var("GITEA_URL").ok();
+        std::env::set_var("GITEA_URL", "http://example.com");
+        let mut reg = ToolRegistry::new();
+        register(&mut reg);
+        if let Some(v) = url_backup { std::env::set_var("GITEA_URL", v); } else { std::env::remove_var("GITEA_URL"); }
+        assert!(reg.contains("gitea_cargo_yank"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_register_adds_cargo_yank_stub_when_not_configured() {
+        let url_backup = std::env::var("GITEA_URL").ok();
+        std::env::remove_var("GITEA_URL");
+        let mut reg = ToolRegistry::new();
+        register(&mut reg);
+        if let Some(v) = url_backup { std::env::set_var("GITEA_URL", v); }
+        assert!(reg.contains("gitea_cargo_yank"));
     }
 
     // ── GPAT (S105): multi-identity (GITEA_PAT_<NAME>) ─────────────────────────
