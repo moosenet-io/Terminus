@@ -159,17 +159,58 @@ const DEFAULT_GITEA_IDENTITY: &str = "moose";
 /// newline in the credential value can never break the auth header again
 /// (this bit us on `GITEA_PAT_MOOSE`). A value that is only whitespace trims to
 /// empty and is treated as absent, exactly like an unset var.
-fn scan_gitea_identities() -> HashMap<String, String> {
+///
+/// Trimming alone only strips LEADING/TRAILING whitespace — a token with
+/// INTERIOR whitespace or control characters (e.g. a PAT accidentally
+/// materialised with an embedded newline or space in the middle, such as
+/// `"abc\ndef"`) trims to itself and would slip through unchanged, either
+/// corrupting the `Authorization` header value or reqwest's `HeaderValue`
+/// parser rejecting it with an opaque "builder error" far from the actual
+/// cause (codex P1). Every token is validated with
+/// [`reject_interior_whitespace`] after trimming; a bad `GITEA_PAT_<NAME>`
+/// fails loudly here, at scan time, with the offending identity named in the
+/// error, rather than surfacing as a confusing HTTP client build failure
+/// later.
+fn scan_gitea_identities() -> Result<HashMap<String, String>, ToolError> {
     let mut identities: HashMap<String, String> = HashMap::new();
     for (k, v) in env::vars() {
         if let Some(name) = k.strip_prefix(GITEA_IDENTITY_PREFIX) {
             let token = v.trim();
             if !token.is_empty() {
+                reject_interior_whitespace(token).map_err(|e| {
+                    ToolError::InvalidArgument(format!(
+                        "{GITEA_IDENTITY_PREFIX}{name}: {e}"
+                    ))
+                })?;
                 identities.insert(name.to_lowercase(), token.to_string());
             }
         }
     }
-    identities
+    Ok(identities)
+}
+
+/// Reject a (already-trimmed) token that still contains interior whitespace
+/// or ASCII control characters. A well-formed PAT is a single contiguous run
+/// of visible characters; leading/trailing whitespace is handled by `.trim()`
+/// at the call site, but an INTERIOR space, tab, or newline (e.g. a secret
+/// materialised as two lines glued together, or a copy-paste that captured a
+/// stray space mid-token) is not something trimming can catch. Sending such a
+/// value verbatim in an `Authorization: token <PAT>` header either builds a
+/// header reqwest's `HeaderValue` parser rejects outright (control bytes) or
+/// — worse — a header that parses fine but can never match the real
+/// credential (an interior space), silently masquerading as "just" a 401.
+/// Reject it explicitly instead, with a message that names the actual
+/// problem instead of leaking the token value.
+fn reject_interior_whitespace(token: &str) -> Result<(), ToolError> {
+    if token.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(ToolError::InvalidArgument(
+            "token contains interior whitespace or control characters after trimming — \
+             refusing to build an auth header from it (check the secret for an embedded \
+             newline/space/tab)"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -221,7 +262,7 @@ impl GiteaClient {
         // Named identities: GITEA_PAT_<NAME> for any agent that needs its own
         // token (e.g. GITEA_PAT_MOOSE, GITEA_PAT_HARMONY, GITEA_PAT_LUMINA).
         // Read once at process start from this process's own environment.
-        let identities = scan_gitea_identities();
+        let identities = scan_gitea_identities()?;
 
         // Active-default identity name: explicit GITEA_IDENTITY_NAME, else the
         // built-in default `moose`. Lowercased to match the identities map /
@@ -275,6 +316,7 @@ impl GiteaClient {
                 "Gitea-family provider token is empty".to_string(),
             ));
         }
+        reject_interior_whitespace(&token)?;
         let http = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -1573,8 +1615,25 @@ pub(crate) fn build_cargo_metadata(name: &str, vers: &str, provided: Option<&Val
 /// Default upper bound on the `.crate` artifact size (64 MiB). A packaged crate
 /// is normally well under a few MiB; this cap exists purely to stop a caller
 /// from pointing the tool at an unbounded/huge file and exhausting memory.
-/// Overridable via `CARGO_PUBLISH_MAX_CRATE_BYTES`.
-const DEFAULT_MAX_CRATE_BYTES: u64 = 64 * 1024 * 1024;
+/// Overridable via `CARGO_PUBLISH_MAX_CRATE_BYTES`. `pub(crate)` because the
+/// Gitea-family [`ForgeProvider`] adapter's `packages_publish` (which accepts
+/// crate bytes as base64 rather than a file path) enforces the same ceiling
+/// against the decoded byte length — one size limit, shared, rather than two
+/// consts that can silently drift apart.
+pub(crate) const DEFAULT_MAX_CRATE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Resolve the effective max `.crate` byte ceiling for cargo publish: the
+/// `CARGO_PUBLISH_MAX_CRATE_BYTES` env override if set to a valid positive
+/// integer, else [`DEFAULT_MAX_CRATE_BYTES`]. Shared by both the file-path
+/// publish tool (`gitea_cargo_publish`) and the `ForgeProvider` adapter's
+/// `packages_publish` (base64 body) so a single knob controls both.
+pub(crate) fn cargo_publish_max_crate_bytes() -> u64 {
+    env::var("CARGO_PUBLISH_MAX_CRATE_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_CRATE_BYTES)
+}
 
 /// True if `owner` is a single, safe registry path segment.
 ///
@@ -1831,10 +1890,7 @@ impl RustTool for CargoPublish {
         // file (rejects dirs and unbounded devices like /dev/zero), size bound,
         // and an optional artifact-directory jail. This stops the tool being
         // used to read arbitrary host files or exhaust memory.
-        let max_bytes = env::var("CARGO_PUBLISH_MAX_CRATE_BYTES")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_MAX_CRATE_BYTES);
+        let max_bytes = cargo_publish_max_crate_bytes();
         let artifact_dir = env::var("CARGO_PUBLISH_ARTIFACT_DIR").ok();
         let canonical_path = resolve_crate_path(crate_path, max_bytes, artifact_dir.as_deref())?;
 
@@ -2098,6 +2154,79 @@ mod tests {
             identities: Arc::new(map),
             owner: "testorg".to_string(),
         }
+    }
+
+    // ── Token whitespace hardening (codex P1) ───────────────────────────────
+
+    #[test]
+    fn test_reject_interior_whitespace_rejects_embedded_space() {
+        let err = reject_interior_whitespace("abc def").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("interior whitespace"), "unexpected message: {msg}");
+    }
+
+    #[test]
+    fn test_reject_interior_whitespace_rejects_embedded_newline() {
+        // A token glued together with a newline in the middle (e.g. two secret
+        // lines concatenated) trims to itself and must still be rejected.
+        let err = reject_interior_whitespace("abc\ndef").unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn test_reject_interior_whitespace_rejects_control_char() {
+        let err = reject_interior_whitespace("abc\tdef").unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn test_reject_interior_whitespace_allows_clean_token() {
+        assert!(reject_interior_whitespace("gta-clean-token-value-xyz").is_ok());
+    }
+
+    #[test]
+    fn test_with_token_rejects_interior_whitespace() {
+        // GiteaClient::with_token trims leading/trailing whitespace but must not
+        // let an INTERIOR space/newline through — that would either corrupt the
+        // `Authorization` header or build one that silently never matches the
+        // real credential (codex P1: whitespace-trim bypass).
+        let result = GiteaClient::with_token(
+            "https://example.invalid",
+            "  abc\ndef  ", // pii-test-fixture
+            "testorg",
+            "forgejo",
+        );
+        assert!(result.is_err(), "token with interior newline must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_with_token_accepts_clean_trimmed_token() {
+        let result = GiteaClient::with_token(
+            "https://example.invalid",
+            "  clean-token-value  ", // pii-test-fixture
+            "testorg",
+            "forgejo",
+        );
+        assert!(result.is_ok(), "clean token with only leading/trailing whitespace should pass");
+    }
+
+    #[test]
+    fn test_scan_gitea_identities_rejects_interior_whitespace() {
+        // Isolate from the real process environment: no other test may set
+        // GITEA_PAT_* vars concurrently, so this is intentionally a single,
+        // narrowly-scoped var set/unset around the call.
+        // SAFETY: tests in this crate do not run env-mutating tests in parallel
+        // across this specific var name; guarded by a unique identity name.
+        std::env::set_var("GITEA_PAT_GITX02WSTEST", "abc\ndef"); // pii-test-fixture
+        let result = scan_gitea_identities();
+        std::env::remove_var("GITEA_PAT_GITX02WSTEST");
+        let err = result.expect_err("interior-whitespace token must be rejected");
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
     // ── PII gate tests ────────────────────────────────────────────────────

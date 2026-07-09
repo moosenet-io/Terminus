@@ -111,8 +111,11 @@ fn enc_path(v: &str) -> String {
 /// check. Any such value must be rejected — it cannot be safely encoded.
 fn has_traversal_segment(v: &str) -> bool {
     v.split(['/', '\\']).any(|seg| {
+        // Trim each segment: downstream extraction (`owner()` / `req_str`) trims
+        // surrounding whitespace, so a value like `" .. "` would otherwise slip
+        // past this check and become a bare `..` segment in the built URL.
         matches!(
-            seg.to_ascii_lowercase().as_str(),
+            seg.trim().to_ascii_lowercase().as_str(),
             "." | ".." | "%2e" | "%2e." | ".%2e" | "%2e%2e"
         )
     })
@@ -134,7 +137,8 @@ use tracing::warn;
 
 use crate::error::ToolError;
 use crate::gitea::{
-    build_cargo_metadata, build_cargo_publish_body, is_valid_owner_segment, pii_check, GiteaClient,
+    build_cargo_metadata, build_cargo_publish_body, cargo_publish_max_crate_bytes,
+    is_valid_owner_segment, pii_check, GiteaClient,
 };
 
 use super::capability::{CapabilityMap, ForgeEndpoint, SupportLevel};
@@ -343,6 +347,21 @@ impl GiteaForge {
             )
         })?;
         let crate_b64 = req_str(params, "crate_b64").map_err(|e| map_tool_err(p, e))?;
+        // Bound the ENCODED length before decoding: base64 inflates size by
+        // ~4/3, so checking only the decoded length would still let a caller
+        // force this process to allocate/hold an oversized intermediate
+        // string in memory. `+ 4` gives a little slack for padding/newlines
+        // around the true ceiling without meaningfully loosening it.
+        let max_bytes = cargo_publish_max_crate_bytes();
+        let max_b64_len = (max_bytes / 3 * 4) + 4;
+        if crate_b64.trim().len() as u64 > max_b64_len {
+            return Err(ForgeError::InvalidRequest(format!(
+                "crate_b64 is too large: encoded length {} bytes exceeds the {max_bytes}-byte \
+                 (.crate) limit — set CARGO_PUBLISH_MAX_CRATE_BYTES to raise it if this is a \
+                 legitimate large crate",
+                crate_b64.trim().len()
+            )));
+        }
         let crate_bytes = B64
             .decode(crate_b64.trim())
             .map_err(|e| ForgeError::InvalidRequest(format!("crate_b64 is not valid base64: {e}")))?;
@@ -350,6 +369,16 @@ impl GiteaForge {
             return Err(ForgeError::InvalidRequest(
                 "decoded crate is empty — nothing to publish".to_string(),
             ));
+        }
+        // Belt-and-suspenders: also check the DECODED length (catches any edge
+        // case in the encoded-length estimate above) before the bytes are
+        // used to build the upload body.
+        if crate_bytes.len() as u64 > max_bytes {
+            return Err(ForgeError::InvalidRequest(format!(
+                "decoded crate is too large: {} bytes exceeds the {max_bytes}-byte limit — set \
+                 CARGO_PUBLISH_MAX_CRATE_BYTES to raise it if this is a legitimate large crate",
+                crate_bytes.len()
+            )));
         }
 
         let meta = build_cargo_metadata(name, version, Some(metadata));
@@ -878,6 +907,56 @@ mod tests {
             .await
             .expect_err("PII gate should block");
         assert!(matches!(err, ForgeError::InvalidRequest(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn packages_publish_rejects_oversized_crate(){
+        // codex P2: packages_publish must reject an oversized crate_b64 BEFORE
+        // ever issuing the upload request — no mock registered, so any HTTP
+        // call here fails the test via `m.assert()`-style absence.
+        let server = MockServer::start();
+        let forge = mock_gitea(&server);
+        // Force a tiny ceiling via the env override so the test doesn't need
+        // to construct a real 64MiB+ payload.
+        std::env::set_var("CARGO_PUBLISH_MAX_CRATE_BYTES", "16");
+        let oversized = B64.encode(vec![b'x'; 1024]); // decodes to 1024 bytes >> 16-byte cap
+        let err = forge
+            .dispatch(
+                ForgeEndpoint::PackagesPublish,
+                ForgeRequest::new(json!({
+                    "name": "demo", "version": "0.1.0",
+                    "metadata": {"name": "demo", "vers": "0.1.0", "deps": []},
+                    "crate_b64": oversized,
+                })),
+            )
+            .await
+            .expect_err("oversized crate_b64 must be rejected");
+        std::env::remove_var("CARGO_PUBLISH_MAX_CRATE_BYTES");
+        assert!(matches!(err, ForgeError::InvalidRequest(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn packages_publish_accepts_crate_within_limit() {
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(PUT).path("/api/packages/moosenet/cargo/api/v1/crates/new");
+            then.status(200).json_body(json!({"ok": true}));
+        });
+        let forge = mock_gitea(&server);
+        let small = B64.encode(vec![b'x'; 32]);
+        let resp = forge
+            .dispatch(
+                ForgeEndpoint::PackagesPublish,
+                ForgeRequest::new(json!({
+                    "name": "demo", "version": "0.1.0",
+                    "metadata": {"name": "demo", "vers": "0.1.0", "deps": []},
+                    "crate_b64": small,
+                })),
+            )
+            .await
+            .expect("small crate under the default limit should publish");
+        m.assert();
+        assert_eq!(resp.body["published"], true);
     }
 
     #[tokio::test]
