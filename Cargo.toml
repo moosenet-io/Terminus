@@ -81,7 +81,13 @@ lettre = { version = "0.11", default-features = false, features = ["tokio1", "to
 # streamable-HTTP MCP server exposing the personal-utility tool subset.
 # Same axum/tower versions Chord (moosenet/Chord) pins, for convention parity.
 axum = { version = "0.7", features = ["json", "macros"] }
-tower = "0.4"
+# TCLI-03: "util" adds `tower::ServiceExt::oneshot`, used by
+# `src/pki/mtls.rs`'s per-connection hyper service to dispatch each request
+# into the shared `axum::Router` (see that module's "why hyper directly"
+# doc). Previously only enabled in [dev-dependencies] (test-only oneshot
+# usage in mcp_server.rs/enroll.rs); promoted here since this item's runtime
+# code now needs it too.
+tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["trace"] }
 # S100 (TERM): distributed Redis-backed Plane GET cache + rate limiter.
 # connection-manager gives a multiplexed, auto-reconnecting async connection;
@@ -96,6 +102,30 @@ redis = { version = "0.24", default-features = false, features = ["tokio-comp", 
 # builds sharing one Redis never fragment the cache (unlike std DefaultHasher).
 # Already in the tree (redis uses it for EVALSHA), so no new build cost.
 sha1_smol = "1"
+# TCLI-03: mTLS listener (`src/pki/mtls.rs`) needs to parse the peer leaf
+# cert's Extended Key Usage + validity window at runtime (post-handshake,
+# fail-closed EKU/expiry check independent of rustls's own chain
+# validation) -- promoted from dev-only (where TCLI-02's tests used it) to a
+# regular dependency. Already a transitive dep of `rcgen`'s "x509-parser"
+# feature; "verify" is kept for the existing enroll.rs chain-of-trust tests.
+x509-parser = { version = "0.18", features = ["verify"] }
+# TCLI-03: parse the PEM-encoded CA/server cert + key material into the DER
+# form `rustls::ServerConfig`/`RootCertStore` need. The same de-facto
+# standard PEM parser the rustls ecosystem uses everywhere (already a
+# transitive dependency via tokio-rustls/reqwest's rustls-tls stack);
+# pinned directly here for the same reason `rcgen`/`time` are pinned above.
+rustls-pemfile = "2"
+# TCLI-03: the mTLS listener terminates TLS itself (via `tokio_rustls`) and
+# then has to speak HTTP over the resulting stream to reach the *same*
+# `axum::Router` the plain `/mcp` listener serves -- `axum::serve` doesn't
+# expose a hook to attach per-connection data (the verified client
+# identity) to each request's extensions, so this item drives one `hyper`
+# connection per accepted socket directly instead, inserting the identity
+# extracted from the handshake before dispatching into the shared router.
+# Version pinned to line up with the `hyper` 1.x axum 0.7 already pulls in
+# transitively, so this does not introduce a second hyper major version.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 
 [dev-dependencies]
 # mcp_server tests drive the axum Router directly via `ServiceExt::oneshot`.
@@ -104,10 +134,6 @@ httpmock = "0.7"
 tokio-test = "0.4"
 serial_test = "3"
 tempfile = "3"
-# TCLI-02: chain-of-trust + TTL assertions on issued leaf certs. Already a
-# transitive dependency (rcgen's "x509-parser" feature); pinned directly
-# here so pki::enroll's tests can parse issued/CA cert DER themselves.
-x509-parser = { version = "0.18", features = ["verify"] }
 
 # S84 ASMT-02: explicit integration-test target for the dim-1 conversation suite
 # (Cargo does not auto-discover test files inside subdirectories).

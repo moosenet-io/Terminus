@@ -492,6 +492,55 @@ pub fn enrollment_jwt_ttl_seconds() -> i64 {
         .unwrap_or(1800)
 }
 
+// ── TCLI-03: mTLS listener config (non-secret) ─────────────────────────────
+//
+// The mTLS listener's TLS material (CA + server cert/key) is PKI material,
+// not a plain secret string, and is handled entirely by `crate::pki`/
+// `crate::pki::mtls` (load-or-generate CA, issue-on-startup server cert) --
+// this section only resolves non-secret knobs: bind address, port, TTL,
+// server identity name. Deliberately a SEPARATE port from
+// `TERMINUS_PERSONAL_PORT`/`TERMINUS_PERSONAL_BIND` (the existing plain
+// HTTP+JWT listener) -- this listener is additive, not a replacement, and
+// must never collide with it (see `crate::pki::mtls` module docs).
+
+/// Bind address for the mTLS listener. From `TERMINUS_MTLS_BIND`; defaults
+/// to `127.0.0.1`, matching the existing plain listener's default posture
+/// (`crate::bin::terminus_personal`'s `TERMINUS_PERSONAL_BIND` default) --
+/// an operator opts into a wider bind explicitly for either listener.
+pub fn mtls_bind_addr() -> String {
+    env_nonempty("TERMINUS_MTLS_BIND").unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
+/// Bind port for the mTLS listener. From `TERMINUS_MTLS_PORT`; defaults to
+/// `8301` -- one past the existing plain listener's default `8300`
+/// (`TERMINUS_PERSONAL_PORT`), never the same port (this listener is a
+/// second, additive one, not a replacement).
+pub fn mtls_port() -> u16 {
+    env_nonempty("TERMINUS_MTLS_PORT")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8301)
+}
+
+/// The terminus primary's own mTLS server-cert identity name, embedded in
+/// CN/SAN at issuance (`crate::pki::mtls::issue_server_cert`). From
+/// `TERMINUS_MTLS_SERVER_IDENTITY`; defaults to `terminus-primary`. Purely
+/// an operator-facing label -- plays no role in client-side authz (a server
+/// cert is not client input).
+pub fn mtls_server_identity() -> String {
+    env_nonempty("TERMINUS_MTLS_SERVER_IDENTITY").unwrap_or_else(|| "terminus-primary".to_string())
+}
+
+/// Validity window, in days, for the terminus primary's own mTLS server
+/// cert. From `TERMINUS_MTLS_SERVER_CERT_TTL_DAYS`; defaults to 365 --
+/// deliberately much longer than TCLI-02's per-client leaf cert TTL (see
+/// `crate::pki::mtls`'s module doc "server cert issuance" section for why).
+pub fn mtls_server_cert_ttl_days() -> i64 {
+    env_nonempty("TERMINUS_MTLS_SERVER_CERT_TTL_DAYS")
+        .and_then(|v| v.parse().ok())
+        .filter(|d: &i64| *d > 0)
+        .unwrap_or(365)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
