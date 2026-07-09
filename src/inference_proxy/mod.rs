@@ -97,7 +97,19 @@ pub const CODING_SELECT_PATH: &str = "/v1/coding/select";
 /// forwarded to Chord) — identical list to Chord's own
 /// `is_unforwardable_request_header` (its hop to the LLM backend), reused
 /// here for terminus-primary's hop to Chord for the same reasons.
+///
+/// Also strips any INBOUND [`CLIENT_IDENTITY_HEADER`]: the caller identity
+/// forwarded to Chord is strictly SERVER-set (derived from the mTLS client
+/// cert, appended below), never trusted from the request — same posture as
+/// TGW-02's federation client, which builds a structured request and sets
+/// only the server-derived identity. Without this strip a client could
+/// supply its own `x-terminus-client-identity`, which `reqwest` would
+/// APPEND (not replace) alongside the real one, leaving Chord's audit with a
+/// forged value to (mis)read.
 fn is_unforwardable_request_header(name: &HeaderName) -> bool {
+    if name.as_str().eq_ignore_ascii_case(CLIENT_IDENTITY_HEADER) {
+        return true;
+    }
     matches!(
         name.as_str(),
         "host"
@@ -385,6 +397,52 @@ mod tests {
         let client = InferenceProxyClient::with_base_url(server.base_url());
         let resp = client
             .forward(CHAT_COMPLETIONS_PATH, headers, Bytes::from("{}"), None)
+            .await;
+
+        mock.assert();
+        assert_eq!(resp.status(), StatusCode::OK);
+        clear_jwt_secret();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn forward_strips_inbound_client_identity_only_server_set_forwarded() {
+        set_jwt_secret();
+        let server = MockServer::start();
+        // The server-set (mTLS-derived) identity MUST reach Chord; a client-
+        // supplied forged copy of the same header MUST NOT.
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path(CHAT_COMPLETIONS_PATH)
+                .header(CLIENT_IDENTITY_HEADER, "real-mtls-identity")
+                .matches(|req| {
+                    let forged_present = req
+                        .headers
+                        .as_ref()
+                        .map(|hs| {
+                            hs.iter()
+                                .filter(|(k, _)| k.eq_ignore_ascii_case(CLIENT_IDENTITY_HEADER))
+                                .any(|(_, v)| v == "forged-identity")
+                        })
+                        .unwrap_or(false);
+                    !forged_present
+                });
+            then.status(200).json_body(json!({"ok": true}));
+        });
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(CLIENT_IDENTITY_HEADER),
+            HeaderValue::from_static("forged-identity"),
+        );
+        let client = InferenceProxyClient::with_base_url(server.base_url());
+        let resp = client
+            .forward(
+                CHAT_COMPLETIONS_PATH,
+                headers,
+                Bytes::from("{}"),
+                Some("real-mtls-identity"),
+            )
             .await;
 
         mock.assert();
