@@ -63,6 +63,38 @@ use super::workdir::{assert_never_force, run_git, MirrorWorkDir};
 /// (`TERMINUS_MIRROR_REMOTE`). NEVER a literal in code — the remote is infra.
 const REMOTE_ENV: &str = "TERMINUS_MIRROR_REMOTE";
 
+/// Resolve the transport token for a mirror-push TARGET provider. The engine's
+/// logic is provider-agnostic by construction (S106 / GITX-05): `github` is
+/// the only wired resolver today because it is the only configured public
+/// mirror target, but this is a routing table, not a hardcoded assumption —
+/// adding a second target (e.g. once a `codeberg`/`gitlab_saas` mirror is
+/// configured) is one more match arm here, not a rewrite of the push/prepare
+/// transport. An unrouted provider is a clean, honest [`ToolError::NotConfigured`],
+/// never a silent fallback to GitHub's credential.
+fn mirror_provider_token(provider: &str) -> Result<String, ToolError> {
+    match provider {
+        "github" => github_token(),
+        other => Err(ToolError::NotConfigured(format!(
+            "mirror engine has no transport credential resolver configured for provider \
+             '{other}' yet (only 'github' is wired) — the engine is provider-routable, but \
+             this target has not been configured"
+        ))),
+    }
+}
+
+/// The mirror-push target provider for a call: explicit `provider` arg, else
+/// `github` (today's only configured target). Kept as its own accessor so the
+/// "not hardcoded, just currently mono-configured" distinction is visible at
+/// every call site.
+fn mirror_provider(args: &Value) -> String {
+    args.get("provider")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("github")
+        .to_string()
+}
+
 /// Tag namespace marking a snapshot the OPERATOR has authorised for push. Created
 /// ONLY by `github_mirror_approve` after the approval gate grants — distinct from
 /// GHMR-03's `mirror-approved/*` (gate-clean, but machine-created by prepare). Push
@@ -536,7 +568,8 @@ impl RustTool for GitHubMirrorPush {
             "properties": {
                 "repo":          { "type": "string", "description": "Logical repo name" },
                 "source":        { "type": "string", "description": "Path to the internal-main checkout on the dev box" },
-                "github_remote": { "type": "string", "description": "Target GitHub mirror remote URL (else TERMINUS_MIRROR_REMOTE[_<REPO>])" },
+                "github_remote": { "type": "string", "description": "Target mirror remote URL (else TERMINUS_MIRROR_REMOTE[_<REPO>])" },
+                "provider":      { "type": "string", "description": "Mirror-push target provider (default 'github'; the engine is provider-routable — see mirror_provider_token)" },
                 "_approval_code": { "type": "string", "description": "One-time approval code (supplied on operator re-dispatch; do not set manually)" }
             },
             "required": ["repo", "source"]
@@ -631,7 +664,9 @@ impl RustTool for GitHubMirrorPush {
 
         // Token resolved ONLY now, immediately before the push, and injected via
         // GIT_ASKPASS — never in the remote URL, never in argv, never logged.
-        let token = github_token()?;
+        // Routed by target provider (default 'github'; see `mirror_provider_token`
+        // for why this is a routing table, not a hardcoded assumption).
+        let token = mirror_provider_token(&mirror_provider(&args))?;
         perform_ff_push(wd.path(), &remote, &approved_commit, &token)?;
 
         Ok(json!({
@@ -818,6 +853,28 @@ fn git_exit_ok(work_dir: &Path, args: &[&str]) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+// ── git-public integration (S106 / GITX-05) ─────────────────────────────────
+
+/// Forward a mirror action to the underlying GHMR subtool. This is how the
+/// `git_public` MCP tool (`crate::forge::git_public`) integrates the mirror
+/// engine as its swept-clean-tree write path for a FULL repo mirror sync,
+/// without duplicating any of the engine's PII-gate / fast-forward-only /
+/// no-force logic: it simply calls the exact same [`RustTool::execute`] these
+/// four core tools already run when dispatched by name via the registry.
+/// `action` is one of `"status" | "prepare" | "approve" | "push"`; anything
+/// else is a clean invalid-argument error.
+pub(crate) async fn dispatch_mirror_action(action: &str, args: Value) -> Result<String, ToolError> {
+    match action {
+        "status" => GitHubMirrorStatus.execute(args).await,
+        "prepare" => GitHubMirrorPrepare.execute(args).await,
+        "approve" => GitHubMirrorApprove.execute(args).await,
+        "push" => GitHubMirrorPush.execute(args).await,
+        other => Err(ToolError::InvalidArgument(format!(
+            "unknown mirror_action '{other}'; expected one of status/prepare/approve/push"
+        ))),
+    }
 }
 
 // ── Registration ────────────────────────────────────────────────────────────

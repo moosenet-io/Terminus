@@ -217,6 +217,16 @@ impl ForgeEndpoint {
         }
     }
 
+    /// Parse an endpoint from its stable snake_case identifier (the inverse of
+    /// [`ForgeEndpoint::as_str`]). Used by the git-private/git-public tool
+    /// assembly (GITX-05) to turn a caller-supplied `endpoint` string into the
+    /// typed vocabulary before any capability/posture check runs. Returns
+    /// `None` for anything not in [`ForgeEndpoint::all`] — callers map that to
+    /// a clean invalid-argument error, never a panic.
+    pub fn from_str(s: &str) -> Option<ForgeEndpoint> {
+        ForgeEndpoint::all().iter().copied().find(|ep| ep.as_str() == s)
+    }
+
     /// Stable snake_case identifier (e.g. `"repos_create"`). Used in errors, the
     /// capability report, and audit logs — a stable dispatch/label key.
     pub fn as_str(&self) -> &'static str {
@@ -428,6 +438,14 @@ mod tests {
         for ep in ForgeEndpoint::all() {
             assert!(seen.insert(ep.as_str()), "duplicate label {}", ep.as_str());
         }
+    }
+
+    #[test]
+    fn from_str_round_trips_every_endpoint() {
+        for ep in ForgeEndpoint::all() {
+            assert_eq!(ForgeEndpoint::from_str(ep.as_str()), Some(*ep));
+        }
+        assert_eq!(ForgeEndpoint::from_str("not_a_real_endpoint"), None);
     }
 
     #[test]
