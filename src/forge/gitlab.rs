@@ -485,20 +485,23 @@ impl GitLabAdapter {
     ///   truncated "success" — the caller is told the result is incomplete.
     async fn call_paginated(&self, token: &str, url: &str) -> Result<Value, ForgeError> {
         let provider = self.variant.provider_id();
-        let origin = host_of(url);
+        // Pin BOTH scheme and host (an "origin"): a bare host match would still
+        // permit an https→http `next` on the same host, leaking PRIVATE-TOKEN in
+        // plaintext.
+        let origin = origin_of(url);
         let mut next = Some(url.to_string());
         let mut items: Vec<Value> = Vec::new();
         let mut pages: u32 = 0;
         while let Some(u) = next.take() {
             // Every hop after the first comes from a server-controlled `Link`
             // header — pin it to the initial origin so the credential can never
-            // be redirected to a different (even allowlisted) host.
-            if host_of(&u) != origin {
+            // be redirected to a different host OR downgraded to plaintext.
+            if origin_of(&u) != origin {
                 return Err(ForgeError::Transport {
                     provider: provider.into(),
                     message: format!(
-                        "egress blocked: paginated 'next' host '{}' differs from the request origin",
-                        host_of(&u).unwrap_or_default()
+                        "egress blocked: paginated 'next' origin '{}' differs from the request origin",
+                        origin_of(&u).unwrap_or_default()
                     ),
                 });
             }
@@ -906,6 +909,20 @@ fn host_of(url: &str) -> Option<String> {
         _ => authority,
     };
     Some(normalized.to_string())
+}
+
+/// The full origin (`scheme://normalized-authority`) of a URL string, or `None`
+/// if the host can't be parsed. Unlike [`host_of`], this INCLUDES the scheme, so
+/// an origin comparison distinguishes `https://h` from `http://h` — the check
+/// pagination uses so a same-host `https`→`http` `next` link (a plaintext
+/// credential downgrade) is rejected, not just a different host.
+fn origin_of(url: &str) -> Option<String> {
+    let scheme = url.split_once("://").map(|(s, _)| s.to_ascii_lowercase());
+    let host = host_of(url)?;
+    match scheme {
+        Some(s) => Some(format!("{s}://{host}")),
+        None => Some(host),
+    }
 }
 
 /// GitLab's advertised support for the shared vocabulary. GitLab v4 covers most
@@ -2607,6 +2624,23 @@ mod tests {
             .expect_err("cross-origin pagination must be blocked");
         assert!(matches!(err, ForgeError::Transport { .. }), "got {err:?}");
         m.assert();
+    }
+
+    #[test]
+    fn origin_of_includes_scheme_and_normalizes_port() {
+        assert_eq!(origin_of("https://h.example/x").as_deref(), Some("https://h.example")); // pii-test-fixture
+        assert_eq!(origin_of("https://h.example:443/x").as_deref(), Some("https://h.example")); // pii-test-fixture
+        // Same host, different scheme -> different origin (downgrade guard).
+        assert_ne!(origin_of("https://h.example/x"), origin_of("http://h.example/x")); // pii-test-fixture
+    }
+
+    #[tokio::test]
+    async fn paginated_next_https_to_http_same_host_is_blocked() {
+        // The mock server is http; simulate the inverse guard by pinning an
+        // https origin and asserting an http same-host `next` is rejected via
+        // origin_of (scheme-inclusive). We test the helper-backed decision
+        // directly to avoid needing a live TLS endpoint.
+        assert_ne!(origin_of("https://gitlab.internal/api"), origin_of("http://gitlab.internal/api")); // pii-test-fixture
     }
 
     #[tokio::test]
