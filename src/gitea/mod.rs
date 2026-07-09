@@ -1563,6 +1563,13 @@ pub(crate) fn build_cargo_publish_body(metadata_json: &[u8], crate_bytes: &[u8])
     body
 }
 
+/// Index URL for the public crates.io registry. This is the Cargo registry
+/// index's own convention for identifying crates.io as a dependency's source
+/// (see the `registry` field in the Cargo registry API's publish metadata
+/// format) — NOT an infra value of ours, so it is not subject to the S1
+/// hardcoded-infra-value rule.
+pub(crate) const CRATES_IO_INDEX_URL: &str = "https://github.com/rust-lang/crates.io-index";
+
 /// Build the Cargo publish metadata JSON.
 ///
 /// The registry publish API requires a metadata object whose only truly
@@ -1578,13 +1585,6 @@ pub(crate) fn build_cargo_publish_body(metadata_json: &[u8], crate_bytes: &[u8])
 /// `name` and `vers` are then force-set from the explicit `name`/`vers`
 /// arguments so the framed metadata can never disagree with the tool's stated
 /// target. (`provided: None` is retained only for helper-level unit tests.)
-/// Index URL for the public crates.io registry. This is the Cargo registry
-/// index's own convention for identifying crates.io as a dependency's source
-/// (see the `registry` field in the Cargo registry API's publish metadata
-/// format) — NOT an infra value of ours, so it is not subject to the S1
-/// hardcoded-infra-value rule.
-pub(crate) const CRATES_IO_INDEX_URL: &str = "https://github.com/rust-lang/crates.io-index";
-
 pub(crate) fn build_cargo_metadata(name: &str, vers: &str, provided: Option<&Value>) -> Value {
     let mut meta = json!({
         "name": name,
