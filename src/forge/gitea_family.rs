@@ -273,7 +273,16 @@ impl GiteaForge {
         if let Some(o) = params.get("owner").and_then(Value::as_str) {
             reject_traversal(self.provider_id, "owner", o)?;
         }
-        let content = req_str(params, "content").map_err(|e| map_tool_err(self.provider_id, e))?;
+        // NOT `req_str`: that helper trims whitespace and rejects an empty
+        // value, which is correct for identifiers (repo/path/branch) but wrong
+        // for file CONTENT — trimming would silently corrupt a file that
+        // legitimately starts/ends with whitespace (e.g. a trailing newline),
+        // and rejecting empty would make it impossible to create an empty file
+        // (codex P1). Extract verbatim, requiring only that the key is present
+        // and is a string (an empty string is a valid, deliberate file body).
+        let content = params.get("content").and_then(Value::as_str).ok_or_else(|| {
+            map_tool_err(self.provider_id, ToolError::InvalidArgument("'content' is required".to_string()))
+        })?;
         let message = params
             .get("message")
             .and_then(Value::as_str)
@@ -1045,6 +1054,58 @@ mod tests {
             )
             .await
             .expect("update file");
+        m.assert();
+    }
+
+    #[tokio::test]
+    async fn content_write_preserves_leading_trailing_whitespace() {
+        // codex P1: content must be committed verbatim, not silently trimmed —
+        // assert the base64-decoded body sent to Gitea matches the exact
+        // (whitespace-padded) input.
+        let server = MockServer::start();
+        let raw = "  padded content\nwith a trailing newline\n\n";
+        let expected_b64 = B64.encode(raw.as_bytes());
+        let m = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/repos/moosenet/demo/contents/a.txt")
+                .json_body(json!({"message": "create", "content": expected_b64}));
+            then.status(201).json_body(json!({"content": {"sha": "new"}}));
+        });
+        let forge = mock_gitea(&server);
+        forge
+            .dispatch(
+                ForgeEndpoint::ContentWriteFile,
+                ForgeRequest::new(json!({
+                    "repo": "demo", "path": "a.txt", "content": raw, "message": "create",
+                })),
+            )
+            .await
+            .expect("whitespace-padded content should be preserved verbatim");
+        m.assert();
+    }
+
+    #[tokio::test]
+    async fn content_write_allows_empty_content() {
+        // codex P1: an empty file body is a legitimate, deliberate request (e.g.
+        // creating a placeholder/`.gitkeep`-style file) and must not be rejected
+        // as "missing".
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/repos/moosenet/demo/contents/empty.txt")
+                .json_body(json!({"message": "create", "content": ""}));
+            then.status(201).json_body(json!({"content": {"sha": "new"}}));
+        });
+        let forge = mock_gitea(&server);
+        forge
+            .dispatch(
+                ForgeEndpoint::ContentWriteFile,
+                ForgeRequest::new(json!({
+                    "repo": "demo", "path": "empty.txt", "content": "", "message": "create",
+                })),
+            )
+            .await
+            .expect("empty content should be accepted, not rejected as missing");
         m.assert();
     }
 
