@@ -1347,10 +1347,9 @@ core module) over the same mTLS/`enroll` front door TCLI-01..03 built for `termi
 | CA material | Whatever <host>'s environment/local store provisions | Independently auto-generated/provisioned on <host> — same `crate::pki::ca()` load-or-generate precedence, just a separate host's own environment/local store, so the two processes get independent CAs with no special-casing in code |
 | Startup <secret-manager> fetch | Yes (`fetch_downstream_secrets_from_infisical`, PSEC-02) | Not in this item — <host> deployment (TGW-05) provisions its environment directly; can be added later without touching the shared setup below |
 
-**Deliberately NOT included in this item** (see the TGW-01 spec item's scope boundary, S108):
-inference proxying to Chord (TGW-03), personal-tool federation to <host> (TGW-02), and the
-per-user auth/audit/rate-limit pipeline (TGW-04). At the end of this item, `terminus-primary`
-serves the core tool set over mTLS with `/enroll` wired — nothing more.
+**Still NOT included** (see the TGW-01/02 spec items' scope boundary, S108): inference proxying
+to Chord (TGW-03) and the per-user auth/audit/rate-limit pipeline (TGW-04). Personal-tool
+federation (TGW-02) is now wired — see the next section.
 
 **Why no combined core+personal registry:** `register_all` and `register_personal` both
 register the `plane`/`gitea`/`github`/`sundry` tool modules under the SAME tool names — a real,
@@ -1358,8 +1357,53 @@ pre-existing collision (see `crate::registry::core_personal_name_collisions` and
 `src/registry.rs`). Each module's own `register()` handles a duplicate name by logging a
 `tracing::warn!` and silently dropping the losing tool — not a loud failure. Rather than build a
 combined registry that would immediately hit this collision, `terminus-primary` registers
-`register_all` only; personal-tool reachability is planned via federation in TGW-02, not local
-aggregation.
+`register_all` only; personal-tool reachability is delivered via federation (TGW-02, below), not
+local aggregation.
+
+### Personal-tool federation via Chord's relay (TGW-02, `crate::federation`)
+
+`terminus-primary` serves the **core** tool set locally (`register_all`), but a client hitting
+its mTLS front door sees an **aggregated** surface: core tools plus the personal-registry tools
+(`ledger_*`, `vitals_*`, `crucible_*`, `git_private`, and the rest of the `register_personal`
+subset). Personal-tool *calls* are not dispatched locally (they'd collide with core and lack the
+<host> backend) — they are **proxied to Chord's existing `/v1/personal/tools/*` relay** (per the
+S108 spec's RESOLVED design decision (2): reuse the known-working federation Chord already runs
+to <host>'s `terminus_personal`, rather than a new direct <host>→<host> path).
+
+**Routing** (in `crate::mcp_server`'s `tools/call` handler): a tool name found in the local core
+registry dispatches in-process exactly as before (unchanged). A name *not* in the core registry
+is forwarded via `crate::federation::PersonalFederationClient` to
+`{TERMINUS_PRIMARY_CHORD_URL}/v1/personal/tools/call`; if federation is not configured (the
+`terminus_personal` posture), an unknown name is just "Unknown tool" as before.
+
+**`tools/list`** aggregates: the local core catalog plus
+`crate::registry::personal_only_tool_metadata()` (personal tools that are *not* also in
+`register_all`, computed in-process from static metadata — no network round trip on a listing;
+plane/gitea/github/sundry, present in both registries, are listed once via the core catalog to
+avoid duplicates).
+
+**Auth to Chord's relay:** Chord's `/v1/personal/tools/*` routes gate on the same HS256 JWT scheme
+as its `/v1/tools/*` routes (`sub` pinned to `"lumina"`, secret = Chord's `CHORD_JWT_SECRET`).
+`terminus-primary` mints a short-lived (120s) service JWT of exactly that shape, signed with
+`TERMINUS_PRIMARY_CHORD_JWT_SECRET` — provisioned identically to Chord's `CHORD_JWT_SECRET` at
+deploy time (never a literal; the standard "materialized into the process env, plain env read is
+the SecretManager read" convention this crate uses for all secret material).
+
+**Identity forwarding + audit:** the caller's mTLS-derived identity
+(`crate::pki::mtls::ClientIdentity`, extracted from the client cert that reached the front door)
+is forwarded to Chord as the `X-Terminus-Client-Identity` header alongside the service JWT —
+additive audit metadata, not a second auth mechanism (Chord's JWT check is what gates the call).
+
+**Error classification** (transport vs. tool-level, mirroring Chord's `proxy_error_response`):
+a `404`/`502` from Chord means the relay reached <host> and the tool wasn't found / ran and failed
+— surfaced as a normal `isError: true` tool result. A `401`/`429`/`503`/`504` or an unreachable
+Chord is a *federation-transport* failure — surfaced as `isError: true` with a `federation error:`
+prefix, never a hang or panic. See `crate::federation`'s module doc for the full contract.
+
+**Config vars:** `TERMINUS_PRIMARY_CHORD_URL` (Chord's relay base URL; default
+`http://127.0.0.1:8099`, Chord's loopback proxy port for a co-located <host> deploy),
+`TERMINUS_PRIMARY_CHORD_FEDERATION_TIMEOUT_MS` (per-call timeout, default 30000ms), and
+`TERMINUS_PRIMARY_CHORD_JWT_SECRET` (the shared HS256 secret, = Chord's `CHORD_JWT_SECRET`).
 
 ### Shared mTLS/enroll server-setup (`crate::pki::server`)
 

@@ -218,6 +218,34 @@ pub fn register_personal(registry: &mut ToolRegistry) {
 /// combined registry (or a test guarding against a values regression) can
 /// call this first and fail loudly (`assert!`/`panic!`) on any non-empty
 /// result instead of relying on that per-module warn-and-drop behavior.
+/// Tool metadata (name/description/schema) for the personal-registry tools
+/// that are NOT also served by `register_all` — i.e. the tools
+/// `terminus-primary` (TGW-01) can only reach via TGW-02's federation to
+/// Chord's `/v1/personal/tools/*` relay, since its own local registry
+/// (`register_all` only, per TGW-01's design decision) never has them.
+///
+/// Used by `terminus-primary`'s `tools/list` handler (`crate::mcp_server`)
+/// to present an AGGREGATED surface (local core + federated personal)
+/// without a network round trip on every listing: tool metadata is static
+/// and known in-process (both registration functions live in this same
+/// crate) — only *dispatch* for these tools needs the network hop. Tools
+/// present in BOTH `register_all` and `register_personal` (see
+/// [`core_personal_name_collisions`] — today that's plane/gitea/github/
+/// sundry) are already listed via the local core registry and are excluded
+/// here to avoid duplicate entries in the aggregated `tools/list` output.
+pub fn personal_only_tool_metadata() -> Vec<ToolInfo> {
+    let mut core = ToolRegistry::new();
+    register_all(&mut core);
+    let mut personal = ToolRegistry::new();
+    register_personal(&mut personal);
+
+    personal
+        .list()
+        .into_iter()
+        .filter(|t| !core.contains(&t.name))
+        .collect()
+}
+
 pub fn core_personal_name_collisions() -> Vec<String> {
     let mut core = ToolRegistry::new();
     register_all(&mut core);
@@ -439,5 +467,77 @@ mod tests {
             personal_tool_count,
             collisions.len()
         );
+    }
+
+    // ── TGW-02: personal-only metadata for terminus-primary's aggregated
+    // tools/list ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn personal_only_tool_metadata_excludes_core_collisions() {
+        let metadata = personal_only_tool_metadata();
+        let mut core = ToolRegistry::new();
+        register_all(&mut core);
+
+        assert!(!metadata.is_empty(), "expected at least one personal-only tool");
+        for entry in &metadata {
+            assert!(
+                !core.contains(&entry.name),
+                "{} is served locally by register_all and must not appear in \
+                 personal_only_tool_metadata (would duplicate the aggregated \
+                 tools/list entry)",
+                entry.name
+            );
+        }
+    }
+
+    #[test]
+    fn personal_only_tool_metadata_includes_known_personal_exclusive_tools() {
+        // IMPORTANT (documents a real registry property): almost every
+        // register_personal module (ledger/vitals/crucible/relay/meridian/
+        // odyssey/cortex/soma/skills/council/network/ansible/dev, plus
+        // plane/gitea/github/sundry) is ALSO called by register_all -- see
+        // `core_personal_name_collisions` and
+        // `test_core_personal_collision_detection_is_loud_not_silent`. So
+        // those tools are served LOCALLY by terminus-primary's register_all
+        // registry and do NOT need federation. The ONE genuinely
+        // personal-EXCLUSIVE difference is forge: register_personal calls
+        // `forge::register_private` (the `git_private` tools) where
+        // register_all calls `forge::register_public` (`git_public`). So the
+        // personal-only set that TGW-02's federation uniquely adds is exactly
+        // the git-private tools -- these are what a client reaches through
+        // the aggregated surface that terminus-primary can't serve locally.
+        let metadata = personal_only_tool_metadata();
+        let names: Vec<&str> = metadata.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"git_private"),
+            "git_private is register_personal-exclusive (register_all serves \
+             git_public instead) and must appear in the personal-only set: {names:?}"
+        );
+        assert!(names.contains(&"git_private_capabilities"), "got {names:?}");
+    }
+
+    #[test]
+    fn personal_only_tool_metadata_excludes_tools_also_in_register_all() {
+        // ledger/vitals/crucible are in BOTH register functions, so they
+        // dispatch locally on terminus-primary and must NOT be double-listed
+        // via federation -- the inverse guard to the test above.
+        let metadata = personal_only_tool_metadata();
+        let names: Vec<&str> = metadata.iter().map(|t| t.name.as_str()).collect();
+        assert!(!names.contains(&"ledger_accounts"), "got {names:?}");
+        assert!(!names.contains(&"vitals_today"), "got {names:?}");
+        assert!(!names.contains(&"crucible_status"), "got {names:?}");
+    }
+
+    #[test]
+    fn personal_only_tool_metadata_excludes_plane_gitea_github_sundry() {
+        // These modules ARE registered by both functions (a real,
+        // pre-existing collision, see core_personal_name_collisions) -- so
+        // they're already reachable locally on terminus-primary and must
+        // not be double-listed via federation.
+        let metadata = personal_only_tool_metadata();
+        let names: Vec<&str> = metadata.iter().map(|t| t.name.as_str()).collect();
+        assert!(!names.contains(&"plane_list_projects"));
+        assert!(!names.contains(&"gitea_list_identities"));
+        assert!(!names.contains(&"github_list_repos"));
     }
 }
