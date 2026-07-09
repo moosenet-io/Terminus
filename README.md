@@ -1347,9 +1347,10 @@ core module) over the same mTLS/`enroll` front door TCLI-01..03 built for `termi
 | CA material | Whatever <host>'s environment/local store provisions | Independently auto-generated/provisioned on <host> — same `crate::pki::ca()` load-or-generate precedence, just a separate host's own environment/local store, so the two processes get independent CAs with no special-casing in code |
 | Startup <secret-manager> fetch | Yes (`fetch_downstream_secrets_from_infisical`, PSEC-02) | Not in this item — <host> deployment (TGW-05) provisions its environment directly; can be added later without touching the shared setup below |
 
-**Still NOT included** (see the TGW-01/02 spec items' scope boundary, S108): inference proxying
-to Chord (TGW-03) and the per-user auth/audit/rate-limit pipeline (TGW-04). Personal-tool
-federation (TGW-02) is now wired — see the next section.
+**Still NOT included** (see the TGW-01/02/03 spec items' scope boundary, S108): the per-user
+auth/audit/rate-limit pipeline (TGW-04) — every route below is reachable by any caller who
+reaches the mTLS front door at all. Personal-tool federation (TGW-02) and the inference proxy to
+Chord (TGW-03) are now wired — see the next two sections.
 
 **Why no combined core+personal registry:** `register_all` and `register_personal` both
 register the `plane`/`gitea`/`github`/`sundry` tool modules under the SAME tool names — a real,
@@ -1404,6 +1405,57 @@ prefix, never a hang or panic. See `crate::federation`'s module doc for the full
 `http://127.0.0.1:8099`, Chord's loopback proxy port for a co-located <host> deploy),
 `TERMINUS_PRIMARY_CHORD_FEDERATION_TIMEOUT_MS` (per-call timeout, default 30000ms), and
 `TERMINUS_PRIMARY_CHORD_JWT_SECRET` (the shared HS256 secret, = Chord's `CHORD_JWT_SECRET`).
+
+### Inference proxy to Chord (TGW-03, `crate::inference_proxy`)
+
+`terminus-primary`'s mTLS front door also forwards **inference** requests straight through to the
+co-located Chord process — Chord remains the actual inference engine (model loading, GPU/VRAM
+management, LiteLLM routing, all unchanged); this is a THIN proxy hop, no inference logic lives
+in terminus-rs.
+
+**Proxied routes** (all four Chord client-facing inference/agent routes named in the TGW-03 spec
+item, confirmed on Chord's own router in `moosenet/Chord`'s `src/routes.rs`, all gated by the
+identical `auth_check`/`CHORD_JWT_SECRET` scheme):
+
+| Route | Chord's role |
+|---|---|
+| `POST /v1/chat/completions` | OpenAI-compatible LLM proxy (supports `stream: true`) |
+| `POST /v1/infer` | single-prompt, backend-aware inference |
+| `POST /v1/agent/execute` | guarded agentic tool-calling loop (also streams via SSE) |
+| `POST /v1/coding/select` | fleet-driven coding-model resolution |
+
+**Streaming** is preserved end to end: Chord's own handlers already relay their upstream response
+as an unbuffered byte stream (`bytes_stream()` → `Body::from_stream`); `crate::inference_proxy`
+does the identical thing one hop earlier — the `reqwest` response body from Chord streams straight
+into the `axum::Response` returned to the mTLS caller, chunk by chunk, never buffered into one
+`Vec<u8>`. Status code and `content-type` are relayed verbatim.
+
+**Auth:** reuses `crate::federation::mint_service_jwt` — the SAME short-lived service JWT TGW-02's
+personal-tool federation already mints (`sub: "lumina"`, signed with
+`TERMINUS_PRIMARY_CHORD_JWT_SECRET`), since Chord gates every one of these routes on the identical
+`auth_check` call its `/v1/personal/tools/*` routes use. No new secret is introduced.
+
+**Identity forwarding:** the caller's mTLS-derived identity is forwarded under the same
+`X-Terminus-Client-Identity` header TGW-02 uses, so Chord's audit/logging sees one consistent
+identity convention regardless of which relay carried the request.
+
+**Transport target:** reuses `TERMINUS_PRIMARY_CHORD_URL` (TGW-02's federation base URL) rather
+than a second, always-identical inference-URL knob — Chord mounts both the personal-tool relay and
+these inference routes on the same router. `TERMINUS_PRIMARY_CHORD_INFERENCE_CONNECT_TIMEOUT_MS`
+(default 5000ms) bounds only the initial connect to Chord — deliberately **not** a total-response
+timeout, so a long or actively-streaming generation is never cut off mid-flight.
+
+**Errors:** a connect failure/timeout to Chord (down, unreachable) surfaces as a clean
+`502 Bad Gateway` JSON error — never a hang, never a silent fallback to any other inference path.
+Once connected, whatever status Chord itself returns (its own 401/503/etc.) is relayed verbatim —
+this proxy does not reinterpret Chord's error semantics. If this terminus process has no
+`inference_proxy` configured at all (e.g. `terminus_personal`, which has no inference-proxy role),
+the four routes still exist but return a clean `503` rather than a bare `404` or a hang.
+
+**Known gap:** Chord restarting mid-request (a real operational scenario — the whole reason Chord
+is kept a separate process) surfaces to the caller as a truncated/interrupted stream or a
+transport error partway through, not a clean retry — no in-flight-request recovery is built here;
+a caller-side retry is the expected mitigation, same as any other proxy hop.
 
 ### Shared mTLS/enroll server-setup (`crate::pki::server`)
 

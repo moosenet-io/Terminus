@@ -625,6 +625,38 @@ pub fn chord_personal_federation_timeout_ms() -> u64 {
         .unwrap_or(30_000)
 }
 
+// ── TGW-03: inference proxy to Chord ──────────────────────────────────────
+// `terminus-primary` forwards `/v1/chat/completions`, `/v1/infer`,
+// `/v1/agent/execute`, and `/v1/coding/select` to the SAME co-located Chord
+// process the personal-tool federation above already relays to (confirmed by
+// reading Chord's `src/routes.rs`: both `/v1/personal/tools/*` and these
+// inference routes are mounted on Chord's one router, behind the same
+// `auth_check`/`CHORD_JWT_SECRET` scheme) — so this reuses
+// [`chord_personal_federation_url`] rather than adding a second,
+// always-identical `TERMINUS_PRIMARY_CHORD_INFERENCE_URL` base-URL knob. Only
+// the connect timeout gets its own knob here: inference responses
+// (especially streamed ones) can legitimately run far longer than a
+// personal-tool call, so this must NOT reuse
+// `chord_personal_federation_timeout_ms` as a *total* request timeout (that
+// would cut off a long generation mid-stream — see the TGW-03 spec item's
+// "very large or long-running inference responses" edge case). The inference
+// HTTP client therefore only bounds the initial TCP connect, never the whole
+// response body.
+
+/// Connect timeout, in milliseconds, for `terminus-primary`'s hop to Chord's
+/// inference routes. From `TERMINUS_PRIMARY_CHORD_INFERENCE_CONNECT_TIMEOUT_MS`;
+/// defaults to 5000 (5s) — long enough for a co-located loopback connect under
+/// load, short enough that a genuinely down/unreachable Chord process fails
+/// fast instead of hanging a caller. Deliberately NOT a total-response
+/// timeout: once connected, a streamed inference response is relayed for as
+/// long as Chord keeps sending it.
+pub fn chord_inference_connect_timeout_ms() -> u64 {
+    env_nonempty("TERMINUS_PRIMARY_CHORD_INFERENCE_CONNECT_TIMEOUT_MS")
+        .and_then(|v| v.parse().ok())
+        .filter(|ms: &u64| *ms > 0)
+        .unwrap_or(5_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,6 +686,22 @@ mod tests {
         std::env::set_var("TERMINUS_PRIMARY_CHORD_FEDERATION_TIMEOUT_MS", "0");
         assert_eq!(chord_personal_federation_timeout_ms(), 30_000);
         std::env::remove_var("TERMINUS_PRIMARY_CHORD_FEDERATION_TIMEOUT_MS");
+    }
+
+    // ── TGW-03: inference-proxy config ──────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn chord_inference_connect_timeout_ms_defaults_and_overrides() {
+        std::env::remove_var("TERMINUS_PRIMARY_CHORD_INFERENCE_CONNECT_TIMEOUT_MS");
+        assert_eq!(chord_inference_connect_timeout_ms(), 5_000);
+        std::env::set_var("TERMINUS_PRIMARY_CHORD_INFERENCE_CONNECT_TIMEOUT_MS", "1500");
+        assert_eq!(chord_inference_connect_timeout_ms(), 1_500);
+        // Non-positive values fall back to the default rather than an
+        // instant-timeout connect.
+        std::env::set_var("TERMINUS_PRIMARY_CHORD_INFERENCE_CONNECT_TIMEOUT_MS", "0");
+        assert_eq!(chord_inference_connect_timeout_ms(), 5_000);
+        std::env::remove_var("TERMINUS_PRIMARY_CHORD_INFERENCE_CONNECT_TIMEOUT_MS");
     }
 
     // ---- intake_database_url precedence (Phase 2 item 6) ----

@@ -43,11 +43,23 @@
 //! forwarded from the mTLS cert, transport vs. tool-level error
 //! classification). Core-tool dispatch is completely unchanged by this.
 //!
+//! ## TGW-03 update — inference proxy to Chord
+//! This binary now also forwards `/v1/chat/completions`, `/v1/infer`,
+//! `/v1/agent/execute`, and `/v1/coding/select` to the co-located Chord
+//! process (the actual inference engine) over loopback, relaying Chord's
+//! response back to the mTLS caller — including SSE streaming, unbuffered —
+//! see `terminus_rs::inference_proxy`'s module doc for the full contract
+//! (auth via the SAME short-lived service JWT TGW-02's federation client
+//! mints, caller identity forwarded from the mTLS cert, Chord's own error
+//! statuses relayed verbatim). Core-tool dispatch and personal-tool
+//! federation are completely unchanged by this.
+//!
 //! ## What this item still does NOT add
 //! Per the TGW-01 spec item's explicit scope boundary (now narrowed by
-//! TGW-02 landing): no inference proxying to Chord (TGW-03), and no
-//! per-user auth/audit/rate-limit pipeline (TGW-04). Reviewers should not
-//! expect TGW-03/04 behavior yet.
+//! TGW-02/TGW-03 landing): no per-user auth/audit/rate-limit pipeline
+//! (TGW-04) wraps these routes yet — they are reachable by any caller who
+//! reaches the mTLS front door at all, same posture as the tool-call routes
+//! before TGW-04. Reviewers should not expect TGW-04 behavior yet.
 //!
 //! ## Runtime configuration (env-sourced; NO literals)
 //! - `TERMINUS_PRIMARY_PORT` — plain HTTP+JWT listener bind port. Defaults
@@ -86,7 +98,14 @@
 //!   `TERMINUS_PRIMARY_CHORD_JWT_SECRET` — the shared HS256 secret this
 //!   binary signs its outbound service JWT with; MUST match Chord's own
 //!   `CHORD_JWT_SECRET` (provisioned identically on both hosts at deploy
-//!   time — see `terminus_rs::federation`'s module doc).
+//!   time — see `terminus_rs::federation`'s module doc). TGW-03's inference
+//!   proxy reuses this same secret and `TERMINUS_PRIMARY_CHORD_URL` (Chord
+//!   mounts both the personal-tool relay and the inference routes on one
+//!   router) — `TERMINUS_PRIMARY_CHORD_INFERENCE_CONNECT_TIMEOUT_MS` bounds
+//!   only the inference hop's initial connect (default 5000ms), deliberately
+//!   NOT a total-response timeout, so a long/streamed generation is never
+//!   cut off — see `crate::config`'s "TGW-03" section and
+//!   `terminus_rs::inference_proxy`'s module doc.
 
 use terminus_rs::pki::server::{build_gateway_router, spawn_mtls_listener, GatewayServerConfig};
 use terminus_rs::registry::{register_all, ToolRegistry};
@@ -133,6 +152,12 @@ async fn main() {
     // error-classification contract.
     let personal_federation = Some(terminus_rs::federation::PersonalFederationClient::from_env());
 
+    // TGW-03: forward the inference/agent routes to the co-located Chord
+    // process -- see `terminus_rs::inference_proxy`'s module doc for the
+    // full contract (thin proxy, streaming preserved, same service-JWT auth
+    // TGW-02's federation client uses).
+    let inference_proxy = Some(terminus_rs::inference_proxy::InferenceProxyClient::from_env());
+
     let gateway_config = GatewayServerConfig {
         server_name: "terminus-primary".to_string(),
         server_version: terminus_rs::VERSION.to_string(),
@@ -141,6 +166,7 @@ async fn main() {
         mtls_port: terminus_rs::config::mtls_primary_port(),
         mtls_server_identity: terminus_rs::config::mtls_primary_server_identity(),
         personal_federation,
+        inference_proxy,
     };
 
     // Same shared setup `terminus_personal` uses (TGW-01 extraction, see
@@ -165,6 +191,7 @@ mod tests {
     use serde_json::json;
     use serial_test::serial;
     use terminus_rs::federation::PersonalFederationClient;
+    use terminus_rs::inference_proxy::InferenceProxyClient;
     use terminus_rs::pki::server::{build_gateway_router, GatewayServerConfig};
     use terminus_rs::registry::{register_all, ToolRegistry};
 
@@ -210,6 +237,27 @@ mod tests {
             mtls_port: 0,
             mtls_server_identity: "terminus-primary-test".to_string(),
             personal_federation: Some(PersonalFederationClient::with_base_url(chord_base_url)),
+            inference_proxy: None,
+        };
+        build_gateway_router(registry, &config)
+    }
+
+    /// TGW-03: same shape as `primary_router_with_federation`, but wires an
+    /// `InferenceProxyClient` pointed at `chord_base_url` instead (personal
+    /// federation left `None` — these tests exercise the inference-proxy
+    /// routes specifically, not tool dispatch).
+    fn primary_router_with_inference_proxy(chord_base_url: String) -> axum::Router {
+        let mut registry = ToolRegistry::new();
+        register_all(&mut registry);
+        let config = GatewayServerConfig {
+            server_name: "terminus-primary-test".to_string(),
+            server_version: "0.0.0-test".to_string(),
+            auth_token: None,
+            mtls_bind: "127.0.0.1".to_string(),
+            mtls_port: 0,
+            mtls_server_identity: "terminus-primary-test".to_string(),
+            personal_federation: None,
+            inference_proxy: Some(InferenceProxyClient::with_base_url(chord_base_url)),
         };
         build_gateway_router(registry, &config)
     }
@@ -339,6 +387,7 @@ mod tests {
             mtls_port: 0,
             mtls_server_identity: "terminus-primary-test".to_string(),
             personal_federation: None,
+            inference_proxy: None,
         };
         let router = build_gateway_router(registry, &config);
         let body = post_mcp(
@@ -408,5 +457,189 @@ mod tests {
         let text = body["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.starts_with("federation error"));
         clear_jwt_secret();
+    }
+
+    // ── TGW-03: inference proxy to Chord, exercised through the actual
+    // router `terminus_primary`'s `main()` builds ────────────────────────
+
+    async fn post_json(
+        router: axum::Router,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, serde_json::Value, axum::http::HeaderMap) {
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+        };
+        (status, value, headers)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn chat_completions_round_trips_to_mocked_chord() {
+        set_jwt_secret();
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions")
+                .json_body_partial(r#"{"model": "test-model"}"#);
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({"id": "chatcmpl-abc", "choices": [{"index": 0}]}));
+        });
+
+        let router = primary_router_with_inference_proxy(server.base_url());
+        let (status, body, _) = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+
+        mock.assert();
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body["id"], "chatcmpl-abc");
+        clear_jwt_secret();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn chat_completions_streaming_passes_sse_chunks_through_unbuffered() {
+        set_jwt_secret();
+        let server = MockServer::start();
+        let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: [DONE]\n\n";
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(sse_body);
+        });
+
+        let router = primary_router_with_inference_proxy(server.base_url());
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({"model": "test-model", "stream": true}).to_string(),
+            ))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(String::from_utf8(bytes.to_vec()).unwrap(), sse_body);
+        clear_jwt_secret();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn chat_completions_forwards_mtls_identity_and_service_jwt() {
+        set_jwt_secret();
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions")
+                .matches(|req| {
+                    let auth = req
+                        .headers
+                        .as_ref()
+                        .and_then(|hs| hs.iter().find(|(k, _)| k.eq_ignore_ascii_case("authorization")))
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_default();
+                    auth.starts_with("Bearer ")
+                });
+            then.status(200).json_body(json!({"ok": true}));
+        });
+
+        // The plain HTTP+JWT listener never populates the `ClientIdentity`
+        // extension (that only happens on the mTLS listener per
+        // `crate::pki::mtls::run_listener`) -- so this test confirms the
+        // service JWT is attached even with no caller identity present, and
+        // (via the mock's own assert) that the route reaches Chord at all.
+        let router = primary_router_with_inference_proxy(server.base_url());
+        let (status, _, _) = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({"model": "test-model"}),
+        )
+        .await;
+
+        mock.assert();
+        assert_eq!(status, axum::http::StatusCode::OK);
+        clear_jwt_secret();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn infer_agent_execute_and_coding_select_are_all_proxied() {
+        set_jwt_secret();
+        let server = MockServer::start();
+        for path in ["/v1/infer", "/v1/agent/execute", "/v1/coding/select"] {
+            server.mock(|when, then| {
+                when.method(httpmock::Method::POST);
+                then.status(200).json_body(json!({"ok": true}));
+            });
+            let router = primary_router_with_inference_proxy(server.base_url());
+            let (status, body, _) = post_json(router, path, json!({"model": "test-model"})).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "path {path} should proxy through");
+            assert_eq!(body["ok"], true, "path {path} should relay chord's response body");
+        }
+        clear_jwt_secret();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn inference_proxy_chord_unreachable_is_clean_502_no_hang() {
+        set_jwt_secret();
+        let router = primary_router_with_inference_proxy("http://127.0.0.1:1".to_string());
+        let (status, body, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            post_json(router, "/v1/chat/completions", json!({"model": "test-model"})),
+        )
+        .await
+        .expect("an unreachable chord must fail fast, not hang");
+
+        assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY);
+        assert!(body["error"].as_str().unwrap().contains("unreachable"));
+        clear_jwt_secret();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn inference_proxy_not_configured_returns_clean_503_not_404() {
+        // terminus_personal's posture (inference_proxy: None) -- the routes
+        // exist but this process isn't configured to serve them.
+        let mut registry = ToolRegistry::new();
+        register_all(&mut registry);
+        let config = GatewayServerConfig {
+            server_name: "terminus-primary-test".to_string(),
+            server_version: "0.0.0-test".to_string(),
+            auth_token: None,
+            mtls_bind: "127.0.0.1".to_string(),
+            mtls_port: 0,
+            mtls_server_identity: "terminus-primary-test".to_string(),
+            personal_federation: None,
+            inference_proxy: None,
+        };
+        let router = build_gateway_router(registry, &config);
+        let (status, _, _) = post_json(router, "/v1/chat/completions", json!({})).await;
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
     }
 }

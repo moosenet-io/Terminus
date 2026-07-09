@@ -64,6 +64,14 @@ pub struct GatewayServerConfig {
     /// itself); `terminus_primary` (TGW-01/02) passes
     /// `Some(crate::federation::PersonalFederationClient::from_env())`.
     pub personal_federation: Option<crate::federation::PersonalFederationClient>,
+    /// TGW-03: when `Some`, `/v1/chat/completions`, `/v1/infer`,
+    /// `/v1/agent/execute`, and `/v1/coding/select` are mounted on the
+    /// router and forwarded to Chord's co-located inference backend — see
+    /// `crate::inference_proxy`'s module doc for the full contract.
+    /// `terminus_personal` passes `None` (it has no inference-proxy role);
+    /// `terminus_primary` (TGW-03) passes
+    /// `Some(crate::inference_proxy::InferenceProxyClient::from_env())`.
+    pub inference_proxy: Option<crate::inference_proxy::InferenceProxyClient>,
 }
 
 /// Build the shared MCP (`/mcp`, `/healthz`) + `/enroll` router for
@@ -80,6 +88,7 @@ pub fn build_gateway_router(registry: ToolRegistry, config: &GatewayServerConfig
         server_version: config.server_version.clone(),
         auth_token: config.auth_token.clone(),
         personal_federation: config.personal_federation.clone(),
+        inference_proxy: config.inference_proxy.clone(),
     });
 
     build_router(state).merge(build_enroll_router())
@@ -174,6 +183,7 @@ mod tests {
             mtls_port,
             mtls_server_identity: "terminus-server-test".to_string(),
             personal_federation: None,
+            inference_proxy: None,
         }
     }
 
