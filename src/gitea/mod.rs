@@ -587,6 +587,48 @@ impl GiteaClient {
         serde_json::from_str(&text)
             .map_err(|e| ToolError::Http(format!("JSON parse error: {e}")))
     }
+
+    /// Fetch a `/api/v1`-relative endpoint that returns **raw file bytes** rather
+    /// than JSON (e.g. the Gitea `/repos/{owner}/{repo}/raw/{path}` endpoint),
+    /// returning the exact bytes with no lossy UTF-8 decode. The raw endpoint can
+    /// serve arbitrary binary content, so routing it through the JSON/text
+    /// [`request_value`](Self::request_value) helper would corrupt non-UTF-8
+    /// bytes; callers base64-encode the result for a lossless round-trip in the
+    /// JSON tool response (mirroring how [`fetch_file_text`](Self::fetch_file_text)
+    /// decodes Gitea's base64 `content` — same discipline, inverse direction).
+    ///
+    /// A `404` maps to [`ToolError::NotFound`]; any other non-2xx maps to
+    /// [`ToolError::Http`] carrying the status + body.
+    pub(crate) async fn request_raw(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+    ) -> Result<Vec<u8>, ToolError> {
+        let url = self.api(path);
+        debug!("{method} {url} (raw bytes)");
+        let resp = self
+            .http
+            .request(method, &url)
+            .header("Authorization", self.auth_header())
+            .header("Accept", "application/octet-stream")
+            .send()
+            .await
+            .map_err(|e| ToolError::Http(format!("Request failed: {e}")))?;
+
+        let status = resp.status();
+        if status == StatusCode::NOT_FOUND {
+            return Err(ToolError::NotFound("Resource not found in Gitea".to_string()));
+        }
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(ToolError::Http(format!("Gitea returned {status}: {body_text}")));
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ToolError::Http(format!("Failed to read raw body: {e}")))?;
+        Ok(bytes.to_vec())
+    }
 }
 
 // ─── Shared optional `identity` argument ─────────────────────────────────────

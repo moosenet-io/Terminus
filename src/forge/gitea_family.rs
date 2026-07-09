@@ -535,9 +535,27 @@ impl GiteaForge {
                 get(format!("/repos/{owner}/{}/git/trees/{}?recursive={recursive}", repo()?, s("sha")?)).await
             }
             ContentRawFetch => {
+                // The Gitea `/raw/` endpoint serves EXACT FILE BYTES, not JSON —
+                // it can carry arbitrary binary content. Routing it through the
+                // JSON/text `request_value` helper would lossily UTF-8-decode
+                // binary files and corrupt them, so fetch the raw bytes verbatim
+                // and base64-encode them for a lossless round-trip in the JSON
+                // tool response. This mirrors `GiteaClient::fetch_file_text`,
+                // which base64-DECODES Gitea's `content` — same discipline,
+                // inverse direction.
+                let path = s("path")?;
                 let git_ref = params.get("ref").and_then(Value::as_str).unwrap_or("");
                 let q = if git_ref.is_empty() { String::new() } else { format!("?ref={git_ref}") };
-                get(format!("/repos/{owner}/{}/raw/{}{q}", repo()?, s("path")?)).await
+                let bytes = client
+                    .request_raw(Method::GET, &format!("/repos/{owner}/{}/raw/{path}{q}", repo()?))
+                    .await
+                    .map_err(|e| map_tool_err(p, e))?;
+                Ok(json!({
+                    "encoding": "base64",
+                    "content": B64.encode(&bytes),
+                    "path": path,
+                    "size": bytes.len(),
+                }))
             }
 
             // ── Org / collaboration ─────────────────────────────────────────────
@@ -835,5 +853,63 @@ mod tests {
                 .expect("branches list");
             assert_eq!(resp.provider, pid);
         }
+    }
+
+    #[tokio::test]
+    async fn raw_fetch_roundtrips_binary_bytes_through_base64() {
+        // The `/raw/` endpoint can serve arbitrary binary content. Feed it bytes
+        // that are NOT valid UTF-8 (a lone 0xFF, an embedded NUL, high bytes) and
+        // prove they round-trip EXACTLY through the base64 tool response — i.e.
+        // no lossy UTF-8 decode corrupts them (the codex P1 this fix closes).
+        let raw: &[u8] = &[0x00, 0xFF, 0xFE, 0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x80];
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/moosenet/demo/raw/assets/logo.png");
+            then.status(200).body(raw);
+        });
+        let forge = mock_gitea(&server);
+        let resp = forge
+            .dispatch(
+                ForgeEndpoint::ContentRawFetch,
+                ForgeRequest::new(json!({"repo": "demo", "path": "assets/logo.png"})),
+            )
+            .await
+            .expect("raw fetch should dispatch");
+        m.assert();
+        assert_eq!(resp.body["encoding"], "base64");
+        assert_eq!(resp.body["path"], "assets/logo.png");
+        assert_eq!(resp.body["size"], raw.len());
+        // The decoded content must equal the original bytes, byte-for-byte.
+        let got = B64
+            .decode(resp.body["content"].as_str().expect("content is a string"))
+            .expect("content must be valid base64");
+        assert_eq!(got, raw, "binary bytes must round-trip losslessly");
+    }
+
+    #[tokio::test]
+    async fn raw_fetch_builds_path_with_ref_query_and_subdirs() {
+        // Path construction: nested (slash-bearing) path segments are preserved
+        // verbatim on the `/raw/` URL, and a `ref` is appended as a query param.
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/repos/moosenet/demo/raw/dir/sub/file.bin")
+                .query_param("ref", "v1.2.3");
+            then.status(200).body([0xDE, 0xAD, 0xBE, 0xEF].as_slice());
+        });
+        let forge = mock_gitea(&server);
+        let resp = forge
+            .dispatch(
+                ForgeEndpoint::ContentRawFetch,
+                ForgeRequest::new(json!({
+                    "repo": "demo", "path": "dir/sub/file.bin", "ref": "v1.2.3"
+                })),
+            )
+            .await
+            .expect("raw fetch with ref should dispatch");
+        m.assert();
+        assert_eq!(resp.body["path"], "dir/sub/file.bin");
+        let got = B64.decode(resp.body["content"].as_str().unwrap()).unwrap();
+        assert_eq!(got, vec![0xDE, 0xAD, 0xBE, 0xEF]);
     }
 }
