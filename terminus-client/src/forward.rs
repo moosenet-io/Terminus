@@ -104,7 +104,25 @@ pub async fn forward(cfg: &PrimaryConfig, request_body: Value) -> Result<Value, 
 /// used by the daemon binary at startup to fail fast (TCLI-05 APPROACH step
 /// 2) before it accepts any local MCP connections, without needing to send a
 /// real MCP request just to prove reachability.
+///
+/// Bounded by `cfg.timeout` -- neither `enroll` (reqwest, no default timeout)
+/// nor `connect` (raw TCP + TLS handshake) imposes its own deadline, so a
+/// primary that accepts the TCP connection but then stalls the TLS handshake
+/// or HTTP response would otherwise hang startup indefinitely. Wrapping the
+/// whole check here keeps the daemon's "fail fast, no partial startup, no
+/// hang" contract intact against a half-open primary, symmetric with
+/// [`forward`]'s own timeout.
 pub async fn establish_initial_connection(cfg: &PrimaryConfig) -> Result<(), ClientError> {
+    match tokio::time::timeout(cfg.timeout, establish_initial_connection_inner(cfg)).await {
+        Ok(result) => result,
+        Err(_) => Err(ClientError::ForwardTimeout(
+            format!("{}:{}", cfg.connect.host, cfg.connect.port),
+            cfg.timeout,
+        )),
+    }
+}
+
+async fn establish_initial_connection_inner(cfg: &PrimaryConfig) -> Result<(), ClientError> {
     let credential = enroll(&cfg.enroll).await?;
     connect(&credential, &cfg.connect).await?;
     Ok(())
@@ -376,6 +394,47 @@ mod tests {
             .expect_err("daemon startup connectivity check must fail fast against an unreachable primary");
         assert!(matches!(err, ClientError::DialUnreachable(_, _)));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn establish_initial_connection_times_out_against_a_stalled_tls_handshake() {
+        // A "primary" that accepts the TCP connection but never speaks TLS at
+        // all -- the mTLS handshake in `connect` would otherwise block
+        // forever. The startup check must fail fast on its own timeout (agy
+        // P2, TCLI-05 review), not hang.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                // Accept and hold the socket open without ever writing the
+                // TLS ServerHello.
+                match listener.accept().await {
+                    Ok((sock, _)) => {
+                        tokio::spawn(async move {
+                            let _held = sock;
+                            std::future::pending::<()>().await;
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let ca = generate_test_ca();
+        let credential = enrolled_credential(&ca, "test-daemon");
+        let mut cfg = primary_config(&credential, addr.ip().to_string(), addr.port());
+        cfg.timeout = Duration::from_millis(250);
+
+        let started = Instant::now();
+        let err = establish_initial_connection(&cfg)
+            .await
+            .expect_err("a stalled TLS handshake must time out, not hang");
+        assert!(matches!(err, ClientError::ForwardTimeout(_, _)));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "startup connectivity check must be bounded by its timeout: {:?}",
+            started.elapsed()
+        );
     }
 
 }
