@@ -16,10 +16,11 @@
 //!   PII gate or posture enforcement lives here — the adapter only advertises
 //!   that it belongs to the public (exfiltration) pool; GITX-05 makes that
 //!   load-bearing.
-//! - IS NOT: the GHMR mirror engine (`src/github/mirror/`). That is a separate
-//!   git-transport write path integrated as git-public's swept-tree writer in
-//!   GITX-05; this adapter does not touch it, and the existing `github_*` tools
-//!   in [`super`] continue to work unchanged.
+//! - IS NOT: the GHMR mirror engine (`src/forge/mirror/`, renamed from
+//!   `src/github/mirror/` at GITX-08). That is a separate git-transport write
+//!   path integrated as git-public's swept-tree writer in GITX-05; this
+//!   adapter does not touch it, and the existing `github_*` tools in
+//!   [`super`] continue to work unchanged.
 //!
 //! ## Credentials — single sanctioned path, per-identity, never literals
 //! Tokens are resolved from the process environment, which is the vault access

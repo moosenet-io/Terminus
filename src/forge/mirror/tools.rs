@@ -1,24 +1,29 @@
-//! GHMR-04 — github mirror engine subtools (core registry) + dev-box transport.
+//! GHMR-04 / GITX-08 — git-public mirror engine subtools (core registry) +
+//! dev-box transport.
 //!
-//! Exposes the GHMR-01/02/03 mirror engine as four github **core-tool** subtools.
-//! They register through [`crate::github::register`], so they land on whatever
-//! registry that function is invoked against — the CORE registry in
-//! `register_all` and the personal registry in `register_personal` (github is a
-//! core tool per the operator's tool taxonomy):
+//! Exposes the GHMR-01/02/03 mirror engine as four **core-tool** subtools
+//! (moved from the github module to `crate::forge::mirror` and renamed from
+//! `github_mirror_*` to `git_public_mirror_*` at GITX-08 — the engine has
+//! been behaviorally provider-agnostic since GITX-05; only the naming still
+//! said "GitHub"). They register through [`crate::github::register`], so
+//! they land on whatever registry that function is invoked against — the
+//! CORE registry in `register_all` and the personal registry in
+//! `register_personal` (github is a core tool per the operator's tool
+//! taxonomy). GitHub remains the only currently-configured mirror target.
 //!
-//!   * `github_mirror_status`  — read-only: internal-main divergence vs. the last
+//!   * `git_public_mirror_status`  — read-only: internal-main divergence vs. the last
 //!     approved snapshot, plus the set of `mirror-approved/*` tags.
-//!   * `github_mirror_prepare` — sync internal `main`'s content into the clean work
+//!   * `git_public_mirror_prepare` — sync internal `main`'s content into the clean work
 //!     dir → mechanical sweep → PII gate → commit (+ `mirror-approved/<sha>` tag
 //!     when gate-clean), via GHMR-03's [`MirrorWorkDir::run`]. Returns residual
 //!     violations for GHMR-05 when the tree is not yet clean.
-//!   * `github_mirror_approve` — **guarded** operator authorisation of a prepared,
+//!   * `git_public_mirror_approve` — **guarded** operator authorisation of a prepared,
 //!     gate-clean snapshot. Requires prepare's `mirror-approved/<sha>` tag for the
 //!     CURRENT internal sha (refusing, without bothering the operator, a residual or
 //!     un-prepared snapshot); on the operator's grant it records a DISTINCT
 //!     `mirror-blessed/<sha>` marker. It never syncs/finalizes here, so it can never
 //!     tag a stale work tree under a newer sha.
-//!   * `github_mirror_push`    — **guarded**, **fast-forward-only** publish of the
+//!   * `git_public_mirror_push`    — **guarded**, **fast-forward-only** publish of the
 //!     OPERATOR-BLESSED work-dir commit (the `mirror-blessed/<sha>` marker — NOT
 //!     prepare's machine tag, so a prepare→push shortcut cannot skip approve) to the
 //!     repo's `github_remote`, using `GITHUB_TOKEN`
@@ -96,7 +101,7 @@ fn mirror_provider(args: &Value) -> String {
 }
 
 /// Tag namespace marking a snapshot the OPERATOR has authorised for push. Created
-/// ONLY by `github_mirror_approve` after the approval gate grants — distinct from
+/// ONLY by `git_public_mirror_approve` after the approval gate grants — distinct from
 /// GHMR-03's `mirror-approved/*` (gate-clean, but machine-created by prepare). Push
 /// requires THIS marker, so a prepare→push shortcut cannot skip operator approval.
 const BLESSED_TAG_PREFIX: &str = "mirror-blessed/";
@@ -170,7 +175,7 @@ fn blessed_tag(internal_sha: &str) -> String {
 
 /// The commit the `mirror-blessed/<sha>` marker points at (the operator-authorised
 /// commit), or `None` when the snapshot has not been blessed by an approved
-/// `github_mirror_approve` call.
+/// `git_public_mirror_approve` call.
 fn blessed_commit(work_dir: &Path, internal_sha: &str) -> Result<Option<String>, ToolError> {
     if !work_dir.join(".git").exists() {
         return Ok(None);
@@ -276,14 +281,14 @@ fn ensure_source_is_main(source: &Path) -> Result<(), ToolError> {
     Ok(())
 }
 
-// ── github_mirror_status ────────────────────────────────────────────────────
+// ── git_public_mirror_status ────────────────────────────────────────────────────
 
-struct GitHubMirrorStatus;
+struct GitPublicMirrorStatus;
 
 #[async_trait]
-impl RustTool for GitHubMirrorStatus {
+impl RustTool for GitPublicMirrorStatus {
     fn name(&self) -> &str {
-        "github_mirror_status"
+        "git_public_mirror_status"
     }
 
     fn description(&self) -> &str {
@@ -369,14 +374,14 @@ impl RustTool for GitHubMirrorStatus {
     }
 }
 
-// ── github_mirror_prepare ───────────────────────────────────────────────────
+// ── git_public_mirror_prepare ───────────────────────────────────────────────────
 
-struct GitHubMirrorPrepare;
+struct GitPublicMirrorPrepare;
 
 #[async_trait]
-impl RustTool for GitHubMirrorPrepare {
+impl RustTool for GitPublicMirrorPrepare {
     fn name(&self) -> &str {
-        "github_mirror_prepare"
+        "git_public_mirror_prepare"
     }
 
     fn description(&self) -> &str {
@@ -422,14 +427,14 @@ impl RustTool for GitHubMirrorPrepare {
     }
 }
 
-// ── github_mirror_approve (guarded) ─────────────────────────────────────────
+// ── git_public_mirror_approve (guarded) ─────────────────────────────────────────
 
-struct GitHubMirrorApprove;
+struct GitPublicMirrorApprove;
 
 #[async_trait]
-impl RustTool for GitHubMirrorApprove {
+impl RustTool for GitPublicMirrorApprove {
     fn name(&self) -> &str {
-        "github_mirror_approve"
+        "git_public_mirror_approve"
     }
 
     fn description(&self) -> &str {
@@ -438,7 +443,7 @@ impl RustTool for GitHubMirrorApprove {
          still pending — those must be cleaned (GHMR-05) and re-prepared first. On a clean \
          snapshot it idempotently confirms the mirror-approved/<internal-sha> tag and, \
          after the operator approves the one-time code, blesses the snapshot for \
-         github_mirror_push. Requires 'repo' and 'source'."
+         git_public_mirror_push. Requires 'repo' and 'source'."
     }
 
     fn parameters(&self) -> Value {
@@ -458,7 +463,7 @@ impl RustTool for GitHubMirrorApprove {
         ensure_source_is_main(wd.source())?;
         if !wd.is_initialised() {
             return Err(ToolError::InvalidArgument(
-                "work dir not initialised — run github_mirror_prepare first".into(),
+                "work dir not initialised — run git_public_mirror_prepare first".into(),
             ));
         }
         let repo = req_str(&args, "repo")?.to_string();
@@ -479,7 +484,7 @@ impl RustTool for GitHubMirrorApprove {
                     "repo": repo,
                     "internal_sha": internal_sha,
                     "reason": "no gate-clean approved snapshot for this internal sha — run \
-                               github_mirror_prepare first (and clean any residual PII violations \
+                               git_public_mirror_prepare first (and clean any residual PII violations \
                                via GHMR-05 before it can be approved)",
                 })
                 .to_string());
@@ -501,7 +506,7 @@ impl RustTool for GitHubMirrorApprove {
         match approval::gate(self.name(), &gate_args, &summary).await {
             Gate::Granted => {
                 // Record the operator's authorisation as a distinct marker that ONLY
-                // this granted path creates — github_mirror_push requires it, so a
+                // this granted path creates — git_public_mirror_push requires it, so a
                 // prepare→push shortcut can never bypass this approval step.
                 create_blessed_tag(wd.path(), &internal_sha, &approved_commit)?;
                 Ok(json!({
@@ -511,7 +516,7 @@ impl RustTool for GitHubMirrorApprove {
                     "approved_tag": format!("mirror-approved/{internal_sha}"),
                     "blessed_tag": blessed_tag(&internal_sha),
                     "commit_sha": approved_commit,
-                    "message": "snapshot blessed — run github_mirror_push to publish (fast-forward only)",
+                    "message": "snapshot blessed — run git_public_mirror_push to publish (fast-forward only)",
                 })
                 .to_string())
             }
@@ -529,7 +534,7 @@ impl RustTool for GitHubMirrorApprove {
     }
 }
 
-// ── github_mirror_push (guarded, fast-forward-only) ─────────────────────────
+// ── git_public_mirror_push (guarded, fast-forward-only) ─────────────────────────
 
 /// Outcome of the fast-forward analysis against the mirror remote.
 #[derive(Debug, PartialEq, Eq)]
@@ -544,12 +549,12 @@ enum FfState {
     NonFastForward { remote_tip: String },
 }
 
-struct GitHubMirrorPush;
+struct GitPublicMirrorPush;
 
 #[async_trait]
-impl RustTool for GitHubMirrorPush {
+impl RustTool for GitPublicMirrorPush {
     fn name(&self) -> &str {
-        "github_mirror_push"
+        "git_public_mirror_push"
     }
 
     fn description(&self) -> &str {
@@ -581,21 +586,21 @@ impl RustTool for GitHubMirrorPush {
         ensure_source_is_main(wd.source())?;
         if !wd.is_initialised() {
             return Err(ToolError::InvalidArgument(
-                "work dir not initialised — run github_mirror_prepare first".into(),
+                "work dir not initialised — run git_public_mirror_prepare first".into(),
             ));
         }
         let repo = req_str(&args, "repo")?.to_string();
         let internal_sha = wd.source_head_sha()?;
 
         // The SOLE publishable commit is the one the OPERATOR blessed via
-        // github_mirror_approve (the `mirror-blessed/<sha>` marker) — NOT prepare's
+        // git_public_mirror_approve (the `mirror-blessed/<sha>` marker) — NOT prepare's
         // machine-created `mirror-approved` tag. This closes the prepare→push
         // shortcut: without a granted approve there is no blessed marker, so push
         // refuses even on a gate-clean prepared snapshot.
         let approved_commit = blessed_commit(wd.path(), &internal_sha)?.ok_or_else(|| {
             ToolError::Conflict(format!(
                 "internal main {internal_sha} is not approved for push — run \
-                 github_mirror_approve first (it requires a github_mirror_prepare'd, gate-clean \
+                 git_public_mirror_approve first (it requires a git_public_mirror_prepare'd, gate-clean \
                  snapshot and the operator's approval; no mirror-blessed marker present)"
             ))
         })?;
@@ -610,14 +615,14 @@ impl RustTool for GitHubMirrorPush {
                 return Err(ToolError::Conflict(format!(
                     "mirror remote has no 'main' branch — it has not been bootstrapped. \
                      Run the GHMR-07 one-time operator-blessed bootstrap to establish shared \
-                     lineage; github_mirror_push is fast-forward-only and never force-pushes."
+                     lineage; git_public_mirror_push is fast-forward-only and never force-pushes."
                 )));
             }
             FfState::NonFastForward { remote_tip } => {
                 return Err(ToolError::Conflict(format!(
                     "non-fast-forward: mirror 'main' is at {remote_tip}, which is not an ancestor \
                      of the approved commit {approved_commit} (the mirror has diverged / is ahead). \
-                     github_mirror_push never force-pushes; reconcile via the GHMR-07 bootstrap."
+                     git_public_mirror_push never force-pushes; reconcile via the GHMR-07 bootstrap."
                 )));
             }
             FfState::UpToDate => {
@@ -867,10 +872,10 @@ fn git_exit_ok(work_dir: &Path, args: &[&str]) -> bool {
 /// else is a clean invalid-argument error.
 pub(crate) async fn dispatch_mirror_action(action: &str, args: Value) -> Result<String, ToolError> {
     match action {
-        "status" => GitHubMirrorStatus.execute(args).await,
-        "prepare" => GitHubMirrorPrepare.execute(args).await,
-        "approve" => GitHubMirrorApprove.execute(args).await,
-        "push" => GitHubMirrorPush.execute(args).await,
+        "status" => GitPublicMirrorStatus.execute(args).await,
+        "prepare" => GitPublicMirrorPrepare.execute(args).await,
+        "approve" => GitPublicMirrorApprove.execute(args).await,
+        "push" => GitPublicMirrorPush.execute(args).await,
         other => Err(ToolError::InvalidArgument(format!(
             "unknown mirror_action '{other}'; expected one of status/prepare/approve/push"
         ))),
@@ -883,13 +888,13 @@ pub(crate) async fn dispatch_mirror_action(action: &str, args: Value) -> Result<
 /// [`crate::github::register`], so they attach to whichever registry github is
 /// registered against (the CORE registry via `register_all`, the personal
 /// registry via `register_personal`). Unconditional: no GitHub credential is
-/// needed to construct them; `github_mirror_push` reads the token lazily at call
+/// needed to construct them; `git_public_mirror_push` reads the token lazily at call
 /// time and returns `NotConfigured` if it is absent.
 pub fn register(registry: &mut ToolRegistry) {
-    registry.register_or_replace(Box::new(GitHubMirrorStatus));
-    registry.register_or_replace(Box::new(GitHubMirrorPrepare));
-    registry.register_or_replace(Box::new(GitHubMirrorApprove));
-    registry.register_or_replace(Box::new(GitHubMirrorPush));
+    registry.register_or_replace(Box::new(GitPublicMirrorStatus));
+    registry.register_or_replace(Box::new(GitPublicMirrorPrepare));
+    registry.register_or_replace(Box::new(GitPublicMirrorApprove));
+    registry.register_or_replace(Box::new(GitPublicMirrorPush));
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -981,7 +986,7 @@ mod tests {
         std::env::set_var("TERMINUS_MIRROR_WORKDIR_ROOT", root);
     }
 
-    /// Stand in for a granted `github_mirror_approve`: bless the current internal
+    /// Stand in for a granted `git_public_mirror_approve`: bless the current internal
     /// sha's approved commit (what the guarded grant path does after the operator
     /// approves). Requires TERMINUS_MIRROR_WORKDIR_ROOT already set.
     fn bless(repo: &str, src: &Path) {
@@ -995,15 +1000,15 @@ mod tests {
 
     #[test]
     fn tool_names_and_schema_are_stable() {
-        assert_eq!(GitHubMirrorStatus.name(), "github_mirror_status");
-        assert_eq!(GitHubMirrorPrepare.name(), "github_mirror_prepare");
-        assert_eq!(GitHubMirrorApprove.name(), "github_mirror_approve");
-        assert_eq!(GitHubMirrorPush.name(), "github_mirror_push");
+        assert_eq!(GitPublicMirrorStatus.name(), "git_public_mirror_status");
+        assert_eq!(GitPublicMirrorPrepare.name(), "git_public_mirror_prepare");
+        assert_eq!(GitPublicMirrorApprove.name(), "git_public_mirror_approve");
+        assert_eq!(GitPublicMirrorPush.name(), "git_public_mirror_push");
         for t in [
-            GitHubMirrorStatus.parameters(),
-            GitHubMirrorPrepare.parameters(),
-            GitHubMirrorApprove.parameters(),
-            GitHubMirrorPush.parameters(),
+            GitPublicMirrorStatus.parameters(),
+            GitPublicMirrorPrepare.parameters(),
+            GitPublicMirrorApprove.parameters(),
+            GitPublicMirrorPush.parameters(),
         ] {
             assert_eq!(t["type"], "object");
             let req = t["required"].as_array().unwrap();
@@ -1017,10 +1022,10 @@ mod tests {
     fn register_adds_four_mirror_tools() {
         let mut reg = ToolRegistry::new();
         register(&mut reg);
-        assert!(reg.contains("github_mirror_status"));
-        assert!(reg.contains("github_mirror_prepare"));
-        assert!(reg.contains("github_mirror_approve"));
-        assert!(reg.contains("github_mirror_push"));
+        assert!(reg.contains("git_public_mirror_status"));
+        assert!(reg.contains("git_public_mirror_prepare"));
+        assert!(reg.contains("git_public_mirror_approve"));
+        assert!(reg.contains("git_public_mirror_push"));
     }
 
     #[test]
@@ -1035,8 +1040,8 @@ mod tests {
         if let Some(v) = backup {
             std::env::set_var("GITHUB_TOKEN", v);
         }
-        assert!(reg.contains("github_mirror_status"));
-        assert!(reg.contains("github_mirror_push"));
+        assert!(reg.contains("git_public_mirror_status"));
+        assert!(reg.contains("git_public_mirror_push"));
     }
 
     // ── missing args ─────────────────────────────────────────────────────────
@@ -1044,11 +1049,11 @@ mod tests {
     #[tokio::test]
     async fn status_requires_repo_and_source() {
         assert!(matches!(
-            GitHubMirrorStatus.execute(json!({})).await,
+            GitPublicMirrorStatus.execute(json!({})).await,
             Err(ToolError::InvalidArgument(_))
         ));
         assert!(matches!(
-            GitHubMirrorStatus.execute(json!({ "repo": "R" })).await,
+            GitPublicMirrorStatus.execute(json!({ "repo": "R" })).await,
             Err(ToolError::InvalidArgument(_))
         ));
     }
@@ -1063,7 +1068,7 @@ mod tests {
         let root = unique("root");
         set_root(&root);
 
-        let prep = GitHubMirrorPrepare
+        let prep = GitPublicMirrorPrepare
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
@@ -1072,7 +1077,7 @@ mod tests {
         assert_eq!(pv["tagged"], true);
         assert_eq!(pv["residual_count"], 0);
 
-        let st = GitHubMirrorStatus
+        let st = GitPublicMirrorStatus
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
@@ -1096,7 +1101,7 @@ mod tests {
         let src = init_source(&[("a.txt", "v1 clean\n")]);
         let root = unique("root");
         set_root(&root);
-        GitHubMirrorPrepare
+        GitPublicMirrorPrepare
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
@@ -1107,7 +1112,7 @@ mod tests {
         write_file(&src, "a.txt", "v3 clean\n");
         commit_all(&src, "v3");
 
-        let st = GitHubMirrorStatus
+        let st = GitPublicMirrorStatus
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
@@ -1127,7 +1132,7 @@ mod tests {
         let src = init_source(&[("a.txt", "v1 clean\n")]);
         let root = unique("root");
         set_root(&root);
-        GitHubMirrorPrepare
+        GitPublicMirrorPrepare
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
@@ -1142,7 +1147,7 @@ mod tests {
         let new_head = run_git(&src, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
         assert_ne!(new_head, c1);
 
-        let st = GitHubMirrorStatus
+        let st = GitPublicMirrorStatus
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
@@ -1169,7 +1174,7 @@ mod tests {
         ]);
         let root = unique("root");
         set_root(&root);
-        GitHubMirrorPrepare
+        GitPublicMirrorPrepare
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
@@ -1178,7 +1183,7 @@ mod tests {
         write_file(&src, "pii-gate.toml", "extra_terms = [\"host-b\"]\n");
         commit_all(&src, "config only");
         let c2 = run_git(&src, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
-        GitHubMirrorPrepare
+        GitPublicMirrorPrepare
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
@@ -1189,7 +1194,7 @@ mod tests {
         // Advance with a REAL content change → c3, unapproved.
         write_file(&src, "README.md", "clean content 2\n");
         commit_all(&src, "readme change");
-        let st = GitHubMirrorStatus
+        let st = GitPublicMirrorStatus
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
@@ -1209,7 +1214,7 @@ mod tests {
         let root = unique("root");
         set_root(&root);
 
-        let st = GitHubMirrorStatus
+        let st = GitPublicMirrorStatus
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
@@ -1235,7 +1240,7 @@ mod tests {
         let root = unique("root");
         set_root(&root);
 
-        let prep = GitHubMirrorPrepare
+        let prep = GitPublicMirrorPrepare
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
@@ -1259,12 +1264,12 @@ mod tests {
         )]);
         let root = unique("root");
         set_root(&root);
-        GitHubMirrorPrepare
+        GitPublicMirrorPrepare
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
 
-        let out = GitHubMirrorApprove
+        let out = GitPublicMirrorApprove
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
@@ -1285,12 +1290,12 @@ mod tests {
         let src = init_source(&[("a.txt", "clean content\n")]);
         let root = unique("root");
         set_root(&root);
-        GitHubMirrorPrepare
+        GitPublicMirrorPrepare
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
 
-        let out = GitHubMirrorApprove
+        let out = GitPublicMirrorApprove
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
@@ -1312,7 +1317,7 @@ mod tests {
         let root = unique("root");
         set_root(&root);
         assert!(matches!(
-            GitHubMirrorApprove
+            GitPublicMirrorApprove
                 .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
                 .await,
             Err(ToolError::InvalidArgument(_))
@@ -1334,12 +1339,12 @@ mod tests {
         let root = unique("root");
         set_root(&root);
         let bare = init_bare();
-        GitHubMirrorPrepare
+        GitPublicMirrorPrepare
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
 
-        let res = GitHubMirrorPush
+        let res = GitPublicMirrorPush
             .execute(json!({
                 "repo": "Terminus",
                 "source": src.display().to_string(),
@@ -1355,13 +1360,13 @@ mod tests {
     #[serial]
     async fn push_refuses_when_prepared_but_not_blessed() {
         // P1-3 regression: a gate-clean prepared snapshot with a bootstrapped,
-        // fast-forwardable remote must STILL refuse push until github_mirror_approve
+        // fast-forwardable remote must STILL refuse push until git_public_mirror_approve
         // has blessed it — prepare's machine tag alone is not push authorisation.
         clear_env();
         let src = init_source(&[("a.txt", "v1 clean\n")]);
         let root = unique("root");
         set_root(&root);
-        GitHubMirrorPrepare
+        GitPublicMirrorPrepare
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
@@ -1373,12 +1378,12 @@ mod tests {
         run_git(wd.path(), &["push", &bare.display().to_string(), &format!("{c1}:refs/heads/main")]).unwrap();
         write_file(&src, "a.txt", "v2 clean\n");
         commit_all(&src, "v2");
-        GitHubMirrorPrepare
+        GitPublicMirrorPrepare
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
 
-        let res = GitHubMirrorPush
+        let res = GitPublicMirrorPush
             .execute(json!({
                 "repo": "Terminus",
                 "source": src.display().to_string(),
@@ -1387,7 +1392,7 @@ mod tests {
             .await;
         match res {
             Err(ToolError::Conflict(m)) => assert!(
-                m.contains("github_mirror_approve"),
+                m.contains("git_public_mirror_approve"),
                 "unblessed push must point at approve: {m}"
             ),
             other => panic!("expected Conflict requiring approve, got {other:?}"),
@@ -1403,13 +1408,13 @@ mod tests {
         let root = unique("root");
         set_root(&root);
         let bare = init_bare(); // empty — no main branch
-        GitHubMirrorPrepare
+        GitPublicMirrorPrepare
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
         bless("Terminus", &src); // operator-approve stand-in
 
-        let res = GitHubMirrorPush
+        let res = GitPublicMirrorPush
             .execute(json!({
                 "repo": "Terminus",
                 "source": src.display().to_string(),
@@ -1431,13 +1436,13 @@ mod tests {
         let src = init_source(&[("a.txt", "clean content\n")]);
         let root = unique("root");
         set_root(&root);
-        GitHubMirrorPrepare
+        GitPublicMirrorPrepare
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
         bless("Terminus", &src); // operator-approve stand-in
         // blessed, but no github_remote arg and no env → NotConfigured.
-        let res = GitHubMirrorPush
+        let res = GitPublicMirrorPush
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await;
         assert!(matches!(res, Err(ToolError::NotConfigured(_))));
@@ -1453,7 +1458,7 @@ mod tests {
         let src = init_source(&[("a.txt", "v1 clean\n")]);
         let root = unique("root");
         set_root(&root);
-        GitHubMirrorPrepare
+        GitPublicMirrorPrepare
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
@@ -1464,13 +1469,13 @@ mod tests {
         // Advance + prepare + bless c2 (a genuine ff over the remote's c1).
         write_file(&src, "a.txt", "v2 clean\n");
         commit_all(&src, "v2");
-        GitHubMirrorPrepare
+        GitPublicMirrorPrepare
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
         bless("Terminus", &src);
 
-        let out = GitHubMirrorPush
+        let out = GitPublicMirrorPush
             .execute(json!({
                 "repo": "Terminus",
                 "source": src.display().to_string(),
@@ -1514,7 +1519,7 @@ mod tests {
         let root = unique("root");
         set_root(&root);
         for bad in ["../escape", "a/b", "..", ".", "/abs", "a\\b"] {
-            let res = GitHubMirrorStatus
+            let res = GitPublicMirrorStatus
                 .execute(json!({ "repo": bad, "source": "/tmp/whatever" }))
                 .await;
             assert!(
@@ -1570,12 +1575,12 @@ mod tests {
         let src = init_source(&[("a.txt", "clean\n")]);
         let root = unique("root");
         set_root(&root);
-        GitHubMirrorPrepare
+        GitPublicMirrorPrepare
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await
             .unwrap();
         bless("Terminus", &src);
-        let res = GitHubMirrorPush
+        let res = GitPublicMirrorPush
             .execute(json!({
                 "repo": "Terminus",
                 "source": src.display().to_string(),
@@ -1601,10 +1606,10 @@ mod tests {
         commit_all(&src, "feature commit");
 
         for res in [
-            GitHubMirrorStatus
+            GitPublicMirrorStatus
                 .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
                 .await,
-            GitHubMirrorPrepare
+            GitPublicMirrorPrepare
                 .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
                 .await,
         ] {
@@ -1616,7 +1621,7 @@ mod tests {
 
         // Back on main → prepare succeeds.
         run_git(&src, &["checkout", "-q", "main"]).unwrap();
-        let ok = GitHubMirrorPrepare
+        let ok = GitPublicMirrorPrepare
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
             .await;
         assert!(ok.is_ok(), "main-tip source must be accepted: {ok:?}");

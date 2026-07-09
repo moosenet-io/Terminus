@@ -20,7 +20,7 @@ dirs = "5.0"
 log = "0.4"
 # Direct process-group kill (killpg) for the GHMR-05 cleaner sandbox measure — no
 # reliance on an external `pkill` binary. Already present transitively; pinned as a
-# direct dep here so `src/github/mirror/clean.rs` can call it. unix-gated at use.
+# direct dep here so `src/forge/mirror/clean.rs` can call it. unix-gated at use.
 libc = "0.2"
 async-trait = "0.1"
 base64 = "0.22"

@@ -1,4 +1,9 @@
-//! GitHub mirror engine — clean work-dir derivative of internal `main`.
+//! git-public mirror engine — clean work-dir derivative of internal `main`.
+//!
+//! (Renamed at GITX-08 from the GitHub-specific `github::mirror`; the engine
+//! has been behaviorally provider-agnostic since GITX-05's
+//! `dispatch_mirror_action` / `mirror_provider_token()` routing — GitHub
+//! remains the only currently-configured mirror target.)
 //!
 //! The mirror engine maintains, per `mirror_ready` repo, a PII-swept derivative
 //! of internal `main` that keeps its own linear git history and shares ancestry
@@ -22,7 +27,7 @@
 //!     loop dispatches a scoped cleaning subagent that remediates the flagged spots
 //!     IN THE WORK DIR ONLY, re-runs the gate each round, and either drives the
 //!     residuals to 0 (tag-able) or escalates the exact `file:line` spots to the
-//!     operator. Wired into `github_mirror_prepare` (GHMR-04).
+//!     operator. Wired into `git_public_mirror_prepare` (GHMR-04).
 //!   * mirror subtools (GHMR-04) build on top.
 //!
 //! The mechanical rewrite writes ONLY into a provided work-dir copy — never the

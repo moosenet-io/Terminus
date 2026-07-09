@@ -38,7 +38,6 @@ use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
 pub mod adapter;
-pub mod mirror;
 pub mod pii;
 pub use adapter::GitHubAdapter;
 use pii::pii_gate;
@@ -921,14 +920,16 @@ pub fn register(registry: &mut ToolRegistry) {
     // github_pii_scan is a pure, read-only diagnostic — always available,
     // independent of whether GitHub write credentials are configured.
     registry.register_or_replace(Box::new(GitHubPiiScan));
-    // GHMR-04 mirror engine subtools (status/prepare/approve/push). Registered
-    // unconditionally — status/prepare/approve are local git + sweep operations
-    // that need no GitHub credential; only `github_mirror_push` reads GITHUB_TOKEN,
-    // and it does so lazily at call time (a clear NotConfigured if it is unset)
-    // rather than being stubbed out at startup. They land on whichever registry
-    // `github::register` is invoked against — the CORE registry in `register_all`
-    // and the personal registry in `register_personal` (github is a core tool).
-    mirror::tools::register(registry);
+    // GITX-08: git-public mirror engine subtools (status/prepare/approve/push,
+    // moved to crate::forge::mirror and renamed from GHMR-04's github_mirror_*).
+    // Registered unconditionally — status/prepare/approve are local git + sweep
+    // operations that need no forge credential; only `git_public_mirror_push`
+    // reads a provider token, and it does so lazily at call time (a clear
+    // NotConfigured if it is unset) rather than being stubbed out at startup.
+    // They land on whichever registry `github::register` is invoked against —
+    // the CORE registry in `register_all` and the personal registry in
+    // `register_personal` (github is a core tool).
+    crate::forge::mirror::tools::register(registry);
     match GitHubConfig::from_env() {
         Ok(cfg) => {
             registry.register_or_replace(Box::new(GitHubListRepos { cfg: cfg.clone() }));

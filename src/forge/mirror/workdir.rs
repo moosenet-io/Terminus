@@ -448,7 +448,7 @@ impl MirrorWorkDir {
     //
     // These expose the existing private git reads (HEAD shas, tag resolution)
     // as a public, side-effect-free surface so `mirror::tools` can build the
-    // `github_mirror_{status,push}` reports without duplicating the force-guarded
+    // `git_public_mirror_{status,push}` reports without duplicating the force-guarded
     // git runner. All are pure reads — none mutate the work dir or source.
 
     /// The internal source's current `main` HEAD sha (full 40-char).
@@ -467,7 +467,7 @@ impl MirrorWorkDir {
 
     /// The work-dir commit the `mirror-approved/<internal_sha>` tag points at, or
     /// `None` when that internal sha has not been approved (no tag). This is the
-    /// exact commit GHMR-04's `github_mirror_push` publishes.
+    /// exact commit GHMR-04's `git_public_mirror_push` publishes.
     pub fn approved_commit(&self, internal_sha: &str) -> Result<Option<String>, ToolError> {
         if !self.approved_tag_exists(internal_sha)? {
             return Ok(None);
