@@ -11,7 +11,7 @@ spec_id: S106-git-tool-domains
      already-shipped work" at the bottom. -->
 
 ## Metadata
-- **Author:** <operator> (Moose)
+- **Author:** the operator (Moose)
 - **Session:** S106
 - **Date:** 2026-07-08
 - **Module version:** Terminus (terminus-rs infra layer)

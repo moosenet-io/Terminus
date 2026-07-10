@@ -421,7 +421,7 @@ impl RustTool for RoutinesPropose {
     }
 
     fn description(&self) -> &str {
-        "Propose a routine change for <operator>'s approval. Action: create, update, delete.\nThis does NOT execute the change — it saves a proposal and notifies <operator>.\nPeter must then approve before routines_approve is called."
+        "Propose a routine change for the operator's approval. Action: create, update, delete.\nThis does NOT execute the change — it saves a proposal and notifies the operator.\nThe operator must then approve before routines_approve is called."
     }
 
     fn parameters(&self) -> Value {
@@ -460,7 +460,7 @@ impl RustTool for RoutinesPropose {
 
         Ok(json!({
             "saved": true,
-            "message": "Proposal saved. <operator> must approve before routines_approve is called.",
+            "message": "Proposal saved. The operator must approve before routines_approve is called.",
             "proposal": proposal,
         })
         .to_string())
@@ -512,7 +512,7 @@ impl RustTool for RoutinesApprove {
     }
 
     fn description(&self) -> &str {
-        "Execute the pending routine proposal. Only call this after <operator> explicitly approves.\nReads the proposal from the staging file and executes via a script on the scheduler host.\nGUARDED: requires a genuine prior operator approval grant (crate::approval)."
+        "Execute the pending routine proposal. Only call this after the operator explicitly approves.\nReads the proposal from the staging file and executes via a script on the scheduler host.\nGUARDED: requires a genuine prior operator approval grant (crate::approval)."
     }
 
     fn parameters(&self) -> Value {
@@ -604,7 +604,7 @@ impl RustTool for RoutinesEdit {
     }
 
     fn description(&self) -> &str {
-        "Edit an existing routine's properties without deleting it.\nOnly provided fields are updated. Preserves run history.\nThis tool is gated — only call after <operator> explicitly approves the change."
+        "Edit an existing routine's properties without deleting it.\nOnly provided fields are updated. Preserves run history.\nThis tool is gated — only call after the operator explicitly approves the change."
     }
 
     fn parameters(&self) -> Value {
@@ -673,7 +673,7 @@ impl RustTool for RoutinesBatchEditNotifyChannel {
     }
 
     fn description(&self) -> &str {
-        "Batch update the notify-channel on ALL routines by deleting and recreating each one.\nWARNING: This wipes run history. Use only when switching all routines to a new channel.\nThe scheduler's edit command does not support changing notify-channel, so delete/recreate is required.\nThis tool is gated — only call after <operator> explicitly approves."
+        "Batch update the notify-channel on ALL routines by deleting and recreating each one.\nWARNING: This wipes run history. Use only when switching all routines to a new channel.\nThe scheduler's edit command does not support changing notify-channel, so delete/recreate is required.\nThis tool is gated — only call after the operator explicitly approves."
     }
 
     fn parameters(&self) -> Value {

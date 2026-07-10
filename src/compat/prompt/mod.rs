@@ -441,7 +441,7 @@ mod tests {
     #[test]
     fn fresh_install_uses_core_identity_and_traits_only() {
         let dir = tempdir().unwrap();
-        let a = assembler(dir.path(), "<operator>");
+        let a = assembler(dir.path(), "morgan");
         let p = a.assemble();
         assert!(p.contains("[identity]"));
         assert!(p.contains("Lumina is a personal AI assistant"));
@@ -460,20 +460,20 @@ mod tests {
     #[test]
     fn initial_files_created_on_first_run() {
         let dir = tempdir().unwrap();
-        let a = assembler(dir.path(), "<operator>");
+        let a = assembler(dir.path(), "morgan");
         a.assemble();
         assert!(dir.path().join("core-identity.txt").exists());
-        assert!(dir.path().join("<operator>").join("trait-vector.json").exists());
+        assert!(dir.path().join("morgan").join("trait-vector.json").exists());
     }
 
     #[test]
     fn all_layers_present_when_files_exist() {
         let dir = tempdir().unwrap();
-        let a = assembler(dir.path(), "<operator>");
+        let a = assembler(dir.path(), "morgan");
         a.ensure_initialized().unwrap();
-        let udir = dir.path().join("<operator>");
-        std::fs::write(udir.join("personality-vector.txt"), "<operator> likes systems thinking.").unwrap();
-        std::fs::write(udir.join("knowledge-digest.txt"), "<operator> is a marketing manager in Foster City.").unwrap();
+        let udir = dir.path().join("morgan");
+        std::fs::write(udir.join("personality-vector.txt"), "Morgan likes systems thinking.").unwrap();
+        std::fs::write(udir.join("knowledge-digest.txt"), "Morgan is a marketing manager in Foster City.").unwrap();
         std::fs::write(udir.join("active-context.txt"), "Recently: built the dynamic prompt system.").unwrap();
         let extras = AssemblyExtras {
             memory: Some("[principle] You prefer direct feedback".into()),
@@ -497,9 +497,9 @@ mod tests {
     #[test]
     fn empty_layer_files_are_skipped() {
         let dir = tempdir().unwrap();
-        let a = assembler(dir.path(), "<operator>");
+        let a = assembler(dir.path(), "morgan");
         a.ensure_initialized().unwrap();
-        std::fs::write(dir.path().join("<operator>").join("knowledge-digest.txt"), "   \n  ").unwrap();
+        std::fs::write(dir.path().join("morgan").join("knowledge-digest.txt"), "   \n  ").unwrap();
         let p = a.assemble();
         assert!(!p.contains("[knowledge]"));
     }
@@ -507,9 +507,9 @@ mod tests {
     #[test]
     fn corrupt_trait_file_falls_back_to_defaults() {
         let dir = tempdir().unwrap();
-        let a = assembler(dir.path(), "<operator>");
+        let a = assembler(dir.path(), "morgan");
         a.ensure_initialized().unwrap();
-        std::fs::write(dir.path().join("<operator>").join("trait-vector.json"), "garbage{").unwrap();
+        std::fs::write(dir.path().join("morgan").join("trait-vector.json"), "garbage{").unwrap();
         let p = a.assemble();
         // Default focus 0.75 → "Laser-focused"
         assert!(p.contains("Laser-focused"));
@@ -518,9 +518,9 @@ mod tests {
     #[test]
     fn token_budget_drops_lowest_priority_first() {
         let dir = tempdir().unwrap();
-        let a = assembler(dir.path(), "<operator>");
+        let a = assembler(dir.path(), "morgan");
         a.ensure_initialized().unwrap();
-        let udir = dir.path().join("<operator>");
+        let udir = dir.path().join("morgan");
         // Fill every file-backed layer past its cap so the summed caps far
         // exceed GLOBAL_TOKEN_BUDGET (1300) and force dropping.
         std::fs::write(udir.join("personality-vector.txt"), "pv ".repeat(900)).unwrap();
@@ -566,7 +566,7 @@ mod tests {
     fn assemble_base_prompt_disabled_returns_fallback() {
         // Pure inner fn — no global env mutation, safe under parallel tests.
         let dir = tempdir().unwrap();
-        let a = assembler(dir.path(), "<operator>");
+        let a = assembler(dir.path(), "morgan");
         let out = assemble_base_prompt_inner(&a, "FALLBACK PROMPT", true, &AssemblyExtras::default());
         assert_eq!(out, "FALLBACK PROMPT");
     }
@@ -613,7 +613,7 @@ mod tests {
     #[test]
     fn assemble_base_prompt_enabled_assembles() {
         let dir = tempdir().unwrap();
-        let a = assembler(dir.path(), "<operator>");
+        let a = assembler(dir.path(), "morgan");
         let out = assemble_base_prompt_inner(&a, "FALLBACK", false, &AssemblyExtras::default());
         assert!(out.contains("[identity]"));
         assert_ne!(out, "FALLBACK");
@@ -622,7 +622,7 @@ mod tests {
     #[test]
     fn no_personal_data_in_core_identity_constant() {
         // The locked-in identity must not hardcode personal/infra specifics.
-        assert!(!CORE_IDENTITY.contains("<operator>"));
+        assert!(!CORE_IDENTITY.contains("<operator>")); // pii-test-fixture
         assert!(!CORE_IDENTITY.contains("192.168"));
         assert!(!CORE_IDENTITY.contains("Foster City"));
     }

@@ -15,7 +15,7 @@
 //!   GOOGLE_LUMINA_EMAIL   — the account address (also IMAP/SMTP/CalDAV username)
 //!   GOOGLE_APP_PASSWORD   — Gmail App Password
 //! Optional env:
-//!   GOOGLE_PETER_EMAIL          — operator's personal calendar (default <email>) // pii-test-fixture
+//!   GOOGLE_SECONDARY_EMAIL      — operator's personal calendar (default <email>) // pii-test-fixture
 //!   GOOGLE_LUMINA_CALENDAR_ID   — extra group calendar id to include
 //!   GOOGLE_EXTRA_CALENDARS      — comma-separated extra calendar ids
 
@@ -35,7 +35,7 @@ use crate::tool::RustTool;
 pub struct GoogleConfig {
     pub email: String,
     pub app_password: String,
-    pub peter_email: String,
+    pub secondary_email: String,
     pub lumina_calendar_id: Option<String>,
     pub extra_calendars: Vec<String>,
 }
@@ -50,7 +50,7 @@ impl GoogleConfig {
             .ok()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| ToolError::NotConfigured("GOOGLE_APP_PASSWORD not set".into()))?;
-        let peter_email = std::env::var("GOOGLE_PETER_EMAIL")
+        let secondary_email = std::env::var("GOOGLE_SECONDARY_EMAIL")
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "<email>".into()); // pii-test-fixture
@@ -65,14 +65,14 @@ impl GoogleConfig {
                     .collect()
             })
             .unwrap_or_default();
-        Ok(Self { email, app_password, peter_email, lumina_calendar_id, extra_calendars })
+        Ok(Self { email, app_password, secondary_email, lumina_calendar_id, extra_calendars })
     }
 
     /// Every calendar id to query, in priority order, de-duplicated:
     /// the account's own calendar, the operator's personal calendar, any extras,
     /// and the Lumina group calendar.
     pub fn all_calendar_ids(&self) -> Vec<String> {
-        let mut ids = vec![self.email.clone(), self.peter_email.clone()];
+        let mut ids = vec![self.email.clone(), self.secondary_email.clone()];
         ids.extend(self.extra_calendars.iter().cloned());
         if let Some(ref c) = self.lumina_calendar_id {
             ids.push(c.clone());
@@ -141,7 +141,7 @@ mod tests {
         GoogleConfig {
             email: "<email>".into(), // pii-test-fixture
             app_password: "x".into(),
-            peter_email: "<email>".into(), // pii-test-fixture
+            secondary_email: "<email>".into(), // pii-test-fixture
             lumina_calendar_id: Some("<email>".into()), // pii-test-fixture
             extra_calendars: vec![],
         }

@@ -847,7 +847,7 @@ mod tests {
         // The bare English word "secret" must NOT trip the gate (abstracted prose
         // is allowed to discuss secret handling).
         assert!(scan_pii("secrets are never pasted into a conversation").is_none());
-        assert!(scan_pii("ask <operator> about it").is_some());
+        assert!(scan_pii("ask <operator> about it").is_some()); // pii-test-fixture
         assert!(scan_pii("the orchestrator Lumina delegates work").is_some());
         // A plausible IP outside the private ranges still trips the dotted-quad rule.
         assert!(scan_pii("connect to 8.8.8.8 first").is_some());

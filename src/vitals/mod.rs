@@ -862,7 +862,7 @@ impl RustTool for VitalsProgramCreate {
     fn name(&self) -> &str { "vitals_program_create" }
 
     fn description(&self) -> &str {
-        "Create a health/fitness program plan using AI. goal: what <operator> wants to achieve \
+        "Create a health/fitness program plan using AI. goal: what the operator wants to achieve \
          (e.g. 'run a 5K', 'lose 5kg', 'improve sleep'). weeks: program duration in weeks \
          (default 8). constraints: any limitations (e.g. 'bad knee', 'no gym', \
          '45 min max per session'). Returns a structured weekly plan stored in Engram and \
