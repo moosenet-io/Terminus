@@ -37,10 +37,13 @@
 use std::time::Duration;
 
 use bytes::Bytes as ByteBuf;
+use futures_core::Stream;
 use http_body_util::{BodyExt, Full};
-use hyper::Request;
+use hyper::body::Incoming;
+use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use serde_json::Value;
+use tokio_stream::StreamExt as _;
 
 use crate::enroll::{enroll, EnrollConfig};
 use crate::error::ClientError;
@@ -58,6 +61,24 @@ pub const DEFAULT_FORWARD_TIMEOUT: Duration = Duration::from_secs(15);
 /// Default HTTP path the primary's MCP endpoint is mounted at, matching
 /// `terminus_rs::mcp_server::build_router`'s `/mcp` route.
 pub const DEFAULT_MCP_PATH: &str = "/mcp";
+
+/// How long [`forward_stream`] waits for the response's status line +
+/// headers (NOT the full body -- see module doc for why streaming calls use
+/// a separate, shorter-scoped timeout than [`DEFAULT_FORWARD_TIMEOUT`]'s
+/// whole-call coverage). Reuses the same default duration as
+/// [`DEFAULT_FORWARD_TIMEOUT`] since both cover the same phase of work
+/// (enroll-check + dial + handshake + issue request); only the *meaning*
+/// differs (open-only vs. whole-call).
+pub const DEFAULT_STREAM_OPEN_TIMEOUT: Duration = DEFAULT_FORWARD_TIMEOUT;
+
+/// How long [`forward_stream`] will wait between two consecutive body chunks
+/// before giving up on an apparently-wedged stream (EGSSE-01 EDGE CASE: an
+/// agentic turn that stalls mid-stream -- primary hung, link dead -- must
+/// surface a clear error rather than block the caller forever). Deliberately
+/// much longer than [`DEFAULT_STREAM_OPEN_TIMEOUT`]/[`DEFAULT_FORWARD_TIMEOUT`]:
+/// legitimate SSE progressive tool-dispatch turns can go quiet for tens of
+/// seconds between tool-call chunks while a tool executes server-side.
+pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Everything [`forward`] needs to reach a terminus primary for one request.
 #[derive(Clone)]
@@ -185,6 +206,155 @@ async fn forward_inner(cfg: &PrimaryConfig, request_body: Value) -> Result<Value
     parse_mcp_response_body(&raw)
 }
 
+/// Forward one JSON request body to an arbitrary `path` on the primary over
+/// a fresh mTLS connection (same dial/enroll model as [`forward`]), and
+/// return the response body as an incrementally-consumable async
+/// [`Stream`] of [`ByteBuf`] chunks -- for progressive/SSE-shaped endpoints
+/// (e.g. Chord's `/v1/agent/execute`, `/v1/chat/completions`, `/v1/infer`,
+/// `/v1/coding/select`) that [`forward`]'s buffer-the-whole-body-then-return
+/// shape cannot represent: a caller driving lumina's `agent_loop` needs each
+/// `event:`/`data:` SSE frame as it arrives, not after the whole turn has
+/// finished.
+///
+/// ## What this function does NOT do
+/// It does not parse SSE framing itself (no `event:`/`data:` splitting, no
+/// JSON decoding of frame payloads) -- it hands the caller raw bytes exactly
+/// as `hyper` delivers them off the wire, unbuffered, the same posture
+/// Chord's own inference proxy takes with `bytes_stream`/`Body::from_stream`
+/// on the far side of this same mTLS link. The caller is responsible for
+/// buffering partial frames across chunk boundaries and splitting on the SSE
+/// record separator -- see "Driving the stream" below.
+///
+/// ## Two-phase timeout model
+/// Unlike [`forward`] (one timeout covers the whole call), this function
+/// splits its timeout coverage in two, because a streaming call's body may
+/// legitimately run far longer than any reasonable whole-call bound:
+/// 1. **Open phase** (enroll-check + dial + handshake + send request + read
+///    response headers): bounded by `cfg.timeout`
+///    ([`DEFAULT_STREAM_OPEN_TIMEOUT`] by default) -- a
+///    [`ClientError::StreamOpenTimeout`] if headers don't arrive in time.
+/// 2. **Body phase** (each chunk read after that): bounded by `idle_timeout`
+///    -- a stream item is `Err(`[`ClientError::StreamIdleTimeout`]`)` if no
+///    new chunk arrives within that window since the last one (or since the
+///    stream opened). The stream ends (returns `None`) once the primary
+///    closes the response body normally.
+///
+/// ## Driving the stream
+/// ```rust,ignore
+/// use tokio_stream::StreamExt;
+///
+/// let mut stream = forward_stream(&cfg, "/v1/agent/execute", request_body).await?;
+/// let mut pending = Vec::new(); // holds bytes since the last complete SSE record
+/// while let Some(chunk) = stream.next().await {
+///     let chunk = chunk?; // StreamRead / StreamIdleTimeout surfaces here
+///     pending.extend_from_slice(&chunk);
+///     // split `pending` on "\n\n", handing each complete `event:`/`data:`
+///     // record to the caller's own SSE-frame decoder (e.g. lumina's
+///     // agent_loop tool-dispatch handling), retaining any trailing partial
+///     // record in `pending` for the next chunk.
+/// }
+/// ```
+///
+/// Attaches the enrolled JWT as `Authorization: Bearer <jwt>`, matching
+/// [`forward`].
+pub async fn forward_stream(
+    cfg: &PrimaryConfig,
+    path: &str,
+    request_body: Value,
+) -> Result<impl Stream<Item = Result<ByteBuf, ClientError>>, ClientError> {
+    forward_stream_with_idle_timeout(cfg, path, request_body, DEFAULT_STREAM_IDLE_TIMEOUT).await
+}
+
+/// Same as [`forward_stream`], but with an explicit per-chunk idle timeout
+/// instead of [`DEFAULT_STREAM_IDLE_TIMEOUT`] -- exposed separately so a
+/// caller with a known-different workload shape (e.g. a much shorter-lived
+/// streaming endpoint) isn't stuck with the agentic-turn-sized default.
+pub async fn forward_stream_with_idle_timeout(
+    cfg: &PrimaryConfig,
+    path: &str,
+    request_body: Value,
+    idle_timeout: Duration,
+) -> Result<impl Stream<Item = Result<ByteBuf, ClientError>>, ClientError> {
+    let addr = format!("{}:{}", cfg.connect.host, cfg.connect.port);
+
+    let resp = match tokio::time::timeout(cfg.timeout, open_stream_inner(cfg, path, request_body)).await {
+        Ok(result) => result?,
+        Err(_) => return Err(ClientError::StreamOpenTimeout(addr, cfg.timeout)),
+    };
+
+    let idle_timeout_addr = addr.clone();
+    let data_stream = resp.into_body().into_data_stream();
+    let mapped = tokio_stream::StreamExt::timeout(data_stream, idle_timeout).map(move |item| match item {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(e)) => Err(ClientError::StreamRead(e.to_string())),
+        Err(_elapsed) => Err(ClientError::StreamIdleTimeout(idle_timeout_addr.clone(), idle_timeout)),
+    });
+
+    Ok(mapped)
+}
+
+/// The open phase of [`forward_stream`]: enroll, dial, handshake, issue the
+/// request, and read the response status + headers (NOT the body). Returns
+/// the still-streaming [`Response`] on a 2xx status; on a non-2xx status,
+/// reads the (expected-small) error body and returns
+/// [`ClientError::ForwardRejected`] -- mirroring [`forward_inner`]'s error
+/// shape for the non-streaming case.
+async fn open_stream_inner(
+    cfg: &PrimaryConfig,
+    path: &str,
+    request_body: Value,
+) -> Result<Response<Incoming>, ClientError> {
+    let credential = enroll(&cfg.enroll).await?;
+    let transport = connect(&credential, &cfg.connect).await?;
+    let io = TokioIo::new(transport.into_io());
+
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(io).await.map_err(|e| {
+        ClientError::Handshake(format!("HTTP/1.1 handshake over mTLS stream failed: {e}"))
+    })?;
+
+    // Same "drive the connection in the background, let it end when the
+    // response body finishes / the caller drops the stream" model as
+    // `forward_inner` -- see module doc's "Connection model" section.
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::debug!("terminus_client::forward_stream: connection ended: {e}");
+        }
+    });
+
+    let addr = format!("{}:{}", cfg.connect.host, cfg.connect.port);
+
+    let body_bytes = serde_json::to_vec(&request_body)
+        .map_err(|e| ClientError::TlsConfig(format!("serializing forwarded stream request body: {e}")))?;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("host", &cfg.connect.server_name)
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream, application/json")
+        .header("authorization", format!("Bearer {}", credential.jwt))
+        .body(Full::new(ByteBuf::from(body_bytes)))
+        .map_err(|e| ClientError::TlsConfig(format!("building forwarded streaming HTTP request: {e}")))?;
+
+    let resp = sender.send_request(req).await.map_err(|e| {
+        ClientError::DialUnreachable(addr.clone(), format!("streaming HTTP request over mTLS stream failed: {e}"))
+    })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| ClientError::MalformedResponse(format!("reading rejected stream response body: {e}")))?
+            .to_bytes();
+        let raw = String::from_utf8_lossy(&body).to_string();
+        return Err(ClientError::ForwardRejected { status: status.as_u16(), body: raw });
+    }
+
+    Ok(resp)
+}
+
 /// Parse a terminus primary `/mcp` response body -- either SSE-framed
 /// (`event: message\ndata: {...}\n\n`, matching
 /// `terminus_rs::mcp_server::sse_response`) or plain JSON, mirroring the
@@ -252,6 +422,7 @@ fn redact(value: Value) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tokio_stream::StreamExt;
 
     #[test]
     fn sanitize_for_log_redacts_secret_shaped_keys_recursively() {
@@ -437,6 +608,128 @@ mod tests {
         );
     }
 
+    // ── forward_stream tests (EGSSE-01) ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn forward_stream_yields_chunks_incrementally_not_buffered_whole() {
+        let ca = generate_test_ca();
+        let credential = enrolled_credential(&ca, "test-daemon");
+        let chunks: Vec<ByteBuf> = vec![
+            ByteBuf::from_static(b"event: message\ndata: {\"delta\":\"one\"}\n\n"),
+            ByteBuf::from_static(b"event: message\ndata: {\"delta\":\"two\"}\n\n"),
+            ByteBuf::from_static(b"event: message\ndata: {\"delta\":\"three\"}\n\n"),
+        ];
+        let (host, port) =
+            spawn_mock_streaming_primary(&ca, chunks.clone(), Duration::from_millis(30)).await;
+
+        let cfg = primary_config(&credential, host, port);
+        let mut stream = Box::pin(
+            forward_stream(&cfg, "/v1/agent/execute", json!({"turn": 1}))
+                .await
+                .expect("opening the stream against a real mock mTLS primary should succeed"),
+        );
+
+        // Each server-side chunk arrives as its own stream item -- proves
+        // this is progressive delivery, not the whole SSE body collected
+        // and split after the fact (which `forward`'s buffered model would
+        // do).
+        let mut received = Vec::new();
+        while let Some(item) = stream.next().await {
+            let bytes = item.expect("each chunk should decode cleanly");
+            received.push(bytes);
+        }
+
+        assert_eq!(received.len(), chunks.len(), "expected one stream item per server-side chunk");
+        for (got, want) in received.iter().zip(chunks.iter()) {
+            assert_eq!(got, want);
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_stream_ends_cleanly_when_the_primary_closes_the_body() {
+        let ca = generate_test_ca();
+        let credential = enrolled_credential(&ca, "test-daemon");
+        let (host, port) =
+            spawn_mock_streaming_primary(&ca, vec![ByteBuf::from_static(b"data: {\"ok\":true}\n\n")], Duration::ZERO)
+                .await;
+
+        let cfg = primary_config(&credential, host, port);
+        let mut stream = Box::pin(
+            forward_stream(&cfg, "/v1/agent/execute", json!({}))
+                .await
+                .expect("open should succeed"),
+        );
+
+        let first = stream.next().await.expect("one chunk expected").expect("chunk should decode");
+        assert_eq!(first, ByteBuf::from_static(b"data: {\"ok\":true}\n\n"));
+        assert!(stream.next().await.is_none(), "stream must end once the primary closes the body");
+    }
+
+    #[tokio::test]
+    async fn forward_stream_rejects_a_non_2xx_status_without_ever_yielding_chunks() {
+        let ca = generate_test_ca();
+        let credential = enrolled_credential(&ca, "test-daemon");
+        let (host, port) = spawn_mock_streaming_primary_rejecting(&ca, 401, "unauthorized").await;
+
+        let cfg = primary_config(&credential, host, port);
+        let err = match forward_stream(&cfg, "/v1/agent/execute", json!({})).await {
+            Ok(_) => panic!("a non-2xx status must be rejected before any stream is handed back"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, ClientError::ForwardRejected { status: 401, .. }));
+    }
+
+    #[tokio::test]
+    async fn forward_stream_open_phase_times_out_cleanly_instead_of_hanging() {
+        let ca = generate_test_ca();
+        let credential = enrolled_credential(&ca, "test-daemon");
+        let (host, port) = spawn_mock_primary_never_responds(&ca).await;
+
+        let mut cfg = primary_config(&credential, host, port);
+        cfg.timeout = Duration::from_millis(250);
+
+        let started = Instant::now();
+        let err = match forward_stream(&cfg, "/v1/agent/execute", json!({})).await {
+            Ok(_) => panic!("a primary that never responds must time out opening the stream, not hang"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, ClientError::StreamOpenTimeout(_, _)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn forward_stream_surfaces_idle_timeout_when_the_body_stalls_mid_stream() {
+        let ca = generate_test_ca();
+        let credential = enrolled_credential(&ca, "test-daemon");
+        let (host, port) = spawn_mock_streaming_primary_then_stalls(
+            &ca,
+            ByteBuf::from_static(b"data: {\"delta\":\"first\"}\n\n"),
+        )
+        .await;
+
+        let cfg = primary_config(&credential, host, port);
+        let mut stream = Box::pin(
+            forward_stream_with_idle_timeout(&cfg, "/v1/agent/execute", json!({}), Duration::from_millis(200))
+                .await
+                .expect("open should succeed"),
+        );
+
+        let first = stream.next().await.expect("first chunk expected").expect("first chunk should decode");
+        assert_eq!(first, ByteBuf::from_static(b"data: {\"delta\":\"first\"}\n\n"));
+
+        let started = Instant::now();
+        let second = stream
+            .next()
+            .await
+            .expect("stream must yield an idle-timeout error item, not end silently")
+            .expect_err("a stalled body must surface as a typed error, not hang forever");
+        assert!(matches!(second, ClientError::StreamIdleTimeout(_, _)));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "idle timeout must be bounded by the configured duration, not left hanging: {:?}",
+            started.elapsed()
+        );
+    }
 }
 
 /// Shared test-support: a mock terminus-primary-shaped mTLS + HTTP/1.1
@@ -460,6 +753,7 @@ pub(crate) mod test_support {
         use rustls::RootCertStore;
         use serde_json::Value;
         use tokio::net::TcpListener;
+        use tokio_stream::StreamExt;
 
         use crate::enroll::{EnrollConfig, EnrolledCredential};
         use crate::forward::PrimaryConfig;
@@ -674,6 +968,200 @@ pub(crate) mod test_support {
                         .status(200)
                         .header("content-type", "text/event-stream")
                         .body(Full::new(ByteBuf::from(sse)))
+                        .unwrap();
+                    Ok::<_, std::convert::Infallible>(resp)
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, svc).await;
+        }
+
+        /// Spawn a mock terminus-primary that serves exactly one request per
+        /// connection by writing `chunks` to the response body one at a
+        /// time (sleeping `delay_between` between each), then closing the
+        /// body normally -- exercises [`crate::forward::forward_stream`]'s
+        /// incremental delivery against a real chunked HTTP/1.1 response,
+        /// not a single buffered write.
+        pub(crate) async fn spawn_mock_streaming_primary(
+            ca: &TestCa,
+            chunks: Vec<ByteBuf>,
+            delay_between: std::time::Duration,
+        ) -> (String, u16) {
+            let tls_config = server_tls_config(ca, true);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let chunks = Arc::new(chunks);
+
+            tokio::spawn(async move {
+                let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+                loop {
+                    let (tcp, _) = match listener.accept().await {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
+                    let acceptor = acceptor.clone();
+                    let chunks = chunks.clone();
+                    tokio::spawn(async move {
+                        let Ok(tls) = acceptor.accept(tcp).await else { return };
+                        serve_one_streaming_connection(tls, chunks, delay_between).await;
+                    });
+                }
+            });
+
+            (addr.ip().to_string(), addr.port())
+        }
+
+        /// Spawn a mock terminus-primary that immediately rejects every
+        /// request with a fixed non-2xx `status` and a small plain-text
+        /// `body` -- exercises [`crate::forward::forward_stream`]'s
+        /// open-phase rejection path (no stream ever handed back).
+        pub(crate) async fn spawn_mock_streaming_primary_rejecting(
+            ca: &TestCa,
+            status: u16,
+            body: &'static str,
+        ) -> (String, u16) {
+            let tls_config = server_tls_config(ca, true);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            tokio::spawn(async move {
+                let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+                loop {
+                    let (tcp, _) = match listener.accept().await {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
+                    let acceptor = acceptor.clone();
+                    tokio::spawn(async move {
+                        let Ok(tls) = acceptor.accept(tcp).await else { return };
+                        let io = TokioIo::new(tls);
+                        let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| async move {
+                            let _ = req.into_body().collect().await;
+                            let resp = hyper::Response::builder()
+                                .status(status)
+                                .header("content-type", "text/plain")
+                                .body(Full::new(ByteBuf::from(body)))
+                                .unwrap();
+                            Ok::<_, std::convert::Infallible>(resp)
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, svc).await;
+                    });
+                }
+            });
+
+            (addr.ip().to_string(), addr.port())
+        }
+
+        /// Spawn a mock terminus-primary that writes exactly `first_chunk`
+        /// to the response body, then holds the connection open forever
+        /// without writing any more data or closing the body -- exercises
+        /// [`crate::forward::forward_stream`]'s per-chunk idle-timeout path
+        /// (a stream that opened and yielded real data, then wedged).
+        pub(crate) async fn spawn_mock_streaming_primary_then_stalls(
+            ca: &TestCa,
+            first_chunk: ByteBuf,
+        ) -> (String, u16) {
+            let tls_config = server_tls_config(ca, true);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            tokio::spawn(async move {
+                let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+                loop {
+                    let (tcp, _) = match listener.accept().await {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
+                    let acceptor = acceptor.clone();
+                    let first_chunk = first_chunk.clone();
+                    tokio::spawn(async move {
+                        let Ok(tls) = acceptor.accept(tcp).await else { return };
+                        serve_one_streaming_connection_then_stall(tls, first_chunk).await;
+                    });
+                }
+            });
+
+            (addr.ip().to_string(), addr.port())
+        }
+
+        /// Build a hyper-compatible response body backed by a
+        /// `tokio::sync::mpsc` channel: `tx.send(chunk)` makes `chunk`
+        /// available as the next body frame, and dropping `tx` closes the
+        /// body normally -- the test-side equivalent of hyper 0.14's
+        /// `Body::channel()`, which has no direct hyper-1.x/http-body-util
+        /// counterpart.
+        fn streaming_response_channel() -> (
+            tokio::sync::mpsc::Sender<ByteBuf>,
+            http_body_util::StreamBody<
+                impl futures_core::Stream<Item = Result<hyper::body::Frame<ByteBuf>, std::convert::Infallible>>,
+            >,
+        ) {
+            let (tx, rx) = tokio::sync::mpsc::channel::<ByteBuf>(8);
+            let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
+                .map(|chunk| Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(chunk)));
+            (tx, http_body_util::StreamBody::new(stream))
+        }
+
+        async fn serve_one_streaming_connection(
+            tls: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+            chunks: Arc<Vec<ByteBuf>>,
+            delay_between: std::time::Duration,
+        ) {
+            let io = TokioIo::new(tls);
+            let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                let chunks = chunks.clone();
+                async move {
+                    let _ = req.into_body().collect().await;
+
+                    let (tx, rx_body) = streaming_response_channel();
+                    tokio::spawn(async move {
+                        for (i, chunk) in chunks.iter().enumerate() {
+                            if i > 0 && !delay_between.is_zero() {
+                                tokio::time::sleep(delay_between).await;
+                            }
+                            if tx.send(chunk.clone()).await.is_err() {
+                                return; // client hung up
+                            }
+                        }
+                        // Dropping `tx` here closes the body normally.
+                    });
+
+                    let resp = hyper::Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(rx_body)
+                        .unwrap();
+                    Ok::<_, std::convert::Infallible>(resp)
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, svc).await;
+        }
+
+        async fn serve_one_streaming_connection_then_stall(
+            tls: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+            first_chunk: ByteBuf,
+        ) {
+            let io = TokioIo::new(tls);
+            let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                let first_chunk = first_chunk.clone();
+                async move {
+                    let _ = req.into_body().collect().await;
+
+                    let (tx, rx_body) = streaming_response_channel();
+                    tokio::spawn(async move {
+                        if tx.send(first_chunk).await.is_err() {
+                            return;
+                        }
+                        // Hold the sender open forever without sending more
+                        // data or dropping it -- the body never closes and
+                        // no further chunk ever arrives, simulating a
+                        // wedged mid-stream primary.
+                        std::future::pending::<()>().await;
+                    });
+
+                    let resp = hyper::Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(rx_body)
                         .unwrap();
                     Ok::<_, std::convert::Infallible>(resp)
                 }
