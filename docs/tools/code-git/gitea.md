@@ -2,13 +2,23 @@
 
 # The `gitea` module
 
-`gitea` is Terminus's Gitea source-control integration: 15 `RustTool` implementations
-(`src/gitea/mod.rs:1-19`) covering repository listing/creation, file CRUD, pull-request
-listing/creation/merge, directory/branch listing, Cargo-registry publish/yank, and
-identity introspection. Every tool talks to a self-hosted Gitea instance's REST API
-(`/api/v1/...`) or, for the two Cargo-registry tools, its Cargo package-registry API
-(`/api/packages/...`) over `reqwest`. All 15 tools live in the same source file
-(`src/gitea/mod.rs`); response/request shapes are in `src/gitea/types.rs`.
+`gitea` is Terminus's Gitea source-control integration: 19 `RustTool` implementations
+(`src/gitea/mod.rs`) covering repository listing/creation, file CRUD, branch listing/
+creation/deletion, pull-request listing/creation/merge/close/diff, directory listing,
+Cargo-registry publish/yank, and identity introspection. Every tool talks to a
+self-hosted Gitea instance's REST API (`/api/v1/...`) or, for the two Cargo-registry
+tools, its Cargo package-registry API (`/api/packages/...`) over `reqwest`. All 19
+tools live in the same source file (`src/gitea/mod.rs`); response/request shapes are
+in `src/gitea/types.rs`.
+
+> **EGJS-02 note:** line-number citations below the "Tool reference" heading were
+> written against the pre-EGJS-02 line layout and have drifted after this item's
+> additions (structured-output refactors on `gitea_create_file`/`gitea_update_file`/
+> `gitea_delete_file`/`gitea_create_repo`, the new `patch()` transport helper, and
+> four new tools). They are still accurate as *pointers to the right function*, just
+> not exact line numbers — search by tool/function name instead of trusting the
+> digits. See [EGJS-02 additions](#egjs-02-additions-harmony-egress-remainder) below
+> for what's new.
 
 Two properties set this module apart from a thin REST wrapper:
 
@@ -865,6 +875,63 @@ Response (JSON string):
 
 ---
 
+## EGJS-02 additions (harmony egress remainder)
+
+Closes the Gitea-side gaps left by LHEG-06 (harmony's egress-cutover item):
+harmony's direct-REST bypass surfaces that had no terminus tool equivalent, or
+whose existing tool had no structured (`structuredContent`) output for a
+production write path.
+
+### structuredContent added to existing write tools
+
+`gitea_create_file`, `gitea_update_file`, `gitea_delete_file`, and
+`gitea_create_repo` now override `execute_structured` (via a shared private
+`run()` helper, the same pattern EGJS-01 established for the read tools) so a
+structured-aware caller gets the parsed result instead of having to parse the
+text summary:
+
+- `gitea_create_file` / `gitea_update_file` → the full `GiteaFileResponse`
+  (`content` + `commit`, `src/gitea/types.rs`) as `structuredContent`.
+- `gitea_delete_file` → `{ owner, repo, path, deleted: true, sha }` (Gitea's
+  delete endpoint returns no body, so this is synthesized from what the tool
+  already knows rather than re-read from Gitea).
+- `gitea_create_repo` → `{ full_name, html_url, clone_url, ssh_url }` (the same
+  object the text output already serialized, now also available as
+  `structuredContent` rather than only as a JSON-formatted string).
+
+`gitea_read_file`'s structured output also gained a `content_base64` field
+alongside its existing (lossily UTF-8-decoded) `content` field — the raw,
+un-decoded base64 Gitea returned, for callers whose type contract expects
+base64 (harmony's `FileContent.content_base64`) where re-encoding decoded text
+would corrupt non-UTF-8 file content.
+
+### New tools
+
+- **`gitea_create_branch`** — `POST /repos/{owner}/{repo}/branches` with
+  `{ new_branch_name, old_branch_name? }` (old branch defaults to the repo's
+  default branch server-side if omitted). Returns the new `GiteaBranchInfo` as
+  `structuredContent`.
+- **`gitea_delete_branch`** — `DELETE /repos/{owner}/{repo}/branches/{branch}`
+  (direct `reqwest` call, no response body). A `404` is remapped to a
+  branch-specific `NotFound`.
+- **`gitea_close_pr`** — `PATCH /repos/{owner}/{repo}/pulls/{index}` with
+  `{ "state": "closed" }`, distinct from `gitea_merge_pr` (closes **without**
+  merging). Uses a new `GiteaClient::patch()` transport helper (mirrors `put`'s
+  status handling: `404` → `NotFound`, other non-2xx → `Http`). Returns the
+  updated `GiteaPullRequest` as `structuredContent`.
+- **`gitea_get_pr_diff`** — `GET /repos/{owner}/{repo}/pulls/{index}.diff`,
+  Gitea's raw-diff suffix endpoint (returns `text/plain`, not JSON). Uses
+  `GiteaClient::request_raw()` (already used for binary file content) so
+  non-UTF-8 bytes inside a diff's binary-file hunks are read losslessly, then
+  lossily decoded to UTF-8 only at the very end for both the text summary and
+  `structuredContent.diff`. Production call site this unblocks:
+  `review::reviewer::run_review_batch` in harmony.
+
+All four are registered in `register()` alongside the existing 15, with
+matching `NotConfiguredStub` entries when `GITEA_URL` is unset, and all expose
+the shared optional `identity` argument like every other CRUD tool in the
+module.
+
 ## The PII gate
 
 `pii_check()` (`src/gitea/mod.rs:50-128`) is a hand-rolled scanner run over any content a
@@ -893,17 +960,17 @@ an exhaustive guarantee.
 
 ## Registration
 
-`register()` (`src/gitea/mod.rs:2241-2289`) is called once at Terminus startup. It attempts
+`register()` (`src/gitea/mod.rs`) is called once at Terminus startup. It attempts
 `GiteaClient::from_env()`:
-- **Success:** all 15 tools are registered, each holding a `.clone()` of the same
+- **Success:** all 19 tools are registered, each holding a `.clone()` of the same
   `GiteaClient` (cheap — the `reqwest::Client` and identities map are both internally
   `Arc`-backed).
-- **Failure (`GITEA_URL` unset):** logs a `tracing::warn!` and registers 15
-  `NotConfiguredStub` instances under the identical tool names instead
-  (`mod.rs:2291-2306`), each of which always returns `ToolError::NotConfigured("GITEA_URL
-  environment variable is not set...")`. This means the tools remain visible and
-  self-documenting in the MCP catalog even when Gitea integration isn't configured, rather
-  than silently disappearing.
+- **Failure (`GITEA_URL` unset):** logs a `tracing::warn!` and registers 19
+  `NotConfiguredStub` instances under the identical tool names instead, each of which
+  always returns `ToolError::NotConfigured("GITEA_URL environment variable is not
+  set...")`. This means the tools remain visible and self-documenting in the MCP
+  catalog even when Gitea integration isn't configured, rather than silently
+  disappearing.
 
 ## Testing
 

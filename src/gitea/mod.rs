@@ -484,6 +484,39 @@ impl GiteaClient {
             .map_err(|e| ToolError::Http(format!("JSON parse error: {e}")))
     }
 
+    /// PATCH request sending JSON body, returning parsed JSON. EGJS-02: added
+    /// for `gitea_close_pr` (`PATCH /repos/{owner}/{repo}/pulls/{index}`),
+    /// mirroring `put`'s error mapping.
+    async fn patch<B, T>(&self, path: &str, body: &B) -> Result<T, ToolError>
+    where
+        B: serde::Serialize,
+        T: serde::de::DeserializeOwned,
+    {
+        let url = self.api(path);
+        debug!("PATCH {url}");
+        let resp = self
+            .http
+            .patch(&url)
+            .header("Authorization", self.auth_header())
+            .header("Content-Type", "application/json")
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| ToolError::Http(format!("Request failed: {e}")))?;
+
+        let status = resp.status();
+        if status == StatusCode::NOT_FOUND {
+            return Err(ToolError::NotFound("Resource not found in Gitea".to_string()));
+        }
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(ToolError::Http(format!("Gitea returned {status}: {body_text}")));
+        }
+        resp.json::<T>()
+            .await
+            .map_err(|e| ToolError::Http(format!("JSON parse error: {e}")))
+    }
+
     /// DELETE request sending JSON body; Gitea's delete-file endpoint uses a body.
     async fn delete_with_body<B>(&self, path: &str, body: &B) -> Result<(), ToolError>
     where
@@ -879,6 +912,16 @@ impl RustTool for CreateRepo {
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl CreateRepo {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let org = args["org"].as_str()
             .map(str::trim)
@@ -937,13 +980,13 @@ impl RustTool for CreateRepo {
             .await
             .map_err(|e| ToolError::Http(format!("JSON parse error: {e}")))?;
 
-        Ok(json!({
+        let structured = json!({
             "full_name": repo.get("full_name").and_then(Value::as_str).unwrap_or(""),
             "html_url":  repo.get("html_url").and_then(Value::as_str).unwrap_or(""),
             "clone_url": repo.get("clone_url").and_then(Value::as_str).unwrap_or(""),
             "ssh_url":   repo.get("ssh_url").and_then(Value::as_str).unwrap_or(""),
-        })
-        .to_string())
+        });
+        Ok((structured.to_string(), structured))
     }
 }
 
@@ -976,6 +1019,16 @@ impl RustTool for CreateFile {
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl CreateFile {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let repo = args["repo"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
@@ -1006,13 +1059,16 @@ impl RustTool for CreateFile {
         let endpoint = format!("/repos/{}/{}/contents/{}", owner, repo, path);
         let resp: GiteaFileResponse = client.post(&endpoint, &body).await?;
 
-        Ok(format!(
+        let text = format!(
             "File created: {}/{}/{}\nCommit: {}",
             owner,
             repo,
             path,
             resp.commit.sha,
-        ))
+        );
+        let structured = serde_json::to_value(&resp)
+            .map_err(|e| ToolError::Http(format!("Failed to serialize response: {e}")))?;
+        Ok((text, structured))
     }
 }
 
@@ -1083,6 +1139,11 @@ impl ReadFile {
             "File: {owner}/{repo}/{path}\nSHA: {}\nSize: {} bytes\n\n---\n{text}",
             fc.sha, fc.size
         );
+        // EGJS-02: alongside the decoded UTF-8 `content`, also surface the raw,
+        // un-decoded base64 Gitea returned (`content_base64`) — harmony's
+        // `FileContent.content_base64` type contract expects base64, and
+        // re-encoding the lossily-decoded UTF-8 text would corrupt non-UTF-8
+        // file content (see LHEG-06's `get_file` gap note).
         let structured = json!({
             "owner": owner,
             "repo": repo,
@@ -1090,6 +1151,7 @@ impl ReadFile {
             "sha": fc.sha,
             "size": fc.size,
             "content": text,
+            "content_base64": clean,
         });
         Ok((out, structured))
     }
@@ -1125,6 +1187,16 @@ impl RustTool for UpdateFile {
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl UpdateFile {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let repo = args["repo"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
@@ -1163,10 +1235,13 @@ impl RustTool for UpdateFile {
         let endpoint = format!("/repos/{}/{}/contents/{}", owner, repo, path);
         let resp: GiteaFileResponse = client.put(&endpoint, &body).await?;
 
-        Ok(format!(
+        let text = format!(
             "File updated: {owner}/{repo}/{path}\nCommit: {}",
             resp.commit.sha,
-        ))
+        );
+        let structured = serde_json::to_value(&resp)
+            .map_err(|e| ToolError::Http(format!("Failed to serialize response: {e}")))?;
+        Ok((text, structured))
     }
 }
 
@@ -1198,6 +1273,16 @@ impl RustTool for DeleteFile {
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl DeleteFile {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let repo = args["repo"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
@@ -1215,14 +1300,22 @@ impl RustTool for DeleteFile {
 
         let body = GiteaDeleteFileRequest {
             message: message.to_string(),
-            sha,
+            sha: sha.clone(),
             branch: args["branch"].as_str().map(str::to_string),
         };
 
         let endpoint = format!("/repos/{}/{}/contents/{}", owner, repo, path);
         client.delete_with_body(&endpoint, &body).await?;
 
-        Ok(format!("File deleted: {owner}/{repo}/{path}"))
+        let text = format!("File deleted: {owner}/{repo}/{path}");
+        let structured = json!({
+            "owner": owner,
+            "repo": repo,
+            "path": path,
+            "deleted": true,
+            "sha": sha,
+        });
+        Ok((text, structured))
     }
 }
 
@@ -1601,6 +1694,272 @@ impl ListBranches {
             ));
         }
         Ok((out, structured))
+    }
+}
+
+// ─── EGJS-02: gitea_create_branch ─────────────────────────────────────────────
+//
+// Missing entirely from the terminus-rs catalogue prior to this item — harmony's
+// `git::` bypass surface needed it (LHEG-06 remainder: "Gitea, no tool exists at
+// all on the terminus primary: ... create_branch"). Wraps
+// `POST /repos/{owner}/{repo}/branches`.
+
+pub struct CreateBranch {
+    client: GiteaClient,
+}
+
+#[async_trait]
+impl RustTool for CreateBranch {
+    fn name(&self) -> &str { "gitea_create_branch" }
+
+    fn description(&self) -> &str {
+        "Create a new branch in a Gitea repository from an existing branch (defaults to the repo's default branch)."
+    }
+
+    fn parameters(&self) -> Value {
+        with_identity_param(json!({
+            "type": "object",
+            "properties": {
+                "repo":        { "type": "string", "description": "Repository name" },
+                "branch":      { "type": "string", "description": "New branch name" },
+                "old_branch":  { "type": "string", "description": "Branch to create from (optional, defaults to the repo's default branch)" },
+                "owner":       { "type": "string", "description": "Owner override (optional)" }
+            },
+            "required": ["repo", "branch"]
+        }))
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl CreateBranch {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
+        let client = self.client.resolve_identity(&args)?;
+        let repo = args["repo"].as_str()
+            .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
+        let branch = args["branch"].as_str()
+            .ok_or_else(|| ToolError::InvalidArgument("'branch' is required".to_string()))?;
+        let owner = client.resolve_owner(args["owner"].as_str());
+
+        let mut body = json!({ "new_branch_name": branch });
+        if let Some(old_branch) = args["old_branch"].as_str() {
+            body["old_branch_name"] = json!(old_branch);
+        }
+
+        let endpoint = format!("/repos/{}/{}/branches", owner, repo);
+        let b: GiteaBranchInfo = client.post(&endpoint, &body).await?;
+
+        let text = format!("Branch created: {owner}/{repo}@{}", b.name);
+        let structured = serde_json::to_value(&b)
+            .map_err(|e| ToolError::Http(format!("Failed to serialize branch: {e}")))?;
+        Ok((text, structured))
+    }
+}
+
+// ─── EGJS-02: gitea_delete_branch ─────────────────────────────────────────────
+
+pub struct DeleteBranch {
+    client: GiteaClient,
+}
+
+#[async_trait]
+impl RustTool for DeleteBranch {
+    fn name(&self) -> &str { "gitea_delete_branch" }
+
+    fn description(&self) -> &str {
+        "Delete a branch from a Gitea repository."
+    }
+
+    fn parameters(&self) -> Value {
+        with_identity_param(json!({
+            "type": "object",
+            "properties": {
+                "repo":   { "type": "string", "description": "Repository name" },
+                "branch": { "type": "string", "description": "Branch name to delete" },
+                "owner":  { "type": "string", "description": "Owner override (optional)" }
+            },
+            "required": ["repo", "branch"]
+        }))
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl DeleteBranch {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
+        let client = self.client.resolve_identity(&args)?;
+        let repo = args["repo"].as_str()
+            .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
+        let branch = args["branch"].as_str()
+            .ok_or_else(|| ToolError::InvalidArgument("'branch' is required".to_string()))?;
+        let owner = client.resolve_owner(args["owner"].as_str());
+
+        let endpoint = format!("/repos/{}/{}/branches/{}", owner, repo, branch);
+        let url = client.api(&endpoint);
+        debug!("DELETE {url}");
+        let resp = client
+            .http
+            .delete(&url)
+            .header("Authorization", client.auth_header())
+            .send()
+            .await
+            .map_err(|e| ToolError::Http(format!("Request failed: {e}")))?;
+
+        let status = resp.status();
+        if status == StatusCode::NOT_FOUND {
+            return Err(ToolError::NotFound(format!("Branch '{branch}' not found in {owner}/{repo}")));
+        }
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(ToolError::Http(format!("Gitea returned {status}: {body_text}")));
+        }
+
+        let text = format!("Branch deleted: {owner}/{repo}@{branch}");
+        let structured = json!({ "owner": owner, "repo": repo, "branch": branch, "deleted": true });
+        Ok((text, structured))
+    }
+}
+
+// ─── EGJS-02: gitea_close_pr ──────────────────────────────────────────────────
+//
+// Close a pull request WITHOUT merging it — distinct from `gitea_merge_pr`.
+// Missing from the catalogue prior to this item (LHEG-06 remainder).
+
+pub struct ClosePr {
+    client: GiteaClient,
+}
+
+#[async_trait]
+impl RustTool for ClosePr {
+    fn name(&self) -> &str { "gitea_close_pr" }
+
+    fn description(&self) -> &str {
+        "Close a pull request in a Gitea repository WITHOUT merging it."
+    }
+
+    fn parameters(&self) -> Value {
+        with_identity_param(json!({
+            "type": "object",
+            "properties": {
+                "repo":  { "type": "string", "description": "Repository name" },
+                "pr":    { "type": "integer", "description": "Pull request number" },
+                "owner": { "type": "string", "description": "Owner override (optional)" }
+            },
+            "required": ["repo", "pr"]
+        }))
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl ClosePr {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
+        let client = self.client.resolve_identity(&args)?;
+        let repo = args["repo"].as_str()
+            .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
+        let pr_num = args["pr"].as_u64()
+            .ok_or_else(|| ToolError::InvalidArgument("'pr' must be an integer".to_string()))?;
+        let owner = client.resolve_owner(args["owner"].as_str());
+
+        let body = json!({ "state": "closed" });
+        let endpoint = format!("/repos/{}/{}/pulls/{}", owner, repo, pr_num);
+        let pr: GiteaPullRequest = client.patch(&endpoint, &body).await.map_err(|e| match e {
+            ToolError::NotFound(_) => ToolError::NotFound(format!("Pull request #{pr_num} not found in {owner}/{repo}")),
+            other => other,
+        })?;
+
+        let text = format!("Pull request #{} closed in {owner}/{repo}.", pr.number);
+        let structured = serde_json::to_value(&pr)
+            .map_err(|e| ToolError::Http(format!("Failed to serialize pull request: {e}")))?;
+        Ok((text, structured))
+    }
+}
+
+// ─── EGJS-02: gitea_get_pr_diff ───────────────────────────────────────────────
+//
+// Missing from the catalogue prior to this item; production call site was
+// `review::reviewer::run_review_batch` in harmony (LHEG-06 remainder). Wraps
+// Gitea's `.diff` suffix endpoint, which returns raw unified-diff text rather
+// than JSON — reuses `GiteaClient::request_raw` (already used for binary file
+// content) so non-UTF-8 diff bytes are never corrupted before the lossy
+// `String::from_utf8_lossy` at the very end (a unified diff is text but may
+// contain non-UTF-8 bytes inside binary-file hunks).
+
+pub struct GetPrDiff {
+    client: GiteaClient,
+}
+
+#[async_trait]
+impl RustTool for GetPrDiff {
+    fn name(&self) -> &str { "gitea_get_pr_diff" }
+
+    fn description(&self) -> &str {
+        "Get the unified diff for a pull request in a Gitea repository."
+    }
+
+    fn parameters(&self) -> Value {
+        with_identity_param(json!({
+            "type": "object",
+            "properties": {
+                "repo":  { "type": "string", "description": "Repository name" },
+                "pr":    { "type": "integer", "description": "Pull request number" },
+                "owner": { "type": "string", "description": "Owner override (optional)" }
+            },
+            "required": ["repo", "pr"]
+        }))
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl GetPrDiff {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
+        let client = self.client.resolve_identity(&args)?;
+        let repo = args["repo"].as_str()
+            .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
+        let pr_num = args["pr"].as_u64()
+            .ok_or_else(|| ToolError::InvalidArgument("'pr' must be an integer".to_string()))?;
+        let owner = client.resolve_owner(args["owner"].as_str());
+
+        let endpoint = format!("/repos/{}/{}/pulls/{}.diff", owner, repo, pr_num);
+        let bytes = client.request_raw(reqwest::Method::GET, &endpoint).await.map_err(|e| match e {
+            ToolError::NotFound(_) => ToolError::NotFound(format!("Pull request #{pr_num} not found in {owner}/{repo}")),
+            other => other,
+        })?;
+        let diff = String::from_utf8_lossy(&bytes).to_string();
+
+        let text = format!("Diff for PR #{pr_num} in {owner}/{repo} ({} bytes):\n\n{diff}", bytes.len());
+        let structured = json!({
+            "owner": owner,
+            "repo": repo,
+            "pr": pr_num,
+            "diff": diff,
+        });
+        Ok((text, structured))
     }
 }
 
@@ -2333,7 +2692,13 @@ pub fn register(registry: &mut ToolRegistry) {
             let _ = registry.register(Box::new(CargoPublish { client: client.clone() }));
             let _ = registry.register(Box::new(CargoYank { client: client.clone() }));
             let _ = registry.register(Box::new(GiteaListIdentities { client: client.clone() }));
-            let _ = registry.register(Box::new(ListDirectory { client }));
+            let _ = registry.register(Box::new(ListDirectory { client: client.clone() }));
+            // EGJS-02: harmony egress remainder — tools that did not exist at all
+            // on the terminus primary (LHEG-06 gap notes).
+            let _ = registry.register(Box::new(CreateBranch { client: client.clone() }));
+            let _ = registry.register(Box::new(DeleteBranch { client: client.clone() }));
+            let _ = registry.register(Box::new(ClosePr { client: client.clone() }));
+            let _ = registry.register(Box::new(GetPrDiff { client }));
         }
         Err(e) => {
             tracing::warn!("Gitea tools not configured: {e}. Registering no-op stubs.");
@@ -2362,6 +2727,10 @@ pub fn register(registry: &mut ToolRegistry) {
             stub!("gitea_cargo_yank", "Yank/unyank a crate version in the Gitea Cargo registry (not configured)");
             stub!("gitea_list_identities", "List configured Gitea identities (not configured)");
             stub!("gitea_list_directory", "List directory contents in Gitea (not configured)");
+            stub!("gitea_create_branch", "Create a branch in a Gitea repository (not configured)");
+            stub!("gitea_delete_branch", "Delete a branch from a Gitea repository (not configured)");
+            stub!("gitea_close_pr", "Close a Gitea pull request without merging (not configured)");
+            stub!("gitea_get_pr_diff", "Get the diff for a Gitea pull request (not configured)");
         }
     }
 }
@@ -4228,5 +4597,284 @@ mod tests {
         assert!(dbg.contains("<redacted>"));
 
         clear_gpat_env();
+    }
+
+    // ── EGJS-02: structuredContent on existing write tools ─────────────────
+
+    #[tokio::test]
+    async fn test_create_file_structured_content_has_commit_sha() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/repos/testorg/myrepo/contents/README.md");
+            then.status(201).json_body(serde_json::json!({
+                "content": null,
+                "commit": {"sha": "abc123", "url": "http://example.com", "html_url": "http://example.com", "message": "init"}
+            }));
+        });
+        let tool = CreateFile { client: mock_client(&server) };
+        let output = tool.execute_structured(serde_json::json!({
+            "repo": "myrepo", "path": "README.md", "content": "# Hello world", "message": "init"
+        })).await.unwrap();
+        let structured = output.structured.expect("structuredContent must be present");
+        assert_eq!(structured["commit"]["sha"], "abc123");
+    }
+
+    #[tokio::test]
+    async fn test_update_file_structured_content_has_commit_sha() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/repos/testorg/myrepo/contents/README.md");
+            then.status(200).json_body(serde_json::json!({
+                "type": "file", "encoding": "base64", "size": 5, "name": "README.md",
+                "path": "README.md", "content": "aGVsbG8=", "sha": "oldsha",
+                "url": "http://example.com", "html_url": "http://example.com"
+            }));
+        });
+        server.mock(|when, then| {
+            when.method(PUT)
+                .path("/api/v1/repos/testorg/myrepo/contents/README.md");
+            then.status(200).json_body(serde_json::json!({
+                "content": null,
+                "commit": {"sha": "def456", "url": "http://example.com", "html_url": "http://example.com", "message": "update"}
+            }));
+        });
+        let tool = UpdateFile { client: mock_client(&server) };
+        let output = tool.execute_structured(serde_json::json!({
+            "repo": "myrepo", "path": "README.md", "content": "new content", "message": "update"
+        })).await.unwrap();
+        let structured = output.structured.expect("structuredContent must be present");
+        assert_eq!(structured["commit"]["sha"], "def456");
+    }
+
+    #[tokio::test]
+    async fn test_delete_file_structured_content() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/repos/testorg/myrepo/contents/stale.md");
+            then.status(200).json_body(serde_json::json!({
+                "type": "file", "encoding": "base64", "size": 5, "name": "stale.md",
+                "path": "stale.md", "content": "aGVsbG8=", "sha": "delsha",
+                "url": "http://example.com", "html_url": "http://example.com"
+            }));
+        });
+        server.mock(|when, then| {
+            when.method(DELETE)
+                .path("/api/v1/repos/testorg/myrepo/contents/stale.md");
+            then.status(200).json_body(serde_json::json!({}));
+        });
+        let tool = DeleteFile { client: mock_client(&server) };
+        let output = tool.execute_structured(serde_json::json!({
+            "repo": "myrepo", "path": "stale.md", "message": "remove"
+        })).await.unwrap();
+        let structured = output.structured.expect("structuredContent must be present");
+        assert_eq!(structured["deleted"], true);
+        assert_eq!(structured["path"], "stale.md");
+        assert_eq!(structured["sha"], "delsha");
+    }
+
+    #[tokio::test]
+    async fn test_create_repo_structured_content() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/api/v1/orgs/moosenet/repos");
+            then.status(201).json_body(serde_json::json!({
+                "full_name": "moosenet/new-tool",
+                "html_url": "http://example.com/moosenet/new-tool",
+                "clone_url": "http://example.com/moosenet/new-tool.git",
+                "ssh_url": "<email>:moosenet/new-tool.git" // pii-test-fixture
+            }));
+        });
+        let tool = CreateRepo { client: mock_client(&server) };
+        let output = tool.execute_structured(serde_json::json!({
+            "org": "moosenet", "name": "new-tool"
+        })).await.unwrap();
+        let structured = output.structured.expect("structuredContent must be present");
+        assert_eq!(structured["full_name"], "moosenet/new-tool");
+    }
+
+    #[tokio::test]
+    async fn test_read_file_structured_content_has_base64() {
+        let server = MockServer::start();
+        let encoded = base64::engine::general_purpose::STANDARD.encode("Hello, Gitea!");
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/repos/testorg/myrepo/contents/hello.txt");
+            then.status(200).json_body(serde_json::json!({
+                "type": "file", "encoding": "base64", "size": 13, "name": "hello.txt",
+                "path": "hello.txt", "content": encoded, "sha": "deadbeef",
+                "url": "http://example.com", "html_url": "http://example.com"
+            }));
+        });
+        let tool = ReadFile { client: mock_client(&server) };
+        let output = tool.execute_structured(serde_json::json!({"repo": "myrepo", "path": "hello.txt"})).await.unwrap();
+        let structured = output.structured.expect("structuredContent must be present");
+        assert_eq!(structured["content"], "Hello, Gitea!");
+        assert_eq!(structured["content_base64"], encoded);
+    }
+
+    // ── EGJS-02: new tools ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_branch_correct_request() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/repos/testorg/myrepo/branches")
+                .json_body(serde_json::json!({"new_branch_name": "feature/x", "old_branch_name": "main"}));
+            then.status(201).json_body(serde_json::json!({
+                "name": "feature/x",
+                "commit": {"id": "abcdef1234567890", "message": "init", "timestamp": "2026-01-01T00:00:00Z"},
+                "protected": false
+            }));
+        });
+        let tool = CreateBranch { client: mock_client(&server) };
+        let output = tool.execute_structured(serde_json::json!({
+            "repo": "myrepo", "branch": "feature/x", "old_branch": "main"
+        })).await.unwrap();
+        mock.assert();
+        let structured = output.structured.expect("structuredContent must be present");
+        assert_eq!(structured["name"], "feature/x");
+        assert!(output.text.contains("feature/x"));
+    }
+
+    #[tokio::test]
+    async fn test_create_branch_requires_repo_and_branch() {
+        let server = MockServer::start();
+        let tool = CreateBranch { client: mock_client(&server) };
+        let err = tool.execute(serde_json::json!({"repo": "myrepo"})).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn test_delete_branch_correct_request() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(DELETE)
+                .path("/api/v1/repos/testorg/myrepo/branches/feature/x");
+            then.status(204);
+        });
+        let tool = DeleteBranch { client: mock_client(&server) };
+        let output = tool.execute_structured(serde_json::json!({
+            "repo": "myrepo", "branch": "feature/x"
+        })).await.unwrap();
+        mock.assert();
+        let structured = output.structured.expect("structuredContent must be present");
+        assert_eq!(structured["deleted"], true);
+    }
+
+    #[tokio::test]
+    async fn test_delete_branch_404_returns_not_found() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(DELETE)
+                .path("/api/v1/repos/testorg/myrepo/branches/ghost");
+            then.status(404).json_body(serde_json::json!({"message": "Not Found"}));
+        });
+        let tool = DeleteBranch { client: mock_client(&server) };
+        let err = tool.execute(serde_json::json!({"repo": "myrepo", "branch": "ghost"})).await.unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn test_close_pr_correct_request() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::PATCH)
+                .path("/api/v1/repos/testorg/myrepo/pulls/5")
+                .json_body(serde_json::json!({"state": "closed"}));
+            then.status(200).json_body(serde_json::json!({
+                "id": 1, "number": 5, "state": "closed", "title": "Some PR", "body": null,
+                "html_url": "http://example.com/pulls/5",
+                "user": {"login": "moose", "full_name": null},
+                "head": {"label": "h", "ref": "feature", "sha": "abc", "repo": null},
+                "base": {"label": "b", "ref": "main", "sha": "def", "repo": null},
+                "mergeable": null, "merged": false,
+                "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+            }));
+        });
+        let tool = ClosePr { client: mock_client(&server) };
+        let output = tool.execute_structured(serde_json::json!({"repo": "myrepo", "pr": 5})).await.unwrap();
+        mock.assert();
+        let structured = output.structured.expect("structuredContent must be present");
+        assert_eq!(structured["state"], "closed");
+        assert_eq!(structured["number"], 5);
+    }
+
+    #[tokio::test]
+    async fn test_close_pr_404_returns_not_found() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::PATCH)
+                .path("/api/v1/repos/testorg/myrepo/pulls/99");
+            then.status(404).json_body(serde_json::json!({"message": "Not Found"}));
+        });
+        let tool = ClosePr { client: mock_client(&server) };
+        let err = tool.execute(serde_json::json!({"repo": "myrepo", "pr": 99})).await.unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn test_get_pr_diff_returns_raw_diff_text() {
+        let server = MockServer::start();
+        let diff_text = "diff --git a/foo b/foo\n--- a/foo\n+++ b/foo\n@@ -1 +1 @@\n-old\n+new\n";
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/repos/testorg/myrepo/pulls/7.diff");
+            then.status(200).body(diff_text);
+        });
+        let tool = GetPrDiff { client: mock_client(&server) };
+        let output = tool.execute_structured(serde_json::json!({"repo": "myrepo", "pr": 7})).await.unwrap();
+        mock.assert();
+        let structured = output.structured.expect("structuredContent must be present");
+        assert_eq!(structured["diff"], diff_text);
+        assert!(output.text.contains("old"));
+    }
+
+    #[tokio::test]
+    async fn test_get_pr_diff_404_returns_not_found() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/repos/testorg/myrepo/pulls/404.diff");
+            then.status(404).body("Not Found");
+        });
+        let tool = GetPrDiff { client: mock_client(&server) };
+        let err = tool.execute(serde_json::json!({"repo": "myrepo", "pr": 404})).await.unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[test]
+    fn test_new_tools_expose_optional_identity_param() {
+        let server = MockServer::start();
+        let client = mock_client(&server);
+        for schema in [
+            CreateBranch { client: client.clone() }.parameters(),
+            DeleteBranch { client: client.clone() }.parameters(),
+            ClosePr { client: client.clone() }.parameters(),
+            GetPrDiff { client }.parameters(),
+        ] {
+            assert_eq!(schema["properties"]["identity"]["type"], "string");
+            let required = schema["required"].as_array().unwrap();
+            assert!(!required.iter().any(|r| r == "identity"));
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_register_configured_registers_new_tools() {
+        clear_gpat_env();
+        std::env::set_var("GITEA_URL", "http://example.com");
+        let mut registry = ToolRegistry::new();
+        register(&mut registry);
+        let names: Vec<String> = registry.list().into_iter().map(|t| t.name).collect();
+        for name in [
+            "gitea_create_branch", "gitea_delete_branch", "gitea_close_pr", "gitea_get_pr_diff",
+        ] {
+            assert!(names.iter().any(|n| n == name), "{name} must be registered");
+        }
+        std::env::remove_var("GITEA_URL");
     }
 }

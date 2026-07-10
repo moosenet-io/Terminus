@@ -51,6 +51,14 @@ pub struct Issue {
     pub due_date: Option<String>,
     #[serde(default)]
     pub completed_at: Option<String>,
+    /// Parent issue UUID, when this issue is a sub-issue (null otherwise).
+    /// EGJS-02: added because harmony's EPIC dependency graph
+    /// (`task_queue::queue`, `conductor::orchestrator::subtask_dependencies_satisfied`)
+    /// needs `parent` on the structured `Issue` and previously had no way to
+    /// get it without staying on direct Plane REST (see harmony's LHEG-06
+    /// completion notes).
+    #[serde(default)]
+    pub parent: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
