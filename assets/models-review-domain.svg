@@ -1,0 +1,98 @@
+<svg width="1280" height="760" viewBox="0 0 1280 760" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bgDom" cx="50%" cy="28%" r="88%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadowDom" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrowDom" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+
+  <rect width="1280" height="760" fill="url(#bgDom)"/>
+
+  <text x="640" y="48" text-anchor="middle" fill="#b9b0d8" font-size="14" letter-spacing="6" font-weight="500">TOOL DOMAIN</text>
+  <text x="640" y="84" text-anchor="middle" fill="#ffffff" font-size="30" font-weight="700" letter-spacing="2">MODELS &amp; REVIEW · 7 MODULES · 21 TOOLS</text>
+  <line x1="440" y1="102" x2="840" y2="102" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <!-- MINT / intake -->
+  <rect x="90" y="140" width="290" height="96" rx="12" fill="#241c42" stroke="#7c5cff" stroke-width="1.6" filter="url(#cardShadowDom)"/>
+  <circle cx="114" cy="166" r="5" fill="#8b5cf6"/>
+  <text x="128" y="171" fill="#e8e3f7" font-size="14.5" font-weight="700">intake (MINT front door)</text>
+  <text x="110" y="192" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">model_intake · _status · _compare</text>
+  <text x="110" y="208" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">_fleet · 4 tools · Postgres</text>
+  <text x="110" y="224" fill="#cbc4e6" font-size="10" font-family="'Courier New',monospace">measures models → operational profile</text>
+
+  <!-- dgem -->
+  <rect x="410" y="140" width="230" height="96" rx="12" fill="#241c42" stroke="#10b981" stroke-width="1.6" filter="url(#cardShadowDom)"/>
+  <circle cx="434" cy="166" r="5" fill="#10b981"/>
+  <text x="448" y="171" fill="#e8e3f7" font-size="14.5" font-weight="700">dgem</text>
+  <text x="430" y="192" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">generate · review · status</text>
+  <text x="430" y="208" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">batch · 4 tools · $0 local</text>
+  <text x="430" y="224" fill="#9bd8bc" font-size="10" font-family="'Courier New',monospace">persistent daemon, loopback HTTP</text>
+
+  <!-- review -->
+  <rect x="660" y="140" width="230" height="96" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1.4" filter="url(#cardShadowDom)"/>
+  <circle cx="684" cy="166" r="5" fill="#4a6cf6"/>
+  <text x="698" y="171" fill="#e8e3f7" font-size="14.5" font-weight="700">review</text>
+  <text x="680" y="192" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">review_run · 1 tool</text>
+  <text x="680" y="208" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">5 providers · 4 structures</text>
+  <text x="680" y="224" fill="#a9bdfa" font-size="10" font-family="'Courier New',monospace">daemon + OpenRouter fan-out</text>
+
+  <!-- wizard -->
+  <rect x="910" y="140" width="280" height="96" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1.4" filter="url(#cardShadowDom)"/>
+  <circle cx="934" cy="166" r="5" fill="#4a6cf6"/>
+  <text x="948" y="171" fill="#e8e3f7" font-size="14.5" font-weight="700">wizard</text>
+  <text x="930" y="192" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">consult · status · history</text>
+  <text x="930" y="208" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">3 tools · via Chord proxy</text>
+  <text x="930" y="224" fill="#a9bdfa" font-size="10" font-family="'Courier New',monospace">deep-reasoning council</text>
+
+  <!-- model_advisor -->
+  <rect x="90" y="268" width="290" height="96" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1.4" filter="url(#cardShadowDom)"/>
+  <circle cx="114" cy="294" r="5" fill="#8b5cf6"/>
+  <text x="128" y="299" fill="#e8e3f7" font-size="14.5" font-weight="700">model_advisor</text>
+  <text x="110" y="320" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">recommend · check_fit</text>
+  <text x="110" y="336" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">query_ollama · 3 tools</text>
+  <text x="110" y="352" fill="#cbc4e6" font-size="10" font-family="'Courier New',monospace">bundled YAML, VRAM budget fit</text>
+
+  <!-- litellm -->
+  <rect x="410" y="268" width="230" height="96" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1.4" filter="url(#cardShadowDom)"/>
+  <circle cx="434" cy="294" r="5" fill="#4a6cf6"/>
+  <text x="448" y="299" fill="#e8e3f7" font-size="14.5" font-weight="700">litellm</text>
+  <text x="430" y="320" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">list_models · model_status</text>
+  <text x="430" y="336" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">request_log · 3 tools</text>
+  <text x="430" y="352" fill="#a9bdfa" font-size="10" font-family="'Courier New',monospace">read-only, master-key auth</text>
+
+  <!-- serving -->
+  <rect x="660" y="268" width="230" height="96" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1.4" filter="url(#cardShadowDom)"/>
+  <circle cx="684" cy="294" r="5" fill="#4a6cf6"/>
+  <text x="698" y="299" fill="#e8e3f7" font-size="14.5" font-weight="700">serving</text>
+  <text x="680" y="320" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">profile_get · residency_status</text>
+  <text x="680" y="336" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">profile_refresh · 3 tools</text>
+  <text x="680" y="352" fill="#a9bdfa" font-size="10" font-family="'Courier New',monospace">reads MINT output + Chord state</text>
+
+  <!-- connecting arrows: intake -> serving/model_advisor -->
+  <path d="M280 236 C 280 400, 780 260, 780 268" stroke="#7c5cff" stroke-width="1.6" fill="none" marker-end="url(#arrowDom)" opacity="0.7"/>
+  <path d="M240 236 C 200 340, 180 250, 220 268" stroke="#7c5cff" stroke-width="1.6" fill="none" marker-end="url(#arrowDom)" opacity="0.7"/>
+  <text x="330" y="405" fill="#c9b8ff" font-size="10.5" font-family="'Courier New',monospace">MINT measures → serving_profile / operational profile rows</text>
+
+  <!-- dgem -> review arrow (precedent) -->
+  <path d="M640 188 L660 188" stroke="#10b981" stroke-width="1.6" fill="none" marker-end="url(#arrowDom)"/>
+  <text x="600" y="248" fill="#9bd8bc" font-size="9.5" font-family="'Courier New',monospace">daemon-over-HTTP precedent</text>
+
+  <!-- governance band -->
+  <rect x="150" y="440" width="980" height="130" rx="14" fill="#1d1736" stroke="#5b4b9b" stroke-width="1.3" filter="url(#cardShadowDom)"/>
+  <text x="175" y="468" fill="#a78bff" font-size="12.5" letter-spacing="3" font-weight="600">TWO REVIEW SHAPES · TWO STATUS LAYERS</text>
+  <g font-size="11" fill="#cbc4e6" font-family="'Courier New',monospace">
+    <text x="175" y="494">dgem_review: single local $0 reviewer, fixed template  ·  review_run: up to 5 providers, 4 aggregation structures, fail-safe verdicts</text>
+    <text x="175" y="516">litellm_model_status: LiteLLM-proxy-level health check  ·  serving_residency_status: Chord-specific, VRAM/role-aware live residency</text>
+    <text x="175" y="538" fill="#9b92c0">wizard_consult ≠ review_run — one synthesized council answer vs. a per-provider verdict panel.</text>
+  </g>
+
+  <!-- footer -->
+  <rect x="150" y="600" width="980" height="58" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="626" text-anchor="middle" fill="#cbc4e6" font-size="13" font-weight="600">PROFILE · REVIEW · CONSULT · RECOMMEND · STATUS — ONE DOMAIN, SEVEN MODULES, 21 MCP TOOLS</text>
+  <text x="640" y="646" text-anchor="middle" fill="#8d84ad" font-size="11" font-family="'Courier New',monospace">every output sanitized: env-var NAMES only, role/id fields, never hosts or secret values</text>
+
+  <text x="640" y="700" text-anchor="middle" fill="#564d75" font-size="11.5" letter-spacing="0.4">docs/tools/models-review/ — one page per module, MINT's harness internals live in tools/mint/.</text>
+</svg>

@@ -1,0 +1,70 @@
+<svg width="1280" height="640" viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bgDg" cx="50%" cy="28%" r="88%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadowDg" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrowDg" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+    <marker id="arrowGreenDg" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#10b981"/></marker>
+  </defs>
+  <rect width="1280" height="640" fill="url(#bgDg)"/>
+
+  <text x="640" y="46" text-anchor="middle" fill="#b9b0d8" font-size="14" letter-spacing="6" font-weight="500">src/dgem/</text>
+  <text x="640" y="80" text-anchor="middle" fill="#ffffff" font-size="28" font-weight="700" letter-spacing="2">DGEM · PERSISTENT LOCAL DIFFUSIONGEMMA DAEMON</text>
+  <line x1="440" y1="98" x2="840" y2="98" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <!-- 4 tools -->
+  <g font-size="12.5" font-weight="700">
+    <rect x="90" y="128" width="250" height="66" rx="10" fill="#241c42" stroke="#7c5cff" stroke-width="1.4"/>
+    <circle cx="112" cy="150" r="5" fill="#8b5cf6"/><text x="126" y="155" fill="#e8e3f7">dgem_generate</text>
+    <text x="110" y="176" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace" font-weight="400">system+user → thinking / response</text>
+
+    <rect x="360" y="128" width="250" height="66" rx="10" fill="#241c42" stroke="#7c5cff" stroke-width="1.4"/>
+    <circle cx="382" cy="150" r="5" fill="#8b5cf6"/><text x="396" y="155" fill="#e8e3f7">dgem_review</text>
+    <text x="380" y="176" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace" font-weight="400">diff+criteria → verdict + issues</text>
+
+    <rect x="630" y="128" width="250" height="66" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1.2"/>
+    <circle cx="652" cy="150" r="5" fill="#4a6cf6"/><text x="666" y="155" fill="#e8e3f7">dgem_status</text>
+    <text x="650" y="176" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace" font-weight="400">running / model_loaded / uptime</text>
+
+    <rect x="900" y="128" width="270" height="66" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1.2"/>
+    <circle cx="922" cy="150" r="5" fill="#4a6cf6"/><text x="936" y="155" fill="#e8e3f7">dgem_batch</text>
+    <text x="920" y="176" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace" font-weight="400">N jobs, sequential, one model load</text>
+  </g>
+
+  <path d="M215 194 L215 240" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowDg)"/>
+  <path d="M485 194 L485 240" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowDg)"/>
+  <path d="M755 194 L755 240" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowDg)"/>
+  <path d="M1035 194 L1035 240" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowDg)"/>
+
+  <!-- reqwest loopback HTTP -->
+  <rect x="140" y="248" width="1000" height="52" rx="10" fill="#1d1736" stroke="#5b4b9b" stroke-width="1.2"/>
+  <text x="640" y="280" text-anchor="middle" fill="#cbc4e6" font-size="12.5" font-family="'Courier New',monospace">reqwest over loopback HTTP — DgemConfig::generate() / status() — no subprocess (RustTool contract, src/tool.rs)</text>
+
+  <path d="M640 300 L640 336" stroke="#10b981" stroke-width="1.8" marker-end="url(#arrowGreenDg)"/>
+
+  <!-- daemon box -->
+  <rect x="380" y="346" width="520" height="110" rx="14" fill="#241c42" stroke="#10b981" stroke-width="1.8" filter="url(#cardShadowDg)"/>
+  <text x="640" y="374" text-anchor="middle" fill="#9bd8bc" font-size="13" letter-spacing="3" font-weight="600">llama-diffusion-daemon (C++, GPU host)</text>
+  <text x="640" y="398" text-anchor="middle" fill="#e8e3f7" font-size="11.5" font-family="'Courier New',monospace">loads GGUF once, serves many · idle-unload frees VRAM</text>
+  <text x="640" y="418" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">cold load ~36-40s · warm ~9s / 256-token canvas</text>
+  <text x="640" y="440" text-anchor="middle" fill="#9bd8bc" font-size="10.5" font-family="'Courier New',monospace">$0, no cloud call</text>
+
+  <!-- vram coordination side note -->
+  <rect x="960" y="346" width="220" height="110" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1.2"/>
+  <text x="980" y="370" fill="#a78bff" font-size="11" letter-spacing="2" font-weight="600">VRAM COORD</text>
+  <text x="978" y="390" fill="#a89fc8" font-size="9.5" font-family="'Courier New',monospace">DGEM_COORDINATE_VRAM</text>
+  <text x="978" y="406" fill="#a89fc8" font-size="9.5" font-family="'Courier New',monospace">default OFF · best-effort</text>
+  <text x="978" y="422" fill="#a89fc8" font-size="9.5" font-family="'Courier New',monospace">unloads Ollama models first</text>
+  <text x="978" y="438" fill="#9b92c0" font-size="9.5" font-family="'Courier New',monospace">restore = implicit lazy-load</text>
+
+  <path d="M900 400 L960 400" stroke="#4a6cf6" stroke-width="1.4" marker-end="url(#arrowDg)" opacity="0.7"/>
+
+  <!-- footer -->
+  <rect x="150" y="490" width="980" height="80" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="516" text-anchor="middle" fill="#cbc4e6" font-size="12.5" font-weight="600">DUAL GUARD: check_input_size (all 4 tools, hard OOM cap) · check_review_size (review only, latency + OOM)</text>
+  <text x="640" y="538" text-anchor="middle" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">DGEM_MAX_INPUT_TOKENS=10000 · DGEM_LATENCY_FALLBACK_TOKENS=4000 → above it, fall back to Haiku for speed</text>
+  <text x="640" y="558" text-anchor="middle" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">split_thinking() separates &lt;|channel&gt;thought trace from the final answer before it reaches a caller</text>
+</svg>

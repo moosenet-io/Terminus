@@ -1,0 +1,65 @@
+<svg width="1280" height="620" viewBox="0 0 1280 620" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bgSv" cx="50%" cy="28%" r="88%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadowSv" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrowSv" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+  <rect width="1280" height="620" fill="url(#bgSv)"/>
+
+  <text x="640" y="46" text-anchor="middle" fill="#b9b0d8" font-size="14" letter-spacing="6" font-weight="500">src/tools/serving_tools.rs · S85 SRV-07</text>
+  <text x="640" y="80" text-anchor="middle" fill="#ffffff" font-size="28" font-weight="700" letter-spacing="2">SERVING · PROFILE &amp; RESIDENCY STATUS</text>
+  <line x1="440" y1="98" x2="840" y2="98" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <!-- 3 tools -->
+  <g font-size="12" font-weight="700">
+    <rect x="90" y="126" width="330" height="80" rx="10" fill="#241c42" stroke="#7c5cff" stroke-width="1.4"/>
+    <circle cx="112" cy="150" r="5" fill="#8b5cf6"/><text x="126" y="155" fill="#e8e3f7">serving_profile_get</text>
+    <text x="110" y="176" fill="#a89fc8" font-size="9.5" font-family="'Courier New',monospace" font-weight="400">model_id → runtime, tok/s, flags, keep_warm</text>
+    <text x="110" y="192" fill="#9b92c0" font-size="9.5" font-family="'Courier New',monospace" font-weight="400">SELECT ... FROM serving_profile</text>
+
+    <rect x="460" y="126" width="330" height="80" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1.2"/>
+    <circle cx="482" cy="150" r="5" fill="#4a6cf6"/><text x="496" y="155" fill="#e8e3f7">serving_residency_status</text>
+    <text x="480" y="176" fill="#a89fc8" font-size="9.5" font-family="'Courier New',monospace" font-weight="400">residents by role, free VRAM, pinned chat</text>
+    <text x="480" y="192" fill="#9b92c0" font-size="9.5" font-family="'Courier New',monospace" font-weight="400">reads Chord's snapshot file</text>
+
+    <rect x="830" y="126" width="330" height="80" rx="10" fill="#241c42" stroke="#f97373" stroke-width="1.4"/>
+    <circle cx="852" cy="150" r="5" fill="#f97373"/><text x="866" y="155" fill="#e8e3f7">serving_profile_refresh</text>
+    <text x="850" y="176" fill="#a89fc8" font-size="9.5" font-family="'Courier New',monospace" font-weight="400">the ONE mutating tool</text>
+    <text x="850" y="192" fill="#9b92c0" font-size="9.5" font-family="'Courier New',monospace" font-weight="400">POST &lt;chord&gt;/serving/reload</text>
+  </g>
+
+  <path d="M255 206 L255 250" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowSv)"/>
+  <path d="M625 206 L625 250" stroke="#4a6cf6" stroke-width="1.6" marker-end="url(#arrowSv)"/>
+  <path d="M995 206 L995 250" stroke="#f97373" stroke-width="1.6" marker-end="url(#arrowSv)"/>
+
+  <!-- postgres -->
+  <rect x="120" y="258" width="270" height="70" rx="10" fill="#19161f" stroke="#3a3358" stroke-width="1.2"/>
+  <text x="255" y="284" text-anchor="middle" fill="#a9bdfa" font-size="11" font-weight="600">serving_profile TABLE</text>
+  <text x="255" y="304" text-anchor="middle" fill="#8d84ad" font-size="9.5" font-family="'Courier New',monospace">Postgres · MINT serving harness writes</text>
+
+  <!-- snapshot file -->
+  <rect x="490" y="258" width="270" height="70" rx="10" fill="#19161f" stroke="#3a3358" stroke-width="1.2"/>
+  <text x="625" y="284" text-anchor="middle" fill="#a9bdfa" font-size="11" font-weight="600">CHORD RESIDENCY SNAPSHOT</text>
+  <text x="625" y="304" text-anchor="middle" fill="#8d84ad" font-size="9.5" font-family="'Courier New',monospace">CHORD_RESIDENCY_STATE_PATH · missing=IDLE</text>
+
+  <!-- chord control -->
+  <rect x="860" y="258" width="270" height="70" rx="10" fill="#19161f" stroke="#3a3358" stroke-width="1.2"/>
+  <text x="995" y="284" text-anchor="middle" fill="#f3b0b0" font-size="11" font-weight="600">CHORD CONTROL ENDPOINT</text>
+  <text x="995" y="304" text-anchor="middle" fill="#8d84ad" font-size="9.5" font-family="'Courier New',monospace">CHORD_CONTROL_URL · never echoed</text>
+
+  <!-- S6 sanitization band -->
+  <rect x="150" y="370" width="980" height="150" rx="14" fill="#1d1736" stroke="#5b4b9b" stroke-width="1.3" filter="url(#cardShadowSv)"/>
+  <text x="175" y="398" fill="#a78bff" font-size="12.5" letter-spacing="3" font-weight="600">S6 SANITIZATION — TYPED, ALLOW-LISTED OUTPUT ONLY</text>
+  <g font-size="11" font-family="'Courier New',monospace" fill="#cbc4e6">
+    <text x="175" y="424">env_json → env_flag_names(): sorted KEY set only — launch-flag NAMES, never their gfx-id / lib-path VALUES</text>
+    <text x="175" y="446">residents reported by ROLE (chat/keep-warm/transient) + model id — never an endpoint or host</text>
+    <text x="175" y="468">Chord control URL / residency-state PATH read from config but NEVER echoed — errors are generic</text>
+    <text x="175" y="490" fill="#9b92c0">DB failures → "serving profile store unavailable" (never the connection string)</text>
+  </g>
+
+  <text x="640" y="570" text-anchor="middle" fill="#564d75" font-size="11.5" letter-spacing="0.4">Read-mostly operator surface over MINT's measured data and Chord's live residency state.</text>
+</svg>

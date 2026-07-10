@@ -1,0 +1,53 @@
+<svg width="1280" height="440" viewBox="0 0 1280 440" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bgCrucible" cx="50%" cy="30%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadowC" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrowC" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+
+  <rect width="1280" height="440" fill="url(#bgCrucible)"/>
+
+  <text x="640" y="44" text-anchor="middle" fill="#b9b0d8" font-size="13" letter-spacing="6" font-weight="500">PERSONAL-LIFE · LEARNING</text>
+  <text x="640" y="76" text-anchor="middle" fill="#ffffff" font-size="26" font-weight="700" letter-spacing="2">CRUCIBLE — 10 TOOLS, SSH-EXEC (NOT HTTP)</text>
+
+  <rect x="60" y="130" width="210" height="66" rx="12" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadowC)"/>
+  <text x="165" y="158" text-anchor="middle" fill="#e8e3f7" font-size="14" font-weight="600">MCP client</text>
+  <text x="165" y="178" text-anchor="middle" fill="#9b92c0" font-size="10.5" font-family="'Courier New',monospace">crucible_* call</text>
+
+  <line x1="270" y1="163" x2="340" y2="163" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowC)"/>
+
+  <rect x="346" y="110" width="270" height="106" rx="14" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6"/>
+  <text x="481" y="136" text-anchor="middle" fill="#a78bff" font-size="12" letter-spacing="2" font-weight="600">src/crucible/mod.rs</text>
+  <circle cx="481" cy="156" r="5" fill="#8b5cf6"/>
+  <text x="481" y="178" text-anchor="middle" fill="#e8e3f7" font-size="12.5" font-weight="600">validate → JSON payload</text>
+  <text x="481" y="196" text-anchor="middle" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">shell_single_quote()</text>
+
+  <line x1="616" y1="163" x2="696" y2="163" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowC)"/>
+
+  <rect x="702" y="110" width="260" height="106" rx="14" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadowC)"/>
+  <text x="832" y="136" text-anchor="middle" fill="#e8e3f7" font-size="14" font-weight="600">SSH · ssh2 crate</text>
+  <text x="832" y="156" text-anchor="middle" fill="#9b92c0" font-size="10.5" font-family="'Courier New',monospace">CRUCIBLE_SSH_HOST:22</text>
+  <circle cx="806" cy="180" r="4" fill="#4a6cf6"/>
+  <text x="818" y="184" fill="#a89fc8" font-size="9.5" font-family="'Courier New',monospace">script &lt;subcommand&gt; '&lt;json&gt;'</text>
+  <text x="832" y="200" text-anchor="middle" fill="#a89fc8" font-size="9.5" font-family="'Courier New',monospace">assumed shape — unverified on wire</text>
+
+  <line x1="962" y1="163" x2="1042" y2="163" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowC)"/>
+
+  <rect x="1048" y="130" width="180" height="66" rx="12" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadowC)"/>
+  <text x="1138" y="158" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="600">remote ops.py</text>
+  <text x="1138" y="178" text-anchor="middle" fill="#9b92c0" font-size="9.5" font-family="'Courier New',monospace">fleet host</text>
+
+  <line x1="1138" y1="196" x2="832" y2="290" stroke="#7c5cff" stroke-width="1.4" marker-end="url(#arrowC)" opacity="0.85"/>
+
+  <rect x="622" y="296" width="420" height="70" rx="12" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadowC)"/>
+  <text x="832" y="322" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="600">parse_remote_response()</text>
+  <text x="832" y="342" text-anchor="middle" fill="#9b92c0" font-size="10" font-family="'Courier New',monospace">stdout as JSON, or &#123;"raw": stdout&#125; — relayed verbatim</text>
+  <text x="832" y="358" text-anchor="middle" fill="#9b92c0" font-size="10" font-family="'Courier New',monospace">never hand-picks/renames fields</text>
+
+  <rect x="60" y="392" width="1160" height="30" rx="8" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="412" text-anchor="middle" fill="#cbc4e6" font-size="11.5" font-weight="600">Errors are generic — never leak "ssh", ":22", or the target host</text>
+</svg>

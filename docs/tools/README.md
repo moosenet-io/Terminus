@@ -70,7 +70,7 @@ reminders.
 
 | Module | Tools | What it does | Page |
 | --- | --- | --- | --- |
-| `plane` | ~37 | Full Plane CE work-management surface over its REST API — issues, modules, multi-identity (`PLANE_PAT_<NAME>`) CRUD, prefix registry. The largest single module in the hub. | [`project-planning/plane.md`](project-planning/plane.md) |
+| `plane` | ~37 | Full Plane CE work-management surface over its REST API — issues, modules, multi-identity (`PLANE_PAT_<NAME>`) CRUD, prefix registry. The largest single module in the hub. | [`project-planning/plane/README.md`](project-planning/plane/README.md) |
 | `axon` | ~4 | Postgres-backed work-order / task queue (submit, status, list, cancel). | [`project-planning/axon.md`](project-planning/axon.md) |
 | `vector` | ~11 | Autonomous dev-loop agent control over a Postgres-backed queue (submit, status, queue depth, halt). | [`project-planning/vector.md`](project-planning/vector.md) |
 | `nexus` | ~5 | Postgres-backed inter-agent inbox (send, check, read, ack, history). | [`project-planning/nexus.md`](project-planning/nexus.md) |
@@ -96,7 +96,7 @@ Fleet health, automation, secrets, networking, and admin surfaces.
 | `vigil` | ~2 | Morning/afternoon fleet-host briefing generation and reporting. | [`infra-ops/vigil.md`](infra-ops/vigil.md) |
 | `sentinel` | ~3 | Triggers operational checks and logging on the fleet host. | [`infra-ops/sentinel.md`](infra-ops/sentinel.md) |
 | `soma` | ~10 | The Lumina Constellation admin panel/API — status, modules, cost summary, backup status, validation runs, skill approval, agent rename. | [`infra-ops/soma.md`](infra-ops/soma.md) |
-| `gateway` | ~2 | Surfaces the Lumina API Gateway / dashboard (`dashboard_refresh` and related). | [`infra-ops/gateway.md`](infra-ops/gateway.md) |
+| `gateway` | ~2 | Surfaces the Lumina API Gateway / dashboard (`dashboard_refresh` and related). | [`infra-ops/dashboard.md`](infra-ops/dashboard.md) |
 | `sundry` | ~6 | Small one-off utility tools that don't warrant their own module: `health`, `echo`, `utc_now`, `constellation_version`, `vector_onboard`, `searxng_search`. | [`infra-ops/sundry.md`](infra-ops/sundry.md) |
 
 ### Models & Review — 7 modules
@@ -112,7 +112,7 @@ selection/profiling (MINT's tool-facing side).
 | `wizard` | ~3 | Deep-reasoning "council" consultation routed through the Chord proxy (`CHORD_PROXY_URL`). | [`models-review/wizard.md`](models-review/wizard.md) |
 | `model_advisor` | ~3 | Recommends model fleets from available VRAM/unified memory and use case; checks whether a specific model+quant fits a target. | [`models-review/model_advisor.md`](models-review/model_advisor.md) |
 | `litellm` | ~6 | Read-only status and model queries against the LiteLLM proxy. | [`models-review/litellm.md`](models-review/litellm.md) |
-| `tools` | ~3 | A small grouping of additional tool modules that live under `src/tools/` rather than the crate root. | [`models-review/tools.md`](models-review/tools.md) |
+| `tools` | ~3 | A small grouping of additional tool modules that live under `src/tools/` rather than the crate root. | [`models-review/serving.md`](models-review/serving.md) |
 
 ### Personal & Life — 16 modules
 

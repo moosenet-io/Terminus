@@ -1,0 +1,51 @@
+<svg width="1280" height="560" viewBox="0 0 1280 560" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bgLl" cx="50%" cy="28%" r="88%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadowLl" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrowLl" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+  <rect width="1280" height="560" fill="url(#bgLl)"/>
+
+  <text x="640" y="46" text-anchor="middle" fill="#b9b0d8" font-size="14" letter-spacing="6" font-weight="500">src/litellm/mod.rs</text>
+  <text x="640" y="80" text-anchor="middle" fill="#ffffff" font-size="28" font-weight="700" letter-spacing="2">LITELLM · READ-ONLY PROXY STATUS &amp; LOGS</text>
+  <line x1="440" y1="98" x2="840" y2="98" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <!-- config gate -->
+  <rect x="440" y="118" width="400" height="60" rx="12" fill="#241c42" stroke="#7c5cff" stroke-width="1.6" filter="url(#cardShadowLl)"/>
+  <text x="640" y="142" text-anchor="middle" fill="#e8e3f7" font-size="12.5" font-weight="700">LiteLLMConfig::from_env()</text>
+  <text x="640" y="162" text-anchor="middle" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">LITELLM_URL + LITELLM_MASTER_KEY</text>
+
+  <!-- two paths -->
+  <path d="M540 178 L340 240" stroke="#10b981" stroke-width="1.6" marker-end="url(#arrowLl)"/>
+  <path d="M740 178 L940 240" stroke="#f97373" stroke-width="1.6" marker-end="url(#arrowLl)"/>
+  <text x="400" y="210" fill="#9bd8bc" font-size="10.5" font-family="'Courier New',monospace">configured</text>
+  <text x="880" y="210" fill="#f3b0b0" font-size="10.5" font-family="'Courier New',monospace">not configured</text>
+
+  <!-- configured branch: 3 real tools -->
+  <rect x="150" y="248" width="440" height="120" rx="12" fill="#241c42" stroke="#10b981" stroke-width="1.4" filter="url(#cardShadowLl)"/>
+  <text x="175" y="272" fill="#9bd8bc" font-size="11.5" font-weight="700">3 LIVE TOOLS (authenticated GET)</text>
+  <text x="175" y="294" fill="#e8e3f7" font-size="10.5" font-family="'Courier New',monospace">litellm_list_models   → GET /v1/models</text>
+  <text x="175" y="314" fill="#e8e3f7" font-size="10.5" font-family="'Courier New',monospace">litellm_model_status  → GET /health</text>
+  <text x="175" y="334" fill="#e8e3f7" font-size="10.5" font-family="'Courier New',monospace">litellm_request_log   → GET /spend/logs</text>
+  <text x="175" y="354" fill="#9b92c0" font-size="9.5" font-family="'Courier New',monospace">falls back to /global/spend on log error</text>
+
+  <!-- stub branch -->
+  <rect x="690" y="248" width="440" height="120" rx="12" fill="#241c42" stroke="#f97373" stroke-width="1.4" filter="url(#cardShadowLl)"/>
+  <text x="715" y="272" fill="#f3b0b0" font-size="11.5" font-weight="700">NotConfiguredStub × 3</text>
+  <text x="715" y="296" fill="#e8e3f7" font-size="10.5" font-family="'Courier New',monospace">same 3 tool NAMES stay registered</text>
+  <text x="715" y="316" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">execute() → NotConfigured error</text>
+  <text x="715" y="340" fill="#9b92c0" font-size="9.5" font-family="'Courier New',monospace">discovery always sees the tools;</text>
+  <text x="715" y="356" fill="#9b92c0" font-size="9.5" font-family="'Courier New',monospace">calling them explains why they can't run</text>
+
+  <!-- api_get passthrough -->
+  <rect x="150" y="404" width="980" height="90" rx="12" fill="#1d1736" stroke="#5b4b9b" stroke-width="1.3" filter="url(#cardShadowLl)"/>
+  <text x="175" y="428" fill="#a78bff" font-size="12" letter-spacing="2" font-weight="600">api_get() ERROR-PASSTHROUGH (mirrors the Python source)</text>
+  <text x="175" y="450" fill="#cbc4e6" font-size="10.5" font-family="'Courier New',monospace">a non-2xx status does NOT raise — returns Ok({"error":true,"status":...,"message":...}) so each</text>
+  <text x="175" y="470" fill="#cbc4e6" font-size="10.5" font-family="'Courier New',monospace">tool's own parse fn decides how to react (most pass it straight through unchanged)</text>
+
+  <text x="640" y="530" text-anchor="middle" fill="#564d75" font-size="11.5" letter-spacing="0.4">A live proxy-level view — complements serving_residency_status's Chord-specific residency snapshot.</text>
+</svg>

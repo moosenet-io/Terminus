@@ -1,0 +1,58 @@
+<svg width="1280" height="560" viewBox="0 0 1280 560" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bgWz" cx="50%" cy="28%" r="88%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadowWz" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrowWz" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+  <rect width="1280" height="560" fill="url(#bgWz)"/>
+
+  <text x="640" y="46" text-anchor="middle" fill="#b9b0d8" font-size="14" letter-spacing="6" font-weight="500">src/wizard/mod.rs</text>
+  <text x="640" y="80" text-anchor="middle" fill="#ffffff" font-size="28" font-weight="700" letter-spacing="2">WIZARD · DEEP-REASONING COUNCIL CONSULTATION</text>
+  <line x1="440" y1="98" x2="840" y2="98" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <!-- 3 tools -->
+  <g font-size="12.5" font-weight="700">
+    <rect x="150" y="130" width="300" height="66" rx="10" fill="#241c42" stroke="#7c5cff" stroke-width="1.4"/>
+    <circle cx="172" cy="152" r="5" fill="#8b5cf6"/><text x="186" y="157" fill="#e8e3f7">wizard_consult</text>
+    <text x="170" y="178" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace" font-weight="400">question(+context) → synthesized answer</text>
+
+    <rect x="490" y="130" width="300" height="66" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1.2"/>
+    <circle cx="512" cy="152" r="5" fill="#4a6cf6"/><text x="526" y="157" fill="#e8e3f7">wizard_status</text>
+    <text x="510" y="178" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace" font-weight="400">is CHORD_PROXY_URL configured?</text>
+
+    <rect x="830" y="130" width="300" height="66" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1.2"/>
+    <circle cx="852" cy="152" r="5" fill="#4a6cf6"/><text x="866" y="157" fill="#e8e3f7">wizard_history</text>
+    <text x="850" y="178" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace" font-weight="400">past sessions for a user_id</text>
+  </g>
+
+  <path d="M300 196 L300 240" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowWz)"/>
+
+  <!-- sanitize -->
+  <rect x="150" y="248" width="300" height="52" rx="10" fill="#1d1736" stroke="#5b4b9b" stroke-width="1.2"/>
+  <text x="300" y="272" text-anchor="middle" fill="#cbc4e6" font-size="10.5" font-family="'Courier New',monospace">sanitize_question (2000 chars)</text>
+  <text x="300" y="288" text-anchor="middle" fill="#9b92c0" font-size="9.5" font-family="'Courier New',monospace">sanitize_context (4000 chars) · strip control chars</text>
+
+  <path d="M300 300 L300 336" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowWz)"/>
+
+  <!-- chord proxy -->
+  <rect x="130" y="346" width="340" height="80" rx="12" fill="#241c42" stroke="#7c5cff" stroke-width="1.6" filter="url(#cardShadowWz)"/>
+  <text x="300" y="374" text-anchor="middle" fill="#a78bff" font-size="12.5" letter-spacing="2" font-weight="600">CHORD PROXY</text>
+  <text x="300" y="396" text-anchor="middle" fill="#e8e3f7" font-size="10.5" font-family="'Courier New',monospace">POST /v1/tools/call</text>
+  <text x="300" y="414" text-anchor="middle" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">name=wizard_council_consult</text>
+
+  <!-- wizard_history -> postgres -->
+  <path d="M852 196 L852 240" stroke="#4a6cf6" stroke-width="1.6" marker-end="url(#arrowWz)"/>
+  <rect x="720" y="248" width="270" height="80" rx="12" fill="#241c42" stroke="#4a6cf6" stroke-width="1.6" filter="url(#cardShadowWz)"/>
+  <text x="855" y="276" text-anchor="middle" fill="#a9bdfa" font-size="12.5" letter-spacing="2" font-weight="600">POSTGRES</text>
+  <text x="855" y="298" text-anchor="middle" fill="#e8e3f7" font-size="10.5" font-family="'Courier New',monospace">wizard_sessions</text>
+  <text x="855" y="316" text-anchor="middle" fill="#a89fc8" font-size="9.5" font-family="'Courier New',monospace">WIZARD_DATABASE_URL → VECTOR_DATABASE_URL fallback</text>
+
+  <!-- config band -->
+  <rect x="150" y="450" width="980" height="70" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1.2"/>
+  <text x="640" y="476" text-anchor="middle" fill="#cbc4e6" font-size="12" font-weight="600">CHORD_PROXY_URL required for consult · WIZARD_DATABASE_URL (or VECTOR_DATABASE_URL) required for history</text>
+  <text x="640" y="498" text-anchor="middle" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">no shell commands anywhere in this module — pure reqwest + sqlx</text>
+</svg>

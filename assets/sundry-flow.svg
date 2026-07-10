@@ -1,0 +1,52 @@
+<svg width="1280" height="380" viewBox="0 0 1280 380" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bg2" cx="50%" cy="30%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+
+  <rect width="1280" height="380" fill="url(#bg2)"/>
+
+  <text x="640" y="44" text-anchor="middle" fill="#b9b0d8" font-size="13" letter-spacing="6" font-weight="500">SUNDRY MODULE</text>
+  <text x="640" y="76" text-anchor="middle" fill="#ffffff" font-size="26" font-weight="700" letter-spacing="2">SIX SMALL, INDEPENDENT TOOLS</text>
+  <line x1="480" y1="92" x2="800" y2="92" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <g font-size="12.5" font-weight="600">
+    <rect x="70" y="130" width="180" height="66" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+    <circle cx="90" cy="152" r="5" fill="#10b981"/><text x="104" y="156" fill="#e8e3f7">health</text>
+    <text x="88" y="176" fill="#a89fc8" font-size="10" font-weight="400" font-family="'Courier New',monospace">static {"{"}ok:true{"}"}</text>
+
+    <rect x="270" y="130" width="180" height="66" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+    <circle cx="290" cy="152" r="5" fill="#10b981"/><text x="304" y="156" fill="#e8e3f7">echo</text>
+    <text x="288" y="176" fill="#a89fc8" font-size="10" font-weight="400" font-family="'Courier New',monospace">returns text verbatim</text>
+
+    <rect x="470" y="130" width="180" height="66" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+    <circle cx="490" cy="152" r="5" fill="#10b981"/><text x="504" y="156" fill="#e8e3f7">utc_now</text>
+    <text x="488" y="176" fill="#a89fc8" font-size="10" font-weight="400" font-family="'Courier New',monospace">chrono::Utc::now()</text>
+
+    <rect x="670" y="130" width="220" height="66" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+    <circle cx="690" cy="152" r="5" fill="#8b5cf6"/><text x="704" y="156" fill="#e8e3f7">constellation_version</text>
+    <text x="688" y="176" fill="#a89fc8" font-size="10" font-weight="400" font-family="'Courier New',monospace">fixed build metadata + ts</text>
+
+    <rect x="70" y="212" width="220" height="66" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+    <circle cx="90" cy="234" r="5" fill="#8b5cf6"/><text x="104" y="238" fill="#e8e3f7">vector_onboard</text>
+    <text x="88" y="258" fill="#a89fc8" font-size="10" font-weight="400" font-family="'Courier New',monospace">static operating manual JSON</text>
+
+    <rect x="310" y="212" width="240" height="66" rx="10" fill="#241c42" stroke="#4a6cf6" stroke-width="1.2"/>
+    <circle cx="330" cy="234" r="5" fill="#4a6cf6"/><text x="344" y="238" fill="#e8e3f7">searxng_search</text>
+    <text x="328" y="258" fill="#a89fc8" font-size="10" font-weight="400" font-family="'Courier New',monospace">only one that leaves the process</text>
+  </g>
+
+  <line x1="550" y1="245" x2="620" y2="245" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <rect x="620" y="212" width="260" height="66" rx="10" fill="#1d1736" stroke="#5b4b9b" stroke-width="1"/>
+  <text x="750" y="238" text-anchor="middle" fill="#e8e3f7" font-size="12.5" font-weight="600">SearXNG instance</text>
+  <text x="750" y="258" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">GET /search?format=json</text>
+
+  <rect x="150" y="310" width="980" height="52" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="334" text-anchor="middle" fill="#cbc4e6" font-size="12.5" font-weight="600">5 of 6 tools are pure in-process — no network, no config, no failure mode</text>
+  <text x="640" y="352" text-anchor="middle" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">searxng_search is the exception: needs SEARXNG_URL, returns NotConfigured if unset</text>
+</svg>

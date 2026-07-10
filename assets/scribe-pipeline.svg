@@ -1,0 +1,78 @@
+<svg width="1280" height="760" viewBox="0 0 1280 760" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bgScribe" cx="50%" cy="30%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadowScribe" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrowScribe" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+
+  <rect width="1280" height="760" fill="url(#bgScribe)"/>
+
+  <text x="640" y="52" text-anchor="middle" fill="#b9b0d8" font-size="15" letter-spacing="7" font-weight="500">CODE &amp; GIT · SCRIBE</text>
+  <text x="640" y="92" text-anchor="middle" fill="#ffffff" font-size="32" font-weight="700" letter-spacing="2">INSPECT → GENERATE → VAULT</text>
+  <line x1="440" y1="112" x2="840" y2="112" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <!-- Stage 1: inspect.rs -->
+  <rect x="70" y="150" width="330" height="150" rx="14" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6" filter="url(#cardShadowScribe)"/>
+  <circle cx="98" cy="178" r="5" fill="#8b5cf6"/>
+  <text x="112" y="183" fill="#a78bff" font-size="13" letter-spacing="3" font-weight="600">1 · inspect.rs</text>
+  <text x="94" y="210" fill="#e8e3f7" font-size="14" font-weight="600">Read-only worktree checkout</text>
+  <text x="94" y="232" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">ReadOnlyGitOp::WorktreeAdd</text>
+  <text x="94" y="250" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">walk_rs_files → doc_comments +</text>
+  <text x="94" y="266" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">public_signatures per file</text>
+  <text x="94" y="286" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">gated: SCRIBE_ALLOW_SUBPROCESS_INSPECTION</text>
+
+  <line x1="400" y1="225" x2="475" y2="225" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowScribe)"/>
+
+  <!-- Stage 2: dispatch -->
+  <rect x="480" y="150" width="330" height="150" rx="14" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6" filter="url(#cardShadowScribe)"/>
+  <circle cx="508" cy="178" r="5" fill="#4a6cf6"/>
+  <text x="522" y="183" fill="#a78bff" font-size="13" letter-spacing="3" font-weight="600">2 · review-daemon dispatch</text>
+  <text x="504" y="210" fill="#e8e3f7" font-size="14" font-weight="600">build_docs_prompt → HTTP</text>
+  <text x="504" y="232" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">ReviewConfig::dispatch_daemon</text>
+  <text x="504" y="250" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">chain: agy → codex → opus</text>
+  <text x="504" y="266" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">POST /dispatch (bearer token)</text>
+  <text x="504" y="286" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">env: REVIEW_DAEMON_URL, REVIEW_DAEMON_TOKEN</text>
+
+  <line x1="810" y1="225" x2="885" y2="225" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowScribe)"/>
+
+  <!-- Stage 3: vault.rs -->
+  <rect x="890" y="150" width="320" height="150" rx="14" fill="#1d1736" stroke="#10b981" stroke-width="1.6" filter="url(#cardShadowScribe)"/>
+  <circle cx="918" cy="178" r="5" fill="#10b981"/>
+  <text x="932" y="183" fill="#a78bff" font-size="13" letter-spacing="3" font-weight="600">3 · vault.rs</text>
+  <text x="914" y="210" fill="#e8e3f7" font-size="14" font-weight="600">Obsidian vault write + push</text>
+  <text x="914" y="232" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">write_note_and_push: add, commit,</text>
+  <text x="914" y="248" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">pull --ff-only, push (never --force)</text>
+  <text x="914" y="266" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">diary/blog only — scribe_generate_readme</text>
+  <text x="914" y="282" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">returns Markdown, does not write</text>
+  <text x="914" y="298" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">gated: SCRIBE_ALLOW_SUBPROCESS_VAULT_WRITE</text>
+
+  <!-- Discrepancy branch -->
+  <line x1="645" y1="300" x2="645" y2="360" stroke="#7c5cff" stroke-width="1.4" marker-end="url(#arrowScribe)" opacity="0.85"/>
+  <rect x="410" y="366" width="470" height="96" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <circle cx="436" cy="392" r="5" fill="#8b5cf6"/>
+  <text x="450" y="397" fill="#e8e3f7" font-size="13" font-weight="600">scribe_report_discrepancy</text>
+  <text x="432" y="418" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">signature = hash(module_path, doc_claim)</text>
+  <text x="432" y="434" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">dedup via existing issue titles → Plane</text>
+  <text x="432" y="450" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">create_work_item, else local pending queue</text>
+
+  <!-- Governance band -->
+  <rect x="150" y="486" width="980" height="86" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="512" text-anchor="middle" fill="#cbc4e6" font-size="13" font-weight="600">GOVERNANCE · closed ReadOnlyGitOp/VaultGitOp enums · no commit/push/force-push tokens possible</text>
+  <text x="640" y="533" text-anchor="middle" fill="#8d84ad" font-size="11" font-family="'Courier New',monospace">default-deny SCRIBE_ALLOWED_REPO_ROOTS · never scribe_status leaks a token · description_html is escaped</text>
+  <text x="640" y="554" text-anchor="middle" fill="#8d84ad" font-size="11" font-family="'Courier New',monospace">subprocess git usage is an explicit, operator-reviewed deviation — off by default</text>
+
+  <text x="640" y="605" text-anchor="middle" fill="#a78bff" font-size="13" letter-spacing="4" font-weight="600">FIVE TOOLS</text>
+  <g font-size="11.5" font-family="'Courier New',monospace" fill="#a89fc8">
+    <text x="215" y="632">scribe_generate_readme</text>
+    <text x="440" y="632">scribe_update_wiki_page</text>
+    <text x="665" y="632">scribe_build_diary_entry</text>
+    <text x="905" y="632">scribe_report_discrepancy</text>
+    <text x="215" y="654">scribe_status</text>
+  </g>
+
+  <text x="640" y="700" text-anchor="middle" fill="#564d75" font-size="11.5" letter-spacing="0.4">Scribe reads real code, never invents behavior, and never touches source — only docs and the vault.</text>
+</svg>

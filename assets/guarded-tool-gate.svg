@@ -1,0 +1,75 @@
+<svg width="1280" height="620" viewBox="0 0 1280 620" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bg2" cx="50%" cy="30%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+    <marker id="arrowRed" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#e85c5c"/></marker>
+    <marker id="arrowGreen" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#10b981"/></marker>
+  </defs>
+
+  <rect width="1280" height="620" fill="url(#bg2)"/>
+
+  <text x="640" y="46" text-anchor="middle" fill="#b9b0d8" font-size="14" letter-spacing="6" font-weight="500">GUARDED TOOL CALL</text>
+  <text x="640" y="80" text-anchor="middle" fill="#ffffff" font-size="28" font-weight="700" letter-spacing="2">PER-OCCURRENCE APPROVAL GATE</text>
+  <line x1="470" y1="98" x2="810" y2="98" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <!-- Step 1: caller invokes tool -->
+  <rect x="60" y="130" width="220" height="66" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadow)"/>
+  <text x="170" y="158" text-anchor="middle" fill="#e8e3f7" font-size="14" font-weight="600">Model calls guarded tool</text>
+  <text x="170" y="178" text-anchor="middle" fill="#9b92c0" font-size="10.5" font-family="'Courier New',monospace">e.g. ansible_run_playbook</text>
+
+  <line x1="280" y1="163" x2="350" y2="163" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <!-- Step 2: gate() -->
+  <rect x="350" y="130" width="220" height="66" rx="10" fill="#241c42" stroke="#7c5cff" stroke-width="1.4"/>
+  <text x="460" y="158" text-anchor="middle" fill="#e8e3f7" font-size="14" font-weight="600">approval::gate()</text>
+  <text x="460" y="178" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">runs before any real work</text>
+
+  <line x1="460" y1="196" x2="460" y2="240" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <!-- branch: has _approval_code? -->
+  <rect x="330" y="242" width="260" height="50" rx="10" fill="#1d1736" stroke="#5b4b9b" stroke-width="1"/>
+  <text x="460" y="272" text-anchor="middle" fill="#e8e3f7" font-size="12.5">args carry _approval_code?</text>
+
+  <!-- No branch: create pending row -->
+  <line x1="400" y1="292" x2="260" y2="340" stroke="#7c5cff" stroke-width="1.4" marker-end="url(#arrow)"/>
+  <rect x="60" y="342" width="360" height="80" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadow)"/>
+  <text x="240" y="366" text-anchor="middle" fill="#e8e3f7" font-size="12.5" font-weight="600">NO — INSERT pending row</text>
+  <text x="240" y="386" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">6-char code · tool_approvals</text>
+  <text x="240" y="404" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">Gate::Pending("APPROVAL REQUIRED")</text>
+
+  <!-- Yes branch: consume -->
+  <line x1="520" y1="292" x2="660" y2="340" stroke="#7c5cff" stroke-width="1.4" marker-end="url(#arrow)"/>
+  <rect x="460" y="342" width="360" height="80" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadow)"/>
+  <text x="640" y="366" text-anchor="middle" fill="#e8e3f7" font-size="12.5" font-weight="600">YES — UPDATE ... WHERE approved</text>
+  <text x="640" y="386" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">code + tool_name + args_json match</text>
+  <text x="640" y="404" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">content-bound, single-use, 10 min TTL</text>
+
+  <!-- outcomes -->
+  <line x1="240" y1="422" x2="240" y2="470" stroke="#e85c5c" stroke-width="1.4" marker-end="url(#arrowRed)"/>
+  <rect x="90" y="472" width="300" height="46" rx="10" fill="#2b1c22" stroke="#e85c5c" stroke-width="1"/>
+  <text x="240" y="500" text-anchor="middle" fill="#f0b8b8" font-size="11.5">Returned to caller as Ok(msg) — NOT executed</text>
+
+  <line x1="640" y1="422" x2="640" y2="470" stroke="#10b981" stroke-width="1.4" marker-end="url(#arrowGreen)"/>
+  <rect x="490" y="472" width="300" height="46" rx="10" fill="#132a22" stroke="#10b981" stroke-width="1"/>
+  <text x="640" y="500" text-anchor="middle" fill="#8fe3c0" font-size="11.5">Gate::Granted — real action runs exactly once</text>
+
+  <!-- operator side -->
+  <rect x="900" y="130" width="320" height="130" rx="12" fill="#1d1736" stroke="#7c5cff" stroke-width="1.4" filter="url(#cardShadow)"/>
+  <text x="1060" y="156" text-anchor="middle" fill="#a78bff" font-size="12.5" letter-spacing="3" font-weight="600">OPERATOR (out of band)</text>
+  <text x="1060" y="182" text-anchor="middle" fill="#e8e3f7" font-size="12.5">Matrix chat: "approve CODE"</text>
+  <text x="1060" y="204" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">lumina-core deterministic handler</text>
+  <text x="1060" y="222" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">NOT an LLM turn — approval_grant / _deny</text>
+  <text x="1060" y="242" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">re-dispatches stored call w/ code attached</text>
+
+  <line x1="1060" y1="260" x2="1060" y2="300" stroke="#7c5cff" stroke-width="1.4" opacity="0.7"/>
+  <line x1="1060" y1="300" x2="590" y2="255" stroke="#7c5cff" stroke-width="1.2" stroke-dasharray="4 4" opacity="0.6" marker-end="url(#arrow)"/>
+
+  <rect x="150" y="546" width="980" height="58" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="570" text-anchor="middle" fill="#cbc4e6" font-size="12.5" font-weight="600">The model can NEVER approve its own request — chord-proxy hard-blocks approval_grant/approval_deny inside the agentic loop</text>
+  <text x="640" y="590" text-anchor="middle" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">src/approval.rs — shared by ansible, <secret-manager>, and every future guarded tool</text>
+</svg>

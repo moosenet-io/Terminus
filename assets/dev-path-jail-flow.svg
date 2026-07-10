@@ -1,0 +1,78 @@
+<svg width="1280" height="920" viewBox="0 0 1280 920" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bgDev" cx="50%" cy="28%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadowDev" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrowDev" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+
+  <rect width="1280" height="920" fill="url(#bgDev)"/>
+
+  <text x="640" y="46" text-anchor="middle" fill="#b9b0d8" font-size="14" letter-spacing="7" font-weight="500">CODE &amp; GIT · DEV MODULE</text>
+  <text x="640" y="84" text-anchor="middle" fill="#ffffff" font-size="29" font-weight="700" letter-spacing="2">PATH-JAIL ENFORCEMENT · dev_run_command / dev_read_file / dev_write_file</text>
+  <line x1="380" y1="102" x2="900" y2="102" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <!-- ===== MCP CALLER ===== -->
+  <rect x="440" y="126" width="400" height="60" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadowDev)"/>
+  <text x="640" y="151" text-anchor="middle" fill="#e8e3f7" font-size="15" font-weight="600">MCP tool call</text>
+  <text x="640" y="172" text-anchor="middle" fill="#9b92c0" font-size="11" font-family="'Courier New',monospace">dev_run_command { command, working_dir, timeout }</text>
+  <line x1="640" y1="186" x2="640" y2="222" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowDev)" opacity="0.9"/>
+
+  <!-- ===== DevConfig::validate_path ===== -->
+  <rect x="290" y="226" width="700" height="92" rx="12" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6"/>
+  <text x="315" y="252" fill="#a78bff" font-size="13" letter-spacing="3" font-weight="600">DevConfig::validate_path(path)  ·  dev/mod.rs:98</text>
+  <circle cx="640" cy="272" r="4.5" fill="#c9b8ff"/>
+  <text x="315" y="292" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">1. path.contains("..")  →  reject: "Path traversal (..) is not allowed"</text>
+  <text x="315" y="308" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">2. path.starts_with(root) for any root in DEV_WORKSPACE_ROOTS  →  else reject</text>
+
+  <line x1="490" y1="318" x2="380" y2="368" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowDev)" opacity="0.85"/>
+  <line x1="790" y1="318" x2="900" y2="368" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowDev)" opacity="0.85"/>
+
+  <!-- branch left: rejected -->
+  <rect x="150" y="372" width="360" height="96" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <circle cx="172" cy="396" r="5" fill="#8b5cf6"/><text x="186" y="400" fill="#e8e3f7" font-size="13" font-weight="600">Rejected</text>
+  <text x="170" y="420" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">ToolError::InvalidArgument(msg)</text>
+  <text x="170" y="436" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">no SSH connection ever opened</text>
+  <text x="170" y="452" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">string check only — no canonicalize()/realpath</text>
+
+  <!-- branch right: accepted -->
+  <rect x="770" y="372" width="360" height="96" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <circle cx="792" cy="396" r="5" fill="#4a6cf6"/><text x="806" y="400" fill="#e8e3f7" font-size="13" font-weight="600">Accepted</text>
+  <text x="790" y="420" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">escape_single_quotes(path)  ·  mod.rs:125</text>
+  <text x="790" y="436" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">' → '\'' (matches Python escaping exactly)</text>
+  <text x="790" y="452" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">wrapped in single quotes for the remote shell</text>
+
+  <line x1="330" y1="468" x2="500" y2="516" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowDev)" opacity="0.6"/>
+  <line x1="950" y1="468" x2="780" y2="516" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowDev)" opacity="0.85"/>
+
+  <!-- ===== ssh_session ===== -->
+  <rect x="300" y="520" width="680" height="76" rx="12" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6"/>
+  <text x="325" y="546" fill="#a78bff" font-size="12.5" letter-spacing="3" font-weight="600">ssh_session()  ·  dev/mod.rs:147  —  ssh2 crate, typed exec, no shell=True</text>
+  <text x="325" y="566" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">TcpStream::connect(DEV_HOST:22) → handshake → userauth_pubkey_file(DEV_USER, DEV_SSH_KEY)</text>
+  <text x="325" y="584" fill="#8d84ad" font-size="10" font-family="'Courier New',monospace">DEV_HOST or DEV_SSH_KEY unset → ToolError::NotConfigured, before any network I/O</text>
+
+  <line x1="640" y1="596" x2="640" y2="630" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowDev)" opacity="0.9"/>
+
+  <!-- ===== remote command construction ===== -->
+  <rect x="290" y="634" width="700" height="90" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1.4"/>
+  <text x="315" y="660" fill="#e8e3f7" font-size="13" font-weight="600">Remote command construction (per tool)</text>
+  <text x="315" y="680" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">run_command:  cd '&lt;safe_dir&gt;' &amp;&amp; &lt;safe_cmd&gt;   (command itself is NOT quote-wrapped)</text>
+  <text x="315" y="696" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">read_file:  test -f &amp;&amp; file --brief, then head -n &lt;max_lines&gt; '&lt;safe_path&gt;'</text>
+  <text x="315" y="712" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">write_file:  mkdir -p '&lt;safe_parent&gt;'  then  cat &gt; '&lt;safe_path&gt;'  (content streamed over stdin)</text>
+
+  <line x1="640" y1="724" x2="640" y2="758" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowDev)" opacity="0.9"/>
+
+  <!-- ===== exec on dev host ===== -->
+  <rect x="360" y="762" width="560" height="66" rx="10" fill="#1d1736" stroke="#10b981" stroke-width="1.4"/>
+  <circle cx="392" cy="792" r="5" fill="#10b981"/>
+  <text x="410" y="782" fill="#e8e3f7" font-size="13" font-weight="600">Dev host — SSH channel exec</text>
+  <text x="410" y="800" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">stdout/stderr/exit-code collected · run_command timeout capped at 300s server-side wait</text>
+
+  <!-- governance band -->
+  <rect x="150" y="850" width="980" height="58" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="874" text-anchor="middle" fill="#cbc4e6" font-size="13" font-weight="600">Path-jail covers FILE PATHS only — dev_run_command's shell command text is NOT sandboxed or approval-gated</text>
+  <text x="640" y="894" text-anchor="middle" fill="#8d84ad" font-size="11" font-family="'Courier New',monospace">DEV_HOST · DEV_USER · DEV_SSH_KEY · DEV_WORKSPACE_ROOTS · DEV_OPENHANDS_URL</text>
+</svg>
