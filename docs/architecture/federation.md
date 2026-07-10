@@ -78,10 +78,16 @@ before the caller's own dispatch logic runs:
    unconditionally (`src/gateway_framework/mod.rs:69-73`, `243-259`).
 2. **Allowlist.** `AllowlistPolicy`, built from
    `TERMINUS_GATEWAY_ALLOWLIST_JSON` (`src/config.rs:669-678`) — a JSON
-   object of `identity -> [action, ...]`, `"*"` meaning "every action for
-   this identity". **Default-deny**: an identity with no entry at all is
-   denied everything, not implicitly allowed
-   (`src/gateway_framework/mod.rs:89-147`).
+   object of `identity -> <grant>`, where `<grant>` is either the legacy
+   `[action, ...]` array (`"*"` meaning "every action for this identity")
+   or, as of LHEG-07, `{"allow": [...], "deny": [...]}` where `deny`
+   entries are PREFIXES that win even over `allow: ["*"]` — the mechanism
+   `lumina`/`harmony`'s scaffold uses to get broad utility access minus the
+   moose-scoped/sensitive routes (`github_`, `git_public`/`git_private`,
+   the secrets-manager `infisical_` prefix, `ansible_`, `openhands_`, etc.
+   — see `DEFAULT_SENSITIVE_DENY_PREFIXES`). **Default-deny**: an identity
+   with no entry at all is denied everything, not implicitly allowed
+   (`src/gateway_framework/mod.rs`).
 3. **Rate-limit.** An interim in-process token bucket, keyed per
    `(identity, action)` (`src/gateway_framework/rate_limit.rs`), explicitly
    documented as replaceable later by a shared/Redis-backed limiter without

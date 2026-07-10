@@ -201,14 +201,31 @@ Two distinct JWTs appear in this system, and they are not interchangeable:
 
 Once an identity is established (by cert, for mTLS traffic), *what it may
 do* is governed entirely by `AllowlistPolicy`
-(`src/gateway_framework/mod.rs:89-147`) — a flat, per-identity,
-config-driven map of `identity -> [allowed action, ...]`
-(`TERMINUS_GATEWAY_ALLOWLIST_JSON`), not a role/permission hierarchy. There
-is no notion of roles, scopes, or inherited permissions here: an identity
-either has an entry naming the action (or `"*"`) or it has nothing, and
-"nothing" always means denied, never "inherits some default". This is
-covered in full, including the rate-limit and audit stages it sits between,
-in [federation.md](federation.md)'s "gateway pipeline" section.
+(`src/gateway_framework/mod.rs`) — a flat, per-identity, config-driven
+policy read from `TERMINUS_GATEWAY_ALLOWLIST_JSON`, not a role/permission
+hierarchy. There is no notion of roles, scopes, or inherited permissions
+here: an identity either has a grant naming the action (or `"*"`) or it has
+nothing, and "nothing" always means denied, never "inherits some default".
+
+Each identity's grant (`Grant`) is one of two shapes:
+- a plain allow-list (`["a", "b", "*"]`) — the original form, still fully
+  supported; `moose`/`claude` use this for unrestricted `["*"]` access.
+- an allow/deny object (`{"allow": [...], "deny": [...]}`, LHEG-07) — `deny`
+  entries are PREFIXES checked first and win even over `allow: ["*"]`. This
+  is what lets `lumina`/`harmony` be granted broad utility access without
+  hand-listing every one of the ~300 legitimate tool/route names, while
+  still keeping them off moose-scoped/sensitive routes: their default
+  scaffold (`SCAFFOLDED_IDENTITIES`/`scaffold_defaults`) is `allow: ["*"]`,
+  `deny: DEFAULT_SENSITIVE_DENY_PREFIXES` (`github_`, `git_public`,
+  `git_private`, `gitea_cargo_publish`/`_yank`, the secrets-manager
+  `infisical_` prefix, `ansible_`, `openhands_`, `approval_`, three
+  destructive `dev_*` actions, `routines_batch_`, and two `soma_*`
+  governance actions) — closing the hole where a bare `"*"` grant would
+  otherwise let either identity reach credentials like the primary's
+  GitHub PAT or mirror-push creds "using Moose where available".
+
+This is covered in full, including the rate-limit and audit stages it sits
+between, in [federation.md](federation.md)'s "gateway pipeline" section.
 
 ## Per-identity PAT convention (Plane / Gitea / GitHub)
 
