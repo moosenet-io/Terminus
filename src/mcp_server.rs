@@ -365,8 +365,19 @@ async fn handle_mcp(
             // only the batch-write tools consult it. Every other tool ignores
             // the extra key (no schema validation happens before `execute`),
             // so this is a no-op for the rest of the registry.
-            if let Some(scope) = params.get("_meta").and_then(|m| m.get("scope")).and_then(|s| s.as_str()) {
-                if let Some(obj) = arguments.as_object_mut() {
+            //
+            // The reserved `__conn_scope` key is ALWAYS stripped from the
+            // inbound arguments first (S2), then re-set ONLY from the trusted
+            // `_meta.scope`. This preserves the invariant "__conn_scope is set
+            // only from trusted transport metadata" even for a request that
+            // reaches this primary WITHOUT `_meta` (a direct-to-primary or
+            // future caller): a model-supplied `arguments.__conn_scope` can
+            // never be honored. (The explicit `scope` tool argument is a
+            // different, deliberately-public knob, bounded to the caller's own
+            // identity by `PlaneClient::with_scope`, and is left untouched.)
+            if let Some(obj) = arguments.as_object_mut() {
+                obj.remove("__conn_scope");
+                if let Some(scope) = params.get("_meta").and_then(|m| m.get("scope")).and_then(|s| s.as_str()) {
                     obj.insert("__conn_scope".to_string(), json!(scope));
                 }
             }
@@ -813,6 +824,49 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["result"]["structuredContent"]["foo"], "bar");
         assert!(body["result"]["structuredContent"].get("__conn_scope").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_strips_caller_supplied_conn_scope_when_no_meta() {
+        // S2: a model/caller-supplied `arguments.__conn_scope` with NO trusted
+        // `_meta` must be stripped, not honored -- the reserved key is set ONLY
+        // from transport metadata.
+        let router = build_router(args_echo_state());
+        let (status, body, _) = post_mcp(
+            router,
+            json!({
+                "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                "params": {"name": "args_echo", "arguments": {"foo": "bar", "__conn_scope": "spoofed"}}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["structuredContent"]["foo"], "bar");
+        assert!(
+            body["result"]["structuredContent"].get("__conn_scope").is_none(),
+            "a caller-supplied __conn_scope must be stripped when there is no trusted _meta"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_meta_scope_overrides_caller_supplied_conn_scope() {
+        // S2: even if a caller smuggles `arguments.__conn_scope`, the trusted
+        // `_meta.scope` wins (strip-then-set).
+        let router = build_router(args_echo_state());
+        let (status, body, _) = post_mcp(
+            router,
+            json!({
+                "jsonrpc": "2.0", "id": 12, "method": "tools/call",
+                "params": {
+                    "name": "args_echo",
+                    "arguments": {"foo": "bar", "__conn_scope": "spoofed"},
+                    "_meta": {"scope": "trusted-conn"}
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["structuredContent"]["__conn_scope"], "trusted-conn");
     }
 
     #[tokio::test]

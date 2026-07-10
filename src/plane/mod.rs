@@ -418,6 +418,27 @@ impl RedisBackend {
         }
     }
 
+    /// DELETE a namespaced key. Best-effort (a failure is swallowed via the
+    /// breaker) — used to reap a batch-job record whose write we could not
+    /// confirm, so a job that then runs synchronously never leaves an
+    /// unreachable all-pending record behind (PWQ-01 N1).
+    async fn del(&self, key: &str) {
+        if !self.breaker.allow() {
+            return;
+        }
+        let fut = async {
+            let mut conn = self
+                .conn()
+                .await
+                .ok_or_else(|| redis::RedisError::from((redis::ErrorKind::IoError, "redis unavailable")))?;
+            redis::cmd("DEL").arg(key).query_async::<_, ()>(&mut conn).await
+        };
+        match tokio::time::timeout(self.op_timeout, fut).await {
+            Ok(Ok(())) => self.breaker.record_success(),
+            _ => self.note_failure(),
+        }
+    }
+
     /// Atomically reserve the next slot in the shared rate budget. `Some(wait)` =
     /// sleep `wait` then proceed; `None` = Redis unavailable, caller should fall
     /// back to its in-process limiter.
@@ -516,6 +537,16 @@ fn redis_cache_key(raw: &str) -> String {
     format!("plane:cache:{}", h.digest())
 }
 
+/// The parent identity rate key for a rate-key suffix (S3 identity ceiling).
+/// A scoped suffix `{identity}:{scope}` has parent `{identity}`; the global or
+/// identity-only suffixes have no parent (nothing above them to gate against).
+/// Returns a slice of the input so no allocation happens on the hot path.
+fn rate_key_parent(key_suffix: Option<&str>) -> Option<&str> {
+    let suffix = key_suffix?;
+    let idx = suffix.find(':')?;
+    Some(&suffix[..idx])
+}
+
 // ─── Rate limiter (in-process, optionally Redis-coordinated) ─────────────────
 //
 // Replaces the Python client's `fcntl.flock`-guarded `/tmp/plane-helper.lock` +
@@ -606,12 +637,30 @@ impl RateLimiter {
 
         // 2. Reserve the shared cross-process slot at ~the actual send time
         //    (best-effort). `None` (unconfigured OR any Redis failure) = zero wait.
+        //
+        //    S3 identity ceiling: a scoped suffix (`{identity}:{scope}`) gets
+        //    its own per-scope key for fairness, but that alone would let a
+        //    caller rotate `scope` per batch to mint unlimited fresh 20-RPM
+        //    budgets and evade any aggregate cap. So a scoped call ALSO reserves
+        //    the identity's PARENT key (`{identity}`) and waits for the later of
+        //    the two slots — the parent serialises every scope under one
+        //    identity to a single shared budget (the ceiling), while the
+        //    per-scope key keeps sub-fairness underneath it. The unscoped path
+        //    (suffix `None` → `global`) has no parent and is byte-for-byte
+        //    unchanged from before PWQ-03.
         if let Some(backend) = &self.redis {
-            let suffix = key_suffix.unwrap_or("global");
-            if let Some(redis_wait) = backend.rate_reserve(self.min_interval, suffix).await {
-                if !redis_wait.is_zero() {
-                    tokio::time::sleep(redis_wait).await;
+            let leaf = key_suffix.unwrap_or("global");
+            let mut wait = Duration::ZERO;
+            if let Some(parent) = rate_key_parent(key_suffix) {
+                if let Some(w) = backend.rate_reserve(self.min_interval, parent).await {
+                    wait = wait.max(w);
                 }
+            }
+            if let Some(w) = backend.rate_reserve(self.min_interval, leaf).await {
+                wait = wait.max(w);
+            }
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
             }
         }
 
@@ -813,11 +862,16 @@ impl JobStore {
         format!("plane:batch:{batch_id}")
     }
 
-    /// Persist (create or overwrite) a job record. Returns `false` if there is
-    /// no backend configured OR the underlying Redis write failed/timed out —
-    /// callers use this to detect "Redis died between the availability check
-    /// and the actual write" and fall back accordingly.
-    async fn save(&self, job: &BatchJob) -> bool {
+    /// Create the INITIAL job record and confirm it actually landed. Returns
+    /// `false` if there is no backend, serialization fails, or the write can't
+    /// be confirmed (Redis died between the `enabled()` check and the write) —
+    /// the batch tool uses this to decide async-vs-synchronous. On a
+    /// confirm-read failure the just-written key is best-effort DELETED (N1) so
+    /// a job that then runs synchronously never leaves an unreachable
+    /// all-pending record to linger until its TTL. Only the initial create
+    /// confirms/reaps; per-item updates use the plain `save` below (a failed
+    /// confirm mid-drain must never delete a live job).
+    async fn create(&self, job: &BatchJob) -> bool {
         let Some(backend) = &self.redis else { return false };
         let Ok(body) = serde_json::to_string(job) else { return false };
         // `cache_set` is itself fail-open (best-effort, swallows errors via the
@@ -825,7 +879,22 @@ impl JobStore {
         // directly observe success there, so re-read once to confirm the
         // write actually landed rather than reporting false confidence.
         backend.cache_set(&Self::key(&job.batch_id), &body, BATCH_JOB_TTL).await;
-        backend.cache_get(&Self::key(&job.batch_id)).await.is_some()
+        if backend.cache_get(&Self::key(&job.batch_id)).await.is_some() {
+            true
+        } else {
+            backend.del(&Self::key(&job.batch_id)).await;
+            false
+        }
+    }
+
+    /// Best-effort overwrite of an existing job record (per-item progress
+    /// updates from the drain worker). No confirm-read and no reap: a transient
+    /// Redis blip just means this one update is lost, never that a live job is
+    /// deleted.
+    async fn save(&self, job: &BatchJob) {
+        let Some(backend) = &self.redis else { return };
+        let Ok(body) = serde_json::to_string(job) else { return };
+        backend.cache_set(&Self::key(&job.batch_id), &body, BATCH_JOB_TTL).await;
     }
 
     async fn load(&self, batch_id: &str) -> Option<BatchJob> {
@@ -850,32 +919,74 @@ impl JobStore {
 // relative size. It does not change pacing at all — every send still goes
 // through `PlaneClient::post_with_retry` -> the same `RateLimiter`.
 
+/// One queued Plane write. Critically (PWQ-01/03 B1 fix) it carries its OWN
+/// batch's `client` and target `url`: the shared dispatcher drains items from
+/// MANY concurrently-enqueued batches through ONE worker, and each item MUST
+/// be POSTed through the client of the batch it belongs to — that client is
+/// what fixes both the auth token (`api_key`) AND the distributed rate-key
+/// suffix (`{identity}:{scope}`). Draining every item through a single fixed
+/// client would misattribute tokens across identities and collapse per-scope
+/// rate separation during exactly the concurrent window PWQ-03 exists for.
+/// The job record is read/written via the SAME client's `job_store` (all
+/// clients share one Redis backend, keyed by `batch_id`).
 struct PendingSend {
+    client: Arc<PlaneClient>,
     batch_id: String,
     index: usize,
+    url: String,
     body: Value,
 }
 
 struct DispatcherInner {
-    /// scope key -> (issues POST url, its pending sends, FIFO within a scope)
-    queues: HashMap<String, (String, std::collections::VecDeque<PendingSend>)>,
+    /// scope key -> its pending sends (FIFO within a scope). Each `PendingSend`
+    /// carries its own client + url, so a single scope bucket can legitimately
+    /// hold items from different batches (same scope, e.g. two batches from
+    /// one connection) and each still drains through its own client.
+    queues: HashMap<String, std::collections::VecDeque<PendingSend>>,
     /// Round-robin order of scope keys that currently have pending work.
     ring: std::collections::VecDeque<String>,
-    /// Whether a drain worker task is currently running. Enqueue and the
-    /// worker's own exit both flip this under the SAME lock, so there is
-    /// never a window where work is pending but no worker is scheduled to
-    /// pick it up (see `next` / `enqueue`).
+    /// Whether a drain worker task is currently running. Owned exclusively by
+    /// `enqueue` (sets true + spawns) and [`RunningGuard`] (resets false on
+    /// worker exit — normal OR panic — and respawns if work is still pending),
+    /// so a panicking worker can never permanently wedge the dispatcher (S1).
     running: bool,
 }
 
 struct BatchDispatcher {
-    inner: AsyncMutex<DispatcherInner>,
+    // A std (sync) mutex, not a tokio mutex: the critical sections here are all
+    // synchronous map/deque ops (no `.await` while held), and the panic-safety
+    // guard below must lock from a *synchronous* `Drop`. `post_with_retry`'s
+    // `.await` happens in the worker OUTSIDE this lock.
+    inner: StdMutex<DispatcherInner>,
+}
+
+/// Reset `running` on worker exit however it exits (normal return OR a panic
+/// unwinding through `run_worker`'s `.await` points), and — under the same
+/// lock — respawn a fresh worker if any work is still queued. This closes both
+/// the "worker panicked with running=true → all future batches queue forever"
+/// wedge (S1) and the benign race where `enqueue` pushed work after the worker
+/// decided to stop but before it reset the flag.
+struct RunningGuard {
+    dispatcher: Arc<BatchDispatcher>,
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        let mut inner = self.dispatcher.inner.lock().unwrap();
+        inner.running = false;
+        if !inner.ring.is_empty() {
+            inner.running = true;
+            let dispatcher = self.dispatcher.clone();
+            drop(inner);
+            tokio::spawn(async move { dispatcher.run_worker().await });
+        }
+    }
 }
 
 impl BatchDispatcher {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            inner: AsyncMutex::new(DispatcherInner {
+            inner: StdMutex::new(DispatcherInner {
                 queues: HashMap::new(),
                 ring: std::collections::VecDeque::new(),
                 running: false,
@@ -883,25 +994,18 @@ impl BatchDispatcher {
         })
     }
 
-    /// Add one batch's items to `scope`'s queue and start the shared drain
-    /// worker if it isn't already running. `scope` is a plain fairness
-    /// bucket key (typically `PlaneClient::rate_key_suffix()`'s value, or
-    /// `"default"` when the batch has no scope) — it is NOT the Redis key
-    /// itself, just this process's round-robin grouping.
-    async fn enqueue(
-        self: &Arc<Self>,
-        client: Arc<PlaneClient>,
-        job_store: Arc<JobStore>,
-        scope: String,
-        url: String,
-        batch_id: String,
-        items: Vec<(usize, Value)>,
-    ) {
-        let mut inner = self.inner.lock().await;
-        let entry = inner.queues.entry(scope.clone()).or_insert_with(|| (url, std::collections::VecDeque::new()));
-        let was_empty = entry.1.is_empty();
-        for (index, body) in items {
-            entry.1.push_back(PendingSend { batch_id: batch_id.clone(), index, body });
+    /// Add one batch's items (each already carrying its own client + url) to
+    /// `scope`'s queue and start the shared drain worker if it isn't already
+    /// running. `scope` is a plain fairness bucket key (typically
+    /// `PlaneClient::rate_key_suffix()`'s value, or `"default"` when the batch
+    /// has no scope) — it is NOT the Redis key itself, just this process's
+    /// round-robin grouping.
+    fn enqueue(self: &Arc<Self>, scope: String, items: Vec<PendingSend>) {
+        let mut inner = self.inner.lock().unwrap();
+        let queue = inner.queues.entry(scope.clone()).or_default();
+        let was_empty = queue.is_empty();
+        for item in items {
+            queue.push_back(item);
         }
         if was_empty {
             inner.ring.push_back(scope);
@@ -909,41 +1013,39 @@ impl BatchDispatcher {
         if !inner.running {
             inner.running = true;
             let dispatcher = self.clone();
-            tokio::spawn(async move {
-                dispatcher.run_worker(client, job_store).await;
-            });
+            tokio::spawn(async move { dispatcher.run_worker().await });
         }
     }
 
-    /// Pop the next pending send in round-robin order across scopes. Flips
-    /// `running` to `false` (under the same lock as the emptiness check) when
-    /// there is nothing left, so `enqueue` can never race a worker that is
-    /// about to exit — either the worker sees the new item before it decides
-    /// to stop, or `enqueue` sees `running == false` and starts a fresh one.
-    async fn next(&self) -> Option<(String, PendingSend)> {
-        let mut inner = self.inner.lock().await;
+    /// Pop the next pending send in round-robin order across scopes. Returns
+    /// `None` when nothing is queued; it deliberately does NOT touch `running`
+    /// — that flag's lifecycle is owned solely by `enqueue`/[`RunningGuard`],
+    /// so the guard is the single place that decides whether a replacement
+    /// worker is needed (making the logic panic-safe).
+    fn next(&self) -> Option<PendingSend> {
+        let mut inner = self.inner.lock().unwrap();
         loop {
-            let Some(scope) = inner.ring.pop_front() else {
-                inner.running = false;
-                return None;
-            };
-            let Some((url, queue)) = inner.queues.get_mut(&scope) else { continue };
+            let scope = inner.ring.pop_front()?;
+            let Some(queue) = inner.queues.get_mut(&scope) else { continue };
             if let Some(item) = queue.pop_front() {
-                let url = url.clone();
                 if queue.is_empty() {
                     inner.queues.remove(&scope);
                 } else {
                     inner.ring.push_back(scope);
                 }
-                return Some((url, item));
+                return Some(item);
             }
             inner.queues.remove(&scope);
         }
     }
 
-    async fn run_worker(self: Arc<Self>, client: Arc<PlaneClient>, job_store: Arc<JobStore>) {
-        while let Some((url, pending)) = self.next().await {
-            let result = match client.post_with_retry(&url, &pending.body).await {
+    async fn run_worker(self: Arc<Self>) {
+        // Dropped on ANY exit path (normal or panic) → resets `running` and
+        // respawns if work remains (S1).
+        let _guard = RunningGuard { dispatcher: self.clone() };
+        while let Some(pending) = self.next() {
+            let client = &pending.client;
+            let result = match client.post_with_retry(&pending.url, &pending.body).await {
                 Ok(resp) => match PlaneClient::check_status(resp).await {
                     Ok(resp) => match resp.json::<Issue>().await {
                         Ok(issue) => BatchItemResult::created(pending.index, &issue),
@@ -953,18 +1055,18 @@ impl BatchDispatcher {
                 },
                 Err(e) => BatchItemResult::failed(pending.index, e.to_string()),
             };
-            // Read-modify-write the job record. If the job has expired or
-            // Redis is currently unreachable, `load` returns `None` and this
-            // item's outcome is simply not recorded anywhere — the Plane
-            // write itself still happened (or was attempted), matching the
-            // PWQ-01 EDGE CASE that a resumer/durable-write-ahead of results
-            // is explicitly out of scope.
-            if let Some(mut job) = job_store.load(&pending.batch_id).await {
+            // Read-modify-write the job record through THIS item's own client's
+            // job store. If the job has expired or Redis is currently
+            // unreachable, `load` returns `None` and this item's outcome is
+            // simply not recorded — the Plane write itself still happened (or
+            // was attempted), matching the PWQ-01 EDGE CASE that a
+            // resumer/durable-write-ahead of results is explicitly out of scope.
+            if let Some(mut job) = client.job_store.load(&pending.batch_id).await {
                 if let Some(slot) = job.items.get_mut(pending.index) {
                     *slot = result;
                 }
                 job.mark_done_if_complete();
-                job_store.save(&job).await;
+                client.job_store.save(&job).await;
             }
         }
     }
@@ -3334,19 +3436,25 @@ impl PlaneBatchCreateWorkItems {
                 total: items.len(),
                 items: item_results,
             };
-            if client.job_store.save(&job).await {
-                let bodies: Vec<(usize, Value)> = items
+            if client.job_store.create(&job).await {
+                // Each PendingSend carries THIS batch's own client + url so the
+                // shared dispatcher drains it with the correct token + rate key
+                // even while other batches (other identities/scopes) drain
+                // concurrently (PWQ-01/03 B1).
+                let sends: Vec<PendingSend> = items
                     .iter()
                     .zip(names.iter())
                     .enumerate()
-                    .map(|(index, (item, name))| (index, build_batch_item_body(item, name)))
+                    .map(|(index, (item, name))| PendingSend {
+                        client: client.clone(),
+                        batch_id: batch_id.clone(),
+                        index,
+                        url: url.clone(),
+                        body: build_batch_item_body(item, name),
+                    })
                     .collect();
                 let dispatcher_scope = scope.clone().unwrap_or_else(|| "default".to_string());
-                client
-                    .batch_dispatcher
-                    .clone()
-                    .enqueue(client.clone(), client.job_store.clone(), dispatcher_scope, url, batch_id.clone(), bodies)
-                    .await;
+                client.batch_dispatcher.clone().enqueue(dispatcher_scope, sends);
 
                 let structured = json!({
                     "batch_id": batch_id,
@@ -4985,6 +5093,72 @@ mod tests {
         assert_ne!(a.rate_key_suffix(), b.rate_key_suffix(), "distinct scopes must reserve distinct Redis keys");
     }
 
+    // ── S3: per-identity parent ceiling key derivation ─────────────────────────
+
+    #[test]
+    fn test_rate_key_parent_of_scoped_suffix_is_the_identity() {
+        // A scoped `{identity}:{scope}` reserves the identity's parent budget
+        // too, so rotating `scope` can't mint unlimited fresh RPM budgets.
+        assert_eq!(rate_key_parent(Some("claude:conn-1")), Some("claude"));
+        assert_eq!(rate_key_parent(Some("lumina:task-42")), Some("lumina"));
+    }
+
+    #[test]
+    fn test_rate_key_parent_none_for_unscoped_and_global() {
+        // No colon → nothing above it to gate against (identity-only or the
+        // legacy global key), and the unscoped `None` path stays parent-less
+        // (byte-for-byte the pre-PWQ-03 single-reservation behavior).
+        assert_eq!(rate_key_parent(Some("global")), None);
+        assert_eq!(rate_key_parent(Some("claude")), None);
+        assert_eq!(rate_key_parent(None), None);
+    }
+
+    // ── S1: a panicking/dead worker must never permanently wedge the dispatcher ─
+
+    #[tokio::test]
+    async fn test_dispatcher_recovers_after_worker_exit_with_pending_work() {
+        // Simulate the wedge state a pre-S1 panicking worker would leave:
+        // running == true (so a normal `enqueue` would NOT spawn a replacement)
+        // with work still queued. Dropping a RunningGuard (what happens on ANY
+        // worker exit, panic included) must reset `running` AND respawn a worker
+        // that drains the backlog.
+        let server = MockServer::start();
+        let post_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/workspaces/testws/projects/p1/issues/");
+            then.status(201).json_body(json!({"id": "z", "name": "z", "project": "p1", "workspace": "testws", "sequence_id": 1}));
+        });
+        let client = mock_client(&server); // JobStore::disabled() — drain still POSTs, just doesn't record
+        let url = format!("{}/api/v1/workspaces/testws/projects/p1/issues/", server.base_url());
+
+        let dispatcher = BatchDispatcher::new();
+        {
+            let mut inner = dispatcher.inner.lock().unwrap();
+            inner.running = true; // as if a worker is (was) alive
+            let mut q = std::collections::VecDeque::new();
+            q.push_back(PendingSend { client: client.clone(), batch_id: "x".into(), index: 0, url, body: json!({"name": "z"}) });
+            inner.ring.push_back("s".into());
+            inner.queues.insert("s".into(), q);
+        }
+
+        // The dead worker's guard drops → recovery path.
+        drop(RunningGuard { dispatcher: dispatcher.clone() });
+
+        // A fresh worker must drain the backlog and reset running=false.
+        let mut recovered = false;
+        for _ in 0..40 {
+            {
+                let inner = dispatcher.inner.lock().unwrap();
+                if inner.queues.is_empty() && inner.ring.is_empty() && !inner.running {
+                    recovered = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(recovered, "dispatcher must respawn a worker and drain after a dead-worker guard drop");
+        assert_eq!(post_mock.hits(), 1, "the backlogged item must actually be POSTed by the respawned worker");
+    }
+
     // ── PWQ-03: fair-share round-robin dispatcher ordering (no network/Redis) ──
 
     #[tokio::test]
@@ -4995,20 +5169,27 @@ mod tests {
         // queued first must not starve a small "agent-b" batch queued right
         // after it.
         let dispatcher = BatchDispatcher::new();
+        let dummy_client = PlaneClient::test_client_with_base_url("http://example.invalid".into());
         {
-            let mut inner = dispatcher.inner.lock().await;
+            let mut inner = dispatcher.inner.lock().unwrap();
             for scope in ["agent-a", "agent-b"] {
                 let count = if scope == "agent-a" { 5 } else { 2 };
                 let mut q = std::collections::VecDeque::new();
                 for i in 0..count {
-                    q.push_back(PendingSend { batch_id: scope.to_string(), index: i, body: json!({}) });
+                    q.push_back(PendingSend {
+                        client: dummy_client.clone(),
+                        batch_id: scope.to_string(),
+                        index: i,
+                        url: format!("http://x/{scope}"),
+                        body: json!({}),
+                    });
                 }
                 inner.ring.push_back(scope.to_string());
-                inner.queues.insert(scope.to_string(), (format!("http://x/{scope}"), q));
+                inner.queues.insert(scope.to_string(), q);
             }
         }
         let mut order = Vec::new();
-        while let Some((_url, pending)) = dispatcher.next().await {
+        while let Some(pending) = dispatcher.next() {
             order.push(pending.batch_id.clone());
         }
         // agent-b (2 items) must be fully drained within the first 4 turns,
@@ -5274,6 +5455,95 @@ mod tests {
         assert_eq!(a.status, BatchItemStatus::Created, "{a:?}");
         assert_eq!(b.status, BatchItemStatus::Failed, "{b:?} -- a failing item must not abort the batch");
         assert_eq!(c.status, BatchItemStatus::Created, "{c:?} -- items after a failure must still be attempted");
+    }
+
+    // PWQ-01/03 B1: two batches from DIFFERENT clients (distinct identity +
+    // scope) enqueued so the second starts while the first is still draining
+    // through the ONE shared dispatcher/worker. Each item must POST with ITS
+    // OWN batch's client — proven here by the auth token (X-API-Key). The
+    // distributed rate-key suffix is derived from that same per-item client, so
+    // token-correctness proves scope-key-correctness too (asserted independently
+    // by `test_rate_key_suffix_*`). Under the pre-fix bug, both batches drained
+    // through the first client, so batch B would POST with token-a.
+    #[tokio::test]
+    async fn test_async_batch_drains_each_item_through_its_own_client() {
+        let redis_url = fake_redis_server().await;
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        // A slow response keeps the worker busy on batch A's first item long
+        // enough for batch B to enqueue into the already-running worker.
+        let mock_a = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/workspaces/testws/projects/p1/issues/")
+                .header("X-API-Key", "token-a");
+            then.status(201)
+                .delay(Duration::from_millis(80))
+                .json_body(json!({"id": "id-a", "name": "A", "project": "p1", "workspace": "testws", "sequence_id": 1}));
+        });
+        let mock_b = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/workspaces/testws/projects/p1/issues/")
+                .header("X-API-Key", "token-b");
+            then.status(201)
+                .delay(Duration::from_millis(80))
+                .json_body(json!({"id": "id-b", "name": "B", "project": "p1", "workspace": "testws", "sequence_id": 2}));
+        });
+
+        // Two clients sharing ONE dispatcher + ONE job-store backend, distinct
+        // identity + token.
+        let redis = RedisBackend::test_pointed_at(&redis_url);
+        let job_store = Arc::new(JobStore::from_env(Some(redis)));
+        let dispatcher = BatchDispatcher::new();
+        let base = mock_client(&server);
+        let make = |token: &str, ident: &str| {
+            Arc::new(PlaneClient {
+                api_key: Some(token.to_string()),
+                identity_name: Some(ident.to_string()),
+                rate_limiter: Arc::new(RateLimiter::local(Duration::ZERO)),
+                job_store: job_store.clone(),
+                batch_dispatcher: dispatcher.clone(),
+                ..(*base).clone()
+            })
+        };
+        let client_a = make("token-a", "id-a");
+        let client_b = make("token-b", "id-b");
+
+        let tool_a = PlaneBatchCreateWorkItems { client: client_a };
+        let tool_b = PlaneBatchCreateWorkItems { client: client_b };
+
+        // Enqueue A (spawns the worker), then B immediately (shared worker still
+        // running → B drains through the SAME worker, the B1 bug window).
+        let out_a = tool_a
+            .execute_structured(json!({"project_id": "p1", "scope": "scope-a", "items": [{"name": "A1"}, {"name": "A2"}]}))
+            .await
+            .unwrap();
+        let out_b = tool_b
+            .execute_structured(json!({"project_id": "p1", "scope": "scope-b", "items": [{"name": "B1"}, {"name": "B2"}]}))
+            .await
+            .unwrap();
+        let id_a = out_a.structured.unwrap()["batch_id"].as_str().unwrap().to_string();
+        let id_b = out_b.structured.unwrap()["batch_id"].as_str().unwrap().to_string();
+
+        // Wait for both to finish draining.
+        for id in [&id_a, &id_b] {
+            let mut done = false;
+            for _ in 0..60 {
+                if let Some(j) = job_store.load(id).await {
+                    if j.status == BatchStatus::Done {
+                        done = true;
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(done, "batch {id} must finish draining");
+        }
+
+        // The decisive assertion: each batch's items hit ONLY its own token's
+        // mock. The pre-fix bug would route batch B through token-a → mock_b
+        // never hit, mock_a hit 4×.
+        assert_eq!(mock_a.hits(), 2, "batch A's two items must POST with token-a");
+        assert_eq!(mock_b.hits(), 2, "batch B's two items must POST with token-b (own client), not the first batch's");
     }
 
     #[tokio::test]
