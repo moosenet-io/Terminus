@@ -9,10 +9,20 @@
 //!                         no subprocess. See the `github_push_branch` doc comment
 //!                         below for the full design rationale.
 //!
-//! Required env:
-//!   GITHUB_TOKEN  — GitHub personal access / app token (Authorization: token …)
-//!                   Required scopes: `repo` (push/create) plus `admin:org` to
-//!                   create or push to repos under an organisation.
+//! Required credential (GHTOK-01: identity-resolved, not a raw env read):
+//!   GITHUB_PAT_<NAME> — per-identity GitHub personal access / app token
+//!                   (Authorization: token …), resolved via
+//!                   [`GitHubAdapter::resolve_token`] for the active default
+//!                   identity (`GITHUB_IDENTITY_NAME`, default `moose` — so in
+//!                   practice `GITHUB_PAT_MOOSE`). Required scopes: `repo`
+//!                   (push/create) plus `admin:org` to create or push to repos
+//!                   under an organisation.
+//!                   GITHUB_TOKEN  — the unsuffixed operator token, kept ONLY as
+//!                   a legacy fallback when the active-default identity has no
+//!                   `GITHUB_PAT_<NAME>` provisioned (S105/GPAT-style
+//!                   transition; the operator has since retired the unsuffixed
+//!                   token in favor of `GITHUB_PAT_MOOSE`, so the fallback is a
+//!                   safety net, not the primary path).
 //! Optional env:
 //!   GITHUB_ORG    — target org (default: moosenet-io)
 //!   GITEA_URL     — Gitea base URL referenced when building the mirror command
@@ -21,8 +31,9 @@
 //!                   at an httpmock server in unit tests, defaults to
 //!                   https://api.github.com in production).
 //!
-//! If GITHUB_TOKEN is unset, NotConfigured stubs are registered so callers get a
-//! clear error rather than a panic.
+//! If neither a `GITHUB_PAT_<NAME>` for the active identity nor `GITHUB_TOKEN`
+//! is set, NotConfigured stubs are registered so callers get a clear error
+//! rather than a panic.
 //!
 //! PII gate (MANDATORY): every WRITE tool here runs its outbound content through
 //! [`pii::pii_gate`] BEFORE any network request fires. There is no flag, env var,
@@ -59,10 +70,12 @@ struct GitHubConfig {
 
 impl GitHubConfig {
     fn from_env() -> Result<Self, ToolError> {
-        let token = std::env::var("GITHUB_TOKEN")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| ToolError::NotConfigured("GITHUB_TOKEN not set".into()))?;
+        // GHTOK-01: resolve through the same identity-first path as
+        // `github_token()` / the mirror engine, rather than a second raw
+        // `GITHUB_TOKEN` read — see `github_token()` below for the resolution
+        // order (GITHUB_PAT_<NAME> for the active identity, GITHUB_TOKEN as
+        // legacy fallback).
+        let token = github_token()?;
         let org = std::env::var("GITHUB_ORG")
             .ok()
             .filter(|s| !s.is_empty())
@@ -96,19 +109,29 @@ impl GitHubConfig {
     }
 }
 
-/// Resolve the `GITHUB_TOKEN` credential — the single sanctioned read point the
-/// mirror push tool (GHMR-04) shares with the rest of the github module. In this
-/// crate secrets are materialised into the process environment at startup by
-/// `secrets_bootstrap` (fetched from the fleet secret store), so this env read IS
-/// the vault access path, centralised here so token handling never sprawls into raw
-/// `std::env::var` calls scattered across the mirror code. Returns
-/// `NotConfigured` (never a panic, never a partial value) when the token is
-/// absent, and the caller must NEVER log or echo the returned string.
+/// Resolve the GitHub write credential — the single sanctioned read point the
+/// mirror push tool (GHMR-04) and the rest of the github module share (GHTOK-01:
+/// `GitHubConfig::from_env` routes through this too, so there is exactly one
+/// place that reads a GitHub token). In this crate secrets are materialised
+/// into the process environment at startup by `secrets_bootstrap` (fetched from
+/// the fleet secret store), so an env read here IS the vault access path —
+/// centralised so token handling never sprawls into raw `std::env::var` calls
+/// scattered across the module.
+///
+/// Resolution order (delegates to [`GitHubAdapter::resolve_token`] — GHTOK-01,
+/// reusing the adapter's identity resolution rather than duplicating it):
+/// 1. `GITHUB_PAT_<NAME>` for the active-default identity (`GITHUB_IDENTITY_NAME`,
+///    default `moose` — so `GITHUB_PAT_MOOSE` in the common case).
+/// 2. The unsuffixed `GITHUB_TOKEN`, kept ONLY as a legacy fallback for a
+///    deployment that has not yet provisioned a per-identity PAT.
+///
+/// Returns `NotConfigured` (never a panic, never a partial value) when NEITHER
+/// is set, and the caller must NEVER log or echo the returned string.
 pub(crate) fn github_token() -> Result<String, ToolError> {
-    std::env::var("GITHUB_TOKEN")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| ToolError::NotConfigured("GITHUB_TOKEN not set".into()))
+    let adapter = GitHubAdapter::from_env().map_err(|e| {
+        ToolError::NotConfigured(format!("GitHub adapter could not be built: {e}"))
+    })?;
+    Ok(adapter.resolve_token(None)?)
 }
 
 // ── Response shaping ──────────────────────────────────────────────────────────
@@ -126,13 +149,21 @@ fn repo_summary(r: &Value) -> Value {
 
 /// Build the `git clone --mirror … && git push --mirror …` command string that
 /// github_push_repo returns. Tokens are referenced as shell variables
-/// ($GITEA_PAT_MOOSE, $GITHUB_TOKEN) and are NOT interpolated, so they never
+/// ($GITEA_PAT_MOOSE, $GITHUB_PAT_MOOSE) and are NOT interpolated, so they never
 /// appear in tool output — identical to the Python behaviour.
 ///
-/// **S105/GPAT:** the Gitea clone uses `$GITEA_PAT_MOOSE`, the default `moose`
-/// gitea identity's token — the unsuffixed `GITEA_TOKEN` was retired fleet-wide
-/// (deleted from the secret store), so the dev box that runs this command now
-/// exports `GITEA_PAT_MOOSE` for its git transport, never a bare `GITEA_TOKEN`.
+/// **S105/GPAT + GHTOK-01:** the Gitea clone uses `$GITEA_PAT_MOOSE`, the
+/// default `moose` gitea identity's token — the unsuffixed `GITEA_TOKEN` was
+/// retired fleet-wide (deleted from the secret store), so the dev box that runs
+/// this command now exports `GITEA_PAT_MOOSE` for its git transport, never a
+/// bare `GITEA_TOKEN`. The GitHub push line now mirrors that same shape: the
+/// operator retired the unsuffixed `GITHUB_TOKEN` and provisioned
+/// `GITHUB_PAT_MOOSE` (the default GitHub identity — see
+/// [`crate::github::adapter::GitHubAdapter`]), so the push line sources its
+/// value from `$GITHUB_PAT_MOOSE` — the same identity `github_token()` resolves
+/// by default — never a raw `$GITHUB_TOKEN` env read. The token's VALUE is
+/// still never interpolated into this string; only the shell variable name is
+/// referenced, so nothing secret ever appears in tool output/logs.
 fn build_mirror_cmd(
     gitea_host: &str,
     gitea_owner: &str,
@@ -907,10 +938,13 @@ struct NotConfiguredStub(&'static str);
 #[async_trait]
 impl RustTool for NotConfiguredStub {
     fn name(&self) -> &str { self.0 }
-    fn description(&self) -> &str { "GitHub tool (GITHUB_TOKEN not configured)" }
+    fn description(&self) -> &str { "GitHub tool (no GITHUB_PAT_<NAME>/GITHUB_TOKEN credential configured)" }
     fn parameters(&self) -> Value { json!({ "type": "object", "properties": {} }) }
     async fn execute(&self, _args: Value) -> Result<String, ToolError> {
-        Err(ToolError::NotConfigured("GITHUB_TOKEN not set".into()))
+        Err(ToolError::NotConfigured(
+            "no GitHub credential configured (set GITHUB_PAT_<NAME> for the active identity, \
+             or the legacy GITHUB_TOKEN)".into(),
+        ))
     }
 }
 
@@ -989,28 +1023,88 @@ mod tests {
         assert_eq!(p["required"][1], "github_repo");
     }
 
-    // ── config ──────────────────────────────────────────────────────────────
+    // ── config / token resolution (GHTOK-01) ──────────────────────────────────
+
+    /// Snapshot + clear the three env vars that drive GitHub credential
+    /// resolution (`GITHUB_PAT_MOOSE`, `GITHUB_TOKEN`, `GITHUB_IDENTITY_NAME`),
+    /// returning the backup so the caller can restore it. Clearing all three
+    /// (not just `GITHUB_TOKEN`) matters now that resolution is PAT-first: a
+    /// real `GITHUB_PAT_MOOSE` materialised into this process's env (e.g. by
+    /// `secrets_bootstrap` on a fully-configured host) would otherwise silently
+    /// win over whatever a test sets up, and a stray `GITHUB_IDENTITY_NAME`
+    /// from another test could change which identity is "default".
+    fn clear_github_credential_env() -> (Option<String>, Option<String>, Option<String>) {
+        let pat = std::env::var("GITHUB_PAT_MOOSE").ok();
+        let tok = std::env::var("GITHUB_TOKEN").ok();
+        let ident = std::env::var("GITHUB_IDENTITY_NAME").ok();
+        std::env::remove_var("GITHUB_PAT_MOOSE");
+        std::env::remove_var("GITHUB_TOKEN");
+        std::env::remove_var("GITHUB_IDENTITY_NAME");
+        (pat, tok, ident)
+    }
+
+    fn restore_github_credential_env(backup: (Option<String>, Option<String>, Option<String>)) {
+        let (pat, tok, ident) = backup;
+        match pat { Some(v) => std::env::set_var("GITHUB_PAT_MOOSE", v), None => std::env::remove_var("GITHUB_PAT_MOOSE") }
+        match tok { Some(v) => std::env::set_var("GITHUB_TOKEN", v), None => std::env::remove_var("GITHUB_TOKEN") }
+        match ident { Some(v) => std::env::set_var("GITHUB_IDENTITY_NAME", v), None => std::env::remove_var("GITHUB_IDENTITY_NAME") }
+    }
 
     #[test]
     #[serial]
     fn config_missing_token_is_not_configured() {
-        let backup = std::env::var("GITHUB_TOKEN").ok();
-        std::env::remove_var("GITHUB_TOKEN");
+        // Neither GITHUB_PAT_MOOSE (default identity) nor legacy GITHUB_TOKEN set.
+        let backup = clear_github_credential_env();
         let r = GitHubConfig::from_env();
-        if let Some(v) = backup { std::env::set_var("GITHUB_TOKEN", v); }
+        restore_github_credential_env(backup);
+        assert!(matches!(r, Err(ToolError::NotConfigured(_))));
+    }
+
+    #[test]
+    #[serial]
+    fn github_token_resolves_pat_moose_first() {
+        // GHTOK-01: when both are set, the per-identity GITHUB_PAT_MOOSE wins
+        // over the legacy unsuffixed GITHUB_TOKEN.
+        let backup = clear_github_credential_env();
+        std::env::set_var("GITHUB_PAT_MOOSE", "pat-moose-value");
+        std::env::set_var("GITHUB_TOKEN", "legacy-token-value");
+        let tok = github_token().unwrap();
+        restore_github_credential_env(backup);
+        assert_eq!(tok, "pat-moose-value");
+    }
+
+    #[test]
+    #[serial]
+    fn github_token_falls_back_to_legacy_github_token() {
+        // GHTOK-01: with no GITHUB_PAT_MOOSE provisioned, the unsuffixed
+        // GITHUB_TOKEN is still honored as a legacy fallback (keeps a
+        // not-yet-migrated deployment working).
+        let backup = clear_github_credential_env();
+        std::env::set_var("GITHUB_TOKEN", "legacy-token-value");
+        let tok = github_token().unwrap();
+        restore_github_credential_env(backup);
+        assert_eq!(tok, "legacy-token-value");
+    }
+
+    #[test]
+    #[serial]
+    fn github_token_not_configured_when_neither_set() {
+        let backup = clear_github_credential_env();
+        let r = github_token();
+        restore_github_credential_env(backup);
         assert!(matches!(r, Err(ToolError::NotConfigured(_))));
     }
 
     #[test]
     #[serial]
     fn config_defaults_org_when_unset() {
-        let tok_backup = std::env::var("GITHUB_TOKEN").ok();
+        let cred_backup = clear_github_credential_env();
         let org_backup = std::env::var("GITHUB_ORG").ok();
-        std::env::set_var("GITHUB_TOKEN", "x");
+        std::env::set_var("GITHUB_PAT_MOOSE", "x");
         std::env::remove_var("GITHUB_ORG");
         let cfg = GitHubConfig::from_env().unwrap();
         assert_eq!(cfg.org, "moosenet-io");
-        if let Some(v) = tok_backup { std::env::set_var("GITHUB_TOKEN", v); } else { std::env::remove_var("GITHUB_TOKEN"); }
+        restore_github_credential_env(cred_backup);
         if let Some(v) = org_backup { std::env::set_var("GITHUB_ORG", v); } else { std::env::remove_var("GITHUB_ORG"); }
     }
 
@@ -1085,7 +1179,10 @@ mod tests {
         // retired bare $GITEA_TOKEN.
         assert!(cmd.contains("$GITEA_PAT_MOOSE"));
         assert!(!cmd.contains("$GITEA_TOKEN"));
-        assert!(cmd.contains("$GITHUB_TOKEN"));
+        // GHTOK-01: the GitHub side sources from $GITHUB_PAT_MOOSE (the default
+        // `moose` identity token), never the retired bare $GITHUB_TOKEN.
+        assert!(cmd.contains("$GITHUB_PAT_MOOSE"));
+        assert!(!cmd.contains("$GITHUB_TOKEN"));
         assert!(cmd.contains("git clone --mirror"));
         assert!(cmd.contains("git push --mirror"));
         assert!(cmd.contains("github.com/moosenet-io/lumina-constellation.git"));
@@ -1150,7 +1247,7 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert!(v.get("cmd").is_some());
         assert_eq!(v["github_url"], "https://github.com/moosenet-io/lumina-constellation");
-        assert!(v["cmd"].as_str().unwrap().contains("$GITHUB_TOKEN"));
+        assert!(v["cmd"].as_str().unwrap().contains("$GITHUB_PAT_MOOSE"));
         // Custom gitea_owner is honoured
         let out2 = tool
             .execute(json!({ "gitea_repo": "r", "github_repo": "r", "gitea_owner": "someone" }))
@@ -1198,10 +1295,27 @@ mod tests {
     #[serial]
     fn register_adds_three_tools_with_token() {
         let mut reg = ToolRegistry::new();
-        let backup = std::env::var("GITHUB_TOKEN").ok();
+        // GHTOK-01: legacy GITHUB_TOKEN alone (no GITHUB_PAT_MOOSE) must still
+        // configure the tools — the fallback path.
+        let backup = clear_github_credential_env();
         std::env::set_var("GITHUB_TOKEN", "testtoken");
         register(&mut reg);
-        if let Some(v) = backup { std::env::set_var("GITHUB_TOKEN", v); } else { std::env::remove_var("GITHUB_TOKEN"); }
+        restore_github_credential_env(backup);
+        assert!(reg.contains("github_list_repos"));
+        assert!(reg.contains("github_create_repo"));
+        assert!(reg.contains("github_push_repo"));
+    }
+
+    #[test]
+    #[serial]
+    fn register_adds_three_tools_with_pat_moose() {
+        // GHTOK-01: the operator-provisioned GITHUB_PAT_MOOSE (default identity)
+        // alone, with no legacy GITHUB_TOKEN, must also configure the tools.
+        let mut reg = ToolRegistry::new();
+        let backup = clear_github_credential_env();
+        std::env::set_var("GITHUB_PAT_MOOSE", "pat-moose-value");
+        register(&mut reg);
+        restore_github_credential_env(backup);
         assert!(reg.contains("github_list_repos"));
         assert!(reg.contains("github_create_repo"));
         assert!(reg.contains("github_push_repo"));
@@ -1210,11 +1324,11 @@ mod tests {
     #[test]
     #[serial]
     fn register_adds_stubs_without_token() {
+        // Neither GITHUB_PAT_MOOSE nor legacy GITHUB_TOKEN configured.
         let mut reg = ToolRegistry::new();
-        let backup = std::env::var("GITHUB_TOKEN").ok();
-        std::env::remove_var("GITHUB_TOKEN");
+        let backup = clear_github_credential_env();
         register(&mut reg);
-        if let Some(v) = backup { std::env::set_var("GITHUB_TOKEN", v); }
+        restore_github_credential_env(backup);
         assert!(reg.contains("github_list_repos"));
         assert!(reg.contains("github_create_repo"));
         assert!(reg.contains("github_push_repo"));
@@ -1860,10 +1974,23 @@ mod tests {
     #[serial]
     fn register_adds_github_push_branch_with_token() {
         let mut reg = ToolRegistry::new();
-        let backup = std::env::var("GITHUB_TOKEN").ok();
+        let backup = clear_github_credential_env();
         std::env::set_var("GITHUB_TOKEN", "testtoken");
         register(&mut reg);
-        if let Some(v) = backup { std::env::set_var("GITHUB_TOKEN", v); } else { std::env::remove_var("GITHUB_TOKEN"); }
+        restore_github_credential_env(backup);
+        assert!(reg.contains("github_push_branch"));
+    }
+
+    #[test]
+    #[serial]
+    fn register_adds_github_push_branch_with_pat_moose() {
+        // GHTOK-01: GITHUB_PAT_MOOSE alone (no legacy GITHUB_TOKEN) configures
+        // the tool too.
+        let mut reg = ToolRegistry::new();
+        let backup = clear_github_credential_env();
+        std::env::set_var("GITHUB_PAT_MOOSE", "pat-moose-value");
+        register(&mut reg);
+        restore_github_credential_env(backup);
         assert!(reg.contains("github_push_branch"));
     }
 
@@ -1871,10 +1998,9 @@ mod tests {
     #[serial]
     fn register_adds_github_push_branch_stub_without_token() {
         let mut reg = ToolRegistry::new();
-        let backup = std::env::var("GITHUB_TOKEN").ok();
-        std::env::remove_var("GITHUB_TOKEN");
+        let backup = clear_github_credential_env();
         register(&mut reg);
-        if let Some(v) = backup { std::env::set_var("GITHUB_TOKEN", v); }
+        restore_github_credential_env(backup);
         assert!(reg.contains("github_push_branch"));
     }
 }
