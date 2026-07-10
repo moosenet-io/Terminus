@@ -17,7 +17,7 @@ compatible provider, not only Gmail.
 |---|---|---|
 | `GOOGLE_LUMINA_EMAIL` | yes | the account address — also the IMAP/SMTP/CalDAV username |
 | `GOOGLE_APP_PASSWORD` | yes | Gmail App Password |
-| `GOOGLE_<NAME>_EMAIL` | no | a secondary personal calendar address to also read; default `<email>` (placeholder). The concrete env-var name is deployment-specific. |
+| `GOOGLE_<NAME>_EMAIL` | no | a secondary personal calendar address to also read; default `<email>` (placeholder). The concrete env-var name is deployment-specific. | <!-- pii-test-fixture -->
 | `GOOGLE_LUMINA_CALENDAR_ID` | no | an extra group calendar id to include when reading |
 | `GOOGLE_EXTRA_CALENDARS` | no | comma-separated extra calendar ids |
 
@@ -245,7 +245,7 @@ Password, using the [`lettre`](https://lettre.rs/) crate (`src/google/smtp.rs:1-
 
 **Behavior.** `looks_like_email` (`src/google/smtp.rs:25-45`) is a lightweight pre-flight
 check — exactly one `@`, non-empty local and domain parts, and a domain `.` that is neither
-the first nor last character (so `<email>` passes but `a@b`, `@example.com`, `user@.com`, and
+the first nor last character (so `<email>` passes but `a@b`, `@example.com`, `user@.com`, and <!-- pii-test-fixture -->
 `user@example.` all fail) — run **before** attempting to parse `to` as a `lettre::Mailbox`, so
 a bad recipient fails fast without ever touching the network. Both `from` (the configured
 account) and `to` are additionally parsed as `Mailbox` values (a stricter RFC 5322 check);
@@ -261,9 +261,9 @@ transport setup or the send itself fails.
 
 ```json
 // request
-{"to": "<email>", "subject": "Trip dates", "body": "Confirmed for March 15."}
+{"to": "<email>", "subject": "Trip dates", "body": "Confirmed for March 15."} <!-- pii-test-fixture -->
 // response (tool output, plain text)
-"Email sent to <email> — subject: Trip dates"
+"Email sent to <email> — subject: Trip dates" <!-- pii-test-fixture -->
 ```
 
 ---

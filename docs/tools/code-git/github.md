@@ -175,7 +175,7 @@ unreadable file, it just skips it (`pii.rs:511-514`, `pii.rs:533-537`).
 
 ```json
 // request
-{ "name": "github_pii_scan", "arguments": { "content": "contact <email> about this" } }
+{ "name": "github_pii_scan", "arguments": { "content": "contact <email> about this" } } <!-- pii-test-fixture -->
 ```
 ```json
 // response (content is JSON-encoded as a string by the tool's Ok(String) return)
@@ -308,7 +308,7 @@ executed via the `dev_run_command` tool on the dev workstation (`mod.rs:372-433`
      unsuffixed `GITEA_TOKEN` was retired fleet-wide, so this must be `$GITEA_PAT_MOOSE`, not
      a bare `$GITEA_TOKEN` — enforced by the test `mirror_cmd_uses_shell_token_vars_not_values`
      (`mod.rs:1073-1096`).
-   - `git push --mirror[ --force] https://$<email>/{org}/{github_repo}.git`
+   - `git push --mirror[ --force] https://$<email>/{org}/{github_repo}.git` <!-- pii-test-fixture -->
      — again a shell variable, never a literal token. Per GHTOK-01 the GitHub side now
      mirrors the Gitea side: it references `$GITHUB_PAT_MOOSE` (the default `moose` GitHub
      identity's PAT, the same identity `github_token()` resolves), not the retired bare
@@ -334,7 +334,7 @@ description and in [`code-git/forge.md`](forge.md)).
   "arguments": { "gitea_repo": "lumina-constellation", "github_repo": "lumina-constellation" } }
 ```
 ```json
-{ "cmd": "cd /tmp && rm -rf _mirror_tmp && git clone --mirror http://oauth2:$GITEA_PAT_MOOSE@<your-gitea-host>/moosenet/lumina-constellation.git _mirror_tmp && cd _mirror_tmp && git push --mirror https://$<email>/moosenet-io/lumina-constellation.git && \\\ncd /tmp && rm -rf _mirror_tmp && echo MIRROR_OK",
+{ "cmd": "cd /tmp && rm -rf _mirror_tmp && git clone --mirror http://oauth2:$GITEA_PAT_MOOSE@<your-gitea-host>/moosenet/lumina-constellation.git _mirror_tmp && cd _mirror_tmp && git push --mirror https://$<email>/moosenet-io/lumina-constellation.git && \\\ncd /tmp && rm -rf _mirror_tmp && echo MIRROR_OK", <!-- pii-test-fixture -->
   "note": "Run this via dev_run_command on the dev workstation. Tokens sourced from shell env, not embedded. Pre-push hook scans for PII.",
   "github_url": "https://github.com/moosenet-io/lumina-constellation" }
 ```
@@ -485,9 +485,9 @@ Built-in (`Patterns` struct, `pii.rs:31-44`; matched per-line by `scan_line()`, 
 | `container_id` | Internal container identifiers of the shape `CT` + 3 digits | `\bCT\d{3}\b` (`pii.rs:53`) |
 | `internal_hostname` | A fixed, case-insensitive set of internal host short-names (compiled from source, not enumerated further here since the names themselves are the sensitive value being redacted) | `(?i)\b(?:...)\b` (`pii.rs:54`) |
 | `internal_domain` | The two internal DNS domains used fleet-wide | matched literally in source (`pii.rs:56`) |
-| `email` | Any `<email>`-shaped string, unless allow-listed (see below) | `[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}` (`pii.rs:58`) |
+| `email` | Any `<email>`-shaped string, unless allow-listed (see below) | `[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}` (`pii.rs:58`) | <!-- pii-test-fixture -->
 | `phone` | Digit runs of 9+ chars with optional leading `+` and internal spaces/hyphens, **except** spans that overlap a `uuid`/`date_like` match on the same line | `\+?\d[\d\s\-]{8,}\d` (`pii.rs:60`), overlap-excluded at `pii.rs:214-224` |
-| `api_key` | Known secret-key prefixes (`sk-`, `ghp_`, `gsk_`, `glpat-`, and the Slack `xox[bpasr]-` family) followed by non-whitespace | `\b(?:sk-\|ghp_\|gsk_\|glpat-\|xox[bpasr]-)\S+` (`pii.rs:61`) |
+| `api_key` | Known secret-key prefixes (`sk-`, `ghp_`, `gsk_`, `glpat-`, and the Slack `xox[bpasr]-` family) followed by non-whitespace | `\b(?:sk-\|ghp_\|gsk_\|glpat-\|xox[bpasr]-)\S+` (`pii.rs:61`) | <!-- pii-test-fixture -->
 | `internal_path` | A fixed set of internal absolute path prefixes (the crate's own convention for "this is a host-specific filesystem path, never mirror it literally") | `pii.rs:63` |
 | `local_url` | `localhost`/`127.0.0.1`/`0.0.0.0` followed by a 4-5 digit port | `(?:localhost\|127\.0\.0\.1\|0\.0\.0\.0):\d{4,5}` (`pii.rs:65`) |
 | `infra_service` | A fixed, case-insensitive set of named internal infrastructure services | `(?i)\b(?:...)\b` (`pii.rs:67`) |
@@ -505,7 +505,7 @@ Extension rules (`extension_rules()`, tree-sweep only unless the caller opts in 
 | `ssh_key` | `-----BEGIN ... PRIVATE KEY-----` PEM header (`pii.rs:342`) |
 | `aws_access_key` | `AKIA` + 16 uppercase-alnum chars (`pii.rs:343`) |
 | `google_api_key` | `AIza` + 35 chars (`pii.rs:344`) |
-| `slack_user_token` | `xoxp-` + 10+ alnum/hyphen chars (`pii.rs:345`) |
+| `slack_user_token` | `xoxp-` + 10+ alnum/hyphen chars (`pii.rs:345`) | <!-- pii-test-fixture -->
 | `generic_secret` | `password`/`secret`/`token` (case-insensitive) `= "..."` or `: '...'` with an 8+ char quoted value (`pii.rs:347-349`) |
 
 Config-driven (`PiiConfig`, `pii.rs:314-331`, loaded via `PiiRuleSet::from_config`,

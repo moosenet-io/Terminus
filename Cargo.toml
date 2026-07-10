@@ -23,7 +23,7 @@ readme = "README.md"
 name = "terminus_rs"
 path = "src/lib.rs"
 
-# TGW-01: `terminus-primary`, the <host> aggregated-core-registry gateway
+# TGW-01: `terminus-primary`, the aggregated-core-registry gateway
 # binary, joins `terminus_personal` (already auto-discovered via
 # `src/bin/*.rs`) as an explicit `[[bin]]` entry for clarity. Cargo's
 # `src/bin/` autodiscovery already covers this path implicitly; this entry
@@ -103,7 +103,7 @@ jsonwebtoken = "9"
 # `rcgen` was pinned to `x509-parser`'s feature above.
 time = { version = "0.3", default-features = false }
 lettre = { version = "0.11", default-features = false, features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "builder", "ring"] }
-# <host> personal MCP server (src/bin/terminus_personal.rs): a standalone
+# The standalone personal MCP server (src/bin/terminus_personal.rs): a
 # streamable-HTTP MCP server exposing the personal-utility tool subset.
 # Same axum/tower versions Chord (moosenet/Chord) pins, for convention parity.
 axum = { version = "0.7", features = ["json", "macros"] }

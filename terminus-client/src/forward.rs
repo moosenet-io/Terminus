@@ -430,12 +430,12 @@ mod tests {
             "name": "gitea_create_repo",
             "arguments": {
                 "auth_token": "super-secret-value",
-                "nested": {"jwt": "<REDACTED-SECRET>", "note": "keep me"}
+                "nested": {"jwt": "<REDACTED-SECRET>", "note": "keep me"} // pii-test-fixture
             }
         });
         let rendered = sanitize_for_log(&value);
         assert!(!rendered.contains("super-secret-value"));
-        assert!(!rendered.contains("<REDACTED-SECRET>"));
+        assert!(!rendered.contains("<REDACTED-SECRET>")); // pii-test-fixture
         assert!(rendered.contains("keep me"));
         assert!(rendered.contains("<redacted>"));
     }

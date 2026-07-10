@@ -63,8 +63,8 @@ spec_id: S104-github-mirror-engine
 - **Description:** Grow the existing `src/github/pii.rs` into the authoritative tree-sweep engine
   and retire the Python `.githooks/pii_gate.py`. A reusable function scans a directory tree (not
   just staged files) and returns structured violations `{file, line, pattern_kind, matched_span}`
-  for: private IPs (`10.x`, `172.16-31.x`, `192.168.x`), API-key prefixes (`ghp_`/`github_pat_`/
-  `gto_`/`glpat-`/`sk-…`), configured PII terms/infra-service names, emails, and username paths —
+  for: private IPs (`10.x`, `172.16-31.x`, `192.168.x`), API-key prefixes (`ghp_`/`github_pat_`/ <!-- pii-test-fixture -->
+  `gto_`/`glpat-`/`sk-…`), configured PII terms/infra-service names, emails, and username paths — <!-- pii-test-fixture -->
   honoring the `// pii-test-fixture` exemption (per the structural-import precedent). Provide both a
   library API (for the mirror engine, GHMR-03/04) and a thin Rust pre-push hook binary that replaces
   the Python hook across repos.

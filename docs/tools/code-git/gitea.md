@@ -301,7 +301,7 @@ Response (JSON string):
   "full_name": "moosenet/new-tool",
   "html_url": "https://gitea.example/moosenet/new-tool",
   "clone_url": "https://gitea.example/moosenet/new-tool.git",
-  "ssh_url": "<email>:moosenet/new-tool.git"
+  "ssh_url": "<email>:moosenet/new-tool.git" <!-- pii-test-fixture -->
 }
 ```
 
@@ -881,7 +881,7 @@ found, else `None`. Patterns checked, in order:
    flagged only if that number falls in `16..=31` inclusive (verified by
    `test_pii_gate_allows_172_15`, `mod.rs:2452-2457`, which confirms `172.15.x.x` is
    correctly treated as public/non-RFC-1918).
-4. **`sk-` API-key-shaped tokens** — after an `sk-` occurrence, if the following run of
+4. **`sk-` API-key-shaped tokens** — after an `sk-` occurrence, if the following run of <!-- pii-test-fixture -->
    alphanumeric/`-`/`_` characters is `>= 20` chars, it's flagged as an API key.
 5. **Long hex runs** — any contiguous run of `>= 32` hex digits anywhere in the content is
    flagged as a probable secret/bearer token, independent of the other checks.
