@@ -1512,6 +1512,29 @@ tree are unrelated: SSH command allowlists, <secret-manager> secret-key allowlis
 A `"*"` entry allows every action for that identity. Malformed JSON degrades to an empty
 (deny-everyone) policy with a loud `tracing::error!`, rather than panicking the process at startup.
 
+**`lumina` / `harmony` scaffold (LHEG-02, S109 lumina/harmony egress-client sprint).**
+`AllowlistPolicy::from_env()` always includes `lumina` and `harmony` (the identities LHEG-01 lets
+`lumina-core`/`harmony-core` enroll as) as recognized entries with an **empty** action list, even
+if `TERMINUS_GATEWAY_ALLOWLIST_JSON` never mentions them — so the moment either identity finishes
+enrollment it has an explicit, visible deny-all entry rather than an implicit "absent, therefore
+denied" gap. This is scaffolding only: neither identity is granted any real tool or route by
+default, and in particular **neither is ever a default source of `moose`-only, `github_*`, or
+mirror access** (per the S109 spec's minimum-necessary-allowlist decision). If the env JSON
+explicitly grants one of them routes, that grant wins in full for that identity (no merge with the
+empty scaffold default). LHEG-07 is the later item that populates their real grants:
+
+```json
+{
+  "dev-box": ["*"],
+  "lumina":  [],
+  "harmony": []
+}
+```
+
+The `"lumina": []` / `"harmony": []` lines above are the scaffold default and don't need to be
+written explicitly in `TERMINUS_GATEWAY_ALLOWLIST_JSON` — they're applied automatically by
+`from_env()` when absent; write them only once LHEG-07 changes them to real route lists.
+
 **Rate limit (`gateway_framework::rate_limit`).** An explicitly **interim, single-process** token
 bucket per `(identity, action)` key (`InProcessRateLimiter`) — burst capacity
 `TERMINUS_GATEWAY_RATE_LIMIT_BURST` (default 20), refill rate

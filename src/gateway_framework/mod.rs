@@ -25,6 +25,13 @@
 //!    this item (confirmed by searching for prior "allowlist" hits — the
 //!    existing ones are all for unrelated things: SSH command allowlists,
 //!    a secret-manager key allowlist, etc., not tool/route access control).
+//!    LHEG-02 (S109 lumina/harmony egress-client sprint) scaffolds `lumina`
+//!    and `harmony` into [`AllowlistPolicy::from_env`]'s result as
+//!    recognized-but-empty entries — see [`SCAFFOLDED_IDENTITIES`] — so
+//!    those two identities (LHEG-01 lets `lumina-core`/`harmony-core`
+//!    enroll as them) are explicitly deny-all from the moment enrollment
+//!    succeeds, not just implicitly absent. LHEG-07 is the later item that
+//!    grants either identity real routes.
 //! 3. **Rate-limit** — `crate::gateway_framework::rate_limit`: an interim
 //!    in-process token bucket per `(identity, action)`. Explicitly scoped as
 //!    replaceable by a later Redis-backed limiter (Phase P4 / S100
@@ -86,6 +93,31 @@ pub enum ActionKind {
     Inference,
 }
 
+/// Identities scaffolded into every `from_env()`-built [`AllowlistPolicy`]
+/// as recognized-but-empty (deny-by-default) entries — LHEG-02 (Terminus
+/// S109 lumina/harmony egress-client sprint). `lumina` and `harmony` are the
+/// Terminus identities LHEG-01 lets `lumina-core`/`harmony-core` enroll as;
+/// this scaffold exists so a freshly-enrolled identity has a defined,
+/// explicit zero-permission entry in the allowlist the moment enrollment
+/// succeeds, rather than a window where its access is merely "absent and
+/// therefore denied" (functionally identical, but LHEG-02's point is to
+/// make the intent visible in the policy shape, not rely on an implicit
+/// gap). LHEG-07 is the item that grants either identity real routes; until
+/// then both stay in this list with an empty action set. Neither identity
+/// is ever granted `moose`-only, `github_*`, or mirror-related actions by
+/// this scaffold or any default derived from it — see the S109 spec's
+/// RESOLVED decision 2 (minimum-necessary allowlists, not `*`).
+pub const SCAFFOLDED_IDENTITIES: &[&str] = &["lumina", "harmony"];
+
+/// The scaffold entries themselves: each [`SCAFFOLDED_IDENTITIES`] identity
+/// mapped to an empty action list.
+fn scaffold_defaults() -> HashMap<String, Vec<String>> {
+    SCAFFOLDED_IDENTITIES
+        .iter()
+        .map(|id| ((*id).to_string(), Vec::new()))
+        .collect()
+}
+
 /// Per-identity allow policy: which tool names / inference routes each
 /// enrolled identity may use. Config-driven
 /// (`crate::config::gateway_allowlist_json`, a JSON object of
@@ -103,25 +135,40 @@ pub struct AllowlistPolicy {
 impl AllowlistPolicy {
     /// Build a policy directly from a map — mainly for tests and for
     /// callers that already have the data in hand rather than as env JSON.
+    /// Does NOT apply the [`SCAFFOLDED_IDENTITIES`] defaults (those are a
+    /// `from_env()`-only convenience for the production entrypoint) — a
+    /// caller using this constructor directly gets exactly the map it
+    /// passed, nothing implicit added.
     pub fn new(entries: HashMap<String, Vec<String>>) -> Self {
         Self { entries }
     }
 
-    /// Build a policy from `crate::config::gateway_allowlist_json`. A
-    /// malformed JSON value degrades to an empty (default-deny-everything)
-    /// policy rather than panicking the process at startup — a config typo
-    /// should not crash the gateway, it should just deny everyone until
-    /// fixed (loudly logged so the operator notices).
+    /// Build a policy from `crate::config::gateway_allowlist_json`, with
+    /// [`SCAFFOLDED_IDENTITIES`] (`lumina`, `harmony`) always present as
+    /// recognized, empty-grant entries unless the env JSON itself grants
+    /// them real routes (LHEG-07) — env wins per-identity: any identity the
+    /// env JSON mentions, including `lumina`/`harmony`, uses the env value
+    /// in full, not a merge of the two action lists. A malformed JSON value
+    /// degrades to the scaffold-only policy (still deny-all for every
+    /// identity except the always-empty `lumina`/`harmony` entries) rather
+    /// than panicking the process at startup — a config typo should not
+    /// crash the gateway, it should just deny everyone until fixed (loudly
+    /// logged so the operator notices).
     pub fn from_env() -> Self {
         let raw = crate::config::gateway_allowlist_json();
+        let mut entries = scaffold_defaults();
         match serde_json::from_str::<HashMap<String, Vec<String>>>(&raw) {
-            Ok(entries) => Self { entries },
+            Ok(parsed) => {
+                entries.extend(parsed);
+                Self { entries }
+            }
             Err(e) => {
                 tracing::error!(
                     "gateway_framework: TERMINUS_GATEWAY_ALLOWLIST_JSON is not valid JSON \
-                     ({e}) -- falling back to an empty (deny-all) allowlist policy"
+                     ({e}) -- falling back to the scaffold-only (deny-all except the \
+                     always-empty lumina/harmony entries) allowlist policy"
                 );
-                Self::default()
+                Self { entries }
             }
         }
     }
@@ -442,6 +489,92 @@ mod tests {
         assert!(policy.is_allowed("dev-box", "ledger_accounts"));
         assert!(policy.is_allowed("dev-box", "literally_anything"));
         assert!(!policy.is_allowed("someone-else", "ledger_accounts"));
+        std::env::remove_var("TERMINUS_GATEWAY_ALLOWLIST_JSON");
+    }
+
+    // ── LHEG-02: lumina/harmony scaffold (recognized, deny-by-default) ──
+
+    /// LHEG-02 acceptance criterion: `lumina` and `harmony` are recognized
+    /// by the allowlist with zero granted routes when no env override
+    /// mentions them at all.
+    #[test]
+    fn lumina_and_harmony_are_scaffolded_as_known_but_empty_by_default() {
+        std::env::remove_var("TERMINUS_GATEWAY_ALLOWLIST_JSON");
+        let policy = AllowlistPolicy::from_env();
+        assert!(policy.has_any_entry("lumina"), "lumina must be a recognized identity");
+        assert!(policy.has_any_entry("harmony"), "harmony must be a recognized identity");
+    }
+
+    /// LHEG-02 acceptance criterion: a dispatch attempt from either
+    /// scaffolded identity is rejected for every route/tool before LHEG-07
+    /// grants anything, including for the `*` action name itself (an empty
+    /// grant list denies literally everything, not just specific names).
+    #[tokio::test]
+    async fn lumina_and_harmony_scaffold_denies_every_action_before_lheg_07() {
+        std::env::remove_var("TERMINUS_GATEWAY_ALLOWLIST_JSON");
+        let fw = framework_with(AllowlistPolicy::from_env(), 10);
+
+        for id_str in SCAFFOLDED_IDENTITIES {
+            let id = identity(id_str);
+            for action in ["ledger_accounts", "gitea_list_identities", "/v1/chat/completions", "*"] {
+                let result = fw.guard(Some(&id), action, ActionKind::Tool).await;
+                assert!(
+                    result.is_err(),
+                    "{id_str} must be denied for '{action}' until LHEG-07 grants routes"
+                );
+                assert_eq!(result.unwrap_err().status(), StatusCode::FORBIDDEN);
+            }
+        }
+    }
+
+    /// Neither scaffolded identity's default (empty) grant list contains a
+    /// `moose`-only, `github_*`, or mirror-related action -- trivially true
+    /// for an empty list, but asserted explicitly since the S109 spec's
+    /// RESOLVED decision 2 calls this out as a hard requirement, not an
+    /// incidental consequence of deny-by-default.
+    #[test]
+    fn lumina_and_harmony_scaffold_grants_no_moose_github_or_mirror_access() {
+        std::env::remove_var("TERMINUS_GATEWAY_ALLOWLIST_JSON");
+        let policy = AllowlistPolicy::from_env();
+        for id_str in SCAFFOLDED_IDENTITIES {
+            for action in ["moose_only_admin", "github_create_repo", "github_push", "mirror_publish"] {
+                assert!(!policy.is_allowed(id_str, action));
+            }
+        }
+    }
+
+    /// Env JSON still wins per-identity: if the operator's
+    /// `TERMINUS_GATEWAY_ALLOWLIST_JSON` explicitly grants `lumina` a
+    /// route (the LHEG-07 end state), that grant is honored in full rather
+    /// than being shadowed by the empty scaffold default.
+    #[test]
+    fn env_override_for_a_scaffolded_identity_still_wins() {
+        std::env::set_var(
+            "TERMINUS_GATEWAY_ALLOWLIST_JSON",
+            r#"{"lumina": ["/v1/chat/completions"]}"#,
+        );
+        let policy = AllowlistPolicy::from_env();
+        assert!(policy.is_allowed("lumina", "/v1/chat/completions"));
+        assert!(!policy.is_allowed("lumina", "gitea_list_identities"));
+        // harmony wasn't mentioned in the env override -- still scaffolded
+        // as recognized-but-empty.
+        assert!(policy.has_any_entry("harmony"));
+        assert!(!policy.is_allowed("harmony", "/v1/chat/completions"));
+        std::env::remove_var("TERMINUS_GATEWAY_ALLOWLIST_JSON");
+    }
+
+    /// A malformed `TERMINUS_GATEWAY_ALLOWLIST_JSON` still degrades to a
+    /// safe policy that recognizes lumina/harmony (empty grants) rather
+    /// than losing the scaffold entirely -- the fail-closed fallback and
+    /// the LHEG-02 scaffold are not mutually exclusive.
+    #[test]
+    fn malformed_env_json_still_scaffolds_lumina_and_harmony_deny_all() {
+        std::env::set_var("TERMINUS_GATEWAY_ALLOWLIST_JSON", "not valid json");
+        let policy = AllowlistPolicy::from_env();
+        assert!(policy.has_any_entry("lumina"));
+        assert!(policy.has_any_entry("harmony"));
+        assert!(!policy.is_allowed("lumina", "anything"));
+        assert!(!policy.is_allowed("harmony", "anything"));
         std::env::remove_var("TERMINUS_GATEWAY_ALLOWLIST_JSON");
     }
 }
