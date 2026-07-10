@@ -37,9 +37,11 @@ summary).
 - [plane_list_issues_by_state](#plane_list_issues_by_state)
 - [plane_get_issue_by_sequence](#plane_get_issue_by_sequence)
 - [plane_batch_create_work_items](#plane_batch_create_work_items)
+- [plane_batch_status](#plane_batch_status)
 - [plane_close_work_item](#plane_close_work_item)
 - [plane_get_state_by_name](#plane_get_state_by_name)
 - [plane_list_recent_activity](#plane_list_recent_activity)
+- [Fairness scoping (PWQ-03)](#fairness-scoping-pwq-03)
 
 ## plane_list_work_items
 
@@ -292,7 +294,16 @@ State: <state|unknown>
 
 ## plane_batch_create_work_items
 
-`mod.rs:2623-2708`. Creates multiple issues sequentially in one call.
+`mod.rs` (PWQ-01/03, S111B). Enqueues multiple issues for creation and returns immediately.
+
+**Why it's async (S111B incident)**: before PWQ-01 this tool ran a synchronous serial `for` loop
+— the whole forwarded MCP call blocked for the entire drain (N items × the shared Plane rate
+limiter's ~3s pacing interval). A 7-item batch (~18-21s) exceeded the client→primary forward
+timeout under concurrent load from a second agent sharing the same identity, causing the call to
+time out even though every individual write would have succeeded. PWQ-01 replaced the blocking
+loop with: validate all items → enqueue a Redis-backed job → hand it to a process-wide fair-share
+dispatcher for a background drain (still fully paced by the *same*, *unchanged* rate limiter) →
+return the `batch_id` immediately. The forwarded MCP call is now O(ms) regardless of batch size.
 
 **Input schema**
 
@@ -301,26 +312,95 @@ State: <state|unknown>
 | `project_id` | string | yes | UUID or identifier |
 | `items` | array\<object\> | yes | Must be non-empty. Each item: `name` (string, required), `description_html`, `priority`, `state` (all optional strings) |
 | `identity` | string | no | See [Multi-identity](README.md#multi-identity) |
+| `scope` | string | no | PWQ-03: optional fairness/grouping scope (e.g. a task or sprint id). Overrides the calling connection's own scope, but only within the caller's own identity. Omit to use the connection's scope (see [Fairness scoping](#fairness-scoping-pwq-03) below). |
 
-**Behavior**: resolves `project_id` once, then issues one POST per item **sequentially** (not
-concurrently — each POST still passes through the shared rate limiter, so a large batch is paced
-like any other calls). Each item's `name` is validated individually with the item's index in the
-error message (`items[N] missing required field: name`) before any network call for that item.
-There is **no all-or-nothing transaction**: a failure partway through leaves earlier items
-created and later items un-attempted — the tool returns the error from the failing item's POST,
-and the caller must inspect what was already created (there is no automatic rollback of prior
-successful creates in the batch).
+**Behavior**: all items are validated up front (fail fast — nothing is enqueued if any item is
+missing `name`), then `project_id` is resolved once. If a Redis job store is configured and
+reachable, the batch is persisted as a job record (`batch_id`, one pending result per item, 1h
+TTL) and handed to the shared drain dispatcher; the tool returns immediately. **If no Redis job
+store is available, the tool transparently falls back to the pre-PWQ-01 synchronous behavior**
+(each item POSTed in order, in-line, still individually validated) and the response text notes
+`"Redis job store unavailable — executed synchronously, degraded mode"` so a caller/operator can
+tell which path ran. In BOTH modes there is still no all-or-nothing transaction: a failing item
+is recorded/returned as failed without rolling back items already created.
 
-**Output shape** (on full success):
+**Output shape (async path — Redis available)**:
+```
+Batch queued: N item(s) accepted (batch_id: <uuid>). Poll results with plane_batch_status.
+```
+`structuredContent`: `{"batch_id": "...", "accepted": N, "status": "running", "poll_with": "plane_batch_status"}`.
+Poll [`plane_batch_status`](#plane_batch_status) with the returned `batch_id` for per-item results.
+
+**Output shape (synchronous fallback — no Redis)**:
 ```
 Batch-created N issue(s):
   1/N: [<uuid>] <name> (#<sequence>)
   2/N: [<uuid>] <name> (#<sequence>)
   ...
+(note: Redis job store unavailable — executed synchronously, degraded mode; batch writes will block the caller for large batches)
 ```
 
-**Errors**: `InvalidArgument` if `items` is missing/empty or an item lacks `name`; otherwise the
-shared HTTP error table, surfaced as soon as one item's POST fails (stopping the batch there).
+**Errors**: `InvalidArgument` if `items` is missing/empty or an item lacks `name` (checked before
+anything is enqueued or POSTed). In the synchronous fallback, the shared HTTP error table applies
+to whichever item's POST failed, stopping the batch there (unchanged pre-PWQ-01 behavior). In the
+async path, per-item HTTP failures never raise a tool-level error — they're recorded as `failed`
+results in the job (see `plane_batch_status`), and the drain continues past them.
+
+## plane_batch_status
+
+`mod.rs` (PWQ-02, S111B). Polls a batch started by `plane_batch_create_work_items`.
+
+**Input schema**
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `batch_id` | string | yes | Returned by `plane_batch_create_work_items` |
+
+**Behavior**: reads the Redis job record directly (never touches Plane). Reports overall status
+(`running`/`done`) and every item's `pending`/`created`/`failed` result. An unknown or expired
+`batch_id` (job records expire after 1 hour, or the batch never used the async path) is a clear
+non-error result, not a crash: `"Unknown or expired batch: <id>"`,
+`structuredContent: {"batch_id": "...", "found": false}`. Calling this tool when no Redis job
+store is configured at all is a hard `NotConfigured` error ("batches run synchronously and have
+no pollable status") rather than a misleading "unknown batch".
+
+**Output shape**:
+```
+Batch <id>: running — 2 created, 1 failed, 4 pending (of 7)
+  0: created [<uuid>] <name> (#<sequence>)
+  1: failed — <error>
+  2: pending
+  ...
+```
+`structuredContent`: `{"batch_id", "found": true, "status", "total", "created", "failed", "pending", "items": [...]}`.
+
+## Fairness scoping (PWQ-03)
+
+Every Plane write is paced by one shared rate limiter (`PLANE_RPM`/`PLANE_RATE_SHARE`, ~3s
+between requests) — necessary to stay within Plane's own limits, but it means two concurrent
+callers **sharing the same identity** (e.g. two Claude Code agents in the same container, both
+carrying the `claude` PAT — the S111B incident's actual concurrency scenario) could previously
+only be told apart by a Redis key that didn't exist below the identity level, and a large batch
+from one caller could head-of-line-block a small request from the other.
+
+PWQ-03 adds a caller **scope** below the identity:
+- `terminus-client-daemon` mints a stable id per MCP client connection (via the peer socket
+  address; a real MCP client that keeps its connection alive keeps the same scope for its whole
+  session) and tags every forwarded `tools/call` with it as MCP-standard `_meta.scope` —
+  metadata about the call, never a tool argument the model sees or can fabricate a different
+  connection's value for.
+- The primary folds that into the dispatched arguments under a reserved key
+  (`__conn_scope`) before calling the tool.
+- `plane_batch_create_work_items`'s own `scope` argument overrides the connection's scope for
+  per-task grouping, but only within the caller's own identity — it can never widen the write
+  budget to another identity's traffic.
+- When a scope is present, the distributed Redis rate key becomes
+  `plane:ratelimit:{identity}:{scope}` instead of the single shared `plane:ratelimit:global` key
+  — so a scoped batch's pacing budget is independent of unrelated traffic sharing the same Redis.
+  Absent a scope, behavior is byte-for-byte unchanged (the original global key).
+- Independent of Redis, a single process-wide dispatcher drains ALL active batches **round-robin
+  across scopes** (one item per scope per turn), so one large batch can never starve a smaller
+  one queued moments later, even within the same process/identity.
 
 ## plane_close_work_item
 
