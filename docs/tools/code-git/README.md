@@ -5,7 +5,7 @@
 The **Code &amp; Git** domain is Terminus's software-engineering surface: the tools an
 agentic coding session uses to read and mutate source, publish to public mirrors, run
 commands on a workstation, delegate autonomous coding tasks, analyze a repository's
-structure and risk, and generate documentation. Seven modules, ~48 tools, split across
+structure and risk, and generate documentation. Seven tools, ~48 actions, split across
 three concerns — **source control** (`gitea`, `github`, `forge`), **dev execution**
 (`dev`, `openhands`), and **code intelligence &amp; docs** (`cortex`, `scribe`).
 
@@ -21,7 +21,7 @@ examples.
 
 ## Modules
 
-| Module | Tools | What it is |
+| Tool | Actions | What it is |
 | --- | --- | --- |
 | [`gitea.md`](gitea.md) | 15 | Terminus's self-hosted Gitea integration — list/get/create repos, read/create/update/delete files, list/create/merge PRs, list branches &amp; directories, Cargo-registry publish/yank, and multi-identity listing. Every write resolves a `GITEA_PAT_<NAME>` identity and passes through the write-path PII gate first. |
 | [`github.md`](github.md) | 5 | The public-GitHub write path — repo listing/creation, a Gitea→GitHub mirror-push builder, and a subprocess-free Git Data API branch pusher — with a mandatory, unbypassable PII scan (`github_pii_scan`) gating every write before it reaches the network. |

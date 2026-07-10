@@ -2,14 +2,18 @@
 
 [← docs index](../README.md)
 
-Terminus registers ~300 tools across 51 domain modules (`src/registry.rs`'s
-`register_all` and `register_personal` — see
+Terminus provides ~51 **tools**, one per integrated service (`src/registry.rs`'s
+`register_all` / `register_personal` — see
 [`architecture/federation.md`](../architecture/federation.md) for which
-registry serves which module). This page groups every module into one of five
-domains plus the **MINT** flagship harness, with an approximate tool count and
-a one-line description sourced from that module's own top-of-file doc comment
-or registration site — never guessed. Each module links to its planned
-per-tool reference page(s) under `docs/tools/<domain>/`; those pages are
+registry serves which tool). Each tool exposes a set of **actions** — the
+individually-named MCP callables an MCP client sees in `tools/list` (e.g. the
+GitHub tool's `github_create_repo`, `github_list_repos`, …). Those actions vary
+with the backing service and change over time, so counts here are approximate;
+across all tools there are ~300 individual MCP actions in total. This page
+groups every tool into one of five domains plus the **MINT** flagship harness,
+with a one-line description sourced from that tool's own top-of-file doc comment
+or registration site — never guessed. Each tool links to its
+reference page(s) under `docs/tools/<domain>/`; those pages are
 filled in by sibling doc pages, one per tool, covering the exact input
 schema, output shape, error paths, and a worked example.
 
@@ -48,12 +52,12 @@ delegation.
 
 ## Domains
 
-### Code & Git — 7 modules · [domain index](code-git/README.md)
+### Code & Git — 7 tools · [domain index](code-git/README.md)
 
 Source control, dev workspace access, agentic coding, code-graph analysis,
 and documentation generation.
 
-| Module | Tools | What it does | Page |
+| Tool | Actions | What it does | Page |
 | --- | --- | --- | --- |
 | `gitea` | ~16 | Gitea source-control API — repos, files, PRs, merges, Cargo-registry publish/yank; every write runs the PII gate first. | [`code-git/gitea.md`](code-git/gitea.md) |
 | `github` | ~9 | GitHub tool + the git-public mirror engine subtools (`git_public_mirror_status/_prepare/_approve/_push`) that drive the PII-swept public-mirror pipeline. | [`code-git/github.md`](code-git/github.md) |
@@ -63,14 +67,14 @@ and documentation generation.
 | `cortex` | ~10 | Code-graph / blast-radius / risk-scoring system — architecture, dependency, and review-flow analysis over a repo. | [`code-git/cortex.md`](code-git/cortex.md) |
 | `scribe` | ~5 | Standing documentation agent — generates READMEs, wikis, and other knowledge-infrastructure artifacts from a repo. | [`code-git/scribe.md`](code-git/scribe.md) |
 
-### Project & Planning — 7 modules
+### Project & Planning — 7 tools
 
 Work tracking, task/dev-loop queues, inter-agent messaging, and scheduled
 reminders.
 
-| Module | Tools | What it does | Page |
+| Tool | Actions | What it does | Page |
 | --- | --- | --- | --- |
-| `plane` | ~37 | Full Plane CE work-management surface over its REST API — issues, modules, multi-identity (`PLANE_PAT_<NAME>`) CRUD, prefix registry. The largest single module in the hub. | [`project-planning/plane/README.md`](project-planning/plane/README.md) |
+| `plane` | ~37 | Full Plane CE work-management surface over its REST API — issues, modules, multi-identity (`PLANE_PAT_<NAME>`) CRUD, prefix registry. The largest single tool in the hub. | [`project-planning/plane/README.md`](project-planning/plane/README.md) |
 | `axon` | ~4 | Postgres-backed work-order / task queue (submit, status, list, cancel). | [`project-planning/axon.md`](project-planning/axon.md) |
 | `vector` | ~11 | Autonomous dev-loop agent control over a Postgres-backed queue (submit, status, queue depth, halt). | [`project-planning/vector.md`](project-planning/vector.md) |
 | `nexus` | ~5 | Postgres-backed inter-agent inbox (send, check, read, ack, history). | [`project-planning/nexus.md`](project-planning/nexus.md) |
@@ -78,11 +82,11 @@ reminders.
 | `routines` | ~7 | Named, cron-like scheduler routines owned by an external scheduler service. | [`project-planning/routines.md`](project-planning/routines.md) |
 | `skills` | ~3 | Filesystem CRUD over `active/`/`proposed/` skill directories (create, list, read). | [`project-planning/skills.md`](project-planning/skills.md) |
 
-### Infra & Ops — 14 modules
+### Infra & Ops — 14 tools
 
 Fleet health, automation, secrets, networking, and admin surfaces.
 
-| Module | Tools | What it does | Page |
+| Tool | Actions | What it does | Page |
 | --- | --- | --- | --- |
 | `ansible` | ~4 | Gated Ansible playbook execution — run, list playbooks, last-run status, view run log. | [`infra-ops/ansible.md`](infra-ops/ansible.md) |
 | `dura` | ~7 | Sysadmin/health-check tools (constellation health, service checks, smoke tests) — a hardened rewrite of a shell-heavy legacy tool. | [`infra-ops/dura.md`](infra-ops/dura.md) |
@@ -99,12 +103,12 @@ Fleet health, automation, secrets, networking, and admin surfaces.
 | `gateway` | ~2 | Surfaces the Lumina API Gateway / dashboard (`dashboard_refresh` and related). | [`infra-ops/dashboard.md`](infra-ops/dashboard.md) |
 | `sundry` | ~6 | Small one-off utility tools that don't warrant their own module: `health`, `echo`, `utc_now`, `constellation_version`, `vector_onboard`, `searxng_search`. | [`infra-ops/sundry.md`](infra-ops/sundry.md) |
 
-### Models & Review — 7 modules
+### Models & Review — 7 tools
 
 Model inference plumbing, local/multi-provider code review, and model
 selection/profiling (MINT's tool-facing side).
 
-| Module | Tools | What it does | Page |
+| Tool | Actions | What it does | Page |
 | --- | --- | --- | --- |
 | `intake` | 4 | The MINT model-intake profiling framework's MCP-facing tools (`model_intake`, `model_intake_status`, `model_intake_compare`, `model_intake_fleet`) — see [MINT flagship](#mint-flagship) above. | [`mint/`](mint/) |
 | `dgem` | ~4 | Drives a persistent DiffusionGemma (`llama-diffusion-daemon`) HTTP daemon for near-zero-cost local code review and generation. | [`models-review/dgem.md`](models-review/dgem.md) |
@@ -114,12 +118,12 @@ selection/profiling (MINT's tool-facing side).
 | `litellm` | ~6 | Read-only status and model queries against the LiteLLM proxy. | [`models-review/litellm.md`](models-review/litellm.md) |
 | `tools` | ~3 | A small grouping of additional tool modules that live under `src/tools/` rather than the crate root. | [`models-review/serving.md`](models-review/serving.md) |
 
-### Personal & Life — 16 modules
+### Personal & Life — 16 tools
 
 Finance, health, travel, home, media, and general life-admin integrations —
 the bulk of the `terminus_personal` registry.
 
-| Module | Tools | What it does | Page |
+| Tool | Actions | What it does | Page |
 | --- | --- | --- | --- |
 | `meridian` | ~5 | Simulated paper-trading crypto portfolio sandbox (portfolio, market data, analysis, report, reset). | [`personal-life/meridian.md`](personal-life/meridian.md) |
 | `odyssey` | ~8 | Trip planning — bucket list, loyalty cards, trip log, deals, research, optimize. | [`personal-life/odyssey.md`](personal-life/odyssey.md) |

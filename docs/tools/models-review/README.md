@@ -5,11 +5,11 @@
 Tools for profiling fleet models, reviewing code changes with local or
 multi-provider LLM panels, consulting a deep-reasoning council, recommending
 model fleets against a VRAM budget, and reading back live serving/proxy
-status. Seven modules, 21 tools total.
+status. Seven tools, 21 actions total.
 
 <img src="../../../assets/models-review-domain.svg" alt="Models & Review domain: seven modules spanning profiling, review, consultation, recommendation, and live status" width="100%">
 
-| Module | Tools | What it does | Page |
+| Tool | Actions | What it does | Page |
 |---|---|---|---|
 | `intake` | 4 | The MCP front door to **MINT**, the fleet model-profiling harness: `model_intake` (profile one model), `model_intake_status` (read back a stored profile), `model_intake_compare` (cross-model metric table), `model_intake_fleet` (profile the entire catalog overnight). The harness internals live in the [MINT flagship manual](../mint/README.md); this page covers just the four tool schemas. | [`intake.md`](intake.md) |
 | `dgem` | 4 | DiffusionGemma local-inference tools (`dgem_generate`, `dgem_review`, `dgem_status`, `dgem_batch`) — a persistent GPU-host daemon reached over loopback HTTP, the build pipeline's $0 local secondary reviewer. | [`dgem.md`](dgem.md) |
