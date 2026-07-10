@@ -33,15 +33,48 @@
 //! everything else is TCLI-03's job.
 //!
 //! ## Secrets
-//! Both `TERMINUS_ENROLLMENT_SHARED_SECRET` and `TERMINUS_JWT_SIGNING_KEY`
-//! are read via the env-materialized runtime secret store, matching the
-//! convention `crate::pki`'s CA bootstrap already established for this crate
-//! (see that module's doc comment) — never `std::env::var` treated as a
-//! literal source of truth, always the materialized-secret-store read.
+//! `TERMINUS_JWT_SIGNING_KEY` is read via the env-materialized runtime
+//! secret store, matching the convention `crate::pki`'s CA bootstrap already
+//! established for this crate (see that module's doc comment) — never
+//! `std::env::var` treated as a literal source of truth, always the
+//! materialized-secret-store read.
+//!
+//! ## Per-identity enrollment secrets (LHEG-01, S109)
+//! As of LHEG-01, the bootstrap credential is looked up **per requested
+//! identity**: `TERMINUS_ENROLLMENT_SHARED_SECRET_<IDENTITY_UPPERCASE>`
+//! (e.g. `TERMINUS_ENROLLMENT_SHARED_SECRET_LUMINA`,
+//! `TERMINUS_ENROLLMENT_SHARED_SECRET_HARMONY`,
+//! `TERMINUS_ENROLLMENT_SHARED_SECRET_CLAUDE`,
+//! `TERMINUS_ENROLLMENT_SHARED_SECRET_MOOSE`). A caller holding only the
+//! `..._LUMINA` value can only ever match the comparison run for identity
+//! `lumina` — it cannot enroll as `moose` or any other identity, because the
+//! lookup key (and therefore the value compared against) is derived from the
+//! identity *being requested*, not supplied by the caller directly. This is
+//! the structural mechanism (not merely a policy statement) that makes
+//! "Lumina/Harmony cannot act as the Moose identity" true.
+//!
+//! **Non-breaking legacy fallback:** if no per-identity secret is configured
+//! for the requested identity, enrollment falls back to the legacy
+//! unsuffixed `TERMINUS_ENROLLMENT_SHARED_SECRET` (logging a
+//! `tracing::warn!` deprecation notice each time it's used). This keeps the
+//! existing terminus-primary + dev-box enroller path working during the
+//! per-identity migration. The unsuffixed secret is intentionally NOT
+//! removed by this item — that is a later hard-cutover cleanup once
+//! per-identity secrets are fully provisioned for every real enroller. The
+//! no-Moose guarantee above still holds operationally: `lumina`/`harmony`
+//! are provisioned only with their own `_LUMINA`/`_HARMONY` secret, never
+//! the unsuffixed value or `_MOOSE`.
+//!
+//! Both the per-identity and legacy secrets are read via the same
+//! env-materialized runtime secret store as `TERMINUS_JWT_SIGNING_KEY`
+//! above, and compared to the presented secret in constant time
+//! ([`constant_time_eq`]). An unset/empty secret always fails closed (never
+//! "everyone's welcome").
 //!
 //! ## Audit logging (S6)
-//! Enrollment log lines carry identity + issuance timestamp + cert serial —
-//! never the private key, the bootstrap secret, or the JWT itself.
+//! Enrollment log lines carry identity + issuance timestamp + cert serial
+//! (and, for the legacy-fallback path, the fact that the fallback was used)
+//! — never the private key, the bootstrap secret, or the JWT itself.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -124,11 +157,15 @@ pub struct EnrollmentClaims {
 /// error message (no internal detail beyond "rejected" / "invalid").
 #[derive(Debug, Error)]
 pub enum EnrollError {
-    /// The bootstrap shared secret is missing from the enrollment endpoint's
-    /// own runtime secret store — an operator provisioning gap, not a client
-    /// error, but still surfaced as a rejection (never "everyone's welcome"
-    /// fail-open).
-    #[error("enrollment is not configured: TERMINUS_ENROLLMENT_SHARED_SECRET is unset")]
+    /// Neither the requested identity's per-identity secret
+    /// (`TERMINUS_ENROLLMENT_SHARED_SECRET_<IDENTITY>`) nor the legacy
+    /// unsuffixed `TERMINUS_ENROLLMENT_SHARED_SECRET` fallback is configured
+    /// — an operator provisioning gap, not a client error, but still
+    /// surfaced as a rejection (never "everyone's welcome" fail-open). The
+    /// message deliberately does not echo the identity name back verbatim
+    /// (kept generic) so this endpoint doesn't confirm/deny which specific
+    /// identities are provisioned to an unauthenticated caller.
+    #[error("enrollment is not configured for the requested identity")]
     NotConfigured,
     /// The presented shared secret didn't match, or was empty.
     #[error("invalid or missing enrollment shared secret")]
@@ -188,7 +225,31 @@ fn env_nonempty(key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// Handle one enrollment request: validate the bootstrap secret + identity,
+/// The legacy, unsuffixed shared-secret env var name — the pre-LHEG-01
+/// bootstrap credential, kept only as a non-breaking fallback (see the
+/// module doc's "Per-identity enrollment secrets" section).
+const LEGACY_SHARED_SECRET_ENV: &str = "TERMINUS_ENROLLMENT_SHARED_SECRET";
+
+/// Build the per-identity enrollment secret's env var name:
+/// `TERMINUS_ENROLLMENT_SHARED_SECRET_<IDENTITY_UPPERCASE>`.
+///
+/// Callers MUST validate `identity` via [`is_valid_identity`] before calling
+/// this (both call sites in [`handle_enrollment`] validate first) — the
+/// identity charset `is_valid_identity` enforces (lowercase ASCII
+/// alphanumerics + hyphens only) is exactly what makes this transform safe:
+/// hyphens become underscores and letters are uppercased, so an
+/// already-validated identity can never inject anything beyond a legal
+/// Rust/shell env var name (no key-injection surprise per the spec's edge
+/// cases).
+fn identity_secret_env_key(identity: &str) -> String {
+    let normalized: String = identity
+        .chars()
+        .map(|c| if c == '-' { '_' } else { c.to_ascii_uppercase() })
+        .collect();
+    format!("{LEGACY_SHARED_SECRET_ENV}_{normalized}")
+}
+
+/// Handle one enrollment request: validate the identity + bootstrap secret,
 /// then issue a signed leaf cert + paired JWT.
 ///
 /// Re-enrollment (an identity that already has an outstanding cert) is not
@@ -199,20 +260,44 @@ pub fn handle_enrollment(
     ca: &CertificateAuthority,
     req: &EnrollmentRequest,
 ) -> Result<EnrollmentResponse, EnrollError> {
-    let expected = env_nonempty("TERMINUS_ENROLLMENT_SHARED_SECRET").ok_or(EnrollError::NotConfigured)?;
-
-    if req.shared_secret.is_empty()
-        || !constant_time_eq(req.shared_secret.as_bytes(), expected.as_bytes())
-    {
-        tracing::warn!("pki::enroll: rejected enrollment attempt (invalid shared secret)");
-        return Err(EnrollError::Unauthorized);
-    }
-
+    // Identity shape is validated FIRST (before any secret lookup): the
+    // per-identity env key is derived from the requested identity, so the
+    // identity must be well-formed before it's used to build that key
+    // (key-injection guard, per the spec's edge cases).
     if !is_valid_identity(&req.identity) {
         tracing::warn!(
             "pki::enroll: rejected enrollment attempt for disallowed identity name pattern"
         );
         return Err(EnrollError::InvalidIdentity(req.identity.clone()));
+    }
+
+    let per_identity_key = identity_secret_env_key(&req.identity);
+    let (expected, used_legacy_fallback) = match env_nonempty(&per_identity_key) {
+        Some(secret) => (secret, false),
+        None => match env_nonempty(LEGACY_SHARED_SECRET_ENV) {
+            Some(secret) => {
+                tracing::warn!(
+                    identity = %req.identity,
+                    "pki::enroll: DEPRECATED — no {per_identity_key} configured for this \
+                     identity, falling back to the legacy unsuffixed \
+                     TERMINUS_ENROLLMENT_SHARED_SECRET; provision a per-identity secret and \
+                     retire this fallback"
+                );
+                (secret, true)
+            }
+            None => return Err(EnrollError::NotConfigured),
+        },
+    };
+
+    if req.shared_secret.is_empty()
+        || !constant_time_eq(req.shared_secret.as_bytes(), expected.as_bytes())
+    {
+        tracing::warn!(
+            identity = %req.identity,
+            legacy_fallback = used_legacy_fallback,
+            "pki::enroll: rejected enrollment attempt (invalid shared secret)"
+        );
+        return Err(EnrollError::Unauthorized);
     }
 
     let (cert_pem, key_pem, serial) = issue_leaf_cert(ca, &req.identity)?;
@@ -560,6 +645,159 @@ mod tests {
             "re-enrollment must issue a fresh cert, not reuse the prior one"
         );
 
+        clear_secrets();
+    }
+
+    // ── LHEG-01: per-identity enrollment secrets ───────────────────────────
+
+    fn clear_identity_secrets() {
+        for key in [
+            "TERMINUS_ENROLLMENT_SHARED_SECRET_LUMINA",
+            "TERMINUS_ENROLLMENT_SHARED_SECRET_HARMONY",
+            "TERMINUS_ENROLLMENT_SHARED_SECRET_MOOSE",
+            "TERMINUS_ENROLLMENT_SHARED_SECRET_CLAUDE",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn identity_secret_env_key_uppercases_and_maps_hyphens() {
+        assert_eq!(
+            identity_secret_env_key("lumina"),
+            "TERMINUS_ENROLLMENT_SHARED_SECRET_LUMINA"
+        );
+        assert_eq!(
+            identity_secret_env_key("dev-box-claude-code"),
+            "TERMINUS_ENROLLMENT_SHARED_SECRET_DEV_BOX_CLAUDE_CODE"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn per_identity_secret_matches_enrolls_as_that_identity() {
+        clear_secrets();
+        clear_identity_secrets();
+        set_secrets("legacy-not-used-here", "jwt-signing-key-for-tests-only");
+        std::env::remove_var("TERMINUS_ENROLLMENT_SHARED_SECRET"); // no legacy fallback available
+        std::env::set_var("TERMINUS_ENROLLMENT_SHARED_SECRET_LUMINA", "lumina-only-secret");
+        let ca = CertificateAuthority::generate().expect("generate CA");
+
+        let req = EnrollmentRequest {
+            identity: "lumina".to_string(),
+            shared_secret: "<REDACTED-SECRET>".to_string(),
+        };
+        let resp = handle_enrollment(&ca, &req)
+            .expect("matching per-identity secret must enroll as that identity");
+        assert!(resp.cert_pem.contains("BEGIN CERTIFICATE"));
+
+        clear_identity_secrets();
+        clear_secrets();
+    }
+
+    #[test]
+    #[serial]
+    fn wrong_per_identity_secret_with_no_legacy_fallback_is_rejected() {
+        clear_secrets();
+        clear_identity_secrets();
+        std::env::set_var("TERMINUS_JWT_SIGNING_KEY", "jwt-signing-key-for-tests-only");
+        std::env::remove_var("TERMINUS_ENROLLMENT_SHARED_SECRET"); // no legacy fallback available
+        std::env::set_var("TERMINUS_ENROLLMENT_SHARED_SECRET_LUMINA", "lumina-only-secret");
+        let ca = CertificateAuthority::generate().expect("generate CA");
+
+        let req = EnrollmentRequest {
+            identity: "lumina".to_string(),
+            shared_secret: "<REDACTED-SECRET>".to_string(),
+        };
+        let err = handle_enrollment(&ca, &req).expect_err("wrong per-identity secret must be rejected");
+        assert!(matches!(err, EnrollError::Unauthorized));
+
+        clear_identity_secrets();
+        clear_secrets();
+    }
+
+    #[test]
+    #[serial]
+    fn identity_with_no_configured_secret_and_no_legacy_fallback_is_rejected() {
+        clear_secrets();
+        clear_identity_secrets();
+        std::env::set_var("TERMINUS_JWT_SIGNING_KEY", "jwt-signing-key-for-tests-only");
+        std::env::remove_var("TERMINUS_ENROLLMENT_SHARED_SECRET"); // no legacy fallback available
+        // Only `_LUMINA` is provisioned; `harmony` has nothing.
+        std::env::set_var("TERMINUS_ENROLLMENT_SHARED_SECRET_LUMINA", "lumina-only-secret");
+        let ca = CertificateAuthority::generate().expect("generate CA");
+
+        let req = EnrollmentRequest {
+            identity: "harmony".to_string(),
+            shared_secret: "<REDACTED-SECRET>".to_string(),
+        };
+        let err = handle_enrollment(&ca, &req)
+            .expect_err("identity with no configured secret and no legacy fallback must fail closed");
+        assert!(matches!(err, EnrollError::NotConfigured));
+
+        clear_identity_secrets();
+        clear_secrets();
+    }
+
+    #[test]
+    #[serial]
+    fn lumina_secret_enrolls_lumina_but_not_moose() {
+        // Structural no-Moose guarantee: a caller holding ONLY the `_LUMINA`
+        // secret can successfully enroll as `lumina`, but presenting that
+        // same secret value while requesting identity `moose` must be
+        // rejected — the comparison is always against `moose`'s OWN secret
+        // (unset here), never `lumina`'s.
+        clear_secrets();
+        clear_identity_secrets();
+        std::env::set_var("TERMINUS_JWT_SIGNING_KEY", "jwt-signing-key-for-tests-only");
+        std::env::remove_var("TERMINUS_ENROLLMENT_SHARED_SECRET"); // no legacy fallback available
+        std::env::set_var("TERMINUS_ENROLLMENT_SHARED_SECRET_LUMINA", "lumina-only-secret");
+        let ca = CertificateAuthority::generate().expect("generate CA");
+
+        let lumina_req = EnrollmentRequest {
+            identity: "lumina".to_string(),
+            shared_secret: "<REDACTED-SECRET>".to_string(),
+        };
+        assert!(
+            handle_enrollment(&ca, &lumina_req).is_ok(),
+            "lumina's own secret must enroll lumina"
+        );
+
+        // Negative test (per LHEG-01 test plan): attempt enrollment as
+        // `moose` using the `_LUMINA` secret value.
+        let moose_req = EnrollmentRequest {
+            identity: "moose".to_string(),
+            shared_secret: "<REDACTED-SECRET>".to_string(),
+        };
+        let err = handle_enrollment(&ca, &moose_req)
+            .expect_err("the _LUMINA secret must never enroll identity moose");
+        assert!(matches!(err, EnrollError::NotConfigured));
+
+        clear_identity_secrets();
+        clear_secrets();
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_unsuffixed_fallback_still_works_when_no_per_identity_secret_set() {
+        // Non-breaking fallback (RESOLVED decision #1, S109): if no
+        // per-identity secret is configured, enrollment falls back to the
+        // legacy unsuffixed TERMINUS_ENROLLMENT_SHARED_SECRET so the
+        // existing terminus-primary / dev-box enroller path keeps working.
+        clear_secrets();
+        clear_identity_secrets();
+        set_secrets("legacy-shared-secret", "jwt-signing-key-for-tests-only");
+        let ca = CertificateAuthority::generate().expect("generate CA");
+
+        let req = EnrollmentRequest {
+            identity: "some-legacy-enroller".to_string(),
+            shared_secret: "<REDACTED-SECRET>".to_string(),
+        };
+        let resp = handle_enrollment(&ca, &req)
+            .expect("legacy unsuffixed fallback must still enroll when no per-identity secret is set");
+        assert!(resp.cert_pem.contains("BEGIN CERTIFICATE"));
+
+        clear_identity_secrets();
         clear_secrets();
     }
 
