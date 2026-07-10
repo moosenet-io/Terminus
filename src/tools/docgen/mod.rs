@@ -42,6 +42,7 @@
 //! target's API.
 
 pub mod config;
+pub mod versioning;
 
 use std::collections::BTreeSet;
 
