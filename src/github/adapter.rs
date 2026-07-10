@@ -229,7 +229,7 @@ impl GitHubAdapter {
     ///   the unsuffixed `GITHUB_TOKEN` when that identity has no PAT.
     /// - No configured credential at all is a clean [`ForgeError::Auth`], never
     ///   an empty `Authorization` header sent to GitHub.
-    fn resolve_token(&self, identity: Option<&str>) -> Result<String, ForgeError> {
+    pub(crate) fn resolve_token(&self, identity: Option<&str>) -> Result<String, ForgeError> {
         let auth = |m: String| ForgeError::Auth { provider: "github".into(), message: m };
         let token = match identity.map(str::trim).filter(|s| !s.is_empty()) {
             Some(name) => {

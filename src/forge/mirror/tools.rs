@@ -26,9 +26,11 @@
 //!   * `git_public_mirror_push`    — **guarded**, **fast-forward-only** publish of the
 //!     OPERATOR-BLESSED work-dir commit (the `mirror-blessed/<sha>` marker — NOT
 //!     prepare's machine tag, so a prepare→push shortcut cannot skip approve) to the
-//!     repo's `github_remote`, using `GITHUB_TOKEN`
-//!     (via [`crate::github::github_token`], never raw-logged, injected through
-//!     `GIT_ASKPASS` — never embedded in the remote URL or argv). Refuses any
+//!     repo's `github_remote`, using the resolved GitHub credential
+//!     (`GITHUB_PAT_<NAME>` for the default identity — `GITHUB_PAT_MOOSE` — with
+//!     legacy `GITHUB_TOKEN` as a fallback; via [`crate::github::github_token`],
+//!     never raw-logged, injected through `GIT_ASKPASS` — never embedded in the
+//!     remote URL or argv). Refuses any
 //!     non-fast-forward move and points at the GHMR-07 bootstrap; NEVER force-pushes.
 //!
 //! ## Dev-box-only transport, logic-in-terminus
@@ -36,8 +38,10 @@
 //! work-dir git ops of GHMR-03 and the `git push` here) RUNS ON THE DEV BOX — the
 //! sanctioned git-transport host — because these tools shell out to `git` locally
 //! (same `std::process::Command` posture GHMR-03 established). No other host ever
-//! holds a GitHub credential: the push reads `GITHUB_TOKEN` from the dev box's own
-//! materialised environment and injects it only into the child `git` process.
+//! holds a GitHub credential: the push resolves the default identity's
+//! `GITHUB_PAT_<NAME>` (`GITHUB_PAT_MOOSE`, legacy `GITHUB_TOKEN` fallback) from
+//! the dev box's own materialised environment and injects it only into the child
+//! `git` process.
 //!
 //! ## Force-push-free
 //! Every git argv this module builds is passed through GHMR-03's
@@ -560,8 +564,10 @@ impl RustTool for GitPublicMirrorPush {
     fn description(&self) -> &str {
         "GUARDED. Fast-forward-only publish of a repo's approved mirror snapshot to its \
          GitHub remote. Pushes the commit behind mirror-approved/<internal-sha> to the \
-         remote's main using GITHUB_TOKEN (injected via GIT_ASKPASS, never in the URL/argv, \
-         never logged). REFUSES any non-fast-forward move (and an un-bootstrapped remote), \
+         remote's main using the resolved GitHub credential (GITHUB_PAT_<NAME> for the \
+         default identity, i.e. GITHUB_PAT_MOOSE, falling back to legacy GITHUB_TOKEN; \
+         injected via GIT_ASKPASS, never in the URL/argv, never logged). REFUSES any \
+         non-fast-forward move (and an un-bootstrapped remote), \
          pointing at the GHMR-07 bootstrap; NEVER force-pushes. Runs on the dev box only. \
          Requires 'repo' and 'source'; the remote comes from 'github_remote' or \
          TERMINUS_MIRROR_REMOTE[_<REPO>]."

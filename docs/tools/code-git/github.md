@@ -38,12 +38,17 @@ itself puts in the registry, plus the `pii.rs` engine they all share.
 
 | Env var | Required | Default | Purpose |
 | --- | --- | --- | --- |
-| `GITHUB_TOKEN` | yes | — | GitHub personal-access/app token. Missing or empty ⇒ `ToolError::NotConfigured("GITHUB_TOKEN not set")` (`mod.rs:62-65`). Needs the `repo` scope (push/create) plus `admin:org` to create/push under an org (`mod.rs:13-15`). |
+| `GITHUB_PAT_<NAME>` | yes (or `GITHUB_TOKEN`) | — | Per-identity GitHub personal-access/app token, resolved for the active default identity (`GITHUB_IDENTITY_NAME`, default `moose` — so `GITHUB_PAT_MOOSE` in practice) via the adapter's `resolve_token`. Needs the `repo` scope (push/create) plus `admin:org` to create/push under an org (`mod.rs:13-17`). (GHTOK-01) |
+| `GITHUB_TOKEN` | fallback | — | Legacy unsuffixed operator token, honored **only** when the active-default identity has no `GITHUB_PAT_<NAME>` provisioned. If neither this nor a `GITHUB_PAT_<NAME>` is set ⇒ `ToolError::NotConfigured` (`mod.rs`, `github_token()`). The operator has since retired the unsuffixed token in favor of `GITHUB_PAT_MOOSE`. |
 | `GITHUB_ORG` | no | `moosenet-io` (`DEFAULT_ORG`, `mod.rs:46`) | Target org for `github_list_repos`/`github_create_repo` and the default `owner` for `github_push_branch`. |
 | `GITEA_URL` | no | `https://gitea.example.com` (`DEFAULT_GITEA_URL`, `mod.rs:47`) | Base URL referenced when `github_push_repo` builds its mirror command. |
 | `GITHUB_API_BASE` | no | `https://api.github.com` (`GITHUB_API`, `mod.rs:48`) | Test-only override so unit tests can point at an `httpmock` server instead of the real API (`mod.rs:20-22`); leave unset in production. |
 
-If `GitHubConfig::from_env()` fails (no `GITHUB_TOKEN`), `register()` does **not** panic or
+`GitHubConfig::from_env()` resolves its token through `github_token()` (GHTOK-01), so the
+config credential follows the same `GITHUB_PAT_<NAME>`-first, `GITHUB_TOKEN`-fallback order
+as the mirror push path — there is one credential-read point, not two.
+
+If `GitHubConfig::from_env()` fails (no `GITHUB_PAT_<NAME>` and no `GITHUB_TOKEN`), `register()` does **not** panic or
 silently omit the tools — it logs a warning and registers `NotConfiguredStub` placeholders
 under the same four names (`github_list_repos`, `github_create_repo`, `github_push_repo`,
 `github_push_branch`), each of which always returns `ToolError::NotConfigured` when called
@@ -62,14 +67,24 @@ hardening described under [the adapter](#the-adapter-a-second-broader-surface) b
 
 ### Credential resolution (`github_token()`)
 
-A second, narrower credential helper, `pub(crate) fn github_token()` (`mod.rs:107-112`), is
-documented in its own doc comment as "the single sanctioned read point the mirror push tool
-(GHMR-04) shares with the rest of the github module." It reads `GITHUB_TOKEN` directly
-(trim/empty-check, `NotConfigured` on absence) and exists so that mirror-related code never
-scatters its own raw `std::env::var("GITHUB_TOKEN")` calls. In this crate, secrets are
+The single credential helper `pub(crate) fn github_token()` is "the single sanctioned read
+point the mirror push tool (GHMR-04) shares with the rest of the github module" — and, as of
+GHTOK-01, `GitHubConfig::from_env()` also routes through it, so there is exactly one place in
+the module that reads a GitHub token. Rather than reading `GITHUB_TOKEN` directly, it now
+delegates to the adapter's identity resolution (`GitHubAdapter::from_env().resolve_token(None)`),
+which resolves in this order:
+
+1. `GITHUB_PAT_<NAME>` for the active-default identity (`GITHUB_IDENTITY_NAME`, default
+   `moose` — so `GITHUB_PAT_MOOSE` in the common case).
+2. The unsuffixed `GITHUB_TOKEN`, kept **only** as a legacy fallback for a deployment that
+   has not yet provisioned a per-identity PAT.
+
+`NotConfigured` is returned when **neither** is set. This keeps mirror-related code from
+scattering its own raw `std::env::var("GITHUB_TOKEN")` calls and gives the module the same
+per-identity resolution the `forge` adapter already used. In this crate, secrets are
 materialized into the process environment at startup by a `secrets_bootstrap` step sourced
-from the fleet secret store, so this env read *is* the vault access path (`mod.rs:99-106`)
-— not a bypass of it. The caller must never log or echo the returned string.
+from the fleet secret store, so this env read *is* the vault access path — not a bypass of
+it. The caller must never log or echo the returned string.
 
 ### The PII gate is mandatory, not configurable
 
@@ -90,8 +105,11 @@ below) — every other category is unconditional.
 
 ## Auth, identity, and allowlist notes
 
-This module (as opposed to `adapter.rs`) has **no per-identity credential model and no
-egress allowlist**: it authenticates purely as `GITHUB_TOKEN` against whatever
+This module (as opposed to `adapter.rs`) still has **no egress allowlist** and issues its own
+HTTP calls, but as of GHTOK-01 it no longer reads a raw `GITHUB_TOKEN`: its credential is
+resolved through `github_token()`, which reuses the adapter's `GITHUB_PAT_<NAME>`-first
+identity resolution (default `moose` → `GITHUB_PAT_MOOSE`, legacy `GITHUB_TOKEN` fallback).
+The resolved token is what it authenticates with against whatever
 `GITHUB_API_BASE` resolves to (real API in production, `httpmock` in tests), and it does not
 constrain which GitHub hosts it will contact beyond the fixed `api.github.com`
 (`GITHUB_API`, `mod.rs:48`) it builds URLs against for `github_list_repos` and
@@ -291,7 +309,10 @@ executed via the `dev_run_command` tool on the dev workstation (`mod.rs:372-433`
      a bare `$GITEA_TOKEN` — enforced by the test `mirror_cmd_uses_shell_token_vars_not_values`
      (`mod.rs:1073-1096`).
    - `git push --mirror[ --force] https://$<email>/{org}/{github_repo}.git`
-     — again a shell variable, never a literal token (`mod.rs:153-155`);
+     — again a shell variable, never a literal token. Per GHTOK-01 the GitHub side now
+     mirrors the Gitea side: it references `$GITHUB_PAT_MOOSE` (the default `moose` GitHub
+     identity's PAT, the same identity `github_token()` resolves), not the retired bare
+     `$GITHUB_TOKEN` — enforced by `mirror_cmd_uses_shell_token_vars_not_values`;
    - cleans up `_mirror_tmp` and echoes `MIRROR_OK` on success.
 5. Returns `{"cmd": <the command string>, "note": "Run this via dev_run_command on the dev
    workstation. Tokens sourced from shell env, not embedded. Pre-push hook scans for PII.",
@@ -602,7 +623,9 @@ violation is cleared, but an *untagged* real violation on the very next line sti
 
 | Var | Read by |
 | --- | --- |
-| `GITHUB_TOKEN` | `GitHubConfig::from_env`, `github_token()` |
+| `GITHUB_PAT_<NAME>` | `github_token()` → `GitHubAdapter::resolve_token` (default identity `moose` ⇒ `GITHUB_PAT_MOOSE`); `GitHubConfig::from_env` via `github_token()` (GHTOK-01) |
+| `GITHUB_IDENTITY_NAME` | `GitHubAdapter::from_env` — active default identity (default `moose`) |
+| `GITHUB_TOKEN` | `github_token()` → `GitHubAdapter::resolve_token` — **legacy fallback only** when the default identity has no PAT |
 | `GITHUB_ORG` | `GitHubConfig::from_env` |
 | `GITEA_URL` | `GitHubConfig::from_env` (used by `github_push_repo`'s mirror command) |
 | `GITHUB_API_BASE` | `GitHubConfig::from_env` (test-only override) |
