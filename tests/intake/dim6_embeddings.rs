@@ -84,22 +84,18 @@ fn shipped_corpora_parse_and_pass_pii_gate() {
 
 #[test]
 fn pii_gate_blocks_infra_names_and_secrets() {
-    assert!(scan_pii("the node at <internal-ip> hosts it").is_some());
-    assert!(scan_pii("see <host> for the orchestrator").is_some());
+    assert!(scan_pii("the node at <internal-ip> hosts it").is_some()); // pii-test-fixture
+    assert!(scan_pii("see <host> for the orchestrator").is_some()); // pii-test-fixture
     assert!(scan_pii("email <email>").is_some()); // pii-test-fixture
-    assert!(scan_pii("Authorization: Bearer abc123").is_some());
-    assert!(scan_pii("the operator <operator> prefers direct feedback").is_some());
+    assert!(scan_pii("Authorization: Bearer abc123").is_some()); // pii-test-fixture
+    assert!(scan_pii("the operator <operator> prefers direct feedback").is_some()); // pii-test-fixture
     // abstracted prose passes
     assert!(scan_pii("the orchestrator delegates bulk work to sub-agents").is_none());
 }
 
 #[test]
 fn corpus_loader_rejects_pii_taint() {
-    let tainted = r#"{
-        "name":"bad","k":2,
-        "docs":[{"id":"d1","text":"reach the box at <internal-ip> now"}],
-        "queries":[{"id":"q1","text":"clean query text","relevant":["d1"]}]
-    }"#;
+    let tainted = r#"{"name":"bad","k":2,"docs":[{"id":"d1","text":"reach the box at <internal-ip> now"}],"queries":[{"id":"q1","text":"clean query text","relevant":["d1"]}]}"#; // pii-test-fixture
     assert!(Corpus::from_json(tainted).is_err(), "PII doc must be rejected");
 }
 

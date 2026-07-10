@@ -37,7 +37,6 @@ struct Patterns {
     phone: Regex,
     api_key: Regex,
     internal_path: Regex,
-    local_url: Regex,
     infra_service: Regex,
     uuid: Regex,
     date_like: Regex,
@@ -62,15 +61,23 @@ fn patterns() -> &'static Patterns {
             .expect("api_key regex"),
         internal_path: Regex::new(r"<path>/|<path>/|<path>/|/opt/lumina[a-z0-9-]*/") // pii-test-fixture
             .expect("internal_path regex"),
-        local_url: Regex::new(r"(?:localhost|127\.0\.0\.1|0\.0\.0\.0):\d{4,5}")
-            .expect("local_url regex"),
         infra_service: Regex::new(r"(?i)\b(?:<matrix-server>|<secret-manager>|<media-service>|<container-mgr>)\b") // pii-test-fixture
             .expect("infra_service regex"),
         uuid: Regex::new(
             r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
         )
         .expect("uuid regex"),
-        date_like: Regex::new(r"\b\d{4}-\d{2}-\d{2}\b").expect("date_like regex"),
+        // Bare ISO date (`YYYY-MM-DD`) OR an ISO date immediately followed by
+        // a `T` (the start of an ISO-8601 datetime, e.g. a JSON
+        // `"timestamp": "2026-07-10T14:32:07Z"` field or a truncated
+        // `"2026-07-09T…"` doc example). The plain-date alt keeps its `\b`
+        // word-boundary anchors (needed so it doesn't swallow a longer digit
+        // run); the datetime alt intentionally has none at the end because
+        // `\d{2}\b` fails to match right before `T` (both are "word" chars,
+        // so `\b` never fires there) — GHMRFIX-gate-tune found this was
+        // letting ISO datetimes fall through to the `phone` matcher.
+        date_like: Regex::new(r"\b\d{4}-\d{2}-\d{2}T|\b\d{4}-\d{2}-\d{2}\b")
+            .expect("date_like regex"),
     })
 }
 
@@ -138,6 +145,36 @@ fn byte_ceil(s: &str, mut i: usize) -> usize {
     i
 }
 
+/// Whether a raw `phone` regex match is actually phone-SHAPED rather than a
+/// hash-digest fragment, a unix timestamp, or an arbitrary large integer ID.
+///
+/// The `phone` regex (`\+?\d[\d\s\-]{8,}\d`) matches any run of 10+ digits
+/// with optional internal spaces/hyphens and an optional leading `+` — which
+/// also matches: digit runs embedded in a hex string (a SHA prefix whose
+/// digits happen to have no letters), bare unix timestamps (`1717000000`),
+/// and large signed integer IDs. None of those are phone numbers.
+///
+/// GHMRFIX-gate-tune's fix: require the match to carry an actual
+/// phone-shaped cue — either a leading `+` (E.164-style, e.g. a
+/// country-code-prefixed number) or an internal separator (space/hyphen, // pii-test-fixture
+/// e.g. a 3-3-4 hyphen-grouped number) — AND at least 7 digit characters
+/// (rules out short hyphen-separated non-phone shapes like the `8-4-4-4-12`
+/// UUID-shape description in docs, which has only 6 digits). A bare,
+/// unseparated digit run (no `+`, no internal space/hyphen) is never treated
+/// as a phone number under this rule, since that shape is indistinguishable
+/// from a hash fragment/timestamp/integer-ID and — per the regression
+/// guards below — every real-phone test fixture in this repo carries either
+/// a leading `+` or a visible separator.
+fn phone_match_is_phone_shaped(matched: &str) -> bool {
+    let digit_count = matched.chars().filter(|c| c.is_ascii_digit()).count();
+    if digit_count < 7 {
+        return false;
+    }
+    let has_plus = matched.starts_with('+');
+    let has_internal_sep = matched.contains(' ') || matched.contains('-');
+    has_plus || has_internal_sep
+}
+
 /// Scan a single `line` (1-based `line_no`) for every built-in PII pattern plus
 /// any `extra` rules, appending one [`PiiViolation`] per match into `out`.
 ///
@@ -178,9 +215,6 @@ fn scan_line(
     }
     for m in p.internal_path.find_iter(line) {
         push("internal_path", m.as_str());
-    }
-    for m in p.local_url.find_iter(line) {
-        push("local_url", m.as_str());
     }
     for m in p.infra_service.find_iter(line) {
         push("infra_service", m.as_str());
@@ -229,7 +263,7 @@ fn scan_line(
             let overlaps_date = date_spans
                 .iter()
                 .any(|&(s, e)| m.start() < e && s < m.end());
-            if !overlaps_uuid && !overlaps_date {
+            if !overlaps_uuid && !overlaps_date && phone_match_is_phone_shaped(m.as_str()) {
                 push("phone", m.as_str());
             }
         }
@@ -430,6 +464,12 @@ fn default_excluded_files() -> HashSet<String> {
     [
         "Cargo.lock",
         ".gitignore",
+        // A worktree's `.git` is a FILE (`gitdir: /abs/path/to/.git/worktrees/<name>`),
+        // not the `.git` directory the tree-walk already prunes by dir name. It is
+        // local dev-box tooling metadata — never git-tracked content, never shipped
+        // to a mirror (git itself excludes it from every tree/commit) — so scanning
+        // it for the dev box's own absolute path is pure noise, not a real leak risk.
+        ".git",
         "pii.rs",       // the scanner itself — holds pattern strings
         "pii_gate.rs",  // the hook binary — holds pattern strings
         "pii_gate.py",  // the retired Python gate, if still present
@@ -473,15 +513,20 @@ fn default_excluded_exts() -> HashSet<String> {
 ///   - `src/<service>/` for each of the named services above — each // pii-test-fixture
 ///     service's own integration module (currently 0 hits there, but
 ///     kept in lockstep with the doc-site exemption per the task ask).
-/// Every other path — including `specs/**` (spec history) and `data/**`
-/// (e.g. `prefix_registry.toml`) — is NOT exempted here even though a few
-/// legitimate mentions exist there too; those are pre-existing, out of the
-/// doc-site false-positive scope this exemption targets, and are left as
-/// residual for a follow-up rather than broadened into this fix.
+/// GHMRFIX-gate-tune: also exempt `specs/**` (spec/sprint history, e.g. a
+/// git-tool-domains spec naming supported secret-manager/git providers // pii-test-fixture
+/// by name) and `data/**` (e.g. `prefix_registry.toml` module-registry
+/// descriptions naming the same runtime-secret-client integrations). Same
+/// reasoning as the doc-site exemption above — every hit found in these two
+/// paths is the same public product name mentioned as a supported
+/// integration, never a leaked hostname/credential — so this is a
+/// conservative, same-category broadening rather than a new relaxation.
 fn infra_service_path_exempt(rel: &str) -> bool {
     let rel = rel.replace('\\', "/");
     rel.starts_with("docs/")
         || rel.starts_with("assets/")
+        || rel.starts_with("specs/")
+        || rel.starts_with("data/")
         || rel.starts_with("src/<secret-manager>/") // pii-test-fixture
         || rel.starts_with("src/<media-service>/") // pii-test-fixture
         || rel.starts_with("src/<container-mgr>/") // pii-test-fixture
@@ -977,6 +1022,80 @@ mod tests {
         );
     }
 
+    /// GHMRFIX-gate-tune: an ISO-8601 *datetime* (`2026-07-10T14:32:07Z`) is
+    /// digit/hyphen shaped exactly like the bare ISO date, but the trailing
+    /// `T` (a word character) means the bare-date regex's closing `\b` never
+    /// fires right after the day, so the date-exclusion span used to miss it
+    /// and the date's own digits fell through to the `phone` matcher. This
+    /// was the root cause of ~15 of the 40 non-SVG phone false positives
+    /// (JSON `"timestamp"`/`"created"`/`"last_updated"` fields across
+    /// `docs/**`).
+    #[test]
+    #[serial]
+    fn iso_datetime_is_not_flagged_as_phone() {
+        clear_allow();
+        for sample in [
+            r#""timestamp": "2026-07-10T14:32:07Z""#,
+            r#""created": "2026-06-01T10:00:00Z""#,
+            r#""last_updated": "2026-07-09T…""#,
+        ] {
+            let v = scan_for_pii(sample); // pii-test-fixture
+            assert!(
+                !v.iter().any(|x| x.category == "phone"),
+                "ISO datetime must not be flagged as phone: {sample:?} -> {v:?}"
+            );
+        }
+        // A genuine phone number sharing a line with an ISO datetime must
+        // still flag — the exclusion is span-scoped, not line-wide.
+        let mixed = scan_for_pii("at 2026-07-10T14:32:07Z call <phone>"); // pii-test-fixture
+        assert!(
+            mixed.iter().any(|x| x.category == "phone"),
+            "a real phone alongside an ISO datetime must still flag: {mixed:?}"
+        );
+    }
+
+    /// GHMRFIX-gate-tune: hash digests (git SHAs), unix timestamps, and large
+    /// integer IDs are digit runs 10+ chars long with no `+` prefix and no
+    /// internal space/hyphen separator — the exact shape the bare `phone`
+    /// regex used to accept. These are the other ~25 of the 40 non-SVG false
+    /// positives (JSON `vram_before`/`vram_after` byte counts in the intake
+    /// corpus, git SHA fragments in `docs/tools/code-git/github.md`, a
+    /// negative `ADVISORY_LOCK_KEY` constant, Prometheus unix timestamps).
+    #[test]
+    #[serial]
+    fn unseparated_digit_runs_are_not_flagged_as_phone() {
+        clear_allow();
+        for sample in [
+            "\"vram_before\": 31479877632", // pii-test-fixture (byte count)
+            "\"timestamp\": 1717000000.0",  // pii-test-fixture (unix ts)
+            "ADVISORY_LOCK_KEY = -5322992491554488081", // pii-test-fixture (integer ID)
+            "\"base_sha\": \"a1b2c3d4e5f60718293a4b5c6d7e8f9012345678\"", // pii-test-fixture (git SHA)
+        ] {
+            let v = scan_for_pii(sample); // pii-test-fixture
+            assert!(
+                !v.iter().any(|x| x.category == "phone"),
+                "unseparated digit run must not be flagged as phone: {sample:?} -> {v:?}"
+            );
+        }
+    }
+
+    /// A short hyphen-separated digit shape that is NOT a phone number (e.g.
+    /// docs prose describing the canonical UUID shape as `8-4-4-4-12`) must
+    /// not flag even though it has an internal separator — it has too few
+    /// digits (6) to plausibly be a phone number. Real hyphenated phones
+    /// (10+ digits, see `hyphenated_phone_still_flagged_regression_guard`)
+    /// are unaffected by this minimum.
+    #[test]
+    #[serial]
+    fn short_hyphenated_non_phone_shape_is_not_flagged() {
+        clear_allow();
+        let v = scan_for_pii("the canonical 8-4-4-4-12 hyphenated shape"); // pii-test-fixture
+        assert!(
+            !v.iter().any(|x| x.category == "phone"),
+            "short hyphenated non-phone shape must not be flagged: {v:?}"
+        );
+    }
+
     #[test]
     #[serial]
     fn allowed_author_email_is_permitted() {
@@ -1118,12 +1237,40 @@ fn it_works() {
         assert!(v.iter().any(|x| x.category == "internal_path"));
     }
 
+    /// GHMRFIX-gate-tune: `localhost`/`127.0.0.1`/`0.0.0.0` are loopback/
+    /// bind-all addresses, never internal-fleet-specific — every one of the
+    /// 25 residual hits from this shape in `docs/**`/`terminus-client/**`
+    /// was a legitimate localhost example, not a leak. The `local_url`
+    /// category (which only ever matched these three loopback shapes) is
+    /// retired from the write gate entirely; a real `192.168.x`/`10.x`
+    /// address with a port is still caught by `private_ip` regardless of
+    /// any trailing `:port`.
     #[test]
     #[serial]
-    fn local_url_is_blocked() {
+    fn local_url_loopback_addresses_are_not_flagged() {
         clear_allow();
-        let v = scan_for_pii("proxy on localhost:4000 active"); // pii-test-fixture
-        assert!(v.iter().any(|x| x.category == "local_url"));
+        for sample in [
+            "proxy on localhost:4000 active",
+            "bind at 127.0.0.1:8300 for enroll",
+            "listening on 0.0.0.0:8080",
+        ] {
+            let v = scan_for_pii(sample); // pii-test-fixture
+            assert!(
+                !v.iter().any(|x| x.category == "local_url"),
+                "loopback URL must not be flagged: {sample:?} -> {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn real_private_ip_with_port_is_still_blocked() {
+        clear_allow();
+        let v = scan_for_pii("bind at <internal-ip>:8300 for enroll"); // pii-test-fixture
+        assert!(
+            v.iter().any(|x| x.category == "private_ip"),
+            "a real LAN IP with a port must still flag via private_ip: {v:?}"
+        );
     }
 
     #[test]
