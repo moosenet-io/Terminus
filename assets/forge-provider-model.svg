@@ -1,0 +1,96 @@
+<svg width="1280" height="820" viewBox="0 0 1280 820" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bgFP" cx="50%" cy="28%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadowFP" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrowFP" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+
+  <rect width="1280" height="820" fill="url(#bgFP)"/>
+
+  <text x="640" y="50" text-anchor="middle" fill="#b9b0d8" font-size="15" letter-spacing="7" font-weight="500">FORGE MODULE</text>
+  <text x="640" y="90" text-anchor="middle" fill="#ffffff" font-size="32" font-weight="700" letter-spacing="2.5">PROVIDER-AGNOSTIC ABSTRACTION &amp; CAPABILITY MODEL</text>
+  <line x1="420" y1="108" x2="860" y2="108" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <!-- Two tools at top -->
+  <rect x="180" y="132" width="420" height="66" rx="12" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6" filter="url(#cardShadowFP)"/>
+  <text x="200" y="158" fill="#a78bff" font-size="13" letter-spacing="3" font-weight="600">git_private</text>
+  <text x="200" y="178" fill="#9b92c0" font-size="11" font-family="'Courier New',monospace">full operator R/W · confirm: true on destructive</text>
+
+  <rect x="680" y="132" width="420" height="66" rx="12" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6" filter="url(#cardShadowFP)"/>
+  <text x="700" y="158" fill="#a78bff" font-size="13" letter-spacing="3" font-weight="600">git_public</text>
+  <text x="700" y="178" fill="#9b92c0" font-size="11" font-family="'Courier New',monospace">PII-gated · first-publish gate · egress-isolated</text>
+
+  <line x1="390" y1="198" x2="480" y2="232" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowFP)" opacity="0.85"/>
+  <line x1="890" y1="198" x2="800" y2="232" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowFP)" opacity="0.85"/>
+
+  <!-- posture.rs band -->
+  <rect x="300" y="236" width="680" height="52" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1.2"/>
+  <text x="640" y="258" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="600">posture.rs — classifies read / write / destructive</text>
+  <text x="640" y="276" text-anchor="middle" fill="#9b92c0" font-size="10.5" font-family="'Courier New',monospace">is_read_endpoint · is_destructive_endpoint · requests_force_or_rewrite</text>
+
+  <line x1="640" y1="288" x2="640" y2="320" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowFP)" opacity="0.85"/>
+
+  <!-- ForgeProvider trait core -->
+  <rect x="240" y="324" width="800" height="100" rx="14" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6"/>
+  <text x="265" y="352" fill="#a78bff" font-size="13" letter-spacing="4" font-weight="600">TRAIT · ForgeProvider</text>
+  <circle cx="640" cy="345" r="5" fill="#c9b8ff"/>
+  <text x="265" y="376" fill="#e8e3f7" font-size="12.5" font-weight="600">dispatch(endpoint, req) → capability gate → execute_endpoint(...)</text>
+  <text x="265" y="398" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">id() · capabilities() → CapabilityMap · capability_report() · supports(ep)</text>
+  <text x="265" y="414" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">unsupported → ForgeError::Unsupported (before transport) · unwired → NotImplemented</text>
+
+  <line x1="640" y1="424" x2="640" y2="456" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowFP)" opacity="0.85"/>
+
+  <!-- ForgeEndpoint vocabulary -->
+  <rect x="220" y="460" width="840" height="70" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <text x="640" y="484" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="600">ForgeEndpoint — 64-member constant vocabulary, 10 domains</text>
+  <text x="640" y="504" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">repos · branches · commits · pull_requests · issues · releases · webhooks · packages · content · org</text>
+  <text x="640" y="520" text-anchor="middle" fill="#8d84ad" font-size="10" font-family="'Courier New',monospace">"a forge is a forge" — SAME surface for every provider; only SupportLevel varies</text>
+
+  <!-- ForgeRegistry -->
+  <text x="220" y="562" fill="#a78bff" font-size="12.5" letter-spacing="3" font-weight="600">ForgeRegistry · from_env() — config-driven activation, two pools</text>
+
+  <!-- Private pool -->
+  <g font-size="11.5">
+    <rect x="150" y="576" width="470" height="150" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1.2"/>
+    <text x="172" y="600" fill="#10b981" font-size="12" font-weight="700" letter-spacing="2">POOL · PRIVATE (self-hosted, full R/W)</text>
+
+    <rect x="172" y="612" width="200" height="46" rx="8" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+    <circle cx="188" cy="630" r="4" fill="#8b5cf6"/><text x="198" y="634" fill="#e8e3f7" font-size="11.5" font-weight="600">gitea / forgejo</text>
+    <text x="188" y="650" fill="#9b92c0" font-size="9.5" font-family="'Courier New',monospace">GiteaForge (1 client)</text>
+
+    <rect x="386" y="612" width="200" height="46" rx="8" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+    <circle cx="402" cy="630" r="4" fill="#8b5cf6"/><text x="412" y="634" fill="#e8e3f7" font-size="11.5" font-weight="600">gitlab_ce</text>
+    <text x="402" y="650" fill="#9b92c0" font-size="9.5" font-family="'Courier New',monospace">GitLabAdapter (CE/EE)</text>
+
+    <rect x="172" y="666" width="200" height="46" rx="8" fill="#241c42" stroke="#5b4b9b" stroke-width="1" opacity="0.85"/>
+    <circle cx="188" cy="684" r="4" fill="#4a6cf6"/><text x="198" y="688" fill="#e8e3f7" font-size="11.5" font-weight="600">gogs · onedev</text>
+    <text x="188" y="704" fill="#9b92c0" font-size="9.5" font-family="'Courier New',monospace">StubForge (honest caps)</text>
+  </g>
+
+  <!-- Public pool -->
+  <g font-size="11.5">
+    <rect x="660" y="576" width="470" height="150" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1.2"/>
+    <text x="682" y="600" fill="#f0b84d" font-size="12" font-weight="700" letter-spacing="2">POOL · PUBLIC (exfiltration surface)</text>
+
+    <rect x="682" y="612" width="200" height="46" rx="8" fill="#241c42" stroke="#7c5cff" stroke-width="1.2"/>
+    <circle cx="698" cy="630" r="4" fill="#4a6cf6"/><text x="708" y="634" fill="#e8e3f7" font-size="11.5" font-weight="600">codeberg / github</text>
+    <text x="698" y="650" fill="#9b92c0" font-size="9.5" font-family="'Courier New',monospace">GiteaForge / GitHubAdapter</text>
+
+    <rect x="896" y="612" width="200" height="46" rx="8" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+    <circle cx="912" cy="630" r="4" fill="#4a6cf6"/><text x="922" y="634" fill="#e8e3f7" font-size="11.5" font-weight="600">gitlab_saas</text>
+    <text x="912" y="650" fill="#9b92c0" font-size="9.5" font-family="'Courier New',monospace">GitLabAdapter (hosted)</text>
+
+    <rect x="682" y="666" width="414" height="46" rx="8" fill="#241c42" stroke="#5b4b9b" stroke-width="1" opacity="0.85"/>
+    <circle cx="698" cy="684" r="4" fill="#4a6cf6"/><text x="708" y="688" fill="#e8e3f7" font-size="11.5" font-weight="600">bitbucket · sourcehut · radicle</text>
+    <text x="708" y="704" fill="#9b92c0" font-size="9.5" font-family="'Courier New',monospace">StubForge — reduced/experimental capability maps</text>
+  </g>
+
+  <!-- governance band -->
+  <rect x="150" y="746" width="980" height="52" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="770" text-anchor="middle" fill="#cbc4e6" font-size="12.5" font-weight="600">A MISSING credential/URL = a clean skip, never a build failure — from_env() always constructs</text>
+  <text x="640" y="788" text-anchor="middle" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">CredentialRef carries a vault KEY NAME only — the token is resolved by SecretManager at call time, never a literal</text>
+</svg>

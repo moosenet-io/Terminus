@@ -1,0 +1,63 @@
+<svg width="1280" height="580" viewBox="0 0 1280 580" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bgMa" cx="50%" cy="28%" r="88%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadowMa" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrowMa" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+  <rect width="1280" height="580" fill="url(#bgMa)"/>
+
+  <text x="640" y="46" text-anchor="middle" fill="#b9b0d8" font-size="14" letter-spacing="6" font-weight="500">src/model_advisor/mod.rs</text>
+  <text x="640" y="80" text-anchor="middle" fill="#ffffff" font-size="28" font-weight="700" letter-spacing="2">MODEL_ADVISOR · VRAM-BUDGET FLEET RECOMMENDATION</text>
+  <line x1="440" y1="98" x2="840" y2="98" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <!-- bundled data -->
+  <rect x="90" y="130" width="280" height="90" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1.4" filter="url(#cardShadowMa)"/>
+  <text x="115" y="156" fill="#a78bff" font-size="12" letter-spacing="2" font-weight="600">BUNDLED YAML</text>
+  <text x="110" y="178" fill="#e8e3f7" font-size="10.5" font-family="'Courier New',monospace">model_presets.yaml</text>
+  <text x="110" y="196" fill="#e8e3f7" font-size="10.5" font-family="'Courier New',monospace">model_matrix.yaml</text>
+  <text x="110" y="212" fill="#9b92c0" font-size="9.5" font-family="'Courier New',monospace">include_str! · MODEL_*_PATH override</text>
+
+  <!-- 3 tools -->
+  <g font-size="12" font-weight="700">
+    <rect x="420" y="130" width="260" height="90" rx="10" fill="#241c42" stroke="#7c5cff" stroke-width="1.4"/>
+    <circle cx="442" cy="154" r="5" fill="#8b5cf6"/><text x="456" y="159" fill="#e8e3f7">model_advisor_recommend</text>
+    <text x="440" y="180" fill="#a89fc8" font-size="9.5" font-family="'Courier New',monospace" font-weight="400">vram_gb+use_case → fleet + pull cmds</text>
+    <text x="440" y="196" fill="#a89fc8" font-size="9.5" font-family="'Courier New',monospace" font-weight="400">pick_preset_for_vram: highest fitting</text>
+
+    <rect x="700" y="130" width="270" height="90" rx="10" fill="#241c42" stroke="#7c5cff" stroke-width="1.4"/>
+    <circle cx="722" cy="154" r="5" fill="#8b5cf6"/><text x="736" y="159" fill="#e8e3f7">model_advisor_check_fit</text>
+    <text x="720" y="180" fill="#a89fc8" font-size="9.5" font-family="'Courier New',monospace" font-weight="400">model+quant+vram → fits + alt quant</text>
+    <text x="720" y="196" fill="#a89fc8" font-size="9.5" font-family="'Courier New',monospace" font-weight="400">unknown model/quant → ok:false, not err</text>
+
+    <rect x="1000" y="130" width="230" height="90" rx="10" fill="#241c42" stroke="#4a6cf6" stroke-width="1.4"/>
+    <circle cx="1022" cy="154" r="5" fill="#4a6cf6"/><text x="1036" y="159" fill="#e8e3f7">model_advisor</text>
+    <text x="1036" y="172" fill="#e8e3f7">_query_ollama</text>
+    <text x="1020" y="196" fill="#a89fc8" font-size="9.5" font-family="'Courier New',monospace" font-weight="400">GET /api/tags → installed vs matrix</text>
+  </g>
+
+  <path d="M370 175 L420 175" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowMa)" opacity="0.8"/>
+  <path d="M370 190 C 500 250, 800 250, 700 175" stroke="#7c5cff" stroke-width="1.4" marker-end="url(#arrowMa)" opacity="0.6"/>
+  <path d="M370 200 C 600 280, 900 280, 1000 175" stroke="#4a6cf6" stroke-width="1.4" marker-end="url(#arrowMa)" opacity="0.6"/>
+
+  <!-- ollama host -->
+  <rect x="960" y="248" width="270" height="70" rx="10" fill="#19161f" stroke="#3a3358" stroke-width="1.2"/>
+  <text x="1095" y="272" text-anchor="middle" fill="#a9bdfa" font-size="11" font-weight="600">OLLAMA HOST</text>
+  <text x="1095" y="292" text-anchor="middle" fill="#a89fc8" font-size="9.5" font-family="'Courier New',monospace">arg &gt; OLLAMA_HOST env</text>
+  <text x="1095" y="308" text-anchor="middle" fill="#a89fc8" font-size="9.5" font-family="'Courier New',monospace">unreachable → real Http error</text>
+  <path d="M1115 220 L1115 248" stroke="#4a6cf6" stroke-width="1.6" marker-end="url(#arrowMa)"/>
+
+  <!-- fit logic band -->
+  <rect x="150" y="350" width="980" height="130" rx="14" fill="#1d1736" stroke="#5b4b9b" stroke-width="1.3" filter="url(#cardShadowMa)"/>
+  <text x="175" y="378" fill="#a78bff" font-size="12.5" letter-spacing="3" font-weight="600">FIT LOGIC — DOESN'T FABRICATE</text>
+  <g font-size="11" font-family="'Courier New',monospace" fill="#cbc4e6">
+    <text x="175" y="404">check_fit: doesn't fit → search sibling quants of the SAME model for the largest one that DOES fit</text>
+    <text x="175" y="426">no quant fits at all → report the model's minimum-VRAM quant instead ("No quant fits") — never invents an alternative</text>
+    <text x="175" y="448" fill="#9b92c0">recommend: role priority per use_case (coding→code,primary · reasoning→reasoning,primary · research→reasoning,primary,fast)</text>
+  </g>
+
+  <text x="640" y="530" text-anchor="middle" fill="#564d75" font-size="11.5" letter-spacing="0.4">Static curated reference data — complements MINT's measured serving profiles, doesn't replace them.</text>
+</svg>

@@ -1,0 +1,51 @@
+<svg width="1280" height="500" viewBox="0 0 1280 500" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bgCou" cx="50%" cy="30%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadowCou" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrowCou" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+
+  <rect width="1280" height="500" fill="url(#bgCou)"/>
+
+  <text x="640" y="46" text-anchor="middle" fill="#b9b0d8" font-size="13" letter-spacing="6" font-weight="500">OBSIDIAN CIRCLE</text>
+  <text x="640" y="80" text-anchor="middle" fill="#ffffff" font-size="28" font-weight="700" letter-spacing="2">COUNCIL · 4 TOOLS</text>
+
+  <rect x="120" y="112" width="330" height="66" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadowCou)"/>
+  <text x="285" y="140" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="600">council_convene</text>
+  <text x="285" y="160" text-anchor="middle" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">no engine wired</text>
+
+  <rect x="475" y="112" width="330" height="66" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadowCou)"/>
+  <text x="640" y="140" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="600">council_presets</text>
+  <text x="640" y="160" text-anchor="middle" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">static data</text>
+
+  <rect x="830" y="112" width="330" height="66" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadowCou)"/>
+  <text x="995" y="140" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="600">council_status · council_history</text>
+  <text x="995" y="160" text-anchor="middle" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">read SessionStore</text>
+
+  <line x1="285" y1="178" x2="285" y2="220" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowCou)" opacity="0.85"/>
+  <rect x="150" y="226" width="270" height="60" rx="10" fill="#19161f" stroke="#3a3358" stroke-width="1.4"/>
+  <text x="285" y="252" text-anchor="middle" fill="#cbc4e6" font-size="12" font-weight="600">always NotConfigured</text>
+  <text x="285" y="270" text-anchor="middle" fill="#8d84ad" font-size="10" font-family="'Courier New',monospace">honest, matches Python fallback</text>
+
+  <line x1="640" y1="178" x2="640" y2="220" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowCou)" opacity="0.85"/>
+  <rect x="505" y="226" width="270" height="66" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <text x="640" y="252" text-anchor="middle" fill="#e8e3f7" font-size="12" font-weight="600">7 built-ins + constellation.yaml</text>
+  <text x="640" y="272" text-anchor="middle" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">COUNCIL_CONSTELLATION_YAML_PATH</text>
+
+  <line x1="995" y1="178" x2="995" y2="220" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowCou)" opacity="0.85"/>
+  <rect x="860" y="226" width="270" height="66" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <circle cx="884" cy="252" r="5" fill="#10b981"/>
+  <text x="995" y="258" text-anchor="middle" fill="#e8e3f7" font-size="12" font-weight="600">Mutex&lt;HashMap&lt;id,Session&gt;&gt;</text>
+  <text x="995" y="276" text-anchor="middle" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">in-memory, per-runtime, Arc-shared</text>
+
+  <line x1="285" y1="286" x2="995" y2="286" stroke="#564d75" stroke-width="1.2" stroke-dasharray="5,5"/>
+  <text x="640" y="304" text-anchor="middle" fill="#564d75" font-size="10.5">convene never writes → store stays empty in production</text>
+
+  <rect x="150" y="360" width="980" height="60" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="386" text-anchor="middle" fill="#cbc4e6" font-size="12.5" font-weight="600">Full engine (obsidian_circle.engine — ReAct loop, LiteLLM, schema validation) not ported</text>
+  <text x="640" y="406" text-anchor="middle" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">follow-up: HTTP bridge to the Python engine, or a dedicated obsidian-circle-rs port</text>
+</svg>

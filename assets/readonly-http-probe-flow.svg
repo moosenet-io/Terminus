@@ -1,0 +1,57 @@
+<svg width="1280" height="420" viewBox="0 0 1280 420" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bg2" cx="50%" cy="30%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+    <marker id="arrowRed" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#e85c5c"/></marker>
+  </defs>
+
+  <rect width="1280" height="420" fill="url(#bg2)"/>
+
+  <text x="640" y="44" text-anchor="middle" fill="#b9b0d8" font-size="13" letter-spacing="6" font-weight="500">READ-ONLY LAN SERVICE</text>
+  <text x="640" y="76" text-anchor="middle" fill="#ffffff" font-size="26" font-weight="700" letter-spacing="2">HTTP PROBE → SHAPE → RETURN</text>
+  <line x1="480" y1="92" x2="800" y2="92" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <rect x="60" y="130" width="220" height="70" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadow)"/>
+  <text x="170" y="158" text-anchor="middle" fill="#e8e3f7" font-size="13.5" font-weight="600">Tool::execute(args)</text>
+  <text x="170" y="178" text-anchor="middle" fill="#9b92c0" font-size="10.5" font-family="'Courier New',monospace">from_env() config check</text>
+
+  <line x1="280" y1="165" x2="345" y2="165" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <rect x="345" y="130" width="230" height="70" rx="10" fill="#241c42" stroke="#4a6cf6" stroke-width="1.2"/>
+  <text x="460" y="158" text-anchor="middle" fill="#e8e3f7" font-size="13.5" font-weight="600">reqwest::Client GET</text>
+  <text x="460" y="178" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">timeout 5-15s · no auth or token header</text>
+
+  <line x1="575" y1="165" x2="640" y2="165" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <rect x="640" y="120" width="230" height="90" rx="10" fill="#1d1736" stroke="#5b4b9b" stroke-width="1"/>
+  <text x="755" y="146" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="600">LAN service</text>
+  <text x="753" y="168" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">Prometheus / <container-mgr> /</text>
+  <text x="753" y="186" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">Ollama / Gitea / Chord / ...</text>
+
+  <line x1="755" y1="210" x2="755" y2="250" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <rect x="600" y="252" width="310" height="70" rx="10" fill="#241c42" stroke="#4a6cf6" stroke-width="1.2"/>
+  <text x="755" y="280" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="600">Response shaping helper</text>
+  <text x="755" y="300" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">format_instant_query / parse_status / ...</text>
+
+  <line x1="600" y1="287" x2="500" y2="287" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <rect x="300" y="252" width="290" height="70" rx="10" fill="#132a22" stroke="#10b981" stroke-width="1.2"/>
+  <text x="445" y="280" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="600">Ok(pretty JSON string)</text>
+  <text x="445" y="300" text-anchor="middle" fill="#8fe3c0" font-size="10.5" font-family="'Courier New',monospace">returned as tool result</text>
+
+  <!-- failure branch -->
+  <line x1="755" y1="210" x2="1000" y2="252" stroke="#e85c5c" stroke-width="1.4" marker-end="url(#arrowRed)" opacity="0.85"/>
+  <rect x="920" y="254" width="290" height="68" rx="10" fill="#2b1c22" stroke="#e85c5c" stroke-width="1"/>
+  <text x="1065" y="280" text-anchor="middle" fill="#f0b8b8" font-size="12.5" font-weight="600">unreachable / non-2xx</text>
+  <text x="1065" y="300" text-anchor="middle" fill="#e0a5a5" font-size="10.5" font-family="'Courier New',monospace">genericized ToolError::Http, never a panic</text>
+
+  <rect x="150" y="352" width="980" height="52" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="376" text-anchor="middle" fill="#cbc4e6" font-size="12.5" font-weight="600">No credentials in these modules except portainer_api_token — LAN services trust network position, not auth</text>
+  <text x="640" y="394" text-anchor="middle" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">If the base URL env var is unset, register() installs NotConfigured stub tools instead of failing startup</text>
+</svg>

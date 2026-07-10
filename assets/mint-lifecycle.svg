@@ -1,0 +1,121 @@
+<svg width="1280" height="820" viewBox="0 0 1280 820" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bgMint" cx="50%" cy="28%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadowMint" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrowMint" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+
+  <rect width="1280" height="820" fill="url(#bgMint)"/>
+
+  <text x="640" y="46" text-anchor="middle" fill="#b9b0d8" font-size="14" letter-spacing="7" font-weight="500">MODEL-INTAKE HARNESS</text>
+  <text x="640" y="84" text-anchor="middle" fill="#ffffff" font-size="32" font-weight="700" letter-spacing="2">MINT · FLEET SWEEP LIFECYCLE</text>
+  <line x1="480" y1="102" x2="800" y2="102" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <!-- ===== Stage 1: entry points ===== -->
+  <g>
+    <rect x="60" y="128" width="230" height="64" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadowMint)"/>
+    <text x="175" y="153" text-anchor="middle" fill="#e8e3f7" font-size="14" font-weight="600">mint sweep coder|assistant</text>
+    <text x="175" y="172" text-anchor="middle" fill="#9b92c0" font-size="10.5" font-family="'Courier New',monospace">mint case · mint gaps</text>
+  </g>
+  <g>
+    <rect x="330" y="128" width="230" height="64" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadowMint)"/>
+    <text x="445" y="153" text-anchor="middle" fill="#e8e3f7" font-size="14" font-weight="600">model_intake_fleet</text>
+    <text x="445" y="172" text-anchor="middle" fill="#9b92c0" font-size="10.5" font-family="'Courier New',monospace">MCP tool (overnight)</text>
+  </g>
+  <g>
+    <rect x="600" y="128" width="230" height="64" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadowMint)"/>
+    <text x="715" y="153" text-anchor="middle" fill="#e8e3f7" font-size="14" font-weight="600">mint supervisor run</text>
+    <text x="715" y="172" text-anchor="middle" fill="#9b92c0" font-size="10.5" font-family="'Courier New',monospace">permanent jam-watch daemon</text>
+  </g>
+  <g>
+    <rect x="870" y="128" width="230" height="64" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadowMint)"/>
+    <text x="985" y="153" text-anchor="middle" fill="#e8e3f7" font-size="14" font-weight="600">mint fetch-model</text>
+    <text x="985" y="172" text-anchor="middle" fill="#9b92c0" font-size="10.5" font-family="'Courier New',monospace">Chord PullCoordinator</text>
+  </g>
+
+  <line x1="175" y1="192" x2="290" y2="228" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowMint)" opacity="0.85"/>
+  <line x1="445" y1="192" x2="400" y2="228" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowMint)" opacity="0.85"/>
+
+  <!-- ===== Stage 2: dispatch / nomination + GPU authority ===== -->
+  <rect x="150" y="234" width="500" height="76" rx="12" fill="#1d1736" stroke="#7c5cff" stroke-width="1.4"/>
+  <text x="172" y="260" fill="#a78bff" font-size="12" letter-spacing="3" font-weight="600">DISPATCH</text>
+  <circle cx="480" cy="255" r="4.5" fill="#c9b8ff"/>
+  <text x="172" y="285" fill="#e8e3f7" font-size="12.5" font-weight="600">Fleet nomination · checkpoint resume-skip</text>
+  <text x="172" y="301" fill="#9b92c0" font-size="10.5" font-family="'Courier New',monospace">INTAKE_STAGING_DIR nominations · JSON-lines checkpoint</text>
+
+  <rect x="680" y="234" width="450" height="76" rx="12" fill="#1d1736" stroke="#7c5cff" stroke-width="1.4"/>
+  <text x="702" y="260" fill="#a78bff" font-size="12" letter-spacing="3" font-weight="600">GPU AUTHORITY</text>
+  <circle cx="1000" cy="255" r="4.5" fill="#10b981"/>
+  <text x="702" y="285" fill="#e8e3f7" font-size="12.5" font-weight="600">ExclusiveGuard::acquire per (model, backend) pass</text>
+  <text x="702" y="301" fill="#9b92c0" font-size="10.5" font-family="'Courier New',monospace">file lock · bounded backoff · fairness pause</text>
+
+  <line x1="400" y1="310" x2="400" y2="346" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowMint)" opacity="0.85"/>
+  <line x1="905" y1="310" x2="905" y2="346" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowMint)" opacity="0.85"/>
+
+  <!-- ===== Stage 3: three evaluation axes (parallel lanes) ===== -->
+  <text x="130" y="342" fill="#a78bff" font-size="13" letter-spacing="4" font-weight="600">EVALUATE · THREE AXES</text>
+
+  <g>
+    <rect x="90" y="352" width="340" height="126" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1.1" filter="url(#cardShadowMint)"/>
+    <circle cx="112" cy="376" r="5" fill="#8b5cf6"/><text x="126" y="380" fill="#e8e3f7" font-size="13" font-weight="600">Coder / builder</text>
+    <text x="110" y="400" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">code_v2: infer → batched-judge → approve</text>
+    <text x="110" y="416" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">0–5 graduated stage score · pass@k</text>
+    <text x="110" y="432" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">real files + spec in context, per language</text>
+    <text x="110" y="454" fill="#9b92c0" font-size="10.5" font-weight="600">coder-eval.md →</text>
+  </g>
+
+  <g>
+    <rect x="450" y="352" width="380" height="126" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1.1" filter="url(#cardShadowMint)"/>
+    <circle cx="472" cy="376" r="5" fill="#4a6cf6"/><text x="486" y="380" fill="#e8e3f7" font-size="13" font-weight="600">Assistant / personality</text>
+    <text x="470" y="400" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">dims 1–7: conversation · toolchain · memory</text>
+    <text x="470" y="416" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">OCEAN latent → prompted adherence · embeddings</text>
+    <text x="470" y="432" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">3-judge panel (Claude · Gemini · Codex CLIs)</text>
+    <text x="470" y="454" fill="#9b92c0" font-size="10.5" font-weight="600">assistant-eval.md →</text>
+  </g>
+
+  <g>
+    <rect x="860" y="352" width="330" height="126" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1.1" filter="url(#cardShadowMint)"/>
+    <circle cx="882" cy="376" r="5" fill="#10b981"/><text x="896" y="380" fill="#e8e3f7" font-size="13" font-weight="600">Serving profile</text>
+    <text x="880" y="400" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">throughput · TTFT · context ceilings</text>
+    <text x="880" y="416" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">VRAM/OOM behavior · timeout recommendation</text>
+    <text x="880" y="432" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">graduated 2K–128K context tiers</text>
+    <text x="880" y="454" fill="#9b92c0" font-size="10.5" font-weight="600">serving-profiles.md →</text>
+  </g>
+
+  <line x1="260" y1="478" x2="260" y2="514" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowMint)" opacity="0.8"/>
+  <line x1="640" y1="478" x2="640" y2="514" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowMint)" opacity="0.8"/>
+  <line x1="1025" y1="478" x2="1025" y2="514" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowMint)" opacity="0.8"/>
+
+  <!-- ===== Stage 4: score + persist ===== -->
+  <rect x="150" y="520" width="980" height="86" rx="14" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6"/>
+  <text x="172" y="546" fill="#a78bff" font-size="13" letter-spacing="4" font-weight="600">SCORE · PERSIST</text>
+  <circle cx="640" cy="540" r="5" fill="#c9b8ff"/>
+  <text x="172" y="572" fill="#e8e3f7" font-size="12.5" font-weight="500">Derived operational profile computed → written to Postgres FIRST</text>
+  <text x="172" y="592" fill="#9b92c0" font-size="10.5" font-family="'Courier New',monospace">code_profile_runs · assistant_dimension_score · serving_profile · run_score_points</text>
+  <text x="700" y="592" fill="#9b92c0" font-size="10.5" font-family="'Courier New',monospace">then JSON-lines checkpoint mark appended → data-model.md / durability.md</text>
+
+  <line x1="640" y1="606" x2="640" y2="642" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowMint)" opacity="0.85"/>
+
+  <!-- ===== Stage 5: report / watch ===== -->
+  <g>
+    <rect x="150" y="648" width="470" height="70" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1.1" filter="url(#cardShadowMint)"/>
+    <circle cx="172" cy="672" r="5" fill="#4a6cf6"/><text x="186" y="676" fill="#e8e3f7" font-size="13" font-weight="600">Report</text>
+    <text x="170" y="698" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">model_intake_status/compare · fleet report · reporting.rs</text>
+  </g>
+  <g>
+    <rect x="660" y="648" width="470" height="70" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1.1" filter="url(#cardShadowMint)"/>
+    <circle cx="682" cy="672" r="5" fill="#8b5cf6"/><text x="696" y="676" fill="#e8e3f7" font-size="13" font-weight="600">Watch</text>
+    <text x="680" y="698" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">supervisor: 90s tick jam-detect → breakfix escalation</text>
+  </g>
+
+  <!-- governance / durability band -->
+  <rect x="150" y="732" width="980" height="58" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="758" text-anchor="middle" fill="#cbc4e6" font-size="13" font-weight="600">RESUME-SAFE · one bad model never wedges the fleet · skip-with-reason · PID-aware GPU self-heal</text>
+  <text x="640" y="778" text-anchor="middle" fill="#8d84ad" font-size="11" font-family="'Courier New',monospace">gpu-authority.md · durability.md</text>
+
+  <text x="640" y="808" text-anchor="middle" fill="#564d75" font-size="11.5" letter-spacing="0.4">Every fleet sweep survives a reboot, a jam, or a bad model — by design, not by luck.</text>
+</svg>

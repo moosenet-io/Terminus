@@ -1,0 +1,72 @@
+<svg width="1280" height="600" viewBox="0 0 1280 600" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bgGoo" cx="50%" cy="30%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadowGoo" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrowGoo" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+
+  <rect width="1280" height="600" fill="url(#bgGoo)"/>
+
+  <text x="640" y="46" text-anchor="middle" fill="#b9b0d8" font-size="13" letter-spacing="6" font-weight="500">CALENDAR + EMAIL · APP PASSWORD, NO OAUTH</text>
+  <text x="640" y="80" text-anchor="middle" fill="#ffffff" font-size="28" font-weight="700" letter-spacing="2">GOOGLE · 8 TOOLS</text>
+
+  <rect x="440" y="106" width="400" height="56" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadowGoo)"/>
+  <text x="640" y="132" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="600">GoogleConfig::from_env()</text>
+  <text x="640" y="150" text-anchor="middle" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">GOOGLE_LUMINA_EMAIL · GOOGLE_APP_PASSWORD</text>
+
+  <line x1="500" y1="162" x2="290" y2="204" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowGoo)" opacity="0.85"/>
+  <line x1="640" y1="162" x2="640" y2="204" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowGoo)" opacity="0.85"/>
+  <line x1="780" y1="162" x2="990" y2="204" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowGoo)" opacity="0.85"/>
+
+  <!-- caldav -->
+  <rect x="120" y="210" width="340" height="118" rx="12" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6"/>
+  <text x="290" y="236" text-anchor="middle" fill="#a78bff" font-size="12" letter-spacing="2" font-weight="600">caldav.rs · 4 tools</text>
+  <g font-family="'Courier New',monospace" font-size="10.5" fill="#a89fc8">
+    <text x="140" y="258">calendar_today / _week</text>
+    <text x="140" y="274">calendar_add · calendar_conflicts</text>
+  </g>
+  <text x="140" y="298" fill="#e8e3f7" font-size="10.5">REPORT calendar-query (Depth:1)</text>
+  <text x="140" y="316" fill="#e8e3f7" font-size="10.5">PUT own calendar only (VCALENDAR)</text>
+
+  <!-- imap -->
+  <rect x="470" y="210" width="340" height="118" rx="12" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6"/>
+  <text x="640" y="236" text-anchor="middle" fill="#a78bff" font-size="12" letter-spacing="2" font-weight="600">imap.rs · 3 tools</text>
+  <g font-family="'Courier New',monospace" font-size="10.5" fill="#a89fc8">
+    <text x="490" y="258">email_inbox · email_read</text>
+    <text x="490" y="274">email_summary</text>
+  </g>
+  <text x="490" y="298" fill="#e8e3f7" font-size="10.5">hand-rolled TLS session driver</text>
+  <text x="490" y="316" fill="#e8e3f7" font-size="10.5">run_command/read_response (no futures dep)</text>
+
+  <!-- smtp -->
+  <rect x="820" y="210" width="340" height="118" rx="12" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6"/>
+  <text x="990" y="236" text-anchor="middle" fill="#a78bff" font-size="12" letter-spacing="2" font-weight="600">smtp.rs · 1 tool</text>
+  <text x="840" y="258" font-family="'Courier New',monospace" font-size="10.5" fill="#a89fc8">email_send</text>
+  <text x="840" y="282" fill="#e8e3f7" font-size="10.5">lettre AsyncSmtpTransport</text>
+  <text x="840" y="300" fill="#e8e3f7" font-size="10.5">looks_like_email() pre-flight check</text>
+  <text x="840" y="318" fill="#e8e3f7" font-size="10.5">smtp.gmail.com:587 STARTTLS</text>
+
+  <line x1="290" y1="328" x2="290" y2="362" stroke="#7c5cff" stroke-width="1.4" marker-end="url(#arrowGoo)" opacity="0.7"/>
+  <line x1="640" y1="328" x2="640" y2="362" stroke="#7c5cff" stroke-width="1.4" marker-end="url(#arrowGoo)" opacity="0.7"/>
+  <line x1="990" y1="328" x2="990" y2="362" stroke="#7c5cff" stroke-width="1.4" marker-end="url(#arrowGoo)" opacity="0.7"/>
+
+  <rect x="120" y="368" width="340" height="52" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <text x="290" y="398" text-anchor="middle" fill="#e8e3f7" font-size="11.5" font-family="'Courier New',monospace">google.com/calendar/dav/*</text>
+
+  <rect x="470" y="368" width="340" height="52" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <text x="640" y="398" text-anchor="middle" fill="#e8e3f7" font-size="11.5" font-family="'Courier New',monospace">imap.gmail.com:993 (TLS)</text>
+
+  <rect x="820" y="368" width="340" height="52" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <text x="990" y="398" text-anchor="middle" fill="#e8e3f7" font-size="11.5" font-family="'Courier New',monospace">smtp.gmail.com:587 (STARTTLS)</text>
+
+  <rect x="150" y="446" width="980" height="60" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="472" text-anchor="middle" fill="#cbc4e6" font-size="12.5" font-weight="600">google_email_summary: CHORD_LLM_URL configured → LLM digest; any failure → plain bullet_list fallback</text>
+  <text x="640" y="492" text-anchor="middle" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">missing GOOGLE_LUMINA_EMAIL or GOOGLE_APP_PASSWORD → all 8 tool names become NotConfigured stubs</text>
+
+  <rect x="150" y="518" width="980" height="52" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="550" text-anchor="middle" fill="#cbc4e6" font-size="12" font-weight="600">All CalDAV date/time strings are validated (validate_caldav_datetime) before XML/iCal embedding</text>
+</svg>

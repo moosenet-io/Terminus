@@ -1,0 +1,76 @@
+<svg width="1280" height="900" viewBox="0 0 1280 900" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bgGitea" cx="50%" cy="28%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadowGitea" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrowGitea" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+
+  <rect width="1280" height="900" fill="url(#bgGitea)"/>
+
+  <text x="640" y="48" text-anchor="middle" fill="#b9b0d8" font-size="14" letter-spacing="7" font-weight="500">CODE &amp; GIT · GITEA MODULE</text>
+  <text x="640" y="86" text-anchor="middle" fill="#ffffff" font-size="30" font-weight="700" letter-spacing="2">REQUEST → IDENTITY RESOLUTION → GITEA API</text>
+  <line x1="440" y1="104" x2="840" y2="104" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <!-- ===== MCP CALLER ===== -->
+  <rect x="470" y="130" width="340" height="58" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadowGitea)"/>
+  <text x="640" y="155" text-anchor="middle" fill="#e8e3f7" font-size="15" font-weight="600">MCP tool call</text>
+  <text x="640" y="175" text-anchor="middle" fill="#9b92c0" font-size="11" font-family="'Courier New',monospace">gitea_create_file { repo, path, content, message, identity? }</text>
+  <line x1="640" y1="188" x2="640" y2="226" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowGitea)" opacity="0.9"/>
+
+  <!-- ===== resolve_identity ===== -->
+  <rect x="330" y="230" width="620" height="86" rx="12" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6"/>
+  <text x="355" y="256" fill="#a78bff" font-size="13" letter-spacing="3" font-weight="600">GiteaClient::resolve_identity()  ·  mod.rs:368</text>
+  <circle cx="640" cy="278" r="4.5" fill="#c9b8ff"/>
+  <text x="355" y="298" fill="#a89fc8" font-size="11.5" font-family="'Courier New',monospace">args["identity"] set?  →  for_identity(name)   |   absent  →  active-default client (Cow::Borrowed)</text>
+
+  <line x1="490" y1="316" x2="380" y2="364" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowGitea)" opacity="0.85"/>
+  <line x1="790" y1="316" x2="900" y2="364" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowGitea)" opacity="0.85"/>
+
+  <!-- branch left: named identity -->
+  <rect x="150" y="368" width="360" height="94" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <circle cx="172" cy="392" r="5" fill="#8b5cf6"/><text x="186" y="396" fill="#e8e3f7" font-size="13" font-weight="600">Named identity</text>
+  <text x="170" y="416" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">for_identity(name) · mod.rs:339</text>
+  <text x="170" y="432" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">lowercase lookup in identities map</text>
+  <text x="170" y="448" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">unknown name → InvalidArgument</text>
+
+  <!-- branch right: active default -->
+  <rect x="770" y="368" width="360" height="94" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <circle cx="792" cy="392" r="5" fill="#4a6cf6"/><text x="806" y="396" fill="#e8e3f7" font-size="13" font-weight="600">Active default</text>
+  <text x="790" y="416" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">GITEA_IDENTITY_NAME (env)</text>
+  <text x="790" y="432" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">unset → built-in default "moose"</text>
+  <text x="790" y="448" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">resolved once at from_env()</text>
+
+  <line x1="330" y1="462" x2="500" y2="510" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowGitea)" opacity="0.85"/>
+  <line x1="950" y1="462" x2="780" y2="510" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowGitea)" opacity="0.85"/>
+
+  <!-- ===== identities map (source) ===== -->
+  <rect x="300" y="514" width="680" height="70" rx="12" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6"/>
+  <text x="325" y="538" fill="#a78bff" font-size="12.5" letter-spacing="3" font-weight="600">scan_gitea_identities()  ·  mod.rs:174</text>
+  <text x="325" y="558" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">env vars GITEA_PAT_&lt;NAME&gt; → trim() → reject_interior_whitespace() → lowercase(name) : token map</text>
+  <text x="325" y="574" fill="#8d84ad" font-size="10" font-family="'Courier New',monospace">blank / whitespace-only value = treated as absent (not registered)</text>
+
+  <line x1="640" y1="584" x2="640" y2="618" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowGitea)" opacity="0.9"/>
+
+  <!-- ===== PII gate (write path only) ===== -->
+  <rect x="330" y="622" width="620" height="64" rx="10" fill="#241c42" stroke="#10b981" stroke-width="1.4"/>
+  <circle cx="358" cy="654" r="5" fill="#10b981"/>
+  <text x="374" y="644" fill="#e8e3f7" font-size="13" font-weight="600">pii_check(content)  ·  mod.rs:50  —  write tools only</text>
+  <text x="374" y="664" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">192.168.x.x · 10.x.x.x · 172.16-31.x.x · sk-... tokens · ≥32-char hex → InvalidArgument, no HTTP call made</text>
+
+  <line x1="640" y1="686" x2="640" y2="720" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowGitea)" opacity="0.9"/>
+
+  <!-- ===== Gitea REST call ===== -->
+  <rect x="290" y="724" width="700" height="78" rx="12" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6"/>
+  <text x="315" y="750" fill="#a78bff" font-size="13" letter-spacing="3" font-weight="600">GiteaClient::get/post/put/delete_with_body()</text>
+  <text x="315" y="770" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">GET|POST|PUT|DELETE {GITEA_URL}/api/v1/...   Authorization: token &lt;resolved PAT&gt;</text>
+  <text x="315" y="788" fill="#8d84ad" font-size="10" font-family="'Courier New',monospace">404 → NotFound · non-2xx → Http(status+body) · PUT 422 on missing file → "use create_file"</text>
+
+  <!-- governance band -->
+  <rect x="150" y="822" width="980" height="52" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="846" text-anchor="middle" fill="#cbc4e6" font-size="13" font-weight="600">15 gitea_* tools · one resolve_identity() dispatch point · per-write PII gate · redacted Debug (never logs tokens)</text>
+  <text x="640" y="864" text-anchor="middle" fill="#8d84ad" font-size="11" font-family="'Courier New',monospace">GITEA_URL · GITEA_OWNER (default moosenet) · GITEA_PAT_&lt;NAME&gt; · GITEA_IDENTITY_NAME (default moose)</text>
+</svg>

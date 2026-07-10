@@ -1,0 +1,72 @@
+<svg width="1280" height="640" viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bg3" cx="50%" cy="30%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadow3" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrow3" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+
+  <rect width="1280" height="640" fill="url(#bg3)"/>
+
+  <text x="640" y="46" text-anchor="middle" fill="#b9b0d8" font-size="14" letter-spacing="6" font-weight="500">PLANE MODULE</text>
+  <text x="640" y="80" text-anchor="middle" fill="#ffffff" font-size="28" font-weight="700" letter-spacing="2">IDENTITY RESOLUTION</text>
+  <line x1="490" y1="98" x2="790" y2="98" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <!-- Startup scan -->
+  <rect x="60" y="126" width="320" height="86" rx="12" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6"/>
+  <text x="80" y="150" fill="#a78bff" font-size="12" letter-spacing="2" font-weight="600">PROCESS START · from_env()</text>
+  <text x="80" y="172" fill="#e8e3f7" font-size="12.5" font-weight="600">scan_named_identities()</text>
+  <text x="80" y="192" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">env PLANE_PAT_&lt;NAME&gt; → lowercased map</text>
+
+  <line x1="380" y1="169" x2="450" y2="169" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow3)"/>
+
+  <rect x="450" y="126" width="330" height="86" rx="12" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6"/>
+  <text x="470" y="150" fill="#a78bff" font-size="12" letter-spacing="2" font-weight="600">ACTIVE DEFAULT</text>
+  <text x="470" y="172" fill="#e8e3f7" font-size="12.5" font-weight="600">PLANE_IDENTITY_NAME → PLANE_PAT_&lt;NAME&gt;</text>
+  <text x="470" y="192" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">else fall back to unsuffixed PLANE_API_KEY</text>
+
+  <!-- per-call resolution -->
+  <text x="60" y="256" fill="#a78bff" font-size="13" letter-spacing="4" font-weight="600">PER TOOL CALL · resolve_identity(args)</text>
+
+  <rect x="60" y="276" width="300" height="70" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <circle cx="82" cy="300" r="5" fill="#8b5cf6"/><text x="96" y="304" fill="#e8e3f7" font-size="13" font-weight="600">args.identity present?</text>
+  <text x="80" y="326" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">optional "identity" schema field</text>
+
+  <line x1="360" y1="300" x2="440" y2="240" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow3)"/>
+  <line x1="360" y1="310" x2="440" y2="390" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow3)"/>
+  <text x="378" y="255" fill="#cbc4e6" font-size="10.5">yes</text>
+  <text x="378" y="368" fill="#cbc4e6" font-size="10.5">no</text>
+
+  <rect x="440" y="196" width="330" height="88" rx="10" fill="#241c42" stroke="#4a6cf6" stroke-width="1.2"/>
+  <circle cx="462" cy="220" r="5" fill="#4a6cf6"/><text x="476" y="224" fill="#e8e3f7" font-size="13" font-weight="600">for_identity(name)</text>
+  <text x="460" y="246" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">lookup identities[name.lower()]</text>
+  <text x="460" y="264" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">→ Cow::Owned clone, scoped token</text>
+  <text x="460" y="278" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">unknown name → InvalidArgument</text>
+
+  <rect x="440" y="356" width="330" height="70" rx="10" fill="#241c42" stroke="#4a6cf6" stroke-width="1.2"/>
+  <circle cx="462" cy="380" r="5" fill="#4a6cf6"/><text x="476" y="384" fill="#e8e3f7" font-size="13" font-weight="600">Cow::Borrowed(self)</text>
+  <text x="460" y="406" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">acts as the active default identity</text>
+
+  <line x1="605" y1="284" x2="605" y2="356" stroke="#5b4b9b" stroke-width="1" stroke-dasharray="4 3"/>
+
+  <line x1="770" y1="240" x2="880" y2="290" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow3)"/>
+  <line x1="770" y1="390" x2="880" y2="330" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow3)"/>
+
+  <rect x="880" y="256" width="300" height="90" rx="10" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6"/>
+  <text x="900" y="280" fill="#a78bff" font-size="12" letter-spacing="2" font-weight="600">CONFIGURED CHECK</text>
+  <text x="900" y="302" fill="#e8e3f7" font-size="12.5" font-weight="600">base_url + api_key both present?</text>
+  <text x="900" y="322" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">no → ToolError::NotConfigured</text>
+  <text x="900" y="338" fill="#10b981" font-size="10.5" font-family="'Courier New',monospace">yes → proceed to HTTP call</text>
+
+  <!-- footer band -->
+  <rect x="60" y="470" width="1160" height="118" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="498" text-anchor="middle" fill="#cbc4e6" font-size="13" font-weight="600">EVERY PLANE CRUD TOOL SHARES ONE RESOLUTION PATH — never 37 separate copies</text>
+  <text x="640" y="524" text-anchor="middle" fill="#8d84ad" font-size="11" font-family="'Courier New',monospace">plane_list_identities → names only, never tokens · plane_whoami(verify:true) → real authenticated read (200 VALID / 401·403 REJECTED)</text>
+  <text x="640" y="548" text-anchor="middle" fill="#8d84ad" font-size="11" font-family="'Courier New',monospace">identity argument is consumed for token selection only — never placed in a request body, never logged</text>
+  <text x="640" y="572" text-anchor="middle" fill="#564d75" font-size="10.5">PlaneClient::Debug is hand-written to redact api_key and identities — never printed, never leaked in a panic</text>
+
+  <text x="640" y="622" text-anchor="middle" fill="#564d75" font-size="11.5" letter-spacing="0.4">mod.rs:838-864 · PlaneClient::resolve_identity / for_identity</text>
+</svg>

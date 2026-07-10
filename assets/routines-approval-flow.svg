@@ -1,0 +1,61 @@
+<svg width="1180" height="520" viewBox="0 0 1180 520" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bgrt" cx="50%" cy="30%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadowRt" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrowRt" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+  <rect width="1180" height="520" fill="url(#bgrt)"/>
+  <text x="590" y="44" text-anchor="middle" fill="#b9b0d8" font-size="14" letter-spacing="7" font-weight="500">ROUTINES · PROPOSE → APPROVE → EXECUTE</text>
+  <text x="590" y="76" text-anchor="middle" fill="#ffffff" font-size="24" font-weight="700" letter-spacing="2">two staging designs stacked over an external scheduler host</text>
+  <line x1="380" y1="92" x2="800" y2="92" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <text x="90" y="122" fill="#a78bff" font-size="12.5" letter-spacing="3" font-weight="600">READ-ONLY (SSH, ungated)</text>
+  <rect x="60" y="132" width="230" height="56" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2"/>
+  <text x="175" y="154" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="600">routines_list</text>
+  <text x="175" y="172" text-anchor="middle" fill="#9b92c0" font-size="10" font-family="'Courier New',monospace">{cli} routines list --json</text>
+
+  <rect x="310" y="132" width="230" height="56" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2"/>
+  <text x="425" y="154" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="600">routines_history(name)</text>
+  <text x="425" y="172" text-anchor="middle" fill="#9b92c0" font-size="10" font-family="'Courier New',monospace">is_safe_identifier gate</text>
+
+  <text x="90" y="222" fill="#a78bff" font-size="12.5" letter-spacing="3" font-weight="600">STAGING (file-backed, single slot, ungated)</text>
+  <rect x="60" y="232" width="230" height="60" rx="10" fill="#1d1736" stroke="#7c5cff" stroke-width="1.4"/>
+  <text x="175" y="258" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="700">routines_propose</text>
+  <text x="175" y="276" text-anchor="middle" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">write_staged(ROUTINES_STAGING_PATH)</text>
+
+  <line x1="290" y1="262" x2="360" y2="262" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowRt)"/>
+  <rect x="360" y="232" width="230" height="60" rx="10" fill="#1d1736" stroke="#7c5cff" stroke-width="1.4"/>
+  <text x="475" y="258" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="700">routines_pending</text>
+  <text x="475" y="276" text-anchor="middle" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">read_staged() → {pending, proposal}</text>
+
+  <text x="700" y="222" fill="#a78bff" font-size="12.5" letter-spacing="3" font-weight="600">GATED (crate::approval::gate)</text>
+  <line x1="590" y1="262" x2="660" y2="262" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowRt)"/>
+  <rect x="660" y="232" width="230" height="60" rx="10" fill="#241c42" stroke="#f66" stroke-width="1.4" filter="url(#cardShadowRt)"/>
+  <text x="775" y="256" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="700">routines_approve</text>
+  <text x="775" y="274" text-anchor="middle" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">shell_quote() every free-text field</text>
+
+  <line x1="890" y1="262" x2="960" y2="262" stroke="#10b981" stroke-width="1.6" marker-end="url(#arrowRt)"/>
+  <rect x="960" y="232" width="160" height="60" rx="10" fill="#1d1736" stroke="#10b981" stroke-width="1.4"/>
+  <text x="1040" y="258" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="700">executed</text>
+  <text x="1040" y="276" text-anchor="middle" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">clears staging on success</text>
+
+  <rect x="660" y="316" width="230" height="60" rx="10" fill="#241c42" stroke="#f66" stroke-width="1.2"/>
+  <text x="775" y="340" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="600">routines_edit</text>
+  <text x="775" y="358" text-anchor="middle" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">gated · only provided fields change</text>
+
+  <rect x="660" y="392" width="360" height="66" rx="10" fill="#2a1420" stroke="#e0466e" stroke-width="1.6" filter="url(#cardShadowRt)"/>
+  <text x="840" y="416" text-anchor="middle" fill="#ffb4c8" font-size="13" font-weight="700">routines_batch_edit_notify_channel</text>
+  <text x="840" y="436" text-anchor="middle" fill="#e0a8b8" font-size="10" font-family="'Courier New',monospace">gated · MOST DESTRUCTIVE · deletes+recreates EVERY routine</text>
+  <text x="840" y="450" text-anchor="middle" fill="#e0a8b8" font-size="10" font-family="'Courier New',monospace">wipes run history for the whole fleet of routines</text>
+
+  <rect x="60" y="392" width="560" height="66" rx="10" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="340" y="416" text-anchor="middle" fill="#cbc4e6" font-size="12.5" font-weight="600">approval grant is content-bound: (tool_name, args_json)</text>
+  <text x="340" y="436" text-anchor="middle" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">a code approved for one proposal cannot be redeemed against different args</text>
+  <text x="340" y="450" text-anchor="middle" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">operator replies "approve &lt;CODE&gt;" out of band via Matrix — never an LLM turn</text>
+
+  <text x="590" y="496" text-anchor="middle" fill="#564d75" font-size="11.5" letter-spacing="0.4">free-text fields (prompt, description, schedule, timezone, cooldown) always go through shell_quote() before reaching ssh2::Channel::exec</text>
+</svg>

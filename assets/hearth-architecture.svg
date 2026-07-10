@@ -1,0 +1,37 @@
+<svg width="1280" height="500" viewBox="0 0 1280 500" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bgHea" cx="50%" cy="30%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadowHea" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrowHea" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+
+  <rect width="1280" height="500" fill="url(#bgHea)"/>
+
+  <text x="640" y="46" text-anchor="middle" fill="#b9b0d8" font-size="13" letter-spacing="6" font-weight="500">KITCHEN &amp; PANTRY</text>
+  <text x="640" y="80" text-anchor="middle" fill="#ffffff" font-size="28" font-weight="700" letter-spacing="2">HEARTH · 7 TOOLS</text>
+
+  <rect x="150" y="110" width="980" height="70" rx="12" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadowHea)"/>
+  <text x="175" y="138" fill="#e8e3f7" font-size="14" font-weight="600">pantry_list · pantry_add · meal_plan · shopping_list · what_can_i_make · recipe_search · stock_check</text>
+  <text x="175" y="160" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">recipe_search &amp; stock_check: reject_shell_metacharacters() — no ; | &amp; ` $ \ " ' — before any network call</text>
+
+  <line x1="640" y1="180" x2="640" y2="220" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowHea)" opacity="0.85"/>
+
+  <rect x="380" y="226" width="520" height="70" rx="12" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6"/>
+  <text x="640" y="256" text-anchor="middle" fill="#a78bff" font-size="13" letter-spacing="3" font-weight="600">HearthClient</text>
+  <text x="640" y="278" text-anchor="middle" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">reqwest GET/POST · header GROCY-API-KEY · 15s timeout</text>
+
+  <line x1="640" y1="296" x2="640" y2="330" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowHea)" opacity="0.85"/>
+
+  <rect x="380" y="336" width="520" height="70" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <circle cx="404" cy="366" r="5" fill="#10b981"/>
+  <text x="640" y="372" text-anchor="middle" fill="#e8e3f7" font-size="14" font-weight="600">Grocy REST API (GROCY_URL)</text>
+  <text x="640" y="392" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">/api/stock · /api/meal_plan · /api/shopping_list · /api/recipes</text>
+
+  <rect x="150" y="424" width="980" height="52" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="446" text-anchor="middle" fill="#cbc4e6" font-size="12.5" font-weight="600">404 → NotFound("Not found in your pantry") · 5xx → "Kitchen service unavailable"</text>
+  <text x="640" y="464" text-anchor="middle" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">Rewrite of a Grade-D shell=True Python original — zero shell commands in this module</text>
+</svg>

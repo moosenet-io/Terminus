@@ -1,0 +1,115 @@
+<svg width="1280" height="900" viewBox="0 0 1280 900" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bg3" cx="50%" cy="28%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadow3" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrow3" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+
+  <rect width="1280" height="900" fill="url(#bg3)"/>
+
+  <text x="640" y="50" text-anchor="middle" fill="#b9b0d8" font-size="15" letter-spacing="7" font-weight="500">MINT · ASSISTANT INTAKE PROFILING</text>
+  <text x="640" y="88" text-anchor="middle" fill="#ffffff" font-size="32" font-weight="700" letter-spacing="2">SEVEN DIMENSIONS OF THE ASSISTANT AXIS</text>
+  <line x1="430" y1="106" x2="850" y2="106" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <!-- ===== source model (top) ===== -->
+  <rect x="480" y="130" width="320" height="54" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadow3)"/>
+  <text x="640" y="153" text-anchor="middle" fill="#e8e3f7" font-size="14" font-weight="600">Candidate model (nominated)</text>
+  <text x="640" y="171" text-anchor="middle" fill="#9b92c0" font-size="10.5" font-family="'Courier New',monospace">runner.rs · per (model_id, backend_tag)</text>
+
+  <line x1="640" y1="184" x2="640" y2="216" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow3)" opacity="0.85"/>
+
+  <!-- ===== six-dimension standard suite label ===== -->
+  <text x="150" y="212" fill="#a78bff" font-size="13" letter-spacing="4" font-weight="600">STANDARD SUITE · runner::SUITE_DIMENSIONS (dim1–dim6, every model)</text>
+
+  <!-- row 1: dim1 dim2 dim3 -->
+  <g font-size="12.5" font-weight="600">
+    <g>
+      <rect x="150" y="226" width="330" height="118" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+      <circle cx="172" cy="252" r="5" fill="#8b5cf6"/><text x="186" y="256" fill="#e8e3f7">dim1 · conversation_depth</text>
+      <text x="170" y="278" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">recall_ceiling_turns (deterministic)</text>
+      <text x="170" y="294" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">coherence (3-judge panel, mean+SD)</text>
+      <text x="170" y="316" fill="#8d84ad" font-size="10" font-weight="400">Scripted 5/10/20/40/80-turn replays;</text>
+      <text x="170" y="332" fill="#8d84ad" font-size="10" font-weight="400">degradation at depth D, never a crash.</text>
+    </g>
+    <g>
+      <rect x="500" y="226" width="330" height="118" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+      <circle cx="522" cy="252" r="5" fill="#8b5cf6"/><text x="536" y="256" fill="#e8e3f7">dim2 · tool_chaining</text>
+      <text x="520" y="278" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">scenario_pass / chain_accuracy</text>
+      <text x="520" y="294" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">judge = deterministic (no panel)</text>
+      <text x="520" y="316" fill="#8d84ad" font-size="10" font-weight="400">Implicit-intent chains, 3-5 steps, handoff.</text>
+      <text x="520" y="332" fill="#8d84ad" font-size="10" font-weight="400">Explicit S83 chains referenced by id.</text>
+    </g>
+    <g>
+      <rect x="850" y="226" width="330" height="118" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+      <circle cx="872" cy="252" r="5" fill="#8b5cf6"/><text x="886" y="256" fill="#e8e3f7">dim3 · memory_integration</text>
+      <text x="870" y="278" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">fact_survival_rate (+ tier split)</text>
+      <text x="870" y="294" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">judge = deterministic (no panel)</text>
+      <text x="870" y="316" fill="#8d84ad" font-size="10" font-weight="400">Drives the REAL ConversationBuffer:</text>
+      <text x="870" y="332" fill="#8d84ad" font-size="10" font-weight="400">plant → forced summarize → recall.</text>
+    </g>
+  </g>
+
+  <!-- row 2: dim4 dim5 dim6 -->
+  <g font-size="12.5" font-weight="600">
+    <g>
+      <rect x="150" y="366" width="330" height="130" rx="12" fill="#241c42" stroke="#7c5cff" stroke-width="1.3"/>
+      <circle cx="172" cy="392" r="5" fill="#4a6cf6"/><text x="186" y="396" fill="#e8e3f7">dim4 · personality_latent</text>
+      <text x="170" y="418" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">5 OCEAN traits (3-judge panel)</text>
+      <text x="170" y="434" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">+ proximity_to_lumina (judge=derived)</text>
+      <text x="170" y="456" fill="#8d84ad" font-size="10" font-weight="400">RAW / base-only prompt — NO Lumina</text>
+      <text x="170" y="472" fill="#8d84ad" font-size="10" font-weight="400">layer. is_base_only() guard enforced.</text>
+    </g>
+    <g>
+      <rect x="500" y="366" width="330" height="130" rx="12" fill="#241c42" stroke="#7c5cff" stroke-width="1.3"/>
+      <circle cx="522" cy="392" r="5" fill="#4a6cf6"/><text x="536" y="396" fill="#e8e3f7">dim5 · personality_prompted</text>
+      <text x="520" y="418" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">trait panel: warm/quirky/curious/direct</text>
+      <text x="520" y="434" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">behavioral panel: 4 rules under pressure</text>
+      <text x="520" y="456" fill="#8d84ad" font-size="10" font-weight="400">REAL 5-layer Lumina prompt, asserted.</text>
+      <text x="520" y="472" fill="#8d84ad" font-size="10" font-weight="400">Deterministic pre-check corroborates.</text>
+    </g>
+    <g>
+      <rect x="850" y="366" width="330" height="130" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+      <circle cx="872" cy="392" r="5" fill="#10b981"/><text x="886" y="396" fill="#e8e3f7">dim6 · embeddings</text>
+      <text x="870" y="418" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">precision/recall/mrr/ndcg_at_k</text>
+      <text x="870" y="434" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">public-vs-Engram delta (domain fit)</text>
+      <text x="870" y="456" fill="#8d84ad" font-size="10" font-weight="400">Separate embedding-model sub-harness;</text>
+      <text x="870" y="472" fill="#8d84ad" font-size="10" font-weight="400">non-embedding candidate → clean skip.</text>
+    </g>
+  </g>
+
+  <!-- dim4 -> dim5 sequential-read connector (visual only; enforced in reporting.rs) -->
+  <line x1="480" y1="431" x2="500" y2="431" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow3)" opacity="0.9"/>
+  <text x="490" y="415" text-anchor="middle" fill="#c9b8ff" font-size="9.5" font-family="'Courier New',monospace">shortlist</text>
+
+  <!-- row 3: dim7 (conditional) -->
+  <g font-size="12.5" font-weight="600">
+    <rect x="325" y="522" width="630" height="82" rx="12" fill="#1d1736" stroke="#5b4b9b" stroke-width="1" stroke-dasharray="5,4"/>
+    <circle cx="350" cy="548" r="5" fill="#4a6cf6"/><text x="364" y="552" fill="#e8e3f7">dim7 · yarn_context_depth  (conditional — NOT in SUITE_DIMENSIONS)</text>
+    <text x="348" y="574" fill="#a89fc8" font-size="10.5" font-weight="400" font-family="'Courier New',monospace">usable_ceiling_tokens · recall_&lt;rung&gt; · coherence_&lt;rung&gt;</text>
+    <text x="348" y="592" fill="#8d84ad" font-size="10" font-weight="400">Only for yarn_capable nominations. Ladder: native → 30% → 60% → 100% of extended_ctx; stops at first collapse.</text>
+  </g>
+
+  <line x1="640" y1="496" x2="640" y2="516" stroke="#7c5cff" stroke-width="1.2" marker-end="url(#arrow3)" opacity="0.6" stroke-dasharray="3,3"/>
+
+  <!-- ===== 3-judge panel band ===== -->
+  <line x1="640" y1="604" x2="640" y2="640" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow3)" opacity="0.7"/>
+  <rect x="230" y="644" width="820" height="96" rx="14" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6" opacity="0.97"/>
+  <text x="255" y="670" fill="#a78bff" font-size="13" letter-spacing="4" font-weight="600">3-JUDGE PANEL · judges.rs</text>
+  <g font-size="11.5" font-weight="500">
+    <circle cx="330" cy="700" r="5" fill="#8b5cf6"/><text x="344" y="704" fill="#e8e3f7">claude --print</text>
+    <circle cx="540" cy="700" r="5" fill="#8b5cf6"/><text x="554" y="704" fill="#e8e3f7">gemini -p "..."</text>
+    <circle cx="770" cy="700" r="5" fill="#8b5cf6"/><text x="784" y="704" fill="#e8e3f7">codex exec "..."</text>
+  </g>
+  <text x="255" y="726" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">JUDGE_&lt;ID&gt;_CLI · JUDGE_&lt;ID&gt;_MODEL · JUDGE_SSH_HOST · JUDGE_TIMEOUT_SECS</text>
+
+  <!-- ===== governance / storage band ===== -->
+  <rect x="150" y="770" width="980" height="76" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="798" text-anchor="middle" fill="#cbc4e6" font-size="13" font-weight="600">assistant_dimension_score · mean + sample SD over complying judges · low_confidence at n=1 · unscored at n=0</text>
+  <text x="640" y="820" text-anchor="middle" fill="#8d84ad" font-size="11" font-family="'Courier New',monospace">Every score keyed on (run_id, model_id, backend_tag, dimension, metric, judge) — never fabricated, never silently averaged.</text>
+
+  <text x="640" y="876" text-anchor="middle" fill="#564d75" font-size="11.5" letter-spacing="0.4">Deterministic where possible, judge-panel where it must be — every degradation is data, not a crash.</text>
+</svg>

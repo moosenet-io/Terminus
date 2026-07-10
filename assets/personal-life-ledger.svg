@@ -1,0 +1,50 @@
+<svg width="1280" height="420" viewBox="0 0 1280 420" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bgLedger" cx="50%" cy="30%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadowL" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrowL" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+
+  <rect width="1280" height="420" fill="url(#bgLedger)"/>
+
+  <text x="640" y="46" text-anchor="middle" fill="#b9b0d8" font-size="13" letter-spacing="6" font-weight="500">PERSONAL-LIFE · FINANCE</text>
+  <text x="640" y="78" text-anchor="middle" fill="#ffffff" font-size="26" font-weight="700" letter-spacing="2">LEDGER — 8 TOOLS OVER ACTUAL BUDGET</text>
+
+  <!-- MCP client -->
+  <rect x="60" y="140" width="220" height="70" rx="12" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadowL)"/>
+  <text x="170" y="170" text-anchor="middle" fill="#e8e3f7" font-size="15" font-weight="600">MCP client</text>
+  <text x="170" y="190" text-anchor="middle" fill="#9b92c0" font-size="11" font-family="'Courier New',monospace">ledger_* call</text>
+
+  <line x1="280" y1="175" x2="380" y2="175" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowL)"/>
+
+  <!-- ledger module -->
+  <rect x="386" y="120" width="290" height="110" rx="14" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6"/>
+  <text x="531" y="146" text-anchor="middle" fill="#a78bff" font-size="12.5" letter-spacing="2.5" font-weight="600">src/ledger/mod.rs</text>
+  <circle cx="531" cy="168" r="5" fill="#8b5cf6"/>
+  <text x="531" y="190" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="600">validate → sanitize</text>
+  <text x="531" y="210" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">date/month/string/amount</text>
+
+  <line x1="676" y1="175" x2="776" y2="175" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowL)"/>
+
+  <!-- Actual Budget backend -->
+  <rect x="782" y="120" width="260" height="110" rx="14" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadowL)"/>
+  <text x="912" y="150" text-anchor="middle" fill="#e8e3f7" font-size="15" font-weight="600">Actual Budget</text>
+  <text x="912" y="172" text-anchor="middle" fill="#9b92c0" font-size="11" font-family="'Courier New',monospace">reqwest · x-api-key</text>
+  <circle cx="885" cy="196" r="5" fill="#10b981"/>
+  <text x="898" y="200" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">/v1/budgets/&#123;id&#125;/...</text>
+
+  <line x1="912" y1="230" x2="912" y2="270" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowL)"/>
+
+  <!-- response -->
+  <rect x="782" y="276" width="260" height="70" rx="12" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadowL)"/>
+  <text x="912" y="304" text-anchor="middle" fill="#e8e3f7" font-size="13.5" font-weight="600">JSON response</text>
+  <text x="912" y="324" text-anchor="middle" fill="#9b92c0" font-size="10.5" font-family="'Courier New',monospace">pretty-printed or plain string</text>
+
+  <!-- governance band -->
+  <rect x="60" y="366" width="1160" height="40" rx="10" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="391" text-anchor="middle" fill="#cbc4e6" font-size="12" font-weight="600">ACTUAL_SERVER_URL · ACTUAL_HTTP_API_KEY · ACTUAL_BUDGET_ID — all required, no fallback</text>
+</svg>

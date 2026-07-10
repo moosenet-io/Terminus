@@ -1,0 +1,102 @@
+<svg width="1280" height="900" viewBox="0 0 1280 900" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bgCoder" cx="50%" cy="30%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadowC" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrowC" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+
+  <rect width="1280" height="900" fill="url(#bgCoder)"/>
+
+  <text x="640" y="46" text-anchor="middle" fill="#b9b0d8" font-size="14" letter-spacing="6" font-weight="500">MINT · CODER/BUILDER EVALUATION AXIS</text>
+  <text x="640" y="82" text-anchor="middle" fill="#ffffff" font-size="30" font-weight="700" letter-spacing="2">V2 HARNESS · THREE-PHASE FLOW</text>
+  <line x1="430" y1="100" x2="850" y2="100" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <!-- ===== CORPUS INPUT ===== -->
+  <rect x="90" y="128" width="1100" height="66" rx="12" fill="#1d1736" stroke="#7c5cff" stroke-width="1.4"/>
+  <text x="115" y="154" fill="#a78bff" font-size="12.5" letter-spacing="3" font-weight="600">INPUT · PER CASE</text>
+  <text x="115" y="178" fill="#a89fc8" font-size="11.5" font-family="'Courier New',monospace">manifest.json case (id, language, tier) → spec.md (Task/Files/Approach/Test Plan) + CURRENT full contents of _workspaces/&lt;ws&gt; target file(s)</text>
+
+  <line x1="640" y1="194" x2="640" y2="222" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowC)" opacity="0.85"/>
+
+  <!-- ===== PHASE 1: INFER ===== -->
+  <rect x="70" y="228" width="1140" height="150" rx="14" fill="#241c42" stroke="#5b4b9b" stroke-width="1.3" filter="url(#cardShadowC)"/>
+  <circle cx="100" cy="256" r="6" fill="#8b5cf6"/>
+  <text x="118" y="261" fill="#e8e3f7" font-size="16" font-weight="700">PHASE 1 · INFER</text>
+  <text x="118" y="281" fill="#9b92c0" font-size="11" font-family="'Courier New',monospace">run_one_case_v2() · test model stays hot for the whole suite</text>
+
+  <g font-size="11.2" font-family="'Courier New',monospace" fill="#cbc4e6">
+    <text x="100" y="306">build_pipeline_prompt(spec, workspace, files, structure)</text>
+    <text x="100" y="324">→ generate_with_retry() · transport errors: backoff 10s/20s/40s (not OOM, not deterministic)</text>
+    <text x="100" y="342">extract_files() → map_outputs() → apply_and_validate() in /tmp/mint-test-&lt;uuid&gt; (staged, no target/)</text>
+    <text x="100" y="360">validate.sh emits STAGE:COMPILE/TESTS/CHANGE ok|fail → graduated_score() 0-5, structural (quality=None)</text>
+  </g>
+  <rect x="850" y="290" width="330" height="72" rx="10" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="866" y="310" fill="#e8e3f7" font-size="11.5" font-weight="600">retry (score 1 or 2 only)</text>
+  <text x="866" y="328" fill="#a89fc8" font-size="10.3" font-family="'Courier New',monospace">build_retry_prompt(orig, prior, err_excerpt)</text>
+  <text x="866" y="344" fill="#a89fc8" font-size="10.3" font-family="'Courier New',monospace">effective = retry_score.max(first_pass)</text>
+  <text x="866" y="358" fill="#a89fc8" font-size="10.3" font-family="'Courier New',monospace">row persisted immediately (INCR-01)</text>
+
+  <line x1="640" y1="378" x2="640" y2="406" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowC)" opacity="0.85"/>
+
+  <!-- ===== PHASE 2: BATCHED JUDGE ===== -->
+  <rect x="70" y="412" width="1140" height="106" rx="14" fill="#241c42" stroke="#5b4b9b" stroke-width="1.3" filter="url(#cardShadowC)"/>
+  <circle cx="100" cy="440" r="6" fill="#4a6cf6"/>
+  <text x="118" y="445" fill="#e8e3f7" font-size="16" font-weight="700">PHASE 2 · BATCHED IDIOM JUDGE</text>
+  <text x="118" y="465" fill="#9b92c0" font-size="11" font-family="'Courier New',monospace">judge_idiom() via INTAKE_JUDGE_MODEL (default qwen3:8b) · ONE model swap for the whole suite, not per case</text>
+  <g font-size="11.2" font-family="'Courier New',monospace" fill="#cbc4e6">
+    <text x="100" y="488">rates idiom/error-handling/style 1-5 on each case's first_response (and retry_response, if any)</text>
+    <text x="100" y="504">judge ≥4 promotes a structural 4 → 5 (both first_pass_score and retry_score) · update_code_run_v2_judge() marks row finalized</text>
+  </g>
+
+  <line x1="640" y1="518" x2="640" y2="546" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrowC)" opacity="0.85"/>
+
+  <!-- ===== PHASE 3: APPROVE / AGGREGATE ===== -->
+  <rect x="70" y="552" width="1140" height="106" rx="14" fill="#241c42" stroke="#5b4b9b" stroke-width="1.3" filter="url(#cardShadowC)"/>
+  <circle cx="100" cy="580" r="6" fill="#10b981"/>
+  <text x="118" y="585" fill="#e8e3f7" font-size="16" font-weight="700">PHASE 3 · APPROVE / AGGREGATE</text>
+  <text x="118" y="605" fill="#9b92c0" font-size="11" font-family="'Courier New',monospace">error rows excluded from averages · rows already persisted</text>
+  <g font-size="11.2" font-family="'Courier New',monospace" fill="#cbc4e6">
+    <text x="100" y="628">compute_approvals_v2(): per (language,tier) mean effective score ≥ 3.0 → "lang:tier" tag</text>
+    <text x="100" y="644">derive_file_limits_v2(tags) → max_files_good / max_files_marginal patched onto the model_profiles row</text>
+  </g>
+
+  <!-- ===== 0-5 SCORE LADDER ===== -->
+  <text x="90" y="694" fill="#a78bff" font-size="13" letter-spacing="4" font-weight="600">GRADUATED STAGE SCORE (0-5)</text>
+  <g font-size="11" font-family="'Courier New',monospace">
+    <rect x="90" y="706" width="176" height="46" rx="8" fill="#19161f" stroke="#3a3358"/>
+    <text x="102" y="724" fill="#e8e3f7" font-weight="700">5</text><text x="122" y="724" fill="#cbc4e6">compile+tests+change</text>
+    <text x="122" y="740" fill="#8d84ad">+ idiomatic (judge ≥4)</text>
+
+    <rect x="276" y="706" width="176" height="46" rx="8" fill="#19161f" stroke="#3a3358"/>
+    <text x="288" y="724" fill="#e8e3f7" font-weight="700">4</text><text x="308" y="724" fill="#cbc4e6">compile+tests+change</text>
+    <text x="308" y="740" fill="#8d84ad">judge &lt;4 or unknown</text>
+
+    <rect x="462" y="706" width="176" height="46" rx="8" fill="#19161f" stroke="#3a3358"/>
+    <text x="474" y="724" fill="#e8e3f7" font-weight="700">3</text><text x="494" y="724" fill="#cbc4e6">compile+tests pass</text>
+    <text x="494" y="740" fill="#8d84ad">CHANGE fails (incomplete)</text>
+
+    <rect x="648" y="706" width="176" height="46" rx="8" fill="#19161f" stroke="#3a3358"/>
+    <text x="660" y="724" fill="#e8e3f7" font-weight="700">2</text><text x="680" y="724" fill="#cbc4e6">compiles</text>
+    <text x="680" y="740" fill="#8d84ad">TESTS fail</text>
+
+    <rect x="834" y="706" width="176" height="46" rx="8" fill="#19161f" stroke="#3a3358"/>
+    <text x="846" y="724" fill="#e8e3f7" font-weight="700">1</text><text x="866" y="724" fill="#cbc4e6">attempt produced</text>
+    <text x="866" y="740" fill="#8d84ad">doesn't compile</text>
+
+    <rect x="1020" y="706" width="130" height="46" rx="8" fill="#19161f" stroke="#3a3358"/>
+    <text x="1032" y="724" fill="#e8e3f7" font-weight="700">0</text><text x="1052" y="724" fill="#cbc4e6">no usable code</text>
+    <text x="1052" y="740" fill="#8d84ad">nothing extracted</text>
+  </g>
+
+  <!-- ===== governance / fleet band ===== -->
+  <rect x="90" y="774" width="1100" height="86" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="800" text-anchor="middle" fill="#cbc4e6" font-size="12.5" font-weight="600">coder_sweep.rs drives the fleet: GPU-pass + CPU-pass per model · checkpoint/resume by (model, backend) · one bad model never wedges the fleet</text>
+  <text x="640" y="820" text-anchor="middle" fill="#8d84ad" font-size="10.8" font-family="'Courier New',monospace">GPU lock acquired/released PER (model, backend) pass, not for the whole run · toolchain-unavailable and OOM degrade to a clean skip, not a crash</text>
+  <text x="640" y="840" text-anchor="middle" fill="#8d84ad" font-size="10.8" font-family="'Courier New',monospace">INTAKE_SAMPLES_PER_CASE (opt-in) repeats each case → pass@k / pass^k · coder_case.rs (gap-fill rerun) · coder_gaps.rs (gap audit)</text>
+
+  <text x="640" y="884" text-anchor="middle" fill="#564d75" font-size="11" letter-spacing="0.4">v2 tests the REAL build-pipeline scenario — real files + spec in context — not a cold one-shot.</text>
+</svg>
