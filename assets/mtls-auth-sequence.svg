@@ -1,0 +1,71 @@
+<svg width="1280" height="760" viewBox="0 0 1280 760" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bg2" cx="50%" cy="30%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+    <marker id="arrowGreen" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#10b981"/></marker>
+    <marker id="arrowRed" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#e85c5c"/></marker>
+  </defs>
+
+  <rect width="1280" height="760" fill="url(#bg2)"/>
+
+  <text x="640" y="46" text-anchor="middle" fill="#b9b0d8" font-size="14" letter-spacing="6" font-weight="500">TCLI-03 / TGW-04</text>
+  <text x="640" y="80" text-anchor="middle" fill="#ffffff" font-size="28" font-weight="700" letter-spacing="2">mTLS REQUEST · TWO-LAYER FAIL-CLOSED AUTH</text>
+  <line x1="380" y1="98" x2="900" y2="98" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <text x="130" y="140" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="600">Enrolled client</text>
+  <line x1="130" y1="150" x2="130" y2="700" stroke="#5b4b9b" stroke-width="1" stroke-dasharray="4 4"/>
+
+  <text x="480" y="140" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="600">rustls / WebPkiClientVerifier</text>
+  <line x1="480" y1="150" x2="480" y2="700" stroke="#5b4b9b" stroke-width="1" stroke-dasharray="4 4"/>
+
+  <text x="830" y="140" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="600">extract_verified_identity</text>
+  <line x1="830" y1="150" x2="830" y2="700" stroke="#5b4b9b" stroke-width="1" stroke-dasharray="4 4"/>
+
+  <text x="1150" y="140" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="600">GatewayFramework::guard</text>
+  <line x1="1150" y1="150" x2="1150" y2="700" stroke="#5b4b9b" stroke-width="1" stroke-dasharray="4 4"/>
+
+  <!-- handshake -->
+  <line x1="130" y1="184" x2="475" y2="184" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <text x="300" y="176" text-anchor="middle" fill="#cbc4e6" font-size="11" font-family="'Courier New',monospace">TLS ClientHello + leaf cert</text>
+
+  <rect x="360" y="200" width="240" height="70" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <text x="380" y="222" fill="#e8e3f7" font-size="11.5" font-weight="600">Layer 1: chain-build</text>
+  <text x="380" y="240" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">chains to embedded CA?</text>
+  <text x="380" y="256" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">validity window OK?</text>
+
+  <line x1="360" y1="290" x2="230" y2="330" stroke="#e85c5c" stroke-width="1.4" marker-end="url(#arrowRed)"/>
+  <text x="240" y="310" fill="#f0b8b8" font-size="10" font-family="'Courier New',monospace">fail → handshake rejected,</text>
+  <text x="240" y="324" fill="#f0b8b8" font-size="10" font-family="'Courier New',monospace">no app code runs</text>
+
+  <line x1="480" y1="290" x2="825" y2="330" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <text x="650" y="310" text-anchor="middle" fill="#cbc4e6" font-size="11" font-family="'Courier New',monospace">handshake OK → peer leaf DER</text>
+
+  <rect x="710" y="346" width="240" height="90" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <text x="730" y="368" fill="#e8e3f7" font-size="11.5" font-weight="600">Layer 2: independent recheck</text>
+  <text x="730" y="386" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">validity window (again)</text>
+  <text x="730" y="402" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">clientAuth EKU present?</text>
+  <text x="730" y="418" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">Subject CN → ClientIdentity</text>
+
+  <line x1="710" y1="450" x2="580" y2="480" stroke="#e85c5c" stroke-width="1.4" marker-end="url(#arrowRed)"/>
+  <text x="590" y="470" fill="#f0b8b8" font-size="10" font-family="'Courier New',monospace">fail → connection dropped</text>
+
+  <line x1="830" y1="450" x2="1145" y2="500" stroke="#10b981" stroke-width="1.6" marker-end="url(#arrowGreen)"/>
+  <text x="1010" y="480" text-anchor="middle" fill="#7fe0b8" font-size="11" font-family="'Courier New',monospace">ClientIdentity on req extensions</text>
+
+  <rect x="1000" y="516" width="260" height="120" rx="10" fill="#241c42" stroke="#7c5cff" stroke-width="1.2"/>
+  <text x="1020" y="538" fill="#e8e3f7" font-size="11.5" font-weight="600">Gateway pipeline</text>
+  <text x="1020" y="556" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">allowlist check (per identity)</text>
+  <text x="1020" y="572" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">rate-limit (token bucket)</text>
+  <text x="1020" y="588" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">→ Ok(GatewayContext)</text>
+  <text x="1020" y="604" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">→ Err(403 / 429)</text>
+  <text x="1020" y="622" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">audit either way</text>
+
+  <rect x="150" y="662" width="980" height="56" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="686" text-anchor="middle" fill="#cbc4e6" font-size="12" font-weight="600">Authorization is the per-identity allowlist, not RBAC roles — an identity with no configured entry is denied every action</text>
+  <text x="640" y="704" text-anchor="middle" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">src/pki/mtls.rs — extract_verified_identity() · src/gateway_framework/mod.rs — AllowlistPolicy</text>
+</svg>

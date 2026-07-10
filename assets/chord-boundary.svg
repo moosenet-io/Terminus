@@ -1,0 +1,63 @@
+<svg width="1280" height="640" viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bg2" cx="50%" cy="30%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+
+  <rect width="1280" height="640" fill="url(#bg2)"/>
+
+  <text x="640" y="46" text-anchor="middle" fill="#b9b0d8" font-size="14" letter-spacing="6" font-weight="500">TGW-03</text>
+  <text x="640" y="80" text-anchor="middle" fill="#ffffff" font-size="28" font-weight="700" letter-spacing="2">TERMINUS ↔ CHORD BOUNDARY</text>
+  <line x1="470" y1="98" x2="810" y2="98" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <!-- Terminus -->
+  <rect x="80" y="150" width="440" height="320" rx="14" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6" filter="url(#cardShadow)"/>
+  <text x="105" y="182" fill="#a78bff" font-size="14" letter-spacing="3" font-weight="600">TERMINUS</text>
+  <text x="105" y="204" fill="#e8e3f7" font-size="12.5" font-weight="600">tool egress + gateway/auth</text>
+  <text x="105" y="228" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">mTLS front door · CA · enrollment</text>
+  <text x="105" y="246" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">tool registry · allowlist · audit</text>
+
+  <rect x="100" y="266" width="400" height="100" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <text x="120" y="288" fill="#e8e3f7" font-size="11.5" font-weight="600">InferenceProxyClient — thin forward</text>
+  <text x="120" y="306" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">no inference logic here</text>
+  <text x="120" y="322" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">connect-timeout only, never total-response</text>
+  <text x="120" y="338" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">streams response body unbuffered (SSE-safe)</text>
+  <text x="120" y="354" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">status + content-type relayed verbatim</text>
+
+  <rect x="100" y="380" width="400" height="66" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <text x="120" y="402" fill="#e8e3f7" font-size="11" font-family="'Courier New',monospace">service JWT: sub="lumina" (pinned)</text>
+  <text x="120" y="420" fill="#e8e3f7" font-size="11" font-family="'Courier New',monospace">X-Terminus-Client-Identity: &lt;mTLS identity&gt;</text>
+
+  <!-- Chord -->
+  <rect x="760" y="150" width="440" height="320" rx="14" fill="#1d1736" stroke="#10b981" stroke-width="1.6" filter="url(#cardShadow)"/>
+  <text x="785" y="182" fill="#7fe0b8" font-size="14" letter-spacing="3" font-weight="600">CHORD</text>
+  <text x="785" y="204" fill="#e8e3f7" font-size="12.5" font-weight="600">inference egress</text>
+  <text x="785" y="228" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">separate repo · separate process</text>
+  <text x="785" y="246" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">model loading · GPU/VRAM mgmt · LiteLLM routing</text>
+
+  <rect x="780" y="266" width="400" height="130" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <text x="800" y="288" fill="#e8e3f7" font-size="11.5" font-weight="600">Forwarded routes (verbatim)</text>
+  <text x="800" y="308" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">POST /v1/chat/completions (stream: true)</text>
+  <text x="800" y="326" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">POST /v1/infer</text>
+  <text x="800" y="344" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">POST /v1/agent/execute</text>
+  <text x="800" y="362" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">POST /v1/coding/select</text>
+  <text x="800" y="382" fill="#8d84ad" font-size="10" font-family="'Courier New',monospace">also serves /v1/personal/tools/* (same JWT scheme)</text>
+
+  <rect x="780" y="406" width="400" height="40" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <text x="800" y="430" fill="#e8e3f7" font-size="11" font-family="'Courier New',monospace">auth_check() + CHORD_JWT_SECRET, sub must == "lumina"</text>
+
+  <!-- arrows -->
+  <line x1="520" y1="316" x2="758" y2="316" stroke="#7c5cff" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <text x="640" y="306" text-anchor="middle" fill="#cbc4e6" font-size="10.5" font-family="'Courier New',monospace">POST + Bearer JWT</text>
+
+  <rect x="150" y="500" width="980" height="66" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="524" text-anchor="middle" fill="#cbc4e6" font-size="12.5" font-weight="600">Why separate processes: Chord keeps serving in-flight generations if Terminus restarts, and a Terminus deploy never contends for Chord's VRAM</text>
+  <text x="640" y="546" text-anchor="middle" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">a proxy-hop failure (JWT mint, connect) → clean 502; once connected, Chord's own status/body is relayed unchanged</text>
+
+  <text x="640" y="600" text-anchor="middle" fill="#564d75" font-size="11.5">github.com/moosenet-io/Chord</text>
+</svg>

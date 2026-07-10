@@ -1,0 +1,78 @@
+<svg width="1280" height="740" viewBox="0 0 1280 740" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bgPs" cx="50%" cy="22%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadowPs" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrowPs" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+
+  <rect width="1280" height="740" fill="url(#bgPs)"/>
+
+  <text x="640" y="48" text-anchor="middle" fill="#b9b0d8" font-size="14" letter-spacing="7" font-weight="500">PERSONAL SERVICES · FEDERATION</text>
+  <text x="640" y="84" text-anchor="middle" fill="#ffffff" font-size="28" font-weight="700" letter-spacing="2">YOUR TERMINUS_PERSONAL, FEDERATED INTO THE FLEET</text>
+  <line x1="400" y1="102" x2="880" y2="102" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <!-- caller -->
+  <rect x="60" y="150" width="220" height="80" rx="10" fill="#221a3d" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadowPs)"/>
+  <text x="170" y="182" text-anchor="middle" fill="#e8e3f7" font-size="14" font-weight="600">Fleet caller</text>
+  <text x="170" y="202" text-anchor="middle" fill="#9b92c0" font-size="10.5" font-family="'Courier New',monospace">any enrolled identity</text>
+  <text x="170" y="218" text-anchor="middle" fill="#9b92c0" font-size="10.5" font-family="'Courier New',monospace">mTLS → terminus-primary</text>
+
+  <line x1="280" y1="190" x2="350" y2="190" stroke="#7c5cff" stroke-width="1.8" marker-end="url(#arrowPs)"/>
+
+  <!-- terminus-primary -->
+  <rect x="350" y="150" width="230" height="90" rx="10" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6" filter="url(#cardShadowPs)"/>
+  <text x="465" y="176" text-anchor="middle" fill="#a78bff" font-size="12" letter-spacing="2.5" font-weight="600">TERMINUS-PRIMARY</text>
+  <text x="465" y="198" text-anchor="middle" fill="#9b92c0" font-size="10.5" font-family="'Courier New',monospace">register_all (core tools)</text>
+  <text x="465" y="216" text-anchor="middle" fill="#9b92c0" font-size="10.5" font-family="'Courier New',monospace">name not in core? → federate</text>
+
+  <line x1="580" y1="195" x2="650" y2="195" stroke="#4a6cf6" stroke-width="1.8" marker-end="url(#arrowPs)"/>
+  <text x="615" y="180" text-anchor="middle" fill="#9fb4ff" font-size="10" font-weight="600">service JWT</text>
+
+  <!-- Chord relay -->
+  <rect x="650" y="150" width="230" height="90" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1" filter="url(#cardShadowPs)"/>
+  <circle cx="672" cy="176" r="5" fill="#10b981"/>
+  <text x="686" y="180" fill="#e8e3f7" font-size="13" font-weight="600">Chord relay</text>
+  <text x="672" y="200" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">/v1/personal/tools/list</text>
+  <text x="672" y="216" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">/v1/personal/tools/call</text>
+
+  <line x1="765" y1="240" x2="765" y2="290" stroke="#7c5cff" stroke-width="1.8" marker-end="url(#arrowPs)"/>
+
+  <!-- your terminus_personal -->
+  <rect x="480" y="290" width="570" height="150" rx="12" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6" filter="url(#cardShadowPs)"/>
+  <text x="765" y="318" text-anchor="middle" fill="#a78bff" font-size="13" letter-spacing="3" font-weight="600">YOUR TERMINUS_PERSONAL DEPLOYMENT</text>
+  <circle cx="510" cy="344" r="4" fill="#8b5cf6"/>
+  <text x="522" y="348" fill="#e8e3f7" font-size="11.5" font-weight="600">register_personal registry</text>
+  <text x="522" y="364" fill="#9b92c0" font-size="10" font-family="'Courier New',monospace">your own tool set (ledger_*, vitals_*, git_private, ...)</text>
+  <circle cx="780" cy="344" r="4" fill="#4a6cf6"/>
+  <text x="792" y="348" fill="#e8e3f7" font-size="11.5" font-weight="600">/mcp + /enroll + mTLS listener</text>
+  <text x="792" y="364" fill="#9b92c0" font-size="10" font-family="'Courier New',monospace">its own identities, its own CA</text>
+  <text x="765" y="392" text-anchor="middle" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">X-Terminus-Client-Identity header carries the ORIGINAL caller through the relay</text>
+  <text x="765" y="412" text-anchor="middle" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">— audited as who actually asked, distinct from the service JWT that authenticates the hop</text>
+
+  <!-- <secret-manager> bootstrap -->
+  <rect x="60" y="290" width="380" height="150" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1" filter="url(#cardShadowPs)"/>
+  <text x="250" y="318" text-anchor="middle" fill="#a78bff" font-size="12" letter-spacing="2.5" font-weight="600">OWN VAULT BOOTSTRAP</text>
+  <text x="90" y="342" fill="#e8e3f7" font-size="11" font-weight="600"><secret-manager> (own identity)</text>
+  <text x="90" y="360" fill="#9b92c0" font-size="9.5" font-family="'Courier New',monospace">INFISICAL_CLIENT_ID/SECRET</text>
+  <text x="90" y="376" fill="#9b92c0" font-size="9.5" font-family="'Courier New',monospace">DOWNSTREAM_SECRET_KEYS allowlist</text>
+  <text x="90" y="392" fill="#9b92c0" font-size="9.5" font-family="'Courier New',monospace">PLANE_PAT_* / GITEA_PAT_* prefix match</text>
+  <line x1="250" y1="405" x2="470" y2="365" stroke="#4a6cf6" stroke-width="1.6" marker-end="url(#arrowPs)" opacity="0.8"/>
+  <text x="360" y="392" fill="#8d84ad" font-size="9.5">fetched fresh at every startup</text>
+
+  <!-- governance band -->
+  <rect x="60" y="480" width="1160" height="150" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="120" y="508" fill="#cbc4e6" font-size="13" font-weight="700">WHY FEDERATE INSTEAD OF MERGING REGISTRIES</text>
+  <g font-family="'Courier New',monospace" font-size="11" fill="#a89fc8">
+    <text x="120" y="534">register_all (core) and register_personal (yours) both register plane/gitea/github/sundry tool modules under the</text>
+    <text x="120" y="554">SAME names — a single combined registry would silently drop one side's entries. Federation keeps the two registries</text>
+    <text x="120" y="574">separate and reaches yours over a proven, already-live relay hop instead.</text>
+    <text x="120" y="600">Your deployment acts as its OWN identity: its own CA, its own enrolled identities, its own <secret-manager> bootstrap —</text>
+    <text x="120" y="620">the fleet reaches it through Chord, it never reaches into the fleet's own secret store.</text>
+  </g>
+
+  <text x="640" y="700" text-anchor="middle" fill="#564d75" font-size="11.5" letter-spacing="0.4">Run your own tools, on your own host, under your own identity — reachable by the whole fleet.</text>
+</svg>

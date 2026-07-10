@@ -1,0 +1,71 @@
+<svg width="1280" height="720" viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bg2" cx="50%" cy="30%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+    <marker id="arrowGreen" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#10b981"/></marker>
+  </defs>
+
+  <rect width="1280" height="720" fill="url(#bg2)"/>
+
+  <text x="640" y="46" text-anchor="middle" fill="#b9b0d8" font-size="14" letter-spacing="6" font-weight="500">TCLI-02 / LHEG-01</text>
+  <text x="640" y="80" text-anchor="middle" fill="#ffffff" font-size="28" font-weight="700" letter-spacing="2">ENROLLMENT SEQUENCE</text>
+  <line x1="480" y1="98" x2="800" y2="98" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <!-- lifelines -->
+  <text x="180" y="140" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="600">Enrolling identity</text>
+  <line x1="180" y1="150" x2="180" y2="660" stroke="#5b4b9b" stroke-width="1" stroke-dasharray="4 4"/>
+
+  <text x="640" y="140" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="600">POST /enroll</text>
+  <line x1="640" y1="150" x2="640" y2="660" stroke="#5b4b9b" stroke-width="1" stroke-dasharray="4 4"/>
+
+  <text x="1080" y="140" text-anchor="middle" fill="#e8e3f7" font-size="13" font-weight="600">Embedded CA</text>
+  <line x1="1080" y1="150" x2="1080" y2="660" stroke="#5b4b9b" stroke-width="1" stroke-dasharray="4 4"/>
+
+  <!-- step 1 -->
+  <line x1="180" y1="190" x2="630" y2="190" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <text x="410" y="182" text-anchor="middle" fill="#cbc4e6" font-size="11.5" font-family="'Courier New',monospace">{identity, shared_secret}</text>
+
+  <!-- step 2: lookup -->
+  <rect x="600" y="212" width="480" height="66" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <text x="620" y="234" fill="#e8e3f7" font-size="12" font-weight="600">Resolve bootstrap credential</text>
+  <text x="620" y="252" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">TERMINUS_ENROLLMENT_SHARED_SECRET_&lt;IDENTITY&gt;</text>
+  <text x="620" y="268" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">else legacy TERMINUS_ENROLLMENT_SHARED_SECRET (deprecated)</text>
+
+  <!-- step 3: constant time compare -->
+  <rect x="600" y="292" width="480" height="46" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <text x="620" y="316" fill="#e8e3f7" font-size="11.5" font-family="'Courier New',monospace">constant_time_eq(presented, expected) — fail closed</text>
+
+  <!-- step 4: request signing -->
+  <line x1="640" y1="340" x2="1070" y2="340" stroke="#7c5cff" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <text x="855" y="332" text-anchor="middle" fill="#cbc4e6" font-size="11.5" font-family="'Courier New',monospace">issue_leaf_cert(ca, identity)</text>
+
+  <rect x="950" y="360" width="260" height="70" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <text x="970" y="382" fill="#e8e3f7" font-size="11.5" font-weight="600">Sign leaf, chained to CA</text>
+  <text x="970" y="400" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">CN/SAN = identity</text>
+  <text x="970" y="416" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">EKU: clientAuth · TTL ~24h</text>
+
+  <line x1="1070" y1="440" x2="640" y2="440" stroke="#10b981" stroke-width="1.6" marker-end="url(#arrowGreen)"/>
+  <text x="855" y="432" text-anchor="middle" fill="#7fe0b8" font-size="11.5" font-family="'Courier New',monospace">cert_pem, key_pem</text>
+
+  <!-- step 5: mint jwt -->
+  <rect x="600" y="460" width="480" height="46" rx="10" fill="#241c42" stroke="#5b4b9b" stroke-width="1"/>
+  <text x="620" y="484" fill="#e8e3f7" font-size="11.5" font-family="'Courier New',monospace">mint_jwt(identity) — HS256, TERMINUS_JWT_SIGNING_KEY, ~30min TTL</text>
+
+  <!-- step 6: response -->
+  <line x1="640" y1="540" x2="190" y2="540" stroke="#10b981" stroke-width="1.8" marker-end="url(#arrowGreen)"/>
+  <text x="410" y="530" text-anchor="middle" fill="#7fe0b8" font-size="11.5" font-family="'Courier New',monospace">200 — cert_pem, key_pem, ca_cert_pem, jwt, expires_at</text>
+
+  <rect x="60" y="560" width="240" height="70" rx="10" fill="#1d1736" stroke="#10b981" stroke-width="1.4" filter="url(#cardShadow)"/>
+  <text x="80" y="584" fill="#e8e3f7" font-size="11.5" font-weight="600">Caller now holds:</text>
+  <text x="80" y="602" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">leaf cert + key (mTLS)</text>
+  <text x="80" y="616" fill="#a89fc8" font-size="10" font-family="'Courier New',monospace">JWT (app-layer claim)</text>
+
+  <rect x="150" y="646" width="980" height="56" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="640" y="670" text-anchor="middle" fill="#cbc4e6" font-size="12" font-weight="600">A caller holding only its own _&lt;IDENTITY&gt; secret can enroll ONLY as that identity — the lookup key is the requested identity, not caller-supplied</text>
+  <text x="640" y="688" text-anchor="middle" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">src/pki/enroll.rs — identity_secret_env_key() / handle_enrollment()</text>
+</svg>

@@ -1,0 +1,99 @@
+<svg width="1280" height="760" viewBox="0 0 1280 760" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <radialGradient id="bgCkpt" cx="50%" cy="28%" r="85%">
+      <stop offset="0%" stop-color="#241a3f"/><stop offset="55%" stop-color="#1a1430"/><stop offset="100%" stop-color="#0d0a1c"/>
+    </radialGradient>
+    <filter id="cardShadowCkpt" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+    <marker id="arrowCkpt" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="#7c5cff"/></marker>
+  </defs>
+
+  <rect width="1280" height="760" fill="url(#bgCkpt)"/>
+
+  <text x="640" y="50" text-anchor="middle" fill="#b9b0d8" font-size="14" letter-spacing="6" font-weight="500">MINT · DURABILITY</text>
+  <text x="640" y="88" text-anchor="middle" fill="#ffffff" font-size="30" font-weight="700" letter-spacing="2">PERSIST-THEN-CHECKPOINT ORDERING</text>
+  <line x1="430" y1="106" x2="850" y2="106" stroke="#6b5bbf" stroke-width="1" opacity="0.5"/>
+
+  <!-- ===== Row: one unit of work's pipeline ===== -->
+  <g>
+    <rect x="60" y="140" width="230" height="86" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadowCkpt)"/>
+    <text x="175" y="170" text-anchor="middle" fill="#e8e3f7" font-size="14" font-weight="600">1 · Suite runs</text>
+    <text x="175" y="190" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">run_suite() / dim runner</text>
+    <text x="175" y="207" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">one (model,backend[,dim])</text>
+  </g>
+
+  <line x1="290" y1="183" x2="352" y2="183" stroke="#7c5cff" stroke-width="1.8" marker-end="url(#arrowCkpt)"/>
+
+  <g>
+    <rect x="354" y="140" width="260" height="86" rx="12" fill="#1d1736" stroke="#10b981" stroke-width="1.6" filter="url(#cardShadowCkpt)"/>
+    <circle cx="378" cy="164" r="5" fill="#10b981"/>
+    <text x="392" y="169" fill="#e8e3f7" font-size="14" font-weight="600">2 · Postgres rows persist</text>
+    <text x="484" y="190" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">insert_dimension_score() /</text>
+    <text x="484" y="207" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">code_profile_runs INSERT</text>
+  </g>
+
+  <line x1="614" y1="183" x2="676" y2="183" stroke="#7c5cff" stroke-width="1.8" marker-end="url(#arrowCkpt)"/>
+
+  <g>
+    <rect x="678" y="140" width="260" height="86" rx="12" fill="#1d1736" stroke="#7c5cff" stroke-width="1.6" filter="url(#cardShadowCkpt)"/>
+    <circle cx="702" cy="164" r="5" fill="#8b5cf6"/>
+    <text x="716" y="169" fill="#e8e3f7" font-size="14" font-weight="600">3 · Checkpoint mark()</text>
+    <text x="808" y="190" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">ONE write_all() syscall</text>
+    <text x="808" y="207" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">JSON line + \n, O_APPEND</text>
+  </g>
+
+  <line x1="938" y1="183" x2="1000" y2="183" stroke="#7c5cff" stroke-width="1.8" marker-end="url(#arrowCkpt)"/>
+
+  <g>
+    <rect x="1002" y="140" width="220" height="86" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1.2" filter="url(#cardShadowCkpt)"/>
+    <text x="1112" y="170" text-anchor="middle" fill="#e8e3f7" font-size="14" font-weight="600">4 · Next unit starts</text>
+    <text x="1112" y="190" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">loop continues /</text>
+    <text x="1112" y="207" text-anchor="middle" fill="#a89fc8" font-size="10.5" font-family="'Courier New',monospace">fleet advances</text>
+  </g>
+
+  <text x="640" y="255" text-anchor="middle" fill="#a78bff" font-size="12.5" letter-spacing="2" font-weight="600">VERIFIED ORDER: DB commit happens BEFORE the checkpoint mark — never the reverse</text>
+  <text x="640" y="274" text-anchor="middle" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">coder_sweep.rs:522 &quot;Durable checkpoint AFTER rows are persisted&quot; · assistant/runner.rs:518 &quot;CRITICAL ORDERING: persist rows FIRST&quot;</text>
+
+  <!-- ===== Crash-point analysis ===== -->
+  <text x="90" y="330" fill="#a78bff" font-size="13" letter-spacing="4" font-weight="600">CRASH-CONSISTENCY: WHERE A REBOOT CAN LAND</text>
+
+  <g>
+    <rect x="80" y="350" width="360" height="130" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1" filter="url(#cardShadowCkpt)"/>
+    <text x="100" y="378" fill="#e8e3f7" font-size="13" font-weight="600">Crash BEFORE step 2 (DB insert)</text>
+    <text x="100" y="402" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">No rows, no checkpoint mark.</text>
+    <text x="100" y="420" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">done() still excludes this key ⇒</text>
+    <text x="100" y="438" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">resume simply re-runs the unit.</text>
+    <text x="100" y="462" fill="#10b981" font-size="11.5" font-weight="600">Safe: harmless re-run.</text>
+  </g>
+
+  <g>
+    <rect x="460" y="350" width="360" height="130" rx="12" fill="#241c42" stroke="#7c5cff" stroke-width="1.4" filter="url(#cardShadowCkpt)"/>
+    <text x="480" y="378" fill="#e8e3f7" font-size="13" font-weight="600">Crash BETWEEN step 2 and step 3</text>
+    <text x="480" y="402" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">Rows ARE durable in Postgres, but</text>
+    <text x="480" y="420" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">the checkpoint line was never</text>
+    <text x="480" y="438" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">appended ⇒ resume re-runs the unit.</text>
+    <text x="480" y="462" fill="#10b981" font-size="11.5" font-weight="600">Safe: harmless re-run, never data loss.</text>
+  </g>
+
+  <g>
+    <rect x="840" y="350" width="360" height="130" rx="12" fill="#241c42" stroke="#5b4b9b" stroke-width="1" filter="url(#cardShadowCkpt)"/>
+    <text x="860" y="378" fill="#e8e3f7" font-size="13" font-weight="600">Crash AFTER step 3 completes</text>
+    <text x="860" y="402" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">Rows durable AND the key is marked</text>
+    <text x="860" y="420" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">done. Resume reads it back from the</text>
+    <text x="860" y="438" fill="#a89fc8" font-size="11" font-family="'Courier New',monospace">JSON-lines file and skips it.</text>
+    <text x="860" y="462" fill="#10b981" font-size="11.5" font-weight="600">Safe: correctly skipped, no re-run.</text>
+  </g>
+
+  <text x="640" y="512" text-anchor="middle" fill="#cbc4e6" font-size="12" font-style="italic">The invariant this order protects: the checkpoint file can never claim work the database doesn&#8217;t actually have.</text>
+
+  <!-- ===== done()/mark() mechanics ===== -->
+  <rect x="80" y="540" width="1120" height="130" rx="12" fill="#19161f" stroke="#3a3358" stroke-width="1"/>
+  <text x="110" y="568" fill="#a78bff" font-size="12.5" letter-spacing="2" font-weight="600">FileCheckpoint&lt;K&gt; MECHANICS — checkpoint.rs</text>
+  <text x="110" y="592" fill="#cbc4e6" font-size="11.5" font-family="'Courier New',monospace">done() → read file, one serde_json::from_str::&lt;K&gt; per line into a BTreeSet; unparseable/partial lines are silently skipped, never fail the read.</text>
+  <text x="110" y="614" fill="#cbc4e6" font-size="11.5" font-family="'Courier New',monospace">mark(key) → append-only, OpenOptions{create,append}; ONE write_all() of &quot;line\n&quot; (not writeln!, which is two syscalls and can interleave under concurrency).</text>
+  <text x="110" y="636" fill="#cbc4e6" font-size="11.5" font-family="'Courier New',monospace">Missing file reads back as empty (fresh run); a key marked twice appears twice on disk but collapses to one entry in the BTreeSet on read.</text>
+  <text x="110" y="658" fill="#8d84ad" font-size="10.5" font-family="'Courier New',monospace">checkpoint.rs:38-116 · concurrent-marks safety relies on O_APPEND being atomic per short single write(2) call on a local filesystem.</text>
+
+  <text x="640" y="710" text-anchor="middle" fill="#564d75" font-size="11" letter-spacing="0.4">A crash can only ever cause a harmless re-run — never a checkpoint that outruns the data it describes.</text>
+</svg>
