@@ -25,21 +25,19 @@
 //! from the local client's view; only a *never-yet-successful* fetch is a
 //! hard error.
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
     body::Bytes,
-    extract::{ConnectInfo, State},
+    extract::State,
     http::{HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
 use serde_json::{json, Value};
-use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tokio::sync::RwLock;
 use tracing::warn;
 
 use crate::error::ClientError;
@@ -62,19 +60,6 @@ pub struct DaemonState {
     pub server_version: String,
     catalog: RwLock<CatalogCache>,
     catalog_ttl: Duration,
-    /// PWQ-03: peer socket address -> stable connection scope id, minted the
-    /// first time a request is seen from that peer ("at accept time" in
-    /// spirit -- axum's per-request extractor is the earliest hook this
-    /// router has into a new TCP connection, and a loopback HTTP client that
-    /// keeps its connection alive, as real MCP clients do, reuses the same
-    /// peer port for every request in that session, so this is stable for the
-    /// connection's lifetime and distinct across connections/processes). Two
-    /// concurrent Claude Code agents sharing this ONE daemon -- and the SAME
-    /// `claude` PAT/identity -- therefore still get separated fairness scopes
-    /// downstream (see `src/plane/mod.rs`'s `plane:ratelimit:{identity}:{scope}`
-    /// key and its round-robin batch dispatcher), which a per-identity key
-    /// alone cannot do.
-    connection_scopes: AsyncMutex<HashMap<SocketAddr, String>>,
 }
 
 impl DaemonState {
@@ -94,16 +79,7 @@ impl DaemonState {
             server_version: server_version.into(),
             catalog: RwLock::new(CatalogCache { tools: Vec::new(), fetched_at: None }),
             catalog_ttl,
-            connection_scopes: AsyncMutex::new(HashMap::new()),
         }
-    }
-
-    /// Resolve (minting on first sight) the stable fairness scope id for
-    /// `peer` -- see the `connection_scopes` field doc. Never panics, never
-    /// blocks on anything but this in-process map's own lock.
-    async fn connection_scope(&self, peer: SocketAddr) -> String {
-        let mut scopes = self.connection_scopes.lock().await;
-        scopes.entry(peer).or_insert_with(|| uuid::Uuid::new_v4().to_string()).clone()
     }
 
     /// Return the cached tool catalog, refreshing from the primary first if
@@ -161,18 +137,7 @@ async fn handle_healthz(State(state): State<Arc<DaemonState>>) -> impl IntoRespo
     (StatusCode::OK, format!("{} {} ok\n", state.server_name, state.server_version))
 }
 
-async fn handle_mcp(
-    State(state): State<Arc<DaemonState>>,
-    // PWQ-03: `Option<ConnectInfo<..>>` rather than a bare `ConnectInfo<..>`
-    // -- axum's blanket `Option<T>` extractor impl turns a missing/rejected
-    // extraction into `None` instead of a 400, so this stays backward
-    // compatible with `build_router`'s existing `.oneshot()`-based unit tests
-    // (which never populate connect-info) and only actually resolves a scope
-    // once the daemon binary serves via
-    // `into_make_service_with_connect_info::<SocketAddr>()`.
-    connect_info: Option<ConnectInfo<SocketAddr>>,
-    body: Bytes,
-) -> Response {
+async fn handle_mcp(State(state): State<Arc<DaemonState>>, body: Bytes) -> Response {
     let parsed: Result<Value, _> = serde_json::from_slice(&body);
     let req = match parsed {
         Ok(v) => v,
@@ -216,13 +181,7 @@ async fn handle_mcp(
                 sse_response(id, Err((-32000, format!("primary unreachable: {e}"))), "")
             }
         },
-        "tools/call" => {
-            let scope = match connect_info {
-                Some(ConnectInfo(peer)) => Some(state.connection_scope(peer).await),
-                None => None,
-            };
-            handle_tools_call(&state, id, params, scope).await
-        }
+        "tools/call" => handle_tools_call(&state, id, params).await,
         other => {
             warn!("terminus_client::mcp_server: unhandled method {other}");
             sse_response(id, Err((-32601, format!("Method not found: {other}"))), "")
@@ -230,7 +189,7 @@ async fn handle_mcp(
     }
 }
 
-async fn handle_tools_call(state: &DaemonState, id: Value, params: Value, scope: Option<String>) -> Response {
+async fn handle_tools_call(state: &DaemonState, id: Value, params: Value) -> Response {
     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
@@ -259,20 +218,11 @@ async fn handle_tools_call(state: &DaemonState, id: Value, params: Value, scope:
         );
     }
 
-    // PWQ-03: tag the forwarded envelope with this connection's fairness
-    // scope via MCP's standard `_meta` params field -- metadata the PRIMARY's
-    // dispatch reads (`src/mcp_server.rs`) to fair-share Plane batch drains
-    // across concurrent same-identity callers, NOT a tool argument the model
-    // ever sees or can spoof a different connection's value for.
-    let mut call_params = json!({"name": name, "arguments": arguments});
-    if let Some(scope) = &scope {
-        call_params["_meta"] = json!({"scope": scope});
-    }
     let upstream_request = json!({
         "jsonrpc": "2.0",
         "id": id.clone(),
         "method": "tools/call",
-        "params": call_params
+        "params": {"name": name, "arguments": arguments}
     });
 
     match forward(&state.primary, upstream_request).await {
@@ -426,68 +376,6 @@ mod tests {
         let req = Request::builder().method("GET").uri("/healthz").body(Body::empty()).unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    // ── PWQ-03: per-connection fairness scope minting ───────────────────────
-
-    #[tokio::test]
-    async fn connection_scope_is_stable_for_the_same_peer() {
-        let state = test_state();
-        let peer: SocketAddr = "127.0.0.1:55001".parse().unwrap();
-        let first = state.connection_scope(peer).await;
-        let second = state.connection_scope(peer).await;
-        assert_eq!(first, second, "the same peer address must keep the same scope across requests");
-    }
-
-    #[tokio::test]
-    async fn connection_scope_differs_across_peers() {
-        let state = test_state();
-        let a: SocketAddr = "127.0.0.1:55002".parse().unwrap();
-        let b: SocketAddr = "127.0.0.1:55003".parse().unwrap();
-        let scope_a = state.connection_scope(a).await;
-        let scope_b = state.connection_scope(b).await;
-        assert_ne!(scope_a, scope_b, "distinct connections must get distinct fairness scopes");
-    }
-
-    #[tokio::test]
-    async fn tools_call_folds_connection_scope_into_forwarded_meta() {
-        let ca = generate_test_ca();
-        let credential = enrolled_credential(&ca, "test-daemon");
-        let seen_params: Arc<AsyncMutex<Option<Value>>> = Arc::new(AsyncMutex::new(None));
-        let seen_params_srv = seen_params.clone();
-        let (host, port) = spawn_mock_primary(&ca, move |req| {
-            if req["method"] == "tools/list" {
-                json!({"jsonrpc": "2.0", "id": req["id"], "result": {"tools": [{"name": "weather"}]}})
-            } else {
-                let params = req.get("params").cloned();
-                let seen_params_srv = seen_params_srv.clone();
-                // spawn_mock_primary's closure is sync; stash via try_lock since
-                // this handler runs on the tokio runtime and the lock is
-                // uncontended here.
-                if let Ok(mut guard) = seen_params_srv.try_lock() {
-                    *guard = params;
-                }
-                json!({"jsonrpc": "2.0", "id": req["id"], "result": {"content": [{"type": "text", "text": "72F sunny"}], "isError": false}})
-            }
-        })
-        .await;
-
-        let primary = primary_config(&credential, host, port);
-        let state = Arc::new(DaemonState::new(primary, "terminus-client-daemon-test", "0.0.0-test"));
-        let scope = state.connection_scope("127.0.0.1:55004".parse().unwrap()).await;
-
-        let resp = handle_tools_call(
-            &state,
-            json!(1),
-            json!({"name": "weather", "arguments": {"city": "x"}}),
-            Some(scope.clone()),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let params = seen_params.lock().await.clone().expect("primary must have received a tools/call");
-        assert_eq!(params["_meta"]["scope"], json!(scope), "forwarded envelope must carry the connection scope as metadata, not a tool argument");
-        assert!(params["arguments"].get("scope").is_none(), "scope metadata must never appear inside the tool's own arguments");
     }
 
     // ── End-to-end: real mock mTLS primary behind the local daemon router ──

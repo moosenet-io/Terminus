@@ -55,7 +55,6 @@
 //! program decides fallback behavior" contract -- for this program, the
 //! decision is "fail fast, let systemd/the operator restart it").
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -153,13 +152,8 @@ async fn main() {
     };
     tracing::info!("terminus-client-daemon: serving local MCP endpoint on {LOCAL_BIND_ADDR}:{local_port}");
 
-    // PWQ-03: connect-info-aware serving so `handle_mcp` can mint a stable
-    // per-connection fairness scope (see `DaemonState::connection_scope`) --
-    // a plain `axum::serve(listener, router)` never exposes the peer address
-    // to extractors.
     let router = build_router(state);
-    let make_service = router.into_make_service_with_connect_info::<SocketAddr>();
-    if let Err(e) = axum::serve(listener, make_service).await {
+    if let Err(e) = axum::serve(listener, router).await {
         eprintln!("terminus-client-daemon: local MCP listener exited with an error: {e}");
         std::process::exit(1);
     }
