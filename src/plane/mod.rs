@@ -71,6 +71,7 @@ use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 use redis::IntoConnectionInfo;
 use reqwest::{Client, Response, StatusCode};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::OnceCell;
@@ -417,10 +418,40 @@ impl RedisBackend {
         }
     }
 
+    /// DELETE a namespaced key. Best-effort (a failure is swallowed via the
+    /// breaker) — used to reap a batch-job record whose write we could not
+    /// confirm, so a job that then runs synchronously never leaves an
+    /// unreachable all-pending record behind (PWQ-01 N1).
+    async fn del(&self, key: &str) {
+        if !self.breaker.allow() {
+            return;
+        }
+        let fut = async {
+            let mut conn = self
+                .conn()
+                .await
+                .ok_or_else(|| redis::RedisError::from((redis::ErrorKind::IoError, "redis unavailable")))?;
+            redis::cmd("DEL").arg(key).query_async::<_, ()>(&mut conn).await
+        };
+        match tokio::time::timeout(self.op_timeout, fut).await {
+            Ok(Ok(())) => self.breaker.record_success(),
+            _ => self.note_failure(),
+        }
+    }
+
     /// Atomically reserve the next slot in the shared rate budget. `Some(wait)` =
     /// sleep `wait` then proceed; `None` = Redis unavailable, caller should fall
     /// back to its in-process limiter.
-    async fn rate_reserve(&self, min_interval: Duration) -> Option<Duration> {
+    ///
+    /// `key_suffix` (PWQ-03) selects which budget this reservation counts
+    /// against: `"global"` (the pre-PWQ-03 behavior, still the default for
+    /// every call that doesn't opt into scoping) reserves against the single
+    /// fleet-wide key every instance/identity always shared; a caller-supplied
+    /// suffix (built by [`PlaneClient::rate_key_suffix`] as
+    /// `{identity}:{scope}`) reserves against its OWN key instead, so a scoped
+    /// batch drain can't starve — or be starved by — unrelated traffic sharing
+    /// the same Redis.
+    async fn rate_reserve(&self, min_interval: Duration, key_suffix: &str) -> Option<Duration> {
         if !self.breaker.allow() {
             return None;
         }
@@ -429,7 +460,7 @@ impl RedisBackend {
         // script, so an idle key still self-expires cleanly (a missing key =
         // "no prior slot") without ever expiring mid-backlog under a burst.
         let ttl_buffer_ms = (interval_ms.saturating_mul(4)).max(1000);
-        let key = format!("{}ratelimit:global", self.key_prefix);
+        let key = format!("{}ratelimit:{key_suffix}", self.key_prefix);
         let fut = async {
             let mut conn = self
                 .conn()
@@ -471,6 +502,24 @@ impl RedisBackend {
             rate_script: redis::Script::new(RATE_RESERVE_LUA),
         })
     }
+
+    /// A backend pointed at a real (test-fake) Redis endpoint, used by PWQ-01
+    /// batch-job tests that need `cache_get`/`cache_set` (i.e. `JobStore`) to
+    /// actually round-trip rather than fail open. Longer op timeout than
+    /// `test_unreachable` since this one is expected to succeed over a real
+    /// (if minimal) TCP round-trip.
+    #[cfg(test)]
+    fn test_pointed_at(url: &str) -> Arc<Self> {
+        let client = redis::Client::open(url).expect("valid test redis url");
+        Arc::new(Self {
+            client,
+            conn: OnceCell::new(),
+            op_timeout: Duration::from_millis(500),
+            breaker: CircuitBreaker::new(),
+            key_prefix: "plane:".to_string(),
+            rate_script: redis::Script::new(RATE_RESERVE_LUA),
+        })
+    }
 }
 
 /// Namespace + hash a raw cache key (`token\0url`) into a Redis key. Hashing
@@ -486,6 +535,16 @@ fn redis_cache_key(raw: &str) -> String {
     let mut h = sha1_smol::Sha1::new();
     h.update(raw.as_bytes());
     format!("plane:cache:{}", h.digest())
+}
+
+/// The parent identity rate key for a rate-key suffix (S3 identity ceiling).
+/// A scoped suffix `{identity}:{scope}` has parent `{identity}`; the global or
+/// identity-only suffixes have no parent (nothing above them to gate against).
+/// Returns a slice of the input so no allocation happens on the hot path.
+fn rate_key_parent(key_suffix: Option<&str>) -> Option<&str> {
+    let suffix = key_suffix?;
+    let idx = suffix.find(':')?;
+    Some(&suffix[..idx])
 }
 
 // ─── Rate limiter (in-process, optionally Redis-coordinated) ─────────────────
@@ -548,7 +607,17 @@ impl RateLimiter {
     /// the whole point is to not hammer Plane, so there is nothing to pipeline —
     /// and no Redis state (down, mid-flight death, restart/flush) can produce an
     /// intra-process burst.
-    async fn acquire(&self) {
+    ///
+    /// `key_suffix` (PWQ-03): `None` reserves against the pre-PWQ-03
+    /// `"global"` shared-Redis key exactly as before (every existing caller
+    /// that doesn't build a scoped [`PlaneClient`] is byte-for-byte
+    /// unaffected). `Some(suffix)` reserves against `plane:ratelimit:{suffix}`
+    /// instead — used only by scope-aware batch writes (see
+    /// [`PlaneClient::rate_key_suffix`]). This ONLY changes which distributed
+    /// Redis slot is reserved; the per-process pacing floor below (and
+    /// `min_interval` itself) is unchanged either way, per the PWQ-01/PWQ-03
+    /// requirement to never touch the pacing values.
+    async fn acquire(&self, key_suffix: Option<&str>) {
         // Pacing disabled → nothing to gate (and no Redis round-trip).
         if self.min_interval.is_zero() {
             return;
@@ -568,11 +637,30 @@ impl RateLimiter {
 
         // 2. Reserve the shared cross-process slot at ~the actual send time
         //    (best-effort). `None` (unconfigured OR any Redis failure) = zero wait.
+        //
+        //    S3 identity ceiling: a scoped suffix (`{identity}:{scope}`) gets
+        //    its own per-scope key for fairness, but that alone would let a
+        //    caller rotate `scope` per batch to mint unlimited fresh 20-RPM
+        //    budgets and evade any aggregate cap. So a scoped call ALSO reserves
+        //    the identity's PARENT key (`{identity}`) and waits for the later of
+        //    the two slots — the parent serialises every scope under one
+        //    identity to a single shared budget (the ceiling), while the
+        //    per-scope key keeps sub-fairness underneath it. The unscoped path
+        //    (suffix `None` → `global`) has no parent and is byte-for-byte
+        //    unchanged from before PWQ-03.
         if let Some(backend) = &self.redis {
-            if let Some(redis_wait) = backend.rate_reserve(self.min_interval).await {
-                if !redis_wait.is_zero() {
-                    tokio::time::sleep(redis_wait).await;
+            let leaf = key_suffix.unwrap_or("global");
+            let mut wait = Duration::ZERO;
+            if let Some(parent) = rate_key_parent(key_suffix) {
+                if let Some(w) = backend.rate_reserve(self.min_interval, parent).await {
+                    wait = wait.max(w);
                 }
+            }
+            if let Some(w) = backend.rate_reserve(self.min_interval, leaf).await {
+                wait = wait.max(w);
+            }
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
             }
         }
 
@@ -651,6 +739,358 @@ impl GetCache {
     }
 }
 
+// ─── PWQ-01/02: async batch job store (Redis-backed, TTL'd) ──────────────────
+//
+// Replaces the pre-PWQ-01 design where `plane_batch_create_work_items` was a
+// synchronous serial loop the caller blocked on for the whole drain. A batch
+// job's full state (every item's pending/created/failed result) is persisted
+// as ONE JSON blob under `plane:batch:{batch_id}`, reusing `RedisBackend`'s
+// existing fail-open cache primitives (`cache_get`/`cache_set`) rather than a
+// new Redis code path — same short-timeout + circuit-breaker guarantees, same
+// TTL semantics. There is deliberately no in-process fallback store: when
+// Redis is unavailable, `JobStore::enabled()` is false and the batch tool
+// falls all the way back to executing synchronously (correct, just degraded,
+// exactly the PWQ-01 spec's documented fallback) rather than keeping
+// ephemeral, single-instance, non-durable job state that a status poll from a
+// different process could never see anyway.
+
+/// How long a batch job record survives in Redis after creation, regardless
+/// of whether it finished draining — see PWQ-01 EDGE CASES ("process restart
+/// mid-drain"): an abandoned "running" job simply expires rather than growing
+/// Redis unbounded.
+const BATCH_JOB_TTL: Duration = Duration::from_secs(3600);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum BatchItemStatus {
+    Pending,
+    Created,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct BatchItemResult {
+    index: usize,
+    status: BatchItemStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sequence_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl BatchItemResult {
+    fn pending(index: usize) -> Self {
+        Self { index, status: BatchItemStatus::Pending, id: None, sequence_id: None, name: None, error: None }
+    }
+
+    fn created(index: usize, issue: &Issue) -> Self {
+        Self {
+            index,
+            status: BatchItemStatus::Created,
+            id: Some(issue.id.clone()),
+            sequence_id: issue.sequence_id,
+            name: Some(issue.name.clone()),
+            error: None,
+        }
+    }
+
+    fn failed(index: usize, error: String) -> Self {
+        Self { index, status: BatchItemStatus::Failed, id: None, sequence_id: None, name: None, error: Some(error) }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum BatchStatus {
+    Running,
+    Done,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BatchJob {
+    batch_id: String,
+    project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    status: BatchStatus,
+    total: usize,
+    items: Vec<BatchItemResult>,
+}
+
+impl BatchJob {
+    fn mark_done_if_complete(&mut self) {
+        if self.items.iter().all(|r| r.status != BatchItemStatus::Pending) {
+            self.status = BatchStatus::Done;
+        }
+    }
+}
+
+/// Redis-backed store for [`BatchJob`] records. Thin wrapper over the same
+/// `RedisBackend` the cache/rate-limiter already share (fail-open, circuit
+/// breaker, short op timeout) — see the module doc above for why there is no
+/// in-process fallback tier.
+struct JobStore {
+    redis: Option<Arc<RedisBackend>>,
+}
+
+impl JobStore {
+    fn from_env(redis: Option<Arc<RedisBackend>>) -> Self {
+        Self { redis }
+    }
+
+    /// A store with no backend at all — batch writes through it always take
+    /// the synchronous fallback path. Used by test-only client constructors.
+    #[cfg(test)]
+    fn disabled() -> Self {
+        Self { redis: None }
+    }
+
+    /// True when a Redis backend is configured. This does NOT guarantee the
+    /// backend is currently reachable (that's the circuit breaker's job) —
+    /// `save`/`load` fail-open on their own and report failure via `bool`/
+    /// `None`, so a mid-drain outage degrades to "results for this job stop
+    /// updating" rather than panicking or blocking.
+    fn enabled(&self) -> bool {
+        self.redis.is_some()
+    }
+
+    fn key(batch_id: &str) -> String {
+        format!("plane:batch:{batch_id}")
+    }
+
+    /// Create the INITIAL job record and confirm it actually landed. Returns
+    /// `false` if there is no backend, serialization fails, or the write can't
+    /// be confirmed (Redis died between the `enabled()` check and the write) —
+    /// the batch tool uses this to decide async-vs-synchronous. On a
+    /// confirm-read failure the just-written key is best-effort DELETED (N1) so
+    /// a job that then runs synchronously never leaves an unreachable
+    /// all-pending record to linger until its TTL. Only the initial create
+    /// confirms/reaps; per-item updates use the plain `save` below (a failed
+    /// confirm mid-drain must never delete a live job).
+    async fn create(&self, job: &BatchJob) -> bool {
+        let Some(backend) = &self.redis else { return false };
+        let Ok(body) = serde_json::to_string(job) else { return false };
+        // `cache_set` is itself fail-open (best-effort, swallows errors via the
+        // breaker) so this can't hang or panic on a dead Redis; we can't
+        // directly observe success there, so re-read once to confirm the
+        // write actually landed rather than reporting false confidence.
+        backend.cache_set(&Self::key(&job.batch_id), &body, BATCH_JOB_TTL).await;
+        if backend.cache_get(&Self::key(&job.batch_id)).await.is_some() {
+            true
+        } else {
+            backend.del(&Self::key(&job.batch_id)).await;
+            false
+        }
+    }
+
+    /// Best-effort overwrite of an existing job record (per-item progress
+    /// updates from the drain worker). No confirm-read and no reap: a transient
+    /// Redis blip just means this one update is lost, never that a live job is
+    /// deleted.
+    async fn save(&self, job: &BatchJob) {
+        let Some(backend) = &self.redis else { return };
+        let Ok(body) = serde_json::to_string(job) else { return };
+        backend.cache_set(&Self::key(&job.batch_id), &body, BATCH_JOB_TTL).await;
+    }
+
+    async fn load(&self, batch_id: &str) -> Option<BatchJob> {
+        let backend = self.redis.as_ref()?;
+        let (body, _remaining_ttl) = backend.cache_get(&Self::key(batch_id)).await?;
+        serde_json::from_str(&body).ok()
+    }
+}
+
+// ─── PWQ-03: fair-share round-robin batch dispatcher (in-process) ────────────
+//
+// The Redis-scoped rate key (`PlaneClient::rate_key_suffix`) separates
+// distributed BUDGETS across identities/scopes/processes, but within a
+// single process the pre-existing `RateLimiter` is one shared, strictly
+// serial gate — if each batch's background drain simply looped its own items
+// through that gate independently, a large batch queued first would still
+// monopolise the gate ahead of a small batch queued moments later (classic
+// head-of-line blocking), even though both returned their `batch_id`
+// immediately. `BatchDispatcher` fixes that by owning ALL pending sends
+// process-wide in one structure and interleaving them round-robin, one item
+// per scope per turn, so no single batch can starve another regardless of
+// relative size. It does not change pacing at all — every send still goes
+// through `PlaneClient::post_with_retry` -> the same `RateLimiter`.
+
+/// One queued Plane write. Critically (PWQ-01/03 B1 fix) it carries its OWN
+/// batch's `client` and target `url`: the shared dispatcher drains items from
+/// MANY concurrently-enqueued batches through ONE worker, and each item MUST
+/// be POSTed through the client of the batch it belongs to — that client is
+/// what fixes both the auth token (`api_key`) AND the distributed rate-key
+/// suffix (`{identity}:{scope}`). Draining every item through a single fixed
+/// client would misattribute tokens across identities and collapse per-scope
+/// rate separation during exactly the concurrent window PWQ-03 exists for.
+/// The job record is read/written via the SAME client's `job_store` (all
+/// clients share one Redis backend, keyed by `batch_id`).
+struct PendingSend {
+    client: Arc<PlaneClient>,
+    batch_id: String,
+    index: usize,
+    url: String,
+    body: Value,
+}
+
+struct DispatcherInner {
+    /// scope key -> its pending sends (FIFO within a scope). Each `PendingSend`
+    /// carries its own client + url, so a single scope bucket can legitimately
+    /// hold items from different batches (same scope, e.g. two batches from
+    /// one connection) and each still drains through its own client.
+    queues: HashMap<String, std::collections::VecDeque<PendingSend>>,
+    /// Round-robin order of scope keys that currently have pending work.
+    ring: std::collections::VecDeque<String>,
+    /// Whether a drain worker task is currently running. Owned exclusively by
+    /// `enqueue` (sets true + spawns) and [`RunningGuard`] (resets false on
+    /// worker exit — normal OR panic — and respawns if work is still pending),
+    /// so a panicking worker can never permanently wedge the dispatcher (S1).
+    running: bool,
+}
+
+struct BatchDispatcher {
+    // A std (sync) mutex, not a tokio mutex: the critical sections here are all
+    // synchronous map/deque ops (no `.await` while held), and the panic-safety
+    // guard below must lock from a *synchronous* `Drop`. `post_with_retry`'s
+    // `.await` happens in the worker OUTSIDE this lock.
+    inner: StdMutex<DispatcherInner>,
+}
+
+/// Reset `running` on worker exit however it exits (normal return OR a panic
+/// unwinding through `run_worker`'s `.await` points), and — under the same
+/// lock — respawn a fresh worker if any work is still queued. This closes both
+/// the "worker panicked with running=true → all future batches queue forever"
+/// wedge (S1) and the benign race where `enqueue` pushed work after the worker
+/// decided to stop but before it reset the flag.
+struct RunningGuard {
+    dispatcher: Arc<BatchDispatcher>,
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        let mut inner = self.dispatcher.inner.lock().unwrap();
+        inner.running = false;
+        if !inner.ring.is_empty() {
+            inner.running = true;
+            let dispatcher = self.dispatcher.clone();
+            drop(inner);
+            tokio::spawn(async move { dispatcher.run_worker().await });
+        }
+    }
+}
+
+impl BatchDispatcher {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: StdMutex::new(DispatcherInner {
+                queues: HashMap::new(),
+                ring: std::collections::VecDeque::new(),
+                running: false,
+            }),
+        })
+    }
+
+    /// Add one batch's items (each already carrying its own client + url) to
+    /// `scope`'s queue and start the shared drain worker if it isn't already
+    /// running. `scope` is a plain fairness bucket key (typically
+    /// `PlaneClient::rate_key_suffix()`'s value, or `"default"` when the batch
+    /// has no scope) — it is NOT the Redis key itself, just this process's
+    /// round-robin grouping.
+    fn enqueue(self: &Arc<Self>, scope: String, items: Vec<PendingSend>) {
+        let mut inner = self.inner.lock().unwrap();
+        let queue = inner.queues.entry(scope.clone()).or_default();
+        let was_empty = queue.is_empty();
+        for item in items {
+            queue.push_back(item);
+        }
+        if was_empty {
+            inner.ring.push_back(scope);
+        }
+        if !inner.running {
+            inner.running = true;
+            let dispatcher = self.clone();
+            tokio::spawn(async move { dispatcher.run_worker().await });
+        }
+    }
+
+    /// Pop the next pending send in round-robin order across scopes. Returns
+    /// `None` when nothing is queued; it deliberately does NOT touch `running`
+    /// — that flag's lifecycle is owned solely by `enqueue`/[`RunningGuard`],
+    /// so the guard is the single place that decides whether a replacement
+    /// worker is needed (making the logic panic-safe).
+    fn next(&self) -> Option<PendingSend> {
+        let mut inner = self.inner.lock().unwrap();
+        loop {
+            let scope = inner.ring.pop_front()?;
+            let Some(queue) = inner.queues.get_mut(&scope) else { continue };
+            if let Some(item) = queue.pop_front() {
+                if queue.is_empty() {
+                    inner.queues.remove(&scope);
+                } else {
+                    inner.ring.push_back(scope);
+                }
+                return Some(item);
+            }
+            inner.queues.remove(&scope);
+        }
+    }
+
+    async fn run_worker(self: Arc<Self>) {
+        // Dropped on ANY exit path (normal or panic) → resets `running` and
+        // respawns if work remains (S1).
+        let _guard = RunningGuard { dispatcher: self.clone() };
+        while let Some(pending) = self.next() {
+            let client = &pending.client;
+            let result = match client.post_with_retry(&pending.url, &pending.body).await {
+                Ok(resp) => match PlaneClient::check_status(resp).await {
+                    Ok(resp) => match resp.json::<Issue>().await {
+                        Ok(issue) => BatchItemResult::created(pending.index, &issue),
+                        Err(e) => BatchItemResult::failed(pending.index, format!("failed to parse created issue: {e}")),
+                    },
+                    Err(e) => BatchItemResult::failed(pending.index, e.to_string()),
+                },
+                Err(e) => BatchItemResult::failed(pending.index, e.to_string()),
+            };
+            // Read-modify-write the job record through THIS item's own client's
+            // job store. If the job has expired or Redis is currently
+            // unreachable, `load` returns `None` and this item's outcome is
+            // simply not recorded — the Plane write itself still happened (or
+            // was attempted), matching the PWQ-01 EDGE CASE that a
+            // resumer/durable-write-ahead of results is explicitly out of scope.
+            if let Some(mut job) = client.job_store.load(&pending.batch_id).await {
+                if let Some(slot) = job.items.get_mut(pending.index) {
+                    *slot = result;
+                }
+                job.mark_done_if_complete();
+                client.job_store.save(&job).await;
+            }
+        }
+    }
+}
+
+/// PWQ-03: resolve the fairness scope for a Plane tool call from its raw
+/// args. An explicit `scope` argument (per-task grouping, e.g. a Plane
+/// project or sprint id) always wins; otherwise falls back to the
+/// terminus-client-daemon-injected connection scope (`__conn_scope` — a
+/// reserved metadata key, never part of any tool's public JSON schema, set by
+/// `src/mcp_server.rs`'s `tools/call` handler from the forwarded request's
+/// `_meta.scope`, never something a model can see or fabricate a value for
+/// beyond what its own connection was tagged with). `None` when neither is
+/// present, which is the common case for every tool that isn't a scoped
+/// batch write — callers must explicitly opt in.
+fn resolve_scope(args: &Value) -> Option<String> {
+    args.get("scope")
+        .and_then(|v| v.as_str())
+        .or_else(|| args.get("__conn_scope").and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 // ─── PlaneClient ─────────────────────────────────────────────────────────────
 
 /// Env-var prefix that marks a per-agent named-identity token. A variable
@@ -701,6 +1141,22 @@ pub struct PlaneClient {
     workspace: String,
     rate_limiter: Arc<RateLimiter>,
     cache: Arc<GetCache>,
+    /// PWQ-03: caller-supplied fairness scope (e.g. a terminus-client
+    /// connection id, or an explicit `scope` tool argument) for THIS client
+    /// instance. `None` for every ordinary clone (the overwhelming majority
+    /// of calls) — only [`PlaneClient::with_scope`] sets it, currently just
+    /// the batch-write tools. See [`PlaneClient::rate_key_suffix`].
+    scope: Option<String>,
+    /// PWQ-01/02: Redis-backed batch job store, sharing the same optional
+    /// backend as `cache`/`rate_limiter`. Disabled (`JobStore::disabled()`)
+    /// whenever `PLANE_REDIS_URL` is unset — the batch tool then falls back
+    /// to its pre-PWQ-01 synchronous behavior.
+    job_store: Arc<JobStore>,
+    /// PWQ-01/03: process-wide fair-share dispatcher for async batch drains.
+    /// Shared by `Arc` across every clone of this client so all batches
+    /// enqueued by ANY identity/scope on this process interleave through one
+    /// round-robin drain instead of each batch's own private serial loop.
+    batch_dispatcher: Arc<BatchDispatcher>,
 }
 
 /// Hand-written `Debug` impl: never prints `api_key` or `identities` (both
@@ -775,7 +1231,10 @@ impl PlaneClient {
             identities: Arc::new(identities),
             workspace,
             rate_limiter: Arc::new(RateLimiter::from_env(redis_backend.clone())),
-            cache: Arc::new(GetCache::from_env(redis_backend)),
+            cache: Arc::new(GetCache::from_env(redis_backend.clone())),
+            scope: None,
+            job_store: Arc::new(JobStore::from_env(redis_backend)),
+            batch_dispatcher: BatchDispatcher::new(),
         }
     }
 
@@ -805,6 +1264,9 @@ impl PlaneClient {
             workspace: "testws".into(),
             rate_limiter: Arc::new(RateLimiter::local(Duration::ZERO)),
             cache: Arc::new(GetCache::new(Duration::from_secs(5))),
+            scope: None,
+            job_store: Arc::new(JobStore::disabled()),
+            batch_dispatcher: BatchDispatcher::new(),
         })
     }
 
@@ -832,6 +1294,39 @@ impl PlaneClient {
             api_key: Some(token),
             identity_name: Some(key),
             ..self.clone()
+        })
+    }
+
+    /// Return a clone of this client tagged with a PWQ-03 fairness scope.
+    /// Cheap (the `Arc`-shared HTTP client, rate limiter, cache, job store and
+    /// dispatcher are all shared unchanged; only the scope string is new) —
+    /// intended to be called once per tool invocation, same as
+    /// [`PlaneClient::for_identity`]. `None`/empty clears the scope, which is
+    /// also the default for every client that never calls this method.
+    pub fn with_scope(&self, scope: Option<String>) -> Self {
+        Self {
+            scope: scope.filter(|s| !s.trim().is_empty()),
+            ..self.clone()
+        }
+    }
+
+    /// The Redis rate-key suffix (PWQ-03) for calls made through this client:
+    /// `Some("{identity}:{scope}")` when a scope has been set via
+    /// [`PlaneClient::with_scope`] (identity defaults to `"default"` when no
+    /// named identity is active), else `None` — which makes
+    /// [`RateLimiter::acquire`] reserve against the original, unscoped
+    /// `"global"` key, byte-for-byte the pre-PWQ-03 behavior for every caller
+    /// that never opts into scoping. Deliberately only two tiers (scoped vs.
+    /// global), not a three-tier identity-only middle key: nearly every
+    /// deployment already resolves a named default `identity_name` even
+    /// without an explicit `identity` argument (see `from_env`), so keying on
+    /// identity alone whenever it's merely *present* would silently move most
+    /// existing traffic off the shared "global" Redis budget — a much wider
+    /// blast radius than this incident calls for. Flagged for review.
+    fn rate_key_suffix(&self) -> Option<String> {
+        self.scope.as_ref().map(|scope| {
+            let identity = self.identity_name.as_deref().unwrap_or("default");
+            format!("{identity}:{scope}")
         })
     }
 
@@ -1042,7 +1537,7 @@ impl PlaneClient {
         let mut attempts = 0u8;
         loop {
             attempts += 1;
-            self.rate_limiter.acquire().await;
+            self.rate_limiter.acquire(self.rate_key_suffix().as_deref()).await;
 
             let sent = build().send().await;
             let resp = match sent {
@@ -2822,6 +3317,32 @@ impl RustTool for PlaneGetStateByName {
 }
 
 // ─── 26. plane_batch_create_work_items ───────────────────────────────────────
+//
+// PWQ-01/03: pre-S111B this was a synchronous serial loop — the caller's MCP
+// request blocked for the ENTIRE drain (N items x the shared 3s pacing
+// interval), which is what made a 7-item batch exceed the client->primary
+// forward timeout under concurrent load (S111B incident). Now: validate all
+// items, enqueue a Redis-backed `BatchJob`, hand it to the process-wide
+// `BatchDispatcher` for a fair, round-robin, still fully paced background
+// drain, and return the `batch_id` immediately — the forwarded MCP call
+// becomes O(ms) regardless of batch size or how many OTHER batches/scopes are
+// draining concurrently. Poll results with `plane_batch_status`. When no
+// Redis job store is configured/reachable, falls back to the original
+// synchronous behavior (correct, just degraded) and says so in the response.
+
+fn build_batch_item_body(item: &Value, name: &str) -> Value {
+    let mut body = json!({ "name": name });
+    if let Some(v) = item.get("description_html").and_then(|v| v.as_str()) {
+        body["description_html"] = json!(v);
+    }
+    if let Some(v) = item.get("priority").and_then(|v| v.as_str()) {
+        body["priority"] = json!(v);
+    }
+    if let Some(v) = item.get("state").and_then(|v| v.as_str()) {
+        body["state"] = json!(v);
+    }
+    body
+}
 
 pub struct PlaneBatchCreateWorkItems {
     client: Arc<PlaneClient>,
@@ -2831,7 +3352,11 @@ pub struct PlaneBatchCreateWorkItems {
 impl RustTool for PlaneBatchCreateWorkItems {
     fn name(&self) -> &str { "plane_batch_create_work_items" }
     fn description(&self) -> &str {
-        "Create multiple work items in a Plane project sequentially, returning each result"
+        "Create multiple work items in a Plane project. Enqueues the batch and returns a batch_id \
+         immediately (never blocks on the drain) — poll plane_batch_status for per-item results. \
+         Items are still written sequentially, paced by the same rate limiter as every other Plane \
+         write; only the caller no longer waits for the whole batch. Falls back to the original \
+         synchronous behavior (clearly flagged) if no Redis job store is available."
     }
     fn parameters(&self) -> Value {
         with_identity_param(json!({
@@ -2851,13 +3376,33 @@ impl RustTool for PlaneBatchCreateWorkItems {
                         },
                         "required": ["name"]
                     }
+                },
+                "scope": {
+                    "type": "string",
+                    "description": "PWQ-03: optional fairness/grouping scope (e.g. a task or sprint id). \
+                                    Overrides the connection-level scope this call was made on, but only \
+                                    within the caller's own identity — it can never widen the write budget \
+                                    to another identity's traffic. Omit to use the connection's own scope."
                 }
             },
             "required": ["project_id", "items"]
         }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        let client = self.client.resolve_identity(&args)?;
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneBatchCreateWorkItems {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
+        let identity_scoped = self.client.resolve_identity(&args)?.into_owned();
+        let scope = resolve_scope(&args);
+        let client = Arc::new(identity_scoped.with_scope(scope.clone()));
+
         let project_id_arg = require_arg!(args, "project_id", as_str);
         let items = args
             .get("items")
@@ -2866,32 +3411,87 @@ impl RustTool for PlaneBatchCreateWorkItems {
         if items.is_empty() {
             return Err(ToolError::InvalidArgument("items must not be empty".into()));
         }
-        let project_id = client.resolve_project_id(project_id_arg).await?;
-
-        let url = format!(
-            "{}projects/{project_id}/issues/",
-            client.workspace_url()
-        );
-        let mut out = format!("Batch-created {} issue(s):\n", items.len());
+        // Validate every item up front (fail fast, before touching Plane or
+        // enqueueing anything) rather than discovering a missing `name` mid-drain.
+        let mut names = Vec::with_capacity(items.len());
         for (index, item) in items.iter().enumerate() {
             let name = item
                 .get("name")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    ToolError::InvalidArgument(format!("items[{index}] missing required field: name"))
-                })?;
-            let mut body = json!({ "name": name });
-            if let Some(v) = item.get("description_html").and_then(|v| v.as_str()) {
-                body["description_html"] = json!(v);
+                .ok_or_else(|| ToolError::InvalidArgument(format!("items[{index}] missing required field: name")))?;
+            names.push(name.to_string());
+        }
+
+        let project_id = client.resolve_project_id(project_id_arg).await?;
+        let url = format!("{}projects/{project_id}/issues/", client.workspace_url());
+
+        if client.job_store.enabled() {
+            let batch_id = uuid::Uuid::new_v4().to_string();
+            let item_results: Vec<BatchItemResult> = (0..items.len()).map(BatchItemResult::pending).collect();
+            let job = BatchJob {
+                batch_id: batch_id.clone(),
+                project_id: project_id.clone(),
+                scope: scope.clone(),
+                status: BatchStatus::Running,
+                total: items.len(),
+                items: item_results,
+            };
+            if client.job_store.create(&job).await {
+                // Each PendingSend carries THIS batch's own client + url so the
+                // shared dispatcher drains it with the correct token + rate key
+                // even while other batches (other identities/scopes) drain
+                // concurrently (PWQ-01/03 B1).
+                let sends: Vec<PendingSend> = items
+                    .iter()
+                    .zip(names.iter())
+                    .enumerate()
+                    .map(|(index, (item, name))| PendingSend {
+                        client: client.clone(),
+                        batch_id: batch_id.clone(),
+                        index,
+                        url: url.clone(),
+                        body: build_batch_item_body(item, name),
+                    })
+                    .collect();
+                let dispatcher_scope = scope.clone().unwrap_or_else(|| "default".to_string());
+                client.batch_dispatcher.clone().enqueue(dispatcher_scope, sends);
+
+                let structured = json!({
+                    "batch_id": batch_id,
+                    "accepted": items.len(),
+                    "status": "running",
+                    "poll_with": "plane_batch_status",
+                });
+                let text = format!(
+                    "Batch queued: {} item(s) accepted (batch_id: {batch_id}). Poll results with plane_batch_status.",
+                    items.len()
+                );
+                return Ok((text, structured));
             }
-            if let Some(v) = item.get("priority").and_then(|v| v.as_str()) {
-                body["priority"] = json!(v);
-            }
-            if let Some(v) = item.get("state").and_then(|v| v.as_str()) {
-                body["state"] = json!(v);
-            }
+            // Redis reported configured but the save itself failed (e.g. died
+            // between the availability check and the write) — degrade to the
+            // synchronous path below rather than losing the batch.
+        }
+
+        // Synchronous fallback: no Redis job store configured/reachable. Same
+        // behavior as the pre-PWQ-01 tool, clearly flagged as degraded.
+        let (mut text, structured) = Self::run_sync(&client, &url, items, &names).await?;
+        text.push_str("\n(note: Redis job store unavailable — executed synchronously, degraded mode; batch writes will block the caller for large batches)");
+        Ok((text, structured))
+    }
+
+    async fn run_sync(
+        client: &Arc<PlaneClient>,
+        url: &str,
+        items: &[Value],
+        names: &[String],
+    ) -> Result<(String, Value), ToolError> {
+        let mut out = format!("Batch-created {} issue(s):\n", items.len());
+        let mut results = Vec::with_capacity(items.len());
+        for (index, (item, name)) in items.iter().zip(names.iter()).enumerate() {
+            let body = build_batch_item_body(item, name);
             debug!("plane_batch_create_work_items [{index}] POST {url}");
-            let resp = client.post_with_retry(&url, &body).await?;
+            let resp = client.post_with_retry(url, &body).await?;
             let resp = PlaneClient::check_status(resp).await?;
             let created: Issue = resp
                 .json()
@@ -2905,8 +3505,105 @@ impl RustTool for PlaneBatchCreateWorkItems {
                 created.name,
                 created.sequence_id.unwrap_or(0)
             ));
+            results.push(BatchItemResult::created(index, &created));
         }
-        Ok(out)
+        let structured = json!({ "mode": "sync", "items": results });
+        Ok((out, structured))
+    }
+}
+
+// ─── 26b. plane_batch_status ─────────────────────────────────────────────────
+//
+// PWQ-02: poll tool for the async batch job PWQ-01's `plane_batch_create_work_items`
+// enqueues. Reads the Redis job record directly — never touches Plane itself.
+
+pub struct PlaneBatchStatus {
+    client: Arc<PlaneClient>,
+}
+
+#[async_trait]
+impl RustTool for PlaneBatchStatus {
+    fn name(&self) -> &str { "plane_batch_status" }
+    fn description(&self) -> &str {
+        "Poll the status of a batch started by plane_batch_create_work_items: overall \
+         running/done state plus each item's pending/created/failed result. Returns a clear \
+         message for an unknown or expired batch_id (job records expire after 1 hour)."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "batch_id": { "type": "string", "description": "The batch_id returned by plane_batch_create_work_items" }
+            },
+            "required": ["batch_id"]
+        })
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneBatchStatus {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
+        let batch_id = require_arg!(args, "batch_id", as_str);
+
+        if !self.client.job_store.enabled() {
+            return Err(ToolError::NotConfigured(
+                "No Redis job store is configured for this Plane client — batches run synchronously \
+                 and have no pollable status".into(),
+            ));
+        }
+
+        let Some(job) = self.client.job_store.load(batch_id).await else {
+            let structured = json!({ "batch_id": batch_id, "found": false });
+            return Ok((format!("Unknown or expired batch: {batch_id}"), structured));
+        };
+
+        let created = job.items.iter().filter(|r| r.status == BatchItemStatus::Created).count();
+        let failed = job.items.iter().filter(|r| r.status == BatchItemStatus::Failed).count();
+        let pending = job.items.iter().filter(|r| r.status == BatchItemStatus::Pending).count();
+
+        let status_word = match job.status {
+            BatchStatus::Running => "running",
+            BatchStatus::Done => "done",
+        };
+        let mut out = format!(
+            "Batch {batch_id}: {status_word} — {created} created, {failed} failed, {pending} pending (of {})\n",
+            job.total
+        );
+        for item in &job.items {
+            match item.status {
+                BatchItemStatus::Pending => out.push_str(&format!("  {}: pending\n", item.index)),
+                BatchItemStatus::Created => out.push_str(&format!(
+                    "  {}: created [{}] {} (#{})\n",
+                    item.index,
+                    item.id.as_deref().unwrap_or("?"),
+                    item.name.as_deref().unwrap_or(""),
+                    item.sequence_id.unwrap_or(0)
+                )),
+                BatchItemStatus::Failed => out.push_str(&format!(
+                    "  {}: failed — {}\n",
+                    item.index,
+                    item.error.as_deref().unwrap_or("unknown error")
+                )),
+            }
+        }
+
+        let structured = json!({
+            "batch_id": batch_id,
+            "found": true,
+            "status": status_word,
+            "total": job.total,
+            "created": created,
+            "failed": failed,
+            "pending": pending,
+            "items": job.items,
+        });
+        Ok((out, structured))
     }
 }
 
@@ -3396,6 +4093,7 @@ pub fn register(registry: &mut ToolRegistry) {
         Box::new(PlaneCloseWorkItem { client: client.clone() }),
         Box::new(PlaneGetStateByName { client: client.clone() }),
         Box::new(PlaneBatchCreateWorkItems { client: client.clone() }),
+        Box::new(PlaneBatchStatus { client: client.clone() }),
         Box::new(PlaneWhoami { client: client.clone() }),
         Box::new(PlaneListIdentities { client: client.clone() }),
         // EGJS-01: sub-issue + label mutation tools (harmony egress-wall gap)
@@ -3443,6 +4141,9 @@ mod tests {
             workspace: "testws".into(),
             rate_limiter: Arc::new(RateLimiter::local(Duration::ZERO)),
             cache: Arc::new(GetCache::new(Duration::from_secs(5))),
+            scope: None,
+            job_store: Arc::new(JobStore::disabled()),
+            batch_dispatcher: BatchDispatcher::new(),
         })
     }
 
@@ -3509,6 +4210,9 @@ mod tests {
             workspace: "moosenet".into(),
             rate_limiter: Arc::new(RateLimiter::local(Duration::ZERO)),
             cache: Arc::new(GetCache::new(Duration::from_secs(5))),
+            scope: None,
+            job_store: Arc::new(JobStore::disabled()),
+            batch_dispatcher: BatchDispatcher::new(),
         });
         let tool = PlaneListProjects { client };
         let result = tool.execute(json!({})).await;
@@ -4000,12 +4704,13 @@ mod tests {
         // (not required for registration, only for execution)
         let mut registry = ToolRegistry::new();
         register(&mut registry);
-        // 37 core plane_* tools + 5 plane_prefix_* sub-tools (see prefix::register).
+        // 38 core plane_* tools + 5 plane_prefix_* sub-tools (see prefix::register).
         // EGJS-01 added 5 sub-issue/label tools (plane_list_sub_issues,
         // plane_link_sub_issue, plane_unlink_sub_issue, plane_create_label,
-        // plane_add_label) to the prior 32 core tools.
-        assert_eq!(registry.len(), 42,
-            "Expected 42 plane tools (37 core + 5 prefix), got {}", registry.len());
+        // plane_add_label) to the prior 32 core tools; PWQ-02 added
+        // plane_batch_status alongside plane_batch_create_work_items.
+        assert_eq!(registry.len(), 43,
+            "Expected 43 plane tools (38 core + 5 prefix), got {}", registry.len());
     }
 
     // ── EGJS-01: sub-issue + label tools are registered and structured ────────
@@ -4316,6 +5021,553 @@ mod tests {
         assert!(matches!(result.unwrap_err(), ToolError::InvalidArgument(_)));
     }
 
+    #[tokio::test]
+    async fn test_batch_create_sync_fallback_flags_degraded_mode_when_no_redis() {
+        // `mock_client` has no job store (JobStore::disabled()) -- PWQ-01's
+        // documented fallback: still creates every item synchronously, but the
+        // response clearly notes it ran degraded, and structuredContent still
+        // carries the created items.
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        server.mock(|when, then| {
+            when.method(POST).path("/api/v1/workspaces/testws/projects/p1/issues/");
+            then.status(201).json_body(json!({
+                "id": "generated", "name": "generated", "project": "p1", "workspace": "testws", "sequence_id": 1
+            }));
+        });
+        let client = mock_client(&server);
+        let tool = PlaneBatchCreateWorkItems { client };
+        let output = tool
+            .execute_structured(json!({"project_id": "p1", "items": [{"name": "Task A"}]}))
+            .await
+            .unwrap();
+        assert!(output.text.contains("Batch-created 1"), "{}", output.text);
+        assert!(output.text.to_lowercase().contains("redis job store unavailable"), "{}", output.text);
+        let structured = output.structured.expect("structuredContent must be present");
+        assert_eq!(structured["mode"], "sync");
+        assert_eq!(structured["items"][0]["status"], "created");
+    }
+
+    // ── PWQ-03: pure scope-resolution + rate-key composition (no I/O) ──────────
+
+    #[test]
+    fn test_resolve_scope_explicit_arg_wins_over_connection_scope() {
+        let args = json!({"scope": "task-a", "__conn_scope": "conn-1"});
+        assert_eq!(resolve_scope(&args).as_deref(), Some("task-a"));
+    }
+
+    #[test]
+    fn test_resolve_scope_falls_back_to_connection_scope() {
+        let args = json!({"__conn_scope": "conn-1"});
+        assert_eq!(resolve_scope(&args).as_deref(), Some("conn-1"));
+    }
+
+    #[test]
+    fn test_resolve_scope_absent_is_none() {
+        assert_eq!(resolve_scope(&json!({})), None);
+        // Blank strings are treated as absent, same as the `identity` arg convention.
+        assert_eq!(resolve_scope(&json!({"scope": "   "})), None);
+    }
+
+    #[test]
+    fn test_rate_key_suffix_none_without_scope() {
+        let client = PlaneClient::test_client_with_base_url("http://example.invalid".into());
+        // No `.with_scope()` call -> None -> RateLimiter::acquire uses the
+        // original unscoped "global" Redis key, byte-for-byte pre-PWQ-03.
+        assert_eq!(client.rate_key_suffix(), None);
+    }
+
+    #[test]
+    fn test_rate_key_suffix_composes_identity_and_scope_when_both_present() {
+        let base = PlaneClient::test_client_with_base_url("http://example.invalid".into());
+        let scoped = (*base).clone().with_scope(Some("conn-1".into()));
+        // No named identity active on this test client -> "default".
+        assert_eq!(scoped.rate_key_suffix().as_deref(), Some("default:conn-1"));
+    }
+
+    #[test]
+    fn test_rate_key_suffix_distinguishes_two_scopes() {
+        let base = PlaneClient::test_client_with_base_url("http://example.invalid".into());
+        let a = (*base).clone().with_scope(Some("agent-a".into()));
+        let b = (*base).clone().with_scope(Some("agent-b".into()));
+        assert_ne!(a.rate_key_suffix(), b.rate_key_suffix(), "distinct scopes must reserve distinct Redis keys");
+    }
+
+    // ── S3: per-identity parent ceiling key derivation ─────────────────────────
+
+    #[test]
+    fn test_rate_key_parent_of_scoped_suffix_is_the_identity() {
+        // A scoped `{identity}:{scope}` reserves the identity's parent budget
+        // too, so rotating `scope` can't mint unlimited fresh RPM budgets.
+        assert_eq!(rate_key_parent(Some("claude:conn-1")), Some("claude"));
+        assert_eq!(rate_key_parent(Some("lumina:task-42")), Some("lumina"));
+    }
+
+    #[test]
+    fn test_rate_key_parent_none_for_unscoped_and_global() {
+        // No colon → nothing above it to gate against (identity-only or the
+        // legacy global key), and the unscoped `None` path stays parent-less
+        // (byte-for-byte the pre-PWQ-03 single-reservation behavior).
+        assert_eq!(rate_key_parent(Some("global")), None);
+        assert_eq!(rate_key_parent(Some("claude")), None);
+        assert_eq!(rate_key_parent(None), None);
+    }
+
+    // ── S1: a panicking/dead worker must never permanently wedge the dispatcher ─
+
+    #[tokio::test]
+    async fn test_dispatcher_recovers_after_worker_exit_with_pending_work() {
+        // Simulate the wedge state a pre-S1 panicking worker would leave:
+        // running == true (so a normal `enqueue` would NOT spawn a replacement)
+        // with work still queued. Dropping a RunningGuard (what happens on ANY
+        // worker exit, panic included) must reset `running` AND respawn a worker
+        // that drains the backlog.
+        let server = MockServer::start();
+        let post_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/workspaces/testws/projects/p1/issues/");
+            then.status(201).json_body(json!({"id": "z", "name": "z", "project": "p1", "workspace": "testws", "sequence_id": 1}));
+        });
+        let client = mock_client(&server); // JobStore::disabled() — drain still POSTs, just doesn't record
+        let url = format!("{}/api/v1/workspaces/testws/projects/p1/issues/", server.base_url());
+
+        let dispatcher = BatchDispatcher::new();
+        {
+            let mut inner = dispatcher.inner.lock().unwrap();
+            inner.running = true; // as if a worker is (was) alive
+            let mut q = std::collections::VecDeque::new();
+            q.push_back(PendingSend { client: client.clone(), batch_id: "x".into(), index: 0, url, body: json!({"name": "z"}) });
+            inner.ring.push_back("s".into());
+            inner.queues.insert("s".into(), q);
+        }
+
+        // The dead worker's guard drops → recovery path.
+        drop(RunningGuard { dispatcher: dispatcher.clone() });
+
+        // A fresh worker must drain the backlog and reset running=false.
+        let mut recovered = false;
+        for _ in 0..40 {
+            {
+                let inner = dispatcher.inner.lock().unwrap();
+                if inner.queues.is_empty() && inner.ring.is_empty() && !inner.running {
+                    recovered = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(recovered, "dispatcher must respawn a worker and drain after a dead-worker guard drop");
+        assert_eq!(post_mock.hits(), 1, "the backlogged item must actually be POSTed by the respawned worker");
+    }
+
+    // ── PWQ-03: fair-share round-robin dispatcher ordering (no network/Redis) ──
+
+    #[tokio::test]
+    async fn test_batch_dispatcher_interleaves_scopes_round_robin() {
+        // Push directly into the dispatcher's internal queues (same-module test
+        // access) so this exercises exactly the `next()` fairness algorithm
+        // without needing a live HTTP/Redis backend -- a large "agent-a" batch
+        // queued first must not starve a small "agent-b" batch queued right
+        // after it.
+        let dispatcher = BatchDispatcher::new();
+        let dummy_client = PlaneClient::test_client_with_base_url("http://example.invalid".into());
+        {
+            let mut inner = dispatcher.inner.lock().unwrap();
+            for scope in ["agent-a", "agent-b"] {
+                let count = if scope == "agent-a" { 5 } else { 2 };
+                let mut q = std::collections::VecDeque::new();
+                for i in 0..count {
+                    q.push_back(PendingSend {
+                        client: dummy_client.clone(),
+                        batch_id: scope.to_string(),
+                        index: i,
+                        url: format!("http://x/{scope}"),
+                        body: json!({}),
+                    });
+                }
+                inner.ring.push_back(scope.to_string());
+                inner.queues.insert(scope.to_string(), q);
+            }
+        }
+        let mut order = Vec::new();
+        while let Some(pending) = dispatcher.next() {
+            order.push(pending.batch_id.clone());
+        }
+        // agent-b (2 items) must be fully drained within the first 4 turns,
+        // interleaved with agent-a, rather than only after all 5 of
+        // agent-a's items.
+        let b_positions: Vec<usize> = order.iter().enumerate().filter(|(_, s)| s.as_str() == "agent-b").map(|(i, _)| i).collect();
+        assert_eq!(b_positions, vec![1, 3], "round-robin must interleave, not drain agent-a first: {order:?}");
+        assert_eq!(order.len(), 7);
+    }
+
+    // ── PWQ-01/02: end-to-end async batch against a minimal fake Redis ─────────
+
+    /// A tiny in-process RESP2 server implementing just enough (PING/SET with
+    /// PX/GET/PTTL) to drive `RedisBackend::cache_get`/`cache_set` -- i.e.
+    /// `JobStore` -- for real, without a system Redis install. Returns a
+    /// `redis://` URL; the listener task runs for the rest of the test binary's
+    /// life (mirrors this file's other spawn-and-leak test-server helpers).
+    async fn fake_redis_server() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let store: Arc<AsyncMutex<HashMap<String, (String, Option<Instant>)>>> = Arc::new(AsyncMutex::new(HashMap::new()));
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else { break };
+                let store = store.clone();
+                tokio::spawn(async move {
+                    let mut socket = socket;
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let Some(parts) = read_resp_command(&mut socket, &mut buf, &mut chunk).await else { break };
+                        if parts.is_empty() {
+                            continue;
+                        }
+                        let reply = handle_fake_redis_command(&parts, &store).await;
+                        if socket.write_all(&reply).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        format!("redis://{addr}/0")
+    }
+
+    /// Read one RESP2 array-of-bulk-strings command from `socket`, buffering
+    /// any bytes read past the end of the current command in `buf` for the
+    /// next call. Returns `None` on EOF/parse failure (connection closed).
+    async fn read_resp_command(
+        socket: &mut tokio::net::TcpStream,
+        buf: &mut Vec<u8>,
+        chunk: &mut [u8],
+    ) -> Option<Vec<String>> {
+        use tokio::io::AsyncReadExt;
+
+        // Ensure at least one full line (the "*N\r\n" header) is buffered.
+        async fn fill_until(socket: &mut tokio::net::TcpStream, buf: &mut Vec<u8>, chunk: &mut [u8], min: usize) -> bool {
+            while buf.len() < min {
+                match socket.read(chunk).await {
+                    Ok(0) | Err(_) => return false,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            true
+        }
+        fn take_line(buf: &mut Vec<u8>) -> Option<String> {
+            let pos = buf.windows(2).position(|w| w == b"\r\n")?;
+            let line = String::from_utf8(buf[..pos].to_vec()).ok()?;
+            buf.drain(..pos + 2);
+            Some(line)
+        }
+
+        loop {
+            if let Some(line) = take_line(buf) {
+                if !line.starts_with('*') {
+                    return None;
+                }
+                let n: usize = line[1..].parse().ok()?;
+                let mut parts = Vec::with_capacity(n);
+                for _ in 0..n {
+                    loop {
+                        if let Some(hdr) = take_line(buf) {
+                            if !hdr.starts_with('$') {
+                                return None;
+                            }
+                            let len: usize = hdr[1..].parse().ok()?;
+                            if !fill_until(socket, buf, chunk, len + 2).await {
+                                return None;
+                            }
+                            let bytes = buf[..len].to_vec();
+                            buf.drain(..len + 2);
+                            parts.push(String::from_utf8(bytes).ok()?);
+                            break;
+                        }
+                        if !fill_until(socket, buf, chunk, buf.len() + 1).await {
+                            return None;
+                        }
+                    }
+                }
+                return Some(parts);
+            }
+            if !fill_until(socket, buf, chunk, buf.len() + 1).await {
+                return None;
+            }
+        }
+    }
+
+    async fn handle_fake_redis_command(
+        parts: &[String],
+        store: &Arc<AsyncMutex<HashMap<String, (String, Option<Instant>)>>>,
+    ) -> Vec<u8> {
+        let cmd = parts[0].to_uppercase();
+        match cmd.as_str() {
+            "PING" => b"+PONG\r\n".to_vec(),
+            "SET" if parts.len() >= 3 => {
+                let mut expiry = None;
+                let mut i = 3;
+                while i < parts.len() {
+                    if parts[i].eq_ignore_ascii_case("PX") && i + 1 < parts.len() {
+                        if let Ok(ms) = parts[i + 1].parse::<u64>() {
+                            expiry = Some(Instant::now() + Duration::from_millis(ms));
+                        }
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                store.lock().await.insert(parts[1].clone(), (parts[2].clone(), expiry));
+                b"+OK\r\n".to_vec()
+            }
+            "GET" if parts.len() >= 2 => {
+                let guard = store.lock().await;
+                match guard.get(&parts[1]) {
+                    Some((v, Some(exp))) if *exp < Instant::now() => b"$-1\r\n".to_vec(),
+                    Some((v, _)) => format!("${}\r\n{}\r\n", v.len(), v).into_bytes(),
+                    None => b"$-1\r\n".to_vec(),
+                }
+            }
+            "PTTL" if parts.len() >= 2 => {
+                let guard = store.lock().await;
+                match guard.get(&parts[1]) {
+                    Some((_, Some(exp))) => {
+                        let now = Instant::now();
+                        if *exp < now {
+                            b":-2\r\n".to_vec()
+                        } else {
+                            format!(":{}\r\n", (*exp - now).as_millis()).into_bytes()
+                        }
+                    }
+                    Some((_, None)) => b":-1\r\n".to_vec(),
+                    None => b":-2\r\n".to_vec(),
+                }
+            }
+            _ => b"+OK\r\n".to_vec(),
+        }
+    }
+
+    fn client_with_job_store(server: &MockServer, redis_url: &str) -> Arc<PlaneClient> {
+        let base = mock_client(server);
+        let redis = RedisBackend::test_pointed_at(redis_url);
+        Arc::new(PlaneClient { job_store: Arc::new(JobStore::from_env(Some(redis))), ..(*base).clone() })
+    }
+
+    #[tokio::test]
+    async fn test_async_batch_enqueue_returns_immediately_with_batch_id() {
+        let redis_url = fake_redis_server().await;
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        server.mock(|when, then| {
+            when.method(POST).path("/api/v1/workspaces/testws/projects/p1/issues/");
+            // Delay each create well past what a "fast" enqueue should take,
+            // so a test that finishes quickly proves the call did NOT wait
+            // for the drain.
+            then.status(201).delay(Duration::from_millis(300)).json_body(json!({
+                "id": "generated", "name": "generated", "project": "p1", "workspace": "testws", "sequence_id": 1
+            }));
+        });
+        let client = client_with_job_store(&server, &redis_url);
+        let tool = PlaneBatchCreateWorkItems { client };
+
+        let start = Instant::now();
+        let output = tool
+            .execute_structured(json!({
+                "project_id": "p1",
+                "items": [{"name": "A"}, {"name": "B"}, {"name": "C"}]
+            }))
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(elapsed < Duration::from_millis(250), "enqueue must return in O(ms), took {elapsed:?}");
+        let structured = output.structured.expect("structuredContent must be present");
+        assert_eq!(structured["accepted"], 3);
+        assert_eq!(structured["status"], "running");
+        assert_eq!(structured["poll_with"], "plane_batch_status");
+        let batch_id = structured["batch_id"].as_str().unwrap().to_string();
+        assert!(output.text.contains(&batch_id));
+    }
+
+    #[tokio::test]
+    async fn test_async_batch_drainer_records_per_item_results_and_survives_a_failure() {
+        let redis_url = fake_redis_server().await;
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        // Item "A" succeeds, "B" fails (500), "C" succeeds -- proves a failing
+        // item is recorded failed WITHOUT aborting the rest of the drain.
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/workspaces/testws/projects/p1/issues/")
+                .json_body_partial(r#"{"name": "A"}"#);
+            then.status(201).json_body(json!({"id": "id-a", "name": "A", "project": "p1", "workspace": "testws", "sequence_id": 1}));
+        });
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/workspaces/testws/projects/p1/issues/")
+                .json_body_partial(r#"{"name": "B"}"#);
+            // 422 (not 5xx/429) is a TERMINAL failure in `request_with_retry` --
+            // no retry/backoff -- so this test stays fast and deterministic
+            // while still proving a failing item doesn't abort the drain.
+            then.status(422).body("boom");
+        });
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/workspaces/testws/projects/p1/issues/")
+                .json_body_partial(r#"{"name": "C"}"#);
+            then.status(201).json_body(json!({"id": "id-c", "name": "C", "project": "p1", "workspace": "testws", "sequence_id": 3}));
+        });
+
+        let client = client_with_job_store(&server, &redis_url);
+        let job_store_for_poll = client.job_store.clone();
+        let tool = PlaneBatchCreateWorkItems { client };
+        let output = tool
+            .execute_structured(json!({"project_id": "p1", "items": [{"name": "A"}, {"name": "B"}, {"name": "C"}]}))
+            .await
+            .unwrap();
+        let structured = output.structured.unwrap();
+        let batch_id = structured["batch_id"].as_str().unwrap().to_string();
+
+        // Bounded poll for the drain to finish (the 500 still retries 3x with
+        // backoff internally via `request_with_retry`'s server-error path in
+        // production, but this test's rate limiter is zero-interval and the
+        // retry backoff floor is seconds -- give it a generous but bounded window).
+        let mut job = None;
+        for _ in 0..50 {
+            if let Some(j) = job_store_for_poll.load(&batch_id).await {
+                if j.status == BatchStatus::Done {
+                    job = Some(j);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let job = job.expect("batch must finish draining within the poll window");
+
+        assert_eq!(job.total, 3);
+        let a = job.items.iter().find(|i| i.index == 0).unwrap();
+        let b = job.items.iter().find(|i| i.index == 1).unwrap();
+        let c = job.items.iter().find(|i| i.index == 2).unwrap();
+        assert_eq!(a.status, BatchItemStatus::Created, "{a:?}");
+        assert_eq!(b.status, BatchItemStatus::Failed, "{b:?} -- a failing item must not abort the batch");
+        assert_eq!(c.status, BatchItemStatus::Created, "{c:?} -- items after a failure must still be attempted");
+    }
+
+    // PWQ-01/03 B1: two batches from DIFFERENT clients (distinct identity +
+    // scope) enqueued so the second starts while the first is still draining
+    // through the ONE shared dispatcher/worker. Each item must POST with ITS
+    // OWN batch's client — proven here by the auth token (X-API-Key). The
+    // distributed rate-key suffix is derived from that same per-item client, so
+    // token-correctness proves scope-key-correctness too (asserted independently
+    // by `test_rate_key_suffix_*`). Under the pre-fix bug, both batches drained
+    // through the first client, so batch B would POST with token-a.
+    #[tokio::test]
+    async fn test_async_batch_drains_each_item_through_its_own_client() {
+        let redis_url = fake_redis_server().await;
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        // A slow response keeps the worker busy on batch A's first item long
+        // enough for batch B to enqueue into the already-running worker.
+        let mock_a = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/workspaces/testws/projects/p1/issues/")
+                .header("X-API-Key", "token-a");
+            then.status(201)
+                .delay(Duration::from_millis(80))
+                .json_body(json!({"id": "id-a", "name": "A", "project": "p1", "workspace": "testws", "sequence_id": 1}));
+        });
+        let mock_b = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/workspaces/testws/projects/p1/issues/")
+                .header("X-API-Key", "token-b");
+            then.status(201)
+                .delay(Duration::from_millis(80))
+                .json_body(json!({"id": "id-b", "name": "B", "project": "p1", "workspace": "testws", "sequence_id": 2}));
+        });
+
+        // Two clients sharing ONE dispatcher + ONE job-store backend, distinct
+        // identity + token.
+        let redis = RedisBackend::test_pointed_at(&redis_url);
+        let job_store = Arc::new(JobStore::from_env(Some(redis)));
+        let dispatcher = BatchDispatcher::new();
+        let base = mock_client(&server);
+        let make = |token: &str, ident: &str| {
+            Arc::new(PlaneClient {
+                api_key: Some(token.to_string()),
+                identity_name: Some(ident.to_string()),
+                rate_limiter: Arc::new(RateLimiter::local(Duration::ZERO)),
+                job_store: job_store.clone(),
+                batch_dispatcher: dispatcher.clone(),
+                ..(*base).clone()
+            })
+        };
+        let client_a = make("token-a", "id-a");
+        let client_b = make("token-b", "id-b");
+
+        let tool_a = PlaneBatchCreateWorkItems { client: client_a };
+        let tool_b = PlaneBatchCreateWorkItems { client: client_b };
+
+        // Enqueue A (spawns the worker), then B immediately (shared worker still
+        // running → B drains through the SAME worker, the B1 bug window).
+        let out_a = tool_a
+            .execute_structured(json!({"project_id": "p1", "scope": "scope-a", "items": [{"name": "A1"}, {"name": "A2"}]}))
+            .await
+            .unwrap();
+        let out_b = tool_b
+            .execute_structured(json!({"project_id": "p1", "scope": "scope-b", "items": [{"name": "B1"}, {"name": "B2"}]}))
+            .await
+            .unwrap();
+        let id_a = out_a.structured.unwrap()["batch_id"].as_str().unwrap().to_string();
+        let id_b = out_b.structured.unwrap()["batch_id"].as_str().unwrap().to_string();
+
+        // Wait for both to finish draining.
+        for id in [&id_a, &id_b] {
+            let mut done = false;
+            for _ in 0..60 {
+                if let Some(j) = job_store.load(id).await {
+                    if j.status == BatchStatus::Done {
+                        done = true;
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(done, "batch {id} must finish draining");
+        }
+
+        // The decisive assertion: each batch's items hit ONLY its own token's
+        // mock. The pre-fix bug would route batch B through token-a → mock_b
+        // never hit, mock_a hit 4×.
+        assert_eq!(mock_a.hits(), 2, "batch A's two items must POST with token-a");
+        assert_eq!(mock_b.hits(), 2, "batch B's two items must POST with token-b (own client), not the first batch's");
+    }
+
+    #[tokio::test]
+    async fn test_plane_batch_status_unknown_batch_id() {
+        let redis_url = fake_redis_server().await;
+        let server = MockServer::start();
+        let client = client_with_job_store(&server, &redis_url);
+        let tool = PlaneBatchStatus { client };
+        let output = tool.execute_structured(json!({"batch_id": "does-not-exist"})).await.unwrap();
+        assert!(output.text.to_lowercase().contains("unknown or expired"), "{}", output.text);
+        assert_eq!(output.structured.unwrap()["found"], false);
+    }
+
+    #[tokio::test]
+    async fn test_plane_batch_status_not_configured_without_redis() {
+        // mock_client has JobStore::disabled() -- batches run synchronously,
+        // so polling is correctly rejected rather than silently claiming "unknown".
+        let server = MockServer::start();
+        let client = mock_client(&server);
+        let tool = PlaneBatchStatus { client };
+        let result = tool.execute(json!({"batch_id": "anything"})).await;
+        assert!(matches!(result.unwrap_err(), ToolError::NotConfigured(_)));
+    }
+
     // ── Rate limiting: proves actual pacing, not just that a sleep call exists ──
 
     #[tokio::test]
@@ -4325,7 +5577,7 @@ mod tests {
 
         let start = Instant::now();
         for _ in 0..4 {
-            limiter.acquire().await;
+            limiter.acquire(None).await;
         }
         let elapsed = start.elapsed();
 
@@ -4358,6 +5610,9 @@ mod tests {
             workspace: "testws".into(),
             rate_limiter: Arc::new(RateLimiter::local(Duration::from_millis(200))),
             cache: Arc::new(GetCache::new(Duration::from_millis(1))), // effectively disabled
+            scope: None,
+            job_store: Arc::new(JobStore::disabled()),
+            batch_dispatcher: BatchDispatcher::new(),
         };
 
         let start = Instant::now();
@@ -4390,6 +5645,9 @@ mod tests {
             workspace: "testws".into(),
             rate_limiter: Arc::new(RateLimiter::local(Duration::ZERO)),
             cache: Arc::new(GetCache::new(Duration::from_millis(300))),
+            scope: None,
+            job_store: Arc::new(JobStore::disabled()),
+            batch_dispatcher: BatchDispatcher::new(),
         };
         let url = format!("{}projects/", client.workspace_url());
 
@@ -4415,6 +5673,9 @@ mod tests {
             workspace: "testws".into(),
             rate_limiter: Arc::new(RateLimiter::local(Duration::ZERO)),
             cache: Arc::new(GetCache::new(Duration::from_millis(100))),
+            scope: None,
+            job_store: Arc::new(JobStore::disabled()),
+            batch_dispatcher: BatchDispatcher::new(),
         };
         let url = format!("{}projects/", client.workspace_url());
 
@@ -4474,6 +5735,9 @@ mod tests {
             workspace: "testws".into(),
             rate_limiter: Arc::new(RateLimiter::local(Duration::ZERO)),
             cache: Arc::new(GetCache::new(Duration::from_secs(5))),
+            scope: None,
+            job_store: Arc::new(JobStore::disabled()),
+            batch_dispatcher: BatchDispatcher::new(),
         };
         let tool = PlaneListProjects { client: Arc::new(client) };
         let result = tool.execute(json!({})).await;
@@ -4527,6 +5791,9 @@ mod tests {
             workspace: "testws".into(),
             rate_limiter: Arc::new(RateLimiter::local(Duration::ZERO)),
             cache: Arc::new(GetCache::new(Duration::from_secs(5))),
+            scope: None,
+            job_store: Arc::new(JobStore::disabled()),
+            batch_dispatcher: BatchDispatcher::new(),
         })
     }
 
@@ -4781,6 +6048,9 @@ mod tests {
             workspace: "testws".into(),
             rate_limiter: Arc::new(RateLimiter::local(Duration::ZERO)),
             cache: Arc::new(GetCache::new(Duration::from_secs(5))),
+            scope: None,
+            job_store: Arc::new(JobStore::disabled()),
+            batch_dispatcher: BatchDispatcher::new(),
         });
         let tool = PlaneListIdentities { client };
         let out = tool.execute(json!({})).await.unwrap();
@@ -5250,8 +6520,8 @@ mod tests {
         // op timeout then uses the local gate — total is bounded and the local
         // min_interval spacing is still enforced on the second call.
         let start = Instant::now();
-        limiter.acquire().await;
-        limiter.acquire().await;
+        limiter.acquire(None).await;
+        limiter.acquire(None).await;
         let elapsed = start.elapsed();
         assert!(elapsed >= interval, "local pacing must still apply on fallback, got {elapsed:?}");
         assert!(elapsed < Duration::from_secs(3), "fail-open must not hang on a dead Redis, got {elapsed:?}");
@@ -5279,6 +6549,9 @@ mod tests {
                 ttl: Duration::from_millis(300),
                 redis: Some(RedisBackend::test_unreachable()),
             }),
+            scope: None,
+            job_store: Arc::new(JobStore::disabled()),
+            batch_dispatcher: BatchDispatcher::new(),
         };
         let url = format!("{}projects/", client.workspace_url());
         let first = client.get_json_cached(&url).await.unwrap();
@@ -5311,10 +6584,10 @@ mod tests {
         let b = RateLimiter { last: AsyncMutex::new(None), min_interval: interval, redis: Some(backend.clone()) };
         // Prime the shared slot, then two more reservations across both
         // instances must be spaced by the shared interval, not run back-to-back.
-        a.acquire().await;
+        a.acquire(None).await;
         let start = Instant::now();
-        b.acquire().await;
-        a.acquire().await;
+        b.acquire(None).await;
+        a.acquire(None).await;
         assert!(start.elapsed() >= interval, "shared budget must pace across instances");
 
         // Shared cache round-trip.
