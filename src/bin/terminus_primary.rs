@@ -751,7 +751,12 @@ mod tests {
 
     fn allow_policy(identity: &str, actions: &[&str]) -> AllowlistPolicy {
         let mut map = HashMap::new();
-        map.insert(identity.to_string(), actions.iter().map(|s| s.to_string()).collect());
+        map.insert(
+            identity.to_string(),
+            terminus_rs::gateway_framework::Grant::List(
+                actions.iter().map(|s| s.to_string()).collect(),
+            ),
+        );
         AllowlistPolicy::new(map)
     }
 
