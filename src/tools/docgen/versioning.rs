@@ -481,7 +481,7 @@ mod tests {
         let store = VersionStore::new();
         store.store_version(key(), "v1", "c1", "t0"); // v1
         store.store_version(key(), "v2", "c2", "t1"); // v2
-        store.rollback(&key(), 1, "t2"); // v3 = rollback to v1
+        let _ = store.rollback(&key(), 1, "t2"); // v3 = rollback to v1
         store.store_version(key(), "v4 new work", "c3", "t3"); // v4
 
         let history = store.history(&key());
