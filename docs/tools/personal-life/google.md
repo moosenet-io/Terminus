@@ -17,7 +17,7 @@ compatible provider, not only Gmail.
 |---|---|---|
 | `GOOGLE_LUMINA_EMAIL` | yes | the account address — also the IMAP/SMTP/CalDAV username |
 | `GOOGLE_APP_PASSWORD` | yes | Gmail App Password |
-| `GOOGLE_PETER_EMAIL` | no | operator's personal calendar address; default `<email>` (placeholder) |
+| `GOOGLE_<NAME>_EMAIL` | no | a secondary personal calendar address to also read; default `<email>` (placeholder). The concrete env-var name is deployment-specific. |
 | `GOOGLE_LUMINA_CALENDAR_ID` | no | an extra group calendar id to include when reading |
 | `GOOGLE_EXTRA_CALENDARS` | no | comma-separated extra calendar ids |
 
@@ -27,7 +27,7 @@ instead of the real sub-module registrations — every stub returns the same `No
 error naming both required vars.
 
 `GoogleConfig::all_calendar_ids()` (`src/google/mod.rs:74-83`) returns every calendar id to
-query, in priority order, de-duplicated: the account's own email, `GOOGLE_PETER_EMAIL`, any
+query, in priority order, de-duplicated: the account's own email, the secondary `GOOGLE_<NAME>_EMAIL`, any
 `GOOGLE_EXTRA_CALENDARS`, then `GOOGLE_LUMINA_CALENDAR_ID` if set. All four calendar-read
 tools query this full list and merge results.
 

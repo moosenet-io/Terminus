@@ -48,7 +48,7 @@ delegation.
 
 ## Domains
 
-### Code & Git — 7 modules
+### Code & Git — 7 modules · [domain index](code-git/README.md)
 
 Source control, dev workspace access, agentic coding, code-graph analysis,
 and documentation generation.
