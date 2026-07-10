@@ -1399,6 +1399,22 @@ impl RustTool for PlaneCreateWorkItem {
         }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneCreateWorkItem {
+    /// EGJS-02: returns the created `Issue` as structured JSON alongside the
+    /// text summary, so an in-process caller (e.g. harmony's
+    /// `PlaneClient::create_issue`/`create_sub_issue`) can read the new
+    /// id/sequence structurally instead of parsing prose — see LHEG-06's
+    /// completion notes ("create-time id/sequence needed immediately, can't
+    /// be safely recovered from text").
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
         let project_id = client.resolve_project_id(project_id_arg).await?;
@@ -1453,9 +1469,12 @@ impl RustTool for PlaneCreateWorkItem {
         } else {
             String::new()
         };
-        Ok(format!("Created issue: {name}\nID: {id}\nSequence: #{seq}{module_note}",
+        let text = format!("Created issue: {name}\nID: {id}\nSequence: #{seq}{module_note}",
             name = i.name, id = i.id,
-            seq = i.sequence_id.unwrap_or(0)))
+            seq = i.sequence_id.unwrap_or(0));
+        let structured = serde_json::to_value(&i)
+            .map_err(|e| ToolError::Http(format!("Failed to serialize created issue: {e}")))?;
+        Ok((text, structured))
     }
 }
 
@@ -1488,6 +1507,22 @@ impl RustTool for PlaneUpdateWorkItem {
         }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneUpdateWorkItem {
+    /// EGJS-02: returns the post-update `Issue` as structured JSON. When the
+    /// PATCH itself carried fields the response body is already the updated
+    /// issue and is reused directly; a module-only update (no PATCH body) has
+    /// no such response, so the issue is re-fetched (read-back), matching the
+    /// write+read-back pattern harmony's egress client already uses for the
+    /// other `plane_update_work_item` callers per LHEG-06.
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
         let project_id = client.resolve_project_id(project_id_arg).await?;
@@ -1509,7 +1544,7 @@ impl RustTool for PlaneUpdateWorkItem {
         if !has_fields && module_id.is_none() {
             return Err(ToolError::InvalidArgument("No fields to update provided".into()));
         }
-        let mut updated_name = None;
+        let mut updated_issue: Option<Issue> = None;
         if has_fields {
             let url = format!(
                 "{}projects/{project_id}/issues/{issue_id}/",
@@ -1520,7 +1555,7 @@ impl RustTool for PlaneUpdateWorkItem {
             let resp = PlaneClient::check_status(resp).await?;
             let i: Issue = resp.json().await
                 .map_err(|e| ToolError::Http(format!("Failed to parse updated issue: {e}")))?;
-            updated_name = Some(i.name);
+            updated_issue = Some(i);
         }
         // Optional module link (module membership is a separate endpoint, not an
         // issue field), applied after any field PATCH.
@@ -1530,8 +1565,25 @@ impl RustTool for PlaneUpdateWorkItem {
         } else {
             String::new()
         };
-        let name = updated_name.as_deref().unwrap_or("(unchanged)");
-        Ok(format!("Updated issue: {name} (ID: {issue_id}){module_note}"))
+        // Read-back for the module-only path: no PATCH response to reuse, so
+        // fetch the current issue to give callers structured data either way.
+        let issue = match updated_issue {
+            Some(i) => i,
+            None => {
+                let url = format!(
+                    "{}projects/{project_id}/issues/{issue_id}/",
+                    client.workspace_url()
+                );
+                let body = client.get_json_cached(&url).await?;
+                serde_json::from_str(&body)
+                    .map_err(|e| ToolError::Http(format!("Failed to parse issue: {e}")))?
+            }
+        };
+        let name = issue.name.clone();
+        let text = format!("Updated issue: {name} (ID: {issue_id}){module_note}");
+        let structured = serde_json::to_value(&issue)
+            .map_err(|e| ToolError::Http(format!("Failed to serialize issue: {e}")))?;
+        Ok((text, structured))
     }
 }
 
@@ -2408,6 +2460,16 @@ impl RustTool for PlaneListIssuesByState {
         }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneListIssuesByState {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
         let project_id = client.resolve_project_id(project_id_arg).await?;
@@ -2434,14 +2496,15 @@ impl RustTool for PlaneListIssuesByState {
             .take(limit)
             .collect();
 
+        let structured = json!({ "items": filtered });
         if filtered.is_empty() {
-            return Ok(format!("No issues in state group '{state_group}'"));
+            return Ok((format!("No issues in state group '{state_group}'"), structured));
         }
         let mut out = format!("Issues in '{}' ({}):\n", state_group, filtered.len());
         for i in &filtered {
             out.push_str(&format!("  [{id}] {name}\n", id = i.id, name = i.name));
         }
-        Ok(out)
+        Ok((out, structured))
     }
 }
 
@@ -3784,6 +3847,13 @@ mod tests {
                 .json_body(json!({"issues": ["i1"]}));
             then.status(201).json_body(json!([]));
         });
+        // EGJS-02: a module-only update has no PATCH response to reuse for the
+        // structured payload, so it reads the issue back via GET.
+        let get_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/workspaces/testws/projects/p1/issues/i1/");
+            then.status(200).json_body(json!({"id": "i1", "name": "x", "project": "p1", "workspace": "testws"}));
+        });
         let client = mock_client(&server);
         let tool = PlaneUpdateWorkItem { client };
         let result = tool.execute(json!({
@@ -3792,6 +3862,7 @@ mod tests {
         assert!(result.contains("m1"), "{result}");
         assert_eq!(patch_mock.hits(), 0, "module-only update must not PATCH the issue");
         link_mock.assert();
+        get_mock.assert();
     }
 
     #[tokio::test]
@@ -5252,5 +5323,165 @@ mod tests {
         let got = backend.cache_get(&key).await;
         assert_eq!(got.as_ref().map(|(b, _)| b.as_str()), Some("shared-value"));
         assert!(got.map(|(_, ttl)| !ttl.is_zero()).unwrap_or(false), "remaining TTL must be positive");
+    }
+
+    // ── EGJS-02: Issue.parent + structured writes (harmony egress remainder) ──
+
+    #[tokio::test]
+    async fn test_get_work_item_structured_includes_parent() {
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/workspaces/testws/projects/p1/issues/i1/");
+            then.status(200).json_body(json!({
+                "id": "i1", "name": "Sub-task", "project": "p1", "workspace": "testws",
+                "parent": "epic-1"
+            }));
+        });
+        let client = mock_client(&server);
+        let tool = PlaneGetWorkItem { client };
+        let output = tool.execute_structured(json!({"project_id": "p1", "issue_id": "i1"})).await.unwrap();
+        let structured = output.structured.expect("structuredContent must be present");
+        assert_eq!(structured["parent"], "epic-1");
+    }
+
+    #[tokio::test]
+    async fn test_get_work_item_structured_parent_null_when_absent() {
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/workspaces/testws/projects/p1/issues/i1/");
+            then.status(200).json_body(json!({
+                "id": "i1", "name": "Top-level", "project": "p1", "workspace": "testws"
+            }));
+        });
+        let client = mock_client(&server);
+        let tool = PlaneGetWorkItem { client };
+        let output = tool.execute_structured(json!({"project_id": "p1", "issue_id": "i1"})).await.unwrap();
+        let structured = output.structured.expect("structuredContent must be present");
+        assert_eq!(structured["parent"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn test_list_work_items_structured_includes_parent() {
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/workspaces/testws/projects/p1/issues/");
+            then.status(200).json_body(json!([
+                {"id": "i1", "name": "Sub-task", "project": "p1", "workspace": "testws", "parent": "epic-1"}
+            ]));
+        });
+        let client = mock_client(&server);
+        let tool = PlaneListWorkItems { client };
+        let output = tool.execute_structured(json!({"project_id": "p1"})).await.unwrap();
+        let structured = output.structured.expect("structuredContent must be present");
+        assert_eq!(structured["items"][0]["parent"], "epic-1");
+    }
+
+    #[tokio::test]
+    async fn test_list_work_items_filtered_structured_includes_parent() {
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/workspaces/testws/projects/p1/issues/");
+            then.status(200).json_body(json!([
+                {"id": "i1", "name": "Sub-task", "project": "p1", "workspace": "testws", "parent": "epic-1"}
+            ]));
+        });
+        let client = mock_client(&server);
+        let tool = PlaneListWorkItemsFiltered { client };
+        let output = tool.execute_structured(json!({"project_id": "p1"})).await.unwrap();
+        let structured = output.structured.expect("structuredContent must be present");
+        assert_eq!(structured["items"][0]["parent"], "epic-1");
+    }
+
+    #[tokio::test]
+    async fn test_list_issues_by_state_structured_includes_parent() {
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/workspaces/testws/projects/p1/issues/");
+            then.status(200).json_body(json!([
+                {"id": "i1", "name": "Sub-task", "project": "p1", "workspace": "testws", "parent": "epic-1",
+                 "state_detail": {"id": "s1", "name": "Started", "color": "#000", "group": "started"}}
+            ]));
+        });
+        let client = mock_client(&server);
+        let tool = PlaneListIssuesByState { client };
+        let output = tool.execute_structured(json!({"project_id": "p1", "state_group": "started"})).await.unwrap();
+        let structured = output.structured.expect("structuredContent must be present");
+        assert_eq!(structured["items"][0]["parent"], "epic-1");
+        assert_eq!(structured["items"][0]["id"], "i1");
+    }
+
+    #[tokio::test]
+    async fn test_create_work_item_structured_content_has_id_and_sequence() {
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        server.mock(|when, then| {
+            when.method(POST).path("/api/v1/workspaces/testws/projects/p1/issues/");
+            then.status(201).json_body(json!({
+                "id": "issue-99", "name": "Fix login bug",
+                "project": "p1", "workspace": "testws", "sequence_id": 99, "parent": Value::Null
+            }));
+        });
+        let client = mock_client(&server);
+        let tool = PlaneCreateWorkItem { client };
+        let output = tool.execute_structured(json!({
+            "project_id": "p1",
+            "name": "Fix login bug"
+        })).await.unwrap();
+        let structured = output.structured.expect("structuredContent must be present");
+        assert_eq!(structured["id"], "issue-99");
+        assert_eq!(structured["sequence_id"], 99);
+    }
+
+    #[tokio::test]
+    async fn test_update_work_item_structured_content_has_updated_fields() {
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        server.mock(|when, then| {
+            when.method(httpmock::Method::PATCH).path("/api/v1/workspaces/testws/projects/p1/issues/i1/");
+            then.status(200).json_body(json!({
+                "id": "i1", "name": "Updated name",
+                "project": "p1", "workspace": "testws"
+            }));
+        });
+        let client = mock_client(&server);
+        let tool = PlaneUpdateWorkItem { client };
+        let output = tool.execute_structured(json!({
+            "project_id": "p1",
+            "issue_id": "i1",
+            "name": "Updated name"
+        })).await.unwrap();
+        let structured = output.structured.expect("structuredContent must be present");
+        assert_eq!(structured["id"], "i1");
+        assert_eq!(structured["name"], "Updated name");
+    }
+
+    #[tokio::test]
+    async fn test_update_work_item_module_only_structured_content_reads_back_issue() {
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/workspaces/testws/projects/p1/modules/m1/module-issues/");
+            then.status(201).json_body(json!([]));
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/workspaces/testws/projects/p1/issues/i1/");
+            then.status(200).json_body(json!({
+                "id": "i1", "name": "Existing", "project": "p1", "workspace": "testws"
+            }));
+        });
+        let client = mock_client(&server);
+        let tool = PlaneUpdateWorkItem { client };
+        let output = tool.execute_structured(json!({
+            "project_id": "p1", "issue_id": "i1", "module_id": "m1"
+        })).await.unwrap();
+        let structured = output.structured.expect("structuredContent must be present");
+        assert_eq!(structured["id"], "i1");
+        assert_eq!(structured["name"], "Existing");
     }
 }

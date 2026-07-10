@@ -59,7 +59,7 @@ and documentation generation.
 
 | Tool | Actions | What it does | Page |
 | --- | --- | --- | --- |
-| `gitea` | ~16 | Gitea source-control API — repos, files, PRs, merges, Cargo-registry publish/yank; every write runs the PII gate first. | [`code-git/gitea.md`](code-git/gitea.md) |
+| `gitea` | ~20 | Gitea source-control API — repos, files, branches, PRs (create/merge/close/diff), Cargo-registry publish/yank; every write runs the PII gate first. | [`code-git/gitea.md`](code-git/gitea.md) |
 | `github` | ~9 | GitHub tool + the git-public mirror engine subtools (`git_public_mirror_status/_prepare/_approve/_push`) that drive the PII-swept public-mirror pipeline. | [`code-git/github.md`](code-git/github.md) |
 | `forge` | ~4 | The provider-agnostic `git_private`/`git_public` dispatch tools (plus their `*_capabilities` introspection companions) — one endpoint vocabulary across 11 self-hosted/hosted forge providers, split by governance posture. | [`code-git/forge.md`](code-git/forge.md) |
 | `dev` | ~6 | Path-jailed read/write/run access to a dev workstation over SSH — the workspace tools an agentic coding session uses. | [`code-git/dev.md`](code-git/dev.md) |

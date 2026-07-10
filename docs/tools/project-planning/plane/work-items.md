@@ -11,6 +11,19 @@ Every tool here shares the machinery documented on the [overview page](README.md
 either a UUID or a human identifier (see [the UUID gotcha](README.md#the-project-id-uuid-gotcha)),
 rate-limited/cached GETs, and uniform HTTP-status-to-`ToolError` mapping.
 
+**EGJS-02:** the `Issue` type now carries a `parent` field (`Option<String>`, the parent
+issue's UUID, `null` for a top-level issue) — this closes a gap harmony's egress client
+hit: `parent` is load-bearing for its EPIC dependency graph
+(`task_queue::queue`/`conductor::orchestrator::subtask_dependencies_satisfied`) and
+previously wasn't present anywhere in the structured `Issue` output. It surfaces in the
+`structuredContent` of every tool below that returns an `Issue` or a list of them:
+`plane_get_work_item`, `plane_list_work_items`, `plane_list_work_items_filtered`,
+`plane_list_issues_by_state` (which also gained `structuredContent` for the first time in
+this item — previously text-only), `plane_create_work_item`, and `plane_update_work_item`
+(the latter two also gained `structuredContent` in this item, so a caller can read the
+created/updated issue's id/sequence/fields structurally instead of parsing the text
+summary).
+
 <img src="../../../../assets/plane-work-item-lifecycle.svg" alt="Plane work-item state groups and close/list-by-state flow" width="100%">
 
 ## Table of contents
@@ -179,6 +192,12 @@ Updated issue: <name|(unchanged)> (ID: <issue_id>) — added to module <module_i
 is present; otherwise the shared HTTP-status error table. Unlike `plane_create_work_item`, a
 module-link failure here propagates as a plain `Http` error (no partial-success id-preservation
 wording) — the field PATCH, if any, has already succeeded and is not rolled back.
+
+**EGJS-02 structured output**: `structuredContent` is the post-update `Issue`. When a scalar
+field was PATCHed, the PATCH response body is reused directly. For a **module-only** update
+(no PATCH sent), there is no PATCH response to reuse, so the tool does one extra `GET` to
+read the issue back — the same write-then-read-back pattern harmony's egress client already
+uses elsewhere per LHEG-06.
 
 ## plane_delete_work_item
 
