@@ -5,7 +5,7 @@
 # Terminus
 
 **The Rust MCP tool hub and federated gateway for the Lumina constellation — one
-authenticated front door for agent tool egress, with ~51 tools, one per
+authenticated front door for agent tool egress, with ~52 tools, one per
 integrated service.**
 
 ## What Terminus is
@@ -56,7 +56,7 @@ Chord-integration deep-dives.
 
 | | |
 | --- | --- |
-| **Tools** | ~51, one per integrated service (GitHub, Plane, Prometheus, …). Each tool exposes a set of **actions** that vary with the backing service and change over time — ~300 individual MCP callables in total across all tools. |
+| **Tools** | ~52, one per integrated service (GitHub, Plane, Prometheus, …). Each tool exposes a set of **actions** that vary with the backing service and change over time — ~300 individual MCP callables in total across all tools. |
 | **Transport** | stdio (local/SSH) and HTTP, with an mTLS listener for federated/remote clients |
 | **Auth** | per-identity mTLS client certificates (`crate::pki`); named-identity tokens (`GITEA_PAT_<NAME>`, `PLANE_PAT_<NAME>`) for outbound git-forge/tracker calls |
 | **Governance** | path-jailed filesystem access, vault-only secrets (never a raw `env::var` for a credential), a mandatory Rust PII gate on every public-forge write, sanitized audit logging |
@@ -106,7 +106,7 @@ This README is the front door; everything past "at a glance" lives in
 | [`docs/architecture/`](docs/architecture/) | Federation (how `terminus-primary` aggregates core + personal tools), auth (mTLS identity model), and the Chord-integration boundary/wire contract. |
 | [`docs/networking/`](docs/networking/) | WireGuard and Tailscale transport options for reaching a Terminus deployment off-LAN. |
 | [`docs/deploy/`](docs/deploy/) | Client enrollment/deploy guide and the personal-services (`terminus_personal`/`terminus_primary`) deployment guide. |
-| [`docs/tools/`](docs/tools/README.md) | The full tool index — all 51 modules grouped by domain, plus the **MINT** flagship harness. |
+| [`docs/tools/`](docs/tools/README.md) | The full tool index — all 52 modules grouped by domain, plus the **MINT** flagship harness. |
 
 ## License
 

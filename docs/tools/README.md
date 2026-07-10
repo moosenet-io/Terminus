@@ -2,7 +2,7 @@
 
 [← docs index](../README.md)
 
-Terminus provides ~51 **tools**, one per integrated service (`src/registry.rs`'s
+Terminus provides ~52 **tools**, one per integrated service (`src/registry.rs`'s
 `register_all` / `register_personal` — see
 [`architecture/federation.md`](../architecture/federation.md) for which
 registry serves which tool). Each tool exposes a set of **actions** — the
@@ -52,7 +52,7 @@ delegation.
 
 ## Domains
 
-### Code & Git — 7 tools · [domain index](code-git/README.md)
+### Code & Git — 8 tools · [domain index](code-git/README.md)
 
 Source control, dev workspace access, agentic coding, code-graph analysis,
 and documentation generation.
@@ -66,6 +66,7 @@ and documentation generation.
 | `openhands` | ~3 | Drives the OpenHands agentic-coding runtime over its HTTP API (run task, list conversations, get status). | [`code-git/openhands.md`](code-git/openhands.md) |
 | `cortex` | ~10 | Code-graph / blast-radius / risk-scoring system — architecture, dependency, and review-flow analysis over a repo. | [`code-git/cortex.md`](code-git/cortex.md) |
 | `scribe` | ~5 | Standing documentation agent — generates READMEs, wikis, and other knowledge-infrastructure artifacts from a repo. | [`code-git/scribe.md`](code-git/scribe.md) |
+| `docgen` | 1 | **Scaffold (DOCGEN-01, S95).** The sovereign, in-house documentation engine (replacing Mintlify): a per-project doc-target config schema (readme/wiki/pdf/notion/obsidian/blog) plus `docgen_status`, a read-only config-inspection tool. No generation/render/versioning yet — those land in later DOCGEN items. | [`code-git/docgen.md`](code-git/docgen.md) |
 
 ### Project & Planning — 7 tools
 
