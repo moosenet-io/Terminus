@@ -29,7 +29,13 @@
 //!                             unset, those two degrade similarly
 
 mod aggregate;
-mod dispatch;
+// `pub(crate)` (was module-private): DOCGEN-10's mismatch detector
+// (`crate::tools::docgen::mismatch`) reuses `is_daemon_provider` /
+// `openrouter_model_for` / the model-tag constants directly rather than
+// re-declaring the opus/codex/agy-vs-nemotron/qwen_coder provider-routing
+// table a second time -- one source of truth for "which providers go
+// through the daemon vs. OpenRouter", not two.
+pub(crate) mod dispatch;
 mod prompt;
 
 use async_trait::async_trait;

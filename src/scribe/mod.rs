@@ -526,7 +526,7 @@ SCRIBE_ALLOW_SUBPROCESS_VAULT_WRITE=true to enable it explicitly"
 /// a later run can detect "we already reported this" by scanning existing
 /// issue titles -- no dependency on Plane label UUID resolution, which would
 /// otherwise be a second point of failure before dedup could even run.
-fn discrepancy_signature(module_path: &str, doc_claim: &str) -> String {
+pub(crate) fn discrepancy_signature(module_path: &str, doc_claim: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
@@ -535,7 +535,7 @@ fn discrepancy_signature(module_path: &str, doc_claim: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-fn build_discrepancy_title(module_path: &str, signature: &str) -> String {
+pub(crate) fn build_discrepancy_title(module_path: &str, signature: &str) -> String {
     format!("Scribe discrepancy: {module_path} -- doc vs. code mismatch [scribe-disc:{signature}]")
 }
 
@@ -546,7 +546,7 @@ fn build_discrepancy_title(module_path: &str, signature: &str) -> String {
 /// Option<T>` or containing `</p>`), and `description_html` is rendered as
 /// raw HTML by Plane, so unescaped interpolation is a real HTML-injection
 /// risk into that view, not merely cosmetic (cycle 1 review finding).
-fn html_escape(s: &str) -> String {
+pub(crate) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -554,7 +554,7 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-fn build_discrepancy_description(module_path: &str, doc_claim: &str, code_behavior: &str) -> String {
+pub(crate) fn build_discrepancy_description(module_path: &str, doc_claim: &str, code_behavior: &str) -> String {
     format!(
         "<p><strong>Module:</strong> {module}</p>\
 <p><strong>Documentation claims:</strong> {claim}</p>\
@@ -572,7 +572,7 @@ severity and decides the fix.</em></p>",
 /// per line, per that tool's own output format) for a line already
 /// containing this discrepancy's signature tag. Returns that line verbatim
 /// if found, so the caller can surface which existing issue matched.
-fn find_duplicate_by_signature<'a>(listing_text: &'a str, signature: &str) -> Option<&'a str> {
+pub(crate) fn find_duplicate_by_signature<'a>(listing_text: &'a str, signature: &str) -> Option<&'a str> {
     let tag = format!("[scribe-disc:{signature}]");
     listing_text.lines().find(|line| line.contains(&tag))
 }
@@ -581,7 +581,7 @@ fn find_duplicate_by_signature<'a>(listing_text: &'a str, signature: &str) -> Op
 /// object per line) instead of losing it, when Plane is unreachable. Pure
 /// local file I/O -- no subprocess, no network, always available regardless
 /// of Plane's status.
-fn queue_discrepancy_locally(
+pub(crate) fn queue_discrepancy_locally(
     queue_path: &str,
     project_id: &str,
     module_path: &str,
