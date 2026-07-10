@@ -349,7 +349,7 @@ mod tests {
     fn sample_credential(identity: &str, expires_in_secs: i64) -> EnrolledCredential {
         EnrolledCredential {
             cert_pem: format!("-----BEGIN CERTIFICATE-----\n{identity}\n-----END CERTIFICATE-----\n"),
-            key_pem: "<REDACTED-SECRET>\nkey\n-----END PRIVATE KEY-----\n".to_string(),
+            key_pem: "<REDACTED-SECRET>\nkey\n-----END PRIVATE KEY-----\n".to_string(), // pii-test-fixture
             ca_cert_pem: "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----\n".to_string(),
             jwt: "test.jwt.token".to_string(),
             expires_at: now_unix() + expires_in_secs,

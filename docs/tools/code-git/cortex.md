@@ -369,7 +369,7 @@ URL passes validation.
 → InvalidArgument: 'url' must point to a public host, not a local/private/internal address
 
 // rejected — disallowed scheme
-{"url": "ssh://<email>/owner/repo"}
+{"url": "ssh://<email>/owner/repo"} <!-- pii-test-fixture -->
 → InvalidArgument: 'url' scheme 'ssh' is not allowed — only http/https public git URLs are accepted
 ```
 

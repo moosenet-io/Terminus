@@ -36,11 +36,11 @@ package wxgo
 import "testing"
 
 func TestMintChange(t *testing.T) {
-	got, err := ValidateEmail("<email>")
-	if err != nil || got != "<email>" {
+	got, err := ValidateEmail("<email>") // pii-test-fixture
+	if err != nil || got != "<email>" { // pii-test-fixture
 		t.Fatalf("normalize: got %q err %v", got, err)
 	}
-	for _, bad := range []string{"noatsign", "a@@b.com", "@example.com", "user@examplecom", "a <email>"} {
+	for _, bad := range []string{"noatsign", "a@@b.com", "@example.com", "user@examplecom", "a <email>"} { // pii-test-fixture
 		if _, err := ValidateEmail(bad); err == nil {
 			t.Fatalf("want error for %q", bad)
 		}

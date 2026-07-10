@@ -43,12 +43,12 @@ public class MintCheck {
     static void check(boolean c, String m){ if(!c) throw new AssertionError(m); }
     static boolean throwsOn(String s){ try { Validate.validateEmail(s); return false; } catch (RuntimeException e){ return true; } }
     public static void main(String[] a){
-        check(Validate.validateEmail("<email>").equals("<email>"), "normalized");
+        check(Validate.validateEmail("<email>").equals("<email>"), "normalized"); // pii-test-fixture
         check(throwsOn("noatsign"), "missing @");
         check(throwsOn("a@@b.com"), "two @");
         check(throwsOn("@example.com"), "empty local");
         check(throwsOn("user@examplecom"), "domain needs a dot");
-        check(throwsOn("a <email>"), "no whitespace allowed");
+        check(throwsOn("a <email>"), "no whitespace allowed"); // pii-test-fixture
         System.out.println("CHANGE-OK");
     }
 }

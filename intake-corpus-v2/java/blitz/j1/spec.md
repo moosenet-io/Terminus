@@ -23,7 +23,7 @@ throwing `IllegalArgumentException` with a clear message on any failure. Return
 the trimmed + lowercased address on success.
 
 ## TEST PLAN
-- `"<email>"` → `"<email>"` (normalized).
+- `"<email>"` → `"<email>"` (normalized). <!-- pii-test-fixture -->
 - No `@`, two `@`, empty local part, and a domain with no dot → each throws.
 - A string containing an internal space → throws.
 - The existing `sanitize` / `parsePositiveInt` methods still work.

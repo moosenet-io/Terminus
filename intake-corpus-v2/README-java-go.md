@@ -8,7 +8,7 @@ the new content is reviewable in git.
 
 ## Why this lives in the repo (and where the live corpus lives)
 
-The operational corpus lives ONLY as deployed data on <host> at
+The operational corpus lives ONLY as deployed data on the benchmark host at
 `<path>/intake-corpus-v2/` — it is **not** git-tracked in this repo, and the
 live `manifest.json` there is the single source of truth for a running sweep.
 This task authors content for review/merge, not deployment, so:
@@ -36,7 +36,7 @@ $CORPUS/prewarm.sh   # smoke-build the new workspaces (needs javac + go on PATH)
 ```
 
 Requires `javac`/`java` and `go` on PATH on the benchmark host — NOT currently
-installed on <host> (apt is broken there; toolchain install is out of scope for
+installed there (apt is broken there; toolchain install is out of scope for
 this task).
 
 ## Cases (10: 5 Java, 5 Go — mixed blitz/standard)
@@ -67,7 +67,7 @@ workspace behavior (Java: a `MintBase.java` smoke; Go: the workspace's
 ## Verification status
 
 **Authored by inspection only — NOT executed.** No `javac`/`java`/`go`
-toolchain was available on the dev box or <host> when these were written, so the
+toolchain was available on the dev box or the benchmark host when these were written, so the
 Java/Go sources embedded in the validators and the case specs were verified by
 careful reading, NOT by compiling or running them. Treat every case as
 UNTESTED-BY-EXECUTION until a toolchain is installed and `prewarm.sh` +

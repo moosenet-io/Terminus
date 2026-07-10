@@ -23,7 +23,7 @@ readme = "README.md"
 name = "terminus_rs"
 path = "src/lib.rs"
 
-# TGW-01: `terminus-primary`, the <host> aggregated-core-registry gateway
+# TGW-01: `terminus-primary`, the aggregated-core-registry gateway
 # binary, joins `terminus_personal` (already auto-discovered via
 # `src/bin/*.rs`) as an explicit `[[bin]]` entry for clarity. Cargo's
 # `src/bin/` autodiscovery already covers this path implicitly; this entry

@@ -86,7 +86,7 @@ fn shipped_corpora_parse_and_pass_pii_gate() {
 fn pii_gate_blocks_infra_names_and_secrets() {
     assert!(scan_pii("the node at <internal-ip> hosts it").is_some());
     assert!(scan_pii("see <host> for the orchestrator").is_some());
-    assert!(scan_pii("email <email>").is_some());
+    assert!(scan_pii("email <email>").is_some()); // pii-test-fixture
     assert!(scan_pii("Authorization: Bearer abc123").is_some());
     assert!(scan_pii("the operator <operator> prefers direct feedback").is_some());
     // abstracted prose passes

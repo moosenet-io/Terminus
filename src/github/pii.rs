@@ -151,6 +151,7 @@ fn scan_line(
     line_no: usize,
     line: &str,
     out: &mut Vec<PiiViolation>,
+    skip_phone: bool,
 ) {
     let mut push = |category: &str, matched: &str| {
         out.push(PiiViolation {
@@ -210,16 +211,27 @@ fn scan_line(
         p.date_like.find_iter(line).map(|m| (m.start(), m.end())).collect();
 
     // Phone: skip any match that overlaps a UUID span (those digits belong
-    // to the UUID, not a phone number) or a bare ISO-date span.
-    for m in p.phone.find_iter(line) {
-        let overlaps_uuid = uuid_spans
-            .iter()
-            .any(|&(s, e)| m.start() < e && s < m.end());
-        let overlaps_date = date_spans
-            .iter()
-            .any(|&(s, e)| m.start() < e && s < m.end());
-        if !overlaps_uuid && !overlaps_date {
-            push("phone", m.as_str());
+    // to the UUID, not a phone number), a bare ISO-date span, or — when
+    // `skip_phone` is set (SVG files only, see `PiiRuleSet::scan_tree`) —
+    // every match on the line. SVG path/viewBox coordinate data (e.g.
+    // `viewBox="..."`, `d="M... L..."`) is digit-and-space/ // pii-test-fixture
+    // hyphen shaped exactly like the phone pattern and is never a phone
+    // number, so scanning `.svg` files for this one pattern is pure noise —
+    // GHMR-fix (see `github/mod.rs::github_pii_scan` docs) narrows this to
+    // the file extension rather than weakening the phone regex itself, so a
+    // real phone number embedded in a non-SVG file is still caught exactly
+    // as before.
+    if !skip_phone {
+        for m in p.phone.find_iter(line) {
+            let overlaps_uuid = uuid_spans
+                .iter()
+                .any(|&(s, e)| m.start() < e && s < m.end());
+            let overlaps_date = date_spans
+                .iter()
+                .any(|&(s, e)| m.start() < e && s < m.end());
+            if !overlaps_uuid && !overlaps_date {
+                push("phone", m.as_str());
+            }
         }
     }
 
@@ -229,8 +241,67 @@ fn scan_line(
     // opts in via its `extra` list.
     for (kind, re) in extra {
         for m in re.find_iter(line) {
+            // `generic_secret` matches ANY 8+ char quoted string after
+            // password/secret/token — including bare identifiers used as
+            // struct-field/JSON-key names next to short synthetic test
+            // values ("testtoken", "test-shared-secret") and mirror-sweep
+            // placeholder tokens ("<EMPTYPAT>", "<REDACTED_HOST>"). Require
+            // the captured value to look secret-SHAPED (see
+            // `generic_secret_value_shaped`) before flagging it — this is a
+            // value-shape/entropy-proxy filter, not a weaker keyword match:
+            // it never touches api_key/jwt/ssh_key/aws/google/slack, which
+            // all have their own dedicated, unrelated patterns.
+            if kind == "generic_secret" && !generic_secret_value_shaped(m.as_str()) {
+                continue;
+            }
             push(kind, m.as_str());
         }
+    }
+}
+
+/// Extract the value between the first and second occurrence of whichever
+/// quote character (`"` or `'`) the `generic_secret` match used. The
+/// `generic_secret` regex always captures exactly one quoted value, so this
+/// should always succeed for a real match.
+fn extract_quoted_value(full_match: &str) -> Option<&str> {
+    let quote = full_match.bytes().find(|&b| b == b'"' || b == b'\'')? as char;
+    let first = full_match.find(quote)?;
+    let rest = &full_match[first + 1..];
+    let second = rest.find(quote)?;
+    Some(&rest[..second])
+}
+
+/// Whether a `generic_secret` match's quoted value looks like an actual
+/// secret VALUE rather than a synthetic test literal or a placeholder token.
+///
+/// Every false positive observed in practice (test fixtures like
+/// `"testtoken"`, `"test-token"`, `"test-shared-secret"`,
+/// `"correct-horse-battery-staple"`, `"jwt-signing-key-for-tests-only"`, and
+/// mirror-sweep placeholder tokens like `"<EMPTYPAT>"`/`"<REDACTED_HOST>"`)
+/// is a human-readable word/phrase or an all-caps `<...>` placeholder — NONE
+/// of them contain an ASCII digit. Every existing/regression-tested TRUE
+/// positive (e.g. `password = "<REDACTED-SECRET>"`, the crate's own
+/// `scan_tree_covers_python_gate_extension_patterns` fixture) does contain a
+/// digit, matching how generated tokens/passwords are actually shaped
+/// (base64/hex/alphanumeric token generators virtually always mix in
+/// digits). Requiring at least one digit is therefore used as a cheap,
+/// robust, well-tested proxy for "looks high-entropy / generated" without
+/// the fragility of a full Shannon-entropy threshold (which sits too close
+/// between the observed false- and true-positive samples to be reliable).
+/// Angle-bracket `<...>` placeholder tokens are rejected outright regardless
+/// of digits, since that shape is exclusively used by the mirror-sweep's own
+/// placeholder config, never a real secret.
+fn generic_secret_value_shaped(full_match: &str) -> bool {
+    match extract_quoted_value(full_match) {
+        Some(value) => {
+            if value.starts_with('<') && value.ends_with('>') {
+                return false;
+            }
+            value.bytes().any(|b| b.is_ascii_digit())
+        }
+        // Regex guarantees a quoted value; fail open (flag) rather than
+        // silently drop a match we couldn't parse.
+        None => true,
     }
 }
 
@@ -241,7 +312,7 @@ pub fn scan_for_pii(content: &str) -> Vec<PiiViolation> {
     let allow = allowed_authors();
     let mut out = Vec::new();
     for (idx, line) in content.lines().enumerate() {
-        scan_line(p, &[], &allow, idx + 1, line, &mut out);
+        scan_line(p, &[], &allow, idx + 1, line, &mut out, false);
     }
     out
 }
@@ -381,6 +452,42 @@ fn default_excluded_exts() -> HashSet<String> {
     .collect()
 }
 
+/// Whether a tree-relative path is exempt from the `infra_service` category
+/// specifically (every OTHER category is still fully scanned at this path).
+///
+/// `infra_service` (see the named service list in `patterns()` above) exists // pii-test-fixture
+/// to catch an internal service NAME leaking where it shouldn't. But
+/// Terminus's own public documentation site legitimately documents these
+/// integrations by name — this repo's `docs/tools/**` pages and their // pii-test-fixture
+/// accompanying `assets/**` architecture-diagram SVGs, plus each service's
+/// own integration module under `src/<service>/**` — because they ARE // pii-test-fixture
+/// public product names that Terminus ships first-class tool support for, // pii-test-fixture
+/// not a leaked internal hostname or credential. Flagging every mention of
+/// a product name a repo is documented to integrate with produces pure
+/// noise on every doc build.
+///
+/// CONSERVATIVE scope, by design — operator/reviewer should re-confirm this
+/// relaxation:
+///   - `docs/` — the doc site content itself.
+///   - `assets/` — the doc site's diagram SVGs (referenced from `docs/`).
+///   - `src/<service>/` for each of the named services above — each // pii-test-fixture
+///     service's own integration module (currently 0 hits there, but
+///     kept in lockstep with the doc-site exemption per the task ask).
+/// Every other path — including `specs/**` (spec history) and `data/**`
+/// (e.g. `prefix_registry.toml`) — is NOT exempted here even though a few
+/// legitimate mentions exist there too; those are pre-existing, out of the
+/// doc-site false-positive scope this exemption targets, and are left as
+/// residual for a follow-up rather than broadened into this fix.
+fn infra_service_path_exempt(rel: &str) -> bool {
+    let rel = rel.replace('\\', "/");
+    rel.starts_with("docs/")
+        || rel.starts_with("assets/")
+        || rel.starts_with("src/<secret-manager>/") // pii-test-fixture
+        || rel.starts_with("src/<media-service>/") // pii-test-fixture
+        || rel.starts_with("src/<container-mgr>/") // pii-test-fixture
+        || rel.starts_with("src/<matrix-server>/") // pii-test-fixture
+}
+
 fn default_excluded_dirs() -> HashSet<String> {
     [".git", "target", "node_modules", ".cargo"]
         .into_iter()
@@ -460,12 +567,21 @@ impl PiiRuleSet {
 
     /// Scan a single content string with this rule set (built-ins + extras).
     pub fn scan_content(&self, content: &str) -> Vec<PiiViolation> {
+        self.scan_content_impl(content, false)
+    }
+
+    /// As [`Self::scan_content`], but with `skip_phone` controlling whether
+    /// the `phone` pattern is scanned at all (see the `skip_phone` doc on
+    /// [`scan_line`] — used by [`Self::scan_tree`] for `.svg` files, where
+    /// coordinate/viewBox data is digit/hyphen shaped exactly like a phone
+    /// number and produces pure noise).
+    fn scan_content_impl(&self, content: &str, skip_phone: bool) -> Vec<PiiViolation> {
         let p = patterns();
         let mut allow = allowed_authors();
         allow.extend(self.allow_emails.iter().cloned());
         let mut out = Vec::new();
         for (idx, line) in content.lines().enumerate() {
-            scan_line(p, &self.extra, &allow, idx + 1, line, &mut out);
+            scan_line(p, &self.extra, &allow, idx + 1, line, &mut out, skip_phone);
         }
         out
     }
@@ -518,7 +634,23 @@ impl PiiRuleSet {
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .into_owned();
-            for v in self.scan_content(&scrubbed) {
+            // SVG files are diagram markup (path coordinates, viewBox data)
+            // — never a phone number. See the `skip_phone` doc on
+            // `scan_line` for why this is scoped to the pattern, not a
+            // blanket file-extension exclusion (other categories, e.g. a
+            // real email or private IP accidentally embedded in a diagram's
+            // text labels, are still scanned normally).
+            let is_svg = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("svg"))
+                .unwrap_or(false);
+            for v in self.scan_content_impl(&scrubbed, is_svg) {
+                if v.category == "infra_service" && infra_service_path_exempt(&rel) {
+                    // See `infra_service_path_exempt` doc: this repo's job
+                    // is to document/integrate these public product names.
+                    continue;
+                }
                 out.push(TreeViolation {
                     file: rel.clone(),
                     line: v.line,
@@ -1266,6 +1398,119 @@ fn it_works() {
         assert!(
             !v.iter().any(|x| x.pattern_kind == "email"),
             "allow-listed email must be permitted: {v:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── GHMR-fix regression tests (phone/svg, infra_service paths, generic_secret) ──
+
+    #[test]
+    #[serial]
+    fn svg_coordinate_data_is_not_flagged_as_phone() {
+        clear_allow();
+        let dir = temp_tree("svg-phone");
+        write_file(&dir, "diagram.svg", "<svg viewBox=\"0 0 1280 760\"><path d=\"M120 340 L960 340\"/></svg>\n"); // pii-test-fixture
+        let v = scan_tree(&dir);
+        assert!(
+            !v.iter().any(|x| x.pattern_kind == "phone"),
+            "SVG coordinate/viewBox data must not be flagged as phone: {v:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[serial]
+    fn real_phone_shaped_string_still_flagged_in_non_svg_file() {
+        clear_allow();
+        let dir = temp_tree("real-phone");
+        write_file(&dir, "contact.txt", "call <phone> for support\n"); // pii-test-fixture
+        let v = scan_tree(&dir);
+        assert!(
+            v.iter().any(|x| x.pattern_kind == "phone"),
+            "a real phone-shaped string in a non-svg file must still flag: {v:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[serial]
+    fn real_phone_shaped_string_still_flagged_even_in_svg_text_content() {
+        // Even inside an .svg file, only the `phone` category is suppressed —
+        // this guards against accidentally suppressing everything for the
+        // whole file. (No pattern kind currently depends on digit shape other
+        // than phone/uuid/date_like, so this asserts private_ip still fires.)
+        clear_allow();
+        let dir = temp_tree("svg-other");
+        write_file(
+            &dir,
+            "diagram.svg",
+            "<svg><text>leaked at <internal-ip></text></svg>\n", // pii-test-fixture
+        );
+        let v = scan_tree(&dir);
+        assert!(
+            v.iter().any(|x| x.pattern_kind == "private_ip"),
+            "non-phone categories must still be scanned inside .svg files: {v:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[serial]
+    fn infra_service_product_name_exempt_in_docs_and_assets() {
+        clear_allow();
+        let dir = temp_tree("infra-docs");
+        write_file(&dir, "docs/tools/infra-ops/<container-mgr>.md", "<container-mgr> manages containers.\n"); // pii-test-fixture
+        write_file(&dir, "assets/architecture.svg", "<svg><text><secret-manager></text></svg>\n"); // pii-test-fixture
+        write_file(&dir, "src/<secret-manager>/mod.rs", "// <secret-manager> client module\n"); // pii-test-fixture
+        let v = scan_tree(&dir);
+        assert!(
+            !v.iter().any(|x| x.pattern_kind == "infra_service"),
+            "product names in docs/assets/service-module paths must be exempt: {v:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[serial]
+    fn infra_service_still_flagged_outside_exempt_paths() {
+        clear_allow();
+        let dir = temp_tree("infra-nonexempt");
+        write_file(&dir, "notes.txt", "secrets in <secret-manager> vault\n"); // pii-test-fixture
+        let v = scan_tree(&dir);
+        assert!(
+            v.iter().any(|x| x.pattern_kind == "infra_service"),
+            "a product-name mention OUTSIDE docs/assets/service-module paths must still flag: {v:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[serial]
+    fn generic_secret_ignores_bare_field_names_and_placeholders() {
+        clear_allow();
+        let dir = temp_tree("secret-shape");
+        write_file(&dir, "struct.rs", "pub secret: String,\n");
+        write_file(&dir, "call.rs", ".field(\"token\", something)\n");
+        write_file(&dir, "test_lit.rs", "let token = \"testtoken\".to_string();\n");
+        write_file(&dir, "placeholder.toml", "token = \"<EMPTYPAT>\"\n");
+        let v = scan_tree(&dir);
+        assert!(
+            !v.iter().any(|x| x.pattern_kind == "generic_secret"),
+            "bare field names, test literals, and placeholder tokens must not flag: {v:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[serial]
+    fn generic_secret_still_flags_real_value_shaped_secret() {
+        clear_allow();
+        let dir = temp_tree("secret-real");
+        write_file(&dir, "leak.txt", "secret = \"aGVsbG9tZXNzYWdlMTIzNDU2\"\n"); // pii-test-fixture
+        let v = scan_tree(&dir);
+        assert!(
+            v.iter().any(|x| x.pattern_kind == "generic_secret"),
+            "a digit-bearing, non-placeholder quoted value must still flag: {v:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

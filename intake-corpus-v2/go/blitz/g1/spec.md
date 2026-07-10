@@ -24,7 +24,7 @@ containing `.`. Use `strings` / `fmt` (already imported). Return
 `strings.ToLower` of the trimmed address on success.
 
 ## TEST PLAN
-- `"<email>"` → `"<email>"`, nil error.
+- `"<email>"` → `"<email>"`, nil error. <!-- pii-test-fixture -->
 - No `@`, two `@`, empty local part, domain with no dot, internal space → each
   returns a non-nil error.
 - Existing `Sanitize` / `ParsePositiveInt` tests still pass.
