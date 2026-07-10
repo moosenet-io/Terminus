@@ -366,6 +366,133 @@ pub fn scan_for_pii(content: &str) -> Vec<PiiViolation> {
     out
 }
 
+/// Redaction-capable sibling of [`scan_for_pii`], used by the docgen
+/// pre-inference input gate (DOCGEN-02, `crate::tools::docgen::pii_gate`).
+///
+/// Detection is IDENTICAL to [`scan_for_pii`] -- same [`patterns`], same
+/// [`extension_rules`], same [`allowed_authors`] / [`email_is_allowed`] /
+/// [`uuid_is_sensitive`] / [`phone_match_is_phone_shaped`] /
+/// [`generic_secret_value_shaped`] helpers. This is NOT a second scanner;
+/// it is the same rule set with match *spans* retained (rather than
+/// discarded after producing a redacted context snippet) so each match can
+/// be replaced in place with a `[REDACTED:{category}]` placeholder.
+///
+/// A `// pii-test-fixture`-tagged line is skipped entirely (left
+/// unredacted, no violations recorded for it), matching the exemption
+/// convention used by [`PiiRuleSet::scan_tree`] / [`strip_fixture_lines`].
+///
+/// Returns the redacted content plus every [`PiiViolation`] found (line +
+/// category + a short redacted context snippet -- never the raw matched
+/// value, same discipline as [`scan_for_pii`]).
+pub fn scan_and_redact(content: &str) -> (String, Vec<PiiViolation>) {
+    let p = patterns();
+    let allow = allowed_authors();
+    let extra = extension_rules();
+    let mut violations = Vec::new();
+    let mut out_lines: Vec<String> = Vec::with_capacity(content.lines().count());
+
+    for (idx, line) in content.lines().enumerate() {
+        let line_no = idx + 1;
+
+        if line.contains("pii-test-fixture") {
+            out_lines.push(line.to_string());
+            continue;
+        }
+
+        let mut spans: Vec<(usize, usize, String)> = Vec::new();
+
+        macro_rules! collect {
+            ($re:expr, $cat:expr) => {
+                for m in $re.find_iter(line) {
+                    spans.push((m.start(), m.end(), $cat.to_string()));
+                }
+            };
+        }
+
+        collect!(p.private_ip, "private_ip");
+        collect!(p.container_id, "container_id");
+        collect!(p.internal_host, "internal_hostname");
+        collect!(p.internal_domain, "internal_domain");
+        collect!(p.api_key, "api_key");
+        collect!(p.internal_path, "internal_path");
+        collect!(p.infra_service, "infra_service");
+        collect!(p.operator_name, "operator_name");
+
+        for m in p.email.find_iter(line) {
+            if !email_is_allowed(m.as_str(), &allow) {
+                spans.push((m.start(), m.end(), "email".to_string()));
+            }
+        }
+
+        let uuid_spans: Vec<(usize, usize)> =
+            p.uuid.find_iter(line).map(|m| (m.start(), m.end())).collect();
+        for &(s, e) in &uuid_spans {
+            if uuid_is_sensitive(line, s, e) {
+                spans.push((s, e, "uuid_secret".to_string()));
+            }
+        }
+
+        let date_spans: Vec<(usize, usize)> =
+            p.date_like.find_iter(line).map(|m| (m.start(), m.end())).collect();
+
+        for m in p.phone.find_iter(line) {
+            let overlaps_uuid = uuid_spans.iter().any(|&(s, e)| m.start() < e && s < m.end());
+            let overlaps_date = date_spans.iter().any(|&(s, e)| m.start() < e && s < m.end());
+            if !overlaps_uuid && !overlaps_date && phone_match_is_phone_shaped(m.as_str()) {
+                spans.push((m.start(), m.end(), "phone".to_string()));
+            }
+        }
+
+        for (kind, re) in &extra {
+            for m in re.find_iter(line) {
+                if kind == "generic_secret" && !generic_secret_value_shaped(m.as_str()) {
+                    continue;
+                }
+                spans.push((m.start(), m.end(), kind.clone()));
+            }
+        }
+
+        if spans.is_empty() {
+            out_lines.push(line.to_string());
+            continue;
+        }
+
+        // Merge overlapping/adjacent spans so a byte range is never
+        // redacted twice (e.g. an `internal_path` span nested inside a
+        // wider `generic_secret` span).
+        spans.sort_by_key(|&(s, _, _)| s);
+        let mut merged: Vec<(usize, usize, String)> = Vec::new();
+        for (s, e, cat) in spans {
+            if let Some(last) = merged.last_mut() {
+                if s <= last.1 {
+                    if e > last.1 {
+                        last.1 = e;
+                    }
+                    continue;
+                }
+            }
+            merged.push((s, e, cat));
+        }
+
+        let mut redacted_line = String::with_capacity(line.len());
+        let mut cursor = 0usize;
+        for (s, e, cat) in &merged {
+            redacted_line.push_str(&line[cursor..*s]);
+            redacted_line.push_str(&format!("[REDACTED:{cat}]"));
+            violations.push(PiiViolation {
+                line: line_no,
+                category: cat.clone(),
+                context: redact(&line[*s..*e]),
+            });
+            cursor = *e;
+        }
+        redacted_line.push_str(&line[cursor..]);
+        out_lines.push(redacted_line);
+    }
+
+    (out_lines.join("\n"), violations)
+}
+
 /// Mandatory gate. Returns `Ok(())` when clean, otherwise an
 /// [`ToolError::InvalidArgument`] whose message lists every violation by
 /// line/category. Logs a one-line audit record (pass/fail + count) without
