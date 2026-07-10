@@ -1248,9 +1248,24 @@ by whichever binary wants it (see `src/bin/terminus_personal.rs`'s `main()`).
   alphanumerics + hyphens, 2-63 chars, no leading/trailing hyphen) — this
   keeps the identity namespace bounded and safe to embed directly in the
   cert's CN/SAN, per the TCLI-02 edge cases.
-- `shared_secret` is compared against `TERMINUS_ENROLLMENT_SHARED_SECRET`
-  (env-materialized runtime secret store, per-identity rotatable) in constant
-  time — never a plain `==` on secret bytes.
+- `shared_secret` is compared, in constant time (never a plain `==` on secret
+  bytes), against a **per-identity** secret keyed by the *requested*
+  identity — `TERMINUS_ENROLLMENT_SHARED_SECRET_<IDENTITY_UPPERCASE>` (e.g.
+  `TERMINUS_ENROLLMENT_SHARED_SECRET_LUMINA`,
+  `TERMINUS_ENROLLMENT_SHARED_SECRET_HARMONY`,
+  `TERMINUS_ENROLLMENT_SHARED_SECRET_CLAUDE`,
+  `TERMINUS_ENROLLMENT_SHARED_SECRET_MOOSE`; hyphens in the identity map to
+  underscores). This is the structural mechanism (LHEG-01, S109) that makes
+  it impossible for a caller holding only e.g. the `_LUMINA` secret to
+  enroll as `moose` or any other identity — the value it's compared against
+  is always derived from the identity it's requesting, not something the
+  caller can choose.
+  **Non-breaking fallback:** if no per-identity secret is configured for the
+  requested identity, enrollment falls back to the legacy unsuffixed
+  `TERMINUS_ENROLLMENT_SHARED_SECRET` (logging a deprecation warning each
+  time). The unsuffixed secret is not removed by this item — provision
+  per-identity secrets going forward and treat the fallback as transitional.
+  Both are read via the env-materialized runtime secret store.
 - On success: a fresh keypair is generated, signed into a leaf cert by the
   TCLI-01 CA (`ca.issuer()`), with `identity` embedded as CN + DNS SAN. TTL
   is short — `config::enrollment_cert_ttl_hours()` (default 24h), nowhere
@@ -1264,8 +1279,9 @@ by whichever binary wants it (see `src/bin/terminus_personal.rs`'s `main()`).
   issues a fresh cert/JWT pair, since short-lived certs are expected to be
   refreshed periodically.
 - Rejections: `401` (wrong/missing shared secret), `400` (identity name
-  fails the naming pattern), `503` (enrollment not configured — the shared
-  secret itself is unset on this instance).
+  fails the naming pattern), `503` (enrollment not configured — neither the
+  requested identity's per-identity secret nor the legacy unsuffixed
+  fallback is set on this instance).
 
 **Bootstrap chicken-and-egg:** at enrollment time the caller has no client
 cert yet — that's the point of this endpoint — so its own transport is plain
