@@ -456,3 +456,12 @@ spec_id = ""
 status = "active"
 description = "Chord coding-proxy model-selection endpoint wiring (project inferred)."
 created = ""
+
+[[prefix]]
+prefix = "DOCGEN"
+name = "Documentation Engine — Sovereign Post-Feat Doc Generation"
+project = "TERM"
+spec_id = "S95-documentation-engine"
+status = "active"
+description = "Sovereign in-house doc engine replacing Mintlify: PII-swept post-feat doc generation via Chord's SLM router, multi-format render (README/wiki/PDF/Notion/Obsidian/blog), and versioning."
+created = "2026-07-09"

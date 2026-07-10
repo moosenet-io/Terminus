@@ -5,9 +5,9 @@
 The **Code &amp; Git** domain is Terminus's software-engineering surface: the tools an
 agentic coding session uses to read and mutate source, publish to public mirrors, run
 commands on a workstation, delegate autonomous coding tasks, analyze a repository's
-structure and risk, and generate documentation. Seven tools, ~48 actions, split across
+structure and risk, and generate documentation. Eight tools, ~49 actions, split across
 three concerns — **source control** (`gitea`, `github`, `forge`), **dev execution**
-(`dev`, `openhands`), and **code intelligence &amp; docs** (`cortex`, `scribe`).
+(`dev`, `openhands`), and **code intelligence &amp; docs** (`cortex`, `scribe`, `docgen`).
 
 <img src="../../../assets/code-git-domain.svg" alt="Code & Git domain map — seven modules grouped into source control, dev execution, and code intelligence & docs" width="100%">
 
@@ -30,6 +30,7 @@ examples.
 | [`openhands.md`](openhands.md) | 3 | Drives an external OpenHands agentic-coding runtime over its HTTP API — submit a task, poll its status, list conversations. All three tools are approval-gated (`approval::gate()`), distinct from and stricter than `dev`'s ungated `dev_trigger_openhands`. |
 | [`cortex.md`](cortex.md) | 10 | Code-graph / blast-radius / risk-scoring intelligence over a repo — scope, review, audit, stats, build/index, architecture, deps, recent, community, flows. An SSH-relay module with no local graph engine; `cortex_audit` carries an SSRF-hardened URL validator for external-repo auditing. |
 | [`scribe.md`](scribe.md) | 5 | Terminus's in-repo, LLM-backed documentation agent — inspects real source via read-only git worktrees, generates READMEs / wiki pages / build-diary entries through the review daemon, writes them to a git-backed Obsidian vault, and files doc/code discrepancies as deduplicated Plane issues. |
+| [`docgen.md`](docgen.md) | 1 | **Scaffold (DOCGEN-01, S95).** The sovereign, config-driven documentation engine that replaces Mintlify — currently just the per-project doc-target config schema (readme/wiki/pdf/notion/obsidian/blog) plus `docgen_status`, a read-only inspection tool. PII-swept generation via Chord's SLM router, multi-format rendering, and versioning are later items. |
 
 ## How the pieces relate
 

@@ -40,13 +40,13 @@ deployment itself.
 
 ## Tool reference
 
-The full catalog of Terminus's ~51 tools (one per integrated service), organized
+The full catalog of Terminus's ~52 tools (one per integrated service), organized
 by domain. Each tool exposes a set of actions — ~300 individual MCP callables in
 total — that vary with the backing service.
 
 | Page | Description |
 | --- | --- |
-| [`tools/README.md`](tools/README.md) | The tool index — all 51 modules grouped into five domains (Code & Git, Project & Planning, Infra & Ops, Models & Review, Personal & Life), each linking out to its per-tool pages. |
+| [`tools/README.md`](tools/README.md) | The tool index — all 52 modules grouped into five domains (Code & Git, Project & Planning, Infra & Ops, Models & Review, Personal & Life), each linking out to its per-tool pages. |
 | [`tools/mint/`](tools/mint/) | **MINT** — the model-intake / serving-profile flagship harness (the `mint` CLI and its `intake`-module tools). Treated as its own small manual; see [`tools/README.md#mint-flagship`](tools/README.md#mint-flagship) for the overview and links into the full command/tool reference. |
 
 ## Conventions used across these docs
