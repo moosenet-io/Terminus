@@ -5,7 +5,7 @@ prefix: GHMR
 spec_id: S104-github-mirror-engine
 
 ## Metadata
-- **Author:** <operator> (Moose) + Claude
+- **Author:** the operator (Moose) + Claude
 - **Session:** S104
 - **Date:** 2026-07-08
 - **Module version:** Terminus (terminus-rs) v1.2.0+
@@ -297,7 +297,7 @@ spec_id: S104-github-mirror-engine
 ### GHMR-07: One-time bootstrap + re-baseline per mirror_ready repo
 - **Priority:** High
 - **Labels:** terminus, github, mirror, ops
-- **Agent:** <operator>
+- **Agent:** moose
 - **Estimate:** 1h + agent-assisted
 - **Type:** human-action
 - **Description:** For each `mirror_ready` repo (Terminus, Chord, lumina-constellation; + Harmony
@@ -320,7 +320,7 @@ spec_id: S104-github-mirror-engine
 ### GHMR-08: Operator decisions bundle
 - **Priority:** High
 - **Labels:** ops
-- **Agent:** <operator>
+- **Agent:** moose
 - **Estimate:** 20m
 - **Type:** human-action
 - **Description:** Resolve the Open Decisions so execution can proceed: (1) provide `GITHUB_TOKEN`

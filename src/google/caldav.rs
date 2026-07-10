@@ -690,7 +690,7 @@ mod tests {
         GoogleConfig {
             email: "<email>".into(), // pii-test-fixture
             app_password: "secret".into(),
-            peter_email: "<email>".into(), // pii-test-fixture
+            secondary_email: "<email>".into(), // pii-test-fixture
             lumina_calendar_id: Some("<email>".into()), // pii-test-fixture
             extra_calendars: vec![],
         }

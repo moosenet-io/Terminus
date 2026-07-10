@@ -2,7 +2,7 @@
 
 - **Spec:** S84-assistant-intake-profiling
 - **Item:** ASMT-08 (discovery / documentation)
-- **Audience:** <operator> (operator) and the ASMT-09 acquisition agent
+- **Audience:** the operator (Moose) and the ASMT-09 acquisition agent
 - **Refreshed:** 2026-06-24 (the seed list was researched earlier in S84; this run revalidated it against
   current Ollama/HF catalogs and preference leaderboards — the landscape moves monthly)
 - **Output:** `../nominations.json` (one record per model, S83-consistent IDs)

@@ -40,6 +40,7 @@ struct Patterns {
     infra_service: Regex,
     uuid: Regex,
     date_like: Regex,
+    operator_name: Regex,
 }
 
 fn patterns() -> &'static Patterns {
@@ -78,6 +79,17 @@ fn patterns() -> &'static Patterns {
         // letting ISO datetimes fall through to the `phone` matcher.
         date_like: Regex::new(r"\b\d{4}-\d{2}-\d{2}T|\b\d{4}-\d{2}-\d{2}\b")
             .expect("date_like regex"),
+        // Whole-word, case-insensitive match on the operator's real first
+        // name. `\b...\b` anchors on both sides so this never fires on a
+        // substring occurrence (e.g. a surname or an unrelated word
+        // containing the same letters) — only the standalone name/token.
+        // Found by an independent PII sweep leaking into shipped tool
+        // description strings, docs, and env var names (GHMRFIX-3); this
+        // closes that gap the same way `internal_host`/`infra_service`
+        // close theirs, as an unconditional built-in pattern (not an
+        // opt-in config term) so it's caught everywhere `scan_for_pii`
+        // runs, including this crate's own self-check.
+        operator_name: Regex::new(r"(?i)\bpeter\b").expect("operator_name regex"),
     })
 }
 
@@ -218,6 +230,9 @@ fn scan_line(
     }
     for m in p.infra_service.find_iter(line) {
         push("infra_service", m.as_str());
+    }
+    for m in p.operator_name.find_iter(line) {
+        push("operator_name", m.as_str());
     }
 
     // Emails: allow-list exception for author attribution.
@@ -944,6 +959,41 @@ mod tests {
         let v = scan_for_pii("visit git.example.com for repos"); // pii-test-fixture
         assert!(v.iter().any(|x| x.category == "internal_domain"));
         assert!(pii_gate("example.com").is_err()); // pii-test-fixture
+    }
+
+    #[test]
+    #[serial]
+    fn operator_name_is_blocked() {
+        clear_allow();
+        let v = scan_for_pii("please ask <operator> about it"); // pii-test-fixture
+        assert!(v.iter().any(|x| x.category == "operator_name"));
+        assert!(pii_gate("<operator> must approve this").is_err()); // pii-test-fixture
+        // case-insensitive
+        assert!(!scan_for_pii("<operator> wants this").is_empty()); // pii-test-fixture
+        // whole-word only: a surname/longer word containing the same
+        // letters must NOT trigger a false positive.
+        assert!(scan_for_pii("the peters family moved in").is_empty()); // pii-test-fixture
+    }
+
+    #[test]
+    #[serial]
+    fn operator_name_fixture_tag_is_exempt_from_tree_sweep() {
+        let dir = temp_tree("operator-name-fixture");
+        let untagged_line = "an untagged mention: <operator> approved this"; // pii-test-fixture
+        let tagged_line = "a tagged mention: <operator> approved this // pii-test-fixture"; // pii-test-fixture
+        let contents = format!("{untagged_line}\n{tagged_line}\n");
+        write_file(&dir, "note.txt", &contents);
+        let rs = PiiRuleSet::new();
+        let violations = rs.scan_tree(&dir);
+        let operator_hits: Vec<_> = violations
+            .iter()
+            .filter(|v| v.pattern_kind == "operator_name")
+            .collect();
+        // Only the untagged line (line 1) should be flagged; the
+        // `// pii-test-fixture`-tagged line (line 2) is stripped before
+        // scanning and must never appear.
+        assert_eq!(operator_hits.len(), 1, "{operator_hits:?}");
+        assert_eq!(operator_hits[0].line, 1);
     }
 
     #[test]
