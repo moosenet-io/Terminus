@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::error::ToolError;
-use crate::tool::RustTool;
+use crate::tool::{RustTool, ToolOutput};
 
 /// Registry of all compiled-in Rust tool implementations.
 ///
@@ -67,6 +67,16 @@ impl ToolRegistry {
     pub async fn call(&self, name: &str, args: Value) -> Option<Result<String, ToolError>> {
         let tool = self.tools.get(name)?;
         Some(tool.execute(args).await)
+    }
+
+    /// Execute a named tool, returning its text summary AND (for tools that
+    /// override `RustTool::execute_structured`, EGJS-01) a structured JSON
+    /// payload alongside it. Additive counterpart to `call` -- tools that
+    /// don't override `execute_structured` behave identically to `call`
+    /// wrapped in a `ToolOutput` with `structured: None`.
+    pub async fn call_structured(&self, name: &str, args: Value) -> Option<Result<ToolOutput, ToolError>> {
+        let tool = self.tools.get(name)?;
+        Some(tool.execute_structured(args).await)
     }
 
     pub fn len(&self) -> usize {
@@ -331,6 +341,26 @@ mod tests {
     async fn test_call_not_found_returns_none() {
         let reg = ToolRegistry::new();
         let result = reg.call("missing", serde_json::json!({})).await;
+        assert!(result.is_none());
+    }
+
+    // ── EGJS-01: call_structured ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_call_structured_found_tool_default_has_no_structured_payload() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(TestTool { name: "echo", desc: "echo" })).unwrap();
+        let result = reg.call_structured("echo", serde_json::json!({"msg": "hi"})).await;
+        assert!(result.is_some());
+        let output = result.unwrap().unwrap();
+        assert!(output.text.contains("echo"));
+        assert_eq!(output.structured, None);
+    }
+
+    #[tokio::test]
+    async fn test_call_structured_not_found_returns_none() {
+        let reg = ToolRegistry::new();
+        let result = reg.call_structured("missing", serde_json::json!({})).await;
         assert!(result.is_none());
     }
 

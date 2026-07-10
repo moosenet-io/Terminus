@@ -31,7 +31,7 @@ use tracing::{debug, warn};
 
 use crate::error::ToolError;
 use crate::registry::ToolRegistry;
-use crate::tool::RustTool;
+use crate::tool::{RustTool, ToolOutput};
 
 use types::{
     GiteaBranchInfo, GiteaCreatePrRequest, GiteaDeleteFileRequest, GiteaFileContent,
@@ -806,6 +806,16 @@ impl RustTool for GetRepo {
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl GetRepo {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let repo = args["repo"]
             .as_str()
@@ -818,18 +828,21 @@ impl RustTool for GetRepo {
             other => other,
         })?;
 
-        Ok(format!(
+        let text = format!(
             "Repository: {}\nDescription: {}\nURL: {}\nDefault branch: {}\nPrivate: {}\nStars: {} | Forks: {} | Open issues: {}\nUpdated: {}",
             r.full_name,
-            if r.description.is_empty() { "(none)".to_string() } else { r.description },
+            if r.description.is_empty() { "(none)".to_string() } else { r.description.clone() },
             r.html_url,
             r.default_branch,
             r.private,
             r.stars_count,
             r.forks_count,
             r.open_issues_count,
-            r.updated.unwrap_or_default(),
-        ))
+            r.updated.clone().unwrap_or_default(),
+        );
+        let structured = serde_json::to_value(&r)
+            .map_err(|e| ToolError::Http(format!("Failed to serialize repo: {e}")))?;
+        Ok((text, structured))
     }
 }
 
@@ -1030,6 +1043,16 @@ impl RustTool for ReadFile {
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl ReadFile {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let repo = args["repo"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
@@ -1048,7 +1071,7 @@ impl RustTool for ReadFile {
         })?;
 
         // Decode base64 content
-        let raw_content = fc.content.unwrap_or_default();
+        let raw_content = fc.content.clone().unwrap_or_default();
         // Gitea wraps lines with newlines in the base64 — strip them
         let clean = raw_content.replace('\n', "").replace('\r', "");
         let decoded = B64
@@ -1056,10 +1079,19 @@ impl RustTool for ReadFile {
             .map_err(|e| ToolError::Http(format!("Failed to decode file content: {e}")))?;
         let text = String::from_utf8_lossy(&decoded).to_string();
 
-        Ok(format!(
+        let out = format!(
             "File: {owner}/{repo}/{path}\nSHA: {}\nSize: {} bytes\n\n---\n{text}",
             fc.sha, fc.size
-        ))
+        );
+        let structured = json!({
+            "owner": owner,
+            "repo": repo,
+            "path": path,
+            "sha": fc.sha,
+            "size": fc.size,
+            "content": text,
+        });
+        Ok((out, structured))
     }
 }
 
@@ -1222,6 +1254,16 @@ impl RustTool for ListPrs {
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl ListPrs {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let repo = args["repo"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
@@ -1236,8 +1278,9 @@ impl RustTool for ListPrs {
         );
         let prs: Vec<GiteaPullRequest> = client.get(&endpoint).await?;
 
+        let structured = json!({ "items": prs });
         if prs.is_empty() {
-            return Ok(format!("No {} pull requests in {owner}/{repo}.", state));
+            return Ok((format!("No {} pull requests in {owner}/{repo}.", state), structured));
         }
 
         let mut out = format!(
@@ -1255,7 +1298,7 @@ impl RustTool for ListPrs {
                 pr.base.ref_name,
             ));
         }
-        Ok(out)
+        Ok((out, structured))
     }
 }
 
@@ -1288,6 +1331,16 @@ impl RustTool for CreatePr {
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl CreatePr {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let repo = args["repo"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
@@ -1319,10 +1372,13 @@ impl RustTool for CreatePr {
         let endpoint = format!("/repos/{}/{}/pulls", owner, repo);
         let pr: GiteaPullRequest = client.post(&endpoint, &body).await?;
 
-        Ok(format!(
+        let text = format!(
             "Pull request created: #{} — {}\nURL: {}\n{} → {}",
             pr.number, pr.title, pr.html_url, pr.head.ref_name, pr.base.ref_name,
-        ))
+        );
+        let structured = serde_json::to_value(&pr)
+            .map_err(|e| ToolError::Http(format!("Failed to serialize pull request: {e}")))?;
+        Ok((text, structured))
     }
 }
 
@@ -1425,6 +1481,16 @@ Returns entries with name, type (file/dir), path, and SHA."
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl ListDirectory {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let repo  = args["repo"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
@@ -1455,6 +1521,7 @@ Returns entries with name, type (file/dir), path, and SHA."
                 other => other,
             })?;
 
+        let structured = json!({ "entries": entries });
         let mut out = format!("Directory: {owner}/{repo}/{}\n{} entries:\n",
             if path.is_empty() { "/" } else { path }, entries.len());
         for e in &entries {
@@ -1463,7 +1530,7 @@ Returns entries with name, type (file/dir), path, and SHA."
             let indicator = if kind == "dir" { "📁" } else { "📄" };
             out.push_str(&format!("  {indicator} {name}\n"));
         }
-        Ok(out)
+        Ok((out, structured))
     }
 }
 
@@ -1493,6 +1560,16 @@ impl RustTool for ListBranches {
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl ListBranches {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let repo = args["repo"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
@@ -1506,8 +1583,9 @@ impl RustTool for ListBranches {
         );
         let branches: Vec<GiteaBranchInfo> = client.get(&endpoint).await?;
 
+        let structured = json!({ "items": branches });
         if branches.is_empty() {
-            return Ok(format!("No branches found in {owner}/{repo}."));
+            return Ok((format!("No branches found in {owner}/{repo}."), structured));
         }
 
         let mut out = format!(
@@ -1522,7 +1600,7 @@ impl RustTool for ListBranches {
                 if b.protected { ", protected" } else { "" },
             ));
         }
-        Ok(out)
+        Ok((out, structured))
     }
 }
 
@@ -2544,6 +2622,41 @@ mod tests {
         assert!(result.contains("main"));
     }
 
+    // ── EGJS-01: structuredContent ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_repo_execute_structured_carries_typed_repo() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/lumina");
+            then.status(200).json_body(serde_json::json!({
+                "id": 1,
+                "name": "lumina",
+                "full_name": "testorg/lumina",
+                "description": "Main docs",
+                "private": false,
+                "html_url": "http://example.com/testorg/lumina",
+                "clone_url": "http://example.com/testorg/lumina.git",
+                "default_branch": "main",
+                "stars_count": 3,
+                "forks_count": 1,
+                "open_issues_count": 2,
+                "updated": "2026-06-07T00:00:00Z"  // pii-test-fixture
+            }));
+        });
+
+        let tool = GetRepo { client: mock_client(&server) };
+        let output = tool
+            .execute_structured(serde_json::json!({"repo": "lumina"}))
+            .await
+            .unwrap();
+        assert!(output.text.contains("testorg/lumina"));
+        let structured = output.structured.expect("expected structuredContent");
+        assert_eq!(structured["full_name"], "testorg/lumina");
+        assert_eq!(structured["default_branch"], "main");
+        assert_eq!(structured["stars_count"], 3);
+    }
+
     #[tokio::test]
     async fn test_get_repo_404_returns_not_found() {
         let server = MockServer::start();
@@ -2818,6 +2931,43 @@ mod tests {
         mock.assert();
         assert!(result.contains("#42"));
         assert!(result.contains("Add Gitea tools"));
+    }
+
+    #[tokio::test]
+    async fn test_list_prs_execute_structured_carries_typed_items() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/repos/testorg/myrepo/pulls")
+                .query_param("state", "open");
+            then.status(200).json_body(serde_json::json!([
+                {
+                    "id": 1,
+                    "number": 42,
+                    "state": "open",
+                    "title": "Add Gitea tools",
+                    "body": null,
+                    "html_url": "http://example.com/pr/42",
+                    "user": { "login": "moose", "full_name": "Moose" },
+                    "head": { "label": "feature", "ref": "CHORD-07-gitea-tools", "sha": "abc", "repo": null },
+                    "base": { "label": "main", "ref": "main", "sha": "def", "repo": null },
+                    "mergeable": true,
+                    "merged": false,
+                    "created_at": "2026-06-07T00:00:00Z",  // pii-test-fixture
+                    "updated_at": "2026-06-07T00:00:00Z"  // pii-test-fixture
+                }
+            ]));
+        });
+
+        let tool = ListPrs { client: mock_client(&server) };
+        let output = tool
+            .execute_structured(serde_json::json!({"repo": "myrepo"}))
+            .await
+            .unwrap();
+        assert!(output.text.contains("#42"));
+        let structured = output.structured.expect("expected structuredContent");
+        assert_eq!(structured["items"][0]["number"], 42);
+        assert_eq!(structured["items"][0]["head"]["ref"], "CHORD-07-gitea-tools");
     }
 
     // ── create_pr ─────────────────────────────────────────────────────────
