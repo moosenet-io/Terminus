@@ -5,8 +5,8 @@
 # Terminus
 
 **The Rust MCP tool hub and federated gateway for the Lumina constellation — one
-authenticated front door for agent tool egress, ~300 tools across 51 domain
-modules.**
+authenticated front door for agent tool egress, with ~51 tools, one per
+integrated service.**
 
 ## What Terminus is
 
@@ -56,7 +56,7 @@ Chord-integration deep-dives.
 
 | | |
 | --- | --- |
-| **Tools** | ~300, across 51 domain modules |
+| **Tools** | ~51, one per integrated service (GitHub, Plane, Prometheus, …). Each tool exposes a set of **actions** that vary with the backing service and change over time — ~300 individual MCP callables in total across all tools. |
 | **Transport** | stdio (local/SSH) and HTTP, with an mTLS listener for federated/remote clients |
 | **Auth** | per-identity mTLS client certificates (`crate::pki`); named-identity tokens (`GITEA_PAT_<NAME>`, `PLANE_PAT_<NAME>`) for outbound git-forge/tracker calls |
 | **Governance** | path-jailed filesystem access, vault-only secrets (never a raw `env::var` for a credential), a mandatory Rust PII gate on every public-forge write, sanitized audit logging |

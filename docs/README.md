@@ -40,7 +40,9 @@ deployment itself.
 
 ## Tool reference
 
-The full catalog of Terminus's ~300 tools, organized by domain.
+The full catalog of Terminus's ~51 tools (one per integrated service), organized
+by domain. Each tool exposes a set of actions — ~300 individual MCP callables in
+total — that vary with the backing service.
 
 | Page | Description |
 | --- | --- |

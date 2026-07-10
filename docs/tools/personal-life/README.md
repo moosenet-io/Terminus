@@ -4,7 +4,7 @@
 
 The `personal-life` domain is the largest single grouping in `terminus_personal` — finance,
 health, vehicle, habits, travel, home, media, and general life-admin integrations. It spans
-**16 modules**, listed below with a one-line description and an exact tool count read off each
+**16 tools**, listed below with a one-line description and an exact action count read off each
 module's own `register()`/`register_all()` call site in source (not an estimate — every count
 below was verified by reading the actual `Box::new(...)` registration calls, since some modules
 register a different tool set depending on runtime config — e.g. `<media-service>`, `commute`, and
@@ -17,7 +17,7 @@ paths, env vars, and worked examples, all sourced directly from the Rust impleme
 remaining ten are listed here with their verified tool count and a one-liner from the module's own
 top-of-file doc comment; their deep-dive pages are a separate documentation pass.
 
-| Module | Tools | What it does | Page |
+| Tool | Actions | What it does | Page |
 | --- | --- | --- | --- |
 | `ledger` | 8 | Finance tracking via the Actual Budget HTTP API — accounts, transactions, budget summaries, category spend, balances, recent activity. | [`ledger.md`](ledger.md) **[deep-dive]** |
 | `vitals` | 11 | Health tracking — weight, exercise, sleep, a generic multi-metric daily log, trends, CSV import, and an LLM-generated fitness/health program. | [`vitals.md`](vitals.md) **[deep-dive]** |

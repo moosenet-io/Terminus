@@ -3,7 +3,7 @@
 [← tool index](../README.md) | [← docs index](../../README.md)
 
 Work tracking, task/dev-loop queues, inter-agent messaging, and scheduled
-reminders — seven modules total. Six are documented on this page (the
+reminders — seven tools total. Six are documented on this page (the
 non-Plane modules); the seventh, `plane`, is large enough to be its own
 sub-section.
 
@@ -11,7 +11,7 @@ sub-section.
 
 ## Modules
 
-| Module | Tools | What it does | Page |
+| Tool | Actions | What it does | Page |
 | --- | --- | --- | --- |
 | `plane` | 37 | Full Plane CE work-management surface — issues, modules, multi-identity (`PLANE_PAT_<NAME>`) CRUD, prefix registry. The largest single module in the hub. | [`plane/README.md`](plane/README.md) |
 | `axon` | 4 | Postgres-backed work-order / task queue: submit, status, list, and access-controlled cancel over `DATABASE_URL`. | [`axon.md`](axon.md) |

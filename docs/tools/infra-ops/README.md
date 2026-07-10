@@ -3,7 +3,7 @@
 [← docs index](../../README.md) · [← tool index](../README.md)
 
 The Infra & Ops domain is fleet health, automation, secrets, networking, and
-admin surfaces — 14 modules registering roughly 76 tools between them. Three
+admin surfaces — 14 tools registering roughly 76 actions between them. Three
 modules (`ansible`, `<secret-manager>`, `approval`) sit behind the shared
 per-occurrence [approval gate](../../../src/approval.rs); the rest are
 read-only HTTP probes against LAN services or fixed-command SSH bridges into
@@ -13,7 +13,7 @@ the fleet host.
 
 ## Modules
 
-| Module | Tools | What it does | Page |
+| Tool | Actions | What it does | Page |
 | --- | --- | --- | --- |
 | `ansible` | 4 | GUARDED. Runs allowlisted Ansible playbooks on the ansible control host over typed SSH, lists playbooks, and reports the last run's status/log. | [`ansible.md`](ansible.md) |
 | `<secret-manager>` | 5 | GUARDED. Read-only secret queries against <secret-manager> (Universal Auth) — status, list projects, list secret keys, get one secret, get a batch. | [`<secret-manager>.md`](<secret-manager>.md) |
