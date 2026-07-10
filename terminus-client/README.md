@@ -167,6 +167,62 @@ per MCP client semantics, `.mcp.json` is read at session start, so a
 rollback (like the cutover itself) only takes effect for the **next** fresh
 session, never retroactively for one already running.
 
+## Streaming forward (`forward_stream`, EGSSE-01)
+
+[`forward`] buffers the whole response body before returning -- fine for
+JSON-RPC `tools/list`/`tools/call`, but wrong for a progressive/SSE-shaped
+endpoint (Chord's `/v1/agent/execute` agentic-turn tool-dispatch stream,
+`/v1/chat/completions`, `/v1/infer`, `/v1/coding/select`), where a caller
+(e.g. lumina's `agent_loop`) needs each `event:`/`data:` frame as it arrives,
+not after the whole turn has finished. `forward_stream` is the same
+enroll/dial/mTLS model as `forward`, but hands back an incrementally-polled
+`Stream` of raw body chunks instead:
+
+```rust,ignore
+use terminus_client::{forward_stream, PrimaryConfig};
+use tokio_stream::StreamExt;
+
+let cfg = PrimaryConfig::new(enroll_cfg, connect_cfg);
+let mut stream = Box::pin(
+    forward_stream(&cfg, "/v1/agent/execute", serde_json::json!({ "...": "..." })).await?
+);
+
+let mut pending = Vec::new(); // bytes since the last complete SSE record
+while let Some(chunk) = stream.next().await {
+    let chunk = chunk?; // ClientError::StreamRead / StreamIdleTimeout surfaces here
+    pending.extend_from_slice(&chunk);
+    // split `pending` on the SSE record separator ("\n\n"), handing each
+    // complete `event:`/`data:` record to your own decoder (e.g. lumina's
+    // agent_loop tool-dispatch handling) and keeping any trailing partial
+    // record in `pending` for the next chunk.
+}
+```
+
+**What it does not do**: `forward_stream` does not parse SSE framing itself
+-- it hands the caller raw bytes exactly as `hyper` delivers them off the
+wire, unbuffered, mirroring the posture Chord's own inference proxy takes
+with `bytes_stream`/`Body::from_stream` on the far side of this same mTLS
+link. Splitting `event:`/`data:` records (including buffering a chunk that
+splits a record mid-frame) is the caller's job.
+
+**Timeouts**: unlike `forward` (one timeout covers the whole call),
+`forward_stream` splits timeout coverage in two, because a streaming call's
+body may legitimately run far longer than any reasonable whole-call bound:
+- **Open phase** (enroll-check + dial + handshake + send request + read
+  response headers): bounded by `cfg.timeout` (`DEFAULT_STREAM_OPEN_TIMEOUT`
+  by default) -- `ClientError::StreamOpenTimeout` if headers don't arrive in
+  time. A non-2xx status at this point is `ClientError::ForwardRejected`
+  (same shape `forward` uses), and no stream is ever handed back.
+- **Body phase** (each chunk read after that): bounded by an idle timeout
+  (`DEFAULT_STREAM_IDLE_TIMEOUT`, 180s by default -- use
+  `forward_stream_with_idle_timeout` to override) -- a stream item is
+  `Err(ClientError::StreamIdleTimeout)` if no new chunk arrives within that
+  window since the last one. The stream ends (`None`) once the primary
+  closes the response body normally.
+
+This is a transport primitive only: re-pointing lumina's `agent_loop` to
+drive it is a separate, downstream change (not part of this crate).
+
 ## Errors
 
 Every enrollment/connection failure is a typed [`error::ClientError`]

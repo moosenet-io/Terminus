@@ -29,6 +29,9 @@ pub mod transport;
 
 pub use enroll::{enroll, EnrollConfig, EnrolledCredential};
 pub use error::ClientError;
-pub use forward::{forward, PrimaryConfig};
+pub use forward::{
+    forward, forward_stream, forward_stream_with_idle_timeout, PrimaryConfig,
+    DEFAULT_STREAM_IDLE_TIMEOUT, DEFAULT_STREAM_OPEN_TIMEOUT,
+};
 pub use mcp_server::DaemonState;
 pub use transport::{connect, ConnectConfig, MtlsTransport};

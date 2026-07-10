@@ -1,6 +1,6 @@
 [package]
 name = "terminus-client"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Enrollment + mTLS transport client for a terminus primary (Gateway P2, TCLI-04)"
@@ -34,6 +34,14 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
+# EGSSE-01: the streaming forward primitive (`forward_stream`) exposes the
+# response body as a `Stream` (via `http_body_util::BodyExt::into_data_stream`)
+# rather than collecting it whole -- `futures-core` is the lightweight crate
+# that defines the `Stream` trait itself (no combinators/executor pulled in),
+# and `tokio-stream`'s `StreamExt::timeout` gives per-chunk idle-timeout
+# enforcement without hand-rolling a `Stream` impl around `tokio::time::Sleep`.
+futures-core = "0.3"
+tokio-stream = { version = "0.1", features = ["time"] }
 # TCLI-05: the daemon's local loopback MCP endpoint (`terminus-client-daemon`
 # bin) -- same axum major version the rest of the workspace (`terminus-rs`)
 # already uses for its own `/mcp` listener.

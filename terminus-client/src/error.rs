@@ -66,4 +66,26 @@ pub enum ClientError {
     /// returns a clear error rather than hanging indefinitely.
     #[error("forwarded MCP request to {0} timed out after {1:?}")]
     ForwardTimeout(String, std::time::Duration),
+    /// EGSSE-01: [`crate::forward::forward_stream`]'s response headers
+    /// (status line + headers, before any body bytes) did not arrive within
+    /// the configured timeout -- mirrors [`ClientError::ForwardTimeout`] but
+    /// scoped to just the connect+request-issue phase of a streaming call,
+    /// since the body itself may legitimately run far longer than a single
+    /// unary request/response (e.g. a whole agentic turn).
+    #[error("opening streamed request to {0} timed out after {1:?}")]
+    StreamOpenTimeout(String, std::time::Duration),
+    /// EGSSE-01: a chunk of a streamed response body failed to read --
+    /// either the underlying HTTP/1.1 framing errored (connection reset,
+    /// malformed chunk) or the primary went idle for longer than the
+    /// configured per-chunk timeout.
+    #[error("reading streamed response body failed: {0}")]
+    StreamRead(String),
+    /// EGSSE-01: no new chunk of a streamed response body arrived within
+    /// the configured idle timeout -- distinct from
+    /// [`ClientError::ForwardTimeout`]/[`ClientError::StreamOpenTimeout`]:
+    /// the stream had already opened successfully and may have already
+    /// yielded chunks, but then stalled, so the caller gets a clear error
+    /// instead of hanging on a wedged primary/link mid-stream.
+    #[error("streamed response from {0} went idle for more than {1:?}")]
+    StreamIdleTimeout(String, std::time::Duration),
 }
