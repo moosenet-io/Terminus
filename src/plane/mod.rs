@@ -1,6 +1,6 @@
 //! Plane CE tool implementations (CHORD-06, hardened per the plane-helper port).
 //!
-//! Provides 28 Rust tools that wrap the Plane CE REST API via reqwest.
+//! Provides 33 Rust tools that wrap the Plane CE REST API via reqwest.
 //! All configuration comes from environment variables — no hardcoded URLs or tokens.
 //!
 //! ## Configuration
@@ -78,7 +78,7 @@ use tracing::{debug, warn};
 
 use crate::error::ToolError;
 use crate::registry::ToolRegistry;
-use crate::tool::RustTool;
+use crate::tool::{RustTool, ToolOutput};
 
 use types::*;
 
@@ -1259,6 +1259,16 @@ impl RustTool for PlaneListWorkItems {
         }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneListWorkItems {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
         let project_id = client.resolve_project_id(project_id_arg).await?;
@@ -1273,8 +1283,9 @@ impl RustTool for PlaneListWorkItems {
             .map_err(|e| ToolError::Http(format!("Failed to parse issues: {e}")))?;
         let total = list.total_count();
         let items: Vec<Issue> = list.into_items().into_iter().take(limit).collect();
+        let structured = json!({ "total": total, "shown": items.len(), "items": items });
         if items.is_empty() {
-            return Ok("No work items found".into());
+            return Ok(("No work items found".into(), structured));
         }
         let mut out = format!("Work items ({} shown of {}):\n", items.len(), total);
         for i in &items {
@@ -1283,7 +1294,7 @@ impl RustTool for PlaneListWorkItems {
             out.push_str(&format!("  [{id}] {seq} {name} (priority: {priority})\n",
                 id = i.id, seq = seq, name = i.name, priority = priority));
         }
-        Ok(out)
+        Ok((out, structured))
     }
 }
 
@@ -1308,6 +1319,16 @@ impl RustTool for PlaneGetWorkItem {
         }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneGetWorkItem {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
         let project_id = client.resolve_project_id(project_id_arg).await?;
@@ -1320,7 +1341,7 @@ impl RustTool for PlaneGetWorkItem {
         let body = client.get_json_cached(&url).await?;
         let i: Issue = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse issue: {e}")))?;
-        Ok(format!(
+        let text = format!(
             "Issue: {name}\nID: {id}\nSequence: {seq}\nPriority: {priority}\nState: {state}\nDescription: {desc}",
             name = i.name,
             id = i.id,
@@ -1328,7 +1349,10 @@ impl RustTool for PlaneGetWorkItem {
             priority = i.priority.as_deref().unwrap_or("none"),
             state = i.state.as_deref().unwrap_or("unknown"),
             desc = i.description.as_deref().unwrap_or("(none)")
-        ))
+        );
+        let structured = serde_json::to_value(&i)
+            .map_err(|e| ToolError::Http(format!("Failed to serialize issue: {e}")))?;
+        Ok((text, structured))
     }
 }
 
@@ -1567,6 +1591,16 @@ impl RustTool for PlaneListCycles {
         }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneListCycles {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
         let project_id = client.resolve_project_id(project_id_arg).await?;
@@ -1579,8 +1613,9 @@ impl RustTool for PlaneListCycles {
         let list: ApiList<Cycle> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse cycles: {e}")))?;
         let items = list.into_items();
+        let structured = json!({ "items": items });
         if items.is_empty() {
-            return Ok("No cycles found".into());
+            return Ok(("No cycles found".into(), structured));
         }
         let mut out = format!("Found {} cycle(s):\n", items.len());
         for c in &items {
@@ -1590,7 +1625,7 @@ impl RustTool for PlaneListCycles {
             out.push_str(&format!("  [{id}] {name} ({status}) {start}..{end}\n",
                 id = c.id, name = c.name, status = status, start = start, end = end));
         }
-        Ok(out)
+        Ok((out, structured))
     }
 }
 
@@ -1702,6 +1737,16 @@ impl RustTool for PlaneListModules {
         }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneListModules {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
         let project_id = client.resolve_project_id(project_id_arg).await?;
@@ -1714,8 +1759,9 @@ impl RustTool for PlaneListModules {
         let list: ApiList<Module> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse modules: {e}")))?;
         let items = list.into_items();
+        let structured = json!({ "items": items });
         if items.is_empty() {
-            return Ok("No modules found".into());
+            return Ok(("No modules found".into(), structured));
         }
         let mut out = format!("Found {} module(s):\n", items.len());
         for m in &items {
@@ -1723,7 +1769,7 @@ impl RustTool for PlaneListModules {
             out.push_str(&format!("  [{id}] {name} ({status})\n",
                 id = m.id, name = m.name, status = status));
         }
-        Ok(out)
+        Ok((out, structured))
     }
 }
 
@@ -1748,6 +1794,16 @@ impl RustTool for PlaneGetModule {
         }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneGetModule {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
         let project_id = client.resolve_project_id(project_id_arg).await?;
@@ -1760,13 +1816,16 @@ impl RustTool for PlaneGetModule {
         let body = client.get_json_cached(&url).await?;
         let m: Module = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse module: {e}")))?;
-        Ok(format!(
+        let text = format!(
             "Module: {name}\nID: {id}\nStatus: {status}\nDates: {start} to {end}",
             name = m.name, id = m.id,
             status = m.status.as_deref().unwrap_or("unknown"),
             start = m.start_date.as_deref().unwrap_or("-"),
             end = m.target_date.as_deref().unwrap_or("-")
-        ))
+        );
+        let structured = serde_json::to_value(&m)
+            .map_err(|e| ToolError::Http(format!("Failed to serialize module: {e}")))?;
+        Ok((text, structured))
     }
 }
 
@@ -1839,6 +1898,16 @@ impl RustTool for PlaneListModuleIssues {
         }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneListModuleIssues {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
         let project_id = client.resolve_project_id(project_id_arg).await?;
@@ -1852,14 +1921,15 @@ impl RustTool for PlaneListModuleIssues {
         let list: ApiList<Issue> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse module issues: {e}")))?;
         let items = list.into_items();
+        let structured = json!({ "items": items });
         if items.is_empty() {
-            return Ok("No issues in this module".into());
+            return Ok(("No issues in this module".into(), structured));
         }
         let mut out = format!("Module issues ({}):\n", items.len());
         for i in &items {
             out.push_str(&format!("  [{id}] {name}\n", id = i.id, name = i.name));
         }
-        Ok(out)
+        Ok((out, structured))
     }
 }
 
@@ -2059,6 +2129,16 @@ impl RustTool for PlaneListStates {
         }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneListStates {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
         let project_id = client.resolve_project_id(project_id_arg).await?;
@@ -2071,15 +2151,16 @@ impl RustTool for PlaneListStates {
         let list: ApiList<State> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse states: {e}")))?;
         let items = list.into_items();
+        let structured = json!({ "items": items });
         if items.is_empty() {
-            return Ok("No states found".into());
+            return Ok(("No states found".into(), structured));
         }
         let mut out = format!("States ({}):\n", items.len());
         for s in &items {
             out.push_str(&format!("  [{id}] {name} (group: {group}, color: {color})\n",
                 id = s.id, name = s.name, group = s.group, color = s.color));
         }
-        Ok(out)
+        Ok((out, structured))
     }
 }
 
@@ -2103,6 +2184,16 @@ impl RustTool for PlaneListLabels {
         }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneListLabels {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
         let project_id = client.resolve_project_id(project_id_arg).await?;
@@ -2115,8 +2206,9 @@ impl RustTool for PlaneListLabels {
         let list: ApiList<Label> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse labels: {e}")))?;
         let items = list.into_items();
+        let structured = json!({ "items": items });
         if items.is_empty() {
-            return Ok("No labels found".into());
+            return Ok(("No labels found".into(), structured));
         }
         let mut out = format!("Labels ({}):\n", items.len());
         for l in &items {
@@ -2124,7 +2216,7 @@ impl RustTool for PlaneListLabels {
             out.push_str(&format!("  [{id}] {name} (color: {color})\n",
                 id = l.id, name = l.name, color = color));
         }
-        Ok(out)
+        Ok((out, structured))
     }
 }
 
@@ -2148,6 +2240,16 @@ impl RustTool for PlaneListMembers {
         }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneListMembers {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
         let project_id = client.resolve_project_id(project_id_arg).await?;
@@ -2160,8 +2262,9 @@ impl RustTool for PlaneListMembers {
         let list: ApiList<Member> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse members: {e}")))?;
         let items = list.into_items();
+        let structured = json!({ "items": items });
         if items.is_empty() {
-            return Ok("No members found".into());
+            return Ok(("No members found".into(), structured));
         }
         let mut out = format!("Members ({}):\n", items.len());
         for m in &items {
@@ -2171,7 +2274,7 @@ impl RustTool for PlaneListMembers {
             out.push_str(&format!("  [{id}] {name} (role: {role})\n",
                 id = m.id, name = name, role = m.role));
         }
-        Ok(out)
+        Ok((out, structured))
     }
 }
 
@@ -2196,6 +2299,16 @@ impl RustTool for PlaneListComments {
         }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneListComments {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
         let project_id = client.resolve_project_id(project_id_arg).await?;
@@ -2209,8 +2322,9 @@ impl RustTool for PlaneListComments {
         let list: ApiList<Comment> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse comments: {e}")))?;
         let items = list.into_items();
+        let structured = json!({ "items": items });
         if items.is_empty() {
-            return Ok("No comments on this issue".into());
+            return Ok(("No comments on this issue".into(), structured));
         }
         let mut out = format!("Comments ({}):\n", items.len());
         for c in &items {
@@ -2223,7 +2337,7 @@ impl RustTool for PlaneListComments {
             out.push_str(&format!("  [{id}] {author}: {text}\n",
                 id = c.id, author = author, text = text));
         }
-        Ok(out)
+        Ok((out, structured))
     }
 }
 
@@ -2352,6 +2466,16 @@ impl RustTool for PlaneGetIssueBySequence {
         }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneGetIssueBySequence {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
         let project_id = client.resolve_project_id(project_id_arg).await?;
@@ -2374,14 +2498,19 @@ impl RustTool for PlaneGetIssueBySequence {
 
         match found {
             None => Err(ToolError::NotFound(format!("No issue with sequence_id #{sequence_id}"))),
-            Some(i) => Ok(format!(
-                "Issue #{seq}: {name}\nID: {id}\nPriority: {priority}\nState: {state}",
-                seq = sequence_id,
-                name = i.name,
-                id = i.id,
-                priority = i.priority.as_deref().unwrap_or("none"),
-                state = i.state.as_deref().unwrap_or("unknown")
-            )),
+            Some(i) => {
+                let text = format!(
+                    "Issue #{seq}: {name}\nID: {id}\nPriority: {priority}\nState: {state}",
+                    seq = sequence_id,
+                    name = i.name,
+                    id = i.id,
+                    priority = i.priority.as_deref().unwrap_or("none"),
+                    state = i.state.as_deref().unwrap_or("unknown")
+                );
+                let structured = serde_json::to_value(&i)
+                    .map_err(|e| ToolError::Http(format!("Failed to serialize issue: {e}")))?;
+                Ok((text, structured))
+            }
         }
     }
 }
@@ -2417,6 +2546,16 @@ impl RustTool for PlaneListWorkItemsFiltered {
         }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneListWorkItemsFiltered {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let project_id_arg = require_arg!(args, "project_id", as_str);
         let project_id = client.resolve_project_id(project_id_arg).await?;
@@ -2447,8 +2586,9 @@ impl RustTool for PlaneListWorkItemsFiltered {
             .take(limit)
             .collect();
 
+        let structured = json!({ "items": filtered });
         if filtered.is_empty() {
-            return Ok("No work items match the given filters".into());
+            return Ok(("No work items match the given filters".into(), structured));
         }
         let mut out = format!("Filtered work items ({}):\n", filtered.len());
         for i in &filtered {
@@ -2456,7 +2596,7 @@ impl RustTool for PlaneListWorkItemsFiltered {
             out.push_str(&format!("  [{id}] {name} (priority: {priority})\n",
                 id = i.id, name = i.name, priority = priority));
         }
-        Ok(out)
+        Ok((out, structured))
     }
 }
 
@@ -2850,9 +2990,315 @@ impl RustTool for PlaneListIdentities {
     }
 }
 
+// ─── EGJS-01: sub-issue + label mutation tools (harmony egress-wall gap) ────
+//
+// Per LHEG-06's inventory (`moosenet/harmony`), harmony's
+// `conductor/orchestrator.rs`, `enrichment/decompose.rs`, and
+// `executor/subtasks.rs` need typed sub-issue listing/linking, and its
+// TRIAGE-01/02/08 escalation-label paths need label creation/mutation --
+// neither had a terminus tool equivalent before this item.
+// `plane_create_work_item`/`plane_update_work_item` already accept a
+// `parent` field and a full-replace `label_ids` array, so linking a single
+// sub-issue or adding a single label is implemented as a thin, focused
+// wrapper around the same PATCH/POST primitives those tools already use --
+// no new client machinery, same identity/error-mapping conventions.
+
+// ─── 29. plane_list_sub_issues ───────────────────────────────────────────────
+
+pub struct PlaneListSubIssues {
+    client: Arc<PlaneClient>,
+}
+
+#[async_trait]
+impl RustTool for PlaneListSubIssues {
+    fn name(&self) -> &str { "plane_list_sub_issues" }
+    fn description(&self) -> &str { "List the sub-issues (children) of a Plane work item, with each sibling's ID, sequence number, name, and state" }
+    fn parameters(&self) -> Value {
+        with_identity_param(json!({
+            "type": "object",
+            "properties": {
+                "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
+                "issue_id": { "type": "string", "description": "Parent issue UUID" }
+            },
+            "required": ["project_id", "issue_id"]
+        }))
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneListSubIssues {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
+        let client = self.client.resolve_identity(&args)?;
+        let project_id_arg = require_arg!(args, "project_id", as_str);
+        let project_id = client.resolve_project_id(project_id_arg).await?;
+        let issue_id = require_arg!(args, "issue_id", as_str);
+        let url = format!(
+            "{}projects/{project_id}/issues/{issue_id}/sub-issues/",
+            client.workspace_url()
+        );
+        debug!("plane_list_sub_issues GET {url}");
+        let body = client.get_json_cached(&url).await?;
+        let raw: Value = serde_json::from_str(&body)
+            .map_err(|e| ToolError::Http(format!("Failed to parse sub-issues response: {e}")))?;
+        // Plane CE's sub-issues endpoint returns `{"sub_issues": [...],
+        // "state_distribution": {...}}` on some versions and a bare array on
+        // others -- accept either shape rather than assuming one.
+        let items: Vec<Issue> = if let Some(arr) = raw.get("sub_issues") {
+            serde_json::from_value(arr.clone())
+                .map_err(|e| ToolError::Http(format!("Failed to parse sub-issues: {e}")))?
+        } else {
+            serde_json::from_value::<ApiList<Issue>>(raw.clone())
+                .map(|l| l.into_items())
+                .map_err(|e| ToolError::Http(format!("Failed to parse sub-issues: {e}")))?
+        };
+        let structured = json!({ "parent_issue_id": issue_id, "items": items });
+        if items.is_empty() {
+            return Ok(("No sub-issues found".into(), structured));
+        }
+        let mut out = format!("Sub-issues of {issue_id} ({}):\n", items.len());
+        for i in &items {
+            let seq = i.sequence_id.map(|s| format!("#{s}")).unwrap_or_default();
+            let state = i.state.as_deref().unwrap_or("unknown");
+            out.push_str(&format!("  [{id}] {seq} {name} (state: {state})\n",
+                id = i.id, seq = seq, name = i.name, state = state));
+        }
+        Ok((out, structured))
+    }
+}
+
+// ─── 30. plane_link_sub_issue ────────────────────────────────────────────────
+
+pub struct PlaneLinkSubIssue {
+    client: Arc<PlaneClient>,
+}
+
+#[async_trait]
+impl RustTool for PlaneLinkSubIssue {
+    fn name(&self) -> &str { "plane_link_sub_issue" }
+    fn description(&self) -> &str { "Link an existing Plane issue as a sub-issue of a parent (sets the child's parent field)" }
+    fn parameters(&self) -> Value {
+        with_identity_param(json!({
+            "type": "object",
+            "properties": {
+                "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
+                "parent_issue_id": { "type": "string", "description": "Parent issue UUID" },
+                "sub_issue_id": { "type": "string", "description": "Issue UUID to become a child of parent_issue_id" }
+            },
+            "required": ["project_id", "parent_issue_id", "sub_issue_id"]
+        }))
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneLinkSubIssue {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
+        let client = self.client.resolve_identity(&args)?;
+        let project_id_arg = require_arg!(args, "project_id", as_str);
+        let project_id = client.resolve_project_id(project_id_arg).await?;
+        let parent_issue_id = require_arg!(args, "parent_issue_id", as_str);
+        let sub_issue_id = require_arg!(args, "sub_issue_id", as_str);
+        let url = format!(
+            "{}projects/{project_id}/issues/{sub_issue_id}/",
+            client.workspace_url()
+        );
+        let body = json!({ "parent": parent_issue_id });
+        debug!("plane_link_sub_issue PATCH {url}");
+        let resp = client.patch_with_retry(&url, &body).await?;
+        let resp = PlaneClient::check_status(resp).await?;
+        let i: Issue = resp.json().await
+            .map_err(|e| ToolError::Http(format!("Failed to parse updated issue: {e}")))?;
+        let text = format!("Linked {sub_issue_id} as a sub-issue of {parent_issue_id}");
+        let structured = serde_json::to_value(&i)
+            .map_err(|e| ToolError::Http(format!("Failed to serialize issue: {e}")))?;
+        Ok((text, structured))
+    }
+}
+
+// ─── 31. plane_unlink_sub_issue ──────────────────────────────────────────────
+
+pub struct PlaneUnlinkSubIssue {
+    client: Arc<PlaneClient>,
+}
+
+#[async_trait]
+impl RustTool for PlaneUnlinkSubIssue {
+    fn name(&self) -> &str { "plane_unlink_sub_issue" }
+    fn description(&self) -> &str { "Unlink an issue from its parent (clears the child's parent field, making it a top-level issue again)" }
+    fn parameters(&self) -> Value {
+        with_identity_param(json!({
+            "type": "object",
+            "properties": {
+                "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
+                "sub_issue_id": { "type": "string", "description": "Issue UUID to detach from its parent" }
+            },
+            "required": ["project_id", "sub_issue_id"]
+        }))
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneUnlinkSubIssue {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
+        let client = self.client.resolve_identity(&args)?;
+        let project_id_arg = require_arg!(args, "project_id", as_str);
+        let project_id = client.resolve_project_id(project_id_arg).await?;
+        let sub_issue_id = require_arg!(args, "sub_issue_id", as_str);
+        let url = format!(
+            "{}projects/{project_id}/issues/{sub_issue_id}/",
+            client.workspace_url()
+        );
+        let body = json!({ "parent": Value::Null });
+        debug!("plane_unlink_sub_issue PATCH {url}");
+        let resp = client.patch_with_retry(&url, &body).await?;
+        let resp = PlaneClient::check_status(resp).await?;
+        let i: Issue = resp.json().await
+            .map_err(|e| ToolError::Http(format!("Failed to parse updated issue: {e}")))?;
+        let text = format!("Unlinked {sub_issue_id} from its parent");
+        let structured = serde_json::to_value(&i)
+            .map_err(|e| ToolError::Http(format!("Failed to serialize issue: {e}")))?;
+        Ok((text, structured))
+    }
+}
+
+// ─── 32. plane_create_label ──────────────────────────────────────────────────
+
+pub struct PlaneCreateLabel {
+    client: Arc<PlaneClient>,
+}
+
+#[async_trait]
+impl RustTool for PlaneCreateLabel {
+    fn name(&self) -> &str { "plane_create_label" }
+    fn description(&self) -> &str { "Create a new label in a Plane project" }
+    fn parameters(&self) -> Value {
+        with_identity_param(json!({
+            "type": "object",
+            "properties": {
+                "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
+                "name": { "type": "string", "description": "Label name" },
+                "color": { "type": "string", "description": "Label color (hex, e.g. \"#ff0000\")" }
+            },
+            "required": ["project_id", "name"]
+        }))
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneCreateLabel {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
+        let client = self.client.resolve_identity(&args)?;
+        let project_id_arg = require_arg!(args, "project_id", as_str);
+        let project_id = client.resolve_project_id(project_id_arg).await?;
+        let name = require_arg!(args, "name", as_str);
+        let mut body = json!({ "name": name });
+        if let Some(color) = args.get("color").and_then(|v| v.as_str()) {
+            body["color"] = json!(color);
+        }
+        let url = format!(
+            "{}projects/{project_id}/labels/",
+            client.workspace_url()
+        );
+        debug!("plane_create_label POST {url}");
+        let resp = client.post_with_retry(&url, &body).await?;
+        let resp = PlaneClient::check_status(resp).await?;
+        let l: Label = resp.json().await
+            .map_err(|e| ToolError::Http(format!("Failed to parse created label: {e}")))?;
+        let text = format!("Created label: {name} (ID: {id})", name = l.name, id = l.id);
+        let structured = serde_json::to_value(&l)
+            .map_err(|e| ToolError::Http(format!("Failed to serialize label: {e}")))?;
+        Ok((text, structured))
+    }
+}
+
+// ─── 33. plane_add_label ─────────────────────────────────────────────────────
+
+pub struct PlaneAddLabel {
+    client: Arc<PlaneClient>,
+}
+
+#[async_trait]
+impl RustTool for PlaneAddLabel {
+    fn name(&self) -> &str { "plane_add_label" }
+    fn description(&self) -> &str { "Add a single label to a Plane work item without disturbing its other labels (read-modify-write over the full-replace label_ids field)" }
+    fn parameters(&self) -> Value {
+        with_identity_param(json!({
+            "type": "object",
+            "properties": {
+                "project_id": { "type": "string", "description": "Project UUID or identifier (e.g. \"LM\")" },
+                "issue_id": { "type": "string", "description": "Issue UUID" },
+                "label_id": { "type": "string", "description": "Label UUID to add" }
+            },
+            "required": ["project_id", "issue_id", "label_id"]
+        }))
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneAddLabel {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
+        let client = self.client.resolve_identity(&args)?;
+        let project_id_arg = require_arg!(args, "project_id", as_str);
+        let project_id = client.resolve_project_id(project_id_arg).await?;
+        let issue_id = require_arg!(args, "issue_id", as_str);
+        let label_id = require_arg!(args, "label_id", as_str);
+        let url = format!(
+            "{}projects/{project_id}/issues/{issue_id}/",
+            client.workspace_url()
+        );
+        debug!("plane_add_label GET {url}");
+        let body = client.get_json_cached(&url).await?;
+        let current: Issue = serde_json::from_str(&body)
+            .map_err(|e| ToolError::Http(format!("Failed to parse issue: {e}")))?;
+        let mut label_ids = current.label_ids.clone();
+        if !label_ids.iter().any(|l| l == label_id) {
+            label_ids.push(label_id.to_string());
+        }
+        let patch_body = json!({ "label_ids": label_ids });
+        debug!("plane_add_label PATCH {url}");
+        let resp = client.patch_with_retry(&url, &patch_body).await?;
+        let resp = PlaneClient::check_status(resp).await?;
+        let i: Issue = resp.json().await
+            .map_err(|e| ToolError::Http(format!("Failed to parse updated issue: {e}")))?;
+        let text = format!("Added label {label_id} to issue {issue_id} ({} label(s) total)", i.label_ids.len());
+        let structured = serde_json::to_value(&i)
+            .map_err(|e| ToolError::Http(format!("Failed to serialize issue: {e}")))?;
+        Ok((text, structured))
+    }
+}
+
 // ─── Register all plane tools ─────────────────────────────────────────────────
 
-/// Register all 28 Plane CE tools into the given registry.
+/// Register all 33 Plane CE tools into the given registry.
 pub fn register(registry: &mut ToolRegistry) {
     let client = Arc::new(PlaneClient::from_env());
 
@@ -2889,6 +3335,12 @@ pub fn register(registry: &mut ToolRegistry) {
         Box::new(PlaneBatchCreateWorkItems { client: client.clone() }),
         Box::new(PlaneWhoami { client: client.clone() }),
         Box::new(PlaneListIdentities { client: client.clone() }),
+        // EGJS-01: sub-issue + label mutation tools (harmony egress-wall gap)
+        Box::new(PlaneListSubIssues { client: client.clone() }),
+        Box::new(PlaneLinkSubIssue { client: client.clone() }),
+        Box::new(PlaneUnlinkSubIssue { client: client.clone() }),
+        Box::new(PlaneCreateLabel { client: client.clone() }),
+        Box::new(PlaneAddLabel { client: client.clone() }),
     ];
 
     for tool in tools {
@@ -3469,7 +3921,7 @@ mod tests {
         assert!(result.contains("No projects"), "{result}");
     }
 
-    // ── register() populates 32 core plane tools + 5 prefix sub-tools ─────────
+    // ── register() populates 37 core plane tools + 5 prefix sub-tools ─────────
 
     #[test]
     fn test_register_all_plane_tools() {
@@ -3477,11 +3929,127 @@ mod tests {
         // (not required for registration, only for execution)
         let mut registry = ToolRegistry::new();
         register(&mut registry);
-        // 32 core plane_* tools + 5 plane_prefix_* sub-tools (see prefix::register).
-        // S102 added 4 module-management tools (update/delete module,
-        // add/remove issue↔module) to the prior 28 core tools.
-        assert_eq!(registry.len(), 37,
-            "Expected 37 plane tools (32 core + 5 prefix), got {}", registry.len());
+        // 37 core plane_* tools + 5 plane_prefix_* sub-tools (see prefix::register).
+        // EGJS-01 added 5 sub-issue/label tools (plane_list_sub_issues,
+        // plane_link_sub_issue, plane_unlink_sub_issue, plane_create_label,
+        // plane_add_label) to the prior 32 core tools.
+        assert_eq!(registry.len(), 42,
+            "Expected 42 plane tools (37 core + 5 prefix), got {}", registry.len());
+    }
+
+    // ── EGJS-01: sub-issue + label tools are registered and structured ────────
+
+    #[test]
+    fn test_egjs01_new_tools_are_registered() {
+        let mut registry = ToolRegistry::new();
+        register(&mut registry);
+        for name in [
+            "plane_list_sub_issues",
+            "plane_link_sub_issue",
+            "plane_unlink_sub_issue",
+            "plane_create_label",
+            "plane_add_label",
+        ] {
+            assert!(registry.contains(name), "expected {name} to be registered");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plane_list_sub_issues_returns_structured_content() {
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/workspaces/testws/projects/p1/issues/parent1/sub-issues/");
+            then.status(200).json_body(json!({
+                "sub_issues": [
+                    {"id": "child1", "name": "Child One", "project": "p1", "workspace": "testws", "sequence_id": 5, "state": "s1"}
+                ]
+            }));
+        });
+        let client = mock_client(&server);
+        let tool = PlaneListSubIssues { client };
+        let output = tool
+            .execute_structured(json!({"project_id": "p1", "issue_id": "parent1"}))
+            .await
+            .unwrap();
+        assert!(output.text.contains("Child One"));
+        let structured = output.structured.expect("expected structuredContent");
+        assert_eq!(structured["parent_issue_id"], "parent1");
+        assert_eq!(structured["items"][0]["id"], "child1");
+        assert_eq!(structured["items"][0]["sequence_id"], 5);
+    }
+
+    #[tokio::test]
+    async fn test_plane_link_sub_issue_patches_parent_field() {
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        server.mock(|when, then| {
+            when.method(httpmock::Method::PATCH)
+                .path("/api/v1/workspaces/testws/projects/p1/issues/child1/")
+                .json_body_partial(json!({"parent": "parent1"}).to_string());
+            then.status(200).json_body(json!({
+                "id": "child1", "name": "Child One", "project": "p1", "workspace": "testws"
+            }));
+        });
+        let client = mock_client(&server);
+        let tool = PlaneLinkSubIssue { client };
+        let result = tool
+            .execute(json!({"project_id": "p1", "parent_issue_id": "parent1", "sub_issue_id": "child1"}))
+            .await
+            .unwrap();
+        assert!(result.contains("child1"));
+        assert!(result.contains("parent1"));
+    }
+
+    #[tokio::test]
+    async fn test_plane_create_label_returns_structured_content() {
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        server.mock(|when, then| {
+            when.method(POST).path("/api/v1/workspaces/testws/projects/p1/labels/");
+            then.status(201).json_body(json!({
+                "id": "lbl1", "name": "urgent-review", "color": "#ff0000", "project": "p1"
+            }));
+        });
+        let client = mock_client(&server);
+        let tool = PlaneCreateLabel { client };
+        let output = tool
+            .execute_structured(json!({"project_id": "p1", "name": "urgent-review", "color": "#ff0000"}))
+            .await
+            .unwrap();
+        assert!(output.text.contains("urgent-review"));
+        let structured = output.structured.expect("expected structuredContent");
+        assert_eq!(structured["id"], "lbl1");
+        assert_eq!(structured["name"], "urgent-review");
+    }
+
+    #[tokio::test]
+    async fn test_plane_add_label_merges_with_existing_labels() {
+        let server = MockServer::start();
+        mock_projects(&server, "p1");
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/workspaces/testws/projects/p1/issues/i1/");
+            then.status(200).json_body(json!({
+                "id": "i1", "name": "Issue One", "project": "p1", "workspace": "testws",
+                "label_ids": ["existing-label"]
+            }));
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::PATCH).path("/api/v1/workspaces/testws/projects/p1/issues/i1/");
+            then.status(200).json_body(json!({
+                "id": "i1", "name": "Issue One", "project": "p1", "workspace": "testws",
+                "label_ids": ["existing-label", "new-label"]
+            }));
+        });
+        let client = mock_client(&server);
+        let tool = PlaneAddLabel { client };
+        let result = tool
+            .execute(json!({"project_id": "p1", "issue_id": "i1", "label_id": "new-label"}))
+            .await
+            .unwrap();
+        assert!(result.contains("new-label"));
+        assert!(result.contains("2 label"));
     }
 
     #[test]

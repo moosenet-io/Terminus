@@ -387,20 +387,27 @@ async fn handle_mcp(
                 None
             };
 
-            let (response, success, detail) = match state.registry.call(name, arguments.clone()).await
+            let (response, success, detail) = match state
+                .registry
+                .call_structured(name, arguments.clone())
+                .await
             {
-                Some(Ok(text)) => (
-                    sse_response(
-                        id,
-                        Ok(json!({
-                            "content": [{"type": "text", "text": text}],
-                            "isError": false
-                        })),
-                        "",
-                    ),
-                    true,
-                    None,
-                ),
+                Some(Ok(output)) => {
+                    // EGJS-01: additive `structuredContent` alongside the
+                    // existing `content` text field -- only present when the
+                    // dispatched tool overrode `RustTool::execute_structured`
+                    // (see `crate::tool::ToolOutput`). Text-only tools (the
+                    // vast majority, unmodified) produce byte-identical
+                    // results to the pre-EGJS-01 `registry.call` path.
+                    let mut result = json!({
+                        "content": [{"type": "text", "text": output.text}],
+                        "isError": false
+                    });
+                    if let Some(structured) = output.structured {
+                        result["structuredContent"] = structured;
+                    }
+                    (sse_response(id, Ok(result), ""), true, None)
+                }
                 Some(Err(e)) => {
                     let msg = e.to_string();
                     (
@@ -663,6 +670,84 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("does_not_exist"));
+    }
+
+    // ── EGJS-01: structuredContent ──────────────────────────────────────────
+
+    struct StructuredEchoTool;
+
+    #[async_trait]
+    impl RustTool for StructuredEchoTool {
+        fn name(&self) -> &str {
+            "structured_echo"
+        }
+        fn description(&self) -> &str {
+            "Echoes structured JSON alongside a text summary"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: Value) -> Result<String, ToolError> {
+            Ok("id: 7, name: widget".to_string())
+        }
+        async fn execute_structured(
+            &self,
+            _args: Value,
+        ) -> Result<crate::tool::ToolOutput, ToolError> {
+            Ok(crate::tool::ToolOutput::with_structured(
+                "id: 7, name: widget",
+                json!({"id": 7, "name": "widget"}),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_includes_structured_content_when_tool_provides_it() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(StructuredEchoTool)).unwrap();
+        let state = Arc::new(McpServerState {
+            registry,
+            server_name: "terminus-personal-test".to_string(),
+            server_version: "0.0.0-test".to_string(),
+            auth_token: None,
+            personal_federation: None,
+            inference_proxy: None,
+            gateway: None,
+        });
+        let router = build_router(state);
+        let (status, body, _) = post_mcp(
+            router,
+            json!({
+                "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                "params": {"name": "structured_echo", "arguments": {}}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["isError"], false);
+        assert_eq!(body["result"]["content"][0]["text"], "id: 7, name: widget");
+        assert_eq!(body["result"]["structuredContent"]["id"], 7);
+        assert_eq!(body["result"]["structuredContent"]["name"], "widget");
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_omits_structured_content_for_text_only_tool() {
+        // EchoHealthTool doesn't override execute_structured -- the default
+        // impl returns structured: None, so the wire result must have NO
+        // structuredContent key at all (proves existing text-only tools are
+        // byte-for-byte unaffected by EGJS-01).
+        let router = build_router(test_state());
+        let (status, body, _) = post_mcp(
+            router,
+            json!({
+                "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                "params": {"name": "health", "arguments": {}}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["content"][0]["text"], "ok");
+        assert!(body["result"].get("structuredContent").is_none());
     }
 
     struct AlwaysFailTool;
