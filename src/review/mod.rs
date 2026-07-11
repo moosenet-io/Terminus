@@ -39,6 +39,9 @@ pub(crate) mod dispatch;
 mod kg_context;
 mod prompt;
 
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
@@ -52,6 +55,83 @@ pub use prompt::{build_docs_prompt, build_prompt, parse_verdict, Role, Structure
 
 const ALLOWED_PROVIDERS: &[&str] = &["opus", "codex", "agy", "nemotron", "qwen_coder"];
 const MAX_PROVIDERS: usize = 5;
+
+/// KGREV-02: process-wide set of `project_id`s with an in-flight KG rebuild.
+/// A re-review of the SAME project short-circuits (see `execute()`'s top-of-
+/// function lock check) while its entry is present; a different project is
+/// never blocked by another's rebuild. Pattern mirrors
+/// `src/sysversion/mod.rs`'s `OnceLock<Mutex<..>>` process-wide cache.
+static IN_FLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn in_flight() -> &'static Mutex<HashSet<String>> {
+    IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// RAII guard that removes `project_id` from [`in_flight()`] when dropped, on
+/// every path (normal return, early `?`, or panic-unwind) -- this is what
+/// guarantees the lock never deadlocks a project.
+struct InFlightGuard(String);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut set = in_flight().lock().unwrap_or_else(|e| e.into_inner());
+        set.remove(&self.0);
+    }
+}
+
+/// KGREV-02 post-aggregate hook: on a successful, complete review pass with
+/// both `project_id` and `repo_path` present in `context`, incrementally
+/// rebuild that project's Atlas graph for the changed files, holding the
+/// per-project lock ([`in_flight()`]) for the duration so a concurrent
+/// re-review of the same project short-circuits rather than referencing a
+/// mid-rebuild graph. Always returns a `kg_rebuild` value to merge into the
+/// tool result -- never propagates a rebuild error (the review already
+/// passed; a rebuild failure is reported, not fatal).
+async fn maybe_rebuild(aggregate_verdict: &str, complete: bool, context: &Value) -> Value {
+    if aggregate_verdict != "APPROVE" || !complete {
+        return json!({"ran": false, "reason": "review did not pass"});
+    }
+    let Some(project_id) = context.get("project_id").and_then(|v| v.as_str()).map(|s| s.to_string()) else {
+        return json!({"ran": false, "reason": "no project_id"});
+    };
+    let Some(repo_path) = context.get("repo_path").and_then(|v| v.as_str()).map(|s| s.to_string()) else {
+        return json!({"ran": false, "reason": "no repo_path"});
+    };
+
+    // Insert BEFORE constructing the guard, then build the guard -- so the
+    // guard's Drop always has a corresponding entry to remove.
+    in_flight().lock().unwrap_or_else(|e| e.into_inner()).insert(project_id.clone());
+    let _guard = InFlightGuard(project_id.clone());
+
+    let changed_files = kg_context::derive_changed_files(context);
+    let rebuild_args = json!({
+        "project_id": project_id,
+        "repo_path": repo_path,
+        "incremental": true,
+        "changed_files": changed_files,
+    });
+
+    match crate::scribe::graph::build::ScribeKgBuild.execute_structured(rebuild_args).await {
+        Ok(out) => {
+            let mut result = json!({"ran": true, "ok": true});
+            if let Some(structured) = out.structured {
+                if let Some(map) = result.as_object_mut() {
+                    for key in ["nodes", "edges", "clusters", "mode"] {
+                        if let Some(v) = structured.get(key) {
+                            map.insert(key.to_string(), v.clone());
+                        }
+                    }
+                }
+            }
+            result
+        }
+        Err(e) => {
+            tracing::warn!("KGREV-02: incremental KG rebuild failed for '{project_id}': {e}");
+            json!({"ran": true, "ok": false, "error": e.to_string()})
+        }
+    }
+    // `_guard` drops here, releasing the lock on every path above.
+}
 
 pub struct ReviewRun;
 
@@ -208,6 +288,25 @@ than failing the whole call."
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
         let (structure, providers, criteria, mut context) = parse_input(&args)?;
+
+        // KGREV-02: a project with an in-flight incremental KG rebuild (from
+        // a just-approved prior review) short-circuits here -- a re-review
+        // must never reference a mid-rebuild graph. Dispatches no providers.
+        if let Some(project_id) = context.get("project_id").and_then(|v| v.as_str()) {
+            let locked = in_flight().lock().unwrap_or_else(|e| e.into_inner()).contains(project_id);
+            if locked {
+                return Ok(json!({
+                    "structure": args["structure"],
+                    "providers": [],
+                    "aggregate_verdict": "UNKNOWN",
+                    "complete": false,
+                    "locked": true,
+                    "reason": format!("KG rebuild in progress for {project_id}; retry when ready"),
+                })
+                .to_string());
+            }
+        }
+
         // KGREV-01: best-effort, backward-compatible KG grounding -- a no-op
         // unless `context.project_id` is present AND a matching graph exists.
         kg_context::inject(&mut context);
@@ -262,11 +361,17 @@ than failing the whole call."
 
         let (aggregate_verdict, complete) = aggregate(structure, &results);
 
+        // KGREV-02: on a successful, complete pass, incrementally rebuild the
+        // project's KG (best-effort, never fails the review); see
+        // `maybe_rebuild` for the lock semantics.
+        let kg_rebuild = maybe_rebuild(&aggregate_verdict, complete, &context).await;
+
         Ok(json!({
             "structure": args["structure"],
             "providers": results,
             "aggregate_verdict": aggregate_verdict,
             "complete": complete,
+            "kg_rebuild": kg_rebuild,
         })
         .to_string())
     }
@@ -354,5 +459,121 @@ mod tests {
         for p in parsed["providers"].as_array().unwrap() {
             assert!(p["error"].is_string(), "expected a degrade reason, got {p}");
         }
+    }
+
+    // ── KGREV-02: rebuild-on-pass hook + per-project re-review lock ────────
+
+    fn clear_in_flight(project_id: &str) {
+        in_flight().lock().unwrap_or_else(|e| e.into_inner()).remove(project_id);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn locked_project_short_circuits() {
+        let project_id = "KGREV02-LOCKED";
+        in_flight().lock().unwrap_or_else(|e| e.into_inner()).insert(project_id.to_string());
+
+        let args = json!({
+            "structure": "single",
+            "providers": ["opus"],
+            "criteria": "x",
+            "context": {"project_id": project_id}
+        });
+        let out = tool().execute(args).await.unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+
+        clear_in_flight(project_id);
+
+        assert_eq!(parsed["locked"], true, "{parsed}");
+        assert_eq!(parsed["providers"].as_array().unwrap().len(), 0, "{parsed}");
+        assert_eq!(parsed["aggregate_verdict"], "UNKNOWN", "{parsed}");
+        assert_eq!(parsed["complete"], false, "{parsed}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn approve_triggers_rebuild_and_releases_lock() {
+        let store_dir = std::env::temp_dir().join(format!("kgrev02-store-{}", std::process::id()));
+        let repo_dir = std::env::temp_dir().join(format!("kgrev02-repo-{}", std::process::id()));
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::write(repo_dir.join("lib.rs"), "pub fn hello() {}\n").unwrap();
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+        std::env::set_var("SCRIBE_ALLOWED_REPO_ROOTS", repo_dir.to_string_lossy().to_string());
+
+        let project_id = "KGREV02-APPROVE";
+        let context = json!({
+            "project_id": project_id,
+            "repo_path": repo_dir.to_string_lossy().to_string(),
+        });
+        let kg_rebuild = maybe_rebuild("APPROVE", true, &context).await;
+
+        assert_eq!(kg_rebuild["ran"], true, "{kg_rebuild}");
+        assert_eq!(kg_rebuild["ok"], true, "{kg_rebuild}");
+        assert!(
+            in_flight().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "lock must be released after rebuild"
+        );
+
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
+        std::env::remove_var("SCRIBE_ALLOWED_REPO_ROOTS");
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let _ = std::fs::remove_dir_all(&repo_dir);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rebuild_error_does_not_fail_review() {
+        let store_dir = std::env::temp_dir().join(format!("kgrev02-errstore-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+        // Empty allowed roots -> any repo_path is default-denied.
+        std::env::set_var("SCRIBE_ALLOWED_REPO_ROOTS", "");
+
+        let project_id = "KGREV02-ERROR";
+        let context = json!({
+            "project_id": project_id,
+            "repo_path": "/nonexistent/bogus/repo/path",
+        });
+        let kg_rebuild = maybe_rebuild("APPROVE", true, &context).await;
+
+        assert_eq!(kg_rebuild["ran"], true, "{kg_rebuild}");
+        assert_eq!(kg_rebuild["ok"], false, "{kg_rebuild}");
+        assert!(kg_rebuild["error"].is_string(), "{kg_rebuild}");
+        assert!(
+            in_flight().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "lock must be released even on rebuild error"
+        );
+
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
+        std::env::remove_var("SCRIBE_ALLOWED_REPO_ROOTS");
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn no_project_id_no_lock_no_rebuild() {
+        let context = json!({"diff": "+ fn x() {}"});
+        let kg_rebuild = maybe_rebuild("APPROVE", true, &context).await;
+        assert_eq!(kg_rebuild["ran"], false, "{kg_rebuild}");
+        assert!(
+            in_flight().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "no lock should ever be taken without a project_id"
+        );
+
+        // Backward compatible: full execute() path with no project_id still
+        // dispatches providers normally (degrading without daemon/OpenRouter
+        // config) rather than short-circuiting.
+        std::env::remove_var("REVIEW_DAEMON_TOKEN");
+        std::env::remove_var("OPENROUTER_API_KEY");
+        let args = json!({
+            "structure": "single",
+            "providers": ["opus"],
+            "criteria": "x",
+            "context": {"diff": "+ fn x() {}"}
+        });
+        let out = tool().execute(args).await.unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["locked"], Value::Null, "{parsed}");
+        assert_eq!(parsed["providers"].as_array().unwrap().len(), 1, "{parsed}");
+        assert_eq!(parsed["kg_rebuild"]["ran"], false, "{parsed}");
     }
 }
