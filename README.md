@@ -107,6 +107,40 @@ environment at startup, plain env read afterward IS the secret read"
 convention the rest of the crate uses (see `crate::pki`). Registry loading,
 validation, and inspection perform zero secret-store reads.
 
+### Catalog merge, namespacing, and routing
+
+`tools/list` on `/mcp` merges the local core catalog with every currently
+healthy mesh upstream's tools into one list (`crate::mesh::merge`). Local
+core tools (and the pre-existing single personal-registry federation) are
+advertised **unprefixed**, exactly as before the mesh existed. Every tool
+sourced from a mesh upstream is advertised as:
+
+```
+<namespace>__<tool>
+```
+
+using that upstream's registered `namespace` (see the table above) as the
+prefix, separated by a literal double underscore (`__`). This means two
+upstreams can each export a tool with the same bare name (e.g. both export
+`echo`) without colliding on the merged catalog — they show up as
+`nsa__echo` and `nsb__echo`, each with an unambiguous, explicit source. Only
+the FIRST `__` in a name is treated as the namespace boundary, so an
+upstream tool whose own bare name happens to contain `__` still round-trips
+correctly (`namespaced("ns", "foo__bar") == "ns__foo__bar"`, which splits
+back to `("ns", "foo__bar")`).
+
+`tools/call` routes on this same convention: a namespaced name has its
+`<namespace>__` prefix stripped and is dispatched to the owning upstream; any
+other name (including a `__`-shaped name whose prefix isn't a currently
+known mesh namespace) dispatches locally, unchanged from pre-mesh behavior.
+If a namespaced call's owning upstream is currently unhealthy or was
+excluded from the pool entirely (e.g. a missing credential at startup), the
+call returns a clean tool-error ("mesh upstream \"<namespace>\" is currently
+unavailable") rather than a panic, a 500, or a silent fallback to local
+dispatch. When the mesh registry/pool is empty or disabled
+(`TERMINUS_MESH_ENABLED` unset), this is all a no-op: `tools/list`/
+`tools/call` behave exactly as they did before the mesh existed.
+
 ## Quickstart
 
 ```sh

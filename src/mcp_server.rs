@@ -61,6 +61,7 @@ use crate::inference_proxy::{
     InferenceProxyClient, AGENT_EXECUTE_PATH, CHAT_COMPLETIONS_PATH, CODING_SELECT_PATH,
     INFER_PATH,
 };
+use crate::mesh::{CallRoute, MergedCatalog, UpstreamPool};
 use crate::pki::mtls::ClientIdentity;
 use crate::registry::ToolRegistry;
 
@@ -97,6 +98,14 @@ pub struct McpServerState {
     /// request that reaches the router dispatches unconditionally.
     /// `terminus_primary` (TGW-04) sets `Some(GatewayFramework::from_env())`.
     pub gateway: Option<GatewayFramework>,
+    /// MESH-03: when set, `tools/list` merges in every currently-healthy
+    /// mesh upstream's tools (namespaced `<namespace>__<tool>`, see
+    /// `crate::mesh::merge`), and `tools/call` on a namespaced name is
+    /// routed to that upstream instead of local/personal-federated
+    /// dispatch. `None` (the default) is byte-for-byte the pre-MESH-03
+    /// behavior — purely additive, matching `personal_federation`'s own
+    /// `Option`-gated convention above.
+    pub mesh_pool: Option<Arc<UpstreamPool>>,
 }
 
 pub fn build_router(state: Arc<McpServerState>) -> Router {
@@ -349,6 +358,16 @@ async fn handle_mcp(
                     })
                 }));
             }
+            // MESH-03: merge in every currently-healthy mesh upstream's
+            // tools, namespaced `<namespace>__<tool>` -- see
+            // `crate::mesh::merge::MergedCatalog`. `state.mesh_pool` is
+            // `None` unless this process is explicitly configured to
+            // federate a mesh, so this is a no-op for every deployment that
+            // predates MESH-03 (byte-for-byte the tools built above).
+            if let Some(pool) = &state.mesh_pool {
+                let merged = MergedCatalog::build(tools, pool).await;
+                tools = merged.tools;
+            }
             sse_response(id, Ok(json!({"tools": tools})), "")
         }
         "tools/call" => {
@@ -387,7 +406,73 @@ async fn handle_mcp(
                 None
             };
 
-            let (response, success, detail) = match state
+            // MESH-03: a namespaced name (`<namespace>__<tool>`) routes to
+            // its owning mesh upstream (or a clean "unavailable" tool-error
+            // if that upstream is down) BEFORE core/personal-federated
+            // dispatch is even attempted -- a namespaced name is never
+            // coincidentally a local or personal-federated tool. `None`
+            // (`state.mesh_pool` unset, e.g. every pre-MESH-03 deployment)
+            // and `Some(CallRoute::Local)` (a plain name, or a `__`-shaped
+            // name whose prefix isn't a known mesh namespace) both fall
+            // straight through to the existing core/personal-federated
+            // dispatch below, byte-for-byte unchanged.
+            let mesh_route = state.mesh_pool.as_ref().map(|pool| crate::mesh::resolve_call_route(name, pool));
+
+            let (response, success, detail) = match mesh_route {
+                Some(CallRoute::Upstream { client, bare_name }) => {
+                    match client.call_tool(&bare_name, arguments.clone()).await {
+                        Ok(outcome) => (
+                            sse_response(
+                                id,
+                                Ok(json!({
+                                    "content": [{"type": "text", "text": outcome.text}],
+                                    "isError": outcome.is_error
+                                })),
+                                "",
+                            ),
+                            !outcome.is_error,
+                            None,
+                        ),
+                        Err(mesh_err) => {
+                            warn!(
+                                "mesh: error calling \"{bare_name}\" on upstream \"{}\": {mesh_err}",
+                                client.namespace()
+                            );
+                            let msg = format!(
+                                "mesh upstream \"{}\" call failed: {mesh_err}",
+                                client.namespace()
+                            );
+                            (
+                                sse_response(
+                                    id,
+                                    Ok(json!({
+                                        "content": [{"type": "text", "text": msg.clone()}],
+                                        "isError": true
+                                    })),
+                                    "",
+                                ),
+                                false,
+                                Some(msg),
+                            )
+                        }
+                    }
+                }
+                Some(CallRoute::Unavailable { namespace }) => {
+                    let msg = crate::mesh::upstream_unavailable_text(&namespace);
+                    (
+                        sse_response(
+                            id,
+                            Ok(json!({
+                                "content": [{"type": "text", "text": msg.clone()}],
+                                "isError": true
+                            })),
+                            "",
+                        ),
+                        false,
+                        Some(msg),
+                    )
+                }
+                Some(CallRoute::Local) | None => match state
                 .registry
                 .call_structured(name, arguments.clone())
                 .await
@@ -486,6 +571,7 @@ async fn handle_mcp(
                             Some(msg),
                         )
                     }
+                },
                 },
             };
 
@@ -669,6 +755,7 @@ mod tests {
             personal_federation: None,
             inference_proxy: None,
             gateway: None,
+            mesh_pool: None,
         })
     }
 
@@ -809,6 +896,7 @@ mod tests {
             personal_federation: None,
             inference_proxy: None,
             gateway: None,
+            mesh_pool: None,
         });
         let router = build_router(state);
         let (status, body, _) = post_mcp(
@@ -876,6 +964,7 @@ mod tests {
             personal_federation: None,
             inference_proxy: None,
             gateway: None,
+            mesh_pool: None,
         });
         let router = build_router(state);
         let (status, body, _) = post_mcp(
@@ -922,6 +1011,7 @@ mod tests {
             personal_federation: None,
             inference_proxy: None,
             gateway: None,
+            mesh_pool: None,
         });
         let router = build_router(state);
         let req = Request::builder()
@@ -948,6 +1038,7 @@ mod tests {
             personal_federation: None,
             inference_proxy: None,
             gateway: None,
+            mesh_pool: None,
         });
         let router = build_router(state);
         let req = Request::builder()
