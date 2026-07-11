@@ -28,6 +28,17 @@ does the authenticated network hop on your behalf.
   operator to provision one for the identity name you want to enroll as
   (lowercase alphanumerics and hyphens, 2–63 characters) rather than sharing
   an existing identity's secret.
+
+  > **Operator note:** the CORE tool `mesh_onboard_client`
+  > (`crate::mesh::client_onboarding`, MESH-12 — see the
+  > [top-level README](../../README.md#onboarding-a-new-remote-client-mesh_onboard_client))
+  > is the recommended way to bring a new client identity onto the mesh: it
+  > mints the client's cert (or records a tailnet-login mapping) and seeds a
+  > **least-privilege** `TERMINUS_GATEWAY_ALLOWLIST_JSON` entry for it in one
+  > step, rather than an operator hand-authoring an allowlist grant (which
+  > risks an accidental `"*"`/over-broad grant for a brand-new, unvetted
+  > client). It emits the config snippets to merge in and reload/restart —
+  > it does not replace the `daemon.env` steps below on the *client* side.
 - **Rust toolchain** (`cargo`, stable channel) if building from source — see
   the [top-level README](../../README.md) for the toolchain version this
   repository targets.

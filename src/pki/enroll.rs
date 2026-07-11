@@ -185,7 +185,7 @@ pub enum EnrollError {
 /// claim, and (per the spec's edge cases) must not allow unbounded namespace
 /// growth or SAN-injection-shaped input. DNS-label-like: lowercase
 /// alphanumerics and hyphens, 2-63 chars, must not start/end with a hyphen.
-fn is_valid_identity(identity: &str) -> bool {
+pub(crate) fn is_valid_identity(identity: &str) -> bool {
     let len_ok = (2..=63).contains(&identity.len());
     let starts_ends_alnum = identity
         .chars()
@@ -320,7 +320,19 @@ pub fn handle_enrollment(
 
 /// Generate a fresh keypair and sign a short-lived leaf cert for `identity`,
 /// chained to `ca`. Returns `(cert_pem, key_pem, serial_hex)`.
-fn issue_leaf_cert(
+///
+/// `pub(crate)`: besides [`handle_enrollment`] (the shared-secret-gated HTTP
+/// path), [`crate::mesh::client_onboarding`] (MESH-12) also calls this
+/// directly to mint a client cert as part of the `mesh_onboard_client`
+/// workflow — that call site is reached only through terminus-rs's own
+/// already-authenticated tool dispatch (the caller must already be an
+/// allowlisted principal to invoke a CORE tool at all), not a fresh
+/// unauthenticated HTTP request, so it deliberately does not re-derive or
+/// re-check `TERMINUS_ENROLLMENT_SHARED_SECRET_<IDENTITY>` — that bootstrap
+/// credential exists to gate the *pre-auth* `/enroll` HTTP route
+/// specifically (see this module's doc), not every possible cert-issuance
+/// call site in the crate.
+pub(crate) fn issue_leaf_cert(
     ca: &CertificateAuthority,
     identity: &str,
 ) -> Result<(String, String, String), EnrollError> {

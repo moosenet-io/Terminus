@@ -139,6 +139,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::litellm::register(registry);
     crate::media::register(registry); // S94/MEDIA-01
     crate::mesh::onboarding::register(registry); // MESH-11: mesh_onboard_upstream
+    crate::mesh::client_onboarding::register(registry); // MESH-12: mesh_onboard_client
     crate::<container-mgr>::register(registry); // pii-test-fixture
     crate::prometheus::register(registry);
     crate::hearth::register(registry);
