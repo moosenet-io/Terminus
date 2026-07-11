@@ -66,6 +66,7 @@ pub mod client;
 pub mod identity;
 pub mod merge;
 pub mod onboarding;
+pub mod principal;
 pub mod registry;
 
 pub use client::{ToolMeta, UpstreamCallResult, UpstreamClient, UpstreamClientError, UpstreamPool};
@@ -78,10 +79,19 @@ pub use onboarding::{
     onboard_upstream, MeshOnboardUpstream, OnboardingError, OnboardingRequest, OnboardingReport,
     TrustStatus,
 };
+pub use principal::{AuthError, Principal, PrincipalMap, PrincipalResolver, PrincipalSource};
 pub use registry::{
     MeshConfigError, ResolvedSecret, UpstreamRegistry, UpstreamServer, UpstreamTransport,
 };
 
+/// MESH-06 — [`principal::Principal`]/[`principal::PrincipalResolver`]
+/// reconcile [`identity::TailnetIdentity`] and
+/// `crate::pki::mtls::ClientIdentity` (mTLS cert CN) with the named PAT
+/// identity model (`PLANE_PAT_<NAME>`/`GITEA_PAT_<NAME>`/`GITHUB_PAT_<NAME>`,
+/// see `crate::plane`) into one canonical identity. Declared unconditionally
+/// (not `#[cfg(feature = "tsnet")]`) for the same reason `identity` is — see
+/// that module's doc — even though it depends on [`identity::TailnetIdentity`],
+/// which is itself already ungated.
 /// MESH-05 — [`identity::TailnetIdentity`] is declared in its own,
 /// deliberately UNGATED module (`pub mod identity` above), not inside
 /// `tailnet` below, so it's usable on DEFAULT features (no `tsnet` compile
