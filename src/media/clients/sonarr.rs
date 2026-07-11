@@ -132,6 +132,21 @@ mod tests {
 
     #[test]
     #[serial]
+    fn from_env_missing_key_is_not_configured() {
+        let url = std::env::var("SONARR_URL").ok();
+        let key = std::env::var("SONARR_API_KEY").ok();
+        std::env::set_var("SONARR_URL", "http://sonarr.test:8989/");
+        std::env::remove_var("SONARR_API_KEY");
+
+        let result = SonarrClient::from_env();
+        assert!(matches!(result, Err(ToolError::NotConfigured(_))));
+
+        if let Some(u) = url { std::env::set_var("SONARR_URL", u); } else { std::env::remove_var("SONARR_URL"); }
+        if let Some(k) = key { std::env::set_var("SONARR_API_KEY", k); }
+    }
+
+    #[test]
+    #[serial]
     fn from_env_builds_when_both_set() {
         let url = std::env::var("SONARR_URL").ok();
         let key = std::env::var("SONARR_API_KEY").ok();
@@ -157,6 +172,20 @@ mod tests {
         let result = client.lookup_series("foundation").await.unwrap();
         mock.assert();
         assert_eq!(result[0]["title"], "Foundation");
+    }
+
+    #[tokio::test]
+    async fn library_parses_mocked_200() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/api/v3/series");
+            then.status(200).json_body(json!([{ "title": "Severance", "monitored": true }]));
+        });
+
+        let client = test_client(&server.base_url());
+        let result = client.library().await.unwrap();
+        mock.assert();
+        assert_eq!(result[0]["title"], "Severance");
     }
 
     #[tokio::test]
