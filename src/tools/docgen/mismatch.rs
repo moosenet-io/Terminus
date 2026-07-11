@@ -37,6 +37,7 @@
 //!   - `crate::scribe::html_escape` -- the same HTML-escaping of
 //!     quoted/interpolated code and doc text before it's embedded in a
 //!     Plane `description_html` body, reused verbatim.
+//!
 //! What's new here (not shared with SCRB-04, because SCRB-04 has no
 //! equivalent): the tiered-sensitivity candidate gate, the panel-dispatch
 //! authority-question prompt/parse, and the panel-consensus aggregation.
