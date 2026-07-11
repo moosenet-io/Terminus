@@ -44,7 +44,7 @@ use crate::registry::ToolRegistry;
 /// never carried in this struct — it's resolved at bootstrap time from
 /// `crate::pki::ca()` / `crate::pki::mtls`, per those modules' own
 /// load-or-generate precedence.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GatewayServerConfig {
     pub server_name: String,
     pub server_version: String,
@@ -80,6 +80,39 @@ pub struct GatewayServerConfig {
     /// spec's deployment target); `terminus_primary` (TGW-04) passes
     /// `Some(crate::gateway_framework::GatewayFramework::from_env())`.
     pub gateway: Option<crate::gateway_framework::GatewayFramework>,
+    /// MESH-15: when `Some`, this pool is installed as
+    /// `McpServerState::mesh_pool` so `tools/list`/`tools/call` federate to
+    /// its enabled/healthy upstreams (MESH-03/08). `terminus_personal`
+    /// passes `None` (mesh federation is a gateway-only concern);
+    /// `terminus_primary` (MESH-15) passes
+    /// `Some(Arc::new(UpstreamPool::from_registry(&registry)))`, built from
+    /// `TERMINUS_MESH_ENABLED`/`TERMINUS_MESH_UPSTREAMS_JSON` at startup
+    /// when the feature is enabled -- `None` (this field's default posture)
+    /// when it isn't, byte-for-byte the pre-MESH-15 behavior.
+    pub mesh_pool: Option<Arc<crate::mesh::UpstreamPool>>,
+}
+
+/// Manual `Debug` (rather than `#[derive(Debug)]` on the struct): every
+/// other field here is `Debug` for free, but [`crate::mesh::UpstreamPool`]
+/// deliberately isn't (it holds live client state, not a value meant to be
+/// dumped) -- so `mesh_pool` is rendered as presence + upstream count only,
+/// same "don't print internals, print a safe summary" posture the mesh
+/// module uses for anything credential-adjacent elsewhere.
+impl std::fmt::Debug for GatewayServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayServerConfig")
+            .field("server_name", &self.server_name)
+            .field("server_version", &self.server_version)
+            .field("auth_token", &self.auth_token.as_ref().map(|_| "<redacted>"))
+            .field("mtls_bind", &self.mtls_bind)
+            .field("mtls_port", &self.mtls_port)
+            .field("mtls_server_identity", &self.mtls_server_identity)
+            .field("personal_federation", &self.personal_federation.is_some())
+            .field("inference_proxy", &self.inference_proxy.is_some())
+            .field("gateway", &self.gateway.is_some())
+            .field("mesh_pool_upstreams", &self.mesh_pool.as_ref().map(|p| p.len()))
+            .finish()
+    }
 }
 
 /// Build the shared MCP (`/mcp`, `/healthz`) + `/enroll` router for
@@ -98,13 +131,14 @@ pub fn build_gateway_router(registry: ToolRegistry, config: &GatewayServerConfig
         personal_federation: config.personal_federation.clone(),
         inference_proxy: config.inference_proxy.clone(),
         gateway: config.gateway.clone(),
-        // MESH-03: mesh federation is not yet wired into
-        // `GatewayServerConfig` (no binary provisions a
-        // `crate::mesh::UpstreamPool` today) -- `None` here is the same
-        // additive "feature not configured" posture `personal_federation`
-        // etc. use elsewhere, and preserves `tools/list`/`tools/call`
-        // byte-for-byte until a binary is wired to pass one in.
-        mesh_pool: None,
+        // MESH-15: pass through whatever the caller provisioned --
+        // `terminus_primary`'s `main()` builds a real pool from env when
+        // `TERMINUS_MESH_ENABLED` is set; every other caller (incl.
+        // `terminus_personal`, and any config that leaves this `None`) keeps
+        // the same additive "feature not configured" posture
+        // `personal_federation` etc. use, preserving `tools/list`/
+        // `tools/call` byte-for-byte when mesh isn't configured.
+        mesh_pool: config.mesh_pool.clone(),
         // MESH-07: build the resolver from `TERMINUS_MESH_PRINCIPAL_MAP_JSON`
         // once at process construction. Malformed JSON is a loud, logged
         // config error (not a startup panic -- a router-building library
@@ -221,6 +255,7 @@ mod tests {
             personal_federation: None,
             inference_proxy: None,
             gateway: None,
+            mesh_pool: None,
         }
     }
 

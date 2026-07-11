@@ -124,6 +124,14 @@
 use terminus_rs::pki::server::{build_gateway_router, spawn_mtls_listener, GatewayServerConfig};
 use terminus_rs::registry::{register_all, ToolRegistry};
 
+/// MESH-15: default period between background `UpstreamPool::health_check_all`
+/// sweeps when `TERMINUS_MESH_HEALTH_INTERVAL_SECS` is unset/invalid. 30s
+/// keeps health transitions reasonably fresh without hammering upstreams --
+/// each upstream also has its own per-failure backoff inside
+/// `UpstreamPool` (see `crate::mesh::client`'s `BASE_BACKOFF_SECS`/
+/// `MAX_BACKOFF_SECS`), so this interval is just the outer sweep cadence.
+const DEFAULT_MESH_HEALTH_INTERVAL_SECS: u64 = 30;
+
 #[tokio::main]
 async fn main() {
     terminus_rs::intake::init_tracing();
@@ -182,6 +190,39 @@ async fn main() {
     // audit log).
     let gateway = Some(terminus_rs::gateway_framework::GatewayFramework::from_env());
 
+    // MESH-15: activate the mesh feature -- until this item, `mesh_pool`
+    // was left `None` in every binary's startup (see MESH-03's comment this
+    // replaces in `terminus_rs::pki::server::build_gateway_router`), so
+    // `TERMINUS_MESH_ENABLED` had no runtime effect anywhere. This is the
+    // one gate: `UpstreamRegistry::from_env()` returns an empty, dormant
+    // registry whenever `TERMINUS_MESH_ENABLED` is unset/false (or
+    // `TERMINUS_MESH_UPSTREAMS_JSON` is unset/blank) -- in that case
+    // `mesh_pool` stays `None` and this binary's behavior is byte-for-byte
+    // identical to before this item. A malformed
+    // `TERMINUS_MESH_UPSTREAMS_JSON` while enabled is a loud, logged
+    // config error (never a startup panic -- a misconfigured mesh must not
+    // take down core-tool serving), degrading to the same dormant `None`
+    // posture.
+    let mesh_registry = match terminus_rs::mesh::UpstreamRegistry::from_env() {
+        Ok(registry) => registry,
+        Err(e) => {
+            tracing::error!(
+                "terminus_primary: TERMINUS_MESH_UPSTREAMS_JSON is invalid ({e}) -- mesh federation disabled until fixed"
+            );
+            terminus_rs::mesh::UpstreamRegistry::empty()
+        }
+    };
+    let mesh_pool = if mesh_registry.enabled_upstreams().count() > 0 {
+        Some(std::sync::Arc::new(terminus_rs::mesh::UpstreamPool::from_registry(&mesh_registry)))
+    } else {
+        None
+    };
+    tracing::info!(
+        "terminus_primary: mesh federation {} ({} enabled upstream(s))",
+        if mesh_pool.is_some() { "enabled" } else { "disabled" },
+        mesh_registry.enabled_upstreams().count()
+    );
+
     let gateway_config = GatewayServerConfig {
         server_name: "terminus-primary".to_string(),
         server_version: terminus_rs::VERSION.to_string(),
@@ -192,6 +233,7 @@ async fn main() {
         personal_federation,
         inference_proxy,
         gateway,
+        mesh_pool: mesh_pool.clone(),
     };
 
     // Same shared setup `terminus_personal` uses (TGW-01 extraction, see
@@ -200,6 +242,35 @@ async fn main() {
     // `TERMINUS_PRIMARY_MTLS_*`-derived config.
     let router = build_gateway_router(registry, &gateway_config);
     spawn_mtls_listener(router.clone(), &gateway_config);
+
+    // MESH-15: run one initial health probe before serving, so the first
+    // `tools/list` a caller sees doesn't optimistically advertise an
+    // upstream that's actually down (every freshly-built `PooledUpstream`
+    // starts `healthy: true` -- see `UpstreamPool::from_registry`'s doc),
+    // then keep probing periodically in the background for the life of the
+    // process. `TERMINUS_MESH_HEALTH_INTERVAL_SECS` (default
+    // `DEFAULT_MESH_HEALTH_INTERVAL_SECS`) controls the period; read once
+    // at startup via plain `std::env::var` -- this is a non-secret interval
+    // knob, not a credential.
+    if let Some(pool) = mesh_pool.clone() {
+        pool.health_check_all().await;
+        let interval_secs = std::env::var("TERMINUS_MESH_HEALTH_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_MESH_HEALTH_INTERVAL_SECS);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            // The first tick fires immediately; we already ran the initial
+            // probe above, so skip it to avoid a redundant back-to-back
+            // probe at startup.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                pool.health_check_all().await;
+            }
+        });
+    }
 
     // MESH-04: the embedded tailnet listener -- gated at COMPILE time by the
     // `tsnet` Cargo feature and at RUNTIME by `TERMINUS_MESH_TAILNET_ENABLED`
@@ -315,6 +386,7 @@ mod tests {
             personal_federation: Some(PersonalFederationClient::with_base_url(chord_base_url)),
             inference_proxy: None,
             gateway: None,
+            mesh_pool: None,
         };
         build_gateway_router(registry, &config)
     }
@@ -338,6 +410,7 @@ mod tests {
             personal_federation: Some(PersonalFederationClient::with_base_url(chord_base_url)),
             inference_proxy: None,
             gateway: Some(gateway),
+            mesh_pool: None,
         };
         build_gateway_router(registry, &config)
     }
@@ -359,6 +432,7 @@ mod tests {
             personal_federation: None,
             inference_proxy: Some(InferenceProxyClient::with_base_url(chord_base_url)),
             gateway: None,
+            mesh_pool: None,
         };
         build_gateway_router(registry, &config)
     }
@@ -382,6 +456,7 @@ mod tests {
             personal_federation: None,
             inference_proxy: Some(InferenceProxyClient::with_base_url(chord_base_url)),
             gateway: Some(gateway),
+            mesh_pool: None,
         };
         build_gateway_router(registry, &config)
     }
@@ -530,6 +605,7 @@ mod tests {
             personal_federation: None,
             inference_proxy: None,
             gateway: None,
+            mesh_pool: None,
         };
         let router = build_gateway_router(registry, &config);
         let body = post_mcp(
@@ -794,6 +870,7 @@ mod tests {
             personal_federation: None,
             inference_proxy: None,
             gateway: None,
+            mesh_pool: None,
         };
         let router = build_gateway_router(registry, &config);
         let (status, _, _) = post_json(router, "/v1/chat/completions", json!({})).await;

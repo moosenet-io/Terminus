@@ -316,6 +316,10 @@ async fn main() {
         // (this spec item's deployment target) -- terminus_personal predates
         // it and keeps its pre-existing ungated behavior.
         gateway: None,
+        // MESH-15: mesh federation is a terminus_primary-only concern (this
+        // item deliberately does not touch terminus_personal) -- always
+        // `None` here.
+        mesh_pool: None,
     };
 
     // TCLI-02: the enrollment endpoint is a fully separate, additive router
