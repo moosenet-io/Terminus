@@ -54,6 +54,39 @@ points ([`src/intake/`](../../src/intake/)):
   `intake_coder_gaps`, `intake_assistant_sweep`) call — nothing is
   duplicated, and the legacy binaries remain first-class.
 
+### The discovery brochure — a separate lifecycle stage from the fleet catalog
+
+S114 (TERM #251, DISC-01) adds a second, DELIBERATELY DISTINCT registry: the
+**brochure** (`model_discovery_candidate`, [`src/intake/discovery/`](../../src/intake/discovery/)).
+Where `model_fleet_catalog` above answers "what has been TESTED, and how did it
+score?" for models already in the fleet, the brochure answers an earlier
+question: "what's a CANDIDATE — newly available on HuggingFace, not yet
+acquired or tested?" The two tables relate ONLY via a `model_name` join; the
+brochure never gains fleet-catalog fields and vice versa. This is also
+deliberately not "catalog": Chord's `src/catalog.rs` is a third, unrelated
+thing (the MCP *tool* catalog) — see `src/intake/discovery/schema.rs`'s module
+doc for the full naming rationale.
+
+A brochure row moves through an explicit lifecycle (`CandidateStatus`):
+`discovered` → `fetching` → `cold_stored` → `marked_for_fleet` → `swept` →
+`evicted` (an evicted row may re-enter at `discovered` only, if the model
+reappears in a later HF listing); `discovered`/`fetching` can also terminate
+at `rejected` (failed the VRAM/gfx1151 fit check, never fetched). Each row also
+carries a `category` tag (`tool_router` | `writer_slm` | `assistant` | `coder`
+| `embedding` | `visual` | `voice` — which fleet category the candidate
+targets) and a `retained_profile` JSONB blob that survives eviction, so a
+pruned candidate's discovery profile is never lost even after its cold-storage
+copy is reclaimed.
+
+DISC-01 is storage-only (the table, the migration, and the
+`FleetCategory`/`CandidateStatus` Rust types with `as_str()`/`from_str()`
+round-tripping and a clean parse error for any unrecognized string — never a
+silent default). Later items build on this schema without changing it: DISC-02
+adds the read-only `model_discovery_brochure` MCP tool (mirroring
+`model_fleet_catalog`'s `json`/`markdown` filter/render pattern); DISC-03 adds
+the one write API (`upsert_candidate`/`transition_status`/`record_eviction`)
+every other discovery item uses to mutate rows.
+
 ### The unified MINT harness (two run kinds)
 
 MINT runs two sweep **families** — a **coder** sweep (code-generation cases,

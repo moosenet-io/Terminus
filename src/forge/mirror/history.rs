@@ -79,7 +79,7 @@ impl ReplayOpts {
 pub struct IdentityRule {
     #[serde(default)]
     pub match_email: Option<String>,
-    /// Bare domain, e.g. `example.com` — matches an email ending `@example.com`.
+    /// Bare domain, e.g. `example.com` — matches an email ending `@example.com`.  // pii-test-fixture
     #[serde(default)]
     pub match_email_domain: Option<String>,
     #[serde(default)]
@@ -241,32 +241,106 @@ pub fn replay_full_history(
         .map_err(|e| ToolError::Execution(format!("create work_dir {}: {e}", work_dir.display())))?;
     git_capture(work_dir, &["init", "-q", "-b", &default_branch])?;
 
-    // Exporter on the source (READ-ONLY). --reencode normalizes to UTF-8; signed
-    // tags are stripped (no gpg in the replay); a tag of a filtered object is dropped.
+    // Full backfill: export ALL refs, no import-marks (this is a fresh lineage).
+    let report = run_export_import(source, work_dir, &["--all"], false, opts)?;
+    // Record the internal HEAD we just mirrored so an incremental run knows where
+    // to resume from (GHIST-04).
+    if let Ok(head) = git_capture(source, &["rev-parse", "HEAD"]) {
+        let head = head.trim();
+        if !head.is_empty() {
+            set_mirrored_sha(work_dir, head)?;
+        }
+    }
+    Ok(report)
+}
+
+// ── GHIST-04: going-forward per-commit (incremental) replay ──────────────────
+
+/// Marks-file paths (kept under `.git/ghist/`, OUTSIDE the work-tree so they are
+/// never scanned or committed). `src-marks` records SOURCE commit → mark from
+/// `git fast-export`; `import-marks` records mark → WORK-DIR commit from
+/// `git fast-import`. Persisting both across runs is what lets a later
+/// incremental export reference already-mirrored commits by mark and append onto
+/// the existing scrubbed history instead of re-squashing it.
+struct MarksPaths {
+    src: PathBuf,
+    import: PathBuf,
+}
+
+fn marks_paths(work_dir: &Path) -> MarksPaths {
+    let d = work_dir.join(".git").join("ghist");
+    MarksPaths { src: d.join("src-marks"), import: d.join("import-marks") }
+}
+
+/// The internal sha last mirrored into `work_dir`, if any (persisted in
+/// `.git/ghist/internal-head`).
+pub fn last_mirrored_sha(work_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(work_dir.join(".git").join("ghist").join("internal-head"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn set_mirrored_sha(work_dir: &Path, sha: &str) -> Result<(), ToolError> {
+    let d = work_dir.join(".git").join("ghist");
+    std::fs::create_dir_all(&d)
+        .map_err(|e| ToolError::Execution(format!("create .git/ghist: {e}")))?;
+    std::fs::write(d.join("internal-head"), format!("{sha}\n"))
+        .map_err(|e| ToolError::Execution(format!("write internal-head: {e}")))
+}
+
+/// Shared fast-export → transform → fast-import core for both the full backfill and
+/// the incremental range. `rev_args` selects what to export (`--all`, or a
+/// `<from>..<to>` range). When `incremental` is true, both git ends read+write the
+/// persisted marks files, so exported commits reference already-mirrored parents by
+/// mark and are appended onto the existing history (a fast-forward), rather than
+/// starting a new root.
+fn run_export_import(
+    source: &Path,
+    work_dir: &Path,
+    rev_args: &[&str],
+    incremental: bool,
+    opts: &ReplayOpts,
+) -> Result<HistoryReport, ToolError> {
+    let marks = marks_paths(work_dir);
+    std::fs::create_dir_all(marks.src.parent().expect("has parent"))
+        .map_err(|e| ToolError::Execution(format!("create marks dir: {e}")))?;
+    let src_marks = marks.src.display().to_string();
+    let import_marks = marks.import.display().to_string();
+
+    // fast-export args (READ-ONLY on source): rev selector + normalization + marks.
+    let mut export_args: Vec<String> = vec!["fast-export".into()];
+    export_args.extend(rev_args.iter().map(|s| s.to_string()));
+    export_args.push("--reencode=yes".into());
+    export_args.push("--signed-tags=strip".into());
+    export_args.push("--tag-of-filtered-object=drop".into());
+    export_args.push(format!("--export-marks={src_marks}"));
+    if incremental {
+        export_args.push(format!("--import-marks={src_marks}"));
+    }
+
+    // fast-import args. --force = allow ref updates into this repo (NOT a push-force).
+    let mut import_args: Vec<String> =
+        vec!["fast-import".into(), "--quiet".into(), "--force".into()];
+    import_args.push(format!("--export-marks={import_marks}"));
+    if incremental {
+        import_args.push(format!("--import-marks={import_marks}"));
+    }
+
     let mut exporter = Command::new("git")
         .arg("-C")
         .arg(source)
         .args(HOOKS_OFF)
-        .args([
-            "fast-export",
-            "--all",
-            "--reencode=yes",
-            "--signed-tags=strip",
-            "--tag-of-filtered-object=drop",
-        ])
+        .args(&export_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| ToolError::Execution(format!("spawn git fast-export: {e}")))?;
-
-    // Importer into the work-dir. --force lets it write the refs into the fresh repo;
-    // this is fast-import's ref-update flag, NOT a dangerous push-force (it never
-    // touches a remote), so it is spawned directly rather than through `run_git`.
     let mut importer = Command::new("git")
         .arg("-C")
         .arg(work_dir)
         .args(HOOKS_OFF)
-        .args(["fast-import", "--quiet", "--force"])
+        .args(&import_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -278,7 +352,6 @@ pub fn replay_full_history(
     let import_in = importer.stdin.take().expect("piped");
     let import_err = importer.stderr.take().expect("piped");
 
-    // Drain both stderrs on threads so neither pipe can fill and deadlock the pump.
     let e_err = std::thread::spawn(move || {
         let mut s = String::new();
         let _ = BufReader::new(export_err).read_to_string(&mut s);
@@ -290,8 +363,6 @@ pub fn replay_full_history(
         s
     });
 
-    // Pump export → transform → import. The BufWriter owns import_in and closes it
-    // (EOF to fast-import) when it is dropped at the end of this call.
     let pump = transform_stream(
         BufReader::new(export_out),
         BufWriter::new(import_in),
@@ -307,8 +378,6 @@ pub fn replay_full_history(
     let e_stderr = e_err.join().unwrap_or_default();
     let i_stderr = i_err.join().unwrap_or_default();
 
-    // Surface a stream/transform error first (it usually explains a downstream import
-    // failure), then non-zero child exits.
     let report = pump?;
     if !e_status.success() {
         return Err(ToolError::Execution(format!(
@@ -323,11 +392,67 @@ pub fn replay_full_history(
         )));
     }
 
-    // Populate the work-dir's index + work-tree from the imported HEAD. The repo is
-    // freshly init'd (empty index/tree), so this only fills it in — nothing to lose.
+    // Sync the work-tree to the (new) imported HEAD.
     git_capture(work_dir, &["reset", "--hard"])?;
-
     Ok(report)
+}
+
+/// Append the internal commits in `from_sha..to_sha` onto an ALREADY-backfilled
+/// mirror `work_dir`, each scrubbed + attributed, chaining onto the existing
+/// scrubbed history via the persisted marks (a fast-forward, not a re-squash).
+/// `from_sha` must be an ancestor of `to_sha` in the source (else the internal
+/// history was rewritten — we refuse rather than silently diverge).
+pub fn replay_range(
+    source: &Path,
+    work_dir: &Path,
+    from_sha: &str,
+    to_sha: &str,
+    opts: &ReplayOpts,
+) -> Result<HistoryReport, ToolError> {
+    run_git(source, &["rev-parse", "--git-dir"])
+        .map_err(|e| ToolError::Execution(format!("source is not a git repo: {e}")))?;
+    if !marks_paths(work_dir).src.exists() {
+        return Err(ToolError::Execution(
+            "no backfill marks present — run replay_full_history before an incremental range".into(),
+        ));
+    }
+    // Ancestry guard: from must be an ancestor of to (fast-forward only).
+    let anc = Command::new("git")
+        .arg("-C")
+        .arg(source)
+        .args(HOOKS_OFF)
+        .args(["merge-base", "--is-ancestor", from_sha, to_sha])
+        .status()
+        .map_err(|e| ToolError::Execution(format!("merge-base: {e}")))?;
+    if !anc.success() {
+        return Err(ToolError::Execution(format!(
+            "internal history is not a fast-forward: {from_sha}..{to_sha} — {to_sha} does not descend from {from_sha}; refusing to diverge the mirror"
+        )));
+    }
+    // Export `--all` WITH `--import-marks`: git skips every commit already recorded
+    // in the marks (everything up to the last mirror) and emits ONLY the new ones,
+    // updating `refs/heads/*` correctly. (A `<from>..<to>` range instead emits an
+    // anonymous per-commit ref and never advances the branch — verified.) The
+    // ancestry guard above is what bounds this to a fast-forward from `from_sha`.
+    let report = run_export_import(source, work_dir, &["--all"], true, opts)?;
+    set_mirrored_sha(work_dir, to_sha)?;
+    Ok(report)
+}
+
+/// Bring `work_dir` up to `source`'s current HEAD: a full backfill on first run
+/// (no prior lineage), else an incremental append of the new commits. Returns
+/// `(is_full, report)`. A no-op (already at HEAD) returns a zero report.
+pub fn replay_incremental_or_full(
+    source: &Path,
+    work_dir: &Path,
+    opts: &ReplayOpts,
+) -> Result<(bool, HistoryReport), ToolError> {
+    let head = git_capture(source, &["rev-parse", "HEAD"])?.trim().to_string();
+    match last_mirrored_sha(work_dir) {
+        Some(last) if last == head => Ok((false, HistoryReport::default())), // nothing new
+        Some(last) => Ok((false, replay_range(source, work_dir, &last, &head, opts)?)),
+        None => Ok((true, replay_full_history(source, work_dir, opts)?)),
+    }
 }
 
 // ── GHIST-02: full-history PII gate ──────────────────────────────────────────
@@ -825,20 +950,20 @@ mod tests {
         let map = IdentityMap {
             rules: vec![
                 rule(Some("<email>"), None, None, "PubMe", "<email>"), // pii-test-fixture
-                rule(None, Some("agents.example"), None, "MoosenetBot", "<email>"),
-                rule(None, None, Some("Legacy Human"), "PubMe", "<email>"),
+                rule(None, Some("agents.example"), None, "MoosenetBot", "<email>"),  // pii-test-fixture
+                rule(None, None, Some("Legacy Human"), "PubMe", "<email>"),  // pii-test-fixture
             ],
             default_name: "fallback-bot".into(),
-            default_email: "<email>".into(),
+            default_email: "<email>".into(),  // pii-test-fixture
         };
         // exact email (case-insensitive)
         assert_eq!(map.remap("Whatever", "<email>"), ("PubMe".into(), "<email>".into())); // pii-test-fixture
         // domain suffix
-        assert_eq!(map.remap("Agent", "<email>"), ("MoosenetBot".into(), "<email>".into()));
+        assert_eq!(map.remap("Agent", "<email>"), ("MoosenetBot".into(), "<email>".into()));  // pii-test-fixture
         // display name
-        assert_eq!(map.remap("Legacy Human", "<email>"), ("PubMe".into(), "<email>".into()));
+        assert_eq!(map.remap("Legacy Human", "<email>"), ("PubMe".into(), "<email>".into()));  // pii-test-fixture
         // unmatched → default (never the raw internal email)
-        assert_eq!(map.remap("Nobody", "<email>"), ("fallback-bot".into(), "<email>".into()));
+        assert_eq!(map.remap("Nobody", "<email>"), ("fallback-bot".into(), "<email>".into()));  // pii-test-fixture
     }
 
     #[test]
@@ -846,38 +971,123 @@ mod tests {
         let map = IdentityMap {
             rules: vec![rule(Some("<email>"), None, None, "PubMe", "<email>")], // pii-test-fixture
             default_name: "bot".into(),
-            default_email: "<email>".into(),
+            default_email: "<email>".into(),  // pii-test-fixture
         };
         let line = b"author Real Name <<email>> 1609556645 +0000\n"; // pii-test-fixture
         let out = rewrite_ident_line(line, &map);
         let s = String::from_utf8(out).unwrap();
-        assert_eq!(s, "author PubMe <<email>> 1609556645 +0000\n", "remapped + ts preserved: {s}");
+        assert_eq!(s, "author PubMe <<email>> 1609556645 +0000\n", "remapped + ts preserved: {s}");  // pii-test-fixture
         assert!(!s.contains("<email>"), "internal email scrubbed"); // pii-test-fixture
         // committer prefix handled too; a malformed line is passed through.
         assert_eq!(rewrite_ident_line(b"committer X <<email>> 1 +0000\n", &map), // pii-test-fixture
-                   b"committer PubMe <<email>> 1 +0000\n".to_vec());
+                   b"committer PubMe <<email>> 1 +0000\n".to_vec());  // pii-test-fixture
         assert_eq!(rewrite_ident_line(b"author malformed line\n", &map), b"author malformed line\n".to_vec());
     }
 
     #[test]
     fn replay_with_author_map_remaps_all_idents_and_preserves_dates() {
         std::env::remove_var("TERMINUS_PII_CONFIG");
-        let src = init_source(); // authored by <email>
+        let src = init_source(); // authored by <email>  // pii-test-fixture
         let wd = unique("replay-attr-wd");
         let src_dates: String = git(&src, &["log", "--all", "--format=%ad", "--date=iso-strict"]);
         let map = IdentityMap {
             rules: vec![],
             default_name: "MoosenetBot".into(),
-            default_email: "<email>".into(),
+            default_email: "<email>".into(),  // pii-test-fixture
         };
         let report = replay_full_history(&src, &wd, &ReplayOpts::with_author_map(map)).unwrap();
         assert!(report.idents_remapped >= 2, "author+committer remapped: {report:?}");
         // NO internal author email survives; all attributed to the mapped identity.
         let authors = git(&wd, &["log", "--all", "--format=%ae|%ce"]);
         assert!(!authors.contains("<email>"), "internal email gone: {authors}"); // pii-test-fixture
-        assert!(authors.contains("<email>"), "remapped: {authors}");
+        assert!(authors.contains("<email>"), "remapped: {authors}");  // pii-test-fixture
         // Dates unchanged (contribution fidelity).
         assert_eq!(git(&wd, &["log", "--all", "--format=%ad", "--date=iso-strict"]), src_dates, "dates preserved");
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    // ── GHIST-04: incremental replay appends new commits 1:1 (no re-squash) ──
+    #[test]
+    fn incremental_replay_appends_new_commits() {
+        std::env::remove_var("TERMINUS_PII_CONFIG");
+        let src = init_source(); // 3 commits
+        let wd = unique("inc-wd");
+
+        // First run: full backfill.
+        let (full, r1) = replay_incremental_or_full(&src, &wd, &ReplayOpts::new()).unwrap();
+        assert!(full && r1.commits == 3, "first run is a 3-commit backfill: {r1:?}");
+        assert_eq!(git(&wd, &["rev-list", "--count", "--all"]).trim(), "3");
+        let backfill_head = last_mirrored_sha(&wd).unwrap();
+        assert_eq!(backfill_head, git(&src, &["rev-parse", "HEAD"]).trim());
+
+        // Add two more internal commits (one with an IP to scrub).
+        write(&src, "new1.txt", b"host <internal-ip> added later\n"); // pii-test-fixture
+        commit_all(&src, "add new1");
+        write(&src, "new2.txt", b"plain new content\n");
+        commit_all(&src, "add new2");
+
+        // Second run: incremental append of exactly the 2 new commits.
+        let (full2, r2) = replay_incremental_or_full(&src, &wd, &ReplayOpts::new()).unwrap();
+        assert!(!full2, "second run is incremental");
+        assert_eq!(r2.commits, 2, "exactly 2 new commits replayed: {r2:?}");
+        assert_eq!(
+            git(&wd, &["rev-list", "--count", "--all"]).trim(),
+            "5",
+            "appended onto history (5), not re-squashed"
+        );
+        // Linear history (each commit has <=1 parent here).
+        let tip_files = git(&wd, &["ls-tree", "-r", "--name-only", "HEAD"]);
+        assert!(tip_files.contains("new1.txt") && tip_files.contains("new2.txt"), "new files present: {tip_files}");
+        // The new commit's IP is scrubbed.
+        let n1 = git(&wd, &["show", "HEAD:new1.txt"]);
+        assert!(n1.contains("<internal-ip>") && !n1.contains("<internal-ip>"), "new IP scrubbed: {n1:?}"); // pii-test-fixture
+        // The whole (backfilled + appended) history passes the gate.
+        assert!(gate_full_history(&wd).unwrap().clean, "appended history gate-clean");
+        assert_eq!(last_mirrored_sha(&wd).unwrap(), git(&src, &["rev-parse", "HEAD"]).trim());
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    // ── GHIST-04: incremental is a no-op when the mirror is already at HEAD ──
+    #[test]
+    fn incremental_is_noop_at_head() {
+        std::env::remove_var("TERMINUS_PII_CONFIG");
+        let src = init_source();
+        let wd = unique("noop-wd");
+        replay_incremental_or_full(&src, &wd, &ReplayOpts::new()).unwrap();
+        let (full, r) = replay_incremental_or_full(&src, &wd, &ReplayOpts::new()).unwrap();
+        assert!(!full && r.commits == 0, "no new commits → no-op: {r:?}");
+        assert_eq!(git(&wd, &["rev-list", "--count", "--all"]).trim(), "3", "history unchanged");
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    // ── GHIST-04: a non-fast-forward internal history is REFUSED, not diverged ──
+    #[test]
+    fn incremental_refuses_non_fastforward() {
+        std::env::remove_var("TERMINUS_PII_CONFIG");
+        let src = init_source();
+        let wd = unique("nonff-wd");
+        replay_incremental_or_full(&src, &wd, &ReplayOpts::new()).unwrap();
+        let c1 = git(&src, &["rev-list", "--max-parents=0", "HEAD"]).trim().to_string(); // root commit
+
+        // Rewrite the source: reset the branch back to the root and commit a
+        // DIVERGENT change — the new HEAD does not descend from the mirrored sha.
+        git(&src, &["reset", "--hard", &c1]);
+        write(&src, "divergent.txt", b"a rewritten branch\n");
+        commit_all(&src, "divergent commit");
+
+        let err = replay_incremental_or_full(&src, &wd, &ReplayOpts::new());
+        assert!(err.is_err(), "non-ff internal history must be refused: {err:?}");
+        assert!(
+            format!("{err:?}").contains("fast-forward") || format!("{err:?}").contains("descend"),
+            "error explains the non-ff: {err:?}"
+        );
+        // The mirror is untouched (still 3 commits).
+        assert_eq!(git(&wd, &["rev-list", "--count", "--all"]).trim(), "3", "mirror not diverged");
+
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&wd);
     }

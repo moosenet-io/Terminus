@@ -241,7 +241,12 @@ fresh work-dir. The commit graph, messages, and author DATES are preserved (so t
 public contribution history matches internal), while every historical blob is
 scrubbed. A full-history PII gate (scanning every replayed commit's tree, not just
 the tip) and contribution-attribution remapping build on this; the one-time backfill
-and per-commit going-forward replay are driven by the mirror history tools.
+and per-commit going-forward replay are driven by the mirror history tools:
+`git_public_history_status` (lineage state — is a backfill established, internal vs
+work-dir commit counts, how far behind) and `git_public_history_backfill` (produce/
+update the scrubbed full-history mirror + gate EVERY commit; NEVER pushes — a
+gate-clean result is a blessable snapshot for the operator to spot-check and force
+re-baseline; requires `TERMINUS_MIRROR_AUTHOR_MAP` so authors are remapped).
 
 ### Approval-gate propagation across the mesh (MESH-09)
 
@@ -595,6 +600,36 @@ is caught, logged, and reported rather than propagated — it never turns an
 
 No direct doc-generation HTTP/Chord call is made from `review_run` — the only
 doc path is the existing `docgen_run` tool (S9 single door).
+
+### Atlas vector store (KGEMB-01)
+
+Phase 1 of KG-as-behavioral-correction adds semantic (meaning-based) retrieval
+alongside the lexical `kg_search` above. `AtlasVecStore`
+(`src/scribe/graph/vec_store.rs`) owns a dedicated Postgres table,
+`kg_embeddings`, holding one 768-dim [pgvector](https://github.com/pgvector/pgvector)
+embedding per `(project_id, node_id)`, plus the `card_hash` of the text that
+was embedded (so a rebuild can skip re-embedding unchanged nodes) and an HNSW
+cosine-similarity index for fast top-K search.
+
+- **`ATLAS_DATABASE_URL`** — the dedicated Postgres DSN for the embeddings
+  store. This is the ONLY source for the store's DSN — there is deliberately no
+  fallback to a shared `DATABASE_URL`, so the store stays isolated to its own
+  database. When `ATLAS_DATABASE_URL` is unset, `AtlasVecStore::from_env()`
+  returns `NotConfigured` cleanly — no connection is attempted, and callers (the
+  build-time embed step and the `kg_semantic_search` tool) degrade to the
+  existing lexical path rather than failing.
+- The migration (`CREATE EXTENSION IF NOT EXISTS vector`, the table, and its
+  `hnsw (embedding vector_cosine_ops)` index) is idempotent and
+  advisory-lock-serialized, safe to run on every `from_env()` call including
+  from concurrent processes. HNSW index creation is best-effort: if a given
+  pgvector build rejects it, the table still works (exact top-K scan via
+  `<=>`), just without the ANN speedup.
+- Typed methods: `upsert` (batched, parameterized, `ON CONFLICT` update),
+  `delete` (by `node_id` list), `existing_hashes` (for incremental
+  hash-diff skip), and `query_topk` (cosine similarity, descending).
+- This module lands only the store. The embeddings client, the gated
+  build-time wiring, and the `kg_semantic_search` tool are later items in
+  spec `S113-kg-semantic-embeddings` (KGEMB-02/03/04).
 
 ## License
 

@@ -560,13 +560,13 @@ mod tests {
 
         match &report.mechanism {
             ClientMechanismReport::Tailnet { login, tags } => {
-                assert_eq!(login, "<email>");
+                assert_eq!(login, "<email>");  // pii-test-fixture
                 assert_eq!(tags, &vec!["tag:remote-client".to_string()]);
             }
             other => panic!("expected Tailnet mechanism report, got {other:?}"),
         }
         assert_eq!(
-            report.principal_map_entry["tailnet_login"]["<email>"],
+            report.principal_map_entry["tailnet_login"]["<email>"],  // pii-test-fixture
             "moose-laptop"
         );
         assert_eq!(
@@ -654,7 +654,7 @@ mod tests {
     #[test]
     fn tailnet_login_already_mapped_to_a_different_principal_is_rejected() {
         let existing = serde_json::from_str::<PrincipalMap>(
-            r#"{"tailnet_login": {"<email>": "someone-else"}}"#,
+            r#"{"tailnet_login": {"<email>": "someone-else"}}"#,  // pii-test-fixture
         )
         .expect("valid fixture");
         let req = OnboardClientRequest {
@@ -669,7 +669,7 @@ mod tests {
         match err {
             OnboardClientError::MechanismCollision { kind, value, owner } => {
                 assert_eq!(kind, "tailnet login");
-                assert_eq!(value, "<email>");
+                assert_eq!(value, "<email>");  // pii-test-fixture
                 assert_eq!(owner, "someone-else");
             }
             other => panic!("expected MechanismCollision, got {other:?}"),

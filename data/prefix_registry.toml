@@ -519,3 +519,21 @@ spec_id = "S112-agy-serialize-retry"
 status = "active"
 description = "Serialize agy spawns in the review-daemon and retry the intermittent agy OAuth access-token-refresh failure (Authentication required) so agy is reliable as the default review secondary."
 created = "2026-07-11"
+
+[[prefix]]
+prefix = "DISC"
+name = "Model Discovery & Curation Agent (the Brochure)"
+project = "TERM"
+spec_id = "S114-model-discovery-agent"
+status = "ingested"
+description = "Standing agent: daily HF discovery brochure across all fleet categories (tool-router/writer-slm/assistant/coder/embedding/visual/voice), auto-fetch candidates to cold storage, auto-threshold sweep trigger, score-based cold-storage pruning (keep profile data), and new live visual/voice/tool-router backends."
+created = "2026-07-11"
+
+[[prefix]]
+prefix = "FREEP"
+name = "Seamless OpenRouter free-tier pool (daily-curated, round-robin + 429 failover)"
+project = "TERM"
+spec_id = "S112-openrouter-free-pool"
+status = "active"
+description = "Add a 'free' review_run provider backed by a daily-curated pool of high-quality free OpenRouter models with round-robin selection and 429 failover, so free-tier reviews always land on a model with quota."
+created = "2026-07-11"
