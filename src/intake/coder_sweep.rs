@@ -39,7 +39,7 @@ use crate::intake::assistant::schema;
 use crate::intake::assistant::BackendTag;
 use crate::intake::checkpoint::FileCheckpoint;
 use crate::intake::gpu_authority;
-use crate::intake::{self, infer};
+use crate::intake::{self, chord_pull, infer};
 
 // ===========================================================================
 // Env-sourced config (pub — shared by the binary AND the `mint` CLI, which
@@ -370,10 +370,14 @@ fn pre_skip_reason(nom: &Nomination, backend: BackendTag) -> Option<String> {
 // the orchestrator (`run_one_backend`), not the driver.
 #[async_trait::async_trait]
 pub trait CoderSuiteDriver: Send + Sync {
-    /// HFIX-05 pre-flight: is `model_id` present in the CURRENTLY-overridden
-    /// backend's Ollama registry? Assumes the caller has already applied the
-    /// backend override for the pass being checked.
-    async fn model_available(&self, model_id: &str) -> bool;
+    /// ACQ-01 (was the HFIX-05 presence-only pre-flight): ACQUIRE `model_id`
+    /// via Chord's cold-storage promotion (`chord_pull::acquire_via_chord`) —
+    /// not merely check whether it happens to already be present. Assumes the
+    /// caller has already applied the backend override for the pass being
+    /// checked. `Warmed` ⇒ proceed; `NonViable` ⇒ the caller records a
+    /// non-viable row (via [`Self::record_non_viable_acquire`]) and skips the
+    /// cell cleanly.
+    async fn acquire_model(&self, model_id: &str) -> chord_pull::AcquireOutcome;
 
     /// Create a fresh profile row scoping one `(model, backend)` pass's rows.
     async fn create_profile_row(&self, model_id: &str) -> Result<uuid::Uuid, ToolError>;
@@ -390,6 +394,22 @@ pub trait CoderSuiteDriver: Send + Sync {
         backend_tag: &str,
         reason: &str,
         mem_config: Option<&str>,
+    ) -> Result<(), ToolError>;
+
+    /// ACQ-01: record a terminal non-viable row for a `(model, backend)` cell
+    /// that was never attempted because Chord's cold-storage acquisition
+    /// (`chord_pull::acquire_via_chord`) hard-failed — a distinct write path
+    /// from [`Self::record_non_viable`] (the over-VRAM skip) so the two skip
+    /// reasons stay classified apart (`non_viable_unavailable` /
+    /// `non_viable_resource` vs. `non_viable_vram`) in the data. The live impl
+    /// writes the row via `code_v2::record_non_viable_acquire_row`.
+    async fn record_non_viable_acquire(
+        &self,
+        model_id: &str,
+        backend_tag: &str,
+        reason: &str,
+        mem_config: Option<&str>,
+        failure_class: intake::code_v2::FailureClass,
     ) -> Result<(), ToolError>;
 
     /// Run the v2 code suite for `model_id` under `profile_id`, against the
@@ -423,8 +443,8 @@ pub struct LiveCoderDriver;
 
 #[async_trait::async_trait]
 impl CoderSuiteDriver for LiveCoderDriver {
-    async fn model_available(&self, model_id: &str) -> bool {
-        infer::model_available(model_id).await
+    async fn acquire_model(&self, model_id: &str) -> chord_pull::AcquireOutcome {
+        chord_pull::acquire_via_chord(model_id).await
     }
 
     async fn create_profile_row(&self, model_id: &str) -> Result<uuid::Uuid, ToolError> {
@@ -439,6 +459,18 @@ impl CoderSuiteDriver for LiveCoderDriver {
         mem_config: Option<&str>,
     ) -> Result<(), ToolError> {
         intake::code_v2::record_non_viable_vram_row(model_id, backend_tag, reason, mem_config).await
+    }
+
+    async fn record_non_viable_acquire(
+        &self,
+        model_id: &str,
+        backend_tag: &str,
+        reason: &str,
+        mem_config: Option<&str>,
+        failure_class: intake::code_v2::FailureClass,
+    ) -> Result<(), ToolError> {
+        intake::code_v2::record_non_viable_acquire_row(model_id, backend_tag, reason, mem_config, failure_class)
+            .await
     }
 
     async fn run_suite(
@@ -599,18 +631,33 @@ async fn run_one_backend(
     infer::set_backend_override(Some(override_str.to_string()));
     let _clear = ClearOverride;
 
-    // ── HFIX-05 pre-flight: skip cleanly (one reason) instead of persisting
-    //    a "model not found" 404 PER CASE (up to 200 wasted rows per model,
-    //    the dominant failure mode found auditing the dynamic_gtt run) ──
-    if !driver.model_available(&model_id).await {
-        let reason = format!(
-            "model '{model_id}' not present in the resolved backend's Ollama registry (not pulled)"
-        );
-        return Ok(BackendReport {
-            model_id,
-            backend_tag: backend,
-            outcome: BackendOutcome::Skipped(reason),
-        });
+    // ── ACQ-01 (was the HFIX-05 presence-only pre-flight): ACQUIRE the model
+    //    via Chord's cold-storage promotion instead of merely checking whether
+    //    it happens to already be present — this both closes the survivorship
+    //    gap where a genuinely-missing model just silently 404'd per case (up
+    //    to 200 wasted rows, the dominant failure mode found auditing the
+    //    dynamic_gtt run) AND makes the sweep self-healing: a model that is
+    //    archived but not yet warm on this host is promoted here, not skipped. ──
+    match driver.acquire_model(&model_id).await {
+        chord_pull::AcquireOutcome::Warmed => {}
+        chord_pull::AcquireOutcome::NonViable { reason, failure_class } => {
+            // Best-effort: a DB hiccup must not turn a clean skip into an error.
+            if let Err(e) = driver
+                .record_non_viable_acquire(&model_id, backend.as_str(), &reason, mem_config, failure_class)
+                .await
+            {
+                eprintln!(
+                    "coder sweep: could not record non_viable row for model={model_id} \
+                     backend={} (chord acquisition failure, continuing): {e}",
+                    backend.as_str()
+                );
+            }
+            return Ok(BackendReport {
+                model_id,
+                backend_tag: backend,
+                outcome: BackendOutcome::Skipped(reason),
+            });
+        }
     }
 
     // ── S86 hardening: reconcile orphaned incomplete rows from a prior
@@ -1446,15 +1493,22 @@ mod tests {
     }
 
     /// Scriptable driver mirroring `assistant::runner::tests::ScriptDriver`:
-    /// `model_available` returns a fixed answer; `run_suite` either succeeds
-    /// with a canned outcome or fails with a canned reason, per model.
+    /// `acquire_model` (ACQ-01) returns `Warmed` for every model in
+    /// `available`, else a scripted `NonViable` (defaulting to a chord
+    /// "not found"-shaped skip, matching the live driver's most common real
+    /// failure mode); `run_suite` either succeeds with a canned outcome or
+    /// fails with a canned reason, per model.
     struct ScriptDriver {
         available: BTreeSet<String>,
         suite_fail: BTreeSet<String>,
         profile_calls: Mutex<Vec<String>>,
         suite_calls: Mutex<Vec<(String, String)>>,
-        /// MINT2-02: (model_id, backend_tag, reason) per recorded non_viable row.
+        /// MINT2-02: (model_id, backend_tag, reason) per recorded non_viable
+        /// (over-VRAM) row.
         non_viable_calls: Mutex<Vec<(String, String, String)>>,
+        /// ACQ-01: (model_id, backend_tag, reason, failure_class) per recorded
+        /// non-viable row from a chord acquisition failure.
+        non_viable_acquire_calls: Mutex<Vec<(String, String, String, intake::code_v2::FailureClass)>>,
     }
 
     impl ScriptDriver {
@@ -1465,6 +1519,7 @@ mod tests {
                 profile_calls: Mutex::new(Vec::new()),
                 suite_calls: Mutex::new(Vec::new()),
                 non_viable_calls: Mutex::new(Vec::new()),
+                non_viable_acquire_calls: Mutex::new(Vec::new()),
             }
         }
 
@@ -1476,8 +1531,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CoderSuiteDriver for ScriptDriver {
-        async fn model_available(&self, model_id: &str) -> bool {
-            self.available.contains(model_id)
+        async fn acquire_model(&self, model_id: &str) -> chord_pull::AcquireOutcome {
+            if self.available.contains(model_id) {
+                chord_pull::AcquireOutcome::Warmed
+            } else {
+                chord_pull::AcquireOutcome::NonViable {
+                    reason: format!("chord: model not available from cold storage: {model_id}"),
+                    failure_class: intake::code_v2::FailureClass::NonViableUnavailable,
+                }
+            }
         }
 
         async fn create_profile_row(&self, model_id: &str) -> Result<uuid::Uuid, ToolError> {
@@ -1496,6 +1558,23 @@ mod tests {
                 model_id.to_string(),
                 backend_tag.to_string(),
                 reason.to_string(),
+            ));
+            Ok(())
+        }
+
+        async fn record_non_viable_acquire(
+            &self,
+            model_id: &str,
+            backend_tag: &str,
+            reason: &str,
+            _mem_config: Option<&str>,
+            failure_class: intake::code_v2::FailureClass,
+        ) -> Result<(), ToolError> {
+            self.non_viable_acquire_calls.lock().unwrap().push((
+                model_id.to_string(),
+                backend_tag.to_string(),
+                reason.to_string(),
+                failure_class,
             ));
             Ok(())
         }
@@ -1628,7 +1707,12 @@ mod tests {
     }
 
     #[test]
-    fn driver_unavailable_model_skips_with_reason_and_never_reaches_suite() {
+    fn driver_chord_non_viable_model_skips_with_reason_and_never_reaches_suite() {
+        // ACQ-01: a model Chord could not acquire (not marked `available` in the
+        // script, mirroring a 404/NotConfigured/etc. from `acquire_via_chord`) is
+        // a clean skip — never reaches `run_suite`, never checkpointed — AND a
+        // typed non-viable row is recorded via `record_non_viable_acquire`
+        // (distinct from the over-VRAM `record_non_viable` path).
         let fleet = Nominations::from_json(
             r#"{"nominations":[{"id":"ghost:8b","size_b":8,"gfx1151_class":"confirmed","acquisition":"ollama_pull","backends":["gpu"]}]}"#,
         )
@@ -1640,14 +1724,48 @@ mod tests {
 
         assert_eq!(reports.len(), 1);
         match &reports[0].outcome {
-            BackendOutcome::Skipped(reason) => assert!(reason.contains("not present")),
+            BackendOutcome::Skipped(reason) => assert!(reason.contains("cold storage")),
             other => panic!("expected Skipped, got {other:?}"),
         }
         assert!(
             driver.suite_calls.lock().unwrap().is_empty(),
-            "an unavailable model must never reach run_suite (HFIX-05)"
+            "a chord-non-viable model must never reach run_suite"
         );
         assert!(checkpoint.done().is_empty(), "a skip must never be checkpointed");
+
+        // The non-viable row was recorded through the chord-acquisition path
+        // (NOT the over-VRAM `record_non_viable` path), typed `NonViableUnavailable`.
+        assert!(driver.non_viable_calls.lock().unwrap().is_empty());
+        let acquire_calls = driver.non_viable_acquire_calls.lock().unwrap();
+        assert_eq!(acquire_calls.len(), 1);
+        assert_eq!(acquire_calls[0].0, "ghost:8b");
+        assert_eq!(acquire_calls[0].3, intake::code_v2::FailureClass::NonViableUnavailable);
+    }
+
+    #[test]
+    fn driver_acquire_via_chord_never_falls_back_to_ollama_pull_or_hf_fetch() {
+        // NEGATIVE test: the sweep's per-model acquisition step is `acquire_model`
+        // (Chord-only) — `Nomination.acquisition` (`ollama_pull` / `hf_fetch` /
+        // `register_span`) is metadata consumed elsewhere (the assistant
+        // acquirer's now-chord-backed dispatch), never by the coder sweep's
+        // pre-flight. A model with `acquisition: "hf_fetch"` that Chord cannot
+        // acquire is skipped exactly like an `ollama_pull` one — proving no
+        // internet/ollama-pull branch exists in this path.
+        let fleet = Nominations::from_json(
+            r#"{"nominations":[{"id":"ghost-hf:8b","size_b":8,"gfx1151_class":"confirmed","acquisition":"hf_fetch","backends":["gpu"]}]}"#,
+        )
+        .unwrap();
+        let driver = ScriptDriver::new(); // nothing marked available
+        let checkpoint = tmp_checkpoint("unavailable-hf");
+
+        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &NoopGpuLock)).unwrap();
+
+        assert_eq!(reports.len(), 1);
+        match &reports[0].outcome {
+            BackendOutcome::Skipped(reason) => assert!(reason.contains("chord")),
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        assert!(driver.suite_calls.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1853,8 +1971,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CoderSuiteDriver for MidUnitScriptDriver {
-        async fn model_available(&self, _model_id: &str) -> bool {
-            true
+        async fn acquire_model(&self, _model_id: &str) -> chord_pull::AcquireOutcome {
+            chord_pull::AcquireOutcome::Warmed
         }
 
         async fn create_profile_row(&self, _model_id: &str) -> Result<uuid::Uuid, ToolError> {
@@ -1867,6 +1985,17 @@ mod tests {
             _backend_tag: &str,
             _reason: &str,
             _mem_config: Option<&str>,
+        ) -> Result<(), ToolError> {
+            Ok(())
+        }
+
+        async fn record_non_viable_acquire(
+            &self,
+            _model_id: &str,
+            _backend_tag: &str,
+            _reason: &str,
+            _mem_config: Option<&str>,
+            _failure_class: intake::code_v2::FailureClass,
         ) -> Result<(), ToolError> {
             Ok(())
         }
