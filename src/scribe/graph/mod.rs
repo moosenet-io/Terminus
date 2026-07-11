@@ -17,11 +17,13 @@
 
 pub mod cluster;
 pub mod extract;
+pub mod layout;
 pub mod model;
 pub mod store;
 pub mod tools;
 
 pub use cluster::cluster;
 pub use extract::build_rust_graph;
+pub use layout::{cluster_hue, layout, node_radius, LayoutResult};
 pub use model::{Confidence, EdgeKind, KgEdge, KgNode, KnowledgeGraph, NodeKind};
 pub use store::GraphStore;
