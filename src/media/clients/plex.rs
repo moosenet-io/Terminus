@@ -1,9 +1,10 @@
 //! Plex client — thin typed wrapper for library/history reads.
 //!
 //! Plex is the consumption/history layer: library sections, watch history,
-//! and on-deck/continue-watching all live here (later items — MEDIA-05
-//! recommend/engagement — build on `history`). MEDIA-01 scaffold only:
-//! config + `library_sections` (proves the client shape) + `history`.
+//! and on-deck/continue-watching all live here. MEDIA-01 scaffolded config +
+//! `library_sections` + `history`; MEDIA-05 (`crate::media::recommend`) adds
+//! `on_deck` (continue-watching) and `recently_added` (engagement surface)
+//! on top of that same thin-passthrough shape.
 //!
 //! ## Configuration
 //! - `PLEX_URL`   — base URL, e.g. `http://<plex-host>:32400`
@@ -70,6 +71,40 @@ impl PlexClient {
     /// passthrough; used by MEDIA-05's recommendation rationale).
     pub async fn history(&self) -> Result<Value, ToolError> {
         let url = format!("{}/status/sessions/history/all", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .header("X-Plex-Token", &self.token)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| ToolError::Http(format!("Plex unavailable: {e}")))?;
+
+        map_response(resp).await
+    }
+
+    /// `GET /library/onDeck` — Plex's own "continue watching" surface
+    /// (in-progress + next-up episodes). Thin passthrough; used by
+    /// MEDIA-05's `media_on_deck` tool.
+    pub async fn on_deck(&self) -> Result<Value, ToolError> {
+        let url = format!("{}/library/onDeck", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .header("X-Plex-Token", &self.token)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| ToolError::Http(format!("Plex unavailable: {e}")))?;
+
+        map_response(resp).await
+    }
+
+    /// `GET /library/recentlyAdded` — items recently added across the
+    /// configured library sections. Thin passthrough; used by MEDIA-05's
+    /// `media_recently_added` tool.
+    pub async fn recently_added(&self) -> Result<Value, ToolError> {
+        let url = format!("{}/library/recentlyAdded", self.base_url);
         let resp = self
             .http
             .get(&url)
@@ -171,6 +206,51 @@ mod tests {
 
         let client = test_client(&server.base_url());
         let result = client.history().await;
+        assert!(matches!(result, Err(ToolError::Http(_))));
+    }
+
+    #[tokio::test]
+    async fn on_deck_parses_mocked_200() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/library/onDeck");
+            then.status(200).json_body(json!({
+                "MediaContainer": { "Metadata": [{ "title": "Foundation", "viewOffset": 120000 }] }
+            }));
+        });
+
+        let client = test_client(&server.base_url());
+        let result = client.on_deck().await.unwrap();
+        mock.assert();
+        assert_eq!(result["MediaContainer"]["Metadata"][0]["title"], "Foundation");
+    }
+
+    #[tokio::test]
+    async fn recently_added_parses_mocked_200() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/library/recentlyAdded");
+            then.status(200).json_body(json!({
+                "MediaContainer": { "Metadata": [{ "title": "New Arrival" }] }
+            }));
+        });
+
+        let client = test_client(&server.base_url());
+        let result = client.recently_added().await.unwrap();
+        mock.assert();
+        assert_eq!(result["MediaContainer"]["Metadata"][0]["title"], "New Arrival");
+    }
+
+    #[tokio::test]
+    async fn on_deck_maps_server_error_to_unavailable() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/library/onDeck");
+            then.status(503);
+        });
+
+        let client = test_client(&server.base_url());
+        let result = client.on_deck().await;
         assert!(matches!(result, Err(ToolError::Http(_))));
     }
 

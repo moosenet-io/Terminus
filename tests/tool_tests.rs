@@ -66,9 +66,10 @@ fn test_hearth_tools_registered() {
     );
 }
 
-/// S94/MEDIA-01/MEDIA-02/MEDIA-03/MEDIA-04: the media domain scaffold,
-/// read/search surface, tiered request/download tool, and organize +
-/// hard-gated destructive-op tools.
+/// S94/MEDIA-01/MEDIA-02/MEDIA-03/MEDIA-04/MEDIA-05: the media domain
+/// scaffold, read/search surface, tiered request/download tool, organize +
+/// hard-gated destructive-op tools, and the stateless recommend/engagement
+/// surface.
 #[test]
 fn test_media_tools_registered() {
     let reg = full_registry();
@@ -99,6 +100,18 @@ fn test_media_tools_registered() {
     assert!(
         reg.contains("media_cleanup"),
         "media_cleanup must be registered"
+    );
+    assert!(
+        reg.contains("media_recommend"),
+        "media_recommend must be registered"
+    );
+    assert!(
+        reg.contains("media_on_deck"),
+        "media_on_deck must be registered"
+    );
+    assert!(
+        reg.contains("media_recently_added"),
+        "media_recently_added must be registered"
     );
 }
 

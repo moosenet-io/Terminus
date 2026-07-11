@@ -15,6 +15,7 @@ gateway binary, identity, and the Chord boundary.
 | Page | Description |
 | --- | --- |
 | [`architecture/federation.md`](architecture/federation.md) | How `terminus-primary` aggregates the core registry (served locally) with the personal registry's tools (federated in from `terminus_personal` over `crate::federation::PersonalFederationClient`) into one client-visible surface. |
+| [`architecture/mesh.md`](architecture/mesh.md) | The **mesh**: federating an arbitrary number of upstream Terminus-shaped MCP servers (`crate::mesh`) — namespacing/routing, unified `Principal` identity & per-upstream RBAC, optional embedded-tsnet tailnet exposure, `mesh_onboard_upstream`/`mesh_onboard_client` runbooks, federated audit, approval-gate propagation, and the current known gaps. Distinct from, and additive to, the single-upstream federation above. |
 | [`architecture/auth.md`](architecture/auth.md) | The mTLS client-identity model (`crate::pki`), per-identity certs, the `enroll` flow, and how a caller's `ClientIdentity` is forwarded through federation and audited. |
 | [`architecture/chord-integration.md`](architecture/chord-integration.md) | The Terminus/Chord boundary: Terminus is tool egress + gateway/auth, Chord (a separate repo/process, [moosenet-io/Chord](https://github.com/moosenet-io/Chord)) is inference egress. Covers the inference-proxy forwarding routes, the short-lived service-JWT auth Terminus mints for Chord calls, and streaming semantics. |
 
