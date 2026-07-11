@@ -11,7 +11,7 @@
 //! count; scores are guarded so a disconnected or empty graph never produces
 //! NaN. Pure computation — no I/O, networking, or secrets.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::model::KnowledgeGraph;
 
@@ -88,22 +88,21 @@ pub fn pagerank(graph: &mut KnowledgeGraph) {
     let teleport = vec![1.0f32 / n as f32; n];
     let scores = run(n, &out, &teleport);
     for (i, id) in ids.iter().enumerate() {
-        if let Some(node) = graph.get_node(id) {
-            let mut updated = node.clone();
-            updated.rank = scores[i];
-            graph.insert_node(updated);
-        }
+        // Direct set (not clone+insert_node) so a score is stored verbatim even
+        // if it were exactly 0.0 — no merge heuristic in the way.
+        graph.set_rank(id, scores[i]);
     }
 }
 
 /// Query-personalized PageRank: teleport biased toward `seeds` (node ids present
-/// in the graph). Returns id → score. An empty/entirely-unknown seed set falls
-/// back to uniform teleport (i.e. global PageRank).
-pub fn personalized(graph: &KnowledgeGraph, seeds: &[&str]) -> HashMap<String, f32> {
+/// in the graph). Returns id → score as a `BTreeMap` (deterministic iteration
+/// order — callers may iterate without observing hash-order nondeterminism). An
+/// empty/entirely-unknown seed set falls back to uniform teleport (global PR).
+pub fn personalized(graph: &KnowledgeGraph, seeds: &[&str]) -> BTreeMap<String, f32> {
     let (ids, index, out) = adjacency(graph);
     let n = ids.len();
     if n == 0 {
-        return HashMap::new();
+        return BTreeMap::new();
     }
     let seed_idx: Vec<usize> = seeds.iter().filter_map(|s| index.get(*s).copied()).collect();
     let teleport = if seed_idx.is_empty() {

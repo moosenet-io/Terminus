@@ -117,7 +117,7 @@ cluster, and degree. Ask the graph instead of grepping source."
             let ae = (a.name.to_lowercase() == q) as u8;
             let be = (b.name.to_lowercase() == q) as u8;
             be.cmp(&ae)
-                .then(b.rank.partial_cmp(&a.rank).unwrap_or(std::cmp::Ordering::Equal))
+                .then(b.rank.total_cmp(&a.rank))
                 .then(b.degree.cmp(&a.degree))
                 .then(a.id.cmp(&b.id))
         });
@@ -368,9 +368,7 @@ per-cluster counts, the top-degree hotspots, and orphan (degree-0) count."
         // Hotspots ranked by PageRank importance (KGRAPH-13), then degree.
         let mut top: Vec<&super::model::KgNode> = g.nodes().collect();
         top.sort_by(|a, b| {
-            b.rank
-                .partial_cmp(&a.rank)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            b.rank.total_cmp(&a.rank)
                 .then(b.degree.cmp(&a.degree))
                 .then(a.id.cmp(&b.id))
         });
