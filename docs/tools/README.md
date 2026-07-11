@@ -45,6 +45,35 @@ points ([`src/intake/`](../../src/intake/)):
   `intake_coder_gaps`, `intake_assistant_sweep`) call — nothing is
   duplicated, and the legacy binaries remain first-class.
 
+### The unified MINT harness (two run kinds)
+
+MINT runs two sweep **families** — a **coder** sweep (code-generation cases,
+scored/stored in `code_profile_runs`) and a Lumina **assistant** sweep (the
+seven behavioral dimensions, stored via `assistant::schema`). Both share this
+one `src/intake/` tree and the one `lumina_intake` Postgres, and both are now
+driven through a single orchestrator, **`MintHarness`**
+([`src/intake/mod.rs`](../../src/intake/mod.rs)):
+
+- **`RunKind::Coder` | `RunKind::Assistant`** selects the family. A given
+  process runs exactly one kind; the two are independent, so running one kind
+  never blocks the other.
+- `MintHarness` owns the common run lifecycle — resolve config → confirm the
+  shared intake DB is reachable via the **one** canonical resolver both
+  families use (`config::intake_database_url()`, i.e. `INTAKE_DATABASE_URL`
+  falling back to `DATABASE_URL`) → stamp a harness run-identity for log
+  correlation → dispatch to the per-kind **sub-runner** (which implements the
+  small shared `SweepRunner` trait). If the intake DB URL is unset the harness
+  surfaces a clean per-kind *NotConfigured* message instead of crashing deeper
+  in a sub-runner.
+- The two standalone binaries (`intake_coder_sweep`, `intake_assistant_sweep`)
+  are now **thin entrypoints** — each is a one-line
+  `MintHarness::run(RunKind::…)`. All binary-specific orchestration (env-config
+  resolution for coder, the end-of-run summary for assistant) moved into the
+  sub-runners.
+- This is a **structural** unification only: it does not change what either
+  sweep measures — the coder cases and the assistant's seven dimensions run
+  exactly as before, each under its existing sub-runner and driver.
+
 See [`mint/`](mint/) for the full flagship manual: the sweep/case/gaps
 lifecycle, the GPU-authority lock (`gpu_authority`), the permanent
 jam-detect supervisor daemon, and the Chord `PullCoordinator` re-pull

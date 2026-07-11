@@ -697,6 +697,69 @@ pub async fn run() -> Result<RunReport, ToolError> {
         .map_err(ToolError::Execution)
 }
 
+// ---------------------------------------------------------------------------
+// Assistant sub-runner under the unified MINT harness (MINT2-04)
+// ---------------------------------------------------------------------------
+
+/// The assistant sub-runner registered into [`crate::intake::MintHarness`]. A
+/// thin adapter over the existing consolidated [`run`] orchestrator: the seven
+/// assistant dimensions and their measurement are unchanged — this only routes
+/// the assistant sweep through the one shared harness surface, and owns the
+/// end-of-run summary the standalone `intake_assistant_sweep` binary used to
+/// print (so the binary is now merely `MintHarness::run(RunKind::Assistant)`).
+pub struct AssistantSweepRunner;
+
+impl AssistantSweepRunner {
+    pub fn new() -> Self {
+        AssistantSweepRunner
+    }
+}
+
+impl Default for AssistantSweepRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::intake::SweepRunner for AssistantSweepRunner {
+    fn kind(&self) -> crate::intake::RunKind {
+        crate::intake::RunKind::Assistant
+    }
+
+    async fn run(&self) -> std::process::ExitCode {
+        // Binary-specific orchestration moved here from the old binary `main`:
+        // run the consolidated suite, then summarize the per-model report.
+        match run().await {
+            Ok(report) => {
+                let total = report.models.len();
+                let profiled = report
+                    .models
+                    .iter()
+                    .filter(|m| {
+                        m.acquisition_skip.is_none() && m.backends.iter().any(|b| b.survived)
+                    })
+                    .count();
+                let skipped = report
+                    .models
+                    .iter()
+                    .filter(|m| m.acquisition_skip.is_some())
+                    .count();
+                eprintln!(
+                    "assistant sweep complete: {profiled}/{total} models profiled, \
+                     {skipped} acquisition-skipped (scores persisted to the intake DB)"
+                );
+                std::process::ExitCode::SUCCESS
+            }
+            Err(e) => {
+                // Genericized — the error type already avoids infra leakage (S77).
+                eprintln!("assistant sweep did not complete: {e}");
+                std::process::ExitCode::FAILURE
+            }
+        }
+    }
+}
+
 /// Read the memory-model configuration tag from the SAME env var the coder
 /// sweep uses (`SWEEP_MEM_CONFIG`) — this describes the physical host's memory
 /// config (e.g. `dynamic_gtt` dynamic-GTT pool vs the preserved `carveout`
