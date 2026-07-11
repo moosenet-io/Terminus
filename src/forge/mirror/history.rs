@@ -45,21 +45,103 @@ pub struct HistoryReport {
     pub blobs_total: usize,
     /// blob payloads the cleaner actually changed.
     pub blobs_rewritten: usize,
-    /// author/committer ident lines seen (remapped in GHIST-03; passed through here).
+    /// author/committer ident lines seen.
     pub idents_seen: usize,
+    /// author/committer idents actually rewritten by the GHIST-03 attribution map.
+    pub idents_remapped: usize,
 }
 
-/// Replay options. GHIST-03 adds the author-identity remap here; GHIST-01 passes
-/// author/committer idents through unchanged.
+/// Replay options.
 #[derive(Default)]
 pub struct ReplayOpts {
-    // GHIST-03: `pub author_map: Option<IdentityMap>` slots in here.
-    _private: (),
+    /// GHIST-03 author/committer identity remap. `None` passes idents through
+    /// unchanged (GHIST-01 behavior).
+    pub author_map: Option<IdentityMap>,
 }
 
 impl ReplayOpts {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// With the given identity remap applied to every author/committer.
+    pub fn with_author_map(map: IdentityMap) -> Self {
+        Self { author_map: Some(map) }
+    }
+}
+
+// ── GHIST-03: contribution attribution remap ────────────────────────────────
+
+/// One remap rule: match an internal ident by exact email, email DOMAIN suffix,
+/// or exact display name (all case-insensitive), and rewrite it to a public
+/// identity. The FIRST matching rule (in file order) wins.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct IdentityRule {
+    #[serde(default)]
+    pub match_email: Option<String>,
+    /// Bare domain, e.g. `example.com` — matches an email ending `@example.com`.
+    #[serde(default)]
+    pub match_email_domain: Option<String>,
+    #[serde(default)]
+    pub match_name: Option<String>,
+    pub public_name: String,
+    pub public_email: String,
+}
+
+/// Author-identity remap for the history replay. Loaded from a deployment-config
+/// TOML file (path in `TERMINUS_MIRROR_AUTHOR_MAP`) so NO email literal ever lives
+/// in source. Rewriting only the ident's name+email (not the timestamp) both
+/// attributes commits to the right public account AND scrubs the internal author
+/// emails (`*.local`/`*.online`/personal) for free. An email matched by no rule
+/// falls through to `default_*` — never left as the raw internal address.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct IdentityMap {
+    #[serde(default)]
+    pub rules: Vec<IdentityRule>,
+    pub default_name: String,
+    pub default_email: String,
+}
+
+impl IdentityMap {
+    /// Load from a TOML file. Errors if the file is missing/unreadable/malformed
+    /// (a backfill must NOT silently run with no attribution map).
+    pub fn from_toml_file(path: &Path) -> Result<Self, ToolError> {
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            ToolError::Execution(format!("read author-map {}: {e}", path.display()))
+        })?;
+        toml::from_str(&text)
+            .map_err(|e| ToolError::Execution(format!("parse author-map {}: {e}", path.display())))
+    }
+
+    /// Load from `TERMINUS_MIRROR_AUTHOR_MAP` if set, else `None` (no remap).
+    pub fn from_env() -> Result<Option<Self>, ToolError> {
+        match std::env::var("TERMINUS_MIRROR_AUTHOR_MAP") {
+            Ok(p) if !p.trim().is_empty() => Ok(Some(Self::from_toml_file(Path::new(p.trim()))?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Remap `(name, email)` → the public `(name, email)`. Case-insensitive
+    /// matching; first matching rule wins; unmatched → the configured default.
+    pub fn remap(&self, name: &str, email: &str) -> (String, String) {
+        let email_lc = email.to_ascii_lowercase();
+        let name_lc = name.to_ascii_lowercase();
+        for r in &self.rules {
+            let hit = r
+                .match_email
+                .as_deref()
+                .is_some_and(|m| m.eq_ignore_ascii_case(email))
+                || r.match_email_domain
+                    .as_deref()
+                    .is_some_and(|d| email_lc.ends_with(&format!("@{}", d.to_ascii_lowercase())))
+                || r.match_name
+                    .as_deref()
+                    .is_some_and(|n| n.to_ascii_lowercase() == name_lc);
+            if hit {
+                return (r.public_name.clone(), r.public_email.clone());
+            }
+        }
+        (self.default_name.clone(), self.default_email.clone())
     }
 }
 
@@ -93,13 +175,57 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+/// Rewrite a fast-export `author`/`committer` ident line's NAME + EMAIL per the
+/// attribution map, PRESERVING the trailing ` <timestamp> <tz>` (so the
+/// contribution date is unchanged). Line format: `author NAME <EMAIL> TS TZ\n`.
+/// Returns the original bytes on any parse failure — a malformed ident is passed
+/// through unchanged rather than dropped or panicking.
+fn rewrite_ident_line(line: &[u8], map: &IdentityMap) -> Vec<u8> {
+    let prefix_len = if line.starts_with(b"author ") {
+        "author ".len()
+    } else if line.starts_with(b"committer ") {
+        "committer ".len()
+    } else {
+        return line.to_vec();
+    };
+    let (prefix, rest) = line.split_at(prefix_len);
+    // git idents put the email in an angle-bracket pair; names cannot contain
+    // '<'/'>', so the first '<' opens the email.
+    let lt = match rest.iter().position(|&b| b == b'<') {
+        Some(i) => i,
+        None => return line.to_vec(),
+    };
+    let gt = match rest[lt..].iter().position(|&b| b == b'>') {
+        Some(i) => lt + i,
+        None => return line.to_vec(),
+    };
+    let name = match std::str::from_utf8(&rest[..lt]) {
+        Ok(s) => s.trim(),
+        Err(_) => return line.to_vec(),
+    };
+    let email = match std::str::from_utf8(&rest[lt + 1..gt]) {
+        Ok(s) => s.trim(),
+        Err(_) => return line.to_vec(),
+    };
+    let suffix = &rest[gt + 1..]; // ` <TS> <TZ>\n` — preserved verbatim
+    let (public_name, public_email) = map.remap(name, email);
+    let mut out = Vec::with_capacity(prefix.len() + public_name.len() + public_email.len() + suffix.len() + 4);
+    out.extend_from_slice(prefix);
+    out.extend_from_slice(public_name.as_bytes());
+    out.extend_from_slice(b" <");
+    out.extend_from_slice(public_email.as_bytes());
+    out.push(b'>');
+    out.extend_from_slice(suffix);
+    out
+}
+
 /// Reproduce `source`'s entire commit history into `work_dir` as a PII-scrubbed
 /// derivative. `work_dir` MUST be empty/non-existent (a fresh backfill target); the
 /// source repo is never modified. Returns metrics on what was replayed.
 pub fn replay_full_history(
     source: &Path,
     work_dir: &Path,
-    _opts: &ReplayOpts,
+    opts: &ReplayOpts,
 ) -> Result<HistoryReport, ToolError> {
     // Confirm the source is a git repo before doing anything.
     run_git(source, &["rev-parse", "--git-dir"])
@@ -166,7 +292,11 @@ pub fn replay_full_history(
 
     // Pump export → transform → import. The BufWriter owns import_in and closes it
     // (EOF to fast-import) when it is dropped at the end of this call.
-    let pump = transform_stream(BufReader::new(export_out), BufWriter::new(import_in));
+    let pump = transform_stream(
+        BufReader::new(export_out),
+        BufWriter::new(import_in),
+        opts.author_map.as_ref(),
+    );
 
     let e_status = exporter
         .wait()
@@ -367,7 +497,11 @@ enum Pending {
 /// through [`DeterministicCleaner::scrub_bytes`]; commit messages and every
 /// structural line (`mark`/`from`/`merge`/`M`/`D`/`author`/…) pass through verbatim,
 /// preserving the graph, dates, and commit count.
-fn transform_stream<R: BufRead, W: Write>(mut r: R, mut w: W) -> Result<HistoryReport, ToolError> {
+fn transform_stream<R: BufRead, W: Write>(
+    mut r: R,
+    mut w: W,
+    author_map: Option<&IdentityMap>,
+) -> Result<HistoryReport, ToolError> {
     let mut report = HistoryReport::default();
     let mut pending = Pending::None;
     let ioerr = |e: std::io::Error| ToolError::Execution(format!("history stream io: {e}"));
@@ -424,8 +558,18 @@ fn transform_stream<R: BufRead, W: Write>(mut r: R, mut w: W) -> Result<HistoryR
         } else if line.starts_with(b"M ") && contains_subslice(&line, b" inline ") {
             pending = Pending::Blob;
         } else if line.starts_with(b"author ") || line.starts_with(b"committer ") {
-            // GHIST-03 remaps the ident here; GHIST-01 passes it through and counts.
             report.idents_seen += 1;
+            // GHIST-03: remap the ident's name+email to the public identity,
+            // preserving the timestamp. Only when a map is configured; on any
+            // parse failure the original line is written unchanged.
+            if let Some(map) = author_map {
+                let rewritten = rewrite_ident_line(&line, map);
+                if rewritten != line {
+                    report.idents_remapped += 1;
+                }
+                w.write_all(&rewritten).map_err(ioerr)?;
+                continue;
+            }
         }
 
         w.write_all(&line).map_err(ioerr)?;
@@ -661,6 +805,79 @@ mod tests {
         // After GHIST-01 scrubbed every blob, the full-history gate is clean.
         let report = gate_full_history(&wd).unwrap();
         assert!(report.clean, "replayed (scrubbed) history passes the full gate: {report:?}");
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    // ── GHIST-03: attribution remap ──
+    fn rule(email: Option<&str>, domain: Option<&str>, name: Option<&str>, pn: &str, pe: &str) -> IdentityRule {
+        IdentityRule {
+            match_email: email.map(String::from),
+            match_email_domain: domain.map(String::from),
+            match_name: name.map(String::from),
+            public_name: pn.into(),
+            public_email: pe.into(),
+        }
+    }
+
+    #[test]
+    fn identity_map_remaps_by_email_domain_and_name() {
+        let map = IdentityMap {
+            rules: vec![
+                rule(Some("<email>"), None, None, "PubMe", "<email>"), // pii-test-fixture
+                rule(None, Some("agents.example"), None, "MoosenetBot", "<email>"),
+                rule(None, None, Some("Legacy Human"), "PubMe", "<email>"),
+            ],
+            default_name: "fallback-bot".into(),
+            default_email: "<email>".into(),
+        };
+        // exact email (case-insensitive)
+        assert_eq!(map.remap("Whatever", "<email>"), ("PubMe".into(), "<email>".into())); // pii-test-fixture
+        // domain suffix
+        assert_eq!(map.remap("Agent", "<email>"), ("MoosenetBot".into(), "<email>".into()));
+        // display name
+        assert_eq!(map.remap("Legacy Human", "<email>"), ("PubMe".into(), "<email>".into()));
+        // unmatched → default (never the raw internal email)
+        assert_eq!(map.remap("Nobody", "<email>"), ("fallback-bot".into(), "<email>".into()));
+    }
+
+    #[test]
+    fn rewrite_ident_preserves_timestamp_and_scrubs_email() {
+        let map = IdentityMap {
+            rules: vec![rule(Some("<email>"), None, None, "PubMe", "<email>")], // pii-test-fixture
+            default_name: "bot".into(),
+            default_email: "<email>".into(),
+        };
+        let line = b"author Real Name <<email>> 1609556645 +0000\n"; // pii-test-fixture
+        let out = rewrite_ident_line(line, &map);
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(s, "author PubMe <<email>> 1609556645 +0000\n", "remapped + ts preserved: {s}");
+        assert!(!s.contains("<email>"), "internal email scrubbed"); // pii-test-fixture
+        // committer prefix handled too; a malformed line is passed through.
+        assert_eq!(rewrite_ident_line(b"committer X <<email>> 1 +0000\n", &map), // pii-test-fixture
+                   b"committer PubMe <<email>> 1 +0000\n".to_vec());
+        assert_eq!(rewrite_ident_line(b"author malformed line\n", &map), b"author malformed line\n".to_vec());
+    }
+
+    #[test]
+    fn replay_with_author_map_remaps_all_idents_and_preserves_dates() {
+        std::env::remove_var("TERMINUS_PII_CONFIG");
+        let src = init_source(); // authored by <email>
+        let wd = unique("replay-attr-wd");
+        let src_dates: String = git(&src, &["log", "--all", "--format=%ad", "--date=iso-strict"]);
+        let map = IdentityMap {
+            rules: vec![],
+            default_name: "MoosenetBot".into(),
+            default_email: "<email>".into(),
+        };
+        let report = replay_full_history(&src, &wd, &ReplayOpts::with_author_map(map)).unwrap();
+        assert!(report.idents_remapped >= 2, "author+committer remapped: {report:?}");
+        // NO internal author email survives; all attributed to the mapped identity.
+        let authors = git(&wd, &["log", "--all", "--format=%ae|%ce"]);
+        assert!(!authors.contains("<email>"), "internal email gone: {authors}"); // pii-test-fixture
+        assert!(authors.contains("<email>"), "remapped: {authors}");
+        // Dates unchanged (contribution fidelity).
+        assert_eq!(git(&wd, &["log", "--all", "--format=%ad", "--date=iso-strict"]), src_dates, "dates preserved");
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&wd);
     }
