@@ -38,6 +38,9 @@ pub mod lumina_ext;
 /// Standalone streamable-HTTP MCP server (backs the `terminus_personal` bin).
 pub mod mcp_server;
 pub mod meridian;
+/// Upstream Terminus mesh registry (MESH-01) — config-driven federation
+/// targets, replacing the two hard-coded backends.
+pub mod mesh;
 pub mod model_advisor;
 pub mod <container-mgr>; // pii-test-fixture
 pub mod prometheus;
