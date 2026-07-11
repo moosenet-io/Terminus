@@ -2,13 +2,15 @@
 
 [← personal-life index](README.md) · [← tool index](../README.md) · [← docs index](../../README.md)
 
-**Status: read/search + tiered request + organize/destructive-gating surface live (MEDIA-01
-through MEDIA-04, S94).** This page documents the domain through its first four build items: the
-seven typed service clients + `media_domain_status` (MEDIA-01), the read-only search/status
-surface (`media_search` and `media_status`, MEDIA-02), the tiered-mutation-safety request/
-download tool (`media_request`, MEDIA-03), and non-destructive organize plus hard-typed-
-confirmation destructive delete/bulk-cleanup (`media_organize`/`media_delete`/`media_cleanup`,
-MEDIA-04). Recommend and taste-memory tools land with MEDIA-05 through MEDIA-08 as those items
+**Status: read/search + tiered request + organize/destructive-gating + stateless recommend/
+engagement surface live (MEDIA-01 through MEDIA-05, S94).** This page documents the domain
+through its first five build items: the seven typed service clients + `media_domain_status`
+(MEDIA-01), the read-only search/status surface (`media_search` and `media_status`, MEDIA-02),
+the tiered-mutation-safety request/download tool (`media_request`, MEDIA-03), non-destructive
+organize plus hard-typed-confirmation destructive delete/bulk-cleanup (`media_organize`/
+`media_delete`/`media_cleanup`, MEDIA-04), and the stateless recommend/engagement surface
+(`media_recommend`/`media_on_deck`/`media_recently_added`, MEDIA-05). Taste-memory
+personalization and Lumina surface wiring land with MEDIA-06 through MEDIA-08 as those items
 ship.
 
 The media domain (`src/media/mod.rs`) orchestrates the self-hosted media stack directly —
@@ -329,9 +331,71 @@ deleted via the same Radarr/Sonarr client methods `media_delete` uses, individua
 with per-item `deleted`/`already_absent`/`failed` outcomes in the response (one candidate's
 failure never blocks the others).
 
+## media_recommend (MEDIA-05) — stateless
+
+Suggests movies/shows already in the Radarr/Sonarr library that haven't been watched yet, ranked
+against a taste profile built **fresh, in-process, on every call** from recent Plex watch history
+(`src/media/recommend.rs`). Read-only.
+
+**STATELESS by design.** This tool makes no call to any personalization/curation-memory facade —
+no such client exists in this crate yet (a later, separately-toggled item may add one). The taste
+profile is computed newly each call from that call's own Plex history and is never persisted or
+read back; the tool works fully with any future personalization layer off. A unit test
+(`stateless_module_makes_no_memory_calls`) scans the module's own production source for
+memory-shaped identifiers so a future change that introduces one fails the test.
+
+**Input schema**
+
+| Field | Type | Required |
+|---|---|---|
+| `limit` | integer | no, default 5 |
+| `account_id` | string | no — scopes watch history to one Plex account/user id. On a multi-user server, watch history is **never blended** across accounts: an explicit `account_id` is honored, otherwise the most-recently-active account (by `viewedAt`) is used alone; history with no per-user signal at all (single-user servers) is used unfiltered. |
+
+**Behavior.** Builds a recency-weighted taste profile from Plex history (`PlexClient::history`):
+genre and director overlap accumulate weight, most-recent watches weighted most. Candidates come
+from the current Radarr/Sonarr library (`RadarrClient::library`/`SonarrClient::library`) minus
+anything already watched, scored by genre/director overlap against the profile (a director match
+weighs more than a bare genre match) and ranked descending. Each recommendation's `rationale`
+names the watched title(s) that drove the match, e.g. "because you watched Dune (Science
+Fiction)".
+
+**Edge cases.** Sparse/empty watch history (new user) → falls back to plain library candidates,
+`thin_signal: true`, and a summary that says so instead of fabricating a rationale. Plex
+unreachable → degrades to Radarr/Sonarr-only library picks with `structured.degraded` naming
+what couldn't be reached, never a hard failure. No services configured at all → a friendly empty
+response, not an error.
+
+**Output** (JSON string, narration-shaped):
+
+```json
+{
+  "summary": "You might like \"Arrival\" -- because you watched Dune (Science Fiction).",
+  "structured": {
+    "thin_signal": false,
+    "degraded": null,
+    "recommendations": [
+      { "title": "Arrival", "media_type": "movie", "score": 1.0, "matched_genres": ["Science Fiction"], "rationale": "because you watched Dune (Science Fiction)" }
+    ]
+  }
+}
+```
+
+## media_on_deck / media_recently_added (MEDIA-05) — engagement
+
+Thin, read-only Plex engagement surface, not personalized:
+
+- `media_on_deck` — `PlexClient::on_deck` (`GET /library/onDeck`), Plex's own continue-watching /
+  next-up surface.
+- `media_recently_added` — `PlexClient::recently_added` (`GET /library/recentlyAdded`), what's
+  new in the library.
+
+Both take no arguments, require `PLEX_URL`/`PLEX_TOKEN` (else `NotConfigured`), and return the
+same narration-shaped `{ summary, structured: { count, titles } }` shape; an empty result is a
+friendly "nothing on deck"/"nothing recently added" summary, not an error.
+
 ## What's not here yet
 
-No recommend or taste-memory tools exist yet — see the spec (`S94-media-domain`, Plane project
-`TERM`) for MEDIA-05 through MEDIA-08. See
+Taste-memory personalization (MEDIA-06) and Lumina conversational/subagent surface wiring
+(MEDIA-07) aren't built yet — see the spec (`S94-media-domain`, Plane project `TERM`). See
 [`specs/behavior/media-behavior.md`](../../../specs/behavior/media-behavior.md) for the
 states/degradation contract this domain establishes.

@@ -26,6 +26,7 @@
 
 pub mod clients;
 pub mod organize;
+pub mod recommend;
 pub mod request;
 pub mod search;
 
@@ -98,6 +99,7 @@ pub fn register(registry: &mut ToolRegistry) {
     search::register(registry);
     request::register(registry);
     organize::register(registry);
+    recommend::register(registry);
 }
 
 #[cfg(test)]
