@@ -63,7 +63,10 @@ const DELETE_SQL: &str =
 const EXISTING_HASHES_SQL: &str =
     "SELECT node_id, card_hash FROM kg_embeddings WHERE project_id = $1";
 
-const QUERY_TOPK_SQL: &str = "SELECT node_id, 1 - (embedding <=> $1) AS score \
+// `<=>` returns `double precision`; cast the similarity to `real` so sqlx
+// decodes it into the `f32` this method returns (decoding float8 -> f32 fails
+// with a type mismatch at runtime — not caught by the no-DB unit tests).
+const QUERY_TOPK_SQL: &str = "SELECT node_id, (1 - (embedding <=> $1))::real AS score \
     FROM kg_embeddings WHERE project_id = $2 \
     ORDER BY embedding <=> $1 LIMIT $3";
 
@@ -78,7 +81,7 @@ impl AtlasVecStore {
     /// attempting a connect) when no DSN is set.
     pub async fn from_env() -> Result<Self, ToolError> {
         let url = crate::config::atlas_database_url().ok_or_else(|| {
-            ToolError::NotConfigured("ATLAS_DATABASE_URL (or DATABASE_URL) not set".into())
+            ToolError::NotConfigured("ATLAS_DATABASE_URL not set".into())
         })?;
 
         let pool = PgPoolOptions::new()
@@ -333,7 +336,7 @@ mod tests {
         // Mirrors src/vector/mod.rs:812's shape: if a real DSN happens to be
         // configured in this process, skip gracefully (never attempt a live
         // connection from a unit test) rather than mutating global env state.
-        if std::env::var("ATLAS_DATABASE_URL").is_ok() || std::env::var("DATABASE_URL").is_ok() {
+        if std::env::var("ATLAS_DATABASE_URL").is_ok() {
             return; // skip — a real DSN is available, not testing NotConfigured
         }
 

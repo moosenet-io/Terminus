@@ -109,7 +109,12 @@ pub fn intake_database_url() -> Option<String> {
 /// the shared `DATABASE_URL` (mirrors [`intake_database_url`]).
 /// Returns `None` (caller raises `NotConfigured`) when neither is set.
 pub fn atlas_database_url() -> Option<String> {
-    env_nonempty("ATLAS_DATABASE_URL").or_else(|| env_nonempty("DATABASE_URL"))
+    // Dedicated DSN ONLY — deliberately no `DATABASE_URL` fallback. The atlas
+    // embeddings store is an isolated database; falling back to a shared
+    // `DATABASE_URL` would run pgvector migrations against an unrelated DB and
+    // make `from_env()` connect when `ATLAS_DATABASE_URL` is unset (the store's
+    // contract is: unset ⇒ NotConfigured, never connects).
+    env_nonempty("ATLAS_DATABASE_URL")
 }
 
 // ── ASMT-09 consolidated runner: resilient staging + acquisition ──────────────

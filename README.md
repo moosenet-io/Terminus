@@ -611,11 +611,12 @@ embedding per `(project_id, node_id)`, plus the `card_hash` of the text that
 was embedded (so a rebuild can skip re-embedding unchanged nodes) and an HNSW
 cosine-similarity index for fast top-K search.
 
-- **`ATLAS_DATABASE_URL`** — the Postgres DSN for the embeddings store.
-  Falls back to the shared `DATABASE_URL` when unset (same pattern as
-  `INTAKE_DATABASE_URL`). Neither set ⇒ `AtlasVecStore::from_env()` returns
-  `NotConfigured` cleanly — no connection is attempted, and callers (the
-  future build-time embed step and `kg_semantic_search` tool) degrade to the
+- **`ATLAS_DATABASE_URL`** — the dedicated Postgres DSN for the embeddings
+  store. This is the ONLY source for the store's DSN — there is deliberately no
+  fallback to a shared `DATABASE_URL`, so the store stays isolated to its own
+  database. When `ATLAS_DATABASE_URL` is unset, `AtlasVecStore::from_env()`
+  returns `NotConfigured` cleanly — no connection is attempted, and callers (the
+  build-time embed step and the `kg_semantic_search` tool) degrade to the
   existing lexical path rather than failing.
 - The migration (`CREATE EXTENSION IF NOT EXISTS vector`, the table, and its
   `hnsw (embedding vector_cosine_ops)` index) is idempotent and
