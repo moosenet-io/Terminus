@@ -1742,6 +1742,139 @@ pub async fn persist_fleet_catalog(
         .map_err(|e| ToolError::Database(format!("commit fleet-catalog persist tx: {e}")))
 }
 
+/// The SELECT that reads the per-model summary cards, newest-refresh first.
+const READ_FLEET_CATALOG_CARDS_SQL: &str = "SELECT model_name, quant, in_current_fleet, \
+     serving_json, not_run_count, stale_count, refreshed_at \
+     FROM model_fleet_catalog ORDER BY model_name";
+
+/// The SELECT that reads every coverage cell.
+const READ_FLEET_CATALOG_CELLS_SQL: &str = "SELECT model_name, quant, test_type, task_category, \
+     status, pass_rate, n_samples, score_stddev, low_confidence, last_run_at, harness_version \
+     FROM model_fleet_catalog_cell";
+
+type FleetCardTuple = (
+    String,                                  // model_name
+    Option<String>,                          // quant
+    bool,                                    // in_current_fleet
+    Option<serde_json::Value>,               // serving_json
+    i32,                                     // not_run_count
+    i32,                                     // stale_count
+    chrono::DateTime<chrono::Utc>,           // refreshed_at
+);
+
+type FleetCellTuple = (
+    String,                                  // model_name
+    Option<String>,                          // quant
+    String,                                  // test_type
+    String,                                  // task_category
+    String,                                  // status
+    Option<f64>,                             // pass_rate
+    Option<i32>,                             // n_samples
+    Option<f64>,                             // score_stddev
+    Option<bool>,                            // low_confidence
+    Option<chrono::DateTime<chrono::Utc>>,   // last_run_at
+    Option<String>,                          // harness_version
+);
+
+/// Read the PERSISTED Model Fleet Catalog (both tables) into per-model cards —
+/// the read side MINT2-08's `model_fleet_catalog` tool serves. This NEVER
+/// recomputes; it reads exactly what the MINT2-07 refresh last persisted.
+///
+/// An un-migrated host (the catalog tables do not exist yet) is a clean
+/// [`ToolError::NotConfigured`] — NOT a crash and NOT a masked empty result: the
+/// tool surfaces "catalog not configured" so the caller knows the difference
+/// between "no models" and "no catalog". Any OTHER DB error propagates. Cells are
+/// grouped onto their card by `model_name`; a cell whose model has no summary row
+/// (should not happen — both tables are rewritten together) is ignored.
+pub async fn read_fleet_catalog(
+    pool: &PgPool,
+) -> Result<Vec<crate::intake::catalog::StoredCatalogCard>, ToolError> {
+    use crate::intake::catalog::{StoredCatalogCard, StoredCatalogCell};
+    use std::collections::BTreeMap;
+
+    let card_rows = match sqlx::query_as::<_, FleetCardTuple>(READ_FLEET_CATALOG_CARDS_SQL)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) {
+                return Err(ToolError::NotConfigured(
+                    "the Model Fleet Catalog is not configured on this host \
+                     (model_fleet_catalog table absent — run the MINT2-07 migration \
+                     and a sweep to populate it)"
+                        .into(),
+                ));
+            }
+            return Err(ToolError::Database(format!(
+                "Failed to read model_fleet_catalog: {msg}"
+            )));
+        }
+    };
+
+    let cell_rows = match sqlx::query_as::<_, FleetCellTuple>(READ_FLEET_CATALOG_CELLS_SQL)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) {
+                return Err(ToolError::NotConfigured(
+                    "the Model Fleet Catalog is not configured on this host \
+                     (model_fleet_catalog_cell table absent)"
+                        .into(),
+                ));
+            }
+            return Err(ToolError::Database(format!(
+                "Failed to read model_fleet_catalog_cell: {msg}"
+            )));
+        }
+    };
+
+    // Group cells by model.
+    let mut cells_by_model: BTreeMap<String, Vec<StoredCatalogCell>> = BTreeMap::new();
+    for (model_name, quant, test_type, task_category, status, pass_rate, n_samples, score_stddev, low_confidence, last_run_at, harness_version) in cell_rows {
+        cells_by_model
+            .entry(model_name.clone())
+            .or_default()
+            .push(StoredCatalogCell {
+                model_name,
+                quant,
+                test_type,
+                task_category,
+                status,
+                pass_rate,
+                n_samples: n_samples.map(|n| n as i64),
+                score_stddev,
+                low_confidence,
+                last_run_at,
+                harness_version,
+            });
+    }
+
+    let cards = card_rows
+        .into_iter()
+        .map(
+            |(model_name, quant, in_current_fleet, serving_json, not_run_count, stale_count, refreshed_at)| {
+                let cells = cells_by_model.remove(&model_name).unwrap_or_default();
+                StoredCatalogCard {
+                    model_name,
+                    quant,
+                    in_current_fleet,
+                    serving_json,
+                    not_run_count: not_run_count as i64,
+                    stale_count: stale_count as i64,
+                    refreshed_at,
+                    cells,
+                }
+            },
+        )
+        .collect();
+    Ok(cards)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
