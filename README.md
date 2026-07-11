@@ -241,7 +241,12 @@ fresh work-dir. The commit graph, messages, and author DATES are preserved (so t
 public contribution history matches internal), while every historical blob is
 scrubbed. A full-history PII gate (scanning every replayed commit's tree, not just
 the tip) and contribution-attribution remapping build on this; the one-time backfill
-and per-commit going-forward replay are driven by the mirror history tools.
+and per-commit going-forward replay are driven by the mirror history tools:
+`git_public_history_status` (lineage state — is a backfill established, internal vs
+work-dir commit counts, how far behind) and `git_public_history_backfill` (produce/
+update the scrubbed full-history mirror + gate EVERY commit; NEVER pushes — a
+gate-clean result is a blessable snapshot for the operator to spot-check and force
+re-baseline; requires `TERMINUS_MIRROR_AUTHOR_MAP` so authors are remapped).
 
 ### Approval-gate propagation across the mesh (MESH-09)
 
