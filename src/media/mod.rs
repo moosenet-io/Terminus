@@ -29,6 +29,7 @@ pub mod organize;
 pub mod recommend;
 pub mod request;
 pub mod search;
+pub mod surface;
 pub mod taste_memory;
 
 use async_trait::async_trait;
