@@ -44,22 +44,65 @@
 //! feature; nothing about the code below assumes anything beyond what the
 //! `tsnet` crate documents.
 //!
-//! ## WhoIs — what MESH-04 exposes, what MESH-05 still has to add
-//! The pinned `tsnet` crate version (0.1.0) wraps an OLDER `libtailscale` C
-//! API (see its vendored `tailscale.h`) that predates `tailscale_whois` —
-//! there is no WhoIs FFI binding available through this crate today.
-//! [`TailnetServer::whois`] is still provided as the stable accessor
-//! surface MESH-05 is meant to consume (per this item's scope: "you provide
-//! the accessor; MESH-05 wires the middleware"), but its current
-//! implementation always returns [`WhoIsError::Unsupported`]. Closing that
-//! gap is explicitly MESH-05's (or a later `tsnet` version bump's) job, by
-//! either (a) bumping to a `tsnet` release that wraps `tailscale_whois`, or
-//! (b) adding this crate's own `extern "C"` declaration for that symbol
-//! (already statically linked into the binary via the same `libtailscale.a`
-//! the `tsnet` crate's build script produces, since it's part of the same C
-//! archive) — whichever lands first. Not resolving this by hand here is a
-//! deliberate MESH-04 scope boundary, not an oversight: MESH-04 owns
-//! lifecycle/listener wiring, MESH-05 owns identity extraction.
+//! ## WhoIs (MESH-05) — FFI binding added, wiring blocked on two verified gaps
+//! MESH-04's doc (previous paragraph, preserved above for history) assumed
+//! `tailscale_whois` was "already statically linked into the binary via the
+//! same `libtailscale.a`" and only missing a Rust wrapper. MESH-05 checked
+//! that assumption against the actual vendored source the pinned `tsnet`
+//! 0.1.0 crate ships (`tailscale.h`/`tailscale.c`/`tailscale.go`, present in
+//! its crates.io source tarball) and found it does **not** hold:
+//!
+//! 1. **The C symbol itself does not exist in this vendored snapshot.**
+//!    `grep -n whois` across all three vendored source files returns nothing
+//!    — the pinned crate vendors `tailscale.com v1.1.1-0.20230308…` (see its
+//!    `go.mod`), which predates upstream `libtailscale` adding
+//!    `tailscale_whois` at all. So `--features tsnet` compiling this crate's
+//!    vendored Go source will never *produce* a `tailscale_whois` symbol to
+//!    link against, regardless of how it's declared on the Rust side.
+//! 2. **Even with that symbol available, `tsnet::Server` doesn't expose the
+//!    handle needed to call it.** `tsnet::Server { handle: sys::tailscale }`
+//!    (`rust/src/lib.rs` in the crate's source) is a private field with no
+//!    accessor — `sys::tailscale` is a bare `c_int` (see its
+//!    bindgen-generated `tailscale.h`: `typedef int tailscale;`), but this
+//!    crate has no supported way to read it out of a `Server` we didn't
+//!    build ourselves via `sys::tailscale_new` (which would create a SECOND,
+//!    disconnected tsnet node object, not give us the handle for the one
+//!    [`TailnetServer::start`] already built).
+//!
+//! This is exactly the "genuinely does not expose the underlying handle
+//! needed" case the MESH-05 spec item's own approach section anticipated,
+//! and its prescribed response is "bump the dep or add a minimal direct
+//! `extern "C"` against libtailscale, document exactly what you did and
+//! why." Bumping `tsnet` to a release whose vendored source implements
+//! `tailscale_whois` is the real fix, but this dev/build sandbox has no
+//! network egress to crates.io or GitHub to identify/fetch one (verified —
+//! `curl` to both times out/is unreachable here), so that step is left for
+//! whichever future item does have that access, rather than guessing a
+//! version number blind.
+//!
+//! What MESH-05 DID land, all under this feature gate:
+//! - [`whois_ffi::tailscale_whois`] — the `extern "C"` declaration itself
+//!   (item 1's blocker: declared, but nothing in the currently-linked
+//!   archive implements it yet, so it is not actually *called* anywhere in
+//!   this file — an unreferenced `extern "C"` declaration links fine; it
+//!   only needs to resolve once something calls it).
+//! - [`parse_whois_json`] — a pure, fully unit-tested function that decodes
+//!   `libtailscale`'s documented `WhoIsResponse` JSON shape
+//!   (`Node.Name`/`Node.Tags`/`UserProfile.LoginName`) into a
+//!   [`crate::mesh::TailnetIdentity`]. This is the part of "wire up WhoIs"
+//!   that doesn't depend on either verified gap above, so it's real,
+//!   working, tested code today — once a future item resolves gap 1 (dep
+//!   bump) and gap 2 (a way to reach the live handle, e.g. if that same dep
+//!   bump also adds a `Server` accessor), completing the wire-up is "call
+//!   the FFI function, feed its JSON output to this parser" — a small,
+//!   mechanical follow-up, not a redesign.
+//! - [`TailnetServer::whois`] / [`TailnetServer::whois_identity`] — the
+//!   stable accessor surface (unchanged shape from MESH-04, plus the new
+//!   `TailnetIdentity`-returning variant the mesh identity layer in
+//!   `crate::mcp_server` consumes). Both still return "not available" today
+//!   ([`WhoIsError::Unavailable`] / `None` respectively) — never a panic —
+//!   because of the two verified gaps above, not because they're unwired in
+//!   principle.
 //!
 //! ## Config surface (non-secret, `std::env::var`; consistent with
 //! `crate::mesh::registry`'s convention)
@@ -104,6 +147,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::mesh::registry::ResolvedSecret;
+use crate::mesh::TailnetIdentity;
 
 /// The tailnet listener's bind address, in `tsnet`'s own address syntax
 /// (empty host = all of this node's tailnet IPs). Deliberately NOT 443 —
@@ -243,6 +287,12 @@ pub fn tailnet_enabled_from_env() -> bool {
 /// A tailnet peer's resolved identity — the minimal shape MESH-05's
 /// allowlist/audit middleware needs. Deliberately small: only what an authz
 /// decision requires, never anything secret.
+///
+/// Kept as this module's own type (distinct from
+/// [`crate::mesh::TailnetIdentity`]) because it mirrors `libtailscale`'s
+/// `WhoIsResponse` field names 1:1 for [`parse_whois_json`]'s benefit;
+/// [`TailnetServer::whois_identity`] converts to the crate-wide
+/// [`crate::mesh::TailnetIdentity`] shape MESH-06 actually consumes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WhoIsInfo {
     /// The tailnet login identity (e.g. an operator's tailnet account) that
@@ -250,19 +300,35 @@ pub struct WhoIsInfo {
     pub login_name: String,
     /// The connecting node's own tailnet machine name.
     pub node_name: String,
+    /// ACL tags carried by the connecting node, if any (e.g. `tag:ci`).
+    pub tags: Vec<String>,
 }
 
 /// Errors from [`TailnetServer::whois`].
 #[derive(Debug, Error)]
 pub enum WhoIsError {
-    /// See the module doc's "WhoIs" section: the pinned `tsnet` 0.1.0
-    /// crate's C API predates `tailscale_whois`, so no lookup can be
-    /// performed yet.
+    /// WhoIs cannot be performed today. See the module doc's "WhoIs
+    /// (MESH-05)" section for the two independently-verified reasons: the
+    /// pinned `tsnet` 0.1.0 crate's vendored `libtailscale` source doesn't
+    /// implement `tailscale_whois` at all (not just an unwrapped binding),
+    /// and even if it did, `tsnet::Server` exposes no accessor for the raw
+    /// handle [`whois_ffi::tailscale_whois`] would need to call it.
     #[error(
-        "WhoIs is not supported by the pinned tsnet crate version (no tailscale_whois FFI \
-         binding available) -- see crate::mesh::tailnet's module doc"
+        "WhoIs is not available: the pinned tsnet 0.1.0 crate's vendored libtailscale source \
+         has no tailscale_whois implementation, and tsnet::Server exposes no handle accessor \
+         to call it even if it did -- see crate::mesh::tailnet's module doc"
     )]
-    Unsupported,
+    Unavailable,
+    /// `tailscale_whois` itself reported an error for this lookup (e.g. no
+    /// entry for the given address). Not currently reachable (see
+    /// [`WhoIsError::Unavailable`]), but modeled now so the eventual live
+    /// call site has somewhere to put a real FFI error.
+    #[error("tailscale_whois lookup failed: {0}")]
+    Ffi(String),
+    /// `tailscale_whois` succeeded but its JSON output didn't match the
+    /// expected `WhoIsResponse` shape.
+    #[error("could not parse tailscale_whois response: {0}")]
+    InvalidResponse(String),
 }
 
 /// A gateway node embedded in-process on the tailnet (MESH-04). Wraps a
@@ -387,12 +453,147 @@ impl TailnetServer {
 
     /// Look up the tailnet identity of the peer that reached this listener.
     /// Stable accessor surface for MESH-05's middleware to consume — see the
-    /// module doc's "WhoIs" section for why this currently always returns
-    /// [`WhoIsError::Unsupported`]: the pinned `tsnet` 0.1.0 crate's C API
-    /// predates `tailscale_whois`.
+    /// module doc's "WhoIs (MESH-05)" section for why this currently always
+    /// returns [`WhoIsError::Unavailable`]: the pinned `tsnet` 0.1.0 crate's
+    /// vendored `libtailscale` source has no `tailscale_whois`
+    /// implementation to call, and even if it did, `tsnet::Server` exposes
+    /// no accessor for the raw handle [`whois_ffi::tailscale_whois`] needs.
     pub fn whois(&self, _remote_addr: std::net::SocketAddr) -> Result<WhoIsInfo, WhoIsError> {
-        Err(WhoIsError::Unsupported)
+        // Deliberately does NOT call `whois_ffi::tailscale_whois` -- doing
+        // so would require a `sys::tailscale` handle this crate cannot
+        // obtain from `self.server` (private field, no accessor; see the
+        // module doc). Fabricating one (e.g. `0`, or minting a second node
+        // via `tsnet::ServerBuilder`) would either call into an
+        // unimplemented symbol or silently return wrong-node data --  both
+        // worse than this explicit, documented "not available" error.
+        Err(WhoIsError::Unavailable)
     }
+
+    /// [`Self::whois`], mapped into the crate-wide
+    /// [`crate::mesh::TailnetIdentity`] shape the identity middleware in
+    /// `crate::mcp_server` (and MESH-06 downstream) consumes, collapsing any
+    /// error into `None` -- a WhoIs miss or failure is never fatal here;
+    /// absence just means this connection has no tailnet-derived principal
+    /// input, and mTLS (or another source) may still supply one. This is the
+    /// method MESH-05's middleware actually calls.
+    pub fn whois_identity(&self, remote_addr: std::net::SocketAddr) -> Option<TailnetIdentity> {
+        match self.whois(remote_addr) {
+            Ok(info) => Some(TailnetIdentity {
+                login: info.login_name,
+                node: info.node_name,
+                tags: info.tags,
+            }),
+            Err(_) => None,
+        }
+    }
+}
+
+/// Raw FFI binding to `libtailscale`'s `tailscale_whois` entry point — added
+/// by MESH-05 (previously a hard stub with no binding at all). See the
+/// module doc's "WhoIs (MESH-05)" section for why this declaration, while
+/// well-formed, is not yet reachable from [`TailnetServer::whois`].
+///
+/// Signature mirrors the documented upstream `libtailscale` C API (as of the
+/// `tailscale_whois` entry point's public documentation): like
+/// [`tailscale_loopback`]'s existing buffer-out convention (`tailscale.h` in
+/// this crate's vendored source), the response is written as a JSON-encoded
+/// `WhoIsResponse` into a caller-provided buffer rather than an FFI struct,
+/// which avoids having to pin an exact C struct ABI on the Rust side (a
+/// struct layout mismatch would silently corrupt memory; a JSON parse
+/// failure just returns an error). [`ERANGE_ERRNO`] documents the "buffer
+/// too small" contract callers must handle by retrying with a larger buffer
+/// (mirroring [`tailscale_errmsg`]'s own fixed-buffer usage elsewhere in
+/// this file, generalized to a retry loop since a `WhoIsResponse` has no
+/// fixed maximum size).
+///
+/// [`tailscale_loopback`]: https://github.com/tailscale/libtailscale
+/// [`tailscale_errmsg`]: https://github.com/tailscale/libtailscale
+mod whois_ffi {
+    use std::os::raw::{c_char, c_int};
+
+    extern "C" {
+        /// `int tailscale_whois(tailscale sd, const char* remote_addr, char* json_out, size_t json_out_len);`
+        ///
+        /// `remote_addr` is a NUL-terminated `ip:port` string. Writes a
+        /// JSON-encoded `WhoIsResponse` into `json_out` (NUL-terminated,
+        /// truncated to `json_out_len`). Returns zero on success, -1 on
+        /// error (call `tailscale_errmsg` for details, per this crate's
+        /// existing convention for every other `tailscale_*` call).
+        ///
+        /// NOT CURRENTLY CALLED anywhere in this crate — see the module
+        /// doc's "WhoIs (MESH-05)" section for why (no handle accessor from
+        /// `tsnet::Server`, and this symbol isn't implemented by the
+        /// currently-linked, pinned `tsnet` 0.1.0 vendored archive either).
+        /// An unreferenced `extern "C"` declaration like this one links
+        /// fine regardless -- it only needs to resolve once something
+        /// actually calls it.
+        #[allow(dead_code)]
+        pub fn tailscale_whois(
+            sd: c_int,
+            remote_addr: *const c_char,
+            json_out: *mut c_char,
+            json_out_len: usize,
+        ) -> c_int;
+    }
+}
+
+/// Decode `libtailscale`'s `WhoIsResponse` JSON shape (as written by
+/// [`whois_ffi::tailscale_whois`], once reachable) into a [`WhoIsInfo`].
+/// Pure and fully unit-tested independent of any live FFI call or handle --
+/// see the module doc's "WhoIs (MESH-05)" section for why this is the part
+/// of WhoIs support that's genuinely complete today, ahead of the FFI call
+/// site itself.
+///
+/// Only decodes the fields this crate actually uses
+/// (`Node.Name`/`Node.Tags`/`UserProfile.LoginName`); the real
+/// `WhoIsResponse` has additional fields (capabilities, key expiry, etc.)
+/// this crate has no use for and deliberately ignores (`serde`'s default
+/// "ignore unknown fields" behavior), so a future `libtailscale` version
+/// adding more fields to the response can't break parsing here.
+fn parse_whois_json(json: &str) -> Result<WhoIsInfo, WhoIsError> {
+    #[derive(serde::Deserialize)]
+    struct WhoIsResponse {
+        #[serde(rename = "Node")]
+        node: Option<WhoIsNode>,
+        #[serde(rename = "UserProfile")]
+        user_profile: Option<WhoIsUserProfile>,
+    }
+    #[derive(serde::Deserialize)]
+    struct WhoIsNode {
+        #[serde(rename = "Name")]
+        name: Option<String>,
+        #[serde(rename = "Tags")]
+        tags: Option<Vec<String>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct WhoIsUserProfile {
+        #[serde(rename = "LoginName")]
+        login_name: Option<String>,
+    }
+
+    let parsed: WhoIsResponse =
+        serde_json::from_str(json).map_err(|e| WhoIsError::InvalidResponse(e.to_string()))?;
+
+    let node_name = parsed
+        .node
+        .as_ref()
+        .and_then(|n| n.name.clone())
+        .ok_or_else(|| WhoIsError::InvalidResponse("missing Node.Name".to_string()))?;
+    let login_name = parsed
+        .user_profile
+        .as_ref()
+        .and_then(|p| p.login_name.clone())
+        .ok_or_else(|| WhoIsError::InvalidResponse("missing UserProfile.LoginName".to_string()))?;
+    let tags = parsed
+        .node
+        .and_then(|n| n.tags)
+        .unwrap_or_default();
+
+    Ok(WhoIsInfo {
+        login_name,
+        node_name,
+        tags,
+    })
 }
 
 /// Drive one accepted tailnet connection's HTTP framing directly with
@@ -561,13 +762,61 @@ mod tests {
     // ── WhoIs scope boundary ─────────────────────────────────────────────────
 
     #[test]
-    fn whois_error_documents_the_unsupported_reason() {
+    fn whois_error_documents_the_unavailable_reason() {
         // A live `TailnetServer::whois` call needs an actually-started tsnet
         // node (real auth key + network egress), out of scope for a unit
         // test -- this pins the documented contract via the error type
-        // itself instead: MESH-04 exposes the accessor, but the pinned
-        // `tsnet` crate version has no `tailscale_whois` FFI binding yet.
-        let err = WhoIsError::Unsupported;
-        assert!(err.to_string().contains("not supported"));
+        // itself instead: MESH-05 added the `tailscale_whois` FFI
+        // declaration, but the pinned `tsnet` 0.1.0 crate's vendored
+        // libtailscale source doesn't implement that symbol, and
+        // `tsnet::Server` exposes no handle accessor to call it even if it
+        // did -- see the module doc's "WhoIs (MESH-05)" section.
+        let err = WhoIsError::Unavailable;
+        assert!(err.to_string().contains("not available"));
+    }
+
+    // ── parse_whois_json — pure, no live handle/FFI call needed ─────────────
+
+    #[test]
+    fn parse_whois_json_decodes_a_well_formed_response() {
+        let json = r#"{
+            "Node": {"Name": "laptop.tailnetname.ts.net", "Tags": ["tag:ci"]},
+            "UserProfile": {"LoginName": "<email>"}
+        }"#;
+        let info = parse_whois_json(json).expect("well-formed response should parse");
+        assert_eq!(info.node_name, "laptop.tailnetname.ts.net");
+        assert_eq!(info.login_name, "<email>");
+        assert_eq!(info.tags, vec!["tag:ci".to_string()]);
+    }
+
+    #[test]
+    fn parse_whois_json_defaults_missing_tags_to_empty() {
+        let json = r#"{
+            "Node": {"Name": "laptop.tailnetname.ts.net"},
+            "UserProfile": {"LoginName": "<email>"}
+        }"#;
+        let info = parse_whois_json(json).expect("response without Tags should still parse");
+        assert!(info.tags.is_empty());
+    }
+
+    #[test]
+    fn parse_whois_json_rejects_garbage() {
+        let err = parse_whois_json("not json").expect_err("garbage input must not panic or succeed");
+        assert!(matches!(err, WhoIsError::InvalidResponse(_)));
+    }
+
+    #[test]
+    fn parse_whois_json_rejects_missing_node_name() {
+        let json = r#"{"UserProfile": {"LoginName": "<email>"}}"#;
+        let err = parse_whois_json(json).expect_err("missing Node.Name must error, not panic");
+        assert!(matches!(err, WhoIsError::InvalidResponse(_)));
+    }
+
+    #[test]
+    fn parse_whois_json_rejects_missing_login_name() {
+        let json = r#"{"Node": {"Name": "laptop.tailnetname.ts.net"}}"#;
+        let err =
+            parse_whois_json(json).expect_err("missing UserProfile.LoginName must error, not panic");
+        assert!(matches!(err, WhoIsError::InvalidResponse(_)));
     }
 }
