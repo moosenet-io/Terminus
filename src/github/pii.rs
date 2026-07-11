@@ -57,8 +57,44 @@ fn patterns() -> &'static Patterns {
             .expect("internal_domain regex"),
         email: Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
             .expect("email regex"),
-        phone: Regex::new(r"\+?\d[\d\s\-]{8,}\d").expect("phone regex"),
-        api_key: Regex::new(r"\b(?:sk-|ghp_|gsk_|glpat-|xox[bpasr]-)\S+") // pii-test-fixture
+        // Canonical phone formats ONLY — either E.164 (a leading `+` then a
+        // mostly-digit run) or a grouped NANP-style `NNN NNN NNNN` /
+        // `NNN-NNN-NNNN` (optionally parenthesized area code). The previous
+        // loose regex (`\+?\d[\d\s\-]{8,}\d`) matched ANY 10+ digit/space/hyphen
+        // run, which — even with the `date_like`/`phone_match_is_phone_shaped`
+        // guards — still leaked on compact build IDs (`20260526-010203`),
+        // model-version strings (`claude-…-4-20250514`), multi-number log/data
+        // lines (`200 1532 0`), numeric ranges (`1000-10000`), and space-grouped
+        // math data (`10 20 30 40`), because the `\b`-anchored date exclusion
+        // silently fails whenever a date abuts a word char (`\n2026-01-01`, a
+        // leading `v`, etc.). Requiring a canonical phone SHAPE sidesteps every
+        // one of those: none of those shapes is `+…` or 3-3-4 grouped. Real
+        // phones in these repos are always written in one of these two forms
+        // (see the E.164 / hyphenated regression guards in the test module).
+        //
+        // KNOWN ACCEPTED-SCOPE GAPS (deliberate recall/precision trade-off):
+        // a bare unseparated 10-digit run (`5551234567`) is intentionally NOT
+        // flagged — it is indistinguishable from a byte-count / timestamp / ID
+        // (cf. `unseparated_digit_runs_are_not_flagged_as_phone`); a
+        // dot-separated `555.123.4567` and non-NANP national formats (UK
+        // `020 7123 4567`, `00`-prefixed international) also slip. Any real
+        // phone in these repos is written `+E.164` or NANP 3-3-4, so this is an
+        // accepted trade to eliminate the ID/date/timestamp false-positive flood.
+        phone: Regex::new(
+            r"(?:\+\d[\d \-]{5,13}\d)|(?:\b\(?\d{3}\)?[ \-]\d{3}[ \-]\d{4}\b)",
+        )
+        .expect("phone regex"),
+        // A key prefix followed by a REAL token body (>= 10 token chars) — not
+        // the bare prefix. The old `\S+` (>=1 non-space) fired on every
+        // occurrence of a bare prefix inside PII-*detection* source: a
+        // redaction regex `Regex::new(r"\b(sk-[A-Za-z0-9\-_]{10,}|ghp_…)")`, a
+        // doc comment `// patterns: sk-, ghp_`, a test `assert!(!s.contains(
+        // "glpat-"))`. In every one of those the prefix is followed by a
+        // non-token char (`[`, `|`, `,`, `"`, `)`), so a real-body requirement
+        // rejects them while still matching a genuine leaked key (`<REDACTED-SECRET>…`,
+        // `ghp_…36`, `glpat-…20` all carry >= 10 token chars). This mirrors the
+        // fleet's own detectors (Chord `result_guard.rs` uses the same `{10,}`).
+        api_key: Regex::new(r"\b(?:sk-|ghp_|gsk_|glpat-|xox[bpasr]-)[A-Za-z0-9_\-]{10,}") // pii-test-fixture
             .expect("api_key regex"),
         internal_path: Regex::new(r"<path>/|<path>/|<path>/|/opt/lumina[a-z0-9-]*/") // pii-test-fixture
             .expect("internal_path regex"),
@@ -157,26 +193,15 @@ fn byte_ceil(s: &str, mut i: usize) -> usize {
     i
 }
 
-/// Whether a raw `phone` regex match is actually phone-SHAPED rather than a
-/// hash-digest fragment, a unix timestamp, or an arbitrary large integer ID.
+/// Secondary digit-count guard on a canonical `phone` regex match.
 ///
-/// The `phone` regex (`\+?\d[\d\s\-]{8,}\d`) matches any run of 10+ digits
-/// with optional internal spaces/hyphens and an optional leading `+` — which
-/// also matches: digit runs embedded in a hex string (a SHA prefix whose
-/// digits happen to have no letters), bare unix timestamps (`1717000000`),
-/// and large signed integer IDs. None of those are phone numbers.
-///
-/// GHMRFIX-gate-tune's fix: require the match to carry an actual
-/// phone-shaped cue — either a leading `+` (E.164-style, e.g. a
-/// country-code-prefixed number) or an internal separator (space/hyphen, // pii-test-fixture
-/// e.g. a 3-3-4 hyphen-grouped number) — AND at least 7 digit characters
-/// (rules out short hyphen-separated non-phone shapes like the `8-4-4-4-12`
-/// UUID-shape description in docs, which has only 6 digits). A bare,
-/// unseparated digit run (no `+`, no internal space/hyphen) is never treated
-/// as a phone number under this rule, since that shape is indistinguishable
-/// from a hash fragment/timestamp/integer-ID and — per the regression
-/// guards below — every real-phone test fixture in this repo carries either
-/// a leading `+` or a visible separator.
+/// The `phone` regex now matches ONLY canonical shapes — E.164
+/// (`\+\d[\d \-]{5,13}\d`) or grouped NANP (`\(?\d{3}\)?[ \-]\d{3}[ \-]\d{4}`)
+/// — so the old "must carry a `+` or a separator" heuristic is subsumed by the
+/// regex itself. This guard remains only to reject a degenerate E.164 match
+/// that is mostly separators (e.g. `<phone>`, which the regex accepts but
+/// carries too few digits to be a real number): a genuine phone has at least 7
+/// digit characters. NANP matches always have exactly 10, so they always pass.
 fn phone_match_is_phone_shaped(matched: &str) -> bool {
     let digit_count = matched.chars().filter(|c| c.is_ascii_digit()).count();
     if digit_count < 7 {
@@ -1270,6 +1295,88 @@ mod tests {
         assert!(
             !v.iter().any(|x| x.category == "phone"),
             "short hyphenated non-phone shape must not be flagged: {v:?}"
+        );
+    }
+
+    /// GHMR-phone-strict: the real-world non-phone shapes that the mirror
+    /// catch-up sweep surfaced across Harmony + lumina-constellation — compact
+    /// build IDs, model-version strings, multi-number log/data lines, numeric
+    /// ranges, space-grouped math data, ISO dates abutting a word char (`\n`
+    /// escape), and a fake test SSN. NONE is a phone number; all previously
+    /// slipped through the loose regex + `\b`-anchored date exclusion. The
+    /// canonical-format regex rejects every one by shape.
+    #[test]
+    #[serial]
+    fn real_world_non_phone_shapes_are_not_flagged() {
+        clear_allow();
+        for sample in [
+            "\"build-LM-20260526-010203\"",              // pii-test-fixture (build id)
+            "name: \"build-LM-20260514-100000\".into()", // pii-test-fixture (build id)
+            "/// claude-sonnet-4-20250514 retires 2026-06-15", // pii-test-fixture (model+date)
+            "  - claude-opus-4-20250514",                // pii-test-fixture (model version)
+            "Recommended: 1000-10000 milliseconds",      // pii-test-fixture (range)
+            "\"GET /a HTTP/1.1\" 200 1532 0.042",        // pii-test-fixture (access-log numbers)
+            "values `10 20 30 40` -> middles",           // pii-test-fixture (space-grouped math)
+            "parse_sales(\"date,region\\n2026-01-01,north\\n\")", // pii-test-fixture (date after \n)
+            "Your SSN: 123-45-6789 has been updated.",   // pii-test-fixture (fake ssn, 3-2-4)
+            "window 20260612T090000Z -> 20260612T100000Z", // pii-test-fixture (compact datetime)
+        ] {
+            let v = scan_for_pii(sample); // pii-test-fixture
+            assert!(
+                !v.iter().any(|x| x.category == "phone"),
+                "non-phone shape must not be flagged as phone: {sample:?} -> {v:?}"
+            );
+        }
+    }
+
+    /// GHMR-phone-strict: canonical phone formats — E.164, hyphen-grouped, and
+    /// space-grouped / parenthesized NANP — must all still flag. Guards the
+    /// strict regex against over-tightening past real phone numbers.
+    #[test]
+    #[serial]
+    fn canonical_phone_formats_still_flag() {
+        clear_allow();
+        for sample in [
+            "call <phone> today",       // pii-test-fixture (e.164)
+            "reach me at <phone>",      // pii-test-fixture (hyphen 3-3-4)
+            "phone: <phone>",           // pii-test-fixture (space 3-3-4)
+            "office (<phone> ext 2",   // pii-test-fixture (parenthesized area code)
+        ] {
+            let v = scan_for_pii(sample); // pii-test-fixture
+            assert!(
+                v.iter().any(|x| x.category == "phone"),
+                "canonical phone must still flag: {sample:?} -> {v:?}"
+            );
+        }
+    }
+
+    /// GHMRFIX-4: a bare key PREFIX inside PII-detection source (a redaction
+    /// regex, a doc comment, a `contains("glpat-")` test assertion) is public,
+    /// well-known, and not a secret — it must NOT flag. Only a prefix followed
+    /// by a real >= 10-char token body (an actual leaked key) flags. This is
+    /// what lets the fleet's own guard code publish cleanly instead of being
+    /// corrupted by an over-eager scrub.
+    #[test]
+    #[serial]
+    fn bare_key_prefixes_in_detection_code_are_not_flagged() {
+        clear_allow();
+        for sample in [
+            r#"api_key: Regex::new(r"\b(sk-[A-Za-z0-9\-_]{10,}|ghp_[A-Za-z0-9]{10,})")"#, // pii-test-fixture
+            r#"//! - Credential patterns (sk-, ghp_, JWT tokens, API keys)"#, // pii-test-fixture
+            r#"assert!(!err.reason.contains("glpat-"), "prefix must not leak");"#, // pii-test-fixture
+            r#"assert!(!out.contains("glpat-"));"#, // pii-test-fixture
+        ] {
+            let v = scan_for_pii(sample); // pii-test-fixture
+            assert!(
+                !v.iter().any(|x| x.category == "api_key"),
+                "bare key prefix in detection code must not flag: {sample:?} -> {v:?}"
+            );
+        }
+        // A real key (prefix + >= 10-char body) must still flag.
+        let real = scan_for_pii("leaked <REDACTED-SECRET> here"); // pii-test-fixture
+        assert!(
+            real.iter().any(|x| x.category == "api_key"),
+            "a genuine key must still flag: {real:?}"
         );
     }
 
