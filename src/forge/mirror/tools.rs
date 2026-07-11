@@ -79,7 +79,10 @@ use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
 use super::clean::dispatch_cleaning;
-use super::workdir::{assert_never_force, run_git, MirrorWorkDir};
+use super::history::{
+    gate_full_history, last_mirrored_sha, replay_incremental_or_full, IdentityMap, ReplayOpts,
+};
+use super::workdir::{assert_never_force, run_git, MirrorWorkDir, WORKDIR_ROOT_ENV};
 
 /// Environment variable holding the target GitHub mirror remote URL when a call
 /// does not pass one explicitly. Checked per-repo first
@@ -1328,8 +1331,184 @@ pub(crate) async fn dispatch_mirror_action(action: &str, args: Value) -> Result<
 
 // ── Registration ────────────────────────────────────────────────────────────
 
-/// Register all four GHMR-04 mirror subtools. Called from
-/// [`crate::github::register`], so they attach to whichever registry github is
+// ── GHIST-06: full-history backfill + status tools ──────────────────────────
+
+/// The FULL-HISTORY mirror work dir for `repo`: `<WORKDIR_ROOT>/<repo>-history`.
+/// Distinct from the snapshot mirror work dir (`<root>/<repo>`) so the two models
+/// coexist during the GHIST transition. `repo` must be pre-validated.
+fn history_workdir(repo: &str) -> Result<PathBuf, ToolError> {
+    let root = std::env::var(WORKDIR_ROOT_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            ToolError::NotConfigured(format!(
+                "{WORKDIR_ROOT_ENV} is not set — cannot locate the history work dir for {repo}"
+            ))
+        })?;
+    Ok(Path::new(root.trim()).join(format!("{repo}-history")))
+}
+
+/// `git_public_history_status` — lineage state of the full-history mirror.
+struct GitPublicHistoryStatus;
+
+#[async_trait]
+impl RustTool for GitPublicHistoryStatus {
+    fn name(&self) -> &str {
+        "git_public_history_status"
+    }
+    fn description(&self) -> &str {
+        "Report the full-history mirror's lineage state for a repo (GHIST): whether a \
+         scrubbed full-history backfill exists, internal-main HEAD + total internal commit \
+         count, the mirror work-dir commit count, the last-mirrored internal sha, and how \
+         many internal commits are not yet mirrored. Read-only. Requires 'repo'; 'source' \
+         defaults to TERMINUS_MIRROR_SOURCE_ROOT/<repo> when set."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "repo":   { "type": "string", "description": "Logical repo name" },
+                "source": { "type": "string", "description": "internal-main checkout (optional when TERMINUS_MIRROR_SOURCE_ROOT is set)" }
+            },
+            "required": ["repo"]
+        })
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let repo = req_str(&args, "repo")?;
+        validate_repo(repo)?;
+        let source = resolve_source(&args, repo)?;
+        ensure_source_is_main(&source)?;
+        let hwd = history_workdir(repo)?;
+
+        let source_head = run_git(&source, &["rev-parse", "HEAD"])?.trim().to_string();
+        let source_commits: u64 = run_git(&source, &["rev-list", "--count", "--all"])?
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        let last = last_mirrored_sha(&hwd);
+        let lineage = hwd.join(".git").is_dir();
+        let work_commits: u64 = if lineage {
+            run_git(&hwd, &["rev-list", "--count", "--all"])
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let behind: Option<u64> = last.as_ref().map(|l| {
+            run_git(&source, &["rev-list", "--count", &format!("{l}..{source_head}")])
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0)
+        });
+
+        Ok(json!({
+            "repo": repo,
+            "lineage_established": lineage,
+            "source_head": source_head,
+            "source_commits": source_commits,
+            "work_commits": work_commits,
+            "last_mirrored_sha": last,
+            "commits_behind": behind,
+        })
+        .to_string())
+    }
+}
+
+/// `git_public_history_backfill` — produce/update the scrubbed full-history mirror
+/// and gate every commit. NEVER pushes (a clean result is a blessable snapshot).
+struct GitPublicHistoryBackfill;
+
+#[async_trait]
+impl RustTool for GitPublicHistoryBackfill {
+    fn name(&self) -> &str {
+        "git_public_history_backfill"
+    }
+    fn description(&self) -> &str {
+        "Produce (or update) the PII-scrubbed FULL-HISTORY mirror for a repo and gate EVERY \
+         commit's tree (GHIST). First run = full backfill (all history replayed, every blob \
+         scrubbed, authors remapped per TERMINUS_MIRROR_AUTHOR_MAP); later runs append the \
+         new internal commits (fast-forward). Then runs the full-history PII gate over every \
+         commit. Returns replay metrics + the gate result. NEVER pushes — a gate-clean result \
+         is a blessable snapshot for the operator to spot-check + force re-baseline (GHIST-07); \
+         a dirty result WITHHOLDS the snapshot and reports the exact commit:file:line. Requires \
+         'repo' (+ 'source' unless TERMINUS_MIRROR_SOURCE_ROOT is set) and a configured \
+         TERMINUS_MIRROR_AUTHOR_MAP (a public backfill must remap author identities)."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "repo":   { "type": "string", "description": "Logical repo name" },
+                "source": { "type": "string", "description": "internal-main checkout (optional when TERMINUS_MIRROR_SOURCE_ROOT is set)" }
+            },
+            "required": ["repo"]
+        })
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let repo = req_str(&args, "repo")?;
+        validate_repo(repo)?;
+        let source = resolve_source(&args, repo)?;
+        ensure_source_is_main(&source)?;
+        let hwd = history_workdir(repo)?;
+
+        // Fail-closed: a PUBLIC history backfill must remap author identities
+        // (attribution + internal-email scrub). No map → refuse.
+        let author_map = IdentityMap::from_env()?.ok_or_else(|| {
+            ToolError::NotConfigured(
+                "TERMINUS_MIRROR_AUTHOR_MAP is not set — a public history backfill must remap \
+                 author identities (contribution attribution + internal-email scrub). Configure \
+                 it (see .env.example) before running."
+                    .into(),
+            )
+        })?;
+
+        // A FRESH full backfill needs an empty work dir; wipe a stale one (a prior
+        // partial run that never recorded a mirrored sha). An already-established
+        // lineage is left intact — replay_incremental_or_full appends to it.
+        if last_mirrored_sha(&hwd).is_none() && hwd.exists() {
+            std::fs::remove_dir_all(&hwd)
+                .map_err(|e| ToolError::Execution(format!("wipe stale history work-dir: {e}")))?;
+        }
+
+        let opts = ReplayOpts::with_author_map(author_map);
+        let (is_full, replay) = replay_incremental_or_full(&source, &hwd, &opts)?;
+        let gate = gate_full_history(&hwd)?;
+        let work_head = run_git(&hwd, &["rev-parse", "HEAD"]).ok().map(|s| s.trim().to_string());
+
+        Ok(json!({
+            "repo": repo,
+            "mode": if is_full { "full-backfill" } else { "incremental" },
+            "replay": {
+                "commits": replay.commits,
+                "blobs_total": replay.blobs_total,
+                "blobs_rewritten": replay.blobs_rewritten,
+                "idents_remapped": replay.idents_remapped,
+            },
+            "gate": {
+                "clean": gate.clean,
+                "commits_scanned": gate.commits_scanned,
+                "unique_trees": gate.unique_trees,
+                "residual_count": gate.violations.len(),
+                // Cap the echoed spots so a very dirty history doesn't return a huge payload.
+                "violations": gate.violations.iter().take(50).map(|v| json!({
+                    "commit": v.commit, "file": v.file, "line": v.line, "pattern_kind": v.pattern_kind, "context": v.context,
+                })).collect::<Vec<_>>(),
+            },
+            "work_head": work_head,
+            "blessable": gate.clean,
+            "note": if gate.clean {
+                "gate-clean full-history snapshot — spot-check + operator-bless, then force re-baseline (GHIST-07). NOT pushed."
+            } else {
+                "residual PII remains in history — snapshot WITHHELD; remediate the flagged commits (or source), then re-run."
+            },
+        })
+        .to_string())
+    }
+}
+
+/// Register all four GHMR-04 mirror subtools plus the GHIST history tools. Called
+/// from [`crate::github::register`], so they attach to whichever registry github is
 /// registered against (the CORE registry via `register_all`, the personal
 /// registry via `register_personal`). Unconditional: no GitHub credential is
 /// needed to construct them; `git_public_mirror_push` reads the token lazily at call
@@ -1340,6 +1519,8 @@ pub fn register(registry: &mut ToolRegistry) {
     registry.register_or_replace(Box::new(GitPublicMirrorApprove));
     registry.register_or_replace(Box::new(GitPublicMirrorPush));
     registry.register_or_replace(Box::new(GitPublicMirrorSyncSource));
+    registry.register_or_replace(Box::new(GitPublicHistoryStatus));
+    registry.register_or_replace(Box::new(GitPublicHistoryBackfill));
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1429,7 +1610,72 @@ mod tests {
         std::env::remove_var("TERMINUS_MIRROR_INTERNAL_REMOTE_DEMO");
         std::env::remove_var("TERMINUS_MIRROR_SOURCE_BRANCH");
         std::env::remove_var("TERMINUS_MIRROR_CLEAN_CMD");
+        std::env::remove_var("TERMINUS_MIRROR_AUTHOR_MAP");
         std::env::remove_var("DATABASE_URL");
+    }
+
+    // ── GHIST-06: history backfill + status tools ──
+    #[tokio::test]
+    #[serial]
+    async fn history_backfill_tool_produces_blessable_snapshot() {
+        clear_env();
+        // Source history carries an internal IP and an internal author email.
+        let src = init_source(&[("cfg.txt", "internal host <internal-ip> in config\n")]); // pii-test-fixture
+        let root = unique("hist-root");
+        set_root(&root);
+        // Author map: everything → a bot noreply (also scrubs the internal author email).
+        let map_path = unique("author-map.toml");
+        std::fs::write(
+            &map_path,
+            "default_name = \"MoosenetBot\"\ndefault_email = \"<email>\"\n",
+        )
+        .unwrap();
+        std::env::set_var("TERMINUS_MIRROR_AUTHOR_MAP", &map_path);
+
+        // Backfill: full history replayed + scrubbed + attributed, then gated.
+        let out = GitPublicHistoryBackfill
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["mode"], "full-backfill", "{v}");
+        assert_eq!(v["gate"]["clean"], true, "gate-clean snapshot: {v}");
+        assert_eq!(v["blessable"], true);
+        assert!(v["replay"]["idents_remapped"].as_u64().unwrap() >= 1, "authors remapped: {v}");
+        assert!(v["replay"]["blobs_rewritten"].as_u64().unwrap() >= 1, "the IP blob scrubbed: {v}");
+
+        // Status reports established lineage.
+        let s = GitPublicHistoryStatus
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        let sv: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(sv["lineage_established"], true, "{sv}");
+        assert!(sv["work_commits"].as_u64().unwrap() >= 1);
+        assert_eq!(sv["commits_behind"].as_u64().unwrap(), 0, "mirror is at source HEAD: {sv}");
+
+        std::env::remove_var("TERMINUS_MIRROR_AUTHOR_MAP");
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&map_path);
+    }
+
+    // ── GHIST-06: backfill refuses without an author map (fail-closed) ──
+    #[tokio::test]
+    #[serial]
+    async fn history_backfill_refuses_without_author_map() {
+        clear_env();
+        let src = init_source(&[("a.txt", "plain\n")]);
+        let root = unique("hist-root2");
+        set_root(&root);
+        // No TERMINUS_MIRROR_AUTHOR_MAP set.
+        let err = GitPublicHistoryBackfill
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await;
+        assert!(err.is_err(), "must refuse without an author map: {err:?}");
+        assert!(format!("{err:?}").contains("TERMINUS_MIRROR_AUTHOR_MAP"), "{err:?}");
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn cleanup(paths: &[&Path]) {
