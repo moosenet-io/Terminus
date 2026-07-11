@@ -297,20 +297,34 @@ from it and any provided field overrides the claim's value.
 
 1. Validate the prefix (and any `status` override) → `InvalidArgument` on failure.
 2. Resolve the row: if the prefix is **already in the baseline** → `ok: false, reason:
-   "already_promoted"` (no branch, no PR). Otherwise seed from an existing pending overlay claim
-   if present, else build from args — missing required fields → `ok: false, reason:
-   "insufficient_args"` with a `required`/`missing` list and **no partial write**.
-3. When `open_pr: true` and Gitea is unconfigured → `ok: false, reason: "gitea_unconfigured"`
+   "already_promoted"` (no branch, no PR; a stale pending overlay claim is best-effort cleared).
+   Otherwise seed from an existing pending overlay claim if present, else build from args —
+   missing required fields → `ok: false, reason: "insufficient_args"` with a `required`/`missing`
+   list and **no partial write**.
+3. **Validate the durable-write fields** before touching git: `project` must be one of
+   `HARM`/`LUM`/`CHRD`/`TERM`/`RAIL`/`HW`/`PSH`, and `created` a real `YYYY-MM-DD` date
+   (`chrono::NaiveDate`). A typo in either fails with `InvalidArgument` — it lands verbatim in the
+   reviewed baseline, so it is checked before anything is written.
+4. When `open_pr: true` and Gitea is unconfigured → `ok: false, reason: "gitea_unconfigured"`
    (returned before any git mutation).
-4. Render the `[[prefix]]` row (via the `toml` serializer, so it round-trips through the same
-   `Baseline`/`PrefixEntry` types the file uses) and **idempotently append** it to
-   `data/prefix_registry.toml`. If the row is already present in the file → `ok: true, appended:
-   false` (no branch/PR).
-5. Create branch `prefix-promote-{PREFIX}` off `main`, write the file onto that branch, commit.
-   - `open_pr: true` → push and open the PR through the shared `GiteaClient::create_pull` helper
-     (the same create-pull path as `gitea_create_pr`, including its PII gate), then best-effort
-     clear the pending overlay claim. Returns `ok, pr_url, pr_number, branch, entry`.
-   - `open_pr: false` → return the branch's diff, no PR. Returns `ok, branch, entry, diff`.
+5. All git work happens in a **throwaway `git worktree`** created off `main` (preferring
+   `origin/main` after a best-effort fetch) under the system temp dir — the process's own
+   long-running checkout is **never mutated** (terminus-rs runs embedded in the Chord server, so
+   the live checkout's branch/state must be left untouched). Inside the worktree the tool renders
+   the `[[prefix]]` row (via the `toml` serializer, so it round-trips through the same
+   `Baseline`/`PrefixEntry` types the file uses) and **idempotently appends** it to
+   `data/prefix_registry.toml`. If the row is already present → `ok: true, appended: false` (no
+   PR).
+   - `open_pr: true` → push the branch, then open the PR through the shared
+     `GiteaClient::create_pull` helper (the same create-pull path as `gitea_create_pr`, including
+     its PII gate), then best-effort clear the pending overlay claim. Returns `ok, pr_url,
+     pr_number, branch, entry`. **If the PR call fails after the push, the remote branch is
+     deleted** (best-effort) so a re-run is a clean, idempotent push rather than a
+     non-fast-forward failure.
+   - `open_pr: false` → return the branch's diff (a `git diff` failure surfaces as an error, not a
+     silent empty string), no PR. Returns `ok, branch, entry, diff`.
+6. The throwaway worktree and its local branch are **always removed** afterwards (success or
+   error), in a finally-style cleanup.
 
 Git transport is a minimal `std::process::Command` sequence run against
 `PREFIX_REGISTRY_REPO_DIR` (default `.`), which must be a Terminus checkout with an `origin`

@@ -1012,6 +1012,31 @@ const REGISTRY_REL_PATH: &str = "data/prefix_registry.toml";
 /// meaningful. `spec_id`/`status`/`created` are optional (they default).
 const PROMOTE_REQUIRED_FIELDS: &[&str] = &["name", "project", "description"];
 
+/// The per-repo Plane *project* prefixes a baseline row may belong to (the
+/// v3.7 consolidation set). A durable baseline write is validated against this
+/// set — a typo'd project is rejected before anything is committed.
+const VALID_PROJECTS: &[&str] = &["HARM", "LUM", "CHRD", "TERM", "RAIL", "HW", "PSH"];
+
+/// Validate the owning-project field (already uppercased) against
+/// [`VALID_PROJECTS`]. Returns a clear error naming the allowed set otherwise.
+fn validate_project(project: &str) -> Result<(), String> {
+    if VALID_PROJECTS.contains(&project) {
+        Ok(())
+    } else {
+        Err(format!(
+            "project '{project}' invalid; expected one of {VALID_PROJECTS:?}"
+        ))
+    }
+}
+
+/// Validate an ISO `YYYY-MM-DD` date. A durable baseline row's `created` is
+/// written verbatim, so it must be a real calendar date, not free text.
+fn validate_created(created: &str) -> Result<(), String> {
+    chrono::NaiveDate::parse_from_str(created.trim(), "%Y-%m-%d")
+        .map(|_| ())
+        .map_err(|_| format!("created '{created}' is not a valid YYYY-MM-DD date"))
+}
+
 /// Resolve the working-tree root whose `data/prefix_registry.toml` is edited.
 /// Configurable via `PREFIX_REGISTRY_REPO_DIR` (default `"."`) — NOT a secret,
 /// so a plain env read is correct here (mirrors gitea/plane config reads). Git
@@ -1023,11 +1048,6 @@ fn repo_dir() -> PathBuf {
         .filter(|v| !v.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
-}
-
-/// Full on-disk path to the baseline TOML (`{repo_dir}/data/prefix_registry.toml`).
-fn registry_file_path() -> PathBuf {
-    repo_dir().join(REGISTRY_REL_PATH)
 }
 
 /// The Gitea repo name that hosts this baseline file. Defaults to `"Terminus"`
@@ -1149,6 +1169,13 @@ pub struct PlanePrefixPromote {
     /// configured in this process — `open_pr: true` then returns a clean
     /// `ok: false, reason: "gitea_unconfigured"` before touching git.
     gitea: Option<GiteaClient>,
+    /// Working-tree root whose `data/prefix_registry.toml` seeds the promotion.
+    /// The live checkout is NEVER mutated: all writes happen in a throwaway
+    /// `git worktree` created off `main`. Field (not a global env read) so tests
+    /// can point it at a temp repo without touching env or the network.
+    repo_dir: PathBuf,
+    /// Gitea repo name that hosts the baseline file (owner resolved by the client).
+    gitea_repo: String,
 }
 
 impl PlanePrefixPromote {
@@ -1173,10 +1200,26 @@ impl PlanePrefixPromote {
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     }
 
-    /// The side-effecting half: branch → write file → commit → (push + PR | diff).
-    /// Kept as its own method so unit tests exercise entry-building, TOML
-    /// rendering, and the `already_promoted`/validation decisions WITHOUT ever
-    /// shelling out to git or the network.
+    /// Pick a base ref for the throwaway worktree. Best-effort `fetch origin main`
+    /// (fetch touches only remote-tracking refs, never the working tree/branches,
+    /// so it is safe against the live checkout), then prefer `origin/main` if it
+    /// resolves, else fall back to local `main`. In a test repo with no remote the
+    /// fetch/rev-parse fail silently and this returns `"main"`.
+    fn resolve_base_ref(repo_dir: &Path) -> String {
+        let _ = Self::git(repo_dir, &["fetch", "origin", "main"]);
+        if Self::git(repo_dir, &["rev-parse", "--verify", "origin/main"]).is_ok() {
+            "origin/main".to_string()
+        } else {
+            "main".to_string()
+        }
+    }
+
+    /// The side-effecting half: create a THROWAWAY git worktree off `main`, do
+    /// the TOML append + commit + push + PR inside it, then ALWAYS remove the
+    /// worktree and the local branch — success or error — so the process's own
+    /// long-running checkout (terminus-rs runs embedded in the Chord server) is
+    /// NEVER mutated. Kept as its own method so unit tests exercise entry-building,
+    /// TOML rendering, and the `already_promoted`/validation decisions without git.
     async fn transport(
         &self,
         key: &str,
@@ -1184,15 +1227,68 @@ impl PlanePrefixPromote {
         open_pr: bool,
         identity: Option<&str>,
     ) -> Result<Value, ToolError> {
-        let base_branch = "main";
+        let repo_dir = self.repo_dir.clone();
         let branch = format!("prefix-promote-{key}");
-        let dir = repo_dir();
-        let file = registry_file_path();
+        let base_ref = Self::resolve_base_ref(&repo_dir);
 
-        // Read the current on-disk baseline and compute the idempotent append.
+        // Unique temp worktree path so concurrent promotes never collide.
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let wt = std::env::temp_dir().join(format!("terminus-prefix-promote-{key}-{unique}"));
+        let wt_str = wt.to_string_lossy().to_string();
+
+        // Clear any stale local branch of the same name (best-effort) so a retry
+        // after an earlier failure can recreate the worktree cleanly.
+        let _ = Self::git(&repo_dir, &["worktree", "prune"]);
+        let _ = Self::git(&repo_dir, &["branch", "-D", &branch]);
+
+        // Create the isolated worktree ON A NEW BRANCH off the base. Nothing in
+        // the live checkout changes.
+        Self::git(
+            &repo_dir,
+            &["worktree", "add", &wt_str, "-b", &branch, &base_ref],
+        )?;
+
+        // Do the work; capture the outcome so cleanup ALWAYS runs afterwards.
+        let outcome = self
+            .transport_in_worktree(&repo_dir, &wt, &branch, key, entry, open_pr, identity)
+            .await;
+
+        // Finally-style cleanup: remove the worktree and delete the local branch,
+        // regardless of success/failure. (On success the REMOTE branch is kept —
+        // the PR needs it; on a post-push failure the remote branch was already
+        // deleted inside `transport_in_worktree`.)
+        let _ = Self::git(&repo_dir, &["worktree", "remove", "--force", &wt_str]);
+        let _ = Self::git(&repo_dir, &["branch", "-D", &branch]);
+
+        outcome
+    }
+
+    /// The in-worktree steps, isolated so the caller can guarantee cleanup.
+    #[allow(clippy::too_many_arguments)]
+    async fn transport_in_worktree(
+        &self,
+        repo_dir: &Path,
+        wt: &Path,
+        branch: &str,
+        key: &str,
+        entry: &PrefixEntry,
+        open_pr: bool,
+        identity: Option<&str>,
+    ) -> Result<Value, ToolError> {
+        let file = wt.join(REGISTRY_REL_PATH);
+
+        // Read the base version of the file FROM the worktree and compute the
+        // idempotent append.
         let existing = std::fs::read_to_string(&file).map_err(|e| {
             ToolError::Http(format!(
-                "cannot read {} (is PREFIX_REGISTRY_REPO_DIR a Terminus checkout?): {e}",
+                "cannot read {} in the promotion worktree: {e}",
                 file.display()
             ))
         })?;
@@ -1213,19 +1309,17 @@ impl PlanePrefixPromote {
             }));
         }
 
-        // Create/reset the promotion branch off the base, then write the file
-        // ONTO that branch so the change is isolated to the PR.
-        Self::git(&dir, &["checkout", "-B", &branch, base_branch])?;
+        // Write + commit ONTO the worktree's branch.
         std::fs::write(&file, &new_content)
             .map_err(|e| ToolError::Http(format!("failed to write {}: {e}", file.display())))?;
-        Self::git(&dir, &["add", REGISTRY_REL_PATH])?;
+        Self::git(wt, &["add", REGISTRY_REL_PATH])?;
         let commit_msg = format!("chore(prefix): promote {key} into baseline prefix registry");
-        Self::git(&dir, &["commit", "-m", &commit_msg])?;
+        Self::git(wt, &["commit", "-m", &commit_msg])?;
 
         if !open_pr {
-            // open_pr=false: leave the commit on the branch, return the diff, no PR.
-            let diff = Self::git(&dir, &["diff", &format!("{base_branch}..{branch}"), "--", REGISTRY_REL_PATH])
-                .unwrap_or_default();
+            // open_pr=false: leave the commit on the branch, return the diff, no
+            // PR. Surface a diff error instead of silently emptying it.
+            let diff = Self::git(wt, &["diff", "HEAD~1", "HEAD", "--", REGISTRY_REL_PATH])?;
             return Ok(json!({
                 "ok": true,
                 "appended": true,
@@ -1233,17 +1327,17 @@ impl PlanePrefixPromote {
                 "pr_url": Value::Null,
                 "entry": entry_json(entry),
                 "diff": diff,
-                "note": "open_pr=false: committed to the branch, no PR opened",
+                "note": "open_pr=false: committed to the throwaway branch, no PR opened",
             }));
         }
 
-        // Push and open the PR through the shared Gitea create-pull helper.
+        // Push from the worktree (shares the live repo's remotes/credentials).
         let gitea = self.gitea.as_ref().ok_or_else(|| {
             ToolError::NotConfigured("Gitea is not configured; cannot open the promotion PR".into())
         })?;
-        Self::git(&dir, &["push", "-u", "origin", &branch])?;
+        Self::git(wt, &["push", "-u", "origin", branch])?;
 
-        let repo = gitea_repo_name();
+        // PR base is the remote's default branch NAME (not `origin/main`).
         let pr_body = format!(
             "Promote prefix `{key}` into the durable baseline registry \
              (`{REGISTRY_REL_PATH}`).\n\n\
@@ -1252,16 +1346,26 @@ impl PlanePrefixPromote {
             entry.name, entry.project, entry.spec_id, entry.status, entry.created
         );
         let mut pr_args = json!({
-            "repo": repo,
+            "repo": self.gitea_repo,
             "title": format!("chore(prefix): promote {key} into baseline registry"),
             "head": branch,
-            "base": base_branch,
+            "base": "main",
             "body": pr_body,
         });
         if let Some(id) = identity {
             pr_args["identity"] = json!(id);
         }
-        let pr = gitea.create_pull(&pr_args).await?;
+
+        let pr = match gitea.create_pull(&pr_args).await {
+            Ok(pr) => pr,
+            Err(e) => {
+                // The branch was pushed but the PR did not open — delete the
+                // remote branch (best-effort) so a re-run is a clean, idempotent
+                // push rather than a non-fast-forward failure.
+                let _ = Self::git(repo_dir, &["push", "origin", "--delete", branch]);
+                return Err(e);
+            }
+        };
 
         // Best-effort: drop the now-promoted pending overlay claim if reachable.
         // Never fatal, and never adds a Redis dependency (no-op with no overlay).
@@ -1335,6 +1439,9 @@ impl RustTool for PlanePrefixPromote {
         let (map, _reachable) = self.store.merged().await;
         if let Some(row) = map.get(&key) {
             if row.in_baseline {
+                // Already durable — drop any stale pending overlay claim too
+                // (best-effort; no-op without an overlay).
+                let _ = self.store.clear_overlay_claim(&key).await;
                 return Ok(json!({
                     "ok": false,
                     "reason": "already_promoted",
@@ -1370,6 +1477,12 @@ impl RustTool for PlanePrefixPromote {
             status: normalize_status(&entry.status).map_err(ToolError::InvalidArgument)?,
             ..entry
         };
+
+        // Validate the durable-write fields BEFORE any git mutation: `project`
+        // must be a known Plane project, and `created` a real YYYY-MM-DD date.
+        // These land verbatim in the reviewed baseline, so a typo must fail here.
+        validate_project(&entry.project).map_err(ToolError::InvalidArgument)?;
+        validate_created(&entry.created).map_err(ToolError::InvalidArgument)?;
 
         // A PR needs Gitea configured — gate here, AFTER the already_promoted /
         // insufficient_args decisions (those never touch Gitea) but BEFORE any
@@ -1417,7 +1530,12 @@ pub fn register(registry: &mut ToolRegistry) {
         Box::new(PlanePrefixGet { store: store.clone() }),
         Box::new(PlanePrefixCheck { store: store.clone() }),
         Box::new(PlanePrefixRetire { store: store.clone() }),
-        Box::new(PlanePrefixPromote { store: store.clone(), gitea }),
+        Box::new(PlanePrefixPromote {
+            store: store.clone(),
+            gitea,
+            repo_dir: repo_dir(),
+            gitea_repo: gitea_repo_name(),
+        }),
     ];
     for tool in tools {
         if let Err(e) = registry.register(tool) {
@@ -1678,11 +1796,61 @@ mod tests {
 
     /// A promote tool with no overlay and no Gitea — enough for the pure
     /// decision paths (already_promoted / validation / insufficient_args) that
-    /// never reach git or the network.
+    /// never reach git or the network. `repo_dir` is a placeholder; these paths
+    /// return before any git call.
     fn promote_tool() -> PlanePrefixPromote {
         PlanePrefixPromote {
             store: baseline_only_store(),
             gitea: None,
+            repo_dir: PathBuf::from("."),
+            gitea_repo: "Terminus".into(),
+        }
+    }
+
+    /// Initialise a throwaway git repo on branch `main` with a seeded
+    /// `data/prefix_registry.toml`, returning its path. Used by the seam tests so
+    /// `transport` runs end-to-end (open_pr:false) without a network or env
+    /// globals. Caller removes the dir.
+    fn init_temp_repo(seed_entries: &str) -> PathBuf {
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(format!("terminus-prefix-promote-test-{unique}"));
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        std::fs::write(dir.join("data/prefix_registry.toml"), seed_entries).unwrap();
+
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "-q"]);
+        // Force the default branch to `main` regardless of the host git default.
+        run(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+        run(&["config", "user.email", "<email>"]);
+        run(&["config", "user.name", "Test"]);
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "seed"]);
+        dir
+    }
+
+    /// A promote tool rooted at a temp repo, no Gitea (so only open_pr:false is
+    /// exercised end-to-end through the throwaway-worktree transport).
+    fn promote_tool_at(dir: &Path) -> PlanePrefixPromote {
+        PlanePrefixPromote {
+            store: baseline_only_store(),
+            gitea: None,
+            repo_dir: dir.to_path_buf(),
+            gitea_repo: "Terminus".into(),
         }
     }
 
@@ -1828,6 +1996,117 @@ mod tests {
         assert!(required.iter().any(|v| v == "name"));
         assert!(required.iter().any(|v| v == "project"));
         assert!(required.iter().any(|v| v == "description"));
+    }
+
+    #[tokio::test]
+    async fn promote_bad_project_rejected_before_write() {
+        let tool = promote_tool();
+        let err = tool
+            .execute(json!({"prefix": "ZZQW", "name": "n", "project": "NOPE", "description": "d", "open_pr": false}))
+            .await;
+        assert!(matches!(err, Err(ToolError::InvalidArgument(_))), "bad project must error");
+    }
+
+    #[tokio::test]
+    async fn promote_bad_created_rejected_before_write() {
+        let tool = promote_tool();
+        let err = tool
+            .execute(json!({
+                "prefix": "ZZQW", "name": "n", "project": "TERM", "description": "d",
+                "created": "not-a-date", "open_pr": false
+            }))
+            .await;
+        assert!(matches!(err, Err(ToolError::InvalidArgument(_))), "bad created must error");
+    }
+
+    #[test]
+    fn validate_project_and_created_rules() {
+        assert!(validate_project("TERM").is_ok());
+        assert!(validate_project("HW").is_ok());
+        assert!(validate_project("BOGUS").is_err());
+        assert!(validate_project("").is_err());
+        assert!(validate_created("2026-07-11").is_ok());
+        assert!(validate_created("2026-13-40").is_err());
+        assert!(validate_created("July 11").is_err());
+        assert!(validate_created("").is_err());
+    }
+
+    // ── Seam test: open_pr:false runs the throwaway-worktree transport
+    // end-to-end against a temp repo, and the live checkout is never mutated.
+    #[tokio::test]
+    async fn transport_open_pr_false_end_to_end() {
+        let seed = "[[prefix]]\nprefix = \"AAA\"\nname = \"Seed\"\nproject = \"TERM\"\nspec_id = \"\"\nstatus = \"active\"\ndescription = \"seed\"\ncreated = \"2026-01-01\"\n";
+        let repo = init_temp_repo(seed);
+        let tool = promote_tool_at(&repo);
+
+        let res = parse(
+            &tool
+                .execute(json!({
+                    "prefix": "ZZQW", "name": "New", "project": "TERM",
+                    "description": "a new one", "open_pr": false
+                }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["appended"], true);
+        assert_eq!(res["branch"], "prefix-promote-ZZQW");
+        assert!(res["pr_url"].is_null());
+        assert_eq!(res["entry"]["prefix"], "ZZQW");
+        let diff = res["diff"].as_str().unwrap();
+        assert!(diff.contains("ZZQW"), "diff should show the new row: {diff}");
+
+        // The live checkout was NOT mutated: still on `main`, no promote branch,
+        // no throwaway worktree left behind, working tree still just the seed.
+        let branches = String::from_utf8(
+            std::process::Command::new("git").arg("-C").arg(&repo)
+                .args(["branch", "--list"]).output().unwrap().stdout,
+        ).unwrap();
+        assert!(branches.contains("main"), "branches: {branches}");
+        assert!(!branches.contains("prefix-promote-ZZQW"), "promote branch leaked: {branches}");
+        let worktrees = String::from_utf8(
+            std::process::Command::new("git").arg("-C").arg(&repo)
+                .args(["worktree", "list"]).output().unwrap().stdout,
+        ).unwrap();
+        assert_eq!(worktrees.lines().count(), 1, "throwaway worktree leaked: {worktrees}");
+        // The seed file on the live checkout is unchanged (ZZQW only on the branch).
+        let live = std::fs::read_to_string(repo.join("data/prefix_registry.toml")).unwrap();
+        assert!(!live.contains("ZZQW"), "live checkout file was mutated: {live}");
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    // ── Seam test: an entry already present in the file → appended:false, no
+    // branch, no worktree residue.
+    #[tokio::test]
+    async fn transport_already_in_file_appended_false() {
+        let seed = "[[prefix]]\nprefix = \"AAA\"\nname = \"Seed\"\nproject = \"TERM\"\nspec_id = \"\"\nstatus = \"active\"\ndescription = \"seed\"\ncreated = \"2026-01-01\"\n";
+        let repo = init_temp_repo(seed);
+        let tool = promote_tool_at(&repo);
+
+        // AAA is already in the file (and NOT in the compiled baseline, so it
+        // reaches transport). Uppercase override to prove case-insensitivity.
+        let res = parse(
+            &tool
+                .execute(json!({
+                    "prefix": "aaa", "name": "Seed", "project": "TERM",
+                    "description": "seed", "created": "2026-01-01", "open_pr": false
+                }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["appended"], false);
+        assert!(res["branch"].is_null());
+        assert!(res["note"].as_str().unwrap().contains("already present"));
+
+        let worktrees = String::from_utf8(
+            std::process::Command::new("git").arg("-C").arg(&repo)
+                .args(["worktree", "list"]).output().unwrap().stdout,
+        ).unwrap();
+        assert_eq!(worktrees.lines().count(), 1, "throwaway worktree leaked: {worktrees}");
+
+        std::fs::remove_dir_all(&repo).ok();
     }
 
     // ── No-secret-leak: the overlay's Debug must never print the password even
