@@ -256,6 +256,20 @@ pub trait CoderSuiteDriver: Send + Sync {
     /// Create a fresh profile row scoping one `(model, backend)` pass's rows.
     async fn create_profile_row(&self, model_id: &str) -> Result<uuid::Uuid, ToolError>;
 
+    /// MINT2-02: record a terminal `failure_class = "non_viable_vram"` row for a
+    /// `(model, backend)` cell skipped pre-flight as over-VRAM — so the cell
+    /// EXISTS in the data (score 0) instead of silently vanishing. Injected
+    /// through the trait (rather than called inline) so the fleet loop's skip
+    /// path stays unit-testable without a live DB. The live impl writes the row
+    /// via `code_v2::record_non_viable_vram_row`; test fakes just record the call.
+    async fn record_non_viable(
+        &self,
+        model_id: &str,
+        backend_tag: &str,
+        reason: &str,
+        mem_config: Option<&str>,
+    ) -> Result<(), ToolError>;
+
     /// Run the v2 code suite for `model_id` under `profile_id`, against the
     /// currently-overridden backend. Persists one `code_profile_runs` row per
     /// case internally (the canonical write path, unchanged by this trait).
@@ -293,6 +307,16 @@ impl CoderSuiteDriver for LiveCoderDriver {
 
     async fn create_profile_row(&self, model_id: &str) -> Result<uuid::Uuid, ToolError> {
         intake::create_profile_row(model_id).await
+    }
+
+    async fn record_non_viable(
+        &self,
+        model_id: &str,
+        backend_tag: &str,
+        reason: &str,
+        mem_config: Option<&str>,
+    ) -> Result<(), ToolError> {
+        intake::code_v2::record_non_viable_vram_row(model_id, backend_tag, reason, mem_config).await
     }
 
     async fn run_suite(
@@ -420,6 +444,21 @@ async fn run_one_backend(
 
     // ── pre-flight skip (over-VRAM on GPU) ──
     if let Some(reason) = pre_skip_reason(nom, backend) {
+        // MINT2-02: the cell EXISTS — record a non_viable_vram row instead of
+        // silently continuing (defense-in-depth; the live fleet loop already
+        // records + `continue`s at its own pre-skip check before ever reaching
+        // here, so this fires only for a direct caller of `run_one_backend`).
+        // Best-effort: a DB hiccup must not turn a clean skip into an error.
+        if let Err(e) = driver
+            .record_non_viable(&model_id, backend.as_str(), &reason, mem_config)
+            .await
+        {
+            eprintln!(
+                "coder sweep: could not record non_viable_vram row for model={model_id} \
+                 backend={} (continuing): {e}",
+                backend.as_str()
+            );
+        }
         return Ok(BackendReport {
             model_id,
             backend_tag: backend,
@@ -599,6 +638,21 @@ async fn run_fleet(
                 continue;
             }
             if let Some(reason) = pre_skip_reason(nom, backend_tag) {
+                // MINT2-02: kill survivorship bias — the over-VRAM cell EXISTS
+                // as a row (failure_class="non_viable_vram", score 0) instead of
+                // silently vanishing. Best-effort: a DB hiccup here must not
+                // abort the fleet (worst case, this one skip isn't recorded — no
+                // worse than the pre-MINT2-02 behavior of never recording it).
+                if let Err(e) = driver
+                    .record_non_viable(&model_id, backend_tag.as_str(), &reason, mem_config)
+                    .await
+                {
+                    eprintln!(
+                        "coder sweep: could not record non_viable_vram row for model={model_id} \
+                         backend={} (continuing): {e}",
+                        backend_tag.as_str()
+                    );
+                }
                 reports.push(BackendReport { model_id, backend_tag, outcome: BackendOutcome::Skipped(reason) });
                 continue;
             }
@@ -1047,6 +1101,8 @@ mod tests {
         suite_fail: BTreeSet<String>,
         profile_calls: Mutex<Vec<String>>,
         suite_calls: Mutex<Vec<(String, String)>>,
+        /// MINT2-02: (model_id, backend_tag, reason) per recorded non_viable row.
+        non_viable_calls: Mutex<Vec<(String, String, String)>>,
     }
 
     impl ScriptDriver {
@@ -1056,6 +1112,7 @@ mod tests {
                 suite_fail: BTreeSet::new(),
                 profile_calls: Mutex::new(Vec::new()),
                 suite_calls: Mutex::new(Vec::new()),
+                non_viable_calls: Mutex::new(Vec::new()),
             }
         }
 
@@ -1074,6 +1131,21 @@ mod tests {
         async fn create_profile_row(&self, model_id: &str) -> Result<uuid::Uuid, ToolError> {
             self.profile_calls.lock().unwrap().push(model_id.to_string());
             Ok(uuid::Uuid::nil())
+        }
+
+        async fn record_non_viable(
+            &self,
+            model_id: &str,
+            backend_tag: &str,
+            reason: &str,
+            _mem_config: Option<&str>,
+        ) -> Result<(), ToolError> {
+            self.non_viable_calls.lock().unwrap().push((
+                model_id.to_string(),
+                backend_tag.to_string(),
+                reason.to_string(),
+            ));
+            Ok(())
         }
 
         async fn run_suite(
@@ -1247,6 +1319,39 @@ mod tests {
     }
 
     #[test]
+    fn over_vram_skip_records_a_non_viable_row_not_just_an_absence() {
+        // MINT2-02 core behavior: a model skipped as over-VRAM must produce a
+        // recorded non_viable row (the cell EXISTS), not vanish from the data.
+        // 400B at ~0.6GB/B is over any realistic default ceiling, so the GPU
+        // pass is pre-skipped in `run_fleet` before any lock/driver suite call.
+        let fleet = Nominations::from_json(
+            r#"{"nominations":[{"id":"huge:400b","size_b":400,"gfx1151_class":"confirmed","acquisition":"ollama_pull","backends":["gpu"]}]}"#,
+        )
+        .unwrap();
+        let driver = ScriptDriver::new();
+        let checkpoint = tmp_checkpoint("non-viable-row");
+
+        let reports =
+            block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &NoopGpuLock)).unwrap();
+
+        assert_eq!(reports.len(), 1);
+        match &reports[0].outcome {
+            BackendOutcome::Skipped(reason) => assert!(reason.contains("VRAM")),
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        // The cell EXISTS: exactly one non_viable row was recorded for this
+        // (model, backend), carrying the over-VRAM reason.
+        let calls = driver.non_viable_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "huge:400b");
+        assert_eq!(calls[0].1, "gpu");
+        assert!(calls[0].2.to_lowercase().contains("vram"));
+        // A skip is still never checkpointed (resumable), and never reaches the suite.
+        assert!(checkpoint.done().is_empty());
+        assert!(driver.suite_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn driver_resume_skips_already_checkpointed_backend_without_touching_driver() {
         let fleet = Nominations::from_json(
             r#"{"nominations":[{"id":"m:8b","size_b":8,"gfx1151_class":"confirmed","acquisition":"ollama_pull"}]}"#,
@@ -1402,6 +1507,16 @@ mod tests {
 
         async fn create_profile_row(&self, _model_id: &str) -> Result<uuid::Uuid, ToolError> {
             Ok(uuid::Uuid::nil())
+        }
+
+        async fn record_non_viable(
+            &self,
+            _model_id: &str,
+            _backend_tag: &str,
+            _reason: &str,
+            _mem_config: Option<&str>,
+        ) -> Result<(), ToolError> {
+            Ok(())
         }
 
         async fn run_suite(

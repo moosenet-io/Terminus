@@ -1,0 +1,47 @@
+-- S112 MINT2-02: record non-viable / skipped / timed-out models as explicit
+-- rows (kill survivorship bias).
+--
+-- Adds a single queryable dimension to `code_profile_runs` so that a model
+-- which times out, OOMs before producing output, or is skipped as over-VRAM
+-- writes a ROW (score 0, failure_class set) instead of leaving NO row at all —
+-- making absence-of-data and genuine-failure distinguishable in the data.
+--
+-- Applied OUT-OF-BAND by an operator (item MINT2-00), NOT by the harness code:
+-- `src/intake/storage.rs` is authoritative that the harness only INSERTs and
+-- SELECTs `code_profile_runs`, never issuing DDL against it. The read path is
+-- written to tolerate a DB where this column does not yet exist (a NULL-typed
+-- fallback query, so a missing column reads as NULL and never panics) — so this
+-- migration can be applied any time after the MINT2-02 PR merges; until it runs,
+-- new `'v3'` rows simply persist without a failure_class.
+--
+-- Additive and non-destructive: the column is nullable, there is NO backfill.
+-- Legacy `'v1'`/`'v2'` rows keep NULL — and NULL is DISTINCT from the "none"
+-- value: a genuinely clean `'v3'` run records failure_class = 'none', so
+-- NULL means ONLY "a pre-migration / legacy row", never "this run succeeded".
+-- `IF NOT EXISTS` makes the statement idempotent so re-applying is a safe no-op.
+--
+-- failure_class enum values (stable snake_case keys written by
+-- `FailureClass::key()` in `src/intake/code_v2.rs`; variant names mirror
+-- Harmony's `FailureCategory` taxonomy so the two planes speak one language,
+-- PLUS the intake-specific `non_viable_vram`):
+--   none                -- a genuinely clean run (compiles + tests + change ok)
+--   truncation          -- output cut off mid-generation
+--   empty_diff          -- model returned but emitted no usable code / refusal
+--   tautological_tests  -- model-authored tests are vacuous / self-satisfying
+--   compilation_error   -- produced code that does not compile / parse
+--   test_failure        -- compiles but tests (or the hidden change check) fail
+--   review_rejection    -- rejected by a review gate
+--   provider_error      -- inference/provider/toolchain/OOM error (see note)
+--   max_iterations      -- exhausted the retry/iteration budget
+--   timeout             -- inference exceeded its per-case deadline
+--   phase_stall         -- a pipeline phase made no progress
+--   unknown             -- an unclassified failure
+--   non_viable_vram     -- skipped pre-flight: footprint over the VRAM ceiling
+--
+-- Note on OOM/timeout precedence: when a run BOTH OOMs and times out, OOM wins
+-- (it is observed earlier — an OOM aborts generation immediately, whereas a
+-- timeout only fires after the full deadline elapses). OOM maps to
+-- provider_error (there is no dedicated OOM variant in the mirrored taxonomy;
+-- an OOM is the provider failing to serve). See `FailureClass::classify`.
+
+ALTER TABLE code_profile_runs ADD COLUMN IF NOT EXISTS failure_class TEXT;
