@@ -45,6 +45,7 @@ pub mod config;
 pub mod generate;
 pub mod mismatch;
 pub mod pii_gate;
+pub mod readme_layers;
 pub mod render;
 pub mod versioning;
 
@@ -63,6 +64,10 @@ pub use generate::{
     SweptFeatContext,
 };
 pub use pii_gate::{sweep_input, sweep_input_for_routing, PiiGateOutcome, RoutingDestination};
+pub use readme_layers::{
+    deepen_layers, parse_layers, render_diataxis_set, render_layered_readme, DiataxisArtifact,
+    DiataxisMode, ParsedLayers,
+};
 pub use render::{render_all, RenderContext, RenderOutcome, RenderedArtifact};
 
 /// `docgen_status` -- report how the doc engine would interpret a project's
