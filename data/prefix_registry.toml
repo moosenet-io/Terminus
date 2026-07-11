@@ -386,11 +386,11 @@ created = "2026-07-08"
 [[prefix]]
 prefix = "MEDIA"
 name = "Media domain orchestration"
-project = "LUM"
+project = "TERM"
 spec_id = "S94-media-domain"
 status = "ingested"
-description = "Sovereign media-domain orchestration with Lumina as the surface (staging)."
-created = ""
+description = "Sovereign media-domain orchestration in terminus-rs with Lumina as the surface. Ingested to TERM as the Media Domain (S94-MEDIA) module."
+created = "2026-07-11"
 
 [[prefix]]
 prefix = "RMDR"
