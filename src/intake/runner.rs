@@ -13,9 +13,53 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use async_trait::async_trait;
+
 use crate::error::ToolError;
 use crate::intake::context::{self, TierResult};
 use crate::intake::storage::{self, ContextRunRow, OperationalProfileRow};
+use crate::intake::{coder_sweep, RunKind, SweepRunner};
+
+// ---------------------------------------------------------------------------
+// Coder sub-runner under the unified MINT harness (MINT2-04)
+// ---------------------------------------------------------------------------
+
+/// The coder sub-runner registered into [`crate::intake::MintHarness`]. A thin
+/// adapter over the existing `coder_sweep::run` fleet driver: the coder cases
+/// and their measurement are unchanged — this only routes the coder sweep
+/// through the one shared harness surface. Its config (languages, case-limit,
+/// mem-config) is read from the SAME env vars the standalone
+/// `intake_coder_sweep` binary read, so runtime behavior is byte-for-byte the
+/// same; the binary is now merely `MintHarness::run(RunKind::Coder)`.
+pub struct CoderSweepRunner {
+    langs: Vec<String>,
+    case_limit: Option<usize>,
+    mem_config: Option<String>,
+}
+
+impl CoderSweepRunner {
+    /// Build from the env-sourced config (identical vars/behavior to the old
+    /// `intake_coder_sweep` binary). Pure env reads that default gracefully —
+    /// no DB, no network — so it is safe to construct in a unit test.
+    pub fn from_env() -> Self {
+        CoderSweepRunner {
+            langs: coder_sweep::langs_from_env(),
+            case_limit: coder_sweep::case_limit_from_env(),
+            mem_config: coder_sweep::mem_config_from_env(),
+        }
+    }
+}
+
+#[async_trait]
+impl SweepRunner for CoderSweepRunner {
+    fn kind(&self) -> RunKind {
+        RunKind::Coder
+    }
+
+    async fn run(&self) -> std::process::ExitCode {
+        coder_sweep::run(&self.langs, self.case_limit, self.mem_config.as_deref()).await
+    }
+}
 
 /// The full graduated tier list from the spec.
 pub const FULL_TIERS: [usize; 9] =

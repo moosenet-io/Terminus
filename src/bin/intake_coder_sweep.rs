@@ -1,11 +1,15 @@
 //! S86 live entrypoint: run the S83/MINT v2 **code** profiling suite across a
 //! fleet of models (the builder/coder counterpart to `intake_assistant_sweep`).
 //!
-//! MINT Phase 1: the fleet driver itself now lives in the library
-//! (`terminus_rs::intake::coder_sweep::run`), extracted so both this binary
-//! AND the new `mint sweep coder` CLI subcommand share one code path. This
-//! binary is now a thin wrapper: read the env-sourced config (unchanged
-//! behavior/var names) and hand it to the library entry point.
+//! MINT2-04: this binary is now a thin entrypoint into the UNIFIED MINT
+//! harness — `MintHarness::run(RunKind::Coder)`. The harness (in
+//! `terminus_rs::intake`) owns the common run lifecycle (resolve config,
+//! confirm the shared intake DB via `config::intake_database_url()`, stamp a
+//! run-identity, dispatch to the coder sub-runner). The coder sub-runner
+//! (`intake::runner::CoderSweepRunner`) reads the SAME env-sourced config it
+//! always did and drives `coder_sweep::run` unchanged, so behavior/var names
+//! are identical — only the orchestration seam moved into the library, shared
+//! with the assistant sweep and the `mint sweep coder` CLI subcommand.
 //!
 //! ## Runtime configuration (all env-sourced, no literals — set before launch)
 //! - `INTAKE_DATABASE_URL` (or `DATABASE_URL`) — the intake Postgres (rows land
@@ -29,7 +33,7 @@
 //! is unavailable, over-VRAM, or errors is recorded as a skip-with-reason and the
 //! sweep CONTINUES — one bad model never wedges the fleet.
 
-use terminus_rs::intake::coder_sweep;
+use terminus_rs::intake::{MintHarness, RunKind};
 
 // Multi-threaded runtime: the suite mixes async IO with libraries that expect a
 // multi-thread scheduler (the same reason the assistant sweep uses it); a
@@ -37,9 +41,5 @@ use terminus_rs::intake::coder_sweep;
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> std::process::ExitCode {
     terminus_rs::intake::init_tracing();
-    let langs = coder_sweep::langs_from_env();
-    let case_limit = coder_sweep::case_limit_from_env();
-    let mem_config = coder_sweep::mem_config_from_env();
-
-    coder_sweep::run(&langs, case_limit, mem_config.as_deref()).await
+    MintHarness::run(RunKind::Coder).await
 }

@@ -84,6 +84,141 @@ pub use code_v2::{
 };
 pub use runner::create_profile_row;
 
+// ---------------------------------------------------------------------------
+// Unified MINT harness (MINT2-04)
+// ---------------------------------------------------------------------------
+//
+// The coder sweep (`intake_coder_sweep`) and the Lumina assistant sweep
+// (`intake_assistant_sweep`) already share this `src/intake/` tree and the
+// `lumina_intake` Postgres, but historically each binary drove its own
+// orchestration and reporting, so there was no single "MINT harness" surface.
+//
+// `MintHarness` is that one surface. It owns the common run lifecycle —
+// resolve config, confirm the shared intake DB is reachable via the ONE
+// canonical resolver both sweep families use (`config::intake_database_url`),
+// stamp a run-identity for log correlation, then dispatch to a per-kind
+// sub-runner — and the two binaries become thin `MintHarness::run(RunKind::…)`
+// entrypoints. This is a STRUCTURAL unification only: neither sweep's
+// measurement changes (the coder cases and the assistant's seven dimensions
+// run exactly as before, each under its existing sub-runner).
+
+/// Which sweep family a [`MintHarness`] run drives. One process runs exactly
+/// one kind; the two kinds are independent (running one never blocks the
+/// other — they are separate binaries against the same shared DB).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunKind {
+    /// The S83/MINT coder (code-generation) fleet sweep.
+    Coder,
+    /// The S84 Lumina assistant (seven-dimension) fleet sweep.
+    Assistant,
+}
+
+impl RunKind {
+    /// Stable snake_case label used in logs / the run banner. Not written to
+    /// the DB by the harness itself (each sub-runner keeps its own row schema).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RunKind::Coder => "coder",
+            RunKind::Assistant => "assistant",
+        }
+    }
+}
+
+/// A sweep sub-runner registered under the unified MINT harness. Each kind
+/// (coder → [`runner::CoderSweepRunner`], assistant →
+/// [`assistant::runner::AssistantSweepRunner`]) implements this thin trait;
+/// [`MintHarness`] owns the common lifecycle and dispatches to the sub-runner.
+///
+/// The sub-runner drives its family's existing fleet driver unchanged and
+/// returns a process exit code (both binaries ultimately produce one), so the
+/// binaries carry no orchestration of their own.
+#[async_trait]
+pub trait SweepRunner: Send + Sync {
+    /// The kind this sub-runner drives (used by the harness/tests to confirm
+    /// dispatch selected the right family).
+    fn kind(&self) -> RunKind;
+
+    /// Run this sweep to completion, returning the process exit code. Any
+    /// per-model failure is a recorded skip inside the underlying driver, not
+    /// an error here — the exit code reflects only whether the sweep could
+    /// start and finish its bookkeeping.
+    async fn run(&self) -> std::process::ExitCode;
+}
+
+/// The single unified MINT harness surface. Both `intake_coder_sweep` and
+/// `intake_assistant_sweep` route through here so "the MINT harness" is one
+/// thing with one lifecycle, rather than two disconnected binaries.
+pub struct MintHarness {
+    kind: RunKind,
+    /// Harness-level run-identity, stamped for log correlation across the
+    /// lifecycle. Distinct from (and does not replace) the per-sweep run rows
+    /// the sub-runners already write to their own tables.
+    run_id: uuid::Uuid,
+}
+
+impl MintHarness {
+    /// Build a harness for `kind` with a fresh run-identity.
+    pub fn new(kind: RunKind) -> Self {
+        MintHarness {
+            kind,
+            run_id: uuid::Uuid::new_v4(),
+        }
+    }
+
+    /// The run kind this harness drives.
+    pub fn kind(&self) -> RunKind {
+        self.kind
+    }
+
+    /// This run's harness-level identity (log correlation).
+    pub fn run_id(&self) -> uuid::Uuid {
+        self.run_id
+    }
+
+    /// The per-kind sub-runner. Construction is DB-free (env-sourced config
+    /// only), so it is safe to build in a unit test without touching Postgres.
+    fn sub_runner(&self) -> Box<dyn SweepRunner> {
+        match self.kind {
+            RunKind::Coder => Box::new(runner::CoderSweepRunner::from_env()),
+            RunKind::Assistant => Box::new(assistant::runner::AssistantSweepRunner::new()),
+        }
+    }
+
+    /// Thin entrypoint both binaries call: build the harness for `kind` and run
+    /// the shared lifecycle.
+    pub async fn run(kind: RunKind) -> std::process::ExitCode {
+        MintHarness::new(kind).execute().await
+    }
+
+    /// The common run lifecycle: acquire config → confirm the shared intake DB
+    /// URL resolves via `config::intake_database_url()` (surfacing a clean
+    /// per-kind NotConfigured instead of crashing deeper in a sub-runner) →
+    /// dispatch to the sub-runner.
+    async fn execute(&self) -> std::process::ExitCode {
+        tracing::info!(
+            "MINT harness starting: kind={}, run_id={}",
+            self.kind.as_str(),
+            self.run_id
+        );
+
+        // Both sweep families connect their pool through this ONE resolver
+        // (`storage::get_pool` and `assistant::schema::get_pool` each delegate
+        // to it). Checking it here first means an unconfigured host reports a
+        // clear per-kind NotConfigured up front rather than failing partway
+        // through the sub-runner's own connect.
+        if crate::config::intake_database_url().is_none() {
+            eprintln!(
+                "MINT harness ({}) not configured: neither INTAKE_DATABASE_URL nor \
+                 DATABASE_URL is set — the intake sweep requires a Postgres connection",
+                self.kind.as_str()
+            );
+            return std::process::ExitCode::FAILURE;
+        }
+
+        self.sub_runner().run().await
+    }
+}
+
 /// Parse the optional `suites` arg into a deduped, validated list. When absent
 /// (or empty), default to the per-model purpose inference for `model_name`.
 fn parse_suites(args: &Value, model_name: &str) -> Vec<String> {
@@ -853,6 +988,30 @@ mod tests {
             .execute(json!({"models": [], "metric": "max_context_safe"}))
             .await;
         assert!(matches!(r, Err(ToolError::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn run_kind_labels_are_stable() {
+        assert_eq!(RunKind::Coder.as_str(), "coder");
+        assert_eq!(RunKind::Assistant.as_str(), "assistant");
+    }
+
+    #[test]
+    fn mint_harness_constructs_and_dispatches_both_kinds() {
+        // MINT2-04: both run kinds construct under one MintHarness and dispatch
+        // to the correct sub-runner, with a mocked/skipped DB — sub_runner()
+        // construction is env-sourced only and touches no Postgres, so this
+        // exercises the unify-and-dispatch structure without a live DB.
+        let coder = MintHarness::new(RunKind::Coder);
+        assert_eq!(coder.kind(), RunKind::Coder);
+        assert_eq!(coder.sub_runner().kind(), RunKind::Coder);
+
+        let assistant = MintHarness::new(RunKind::Assistant);
+        assert_eq!(assistant.kind(), RunKind::Assistant);
+        assert_eq!(assistant.sub_runner().kind(), RunKind::Assistant);
+
+        // Distinct harness instances get distinct run identities.
+        assert_ne!(coder.run_id(), assistant.run_id());
     }
 
     #[test]
