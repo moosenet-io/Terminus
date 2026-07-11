@@ -236,6 +236,12 @@ async fn dispatch_docs_generation(
 /// repos Scribe may inspect (SCRB-02 cycle 1 review finding: an unconfined
 /// `repo_path` would let a caller point Scribe at an arbitrary local repo
 /// and have its contents shipped to an external LLM provider).
+///
+/// `pub(crate)` (DOCGEN-19): `crate::tools::docgen::drift`'s
+/// `docgen_drift_check` reuses this exact confinement check rather than
+/// duplicating it -- it calls the same `inspect::checkout` this module's
+/// `scribe_generate_readme` does, so it must honor the same default-deny
+/// gate, not a second copy of the logic.
 pub(crate) fn is_repo_path_allowed(repo_path: &Path, allowed_roots: &[String]) -> bool {
     if allowed_roots.is_empty() {
         return false;
