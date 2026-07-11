@@ -1212,4 +1212,180 @@ mod tests {
         let extensions = axum::http::Extensions::new();
         assert!(extensions.get::<crate::mesh::TailnetIdentity>().is_none());
     }
+
+    // ── MESH-07: resolved `Principal` wired through the gateway ───────────
+
+    use crate::gateway_framework::rate_limit::InProcessRateLimiter;
+    use crate::gateway_framework::{AllowlistPolicy, Grant};
+    use crate::mesh::PrincipalMap;
+    use std::collections::HashMap;
+
+    /// A `GatewayFramework` whose allowlist maps EXACTLY `identity ->
+    /// actions` (a generous rate-limit budget, high enough that none of
+    /// these tests trip it).
+    fn gateway_allowing(identity: &str, actions: &[&str]) -> GatewayFramework {
+        let mut map = HashMap::new();
+        map.insert(identity.to_string(), Grant::List(actions.iter().map(|a| a.to_string()).collect()));
+        GatewayFramework::new(AllowlistPolicy::new(map), Arc::new(InProcessRateLimiter::new(1000, 1000.0)))
+    }
+
+    fn state_with(gateway: GatewayFramework, principal_resolver: PrincipalResolver) -> Arc<McpServerState> {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoHealthTool)).unwrap();
+        Arc::new(McpServerState {
+            registry,
+            server_name: "terminus-mesh07-test".to_string(),
+            server_version: "0.0.0-test".to_string(),
+            auth_token: None,
+            personal_federation: None,
+            inference_proxy: None,
+            gateway: Some(gateway),
+            mesh_pool: None,
+            principal_resolver,
+        })
+    }
+
+    /// Build a `POST /mcp` request carrying an optional `ClientIdentity`
+    /// request extension (simulating what `crate::pki::mtls::run_listener`
+    /// inserts post-handshake) and optional extra headers (simulating what
+    /// a client might send on the wire, including an attempted
+    /// `X-Terminus-Client-Identity` spoof).
+    async fn post_mcp_with_identity(
+        router: Router,
+        body: Value,
+        identity: Option<ClientIdentity>,
+        extra_headers: &[(&str, &str)],
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream");
+        for (k, v) in extra_headers {
+            builder = builder.header(*k, *v);
+        }
+        let mut req = builder.body(Body::from(body.to_string())).unwrap();
+        if let Some(id) = identity {
+            req.extensions_mut().insert(id);
+        }
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let raw = String::from_utf8(bytes.to_vec()).unwrap();
+        let json_str = raw
+            .lines()
+            .find(|l| l.starts_with("data:"))
+            .map(|l| l.trim_start_matches("data:").trim())
+            .unwrap_or(&raw);
+        let value: Value = if json_str.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(json_str).unwrap()
+        };
+        (status, value)
+    }
+
+    fn health_call(id: i64) -> Value {
+        json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "health", "arguments": {}}
+        })
+    }
+
+    /// The resolved `Principal` -- not the raw cert CN -- is what `guard()`
+    /// checks: a configured map sends `"harmony-primary.example.test"` to
+    /// the allowlist as `"harmony"`, which IS granted `health`, even though
+    /// the raw CN itself has no allowlist entry at all (default-deny would
+    /// reject it if resolution were a no-op / a constant).
+    #[tokio::test]
+    async fn resolved_principal_not_raw_cn_is_used_at_the_guard_call_site() {
+        let resolver = PrincipalResolver::new(
+            serde_json::from_value::<PrincipalMap>(json!({
+                "cert_cn": {"harmony-primary.example.test": "harmony"}
+            }))
+            .unwrap(),
+        );
+        let gateway = gateway_allowing("harmony", &["health"]);
+        let state = state_with(gateway, resolver);
+        let router = build_router(state);
+
+        let identity = ClientIdentity("harmony-primary.example.test".to_string());
+        let (status, body) =
+            post_mcp_with_identity(router, health_call(1), Some(identity), &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["isError"], false, "mapped principal should be granted: {body}");
+    }
+
+    /// Same configured map as above, but the allowlist has NO entry for the
+    /// raw CN string at all -- proving resolution is really consulted
+    /// (denying an unmapped cert), not bypassed in favor of the raw CN.
+    #[tokio::test]
+    async fn unmapped_cert_with_a_configured_map_is_denied_fail_closed() {
+        let resolver = PrincipalResolver::new(
+            serde_json::from_value::<PrincipalMap>(json!({
+                "cert_cn": {"harmony-primary.example.test": "harmony"}
+            }))
+            .unwrap(),
+        );
+        let gateway = gateway_allowing("harmony", &["health"]);
+        let state = state_with(gateway, resolver);
+        let router = build_router(state);
+
+        // This CN has no entry in the configured map at all.
+        let identity = ClientIdentity("stranger.example.test".to_string());
+        let (status, body) =
+            post_mcp_with_identity(router, health_call(2), Some(identity), &[]).await;
+        assert_eq!(status, StatusCode::OK); // JSON-RPC always 200s; the denial is in the result.
+        assert_eq!(body["result"]["isError"], true, "unmapped cert must fail closed: {body}");
+    }
+
+    /// No `TERMINUS_MESH_PRINCIPAL_MAP_JSON`-shaped map configured at all
+    /// (`PrincipalResolver::default()`) -- the legacy pre-MESH-07 behavior
+    /// (raw cert CN used verbatim as the principal name) must still work
+    /// unmodified, so existing single-identity deployments are never
+    /// mass-denied by this item.
+    #[tokio::test]
+    async fn unconfigured_resolver_keeps_legacy_cn_as_name_passthrough() {
+        let gateway = gateway_allowing("legacy-cn.example.test", &["health"]);
+        let state = state_with(gateway, PrincipalResolver::default());
+        let router = build_router(state);
+
+        let identity = ClientIdentity("legacy-cn.example.test".to_string());
+        let (status, body) =
+            post_mcp_with_identity(router, health_call(3), Some(identity), &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["isError"], false, "legacy passthrough should still work: {body}");
+    }
+
+    /// A client-supplied `X-Terminus-Client-Identity` header can NEVER
+    /// elevate identity: with no `ClientIdentity` extension on the request
+    /// (i.e. no server-verified mTLS identity presented), sending the
+    /// header that names an identity the gateway WOULD allow must still be
+    /// denied -- `resolve_principal` never reads `HeaderMap` at all.
+    #[tokio::test]
+    async fn client_supplied_identity_header_cannot_elevate_identity() {
+        let resolver = PrincipalResolver::new(
+            serde_json::from_value::<PrincipalMap>(json!({
+                "cert_cn": {"harmony-primary.example.test": "harmony"}
+            }))
+            .unwrap(),
+        );
+        let gateway = gateway_allowing("harmony", &["health"]);
+        let state = state_with(gateway, resolver);
+        let router = build_router(state);
+
+        // No `ClientIdentity` extension at all -- only a spoofed header.
+        let (status, body) = post_mcp_with_identity(
+            router,
+            health_call(4),
+            None,
+            &[("x-terminus-client-identity", "harmony")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["result"]["isError"], true,
+            "a bare client-set identity header must never grant access: {body}"
+        );
+    }
 }
