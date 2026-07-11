@@ -28,6 +28,7 @@ pub mod render;
 pub mod semantic;
 pub mod store;
 pub mod tools;
+pub mod vec_store;
 
 pub use cluster::cluster;
 pub use rank::{pagerank, personalized};
@@ -35,3 +36,4 @@ pub use extract::build_rust_graph;
 pub use layout::{cluster_hue, layout, node_radius, LayoutResult};
 pub use model::{Confidence, EdgeKind, KgEdge, KgNode, KnowledgeGraph, NodeKind};
 pub use store::GraphStore;
+pub use vec_store::AtlasVecStore;
