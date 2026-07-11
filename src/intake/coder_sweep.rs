@@ -897,6 +897,11 @@ pub async fn run(
                      marker is audit-only, sweep rows persisted): {e}"
                 ),
             }
+            // NOTE: the Model Fleet Catalog refresh (MINT2-07) is NOT called here
+            // — it runs once in the shared `MintHarness::execute` lifecycle
+            // (src/intake/mod.rs) at the end of EVERY unified harness run (coder
+            // AND assistant), so both families refresh exactly once and there is
+            // no double-refresh on a coder run.
             std::process::ExitCode::SUCCESS
         }
         Err(e) => {
