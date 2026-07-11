@@ -653,6 +653,7 @@ pub async fn read_code_run_factors(
 // ===========================================================================
 
 use crate::intake::aggregate::{AggregateInputRow, RunAggregate};
+use crate::intake::EpochSelector;
 
 /// True when a Postgres error text indicates a MISSING RELATION (the table does
 /// not exist — the un-migrated `code_run_aggregates` case), so the read path can
@@ -841,42 +842,71 @@ type StoredAggTuple = (
     bool,
 );
 
-/// Read the persisted aggregates for one epoch, TOLERATING the
+/// Pure mapping from the decoded `code_run_aggregates` tuple to a
+/// [`StoredRunAggregate`]. Extracted so the epoch-specific and selector-aware
+/// reads decode identically (and so it is unit-testable without a live DB).
+fn map_stored_agg(t: StoredAggTuple) -> StoredRunAggregate {
+    StoredRunAggregate {
+        model: t.0,
+        task_category: t.1,
+        harness_version: t.2,
+        quant: t.3,
+        reasoning_enabled: t.4,
+        context_window_launched: t.5,
+        temperature: t.6,
+        top_p: t.7,
+        pass_rate: t.8,
+        n_samples: t.9,
+        passes: t.10,
+        score_stddev: t.11,
+        low_confidence: t.12,
+    }
+}
+
+/// Read the persisted aggregates for ONE explicit epoch, TOLERATING the
 /// `code_run_aggregates` table being ABSENT on an un-migrated DB: a missing
 /// relation ([`is_missing_relation_error`]) reads as an empty set, never a
 /// panic — mirroring the MINT2-01/02 null-tolerant column reads. Any other DB
-/// error is propagated.
+/// error is propagated. Thin wrapper over [`read_code_run_aggregates_selected`]
+/// with an [`EpochSelector::Only`], preserved for callers that already hold a
+/// concrete epoch string (e.g. the current-epoch persist/read round-trip).
 pub async fn read_code_run_aggregates(
     pool: &PgPool,
     epoch: &str,
 ) -> Result<Vec<StoredRunAggregate>, ToolError> {
-    let sql = "SELECT model, task_category, harness_version, quant, reasoning_enabled, \
+    read_code_run_aggregates_selected(pool, &EpochSelector::Only(epoch.to_string())).await
+}
+
+/// Read the persisted run aggregates, honoring an [`EpochSelector`] so the coder
+/// catalog/reports DEFAULT to the current epoch — legacy rows never pollute the
+/// current numbers — while still exposing legacy/all provenance:
+///   - [`EpochSelector::Current`] (the default) → only `current_epoch()`,
+///   - [`EpochSelector::Only`]    → one explicit legacy/other epoch,
+///   - [`EpochSelector::All`]     → every epoch (no `harness_version` filter).
+///
+/// Legacy rows are partitioned by FILTER only — this read never deletes or
+/// mutates them. The epoch `WHERE`-fragment comes from the ONE central
+/// [`crate::intake::epoch_where_fragment`] (`All` → a bind-free `TRUE`). Tolerates
+/// the `code_run_aggregates` table being ABSENT on an un-migrated DB (empty set),
+/// mirroring the MINT2-03 null/absence-tolerant read pattern.
+pub async fn read_code_run_aggregates_selected(
+    pool: &PgPool,
+    selector: &EpochSelector,
+) -> Result<Vec<StoredRunAggregate>, ToolError> {
+    let where_frag = crate::intake::epoch_where_fragment(selector, 1);
+    let sql = format!(
+        "SELECT model, task_category, harness_version, quant, reasoning_enabled, \
          context_window_launched, temperature, top_p, pass_rate, n_samples, passes, \
-         score_stddev, low_confidence FROM code_run_aggregates WHERE harness_version = $1 \
-         ORDER BY model, task_category NULLS FIRST, quant NULLS FIRST";
-    match sqlx::query_as::<_, StoredAggTuple>(sql)
-        .bind(epoch)
-        .fetch_all(pool)
-        .await
-    {
-        Ok(rows) => Ok(rows
-            .into_iter()
-            .map(|t| StoredRunAggregate {
-                model: t.0,
-                task_category: t.1,
-                harness_version: t.2,
-                quant: t.3,
-                reasoning_enabled: t.4,
-                context_window_launched: t.5,
-                temperature: t.6,
-                top_p: t.7,
-                pass_rate: t.8,
-                n_samples: t.9,
-                passes: t.10,
-                score_stddev: t.11,
-                low_confidence: t.12,
-            })
-            .collect()),
+         score_stddev, low_confidence FROM code_run_aggregates WHERE {where_frag} \
+         ORDER BY model, task_category NULLS FIRST, quant NULLS FIRST"
+    );
+    let mut query = sqlx::query_as::<_, StoredAggTuple>(&sql);
+    // Bind the epoch only when the selector resolves to one (All binds nothing).
+    if let Some(epoch) = selector.epoch() {
+        query = query.bind(epoch.to_string());
+    }
+    match query.fetch_all(pool).await {
+        Ok(rows) => Ok(rows.into_iter().map(map_stored_agg).collect()),
         Err(e) => {
             let msg = e.to_string();
             if is_missing_relation_error(&msg) {
@@ -884,7 +914,93 @@ pub async fn read_code_run_aggregates(
                 Ok(Vec::new())
             } else {
                 Err(ToolError::Database(format!(
-                    "Failed to read code_run_aggregates: {msg}"
+                    "Failed to read code_run_aggregates (selected): {msg}"
+                )))
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// MINT2-05: persisted epoch marker (audit timeline of when an epoch became
+// current). Table-absence tolerant, mirroring the aggregate read above.
+// ===========================================================================
+
+/// A persisted `intake_epoch_marker` row: which epoch, when it became the
+/// current partition, and an optional note (why it was bumped / what evolved).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EpochMarker {
+    pub epoch: String,
+    pub became_current_at: chrono::DateTime<chrono::Utc>,
+    pub note: Option<String>,
+}
+
+/// SQL for [`upsert_epoch_marker`]. Pulled out to a const so a unit test can
+/// assert its idempotent-upsert shape without a live DB: an INSERT keyed on the
+/// `epoch` PRIMARY KEY with `ON CONFLICT (epoch) DO UPDATE` so recording the
+/// same epoch twice is a safe no-op update (the marker is a single audit row per
+/// epoch, never duplicated). `became_current_at` is only set on first insert —
+/// `ON CONFLICT` deliberately does NOT overwrite it (the timeline records when
+/// the epoch FIRST became current), while `note` is refreshed if re-supplied.
+const UPSERT_EPOCH_MARKER_SQL: &str = "INSERT INTO intake_epoch_marker (epoch, note) \
+     VALUES ($1, $2) \
+     ON CONFLICT (epoch) DO UPDATE SET note = COALESCE(EXCLUDED.note, intake_epoch_marker.note)";
+
+/// Record (idempotently) that `epoch` is/became the current partition. Safe to
+/// call every startup/cutover: the first call inserts the marker with
+/// `became_current_at = now()`; subsequent calls for the same epoch are a no-op
+/// update that preserves the original timestamp (the audit point) and only
+/// refreshes the note when a new one is supplied. Never deletes or rewrites any
+/// other epoch's marker. Returns whether a NEW marker row was created (`true`)
+/// vs. an existing one was seen (`false`) — for logging only.
+pub async fn upsert_epoch_marker(
+    pool: &PgPool,
+    epoch: &str,
+    note: Option<&str>,
+) -> Result<bool, ToolError> {
+    let result = sqlx::query(UPSERT_EPOCH_MARKER_SQL)
+        .bind(epoch)
+        .bind(note)
+        .execute(pool)
+        .await
+        .map_err(|e| ToolError::Database(format!("Failed to upsert intake_epoch_marker: {e}")))?;
+    // A fresh INSERT affects 1 row; an ON CONFLICT no-op update that changes
+    // nothing may report 0 — either way it is not an error. `rows_affected == 1`
+    // on the very first insert; treat >=1-with-a-real-change as "created/updated".
+    Ok(result.rows_affected() >= 1)
+}
+
+/// Read the marker for one epoch, TOLERATING the `intake_epoch_marker` table
+/// being ABSENT on an un-migrated DB: a missing relation
+/// ([`is_missing_relation_error`]) reads as `None` ("no marker recorded"), never
+/// a panic — mirroring [`read_code_run_aggregates_selected`]'s absence tolerance.
+/// A genuinely absent row (table exists, epoch never recorded) also yields
+/// `None`. Any OTHER DB error is propagated.
+pub async fn read_epoch_marker(
+    pool: &PgPool,
+    epoch: &str,
+) -> Result<Option<EpochMarker>, ToolError> {
+    let sql = "SELECT epoch, became_current_at, note \
+         FROM intake_epoch_marker WHERE epoch = $1";
+    type MarkerTuple = (String, chrono::DateTime<chrono::Utc>, Option<String>);
+    match sqlx::query_as::<_, MarkerTuple>(sql)
+        .bind(epoch)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(row) => Ok(row.map(|t| EpochMarker {
+            epoch: t.0,
+            became_current_at: t.1,
+            note: t.2,
+        })),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) {
+                // Un-migrated DB: the marker table isn't there yet.
+                Ok(None)
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read intake_epoch_marker: {msg}"
                 )))
             }
         }
@@ -1709,5 +1825,90 @@ mod tests {
         assert!(SELECT_CODE_RUN_FACTORS_FALLBACK_SQL.contains("NULL::integer"));
         assert!(SELECT_CODE_RUN_FACTORS_FALLBACK_SQL.contains("NULL::double precision"));
         assert!(SELECT_CODE_RUN_FACTORS_FALLBACK_SQL.contains("WHERE id = $1"));
+    }
+
+    // ---- MINT2-05: harness-version epochs ------------------------------
+
+    /// The missing-RELATION detector (used by the aggregate read AND the new
+    /// epoch-marker read) matches only "relation … does not exist", never an
+    /// unrelated DB error or a missing-COLUMN error.
+    #[test]
+    fn is_missing_relation_error_matches_only_missing_relation() {
+        assert!(is_missing_relation_error(
+            "error returned from database: relation \"code_run_aggregates\" does not exist"
+        ));
+        assert!(is_missing_relation_error(
+            "relation \"intake_epoch_marker\" does not exist"
+        ));
+        // A missing COLUMN is a different case (handled by is_missing_column_error).
+        assert!(!is_missing_relation_error("column \"quant\" does not exist"));
+        assert!(!is_missing_relation_error("connection refused"));
+    }
+
+    /// The selector-aware aggregate read scopes to ONE epoch for
+    /// Current/Only (binding `harness_version = $1`) and to EVERY epoch for
+    /// All (a bind-free `TRUE`), reusing the central epoch fragment.
+    #[test]
+    fn epoch_where_fragment_drives_selected_aggregate_scoping() {
+        // Current resolves to the one central epoch value.
+        assert_eq!(
+            crate::intake::epoch_where_fragment(&EpochSelector::Current, 1),
+            "harness_version = $1"
+        );
+        // Only(legacy) is still a single-epoch filter (legacy stays queryable).
+        assert_eq!(
+            crate::intake::epoch_where_fragment(&EpochSelector::Only("v1".into()), 1),
+            "harness_version = $1"
+        );
+        // All → no filter, so legacy + current both return (provenance view).
+        assert_eq!(
+            crate::intake::epoch_where_fragment(&EpochSelector::All, 1),
+            "TRUE"
+        );
+        // ...and the selector reports whether a bind is consumed.
+        assert_eq!(EpochSelector::Current.epoch(), Some(crate::intake::current_epoch()));
+        assert_eq!(EpochSelector::All.epoch(), None);
+    }
+
+    /// The stored-aggregate tuple mapper round-trips every column into the
+    /// struct (proving the epoch-specific and selector-aware reads decode
+    /// identically) — including the `harness_version` epoch key.
+    #[test]
+    fn map_stored_agg_round_trips_all_columns() {
+        let t: StoredAggTuple = (
+            "qwen3-coder:30b".to_string(),
+            Some("blitz".to_string()),
+            "v3".to_string(),
+            Some("Q4_K_M".to_string()),
+            Some(true),
+            Some(8192),
+            Some(0.7),
+            Some(0.9),
+            0.5,
+            4,
+            2,
+            0.25,
+            false,
+        );
+        let a = map_stored_agg(t);
+        assert_eq!(a.model, "qwen3-coder:30b");
+        assert_eq!(a.harness_version, "v3");
+        assert_eq!(a.n_samples, 4);
+        assert_eq!(a.passes, 2);
+        assert_eq!(a.pass_rate, 0.5);
+    }
+
+    /// The epoch-marker upsert is idempotent: an INSERT keyed on the `epoch`
+    /// PRIMARY KEY with `ON CONFLICT (epoch) DO UPDATE`, so recording `'v3'`
+    /// twice never duplicates the audit row, and the first-seen
+    /// `became_current_at` is preserved (only `note` is refreshed).
+    #[test]
+    fn upsert_epoch_marker_sql_is_idempotent_upsert() {
+        assert!(UPSERT_EPOCH_MARKER_SQL.contains("INSERT INTO intake_epoch_marker (epoch, note)"));
+        assert!(UPSERT_EPOCH_MARKER_SQL.contains("ON CONFLICT (epoch) DO UPDATE"));
+        // became_current_at is NOT in the conflict SET — the original stamp stays.
+        assert!(!UPSERT_EPOCH_MARKER_SQL.contains("became_current_at ="));
+        // note is refreshed only when a new one is supplied (COALESCE keeps prior).
+        assert!(UPSERT_EPOCH_MARKER_SQL.contains("note = COALESCE(EXCLUDED.note"));
     }
 }

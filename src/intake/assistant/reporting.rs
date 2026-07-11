@@ -966,13 +966,25 @@ fn render_money_query(s: &mut String, q: &MoneyQuery) {
 /// parameter sourced from [`dims`] — the only constants in these strings are the
 /// schema's own column/table names. No model id, threshold, or metric literal.
 pub mod sql {
-    /// Fetch ALL score rows for the latest run (or every run if `run_id` is NULL).
+    /// Fetch score rows for a run (or every run if `run_id` is NULL), scoped to
+    /// an epoch (`harness_version`) partition (or every epoch if `$2` is NULL).
     /// The report logic ranks in Rust over the returned rows, so a single
     /// parameterized fetch backs every money query — no per-query literal SQL.
+    ///
+    /// MINT2-05: `harness_version` is the epoch partition key. It lives on
+    /// `assistant_profile_run` (the ASSISTANT lineage — its own version string,
+    /// [`super::super::schema::HARNESS_VERSION`], distinct from the coder
+    /// build-scenario `intake::CURRENT_EPOCH`), so the scores table is JOINed to
+    /// its run to filter on it. `$2` NULL ⇒ every epoch (legacy/all provenance);
+    /// a non-NULL `$2` ⇒ only that epoch, so evolved-harness runs don't blend
+    /// with a prior epoch's rows in the report. Both filters are still fully
+    /// parameterized — no id/metric/epoch literal in the SQL.
     pub const FETCH_SCORES: &str = "\
-        SELECT model_id, backend_tag, dimension, metric, value, std_dev, judge, low_confidence \
-        FROM assistant_dimension_score \
-        WHERE ($1::uuid IS NULL OR run_id = $1)";
+        SELECT s.model_id, s.backend_tag, s.dimension, s.metric, s.value, s.std_dev, s.judge, s.low_confidence \
+        FROM assistant_dimension_score s \
+        JOIN assistant_profile_run r ON r.id = s.run_id \
+        WHERE ($1::uuid IS NULL OR s.run_id = $1) \
+          AND ($2::text IS NULL OR r.harness_version = $2)";
 
     /// Per-dimension/metric ranking, fully parameterized — kept for callers that
     /// want the DB to rank one metric. `$2` = dimension, `$3` = metric. The
@@ -996,13 +1008,27 @@ pub mod sql {
         ORDER BY model_id, backend_tag, mem_config";
 }
 
-/// Fetch every assistant score row for a run (NULL ⇒ all runs) from the live DB.
+/// The current epoch for the ASSISTANT report lineage: the assistant sweep's
+/// own `harness_version` ([`schema::HARNESS_VERSION`]). This is deliberately
+/// SEPARATE from the coder build-scenario epoch ([`crate::intake::CURRENT_EPOCH`]
+/// = `'v3'`): the two sweeps evolve on independent version strings, so the
+/// assistant report scopes to the assistant lineage, never to `'v3'`.
+pub fn assistant_current_epoch() -> &'static str {
+    schema::HARNESS_VERSION
+}
+
+/// Fetch assistant score rows for a run (NULL ⇒ all runs) from the live DB,
+/// scoped to an epoch: `Some(epoch)` returns only that `harness_version`
+/// partition, `None` returns every epoch (legacy/all provenance). Callers that
+/// want the current epoch pass `Some(assistant_current_epoch())`.
 pub async fn fetch_scores(
     pool: &PgPool,
     run_id: Option<uuid::Uuid>,
+    epoch: Option<&str>,
 ) -> Result<Vec<ScoreRow>, ToolError> {
     let rows = sqlx::query(sql::FETCH_SCORES)
         .bind(run_id)
+        .bind(epoch)
         .fetch_all(pool)
         .await
         .map_err(|e| ToolError::Database(format!("fetch_scores: {e}")))?;
@@ -1048,9 +1074,22 @@ pub async fn run_report(
     run_id: Option<uuid::Uuid>,
     cfg: &ReportConfig,
 ) -> Result<(AssistantReport, String), ToolError> {
+    run_report_for_epoch(run_id, Some(assistant_current_epoch()), cfg).await
+}
+
+/// [`run_report`] with an explicit epoch selector: `Some(epoch)` scopes the
+/// report to one `harness_version` partition (the default is
+/// [`assistant_current_epoch`], so evolved-harness runs don't blend with a
+/// prior epoch), `None` includes every epoch for legacy/all provenance. Legacy
+/// rows are partitioned by filter only — never deleted or mutated.
+pub async fn run_report_for_epoch(
+    run_id: Option<uuid::Uuid>,
+    epoch: Option<&str>,
+    cfg: &ReportConfig,
+) -> Result<(AssistantReport, String), ToolError> {
     let pool = schema::get_pool().await?;
     schema::migrate(&pool).await?;
-    let rows = fetch_scores(&pool, run_id).await?;
+    let rows = fetch_scores(&pool, run_id, epoch).await?;
     let dual = fetch_dual_profile(&pool).await?;
     let report = build_report(&rows, dual, cfg);
     let md = render_markdown(&report);
@@ -1127,6 +1166,29 @@ mod tests {
             md.contains("qwen3-coder:30b | gpu | dynamic_gtt | ✓ | ✓ | 0.750 | 3.200"),
             "dynamic_gtt row values not rendered distinctly:\n{md}"
         );
+    }
+
+    #[test]
+    fn fetch_scores_sql_is_epoch_scoped_and_parameterized() {
+        // MINT2-05: the report scopes to a harness_version epoch partition,
+        // JOINing scores to their run (where harness_version lives). Both the
+        // run and epoch filters are parameterized ($1 run, $2 epoch), NULL ⇒
+        // "all" for each — no id/epoch literal in the SQL.
+        assert!(sql::FETCH_SCORES.contains("JOIN assistant_profile_run r ON r.id = s.run_id"));
+        assert!(sql::FETCH_SCORES.contains("$2::text IS NULL OR r.harness_version = $2"));
+        assert!(sql::FETCH_SCORES.contains("$1::uuid IS NULL OR s.run_id = $1"));
+        // No epoch value literal leaks into the SQL.
+        assert!(!sql::FETCH_SCORES.contains("'v3'"));
+        assert!(!sql::FETCH_SCORES.contains(schema::HARNESS_VERSION));
+    }
+
+    #[test]
+    fn assistant_epoch_is_a_separate_lineage_from_the_coder_epoch() {
+        // The assistant report's current epoch is the assistant sweep's own
+        // harness_version, NOT the coder build-scenario epoch ('v3'). Blending
+        // the two would filter the assistant report down to zero rows.
+        assert_eq!(assistant_current_epoch(), schema::HARNESS_VERSION);
+        assert_ne!(assistant_current_epoch(), crate::intake::CURRENT_EPOCH);
     }
 
     #[test]

@@ -86,6 +86,89 @@ pub use code_v2::{
 pub use runner::create_profile_row;
 
 // ---------------------------------------------------------------------------
+// MINT2-05: harness-version EPOCHS — the single source of truth
+// ---------------------------------------------------------------------------
+//
+// `harness_version` is the EPOCH partition key for the build-scenario coder
+// rows (`code_profile_runs`) and their derived aggregates
+// (`code_run_aggregates`). When a test evolves (Phase 1 changes what/how we
+// measure), the epoch is bumped so old results become a distinct partition:
+// they are never DELETED (provenance) but they also never blend into the
+// current epoch's tuning numbers.
+//
+// This is the ONE place the current epoch string is stated. MINT2-03 originally
+// held a local `CURRENT_EPOCH` in `aggregate.rs`; MINT2-05 promotes it here and
+// `aggregate.rs` re-exports THIS const, so there is exactly one definition. A
+// future `'v4'` is a one-line bump here and nowhere else.
+//
+// NOTE ON SCOPE: this epoch governs the CODER build-scenario lineage (`'v3'`).
+// The assistant sweep (`assistant_profile_run.harness_version`) is a SEPARATE
+// lineage with its own version string (`assistant::schema::HARNESS_VERSION`);
+// its report scopes to that lineage, not to this `'v3'` — see
+// `assistant/reporting.rs`.
+
+/// The current build-scenario harness epoch. `harness_version` is the epoch
+/// partition key: every current-epoch read/aggregate/catalog scopes to this
+/// value by default so evolved-test results never blend with a prior harness's
+/// rows, while legacy epochs (`'v1'`/`'v2'`) remain queryable via an explicit
+/// [`EpochSelector`] but never pollute the current numbers. Bumping to a future
+/// `'v4'` is a ONE-LINE change here — the single source of truth for the value.
+pub const CURRENT_EPOCH: &str = "v3";
+
+/// The current epoch string (helper form of [`CURRENT_EPOCH`]) — the value all
+/// current-epoch reads default to.
+pub fn current_epoch() -> &'static str {
+    CURRENT_EPOCH
+}
+
+/// Which epoch(s) a current-epoch-partitioned read should cover.
+///
+/// Reads default to [`EpochSelector::Current`] (only the current epoch), so
+/// legacy rows never pollute current-epoch numbers. Provenance queries pass
+/// [`EpochSelector::Only`] for a specific prior epoch, or [`EpochSelector::All`]
+/// to include every epoch. This ONLY changes which rows a read returns — legacy
+/// rows are partitioned by filter and are NEVER deleted or mutated.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EpochSelector {
+    /// Only the current epoch ([`current_epoch`]) — the default for every
+    /// current-epoch read.
+    #[default]
+    Current,
+    /// Only this one explicit epoch (e.g. `"v1"` / `"v2"` for a legacy
+    /// provenance query).
+    Only(String),
+    /// Every epoch — no `harness_version` filter (the all-provenance view).
+    All,
+}
+
+impl EpochSelector {
+    /// The concrete epoch string to filter on, or `None` for
+    /// [`EpochSelector::All`] (no filter). [`EpochSelector::Current`] resolves to
+    /// [`current_epoch`], so "current" is always the one central value.
+    pub fn epoch(&self) -> Option<&str> {
+        match self {
+            EpochSelector::Current => Some(current_epoch()),
+            EpochSelector::Only(e) => Some(e.as_str()),
+            EpochSelector::All => None,
+        }
+    }
+}
+
+/// The SQL `WHERE`-fragment that scopes a `harness_version`-partitioned query to
+/// `selector`, binding the epoch at positional `$idx`.
+///
+/// `Current` / `Only` yield `harness_version = $idx` (the caller binds the value
+/// from [`EpochSelector::epoch`]); `All` yields `TRUE` (no bind consumed) so a
+/// caller can always splice the fragment into its `WHERE` unconditionally. This
+/// is the ONE place the epoch filter shape is defined. PURE — unit-tested.
+pub fn epoch_where_fragment(selector: &EpochSelector, idx: usize) -> String {
+    match selector.epoch() {
+        Some(_) => format!("harness_version = ${idx}"),
+        None => "TRUE".to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unified MINT harness (MINT2-04)
 // ---------------------------------------------------------------------------
 //
@@ -989,6 +1072,44 @@ mod tests {
             .execute(json!({"models": [], "metric": "max_context_safe"}))
             .await;
         assert!(matches!(r, Err(ToolError::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn current_epoch_is_the_single_source_of_truth() {
+        // MINT2-05: the ONE place the current epoch is stated. `current_epoch()`
+        // and the const agree, and `aggregate.rs` re-exports THIS value (proven
+        // by `aggregate`'s own tests keying rows off `CURRENT_EPOCH`).
+        assert_eq!(CURRENT_EPOCH, "v3");
+        assert_eq!(current_epoch(), CURRENT_EPOCH);
+    }
+
+    #[test]
+    fn epoch_selector_resolves_current_legacy_and_all() {
+        // Default is Current → resolves to the one central value.
+        assert_eq!(EpochSelector::default(), EpochSelector::Current);
+        assert_eq!(EpochSelector::Current.epoch(), Some(current_epoch()));
+        // An explicit legacy epoch stays queryable.
+        assert_eq!(
+            EpochSelector::Only("v1".to_string()).epoch(),
+            Some("v1")
+        );
+        // All = no filter.
+        assert_eq!(EpochSelector::All.epoch(), None);
+    }
+
+    #[test]
+    fn epoch_where_fragment_appends_filter_or_true() {
+        // Current/Only append the epoch filter at the given bind index; All is a
+        // bind-free always-true fragment so callers can splice unconditionally.
+        assert_eq!(
+            epoch_where_fragment(&EpochSelector::Current, 1),
+            "harness_version = $1"
+        );
+        assert_eq!(
+            epoch_where_fragment(&EpochSelector::Only("v2".into()), 3),
+            "harness_version = $3"
+        );
+        assert_eq!(epoch_where_fragment(&EpochSelector::All, 1), "TRUE");
     }
 
     #[test]

@@ -875,6 +875,28 @@ pub async fn run(
                      persisted, aggregates recompute next run): {e}"
                 ),
             }
+            // MINT2-05: idempotently record that the current epoch is/became the
+            // active build-scenario partition, so the audit timeline (when 'v3'
+            // became current) is answerable from the data. Best-effort — same
+            // as the aggregate refresh: a DB hiccup or an un-migrated DB missing
+            // the `intake_epoch_marker` table must NOT fail an otherwise-
+            // successful sweep whose per-case rows are already durably written.
+            match intake::storage::upsert_epoch_marker(
+                &pool,
+                intake::current_epoch(),
+                Some("current build-scenario coder epoch (recorded by coder sweep)"),
+            )
+            .await
+            {
+                Ok(_) => eprintln!(
+                    "coder sweep: epoch marker recorded/confirmed for epoch {}",
+                    intake::current_epoch()
+                ),
+                Err(e) => eprintln!(
+                    "coder sweep: could not record epoch marker (continuing — \
+                     marker is audit-only, sweep rows persisted): {e}"
+                ),
+            }
             std::process::ExitCode::SUCCESS
         }
         Err(e) => {
