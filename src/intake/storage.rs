@@ -1442,6 +1442,265 @@ pub async fn read_latest_profile(
     }))
 }
 
+// ===========================================================================
+// MINT2-07: Model Fleet Catalog — tolerant readers for every upstream source +
+// the wholesale persist. Each read tolerates its source table/column being
+// ABSENT on an un-migrated host (a missing relation/column reads as "no rows",
+// so the catalog builder degrades those cells to `not_run` rather than
+// crashing) — mirroring the MINT2-03/05 absence-tolerant pattern. The catalog's
+// COMPUTATION is the pure `crate::intake::catalog::build_catalog`; these are the
+// thin DB wrappers around it.
+// ===========================================================================
+
+use crate::intake::catalog::{
+    AgentRollup, AssistantCell, CoverageStatus, ModelCatalog, NonViableRow, ServingRow,
+};
+
+/// Max run timestamp per `(model_name, task_category)` for one coder epoch —
+/// the `last_run_at` a catalog `run` cell reports. Tolerates the `task_category`
+/// column being absent (un-migrated MINT2-01) or the table being absent: either
+/// yields an empty map, never a panic. Skips `non_viable_skip` rows (they have
+/// no measured category) exactly as the aggregate-input read does.
+pub async fn read_coder_last_run(
+    pool: &PgPool,
+    epoch: &str,
+) -> Result<std::collections::BTreeMap<(String, String), chrono::DateTime<chrono::Utc>>, ToolError> {
+    let sql = "SELECT p.model_name, r.task_category, max(r.created_at) \
+         FROM code_profile_runs r JOIN model_profiles p ON p.id = r.profile_id \
+         WHERE r.harness_version = $1 AND COALESCE(r.task_type, '') <> 'non_viable_skip' \
+           AND r.task_category IS NOT NULL \
+         GROUP BY p.model_name, r.task_category";
+    type Row = (String, String, chrono::DateTime<chrono::Utc>);
+    match sqlx::query_as::<_, Row>(sql).bind(epoch).fetch_all(pool).await {
+        Ok(rows) => Ok(rows
+            .into_iter()
+            .map(|(m, c, t)| ((m, c), t))
+            .collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                Ok(std::collections::BTreeMap::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read coder last-run timestamps: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// The `non_viable_vram` skip rows for one epoch, read on their OWN axis from
+/// `code_profile_runs.failure_class` (NOT inferred from aggregates, which
+/// EXCLUDE skips). Tolerates the `failure_class`/`quant` column or the table
+/// being absent → empty vec.
+pub async fn read_non_viable_rows(
+    pool: &PgPool,
+    epoch: &str,
+) -> Result<Vec<NonViableRow>, ToolError> {
+    let sql = "SELECT p.model_name, r.quant \
+         FROM code_profile_runs r JOIN model_profiles p ON p.id = r.profile_id \
+         WHERE r.harness_version = $1 AND r.failure_class = 'non_viable_vram'";
+    type Row = (String, Option<String>);
+    match sqlx::query_as::<_, Row>(sql).bind(epoch).fetch_all(pool).await {
+        Ok(rows) => Ok(rows
+            .into_iter()
+            .map(|(model_name, quant)| NonViableRow { model_name, quant })
+            .collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                Ok(Vec::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read non_viable_vram rows: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// Per-(model, dimension) rollup of the assistant sweep's dimension scores:
+/// sample count, mean dispersion, last-run. Tolerates the
+/// `assistant_dimension_score` table being absent → empty vec.
+pub async fn read_assistant_cells(pool: &PgPool) -> Result<Vec<AssistantCell>, ToolError> {
+    let sql = "SELECT model_id, dimension, count(*)::bigint, avg(std_dev), max(created_at) \
+         FROM assistant_dimension_score GROUP BY model_id, dimension";
+    type Row = (
+        String,
+        String,
+        i64,
+        Option<f64>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    );
+    match sqlx::query_as::<_, Row>(sql).fetch_all(pool).await {
+        Ok(rows) => Ok(rows
+            .into_iter()
+            .map(|(model_name, dimension, n, sd, last)| AssistantCell {
+                model_name,
+                dimension,
+                n_samples: n,
+                score_stddev: sd,
+                last_run_at: last,
+            })
+            .collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) {
+                Ok(Vec::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read assistant dimension cells: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// Latest serving/operational profile per model (the fleet card's serving
+/// facts). Tolerates the operational-profile table being absent → empty vec.
+pub async fn read_serving_rows(pool: &PgPool) -> Result<Vec<ServingRow>, ToolError> {
+    let sql = "SELECT DISTINCT ON (mp.model_name) mp.model_name, op.max_context_safe, \
+                op.quality_degradation_point, op.throughput_at_8k, op.created_at \
+         FROM model_profiles mp JOIN model_operational_profiles op ON op.profile_id = mp.id \
+         ORDER BY mp.model_name, op.created_at DESC";
+    type Row = (
+        String,
+        Option<i32>,
+        Option<i32>,
+        Option<f64>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    );
+    match sqlx::query_as::<_, Row>(sql).fetch_all(pool).await {
+        Ok(rows) => Ok(rows
+            .into_iter()
+            .map(
+                |(model_name, max_context_safe, quality_degradation_point, throughput, last)| {
+                    ServingRow {
+                        model_name,
+                        max_context_safe,
+                        quality_degradation_point,
+                        throughput,
+                        last_run_at: last,
+                    }
+                },
+            )
+            .collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) {
+                Ok(Vec::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read serving profiles: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// Per-model agent tool-use rollup: sample count and correct-tool-selection
+/// accuracy. Tolerates the `agent_profile_runs` table being absent → empty vec.
+pub async fn read_agent_rollups(pool: &PgPool) -> Result<Vec<AgentRollup>, ToolError> {
+    let sql = "SELECT mp.model_name, count(*)::bigint, \
+                avg(CASE WHEN ap.correct_tool_selected THEN 1.0 ELSE 0.0 END) \
+         FROM model_profiles mp JOIN agent_profile_runs ap ON ap.profile_id = mp.id \
+         GROUP BY mp.model_name";
+    type Row = (String, i64, Option<f64>);
+    match sqlx::query_as::<_, Row>(sql).fetch_all(pool).await {
+        Ok(rows) => Ok(rows
+            .into_iter()
+            .map(|(model_name, n, acc)| AgentRollup {
+                model_name,
+                n_samples: n,
+                tool_accuracy: acc,
+            })
+            .collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) {
+                Ok(Vec::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read agent tool-use rollups: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// Persist the freshly-built fleet catalog, replacing BOTH catalog tables
+/// wholesale in one transaction (the catalog is fully re-derivable from the
+/// upstream tables, so a delete-then-insert is the simplest correct idempotent
+/// write — and a partial failure never leaves a half-updated card). The cell
+/// table is cleared FIRST, then the summary; inserts stamp `refreshed_at` via
+/// the column defaults. If the catalog tables are ABSENT (un-migrated host) this
+/// errors on the missing relation — callers wire the refresh best-effort so a
+/// not-yet-migrated host degrades to "catalog not refreshed" rather than failing
+/// the sweep (see the coder-sweep call site).
+pub async fn persist_fleet_catalog(
+    pool: &PgPool,
+    catalog: &[ModelCatalog],
+) -> Result<(), ToolError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ToolError::Database(format!("begin fleet-catalog persist tx: {e}")))?;
+
+    sqlx::query("DELETE FROM model_fleet_catalog_cell")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ToolError::Database(format!("clear model_fleet_catalog_cell: {e}")))?;
+    sqlx::query("DELETE FROM model_fleet_catalog")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ToolError::Database(format!("clear model_fleet_catalog: {e}")))?;
+
+    for m in catalog {
+        let serving_json = m.serving.to_json();
+        sqlx::query(
+            "INSERT INTO model_fleet_catalog \
+             (model_name, quant, in_current_fleet, serving_json, not_run_count, stale_count) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(&m.model_name)
+        .bind(m.quant.as_deref())
+        .bind(m.in_current_fleet)
+        .bind(serving_json)
+        .bind(m.not_run_count as i32)
+        .bind(m.stale_count as i32)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ToolError::Database(format!("insert model_fleet_catalog row: {e}")))?;
+
+        for c in &m.cells {
+            sqlx::query(
+                "INSERT INTO model_fleet_catalog_cell \
+                 (model_name, quant, test_type, task_category, status, pass_rate, \
+                  n_samples, score_stddev, low_confidence, last_run_at, harness_version) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            )
+            .bind(&c.model_name)
+            .bind(c.quant.as_deref())
+            .bind(&c.test_type)
+            .bind(&c.task_category)
+            .bind(CoverageStatus::as_str(&c.status))
+            .bind(c.pass_rate)
+            .bind(c.n_samples.map(|n| n as i32))
+            .bind(c.score_stddev)
+            .bind(c.low_confidence)
+            .bind(c.last_run_at)
+            .bind(c.harness_version.as_deref())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ToolError::Database(format!("insert model_fleet_catalog_cell row: {e}")))?;
+        }
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| ToolError::Database(format!("commit fleet-catalog persist tx: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -22,6 +22,7 @@ mod agent;
 pub mod aggregate;
 pub mod assistant;
 pub mod breakfix;
+pub mod catalog;
 pub mod checkpoint;
 pub mod chord_pull;
 mod code;
