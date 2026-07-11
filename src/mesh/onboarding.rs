@@ -745,7 +745,7 @@ mod tests {
         let output = tool.execute(args).await.expect("tool call should succeed");
         assert!(!output.contains("fixture-token-value"));
         assert!(output.contains("MESH_ONBOARD_TEST_TOKEN"));
-        assert!(output.contains("\"dry_run\": true"));
+        assert!(output.contains("\"dry_run\":true"));
         std::env::remove_var("MESH_ONBOARD_TEST_TOKEN");
     }
 
