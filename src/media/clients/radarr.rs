@@ -90,6 +90,27 @@ impl RadarrClient {
 
         map_response(resp).await
     }
+
+    /// `POST /api/v3/movie` — add a movie to the library, driving Radarr's
+    /// own indexer search + grab (which hands the completed download to the
+    /// configured download client, qtor) when `addOptions.searchForMovie` is
+    /// `true` in `body`. MEDIA-03: this is the only mutation this client
+    /// exposes; it stays a thin passthrough of a caller-built body -- the
+    /// tiering/confirmation decision about whether to call this at all lives
+    /// in `crate::media::request`, not here.
+    pub async fn add_movie(&self, body: Value) -> Result<Value, ToolError> {
+        let url = format!("{}/api/v3/movie", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .header("X-Api-Key", &self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ToolError::Http(format!("Radarr unavailable: {e}")))?;
+
+        map_response(resp).await
+    }
 }
 
 /// Shared status-mapping: 404 -> NotFound, other 4xx -> api-error Http,
@@ -199,6 +220,36 @@ mod tests {
         let result = client.library().await.unwrap();
         mock.assert();
         assert_eq!(result[0]["title"], "Arrival");
+    }
+
+    #[tokio::test]
+    async fn add_movie_posts_body_and_parses_mocked_201() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v3/movie")
+                .json_body(json!({ "tmdbId": 438631, "title": "Dune", "qualityProfileId": 1, "rootFolderPath": "/movies", "monitored": true, "addOptions": { "searchForMovie": true } }));
+            then.status(201).json_body(json!({ "id": 7, "title": "Dune" }));
+        });
+
+        let client = test_client(&server.base_url());
+        let body = json!({ "tmdbId": 438631, "title": "Dune", "qualityProfileId": 1, "rootFolderPath": "/movies", "monitored": true, "addOptions": { "searchForMovie": true } });
+        let result = client.add_movie(body).await.unwrap();
+        mock.assert();
+        assert_eq!(result["id"], 7);
+    }
+
+    #[tokio::test]
+    async fn add_movie_server_error_maps_to_http() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/api/v3/movie");
+            then.status(500);
+        });
+
+        let client = test_client(&server.base_url());
+        let result = client.add_movie(json!({})).await;
+        assert!(matches!(result, Err(ToolError::Http(_))));
     }
 
     #[tokio::test]

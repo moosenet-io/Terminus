@@ -79,6 +79,26 @@ impl SonarrClient {
 
         map_response(resp).await
     }
+
+    /// `POST /api/v3/series` — add a series to the library, driving Sonarr's
+    /// own indexer search + grab (which hands completed downloads to the
+    /// configured download client, qtor) when `addOptions.searchForMissingEpisodes`
+    /// is `true` in `body`. MEDIA-03: thin passthrough of a caller-built
+    /// body -- whole-series vs. single-season monitoring and the
+    /// tiering/confirmation decision live in `crate::media::request`.
+    pub async fn add_series(&self, body: Value) -> Result<Value, ToolError> {
+        let url = format!("{}/api/v3/series", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .header("X-Api-Key", &self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ToolError::Http(format!("Sonarr unavailable: {e}")))?;
+
+        map_response(resp).await
+    }
 }
 
 async fn map_response(resp: reqwest::Response) -> Result<Value, ToolError> {
@@ -186,6 +206,34 @@ mod tests {
         let result = client.library().await.unwrap();
         mock.assert();
         assert_eq!(result[0]["title"], "Severance");
+    }
+
+    #[tokio::test]
+    async fn add_series_posts_body_and_parses_mocked_201() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v3/series");
+            then.status(201).json_body(json!({ "id": 9, "title": "Foundation" }));
+        });
+
+        let client = test_client(&server.base_url());
+        let body = json!({ "tvdbId": 358903, "title": "Foundation", "qualityProfileId": 1, "rootFolderPath": "/tv", "monitored": true, "addOptions": { "searchForMissingEpisodes": true } });
+        let result = client.add_series(body).await.unwrap();
+        mock.assert();
+        assert_eq!(result["id"], 9);
+    }
+
+    #[tokio::test]
+    async fn add_series_server_error_maps_to_http() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/api/v3/series");
+            then.status(500);
+        });
+
+        let client = test_client(&server.base_url());
+        let result = client.add_series(json!({})).await;
+        assert!(matches!(result, Err(ToolError::Http(_))));
     }
 
     #[tokio::test]
