@@ -20,11 +20,13 @@
 //! every replayed commit's tree before anything is pushed — a secret hidden in an
 //! old, later-"removed" commit is caught there, never shipped.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::error::ToolError;
+use crate::github::pii::{ruleset_from_config, TreeViolation};
 
 use super::native_clean::DeterministicCleaner;
 use super::workdir::run_git;
@@ -196,6 +198,156 @@ pub fn replay_full_history(
     git_capture(work_dir, &["reset", "--hard"])?;
 
     Ok(report)
+}
+
+// ── GHIST-02: full-history PII gate ──────────────────────────────────────────
+
+/// One residual PII violation found in a HISTORICAL commit's tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryViolation {
+    /// A commit whose tree carries the violation (the representative commit for
+    /// the tree — many commits can share one tree; see [`gate_full_history`]).
+    pub commit: String,
+    pub file: String,
+    pub line: usize,
+    pub pattern_kind: String,
+    /// Redacted context (the gate never stores the full secret).
+    pub context: String,
+}
+
+/// Result of scanning EVERY commit's tree in a replayed history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullHistoryGateReport {
+    /// True iff zero residual violations across all commits.
+    pub clean: bool,
+    pub commits_scanned: usize,
+    /// Distinct tree objects actually scanned (commits sharing a tree scan once).
+    pub unique_trees: usize,
+    pub violations: Vec<HistoryViolation>,
+}
+
+/// Scan the tree of EVERY commit reachable in `work_dir` (not just the tip) with
+/// the authoritative PII gate, and report any residual `commit:file:line`. This is
+/// the safety spine of the backfill: a secret committed once and later "removed"
+/// still lives in that historical commit's tree, and a full-history push would ship
+/// it — so the caller MUST refuse to push when `clean` is false.
+///
+/// Cost is bounded by de-duplicating on the TREE object: commits that share a tree
+/// (a no-op commit, a revert to an identical tree) are scanned once. Each unique
+/// tree is materialized read-only via `git archive | tar -x` into a throwaway temp
+/// dir, scanned, and removed. Progress is logged for large histories.
+pub fn gate_full_history(work_dir: &Path) -> Result<FullHistoryGateReport, ToolError> {
+    let rev_list = git_capture(work_dir, &["rev-list", "--all"])?;
+    let commits: Vec<String> = rev_list.split_whitespace().map(|s| s.to_string()).collect();
+    // Same ruleset resolution every other gate surface uses (repo pii-gate.toml /
+    // TERMINUS_PII_CONFIG / built-in default), so history is gated identically to
+    // the tip.
+    let ruleset = ruleset_from_config(Some(work_dir));
+
+    let scan_root = temp_dir_unique("ghist02-gate");
+    std::fs::create_dir_all(&scan_root)
+        .map_err(|e| ToolError::Execution(format!("create gate scan root: {e}")))?;
+
+    let mut seen_trees: HashSet<String> = HashSet::new();
+    let mut violations: Vec<HistoryViolation> = Vec::new();
+    let total = commits.len();
+
+    for (i, commit) in commits.iter().enumerate() {
+        let tree = git_capture(work_dir, &["rev-parse", &format!("{commit}^{{tree}}")])?
+            .trim()
+            .to_string();
+        if !seen_trees.insert(tree.clone()) {
+            continue; // tree already scanned via an earlier (representative) commit
+        }
+        let dir = scan_root.join(&tree);
+        if let Err(e) = extract_tree(work_dir, &tree, &dir) {
+            let _ = std::fs::remove_dir_all(&scan_root);
+            return Err(e);
+        }
+        for TreeViolation { file, line, pattern_kind, context } in ruleset.scan_tree(&dir) {
+            violations.push(HistoryViolation {
+                commit: commit.clone(),
+                file,
+                line,
+                pattern_kind,
+                context,
+            });
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        if i > 0 && i % 200 == 0 {
+            tracing::info!(
+                target: "forge.mirror",
+                scanned = i,
+                total,
+                unique_trees = seen_trees.len(),
+                residuals = violations.len(),
+                "full-history gate progress"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&scan_root);
+
+    Ok(FullHistoryGateReport {
+        clean: violations.is_empty(),
+        commits_scanned: total,
+        unique_trees: seen_trees.len(),
+        violations,
+    })
+}
+
+/// Materialize a git TREE object read-only into `dest` via `git archive | tar -x`.
+/// The two children are connected by an OS pipe (git stdout → tar stdin), so there
+/// is no manual pump and no deadlock. Neither touches the source work-tree.
+fn extract_tree(repo: &Path, tree: &str, dest: &Path) -> Result<(), ToolError> {
+    std::fs::create_dir_all(dest)
+        .map_err(|e| ToolError::Execution(format!("create tree dir {}: {e}", dest.display())))?;
+    let mut archive = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(HOOKS_OFF)
+        .args(["archive", "--format=tar", tree])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| ToolError::Execution(format!("spawn git archive: {e}")))?;
+    let archive_out: Stdio = archive.stdout.take().expect("piped").into();
+    let tar = Command::new("tar")
+        .arg("-x")
+        .arg("-C")
+        .arg(dest)
+        .stdin(archive_out)
+        .output()
+        .map_err(|e| ToolError::Execution(format!("run tar -x: {e}")))?;
+    let a_status = archive
+        .wait()
+        .map_err(|e| ToolError::Execution(format!("wait git archive: {e}")))?;
+    let mut a_err = String::new();
+    if let Some(mut es) = archive.stderr.take() {
+        let _ = es.read_to_string(&mut a_err);
+    }
+    if !a_status.success() {
+        return Err(ToolError::Execution(format!("git archive {tree} failed: {}", a_err.trim())));
+    }
+    if !tar.status.success() {
+        return Err(ToolError::Execution(format!(
+            "tar -x failed for {tree}: {}",
+            String::from_utf8_lossy(&tar.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// A process-unique temp dir path (no `Date`/`rand` — uses pid + monotonic-ish
+/// system time, unique enough for a serialized backfill).
+fn temp_dir_unique(tag: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ))
 }
 
 /// What the NEXT `data <n>` block belongs to, set by the command line preceding it.
@@ -411,5 +563,105 @@ mod tests {
         assert!(contains_subslice(b"M 100644 inline path", b" inline "));
         assert!(!contains_subslice(b"M 100644 :5 path", b" inline "));
         assert!(contains_subslice(b"anything", b""));
+    }
+
+    /// Commit `dir` with a fixed identity (helper for the gate tests).
+    fn commit_all(dir: &Path, msg: &str) {
+        git(dir, &["add", "-A"]);
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(HOOKS_OFF)
+            .args([
+                "-c",
+                "user.name=Gate Test",
+                "-c",
+                "user.email=<email>", // pii-test-fixture
+                "commit",
+                "-q",
+                "-m",
+                msg,
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "commit: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    // ── GHIST-02: a secret present ONLY in a historical (non-tip) commit is caught ──
+    #[test]
+    fn gate_flags_secret_in_historical_commit() {
+        std::env::remove_var("TERMINUS_PII_CONFIG");
+        let dir = unique("gate-hist");
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        // Commit 1 introduces an internal IP...
+        write(&dir, "leak.txt", b"internal host <internal-ip> in an old commit\n"); // pii-test-fixture
+        commit_all(&dir, "add a file with an internal ip");
+        // Commit 2 DELETES the file — so the TIP tree is clean, but the IP still
+        // lives in commit 1's tree.
+        std::fs::remove_file(dir.join("leak.txt")).unwrap();
+        write(&dir, "readme.txt", b"nothing sensitive now\n");
+        commit_all(&dir, "remove the leaky file");
+
+        // Tip is clean...
+        let tip_dir = unique("gate-tip");
+        let tip_tree = git(&dir, &["rev-parse", "HEAD^{tree}"]).trim().to_string();
+        extract_tree(&dir, &tip_tree, &tip_dir).unwrap();
+        assert!(
+            crate::github::pii::ruleset_from_config(None).scan_tree(&tip_dir).is_empty(),
+            "tip tree is clean"
+        );
+
+        // ...but the FULL-HISTORY gate flags commit 1.
+        let report = gate_full_history(&dir).unwrap();
+        assert!(!report.clean, "gate must flag the historical secret: {report:?}");
+        assert!(report.commits_scanned >= 2);
+        assert!(
+            report.violations.iter().any(|v| v.file == "leak.txt" && v.pattern_kind == "private_ip"),
+            "the historical leak.txt private_ip is flagged: {:?}",
+            report.violations
+        );
+        // Context is redacted — the raw IP is never echoed in the report.
+        assert!(
+            report.violations.iter().all(|v| !v.context.contains("<internal-ip>")), // pii-test-fixture
+            "context must be redacted"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&tip_dir);
+    }
+
+    // ── GHIST-02: a fully-clean history passes the gate ──
+    #[test]
+    fn gate_passes_clean_history() {
+        std::env::remove_var("TERMINUS_PII_CONFIG");
+        let dir = unique("gate-clean");
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        write(&dir, "a.txt", b"just some ordinary content\n");
+        commit_all(&dir, "c1");
+        write(&dir, "b.txt", b"more ordinary content, no secrets\n");
+        commit_all(&dir, "c2");
+
+        let report = gate_full_history(&dir).unwrap();
+        assert!(report.clean, "clean history passes: {report:?}");
+        assert_eq!(report.violations.len(), 0);
+        assert!(report.commits_scanned >= 2 && report.unique_trees >= 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── GHIST-01 + GHIST-02 together: replay scrubs history so the gate then passes ──
+    #[test]
+    fn replayed_history_passes_the_full_gate() {
+        std::env::remove_var("TERMINUS_PII_CONFIG");
+        let src = init_source(); // has an internal IP in its first commit
+        let wd = unique("replay-gate-wd");
+        replay_full_history(&src, &wd, &ReplayOpts::new()).unwrap();
+        // After GHIST-01 scrubbed every blob, the full-history gate is clean.
+        let report = gate_full_history(&wd).unwrap();
+        assert!(report.clean, "replayed (scrubbed) history passes the full gate: {report:?}");
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&wd);
     }
 }
