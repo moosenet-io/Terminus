@@ -44,7 +44,7 @@ use crate::registry::ToolRegistry;
 /// never carried in this struct — it's resolved at bootstrap time from
 /// `crate::pki::ca()` / `crate::pki::mtls`, per those modules' own
 /// load-or-generate precedence.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GatewayServerConfig {
     pub server_name: String,
     pub server_version: String,
@@ -90,6 +90,29 @@ pub struct GatewayServerConfig {
     /// when the feature is enabled -- `None` (this field's default posture)
     /// when it isn't, byte-for-byte the pre-MESH-15 behavior.
     pub mesh_pool: Option<Arc<crate::mesh::UpstreamPool>>,
+}
+
+/// Manual `Debug` (rather than `#[derive(Debug)]` on the struct): every
+/// other field here is `Debug` for free, but [`crate::mesh::UpstreamPool`]
+/// deliberately isn't (it holds live client state, not a value meant to be
+/// dumped) -- so `mesh_pool` is rendered as presence + upstream count only,
+/// same "don't print internals, print a safe summary" posture the mesh
+/// module uses for anything credential-adjacent elsewhere.
+impl std::fmt::Debug for GatewayServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayServerConfig")
+            .field("server_name", &self.server_name)
+            .field("server_version", &self.server_version)
+            .field("auth_token", &self.auth_token.as_ref().map(|_| "<redacted>"))
+            .field("mtls_bind", &self.mtls_bind)
+            .field("mtls_port", &self.mtls_port)
+            .field("mtls_server_identity", &self.mtls_server_identity)
+            .field("personal_federation", &self.personal_federation.is_some())
+            .field("inference_proxy", &self.inference_proxy.is_some())
+            .field("gateway", &self.gateway.is_some())
+            .field("mesh_pool_upstreams", &self.mesh_pool.as_ref().map(|p| p.len()))
+            .finish()
+    }
 }
 
 /// Build the shared MCP (`/mcp`, `/healthz`) + `/enroll` router for
