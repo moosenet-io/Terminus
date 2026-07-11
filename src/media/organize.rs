@@ -343,8 +343,20 @@ impl RustTool for MediaDelete {
         }
 
         let deleted = match media_type {
-            "movie" => self.radarr.as_ref().unwrap().delete_movie(id).await,
-            _ => self.sonarr.as_ref().unwrap().delete_series(id).await,
+            "movie" => {
+                let radarr = self
+                    .radarr
+                    .as_ref()
+                    .ok_or_else(|| ToolError::NotConfigured("RADARR_URL/RADARR_API_KEY not set".into()))?;
+                radarr.delete_movie(id).await
+            }
+            _ => {
+                let sonarr = self
+                    .sonarr
+                    .as_ref()
+                    .ok_or_else(|| ToolError::NotConfigured("SONARR_URL/SONARR_API_KEY not set".into()))?;
+                sonarr.delete_series(id).await
+            }
         };
 
         match deleted {
@@ -1026,5 +1038,47 @@ mod tests {
         let c = cleanup_tool(None, None);
         assert_eq!(c.name(), "media_cleanup");
         assert!(!c.description().is_empty());
+    }
+
+    // media_organize on an id that isn't in the library → NotFound, not a panic.
+    #[tokio::test]
+    async fn organize_item_not_found_returns_error() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v3/movie");
+            then.status(200).json_body(json!([]));
+        });
+
+        let tool = organize_tool(Some(&server.base_url()), None);
+        let result = tool
+            .execute(json!({ "id": 999, "media_type": "movie", "action": "monitor", "monitored": false }))
+            .await;
+
+        assert!(matches!(result, Err(ToolError::NotFound(_))));
+    }
+
+    // media_cleanup with no candidates → clean no-op response (nothing eligible,
+    // executed:false), never an error and never a delete.
+    #[tokio::test]
+    async fn cleanup_empty_candidates_returns_clean_response() {
+        let server = MockServer::start();
+        let any_delete = server.mock(|when, then| {
+            when.method(DELETE);
+            then.status(200);
+        });
+
+        let tool = cleanup_tool(Some(&server.base_url()), None);
+        let result = tool
+            .execute(json!({ "media_type": "movie", "candidates": [] }))
+            .await
+            .unwrap();
+
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["structured"]["executed"], false);
+        assert_eq!(
+            parsed["structured"]["eligible"].as_array().map(|a| a.len()).unwrap_or(0),
+            0
+        );
+        assert_eq!(any_delete.hits(), 0, "empty cleanup must never delete anything");
     }
 }
