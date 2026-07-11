@@ -22,6 +22,11 @@
 //! - `SWEEP_MEM_CONFIG` — memory-model tag (overridden by `run`'s `mem_config`
 //!   param when `Some`).
 //! - `INTAKE_VRAM_CEILING_GB` — over-ceiling models skip the GPU pass cleanly.
+//! - MINT2-01 measurement-factor knobs (all optional; recorded on every `'v3'`
+//!   case row so pass-rate can be analyzed against the knob that was set — see
+//!   [`intake::code_v2::MeasurementFactors::from_env`]): `SWEEP_QUANT`,
+//!   `SWEEP_REASONING_ENABLED`, `SWEEP_CONTEXT_WINDOW`, `SWEEP_TEMPERATURE`,
+//!   `SWEEP_TOP_P`. Unset ⇒ the factor records as "unset"/`unknown`, never guessed.
 
 use std::collections::BTreeSet;
 
@@ -779,12 +784,17 @@ pub async fn run(
     // silently race another holder — it waits, bounded, via the shared
     // `gpu_authority::acquire_with_backoff` — it just does so freshly per
     // pass instead of once for days.
+    // MINT2-01: surface the run-global sampling/launch factors that will be
+    // recorded on every `'v3'` case row (quant is model-specific — parsed per
+    // model at case time — so it's omitted from this run-level banner).
+    let factor_summary = intake::code_v2::MeasurementFactors::from_env("").sampling_summary();
     eprintln!(
-        "coder sweep starting: {} models, langs={}, case_limit={:?}, mem_config={}, checkpoint={}",
+        "coder sweep starting: {} models, langs={}, case_limit={:?}, mem_config={}, factors=[{}], checkpoint={}",
         fleet.nominations.len(),
         if langs.is_empty() { "all".into() } else { langs.join(",") },
         case_limit,
         mem_config.unwrap_or("(unset — rows land with mem_config=NULL)"),
+        factor_summary,
         checkpoint.path(),
     );
 

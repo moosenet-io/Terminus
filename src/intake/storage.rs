@@ -225,9 +225,11 @@ pub async fn insert_code_run(
     Ok(())
 }
 
-/// One measured code case from the REALISTIC build-scenario harness (v2).
-/// Stored in `code_profile_runs` with `harness_version='v2'` so it never mixes
-/// with the v1 one-shot rows. Mirrors the v2 columns added to the table.
+/// One measured code case from the REALISTIC build-scenario harness. Stored in
+/// `code_profile_runs` with `harness_version='v3'` (MINT2-01 bumped the
+/// build-scenario epoch from `'v2'`, the measurement-corrected harness that
+/// records the tunable factors below) so it never mixes with the v1 one-shot
+/// rows or the pre-correction v2 rows. Mirrors the columns on the table.
 #[derive(Debug, Clone, Default)]
 pub struct CodeRunRowV2 {
     pub language: String,
@@ -286,6 +288,39 @@ pub struct CodeRunRowV2 {
     /// was produced). SEPARATE signal — it never affects the correctness score.
     /// See `vuln_scan` for the honest caveats: coarse heuristic, not real SAST.
     pub vuln_finding_count: Option<i32>,
+    // ---- MINT2-01: tunable measurement factors ----------------------------
+    // The knobs a harness would actually turn, recorded as first-class columns
+    // so pass-rate can be analyzed against the config that was set, not just the
+    // model name. Written on new `'v3'` rows; legacy `'v1'`/`'v2'` rows have
+    // NULL for all six (they belong to a prior epoch). `None` here writes SQL
+    // NULL, and the read path (`read_code_run_factors`) tolerates the columns
+    // being ABSENT on an un-migrated DB — a missing column reads as `None`,
+    // never a panic.
+    /// Quantization the weights ran at, e.g. `"Q4_K_M"`/`"Q6_K"`/`"fp16"`. On a
+    /// `'v3'` write this is `Some("unknown")` when the model nomination / launch
+    /// flags don't declare a quant — NEVER guessed — so a genuine "we didn't
+    /// know" is distinguishable from a legacy row's NULL. `None` only for rows
+    /// written by a caller that doesn't set it (the preserved default).
+    pub quant: Option<String>,
+    /// Three-state reasoning/thinking flag the runtime was launched with:
+    /// `Some(true)` = on, `Some(false)` = off, `None` = unset (the runtime
+    /// doesn't expose it / not configured). Never coerce "unset" to `false`.
+    pub reasoning_enabled: Option<bool>,
+    /// The context window the runtime was LAUNCHED with (the `-c` / `num_ctx`),
+    /// distinct from the observed `context_tokens` a given prompt actually used.
+    /// `None` when the launch window wasn't configured for this run.
+    pub context_window_launched: Option<i32>,
+    /// Sampling temperature the run was configured with. `None` = the runtime
+    /// default was used (not recorded as a specific value).
+    pub temperature: Option<f64>,
+    /// Sampling top-p the run was configured with. `None` = runtime default.
+    pub top_p: Option<f64>,
+    /// The case's declared task category (`"blitz"`/`"multi_file"`/`"deep"`),
+    /// promoted from a chart-time bucket over `file_count` to a stored factor.
+    /// Recorded FROM THE CORPUS MANIFEST tier on the write path, never
+    /// re-derived from `file_count`. `None` for rows written before this column
+    /// existed / by callers that don't set it.
+    pub task_category: Option<String>,
 }
 
 /// SQL for [`insert_code_run_v2`]. Pulled out to a const so a unit test can
@@ -300,13 +335,14 @@ const INSERT_CODE_RUN_V2_SQL: &str = "INSERT INTO code_profile_runs \
       first_pass_score, retry_score, compiles, tests_pass, change_correct, \
       code_quality_score, context_tokens, response_tokens, file_count, total_lines, \
       throughput_tok_per_sec, total_time_ms, oom, error, backend_tag, mem_config, case_id, \
-      well_formed, sample_index, vuln_finding_count, finalized) \
-     VALUES ($1, 'v2', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, \
-     false) \
+      well_formed, sample_index, vuln_finding_count, \
+      quant, reasoning_enabled, context_window_launched, temperature, top_p, task_category, finalized) \
+     VALUES ($1, 'v3', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, \
+     $24, $25, $26, $27, $28, $29, false) \
      RETURNING id";
 
-/// Insert one v2 `code_profile_runs` row (harness_version='v2'). Additive — the
-/// v1 columns it does not populate are left NULL.
+/// Insert one build-scenario `code_profile_runs` row (harness_version='v3',
+/// MINT2-01). Additive — the columns it does not populate are left NULL.
 ///
 /// INCR-01: returns the new row's id so a caller doing incremental
 /// (per-case, not per-model-batch) persistence can patch the row later
@@ -347,6 +383,12 @@ pub async fn insert_code_run_v2(
         .bind(row.well_formed)
         .bind(row.sample_index)
         .bind(row.vuln_finding_count)
+        .bind(row.quant.as_deref())
+        .bind(row.reasoning_enabled)
+        .bind(row.context_window_launched)
+        .bind(row.temperature)
+        .bind(row.top_p)
+        .bind(row.task_category.as_deref())
         .fetch_one(pool)
         .await
         .map_err(|e| ToolError::Database(format!("Failed to insert code_profile_runs (v2): {e}")))?;
@@ -425,14 +467,17 @@ fn check_judge_update_affected_one_row(id: Uuid, rows_affected: u64) -> Result<(
 /// rows"), AND requiring `finalized = false` so an already-complete row —
 /// even one for this exact (model, backend, mem_config) from a genuinely
 /// finished prior run — is never touched. Also scoped to `harness_version =
-/// 'v2'` as a belt-and-suspenders guard (v1 rows are never written with
-/// `finalized = false` in the first place, since only `insert_code_run_v2`
-/// sets that column explicitly).
+/// 'v3'` as a belt-and-suspenders guard: MINT2-01 bumped the build-scenario
+/// write epoch to `'v3'`, so a fresh attempt's orphaned Phase-1 rows are now
+/// `'v3'`, and this reconcile must target that same epoch (v1 rows are never
+/// written with `finalized = false` in the first place, since only
+/// `insert_code_run_v2` sets that column explicitly, and pre-correction v2
+/// rows belong to a closed epoch that is never re-attempted).
 const DELETE_UNFINALIZED_CODE_RUNS_V2_SQL: &str = "DELETE FROM code_profile_runs r \
      USING model_profiles p \
      WHERE r.profile_id = p.id \
        AND p.model_name = $1 \
-       AND r.harness_version = 'v2' \
+       AND r.harness_version = 'v3' \
        AND r.backend_tag = $2 \
        AND r.mem_config IS NOT DISTINCT FROM $3 \
        AND r.finalized = false";
@@ -466,6 +511,121 @@ pub async fn delete_unfinalized_code_runs_v2(
             ToolError::Database(format!("Failed to delete orphaned unfinalized code_profile_runs rows: {e}"))
         })?;
     Ok(result.rows_affected())
+}
+
+// ===========================================================================
+// MINT2-01: read the tunable measurement factors back (null-tolerant)
+// ===========================================================================
+
+/// The MINT2-01 measurement factors read back from one `code_profile_runs`
+/// row. Every field is optional and independently nullable: a legacy
+/// (`'v1'`/`'v2'`) row has NULL for all six (they predate the columns), and an
+/// UN-MIGRATED DB (the columns don't exist yet) reads as all-`None` via the
+/// fallback query below — a missing column is never a panic. Round-trips a
+/// [`CodeRunRowV2`]'s factor fields for a `'v3'` row.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CodeRunFactors {
+    pub quant: Option<String>,
+    pub reasoning_enabled: Option<bool>,
+    pub context_window_launched: Option<i32>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub task_category: Option<String>,
+}
+
+/// The row-shape the factor SELECTs decode into (kept as a type alias so the
+/// primary and fallback queries decode identically and the pure mapper is
+/// trivially unit-testable without a live DB).
+type FactorTuple = (
+    Option<String>,
+    Option<bool>,
+    Option<i32>,
+    Option<f64>,
+    Option<f64>,
+    Option<String>,
+);
+
+/// Pure mapping from the decoded row tuple to [`CodeRunFactors`]. Extracted so a
+/// unit test can prove the round-trip (all-set → same values) and the
+/// null-tolerant path (all-NULL → all-`None`) without a Postgres connection —
+/// this crate has no live-DB test harness (see the SQL-constant tests on this
+/// module's other writers for the same constraint).
+fn map_factor_row(t: FactorTuple) -> CodeRunFactors {
+    CodeRunFactors {
+        quant: t.0,
+        reasoning_enabled: t.1,
+        context_window_launched: t.2,
+        temperature: t.3,
+        top_p: t.4,
+        task_category: t.5,
+    }
+}
+
+/// Primary factor SELECT — references the MINT2-01 columns directly. Errors on
+/// an un-migrated DB where those columns don't exist yet; [`read_code_run_factors`]
+/// catches that and retries [`SELECT_CODE_RUN_FACTORS_FALLBACK_SQL`].
+const SELECT_CODE_RUN_FACTORS_SQL: &str = "SELECT quant, reasoning_enabled, \
+     context_window_launched, temperature, top_p, task_category \
+     FROM code_profile_runs WHERE id = $1";
+
+/// Fallback factor SELECT for an UN-MIGRATED DB (the six columns are absent):
+/// selects correctly-typed SQL NULLs so the row still decodes into an
+/// all-`None` [`CodeRunFactors`] instead of erroring on the missing columns.
+/// Still gated on `WHERE id = $1` so a non-existent row yields no row (→
+/// default), matching the migrated path exactly.
+const SELECT_CODE_RUN_FACTORS_FALLBACK_SQL: &str = "SELECT NULL::text, NULL::boolean, \
+     NULL::integer, NULL::double precision, NULL::double precision, NULL::text \
+     FROM code_profile_runs WHERE id = $1";
+
+/// True when a Postgres error text indicates a MISSING COLUMN (the un-migrated
+/// schema case), so the read path can fall back to the NULL-only query rather
+/// than propagating the error. Postgres reports `error: column "quant" does not
+/// exist` (SQLSTATE 42703); matching the phrase keeps this dependency-free and
+/// unit-testable. Pure over its input.
+fn is_missing_column_error(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("column") && m.contains("does not exist")
+}
+
+/// Read the MINT2-01 measurement factors for one `code_profile_runs` row,
+/// tolerating an un-migrated DB. Tries [`SELECT_CODE_RUN_FACTORS_SQL`]; if that
+/// fails specifically because the columns don't exist yet
+/// ([`is_missing_column_error`]), retries the NULL-typed
+/// [`SELECT_CODE_RUN_FACTORS_FALLBACK_SQL`] so the caller gets all-`None`
+/// instead of an error — the harness keeps running against a DB the migration
+/// hasn't reached. A genuinely missing row (id not present) yields
+/// [`CodeRunFactors::default`], NOT an error. Any OTHER DB error (connection
+/// loss, etc.) is propagated, never masked as "no factors".
+pub async fn read_code_run_factors(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<CodeRunFactors, ToolError> {
+    match sqlx::query_as::<_, FactorTuple>(SELECT_CODE_RUN_FACTORS_SQL)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(row) => Ok(row.map(map_factor_row).unwrap_or_default()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_column_error(&msg) {
+                let row = sqlx::query_as::<_, FactorTuple>(SELECT_CODE_RUN_FACTORS_FALLBACK_SQL)
+                    .bind(id)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|e| {
+                        ToolError::Database(format!(
+                            "Failed to read code_profile_runs factors (fallback): {e}"
+                        ))
+                    })?;
+                Ok(row.map(map_factor_row).unwrap_or_default())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read code_profile_runs factors: {msg}"
+                )))
+            }
+        }
+    }
 }
 
 /// One measured agent scenario. Mirrors `agent_profile_runs` columns.
@@ -892,13 +1052,12 @@ mod tests {
     #[test]
     fn insert_code_run_v2_sql_explicitly_sets_finalized_false() {
         assert!(INSERT_CODE_RUN_V2_SQL.contains("finalized"));
-        // The last bind param ($23 = `vuln_finding_count`, security-scan-signal,
-        // itself preceded by $22 = `sample_index`, multi-sample-consistency) is
-        // the final VALUES entry before the literal `false` for `finalized` —
-        // confirming the insert never falls through to the column's
-        // `DEFAULT true`.
+        // The last bind param ($29 = `task_category`, MINT2-01, the last of the
+        // six new measurement-factor binds $24..$29) is the final VALUES entry
+        // before the literal `false` for `finalized` — confirming the insert
+        // never falls through to the column's `DEFAULT true`.
         assert!(
-            INSERT_CODE_RUN_V2_SQL.contains("$22, $23, false) RETURNING id"),
+            INSERT_CODE_RUN_V2_SQL.contains("$28, $29, false) RETURNING id"),
             "expected the VALUES list to end with an explicit `false` for \
              `finalized`, got: {INSERT_CODE_RUN_V2_SQL}"
         );
@@ -949,13 +1108,15 @@ mod tests {
         assert_eq!(row.well_formed, Some(true));
     }
 
-    /// The score-point insert must set `sample_index` then `vuln_finding_count`
-    /// as its final two bind params ($22, $23) before the literal `false` for
-    /// `finalized` — it never falls through to a column default.
+    /// The insert names `sample_index` then `vuln_finding_count`, then the six
+    /// MINT2-01 measurement-factor columns, then `finalized` last — so it never
+    /// falls through to a column default.
     #[test]
     fn insert_code_run_v2_sql_includes_sample_index_and_vuln_count_last() {
-        assert!(INSERT_CODE_RUN_V2_SQL
-            .contains("well_formed, sample_index, vuln_finding_count, finalized)"));
+        assert!(INSERT_CODE_RUN_V2_SQL.contains(
+            "well_formed, sample_index, vuln_finding_count, \
+      quant, reasoning_enabled, context_window_launched, temperature, top_p, task_category, finalized)"
+        ));
     }
 
     /// `sample_index` defaults to `0` (single-sample / legacy rows read as
@@ -999,8 +1160,8 @@ mod tests {
         let vals = &sql[v_open + 1..v_close];
         let n_vals = vals.split(',').filter(|s| !s.trim().is_empty()).count();
 
-        // Sanity: placeholders run $1..$23 contiguously.
-        let max_placeholder = 23;
+        // Sanity: placeholders run $1..$29 contiguously.
+        let max_placeholder = 29;
         for n in 1..=max_placeholder {
             assert!(sql.contains(&format!("${n}")), "missing placeholder ${n}");
         }
@@ -1049,10 +1210,133 @@ mod tests {
         assert!(sql.contains("r.backend_tag = $2"));
         assert!(sql.contains("r.mem_config IS NOT DISTINCT FROM $3"));
         assert!(sql.contains("r.finalized = false"));
-        assert!(sql.contains("harness_version = 'v2'"));
+        // MINT2-01 bumped the build-scenario write epoch to 'v3'; the orphan
+        // reconcile must target that same epoch (fresh attempts now write 'v3').
+        assert!(sql.contains("harness_version = 'v3'"));
         // Must join through model_profiles so the DELETE cannot match rows
         // belonging to a different model_id sharing the same backend/mem_config.
         assert!(sql.contains("USING model_profiles p"));
         assert!(sql.contains("r.profile_id = p.id"));
+    }
+
+    // ---- MINT2-01: tunable measurement factors -------------------------
+
+    /// The build-scenario insert now stamps the epoch as `'v3'` (bumped from
+    /// `'v2'`) and names all six new factor columns.
+    #[test]
+    fn insert_code_run_v2_sql_writes_v3_epoch_and_factor_columns() {
+        assert!(
+            INSERT_CODE_RUN_V2_SQL.contains("VALUES ($1, 'v3',"),
+            "build-scenario path must write harness_version = 'v3'"
+        );
+        for col in [
+            "quant",
+            "reasoning_enabled",
+            "context_window_launched",
+            "temperature",
+            "top_p",
+            "task_category",
+        ] {
+            assert!(
+                INSERT_CODE_RUN_V2_SQL.contains(col),
+                "INSERT must name the {col} factor column"
+            );
+        }
+    }
+
+    /// Every new factor field defaults to `None` (a writer that doesn't set it
+    /// never mislabels a row) and is settable like any other field.
+    #[test]
+    fn code_run_row_v2_factor_fields_default_none_and_are_settable() {
+        let d = CodeRunRowV2::default();
+        assert_eq!(d.quant, None);
+        assert_eq!(d.reasoning_enabled, None);
+        assert_eq!(d.context_window_launched, None);
+        assert_eq!(d.temperature, None);
+        assert_eq!(d.top_p, None);
+        assert_eq!(d.task_category, None);
+
+        let row = CodeRunRowV2 {
+            quant: Some("Q4_K_M".to_string()),
+            reasoning_enabled: Some(false),
+            context_window_launched: Some(16384),
+            temperature: Some(0.2),
+            top_p: Some(0.9),
+            task_category: Some("multi_file".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(row.quant.as_deref(), Some("Q4_K_M"));
+        assert_eq!(row.reasoning_enabled, Some(false));
+        assert_eq!(row.context_window_launched, Some(16384));
+        assert_eq!(row.temperature, Some(0.2));
+        assert_eq!(row.top_p, Some(0.9));
+        assert_eq!(row.task_category.as_deref(), Some("multi_file"));
+    }
+
+    /// Round-trip through the pure row mapper: a fully-populated `'v3'` row's
+    /// factors decode back to the same values (the migrated-DB read path).
+    #[test]
+    fn map_factor_row_round_trips_all_set() {
+        let t: FactorTuple = (
+            Some("Q6_K".to_string()),
+            Some(true),
+            Some(32768),
+            Some(0.7),
+            Some(0.95),
+            Some("deep".to_string()),
+        );
+        let f = map_factor_row(t);
+        assert_eq!(
+            f,
+            CodeRunFactors {
+                quant: Some("Q6_K".to_string()),
+                reasoning_enabled: Some(true),
+                context_window_launched: Some(32768),
+                temperature: Some(0.7),
+                top_p: Some(0.95),
+                task_category: Some("deep".to_string()),
+            }
+        );
+    }
+
+    /// The null-tolerant path: an un-migrated DB (all columns absent → the
+    /// fallback query returns all-NULL) decodes to an all-`None` factors, never
+    /// a panic and never a fabricated value.
+    #[test]
+    fn map_factor_row_all_null_is_all_none() {
+        let t: FactorTuple = (None, None, None, None, None, None);
+        assert_eq!(map_factor_row(t), CodeRunFactors::default());
+    }
+
+    /// The read path detects a MISSING-COLUMN error (un-migrated schema) so it
+    /// can fall back to the NULL-only query, and does NOT misclassify unrelated
+    /// DB errors as "columns absent".
+    #[test]
+    fn is_missing_column_error_matches_only_missing_column() {
+        assert!(is_missing_column_error(
+            "error returned from database: column \"quant\" does not exist"
+        ));
+        assert!(is_missing_column_error(
+            "column \"task_category\" does not exist"
+        ));
+        // Unrelated errors must propagate, not silently become all-NULL.
+        assert!(!is_missing_column_error("connection refused"));
+        assert!(!is_missing_column_error("relation \"foo\" does not exist"));
+        assert!(!is_missing_column_error("syntax error at or near \"SELECT\""));
+    }
+
+    /// The fallback SELECT casts each NULL to the matching column type so the
+    /// tuple decodes identically to the primary query, and stays scoped by id.
+    #[test]
+    fn factor_select_sql_shapes() {
+        assert!(SELECT_CODE_RUN_FACTORS_SQL.contains(
+            "quant, reasoning_enabled, context_window_launched, temperature, top_p, task_category"
+        ));
+        assert!(SELECT_CODE_RUN_FACTORS_SQL.contains("WHERE id = $1"));
+        assert!(SELECT_CODE_RUN_FACTORS_FALLBACK_SQL.contains("NULL::text"));
+        assert!(SELECT_CODE_RUN_FACTORS_FALLBACK_SQL.contains("NULL::boolean"));
+        assert!(SELECT_CODE_RUN_FACTORS_FALLBACK_SQL.contains("NULL::integer"));
+        assert!(SELECT_CODE_RUN_FACTORS_FALLBACK_SQL.contains("NULL::double precision"));
+        assert!(SELECT_CODE_RUN_FACTORS_FALLBACK_SQL.contains("WHERE id = $1"));
     }
 }

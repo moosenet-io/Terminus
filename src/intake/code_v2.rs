@@ -377,6 +377,179 @@ pub fn should_retry(first_pass: i32) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// MINT2-01: tunable measurement factors (launch / sampling / quant config)
+// ---------------------------------------------------------------------------
+
+/// The launch/sampling/quant knobs a harness would actually tune, resolved once
+/// per sweep run and recorded on every `'v3'` case row so pass-rate can be
+/// analyzed against the config that was set, not just the model name. Threaded
+/// into [`run_one_case_v2`] and written onto the per-case [`CodeRunRowV2`].
+///
+/// Resolved from optional env knobs (see [`MeasurementFactors::from_env`]) — the
+/// same env-sourced, opt-in convention as [`samples_per_case`]. `quant` always
+/// resolves to a concrete string (`"unknown"` when undeclared, NEVER guessed);
+/// the sampling/reasoning/context knobs stay `None` when unset so a genuine
+/// "unset" is distinguishable from a recorded value (three-state).
+#[derive(Debug, Clone)]
+pub struct MeasurementFactors {
+    /// Quantization tag, e.g. `"Q4_K_M"`; `"unknown"` when undeclared.
+    pub quant: String,
+    /// Three-state reasoning flag: `Some(true)`/`Some(false)`/`None` (unset).
+    pub reasoning_enabled: Option<bool>,
+    /// The launched context window (`-c` / `num_ctx`), distinct from the
+    /// per-prompt observed `context_tokens`. `None` when not configured.
+    pub context_window_launched: Option<i32>,
+    /// Sampling temperature; `None` = runtime default (not a recorded value).
+    pub temperature: Option<f64>,
+    /// Sampling top-p; `None` = runtime default.
+    pub top_p: Option<f64>,
+}
+
+impl Default for MeasurementFactors {
+    fn default() -> Self {
+        MeasurementFactors {
+            quant: "unknown".to_string(),
+            reasoning_enabled: None,
+            context_window_launched: None,
+            temperature: None,
+            top_p: None,
+        }
+    }
+}
+
+impl MeasurementFactors {
+    /// Resolve the measurement factors for `model_name` from the optional sweep
+    /// env knobs. All are opt-in: an unset/blank value leaves the corresponding
+    /// factor at its "unset" default, so a production sweep records honest NULLs
+    /// rather than fabricated values.
+    ///
+    /// - `SWEEP_QUANT` — explicit quant tag; when unset/blank, the quant is
+    ///   parsed from the model id ([`parse_quant_from_model_id`]) and falls back
+    ///   to `"unknown"` when the id doesn't declare one (never guessed).
+    /// - `SWEEP_REASONING_ENABLED` — `1/true/on` → `Some(true)`,
+    ///   `0/false/off` → `Some(false)`, unset/other → `None` (three-state).
+    /// - `SWEEP_CONTEXT_WINDOW` — the launched `-c`; a positive integer or
+    ///   `None`.
+    /// - `SWEEP_TEMPERATURE` / `SWEEP_TOP_P` — finite floats or `None`.
+    pub fn from_env(model_name: &str) -> Self {
+        let quant = env_nonempty("SWEEP_QUANT")
+            .or_else(|| parse_quant_from_model_id(model_name))
+            .unwrap_or_else(|| "unknown".to_string());
+        MeasurementFactors {
+            quant,
+            reasoning_enabled: env_three_state_bool("SWEEP_REASONING_ENABLED"),
+            context_window_launched: env_nonempty("SWEEP_CONTEXT_WINDOW")
+                .and_then(|s| s.parse::<i32>().ok())
+                .filter(|n| *n > 0),
+            temperature: env_finite_f64("SWEEP_TEMPERATURE"),
+            top_p: env_finite_f64("SWEEP_TOP_P"),
+        }
+    }
+
+    /// One-line human summary of the SAMPLING/LAUNCH knobs (model-independent),
+    /// for the sweep startup banner. Quant is model-specific so it's omitted here.
+    pub fn sampling_summary(&self) -> String {
+        format!(
+            "reasoning={} context_window={} temperature={} top_p={}",
+            self.reasoning_enabled
+                .map(|b| if b { "on".to_string() } else { "off".to_string() })
+                .unwrap_or_else(|| "unset".to_string()),
+            self.context_window_launched
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "unset".to_string()),
+            self.temperature
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "default".to_string()),
+            self.top_p
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "default".to_string()),
+        )
+    }
+}
+
+/// Read an env var, trimmed, treating blank as unset. Local helper mirroring the
+/// `filter(|s| !s.trim().is_empty())` idiom used across this module.
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Parse a three-state boolean env knob: `1/true/on/yes` → `Some(true)`,
+/// `0/false/off/no` → `Some(false)`, unset/blank/unrecognized → `None`. Pure
+/// over the env read so the recognized-token set is unit-testable.
+fn env_three_state_bool(key: &str) -> Option<bool> {
+    parse_three_state_bool(env_nonempty(key).as_deref())
+}
+
+/// Pure token → three-state mapping backing [`env_three_state_bool`].
+pub fn parse_three_state_bool(raw: Option<&str>) -> Option<bool> {
+    match raw.map(|s| s.trim().to_lowercase()).as_deref() {
+        Some("1" | "true" | "on" | "yes") => Some(true),
+        Some("0" | "false" | "off" | "no") => Some(false),
+        _ => None,
+    }
+}
+
+/// Read a finite `f64` env knob; `None` for unset/blank/unparsable/non-finite
+/// (NaN/±inf are never recorded as a real sampling value).
+fn env_finite_f64(key: &str) -> Option<f64> {
+    env_nonempty(key)
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+}
+
+/// Parse a known quantization tag out of a model id (e.g. the `Q4_K_M` in
+/// `qwen3-coder:30b-a3b-q4_K_M`), returning the CANONICAL tag when one is
+/// present. Returns `None` when the id declares no recognizable quant — the
+/// caller then records `"unknown"` rather than guessing. Recognizes the common
+/// llama.cpp/GGUF tags plus the float formats; matching is case-insensitive.
+/// Pure — unit-tested.
+pub fn parse_quant_from_model_id(id: &str) -> Option<String> {
+    let lower = id.to_lowercase();
+    // Ordered longest-first within each family so `q4_k_m` matches before `q4_0`
+    // would, and `q4_k_s`/`q4_k_m` before a bare `q4_k`.
+    const KNOWN: &[&str] = &[
+        "q2_k", "q3_k_s", "q3_k_m", "q3_k_l", "q3_k", "q4_k_s", "q4_k_m", "q4_k", "q4_0", "q4_1",
+        "q5_k_s", "q5_k_m", "q5_k", "q5_0", "q5_1", "q6_k", "q8_0", "iq2_xxs", "iq2_xs", "iq3_xxs",
+        "iq4_nl", "iq4_xs", "bf16", "fp16", "f16", "fp32", "f32",
+    ];
+    // Find the longest matching known tag anywhere in the id.
+    KNOWN
+        .iter()
+        .filter(|tag| lower.contains(*tag))
+        .max_by_key(|tag| tag.len())
+        .map(|tag| canonical_quant(tag))
+}
+
+/// Canonicalize a matched lowercase quant token to its conventional casing
+/// (`q4_k_m` → `Q4_K_M`, `fp16`/`f16`/`bf16` stay lowercase). Pure.
+fn canonical_quant(tag: &str) -> String {
+    match tag {
+        "bf16" | "fp16" | "f16" | "fp32" | "f32" => tag.to_string(),
+        // The `qN_...` GGUF families are conventionally upper-cased.
+        _ => tag.to_uppercase(),
+    }
+}
+
+/// Map a corpus-manifest `tier` to the stored `task_category` factor
+/// (`blitz`/`multi_file`/`deep`). This is the ONLY place the category is derived
+/// and it derives ONLY from the manifest tier — NEVER from `file_count` — so
+/// BLITZ/MULTI/DEEP is a first-class recorded factor (MINT2-01). The manifest's
+/// middle tier is `standard`, which maps to the `multi_file` category. An
+/// unrecognized tier is recorded verbatim (lowercased), never silently bucketed.
+/// Pure — unit-tested.
+pub fn task_category_from_tier(tier: &str) -> String {
+    match tier.trim().to_lowercase().as_str() {
+        "blitz" => "blitz".to_string(),
+        "standard" | "multi_file" => "multi_file".to_string(),
+        "deep" => "deep".to_string(),
+        other => other.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Per-case execution (live)
 // ---------------------------------------------------------------------------
 
@@ -571,6 +744,7 @@ async fn run_one_case_v2(
     corpus: &Path,
     backend_tag: Option<&str>,
     mem_config: Option<&str>,
+    factors: &MeasurementFactors,
 ) -> CaseV2Result {
     let mut row = CodeRunRowV2 {
         language: case.language.clone(),
@@ -578,6 +752,17 @@ async fn run_one_case_v2(
         backend_tag: backend_tag.map(str::to_string),
         mem_config: mem_config.map(str::to_string),
         case_id: Some(case.id.clone()),
+        // MINT2-01: record the tunable factors this run was configured with.
+        // `quant` is always a concrete string ("unknown" when undeclared, never
+        // guessed); reasoning/context/sampling stay None when unset (three-state).
+        quant: Some(factors.quant.clone()),
+        reasoning_enabled: factors.reasoning_enabled,
+        context_window_launched: factors.context_window_launched,
+        temperature: factors.temperature,
+        top_p: factors.top_p,
+        // `task_category` comes FROM THE MANIFEST tier, never re-derived from
+        // file_count — this is the one place it's recorded on the write path.
+        task_category: Some(task_category_from_tier(&case.tier)),
         ..Default::default()
     };
     let none = CaseV2Result::default;
@@ -873,6 +1058,13 @@ pub async fn run_code_suite_v2(
     .await
 }
 
+/// Resolve the MINT2-01 measurement factors for `model_name` from the sweep env
+/// config. A thin named wrapper over [`MeasurementFactors::from_env`] so the
+/// suite driver and the fleet entrypoint share one resolution point.
+pub fn measurement_factors(model_name: &str) -> MeasurementFactors {
+    MeasurementFactors::from_env(model_name)
+}
+
 /// Like [`run_code_suite_v2`] but scoped to an explicit `case_ids` subset
 /// (HFIX-06). `None`/empty ⇒ every case matching `languages`, i.e. identical
 /// behavior to `run_code_suite_v2`. Lets a single case (or a small named set)
@@ -912,6 +1104,13 @@ pub async fn run_code_suite_v2_cases(
         .build()
         .map_err(|e| ToolError::Http(format!("client build failed: {e}")))?;
     let pool = storage::get_pool().await?;
+
+    // MINT2-01: resolve the tunable measurement factors ONCE for this run
+    // (env-sourced, opt-in — same pattern as `samples_per_case()` above), then
+    // record them on every per-case row written below. `quant` is model-specific
+    // (parsed from the id when the launch flags don't declare it), so it's keyed
+    // on `model_name`; the sampling/launch knobs are run-global.
+    let factors = MeasurementFactors::from_env(model_name);
 
     // ---- Phase 1: inference, with the TEST model hot, NO judging --------
     // INCR-01: persist each case's row IMMEDIATELY after it runs (instead of
@@ -954,7 +1153,8 @@ pub async fn run_code_suite_v2_cases(
     let mut row_ids: Vec<uuid::Uuid> = Vec::with_capacity(sampled.len());
     for &(case, sample_index) in &sampled {
         let mut cr =
-            run_one_case_v2(&client, model_name, case, &dir, backend_tag, mem_config).await;
+            run_one_case_v2(&client, model_name, case, &dir, backend_tag, mem_config, &factors)
+                .await;
         cr.row.sample_index = sample_index;
         let id = storage::insert_code_run_v2(&pool, profile_id, &cr.row).await?;
         row_ids.push(id);
@@ -1632,5 +1832,134 @@ mod tests {
         // c > n (impossible in practice) is clamped to c = n, not a panic.
         assert!((pass_at_k(3, 9, 2).unwrap() - 1.0).abs() < EPS);
         assert!((pass_hat_k(3, 9, 2).unwrap() - 1.0).abs() < EPS);
+    }
+
+    // ---- MINT2-01: measurement factors ---------------------------------
+
+    /// `task_category` is derived from the corpus-manifest TIER, never from
+    /// `file_count` — the whole point of promoting it to a stored factor. Same
+    /// tier ⇒ same category regardless of file_count; different tier ⇒ different
+    /// category even at identical file_count.
+    #[test]
+    fn task_category_comes_from_tier_not_file_count() {
+        // `standard` tier → `multi_file` category (the manifest's middle tier).
+        assert_eq!(task_category_from_tier("blitz"), "blitz");
+        assert_eq!(task_category_from_tier("standard"), "multi_file");
+        assert_eq!(task_category_from_tier("deep"), "deep");
+        // Case-insensitive + trimmed; an already-canonical `multi_file` passes
+        // through; an unknown tier is recorded verbatim (lowercased), not bucketed.
+        assert_eq!(task_category_from_tier("  DEEP "), "deep");
+        assert_eq!(task_category_from_tier("multi_file"), "multi_file");
+        assert_eq!(task_category_from_tier("weird"), "weird");
+
+        // The factor is a pure function of the tier string: two cases with the
+        // SAME tier but very different file counts get the SAME category, and
+        // two cases with DIFFERENT tiers but (hypothetically) the same file
+        // count get DIFFERENT categories — file_count never enters this path.
+        let blitz_1_file = CaseV2 {
+            id: "b".into(), language: "rust".into(), tier: "blitz".into(),
+            spec: default_spec(), validate: default_validate(), dir: "d".into(),
+            workspace: "w".into(), files: vec!["a.rs".into()], timeout_s: None, task_type: None,
+        };
+        let deep_1_file = CaseV2 {
+            id: "d".into(), language: "rust".into(), tier: "deep".into(),
+            spec: default_spec(), validate: default_validate(), dir: "d".into(),
+            workspace: "w".into(), files: vec!["a.rs".into()], timeout_s: None, task_type: None,
+        };
+        assert_eq!(blitz_1_file.files.len(), deep_1_file.files.len());
+        assert_ne!(
+            task_category_from_tier(&blitz_1_file.tier),
+            task_category_from_tier(&deep_1_file.tier),
+            "identical file_count must NOT collapse two tiers into one category"
+        );
+    }
+
+    /// Quant is parsed from the model id when present, canonicalized, and is
+    /// `None` (→ recorded as "unknown", never guessed) when the id declares none.
+    #[test]
+    fn parse_quant_from_model_id_recognizes_tags_else_none() {
+        assert_eq!(parse_quant_from_model_id("qwen3-coder:30b-a3b-q4_K_M").as_deref(), Some("Q4_K_M"));
+        assert_eq!(parse_quant_from_model_id("model:Q6_K").as_deref(), Some("Q6_K"));
+        assert_eq!(parse_quant_from_model_id("some-model-fp16").as_deref(), Some("fp16"));
+        assert_eq!(parse_quant_from_model_id("thing-bf16-gguf").as_deref(), Some("bf16"));
+        // Longest-match wins so a `q4_k_m` id doesn't degrade to `q4_0`/`q4_k`.
+        assert_eq!(parse_quant_from_model_id("x-q4_k_m-y").as_deref(), Some("Q4_K_M"));
+        // No recognizable quant tag → None (caller records "unknown").
+        assert_eq!(parse_quant_from_model_id("qwen3-coder:30b"), None);
+        assert_eq!(parse_quant_from_model_id("qwen3:8b"), None);
+    }
+
+    /// Three-state bool: on/off recognized, everything else (incl. unset) None.
+    #[test]
+    fn parse_three_state_bool_is_three_state() {
+        assert_eq!(parse_three_state_bool(Some("true")), Some(true));
+        assert_eq!(parse_three_state_bool(Some("ON")), Some(true));
+        assert_eq!(parse_three_state_bool(Some("1")), Some(true));
+        assert_eq!(parse_three_state_bool(Some("false")), Some(false));
+        assert_eq!(parse_three_state_bool(Some("off")), Some(false));
+        assert_eq!(parse_three_state_bool(Some("0")), Some(false));
+        // Unset / unrecognized ⇒ None (never coerced to false).
+        assert_eq!(parse_three_state_bool(None), None);
+        assert_eq!(parse_three_state_bool(Some("maybe")), None);
+        assert_eq!(parse_three_state_bool(Some("")), None);
+    }
+
+    /// The default factors: quant "unknown", everything else unset/None — so a
+    /// row written with no config records honest NULLs, not fabricated values.
+    #[test]
+    fn measurement_factors_default_is_unknown_quant_and_unset_rest() {
+        let f = MeasurementFactors::default();
+        assert_eq!(f.quant, "unknown");
+        assert_eq!(f.reasoning_enabled, None);
+        assert_eq!(f.context_window_launched, None);
+        assert_eq!(f.temperature, None);
+        assert_eq!(f.top_p, None);
+    }
+
+    /// `from_env` resolves each knob; unset quant falls back to the id-parsed
+    /// tag, then to "unknown". Serialized (mutates process env).
+    #[test]
+    #[serial_test::serial(intake_env)]
+    fn measurement_factors_from_env_resolves_knobs() {
+        for k in [
+            "SWEEP_QUANT", "SWEEP_REASONING_ENABLED", "SWEEP_CONTEXT_WINDOW",
+            "SWEEP_TEMPERATURE", "SWEEP_TOP_P",
+        ] {
+            std::env::remove_var(k);
+        }
+        // Nothing set: quant parsed from the id (none here → "unknown"), rest None.
+        let f = MeasurementFactors::from_env("qwen3:8b");
+        assert_eq!(f.quant, "unknown");
+        assert_eq!(f.reasoning_enabled, None);
+        assert_eq!(f.context_window_launched, None);
+
+        // Id declares a quant, still nothing in env → parsed from the id.
+        assert_eq!(MeasurementFactors::from_env("m:30b-q6_k").quant, "Q6_K");
+
+        // Explicit env overrides everything, including an id-declared quant.
+        std::env::set_var("SWEEP_QUANT", "fp16");
+        std::env::set_var("SWEEP_REASONING_ENABLED", "off");
+        std::env::set_var("SWEEP_CONTEXT_WINDOW", "16384");
+        std::env::set_var("SWEEP_TEMPERATURE", "0.2");
+        std::env::set_var("SWEEP_TOP_P", "0.9");
+        let f = MeasurementFactors::from_env("m:30b-q6_k");
+        assert_eq!(f.quant, "fp16");
+        assert_eq!(f.reasoning_enabled, Some(false));
+        assert_eq!(f.context_window_launched, Some(16384));
+        assert_eq!(f.temperature, Some(0.2));
+        assert_eq!(f.top_p, Some(0.9));
+
+        // A non-positive / garbage context window is rejected (stays None).
+        std::env::set_var("SWEEP_CONTEXT_WINDOW", "0");
+        assert_eq!(MeasurementFactors::from_env("m").context_window_launched, None);
+        std::env::set_var("SWEEP_CONTEXT_WINDOW", "nope");
+        assert_eq!(MeasurementFactors::from_env("m").context_window_launched, None);
+
+        for k in [
+            "SWEEP_QUANT", "SWEEP_REASONING_ENABLED", "SWEEP_CONTEXT_WINDOW",
+            "SWEEP_TEMPERATURE", "SWEEP_TOP_P",
+        ] {
+            std::env::remove_var(k);
+        }
     }
 }
