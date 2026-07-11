@@ -148,7 +148,7 @@ This README is the front door; everything past "at a glance" lives in
 | --- | --- |
 | [`docs/README.md`](docs/README.md) | The documentation site index — start here for the full table of contents. |
 | [`docs/architecture/`](docs/architecture/) | Federation (how `terminus-primary` aggregates core + personal tools), auth (mTLS identity model), and the Chord-integration boundary/wire contract. |
-| [`docs/networking/`](docs/networking/) | WireGuard and Tailscale transport options for reaching a Terminus deployment off-LAN. |
+| [`docs/networking/`](docs/networking/) | WireGuard and Tailscale transport options for reaching a Terminus deployment off-LAN, including the optional embedded-tsnet mode (MESH-04, `tsnet` Cargo feature — no host `tailscaled` required; see [`docs/networking/tailscale.md`](docs/networking/tailscale.md#alternative-embedded-tsnet-mesh-04--no-host-tailscaled-at-all)). |
 | [`docs/deploy/`](docs/deploy/) | Client enrollment/deploy guide and the personal-services (`terminus_personal`/`terminus_primary`) deployment guide. |
 | [`docs/tools/`](docs/tools/README.md) | The full tool index — all 52 modules grouped by domain, plus the **MINT** flagship harness. |
 

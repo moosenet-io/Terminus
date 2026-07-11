@@ -137,6 +137,58 @@ enrolled Terminus identity — see
 identity-level revocation is handled (provisioning-side, not something this
 network layer controls).
 
+## Alternative: embedded tsnet (MESH-04) — no host `tailscaled` at all
+
+Everything above joins the tailnet at the OS level (a `tailscaled` daemon
+running on the primary gateway host, outside Terminus's own process). MESH-04
+adds a second, feature-flagged option: `terminus_primary` can join the
+tailnet **in-process**, as its own Tailscale node, with no host `tailscaled`
+required at all. This is a genuinely different deployment shape, not a
+convenience wrapper around the steps above — pick ONE of the two for a given
+deployment, not both, for the primary's own traffic. (Embedded tsnet is also
+fine to run on a host whose *other* processes still use a normal host-level
+tailnet join for unrelated traffic; the two don't conflict, they're just
+independent.)
+
+**Requires a build with the `tsnet` Cargo feature enabled** (off by default —
+see `Cargo.toml`) **and, at runtime, `TERMINUS_MESH_TAILNET_ENABLED=1`**.
+Either gate left off leaves `terminus_primary`'s plain + mTLS listeners
+byte-for-byte unchanged from a non-mesh deployment — see
+`src/mesh/tailnet.rs`'s module doc for the full design, including why
+building with `--features tsnet` needs a Go toolchain (`go` on `$PATH`) on
+the build host, and the current WhoIs scope boundary (MESH-05 picks that up).
+
+### Config
+
+```sh
+# Build-time (Cargo.toml feature; needs a Go toolchain on the build host):
+cargo build --features tsnet --release
+
+# Runtime env (see .env.example):
+export TERMINUS_MESH_TAILNET_ENABLED=1
+export TERMINUS_TSNET_HOSTNAME=<primary-host>          # MagicDNS name to advertise
+export TERMINUS_TSNET_STATE_DIR=/var/lib/terminus/tsnet # persisted node state/keys
+export TERMINUS_TSNET_AUTHKEY=<materialized-by-<secret-manager>-at-deploy-time>
+```
+
+`TERMINUS_TSNET_AUTHKEY` is a variable NAME in `.env.example`, like every
+other credential in this repo — the real value is materialized into the
+process environment by the runtime secret store at deploy time, never
+authored as a literal (see moosenet-spec S7). Once started, the same merged
+`/mcp` router the plain and mTLS listeners already serve is ALSO reachable on
+this node's tailnet IP / MagicDNS name — no separate route wiring, no
+separate tool registry.
+
+### Why you might pick this over a host-level join
+
+No `tailscaled` package/service to install, configure, or keep patched on
+the gateway host; the tailnet identity lives and dies with the
+`terminus_primary` process itself (useful for ephemeral/container-style
+deployments). The tradeoff: it's a newer, feature-flagged path (this dev
+host, notably, can't even compile it — no Go toolchain), versus the
+host-level `tailscaled` approach above, which is the mature, widely-deployed
+integration path today.
+
 ---
 
 Back to the [networking index](README.md) · [documentation index](../README.md).
