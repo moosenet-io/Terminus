@@ -33,9 +33,10 @@ measured VRAM/RAM peak, cold-load time, and `keep_warm`/`exclusion_reason`
 metadata) in Postgres. It ships two front doors over the same library entry
 points ([`src/intake/`](../../src/intake/)):
 
-- The **`intake`** tool module (5 MCP tools: `model_intake`,
-  `model_intake_status`, `model_intake_compare`, `model_intake_fleet`, and the
-  read-only `model_fleet_catalog`) — callable from any MCP client.
+- The **`intake`** tool module (6 MCP tools: `model_intake`,
+  `model_intake_status`, `model_intake_compare`, `model_intake_fleet`, the
+  read-only `model_fleet_catalog`, and the read-only
+  `model_discovery_brochure`) — callable from any MCP client.
   `model_fleet_catalog` is the SQL-free coverage registry: it reads the
   persisted Model Fleet Catalog and returns, per model, one cell per
   (test_type × task_category) with its coverage status (`run` | `stale` |
@@ -45,6 +46,9 @@ points ([`src/intake/`](../../src/intake/)):
   `not_run`), `test_type`; `format` is `json` (default, structured) or
   `markdown` (a compact coverage matrix). Read-only — it reads what the MINT
   harness's end-of-run refresh persisted, and never recomputes.
+  `model_discovery_brochure` (DISC-02, see below) is the sibling read tool
+  over the newer discovery brochure — a different lifecycle stage, never
+  confused with the fleet catalog above.
 - The **`mint`** CLI binary ([`src/bin/mint.rs`](../../src/bin/mint.rs)) — a
   clap-derived subcommand tree (`mint sweep coder`, `mint sweep assistant`,
   `mint case`, `mint gaps`, `mint gpu status/acquire/release`, `mint
@@ -86,6 +90,29 @@ adds the read-only `model_discovery_brochure` MCP tool (mirroring
 `model_fleet_catalog`'s `json`/`markdown` filter/render pattern); DISC-03 adds
 the one write API (`upsert_candidate`/`transition_status`/`record_eviction`)
 every other discovery item uses to mutate rows.
+
+DISC-02 (TERM #252) adds that read-only tool: **`model_discovery_brochure`**
+([`src/intake/discovery/tool.rs`](../../src/intake/discovery/tool.rs)),
+registered on the core registry alongside `model_fleet_catalog`. It reads the
+persisted brochure via the ONE shared Postgres pool
+(`crate::intake::storage::get_pool`, reused rather than a second pool) and
+applies a pure filter/render layer, unit-testable without a live DB — the
+same split `model_fleet_catalog` uses. Filters (all optional): `category`
+(`tool_router`|`writer_slm`|`assistant`|`coder`|`embedding`|`visual`|`voice`),
+`status` (`discovered`|`fetching`|`cold_stored`|`marked_for_fleet`|`swept`|
+`evicted`|`rejected`), `min_discovery_score`, `gfx1151_class`
+(`confirmed`|`experimental`|`unknown`), and `model` (exact `model_name`
+match — unknown value returns an empty result plus a note, never an error);
+an invalid `category`/`status`/`format` enum value is a clean
+`ToolError::InvalidArgument`. `format` is `json` (default, structured) or
+`markdown` (a compact table: model | category | status | gfx1151_class |
+vram_gb | discovery_score | last_seen_at). An `Evicted` candidate (its
+`retained_profile` populated) is never hidden by default — only an explicit
+`status` filter excluding it removes it. The tool's own description states
+the brochure/catalog distinction explicitly so an agent's tool-selection
+reasoning picks the right one: query `model_discovery_brochure` first to
+discover new models, query `model_fleet_catalog` for test coverage/scores on
+a model already in the fleet.
 
 ### The unified MINT harness (two run kinds)
 
@@ -199,7 +226,7 @@ selection/profiling (MINT's tool-facing side).
 
 | Tool | Actions | What it does | Page |
 | --- | --- | --- | --- |
-| `intake` | 5 | The MINT model-intake profiling framework's MCP-facing tools (`model_intake`, `model_intake_status`, `model_intake_compare`, `model_intake_fleet`, and the read-only `model_fleet_catalog` coverage registry) — see [MINT flagship](#mint-flagship) above. | [`mint/`](mint/) |
+| `intake` | 6 | The MINT model-intake profiling framework's MCP-facing tools (`model_intake`, `model_intake_status`, `model_intake_compare`, `model_intake_fleet`, the read-only `model_fleet_catalog` coverage registry, and the read-only `model_discovery_brochure` candidate registry, DISC-02) — see [MINT flagship](#mint-flagship) above. | [`mint/`](mint/) |
 | `dgem` | ~4 | Drives a persistent DiffusionGemma (`llama-diffusion-daemon`) HTTP daemon for near-zero-cost local code review and generation. | [`models-review/dgem.md`](models-review/dgem.md) |
 | `review` | 1 | `review_run` — dispatches a review prompt to 1–5 providers concurrently, in one of several output structures, for multi-provider/multi-structure code review. | [`models-review/review.md`](models-review/review.md) |
 | `wizard` | ~3 | Deep-reasoning "council" consultation routed through the Chord proxy (`CHORD_PROXY_URL`). | [`models-review/wizard.md`](models-review/wizard.md) |
