@@ -452,6 +452,19 @@ fn is_agy_auth_transient(detail: &str) -> bool {
         || d.contains("o/oauth2/auth")
 }
 
+/// The error RETURNED when agy's auth-transient persists through every retry.
+/// Deliberately a FIXED, URL-free message: the raw agy `detail` embeds a Google
+/// OAuth login URL (client_id / redirect_uri / code_challenge query params), and
+/// returning it verbatim would propagate that auth material into the caller's
+/// `/dispatch` response body (and any log that records provider errors). We keep
+/// the classification, drop the URL.
+fn agy_auth_exhausted_error() -> (&'static str, String) {
+    (
+        "other",
+        format!("agy auth-transient persisted after {AGY_AUTH_RETRIES} retries (login URL redacted)"),
+    )
+}
+
 /// Run agy under the serialize lock, retrying a bounded number of times on the
 /// auth-transient (see [`is_agy_auth_transient`]) with escalating backoff. An
 /// auth-transient is a FAST failure (agy exits rc=1 in seconds, not the full
@@ -475,22 +488,29 @@ async fn run_agy_with_retry(
     let _guard = agy_serialize_lock().lock().await;
     let mut attempt = 0usize;
     loop {
-        match run_built_command(built, resolved_path, timeout_secs, env).await {
-            Err((_, detail)) if attempt < AGY_AUTH_RETRIES && is_agy_auth_transient(&detail) => {
-                attempt += 1;
-                // Log the CLASSIFICATION + attempt only -- never the raw
-                // `detail`. agy's auth-transient text embeds a Google OAuth
-                // login URL whose query string (client_id, redirect_uri,
-                // code_challenge, ...) is auth material that must not be
-                // expanded into the daemon's logs.
-                tracing::warn!(
-                    attempt,
-                    "review-daemon: agy OAuth auth-transient (detail redacted), retrying after backoff"
-                );
-                tokio::time::sleep(AGY_RETRY_BACKOFF * attempt as u32).await;
-            }
-            other => return other,
+        let result = run_built_command(built, resolved_path, timeout_secs, env).await;
+        let is_transient = matches!(&result, Err((_, d)) if is_agy_auth_transient(d));
+        if is_transient && attempt < AGY_AUTH_RETRIES {
+            attempt += 1;
+            // Log the CLASSIFICATION + attempt only -- never the raw `detail`.
+            // agy's auth-transient text embeds a Google OAuth login URL whose
+            // query string (client_id, redirect_uri, code_challenge, ...) is
+            // auth material that must not be expanded into the daemon's logs.
+            tracing::warn!(
+                attempt,
+                "review-daemon: agy OAuth auth-transient (detail redacted), retrying after backoff"
+            );
+            tokio::time::sleep(AGY_RETRY_BACKOFF * attempt as u32).await;
+            continue;
         }
+        if is_transient {
+            // Retries exhausted: return the REDACTED error, never the raw detail
+            // (which still carries the OAuth login URL) up to the caller/response.
+            return Err(agy_auth_exhausted_error());
+        }
+        // Success, or a non-transient error (timeout / binary_not_found /
+        // empty_output / other) -- return as-is, immediately.
+        return result;
     }
 }
 
@@ -588,6 +608,20 @@ mod tests {
         assert!(!is_agy_auth_transient("'bwrap' binary was not found on PATH at daemon startup"));
         assert!(!is_agy_auth_transient("bwrap exited rc=1: some unrelated segfault"));
         assert!(!is_agy_auth_transient("exited successfully but produced empty output"));
+    }
+
+    #[test]
+    fn agy_exhausted_error_carries_no_oauth_url_or_query_material() {
+        // The final returned error (after retries are exhausted) must NOT leak
+        // the OAuth login URL / its query params into the caller's response.
+        let (kind, msg) = agy_auth_exhausted_error();
+        let low = msg.to_ascii_lowercase();
+        assert!(!low.contains("http"), "must not contain a URL: {msg}");
+        assert!(!low.contains("oauth"), "must not contain oauth material: {msg}");
+        assert!(!low.contains("accounts.google"), "must not contain the login host: {msg}");
+        assert!(!low.contains("client_id") && !low.contains("code_challenge"));
+        assert!(low.contains("redacted"), "should state it was redacted: {msg}");
+        assert_eq!(kind, "other");
     }
 
     #[tokio::test]
