@@ -111,6 +111,55 @@ impl RadarrClient {
 
         map_response(resp).await
     }
+
+    /// `PUT /api/v3/movie/{id}` — update an existing movie resource (tags,
+    /// `monitored`, `qualityProfileId`, collection membership, ...). MEDIA-04:
+    /// thin passthrough of a caller-built full resource body -- Radarr's PUT
+    /// expects the complete updated resource, not a partial patch, so callers
+    /// must round-trip through a prior `library()`/lookup read. Used for both
+    /// non-destructive organize actions (tag, monitor toggle) and for the
+    /// high-impact quality-profile-change path, which `organize.rs` treats as
+    /// destructive and hard-gates before ever calling this.
+    pub async fn update_movie(&self, id: i64, body: Value) -> Result<Value, ToolError> {
+        let url = format!("{}/api/v3/movie/{id}", self.base_url);
+        let resp = self
+            .http
+            .put(&url)
+            .header("X-Api-Key", &self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ToolError::Http(format!("Radarr unavailable: {e}")))?;
+
+        map_response(resp).await
+    }
+
+    /// `DELETE /api/v3/movie/{id}?deleteFiles=true&addImportExclusion=false`
+    /// — remove a movie from the Radarr library **and** delete its files on
+    /// disk. MEDIA-04: this is the one truly destructive operation this
+    /// client exposes; the hard-typed-confirmation gate lives entirely in
+    /// `crate::media::organize`, never here -- this method stays a thin,
+    /// unconditional passthrough so the safety logic has exactly one place
+    /// to live and be tested. Returns `Ok(false)` (not `Err`) when Radarr
+    /// reports the id doesn't exist, so callers can render a clean no-op
+    /// message instead of a false error.
+    pub async fn delete_movie(&self, id: i64) -> Result<bool, ToolError> {
+        let url = format!("{}/api/v3/movie/{id}", self.base_url);
+        let resp = self
+            .http
+            .delete(&url)
+            .header("X-Api-Key", &self.api_key)
+            .query(&[("deleteFiles", "true"), ("addImportExclusion", "false")])
+            .send()
+            .await
+            .map_err(|e| ToolError::Http(format!("Radarr unavailable: {e}")))?;
+
+        match map_response(resp).await {
+            Ok(_) => Ok(true),
+            Err(ToolError::NotFound(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// Shared status-mapping: 404 -> NotFound, other 4xx -> api-error Http,
@@ -292,6 +341,62 @@ mod tests {
             Err(ToolError::Http(msg)) => assert!(msg.contains("401")),
             other => panic!("expected Http error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn update_movie_puts_body_and_parses_mocked_200() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(PUT).path("/api/v3/movie/7");
+            then.status(200).json_body(json!({ "id": 7, "monitored": false }));
+        });
+
+        let client = test_client(&server.base_url());
+        let result = client.update_movie(7, json!({ "id": 7, "monitored": false })).await.unwrap();
+        mock.assert();
+        assert_eq!(result["id"], 7);
+    }
+
+    #[tokio::test]
+    async fn delete_movie_present_returns_true() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(DELETE)
+                .path("/api/v3/movie/7")
+                .query_param("deleteFiles", "true");
+            then.status(200);
+        });
+
+        let client = test_client(&server.base_url());
+        let deleted = client.delete_movie(7).await.unwrap();
+        mock.assert();
+        assert!(deleted);
+    }
+
+    #[tokio::test]
+    async fn delete_movie_not_present_returns_false_not_error() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(DELETE).path("/api/v3/movie/999");
+            then.status(404);
+        });
+
+        let client = test_client(&server.base_url());
+        let deleted = client.delete_movie(999).await.unwrap();
+        assert!(!deleted, "a 404 from Radarr must map to Ok(false), not an error");
+    }
+
+    #[tokio::test]
+    async fn delete_movie_server_error_maps_to_http() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(DELETE).path("/api/v3/movie/7");
+            then.status(500);
+        });
+
+        let client = test_client(&server.base_url());
+        let result = client.delete_movie(7).await;
+        assert!(matches!(result, Err(ToolError::Http(_))));
     }
 
     #[tokio::test]
