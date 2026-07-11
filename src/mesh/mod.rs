@@ -32,8 +32,22 @@
 //! [`UpstreamServer::resolve_secret`], called by a later dial step, does that
 //! env read, and it wraps the result in [`ResolvedSecret`] so an accidental
 //! `{:?}`/`{}` of the resolved value never leaks it into logs.
+//!
+//! ## MESH-02: dialing the registered upstreams
+//! [`client`] generalizes terminus-rs's client-side MCP transport (mirroring
+//! the streamable-HTTP request/response framing `crate::mcp_server` already
+//! implements server-side — see that module's doc comment) into
+//! [`client::UpstreamClient`]/[`client::UpstreamPool`], which dial ANY
+//! registered [`UpstreamServer`] over mTLS or bearer. Nothing before this
+//! item made a network call against a registered upstream; this module only
+//! parses/validates config. See [`client`]'s own module doc for why this is
+//! new client logic rather than a refactor of
+//! `crate::federation::PersonalFederationClient` (that client speaks a
+//! different, Chord-specific wire protocol entirely).
+pub mod client;
 pub mod registry;
 
+pub use client::{ToolMeta, UpstreamCallResult, UpstreamClient, UpstreamClientError, UpstreamPool};
 pub use registry::{
     MeshConfigError, ResolvedSecret, UpstreamRegistry, UpstreamServer, UpstreamTransport,
 };
