@@ -372,10 +372,47 @@ pub fn build_graph(
         }
     }
 
-    // Pass 2b: resolve import/call candidates.
+    // Pass 2b: resolve IMPORTS first, recording a per-file `imported_name ->
+    // definition id` map. This is the scope signal that lets a later call to a
+    // name resolve to the symbol the file actually imported (KGRAPH-18), the
+    // stack-graphs-free precision path.
+    let mut file_imports: HashMap<String, HashMap<String, String>> = HashMap::new();
     for fe in &per_file {
         for (src_id, target, kind) in &fe.candidates {
+            if *kind != EdgeKind::Imports {
+                continue;
+            }
             if let Some(to) = resolve_target(target, src_id, &by_name, &id_path) {
+                let _ = graph.insert_edge(KgEdge::new(src_id, &to, *kind, Confidence::Extracted));
+                if let Some(file) = id_path.get(src_id) {
+                    file_imports
+                        .entry(file.clone())
+                        .or_default()
+                        .insert(last_segment(target).to_string(), to);
+                }
+            }
+        }
+    }
+
+    // Pass 2c: resolve CALLS / REFERENCES, preferring an import the SOURCE FILE
+    // actually declares. A call to `N` from a file that imports `N` binds to the
+    // imported definition even when `N` is ambiguous project-wide — turning a
+    // previously-dropped ambiguous call into a precise edge. Falls back to the
+    // uniqueness-checked resolver otherwise.
+    for fe in &per_file {
+        for (src_id, target, kind) in &fe.candidates {
+            if *kind == EdgeKind::Imports {
+                continue;
+            }
+            let simple = last_segment(target);
+            let via_import = id_path
+                .get(src_id)
+                .and_then(|file| file_imports.get(file))
+                .and_then(|m| m.get(simple))
+                .filter(|to| to.as_str() != src_id)
+                .cloned();
+            let resolved = via_import.or_else(|| resolve_target(target, src_id, &by_name, &id_path));
+            if let Some(to) = resolved {
                 let _ = graph.insert_edge(KgEdge::new(src_id, &to, *kind, Confidence::Extracted));
             }
         }
@@ -659,17 +696,47 @@ fn generic_callee(node: Node, src: &[u8]) -> Option<String> {
     first_ident(node, src, 2)
 }
 
-/// Imported symbol short names from an import node (identifier leaves).
+/// Imported symbols from an import node, QUALIFIED where the import names a
+/// source module (`from a.b import foo` -> `b::foo`; JS `import {foo} from
+/// "x/y"` -> `y::foo`). The qualifier lets the resolver bind a call to the
+/// specific imported definition even when the bare name is ambiguous project-
+/// wide (KGRAPH-18). Falls back to bare last-segment names when no module
+/// qualifier is discernible.
 fn generic_imports(node: Node, src: &[u8]) -> Vec<String> {
-    let mut out = Vec::new();
+    // The module qualifier: python `module_name` field, else a string source
+    // (JS/TS `import ... from "path"`), else none.
+    let qualifier: Option<String> = node
+        .child_by_field_name("module_name")
+        .and_then(|m| m.utf8_text(src).ok())
+        .map(|t| last_segment(t.trim()).to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            // a string literal source anywhere in the import (JS/TS)
+            let mut c = node.walk();
+            let strnode = node
+                .named_children(&mut c)
+                .find(|ch| ch.kind() == "string" || ch.kind() == "string_fragment");
+            let seg = strnode
+                .and_then(|s| s.utf8_text(src).ok())
+                .map(|t| last_segment(t.trim_matches(|c| c == '"' || c == '\'' || c == '/')).to_string())
+                .filter(|s| !s.is_empty());
+            seg
+        });
+
+    let mut names = Vec::new();
+    let module_name_node = node.child_by_field_name("module_name");
     let mut q: std::collections::VecDeque<Node> = std::collections::VecDeque::new();
     q.push_back(node);
     while let Some(n) = q.pop_front() {
+        // skip the module-path subtree so its segments aren't taken as imported names
+        if Some(n) == module_name_node {
+            continue;
+        }
         if IDENT_KINDS.contains(&n.kind()) {
             if let Ok(t) = n.utf8_text(src) {
                 let seg = last_segment(t.trim());
                 if !seg.is_empty() && seg != "self" {
-                    out.push(seg.to_string());
+                    names.push(seg.to_string());
                 }
             }
         }
@@ -678,6 +745,11 @@ fn generic_imports(node: Node, src: &[u8]) -> Vec<String> {
             q.push_back(ch);
         }
     }
+    names.dedup();
+    let mut out: Vec<String> = match &qualifier {
+        Some(qual) => names.into_iter().map(|nm| format!("{qual}::{nm}")).collect(),
+        None => names,
+    };
     out.truncate(16);
     out
 }
@@ -1051,6 +1123,28 @@ pub fn outer() -> u8 {
         assert!(g.get_node("b::luaf").is_some(), "lua");
         assert!(g.get_node("c::Gof").is_some(), "go");
         assert!(g.get_node("crate::d::rustf").is_some(), "rust keeps crate:: FQN");
+    }
+
+    #[test]
+    fn import_aware_resolution_disambiguates_cross_file_call() {
+        // Two files define `helper`; c imports a's and calls it. Without import
+        // awareness the call is globally ambiguous and dropped; with it, the
+        // call binds to a's helper (KGRAPH-18).
+        let files = vec![
+            ("pkg/a.py".to_string(), "def helper():\n    return 1\n".to_string()),
+            ("pkg/b.py".to_string(), "def helper():\n    return 2\n".to_string()),
+            ("pkg/c.py".to_string(), "from a import helper\n\ndef use():\n    return helper()\n".to_string()),
+        ];
+        let g = build_graph("P", &files).unwrap();
+        let call = g
+            .edges()
+            .find(|e| e.kind == EdgeKind::Calls && e.from == "pkg::c::use")
+            .expect("call resolved via the import (would be dropped as ambiguous otherwise)");
+        assert_eq!(call.to, "pkg::a::helper", "bound to the imported definition, not b's");
+        assert!(
+            g.edges().any(|e| e.kind == EdgeKind::Imports && e.from == "pkg::c" && e.to == "pkg::a::helper"),
+            "qualified import edge present"
+        );
     }
 
     #[test]
