@@ -114,7 +114,12 @@ sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chron
 # KGEMB-01: Atlas KG semantic-embeddings vector store (kg_embeddings table).
 # The "sqlx" feature binds pgvector::Vector as a bindable/decodable sqlx type
 # for the Postgres `vector(N)` column, matching our sqlx 0.8 pin.
-pgvector = { version = "0.4", features = ["sqlx"] }
+# Pinned EXACT (=0.4.1): 0.4.2 declares `sqlx = ">=0.8, <0.10"`, which lets Cargo
+# resolve a second `sqlx-core` 0.9.x alongside the workspace's 0.8.6 pin, splitting
+# the trait impls (Encode/Type) across two sqlx versions and failing the build.
+# Cargo.lock is gitignored in this repo, so a fresh resolve MUST pick a compatible
+# pgvector — 0.4.1 unifies on the workspace sqlx 0.8.6.
+pgvector = { version = "=0.4.1", features = ["sqlx"] }
 ssh2 = "0.9"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
