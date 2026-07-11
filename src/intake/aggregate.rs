@@ -41,10 +41,14 @@ pub const PASS_THRESHOLD: i32 = 4;
 
 /// The current build-scenario harness epoch. Aggregates are scoped to this;
 /// legacy epochs (`'v1'`/`'v2'`) are excluded so evolved tests aren't blended
-/// with results measured under a prior harness. MINT2-05 will promote this to a
-/// shared epoch concept — for now it lives here as the one place the value is
-/// stated (a future `'v4'` is a one-line bump).
-pub const CURRENT_EPOCH: &str = "v3";
+/// with results measured under a prior harness.
+///
+/// MINT2-05 promoted the definition to the ONE canonical place
+/// ([`crate::intake::CURRENT_EPOCH`] in `intake/mod.rs`); this is a re-export of
+/// that single source of truth, NOT a second definition — so existing
+/// `aggregate::CURRENT_EPOCH` references (e.g. `coder_sweep.rs`) keep working
+/// while there is exactly one value to bump for a future `'v4'`.
+pub use crate::intake::CURRENT_EPOCH;
 
 /// A cell with at most this many samples is flagged low-confidence: a single
 /// sample cannot express variance, so its pass_rate (0.0 or 1.0) must never be
