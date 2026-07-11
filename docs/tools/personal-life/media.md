@@ -393,9 +393,42 @@ Both take no arguments, require `PLEX_URL`/`PLEX_TOKEN` (else `NotConfigured`), 
 same narration-shaped `{ summary, structured: { count, titles } }` shape; an empty result is a
 friendly "nothing on deck"/"nothing recently added" summary, not an error.
 
+## Taste-memory personalization (MEDIA-06) — toggleable, default OFF
+
+A hard on/off personalization layer that enriches `media_recommend` with the operator's
+taste/curation memory. **The media domain works fully without it** — flipping it off
+de-personalizes suggestions but never breaks recommendations.
+
+**Toggle.** `MEDIA_TASTE_MEMORY_ENABLED` (three-state env: `1/true/on/yes` = on; anything else,
+including unset, = off — **default OFF**). The flag gates the *entire* module:
+
+- **OFF** → `crate::media::register` registers MEDIA-05's stateless `media_recommend` unchanged and
+  makes **zero** taste-facade calls. `taste_memory::register` is a no-op. (The MEDIA-05 statelessness
+  guarantee — and its `stateless_module_makes_no_memory_calls` test — are unaffected: the taste code
+  lives entirely in `src/media/taste_memory.rs`, and `recommend.rs` gains only a plain `from_env()`
+  constructor, no memory dependency.)
+- **ON** → `taste_memory::register` `register_or_replace`s `media_recommend` with a taste-aware
+  decorator that first computes the stateless MEDIA-05 result, then blends in taste signals read from
+  the facade (adjusting ranking + rationale, e.g. *"you told me you're into slow-burn sci-fi"*), and
+  registers the optional **`media_taste_feedback`** write-back tool.
+
+**Facade.** `MEDIA_TASTE_API_URL` — an *assumed* REST facade for the taste/curation store (liked/
+disliked, curation notes, stated preferences), following the `vitals`/`odyssey` convention. Non-secret
+base URL. **The endpoint/wire shape is not verified against a live service** and may need adjustment
+when a real taste store is wired.
+
+**Never a hard dependency.** Flag on but `MEDIA_TASTE_API_URL` unset, or the facade unreachable/erroring
+→ recommendations **degrade to the stateless MEDIA-05 result**, stamped `structured.taste_memory: { applied: false, note: "…" }`;
+they still return `Ok`. Write-back failures are logged, not surfaced as errors. No PII is written into stored signals.
+
+### media_taste_feedback (MEDIA-06, flag-gated) — write-back
+Registered only when the flag is on. Records engagement signals (requested/watched/dismissed) to the
+taste facade (POST) so curation improves over time. Its mere presence in the tool catalog reflects the
+flag state.
+
 ## What's not here yet
 
-Taste-memory personalization (MEDIA-06) and Lumina conversational/subagent surface wiring
-(MEDIA-07) aren't built yet — see the spec (`S94-media-domain`, Plane project `TERM`). See
+Lumina conversational/subagent surface wiring (MEDIA-07) isn't built yet — see the spec
+(`S94-media-domain`, Plane project `TERM`). See
 [`specs/behavior/media-behavior.md`](../../../specs/behavior/media-behavior.md) for the
 states/degradation contract this domain establishes.
