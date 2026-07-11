@@ -1,10 +1,11 @@
 //! Atlas deterministic node/edge extraction (KGRAPH-02).
 //!
-//! Reuses the same tree-sitter signature-walk shape Harmony's `repo_map.rs`
-//! uses (the `emit_kinds` / `container_kinds` whitelist — never descending into
-//! function BODIES, so we surface top-level items and impl/trait methods but not
-//! local helpers), but emits [`KgNode`]s and EXTRACTED [`KgEdge`]s instead of a
-//! text section.
+//! Reuses the same tree-sitter emit-kind whitelist Harmony's `repo_map.rs` uses
+//! to decide what is a node (top-level items + impl/trait methods), but emits
+//! [`KgNode`]s and EXTRACTED [`KgEdge`]s instead of a text section. Unlike
+//! `repo_map`, it DOES descend into function bodies — but only to capture the
+//! `Calls` they make; emission stays gated so a local item inside a body is
+//! never surfaced as a node (we keep "top-level items + methods only").
 //!
 //! Rust only in this item (Python/TS grammars follow in a later widening item).
 //! Everything here is a pure, in-memory parse: no I/O, no networking, no
@@ -77,6 +78,19 @@ fn last_segment(name: &str) -> &str {
     name.rsplit("::").next().unwrap_or(name).trim()
 }
 
+/// The base type name: last `::`-segment with any generic argument list
+/// stripped (`std::vec::Vec<T>` -> `Vec`, `Cache<K, V>` -> `Cache`). Without
+/// this, generic-type impls would FQN a method as `crate::m::Cache<T>::get`,
+/// which never matches the `crate::m::Cache` struct node.
+fn base_type_name(s: &str) -> String {
+    last_segment(s)
+        .split('<')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
 struct FileExtract {
     nodes: Vec<KgNode>,
     /// Structural edges, both endpoints intra-file (always resolvable).
@@ -146,6 +160,12 @@ fn walk(ctx: &mut Ctx, node: Node, container_id: &str, enclosing_fn: Option<&str
         }
 
         if let Some(nk) = emit_kind(kind) {
+            if enclosing_fn.is_some() {
+                // We are inside a function body (descended for calls): a local
+                // item is NOT a graph node. Still recurse to catch its calls.
+                walk(ctx, child, container_id, enclosing_fn);
+                continue;
+            }
             let Some(name) = ctx.name_of(child) else {
                 // unnamed item (rare) — recurse but don't emit
                 walk(ctx, child, container_id, enclosing_fn);
@@ -186,7 +206,7 @@ fn walk(ctx: &mut Ctx, node: Node, container_id: &str, enclosing_fn: Option<&str
 /// -> `<module>::Foo`.
 fn impl_type_fqn(ctx: &Ctx, impl_node: Node) -> Option<String> {
     let ty = impl_node.child_by_field_name("type")?;
-    let name = last_segment(&ctx.text(ty)).to_string();
+    let name = base_type_name(&ctx.text(ty));
     if name.is_empty() {
         return None;
     }
@@ -204,10 +224,24 @@ fn use_targets(ctx: &Ctx, use_node: Node) -> Vec<String> {
                 let t = ctx.text(child);
                 out.push(last_segment(&t).to_string());
             }
+            // `use a::b::C as D` — link to the imported symbol C (the `path`
+            // child), not the local alias D.
+            "use_as_clause" => {
+                if let Some(path) = child.child_by_field_name("path") {
+                    out.push(last_segment(&ctx.text(path)).to_string());
+                }
+            }
             "use_list" => {
                 let mut c2 = child.walk();
                 for item in child.named_children(&mut c2) {
-                    let t = ctx.text(item);
+                    // an aliased item inside a group is itself a use_as_clause
+                    let t = if item.kind() == "use_as_clause" {
+                        item.child_by_field_name("path")
+                            .map(|p| ctx.text(p))
+                            .unwrap_or_default()
+                    } else {
+                        ctx.text(item)
+                    };
                     let seg = last_segment(&t);
                     if !seg.is_empty() {
                         out.push(seg.to_string());
@@ -221,23 +255,43 @@ fn use_targets(ctx: &Ctx, use_node: Node) -> Vec<String> {
     out
 }
 
-/// The callee simple-name of a `call_expression`.
+/// The callee of a `call_expression`, keeping a one-level qualifier for scoped
+/// calls so resolution can disambiguate (`Foo::new` stays `Foo::new`, not just
+/// `new`); an unqualified call stays a bare name; a method call `x.foo()` yields
+/// the field name `foo`. Generic args are stripped from every segment.
 fn call_callee(ctx: &Ctx, call: Node) -> Option<String> {
     let f = call.child_by_field_name("function")?;
     let seg = match f.kind() {
         "identifier" => ctx.text(f),
-        "scoped_identifier" => last_segment(&ctx.text(f)).to_string(),
+        "scoped_identifier" => scoped_tail(&ctx.text(f)),
         "field_expression" => f
             .child_by_field_name("field")
             .map(|c| ctx.text(c))
             .unwrap_or_default(),
-        _ => last_segment(&ctx.text(f)).to_string(),
+        _ => scoped_tail(&ctx.text(f)),
     };
     let seg = seg.trim().to_string();
     if seg.is_empty() {
         None
     } else {
         Some(seg)
+    }
+}
+
+/// The last one or two `::`-segments of a scoped path, generics stripped:
+/// `a::b::Foo::new` -> `Foo::new`, `crate::m::helper` -> `m::helper`,
+/// `bare` -> `bare`. The one-level qualifier is what lets a same-named method on
+/// a different type resolve unambiguously.
+fn scoped_tail(s: &str) -> String {
+    let segs: Vec<String> = s
+        .split("::")
+        .map(|p| p.split('<').next().unwrap_or("").trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    match segs.len() {
+        0 => String::new(),
+        1 => segs[0].clone(),
+        n => format!("{}::{}", segs[n - 2], segs[n - 1]),
     }
 }
 
@@ -311,32 +365,68 @@ pub fn build_rust_graph(
 
     // Pass 2b: resolve import/call candidates.
     for fe in &per_file {
-        for (src_id, target_name, kind) in &fe.candidates {
-            let Some(ids) = by_name.get(target_name) else {
-                continue; // unknown target -> drop (KGRAPH-11 will resolve refs)
-            };
-            let src_path = id_path.get(src_id);
-            // same-file match first
-            let resolved = ids
-                .iter()
-                .find(|id| id_path.get(*id) == src_path && *id != src_id)
-                .or_else(|| {
-                    // else a unique global match (excluding self)
-                    let others: Vec<&String> = ids.iter().filter(|id| *id != src_id).collect();
-                    if others.len() == 1 {
-                        Some(others[0])
-                    } else {
-                        None
-                    }
-                });
-            if let Some(to) = resolved {
-                let _ = graph.insert_edge(KgEdge::new(src_id, to, *kind, Confidence::Extracted));
+        for (src_id, target, kind) in &fe.candidates {
+            if let Some(to) = resolve_target(target, src_id, &by_name, &id_path) {
+                let _ = graph.insert_edge(KgEdge::new(src_id, &to, *kind, Confidence::Extracted));
             }
         }
     }
 
     graph.recompute_degrees();
     Ok(graph)
+}
+
+/// Resolve a candidate `target` (a bare name, or a one-level-qualified
+/// `Qual::name`) to exactly one node id, or `None` (drop). Precedence:
+/// 1. If qualified, a *unique* node whose id ends with `::Qual::name`;
+///    a qualified target that matches >1 node is ambiguous → drop.
+/// 2. Else a *unique* same-file node named `name`.
+/// 3. Else a *unique* global node named `name`.
+/// Every step demands uniqueness, so an ambiguous target is dropped rather than
+/// mis-resolved to a wrong EXTRACTED edge. `src_id` is excluded (no self-edge).
+fn resolve_target(
+    target: &str,
+    src_id: &str,
+    by_name: &HashMap<String, Vec<String>>,
+    id_path: &HashMap<String, String>,
+) -> Option<String> {
+    let simple = last_segment(target);
+    let ids = by_name.get(simple)?;
+    let pool: Vec<&String> = ids.iter().filter(|id| id.as_str() != src_id).collect();
+    if pool.is_empty() {
+        return None;
+    }
+
+    // 1) qualified preference
+    if target.contains("::") {
+        let want = format!("::{target}");
+        let q: Vec<&String> = pool.iter().copied().filter(|id| id.ends_with(&want)).collect();
+        match q.len() {
+            1 => return Some(q[0].clone()),
+            n if n > 1 => return None, // ambiguous even qualified
+            _ => {}                    // no qualified hit → fall through to name rules
+        }
+    }
+
+    // 2) same-file unique
+    let src_path = id_path.get(src_id);
+    let same: Vec<&String> = pool
+        .iter()
+        .copied()
+        .filter(|id| id_path.get(id.as_str()) == src_path)
+        .collect();
+    match same.len() {
+        1 => return Some(same[0].clone()),
+        n if n > 1 => return None, // same-file ambiguous → drop
+        _ => {}
+    }
+
+    // 3) global unique
+    if pool.len() == 1 {
+        Some(pool[0].clone())
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -434,5 +524,97 @@ pub fn caller() { some_unknown_external_fn(); }
             .edges()
             .find(|e| e.kind == EdgeKind::Imports && e.to == "crate::a::Beacon");
         assert!(imp.is_some(), "import resolves to the unique global Beacon node");
+    }
+
+    #[test]
+    fn generic_impl_method_attributes_to_base_type() {
+        // Regression (review P2-1): `impl<T> Cache<T>` must FQN the method to
+        // `crate::m::Cache::get`, and the type->method Contains edge must exist.
+        let src = r#"
+pub struct Cache<T> { items: Vec<T> }
+impl<T> Cache<T> {
+    pub fn get(&self) -> u8 { 0 }
+}
+"#;
+        let g = build_rust_graph("TERM", &[("src/m.rs".to_string(), src.to_string())]).unwrap();
+        assert!(g.get_node("crate::m::Cache").is_some(), "generic struct node");
+        assert!(
+            g.get_node("crate::m::Cache::get").is_some(),
+            "method FQN strips generics"
+        );
+        assert!(
+            g.edges().any(|e| e.from == "crate::m::Cache"
+                && e.to == "crate::m::Cache::get"
+                && e.kind == EdgeKind::Contains),
+            "type Contains method edge survives for generic type"
+        );
+    }
+
+    #[test]
+    fn qualified_call_disambiguates_same_named_methods() {
+        // Regression (review P2-2): two `new`s in one file; a qualified
+        // `Foo::new()` must resolve to Foo::new, never Bar::new.
+        let src = r#"
+pub struct Foo;
+pub struct Bar;
+impl Foo { pub fn new() -> Foo { Foo } }
+impl Bar { pub fn new() -> Bar { Bar } }
+pub fn make() -> Foo { Foo::new() }
+"#;
+        let g = build_rust_graph("TERM", &[("src/m.rs".to_string(), src.to_string())]).unwrap();
+        let call = g
+            .edges()
+            .find(|e| e.kind == EdgeKind::Calls && e.from == "crate::m::make");
+        let call = call.expect("a Calls edge from make");
+        assert_eq!(call.to, "crate::m::Foo::new", "qualified call must not mis-resolve to Bar::new");
+    }
+
+    #[test]
+    fn ambiguous_unqualified_call_is_dropped_not_misresolved() {
+        // Two `new`s; an UNqualified `new()` (no receiver) is ambiguous → drop,
+        // never a wrong EXTRACTED edge.
+        let src = r#"
+pub struct Foo;
+pub struct Bar;
+impl Foo { pub fn new() -> Foo { Foo } }
+impl Bar { pub fn new() -> Bar { Bar } }
+pub fn make() -> Foo { new() }
+"#;
+        let g = build_rust_graph("TERM", &[("src/m.rs".to_string(), src.to_string())]).unwrap();
+        assert!(
+            !g.edges().any(|e| e.kind == EdgeKind::Calls && e.from == "crate::m::make"),
+            "ambiguous unqualified call must be dropped, not mis-resolved"
+        );
+    }
+
+    #[test]
+    fn nested_item_in_body_is_not_emitted() {
+        // Regression (review P3-3): a local item inside a fn body is not a node.
+        let src = r#"
+pub fn outer() -> u8 {
+    struct Local { x: u8 }
+    fn helper() -> u8 { 1 }
+    helper()
+}
+"#;
+        let g = build_rust_graph("TERM", &[("src/m.rs".to_string(), src.to_string())]).unwrap();
+        assert!(g.get_node("crate::m::outer").is_some(), "top-level fn emitted");
+        assert!(g.get_node("crate::m::outer::Local").is_none(), "local struct not a node");
+        assert!(g.get_node("crate::m::outer::helper").is_none(), "local fn not a node");
+    }
+
+    #[test]
+    fn use_as_alias_links_to_imported_symbol() {
+        let a = "pub struct Beacon;";
+        let b = "use crate::a::Beacon as B;\npub fn f() {}";
+        let g = build_rust_graph(
+            "TERM",
+            &[("src/a.rs".to_string(), a.to_string()), ("src/b.rs".to_string(), b.to_string())],
+        )
+        .unwrap();
+        assert!(
+            g.edges().any(|e| e.kind == EdgeKind::Imports && e.to == "crate::a::Beacon"),
+            "use-as links to the imported symbol, not the alias"
+        );
     }
 }
