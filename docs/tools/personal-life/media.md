@@ -2,12 +2,14 @@
 
 [← personal-life index](README.md) · [← tool index](../README.md) · [← docs index](../../README.md)
 
-**Status: read/search + tiered request surface live (MEDIA-01 through MEDIA-03, S94).** This page
-documents the domain through its first three build items: the seven typed service clients +
-`media_domain_status` (MEDIA-01), the read-only search/status surface (`media_search` and
-`media_status`, MEDIA-02), and the tiered-mutation-safety request/download tool (`media_request`,
-MEDIA-03). Organize, recommend, and taste-memory tools land with MEDIA-04 through MEDIA-08 as
-those items ship.
+**Status: read/search + tiered request + organize/destructive-gating surface live (MEDIA-01
+through MEDIA-04, S94).** This page documents the domain through its first four build items: the
+seven typed service clients + `media_domain_status` (MEDIA-01), the read-only search/status
+surface (`media_search` and `media_status`, MEDIA-02), the tiered-mutation-safety request/
+download tool (`media_request`, MEDIA-03), and non-destructive organize plus hard-typed-
+confirmation destructive delete/bulk-cleanup (`media_organize`/`media_delete`/`media_cleanup`,
+MEDIA-04). Recommend and taste-memory tools land with MEDIA-05 through MEDIA-08 as those items
+ship.
 
 The media domain (`src/media/mod.rs`) orchestrates the self-hosted media stack directly —
 Radarr, Sonarr, Prowlarr, qtor (download client), Plex, <media-service>, and TMDb — rather than
@@ -238,10 +240,98 @@ Every *executed* mutation is recorded via `crate::gateway_framework::audit::Audi
 }
 ```
 
+## media_organize (MEDIA-04)
+
+Non-destructive library organization — set the `monitored` flag, replace a movie/series' tags,
+or set a movie's TMDb collection (`src/media/organize.rs`). Reuses `media_request`'s exact
+`classify_request`/`MutationTier` pure tiering model verbatim: a specific, unambiguous,
+single-item or single-season change (`item_count == 1`, not a whole-series change) executes
+immediately (Light); anything ambiguous, bulk (`item_count > 1`), or whole-series-scoped (no
+`season` given) returns a confirmation payload and requires a follow-up `confirm: true`
+(Confirm) — identical semantics to `media_request`, just with `est_size_bytes` fixed at 0 since
+metadata changes have no download size.
+
+**Input schema**
+
+| Field | Type | Required |
+|---|---|---|
+| `id` | integer | yes — Radarr/Sonarr resource id |
+| `media_type` | `"movie"` \| `"series"` | yes |
+| `action` | `"monitor"` \| `"tag"` \| `"add_to_collection"` | yes |
+| `season` | integer | no — season-scoped change; omitting it for a series means "whole series" (always Confirm-tier) |
+| `monitored` | boolean | required for `action=monitor` |
+| `tag_ids` | integer[] | required for `action=tag` — already-resolved Radarr/Sonarr tag ids |
+| `collection_tmdb_id` | integer | required for `action=add_to_collection` (movies only) |
+| `item_count` | integer | no, default 1 |
+| `is_ambiguous` | boolean | no, default false |
+| `confirm` | boolean | no, default false — must be `true` to execute a Confirm-tier change |
+
+**Behavior.** Confirm-tier without `confirm: true` returns the confirmation payload and stops —
+no library fetch, no PUT. Otherwise fetches the current resource (`RadarrClient::library` /
+`SonarrClient::library`, matched by `id`), merges the requested field into the full resource
+body (Radarr/Sonarr's PUT expects the complete resource, not a partial patch), and calls
+`RadarrClient::update_movie` / `SonarrClient::update_series`. A missing `id` is `NotFound`, never
+a silent no-op (organize targets a specific known resource, unlike delete's "already absent" —
+see below). Every executed change is audit-logged with the id/title/action.
+
+## media_delete (MEDIA-04) — DESTRUCTIVE, hard-gated
+
+Permanently deletes a single movie or series and its files. This is **structurally stronger**
+than `media_request`/`media_organize`'s boolean `confirm: true`: the schema doesn't even accept
+one. The caller must set `confirm_delete` to the **exact, verbatim title** of the thing being
+deleted (as returned by the first, unconfirmed call) — a light ack, a stale/replayed
+`confirm: true`, or any string that isn't an exact (trimmed, case-sensitive) match to the real
+title never triggers a delete.
+
+**Input schema**
+
+| Field | Type | Required |
+|---|---|---|
+| `id` | integer | yes |
+| `media_type` | `"movie"` \| `"series"` | yes |
+| `confirm_delete` | string | no — must equal the target's exact title to execute; omit to get the confirmation payload |
+
+**Behavior.** Looks the item up by `id` first. Not present in the library at all → a clean
+no-op response (`already_absent: true`), never an error and never a confirmation prompt (EDGE
+CASE: deleting something already gone). Present but `confirm_delete` missing/mismatched → a
+confirmation payload naming the exact target title, **nothing deleted**. Present and
+`confirm_delete` matches exactly → `RadarrClient::delete_movie` / `SonarrClient::delete_series`
+(which itself deletes files), audit-logged with the id/title.
+
+## media_cleanup (MEDIA-04) — DESTRUCTIVE bulk op, enumerate-then-confirm
+
+Bulk removal (e.g. "clean up what I've watched"). The caller supplies pre-resolved `candidates`
+(typically Plex watch history cross-referenced against the Radarr/Sonarr library upstream of
+this tool — this domain's `PlexClient` exposes account-level history only, not a per-user
+breakdown, so per-user watched-aggregation happens above this tool; the wire shape for that
+aggregation is not verified against a live multi-user Plex deployment).
+
+**Input schema**
+
+| Field | Type | Required |
+|---|---|---|
+| `media_type` | `"movie"` \| `"series"` | yes |
+| `candidates` | array of `{ id, title, watched_by_all_users? }` | yes |
+| `confirm_delete` | string[] | no — must exactly equal (order-independent) the enumerated eligible-title set from the first call |
+
+**Behavior — multi-user Plex EDGE CASE.** Candidates split into *eligible* (`watched_by_all_users
+== true`) and *flagged* (`false`, **or omitted** — the safe default for a destructive op is to
+flag, not assume consensus). Flagged items are surfaced in every response but are **never
+deleted, even when confirmed** — the confirm-set comparison is against the eligible set only, so
+a caller that tries to confirm a superset including a flagged item falls back to
+re-enumeration rather than partially executing.
+
+The first call (no `confirm_delete`, or one that doesn't exactly match the eligible set)
+**enumerates** the exact eligible titles in the response and deletes nothing — no blind purge.
+Only a follow-up call whose `confirm_delete` is exactly the eligible-title set (as a set; order
+doesn't matter, a partial or superset confirm doesn't match) executes: each eligible candidate is
+deleted via the same Radarr/Sonarr client methods `media_delete` uses, individually audit-logged,
+with per-item `deleted`/`already_absent`/`failed` outcomes in the response (one candidate's
+failure never blocks the others).
+
 ## What's not here yet
 
-No organize, recommend, or taste-memory tools exist yet — see the spec (`S94-media-domain`,
-Plane project `TERM`) for MEDIA-04 through MEDIA-08. Destructive-op hard gating (MEDIA-04) is a
-separate, stricter discipline from this item's tiered confirmation. See
+No recommend or taste-memory tools exist yet — see the spec (`S94-media-domain`, Plane project
+`TERM`) for MEDIA-05 through MEDIA-08. See
 [`specs/behavior/media-behavior.md`](../../../specs/behavior/media-behavior.md) for the
 states/degradation contract this domain establishes.
