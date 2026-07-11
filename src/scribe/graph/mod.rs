@@ -19,6 +19,7 @@ pub mod cluster;
 pub mod extract;
 pub mod layout;
 pub mod model;
+pub mod render;
 pub mod store;
 pub mod tools;
 
