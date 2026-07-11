@@ -224,9 +224,22 @@ pub struct ParsedLayers {
 pub fn parse_layers(content: &str) -> ParsedLayers {
     ParsedLayers {
         hero: preamble(content),
-        quickstart: extract_section(content, "Quickstart").unwrap_or_default(),
-        deep_dive: extract_section(content, "Deep Dive").unwrap_or_default(),
+        // Accept both the GENERATED heading names (Quickstart/Deep Dive) and
+        // the RENDERED ones (Usage/API, from build_layered_body) so a prior
+        // *rendered* README round-trips back into layers for the deepen merge.
+        // Without this, a round that OMITS a layer would drop the prior
+        // content -- it lives under the rendered heading, not the generated
+        // one (regression fixed here: preserves_prior_quickstart_when_round_omits_it).
+        quickstart: extract_section_any(content, &["Quickstart", "Usage"]).unwrap_or_default(),
+        deep_dive: extract_section_any(content, &["Deep Dive", "API"]).unwrap_or_default(),
     }
+}
+
+/// Try [`extract_section`] for each candidate heading in order, returning the
+/// first match. One parser thus handles both generated content (Quickstart/
+/// Deep Dive headings) and a previously-rendered README (Usage/API headings).
+fn extract_section_any(content: &str, header_names: &[&str]) -> Option<String> {
+    header_names.iter().find_map(|name| extract_section(content, name))
 }
 
 /// Preserve a layer's PRIOR content when this round's generation didn't
