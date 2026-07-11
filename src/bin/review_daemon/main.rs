@@ -457,6 +457,15 @@ fn is_agy_auth_transient(detail: &str) -> bool {
 /// auth-transient is a FAST failure (agy exits rc=1 in seconds, not the full
 /// timeout), so even the worst case stays well under the caller's dispatch
 /// timeout. Any non-transient error (or success) returns immediately.
+///
+/// NOTE on the time budget: `timeout_secs` is applied PER ATTEMPT (each
+/// `run_built_command` call gets the full budget), so a pathological run that
+/// somehow hit the timeout on every attempt could take up to
+/// `(AGY_AUTH_RETRIES + 1) * timeout_secs` plus the backoffs. That is a hard
+/// upper bound (never unbounded), and in practice the auth-transient fails in a
+/// few seconds -- a genuine per-attempt timeout is a different, non-transient
+/// error kind (`"timeout"`), which `is_agy_auth_transient` excludes, so it is
+/// returned immediately without consuming a retry.
 async fn run_agy_with_retry(
     built: &provider::BuiltCommand,
     resolved_path: &std::path::Path,
@@ -469,9 +478,14 @@ async fn run_agy_with_retry(
         match run_built_command(built, resolved_path, timeout_secs, env).await {
             Err((_, detail)) if attempt < AGY_AUTH_RETRIES && is_agy_auth_transient(&detail) => {
                 attempt += 1;
+                // Log the CLASSIFICATION + attempt only -- never the raw
+                // `detail`. agy's auth-transient text embeds a Google OAuth
+                // login URL whose query string (client_id, redirect_uri,
+                // code_challenge, ...) is auth material that must not be
+                // expanded into the daemon's logs.
                 tracing::warn!(
                     attempt,
-                    "review-daemon: agy OAuth auth-transient, retrying after backoff: {detail}"
+                    "review-daemon: agy OAuth auth-transient (detail redacted), retrying after backoff"
                 );
                 tokio::time::sleep(AGY_RETRY_BACKOFF * attempt as u32).await;
             }
