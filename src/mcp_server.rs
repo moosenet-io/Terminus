@@ -604,6 +604,23 @@ async fn handle_mcp(
                             crate::approval::Gate::Granted => {}
                             crate::approval::Gate::Pending(msg)
                             | crate::approval::Gate::Denied(msg) => {
+                                // MESH-16 (F1): the RBAC deny path above
+                                // always logs a federated `AuditEntry` before
+                                // returning early -- this approval-gate deny
+                                // path must do the same, or a
+                                // pending/denied federated call would be
+                                // completely silent in the audit log.
+                                AuditEntry::new_federated(
+                                    &audit_principal,
+                                    Some(client.namespace().to_string()),
+                                    name,
+                                    &bare_name,
+                                    ActionKind::Tool,
+                                    AuditResult::DeniedNotAllowlisted,
+                                    AuditDecision::ApprovalRequired,
+                                    Some(&msg),
+                                )
+                                .log();
                                 return sse_response(
                                     id,
                                     Ok(json!({
@@ -647,6 +664,15 @@ async fn handle_mcp(
                                 if let Some(code) = &approval_code {
                                     let _ = crate::approval::unconsume(&bare_name, code).await;
                                 }
+                                // MESH-16 (F2): a post-approval upstream
+                                // failure is a transport/dispatch failure,
+                                // not an ordinary application-level tool
+                                // error -- route it to
+                                // `record_transport_failure` below exactly
+                                // like the non-guarded upstream error branch
+                                // already does, instead of the default
+                                // `record_result(false, ..)`.
+                                is_transport_failure = true;
                                 warn!(
                                     "mesh: error calling guarded \"{bare_name}\" on upstream \"{}\": {mesh_err}",
                                     client.namespace()
@@ -670,7 +696,16 @@ async fn handle_mcp(
                             }
                         }
                     } else {
-                    match client.call_tool(&bare_name, arguments.clone()).await {
+                    // MESH-16 (F3): a gateway-only `_approval_code` must
+                    // never reach an upstream, guarded or not -- the guarded
+                    // branch above already strips it before forwarding; mirror
+                    // that here so a caller who happens to pass one on a
+                    // non-guarded federated tool doesn't leak it upstream.
+                    let mut forward_args = arguments.clone();
+                    if let Some(obj) = forward_args.as_object_mut() {
+                        obj.remove(crate::approval::APPROVAL_ARG);
+                    }
+                    match client.call_tool(&bare_name, forward_args).await {
                         Ok(outcome) => (
                             sse_response(
                                 id,
@@ -1671,5 +1706,156 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["result"]["isError"], true, "denied federated call must be a tool-error result: {body}");
+    }
+
+    // ── MESH-16: Epic Review fixes to the federated `tools/call` path ──────
+
+    /// F1: a GUARDED federated call (RBAC-allowlisted, so it reaches the
+    /// `approval::gate` check) that is refused because it has no valid
+    /// approval must still emit a federated `AuditEntry` before the early
+    /// `return` -- exactly like the RBAC-deny path above already does.
+    /// Pre-fix, that `Gate::Pending | Gate::Denied` arm returned with zero
+    /// audit call at all (a silent denial). `DATABASE_URL` unset makes
+    /// `approval::gate` deterministically return `Gate::Denied(..)` without
+    /// needing a real Postgres -- no mock is registered for `tools/call`
+    /// either, so if the fix's new `AuditEntry::new_federated(..).log()`
+    /// call were to panic (wrong field/type), or if dispatch incorrectly
+    /// proceeded to the upstream, this test would fail.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn federated_guarded_call_denied_approval_is_audited_not_silent() {
+        std::env::remove_var("DATABASE_URL");
+
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/mcp").json_body_partial(r#"{"method": "initialize"}"#);
+            then.status(200).header("Mcp-Session-Id", "mesh10-session").json_body(mesh10_init_response());
+        });
+
+        let registry = crate::mesh::registry::UpstreamRegistry::from_json(&mesh10_registry_json(&server.base_url()))
+            .expect("valid registry json");
+        let pool = UpstreamPool::from_registry(&registry);
+
+        // Allowlisted at RBAC -- it's the approval gate, not RBAC, that must
+        // block (and audit) this call.
+        let gateway = gateway_allowing("dev-box", &["mesh10ns__infisical_status"]);
+        let state = state_with_mesh(gateway, pool);
+        let router = build_router(state);
+
+        let identity = ClientIdentity("dev-box".to_string());
+        let (status, body) = post_mcp_with_identity(
+            router,
+            json!({
+                "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                "params": {"name": "mesh10ns__infisical_status", "arguments": {}}
+            }),
+            Some(identity),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["result"]["isError"], true,
+            "a guarded federated call with no valid approval must be refused, never dispatched: {body}"
+        );
+    }
+
+    /// F2: a GUARDED federated call that IS approved but then fails at the
+    /// transport level must be audited as `TransportFailure`, not an
+    /// ordinary `record_result(false, ..)`. Reaching `Gate::Granted` for
+    /// real requires a live Postgres grant row -- unavailable in this unit
+    /// test environment, the same limitation `approval`'s own
+    /// `gate_without_db_url_denies_gracefully` test documents (it too can
+    /// only exercise the DB-unavailable `Denied` arm, never `Granted`).
+    ///
+    /// So this is a targeted source-level regression guard instead of a
+    /// live dispatch: it pins that `is_transport_failure = true` is set
+    /// inside the GUARDED upstream's `Err(mesh_err)` arm (right after the
+    /// `unconsume` rollback call and before its `warn!("mesh: error calling
+    /// guarded ...")`), which is exactly the statement the F2 fix adds.
+    /// Deleting or moving that line -- the actual regression this guards
+    /// against -- fails this test.
+    #[test]
+    fn guarded_upstream_transport_error_sets_is_transport_failure_before_warn() {
+        let src = include_str!("mcp_server.rs");
+        let unconsume_pos = src
+            .find("let _ = crate::approval::unconsume(&bare_name, code).await;")
+            .expect("guarded approval-rollback call must still be present");
+        let guarded_warn_pos = src
+            .find("\"mesh: error calling guarded \\\"{bare_name}\\\" on upstream \\\"{}\\\": {mesh_err}\"")
+            .expect("guarded transport-error warn! must still be present");
+        let flag_pos = src[unconsume_pos..guarded_warn_pos]
+            .find("is_transport_failure = true;")
+            .expect(
+                "F2 regression: the guarded `Err(mesh_err)` arm must set \
+                 `is_transport_failure = true` between the approval-rollback \
+                 and its warn!, so the terminal audit records \
+                 `TransportFailure` (not a plain `record_result(false, ..)`) \
+                 for a post-approval upstream failure",
+            );
+        assert!(flag_pos > 0, "flag must be set strictly after the rollback call, matching the fix's placement");
+    }
+
+    /// F3: `_approval_code` must never leak to a NON-guarded federated
+    /// upstream. This mock only matches a `tools/call` request whose body
+    /// does NOT contain `_approval_code` -- if the fix regresses (the arg is
+    /// forwarded verbatim again), the mock won't match, the mesh client gets
+    /// a 404, and the call surfaces as an error instead of the expected
+    /// clean success.
+    fn body_excludes_approval_code(req: &httpmock::prelude::HttpMockRequest) -> bool {
+        let body = req.body.as_deref().unwrap_or(&[]);
+        let text = String::from_utf8_lossy(body);
+        text.contains("\"method\":\"tools/call\"") && !text.contains("_approval_code")
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn federated_non_guarded_call_strips_approval_code_before_forwarding() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/mcp").json_body_partial(r#"{"method": "initialize"}"#);
+            then.status(200).header("Mcp-Session-Id", "mesh10-session").json_body(mesh10_init_response());
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/mcp")
+                .matches(body_excludes_approval_code);
+            then.status(200).json_body(json!({
+                "jsonrpc": "2.0", "id": 9,
+                "result": {"content": [{"type": "text", "text": "echo: hi"}], "isError": false}
+            }));
+        });
+
+        let registry = crate::mesh::registry::UpstreamRegistry::from_json(&mesh10_registry_json(&server.base_url()))
+            .expect("valid registry json");
+        let pool = UpstreamPool::from_registry(&registry);
+
+        // "echo" is not in `approval::GUARDED_BARE_NAMES`, so this exercises
+        // the non-guarded forward branch specifically.
+        let gateway = gateway_allowing("dev-box", &["mesh10ns__echo"]);
+        let state = state_with_mesh(gateway, pool);
+        let router = build_router(state);
+
+        let identity = ClientIdentity("dev-box".to_string());
+        let (status, body) = post_mcp_with_identity(
+            router,
+            json!({
+                "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                "params": {
+                    "name": "mesh10ns__echo",
+                    "arguments": {"msg": "hi", "_approval_code": "SHOULD-NOT-LEAK"}
+                }
+            }),
+            Some(identity),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["result"]["isError"], false,
+            "call must succeed, proving the upstream only received the request \
+             once `_approval_code` was stripped: {body}"
+        );
+        assert_eq!(body["result"]["content"][0]["text"], "echo: hi");
     }
 }
