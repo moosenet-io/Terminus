@@ -303,7 +303,46 @@ written.
 }
 ```
 
-### Onboarding a new remote client (`mesh_onboard_client`)
+### Federated audit trail (MESH-10)
+
+Every `tools/call` gated by `crate::gateway_framework` (see MESH-08 above) is
+audited via `crate::gateway_framework::audit::AuditEntry` — S6-sanitized
+(secret-shaped `key=value`/`Bearer <token>` values redacted to
+`***REDACTED***`, bodies truncated past 200 chars), one entry per request,
+whether the request was denied, dispatched-and-succeeded, or
+dispatched-and-failed. As of MESH-10 that entry carries the FULL federated
+shape, not just identity/action/result:
+
+| Field | Meaning |
+| --- | --- |
+| `principal` | The resolved caller (`crate::mesh::Principal::name()`) — same value as `identity`, but the field a federated-audit reviewer keys on. |
+| `upstream` | The mesh namespace this call routed to (e.g. `"ct322"` for a `ct322__ledger_add` call), or `null`/absent for a local (non-federated) call. |
+| `tool_advertised` | The tool name exactly as the caller sent it — namespaced for a federated call. |
+| `tool_bare` | The tool name actually dispatched (namespace prefix stripped for a federated call; identical to `tool_advertised` for a local call). |
+| `decision` | One of `allow`, `deny`, `approval_required`, `transport_failure` — the gate's decision, independent of whether a dispatched call then itself succeeded or failed (see `result` below). |
+| `result` | `success` / `failure` (dispatched; underlying call succeeded/errored) or `denied_no_identity` / `denied_not_allowlisted` / `denied_rate_limited` (never dispatched). |
+| `detail` | Sanitized, truncated human-readable context — a denial reason, or a summarized tool-error/args string. Never a raw payload; never an unredacted secret. |
+
+A federated call is **always** audited, at every outcome — including the
+ones easy to accidentally drop silently:
+
+- **Denied before routing** (no identity / not allowlisted / rate-limited):
+  audited with `decision: "deny"`, `upstream` populated from parsing the
+  namespaced name (mesh routing itself hasn't run yet at this point, since
+  the gate runs first) — see the `tools/call` handler's `Err(denial)` arm in
+  `crate::mcp_server`.
+- **Routed to a healthy upstream**: audited with `decision: "allow"` and
+  `result` reflecting whether the upstream's own response was
+  success/error.
+- **Upstream unreachable or unhealthy** (`crate::mesh::CallRoute::Unavailable`,
+  or a network-level failure calling a upstream the pool still believed was
+  healthy): audited with `decision: "transport_failure"` — deliberately
+  distinct from an ordinary `result: "failure"`, and never a silent drop
+  (`GatewayContext::record_transport_failure`).
+- **A guarded local tool requiring human approval** (`crate::approval`'s
+  "APPROVAL REQUIRED" gate): audited with `decision: "approval_required"`.
+
+
 
 `mesh_onboard_upstream` (above) brings a new *server* into the mesh; this is
 the companion tool for the other direction — bringing a new *client* (an
