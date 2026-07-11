@@ -509,6 +509,41 @@ Grounding is entirely best-effort: no `project_id`, no stored graph, or no
 node matching any changed file all silently skip injection — never an error,
 never a partial/empty block.
 
+### `review_run` rebuilds the graph on pass + holds a per-project lock (KGREV-02)
+
+When a dispatched review's aggregate verdict is `APPROVE` and `complete`, and
+`context` carries both `project_id` and `repo_path` (an absolute path under
+`SCRIBE_ALLOWED_REPO_ROOTS`), `review_run` incrementally rebuilds that
+project's Atlas graph via `scribe_kg_build` (`incremental: true`,
+`changed_files` reusing the same derivation KGREV-01 uses) — so the graph the
+*next* review consults reflects the change that was just approved.
+
+While that rebuild is in flight, `review_run` holds a per-project lock keyed
+by `project_id`. Another call with the SAME `project_id` short-circuits
+immediately at the top of `execute()`:
+
+```json
+{ "structure": "...", "providers": [], "aggregate_verdict": "UNKNOWN",
+  "complete": false, "locked": true,
+  "reason": "KG rebuild in progress for <project>; retry when ready" }
+```
+
+No providers are dispatched on a locked call. Reviews of *different*
+`project_id`s never block each other. The lock is released via an RAII guard
+on every path — rebuild success, rebuild error, or a panic-unwind — so it can
+never deadlock a project.
+
+The rebuild is entirely non-blocking to the review result: a rebuild failure
+(bad `repo_path`, disallowed root, etc.) is logged and reported in a
+`kg_rebuild` field, and never turns an `APPROVE` into a tool error or changes
+the aggregate verdict. Every `review_run` result now includes `kg_rebuild`:
+
+| Shape | Meaning |
+| --- | --- |
+| `{"ran": false, "reason": "..."}` | Not an approved+complete pass, or `project_id`/`repo_path` missing — no lock taken, backward compatible. |
+| `{"ran": true, "ok": true, "nodes": …, "edges": …, "clusters": …, "mode": "incremental"}` | Rebuild succeeded. |
+| `{"ran": true, "ok": false, "error": "..."}` | Rebuild failed; review verdict is unaffected. |
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
