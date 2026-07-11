@@ -184,6 +184,52 @@ pub fn issue_server_cert(
     Ok((cert.pem(), key_pair.serialize_pem()))
 }
 
+/// Generate a fresh CLIENT leaf cert for THIS process to present when it is
+/// the one dialing OUT to another mTLS-fronted upstream (MESH-02), signed by
+/// `ca` and carrying the clientAuth EKU — the same shape TCLI-02's
+/// `crate::pki::enroll::issue_leaf_cert` issues for enrolling peers, but
+/// used here for the opposite direction (this process presenting an
+/// identity to a peer, rather than validating one presented to it).
+/// Short-lived, matching TCLI-02's enrollment TTL convention
+/// (`crate::config::enrollment_cert_ttl_hours`) rather than the long-lived
+/// server-cert TTL above — an outbound mesh dial mints a fresh leaf per
+/// [`crate::mesh::client::UpstreamClient`] construction rather than caching
+/// one across the process lifetime, so a short TTL costs nothing and keeps
+/// the exposure window small.
+pub fn issue_client_cert(
+    ca: &CertificateAuthority,
+    identity: &str,
+) -> Result<(String, String), MtlsError> {
+    let mut params = CertificateParams::new(Vec::<String>::new())
+        .map_err(|e| MtlsError::ServerCertIssuance(format!("client leaf params: {e}")))?;
+
+    let now = chrono::Utc::now();
+    let ttl = chrono::Duration::hours(crate::config::enrollment_cert_ttl_hours());
+    params.not_before = to_rcgen_time(now - chrono::Duration::minutes(5));
+    params.not_after = to_rcgen_time(now + ttl);
+    params
+        .distinguished_name
+        .push(DnType::CommonName, identity);
+    params.subject_alt_names = vec![SanType::DnsName(
+        identity
+            .to_string()
+            .try_into()
+            .map_err(|e| MtlsError::ServerCertIssuance(format!("SAN encoding: {e:?}")))?,
+    )];
+    params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+    params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ClientAuth);
+
+    let key_pair = KeyPair::generate()
+        .map_err(|e| MtlsError::ServerCertIssuance(format!("client leaf keypair: {e}")))?;
+    let cert = params
+        .signed_by(&key_pair, ca.issuer())
+        .map_err(|e| MtlsError::ServerCertIssuance(format!("client leaf signing: {e}")))?;
+
+    Ok((cert.pem(), key_pair.serialize_pem()))
+}
+
 fn to_rcgen_time(dt: chrono::DateTime<chrono::Utc>) -> time::OffsetDateTime {
     time::OffsetDateTime::from_unix_timestamp(dt.timestamp())
         .expect("chrono timestamps are always in range for time::OffsetDateTime")
