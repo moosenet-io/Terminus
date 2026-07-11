@@ -444,4 +444,38 @@ mod tests {
         assert_eq!(catalog.routing.len(), 2);
         assert_eq!(catalog.routing.get("health"), Route::Local);
     }
+
+    // ── MESH-08: a merged (namespaced) catalog filters correctly through
+    //    `crate::gateway_framework::AllowlistPolicy` ─────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn merged_namespaced_catalog_filters_per_principal_allowlist() {
+        use crate::gateway_framework::{AllowlistPolicy, Grant};
+        use std::collections::HashMap;
+
+        std::env::set_var("MESH_MERGE_TEST_TOKEN_FILTER", "fixture-token"); // pii-test-fixture
+        let server = MockServer::start();
+        mount_list_tools(&server, "ledger_add");
+        let json = bearer_upstream_json("ct322", &server.base_url(), "ct322", "MESH_MERGE_TEST_TOKEN_FILTER");
+        let registry = UpstreamRegistry::from_json(&format!("[{json}]")).expect("valid json");
+        let pool = UpstreamPool::from_registry(&registry);
+
+        let catalog = MergedCatalog::build(vec![tool_json("plain_local_tool")], &pool).await;
+        let names: Vec<&str> =
+            catalog.tools.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str())).collect();
+        assert!(names.contains(&"ct322__ledger_add"));
+        assert!(names.contains(&"plain_local_tool"));
+
+        let mut map = HashMap::new();
+        map.insert("ct322-viewer".to_string(), Grant::List(vec!["ct322__*".to_string()]));
+        let policy = AllowlistPolicy::new(map);
+
+        let visible = policy.filter_tools("ct322-viewer", catalog.tools);
+        let visible_names: Vec<&str> =
+            visible.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str())).collect();
+        assert_eq!(visible_names, vec!["ct322__ledger_add"]);
+
+        std::env::remove_var("MESH_MERGE_TEST_TOKEN_FILTER");
+    }
 }

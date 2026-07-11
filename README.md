@@ -149,6 +149,7 @@ Wiring the resolver into the live request path (replacing the interim
 MESH-07 — existing callers keep working today via a direct, resolver-bypassing
 conversion (`Principal::from(&ClientIdentity)`) that uses the raw cert CN as
 the principal name, unchanged from pre-MESH-06 behavior.
+
 ### Catalog merge, namespacing, and routing
 
 `tools/list` on `/mcp` merges the local core catalog with every currently
@@ -183,6 +184,49 @@ dispatch. When the mesh registry/pool is empty or disabled
 (`TERMINUS_MESH_ENABLED` unset), this is all a no-op: `tools/list`/
 `tools/call` behave exactly as they did before the mesh existed.
 
+### Per-upstream, per-tool RBAC over namespaced tools (MESH-08)
+
+`crate::gateway_framework::AllowlistPolicy` (`TERMINUS_GATEWAY_ALLOWLIST_JSON`,
+see `.env.example`) grants a `Principal` access by tool/route NAME — as of
+MESH-08 that name may be a plain local tool, or a mesh namespaced name
+(`<namespace>__<tool>`, see the catalog-merge section above), so one policy
+covers both. An allow entry (in either the legacy plain-array `Grant::List`
+form or the `{"allow": [...], "deny": [...]}` `Grant::AllowDeny` form) may be:
+
+| Entry | Grants |
+| --- | --- |
+| `"*"` | every tool/route, local or namespaced |
+| `"ct322__*"` | every tool currently exported by the mesh upstream registered under namespace `ct322` (any entry ending in `*` is a prefix wildcard — not just the bare `"*"` entry) |
+| `"ct322__ledger_add"` | exactly that one namespaced tool |
+| `"ledger_add"` | a plain local tool (unchanged, pre-mesh behavior) |
+
+A `deny` PREFIX (`Grant::AllowDeny` only) is checked against the action as
+given **and**, for a namespaced action, against its bare (post-`__`) tool
+name too — so `DEFAULT_SENSITIVE_DENY_PREFIXES` entries authored against bare
+names (e.g. `"github_"`) keep closing off a sensitive tool no matter which
+upstream namespace re-exports it: `deny: ["github_"]` blocks both
+`github_push_repo` and `ct322__github_push_repo`. Deny always wins over an
+overlapping `allow`, including `allow: ["*"]` — unchanged from LHEG-07.
+
+**Visibility == enforcement, by construction.** `tools/list` filters the
+merged catalog down to exactly the tools the resolved `Principal` may call
+(`GatewayFramework::filter_catalog_for_principal`, driven by
+`AllowlistPolicy::filter_tools`) and `tools/call` gates on the same namespaced
+name via the same `AllowlistPolicy::is_allowed` decision — a tool is never
+advertised to a caller who couldn't then call it, and never callable without
+first being visible. An unmapped `Principal` (no entry in
+`TERMINUS_GATEWAY_ALLOWLIST_JSON` at all, and not one of the
+`SCAFFOLDED_IDENTITIES`) sees an EMPTY catalog and has every call denied —
+default-deny, exactly like the pre-MESH-08 single-namespace allowlist. A
+grant that references a namespace with no live/registered upstream is inert
+(matches nothing, no error) — an operator can pre-author a grant for an
+upstream that isn't deployed yet.
+
+Example — grant `ct322-viewer` every `ct322` tool except its sensitive
+`vitals_*` ones, and nothing else at all:
+
+```json
+{"ct322-viewer": {"allow": ["ct322__*"], "deny": ["ct322__vitals_"]}}
 ### Onboarding a new upstream (`mesh_onboard_upstream`)
 
 Adding an entry to `TERMINUS_MESH_UPSTREAMS_JSON` by hand risks a typo'd
