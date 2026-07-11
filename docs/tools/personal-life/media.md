@@ -418,8 +418,8 @@ base URL. **The endpoint/wire shape is not verified against a live service** and
 when a real taste store is wired.
 
 **Never a hard dependency.** Flag on but `MEDIA_TASTE_API_URL` unset, or the facade unreachable/erroring
-→ recommendations **degrade to the stateless MEDIA-05 result** with a `taste_degraded` note; they still
-return `Ok`. Write-back failures are logged, not surfaced as errors. No PII is written into stored signals.
+→ recommendations **degrade to the stateless MEDIA-05 result**, stamped `structured.taste_memory: { applied: false, note: "…" }`;
+they still return `Ok`. Write-back failures are logged, not surfaced as errors. No PII is written into stored signals.
 
 ### media_taste_feedback (MEDIA-06, flag-gated) — write-back
 Registered only when the flag is on. Records engagement signals (requested/watched/dismissed) to the

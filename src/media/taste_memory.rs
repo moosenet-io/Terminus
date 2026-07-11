@@ -318,12 +318,12 @@ impl RustTool for MediaTasteFeedback {
             "type": "object",
             "properties": {
                 "title": { "type": "string", "description": "Title of the movie/show the signal is about." },
-                "media_type": { "type": "string", "enum": ["movie", "tv"], "description": "Movie or TV series." },
+                "media_type": { "type": "string", "enum": ["movie", "tv"], "description": "Movie or TV series. Optional, defaults to \"movie\"." },
                 "signal": { "type": "string", "enum": ["requested", "watched", "dismissed"], "description": "The engagement signal to record." },
                 "account_id": { "type": "string", "description": "Optional Plex account/user id, for multi-user servers." },
                 "note": { "type": "string", "description": "Optional free-text curation note, e.g. \"loved the slow pacing\"." }
             },
-            "required": ["title", "media_type", "signal"]
+            "required": ["title", "signal"]
         })
     }
 
@@ -610,6 +610,60 @@ mod tests {
         let parsed: Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(parsed["structured"]["taste_memory"]["applied"], false);
         assert!(parsed["structured"]["taste_memory"]["note"].as_str().unwrap().to_lowercase().contains("unreachable"));
+    }
+
+    // Cold start: facade returns an empty signal set. Taste memory is active
+    // (applied=true) but no signal moves the ranking -- behaves ~stateless and
+    // starts learning. Regression guard for the empty-payload path.
+    #[test]
+    fn cold_start_empty_signals_applies_without_changing_ranking() {
+        let base = json!({
+            "summary": "You might like \"Dune\".",
+            "structured": { "recommendations": [
+                { "title": "Dune", "media_type": "movie", "score": 1.0, "matched_genres": ["Science Fiction"], "rationale": "because you watched Arrival" }
+            ] }
+        });
+        let before_score = base["structured"]["recommendations"][0]["score"].clone();
+        let enriched = apply_taste_signals(base, &json!({}));
+        assert_eq!(enriched["structured"]["taste_memory"]["applied"], true, "module active even on cold start");
+        assert_eq!(enriched["structured"]["recommendations"][0]["score"], before_score, "no signal must not move the ranking");
+        assert_eq!(enriched["structured"]["recommendations"][0]["title"], "Dune");
+    }
+
+    // Conflicting signals: the same genre both liked AND disliked must resolve
+    // to liked (the disliked set excludes anything also liked), i.e. recency/
+    // like wins -- never a hard flip to the pure-dislike penalty.
+    #[test]
+    fn conflicting_like_and_dislike_same_genre_favors_like_not_hard_flip() {
+        let base = json!({
+            "summary": "s",
+            "structured": { "recommendations": [
+                { "title": "Dune", "media_type": "movie", "score": 1.0, "matched_genres": ["Science Fiction"], "rationale": "r" }
+            ] }
+        });
+        let signals = json!({ "liked_genres": ["Science Fiction"], "disliked_genres": ["Science Fiction"] });
+        let enriched = apply_taste_signals(base, &signals);
+        let score = enriched["structured"]["recommendations"][0]["score"].as_f64().unwrap();
+        assert!(score > 1.0, "a genre both liked and disliked must resolve to liked (boosted), got {score}");
+    }
+
+    // Flag ON but the facade returns an unparseable body → degrade to the
+    // stateless result, never fail the tool.
+    #[tokio::test]
+    async fn decorator_facade_invalid_json_degrades_to_stateless() {
+        let taste_server = MockServer::start();
+        taste_server.mock(|when, then| {
+            when.method(GET).path("/media/taste/signals");
+            then.status(200).body("not valid json");
+        });
+        let decorator = TasteAwareMediaRecommend {
+            inner: MediaRecommend::from_env(),
+            client: Some(TasteMemoryClient::new(taste_server.base_url(), reqwest::Client::new())),
+        };
+        let result = decorator.execute(json!({})).await;
+        assert!(result.is_ok(), "an unparseable facade response must degrade, never fail the tool");
+        let parsed: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(parsed["structured"]["taste_memory"]["applied"], false);
     }
 
     // ── write-back ───────────────────────────────────────────────────────────
