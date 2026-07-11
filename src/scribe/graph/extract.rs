@@ -405,13 +405,23 @@ pub fn build_graph(
                 continue;
             }
             let simple = last_segment(target);
-            let via_import = id_path
-                .get(src_id)
-                .and_then(|file| file_imports.get(file))
-                .and_then(|m| m.get(simple))
-                .filter(|to| to.as_str() != src_id)
-                .cloned();
-            let resolved = via_import.or_else(|| resolve_target(target, src_id, &by_name, &id_path));
+            let resolved = if target.contains("::") {
+                // Qualified call (`Foo::new`): the qualifier disambiguates —
+                // let the qualified-preference resolver bind it.
+                resolve_target(target, src_id, &by_name, &id_path)
+            } else {
+                // Unqualified: a LOCAL (same-file) definition SHADOWS an import,
+                // which shadows a global unique match (Python/JS/Rust scoping).
+                let via_import = id_path
+                    .get(src_id)
+                    .and_then(|file| file_imports.get(file))
+                    .and_then(|m| m.get(simple))
+                    .filter(|to| to.as_str() != src_id)
+                    .cloned();
+                resolve_same_file(simple, src_id, &by_name, &id_path)
+                    .or(via_import)
+                    .or_else(|| resolve_target(target, src_id, &by_name, &id_path))
+            };
             if let Some(to) = resolved {
                 let _ = graph.insert_edge(KgEdge::new(src_id, &to, *kind, Confidence::Extracted));
             }
@@ -827,6 +837,27 @@ fn generic_extract_file(path: &str, source: &str, lang: Lang) -> FileExtract {
     ctx.out
 }
 
+/// A unique same-file definition named `simple` (excluding `src_id`), or
+/// `None`. Used to give a LOCAL definition priority over an import (shadowing).
+fn resolve_same_file(
+    simple: &str,
+    src_id: &str,
+    by_name: &HashMap<String, Vec<String>>,
+    id_path: &HashMap<String, String>,
+) -> Option<String> {
+    let ids = by_name.get(simple)?;
+    let src_path = id_path.get(src_id);
+    let same: Vec<&String> = ids
+        .iter()
+        .filter(|id| id.as_str() != src_id && id_path.get(id.as_str()) == src_path)
+        .collect();
+    if same.len() == 1 {
+        Some(same[0].clone())
+    } else {
+        None
+    }
+}
+
 /// Resolve a candidate `target` (a bare name, or a one-level-qualified
 /// `Qual::name`) to exactly one node id, or `None` (drop). Precedence:
 /// 1. If qualified, a *unique* node whose id ends with `::Qual::name`;
@@ -1145,6 +1176,25 @@ pub fn outer() -> u8 {
             g.edges().any(|e| e.kind == EdgeKind::Imports && e.from == "pkg::c" && e.to == "pkg::a::helper"),
             "qualified import edge present"
         );
+    }
+
+    #[test]
+    fn local_definition_shadows_import() {
+        // c defines its OWN helper AND imports a's; the call must bind to the
+        // LOCAL helper (shadowing), not the import (review P1).
+        let files = vec![
+            ("pkg/a.py".to_string(), "def helper():\n    return 1\n".to_string()),
+            (
+                "pkg/c.py".to_string(),
+                "from a import helper\n\ndef helper():\n    return 9\n\ndef use():\n    return helper()\n".to_string(),
+            ),
+        ];
+        let g = build_graph("P", &files).unwrap();
+        let call = g
+            .edges()
+            .find(|e| e.kind == EdgeKind::Calls && e.from == "pkg::c::use")
+            .expect("call resolved");
+        assert_eq!(call.to, "pkg::c::helper", "local def shadows the import");
     }
 
     #[test]
