@@ -17,6 +17,8 @@
 
 pub mod extract;
 pub mod model;
+pub mod store;
 
 pub use extract::build_rust_graph;
 pub use model::{Confidence, EdgeKind, KgEdge, KgNode, KnowledgeGraph, NodeKind};
+pub use store::GraphStore;
