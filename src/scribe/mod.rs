@@ -211,7 +211,7 @@ const DOCS_PROVIDER_CHAIN: &[&str] = &["agy", "codex", "opus"];
 /// `ReviewConfig { daemon_url: mock.base_url(), .. }` without ever mutating
 /// process-wide environment variables (which would race against other tests
 /// running concurrently in the same test binary).
-async fn dispatch_docs_generation(
+pub(crate) async fn dispatch_docs_generation(
     cfg: &crate::review::ReviewConfig,
     prompt: &str,
 ) -> Result<String, ToolError> {

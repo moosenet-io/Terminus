@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::store::GraphStore;
-use super::{build_rust_graph, cluster, layout, pagerank, render};
+use super::{build_rust_graph, cluster, layout, pagerank, render, semantic};
 use crate::error::ToolError;
 use crate::registry::ToolRegistry;
 use crate::scribe::vault::slugify;
@@ -211,6 +211,25 @@ only those files."
             capped = was_capped;
             build_rust_graph(&project_id, &files)?
         };
+
+        // KGRAPH-04: optional semantic-edge pass (opt-in; best-effort). Runs
+        // BEFORE clustering so INFERRED edges can influence communities. Gated
+        // on SCRIBE_KG_SEMANTIC + a configured review daemon; a model failure
+        // keeps the EXTRACTED graph unchanged.
+        let semantic_on = std::env::var("SCRIBE_KG_SEMANTIC")
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        if semantic_on {
+            let review_cfg = crate::review::ReviewConfig::from_env();
+            if review_cfg.daemon_token.is_some() {
+                let prompt = semantic::build_prompt(&graph);
+                if let Ok(reply) = crate::scribe::dispatch_docs_generation(&review_cfg, &prompt).await {
+                    if semantic::insert_semantic_edges(&mut graph, &reply) > 0 {
+                        graph.recompute_degrees();
+                    }
+                }
+            }
+        }
 
         // Enrich + render on the full merged graph.
         cluster(&mut graph);

@@ -23,6 +23,7 @@ pub mod layout;
 pub mod model;
 pub mod rank;
 pub mod render;
+pub mod semantic;
 pub mod store;
 pub mod tools;
 
