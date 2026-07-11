@@ -840,7 +840,11 @@ mod tests {
     fn registers_all_five_stub_tools() {
         let mut reg = ToolRegistry::new();
         register(&mut reg);
-        assert_eq!(reg.len(), EXPECTED_TOOL_NAMES.len());
+        // >= not ==: register() also co-registers KGRAPH-06's kg_* graph tools
+        // on the same core path (see the graph::tools::register call in
+        // register()), so the registry is a SUPERSET of the 5 scribe stubs.
+        // The presence loop below is the real assertion.
+        assert!(reg.len() >= EXPECTED_TOOL_NAMES.len());
         for name in EXPECTED_TOOL_NAMES {
             assert!(reg.contains(name), "missing tool: {name}");
         }
@@ -869,13 +873,20 @@ mod tests {
         crate::plane::register(&mut reg);
         crate::gitea::register(&mut reg);
         crate::github::register(&mut reg);
-        let before = reg.len();
+        let before: Vec<String> = reg.list().into_iter().map(|i| i.name.to_string()).collect();
         register(&mut reg);
-        assert_eq!(
-            reg.len(),
-            before + EXPECTED_TOOL_NAMES.len(),
-            "scribe tool name collided with an existing core tool"
-        );
+        // Each scribe stub must be present AND must not collide with a
+        // pre-existing core tool name. register() also co-registers KGRAPH-06's
+        // kg_* graph tools, so an exact `before + 5` count delta is no longer
+        // meaningful -- assert the scribe names' presence + non-collision
+        // directly, which is what this test actually guards.
+        for name in EXPECTED_TOOL_NAMES {
+            assert!(reg.contains(name), "scribe tool missing after register: {name}");
+            assert!(
+                !before.iter().any(|n| n.as_str() == *name),
+                "scribe tool name collided with an existing core tool: {name}"
+            );
+        }
     }
 
     #[tokio::test]
