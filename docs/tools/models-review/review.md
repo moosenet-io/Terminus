@@ -69,6 +69,8 @@ distinct models, adding panel diversity at $0).
 | `FREE_POOL_COOLDOWN_SECS` | per-model cooldown after a 429 | `600` |
 | `FREE_POOL_TTL_SECS` | daily catalog refresh interval | `86400` |
 | `FREE_POOL_FAMILIES` | comma-separated id-substring allowlist override | built-in list |
+| `FREE_POOL_MODELS_URL` | OpenRouter model-catalog URL to scan | `https://openrouter.ai/api/v1/models` |
+| `OPENROUTER_CHAT_URL` | OpenRouter chat-completions endpoint (also used by `nemotron`/`qwen_coder`) | `https://openrouter.ai/api/v1/chat/completions` |
 
 `ReviewConfig::from_env()` (`src/review/dispatch.rs:47-63`) trims and
 strips a trailing slash from the daemon URL.

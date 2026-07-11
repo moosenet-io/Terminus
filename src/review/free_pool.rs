@@ -29,8 +29,19 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-/// Public, unauthenticated OpenRouter model catalog.
-pub const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
+/// Default public, unauthenticated OpenRouter model catalog. Overridable via
+/// `FREE_POOL_MODELS_URL` (see [`models_url`]) rather than being hardcoded at
+/// the call site.
+pub const DEFAULT_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
+
+/// The catalog URL to scan: `FREE_POOL_MODELS_URL` if set, else the default.
+pub fn models_url() -> String {
+    std::env::var("FREE_POOL_MODELS_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_MODELS_URL.to_string())
+}
 
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(default)
@@ -207,11 +218,21 @@ impl FreePool {
     }
 }
 
-/// Process-global pool. `tokio::sync::Mutex` (not `std`) because refresh awaits
-/// a network fetch while a caller may hold it.
+/// Process-global pool. `tokio::sync::Mutex` (not `std`) because callers hold it
+/// only briefly (pick a model / mark a cooldown); the network fetch happens
+/// outside this lock.
 pub fn global_pool() -> &'static tokio::sync::Mutex<FreePool> {
     static POOL: OnceLock<tokio::sync::Mutex<FreePool>> = OnceLock::new();
     POOL.get_or_init(|| tokio::sync::Mutex::new(FreePool::default()))
+}
+
+/// Serializes catalog refreshes so N concurrent stale callers don't each fetch
+/// the catalog (a stampede) and race to overwrite the pool. A refresher takes
+/// this, re-checks staleness, and only then fetches + applies; the others wait,
+/// then see a fresh pool and skip. Held only across a refresh, never a dispatch.
+pub fn refresh_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 #[cfg(test)]
@@ -302,6 +323,28 @@ mod tests {
     fn is_stale_true_when_never_refreshed() {
         let p = FreePool::default();
         assert!(p.is_stale(Instant::now()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn models_url_honors_override_else_default() {
+        std::env::remove_var("FREE_POOL_MODELS_URL");
+        assert_eq!(models_url(), DEFAULT_MODELS_URL);
+        std::env::set_var("FREE_POOL_MODELS_URL", "http://catalog.internal/models"); // pii-test-fixture
+        assert_eq!(models_url(), "http://catalog.internal/models");
+        std::env::remove_var("FREE_POOL_MODELS_URL");
+    }
+
+    #[test]
+    fn empty_and_all_cooling_are_distinguishable_at_the_pool() {
+        let now = Instant::now();
+        let empty = FreePool::default();
+        assert!(empty.is_empty());
+        let mut cooling = FreePool::default();
+        cooling.set_models(vec!["a".into()], now);
+        cooling.mark_rate_limited("a", now);
+        assert!(!cooling.is_empty()); // NOT empty ...
+        assert_eq!(cooling.next_available(now), None); // ... but nothing available
     }
 
     #[test]
