@@ -56,7 +56,7 @@ Chord-integration deep-dives.
 
 | | |
 | --- | --- |
-| **Tools** | ~53, one per integrated service (GitHub, Plane, Prometheus, …). Each tool exposes a set of **actions** that vary with the backing service and change over time — ~300 individual MCP callables in total across all tools. |
+| **Tools** | ~53, one per integrated service (GitHub, Plane, Prometheus, …). Each tool exposes a set of **actions** that vary with the backing service and change over time — ~302 individual MCP callables in total across all tools. |
 | **Transport** | stdio (local/SSH) and HTTP, with an mTLS listener for federated/remote clients |
 | **Auth** | per-identity mTLS client certificates (`crate::pki`); named-identity tokens (`GITEA_PAT_<NAME>`, `PLANE_PAT_<NAME>`) for outbound git-forge/tracker calls |
 | **Governance** | path-jailed filesystem access, vault-only secrets (never a raw `env::var` for a credential), a mandatory Rust PII gate on every public-forge write, sanitized audit logging |
@@ -227,6 +227,47 @@ Example — grant `ct322-viewer` every `ct322` tool except its sensitive
 
 ```json
 {"ct322-viewer": {"allow": ["ct322__*"], "deny": ["ct322__vitals_"]}}
+### Onboarding a new upstream (`mesh_onboard_upstream`)
+
+Adding an entry to `TERMINUS_MESH_UPSTREAMS_JSON` by hand risks a typo'd
+namespace collision or an unreachable/misconfigured candidate you only
+discover after restarting. The CORE tool `mesh_onboard_upstream`
+(`crate::mesh::onboarding`) is a **read-only dry-run** workflow to try a
+candidate first:
+
+1. Probes the candidate (`initialize` + `tools/list`, plus a best-effort
+   `GET /healthz`) via a real `UpstreamClient` built for it.
+2. Checks the proposed `name`/`namespace` against the currently-configured
+   mesh registry (loaded from `TERMINUS_MESH_UPSTREAMS_JSON`) — a taken
+   namespace is rejected with up to three free alternative suggestions.
+3. Confirms trust readiness: for `mtls`, that this node's embedded CA
+   (`crate::pki::ca`) bootstraps and can mint the client identity the
+   candidate will trust (mesh peers share one embedded-CA trust domain, so
+   there is no separate remote "enroll" call to drive here); for `bearer`,
+   that the named `secret_key` resolves from the process environment. A
+   missing/unresolvable credential blocks onboarding with a clear message —
+   the secret's **value** is never read into, or printed by, this tool.
+4. Previews the namespaced catalog delta (`<namespace>__<tool>` for every
+   discovered tool) the merge step would add.
+5. On success, **emits** the validated JSON entry for the operator to append
+   to `TERMINUS_MESH_UPSTREAMS_JSON` themselves and reload/restart — the tool
+   never writes that file, or any other live config, itself.
+
+A candidate reachable but exporting zero tools is still allowed to onboard
+(with a warning); an unreachable candidate fails cleanly with nothing
+written.
+
+```json
+{
+  "name": "mesh_onboard_upstream",
+  "arguments": {
+    "name": "fleet-c",
+    "url": "https://fleet-c.example.internal:8443",
+    "transport": "bearer",
+    "namespace": "fleetc",
+    "secret_key": "TERMINUS_MESH_FLEETC_TOKEN"
+  }
+}
 ```
 
 ## Quickstart

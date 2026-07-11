@@ -310,6 +310,21 @@ impl KnowledgeGraph {
         self.edges.values()
     }
 
+    /// Directly set a node's PageRank score (KGRAPH-13). Unlike re-inserting a
+    /// clone through `insert_node` — which keeps the existing rank when the
+    /// incoming rank is exactly `0.0` — this always stores the given value, so
+    /// an analysis pass can write any score (incl. `0.0`) without the merge
+    /// heuristic clobbering it. Returns `false` if the id is unknown.
+    pub fn set_rank(&mut self, id: &str, rank: f32) -> bool {
+        match self.nodes.get_mut(id) {
+            Some(n) => {
+                n.rank = rank;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn get_node(&self, id: &str) -> Option<&KgNode> {
         self.nodes.get(id)
     }
@@ -437,6 +452,16 @@ mod tests {
         let json = g.to_json_pretty().unwrap();
         let back = KnowledgeGraph::from_json(&json).unwrap();
         assert!(back.is_empty());
+    }
+
+    #[test]
+    fn set_rank_stores_value_verbatim_including_zero() {
+        let mut g = g();
+        assert!(g.set_rank("crate::a::foo", 0.0), "known id");
+        assert_eq!(g.get_node("crate::a::foo").unwrap().rank, 0.0);
+        assert!(g.set_rank("crate::a::foo", 0.42));
+        assert_eq!(g.get_node("crate::a::foo").unwrap().rank, 0.42);
+        assert!(!g.set_rank("crate::z::missing", 1.0), "unknown id -> false");
     }
 
     #[test]

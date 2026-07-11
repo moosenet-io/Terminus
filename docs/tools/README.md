@@ -9,7 +9,7 @@ registry serves which tool). Each tool exposes a set of **actions** — the
 individually-named MCP callables an MCP client sees in `tools/list` (e.g. the
 GitHub tool's `github_create_repo`, `github_list_repos`, …). Those actions vary
 with the backing service and change over time, so counts here are approximate;
-across all tools there are ~300 individual MCP actions in total. This page
+across all tools there are ~302 individual MCP actions in total. This page
 groups every tool into one of five domains plus the **MINT** flagship harness,
 with a one-line description sourced from that tool's own top-of-file doc comment
 or registration site — never guessed. Each tool links to its
@@ -172,7 +172,7 @@ the bulk of the `terminus_personal` registry.
 | `vitals` | ~11 | Health tracking (weight, sleep, and other logs; summary/recent/today; program creation) via a REST API backend. | [`personal-life/vitals.md`](personal-life/vitals.md) |
 | `hearth` | ~7 | Pantry/meal-planning tools via Grocy — what-can-I-make, pantry list, meal plan. | [`personal-life/hearth.md`](personal-life/hearth.md) |
 | `<media-service>` | ~8 | Read-only media request queries against <media-service> (Plex/Jellyfin request management). | [`personal-life/<media-service>.md`](personal-life/<media-service>.md) |
-| `media` | 1 | **Scaffold (MEDIA-01, S94).** Sovereign media-stack orchestration domain (Radarr/Sonarr/Prowlarr/qtor/Plex/<media-service>/TMDb) — vault(env)-backed service clients + one config-status tool. No user-facing search/request/recommend tools yet; those land in MEDIA-02..07. | [`personal-life/media.md`](personal-life/media.md) |
+| `media` | 3 | **S94.** Sovereign media-stack orchestration domain (Radarr/Sonarr/Prowlarr/qtor/Plex/<media-service>/TMDb) — vault(env)-backed service clients, a config-status tool, and (MEDIA-02) the read/search surface: fuzzy title resolution (`media_search`) and cross-service presence/quality status (`media_status`). Request/organize/recommend tools land in MEDIA-03..07. | [`personal-life/media.md`](personal-life/media.md) |
 | `commute` | ~8 | Traffic-aware routing (TomTom) and Bay Area public-transit planning (511.org). | [`personal-life/commute.md`](personal-life/commute.md) |
 | `weather` | 1 | Current conditions and forecasts via OpenWeatherMap. | [`personal-life/weather.md`](personal-life/weather.md) |
 | `news` | ~3 | Headlines, search, and topic feeds. | [`personal-life/news.md`](personal-life/news.md) |

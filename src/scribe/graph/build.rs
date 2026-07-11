@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::store::GraphStore;
-use super::{build_rust_graph, cluster, layout, render};
+use super::{build_rust_graph, cluster, layout, pagerank, render};
 use crate::error::ToolError;
 use crate::registry::ToolRegistry;
 use crate::scribe::vault::slugify;
@@ -214,6 +214,7 @@ only those files."
 
         // Enrich + render on the full merged graph.
         cluster(&mut graph);
+        pagerank(&mut graph); // KGRAPH-13: node importance for ranking/hotspots
         graph.generated_at = now_rfc3339_secs();
         let lay = layout(&graph);
         let svg = render::to_svg(&graph, &lay);
