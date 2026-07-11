@@ -260,6 +260,39 @@ pub struct PrincipalMap {
     tailnet_tag: HashMap<String, String>,
 }
 
+impl PrincipalMap {
+    /// The canonical name currently mapped from cert CN `cn`, if any.
+    /// Read-only lookup — used by [`crate::mesh::client_onboarding`] (MESH-12)
+    /// to detect a CN collision before minting a new client cert, without
+    /// exposing the underlying map for mutation.
+    pub fn cert_cn_owner(&self, cn: &str) -> Option<&str> {
+        self.cert_cn.get(cn).map(String::as_str)
+    }
+
+    /// The canonical name currently mapped from tailnet login `login`, if
+    /// any. See [`Self::cert_cn_owner`]'s doc.
+    pub fn tailnet_login_owner(&self, login: &str) -> Option<&str> {
+        self.tailnet_login.get(login).map(String::as_str)
+    }
+
+    /// The canonical name currently mapped from tailnet tag `tag`, if any.
+    /// See [`Self::cert_cn_owner`]'s doc.
+    pub fn tailnet_tag_owner(&self, tag: &str) -> Option<&str> {
+        self.tailnet_tag.get(tag).map(String::as_str)
+    }
+
+    /// Whether `name` is already the canonical target of ANY entry in this
+    /// map (cert CN, tailnet login, or tailnet tag) — used by
+    /// [`crate::mesh::client_onboarding::onboard_client`] to reject a
+    /// requested identity name that collides with an already-onboarded
+    /// principal (MESH-12 edge case).
+    pub fn name_in_use(&self, name: &str) -> bool {
+        self.cert_cn.values().any(|v| v == name)
+            || self.tailnet_login.values().any(|v| v == name)
+            || self.tailnet_tag.values().any(|v| v == name)
+    }
+}
+
 /// Resolves inbound transport identities (mTLS cert CN, tailnet WhoIs) to a
 /// single canonical [`Principal`] via a config-driven [`PrincipalMap`]. See
 /// this module's doc for the full precedence rule and config surface.
@@ -273,6 +306,14 @@ impl PrincipalResolver {
     /// for callers that already have the data in hand.
     pub fn new(map: PrincipalMap) -> Self {
         Self { map }
+    }
+
+    /// Borrow the underlying [`PrincipalMap`] — read-only lookups for
+    /// callers (e.g. [`crate::mesh::client_onboarding`], MESH-12) that need
+    /// to check for collisions before proposing a new mapping entry, without
+    /// duplicating `TERMINUS_MESH_PRINCIPAL_MAP_JSON` parsing themselves.
+    pub fn map(&self) -> &PrincipalMap {
+        &self.map
     }
 
     /// Build a resolver from `TERMINUS_MESH_PRINCIPAL_MAP_JSON`. An

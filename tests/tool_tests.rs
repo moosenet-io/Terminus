@@ -66,7 +66,8 @@ fn test_hearth_tools_registered() {
     );
 }
 
-/// S94/MEDIA-01/MEDIA-02: the media domain scaffold + read/search surface.
+/// S94/MEDIA-01/MEDIA-02/MEDIA-03: the media domain scaffold, read/search
+/// surface, and tiered request/download tool.
 #[test]
 fn test_media_tools_registered() {
     let reg = full_registry();
@@ -81,6 +82,10 @@ fn test_media_tools_registered() {
     assert!(
         reg.contains("media_status"),
         "media_status must be registered"
+    );
+    assert!(
+        reg.contains("media_request"),
+        "media_request must be registered"
     );
 }
 

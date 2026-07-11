@@ -694,6 +694,20 @@ pub fn gateway_allowlist_json() -> String {
     env_nonempty("TERMINUS_GATEWAY_ALLOWLIST_JSON").unwrap_or_else(|| "{}".to_string())
 }
 
+/// The gateway's tailnet MagicDNS name (or any other operator-chosen
+/// reachable hostname), for display in a [`crate::mesh::client_onboarding`]
+/// (MESH-12) connection profile ONLY — never used to make a connection from
+/// this process itself. From `TERMINUS_MESH_GATEWAY_MAGICDNS_NAME`; `None`
+/// when unset, since this crate has no legitimate infra literal to default
+/// to (a real tailnet hostname is deployment-specific and must be
+/// operator-provisioned, never guessed or hardcoded — see the "no hardcoded
+/// infrastructure values" acceptance criterion). A `None` here means the
+/// emitted client profile carries an explicit placeholder + warning instead
+/// of a made-up hostname.
+pub fn gateway_magicdns_name() -> Option<String> {
+    env_nonempty("TERMINUS_MESH_GATEWAY_MAGICDNS_NAME")
+}
+
 /// Token-bucket burst capacity for the interim in-process rate limiter, per
 /// `(identity, action)` key. From `TERMINUS_GATEWAY_RATE_LIMIT_BURST`;
 /// defaults to 20 — generous enough for a legitimate multi-tool-call

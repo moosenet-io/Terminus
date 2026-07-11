@@ -56,7 +56,7 @@ Chord-integration deep-dives.
 
 | | |
 | --- | --- |
-| **Tools** | ~53, one per integrated service (GitHub, Plane, Prometheus, …). Each tool exposes a set of **actions** that vary with the backing service and change over time — ~302 individual MCP callables in total across all tools. |
+| **Tools** | ~53, one per integrated service (GitHub, Plane, Prometheus, …). Each tool exposes a set of **actions** that vary with the backing service and change over time — ~303 individual MCP callables in total across all tools. |
 | **Transport** | stdio (local/SSH) and HTTP, with an mTLS listener for federated/remote clients |
 | **Auth** | per-identity mTLS client certificates (`crate::pki`); named-identity tokens (`GITEA_PAT_<NAME>`, `PLANE_PAT_<NAME>`) for outbound git-forge/tracker calls |
 | **Governance** | path-jailed filesystem access, vault-only secrets (never a raw `env::var` for a credential), a mandatory Rust PII gate on every public-forge write, sanitized audit logging |
@@ -266,6 +266,65 @@ written.
     "transport": "bearer",
     "namespace": "fleetc",
     "secret_key": "TERMINUS_MESH_FLEETC_TOKEN"
+  }
+}
+```
+
+### Onboarding a new remote client (`mesh_onboard_client`)
+
+`mesh_onboard_upstream` (above) brings a new *server* into the mesh; this is
+the companion tool for the other direction — bringing a new *client* (an
+outside machine running `terminus-client-daemon`, see
+[`docs/deploy/client.md`](docs/deploy/client.md)) onto it. The CORE tool
+`mesh_onboard_client` (`crate::mesh::client_onboarding`):
+
+1. Establishes the client's identity, one of two ways:
+   - `"mtls_cert"` — mints a fresh short-lived leaf certificate via this
+     node's embedded CA (`crate::pki::ca`, reusing the same issuance code
+     TCLI-02's `/enroll` HTTP route uses), CN == the requested canonical
+     name.
+   - `"tailnet"` — records a tailnet login (+ optional ACL tags) → canonical
+     name mapping only; no cert is issued. The mapping is valid even if the
+     login has never yet been seen by tailnet WhoIs — it's enforced the
+     first time that login actually connects.
+2. Rejects a requested name that's already mapped to an existing principal
+   in `TERMINUS_MESH_PRINCIPAL_MAP_JSON` (cert CN, tailnet login, or
+   tailnet tag) — an onboarding attempt never silently re-targets an
+   existing identity.
+3. Seeds a **least-privilege** allowlist grant for the new name — a small,
+   explicit read-only tool list (never a `"*"` wildcard, and never the
+   broader allow-minus-deny shape reserved for the `lumina`/`harmony`
+   scaffold). A default-allow seed is a hard review failure for this tool.
+4. Emits a ready-to-use client connection profile (gateway MagicDNS name
+   from `TERMINUS_MESH_GATEWAY_MAGICDNS_NAME` if configured, transport,
+   identity) — never a CA private key, only the client's own freshly-minted
+   key (mTLS mechanism) which the client legitimately must hold locally.
+5. On success, **emits** the validated JSON snippets for the operator to
+   merge into `TERMINUS_MESH_PRINCIPAL_MAP_JSON` and
+   `TERMINUS_GATEWAY_ALLOWLIST_JSON` themselves and reload/restart — same as
+   `mesh_onboard_upstream`, this tool never writes those files, or any other
+   live config, itself. (The mTLS mechanism's cert/key ARE already
+   live-issued by the embedded CA at call time — only the mesh-side mapping
+   and grant config remain to be applied.)
+
+```json
+{
+  "name": "mesh_onboard_client",
+  "arguments": {
+    "name": "dev-box-claude-code",
+    "mechanism": "mtls_cert"
+  }
+}
+```
+
+```json
+{
+  "name": "mesh_onboard_client",
+  "arguments": {
+    "name": "moose-laptop",
+    "mechanism": "tailnet",
+    "tailnet_login": "<email>",
+    "tailnet_tags": ["tag:remote-client"]
   }
 }
 ```
