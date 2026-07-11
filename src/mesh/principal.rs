@@ -332,6 +332,24 @@ impl PrincipalResolver {
         }
     }
 
+    /// `true` when at least one of the three `TERMINUS_MESH_PRINCIPAL_MAP_JSON`
+    /// lookup tables (`cert_cn`/`tailnet_login`/`tailnet_tag`) has at least
+    /// one entry — i.e. an operator has actually configured a mapping.
+    /// MESH-07's live-request wiring (`crate::mcp_server::handle_mcp`) uses
+    /// this to decide precedence: a configured map means strict
+    /// resolve-or-fail-closed (`resolve()`); an entirely unconfigured
+    /// resolver (the default for every deployment that predates MESH-07, and
+    /// for `terminus_personal`, which never sets
+    /// `TERMINUS_MESH_PRINCIPAL_MAP_JSON`) means the legacy
+    /// `Principal::from(&ClientIdentity)` passthrough is used instead, so a
+    /// single-identity deployment with no map authored keeps working exactly
+    /// as it did before MESH-07 rather than being mass-denied. See this
+    /// module's doc and `crate::mcp_server`'s module doc for the full
+    /// precedence rule.
+    pub fn is_configured(&self) -> bool {
+        !self.map.cert_cn.is_empty() || !self.map.tailnet_login.is_empty() || !self.map.tailnet_tag.is_empty()
+    }
+
     /// Resolve one request's transport identity/identities to a single
     /// canonical [`Principal`]. See this module's doc for the full,
     /// fail-closed precedence rule: cert (if present) decides exclusively;
@@ -509,6 +527,21 @@ mod tests {
         let resolver = resolver_with(&[("cn", "name")], &[("login", "name")], &[]);
         let err = resolver.resolve(None, None).expect_err("no identity at all must be denied");
         assert!(matches!(err, AuthError::NoIdentityPresented));
+    }
+
+    // ── is_configured (MESH-07 legacy-passthrough precedence signal) ──────
+
+    #[test]
+    fn is_configured_false_for_default_empty_resolver() {
+        let resolver = PrincipalResolver::default();
+        assert!(!resolver.is_configured());
+    }
+
+    #[test]
+    fn is_configured_true_when_any_table_has_an_entry() {
+        assert!(resolver_with(&[("cn", "name")], &[], &[]).is_configured());
+        assert!(resolver_with(&[], &[("login", "name")], &[]).is_configured());
+        assert!(resolver_with(&[], &[], &[("tag:ci", "name")]).is_configured());
     }
 
     // ── from_env ─────────────────────────────────────────────────────────

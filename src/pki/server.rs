@@ -105,6 +105,26 @@ pub fn build_gateway_router(registry: ToolRegistry, config: &GatewayServerConfig
         // etc. use elsewhere, and preserves `tools/list`/`tools/call`
         // byte-for-byte until a binary is wired to pass one in.
         mesh_pool: None,
+        // MESH-07: build the resolver from `TERMINUS_MESH_PRINCIPAL_MAP_JSON`
+        // once at process construction. Malformed JSON is a loud, logged
+        // config error (not a startup panic -- a router-building library
+        // function is not the right place to abort a whole binary's
+        // `main()`) that degrades to an unconfigured (default) resolver, so
+        // `crate::mcp_server::resolve_principal`'s legacy-passthrough path
+        // still applies rather than mass-denying every caller over a config
+        // typo -- see `crate::mesh::principal`'s module doc for why
+        // `PrincipalResolver::from_env` itself returns a hard `Err` on
+        // malformed JSON (a config typo should be loud), and
+        // `AllowlistPolicy::from_env`'s doc for the precedent this mirrors
+        // (a startup config error degrades to a safe default policy, not a
+        // crashed process).
+        principal_resolver: crate::mesh::PrincipalResolver::from_env().unwrap_or_else(|e| {
+            tracing::error!(
+                "mesh: TERMINUS_MESH_PRINCIPAL_MAP_JSON is invalid ({e}) -- falling back to an \
+                 unconfigured principal resolver (legacy cert-CN-as-name passthrough) until fixed"
+            );
+            crate::mesh::PrincipalResolver::default()
+        }),
     });
 
     build_router(state).merge(build_enroll_router())
