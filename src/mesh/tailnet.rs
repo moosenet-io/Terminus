@@ -120,7 +120,7 @@
 //!   state/keys under (mirrors Go `tsnet.Server.Dir`). Required when the
 //!   flag is on; created if missing, and probed for write access — see
 //!   [`TsnetConfigError::StateDirUnwritable`].
-//! - `TERMINUS_TSNET_AUTHKEY` — the tailnet auth key (<secret-manager>-hydrated,
+//! - `TERMINUS_TSNET_AUTHKEY` — the tailnet auth key (<secret-manager>-hydrated,  // pii-test-fixture
 //!   materialized into this process's environment the same way every other
 //!   secret in this crate is — see `crate::mesh::registry`'s module doc for
 //!   the established convention). Read via plain `std::env::var`, wrapped
@@ -781,11 +781,11 @@ mod tests {
     fn parse_whois_json_decodes_a_well_formed_response() {
         let json = r#"{
             "Node": {"Name": "laptop.tailnetname.ts.net", "Tags": ["tag:ci"]},
-            "UserProfile": {"LoginName": "<email>"}
+            "UserProfile": {"LoginName": "<email>"}  // pii-test-fixture
         }"#;
         let info = parse_whois_json(json).expect("well-formed response should parse");
         assert_eq!(info.node_name, "laptop.tailnetname.ts.net");
-        assert_eq!(info.login_name, "<email>");
+        assert_eq!(info.login_name, "<email>");  // pii-test-fixture
         assert_eq!(info.tags, vec!["tag:ci".to_string()]);
     }
 
@@ -793,7 +793,7 @@ mod tests {
     fn parse_whois_json_defaults_missing_tags_to_empty() {
         let json = r#"{
             "Node": {"Name": "laptop.tailnetname.ts.net"},
-            "UserProfile": {"LoginName": "<email>"}
+            "UserProfile": {"LoginName": "<email>"}  // pii-test-fixture
         }"#;
         let info = parse_whois_json(json).expect("response without Tags should still parse");
         assert!(info.tags.is_empty());
@@ -807,7 +807,7 @@ mod tests {
 
     #[test]
     fn parse_whois_json_rejects_missing_node_name() {
-        let json = r#"{"UserProfile": {"LoginName": "<email>"}}"#;
+        let json = r#"{"UserProfile": {"LoginName": "<email>"}}"#;  // pii-test-fixture
         let err = parse_whois_json(json).expect_err("missing Node.Name must error, not panic");
         assert!(matches!(err, WhoIsError::InvalidResponse(_)));
     }

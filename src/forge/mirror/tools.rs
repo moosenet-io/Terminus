@@ -1627,7 +1627,7 @@ mod tests {
         let map_path = unique("author-map.toml");
         std::fs::write(
             &map_path,
-            "default_name = \"MoosenetBot\"\ndefault_email = \"<email>\"\n",
+            "default_name = \"MoosenetBot\"\ndefault_email = \"<email>\"\n",  // pii-test-fixture
         )
         .unwrap();
         std::env::set_var("TERMINUS_MIRROR_AUTHOR_MAP", &map_path);

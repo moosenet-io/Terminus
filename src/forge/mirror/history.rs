@@ -79,7 +79,7 @@ impl ReplayOpts {
 pub struct IdentityRule {
     #[serde(default)]
     pub match_email: Option<String>,
-    /// Bare domain, e.g. `example.com` — matches an email ending `@example.com`.
+    /// Bare domain, e.g. `example.com` — matches an email ending `@example.com`.  // pii-test-fixture
     #[serde(default)]
     pub match_email_domain: Option<String>,
     #[serde(default)]
@@ -950,20 +950,20 @@ mod tests {
         let map = IdentityMap {
             rules: vec![
                 rule(Some("<email>"), None, None, "PubMe", "<email>"), // pii-test-fixture
-                rule(None, Some("agents.example"), None, "MoosenetBot", "<email>"),
-                rule(None, None, Some("Legacy Human"), "PubMe", "<email>"),
+                rule(None, Some("agents.example"), None, "MoosenetBot", "<email>"),  // pii-test-fixture
+                rule(None, None, Some("Legacy Human"), "PubMe", "<email>"),  // pii-test-fixture
             ],
             default_name: "fallback-bot".into(),
-            default_email: "<email>".into(),
+            default_email: "<email>".into(),  // pii-test-fixture
         };
         // exact email (case-insensitive)
         assert_eq!(map.remap("Whatever", "<email>"), ("PubMe".into(), "<email>".into())); // pii-test-fixture
         // domain suffix
-        assert_eq!(map.remap("Agent", "<email>"), ("MoosenetBot".into(), "<email>".into()));
+        assert_eq!(map.remap("Agent", "<email>"), ("MoosenetBot".into(), "<email>".into()));  // pii-test-fixture
         // display name
-        assert_eq!(map.remap("Legacy Human", "<email>"), ("PubMe".into(), "<email>".into()));
+        assert_eq!(map.remap("Legacy Human", "<email>"), ("PubMe".into(), "<email>".into()));  // pii-test-fixture
         // unmatched → default (never the raw internal email)
-        assert_eq!(map.remap("Nobody", "<email>"), ("fallback-bot".into(), "<email>".into()));
+        assert_eq!(map.remap("Nobody", "<email>"), ("fallback-bot".into(), "<email>".into()));  // pii-test-fixture
     }
 
     #[test]
@@ -971,36 +971,36 @@ mod tests {
         let map = IdentityMap {
             rules: vec![rule(Some("<email>"), None, None, "PubMe", "<email>")], // pii-test-fixture
             default_name: "bot".into(),
-            default_email: "<email>".into(),
+            default_email: "<email>".into(),  // pii-test-fixture
         };
         let line = b"author Real Name <<email>> 1609556645 +0000\n"; // pii-test-fixture
         let out = rewrite_ident_line(line, &map);
         let s = String::from_utf8(out).unwrap();
-        assert_eq!(s, "author PubMe <<email>> 1609556645 +0000\n", "remapped + ts preserved: {s}");
+        assert_eq!(s, "author PubMe <<email>> 1609556645 +0000\n", "remapped + ts preserved: {s}");  // pii-test-fixture
         assert!(!s.contains("<email>"), "internal email scrubbed"); // pii-test-fixture
         // committer prefix handled too; a malformed line is passed through.
         assert_eq!(rewrite_ident_line(b"committer X <<email>> 1 +0000\n", &map), // pii-test-fixture
-                   b"committer PubMe <<email>> 1 +0000\n".to_vec());
+                   b"committer PubMe <<email>> 1 +0000\n".to_vec());  // pii-test-fixture
         assert_eq!(rewrite_ident_line(b"author malformed line\n", &map), b"author malformed line\n".to_vec());
     }
 
     #[test]
     fn replay_with_author_map_remaps_all_idents_and_preserves_dates() {
         std::env::remove_var("TERMINUS_PII_CONFIG");
-        let src = init_source(); // authored by <email>
+        let src = init_source(); // authored by <email>  // pii-test-fixture
         let wd = unique("replay-attr-wd");
         let src_dates: String = git(&src, &["log", "--all", "--format=%ad", "--date=iso-strict"]);
         let map = IdentityMap {
             rules: vec![],
             default_name: "MoosenetBot".into(),
-            default_email: "<email>".into(),
+            default_email: "<email>".into(),  // pii-test-fixture
         };
         let report = replay_full_history(&src, &wd, &ReplayOpts::with_author_map(map)).unwrap();
         assert!(report.idents_remapped >= 2, "author+committer remapped: {report:?}");
         // NO internal author email survives; all attributed to the mapped identity.
         let authors = git(&wd, &["log", "--all", "--format=%ae|%ce"]);
         assert!(!authors.contains("<email>"), "internal email gone: {authors}"); // pii-test-fixture
-        assert!(authors.contains("<email>"), "remapped: {authors}");
+        assert!(authors.contains("<email>"), "remapped: {authors}");  // pii-test-fixture
         // Dates unchanged (contribution fidelity).
         assert_eq!(git(&wd, &["log", "--all", "--format=%ad", "--date=iso-strict"]), src_dates, "dates preserved");
         let _ = std::fs::remove_dir_all(&src);

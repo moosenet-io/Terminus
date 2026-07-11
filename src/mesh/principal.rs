@@ -66,7 +66,7 @@
 //! ```json
 //! {
 //!   "cert_cn": { "harmony-primary.example.test": "harmony" },
-//!   "tailnet_login": { "<email>": "moose" },
+//!   "tailnet_login": { "<email>": "moose" },  // pii-test-fixture
 //!   "tailnet_tag": { "tag:ci": "claude" }
 //! }
 //! ```
@@ -454,8 +454,8 @@ mod tests {
 
     #[test]
     fn tailnet_login_only_maps_to_canonical_name() {
-        let resolver = resolver_with(&[], &[("<email>", "moose")], &[]);
-        let t = tailnet("<email>", &[]);
+        let resolver = resolver_with(&[], &[("<email>", "moose")], &[]);  // pii-test-fixture
+        let t = tailnet("<email>", &[]);  // pii-test-fixture
         let principal = resolver.resolve(None, Some(&t)).expect("mapped tailnet login should resolve");
         assert_eq!(principal.name(), "moose");
         assert_eq!(principal.source(), PrincipalSource::Tailnet);
@@ -466,7 +466,7 @@ mod tests {
     #[test]
     fn tailnet_tag_only_maps_to_canonical_name_when_login_unmapped() {
         let resolver = resolver_with(&[], &[], &[("tag:ci", "claude")]);
-        let t = tailnet("<email>", &["tag:ci"]);
+        let t = tailnet("<email>", &["tag:ci"]);  // pii-test-fixture
         let principal = resolver.resolve(None, Some(&t)).expect("mapped tailnet tag should resolve");
         assert_eq!(principal.name(), "claude");
         assert_eq!(principal.source(), PrincipalSource::Tailnet);
@@ -474,16 +474,16 @@ mod tests {
 
     #[test]
     fn tailnet_login_wins_over_tag_when_both_mapped() {
-        let resolver = resolver_with(&[], &[("<email>", "moose")], &[("tag:ci", "claude")]);
-        let t = tailnet("<email>", &["tag:ci"]);
+        let resolver = resolver_with(&[], &[("<email>", "moose")], &[("tag:ci", "claude")]);  // pii-test-fixture
+        let t = tailnet("<email>", &["tag:ci"]);  // pii-test-fixture
         let principal = resolver.resolve(None, Some(&t)).expect("should resolve");
         assert_eq!(principal.name(), "moose");
     }
 
     #[test]
     fn unmapped_tailnet_identity_is_denied_fail_closed() {
-        let resolver = resolver_with(&[], &[("<email>", "moose")], &[("tag:known", "claude")]);
-        let t = tailnet("<email>", &["tag:unknown"]);
+        let resolver = resolver_with(&[], &[("<email>", "moose")], &[("tag:known", "claude")]);  // pii-test-fixture
+        let t = tailnet("<email>", &["tag:unknown"]);  // pii-test-fixture
         let err = resolver.resolve(None, Some(&t)).expect_err("unmapped tailnet identity must be denied");
         assert!(matches!(err, AuthError::UnmappedIdentity(_)));
     }
@@ -494,11 +494,11 @@ mod tests {
     fn cn_wins_over_tailnet_when_both_present_and_mapped() {
         let resolver = resolver_with(
             &[("harmony-primary.example.test", "harmony")],
-            &[("<email>", "moose")],
+            &[("<email>", "moose")],  // pii-test-fixture
             &[],
         );
         let cid = cert("harmony-primary.example.test");
-        let t = tailnet("<email>", &[]);
+        let t = tailnet("<email>", &[]);  // pii-test-fixture
         let principal = resolver.resolve(Some(&cid), Some(&t)).expect("should resolve");
         assert_eq!(principal.name(), "harmony", "cert CN must win over a conflicting tailnet mapping");
         assert_eq!(principal.source(), PrincipalSource::Both);
@@ -511,9 +511,9 @@ mod tests {
     fn cn_present_but_unmapped_is_denied_even_when_tailnet_is_mapped() {
         // CN is checked EXCLUSIVELY when present -- an unmapped cert never
         // silently falls back to a mapped tailnet identity.
-        let resolver = resolver_with(&[], &[("<email>", "moose")], &[]);
+        let resolver = resolver_with(&[], &[("<email>", "moose")], &[]);  // pii-test-fixture
         let cid = cert("unmapped-cn.example.test");
-        let t = tailnet("<email>", &[]);
+        let t = tailnet("<email>", &[]);  // pii-test-fixture
         let err = resolver
             .resolve(Some(&cid), Some(&t))
             .expect_err("unmapped CN must deny even with a mapped tailnet identity present");
@@ -560,7 +560,7 @@ mod tests {
     fn from_env_parses_configured_map() {
         std::env::set_var(
             "TERMINUS_MESH_PRINCIPAL_MAP_JSON",
-            r#"{"cert_cn": {"harmony-primary.example.test": "harmony"}, "tailnet_login": {"<email>": "moose"}}"#,
+            r#"{"cert_cn": {"harmony-primary.example.test": "harmony"}, "tailnet_login": {"<email>": "moose"}}"#,  // pii-test-fixture
         );
         let resolver = PrincipalResolver::from_env().expect("valid JSON should parse");
         let cid = cert("harmony-primary.example.test");
