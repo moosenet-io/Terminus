@@ -75,7 +75,7 @@ reminders.
 
 | Tool | Actions | What it does | Page |
 | --- | --- | --- | --- |
-| `plane` | ~37 | Full Plane CE work-management surface over its REST API — issues, modules, multi-identity (`PLANE_PAT_<NAME>`) CRUD, prefix registry. The largest single tool in the hub. | [`project-planning/plane/README.md`](project-planning/plane/README.md) |
+| `plane` | ~43 | Full Plane CE work-management surface over its REST API — issues, modules, multi-identity (`PLANE_PAT_<NAME>`) CRUD, prefix registry (incl. `plane_prefix_promote`, the durable baseline PR path). The largest single tool in the hub. | [`project-planning/plane/README.md`](project-planning/plane/README.md) |
 | `axon` | ~4 | Postgres-backed work-order / task queue (submit, status, list, cancel). | [`project-planning/axon.md`](project-planning/axon.md) |
 | `vector` | ~11 | Autonomous dev-loop agent control over a Postgres-backed queue (submit, status, queue depth, halt). | [`project-planning/vector.md`](project-planning/vector.md) |
 | `nexus` | ~5 | Postgres-backed inter-agent inbox (send, check, read, ack, history). | [`project-planning/nexus.md`](project-planning/nexus.md) |

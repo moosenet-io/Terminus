@@ -3,8 +3,8 @@
 # Plane — Plane CE work-management surface
 
 The `plane` module (`src/plane/mod.rs`, `src/plane/prefix.rs`, `src/plane/types.rs`) wraps the
-[Plane CE](https://plane.so) REST API and exposes it as **37 Rust tools**: 28 core `plane_*`
-tools registered from `mod.rs`, plus 5 `plane_prefix_*` sub-tools registered from the `prefix`
+[Plane CE](https://plane.so) REST API and exposes it as **43 Rust tools**: 37 core `plane_*`
+tools registered from `mod.rs`, plus 6 `plane_prefix_*` sub-tools registered from the `prefix`
 sub-module. It is the largest single module in the Terminus tool hub
 (`mod.rs:1-3` doc comment: "Plane CE tool implementations (CHORD-06, hardened per the
 plane-helper port)").
@@ -192,9 +192,11 @@ absent.
 ## Registration
 
 `plane::register(registry)` (`mod.rs:2856-2904`) builds one shared `Arc<PlaneClient>` from the
-environment, registers all 28 core tools against it, then calls `prefix::register(registry)` to
-register the 5 prefix sub-tools — so `plane_prefix_*` tools always surface alongside `plane_*` in
-both the core Chord registry and the personal registry. A tool that fails to register (name
+environment, registers all 37 core tools against it, then calls `prefix::register(registry)` to
+register the 6 prefix sub-tools — so `plane_prefix_*` tools always surface alongside `plane_*` in
+both the core Chord registry and the personal registry. `prefix::register` also constructs a
+`GiteaClient` from the environment (`None` when Gitea is unconfigured) so `plane_prefix_promote`
+can open its PR. A tool that fails to register (name
 collision) logs a warning rather than panicking the whole registry.
 
 Two tools (`PlaneCreateWorkItem::new`, `mod.rs:1341-1353`, and `PlaneListWorkItemsFiltered::new`,

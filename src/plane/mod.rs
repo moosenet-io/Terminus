@@ -3992,7 +3992,7 @@ mod tests {
         assert!(result.contains("No projects"), "{result}");
     }
 
-    // ── register() populates 37 core plane tools + 5 prefix sub-tools ─────────
+    // ── register() populates 37 core plane tools + 6 prefix sub-tools ─────────
 
     #[test]
     fn test_register_all_plane_tools() {
@@ -4000,12 +4000,13 @@ mod tests {
         // (not required for registration, only for execution)
         let mut registry = ToolRegistry::new();
         register(&mut registry);
-        // 37 core plane_* tools + 5 plane_prefix_* sub-tools (see prefix::register).
+        // 37 core plane_* tools + 6 plane_prefix_* sub-tools (see prefix::register).
         // EGJS-01 added 5 sub-issue/label tools (plane_list_sub_issues,
         // plane_link_sub_issue, plane_unlink_sub_issue, plane_create_label,
-        // plane_add_label) to the prior 32 core tools.
-        assert_eq!(registry.len(), 42,
-            "Expected 42 plane tools (37 core + 5 prefix), got {}", registry.len());
+        // plane_add_label) to the prior 32 core tools. PROMO-01 added the 6th
+        // prefix sub-tool, plane_prefix_promote.
+        assert_eq!(registry.len(), 43,
+            "Expected 43 plane tools (37 core + 6 prefix), got {}", registry.len());
     }
 
     // ── EGJS-01: sub-issue + label tools are registered and structured ────────
