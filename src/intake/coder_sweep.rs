@@ -897,21 +897,11 @@ pub async fn run(
                      marker is audit-only, sweep rows persisted): {e}"
                 ),
             }
-            // MINT2-07: refresh the Model Fleet Catalog — the per-model coverage
-            // registry an agent reads to know the fleet WITHOUT SQL — from the
-            // rows this run (and every prior source) has persisted. Best-effort,
-            // exactly like the aggregate refresh / epoch marker above: a DB
-            // hiccup or an un-migrated DB missing the `model_fleet_catalog`
-            // table(s) must NOT turn a successful sweep into a failure (the
-            // catalog is fully re-derivable next run). The read side is what
-            // MINT2-08's tool exposes.
-            match intake::catalog::refresh_fleet_catalog(&pool).await {
-                Ok(n) => eprintln!("coder sweep: refreshed fleet catalog ({n} model card(s))"),
-                Err(e) => eprintln!(
-                    "coder sweep: could not refresh fleet catalog (continuing — \
-                     catalog is derived, recomputes next run): {e}"
-                ),
-            }
+            // NOTE: the Model Fleet Catalog refresh (MINT2-07) is NOT called here
+            // — it runs once in the shared `MintHarness::execute` lifecycle
+            // (src/intake/mod.rs) at the end of EVERY unified harness run (coder
+            // AND assistant), so both families refresh exactly once and there is
+            // no double-refresh on a coder run.
             std::process::ExitCode::SUCCESS
         }
         Err(e) => {

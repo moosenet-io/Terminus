@@ -300,7 +300,54 @@ impl MintHarness {
             return std::process::ExitCode::FAILURE;
         }
 
-        self.sub_runner().run().await
+        let exit = self.sub_runner().run().await;
+
+        // MINT2-07: refresh the Model Fleet Catalog at the end of EVERY unified
+        // harness run — coder AND assistant — not just the coder sweep. This is
+        // the shared lifecycle, so it fires EXACTLY ONCE per run for both
+        // `RunKind`s (the per-sweep code no longer calls it — no double-refresh).
+        self.refresh_catalog_best_effort().await;
+
+        exit
+    }
+
+    /// Re-derive and persist the Model Fleet Catalog after a sweep — BEST-EFFORT.
+    ///
+    /// The catalog spans both families (coder aggregates + assistant dimension
+    /// scores + serving/agent profiles), so an assistant-only run that adds
+    /// fresh `assistant_dimension_score` rows must re-derive the catalog too, or
+    /// its assistant cells stay stale until a coder sweep happens to run — hence
+    /// this lives in the shared lifecycle, kind-agnostic, invoked for BOTH kinds.
+    ///
+    /// Same posture as MINT2-03's aggregate refresh / MINT2-05's marker: a DB
+    /// hiccup, a host with no DB configured, or an un-migrated host missing the
+    /// `model_fleet_catalog` table(s) is LOGGED and swallowed — it NEVER turns an
+    /// otherwise-successful sweep into a failure (the catalog is fully
+    /// re-derivable next run). The DB URL resolves via the same
+    /// `config::intake_database_url()` resolver `storage::get_pool()` uses — no
+    /// raw env, no literal DSN. `refresh_fleet_catalog` stays a `pub fn` so
+    /// MINT2-08's tool reads the persisted result on demand. Extracted from
+    /// [`MintHarness::execute`] so the shared-lifecycle refresh is unit-testable
+    /// without a live DB (a no-DB host exercises the swallow path).
+    async fn refresh_catalog_best_effort(&self) {
+        match storage::get_pool().await {
+            Ok(pool) => match catalog::refresh_fleet_catalog(&pool).await {
+                Ok(n) => eprintln!(
+                    "MINT harness ({}): refreshed fleet catalog ({n} model card(s))",
+                    self.kind.as_str()
+                ),
+                Err(e) => eprintln!(
+                    "MINT harness ({}): could not refresh fleet catalog (continuing — \
+                     catalog is derived, recomputes next run): {e}",
+                    self.kind.as_str()
+                ),
+            },
+            Err(e) => eprintln!(
+                "MINT harness ({}): could not connect to refresh fleet catalog \
+                 (continuing — catalog recomputes next run): {e}",
+                self.kind.as_str()
+            ),
+        }
     }
 }
 
@@ -1135,6 +1182,28 @@ mod tests {
 
         // Distinct harness instances get distinct run identities.
         assert_ne!(coder.run_id(), assistant.run_id());
+    }
+
+    /// MINT2-07: the fleet-catalog refresh is part of the SHARED lifecycle, so
+    /// it is reachable and best-effort for BOTH run kinds (coder AND assistant),
+    /// not just the coder sweep. With no DB configured, the shared refresh path
+    /// takes its swallow branch (a clean `NotConfigured` connect error, logged)
+    /// and returns without panicking or failing — exactly the posture a live run
+    /// relies on. Proving it for BOTH kinds proves an assistant-only run also
+    /// triggers the refresh (the acceptance criterion). No live DB needed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn catalog_refresh_runs_for_both_kinds_best_effort() {
+        std::env::remove_var("DATABASE_URL");
+        std::env::remove_var("INTAKE_DATABASE_URL");
+        // Both kinds reach the same shared helper; neither panics nor blocks on
+        // the missing DB — the swallow branch runs and returns unit.
+        MintHarness::new(RunKind::Coder)
+            .refresh_catalog_best_effort()
+            .await;
+        MintHarness::new(RunKind::Assistant)
+            .refresh_catalog_best_effort()
+            .await;
     }
 
     #[test]
