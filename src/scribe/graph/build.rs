@@ -12,7 +12,7 @@
 //! Stage-7c hook) calls. File reads use typed `std::fs` — never a subprocess.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -32,6 +32,27 @@ const SKIP_DIRS: &[&str] = &["target", ".git", "node_modules", ".worktrees", "wo
 /// result, never silent).
 const MAX_FILES: usize = 8000;
 const MAX_FILE_BYTES: u64 = 1_000_000;
+
+/// Reject a `changed_files` entry that could escape the repo root: it must be
+/// repo-relative with no `..` / root / prefix components. Without this the
+/// incremental read path would bypass the allowlist that only guards
+/// `repo_path` (a `../../x.rs` would be joined and read outside the root).
+fn ensure_safe_rel(rel: &str) -> Result<(), ToolError> {
+    let p = Path::new(rel);
+    if p.is_absolute() {
+        return Err(ToolError::InvalidArgument(format!(
+            "changed_files entry must be repo-relative, got absolute path '{rel}'"
+        )));
+    }
+    for c in p.components() {
+        if matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_)) {
+            return Err(ToolError::InvalidArgument(format!(
+                "changed_files entry must not escape the repo (no '..'): '{rel}'"
+            )));
+        }
+    }
+    Ok(())
+}
 
 fn req_str(args: &Value, key: &str) -> Result<String, ToolError> {
     args.get(key)
@@ -58,14 +79,21 @@ fn walk_rs(root: &Path) -> Result<(Vec<(String, String)>, bool), ToolError> {
                 capped = true;
                 break;
             }
-            if path.is_dir() {
+            // Do NOT follow symlinks — a symlink inside the repo could point at a
+            // dir/file outside the allowlist (symlink escape). symlink_metadata
+            // reports the link itself, not its target.
+            let Ok(meta) = fs::symlink_metadata(&path) else { continue };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
                 let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
                 if name.starts_with('.') || SKIP_DIRS.contains(&name) {
                     continue;
                 }
                 stack.push(path);
-            } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
-                if fs::metadata(&path).map(|m| m.len() > MAX_FILE_BYTES).unwrap_or(true) {
+            } else if meta.is_file() && path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                if meta.len() > MAX_FILE_BYTES {
                     continue;
                 }
                 let Ok(content) = fs::read_to_string(&path) else { continue };
@@ -164,13 +192,17 @@ only those files."
                 if !rel.ends_with(".rs") {
                     continue;
                 }
+                ensure_safe_rel(rel)?; // refuse traversal — the allowlist only guards repo_path
                 let p = root.join(rel);
-                if let Ok(content) = fs::read_to_string(&p) {
-                    pairs.push((rel.clone(), content));
-                } else {
-                    // a deleted file: patch it out by extracting an empty set
-                    // for its path (refresh_files removes the old subgraph).
-                    pairs.push((rel.clone(), String::new()));
+                match fs::read_to_string(&p) {
+                    Ok(content) => pairs.push((rel.clone(), content)),
+                    // Genuinely gone → patch it out (drop its subgraph).
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        pairs.push((rel.clone(), String::new()))
+                    }
+                    // Exists but unreadable (permissions / transient I/O): leave
+                    // its existing subgraph intact rather than silently dropping.
+                    Err(_) => continue,
                 }
             }
             store.refresh_files(&project_id, &pairs)?
@@ -340,6 +372,59 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)), "outside allowlist rejected");
         let _ = fs::remove_dir_all(&other);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn incremental_traversal_in_changed_files_is_refused() {
+        let env = setup("trav");
+        let repo = env.repo.to_str().unwrap().to_string();
+        ScribeKgBuild.execute_structured(json!({"project_id": "TERM", "repo_path": repo})).await.unwrap();
+        let err = ScribeKgBuild
+            .execute_structured(json!({
+                "project_id": "TERM", "repo_path": repo,
+                "incremental": true, "changed_files": ["../../../../etc/hosts.rs"]
+            }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)), "traversal rejected, got {err:?}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn incremental_deleted_file_drops_its_subgraph() {
+        let env = setup("del");
+        let repo = env.repo.to_str().unwrap().to_string();
+        ScribeKgBuild.execute_structured(json!({"project_id": "TERM", "repo_path": repo})).await.unwrap();
+        fs::remove_file(env.repo.join("src/w.rs")).unwrap();
+        ScribeKgBuild
+            .execute_structured(json!({"project_id": "TERM", "repo_path": repo, "incremental": true, "changed_files": ["src/w.rs"]}))
+            .await
+            .unwrap();
+        let g = GraphStore::from_config(&ScribeConfig::from_env()).load("TERM").unwrap().unwrap();
+        assert!(g.get_node("crate::w::Widget").is_none(), "deleted file's nodes dropped");
+        assert!(g.get_node("crate::helper").is_some(), "unchanged file preserved");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn walk_does_not_follow_symlinks_out_of_repo() {
+        let env = setup("symlink");
+        // a secret file OUTSIDE the repo, and a symlink to it INSIDE the repo
+        let outside = std::env::temp_dir().join(format!("atlas-secret-{}", std::process::id()));
+        let _ = fs::create_dir_all(&outside);
+        fs::write(outside.join("secret.rs"), "pub fn top_secret() {}\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.rs"), env.repo.join("src/link.rs")).unwrap();
+
+        ScribeKgBuild
+            .execute_structured(json!({"project_id": "TERM", "repo_path": env.repo.to_str().unwrap()}))
+            .await
+            .unwrap();
+        let g = GraphStore::from_config(&ScribeConfig::from_env()).load("TERM").unwrap().unwrap();
+        assert!(g.get_node("crate::link::top_secret").is_none(), "symlinked file not followed/read");
+        assert!(g.get_node("crate::helper").is_some(), "real files still indexed");
+        let _ = fs::remove_dir_all(&outside);
     }
 
     #[tokio::test]
