@@ -19,8 +19,10 @@
 //! after the run.
 
 mod agent;
+pub mod aggregate;
 pub mod assistant;
 pub mod breakfix;
+pub mod catalog;
 pub mod checkpoint;
 pub mod chord_pull;
 mod code;
@@ -83,6 +85,89 @@ pub use code_v2::{
     run_code_suite_v2, run_code_suite_v2_cases, samples_per_case, CaseV2, CodeV2Outcome,
 };
 pub use runner::create_profile_row;
+
+// ---------------------------------------------------------------------------
+// MINT2-05: harness-version EPOCHS — the single source of truth
+// ---------------------------------------------------------------------------
+//
+// `harness_version` is the EPOCH partition key for the build-scenario coder
+// rows (`code_profile_runs`) and their derived aggregates
+// (`code_run_aggregates`). When a test evolves (Phase 1 changes what/how we
+// measure), the epoch is bumped so old results become a distinct partition:
+// they are never DELETED (provenance) but they also never blend into the
+// current epoch's tuning numbers.
+//
+// This is the ONE place the current epoch string is stated. MINT2-03 originally
+// held a local `CURRENT_EPOCH` in `aggregate.rs`; MINT2-05 promotes it here and
+// `aggregate.rs` re-exports THIS const, so there is exactly one definition. A
+// future `'v4'` is a one-line bump here and nowhere else.
+//
+// NOTE ON SCOPE: this epoch governs the CODER build-scenario lineage (`'v3'`).
+// The assistant sweep (`assistant_profile_run.harness_version`) is a SEPARATE
+// lineage with its own version string (`assistant::schema::HARNESS_VERSION`);
+// its report scopes to that lineage, not to this `'v3'` — see
+// `assistant/reporting.rs`.
+
+/// The current build-scenario harness epoch. `harness_version` is the epoch
+/// partition key: every current-epoch read/aggregate/catalog scopes to this
+/// value by default so evolved-test results never blend with a prior harness's
+/// rows, while legacy epochs (`'v1'`/`'v2'`) remain queryable via an explicit
+/// [`EpochSelector`] but never pollute the current numbers. Bumping to a future
+/// `'v4'` is a ONE-LINE change here — the single source of truth for the value.
+pub const CURRENT_EPOCH: &str = "v3";
+
+/// The current epoch string (helper form of [`CURRENT_EPOCH`]) — the value all
+/// current-epoch reads default to.
+pub fn current_epoch() -> &'static str {
+    CURRENT_EPOCH
+}
+
+/// Which epoch(s) a current-epoch-partitioned read should cover.
+///
+/// Reads default to [`EpochSelector::Current`] (only the current epoch), so
+/// legacy rows never pollute current-epoch numbers. Provenance queries pass
+/// [`EpochSelector::Only`] for a specific prior epoch, or [`EpochSelector::All`]
+/// to include every epoch. This ONLY changes which rows a read returns — legacy
+/// rows are partitioned by filter and are NEVER deleted or mutated.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EpochSelector {
+    /// Only the current epoch ([`current_epoch`]) — the default for every
+    /// current-epoch read.
+    #[default]
+    Current,
+    /// Only this one explicit epoch (e.g. `"v1"` / `"v2"` for a legacy
+    /// provenance query).
+    Only(String),
+    /// Every epoch — no `harness_version` filter (the all-provenance view).
+    All,
+}
+
+impl EpochSelector {
+    /// The concrete epoch string to filter on, or `None` for
+    /// [`EpochSelector::All`] (no filter). [`EpochSelector::Current`] resolves to
+    /// [`current_epoch`], so "current" is always the one central value.
+    pub fn epoch(&self) -> Option<&str> {
+        match self {
+            EpochSelector::Current => Some(current_epoch()),
+            EpochSelector::Only(e) => Some(e.as_str()),
+            EpochSelector::All => None,
+        }
+    }
+}
+
+/// The SQL `WHERE`-fragment that scopes a `harness_version`-partitioned query to
+/// `selector`, binding the epoch at positional `$idx`.
+///
+/// `Current` / `Only` yield `harness_version = $idx` (the caller binds the value
+/// from [`EpochSelector::epoch`]); `All` yields `TRUE` (no bind consumed) so a
+/// caller can always splice the fragment into its `WHERE` unconditionally. This
+/// is the ONE place the epoch filter shape is defined. PURE — unit-tested.
+pub fn epoch_where_fragment(selector: &EpochSelector, idx: usize) -> String {
+    match selector.epoch() {
+        Some(_) => format!("harness_version = ${idx}"),
+        None => "TRUE".to_string(),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Unified MINT harness (MINT2-04)
@@ -215,7 +300,54 @@ impl MintHarness {
             return std::process::ExitCode::FAILURE;
         }
 
-        self.sub_runner().run().await
+        let exit = self.sub_runner().run().await;
+
+        // MINT2-07: refresh the Model Fleet Catalog at the end of EVERY unified
+        // harness run — coder AND assistant — not just the coder sweep. This is
+        // the shared lifecycle, so it fires EXACTLY ONCE per run for both
+        // `RunKind`s (the per-sweep code no longer calls it — no double-refresh).
+        self.refresh_catalog_best_effort().await;
+
+        exit
+    }
+
+    /// Re-derive and persist the Model Fleet Catalog after a sweep — BEST-EFFORT.
+    ///
+    /// The catalog spans both families (coder aggregates + assistant dimension
+    /// scores + serving/agent profiles), so an assistant-only run that adds
+    /// fresh `assistant_dimension_score` rows must re-derive the catalog too, or
+    /// its assistant cells stay stale until a coder sweep happens to run — hence
+    /// this lives in the shared lifecycle, kind-agnostic, invoked for BOTH kinds.
+    ///
+    /// Same posture as MINT2-03's aggregate refresh / MINT2-05's marker: a DB
+    /// hiccup, a host with no DB configured, or an un-migrated host missing the
+    /// `model_fleet_catalog` table(s) is LOGGED and swallowed — it NEVER turns an
+    /// otherwise-successful sweep into a failure (the catalog is fully
+    /// re-derivable next run). The DB URL resolves via the same
+    /// `config::intake_database_url()` resolver `storage::get_pool()` uses — no
+    /// raw env, no literal DSN. `refresh_fleet_catalog` stays a `pub fn` so
+    /// MINT2-08's tool reads the persisted result on demand. Extracted from
+    /// [`MintHarness::execute`] so the shared-lifecycle refresh is unit-testable
+    /// without a live DB (a no-DB host exercises the swallow path).
+    async fn refresh_catalog_best_effort(&self) {
+        match storage::get_pool().await {
+            Ok(pool) => match catalog::refresh_fleet_catalog(&pool).await {
+                Ok(n) => eprintln!(
+                    "MINT harness ({}): refreshed fleet catalog ({n} model card(s))",
+                    self.kind.as_str()
+                ),
+                Err(e) => eprintln!(
+                    "MINT harness ({}): could not refresh fleet catalog (continuing — \
+                     catalog is derived, recomputes next run): {e}",
+                    self.kind.as_str()
+                ),
+            },
+            Err(e) => eprintln!(
+                "MINT harness ({}): could not connect to refresh fleet catalog \
+                 (continuing — catalog recomputes next run): {e}",
+                self.kind.as_str()
+            ),
+        }
     }
 }
 
@@ -991,6 +1123,44 @@ mod tests {
     }
 
     #[test]
+    fn current_epoch_is_the_single_source_of_truth() {
+        // MINT2-05: the ONE place the current epoch is stated. `current_epoch()`
+        // and the const agree, and `aggregate.rs` re-exports THIS value (proven
+        // by `aggregate`'s own tests keying rows off `CURRENT_EPOCH`).
+        assert_eq!(CURRENT_EPOCH, "v3");
+        assert_eq!(current_epoch(), CURRENT_EPOCH);
+    }
+
+    #[test]
+    fn epoch_selector_resolves_current_legacy_and_all() {
+        // Default is Current → resolves to the one central value.
+        assert_eq!(EpochSelector::default(), EpochSelector::Current);
+        assert_eq!(EpochSelector::Current.epoch(), Some(current_epoch()));
+        // An explicit legacy epoch stays queryable.
+        assert_eq!(
+            EpochSelector::Only("v1".to_string()).epoch(),
+            Some("v1")
+        );
+        // All = no filter.
+        assert_eq!(EpochSelector::All.epoch(), None);
+    }
+
+    #[test]
+    fn epoch_where_fragment_appends_filter_or_true() {
+        // Current/Only append the epoch filter at the given bind index; All is a
+        // bind-free always-true fragment so callers can splice unconditionally.
+        assert_eq!(
+            epoch_where_fragment(&EpochSelector::Current, 1),
+            "harness_version = $1"
+        );
+        assert_eq!(
+            epoch_where_fragment(&EpochSelector::Only("v2".into()), 3),
+            "harness_version = $3"
+        );
+        assert_eq!(epoch_where_fragment(&EpochSelector::All, 1), "TRUE");
+    }
+
+    #[test]
     fn run_kind_labels_are_stable() {
         assert_eq!(RunKind::Coder.as_str(), "coder");
         assert_eq!(RunKind::Assistant.as_str(), "assistant");
@@ -1012,6 +1182,28 @@ mod tests {
 
         // Distinct harness instances get distinct run identities.
         assert_ne!(coder.run_id(), assistant.run_id());
+    }
+
+    /// MINT2-07: the fleet-catalog refresh is part of the SHARED lifecycle, so
+    /// it is reachable and best-effort for BOTH run kinds (coder AND assistant),
+    /// not just the coder sweep. With no DB configured, the shared refresh path
+    /// takes its swallow branch (a clean `NotConfigured` connect error, logged)
+    /// and returns without panicking or failing — exactly the posture a live run
+    /// relies on. Proving it for BOTH kinds proves an assistant-only run also
+    /// triggers the refresh (the acceptance criterion). No live DB needed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn catalog_refresh_runs_for_both_kinds_best_effort() {
+        std::env::remove_var("DATABASE_URL");
+        std::env::remove_var("INTAKE_DATABASE_URL");
+        // Both kinds reach the same shared helper; neither panics nor blocks on
+        // the missing DB — the swallow branch runs and returns unit.
+        MintHarness::new(RunKind::Coder)
+            .refresh_catalog_best_effort()
+            .await;
+        MintHarness::new(RunKind::Assistant)
+            .refresh_catalog_best_effort()
+            .await;
     }
 
     #[test]

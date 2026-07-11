@@ -647,6 +647,367 @@ pub async fn read_code_run_factors(
 }
 
 // ===========================================================================
+// MINT2-03: variance-aware run aggregates (read input rows; persist/read the
+// `code_run_aggregates` table). The COMPUTATION is pure and lives in
+// `crate::intake::aggregate`; these are the thin DB wrappers around it.
+// ===========================================================================
+
+use crate::intake::aggregate::{AggregateInputRow, RunAggregate};
+use crate::intake::EpochSelector;
+
+/// True when a Postgres error text indicates a MISSING RELATION (the table does
+/// not exist — the un-migrated `code_run_aggregates` case), so the read path can
+/// degrade to an empty aggregate set rather than propagating. Postgres reports
+/// `error: relation "code_run_aggregates" does not exist` (SQLSTATE 42P01).
+/// Pure over its input; mirrors [`is_missing_column_error`].
+fn is_missing_relation_error(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("relation") && m.contains("does not exist")
+}
+
+/// Row shape the aggregate-input SELECT decodes into: model, task_category,
+/// harness_version, the five MINT2-01 config factors, and the pre-resolved
+/// effective score. Kept as a type alias so the primary and un-migrated fallback
+/// queries decode identically.
+type AggInputTuple = (
+    String,         // model_name
+    Option<String>, // task_category
+    String,         // harness_version
+    Option<String>, // quant
+    Option<bool>,   // reasoning_enabled
+    Option<i32>,    // context_window_launched
+    Option<f64>,    // temperature
+    Option<f64>,    // top_p
+    i32,            // effective score (COALESCE(GREATEST(retry, first_pass), 0))
+);
+
+fn map_agg_input(t: AggInputTuple) -> AggregateInputRow {
+    AggregateInputRow {
+        model: t.0,
+        task_category: t.1,
+        harness_version: t.2,
+        quant: t.3,
+        reasoning_enabled: t.4,
+        context_window_launched: t.5,
+        temperature: t.6,
+        top_p: t.7,
+        effective_score: t.8,
+    }
+}
+
+/// Primary aggregate-input SELECT — references the MINT2-01 factor columns
+/// directly. The effective score is resolved in SQL exactly as `code_v2.rs` does
+/// in Rust: `max(first_pass, retry)` with a NULL retry ignored, defaulting to 0.
+/// Joins `model_profiles` for the model NAME (the sweep keys rows by `profile_id`
+/// UUID). Scoped to the caller-supplied epoch (`harness_version = $1`).
+const SELECT_AGG_INPUT_SQL: &str = "SELECT p.model_name, r.task_category, r.harness_version, \
+     r.quant, r.reasoning_enabled, r.context_window_launched, r.temperature, r.top_p, \
+     COALESCE(GREATEST(r.retry_score, r.first_pass_score), 0) \
+     FROM code_profile_runs r JOIN model_profiles p ON p.id = r.profile_id \
+     WHERE r.harness_version = $1 AND COALESCE(r.task_type, '') <> 'non_viable_skip'";
+
+/// Fallback aggregate-input SELECT for a DB NOT yet migrated for MINT2-01 (the
+/// five factor columns + `task_category` are absent): selects correctly-typed
+/// SQL NULLs for those so the row still decodes, mirroring
+/// [`SELECT_CODE_RUN_FACTORS_FALLBACK_SQL`]. Un-factored rows aggregate under an
+/// all-`None` config bucket — honest for a pre-MINT2-01 host.
+const SELECT_AGG_INPUT_FALLBACK_SQL: &str = "SELECT p.model_name, NULL::text, r.harness_version, \
+     NULL::text, NULL::boolean, NULL::integer, NULL::double precision, NULL::double precision, \
+     COALESCE(GREATEST(r.retry_score, r.first_pass_score), 0) \
+     FROM code_profile_runs r JOIN model_profiles p ON p.id = r.profile_id \
+     WHERE r.harness_version = $1 AND COALESCE(r.task_type, '') <> 'non_viable_skip'";
+
+/// Read the per-sample rows an epoch's aggregates are computed from, tolerating a
+/// DB not yet migrated for MINT2-01 (the factor columns fall back to NULL). Any
+/// OTHER DB error is propagated. The pure [`crate::intake::aggregate::compute_aggregates`]
+/// turns these into the variance-aware aggregates.
+pub async fn read_aggregate_input_rows(
+    pool: &PgPool,
+    epoch: &str,
+) -> Result<Vec<AggregateInputRow>, ToolError> {
+    match sqlx::query_as::<_, AggInputTuple>(SELECT_AGG_INPUT_SQL)
+        .bind(epoch)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => Ok(rows.into_iter().map(map_agg_input).collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_column_error(&msg) {
+                let rows = sqlx::query_as::<_, AggInputTuple>(SELECT_AGG_INPUT_FALLBACK_SQL)
+                    .bind(epoch)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|e| {
+                        ToolError::Database(format!(
+                            "Failed to read aggregate input rows (fallback): {e}"
+                        ))
+                    })?;
+                Ok(rows.into_iter().map(map_agg_input).collect())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read aggregate input rows: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// Persist a freshly-computed aggregate set for ONE epoch into
+/// `code_run_aggregates`, replacing that epoch's prior rows wholesale (aggregates
+/// are cheap to recompute from `code_profile_runs`, so a DELETE-then-INSERT of the
+/// current epoch's rows is the simplest correct idempotent write — and it avoids
+/// the NULL-in-a-unique-index upsert hazard the nullable config-factor key would
+/// otherwise pose). Runs in a single transaction so a partial failure never
+/// leaves the table half-updated. Only the passed epoch's rows are touched; other
+/// epochs are left intact.
+pub async fn persist_code_run_aggregates(
+    pool: &PgPool,
+    epoch: &str,
+    aggregates: &[RunAggregate],
+) -> Result<(), ToolError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ToolError::Database(format!("begin aggregate persist tx: {e}")))?;
+
+    sqlx::query("DELETE FROM code_run_aggregates WHERE harness_version = $1")
+        .bind(epoch)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ToolError::Database(format!("clear code_run_aggregates for epoch: {e}")))?;
+
+    for a in aggregates {
+        sqlx::query(
+            "INSERT INTO code_run_aggregates \
+             (model, task_category, harness_version, quant, reasoning_enabled, \
+              context_window_launched, temperature, top_p, \
+              pass_rate, n_samples, passes, score_stddev, low_confidence) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+        )
+        .bind(&a.key.model)
+        .bind(a.key.task_category.as_deref())
+        .bind(&a.key.harness_version)
+        .bind(a.key.quant.as_deref())
+        .bind(a.key.reasoning_enabled)
+        .bind(a.key.context_window_launched)
+        .bind(a.key.temperature)
+        .bind(a.key.top_p)
+        .bind(a.pass_rate)
+        .bind(a.n_samples as i32)
+        .bind(a.passes as i32)
+        .bind(a.score_stddev)
+        .bind(a.low_confidence)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ToolError::Database(format!("insert code_run_aggregates row: {e}")))?;
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| ToolError::Database(format!("commit aggregate persist tx: {e}")))
+}
+
+/// A persisted `code_run_aggregates` row (the read-back shape for the catalog).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredRunAggregate {
+    pub model: String,
+    pub task_category: Option<String>,
+    pub harness_version: String,
+    pub quant: Option<String>,
+    pub reasoning_enabled: Option<bool>,
+    pub context_window_launched: Option<i32>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub pass_rate: f64,
+    pub n_samples: i32,
+    pub passes: i32,
+    pub score_stddev: f64,
+    pub low_confidence: bool,
+}
+
+type StoredAggTuple = (
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<bool>,
+    Option<i32>,
+    Option<f64>,
+    Option<f64>,
+    f64,
+    i32,
+    i32,
+    f64,
+    bool,
+);
+
+/// Pure mapping from the decoded `code_run_aggregates` tuple to a
+/// [`StoredRunAggregate`]. Extracted so the epoch-specific and selector-aware
+/// reads decode identically (and so it is unit-testable without a live DB).
+fn map_stored_agg(t: StoredAggTuple) -> StoredRunAggregate {
+    StoredRunAggregate {
+        model: t.0,
+        task_category: t.1,
+        harness_version: t.2,
+        quant: t.3,
+        reasoning_enabled: t.4,
+        context_window_launched: t.5,
+        temperature: t.6,
+        top_p: t.7,
+        pass_rate: t.8,
+        n_samples: t.9,
+        passes: t.10,
+        score_stddev: t.11,
+        low_confidence: t.12,
+    }
+}
+
+/// Read the persisted aggregates for ONE explicit epoch, TOLERATING the
+/// `code_run_aggregates` table being ABSENT on an un-migrated DB: a missing
+/// relation ([`is_missing_relation_error`]) reads as an empty set, never a
+/// panic — mirroring the MINT2-01/02 null-tolerant column reads. Any other DB
+/// error is propagated. Thin wrapper over [`read_code_run_aggregates_selected`]
+/// with an [`EpochSelector::Only`], preserved for callers that already hold a
+/// concrete epoch string (e.g. the current-epoch persist/read round-trip).
+pub async fn read_code_run_aggregates(
+    pool: &PgPool,
+    epoch: &str,
+) -> Result<Vec<StoredRunAggregate>, ToolError> {
+    read_code_run_aggregates_selected(pool, &EpochSelector::Only(epoch.to_string())).await
+}
+
+/// Read the persisted run aggregates, honoring an [`EpochSelector`] so the coder
+/// catalog/reports DEFAULT to the current epoch — legacy rows never pollute the
+/// current numbers — while still exposing legacy/all provenance:
+///   - [`EpochSelector::Current`] (the default) → only `current_epoch()`,
+///   - [`EpochSelector::Only`]    → one explicit legacy/other epoch,
+///   - [`EpochSelector::All`]     → every epoch (no `harness_version` filter).
+///
+/// Legacy rows are partitioned by FILTER only — this read never deletes or
+/// mutates them. The epoch `WHERE`-fragment comes from the ONE central
+/// [`crate::intake::epoch_where_fragment`] (`All` → a bind-free `TRUE`). Tolerates
+/// the `code_run_aggregates` table being ABSENT on an un-migrated DB (empty set),
+/// mirroring the MINT2-03 null/absence-tolerant read pattern.
+pub async fn read_code_run_aggregates_selected(
+    pool: &PgPool,
+    selector: &EpochSelector,
+) -> Result<Vec<StoredRunAggregate>, ToolError> {
+    let where_frag = crate::intake::epoch_where_fragment(selector, 1);
+    let sql = format!(
+        "SELECT model, task_category, harness_version, quant, reasoning_enabled, \
+         context_window_launched, temperature, top_p, pass_rate, n_samples, passes, \
+         score_stddev, low_confidence FROM code_run_aggregates WHERE {where_frag} \
+         ORDER BY model, task_category NULLS FIRST, quant NULLS FIRST"
+    );
+    let mut query = sqlx::query_as::<_, StoredAggTuple>(&sql);
+    // Bind the epoch only when the selector resolves to one (All binds nothing).
+    if let Some(epoch) = selector.epoch() {
+        query = query.bind(epoch.to_string());
+    }
+    match query.fetch_all(pool).await {
+        Ok(rows) => Ok(rows.into_iter().map(map_stored_agg).collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) {
+                // Un-migrated DB: the table isn't there yet — no aggregates.
+                Ok(Vec::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read code_run_aggregates (selected): {msg}"
+                )))
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// MINT2-05: persisted epoch marker (audit timeline of when an epoch became
+// current). Table-absence tolerant, mirroring the aggregate read above.
+// ===========================================================================
+
+/// A persisted `intake_epoch_marker` row: which epoch, when it became the
+/// current partition, and an optional note (why it was bumped / what evolved).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EpochMarker {
+    pub epoch: String,
+    pub became_current_at: chrono::DateTime<chrono::Utc>,
+    pub note: Option<String>,
+}
+
+/// SQL for [`upsert_epoch_marker`]. Pulled out to a const so a unit test can
+/// assert its idempotent-upsert shape without a live DB: an INSERT keyed on the
+/// `epoch` PRIMARY KEY with `ON CONFLICT (epoch) DO UPDATE` so recording the
+/// same epoch twice is a safe no-op update (the marker is a single audit row per
+/// epoch, never duplicated). `became_current_at` is only set on first insert —
+/// `ON CONFLICT` deliberately does NOT overwrite it (the timeline records when
+/// the epoch FIRST became current), while `note` is refreshed if re-supplied.
+const UPSERT_EPOCH_MARKER_SQL: &str = "INSERT INTO intake_epoch_marker (epoch, note) \
+     VALUES ($1, $2) \
+     ON CONFLICT (epoch) DO UPDATE SET note = COALESCE(EXCLUDED.note, intake_epoch_marker.note)";
+
+/// Record (idempotently) that `epoch` is/became the current partition. Safe to
+/// call every startup/cutover: the first call inserts the marker with
+/// `became_current_at = now()`; subsequent calls for the same epoch are a no-op
+/// update that preserves the original timestamp (the audit point) and only
+/// refreshes the note when a new one is supplied. Never deletes or rewrites any
+/// other epoch's marker. Returns whether a NEW marker row was created (`true`)
+/// vs. an existing one was seen (`false`) — for logging only.
+pub async fn upsert_epoch_marker(
+    pool: &PgPool,
+    epoch: &str,
+    note: Option<&str>,
+) -> Result<bool, ToolError> {
+    let result = sqlx::query(UPSERT_EPOCH_MARKER_SQL)
+        .bind(epoch)
+        .bind(note)
+        .execute(pool)
+        .await
+        .map_err(|e| ToolError::Database(format!("Failed to upsert intake_epoch_marker: {e}")))?;
+    // A fresh INSERT affects 1 row; an ON CONFLICT no-op update that changes
+    // nothing may report 0 — either way it is not an error. `rows_affected == 1`
+    // on the very first insert; treat >=1-with-a-real-change as "created/updated".
+    Ok(result.rows_affected() >= 1)
+}
+
+/// Read the marker for one epoch, TOLERATING the `intake_epoch_marker` table
+/// being ABSENT on an un-migrated DB: a missing relation
+/// ([`is_missing_relation_error`]) reads as `None` ("no marker recorded"), never
+/// a panic — mirroring [`read_code_run_aggregates_selected`]'s absence tolerance.
+/// A genuinely absent row (table exists, epoch never recorded) also yields
+/// `None`. Any OTHER DB error is propagated.
+pub async fn read_epoch_marker(
+    pool: &PgPool,
+    epoch: &str,
+) -> Result<Option<EpochMarker>, ToolError> {
+    let sql = "SELECT epoch, became_current_at, note \
+         FROM intake_epoch_marker WHERE epoch = $1";
+    type MarkerTuple = (String, chrono::DateTime<chrono::Utc>, Option<String>);
+    match sqlx::query_as::<_, MarkerTuple>(sql)
+        .bind(epoch)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(row) => Ok(row.map(|t| EpochMarker {
+            epoch: t.0,
+            became_current_at: t.1,
+            note: t.2,
+        })),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) {
+                // Un-migrated DB: the marker table isn't there yet.
+                Ok(None)
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read intake_epoch_marker: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+// ===========================================================================
 // MINT2-02: read the structured failure_class back (null-tolerant)
 // ===========================================================================
 
@@ -1081,6 +1442,265 @@ pub async fn read_latest_profile(
     }))
 }
 
+// ===========================================================================
+// MINT2-07: Model Fleet Catalog — tolerant readers for every upstream source +
+// the wholesale persist. Each read tolerates its source table/column being
+// ABSENT on an un-migrated host (a missing relation/column reads as "no rows",
+// so the catalog builder degrades those cells to `not_run` rather than
+// crashing) — mirroring the MINT2-03/05 absence-tolerant pattern. The catalog's
+// COMPUTATION is the pure `crate::intake::catalog::build_catalog`; these are the
+// thin DB wrappers around it.
+// ===========================================================================
+
+use crate::intake::catalog::{
+    AgentRollup, AssistantCell, CoverageStatus, ModelCatalog, NonViableRow, ServingRow,
+};
+
+/// Max run timestamp per `(model_name, task_category)` for one coder epoch —
+/// the `last_run_at` a catalog `run` cell reports. Tolerates the `task_category`
+/// column being absent (un-migrated MINT2-01) or the table being absent: either
+/// yields an empty map, never a panic. Skips `non_viable_skip` rows (they have
+/// no measured category) exactly as the aggregate-input read does.
+pub async fn read_coder_last_run(
+    pool: &PgPool,
+    epoch: &str,
+) -> Result<std::collections::BTreeMap<(String, String), chrono::DateTime<chrono::Utc>>, ToolError> {
+    let sql = "SELECT p.model_name, r.task_category, max(r.created_at) \
+         FROM code_profile_runs r JOIN model_profiles p ON p.id = r.profile_id \
+         WHERE r.harness_version = $1 AND COALESCE(r.task_type, '') <> 'non_viable_skip' \
+           AND r.task_category IS NOT NULL \
+         GROUP BY p.model_name, r.task_category";
+    type Row = (String, String, chrono::DateTime<chrono::Utc>);
+    match sqlx::query_as::<_, Row>(sql).bind(epoch).fetch_all(pool).await {
+        Ok(rows) => Ok(rows
+            .into_iter()
+            .map(|(m, c, t)| ((m, c), t))
+            .collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                Ok(std::collections::BTreeMap::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read coder last-run timestamps: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// The `non_viable_vram` skip rows for one epoch, read on their OWN axis from
+/// `code_profile_runs.failure_class` (NOT inferred from aggregates, which
+/// EXCLUDE skips). Tolerates the `failure_class`/`quant` column or the table
+/// being absent → empty vec.
+pub async fn read_non_viable_rows(
+    pool: &PgPool,
+    epoch: &str,
+) -> Result<Vec<NonViableRow>, ToolError> {
+    let sql = "SELECT p.model_name, r.quant \
+         FROM code_profile_runs r JOIN model_profiles p ON p.id = r.profile_id \
+         WHERE r.harness_version = $1 AND r.failure_class = 'non_viable_vram'";
+    type Row = (String, Option<String>);
+    match sqlx::query_as::<_, Row>(sql).bind(epoch).fetch_all(pool).await {
+        Ok(rows) => Ok(rows
+            .into_iter()
+            .map(|(model_name, quant)| NonViableRow { model_name, quant })
+            .collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                Ok(Vec::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read non_viable_vram rows: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// Per-(model, dimension) rollup of the assistant sweep's dimension scores:
+/// sample count, mean dispersion, last-run. Tolerates the
+/// `assistant_dimension_score` table being absent → empty vec.
+pub async fn read_assistant_cells(pool: &PgPool) -> Result<Vec<AssistantCell>, ToolError> {
+    let sql = "SELECT model_id, dimension, count(*)::bigint, avg(std_dev), max(created_at) \
+         FROM assistant_dimension_score GROUP BY model_id, dimension";
+    type Row = (
+        String,
+        String,
+        i64,
+        Option<f64>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    );
+    match sqlx::query_as::<_, Row>(sql).fetch_all(pool).await {
+        Ok(rows) => Ok(rows
+            .into_iter()
+            .map(|(model_name, dimension, n, sd, last)| AssistantCell {
+                model_name,
+                dimension,
+                n_samples: n,
+                score_stddev: sd,
+                last_run_at: last,
+            })
+            .collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) {
+                Ok(Vec::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read assistant dimension cells: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// Latest serving/operational profile per model (the fleet card's serving
+/// facts). Tolerates the operational-profile table being absent → empty vec.
+pub async fn read_serving_rows(pool: &PgPool) -> Result<Vec<ServingRow>, ToolError> {
+    let sql = "SELECT DISTINCT ON (mp.model_name) mp.model_name, op.max_context_safe, \
+                op.quality_degradation_point, op.throughput_at_8k, op.created_at \
+         FROM model_profiles mp JOIN model_operational_profiles op ON op.profile_id = mp.id \
+         ORDER BY mp.model_name, op.created_at DESC";
+    type Row = (
+        String,
+        Option<i32>,
+        Option<i32>,
+        Option<f64>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    );
+    match sqlx::query_as::<_, Row>(sql).fetch_all(pool).await {
+        Ok(rows) => Ok(rows
+            .into_iter()
+            .map(
+                |(model_name, max_context_safe, quality_degradation_point, throughput, last)| {
+                    ServingRow {
+                        model_name,
+                        max_context_safe,
+                        quality_degradation_point,
+                        throughput,
+                        last_run_at: last,
+                    }
+                },
+            )
+            .collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) {
+                Ok(Vec::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read serving profiles: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// Per-model agent tool-use rollup: sample count and correct-tool-selection
+/// accuracy. Tolerates the `agent_profile_runs` table being absent → empty vec.
+pub async fn read_agent_rollups(pool: &PgPool) -> Result<Vec<AgentRollup>, ToolError> {
+    let sql = "SELECT mp.model_name, count(*)::bigint, \
+                avg(CASE WHEN ap.correct_tool_selected THEN 1.0 ELSE 0.0 END) \
+         FROM model_profiles mp JOIN agent_profile_runs ap ON ap.profile_id = mp.id \
+         GROUP BY mp.model_name";
+    type Row = (String, i64, Option<f64>);
+    match sqlx::query_as::<_, Row>(sql).fetch_all(pool).await {
+        Ok(rows) => Ok(rows
+            .into_iter()
+            .map(|(model_name, n, acc)| AgentRollup {
+                model_name,
+                n_samples: n,
+                tool_accuracy: acc,
+            })
+            .collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) {
+                Ok(Vec::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read agent tool-use rollups: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// Persist the freshly-built fleet catalog, replacing BOTH catalog tables
+/// wholesale in one transaction (the catalog is fully re-derivable from the
+/// upstream tables, so a delete-then-insert is the simplest correct idempotent
+/// write — and a partial failure never leaves a half-updated card). The cell
+/// table is cleared FIRST, then the summary; inserts stamp `refreshed_at` via
+/// the column defaults. If the catalog tables are ABSENT (un-migrated host) this
+/// errors on the missing relation — callers wire the refresh best-effort so a
+/// not-yet-migrated host degrades to "catalog not refreshed" rather than failing
+/// the sweep (see the coder-sweep call site).
+pub async fn persist_fleet_catalog(
+    pool: &PgPool,
+    catalog: &[ModelCatalog],
+) -> Result<(), ToolError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ToolError::Database(format!("begin fleet-catalog persist tx: {e}")))?;
+
+    sqlx::query("DELETE FROM model_fleet_catalog_cell")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ToolError::Database(format!("clear model_fleet_catalog_cell: {e}")))?;
+    sqlx::query("DELETE FROM model_fleet_catalog")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ToolError::Database(format!("clear model_fleet_catalog: {e}")))?;
+
+    for m in catalog {
+        let serving_json = m.serving.to_json();
+        sqlx::query(
+            "INSERT INTO model_fleet_catalog \
+             (model_name, quant, in_current_fleet, serving_json, not_run_count, stale_count) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(&m.model_name)
+        .bind(m.quant.as_deref())
+        .bind(m.in_current_fleet)
+        .bind(serving_json)
+        .bind(m.not_run_count as i32)
+        .bind(m.stale_count as i32)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ToolError::Database(format!("insert model_fleet_catalog row: {e}")))?;
+
+        for c in &m.cells {
+            sqlx::query(
+                "INSERT INTO model_fleet_catalog_cell \
+                 (model_name, quant, test_type, task_category, status, pass_rate, \
+                  n_samples, score_stddev, low_confidence, last_run_at, harness_version) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            )
+            .bind(&c.model_name)
+            .bind(c.quant.as_deref())
+            .bind(&c.test_type)
+            .bind(&c.task_category)
+            .bind(CoverageStatus::as_str(&c.status))
+            .bind(c.pass_rate)
+            .bind(c.n_samples.map(|n| n as i32))
+            .bind(c.score_stddev)
+            .bind(c.low_confidence)
+            .bind(c.last_run_at)
+            .bind(c.harness_version.as_deref())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ToolError::Database(format!("insert model_fleet_catalog_cell row: {e}")))?;
+        }
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| ToolError::Database(format!("commit fleet-catalog persist tx: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1464,5 +2084,90 @@ mod tests {
         assert!(SELECT_CODE_RUN_FACTORS_FALLBACK_SQL.contains("NULL::integer"));
         assert!(SELECT_CODE_RUN_FACTORS_FALLBACK_SQL.contains("NULL::double precision"));
         assert!(SELECT_CODE_RUN_FACTORS_FALLBACK_SQL.contains("WHERE id = $1"));
+    }
+
+    // ---- MINT2-05: harness-version epochs ------------------------------
+
+    /// The missing-RELATION detector (used by the aggregate read AND the new
+    /// epoch-marker read) matches only "relation … does not exist", never an
+    /// unrelated DB error or a missing-COLUMN error.
+    #[test]
+    fn is_missing_relation_error_matches_only_missing_relation() {
+        assert!(is_missing_relation_error(
+            "error returned from database: relation \"code_run_aggregates\" does not exist"
+        ));
+        assert!(is_missing_relation_error(
+            "relation \"intake_epoch_marker\" does not exist"
+        ));
+        // A missing COLUMN is a different case (handled by is_missing_column_error).
+        assert!(!is_missing_relation_error("column \"quant\" does not exist"));
+        assert!(!is_missing_relation_error("connection refused"));
+    }
+
+    /// The selector-aware aggregate read scopes to ONE epoch for
+    /// Current/Only (binding `harness_version = $1`) and to EVERY epoch for
+    /// All (a bind-free `TRUE`), reusing the central epoch fragment.
+    #[test]
+    fn epoch_where_fragment_drives_selected_aggregate_scoping() {
+        // Current resolves to the one central epoch value.
+        assert_eq!(
+            crate::intake::epoch_where_fragment(&EpochSelector::Current, 1),
+            "harness_version = $1"
+        );
+        // Only(legacy) is still a single-epoch filter (legacy stays queryable).
+        assert_eq!(
+            crate::intake::epoch_where_fragment(&EpochSelector::Only("v1".into()), 1),
+            "harness_version = $1"
+        );
+        // All → no filter, so legacy + current both return (provenance view).
+        assert_eq!(
+            crate::intake::epoch_where_fragment(&EpochSelector::All, 1),
+            "TRUE"
+        );
+        // ...and the selector reports whether a bind is consumed.
+        assert_eq!(EpochSelector::Current.epoch(), Some(crate::intake::current_epoch()));
+        assert_eq!(EpochSelector::All.epoch(), None);
+    }
+
+    /// The stored-aggregate tuple mapper round-trips every column into the
+    /// struct (proving the epoch-specific and selector-aware reads decode
+    /// identically) — including the `harness_version` epoch key.
+    #[test]
+    fn map_stored_agg_round_trips_all_columns() {
+        let t: StoredAggTuple = (
+            "qwen3-coder:30b".to_string(),
+            Some("blitz".to_string()),
+            "v3".to_string(),
+            Some("Q4_K_M".to_string()),
+            Some(true),
+            Some(8192),
+            Some(0.7),
+            Some(0.9),
+            0.5,
+            4,
+            2,
+            0.25,
+            false,
+        );
+        let a = map_stored_agg(t);
+        assert_eq!(a.model, "qwen3-coder:30b");
+        assert_eq!(a.harness_version, "v3");
+        assert_eq!(a.n_samples, 4);
+        assert_eq!(a.passes, 2);
+        assert_eq!(a.pass_rate, 0.5);
+    }
+
+    /// The epoch-marker upsert is idempotent: an INSERT keyed on the `epoch`
+    /// PRIMARY KEY with `ON CONFLICT (epoch) DO UPDATE`, so recording `'v3'`
+    /// twice never duplicates the audit row, and the first-seen
+    /// `became_current_at` is preserved (only `note` is refreshed).
+    #[test]
+    fn upsert_epoch_marker_sql_is_idempotent_upsert() {
+        assert!(UPSERT_EPOCH_MARKER_SQL.contains("INSERT INTO intake_epoch_marker (epoch, note)"));
+        assert!(UPSERT_EPOCH_MARKER_SQL.contains("ON CONFLICT (epoch) DO UPDATE"));
+        // became_current_at is NOT in the conflict SET — the original stamp stays.
+        assert!(!UPSERT_EPOCH_MARKER_SQL.contains("became_current_at ="));
+        // note is refreshed only when a new one is supplied (COALESCE keeps prior).
+        assert!(UPSERT_EPOCH_MARKER_SQL.contains("note = COALESCE(EXCLUDED.note"));
     }
 }
