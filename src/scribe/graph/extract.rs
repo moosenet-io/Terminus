@@ -78,6 +78,17 @@ fn last_segment(name: &str) -> &str {
     name.rsplit("::").next().unwrap_or(name).trim()
 }
 
+/// The last segment of a MODULE path that may use any of `.` / `/` / `::` as a
+/// separator (`a.b` -> `b`, `x/y` -> `y`, `crate::a` -> `a`). Used to qualify an
+/// import's source module regardless of the language's path syntax.
+fn mod_last_segment(s: &str) -> String {
+    s.rsplit(|c| c == '.' || c == '/' || c == ':')
+        .find(|seg| !seg.trim().is_empty())
+        .unwrap_or(s)
+        .trim()
+        .to_string()
+}
+
 /// The base type name: last `::`-segment with any generic argument list
 /// stripped (`std::vec::Vec<T>` -> `Vec`, `Cache<K, V>` -> `Cache`). Without
 /// this, generic-type impls would FQN a method as `crate::m::Cache<T>::get`,
@@ -718,7 +729,7 @@ fn generic_imports(node: Node, src: &[u8]) -> Vec<String> {
     let qualifier: Option<String> = node
         .child_by_field_name("module_name")
         .and_then(|m| m.utf8_text(src).ok())
-        .map(|t| last_segment(t.trim()).to_string())
+        .map(|t| mod_last_segment(t.trim()))
         .filter(|s| !s.is_empty())
         .or_else(|| {
             // a string literal source anywhere in the import (JS/TS)
@@ -728,7 +739,7 @@ fn generic_imports(node: Node, src: &[u8]) -> Vec<String> {
                 .find(|ch| ch.kind() == "string" || ch.kind() == "string_fragment");
             let seg = strnode
                 .and_then(|s| s.utf8_text(src).ok())
-                .map(|t| last_segment(t.trim_matches(|c| c == '"' || c == '\'' || c == '/')).to_string())
+                .map(|t| mod_last_segment(t.trim_matches(|c| c == '"' || c == '\'')))
                 .filter(|s| !s.is_empty());
             seg
         });
@@ -1176,6 +1187,23 @@ pub fn outer() -> u8 {
             g.edges().any(|e| e.kind == EdgeKind::Imports && e.from == "pkg::c" && e.to == "pkg::a::helper"),
             "qualified import edge present"
         );
+    }
+
+    #[test]
+    fn multi_segment_dotted_import_qualifies() {
+        // `from pkg.a import helper` (multi-segment module) must qualify to
+        // pkg::a::helper, not fall back to global-ambiguous drop.
+        let files = vec![
+            ("pkg/a.py".to_string(), "def helper():\n    return 1\n".to_string()),
+            ("pkg/b.py".to_string(), "def helper():\n    return 2\n".to_string()),
+            ("svc/c.py".to_string(), "from pkg.a import helper\n\ndef use():\n    return helper()\n".to_string()),
+        ];
+        let g = build_graph("P", &files).unwrap();
+        let call = g
+            .edges()
+            .find(|e| e.kind == EdgeKind::Calls && e.from == "svc::c::use")
+            .expect("multi-segment import qualified the call");
+        assert_eq!(call.to, "pkg::a::helper");
     }
 
     #[test]
