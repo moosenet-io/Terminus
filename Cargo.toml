@@ -111,6 +111,10 @@ serde_yaml = "0.9"
 # Parse-only at runtime (overlay claims are JSON in Redis via serde_json).
 toml = "0.8"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid"], default-features = false }
+# KGEMB-01: Atlas KG semantic-embeddings vector store (kg_embeddings table).
+# The "sqlx" feature binds pgvector::Vector as a bindable/decodable sqlx type
+# for the Postgres `vector(N)` column, matching our sqlx 0.8 pin.
+pgvector = { version = "0.4", features = ["sqlx"] }
 ssh2 = "0.9"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
