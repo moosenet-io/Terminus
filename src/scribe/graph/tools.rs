@@ -453,6 +453,73 @@ zoom without walking every node."
     }
 }
 
+// ── kg_query ──────────────────────────────────────────────────────────────────
+pub struct KgQuery;
+
+#[async_trait]
+impl RustTool for KgQuery {
+    fn name(&self) -> &str {
+        "kg_query"
+    }
+    fn description(&self) -> &str {
+        "Answer a natural-language question about a project's codebase against its Atlas knowledge \
+graph (KGRAPH-14). Routes automatically: a specific-symbol question retrieves the ranked matching \
+entities; an architectural/subsystem question retrieves the community summaries. Returns the \
+retrieved context plus, when a model is available, a synthesized answer."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "question": {"type": "string"}
+            },
+            "required": ["project_id", "question"]
+        })
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.execute_structured(args).await?.text)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let project_id = req_str(&args, "project_id")?;
+        let question = req_str(&args, "question")?;
+        let Some(g) = load_graph(&project_id)? else {
+            return structured(no_graph(&project_id));
+        };
+        let level = super::query::classify(&question);
+        let context: Value = match level {
+            super::query::QueryLevel::Entity => {
+                serde_json::to_value(super::query::gather_entity(&g, &question, 15)).unwrap_or_else(|_| json!([]))
+            }
+            super::query::QueryLevel::Community => {
+                serde_json::to_value(super::query::gather_community(&g)).unwrap_or_else(|_| json!([]))
+            }
+        };
+
+        // Best-effort answer synthesis (two-tier: strong model over the context).
+        let mut answer = Value::Null;
+        let semantic_on = std::env::var("SCRIBE_KG_SEMANTIC")
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        if semantic_on {
+            let review_cfg = crate::review::ReviewConfig::from_env();
+            if review_cfg.daemon_token.is_some() {
+                let ctx_str = serde_json::to_string(&context).unwrap_or_default();
+                let prompt = super::query::build_answer_prompt(&question, level, &ctx_str);
+                if let Ok(reply) = crate::scribe::dispatch_docs_generation(&review_cfg, &prompt).await {
+                    answer = json!(reply.trim());
+                }
+            }
+        }
+
+        structured(json!({
+            "project_id": project_id, "found": true,
+            "level": level, "question": question,
+            "answer": answer, "context": context,
+        }))
+    }
+}
+
 /// Register the `kg_*` tools on the core registry.
 pub fn register(registry: &mut ToolRegistry) {
     let _ = registry.register(Box::new(KgSearch));
@@ -461,6 +528,7 @@ pub fn register(registry: &mut ToolRegistry) {
     let _ = registry.register(Box::new(KgPath));
     let _ = registry.register(Box::new(KgStats));
     let _ = registry.register(Box::new(KgCommunities));
+    let _ = registry.register(Box::new(KgQuery));
 }
 
 #[cfg(test)]
@@ -580,6 +648,38 @@ pub struct Widget;
         assert!(v["count"].as_u64().unwrap() >= 1, "at least one community");
         let comms = v["communities"].as_array().unwrap();
         assert!(comms.iter().all(|c| c["summary"] == ""), "no summaries without a daemon");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn query_routes_and_returns_context_without_daemon() {
+        let dir = std::env::temp_dir().join(format!("atlas-kgquery-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &dir);
+        std::env::remove_var("SCRIBE_KG_SEMANTIC");
+        let mut g = build_rust_graph(
+            "QRY",
+            &[("src/x.rs".to_string(), "pub fn backoff(){}\npub fn caller(){backoff();}".to_string())],
+        )
+        .unwrap();
+        crate::scribe::graph::cluster::cluster(&mut g);
+        GraphStore::from_config(&ScribeConfig::from_env()).save("QRY", &g).unwrap();
+
+        // specific-symbol question → entity level, matching node in context
+        let v = val(KgQuery
+            .execute_structured(json!({"project_id": "QRY", "question": "where is backoff"}))
+            .await
+            .unwrap());
+        assert_eq!(v["level"], "entity");
+        assert!(v["answer"].is_null(), "no synthesis without a daemon");
+        assert!(v["context"].as_array().unwrap().iter().any(|h| h["id"] == "crate::x::backoff"));
+
+        // architectural question → community level
+        let v2 = val(KgQuery
+            .execute_structured(json!({"project_id": "QRY", "question": "give an overview of the architecture"}))
+            .await
+            .unwrap());
+        assert_eq!(v2["level"], "community");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

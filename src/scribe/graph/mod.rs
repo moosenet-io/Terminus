@@ -22,6 +22,7 @@ pub mod embed;
 pub mod extract;
 pub mod layout;
 pub mod model;
+pub mod query;
 pub mod rank;
 pub mod render;
 pub mod semantic;
