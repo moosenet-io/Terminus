@@ -78,7 +78,7 @@ use std::sync::Arc;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::mesh::Principal;
 use audit::{AuditEntry, AuditResult};
@@ -196,18 +196,73 @@ impl Grant {
     /// checked only after confirming `allow` would otherwise grant it, but
     /// its result overrides that grant unconditionally (no such thing as
     /// "denied but also separately allowed").
+    ///
+    /// MESH-08: `action` may now be a plain local tool/route name OR a mesh
+    /// namespaced name (`<namespace>__<tool>`, see
+    /// [`crate::mesh::merge::namespaced`]) — an allow ENTRY may itself be a
+    /// bare wildcard (`"*"`), an exact plain/namespaced name
+    /// (`"ct322__ledger_add"`), or a namespace wildcard
+    /// (`"ct322__*"`, matching every tool exported by that one upstream) via
+    /// [`grant_entry_matches`]. A DENY entry is checked against `action`
+    /// verbatim AND, when `action` is namespaced, against its bare (post-`__`)
+    /// tool name as well — see [`deny_matches`] for why: this is what makes
+    /// [`DEFAULT_SENSITIVE_DENY_PREFIXES`] (authored against bare names like
+    /// `"github_"`) continue to close a sensitive tool re-exported through
+    /// ANY upstream namespace, not just the local/bare form.
     fn permits(&self, action: &str) -> bool {
         match self {
-            Grant::List(actions) => actions.iter().any(|a| a == "*" || a == action),
+            Grant::List(actions) => actions.iter().any(|a| grant_entry_matches(a, action)),
             Grant::AllowDeny { allow, deny } => {
-                let allowed = allow.iter().any(|a| a == "*" || a == action);
+                let allowed = allow.iter().any(|a| grant_entry_matches(a, action));
                 if !allowed {
                     return false;
                 }
-                !deny.iter().any(|d| action == d || action.starts_with(d.as_str()))
+                !deny.iter().any(|d| deny_matches(d, action))
             }
         }
     }
+}
+
+/// Whether allow/list `entry` matches `action`. Three shapes:
+/// - `"*"` — matches everything.
+/// - `"<prefix>*"` (any other entry ending in `*`) — matches every `action`
+///   starting with `prefix`. This is what lets an allow entry like
+///   `"ct322__*"` grant an entire mesh upstream namespace, or (equally)
+///   `"github_*"` grant a local prefix, without hand-listing every tool name
+///   — additive over the pre-MESH-08 behavior, where only the bare `"*"`
+///   entry had any wildcard meaning at all (a non-`"*"` entry was always an
+///   exact match), so no existing config's meaning changes.
+/// - anything else — exact match only, the original (pre-MESH-08) behavior.
+fn grant_entry_matches(entry: &str, action: &str) -> bool {
+    if entry == "*" {
+        return true;
+    }
+    match entry.strip_suffix('*') {
+        Some(prefix) => action.starts_with(prefix),
+        None => entry == action,
+    }
+}
+
+/// Whether deny-prefix `entry` matches `action`, per [`Grant::AllowDeny`]'s
+/// existing exact-or-prefix rule — applied to `action` as given AND, when
+/// `action` is a mesh namespaced name (`<namespace>__<tool>`), to its bare
+/// tool name too (MESH-08). This composition is deliberate: a deny entry
+/// like `"github_"` in [`DEFAULT_SENSITIVE_DENY_PREFIXES`] was authored
+/// against bare local tool names, from before any upstream could re-export a
+/// same-named sensitive tool under a namespace prefix. Without this bare-name
+/// fallback, `"ct322__github_push_repo"` would slip past a deny entry that
+/// very obviously means to block it — the sensitive-deny prefixes are
+/// meant to compose WITH namespacing, not be shadowed by it.
+fn deny_matches(entry: &str, action: &str) -> bool {
+    if action == entry || action.starts_with(entry) {
+        return true;
+    }
+    if let Some((_, bare)) = crate::mesh::merge::split_namespaced(action) {
+        if bare == entry || bare.starts_with(entry) {
+            return true;
+        }
+    }
+    false
 }
 
 impl From<Vec<String>> for Grant {
@@ -334,6 +389,32 @@ impl AllowlistPolicy {
             Some(grant) => grant.permits(action),
             None => false,
         }
+    }
+
+    /// MESH-08: filter a `tools/list` catalog (a `Vec` of MCP `Tool` JSON
+    /// objects, each with a `"name"` field — the same shape
+    /// [`crate::mesh::merge::MergedCatalog::tools`] and
+    /// `src/mcp_server.rs`'s `tools/list` handler already build) down to
+    /// exactly the tools `identity` may CALL per this policy. A tool object
+    /// with no `"name"` field at all (should not happen in practice, but
+    /// this is a filter, not a validator) is dropped rather than kept —
+    /// fail-closed, consistent with `is_allowed`'s own default-deny.
+    ///
+    /// This is the single source of truth both `tools/list` visibility and
+    /// `tools/call` enforcement are checked against ([`Self::is_allowed`] is
+    /// exactly what [`GatewayFramework::guard`] calls for the `tools/call`
+    /// gate) — a tool this method keeps is always also callable, and a tool
+    /// it drops is always also denied at call time, by construction (same
+    /// underlying `Grant::permits` decision, same `action` string: the
+    /// tool's advertised `"name"`, namespaced or not).
+    pub fn filter_tools(&self, identity: &str, tools: Vec<Value>) -> Vec<Value> {
+        tools
+            .into_iter()
+            .filter(|t| match t.get("name").and_then(|n| n.as_str()) {
+                Some(name) => self.is_allowed(identity, name),
+                None => false,
+            })
+            .collect()
     }
 }
 
@@ -474,6 +555,23 @@ impl GatewayFramework {
             action: action.to_string(),
             kind,
         })
+    }
+
+    /// MESH-08: filter a merged `tools/list` catalog down to exactly what
+    /// `principal` may call — visibility/enforcement parity with
+    /// [`Self::guard`]'s `tools/call` gate, both ultimately backed by the
+    /// same [`AllowlistPolicy::is_allowed`] decision per tool name.
+    ///
+    /// `principal: None` (no server-verified transport identity — the exact
+    /// condition [`Self::guard`] fails closed on) returns an EMPTY catalog,
+    /// never the unfiltered input — a caller with no identity at all must
+    /// never be shown tools it could not subsequently call, mirroring
+    /// `guard`'s own fail-closed rule for the missing-identity case.
+    pub fn filter_catalog_for_principal(&self, principal: Option<&Principal>, tools: Vec<Value>) -> Vec<Value> {
+        match principal {
+            Some(p) => self.inner.allowlist.filter_tools(p.name(), tools),
+            None => Vec::new(),
+        }
     }
 }
 
@@ -856,5 +954,154 @@ mod tests {
         assert!(policy.is_allowed("harmony", "reminder_poll"));
         assert!(!policy.is_allowed("harmony", "infisical_get_secret"));
         std::env::remove_var("TERMINUS_GATEWAY_ALLOWLIST_JSON");
+    }
+
+    // ── MESH-08: per-upstream, per-tool RBAC over namespaced tools ──────
+
+    fn tool_json(name: &str) -> Value {
+        json!({"name": name, "description": "d", "inputSchema": {"type": "object"}})
+    }
+
+    /// Namespace-wildcard allow entry (`"ct322__*"`) grants every tool under
+    /// that one namespace, but a narrower `deny` prefix on the same
+    /// namespace still wins -- and `tools/list` visibility (`filter_tools`)
+    /// agrees exactly with `tools/call` enforcement (`is_allowed`) for every
+    /// tool checked, proving a hidden tool is also uncallable and a visible
+    /// one is also callable.
+    #[tokio::test]
+    async fn namespace_wildcard_allow_with_narrower_deny_prefix_list_and_call_agree() {
+        fn ct322_viewer_map() -> HashMap<String, Grant> {
+            let mut map = HashMap::new();
+            map.insert(
+                "ct322-viewer".to_string(),
+                Grant::AllowDeny {
+                    allow: vec!["ct322__*".to_string()],
+                    deny: vec!["ct322__vitals_".to_string()],
+                },
+            );
+            map
+        }
+        let policy = AllowlistPolicy::new(ct322_viewer_map());
+        let fw = framework_with(AllowlistPolicy::new(ct322_viewer_map()), 10);
+        let id = identity("ct322-viewer");
+
+        let catalog = vec![
+            tool_json("ct322__ledger_add"),
+            tool_json("ct322__vitals_get"),
+            tool_json("other__ledger_add"),
+            tool_json("plain_local_tool"),
+        ];
+        let visible = policy.filter_tools("ct322-viewer", catalog);
+        let visible_names: Vec<&str> =
+            visible.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str())).collect();
+
+        assert!(visible_names.contains(&"ct322__ledger_add"));
+        assert!(!visible_names.contains(&"ct322__vitals_get"), "denied prefix must be hidden");
+        assert!(!visible_names.contains(&"other__ledger_add"), "other namespace must be hidden");
+        assert!(!visible_names.contains(&"plain_local_tool"), "un-granted local tool must be hidden");
+
+        // Enforcement agrees with visibility for every candidate tool.
+        for name in ["ct322__ledger_add", "ct322__vitals_get", "other__ledger_add", "plain_local_tool"] {
+            let call_ok = fw.guard(Some(&id), name, ActionKind::Tool).await.is_ok();
+            let list_ok = visible_names.contains(&name);
+            assert_eq!(call_ok, list_ok, "list/call parity violated for '{name}'");
+        }
+    }
+
+    /// Deny-prefix precedence is preserved for namespaced names even under a
+    /// bare `allow: ["*"]` wildcard grant (not just a namespace-scoped
+    /// wildcard) -- and the sensitive-deny prefix composes with namespacing:
+    /// a bare sensitive name re-exported under ANY `<ns>__` prefix stays
+    /// denied by default, exactly like the un-namespaced form.
+    #[tokio::test]
+    async fn deny_prefix_beats_wildcard_allow_on_namespaced_tool_and_composes_with_sensitive_defaults() {
+        let mut map = HashMap::new();
+        map.insert(
+            "broad-id".to_string(),
+            Grant::AllowDeny {
+                allow: vec!["*".to_string()],
+                deny: DEFAULT_SENSITIVE_DENY_PREFIXES.iter().map(|s| s.to_string()).collect(),
+            },
+        );
+        let policy = AllowlistPolicy::new(map);
+
+        assert!(policy.is_allowed("broad-id", "ct322__ledger_add"));
+        assert!(
+            !policy.is_allowed("broad-id", "ct322__github_push_repo"),
+            "a sensitive bare name under a mesh namespace prefix must stay denied by default"
+        );
+        assert!(!policy.is_allowed("broad-id", "github_push_repo"), "un-namespaced sensitive name still denied");
+    }
+
+    /// An unmapped principal gets an EMPTY filtered catalog (not the
+    /// unfiltered input) and every call is denied -- default-deny extends
+    /// cleanly to the list-filter path, not just `guard`.
+    #[tokio::test]
+    async fn unmapped_principal_gets_empty_catalog_and_every_call_denied() {
+        let policy = AllowlistPolicy::default();
+        let fw = framework_with(AllowlistPolicy::default(), 10);
+        let id = identity("totally-unmapped");
+
+        let catalog = vec![tool_json("ct322__ledger_add"), tool_json("plain_local_tool")];
+        let visible = policy.filter_tools("totally-unmapped", catalog.clone());
+        assert!(visible.is_empty(), "unmapped principal must see an empty catalog");
+
+        for tool in &catalog {
+            let name = tool.get("name").and_then(|n| n.as_str()).unwrap();
+            assert!(fw.guard(Some(&id), name, ActionKind::Tool).await.is_err());
+        }
+    }
+
+    /// `GatewayFramework::filter_catalog_for_principal` with `principal:
+    /// None` returns an empty catalog too -- mirroring `guard`'s own
+    /// fail-closed behavior for a missing identity, never the raw
+    /// unfiltered input.
+    #[test]
+    fn filter_catalog_for_principal_none_is_empty() {
+        let fw = framework_with(policy_allowing("dev-box", &["*"]), 10);
+        let catalog = vec![tool_json("ledger_accounts")];
+        let filtered = fw.filter_catalog_for_principal(None, catalog);
+        assert!(filtered.is_empty());
+    }
+
+    /// A namespace wildcard grant referencing a namespace with no live
+    /// upstream is simply inert (matches nothing that catalog build ever
+    /// produces) -- no error, no special-casing needed. Modeled here as: the
+    /// grant matches an action string with that prefix if one is ever
+    /// presented (pre-authoring for a not-yet-deployed upstream is allowed),
+    /// but an empty catalog filters down to empty regardless.
+    #[test]
+    fn namespace_grant_for_unregistered_upstream_is_inert_not_an_error() {
+        let mut map = HashMap::new();
+        map.insert(
+            "future-viewer".to_string(),
+            Grant::List(vec!["notyetdeployed__*".to_string()]),
+        );
+        let policy = AllowlistPolicy::new(map);
+        // No upstream by that namespace exists in this test's catalog at
+        // all -- filtering just yields nothing, no panic/error.
+        let visible = policy.filter_tools("future-viewer", vec![tool_json("plain_local_tool")]);
+        assert!(visible.is_empty());
+        // But the grant is still syntactically live: if that upstream is
+        // deployed later and starts exporting tools, they'd immediately be
+        // visible without any policy change.
+        assert!(policy.is_allowed("future-viewer", "notyetdeployed__some_tool"));
+    }
+
+    /// Existing single-identity (non-mesh) callers are unaffected: a plain
+    /// `Grant::List` grant with no namespaced entries behaves identically to
+    /// pre-MESH-08 for both call-gating and list-filtering.
+    #[tokio::test]
+    async fn plain_grant_additive_no_namespacing_behavior_unchanged() {
+        let policy = policy_allowing("dev-box", &["ledger_accounts"]);
+        let fw = framework_with(policy_allowing("dev-box", &["ledger_accounts"]), 10);
+        let id = identity("dev-box");
+
+        let visible = policy.filter_tools("dev-box", vec![tool_json("ledger_accounts"), tool_json("other_tool")]);
+        let names: Vec<&str> = visible.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str())).collect();
+        assert_eq!(names, vec!["ledger_accounts"]);
+
+        assert!(fw.guard(Some(&id), "ledger_accounts", ActionKind::Tool).await.is_ok());
+        assert!(fw.guard(Some(&id), "other_tool", ActionKind::Tool).await.is_err());
     }
 }
