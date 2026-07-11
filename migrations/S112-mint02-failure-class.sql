@@ -10,9 +10,13 @@
 -- `src/intake/storage.rs` is authoritative that the harness only INSERTs and
 -- SELECTs `code_profile_runs`, never issuing DDL against it. The read path is
 -- written to tolerate a DB where this column does not yet exist (a NULL-typed
--- fallback query, so a missing column reads as NULL and never panics) — so this
--- migration can be applied any time after the MINT2-02 PR merges; until it runs,
--- new `'v3'` rows simply persist without a failure_class.
+-- fallback query, so a missing column reads as NULL and never panics).
+-- IMPORTANT — reads tolerate absence, WRITES DO NOT: `insert_code_run_v2`
+-- unconditionally names `failure_class` in its INSERT, so on a DB without this
+-- column every sweep insert fails with undefined_column and aborts the suite.
+-- Therefore this migration MUST be applied BEFORE (or together with) deploying
+-- the MINT2-02 sweep binary — not "any time after". Applying it early is safe
+-- (additive, nullable); deploying the binary first is not.
 --
 -- Additive and non-destructive: the column is nullable, there is NO backfill.
 -- Legacy `'v1'`/`'v2'` rows keep NULL — and NULL is DISTINCT from the "none"
