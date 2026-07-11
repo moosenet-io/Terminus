@@ -49,6 +49,7 @@ pub mod drift;
 pub mod generate;
 pub mod mismatch;
 pub mod pii_gate;
+pub mod quality;
 pub mod readme_layers;
 pub mod render;
 pub mod search_index;
@@ -70,6 +71,10 @@ pub use generate::{
     SweptFeatContext,
 };
 pub use pii_gate::{sweep_input, sweep_input_for_routing, PiiGateOutcome, RoutingDestination};
+pub use quality::{
+    lint_prose, run_quality_gate, JudgeScores, LintResult, ProseLintConfig, QualityScore,
+    QualityScoreStore, QualityVerdict, DEFAULT_QUALITY_THRESHOLD,
+};
 pub use readme_layers::{
     deepen_layers, parse_layers, render_diataxis_set, render_layered_readme, DiataxisArtifact,
     DiataxisMode, ParsedLayers,
