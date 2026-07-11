@@ -25,6 +25,7 @@
 //! per-service configuration state without ever failing itself.
 
 pub mod clients;
+pub mod organize;
 pub mod request;
 pub mod search;
 
@@ -88,12 +89,15 @@ impl RustTool for MediaDomainStatus {
 
 /// Register the media domain's tools. MEDIA-01 registers one internal
 /// status tool; MEDIA-02 adds the read/search surface (`media_search`,
-/// `media_status`); MEDIA-03..07 add the remaining request/organize/
-/// recommend/surface tools on top of the clients this item establishes.
+/// `media_status`); MEDIA-03 adds the tiered request/download tool; MEDIA-04
+/// adds organize + hard-gated destructive ops; MEDIA-05..07 add the
+/// remaining recommend/surface tools on top of the clients this item
+/// establishes.
 pub fn register(registry: &mut ToolRegistry) {
     registry.register_or_replace(Box::new(MediaDomainStatus));
     search::register(registry);
     request::register(registry);
+    organize::register(registry);
 }
 
 #[cfg(test)]

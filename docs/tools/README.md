@@ -104,7 +104,7 @@ and documentation generation.
 | `openhands` | ~3 | Drives the OpenHands agentic-coding runtime over its HTTP API (run task, list conversations, get status). | [`code-git/openhands.md`](code-git/openhands.md) |
 | `cortex` | ~10 | Code-graph / blast-radius / risk-scoring system — architecture, dependency, and review-flow analysis over a repo. | [`code-git/cortex.md`](code-git/cortex.md) |
 | `scribe` | ~5 | Standing documentation agent — generates READMEs, wikis, and other knowledge-infrastructure artifacts from a repo. | [`code-git/scribe.md`](code-git/scribe.md) |
-| `docgen` | 1 | **Scaffold (DOCGEN-01, S95).** The sovereign, in-house documentation engine (replacing Mintlify): a per-project doc-target config schema (readme/wiki/pdf/notion/obsidian/blog) plus `docgen_status`, a read-only config-inspection tool. No generation/render/versioning yet — those land in later DOCGEN items. | [`code-git/docgen.md`](code-git/docgen.md) |
+| `docgen` | ~5 | **S95.** The sovereign, in-house documentation engine (replacing Mintlify): per-project doc-target config (readme/wiki/pdf/notion/obsidian/blog), PII-swept generation via Chord's SLM router, multi-format rendering, versioning, and `docgen_run` — the post-feat build-skill trigger (DOCGEN-08) that runs the whole flow and returns versioned artifacts for the harness to place. | [`code-git/docgen.md`](code-git/docgen.md) |
 
 ### Project & Planning — 7 tools
 
@@ -172,7 +172,7 @@ the bulk of the `terminus_personal` registry.
 | `vitals` | ~11 | Health tracking (weight, sleep, and other logs; summary/recent/today; program creation) via a REST API backend. | [`personal-life/vitals.md`](personal-life/vitals.md) |
 | `hearth` | ~7 | Pantry/meal-planning tools via Grocy — what-can-I-make, pantry list, meal plan. | [`personal-life/hearth.md`](personal-life/hearth.md) |
 | `<media-service>` | ~8 | Read-only media request queries against <media-service> (Plex/Jellyfin request management). | [`personal-life/<media-service>.md`](personal-life/<media-service>.md) |
-| `media` | 4 | **S94.** Sovereign media-stack orchestration domain (Radarr/Sonarr/Prowlarr/qtor/Plex/<media-service>/TMDb) — vault(env)-backed service clients, a config-status tool, the read/search surface (`media_search`, `media_status`), and (MEDIA-03) `media_request` — tiered-confirmation add/request driving Radarr/Sonarr → the download client. Organize/recommend tools land in MEDIA-04..07. | [`personal-life/media.md`](personal-life/media.md) |
+| `media` | 7 | **S94.** Sovereign media-stack orchestration domain (Radarr/Sonarr/Prowlarr/qtor/Plex/<media-service>/TMDb) — vault(env)-backed service clients, a config-status tool, the read/search surface (`media_search`, `media_status`), (MEDIA-03) `media_request` — tiered-confirmation add/request driving Radarr/Sonarr → the download client, and (MEDIA-04) `media_organize`/`media_delete`/`media_cleanup` — non-destructive organize plus hard-typed-confirmation destructive delete/bulk cleanup. Recommend tools land in MEDIA-05..07. | [`personal-life/media.md`](personal-life/media.md) |
 | `commute` | ~8 | Traffic-aware routing (TomTom) and Bay Area public-transit planning (511.org). | [`personal-life/commute.md`](personal-life/commute.md) |
 | `weather` | 1 | Current conditions and forecasts via OpenWeatherMap. | [`personal-life/weather.md`](personal-life/weather.md) |
 | `news` | ~3 | Headlines, search, and topic feeds. | [`personal-life/news.md`](personal-life/news.md) |

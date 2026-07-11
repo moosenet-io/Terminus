@@ -99,6 +99,47 @@ impl SonarrClient {
 
         map_response(resp).await
     }
+
+    /// `PUT /api/v3/series/{id}` — update an existing series resource (tags,
+    /// `monitored`, `qualityProfileId`, ...). See
+    /// [`crate::media::clients::radarr::RadarrClient::update_movie`] for the
+    /// full-resource-body caveat; same shape here.
+    pub async fn update_series(&self, id: i64, body: Value) -> Result<Value, ToolError> {
+        let url = format!("{}/api/v3/series/{id}", self.base_url);
+        let resp = self
+            .http
+            .put(&url)
+            .header("X-Api-Key", &self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ToolError::Http(format!("Sonarr unavailable: {e}")))?;
+
+        map_response(resp).await
+    }
+
+    /// `DELETE /api/v3/series/{id}?deleteFiles=true&addImportListExclusion=false`
+    /// — remove a series from the Sonarr library and delete its files. See
+    /// [`crate::media::clients::radarr::RadarrClient::delete_movie`] for the
+    /// rationale (thin/unconditional; the hard-confirm gate lives in
+    /// `crate::media::organize`) and the `Ok(false)`-on-404 no-op contract.
+    pub async fn delete_series(&self, id: i64) -> Result<bool, ToolError> {
+        let url = format!("{}/api/v3/series/{id}", self.base_url);
+        let resp = self
+            .http
+            .delete(&url)
+            .header("X-Api-Key", &self.api_key)
+            .query(&[("deleteFiles", "true"), ("addImportListExclusion", "false")])
+            .send()
+            .await
+            .map_err(|e| ToolError::Http(format!("Sonarr unavailable: {e}")))?;
+
+        match map_response(resp).await {
+            Ok(_) => Ok(true),
+            Err(ToolError::NotFound(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 async fn map_response(resp: reqwest::Response) -> Result<Value, ToolError> {
@@ -260,5 +301,48 @@ mod tests {
         let client = test_client(&server.base_url());
         let result = client.library().await;
         assert!(matches!(result, Err(ToolError::Http(_))));
+    }
+
+    #[tokio::test]
+    async fn update_series_puts_body_and_parses_mocked_200() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(PUT).path("/api/v3/series/9");
+            then.status(200).json_body(json!({ "id": 9, "monitored": false }));
+        });
+
+        let client = test_client(&server.base_url());
+        let result = client.update_series(9, json!({ "id": 9, "monitored": false })).await.unwrap();
+        mock.assert();
+        assert_eq!(result["id"], 9);
+    }
+
+    #[tokio::test]
+    async fn delete_series_present_returns_true() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(DELETE)
+                .path("/api/v3/series/9")
+                .query_param("deleteFiles", "true");
+            then.status(200);
+        });
+
+        let client = test_client(&server.base_url());
+        let deleted = client.delete_series(9).await.unwrap();
+        mock.assert();
+        assert!(deleted);
+    }
+
+    #[tokio::test]
+    async fn delete_series_not_present_returns_false_not_error() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(DELETE).path("/api/v3/series/999");
+            then.status(404);
+        });
+
+        let client = test_client(&server.base_url());
+        let deleted = client.delete_series(999).await.unwrap();
+        assert!(!deleted, "a 404 from Sonarr must map to Ok(false), not an error");
     }
 }

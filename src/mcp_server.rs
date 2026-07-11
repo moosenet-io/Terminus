@@ -575,6 +575,101 @@ async fn handle_mcp(
 
             let (response, success, detail) = match mesh_route {
                 Some(CallRoute::Upstream { client, bare_name }) => {
+                    // MESH-09: a guarded tool (<secret-manager>/ansible/openhands/
+                    // routines, per `approval::is_guarded`) must be
+                    // enforced at THIS gateway even when it lives on a
+                    // remote upstream -- federation must never be a way to
+                    // bypass human approval. Run the same `approval::gate`
+                    // local guarded tools call, keyed on the bare tool name
+                    // so guardedness classification matches local dispatch
+                    // exactly, but with the target namespace folded into
+                    // the gated content (`approval::mesh_gate_args`) so a
+                    // code approved for one upstream's tool can never be
+                    // replayed against another upstream's (or the local)
+                    // same-named tool. This gate is authoritative and runs
+                    // regardless of whatever approval gate the upstream
+                    // itself may also enforce -- double-gating is fine,
+                    // never skipped.
+                    if crate::approval::is_guarded(&bare_name) {
+                        let approval_code = arguments
+                            .get(crate::approval::APPROVAL_ARG)
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        let gate_args = crate::approval::mesh_gate_args(&arguments, client.namespace());
+                        let summary = format!(
+                            "federated call \"{bare_name}\" on mesh upstream \"{}\"",
+                            client.namespace()
+                        );
+                        match crate::approval::gate(&bare_name, &gate_args, &summary).await {
+                            crate::approval::Gate::Granted => {}
+                            crate::approval::Gate::Pending(msg)
+                            | crate::approval::Gate::Denied(msg) => {
+                                return sse_response(
+                                    id,
+                                    Ok(json!({
+                                        "content": [{"type": "text", "text": msg}],
+                                        "isError": true
+                                    })),
+                                    "",
+                                );
+                            }
+                        }
+                        // Approved -- forward the caller's real args, with
+                        // the gateway-only `_approval_code` stripped (the
+                        // upstream's own tool schema knows nothing about
+                        // it, and it must not leak to a remote server).
+                        let mut forward_args = arguments.clone();
+                        if let Some(obj) = forward_args.as_object_mut() {
+                            obj.remove(crate::approval::APPROVAL_ARG);
+                        }
+                        match client.call_tool(&bare_name, forward_args).await {
+                            Ok(outcome) => (
+                                sse_response(
+                                    id,
+                                    Ok(json!({
+                                        "content": [{"type": "text", "text": outcome.text}],
+                                        "isError": outcome.is_error
+                                    })),
+                                    "",
+                                ),
+                                !outcome.is_error,
+                                None,
+                            ),
+                            Err(mesh_err) => {
+                                // Transport/dispatch failure AFTER approval
+                                // was granted -- the operator approved
+                                // "run this call", not "spend the one-time
+                                // code on a failed attempt at an unhealthy
+                                // upstream". Roll the grant back so the same
+                                // code can be retried once the upstream
+                                // recovers (best-effort; a rollback failure
+                                // just means a fresh approval is needed).
+                                if let Some(code) = &approval_code {
+                                    let _ = crate::approval::unconsume(&bare_name, code).await;
+                                }
+                                warn!(
+                                    "mesh: error calling guarded \"{bare_name}\" on upstream \"{}\": {mesh_err}",
+                                    client.namespace()
+                                );
+                                let msg = format!(
+                                    "mesh upstream \"{}\" call failed: {mesh_err}",
+                                    client.namespace()
+                                );
+                                (
+                                    sse_response(
+                                        id,
+                                        Ok(json!({
+                                            "content": [{"type": "text", "text": msg.clone()}],
+                                            "isError": true
+                                        })),
+                                        "",
+                                    ),
+                                    false,
+                                    Some(msg),
+                                )
+                            }
+                        }
+                    } else {
                     match client.call_tool(&bare_name, arguments.clone()).await {
                         Ok(outcome) => (
                             sse_response(
@@ -611,6 +706,7 @@ async fn handle_mcp(
                                 Some(msg),
                             )
                         }
+                    }
                     }
                 }
                 Some(CallRoute::Unavailable { namespace }) => {
