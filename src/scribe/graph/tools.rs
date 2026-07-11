@@ -13,6 +13,7 @@
 //!   - `kg_subgraph`  — the local neighborhood (BFS to a depth)
 //!   - `kg_path`      — how two entities connect (shortest undirected path)
 //!   - `kg_stats`     — clusters, hotspots (top degree), orphans — the shape
+//!   - `kg_file_symbols` — the symbols a given file defines
 //!
 //! Per-project *exposure gating* (`expose_query`) is the companion HARM
 //! pipeline config; these tools are always registered but simply report
@@ -387,6 +388,54 @@ per-cluster counts, the top-degree hotspots, and orphan (degree-0) count."
     }
 }
 
+// ── kg_file_symbols ───────────────────────────────────────────────────────────
+pub struct KgFileSymbols;
+
+const KG_FILE_SYMBOLS_MAX: usize = 500;
+
+#[async_trait]
+impl RustTool for KgFileSymbols {
+    fn name(&self) -> &str {
+        "kg_file_symbols"
+    }
+    fn description(&self) -> &str {
+        "List the symbols a file defines in a project's Atlas knowledge graph: every currently-valid \
+node whose path equals the given repo-relative file path, sorted by PageRank importance. Ask the \
+graph instead of grepping the file for `fn`/`struct`/etc."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "Plane project id, e.g. TERM"},
+                "path": {"type": "string", "description": "repo-relative file path, e.g. src/review/mod.rs"}
+            },
+            "required": ["project_id", "path"]
+        })
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.execute_structured(args).await?.text)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let project_id = req_str(&args, "project_id")?;
+        let path = req_str(&args, "path")?;
+        let Some(g) = load_graph(&project_id)? else {
+            return structured(no_graph(&project_id));
+        };
+        let mut hits: Vec<&super::model::KgNode> = g.current_nodes().filter(|n| n.path == path).collect();
+        hits.sort_by(|a, b| b.rank.total_cmp(&a.rank).then(a.id.cmp(&b.id)));
+        let symbols: Vec<Value> = hits
+            .iter()
+            .take(KG_FILE_SYMBOLS_MAX)
+            .map(|n| json!({"id": n.id, "name": n.name, "kind": n.kind.as_str(), "rank": n.rank, "cluster": n.cluster}))
+            .collect();
+        structured(json!({
+            "project_id": project_id, "found": true, "path": path,
+            "count": symbols.len(), "symbols": symbols,
+        }))
+    }
+}
+
 /// Wrap a JSON value as a `ToolOutput` carrying both a pretty text form and the
 /// structured payload (so a model gets typed results).
 fn structured(v: Value) -> Result<ToolOutput, ToolError> {
@@ -529,6 +578,7 @@ pub fn register(registry: &mut ToolRegistry) {
     let _ = registry.register(Box::new(KgStats));
     let _ = registry.register(Box::new(KgCommunities));
     let _ = registry.register(Box::new(KgQuery));
+    let _ = registry.register(Box::new(KgFileSymbols));
 }
 
 #[cfg(test)]
@@ -680,6 +730,50 @@ pub struct Widget;
             .await
             .unwrap());
         assert_eq!(v2["level"], "community");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn file_symbols_returns_symbols_defined_in_the_file() {
+        let _g = seed_project("FSYM");
+        let out = KgFileSymbols
+            .execute_structured(json!({"project_id": "FSYM", "path": "src/w.rs"}))
+            .await
+            .unwrap();
+        let v = val(out);
+        assert_eq!(v["found"], true);
+        let symbols = v["symbols"].as_array().unwrap();
+        assert!(symbols.iter().any(|s| s["id"] == "crate::w::helper" && s["kind"] == "function"));
+        assert!(symbols.iter().any(|s| s["id"] == "crate::w::caller" && s["kind"] == "function"));
+        assert!(symbols.iter().any(|s| s["id"] == "crate::w::Widget" && s["kind"] == "struct"));
+        assert_eq!(v["count"].as_u64().unwrap(), symbols.len() as u64);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn file_symbols_unknown_path_is_empty_not_error() {
+        let _g = seed_project("FSYM2");
+        let out = KgFileSymbols
+            .execute_structured(json!({"project_id": "FSYM2", "path": "src/does_not_exist.rs"}))
+            .await
+            .unwrap();
+        let v = val(out);
+        assert_eq!(v["found"], true);
+        assert_eq!(v["count"].as_u64().unwrap(), 0);
+        assert!(v["symbols"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn file_symbols_missing_project_reports_not_found() {
+        let dir = std::env::temp_dir().join(format!("atlas-kgfsym-empty-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &dir);
+        let out = KgFileSymbols
+            .execute_structured(json!({"project_id": "NOPE", "path": "src/w.rs"}))
+            .await
+            .unwrap();
+        assert_eq!(val(out)["found"], false);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
