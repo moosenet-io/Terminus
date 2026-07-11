@@ -4,7 +4,7 @@
 
 The `personal-life` domain is the largest single grouping in `terminus_personal` — finance,
 health, vehicle, habits, travel, home, media, and general life-admin integrations. It spans
-**16 tools**, listed below with a one-line description and an exact action count read off each
+**17 tools**, listed below with a one-line description and an exact action count read off each
 module's own `register()`/`register_all()` call site in source (not an estimate — every count
 below was verified by reading the actual `Box::new(...)` registration calls, since some modules
 register a different tool set depending on runtime config — e.g. `<media-service>`, `commute`, and
@@ -28,6 +28,7 @@ top-of-file doc comment; their deep-dive pages are a separate documentation pass
 | `odyssey` | 8 | Trip planning — bucket list, loyalty-card points, trip log, deals, destination research, itinerary optimization. | [`odyssey.md`](odyssey.md) |
 | `hearth` | 7 | Pantry/meal-planning via Grocy — pantry list/add, meal plan, shopping list, "what can I make", recipe search, stock check. Replaced a legacy Python tool that used `shell=True`. | [`hearth.md`](hearth.md) |
 | `<media-service>` | 4 | Read-only media request queries against <media-service> (Plex/Jellyfin request management) — status, requests, request count, search. | [`<media-service>.md`](<media-service>.md) |
+| `media` | 1 | **Scaffold (MEDIA-01, S94).** Sovereign media-stack orchestration domain (Radarr/Sonarr/Prowlarr/qtor/Plex/<media-service>/TMDb) — one thin, env-config-backed client per service plus `media_domain_status`, a config-presence-only status tool. No search/request/organize/recommend tools yet — MEDIA-02..07 build those on this scaffold. | [`media.md`](media.md) |
 | `commute` | 4 | Traffic-aware routing and incident data (TomTom) plus a Bay Area public-transit planner (511.org). | [`commute.md`](commute.md) |
 | `weather` | 1 | Current conditions and forecasts via OpenWeatherMap. | [`weather.md`](weather.md) |
 | `news` | 3 | Headlines, search, and topic feeds (NewsAPI / GNews). | [`news.md`](news.md) |
@@ -38,7 +39,7 @@ top-of-file doc comment; their deep-dive pages are a separate documentation pass
 
 ## Common patterns across the domain
 
-A few conventions recur across most of these 16 modules, worth knowing before reading any single
+A few conventions recur across most of these 17 modules, worth knowing before reading any single
 page:
 
 - **Config-gated stub registration.** Several modules (`<media-service>`, `commute`, `weather`,

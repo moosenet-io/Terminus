@@ -5,7 +5,7 @@
 # Terminus
 
 **The Rust MCP tool hub and federated gateway for the Lumina constellation — one
-authenticated front door for agent tool egress, with ~52 tools, one per
+authenticated front door for agent tool egress, with ~53 tools, one per
 integrated service.**
 
 ## What Terminus is
@@ -47,7 +47,7 @@ MCP server, which owns dispatch, JSON-Schema validation, and governance.
 Governance is mandatory and layered: a path-jailed filesystem, vault-only
 secret access (no raw environment reads for secrets), a PII gate, and a
 sanitized audit log — tools are read-only by default, write scopes are
-explicit. Behind the registry sit the 51 domain tool modules, each owning its
+explicit. Behind the registry sit the 52 domain tool modules, each owning its
 own typed client and credentials. See
 [`docs/architecture/`](docs/architecture/) for the federation, auth, and
 Chord-integration deep-dives.
@@ -56,7 +56,7 @@ Chord-integration deep-dives.
 
 | | |
 | --- | --- |
-| **Tools** | ~52, one per integrated service (GitHub, Plane, Prometheus, …). Each tool exposes a set of **actions** that vary with the backing service and change over time — ~300 individual MCP callables in total across all tools. |
+| **Tools** | ~53, one per integrated service (GitHub, Plane, Prometheus, …). Each tool exposes a set of **actions** that vary with the backing service and change over time — ~300 individual MCP callables in total across all tools. |
 | **Transport** | stdio (local/SSH) and HTTP, with an mTLS listener for federated/remote clients |
 | **Auth** | per-identity mTLS client certificates (`crate::pki`); named-identity tokens (`GITEA_PAT_<NAME>`, `PLANE_PAT_<NAME>`) for outbound git-forge/tracker calls |
 | **Governance** | path-jailed filesystem access, vault-only secrets (never a raw `env::var` for a credential), a mandatory Rust PII gate on every public-forge write, sanitized audit logging |
@@ -150,7 +150,7 @@ This README is the front door; everything past "at a glance" lives in
 | [`docs/architecture/`](docs/architecture/) | Federation (how `terminus-primary` aggregates core + personal tools), auth (mTLS identity model), and the Chord-integration boundary/wire contract. |
 | [`docs/networking/`](docs/networking/) | WireGuard and Tailscale transport options for reaching a Terminus deployment off-LAN, including the optional embedded-tsnet mode (MESH-04, `tsnet` Cargo feature — no host `tailscaled` required; see [`docs/networking/tailscale.md`](docs/networking/tailscale.md#alternative-embedded-tsnet-mesh-04--no-host-tailscaled-at-all)). |
 | [`docs/deploy/`](docs/deploy/) | Client enrollment/deploy guide and the personal-services (`terminus_personal`/`terminus_primary`) deployment guide. |
-| [`docs/tools/`](docs/tools/README.md) | The full tool index — all 52 modules grouped by domain, plus the **MINT** flagship harness. |
+| [`docs/tools/`](docs/tools/README.md) | The full tool index — all 53 modules grouped by domain, plus the **MINT** flagship harness. |
 
 ## Atlas — knowledge-graph query tools
 
