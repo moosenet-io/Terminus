@@ -659,6 +659,7 @@ mod tests {
             personal_federation: None,
             inference_proxy: None,
             gateway: None,
+            mesh_pool: None,
         })
     }
 
