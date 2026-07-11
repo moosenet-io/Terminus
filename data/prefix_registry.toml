@@ -483,3 +483,12 @@ spec_id = "S112-prefix-promote"
 status = "complete"
 description = "plane_prefix_promote tool: promote a prefix claim into the baseline data/prefix_registry.toml and open a Terminus PR (durable path, no client-side Redis)."
 created = "2026-07-11"
+
+[[prefix]]
+prefix = "MESH"
+name = "Terminus Mesh — N-Upstream MCP Federation Gateway over Tailscale"
+project = "TERM"
+spec_id = "S113-terminus-mesh-federation"
+status = "complete"
+description = "N-upstream MCP federation gateway over Tailscale: registry, namespacing, unified Principal identity, RBAC, approval propagation, audit, onboarding."
+created = "2026-07-11"
