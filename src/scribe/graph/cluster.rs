@@ -97,7 +97,7 @@ fn set_cluster(graph: &mut KnowledgeGraph, id: &str, cluster: u32) {
 }
 
 /// One-level Louvain local-moving. Returns a community index per node index.
-fn louvain_local_moving(g: &UnGraph<(), f64>) -> Vec<usize> {
+pub(crate) fn louvain_local_moving(g: &UnGraph<(), f64>) -> Vec<usize> {
     let n = g.node_count();
     let mut community: Vec<usize> = (0..n).collect();
     if n == 0 {
