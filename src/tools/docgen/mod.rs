@@ -41,6 +41,7 @@
 //! to the generation/render items that actually call out to Chord or a
 //! target's API.
 
+pub mod changelog;
 pub mod config;
 pub mod crate_graph;
 pub mod diagram;
@@ -168,13 +169,15 @@ scaffold item generates/renders nothing."
 pub fn register(registry: &mut ToolRegistry) {
     let _ = registry.register(Box::new(DocgenStatus));
     mismatch::register(registry);
+    changelog::register(registry);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const EXPECTED_TOOL_NAMES: &[&str] = &["docgen_status", "docgen_mismatch_detect"];
+    const EXPECTED_TOOL_NAMES: &[&str] =
+        &["docgen_status", "docgen_mismatch_detect", "docgen_generate_changelog"];
 
     #[test]
     fn registers_expected_tools() {
