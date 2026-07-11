@@ -286,23 +286,21 @@ mod tests {
         });
         let cfg = ProjectDocConfig::parse(Some(&raw)).unwrap();
         let c = ctx("# Widget\n\nThe widget does A.");
-        // `obsidian` is credential-gated to OBSIDIAN_VAULT_TOKEN by the
-        // merged DOCGEN-01 `config.rs` mapping, so supply it -- otherwise
-        // `resolve()` would (correctly) skip it for a missing credential
-        // (that skip path is covered separately by
+        // `obsidian` is credential-FREE (DGFIX-02, TERM-200): rendering an
+        // Obsidian note is pure and needs no token, so it renders here with
+        // no credential keys supplied at all -- unlike `notion`/`blog`,
+        // which stay genuinely credential-gated (see
         // `missing_notion_credential_skips_notion_others_still_render`).
-        let mut available = BTreeSet::new();
-        available.insert("OBSIDIAN_VAULT_TOKEN".to_string());
+        let available = BTreeSet::new();
         let out = render_all(&c, &cfg, &available, None, None).await;
 
         assert_eq!(out.artifacts.len(), 4);
-        // readme, wiki render locally (no credential needed); obsidian
-        // renders locally too once its declared credential is present; pdf
-        // is always unavailable in this sandbox (see pdf.rs).
+        // readme, wiki, obsidian all render locally with no credential
+        // needed; pdf is always unavailable in this sandbox (see pdf.rs).
         assert!(out.artifacts[0].was_rendered(), "readme should render");
         assert!(out.artifacts[1].was_rendered(), "wiki should render");
         assert!(!out.artifacts[2].was_rendered(), "pdf renderer is unavailable");
-        assert!(out.artifacts[3].was_rendered(), "obsidian should render");
+        assert!(out.artifacts[3].was_rendered(), "obsidian should render unconditionally");
     }
 
     // ── WRITE-MODEL INVERSION: no placement, ever ───────────────────────

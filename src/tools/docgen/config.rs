@@ -77,11 +77,19 @@ impl DocTargetType {
     /// resolved elsewhere, later (DOCGEN-06 render), via
     /// `vault::manager().get(key)` / `SecretManager::get(key)` -- this
     /// module only names the key.
+    ///
+    /// `obsidian` is credential-FREE here (DGFIX-02, Plane TERM-200,
+    /// follow-up from the DOCGEN-06 review): rendering an Obsidian note is
+    /// pure -- it needs no token, only *pushing* a note into a vault would,
+    /// and this engine never places/pushes (see the WRITE-MODEL INVERSION
+    /// doc comment on `super::render`). `OBSIDIAN_VAULT_TOKEN` remains a
+    /// valid env var name for a future placement/push layer outside this
+    /// module, but it must never gate rendering itself -- obsidian renders
+    /// unconditionally, exactly like `readme`/`wiki`.
     pub fn credential_key(self) -> Option<&'static str> {
         match self {
-            Self::Readme | Self::Wiki | Self::Pdf => None,
+            Self::Readme | Self::Wiki | Self::Pdf | Self::Obsidian => None,
             Self::Notion => Some("NOTION_TOKEN"),
-            Self::Obsidian => Some("OBSIDIAN_VAULT_TOKEN"),
             Self::Blog => Some("DOCGEN_BLOG_API_TOKEN"),
         }
     }
@@ -404,8 +412,24 @@ mod tests {
         assert_eq!(DocTargetType::Wiki.credential_key(), None);
         assert_eq!(DocTargetType::Pdf.credential_key(), None);
         assert_eq!(DocTargetType::Notion.credential_key(), Some("NOTION_TOKEN"));
-        assert_eq!(DocTargetType::Obsidian.credential_key(), Some("OBSIDIAN_VAULT_TOKEN"));
+        // DGFIX-02 (TERM-200): obsidian rendering is pure -- no credential
+        // gates it. Only a future vault-push/placement layer would need
+        // OBSIDIAN_VAULT_TOKEN, and this module never places/pushes.
+        assert_eq!(DocTargetType::Obsidian.credential_key(), None);
         assert_eq!(DocTargetType::Blog.credential_key(), Some("DOCGEN_BLOG_API_TOKEN"));
+    }
+
+    /// Negative test (DGFIX-02): obsidian resolves as always-enabled with no
+    /// hint, exactly like readme/wiki/pdf -- never disabled for a "missing"
+    /// credential, even when no credential keys at all are available.
+    #[test]
+    fn obsidian_target_always_enabled_regardless_of_available_credentials() {
+        let raw = json!({"targets": [{"type": "obsidian"}]});
+        let cfg = ProjectDocConfig::parse(Some(&raw)).unwrap();
+        let resolved = cfg.resolve(&BTreeSet::new());
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].enabled, "obsidian must render unconditionally");
+        assert!(resolved[0].hint.is_none());
     }
 
     #[test]
