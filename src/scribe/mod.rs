@@ -236,7 +236,7 @@ async fn dispatch_docs_generation(
 /// repos Scribe may inspect (SCRB-02 cycle 1 review finding: an unconfined
 /// `repo_path` would let a caller point Scribe at an arbitrary local repo
 /// and have its contents shipped to an external LLM provider).
-fn is_repo_path_allowed(repo_path: &Path, allowed_roots: &[String]) -> bool {
+pub(crate) fn is_repo_path_allowed(repo_path: &Path, allowed_roots: &[String]) -> bool {
     if allowed_roots.is_empty() {
         return false;
     }
@@ -819,8 +819,9 @@ pub fn register(registry: &mut ToolRegistry) {
     let _ = registry.register(Box::new(ScribeBuildDiaryEntry));
     let _ = registry.register(Box::new(ScribeReportDiscrepancy));
     let _ = registry.register(Box::new(ScribeStatus));
-    // Atlas kg_* query tools (KGRAPH-06) — same core registration path.
+    // Atlas kg_* query tools (KGRAPH-06) + build/status orchestration (KGRAPH-10).
     graph::tools::register(registry);
+    graph::build::register(registry);
 }
 
 #[cfg(test)]
