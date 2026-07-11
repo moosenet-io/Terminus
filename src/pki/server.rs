@@ -98,6 +98,13 @@ pub fn build_gateway_router(registry: ToolRegistry, config: &GatewayServerConfig
         personal_federation: config.personal_federation.clone(),
         inference_proxy: config.inference_proxy.clone(),
         gateway: config.gateway.clone(),
+        // MESH-03: mesh federation is not yet wired into
+        // `GatewayServerConfig` (no binary provisions a
+        // `crate::mesh::UpstreamPool` today) -- `None` here is the same
+        // additive "feature not configured" posture `personal_federation`
+        // etc. use elsewhere, and preserves `tools/list`/`tools/call`
+        // byte-for-byte until a binary is wired to pass one in.
+        mesh_pool: None,
     });
 
     build_router(state).merge(build_enroll_router())

@@ -44,10 +44,25 @@
 //! new client logic rather than a refactor of
 //! `crate::federation::PersonalFederationClient` (that client speaks a
 //! different, Chord-specific wire protocol entirely).
+//!
+//! ## MESH-03: merging catalogs across many upstreams + local core
+//! [`merge`] merges the local core catalog with every healthy upstream's
+//! `tools/list` into one `tools/list` result, namespacing every federated
+//! tool `<namespace>__<tool>` (see [`merge::MESH_NS_SEP`]) so two upstreams
+//! exporting the same bare tool name never collide, and builds the routing
+//! a `tools/call` needs to strip that prefix and dispatch to the owning
+//! upstream. See that module's doc for the two distinct routing paths it
+//! exposes (`MergedCatalog::build` for the full `tools/list`,
+//! `resolve_call_route` for a single cheap `tools/call` lookup).
 pub mod client;
+pub mod merge;
 pub mod registry;
 
 pub use client::{ToolMeta, UpstreamCallResult, UpstreamClient, UpstreamClientError, UpstreamPool};
+pub use merge::{
+    namespaced, resolve_call_route, split_namespaced, upstream_unavailable_text, CallRoute,
+    MergedCatalog, Route, RoutingTable, MESH_NS_SEP,
+};
 pub use registry::{
     MeshConfigError, ResolvedSecret, UpstreamRegistry, UpstreamServer, UpstreamTransport,
 };
