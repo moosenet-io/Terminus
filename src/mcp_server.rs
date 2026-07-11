@@ -61,6 +61,7 @@ use crate::inference_proxy::{
     InferenceProxyClient, AGENT_EXECUTE_PATH, CHAT_COMPLETIONS_PATH, CODING_SELECT_PATH,
     INFER_PATH,
 };
+use crate::mesh::Principal;
 use crate::pki::mtls::ClientIdentity;
 use crate::registry::ToolRegistry;
 
@@ -144,8 +145,13 @@ async fn handle_inference_proxy(
     // pre-TGW-04 ungated behavior.
     let gate_ctx = match &state.gateway {
         Some(gateway) => {
-            let client_identity = identity.as_ref().map(|Extension(i)| i.clone());
-            match gateway.guard(client_identity.as_ref(), path, ActionKind::Inference).await {
+            // MESH-06: `guard()` now takes a `Principal` rather than a raw
+            // `ClientIdentity` -- converted here via `Principal::from`'s
+            // direct cert-CN-as-name mapping, preserving this call site's
+            // pre-MESH-06 behavior exactly (full `PrincipalResolver` wiring
+            // is MESH-07's job, not this item's).
+            let principal = identity.as_ref().map(|Extension(i)| Principal::from(i));
+            match gateway.guard(principal.as_ref(), path, ActionKind::Inference).await {
                 Ok(ctx) => Some(ctx),
                 Err(denial) => return denial,
             }
@@ -368,8 +374,11 @@ async fn handle_mcp(
             // sanitized audit entry are identical to the inference-proxy
             // path's real `403`/`429` HTTP responses.
             let gate_ctx = if let Some(gateway) = &state.gateway {
-                let client_identity = identity.as_ref().map(|Extension(i)| i.clone());
-                match gateway.guard(client_identity.as_ref(), name, ActionKind::Tool).await {
+                // MESH-06: see the `handle_inference_proxy` call site's
+                // comment above for why this is a direct cert-CN-as-name
+                // conversion rather than full resolver wiring.
+                let principal = identity.as_ref().map(|Extension(i)| Principal::from(i));
+                match gateway.guard(principal.as_ref(), name, ActionKind::Tool).await {
                     Ok(ctx) => Some(ctx),
                     Err(denial) => {
                         let denial_text = response_body_text(denial).await;

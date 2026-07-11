@@ -107,6 +107,49 @@ environment at startup, plain env read afterward IS the secret read"
 convention the rest of the crate uses (see `crate::pki`). Registry loading,
 validation, and inspection perform zero secret-store reads.
 
+## Unified `Principal` identity (MESH-06)
+
+Terminus can see a caller's identity through up to two independent
+transports — the mTLS client cert's Subject CN (`crate::pki::mtls::ClientIdentity`)
+and the tailnet WhoIs identity (`crate::mesh::TailnetIdentity`, MESH-05) — plus
+a third, separate identity concept: the named-PAT credential model
+(`PLANE_PAT_<NAME>` / `GITEA_PAT_<NAME>` / `GITHUB_PAT_<NAME>`) used to
+authenticate outbound calls. `crate::mesh::Principal` and
+`crate::mesh::PrincipalResolver` reconcile these into one canonical identity
+`name`, in the same string space the named-PAT lookups already use, that
+drives both the gateway allowlist/RBAC decision
+(`crate::gateway_framework::GatewayFramework::guard`, which now takes a
+`Principal` rather than a raw `ClientIdentity`) and downstream PAT selection.
+
+Configured via `TERMINUS_MESH_PRINCIPAL_MAP_JSON` — non-secret structural
+JSON, same convention as `TERMINUS_MESH_UPSTREAMS_JSON` above:
+
+```json
+{
+  "cert_cn": { "harmony-primary.example.test": "harmony" },
+  "tailnet_login": { "<email>": "moose" },
+  "tailnet_tag": { "tag:ci": "claude" }
+}
+```
+
+Resolution is fail-closed and deterministic: a present mTLS cert CN is
+checked first and exclusively — mapped, it wins outright (even over a
+conflicting tailnet mapping); unmapped, the request is denied without
+falling back to the tailnet identity. The tailnet login/tag maps are only
+consulted when no cert is presented at all. Neither transport identity
+present, or the one presented has no mapping entry, is always denied — never
+a silent pass-through of the raw transport identity. See
+[`docs/architecture/auth.md`](docs/architecture/auth.md#unified-principal-identity-mesh-06)
+for the full precedence rule and edge cases (e.g. a resolved name with no
+provisioned PAT credential).
+
+MESH-06 delivers the model, the resolver, and `guard()`'s new signature.
+Wiring the resolver into the live request path (replacing the interim
+`sub="lumina"` pin / `X-Terminus-Client-Identity` header workaround) is
+MESH-07 — existing callers keep working today via a direct, resolver-bypassing
+conversion (`Principal::from(&ClientIdentity)`) that uses the raw cert CN as
+the principal name, unchanged from pre-MESH-06 behavior.
+
 ## Quickstart
 
 ```sh
