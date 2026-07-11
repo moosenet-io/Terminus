@@ -66,13 +66,21 @@ fn test_hearth_tools_registered() {
     );
 }
 
-/// S94/MEDIA-01: the media domain scaffold registers its one internal tool.
+/// S94/MEDIA-01/MEDIA-02: the media domain scaffold + read/search surface.
 #[test]
 fn test_media_tools_registered() {
     let reg = full_registry();
     assert!(
         reg.contains("media_domain_status"),
         "media_domain_status must be registered"
+    );
+    assert!(
+        reg.contains("media_search"),
+        "media_search must be registered"
+    );
+    assert!(
+        reg.contains("media_status"),
+        "media_status must be registered"
     );
 }
 
