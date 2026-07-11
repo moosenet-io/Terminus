@@ -236,6 +236,49 @@ your deployment's plain/mTLS ports exactly as described in
 [`docs/deploy/client.md`](client.md), using the identity/secret you
 provisioned for yourself above.
 
+### Onboarding this deployment as a mesh upstream (`mesh_onboard_upstream`)
+
+The federation hop above (`terminus-primary` → Chord → your deployment) is
+one way in. The other is the MESH-01/02/03 many-upstream **mesh registry**
+(`TERMINUS_MESH_ENABLED` / `TERMINUS_MESH_UPSTREAMS_JSON`, see the main
+[README](../../README.md#mesh-federating-multiple-upstream-terminus-servers)):
+a mesh-enabled node (e.g. `terminus-primary`) can federate your deployment
+as one of several upstream Terminus-shaped MCP servers, with your tools
+advertised under a namespace prefix instead of via the single-upstream
+personal relay.
+
+Before that operator hand-edits their `TERMINUS_MESH_UPSTREAMS_JSON`, have
+them run the CORE tool `mesh_onboard_upstream` against your deployment's
+already-running `/mcp` endpoint — it is a **read-only dry-run**: it probes
+your deployment, discovers your tool catalog, checks the proposed namespace
+for collisions against their current mesh registry, confirms trust
+readiness (mTLS: their embedded CA can mint a client identity; bearer: the
+named `secret_key` resolves in *their* environment — never printed), and
+previews the namespaced catalog delta. It writes nothing itself; on success
+it emits the validated JSON entry for them to append and reload/restart:
+
+```json
+{
+  "name": "mesh_onboard_upstream",
+  "arguments": {
+    "name": "your-deployment-name",
+    "url": "https://your-deployment.example.internal:8443",
+    "transport": "bearer",
+    "namespace": "yourns",
+    "secret_key": "TERMINUS_MESH_YOURNS_TOKEN"
+  }
+}
+```
+
+Give the operator: your reachable base URL, your preferred namespace (short,
+lowercase alphanumeric, 2-16 chars — they'll get free-namespace suggestions
+from the tool if it collides), and — for `bearer` transport — the NAME of an
+env var they'll provision on *their* side (never the value; you never send
+them a credential value out of band for this). For `mtls`, no credential
+changes hands at all: mesh peers share one embedded-CA trust domain, so
+trust is established the same way federation already trusts your presented
+server cert.
+
 ## Troubleshooting
 
 - **`/enroll` returns 503 "not configured".** `TERMINUS_ENROLLMENT_SHARED_SECRET`
