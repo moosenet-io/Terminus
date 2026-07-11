@@ -55,6 +55,10 @@ serde_json = "1"
 # Harmony's existing repo_map pins (tree-sitter 0.25 / tree-sitter-rust 0.24).
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
+# KGRAPH-05: Atlas community detection. petgraph holds the undirected graph the
+# (inline, deterministic) Louvain pass runs over. A Leiden crate is not vendored
+# in the local registry, so Louvain is the sanctioned fallback (spec KGRAPH-05).
+petgraph = "0.6"
 # model_advisor bundled presets/matrix + council custom-preset overlay (constellation.yaml)
 serde_yaml = "0.9"
 # S101 (TERM): parse the git-versioned prefix-registry baseline

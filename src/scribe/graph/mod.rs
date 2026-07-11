@@ -15,10 +15,12 @@
 //! This item (KGRAPH-01) lands only the model; nothing here does I/O, parsing,
 //! or networking.
 
+pub mod cluster;
 pub mod extract;
 pub mod model;
 pub mod store;
 
+pub use cluster::cluster;
 pub use extract::build_rust_graph;
 pub use model::{Confidence, EdgeKind, KgEdge, KgNode, KnowledgeGraph, NodeKind};
 pub use store::GraphStore;
