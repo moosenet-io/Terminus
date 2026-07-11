@@ -227,6 +227,7 @@ Example — grant `ct322-viewer` every `ct322` tool except its sensitive
 
 ```json
 {"ct322-viewer": {"allow": ["ct322__*"], "deny": ["ct322__vitals_"]}}
+```
 
 ### Approval-gate propagation across the mesh (MESH-09)
 
@@ -342,7 +343,7 @@ ones easy to accidentally drop silently:
 - **A guarded local tool requiring human approval** (`crate::approval`'s
   "APPROVAL REQUIRED" gate): audited with `decision: "approval_required"`.
 
-
+### Onboarding a new remote client (`mesh_onboard_client`)
 
 `mesh_onboard_upstream` (above) brings a new *server* into the mesh; this is
 the companion tool for the other direction — bringing a new *client* (an
@@ -441,7 +442,7 @@ This README is the front door; everything past "at a glance" lives in
 | Area | What's there |
 | --- | --- |
 | [`docs/README.md`](docs/README.md) | The documentation site index — start here for the full table of contents. |
-| [`docs/architecture/`](docs/architecture/) | Federation (how `terminus-primary` aggregates core + personal tools), auth (mTLS identity model), and the Chord-integration boundary/wire contract. |
+| [`docs/architecture/`](docs/architecture/) | Federation (how `terminus-primary` aggregates core + personal tools), the [mesh](docs/architecture/mesh.md) (N-upstream federation, identity/RBAC, tailnet exposure, onboarding, known gaps), auth (mTLS identity model), and the Chord-integration boundary/wire contract. |
 | [`docs/networking/`](docs/networking/) | WireGuard and Tailscale transport options for reaching a Terminus deployment off-LAN, including the optional embedded-tsnet mode (MESH-04, `tsnet` Cargo feature — no host `tailscaled` required; see [`docs/networking/tailscale.md`](docs/networking/tailscale.md#alternative-embedded-tsnet-mesh-04--no-host-tailscaled-at-all)). |
 | [`docs/deploy/`](docs/deploy/) | Client enrollment/deploy guide and the personal-services (`terminus_personal`/`terminus_primary`) deployment guide. |
 | [`docs/tools/`](docs/tools/README.md) | The full tool index — all 53 modules grouped by domain, plus the **MINT** flagship harness. |
