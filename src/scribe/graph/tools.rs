@@ -394,13 +394,73 @@ fn structured(v: Value) -> Result<ToolOutput, ToolError> {
     Ok(ToolOutput { text, structured: Some(v) })
 }
 
-/// Register the five `kg_*` tools on the core registry.
+// ── kg_communities ────────────────────────────────────────────────────────────
+pub struct KgCommunities;
+
+#[async_trait]
+impl RustTool for KgCommunities {
+    fn name(&self) -> &str {
+        "kg_communities"
+    }
+    fn description(&self) -> &str {
+        "Return the community structure of a project's Atlas knowledge graph (KGRAPH-12): the \
+level-0 clusters and a coarser level-1 grouping, each with its member entities and — when a model \
+is available — a short summary. Lets a model answer subsystem/architecture questions at the right \
+zoom without walking every node."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "level": {"type": "integer", "description": "filter to a zoom level (0 finest); omit for all"}
+            },
+            "required": ["project_id"]
+        })
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.execute_structured(args).await?.text)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let project_id = req_str(&args, "project_id")?;
+        let want_level = args.get("level").and_then(|v| v.as_u64()).map(|l| l as u32);
+        let Some(g) = load_graph(&project_id)? else {
+            return structured(no_graph(&project_id));
+        };
+        let mut comms = super::community::hierarchical_communities(&g);
+
+        // Best-effort summaries when a review daemon is configured AND opt-in.
+        let semantic_on = std::env::var("SCRIBE_KG_SEMANTIC")
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        if semantic_on {
+            let review_cfg = crate::review::ReviewConfig::from_env();
+            if review_cfg.daemon_token.is_some() {
+                for c in comms.iter_mut() {
+                    let prompt = super::community::community_prompt(c, &g);
+                    if let Ok(reply) = crate::scribe::dispatch_docs_generation(&review_cfg, &prompt).await {
+                        super::community::set_summary(c, &reply);
+                    }
+                }
+            }
+        }
+
+        if let Some(l) = want_level {
+            comms.retain(|c| c.level == l);
+        }
+        let comms_json = serde_json::to_value(&comms).unwrap_or_else(|_| json!([]));
+        structured(json!({"project_id": project_id, "found": true, "count": comms.len(), "communities": comms_json}))
+    }
+}
+
+/// Register the `kg_*` tools on the core registry.
 pub fn register(registry: &mut ToolRegistry) {
     let _ = registry.register(Box::new(KgSearch));
     let _ = registry.register(Box::new(KgNeighbors));
     let _ = registry.register(Box::new(KgSubgraph));
     let _ = registry.register(Box::new(KgPath));
     let _ = registry.register(Box::new(KgStats));
+    let _ = registry.register(Box::new(KgCommunities));
 }
 
 #[cfg(test)]
@@ -497,6 +557,30 @@ pub struct Widget;
         std::env::set_var("SCRIBE_KG_STORE_DIR", &dir);
         let out = KgStats.execute_structured(json!({"project_id": "NOPE"})).await.unwrap();
         assert_eq!(val(out)["found"], false);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn communities_returns_clusters_without_summaries_when_no_daemon() {
+        let dir = std::env::temp_dir().join(format!("atlas-kgcomm-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &dir);
+        std::env::remove_var("SCRIBE_KG_SEMANTIC");
+        let mut g = build_rust_graph(
+            "COMM",
+            &[("src/x.rs".to_string(),
+               "pub fn a1(){a2();}\npub fn a2(){a1();}\npub fn b1(){b2();}\npub fn b2(){b1();}".to_string())],
+        )
+        .unwrap();
+        crate::scribe::graph::cluster::cluster(&mut g);
+        GraphStore::from_config(&ScribeConfig::from_env()).save("COMM", &g).unwrap();
+
+        let out = KgCommunities.execute_structured(json!({"project_id": "COMM"})).await.unwrap();
+        let v = val(out);
+        assert_eq!(v["found"], true);
+        assert!(v["count"].as_u64().unwrap() >= 1, "at least one community");
+        let comms = v["communities"].as_array().unwrap();
+        assert!(comms.iter().all(|c| c["summary"] == ""), "no summaries without a daemon");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
