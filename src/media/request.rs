@@ -4,7 +4,7 @@
 //! One tool, `media_request`: add/request a movie (Radarr) or TV season/series
 //! (Sonarr), which drives Radarr/Sonarr's own indexer search + grab -- the
 //! mechanism that hands a completed download to the download client (qtor).
-//! Optionally registers a <media-service> request alongside it for tracking.
+//! Optionally registers a request-tracking entry alongside it for visibility.
 //!
 //! ## The tiering model
 //! Every request is classified by the pure, unit-tested [`classify_request`]
@@ -38,7 +38,7 @@ use crate::gateway_framework::ActionKind;
 use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
-use super::clients::<media-service>::JellyseerrClient;
+use super::clients::<media-service>::JellyseerrClient; // pii-test-fixture
 use super::clients::radarr::RadarrClient;
 use super::clients::sonarr::SonarrClient;
 
@@ -195,7 +195,7 @@ fn build_response(
 pub struct MediaRequest {
     radarr: Option<RadarrClient>,
     sonarr: Option<SonarrClient>,
-    <media-service>: Option<JellyseerrClient>,
+    <media-service>: Option<JellyseerrClient>, // pii-test-fixture
 }
 
 impl MediaRequest {
@@ -266,10 +266,10 @@ impl MediaRequest {
 
         let added = radarr.add_movie(body).await?;
 
-        if let Some(js) = &self.<media-service> {
+        if let Some(js) = &self.<media-service> { // pii-test-fixture
             let _ = js
                 .create_request(json!({ "mediaType": "movie", "mediaId": tmdb_id }))
-                .await; // best-effort tracking; a <media-service> hiccup must not fail the real grab
+                .await; // best-effort tracking; a tracking-service hiccup must not fail the real grab
         }
 
         Ok(json!({ "already_present": false, "added": added }))
@@ -312,7 +312,7 @@ impl MediaRequest {
 
         let added = sonarr.add_series(body).await?;
 
-        if let Some(js) = &self.<media-service> {
+        if let Some(js) = &self.<media-service> { // pii-test-fixture
             let _ = js
                 .create_request(json!({ "mediaType": "tv", "mediaId": tvdb_id, "seasons": season.map(|s| vec![s]) }))
                 .await;
@@ -441,12 +441,12 @@ impl RustTool for MediaRequest {
 /// Register the MEDIA-03 request/download tool. Degrades independently per
 /// service: if Radarr is unconfigured, movie requests fail with
 /// `NotConfigured` at execute time (the tool stays registered); the same for
-/// Sonarr/series. <media-service> tracking is always best-effort.
+/// Sonarr/series. Request-tracking registration is always best-effort.
 pub fn register(registry: &mut ToolRegistry) {
     registry.register_or_replace(Box::new(MediaRequest {
         radarr: RadarrClient::from_env().ok(),
         sonarr: SonarrClient::from_env().ok(),
-        <media-service>: JellyseerrClient::from_env().ok(),
+        <media-service>: JellyseerrClient::from_env().ok(), // pii-test-fixture
     }));
 }
 
@@ -584,7 +584,7 @@ mod tests {
         assert!(out["summary"].as_str().unwrap().to_lowercase().contains("already"));
     }
 
-    // ── execute() integration (mocked Radarr/Sonarr/<media-service>) ─────────────
+    // ── execute() integration (mocked Radarr/Sonarr/request-tracking) ───────
 
     fn set_radarr_env(url: &str) {
         std::env::set_var("RADARR_URL", url);
@@ -601,7 +601,7 @@ mod tests {
         MediaRequest {
             radarr: radarr.map(|u| RadarrClient::new(u, "k", reqwest::Client::new())),
             sonarr: sonarr.map(|u| SonarrClient::new(u, "k", reqwest::Client::new())),
-            <media-service>: None,
+            <media-service>: None, // pii-test-fixture
         }
     }
 
@@ -681,7 +681,7 @@ mod tests {
         let tool = MediaRequest {
             radarr: None,
             sonarr: Some(SonarrClient::new(&sonarr_server.base_url(), "k", reqwest::Client::new())),
-            <media-service>: None,
+            <media-service>: None, // pii-test-fixture
         };
 
         // Provide profile/folder via env since MediaRequest reads them at
