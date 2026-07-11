@@ -44,6 +44,7 @@
 pub mod config;
 pub mod generate;
 pub mod pii_gate;
+pub mod render;
 pub mod versioning;
 
 use std::collections::BTreeSet;
@@ -61,6 +62,7 @@ pub use generate::{
     SweptFeatContext,
 };
 pub use pii_gate::{sweep_input, sweep_input_for_routing, PiiGateOutcome, RoutingDestination};
+pub use render::{render_all, RenderContext, RenderOutcome, RenderedArtifact};
 
 /// `docgen_status` -- report how the doc engine would interpret a project's
 /// declared (or absent) doc-target config: which targets it declares (or
