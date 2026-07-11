@@ -228,10 +228,20 @@ pub fn node_card(node: &KgNode, callers: &[&str], callees: &[&str]) -> String {
     truncate_at_char_boundary(&card, CARD_MAX_LEN)
 }
 
-/// Join up to [`CARD_MAX_NEIGHBORS`] names with ", ", preserving input order
-/// (deterministic when the caller passes a stably-sorted slice).
+/// Sort names, dedup, then join up to [`CARD_MAX_NEIGHBORS`] with ", ".
+/// Sorting INSIDE the card builder makes `node_card` independently deterministic
+/// — the same node + same neighbor set always yields the identical card
+/// regardless of the order the caller passed them (so the card hash, and thus
+/// the "re-embed only when changed" logic, is stable across builds).
 fn capped_names(names: &[&str]) -> String {
-    names.iter().take(CARD_MAX_NEIGHBORS).copied().collect::<Vec<_>>().join(", ")
+    let mut sorted: Vec<&str> = names.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    sorted
+        .into_iter()
+        .take(CARD_MAX_NEIGHBORS)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Truncate `s` to at most `max_len` bytes, backing off to the nearest
@@ -448,6 +458,22 @@ mod tests {
         let c1 = node_card(&n, &callers, &callees);
         let c2 = node_card(&n, &callers, &callees);
         assert_eq!(c1, c2);
+    }
+
+    #[test]
+    fn node_card_is_order_independent_and_dedups() {
+        // The card must be identical regardless of the order (or duplication)
+        // of the neighbor names the caller passes — determinism is a property of
+        // node_card itself, not of the caller pre-sorting (KGEMB-02 review).
+        let n = node(NodeKind::Function, "hub", "src/hub.rs");
+        let forward = node_card(&n, &["make", "reset", "init"], &["zed", "alpha"]);
+        let reversed = node_card(&n, &["init", "reset", "make"], &["alpha", "zed"]);
+        let with_dupes = node_card(&n, &["reset", "make", "init", "make"], &["alpha", "zed", "zed"]);
+        assert_eq!(forward, reversed);
+        assert_eq!(forward, with_dupes);
+        // sorted + deduped inside the builder
+        assert!(forward.contains("calls: alpha, zed"));
+        assert!(forward.contains("called by: init, make, reset"));
     }
 
     #[test]
