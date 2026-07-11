@@ -79,11 +79,62 @@ Returns which targets the config declares (or the README-only default), and
 — when `available_credential_keys` is supplied — which are enabled vs.
 disabled for a missing credential. It generates and renders nothing.
 
+## `docgen_generate_changelog` (DOCGEN-17, Plane TERM-168)
+
+Generates a Keep-a-Changelog-formatted `CHANGELOG.md` section plus a
+separate, human-readable release-notes document from a list of merged
+commits, parsed as Conventional Commits (`feat(...)/fix(...)/docs(...)/...`
+— this repo's own commit convention already fits). Lives at
+`src/tools/docgen/changelog.rs`.
+
+**git-cliff vs. built-in:** the originating research pointed at `git-cliff`
+(Rust CLI, Tera templates, Keep-a-Changelog preset). No `git-cliff` binary
+is available in this build environment, and it is a standalone binary, not
+a library crate to vendor — so this item ships a minimal, dependency-free,
+in-process Conventional-Commit parser and Keep-a-Changelog/release-notes
+renderer instead, producing the same grouped-by-type, dated shape of
+output. A future item may shell out to a real `git-cliff` binary once one
+is provisioned on a build host.
+
+- Commits are grouped into fixed Keep-a-Changelog sections (Breaking
+  first, then Added/Changed/Fixed/Documentation/Performance/Tests/Build &
+  CI/Reverted/Chore/Other) in deterministic order.
+- A commit that doesn't match Conventional Commit shape is never dropped —
+  it's included under `Other` with its original subject line.
+- Merge commits (`Merge pull request ...` / `Merge branch ...`) are
+  excluded as noise but counted (`merge_commits_excluded`).
+- Breaking changes (`type(scope)!: ...` or a `BREAKING CHANGE:` footer) are
+  flagged and rendered first in both artifacts.
+- **Deterministic, no hidden I/O**: like `versioning.rs`/`render.rs`, this
+  module never reads the system clock — the caller supplies `version` and
+  `date`. The same input always produces byte-identical output.
+- **Write-model inversion**: like `render.rs`, this RETURNS the two
+  artifacts as strings; it never places them into a repo. Versioning them
+  (DOCGEN-07) is the caller's job, via the existing
+  `versioning::VersionStore` using `ArtifactKey::new(project, "changelog")`
+  / `ArtifactKey::new(project, "release_notes")` — no second version store.
+
+```json
+{
+  "name": "docgen_generate_changelog",
+  "arguments": {
+    "project": "Terminus",
+    "version": "1.6.0",
+    "date": "2026-07-11",
+    "commits": [
+      {"hash": "abc1234", "message": "feat(docgen): DOCGEN-17 -- changelog generation"},
+      {"hash": "def5678", "message": "fix(docgen): correct grouping bug"}
+    ]
+  }
+}
+```
+
+**DOCGEN-08 trigger wiring:** DOCGEN-08 (the post-feat build-skill trigger)
+has not shipped yet. This item exposes the API DOCGEN-08 will call once it
+lands, rather than wiring an automatic trigger that doesn't exist yet —
+tracked as a follow-up on DOCGEN-08 itself.
+
 ## What's NOT here yet
 
-- The unconditional PII sweep gate on doc-gen input (DOCGEN-02).
-- Chord's SLM router integration (DOCGEN-03) and the generation orchestration
-  that calls it (DOCGEN-05).
-- Per-format rendering (DOCGEN-06) and artifact version control (DOCGEN-07).
-- The build-skill post-feat trigger (DOCGEN-08) and the behavior-contract
-  mismatch detector (DOCGEN-10).
+- The build-skill post-feat trigger (DOCGEN-08) that automatically invokes
+  changelog generation (and the rest of docgen) after every merged feat.
