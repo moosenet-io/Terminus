@@ -80,6 +80,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
 
+use crate::mesh::Principal;
+
 /// Read an env var, trimmed; `None` when unset or empty. Same convention as
 /// `crate::config`'s private helper of the same name — duplicated here
 /// (rather than made `pub(crate)` there) to keep this module's one secret
@@ -95,10 +97,28 @@ fn env_nonempty(key: &str) -> Option<String> {
 /// `sub` MUST be the literal string `"lumina"`, `exp` is unix seconds, `role`
 /// is optional and unused by this module (Chord defaults an absent role to
 /// its own "user" role server-side).
+///
+/// `principal` (MESH-07) is an ADDITIVE, optional claim: the resolved
+/// caller [`Principal::name`] for this call, carried INSIDE the signed JWT
+/// rather than as a raw, client-settable header — forging it would require
+/// the shared `TERMINUS_PRIMARY_CHORD_JWT_SECRET` signing key itself, so an
+/// upstream that opts into reading it gets a tamper-evident propagation of
+/// the gateway's RBAC decision, not just an unauthenticated hint. It is
+/// `#[serde(skip_serializing_if = "Option::is_none")]` (omitted entirely,
+/// never serialized as `null`) so a call with no resolved principal (e.g.
+/// the plain HTTP+JWT listener, no mTLS/tailnet identity presented) produces
+/// the exact byte-for-byte pre-MESH-07 claims shape, and so an upstream
+/// (Chord's own `validate_jwt` today) that has no opinion on this claim at
+/// all keeps validating unchanged — it only checks `sub`/`exp`. The
+/// transport-auth `sub` stays pinned to `"lumina"` regardless (see this
+/// module's "Auth" doc section for why) — `principal` is the RBAC identity
+/// of record, `sub` is only who's allowed to speak to Chord's relay at all.
 #[derive(Debug, Serialize, Deserialize)]
 struct ChordServiceClaims {
     sub: String,
     exp: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    principal: Option<String>,
 }
 
 /// The one subject value Chord's JWT validation accepts (`Claims::sub !=
@@ -210,17 +230,23 @@ impl PersonalFederationClient {
     }
 
     /// Dispatch `name(arguments)` through Chord's `/v1/personal/tools/call`,
-    /// presenting a freshly-minted service JWT and forwarding
-    /// `caller_identity` (the mTLS-derived identity of whoever called
-    /// terminus-primary, if any) for audit purposes. See the module doc's
-    /// "Error classification" section for the `Ok`/`Err` split.
+    /// presenting a freshly-minted service JWT and forwarding `principal`
+    /// (MESH-07: the resolved canonical caller [`Principal`] — mapped, when
+    /// `crate::mesh::PrincipalResolver` has a configured map — for whoever
+    /// called terminus-primary, if any) for audit purposes AND as a signed
+    /// JWT claim. See the module doc's "Error classification" section for
+    /// the `Ok`/`Err` split, and [`ChordServiceClaims`]'s doc for why the
+    /// signed `principal` claim is the tamper-evident propagation path
+    /// rather than the plain [`CLIENT_IDENTITY_HEADER`] alone (kept
+    /// alongside it for backward compatibility with the existing
+    /// personal/Chord relay contract, which already reads that header).
     pub async fn call_tool(
         &self,
         name: &str,
         arguments: Value,
-        caller_identity: Option<&str>,
+        principal: Option<&Principal>,
     ) -> Result<FederationCallResult, FederationError> {
-        let jwt = mint_service_jwt()?;
+        let jwt = mint_service_jwt_for_principal(principal)?;
 
         let mut req = self
             .http
@@ -228,8 +254,8 @@ impl PersonalFederationClient {
             .timeout(self.timeout)
             .bearer_auth(jwt)
             .json(&json!({"name": name, "arguments": arguments}));
-        if let Some(identity) = caller_identity {
-            req = req.header(CLIENT_IDENTITY_HEADER, identity);
+        if let Some(p) = principal {
+            req = req.header(CLIENT_IDENTITY_HEADER, p.name());
         }
 
         let resp = req.send().await.map_err(|e| classify_transport_error(&e))?;
@@ -305,8 +331,22 @@ fn classify_transport_error(e: &reqwest::Error) -> FederationError {
 /// `/v1/personal/tools/*` (confirmed by reading Chord's `src/routes.rs` —
 /// every Chord route this crate proxies to shares one `auth_check` call) —
 /// factored here rather than duplicated, per the TGW-03 spec item's "reuse
-/// that machinery" instruction.
+/// that machinery" instruction. Mints with no `principal` claim
+/// (`crate::inference_proxy` predates MESH-07's principal propagation and is
+/// out of this item's scope — see [`mint_service_jwt_for_principal`] for the
+/// principal-carrying variant [`PersonalFederationClient::call_tool`] uses).
 pub(crate) fn mint_service_jwt() -> Result<String, FederationError> {
+    mint_service_jwt_for_principal(None)
+}
+
+/// MESH-07: mint the same short-lived Chord-shaped service JWT
+/// [`mint_service_jwt`] does, additionally carrying the resolved caller
+/// [`Principal::name`] (if any) as a signed `principal` claim — see
+/// [`ChordServiceClaims`]'s doc for why this is the tamper-evident
+/// propagation path.
+pub(crate) fn mint_service_jwt_for_principal(
+    principal: Option<&Principal>,
+) -> Result<String, FederationError> {
     let signing_key = env_nonempty("TERMINUS_PRIMARY_CHORD_JWT_SECRET").ok_or_else(|| {
         FederationError::JwtSigning("TERMINUS_PRIMARY_CHORD_JWT_SECRET is unset".to_string())
     })?;
@@ -322,6 +362,7 @@ pub(crate) fn mint_service_jwt() -> Result<String, FederationError> {
     let claims = ChordServiceClaims {
         sub: CHORD_SERVICE_SUBJECT.to_string(),
         exp,
+        principal: principal.map(|p| p.name().to_string()),
     };
 
     encode(&Header::default(), &claims, &EncodingKey::from_secret(signing_key.as_bytes()))
@@ -331,6 +372,7 @@ pub(crate) fn mint_service_jwt() -> Result<String, FederationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::PrincipalSource;
     use httpmock::MockServer;
     use serial_test::serial;
 
@@ -385,8 +427,9 @@ mod tests {
         });
 
         let client = PersonalFederationClient::with_base_url(server.base_url());
+        let principal = Principal::new("dev-box", PrincipalSource::MtlsCert);
         let outcome = client
-            .call_tool("ledger_accounts", json!({}), Some("dev-box"))
+            .call_tool("ledger_accounts", json!({}), Some(&principal))
             .await
             .expect("call should succeed");
         assert_eq!(outcome.text, "3 accounts");
@@ -408,11 +451,80 @@ mod tests {
         });
 
         let client = PersonalFederationClient::with_base_url(server.base_url());
+        let principal = Principal::new("harmony-primary", PrincipalSource::MtlsCert);
         client
-            .call_tool("ledger_accounts", json!({}), Some("harmony-primary"))
+            .call_tool("ledger_accounts", json!({}), Some(&principal))
             .await
             .expect("call should succeed");
         mock.assert();
+        clear_jwt_secret();
+    }
+
+    // ── MESH-07: signed `principal` claim (tamper-evident propagation) ────
+
+    #[tokio::test]
+    #[serial]
+    async fn call_tool_signs_principal_into_the_jwt_not_just_the_header() {
+        set_jwt_secret();
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/personal/tools/call")
+                .matches(|req| {
+                    let auth = req
+                        .headers
+                        .as_ref()
+                        .and_then(|hs| hs.iter().find(|(k, _)| k.eq_ignore_ascii_case("authorization")))
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_default();
+                    let Some(token) = auth.strip_prefix("Bearer ") else { return false };
+                    use jsonwebtoken::{decode, DecodingKey, Validation};
+                    decode::<ChordServiceClaims>(
+                        token,
+                        &DecodingKey::from_secret(b"test-chord-shared-secret"),
+                        &Validation::new(jsonwebtoken::Algorithm::HS256),
+                    )
+                    .map(|d| d.claims.principal.as_deref() == Some("harmony"))
+                    .unwrap_or(false)
+                });
+            then.status(200).json_body(json!({"result": "ok", "source": "terminus_personal"}));
+        });
+
+        let client = PersonalFederationClient::with_base_url(server.base_url());
+        let principal = Principal::new("harmony", PrincipalSource::MtlsCert);
+        client
+            .call_tool("ledger_accounts", json!({}), Some(&principal))
+            .await
+            .expect("call should succeed");
+        mock.assert();
+        clear_jwt_secret();
+    }
+
+    #[test]
+    #[serial]
+    fn mint_service_jwt_omits_principal_claim_when_none() {
+        set_jwt_secret();
+        let jwt = mint_service_jwt_for_principal(None).expect("signing should succeed");
+        use jsonwebtoken::{decode, DecodingKey, Validation};
+        let decoded = decode::<ChordServiceClaims>(
+            &jwt,
+            &DecodingKey::from_secret(b"test-chord-shared-secret"),
+            &Validation::new(jsonwebtoken::Algorithm::HS256),
+        )
+        .expect("jwt should decode");
+        assert_eq!(decoded.claims.principal, None);
+        // The pre-MESH-07 `mint_service_jwt()` entrypoint (still used by
+        // `crate::inference_proxy`) must produce byte-identical claims to
+        // the explicit `None` call above.
+        let legacy_jwt = mint_service_jwt().expect("signing should succeed");
+        let legacy_decoded = decode::<ChordServiceClaims>(
+            &legacy_jwt,
+            &DecodingKey::from_secret(b"test-chord-shared-secret"),
+            &Validation::new(jsonwebtoken::Algorithm::HS256),
+        )
+        .expect("jwt should decode");
+        assert_eq!(legacy_decoded.claims.principal, None);
+        assert_eq!(legacy_decoded.claims.sub, "lumina");
         clear_jwt_secret();
     }
 

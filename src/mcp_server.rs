@@ -61,7 +61,7 @@ use crate::inference_proxy::{
     InferenceProxyClient, AGENT_EXECUTE_PATH, CHAT_COMPLETIONS_PATH, CODING_SELECT_PATH,
     INFER_PATH,
 };
-use crate::mesh::{CallRoute, MergedCatalog, Principal, UpstreamPool};
+use crate::mesh::{CallRoute, MergedCatalog, Principal, PrincipalResolver, TailnetIdentity, UpstreamPool};
 use crate::pki::mtls::ClientIdentity;
 use crate::registry::ToolRegistry;
 
@@ -106,6 +106,58 @@ pub struct McpServerState {
     /// behavior — purely additive, matching `personal_federation`'s own
     /// `Option`-gated convention above.
     pub mesh_pool: Option<Arc<UpstreamPool>>,
+    /// MESH-07: resolves the caller's transport identity/identities
+    /// (`ClientIdentity`/`TailnetIdentity` request extensions) to a single
+    /// canonical [`Principal`] for every gated request, replacing the
+    /// interim `Principal::from(&ClientIdentity)` direct conversion at each
+    /// `guard()` call site. See [`resolve_principal`]'s doc for the
+    /// precedence rule: a configured `TERMINUS_MESH_PRINCIPAL_MAP_JSON`
+    /// (`principal_resolver.is_configured()`) means strict
+    /// resolve-or-fail-closed; an unconfigured resolver (the default —
+    /// `PrincipalResolver::default()`, e.g. every deployment that predates
+    /// this item, and `terminus_personal`, which never sets the map var)
+    /// means the legacy cert-CN-as-name passthrough is used instead, so
+    /// existing single-identity deployments and every pre-MESH-07 test in
+    /// this module keep working unmodified.
+    pub principal_resolver: PrincipalResolver,
+}
+
+/// MESH-07: resolve one request's [`Principal`] from its transport identity
+/// extensions (`cert`, the mTLS-derived [`ClientIdentity`]; `tailnet`, the
+/// MESH-05 [`TailnetIdentity`]) via `resolver`, per the precedence this item
+/// establishes:
+/// - `resolver.is_configured()` (an operator has authored at least one entry
+///   in `TERMINUS_MESH_PRINCIPAL_MAP_JSON`) — strict resolution:
+///   `resolver.resolve(cert, tailnet)`. An unmapped or absent transport
+///   identity yields `None` here (never a fallback to the raw cert CN), which
+///   every `guard()` call site below treats as fail-closed, exactly as
+///   `crate::mesh::principal`'s module doc requires.
+/// - resolver NOT configured (the default — no map authored at all) — legacy
+///   passthrough: `cert.map(Principal::from)`, byte-for-byte the interim
+///   behavior every call site in this module used before MESH-07 (a present
+///   cert's CN IS the principal name; a tailnet-only caller with no cert
+///   gets no principal, same as before this item, since the pre-MESH-07 code
+///   never looked at `TailnetIdentity` at all). This is what keeps every
+///   existing single-identity deployment (and every pre-MESH-07 test in this
+///   module) working unmodified when no map is configured.
+///
+/// Deliberately does NOT consult any HTTP header — a `Principal` is built
+/// only from server-verified transport identities attached to the request's
+/// `axum::http::Extensions` by the listener itself (mTLS handshake /
+/// tailnet WhoIs), never from anything the client can set on the wire. This
+/// is what makes a client-supplied `X-Terminus-Client-Identity` (or any
+/// other) header unable to elevate identity — this function never reads
+/// `HeaderMap` at all.
+fn resolve_principal(
+    resolver: &PrincipalResolver,
+    cert: Option<&ClientIdentity>,
+    tailnet: Option<&TailnetIdentity>,
+) -> Option<Principal> {
+    if resolver.is_configured() {
+        resolver.resolve(cert, tailnet).ok()
+    } else {
+        cert.map(Principal::from)
+    }
 }
 
 pub fn build_router(state: Arc<McpServerState>) -> Router {
@@ -141,9 +193,22 @@ async fn handle_inference_proxy(
     state: Arc<McpServerState>,
     path: &'static str,
     identity: Option<Extension<ClientIdentity>>,
+    tailnet: Option<Extension<TailnetIdentity>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // MESH-07: resolve the ONE canonical principal for this request once,
+    // from server-verified transport identities only (never from a header)
+    // -- see `resolve_principal`'s doc for the configured-map-vs-legacy
+    // precedence. Used for both the gateway guard below AND (further down)
+    // the caller-identity string forwarded to Chord's inference backend, so
+    // both are derived from the exact same resolved identity.
+    let principal = resolve_principal(
+        &state.principal_resolver,
+        identity.as_ref().map(|Extension(i)| i),
+        tailnet.as_ref().map(|Extension(t)| t),
+    );
+
     // TGW-04: gate every inference-proxy request through the same
     // identity → allowlist → rate-limit pipeline the tool-call path uses
     // (see `handle_mcp`'s `tools/call` branch) — `guard()` returns a ready
@@ -153,12 +218,6 @@ async fn handle_inference_proxy(
     // pre-TGW-04 ungated behavior.
     let gate_ctx = match &state.gateway {
         Some(gateway) => {
-            // MESH-06: `guard()` now takes a `Principal` rather than a raw
-            // `ClientIdentity` -- converted here via `Principal::from`'s
-            // direct cert-CN-as-name mapping, preserving this call site's
-            // pre-MESH-06 behavior exactly (full `PrincipalResolver` wiring
-            // is MESH-07's job, not this item's).
-            let principal = identity.as_ref().map(|Extension(i)| Principal::from(i));
             match gateway.guard(principal.as_ref(), path, ActionKind::Inference).await {
                 Ok(ctx) => Some(ctx),
                 Err(denial) => return denial,
@@ -169,7 +228,11 @@ async fn handle_inference_proxy(
 
     let response = match &state.inference_proxy {
         Some(client) => {
-            let caller_identity = identity.as_ref().map(|Extension(i)| i.as_str());
+            // MESH-07: the identity forwarded to Chord is now the resolved
+            // canonical `Principal::name` (mapped, when a map is
+            // configured), not the raw mTLS cert CN -- same source of truth
+            // the gate above just used.
+            let caller_identity = principal.as_ref().map(|p| p.name());
             client.forward(path, headers, body, caller_identity).await
         }
         None => (
@@ -197,37 +260,41 @@ async fn handle_inference_proxy(
 async fn handle_chat_completions(
     State(state): State<Arc<McpServerState>>,
     identity: Option<Extension<ClientIdentity>>,
+    tailnet: Option<Extension<TailnetIdentity>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    handle_inference_proxy(state, CHAT_COMPLETIONS_PATH, identity, headers, body).await
+    handle_inference_proxy(state, CHAT_COMPLETIONS_PATH, identity, tailnet, headers, body).await
 }
 
 async fn handle_infer(
     State(state): State<Arc<McpServerState>>,
     identity: Option<Extension<ClientIdentity>>,
+    tailnet: Option<Extension<TailnetIdentity>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    handle_inference_proxy(state, INFER_PATH, identity, headers, body).await
+    handle_inference_proxy(state, INFER_PATH, identity, tailnet, headers, body).await
 }
 
 async fn handle_agent_execute(
     State(state): State<Arc<McpServerState>>,
     identity: Option<Extension<ClientIdentity>>,
+    tailnet: Option<Extension<TailnetIdentity>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    handle_inference_proxy(state, AGENT_EXECUTE_PATH, identity, headers, body).await
+    handle_inference_proxy(state, AGENT_EXECUTE_PATH, identity, tailnet, headers, body).await
 }
 
 async fn handle_coding_select(
     State(state): State<Arc<McpServerState>>,
     identity: Option<Extension<ClientIdentity>>,
+    tailnet: Option<Extension<TailnetIdentity>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    handle_inference_proxy(state, CODING_SELECT_PATH, identity, headers, body).await
+    handle_inference_proxy(state, CODING_SELECT_PATH, identity, tailnet, headers, body).await
 }
 
 /// Extract a human-readable denial message from a `GatewayFramework::guard`
@@ -289,11 +356,30 @@ async fn handle_mcp(
     // request extensions post-handshake) -- absent on the plain HTTP+JWT
     // listener, in which case federated calls forward no caller identity.
     identity: Option<Extension<ClientIdentity>>,
+    // MESH-05: present only on a request that arrived over a tailnet
+    // listener connection whose WhoIs lookup resolved -- see
+    // `TailnetIdentityLayer`'s doc.
+    tailnet: Option<Extension<TailnetIdentity>>,
     body: Bytes,
 ) -> Response {
     if !is_authorized(&state, &headers) {
         return unauthorized();
     }
+
+    // MESH-07: resolve the ONE canonical `Principal` for this request up
+    // front, from server-verified transport identity extensions only (never
+    // from any inbound header -- notably NOT
+    // `crate::federation::CLIENT_IDENTITY_HEADER`, which this handler never
+    // reads at all) -- see `resolve_principal`'s doc for the
+    // configured-map-vs-legacy-passthrough precedence. Every `guard()` call
+    // site and the personal-federation dispatch below all use this SAME
+    // resolved principal, so a client cannot elevate identity by presenting
+    // a header the server doesn't consult in the first place.
+    let principal = resolve_principal(
+        &state.principal_resolver,
+        identity.as_ref().map(|Extension(i)| i),
+        tailnet.as_ref().map(|Extension(t)| t),
+    );
 
     let parsed: Result<Value, _> = serde_json::from_slice(&body);
     let req = match parsed {
@@ -382,7 +468,6 @@ async fn handle_mcp(
             // `terminus_personal`, every pre-TGW-04 deployment) preserves
             // the exact pre-MESH-08 behavior: no filtering at all.
             if let Some(gateway) = &state.gateway {
-                let principal = identity.as_ref().map(|Extension(i)| Principal::from(i));
                 tools = gateway.filter_catalog_for_principal(principal.as_ref(), tools);
             }
             sse_response(id, Ok(json!({"tools": tools})), "")
@@ -404,10 +489,6 @@ async fn handle_mcp(
             // sanitized audit entry are identical to the inference-proxy
             // path's real `403`/`429` HTTP responses.
             let gate_ctx = if let Some(gateway) = &state.gateway {
-                // MESH-06: see the `handle_inference_proxy` call site's
-                // comment above for why this is a direct cert-CN-as-name
-                // conversion rather than full resolver wiring.
-                let principal = identity.as_ref().map(|Extension(i)| Principal::from(i));
                 match gateway.guard(principal.as_ref(), name, ActionKind::Tool).await {
                     Ok(ctx) => Some(ctx),
                     Err(denial) => {
@@ -534,8 +615,15 @@ async fn handle_mcp(
                 // dispatch above is completely unchanged by this branch.
                 None => match &state.personal_federation {
                     Some(client) => {
-                        let caller_identity = identity.as_ref().map(|Extension(i)| i.as_str());
-                        match client.call_tool(name, arguments, caller_identity).await {
+                        // MESH-07: propagate the resolved canonical
+                        // `Principal` (not the raw `ClientIdentity`) so the
+                        // JWT signed for this hop carries the mapped
+                        // identity, and the legacy
+                        // `X-Terminus-Client-Identity` header (kept for
+                        // backward compatibility with the existing
+                        // personal/Chord relay) is populated from the same
+                        // source -- see `crate::federation`'s module doc.
+                        match client.call_tool(name, arguments, principal.as_ref()).await {
                             Ok(outcome) => (
                                 sse_response(
                                     id,
@@ -776,6 +864,7 @@ mod tests {
             inference_proxy: None,
             gateway: None,
             mesh_pool: None,
+            principal_resolver: PrincipalResolver::default(),
         })
     }
 
@@ -917,6 +1006,7 @@ mod tests {
             inference_proxy: None,
             gateway: None,
             mesh_pool: None,
+            principal_resolver: PrincipalResolver::default(),
         });
         let router = build_router(state);
         let (status, body, _) = post_mcp(
@@ -985,6 +1075,7 @@ mod tests {
             inference_proxy: None,
             gateway: None,
             mesh_pool: None,
+            principal_resolver: PrincipalResolver::default(),
         });
         let router = build_router(state);
         let (status, body, _) = post_mcp(
@@ -1032,6 +1123,7 @@ mod tests {
             inference_proxy: None,
             gateway: None,
             mesh_pool: None,
+            principal_resolver: PrincipalResolver::default(),
         });
         let router = build_router(state);
         let req = Request::builder()
@@ -1059,6 +1151,7 @@ mod tests {
             inference_proxy: None,
             gateway: None,
             mesh_pool: None,
+            principal_resolver: PrincipalResolver::default(),
         });
         let router = build_router(state);
         let req = Request::builder()
