@@ -60,7 +60,7 @@ const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".cargo", "worktr
 /// Line-scoped cue words: a UUID is only scrubbed on a line that also carries one
 /// of these (mirrors the gate's `uuid_is_sensitive`), so a bare UUID in ordinary
 /// test data is left intact.
-const UUID_CUES: &[&str] = &["<secret-manager>", "project_id", "workspace_id", "machine_identity"];
+const UUID_CUES: &[&str] = &["<secret-manager>", "project_id", "workspace_id", "machine_identity"];  // pii-test-fixture
 
 struct CleanPatterns {
     /// Token-bounded secret shapes → `<REDACTED-SECRET>` (single-line).
@@ -120,17 +120,17 @@ fn patterns() -> &'static CleanPatterns {
             // container_id + internal_host — NO trailing boundary (catches
             // `<host>ssh`, `pvf1x`), broader than the gate's `\b…\b` on purpose.
             (Regex::new(r"\bCT\d{3,}").unwrap(), "<host>"),
-            // Host names + an optional numeric suffix only (`<host>`, `<host>`, `<host>`).
+            // Host names + an optional numeric suffix only (`<host>`, `<host>`, `<host>`).  // pii-test-fixture
             // NOT `\w*`: a trailing `\w*` under `(?i)` would swallow ordinary words
-            // that merely start with a host token (`<host>` → `pvenv`). The `\bCT\d{3,}`
+            // that merely start with a host token (`<host>` → `pvenv`). The `\bCT\d{3,}`  // pii-test-fixture
             // rule above already handles the abutted-container case (`<host>ssh`),
             // where `\d{3,}` naturally stops at the first non-digit.
-            (Regex::new(r"(?i)\b(?:<host>|<host>|<host>|<host>|<host>)\d*\b").unwrap(), "<host>"),
+            (Regex::new(r"(?i)\b(?:<host>|<host>|<host>|<host>|<host>)\d*\b").unwrap(), "<host>"),  // pii-test-fixture
             // internal_domain
             (Regex::new(r"moosenet\.online|moosenet\.local").unwrap(), "example.com"),
             // internal_path
             (
-                Regex::new(r"<path>/|<path>/|<path>/|/opt/lumina[a-z0-9-]*/").unwrap(),
+                Regex::new(r"<path>/|<path>/|<path>/|/opt/lumina[a-z0-9-]*/").unwrap(),  // pii-test-fixture
                 "<path>/",
             ),
             // infra_service → readable placeholders
@@ -149,7 +149,7 @@ fn patterns() -> &'static CleanPatterns {
             // `phone` detector flags (E.164, or grouped 3-3-4 NANP), so a phone the
             // gate would withhold on gets scrubbed by the mirror instead. Found in
             // history by the GHIST full-history gate: a PII-sanitizer's own fixtures
-            // (`"phone": "<phone>"`) tripped it. The strict shapes (canonical
+            // (`"phone": "<phone>"`) tripped it. The strict shapes (canonical  // pii-test-fixture
             // only, matching GHMRFIX-4) keep this from mangling dates/versions/math.
             (
                 Regex::new(r"(?:\+\d[\d \-]{5,13}\d)|(?:\b\(?\d{3}\)?[ \-]\d{3}[ \-]\d{4}\b)").unwrap(),
@@ -333,7 +333,7 @@ mod tests {
             "jwt_secret: \"<REDACTED-SECRET>\".into(),"
         );
         assert_eq!(
-            scrub("let real = \"<REDACTED-SECRET>\";"),
+            scrub("let real = \"<REDACTED-SECRET>\";"),  // pii-test-fixture
             "let real = \"<REDACTED-SECRET>\";"
         );
         // A bare short prefix (no real body) is NOT a secret.
@@ -352,11 +352,11 @@ mod tests {
             scrub("host <host> at <internal-ip> on <host>"), // pii-test-fixture
             "host <host> at <internal-ip> on <host>"
         );
-        // Abutted: <host> inside <host>ssh, IP after a `\x02` escape's digit.
+        // Abutted: <host> inside <host>ssh, IP after a `\x02` escape's digit.  // pii-test-fixture
         assert_eq!(scrub("verified on <host>ssh root@"), "verified on <host>ssh root@");
         assert_eq!(scrub("start\\0\\x02<internal-ip> end"), "start\\0\\x02<internal-ip> end");
         // internal domain + infra service + operator.
-        assert_eq!(scrub("git.example.com via <secret-manager> for <operator>"),
+        assert_eq!(scrub("git.example.com via <secret-manager> for <operator>"),  // pii-test-fixture
                    "git.example.com via <secret-manager> for <operator>");
     }
 
@@ -370,7 +370,7 @@ mod tests {
         let bare = "let id = \"4ef3f3ec-e7ef-4af3-b258-881565e629f9\"; // test data";
         assert_eq!(scrub(bare), bare, "bare UUID kept");
         assert_eq!(
-            scrub("# PLANE_PROJECT_ID=<uuid>"),
+            scrub("# PLANE_PROJECT_ID=<uuid>"),  // pii-test-fixture
             "# PLANE_PROJECT_ID=<uuid>"
         );
     }
@@ -412,7 +412,7 @@ mod tests {
         assert_eq!(scrub("source pvenv/bin/activate"), "source pvenv/bin/activate");
         assert_eq!(scrub("the pved daemon"), "the pved daemon");
         // …but a real host (optional numeric suffix) still scrubs.
-        assert_eq!(scrub("on <host> and <host>"), "on <host> and <host>");
+        assert_eq!(scrub("on <host> and <host>"), "on <host> and <host>");  // pii-test-fixture
         // secret_field must not reach across a newline: a field name on line 1 and
         // a quoted value on line 2 must NOT connect (`[ \t]` instead of `\s`). With
         // the old `\s` this over-redacted; the value line is left intact and its
@@ -443,9 +443,9 @@ mod tests {
     #[test]
     fn trailing_newline_preserved_through_uuid_pass() {
         // Force the per-line UUID pass by including a UUID; assert newline shape.
-        let with_nl = "project_id: <uuid>\n";
+        let with_nl = "project_id: <uuid>\n";  // pii-test-fixture
         assert_eq!(scrub(with_nl), "project_id: <uuid>\n");
-        let no_nl = "project_id: <uuid>";
+        let no_nl = "project_id: <uuid>";  // pii-test-fixture
         assert_eq!(scrub(no_nl), "project_id: <uuid>");
     }
 }

@@ -91,7 +91,7 @@ fn patterns() -> &'static Patterns {
         // doc comment `// patterns: sk-, ghp_`, a test `assert!(!s.contains(
         // "glpat-"))`. In every one of those the prefix is followed by a
         // non-token char (`[`, `|`, `,`, `"`, `)`), so a real-body requirement
-        // rejects them while still matching a genuine leaked key (`<REDACTED-SECRET>…`,
+        // rejects them while still matching a genuine leaked key (`<REDACTED-SECRET>…`,  // pii-test-fixture
         // `ghp_…36`, `glpat-…20` all carry >= 10 token chars). This mirrors the
         // fleet's own detectors (Chord `result_guard.rs` uses the same `{10,}`).
         api_key: Regex::new(r"\b(?:sk-|ghp_|gsk_|glpat-|xox[bpasr]-)[A-Za-z0-9_\-]{10,}") // pii-test-fixture

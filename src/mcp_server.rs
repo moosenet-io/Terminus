@@ -575,7 +575,7 @@ async fn handle_mcp(
 
             let (response, success, detail) = match mesh_route {
                 Some(CallRoute::Upstream { client, bare_name }) => {
-                    // MESH-09: a guarded tool (<secret-manager>/ansible/openhands/
+                    // MESH-09: a guarded tool (<secret-manager>/ansible/openhands/  // pii-test-fixture
                     // routines, per `approval::is_guarded`) must be
                     // enforced at THIS gateway even when it lives on a
                     // remote upstream -- federation must never be a way to

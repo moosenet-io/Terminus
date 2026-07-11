@@ -42,7 +42,7 @@ pub const APPROVAL_ARG: &str = "_approval_code";
 const MESH_UPSTREAM_ARG: &str = "_mesh_upstream";
 
 /// Bare tool names that are approval-gated locally: every tool in the
-/// `ansible`/`openhands`/`<secret-manager>` modules calls [`gate`] at the top of its
+/// `ansible`/`openhands`/`<secret-manager>` modules calls [`gate`] at the top of its  // pii-test-fixture
 /// own `execute()`, plus the state-mutating `routines_propose`/
 /// `routines_pending`/`routines_approve` and the irreversible
 /// `git_public_mirror_approve`/`git_public_mirror_push`. Mirrored here as a
