@@ -488,6 +488,27 @@ README/wiki/vault; a **`graph.graphml`** interchange file for Gephi/yEd/
 Cytoscape; and a self-contained interactive **`graph.html`** (inline SVG with
 vanilla-JS pan/zoom/search, no external hosts).
 
+### `review_run` is KG-grounded (KGREV-01)
+
+`review_run` best-effort grounds every dispatched review in the project's
+Atlas graph: before building each provider's prompt, it looks for two optional
+keys on `context`:
+
+| Context key | Type | Purpose |
+| --- | --- | --- |
+| `project_id` | string | Which project's stored Atlas graph (`SCRIBE_KG_STORE_DIR`) to consult. Omit this and nothing below happens — the review is byte-for-byte identical to a build with no Atlas awareness at all. |
+| `changed_files` | array of repo-relative path strings | The files under review. If omitted, they're parsed from `context.diff`'s unified-diff `+++ b/<path>` headers instead. |
+
+When `project_id` resolves to a graph with at least one node defined in a
+changed file, `review_run` injects a bounded `knowledge_graph` block into
+`context` — the touched symbols (id/name/kind/cluster) plus up to a few 1-hop
+callers and callees each (≤ 40 symbols total, ≤ ~2 KB serialized; a
+`"truncated": true` marker appears if the cap was hit) — and every provider's
+prompt gets a one-line pointer to it ("... weigh cross-module impact").
+Grounding is entirely best-effort: no `project_id`, no stored graph, or no
+node matching any changed file all silently skip injection — never an error,
+never a partial/empty block.
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).

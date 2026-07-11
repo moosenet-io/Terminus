@@ -36,6 +36,7 @@ mod aggregate;
 // table a second time -- one source of truth for "which providers go
 // through the daemon vs. OpenRouter", not two.
 pub(crate) mod dispatch;
+mod kg_context;
 mod prompt;
 
 use async_trait::async_trait;
@@ -206,7 +207,10 @@ than failing the whole call."
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        let (structure, providers, criteria, context) = parse_input(&args)?;
+        let (structure, providers, criteria, mut context) = parse_input(&args)?;
+        // KGREV-01: best-effort, backward-compatible KG grounding -- a no-op
+        // unless `context.project_id` is present AND a matching graph exists.
+        kg_context::inject(&mut context);
         let cfg = ReviewConfig::from_env();
 
         let mut set = tokio::task::JoinSet::new();
