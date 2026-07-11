@@ -1,7 +1,7 @@
 //! GHMR-04 / GITX-08 — git-public mirror engine subtools (core registry) +
 //! dev-box transport.
 //!
-//! Exposes the GHMR-01/02/03 mirror engine as four **core-tool** subtools
+//! Exposes the GHMR-01/02/03 mirror engine as five **core-tool** subtools
 //! (moved from the github module to `crate::forge::mirror` and renamed from
 //! `github_mirror_*` to `git_public_mirror_*` at GITX-08 — the engine has
 //! been behaviorally provider-agnostic since GITX-05; only the naming still
@@ -9,10 +9,16 @@
 //! they land on whatever registry that function is invoked against — the
 //! CORE registry in `register_all` and the personal registry in
 //! `register_personal` (github is a core tool per the operator's tool
-//! taxonomy). GitHub remains the only currently-configured mirror target.
+//! taxonomy). GitHub remains the only currently-configured public mirror
+//! target; Gitea is the internal source of truth.
 //!
 //!   * `git_public_mirror_status`  — read-only: internal-main divergence vs. the last
 //!     approved snapshot, plus the set of `mirror-approved/*` tags.
+//!   * `git_public_mirror_sync_source` (S111E/MIRR-04) — clone/fetch the internal-main
+//!     "parking lot" checkout directly from Gitea (git-protocol transport: clone if
+//!     absent, else fetch + checkout + hard-reset to `origin/<branch>`), using the
+//!     resolved `GITEA_PAT_<NAME>` credential via `GIT_ASKPASS`. This is what feeds
+//!     `source` for the other four tools — see the operator-decision note below.
 //!   * `git_public_mirror_prepare` — sync internal `main`'s content into the clean work
 //!     dir → mechanical sweep → PII gate → commit (+ `mirror-approved/<sha>` tag
 //!     when gate-clean), via GHMR-03's [`MirrorWorkDir::run`]. Returns residual
@@ -33,6 +39,15 @@
 //!     remote URL or argv). Refuses any
 //!     non-fast-forward move and points at the GHMR-07 bootstrap; NEVER force-pushes.
 //!
+//! ## Git-protocol transport ownership (S111E, 2026-07-10, operator decision)
+//! As of moosenet-spec skill v3.14, the Terminus git tool (this module, plus
+//! [`crate::github`]/[`crate::gitea`]) is the SANCTIONED OWNER of git-protocol
+//! transport (clone/fetch/merge/push/source-sync), holding both the Gitea and
+//! GitHub credentials via `GIT_ASKPASS`. This SUPERSEDES the former
+//! dev-box-only git-transport rule for these operations — the one sanctioned
+//! door for git transport is now this engine, not a specific host. Other hosts
+//! still never get their own ad hoc credentials.
+//!
 //! ## Dev-box-only transport, logic-in-terminus
 //! The engine's LOGIC lives here in terminus-rs, but every git operation (the
 //! work-dir git ops of GHMR-03 and the `git push` here) RUNS ON THE DEV BOX — the
@@ -51,7 +66,7 @@
 //! outside this engine.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use async_trait::async_trait;
@@ -104,6 +119,31 @@ fn mirror_provider(args: &Value) -> String {
         .to_string()
 }
 
+/// Environment variable enabling autonomous approve/push on a verified-clean,
+/// fast-forward-eligible snapshot (MIRR-02 / S111E): when set to `"true"`
+/// (case-insensitive), `git_public_mirror_approve` skips the operator one-time code
+/// once the machine `mirror-approved/<sha>` tag (prepare's 0-residual PII proof)
+/// is present for the current internal sha, and `git_public_mirror_push` skips it
+/// once the snapshot is blessed AND the fast-forward analysis is clean. Default
+/// FALSE (unset/anything else) — the operator code is still required. This flag
+/// NEVER touches the hard PII block: a dirty/residual sweep never creates a
+/// `mirror-approved` tag in the first place, so auto-approve cannot fire on it; a
+/// non-fast-forward / un-bootstrapped remote refuses unconditionally regardless
+/// of this flag. Every auto-approve/auto-push is logged loudly (see
+/// `auto_approve_enabled`'s call sites).
+const AUTO_APPROVE_ENV: &str = "TERMINUS_MIRROR_AUTO_APPROVE";
+
+/// Whether [`AUTO_APPROVE_ENV`] is enabled. Matches the codebase's existing
+/// boolean-env convention (see e.g. `scribe::mod`'s
+/// `SCRIBE_ALLOW_SUBPROCESS_VAULT_WRITE`): case-insensitive `"true"`, anything
+/// else (including unset) is `false`.
+fn auto_approve_enabled() -> bool {
+    std::env::var(AUTO_APPROVE_ENV)
+        .ok()
+        .map(|s| s.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Tag namespace marking a snapshot the OPERATOR has authorised for push. Created
 /// ONLY by `git_public_mirror_approve` after the approval gate grants — distinct from
 /// GHMR-03's `mirror-approved/*` (gate-clean, but machine-created by prepare). Push
@@ -145,13 +185,49 @@ fn validate_repo(repo: &str) -> Result<(), ToolError> {
     }
 }
 
+/// Environment variable holding a configurable "parking lot" root directory
+/// containing one internal-`main` checkout per repo
+/// (`<TERMINUS_MIRROR_SOURCE_ROOT>/<repo>`), used to derive `source` when a
+/// caller does not pass it explicitly — e.g. a shared NFS location updated by
+/// the dev box on merge and read by whichever host runs the mirror tools
+/// (MIRR-01 / S111E). Unset by default: with no root configured, `source`
+/// remains a required explicit arg (back-compat with pre-MIRR-01 callers).
+const SOURCE_ROOT_ENV: &str = "TERMINUS_MIRROR_SOURCE_ROOT";
+
+/// Resolve the `source` path for a call: an explicit `source` arg always wins
+/// (even when a root is configured); otherwise, when
+/// [`SOURCE_ROOT_ENV`] is set, derive `<root>/<repo>`; otherwise a clear
+/// [`ToolError::NotConfigured`] — there is nothing to fall back to. `repo` must
+/// already be validated by [`validate_repo`] before this is called (it is
+/// joined onto the root exactly like [`MirrorWorkDir::from_config`] joins the
+/// work-dir root, so the same traversal guard applies).
+fn resolve_source(args: &Value, repo: &str) -> Result<PathBuf, ToolError> {
+    if let Some(s) = args.get("source").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(PathBuf::from(s));
+    }
+    let root = std::env::var(SOURCE_ROOT_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ToolError::NotConfigured(format!(
+                "'source' was not given and {SOURCE_ROOT_ENV} is not set — pass 'source' \
+                 explicitly (the internal-main checkout path) or configure {SOURCE_ROOT_ENV} so \
+                 it can be derived as {SOURCE_ROOT_ENV}/{repo}"
+            ))
+        })?;
+    Ok(Path::new(&root).join(repo))
+}
+
 /// Build a [`MirrorWorkDir`] for `(repo, source)` with the work dir resolved from
-/// [`WORKDIR_ROOT_ENV`](super::workdir::WORKDIR_ROOT_ENV). `repo` and `source`
-/// (the dev-box internal-`main` checkout) are required args on every mirror tool.
+/// [`WORKDIR_ROOT_ENV`](super::workdir::WORKDIR_ROOT_ENV). `repo` is a required
+/// arg on every mirror tool; `source` (the internal-`main` checkout) is either
+/// passed explicitly or derived from [`SOURCE_ROOT_ENV`] (MIRR-01) — see
+/// [`resolve_source`].
 fn workdir_from_args(args: &Value) -> Result<MirrorWorkDir, ToolError> {
     let repo = req_str(args, "repo")?;
     validate_repo(repo)?;
-    let source = req_str(args, "source")?;
+    let source = resolve_source(args, repo)?;
     MirrorWorkDir::from_config(repo, source)
 }
 
@@ -300,7 +376,9 @@ impl RustTool for GitPublicMirrorStatus {
          whether that exact commit is already approved (a mirror-approved tag), how \
          far internal main has diverged past the last approved snapshot, the work-dir \
          HEAD, and the full set of mirror-approved tags. Read-only. Requires 'repo' \
-         (logical name) and 'source' (the dev-box internal-main checkout path)."
+         (logical name); 'source' (the internal-main checkout path) is required UNLESS \
+         TERMINUS_MIRROR_SOURCE_ROOT is configured, in which case it defaults to \
+         TERMINUS_MIRROR_SOURCE_ROOT/<repo> (an explicit 'source' always overrides)."
     }
 
     fn parameters(&self) -> Value {
@@ -308,9 +386,9 @@ impl RustTool for GitPublicMirrorStatus {
             "type": "object",
             "properties": {
                 "repo":   { "type": "string", "description": "Logical repo name (work-dir subdir + commit label)" },
-                "source": { "type": "string", "description": "Path to the internal-main checkout on the dev box" }
+                "source": { "type": "string", "description": "Path to the internal-main checkout (optional when TERMINUS_MIRROR_SOURCE_ROOT is set — defaults to <root>/<repo>)" }
             },
-            "required": ["repo", "source"]
+            "required": ["repo"]
         })
     }
 
@@ -397,8 +475,9 @@ impl RustTool for GitPublicMirrorPrepare {
          operationalized bounded cleaning pass (GHMR-05): a configured cleaning subagent \
          remediates the flagged spots in the work dir and re-gates, up to 3 rounds — driving \
          the gate to 0 (then committed + tagged) or escalating the exact file:line spots to \
-         the operator. Requires 'repo' and 'source' (the dev-box internal-main checkout). \
-         Writes ONLY to the work dir, never the source."
+         the operator. Requires 'repo'; 'source' (the internal-main checkout) is required \
+         UNLESS TERMINUS_MIRROR_SOURCE_ROOT is configured, in which case it defaults to \
+         TERMINUS_MIRROR_SOURCE_ROOT/<repo>. Writes ONLY to the work dir, never the source."
     }
 
     fn parameters(&self) -> Value {
@@ -406,9 +485,9 @@ impl RustTool for GitPublicMirrorPrepare {
             "type": "object",
             "properties": {
                 "repo":   { "type": "string", "description": "Logical repo name" },
-                "source": { "type": "string", "description": "Path to the internal-main checkout on the dev box" }
+                "source": { "type": "string", "description": "Path to the internal-main checkout (optional when TERMINUS_MIRROR_SOURCE_ROOT is set — defaults to <root>/<repo>)" }
             },
-            "required": ["repo", "source"]
+            "required": ["repo"]
         })
     }
 
@@ -447,7 +526,11 @@ impl RustTool for GitPublicMirrorApprove {
          still pending — those must be cleaned (GHMR-05) and re-prepared first. On a clean \
          snapshot it idempotently confirms the mirror-approved/<internal-sha> tag and, \
          after the operator approves the one-time code, blesses the snapshot for \
-         git_public_mirror_push. Requires 'repo' and 'source'."
+         git_public_mirror_push. When TERMINUS_MIRROR_AUTO_APPROVE is true AND the \
+         mirror-approved/<sha> tag (the 0-residual PII proof) is present, the operator \
+         code is skipped and the snapshot is blessed automatically. Requires 'repo'; \
+         'source' defaults to TERMINUS_MIRROR_SOURCE_ROOT/<repo> when that root is \
+         configured, else it is required."
     }
 
     fn parameters(&self) -> Value {
@@ -455,10 +538,10 @@ impl RustTool for GitPublicMirrorApprove {
             "type": "object",
             "properties": {
                 "repo":   { "type": "string", "description": "Logical repo name" },
-                "source": { "type": "string", "description": "Path to the internal-main checkout on the dev box" },
+                "source": { "type": "string", "description": "Path to the internal-main checkout (optional when TERMINUS_MIRROR_SOURCE_ROOT is set — defaults to <root>/<repo>)" },
                 "_approval_code": { "type": "string", "description": "One-time approval code (supplied on operator re-dispatch; do not set manually)" }
             },
-            "required": ["repo", "source"]
+            "required": ["repo"]
         })
     }
 
@@ -494,6 +577,39 @@ impl RustTool for GitPublicMirrorApprove {
                 .to_string());
             }
         };
+
+        // MIRR-02: TERMINUS_MIRROR_AUTO_APPROVE removes the human convenience gate
+        // ONLY on an already-verified-clean snapshot — the match arm above already
+        // proved `approved_commit` exists, which happens IFF prepare's PII gate
+        // reported 0 residual violations for this exact internal sha (see GHMR-03's
+        // `MirrorWorkDir::run`). A dirty/residual/un-prepared sha never reaches this
+        // point (it returns early above), so auto-approve can never bless unswept
+        // content — the hard PII block is untouched. Every auto-approval is logged
+        // loudly to the audit log (repo + sha + commit).
+        if auto_approve_enabled() {
+            create_blessed_tag(wd.path(), &internal_sha, &approved_commit)?;
+            tracing::warn!(
+                target: "mirror_audit",
+                event = "auto_approve",
+                repo = %repo,
+                internal_sha = %internal_sha,
+                commit_sha = %approved_commit,
+                "AUTO-APPROVE (TERMINUS_MIRROR_AUTO_APPROVE): mirror snapshot blessed \
+                 without an operator code — verified 0-residual PII sweep"
+            );
+            return Ok(json!({
+                "approved": true,
+                "repo": repo,
+                "internal_sha": internal_sha,
+                "approved_tag": format!("mirror-approved/{internal_sha}"),
+                "blessed_tag": blessed_tag(&internal_sha),
+                "commit_sha": approved_commit,
+                "auto_approved": true,
+                "message": "snapshot auto-blessed (TERMINUS_MIRROR_AUTO_APPROVE, verified clean \
+                             sweep) — run git_public_mirror_push to publish (fast-forward only)",
+            })
+            .to_string());
+        }
 
         // GUARDED: the operator must bless this snapshot out of band. The gate is
         // content-bound to the FRESHLY-RESOLVED identity — repo, source, AND the
@@ -569,8 +685,12 @@ impl RustTool for GitPublicMirrorPush {
          injected via GIT_ASKPASS, never in the URL/argv, never logged). REFUSES any \
          non-fast-forward move (and an un-bootstrapped remote), \
          pointing at the GHMR-07 bootstrap; NEVER force-pushes. Runs on the dev box only. \
-         Requires 'repo' and 'source'; the remote comes from 'github_remote' or \
-         TERMINUS_MIRROR_REMOTE[_<REPO>]."
+         When TERMINUS_MIRROR_AUTO_APPROVE is true AND the snapshot is blessed AND the \
+         fast-forward analysis is clean, the operator code is skipped and the push \
+         proceeds automatically — a non-fast-forward / un-bootstrapped remote still \
+         refuses unconditionally. Requires 'repo'; 'source' defaults to \
+         TERMINUS_MIRROR_SOURCE_ROOT/<repo> when that root is configured, else it is \
+         required; the remote comes from 'github_remote' or TERMINUS_MIRROR_REMOTE[_<REPO>]."
     }
 
     fn parameters(&self) -> Value {
@@ -578,12 +698,12 @@ impl RustTool for GitPublicMirrorPush {
             "type": "object",
             "properties": {
                 "repo":          { "type": "string", "description": "Logical repo name" },
-                "source":        { "type": "string", "description": "Path to the internal-main checkout on the dev box" },
+                "source":        { "type": "string", "description": "Path to the internal-main checkout (optional when TERMINUS_MIRROR_SOURCE_ROOT is set — defaults to <root>/<repo>)" },
                 "github_remote": { "type": "string", "description": "Target mirror remote URL (else TERMINUS_MIRROR_REMOTE[_<REPO>])" },
                 "provider":      { "type": "string", "description": "Mirror-push target provider (default 'github'; the engine is provider-routable — see mirror_provider_token)" },
                 "_approval_code": { "type": "string", "description": "One-time approval code (supplied on operator re-dispatch; do not set manually)" }
             },
-            "required": ["repo", "source"]
+            "required": ["repo"]
         })
     }
 
@@ -644,6 +764,39 @@ impl RustTool for GitPublicMirrorPush {
                 .to_string());
             }
             FfState::FastForward => {}
+        }
+
+        // MIRR-02: TERMINUS_MIRROR_AUTO_APPROVE removes the human convenience gate
+        // ONLY once BOTH operator-independent preconditions already hold: a
+        // `mirror-blessed/<sha>` marker (checked above — the operator must have
+        // approved this exact snapshot at some point, auto or manual) AND a clean
+        // FastForward analysis (checked immediately above — NoRemoteBranch and
+        // NonFastForward both return/refuse before reaching here, unconditionally,
+        // regardless of this flag). Every auto-push is logged loudly to the audit
+        // log (repo + sha + remote).
+        if auto_approve_enabled() {
+            tracing::warn!(
+                target: "mirror_audit",
+                event = "auto_push",
+                repo = %repo,
+                internal_sha = %internal_sha,
+                commit_sha = %approved_commit,
+                remote = %remote,
+                "AUTO-PUSH (TERMINUS_MIRROR_AUTO_APPROVE): fast-forward mirror push \
+                 proceeding without an operator code — blessed + fast-forward verified"
+            );
+            let token = mirror_provider_token(&mirror_provider(&args))?;
+            perform_ff_push(wd.path(), &remote, &approved_commit, &token)?;
+            return Ok(json!({
+                "pushed": true,
+                "repo": repo,
+                "internal_sha": internal_sha,
+                "commit_sha": approved_commit,
+                "branch": "main",
+                "auto_pushed": true,
+                "message": "fast-forward push complete (auto, TERMINUS_MIRROR_AUTO_APPROVE)",
+            })
+            .to_string());
         }
 
         // GUARDED: the actual mutation of public state requires an operator blessing.
@@ -866,6 +1019,287 @@ fn git_exit_ok(work_dir: &Path, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+// ── git_public_mirror_sync_source (S111E / MIRR-04) ─────────────────────────────
+
+/// Environment variable holding the internal Gitea git-transport remote for a
+/// repo's parking-lot checkout, when a call does not pass `internal_remote`
+/// explicitly. Checked per-repo first (`TERMINUS_MIRROR_INTERNAL_REMOTE_<REPO_UPPER>`)
+/// then as a single fallback (`TERMINUS_MIRROR_INTERNAL_REMOTE`) — same shape as
+/// [`REMOTE_ENV`] for the public mirror target. NEVER a literal in code, and
+/// NEVER carries an embedded token (auth is injected via `GIT_ASKPASS` at call
+/// time — see [`run_git_askpass_plain`] / [`run_git_askpass_in`]).
+const INTERNAL_REMOTE_ENV: &str = "TERMINUS_MIRROR_INTERNAL_REMOTE";
+
+/// Resolve the internal Gitea remote for `(args, repo)`: explicit
+/// `internal_remote` arg wins, then `TERMINUS_MIRROR_INTERNAL_REMOTE_<REPO_UPPER>`,
+/// then `TERMINUS_MIRROR_INTERNAL_REMOTE`. Reuses [`validate_remote`] so an
+/// option-like remote (`-`-prefixed) is refused the same way the public mirror
+/// remote is.
+fn resolve_internal_remote(args: &Value, repo: &str) -> Result<String, ToolError> {
+    if let Some(r) = args
+        .get("internal_remote")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        validate_remote(r)?;
+        return Ok(r.to_string());
+    }
+    let per_repo = format!(
+        "{INTERNAL_REMOTE_ENV}_{}",
+        repo.to_uppercase().replace(|c: char| !c.is_ascii_alphanumeric(), "_")
+    );
+    for key in [per_repo.as_str(), INTERNAL_REMOTE_ENV] {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                validate_remote(&v)?;
+                return Ok(v);
+            }
+        }
+    }
+    Err(ToolError::NotConfigured(format!(
+        "no internal Gitea remote for '{repo}': pass 'internal_remote' or set {per_repo} / \
+         {INTERNAL_REMOTE_ENV} (e.g. http://<gitea-host>/moosenet/{repo}.git — no embedded token; \
+         auth is injected via GIT_ASKPASS)"
+    )))
+}
+
+/// The parking-lot checkout branch: `TERMINUS_MIRROR_SOURCE_BRANCH` (same env
+/// var [`ensure_source_is_main`] honours), default `"main"`.
+fn source_branch() -> String {
+    std::env::var("TERMINUS_MIRROR_SOURCE_BRANCH")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "main".to_string())
+}
+
+/// Force-guard for the sync-source parking-lot checkout. Unlike
+/// [`assert_never_force`] (the clean mirror WORK DIR's guard, which bans
+/// `--hard` unconditionally because that tree's history only ever moves
+/// forward), this checkout IS the internal-main parking lot itself — making it
+/// exactly match internal main via `reset --hard origin/<branch>` is the
+/// intended, sanctioned sync-source operation (S111E/MIRR-04), not a
+/// force-push of anything public. `--force`/`-f`/`--force-with-lease` remain
+/// unconditionally banned; `--hard` is tolerated ONLY in the exact
+/// `["reset", "--hard", "origin/<branch>"]` shape `fetch_and_reset` below
+/// builds — any other appearance of `--hard` is refused just as loudly.
+fn assert_source_sync_safe(argv: &[&str]) {
+    const BANNED: &[&str] = &["--force", "-f", "--force-with-lease"];
+    for token in argv {
+        let lower = token.to_lowercase();
+        assert!(
+            !BANNED.contains(&lower.as_str()),
+            "sync-source git argv contained a force token '{token}': {argv:?}"
+        );
+    }
+    if argv.iter().any(|a| *a == "--hard") {
+        let sanctioned = argv.first() == Some(&"reset")
+            && argv.get(1) == Some(&"--hard")
+            && argv.len() == 3
+            && argv.get(2).map(|s| s.starts_with("origin/")).unwrap_or(false);
+        assert!(
+            sanctioned,
+            "sync-source git argv used --hard outside the sanctioned \
+             'reset --hard origin/<branch>' shape: {argv:?}"
+        );
+    }
+}
+
+/// Run a git command in `cwd` with no credential injection (local ops: checkout,
+/// rev-parse, the hard reset itself). Force-guarded via
+/// [`assert_source_sync_safe`], NOT [`assert_never_force`] — this checkout
+/// tolerates the one sanctioned `reset --hard origin/<branch>` shape.
+fn run_source_git(cwd: &Path, args: &[&str]) -> Result<String, ToolError> {
+    assert_source_sync_safe(args);
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|e| ToolError::Execution(format!("failed to spawn git {}: {e}", args.join(" "))))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(ToolError::Execution(format!(
+            "git {} (in {}) failed: {}",
+            args.join(" "),
+            cwd.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+}
+
+/// Run a git command with no `cwd` (for `clone`, which creates its own target
+/// dir), injecting `token` via `GIT_ASKPASS` exactly like [`perform_ff_push`]'s
+/// transport — the token never appears in argv, the remote URL, or logs (a
+/// failure's stderr is defensively redacted of the token before surfacing).
+fn run_git_askpass_plain(args: &[&str], token: &str) -> Result<String, ToolError> {
+    assert_source_sync_safe(args);
+    let askpass = write_askpass_script()?;
+    let output = Command::new("git")
+        .args(args)
+        .env("GIT_ASKPASS", askpass.path())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_MIRROR_TOKEN", token)
+        .output()
+        .map_err(|e| ToolError::Execution(format!("failed to spawn git {}: {e}", args.join(" "))))?;
+    drop(askpass);
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let redacted = stderr.replace(token, "<redacted>");
+        Err(ToolError::Execution(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            redacted.trim()
+        )))
+    }
+}
+
+/// Like [`run_git_askpass_plain`] but in an existing checkout (`fetch`), with
+/// hooks disabled the same way [`run_git`] disables them.
+fn run_git_askpass_in(cwd: &Path, args: &[&str], token: &str) -> Result<String, ToolError> {
+    assert_source_sync_safe(args);
+    let askpass = write_askpass_script()?;
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(args)
+        .env("GIT_ASKPASS", askpass.path())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_MIRROR_TOKEN", token)
+        .output()
+        .map_err(|e| ToolError::Execution(format!("failed to spawn git {}: {e}", args.join(" "))))?;
+    drop(askpass);
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let redacted = stderr.replace(token, "<redacted>");
+        Err(ToolError::Execution(format!(
+            "git {} (in {}) failed: {}",
+            args.join(" "),
+            cwd.display(),
+            redacted.trim()
+        )))
+    }
+}
+
+/// `<source>/.git` absent → clone. The token is injected via `GIT_ASKPASS`; the
+/// remote URL (stored verbatim in the resulting `.git/config`'s `origin`) never
+/// carries the token, so subsequent `fetch`es re-resolve auth per-call the same
+/// way.
+fn clone_source(dest: &Path, remote: &str, token: &str) -> Result<(), ToolError> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            ToolError::Execution(format!(
+                "failed to create source parent dir {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    let dest_str = dest.to_string_lossy().to_string();
+    let argv = ["clone", "--", remote, dest_str.as_str()];
+    run_git_askpass_plain(&argv, token)?;
+    Ok(())
+}
+
+/// `<source>/.git` present → `fetch origin` + `checkout <branch>` +
+/// `reset --hard origin/<branch>`, making the checkout exactly match internal
+/// main (this is the sanctioned `--hard`; see [`assert_source_sync_safe`]).
+fn fetch_and_reset(source: &Path, branch: &str, token: &str) -> Result<(), ToolError> {
+    run_git_askpass_in(source, &["fetch", "--", "origin", branch], token)?;
+    run_source_git(source, &["checkout", branch])?;
+    let reset_target = format!("origin/{branch}");
+    run_source_git(source, &["reset", "--hard", reset_target.as_str()])?;
+    Ok(())
+}
+
+struct GitPublicMirrorSyncSource;
+
+#[async_trait]
+impl RustTool for GitPublicMirrorSyncSource {
+    fn name(&self) -> &str {
+        "git_public_mirror_sync_source"
+    }
+
+    fn description(&self) -> &str {
+        "S111E/MIRR-04. Sync a repo's internal-main 'parking lot' checkout (the \
+         source the mirror engine's git_public_mirror_prepare reads) directly from \
+         Gitea, using the resolved GITEA_PAT_<NAME> credential (default identity \
+         GITEA_PAT_MOOSE) injected via GIT_ASKPASS — never in argv/URL/logs. If the \
+         checkout doesn't exist yet (<source>/.git absent) it is cloned; otherwise it \
+         is fetched and hard-reset to origin/<branch>, making the parking lot exactly \
+         match internal main. 'source' defaults to TERMINUS_MIRROR_SOURCE_ROOT/<repo> \
+         (same resolution as the other mirror tools); 'internal_remote' defaults to \
+         TERMINUS_MIRROR_INTERNAL_REMOTE_<REPO_UPPER> then TERMINUS_MIRROR_INTERNAL_REMOTE \
+         (no embedded token — an http(s) Gitea remote URL only). Returns the resulting \
+         HEAD sha and branch. This is the git-protocol transport the operator (S111E, \
+         2026-07-10, moosenet-spec skill v3.14) designated the Terminus git tool to own; \
+         it supersedes the former dev-box-only git-clone/fetch rule for this transport."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "repo":            { "type": "string", "description": "Logical repo name (source-root subdir)" },
+                "source":          { "type": "string", "description": "Path to the parking-lot checkout (optional when TERMINUS_MIRROR_SOURCE_ROOT is set — defaults to <root>/<repo>)" },
+                "internal_remote": { "type": "string", "description": "Internal Gitea git remote (else TERMINUS_MIRROR_INTERNAL_REMOTE[_<REPO>])" },
+                "identity":        { "type": "string", "description": "Named GITEA_PAT_<NAME> identity to authenticate as (default: GITEA_IDENTITY_NAME, i.e. moose)" }
+            },
+            "required": ["repo"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let repo = req_str(&args, "repo")?.to_string();
+        validate_repo(&repo)?;
+        let source = resolve_source(&args, &repo)?;
+        let remote = resolve_internal_remote(&args, &repo)?;
+        let identity = args.get("identity").and_then(Value::as_str).map(str::to_string);
+        // Resolved ONLY here, immediately before use, and injected via
+        // GIT_ASKPASS — never in the remote URL, never in argv, never logged.
+        let token = crate::gitea::gitea_token(identity.as_deref())?;
+        let branch = source_branch();
+
+        let cloned = if !source.join(".git").exists() {
+            clone_source(&source, &remote, &token)?;
+            // A fresh clone may check out the remote's default branch under a
+            // different local name than `branch` (rare, but not guaranteed) —
+            // make sure the parking lot lands on the configured branch.
+            run_source_git(&source, &["checkout", &branch]).map_err(|e| {
+                ToolError::Execution(format!(
+                    "cloned '{repo}' but could not check out branch '{branch}': {e}"
+                ))
+            })?;
+            true
+        } else {
+            fetch_and_reset(&source, &branch, &token)?;
+            false
+        };
+
+        let head_sha = run_source_git(&source, &["rev-parse", "HEAD"])?.trim().to_string();
+        let current_branch = run_source_git(&source, &["rev-parse", "--abbrev-ref", "HEAD"])?
+            .trim()
+            .to_string();
+
+        Ok(json!({
+            "repo": repo,
+            "source": source.display().to_string(),
+            "cloned": cloned,
+            "remote": remote,
+            "head_sha": head_sha,
+            "branch": current_branch,
+        })
+        .to_string())
+    }
+}
+
 // ── git-public integration (S106 / GITX-05) ─────────────────────────────────
 
 /// Forward a mirror action to the underlying GHMR subtool. This is how the
@@ -874,16 +1308,20 @@ fn git_exit_ok(work_dir: &Path, args: &[&str]) -> bool {
 /// without duplicating any of the engine's PII-gate / fast-forward-only /
 /// no-force logic: it simply calls the exact same [`RustTool::execute`] these
 /// four core tools already run when dispatched by name via the registry.
-/// `action` is one of `"status" | "prepare" | "approve" | "push"`; anything
-/// else is a clean invalid-argument error.
+/// `action` is one of `"status" | "prepare" | "approve" | "push" | "sync-source"`;
+/// anything else is a clean invalid-argument error. `sync-source` (S111E/MIRR-04)
+/// is the Gitea-side transport (clone/fetch the internal-main parking lot) —
+/// distinct from the other four, which operate on the swept work-dir derivative
+/// and its GitHub-side transport.
 pub(crate) async fn dispatch_mirror_action(action: &str, args: Value) -> Result<String, ToolError> {
     match action {
         "status" => GitPublicMirrorStatus.execute(args).await,
         "prepare" => GitPublicMirrorPrepare.execute(args).await,
         "approve" => GitPublicMirrorApprove.execute(args).await,
         "push" => GitPublicMirrorPush.execute(args).await,
+        "sync-source" => GitPublicMirrorSyncSource.execute(args).await,
         other => Err(ToolError::InvalidArgument(format!(
-            "unknown mirror_action '{other}'; expected one of status/prepare/approve/push"
+            "unknown mirror_action '{other}'; expected one of status/prepare/approve/push/sync-source"
         ))),
     }
 }
@@ -901,6 +1339,7 @@ pub fn register(registry: &mut ToolRegistry) {
     registry.register_or_replace(Box::new(GitPublicMirrorPrepare));
     registry.register_or_replace(Box::new(GitPublicMirrorApprove));
     registry.register_or_replace(Box::new(GitPublicMirrorPush));
+    registry.register_or_replace(Box::new(GitPublicMirrorSyncSource));
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -937,13 +1376,19 @@ mod tests {
 
     fn init_source(files: &[(&str, &str)]) -> std::path::PathBuf {
         let dir = unique("src");
-        std::fs::create_dir_all(&dir).unwrap();
-        run_git(&dir, &["init", "-q", "-b", "main"]).unwrap();
-        for (rel, content) in files {
-            write_file(&dir, rel, content);
-        }
-        commit_all(&dir, "initial");
+        init_source_at(&dir, files);
         dir
+    }
+
+    /// Like [`init_source`] but at a caller-chosen path (MIRR-01: used to build a
+    /// `<source_root>/<repo>` parking-lot checkout at an exact location).
+    fn init_source_at(dir: &Path, files: &[(&str, &str)]) {
+        std::fs::create_dir_all(dir).unwrap();
+        run_git(dir, &["init", "-q", "-b", "main"]).unwrap();
+        for (rel, content) in files {
+            write_file(dir, rel, content);
+        }
+        commit_all(dir, "initial");
     }
 
     fn commit_all(dir: &Path, msg: &str) {
@@ -978,6 +1423,11 @@ mod tests {
         std::env::remove_var("GITHUB_ALLOWED_AUTHORS");
         std::env::remove_var("TERMINUS_MIRROR_WORKDIR_ROOT");
         std::env::remove_var("TERMINUS_MIRROR_REMOTE");
+        std::env::remove_var("TERMINUS_MIRROR_SOURCE_ROOT");
+        std::env::remove_var("TERMINUS_MIRROR_AUTO_APPROVE");
+        std::env::remove_var("TERMINUS_MIRROR_INTERNAL_REMOTE");
+        std::env::remove_var("TERMINUS_MIRROR_INTERNAL_REMOTE_DEMO");
+        std::env::remove_var("TERMINUS_MIRROR_SOURCE_BRANCH");
         std::env::remove_var("DATABASE_URL");
     }
 
@@ -1019,7 +1469,12 @@ mod tests {
             assert_eq!(t["type"], "object");
             let req = t["required"].as_array().unwrap();
             assert!(req.iter().any(|v| v == "repo"));
-            assert!(req.iter().any(|v| v == "source"));
+            // MIRR-01: 'source' is no longer schema-required — it is derivable from
+            // TERMINUS_MIRROR_SOURCE_ROOT/<repo> when that root is configured (an
+            // explicit 'source' still always overrides). It remains a documented
+            // property either way.
+            assert!(!req.iter().any(|v| v == "source"));
+            assert!(t["properties"].get("source").is_some());
         }
     }
 
@@ -1053,14 +1508,19 @@ mod tests {
     // ── missing args ─────────────────────────────────────────────────────────
 
     #[tokio::test]
+    #[serial]
     async fn status_requires_repo_and_source() {
+        clear_env();
         assert!(matches!(
             GitPublicMirrorStatus.execute(json!({})).await,
             Err(ToolError::InvalidArgument(_))
         ));
+        // MIRR-01: with no explicit 'source' AND no TERMINUS_MIRROR_SOURCE_ROOT
+        // configured, there is nothing to derive from — a clear NotConfigured,
+        // not the old "missing required arg" InvalidArgument.
         assert!(matches!(
             GitPublicMirrorStatus.execute(json!({ "repo": "R" })).await,
-            Err(ToolError::InvalidArgument(_))
+            Err(ToolError::NotConfigured(_))
         ));
     }
 
@@ -1851,5 +2311,485 @@ mod tests {
     #[test]
     fn git_ok_helper_is_reachable() {
         let _ = git_ok as fn(&Path, &[&str]) -> bool;
+    }
+
+    // ── MIRR-01: configurable source root ("parking lot") ────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn source_derives_from_configured_root_when_arg_omitted() {
+        clear_env();
+        let source_root = unique("source-root");
+        let repo = "Terminus";
+        let src = source_root.join(repo);
+        init_source_at(&src, &[("a.txt", "clean\n")]);
+        std::env::set_var("TERMINUS_MIRROR_SOURCE_ROOT", &source_root);
+        let root = unique("root");
+        set_root(&root);
+
+        let st = GitPublicMirrorStatus.execute(json!({ "repo": repo })).await.unwrap();
+        let sv: Value = serde_json::from_str(&st).unwrap();
+        assert_eq!(
+            sv["internal_sha"],
+            run_git(&src, &["rev-parse", "HEAD"]).unwrap().trim(),
+            "source resolved as TERMINUS_MIRROR_SOURCE_ROOT/<repo>"
+        );
+
+        std::env::remove_var("TERMINUS_MIRROR_SOURCE_ROOT");
+        cleanup(&[&source_root, &root]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn explicit_source_arg_overrides_configured_root() {
+        clear_env();
+        // The configured root points at a location with NO 'Terminus' checkout —
+        // if it were ever consulted, ensure_source_is_main would fail. It must be
+        // ignored entirely because 'source' is passed explicitly.
+        let bogus_root = unique("bogus-root");
+        std::env::set_var("TERMINUS_MIRROR_SOURCE_ROOT", &bogus_root);
+        let src = init_source(&[("a.txt", "clean\n")]);
+        let root = unique("root");
+        set_root(&root);
+
+        let st = GitPublicMirrorStatus
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        let sv: Value = serde_json::from_str(&st).unwrap();
+        assert_eq!(sv["internal_sha"], run_git(&src, &["rev-parse", "HEAD"]).unwrap().trim());
+
+        std::env::remove_var("TERMINUS_MIRROR_SOURCE_ROOT");
+        cleanup(&[&src, &root]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn source_root_unset_and_source_absent_is_not_configured() {
+        clear_env();
+        let root = unique("root");
+        set_root(&root);
+        // Neither an explicit 'source' arg nor TERMINUS_MIRROR_SOURCE_ROOT — a
+        // clear NotConfigured error, distinct from a residual/blocked state.
+        let res = GitPublicMirrorPrepare.execute(json!({ "repo": "Terminus" })).await;
+        assert!(matches!(res, Err(ToolError::NotConfigured(_))));
+        cleanup(&[&root]);
+    }
+
+    // ── MIRR-02: auto-approve / auto-push on a verified-clean sweep ──────────
+
+    #[tokio::test]
+    #[serial]
+    async fn auto_approve_bypasses_gate_when_snapshot_is_verified_clean() {
+        clear_env(); // DATABASE_URL unset — proves the gate is genuinely skipped, not just granted
+        let src = init_source(&[("a.txt", "clean content\n")]);
+        let root = unique("root");
+        set_root(&root);
+        GitPublicMirrorPrepare
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        std::env::set_var("TERMINUS_MIRROR_AUTO_APPROVE", "true");
+
+        let out = GitPublicMirrorApprove
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["approved"], true);
+        assert_eq!(v["auto_approved"], true);
+        assert!(v.get("approval_required").is_none(), "no operator code should be requested");
+
+        let wd = MirrorWorkDir::from_config("Terminus", &src).unwrap();
+        let sha = wd.source_head_sha().unwrap();
+        assert!(blessed_commit(wd.path(), &sha).unwrap().is_some(), "auto-approve must actually bless");
+
+        std::env::remove_var("TERMINUS_MIRROR_AUTO_APPROVE");
+        cleanup(&[&src, &root]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn auto_push_bypasses_gate_when_blessed_and_fast_forward() {
+        clear_env();
+        // Auto-push (unlike the guarded path in push_blessed_and_fast_forwardable_
+        // reaches_the_guard) actually reaches token resolution, since there is no
+        // approval_required stop — the local bare remote never invokes askpass, but
+        // mirror_provider_token still needs a resolvable credential.
+        std::env::set_var("GITHUB_TOKEN", "unused-local-test-token"); // pii-test-fixture
+        let src = init_source(&[("a.txt", "v1 clean\n")]);
+        let root = unique("root");
+        set_root(&root);
+        GitPublicMirrorPrepare
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        let wd = MirrorWorkDir::from_config("Terminus", &src).unwrap();
+        let c1 = wd.approved_commit(&wd.source_head_sha().unwrap()).unwrap().unwrap();
+        let bare = init_bare();
+        run_git(wd.path(), &["push", &bare.display().to_string(), &format!("{c1}:refs/heads/main")]).unwrap();
+        // Advance so there is a genuine fast-forward available.
+        write_file(&src, "a.txt", "v2 clean\n");
+        commit_all(&src, "v2");
+        GitPublicMirrorPrepare
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+
+        std::env::set_var("TERMINUS_MIRROR_AUTO_APPROVE", "true");
+        let ap = GitPublicMirrorApprove
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        let apv: Value = serde_json::from_str(&ap).unwrap();
+        assert_eq!(apv["auto_approved"], true);
+
+        let out = GitPublicMirrorPush
+            .execute(json!({
+                "repo": "Terminus",
+                "source": src.display().to_string(),
+                "github_remote": bare.display().to_string()
+            }))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["pushed"], true);
+        assert_eq!(v["auto_pushed"], true);
+        assert!(v.get("approval_required").is_none());
+
+        let c2 = wd.approved_commit(&wd.source_head_sha().unwrap()).unwrap().unwrap();
+        let tip = run_git(&bare, &["rev-parse", "refs/heads/main"]).unwrap().trim().to_string();
+        assert_eq!(tip, c2, "auto-push must actually advance the mirror");
+
+        std::env::remove_var("TERMINUS_MIRROR_AUTO_APPROVE");
+        std::env::remove_var("GITHUB_TOKEN");
+        cleanup(&[&src, &root, &bare]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn auto_approve_off_still_requires_the_operator_code() {
+        // Explicit regression companion to approve_clean_snapshot_reaches_the_guard
+        // / push_blessed_and_fast_forwardable_reaches_the_guard: with the flag
+        // unset (default FALSE), both approve and push must still stop at the
+        // guarded gate.
+        clear_env();
+        let src = init_source(&[("a.txt", "v1 clean\n")]);
+        let root = unique("root");
+        set_root(&root);
+        GitPublicMirrorPrepare
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+
+        let ap = GitPublicMirrorApprove
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        let apv: Value = serde_json::from_str(&ap).unwrap();
+        assert_eq!(apv["approved"], false);
+        assert_eq!(apv["approval_required"], true);
+        assert!(apv.get("auto_approved").is_none());
+
+        bless("Terminus", &src); // operator-approve stand-in so push can be reached
+        let wd = MirrorWorkDir::from_config("Terminus", &src).unwrap();
+        let c1 = wd.approved_commit(&wd.source_head_sha().unwrap()).unwrap().unwrap();
+        let bare = init_bare();
+        run_git(wd.path(), &["push", &bare.display().to_string(), &format!("{c1}:refs/heads/main")]).unwrap();
+        write_file(&src, "a.txt", "v2 clean\n");
+        commit_all(&src, "v2");
+        GitPublicMirrorPrepare
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        bless("Terminus", &src);
+
+        let out = GitPublicMirrorPush
+            .execute(json!({
+                "repo": "Terminus",
+                "source": src.display().to_string(),
+                "github_remote": bare.display().to_string()
+            }))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["pushed"], false);
+        assert_eq!(v["approval_required"], true);
+        assert!(v.get("auto_pushed").is_none());
+
+        cleanup(&[&src, &root, &bare]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn auto_approve_does_not_fire_without_a_clean_approved_tag() {
+        clear_env();
+        // Residual (non-mechanical) violation → prepare never creates the
+        // mirror-approved/<sha> tag, so there is no 0-residual proof to act on.
+        let src = init_source(&[(
+            "c.txt",
+            "token = \"<REDACTED-SECRET>\"\n", // pii-test-fixture
+        )]);
+        let root = unique("root");
+        set_root(&root);
+        GitPublicMirrorPrepare
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        std::env::set_var("TERMINUS_MIRROR_AUTO_APPROVE", "true");
+
+        let out = GitPublicMirrorApprove
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["approved"], false);
+        assert!(v["reason"].as_str().unwrap().contains("residual"));
+        assert!(v.get("auto_approved").is_none(), "auto-approve must never fire on a dirty sweep");
+
+        let wd = MirrorWorkDir::from_config("Terminus", &src).unwrap();
+        let sha = wd.source_head_sha().unwrap();
+        assert!(
+            blessed_commit(wd.path(), &sha).unwrap().is_none(),
+            "the hard PII block must be untouched: a dirty sweep is never blessed, flag or no flag"
+        );
+
+        std::env::remove_var("TERMINUS_MIRROR_AUTO_APPROVE");
+        cleanup(&[&src, &root]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn auto_push_still_refuses_non_fast_forward() {
+        clear_env();
+        let src = init_source(&[("a.txt", "v1 clean\n")]);
+        let root = unique("root");
+        set_root(&root);
+        GitPublicMirrorPrepare
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        bless("Terminus", &src);
+
+        // Seed the bare mirror with a commit from a totally independent history
+        // (no shared ancestor with the Terminus work dir) — any push to it is
+        // structurally non-fast-forward, regardless of the auto-approve flag.
+        let other_src = init_source(&[("z.txt", "unrelated\n")]);
+        let other_root = unique("other-root");
+        std::env::set_var("TERMINUS_MIRROR_WORKDIR_ROOT", &other_root);
+        let other_wd = MirrorWorkDir::from_config("Other", &other_src).unwrap();
+        other_wd.run().unwrap();
+        let other_c = other_wd.approved_commit(&other_wd.source_head_sha().unwrap()).unwrap().unwrap();
+        let bare = init_bare();
+        run_git(other_wd.path(), &["push", &bare.display().to_string(), &format!("{other_c}:refs/heads/main")])
+            .unwrap();
+        std::env::set_var("TERMINUS_MIRROR_WORKDIR_ROOT", &root); // restore for Terminus
+
+        std::env::set_var("TERMINUS_MIRROR_AUTO_APPROVE", "true");
+        let res = GitPublicMirrorPush
+            .execute(json!({
+                "repo": "Terminus",
+                "source": src.display().to_string(),
+                "github_remote": bare.display().to_string()
+            }))
+            .await;
+        assert!(
+            matches!(res, Err(ToolError::Conflict(_))),
+            "non-fast-forward must refuse even with TERMINUS_MIRROR_AUTO_APPROVE on: {res:?}"
+        );
+        // The remote must not have moved.
+        let tip = run_git(&bare, &["rev-parse", "refs/heads/main"]).unwrap().trim().to_string();
+        assert_eq!(tip, other_c);
+
+        std::env::remove_var("TERMINUS_MIRROR_AUTO_APPROVE");
+        cleanup(&[&src, &root, &other_src, &other_root, &bare]);
+    }
+
+    // ── git_public_mirror_sync_source (S111E / MIRR-04) ─────────────────────
+
+    /// Set the trio of Gitea env vars `sync-source`'s `gitea_token()` call
+    /// needs to resolve without hitting the network (GITEA_URL just needs to
+    /// be *set*, never actually contacted — the test remotes below are local
+    /// filesystem paths, so git never invokes GIT_ASKPASS against them and the
+    /// token value itself is never used, only resolved). Returns the prior
+    /// values so callers can restore them.
+    fn set_dummy_gitea_env(token: &str) -> (Option<String>, Option<String>, Option<String>) {
+        let url = std::env::var("GITEA_URL").ok();
+        let pat = std::env::var("GITEA_PAT_MOOSE").ok();
+        let identity = std::env::var("GITEA_IDENTITY_NAME").ok();
+        std::env::set_var("GITEA_URL", "http://example.invalid"); // pii-test-fixture
+        std::env::set_var("GITEA_PAT_MOOSE", token);
+        std::env::remove_var("GITEA_IDENTITY_NAME");
+        (url, pat, identity)
+    }
+
+    fn restore_gitea_env(saved: (Option<String>, Option<String>, Option<String>)) {
+        let (url, pat, identity) = saved;
+        match url { Some(v) => std::env::set_var("GITEA_URL", v), None => std::env::remove_var("GITEA_URL") }
+        match pat { Some(v) => std::env::set_var("GITEA_PAT_MOOSE", v), None => std::env::remove_var("GITEA_PAT_MOOSE") }
+        match identity { Some(v) => std::env::set_var("GITEA_IDENTITY_NAME", v), None => std::env::remove_var("GITEA_IDENTITY_NAME") }
+    }
+
+    #[test]
+    #[serial]
+    fn sync_source_resolve_internal_remote_prefers_explicit_then_per_repo_then_fallback() {
+        clear_env();
+        // Nothing configured -> NotConfigured, names the env vars.
+        let err = resolve_internal_remote(&json!({}), "demo").unwrap_err();
+        assert!(matches!(err, ToolError::NotConfigured(_)));
+        assert!(err.to_string().contains("TERMINUS_MIRROR_INTERNAL_REMOTE"));
+
+        // Generic fallback.
+        std::env::set_var("TERMINUS_MIRROR_INTERNAL_REMOTE", "http://gitea.example/moosenet/demo.git"); // pii-test-fixture
+        assert_eq!(
+            resolve_internal_remote(&json!({}), "demo").unwrap(),
+            "http://gitea.example/moosenet/demo.git" // pii-test-fixture
+        );
+
+        // Per-repo env wins over the generic fallback.
+        std::env::set_var("TERMINUS_MIRROR_INTERNAL_REMOTE_DEMO", "http://gitea.example/moosenet/demo-specific.git"); // pii-test-fixture
+        assert_eq!(
+            resolve_internal_remote(&json!({}), "demo").unwrap(),
+            "http://gitea.example/moosenet/demo-specific.git" // pii-test-fixture
+        );
+
+        // An explicit arg wins over everything.
+        assert_eq!(
+            resolve_internal_remote(&json!({"internal_remote": "http://gitea.example/moosenet/explicit.git"}), "demo").unwrap(), // pii-test-fixture
+            "http://gitea.example/moosenet/explicit.git" // pii-test-fixture
+        );
+        clear_env();
+    }
+
+    #[test]
+    fn sync_source_assert_source_sync_safe_allows_only_the_sanctioned_hard_reset_shape() {
+        // The sanctioned shape must pass.
+        assert_source_sync_safe(&["reset", "--hard", "origin/main"]);
+        // Non-hard-reset argv (no --hard at all) is always fine.
+        assert_source_sync_safe(&["fetch", "--", "origin", "main"]);
+        assert_source_sync_safe(&["checkout", "main"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "force")]
+    fn sync_source_assert_source_sync_safe_rejects_force_flag() {
+        assert_source_sync_safe(&["push", "--force", "origin", "main"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--hard")]
+    fn sync_source_assert_source_sync_safe_rejects_hard_outside_sanctioned_shape() {
+        // `--hard` against a branch that is NOT `origin/<branch>` (e.g. a
+        // caller-supplied ref) must still be refused — only
+        // `reset --hard origin/<branch>` is tolerated.
+        assert_source_sync_safe(&["reset", "--hard", "some-other-ref"]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sync_source_missing_root_and_no_explicit_source_is_not_configured() {
+        clear_env();
+        let err = GitPublicMirrorSyncSource
+            .execute(json!({"repo": "demo"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotConfigured(_)));
+        assert!(err.to_string().contains("TERMINUS_MIRROR_SOURCE_ROOT"));
+        clear_env();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sync_source_clones_when_absent_then_fetches_and_resets_when_present() {
+        clear_env();
+        let remote = init_source(&[("f.txt", "v1")]);
+        let root = unique("sync-root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("TERMINUS_MIRROR_SOURCE_ROOT", &root);
+        std::env::set_var("TERMINUS_MIRROR_INTERNAL_REMOTE", remote.display().to_string());
+        let saved = set_dummy_gitea_env("dummy-clone-token"); // pii-test-fixture
+
+        let out = GitPublicMirrorSyncSource.execute(json!({"repo": "demo"})).await.unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["cloned"], true, "first sync must clone: {v}");
+        assert_eq!(v["branch"], "main");
+        let source = root.join("demo");
+        assert!(source.join(".git").exists());
+        let remote_head_after_clone = run_git(&remote, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        assert_eq!(v["head_sha"], remote_head_after_clone);
+
+        // Advance the "remote" (a plain local repo standing in for internal
+        // Gitea main) with a second commit, then re-sync — this must fetch +
+        // hard-reset the existing checkout, NOT re-clone.
+        write_file(&remote, "f.txt", "v2");
+        commit_all(&remote, "second");
+        let remote_head_after_second = run_git(&remote, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        assert_ne!(remote_head_after_clone, remote_head_after_second);
+
+        let out2 = GitPublicMirrorSyncSource.execute(json!({"repo": "demo"})).await.unwrap();
+        let v2: Value = serde_json::from_str(&out2).unwrap();
+        assert_eq!(v2["cloned"], false, "second sync must fetch+reset, not re-clone: {v2}");
+        assert_eq!(v2["head_sha"], remote_head_after_second);
+
+        // The persisted git config must carry the plain remote path — never a
+        // credential embedded in the URL (auth goes only through GIT_ASKPASS).
+        let origin_url = run_git(&source, &["config", "--get", "remote.origin.url"]).unwrap().trim().to_string();
+        assert_eq!(origin_url, remote.display().to_string());
+        assert!(!origin_url.contains("dummy-clone-token"));
+
+        restore_gitea_env(saved);
+        cleanup(&[&remote, &root]);
+        clear_env();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sync_source_token_never_leaks_into_error_output() {
+        clear_env();
+        let root = unique("sync-root-err");
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("TERMINUS_MIRROR_SOURCE_ROOT", &root);
+        // A remote path that does not exist -> clone fails, but the failure
+        // must never echo the resolved token.
+        let bogus_remote = unique("does-not-exist");
+        std::env::set_var("TERMINUS_MIRROR_INTERNAL_REMOTE", bogus_remote.display().to_string());
+        let very_distinctive_token = "<REDACTED-SECRET>"; // pii-test-fixture
+        let saved = set_dummy_gitea_env(very_distinctive_token);
+
+        let err = GitPublicMirrorSyncSource
+            .execute(json!({"repo": "demo"}))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains(very_distinctive_token),
+            "error message must never contain the raw token: {msg}"
+        );
+
+        restore_gitea_env(saved);
+        cleanup(&[&root]);
+        clear_env();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dispatch_mirror_action_routes_sync_source() {
+        clear_env();
+        // Same NotConfigured failure mode as calling the tool directly —
+        // proves the dispatcher actually forwards to GitPublicMirrorSyncSource
+        // rather than silently no-op'ing or hitting the wrong tool.
+        let err = dispatch_mirror_action("sync-source", json!({"repo": "demo"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotConfigured(_)));
+        assert!(err.to_string().contains("TERMINUS_MIRROR_SOURCE_ROOT"));
+        clear_env();
+    }
+
+    #[test]
+    fn sync_source_tool_is_registered() {
+        let mut reg = ToolRegistry::new();
+        register(&mut reg);
+        assert!(reg.contains("git_public_mirror_sync_source"));
     }
 }
