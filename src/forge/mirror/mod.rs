@@ -35,6 +35,7 @@
 //! concern; the sweep here operates on whatever tree path it is handed.
 
 pub mod clean;
+pub mod native_clean;
 pub mod sweep;
 pub mod tools;
 pub mod workdir;
