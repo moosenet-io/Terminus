@@ -54,6 +54,7 @@ pub mod readme_layers;
 pub mod render;
 pub mod search_index;
 pub mod svg_assets;
+pub mod trigger;
 pub mod versioning;
 
 use std::collections::BTreeSet;
@@ -80,6 +81,7 @@ pub use readme_layers::{
     DiataxisMode, ParsedLayers,
 };
 pub use render::{render_all, RenderContext, RenderOutcome, RenderedArtifact};
+pub use trigger::{run_docgen_trigger, DocgenRun, TriggerOutcome};
 
 /// `docgen_status` -- report how the doc engine would interpret a project's
 /// declared (or absent) doc-target config: which targets it declares (or
@@ -178,14 +180,20 @@ pub fn register(registry: &mut ToolRegistry) {
     mismatch::register(registry);
     changelog::register(registry);
     drift::register(registry);
+    trigger::register(registry);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const EXPECTED_TOOL_NAMES: &[&str] =
-        &["docgen_status", "docgen_mismatch_detect", "docgen_generate_changelog", "docgen_drift_check"];
+    const EXPECTED_TOOL_NAMES: &[&str] = &[
+        "docgen_status",
+        "docgen_mismatch_detect",
+        "docgen_generate_changelog",
+        "docgen_drift_check",
+        "docgen_run",
+    ];
 
     #[test]
     fn registers_expected_tools() {

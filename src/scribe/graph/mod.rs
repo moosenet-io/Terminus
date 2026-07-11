@@ -17,6 +17,7 @@
 
 pub mod build;
 pub mod cluster;
+pub mod community;
 pub mod embed;
 pub mod extract;
 pub mod layout;

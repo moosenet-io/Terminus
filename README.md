@@ -422,6 +422,7 @@ on the core registry, so a model can query the graph instead of grepping source:
 | `kg_subgraph` | The local neighborhood (blast radius) around a symbol, to a depth. |
 | `kg_path` | The shortest path connecting two entities. |
 | `kg_stats` | Node/edge counts, clusters, top-degree hotspots, orphans. |
+| `kg_communities` | The community structure (level-0 clusters + a coarser level-1), each with members and — when a model is available — a short summary, for answering subsystem/architecture questions at the right zoom. |
 
 All take a `project_id` and read the per-project graph store
 (`SCRIBE_KG_STORE_DIR`); a project with no graph yet returns `found: false`
