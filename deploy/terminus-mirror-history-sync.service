@@ -1,0 +1,25 @@
+[Unit]
+# GHIST-08 — going-forward public-mirror full-history sync (oneshot, timer-driven).
+# Appends new internal commits to each mirror_ready repo's public baseline, gates
+# only the new commits for PII, and fast-forward-pushes clean results. Never forces.
+Description=Terminus public-mirror full-history sync (GHIST-08)
+After=network-online.target terminus-primary.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as the mirror host service user; the tool reads TERMINUS_MIRROR_* and the
+# GitHub credential from terminus-primary's runtime env via the MCP endpoint — this
+# unit holds NO secrets of its own.
+ExecStart=/opt/terminus-primary/deploy/terminus-mirror-history-sync.sh
+# The per-repo incremental gate can be slow on very large histories; give it room.
+TimeoutStartSec=1800
+Nice=10
+# The runner's non-zero exits are the fail-closed alert (2 = a repo WITHHELD on residual
+# PII; 3/1 = a refusal/error — non-fast-forward, un-bootstrapped remote, missing author
+# map, transport failure). These are intentionally surfaced as unit failures so the timer
+# job never reads as clean when the mirror did not actually advance — do NOT add them to
+# SuccessExitStatus.
+
+[Install]
+WantedBy=multi-user.target
