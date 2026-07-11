@@ -19,6 +19,7 @@
 //! after the run.
 
 mod agent;
+pub mod aggregate;
 pub mod assistant;
 pub mod breakfix;
 pub mod checkpoint;

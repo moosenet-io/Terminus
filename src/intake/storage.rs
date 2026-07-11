@@ -647,6 +647,251 @@ pub async fn read_code_run_factors(
 }
 
 // ===========================================================================
+// MINT2-03: variance-aware run aggregates (read input rows; persist/read the
+// `code_run_aggregates` table). The COMPUTATION is pure and lives in
+// `crate::intake::aggregate`; these are the thin DB wrappers around it.
+// ===========================================================================
+
+use crate::intake::aggregate::{AggregateInputRow, RunAggregate};
+
+/// True when a Postgres error text indicates a MISSING RELATION (the table does
+/// not exist — the un-migrated `code_run_aggregates` case), so the read path can
+/// degrade to an empty aggregate set rather than propagating. Postgres reports
+/// `error: relation "code_run_aggregates" does not exist` (SQLSTATE 42P01).
+/// Pure over its input; mirrors [`is_missing_column_error`].
+fn is_missing_relation_error(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("relation") && m.contains("does not exist")
+}
+
+/// Row shape the aggregate-input SELECT decodes into: model, task_category,
+/// harness_version, the five MINT2-01 config factors, and the pre-resolved
+/// effective score. Kept as a type alias so the primary and un-migrated fallback
+/// queries decode identically.
+type AggInputTuple = (
+    String,         // model_name
+    Option<String>, // task_category
+    String,         // harness_version
+    Option<String>, // quant
+    Option<bool>,   // reasoning_enabled
+    Option<i32>,    // context_window_launched
+    Option<f64>,    // temperature
+    Option<f64>,    // top_p
+    i32,            // effective score (COALESCE(GREATEST(retry, first_pass), 0))
+);
+
+fn map_agg_input(t: AggInputTuple) -> AggregateInputRow {
+    AggregateInputRow {
+        model: t.0,
+        task_category: t.1,
+        harness_version: t.2,
+        quant: t.3,
+        reasoning_enabled: t.4,
+        context_window_launched: t.5,
+        temperature: t.6,
+        top_p: t.7,
+        effective_score: t.8,
+    }
+}
+
+/// Primary aggregate-input SELECT — references the MINT2-01 factor columns
+/// directly. The effective score is resolved in SQL exactly as `code_v2.rs` does
+/// in Rust: `max(first_pass, retry)` with a NULL retry ignored, defaulting to 0.
+/// Joins `model_profiles` for the model NAME (the sweep keys rows by `profile_id`
+/// UUID). Scoped to the caller-supplied epoch (`harness_version = $1`).
+const SELECT_AGG_INPUT_SQL: &str = "SELECT p.model_name, r.task_category, r.harness_version, \
+     r.quant, r.reasoning_enabled, r.context_window_launched, r.temperature, r.top_p, \
+     COALESCE(GREATEST(r.retry_score, r.first_pass_score), 0) \
+     FROM code_profile_runs r JOIN model_profiles p ON p.id = r.profile_id \
+     WHERE r.harness_version = $1 AND COALESCE(r.task_type, '') <> 'non_viable_skip'";
+
+/// Fallback aggregate-input SELECT for a DB NOT yet migrated for MINT2-01 (the
+/// five factor columns + `task_category` are absent): selects correctly-typed
+/// SQL NULLs for those so the row still decodes, mirroring
+/// [`SELECT_CODE_RUN_FACTORS_FALLBACK_SQL`]. Un-factored rows aggregate under an
+/// all-`None` config bucket — honest for a pre-MINT2-01 host.
+const SELECT_AGG_INPUT_FALLBACK_SQL: &str = "SELECT p.model_name, NULL::text, r.harness_version, \
+     NULL::text, NULL::boolean, NULL::integer, NULL::double precision, NULL::double precision, \
+     COALESCE(GREATEST(r.retry_score, r.first_pass_score), 0) \
+     FROM code_profile_runs r JOIN model_profiles p ON p.id = r.profile_id \
+     WHERE r.harness_version = $1 AND COALESCE(r.task_type, '') <> 'non_viable_skip'";
+
+/// Read the per-sample rows an epoch's aggregates are computed from, tolerating a
+/// DB not yet migrated for MINT2-01 (the factor columns fall back to NULL). Any
+/// OTHER DB error is propagated. The pure [`crate::intake::aggregate::compute_aggregates`]
+/// turns these into the variance-aware aggregates.
+pub async fn read_aggregate_input_rows(
+    pool: &PgPool,
+    epoch: &str,
+) -> Result<Vec<AggregateInputRow>, ToolError> {
+    match sqlx::query_as::<_, AggInputTuple>(SELECT_AGG_INPUT_SQL)
+        .bind(epoch)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => Ok(rows.into_iter().map(map_agg_input).collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_column_error(&msg) {
+                let rows = sqlx::query_as::<_, AggInputTuple>(SELECT_AGG_INPUT_FALLBACK_SQL)
+                    .bind(epoch)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|e| {
+                        ToolError::Database(format!(
+                            "Failed to read aggregate input rows (fallback): {e}"
+                        ))
+                    })?;
+                Ok(rows.into_iter().map(map_agg_input).collect())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read aggregate input rows: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// Persist a freshly-computed aggregate set for ONE epoch into
+/// `code_run_aggregates`, replacing that epoch's prior rows wholesale (aggregates
+/// are cheap to recompute from `code_profile_runs`, so a DELETE-then-INSERT of the
+/// current epoch's rows is the simplest correct idempotent write — and it avoids
+/// the NULL-in-a-unique-index upsert hazard the nullable config-factor key would
+/// otherwise pose). Runs in a single transaction so a partial failure never
+/// leaves the table half-updated. Only the passed epoch's rows are touched; other
+/// epochs are left intact.
+pub async fn persist_code_run_aggregates(
+    pool: &PgPool,
+    epoch: &str,
+    aggregates: &[RunAggregate],
+) -> Result<(), ToolError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ToolError::Database(format!("begin aggregate persist tx: {e}")))?;
+
+    sqlx::query("DELETE FROM code_run_aggregates WHERE harness_version = $1")
+        .bind(epoch)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ToolError::Database(format!("clear code_run_aggregates for epoch: {e}")))?;
+
+    for a in aggregates {
+        sqlx::query(
+            "INSERT INTO code_run_aggregates \
+             (model, task_category, harness_version, quant, reasoning_enabled, \
+              context_window_launched, temperature, top_p, \
+              pass_rate, n_samples, passes, score_stddev, low_confidence) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+        )
+        .bind(&a.key.model)
+        .bind(a.key.task_category.as_deref())
+        .bind(&a.key.harness_version)
+        .bind(a.key.quant.as_deref())
+        .bind(a.key.reasoning_enabled)
+        .bind(a.key.context_window_launched)
+        .bind(a.key.temperature)
+        .bind(a.key.top_p)
+        .bind(a.pass_rate)
+        .bind(a.n_samples as i32)
+        .bind(a.passes as i32)
+        .bind(a.score_stddev)
+        .bind(a.low_confidence)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ToolError::Database(format!("insert code_run_aggregates row: {e}")))?;
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| ToolError::Database(format!("commit aggregate persist tx: {e}")))
+}
+
+/// A persisted `code_run_aggregates` row (the read-back shape for the catalog).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredRunAggregate {
+    pub model: String,
+    pub task_category: Option<String>,
+    pub harness_version: String,
+    pub quant: Option<String>,
+    pub reasoning_enabled: Option<bool>,
+    pub context_window_launched: Option<i32>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub pass_rate: f64,
+    pub n_samples: i32,
+    pub passes: i32,
+    pub score_stddev: f64,
+    pub low_confidence: bool,
+}
+
+type StoredAggTuple = (
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<bool>,
+    Option<i32>,
+    Option<f64>,
+    Option<f64>,
+    f64,
+    i32,
+    i32,
+    f64,
+    bool,
+);
+
+/// Read the persisted aggregates for one epoch, TOLERATING the
+/// `code_run_aggregates` table being ABSENT on an un-migrated DB: a missing
+/// relation ([`is_missing_relation_error`]) reads as an empty set, never a
+/// panic — mirroring the MINT2-01/02 null-tolerant column reads. Any other DB
+/// error is propagated.
+pub async fn read_code_run_aggregates(
+    pool: &PgPool,
+    epoch: &str,
+) -> Result<Vec<StoredRunAggregate>, ToolError> {
+    let sql = "SELECT model, task_category, harness_version, quant, reasoning_enabled, \
+         context_window_launched, temperature, top_p, pass_rate, n_samples, passes, \
+         score_stddev, low_confidence FROM code_run_aggregates WHERE harness_version = $1 \
+         ORDER BY model, task_category NULLS FIRST, quant NULLS FIRST";
+    match sqlx::query_as::<_, StoredAggTuple>(sql)
+        .bind(epoch)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => Ok(rows
+            .into_iter()
+            .map(|t| StoredRunAggregate {
+                model: t.0,
+                task_category: t.1,
+                harness_version: t.2,
+                quant: t.3,
+                reasoning_enabled: t.4,
+                context_window_launched: t.5,
+                temperature: t.6,
+                top_p: t.7,
+                pass_rate: t.8,
+                n_samples: t.9,
+                passes: t.10,
+                score_stddev: t.11,
+                low_confidence: t.12,
+            })
+            .collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) {
+                // Un-migrated DB: the table isn't there yet — no aggregates.
+                Ok(Vec::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read code_run_aggregates: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+// ===========================================================================
 // MINT2-02: read the structured failure_class back (null-tolerant)
 // ===========================================================================
 
