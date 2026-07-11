@@ -16,8 +16,9 @@ everything above. This page (MEDIA-08) is the consolidated reference for the who
 
 The media domain orchestrates the self-hosted media stack directly — Radarr, Sonarr,
 Prowlarr, qtor (download client), Plex, <media-service>, and TMDb — rather than wrapping a single
-thin API. It is a **sovereign** build: every credential comes from the vault/env at runtime
-(`vault::manager().get()` / documented env-var pairs, never a literal), there is no
+thin API. It is a **sovereign** build: every credential comes from <secret-manager>, materialized
+into the process environment at runtime and read via `std::env::var` from its documented
+env-var pair (never a literal in source or config), there is no
 third-party MCP server in the loop, and everything routes through this one hardened
 terminus-rs hub, the same as every other domain in this crate. The one external network call
 in the whole domain is TMDb title resolution (fuzzy title → real ID); no PII crosses that
