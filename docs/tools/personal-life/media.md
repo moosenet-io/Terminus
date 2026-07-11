@@ -2,24 +2,71 @@
 
 [← personal-life index](README.md) · [← tool index](../README.md) · [← docs index](../../README.md)
 
-**Status: read/search + tiered request + organize/destructive-gating + stateless recommend/
-engagement surface + toggleable taste-memory + Lumina surface wiring live (MEDIA-01 through
-MEDIA-07, S94).** This page documents the domain through its first seven build items: the
-seven typed service clients + `media_domain_status` (MEDIA-01), the read-only search/status
-surface (`media_search` and `media_status`, MEDIA-02), the tiered-mutation-safety
-request/download tool (`media_request`, MEDIA-03), non-destructive organize plus
-hard-typed-confirmation destructive delete/bulk-cleanup (`media_organize`/`media_delete`/
-`media_cleanup`, MEDIA-04), the stateless recommend/engagement surface (`media_recommend`/
-`media_on_deck`/`media_recently_added`, MEDIA-05), toggleable taste-memory personalization
-(MEDIA-06), and the Lumina conversational surface (intent routing + confirmation narration,
-MEDIA-07, `src/media/surface.rs`). Documentation lands with MEDIA-08 as it ships.
+**Status: complete (MEDIA-01 through MEDIA-08, S94).** The media domain
+(`src/media/mod.rs`) registers ten tools, always-on: `media_domain_status` (MEDIA-01),
+`media_search`/`media_status` (MEDIA-02, read), `media_request` (MEDIA-03, tiered
+mutation), `media_organize`/`media_delete`/`media_cleanup` (MEDIA-04, tiered + hard-gated
+destructive), and `media_recommend`/`media_on_deck`/`media_recently_added` (MEDIA-05, read,
+stateless). An eleventh tool, `media_taste_feedback`, registers only when the MEDIA-06 taste-
+memory toggle is on. MEDIA-07 (`src/media/surface.rs`) adds no new tool — it's the intent-
+routing + confirmation-narration layer that makes Lumina the conversational surface for
+everything above. This page (MEDIA-08) is the consolidated reference for the whole domain.
 
-The media domain (`src/media/mod.rs`) orchestrates the self-hosted media stack directly —
-Radarr, Sonarr, Prowlarr, qtor (download client), Plex, <media-service>, and TMDb — rather than
-wrapping a single thin API. It is a **sovereign** build: vault(env)-backed secrets, no
-third-party MCP server, everything through this one hardened hub. Lumina (the personality
-agent) is the conversational surface — `src/media/surface.rs` (MEDIA-07) shapes how she picks
-tools and narrates confirmations; this domain is the muscle behind it.
+## Overview
+
+The media domain orchestrates the self-hosted media stack directly — Radarr, Sonarr,
+Prowlarr, qtor (download client), Plex, <media-service>, and TMDb — rather than wrapping a single
+thin API. It is a **sovereign** build: every credential comes from <secret-manager>, materialized
+into the process environment at runtime and read via `std::env::var` from its documented
+env-var pair (never a literal in source or config), there is no
+third-party MCP server in the loop, and everything routes through this one hardened
+terminus-rs hub, the same as every other domain in this crate. The one external network call
+in the whole domain is TMDb title resolution (fuzzy title → real ID); no PII crosses that
+boundary.
+
+Lumina (the personality agent) is the conversational surface, not a wrapper the operator
+talks to directly. `src/media/surface.rs` (MEDIA-07) routes fuzzy intent ("put something on")
+to the right tool or tool chain, and turns a tool's raw JSON into an in-voice line Lumina
+actually says — including the confirmation prompts that gate every mutation. The domain's
+tools are the muscle; Lumina is the mouth. See [Lumina surface wiring](#lumina-surface-wiring-media-07--conversational-contract-no-new-mutation-logic) below.
+
+## The stack it orchestrates
+
+Seven services, each with one job:
+
+| Service | Role |
+|---|---|
+| **Radarr** | Movie library manager — add/track movies, kick off indexer search + grab, hold quality profile + root folder. |
+| **Sonarr** | The Radarr equivalent for TV — series/season/episode adds, monitoring, quality profile + root folder. |
+| **Prowlarr** | Indexer aggregation feeding Radarr/Sonarr's searches (client exists from MEDIA-01; no dedicated tool calls it directly yet — Radarr/Sonarr call it internally). |
+| **qtor** | The download client Radarr/Sonarr hand a grab to once an indexer hit is found; this domain never talks to it for acquisition directly, only status/queue. |
+| **Plex** | The library/consumption layer — what's actually playable, watch history, on-deck, recently-added. The source of truth for "have I seen this" and for `media_recommend`'s taste signal. |
+| **<media-service>** | Request-tracking + discovery, **secondary** — `media_request` best-effort mirrors a grab into <media-service> for visibility, but Radarr/Sonarr/qtor do the real acquisition work. Also the pre-existing read-only [`<media-service>`](<media-service>.md) tool module. |
+| **TMDb** | Title resolution — the one external (non-LAN) call, turning a fuzzy natural-language title into real movie/TV IDs that Radarr/Sonarr/Plex can be queried or driven with. |
+
+Each service is configured independently (own env-var pair, own client) — one service being
+absent or unreachable degrades only the tools that need it; the rest of the domain keeps
+working. See [Client shape](#client-shape-srcmediaclients) below.
+
+## Mutation-safety tiers
+
+Every mutation in the domain is classified into one of four tiers before any write happens.
+The tier decision is a pure, unit-tested function of the request shape — never a judgment
+call made mid-flight:
+
+| Tier | Fires on | Example |
+|---|---|---|
+| **Read** | No tier — nothing ever mutates. | `media_search "dune"`, `media_status "Dune"`, `media_recommend`, `media_on_deck` — pure lookups, always safe to call. |
+| **Light** | A specific, unambiguous, single item under the size threshold — executes immediately, no blocking. | `media_request` for one named movie under 20 GiB, e.g. `media_request { title: "Arrival", media_type: "movie", tmdb_id: 210577 }` → grabbed immediately, response says so. |
+| **Confirm** | Ambiguous, bulk (`item_count > 1`), a whole series/season-less request, or oversized (>20 GiB, e.g. a 4K remux) — returns a confirmation payload (title/year/size/quality) and does nothing until re-called with `confirm: true`. | `media_request` for "Dune (2021)" at `2160p remux` (~40 GB) stops and asks; a whole-series `media_request`/`media_organize` with no `season` stops and asks even though it's nominally "one" request. |
+| **Hard-confirm** | Destructive — permanent delete or bulk cleanup. Rejects a plain `confirm: true`; requires the caller to echo back the **exact target** (a verbatim title, or the verbatim set of eligible titles for a bulk op). | `media_delete` requires `confirm_delete` to equal the movie's exact title; `media_cleanup` enumerates eligible titles first and only executes when `confirm_delete` is exactly that title set. |
+
+Confirmation weight scales with irreversibility + ambiguity, not a blanket rule — see
+[`media_request`](#media_request-media-03), [`media_organize`](#media_organize-media-04),
+[`media_delete`](#media_delete-media-04--destructive-hard-gated), and
+[`media_cleanup`](#media_cleanup-media-04--destructive-bulk-op-enumerate-then-confirm) below
+for the exact per-tool rules. The gate cannot be bypassed by chaining tools together either —
+see [Chain composition](#lumina-surface-wiring-media-07--conversational-contract-no-new-mutation-logic).
 
 ## Configuration
 
@@ -476,3 +523,32 @@ whole-series `media_request` call (always Confirm-tier per MEDIA-03) through the
 `ToolRegistry`/`call()` path exactly as the last step of a resolved chain, and asserts it still
 returns the confirmation payload (`executed: false`) rather than a false "done" — chaining cannot
 bypass the confirm gate.
+
+## Example conversations
+
+Three representative exchanges, tying `resolve_intent` and the confirmation narration back to
+the actual tool calls and gates above.
+
+**"Put something on."** Resolves to `media_recommend` (a Read-tier, stateless call — see
+[`media_recommend`](#media_recommend-media-05--stateless)). Lumina narrates the top result's
+`rationale` directly, no gate involved: *"You might like Arrival — because you watched Dune."*
+
+**"Grab that show I was watching."** Resolves to the `media_search` → `media_status` →
+`media_request` chain. `media_search` resolves the fuzzy title to a TMDb candidate;
+`media_status` checks it isn't already in Sonarr/Plex; `media_request` classifies the actual
+grab. If it's a single named season under the size threshold, that's Light-tier and it just
+happens — *"Grabbed Arrival (2016) — Sonarr/Radarr is searching indexers now."* If it resolves
+ambiguously (two candidate titles) or the user asked for "the whole series" with no season
+given, `media_request` returns Confirm-tier and `narrate_request_confirmation` turns that into
+an in-voice ask: *"That's the whole series, no season specified — about 60GB at 2160p remux —
+want me to go ahead?"* Nothing is grabbed until the reply carries `confirm: true`; the chain
+does not bypass this (see [Chain composition](#lumina-surface-wiring-media-07--conversational-contract-no-new-mutation-logic)).
+
+**"Clean up what I've watched."** Resolves to `media_cleanup`, a destructive bulk op. The
+first call enumerates every eligible title (watched by all users on a multi-user Plex — see
+the [`media_cleanup`](#media_cleanup-media-04--destructive-bulk-op-enumerate-then-confirm)
+edge case) and deletes nothing: *"I'd remove these 4 you've all finished: Arrival, Dune,
+Sicario, Prisoners — anything half-watched by someone else stays. Say the word and I'll clear
+exactly those four."* Only a follow-up call whose `confirm_delete` is exactly that title set
+executes — a vague "yeah go ahead" from the user is not itself enough; Lumina must echo back
+the enumerated set as the typed confirmation, per `narrate_cleanup_confirmation`.
