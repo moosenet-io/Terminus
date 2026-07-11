@@ -242,9 +242,9 @@ pub enum DriftResolution {
 ///   - Same line number AND same `line_hash` -> [`DriftResolution::Unchanged`].
 ///   - `line_hash` differs (line moved and/or its text changed): if
 ///     `anchor.snapshot` is available, compare token overlap against the
-///     freshly re-scanned line via [`jaccard_similarity`] --
-///     >= [`SIGNATURE_SIMILARITY_THRESHOLD`] auto-patches
-///     ([`DriftResolution::TrivialPatch`]), below it is
+///     freshly re-scanned line via [`jaccard_similarity`]. At or above
+///     [`SIGNATURE_SIMILARITY_THRESHOLD`] this auto-patches
+///     ([`DriftResolution::TrivialPatch`]); below it, this is
 ///     [`DriftResolution::SignificantDrift`] ("body/signature changed
 ///     materially"). If `anchor.snapshot` is empty (a caller that dropped
 ///     it after persisting only the `{file,symbol,line-hash}` triple), any
