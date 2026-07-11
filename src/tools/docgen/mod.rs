@@ -42,6 +42,7 @@
 //! target's API.
 
 pub mod config;
+pub mod crate_graph;
 pub mod diagram;
 pub mod generate;
 pub mod mismatch;

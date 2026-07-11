@@ -180,6 +180,22 @@ pub struct FileExcerpt {
     /// `pub enum`, `pub trait`). A simple line-scan, not a full parser --
     /// good enough for a documentation-context bundle, not for codegen.
     pub public_signatures: Vec<String>,
+    /// File-module declarations (`mod foo;` / `pub mod foo;` / `pub(crate)
+    /// mod foo;`) -- the module's bare name only (`"foo"`), in file order.
+    /// Deliberately EXCLUDES inline module blocks (`mod tests { ... }`,
+    /// which end in `{` not `;`) -- an inline block isn't a separate
+    /// file/module node in the crate's on-disk module tree, which is the
+    /// ground truth DOCGEN-12's crate-graph model cares about (see
+    /// `crate::tools::docgen::crate_graph`, this field's consumer).
+    pub mod_decls: Vec<String>,
+    /// Raw `use` paths, stripped of the leading `use ` and trailing `;`, in
+    /// file order -- e.g. `"crate::error::ToolError"`, `"super::vault::slugify"`.
+    /// A simple line-scan (like `public_signatures`), not a full parser: a
+    /// `use` spanning multiple lines (a multi-line `use foo::{ ... }` group)
+    /// is captured only from its opening line -- a known, documented scope
+    /// limit that's good enough for a dependency-edge ground-truth graph,
+    /// not a substitute for real macro/attribute-aware name resolution.
+    pub use_decls: Vec<String>,
 }
 
 /// The bundled context for one module: its files plus any existing README,
@@ -357,12 +373,65 @@ fn walk_rs_files(dir: &Path, out: &mut Vec<FileExcerpt>) -> Result<(), ToolError
     Ok(())
 }
 
+/// Strip a leading `mod`/`pub mod`/`pub(crate) mod`/`pub(super) mod`/etc.
+/// visibility prefix from a trimmed line, returning the remainder starting
+/// at the module name. Returns `None` if the line isn't a `mod` declaration
+/// at all.
+fn strip_mod_prefix(trimmed: &str) -> Option<&str> {
+    if let Some(rest) = trimmed.strip_prefix("mod ") {
+        return Some(rest);
+    }
+    // `pub mod foo;`, `pub(crate) mod foo;`, `pub(super) mod foo;`, etc. --
+    // find " mod " after a leading "pub" so any visibility qualifier is
+    // skipped without needing to enumerate every `pub(...)` spelling.
+    if let Some(stripped) = trimmed.strip_prefix("pub") {
+        let stripped = stripped.trim_start_matches(|c: char| c == '(' || c == ')' || c.is_alphanumeric());
+        if let Some(rest) = stripped.trim_start().strip_prefix("mod ") {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+/// Extract the bare module name from a `mod` declaration line, ONLY when it
+/// is a file-module declaration (ends with `;`, e.g. `mod foo;`) -- an
+/// inline module block (`mod tests {`) is not a separate file/module node
+/// and is deliberately excluded (see [`FileExcerpt::mod_decls`]).
+fn parse_mod_decl(trimmed: &str) -> Option<String> {
+    let rest = strip_mod_prefix(trimmed)?;
+    let rest = rest.trim();
+    let name_end = rest.strip_suffix(';')?;
+    let name = name_end.trim();
+    if name.is_empty() || name.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Extract the raw path from a single-line `use` declaration
+/// (`use crate::foo::Bar;` -> `"crate::foo::Bar"`), stripping any trailing
+/// `as Alias` rename. Returns `None` for a line that doesn't look like a
+/// complete single-line `use` statement (e.g. the opening line of a
+/// multi-line `use foo::{` group, which has no closing `;` on this line --
+/// see [`FileExcerpt::use_decls`]'s documented scope limit).
+fn parse_use_decl(trimmed: &str) -> Option<String> {
+    let rest = trimmed.strip_prefix("use ")?;
+    let rest = rest.strip_suffix(';')?;
+    let path = rest.split(" as ").next().unwrap_or(rest).trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(path.to_string())
+}
+
 fn extract_excerpt(path: &Path) -> Result<FileExcerpt, ToolError> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| ToolError::Execution(format!("failed to read {}: {e}", path.display())))?;
 
     let mut doc_comments = Vec::new();
     let mut public_signatures = Vec::new();
+    let mut mod_decls = Vec::new();
+    let mut use_decls = Vec::new();
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -375,6 +444,10 @@ fn extract_excerpt(path: &Path) -> Result<FileExcerpt, ToolError> {
             || trimmed.starts_with("pub trait")
         {
             public_signatures.push(trimmed.to_string());
+        } else if let Some(name) = parse_mod_decl(trimmed) {
+            mod_decls.push(name);
+        } else if let Some(use_path) = parse_use_decl(trimmed) {
+            use_decls.push(use_path);
         }
     }
 
@@ -382,6 +455,8 @@ fn extract_excerpt(path: &Path) -> Result<FileExcerpt, ToolError> {
         path: path.to_string_lossy().into_owned(),
         doc_comments,
         public_signatures,
+        mod_decls,
+        use_decls,
     })
 }
 
@@ -389,6 +464,63 @@ fn extract_excerpt(path: &Path) -> Result<FileExcerpt, ToolError> {
 mod tests {
     use super::*;
     use std::process::Command as StdCommand;
+
+    // ── mod/use declaration parsing (DOCGEN-12 addition) ────────────────
+
+    #[test]
+    fn parse_mod_decl_extracts_bare_mod() {
+        assert_eq!(parse_mod_decl("mod foo;"), Some("foo".to_string()));
+    }
+
+    #[test]
+    fn parse_mod_decl_extracts_pub_and_scoped_pub_variants() {
+        assert_eq!(parse_mod_decl("pub mod foo;"), Some("foo".to_string()));
+        assert_eq!(parse_mod_decl("pub(crate) mod foo;"), Some("foo".to_string()));
+        assert_eq!(parse_mod_decl("pub(super) mod foo;"), Some("foo".to_string()));
+    }
+
+    #[test]
+    fn parse_mod_decl_excludes_inline_module_blocks() {
+        // `mod tests {` has no trailing `;` -- it's an inline block, not a
+        // separate file/module node, and must NOT be captured.
+        assert_eq!(parse_mod_decl("mod tests {"), None);
+        assert_eq!(parse_mod_decl("#[cfg(test)]"), None);
+    }
+
+    #[test]
+    fn parse_mod_decl_ignores_unrelated_lines() {
+        assert_eq!(parse_mod_decl("let module = 5;"), None);
+        assert_eq!(parse_mod_decl("// mod foo;"), None);
+    }
+
+    #[test]
+    fn parse_use_decl_extracts_full_path() {
+        assert_eq!(
+            parse_use_decl("use crate::error::ToolError;"),
+            Some("crate::error::ToolError".to_string())
+        );
+        assert_eq!(parse_use_decl("use super::vault::slugify;"), Some("super::vault::slugify".to_string()));
+    }
+
+    #[test]
+    fn parse_use_decl_strips_as_rename() {
+        assert_eq!(
+            parse_use_decl("use crate::foo::Bar as Baz;"),
+            Some("crate::foo::Bar".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_use_decl_returns_none_for_multiline_group_opener() {
+        // No trailing `;` on this line -- the opening line of a multi-line
+        // `use foo::{` group is out of scope (documented limit).
+        assert_eq!(parse_use_decl("use crate::foo::{"), None);
+    }
+
+    #[test]
+    fn parse_use_decl_ignores_non_use_lines() {
+        assert_eq!(parse_use_decl("pub fn use_something() {}"), None);
+    }
 
     /// Regression coverage for today's three `ReadOnlyGitOp` variants.
     ///
@@ -543,6 +675,10 @@ mod tests {
         assert!(
             bundle.files.iter().any(|f| f.public_signatures.iter().any(|s| s.contains("pub struct"))),
             "src/sundry should expose at least one pub struct"
+        );
+        assert!(
+            bundle.files.iter().any(|f| !f.use_decls.is_empty()),
+            "src/sundry should have at least one `use` declaration (DOCGEN-12 addition)"
         );
 
         // Reuse path: checking out the same ref again must not fail or
