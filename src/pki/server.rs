@@ -80,6 +80,16 @@ pub struct GatewayServerConfig {
     /// spec's deployment target); `terminus_primary` (TGW-04) passes
     /// `Some(crate::gateway_framework::GatewayFramework::from_env())`.
     pub gateway: Option<crate::gateway_framework::GatewayFramework>,
+    /// MESH-15: when `Some`, this pool is installed as
+    /// `McpServerState::mesh_pool` so `tools/list`/`tools/call` federate to
+    /// its enabled/healthy upstreams (MESH-03/08). `terminus_personal`
+    /// passes `None` (mesh federation is a gateway-only concern);
+    /// `terminus_primary` (MESH-15) passes
+    /// `Some(Arc::new(UpstreamPool::from_registry(&registry)))`, built from
+    /// `TERMINUS_MESH_ENABLED`/`TERMINUS_MESH_UPSTREAMS_JSON` at startup
+    /// when the feature is enabled -- `None` (this field's default posture)
+    /// when it isn't, byte-for-byte the pre-MESH-15 behavior.
+    pub mesh_pool: Option<Arc<crate::mesh::UpstreamPool>>,
 }
 
 /// Build the shared MCP (`/mcp`, `/healthz`) + `/enroll` router for
@@ -98,13 +108,14 @@ pub fn build_gateway_router(registry: ToolRegistry, config: &GatewayServerConfig
         personal_federation: config.personal_federation.clone(),
         inference_proxy: config.inference_proxy.clone(),
         gateway: config.gateway.clone(),
-        // MESH-03: mesh federation is not yet wired into
-        // `GatewayServerConfig` (no binary provisions a
-        // `crate::mesh::UpstreamPool` today) -- `None` here is the same
-        // additive "feature not configured" posture `personal_federation`
-        // etc. use elsewhere, and preserves `tools/list`/`tools/call`
-        // byte-for-byte until a binary is wired to pass one in.
-        mesh_pool: None,
+        // MESH-15: pass through whatever the caller provisioned --
+        // `terminus_primary`'s `main()` builds a real pool from env when
+        // `TERMINUS_MESH_ENABLED` is set; every other caller (incl.
+        // `terminus_personal`, and any config that leaves this `None`) keeps
+        // the same additive "feature not configured" posture
+        // `personal_federation` etc. use, preserving `tools/list`/
+        // `tools/call` byte-for-byte when mesh isn't configured.
+        mesh_pool: config.mesh_pool.clone(),
         // MESH-07: build the resolver from `TERMINUS_MESH_PRINCIPAL_MAP_JSON`
         // once at process construction. Malformed JSON is a loud, logged
         // config error (not a startup panic -- a router-building library
@@ -221,6 +232,7 @@ mod tests {
             personal_federation: None,
             inference_proxy: None,
             gateway: None,
+            mesh_pool: None,
         }
     }
 
