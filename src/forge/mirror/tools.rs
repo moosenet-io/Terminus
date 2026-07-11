@@ -497,11 +497,11 @@ impl RustTool for GitPublicMirrorPrepare {
         let report = wd.run()?;
 
         // GHMR-05: when the mechanical sweep leaves residual (non-mechanical)
-        // violations, run the operationalized, bounded cleaning pass (a configured
-        // cleaning subagent editing the work dir only) instead of just returning the
-        // residuals. It drives the gate to 0 (→ committed + tagged) or escalates the
-        // exact spots to the operator. No cleaner configured → immediate escalation,
-        // never a silent pass-through.
+        // violations, run the operationalized, bounded cleaning pass (the native
+        // DeterministicCleaner by default, or an operator command override, editing
+        // the work dir only) instead of just returning the residuals. It drives the
+        // gate to 0 (→ committed + tagged) or escalates the exact spots to the
+        // operator — never a silent pass-through.
         if !report.residual_violations.is_empty() {
             let outcome = dispatch_cleaning(&wd, &report)?;
             return Ok(outcome.to_json().to_string());
@@ -1428,6 +1428,7 @@ mod tests {
         std::env::remove_var("TERMINUS_MIRROR_INTERNAL_REMOTE");
         std::env::remove_var("TERMINUS_MIRROR_INTERNAL_REMOTE_DEMO");
         std::env::remove_var("TERMINUS_MIRROR_SOURCE_BRANCH");
+        std::env::remove_var("TERMINUS_MIRROR_CLEAN_CMD");
         std::env::remove_var("DATABASE_URL");
     }
 
@@ -1698,6 +1699,11 @@ mod tests {
     #[serial]
     async fn prepare_with_residual_does_not_tag() {
         clear_env();
+        // A no-op override cleaner (a shell command that changes nothing) stands in
+        // for an UNRESOLVABLE residual — the native default cleaner would scrub this
+        // token, so to test the "residual persists → no tag" path we force a cleaner
+        // that cannot drive the gate to 0.
+        std::env::set_var("TERMINUS_MIRROR_CLEAN_CMD", "true");
         // A raw token-shaped secret is NOT mechanically sweepable → residual.
         let src = init_source(&[(
             "c.txt",
@@ -1715,6 +1721,7 @@ mod tests {
         assert_eq!(pv["tagged"], false);
         assert!(pv["residual_count"].as_u64().unwrap() >= 1);
 
+        std::env::remove_var("TERMINUS_MIRROR_CLEAN_CMD");
         cleanup(&[&src, &root]);
     }
 
@@ -1724,6 +1731,9 @@ mod tests {
     #[serial]
     async fn approve_refuses_when_residuals_pending() {
         clear_env();
+        // No-op override cleaner → the residual persists (see the note in
+        // prepare_with_residual_does_not_tag), so approve must refuse it.
+        std::env::set_var("TERMINUS_MIRROR_CLEAN_CMD", "true");
         let src = init_source(&[(
             "c.txt",
             "token = \"<REDACTED-SECRET>\"\n", // pii-test-fixture
@@ -1740,6 +1750,7 @@ mod tests {
             .await
             .unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
+        std::env::remove_var("TERMINUS_MIRROR_CLEAN_CMD");
         assert_eq!(v["approved"], false);
         assert!(v["reason"].as_str().unwrap().contains("residual"));
         // No approval was requested (no approval_required flag) — the gate was
@@ -2524,6 +2535,10 @@ mod tests {
     #[serial]
     async fn auto_approve_does_not_fire_without_a_clean_approved_tag() {
         clear_env();
+        // No-op override cleaner so the residual PERSISTS (the native default
+        // cleaner would scrub it): prepare then never creates the
+        // mirror-approved/<sha> tag, so there is no 0-residual proof to act on.
+        std::env::set_var("TERMINUS_MIRROR_CLEAN_CMD", "true");
         // Residual (non-mechanical) violation → prepare never creates the
         // mirror-approved/<sha> tag, so there is no 0-residual proof to act on.
         let src = init_source(&[(
@@ -2555,6 +2570,7 @@ mod tests {
         );
 
         std::env::remove_var("TERMINUS_MIRROR_AUTO_APPROVE");
+        std::env::remove_var("TERMINUS_MIRROR_CLEAN_CMD");
         cleanup(&[&src, &root]);
     }
 

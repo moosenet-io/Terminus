@@ -415,7 +415,7 @@ const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 /// then rewriting would silently corrupt the file's unrelated bytes. Such a file
 /// is left byte-for-byte intact and still surfaces via the (read-only) residual
 /// scan — "flag rather than silently break".
-fn read_text(path: &Path) -> Option<String> {
+pub(super) fn read_text(path: &Path) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
     if meta.len() > MAX_FILE_BYTES {
         return None;

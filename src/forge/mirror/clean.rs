@@ -71,11 +71,13 @@
 //! extent an in-process orchestration can and defers the rest to that sandbox by
 //! design.
 //!
-//! In production the cleaner is dispatched through a config-driven command hook
-//! ([`CommandCleaner`], from [`CLEAN_CMD_ENV`]) with that cleared environment.
-//! Tests inject a mock. When no
-//! command is configured, [`dispatch_cleaning`] escalates immediately (0 rounds)
-//! rather than silently passing residuals through.
+//! By default the cleaner is the native in-process [`DeterministicCleaner`]
+//! (`native_clean`, GHMRFIX-5) — no external process. An operator MAY override it
+//! with a config-driven command hook ([`CommandCleaner`], from [`CLEAN_CMD_ENV`])
+//! run with the cleared environment described above; when that var is set it takes
+//! precedence. Tests inject a mock. Either way the bounded, gate-verified pass
+//! escalates any residual the chosen cleaner cannot resolve rather than silently
+//! passing it through.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -85,6 +87,7 @@ use serde_json::{json, Value};
 use crate::error::ToolError;
 use crate::github::pii::TreeViolation;
 
+use super::native_clean::DeterministicCleaner;
 use super::workdir::{MirrorWorkDir, WorkDirRunReport};
 
 /// Maximum cleaning rounds per prepare — the bounded infinite-loop guard. The spec
@@ -413,35 +416,29 @@ pub fn run_cleaning_pass(
 }
 
 /// Prepare-time entry point: given GHMR-03's `run` report that still carries
-/// residual violations, either dispatch the configured cleaning command
-/// ([`CommandCleaner`]) through the bounded pass, or — when no command is
-/// configured — escalate the residual spots to the operator immediately (0 rounds).
-/// Never silently passes residuals through.
+/// residual violations, run the bounded cleaning pass with the operator-configured
+/// command cleaner ([`CommandCleaner`]) if `TERMINUS_MIRROR_CLEAN_CMD` is set, else
+/// the native [`DeterministicCleaner`] (the default, GHMRFIX-5). Never silently
+/// passes residuals through — anything the chosen cleaner cannot drive to a 0-gate
+/// still escalates the exact spots.
 pub fn dispatch_cleaning(
     wd: &MirrorWorkDir,
     report: &WorkDirRunReport,
 ) -> Result<CleaningOutcome, ToolError> {
     let residuals = report.residual_violations.clone();
+    // Cleaner selection: an operator-configured command hook ([`CommandCleaner`],
+    // `TERMINUS_MIRROR_CLEAN_CMD`) takes precedence as an OVERRIDE; otherwise the
+    // native in-process [`DeterministicCleaner`] (GHMRFIX-5) runs by default. Both
+    // go through the same bounded, gate-verified pass — a residual the chosen
+    // cleaner cannot resolve still escalates the exact spots, never a silent pass.
     match CommandCleaner::from_env() {
         Some(cleaner) => {
             run_cleaning_pass(wd, &report.internal_sha, residuals, &cleaner, MAX_CLEAN_ROUNDS)
         }
-        None => Ok(CleaningOutcome::Escalated {
-            repo: report.repo.clone(),
-            internal_sha: report.internal_sha.clone(),
-            rounds_used: 0,
-            residual_violations: residuals,
-            reason: format!(
-                "residual PII violations remain and no cleaning command is configured \
-                 ({CLEAN_CMD_ENV} unset). Configure the cleaning-subagent command so the bounded \
-                 pass runs INSIDE prepare (its work-dir edits survive via finalize), or remediate \
-                 the flagged spots at their source (internal main / the placeholder+gate config) \
-                 and re-run git_public_mirror_prepare. NOTE: hand-editing the work dir and re-running \
-                 prepare does NOT work — prepare re-syncs internal main's tree and discards those \
-                 edits; only the in-prepare cleaning pass (which finalizes without re-syncing) or \
-                 a source-side fix is a valid remediation path."
-            ),
-        }),
+        None => {
+            let cleaner = DeterministicCleaner::new();
+            run_cleaning_pass(wd, &report.internal_sha, residuals, &cleaner, MAX_CLEAN_ROUNDS)
+        }
     }
 }
 
@@ -894,31 +891,36 @@ mod tests {
         cleanup(&[&src, &wd_path]);
     }
 
-    // ── dispatch_cleaning with no configured command escalates immediately ─────
+    // ── dispatch_cleaning with no configured command uses the NATIVE cleaner ───
+    // (GHMRFIX-5) When TERMINUS_MIRROR_CLEAN_CMD is unset, dispatch falls back to
+    // the in-process DeterministicCleaner rather than escalating immediately — a
+    // token-shaped secret residual is scrubbed in-process and the tree is tagged.
     #[test]
     #[serial]
-    fn dispatch_without_command_escalates_zero_rounds() {
-        clear_env(); // CLEAN_CMD_ENV unset
+    fn dispatch_without_command_uses_native_cleaner() {
+        clear_env(); // CLEAN_CMD_ENV unset → native default
         let src = init_source(&[(
             "s.txt",
             "token = \"<REDACTED-SECRET>\"\n", // pii-test-fixture
         )]);
         let wd_path = unique("wd");
         let mgr = MirrorWorkDir::new("Terminus", &src, &wd_path);
+        let sha = run_git(&src, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
         let report = mgr.run().unwrap();
         assert!(!report.residual_violations.is_empty());
 
         let outcome = dispatch_cleaning(&mgr, &report).unwrap();
         match &outcome {
-            CleaningOutcome::Escalated { rounds_used, reason, residual_violations, .. } => {
-                assert_eq!(*rounds_used, 0, "no command → immediate escalation");
-                assert!(reason.contains(CLEAN_CMD_ENV), "reason names the missing config var");
-                assert!(!residual_violations.is_empty());
+            CleaningOutcome::Cleaned { report, rounds_used } => {
+                assert_eq!(*rounds_used, 1, "native cleaner clears the secret in one round");
+                assert!(report.tagged, "cleaned tree is tagged");
             }
-            other => panic!("expected Escalated, got {other:?}"),
+            other => panic!("expected Cleaned via native cleaner, got {other:?}"),
         }
-        // No silent pass-through: nothing tagged.
-        assert!(tag_list(&wd_path).is_empty());
+        assert!(tag_list(&wd_path).contains(&approved_tag(&sha)));
+        // Source untouched; the token was scrubbed only in the work-dir copy.
+        assert!(std::fs::read_to_string(src.join("s.txt")).unwrap().contains("ghp_")); // pii-test-fixture
+        assert!(std::fs::read_to_string(wd_path.join("s.txt")).unwrap().contains("<REDACTED-SECRET>"));
 
         cleanup(&[&src, &wd_path]);
     }
