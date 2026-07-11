@@ -39,12 +39,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde_json::json;
+use async_trait::async_trait;
+use serde_json::{json, Value};
 use sqlx::PgPool;
 
 use crate::error::ToolError;
 use crate::intake::storage::{self, StoredRunAggregate};
 use crate::intake::{current_epoch, EpochSelector};
+use crate::registry::ToolRegistry;
+use crate::tool::{RustTool, ToolOutput};
 
 /// Coder task categories the catalog reports (the `code_v2` tier taxonomy —
 /// `standard` maps to `multi_file`). One coder cell per category per model.
@@ -676,6 +679,381 @@ fn build_fleet_list(
     by_name.into_values().collect()
 }
 
+// ===========================================================================
+// MINT2-08: the READ side — a query API over the PERSISTED catalog, and the
+// `model_fleet_catalog` core Terminus tool that exposes it.
+//
+// The refresh above (MINT2-07) WRITES the two catalog tables; this side only
+// READS them — it never recomputes. The pure filter/render helpers
+// ([`filter_cards`], [`render_catalog_json`], [`render_catalog_markdown`]) take
+// plain owned [`StoredCatalogCard`]s so the whole query surface is unit-testable
+// over a seeded fixture WITHOUT a live DB — the same pure/impure seam MINT2-07's
+// [`build_catalog`] uses. Only [`storage::read_fleet_catalog`] touches Postgres.
+// ===========================================================================
+
+/// The four coverage-status keys a `status` filter may take (the persisted
+/// `model_fleet_catalog_cell.status` values). Used to validate the tool arg.
+pub const VALID_STATUSES: &[&str] = &["run", "stale", "not_run", "non_viable"];
+
+/// One persisted coverage cell, read back from `model_fleet_catalog_cell`.
+/// `status` is kept as the stored snake_case string (no re-parse needed for the
+/// read path — the tool filters/emits it directly).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredCatalogCell {
+    pub model_name: String,
+    pub quant: Option<String>,
+    pub test_type: String,
+    pub task_category: String,
+    pub status: String,
+    pub pass_rate: Option<f64>,
+    pub n_samples: Option<i64>,
+    pub score_stddev: Option<f64>,
+    pub low_confidence: Option<bool>,
+    pub last_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub harness_version: Option<String>,
+}
+
+/// One persisted per-model card (a `model_fleet_catalog` row) plus its cells.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredCatalogCard {
+    pub model_name: String,
+    pub quant: Option<String>,
+    pub in_current_fleet: bool,
+    pub serving_json: Option<Value>,
+    pub not_run_count: i64,
+    pub stale_count: i64,
+    pub refreshed_at: chrono::DateTime<chrono::Utc>,
+    pub cells: Vec<StoredCatalogCell>,
+}
+
+/// The optional filters the `model_fleet_catalog` tool accepts. All `None` ⇒ the
+/// whole current fleet card.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CatalogQuery {
+    /// Restrict to one model's card (unknown ⇒ empty + a note).
+    pub model: Option<String>,
+    /// Restrict to cells with this coverage status (e.g. `not_run` — "what has
+    /// NOT been run").
+    pub status: Option<String>,
+    /// Restrict to cells of this test family (`coder`/`assistant`/`serving`/`agent`).
+    pub test_type: Option<String>,
+}
+
+/// Apply a [`CatalogQuery`] to the persisted cards. PURE. Returns the filtered
+/// cards (each carrying only the cells that survive the cell-level filters) plus
+/// an optional human note (set when a `model` filter matched nothing — the
+/// "unknown model" case: an empty result with an explanation, never an error).
+///
+/// A `model` filter selects the one matching card. A `status`/`test_type` filter
+/// prunes each card's cells; a card left with NO cells by an active cell-level
+/// filter is dropped (so `status=not_run` yields exactly the models WITH a gap).
+/// With no cell-level filter every card is kept as-is — so the default
+/// (no-filter) card lists every fleet model exactly once.
+pub fn filter_cards(
+    cards: &[StoredCatalogCard],
+    q: &CatalogQuery,
+) -> (Vec<StoredCatalogCard>, Option<String>) {
+    let mut note = None;
+    let selected: Vec<&StoredCatalogCard> = match &q.model {
+        Some(m) => {
+            let v: Vec<&StoredCatalogCard> = cards.iter().filter(|c| &c.model_name == m).collect();
+            if v.is_empty() {
+                note = Some(format!("no such model '{m}' in the fleet catalog"));
+            }
+            v
+        }
+        None => cards.iter().collect(),
+    };
+
+    let cell_filter_active = q.status.is_some() || q.test_type.is_some();
+    let mut out = Vec::new();
+    for card in selected {
+        let cells: Vec<StoredCatalogCell> = card
+            .cells
+            .iter()
+            .filter(|c| q.status.as_deref().map_or(true, |s| c.status == s))
+            .filter(|c| q.test_type.as_deref().map_or(true, |t| c.test_type == t))
+            .cloned()
+            .collect();
+        if cell_filter_active && cells.is_empty() {
+            continue;
+        }
+        out.push(StoredCatalogCard {
+            cells,
+            ..card.clone()
+        });
+    }
+    (out, note)
+}
+
+/// One cell as an output JSON object.
+fn cell_json(c: &StoredCatalogCell) -> Value {
+    json!({
+        "test_type": c.test_type,
+        "task_category": c.task_category,
+        "quant": c.quant,
+        "status": c.status,
+        "pass_rate": c.pass_rate,
+        "n_samples": c.n_samples,
+        "score_stddev": c.score_stddev,
+        "low_confidence": c.low_confidence,
+        "last_run_at": c.last_run_at,
+        "harness_version": c.harness_version,
+    })
+}
+
+/// Render the (already-filtered) cards as the tool's structured JSON. PURE.
+///
+/// Shape: `{ epoch, refreshed_at, note?, models: [ { model_name, quant,
+/// in_current_fleet, serving, cells: [...], not_run_count, stale_count } ],
+/// summary: { total_models, total_not_run, total_stale, not_run_cells: [...] } }`.
+/// `epoch` is always the current epoch (even for an empty catalog). The
+/// `summary` counts the cells ACTUALLY present in this (filtered) view so
+/// "what's missing" is one field away; the per-model `not_run_count`/`stale_count`
+/// are the card's stored full-model totals.
+pub fn render_catalog_json(
+    cards: &[StoredCatalogCard],
+    note: Option<&str>,
+    epoch: &str,
+) -> Value {
+    let refreshed_at = cards.iter().map(|c| c.refreshed_at).max();
+    let mut total_not_run = 0i64;
+    let mut total_stale = 0i64;
+    let mut not_run_cells: Vec<Value> = Vec::new();
+
+    let models: Vec<Value> = cards
+        .iter()
+        .map(|card| {
+            let cells: Vec<Value> = card
+                .cells
+                .iter()
+                .map(|c| {
+                    match c.status.as_str() {
+                        "not_run" => {
+                            total_not_run += 1;
+                            not_run_cells.push(json!({
+                                "model_name": c.model_name,
+                                "test_type": c.test_type,
+                                "task_category": c.task_category,
+                            }));
+                        }
+                        "stale" => total_stale += 1,
+                        _ => {}
+                    }
+                    cell_json(c)
+                })
+                .collect();
+            json!({
+                "model_name": card.model_name,
+                "quant": card.quant,
+                "in_current_fleet": card.in_current_fleet,
+                "serving": card.serving_json,
+                "cells": cells,
+                "not_run_count": card.not_run_count,
+                "stale_count": card.stale_count,
+            })
+        })
+        .collect();
+
+    let mut out = json!({
+        "epoch": epoch,
+        "refreshed_at": refreshed_at,
+        "models": models,
+        "summary": {
+            "total_models": cards.len(),
+            "total_not_run": total_not_run,
+            "total_stale": total_stale,
+            "not_run_cells": not_run_cells,
+        },
+    });
+    if let Some(n) = note {
+        out.as_object_mut()
+            .unwrap()
+            .insert("note".to_string(), json!(n));
+    }
+    out
+}
+
+/// Render the (already-filtered) cards as a compact markdown coverage matrix:
+/// models as rows, `test_type/task_category` cells as columns, the coverage
+/// status in each cell (blank when a model has no such cell). PURE — a human/agent
+/// display for `format=markdown`.
+pub fn render_catalog_markdown(
+    cards: &[StoredCatalogCard],
+    note: Option<&str>,
+    epoch: &str,
+) -> String {
+    let mut s = String::new();
+    s.push_str(&format!("# Fleet coverage matrix (epoch {epoch})\n\n"));
+    if let Some(n) = note {
+        s.push_str(&format!("_{n}_\n\n"));
+    }
+    if cards.is_empty() {
+        s.push_str("_(no models)_\n");
+        return s;
+    }
+
+    // Column axis: the sorted union of every present cell's test_type/category.
+    let mut columns: BTreeSet<String> = BTreeSet::new();
+    for card in cards {
+        for c in &card.cells {
+            columns.insert(format!("{}/{}", c.test_type, c.task_category));
+        }
+    }
+    let columns: Vec<String> = columns.into_iter().collect();
+
+    // Header.
+    s.push_str("| model |");
+    for col in &columns {
+        s.push_str(&format!(" {col} |"));
+    }
+    s.push('\n');
+    s.push_str("| --- |");
+    for _ in &columns {
+        s.push_str(" --- |");
+    }
+    s.push('\n');
+
+    // One row per model; each column carries the cell's status, or blank.
+    for card in cards {
+        let mut by_col: BTreeMap<String, &str> = BTreeMap::new();
+        for c in &card.cells {
+            by_col.insert(format!("{}/{}", c.test_type, c.task_category), c.status.as_str());
+        }
+        s.push_str(&format!("| {} |", card.model_name));
+        for col in &columns {
+            s.push_str(&format!(" {} |", by_col.get(col).copied().unwrap_or("")));
+        }
+        s.push('\n');
+    }
+    s
+}
+
+/// Parse + validate the tool args into a [`CatalogQuery`] and the output format.
+/// Empty/whitespace filters are treated as absent. An unrecognized `status` or
+/// `format` is a clean [`ToolError::InvalidArgument`], not a silent no-op.
+fn parse_catalog_args(args: &Value) -> Result<(CatalogQuery, String), ToolError> {
+    let opt_str = |k: &str| -> Option<String> {
+        args.get(k)
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+
+    let status = opt_str("status");
+    if let Some(s) = &status {
+        if !VALID_STATUSES.contains(&s.as_str()) {
+            return Err(ToolError::InvalidArgument(format!(
+                "'status' must be one of {VALID_STATUSES:?}, got '{s}'"
+            )));
+        }
+    }
+
+    let format = opt_str("format").unwrap_or_else(|| "json".to_string());
+    if format != "json" && format != "markdown" {
+        return Err(ToolError::InvalidArgument(format!(
+            "'format' must be 'json' or 'markdown', got '{format}'"
+        )));
+    }
+
+    let query = CatalogQuery {
+        model: opt_str("model"),
+        status,
+        test_type: opt_str("test_type"),
+    };
+    Ok((query, format))
+}
+
+/// The `model_fleet_catalog` core Terminus tool: a read-only, SQL-free window on
+/// the persisted Model Fleet Catalog. Any agent (Harmony, Lumina, a reviewer)
+/// calls it to see, per model, what has and has NOT been tested and how it
+/// scored — with a `status=not_run` filter for "what's missing" in one shot.
+pub struct ModelFleetCatalog;
+
+impl ModelFleetCatalog {
+    /// Shared read+filter+render used by both `execute` (text) and
+    /// `execute_structured` (text + structured JSON). Reads the PERSISTED
+    /// catalog (never recomputes); a not-yet-migrated host surfaces a clean
+    /// [`ToolError::NotConfigured`] from [`storage::read_fleet_catalog`].
+    async fn run(&self, args: Value) -> Result<(String, Option<Value>), ToolError> {
+        let (query, format) = parse_catalog_args(&args)?;
+        let pool = storage::get_pool().await?;
+        let cards = storage::read_fleet_catalog(&pool).await?;
+        let (filtered, note) = filter_cards(&cards, &query);
+        let epoch = current_epoch();
+        if format == "markdown" {
+            let md = render_catalog_markdown(&filtered, note.as_deref(), epoch);
+            Ok((md, None))
+        } else {
+            let value = render_catalog_json(&filtered, note.as_deref(), epoch);
+            let text = serde_json::to_string_pretty(&value)
+                .unwrap_or_else(|_| value.to_string());
+            Ok((text, Some(value)))
+        }
+    }
+}
+
+#[async_trait]
+impl RustTool for ModelFleetCatalog {
+    fn name(&self) -> &str {
+        "model_fleet_catalog"
+    }
+
+    fn description(&self) -> &str {
+        "Read the Model Fleet Catalog — the per-model test-coverage registry — WITHOUT SQL. \
+         Returns, per model, one cell per (test_type × task_category) carrying its coverage \
+         status (run | stale | not_run | non_viable) plus metrics (pass_rate, n_samples, \
+         variance), last run, and harness_version, with a not_run/stale gap summary so \
+         'what has NOT been run' is one field away. All filters optional: 'model' (one card), \
+         'status' (e.g. not_run for gaps), 'test_type' (coder|assistant|serving|agent). \
+         'format' is 'json' (default, structured) or 'markdown' (a compact coverage matrix). \
+         Read-only; reads the persisted catalog (refreshed at the end of each MINT harness run)."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "model": {
+                    "type": "string",
+                    "description": "Restrict to one model's card. Unknown model → empty models with a note."
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["run", "stale", "not_run", "non_viable"],
+                    "description": "Restrict to cells with this coverage status. Use 'not_run' for 'what has NOT been run'."
+                },
+                "test_type": {
+                    "type": "string",
+                    "description": "Restrict to one test family: 'coder', 'assistant', 'serving', or 'agent'."
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["json", "markdown"],
+                    "description": "Output format. 'json' (default) is structured; 'markdown' renders the coverage matrix as a table."
+                }
+            }
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let (text, _structured) = self.run(args).await?;
+        Ok(text)
+    }
+
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured })
+    }
+}
+
+/// Register the read-only `model_fleet_catalog` tool on the CORE registry
+/// (called from `crate::intake::register`, itself wired into `register_all` —
+/// the same Chord-served core surface as `plane`/`gitea`). No personal registry.
+pub fn register(registry: &mut ToolRegistry) {
+    registry.register_or_replace(Box::new(ModelFleetCatalog));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -930,5 +1308,232 @@ mod tests {
         assert!((pr - 5.0 / 7.0).abs() < 1e-9);
         assert!((sd - 1.2).abs() < 1e-9, "worst-case stddev");
         assert!(!lc);
+    }
+
+    // ---- MINT2-08: read-side query API (pure, DB-free over a fixture) ----
+
+    fn scell(model: &str, tt: &str, cat: &str, status: &str) -> StoredCatalogCell {
+        StoredCatalogCell {
+            model_name: model.into(),
+            quant: None,
+            test_type: tt.into(),
+            task_category: cat.into(),
+            status: status.into(),
+            pass_rate: None,
+            n_samples: None,
+            score_stddev: None,
+            low_confidence: None,
+            last_run_at: None,
+            harness_version: None,
+        }
+    }
+
+    fn scard(model: &str, cells: Vec<StoredCatalogCell>) -> StoredCatalogCard {
+        let not_run = cells.iter().filter(|c| c.status == "not_run").count() as i64;
+        let stale = cells.iter().filter(|c| c.status == "stale").count() as i64;
+        StoredCatalogCard {
+            model_name: model.into(),
+            quant: Some("Q4_K_M".into()),
+            in_current_fleet: true,
+            serving_json: Some(json!({"vram_gb": 18.5})),
+            not_run_count: not_run,
+            stale_count: stale,
+            refreshed_at: chrono::Utc::now(),
+            cells,
+        }
+    }
+
+    /// A two-model fixture: `alpha` has a run + a not_run coder cell; `beta` has
+    /// every cell not_run (a never-swept fleet model).
+    fn fixture() -> Vec<StoredCatalogCard> {
+        vec![
+            scard(
+                "alpha",
+                vec![
+                    {
+                        let mut c = scell("alpha", "coder", "blitz", "run");
+                        c.pass_rate = Some(0.8);
+                        c.n_samples = Some(10);
+                        c.quant = Some("Q4_K_M".into());
+                        c.harness_version = Some(current_epoch().into());
+                        c
+                    },
+                    scell("alpha", "coder", "multi_file", "not_run"),
+                    scell("alpha", "assistant", "tool_chaining", "run"),
+                ],
+            ),
+            scard(
+                "beta",
+                vec![
+                    scell("beta", "coder", "blitz", "not_run"),
+                    scell("beta", "coder", "multi_file", "not_run"),
+                ],
+            ),
+        ]
+    }
+
+    /// get-all: every fixture model appears exactly once; epoch is the current
+    /// epoch; the gap summary counts the not_run cells.
+    #[test]
+    fn render_all_lists_every_model_once_with_epoch_and_summary() {
+        let (cards, note) = filter_cards(&fixture(), &CatalogQuery::default());
+        assert!(note.is_none());
+        let v = render_catalog_json(&cards, note.as_deref(), current_epoch());
+        assert_eq!(v["epoch"], current_epoch());
+        let models = v["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        let names: Vec<&str> = models.iter().map(|m| m["model_name"].as_str().unwrap()).collect();
+        assert_eq!(names.iter().filter(|n| **n == "alpha").count(), 1);
+        assert_eq!(names.iter().filter(|n| **n == "beta").count(), 1);
+        // alpha(1) + beta(2) = 3 not_run cells across the view.
+        assert_eq!(v["summary"]["total_not_run"], 3);
+        assert_eq!(v["summary"]["total_models"], 2);
+    }
+
+    /// A model with no results has all cells `not_run` (beta in the fixture).
+    #[test]
+    fn model_with_no_results_is_all_not_run() {
+        let (cards, _) = filter_cards(&fixture(), &CatalogQuery::default());
+        let beta = cards.iter().find(|c| c.model_name == "beta").unwrap();
+        assert!(beta.cells.iter().all(|c| c.status == "not_run"));
+    }
+
+    /// `status=not_run` returns ONLY not_run cells (and drops models with none).
+    #[test]
+    fn status_not_run_returns_only_gap_cells() {
+        let q = CatalogQuery {
+            status: Some("not_run".into()),
+            ..Default::default()
+        };
+        let (cards, note) = filter_cards(&fixture(), &q);
+        assert!(note.is_none());
+        for card in &cards {
+            assert!(
+                card.cells.iter().all(|c| c.status == "not_run"),
+                "only not_run cells survive the filter"
+            );
+        }
+        // alpha keeps its 1 gap cell; beta keeps its 2 — both remain.
+        assert_eq!(cards.len(), 2);
+        let v = render_catalog_json(&cards, None, current_epoch());
+        assert_eq!(v["summary"]["total_not_run"], 3);
+    }
+
+    /// `model=<x>` returns exactly that one card.
+    #[test]
+    fn model_filter_returns_one_card() {
+        let q = CatalogQuery {
+            model: Some("alpha".into()),
+            ..Default::default()
+        };
+        let (cards, note) = filter_cards(&fixture(), &q);
+        assert!(note.is_none());
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].model_name, "alpha");
+    }
+
+    /// Unknown `model` → empty models with a note, still a 200-shaped response.
+    #[test]
+    fn unknown_model_is_empty_with_note_not_error() {
+        let q = CatalogQuery {
+            model: Some("nope".into()),
+            ..Default::default()
+        };
+        let (cards, note) = filter_cards(&fixture(), &q);
+        assert!(cards.is_empty());
+        let note = note.expect("a note explaining the unknown model");
+        assert!(note.contains("nope"));
+        let v = render_catalog_json(&cards, Some(&note), current_epoch());
+        assert_eq!(v["epoch"], current_epoch());
+        assert!(v["models"].as_array().unwrap().is_empty());
+        assert!(v["note"].as_str().unwrap().contains("nope"));
+    }
+
+    /// `test_type` filter keeps only that family's cells.
+    #[test]
+    fn test_type_filter_keeps_only_that_family() {
+        let q = CatalogQuery {
+            test_type: Some("assistant".into()),
+            ..Default::default()
+        };
+        let (cards, _) = filter_cards(&fixture(), &q);
+        // Only alpha has an assistant cell; beta is dropped (no matching cells).
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].model_name, "alpha");
+        assert!(cards[0].cells.iter().all(|c| c.test_type == "assistant"));
+    }
+
+    /// `format=markdown` renders a table (header + separator + a model row).
+    #[test]
+    fn markdown_renders_a_table() {
+        let (cards, _) = filter_cards(&fixture(), &CatalogQuery::default());
+        let md = render_catalog_markdown(&cards, None, current_epoch());
+        assert!(md.contains("| model |"), "has a header row");
+        assert!(md.contains("| --- |"), "has a markdown separator");
+        assert!(md.contains("coder/multi_file"), "has a matrix column");
+        assert!(md.contains("| alpha |") && md.contains("| beta |"), "has model rows");
+        assert!(md.contains(current_epoch()));
+    }
+
+    /// An empty catalog renders valid JSON with the current epoch and no models
+    /// — the fresh-cutover case is data, not an error.
+    #[test]
+    fn empty_catalog_renders_epoch_and_no_models() {
+        let v = render_catalog_json(&[], None, current_epoch());
+        assert_eq!(v["epoch"], current_epoch());
+        assert!(v["models"].as_array().unwrap().is_empty());
+        assert_eq!(v["summary"]["total_models"], 0);
+    }
+
+    /// Arg parsing validates status/format and treats blank filters as absent.
+    #[test]
+    fn parse_args_validates_and_trims() {
+        let (q, fmt) = parse_catalog_args(&json!({
+            "model": "  alpha ", "status": "not_run", "test_type": " coder ", "format": "markdown"
+        }))
+        .unwrap();
+        assert_eq!(q.model.as_deref(), Some("alpha"));
+        assert_eq!(q.status.as_deref(), Some("not_run"));
+        assert_eq!(q.test_type.as_deref(), Some("coder"));
+        assert_eq!(fmt, "markdown");
+
+        // Defaults: no format → json; blank strings → absent filters.
+        let (q, fmt) = parse_catalog_args(&json!({"model": "  "})).unwrap();
+        assert!(q.model.is_none());
+        assert_eq!(fmt, "json");
+
+        // Invalid status / format → clean InvalidArgument.
+        assert!(matches!(
+            parse_catalog_args(&json!({"status": "bogus"})),
+            Err(ToolError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            parse_catalog_args(&json!({"format": "xml"})),
+            Err(ToolError::InvalidArgument(_))
+        ));
+    }
+
+    /// The tool's identity + schema are stable and read-only-shaped.
+    #[test]
+    fn tool_metadata_is_stable() {
+        let t = ModelFleetCatalog;
+        assert_eq!(t.name(), "model_fleet_catalog");
+        let p = t.parameters();
+        assert_eq!(p["type"], "object");
+        // All filters optional — no `required` array.
+        assert!(p.get("required").is_none());
+        assert!(p["properties"]["status"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "not_run"));
+    }
+
+    /// The tool registers on a core registry under its stable name.
+    #[test]
+    fn tool_registers_on_core_registry() {
+        let mut reg = ToolRegistry::new();
+        register(&mut reg);
+        assert!(reg.contains("model_fleet_catalog"));
     }
 }
