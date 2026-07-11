@@ -1836,7 +1836,7 @@ mod tests {
         run(&["init", "-q"]);
         // Force the default branch to `main` regardless of the host git default.
         run(&["symbolic-ref", "HEAD", "refs/heads/main"]);
-        run(&["config", "user.email", "<email>"]);
+        run(&["config", "user.email", "<email>"]); // pii-test-fixture
         run(&["config", "user.name", "Test"]);
         run(&["add", "-A"]);
         run(&["commit", "-q", "-m", "seed"]);
