@@ -465,3 +465,21 @@ spec_id = "S95-documentation-engine"
 status = "active"
 description = "Sovereign in-house doc engine replacing Mintlify: PII-swept post-feat doc generation via Chord's SLM router, multi-format render (README/wiki/PDF/Notion/Obsidian/blog), and versioning."
 created = "2026-07-09"
+
+[[prefix]]
+prefix = "MINT2"
+name = "MINT Harness v2 — measurement corrections, unified sweep, fleet catalog"
+project = "TERM"
+spec_id = "S112-mint-harness-v2"
+status = "ingested"
+description = "Revise MINT intake harness: record tuning factors (quant/reasoning/context/sampling), record non-viable/timeout failures, variance-aware aggregation, unify coder+assistant sweeps, epoch-partition legacy results, and add a Model Fleet Catalog registry."
+created = "2026-07-11"
+
+[[prefix]]
+prefix = "PROMO"
+name = "Prefix registry durable onboarding (plane_prefix_promote)"
+project = "TERM"
+spec_id = "S112-prefix-promote"
+status = "complete"
+description = "plane_prefix_promote tool: promote a prefix claim into the baseline data/prefix_registry.toml and open a Terminus PR (durable path, no client-side Redis)."
+created = "2026-07-11"
