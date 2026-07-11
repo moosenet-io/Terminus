@@ -50,6 +50,7 @@ pub mod mismatch;
 pub mod pii_gate;
 pub mod readme_layers;
 pub mod render;
+pub mod search_index;
 pub mod svg_assets;
 pub mod versioning;
 
