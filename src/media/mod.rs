@@ -29,6 +29,7 @@ pub mod organize;
 pub mod recommend;
 pub mod request;
 pub mod search;
+pub mod taste_memory;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -91,15 +92,19 @@ impl RustTool for MediaDomainStatus {
 /// Register the media domain's tools. MEDIA-01 registers one internal
 /// status tool; MEDIA-02 adds the read/search surface (`media_search`,
 /// `media_status`); MEDIA-03 adds the tiered request/download tool; MEDIA-04
-/// adds organize + hard-gated destructive ops; MEDIA-05..07 add the
-/// remaining recommend/surface tools on top of the clients this item
-/// establishes.
+/// adds organize + hard-gated destructive ops; MEDIA-05 adds the stateless
+/// recommend/engagement tools; MEDIA-06 (`taste_memory::register`) is a
+/// flag-gated no-op by default -- when `MEDIA_TASTE_MEMORY_ENABLED` is on,
+/// it REPLACES `media_recommend` with a taste-memory-aware decorator and
+/// adds the optional `media_taste_feedback` write-back tool. MEDIA-07 adds
+/// the remaining surface tools.
 pub fn register(registry: &mut ToolRegistry) {
     registry.register_or_replace(Box::new(MediaDomainStatus));
     search::register(registry);
     request::register(registry);
     organize::register(registry);
     recommend::register(registry);
+    taste_memory::register(registry);
 }
 
 #[cfg(test)]

@@ -303,6 +303,16 @@ pub struct MediaRecommend {
 
 impl MediaRecommend {
     const DEFAULT_LIMIT: usize = 5;
+
+    /// Build a stateless `MediaRecommend` from env, identically to
+    /// [`register`] below. Exposed so a decorator in a sibling module (see
+    /// `crate::media::taste_memory`) can wrap this exact stateless tool
+    /// rather than reimplementing its client construction -- this is a
+    /// plain constructor, not a memory dependency, so it does not affect
+    /// the `stateless_module_makes_no_memory_calls` guarantee above.
+    pub fn from_env() -> Self {
+        Self { plex: PlexClient::from_env().ok(), radarr: RadarrClient::from_env().ok(), sonarr: SonarrClient::from_env().ok() }
+    }
 }
 
 #[async_trait]
@@ -498,11 +508,7 @@ impl RustTool for MediaRecentlyAdded {
 /// pattern -- an unconfigured/unreachable service disables/degrades only its
 /// own contribution, never the whole domain.
 pub fn register(registry: &mut ToolRegistry) {
-    registry.register_or_replace(Box::new(MediaRecommend {
-        plex: PlexClient::from_env().ok(),
-        radarr: RadarrClient::from_env().ok(),
-        sonarr: SonarrClient::from_env().ok(),
-    }));
+    registry.register_or_replace(Box::new(MediaRecommend::from_env()));
     registry.register_or_replace(Box::new(MediaOnDeck { plex: PlexClient::from_env().ok() }));
     registry.register_or_replace(Box::new(MediaRecentlyAdded { plex: PlexClient::from_env().ok() }));
 }
