@@ -449,7 +449,7 @@ This README is the front door; everything past "at a glance" lives in
 
 ## Atlas — knowledge-graph query tools
 
-Atlas (the knowledge-graph subsystem of the Scribe documentation engine, spec
+Atlas builds a per-project knowledge graph from **any of ~14 languages** (Rust, Python, JavaScript/TypeScript, Go, Java, C, C++, Ruby, Lua, C#, PHP, Bash) via tree-sitter, not just Rust (KGRAPH-17). Atlas (the knowledge-graph subsystem of the Scribe documentation engine, spec
 `S112-knowledge-graph-docs`) builds a per-project graph of a codebase — nodes
 are code entities (functions/structs/…), edges are calls/imports/references
 tagged with a confidence tier — and exposes it to local models as `kg_*` tools

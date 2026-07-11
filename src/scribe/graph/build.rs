@@ -92,7 +92,13 @@ fn walk_rs(root: &Path) -> Result<(Vec<(String, String)>, bool), ToolError> {
                     continue;
                 }
                 stack.push(path);
-            } else if meta.is_file() && path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            } else if meta.is_file()
+                && path
+                    .to_str()
+                    .and_then(super::extract::Lang::from_path)
+                    .is_some()
+            {
+                // Any supported language (KGRAPH-17), not just Rust.
                 if meta.len() > MAX_FILE_BYTES {
                     continue;
                 }
@@ -189,8 +195,8 @@ only those files."
             // Read the changed files' current content, patch the stored graph.
             let mut pairs = Vec::new();
             for rel in &changed {
-                if !rel.ends_with(".rs") {
-                    continue;
+                if super::extract::Lang::from_path(rel).is_none() {
+                    continue; // unsupported language
                 }
                 ensure_safe_rel(rel)?; // refuse traversal — the allowlist only guards repo_path
                 let p = root.join(rel);
