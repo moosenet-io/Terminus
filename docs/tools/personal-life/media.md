@@ -2,11 +2,12 @@
 
 [← personal-life index](README.md) · [← tool index](../README.md) · [← docs index](../../README.md)
 
-**Status: read/search surface live (MEDIA-01+MEDIA-02, S94).** This page documents the domain
-through its first two build items: the seven typed service clients + `media_domain_status`
-(MEDIA-01), and the read-only search/status surface, `media_search` and `media_status`
-(MEDIA-02). Request/download, organize, recommend, and taste-memory tools land with MEDIA-03
-through MEDIA-08 as those items ship.
+**Status: read/search + tiered request surface live (MEDIA-01 through MEDIA-03, S94).** This page
+documents the domain through its first three build items: the seven typed service clients +
+`media_domain_status` (MEDIA-01), the read-only search/status surface (`media_search` and
+`media_status`, MEDIA-02), and the tiered-mutation-safety request/download tool (`media_request`,
+MEDIA-03). Organize, recommend, and taste-memory tools land with MEDIA-04 through MEDIA-08 as
+those items ship.
 
 The media domain (`src/media/mod.rs`) orchestrates the self-hosted media stack directly —
 Radarr, Sonarr, Prowlarr, qtor (download client), Plex, <media-service>, and TMDb — rather than
@@ -27,6 +28,8 @@ behind it.
 | `JELLYSEERR_URL` / `JELLYSEERR_API_KEY` | <media-service> (request-tracking) | shared with the pre-existing [`<media-service>`](<media-service>.md) tool module; same two env vars |
 | `TMDB_API_KEY` | TMDb (title resolution) | sent as the `api_key` query param — the one external call in this domain |
 | `TMDB_API_URL` | TMDb | optional, non-secret base-URL override; defaults to `https://api.themoviedb.org/3` |
+| `RADARR_QUALITY_PROFILE_ID` / `RADARR_ROOT_FOLDER_PATH` | Radarr | **MEDIA-03**, non-secret behavioral config read at `media_request` execute time (not client-construction time) -- which quality profile (integer id) and library root folder Radarr should use for a new movie. Missing/invalid -> `NotConfigured` when a movie add is attempted. |
+| `SONARR_QUALITY_PROFILE_ID` / `SONARR_ROOT_FOLDER_PATH` | Sonarr | **MEDIA-03**, same idea as the Radarr pair, for Sonarr series/season adds. |
 
 Each service is configured independently — a missing pair for one service never affects
 another. All names are documented (no values) in `.env.example` and materialized into the
@@ -161,11 +164,84 @@ anywhere still returns a normal (not error) response.
 }
 ```
 
+## media_request (MEDIA-03)
+
+Requests/downloads a movie (Radarr) or TV season/series (Sonarr) -- the acquisition surface,
+guarded by a **tiered mutation safety** model (`src/media/request.rs`). Optionally registers a
+<media-service> request alongside the real grab, best-effort, for tracking.
+
+**Input schema**
+
+| Field | Type | Required |
+|---|---|---|
+| `title` | string | yes (rejected as `InvalidArgument` if empty/whitespace-only) |
+| `media_type` | `"movie"` \| `"series"` | yes |
+| `year` | string | no |
+| `tmdb_id` | integer | conditionally -- required to execute a movie add (from `media_search`) |
+| `tvdb_id` | integer | conditionally -- required to execute a series add (Sonarr's id space, distinct from TMDb) |
+| `season` | integer | no -- a specific season number; omitting it for a series means "the whole series" |
+| `quality_hint` | string | no -- e.g. `"2160p remux"`, `"1080p"`; used to estimate size when `size_estimate_bytes` isn't given |
+| `size_estimate_bytes` | integer | no -- a known/estimated download size, if available |
+| `item_count` | integer | no, default 1 -- how many discrete items this single call would grab (e.g. requesting 3 seasons at once); `>1` is always Confirm-tier |
+| `is_ambiguous` | boolean | no, default false -- true when the title/candidate itself isn't definitively resolved |
+| `confirm` | boolean | no, default false -- must be `true` to execute a Confirm-tier request |
+
+**The tiering model** (`classify_request(kind, is_ambiguous, item_count, est_size_bytes) -> MutationTier`,
+pure and unit-tested, `src/media/request.rs`):
+
+- **Light** -- a specific, unambiguous, single item (`item_count == 1`, not a whole series) under
+  `OVERSIZED_THRESHOLD_BYTES` (20 GiB). Executed immediately.
+- **Confirm** -- `is_ambiguous`, `item_count > 1`, a whole series with no `season` given (always
+  high-impact, even as "one" request), or an oversized single item (e.g. a 4K remux, `est_size_bytes >
+  20 GiB`). **Never auto-executed** -- the response carries the confirmation payload (title, year,
+  size, quality) and the caller must re-call with `confirm: true`.
+
+Size, when not given explicitly, is estimated from `quality_hint` (`remux`/`2160p`/`4k` -> 25 GB,
+`1080p` -> 4 GB, `720p` -> 2 GB, unknown -> 4 GB) purely so an oversized hint alone is enough to
+force Confirm-tier even without a byte-accurate estimate.
+
+**Behavior.** Classifies first, before any I/O. Confirm-tier without `confirm: true` returns the
+confirmation payload and stops -- no library check, no HTTP call to Radarr/Sonarr. Otherwise:
+checks the target service's library for a title match (`RadarrClient::library` /
+`SonarrClient::library`) and, if already present, reports that without duplicating; otherwise
+calls `RadarrClient::add_movie` / `SonarrClient::add_series` (quality profile + root folder from
+`RADARR_QUALITY_PROFILE_ID`/`RADARR_ROOT_FOLDER_PATH` or the Sonarr equivalents, `addOptions`
+set to trigger Radarr/Sonarr's own indexer search+grab -- the mechanism that hands a completed
+download to qtor) and, best-effort, a <media-service> tracking request. An arr rejection or
+unreachable-service error propagates as a real `ToolError`, never a false "executed" success.
+Every *executed* mutation is recorded via `crate::gateway_framework::audit::AuditEntry`
+(S6-sanitized) in addition to the `#[instrument]` span.
+
+**Output** (JSON string, narration-shaped):
+
+```json
+// Confirm-tier, not yet confirmed
+{
+  "summary": "\"Dune (2021)\" is ~40.0 GB at 2160p remux -- this needs confirmation before I grab it. Reply with confirm: true to proceed.",
+  "structured": {
+    "title": "Dune", "year": "2021", "media_type": "movie", "season": null,
+    "quality_hint": "2160p remux", "estimated_size_bytes": 42949672960,
+    "tier": "confirm", "executed": false, "already_present": false, "note": null
+  }
+}
+```
+
+```json
+// Light-tier, executed
+{
+  "summary": "Grabbed \"Arrival\" (2016) (~4.0 GB) -- Radarr/Sonarr is searching indexers now.",
+  "structured": {
+    "title": "Arrival", "year": "2016", "media_type": "movie", "season": null,
+    "quality_hint": "1080p", "estimated_size_bytes": 4294967296,
+    "tier": "light", "executed": true, "already_present": false, "note": null
+  }
+}
+```
+
 ## What's not here yet
 
-No request/download, organize, or recommend tools exist yet — see the spec
-(`S94-media-domain`, Plane project `TERM`) for MEDIA-03 through MEDIA-08. The tiered
-mutation-safety model (read-free / light-execute / confirm-required / hard-confirm-destructive)
-and the toggleable taste-memory module are load-bearing design pieces of later items, not this
-read/search surface. See [`specs/behavior/media-behavior.md`](../../../specs/behavior/media-behavior.md)
-for the states/degradation contract this domain establishes.
+No organize, recommend, or taste-memory tools exist yet — see the spec (`S94-media-domain`,
+Plane project `TERM`) for MEDIA-04 through MEDIA-08. Destructive-op hard gating (MEDIA-04) is a
+separate, stricter discipline from this item's tiered confirmation. See
+[`specs/behavior/media-behavior.md`](../../../specs/behavior/media-behavior.md) for the
+states/degradation contract this domain establishes.

@@ -25,6 +25,7 @@
 //! per-service configuration state without ever failing itself.
 
 pub mod clients;
+pub mod request;
 pub mod search;
 
 use async_trait::async_trait;
@@ -92,6 +93,7 @@ impl RustTool for MediaDomainStatus {
 pub fn register(registry: &mut ToolRegistry) {
     registry.register_or_replace(Box::new(MediaDomainStatus));
     search::register(registry);
+    request::register(registry);
 }
 
 #[cfg(test)]

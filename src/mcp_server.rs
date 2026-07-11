@@ -373,6 +373,18 @@ async fn handle_mcp(
                 let merged = MergedCatalog::build(tools, pool).await;
                 tools = merged.tools;
             }
+            // MESH-08: filter the merged catalog down to exactly what the
+            // resolved caller `Principal` may CALL, per
+            // `crate::gateway_framework::AllowlistPolicy` -- visibility ==
+            // enforcement parity with the `tools/call` gate below, which
+            // runs the same `is_allowed` decision on the same (possibly
+            // namespaced) tool name. `state.gateway` unset (e.g.
+            // `terminus_personal`, every pre-TGW-04 deployment) preserves
+            // the exact pre-MESH-08 behavior: no filtering at all.
+            if let Some(gateway) = &state.gateway {
+                let principal = identity.as_ref().map(|Extension(i)| Principal::from(i));
+                tools = gateway.filter_catalog_for_principal(principal.as_ref(), tools);
+            }
             sse_response(id, Ok(json!({"tools": tools})), "")
         }
         "tools/call" => {
