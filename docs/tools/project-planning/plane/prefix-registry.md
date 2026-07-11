@@ -3,8 +3,8 @@
 # Plane — prefix registry (`plane_prefix_*`)
 
 `src/plane/prefix.rs` is a **sub-module** of `plane`, registered from the same entry point
-(`plane::register` calls `prefix::register` at the end, `mod.rs:2900-2903`) so its 5 tools always
-surface alongside the other 32 `plane_*` tools. It gives the constellation's "a prefix must be
+(`plane::register` calls `prefix::register` at the end) so its 6 tools always
+surface alongside the other 37 `plane_*` tools. It gives the constellation's "a prefix must be
 unique — check the registry" convention a real, queryable, programmatic backing
 (`prefix.rs:7-11`).
 
@@ -19,6 +19,7 @@ which of those owning projects a given item prefix belongs to.
 ## Table of contents
 
 - [Hybrid store](#hybrid-store)
+- [Client vs server durability (PROMO-01)](#client-vs-server-durability-promo-01)
 - [Data model](#data-model)
 - [Validation rules](#validation-rules)
 - [Fail-open](#fail-open)
@@ -27,6 +28,7 @@ which of those owning projects a given item prefix belongs to.
 - [plane_prefix_check](#plane_prefix_check)
 - [plane_prefix_register](#plane_prefix_register)
 - [plane_prefix_retire](#plane_prefix_retire)
+- [plane_prefix_promote](#plane_prefix_promote)
 
 ## Hybrid store
 
@@ -52,6 +54,24 @@ row (so a retire override or an unpromoted claim takes effect immediately), whil
 `MergedRow.in_baseline`/`in_overlay` flags both provenances (`prefix.rs:344-382`).
 `source_label()` reports one of `"baseline"`, `"overlay-only"`, `"baseline+overlay"`, or
 `"unknown"`.
+
+## Client vs server durability (PROMO-01)
+
+The two write layers have very different durability, and the **client gateway deliberately runs
+with no Redis** (a security posture — no shared mutable state reachable from the client surface).
+That split matters:
+
+| Layer | Written by | Durable? | Reachable from the client (no-Redis) gateway? |
+| --- | --- | --- | --- |
+| Redis overlay | `plane_prefix_register`, `plane_prefix_retire` | No — runtime only, promoted later | No |
+| Baseline TOML | `plane_prefix_promote` (this tool) → PR → merge | **Yes** — the reviewed source of truth compiled into the binary | Yes |
+
+Before PROMO-01 the only programmatic write path was the overlay, so a client with no Redis had
+**no durable path at all** — it could check/list but never record a claim durably.
+`plane_prefix_promote` closes that gap: it writes the baseline TOML directly through a git branch
++ Gitea PR and **needs no overlay**. On a server where an overlay *is* reachable it may
+additionally clear the now-promoted pending claim (best-effort `HDEL`), but it never depends on
+Redis to function — the promote path is identical with or without an overlay.
 
 ## Data model
 
@@ -248,3 +268,71 @@ as a structured `ok: false` JSON result, not a `ToolError`).
 **Errors**: none of these paths return a `ToolError` — a missing `prefix` argument does
 (`InvalidArgument`), but a not-found *prefix value*, an unconfigured overlay, or an unreachable
 overlay are all reported as structured `ok: false` results.
+
+## plane_prefix_promote
+
+Make a prefix claim **durable** by writing its baseline `[[prefix]]` row and opening a Terminus
+PR. This is the client-side durable path (see
+[Client vs server durability](#client-vs-server-durability-promo-01)) and needs **no Redis**.
+
+**Input schema**
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `prefix` | string | yes | — | Prefix to promote, validated per [Validation rules](#validation-rules) |
+| `name` | string | see below | (from claim) | Override/supply the full name |
+| `project` | string | see below | (from claim) | Override/supply the owning project, uppercased |
+| `spec_id` | string | no | (from claim) | Override/supply the originating spec id |
+| `description` | string | see below | (from claim) | Override/supply the one-line summary |
+| `status` | string | no | (from claim, else `active`) | Must be a valid status |
+| `created` | string | no | (from claim, else today UTC) | `YYYY-MM-DD` |
+| `open_pr` | boolean | no | `true` | When `false`, commit to the branch and return the diff without opening a PR |
+| `identity` | string | no | configured default | Gitea identity (`GITEA_PAT_<NAME>`) to open the PR as |
+
+`name`, `project`, and `description` are **required only when there is no overlay/pending claim to
+seed the row from** — i.e. a from-scratch promote. When a pending claim exists, the row is seeded
+from it and any provided field overrides the claim's value.
+
+**Behavior**:
+
+1. Validate the prefix (and any `status` override) → `InvalidArgument` on failure.
+2. Resolve the row: if the prefix is **already in the baseline** → `ok: false, reason:
+   "already_promoted"` (no branch, no PR). Otherwise seed from an existing pending overlay claim
+   if present, else build from args — missing required fields → `ok: false, reason:
+   "insufficient_args"` with a `required`/`missing` list and **no partial write**.
+3. When `open_pr: true` and Gitea is unconfigured → `ok: false, reason: "gitea_unconfigured"`
+   (returned before any git mutation).
+4. Render the `[[prefix]]` row (via the `toml` serializer, so it round-trips through the same
+   `Baseline`/`PrefixEntry` types the file uses) and **idempotently append** it to
+   `data/prefix_registry.toml`. If the row is already present in the file → `ok: true, appended:
+   false` (no branch/PR).
+5. Create branch `prefix-promote-{PREFIX}` off `main`, write the file onto that branch, commit.
+   - `open_pr: true` → push and open the PR through the shared `GiteaClient::create_pull` helper
+     (the same create-pull path as `gitea_create_pr`, including its PII gate), then best-effort
+     clear the pending overlay claim. Returns `ok, pr_url, pr_number, branch, entry`.
+   - `open_pr: false` → return the branch's diff, no PR. Returns `ok, branch, entry, diff`.
+
+Git transport is a minimal `std::process::Command` sequence run against
+`PREFIX_REGISTRY_REPO_DIR` (default `.`), which must be a Terminus checkout with an `origin`
+remote when `open_pr: true`. The Gitea repo name is `PREFIX_REGISTRY_GITEA_REPO` (default
+`Terminus`); the owner/org is resolved by `GiteaClient` (`GITEA_OWNER`), never hardcoded.
+
+**Output shape** (JSON, PR opened):
+```json
+{"ok": true, "appended": true, "branch": "prefix-promote-ZZQW",
+ "pr_url": "https://<gitea>/<owner>/Terminus/pulls/123", "pr_number": 123,
+ "entry": {"prefix": "ZZQW", "name": "...", "project": "TERM", "spec_id": "...",
+           "status": "active", "description": "...", "created": "2026-07-11"},
+ "overlay_claim_cleared": null}
+```
+
+**Output shape** (JSON, `open_pr: false`):
+```json
+{"ok": true, "appended": true, "branch": "prefix-promote-ZZQW", "pr_url": null,
+ "entry": {"...": "..."}, "diff": "--- a/data/prefix_registry.toml\n+++ ...",
+ "note": "open_pr=false: committed to the branch, no PR opened"}
+```
+
+**Errors**: `InvalidArgument` for a missing/malformed `prefix` or an invalid `status`. Every other
+outcome (`already_promoted`, `insufficient_args`, `gitea_unconfigured`, already-in-file) is a
+structured `ok: …` JSON result. Git/Gitea transport failures surface as `ToolError::Http`.

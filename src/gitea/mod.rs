@@ -579,6 +579,48 @@ impl GiteaClient {
         override_owner.unwrap_or(&self.owner)
     }
 
+    /// Open a pull request via `POST /repos/{owner}/{repo}/pulls`, reusing this
+    /// client's identity resolution, PII gate, and HTTP transport. `args` is the
+    /// same shape [`CreatePr`] accepts: `repo` (required), `title` (required),
+    /// `head` (required), `base` (required), optional `body`, optional `owner`
+    /// override, optional `identity`. Returns the typed PR.
+    ///
+    /// This is the single create-pull implementation shared by the `gitea_create_pr`
+    /// tool and by PROMO-01's `plane_prefix_promote`, so neither hand-rolls a second
+    /// HTTP client or a second PII gate.
+    pub async fn create_pull(&self, args: &Value) -> Result<GiteaPullRequest, ToolError> {
+        let client = self.resolve_identity(args)?;
+        let repo = args["repo"].as_str()
+            .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
+        let title = args["title"].as_str()
+            .ok_or_else(|| ToolError::InvalidArgument("'title' is required".to_string()))?;
+        let head = args["head"].as_str()
+            .ok_or_else(|| ToolError::InvalidArgument("'head' is required".to_string()))?;
+        let base = args["base"].as_str()
+            .ok_or_else(|| ToolError::InvalidArgument("'base' is required".to_string()))?;
+        let owner = client.resolve_owner(args["owner"].as_str());
+
+        // PII gate on the PR body if provided (same guard as the tool path).
+        if let Some(body_text) = args["body"].as_str() {
+            if let Some(reason) = pii_check(body_text) {
+                warn!("PII gate blocked create_pr body for {owner}/{repo}: {reason}");
+                return Err(ToolError::InvalidArgument(format!(
+                    "PR body rejected by PII gate: {reason}"
+                )));
+            }
+        }
+
+        let body = GiteaCreatePrRequest {
+            title: title.to_string(),
+            head: head.to_string(),
+            base: base.to_string(),
+            body: args["body"].as_str().map(str::to_string),
+        };
+
+        let endpoint = format!("/repos/{}/{}/pulls", owner, repo);
+        client.post(&endpoint, &body).await
+    }
+
     // ── Accessors + generic transport for the forge adapter (GITX-02) ──────────
     //
     // The Gitea-family `ForgeProvider` adapter (`crate::forge::gitea_family`)
@@ -1434,36 +1476,9 @@ impl RustTool for CreatePr {
 
 impl CreatePr {
     async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
-        let client = self.client.resolve_identity(&args)?;
-        let repo = args["repo"].as_str()
-            .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
-        let title = args["title"].as_str()
-            .ok_or_else(|| ToolError::InvalidArgument("'title' is required".to_string()))?;
-        let head = args["head"].as_str()
-            .ok_or_else(|| ToolError::InvalidArgument("'head' is required".to_string()))?;
-        let base = args["base"].as_str()
-            .ok_or_else(|| ToolError::InvalidArgument("'base' is required".to_string()))?;
-        let owner = client.resolve_owner(args["owner"].as_str());
-
-        // PII gate on PR body if provided
-        if let Some(body_text) = args["body"].as_str() {
-            if let Some(reason) = pii_check(body_text) {
-                warn!("PII gate blocked create_pr body for {owner}/{repo}: {reason}");
-                return Err(ToolError::InvalidArgument(format!(
-                    "PR body rejected by PII gate: {reason}"
-                )));
-            }
-        }
-
-        let body = GiteaCreatePrRequest {
-            title: title.to_string(),
-            head: head.to_string(),
-            base: base.to_string(),
-            body: args["body"].as_str().map(str::to_string),
-        };
-
-        let endpoint = format!("/repos/{}/{}/pulls", owner, repo);
-        let pr: GiteaPullRequest = client.post(&endpoint, &body).await?;
+        // Delegates to the shared `GiteaClient::create_pull` helper so the tool
+        // and PROMO-01's `plane_prefix_promote` share one create-pull path.
+        let pr: GiteaPullRequest = self.client.create_pull(&args).await?;
 
         let text = format!(
             "Pull request created: #{} — {}\nURL: {}\n{} → {}",
