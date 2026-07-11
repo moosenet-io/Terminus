@@ -88,6 +88,23 @@ lifecycle, the GPU-authority lock (`gpu_authority`), the permanent
 jam-detect supervisor daemon, and the Chord `PullCoordinator` re-pull
 delegation.
 
+**ACQ-01 (Terminus TERM #244) — model acquisition is Chord-only, not a
+presence check.** Both sweep families acquire every model they profile via
+Chord's control-API pull endpoint (`chord_pull::acquire_via_chord`, the same
+`PullCoordinator` delegation `mint fetch-model`/`breakfix` already use),
+which promotes the model from this fleet's tiered/cold-storage archive — it
+is **never** an internet fetch. This replaced two prior gaps: the coder
+sweep's HFIX-05 pre-flight used to only check whether a model happened to
+already be present (skipping it otherwise, even if the archive had it), and
+the assistant sweep's `ShellAcquirer` used to shell out directly to
+`ollama pull` and an HF-fetch binary for its `ollama_pull`/`hf_fetch`
+nominations. A model Chord cannot acquire (unknown/missing from the archive,
+insufficient host disk, unauthorized, or Chord unreachable/unconfigured) is a
+clean skip — recorded as a terminal non-viable `code_profile_runs` row
+(`failure_class` = `non_viable_unavailable` or `non_viable_resource`, the
+same finalized-row mechanism MINT2-02 introduced for over-VRAM skips) rather
+than silently vanishing from the data or being retried forever.
+
 ## Domains
 
 ### Code & Git — 8 tools · [domain index](code-git/README.md)

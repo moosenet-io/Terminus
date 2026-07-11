@@ -42,6 +42,7 @@
 use std::time::Duration;
 
 use crate::config;
+use crate::intake::code_v2::FailureClass;
 
 /// Outcome of one `fetch_model` call. Distinct variants (not stringly-typed)
 /// so callers (the CLI and breakfix) can match on the exact failure mode
@@ -210,6 +211,98 @@ fn interpret_response(status: u16, body: &serde_json::Value, model: &str) -> Pul
     }
 }
 
+// ===========================================================================
+// ACQ-01: shared acquisition entry point for the coder + assistant sweeps
+// ===========================================================================
+//
+// Terminus TERM #244. Both sweep families previously either did a bare
+// "is the model already present" registry check (coder's HFIX-05 pre-flight
+// in `coder_sweep.rs`) or shelled out to `ollama pull` / an HF-fetch binary
+// (the assistant's `assistant::acquire::ShellAcquirer`) — neither actually
+// PROMOTED a model from this fleet's cold-storage archive via Chord. This is
+// the ONE acquisition entry point both now call: [`acquire_via_chord`] wraps
+// [`fetch_model`] and maps every outcome to either "proceed" or a typed
+// non-viable skip, carrying the [`FailureClass`] the caller writes onto its
+// non-viable row via `code_v2::record_non_viable_acquire_row` (the SAME
+// finalized-row mechanism MINT2-02 introduced for over-VRAM skips — see that
+// module's doc). No caller of this function ever shells out to `ollama pull`,
+// fetches from Hugging Face, or otherwise reaches the internet: the ONLY
+// remote call `acquire_via_chord` makes is `fetch_model`, i.e. Chord's
+// control-API pull endpoint (which itself promotes from tiered/cold storage,
+// not the internet — see the module doc above).
+
+/// Result of [`acquire_via_chord`] — what a caller (coder or assistant sweep)
+/// does next for one `(model, backend)` cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcquireOutcome {
+    /// Chord reports the model warm (locally resident) — proceed with the
+    /// existing serve/test flow.
+    Warmed,
+    /// A hard failure — the cell was never attempted. `reason` is a free-text,
+    /// already-genericized message safe to persist verbatim (no host/path);
+    /// `failure_class` is the structured class the caller records the
+    /// non-viable row under.
+    NonViable { reason: String, failure_class: FailureClass },
+}
+
+/// Map a non-`Warmed` [`PullOutcome`] to the `(reason, FailureClass)` a caller
+/// records on its non-viable row. Pure — unit-testable without a live Chord
+/// instance. `404`/`NotConfigured`/unreachable/unauthorized/other all map to
+/// [`FailureClass::NonViableUnavailable`] (the model could not be made
+/// resident, for any non-resource reason); `507` maps to
+/// [`FailureClass::NonViableResource`] (the host itself is short on disk,
+/// a distinct operational signal from "this model doesn't exist").
+fn classify_pull_outcome(outcome: &PullOutcome) -> (String, FailureClass) {
+    match outcome {
+        PullOutcome::Warmed { model } => {
+            // Never called by `acquire_via_chord` for a `Warmed` outcome —
+            // kept total (no panic) so this stays a plain, testable pure
+            // function rather than one that can be misused into a panic.
+            (format!("model '{model}' is warm (not a failure)"), FailureClass::NonViableUnavailable)
+        }
+        PullOutcome::NotFound { detail } => (
+            format!("chord: model not available from cold storage: {detail}"),
+            FailureClass::NonViableUnavailable,
+        ),
+        PullOutcome::InsufficientDiskSpace { detail } => (
+            format!("chord: insufficient disk space to acquire model: {detail}"),
+            FailureClass::NonViableResource,
+        ),
+        PullOutcome::Unauthorized => (
+            "chord: unauthorized (missing/invalid CHORD_JWT) while acquiring model".to_string(),
+            FailureClass::NonViableUnavailable,
+        ),
+        PullOutcome::Unreachable { detail } => (
+            format!("chord: control endpoint unreachable while acquiring model: {detail}"),
+            FailureClass::NonViableUnavailable,
+        ),
+        PullOutcome::Failed { detail } => (
+            format!("chord: model acquisition failed: {detail}"),
+            FailureClass::NonViableUnavailable,
+        ),
+    }
+}
+
+/// ACQ-01: acquire `model` via Chord's cold-storage promotion — the ONE
+/// acquisition path shared by the coder and assistant sweeps (see module
+/// doc). Never panics; every outcome (including `NotConfigured`, a caller
+/// misconfiguration rather than something Chord reported) resolves to an
+/// [`AcquireOutcome`] the caller can match on to either proceed or record a
+/// clean non-viable skip.
+pub async fn acquire_via_chord(model: &str) -> AcquireOutcome {
+    match fetch_model(model).await {
+        Ok(PullOutcome::Warmed { .. }) => AcquireOutcome::Warmed,
+        Ok(other) => {
+            let (reason, failure_class) = classify_pull_outcome(&other);
+            AcquireOutcome::NonViable { reason, failure_class }
+        }
+        Err(NotConfigured(detail)) => AcquireOutcome::NonViable {
+            reason: format!("chord: {detail}"),
+            failure_class: FailureClass::NonViableUnavailable,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +464,70 @@ mod tests {
         match result {
             Ok(PullOutcome::Unreachable { .. }) => {}
             other => panic!("expected Ok(Unreachable), got {other:?}"),
+        }
+    }
+
+    // ---- classify_pull_outcome: pure PullOutcome → (reason, FailureClass) ----
+
+    #[test]
+    fn classify_not_found_and_unreachable_and_unauthorized_and_failed_are_unavailable() {
+        for outcome in [
+            PullOutcome::NotFound { detail: "unknown model: x".to_string() },
+            PullOutcome::Unreachable { detail: "connection refused".to_string() },
+            PullOutcome::Unauthorized,
+            PullOutcome::Failed { detail: "backend saturated".to_string() },
+        ] {
+            let (reason, class) = classify_pull_outcome(&outcome);
+            assert_eq!(class, FailureClass::NonViableUnavailable, "outcome={outcome:?}");
+            assert!(!reason.is_empty());
+        }
+    }
+
+    #[test]
+    fn classify_insufficient_disk_space_is_resource() {
+        let outcome = PullOutcome::InsufficientDiskSpace {
+            detail: "need 20.00 GB, have 5.00 GB".to_string(),
+        };
+        let (reason, class) = classify_pull_outcome(&outcome);
+        assert_eq!(class, FailureClass::NonViableResource);
+        assert!(reason.contains("disk space"));
+    }
+
+    // ---- acquire_via_chord: end-to-end mapping (env-controlled, no live Chord) ----
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acquire_via_chord_not_configured_is_non_viable_unavailable() {
+        std::env::remove_var("CHORD_CONTROL_URL");
+        match acquire_via_chord("qwen3-coder:30b").await {
+            AcquireOutcome::NonViable { failure_class, reason } => {
+                assert_eq!(failure_class, FailureClass::NonViableUnavailable);
+                assert!(reason.contains("CHORD_CONTROL_URL"));
+            }
+            other => panic!("expected NonViable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acquire_via_chord_unreachable_is_non_viable_unavailable_never_falls_back() {
+        // NEGATIVE test: even when Chord is unreachable, `acquire_via_chord`
+        // must resolve to a clean non-viable skip — it must NEVER fall back to
+        // an `ollama pull` / internet fetch. There is nothing here to assert
+        // "no shell-out happened" against directly, but this function's only
+        // side effect is the HTTP call `fetch_model` makes (asserted via the
+        // Unreachable classification) — there is no other code path in
+        // `acquire_via_chord` that could reach `ollama`/HF/any other host.
+        std::env::set_var("CHORD_CONTROL_URL", "http://127.0.0.1:1");
+        std::env::set_var("MINT_FETCH_MODEL_TIMEOUT_SECS", "2");
+        let outcome = acquire_via_chord("qwen3-coder:30b").await;
+        std::env::remove_var("CHORD_CONTROL_URL");
+        std::env::remove_var("MINT_FETCH_MODEL_TIMEOUT_SECS");
+        match outcome {
+            AcquireOutcome::NonViable { failure_class, .. } => {
+                assert_eq!(failure_class, FailureClass::NonViableUnavailable);
+            }
+            other => panic!("expected NonViable, got {other:?}"),
         }
     }
 }

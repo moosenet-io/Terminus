@@ -278,10 +278,16 @@ pub trait Acquirer: Send + Sync {
     async fn acquire(&self, nom: &Nomination) -> AcquisitionOutcome;
 }
 
-/// Live acquirer: ollama-pull / register-span / HF-fetch via `gguf_path`,
-/// honoring the gfx1151 class (Vulkan first; experimental MoE via ROCm + HSA
-/// override). Read-heavy loads come from [`model_load_root`] (span→NAS); the
-/// `gguf_path` binary name comes from [`config::gguf_path_bin`].
+/// Live acquirer: Chord cold-storage promotion / register-span, honoring the
+/// gfx1151 class. Read-heavy loads come from [`model_load_root`] (span→NAS).
+///
+/// ACQ-01 (Terminus TERM #244): `OllamaPull` and `HfFetch` are BOTH routed
+/// through [`chord_pull::acquire_via_chord`] — Chord's control-API pull
+/// endpoint promotes a model from this fleet's tiered/cold-storage archive,
+/// which is NOT the internet. This acquirer previously shelled out directly
+/// to `ollama pull` and to the S83 `gguf_path` HF-fetch binary (both genuine
+/// internet fetches); neither remains. `RegisterSpan` is unchanged — it reads
+/// an already-staged local GGUF (span/NAS), never a remote fetch of any kind.
 pub struct ShellAcquirer;
 
 #[async_trait::async_trait]
@@ -297,29 +303,23 @@ impl Acquirer for ShellAcquirer {
             };
         }
         match nom.acquisition {
-            AcquisitionPath::OllamaPull => self.ollama_pull(nom).await,
+            AcquisitionPath::OllamaPull | AcquisitionPath::HfFetch => self.chord_acquire(nom).await,
             AcquisitionPath::RegisterSpan => self.register_span(nom),
-            AcquisitionPath::HfFetch => self.hf_fetch(nom).await,
         }
     }
 }
 
 impl ShellAcquirer {
-    async fn ollama_pull(&self, nom: &Nomination) -> AcquisitionOutcome {
-        // `ollama pull <id>` — Ollama manages the blob store; no local_path needed.
-        let status = tokio::process::Command::new("ollama")
-            .arg("pull")
-            .arg(&nom.id)
-            .status()
-            .await;
-        match status {
-            Ok(s) if s.success() => AcquisitionOutcome::Ready { local_path: None },
-            Ok(s) => AcquisitionOutcome::Skipped {
-                reason: format!("ollama pull failed (exit {:?})", s.code()),
-            },
-            Err(e) => AcquisitionOutcome::Skipped {
-                reason: format!("ollama pull could not start: {e}"),
-            },
+    /// ACQ-01: acquire `nom`'s weights via Chord's cold-storage promotion —
+    /// the ONE remote acquisition path (see the struct doc). Covers both the
+    /// `OllamaPull` and `HfFetch` nomination kinds identically: Chord's
+    /// registry, not the nomination's `acquisition` tag, decides how the
+    /// model is actually sourced from the archive.
+    async fn chord_acquire(&self, nom: &Nomination) -> AcquisitionOutcome {
+        use crate::intake::chord_pull::{acquire_via_chord, AcquireOutcome};
+        match acquire_via_chord(&nom.id).await {
+            AcquireOutcome::Warmed => AcquisitionOutcome::Ready { local_path: None },
+            AcquireOutcome::NonViable { reason, .. } => AcquisitionOutcome::Skipped { reason },
         }
     }
 
@@ -345,49 +345,6 @@ impl ShellAcquirer {
         }
     }
 
-    async fn hf_fetch(&self, nom: &Nomination) -> AcquisitionOutcome {
-        let repo = match &nom.hf_repo {
-            Some(r) => r,
-            None => {
-                return AcquisitionOutcome::Skipped {
-                    reason: "HfFetch nomination missing hf_repo".into(),
-                }
-            }
-        };
-        let root = match model_load_root() {
-            Some(r) => r,
-            None => {
-                return AcquisitionOutcome::Skipped {
-                    reason: "no model load root configured for HF fetch".into(),
-                }
-            }
-        };
-        // Resumable by construction: the gguf_path binary re-fetches into the same
-        // staged path, so a mid-download crash resumes rather than restarting the
-        // whole run (spec EDGE CASE).
-        let out_dir = format!("{}/{}", root.trim_end_matches('/'), sanitize_id(&nom.id));
-        let mut cmd = tokio::process::Command::new(config::gguf_path_bin());
-        cmd.arg("--repo").arg(repo).arg("--out").arg(&out_dir);
-        // Experimental MoE on the gfx1151 class: bring up on ROCm with the HSA
-        // override so the loader recognizes the GPU. Applied as an env at the
-        // acquisition boundary; the value comes from config, never a literal.
-        if nom.gfx1151_class == Gfx1151Class::Experimental {
-            if let Some(hsa) = config::hsa_override_gfx_version() {
-                cmd.env("HSA_OVERRIDE_GFX_VERSION", hsa);
-            }
-        }
-        match cmd.status().await {
-            Ok(s) if s.success() => AcquisitionOutcome::Ready {
-                local_path: Some(out_dir),
-            },
-            Ok(s) => AcquisitionOutcome::Skipped {
-                reason: format!("gguf_path HF fetch failed (exit {:?})", s.code()),
-            },
-            Err(e) => AcquisitionOutcome::Skipped {
-                reason: format!("gguf_path binary could not start: {e}"),
-            },
-        }
-    }
 }
 
 /// Make a model id filesystem-safe for a staged path (`:` and `/` → `_`).
@@ -454,6 +411,31 @@ mod tests {
         let outcome = futures_block_on(ShellAcquirer.acquire(&big));
         assert!(!outcome.is_ready());
         assert!(outcome.skip_reason().unwrap().contains("VRAM"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn shell_acquirer_ollama_pull_and_hf_fetch_both_route_through_chord_not_the_internet() {
+        // ACQ-01: `OllamaPull` and `HfFetch` nominations both go through
+        // `chord_pull::acquire_via_chord` now — never `ollama pull`, never the
+        // `gguf_path` HF-fetch binary. With `CHORD_CONTROL_URL` unset,
+        // `acquire_via_chord` resolves to `NonViable` (`NotConfigured`) purely
+        // in-process — if either path still shelled out to `ollama`/`gguf_path`,
+        // that binary likely isn't even on this test host and the call would
+        // hang or fail differently, not resolve instantly to this reason.
+        std::env::remove_var("CHORD_CONTROL_URL");
+        std::env::remove_var("INTAKE_VRAM_CEILING_GB");
+
+        let ollama_nom = nom("qwen3-coder:30b", 30.0, Gfx1151Class::Confirmed, AcquisitionPath::OllamaPull);
+        let outcome = futures_block_on(ShellAcquirer.acquire(&ollama_nom));
+        assert!(!outcome.is_ready());
+        assert!(outcome.skip_reason().unwrap().contains("CHORD_CONTROL_URL"));
+
+        let mut hf_nom = nom("cohere/command-a-plus:104b", 104.0, Gfx1151Class::Experimental, AcquisitionPath::HfFetch);
+        hf_nom.hf_repo = Some("cohere/command-a-plus".to_string());
+        let outcome = futures_block_on(ShellAcquirer.acquire(&hf_nom));
+        assert!(!outcome.is_ready());
+        assert!(outcome.skip_reason().unwrap().contains("CHORD_CONTROL_URL"));
     }
 
     #[test]

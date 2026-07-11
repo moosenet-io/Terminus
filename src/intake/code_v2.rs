@@ -605,6 +605,17 @@ pub enum FailureClass {
     /// the host VRAM ceiling — the cell was never attempted, but it EXISTS as a
     /// row (score 0) instead of silently vanishing from the data.
     NonViableVram,
+    /// ACQ-01: skipped because Chord's cold-storage acquisition (`chord_pull::
+    /// fetch_model`) reported the model as unreachable/unknown — a `404`
+    /// (unknown model, or known but missing from the archive), `401`/`403`
+    /// (unauthorized), a transport-level unreachable, `NotConfigured`
+    /// (`CHORD_CONTROL_URL`/`CHORD_JWT` unset), or any other non-resource
+    /// hard failure. The cell was never attempted (no inference ran).
+    NonViableUnavailable,
+    /// ACQ-01: skipped because Chord's cold-storage acquisition reported `507`
+    /// — insufficient local disk space to hold the model. The cell was never
+    /// attempted.
+    NonViableResource,
 }
 
 impl FailureClass {
@@ -626,6 +637,8 @@ impl FailureClass {
             FailureClass::PhaseStall => "phase_stall",
             FailureClass::Unknown => "unknown",
             FailureClass::NonViableVram => "non_viable_vram",
+            FailureClass::NonViableUnavailable => "non_viable_unavailable",
+            FailureClass::NonViableResource => "non_viable_resource",
         }
     }
 
@@ -752,6 +765,40 @@ pub async fn record_non_viable_vram_row(
     reason: &str,
     mem_config: Option<&str>,
 ) -> Result<(), ToolError> {
+    record_non_viable_row(model_name, backend_tag, reason, mem_config, FailureClass::NonViableVram).await
+}
+
+/// ACQ-01: write a single terminal `code_profile_runs` row recording that a
+/// (model × backend × config) cell was skipped pre-flight because Chord's
+/// cold-storage acquisition (`chord_pull::fetch_model`) reported a hard
+/// failure — the cell was never attempted (no inference ran), but it EXISTS
+/// as a row (score 0) instead of silently vanishing from the data, same as
+/// the `non_viable_vram` skip this generalizes from. `class` is expected to
+/// be [`FailureClass::NonViableUnavailable`] or [`FailureClass::NonViableResource`]
+/// (any `FailureClass` is accepted; callers choose the class).
+pub async fn record_non_viable_acquire_row(
+    model_name: &str,
+    backend_tag: &str,
+    reason: &str,
+    mem_config: Option<&str>,
+    class: FailureClass,
+) -> Result<(), ToolError> {
+    record_non_viable_row(model_name, backend_tag, reason, mem_config, class).await
+}
+
+/// Shared write path behind [`record_non_viable_vram_row`] and
+/// [`record_non_viable_acquire_row`] — a single terminal `code_profile_runs`
+/// row for a (model × backend × config) cell that was skipped PRE-FLIGHT
+/// (over-VRAM, or — ACQ-01 — a Chord acquisition failure), tagged with
+/// whichever `class` the caller determined. See the two public wrappers'
+/// docs for the field-by-field rationale (unchanged by this refactor).
+async fn record_non_viable_row(
+    model_name: &str,
+    backend_tag: &str,
+    reason: &str,
+    mem_config: Option<&str>,
+    class: FailureClass,
+) -> Result<(), ToolError> {
     let pool = storage::get_pool().await?;
     let profile_id = storage::insert_model_profile(&pool, model_name, "ollama", None, None).await?;
     // Record the config dimension the same way a scored row would, so
@@ -775,7 +822,7 @@ pub async fn record_non_viable_vram_row(
         context_window_launched: factors.context_window_launched,
         temperature: factors.temperature,
         top_p: factors.top_p,
-        failure_class: Some(FailureClass::NonViableVram.key().to_string()),
+        failure_class: Some(class.key().to_string()),
         ..Default::default()
     };
     let id = storage::insert_code_run_v2(&pool, profile_id, &row).await?;
