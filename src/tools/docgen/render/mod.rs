@@ -47,6 +47,7 @@ pub mod notion;
 pub mod obsidian;
 pub mod pdf;
 pub mod wiki;
+pub mod wiki_graph;
 
 use std::collections::BTreeSet;
 
