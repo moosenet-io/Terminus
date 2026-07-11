@@ -404,7 +404,14 @@ async fn run_provider(
             (std::borrow::Cow::Borrowed(resolved_path), built)
         };
 
-    let result = run_built_command(&spawn_built, &spawn_binary_path, timeout_secs, env).await;
+    // agy's OAuth access-token refresh races when agy runs concurrently or in
+    // rapid succession -- route it through the serialize+retry wrapper. Every
+    // other provider spawns directly, unchanged.
+    let result = if matches!(provider, Provider::Agy) {
+        run_agy_with_retry(&spawn_built, &spawn_binary_path, timeout_secs, env).await
+    } else {
+        run_built_command(&spawn_built, &spawn_binary_path, timeout_secs, env).await
+    };
 
     // Clean up the codex --output-last-message temp file on EVERY exit path
     // (timeout, spawn failure, non-zero exit, empty output, success) -- not
@@ -415,6 +422,96 @@ async fn run_provider(
     }
 
     result
+}
+
+/// Process-global mutex serializing `agy` spawns. agy's OAuth access-token
+/// refresh races when two agy processes run at once (each refresh consults the
+/// same on-disk refresh token + Google's token endpoint concurrently), so agy
+/// -- and ONLY agy -- is serialized daemon-wide. opus/codex are unaffected and
+/// keep running concurrently under the normal `AppState::semaphore` cap.
+fn agy_serialize_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Number of EXTRA agy attempts (beyond the first) on an auth-transient.
+const AGY_AUTH_RETRIES: usize = 2;
+/// Base backoff between agy retries; attempt N sleeps N * this (4s, then 8s)
+/// so agy's OAuth refresh state settles before the next try.
+const AGY_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Whether an agy failure `detail` matches the TRANSIENT OAuth-refresh signature
+/// a retry can plausibly clear -- agy's own "Authentication required / please
+/// visit the URL to log in / .../o/oauth2/auth" message. A genuine hard error
+/// (missing binary, timeout, real credential expiry that keeps repeating) does
+/// NOT loop forever: retries are bounded by [`AGY_AUTH_RETRIES`].
+fn is_agy_auth_transient(detail: &str) -> bool {
+    let d = detail.to_ascii_lowercase();
+    d.contains("authentication required")
+        || d.contains("please visit the url to log in")
+        || d.contains("o/oauth2/auth")
+}
+
+/// The error RETURNED when agy's auth-transient persists through every retry.
+/// Deliberately a FIXED, URL-free message: the raw agy `detail` embeds a Google
+/// OAuth login URL (client_id / redirect_uri / code_challenge query params), and
+/// returning it verbatim would propagate that auth material into the caller's
+/// `/dispatch` response body (and any log that records provider errors). We keep
+/// the classification, drop the URL.
+fn agy_auth_exhausted_error() -> (&'static str, String) {
+    (
+        "other",
+        format!("agy auth-transient persisted after {AGY_AUTH_RETRIES} retries (login URL redacted)"),
+    )
+}
+
+/// Run agy under the serialize lock, retrying a bounded number of times on the
+/// auth-transient (see [`is_agy_auth_transient`]) with escalating backoff. An
+/// auth-transient is a FAST failure (agy exits rc=1 in seconds, not the full
+/// timeout), so even the worst case stays well under the caller's dispatch
+/// timeout. Any non-transient error (or success) returns immediately.
+///
+/// NOTE on the time budget: `timeout_secs` is applied PER ATTEMPT (each
+/// `run_built_command` call gets the full budget), so a pathological run that
+/// somehow hit the timeout on every attempt could take up to
+/// `(AGY_AUTH_RETRIES + 1) * timeout_secs` plus the backoffs. That is a hard
+/// upper bound (never unbounded), and in practice the auth-transient fails in a
+/// few seconds -- a genuine per-attempt timeout is a different, non-transient
+/// error kind (`"timeout"`), which `is_agy_auth_transient` excludes, so it is
+/// returned immediately without consuming a retry.
+async fn run_agy_with_retry(
+    built: &provider::BuiltCommand,
+    resolved_path: &std::path::Path,
+    timeout_secs: u64,
+    env: &HashMap<String, String>,
+) -> Result<String, (&'static str, String)> {
+    let _guard = agy_serialize_lock().lock().await;
+    let mut attempt = 0usize;
+    loop {
+        let result = run_built_command(built, resolved_path, timeout_secs, env).await;
+        let is_transient = matches!(&result, Err((_, d)) if is_agy_auth_transient(d));
+        if is_transient && attempt < AGY_AUTH_RETRIES {
+            attempt += 1;
+            // Log the CLASSIFICATION + attempt only -- never the raw `detail`.
+            // agy's auth-transient text embeds a Google OAuth login URL whose
+            // query string (client_id, redirect_uri, code_challenge, ...) is
+            // auth material that must not be expanded into the daemon's logs.
+            tracing::warn!(
+                attempt,
+                "review-daemon: agy OAuth auth-transient (detail redacted), retrying after backoff"
+            );
+            tokio::time::sleep(AGY_RETRY_BACKOFF * attempt as u32).await;
+            continue;
+        }
+        if is_transient {
+            // Retries exhausted: return the REDACTED error, never the raw detail
+            // (which still carries the OAuth login URL) up to the caller/response.
+            return Err(agy_auth_exhausted_error());
+        }
+        // Success, or a non-transient error (timeout / binary_not_found /
+        // empty_output / other) -- return as-is, immediately.
+        return result;
+    }
 }
 
 /// Core spawn-and-collect logic, split out from [`run_provider`] so the
@@ -489,6 +586,42 @@ mod tests {
             home_dir: "/tmp/test-home".into(),
             gemini_cache_dir: "/tmp/test-home/.gemini/antigravity-cli".into(),
         }
+    }
+
+    #[test]
+    fn agy_auth_transient_matches_the_observed_oauth_signature() {
+        // The exact failure surfaced live: agy exits rc=1 carrying this text.
+        let real = "bwrap exited rc=1: 2 tcmalloc parameters.cc:586 ... \
+                    Authentication required. Please visit the URL to log in:\n  \
+                    https://accounts.google.com/o/oauth2/auth?access_type=offline&client_id=x";
+        assert!(is_agy_auth_transient(real));
+        // Case-insensitive on each key phrase.
+        assert!(is_agy_auth_transient("AUTHENTICATION REQUIRED"));
+        assert!(is_agy_auth_transient("redirected to /o/oauth2/auth?foo"));
+        assert!(is_agy_auth_transient("Please visit the URL to log in: https://..."));
+    }
+
+    #[test]
+    fn agy_auth_transient_does_not_match_hard_errors() {
+        // These must NOT be treated as retryable -- retrying only prolongs them.
+        assert!(!is_agy_auth_transient("agy timed out after 120s"));
+        assert!(!is_agy_auth_transient("'bwrap' binary was not found on PATH at daemon startup"));
+        assert!(!is_agy_auth_transient("bwrap exited rc=1: some unrelated segfault"));
+        assert!(!is_agy_auth_transient("exited successfully but produced empty output"));
+    }
+
+    #[test]
+    fn agy_exhausted_error_carries_no_oauth_url_or_query_material() {
+        // The final returned error (after retries are exhausted) must NOT leak
+        // the OAuth login URL / its query params into the caller's response.
+        let (kind, msg) = agy_auth_exhausted_error();
+        let low = msg.to_ascii_lowercase();
+        assert!(!low.contains("http"), "must not contain a URL: {msg}");
+        assert!(!low.contains("oauth"), "must not contain oauth material: {msg}");
+        assert!(!low.contains("accounts.google"), "must not contain the login host: {msg}");
+        assert!(!low.contains("client_id") && !low.contains("code_challenge"));
+        assert!(low.contains("redacted"), "should state it was redacted: {msg}");
+        assert_eq!(kind, "other");
     }
 
     #[tokio::test]
