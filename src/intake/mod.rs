@@ -234,7 +234,7 @@ impl RustTool for ModelIntake {
                 "code_harness": {
                     "type": "string",
                     "enum": ["v1", "v2"],
-                    "description": "Which code-suite harness to run. 'v2' (default) is the realistic build-scenario harness: real files + spec in context, graduated 0-5 score, retry, rows tagged harness_version='v2'. 'v1' is the legacy cold one-shot suite (additive, original rows)."
+                    "description": "Which code-suite harness to run. 'v2' (default) is the realistic build-scenario harness: real files + spec in context, graduated 0-5 score, retry, rows tagged harness_version='v3'. 'v1' is the legacy cold one-shot suite (additive, original rows)."
                 },
                 "backend": {
                     "type": "string",
