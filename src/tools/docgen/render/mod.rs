@@ -42,6 +42,7 @@
 //!   this item.
 
 pub mod blog;
+pub mod llms_txt;
 pub mod markdown;
 pub mod notion;
 pub mod obsidian;
