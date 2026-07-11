@@ -45,6 +45,7 @@ pub mod changelog;
 pub mod config;
 pub mod crate_graph;
 pub mod diagram;
+pub mod drift;
 pub mod generate;
 pub mod mismatch;
 pub mod pii_gate;
@@ -170,6 +171,7 @@ pub fn register(registry: &mut ToolRegistry) {
     let _ = registry.register(Box::new(DocgenStatus));
     mismatch::register(registry);
     changelog::register(registry);
+    drift::register(registry);
 }
 
 #[cfg(test)]
@@ -177,7 +179,7 @@ mod tests {
     use super::*;
 
     const EXPECTED_TOOL_NAMES: &[&str] =
-        &["docgen_status", "docgen_mismatch_detect", "docgen_generate_changelog"];
+        &["docgen_status", "docgen_mismatch_detect", "docgen_generate_changelog", "docgen_drift_check"];
 
     #[test]
     fn registers_expected_tools() {
