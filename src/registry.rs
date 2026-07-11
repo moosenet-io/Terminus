@@ -137,6 +137,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::google::register(registry);
     crate::<media-service>::register(registry); // pii-test-fixture
     crate::litellm::register(registry);
+    crate::media::register(registry); // S94/MEDIA-01
     crate::<container-mgr>::register(registry); // pii-test-fixture
     crate::prometheus::register(registry);
     crate::hearth::register(registry);

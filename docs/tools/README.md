@@ -2,7 +2,7 @@
 
 [← docs index](../README.md)
 
-Terminus provides ~52 **tools**, one per integrated service (`src/registry.rs`'s
+Terminus provides ~53 **tools**, one per integrated service (`src/registry.rs`'s
 `register_all` / `register_personal` — see
 [`architecture/federation.md`](../architecture/federation.md) for which
 registry serves which tool). Each tool exposes a set of **actions** — the
@@ -157,7 +157,7 @@ selection/profiling (MINT's tool-facing side).
 | `litellm` | ~6 | Read-only status and model queries against the LiteLLM proxy. | [`models-review/litellm.md`](models-review/litellm.md) |
 | `tools` | ~3 | A small grouping of additional tool modules that live under `src/tools/` rather than the crate root. | [`models-review/serving.md`](models-review/serving.md) |
 
-### Personal & Life — 16 tools
+### Personal & Life — 17 tools
 
 Finance, health, travel, home, media, and general life-admin integrations —
 the bulk of the `terminus_personal` registry.
@@ -172,6 +172,7 @@ the bulk of the `terminus_personal` registry.
 | `vitals` | ~11 | Health tracking (weight, sleep, and other logs; summary/recent/today; program creation) via a REST API backend. | [`personal-life/vitals.md`](personal-life/vitals.md) |
 | `hearth` | ~7 | Pantry/meal-planning tools via Grocy — what-can-I-make, pantry list, meal plan. | [`personal-life/hearth.md`](personal-life/hearth.md) |
 | `<media-service>` | ~8 | Read-only media request queries against <media-service> (Plex/Jellyfin request management). | [`personal-life/<media-service>.md`](personal-life/<media-service>.md) |
+| `media` | 1 | **Scaffold (MEDIA-01, S94).** Sovereign media-stack orchestration domain (Radarr/Sonarr/Prowlarr/qtor/Plex/<media-service>/TMDb) — vault(env)-backed service clients + one config-status tool. No user-facing search/request/recommend tools yet; those land in MEDIA-02..07. | [`personal-life/media.md`](personal-life/media.md) |
 | `commute` | ~8 | Traffic-aware routing (TomTom) and Bay Area public-transit planning (511.org). | [`personal-life/commute.md`](personal-life/commute.md) |
 | `weather` | 1 | Current conditions and forecasts via OpenWeatherMap. | [`personal-life/weather.md`](personal-life/weather.md) |
 | `news` | ~3 | Headlines, search, and topic feeds. | [`personal-life/news.md`](personal-life/news.md) |

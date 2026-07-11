@@ -5,7 +5,7 @@
 # Terminus
 
 **The Rust MCP tool hub and federated gateway for the Lumina constellation — one
-authenticated front door for agent tool egress, with ~52 tools, one per
+authenticated front door for agent tool egress, with ~53 tools, one per
 integrated service.**
 
 ## What Terminus is
@@ -47,7 +47,7 @@ MCP server, which owns dispatch, JSON-Schema validation, and governance.
 Governance is mandatory and layered: a path-jailed filesystem, vault-only
 secret access (no raw environment reads for secrets), a PII gate, and a
 sanitized audit log — tools are read-only by default, write scopes are
-explicit. Behind the registry sit the 51 domain tool modules, each owning its
+explicit. Behind the registry sit the 52 domain tool modules, each owning its
 own typed client and credentials. See
 [`docs/architecture/`](docs/architecture/) for the federation, auth, and
 Chord-integration deep-dives.
@@ -56,7 +56,7 @@ Chord-integration deep-dives.
 
 | | |
 | --- | --- |
-| **Tools** | ~52, one per integrated service (GitHub, Plane, Prometheus, …). Each tool exposes a set of **actions** that vary with the backing service and change over time — ~300 individual MCP callables in total across all tools. |
+| **Tools** | ~53, one per integrated service (GitHub, Plane, Prometheus, …). Each tool exposes a set of **actions** that vary with the backing service and change over time — ~300 individual MCP callables in total across all tools. |
 | **Transport** | stdio (local/SSH) and HTTP, with an mTLS listener for federated/remote clients |
 | **Auth** | per-identity mTLS client certificates (`crate::pki`); named-identity tokens (`GITEA_PAT_<NAME>`, `PLANE_PAT_<NAME>`) for outbound git-forge/tracker calls |
 | **Governance** | path-jailed filesystem access, vault-only secrets (never a raw `env::var` for a credential), a mandatory Rust PII gate on every public-forge write, sanitized audit logging |
@@ -149,6 +149,39 @@ Wiring the resolver into the live request path (replacing the interim
 MESH-07 — existing callers keep working today via a direct, resolver-bypassing
 conversion (`Principal::from(&ClientIdentity)`) that uses the raw cert CN as
 the principal name, unchanged from pre-MESH-06 behavior.
+### Catalog merge, namespacing, and routing
+
+`tools/list` on `/mcp` merges the local core catalog with every currently
+healthy mesh upstream's tools into one list (`crate::mesh::merge`). Local
+core tools (and the pre-existing single personal-registry federation) are
+advertised **unprefixed**, exactly as before the mesh existed. Every tool
+sourced from a mesh upstream is advertised as:
+
+```
+<namespace>__<tool>
+```
+
+using that upstream's registered `namespace` (see the table above) as the
+prefix, separated by a literal double underscore (`__`). This means two
+upstreams can each export a tool with the same bare name (e.g. both export
+`echo`) without colliding on the merged catalog — they show up as
+`nsa__echo` and `nsb__echo`, each with an unambiguous, explicit source. Only
+the FIRST `__` in a name is treated as the namespace boundary, so an
+upstream tool whose own bare name happens to contain `__` still round-trips
+correctly (`namespaced("ns", "foo__bar") == "ns__foo__bar"`, which splits
+back to `("ns", "foo__bar")`).
+
+`tools/call` routes on this same convention: a namespaced name has its
+`<namespace>__` prefix stripped and is dispatched to the owning upstream; any
+other name (including a `__`-shaped name whose prefix isn't a currently
+known mesh namespace) dispatches locally, unchanged from pre-mesh behavior.
+If a namespaced call's owning upstream is currently unhealthy or was
+excluded from the pool entirely (e.g. a missing credential at startup), the
+call returns a clean tool-error ("mesh upstream \"<namespace>\" is currently
+unavailable") rather than a panic, a 500, or a silent fallback to local
+dispatch. When the mesh registry/pool is empty or disabled
+(`TERMINUS_MESH_ENABLED` unset), this is all a no-op: `tools/list`/
+`tools/call` behave exactly as they did before the mesh existed.
 
 ## Quickstart
 
@@ -193,7 +226,7 @@ This README is the front door; everything past "at a glance" lives in
 | [`docs/architecture/`](docs/architecture/) | Federation (how `terminus-primary` aggregates core + personal tools), auth (mTLS identity model), and the Chord-integration boundary/wire contract. |
 | [`docs/networking/`](docs/networking/) | WireGuard and Tailscale transport options for reaching a Terminus deployment off-LAN, including the optional embedded-tsnet mode (MESH-04, `tsnet` Cargo feature — no host `tailscaled` required; see [`docs/networking/tailscale.md`](docs/networking/tailscale.md#alternative-embedded-tsnet-mesh-04--no-host-tailscaled-at-all)). |
 | [`docs/deploy/`](docs/deploy/) | Client enrollment/deploy guide and the personal-services (`terminus_personal`/`terminus_primary`) deployment guide. |
-| [`docs/tools/`](docs/tools/README.md) | The full tool index — all 52 modules grouped by domain, plus the **MINT** flagship harness. |
+| [`docs/tools/`](docs/tools/README.md) | The full tool index — all 53 modules grouped by domain, plus the **MINT** flagship harness. |
 
 ## Atlas — knowledge-graph query tools
 

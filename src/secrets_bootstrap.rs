@@ -51,6 +51,19 @@ use crate::<secret-manager>::{fetch_secrets_batch, InfisicalConfig}; // pii-test
 /// so `crate::pki::bootstrap`'s "check the process env first" tier relies on
 /// this fetch to have populated them from the runtime secret store, exactly
 /// like every other key here.
+///
+/// **S94/MEDIA-01:** also carries the media domain's service credentials
+/// (`crate::media::clients::*`) — Radarr/Sonarr/Prowlarr/qtor/Plex/TMDb.
+/// Not Gitea/Plane/GitHub either, but same rationale: this is the crate's
+/// one startup materialization point, so any `*::from_env()`-style client
+/// (including the media clients' `std::env::var` reads) relies on this fetch
+/// having populated the process environment from the runtime secret store.
+/// `JELLYSEERR_URL`/`JELLYSEERR_API_KEY` are deliberately NOT added here —
+/// they were already read directly from the static/deployed environment by
+/// the pre-existing `crate::<media-service>` module before this item, and the // pii-test-fixture
+/// media domain's own <media-service> client (`media::clients::<media-service>`) // pii-test-fixture
+/// shares those same two keys, so adding them again here would be redundant
+/// rather than additive.
 pub const GITEA_PLANE_GITHUB_SECRET_KEYS: &[&str] = &[
     "PLANE_API_URL",
     "PLANE_API_KEY",
@@ -61,6 +74,17 @@ pub const GITEA_PLANE_GITHUB_SECRET_KEYS: &[&str] = &[
     "GITLAB_TOKEN",
     "TERMINUS_CA_CERT",
     "TERMINUS_CA_KEY",
+    "RADARR_URL",
+    "RADARR_API_KEY",
+    "SONARR_URL",
+    "SONARR_API_KEY",
+    "PROWLARR_URL",
+    "PROWLARR_API_KEY",
+    "QTOR_URL",
+    "QTOR_CREDS",
+    "PLEX_URL",
+    "PLEX_TOKEN",
+    "TMDB_API_KEY",
 ];
 
 /// Prefixes for named-identity Personal Access Tokens. In addition to the fixed

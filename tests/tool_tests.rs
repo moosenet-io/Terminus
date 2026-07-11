@@ -66,6 +66,16 @@ fn test_hearth_tools_registered() {
     );
 }
 
+/// S94/MEDIA-01: the media domain scaffold registers its one internal tool.
+#[test]
+fn test_media_tools_registered() {
+    let reg = full_registry();
+    assert!(
+        reg.contains("media_domain_status"),
+        "media_domain_status must be registered"
+    );
+}
+
 #[test]
 fn test_myelin_tools_registered() {
     let reg = full_registry();
