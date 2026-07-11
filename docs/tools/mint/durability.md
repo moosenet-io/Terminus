@@ -16,6 +16,10 @@ into the three subsystems that make that survivable:
   *jammed* sweep (GPU pegged, no new rows landing) and auto-recovers it.
 - **`breakfix.rs`** — the escalation/self-repair logic the supervisor hands a
   repeatedly-jammed combination off to, once plain restarts stop working.
+- **`chord_session.rs`** (RESIL-03) — a SECOND, independent durability signal:
+  the sweep registers its planned queue with Chord's session cache and
+  advances it as work completes, so a restart can resume from Chord even if
+  the local `INTAKE_STAGING_DIR` checkpoint file was lost — and vice versa.
 
 Every claim below is sourced from the actual code as of this page's writing, with
 `file.rs:line` citations for anything non-obvious. Where the build brief's assumptions
@@ -29,6 +33,7 @@ disagreed with what the code does, that is called out explicitly.
 - [supervisor.rs — the jam-detection daemon](#supervisorrs--the-jam-detection-daemon)
 - [breakfix.rs — the self-repair escalation ladder](#breakfixrs--the-self-repair-escalation-ladder)
 - [Relationship to gpu_authority.rs](#relationship-to-gpu_authorityrs)
+- [chord_session.rs — Chord-backed resume (RESIL-03)](#chord_sessionrs--chord-backed-resume-resil-03)
 - [Environment variables](#environment-variables)
 - [Worked example: a resumed sweep](#worked-example-a-resumed-sweep)
 
@@ -585,6 +590,74 @@ For the exclusive-lock mechanics themselves — holder labels, reconciliation,
 idempotent-reacquire rules — see the dedicated `gpu-authority.md` reference page; this
 page intentionally does not duplicate that depth.
 
+## chord_session.rs — Chord-backed resume (RESIL-03)
+
+`checkpoint.rs`'s file-backed ledger (above) stays the PRIMARY, always-attempted resume
+path — every claim in this section is additive, never a replacement. `chord_session.rs`
+adds a SECOND, independent durability signal by talking to Chord's session-cache control
+endpoints (`POST /api/sweep/session`, `GET /api/sweep/session/:id`,
+`POST /api/sweep/session/:id/advance` — JWT-gated the same way as every other
+Chord-calling module in this repo; see `chord_pull.rs` for the precedent this module
+mirrors). The point is resilience against LOSING one of the two signals independently: a
+Terminus host that loses its `INTAKE_STAGING_DIR` (disk wipe, host rebuild) can still
+resume from Chord; a Chord outage or a freshly-provisioned `CHORD_CONTROL_URL` still
+resumes correctly from the file checkpoint alone, exactly as it did before RESIL-03.
+
+### Stable identity: `session_id` and `ActionKey`
+
+A sweep restart must re-attach to the SAME Chord-side session, not fragment into a new
+one every run. `derive_session_id(epoch, run_kind, queue)` derives a session id from the
+harness epoch, the run kind (`"coder"`/`"assistant"`), and a stable SHA-1 digest (via
+`sha1_smol`, the same stable-across-builds hash this repo already uses for
+`plane::redis_cache_key` — `std`'s `DefaultHasher` is explicitly NOT used because it is
+not stable across Rust versions/builds) of the planned queue's contents, in order. Same
+planned queue ⇒ same session id, every restart; a materially different queue (fleet
+change, a different `--only-stale` selection) naturally derives a new session, matching
+Chord's own "different queue = replace + reset" semantics.
+
+Each unit of work is identified by an `ActionKey` — a stable string,
+`"<run_kind>|<model>|<backend>[|<case>]"` — built by `action_key(...)`. This is
+deliberately the SAME conceptual unit the file checkpoint's own key struct
+(`CodeCheckpointKey` for the coder sweep) already keys on, so Chord's `done` set and the
+file checkpoint's `done` set describe identical units and either can be used to skip the
+other's re-run.
+
+### Registration + reconciliation, at sweep start
+
+Before the coder sweep's fleet loop starts, `coder_sweep.rs`'s
+`register_and_reconcile_chord_session` builds the planned `(model, backend)` queue for the
+(possibly `--only-stale`-narrowed) fleet, derives the session id, and calls
+`chord_session::register`. On success, it reconciles: any queued unit Chord's response
+does NOT list in `remaining` is treated as Chord-done and, if the file checkpoint doesn't
+already have it, backfilled into the file checkpoint via `checkpoint.mark(&key)`. This
+means the existing `run_fleet`/`run_one_backend` skip logic (`done.contains(&key)`) is
+completely unchanged — reconciliation happens once, up front, by making the file
+checkpoint the union of what both sources already know, so a Terminus restart resumes
+from Chord even if the local file checkpoint was lost.
+
+If `register` fails — `CHORD_CONTROL_URL` unset, or Chord unreachable — this is logged
+ONCE and the run proceeds with `chord_session_id = None`: durability falls back to the
+file checkpoint alone. This is a hard requirement, not an incidental default: Chord being
+down must never stop a sweep from starting.
+
+### Advancing, at each unit's completion
+
+`run_one_backend` calls `chord_session::advance(session_id, &[action_key])`
+**immediately after** `checkpoint.mark(&key)` succeeds — never before, and never as a
+substitute for it. The file checkpoint mark remains the sole authoritative
+"this-process's-own" durability event; the Chord advance is a best-effort mirror of that
+same fact onto the second signal. An advance failure (Chord down mid-run, a transient
+network blip) is logged and swallowed — it can never undo or block the file checkpoint
+mark that already landed, and never turns a successful case into a sweep failure.
+
+### Soft-fail contract
+
+Every `chord_session` call (`register`/`remaining`/`advance`) returns a plain `Result`
+value for every failure mode — unconfigured, unreachable, or an unexpected response —
+never a panic and never a hard error a caller must propagate. The ONLY remote host this
+module ever calls is `CHORD_CONTROL_URL` itself; there is no internet call and no guessed
+host on any path, mirroring `chord_pull.rs`'s `NotConfigured` contract exactly.
+
 ## Environment variables
 
 Names only, per this documentation set's PII discipline — see each var's default in the
@@ -603,6 +676,9 @@ source cited.
 | `MINT_BREAKFIX_FETCH_MODEL_TIMEOUT_SECS` | `breakfix.rs` (`fetch_model_bounded`) | Tighter timeout for breakfix's own fetch-model call; default 120s |
 | `MINT_FETCH_MODEL_TIMEOUT_SECS` | `chord_pull.rs` (not this file, referenced for contrast) | The underlying Chord pull's own, more generous HTTP timeout; default 600s |
 | `RUST_LOG` | the rendered systemd unit | Standard `tracing` log-level filter for the daemon process |
+| `CHORD_CONTROL_URL` | `chord_session.rs` (via `config.rs`), also `chord_pull.rs` | Base URL for Chord's control API — session-cache register/remaining/advance calls; unset ⇒ `chord_session` soft-fails to file-checkpoint-only durability, never a hard error |
+| `CHORD_JWT` | `chord_session.rs` | Bearer token for Chord's control-API JWT auth; unset/blank ⇒ no `authorization` header sent (matches Chord's own auth-disabled-when-secret-empty behavior) |
+| `MINT_SWEEP_SESSION_TIMEOUT_SECS` | `chord_session.rs` | Timeout for a single session-cache HTTP call (register/remaining/advance); default 10s — deliberately short, these are cheap metadata round trips, not `chord_pull`'s multi-GB model pull |
 
 ## Worked example: a resumed sweep
 

@@ -25,6 +25,7 @@ pub mod breakfix;
 pub mod catalog;
 pub mod checkpoint;
 pub mod chord_pull;
+pub mod chord_session;
 mod code;
 mod code_v2;
 pub mod coder_case;
