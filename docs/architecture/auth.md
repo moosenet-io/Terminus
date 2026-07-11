@@ -229,7 +229,10 @@ between, in [federation.md](federation.md)'s "gateway pipeline" section.
 
 ## Unified `Principal` identity (MESH-06)
 
-Three identity concepts described above — the mTLS cert CN
+See [mesh.md](mesh.md#3-identity--rbac) for how this identity model plugs
+into the broader N-upstream mesh (per-upstream RBAC, federated audit,
+approval-gate propagation, and the current known gaps). Three identity
+concepts described above — the mTLS cert CN
 (`crate::pki::mtls::ClientIdentity`), the tailnet WhoIs identity
 (`crate::mesh::TailnetIdentity`, MESH-05), and the named-PAT identity model
 just below — historically had no single reconciliation point: the gateway's

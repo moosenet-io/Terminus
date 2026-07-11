@@ -9,8 +9,9 @@ that front door is built, the uniform pipeline every request goes through, how
 personal tools are reached, and — the part that surprises people first — why
 the two tool registries are never simply merged into one process.
 
-See also: [../README.md](../README.md) · [auth.md](auth.md) ·
-[chord-integration.md](chord-integration.md)
+See also: [../README.md](../README.md) · [mesh.md](mesh.md) (the separate,
+config-driven N-upstream mesh this single-upstream federation is additive
+to) · [auth.md](auth.md) · [chord-integration.md](chord-integration.md)
 
 <img src="../../assets/federation-topology.svg" alt="Federation topology: terminus-primary, terminus_personal, and Chord" width="100%">
 
