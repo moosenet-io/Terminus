@@ -16,11 +16,17 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::extract::build_rust_graph;
 use super::model::KnowledgeGraph;
 use crate::error::ToolError;
 use crate::scribe::vault::slugify;
+
+/// Process-global sequence so every `save` gets a distinct temp file name even
+/// for concurrent writes of the SAME project from multiple threads (pid alone
+/// is not enough — see the atomicity note on [`GraphStore::save`]).
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A filesystem-backed store of per-project knowledge graphs.
 #[derive(Clone, Debug)]
@@ -59,18 +65,21 @@ impl GraphStore {
 
     /// Save a project's graph atomically (temp file in the same dir + rename, so
     /// a reader never observes a half-written file). Creates the root dir if
-    /// needed.
+    /// needed. The temp name is unique per write — `pid` + a process-global
+    /// sequence — so two concurrent saves of the same project never write to the
+    /// same temp file (which would corrupt it); the rename is atomic within a
+    /// dir, so whichever save renames last wins cleanly.
     pub fn save(&self, project_id: &str, graph: &KnowledgeGraph) -> Result<(), ToolError> {
         fs::create_dir_all(&self.root).map_err(|e| {
             ToolError::Execution(format!("create kg store dir {}: {e}", self.root.display()))
         })?;
         let path = self.path_for(project_id);
         let json = graph.to_json_pretty()?;
-        // A per-process-unique temp sibling; rename is atomic within a dir.
         let tmp = self.root.join(format!(
-            "{}.{}.tmp",
+            "{}.{}.{}.tmp",
             slugify(project_id),
-            std::process::id()
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         fs::write(&tmp, json.as_bytes())
             .map_err(|e| ToolError::Execution(format!("write {}: {e}", tmp.display())))?;
@@ -208,6 +217,29 @@ mod tests {
         store.save("TERM", &sample("TERM")).unwrap();
         let g = store.refresh_files("TERM", &[]).unwrap();
         assert_eq!(g.node_count(), 2, "unchanged");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repeated_saves_same_project_do_not_corrupt_and_last_wins() {
+        // Regression (review P2): each save uses a unique temp name, so repeated
+        // saves of the same project succeed and the final graph is intact.
+        let root = tmp_root("repeat");
+        let store = GraphStore::new(&root);
+        for _ in 0..5 {
+            store.save("TERM", &sample("TERM")).unwrap();
+        }
+        let mut g2 = sample("TERM");
+        g2.insert_node(KgNode::new("crate::c::baz", NodeKind::Function, "baz", "src/c.rs"));
+        store.save("TERM", &g2).unwrap();
+        let loaded = store.load("TERM").unwrap().unwrap();
+        assert_eq!(loaded, g2, "last save wins, file not corrupted");
+        // no leftover temp files
+        let stray = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!stray, "no temp files left behind");
         let _ = fs::remove_dir_all(&root);
     }
 
