@@ -45,13 +45,21 @@
 //! `crate::federation::PersonalFederationClient` (that client speaks a
 //! different, Chord-specific wire protocol entirely).
 pub mod client;
+pub mod identity;
 pub mod registry;
 
 pub use client::{ToolMeta, UpstreamCallResult, UpstreamClient, UpstreamClientError, UpstreamPool};
+pub use identity::TailnetIdentity;
 pub use registry::{
     MeshConfigError, ResolvedSecret, UpstreamRegistry, UpstreamServer, UpstreamTransport,
 };
 
+/// MESH-05 — [`identity::TailnetIdentity`] is declared in its own,
+/// deliberately UNGATED module (`pub mod identity` above), not inside
+/// `tailnet` below, so it's usable on DEFAULT features (no `tsnet` compile
+/// feature required). See `identity`'s own module doc for the full
+/// reasoning. Only the WhoIs RESOLUTION logic that produces one is gated, in
+/// `tailnet` below.
 /// MESH-04 — embed tsnet so the gateway is its own tailnet node. Compiled
 /// ONLY under the `tsnet` Cargo feature (off by default; see `Cargo.toml`'s
 /// comment on the optional `tsnet` dependency) — a default `cargo build`

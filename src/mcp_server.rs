@@ -534,6 +534,102 @@ fn sse_response(id: Value, result: Result<Value, (i64, String)>, session_id: &st
     resp
 }
 
+/// MESH-05 — tower layer that inserts an already-resolved
+/// [`crate::mesh::TailnetIdentity`] into every request on ONE tailnet
+/// connection's extensions, parallel to how
+/// `crate::pki::mtls::serve_connection` inserts [`ClientIdentity`] for the
+/// mTLS listener (see that function's doc comment). Gated under the `tsnet`
+/// Cargo feature (off by default; see `crate::mesh::tailnet`'s module doc)
+/// because it depends on `crate::mesh::tailnet::TailnetServer` — NOTE
+/// [`crate::mesh::TailnetIdentity`] itself is deliberately NOT gated (see
+/// that type's own module doc), only this insertion code is.
+///
+/// A fresh [`TailnetIdentityLayer`] is built PER ACCEPTED CONNECTION (mirror
+/// of `crate::mesh::tailnet::serve_tailnet_connection`'s existing
+/// per-connection `router.clone()`) with that connection's own resolved
+/// identity — `identity: None` (a WhoIs miss or [`TailnetServer::whois`]
+/// failure) is a completely normal, non-fatal outcome: the extension is
+/// simply absent on every request over that connection, exactly like a
+/// plain-HTTP request never carries a [`ClientIdentity`]. This layer never
+/// fails a request over a WhoIs miss — precedence between a present
+/// [`crate::mesh::TailnetIdentity`] and a present [`ClientIdentity`] (when a
+/// future item lets both transports converge) is explicitly MESH-06's
+/// decision, not this layer's.
+#[cfg(feature = "tsnet")]
+#[derive(Clone)]
+pub struct TailnetIdentityLayer {
+    identity: Option<crate::mesh::TailnetIdentity>,
+}
+
+#[cfg(feature = "tsnet")]
+impl TailnetIdentityLayer {
+    /// `identity` is the already-resolved (or absent) result of
+    /// `TailnetServer::whois_identity` for the one connection this layer
+    /// will be applied to — resolution itself does not happen here, only
+    /// insertion, keeping this layer trivially cheap to construct per
+    /// connection.
+    pub fn new(identity: Option<crate::mesh::TailnetIdentity>) -> Self {
+        Self { identity }
+    }
+}
+
+#[cfg(feature = "tsnet")]
+impl<S> tower::Layer<S> for TailnetIdentityLayer {
+    type Service = TailnetIdentityService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        TailnetIdentityService {
+            inner,
+            identity: self.identity.clone(),
+        }
+    }
+}
+
+/// The [`tower::Service`] [`TailnetIdentityLayer`] produces. Inserts the
+/// carried identity (if any) into each request's extensions before calling
+/// through to `inner` — never short-circuits or rejects a request, since
+/// absence of a tailnet identity is an allowed, expected state (see
+/// [`TailnetIdentityLayer`]'s doc).
+#[cfg(feature = "tsnet")]
+#[derive(Clone)]
+pub struct TailnetIdentityService<S> {
+    inner: S,
+    identity: Option<crate::mesh::TailnetIdentity>,
+}
+
+#[cfg(feature = "tsnet")]
+impl<S> tower::Service<axum::extract::Request> for TailnetIdentityService<S>
+where
+    S: tower::Service<axum::extract::Request, Response = Response> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: axum::extract::Request) -> Self::Future {
+        if let Some(identity) = self.identity.clone() {
+            req.extensions_mut().insert(identity);
+        }
+        // Standard "clone the ready service, move the clone into the
+        // future" pattern (the original `self.inner` may not be `Ready`
+        // again until this call completes) -- same pattern
+        // `tower::util::BoxCloneService`/most hand-rolled `tower::Service`
+        // wrappers use.
+        let mut inner = self.inner.clone();
+        Box::pin(async move { inner.call(req).await })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -877,5 +973,39 @@ mod tests {
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── MESH-05: TailnetIdentity's no-op (absent) path on DEFAULT features ──
+    //
+    // `TailnetIdentityLayer`/`TailnetIdentityService` themselves are gated
+    // under `#[cfg(feature = "tsnet")]` (see their doc comments above --
+    // they depend on `crate::mesh::tailnet::TailnetServer`, which doesn't
+    // exist on default features at all). But `crate::mesh::TailnetIdentity`
+    // is deliberately UNGATED (see its own module doc), so the "no tailnet
+    // identity was ever inserted" path -- the normal state for every
+    // request on this crate's existing plain and mTLS listeners, and for a
+    // tailnet-listener connection whose WhoIs lookup misses -- is real,
+    // testable behavior on a plain default `cargo test`, with no panic and
+    // no `tsnet` feature required.
+    #[tokio::test]
+    async fn tailnet_identity_extension_absent_by_default_causes_no_panic() {
+        let router = build_router(test_state());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        // No `crate::mesh::TailnetIdentity` extension was ever inserted on
+        // this request (no tailnet listener involved at all here) --
+        // dispatch still succeeds normally, exactly as it does today for a
+        // plain HTTP request with no `ClientIdentity` either.
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn tailnet_identity_extension_get_returns_none_when_never_inserted() {
+        let extensions = axum::http::Extensions::new();
+        assert!(extensions.get::<crate::mesh::TailnetIdentity>().is_none());
     }
 }
