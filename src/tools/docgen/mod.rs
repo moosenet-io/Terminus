@@ -42,6 +42,7 @@
 //! target's API.
 
 pub mod config;
+pub mod generate;
 pub mod pii_gate;
 pub mod versioning;
 
@@ -55,6 +56,10 @@ use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
 pub use config::{DocTargetConfig, DocTargetType, ProjectDocConfig, ResolvedDocTarget};
+pub use generate::{
+    generate_docs, generate_docs_for_module, ChordDocGenerator, DocGenerator, GenerationOutcome,
+    SweptFeatContext,
+};
 pub use pii_gate::{sweep_input, sweep_input_for_routing, PiiGateOutcome, RoutingDestination};
 
 /// `docgen_status` -- report how the doc engine would interpret a project's

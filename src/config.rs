@@ -625,6 +625,23 @@ pub fn chord_personal_federation_timeout_ms() -> u64 {
         .unwrap_or(30_000)
 }
 
+// ── DOCGEN-05: doc-generation routing via Chord's SLM router ──────────────
+// The doc engine (`crate::tools::docgen::generate`) never picks a model
+// itself -- per the S95 design overview's seam, Chord's SLM router (DOCGEN-03,
+// shipped in `moosenet/Chord`) owns that decision. This crate only needs to
+// name the routing tag it sends on `POST /v1/infer`'s `model` field; Chord's
+// router resolves the actual backend model from it. Reuses
+// [`chord_personal_federation_url`]/[`chord_personal_federation_timeout_ms`]
+// for transport (same co-located Chord process, same auth scheme) rather than
+// adding a third pair of always-identical base-URL/timeout knobs.
+
+/// The routing tag `ChordDocGenerator` sends as `model` on `POST /v1/infer`
+/// for doc-generation requests. From `DOCGEN_CHORD_MODEL`; defaults to
+/// `"auto"` (let Chord's SLM router pick), never a literal model/host name.
+pub fn docgen_chord_model() -> String {
+    env_nonempty("DOCGEN_CHORD_MODEL").unwrap_or_else(|| "auto".to_string())
+}
+
 // ── TGW-03: inference proxy to Chord ──────────────────────────────────────
 // `terminus-primary` forwards `/v1/chat/completions`, `/v1/infer`,
 // `/v1/agent/execute`, and `/v1/coding/select` to the SAME co-located Chord
@@ -714,6 +731,18 @@ mod tests {
         std::env::set_var("TERMINUS_PRIMARY_CHORD_URL", "http://127.0.0.1:9999"); // pii-test-fixture
         assert_eq!(chord_personal_federation_url(), "http://127.0.0.1:9999"); // pii-test-fixture
         std::env::remove_var("TERMINUS_PRIMARY_CHORD_URL");
+    }
+
+    // ── DOCGEN-05: doc-generation routing tag ───────────────────────────
+
+    #[test]
+    #[serial]
+    fn docgen_chord_model_defaults_to_auto_and_honors_override() {
+        std::env::remove_var("DOCGEN_CHORD_MODEL");
+        assert_eq!(docgen_chord_model(), "auto");
+        std::env::set_var("DOCGEN_CHORD_MODEL", "docs-slm");
+        assert_eq!(docgen_chord_model(), "docs-slm");
+        std::env::remove_var("DOCGEN_CHORD_MODEL");
     }
 
     #[test]
