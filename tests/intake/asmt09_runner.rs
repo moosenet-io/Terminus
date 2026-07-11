@@ -312,7 +312,7 @@ fn resume_after_interruption_skips_completed_dimensions() {
         cp.keys
             .lock()
             .unwrap()
-            .push(CheckpointKey::new(&model, BackendTag::Gpu, d));
+            .push(CheckpointKey::new(&model, BackendTag::Gpu, d, terminus_rs::intake::current_epoch()));
     }
     let acq = MockAcquirer { skip: BTreeSet::new() };
     let driver = MockDriver::default();
