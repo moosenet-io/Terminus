@@ -743,6 +743,40 @@ pub fn gateway_rate_limit_refill_per_sec() -> f64 {
         .unwrap_or(5.0)
 }
 
+// ── DISC-04: HF Hub public model-listing client ──────────────────────────────
+//
+// `intake::discovery::hf_client::HfHubClient` queries the PUBLIC HuggingFace Hub
+// models-listing API (no auth token — see the module doc there for why that's a
+// deliberate distinction from DISC-08's authenticated fetch). Both knobs below are
+// read from env here — NEVER a literal in hf_client.rs — matching this file's own
+// convention for every other tool in this crate.
+
+/// Base URL for the public HuggingFace Hub API. From `HF_API_BASE_URL`; defaults to
+/// the well-known public HF Hub host. This is a documented PUBLIC API endpoint (the
+/// same kind of "well-known default" `model_advisor::mod`'s `OLLAMA_HOST` default
+/// already establishes for a well-known *local* endpoint), not an internal infra
+/// literal — flagged explicitly as a borderline S1 case in the DISC-04 PR
+/// description. Unlike most `Option<String>`-returning helpers in this file, this
+/// one always resolves to a value (a listing client with no configured override
+/// falls back to the public default rather than raising `NotConfigured`, since a
+/// sane default genuinely exists here).
+pub fn hf_api_base_url() -> String {
+    env_nonempty("HF_API_BASE_URL").unwrap_or_else(|| "https://huggingface.co".to_string())
+}
+
+/// Self-imposed rate limit (requests/minute) the HF Hub listing client throttles
+/// itself to. From `HF_DISCOVERY_RATE_LIMIT_PER_MIN`, default 30 — a conservative,
+/// documented default; HF's public API publishes no hard rate limit for anonymous
+/// listing calls, so this is a courtesy self-throttle, not a value HF mandated.
+/// A non-positive or unparseable override falls back to the default rather than
+/// disabling throttling.
+pub fn hf_discovery_rate_limit_per_min() -> u32 {
+    env_nonempty("HF_DISCOVERY_RATE_LIMIT_PER_MIN")
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &u32| *n > 0)
+        .unwrap_or(30)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1160,5 +1194,37 @@ mod tests {
             "terminus-primary and terminus_personal must default to different mTLS ports \
              so both can run alongside each other on the same host"
         );
+    }
+
+    // ── DISC-04 ─────────────────────────────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn hf_api_base_url_defaults_and_overrides() {
+        std::env::remove_var("HF_API_BASE_URL");
+        assert_eq!(hf_api_base_url(), "https://huggingface.co");
+        std::env::set_var("HF_API_BASE_URL", "http://mock-hf.example");
+        assert_eq!(hf_api_base_url(), "http://mock-hf.example");
+        std::env::remove_var("HF_API_BASE_URL");
+    }
+
+    #[test]
+    #[serial]
+    fn hf_discovery_rate_limit_per_min_defaults_and_overrides() {
+        std::env::remove_var("HF_DISCOVERY_RATE_LIMIT_PER_MIN");
+        assert_eq!(hf_discovery_rate_limit_per_min(), 30);
+        std::env::set_var("HF_DISCOVERY_RATE_LIMIT_PER_MIN", "60");
+        assert_eq!(hf_discovery_rate_limit_per_min(), 60);
+        std::env::remove_var("HF_DISCOVERY_RATE_LIMIT_PER_MIN");
+    }
+
+    #[test]
+    #[serial]
+    fn hf_discovery_rate_limit_per_min_ignores_non_positive_override() {
+        std::env::set_var("HF_DISCOVERY_RATE_LIMIT_PER_MIN", "0");
+        assert_eq!(hf_discovery_rate_limit_per_min(), 30);
+        std::env::set_var("HF_DISCOVERY_RATE_LIMIT_PER_MIN", "not-a-number");
+        assert_eq!(hf_discovery_rate_limit_per_min(), 30);
+        std::env::remove_var("HF_DISCOVERY_RATE_LIMIT_PER_MIN");
     }
 }
