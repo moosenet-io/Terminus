@@ -36,6 +36,7 @@
 //!   -- read via `crate::review::ReviewConfig::from_env()`, never duplicated
 //!   here.
 
+pub mod graph;
 pub mod inspect;
 pub mod vault;
 
