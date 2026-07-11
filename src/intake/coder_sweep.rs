@@ -39,7 +39,7 @@ use crate::intake::assistant::schema;
 use crate::intake::assistant::BackendTag;
 use crate::intake::checkpoint::FileCheckpoint;
 use crate::intake::gpu_authority;
-use crate::intake::{self, chord_pull, infer};
+use crate::intake::{self, chord_pull, chord_session, infer};
 
 // ===========================================================================
 // Env-sourced config (pub — shared by the binary AND the `mint` CLI, which
@@ -566,6 +566,104 @@ impl Drop for ReleaseOnDrop<'_> {
     }
 }
 
+// ===========================================================================
+// RESIL-03: Chord session-cache registration + reconciliation
+// ===========================================================================
+//
+// A SECOND, independent durability signal alongside the file checkpoint (see
+// the module doc in `chord_session.rs`). Best-effort end to end: Chord being
+// unconfigured or unreachable NEVER stops the sweep from starting or running
+// — it just means this run has no Chord-side resume signal, and durability
+// falls back to the file checkpoint alone (exactly how it worked before
+// RESIL-03).
+
+/// One planned unit of coder fleet work, correlated across BOTH durability
+/// signals: the file checkpoint's own key shape ([`CodeCheckpointKey`]) and
+/// the stable Chord [`chord_session::ActionKey`] string — so a unit Chord
+/// reports done can be backfilled into the exact file-checkpoint key it
+/// corresponds to, with no string-parsing round trip.
+struct QueuedUnit {
+    ckpt_key: CodeCheckpointKey,
+    action_key: chord_session::ActionKey,
+}
+
+/// Build the planned queue for `fleet` — the ALREADY-narrowed fleet (e.g.
+/// after `--only-stale` filtering), so the Chord session's queue matches
+/// exactly what this run intends to do.
+fn build_queued_units(fleet: &Nominations) -> Vec<QueuedUnit> {
+    fleet
+        .nominations
+        .iter()
+        .flat_map(|nom| {
+            nom.backend_strategy().into_iter().map(move |(backend_tag, _)| QueuedUnit {
+                ckpt_key: CodeCheckpointKey::new(&nom.id, backend_tag, intake::current_epoch()),
+                action_key: chord_session::action_key("coder", &nom.id, backend_tag.as_str(), None),
+            })
+        })
+        .collect()
+}
+
+/// Register `queued`'s planned work with Chord's session cache and reconcile:
+/// any queued unit Chord already reports done (absent from the `remaining`
+/// list of a freshly-registered/re-attached session) is backfilled into the
+/// file `checkpoint` if not already there, so [`run_fleet`]'s existing
+/// `done.contains(&key)` skip logic (unchanged) naturally honors BOTH
+/// durability signals without needing its own Chord-awareness.
+///
+/// Returns the Chord session id to advance against for the rest of this run,
+/// or `None` if Chord is unconfigured/unreachable — logged ONCE here, never
+/// fatal. `None` means this run has no Chord-side resume signal; the file
+/// checkpoint alone still works exactly as before RESIL-03.
+async fn register_and_reconcile_chord_session(
+    queued: &[QueuedUnit],
+    checkpoint: &CodeCheckpoint,
+) -> Option<String> {
+    let queue: Vec<chord_session::ActionKey> = queued.iter().map(|q| q.action_key.clone()).collect();
+    let session_id = chord_session::derive_session_id(intake::current_epoch(), "coder", &queue);
+
+    let summary = match chord_session::register(&session_id, &queue).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "coder sweep: Chord session cache unavailable ({e}) — falling back to \
+                 file-checkpoint-only durability for this run"
+            );
+            return None;
+        }
+    };
+
+    let remaining_set: BTreeSet<&str> = summary.remaining.iter().map(|s| s.as_str()).collect();
+    let mut file_done = checkpoint.done();
+    let mut backfilled = 0usize;
+    for q in queued {
+        if remaining_set.contains(q.action_key.as_str()) {
+            continue; // Chord doesn't consider this unit done
+        }
+        if file_done.contains(&q.ckpt_key) {
+            continue; // already known locally too
+        }
+        match checkpoint.mark(&q.ckpt_key) {
+            Ok(()) => {
+                file_done.insert(q.ckpt_key.clone());
+                backfilled += 1;
+            }
+            Err(e) => eprintln!(
+                "coder sweep: could not backfill file checkpoint from Chord session for \
+                 model={} backend={} (continuing — Chord's own signal still resumes it next \
+                 run): {e}",
+                q.ckpt_key.model_id, q.ckpt_key.backend_tag
+            ),
+        }
+    }
+    if backfilled > 0 {
+        eprintln!(
+            "coder sweep: resumed {backfilled} unit(s) from Chord's session cache (session={session_id})"
+        );
+    }
+
+    Some(session_id)
+}
+
 /// Run one `(model, backend)` code-suite pass under the P5 backend override,
 /// honoring the resume checkpoint. NEVER returns `Err` for a per-model failure —
 /// a hang/unavailable/OOM becomes a `Skipped` outcome so the fleet continues.
@@ -583,6 +681,7 @@ async fn run_one_backend(
     mem_config: Option<&str>,
     driver: &dyn CoderSuiteDriver,
     gpu_lock: &dyn GpuLock,
+    chord_session_id: Option<&str>,
 ) -> Result<BackendReport, ToolError> {
     let model_id = nom.id.clone();
     let key = CodeCheckpointKey::new(&model_id, backend, intake::current_epoch());
@@ -736,6 +835,24 @@ async fn run_one_backend(
             checkpoint
                 .mark(&key)
                 .map_err(|e| ToolError::Execution(format!("mark checkpoint: {e}")))?;
+            // RESIL-03: best-effort mirror onto Chord's session cache, AFTER
+            // the file checkpoint mark succeeds (never before — the file
+            // checkpoint stays the primary, always-attempted durability
+            // signal; this is a SECOND signal, not a replacement). A `None`
+            // session id (Chord never configured/reachable this run) or an
+            // advance failure is logged and swallowed — never fatal, and
+            // never blocks/undoes the file checkpoint that already landed.
+            if let Some(sid) = chord_session_id {
+                let action_key =
+                    chord_session::action_key("coder", &model_id, backend.as_str(), None);
+                if let Err(e) = chord_session::advance(sid, &[action_key]).await {
+                    eprintln!(
+                        "coder sweep: Chord session advance failed for model={model_id} \
+                         backend={} (continuing — file checkpoint already durable): {e}",
+                        backend.as_str()
+                    );
+                }
+            }
             BackendOutcome::Profiled {
                 cases_run: res.cases_run,
                 scored: res.scored,
@@ -773,6 +890,7 @@ async fn run_fleet(
     mem_config: Option<&str>,
     driver: &dyn CoderSuiteDriver,
     gpu_lock: &dyn GpuLock,
+    chord_session_id: Option<&str>,
 ) -> Result<Vec<BackendReport>, ToolError> {
     let done = checkpoint.done();
     let mut reports = Vec::new();
@@ -851,7 +969,7 @@ async fn run_fleet(
 
             let report = run_one_backend(
                 nom, backend_tag, override_str, langs, case_limit, checkpoint, &done, mem_config,
-                driver, gpu_lock,
+                driver, gpu_lock, chord_session_id,
             )
             .await?;
             reports.push(report);
@@ -1067,9 +1185,29 @@ pub async fn run(
         checkpoint.path(),
     );
 
+    // RESIL-03: register this run's planned queue with Chord's session cache
+    // and reconcile it against the file checkpoint BEFORE the fleet loop
+    // starts, so `run_fleet`'s existing skip logic (unchanged) picks up any
+    // unit Chord already reports done. Best-effort: `None` (Chord
+    // unconfigured/unreachable, logged once inside) just means this run has
+    // no Chord-side resume signal — the file checkpoint alone still works.
+    let queued_units = build_queued_units(&fleet);
+    let chord_session_id = register_and_reconcile_chord_session(&queued_units, &checkpoint).await;
+
     let driver = LiveCoderDriver;
     let gpu_lock = LiveGpuLock::new(GPU_HOLDER, coder_acquire_max_wait());
-    match run_fleet(&fleet, langs, case_limit, &checkpoint, mem_config, &driver, &gpu_lock).await {
+    match run_fleet(
+        &fleet,
+        langs,
+        case_limit,
+        &checkpoint,
+        mem_config,
+        &driver,
+        &gpu_lock,
+        chord_session_id.as_deref(),
+    )
+    .await
+    {
         Ok(reports) => {
             print_report(&reports);
             // MINT2-03: refresh the variance-aware aggregates (pass_rate +
@@ -1691,7 +1829,7 @@ mod tests {
         let driver = ScriptDriver::new().available("qwen3-coder:30b");
         let checkpoint = tmp_checkpoint("profiles-both");
 
-        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &NoopGpuLock)).unwrap();
+        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &NoopGpuLock, None)).unwrap();
 
         assert_eq!(reports.len(), 2);
         for r in &reports {
@@ -1720,7 +1858,7 @@ mod tests {
         let driver = ScriptDriver::new(); // nothing marked available
         let checkpoint = tmp_checkpoint("unavailable");
 
-        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &NoopGpuLock)).unwrap();
+        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &NoopGpuLock, None)).unwrap();
 
         assert_eq!(reports.len(), 1);
         match &reports[0].outcome {
@@ -1758,7 +1896,7 @@ mod tests {
         let driver = ScriptDriver::new(); // nothing marked available
         let checkpoint = tmp_checkpoint("unavailable-hf");
 
-        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &NoopGpuLock)).unwrap();
+        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &NoopGpuLock, None)).unwrap();
 
         assert_eq!(reports.len(), 1);
         match &reports[0].outcome {
@@ -1778,7 +1916,7 @@ mod tests {
         driver.suite_fail.insert("hangy:32b".to_string());
         let checkpoint = tmp_checkpoint("suite-fail");
 
-        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &NoopGpuLock)).unwrap();
+        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &NoopGpuLock, None)).unwrap();
 
         assert_eq!(reports.len(), 1);
         match &reports[0].outcome {
@@ -1802,7 +1940,7 @@ mod tests {
         let checkpoint = tmp_checkpoint("non-viable-row");
 
         let reports =
-            block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &NoopGpuLock)).unwrap();
+            block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &NoopGpuLock, None)).unwrap();
 
         assert_eq!(reports.len(), 1);
         match &reports[0].outcome {
@@ -1834,7 +1972,7 @@ mod tests {
             .unwrap();
         let driver = ScriptDriver::new().available("m:8b");
 
-        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &NoopGpuLock)).unwrap();
+        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &NoopGpuLock, None)).unwrap();
 
         assert_eq!(reports.len(), 2);
         let gpu = reports.iter().find(|r| r.backend_tag == BackendTag::Gpu).unwrap();
@@ -1863,7 +2001,7 @@ mod tests {
         let checkpoint = tmp_checkpoint("gpu-lock-both-backends");
         let gpu = ScriptGpuLock::default();
 
-        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &gpu)).unwrap();
+        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &gpu, None)).unwrap();
 
         assert_eq!(reports.len(), 2);
         assert_eq!(*gpu.acquire_calls.lock().unwrap(), 2, "one acquire per backend pass");
@@ -1891,7 +2029,7 @@ mod tests {
         let driver = ScriptDriver::new(); // nothing marked available — irrelevant, never reached
         let gpu = ScriptGpuLock::default();
 
-        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &gpu)).unwrap();
+        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &gpu, None)).unwrap();
 
         assert_eq!(reports.len(), 2);
         assert!(matches!(reports[0].outcome, BackendOutcome::Resumed));
@@ -1917,7 +2055,7 @@ mod tests {
         let checkpoint = tmp_checkpoint("gpu-lock-reacquire-fail");
         let gpu = ScriptGpuLock::failing_on(1); // refuse the very first acquire (the gpu pass)
 
-        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &gpu)).unwrap();
+        let reports = block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &gpu, None)).unwrap();
 
         assert_eq!(reports.len(), 2);
         let gpu_report = reports.iter().find(|r| r.backend_tag == BackendTag::Gpu).unwrap();
