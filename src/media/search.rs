@@ -7,7 +7,7 @@
 //!   back as ranked options with disambiguating detail, never a single wrong
 //!   guess; no matches come back as a friendly "couldn't find that" message,
 //!   never a hard error.
-//! - `media_status(id_or_title)` — aggregate presence/availability/quality
+//! - `media_status(title)` — aggregate presence/availability/quality
 //!   across Radarr, Sonarr, and Plex ([`crate::media::clients::{radarr,
 //!   sonarr, plex}`]), degrading gracefully (per-service note, not a panic
 //!   or a failed call) when any one of those services is unconfigured or
@@ -400,20 +400,20 @@ impl RustTool for MediaStatus {
         json!({
             "type": "object",
             "properties": {
-                "id_or_title": {
+                "title": {
                     "type": "string",
-                    "description": "Title (or TMDb id as a string) to check status for."
+                    "description": "Title to check, e.g. a title returned by media_search."
                 }
             },
-            "required": ["id_or_title"]
+            "required": ["title"]
         })
     }
 
     #[instrument(skip(self, args), fields(tool = "media_status"))]
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        let query = args.get("id_or_title").and_then(|v| v.as_str()).map(str::trim).unwrap_or("");
+        let query = args.get("title").and_then(|v| v.as_str()).map(str::trim).unwrap_or("");
         if query.is_empty() {
-            return Err(ToolError::InvalidArgument("id_or_title must not be empty".into()));
+            return Err(ToolError::InvalidArgument("title must not be empty".into()));
         }
 
         let radarr = check_radarr(&self.radarr, query).await;
@@ -663,7 +663,7 @@ mod tests {
             sonarr: Some(sonarr_client(&sonarr_server.base_url())),
             plex: Some(plex_client(&plex_server.base_url())),
         };
-        let result = tool.execute(json!({ "id_or_title": "Dune" })).await.unwrap();
+        let result = tool.execute(json!({ "title": "Dune" })).await.unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
 
         assert!(parsed.get("summary").is_some());
@@ -695,7 +695,7 @@ mod tests {
             plex: Some(plex_client(&plex_server.base_url())),
         };
         // Must not panic despite Plex erroring and Sonarr being unconfigured.
-        let result = tool.execute(json!({ "id_or_title": "Dune" })).await.unwrap();
+        let result = tool.execute(json!({ "title": "Dune" })).await.unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
 
         assert_eq!(parsed["structured"]["radarr"]["present"], true);
@@ -707,7 +707,7 @@ mod tests {
     #[tokio::test]
     async fn media_status_all_unconfigured_still_returns_ok() {
         let tool = MediaStatus { radarr: None, sonarr: None, plex: None };
-        let result = tool.execute(json!({ "id_or_title": "Dune" })).await;
+        let result = tool.execute(json!({ "title": "Dune" })).await;
         assert!(result.is_ok());
         let parsed: Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(parsed["structured"]["radarr"]["configured"], false);
@@ -716,10 +716,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn media_status_empty_id_or_title_is_invalid_argument() {
+    async fn media_status_empty_title_is_invalid_argument() {
         let tool = MediaStatus { radarr: None, sonarr: None, plex: None };
-        let result = tool.execute(json!({ "id_or_title": "" })).await;
+        let result = tool.execute(json!({ "title": "" })).await;
         assert!(matches!(result, Err(ToolError::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn media_status_numeric_string_is_treated_as_a_title() {
+        // MEDIA-02 matches by title only; a bare TMDb id string is not resolved
+        // (deferred). It must degrade gracefully to "not present", never panic
+        // or error. Mock Radarr returns a real library entry whose title is not
+        // the numeric id, so the numeric query correctly resolves to absent.
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v3/movie");
+            then.status(200).json_body(json!([{ "title": "Dune", "hasFile": true }]));
+        });
+        let tool = MediaStatus {
+            radarr: Some(RadarrClient::new(&server.base_url(), "k", reqwest::Client::new())),
+            sonarr: None,
+            plex: None,
+        };
+        let result = tool.execute(json!({ "title": "438631" })).await.unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        // numeric id treated as a title -> no library title matches it -> not present
+        assert_eq!(parsed["structured"]["radarr"]["present"], false);
     }
 
     #[test]

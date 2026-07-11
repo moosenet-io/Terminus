@@ -131,7 +131,9 @@ aggregating across Radarr, Sonarr, and Plex (`src/media/search.rs`). Read-only.
 
 | Field | Type | Required |
 |---|---|---|
-| `id_or_title` | string | yes (rejected as `InvalidArgument` if empty/whitespace-only) |
+| `title` | string | yes (rejected as `InvalidArgument` if empty/whitespace-only) |
+
+> **Note:** MEDIA-02 matches **by title only** (e.g. a title returned by `media_search`). Direct lookup by numeric TMDb id is deferred to a later item; a bare id string is treated as a title and simply resolves to "not present" rather than erroring.
 
 **Behavior.** Independently checks each service's client:
 - Radarr/Sonarr: fetches the full library (`RadarrClient::library` / `SonarrClient::library`)
