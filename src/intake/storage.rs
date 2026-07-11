@@ -321,6 +321,22 @@ pub struct CodeRunRowV2 {
     /// re-derived from `file_count`. `None` for rows written before this column
     /// existed / by callers that don't set it.
     pub task_category: Option<String>,
+    // ---- MINT2-02: structured failure classification ----------------------
+    /// The queryable, structured reason this (model × case × config) cell did
+    /// not yield a full-quality result — or `Some("none")` when it DID (a clean
+    /// run). The stable snake_case `key()` of an intake-local `FailureClass`
+    /// (variant names mirror Harmony's `FailureCategory` + `non_viable_vram`;
+    /// see `code_v2.rs`). The whole point of MINT2-02: a timed-out / OOM'd /
+    /// over-VRAM-skipped cell now writes a ROW with this set (score 0) instead
+    /// of NO row — so absence-of-data and genuine-failure are distinguishable.
+    ///
+    /// `None` here writes SQL NULL, which is RESERVED to mean "a legacy /
+    /// pre-migration row": a `'v3'` write always sets this (a clean pass →
+    /// `Some("none")`, never `None`), so NULL never means "this run succeeded".
+    /// The read path (`read_code_run_failure_class`) tolerates the column being
+    /// ABSENT on an un-migrated DB — a missing column reads as `None`, never a
+    /// panic.
+    pub failure_class: Option<String>,
 }
 
 /// SQL for [`insert_code_run_v2`]. Pulled out to a const so a unit test can
@@ -336,9 +352,10 @@ const INSERT_CODE_RUN_V2_SQL: &str = "INSERT INTO code_profile_runs \
       code_quality_score, context_tokens, response_tokens, file_count, total_lines, \
       throughput_tok_per_sec, total_time_ms, oom, error, backend_tag, mem_config, case_id, \
       well_formed, sample_index, vuln_finding_count, \
-      quant, reasoning_enabled, context_window_launched, temperature, top_p, task_category, finalized) \
+      quant, reasoning_enabled, context_window_launched, temperature, top_p, task_category, \
+      failure_class, finalized) \
      VALUES ($1, 'v3', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, \
-     $24, $25, $26, $27, $28, $29, false) \
+     $24, $25, $26, $27, $28, $29, $30, false) \
      RETURNING id";
 
 /// Insert one build-scenario `code_profile_runs` row (harness_version='v3',
@@ -389,6 +406,7 @@ pub async fn insert_code_run_v2(
         .bind(row.temperature)
         .bind(row.top_p)
         .bind(row.task_category.as_deref())
+        .bind(row.failure_class.as_deref())
         .fetch_one(pool)
         .await
         .map_err(|e| ToolError::Database(format!("Failed to insert code_profile_runs (v2): {e}")))?;
@@ -622,6 +640,77 @@ pub async fn read_code_run_factors(
             } else {
                 Err(ToolError::Database(format!(
                     "Failed to read code_profile_runs factors: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// MINT2-02: read the structured failure_class back (null-tolerant)
+// ===========================================================================
+
+/// Primary `failure_class` SELECT — references the MINT2-02 column directly.
+/// Errors on an un-migrated DB where the column doesn't exist yet;
+/// [`read_code_run_failure_class`] catches that and retries the NULL-typed
+/// [`SELECT_CODE_RUN_FAILURE_CLASS_FALLBACK_SQL`].
+///
+/// Deliberately SEPARATE from the MINT2-01 factor SELECT (not folded into it):
+/// a DB migrated for MINT2-01 but NOT yet MINT2-02 must still read its real
+/// quant/reasoning/etc values — folding `failure_class` into that query would
+/// make the whole query fail on the missing column and fall back to all-NULL,
+/// wrongly nulling the factors that DO exist. Each migration's columns fall
+/// back independently.
+const SELECT_CODE_RUN_FAILURE_CLASS_SQL: &str =
+    "SELECT failure_class FROM code_profile_runs WHERE id = $1";
+
+/// Fallback `failure_class` SELECT for an UN-MIGRATED DB (the column is absent):
+/// selects a correctly-typed SQL NULL so the row still decodes into `None`
+/// instead of erroring on the missing column. Still gated on `WHERE id = $1`.
+const SELECT_CODE_RUN_FAILURE_CLASS_FALLBACK_SQL: &str =
+    "SELECT NULL::text FROM code_profile_runs WHERE id = $1";
+
+/// Read the MINT2-02 `failure_class` for one `code_profile_runs` row,
+/// tolerating an un-migrated DB. Tries [`SELECT_CODE_RUN_FAILURE_CLASS_SQL`]; if
+/// that fails specifically because the column doesn't exist yet
+/// ([`is_missing_column_error`]), retries the NULL-typed fallback so the caller
+/// gets `None` instead of an error — the harness keeps running against a DB the
+/// migration hasn't reached. A genuinely missing row (id not present) yields
+/// `None`, NOT an error. Any OTHER DB error is propagated, never masked.
+///
+/// Semantics of the returned value: `Some("none")` = a clean `'v3'` run;
+/// `Some(other)` = a classified failure; `None` = either a legacy/pre-migration
+/// row OR an un-migrated DB (the column is absent). The two `None` cases are
+/// intentionally indistinguishable HERE — both mean "no structured class was
+/// ever recorded" — which is exactly what reporting needs.
+pub async fn read_code_run_failure_class(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Option<String>, ToolError> {
+    match sqlx::query_scalar::<_, Option<String>>(SELECT_CODE_RUN_FAILURE_CLASS_SQL)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(row) => Ok(row.flatten()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_column_error(&msg) {
+                let row = sqlx::query_scalar::<_, Option<String>>(
+                    SELECT_CODE_RUN_FAILURE_CLASS_FALLBACK_SQL,
+                )
+                .bind(id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| {
+                    ToolError::Database(format!(
+                        "Failed to read code_profile_runs failure_class (fallback): {e}"
+                    ))
+                })?;
+                Ok(row.flatten())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read code_profile_runs failure_class: {msg}"
                 )))
             }
         }
@@ -1052,12 +1141,13 @@ mod tests {
     #[test]
     fn insert_code_run_v2_sql_explicitly_sets_finalized_false() {
         assert!(INSERT_CODE_RUN_V2_SQL.contains("finalized"));
-        // The last bind param ($29 = `task_category`, MINT2-01, the last of the
-        // six new measurement-factor binds $24..$29) is the final VALUES entry
-        // before the literal `false` for `finalized` — confirming the insert
-        // never falls through to the column's `DEFAULT true`.
+        // The last bind param ($30 = `failure_class`, MINT2-02) is the final
+        // VALUES entry before the literal `false` for `finalized` — confirming
+        // the insert never falls through to the column's `DEFAULT true`. ($29 =
+        // `task_category` is the last of the six MINT2-01 factor binds; $30
+        // appends the MINT2-02 failure_class immediately before `finalized`.)
         assert!(
-            INSERT_CODE_RUN_V2_SQL.contains("$28, $29, false) RETURNING id"),
+            INSERT_CODE_RUN_V2_SQL.contains("$29, $30, false) RETURNING id"),
             "expected the VALUES list to end with an explicit `false` for \
              `finalized`, got: {INSERT_CODE_RUN_V2_SQL}"
         );
@@ -1109,13 +1199,14 @@ mod tests {
     }
 
     /// The insert names `sample_index` then `vuln_finding_count`, then the six
-    /// MINT2-01 measurement-factor columns, then `finalized` last — so it never
-    /// falls through to a column default.
+    /// MINT2-01 measurement-factor columns, then the MINT2-02 `failure_class`,
+    /// then `finalized` last — so it never falls through to a column default.
     #[test]
     fn insert_code_run_v2_sql_includes_sample_index_and_vuln_count_last() {
         assert!(INSERT_CODE_RUN_V2_SQL.contains(
             "well_formed, sample_index, vuln_finding_count, \
-      quant, reasoning_enabled, context_window_launched, temperature, top_p, task_category, finalized)"
+      quant, reasoning_enabled, context_window_launched, temperature, top_p, task_category, \
+      failure_class, finalized)"
         ));
     }
 
@@ -1160,8 +1251,8 @@ mod tests {
         let vals = &sql[v_open + 1..v_close];
         let n_vals = vals.split(',').filter(|s| !s.trim().is_empty()).count();
 
-        // Sanity: placeholders run $1..$29 contiguously.
-        let max_placeholder = 29;
+        // Sanity: placeholders run $1..$30 contiguously.
+        let max_placeholder = 30;
         for n in 1..=max_placeholder {
             assert!(sql.contains(&format!("${n}")), "missing placeholder ${n}");
         }
@@ -1323,6 +1414,41 @@ mod tests {
         assert!(!is_missing_column_error("connection refused"));
         assert!(!is_missing_column_error("relation \"foo\" does not exist"));
         assert!(!is_missing_column_error("syntax error at or near \"SELECT\""));
+    }
+
+    // ---- MINT2-02: structured failure_class ----------------------------
+
+    /// The build-scenario insert names the `failure_class` column (MINT2-02),
+    /// positioned immediately before the literal `finalized`.
+    #[test]
+    fn insert_code_run_v2_sql_names_failure_class_before_finalized() {
+        assert!(INSERT_CODE_RUN_V2_SQL.contains("task_category, failure_class, finalized)"));
+    }
+
+    /// `failure_class` defaults to `None` (a writer that doesn't set it never
+    /// mislabels a row) and is settable like any other field.
+    #[test]
+    fn code_run_row_v2_failure_class_defaults_none_and_is_settable() {
+        assert_eq!(CodeRunRowV2::default().failure_class, None);
+        let row = CodeRunRowV2 {
+            failure_class: Some("non_viable_vram".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(row.failure_class.as_deref(), Some("non_viable_vram"));
+    }
+
+    /// The failure_class read path is a SEPARATE query from the MINT2-01 factor
+    /// read (so a DB migrated for MINT2-01 but not MINT2-02 keeps its real
+    /// factors), with its own NULL-typed fallback for the un-migrated schema,
+    /// still scoped by id — reusing the same missing-column detector.
+    #[test]
+    fn failure_class_select_sql_shapes() {
+        assert!(SELECT_CODE_RUN_FAILURE_CLASS_SQL.contains("SELECT failure_class"));
+        assert!(SELECT_CODE_RUN_FAILURE_CLASS_SQL.contains("WHERE id = $1"));
+        assert!(SELECT_CODE_RUN_FAILURE_CLASS_FALLBACK_SQL.contains("NULL::text"));
+        assert!(SELECT_CODE_RUN_FAILURE_CLASS_FALLBACK_SQL.contains("WHERE id = $1"));
+        // Must NOT reference the MINT2-01 factor columns — independence is the point.
+        assert!(!SELECT_CODE_RUN_FAILURE_CLASS_SQL.contains("quant"));
     }
 
     /// The fallback SELECT casts each NULL to the matching column type so the

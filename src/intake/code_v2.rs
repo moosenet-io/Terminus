@@ -550,6 +550,244 @@ pub fn task_category_from_tier(tier: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// MINT2-02: structured failure classification (kill survivorship bias)
+// ---------------------------------------------------------------------------
+
+/// Structured classification of WHY a (model × case × config) cell did not yield
+/// a full-quality result — or [`FailureClass::None`] when it did. Stored as the
+/// stable snake_case [`key`](FailureClass::key) string in
+/// `code_profile_runs.failure_class`, so absence-of-data (no row / legacy NULL)
+/// and genuine-failure are distinguishable in the data (the opposite of the
+/// pre-MINT2-02 survivorship bias, where a timed-out / OOM'd / over-VRAM-skipped
+/// cell produced NO row at all).
+///
+/// The variant NAMES deliberately MIRROR Harmony's `FailureCategory` taxonomy so
+/// the two planes speak one language — but this is an intake-LOCAL enum, NOT an
+/// import (Harmony is a separate repo; per one-project-per-repo discipline we
+/// never take a cross-repo dependency for a shared vocabulary). The one addition
+/// beyond Harmony's set is the intake-specific [`NonViableVram`](FailureClass::NonViableVram):
+/// a model skipped pre-flight because its footprint exceeds the host VRAM
+/// ceiling — a concept the build orchestrator's taxonomy has no equivalent for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureClass {
+    /// A genuinely clean run: compiled, tests passed, change was correct. This
+    /// is written as `"none"` on a `'v3'` success — NEVER left NULL (NULL is
+    /// reserved to mean "a legacy / pre-migration row").
+    None,
+    /// Output was cut off mid-generation (hit the token ceiling).
+    Truncation,
+    /// The model returned but emitted no usable/mappable code — a refusal or an
+    /// empty answer. (Mirrors Harmony's `EmptyDiff`: nothing to apply.)
+    EmptyDiff,
+    /// Model-authored tests are vacuous / self-satisfying (assert nothing real).
+    TautologicalTests,
+    /// Produced code that does not compile / parse.
+    CompilationError,
+    /// Compiles, but the tests (or the independent hidden change-behavior check)
+    /// fail.
+    TestFailure,
+    /// Rejected by a review gate.
+    ReviewRejection,
+    /// An inference / provider / toolchain error prevented a scored attempt —
+    /// including an OOM (see [`classify`](FailureClass::classify): there is no
+    /// dedicated OOM variant in the mirrored taxonomy; an OOM is the provider
+    /// failing to serve, so it maps here).
+    ProviderError,
+    /// Exhausted the retry / iteration budget without converging.
+    MaxIterations,
+    /// Inference exceeded its per-case deadline.
+    Timeout,
+    /// A pipeline phase made no forward progress (stalled).
+    PhaseStall,
+    /// A failure that did not match any of the above.
+    Unknown,
+    /// Intake-specific: skipped pre-flight because the model's footprint exceeds
+    /// the host VRAM ceiling — the cell was never attempted, but it EXISTS as a
+    /// row (score 0) instead of silently vanishing from the data.
+    NonViableVram,
+}
+
+impl FailureClass {
+    /// The stable snake_case string persisted in `code_profile_runs.failure_class`.
+    /// These strings are a DATA CONTRACT (queried by reporting / the catalog);
+    /// changing one is a schema-visible change, not a rename.
+    pub fn key(self) -> &'static str {
+        match self {
+            FailureClass::None => "none",
+            FailureClass::Truncation => "truncation",
+            FailureClass::EmptyDiff => "empty_diff",
+            FailureClass::TautologicalTests => "tautological_tests",
+            FailureClass::CompilationError => "compilation_error",
+            FailureClass::TestFailure => "test_failure",
+            FailureClass::ReviewRejection => "review_rejection",
+            FailureClass::ProviderError => "provider_error",
+            FailureClass::MaxIterations => "max_iterations",
+            FailureClass::Timeout => "timeout",
+            FailureClass::PhaseStall => "phase_stall",
+            FailureClass::Unknown => "unknown",
+            FailureClass::NonViableVram => "non_viable_vram",
+        }
+    }
+
+    /// Map a terminal case outcome to a [`FailureClass`].
+    ///
+    /// Inputs (all the signals available at a cell's true end):
+    /// - `stages`: the validator's parsed compile/tests/change stages — `Some`
+    ///   ONLY when an actual scored attempt ran (code was produced and the
+    ///   validator executed). `None` when no attempt was scored.
+    /// - `error_text`: any free-text infra/inference error recorded on the row
+    ///   (timeout message, provider error, toolchain-unavailable, …).
+    /// - `oom`: whether generation OOM'd before producing output.
+    /// - `skip_reason`: a pre-flight skip reason (over-VRAM), when the cell was
+    ///   never attempted at all.
+    ///
+    /// ## Precedence (deterministic — documented per the spec's edge case)
+    /// 1. **Pre-flight skip** wins over everything: a skipped cell was never
+    ///    even attempted, so no runtime signal can apply.
+    /// 2. **OOM before timeout.** When a run BOTH OOMs and times out, OOM wins:
+    ///    it is the EARLIER-observed cause — an OOM aborts generation
+    ///    immediately (an explicit resource verdict from the provider), whereas
+    ///    a timeout only fires after the full deadline elapses. OOM maps to
+    ///    [`ProviderError`](FailureClass::ProviderError) (the mirrored taxonomy
+    ///    has no dedicated OOM variant).
+    /// 3. **Error text** (timeout vs. other provider error) next.
+    /// 4. **Validator stages** (an actually-scored attempt) last.
+    /// 5. No signal at all after a clean return ⇒ the model produced nothing
+    ///    ([`EmptyDiff`](FailureClass::EmptyDiff)); a clean PASS is only reached
+    ///    via the all-ok stages branch above.
+    pub fn classify(
+        stages: Option<&ValidateStages>,
+        error_text: Option<&str>,
+        oom: bool,
+        skip_reason: Option<&str>,
+    ) -> FailureClass {
+        // 1. Pre-flight skip — never attempted.
+        if let Some(reason) = skip_reason {
+            if reason.to_lowercase().contains("vram") {
+                return FailureClass::NonViableVram;
+            }
+            // A skip we don't have a dedicated class for (no current caller
+            // routes a non-VRAM skip here, but never silently misreport it).
+            return FailureClass::Unknown;
+        }
+        // 2. OOM before timeout (earliest-observed cause wins).
+        if oom {
+            return FailureClass::ProviderError;
+        }
+        // 3. Infra/inference error text.
+        if let Some(err) = error_text {
+            let e = err.to_lowercase();
+            if e.contains("timed out") || e.contains("timeout") || e.contains("deadline") {
+                return FailureClass::Timeout;
+            }
+            return FailureClass::ProviderError;
+        }
+        // 4. A scored attempt: classify by the most specific failing stage.
+        if let Some(st) = stages {
+            return match st.compile {
+                // Produced code that never compiled (or never reached compile).
+                Some(false) | None => FailureClass::CompilationError,
+                Some(true) => {
+                    if st.tests == Some(false) {
+                        FailureClass::TestFailure
+                    } else if st.change == Some(false) {
+                        // Compiles + tests pass but the independent hidden
+                        // behavior check failed — the required change wasn't
+                        // actually made. Treated as a test failure (the hidden
+                        // check IS a behavior test).
+                        FailureClass::TestFailure
+                    } else {
+                        // compiles + tests + change all ok ⇒ clean.
+                        FailureClass::None
+                    }
+                }
+            };
+        }
+        // 5. Returned cleanly but produced nothing scored — refusal / empty.
+        FailureClass::EmptyDiff
+    }
+}
+
+/// Compute the [`FailureClass`] for a FINISHED per-case row from its terminal
+/// state (after any retry — the row's `compiles`/`tests_pass`/`change_correct`
+/// already reflect the better attempt). This is the single classification point
+/// for a scored/attempted case: called once per row at insert time so EVERY
+/// case row (including a timed-out or OOM'd one, which already writes a row with
+/// `error`/`oom` set) carries a structured `failure_class`.
+///
+/// An in-case row is never a pre-flight skip (that path lives in
+/// `coder_sweep.rs`), so `skip_reason` is always `None` here.
+pub fn classify_case_row(row: &CodeRunRowV2) -> FailureClass {
+    let produced = row.well_formed.unwrap_or(false);
+    let stages = ValidateStages {
+        compile: row.compiles,
+        tests: row.tests_pass,
+        change: row.change_correct,
+        toolchain_missing: None,
+    };
+    FailureClass::classify(
+        if produced { Some(&stages) } else { None },
+        row.error.as_deref(),
+        row.oom,
+        None,
+    )
+}
+
+/// MINT2-02: write a single terminal `code_profile_runs` row recording that a
+/// (model × backend × config) cell was skipped PRE-FLIGHT as non-viable (its
+/// footprint exceeds the host VRAM ceiling), instead of the cell silently
+/// vanishing from the data (survivorship bias). The row carries a fresh model
+/// identity, the backend/mem_config/quant config, score 0, the free-text
+/// `reason`, and `failure_class = "non_viable_vram"`. It is FINALIZED (a skip
+/// has no follow-up idiom-judge pass) so the gap audit never treats it as
+/// forever-incomplete.
+///
+/// DB URL resolved via the existing `config::intake_database_url()` (through
+/// `storage::get_pool()`) — no raw env, no literal DSN. Called from the coder
+/// sweep's over-VRAM skip path (via the `CoderSuiteDriver` trait so the fleet
+/// loop stays unit-testable without a DB).
+pub async fn record_non_viable_vram_row(
+    model_name: &str,
+    backend_tag: &str,
+    reason: &str,
+    mem_config: Option<&str>,
+) -> Result<(), ToolError> {
+    let pool = storage::get_pool().await?;
+    let profile_id = storage::insert_model_profile(&pool, model_name, "ollama", None, None).await?;
+    // Record the config dimension the same way a scored row would, so
+    // "this quant of this model is non-viable" is queryable.
+    let factors = MeasurementFactors::from_env(model_name);
+    let row = CodeRunRowV2 {
+        // No single language/case for a whole-model skip: this row represents
+        // the cell's NON-VIABILITY, not a scored case. Empty language + a
+        // descriptive task_type keep it self-identifying without inventing a
+        // fake case identity.
+        language: String::new(),
+        task_type: Some("non_viable_skip".into()),
+        first_pass_score: Some(0),
+        well_formed: Some(false),
+        oom: false,
+        error: Some(reason.to_string()),
+        backend_tag: Some(backend_tag.to_string()),
+        mem_config: mem_config.map(str::to_string),
+        quant: Some(factors.quant.clone()),
+        reasoning_enabled: factors.reasoning_enabled,
+        context_window_launched: factors.context_window_launched,
+        temperature: factors.temperature,
+        top_p: factors.top_p,
+        failure_class: Some(FailureClass::NonViableVram.key().to_string()),
+        ..Default::default()
+    };
+    let id = storage::insert_code_run_v2(&pool, profile_id, &row).await?;
+    // `insert_code_run_v2` always writes finalized=false (the Phase-1 insert
+    // shape); a skip row has no judge follow-up, so finalize it now (this call
+    // also stamps first_pass_score=0) — the same finalization path every scored
+    // case reaches at the end of its judge pass.
+    storage::update_code_run_v2_judge(&pool, id, None, Some(0), None).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Per-case execution (live)
 // ---------------------------------------------------------------------------
 
@@ -1156,6 +1394,13 @@ pub async fn run_code_suite_v2_cases(
             run_one_case_v2(&client, model_name, case, &dir, backend_tag, mem_config, &factors)
                 .await;
         cr.row.sample_index = sample_index;
+        // MINT2-02: stamp the structured failure_class from this case's terminal
+        // state BEFORE persisting the row (a clean run → "none", never NULL;
+        // a timeout/OOM/no-code case still writes a row, now with a queryable
+        // class instead of only free-text `error`). The retry (if any) has
+        // already run inside `run_one_case_v2`, so the row's compile/test/change
+        // fields are final here.
+        cr.row.failure_class = Some(classify_case_row(&cr.row).key().to_string());
         let id = storage::insert_code_run_v2(&pool, profile_id, &cr.row).await?;
         row_ids.push(id);
         pending.push(cr);
@@ -1961,5 +2206,160 @@ mod tests {
         ] {
             std::env::remove_var(k);
         }
+    }
+
+    // ---- MINT2-02: structured failure classification -------------------
+
+    /// Every variant's `key()` is the exact stable snake_case string stored in
+    /// the DB — this is the data contract with reporting/the catalog and with
+    /// the migration's documented enum values, so it is asserted explicitly.
+    #[test]
+    fn failure_class_keys_are_stable_snake_case() {
+        assert_eq!(FailureClass::None.key(), "none");
+        assert_eq!(FailureClass::Truncation.key(), "truncation");
+        assert_eq!(FailureClass::EmptyDiff.key(), "empty_diff");
+        assert_eq!(FailureClass::TautologicalTests.key(), "tautological_tests");
+        assert_eq!(FailureClass::CompilationError.key(), "compilation_error");
+        assert_eq!(FailureClass::TestFailure.key(), "test_failure");
+        assert_eq!(FailureClass::ReviewRejection.key(), "review_rejection");
+        assert_eq!(FailureClass::ProviderError.key(), "provider_error");
+        assert_eq!(FailureClass::MaxIterations.key(), "max_iterations");
+        assert_eq!(FailureClass::Timeout.key(), "timeout");
+        assert_eq!(FailureClass::PhaseStall.key(), "phase_stall");
+        assert_eq!(FailureClass::Unknown.key(), "unknown");
+        assert_eq!(FailureClass::NonViableVram.key(), "non_viable_vram");
+    }
+
+    fn stages(compile: Option<bool>, tests: Option<bool>, change: Option<bool>) -> ValidateStages {
+        ValidateStages { compile, tests, change, toolchain_missing: None }
+    }
+
+    /// A genuinely clean run (compiles + tests + change all ok) → `None`/"none",
+    /// NEVER null-on-success (null is reserved for legacy rows).
+    #[test]
+    fn classify_clean_pass_is_none() {
+        let s = stages(Some(true), Some(true), Some(true));
+        assert_eq!(FailureClass::classify(Some(&s), None, false, None), FailureClass::None);
+        assert_eq!(FailureClass::classify(Some(&s), None, false, None).key(), "none");
+    }
+
+    /// A produced-but-doesn't-compile attempt → compilation_error.
+    #[test]
+    fn classify_compile_fail_is_compilation_error() {
+        let s = stages(Some(false), None, None);
+        assert_eq!(
+            FailureClass::classify(Some(&s), None, false, None),
+            FailureClass::CompilationError
+        );
+    }
+
+    /// Compiles but tests fail → test_failure; compiles + tests ok but the
+    /// hidden change-behavior check fails is ALSO test_failure (that check is a
+    /// behavior test).
+    #[test]
+    fn classify_test_and_change_fail_are_test_failure() {
+        let tests_fail = stages(Some(true), Some(false), Some(false));
+        assert_eq!(
+            FailureClass::classify(Some(&tests_fail), None, false, None),
+            FailureClass::TestFailure
+        );
+        let change_fail = stages(Some(true), Some(true), Some(false));
+        assert_eq!(
+            FailureClass::classify(Some(&change_fail), None, false, None),
+            FailureClass::TestFailure
+        );
+    }
+
+    /// A timeout error text → timeout (matched case-insensitively, several
+    /// phrasings).
+    #[test]
+    fn classify_timeout_from_error_text() {
+        for msg in ["operation timed out", "request TIMEOUT", "deadline exceeded"] {
+            assert_eq!(
+                FailureClass::classify(None, Some(msg), false, None),
+                FailureClass::Timeout,
+                "msg={msg}"
+            );
+        }
+    }
+
+    /// A non-timeout infra/inference error → provider_error.
+    #[test]
+    fn classify_other_error_is_provider_error() {
+        assert_eq!(
+            FailureClass::classify(None, Some("connection refused"), false, None),
+            FailureClass::ProviderError
+        );
+        assert_eq!(
+            FailureClass::classify(None, Some("toolchain unavailable: rust (needs cargo)"), false, None),
+            FailureClass::ProviderError
+        );
+    }
+
+    /// OOM → provider_error, and OOM takes precedence over a concurrent timeout
+    /// (earliest-observed cause wins — the documented precedence).
+    #[test]
+    fn classify_oom_maps_to_provider_error_and_beats_timeout() {
+        assert_eq!(FailureClass::classify(None, None, true, None), FailureClass::ProviderError);
+        // Both OOM and a timeout error text present → OOM wins.
+        assert_eq!(
+            FailureClass::classify(None, Some("operation timed out"), true, None),
+            FailureClass::ProviderError
+        );
+    }
+
+    /// A pre-flight over-VRAM skip → non_viable_vram, and it wins over every
+    /// runtime signal (a skipped cell was never attempted).
+    #[test]
+    fn classify_non_viable_vram_skip_wins() {
+        let reason = "over VRAM ceiling on GPU (131GB footprint > 96GB ceiling)";
+        assert_eq!(
+            FailureClass::classify(None, None, false, Some(reason)),
+            FailureClass::NonViableVram
+        );
+        // Even if a stray runtime signal is also present, the skip dominates.
+        assert_eq!(
+            FailureClass::classify(None, Some("operation timed out"), true, Some(reason)),
+            FailureClass::NonViableVram
+        );
+    }
+
+    /// A refusal / empty output (returned cleanly, produced nothing scored) →
+    /// empty_diff.
+    #[test]
+    fn classify_no_code_is_empty_diff() {
+        assert_eq!(FailureClass::classify(None, None, false, None), FailureClass::EmptyDiff);
+    }
+
+    /// The row-level helper reflects the row's terminal state: a clean row →
+    /// "none"; a no-code row (well_formed=false) → empty_diff; an OOM row →
+    /// provider_error; a compile-fail row → compilation_error.
+    #[test]
+    fn classify_case_row_reads_terminal_state() {
+        let clean = CodeRunRowV2 {
+            well_formed: Some(true),
+            compiles: Some(true),
+            tests_pass: Some(true),
+            change_correct: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(classify_case_row(&clean), FailureClass::None);
+
+        let no_code = CodeRunRowV2 { well_formed: Some(false), ..Default::default() };
+        assert_eq!(classify_case_row(&no_code), FailureClass::EmptyDiff);
+
+        let oomed = CodeRunRowV2 {
+            oom: true,
+            error: Some("OOM".into()),
+            ..Default::default()
+        };
+        assert_eq!(classify_case_row(&oomed), FailureClass::ProviderError);
+
+        let compile_fail = CodeRunRowV2 {
+            well_formed: Some(true),
+            compiles: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(classify_case_row(&compile_fail), FailureClass::CompilationError);
     }
 }
