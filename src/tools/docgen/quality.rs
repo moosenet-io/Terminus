@@ -192,7 +192,7 @@ fn check_banned_words(text: &str, config: &ProseLintConfig, issues: &mut Vec<Lin
 
     for banned in &config.banned_words {
         let needle = banned.to_lowercase();
-        if tokens.iter().any(|t| *t == needle) {
+        if tokens.contains(&needle) {
             issues.push(LintIssue {
                 rule: "banned-word".to_string(),
                 message: format!("banned word '{banned}' found -- rewrite without hedge language"),
