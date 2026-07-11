@@ -129,12 +129,61 @@ is provisioned on a build host.
 }
 ```
 
-**DOCGEN-08 trigger wiring:** DOCGEN-08 (the post-feat build-skill trigger)
-has not shipped yet. This item exposes the API DOCGEN-08 will call once it
-lands, rather than wiring an automatic trigger that doesn't exist yet —
-tracked as a follow-up on DOCGEN-08 itself.
+## `docgen_run` — the build-skill trigger (DOCGEN-08, Plane TERM-150)
+
+The post-feat doc stage: the single orchestration entry point the build
+skill calls after a feat merges + verifies. It assembles the shipped engine
+pieces above into one flow and returns versioned artifacts — it does not
+place them anywhere. Lives at `src/tools/docgen/trigger.rs`; the pure
+orchestration function is `run_docgen_trigger` (`docgen_run` is its
+`RustTool` wrapper, holding its own `versioning::VersionStore` instance).
+
+**Flow:** opt-in gate → PII sweep (`pii_gate::sweep_input`, DOCGEN-02) →
+generate via Chord (`generate::generate_docs`, DOCGEN-05) → render every
+declared target (`render::render_all`, DOCGEN-06) → version each rendered
+artifact (`versioning::VersionStore::store_version`, DOCGEN-07) → return the
+versioned artifacts to the caller.
+
+- **Opt-in per project, like `mirror_ready`.** A project with no
+  `project_config` (or an empty/absent `targets` list) is not considered
+  onboarded to this stage: the engine is never invoked and the call reports
+  `"outcome": "skipped"`. This is a stricter gate than `config.rs`'s own
+  README-only default — that default only applies once a project HAS
+  opted in with at least one declared target.
+- **Non-blocking to the feat.** The underlying `run_docgen_trigger` function
+  has no `Result`/`Err` in its signature at all — a config, PII-sweep, or
+  Chord-generation failure is folded into a normal `"outcome": "failed"`
+  response value, never propagated as an error a caller would need to treat
+  as "the feat failed." A feat merges and verifies independently of whether
+  its doc-gen stage succeeded.
+- **`GenerationOutcome::NoChange` / `::Flagged` complete cleanly** with no
+  render or version step — matching DOCGEN-05's "don't fabricate a version"
+  edge case.
+- **Artifacts only.** Exactly like `render_all`, this tool never writes to a
+  filesystem, repo, or hosting surface — placing a returned artifact is the
+  calling harness's job.
+
+```json
+{
+  "name": "docgen_run",
+  "arguments": {
+    "spec_id": "S95-documentation-engine",
+    "project": "TERM",
+    "module_path": "src/tools/docgen",
+    "git_ref": "237b14b",
+    "feat_context": "the merged diff/spec/code describing what this feat changed",
+    "existing_docs": "# terminus-rs docgen module\n\n...",
+    "project_config": { "targets": [{ "type": "readme" }] },
+    "available_credential_keys": []
+  }
+}
+```
+
+See the skill's build pipeline (Stage 7c) for how this is invoked in
+sequence after Stage 7 verify and before Stage 7d mirror.
 
 ## What's NOT here yet
 
-- The build-skill post-feat trigger (DOCGEN-08) that automatically invokes
-  changelog generation (and the rest of docgen) after every merged feat.
+- Full multi-target rendering coverage beyond what DOCGEN-06 already ships
+  (`readme`/`wiki`/`pdf`/`notion`/`obsidian`/`blog` all render today; future
+  items may add further formats).

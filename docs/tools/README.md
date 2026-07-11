@@ -104,7 +104,7 @@ and documentation generation.
 | `openhands` | ~3 | Drives the OpenHands agentic-coding runtime over its HTTP API (run task, list conversations, get status). | [`code-git/openhands.md`](code-git/openhands.md) |
 | `cortex` | ~10 | Code-graph / blast-radius / risk-scoring system — architecture, dependency, and review-flow analysis over a repo. | [`code-git/cortex.md`](code-git/cortex.md) |
 | `scribe` | ~5 | Standing documentation agent — generates READMEs, wikis, and other knowledge-infrastructure artifacts from a repo. | [`code-git/scribe.md`](code-git/scribe.md) |
-| `docgen` | 1 | **Scaffold (DOCGEN-01, S95).** The sovereign, in-house documentation engine (replacing Mintlify): a per-project doc-target config schema (readme/wiki/pdf/notion/obsidian/blog) plus `docgen_status`, a read-only config-inspection tool. No generation/render/versioning yet — those land in later DOCGEN items. | [`code-git/docgen.md`](code-git/docgen.md) |
+| `docgen` | ~5 | **S95.** The sovereign, in-house documentation engine (replacing Mintlify): per-project doc-target config (readme/wiki/pdf/notion/obsidian/blog), PII-swept generation via Chord's SLM router, multi-format rendering, versioning, and `docgen_run` — the post-feat build-skill trigger (DOCGEN-08) that runs the whole flow and returns versioned artifacts for the harness to place. | [`code-git/docgen.md`](code-git/docgen.md) |
 
 ### Project & Planning — 7 tools
 
