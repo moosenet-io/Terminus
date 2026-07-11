@@ -173,7 +173,7 @@ from the current production database, alongside `context_profile_runs`.
 
 The busiest table in the subsystem — one row per measured code case, from either the v1
 one-shot harness or the v2 realistic build-scenario harness (`harness_version` distinguishes
-them; v1 rows leave it unset/NULL, v2 rows always write `'v2'`). The table itself pre-exists
+them; v1 rows leave it unset/NULL, the build-scenario harness now writes `'v3'` — historical build-scenario rows wrote `'v2'`). The table itself pre-exists
 (never `CREATE TABLE`d here), but `assistant::schema::migrate_locked` runs a series of
 `ALTER TABLE code_profile_runs ADD COLUMN IF NOT EXISTS` statements (`src/intake/assistant/schema.rs:275-391`)
 that this file is the source of truth for.
@@ -190,7 +190,7 @@ that this file is the source of truth for.
 | `total_time_ms`, `memory_usage_mb` | `INTEGER`, nullable | pre-existing | |
 | `oom` | `BOOLEAN` | pre-existing | |
 | `error` | — nullable | pre-existing | |
-| `harness_version` | — | pre-existing | v2 rows: literal `'v2'`. v1 rows: never set by `insert_code_run`. |
+| `harness_version` | — | pre-existing | build-scenario rows: literal `'v3'` (historical rows: `'v2'`). v1 rows: never set by `insert_code_run`. |
 | `first_pass_score`, `retry_score` | `INTEGER`, nullable | pre-existing (v2 columns) | Graduated 0-5 quality; `retry_score` only populated when `first_pass_score` was 1-2. |
 | `change_correct` | `BOOLEAN`, nullable | pre-existing (v2) | Independent change-present/behavior check. |
 | `response_tokens` | `INTEGER`, nullable | pre-existing (v2) | |
@@ -208,7 +208,7 @@ by a unit test asserting the SQL constant's literal tail, `src/intake/storage.rs
 `893-905`); `storage::update_code_run_v2_judge` (v2 Phase 2 patch, always sets `finalized = true`
 unconditionally and errors unless exactly one row was affected — `src/intake/storage.rs:360-417`);
 `storage::delete_unfinalized_code_runs_v2` (startup reconciliation of orphaned unfinalized rows
-from a crashed prior attempt, scoped to `(model_name, backend_tag, mem_config, harness_version='v2',
+from a crashed prior attempt, scoped to `(model_name, backend_tag, mem_config, harness_version='v3',
 finalized=false)` — `src/intake/storage.rs:431-469`).
 
 ### `assistant_profile_run` (S84, owned)
