@@ -32,6 +32,7 @@ pub mod coder_case;
 pub mod coder_gaps;
 pub mod coder_sweep;
 mod context;
+pub mod discovery;
 pub mod gpu_authority;
 pub mod infer;
 pub mod lifecycle;
