@@ -20,6 +20,7 @@ judgment call.
 | `agy` | `review-daemon` over loopback HTTP | CLI-backed |
 | `nemotron` | direct to OpenRouter `chat/completions` | `nvidia/nemotron-3-ultra-550b-a55b:free` — 550B total params, 1M context, re-confirmed live free-tier (`src/review/dispatch.rs:19-24`) |
 | `qwen_coder` | direct to OpenRouter `chat/completions` | `qwen/qwen3-coder:free` — 480B total params, 1M context, code-specialized (`src/review/dispatch.rs:25-32`) |
+| `free` | daily-curated OpenRouter free-model **pool**, round-robin + 429 failover | seamless free tier — see [The `free` provider](#the-free-provider) below (`src/review/free_pool.rs`) |
 
 `opus`/`codex`/`agy` are reached via the `review-daemon` binary
 (`src/bin/review_daemon/`) — per `src/tool.rs`'s no-subprocess-in-tool
@@ -32,13 +33,44 @@ established by [`dgem`](dgem.md).
 model no longer exists on OpenRouter at all (no free-tier deepseek model
 remains), so `qwen_coder` replaced that slot.
 
+### The `free` provider
+
+`nemotron`/`qwen_coder` pin ONE free model each, so a per-model OpenRouter free-tier
+throttle (a persistent HTTP 429 on a popular model like `qwen/qwen3-coder:free`) makes
+that slot unusable. The `free` provider fixes this by drawing from a **pool** instead:
+
+- **Daily scan (24h lazy TTL).** On first use after the TTL, `free_pool` fetches
+  OpenRouter's public, unauthenticated `/models` catalog and `curate()`s it to a
+  high-quality subset: free (`pricing` 0/0), text-emitting, `context_length ≥ 32k`, and
+  matching a maintainable family allowlist (qwen3-coder/next, nemotron ultra/super/nano-30b,
+  gemma-4, gpt-oss, llama-3.3-70b, hermes-405b, north-code, deepseek, …). Capped and sorted
+  by context.
+- **Round-robin + 429 failover.** Each `free` dispatch picks the next non-cooling model; on a
+  429 it marks that model in a short cooldown and rotates to the next — so a free review lands
+  on whatever pooled model still has quota. The pool (round-robin cursor + cooldowns + refresh
+  time) is process-global, shared across `review_run` calls.
+- **Degrades cleanly:** no key → `unavailable`; catalog unreachable → keep the last-good pool;
+  every model cooling down → a clear `"all free-tier models are rate-limited"` (never a hang or
+  panic).
+
+Intended use is as the **tail of a 3–5 provider panel**: sub/OAuth providers first
+(`opus`/`codex`/`agy`), then one or more `free` slots (multiple `free` entries round-robin to
+distinct models, adding panel diversity at $0).
+
 ### Config (env)
 
 | Env var | Purpose | Default |
 |---|---|---|
 | `REVIEW_DAEMON_URL` | review-daemon base URL | `http://127.0.0.1:8790` |
 | `REVIEW_DAEMON_TOKEN` | Bearer token matching the daemon's own config | none — unset degrades `opus`/`codex`/`agy` to `"unavailable: REVIEW_DAEMON_TOKEN not configured"` |
-| `OPENROUTER_API_KEY` | OpenRouter key | none — unset degrades `nemotron`/`qwen_coder` similarly |
+| `OPENROUTER_API_KEY` | OpenRouter key | none — unset degrades `nemotron`/`qwen_coder`/`free` similarly |
+| `FREE_POOL_MIN_CONTEXT` | min `context_length` to pool a free model | `32768` |
+| `FREE_POOL_MAX_SIZE` | cap on pool size | `12` |
+| `FREE_POOL_COOLDOWN_SECS` | per-model cooldown after a 429 | `600` |
+| `FREE_POOL_TTL_SECS` | daily catalog refresh interval | `86400` |
+| `FREE_POOL_FAMILIES` | comma-separated id-substring allowlist override | built-in list |
+| `FREE_POOL_MODELS_URL` | OpenRouter model-catalog URL to scan | `https://openrouter.ai/api/v1/models` |
+| `OPENROUTER_CHAT_URL` | OpenRouter chat-completions endpoint (also used by `nemotron`/`qwen_coder`) | `https://openrouter.ai/api/v1/chat/completions` |
 
 `ReviewConfig::from_env()` (`src/review/dispatch.rs:47-63`) trims and
 strips a trailing slash from the daemon URL.

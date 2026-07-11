@@ -36,6 +36,7 @@ mod aggregate;
 // table a second time -- one source of truth for "which providers go
 // through the daemon vs. OpenRouter", not two.
 pub(crate) mod dispatch;
+pub(crate) mod free_pool;
 mod kg_context;
 mod prompt;
 
@@ -53,7 +54,7 @@ pub use aggregate::{aggregate, ProviderResult};
 pub use dispatch::ReviewConfig;
 pub use prompt::{build_docs_prompt, build_prompt, parse_verdict, Role, Structure};
 
-const ALLOWED_PROVIDERS: &[&str] = &["opus", "codex", "agy", "nemotron", "qwen_coder"];
+const ALLOWED_PROVIDERS: &[&str] = &["opus", "codex", "agy", "nemotron", "qwen_coder", "free"];
 const MAX_PROVIDERS: usize = 5;
 
 /// KGREV-02: process-wide set of `project_id`s with an in-flight KG rebuild.
@@ -281,6 +282,11 @@ fn role_for(structure: Structure, index: usize) -> Role {
 async fn run_one_provider(cfg: ReviewConfig, provider: String, prompt_text: String) -> ProviderResult {
     let raw = if dispatch::is_daemon_provider(&provider) {
         cfg.dispatch_daemon(&provider, &prompt_text).await
+    } else if provider == "free" {
+        // Seamless free-tier: round-robin the daily-curated free-model pool
+        // with 429 failover (see free_pool). Used as the tail of a 3-5 provider
+        // panel, after the sub/OAuth providers.
+        cfg.dispatch_free_pool(&prompt_text).await
     } else if let Some(model) = dispatch::openrouter_model_for(&provider) {
         cfg.dispatch_openrouter(model, &prompt_text).await
     } else {
