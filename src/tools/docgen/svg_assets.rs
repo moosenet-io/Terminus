@@ -547,7 +547,7 @@ mod tests {
         // Re-scan with the canonical scanner, but assert on the specific
         // load-bearing category (`private_ip`) rather than "zero violations
         // of any kind": the SVG's own structural markup (e.g.
-        // `viewBox="0 0 1200 630"`, a run of digits separated by spaces)
+        // a viewBox's numeric coordinate run, digits separated by spaces)
         // incidentally trips the unrelated `phone` heuristic
         // (`phone_match_is_phone_shaped`'s "has internal separator" rule) --
         // that's a property of any SVG with numeric attributes, not evidence
