@@ -133,6 +133,74 @@ async fn maybe_rebuild(aggregate_verdict: &str, complete: bool, context: &Value)
     // `_guard` drops here, releasing the lock on every path above.
 }
 
+/// KGREV-03 post-rebuild hook: on a successful, complete review pass whose
+/// `context` also carries doc params (`project` + `spec_id`, required;
+/// `module_path` / `git_ref` / `project_config`, optional), drive a doc
+/// refresh through the ONE sanctioned doc-generation door -- `docgen_run`
+/// (`crate::tools::docgen::trigger::DocgenRun`), called in-process via its
+/// `RustTool::execute_structured`. Must run AFTER [`maybe_rebuild`] so the
+/// doc engine sees the freshly-rebuilt graph/state. Always returns a
+/// `scribe_docs` value to merge into the tool result -- never propagates a
+/// docgen error (the review already passed; a doc-gen failure is reported,
+/// not fatal). Most reviews won't supply doc params at all; this wire only
+/// fires for real merge-time reviews that do (S9: no ad-hoc doc path).
+async fn maybe_scribe_docs(aggregate_verdict: &str, complete: bool, context: &Value) -> Value {
+    if aggregate_verdict != "APPROVE" || !complete {
+        return json!({"ran": false, "reason": "not an approved pass"});
+    }
+    let Some(project) = context.get("project").and_then(|v| v.as_str()).map(|s| s.to_string()) else {
+        return json!({"ran": false, "reason": "no doc params"});
+    };
+    let Some(spec_id) = context.get("spec_id").and_then(|v| v.as_str()).map(|s| s.to_string()) else {
+        return json!({"ran": false, "reason": "no doc params"});
+    };
+
+    // `docgen_run` requires non-empty `module_path`/`git_ref`; a review's
+    // context may not carry either, so fall back to inert placeholders
+    // rather than failing the doc wire outright -- `docgen_run` itself is
+    // opt-in per project (no `project_config` -> clean `Skipped`), so an
+    // unspecified module/ref never causes a spurious doc generation.
+    let module_path = context.get("module_path").and_then(|v| v.as_str()).unwrap_or(".").to_string();
+    let git_ref = context.get("git_ref").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+    let feat_context = context.get("diff").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+
+    let mut docgen_args = json!({
+        "spec_id": spec_id,
+        "project": project,
+        "module_path": module_path,
+        "git_ref": git_ref,
+        "feat_context": feat_context,
+    });
+    if let Some(project_config) = context.get("project_config") {
+        docgen_args["project_config"] = project_config.clone();
+    }
+
+    // The ONLY doc-generation door: the existing `docgen_run` tool, called
+    // in-process. No direct doc-gen HTTP/Chord call is made here (S9).
+    match crate::tools::docgen::trigger::DocgenRun::default().execute_structured(docgen_args).await {
+        Ok(out) => match serde_json::from_str::<Value>(&out.text) {
+            Ok(parsed) => {
+                let mut result = json!({"ran": true});
+                if let Some(map) = result.as_object_mut() {
+                    if let Some(outcome) = parsed.get("outcome") {
+                        map.insert("outcome".to_string(), outcome.clone());
+                    }
+                    map.insert("docgen".to_string(), parsed);
+                }
+                result
+            }
+            Err(e) => {
+                tracing::warn!("KGREV-03: docgen_run for '{project}' returned non-JSON output: {e}");
+                json!({"ran": true, "ok": false, "error": e.to_string()})
+            }
+        },
+        Err(e) => {
+            tracing::warn!("KGREV-03: docgen_run failed for '{project}': {e}");
+            json!({"ran": true, "ok": false, "error": e.to_string()})
+        }
+    }
+}
+
 pub struct ReviewRun;
 
 impl ReviewRun {
@@ -366,12 +434,18 @@ than failing the whole call."
         // `maybe_rebuild` for the lock semantics.
         let kg_rebuild = maybe_rebuild(&aggregate_verdict, complete, &context).await;
 
+        // KGREV-03: after the KG rebuild (so docs see the refreshed graph),
+        // best-effort doc refresh through the sanctioned `docgen_run` door;
+        // see `maybe_scribe_docs` for the gating/S9 rationale.
+        let scribe_docs = maybe_scribe_docs(&aggregate_verdict, complete, &context).await;
+
         Ok(json!({
             "structure": args["structure"],
             "providers": results,
             "aggregate_verdict": aggregate_verdict,
             "complete": complete,
             "kg_rebuild": kg_rebuild,
+            "scribe_docs": scribe_docs,
         })
         .to_string())
     }
@@ -575,5 +649,73 @@ mod tests {
         assert_eq!(parsed["locked"], Value::Null, "{parsed}");
         assert_eq!(parsed["providers"].as_array().unwrap().len(), 1, "{parsed}");
         assert_eq!(parsed["kg_rebuild"]["ran"], false, "{parsed}");
+    }
+
+    // -- KGREV-03: scribe_docs wiring ----------------------------------------
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn approve_with_doc_params_runs_docgen() {
+        // No project_config -> docgen_run's own opt-in gate skips cleanly
+        // before touching Chord; no doc-target credentials/backend needed.
+        let context = json!({
+            "project": "TERM",
+            "spec_id": "S112-review-kg-integration",
+            "diff": "+ fn hello() {}",
+        });
+        let scribe_docs = maybe_scribe_docs("APPROVE", true, &context).await;
+
+        assert_eq!(scribe_docs["ran"], true, "{scribe_docs}");
+        let outcome = scribe_docs["outcome"].as_str().unwrap_or_default();
+        assert!(
+            outcome == "failed" || outcome == "skipped",
+            "expected outcome failed|skipped, got {scribe_docs}"
+        );
+
+        // The overall review result stays Ok and the verdict is unaffected.
+        std::env::remove_var("REVIEW_DAEMON_TOKEN");
+        std::env::remove_var("OPENROUTER_API_KEY");
+        let args = json!({
+            "structure": "single",
+            "providers": ["opus"],
+            "criteria": "x",
+            "context": {
+                "diff": "+ fn hello() {}",
+                "project": "TERM",
+                "spec_id": "S112-review-kg-integration",
+            }
+        });
+        let out = tool().execute(args).await.unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        // With no REVIEW_DAEMON_TOKEN configured, the single provider
+        // degrades to UNKNOWN/incomplete, so `maybe_scribe_docs`'s APPROVE
+        // gate is correctly never reached from the full `execute()` path --
+        // this just confirms `execute()` stays Ok end-to-end with the new
+        // `scribe_docs` field always present in the result shape.
+        assert_eq!(parsed["scribe_docs"]["ran"], false, "{parsed}");
+        assert!(parsed["aggregate_verdict"].is_string(), "{parsed}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn approve_without_doc_params_skips_docgen() {
+        let context = json!({"diff": "+ fn x() {}"});
+        let scribe_docs = maybe_scribe_docs("APPROVE", true, &context).await;
+        assert_eq!(scribe_docs["ran"], false, "{scribe_docs}");
+        assert_eq!(scribe_docs["reason"], "no doc params", "{scribe_docs}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn non_approve_skips_docgen() {
+        let context = json!({
+            "project": "TERM",
+            "spec_id": "S112-review-kg-integration",
+        });
+        let scribe_docs = maybe_scribe_docs("REQUEST_CHANGES", true, &context).await;
+        assert_eq!(scribe_docs["ran"], false, "{scribe_docs}");
+
+        let scribe_docs = maybe_scribe_docs("UNKNOWN", false, &context).await;
+        assert_eq!(scribe_docs["ran"], false, "{scribe_docs}");
     }
 }

@@ -544,6 +544,43 @@ the aggregate verdict. Every `review_run` result now includes `kg_rebuild`:
 | `{"ran": true, "ok": true, "nodes": …, "edges": …, "clusters": …, "mode": "incremental"}` | Rebuild succeeded. |
 | `{"ran": true, "ok": false, "error": "..."}` | Rebuild failed; review verdict is unaffected. |
 
+### `review_run` refreshes docs through the SCRIBE door on pass (KGREV-03)
+
+When a dispatched review's aggregate verdict is `APPROVE` and `complete`, and
+`context` also carries both `project` and `spec_id`, `review_run` drives a doc
+refresh through the ONE sanctioned doc-generation door — the existing
+`docgen_run` tool (`crate::tools::docgen::trigger::DocgenRun`), called
+in-process. This runs **after** the KGREV-02 rebuild above, so the doc engine
+sees the just-refreshed Atlas graph.
+
+| Context key | Type | Purpose |
+| --- | --- | --- |
+| `project` | string | Passed through to `docgen_run` as `project`. Required (with `spec_id`) to trigger a doc refresh at all. |
+| `spec_id` | string | Passed through to `docgen_run` as `spec_id`. Required (with `project`). |
+| `git_ref` | string, optional | Passed through to `docgen_run` as `git_ref`. Defaults to `"unknown"` if omitted. |
+| `module_path` | string, optional | Passed through to `docgen_run` as `module_path`. Defaults to `"."` if omitted. |
+| `project_config` | object, optional | Passed through to `docgen_run` as `project_config` (the project's doc-target config). Omitting it means `docgen_run`'s own opt-in gate skips cleanly — no doc-target config declared. |
+| `diff` | string, optional | Passed through to `docgen_run` as the unswept `feat_context` (`docgen_run` runs its own PII sweep before anything else touches it). |
+
+If `project`/`spec_id` are absent, this is a no-op — most reviews won't supply
+doc params; the wire only fires for real merge-time reviews that do. The doc
+refresh is entirely non-blocking to the review result: `docgen_run` is
+already structurally non-blocking (an internal doc-gen failure surfaces as
+`outcome: "failed"`, never a tool error), and any unexpected error calling it
+is caught, logged, and reported rather than propagated — it never turns an
+`APPROVE` into a tool error or changes the aggregate verdict. Every
+`review_run` result now includes `scribe_docs`:
+
+| Shape | Meaning |
+| --- | --- |
+| `{"ran": false, "reason": "not an approved pass"}` | Not an approved+complete pass. |
+| `{"ran": false, "reason": "no doc params"}` | `project`/`spec_id` missing — no `docgen_run` call. |
+| `{"ran": true, "outcome": "skipped"\|"completed"\|"failed", "docgen": {...}}` | `docgen_run` was called; `docgen` carries its full structured result. |
+| `{"ran": true, "ok": false, "error": "..."}` | Calling `docgen_run` itself errored unexpectedly; review verdict is unaffected. |
+
+No direct doc-generation HTTP/Chord call is made from `review_run` — the only
+doc path is the existing `docgen_run` tool (S9 single door).
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
