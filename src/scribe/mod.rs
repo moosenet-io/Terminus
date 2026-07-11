@@ -102,6 +102,10 @@ pub struct ScribeConfig {
     /// surfaced in Scribe's own output rather than silently lost, with a
     /// retry-later marker"). Not a secret -- a filesystem path.
     pub pending_queue_path: String,
+    /// Root directory for Atlas per-project knowledge graphs (KGRAPH-03): one
+    /// `{project_slug}.json` per project. Not a secret -- a filesystem path,
+    /// same convention as `worktree_root` / `vault_local_dir`.
+    pub kg_store_dir: String,
 }
 
 impl ScribeConfig {
@@ -161,6 +165,16 @@ impl ScribeConfig {
                     .to_string_lossy()
                     .to_string()
             });
+        let kg_store_dir = std::env::var("SCRIBE_KG_STORE_DIR")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                std::env::temp_dir()
+                    .join("scribe-knowledge-graphs")
+                    .to_string_lossy()
+                    .to_string()
+            });
 
         Self {
             worktree_root,
@@ -171,6 +185,7 @@ impl ScribeConfig {
             vault_local_dir,
             allow_subprocess_vault_write,
             pending_queue_path,
+            kg_store_dir,
         }
     }
 }
@@ -987,6 +1002,10 @@ mod tests {
             allow_subprocess_vault_write: false,
             pending_queue_path: std::env::temp_dir()
                 .join("scribe-pending-discrepancies.jsonl")
+                .to_string_lossy()
+                .to_string(),
+            kg_store_dir: std::env::temp_dir()
+                .join("scribe-knowledge-graphs")
                 .to_string_lossy()
                 .to_string(),
         };
