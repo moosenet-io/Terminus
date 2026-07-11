@@ -115,6 +115,25 @@ impl UpstreamServer {
 pub struct ResolvedSecret(String);
 
 impl ResolvedSecret {
+    /// Wrap an already-resolved secret VALUE. Deliberately `pub(crate)`, not
+    /// `pub`: this type's whole point is "the only way to get one of these is
+    /// to have already done a sanctioned secret read" (this module's own
+    /// [`UpstreamServer::resolve_secret`], or — MESH-04 —
+    /// `crate::mesh::tailnet`'s `TERMINUS_TSNET_AUTHKEY` env read; see that
+    /// module's doc). A `pub` constructor would let any caller wrap an
+    /// arbitrary string and claim it's a resolved secret, defeating the
+    /// invariant the rest of this crate relies on when reasoning about where
+    /// secret values can leak from.
+    // Only called today from `crate::mesh::tailnet`, which is itself
+    // compiled ONLY under the `tsnet` feature -- `allow(dead_code)` on a
+    // default build (feature off) rather than a spurious "never
+    // constructed" warning on a perfectly intentional, currently
+    // single-caller constructor.
+    #[cfg_attr(not(feature = "tsnet"), allow(dead_code))]
+    pub(crate) fn new(value: String) -> Self {
+        Self(value)
+    }
+
     /// Explicit, deliberately-named accessor for the underlying credential
     /// value — named `expose` (rather than e.g. `AsRef`/`Deref`) so every
     /// call site reads as an intentional secret access, not an accident.

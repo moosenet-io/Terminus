@@ -37,3 +37,13 @@ pub mod registry;
 pub use registry::{
     MeshConfigError, ResolvedSecret, UpstreamRegistry, UpstreamServer, UpstreamTransport,
 };
+
+/// MESH-04 — embed tsnet so the gateway is its own tailnet node. Compiled
+/// ONLY under the `tsnet` Cargo feature (off by default; see `Cargo.toml`'s
+/// comment on the optional `tsnet` dependency) — a default `cargo build`
+/// never sees this module's code at all, so it can never pull in the
+/// tailscale C library or fail to build on a host lacking it. See
+/// `tailnet`'s own module doc for the full design (binding choice, config
+/// surface, WhoIs scope boundary with MESH-05).
+#[cfg(feature = "tsnet")]
+pub mod tailnet;

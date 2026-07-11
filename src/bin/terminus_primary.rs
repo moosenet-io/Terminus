@@ -107,6 +107,20 @@
 //!   cut off — see `crate::config`'s "TGW-03" section and
 //!   `terminus_rs::inference_proxy`'s module doc.
 
+//!
+//! ## MESH-04 update — optional embedded-tailnet listener
+//! When compiled with the `tsnet` Cargo feature AND
+//! `TERMINUS_MESH_TAILNET_ENABLED` is set at runtime, this binary ALSO binds
+//! the same merged `/mcp` router (below) on an in-process tailnet listener
+//! (`terminus_rs::mesh::tailnet::TailnetServer`) — the gateway becomes its
+//! own Tailscale node, no host `tailscaled` required. Feature off, flag off,
+//! or a config/startup error ⇒ this binary's behavior is EXACTLY as before
+//! this item: the plain + mTLS listeners are untouched, and only a log line
+//! notes the tailnet listener was skipped/disabled. See
+//! `terminus_rs::mesh::tailnet`'s module doc for the full config surface
+//! (`TERMINUS_TSNET_HOSTNAME`/`TERMINUS_TSNET_STATE_DIR`/`TERMINUS_TSNET_AUTHKEY`)
+//! and the WhoIs scope boundary MESH-05 picks up next.
+
 use terminus_rs::pki::server::{build_gateway_router, spawn_mtls_listener, GatewayServerConfig};
 use terminus_rs::registry::{register_all, ToolRegistry};
 
@@ -186,6 +200,52 @@ async fn main() {
     // `TERMINUS_PRIMARY_MTLS_*`-derived config.
     let router = build_gateway_router(registry, &gateway_config);
     spawn_mtls_listener(router.clone(), &gateway_config);
+
+    // MESH-04: the embedded tailnet listener -- gated at COMPILE time by the
+    // `tsnet` Cargo feature and at RUNTIME by `TERMINUS_MESH_TAILNET_ENABLED`
+    // (see `terminus_rs::mesh::tailnet`'s module doc). Neither gate being on
+    // is the common case today (the feature isn't in `default`, and the flag
+    // defaults to off) -- in that case this whole block is either compiled
+    // out entirely (feature off) or a no-op after one log line (flag off),
+    // and the plain + mTLS listeners below are completely unaffected either
+    // way.
+    #[cfg(feature = "tsnet")]
+    {
+        if terminus_rs::mesh::tailnet::tailnet_enabled_from_env() {
+            match terminus_rs::mesh::tailnet::TailnetConfig::from_env() {
+                Ok(tailnet_config) => match terminus_rs::mesh::tailnet::TailnetServer::start(tailnet_config) {
+                    Ok(tailnet) => {
+                        let tailnet_router = router.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = tailnet.serve(tailnet_router).await {
+                                tracing::error!("terminus_primary: tailnet listener stopped: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "terminus_primary: tailnet listener disabled -- failed to start: {e}"
+                        );
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(
+                        "terminus_primary: tailnet listener disabled -- config error: {e}"
+                    );
+                }
+            }
+        } else {
+            tracing::info!(
+                "terminus_primary: tsnet feature compiled in but TERMINUS_MESH_TAILNET_ENABLED is off -- tailnet listener not started"
+            );
+        }
+    }
+    #[cfg(not(feature = "tsnet"))]
+    {
+        tracing::debug!(
+            "terminus_primary: built without the tsnet feature -- no embedded tailnet listener available"
+        );
+    }
 
     let listener = tokio::net::TcpListener::bind(format!("{bind_addr}:{port}"))
         .await
