@@ -328,13 +328,33 @@ fn html_escape(s: &str) -> String {
 /// every produced file back into memory, then delete the temp directory --
 /// so no trace is left on disk regardless of success or failure. Returns
 /// `None` on any failure (binary missing, non-zero exit, no output
-/// produced), letting the caller fall back to the built-in index.
+/// produced, or a staging write failure), letting the caller fall back to
+/// the built-in index.
+///
+/// All the actual work happens in [`try_run_pagefind`], which -- unlike a
+/// flat `?`-chained function body -- is free to fail (via its own `?`) at
+/// ANY step (temp-dir naming, directory creation, staging a file, invoking
+/// the binary, reading its output) without skipping cleanup: this wrapper
+/// ALWAYS removes `tmp` afterward, on every path, success or failure alike
+/// (an agy secondary-review finding: the original single-function version
+/// used `?` inside the staging loop, which on a write failure returned
+/// early and skipped the `remove_dir_all` cleanup below it, leaking the
+/// temp directory -- see `run_pagefind_cleans_up_even_when_staging_fails`).
 pub fn run_pagefind(pages: &[IndexedPage]) -> Option<BTreeMap<String, Vec<u8>>> {
     let tmp = std::env::temp_dir().join(format!(
         "docgen-search-index-pagefind-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
     ));
+    let result = try_run_pagefind(pages, &tmp);
+    let _ = fs::remove_dir_all(&tmp);
+    result
+}
+
+/// The fallible body of [`run_pagefind`], factored out so every early
+/// return via `?` still leaves cleanup to the caller's unconditional
+/// `remove_dir_all` -- this function itself never needs to clean up.
+fn try_run_pagefind(pages: &[IndexedPage], tmp: &Path) -> Option<BTreeMap<String, Vec<u8>>> {
     let site_dir = tmp.join("site");
     let out_dir = tmp.join("out");
     fs::create_dir_all(&site_dir).ok()?;
@@ -354,13 +374,10 @@ pub fn run_pagefind(pages: &[IndexedPage]) -> Option<BTreeMap<String, Vec<u8>>> 
         .stderr(Stdio::null())
         .status();
 
-    let result = match status {
+    match status {
         Ok(s) if s.success() => read_dir_recursive(&out_dir),
         _ => None,
-    };
-
-    let _ = fs::remove_dir_all(&tmp);
-    result
+    }
 }
 
 fn read_dir_recursive(dir: &Path) -> Option<BTreeMap<String, Vec<u8>>> {
@@ -691,5 +708,64 @@ mod tests {
             .filter(|n| n.starts_with("docgen-search-index-pagefind-"))
             .collect();
         assert!(after.is_empty(), "build_search_artifact must never leave temp files behind");
+    }
+
+    fn count_pagefind_temp_dirs() -> usize {
+        fs::read_dir(std::env::temp_dir())
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("docgen-search-index-pagefind-"))
+            .count()
+    }
+
+    #[test]
+    fn run_pagefind_removes_its_temp_dir_even_when_binary_is_missing() {
+        // `pagefind` isn't installed in this sandbox (confirmed via `which
+        // pagefind` before writing this module), so this exercises
+        // run_pagefind's REAL failure path end to end: staging succeeds,
+        // the `Command::new("pagefind")` spawn fails, and the wrapper's
+        // unconditional `remove_dir_all` at the end of run_pagefind must
+        // still run regardless.
+        assert!(!pagefind_available(), "this test assumes no pagefind binary is on PATH");
+        let before = count_pagefind_temp_dirs();
+        let pages = vec![page("widget", "Widget", "content")];
+        assert!(run_pagefind(&pages).is_none());
+        assert_eq!(
+            before,
+            count_pagefind_temp_dirs(),
+            "run_pagefind must remove its temp dir even when the pagefind binary is missing"
+        );
+    }
+
+    #[test]
+    fn try_run_pagefind_fails_cleanly_when_staging_cannot_create_site_dir() {
+        // Regression test for an agy secondary-review finding: the
+        // original single-function `run_pagefind` used `?` inside the
+        // staging loop, which on a write/staging failure returned early
+        // and skipped the `remove_dir_all` cleanup below it, leaking the
+        // temp directory. The fix splits the fallible body into
+        // `try_run_pagefind` (this function -- free to fail via `?` at
+        // any step) from `run_pagefind` (the wrapper, which unconditionally
+        // cleans up `tmp` after calling this regardless of outcome). This
+        // test proves the staging-failure branch itself still returns
+        // `None` cleanly (no panic) when `site_dir` can't be created
+        // because a plain file already occupies that path.
+        let tmp = std::env::temp_dir().join(format!(
+            "docgen-search-index-test-staging-fail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+        // Plant a plain FILE at the exact path try_run_pagefind wants to
+        // `create_dir_all` as a directory ("<tmp>/site"), forcing that
+        // call to fail.
+        fs::write(tmp.join("site"), b"blocking file").unwrap();
+
+        let pages = vec![page("widget", "Widget", "content")];
+        let result = try_run_pagefind(&pages, &tmp);
+        assert!(result.is_none(), "staging must fail cleanly when site_dir's path is blocked by a file");
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
