@@ -28,6 +28,7 @@ pub mod render;
 pub mod semantic;
 pub mod store;
 pub mod tools;
+pub mod vec_embed;
 pub mod vec_store;
 
 pub use cluster::cluster;

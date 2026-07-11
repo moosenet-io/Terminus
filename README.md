@@ -631,6 +631,51 @@ cosine-similarity index for fast top-K search.
   build-time wiring, and the `kg_semantic_search` tool are later items in
   spec `S113-kg-semantic-embeddings` (KGEMB-02/03/04).
 
+### KG embeddings client (KGEMB-02)
+
+`EmbedClient` (`src/scribe/graph/vec_embed.rs`) turns text into a vector
+against a configurable endpoint, provider-agnostic between the local Ollama
+shape and hosted OpenAI-style APIs, auto-detected from the URL:
+
+- Ollama (`/api/embeddings`, `{"model","prompt"}` → `{"embedding":[...]}`) —
+  the default, matching the CPU-tier ollama unit already used elsewhere.
+- OpenAI-style (any URL containing `/v1/embeddings`, `{"model","input"}` →
+  `{"data":[{"embedding":[...]}]}`) — for hosted providers (e.g. an
+  OpenRouter-compatible embeddings endpoint), with bearer auth.
+
+Config (non-secret, via `crate::config`):
+
+- **`EMBEDDINGS_URL`** — the embeddings endpoint. Defaults to the secondary
+  (CPU) ollama unit's `OLLAMA_CPU_URL` + `/api/embeddings`; with neither set,
+  falls back to a loopback CPU-ollama default (never a real non-loopback host
+  baked in).
+- **`EMBEDDINGS_MODEL`** — the model name sent on each request. Defaults to
+  `nomic-embed-text`.
+- **`EMBEDDINGS_TIMEOUT_MS`** — per-request timeout. Defaults to 30000 (30s).
+
+**`EMBEDDINGS_API_KEY`** (optional, for hosted providers) is secret material
+and is read directly from the env-materialized runtime secret store inside
+`vec_embed` itself, not from `crate::config` — this crate has no separate
+`SecretManager`/`vault` API of its own (same convention as `crate::pki`'s CA
+material and `review::dispatch`'s `OPENROUTER_API_KEY`: the deployment's
+secret store materializes into env at startup, so a plain env read afterward
+already IS the SecretManager read). When unset, no `Authorization` header is
+sent (Ollama needs none).
+
+`EmbedClient::embed`/`embed_batch` never panic: transport, HTTP-status, and
+parse failures all become a `ToolError` for the caller to log and skip — a
+best-effort contract, since KGEMB-03's build-time wiring must never block on
+an embeddings outage.
+
+`node_card(node, callers, callees)` builds the deterministic short text that
+gets embedded for a `KgNode`: `"{kind} {name} in {path}"`, plus (if any
+neighbors) `" — calls: ...; called by: ..."`, each neighbor list capped at 6
+names and the whole card capped at 512 characters (truncated on a char
+boundary).
+
+This item ships only the client + card builder — it is not yet wired into
+`scribe_kg_build` (that's KGEMB-03).
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
