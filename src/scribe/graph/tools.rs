@@ -111,11 +111,15 @@ cluster, and degree. Ask the graph instead of grepping source."
             .nodes()
             .filter(|n| n.name.to_lowercase().contains(&q) || n.id.to_lowercase().contains(&q))
             .collect();
-        // Rank: exact name first, then by degree desc, then id for stability.
+        // Rank: exact name first, then PageRank importance (KGRAPH-13), then
+        // degree, then id for stability.
         hits.sort_by(|a, b| {
             let ae = (a.name.to_lowercase() == q) as u8;
             let be = (b.name.to_lowercase() == q) as u8;
-            be.cmp(&ae).then(b.degree.cmp(&a.degree)).then(a.id.cmp(&b.id))
+            be.cmp(&ae)
+                .then(b.rank.total_cmp(&a.rank))
+                .then(b.degree.cmp(&a.degree))
+                .then(a.id.cmp(&b.id))
         });
         let results: Vec<Value> = hits.iter().take(limit).map(|n| node_json(n)).collect();
         structured(json!({"project_id": project_id, "found": true, "query": query, "count": results.len(), "results": results}))
@@ -361,13 +365,18 @@ per-cluster counts, the top-degree hotspots, and orphan (degree-0) count."
                 orphans += 1;
             }
         }
+        // Hotspots ranked by PageRank importance (KGRAPH-13), then degree.
         let mut top: Vec<&super::model::KgNode> = g.nodes().collect();
-        top.sort_by(|a, b| b.degree.cmp(&a.degree).then(a.id.cmp(&b.id)));
+        top.sort_by(|a, b| {
+            b.rank.total_cmp(&a.rank)
+                .then(b.degree.cmp(&a.degree))
+                .then(a.id.cmp(&b.id))
+        });
         let hotspots: Vec<Value> = top
             .iter()
             .take(10)
             .filter(|n| n.degree > 0)
-            .map(|n| json!({"id": n.id, "degree": n.degree, "cluster": n.cluster}))
+            .map(|n| json!({"id": n.id, "rank": n.rank, "degree": n.degree, "cluster": n.cluster}))
             .collect();
         structured(json!({
             "project_id": project_id, "found": true,
