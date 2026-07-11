@@ -47,6 +47,7 @@ pub mod generate;
 pub mod mismatch;
 pub mod pii_gate;
 pub mod render;
+pub mod svg_assets;
 pub mod versioning;
 
 use std::collections::BTreeSet;
