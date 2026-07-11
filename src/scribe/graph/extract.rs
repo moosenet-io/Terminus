@@ -78,6 +78,17 @@ fn last_segment(name: &str) -> &str {
     name.rsplit("::").next().unwrap_or(name).trim()
 }
 
+/// The last segment of a MODULE path that may use any of `.` / `/` / `::` as a
+/// separator (`a.b` -> `b`, `x/y` -> `y`, `crate::a` -> `a`). Used to qualify an
+/// import's source module regardless of the language's path syntax.
+fn mod_last_segment(s: &str) -> String {
+    s.rsplit(|c| c == '.' || c == '/' || c == ':')
+        .find(|seg| !seg.trim().is_empty())
+        .unwrap_or(s)
+        .trim()
+        .to_string()
+}
+
 /// The base type name: last `::`-segment with any generic argument list
 /// stripped (`std::vec::Vec<T>` -> `Vec`, `Cache<K, V>` -> `Cache`). Without
 /// this, generic-type impls would FQN a method as `crate::m::Cache<T>::get`,
@@ -372,10 +383,57 @@ pub fn build_graph(
         }
     }
 
-    // Pass 2b: resolve import/call candidates.
+    // Pass 2b: resolve IMPORTS first, recording a per-file `imported_name ->
+    // definition id` map. This is the scope signal that lets a later call to a
+    // name resolve to the symbol the file actually imported (KGRAPH-18), the
+    // stack-graphs-free precision path.
+    let mut file_imports: HashMap<String, HashMap<String, String>> = HashMap::new();
     for fe in &per_file {
         for (src_id, target, kind) in &fe.candidates {
+            if *kind != EdgeKind::Imports {
+                continue;
+            }
             if let Some(to) = resolve_target(target, src_id, &by_name, &id_path) {
+                let _ = graph.insert_edge(KgEdge::new(src_id, &to, *kind, Confidence::Extracted));
+                if let Some(file) = id_path.get(src_id) {
+                    file_imports
+                        .entry(file.clone())
+                        .or_default()
+                        .insert(last_segment(target).to_string(), to);
+                }
+            }
+        }
+    }
+
+    // Pass 2c: resolve CALLS / REFERENCES, preferring an import the SOURCE FILE
+    // actually declares. A call to `N` from a file that imports `N` binds to the
+    // imported definition even when `N` is ambiguous project-wide — turning a
+    // previously-dropped ambiguous call into a precise edge. Falls back to the
+    // uniqueness-checked resolver otherwise.
+    for fe in &per_file {
+        for (src_id, target, kind) in &fe.candidates {
+            if *kind == EdgeKind::Imports {
+                continue;
+            }
+            let simple = last_segment(target);
+            let resolved = if target.contains("::") {
+                // Qualified call (`Foo::new`): the qualifier disambiguates —
+                // let the qualified-preference resolver bind it.
+                resolve_target(target, src_id, &by_name, &id_path)
+            } else {
+                // Unqualified: a LOCAL (same-file) definition SHADOWS an import,
+                // which shadows a global unique match (Python/JS/Rust scoping).
+                let via_import = id_path
+                    .get(src_id)
+                    .and_then(|file| file_imports.get(file))
+                    .and_then(|m| m.get(simple))
+                    .filter(|to| to.as_str() != src_id)
+                    .cloned();
+                resolve_same_file(simple, src_id, &by_name, &id_path)
+                    .or(via_import)
+                    .or_else(|| resolve_target(target, src_id, &by_name, &id_path))
+            };
+            if let Some(to) = resolved {
                 let _ = graph.insert_edge(KgEdge::new(src_id, &to, *kind, Confidence::Extracted));
             }
         }
@@ -659,17 +717,47 @@ fn generic_callee(node: Node, src: &[u8]) -> Option<String> {
     first_ident(node, src, 2)
 }
 
-/// Imported symbol short names from an import node (identifier leaves).
+/// Imported symbols from an import node, QUALIFIED where the import names a
+/// source module (`from a.b import foo` -> `b::foo`; JS `import {foo} from
+/// "x/y"` -> `y::foo`). The qualifier lets the resolver bind a call to the
+/// specific imported definition even when the bare name is ambiguous project-
+/// wide (KGRAPH-18). Falls back to bare last-segment names when no module
+/// qualifier is discernible.
 fn generic_imports(node: Node, src: &[u8]) -> Vec<String> {
-    let mut out = Vec::new();
+    // The module qualifier: python `module_name` field, else a string source
+    // (JS/TS `import ... from "path"`), else none.
+    let qualifier: Option<String> = node
+        .child_by_field_name("module_name")
+        .and_then(|m| m.utf8_text(src).ok())
+        .map(|t| mod_last_segment(t.trim()))
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            // a string literal source anywhere in the import (JS/TS)
+            let mut c = node.walk();
+            let strnode = node
+                .named_children(&mut c)
+                .find(|ch| ch.kind() == "string" || ch.kind() == "string_fragment");
+            let seg = strnode
+                .and_then(|s| s.utf8_text(src).ok())
+                .map(|t| mod_last_segment(t.trim_matches(|c| c == '"' || c == '\'')))
+                .filter(|s| !s.is_empty());
+            seg
+        });
+
+    let mut names = Vec::new();
+    let module_name_node = node.child_by_field_name("module_name");
     let mut q: std::collections::VecDeque<Node> = std::collections::VecDeque::new();
     q.push_back(node);
     while let Some(n) = q.pop_front() {
+        // skip the module-path subtree so its segments aren't taken as imported names
+        if Some(n) == module_name_node {
+            continue;
+        }
         if IDENT_KINDS.contains(&n.kind()) {
             if let Ok(t) = n.utf8_text(src) {
                 let seg = last_segment(t.trim());
                 if !seg.is_empty() && seg != "self" {
-                    out.push(seg.to_string());
+                    names.push(seg.to_string());
                 }
             }
         }
@@ -678,6 +766,11 @@ fn generic_imports(node: Node, src: &[u8]) -> Vec<String> {
             q.push_back(ch);
         }
     }
+    names.dedup();
+    let mut out: Vec<String> = match &qualifier {
+        Some(qual) => names.into_iter().map(|nm| format!("{qual}::{nm}")).collect(),
+        None => names,
+    };
     out.truncate(16);
     out
 }
@@ -753,6 +846,27 @@ fn generic_extract_file(path: &str, source: &str, lang: Lang) -> FileExtract {
     };
     generic_walk(&mut ctx, tree.root_node(), &module, None, lang);
     ctx.out
+}
+
+/// A unique same-file definition named `simple` (excluding `src_id`), or
+/// `None`. Used to give a LOCAL definition priority over an import (shadowing).
+fn resolve_same_file(
+    simple: &str,
+    src_id: &str,
+    by_name: &HashMap<String, Vec<String>>,
+    id_path: &HashMap<String, String>,
+) -> Option<String> {
+    let ids = by_name.get(simple)?;
+    let src_path = id_path.get(src_id);
+    let same: Vec<&String> = ids
+        .iter()
+        .filter(|id| id.as_str() != src_id && id_path.get(id.as_str()) == src_path)
+        .collect();
+    if same.len() == 1 {
+        Some(same[0].clone())
+    } else {
+        None
+    }
 }
 
 /// Resolve a candidate `target` (a bare name, or a one-level-qualified
@@ -1051,6 +1165,64 @@ pub fn outer() -> u8 {
         assert!(g.get_node("b::luaf").is_some(), "lua");
         assert!(g.get_node("c::Gof").is_some(), "go");
         assert!(g.get_node("crate::d::rustf").is_some(), "rust keeps crate:: FQN");
+    }
+
+    #[test]
+    fn import_aware_resolution_disambiguates_cross_file_call() {
+        // Two files define `helper`; c imports a's and calls it. Without import
+        // awareness the call is globally ambiguous and dropped; with it, the
+        // call binds to a's helper (KGRAPH-18).
+        let files = vec![
+            ("pkg/a.py".to_string(), "def helper():\n    return 1\n".to_string()),
+            ("pkg/b.py".to_string(), "def helper():\n    return 2\n".to_string()),
+            ("pkg/c.py".to_string(), "from a import helper\n\ndef use():\n    return helper()\n".to_string()),
+        ];
+        let g = build_graph("P", &files).unwrap();
+        let call = g
+            .edges()
+            .find(|e| e.kind == EdgeKind::Calls && e.from == "pkg::c::use")
+            .expect("call resolved via the import (would be dropped as ambiguous otherwise)");
+        assert_eq!(call.to, "pkg::a::helper", "bound to the imported definition, not b's");
+        assert!(
+            g.edges().any(|e| e.kind == EdgeKind::Imports && e.from == "pkg::c" && e.to == "pkg::a::helper"),
+            "qualified import edge present"
+        );
+    }
+
+    #[test]
+    fn multi_segment_dotted_import_qualifies() {
+        // `from pkg.a import helper` (multi-segment module) must qualify to
+        // pkg::a::helper, not fall back to global-ambiguous drop.
+        let files = vec![
+            ("pkg/a.py".to_string(), "def helper():\n    return 1\n".to_string()),
+            ("pkg/b.py".to_string(), "def helper():\n    return 2\n".to_string()),
+            ("svc/c.py".to_string(), "from pkg.a import helper\n\ndef use():\n    return helper()\n".to_string()),
+        ];
+        let g = build_graph("P", &files).unwrap();
+        let call = g
+            .edges()
+            .find(|e| e.kind == EdgeKind::Calls && e.from == "svc::c::use")
+            .expect("multi-segment import qualified the call");
+        assert_eq!(call.to, "pkg::a::helper");
+    }
+
+    #[test]
+    fn local_definition_shadows_import() {
+        // c defines its OWN helper AND imports a's; the call must bind to the
+        // LOCAL helper (shadowing), not the import (review P1).
+        let files = vec![
+            ("pkg/a.py".to_string(), "def helper():\n    return 1\n".to_string()),
+            (
+                "pkg/c.py".to_string(),
+                "from a import helper\n\ndef helper():\n    return 9\n\ndef use():\n    return helper()\n".to_string(),
+            ),
+        ];
+        let g = build_graph("P", &files).unwrap();
+        let call = g
+            .edges()
+            .find(|e| e.kind == EdgeKind::Calls && e.from == "pkg::c::use")
+            .expect("call resolved");
+        assert_eq!(call.to, "pkg::c::helper", "local def shadows the import");
     }
 
     #[test]
