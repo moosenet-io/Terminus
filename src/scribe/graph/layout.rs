@@ -31,7 +31,11 @@ const MARGIN: f32 = 40.0;
 
 /// Compute a deterministic force-directed layout for the graph.
 pub fn layout(graph: &KnowledgeGraph) -> LayoutResult {
-    let ids: Vec<&str> = graph.nodes().map(|n| n.id.as_str()).collect();
+    // Sort explicitly so determinism is self-contained and does not silently
+    // depend on the model's internal node storage order (it is a BTreeMap today,
+    // but this makes the "sorted-id order" contract independent of that).
+    let mut ids: Vec<&str> = graph.nodes().map(|n| n.id.as_str()).collect();
+    ids.sort_unstable();
     let n = ids.len();
     let mut positions = BTreeMap::new();
 
@@ -128,10 +132,11 @@ pub fn layout(graph: &KnowledgeGraph) -> LayoutResult {
     }
     let spanx = (maxx - minx).max(1e-3);
     let spany = (maxy - miny).max(1e-3);
-    let draw = W - 2.0 * MARGIN;
+    let draw_x = W - 2.0 * MARGIN;
+    let draw_y = H - 2.0 * MARGIN;
     for (i, id) in ids.iter().enumerate() {
-        let nx = MARGIN + (pos[i].0 - minx) / spanx * draw;
-        let ny = MARGIN + (pos[i].1 - miny) / spany * draw;
+        let nx = MARGIN + (pos[i].0 - minx) / spanx * draw_x;
+        let ny = MARGIN + (pos[i].1 - miny) / spany * draw_y;
         positions.insert((*id).to_string(), (nx, ny));
     }
 
