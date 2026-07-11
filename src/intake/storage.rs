@@ -703,7 +703,7 @@ const SELECT_AGG_INPUT_SQL: &str = "SELECT p.model_name, r.task_category, r.harn
      r.quant, r.reasoning_enabled, r.context_window_launched, r.temperature, r.top_p, \
      COALESCE(GREATEST(r.retry_score, r.first_pass_score), 0) \
      FROM code_profile_runs r JOIN model_profiles p ON p.id = r.profile_id \
-     WHERE r.harness_version = $1";
+     WHERE r.harness_version = $1 AND COALESCE(r.task_type, '') <> 'non_viable_skip'";
 
 /// Fallback aggregate-input SELECT for a DB NOT yet migrated for MINT2-01 (the
 /// five factor columns + `task_category` are absent): selects correctly-typed
@@ -714,7 +714,7 @@ const SELECT_AGG_INPUT_FALLBACK_SQL: &str = "SELECT p.model_name, NULL::text, r.
      NULL::text, NULL::boolean, NULL::integer, NULL::double precision, NULL::double precision, \
      COALESCE(GREATEST(r.retry_score, r.first_pass_score), 0) \
      FROM code_profile_runs r JOIN model_profiles p ON p.id = r.profile_id \
-     WHERE r.harness_version = $1";
+     WHERE r.harness_version = $1 AND COALESCE(r.task_type, '') <> 'non_viable_skip'";
 
 /// Read the per-sample rows an epoch's aggregates are computed from, tolerating a
 /// DB not yet migrated for MINT2-01 (the factor columns fall back to NULL). Any
