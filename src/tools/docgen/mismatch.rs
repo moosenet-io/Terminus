@@ -30,7 +30,10 @@
 //!     the same stable-signature-embedded-in-title dedup convention, reused
 //!     verbatim (both now `pub(crate)` for this reuse).
 //!   - `crate::scribe::find_duplicate_by_signature` -- the same
-//!     text-listing scan for "already reported this", reused verbatim.
+//!     text-listing scan for "already reported this", reused with this
+//!     module's own `"mismatch-sig"` tag prefix so it only matches this
+//!     detector's own prior issues (NOT SCRB-04's `"scribe-disc"` ones --
+//!     separate dedup namespaces, shared scanning logic).
 //!   - `crate::scribe::queue_discrepancy_locally` -- the same local-queue
 //!     fallback (one JSON object per line) when Plane is unreachable,
 //!     reused verbatim so a mismatch is never silently lost.
@@ -462,11 +465,16 @@ pub fn aggregate_panel(votes: &[PanelVote]) -> PanelConsensus {
 // ---------------------------------------------------------------------------
 
 /// Build the Plane issue title for a filed mismatch. Reuses
-/// `crate::scribe::discrepancy_signature`/`build_discrepancy_title`'s exact
-/// dedup convention (a stable signature embedded as `[scribe-disc:<sig>]`
-/// in the title, scanned for by `find_duplicate_by_signature`) so both
-/// SCRB-04 and this detector dedup against the SAME signature space and
-/// scanning logic -- one dedup mechanism, two callers, not two.
+/// `crate::scribe::discrepancy_signature` for the signature itself (same
+/// hashing function, same collision behavior as SCRB-04), but this
+/// detector's issues are tagged in their OWN namespace, `[mismatch-sig:<sig>]`,
+/// distinct from SCRB-04's `[scribe-disc:<sig>]` -- the two artifacts
+/// describe different things (a panel-adjudicated behavior-contract
+/// mismatch vs. a raw doc/code discrepancy report) and must never dedup
+/// against each other. `find_duplicate_by_signature` takes an explicit
+/// `tag_prefix` argument precisely so each caller only ever matches within
+/// its own namespace: shared signature *function*, separate dedup
+/// namespaces per artifact kind.
 fn mismatch_signature(module_path: &str, contract_text: &str) -> String {
     crate::scribe::discrepancy_signature(module_path, contract_text)
 }
@@ -634,7 +642,9 @@ sensitivity gate, not escalated (bias toward silence)."
         Err(e) => return Err(e),
     };
 
-    if let Some(existing_line) = crate::scribe::find_duplicate_by_signature(&listing_text, &signature) {
+    if let Some(existing_line) =
+        crate::scribe::find_duplicate_by_signature(&listing_text, &signature, "mismatch-sig")
+    {
         return Ok(format!(
             "Duplicate mismatch -- an existing open issue already matches this signature, not \
 creating another: {}",
@@ -1138,6 +1148,132 @@ types, and applies default values before returning a typed struct.";
         )
         .await;
         assert!(matches!(result, Err(ToolError::NotConfigured(_))));
+    }
+
+    // ─── Dedup: the detector must match its OWN [mismatch-sig] issues, and
+    //     must NOT be fooled or blocked by a [scribe-disc] issue that
+    //     happens to carry the same signature (separate namespaces). ───────
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn adjudicate_mismatch_second_run_detects_its_own_prior_issue_as_duplicate() {
+        // Regression for the dedup bug found in review: adjudicate_mismatch
+        // used to call crate::scribe::find_duplicate_by_signature with the
+        // scribe-only "[scribe-disc:]" tag, so it could never match its own
+        // "[mismatch-sig:]" issues from a prior run -- it would file a
+        // duplicate Plane issue on every run for the same still-open
+        // mismatch. Two independent httpmock servers model two independent
+        // calls (matches the pattern in scribe::mod's own
+        // report_discrepancy_execute_end_to_end_creates_then_dedups_second_call).
+        let dispatcher = approve_all("CODE_WRONG");
+        let module_path = "src/sundry";
+        let contract_text = "The function returns an error when the input is empty.";
+        let code_behavior = "The function does not return an error when the input is empty.";
+
+        // First run: no existing issues -> creates one.
+        let server1 = httpmock::MockServer::start();
+        server1.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/api/v1/workspaces/testws/projects/");
+            then.status(200).json_body(json!([
+                {"id": "TERM", "name": "Mock", "identifier": "TERM", "network": 0}
+            ]));
+        });
+        let list_empty = server1.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/api/v1/workspaces/testws/projects/TERM/issues/");
+            then.status(200).json_body(json!([]));
+        });
+        let create_mock = server1.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/api/v1/workspaces/testws/projects/TERM/issues/");
+            then.status(201).json_body(json!({
+                "id": "issue-uuid-1",
+                "name": "Behavior-contract mismatch [READY-FOR-BUILD: fix code]: src/sundry [mismatch-sig:x]",
+                "project": "TERM",
+                "workspace": "testws",
+                "sequence_id": 9
+            }));
+        });
+
+        std::env::set_var("PLANE_API_URL", server1.base_url());
+        std::env::set_var("PLANE_API_KEY", "test-token");
+        std::env::set_var("PLANE_WORKSPACE", "testws");
+
+        let first = adjudicate_mismatch(
+            dispatcher.clone(),
+            "TERM",
+            module_path,
+            ContractTier::AcceptanceCriteria,
+            contract_text,
+            code_behavior,
+        )
+        .await;
+
+        std::env::remove_var("PLANE_API_URL");
+        std::env::remove_var("PLANE_API_KEY");
+        std::env::remove_var("PLANE_WORKSPACE");
+
+        let first_text = first.expect("first run should create the issue");
+        assert!(first_text.contains("Created issue"), "{first_text}");
+        list_empty.assert();
+        create_mock.assert();
+
+        // Second run, same contract/code pair -> same signature. The
+        // listing now returns the detector's OWN prior issue, tagged
+        // [mismatch-sig:<sig>] (not [scribe-disc:]) -- this MUST be
+        // detected as a duplicate and MUST NOT create a second issue.
+        let signature = mismatch_signature(module_path, contract_text);
+        let title = build_mismatch_title(module_path, &signature, PanelConsensus::CodeWrong);
+        let server2 = httpmock::MockServer::start();
+        server2.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/api/v1/workspaces/testws/projects/");
+            then.status(200).json_body(json!([
+                {"id": "TERM", "name": "Mock", "identifier": "TERM", "network": 0}
+            ]));
+        });
+        let list_with_existing = server2.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/api/v1/workspaces/testws/projects/TERM/issues/");
+            then.status(200).json_body(json!([
+                {"id": "issue-uuid-1", "name": title, "priority": "medium", "project": "TERM", "workspace": "testws"}
+            ]));
+        });
+        // No POST mock registered on server2 -- if adjudicate_mismatch
+        // tried to create anyway, the request simply wouldn't match.
+
+        std::env::set_var("PLANE_API_URL", server2.base_url());
+        std::env::set_var("PLANE_API_KEY", "test-token");
+        std::env::set_var("PLANE_WORKSPACE", "testws");
+
+        let second = adjudicate_mismatch(
+            dispatcher,
+            "TERM",
+            module_path,
+            ContractTier::AcceptanceCriteria,
+            contract_text,
+            code_behavior,
+        )
+        .await;
+
+        std::env::remove_var("PLANE_API_URL");
+        std::env::remove_var("PLANE_API_KEY");
+        std::env::remove_var("PLANE_WORKSPACE");
+
+        let second_text = second.expect("second run should detect the duplicate, not error");
+        assert!(second_text.contains("Duplicate mismatch"), "{second_text}");
+        list_with_existing.assert();
+    }
+
+    #[test]
+    fn a_scribe_disc_issue_does_not_falsely_dedup_a_mismatch_with_the_same_signature() {
+        // Cross-namespace negative test: even if a [scribe-disc:SIG] issue
+        // exists with the exact same signature the detector would compute,
+        // the detector's own tag-scoped lookup must NOT treat it as a
+        // duplicate -- scribe-disc and mismatch-sig are different artifacts.
+        let listing = "Filtered work items (1):\n  [uuid-1] Scribe discrepancy: src/sundry -- doc vs. code mismatch [scribe-disc:deadbeef] (priority: medium)\n";
+        assert!(crate::scribe::find_duplicate_by_signature(listing, "deadbeef", "mismatch-sig").is_none());
     }
 
     #[tokio::test]
