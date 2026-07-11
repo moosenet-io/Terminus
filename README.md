@@ -423,6 +423,7 @@ on the core registry, so a model can query the graph instead of grepping source:
 | `kg_path` | The shortest path connecting two entities. |
 | `kg_stats` | Node/edge counts, clusters, top-degree hotspots, orphans. |
 | `kg_communities` | The community structure (level-0 clusters + a coarser level-1), each with members and — when a model is available — a short summary, for answering subsystem/architecture questions at the right zoom. |
+| `kg_query` | Answer a natural-language question — routes automatically to entity-level retrieval (specific symbols) or community-level retrieval (architecture/subsystems), returns the context plus a synthesized answer when a model is available. |
 
 All take a `project_id` and read the per-project graph store
 (`SCRIBE_KG_STORE_DIR`); a project with no graph yet returns `found: false`
