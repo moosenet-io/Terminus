@@ -526,7 +526,7 @@ SCRIBE_ALLOW_SUBPROCESS_VAULT_WRITE=true to enable it explicitly"
 /// a later run can detect "we already reported this" by scanning existing
 /// issue titles -- no dependency on Plane label UUID resolution, which would
 /// otherwise be a second point of failure before dedup could even run.
-fn discrepancy_signature(module_path: &str, doc_claim: &str) -> String {
+pub(crate) fn discrepancy_signature(module_path: &str, doc_claim: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
@@ -535,7 +535,7 @@ fn discrepancy_signature(module_path: &str, doc_claim: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-fn build_discrepancy_title(module_path: &str, signature: &str) -> String {
+pub(crate) fn build_discrepancy_title(module_path: &str, signature: &str) -> String {
     format!("Scribe discrepancy: {module_path} -- doc vs. code mismatch [scribe-disc:{signature}]")
 }
 
@@ -546,7 +546,7 @@ fn build_discrepancy_title(module_path: &str, signature: &str) -> String {
 /// Option<T>` or containing `</p>`), and `description_html` is rendered as
 /// raw HTML by Plane, so unescaped interpolation is a real HTML-injection
 /// risk into that view, not merely cosmetic (cycle 1 review finding).
-fn html_escape(s: &str) -> String {
+pub(crate) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -554,7 +554,7 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-fn build_discrepancy_description(module_path: &str, doc_claim: &str, code_behavior: &str) -> String {
+pub(crate) fn build_discrepancy_description(module_path: &str, doc_claim: &str, code_behavior: &str) -> String {
     format!(
         "<p><strong>Module:</strong> {module}</p>\
 <p><strong>Documentation claims:</strong> {claim}</p>\
@@ -570,10 +570,25 @@ severity and decides the fix.</em></p>",
 
 /// Scan a `plane_list_work_items_filtered`-shaped text listing (one issue
 /// per line, per that tool's own output format) for a line already
-/// containing this discrepancy's signature tag. Returns that line verbatim
-/// if found, so the caller can surface which existing issue matched.
-fn find_duplicate_by_signature<'a>(listing_text: &'a str, signature: &str) -> Option<&'a str> {
-    let tag = format!("[scribe-disc:{signature}]");
+/// containing this signature's tag, in the tag namespace identified by
+/// `tag_prefix` (e.g. `"scribe-disc"` for SCRB-04 discrepancies,
+/// `"mismatch-sig"` for the DOCGEN-10 behavior-contract mismatch detector).
+/// Returns that line verbatim if found, so the caller can surface which
+/// existing issue matched.
+///
+/// The signature-generation function (`discrepancy_signature`) is shared
+/// across artifact kinds, but each kind's issues are tagged with its own
+/// prefix and this function only ever matches within that one prefix's
+/// namespace -- a `[scribe-disc:SIG]` issue can never be mistaken for a
+/// `[mismatch-sig:SIG]` one even if they happen to carry the same `SIG`,
+/// because they are different artifacts describing different things and
+/// deduping across them would silently suppress a real, distinct issue.
+pub(crate) fn find_duplicate_by_signature<'a>(
+    listing_text: &'a str,
+    signature: &str,
+    tag_prefix: &str,
+) -> Option<&'a str> {
+    let tag = format!("[{tag_prefix}:{signature}]");
     listing_text.lines().find(|line| line.contains(&tag))
 }
 
@@ -581,7 +596,7 @@ fn find_duplicate_by_signature<'a>(listing_text: &'a str, signature: &str) -> Op
 /// object per line) instead of losing it, when Plane is unreachable. Pure
 /// local file I/O -- no subprocess, no network, always available regardless
 /// of Plane's status.
-fn queue_discrepancy_locally(
+pub(crate) fn queue_discrepancy_locally(
     queue_path: &str,
     project_id: &str,
     module_path: &str,
@@ -712,7 +727,7 @@ a retry-later marker rather than lost."
             Err(e) => return Err(e),
         };
 
-        if let Some(existing_line) = find_duplicate_by_signature(&listing_text, &signature) {
+        if let Some(existing_line) = find_duplicate_by_signature(&listing_text, &signature, "scribe-disc") {
             return Ok(format!(
                 "Duplicate discrepancy -- an existing open issue already matches this signature, \
 not creating another: {}",
@@ -1170,7 +1185,7 @@ mod tests {
         let sig = "abc123";
         let listing = "Filtered work items (1):\n  [uuid-1] Scribe discrepancy: src/x [scribe-disc:abc123] (priority: medium)\n";
         assert_eq!(
-            find_duplicate_by_signature(listing, sig),
+            find_duplicate_by_signature(listing, sig, "scribe-disc"),
             Some("  [uuid-1] Scribe discrepancy: src/x [scribe-disc:abc123] (priority: medium)")
         );
     }
@@ -1178,7 +1193,16 @@ mod tests {
     #[test]
     fn find_duplicate_by_signature_none_when_no_match() {
         let listing = "No work items match the given filters";
-        assert_eq!(find_duplicate_by_signature(listing, "abc123"), None);
+        assert_eq!(find_duplicate_by_signature(listing, "abc123", "scribe-disc"), None);
+    }
+
+    #[test]
+    fn find_duplicate_by_signature_does_not_cross_the_mismatch_sig_namespace() {
+        // A [mismatch-sig:] issue (DOCGEN-10's detector) must never be
+        // mistaken for a [scribe-disc:] duplicate (SCRB-04) even with the
+        // identical signature -- they are different artifacts.
+        let listing = "Filtered work items (1):\n  [uuid-1] Behavior-contract mismatch [READY-FOR-BUILD: fix code]: src/x [mismatch-sig:abc123] (priority: medium)\n";
+        assert_eq!(find_duplicate_by_signature(listing, "abc123", "scribe-disc"), None);
     }
 
     #[test]
@@ -1249,7 +1273,7 @@ mod tests {
         let client = crate::plane::PlaneClient::test_client_with_base_url(server.base_url());
         let lister = crate::plane::PlaneListWorkItemsFiltered::new(client.clone());
         let listing = lister.execute(json!({"project_id": "TERM", "limit": 200})).await.unwrap();
-        assert!(find_duplicate_by_signature(&listing, "anything").is_none());
+        assert!(find_duplicate_by_signature(&listing, "anything", "scribe-disc").is_none());
 
         let creator = crate::plane::PlaneCreateWorkItem::new(client);
         let result = creator
@@ -1292,7 +1316,7 @@ mod tests {
         let client = crate::plane::PlaneClient::test_client_with_base_url(server.base_url());
         let lister = crate::plane::PlaneListWorkItemsFiltered::new(client);
         let listing = lister.execute(json!({"project_id": "TERM", "limit": 200})).await.unwrap();
-        let found = find_duplicate_by_signature(&listing, &signature);
+        let found = find_duplicate_by_signature(&listing, &signature, "scribe-disc");
         assert!(found.is_some(), "listing should contain the pre-seeded duplicate: {listing}");
     }
 

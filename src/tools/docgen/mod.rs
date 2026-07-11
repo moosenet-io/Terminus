@@ -43,6 +43,7 @@
 
 pub mod config;
 pub mod generate;
+pub mod mismatch;
 pub mod pii_gate;
 pub mod versioning;
 
@@ -156,13 +157,14 @@ scaffold item generates/renders nothing."
 /// personal-only path.
 pub fn register(registry: &mut ToolRegistry) {
     let _ = registry.register(Box::new(DocgenStatus));
+    mismatch::register(registry);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const EXPECTED_TOOL_NAMES: &[&str] = &["docgen_status"];
+    const EXPECTED_TOOL_NAMES: &[&str] = &["docgen_status", "docgen_mismatch_detect"];
 
     #[test]
     fn registers_expected_tools() {
