@@ -45,6 +45,14 @@
 //! `crate::federation::PersonalFederationClient` (that client speaks a
 //! different, Chord-specific wire protocol entirely).
 //!
+//! ## MESH-11: onboarding a new upstream
+//! [`onboarding`] adds the first-class, read-only dry-run workflow (and the
+//! CORE tool `mesh_onboard_upstream`) an operator uses to try a candidate
+//! upstream — probe it, discover its catalog, check namespace/name
+//! collisions, confirm trust readiness, and preview the merge delta — before
+//! hand-editing `TERMINUS_MESH_UPSTREAMS_JSON`. See that module's doc for why
+//! it never mutates config or prints a secret value.
+//!
 //! ## MESH-03: merging catalogs across many upstreams + local core
 //! [`merge`] merges the local core catalog with every healthy upstream's
 //! `tools/list` into one `tools/list` result, namespacing every federated
@@ -57,6 +65,7 @@
 pub mod client;
 pub mod identity;
 pub mod merge;
+pub mod onboarding;
 pub mod registry;
 
 pub use client::{ToolMeta, UpstreamCallResult, UpstreamClient, UpstreamClientError, UpstreamPool};
@@ -64,6 +73,10 @@ pub use identity::TailnetIdentity;
 pub use merge::{
     namespaced, resolve_call_route, split_namespaced, upstream_unavailable_text, CallRoute,
     MergedCatalog, Route, RoutingTable, MESH_NS_SEP,
+};
+pub use onboarding::{
+    onboard_upstream, MeshOnboardUpstream, OnboardingError, OnboardingRequest, OnboardingReport,
+    TrustStatus,
 };
 pub use registry::{
     MeshConfigError, ResolvedSecret, UpstreamRegistry, UpstreamServer, UpstreamTransport,
