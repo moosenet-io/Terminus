@@ -3,22 +3,23 @@
 [← personal-life index](README.md) · [← tool index](../README.md) · [← docs index](../../README.md)
 
 **Status: read/search + tiered request + organize/destructive-gating + stateless recommend/
-engagement surface live (MEDIA-01 through MEDIA-05, S94).** This page documents the domain
-through its first five build items: the seven typed service clients + `media_domain_status`
-(MEDIA-01), the read-only search/status surface (`media_search` and `media_status`, MEDIA-02),
-the tiered-mutation-safety request/download tool (`media_request`, MEDIA-03), non-destructive
-organize plus hard-typed-confirmation destructive delete/bulk-cleanup (`media_organize`/
-`media_delete`/`media_cleanup`, MEDIA-04), and the stateless recommend/engagement surface
-(`media_recommend`/`media_on_deck`/`media_recently_added`, MEDIA-05). Taste-memory
-personalization and Lumina surface wiring land with MEDIA-06 through MEDIA-08 as those items
-ship.
+engagement surface + toggleable taste-memory + Lumina surface wiring live (MEDIA-01 through
+MEDIA-07, S94).** This page documents the domain through its first seven build items: the
+seven typed service clients + `media_domain_status` (MEDIA-01), the read-only search/status
+surface (`media_search` and `media_status`, MEDIA-02), the tiered-mutation-safety
+request/download tool (`media_request`, MEDIA-03), non-destructive organize plus
+hard-typed-confirmation destructive delete/bulk-cleanup (`media_organize`/`media_delete`/
+`media_cleanup`, MEDIA-04), the stateless recommend/engagement surface (`media_recommend`/
+`media_on_deck`/`media_recently_added`, MEDIA-05), toggleable taste-memory personalization
+(MEDIA-06), and the Lumina conversational surface (intent routing + confirmation narration,
+MEDIA-07, `src/media/surface.rs`). Documentation lands with MEDIA-08 as it ships.
 
 The media domain (`src/media/mod.rs`) orchestrates the self-hosted media stack directly —
 Radarr, Sonarr, Prowlarr, qtor (download client), Plex, <media-service>, and TMDb — rather than
 wrapping a single thin API. It is a **sovereign** build: vault(env)-backed secrets, no
 third-party MCP server, everything through this one hardened hub. Lumina (the personality
-agent) is intended as the eventual conversational surface (MEDIA-07); this domain is the muscle
-behind it.
+agent) is the conversational surface — `src/media/surface.rs` (MEDIA-07) shapes how she picks
+tools and narrates confirmations; this domain is the muscle behind it.
 
 ## Configuration
 
@@ -426,9 +427,52 @@ Registered only when the flag is on. Records engagement signals (requested/watch
 taste facade (POST) so curation improves over time. Its mere presence in the tool catalog reflects the
 flag state.
 
-## What's not here yet
+## Lumina surface wiring (MEDIA-07) — conversational contract, no new mutation logic
 
-Lumina conversational/subagent surface wiring (MEDIA-07) isn't built yet — see the spec
-(`S94-media-domain`, Plane project `TERM`). See
-[`specs/behavior/media-behavior.md`](../../../specs/behavior/media-behavior.md) for the
-states/degradation contract this domain establishes.
+`src/media/surface.rs` makes Lumina the interaction surface for the whole domain. It adds **no**
+new tool and **no** new mutation logic — the tiering/confirm gates stay exactly where MEDIA-03/04
+put them. It is pure metadata + pure helper functions, fully unit-tested without HTTP.
+
+**Intent routing.** `resolve_intent(phrase: &str) -> MediaIntent` is a small, deterministic,
+keyword-matched routing table from representative conversational phrases to the tool (or ordered
+tool chain) they imply, e.g.:
+
+| Phrase (representative) | Resolves to |
+|---|---|
+| "put something on" / "what should I watch" | `media_recommend` |
+| "grab that show I was watching" | chain: `media_search` → `media_status` → `media_request` |
+| "is Dune on Plex?" / "do I already have it" | `media_status` |
+| "clean up what I've watched" | `media_cleanup` |
+| "delete that movie" | `media_delete` |
+| "what's on deck" / "what's new" | `media_on_deck` / `media_recently_added` |
+
+Note this repo's `ToolRegistry`/`RustTool` trait has no separate keywords/intent-hints field, and
+the live subagent-side tool matcher (`discover(query, max)`, tokenized name+description matching)
+lives in Chord, not here — `resolve_intent` is a standalone, directly-testable reference table a
+subagent-side matcher can consult, in the same spirit as this domain's keyword-rich
+`description()` strings. An under-specified phrase (media vocabulary present but no clear action,
+or no media vocabulary at all) resolves to `MediaIntent::Clarify(question)` — a clarifying
+question Lumina asks, never a guessed action.
+
+**Confirmation narration.** Three pure helpers turn a tool's raw `structured` JSON into a short,
+in-voice prompt carrying the concrete specifics, instead of Lumina reading raw JSON aloud:
+
+- `narrate_request_confirmation(&structured)` — MEDIA-03's `media_request`/`media_organize`
+  Confirm-tier payload → e.g. *"'Dune' (2021) -- that's a ~60GB 2160p remux grab -- want me to go
+  ahead?"*. Returns `None` when the call already executed or was never Confirm-tier (nothing to
+  narrate, not an error).
+- `narrate_delete_confirmation(&structured)` — MEDIA-04's `media_delete` pending-delete payload →
+  names the exact target and reminds Lumina the gate is a **typed** exact-title match, not a
+  yes/no `confirm: true`.
+- `narrate_cleanup_confirmation(&structured)` — MEDIA-04's `media_cleanup` pending-bulk-delete
+  payload → enumerates every eligible title plus how many were flagged (not watched by every
+  user) and left alone.
+
+**Chain composition + the gate holds mid-chain.** `MediaChain`/`SEARCH_STATUS_REQUEST_CHAIN`
+documents the canonical `media_search` → `media_status` → `media_request` acquisition chain.
+Each step is an independent tool call — there is no "this call came from a chain" flag anywhere
+in this domain for a chain to exploit. `surface.rs`'s tests include a negative case that drives a
+whole-series `media_request` call (always Confirm-tier per MEDIA-03) through the public
+`ToolRegistry`/`call()` path exactly as the last step of a resolved chain, and asserts it still
+returns the confirmation payload (`executed: false`) rather than a false "done" — chaining cannot
+bypass the confirm gate.
