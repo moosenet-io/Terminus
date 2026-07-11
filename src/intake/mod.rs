@@ -170,6 +170,90 @@ pub fn epoch_where_fragment(selector: &EpochSelector, idx: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// MINT2-06: stale-cell re-run planner core (PURE)
+// ---------------------------------------------------------------------------
+//
+// After an epoch bump (or a newly-added fleet model, or a raised sample target)
+// most (model × test × config) cells no longer have a current-epoch result at
+// the sample target and must be re-run — but re-running the WHOLE sweep is
+// wasteful. This is the shared, family-agnostic heart of "re-run tests that
+// evolve": given the intended coverage grid and how many current-epoch samples
+// each cell already has, return EXACTLY the cells that still need work.
+//
+// It is deliberately generic over the caller's own coverage-cell key `K` (the
+// coder planner keys on (model, category, config); the assistant planner keys on
+// (model, dimension)) and takes the current-epoch sample counts as plain data,
+// so it is a PURE function — grid + counts + target → stale list — unit-testable
+// with no DB, clock, or env. Each family's own planner (in `coder_sweep.rs` /
+// `assistant/runner.rs`) builds the grid + counts from ITS OWN epoch lineage
+// (the coder [`CURRENT_EPOCH`] vs the assistant's separate
+// `schema::HARNESS_VERSION`) and calls this.
+
+/// PURE stale-cell planner core (MINT2-06). Given the intended coverage `grid`
+/// and how many current-epoch samples each cell already has (`existing_counts`),
+/// return EXACTLY the grid cells that are STALE: a cell is stale iff it has
+/// `0` current-epoch samples (absent from `existing_counts`) OR fewer than
+/// `target_samples`. A cell already at (or above) the target is NOT re-run.
+///
+/// The complement is computed over the GRID, so a cell only present in
+/// `existing_counts` but NOT in the grid (e.g. a model dropped from the fleet, or
+/// a legacy category no longer measured) is never returned — dropped work is not
+/// re-run. The result is sorted + deduped for a deterministic work list. Same
+/// input → same output; no DB, no clock, no env.
+pub fn stale_cells<K>(
+    grid: &[K],
+    existing_counts: &std::collections::BTreeMap<K, i64>,
+    target_samples: i64,
+) -> Vec<K>
+where
+    K: Ord + Clone,
+{
+    let mut out: Vec<K> = grid
+        .iter()
+        .filter(|c| existing_counts.get(*c).copied().unwrap_or(0) < target_samples)
+        .cloned()
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Parse the per-cell stale sample target from a raw env value
+/// (`INTAKE_STALE_TARGET_SAMPLES`). Default `1` (any current-epoch sample covers
+/// the cell — the epoch-bump default: after a bump nothing is current, so the
+/// planner returns the full grid). A larger value tops up under-sampled cells.
+/// Clamped to at least `1` (a target of `0`/negative would mark every cell
+/// covered, defeating the point). Pure over its input.
+pub fn parse_stale_target(raw: Option<&str>) -> i64 {
+    raw.and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(1)
+}
+
+/// The per-cell stale sample target from the environment
+/// (`INTAKE_STALE_TARGET_SAMPLES`, default `1`).
+pub fn stale_target_from_env() -> i64 {
+    parse_stale_target(std::env::var("INTAKE_STALE_TARGET_SAMPLES").ok().as_deref())
+}
+
+/// Parse the `--only-stale` run-mode flag from a raw env value
+/// (`MINT_ONLY_STALE`). Truthy = `1`/`true`/`yes`/`on` (case-insensitive);
+/// anything else (including unset) is `false` so the FULL sweep stays the
+/// default. Pure over its input.
+pub fn parse_only_stale(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+/// Whether the unified harness should run in `--only-stale` mode
+/// (`MINT_ONLY_STALE`, default `false` → full sweep).
+pub fn only_stale_from_env() -> bool {
+    parse_only_stale(std::env::var("MINT_ONLY_STALE").ok().as_deref())
+}
+
+// ---------------------------------------------------------------------------
 // Unified MINT harness (MINT2-04)
 // ---------------------------------------------------------------------------
 //
@@ -1158,6 +1242,91 @@ mod tests {
             "harness_version = $3"
         );
         assert_eq!(epoch_where_fragment(&EpochSelector::All, 1), "TRUE");
+    }
+
+    // ---- MINT2-06: pure stale-cell planner core ----
+
+    #[test]
+    fn stale_set_is_exactly_the_complement() {
+        // Grid of 4 cells; two already have >= target current-epoch samples, two
+        // do not (one under-sampled, one absent) → the stale set is EXACTLY the
+        // two uncovered cells, no more, no less.
+        use std::collections::BTreeMap;
+        let grid = vec!["a", "b", "c", "d"];
+        let mut counts: BTreeMap<&str, i64> = BTreeMap::new();
+        counts.insert("a", 5); // at target → covered
+        counts.insert("b", 2); // below target → stale
+        counts.insert("c", 5); // at target → covered
+        // "d" absent → 0 samples → stale
+        let stale = stale_cells(&grid, &counts, 5);
+        assert_eq!(stale, vec!["b", "d"]);
+    }
+
+    #[test]
+    fn cell_already_at_target_is_not_rerun() {
+        use std::collections::BTreeMap;
+        let grid = vec!["x"];
+        let mut counts: BTreeMap<&str, i64> = BTreeMap::new();
+        counts.insert("x", 7);
+        // At target → not stale.
+        assert!(stale_cells(&grid, &counts, 7).is_empty());
+        // Above target → still not stale.
+        assert!(stale_cells(&grid, &counts, 5).is_empty());
+    }
+
+    #[test]
+    fn empty_counts_makes_everything_stale() {
+        // The un-migrated-DB / fresh-epoch case: NO current-epoch samples exist →
+        // the planner returns the WHOLE grid (correct: everything must be run).
+        use std::collections::BTreeMap;
+        let grid = vec!["a", "b", "c"];
+        let counts: BTreeMap<&str, i64> = BTreeMap::new();
+        assert_eq!(stale_cells(&grid, &counts, 1), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn counts_outside_grid_are_never_rerun() {
+        // A cell present in the counts but NOT in the grid (dropped-from-fleet
+        // model / retired category) is never returned — dropped work isn't run.
+        use std::collections::BTreeMap;
+        let grid = vec!["a"];
+        let mut counts: BTreeMap<&str, i64> = BTreeMap::new();
+        counts.insert("gone", 0); // 0 samples but not in the grid
+        counts.insert("a", 5);
+        assert!(stale_cells(&grid, &counts, 5).is_empty());
+    }
+
+    #[test]
+    fn raising_target_makes_below_target_cells_stale() {
+        // A cell covered at target=3 becomes stale when the target is raised to 6.
+        use std::collections::BTreeMap;
+        let grid = vec!["a"];
+        let mut counts: BTreeMap<&str, i64> = BTreeMap::new();
+        counts.insert("a", 4);
+        assert!(stale_cells(&grid, &counts, 3).is_empty(), "4 >= 3 → covered");
+        assert_eq!(stale_cells(&grid, &counts, 6), vec!["a"], "4 < 6 → stale");
+    }
+
+    #[test]
+    fn parse_stale_target_defaults_and_clamps() {
+        assert_eq!(parse_stale_target(None), 1);
+        assert_eq!(parse_stale_target(Some("")), 1);
+        assert_eq!(parse_stale_target(Some("garbage")), 1);
+        assert_eq!(parse_stale_target(Some("0")), 1, "0 clamps up to 1");
+        assert_eq!(parse_stale_target(Some("-3")), 1, "negative clamps up to 1");
+        assert_eq!(parse_stale_target(Some(" 7 ")), 7);
+    }
+
+    #[test]
+    fn parse_only_stale_is_false_unless_explicitly_truthy() {
+        assert!(!parse_only_stale(None), "unset → full sweep (default)");
+        assert!(!parse_only_stale(Some("")));
+        assert!(!parse_only_stale(Some("0")));
+        assert!(!parse_only_stale(Some("false")));
+        assert!(parse_only_stale(Some("1")));
+        assert!(parse_only_stale(Some("true")));
+        assert!(parse_only_stale(Some("YES")));
+        assert!(parse_only_stale(Some(" On ")));
     }
 
     #[test]
