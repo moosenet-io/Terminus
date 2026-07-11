@@ -1039,6 +1039,8 @@ mod tests {
                 path: "src/sundry/mod.rs".to_string(),
                 doc_comments: vec!["//! Sundry tools".to_string()],
                 public_signatures: vec!["pub struct Health;".to_string()],
+                mod_decls: vec![],
+                use_decls: vec![],
             }],
             existing_readme: Some("# Old README".to_string()),
         };

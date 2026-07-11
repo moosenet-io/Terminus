@@ -383,11 +383,16 @@ pub fn to_dot(model: &GraphModel, theme: GraphTheme) -> String {
 /// `-V` prints its version to stderr and some builds exit non-zero) is
 /// enough to know the binary is invocable. A spawn failure (binary not
 /// found) means unavailable.
-fn engine_available(engine: &str) -> bool {
+/// `pub(crate)`: reused by `crate::tools::docgen::crate_graph` (DOCGEN-12)
+/// for its own sfdp/neato SVG-if-available rasterization, rather than a
+/// second copy of this exact spawn-and-probe logic.
+pub(crate) fn engine_available(engine: &str) -> bool {
     Command::new(engine).arg("-V").stdout(Stdio::null()).stderr(Stdio::null()).output().is_ok()
 }
 
-fn run_engine(engine: &str, dot_source: &str) -> Option<String> {
+/// `pub(crate)`: see [`engine_available`]'s doc comment -- same reuse by
+/// `crate::tools::docgen::crate_graph`.
+pub(crate) fn run_engine(engine: &str, dot_source: &str) -> Option<String> {
     let mut child = Command::new(engine)
         .arg("-Tsvg")
         .stdin(Stdio::piped())
