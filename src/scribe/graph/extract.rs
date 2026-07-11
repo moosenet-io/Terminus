@@ -328,17 +328,26 @@ fn extract_file(path: &str, source: &str) -> FileExtract {
 /// files. Two-pass: emit all nodes, then resolve import/call candidates against
 /// the global node set (same-file first, then a unique global match; ambiguous
 /// or unknown targets are dropped). All emitted edges are EXTRACTED.
-pub fn build_rust_graph(
+/// Build a knowledge graph from a set of `(repo_relative_path, source)` files
+/// of ANY supported language (KGRAPH-17). Each file is routed by extension: Rust
+/// uses the precise Rust extractor; every other supported language uses the
+/// generic tree-sitter extractor. Files whose language is unsupported are
+/// skipped. Pass-2 resolution is shared.
+pub fn build_graph(
     project_id: &str,
     files: &[(String, String)],
 ) -> Result<KnowledgeGraph, ToolError> {
     let mut graph = KnowledgeGraph::new(project_id);
 
-    // Pass 1: nodes.
+    // Pass 1: nodes, dispatched per language.
     let per_file: Vec<FileExtract> = files
         .iter()
-        .filter(|(p, _)| p.ends_with(".rs"))
-        .map(|(p, s)| extract_file(p, s))
+        .filter_map(|(p, s)| {
+            Lang::from_path(p).map(|lang| match lang {
+                Lang::Rust => extract_file(p, s),
+                other => generic_extract_file(p, s, other),
+            })
+        })
         .collect();
 
     for fe in &per_file {
@@ -374,6 +383,376 @@ pub fn build_rust_graph(
 
     graph.recompute_degrees();
     Ok(graph)
+}
+
+/// Back-compat alias: the Rust-specific name kept for existing callers/tests.
+/// Now multi-language under the hood (routes each file by extension).
+pub fn build_rust_graph(
+    project_id: &str,
+    files: &[(String, String)],
+) -> Result<KnowledgeGraph, ToolError> {
+    build_graph(project_id, files)
+}
+
+// ─── Multi-language extraction (KGRAPH-17) ───────────────────────────────────
+
+/// Supported source languages. Rust has a dedicated precise extractor; the rest
+/// share the generic tree-sitter extractor driven by a [`LangSpec`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lang {
+    Rust,
+    Python,
+    JavaScript,
+    TypeScript,
+    Tsx,
+    Go,
+    Java,
+    C,
+    Cpp,
+    Ruby,
+    CSharp,
+    Php,
+    Bash,
+    Lua,
+}
+
+impl Lang {
+    pub fn from_path(path: &str) -> Option<Lang> {
+        let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
+        Some(match ext.as_str() {
+            "rs" => Lang::Rust,
+            "py" | "pyi" => Lang::Python,
+            "js" | "mjs" | "cjs" | "jsx" => Lang::JavaScript,
+            "ts" | "mts" | "cts" => Lang::TypeScript,
+            "tsx" => Lang::Tsx,
+            "go" => Lang::Go,
+            "java" => Lang::Java,
+            "c" | "h" => Lang::C,
+            "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => Lang::Cpp,
+            "rb" => Lang::Ruby,
+            "cs" => Lang::CSharp,
+            "php" | "phtml" => Lang::Php,
+            "sh" | "bash" => Lang::Bash,
+            "lua" => Lang::Lua,
+            _ => return None,
+        })
+    }
+
+    fn ts_language(self) -> tree_sitter::Language {
+        match self {
+            Lang::Rust => tree_sitter_rust::LANGUAGE.into(),
+            Lang::Python => tree_sitter_python::LANGUAGE.into(),
+            Lang::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+            Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            Lang::Go => tree_sitter_go::LANGUAGE.into(),
+            Lang::Java => tree_sitter_java::LANGUAGE.into(),
+            Lang::C => tree_sitter_c::LANGUAGE.into(),
+            Lang::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            Lang::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+            Lang::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+            Lang::Php => tree_sitter_php::LANGUAGE_PHP.into(),
+            Lang::Bash => tree_sitter_bash::LANGUAGE.into(),
+            Lang::Lua => tree_sitter_lua::LANGUAGE.into(),
+        }
+    }
+
+    /// The tree-sitter node kinds that define an emittable symbol, mapped to a
+    /// graph [`NodeKind`]. A `Function` kind recurses as a call-scope; any other
+    /// (type-like) kind recurses as a `Contains` container for its members.
+    fn defs(self) -> &'static [(&'static str, NodeKind)] {
+        use NodeKind::*;
+        match self {
+            Lang::Python => &[("function_definition", Function), ("class_definition", Class)],
+            Lang::JavaScript | Lang::TypeScript | Lang::Tsx => &[
+                ("function_declaration", Function),
+                ("generator_function_declaration", Function),
+                ("method_definition", Function),
+                ("class_declaration", Class),
+                ("abstract_class_declaration", Class),
+                ("interface_declaration", Trait),
+                ("type_alias_declaration", Struct),
+                ("enum_declaration", Enum),
+            ],
+            Lang::Go => &[
+                ("function_declaration", Function),
+                ("method_declaration", Function),
+                ("type_spec", Struct),
+            ],
+            Lang::Java => &[
+                ("class_declaration", Class),
+                ("interface_declaration", Trait),
+                ("enum_declaration", Enum),
+                ("record_declaration", Struct),
+                ("method_declaration", Function),
+                ("constructor_declaration", Function),
+            ],
+            Lang::C => &[
+                ("function_definition", Function),
+                ("struct_specifier", Struct),
+                ("union_specifier", Struct),
+                ("enum_specifier", Enum),
+            ],
+            Lang::Cpp => &[
+                ("function_definition", Function),
+                ("struct_specifier", Struct),
+                ("union_specifier", Struct),
+                ("class_specifier", Class),
+                ("enum_specifier", Enum),
+                ("namespace_definition", Module),
+            ],
+            Lang::Ruby => &[
+                ("method", Function),
+                ("singleton_method", Function),
+                ("class", Class),
+                ("module", Module),
+            ],
+            Lang::CSharp => &[
+                ("class_declaration", Class),
+                ("interface_declaration", Trait),
+                ("struct_declaration", Struct),
+                ("enum_declaration", Enum),
+                ("method_declaration", Function),
+                ("constructor_declaration", Function),
+                ("namespace_declaration", Module),
+            ],
+            Lang::Php => &[
+                ("function_definition", Function),
+                ("method_declaration", Function),
+                ("class_declaration", Class),
+                ("interface_declaration", Trait),
+                ("trait_declaration", Trait),
+                ("enum_declaration", Enum),
+            ],
+            Lang::Bash => &[("function_definition", Function)],
+            Lang::Lua => &[
+                ("function_declaration", Function),
+                ("function_definition", Function),
+            ],
+            Lang::Rust => &[], // handled by the dedicated extractor
+        }
+    }
+
+    /// Call-expression node kinds (for `Calls` edges).
+    fn calls(self) -> &'static [&'static str] {
+        match self {
+            Lang::Python | Lang::Lua => &["call", "function_call"],
+            Lang::JavaScript | Lang::TypeScript | Lang::Tsx | Lang::Go | Lang::C | Lang::Cpp => &["call_expression"],
+            Lang::Java => &["method_invocation", "object_creation_expression"],
+            Lang::Ruby => &["call", "method_call"],
+            Lang::CSharp => &["invocation_expression"],
+            Lang::Php => &["function_call_expression", "member_call_expression", "scoped_call_expression"],
+            Lang::Bash => &["command"],
+            Lang::Rust => &[],
+        }
+    }
+
+    /// Import/use node kinds (for `Imports` edges).
+    fn imports(self) -> &'static [&'static str] {
+        match self {
+            Lang::Python => &["import_statement", "import_from_statement"],
+            Lang::JavaScript | Lang::TypeScript | Lang::Tsx => &["import_statement"],
+            Lang::Go => &["import_spec"],
+            Lang::Java => &["import_declaration"],
+            Lang::C | Lang::Cpp => &["preproc_include"],
+            Lang::CSharp => &["using_directive"],
+            Lang::Php => &["namespace_use_declaration"],
+            Lang::Ruby | Lang::Bash | Lang::Lua | Lang::Rust => &[],
+        }
+    }
+
+    fn def_kind(self, kind: &str) -> Option<NodeKind> {
+        self.defs().iter().find(|(k, _)| *k == kind).map(|(_, nk)| *nk)
+    }
+}
+
+/// Identifier-ish node kinds a generic name/callee/import lookup will accept.
+const IDENT_KINDS: &[&str] = &[
+    "identifier",
+    "type_identifier",
+    "field_identifier",
+    "property_identifier",
+    "constant",
+    "name",
+    "word",
+    "scoped_identifier",
+    "dotted_name",
+    "namespace",
+    "variable_name",
+];
+
+/// Derive a language-neutral module FQN from a repo-relative path, joining path
+/// segments with `::` (used purely as a stable id separator). Drops a leading
+/// `src`/`lib`/`app` dir and index-like file stems.
+fn generic_module_fqn(path: &str) -> String {
+    let p = path.trim_start_matches("./");
+    let stem = match p.rsplit_once('.') {
+        Some((s, _)) => s,
+        None => p,
+    };
+    let mut parts: Vec<&str> = stem.split('/').filter(|s| !s.is_empty()).collect();
+    if matches!(parts.first().copied(), Some("src") | Some("lib") | Some("app")) {
+        parts.remove(0);
+    }
+    if matches!(
+        parts.last().copied(),
+        Some("mod") | Some("lib") | Some("main") | Some("index") | Some("__init__") | Some("init")
+    ) {
+        parts.pop();
+    }
+    if parts.is_empty() {
+        return "root".to_string();
+    }
+    parts.join("::")
+}
+
+/// Find the first identifier-ish descendant text (BFS to `max_depth`).
+fn first_ident(node: Node, src: &[u8], max_depth: usize) -> Option<String> {
+    let mut q: std::collections::VecDeque<(Node, usize)> = std::collections::VecDeque::new();
+    q.push_back((node, 0));
+    while let Some((n, d)) = q.pop_front() {
+        if d > 0 && IDENT_KINDS.contains(&n.kind()) {
+            if let Ok(t) = n.utf8_text(src) {
+                let t = t.trim();
+                if !t.is_empty() {
+                    return Some(t.to_string());
+                }
+            }
+        }
+        if d < max_depth {
+            let mut c = n.walk();
+            for ch in n.named_children(&mut c) {
+                q.push_back((ch, d + 1));
+            }
+        }
+    }
+    None
+}
+
+/// The defined symbol's short name: the `name` field if present, else the first
+/// identifier-ish descendant (handles C-style declarators, etc.).
+fn generic_name_of(node: Node, src: &[u8]) -> Option<String> {
+    if let Some(nf) = node.child_by_field_name("name") {
+        if let Ok(t) = nf.utf8_text(src) {
+            let t = last_segment(t.trim());
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    first_ident(node, src, 3).map(|s| last_segment(&s).to_string())
+}
+
+/// The callee short name of a call node.
+fn generic_callee(node: Node, src: &[u8]) -> Option<String> {
+    for field in ["function", "name", "method"] {
+        if let Some(f) = node.child_by_field_name(field) {
+            // a field may itself be scoped/attribute — take its last identifier
+            if let Ok(t) = f.utf8_text(src) {
+                let seg = last_segment(t.trim());
+                if !seg.is_empty() {
+                    return Some(seg.to_string());
+                }
+            }
+        }
+    }
+    first_ident(node, src, 2)
+}
+
+/// Imported symbol short names from an import node (identifier leaves).
+fn generic_imports(node: Node, src: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut q: std::collections::VecDeque<Node> = std::collections::VecDeque::new();
+    q.push_back(node);
+    while let Some(n) = q.pop_front() {
+        if IDENT_KINDS.contains(&n.kind()) {
+            if let Ok(t) = n.utf8_text(src) {
+                let seg = last_segment(t.trim());
+                if !seg.is_empty() && seg != "self" {
+                    out.push(seg.to_string());
+                }
+            }
+        }
+        let mut c = n.walk();
+        for ch in n.named_children(&mut c) {
+            q.push_back(ch);
+        }
+    }
+    out.truncate(16);
+    out
+}
+
+/// Generic recursive walk for a non-Rust language, mirroring the Rust walk but
+/// driven by the language's [`LangSpec`].
+fn generic_walk(ctx: &mut Ctx, node: Node, container_id: &str, enclosing_fn: Option<&str>, lang: Lang) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        let kind = child.kind();
+
+        if lang.imports().contains(&kind) {
+            for name in generic_imports(child, ctx.src) {
+                ctx.out.candidates.push((ctx.module.clone(), name, EdgeKind::Imports));
+            }
+            continue;
+        }
+        if lang.calls().contains(&kind) {
+            if let Some(src_id) = enclosing_fn {
+                if let Some(callee) = generic_callee(child, ctx.src) {
+                    ctx.out.candidates.push((src_id.to_string(), callee, EdgeKind::Calls));
+                }
+            }
+            generic_walk(ctx, child, container_id, enclosing_fn, lang);
+            continue;
+        }
+        if let Some(nk) = lang.def_kind(kind) {
+            // Inside a function body → a local/nested def; not a node. Recurse
+            // for calls only (keeps top-level items + methods, like the Rust path).
+            if enclosing_fn.is_some() {
+                generic_walk(ctx, child, container_id, enclosing_fn, lang);
+                continue;
+            }
+            let Some(name) = generic_name_of(child, ctx.src) else {
+                generic_walk(ctx, child, container_id, enclosing_fn, lang);
+                continue;
+            };
+            let id = format!("{container_id}::{name}");
+            ctx.push_node(&id, nk, &name, child);
+            ctx.out.contains.push((container_id.to_string(), id.clone()));
+            if nk == NodeKind::Function {
+                generic_walk(ctx, child, &id, Some(&id), lang);
+            } else {
+                // type-like: its members are Contained by it
+                generic_walk(ctx, child, &id, enclosing_fn, lang);
+            }
+            continue;
+        }
+        generic_walk(ctx, child, container_id, enclosing_fn, lang);
+    }
+}
+
+/// Extract nodes + edge candidates from one non-Rust file.
+fn generic_extract_file(path: &str, source: &str, lang: Lang) -> FileExtract {
+    let module = generic_module_fqn(path);
+    let out = FileExtract {
+        nodes: vec![KgNode::new(&module, NodeKind::Module, last_segment(&module), path)],
+        contains: Vec::new(),
+        candidates: Vec::new(),
+    };
+    let mut parser = Parser::new();
+    if parser.set_language(&lang.ts_language()).is_err() {
+        return out;
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return out;
+    };
+    let mut ctx = Ctx {
+        src: source.as_bytes(),
+        path,
+        module: module.clone(),
+        out,
+    };
+    generic_walk(&mut ctx, tree.root_node(), &module, None, lang);
+    ctx.out
 }
 
 /// Resolve a candidate `target` (a bare name, or a one-level-qualified
@@ -601,6 +980,88 @@ pub fn outer() -> u8 {
         assert!(g.get_node("crate::m::outer").is_some(), "top-level fn emitted");
         assert!(g.get_node("crate::m::outer::Local").is_none(), "local struct not a node");
         assert!(g.get_node("crate::m::outer::helper").is_none(), "local fn not a node");
+    }
+
+    #[test]
+    fn python_class_method_and_call() {
+        let src = "def helper():\n    pass\n\ndef caller():\n    helper()\n\nclass Widget:\n    def rename(self):\n        pass\n";
+        let g = build_graph("P", &[("pkg/w.py".to_string(), src.to_string())]).unwrap();
+        assert!(g.get_node("pkg::w::helper").is_some(), "fn");
+        assert!(g.get_node("pkg::w::Widget").is_some(), "class");
+        assert!(g.get_node("pkg::w::Widget::rename").is_some(), "method attributed to class");
+        assert!(g.edges().any(|e| e.from == "pkg::w::Widget" && e.to == "pkg::w::Widget::rename" && e.kind == EdgeKind::Contains));
+        assert!(g.edges().any(|e| e.from == "pkg::w::caller" && e.to == "pkg::w::helper" && e.kind == EdgeKind::Calls));
+    }
+
+    #[test]
+    fn go_functions_and_call() {
+        let src = "package p\nfunc Foo() { Bar() }\nfunc Bar() {}\n";
+        let g = build_graph("G", &[("svc/x.go".to_string(), src.to_string())]).unwrap();
+        assert!(g.get_node("svc::x::Foo").is_some());
+        assert!(g.get_node("svc::x::Bar").is_some());
+        assert!(g.edges().any(|e| e.from == "svc::x::Foo" && e.to == "svc::x::Bar" && e.kind == EdgeKind::Calls));
+    }
+
+    #[test]
+    fn lua_function_extracted_unblocks_civic_rail() {
+        let src = "function greet(name)\n  print('hi '..name)\nend\n\nlocal function helper()\nend\n";
+        let g = build_graph("RAIL", &[("cfg/a.lua".to_string(), src.to_string())]).unwrap();
+        assert!(g.get_node("cfg::a::greet").is_some(), "lua function extracted");
+        assert!(g.node_count() >= 2, "module + at least one function");
+    }
+
+    #[test]
+    fn java_class_method_contains_and_call() {
+        let src = "class Foo {\n  void m() { n(); }\n  void n() {}\n}\n";
+        let g = build_graph("J", &[("com/widgets.java".to_string(), src.to_string())]).unwrap();
+        assert!(g.get_node("com::widgets::Foo").is_some(), "class");
+        assert!(g.get_node("com::widgets::Foo::m").is_some(), "method");
+        assert!(g.edges().any(|e| e.from == "com::widgets::Foo" && e.to == "com::widgets::Foo::m" && e.kind == EdgeKind::Contains));
+        assert!(g.edges().any(|e| e.from == "com::widgets::Foo::m" && e.to == "com::widgets::Foo::n" && e.kind == EdgeKind::Calls));
+    }
+
+    #[test]
+    fn javascript_functions_and_call() {
+        let src = "function f() { g(); }\nfunction g() {}\n";
+        let g = build_graph("W", &[("web/app.js".to_string(), src.to_string())]).unwrap();
+        assert!(g.get_node("web::app::f").is_some());
+        assert!(g.edges().any(|e| e.from == "web::app::f" && e.to == "web::app::g" && e.kind == EdgeKind::Calls));
+    }
+
+    #[test]
+    fn ruby_class_and_method() {
+        let src = "class Foo\n  def bar\n  end\nend\n";
+        let g = build_graph("R", &[("lib/foo.rb".to_string(), src.to_string())]).unwrap();
+        // lib/ is stripped -> module "foo"
+        assert!(g.get_node("foo::Foo").is_some(), "ruby class");
+        assert!(g.get_node("foo::Foo::bar").is_some(), "ruby method");
+    }
+
+    #[test]
+    fn mixed_language_project_builds_all() {
+        let files = vec![
+            ("a.py".to_string(), "def pyf():\n    pass\n".to_string()),
+            ("b.lua".to_string(), "function luaf()\nend\n".to_string()),
+            ("c.go".to_string(), "package c\nfunc Gof() {}\n".to_string()),
+            ("d.rs".to_string(), "pub fn rustf() {}\n".to_string()),
+            ("readme.txt".to_string(), "not code".to_string()), // unsupported → skipped
+        ];
+        let g = build_graph("MIX", &files).unwrap();
+        assert!(g.get_node("a::pyf").is_some(), "python");
+        assert!(g.get_node("b::luaf").is_some(), "lua");
+        assert!(g.get_node("c::Gof").is_some(), "go");
+        assert!(g.get_node("crate::d::rustf").is_some(), "rust keeps crate:: FQN");
+    }
+
+    #[test]
+    fn lang_from_path_covers_the_set() {
+        assert_eq!(Lang::from_path("x.py"), Some(Lang::Python));
+        assert_eq!(Lang::from_path("x.lua"), Some(Lang::Lua));
+        assert_eq!(Lang::from_path("x.go"), Some(Lang::Go));
+        assert_eq!(Lang::from_path("x.tsx"), Some(Lang::Tsx));
+        assert_eq!(Lang::from_path("x.cpp"), Some(Lang::Cpp));
+        assert_eq!(Lang::from_path("x.rb"), Some(Lang::Ruby));
+        assert_eq!(Lang::from_path("x.md"), None);
     }
 
     #[test]
