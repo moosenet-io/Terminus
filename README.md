@@ -178,7 +178,10 @@ A graph is produced end-to-end by **`scribe_kg_build`** (`project_id`,
 to patch only those files) — it walks the repo, extracts → clusters → lays out
 → renders, stores the graph JSON, and writes the visual artifacts.
 **`scribe_kg_status`** reports a project's counts, freshness, and which
-artifacts exist.
+artifacts exist. When `scribe_generate_readme` is given a `project_id` whose
+graph has been built, it appends the rendered map (`map.svg` + confidence
+legend) to the generated README as an **"## Architecture map"** section — so the
+graph informs the doc's visual output; projects without a graph are unchanged.
 
 A graph also renders to three visual artifacts (all from one shared
 force-directed layout, so they agree): a static **`map.svg`** — nodes colored by
