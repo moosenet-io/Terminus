@@ -145,6 +145,16 @@ fn patterns() -> &'static CleanPatterns {
             (Regex::new(r"(?i)\bpboose\b").unwrap(), "<operator>"),
             // generic email — last
             (Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}").unwrap(), "<email>"),
+            // Canonical phone numbers (GHMRFIX-6) — the SAME shapes the gate's
+            // `phone` detector flags (E.164, or grouped 3-3-4 NANP), so a phone the
+            // gate would withhold on gets scrubbed by the mirror instead. Found in
+            // history by the GHIST full-history gate: a PII-sanitizer's own fixtures
+            // (`"phone": "<phone>"`) tripped it. The strict shapes (canonical
+            // only, matching GHMRFIX-4) keep this from mangling dates/versions/math.
+            (
+                Regex::new(r"(?:\+\d[\d \-]{5,13}\d)|(?:\b\(?\d{3}\)?[ \-]\d{3}[ \-]\d{4}\b)").unwrap(),
+                "<phone>",
+            ),
         ];
 
         let uuid =
@@ -363,6 +373,27 @@ mod tests {
             scrub("# PLANE_PROJECT_ID=<uuid>"),
             "# PLANE_PROJECT_ID=<uuid>"
         );
+    }
+
+    // ── GHMRFIX-6: canonical phones scrubbed; non-phone digit shapes untouched ──
+    #[test]
+    fn canonical_phones_are_scrubbed_but_dates_are_not() {
+        // The exact fixtures the GHIST full-history gate flagged in Lumina history.
+        assert_eq!(scrub(r#"    "phone": "<phone>","#), r#"    "phone": "<phone>","#); // pii-test-fixture
+        assert_eq!(
+            scrub("call <phone>. SSN: 123-45-6789."), // pii-test-fixture
+            "call <phone>. SSN: 123-45-6789." // 3-3-4 phone scrubbed; 3-2-4 fake SSN left (gate doesn't flag it)
+        );
+        assert_eq!(scrub("reach <phone> now"), "reach <phone> now"); // pii-test-fixture (e.164)
+        // Non-phone digit shapes the strict pattern must NOT touch.
+        for keep in [
+            "released 2026-01-01 today",
+            "version 1.2.3 build 20260514-100000",
+            "values 10 20 30 40 middle",
+            "range 1000-10000 ms",
+        ] {
+            assert_eq!(scrub(keep), keep, "non-phone shape untouched: {keep}");
+        }
     }
 
     // ── review hardening: no identifier / venv / multi-line over-redaction ──
