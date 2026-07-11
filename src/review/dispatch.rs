@@ -12,9 +12,12 @@
 //! whole tool call. See `mod.rs::execute` for how a single provider's failure
 //! never blocks the others.
 
+use std::time::Instant;
+
 use serde_json::{json, Value};
 
 use crate::error::ToolError;
+use crate::review::free_pool;
 
 /// nemotron's fixed, verified-live OpenRouter model tag. Upgraded from the
 /// nano-tier `nvidia/nemotron-nano-9b-v2:free` (real but not frontier-class)
@@ -145,6 +148,85 @@ impl ReviewConfig {
             Ok(text)
         }
     }
+
+    /// Dispatch the `free` provider: draw from the daily-curated free-model pool
+    /// (`free_pool`), round-robin, and on a 429 put that model in cooldown and
+    /// rotate to the next -- so a free review lands on whatever pooled model
+    /// still has quota. Degrades cleanly (never panics): no key -> unavailable;
+    /// every model rate-limited -> a clear "all cooling down" error; catalog
+    /// unreachable -> keep the last-good pool (best-effort refresh).
+    pub async fn dispatch_free_pool(&self, prompt: &str) -> Result<String, String> {
+        if self.openrouter_key.is_none() {
+            return Err("unavailable: OPENROUTER_API_KEY not configured".to_string());
+        }
+        self.ensure_pool_fresh().await;
+
+        let pool = free_pool::global_pool();
+        let attempts = pool.lock().await.len().max(1);
+        let mut last_err = "unavailable: free-tier pool is empty".to_string();
+        for _ in 0..attempts {
+            let model = pool.lock().await.next_available(Instant::now());
+            let Some(model) = model else {
+                return Err(
+                    "unavailable: all free-tier models are rate-limited (cooling down)".to_string(),
+                );
+            };
+            match self.dispatch_openrouter(&model, prompt).await {
+                Ok(text) => return Ok(text),
+                Err(e) => {
+                    // Only a rate-limit earns a cooldown; other per-model errors
+                    // just rotate (the cursor already advanced) without penalty.
+                    if is_openrouter_rate_limited(&e) {
+                        pool.lock().await.mark_rate_limited(&model, Instant::now());
+                    }
+                    last_err = e;
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    /// Refresh the global free-model pool from OpenRouter's public catalog if it
+    /// is stale (>= 24h) or empty. Best-effort: any failure keeps the last-good
+    /// pool rather than clearing it. The catalog endpoint is unauthenticated, so
+    /// this needs no key.
+    async fn ensure_pool_fresh(&self) {
+        let pool = free_pool::global_pool();
+        let stale = pool.lock().await.is_stale(Instant::now());
+        if !stale {
+            return;
+        }
+        match self.fetch_free_catalog().await {
+            Ok(models) if !models.is_empty() => {
+                pool.lock().await.set_models(models, Instant::now());
+            }
+            Ok(_) => tracing::warn!("free_pool: catalog scan curated 0 models -- keeping last-good pool"),
+            Err(e) => tracing::warn!("free_pool: catalog refresh failed ({e}) -- keeping last-good pool"),
+        }
+    }
+
+    /// Fetch + curate the OpenRouter model catalog into a pool of model ids.
+    async fn fetch_free_catalog(&self) -> Result<Vec<String>, String> {
+        let client = Self::client().map_err(|e| e.to_string())?;
+        let resp = client
+            .get(free_pool::OPENROUTER_MODELS_URL)
+            .send()
+            .await
+            .map_err(|e| format!("models unreachable: {e}"))?;
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("malformed models response: {e}"))?;
+        Ok(free_pool::curate(&body))
+    }
+}
+
+/// Whether an OpenRouter dispatch error string is a rate-limit (HTTP 429),
+/// which the free pool treats as "this model is out of quota, rotate + cool it
+/// down" rather than a hard failure.
+pub fn is_openrouter_rate_limited(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("http 429") || e.contains("too many requests")
 }
 
 /// Map a review-provider name (as accepted by `review_run`'s `providers` list)
@@ -239,5 +321,30 @@ mod tests {
         assert!(is_daemon_provider("agy"));
         assert!(!is_daemon_provider("nemotron"));
         assert!(!is_daemon_provider("qwen_coder"));
+        assert!(!is_daemon_provider("free"));
+    }
+
+    #[test]
+    fn rate_limit_detector_matches_429_and_ignores_others() {
+        // The exact shape dispatch_openrouter produces on a throttle.
+        assert!(is_openrouter_rate_limited(
+            "unavailable: openrouter http 429 Too Many Requests: Provider returned error"
+        ));
+        assert!(is_openrouter_rate_limited("Too Many Requests"));
+        // Non-rate-limit errors must NOT be treated as a cooldown trigger.
+        assert!(!is_openrouter_rate_limited("unavailable: openrouter http 500: server error"));
+        assert!(!is_openrouter_rate_limited("unavailable: openrouter returned empty content"));
+        assert!(!is_openrouter_rate_limited("unavailable: OPENROUTER_API_KEY not configured"));
+    }
+
+    #[tokio::test]
+    async fn free_pool_dispatch_degrades_when_no_key() {
+        let cfg = ReviewConfig {
+            daemon_url: DEFAULT_DAEMON_URL.to_string(),
+            daemon_token: None,
+            openrouter_key: None,
+        };
+        let err = cfg.dispatch_free_pool("review this").await.unwrap_err();
+        assert!(err.contains("OPENROUTER_API_KEY"));
     }
 }
