@@ -41,13 +41,35 @@
 -- `CREATE INDEX IF NOT EXISTS`, so re-applying is a safe no-op. No backfill — the
 -- catalog is (re)derived cheaply from the upstream tables and re-persisted
 -- wholesale by the refresh at the end of each unified harness run (and on demand).
+--
+-- ACQ-02 (TERM #245) PK CORRECTION: the parent card table `model_fleet_catalog`
+-- was originally declared with `quant TEXT` (nullable) but
+-- `PRIMARY KEY (model_name, quant)` — Postgres implicitly forces every PK column
+-- NOT NULL, so that declaration silently rejected any card whose quant is
+-- unknown (a fleet model never swept has no measured quant to report; see the
+-- "NULL for a fleet model that was never swept" comment below). Production
+-- (<host> `lumina_intake`) was already hotfixed LIVE via
+-- `ALTER TABLE model_fleet_catalog DROP CONSTRAINT ... , ADD PRIMARY KEY
+-- (model_name)` plus a COALESCE-based unique index so `quant` can stay NULL
+-- while `(model_name, quant)` combinations are still deduplicated. This
+-- migration is corrected to match that live state exactly, so a fresh-from-repo
+-- DB build ends up identical to <host> rather than re-introducing the bug.
+-- Ordering note: on a DB where the live ALTER already ran (e.g. <host>), the
+-- `CREATE TABLE IF NOT EXISTS` below is a no-op (table already exists, already
+-- keyed on `model_name`) and only the `CREATE UNIQUE INDEX IF NOT EXISTS`
+-- statement actually executes (and is itself a no-op there too, since the
+-- equivalent index was already created by the live hotfix under a different
+-- name — Postgres allows duplicate functionally-equivalent indexes, so this is
+-- inert, not an error). On a genuinely fresh DB, both statements create the
+-- corrected objects from scratch.
 
--- Per-model summary card: one row per (model_name, quant). `quant` is the model's
--- representative quant (from its coder aggregates, else NULL when never swept); the
--- authoritative per-config detail lives in the cell table below. Serving facts are
--- stashed as JSONB so the summary stays a single "fleet card" object without a
--- migration every time a new serving fact is surfaced. `not_run_count`/`stale_count`
--- put "what's missing" one field away.
+-- Per-model summary card: ONE ROW PER model_name (ACQ-02: the card is keyed on
+-- model_name only, not (model_name, quant) — see the PK CORRECTION note above).
+-- `quant` is the model's representative quant (from its coder aggregates, else
+-- NULL when never swept); the authoritative per-config detail lives in the cell
+-- table below. Serving facts are stashed as JSONB so the summary stays a single
+-- "fleet card" object without a migration every time a new serving fact is
+-- surfaced. `not_run_count`/`stale_count` put "what's missing" one field away.
 CREATE TABLE IF NOT EXISTS model_fleet_catalog (
     model_name        TEXT        NOT NULL,
     -- Representative quant for the card (cells carry their own per-config quant).
@@ -64,8 +86,18 @@ CREATE TABLE IF NOT EXISTS model_fleet_catalog (
     stale_count       INTEGER     NOT NULL DEFAULT 0,
     -- When this card was last (re)derived.
     refreshed_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (model_name, quant)
+    -- ACQ-02: PK on model_name ONLY (was `(model_name, quant)`, which — since a
+    -- PK column is implicitly NOT NULL — rejected any card with an unknown
+    -- (never-swept) quant). See the ACQ-02 header comment above.
+    PRIMARY KEY (model_name)
 );
+
+-- ACQ-02: uniqueness across (model_name, quant) is enforced here instead of via
+-- the PK, using COALESCE so a NULL quant (never-swept model) still dedupes
+-- against other NULL-quant rows for the same model_name — matching the live
+-- <host> hotfix exactly. `IF NOT EXISTS` makes re-applying a clean no-op.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_fleet_catalog_model_quant
+    ON model_fleet_catalog (model_name, COALESCE(quant, ''));
 
 -- LONG-format coverage cells: the queryable core. One row per
 -- (model_name, quant, test_type, task_category). `status` is the coverage status
