@@ -53,6 +53,18 @@
 //! hand-editing `TERMINUS_MESH_UPSTREAMS_JSON`. See that module's doc for why
 //! it never mutates config or prints a secret value.
 //!
+//! ## MESH-12: onboarding a new remote CLIENT
+//! [`client_onboarding`] adds the companion workflow (CORE tool
+//! `mesh_onboard_client`) for the other direction: bringing a new remote
+//! client onto the mesh, rather than a new upstream server. It mints/records
+//! the client's identity (embedded-CA cert or tailnet mapping), maps it to a
+//! canonical [`principal::Principal`] name, seeds a least-privilege
+//! `crate::gateway_framework::AllowlistPolicy` grant for that name (never
+//! default-allow), and emits a ready-to-use client connection profile — same
+//! "emit config for the operator to persist, never mutate live config
+//! directly" convention as [`onboarding`]. See that module's own doc for the
+//! full design.
+//!
 //! ## MESH-03: merging catalogs across many upstreams + local core
 //! [`merge`] merges the local core catalog with every healthy upstream's
 //! `tools/list` into one `tools/list` result, namespacing every federated
@@ -63,6 +75,7 @@
 //! exposes (`MergedCatalog::build` for the full `tools/list`,
 //! `resolve_call_route` for a single cheap `tools/call` lookup).
 pub mod client;
+pub mod client_onboarding;
 pub mod identity;
 pub mod merge;
 pub mod onboarding;
@@ -70,6 +83,11 @@ pub mod principal;
 pub mod registry;
 
 pub use client::{ToolMeta, UpstreamCallResult, UpstreamClient, UpstreamClientError, UpstreamPool};
+pub use client_onboarding::{
+    onboard_client, ClientMechanism, ClientMechanismReport, MeshOnboardClient,
+    OnboardClientError, OnboardClientRequest, OnboardClientReport,
+    LEAST_PRIVILEGE_CLIENT_GRANT_TOOLS,
+};
 pub use identity::TailnetIdentity;
 pub use merge::{
     namespaced, resolve_call_route, split_namespaced, upstream_unavailable_text, CallRoute,
