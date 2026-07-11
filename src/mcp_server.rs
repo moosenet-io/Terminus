@@ -56,7 +56,8 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::federation::PersonalFederationClient;
-use crate::gateway_framework::{ActionKind, GatewayFramework};
+use crate::gateway_framework::audit::{AuditDecision, AuditEntry, AuditResult};
+use crate::gateway_framework::{ActionKind, GatewayFramework, ANONYMOUS_IDENTITY};
 use crate::inference_proxy::{
     InferenceProxyClient, AGENT_EXECUTE_PATH, CHAT_COMPLETIONS_PATH, CODING_SELECT_PATH,
     INFER_PATH,
@@ -476,6 +477,15 @@ async fn handle_mcp(
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
+            // MESH-10: the canonical principal + the namespace (if any) the
+            // advertised name parses to -- computed once up front so both
+            // the pre-dispatch deny path (mesh routing hasn't run yet, so it
+            // can't supply this from a `CallRoute`) and the post-dispatch
+            // audit below can attribute a federated call to its upstream.
+            let audit_principal =
+                principal.as_ref().map(|p| p.name().to_string()).unwrap_or_else(|| ANONYMOUS_IDENTITY.to_string());
+            let audit_upstream_ns = crate::mesh::split_namespaced(name).map(|(ns, _)| ns.to_string());
+
             // TGW-04: gate every tool call -- core (local) AND
             // personal-federated -- through the same identity → allowlist →
             // rate-limit pipeline the inference-proxy routes use (see
@@ -493,6 +503,28 @@ async fn handle_mcp(
                     Ok(ctx) => Some(ctx),
                     Err(denial) => {
                         let denial_text = response_body_text(denial).await;
+                        // MESH-10: `guard()` already logged the precise
+                        // generic denial (no-identity / not-allowlisted /
+                        // rate-limited) -- for a FEDERATED (namespaced) name
+                        // specifically, also log a federated-audit entry
+                        // carrying the upstream/bare-tool-name context
+                        // `guard()` itself can't know about, so a reviewer
+                        // never has to correlate two log lines to see that a
+                        // mesh call was denied. Never silent either way.
+                        if let Some(namespace) = &audit_upstream_ns {
+                            let bare = crate::mesh::split_namespaced(name).map(|(_, b)| b).unwrap_or(name);
+                            AuditEntry::new_federated(
+                                &audit_principal,
+                                Some(namespace.clone()),
+                                name,
+                                bare,
+                                ActionKind::Tool,
+                                AuditResult::DeniedNotAllowlisted,
+                                AuditDecision::Deny,
+                                Some(&denial_text),
+                            )
+                            .log();
+                        }
                         return sse_response(
                             id,
                             Ok(json!({
@@ -519,6 +551,28 @@ async fn handle_mcp(
             // dispatch below, byte-for-byte unchanged.
             let mesh_route = state.mesh_pool.as_ref().map(|pool| crate::mesh::resolve_call_route(name, pool));
 
+            // MESH-10: once routing is resolved, attach the upstream/bare
+            // tool name to the gate context (a no-op when `state.gateway` is
+            // unset) so the terminal audit entry below carries the same
+            // federated context the deny path above already logs.
+            let gate_ctx = match &mesh_route {
+                Some(CallRoute::Upstream { client, bare_name }) => {
+                    gate_ctx.map(|ctx| ctx.with_upstream(client.namespace().to_string(), bare_name.clone()))
+                }
+                Some(CallRoute::Unavailable { namespace }) => {
+                    gate_ctx.map(|ctx| ctx.with_upstream(namespace.clone(), name.to_string()))
+                }
+                _ => gate_ctx,
+            };
+            // MESH-10: set when dispatch couldn't even reach an upstream at
+            // the transport level (unhealthy/unregistered mesh upstream, or
+            // a network-level failure calling one that IS registered) --
+            // audited below as `AuditDecision::TransportFailure`, never
+            // silently dropped, and kept distinct from an ordinary
+            // application-level tool error (`success: false` with the
+            // default `Allow` decision).
+            let mut is_transport_failure = false;
+
             let (response, success, detail) = match mesh_route {
                 Some(CallRoute::Upstream { client, bare_name }) => {
                     match client.call_tool(&bare_name, arguments.clone()).await {
@@ -535,6 +589,7 @@ async fn handle_mcp(
                             None,
                         ),
                         Err(mesh_err) => {
+                            is_transport_failure = true;
                             warn!(
                                 "mesh: error calling \"{bare_name}\" on upstream \"{}\": {mesh_err}",
                                 client.namespace()
@@ -559,6 +614,7 @@ async fn handle_mcp(
                     }
                 }
                 Some(CallRoute::Unavailable { namespace }) => {
+                    is_transport_failure = true;
                     let msg = crate::mesh::upstream_unavailable_text(&namespace);
                     (
                         sse_response(
@@ -684,7 +740,11 @@ async fn handle_mcp(
             };
 
             if let Some(ctx) = gate_ctx {
-                ctx.record_result(success, detail.as_deref());
+                if is_transport_failure {
+                    ctx.record_transport_failure(detail.as_deref());
+                } else {
+                    ctx.record_result(success, detail.as_deref());
+                }
             }
             response
         }
@@ -1387,5 +1447,133 @@ mod tests {
             body["result"]["isError"], true,
             "a bare client-set identity header must never grant access: {body}"
         );
+    }
+
+    // ── MESH-10: federated audit trail ─────────────────────────────────────
+    //
+    // The AuditEntry/AuditDecision shape itself (redaction, principal,
+    // upstream, decision values) is covered exhaustively by
+    // `gateway_framework::audit`'s own unit tests. These tests instead
+    // exercise the `tools/call` dispatch path end to end -- proving a
+    // federated call actually reaches `GatewayContext::with_upstream` /
+    // `record_result` / `record_transport_failure` (i.e. an audit entry is
+    // really emitted, not silently skipped) without panicking, for both the
+    // allow and the deny cases.
+
+    fn state_with_mesh(gateway: GatewayFramework, mesh_pool: UpstreamPool) -> Arc<McpServerState> {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoHealthTool)).unwrap();
+        Arc::new(McpServerState {
+            registry,
+            server_name: "terminus-mesh10-test".to_string(),
+            server_version: "0.0.0-test".to_string(),
+            auth_token: None,
+            personal_federation: None,
+            inference_proxy: None,
+            gateway: Some(gateway),
+            mesh_pool: Some(Arc::new(mesh_pool)),
+            principal_resolver: PrincipalResolver::default(),
+        })
+    }
+
+    fn mesh10_init_response() -> Value {
+        json!({"jsonrpc": "2.0", "id": 1, "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "mesh10-mock-upstream", "version": "0.0.0"}
+        }})
+    }
+
+    fn mesh10_registry_json(base_url: &str) -> String {
+        // Bearer transport with no `secret_key` configured resolves to "no
+        // auth" (see `UpstreamServer::resolve_secret`) -- simplest transport
+        // for a plain local mock server, no embedded-CA/mTLS bootstrap
+        // needed.
+        format!(r#"[{{"name":"mesh10-upstream","url":"{base_url}","transport":"bearer","namespace":"mesh10ns"}}]"#)
+    }
+
+    /// A federated (namespaced) call that IS allowlisted and routes to a
+    /// healthy upstream: dispatch succeeds, and
+    /// `GatewayContext::with_upstream(..).record_result(true, ..)` runs
+    /// (proven by a clean `200`/`isError: false` round trip -- a panic in
+    /// that path would fail this test).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn federated_call_allowed_and_routed_is_audited_as_allow() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/mcp").json_body_partial(r#"{"method": "initialize"}"#);
+            then.status(200).header("Mcp-Session-Id", "mesh10-session").json_body(mesh10_init_response());
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/mcp").json_body_partial(r#"{"method": "tools/call"}"#);
+            then.status(200).json_body(json!({
+                "jsonrpc": "2.0", "id": 3,
+                "result": {"content": [{"type": "text", "text": "echo: hi"}], "isError": false}
+            }));
+        });
+
+        let registry = crate::mesh::registry::UpstreamRegistry::from_json(&mesh10_registry_json(&server.base_url()))
+            .expect("valid registry json");
+        let pool = UpstreamPool::from_registry(&registry);
+
+        let gateway = gateway_allowing("dev-box", &["mesh10ns__echo"]);
+        let state = state_with_mesh(gateway, pool);
+        let router = build_router(state);
+
+        let identity = ClientIdentity("dev-box".to_string());
+        let (status, body) = post_mcp_with_identity(
+            router,
+            json!({
+                "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                "params": {"name": "mesh10ns__echo", "arguments": {"msg": "hi"}}
+            }),
+            Some(identity),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["isError"], false, "federated call should succeed: {body}");
+        assert_eq!(body["result"]["content"][0]["text"], "echo: hi");
+    }
+
+    /// A federated (namespaced) call NOT allowlisted for this identity: the
+    /// deny happens before mesh routing is even resolved -- proving the
+    /// `AuditEntry::new_federated(.., AuditDecision::Deny, ..)` branch in the
+    /// `Err(denial)` arm runs (a panic there would fail this test), and the
+    /// call is never dispatched to the upstream at all (no mock configured
+    /// for `tools/call`, so a dispatch attempt would itself fail the mock
+    /// server's strict routing).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn federated_call_denied_before_dispatch_is_audited_as_deny() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/mcp").json_body_partial(r#"{"method": "initialize"}"#);
+            then.status(200).header("Mcp-Session-Id", "mesh10-session").json_body(mesh10_init_response());
+        });
+
+        let registry = crate::mesh::registry::UpstreamRegistry::from_json(&mesh10_registry_json(&server.base_url()))
+            .expect("valid registry json");
+        let pool = UpstreamPool::from_registry(&registry);
+
+        // Allowlisted for a DIFFERENT tool only -- "mesh10ns__echo" is denied.
+        let gateway = gateway_allowing("dev-box", &["some_other_tool"]);
+        let state = state_with_mesh(gateway, pool);
+        let router = build_router(state);
+
+        let identity = ClientIdentity("dev-box".to_string());
+        let (status, body) = post_mcp_with_identity(
+            router,
+            json!({
+                "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                "params": {"name": "mesh10ns__echo", "arguments": {}}
+            }),
+            Some(identity),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["isError"], true, "denied federated call must be a tool-error result: {body}");
     }
 }

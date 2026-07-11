@@ -81,7 +81,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::mesh::Principal;
-use audit::{AuditEntry, AuditResult};
+use audit::{AuditDecision, AuditEntry, AuditResult};
 use rate_limit::{rate_limit_key, InProcessRateLimiter, RateLimitDecision, RateLimiter};
 
 /// Label recorded in the audit log when no mTLS identity is present at all
@@ -426,11 +426,31 @@ pub struct GatewayContext {
     identity: String,
     action: String,
     kind: ActionKind,
+    /// MESH-10: the mesh namespace this call was routed to, if any — set via
+    /// [`Self::with_upstream`] once the caller (`crate::mcp_server`) has
+    /// resolved the `tools/call` route. `None` for local/personal-federated
+    /// dispatch and for every non-`Tool` (inference) request.
+    upstream: Option<String>,
+    /// MESH-10: the bare (un-namespaced) tool name actually dispatched.
+    /// Equal to `action` until/unless [`Self::with_upstream`] overrides it.
+    tool_bare: String,
 }
 
 impl GatewayContext {
     pub fn identity(&self) -> &str {
         &self.identity
+    }
+
+    /// MESH-10: attach federated-dispatch context — the mesh namespace this
+    /// call routed to, and the bare tool name forwarded to that upstream —
+    /// before calling [`Self::record_result`]. Local (non-federated) call
+    /// sites never call this, leaving `upstream` `None` and `tool_bare`
+    /// equal to the advertised `action`, exactly as constructed by
+    /// [`GatewayFramework::guard`].
+    pub fn with_upstream(mut self, upstream: impl Into<String>, tool_bare: impl Into<String>) -> Self {
+        self.upstream = Some(upstream.into());
+        self.tool_bare = tool_bare.into();
+        self
     }
 
     /// Record the terminal outcome of a request this context already
@@ -441,13 +461,63 @@ impl GatewayContext {
     /// invariant "exactly one audit entry per request" true whether the
     /// request was denied or completed.
     ///
-    /// `detail` is passed through `audit::sanitize` (via `AuditEntry::new`)
-    /// before it's logged — pass a short summary (e.g. a tool error's
-    /// `Display` output), never a raw payload.
+    /// `detail` is passed through `audit::sanitize` (via
+    /// `AuditEntry::new_federated`) before it's logged — pass a short
+    /// summary (e.g. a tool error's `Display` output, or a sanitized args
+    /// dump), never a raw payload.
+    ///
+    /// MESH-10: if `detail` carries `crate::approval`'s "APPROVAL REQUIRED"
+    /// marker (a guarded local tool that was gated but NOT dispatched), the
+    /// decision recorded is [`AuditDecision::ApprovalRequired`] rather than
+    /// `Allow`, even though this context already cleared the identity/
+    /// allowlist/rate-limit gate — the approval gate is a second, tool-level
+    /// gate this framework doesn't itself enforce but must still audit.
     pub fn record_result(&self, success: bool, detail: Option<&str>) {
-        let result = if success { AuditResult::Success } else { AuditResult::Failure };
-        AuditEntry::new(&self.identity, &self.action, self.kind, result, detail).log();
+        self.record_outcome(None, success, detail);
     }
+
+    /// MESH-10: like [`Self::record_result`], but for the case dispatch
+    /// couldn't even be attempted at the transport level — a federated (mesh)
+    /// upstream that's unhealthy/unregistered, or a network-level failure
+    /// calling one that IS registered. Always audited (never a silent drop):
+    /// records [`AuditDecision::TransportFailure`] rather than `Allow`, so a
+    /// reviewer can tell "upstream unreachable" apart from "upstream reached,
+    /// but the tool call itself errored" ([`Self::record_result`] with
+    /// `success: false`).
+    pub fn record_transport_failure(&self, detail: Option<&str>) {
+        self.record_outcome(Some(AuditDecision::TransportFailure), false, detail);
+    }
+
+    fn record_outcome(&self, decision_override: Option<AuditDecision>, success: bool, detail: Option<&str>) {
+        let result = if success { AuditResult::Success } else { AuditResult::Failure };
+        let decision = decision_override.unwrap_or_else(|| {
+            if detail.map(is_approval_required_marker).unwrap_or(false) {
+                AuditDecision::ApprovalRequired
+            } else {
+                AuditDecision::Allow
+            }
+        });
+        AuditEntry::new_federated(
+            &self.identity,
+            self.upstream.clone(),
+            &self.action,
+            &self.tool_bare,
+            self.kind,
+            result,
+            decision,
+            detail,
+        )
+        .log();
+    }
+}
+
+/// MESH-10: detect `crate::approval`'s "APPROVAL REQUIRED" gate marker in an
+/// (unsanitized) detail string. A plain substring check on the exact marker
+/// text `approval.rs` emits — kept local rather than importing
+/// `crate::approval` to avoid coupling this module to tool-gate internals
+/// for a single string constant.
+fn is_approval_required_marker(detail: &str) -> bool {
+    detail.contains("APPROVAL REQUIRED")
 }
 
 struct GatewayFrameworkInner {
@@ -554,6 +624,8 @@ impl GatewayFramework {
             identity: identity_str,
             action: action.to_string(),
             kind,
+            upstream: None,
+            tool_bare: action.to_string(),
         })
     }
 
