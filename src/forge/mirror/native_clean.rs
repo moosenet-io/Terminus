@@ -203,6 +203,25 @@ impl DeterministicCleaner {
         out
     }
 
+    /// Scrub a raw blob (for the GHIST full-history replay, which rewrites a
+    /// `git fast-export` byte stream). A blob that is a valid-UTF-8 text file and
+    /// not oversized and NUL-free is scrubbed via [`Self::scrub_text`]; a binary,
+    /// oversized, or non-UTF-8 blob is returned BYTE-IDENTICAL. These skip rules
+    /// mirror [`read_text`] exactly, so replaying history never corrupts a binary
+    /// asset and never alters a blob's line count (the corruption invariant that
+    /// `scrub_text` already guarantees for text).
+    pub fn scrub_bytes(bytes: &[u8]) -> Vec<u8> {
+        // 5 MiB cap matches `read_text`/the sweep's MAX_FILE_BYTES.
+        const MAX_BLOB_BYTES: usize = 5 * 1024 * 1024;
+        if bytes.len() > MAX_BLOB_BYTES || bytes.contains(&0) {
+            return bytes.to_vec();
+        }
+        match std::str::from_utf8(bytes) {
+            Ok(text) => Self::scrub_text(text).into_bytes(),
+            Err(_) => bytes.to_vec(),
+        }
+    }
+
     /// Walk `work_dir`, scrubbing every readable text file in place. Returns the
     /// number of files changed. Skips [`SKIP_DIRS`], symlinks (no traversal
     /// outside the tree), and binary/oversized/non-UTF-8 files (via [`read_text`]).

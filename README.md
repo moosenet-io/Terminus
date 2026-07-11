@@ -229,6 +229,20 @@ Example — grant `ct322-viewer` every `ct322` tool except its sensitive
 {"ct322-viewer": {"allow": ["ct322__*"], "deny": ["ct322__vitals_"]}}
 ```
 
+### git-public full-history replay (GHIST)
+
+The git-public mirror engine can publish a repo's ENTIRE commit history as a
+PII-scrubbed derivative, not just a single swept snapshot — so a public mirror
+carries genuine, dated development history. `forge::mirror::history::replay_full_history`
+drives `git fast-export` on the (read-only) source, rewrites the byte stream
+in-process — every text blob through the native `DeterministicCleaner`, binary/
+oversized/non-UTF-8 blobs byte-identical — and `git fast-import`s the result into a
+fresh work-dir. The commit graph, messages, and author DATES are preserved (so the
+public contribution history matches internal), while every historical blob is
+scrubbed. A full-history PII gate (scanning every replayed commit's tree, not just
+the tip) and contribution-attribution remapping build on this; the one-time backfill
+and per-commit going-forward replay are driven by the mirror history tools.
+
 ### Approval-gate propagation across the mesh (MESH-09)
 
 Federation is never a way to dodge human approval. Guarded tools
