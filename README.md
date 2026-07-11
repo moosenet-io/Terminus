@@ -129,6 +129,14 @@ All take a `project_id` and read the per-project graph store
 rather than an error. Graphs are produced/refreshed by the build pipeline's
 docs stage (`scribe_kg_build`).
 
+A graph also renders to three visual artifacts (all from one shared
+force-directed layout, so they agree): a static **`map.svg`** — nodes colored by
+cluster, sized by degree, edges styled by confidence (solid EXTRACTED / dashed
+INFERRED / dotted AMBIGUOUS) with a legend — which Scribe embeds directly in the
+README/wiki/vault; a **`graph.graphml`** interchange file for Gephi/yEd/
+Cytoscape; and a self-contained interactive **`graph.html`** (inline SVG with
+vanilla-JS pan/zoom/search, no external hosts).
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
