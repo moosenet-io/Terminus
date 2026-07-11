@@ -126,6 +126,15 @@ pub struct KgNode {
     /// Degree, filled by the graph on rebuild of the adjacency view.
     #[serde(default)]
     pub degree: u32,
+    /// Bi-temporal validity (KGRAPH-15): the build sequence at which this node
+    /// first appeared. `0` = original/unstamped.
+    #[serde(default)]
+    pub valid_from: u64,
+    /// The build sequence at which this node was invalidated (removed), or
+    /// `None` if still current. Invalidated elements are KEPT, not deleted, so
+    /// history (and `as_of`) is reconstructable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_to: Option<u64>,
 }
 
 impl KgNode {
@@ -139,6 +148,8 @@ impl KgNode {
             cluster: None,
             rank: 0.0,
             degree: 0,
+            valid_from: 0,
+            valid_to: None,
         }
     }
 
@@ -155,6 +166,11 @@ pub struct KgEdge {
     pub to: String,
     pub kind: EdgeKind,
     pub confidence: Confidence,
+    /// Bi-temporal validity (KGRAPH-15), mirroring [`KgNode`].
+    #[serde(default)]
+    pub valid_from: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_to: Option<u64>,
 }
 
 impl KgEdge {
@@ -164,6 +180,8 @@ impl KgEdge {
             to: to.into(),
             kind,
             confidence,
+            valid_from: 0,
+            valid_to: None,
         }
     }
 
@@ -190,6 +208,10 @@ pub struct KnowledgeGraph {
     /// Build stamp (RFC3339 or a commit SHA). Set by the store/build; the model
     /// treats it as opaque.
     pub generated_at: String,
+    /// Monotonic build counter (KGRAPH-15): each incremental refresh bumps it,
+    /// and new/invalidated elements are stamped with the current value so a past
+    /// state is reconstructable via [`Self::as_of`].
+    pub build_seq: u64,
     nodes: BTreeMap<String, KgNode>,
     edges: BTreeMap<(String, String, EdgeKind), KgEdge>,
 }
@@ -202,6 +224,8 @@ struct GraphWire {
     #[serde(default)]
     generated_at: String,
     #[serde(default)]
+    build_seq: u64,
+    #[serde(default)]
     nodes: Vec<KgNode>,
     #[serde(default)]
     edges: Vec<KgEdge>,
@@ -212,6 +236,7 @@ impl From<KnowledgeGraph> for GraphWire {
         GraphWire {
             project_id: g.project_id,
             generated_at: g.generated_at,
+            build_seq: g.build_seq,
             nodes: g.nodes.into_values().collect(),
             edges: g.edges.into_values().collect(),
         }
@@ -222,6 +247,7 @@ impl From<GraphWire> for KnowledgeGraph {
     fn from(w: GraphWire) -> Self {
         let mut g = KnowledgeGraph::new(w.project_id);
         g.generated_at = w.generated_at;
+        g.build_seq = w.build_seq;
         for n in w.nodes {
             g.nodes.insert(n.id.clone(), n);
         }
@@ -239,6 +265,7 @@ impl KnowledgeGraph {
         KnowledgeGraph {
             project_id: project_id.into(),
             generated_at: String::new(),
+            build_seq: 0,
             nodes: BTreeMap::new(),
             edges: BTreeMap::new(),
         }
@@ -267,6 +294,12 @@ impl KnowledgeGraph {
             }
             if node.rank == 0.0 {
                 node.rank = existing.rank;
+            }
+            // Temporal continuity (KGRAPH-15): a re-extracted surviving node
+            // keeps its ORIGINAL valid_from, and re-inserting clears any prior
+            // invalidation (it exists again → current).
+            if node.valid_from == 0 && existing.valid_from != 0 {
+                node.valid_from = existing.valid_from;
             }
         }
         self.nodes.insert(node.id.clone(), node);
@@ -327,6 +360,81 @@ impl KnowledgeGraph {
 
     pub fn get_node(&self, id: &str) -> Option<&KgNode> {
         self.nodes.get(id)
+    }
+
+    // ── Bi-temporal API (KGRAPH-15) ──────────────────────────────────────────
+
+    /// Bump and return the build sequence (a new incremental refresh boundary).
+    pub fn next_build_seq(&mut self) -> u64 {
+        self.build_seq += 1;
+        self.build_seq
+    }
+
+    /// Invalidate (but KEEP) every currently-valid node defined in `path`,
+    /// stamping `valid_to = at`. Returns the number invalidated. Re-extracting an
+    /// unchanged symbol later revives it (see [`Self::insert_node`]); a symbol
+    /// that is NOT re-added stays invalidated, so its history survives. Edge
+    /// validity is DERIVED from node membership in [`Self::as_of`], so edges are
+    /// not separately time-stamped here (which avoids a revive-ordering bug).
+    pub fn invalidate_path(&mut self, path: &str, at: u64) -> usize {
+        let victims: Vec<String> = self
+            .nodes
+            .values()
+            .filter(|n| n.path == path && n.valid_to.is_none())
+            .map(|n| n.id.clone())
+            .collect();
+        for id in &victims {
+            if let Some(n) = self.nodes.get_mut(id) {
+                n.valid_to = Some(at);
+            }
+        }
+        victims.len()
+    }
+
+    /// Stamp `valid_from = at` on nodes whose id was NOT present before this
+    /// refresh (`known_before`) — i.e. the genuinely-new nodes. Nodes that
+    /// existed before keep their original `valid_from` (including `0`, which
+    /// means "present from the beginning"), so `as_of` of an earlier sequence
+    /// still includes a symbol that has survived since origin.
+    pub fn stamp_new_nodes(&mut self, known_before: &std::collections::BTreeSet<String>, at: u64) {
+        for n in self.nodes.values_mut() {
+            if n.valid_from == 0 && !known_before.contains(&n.id) {
+                n.valid_from = at;
+            }
+        }
+    }
+
+    /// All node ids currently in the graph (both live and invalidated).
+    pub fn node_ids(&self) -> std::collections::BTreeSet<String> {
+        self.nodes.keys().cloned().collect()
+    }
+
+    /// Iterate the currently-valid nodes (not invalidated).
+    pub fn current_nodes(&self) -> impl Iterator<Item = &KgNode> {
+        self.nodes.values().filter(|n| n.valid_to.is_none())
+    }
+
+    /// Reconstruct the graph as it stood at build sequence `seq`: nodes whose
+    /// validity interval `[valid_from, valid_to)` contains `seq`, plus every
+    /// edge whose BOTH endpoints are live at `seq` (edge validity is derived
+    /// from node membership). `valid_from == 0` (original/unstamped) counts as
+    /// present from the beginning.
+    pub fn as_of(&self, seq: u64) -> (Vec<KgNode>, Vec<KgEdge>) {
+        let live = |vf: u64, vt: Option<u64>| vf <= seq && vt.map(|t| seq < t).unwrap_or(true);
+        let nodes: Vec<KgNode> = self
+            .nodes
+            .values()
+            .filter(|n| live(n.valid_from, n.valid_to))
+            .cloned()
+            .collect();
+        let ids: std::collections::BTreeSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        let edges = self
+            .edges
+            .values()
+            .filter(|e| ids.contains(e.from.as_str()) && ids.contains(e.to.as_str()))
+            .cloned()
+            .collect();
+        (nodes, edges)
     }
 
     /// Recompute each node's `degree` (in + out) from the current edge set.
@@ -452,6 +560,59 @@ mod tests {
         let json = g.to_json_pretty().unwrap();
         let back = KnowledgeGraph::from_json(&json).unwrap();
         assert!(back.is_empty());
+    }
+
+    #[test]
+    fn temporal_invalidate_keeps_history_and_as_of_reconstructs() {
+        let mut g = KnowledgeGraph::new("TERM");
+        g.insert_node(KgNode::new("crate::a::keep", NodeKind::Function, "keep", "src/a.rs"));
+        g.insert_node(KgNode::new("crate::a::gone", NodeKind::Function, "gone", "src/a.rs"));
+        g.insert_edge(KgEdge::new("crate::a::keep", "crate::a::gone", EdgeKind::Calls, Confidence::Extracted)).unwrap();
+
+        // Refresh: seq 1 invalidates src/a.rs, then only `keep` is re-added.
+        let seq = g.next_build_seq();
+        assert_eq!(seq, 1);
+        let known = g.node_ids();
+        assert_eq!(g.invalidate_path("src/a.rs", seq), 2, "both nodes invalidated");
+        g.insert_node(KgNode::new("crate::a::keep", NodeKind::Function, "keep", "src/a.rs")); // revive
+        g.insert_node(KgNode::new("crate::a::new", NodeKind::Function, "new", "src/a.rs")); // genuinely new
+        g.stamp_new_nodes(&known, seq);
+
+        // Current view: keep + new; gone is invalidated (kept, not deleted).
+        let cur: Vec<&str> = g.current_nodes().map(|n| n.id.as_str()).collect();
+        assert!(cur.contains(&"crate::a::keep") && cur.contains(&"crate::a::new"));
+        assert!(!cur.contains(&"crate::a::gone"), "removed symbol not current");
+        assert!(g.get_node("crate::a::gone").is_some(), "but kept for history");
+        assert_eq!(g.node_count(), 3, "nothing deleted");
+
+        // as_of(0): the original two, and the edge between them.
+        let (n0, e0) = g.as_of(0);
+        let ids0: Vec<&str> = n0.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids0.contains(&"crate::a::keep") && ids0.contains(&"crate::a::gone"));
+        assert!(!ids0.contains(&"crate::a::new"), "new not yet present at seq 0");
+        assert_eq!(e0.len(), 1, "edge live at seq 0 (both endpoints live)");
+
+        // as_of(1): keep + new; gone is gone; the keep->gone edge is not live
+        // (an endpoint is invalidated).
+        let (n1, _e1) = g.as_of(1);
+        let ids1: Vec<&str> = n1.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids1.contains(&"crate::a::keep") && ids1.contains(&"crate::a::new"));
+        assert!(!ids1.contains(&"crate::a::gone"));
+    }
+
+    #[test]
+    fn temporal_fields_round_trip() {
+        let mut g = KnowledgeGraph::new("TERM");
+        let seq = g.next_build_seq();
+        let mut n = KgNode::new("crate::a::foo", NodeKind::Function, "foo", "src/a.rs");
+        n.valid_from = seq;
+        g.insert_node(n);
+        let seq2 = g.next_build_seq();
+        g.invalidate_path("src/a.rs", seq2);
+        let json = g.to_json_pretty().unwrap();
+        let back = KnowledgeGraph::from_json(&json).unwrap();
+        assert_eq!(back.build_seq, 2);
+        assert_eq!(back.get_node("crate::a::foo").unwrap().valid_to, Some(2));
     }
 
     #[test]
