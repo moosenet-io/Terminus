@@ -45,10 +45,25 @@ pub enum Role {
 /// extract it deterministically.
 pub fn build_prompt(role: Role, criteria: &str, context: &Value) -> String {
     let context_str = serde_json::to_string_pretty(context).unwrap_or_else(|_| context.to_string());
+    // KGREV-01: when `context` carries a `knowledge_graph` block (injected by
+    // `crate::review::kg_context::inject`, best-effort and only when a
+    // `project_id` resolves to a stored Atlas graph), prepend a one-line
+    // pointer to it. The block itself is already surfaced via `context_str`
+    // above (it's just another key in the serialized context) -- this is
+    // purely a framing nudge, not a second copy of the data. Absent the key
+    // (the common/no-`project_id` path), this is a no-op string, keeping the
+    // prompt byte-for-byte identical to pre-KGREV-01 behavior.
+    let kg_pointer = if context.get("knowledge_graph").is_some() {
+        "A `knowledge_graph` section below gives the structural blast radius (callers/callees/subsystem) \
+of the changed symbols -- weigh cross-module impact.\n\n"
+    } else {
+        ""
+    };
 
     match role {
         Role::Reviewer => format!(
             "You are an independent code/change reviewer.\n\n\
+{kg_pointer}\
 Criteria to check against:\n{criteria}\n\n\
 Context (diff/files/description):\n{context_str}\n\n\
 Review the change against the criteria above. Give your reasoning, then end your \
@@ -59,6 +74,7 @@ VERDICT: REQUEST_CHANGES\n"
         ),
         Role::Defend => format!(
             "You are DEFENDING this change as sound and ready to ship.\n\n\
+{kg_pointer}\
 Criteria to check against:\n{criteria}\n\n\
 Context (diff/files/description):\n{context_str}\n\n\
 Argue why the change satisfies the criteria above. Give your reasoning, then end your \
@@ -72,6 +88,7 @@ VERDICT: REQUEST_CHANGES\n"
 plausible reason it should be rejected against the criteria below. Do not be charitable -- \
 assume the defender is wrong until proven otherwise, and argue the strongest case for rejection \
 you can construct.\n\n\
+{kg_pointer}\
 Criteria to check against:\n{criteria}\n\n\
 Context (diff/files/description):\n{context_str}\n\n\
 Give your reasoning, then end your response with EXACTLY one line, verbatim:\n\
@@ -311,6 +328,18 @@ mod tests {
         let prompt = build_docs_prompt("src/x", "HEAD", &ctx);
         assert!(prompt.to_lowercase().contains("markdown"));
         assert!(prompt.to_lowercase().contains("never invent"));
+    }
+
+    #[test]
+    fn reviewer_prompt_adds_kg_pointer_only_when_knowledge_graph_present() {
+        let ctx_plain = json!({"diff": "+ fn foo() {}"});
+        let p_plain = build_prompt(Role::Reviewer, "criteria", &ctx_plain);
+        assert!(!p_plain.contains("knowledge_graph` section"), "no pointer without the key");
+
+        let ctx_kg = json!({"diff": "+ fn foo() {}", "knowledge_graph": {"files": []}});
+        let p_kg = build_prompt(Role::Reviewer, "criteria", &ctx_kg);
+        assert!(p_kg.contains("knowledge_graph` section"), "pointer present when key is set");
+        assert!(p_kg.contains("blast radius"));
     }
 
     #[test]
