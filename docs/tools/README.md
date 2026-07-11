@@ -33,9 +33,18 @@ measured VRAM/RAM peak, cold-load time, and `keep_warm`/`exclusion_reason`
 metadata) in Postgres. It ships two front doors over the same library entry
 points ([`src/intake/`](../../src/intake/)):
 
-- The **`intake`** tool module (4 MCP tools: `model_intake`,
-  `model_intake_status`, `model_intake_compare`, `model_intake_fleet`) —
-  callable from any MCP client.
+- The **`intake`** tool module (5 MCP tools: `model_intake`,
+  `model_intake_status`, `model_intake_compare`, `model_intake_fleet`, and the
+  read-only `model_fleet_catalog`) — callable from any MCP client.
+  `model_fleet_catalog` is the SQL-free coverage registry: it reads the
+  persisted Model Fleet Catalog and returns, per model, one cell per
+  (test_type × task_category) with its coverage status (`run` | `stale` |
+  `not_run` | `non_viable`), metrics (pass_rate, n_samples, variance), last run,
+  and harness_version, plus a `not_run`/`stale` gap summary so "what has NOT
+  been run" is one field away. Filters (all optional): `model`, `status` (e.g.
+  `not_run`), `test_type`; `format` is `json` (default, structured) or
+  `markdown` (a compact coverage matrix). Read-only — it reads what the MINT
+  harness's end-of-run refresh persisted, and never recomputes.
 - The **`mint`** CLI binary ([`src/bin/mint.rs`](../../src/bin/mint.rs)) — a
   clap-derived subcommand tree (`mint sweep coder`, `mint sweep assistant`,
   `mint case`, `mint gaps`, `mint gpu status/acquire/release`, `mint
@@ -133,14 +142,14 @@ Fleet health, automation, secrets, networking, and admin surfaces.
 | `gateway` | ~2 | Surfaces the Lumina API Gateway / dashboard (`dashboard_refresh` and related). | [`infra-ops/dashboard.md`](infra-ops/dashboard.md) |
 | `sundry` | ~6 | Small one-off utility tools that don't warrant their own module: `health`, `echo`, `utc_now`, `constellation_version`, `vector_onboard`, `searxng_search`. | [`infra-ops/sundry.md`](infra-ops/sundry.md) |
 
-### Models & Review — 7 tools
+### Models & Review — 8 tools
 
 Model inference plumbing, local/multi-provider code review, and model
 selection/profiling (MINT's tool-facing side).
 
 | Tool | Actions | What it does | Page |
 | --- | --- | --- | --- |
-| `intake` | 4 | The MINT model-intake profiling framework's MCP-facing tools (`model_intake`, `model_intake_status`, `model_intake_compare`, `model_intake_fleet`) — see [MINT flagship](#mint-flagship) above. | [`mint/`](mint/) |
+| `intake` | 5 | The MINT model-intake profiling framework's MCP-facing tools (`model_intake`, `model_intake_status`, `model_intake_compare`, `model_intake_fleet`, and the read-only `model_fleet_catalog` coverage registry) — see [MINT flagship](#mint-flagship) above. | [`mint/`](mint/) |
 | `dgem` | ~4 | Drives a persistent DiffusionGemma (`llama-diffusion-daemon`) HTTP daemon for near-zero-cost local code review and generation. | [`models-review/dgem.md`](models-review/dgem.md) |
 | `review` | 1 | `review_run` — dispatches a review prompt to 1–5 providers concurrently, in one of several output structures, for multi-provider/multi-structure code review. | [`models-review/review.md`](models-review/review.md) |
 | `wizard` | ~3 | Deep-reasoning "council" consultation routed through the Chord proxy (`CHORD_PROXY_URL`). | [`models-review/wizard.md`](models-review/wizard.md) |

@@ -329,6 +329,10 @@ persisting it into a vault/repo is a separate concern (SCRB-05)."
                 "repo_path": {
                     "type": "string",
                     "description": "Local filesystem path to the repo to inspect. Defaults to SCRIBE_REPO_PATH if unset."
+                },
+                "project_id": {
+                    "type": "string",
+                    "description": "If set and the project has a built Atlas knowledge graph, its rendered map (map.svg + legend) is appended as an '## Architecture map' section."
                 }
             },
             "required": ["module_path"]
@@ -384,7 +388,11 @@ SCRIBE_ALLOW_SUBPROCESS_INSPECTION=true to enable it explicitly"
         let prompt = crate::review::build_docs_prompt(module_path, repo_ref, &context);
 
         let review_cfg = crate::review::ReviewConfig::from_env();
-        dispatch_docs_generation(&review_cfg, &prompt).await
+        let doc = dispatch_docs_generation(&review_cfg, &prompt).await?;
+        // KGRAPH-09: if the project has a rendered Atlas map, append it. Purely
+        // additive — a project without a graph gets exactly the same output.
+        let project_id = args.get("project_id").and_then(Value::as_str);
+        Ok(graph::embed::embed_map_section(doc, project_id, &cfg, false))
     }
 }
 

@@ -97,6 +97,9 @@ name in `default_suites_for`'s output isn't mistaken for the assistant-eval axis
   the supervisor + breakfix jam-recovery system.
 - [data-model.md](data-model.md) — the full Postgres schema (tables, views, migration
   mechanics) and the complete `INTAKE_*`/`MINT_*`/`JUDGE_*` environment-variable surface.
+- [coverage-and-results.md](coverage-and-results.md) — the fleet coverage matrix
+  (run/stale/not_run/non_viable), the variance-aware leaderboard (pass_rate + n_samples +
+  stddev, not best-of-N), harness-version epochs, and the `model_fleet_catalog` query tool.
 
 ## Where MINT fits
 

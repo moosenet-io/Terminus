@@ -1077,6 +1077,10 @@ pub fn register(registry: &mut ToolRegistry) {
     registry.register_or_replace(Box::new(ModelIntakeStatus));
     registry.register_or_replace(Box::new(ModelIntakeCompare));
     registry.register_or_replace(Box::new(ModelIntakeFleet));
+    // MINT2-08: the read-only `model_fleet_catalog` core tool (its own register()
+    // in `catalog.rs`, mirroring how plane/gitea keep registration next to the
+    // tool). Core registry only — no personal registry.
+    catalog::register(registry);
 }
 
 #[cfg(test)]
@@ -1376,11 +1380,15 @@ mod tests {
     }
 
     #[test]
-    fn registration_adds_three_tools() {
+    fn registration_adds_intake_tools() {
         let mut reg = ToolRegistry::new();
         register(&mut reg);
         assert!(reg.contains("model_intake"));
         assert!(reg.contains("model_intake_status"));
         assert!(reg.contains("model_intake_compare"));
+        assert!(reg.contains("model_intake_fleet"));
+        // MINT2-08: the read-only fleet-catalog tool registers on the same core
+        // path as the rest of the intake module (→ register_all → Chord).
+        assert!(reg.contains("model_fleet_catalog"));
     }
 }

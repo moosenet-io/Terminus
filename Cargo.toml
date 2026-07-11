@@ -32,7 +32,37 @@ path = "src/lib.rs"
 name = "terminus_primary"
 path = "src/bin/terminus_primary.rs"
 
+[features]
+default = []
+# MESH-04: embed tsnet -- the gateway joins the tailnet in-process. OFF by
+# default and NOT part of `default`, so a plain `cargo build`/`cargo test`
+# never fetches or compiles the `tsnet` dependency below (it's
+# `optional = true`, pulled in ONLY when this feature is enabled) -- the
+# shared build farm and other agents building this crate on default features
+# are unaffected. Also gated at RUNTIME by `TERMINUS_MESH_TAILNET_ENABLED`
+# (see `crate::mesh::tailnet`'s module doc) -- compile feature and runtime
+# flag are independent; both must be on for `terminus_primary` to actually
+# bind the tailnet listener.
+tsnet = ["dep:tsnet"]
+
 [dependencies]
+# MESH-04: optional, feature-gated in-process Tailscale embedding
+# (`crate::mesh::tailnet`, compiled ONLY under the `tsnet` feature above).
+# Binding chosen (per that module's "decide and record" doc section): the
+# official `libtailscale` C library via crates.io's `tsnet` crate
+# (https://crates.io/crates/tsnet, wraps
+# https://github.com/tailscale/libtailscale's tailscale.h C API --
+# Up/Listen/Dial/Close), rather than shelling out to a host `tailscaled` +
+# its LocalAPI (that fallback is documented, not implemented, in the module
+# doc). NOTE: this crate's own `build.rs` compiles vendored Go source via
+# `go build -buildmode=c-archive`, so building with `--features tsnet`
+# requires a Go toolchain (`go` on `$PATH`) on the build host in addition to
+# Rust -- this dev host has none, so `--features tsnet` is EXPECTED to fail
+# here at that build-script step, before any of this crate's own code
+# compiles. A build host with Go available (e.g. a future <host>-style
+# provisioned host) can compile this feature.
+tsnet = { version = "0.1", optional = true }
+
 # terminus-rs is a STANDALONE crate with no lumina-core dependency. The small
 # set of types it once borrowed from lumina-core are vendored byte-for-byte into
 # `src/compat/`, keeping the chord -> terminus chain free of lumina-core.
