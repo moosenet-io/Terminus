@@ -227,6 +227,81 @@ Each identity's grant (`Grant`) is one of two shapes:
 This is covered in full, including the rate-limit and audit stages it sits
 between, in [federation.md](federation.md)'s "gateway pipeline" section.
 
+## Unified `Principal` identity (MESH-06)
+
+Three identity concepts described above — the mTLS cert CN
+(`crate::pki::mtls::ClientIdentity`), the tailnet WhoIs identity
+(`crate::mesh::TailnetIdentity`, MESH-05), and the named-PAT identity model
+just below — historically had no single reconciliation point: the gateway's
+`AllowlistPolicy` keyed directly off a raw `ClientIdentity`'s CN string, with
+an interim `sub="lumina"` pin plus an `X-Terminus-Client-Identity` header as
+a workaround for cases the cert CN alone didn't cover. `crate::mesh::Principal`
+(`src/mesh/principal.rs`) and its resolver, `crate::mesh::PrincipalResolver`,
+replace that ad hoc reconciliation with one canonical identity `name` — in
+the SAME string space `PLANE_PAT_<NAME>` / `GITEA_PAT_<NAME>` /
+`GITHUB_PAT_<NAME>` already use (see the PAT convention section below) — that
+drives both the gateway allowlist decision and downstream PAT selection.
+`GatewayFramework::guard` (`src/gateway_framework/mod.rs`) takes a
+`Option<&Principal>` rather than a raw `Option<&ClientIdentity>`, using
+`Principal::name()` as the allowlist/audit key.
+
+**Config**: `TERMINUS_MESH_PRINCIPAL_MAP_JSON`, a JSON object with three
+independent, all-optional lookup tables:
+
+```json
+{
+  "cert_cn": { "<mTLS cert Subject CN>": "<canonical name>" },
+  "tailnet_login": { "<tailnet login>": "<canonical name>" },
+  "tailnet_tag": { "<tailnet ACL tag, e.g. \"tag:ci\">": "<canonical name>" }
+}
+```
+
+**Precedence** (`PrincipalResolver::resolve(cert, tailnet)`), deterministic
+and fail-closed:
+
+1. A present mTLS cert identity is checked **first and exclusively**. If its
+   CN has a `cert_cn` mapping entry, that entry's name is the result —
+   `PrincipalSource::MtlsCert` (or `PrincipalSource::Both` when a tailnet
+   identity also happens to be present on the same request; the tailnet
+   identity is carried on the resolved `Principal` for observability but
+   never changes which name wins). If the CN has **no** mapping entry,
+   resolution fails closed (`AuthError::UnmappedIdentity`) — it never falls
+   back to consulting the tailnet identity instead, even when the tailnet
+   identity IS mapped.
+2. Only when **no** cert identity is presented at all is the tailnet
+   identity consulted: `tailnet_login` first, then each of the identity's
+   `tags` against `tailnet_tag` (first configured match wins — ACL tags on a
+   tailnet node carry no inherent priority order of their own). Unmapped ⇒
+   `AuthError::UnmappedIdentity`.
+3. Neither transport identity presented at all ⇒
+   `AuthError::NoIdentityPresented`.
+
+This makes the mTLS layer's own fail-closed guarantees (see "The mTLS
+listener" above) the stronger signal, while still supporting a tailnet-only
+deployment shape for callers that never present a client cert.
+
+**Edge case — a resolved name with no provisioned PAT**: resolution only
+consults the configured mapping; it never probes whether a matching
+`PLANE_PAT_<NAME>` / `GITEA_PAT_<NAME>` / `GITHUB_PAT_<NAME>` secret actually
+exists. A `Principal` for a mapped-but-unprovisioned name still resolves
+successfully and gateway RBAC still applies normally — the missing-credential
+failure surfaces later, at the point a downstream client's own
+`for_identity()`-equivalent call fails (exactly like
+`PlaneClient::for_identity`'s existing `ToolError::InvalidArgument` for an
+unconfigured name today).
+
+**Scope of this item**: MESH-06 delivers the `Principal` model, the resolver,
+and `guard()`'s new signature — it does not yet wire `PrincipalResolver::resolve`
+into the live request path with both a real mTLS extension and a real tailnet
+extension pulled off one request (replacing the `sub="lumina"` pin /
+`X-Terminus-Client-Identity` header workaround end to end). `src/mcp_server.rs`'s
+existing `guard()` call sites keep working unchanged in behavior via
+`Principal::from(&ClientIdentity)` — a direct, resolver-bypassing conversion
+that uses the raw cert CN as the principal name, identical to `guard()`'s
+pre-MESH-06 behavior. Routing those call sites through the resolver (so a
+cert CN like `harmony-primary.example.test` maps to the canonical name
+`harmony` rather than being used verbatim) is MESH-07's job.
+
 ## Per-identity PAT convention (Plane / Gitea / GitHub)
 
 Once a caller is authenticated to Terminus, several tool modules

@@ -7,13 +7,19 @@
 //! one shared thing both routes go through, not two divergent bolt-ons.
 //!
 //! ## Stages
-//! 1. **Identity** — the caller's mTLS-derived identity
-//!    (`crate::pki::mtls::ClientIdentity`), extracted by
-//!    `crate::pki::mtls::run_listener` and attached to the request's
-//!    extensions *by the server*, post-handshake. This module never trusts
-//!    a client-supplied identity field/header — [`GatewayFramework::guard`]
-//!    takes only an `Option<&ClientIdentity>` sourced from that extension,
-//!    and treats `None` as fail-closed (see below), never as "identity
+//! 1. **Identity** — [`GatewayFramework::guard`] takes an
+//!    `Option<&crate::mesh::Principal>` (MESH-06) — the single, reconciled
+//!    identity `crate::mesh::PrincipalResolver` would produce from the
+//!    caller's mTLS-derived identity (`crate::pki::mtls::ClientIdentity`,
+//!    extracted by `crate::pki::mtls::run_listener` and attached to the
+//!    request's extensions *by the server*, post-handshake) and/or tailnet
+//!    WhoIs identity (`crate::mesh::TailnetIdentity`, MESH-05). Existing
+//!    callers that only ever had a `ClientIdentity` keep working via
+//!    [`crate::mesh::Principal`]'s `From<&ClientIdentity>` conversion (see
+//!    that impl's doc for why it's a direct, resolver-bypassing mapping
+//!    today — full resolver wiring into the live request path is MESH-07).
+//!    This module never trusts a client-supplied identity field/header —
+//!    `guard` treats `None` as fail-closed (see below), never as "identity
 //!    unknown, proceed anyway".
 //! 2. **Allowlist** — [`AllowlistPolicy`]: a per-identity, config-driven
 //!    allow list of tool names / inference routes. Default-deny: an
@@ -74,7 +80,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use serde_json::json;
 
-use crate::pki::mtls::ClientIdentity;
+use crate::mesh::Principal;
 use audit::{AuditEntry, AuditResult};
 use rate_limit::{rate_limit_key, InProcessRateLimiter, RateLimitDecision, RateLimiter};
 
@@ -406,10 +412,11 @@ impl GatewayFramework {
         )
     }
 
-    /// Gate one request. `identity` must come from the mTLS-verified
-    /// `ClientIdentity` request extension only (see this module's doc) —
-    /// `None` fails closed unconditionally, before any allowlist/rate-limit
-    /// check.
+    /// Gate one request. `principal` must come from a server-verified
+    /// transport identity only (see this module's doc) — `None` fails
+    /// closed unconditionally, before any allowlist/rate-limit check.
+    /// [`Principal::name`] is the key used for both the allowlist lookup and
+    /// the audit trail.
     ///
     /// - `Err(response)` — the request is denied; `response` is a ready-to-
     ///   return `403` (missing identity or not allowlisted) or `429` (rate
@@ -421,12 +428,12 @@ impl GatewayFramework {
     ///   `ctx.record_result(..)` exactly once to complete the audit trail.
     pub async fn guard(
         &self,
-        identity: Option<&ClientIdentity>,
+        principal: Option<&Principal>,
         action: &str,
         kind: ActionKind,
     ) -> Result<GatewayContext, Response> {
-        let identity_str = match identity {
-            Some(id) => id.as_str().to_string(),
+        let identity_str = match principal {
+            Some(p) => p.name().to_string(),
             None => {
                 AuditEntry::new(
                     ANONYMOUS_IDENTITY,
@@ -480,8 +487,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn identity(s: &str) -> ClientIdentity {
-        ClientIdentity(s.to_string())
+    fn identity(s: &str) -> Principal {
+        Principal::new(s, crate::mesh::PrincipalSource::MtlsCert)
     }
 
     fn policy_allowing(identity: &str, actions: &[&str]) -> AllowlistPolicy {
