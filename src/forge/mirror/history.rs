@@ -289,6 +289,33 @@ fn set_mirrored_sha(work_dir: &Path, sha: &str) -> Result<(), ToolError> {
         .map_err(|e| ToolError::Execution(format!("write internal-head: {e}")))
 }
 
+/// The WORK-DIR commit last successfully PUSHED to the public remote (persisted in
+/// `.git/ghist/pushed-head`), if any. This is the true "what is published" boundary
+/// — distinct from `internal-head` (the SOURCE sha last replayed) and from the local
+/// work-dir HEAD (which may sit AHEAD of the remote after a withheld / refused sync).
+/// The going-forward runner (GHIST-08) gates and pushes the range
+/// `pushed-head..HEAD`, so any commit that was replayed but not yet published — e.g.
+/// one whose PII gate failed — stays in the gated range on every subsequent run
+/// until it is gate-clean AND pushed. Anchoring on the local HEAD instead would let a
+/// later remediation-only re-gate skip a previously-withheld PII commit while a
+/// fast-forward push still published it.
+pub fn last_pushed_sha(work_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(work_dir.join(".git").join("ghist").join("pushed-head"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Record the work-dir commit now published on the public remote. Call ONLY after a
+/// confirmed push (or when initialising the boundary to the established baseline).
+pub fn set_pushed_sha(work_dir: &Path, sha: &str) -> Result<(), ToolError> {
+    let d = work_dir.join(".git").join("ghist");
+    std::fs::create_dir_all(&d)
+        .map_err(|e| ToolError::Execution(format!("create .git/ghist: {e}")))?;
+    std::fs::write(d.join("pushed-head"), format!("{sha}\n"))
+        .map_err(|e| ToolError::Execution(format!("write pushed-head: {e}")))
+}
+
 /// Shared fast-export → transform → fast-import core for both the full backfill and
 /// the incremental range. `rev_args` selects what to export (`--all`, or a
 /// `<from>..<to>` range). When `incremental` is true, both git ends read+write the
@@ -494,6 +521,22 @@ pub struct FullHistoryGateReport {
 pub fn gate_full_history(work_dir: &Path) -> Result<FullHistoryGateReport, ToolError> {
     let rev_list = git_capture(work_dir, &["rev-list", "--all"])?;
     let commits: Vec<String> = rev_list.split_whitespace().map(|s| s.to_string()).collect();
+    gate_commit_list(work_dir, &commits)
+}
+
+/// Gate ONLY the given commits' trees (GHIST-08 — the cheap incremental path for the
+/// going-forward runner). A full re-gate of the whole history is wasteful when a sync
+/// appended only a handful of new commits; this scans just those (still tree-deduped,
+/// still `commit:file:line`, still a hard block on any residual). `commits` is
+/// typically `rev-list <last-mirrored>..HEAD` on the work dir.
+pub fn gate_commits(work_dir: &Path, commits: &[String]) -> Result<FullHistoryGateReport, ToolError> {
+    gate_commit_list(work_dir, commits)
+}
+
+/// Shared gate core: scan each commit's tree (tree-deduped) with the authoritative
+/// gate, accumulate `commit:file:line` residuals. Used by both the full-history and
+/// the incremental gates.
+fn gate_commit_list(work_dir: &Path, commits: &[String]) -> Result<FullHistoryGateReport, ToolError> {
     // Same ruleset resolution every other gate surface uses (repo pii-gate.toml /
     // TERMINUS_PII_CONFIG / built-in default), so history is gated identically to
     // the tip.

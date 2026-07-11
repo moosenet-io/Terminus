@@ -1,0 +1,14 @@
+[Unit]
+# GHIST-08 — periodic public-mirror full-history sync. Complements the MIRR
+# per-merge runner: this catches every mirror_ready repo on a cadence so the public
+# mirrors keep growing 1:1 with internal main even between merge hooks.
+Description=Periodic Terminus public-mirror full-history sync (GHIST-08)
+
+[Timer]
+# Hourly, a few minutes past the hour, with jitter so multiple hosts don't align.
+OnCalendar=*-*-* *:07:00
+RandomizedDelaySec=180
+Persistent=true
+
+[Install]
+WantedBy=timers.target

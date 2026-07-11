@@ -80,7 +80,8 @@ use crate::tool::RustTool;
 
 use super::clean::dispatch_cleaning;
 use super::history::{
-    gate_full_history, last_mirrored_sha, replay_incremental_or_full, IdentityMap, ReplayOpts,
+    gate_commits, gate_full_history, last_mirrored_sha, last_pushed_sha, replay_incremental_or_full,
+    set_pushed_sha, IdentityMap, ReplayOpts,
 };
 use super::workdir::{assert_never_force, run_git, MirrorWorkDir, WORKDIR_ROOT_ENV};
 
@@ -1507,6 +1508,256 @@ impl RustTool for GitPublicHistoryBackfill {
     }
 }
 
+/// `git_public_history_sync` — the GOING-FORWARD sync runner (GHIST-08). Appends the
+/// new internal commits to the established, operator-blessed full-history baseline,
+/// gates ONLY the newly-appended commits, and fast-forward-only pushes the new tip to
+/// the public mirror. NEVER force-pushes, NEVER creates a baseline, and WITHHOLDS the
+/// push on any residual PII. This is what keeps the public mirror growing 1:1 with the
+/// internal repo after GHIST-07's one-time bless + force re-baseline.
+struct GitPublicHistorySync;
+
+#[async_trait]
+impl RustTool for GitPublicHistorySync {
+    fn name(&self) -> &str {
+        "git_public_history_sync"
+    }
+    fn description(&self) -> &str {
+        "GOING-FORWARD full-history mirror sync (GHIST). Appends the new internal commits onto \
+         the established, operator-blessed public-mirror baseline (GHIST-07), gates ONLY the \
+         newly-appended commits' trees for residual PII, and — only when clean — fast-forward \
+         pushes the new tip to the public GitHub mirror. Every new blob is scrubbed and every \
+         author remapped per TERMINUS_MIRROR_AUTHOR_MAP during replay. REFUSES to force-push, \
+         REFUSES to create a baseline (a first baseline is git_public_history_backfill + operator \
+         bless), and WITHHOLDS the push (reporting the exact commit:file:line) on any residual \
+         PII — the hard block is preserved for the going-forward path too. Fail-closed without a \
+         configured TERMINUS_MIRROR_AUTHOR_MAP. Requires 'repo' (+ 'source' unless \
+         TERMINUS_MIRROR_SOURCE_ROOT is set); the remote comes from 'github_remote' or \
+         TERMINUS_MIRROR_REMOTE[_<REPO>]."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "repo":          { "type": "string", "description": "Logical repo name" },
+                "source":        { "type": "string", "description": "internal-main checkout (optional when TERMINUS_MIRROR_SOURCE_ROOT is set)" },
+                "github_remote": { "type": "string", "description": "Target mirror remote URL (else TERMINUS_MIRROR_REMOTE[_<REPO>])" },
+                "provider":      { "type": "string", "description": "Mirror-push target provider (default 'github')" }
+            },
+            "required": ["repo"]
+        })
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let repo = req_str(&args, "repo")?;
+        validate_repo(repo)?;
+        let source = resolve_source(&args, repo)?;
+        ensure_source_is_main(&source)?;
+        let hwd = history_workdir(repo)?;
+
+        // Fail-closed: a public sync must remap author identities (attribution +
+        // internal-email scrub), exactly like the backfill.
+        let author_map = IdentityMap::from_env()?.ok_or_else(|| {
+            ToolError::NotConfigured(
+                "TERMINUS_MIRROR_AUTHOR_MAP is not set — a public history sync must remap author \
+                 identities (contribution attribution + internal-email scrub). Configure it (see \
+                 .env.example) before running."
+                    .into(),
+            )
+        })?;
+
+        // A sync EXTENDS an established, operator-blessed baseline (GHIST-07). It never
+        // creates one — a first baseline is git_public_history_backfill → operator
+        // spot-check + force re-baseline. Refuse if no lineage exists.
+        if last_mirrored_sha(&hwd).is_none() || !hwd.join(".git").is_dir() {
+            return Err(ToolError::Conflict(format!(
+                "no established history lineage for '{repo}' — run git_public_history_backfill and \
+                 have the operator bless + force re-baseline the public mirror first (GHIST-07). \
+                 git_public_history_sync only fast-forwards an existing baseline, never creates one."
+            )));
+        }
+
+        let old_head = run_git(&hwd, &["rev-parse", "HEAD"])?.trim().to_string();
+
+        // The PUBLISHED boundary — the work-dir commit actually on the public remote.
+        // Once established it is persisted in `.git/ghist/pushed-head` and only advanced
+        // after a confirmed push; anchoring the gate/push range on it (never the moved
+        // local HEAD) is what keeps a previously-withheld commit in the gate range until
+        // it is gate-clean AND published.
+        //
+        // On the FIRST sync there is no marker yet. We may adopt old_head as the
+        // boundary ONLY if the public remote's `main` ALREADY equals it — i.e. the
+        // operator has blessed + force re-baselined to exactly this commit (GHIST-07).
+        // A remote that is merely an ANCESTOR (behind), diverged, or absent is NOT a
+        // blessed baseline: sync must never create or complete one, so we refuse rather
+        // than silently persist an un-verified boundary and push into it.
+        let pushed_head = match last_pushed_sha(&hwd) {
+            Some(s) => s,
+            None => {
+                let remote = resolve_remote(&args, repo)?;
+                match remote_main_tip(&remote)? {
+                    None => {
+                        return Err(ToolError::Conflict(format!(
+                            "mirror remote for '{repo}' has no 'main' branch — no published \
+                             baseline exists to extend. Establish it via git_public_history_backfill \
+                             + operator bless + force re-baseline (GHIST-07); git_public_history_sync \
+                             only fast-forwards an already-published baseline."
+                        )));
+                    }
+                    Some(tip) if tip == old_head => {
+                        set_pushed_sha(&hwd, &old_head)?;
+                        old_head.clone()
+                    }
+                    Some(tip) => {
+                        return Err(ToolError::Conflict(format!(
+                            "public mirror 'main' is at {tip}, not the local blessed baseline \
+                             {old_head} — git_public_history_sync extends an already-published \
+                             baseline and never creates or completes one. Refresh the baseline via \
+                             git_public_history_backfill + operator bless + force re-baseline \
+                             (GHIST-07), which establishes shared lineage at HEAD."
+                        )));
+                    }
+                }
+            }
+        };
+
+        let opts = ReplayOpts::with_author_map(author_map);
+        let (is_full, _replay) = replay_incremental_or_full(&source, &hwd, &opts)?;
+        // A sync MUST be incremental. If the replay went full, the work-dir lost its
+        // lineage (wiped/corrupted); every commit sha was re-written, so the public
+        // remote can no longer fast-forward onto it. Refuse — do not silently diverge.
+        if is_full {
+            return Err(ToolError::Conflict(format!(
+                "history work-dir for '{repo}' replayed as a FULL backfill (lineage was \
+                 missing/reset) — a sync must be a fast-forward append. Re-establish the baseline \
+                 via git_public_history_backfill + operator bless, then sync."
+            )));
+        }
+
+        let new_head = run_git(&hwd, &["rev-parse", "HEAD"])?.trim().to_string();
+
+        // The commits to publish = everything on the work dir that is not yet on the
+        // remote (pushed_head..HEAD), NOT old_head..HEAD. Anchoring on pushed_head
+        // (never the moved local HEAD) keeps any commit that was replayed but withheld
+        // in a prior run inside the gated+pushed range until it is actually published.
+        let new_commits: Vec<String> =
+            run_git(&hwd, &["rev-list", &format!("{pushed_head}..{new_head}")])?
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
+
+        // Gate the unpublished commits (if any) BEFORE consulting the remote — the
+        // hard PII block is independent of remote state, and a withhold needs no
+        // credential. The already-published baseline was gated clean at bless time; a
+        // full re-scan every sync would be needlessly O(history), so this scans only
+        // pushed_head..new_head — the cheap incremental gate (GHIST-08). `gate` is None
+        // when there is nothing unpublished.
+        let gate = if new_commits.is_empty() {
+            None
+        } else {
+            let g = gate_commits(&hwd, &new_commits)?;
+            if !g.clean {
+                // Residual PII in an unpublished commit WITHHOLDS the push. The work-dir
+                // advanced locally, but nothing is published until the source is
+                // remediated and re-synced; the commit stays in the gated range.
+                return Ok(json!({
+                    "repo": repo,
+                    "pushed": false,
+                    "withheld": true,
+                    "new_commits": new_commits.len(),
+                    "gate": {
+                        "clean": false,
+                        "commits_scanned": g.commits_scanned,
+                        "unique_trees": g.unique_trees,
+                        "residual_count": g.violations.len(),
+                        "violations": g.violations.iter().take(50).map(|v| json!({
+                            "commit": v.commit, "file": v.file, "line": v.line,
+                            "pattern_kind": v.pattern_kind, "context": v.context,
+                        })).collect::<Vec<_>>(),
+                    },
+                    "work_head": new_head,
+                    "pushed_head": pushed_head,
+                    "note": "residual PII in unpublished commits — push WITHHELD; remediate the \
+                             source, then re-sync. The public mirror is unchanged, and these \
+                             commits stay in the gated range until they are clean AND published.",
+                })
+                .to_string());
+            }
+            Some(g)
+        };
+
+        // Consult the remote in EVERY case — even a no-op sync must confirm the mirror
+        // is actually bootstrapped and has NOT diverged; it must never silently report
+        // "current" without checking. The fast-forward analysis runs BEFORE the
+        // credential is resolved, so a non-fast-forward / un-bootstrapped remote is
+        // refused without needing a token. NEVER force.
+        let remote = resolve_remote(&args, repo)?;
+        match ff_state(&hwd, &remote, &new_head)? {
+            FfState::NoRemoteBranch => {
+                return Err(ToolError::Conflict(format!(
+                    "mirror remote for '{repo}' has no 'main' branch — the baseline was never \
+                     pushed. Establish it via git_public_history_backfill + operator bless + force \
+                     re-baseline (GHIST-07); git_public_history_sync is fast-forward-only."
+                )));
+            }
+            FfState::NonFastForward { remote_tip } => {
+                return Err(ToolError::Conflict(format!(
+                    "non-fast-forward: mirror 'main' is at {remote_tip}, which is not an ancestor \
+                     of the new tip {new_head} (the public mirror diverged from the history \
+                     baseline). git_public_history_sync never force-pushes; reconcile via a fresh \
+                     GHIST-07 bless + force re-baseline."
+                )));
+            }
+            FfState::UpToDate => {
+                // Remote already at new_head — genuinely current (whether there were no
+                // unpublished commits, or a prior run pushed but failed to persist the
+                // marker). Reconcile the boundary marker so future gate ranges are right.
+                set_pushed_sha(&hwd, &new_head)?;
+                return Ok(json!({
+                    "repo": repo,
+                    "pushed": false,
+                    "up_to_date": true,
+                    "new_commits": new_commits.len(),
+                    "work_head": new_head,
+                    "pushed_head": new_head,
+                    "message": "mirror 'main' already at the tip — verified current, nothing to push",
+                })
+                .to_string());
+            }
+            FfState::FastForward => {}
+        }
+
+        let token = mirror_provider_token(&mirror_provider(&args))?;
+        perform_ff_push(&hwd, &remote, &new_head, &token)?;
+        // Advance the published boundary ONLY after a confirmed push. If this write
+        // ever fails the remote is already updated; the next run's UpToDate arm
+        // reconciles the marker, so we never re-publish or skip a commit.
+        set_pushed_sha(&hwd, &new_head)?;
+
+        // `gate` is Some here whenever there were unpublished commits (the only way to
+        // reach a FastForward push); a reconciling push with an empty range reports 0s.
+        let (scanned, trees) = gate
+            .as_ref()
+            .map(|g| (g.commits_scanned, g.unique_trees))
+            .unwrap_or((0, 0));
+        Ok(json!({
+            "repo": repo,
+            "pushed": true,
+            "new_commits": new_commits.len(),
+            "gate": {
+                "clean": true,
+                "commits_scanned": scanned,
+                "unique_trees": trees,
+            },
+            "old_head": old_head,
+            "work_head": new_head,
+            "pushed_head": new_head,
+            "branch": "main",
+            "note": "fast-forward sync — new PII-scrubbed, attributed commits published to the \
+                     public mirror.",
+        })
+        .to_string())
+    }
+}
+
 /// Register all four GHMR-04 mirror subtools plus the GHIST history tools. Called
 /// from [`crate::github::register`], so they attach to whichever registry github is
 /// registered against (the CORE registry via `register_all`, the personal
@@ -1521,6 +1772,7 @@ pub fn register(registry: &mut ToolRegistry) {
     registry.register_or_replace(Box::new(GitPublicMirrorSyncSource));
     registry.register_or_replace(Box::new(GitPublicHistoryStatus));
     registry.register_or_replace(Box::new(GitPublicHistoryBackfill));
+    registry.register_or_replace(Box::new(GitPublicHistorySync));
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1678,6 +1930,372 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // ── GHIST-08: going-forward sync runner ──
+    //
+    // Helper: run a full backfill and then simulate GHIST-07's blessed force
+    // re-baseline by pushing the scrubbed history tip to the (bare) public remote.
+    // Returns (source, workdir_root, bare_remote, author_map_path).
+    async fn baselined_history(
+        repo: &str,
+        seed: &[(&str, &str)],
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let src = init_source(seed);
+        let root = unique("sync-root");
+        set_root(&root);
+        let bare = init_bare();
+        std::env::set_var("TERMINUS_MIRROR_REMOTE", bare.display().to_string());
+        let map_path = unique("sync-author-map.toml");
+        std::fs::write(
+            &map_path,
+            "default_name = \"MoosenetBot\"\ndefault_email = \"<email>\"\n", // pii-test-fixture
+        )
+        .unwrap();
+        std::env::set_var("TERMINUS_MIRROR_AUTHOR_MAP", &map_path);
+
+        GitPublicHistoryBackfill
+            .execute(json!({ "repo": repo, "source": src.display().to_string() }))
+            .await
+            .unwrap();
+
+        // Bless + force re-baseline (GHIST-07 stand-in): the public remote's main now
+        // shares lineage with the history work-dir, so future syncs fast-forward.
+        let hwd = history_workdir(repo).unwrap();
+        let tip = run_git(&hwd, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        run_git(&hwd, &["push", &bare.display().to_string(), &format!("{tip}:refs/heads/main")])
+            .unwrap();
+        (src, root, bare, map_path)
+    }
+
+    /// Raw git that BYPASSES the mirror force-guard — for test *setup* only (e.g.
+    /// force-diverging the stand-in remote). Never used by production code paths.
+    fn raw_git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "raw_git {args:?} failed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn history_sync_fast_forwards_new_commits() {
+        clear_env();
+        // Local file:// remote never invokes askpass, but the tool still fail-closes
+        // on a missing credential before pushing — supply a dummy token.
+        std::env::set_var("GITHUB_TOKEN", "dummy-token-unused-for-local-remote");
+        let (src, root, bare, map_path) =
+            baselined_history("Terminus", &[("a.txt", "hello\n")]).await;
+
+        // A new internal commit lands on source (carrying an internal IP to prove the
+        // going-forward path still scrubs).
+        write_file(&src, "b.txt", "new host <internal-ip> added\n"); // pii-test-fixture
+        commit_all(&src, "second");
+
+        let out = GitPublicHistorySync
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["pushed"], true, "clean ff sync must push: {v}");
+        assert_eq!(v["new_commits"].as_u64().unwrap(), 1, "exactly one new commit: {v}");
+        // The incremental gate scans ONLY the new commit, not the whole history.
+        assert_eq!(v["gate"]["commits_scanned"].as_u64().unwrap(), 1, "incremental gate: {v}");
+
+        // The public remote's main advanced to the new scrubbed tip.
+        let hwd = history_workdir("Terminus").unwrap();
+        let work_head = run_git(&hwd, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let remote_main = run_git(&bare, &["rev-parse", "main"]).unwrap().trim().to_string();
+        assert_eq!(remote_main, work_head, "remote main == new tip");
+        // …and the new blob was scrubbed (no raw internal IP anywhere in the mirror).
+        let grep = run_git(&hwd, &["grep", "-I", "<internal-ip>", "HEAD"]); // pii-test-fixture
+        assert!(grep.is_err() || grep.unwrap().trim().is_empty(), "IP scrubbed in new commit");
+
+        std::env::remove_var("GITHUB_TOKEN");
+        std::env::remove_var("TERMINUS_MIRROR_AUTHOR_MAP");
+        std::env::remove_var("TERMINUS_MIRROR_REMOTE");
+        cleanup(&[&src, &root, &bare]);
+        let _ = std::fs::remove_file(&map_path);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn history_sync_noop_when_up_to_date() {
+        clear_env();
+        let (src, root, bare, map_path) =
+            baselined_history("Terminus", &[("a.txt", "hello\n")]).await;
+
+        // No new source commit → sync is a clean no-op (nothing gated, nothing pushed).
+        let out = GitPublicHistorySync
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["pushed"], false, "{v}");
+        assert_eq!(v["up_to_date"], true, "{v}");
+
+        std::env::remove_var("TERMINUS_MIRROR_AUTHOR_MAP");
+        std::env::remove_var("TERMINUS_MIRROR_REMOTE");
+        cleanup(&[&src, &root, &bare]);
+        let _ = std::fs::remove_file(&map_path);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn history_sync_refuses_without_lineage() {
+        clear_env();
+        // Author map present, but NO backfill/baseline established yet.
+        let src = init_source(&[("a.txt", "hello\n")]);
+        let root = unique("sync-nolineage");
+        set_root(&root);
+        let map_path = unique("sync-map2.toml");
+        std::fs::write(
+            &map_path,
+            "default_name = \"Bot\"\ndefault_email = \"<email>\"\n", // pii-test-fixture
+        )
+        .unwrap();
+        std::env::set_var("TERMINUS_MIRROR_AUTHOR_MAP", &map_path);
+
+        let err = GitPublicHistorySync
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await;
+        assert!(err.is_err(), "sync must refuse without an established baseline: {err:?}");
+        assert!(format!("{err:?}").contains("lineage"), "{err:?}");
+
+        std::env::remove_var("TERMINUS_MIRROR_AUTHOR_MAP");
+        cleanup(&[&src, &root]);
+        let _ = std::fs::remove_file(&map_path);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn history_sync_refuses_without_author_map() {
+        clear_env();
+        let src = init_source(&[("a.txt", "hello\n")]);
+        let root = unique("sync-nomap");
+        set_root(&root);
+        // No TERMINUS_MIRROR_AUTHOR_MAP.
+        let err = GitPublicHistorySync
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await;
+        assert!(err.is_err());
+        assert!(format!("{err:?}").contains("TERMINUS_MIRROR_AUTHOR_MAP"), "{err:?}");
+        cleanup(&[&src, &root]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn history_sync_refuses_non_fast_forward() {
+        clear_env();
+        // Baseline the mirror, then DIVERGE the public remote: reset its main to an
+        // unrelated orphan commit so the new tip is not a fast-forward. Sync must
+        // refuse and NEVER force.
+        let (src, root, bare, map_path) =
+            baselined_history("Terminus", &[("a.txt", "hello\n")]).await;
+
+        // Simulate a prior successful sync: the pushed-head boundary is already
+        // established at the baseline, so this exercises the main-flow non-ff guard
+        // (not the first-run baseline-verification path).
+        let hwd = history_workdir("Terminus").unwrap();
+        let baseline_tip = run_git(&hwd, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        set_pushed_sha(&hwd, &baseline_tip).unwrap();
+
+        // Orphan commit in a throwaway repo, force-pushed over the bare remote's main
+        // (raw git — a deliberate divergence the mirror engine's own guard would block).
+        let other = init_source(&[("z.txt", "unrelated\n")]);
+        let orphan = run_git(&other, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        raw_git(&other, &["push", "-f", &bare.display().to_string(), &format!("{orphan}:refs/heads/main")]);
+
+        // New internal commit so the sync has something to try to push.
+        write_file(&src, "b.txt", "more\n");
+        commit_all(&src, "second");
+
+        let err = GitPublicHistorySync
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await;
+        assert!(err.is_err(), "must refuse a non-fast-forward: {err:?}");
+        assert!(format!("{err:?}").contains("non-fast-forward"), "{err:?}");
+
+        std::env::remove_var("TERMINUS_MIRROR_AUTHOR_MAP");
+        std::env::remove_var("TERMINUS_MIRROR_REMOTE");
+        cleanup(&[&src, &root, &bare, &other]);
+        let _ = std::fs::remove_file(&map_path);
+    }
+
+    // Regression (codex review of GHIST-08): a commit whose PII gate FAILED must stay
+    // in the gated+pushed range on every subsequent run — a later remediation-only
+    // commit must NOT let a fast-forward push publish the still-present residual. The
+    // fix anchors the gate/push boundary on the persisted `pushed-head` (what is
+    // actually on the remote), never the local work-dir HEAD (which advances on a
+    // withhold). Without the fix, run #2 would gate only the clean remediation commit
+    // and ff-push the whole tip, publishing the withheld PII.
+    #[tokio::test]
+    #[serial]
+    async fn history_sync_withheld_commit_stays_gated_across_retries() {
+        clear_env();
+        std::env::set_var("GITHUB_TOKEN", "dummy-token-unused-for-local-remote");
+        // The gate flags the literal WITHHOLDME (a term the deterministic cleaner does
+        // NOT scrub), so a commit containing it survives replay and trips the gate.
+        let cfg = unique("pii-withhold.toml");
+        std::fs::write(&cfg, "extra_terms = [\"WITHHOLDME\"]\n").unwrap();
+
+        // Baseline is produced with the DEFAULT gate (WITHHOLDME not yet active), clean.
+        let (src, root, bare, map_path) =
+            baselined_history("Terminus", &[("a.txt", "hello\n")]).await;
+        let hwd = history_workdir("Terminus").unwrap();
+        let baseline_remote = run_git(&bare, &["rev-parse", "main"]).unwrap().trim().to_string();
+
+        // Activate the withhold-triggering gate, then land a commit carrying the token.
+        std::env::set_var("TERMINUS_PII_CONFIG", &cfg);
+        write_file(&src, "leak.txt", "contains WITHHOLDME here\n");
+        commit_all(&src, "leaky");
+
+        // Sync #1 → WITHHELD, nothing pushed, boundary unchanged.
+        let out1: Value = serde_json::from_str(
+            &GitPublicHistorySync
+                .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out1["withheld"], true, "must withhold on residual: {out1}");
+        assert_eq!(out1["pushed"], false);
+        assert_eq!(
+            run_git(&bare, &["rev-parse", "main"]).unwrap().trim(),
+            baseline_remote,
+            "remote must not move on withhold"
+        );
+        assert_eq!(
+            last_pushed_sha(&hwd).unwrap(),
+            baseline_remote,
+            "pushed-head boundary must stay at the baseline"
+        );
+        // The withhold advanced the work-dir locally (past the remote).
+        assert_ne!(
+            run_git(&hwd, &["rev-parse", "HEAD"]).unwrap().trim(),
+            baseline_remote,
+            "work-dir advanced past the remote"
+        );
+
+        // A remediation commit that does NOT rewrite the leaky one (the leak stays in
+        // history). The naive old_head..HEAD gate would scan only this clean commit.
+        write_file(&src, "fix.txt", "clean followup\n");
+        commit_all(&src, "remediation");
+
+        // Sync #2 → the leak is STILL in pushed_head..HEAD → STILL withheld, no push.
+        let out2: Value = serde_json::from_str(
+            &GitPublicHistorySync
+                .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            out2["withheld"], true,
+            "leak must STILL be withheld after a remediation-only commit: {out2}"
+        );
+        assert_eq!(
+            run_git(&bare, &["rev-parse", "main"]).unwrap().trim(),
+            baseline_remote,
+            "remote STILL unchanged — no PII bypass across retries"
+        );
+
+        std::env::remove_var("TERMINUS_PII_CONFIG");
+        std::env::remove_var("GITHUB_TOKEN");
+        std::env::remove_var("TERMINUS_MIRROR_AUTHOR_MAP");
+        std::env::remove_var("TERMINUS_MIRROR_REMOTE");
+        cleanup(&[&src, &root, &bare]);
+        let _ = std::fs::remove_file(&map_path);
+        let _ = std::fs::remove_file(&cfg);
+    }
+
+    // Regression (codex/agy re-review of GHIST-08): a FIRST sync must not adopt the
+    // local work-dir HEAD as the published boundary unless the remote ALREADY equals
+    // it. If the remote is merely an ANCESTOR (behind) the local baseline, accepting it
+    // would let a fast-forward push COMPLETE an un-blessed baseline. Must refuse.
+    #[tokio::test]
+    #[serial]
+    async fn history_sync_refuses_when_remote_behind_local_baseline() {
+        clear_env();
+        let (src, root, bare, map_path) =
+            baselined_history("Terminus", &[("a.txt", "hello\n")]).await;
+
+        // Advance the local history work-dir PAST the remote (new source commit +
+        // re-backfill), without pushing and without a pushed-head marker. The remote is
+        // now a strict ancestor of the local HEAD, not equal to it.
+        write_file(&src, "b.txt", "second\n");
+        commit_all(&src, "second");
+        GitPublicHistoryBackfill
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+
+        let baseline_remote = run_git(&bare, &["rev-parse", "main"]).unwrap().trim().to_string();
+        let err = GitPublicHistorySync
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await;
+        assert!(err.is_err(), "must refuse when remote is behind the local baseline: {err:?}");
+        assert!(
+            format!("{err:?}").contains("not the local blessed baseline"),
+            "{err:?}"
+        );
+        // Remote unchanged — no baseline was completed.
+        assert_eq!(
+            run_git(&bare, &["rev-parse", "main"]).unwrap().trim(),
+            baseline_remote,
+            "remote must not advance — sync never completes a baseline"
+        );
+
+        std::env::remove_var("TERMINUS_MIRROR_AUTHOR_MAP");
+        std::env::remove_var("TERMINUS_MIRROR_REMOTE");
+        cleanup(&[&src, &root, &bare]);
+        let _ = std::fs::remove_file(&map_path);
+    }
+
+    // Regression (codex re-review of GHIST-08): a no-op sync (nothing unpublished)
+    // must STILL consult the remote — an un-bootstrapped remote must be refused, never
+    // silently reported "current". Backfill establishes local lineage but does NOT
+    // push; with no baseline on the remote, a sync with no new commits must error.
+    #[tokio::test]
+    #[serial]
+    async fn history_sync_refuses_unbootstrapped_remote_even_with_no_new_commits() {
+        clear_env();
+        let src = init_source(&[("a.txt", "hello\n")]);
+        let root = unique("sync-unboot");
+        set_root(&root);
+        let bare = init_bare(); // empty remote — no 'main'
+        std::env::set_var("TERMINUS_MIRROR_REMOTE", bare.display().to_string());
+        let map_path = unique("sync-unboot-map.toml");
+        std::fs::write(
+            &map_path,
+            "default_name = \"Bot\"\ndefault_email = \"<email>\"\n", // pii-test-fixture
+        )
+        .unwrap();
+        std::env::set_var("TERMINUS_MIRROR_AUTHOR_MAP", &map_path);
+
+        // Backfill establishes local lineage but never pushes to the remote.
+        GitPublicHistoryBackfill
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+
+        // Sync: no new commits since backfill, but the remote has no 'main' → refuse.
+        let err = GitPublicHistorySync
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await;
+        assert!(err.is_err(), "no-op sync must not silently pass an un-bootstrapped remote: {err:?}");
+        assert!(
+            format!("{err:?}").contains("no 'main'"),
+            "must report the remote is un-bootstrapped: {err:?}"
+        );
+
+        std::env::remove_var("TERMINUS_MIRROR_AUTHOR_MAP");
+        std::env::remove_var("TERMINUS_MIRROR_REMOTE");
+        cleanup(&[&src, &root, &bare]);
+        let _ = std::fs::remove_file(&map_path);
+    }
+
     fn cleanup(paths: &[&Path]) {
         for p in paths {
             let _ = std::fs::remove_dir_all(p);
@@ -1734,6 +2352,10 @@ mod tests {
         assert!(reg.contains("git_public_mirror_prepare"));
         assert!(reg.contains("git_public_mirror_approve"));
         assert!(reg.contains("git_public_mirror_push"));
+        // GHIST history tools ride on the same registration.
+        assert!(reg.contains("git_public_history_status"));
+        assert!(reg.contains("git_public_history_backfill"));
+        assert!(reg.contains("git_public_history_sync"));
     }
 
     #[test]
