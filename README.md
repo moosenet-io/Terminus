@@ -108,6 +108,27 @@ This README is the front door; everything past "at a glance" lives in
 | [`docs/deploy/`](docs/deploy/) | Client enrollment/deploy guide and the personal-services (`terminus_personal`/`terminus_primary`) deployment guide. |
 | [`docs/tools/`](docs/tools/README.md) | The full tool index — all 52 modules grouped by domain, plus the **MINT** flagship harness. |
 
+## Atlas — knowledge-graph query tools
+
+Atlas (the knowledge-graph subsystem of the Scribe documentation engine, spec
+`S112-knowledge-graph-docs`) builds a per-project graph of a codebase — nodes
+are code entities (functions/structs/…), edges are calls/imports/references
+tagged with a confidence tier — and exposes it to local models as `kg_*` tools
+on the core registry, so a model can query the graph instead of grepping source:
+
+| Tool | What it answers |
+| --- | --- |
+| `kg_search` | Find entities by name or id substring. |
+| `kg_neighbors` | What a node calls/imports/references, and what references it. |
+| `kg_subgraph` | The local neighborhood (blast radius) around a symbol, to a depth. |
+| `kg_path` | The shortest path connecting two entities. |
+| `kg_stats` | Node/edge counts, clusters, top-degree hotspots, orphans. |
+
+All take a `project_id` and read the per-project graph store
+(`SCRIBE_KG_STORE_DIR`); a project with no graph yet returns `found: false`
+rather than an error. Graphs are produced/refreshed by the build pipeline's
+docs stage (`scribe_kg_build`).
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).

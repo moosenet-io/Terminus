@@ -819,6 +819,8 @@ pub fn register(registry: &mut ToolRegistry) {
     let _ = registry.register(Box::new(ScribeBuildDiaryEntry));
     let _ = registry.register(Box::new(ScribeReportDiscrepancy));
     let _ = registry.register(Box::new(ScribeStatus));
+    // Atlas kg_* query tools (KGRAPH-06) — same core registration path.
+    graph::tools::register(registry);
 }
 
 #[cfg(test)]

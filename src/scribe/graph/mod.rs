@@ -19,6 +19,7 @@ pub mod cluster;
 pub mod extract;
 pub mod model;
 pub mod store;
+pub mod tools;
 
 pub use cluster::cluster;
 pub use extract::build_rust_graph;
