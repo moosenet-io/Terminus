@@ -35,6 +35,9 @@ pub struct CoderSweepRunner {
     langs: Vec<String>,
     case_limit: Option<usize>,
     mem_config: Option<String>,
+    /// MINT2-06: `--only-stale` run mode (`MINT_ONLY_STALE`). Default `false` →
+    /// the FULL sweep; `true` → re-run only the models with a stale coder cell.
+    only_stale: bool,
 }
 
 impl CoderSweepRunner {
@@ -46,6 +49,7 @@ impl CoderSweepRunner {
             langs: coder_sweep::langs_from_env(),
             case_limit: coder_sweep::case_limit_from_env(),
             mem_config: coder_sweep::mem_config_from_env(),
+            only_stale: crate::intake::only_stale_from_env(),
         }
     }
 }
@@ -57,7 +61,13 @@ impl SweepRunner for CoderSweepRunner {
     }
 
     async fn run(&self) -> std::process::ExitCode {
-        coder_sweep::run(&self.langs, self.case_limit, self.mem_config.as_deref()).await
+        coder_sweep::run(
+            &self.langs,
+            self.case_limit,
+            self.mem_config.as_deref(),
+            self.only_stale,
+        )
+        .await
     }
 }
 

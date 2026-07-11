@@ -62,21 +62,32 @@ pub const SUITE_DIMENSIONS: &[&str] = &[
 // Resume checkpoint ledger
 // ===========================================================================
 
-/// One unit of completed work: a (model, backend, dimension) whose rows are
-/// already persisted. The resume key.
+/// One unit of completed work: a (model, backend, dimension, epoch) whose rows
+/// are already persisted. The resume key.
+///
+/// MINT2-06 — EPOCH-AWARE: the key carries the assistant harness `epoch`
+/// ([`schema::HARNESS_VERSION`] — the assistant's OWN epoch lineage, NOT the
+/// coder `'v3'` epoch), so a resume only skips work done under the SAME epoch.
+/// When the assistant harness version is bumped, the prior epoch's checkpoint
+/// entries no longer match, so each (model, dimension) is correctly re-run for
+/// the new epoch rather than falsely resumed. A serialized pre-MINT2-06 line
+/// (no `epoch` field) fails to parse and is skipped by the ledger's tolerant
+/// read — a harmless one-time re-run, never a false skip.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct CheckpointKey {
     pub model_id: String,
     pub backend_tag: String,
     pub dimension: String,
+    pub epoch: String,
 }
 
 impl CheckpointKey {
-    pub fn new(model_id: &ModelId, backend_tag: BackendTag, dimension: &str) -> Self {
+    pub fn new(model_id: &ModelId, backend_tag: BackendTag, dimension: &str, epoch: &str) -> Self {
         CheckpointKey {
             model_id: model_id.as_str().to_string(),
             backend_tag: backend_tag.as_str().to_string(),
             dimension: dimension.to_string(),
+            epoch: epoch.to_string(),
         }
     }
 }
@@ -131,6 +142,75 @@ impl Checkpoint for FileCheckpoint {
     async fn mark(&self, key: &CheckpointKey) -> Result<(), String> {
         self.inner.mark(key)
     }
+}
+
+// ===========================================================================
+// MINT2-06: stale-cell re-run planner (assistant family)
+// ===========================================================================
+//
+// The assistant analogue of the coder stale planner, keyed on (model,
+// dimension). CRITICAL — it uses the assistant's OWN epoch lineage: the
+// assistant sweep tags its runs with `schema::HARNESS_VERSION` (a SEPARATE
+// namespace from the coder `CURRENT_EPOCH = 'v3'`), so "current-epoch samples"
+// here means rows whose `assistant_profile_run.harness_version` equals
+// `schema::HARNESS_VERSION`. The pure complement is the central
+// [`crate::intake::stale_cells`]; only the grid + counts are assistant-specific.
+
+/// One assistant coverage cell: a (model × dimension) the sweep intends to
+/// measure. Ordered for a deterministic work list.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AssistantDimCell {
+    pub model: String,
+    pub dimension: String,
+}
+
+/// Build the assistant stale work list PURELY: `active_models × SUITE_DIMENSIONS`
+/// (the six dimensions the sweep runs for every model — the conditional
+/// `yarn_context_depth` seventh is planned only for yarn-capable nominations and
+/// is intentionally out of this general grid, so it never sits perpetually
+/// stale for non-yarn models) MINUS the (model, dimension) cells already at the
+/// sample `target` in the assistant's OWN current epoch. `existing_counts` are
+/// the current-(assistant-)epoch sample counts per (model, dimension) — the
+/// caller reads them scoped to `schema::HARNESS_VERSION`. A cell is STALE iff it
+/// has `0` current-epoch samples OR fewer than `target`. PURE — unit-testable
+/// without a DB.
+pub fn assistant_stale_cells(
+    active_models: &[String],
+    existing_counts: &std::collections::BTreeMap<(String, String), i64>,
+    target: i64,
+) -> Vec<AssistantDimCell> {
+    // Re-key the (model, dimension) tuple counts onto the cell type.
+    let counts: std::collections::BTreeMap<AssistantDimCell, i64> = existing_counts
+        .iter()
+        .map(|((m, d), n)| {
+            (
+                AssistantDimCell {
+                    model: m.clone(),
+                    dimension: d.clone(),
+                },
+                *n,
+            )
+        })
+        .collect();
+
+    let mut grid: Vec<AssistantDimCell> = Vec::new();
+    for m in active_models {
+        for dim in SUITE_DIMENSIONS {
+            grid.push(AssistantDimCell {
+                model: m.clone(),
+                dimension: (*dim).to_string(),
+            });
+        }
+    }
+
+    crate::intake::stale_cells(&grid, &counts, target)
+}
+
+/// The distinct set of models a stale assistant-cell list touches — the fleet
+/// subset [`run_mode`] re-runs in `--only-stale` mode (the runner runs a model's
+/// whole dimension suite, so cell → model is the enqueue granularity).
+fn assistant_stale_models(cells: &[AssistantDimCell]) -> std::collections::BTreeSet<String> {
+    cells.iter().map(|c| c.model.clone()).collect()
 }
 
 // ===========================================================================
@@ -479,7 +559,7 @@ async fn run_one_backend(
     // we can skip the smoke entirely (the model already ran here).
     let all_done = dims
         .iter()
-        .all(|d| done.contains(&CheckpointKey::new(model_id, backend_tag, d)));
+        .all(|d| done.contains(&CheckpointKey::new(model_id, backend_tag, d, schema::HARNESS_VERSION)));
 
     if !all_done {
         // ── bounded smoke (1 case) — fail fast on a broken acquisition / hang ──
@@ -498,7 +578,7 @@ async fn run_one_backend(
 
     // ── full suite, dimension by dimension, persisting + checkpointing each ──
     for dim in dims {
-        let key = CheckpointKey::new(model_id, backend_tag, dim);
+        let key = CheckpointKey::new(model_id, backend_tag, dim, schema::HARNESS_VERSION);
         if done.contains(&key) {
             resumed.push(dim.to_string());
             continue; // already persisted on a prior run → resume past it
@@ -667,12 +747,59 @@ impl Drop for ReleaseOnDrop<'_> {
 /// The live [`LiveSuiteDriver`] wires the REAL dimension runners under the P5
 /// backend override; all inference stays on the unified proxy path.
 pub async fn run() -> Result<RunReport, ToolError> {
+    run_mode(false).await
+}
+
+/// [`run`] with an explicit `--only-stale` mode (MINT2-06). `only_stale = false`
+/// is the FULL sweep (the default [`run`] path); `only_stale = true` narrows the
+/// nomination fleet to just the models with a stale (model, dimension) cell —
+/// those lacking a current-(assistant-)epoch result at the sample target — using
+/// the assistant's OWN epoch lineage (`schema::HARNESS_VERSION`). The
+/// per-(model, backend, dimension) checkpoint (now epoch-aware) still resumes
+/// within the narrowed fleet.
+pub async fn run_mode(only_stale: bool) -> Result<RunReport, ToolError> {
     let pool = schema::get_pool().await?;
     schema::migrate(&pool).await?;
     let run_id = schema::insert_run(&pool).await?;
 
-    let nominations = Nominations::load().map_err(ToolError::NotConfigured)?;
+    let mut nominations = Nominations::load().map_err(ToolError::NotConfigured)?;
     let mem_config = mem_config_from_env();
+
+    // MINT2-06: `--only-stale` — re-run only the models with a stale dimension.
+    // Absence-tolerant: an un-migrated DB reads back zero current-epoch counts →
+    // every cell is stale → the whole fleet runs (correct). The FULL sweep stays
+    // the default.
+    if only_stale {
+        let target = crate::intake::stale_target_from_env();
+        let counts = crate::intake::storage::read_assistant_dimension_counts(
+            &pool,
+            schema::HARNESS_VERSION,
+        )
+        .await?;
+        let active_models: Vec<String> = nominations
+            .nominations
+            .iter()
+            .map(|n| n.model_id().as_str().to_string())
+            .collect();
+        let stale = assistant_stale_cells(&active_models, &counts, target);
+        let stale_set = assistant_stale_models(&stale);
+        tracing::info!(
+            "assistant sweep --only-stale (epoch {}, target n_samples={target}): {} stale cell(s) across {} model(s) (of {} nominated)",
+            schema::HARNESS_VERSION,
+            stale.len(),
+            stale_set.len(),
+            nominations.nominations.len(),
+        );
+        nominations
+            .nominations
+            .retain(|n| stale_set.contains(&n.model_id().as_str().to_string()));
+        if nominations.nominations.is_empty() {
+            tracing::info!(
+                "assistant sweep --only-stale: nothing stale — all current-epoch dimension cells already meet the sample target"
+            );
+            return Ok(RunReport { models: Vec::new() });
+        }
+    }
 
     // S86: exclusive GPU use is now claimed PER MODEL (see `run_with`'s loop),
     // not once for this whole multi-hour run — HFIX-08/HFIX-09's one-shot,
@@ -707,11 +834,17 @@ pub async fn run() -> Result<RunReport, ToolError> {
 /// the assistant sweep through the one shared harness surface, and owns the
 /// end-of-run summary the standalone `intake_assistant_sweep` binary used to
 /// print (so the binary is now merely `MintHarness::run(RunKind::Assistant)`).
-pub struct AssistantSweepRunner;
+pub struct AssistantSweepRunner {
+    /// MINT2-06: `--only-stale` run mode (`MINT_ONLY_STALE`). Default `false` →
+    /// the FULL sweep; `true` → re-run only the models with a stale dimension.
+    only_stale: bool,
+}
 
 impl AssistantSweepRunner {
     pub fn new() -> Self {
-        AssistantSweepRunner
+        AssistantSweepRunner {
+            only_stale: crate::intake::only_stale_from_env(),
+        }
     }
 }
 
@@ -730,7 +863,7 @@ impl crate::intake::SweepRunner for AssistantSweepRunner {
     async fn run(&self) -> std::process::ExitCode {
         // Binary-specific orchestration moved here from the old binary `main`:
         // run the consolidated suite, then summarize the per-model report.
-        match run().await {
+        match run_mode(self.only_stale).await {
             Ok(report) => {
                 let total = report.models.len();
                 let profiled = report
@@ -969,6 +1102,60 @@ mod tests {
         assert_eq!(SUITE_DIMENSIONS.len(), 6);
         assert_eq!(SUITE_DIMENSIONS[0], super::super::dim1_conversation::DIMENSION);
         assert_eq!(SUITE_DIMENSIONS[5], super::super::dim6_embeddings::DIMENSION);
+    }
+
+    // ---- MINT2-06: assistant stale-cell planner ----
+
+    #[test]
+    fn epoch_aware_assistant_checkpoint_key_differs_across_epochs() {
+        // The same (model, backend, dimension) under a different assistant epoch
+        // is a distinct key → a resume after a harness-version bump re-runs it.
+        let m = ModelId::from("m:8b");
+        let a = CheckpointKey::new(&m, BackendTag::Gpu, "conversation_depth", "s84-asmt-01");
+        let b = CheckpointKey::new(&m, BackendTag::Gpu, "conversation_depth", "s85-asmt-02");
+        assert_ne!(a, b);
+        assert_eq!(a.epoch, "s84-asmt-01");
+    }
+
+    #[test]
+    fn assistant_stale_no_counts_makes_every_dimension_stale() {
+        // A never-swept model (no current-epoch counts) → all six dimensions stale.
+        let counts = std::collections::BTreeMap::new();
+        let stale = assistant_stale_cells(&["fresh:8b".to_string()], &counts, 1);
+        assert_eq!(stale.len(), SUITE_DIMENSIONS.len());
+    }
+
+    #[test]
+    fn assistant_stale_is_exactly_the_complement() {
+        // One dimension at target (covered), one under target (stale); the other
+        // four absent (stale). Stale = 5 cells, and NOT the covered one.
+        let mut counts = std::collections::BTreeMap::new();
+        counts.insert(("m:8b".to_string(), "conversation_depth".to_string()), 5);
+        counts.insert(("m:8b".to_string(), "tool_chaining".to_string()), 2);
+        let stale = assistant_stale_cells(&["m:8b".to_string()], &counts, 5);
+        assert_eq!(stale.len(), 5);
+        assert!(
+            !stale.iter().any(|c| c.dimension == "conversation_depth"),
+            "a dimension at the sample target is not re-run"
+        );
+        assert!(stale.iter().any(|c| c.dimension == "tool_chaining"));
+    }
+
+    #[test]
+    fn assistant_stale_removed_model_not_rerun_and_raising_target_tops_up() {
+        let mut counts = std::collections::BTreeMap::new();
+        // Legacy counts for a model NOT in the active fleet.
+        counts.insert(("dropped:70b".to_string(), "tool_chaining".to_string()), 0);
+        for d in SUITE_DIMENSIONS {
+            counts.insert(("m:8b".to_string(), d.to_string()), 4);
+        }
+        let models = vec!["m:8b".to_string()];
+        // target 4 → all covered, dropped model absent from grid.
+        let s4 = assistant_stale_cells(&models, &counts, 4);
+        assert!(s4.is_empty());
+        assert!(!s4.iter().any(|c| c.model == "dropped:70b"));
+        // raise to 6 → every dimension below the new target becomes stale.
+        assert_eq!(assistant_stale_cells(&models, &counts, 6).len(), 6);
     }
 
     #[test]
@@ -1616,7 +1803,7 @@ mod tests {
             cp.keys
                 .lock()
                 .unwrap()
-                .push(CheckpointKey::new(&model, BackendTag::Gpu, d));
+                .push(CheckpointKey::new(&model, BackendTag::Gpu, d, schema::HARNESS_VERSION));
         }
         let acq = ScriptAcquirer { skip: BTreeSet::new() };
         let driver = ScriptDriver::new();
@@ -1661,7 +1848,7 @@ mod tests {
             cp.keys
                 .lock()
                 .unwrap()
-                .push(CheckpointKey::new(&model, BackendTag::Gpu, d));
+                .push(CheckpointKey::new(&model, BackendTag::Gpu, d, schema::HARNESS_VERSION));
         }
         let acq = ScriptAcquirer { skip: BTreeSet::new() };
         let driver = ScriptDriver::new();

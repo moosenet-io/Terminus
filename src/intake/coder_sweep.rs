@@ -135,21 +135,32 @@ fn load_fleet() -> Result<Nominations, ToolError> {
 // Resume checkpoint — keyed on (model, backend); atomic per code-suite run
 // ===========================================================================
 
-/// One completed unit of fleet work: a `(model, backend)` whose
+/// One completed unit of fleet work: a `(model, backend, epoch)` whose
 /// `code_profile_runs` rows are durably persisted. Mirrors the assistant
 /// runner's `CheckpointKey`, minus the dimension (the code suite is atomic per
 /// backend pass).
+///
+/// MINT2-06 — EPOCH-AWARE: the key carries the build-scenario `epoch`
+/// ([`crate::intake::CURRENT_EPOCH`]) the pass was run under, so a resume only
+/// skips work done under the SAME epoch. After an epoch bump (`v3` → `v4`) the
+/// prior epoch's checkpoint entries no longer match the new keys, so every model
+/// is correctly re-run for the new epoch instead of being falsely treated as
+/// "done" from a partition whose rows the new epoch doesn't have. A serialized
+/// pre-MINT2-06 line (no `epoch` field) simply fails to parse and is skipped by
+/// the ledger's tolerant read — a harmless one-time re-run, never a false skip.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct CodeCheckpointKey {
     model_id: String,
     backend_tag: String,
+    epoch: String,
 }
 
 impl CodeCheckpointKey {
-    fn new(model_id: &str, backend: BackendTag) -> Self {
+    fn new(model_id: &str, backend: BackendTag, epoch: &str) -> Self {
         CodeCheckpointKey {
             model_id: model_id.to_string(),
             backend_tag: backend.as_str().to_string(),
+            epoch: epoch.to_string(),
         }
     }
 }
@@ -175,6 +186,117 @@ fn open_code_checkpoint() -> Result<CodeCheckpoint, ToolError> {
     })?;
     let path = format!("{}/coder-sweep-checkpoint.json", dir.trim_end_matches('/'));
     Ok(CodeCheckpoint::at(path))
+}
+
+// ===========================================================================
+// MINT2-06: stale-cell re-run planner (coder family)
+// ===========================================================================
+//
+// After a coder epoch bump most (model × category × config) cells have no
+// current-epoch aggregate at the sample target and must be re-run — but the
+// whole multi-day sweep is wasteful when only the invalidated cells need work.
+// This planner enumerates the intended coverage grid for the ACTIVE fleet and
+// subtracts the cells already covered in the CODER current epoch
+// ([`crate::intake::CURRENT_EPOCH`], consumed centrally — never re-derived here),
+// yielding just the stale cells; [`run`] then runs only the models those cells
+// belong to, resuming the existing per-(model, backend) checkpoint pattern.
+
+use crate::intake::catalog::{NonViableRow, CODER_CATEGORIES};
+use crate::intake::storage::StoredRunAggregate;
+
+/// The canonical config token for a run measuring only the current DEFAULT
+/// configuration (no explicit quant/reasoning matrix). The pure planner core
+/// ([`crate::intake::stale_cells`]) is fully general over the config axis; the
+/// live coder grid folds all current-epoch config variants of a (model,
+/// category) into this single token, matching the spec's "at minimum the current
+/// default config" and the per-(model, backend) runner's granularity (one pass
+/// runs ALL of a model's cases/configs).
+pub const DEFAULT_CONFIG: &str = "default";
+
+/// One coder coverage cell: a (model × coder task-category × config) the sweep
+/// intends to measure. Ordered so the stale work list is deterministic.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CoderCell {
+    pub model: String,
+    pub category: String,
+    pub config: String,
+}
+
+/// Build the coder stale work list PURELY from its inputs — the active-fleet
+/// model list, the CODER current-epoch aggregates (`code_run_aggregates`, MINT2-03,
+/// the source of per-cell `n_samples`), the recorded `non_viable_vram` skips, and
+/// the per-cell sample `target`.
+///
+/// The intended coverage grid is `active_models × CODER_CATEGORIES ×
+/// [DEFAULT_CONFIG]`. A cell's existing current-epoch sample count is the SUM of
+/// `n_samples` across the current-epoch aggregate rows for that (model, category)
+/// — folding config variants into the single default-config cell. A cell is STALE
+/// iff it has `0` current-epoch samples OR fewer than `target` (delegated to the
+/// central pure [`crate::intake::stale_cells`]). Under-sampled cells top up; a
+/// newly-added fleet model (no current-epoch rows) is fully stale; a model
+/// dropped from the fleet is absent from the grid so it is never re-run.
+///
+/// non_viable choice (documented, per the spec): a model with ANY recorded
+/// `non_viable_vram` skip in the current epoch is treated as COVERED for its
+/// coder cells — it is NOT re-enqueued as stale, because re-running would just
+/// re-hit the same VRAM ceiling and re-record the same skip. Retrying viability
+/// is a deliberate separate action (clear the skip / raise the ceiling), not
+/// stale top-up; raising the sample target does not un-cover a non_viable model.
+///
+/// PURE — grid + counts + target in, stale list out; no DB/clock/env — so it is
+/// unit-testable without a live DB.
+pub fn coder_stale_cells(
+    active_models: &[String],
+    current_aggs: &[StoredRunAggregate],
+    non_viable: &[NonViableRow],
+    target: i64,
+) -> Vec<CoderCell> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // Models with a recorded non_viable_vram skip → covered (not stale).
+    let non_viable_models: BTreeSet<&str> =
+        non_viable.iter().map(|nv| nv.model_name.as_str()).collect();
+
+    // Current-epoch sample counts, folded to (model, category) on the default
+    // config token. Aggregates are ALREADY current-epoch-scoped by the read; a
+    // NULL task_category can't map to a coder category cell, so it is skipped.
+    let mut counts: BTreeMap<CoderCell, i64> = BTreeMap::new();
+    for a in current_aggs {
+        let Some(cat) = a.task_category.as_deref() else {
+            continue;
+        };
+        let cell = CoderCell {
+            model: a.model.clone(),
+            category: cat.to_string(),
+            config: DEFAULT_CONFIG.to_string(),
+        };
+        *counts.entry(cell).or_insert(0) += a.n_samples as i64;
+    }
+
+    // The intended grid: active fleet × categories × [default config], minus the
+    // non_viable-covered models.
+    let mut grid: Vec<CoderCell> = Vec::new();
+    for m in active_models {
+        if non_viable_models.contains(m.as_str()) {
+            continue;
+        }
+        for cat in CODER_CATEGORIES {
+            grid.push(CoderCell {
+                model: m.clone(),
+                category: (*cat).to_string(),
+                config: DEFAULT_CONFIG.to_string(),
+            });
+        }
+    }
+
+    crate::intake::stale_cells(&grid, &counts, target)
+}
+
+/// The distinct set of models a stale-cell list touches — the exact fleet subset
+/// [`run`] re-runs in `--only-stale` mode (the per-(model, backend) runner runs a
+/// model's whole pass, so cell → model is the enqueue granularity).
+fn stale_models(cells: &[CoderCell]) -> std::collections::BTreeSet<String> {
+    cells.iter().map(|c| c.model.clone()).collect()
 }
 
 // ===========================================================================
@@ -431,7 +553,7 @@ async fn run_one_backend(
     gpu_lock: &dyn GpuLock,
 ) -> Result<BackendReport, ToolError> {
     let model_id = nom.id.clone();
-    let key = CodeCheckpointKey::new(&model_id, backend);
+    let key = CodeCheckpointKey::new(&model_id, backend, intake::current_epoch());
 
     // ── resume: already complete → skip without touching the model ──
     if done.contains(&key) {
@@ -627,7 +749,7 @@ async fn run_fleet(
             };
 
             let model_id = nom.id.clone();
-            let key = CodeCheckpointKey::new(&model_id, backend_tag);
+            let key = CodeCheckpointKey::new(&model_id, backend_tag, intake::current_epoch());
 
             // ── cheap, GPU-free pre-check: a resumed or pre-flight VRAM
             //    skip never touches the model at all (mirrors the checks
@@ -779,8 +901,9 @@ pub async fn run(
     langs: &[String],
     case_limit: Option<usize>,
     mem_config: Option<&str>,
+    only_stale: bool,
 ) -> std::process::ExitCode {
-    let fleet = match load_fleet() {
+    let mut fleet = match load_fleet() {
         Ok(f) => f,
         Err(e) => {
             eprintln!("coder sweep did not start: {e}");
@@ -817,6 +940,51 @@ pub async fn run(
     if let Err(e) = schema::migrate(&pool).await {
         eprintln!("coder sweep did not start: schema migrate failed: {e}");
         return std::process::ExitCode::FAILURE;
+    }
+
+    // MINT2-06: `--only-stale` — narrow the fleet to just the models with a
+    // stale coder cell (0 current-epoch samples, or below the target) rather than
+    // sweeping every nominated model. Reads the CODER current-epoch aggregates
+    // (MINT2-03) + `non_viable_vram` skips and computes the stale set via the pure
+    // planner; the per-(model, backend) checkpoint (now epoch-aware) still resumes
+    // within the narrowed fleet. The FULL sweep remains the default (only_stale
+    // false). Absence-tolerant: an un-migrated DB reads back zero aggregates → the
+    // planner marks EVERY cell stale → the whole fleet runs, which is correct.
+    if only_stale {
+        let target = intake::stale_target_from_env();
+        let epoch = intake::current_epoch();
+        let current_aggs = match intake::storage::read_code_run_aggregates(&pool, epoch).await {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("coder sweep did not start: could not read current-epoch aggregates for stale planning: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+        let non_viable = match intake::storage::read_non_viable_rows(&pool, epoch).await {
+            Ok(nv) => nv,
+            Err(e) => {
+                eprintln!("coder sweep did not start: could not read non_viable rows for stale planning: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+        let active_models: Vec<String> = fleet.nominations.iter().map(|n| n.id.clone()).collect();
+        let stale = coder_stale_cells(&active_models, &current_aggs, &non_viable, target);
+        let stale_set = stale_models(&stale);
+        eprintln!(
+            "coder sweep --only-stale (epoch {epoch}, target n_samples={target}): {} stale cell(s) across {} model(s) (of {} nominated)",
+            stale.len(),
+            stale_set.len(),
+            fleet.nominations.len(),
+        );
+        fleet
+            .nominations
+            .retain(|n| stale_set.contains(&n.id));
+        if fleet.nominations.is_empty() {
+            eprintln!(
+                "coder sweep --only-stale: nothing stale — all current-epoch cells already meet the sample target; nothing to re-run"
+            );
+            return std::process::ExitCode::SUCCESS;
+        }
     }
 
     // multi-point-score-tracking: corpus-coverage reconciliation. Read-only and
@@ -984,8 +1152,8 @@ mod tests {
 
     #[test]
     fn checkpoint_key_distinguishes_backends() {
-        let gpu = CodeCheckpointKey::new("qwen3:8b", BackendTag::Gpu);
-        let cpu = CodeCheckpointKey::new("qwen3:8b", BackendTag::Cpu);
+        let gpu = CodeCheckpointKey::new("qwen3:8b", BackendTag::Gpu, intake::current_epoch());
+        let cpu = CodeCheckpointKey::new("qwen3:8b", BackendTag::Cpu, intake::current_epoch());
         assert_ne!(gpu, cpu);
         assert_eq!(gpu.backend_tag, "gpu");
         assert_eq!(cpu.backend_tag, "cpu");
@@ -996,20 +1164,159 @@ mod tests {
         // The exact skip predicate `run_one_backend` uses: a (model, backend)
         // present in `done` is resumed (skipped), absent is run.
         let mut done = BTreeSet::new();
-        done.insert(CodeCheckpointKey::new("m:8b", BackendTag::Gpu));
-        assert!(done.contains(&CodeCheckpointKey::new("m:8b", BackendTag::Gpu)));
-        assert!(!done.contains(&CodeCheckpointKey::new("m:8b", BackendTag::Cpu)));
-        assert!(!done.contains(&CodeCheckpointKey::new("other:8b", BackendTag::Gpu)));
+        done.insert(CodeCheckpointKey::new("m:8b", BackendTag::Gpu, intake::current_epoch()));
+        assert!(done.contains(&CodeCheckpointKey::new("m:8b", BackendTag::Gpu, intake::current_epoch())));
+        assert!(!done.contains(&CodeCheckpointKey::new("m:8b", BackendTag::Cpu, intake::current_epoch())));
+        assert!(!done.contains(&CodeCheckpointKey::new("other:8b", BackendTag::Gpu, intake::current_epoch())));
     }
 
     #[test]
     fn checkpoint_key_roundtrips_through_jsonlines() {
         // The file ledger is JSON-lines; a written key must parse back identically
         // (this is what makes a reboot resume rather than restart).
-        let key = CodeCheckpointKey::new("mixtral:8x7b", BackendTag::Cpu);
+        let key = CodeCheckpointKey::new("mixtral:8x7b", BackendTag::Cpu, intake::current_epoch());
         let line = serde_json::to_string(&key).unwrap();
         let back: CodeCheckpointKey = serde_json::from_str(&line).unwrap();
         assert_eq!(key, back);
+    }
+
+    #[test]
+    fn epoch_aware_checkpoint_key_differs_across_epochs() {
+        // MINT2-06: the SAME (model, backend) under a DIFFERENT epoch is a
+        // DISTINCT key, so a resume after an epoch bump re-runs the model rather
+        // than falsely skipping it as "done" from the prior epoch's partition.
+        let v3 = CodeCheckpointKey::new("m:8b", BackendTag::Gpu, "v3");
+        let v4 = CodeCheckpointKey::new("m:8b", BackendTag::Gpu, "v4");
+        assert_ne!(v3, v4);
+        let mut done = BTreeSet::new();
+        done.insert(v3.clone());
+        assert!(done.contains(&v3), "v3 pass is resumed under v3");
+        assert!(!done.contains(&v4), "v3 checkpoint must NOT cover the v4 epoch");
+    }
+
+    // ---- MINT2-06: coder stale-cell planner ----
+
+    fn agg(model: &str, cat: &str, n: i32) -> StoredRunAggregate {
+        StoredRunAggregate {
+            model: model.to_string(),
+            task_category: Some(cat.to_string()),
+            harness_version: intake::current_epoch().to_string(),
+            quant: Some("Q4_K_M".to_string()),
+            reasoning_enabled: None,
+            context_window_launched: None,
+            temperature: None,
+            top_p: None,
+            pass_rate: 1.0,
+            n_samples: n,
+            passes: n,
+            score_stddev: 0.0,
+            low_confidence: n <= 1,
+        }
+    }
+
+    fn coder_cell(model: &str, cat: &str) -> CoderCell {
+        CoderCell {
+            model: model.to_string(),
+            category: cat.to_string(),
+            config: DEFAULT_CONFIG.to_string(),
+        }
+    }
+
+    #[test]
+    fn coder_stale_no_rows_means_every_cell_stale() {
+        // A newly-added (or never-swept) fleet model has NO current-epoch rows →
+        // ALL of its coder cells (one per category) are stale. Also the
+        // un-migrated-DB case: empty aggregates → full grid.
+        let stale = coder_stale_cells(&["fresh:8b".to_string()], &[], &[], 1);
+        let cats: Vec<&str> = stale.iter().map(|c| c.category.as_str()).collect();
+        assert_eq!(stale.len(), CODER_CATEGORIES.len());
+        for cat in CODER_CATEGORIES {
+            assert!(cats.contains(cat), "category {cat} must be stale");
+        }
+    }
+
+    #[test]
+    fn coder_stale_is_exactly_the_complement_incl_under_sampled() {
+        // blitz: at target (covered); multi_file: under target (stale);
+        // deep: absent (stale). Stale set is EXACTLY {multi_file, deep}.
+        let models = vec!["m:8b".to_string()];
+        let aggs = vec![agg("m:8b", "blitz", 5), agg("m:8b", "multi_file", 2)];
+        let stale = coder_stale_cells(&models, &aggs, &[], 5);
+        assert_eq!(
+            stale,
+            vec![coder_cell("m:8b", "deep"), coder_cell("m:8b", "multi_file")]
+        );
+    }
+
+    #[test]
+    fn coder_stale_folds_config_variants_into_one_cell() {
+        // Two config variants of the SAME (model, category) SUM toward the cell's
+        // sample count: 3 + 3 = 6 >= target 5 → covered, not re-run.
+        let models = vec!["m:8b".to_string()];
+        let q4 = agg("m:8b", "blitz", 3);
+        let mut q8 = agg("m:8b", "blitz", 3);
+        q8.quant = Some("Q8_0".to_string());
+        let stale = coder_stale_cells(&models, &[q4, q8], &[], 5);
+        assert!(
+            !stale.iter().any(|c| c.category == "blitz"),
+            "summed samples across configs cover the cell"
+        );
+    }
+
+    #[test]
+    fn coder_stale_at_target_not_rerun_and_raising_target_tops_up() {
+        let models = vec!["m:8b".to_string()];
+        let aggs = vec![
+            agg("m:8b", "blitz", 4),
+            agg("m:8b", "multi_file", 4),
+            agg("m:8b", "deep", 4),
+        ];
+        // target 4 → all covered.
+        assert!(coder_stale_cells(&models, &aggs, &[], 4).is_empty());
+        // raise to 6 → every cell below the new target becomes stale.
+        assert_eq!(coder_stale_cells(&models, &aggs, &[], 6).len(), 3);
+    }
+
+    #[test]
+    fn coder_stale_removed_model_not_rerun() {
+        // Legacy rows for a model NOT in the active fleet must not be re-run — the
+        // grid is enumerated from the active fleet, so the dropped model is absent.
+        let models = vec!["current:8b".to_string()];
+        let legacy = vec![agg("dropped:70b", "blitz", 0)]; // 0 samples, but not in fleet
+        let stale = coder_stale_cells(&models, &legacy, &[], 1);
+        assert!(
+            !stale.iter().any(|c| c.model == "dropped:70b"),
+            "a model removed from the fleet is never re-run"
+        );
+        // The active model, with no rows, IS fully stale.
+        assert_eq!(stale.iter().filter(|c| c.model == "current:8b").count(), 3);
+    }
+
+    #[test]
+    fn coder_stale_non_viable_model_is_covered() {
+        // A model with a recorded non_viable_vram skip is COVERED — not
+        // re-enqueued as stale (documented choice: don't retry viability), even
+        // though it has no aggregate rows.
+        let models = vec!["huge:70b".to_string()];
+        let nv = vec![NonViableRow {
+            model_name: "huge:70b".to_string(),
+            quant: Some("Q4_K_M".to_string()),
+        }];
+        let stale = coder_stale_cells(&models, &[], &nv, 1);
+        assert!(stale.is_empty(), "non_viable model must not be re-run as stale");
+    }
+
+    #[test]
+    fn stale_models_are_the_distinct_touched_models() {
+        let cells = vec![
+            coder_cell("a:8b", "blitz"),
+            coder_cell("a:8b", "deep"),
+            coder_cell("b:8b", "blitz"),
+        ];
+        let models = stale_models(&cells);
+        assert_eq!(models.len(), 2);
+        assert!(models.contains("a:8b"));
+        assert!(models.contains("b:8b"));
     }
 
     #[test]
@@ -1405,7 +1712,7 @@ mod tests {
         let checkpoint = tmp_checkpoint("resume");
         // Pre-seed as if the gpu pass already completed on a prior run.
         checkpoint
-            .mark(&CodeCheckpointKey::new("m:8b", BackendTag::Gpu))
+            .mark(&CodeCheckpointKey::new("m:8b", BackendTag::Gpu, intake::current_epoch()))
             .unwrap();
         let driver = ScriptDriver::new().available("m:8b");
 
@@ -1461,7 +1768,7 @@ mod tests {
         .unwrap();
         let checkpoint = tmp_checkpoint("gpu-lock-skip-cases");
         checkpoint
-            .mark(&CodeCheckpointKey::new("resumed:8b", BackendTag::Gpu))
+            .mark(&CodeCheckpointKey::new("resumed:8b", BackendTag::Gpu, intake::current_epoch()))
             .unwrap();
         let driver = ScriptDriver::new(); // nothing marked available — irrelevant, never reached
         let gpu = ScriptGpuLock::default();
@@ -1513,7 +1820,7 @@ mod tests {
         assert_eq!(suite_calls[0], ("stuck:8b".to_string(), "cpu".to_string()));
 
         // A refused pass was never checkpointed (durability: only real progress is marked).
-        assert!(!checkpoint.done().contains(&CodeCheckpointKey::new("stuck:8b", BackendTag::Gpu)));
+        assert!(!checkpoint.done().contains(&CodeCheckpointKey::new("stuck:8b", BackendTag::Gpu, intake::current_epoch())));
     }
 
     // ── S86 max-lock-hold safety valve: wiring tests ────────────────────────

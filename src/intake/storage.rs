@@ -1519,6 +1519,47 @@ pub async fn read_non_viable_rows(
     }
 }
 
+/// MINT2-06: current-(assistant-)epoch sample counts per (model_id, dimension),
+/// for the assistant stale-cell planner. Scoped to the assistant's OWN epoch
+/// lineage — `assistant_profile_run.harness_version = $1` (the caller passes
+/// `assistant::schema::HARNESS_VERSION`, NOT the coder `'v3'` epoch) — by joining
+/// each `assistant_dimension_score` row to its run, so legacy-epoch scores never
+/// count toward current coverage. Tolerates the `assistant_dimension_score` /
+/// `assistant_profile_run` tables being ABSENT on an un-migrated DB → empty map
+/// (⇒ the planner sees zero current-epoch samples and marks everything stale,
+/// which is correct). Any other DB error is propagated.
+pub async fn read_assistant_dimension_counts(
+    pool: &PgPool,
+    harness_version: &str,
+) -> Result<std::collections::BTreeMap<(String, String), i64>, ToolError> {
+    let sql = "SELECT s.model_id, s.dimension, count(*)::bigint \
+         FROM assistant_dimension_score s \
+         JOIN assistant_profile_run r ON r.id = s.run_id \
+         WHERE r.harness_version = $1 \
+         GROUP BY s.model_id, s.dimension";
+    type Row = (String, String, i64);
+    match sqlx::query_as::<_, Row>(sql)
+        .bind(harness_version)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => Ok(rows
+            .into_iter()
+            .map(|(model, dim, n)| ((model, dim), n))
+            .collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                Ok(std::collections::BTreeMap::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read assistant dimension counts: {msg}"
+                )))
+            }
+        }
+    }
+}
+
 /// Per-(model, dimension) rollup of the assistant sweep's dimension scores:
 /// sample count, mean dispersion, last-run. Tolerates the
 /// `assistant_dimension_score` table being absent → empty vec.
