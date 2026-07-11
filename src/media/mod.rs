@@ -25,6 +25,7 @@
 //! per-service configuration state without ever failing itself.
 
 pub mod clients;
+pub mod search;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -85,10 +86,12 @@ impl RustTool for MediaDomainStatus {
 }
 
 /// Register the media domain's tools. MEDIA-01 registers one internal
-/// status tool; MEDIA-02..07 add the real search/request/organize/
+/// status tool; MEDIA-02 adds the read/search surface (`media_search`,
+/// `media_status`); MEDIA-03..07 add the remaining request/organize/
 /// recommend/surface tools on top of the clients this item establishes.
 pub fn register(registry: &mut ToolRegistry) {
     registry.register_or_replace(Box::new(MediaDomainStatus));
+    search::register(registry);
 }
 
 #[cfg(test)]
