@@ -1,7 +1,7 @@
 //! GHMR-04 / GITX-08 — git-public mirror engine subtools (core registry) +
 //! dev-box transport.
 //!
-//! Exposes the GHMR-01/02/03 mirror engine as four **core-tool** subtools
+//! Exposes the GHMR-01/02/03 mirror engine as five **core-tool** subtools
 //! (moved from the github module to `crate::forge::mirror` and renamed from
 //! `github_mirror_*` to `git_public_mirror_*` at GITX-08 — the engine has
 //! been behaviorally provider-agnostic since GITX-05; only the naming still
@@ -9,10 +9,16 @@
 //! they land on whatever registry that function is invoked against — the
 //! CORE registry in `register_all` and the personal registry in
 //! `register_personal` (github is a core tool per the operator's tool
-//! taxonomy). GitHub remains the only currently-configured mirror target.
+//! taxonomy). GitHub remains the only currently-configured public mirror
+//! target; Gitea is the internal source of truth.
 //!
 //!   * `git_public_mirror_status`  — read-only: internal-main divergence vs. the last
 //!     approved snapshot, plus the set of `mirror-approved/*` tags.
+//!   * `git_public_mirror_sync_source` (S111E/MIRR-04) — clone/fetch the internal-main
+//!     "parking lot" checkout directly from Gitea (git-protocol transport: clone if
+//!     absent, else fetch + checkout + hard-reset to `origin/<branch>`), using the
+//!     resolved `GITEA_PAT_<NAME>` credential via `GIT_ASKPASS`. This is what feeds
+//!     `source` for the other four tools — see the operator-decision note below.
 //!   * `git_public_mirror_prepare` — sync internal `main`'s content into the clean work
 //!     dir → mechanical sweep → PII gate → commit (+ `mirror-approved/<sha>` tag
 //!     when gate-clean), via GHMR-03's [`MirrorWorkDir::run`]. Returns residual
@@ -32,6 +38,15 @@
 //!     never raw-logged, injected through `GIT_ASKPASS` — never embedded in the
 //!     remote URL or argv). Refuses any
 //!     non-fast-forward move and points at the GHMR-07 bootstrap; NEVER force-pushes.
+//!
+//! ## Git-protocol transport ownership (S111E, 2026-07-10, operator decision)
+//! As of moosenet-spec skill v3.14, the Terminus git tool (this module, plus
+//! [`crate::github`]/[`crate::gitea`]) is the SANCTIONED OWNER of git-protocol
+//! transport (clone/fetch/merge/push/source-sync), holding both the Gitea and
+//! GitHub credentials via `GIT_ASKPASS`. This SUPERSEDES the former
+//! dev-box-only git-transport rule for these operations — the one sanctioned
+//! door for git transport is now this engine, not a specific host. Other hosts
+//! still never get their own ad hoc credentials.
 //!
 //! ## Dev-box-only transport, logic-in-terminus
 //! The engine's LOGIC lives here in terminus-rs, but every git operation (the
@@ -1004,6 +1019,287 @@ fn git_exit_ok(work_dir: &Path, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+// ── git_public_mirror_sync_source (S111E / MIRR-04) ─────────────────────────────
+
+/// Environment variable holding the internal Gitea git-transport remote for a
+/// repo's parking-lot checkout, when a call does not pass `internal_remote`
+/// explicitly. Checked per-repo first (`TERMINUS_MIRROR_INTERNAL_REMOTE_<REPO_UPPER>`)
+/// then as a single fallback (`TERMINUS_MIRROR_INTERNAL_REMOTE`) — same shape as
+/// [`REMOTE_ENV`] for the public mirror target. NEVER a literal in code, and
+/// NEVER carries an embedded token (auth is injected via `GIT_ASKPASS` at call
+/// time — see [`run_git_askpass_plain`] / [`run_git_askpass_in`]).
+const INTERNAL_REMOTE_ENV: &str = "TERMINUS_MIRROR_INTERNAL_REMOTE";
+
+/// Resolve the internal Gitea remote for `(args, repo)`: explicit
+/// `internal_remote` arg wins, then `TERMINUS_MIRROR_INTERNAL_REMOTE_<REPO_UPPER>`,
+/// then `TERMINUS_MIRROR_INTERNAL_REMOTE`. Reuses [`validate_remote`] so an
+/// option-like remote (`-`-prefixed) is refused the same way the public mirror
+/// remote is.
+fn resolve_internal_remote(args: &Value, repo: &str) -> Result<String, ToolError> {
+    if let Some(r) = args
+        .get("internal_remote")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        validate_remote(r)?;
+        return Ok(r.to_string());
+    }
+    let per_repo = format!(
+        "{INTERNAL_REMOTE_ENV}_{}",
+        repo.to_uppercase().replace(|c: char| !c.is_ascii_alphanumeric(), "_")
+    );
+    for key in [per_repo.as_str(), INTERNAL_REMOTE_ENV] {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                validate_remote(&v)?;
+                return Ok(v);
+            }
+        }
+    }
+    Err(ToolError::NotConfigured(format!(
+        "no internal Gitea remote for '{repo}': pass 'internal_remote' or set {per_repo} / \
+         {INTERNAL_REMOTE_ENV} (e.g. http://<gitea-host>/moosenet/{repo}.git — no embedded token; \
+         auth is injected via GIT_ASKPASS)"
+    )))
+}
+
+/// The parking-lot checkout branch: `TERMINUS_MIRROR_SOURCE_BRANCH` (same env
+/// var [`ensure_source_is_main`] honours), default `"main"`.
+fn source_branch() -> String {
+    std::env::var("TERMINUS_MIRROR_SOURCE_BRANCH")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "main".to_string())
+}
+
+/// Force-guard for the sync-source parking-lot checkout. Unlike
+/// [`assert_never_force`] (the clean mirror WORK DIR's guard, which bans
+/// `--hard` unconditionally because that tree's history only ever moves
+/// forward), this checkout IS the internal-main parking lot itself — making it
+/// exactly match internal main via `reset --hard origin/<branch>` is the
+/// intended, sanctioned sync-source operation (S111E/MIRR-04), not a
+/// force-push of anything public. `--force`/`-f`/`--force-with-lease` remain
+/// unconditionally banned; `--hard` is tolerated ONLY in the exact
+/// `["reset", "--hard", "origin/<branch>"]` shape `fetch_and_reset` below
+/// builds — any other appearance of `--hard` is refused just as loudly.
+fn assert_source_sync_safe(argv: &[&str]) {
+    const BANNED: &[&str] = &["--force", "-f", "--force-with-lease"];
+    for token in argv {
+        let lower = token.to_lowercase();
+        assert!(
+            !BANNED.contains(&lower.as_str()),
+            "sync-source git argv contained a force token '{token}': {argv:?}"
+        );
+    }
+    if argv.iter().any(|a| *a == "--hard") {
+        let sanctioned = argv.first() == Some(&"reset")
+            && argv.get(1) == Some(&"--hard")
+            && argv.len() == 3
+            && argv.get(2).map(|s| s.starts_with("origin/")).unwrap_or(false);
+        assert!(
+            sanctioned,
+            "sync-source git argv used --hard outside the sanctioned \
+             'reset --hard origin/<branch>' shape: {argv:?}"
+        );
+    }
+}
+
+/// Run a git command in `cwd` with no credential injection (local ops: checkout,
+/// rev-parse, the hard reset itself). Force-guarded via
+/// [`assert_source_sync_safe`], NOT [`assert_never_force`] — this checkout
+/// tolerates the one sanctioned `reset --hard origin/<branch>` shape.
+fn run_source_git(cwd: &Path, args: &[&str]) -> Result<String, ToolError> {
+    assert_source_sync_safe(args);
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|e| ToolError::Execution(format!("failed to spawn git {}: {e}", args.join(" "))))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(ToolError::Execution(format!(
+            "git {} (in {}) failed: {}",
+            args.join(" "),
+            cwd.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+}
+
+/// Run a git command with no `cwd` (for `clone`, which creates its own target
+/// dir), injecting `token` via `GIT_ASKPASS` exactly like [`perform_ff_push`]'s
+/// transport — the token never appears in argv, the remote URL, or logs (a
+/// failure's stderr is defensively redacted of the token before surfacing).
+fn run_git_askpass_plain(args: &[&str], token: &str) -> Result<String, ToolError> {
+    assert_source_sync_safe(args);
+    let askpass = write_askpass_script()?;
+    let output = Command::new("git")
+        .args(args)
+        .env("GIT_ASKPASS", askpass.path())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_MIRROR_TOKEN", token)
+        .output()
+        .map_err(|e| ToolError::Execution(format!("failed to spawn git {}: {e}", args.join(" "))))?;
+    drop(askpass);
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let redacted = stderr.replace(token, "<redacted>");
+        Err(ToolError::Execution(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            redacted.trim()
+        )))
+    }
+}
+
+/// Like [`run_git_askpass_plain`] but in an existing checkout (`fetch`), with
+/// hooks disabled the same way [`run_git`] disables them.
+fn run_git_askpass_in(cwd: &Path, args: &[&str], token: &str) -> Result<String, ToolError> {
+    assert_source_sync_safe(args);
+    let askpass = write_askpass_script()?;
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(args)
+        .env("GIT_ASKPASS", askpass.path())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_MIRROR_TOKEN", token)
+        .output()
+        .map_err(|e| ToolError::Execution(format!("failed to spawn git {}: {e}", args.join(" "))))?;
+    drop(askpass);
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let redacted = stderr.replace(token, "<redacted>");
+        Err(ToolError::Execution(format!(
+            "git {} (in {}) failed: {}",
+            args.join(" "),
+            cwd.display(),
+            redacted.trim()
+        )))
+    }
+}
+
+/// `<source>/.git` absent → clone. The token is injected via `GIT_ASKPASS`; the
+/// remote URL (stored verbatim in the resulting `.git/config`'s `origin`) never
+/// carries the token, so subsequent `fetch`es re-resolve auth per-call the same
+/// way.
+fn clone_source(dest: &Path, remote: &str, token: &str) -> Result<(), ToolError> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            ToolError::Execution(format!(
+                "failed to create source parent dir {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    let dest_str = dest.to_string_lossy().to_string();
+    let argv = ["clone", "--", remote, dest_str.as_str()];
+    run_git_askpass_plain(&argv, token)?;
+    Ok(())
+}
+
+/// `<source>/.git` present → `fetch origin` + `checkout <branch>` +
+/// `reset --hard origin/<branch>`, making the checkout exactly match internal
+/// main (this is the sanctioned `--hard`; see [`assert_source_sync_safe`]).
+fn fetch_and_reset(source: &Path, branch: &str, token: &str) -> Result<(), ToolError> {
+    run_git_askpass_in(source, &["fetch", "--", "origin", branch], token)?;
+    run_source_git(source, &["checkout", branch])?;
+    let reset_target = format!("origin/{branch}");
+    run_source_git(source, &["reset", "--hard", reset_target.as_str()])?;
+    Ok(())
+}
+
+struct GitPublicMirrorSyncSource;
+
+#[async_trait]
+impl RustTool for GitPublicMirrorSyncSource {
+    fn name(&self) -> &str {
+        "git_public_mirror_sync_source"
+    }
+
+    fn description(&self) -> &str {
+        "S111E/MIRR-04. Sync a repo's internal-main 'parking lot' checkout (the \
+         source the mirror engine's git_public_mirror_prepare reads) directly from \
+         Gitea, using the resolved GITEA_PAT_<NAME> credential (default identity \
+         GITEA_PAT_MOOSE) injected via GIT_ASKPASS — never in argv/URL/logs. If the \
+         checkout doesn't exist yet (<source>/.git absent) it is cloned; otherwise it \
+         is fetched and hard-reset to origin/<branch>, making the parking lot exactly \
+         match internal main. 'source' defaults to TERMINUS_MIRROR_SOURCE_ROOT/<repo> \
+         (same resolution as the other mirror tools); 'internal_remote' defaults to \
+         TERMINUS_MIRROR_INTERNAL_REMOTE_<REPO_UPPER> then TERMINUS_MIRROR_INTERNAL_REMOTE \
+         (no embedded token — an http(s) Gitea remote URL only). Returns the resulting \
+         HEAD sha and branch. This is the git-protocol transport the operator (S111E, \
+         2026-07-10, moosenet-spec skill v3.14) designated the Terminus git tool to own; \
+         it supersedes the former dev-box-only git-clone/fetch rule for this transport."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "repo":            { "type": "string", "description": "Logical repo name (source-root subdir)" },
+                "source":          { "type": "string", "description": "Path to the parking-lot checkout (optional when TERMINUS_MIRROR_SOURCE_ROOT is set — defaults to <root>/<repo>)" },
+                "internal_remote": { "type": "string", "description": "Internal Gitea git remote (else TERMINUS_MIRROR_INTERNAL_REMOTE[_<REPO>])" },
+                "identity":        { "type": "string", "description": "Named GITEA_PAT_<NAME> identity to authenticate as (default: GITEA_IDENTITY_NAME, i.e. moose)" }
+            },
+            "required": ["repo"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let repo = req_str(&args, "repo")?.to_string();
+        validate_repo(&repo)?;
+        let source = resolve_source(&args, &repo)?;
+        let remote = resolve_internal_remote(&args, &repo)?;
+        let identity = args.get("identity").and_then(Value::as_str).map(str::to_string);
+        // Resolved ONLY here, immediately before use, and injected via
+        // GIT_ASKPASS — never in the remote URL, never in argv, never logged.
+        let token = crate::gitea::gitea_token(identity.as_deref())?;
+        let branch = source_branch();
+
+        let cloned = if !source.join(".git").exists() {
+            clone_source(&source, &remote, &token)?;
+            // A fresh clone may check out the remote's default branch under a
+            // different local name than `branch` (rare, but not guaranteed) —
+            // make sure the parking lot lands on the configured branch.
+            run_source_git(&source, &["checkout", &branch]).map_err(|e| {
+                ToolError::Execution(format!(
+                    "cloned '{repo}' but could not check out branch '{branch}': {e}"
+                ))
+            })?;
+            true
+        } else {
+            fetch_and_reset(&source, &branch, &token)?;
+            false
+        };
+
+        let head_sha = run_source_git(&source, &["rev-parse", "HEAD"])?.trim().to_string();
+        let current_branch = run_source_git(&source, &["rev-parse", "--abbrev-ref", "HEAD"])?
+            .trim()
+            .to_string();
+
+        Ok(json!({
+            "repo": repo,
+            "source": source.display().to_string(),
+            "cloned": cloned,
+            "remote": remote,
+            "head_sha": head_sha,
+            "branch": current_branch,
+        })
+        .to_string())
+    }
+}
+
 // ── git-public integration (S106 / GITX-05) ─────────────────────────────────
 
 /// Forward a mirror action to the underlying GHMR subtool. This is how the
@@ -1012,16 +1308,20 @@ fn git_exit_ok(work_dir: &Path, args: &[&str]) -> bool {
 /// without duplicating any of the engine's PII-gate / fast-forward-only /
 /// no-force logic: it simply calls the exact same [`RustTool::execute`] these
 /// four core tools already run when dispatched by name via the registry.
-/// `action` is one of `"status" | "prepare" | "approve" | "push"`; anything
-/// else is a clean invalid-argument error.
+/// `action` is one of `"status" | "prepare" | "approve" | "push" | "sync-source"`;
+/// anything else is a clean invalid-argument error. `sync-source` (S111E/MIRR-04)
+/// is the Gitea-side transport (clone/fetch the internal-main parking lot) —
+/// distinct from the other four, which operate on the swept work-dir derivative
+/// and its GitHub-side transport.
 pub(crate) async fn dispatch_mirror_action(action: &str, args: Value) -> Result<String, ToolError> {
     match action {
         "status" => GitPublicMirrorStatus.execute(args).await,
         "prepare" => GitPublicMirrorPrepare.execute(args).await,
         "approve" => GitPublicMirrorApprove.execute(args).await,
         "push" => GitPublicMirrorPush.execute(args).await,
+        "sync-source" => GitPublicMirrorSyncSource.execute(args).await,
         other => Err(ToolError::InvalidArgument(format!(
-            "unknown mirror_action '{other}'; expected one of status/prepare/approve/push"
+            "unknown mirror_action '{other}'; expected one of status/prepare/approve/push/sync-source"
         ))),
     }
 }
@@ -1039,6 +1339,7 @@ pub fn register(registry: &mut ToolRegistry) {
     registry.register_or_replace(Box::new(GitPublicMirrorPrepare));
     registry.register_or_replace(Box::new(GitPublicMirrorApprove));
     registry.register_or_replace(Box::new(GitPublicMirrorPush));
+    registry.register_or_replace(Box::new(GitPublicMirrorSyncSource));
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1124,6 +1425,9 @@ mod tests {
         std::env::remove_var("TERMINUS_MIRROR_REMOTE");
         std::env::remove_var("TERMINUS_MIRROR_SOURCE_ROOT");
         std::env::remove_var("TERMINUS_MIRROR_AUTO_APPROVE");
+        std::env::remove_var("TERMINUS_MIRROR_INTERNAL_REMOTE");
+        std::env::remove_var("TERMINUS_MIRROR_INTERNAL_REMOTE_DEMO");
+        std::env::remove_var("TERMINUS_MIRROR_SOURCE_BRANCH");
         std::env::remove_var("DATABASE_URL");
     }
 
@@ -2299,5 +2603,193 @@ mod tests {
 
         std::env::remove_var("TERMINUS_MIRROR_AUTO_APPROVE");
         cleanup(&[&src, &root, &other_src, &other_root, &bare]);
+    }
+
+    // ── git_public_mirror_sync_source (S111E / MIRR-04) ─────────────────────
+
+    /// Set the trio of Gitea env vars `sync-source`'s `gitea_token()` call
+    /// needs to resolve without hitting the network (GITEA_URL just needs to
+    /// be *set*, never actually contacted — the test remotes below are local
+    /// filesystem paths, so git never invokes GIT_ASKPASS against them and the
+    /// token value itself is never used, only resolved). Returns the prior
+    /// values so callers can restore them.
+    fn set_dummy_gitea_env(token: &str) -> (Option<String>, Option<String>, Option<String>) {
+        let url = std::env::var("GITEA_URL").ok();
+        let pat = std::env::var("GITEA_PAT_MOOSE").ok();
+        let identity = std::env::var("GITEA_IDENTITY_NAME").ok();
+        std::env::set_var("GITEA_URL", "http://example.invalid"); // pii-test-fixture
+        std::env::set_var("GITEA_PAT_MOOSE", token);
+        std::env::remove_var("GITEA_IDENTITY_NAME");
+        (url, pat, identity)
+    }
+
+    fn restore_gitea_env(saved: (Option<String>, Option<String>, Option<String>)) {
+        let (url, pat, identity) = saved;
+        match url { Some(v) => std::env::set_var("GITEA_URL", v), None => std::env::remove_var("GITEA_URL") }
+        match pat { Some(v) => std::env::set_var("GITEA_PAT_MOOSE", v), None => std::env::remove_var("GITEA_PAT_MOOSE") }
+        match identity { Some(v) => std::env::set_var("GITEA_IDENTITY_NAME", v), None => std::env::remove_var("GITEA_IDENTITY_NAME") }
+    }
+
+    #[test]
+    #[serial]
+    fn sync_source_resolve_internal_remote_prefers_explicit_then_per_repo_then_fallback() {
+        clear_env();
+        // Nothing configured -> NotConfigured, names the env vars.
+        let err = resolve_internal_remote(&json!({}), "demo").unwrap_err();
+        assert!(matches!(err, ToolError::NotConfigured(_)));
+        assert!(err.to_string().contains("TERMINUS_MIRROR_INTERNAL_REMOTE"));
+
+        // Generic fallback.
+        std::env::set_var("TERMINUS_MIRROR_INTERNAL_REMOTE", "http://gitea.example/moosenet/demo.git"); // pii-test-fixture
+        assert_eq!(
+            resolve_internal_remote(&json!({}), "demo").unwrap(),
+            "http://gitea.example/moosenet/demo.git" // pii-test-fixture
+        );
+
+        // Per-repo env wins over the generic fallback.
+        std::env::set_var("TERMINUS_MIRROR_INTERNAL_REMOTE_DEMO", "http://gitea.example/moosenet/demo-specific.git"); // pii-test-fixture
+        assert_eq!(
+            resolve_internal_remote(&json!({}), "demo").unwrap(),
+            "http://gitea.example/moosenet/demo-specific.git" // pii-test-fixture
+        );
+
+        // An explicit arg wins over everything.
+        assert_eq!(
+            resolve_internal_remote(&json!({"internal_remote": "http://gitea.example/moosenet/explicit.git"}), "demo").unwrap(), // pii-test-fixture
+            "http://gitea.example/moosenet/explicit.git" // pii-test-fixture
+        );
+        clear_env();
+    }
+
+    #[test]
+    fn sync_source_assert_source_sync_safe_allows_only_the_sanctioned_hard_reset_shape() {
+        // The sanctioned shape must pass.
+        assert_source_sync_safe(&["reset", "--hard", "origin/main"]);
+        // Non-hard-reset argv (no --hard at all) is always fine.
+        assert_source_sync_safe(&["fetch", "--", "origin", "main"]);
+        assert_source_sync_safe(&["checkout", "main"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "force")]
+    fn sync_source_assert_source_sync_safe_rejects_force_flag() {
+        assert_source_sync_safe(&["push", "--force", "origin", "main"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--hard")]
+    fn sync_source_assert_source_sync_safe_rejects_hard_outside_sanctioned_shape() {
+        // `--hard` against a branch that is NOT `origin/<branch>` (e.g. a
+        // caller-supplied ref) must still be refused — only
+        // `reset --hard origin/<branch>` is tolerated.
+        assert_source_sync_safe(&["reset", "--hard", "some-other-ref"]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sync_source_missing_root_and_no_explicit_source_is_not_configured() {
+        clear_env();
+        let err = GitPublicMirrorSyncSource
+            .execute(json!({"repo": "demo"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotConfigured(_)));
+        assert!(err.to_string().contains("TERMINUS_MIRROR_SOURCE_ROOT"));
+        clear_env();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sync_source_clones_when_absent_then_fetches_and_resets_when_present() {
+        clear_env();
+        let remote = init_source(&[("f.txt", "v1")]);
+        let root = unique("sync-root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("TERMINUS_MIRROR_SOURCE_ROOT", &root);
+        std::env::set_var("TERMINUS_MIRROR_INTERNAL_REMOTE", remote.display().to_string());
+        let saved = set_dummy_gitea_env("dummy-clone-token"); // pii-test-fixture
+
+        let out = GitPublicMirrorSyncSource.execute(json!({"repo": "demo"})).await.unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["cloned"], true, "first sync must clone: {v}");
+        assert_eq!(v["branch"], "main");
+        let source = root.join("demo");
+        assert!(source.join(".git").exists());
+        let remote_head_after_clone = run_git(&remote, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        assert_eq!(v["head_sha"], remote_head_after_clone);
+
+        // Advance the "remote" (a plain local repo standing in for internal
+        // Gitea main) with a second commit, then re-sync — this must fetch +
+        // hard-reset the existing checkout, NOT re-clone.
+        write_file(&remote, "f.txt", "v2");
+        commit_all(&remote, "second");
+        let remote_head_after_second = run_git(&remote, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        assert_ne!(remote_head_after_clone, remote_head_after_second);
+
+        let out2 = GitPublicMirrorSyncSource.execute(json!({"repo": "demo"})).await.unwrap();
+        let v2: Value = serde_json::from_str(&out2).unwrap();
+        assert_eq!(v2["cloned"], false, "second sync must fetch+reset, not re-clone: {v2}");
+        assert_eq!(v2["head_sha"], remote_head_after_second);
+
+        // The persisted git config must carry the plain remote path — never a
+        // credential embedded in the URL (auth goes only through GIT_ASKPASS).
+        let origin_url = run_git(&source, &["config", "--get", "remote.origin.url"]).unwrap().trim().to_string();
+        assert_eq!(origin_url, remote.display().to_string());
+        assert!(!origin_url.contains("dummy-clone-token"));
+
+        restore_gitea_env(saved);
+        cleanup(&[&remote, &root]);
+        clear_env();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sync_source_token_never_leaks_into_error_output() {
+        clear_env();
+        let root = unique("sync-root-err");
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("TERMINUS_MIRROR_SOURCE_ROOT", &root);
+        // A remote path that does not exist -> clone fails, but the failure
+        // must never echo the resolved token.
+        let bogus_remote = unique("does-not-exist");
+        std::env::set_var("TERMINUS_MIRROR_INTERNAL_REMOTE", bogus_remote.display().to_string());
+        let very_distinctive_token = "<REDACTED-SECRET>"; // pii-test-fixture
+        let saved = set_dummy_gitea_env(very_distinctive_token);
+
+        let err = GitPublicMirrorSyncSource
+            .execute(json!({"repo": "demo"}))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains(very_distinctive_token),
+            "error message must never contain the raw token: {msg}"
+        );
+
+        restore_gitea_env(saved);
+        cleanup(&[&root]);
+        clear_env();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dispatch_mirror_action_routes_sync_source() {
+        clear_env();
+        // Same NotConfigured failure mode as calling the tool directly —
+        // proves the dispatcher actually forwards to GitPublicMirrorSyncSource
+        // rather than silently no-op'ing or hitting the wrong tool.
+        let err = dispatch_mirror_action("sync-source", json!({"repo": "demo"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotConfigured(_)));
+        assert!(err.to_string().contains("TERMINUS_MIRROR_SOURCE_ROOT"));
+        clear_env();
+    }
+
+    #[test]
+    fn sync_source_tool_is_registered() {
+        let mut reg = ToolRegistry::new();
+        register(&mut reg);
+        assert!(reg.contains("git_public_mirror_sync_source"));
     }
 }

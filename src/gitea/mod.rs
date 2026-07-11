@@ -390,6 +390,15 @@ impl GiteaClient {
         format!("{}/api/v1{}", self.base_url.trim_end_matches('/'), path)
     }
 
+    /// The raw resolved token string for this client's active identity — a
+    /// crate-internal escape hatch for a caller (e.g. the mirror engine's
+    /// `sync-source` git transport, S111E/MIRR-04) that needs the bare
+    /// credential to hand to `git` via `GIT_ASKPASS`, rather than going
+    /// through this client's own HTTP methods. Never logged by callers.
+    fn raw_token(&self) -> &str {
+        &self.token
+    }
+
     fn auth_header(&self) -> String {
         format!("token {}", self.token)
     }
@@ -704,6 +713,40 @@ impl GiteaClient {
             .map_err(|e| ToolError::Http(format!("Failed to read raw body: {e}")))?;
         Ok(bytes.to_vec())
     }
+}
+
+/// Resolve a raw Gitea git-transport credential — the single sanctioned read
+/// point for anything outside this module that needs a bare `GITEA_PAT_<NAME>`
+/// token string to hand to `git` (via `GIT_ASKPASS`), rather than going through
+/// this module's own HTTP tool methods. Used by the mirror engine's
+/// `sync-source` action (S111E/MIRR-04) for its `git clone`/`git fetch`
+/// transport, mirroring `crate::github::github_token()`'s shape exactly.
+///
+/// Resolution order (delegates to [`GiteaClient::from_env`] /
+/// [`GiteaClient::for_identity`], never a raw `std::env::var(GITEA_PAT_...)`
+/// read outside this module):
+/// 1. `identity` (if given) selects that named `GITEA_PAT_<NAME>` identity.
+/// 2. Otherwise the active-default identity (`GITEA_IDENTITY_NAME`, default
+///    `"moose"`).
+///
+/// Returns `NotConfigured` (never a panic, never a partial value) when the
+/// resolved identity has no token, and the caller must NEVER log or echo the
+/// returned string.
+pub(crate) fn gitea_token(identity: Option<&str>) -> Result<String, ToolError> {
+    let client = GiteaClient::from_env()?;
+    let client = match identity {
+        Some(name) if !name.trim().is_empty() => client.for_identity(name)?,
+        _ => client,
+    };
+    let token = client.raw_token();
+    if token.is_empty() {
+        return Err(ToolError::NotConfigured(format!(
+            "no Gitea token resolved for identity '{}' — provision GITEA_PAT_{}",
+            client.identity_name().unwrap_or("?"),
+            client.identity_name().unwrap_or("?").to_uppercase()
+        )));
+    }
+    Ok(token.to_string())
 }
 
 // ─── Shared optional `identity` argument ─────────────────────────────────────
@@ -1538,6 +1581,35 @@ impl RustTool for MergePr {
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
             return Err(ToolError::Http(format!("Merge failed: {status}: {body_text}")));
+        }
+
+        // S111E/MIRR-04: this is the single clean "a gated merge to internal
+        // main just completed" call site the build pipeline's Stage 6 (merge)
+        // actually goes through — best-effort refresh the mirror engine's
+        // parking-lot checkout of this repo's internal main, so the git-public
+        // mirror runner picks up the change on its next tick without waiting
+        // for a separate manual sync-source call. This MUST NEVER fail the
+        // merge itself (the merge above already succeeded on Gitea): a
+        // sync-source failure here (e.g. TERMINUS_MIRROR_SOURCE_ROOT /
+        // TERMINUS_MIRROR_INTERNAL_REMOTE_<REPO> not configured on this host)
+        // is logged and swallowed — the mirror runner self-heals by re-syncing
+        // on its next scheduled tick, exactly like a missed mirror push does
+        // (see git_public_mirror_push's failure protocol).
+        if let Err(e) = crate::forge::mirror::tools::dispatch_mirror_action(
+            "sync-source",
+            json!({ "repo": repo }),
+        )
+        .await
+        {
+            tracing::warn!(
+                target: "mirror_audit",
+                event = "sync_source_after_merge_failed",
+                repo = %repo,
+                pr = pr_num,
+                error = %e,
+                "post-merge mirror sync-source failed (non-fatal — PR #{pr_num} merged \
+                 successfully; the mirror runner will re-sync '{repo}' on its next tick)"
+            );
         }
 
         Ok(format!("Pull request #{pr_num} merged into {base} in {owner}/{repo}.", base = style))
@@ -4876,5 +4948,38 @@ mod tests {
             assert!(names.iter().any(|n| n == name), "{name} must be registered");
         }
         std::env::remove_var("GITEA_URL");
+    }
+
+    // ── S111E/MIRR-04: merge → sync-source non-fatal hook ───────────────────
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn merge_pr_succeeds_even_when_sync_source_is_unconfigured() {
+        // sync-source's underlying gitea_token() reads GITEA_URL/GITEA_PAT_* from
+        // the REAL process environment (independent of the mock `GiteaClient`
+        // injected into the tool below), so clearing them here reproduces "this
+        // host has no TERMINUS_MIRROR_SOURCE_ROOT / Gitea credential configured
+        // for the mirror engine" — exactly the failure the post-merge hook must
+        // swallow (log + continue) rather than propagate, since the merge itself
+        // already succeeded on Gitea before the hook ever runs.
+        let url_backup = std::env::var("GITEA_URL").ok();
+        let root_backup = std::env::var("TERMINUS_MIRROR_SOURCE_ROOT").ok();
+        std::env::remove_var("GITEA_URL");
+        std::env::remove_var("TERMINUS_MIRROR_SOURCE_ROOT");
+
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/7/merge");
+            then.status(200);
+        });
+        let tool = MergePr { client: mock_client(&server) };
+        let result = tool.execute(serde_json::json!({"repo": "myrepo", "pr": 7})).await;
+
+        if let Some(v) = url_backup { std::env::set_var("GITEA_URL", v); } else { std::env::remove_var("GITEA_URL"); }
+        if let Some(v) = root_backup { std::env::set_var("TERMINUS_MIRROR_SOURCE_ROOT", v); } else { std::env::remove_var("TERMINUS_MIRROR_SOURCE_ROOT"); }
+
+        mock.assert();
+        let result = result.expect("merge must succeed even though sync-source is unconfigured");
+        assert!(result.contains("merged into"), "unexpected result: {result}");
     }
 }

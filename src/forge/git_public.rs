@@ -233,8 +233,11 @@ impl RustTool for GitPublicTool {
                 },
                 "mirror_action": {
                     "type": "string",
-                    "enum": ["status", "prepare", "approve", "push"],
-                    "description": "Route to the git-public mirror engine instead of a direct endpoint call"
+                    "enum": ["status", "prepare", "approve", "push", "sync-source"],
+                    "description": "Route to the git-public mirror engine instead of a direct endpoint call. \
+                                     'sync-source' (S111E/MIRR-04) clones/fetches the internal-main parking \
+                                     lot from Gitea (git-protocol transport, GITEA_PAT_<NAME> via GIT_ASKPASS) \
+                                     — the other four operate on the swept work-dir derivative + GitHub."
                 },
                 "provider": {
                     "type": "string",
