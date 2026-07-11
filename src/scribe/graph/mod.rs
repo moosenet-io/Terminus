@@ -15,6 +15,7 @@
 //! This item (KGRAPH-01) lands only the model; nothing here does I/O, parsing,
 //! or networking.
 
+pub mod build;
 pub mod cluster;
 pub mod extract;
 pub mod layout;

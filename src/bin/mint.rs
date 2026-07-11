@@ -292,7 +292,11 @@ async fn main() -> std::process::ExitCode {
                 // `coder_sweep::run` now does for EVERY pass, including the
                 // first. `coder_sweep::run` handles its own acquisition
                 // (fail-fast is no longer correct at any layer here).
-                coder_sweep::run(&langs, case_limit, mem_config.as_deref()).await
+                // MINT2-06: honor the same `--only-stale` env surface as the
+                // unified harness (`MINT_ONLY_STALE`) so `mint sweep coder` can
+                // re-run only stale cells too; unset ⇒ the full sweep (default).
+                let only_stale = terminus_rs::intake::only_stale_from_env();
+                coder_sweep::run(&langs, case_limit, mem_config.as_deref(), only_stale).await
             }
             SweepTarget::Assistant { remote } => {
                 // Phase 6: install the remote inference-target override (if any).
@@ -301,7 +305,9 @@ async fn main() -> std::process::ExitCode {
                 // now acquires/releases the exclusive lock per model (with
                 // bounded backoff on every acquire, including the first), so
                 // `mint` no longer pre-acquires a whole-run outer guard here.
-                match runner::run().await {
+                // MINT2-06: honor the same `--only-stale` env surface (default
+                // full sweep).
+                match runner::run_mode(terminus_rs::intake::only_stale_from_env()).await {
                     Ok(report) => {
                         let total = report.models.len();
                         let profiled = report
