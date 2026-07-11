@@ -227,6 +227,39 @@ Example — grant `ct322-viewer` every `ct322` tool except its sensitive
 
 ```json
 {"ct322-viewer": {"allow": ["ct322__*"], "deny": ["ct322__vitals_"]}}
+
+### Approval-gate propagation across the mesh (MESH-09)
+
+Federation is never a way to dodge human approval. Guarded tools
+(`infisical_*`, `ansible_*`, `openhands_*`, and the state-mutating
+`routines_propose`/`routines_pending`/`routines_approve`/
+`git_public_mirror_approve`/`git_public_mirror_push` — see
+`approval::is_guarded`) are enforced **at this gateway**, even when the
+guarded tool actually lives on a remote mesh upstream:
+
+- `tools/call` resolving a namespaced name to `CallRoute::Upstream` checks
+  `approval::is_guarded` against the **bare** (de-namespaced) tool name —
+  `ct322__ansible_run_playbook` is gated exactly like a local
+  `ansible_run_playbook` — and, if guarded, runs the same
+  `approval::gate()` local tools use, **before** the call is ever forwarded
+  to the upstream. Federation never bypasses the human-approval gate; it is
+  not something an upstream is trusted to enforce on our behalf.
+- The gated content includes the target upstream's namespace
+  (`approval::mesh_gate_args`), so a code approved for one upstream's tool
+  cannot be replayed against another upstream's tool of the same bare name
+  (or against the local tool of that name) — cross-upstream replay is
+  rejected the same way a differing-args replay already is (see
+  "Content-binding" in `src/approval.rs`).
+- This gateway gate is **authoritative and independent** of any approval
+  gate the upstream itself may also run for the same tool — double-gating
+  is fine and expected, never skipped on the assumption the upstream
+  already checked.
+- If the call is approved but then fails to actually reach the upstream
+  (a transport/connectivity error), the one-time code is **not** treated as
+  spent — the grant is rolled back (`approval::unconsume`) so the operator's
+  same approval can be retried once the upstream is healthy again, instead
+  of requiring a fresh `approve <CODE>` for a call that never ran.
+
 ### Onboarding a new upstream (`mesh_onboard_upstream`)
 
 Adding an entry to `TERMINUS_MESH_UPSTREAMS_JSON` by hand risks a typo'd

@@ -371,6 +371,37 @@ lumina-core's deterministic command handler — the model can never approve
 its own request, and every guarded-tool call is additionally hard-blocked
 inside the agentic loop at the Chord level.
 
+### Mesh propagation: the gate applies to federated calls too (MESH-09)
+
+The gate above describes a LOCAL guarded tool's own `execute()`. A guarded
+tool can also live on a remote mesh upstream and be reached through a
+namespaced `<namespace>__<tool>` name (see the "Mesh" section of the
+README). Federation must not be a side door around human approval, so
+`src/mcp_server.rs`'s `tools/call` handler runs the identical gate at the
+**gateway**, before a `CallRoute::Upstream` call is forwarded anywhere:
+
+- `crate::approval::is_guarded(bare_name)` classifies guardedness by the
+  BARE (de-namespaced) tool name, so `ct322__ansible_run_playbook` is
+  recognized as guarded exactly like local `ansible_run_playbook` — the
+  classification list is a static mirror of every tool that calls `gate()`
+  in the `ansible`/`openhands`/`<secret-manager>`/`routines`/mirror modules.
+- `crate::approval::mesh_gate_args(args, namespace)` folds the target
+  upstream's namespace into the content `gate()` binds the code to (on top
+  of `content_of`'s existing arg-stripping), so a code approved for
+  `ct322__ansible_run_playbook` cannot be redeemed against
+  `other__ansible_run_playbook` — cross-upstream replay is rejected the
+  same way a differing-args replay already is.
+- The gateway's gate runs and must return `Granted` **before** `mcp_server`
+  calls `UpstreamClient::call_tool` at all; it is authoritative regardless
+  of whether the upstream process also enforces its own approval gate on
+  the same tool (double-gating is expected, never treated as redundant and
+  skipped).
+- If `Granted` but the subsequent upstream call then fails at the transport
+  layer (upstream unreachable/unhealthy), `crate::approval::unconsume`
+  reverts the grant's `consumed`/`consumed_at` state back to `approved` so
+  the SAME code remains usable on retry — approval was for "run this call",
+  not "spend the code on one connectivity attempt".
+
 ---
 
 Cross-reference: [federation.md](federation.md) covers how an authenticated

@@ -36,6 +36,98 @@ use crate::error::ToolError;
 /// The argument key carrying an approval code on a re-dispatched guarded call.
 pub const APPROVAL_ARG: &str = "_approval_code";
 
+/// The argument key [`mesh_gate_args`] folds into the gated content to bind a
+/// federated approval to the mesh upstream it targets (MESH-09). Reserved —
+/// never a real tool parameter.
+const MESH_UPSTREAM_ARG: &str = "_mesh_upstream";
+
+/// Bare tool names that are approval-gated locally: every tool in the
+/// `ansible`/`openhands`/`<secret-manager>` modules calls [`gate`] at the top of its
+/// own `execute()`, plus the state-mutating `routines_propose`/
+/// `routines_pending`/`routines_approve` and the irreversible
+/// `git_public_mirror_approve`/`git_public_mirror_push`. Mirrored here as a
+/// static classification (MESH-09) so a federated call routed to
+/// `<namespace>__<bare_name>` (see `crate::mesh::merge::CallRoute::Upstream`)
+/// can be gated AT THE GATEWAY, before it ever leaves this process, using the
+/// exact same guardedness rule as local dispatch — a guarded tool cannot be
+/// laundered through a remote upstream to dodge human approval. Kept as one
+/// list so local and mesh guardedness can never drift apart; update this
+/// alongside any new `gate(...)` call site in the tools above.
+const GUARDED_BARE_NAMES: &[&str] = &[
+    "ansible_run_playbook",
+    "ansible_list_playbooks",
+    "ansible_last_run_status",
+    "ansible_view_run_log",
+    "openhands_run_task",
+    "openhands_get_status",
+    "openhands_list_conversations",
+    "infisical_status",
+    "infisical_list_projects",
+    "infisical_list_secrets",
+    "infisical_get_secret",
+    "infisical_get_secrets_batch",
+    "routines_propose",
+    "routines_pending",
+    "routines_approve",
+    "git_public_mirror_approve",
+    "git_public_mirror_push",
+];
+
+/// Is `bare_name` (already de-namespaced — see `crate::mesh::merge::split_namespaced`)
+/// a locally-guarded tool? Used by `src/mcp_server.rs` to decide whether a
+/// federated `tools/call` needs the gateway approval gate before it is
+/// forwarded to the owning mesh upstream.
+pub fn is_guarded(bare_name: &str) -> bool {
+    GUARDED_BARE_NAMES.contains(&bare_name)
+}
+
+/// Build the content a FEDERATED call to `bare_name` on `upstream_namespace`
+/// is gated on: the real args (approval code stripped, same rule as
+/// [`content_of`]) plus the target upstream's namespace, with the caller's
+/// `_approval_code` (if any) reattached so [`gate`] can still find it.
+///
+/// Folding the namespace into the bound content is what makes a code
+/// non-replayable across upstreams: `mesh_gate_args(args, "a")` and
+/// `mesh_gate_args(args, "b")` produce different content for the same real
+/// `args`, so a grant approved for one can never satisfy [`gate`]'s
+/// exact-content match for the other (and likewise never satisfies a
+/// same-bare-name LOCAL call, which is gated on `content_of(args)` with no
+/// `_mesh_upstream` key at all).
+pub fn mesh_gate_args(args: &Value, upstream_namespace: &str) -> Value {
+    let mut v = content_of(args);
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(MESH_UPSTREAM_ARG.to_string(), Value::String(upstream_namespace.to_string()));
+        if let Some(code) = args.get(APPROVAL_ARG).and_then(Value::as_str) {
+            obj.insert(APPROVAL_ARG.to_string(), Value::String(code.to_string()));
+        }
+    }
+    v
+}
+
+/// Roll back a grant that [`gate`] just consumed (`Granted`) when the guarded
+/// action then failed to actually reach/execute on its target — e.g. a
+/// transport error reaching a federated mesh upstream AFTER approval was
+/// confirmed (MESH-09). Restores the row to `approved` with `consumed_at`
+/// cleared so the SAME code can be retried once the upstream is healthy
+/// again: the operator's approval covered "run this call", not "spend one
+/// attempt at reaching a possibly-unhealthy upstream". Only meaningful right
+/// after `gate` returned `Granted` for `code`; a silent no-op (best-effort,
+/// errors swallowed by the caller) if the row is no longer in the state this
+/// expects (e.g. it was already re-consumed by a racing retry).
+pub async fn unconsume(tool_name: &str, code: &str) -> Result<(), ToolError> {
+    let pool = pool().await?;
+    sqlx::query(
+        "UPDATE tool_approvals SET status = 'approved', consumed_at = NULL \
+         WHERE code = $1 AND tool_name = $2 AND status = 'consumed'",
+    )
+    .bind(code)
+    .bind(tool_name)
+    .execute(&pool)
+    .await
+    .map_err(|e| ToolError::Database(format!("approval unconsume: {e}")))?;
+    Ok(())
+}
+
 /// Outcome of the approval gate.
 pub enum Gate {
     /// Approved + consumed — the tool may execute.
@@ -302,5 +394,120 @@ mod tests {
     #[test]
     fn approval_arg_constant() {
         assert_eq!(APPROVAL_ARG, "_approval_code");
+    }
+
+    // ------------------------------------------------------------------
+    // MESH-09 — is_guarded: federated dispatch must classify guardedness
+    // by the exact same bare tool names the local tools gate on.
+    // ------------------------------------------------------------------
+    #[test]
+    fn is_guarded_covers_every_locally_gated_tool() {
+        for name in [
+            "ansible_run_playbook",
+            "ansible_list_playbooks",
+            "ansible_last_run_status",
+            "ansible_view_run_log",
+            "openhands_run_task",
+            "openhands_get_status",
+            "openhands_list_conversations",
+            "infisical_status",
+            "infisical_list_projects",
+            "infisical_list_secrets",
+            "infisical_get_secret",
+            "infisical_get_secrets_batch",
+            "routines_propose",
+            "routines_pending",
+            "routines_approve",
+            "git_public_mirror_approve",
+            "git_public_mirror_push",
+        ] {
+            assert!(is_guarded(name), "{name} should be classified as guarded");
+        }
+    }
+
+    #[test]
+    fn is_guarded_false_for_unguarded_tools() {
+        // Ungated tools (no `gate(...)` call in their `execute()`), and a
+        // namespace-shaped bare name that just happens to collide with
+        // nothing in the guarded list.
+        for name in ["health", "weather_get", "routines_list", "routines_history", "git_public_mirror_status"] {
+            assert!(!is_guarded(name), "{name} should NOT be classified as guarded");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // MESH-09 — mesh_gate_args: content-binding folds in the target
+    // upstream namespace, so the SAME bare tool + SAME real args gate to
+    // DIFFERENT content depending which upstream they're headed to. This
+    // is what makes a federated approval code non-replayable across
+    // upstreams (or against the same-named local tool).
+    // ------------------------------------------------------------------
+    #[test]
+    fn mesh_gate_args_differs_by_upstream_namespace() {
+        let args = json!({"playbook": "deploy.yml"});
+        let for_a = mesh_gate_args(&args, "ct322");
+        let for_b = mesh_gate_args(&args, "other");
+        assert_ne!(
+            for_a, for_b,
+            "same real args gated for two different upstreams must not produce identical content"
+        );
+    }
+
+    #[test]
+    fn mesh_gate_args_strips_and_reattaches_the_approval_code() {
+        let args = json!({"playbook": "deploy.yml", "_approval_code": "ABC123"});
+        let gated = mesh_gate_args(&args, "ct322");
+        assert_eq!(gated.get(APPROVAL_ARG).and_then(Value::as_str), Some("ABC123"));
+        // The stored/compared content (what `gate` diffs against) has no
+        // code in it -- same rule `content_of` enforces for local tools.
+        assert_eq!(
+            content_of(&gated),
+            json!({"playbook": "deploy.yml", "_mesh_upstream": "ct322"})
+        );
+    }
+
+    #[test]
+    fn mesh_gate_args_content_matches_regardless_of_which_code_is_attached() {
+        // Mirrors `content_of_identical_args_are_equal_regardless_of_code_value`:
+        // a legitimate re-dispatch (same real args + code) must diff-match
+        // the row inserted with no code, for the SAME upstream.
+        let proposal = content_of(&mesh_gate_args(&json!({"playbook": "deploy.yml"}), "ct322"));
+        let redemption = content_of(&mesh_gate_args(
+            &json!({"playbook": "deploy.yml", "_approval_code": "ANYCODE"}),
+            "ct322",
+        ));
+        assert_eq!(proposal, redemption);
+    }
+
+    #[test]
+    fn mesh_gate_args_cross_upstream_content_never_matches() {
+        // The actual replay-rejection property MESH-09 requires: content
+        // gated for one upstream can never equal content gated for another,
+        // even with the operator's exact original args + code reused.
+        let approved_for_a =
+            content_of(&mesh_gate_args(&json!({"playbook": "deploy.yml"}), "ct322"));
+        let replayed_against_b = content_of(&mesh_gate_args(
+            &json!({"playbook": "deploy.yml", "_approval_code": "CODE-FROM-A"}),
+            "other",
+        ));
+        assert_ne!(
+            approved_for_a, replayed_against_b,
+            "a code's bound content for upstream A must never match upstream B's content"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn gate_denies_federated_guarded_call_without_db_before_any_dispatch() {
+        // Same DB-unavailable posture as `gate_without_db_url_denies_gracefully`,
+        // exercised through the mesh content-binding path: the gateway gate
+        // must deny/pend BEFORE a federated call is ever forwarded, so an
+        // unreachable approval DB fails closed for mesh dispatch too.
+        std::env::remove_var("DATABASE_URL");
+        let args = mesh_gate_args(&json!({"playbook": "deploy.yml"}), "ct322");
+        match gate("ansible_run_playbook", &args, "run deploy.yml via ct322").await {
+            Gate::Denied(m) => assert!(m.contains("unavailable") || m.contains("DATABASE_URL")),
+            _ => panic!("expected Denied when DATABASE_URL unset"),
+        }
     }
 }
