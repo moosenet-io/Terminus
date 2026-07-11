@@ -131,6 +131,45 @@ impl GraphStore {
         Ok(graph)
     }
 
+    /// Bi-temporal incremental refresh (KGRAPH-15): like [`Self::refresh_files`]
+    /// but **invalidate-don't-delete** — a changed file's old nodes are marked
+    /// invalidated (kept for history) rather than removed, new elements are
+    /// stamped with the build sequence, and the merged graph is saved. The live
+    /// working set is unchanged (`current_nodes` / the default views still see
+    /// exactly the current graph); a past state is reconstructable via
+    /// `KnowledgeGraph::as_of`. Returns the merged graph.
+    pub fn refresh_files_temporal(
+        &self,
+        project_id: &str,
+        changed: &[(String, String)],
+    ) -> Result<KnowledgeGraph, ToolError> {
+        let mut graph = self
+            .load(project_id)?
+            .unwrap_or_else(|| KnowledgeGraph::new(project_id));
+        if changed.is_empty() {
+            return Ok(graph);
+        }
+        let seq = graph.next_build_seq();
+        let known_before = graph.node_ids();
+        for (path, _) in changed {
+            graph.invalidate_path(path, seq);
+        }
+        let sub = build_rust_graph(project_id, changed)?;
+        // Re-insert: a surviving node revives (insert_node keeps its original
+        // valid_from and clears the invalidation); a genuinely-new node (id not
+        // in known_before) is stamped valid_from = seq below.
+        for n in sub.nodes() {
+            graph.insert_node(n.clone());
+        }
+        for e in sub.edges() {
+            let _ = graph.insert_edge(e.clone());
+        }
+        graph.stamp_new_nodes(&known_before, seq);
+        graph.recompute_degrees();
+        self.save(project_id, &graph)?;
+        Ok(graph)
+    }
+
     /// Whether a graph file exists for `project_id` (without loading it).
     pub fn exists(&self, project_id: &str) -> bool {
         Path::new(&self.path_for(project_id)).exists()
@@ -207,6 +246,29 @@ mod tests {
         let reloaded = store.load("TERM").unwrap().unwrap();
         assert!(reloaded.get_node("crate::a::new_a").is_some());
         assert!(reloaded.get_node("crate::b::keep_b").is_some());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn temporal_refresh_keeps_removed_symbol_history() {
+        let root = tmp_root("temporal");
+        let store = GraphStore::new(&root);
+        let v1 = ("src/w.rs".to_string(), "pub fn old_fn() {}\npub fn keep_fn() {}".to_string());
+        store.save("TERM", &build_rust_graph("TERM", &[v1]).unwrap()).unwrap();
+
+        // Change: drop old_fn, keep keep_fn, add new_fn.
+        let v2 = ("src/w.rs".to_string(), "pub fn keep_fn() {}\npub fn new_fn() {}".to_string());
+        let merged = store.refresh_files_temporal("TERM", &[v2]).unwrap();
+
+        let cur: Vec<&str> = merged.current_nodes().map(|n| n.id.as_str()).collect();
+        assert!(cur.contains(&"crate::w::keep_fn"), "survivor current");
+        assert!(cur.contains(&"crate::w::new_fn"), "new current");
+        assert!(!cur.contains(&"crate::w::old_fn"), "removed not current");
+        // History kept, not deleted; reconstructable.
+        assert!(merged.get_node("crate::w::old_fn").is_some(), "removed symbol retained");
+        let (n0, _) = merged.as_of(0);
+        assert!(n0.iter().any(|n| n.id == "crate::w::old_fn"), "old_fn present at seq 0");
+        assert!(!n0.iter().any(|n| n.id == "crate::w::new_fn"), "new_fn absent at seq 0");
         let _ = fs::remove_dir_all(&root);
     }
 
