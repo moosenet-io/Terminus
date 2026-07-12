@@ -647,8 +647,12 @@ or unreachable, so callers should fall back to the lexical `kg_search` in that c
         let qvec = match client.embed(&query).await {
             Ok(v) => v,
             Err(e) => {
+                // Any unusable component (embeddings endpoint down, or the
+                // vector query failing) means semantic search cannot produce
+                // results — report configured:false so the caller falls back to
+                // lexical kg_search, the SAME single signal as an unset store.
                 return structured(json!({
-                    "configured": true, "found": false, "project_id": project_id, "results": [],
+                    "configured": false, "found": false, "project_id": project_id, "results": [],
                     "error": e.to_string(),
                 }));
             }
@@ -657,16 +661,25 @@ or unreachable, so callers should fall back to the lexical `kg_search` in that c
         let hits = match store.query_topk(&project_id, &qvec, limit).await {
             Ok(h) => h,
             Err(e) => {
+                // Any unusable component (embeddings endpoint down, or the
+                // vector query failing) means semantic search cannot produce
+                // results — report configured:false so the caller falls back to
+                // lexical kg_search, the SAME single signal as an unset store.
                 return structured(json!({
-                    "configured": true, "found": false, "project_id": project_id, "results": [],
+                    "configured": false, "found": false, "project_id": project_id, "results": [],
                     "error": e.to_string(),
                 }));
             }
         };
 
+        // No graph for this project is NOT a config problem (the store/embeddings
+        // are configured) — it's a genuine found:false, following the same
+        // no_graph convention as the other kg_* tools. Callers should NOT fall
+        // back to lexical here (there is nothing to search either way).
         let Some(g) = load_graph(&project_id)? else {
             return structured(json!({
-                "configured": true, "found": true, "project_id": project_id, "count": 0, "results": [],
+                "configured": true, "found": false, "project_id": project_id, "count": 0, "results": [],
+                "message": "no knowledge graph for this project (run scribe_kg_build first)",
             }));
         };
 
