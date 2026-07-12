@@ -259,3 +259,62 @@ failure never affects `configured` — it only means that seed's
 | Env var | Purpose | Default |
 |---|---|---|
 | `KGRULE_CRYSTALLIZE_MIN_OCCURRENCES` | Minimum finding recurrence to crystallize into a candidate rule | `3` |
+### `kg_rules` tool (KGRULE-04)
+
+`KgRules` (`tools.rs`) is the read-only MCP surface over `RulesStore::list_active`:
+lists **active**, non-expired rules for a project — the durable guidance the
+system has crystallized from recurring findings (KGRULE-02) and earned
+through an adversarial `review_run` promotion panel (KGRULE-03). An agent
+should ground here before scoping work in a project, the same way it grounds
+in `kg_findings`/`kg_search`.
+
+- **Params:** `project_id` (required), `scope` (optional:
+  node/path/community/global — passed as `scope_kind` to `list_active`),
+  `category` (optional), `limit` (optional, default 50, clamped to
+  `[1, 200]`).
+- **Result shape:** each entry is
+  `{id, scope_kind, scope_ref, category, guidance, enforcement, cortex_risk}`,
+  ordered by enforcement (`blocking` > `lint-candidate` > `advisory`) then
+  recency — `list_active`'s own `ORDER BY`, unchanged by the tool.
+- **Degrade contract (mirrors `kg_findings`/`kg_semantic_search`):**
+  `RulesStore::from_env()` returning `NotConfigured` (or any other error) —
+  or a `list_active` failure — never surfaces as a tool error. Both degrade
+  to `{configured: false, found: false, project_id, results: []}`
+  (optionally with an `error` string). A successful, empty result set is
+  `{configured: true, found: false, ...}`; a non-empty one is
+  `{configured: true, found: true, count, results}`.
+
+## Review injection: `active_rules` (KGRULE-04)
+
+`review::kg_context` — the same module that grounds `review_run` in the KG's
+"blast radius" (`knowledge_graph`, KGREV-01) — also injects a bounded
+`active_rules` array into the review `context`, right after the
+`knowledge_graph` block, closing the loop: the rules the system crystallized
+and promoted from past reviews are now enforced by future ones.
+
+- **Selection:** for `context.project_id`'s active rules, a rule applies if
+  it is `scope_kind == "global"`, or its `scope_ref` matches one of the
+  changed files (`path` scope) or a symbol defined in one of the changed
+  files (`node` scope, resolved via the same Atlas graph `knowledge_graph`
+  grounding uses). The pure decision — given the loaded rules and the
+  changed-file/symbol-id set, which ones apply, in what order, truncated to
+  what cap — lives in `select_rules_for_context(rules, changed_files, cap)`
+  (`review/kg_context.rs`), unit-tested without a database.
+- **Bounding:** at most 20 rules, ordered by enforcement (`blocking` first)
+  then recency, and the serialized block is trimmed (dropping the
+  lowest-priority trailing entries) to stay under ~2 KB — the same shape as
+  `knowledge_graph`'s own `MAX_SYMBOLS`/`MAX_BLOCK_BYTES` caps.
+- **Wiring:** `RulesStore` is sqlx-backed (async), while `kg_context::inject`
+  (the `knowledge_graph` grounding) is synchronous, so this is a separate
+  `pub async fn inject_active_rules(context: &mut Value)`, called from
+  `review_run`'s own `execute()` (`review/mod.rs`) immediately after
+  `kg_context::inject(&mut context)`, in the same async body that already
+  awaits provider dispatch.
+- **Degrade contract:** no `project_id` → no-op. `RulesStore::from_env()`
+  returning `NotConfigured` (no `ATLAS_DATABASE_URL`) → no-op — this is what
+  keeps a review's context **byte-for-byte unchanged** when the rules store
+  isn't configured (backward compatible with pre-KGRULE-04 reviews). Any
+  other store/lookup failure → also a no-op, never an error, never a delay —
+  rule grounding must never block or fail a review. No applicable rules for
+  the changed scope → no-op (an empty `active_rules` array is never
+  injected, mirroring `knowledge_graph`'s own "no empty block" rule).

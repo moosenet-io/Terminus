@@ -817,6 +817,107 @@ returns `configured:false` (not an error) when the findings store is unconfigure
     }
 }
 
+// ── kg_rules ─────────────────────────────────────────────────────────────
+
+/// Read-only lister over the KGRULE-01 [`super::rules_store::RulesStore`]:
+/// active (status='active', non-expired) rules for a project, ordered by
+/// enforcement priority (blocking > lint-candidate > advisory) then recency
+/// (mirrors `RulesStore::list_active`'s own ORDER BY), optionally filtered by
+/// scope kind and category.
+pub struct KgRules;
+
+/// Maximum `limit` accepted by `kg_rules` (default 50, clamped to
+/// `[1, KG_RULES_MAX]`) — mirrors `kg_findings`'s `KG_FINDINGS_MAX` shape.
+const KG_RULES_MAX: i64 = 200;
+
+fn clamp_rules_limit(limit: i64) -> i64 {
+    limit.clamp(1, KG_RULES_MAX)
+}
+
+/// Map a stored [`super::rules_store::RuleRow`] to its result JSON. Pure — no
+/// I/O — so the field mapping is unit-testable without a live store.
+fn rule_row_json(row: &super::rules_store::RuleRow) -> Value {
+    json!({
+        "id": row.id.to_string(),
+        "scope_kind": row.scope_kind,
+        "scope_ref": row.scope_ref,
+        "category": row.category,
+        "guidance": row.guidance,
+        "enforcement": row.enforcement,
+        "cortex_risk": row.cortex_risk,
+    })
+}
+
+#[async_trait]
+impl RustTool for KgRules {
+    fn name(&self) -> &str {
+        "kg_rules"
+    }
+    fn description(&self) -> &str {
+        "Lists ACTIVE Atlas knowledge-graph rules (durable, earned coding guidance crystallized \
+from recurring review findings and promoted via an adversarial review panel) for a project, \
+ordered by enforcement (blocking first) then recency. Optionally filter by `scope` \
+(node/path/community/global) and `category`. Ground here before scoping work. Degrades cleanly \
+— returns `configured:false` (not an error) when the rules store is unconfigured."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "Plane project id, e.g. TERM"},
+                "scope": {"type": "string", "description": "optional scope filter: node/path/community/global"},
+                "category": {"type": "string", "description": "optional category filter"},
+                "limit": {"type": "integer", "description": "max results, clamped to [1,200] (default 50)"}
+            },
+            "required": ["project_id"]
+        })
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.execute_structured(args).await?.text)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let project_id = req_str(&args, "project_id")?;
+        let scope = args.get("scope").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let category = args.get("category").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let limit = clamp_rules_limit(args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50));
+
+        let store = match super::rules_store::RulesStore::from_env().await {
+            Ok(store) => store,
+            Err(ToolError::NotConfigured(_)) => {
+                return structured(json!({
+                    "configured": false, "found": false, "project_id": project_id, "results": [],
+                }));
+            }
+            Err(e) => {
+                return structured(json!({
+                    "configured": false, "found": false, "project_id": project_id, "results": [],
+                    "error": e.to_string(),
+                }));
+            }
+        };
+
+        // A list failure means the store isn't usable for this call — degrade
+        // (configured:false + error), never a hard tool error, matching the
+        // sibling kg_findings/kg_semantic_search store-failure handling.
+        let rows = match store.list_active(&project_id, scope.as_deref(), None, category.as_deref()).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                return structured(json!({
+                    "configured": false, "found": false, "project_id": project_id, "results": [],
+                    "error": e.to_string(),
+                }));
+            }
+        };
+
+        let results: Vec<Value> = rows.iter().take(limit as usize).map(rule_row_json).collect();
+
+        structured(json!({
+            "configured": true, "found": !results.is_empty(), "project_id": project_id,
+            "count": results.len(), "results": results,
+        }))
+    }
+}
+
 /// Register the `kg_*` tools on the core registry.
 pub fn register(registry: &mut ToolRegistry) {
     let _ = registry.register(Box::new(KgSearch));
@@ -829,6 +930,7 @@ pub fn register(registry: &mut ToolRegistry) {
     let _ = registry.register(Box::new(KgFileSymbols));
     let _ = registry.register(Box::new(KgSemanticSearch));
     let _ = registry.register(Box::new(KgFindings));
+    let _ = registry.register(Box::new(KgRules));
 }
 
 #[cfg(test)]
@@ -1217,6 +1319,78 @@ pub struct Widget;
         let results: Vec<Value> = rows.iter().map(finding_row_json).collect();
         assert!(results.is_empty());
         // Mirrors the tool's own found:false-on-empty contract.
+        assert_eq!(!results.is_empty(), false);
+    }
+
+    // ── kg_rules ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn rules_unconfigured_store_degrades_not_errors() {
+        // Mirrors kg_findings's own test shape: never mutate global env to
+        // force NotConfigured if a real DSN is already present in this
+        // process.
+        if std::env::var("ATLAS_DATABASE_URL").is_ok() {
+            return;
+        }
+        let out = KgRules
+            .execute_structured(json!({"project_id": "RULE"}))
+            .await
+            .unwrap();
+        let v = val(out);
+        assert_eq!(v["configured"], false);
+        assert_eq!(v["found"], false);
+        assert_eq!(v["results"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn clamp_rules_limit_clamps_zero_and_over_cap() {
+        assert_eq!(clamp_rules_limit(0), 1);
+        assert_eq!(clamp_rules_limit(300), 200);
+        assert_eq!(clamp_rules_limit(50), 50);
+        assert_eq!(clamp_rules_limit(-5), 1);
+        assert_eq!(clamp_rules_limit(200), 200);
+        assert_eq!(clamp_rules_limit(1), 1);
+    }
+
+    fn sample_rule_row() -> super::super::rules_store::RuleRow {
+        let now = chrono::Utc::now();
+        super::super::rules_store::RuleRow {
+            id: uuid::Uuid::new_v4(),
+            project_id: "RULE".to_string(),
+            scope_kind: "path".to_string(),
+            scope_ref: "src/lib.rs".to_string(),
+            category: "lint".to_string(),
+            guidance: "always propagate errors, never unwrap".to_string(),
+            enforcement: "advisory".to_string(),
+            status: "active".to_string(),
+            provenance: json!({}),
+            recurrence_at_creation: Some(3),
+            cortex_risk: Some(0.42),
+            created_at: now,
+            valid_from: now,
+            valid_to: None,
+        }
+    }
+
+    #[test]
+    fn rule_row_json_preserves_fields() {
+        let row = sample_rule_row();
+        let v = rule_row_json(&row);
+        assert_eq!(v["id"], row.id.to_string());
+        assert_eq!(v["scope_kind"], "path");
+        assert_eq!(v["scope_ref"], "src/lib.rs");
+        assert_eq!(v["category"], "lint");
+        assert_eq!(v["guidance"], "always propagate errors, never unwrap");
+        assert_eq!(v["enforcement"], "advisory");
+        assert_eq!(v["cortex_risk"], 0.42_f32);
+    }
+
+    #[test]
+    fn rule_row_json_empty_rows_maps_to_empty_results() {
+        let rows: Vec<super::super::rules_store::RuleRow> = Vec::new();
+        let results: Vec<Value> = rows.iter().map(rule_row_json).collect();
+        assert!(results.is_empty());
         assert_eq!(!results.is_empty(), false);
     }
 }
