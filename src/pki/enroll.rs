@@ -79,7 +79,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{Duration as ChronoDuration, Utc};
-use jsonwebtoken::{encode, EncodingKey, Header};
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose, SanType};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -179,6 +179,14 @@ pub enum EnrollError {
     /// `jsonwebtoken` failed to sign the paired JWT.
     #[error("failed to mint enrollment JWT: {0}")]
     JwtSigning(String),
+    /// `jsonwebtoken` rejected a presented token on verification — bad
+    /// signature, expired, malformed, or `TERMINUS_JWT_SIGNING_KEY` is
+    /// unset. Deliberately one variant covering all of these (CONST-03's
+    /// `crate::constellation::auth` only needs "valid or not", never
+    /// distinguishes the sub-reason to a caller) — never logged with the
+    /// token itself, only this generic message.
+    #[error("JWT verification failed: {0}")]
+    JwtVerification(String),
 }
 
 /// Identity names are used verbatim in the cert's CN/SAN and the JWT `sub`
@@ -207,7 +215,7 @@ pub(crate) fn is_valid_identity(identity: &str) -> bool {
 /// is folded into the same accumulator rather than short-circuiting, so the
 /// function's timing does not depend on *where* (or whether) the inputs
 /// first diverge.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let len_diff = (a.len() != b.len()) as u8;
     let mut diff: u8 = len_diff;
     for i in 0..a.len().max(b.len()) {
@@ -393,10 +401,26 @@ fn to_rcgen_time(dt: chrono::DateTime<Utc>) -> time::OffsetDateTime {
         .expect("chrono timestamps are always in range for time::OffsetDateTime")
 }
 
-/// Mint a short-lived JWT carrying `identity` as the `sub` claim. Signed with
-/// `TERMINUS_JWT_SIGNING_KEY` (HS256) — the one JWT signing key this crate
-/// now uses (see the `jsonwebtoken` dependency comment in `Cargo.toml`).
+/// Mint a short-lived JWT carrying `identity` as the `sub` claim, TTL from
+/// [`crate::config::enrollment_jwt_ttl_seconds`]. Thin wrapper over
+/// [`mint_jwt_with_ttl`] — the enrollment TTL policy lives here, not in the
+/// shared signing primitive.
 fn mint_jwt(identity: &str) -> Result<(String, i64), EnrollError> {
+    mint_jwt_with_ttl(identity, crate::config::enrollment_jwt_ttl_seconds())
+}
+
+/// Mint a short-lived JWT carrying `sub` as the subject claim, with an
+/// explicit TTL (seconds). Signed with `TERMINUS_JWT_SIGNING_KEY` (HS256) —
+/// the one JWT signing key this crate uses (see the `jsonwebtoken`
+/// dependency comment in `Cargo.toml`).
+///
+/// Reused outside enrollment by CONST-03 (`crate::constellation::auth`) to
+/// mint the constellation control plane's signed session token, with `sub`
+/// = the operator username and a session-specific TTL
+/// (`crate::config::constellation_session_ttl_seconds`) rather than the
+/// enrollment JWT TTL — same signing key, same claim shape
+/// ([`EnrollmentClaims`]), different TTL policy owned by the caller.
+pub fn mint_jwt_with_ttl(sub: &str, ttl_seconds: i64) -> Result<(String, i64), EnrollError> {
     let signing_key = env_nonempty("TERMINUS_JWT_SIGNING_KEY")
         .ok_or_else(|| EnrollError::JwtSigning("TERMINUS_JWT_SIGNING_KEY is unset".to_string()))?;
 
@@ -404,11 +428,10 @@ fn mint_jwt(identity: &str) -> Result<(String, i64), EnrollError> {
         .duration_since(UNIX_EPOCH)
         .map_err(|e| EnrollError::JwtSigning(format!("system clock: {e}")))?
         .as_secs() as i64;
-    let ttl = crate::config::enrollment_jwt_ttl_seconds();
-    let exp = now + ttl;
+    let exp = now + ttl_seconds;
 
     let claims = EnrollmentClaims {
-        sub: identity.to_string(),
+        sub: sub.to_string(),
         exp,
         iat: now,
     };
@@ -421,6 +444,32 @@ fn mint_jwt(identity: &str) -> Result<(String, i64), EnrollError> {
     .map_err(|e| EnrollError::JwtSigning(e.to_string()))?;
 
     Ok((jwt, exp))
+}
+
+/// Verify a JWT previously minted by [`mint_jwt`]/[`mint_jwt_with_ttl`]:
+/// signature (HS256, `TERMINUS_JWT_SIGNING_KEY`) and expiry (`exp`, checked
+/// by `jsonwebtoken`'s default [`Validation`] — no `leeway` override, so
+/// expiry is exact). Returns the decoded [`EnrollmentClaims`] on success —
+/// any failure (bad signature, expired, malformed, unset signing key)
+/// collapses to a single [`EnrollError::JwtVerification`], deliberately not
+/// distinguishing the sub-reason to callers (CONST-03 only needs
+/// valid-or-not).
+///
+/// Reused by CONST-03 (`crate::constellation::auth::session_from_cookie`) to
+/// verify the constellation control plane's session cookie — the SAME
+/// verification primitive TCLI-02's enrollment JWT uses, not a second
+/// hand-rolled HS256 check.
+pub fn verify_jwt(token: &str) -> Result<EnrollmentClaims, EnrollError> {
+    let signing_key = env_nonempty("TERMINUS_JWT_SIGNING_KEY")
+        .ok_or_else(|| EnrollError::JwtVerification("TERMINUS_JWT_SIGNING_KEY is unset".to_string()))?;
+
+    decode::<EnrollmentClaims>(
+        token,
+        &DecodingKey::from_secret(signing_key.as_bytes()),
+        &Validation::new(Algorithm::HS256),
+    )
+    .map(|data| data.claims)
+    .map_err(|e| EnrollError::JwtVerification(e.to_string()))
 }
 
 // ── HTTP route (additive) ──────────────────────────────────────────────────
@@ -509,7 +558,6 @@ async fn handle_enroll_http(
 mod tests {
     use super::*;
     use crate::pki::CertificateAuthority;
-    use jsonwebtoken::{decode, DecodingKey, Validation};
     use serial_test::serial;
 
     fn set_secrets(shared_secret: &str, jwt_key: &str) {

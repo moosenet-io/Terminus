@@ -34,13 +34,19 @@ contract:
 
 ## Architecture notes
 
-- **Auth is a seam, not a gate (yet).** `crate::constellation::auth` ships only the minimum shape
-  CONST-04's UI needs to build/run against. It accepts any non-empty username/password (no hardcoded
-  credential — there is nothing real yet to check against) and sets an **unsigned** cookie. It does
-  **not** enforce access control on `/api/*` today. CONST-03 replaces the cookie with a verified
-  JWT/session (reusing this crate's existing `crate::pki` enrollment machinery, see `docs/architecture/auth.md`)
-  and is expected to make mutating requests actually fail closed without an authenticated principal.
-  Every `// CONST-03:` comment in `src/constellation/auth.rs` marks where that verification plugs in.
+- **Auth is real (CONST-03).** `crate::constellation::auth` verifies the submitted login password
+  against `CONSTELLATION_OPERATOR_SECRET` (constant-time compare, reusing
+  `crate::pki::enroll::constant_time_eq`) and, on success, mints a signed session JWT via
+  `crate::pki::enroll::mint_jwt_with_ttl` — the SAME `TERMINUS_JWT_SIGNING_KEY` HS256 signing
+  primitive TCLI-02's enrollment JWT uses (see `docs/architecture/auth.md`), TTL from
+  `CONSTELLATION_SESSION_TTL_SECONDS`. The cookie carries that JWT, not a plaintext value;
+  `session_from_cookie` verifies its signature + expiry (`crate::pki::enroll::verify_jwt`) on every
+  request. An unset `CONSTELLATION_OPERATOR_SECRET` fails every login attempt closed — never a
+  default-allow. `crate::constellation::auth::require_session` is `axum` middleware layered (in
+  `crate::constellation::mod`) over `/api/terminus/config` and the three proxied
+  `/api/{harmony,chord,lumina}/*path` routes only: an unauthenticated request to any of those is
+  rejected `401` before the handler runs (no backend dispatch). `/api/auth/{me,login,logout}` and
+  `/api/health` stay reachable pre-auth (see `mod.rs`'s `public_router`/`protected_router` split).
 - **Proxy = the single door to Harmony/Chord/Lumina.** `crate::constellation::proxy` is the only place
   in this crate that forwards a browser request to one of those three backends' own HTTP APIs — no
   other module should grow a second ad-hoc client for one of them (mirrors S9's single-access-path
@@ -65,14 +71,22 @@ contract:
 
 ## Configuration
 
-New env vars (see `.env.example`'s "CONST-02" section for the authoritative list with defaults):
-`CONSTELLATION_HARMONY_URL`, `CONSTELLATION_CHORD_URL`, `CONSTELLATION_LUMINA_URL`,
+New env vars (see `.env.example`'s "CONST-02"/"CONST-03" sections for the authoritative list with
+defaults): `CONSTELLATION_HARMONY_URL`, `CONSTELLATION_CHORD_URL`, `CONSTELLATION_LUMINA_URL`,
 `CONSTELLATION_WEB_DIST_DIR`, `CONSTELLATION_BACKEND_TIMEOUT_MS`, `CONSTELLATION_AUDIT_LOG_PATH`. None
 of these are secret-shaped (they're backend base URLs and filesystem paths, not credentials), so —
 matching this crate's existing convention (see `crate::config`'s module doc: terminus-rs has no
 separate `SecretManager`/`vault::manager()` API; a plain env read of a runtime-materialized value IS
 the vault read here) — they're plain `crate::config` helpers, not routed through a separate secret
 store.
+
+**CONST-03 adds:** `CONSTELLATION_SESSION_TTL_SECONDS` (non-secret, `crate::config`, default 3600)
+and `CONSTELLATION_COOKIE_SECURE` (non-secret boolean, `crate::config`, default `false`) — plain
+`crate::config` helpers like the rest of this section. `CONSTELLATION_OPERATOR_SECRET` (the login
+credential) and `TERMINUS_JWT_SIGNING_KEY` (the session-signing key, shared with TCLI-02 enrollment)
+are BOTH secret-shaped and are deliberately read directly via `std::env::var`/`env_nonempty` inside
+`crate::constellation::auth`/`crate::pki::enroll` rather than a `crate::config` helper — same "plain
+env read of a runtime-materialized value IS the vault read" convention, applied at the point of use.
 
 ## Testing
 
