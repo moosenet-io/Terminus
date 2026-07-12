@@ -1,12 +1,14 @@
 [← docs index](../../README.md)
 
-# Cortex — Atlas-backed code-intelligence gate (CXEG-01 re-scaffold)
+# Cortex — Atlas-backed code-intelligence gate (CXEG-01/02)
 
-Cortex is a 10-tool-name module (`src/cortex/mod.rs`, `src/cortex/deprecated.rs`,
-`src/cortex/audit.rs`), but as of **CXEG-01** only 3 of those names are "real"
-tools — the rest are structured deprecation aliases. This page describes the
-current, post-retirement shape; see the "History" section at the bottom for
-what changed and why.
+Cortex is a 10-tool-name module (`src/cortex/mod.rs`, `src/cortex/scope.rs`,
+`src/cortex/deprecated.rs`, `src/cortex/audit.rs`), but as of **CXEG-01** only
+3 of those names are "real" tools — the rest are structured deprecation
+aliases. As of **CXEG-02**, `cortex_scope` is the first of those 3 to be a
+fully live, Atlas-backed implementation rather than a pending-pointer stub.
+This page describes the current shape; see the "History" section at the
+bottom for what changed and why.
 
 ## The single most important fact about this module: **the SSH-relay era is retired**
 
@@ -23,7 +25,7 @@ no remote script, no "relay whatever the other end says" response shape.
 
 | Tool | Status | What it does |
 | --- | --- | --- |
-| `cortex_scope` | **pending rebuild (CXEG-02)** | Validates `project_id`/`changed_files`, returns a structured `{"status":"pending","item":"CXEG-02",...}` pointer. No blast-radius analysis happens yet. |
+| `cortex_scope` | **live (CXEG-02)** | Resolves `project_id` + `changed_files`/`diff` against the project's Atlas graph and returns the blast radius: touched symbols, their 1-hop callers/callees, affected communities, `blast_count`, `token_reduction_pct`. Degrades to `configured:false` (no error) when the project has no stored graph. |
 | `cortex_review` | **pending rebuild (CXEG-04)** | Validates `project_id`/`changed_files`, returns `{"status":"pending","item":"CXEG-04",...}`. No risk scoring happens yet. |
 | `cortex_audit` | **pending rebuild (CXEG-11)** | Runs its existing SSRF-hardened `url` validation (unchanged, see below), then returns `{"status":"pending","item":"CXEG-11",...}`. No clone/graph-build happens yet. |
 | `cortex_stats` | **deprecated alias** | Returns `{"deprecated":true,"use":"kg_stats",...}`. Call `kg_stats` instead. |
@@ -55,30 +57,95 @@ use, and matches the current Plane-project-prefix convention (Terminus, Lumina,
 Harmony, Chord, Civic-Rail). Any other value is rejected with
 `ToolError::InvalidArgument` before the stub response is built.
 
-## `cortex_scope` (pending — CXEG-02)
+## `cortex_scope` — live, Atlas-backed blast radius (CXEG-02)
 
-**Input schema**: `project_id` (enum, required, one of `PROJECT_IDS`),
-`changed_files` (string, required, comma-separated file paths, ≤2000 chars).
+The pipeline's pre-dispatch scoping call: "if I touch these files, what else
+might I break, and how much of the project can I safely ignore?"
 
-**Behavior**: validates both fields, then returns:
+**Input schema**: `project_id` (enum, required, one of `PROJECT_IDS`), plus
+EITHER `changed_files` (a comma-separated string OR a JSON array of file
+paths — the comma-separated form is kept for backward compatibility with the
+CXEG-01 stub's original schema) OR `diff` (a unified diff; changed files are
+parsed from its `+++ b/<path>` headers). At least one of `changed_files`/
+`diff` must yield a non-empty file list.
+
+**Reuse**: both the CSV/array/diff parsing and the graph queries are shared
+with `review_run`'s KGREV-01 grounding, not reimplemented:
+- `crate::review::kg_context::derive_changed_files` does the actual `diff`/
+  array parsing (`src/cortex/scope.rs`'s `changed_files_from_args` only
+  adapts `cortex_scope`'s own CSV-string/array argument shapes into the
+  `{"changed_files"|"diff": ...}` value `derive_changed_files` expects).
+- The graph load + touched-node + 1-hop-neighbor walk use the same
+  `scribe::graph::store::GraphStore` / `KnowledgeGraph` API
+  `review::kg_context::build_kg_block` and the `kg_neighbors`/`kg_subgraph`
+  tools (`src/scribe/graph/tools.rs`) use — there is exactly one in-process
+  graph-query backend in this crate.
+
+**Behavior**:
+1. Validates `project_id` (`InvalidArgument` if not one of `PROJECT_IDS`).
+2. Derives `changed_files` from the input (`InvalidArgument` if both
+   `changed_files` and `diff` are absent/empty).
+3. Loads the project's Atlas graph. If none is stored yet (`scribe_kg_build`
+   hasn't run for this `project_id`, or the store itself failed to load),
+   returns a `"configured": false` response with each entry of
+   `changed_files` echoed back into `blast_radius` as an unresolved literal
+   entry — **never an error**, so a dispatch caller always gets a usable
+   answer even against an unindexed project.
+4. Otherwise, resolves each changed file to the current graph nodes it
+   defines (`role: "touched"`), any changed file with no matching node is
+   ALSO echoed back as an unresolved literal entry (e.g. a brand-new file),
+   then walks the 1-hop callers/callees of every touched node
+   (`role: "caller"`/`"callee"`), collecting each resolved node's community
+   (`cluster`) into `affected_communities`.
+5. Computes `token_reduction_pct` as `1 - (blast-radius node-card bytes /
+   total-project node-card bytes) * 100`, clamped to `[0, 100]` — the same
+   `node_card` text `scribe_kg_build`'s embedding pipeline embeds
+   (`crate::scribe::graph::vec_embed::node_card`), used here as a proxy for
+   "how much smaller is the context a model needs to read than the whole
+   project."
+6. If the walk would enumerate more than `CORTEX_MAX_BLAST_NODES` nodes (see
+   "Configuration" below), it stops and sets `"truncated": true` — plus a
+   `tracing::warn!` noting the drop — rather than silently capping.
+
+**Response shape** (live graph):
 
 ```json
 {
-  "status": "pending",
-  "item": "CXEG-02",
-  "tool": "cortex_scope",
+  "configured": true,
   "project_id": "TERM",
-  "message": "cortex_scope's SSH-relay-era backend has been retired; an Atlas-backed blast-radius implementation lands in CXEG-02. In the meantime, query kg_neighbors / kg_subgraph directly against the Atlas KG.",
-  "tier_b_enabled": false
+  "changed_files": ["src/cortex/mod.rs"],
+  "blast_radius": [
+    { "id": "crate::cortex::validate_project_id", "path": "src/cortex/mod.rs", "kind": "function", "resolved": true, "role": "touched" },
+    { "id": "crate::cortex::CortexScope::execute", "path": "src/cortex/mod.rs", "kind": "function", "resolved": true, "role": "caller" }
+  ],
+  "affected_communities": [1],
+  "blast_count": 2,
+  "token_reduction_pct": 92.5
 }
 ```
 
-**Error/edge cases**: `InvalidArgument` for an unknown `project_id` or an
-oversized `changed_files`. No `NotConfigured`/`Execution` errors are possible
-— there is no network path to fail.
+**Response shape** (no stored graph — degrade):
 
-**In the meantime**: call `kg_neighbors` / `kg_subgraph` directly against the
-Atlas KG for a manual blast-radius query.
+```json
+{
+  "configured": false,
+  "project_id": "TERM",
+  "changed_files": ["src/cortex/mod.rs"],
+  "blast_radius": [
+    { "id": "src/cortex/mod.rs", "path": "src/cortex/mod.rs", "kind": "file", "resolved": false, "role": "touched" }
+  ],
+  "affected_communities": [],
+  "blast_count": 1,
+  "token_reduction_pct": 0.0
+}
+```
+
+**Error/edge cases**: `InvalidArgument` for an unknown `project_id`, an
+oversized `changed_files` CSV string (`≤2000` chars), or neither
+`changed_files` nor `diff` yielding any file. A missing/unloadable Atlas
+graph is NOT an error (see step 3 above) — that is the one deliberate
+exception to "validate first, then act" in this tool, since blast-radius
+unavailability is a data-availability fact, not a caller mistake.
 
 ## `cortex_review` (pending — CXEG-04)
 
@@ -156,11 +223,12 @@ gets even a pending-pointer response, only a rejection.
 | Env var | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `CORTEX_RISK_SCORE_THRESHOLD` | f64 | `7.0` | Echoed in `cortex_review`'s pending-pointer response; will gate the CXEG-04 rebuild's escalation logic. |
-| `CORTEX_ENABLE_TIER_B` | bool | `false` | Feature flag for a not-yet-built Tier B analysis pass; echoed in `cortex_scope`'s response. |
+| `CORTEX_ENABLE_TIER_B` | bool | `false` | Feature flag for a not-yet-built Tier B analysis pass. No longer consumed by `cortex_scope` as of CXEG-02 (the pending stub used to echo it). |
 | `CORTEX_ENABLE_TIER_C` | bool | `false` | Feature flag for a not-yet-built Tier C analysis pass. |
 | `CORTEX_ELEGANCE_ADVISORY_ONLY` | bool | `true` | Whether elegance/style findings are advisory-only; echoed in `cortex_review`'s response. |
 | `CORTEX_DUP_COSINE_THRESHOLD` | f64 | `0.85` | Cosine-similarity threshold for a not-yet-built dup-detection pass; echoed in `cortex_audit`'s response. |
-| `ATLAS_DATABASE_URL` | secret-shaped | none | Read exclusively through `crate::config::atlas_database_url()` — this crate has no separate `SecretManager`/`vault::manager()` API of its own; the runtime secret store is materialized into the process environment at deploy time (same convention as `crate::pki` and `scribe::graph::vec_embed`). `None` means the Atlas KG store is not configured. |
+| `CORTEX_MAX_BLAST_NODES` | usize | `200` | `cortex_scope`'s (CXEG-02) cap on the number of nodes enumerated into `blast_radius` before it sets `truncated:true` and stops walking. A zero/unparseable value falls back to the default rather than dropping every node. |
+| `ATLAS_DATABASE_URL` | secret-shaped | none | Read exclusively through `crate::config::atlas_database_url()` — this crate has no separate `SecretManager`/`vault::manager()` API of its own; the runtime secret store is materialized into the process environment at deploy time (same convention as `crate::pki` and `scribe::graph::vec_embed`). `None` means the Atlas KG store is not configured (`cortex_scope` still degrades cleanly in this case, via `GraphStore`/`ScribeConfig`'s own `SCRIBE_KG_STORE_DIR`, which is independent of the Postgres DSN). |
 
 Boolean flags accept `"1"`/`"true"`/`"yes"` (case-insensitive) as truthy;
 anything else (including unset) falls back to the default.
@@ -198,7 +266,8 @@ arguments — the pointer is returned unconditionally.
 ## Registration
 
 `register()` (`src/cortex/mod.rs`) builds one shared `Arc<CortexConfig>`,
-registers the 3 real (pending) tools against it, then delegates to
+registers the 3 real tools against it (`cortex_scope` live as of CXEG-02;
+`cortex_review`/`cortex_audit` still pending), then delegates to
 `crate::cortex::deprecated::register()` for the 7 aliases. Cortex is wired
 into **both** top-level registries in `src/registry.rs`: `register_all` (the
 core registry, served by `terminus-primary`/Chord) and `register_personal`
@@ -219,10 +288,25 @@ real `risk_score`; the bridge is forward-compatible as-is.
 
 `src/cortex/mod.rs`'s test module covers, without any network access:
 `project_id` validation (accepts `TERM`/`LUM`/`HARM`/`CHRD`/`RAIL`, rejects
-unknowns and the old legacy repo names), free-text length capping, each of
-the 3 real tools' `InvalidArgument` rejection paths and their pending-pointer
-success shape, `cortex_audit`'s unchanged SSRF-guard rejections, and full
-registration (`register()` yields exactly 10 tool names, all `cortex_*`).
+unknowns and the old legacy repo names), free-text length capping,
+`cortex_review`/`cortex_audit`'s `InvalidArgument` rejection paths and
+pending-pointer success shape, `cortex_scope`'s argument-validation/wiring
+(`project_id` rejection, oversized CSV rejection, "neither changed_files nor
+diff" rejection, array-form and diff-only-form acceptance, and a
+`configured:false` degrade smoke test against an empty store dir),
+`cortex_audit`'s unchanged SSRF-guard rejections, and full registration
+(`register()` yields exactly 10 tool names, all `cortex_*`).
+`src/cortex/scope.rs`'s test module covers the full blast-radius derivation
+against a small fixture graph (2 files, a `calls` edge and a `references`
+edge, 2 distinct clusters): `changed_files_from_args`'s array/CSV/diff
+parsing agree on the same file set; a touched node's documented caller AND
+callee both appear in `blast_radius`; a changed file with no matching graph
+node is echoed back as an unresolved literal entry alongside resolved
+symbols; `compute_scope` against an unconfigured/empty store degrades to
+`configured:false` with every `changed_files` entry unresolved; an
+artificially low `max_blast_nodes` sets `truncated:true` and caps the
+returned `blast_radius`; and `token_reduction_pct` is `0.0` for an empty
+graph and high when only a small fraction of a larger graph is touched.
 `src/cortex/deprecated.rs`'s test module covers: all 7 aliases register,
 each returns a `{"deprecated":true,"use":...}` pointer regardless of input
 shape (including empty args), and no alias's `execute` does any I/O.
@@ -245,7 +329,12 @@ kept `cortex_scope`/`cortex_review`/`cortex_audit`'s names/parameter surfaces
 as principled stubs pending their Atlas-backed rebuilds (CXEG-02/CXEG-04/
 CXEG-11), and added 7 zero-I/O deprecation aliases pointing at the in-process
 Atlas KG's `kg_*` tool family, which is the actual successor to "a code graph
-Cortex can query."
+Cortex can query." **CXEG-02** then replaced `cortex_scope`'s pending-pointer
+stub with the real Atlas-backed blast-radius implementation described above
+(`src/cortex/scope.rs`), reusing `review::kg_context::derive_changed_files`
+and the same `GraphStore`/`KnowledgeGraph` query API `kg_neighbors`/
+`build_kg_block` already use rather than standing up a second graph-walk.
+`cortex_review`/`cortex_audit` remain pending CXEG-04/CXEG-11.
 
 ---
 

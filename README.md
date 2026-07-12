@@ -732,8 +732,17 @@ re-scaffolded in-process, keyed by `project_id` (`TERM`/`LUM`/`HARM`/`CHRD`/
 `RAIL`), and built on the live Atlas knowledge graph rather than a subprocess.
 Its risk/elegance surface is rebuilt over the following S115 items:
 
-- `cortex_scope` — pre-change blast radius + token-reduction budget for a
-  planned change (stub pending its Atlas-backed rebuild in **CXEG-02**).
+- `cortex_scope` — pre-change blast radius for a planned change, live as of
+  **CXEG-02**: given `project_id` + `changed_files` (comma-separated string
+  or array) or a unified `diff`, it resolves the touched symbols against the
+  project's Atlas graph, walks their 1-hop callers/callees, and returns
+  `blast_radius`, `affected_communities`, `blast_count`, and a
+  `token_reduction_pct` estimate (how much smaller the blast radius is than
+  the whole project). Degrades to `configured:false` (the literal
+  `changed_files` echoed back as unresolved entries) instead of erroring when
+  the project has no stored Atlas graph yet — dispatch never breaks on a
+  missing graph. Oversized results are capped (`CORTEX_MAX_BLAST_NODES`,
+  default 200) with `truncated:true` and a logged warning, never a silent drop.
 - `cortex_review` — post-change `risk_score` (0–10) + named `risk_signals`
   from Atlas structural metrics and KGFIND recurrence (stub pending **CXEG-04**).
 - `cortex_audit` — audit an external public repo URL (stub pending **CXEG-11**);

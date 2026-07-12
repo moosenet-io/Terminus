@@ -21,12 +21,16 @@
 //!   pointing at its `kg_*` (or `scribe_kg_build`) successor — no network, no
 //!   SSH, just a pointer.
 //! - `cortex_scope` and `cortex_review` keep their tool names/parameter
-//!   surface (now keyed by `project_id` instead of the old `repo` enum) but
-//!   their `execute` bodies are principled stubs — the real Atlas-backed
-//!   blast-radius (`cortex_scope`) and risk-scoring (`cortex_review`) logic
-//!   lands in **CXEG-02** and **CXEG-04** respectively. Until then they
-//!   return a structured `{"status":"pending","item":"CXEG-0N"}` pointer
-//!   rather than silently doing nothing or erroring opaquely.
+//!   surface (now keyed by `project_id` instead of the old `repo` enum).
+//!   **CXEG-02** replaces `cortex_scope`'s stub with a real Atlas-backed
+//!   blast-radius implementation (`src/cortex/scope.rs`) — it now walks the
+//!   project's stored Atlas graph via the same `GraphStore`/`KnowledgeGraph`
+//!   API `kg_neighbors`/`review::kg_context::build_kg_block` use, rather than
+//!   returning a pointer. `cortex_review`'s `execute` body remains a
+//!   principled stub — the real Atlas-backed risk-scoring logic lands in
+//!   **CXEG-04**. Until then it returns a structured
+//!   `{"status":"pending","item":"CXEG-04"}` pointer rather than silently
+//!   doing nothing or erroring opaquely.
 //! - `cortex_audit` keeps its `url` parameter and its existing
 //!   `validate_repo_url` front-gate (`audit.rs` — untouched, SSRF-hardened
 //!   URL validation with no dependency on the deleted SSH helpers), but its
@@ -36,11 +40,12 @@
 //!   reference.
 //!
 //! Net result: this module registers 10 tool NAMES total (unchanged from
-//! before, so no MCP-surface churn for callers listing tools), but only 3 are
-//! "real" (Atlas-rebuild-pending) tools — `cortex_scope`/`cortex_review`/
-//! `cortex_audit` — and the other 7 are pure deprecation aliases with no
-//! backend at all. `test_cortex_tools_registered` below asserts this new
-//! reality, not the old 10-live-relay-tools shape.
+//! before, so no MCP-surface churn for callers listing tools). Of those,
+//! `cortex_scope` is a real, live Atlas-backed tool as of CXEG-02;
+//! `cortex_review`/`cortex_audit` remain Atlas-rebuild-pending stubs; and the
+//! other 7 are pure deprecation aliases with no backend at all.
+//! `test_cortex_tools_registered` below asserts this shape (10 names
+//! present), not the old 10-live-relay-tools implementation.
 //!
 //! ## `project_id`, not `repo`
 //!
@@ -76,6 +81,7 @@ use crate::tool::RustTool;
 
 pub mod audit;
 pub mod deprecated;
+pub mod scope;
 
 use audit::validate_repo_url;
 
@@ -121,9 +127,15 @@ pub struct CortexConfig {
     /// The Atlas KG's Postgres DSN, read exclusively through
     /// `crate::config::atlas_database_url()` (see module doc's "Secrets /
     /// config" section) — never a raw `std::env::var` in this module.
-    /// `None` means the Atlas KG store is not configured; the CXEG-02/04/11
+    /// `None` means the Atlas KG store is not configured; the CXEG-04/11
     /// rebuilds will raise `NotConfigured` rather than guess a DSN.
+    /// `cortex_scope` (CXEG-02) does NOT raise on a missing/unloadable graph
+    /// -- see `scope::compute_scope`'s degrade contract.
     pub atlas_database_url: Option<String>,
+    /// `cortex_scope`'s (CXEG-02) cap on the number of nodes enumerated into
+    /// `blast_radius` before it sets `"truncated": true` and stops walking.
+    /// From `CORTEX_MAX_BLAST_NODES`, default [`scope::DEFAULT_MAX_BLAST_NODES`].
+    pub max_blast_nodes: usize,
 }
 
 impl CortexConfig {
@@ -135,6 +147,7 @@ impl CortexConfig {
             elegance_advisory_only: env_flag("CORTEX_ELEGANCE_ADVISORY_ONLY", true),
             dup_cosine: env_f64("CORTEX_DUP_COSINE_THRESHOLD", 0.85),
             atlas_database_url: crate::config::atlas_database_url(),
+            max_blast_nodes: env_usize("CORTEX_MAX_BLAST_NODES", scope::DEFAULT_MAX_BLAST_NODES),
         }
     }
 }
@@ -157,6 +170,18 @@ fn env_flag(key: &str, default: bool) -> bool {
         Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"),
         Err(_) => default,
     }
+}
+
+/// Read a non-secret unsigned-integer tuning flag; falls back to `default`
+/// when unset, unparseable, or `0` (a zero bound would silently drop every
+/// blast-radius node, which is never the intent of an unset/misconfigured
+/// value).
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
 }
 
 // ---------------------------------------------------------------------------
@@ -193,7 +218,7 @@ fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, ToolError> {
 }
 
 // ---------------------------------------------------------------------------
-// Tool: cortex_scope (stub — real Atlas-backed rebuild is CXEG-02)
+// Tool: cortex_scope (CXEG-02: real Atlas-backed blast-radius)
 // ---------------------------------------------------------------------------
 
 pub struct CortexScope {
@@ -207,13 +232,18 @@ impl RustTool for CortexScope {
     }
 
     fn description(&self) -> &str {
-        "PENDING REBUILD (CXEG-02): blast-radius for a planned code change. \
-         The SSH-relay-era implementation has been retired; this tool \
-         currently returns a structured pending pointer instead of \
-         performing a live analysis. project_id: one of TERM/LUM/HARM/CHRD/ \
-         RAIL. changed_files: comma-separated list of files. In the \
-         meantime, use kg_neighbors / kg_subgraph directly against the \
-         Atlas KG for a manual blast-radius query."
+        "Pre-change blast radius for a planned code change, from the \
+         project's Atlas knowledge graph: the touched symbols plus their \
+         1-hop callers/callees, the affected communities, a blast_count, \
+         and a token_reduction_pct estimate (how much smaller the blast \
+         radius is than the whole project, as a proxy for context budget \
+         saved). project_id: one of TERM/LUM/HARM/CHRD/RAIL. Provide EITHER \
+         changed_files (a comma-separated list, or a JSON array) OR diff (a \
+         unified diff -- changed files are parsed from its '+++ b/<path>' \
+         headers, same parser review_run uses). Degrades cleanly: if the \
+         project has no stored Atlas graph yet (run scribe_kg_build first), \
+         returns configured:false with the literal changed_files echoed \
+         back as unresolved blast_radius entries, never an error."
     }
 
     fn parameters(&self) -> Value {
@@ -221,29 +251,34 @@ impl RustTool for CortexScope {
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "One of TERM/LUM/HARM/CHRD/RAIL", "enum": PROJECT_IDS },
-                "changed_files": { "type": "string", "description": "Comma-separated list of file paths e.g. 'src/cortex/mod.rs,src/cortex/audit.rs'" }
+                "changed_files": {
+                    "description": "Changed file paths: a comma-separated string or a JSON array e.g. 'src/cortex/mod.rs,src/cortex/audit.rs'",
+                    "oneOf": [
+                        { "type": "string" },
+                        { "type": "array", "items": { "type": "string" } }
+                    ]
+                },
+                "diff": { "type": "string", "description": "Unified diff; used to derive changed_files when changed_files is omitted" }
             },
-            "required": ["project_id", "changed_files"]
+            "required": ["project_id"]
         })
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
         let project_id = require_str(&args, "project_id")?;
-        let changed_files = require_str(&args, "changed_files")?;
         validate_project_id(project_id)?;
-        validate_text_len(changed_files, "changed_files")?;
+        if let Some(cf) = args.get("changed_files").and_then(|v| v.as_str()) {
+            validate_text_len(cf, "changed_files")?;
+        }
 
-        let response = json!({
-            "status": "pending",
-            "item": "CXEG-02",
-            "tool": "cortex_scope",
-            "project_id": project_id,
-            "message": "cortex_scope's SSH-relay-era backend has been retired; \
-                an Atlas-backed blast-radius implementation lands in CXEG-02. \
-                In the meantime, query kg_neighbors / kg_subgraph directly \
-                against the Atlas KG.",
-            "tier_b_enabled": self.config.enable_tier_b,
-        });
+        let changed_files = scope::changed_files_from_args(&args);
+        if changed_files.is_empty() {
+            return Err(ToolError::InvalidArgument(
+                "must provide a non-empty 'changed_files' (string or array) or 'diff'".to_string(),
+            ));
+        }
+
+        let response = scope::compute_scope(project_id, &changed_files, self.config.max_blast_nodes);
         serde_json::to_string_pretty(&response)
             .map_err(|e| ToolError::Execution(format!("JSON render error: {e}")))
     }
@@ -373,9 +408,11 @@ impl RustTool for CortexAudit {
 // Registration
 // ---------------------------------------------------------------------------
 
-/// Register all Cortex tools into the ToolRegistry: the 3 Atlas-rebuild-
-/// pending stubs (`cortex_scope`/`cortex_review`/`cortex_audit`) plus the 7
-/// deprecation aliases for the retired pure-relay tools (see [`deprecated`]).
+/// Register all Cortex tools into the ToolRegistry: the 3 "real" tools
+/// (`cortex_scope` — live Atlas-backed blast radius as of CXEG-02;
+/// `cortex_review`/`cortex_audit` — still Atlas-rebuild-pending stubs) plus
+/// the 7 deprecation aliases for the retired pure-relay tools (see
+/// [`deprecated`]).
 pub fn register(registry: &mut ToolRegistry) {
     let config = Arc::new(CortexConfig::from_env());
 
@@ -406,6 +443,7 @@ mod tests {
             elegance_advisory_only: true,
             dup_cosine: 0.85,
             atlas_database_url: None,
+            max_blast_nodes: scope::DEFAULT_MAX_BLAST_NODES,
         })
     }
 
@@ -445,7 +483,13 @@ mod tests {
         assert!(validate_text_len("short", "changed_files").is_ok());
     }
 
-    // --- cortex_scope (stub) ---------------------------------------------------
+    // --- cortex_scope (CXEG-02: real, Atlas-backed) -----------------------
+    //
+    // Full blast-radius derivation behavior (touched-node resolution, 1-hop
+    // neighbors, communities, truncation, token_reduction_pct) is covered by
+    // `scope::tests` against a fixture graph; these tests cover argument
+    // validation and the tool-trait wiring (`CortexScope::execute` ->
+    // `scope::changed_files_from_args` / `scope::compute_scope`).
 
     #[tokio::test]
     async fn test_scope_rejects_unknown_project_id() {
@@ -469,16 +513,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scope_returns_pending_pointer_for_valid_input() {
+    async fn test_scope_rejects_when_no_changed_files_or_diff() {
+        let tool = CortexScope { config: test_config() };
+        let err = tool.execute(json!({"project_id": "TERM"})).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_scope_degrades_to_configured_false_without_a_stored_graph() {
+        let store_dir = std::env::temp_dir().join(format!("atlas-cortexmod-test-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+
         let tool = CortexScope { config: test_config() };
         let out = tool
             .execute(json!({"project_id": "TERM", "changed_files": "src/cortex/mod.rs"}))
             .await
-            .expect("valid input must succeed with a pending pointer, not an error");
+            .expect("no stored graph must degrade, not error");
         let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["status"], "pending");
-        assert_eq!(v["item"], "CXEG-02");
+        assert_eq!(v["configured"], false);
         assert_eq!(v["project_id"], "TERM");
+        assert_eq!(v["blast_radius"][0]["resolved"], false);
+
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
+    }
+
+    #[tokio::test]
+    async fn test_scope_accepts_changed_files_array_form() {
+        let tool = CortexScope { config: test_config() };
+        let out = tool
+            .execute(json!({"project_id": "TERM", "changed_files": ["src/a.rs", "src/b.rs"]}))
+            .await
+            .expect("array changed_files must be accepted");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["changed_files"], json!(["src/a.rs", "src/b.rs"]));
+    }
+
+    #[tokio::test]
+    async fn test_scope_accepts_diff_only_input() {
+        let tool = CortexScope { config: test_config() };
+        let diff = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-x\n+y\n";
+        let out = tool
+            .execute(json!({"project_id": "TERM", "diff": diff}))
+            .await
+            .expect("diff-only input must be accepted");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["changed_files"], json!(["src/a.rs"]));
     }
 
     // --- cortex_review (stub) --------------------------------------------------
@@ -549,9 +629,9 @@ mod tests {
     fn test_cortex_tools_registered() {
         let mut registry = ToolRegistry::new();
         register(&mut registry);
-        // 3 Atlas-rebuild-pending stubs + 7 deprecation aliases = 10 names,
-        // matching the pre-CXEG-01 tool-name surface (no MCP-listing churn)
-        // even though only 3 are "real" tools now.
+        // 3 "real" tools (cortex_scope live, cortex_review/cortex_audit
+        // still pending) + 7 deprecation aliases = 10 names, matching the
+        // pre-CXEG-01 tool-name surface (no MCP-listing churn).
         assert_eq!(registry.len(), 10);
         for name in [
             "cortex_scope",
