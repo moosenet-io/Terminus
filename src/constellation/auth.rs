@@ -163,6 +163,10 @@ pub async fn auth_logout(headers: HeaderMap) -> Response {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+    // login/logout handlers write to the process-global CONSTELLATION_AUDIT_LOG_PATH audit
+    // sink; serialize those tests with each other and with audit.rs's audit test so they
+    // never race over that shared global path (see audit.rs's #[serial] test).
+    use serial_test::serial;
 
     fn headers_with_cookie(cookie: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -209,12 +213,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn login_rejects_empty_credentials() {
         let resp = auth_login(HeaderMap::new(), Bytes::from_static(b"{}")).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
+    #[serial]
     async fn login_accepts_nonempty_credentials_and_sets_cookie() {
         let body = Bytes::from(serde_json::to_vec(&json!({"username": "carol", "password": "x"})).unwrap());
         let resp = auth_login(HeaderMap::new(), body).await;
@@ -224,6 +230,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn logout_clears_cookie() {
         let resp = auth_logout(HeaderMap::new()).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
