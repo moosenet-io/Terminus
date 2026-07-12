@@ -211,7 +211,26 @@ pub fn parse_findings(text: &str) -> Vec<Finding> {
 /// never affect verdict parsing or aggregation. Results are capped at
 /// [`MAX_FINDINGS`].
 pub fn parse_findings_with_marker(text: &str, marker: &str) -> Vec<Finding> {
-    let Some(marker_pos) = text.find(marker) else {
+    // Anchor the marker to a LINE START (index 0 or immediately after a '\n').
+    // A plain `text.find(marker)` cross-matches: the correctness marker
+    // `FINDINGS_JSON:` is a suffix-substring of the lens marker
+    // `CONSISTENCY_FINDINGS_JSON:`, so an unanchored find would let the
+    // correctness parser latch onto a consistency block (and vice-versa).
+    let marker_pos = {
+        let bytes = text.as_bytes();
+        let mut from = 0usize;
+        let mut found = None;
+        while let Some(rel) = text[from..].find(marker) {
+            let abs = from + rel;
+            if abs == 0 || bytes[abs - 1] == b'\n' {
+                found = Some(abs);
+                break;
+            }
+            from = abs + marker.len();
+        }
+        found
+    };
+    let Some(marker_pos) = marker_pos else {
         return Vec::new();
     };
     let after = &text[marker_pos + marker.len()..];
