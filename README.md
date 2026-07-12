@@ -723,6 +723,33 @@ further; `limit` is optional (default 50) and clamped to `[1, 200]`.
 | Store configured, query ran, no matching rows | `{"configured": true, "found": false, "project_id", "count": 0, "results": []}` — a genuine empty result, not a config problem. |
 | Store configured, matches found | `{"configured": true, "found": true, "project_id", "count", "results": [{id, category, severity, scope_kind, scope_ref, description, occurrences, first_seen, last_seen}, ...]}` ordered by recurrence. |
 
+## Cortex — code-elegance / risk gate (Atlas-backed, S115/CXEG)
+
+Cortex is the pipeline's code-elegance, consistency, and risk gate. It was
+originally a thin SSH-exec relay to a script on an external fleet host; that
+host is retired and the relay with it. As of **CXEG-01** the module is
+re-scaffolded in-process, keyed by `project_id` (`TERM`/`LUM`/`HARM`/`CHRD`/
+`RAIL`), and built on the live Atlas knowledge graph rather than a subprocess.
+Its risk/elegance surface is rebuilt over the following S115 items:
+
+- `cortex_scope` — pre-change blast radius + token-reduction budget for a
+  planned change (stub pending its Atlas-backed rebuild in **CXEG-02**).
+- `cortex_review` — post-change `risk_score` (0–10) + named `risk_signals`
+  from Atlas structural metrics and KGFIND recurrence (stub pending **CXEG-04**).
+- `cortex_audit` — audit an external public repo URL (stub pending **CXEG-11**);
+  its SSRF-hardened `validate_repo_url` front-gate (`src/cortex/audit.rs`) is
+  live now — it rejects non-http(s) schemes, embedded credentials, shell
+  metacharacters, and loopback/private/link-local/metadata hosts in their
+  common obfuscated encodings (fail-closed).
+
+The seven retired graph-relay tools are kept only as zero-I/O **deprecation
+aliases** (`src/cortex/deprecated.rs`) that return a structured
+`{"deprecated": true, "use": "kg_..."}` pointer to their live Atlas
+equivalents: `cortex_stats`→`kg_stats`, `cortex_build`→`scribe_kg_build`,
+`cortex_deps`→`kg_neighbors`, `cortex_recent`→`kg_query`,
+`cortex_community`/`cortex_architecture`→`kg_communities`,
+`cortex_flows`→`kg_path`.
+
 ## Postgres tool suite — the single sanctioned Postgres door (S115)
 
 Coder agents historically SSHed directly into DB hosts and ran `psql` for
