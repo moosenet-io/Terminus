@@ -50,6 +50,15 @@ total — that vary with the backing service.
 | [`tools/README.md`](tools/README.md) | The tool index — all 52 modules grouped into five domains (Code & Git, Project & Planning, Infra & Ops, Models & Review, Personal & Life), each linking out to its per-tool pages. |
 | [`tools/mint/`](tools/mint/) | **MINT** — the model-intake / serving-profile flagship harness (the `mint` CLI and its `intake`-module tools). Treated as its own small manual; see [`tools/README.md#mint-flagship`](tools/README.md#mint-flagship) for the overview and links into the full command/tool reference. |
 
+## Development
+
+Conventions and tooling for contributing to this repo itself (not the tools
+it exposes).
+
+| Page | Description |
+| --- | --- |
+| [`house-style.md`](house-style.md) | The Tier-A house-style rule catalog enforced by `crate::house_style` (a deterministic `syn`-AST checker, run as part of `cargo test -p terminus-rs`) — the secret-shaped-env-var rule, the `RustTool::description()` non-empty check, the `panic!`-in-`execute` check, the allow-list, and the `// house-style-allow: <reason>` waiver convention. |
+
 ## Conventions used across these docs
 
 - **Source of truth is the code.** Every claim about a tool's behavior is

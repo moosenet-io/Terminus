@@ -27,6 +27,11 @@ pub mod forge;
 pub mod gitea;
 pub mod dev;
 pub mod gateway;
+/// CXEG-05: deterministic `syn`-AST house-style checker (Tier-A lint set) —
+/// see `docs/house-style.md` for the rule catalog. Shared by
+/// `tests/house_style.rs` (the Stage-4 gate wiring) and the standalone
+/// `house_style_check` bin (`src/bin/house_style_check.rs`, local runs).
+pub mod house_style;
 pub mod gateway_framework;
 pub mod github;
 pub mod <secret-manager>; // pii-test-fixture

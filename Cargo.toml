@@ -227,6 +227,22 @@ rustls-pemfile = "2"
 # transitively, so this does not introduce a second hyper major version.
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+# CXEG-05: house-style checker (`crate::house_style`, `src/bin/house_style_check.rs`,
+# `tests/house_style.rs`). Regular (not dev-only) dependencies deliberately: the
+# checker also ships as a `[[bin]]` below, and a plain `[[bin]]` target does not
+# reliably see `[dev-dependencies]` even during `cargo test` (only test/bench/example
+# targets are guaranteed that). `span-locations` is required for `proc-macro2`
+# spans to carry real file line/column info outside an actual proc-macro
+# invocation -- without it every span reports line 0, and the checker's
+# `file:line:` violation messages (and same/prev-line waiver lookup) would be
+# useless.
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+walkdir = "2"
+
+[[bin]]
+name = "house_style_check"
+path = "src/bin/house_style_check.rs"
 
 [dev-dependencies]
 # mcp_server tests drive the axum Router directly via `ServiceExt::oneshot`.
