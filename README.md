@@ -703,6 +703,70 @@ loaded graph (e.g. the graph was rebuilt and the symbol was removed/renamed)
 is silently dropped from the results rather than surfaced — stale-row
 tolerance, so a query never returns a dangling reference.
 
+## Postgres tool suite — the single sanctioned Postgres door (S115)
+
+Coder agents historically SSHed directly into DB hosts and ran `psql` for
+schema/data/role changes: unaudited, ungoverned, host-level DB access. The
+`pg_*` tools (`src/pg/`) are the ONE sanctioned, audited, identity-scoped
+door for all agent/client/tool Postgres access — no more direct SSH+`psql`.
+This is the same S9 single-door posture Terminus already applies to
+GitHub/Gitea/Plane, applied to Postgres.
+
+**Status:** PGT-01 (this item) ships the connection/identity foundation and
+the read-only `pg_identities` tool. `pg_query` / `pg_list_tables` /
+`pg_describe_table` (read), `pg_execute` (DML), `pg_ddl` (schema), and
+`pg_admin` (roles/GRANT/REVOKE) are later S115 items and are not yet present.
+
+### Identity / connection model
+
+Every `pg_*` tool accepts an optional `identity` argument selecting which
+Postgres connection/DB-ROLE the call authenticates as — exactly mirroring how
+every Plane tool accepts an optional `identity` argument for `PLANE_PAT_<NAME>`
+(see "Unified `Principal` identity" above). A connection identity `<name>` is
+configured by setting a `POSTGRES_URL_<NAME>` secret (e.g.
+`POSTGRES_URL_READONLY`, `POSTGRES_URL_WRITER`, `POSTGRES_URL_ADMIN`) to a
+connection string authenticated as a DB ROLE scoped to that privilege level —
+the DB role, not the tool code, is the real privilege boundary. Omitting
+`identity` uses the least-privileged `readonly` — safe by default, even for a
+call that reaches a tool it shouldn't have.
+
+`pg_identities` lists the configured connection NAMES and a name-derived
+privilege tier (`readonly`/`writer`/`admin`/`unknown`) — never a secret
+value. Read-only, not guarded.
+
+### Secret access
+
+terminus-rs has no separate `SecretManager::get()` / `vault::manager()` API
+of its own (see the `crate::pki` module docs for the full rationale): the
+runtime secret store is materialized into this process's environment at
+startup by the operator's secret manager, so a plain env read afterward
+already IS the "vault" read in this crate's established convention — the
+same convention `PLANE_PAT_<NAME>` uses. `src/pg/conn.rs`'s
+`scan_named_connections` is the ONE place `POSTGRES_URL_<NAME>` is read; no
+URL value is ever logged, displayed in an error, or embedded in a tool
+result — only identity NAMES and tiers are ever surfaced. An identity with no
+configured secret is refused with a clean "not configured" error naming the
+role, never guessing a fallback connection.
+
+### Governance and the exemption boundary
+
+This suite is the single door for AGENT/admin/ad-hoc Postgres access. It does
+**not** replace the application's own governed `sqlx` data paths — the MINT
+sweep (`crate::intake::storage::get_pool`), the fleet-catalog/discovery
+read+write tools, and any other in-process data path keep their direct
+`PgPool`, unrouted through this suite and undisturbed by it.
+
+Destructive `pg_*` tools (`pg_execute`, `pg_ddl`, `pg_admin` — later items)
+are registered in `crate::approval::GUARDED_BARE_NAMES` so the gateway
+requires approval before execution, on top of the DB-role privilege
+boundary and the standard gateway audit trail every tool call already gets.
+Every mutating `pg_*` tool added to this suite MUST be evaluated for the
+guarded set.
+
+`pg` registers on the CORE tool registry only (`crate::registry::register_all`,
+alongside `crate::intake::register`) — Chord-served, never the
+`terminus_personal`/<host> personal registry.
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
