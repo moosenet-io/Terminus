@@ -6,6 +6,19 @@
 
 use serde_json::Value;
 
+use super::aggregate::Finding;
+
+/// KGFIND-02: appended to every `build_prompt` role arm, after the VERDICT
+/// sentinel instruction. Purely optional/additive on the model's side --
+/// `parse_findings` treats an absent or malformed block as zero findings, and
+/// this text never alters or replaces the VERDICT line, which remains the
+/// sole authoritative outcome.
+const FINDINGS_INSTRUCTION: &str = "\n\nAfter the VERDICT line, optionally emit a line \
+`FINDINGS_JSON:` followed by a JSON array of concrete issues you found, each object \
+{\"category\":..., \"severity\":..., \"file\":..., \"symbol\":..., \"description\":...} \
+(empty array if none). This structured output is optional and MUST NOT change or replace \
+your VERDICT line above, which remains authoritative.\n";
+
 /// The four review structures `review_run` supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Structure {
@@ -60,7 +73,7 @@ of the changed symbols -- weigh cross-module impact.\n\n"
         ""
     };
 
-    match role {
+    let base = match role {
         Role::Reviewer => format!(
             "You are an independent code/change reviewer.\n\n\
 {kg_pointer}\
@@ -98,7 +111,8 @@ or\n\
 VERDICT: NOT_REFUTED\n\
 (if the change genuinely withstands your attempt to refute it)\n"
         ),
-    }
+    };
+    format!("{base}{FINDINGS_INSTRUCTION}")
 }
 
 /// Parsed verdict token. `Unknown` covers a response that never produced a
@@ -167,6 +181,72 @@ pub fn parse_verdict(raw: &str) -> (Verdict, String) {
     let reasoning = if reasoning.is_empty() { raw.trim().to_string() } else { reasoning };
 
     (verdict, reasoning)
+}
+
+/// Cap on findings accepted from one provider reply (bounds a runaway/malicious reply).
+const MAX_FINDINGS: usize = 50;
+
+/// KGFIND-02: extract structured findings from a provider's raw reply, if it
+/// emitted an optional `FINDINGS_JSON:` block (see [`FINDINGS_INSTRUCTION`]).
+/// Mirrors `scribe::graph::semantic::extract_json_array`'s tolerant
+/// brace/bracket-matching approach (first `[` after the marker to its
+/// matching `]`), tolerating any prose/fencing around it. Absent marker,
+/// unparseable JSON, or a JSON shape that doesn't deserialize into
+/// `Vec<Finding>` all resolve to an empty `Vec` -- this function never
+/// panics and never errors, since findings are strictly best-effort and must
+/// never affect verdict parsing or aggregation. Results are capped at
+/// [`MAX_FINDINGS`].
+pub fn parse_findings(text: &str) -> Vec<Finding> {
+    let Some(marker_pos) = text.find("FINDINGS_JSON:") else {
+        return Vec::new();
+    };
+    let after = &text[marker_pos + "FINDINGS_JSON:".len()..];
+
+    let Some(start) = after.find('[') else {
+        return Vec::new();
+    };
+    // Depth-match from the first '[' to ITS matching ']', respecting string
+    // contents (a ']' inside a description must not terminate the array) and
+    // backslash escapes. `rfind(']')` was greedy — trailing prose, a fenced
+    // block, or a second FINDINGS_JSON: marker with a later ']' overshot the
+    // slice and made deserialization fail. `[`/`]`/`"`/`\` are all ASCII, so
+    // byte iteration lands on char boundaries for the slice below.
+    let bytes = after.as_bytes();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut end: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(end) = end else {
+        return Vec::new();
+    };
+    let json_slice = &after[start..=end];
+
+    let findings: Vec<Finding> = serde_json::from_str(json_slice).unwrap_or_default();
+    findings.into_iter().take(MAX_FINDINGS).collect()
 }
 
 // ─── SCRB-02: docs-generation prompt (Scribe) ───────────────────────────────
@@ -340,6 +420,87 @@ mod tests {
         let p_kg = build_prompt(Role::Reviewer, "criteria", &ctx_kg);
         assert!(p_kg.contains("knowledge_graph` section"), "pointer present when key is set");
         assert!(p_kg.contains("blast radius"));
+    }
+
+    #[test]
+    fn reviewer_prompt_contains_findings_instruction() {
+        let ctx = json!({});
+        let p = build_prompt(Role::Reviewer, "criteria", &ctx);
+        assert!(p.contains("FINDINGS_JSON:"));
+        assert!(p.contains("VERDICT: APPROVE"), "findings instruction must not displace VERDICT sentinel");
+    }
+
+    #[test]
+    fn parse_findings_extracts_two_findings() {
+        let raw = "VERDICT: APPROVE\nFINDINGS_JSON: [\
+{\"category\":\"style\",\"severity\":\"low\",\"file\":\"a.rs\",\"symbol\":\"foo\",\"description\":\"nit\"},\
+{\"category\":\"bug\",\"severity\":\"high\",\"description\":\"panic risk\"}]";
+        let findings = parse_findings(raw);
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].category, "style");
+        assert_eq!(findings[0].file.as_deref(), Some("a.rs"));
+        assert_eq!(findings[1].category, "bug");
+        assert_eq!(findings[1].file, None);
+    }
+
+    #[test]
+    fn parse_findings_empty_when_no_marker() {
+        let raw = "VERDICT: APPROVE\nLooks good, no issues.";
+        assert!(parse_findings(raw).is_empty());
+    }
+
+    #[test]
+    fn parse_findings_empty_on_malformed_json_no_panic() {
+        let raw = "VERDICT: REQUEST_CHANGES\nFINDINGS_JSON: [ malformed";
+        assert!(parse_findings(raw).is_empty());
+    }
+
+    #[test]
+    fn parse_findings_empty_array_yields_empty_vec() {
+        let raw = "VERDICT: APPROVE\nFINDINGS_JSON: []";
+        assert!(parse_findings(raw).is_empty());
+    }
+
+    #[test]
+    fn parse_findings_extracts_array_despite_trailing_prose() {
+        let raw = "VERDICT: APPROVE\nFINDINGS_JSON: [{\"category\":\"c\",\"severity\":\"s\",\"description\":\"d\"}]\n\nThanks for reading.";
+        let findings = parse_findings(raw);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].description, "d");
+    }
+
+    #[test]
+    fn parse_findings_ignores_brackets_in_trailing_prose_and_strings() {
+        // The bug rfind(']') hit: a ']' AFTER the array (in prose, a fenced
+        // block, or a second marker) OR a ']' inside a description string made
+        // the greedy slice overshoot and fail to deserialize. Depth-matching
+        // from the first '[' to ITS matching ']' fixes both.
+        let raw = "VERDICT: REQUEST_CHANGES\n\
+FINDINGS_JSON: [{\"category\":\"bug\",\"severity\":\"high\",\"description\":\"index [0] out of bounds\"}]\n\
+See also FINDINGS_JSON: [ignore this] and arr[3] in the notes.";
+        let findings = parse_findings(raw);
+        assert_eq!(findings.len(), 1, "must stop at the first array's matching ]");
+        assert_eq!(findings[0].description, "index [0] out of bounds");
+    }
+
+    #[test]
+    fn parse_findings_caps_at_fifty() {
+        let items: Vec<String> = (0..75)
+            .map(|i| format!("{{\"category\":\"c\",\"severity\":\"s\",\"description\":\"d{i}\"}}"))
+            .collect();
+        let raw = format!("VERDICT: APPROVE\nFINDINGS_JSON: [{}]", items.join(","));
+        let findings = parse_findings(&raw);
+        assert_eq!(findings.len(), 50);
+    }
+
+    #[test]
+    fn parse_verdict_still_correct_when_findings_json_follows() {
+        let raw = "Some reasoning here.\nVERDICT: REQUEST_CHANGES\nFINDINGS_JSON: [{\"category\":\"bug\",\"severity\":\"high\",\"description\":\"x\"}]";
+        let (v, reasoning) = parse_verdict(raw);
+        assert_eq!(v, Verdict::RequestChanges);
+        assert_eq!(reasoning, "Some reasoning here.");
+        let findings = parse_findings(raw);
+        assert_eq!(findings.len(), 1);
     }
 
     #[test]
