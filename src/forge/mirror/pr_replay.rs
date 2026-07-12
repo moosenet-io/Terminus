@@ -508,7 +508,14 @@ pub async fn replay_pr(
     }
 
     let title = scrub_text(pr.get("title").and_then(Value::as_str).unwrap_or("mirrored pull request"));
-    let body = scrub_text(pr.get("body").and_then(Value::as_str).unwrap_or(""));
+    // Body: gitea/github use `body`; GitLab MRs use `description`. Read either so a
+    // GitLab internal MR body is reproduced, not silently dropped.
+    let body = scrub_text(
+        pr.get("body")
+            .and_then(Value::as_str)
+            .or_else(|| pr.get("description").and_then(Value::as_str))
+            .unwrap_or(""),
+    );
 
     // 2. Read + scrub the FULL discussion thread (paged, provider-agnostic).
     let scrubbed_comments = read_all_comments(
@@ -598,9 +605,27 @@ pub async fn replay_pr(
         mp["owner"] = json!(o);
     }
     if let Err(e) = call_public(reg, cfg.public_provider.as_deref(), ForgeEndpoint::PullRequestsMerge, mp).await {
-        // The merge itself did NOT happen → still safe to roll back.
-        restore_canonical(&cfg.work_dir, &snap, &branch)?;
-        return Err(e);
+        // The dispatch errored — but a timeout / 5xx-after-success / dropped response
+        // could mean the merge ACTUALLY LANDED. Rolling back the canonical lineage while
+        // public main advanced would corrupt the mirror. Re-read the PR's state and roll
+        // back ONLY if it is POSITIVELY still unmerged; if it merged, fall through
+        // (canonical stays advanced); if the state can't be confirmed, do NOT roll back.
+        match public_pr_for_branch(reg, cfg, &pub_repo, &branch).await {
+            Ok(Some(existing)) if pr_is_merged(&existing) => { /* merged despite the error */ }
+            Ok(Some(_)) => {
+                // Positively still open → the merge did not happen → safe to roll back.
+                restore_canonical(&cfg.work_dir, &snap, &branch)?;
+                return Err(e);
+            }
+            _ => {
+                // Could not confirm (re-read failed / PR not found) → do NOT roll back.
+                return Err(ToolError::Execution(format!(
+                    "public merge for '{branch}' errored ({e}) and its state could not be \
+                     confirmed — NOT rolling back the canonical lineage (the merge may have \
+                     landed). Re-run to reconcile via durable idempotency."
+                )));
+            }
+        }
     }
 
     // Merge SUCCEEDED. From here the canonical lineage stays at head_int (it matches the
