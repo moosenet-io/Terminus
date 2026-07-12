@@ -27,6 +27,7 @@
 //!   next PR replays onto it (PRs replay in merge order — enforced by
 //!   `replay_pr_slice`).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -230,6 +231,100 @@ fn pr_merge_commit(pr: &Value) -> Option<String> {
         .map(String::from)
 }
 
+/// A PR's head branch ref, across gitea/github (`head.ref`) and gitlab (`source_branch`).
+fn pr_head_ref(pr: &Value) -> Option<String> {
+    pr.pointer("/head/ref")
+        .and_then(Value::as_str)
+        .or_else(|| pr.get("source_branch").and_then(Value::as_str))
+        .map(String::from)
+}
+
+/// Read the FULL PR conversation thread across pages, provider-agnostically. gitea
+/// returns one page per call (caller-paged); github/gitlab auto-follow pages and
+/// return everything on the first call. De-duping by comment `id` and stopping when a
+/// page adds no new comment handles BOTH: a single-page provider keeps paging; a
+/// return-all provider stops after its second call (all dupes). Returns scrubbed,
+/// non-empty comment bodies in order.
+async fn read_all_comments(
+    reg: &ForgeRegistry,
+    provider: Option<&str>,
+    repo: &str,
+    owner: Option<&str>,
+    pr: u64,
+) -> Result<Vec<String>, ToolError> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    let mut page = 1u64;
+    loop {
+        let mut params = json!({ "repo": repo, "index": pr, "number": pr, "page": page, "limit": 50 });
+        if let Some(o) = owner {
+            params["owner"] = json!(o);
+        }
+        let body = read_private(reg, provider, ForgeEndpoint::PullRequestsListComments, params).await?;
+        let arr = body.as_array().cloned().unwrap_or_default();
+        if arr.is_empty() {
+            break;
+        }
+        let mut new_in_page = 0usize;
+        for c in &arr {
+            // Stable per-comment key: the `id` (any JSON scalar) else the whole object.
+            let key = c.get("id").map(|v| v.to_string()).unwrap_or_else(|| c.to_string());
+            if seen.insert(key) {
+                new_in_page += 1;
+                if let Some(b) = c.get("body").and_then(Value::as_str) {
+                    if !b.trim().is_empty() {
+                        out.push(scrub_text(b));
+                    }
+                }
+            }
+        }
+        if new_in_page == 0 {
+            break; // return-all provider: this page repeated the first — done.
+        }
+        page += 1;
+        if page > 500 {
+            break; // safety cap — no realistic PR thread is this long.
+        }
+    }
+    Ok(out)
+}
+
+/// Bounded scan of the PUBLIC forge for an existing PR whose head branch is `branch`
+/// (any state — open/closed/merged). This is the DURABLE idempotency check: even with
+/// no local `mirror-pr/<n>` tag (lost work-dir, or a crash after the public merge but
+/// before the local tag), an existing public PR means the work is already done.
+/// Returns the PR's state string if found.
+async fn public_pr_state_for_branch(
+    reg: &ForgeRegistry,
+    cfg: &PrReplayConfig,
+    pub_repo: &str,
+    branch: &str,
+) -> Result<Option<String>, ToolError> {
+    let mut page = 1u64;
+    loop {
+        let mut params = json!({ "repo": pub_repo, "state": "all", "page": page, "limit": 50 });
+        if let Some(o) = &cfg.public_owner {
+            params["owner"] = json!(o);
+        }
+        let body = call_public(reg, cfg.public_provider.as_deref(), ForgeEndpoint::PullRequestsList, params).await?;
+        let arr = body.as_array().cloned().unwrap_or_default();
+        if arr.is_empty() {
+            break;
+        }
+        for pr in &arr {
+            if pr_head_ref(pr).as_deref() == Some(branch) {
+                let state = pr.get("state").and_then(Value::as_str).unwrap_or("unknown").to_string();
+                return Ok(Some(state));
+            }
+        }
+        page += 1;
+        if page > 10 {
+            break; // bounded — a freshly-created mirror PR is on the first pages.
+        }
+    }
+    Ok(None)
+}
+
 /// True if a remote URL embeds userinfo (`scheme://user[:pass]@host`). A `file://`
 /// path or a bare `https://host/…` URL has no `@` before the first path `/`, so this
 /// stays false for legitimate remotes and true for a credential-bearing one.
@@ -315,10 +410,23 @@ pub async fn replay_pr(
         ));
     }
 
-    // Idempotency: a recorded PR is never re-created.
+    // Idempotency (local): a recorded PR is never re-created.
     if already_replayed(&cfg.work_dir, internal_pr) {
         base_outcome.skipped = true;
         base_outcome.note = "already mirrored (mirror-pr tag present) — skipped".into();
+        return Ok(base_outcome);
+    }
+
+    // Idempotency (DURABLE): even without a local tag (lost work-dir, or a crash after
+    // the public merge but before the local tag), an existing PUBLIC PR for this
+    // branch means the work is already done. Re-record the local tag and skip — never
+    // double-create.
+    let pub_repo_probe = cfg.public_repo.clone().unwrap_or_else(|| cfg.repo.clone());
+    if let Some(state) = public_pr_state_for_branch(reg, cfg, &pub_repo_probe, &branch).await? {
+        let _ = git(&cfg.work_dir, &["tag", "-f", &pr_tag(internal_pr), "HEAD"]);
+        base_outcome.skipped = true;
+        base_outcome.note =
+            format!("public PR already exists for '{branch}' (state {state}) — skipped (durable idempotency)");
         return Ok(base_outcome);
     }
 
@@ -349,26 +457,40 @@ pub async fn replay_pr(
             "no canonical scrubbed lineage — run git_public_history_backfill first".into(),
         )
     })?;
+
+    // ORDER guard: this PR must be the NEXT unreplayed merged PR. Its merge commit's
+    // FIRST parent (internal main just BEFORE the merge) must equal the canonical
+    // lineage tip (base_int). If it doesn't, base_int..head_int would span earlier
+    // un-replayed PRs and this run would open one public PR carrying only THIS PR's
+    // title/body/comments over all those commits — mis-attributing earlier work. Refuse.
+    let first_parent = git(&cfg.source, &["rev-parse", "--verify", &format!("{head_int}^1")])
+        .map_err(|e| {
+            ToolError::Execution(format!(
+                "cannot read the merge commit's first parent for PR {internal_pr} ({head_int}^1): {e}"
+            ))
+        })?
+        .trim()
+        .to_string();
+    if first_parent != base_int {
+        return Err(ToolError::Conflict(format!(
+            "internal PR {internal_pr} is not the next unreplayed merged PR — its merge commit's \
+             first parent {first_parent} does not equal the canonical lineage tip {base_int}. \
+             Replay merged PRs in merge order (the immediately-following one first)."
+        )));
+    }
+
     let title = scrub_text(pr.get("title").and_then(Value::as_str).unwrap_or("mirrored pull request"));
     let body = scrub_text(pr.get("body").and_then(Value::as_str).unwrap_or(""));
 
-    // 2. Read + scrub the discussion thread.
-    let mut c_params = json!({ "repo": priv_repo, "index": internal_pr, "number": internal_pr });
-    if let Some(o) = &cfg.private_owner {
-        c_params["owner"] = json!(o);
-    }
-    let comments_body =
-        read_private(reg, cfg.private_provider.as_deref(), ForgeEndpoint::PullRequestsListComments, c_params).await?;
-    let scrubbed_comments: Vec<String> = comments_body
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|c| c.get("body").and_then(Value::as_str))
-                .filter(|b| !b.trim().is_empty())
-                .map(scrub_text)
-                .collect()
-        })
-        .unwrap_or_default();
+    // 2. Read + scrub the FULL discussion thread (paged, provider-agnostic).
+    let scrubbed_comments = read_all_comments(
+        reg,
+        cfg.private_provider.as_deref(),
+        &priv_repo,
+        cfg.private_owner.as_deref(),
+        internal_pr,
+    )
+    .await?;
 
     // Partial-prior-run guard: if the feature branch already exists on the remote,
     // a previous run pushed it but did not finish (create/comment/merge + the
@@ -534,6 +656,24 @@ mod tests {
         assert!(!outcome.replayed);
 
         let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    #[test]
+    fn pr_field_getters_tolerate_provider_shapes() {
+        // gitea/github merged PR
+        let gh = json!({"merged": true, "merge_commit_sha": "abc123", "head": {"ref": "pr-mirror/7"}});
+        assert!(pr_is_merged(&gh));
+        assert_eq!(pr_merge_commit(&gh).as_deref(), Some("abc123"));
+        assert_eq!(pr_head_ref(&gh).as_deref(), Some("pr-mirror/7"));
+        assert_eq!(pr_number(&json!({"number": 12})), Some(12));
+        // gitlab MR merged
+        let gl = json!({"state": "merged", "sha": "def456", "source_branch": "pr-mirror/9", "iid": 9});
+        assert!(pr_is_merged(&gl));
+        assert_eq!(pr_merge_commit(&gl).as_deref(), Some("def456"));
+        assert_eq!(pr_head_ref(&gl).as_deref(), Some("pr-mirror/9"));
+        assert_eq!(pr_number(&gl), Some(9));
+        // an open PR is not merged
+        assert!(!pr_is_merged(&json!({"merged": false, "state": "open"})));
     }
 
     #[test]
