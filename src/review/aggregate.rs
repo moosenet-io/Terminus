@@ -5,7 +5,23 @@
 //! providers can be unit tested without any network I/O.
 
 use super::prompt::Structure;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+/// KGFIND-02: one concrete issue a reviewer surfaced, structured beyond the
+/// coarse `VERDICT:`/`reasoning` pair. Purely additive -- extracted
+/// best-effort from an optional `FINDINGS_JSON:` block in the provider's raw
+/// reply (see `prompt::parse_findings`); absence never affects verdict
+/// parsing or aggregation.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Finding {
+    pub category: String,
+    pub severity: String,
+    #[serde(default)]
+    pub file: Option<String>,
+    #[serde(default)]
+    pub symbol: Option<String>,
+    pub description: String,
+}
 
 /// One provider's outcome, as surfaced in the tool's `providers` output array.
 #[derive(Debug, Clone, Serialize)]
@@ -14,6 +30,11 @@ pub struct ProviderResult {
     pub verdict: String,
     pub reasoning: String,
     pub error: Option<String>,
+    /// KGFIND-02: structured findings parsed from the reply's optional
+    /// `FINDINGS_JSON:` block. Empty when absent/malformed/not applicable
+    /// (e.g. an errored/degraded provider) -- never affects `verdict`.
+    #[serde(default)]
+    pub findings: Vec<Finding>,
 }
 
 impl ProviderResult {
@@ -121,6 +142,7 @@ mod tests {
             verdict: verdict.into(),
             reasoning: "r".into(),
             error: None,
+            findings: Vec::new(),
         }
     }
 
@@ -130,6 +152,7 @@ mod tests {
             verdict: "UNKNOWN".into(),
             reasoning: String::new(),
             error: Some(reason.into()),
+            findings: Vec::new(),
         }
     }
 

@@ -50,9 +50,9 @@ use crate::error::ToolError;
 use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
-pub use aggregate::{aggregate, ProviderResult};
+pub use aggregate::{aggregate, Finding, ProviderResult};
 pub use dispatch::ReviewConfig;
-pub use prompt::{build_docs_prompt, build_prompt, parse_verdict, Role, Structure};
+pub use prompt::{build_docs_prompt, build_prompt, parse_findings, parse_verdict, Role, Structure};
 
 const ALLOWED_PROVIDERS: &[&str] = &["opus", "codex", "agy", "nemotron", "qwen_coder", "free"];
 const MAX_PROVIDERS: usize = 5;
@@ -298,11 +298,13 @@ async fn run_one_provider(cfg: ReviewConfig, provider: String, prompt_text: Stri
     match raw {
         Ok(text) => {
             let (verdict, reasoning) = parse_verdict(&text);
+            let findings = parse_findings(&text);
             ProviderResult {
                 provider,
                 verdict: verdict.as_str().to_string(),
                 reasoning,
                 error: None,
+                findings,
             }
         }
         Err(reason) => ProviderResult {
@@ -310,6 +312,7 @@ async fn run_one_provider(cfg: ReviewConfig, provider: String, prompt_text: Stri
             verdict: "UNKNOWN".to_string(),
             reasoning: String::new(),
             error: Some(reason),
+            findings: Vec::new(),
         },
     }
 }
@@ -425,6 +428,7 @@ than failing the whole call."
                             verdict: "UNKNOWN".to_string(),
                             reasoning: String::new(),
                             error: Some(format!("unavailable: task join error: {join_err}")),
+                            findings: Vec::new(),
                         },
                     ));
                 }
