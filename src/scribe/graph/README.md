@@ -79,3 +79,73 @@ returns `ToolError::NotConfigured` without attempting a connection if unset.
 returns matching rows ordered by `occurrences DESC, last_seen DESC`. All
 filters are optional and the query is built with bound parameters only (no
 string interpolation of caller-supplied values).
+
+## Rules store (`rules_store.rs`, KGRULE-01)
+
+`RulesStore` owns the `kg_rules` Postgres table: crystallized, durable rules
+governing a scope within a project's knowledge graph. A rule is born as a
+`candidate` (never enforced) and is only promoted to `active` by an
+adversarial `review_run` panel (KGRULE-03) that argues it is earned. Active
+rules carry an `enforcement` level and are bi-temporal (`valid_from`/
+`valid_to`) so they can be retired without deleting history.
+
+### Table shape
+
+```sql
+CREATE TABLE kg_rules (
+    id uuid PRIMARY KEY,
+    project_id text NOT NULL,
+    scope_kind text NOT NULL CHECK (scope_kind IN ('node','path','community','global')),
+    scope_ref text NOT NULL,
+    category text NOT NULL,
+    guidance text NOT NULL,
+    enforcement text NOT NULL DEFAULT 'advisory' CHECK (enforcement IN ('advisory','lint-candidate','blocking')),
+    status text NOT NULL DEFAULT 'candidate' CHECK (status IN ('candidate','active','retired')),
+    provenance jsonb NOT NULL DEFAULT '{}'::jsonb,
+    recurrence_at_creation int,
+    cortex_risk real,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    valid_from timestamptz NOT NULL DEFAULT now(),
+    valid_to timestamptz
+);
+CREATE INDEX kg_rules_scope ON kg_rules (project_id, scope_kind, scope_ref, category, status);
+```
+
+Migration is idempotent and advisory-locked (same idiom as
+`findings_store::FindingsStore`, a distinct lock key), safe to call
+repeatedly and from concurrent callers.
+
+### Lifecycle
+
+- **`create_candidate(NewRule)`** — idempotent per `(project_id, scope_kind,
+  scope_ref, category)`: if a `candidate` or `active` row already exists for
+  that bucket, its id is returned rather than inserting a duplicate. Atomic
+  via a transaction-scoped advisory lock keyed by the bucket (mirrors
+  `FindingsStore::record`'s TOCTOU-safe pattern), so concurrent crystallize
+  calls for the same bucket never double-insert.
+- **`promote(id, enforcement, provenance)`** — `candidate` → `active`, sets
+  `enforcement` and `provenance` (typically the promotion review result),
+  refreshes `valid_from`. Already-`active` is a no-op success (idempotent).
+  A missing id is `ToolError::NotFound`; a `retired` id is
+  `ToolError::Conflict` (not silently ignored).
+- **`retire(id, reason)`** — sets `status = 'retired'`, `valid_to = now()`.
+  `reason` is accepted for interface clarity; callers that need it to be
+  durable should fold it into `provenance` before calling, as it is not
+  persisted as its own column. A missing id is `ToolError::NotFound`.
+- **`list_active(project_id, scope_kind?, scope_ref?, category?)`** —
+  returns rows with `status = 'active' AND valid_to IS NULL`, ordered by
+  enforcement priority (`blocking` > `lint-candidate` > `advisory`) then
+  `created_at DESC`. All filters are optional and bound.
+- **`is_active(status, valid_to)`** — the pure predicate mirroring the
+  `list_active` WHERE clause (`status == "active" && valid_to.is_none()`),
+  unit-tested without a database.
+
+### Configuration
+
+Same DSN resolution as `FindingsStore`/`AtlasVecStore`: `RulesStore::from_env()`
+reads `crate::config::atlas_database_url()` (`ATLAS_DATABASE_URL`) and returns
+`ToolError::NotConfigured` without attempting a connection if unset.
+
+| Env var | Purpose | Default |
+|---|---|---|
+| `ATLAS_DATABASE_URL` | Postgres DSN for the Atlas database (shared with the findings/vec stores) | none (`NotConfigured` if unset) |
