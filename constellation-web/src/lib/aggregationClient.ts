@@ -132,15 +132,36 @@ function baseUrl(): string {
   return window.location.origin;
 }
 
+// The single-auth invariant, enforced structurally: Content-Type is always JSON and
+// authoritative; no caller-supplied auth-bearing header is ever forwarded to the backend.
+function enforceHeaders(callerHeaders?: HeadersInit): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (callerHeaders) {
+    const entries = callerHeaders instanceof Headers
+      ? Array.from(callerHeaders.entries())
+      : Array.isArray(callerHeaders)
+        ? callerHeaders
+        : Object.entries(callerHeaders);
+    for (const [k, v] of entries) {
+      const lk = k.toLowerCase();
+      if (lk === 'authorization' || lk === 'cookie' || lk === 'content-type') continue;
+      out[k] = v as string;
+    }
+  }
+  out['Content-Type'] = 'application/json';
+  return out;
+}
+
 async function httpJson<T>(path: string, init?: RequestInit): Promise<T> {
-  // Spread caller init FIRST, then enforce the aggregation-client invariants last so a
-  // caller can never override them: credentials:'include' (session cookie is the only auth
-  // the browser holds) is authoritative, and the JSON Content-Type is always present while
-  // still allowing callers to ADD headers. This keeps the single-auth discipline intact.
+  // Enforce the aggregation-client invariants so a caller can NEVER override them:
+  //  - credentials:'include' — the session cookie is the only auth the browser holds.
+  //  - Content-Type:'application/json' is authoritative (merged LAST, after caller headers).
+  //  - auth-bearing headers are stripped: the browser holds no backend credentials, so an
+  //    Authorization/Cookie header from a caller is meaningless and must never be sent.
   const res = await fetch(`${baseUrl()}${path}`, {
     ...init,
     credentials: 'include',
-    headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
+    headers: enforceHeaders(init?.headers),
   });
   if (!res.ok) {
     throw new Error(`HTTP ${res.status} for ${path}`);
