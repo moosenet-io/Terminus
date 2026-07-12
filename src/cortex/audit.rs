@@ -249,6 +249,7 @@ fn is_disallowed_ipv6(v6: std::net::Ipv6Addr) -> bool {
 /// which is the only case that matters here — this process never compiles
 /// with `panic = "abort"`, and if it ever did, the OS reclaims `temp_dir()`
 /// on the next boot rather than leaking silently forever).
+#[derive(Debug)]
 struct ScratchClone {
     /// The scratch dir itself (parent of `repo/` and the isolated `home/`
     /// handed to the `git` subprocess as `$HOME`) — removed wholesale on
