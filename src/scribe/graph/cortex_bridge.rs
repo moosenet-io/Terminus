@@ -58,16 +58,17 @@
 //! ## Risk extraction
 //!
 //! `extract_risk` is a pure function (no I/O, no async, fully unit-tested)
-//! that looks for a numeric `risk` or `score` field, first at the top level
-//! of the parsed JSON and then one level deeper under a `result` key (in
-//! case a future/alternate Cortex response nests its payload). A found
-//! value is clamped to `[0.0, 1.0]` — Cortex's own documented `risk_score`
-//! range is `0-10`, not `0-1`, but this bridge's contract (and KGRULE-02's
-//! consumption of it) is a normalized `0.0..=1.0` risk signal, so any
-//! numeric value found is clamped into that range rather than left
-//! unbounded or silently rescaled (rescaling would assume a specific,
-//! unverified upstream scale — see `crate::cortex`'s own extensive
-//! "NOT verified" notes about response shapes). A non-numeric value at the
+//! that looks for a numeric risk field, first at the top level of the parsed
+//! JSON and then one level deeper under a `result` key (in case a future/
+//! alternate Cortex response nests its payload). This bridge's contract (and
+//! KGRULE-02's consumption of it) is a normalized `0.0..=1.0` risk signal, so:
+//! - **`risk_score`** is Cortex's own DOCUMENTED field (`cortex_review` states
+//!   its range is `0-10`), so it is the PRIMARY field and is RESCALED `0-10 ->
+//!   0-1` by dividing by 10, then clamped. This is a rescale against Cortex's
+//!   *documented* scale (not a guess).
+//! - **`risk`/`score`** are accepted as fallbacks and treated as already-
+//!   normalized `[0,1]` fractions — clamped as-is, never rescaled.
+//! Everything ends clamped to `[0.0, 1.0]`. A non-numeric value at the
 //! `risk`/`score` key (e.g. `{"risk": "high"}`) is treated the same as a
 //! missing one: `None`, not a parse error.
 

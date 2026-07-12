@@ -29,13 +29,16 @@ through a scratch `ToolRegistry` and parses its JSON response.
 - A well-formed but risk-less response (including `crate::cortex`'s
   `{"raw": "..."}` shape for non-JSON remote stdout) → `None`.
 
-Risk extraction (`extract_risk`, private, pure, fully unit-tested) looks for
-a numeric `risk` or `score` field at the top level and one level deep under
-`result`; any value found is clamped to `[0.0, 1.0]` (Cortex's own
-documented `risk_score` field is `0-10`, but this bridge's contract is a
-normalized `0.0..=1.0` signal, so values are clamped rather than rescaled
-against an unverified upstream range). Non-numeric values at those keys are
-treated as absent, not as a parse error.
+Risk extraction (`extract_risk`, private, pure, fully unit-tested) looks for a
+numeric risk field at the top level and one level deep under `result`, and
+normalizes to this bridge's `0.0..=1.0` contract:
+- **`risk_score`** — Cortex's own DOCUMENTED field (`cortex_review`'s `0-10`
+  scale) — is the primary field and is **rescaled** `0-10 → 0-1` (÷10), then
+  clamped. This rescales against Cortex's *documented* scale, not a guess.
+- **`risk`/`score`** — accepted as fallbacks, treated as already-normalized
+  `[0,1]` fractions and clamped as-is (never rescaled).
+
+Non-numeric values at those keys are treated as absent, not as a parse error.
 
 Uses `cortex_review` (not `cortex_scope`) because its documented purpose is
 a post-hoc risk *score* for a set of files — exactly what this bridge needs
