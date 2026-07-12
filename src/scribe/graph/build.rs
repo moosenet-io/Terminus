@@ -292,9 +292,25 @@ async fn embed_graph_nodes(
 
     let store = match AtlasVecStore::from_env().await {
         Ok(s) => s,
-        Err(e) => return json!({"ran": false, "reason": format!("vector store not configured: {e}")}),
+        Err(e) => {
+            // Log AND report: store construction/config failure should be
+            // visible in the daemon log, not only in the returned JSON.
+            tracing::warn!("KGEMB-03: vector store not configured for project '{project_id}': {e}");
+            return json!({"ran": false, "reason": format!("vector store not configured: {e}")});
+        }
     };
     let client = EmbedClient::from_env();
+
+    // Pre-flight the embeddings endpoint. `EmbedClient::from_env()` is infallible
+    // (it always resolves to a default URL), so the only meaningful "client
+    // configured" gate is a reachability probe: if the endpoint can't embed a
+    // trivial string, embeddings are effectively NOT configured for this build —
+    // report `ran:false` and skip the whole card/candidate pass rather than
+    // doing all that work only to fail at `embed_batch`.
+    if let Err(e) = client.embed("kgemb-03 embeddings preflight probe").await {
+        tracing::warn!("KGEMB-03: embeddings endpoint not usable for project '{project_id}': {e}");
+        return json!({"ran": false, "reason": format!("embeddings endpoint not usable: {e}")});
+    }
 
     match embed_graph_nodes_inner(&store, &client, project_id, graph, changed_node_ids).await {
         Ok((embedded, skipped, deleted)) => json!({
