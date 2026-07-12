@@ -374,6 +374,7 @@ mod tests {
     /// caller can't log in through a route that itself requires being
     /// logged in.
     #[tokio::test]
+    #[serial]
     async fn auth_login_route_is_reachable_without_a_session() {
         let router = constellation_router(test_state());
         let req = Request::builder()
