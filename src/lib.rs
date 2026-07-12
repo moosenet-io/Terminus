@@ -6,6 +6,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod ansible;
 pub mod approval;
 pub mod axon;
+/// Broker-side pluggable worker transport (TMOD-02) — `WorkerTransport`
+/// trait, the three T0/T1/T2 tiers, and the `MinTierPolicy` minimum-tier
+/// floor. See `crate::broker::transport` for the full design.
+pub mod broker;
 pub mod commute;
 /// Vendored byte-for-byte copies of the small lumina-core surfaces terminus
 /// references (the S84 assistant-sweep prompt/conversation types), so the
