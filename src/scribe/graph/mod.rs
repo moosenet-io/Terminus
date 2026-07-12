@@ -27,6 +27,7 @@ pub mod model;
 pub mod query;
 pub mod rank;
 pub mod render;
+pub mod rules;
 pub mod rules_store;
 pub mod semantic;
 pub mod store;
