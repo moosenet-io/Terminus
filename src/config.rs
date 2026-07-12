@@ -1092,6 +1092,78 @@ pub fn validate_worker_transport_entry(
     validate_worker_transports(std::slice::from_ref(entry))
 }
 
+// ── CONST-02: constellation aggregation-layer config ───────────────────────
+//
+// The Terminus aggregation layer (`crate::constellation`) is a compiled-in
+// module of the primary/gateway binary (see `docs/architecture/broker.md` —
+// this is deliberately NOT a broker worker: it is an operator-facing HTTP
+// API + static-asset host, not an MCP tool domain). Every backend base URL
+// it proxies to, and every filesystem path it needs, is resolved here —
+// NEVER a literal in `crate::constellation::*` — matching this file's own
+// convention for every other tool in this crate. Following this crate's
+// established secret/config convention (see the `crate::<secret-manager>` and
+// `crate::review::dispatch` module docs: there is no separate
+// `SecretManager`/`vault::manager()` API in terminus-rs — a plain env read
+// of a runtime-materialized value, via [`env_nonempty`], IS the vault read
+// here), these are plain env-sourced config helpers, not secret-shaped
+// values in their own right (a backend base URL is infra config, not a
+// credential) — no auth token is read or forwarded by this section at all.
+
+/// Base URL of the Harmony backend the aggregation layer proxies
+/// `/api/harmony/*path` to. From `CONSTELLATION_HARMONY_URL`; `None` ⇒ the
+/// proxy handler reports that system as `available:false` rather than
+/// guessing an infra host.
+pub fn constellation_harmony_url() -> Option<String> {
+    env_nonempty("CONSTELLATION_HARMONY_URL")
+}
+
+/// Base URL of the Chord backend the aggregation layer proxies
+/// `/api/chord/*path` to. From `CONSTELLATION_CHORD_URL`; `None` ⇒
+/// `available:false` for that system.
+pub fn constellation_chord_url() -> Option<String> {
+    env_nonempty("CONSTELLATION_CHORD_URL")
+}
+
+/// Base URL of the Lumina backend the aggregation layer proxies
+/// `/api/lumina/*path` to. From `CONSTELLATION_LUMINA_URL`; `None` ⇒
+/// `available:false` for that system.
+pub fn constellation_lumina_url() -> Option<String> {
+    env_nonempty("CONSTELLATION_LUMINA_URL")
+}
+
+/// Filesystem directory holding the built `constellation-web` static
+/// assets (its `dist/` output) that this layer serves as a SPA, with
+/// `index.html` as the not-found fallback. From
+/// `CONSTELLATION_WEB_DIST_DIR`; `None` ⇒ no static-asset host is mounted
+/// at all (an API-only deployment — e.g. a dev box that never built the
+/// web bundle), rather than guessing a path.
+pub fn constellation_web_dist_dir() -> Option<String> {
+    env_nonempty("CONSTELLATION_WEB_DIST_DIR")
+}
+
+/// Per-request timeout, in milliseconds, for a proxied `/api/{system}/*`
+/// backend call. From `CONSTELLATION_BACKEND_TIMEOUT_MS`; defaults to 5000
+/// (5s) — long enough for a healthy co-located backend, bounded so a
+/// wedged/unreachable one degrades a single system's panel instead of
+/// hanging the whole aggregation request.
+pub fn constellation_backend_timeout_ms() -> u64 {
+    env_nonempty("CONSTELLATION_BACKEND_TIMEOUT_MS")
+        .and_then(|v| v.parse().ok())
+        .filter(|ms: &u64| *ms > 0)
+        .unwrap_or(5_000)
+}
+
+/// Filesystem path the aggregation layer's mutating-request audit log
+/// (S6-sanitized JSONL, one line per POST/PUT/PATCH/DELETE through
+/// `/api/*`) is appended to. From `CONSTELLATION_AUDIT_LOG_PATH`; defaults
+/// to a relative file in the process's working directory (low-stakes local
+/// operational log, same "sensible default over hard `NotConfigured`"
+/// posture as [`meridian_state_path`] above, not shared infra).
+pub fn constellation_audit_log_path() -> String {
+    env_nonempty("CONSTELLATION_AUDIT_LOG_PATH")
+        .unwrap_or_else(|| "constellation-audit.jsonl".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1748,5 +1820,53 @@ mod tests {
         let reg = WorkerTransportRegistry::from_env().expect("should parse");
         assert_eq!(reg.len(), 3);
         std::env::remove_var("TERMINUS_BROKER_WORKERS_JSON");
+    }
+
+    // ── CONST-02: constellation aggregation-layer config ────────────────
+
+    #[test]
+    #[serial]
+    fn constellation_backend_urls_none_when_unset() {
+        std::env::remove_var("CONSTELLATION_HARMONY_URL");
+        std::env::remove_var("CONSTELLATION_CHORD_URL");
+        std::env::remove_var("CONSTELLATION_LUMINA_URL");
+        assert_eq!(constellation_harmony_url(), None);
+        assert_eq!(constellation_chord_url(), None);
+        assert_eq!(constellation_lumina_url(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn constellation_backend_urls_read_when_set() {
+        std::env::set_var("CONSTELLATION_HARMONY_URL", "http://127.0.0.1:9001"); // pii-test-fixture
+        assert_eq!(
+            constellation_harmony_url().as_deref(),
+            Some("http://127.0.0.1:9001") // pii-test-fixture
+        );
+        std::env::remove_var("CONSTELLATION_HARMONY_URL");
+    }
+
+    #[test]
+    #[serial]
+    fn constellation_web_dist_dir_none_when_unset() {
+        std::env::remove_var("CONSTELLATION_WEB_DIST_DIR");
+        assert_eq!(constellation_web_dist_dir(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn constellation_backend_timeout_ms_default_and_override() {
+        std::env::remove_var("CONSTELLATION_BACKEND_TIMEOUT_MS");
+        assert_eq!(constellation_backend_timeout_ms(), 5_000);
+        std::env::set_var("CONSTELLATION_BACKEND_TIMEOUT_MS", "1500");
+        assert_eq!(constellation_backend_timeout_ms(), 1_500);
+        std::env::remove_var("CONSTELLATION_BACKEND_TIMEOUT_MS");
+    }
+
+    #[test]
+    #[serial]
+    fn constellation_audit_log_path_has_sane_default() {
+        std::env::remove_var("CONSTELLATION_AUDIT_LOG_PATH");
+        assert_eq!(constellation_audit_log_path(), "constellation-audit.jsonl");
     }
 }

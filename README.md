@@ -466,6 +466,32 @@ This README is the front door; everything past "at a glance" lives in
 | [`docs/deploy/`](docs/deploy/) | Client enrollment/deploy guide and the personal-services (`terminus_personal`/`terminus_primary`) deployment guide. |
 | [`docs/tools/`](docs/tools/README.md) | The full tool index — all 53 modules grouped by domain, plus the **MINT** flagship harness. |
 | [`docs/house-style.md`](docs/house-style.md) | The Tier-A house-style rule catalog (deterministic `syn`-AST checks run in the test gate via `cargo test -p terminus-rs`) — secret-shaped env vars, non-empty tool descriptions, no `panic!` in `execute`, and the `// house-style-allow: <reason>` waiver convention. |
+| [`docs/constellation/`](docs/constellation/) | The Constellation control-plane GUI: the harmony-web adaptation plan (CONST-01) and the aggregation API layer (CONST-02) this crate hosts at `/api/*` for `constellation-web`. |
+
+## Constellation aggregation API (CONST-02)
+
+A compiled-in module (`crate::constellation`, `src/constellation/`) — merged into the same
+`axum::Router` `/mcp` and the inference-proxy routes use, **not** a broker worker (see
+[`docs/architecture/broker.md`](docs/architecture/broker.md)) — serving the `constellation-web`
+control-plane UI's backend surface at the same origin:
+
+- `GET/POST /api/auth/{me,login,logout}` — a session-cookie auth **seam** (CONST-03 wires up real
+  verification; see `src/constellation/auth.rs`'s module doc for exactly what is and isn't enforced
+  today).
+- `GET /api/health` — per-system reachability (`harmony`/`chord`/`lumina`/`terminus`).
+- `GET /api/terminus/config` — the compiled-in tool registry's module list + broker worker count.
+- `* /api/{harmony,chord,lumina}/*path` — namespaced backend proxies (`src/constellation/proxy.rs`):
+  the single door this crate forwards browser requests to those three backends through, degrading a
+  down/unconfigured backend to a structured `available:false` response rather than a `500` cascade.
+- `GET /ws` — scaffolded only (`501`); the full live-event WebSocket relay is a follow-up item.
+- The built `constellation-web` static bundle, served as a SPA fallback when
+  `CONSTELLATION_WEB_DIST_DIR` is configured.
+
+Every `/api/*` response is secret-masked before egress (`src/constellation/mask.rs` — the layer's
+load-bearing security property) and every mutating request is S6-sanitized and audit-logged
+(`src/constellation/audit.rs`). See
+[`docs/constellation/CONST-02-aggregation-api.md`](docs/constellation/CONST-02-aggregation-api.md)
+for the full endpoint contract, architecture notes, and new `.env.example` config keys.
 
 ## Atlas — knowledge-graph query tools
 

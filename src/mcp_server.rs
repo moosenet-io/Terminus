@@ -225,7 +225,14 @@ pub fn build_router(state: Arc<McpServerState>) -> Router {
         .route(INFER_PATH, post(handle_infer))
         .route(AGENT_EXECUTE_PATH, post(handle_agent_execute))
         .route(CODING_SELECT_PATH, post(handle_coding_select))
-        .with_state(state)
+        .with_state(state.clone())
+        // CONST-02: the constellation aggregation API layer -- `/api/*`,
+        // `/ws`, and (when configured) the built `constellation-web` static
+        // asset host. A compiled-in module merged into this router exactly
+        // like every route above, deliberately NOT a broker worker -- see
+        // `crate::constellation`'s module doc and
+        // `docs/architecture/broker.md` for why.
+        .merge(crate::constellation::constellation_router(state))
         // Request-level tracing (method/path/status/latency) via RUST_LOG —
         // useful for an admin-tools endpoint where knowing who called what,
         // when, matters operationally.
