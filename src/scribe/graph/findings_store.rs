@@ -208,6 +208,31 @@ impl FindingsStore {
     ) -> Result<RecordOutcome, ToolError> {
         let threshold = dedup_threshold();
 
+        // Atomicity: the dedup SELECT and the follow-up INSERT/UPDATE must be one
+        // unit — otherwise two concurrent records for the same bucket can BOTH
+        // miss the match and insert duplicate rows (a TOCTOU race). Run them in
+        // one transaction guarded by a transaction-scoped advisory lock keyed by
+        // the bucket, so same-bucket records serialize while different buckets
+        // still proceed in parallel. The xact lock auto-releases on commit/rollback.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ToolError::Database(format!("atlas findings store begin: {e}")))?;
+
+        let bucket = format!(
+            "{}|{}|{}|{}",
+            f.project_id,
+            f.scope_kind.as_str(),
+            f.scope_ref,
+            f.category
+        );
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(&bucket)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ToolError::Database(format!("atlas findings store bucket lock: {e}")))?;
+
         let matched_id = match &embedding {
             Some(candidate) => {
                 let existing: Vec<(Uuid, Option<pgvector::Vector>)> = sqlx::query_as(
@@ -217,7 +242,7 @@ impl FindingsStore {
                 .bind(f.scope_kind.as_str())
                 .bind(&f.scope_ref)
                 .bind(&f.category)
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *tx)
                 .await
                 .map_err(|e| {
                     ToolError::Database(format!("atlas findings store select bucket: {e}"))
@@ -237,7 +262,7 @@ impl FindingsStore {
                     .bind(&f.scope_ref)
                     .bind(&f.category)
                     .bind(&f.description)
-                    .fetch_optional(&self.pool)
+                    .fetch_optional(&mut *tx)
                     .await
                     .map_err(|e| {
                         ToolError::Database(format!("atlas findings store select exact: {e}"))
@@ -246,12 +271,12 @@ impl FindingsStore {
             }
         };
 
-        if let Some(id) = matched_id {
+        let outcome = if let Some(id) = matched_id {
             // Fetch current provenance to merge, then cap to the last N entries.
             let current: (JsonValue,) =
                 sqlx::query_as("SELECT provenance FROM kg_findings WHERE id = $1")
                     .bind(id)
-                    .fetch_one(&self.pool)
+                    .fetch_one(&mut *tx)
                     .await
                     .map_err(|e| {
                         ToolError::Database(format!(
@@ -264,32 +289,38 @@ impl FindingsStore {
             let (occurrences,): (i32,) = sqlx::query_as(BUMP_SQL)
                 .bind(id)
                 .bind(&merged)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *tx)
                 .await
                 .map_err(|e| ToolError::Database(format!("atlas findings store bump: {e}")))?;
 
-            return Ok(RecordOutcome::Recurred { id, occurrences });
-        }
+            RecordOutcome::Recurred { id, occurrences }
+        } else {
+            let id = Uuid::new_v4();
+            let vector = embedding.map(pgvector::Vector::from);
+            let provenance = merge_provenance(JsonValue::Array(Vec::new()), f.provenance);
 
-        let id = Uuid::new_v4();
-        let vector = embedding.map(pgvector::Vector::from);
-        let provenance = merge_provenance(JsonValue::Array(Vec::new()), f.provenance);
+            sqlx::query(INSERT_SQL)
+                .bind(id)
+                .bind(&f.project_id)
+                .bind(&f.category)
+                .bind(&f.severity)
+                .bind(f.scope_kind.as_str())
+                .bind(&f.scope_ref)
+                .bind(&f.description)
+                .bind(vector)
+                .bind(&provenance)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| ToolError::Database(format!("atlas findings store insert: {e}")))?;
 
-        sqlx::query(INSERT_SQL)
-            .bind(id)
-            .bind(&f.project_id)
-            .bind(&f.category)
-            .bind(&f.severity)
-            .bind(f.scope_kind.as_str())
-            .bind(&f.scope_ref)
-            .bind(&f.description)
-            .bind(vector)
-            .bind(&provenance)
-            .execute(&self.pool)
+            RecordOutcome::Created(id)
+        };
+
+        tx.commit()
             .await
-            .map_err(|e| ToolError::Database(format!("atlas findings store insert: {e}")))?;
+            .map_err(|e| ToolError::Database(format!("atlas findings store commit: {e}")))?;
 
-        Ok(RecordOutcome::Created(id))
+        Ok(outcome)
     }
 
     /// List findings for a project, optionally filtered by scope kind,
