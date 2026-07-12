@@ -715,7 +715,7 @@ GitHub/Gitea/Plane, applied to Postgres.
 **Status:** PGT-01 shipped the connection/identity foundation and the
 read-only `pg_identities` tool. PGT-02 adds the read surface (`pg_query` /
 `pg_list_tables` / `pg_describe_table`); PGT-04 adds `pg_ddl` (schema DDL).
-`pg_execute` (DML) and `pg_admin` (roles/GRANT/REVOKE) are other S115 items.
+`pg_execute` (DML) is present; `pg_admin` (roles/GRANT/REVOKE) is a later S115 item.
 
 ### Read tools (PGT-02)
 
@@ -781,6 +781,40 @@ registered on the tool registry here, but PGT-06 is the item that adds it to
 `crate::approval::GUARDED_BARE_NAMES` (and confirms audit sanitization)
 alongside `pg_execute`/`pg_admin` in one governance pass; see the note at the
 bottom of `src/pg/ddl.rs`.
+
+### `pg_execute` — parameterized DML (PGT-03)
+
+`pg_execute` runs exactly one bound-parameter `INSERT`/`UPDATE`/`DELETE`
+(optionally with `RETURNING`) against a connection identity — args
+`{ sql, params?, identity? }`. Anything that isn't a single DML statement is
+a clean `InvalidArgument` pointing at the right tool: a read (`SELECT`/
+`WITH`/`EXPLAIN`/`SHOW`) → `pg_query`; DDL (`CREATE`/`ALTER`/`DROP`/
+`TRUNCATE`/...) → `pg_ddl`; role/privilege statements (`GRANT`/`REVOKE`) →
+`pg_admin`; multi-statement input (an embedded `;`) is rejected outright.
+Values are always bound `params` (`$1`, `$2`, ...), never interpolated into
+`sql`.
+
+`pg_execute` defaults to the `writer` connection identity (not the
+suite-wide `readonly` default — DML needs a writer-tier DB role), and
+returns `{ affected, returning?, destructive, statement_class, identity }`.
+
+**Destructive-shape detection.** A `DELETE`/`UPDATE` with no `WHERE` clause
+mutates or removes an entire table's rows in one call — the response's
+`destructive: true` flag surfaces that shape (pure string/token check, no
+SQL parser) so the audit trail and any guarding logic can see it without
+re-parsing the SQL. The same detector (`crate::pg::execute::is_destructive_shape`,
+`pub` for reuse) also recognizes a bare `TRUNCATE`, even though
+`pg_execute`'s own statement-class gate rejects `TRUNCATE` outright as
+DDL-shaped (pointing the caller at `pg_ddl`) — the detector exists as one
+shared, reusable classifier for later `pg_*` items, not only for what
+`pg_execute` itself accepts.
+
+`pg_execute` is a mutating tool and per the "Governance" section below MUST
+be added to `crate::approval::GUARDED_BARE_NAMES` — that addition is PGT-06's
+centralized change (adding every mutating `pg_*` tool to the guarded set at
+once), not made by this item. Until PGT-06 lands, a reachable `pg_execute`
+runs DML ungated by the approval flow (the DB-role privilege boundary and
+the standard gateway audit trail still apply).
 
 ### Identity / connection model
 
