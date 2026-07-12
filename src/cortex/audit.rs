@@ -1,27 +1,22 @@
 //! URL validation for `cortex_audit` — the highest-risk tool in this module.
 //!
-//! `cortex_audit` clones an *external, operator-supplied* git repository URL.
-//! Live probing (see `super`'s module doc) showed this tool routes through the
-//! exact same SSH-exec-to-fleet-host mechanism as every other `cortex_*` tool
-//! — the actual `git clone` / graph-build / sandbox-cleanup happens in a
-//! remote script on the fleet host (192.168.0.X), not in this process. That
-//! means **this Rust port cannot itself guarantee the remote clone is
-//! sandboxed** — it never runs `git clone` locally, so there is no local
-//! temp-dir/cleanup logic to write or test here. See the module doc in
-//! `mod.rs` for the full transport/isolation analysis and the residual-risk
-//! statement.
+//! `cortex_audit` audits an *external, operator-supplied* public git repository
+//! URL. As of CXEG-01 the retired SSH-exec-to-fleet-host relay is gone; the
+//! tool is currently a stub whose Atlas-backed clone → `scribe_kg_build` →
+//! report backend is rebuilt in CXEG-11. This file's job is unchanged and
+//! remains valuable independent of that rebuild: strict, fail-closed
+//! validation of the `url` argument.
 //!
-//! What this file *does* provide is defense-in-depth on the one thing fully
-//! within this port's control: the `url` argument never reaches the remote
-//! shell command unless it passes strict validation. This is independent of,
-//! and in addition to, the existing single-quote escaping used for every
-//! other free-text field in this crate (see `shell_single_quote` in
-//! `mod.rs`) — even though that escaping already prevents shell breakout,
-//! `validate_repo_url` additionally rejects URL shapes that have no
-//! legitimate reason to be passed to "clone a public git repo", closing off
-//! SSRF-style redirection of the remote clone at internal/private network
-//! targets and non-http(s) schemes before the value is ever serialized into
-//! the command.
+//! `validate_repo_url` is the front-gate every `cortex_audit` call passes
+//! before the URL reaches any backend. It rejects URL shapes that have no
+//! legitimate reason to be passed to "clone a public git repo" — non-http(s)
+//! schemes, embedded credentials, shell metacharacters, and (crucially)
+//! loopback / private / link-local / metadata hosts in any of their common
+//! obfuscated encodings. That closes off SSRF-style redirection of a future
+//! clone step at internal/private network targets under the guise of a
+//! "public repo audit", regardless of what transport CXEG-11 lands on. The
+//! guard is deliberately backend-agnostic: it protects the input whether the
+//! clone eventually runs in-process on the terminus host or elsewhere.
 
 use crate::error::ToolError;
 
@@ -33,15 +28,14 @@ const MAX_URL_LEN: usize = 500;
 ///   HTTPS" assumption the tool's own description makes, or have no business
 ///   being clone targets for an "external public Git repository" audit tool).
 /// - No embedded userinfo (`user:pass@host`) — credential smuggling into a
-///   remote command has no legitimate use here.
-/// - No control characters, whitespace, or shell metacharacters — the value
-///   is later shell-quoted (see `shell_single_quote`), but a URL has no
-///   legitimate reason to contain any of these, so rejecting them outright
-///   is strictly safer than relying on quoting alone.
+///   downstream clone command has no legitimate use here.
+/// - No control characters, whitespace, or shell metacharacters — a URL has
+///   no legitimate reason to contain any of these, so rejecting them outright
+///   is strictly safer than relying on any downstream quoting alone.
 /// - Host must not resolve, textually, to a loopback/private/link-local
-///   address or `localhost` — the remote clone runs on a LAN-attached fleet
-///   host, so allowing it to be pointed at internal addresses under the
-///   guise of "public repo audit" would be an SSRF-shaped hole.
+///   address or `localhost` — a clone/audit backend has no business being
+///   pointed at internal addresses under the guise of "public repo audit",
+///   which would be an SSRF-shaped hole.
 /// - Length-capped like every other free-text field in this crate.
 pub fn validate_repo_url(url: &str) -> Result<(), ToolError> {
     if url.is_empty() {
@@ -112,11 +106,10 @@ pub fn validate_repo_url(url: &str) -> Result<(), ToolError> {
 }
 
 /// Textual check for loopback / private / link-local / metadata hosts. This
-/// is a defense-in-depth string check, not a DNS-resolving check (this crate
-/// never resolves the host itself — the remote fleet host does, as part of
-/// its own clone). It catches the obvious, common ways an operator or an
-/// attacker-controlled input could try to point the tool at internal
-/// infrastructure.
+/// is a defense-in-depth string check, not a DNS-resolving check (validation
+/// runs on the textual URL before any backend resolves or clones it). It
+/// catches the obvious, common ways an operator or an attacker-controlled
+/// input could try to point the tool at internal infrastructure.
 ///
 /// ## Fail-closed on ambiguous numeric hosts
 ///
