@@ -36,9 +36,10 @@
 # script.
 #
 # Env:
-#   TERMINUS_MCP_URL  MCP endpoint (default http://127.0.0.1:8310/mcp — the
-#                     local client daemon that mTLS-proxies to
-#                     terminus-primary).
+#   TERMINUS_MCP_URL  REQUIRED. The local MCP endpoint to call the tool over
+#                     (the loopback MCP daemon that proxies to terminus-primary).
+#                     Set it in the unit (see terminus-mirror-runner.service) —
+#                     no host/URL literal is baked into this script.
 #
 # Exit codes (fail-closed — a timer-driven oneshot must NOT report success
 # when a repo's mirror did not actually advance and needed to):
@@ -51,7 +52,8 @@
 #
 set -euo pipefail
 
-MCP_URL="${TERMINUS_MCP_URL:-http://127.0.0.1:8310/mcp}"
+# REQUIRED — no URL/host literal is baked in; the unit supplies it.
+MCP_URL="${TERMINUS_MCP_URL:?set TERMINUS_MCP_URL to the local MCP endpoint (see terminus-mirror-runner.service)}"
 
 python3 - "$MCP_URL" <<'PY'
 import json, sys, urllib.request

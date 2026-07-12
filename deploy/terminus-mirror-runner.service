@@ -19,7 +19,10 @@ Type=oneshot
 # reads TERMINUS_MIRROR_* and the git-public credential from that host's own runtime
 # env via the local MCP endpoint; this unit holds NO secrets of its own.
 ExecStart=<path-to-terminus-checkout>/deploy/terminus-mirror-runner.sh
-Environment=TERMINUS_MCP_URL=http://127.0.0.1:8310/mcp
+# REQUIRED — the local MCP endpoint the runner calls the tool over. Fill in the
+# actual loopback MCP daemon URL for this host (no literal is committed here);
+# e.g. Environment=TERMINUS_MCP_URL=<scheme>://<loopback-host>:<port>/mcp
+Environment=TERMINUS_MCP_URL=<local-mcp-endpoint-url>
 # A cold full-history backfill (first run for a newly mirror_ready repo, or a large
 # incremental catch-up) can take a while; give it real room. Routine runs (a handful
 # of new commits, already-established lineage) are fast.

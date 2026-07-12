@@ -50,10 +50,9 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::error::ToolError;
-use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
-use super::tools::{history_backfill, history_status, history_sync};
+use super::tools::{ensure_push_boundary, history_backfill, history_status, history_sync, PushBoundary};
 
 /// Environment variable holding the parking-lot root directory that contains
 /// one internal-`main` checkout per repo (`<root>/<repo>`), the SAME variable
@@ -155,6 +154,10 @@ impl MirrorRunReport {
 #[async_trait]
 pub trait HistoryOps: Send + Sync {
     async fn status(&self, repo: &str, cfg: &RunnerConfig) -> Result<Value, ToolError>;
+    /// Establish the going-forward push boundary BEFORE backfill advances the
+    /// local work-dir HEAD (MRUN-01 ff-detection fix — see
+    /// [`ensure_push_boundary`]).
+    async fn ensure_boundary(&self, repo: &str, cfg: &RunnerConfig) -> Result<PushBoundary, ToolError>;
     async fn backfill(&self, repo: &str, cfg: &RunnerConfig) -> Result<Value, ToolError>;
     async fn sync(&self, repo: &str, cfg: &RunnerConfig) -> Result<Value, ToolError>;
 }
@@ -171,6 +174,9 @@ fn parse_json(text: String) -> Result<Value, ToolError> {
 impl HistoryOps for RealHistoryOps {
     async fn status(&self, repo: &str, cfg: &RunnerConfig) -> Result<Value, ToolError> {
         parse_json(history_status(cfg.args(repo)).await?)
+    }
+    async fn ensure_boundary(&self, repo: &str, cfg: &RunnerConfig) -> Result<PushBoundary, ToolError> {
+        ensure_push_boundary(&cfg.args(repo))
     }
     async fn backfill(&self, repo: &str, cfg: &RunnerConfig) -> Result<Value, ToolError> {
         parse_json(history_backfill(cfg.args(repo)).await?)
@@ -221,6 +227,22 @@ pub async fn run_once_with(repo: &str, cfg: &RunnerConfig, ops: &dyn HistoryOps)
     let commits_behind = status.get("commits_behind").and_then(Value::as_u64);
     if commits_behind == Some(0) {
         return MirrorRunReport { repo: repo.to_string(), outcome: RunOutcome::UpToDate };
+    }
+
+    // 1b. Establish the push boundary BEFORE backfill (MRUN-01 ff-detection fix).
+    // Backfill (step 2) advances the local history work-dir HEAD; if the
+    // going-forward `pushed-head` marker isn't already set, git_public_history_sync
+    // would try to initialise it from the POST-backfill HEAD and spuriously see a
+    // non-fast-forward. Pinning the boundary to the pre-backfill baseline here keeps
+    // sync's ff-detection correct so a genuinely fast-forwardable repo actually gets
+    // pushed. Genuine divergence / un-bootstrapped remote → needs_operator_rebaseline,
+    // reported WITHOUT running backfill and WITHOUT ever forcing.
+    match ops.ensure_boundary(repo, cfg).await {
+        Ok(PushBoundary::Established) => {}
+        Ok(PushBoundary::NeedsOperator(reason)) => {
+            return MirrorRunReport::needs_rebaseline(repo, reason);
+        }
+        Err(e) => return MirrorRunReport::error(repo, &e),
     }
 
     // 2. Backfill (replay + full-history gate). NEVER pushes.
@@ -381,6 +403,7 @@ impl RustTool for GitPublicMirrorRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::ToolRegistry;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A stubbed [`HistoryOps`] whose three calls return pre-scripted results
@@ -390,9 +413,15 @@ mod tests {
     #[derive(Default)]
     struct StubOps {
         status: Option<Result<Value, ToolError>>,
+        /// `None` → the boundary is `Established` (the common ff-able case), so
+        /// existing tests that don't care about the boundary keep passing. Set to
+        /// `NeedsOperator`/`Err` to exercise the pre-backfill short-circuit.
+        boundary: Option<PushBoundary>,
+        boundary_err: Option<ToolError>,
         backfill: Option<Result<Value, ToolError>>,
         sync: Option<Result<Value, ToolError>>,
         status_calls: AtomicUsize,
+        boundary_calls: AtomicUsize,
         backfill_calls: AtomicUsize,
         sync_calls: AtomicUsize,
     }
@@ -420,6 +449,16 @@ mod tests {
         async fn status(&self, _repo: &str, _cfg: &RunnerConfig) -> Result<Value, ToolError> {
             self.status_calls.fetch_add(1, Ordering::SeqCst);
             clone_result(self.status.as_ref().expect("status stub not set"))
+        }
+        async fn ensure_boundary(&self, _repo: &str, _cfg: &RunnerConfig) -> Result<PushBoundary, ToolError> {
+            self.boundary_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(e) = &self.boundary_err {
+                return Err(ToolError::Execution(e.to_string()));
+            }
+            Ok(match &self.boundary {
+                Some(PushBoundary::NeedsOperator(m)) => PushBoundary::NeedsOperator(m.clone()),
+                _ => PushBoundary::Established,
+            })
         }
         async fn backfill(&self, _repo: &str, _cfg: &RunnerConfig) -> Result<Value, ToolError> {
             self.backfill_calls.fetch_add(1, Ordering::SeqCst);
@@ -525,6 +564,69 @@ mod tests {
         }
         assert_eq!(ops.backfill_calls.load(Ordering::SeqCst), 1);
         assert_eq!(ops.sync_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// MRUN-01 ff-detection fix (regression for the under-push bug): an
+    /// established-baseline repo that is BEHIND but genuinely fast-forwardable
+    /// (boundary `Established`, no divergence) must end up `pushed`, NOT
+    /// `needs_operator_rebaseline`. Before the fix, the runner's backfill
+    /// advanced local HEAD and sync's first-run boundary init spuriously saw a
+    /// non-ff; establishing the boundary pre-backfill keeps it ff-able.
+    #[tokio::test]
+    async fn established_baseline_behind_but_ff_able_pushes_not_needs_operator() {
+        let ops = StubOps {
+            status: Some(Ok(status_json(true, Some(2)))),
+            // The pre-backfill boundary check succeeds (remote at the blessed baseline).
+            boundary: Some(PushBoundary::Established),
+            backfill: Some(Ok(json!({
+                "repo": "demo",
+                "mode": "incremental",
+                "gate": {"clean": true, "commits_scanned": 2, "unique_trees": 2, "residual_count": 0, "violations": []},
+                "blessable": true,
+            }))),
+            sync: Some(Ok(json!({
+                "repo": "demo",
+                "pushed": true,
+                "new_commits": 2,
+                "old_head": "base000",
+                "work_head": "tip999",
+                "branch": "main",
+            }))),
+            ..Default::default()
+        };
+        let report = run_once_with("demo", &RunnerConfig::default(), &ops).await;
+        match report.outcome {
+            RunOutcome::Pushed { to, .. } => assert_eq!(to, "tip999"),
+            other => panic!("a fast-forwardable behind repo must push, got {other:?}"),
+        }
+        // The boundary was established (once) BEFORE backfill ran.
+        assert_eq!(ops.boundary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ops.backfill_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ops.sync_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A boundary check that reports genuine divergence short-circuits to
+    /// `needs_operator_rebaseline` BEFORE backfill or sync are ever called —
+    /// the runner never advances the work-dir toward a push it can't ff.
+    #[tokio::test]
+    async fn diverged_boundary_needs_operator_before_backfill_or_sync() {
+        let ops = StubOps {
+            status: Some(Ok(status_json(true, Some(1)))),
+            boundary: Some(PushBoundary::NeedsOperator(
+                "public mirror 'main' is at deadbeef, which is not an ancestor of the local \
+                 blessed baseline cafe0000 — the mirror has diverged"
+                    .into(),
+            )),
+            ..Default::default()
+        };
+        let report = run_once_with("demo", &RunnerConfig::default(), &ops).await;
+        match report.outcome {
+            RunOutcome::NeedsOperatorRebaseline { reason } => assert!(reason.contains("diverged")),
+            other => panic!("expected NeedsOperatorRebaseline, got {other:?}"),
+        }
+        assert_eq!(ops.boundary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ops.backfill_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ops.sync_calls.load(Ordering::SeqCst), 0);
     }
 
     /// Clean + divergent: `git_public_history_sync` itself refuses a
