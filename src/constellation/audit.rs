@@ -28,8 +28,6 @@ use std::io::Write;
 
 use crate::gateway_framework::audit::sanitize;
 
-const MAX_BODY_CHARS: usize = 1024;
-
 /// One line of the constellation aggregation layer's mutating-request audit
 /// log.
 #[derive(Debug, Clone, Serialize)]
@@ -49,57 +47,31 @@ pub struct ConstellationAuditEntry {
     /// unauthenticated request (e.g. a pre-auth `/api/auth/login` attempt).
     pub principal: Option<String>,
     /// S6-sanitized, truncated summary of the request body — secret-shaped
-    /// values redacted via [`sanitize`], and truncated to
-    /// [`MAX_BODY_CHARS`] chars + `...(truncated)` per S6's "file contents
-    /// > 1KB truncated" rule applied to a request body. `None` for an empty
-    /// body.
+    /// values redacted via [`sanitize`] (whole-body, before truncation), then
+    /// truncated to 200 chars + `...(truncated)`. `None` for an empty body.
     pub body_summary: Option<String>,
 }
 
-/// Sanitize `raw_body` (already UTF-8-lossy decoded by the caller) per S6:
-/// redact secret-shaped values via [`sanitize`], then hard-truncate to
-/// [`MAX_BODY_CHARS`] chars regardless of what `sanitize` itself already
-/// truncated to (that function's own 200-char cap is tuned for a short
-/// free-text detail string, not a JSON request body — this sink's own
-/// larger 1KB cap is what S6's "bodies >1KB truncated" rule actually
-/// specifies).
+/// Sanitize `raw_body` (already UTF-8-lossy decoded by the caller) per S6 by
+/// delegating WHOLLY to [`sanitize`]: it redacts secret-shaped values across
+/// the ENTIRE body first, then truncates the redacted result to 200 chars +
+/// `...(truncated)`.
+///
+/// This is deliberately a single, un-chunked `sanitize` call. An earlier
+/// version chunked the body into fixed 180-char slices before sanitizing each
+/// (to preserve up to ~1KB of body rather than `sanitize`'s 200-char cap), but
+/// that could split a secret-shaped `"key": "value"` pair across a chunk
+/// boundary so the redaction regex never matched it — leaking the secret into
+/// the audit log (agy review, CONST-02). Security wins over body-length
+/// fidelity here: redaction MUST see the whole body in one pass, and because
+/// `sanitize` redacts BEFORE it truncates, any content past 200 chars is
+/// dropped entirely (never shown), so no secret can survive either path. A
+/// 200-char redacted summary is sufficient for an audit trail.
 pub fn sanitize_body(raw_body: &str) -> Option<String> {
     if raw_body.trim().is_empty() {
         return None;
     }
-    let redacted = sanitize_preserving_length(raw_body);
-    let char_count = redacted.chars().count();
-    if char_count > MAX_BODY_CHARS {
-        let truncated: String = redacted.chars().take(MAX_BODY_CHARS).collect();
-        Some(format!("{truncated}...(truncated)"))
-    } else {
-        Some(redacted)
-    }
-}
-
-/// [`sanitize`] itself truncates at 200 chars, which would make a large
-/// sanitized JSON body report as truncated far earlier than S6's 1KB rule
-/// intends. Redact secret shapes WITHOUT importing `sanitize`'s own
-/// truncation: since `sanitize`'s redaction pass and truncation pass are
-/// combined in one function, and its regexes are private to that module,
-/// re-run `sanitize` in chunks small enough that its 200-char cap never
-/// fires within a chunk (secret tokens are never longer than ~200 chars in
-/// practice), then rejoin — a pragmatic way to reuse the exact redaction
-/// regexes without duplicating them, while applying THIS sink's own 1KB
-/// truncation policy afterward.
-fn sanitize_preserving_length(raw: &str) -> String {
-    const CHUNK_CHARS: usize = 180;
-    let chars: Vec<char> = raw.chars().collect();
-    let mut out = String::new();
-    for chunk in chars.chunks(CHUNK_CHARS) {
-        let piece: String = chunk.iter().collect();
-        let sanitized = sanitize(&piece);
-        // `sanitize` appends "...(truncated)" only when ITS OWN 200-char cap
-        // is exceeded, which a `CHUNK_CHARS`-sized chunk never does — so
-        // `sanitized` here is always the redacted chunk verbatim.
-        out.push_str(&sanitized);
-    }
-    out
+    Some(sanitize(raw_body))
 }
 
 /// Record one mutating `/api/*` request. `raw_body` is the request's raw
@@ -222,7 +194,8 @@ mod tests {
         let raw = format!(r#"{{"data": "{}"}}"#, "x".repeat(2000));
         let summary = sanitize_body(&raw).unwrap();
         assert!(summary.ends_with("...(truncated)"));
-        assert!(summary.chars().count() <= MAX_BODY_CHARS + "...(truncated)".len());
+        // sanitize() caps at 200 redacted chars + the suffix.
+        assert!(summary.chars().count() <= 200 + "...(truncated)".len());
     }
 
     #[test]
@@ -257,11 +230,25 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_body_redacts_secret_past_old_chunk_boundary() {
+        // Regression (agy CONST-02 review): the old 180-char chunking could
+        // split a secret-shaped pair across a boundary so the redaction regex
+        // missed it. Size the padding so the api_key VALUE straddles char ~180
+        // (the old chunk boundary) yet stays inside sanitize's 200-char window —
+        // so this asserts REDACTION across the boundary, not mere truncation.
+        let padding = "a".repeat(140);
+        let secret = "<REDACTED-SECRET>";
+        let raw = format!(r#"{{"pad":"{padding}","api_key":"{secret}"}}"#);
+        let summary = sanitize_body(&raw).unwrap();
+        assert!(!summary.contains(secret), "secret leaked into audit summary: {summary}");
+    }
+
+    #[test]
     fn humantime_rfc3339_renders_known_epoch() {
-        // 2026-07-12T00:00:00Z, a fixed known instant, sanity-checks the
+        // 2026-07-16T00:00:00Z, a fixed known instant, sanity-checks the
         // hand-rolled civil-calendar renderer against a value that's easy
         // to verify by hand.
-        let unix_secs = 1_784_246_400_u64; // 2026-07-12T20:00:00Z-ish window
+        let unix_secs = 1_784_246_400_u64; // 2026-07-16T00:00:00Z
         let rendered = humantime_rfc3339(unix_secs);
         assert!(rendered.starts_with("2026-"));
         assert!(rendered.ends_with('Z'));
