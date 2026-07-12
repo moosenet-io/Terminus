@@ -233,7 +233,19 @@ mod tests {
     ) -> tokio::task::JoinHandle<()> {
         let (server_cert_pem, server_key_pem) =
             issue_server_cert(ca, server_identity).expect("issue worker server cert");
-        let server_config = build_server_config(ca.cert_pem(), &server_cert_pem, &server_key_pem)
+        spawn_tls_worker_with_cert(path, ca.cert_pem(), &server_cert_pem, &server_key_pem)
+    }
+
+    /// Spawn a TLS-over-UDS worker with an explicitly-supplied server cert +
+    /// key (used by the CN-isolation negative test, which needs a cert whose
+    /// SAN and Subject CN deliberately differ).
+    fn spawn_tls_worker_with_cert(
+        path: PathBuf,
+        ca_cert_pem: &str,
+        server_cert_pem: &str,
+        server_key_pem: &str,
+    ) -> tokio::task::JoinHandle<()> {
+        let server_config = build_server_config(ca_cert_pem, server_cert_pem, server_key_pem)
             .expect("build worker TLS server config");
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
 
@@ -277,6 +289,39 @@ mod tests {
         unsafe { libc::getuid() }
     }
 
+    /// Issue a CA-signed server leaf whose Subject CN and SAN dNSName
+    /// DELIBERATELY DIFFER: `san` (what rustls checks against the SNI at
+    /// handshake time) versus `cn` (what THIS module's own
+    /// [`extract_cn_only`] identity check reads). Carries the serverAuth EKU
+    /// and a wide validity window so rustls's handshake-time chain +
+    /// hostname validation passes cleanly, leaving the Subject-CN comparison
+    /// as the ONLY thing that can reject the connection — so a test using
+    /// this fixture fails if the CN check were removed.
+    fn issue_split_san_cn_server_cert(
+        ca: &CertificateAuthority,
+        cn: &str,
+        san: &str,
+    ) -> (String, String) {
+        use rcgen::{
+            CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose, SanType,
+        };
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
+        params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2035, 1, 1);
+        params.distinguished_name.push(DnType::CommonName, cn);
+        params.subject_alt_names = vec![SanType::DnsName(
+            san.to_string().try_into().expect("valid SAN dNSName"),
+        )];
+        params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+        params.key_usages.push(KeyUsagePurpose::KeyEncipherment);
+        params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ServerAuth);
+        let key_pair = KeyPair::generate().expect("keypair");
+        let cert = params.signed_by(&key_pair, ca.issuer()).expect("sign leaf");
+        (cert.pem(), key_pair.serialize_pem())
+    }
+
     #[tokio::test]
     #[serial]
     async fn matching_peercred_and_cn_completes_handshake_and_round_trips() {
@@ -308,19 +353,38 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock_path = dir.path().join("worker-t2-badcn.sock");
         let ca = CertificateAuthority::generate().expect("generate CA");
-        // Worker's cert CN is "worker-a", but the transport is configured to
-        // expect "worker-b" -- CN disagrees with configured identity.
-        let worker = spawn_tls_worker(sock_path.clone(), &ca, "worker-a");
+
+        // Isolate the Subject-CN check: the worker presents a cert whose SAN
+        // dNSName is "worker-a" (so rustls's handshake-time SNI/hostname
+        // validation, driven by the transport's `expected_identity` SNI,
+        // SUCCEEDS) but whose Subject CN is "impostor-cn". The peercred uid
+        // also matches (current process uid). So EVERYTHING except this
+        // module's explicit CN-agreement check passes -- if that check were
+        // deleted, this call would succeed. It must instead fail closed.
+        let (server_cert_pem, server_key_pem) =
+            issue_split_san_cn_server_cert(&ca, "impostor-cn", "worker-a");
+        let worker = spawn_tls_worker_with_cert(
+            sock_path.clone(),
+            ca.cert_pem(),
+            &server_cert_pem,
+            &server_key_pem,
+        );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
-        let transport = UdsMtlsTransport::new(sock_path, current_uid(), "worker-b", &ca, "test-broker")
+        let transport = UdsMtlsTransport::new(sock_path, current_uid(), "worker-a", &ca, "test-broker")
             .expect("transport should build");
 
         let err = transport
             .call("echo", serde_json::json!({}))
             .await
-            .expect_err("CN disagreeing with configured identity must fail closed");
-        assert!(matches!(err, ToolError::Execution(_)));
+            .expect_err("CN disagreeing with configured identity must fail closed even when the handshake itself succeeds");
+        // Assert it's specifically an identity mismatch surfaced by the CN
+        // check -- not a handshake/transport failure (which would mean the
+        // test isn't actually exercising the CN comparison).
+        assert!(
+            matches!(&err, ToolError::Execution(msg) if msg.contains("identity mismatch") && msg.contains("impostor-cn")),
+            "expected a CN-agreement identity mismatch, got: {err:?}"
+        );
         assert!(!transport.health().await);
 
         worker.abort();

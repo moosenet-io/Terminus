@@ -183,7 +183,45 @@ mod tests {
     ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
         let (server_cert_pem, server_key_pem) =
             issue_server_cert(ca, server_identity).expect("issue worker server cert");
-        let server_config = build_server_config(ca.cert_pem(), &server_cert_pem, &server_key_pem)
+        spawn_tls_worker_with_cert(ca.cert_pem(), &server_cert_pem, &server_key_pem).await
+    }
+
+    /// Issue a CA-signed server leaf whose Subject CN and SAN dNSName
+    /// DELIBERATELY DIFFER (see the identical helper in `super::uds_mtls`'s
+    /// tests for the rationale): `san` drives rustls's handshake-time
+    /// SNI/hostname validation; `cn` is what this module's own CN-agreement
+    /// check reads.
+    fn issue_split_san_cn_server_cert(
+        ca: &CertificateAuthority,
+        cn: &str,
+        san: &str,
+    ) -> (String, String) {
+        use rcgen::{
+            CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose, SanType,
+        };
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
+        params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2035, 1, 1);
+        params.distinguished_name.push(DnType::CommonName, cn);
+        params.subject_alt_names = vec![SanType::DnsName(
+            san.to_string().try_into().expect("valid SAN dNSName"),
+        )];
+        params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+        params.key_usages.push(KeyUsagePurpose::KeyEncipherment);
+        params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ServerAuth);
+        let key_pair = KeyPair::generate().expect("keypair");
+        let cert = params.signed_by(&key_pair, ca.issuer()).expect("sign leaf");
+        (cert.pem(), key_pair.serialize_pem())
+    }
+
+    async fn spawn_tls_worker_with_cert(
+        ca_cert_pem: &str,
+        server_cert_pem: &str,
+        server_key_pem: &str,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let server_config = build_server_config(ca_cert_pem, server_cert_pem, server_key_pem)
             .expect("build worker TLS server config");
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
 
@@ -254,17 +292,30 @@ mod tests {
     #[serial]
     async fn cn_disagreeing_with_configured_identity_fails_closed() {
         let ca = CertificateAuthority::generate().expect("generate CA");
-        let (addr, worker) = spawn_tls_worker(&ca, "worker-off-box").await;
+
+        // Isolate the Subject-CN check (see the uds_mtls analogue): the
+        // worker's cert SAN is "worker-off-box" (so the transport's SNI of
+        // the same value passes rustls's handshake-time hostname validation)
+        // but its Subject CN is "impostor-cn". With no peercred signal at
+        // this tier, the CN comparison is the ONLY remaining gate -- if it
+        // were removed, this call would succeed. It must fail closed.
+        let (server_cert_pem, server_key_pem) =
+            issue_split_san_cn_server_cert(&ca, "impostor-cn", "worker-off-box");
+        let (addr, worker) =
+            spawn_tls_worker_with_cert(ca.cert_pem(), &server_cert_pem, &server_key_pem).await;
 
         let transport =
-            MtlsTcpTransport::new(addr.ip().to_string(), addr.port(), "worker-someone-else", &ca, "test-broker")
+            MtlsTcpTransport::new(addr.ip().to_string(), addr.port(), "worker-off-box", &ca, "test-broker")
                 .expect("transport should build");
 
         let err = transport
             .call("echo", serde_json::json!({}))
             .await
-            .expect_err("CN disagreeing with configured identity must fail closed");
-        assert!(matches!(err, ToolError::Execution(_)));
+            .expect_err("CN disagreeing with configured identity must fail closed even when the handshake itself succeeds");
+        assert!(
+            matches!(&err, ToolError::Execution(msg) if msg.contains("identity mismatch") && msg.contains("impostor-cn")),
+            "expected a CN-agreement identity mismatch, got: {err:?}"
+        );
         assert!(!transport.health().await);
 
         worker.abort();

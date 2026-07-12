@@ -375,9 +375,14 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(4096);
         let server_task = tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-            let mut reader = BufReader::new(&mut server);
             let mut line = String::new();
-            reader.read_line(&mut line).await.unwrap();
+            // Scope the reader's `&mut server` borrow so it's explicitly
+            // dropped before the write below (NLL already ends it at the
+            // last read, but scoping makes the borrow lifetime unambiguous).
+            {
+                let mut reader = BufReader::new(&mut server);
+                reader.read_line(&mut line).await.unwrap();
+            }
             let req: Value = serde_json::from_str(line.trim_end()).unwrap();
             assert_eq!(req["op"], "call");
             assert_eq!(req["name"], "echo");
@@ -396,9 +401,11 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(4096);
         let server_task = tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-            let mut reader = BufReader::new(&mut server);
             let mut line = String::new();
-            reader.read_line(&mut line).await.unwrap();
+            {
+                let mut reader = BufReader::new(&mut server);
+                reader.read_line(&mut line).await.unwrap();
+            }
             let resp = serde_json::json!({"ok": false, "error": "boom"});
             server.write_all(format!("{resp}\n").as_bytes()).await.unwrap();
         });
@@ -413,9 +420,11 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(4096);
         let server_task = tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-            let mut reader = BufReader::new(&mut server);
             let mut line = String::new();
-            reader.read_line(&mut line).await.unwrap();
+            {
+                let mut reader = BufReader::new(&mut server);
+                reader.read_line(&mut line).await.unwrap();
+            }
             let resp = serde_json::json!({"ok": true, "tools": ["a", "b"]});
             server.write_all(format!("{resp}\n").as_bytes()).await.unwrap();
         });
