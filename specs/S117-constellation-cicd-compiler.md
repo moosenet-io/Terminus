@@ -160,6 +160,69 @@ fleet-wide.
   - [ ] `SCCACHE_REDIS` is confirmed, reachable from both build hosts, and materialized from the vault
   - [ ] No Redis endpoint literal committed to any tracked file
 
+### BLD-20: Provision Redis into terminus-primary — shared fleet backend
+- **Priority:** Critical
+- **Labels:** terminus, redis, infra, cicd
+- **Agent:** claude
+- **Estimate:** 5h
+- **Description:** There is no fleet Redis today (the prefix-registry overlay is unconfigured for
+  exactly this reason, and sccache/queue need a shared backend). Stand up a Redis owned by
+  terminus-primary and wire it as the shared backend for MULTIPLE use cases: sccache shared cache
+  (BLD-05), the compiler queue/scheduler state (BLD-06), the prefix-registry overlay (finally
+  durable, cross-instance), and — especially — **rate-limiting + request queuing on the proxy
+  surfaces** (Chord + terminus). One managed instance, many consumers.
+
+  ## FILES
+  - `deploy/redis/redis.service` + `deploy/redis/redis.conf` (new, Terminus) — a Redis instance
+    co-located with terminus-primary on the heavy host: bind loopback + the mesh interface only,
+    `requirepass` from the vault, appendonly for the queue/overlay durability, maxmemory + an
+    eviction policy that protects the durable keyspaces (queue/overlay) from the volatile ones
+    (rate-limit counters, sccache index) via key prefixes / logical DBs.
+  - `src/redis/mod.rs` (new) — a shared Redis client (pooled) + typed namespaces (`sccache:*`,
+    `queue:*`, `prefix:*`, `ratelimit:*`), endpoint from `REDIS_URL` via SecretManager.
+  - `src/ratelimit/mod.rs` (new) — token-bucket / sliding-window rate-limiter + a request queue for
+    the proxy surfaces, backed by Redis (atomic Lua for correctness under concurrency).
+  - `src/plane/prefix.rs` — point the prefix-registry overlay at this Redis (durable cross-instance).
+  - `deploy/redis/install.sh` — provision the instance (idempotent).
+  - `README.md` — the Redis backend + the namespaces + the rate-limit/queue surface.
+
+  ## APPROACH
+  1. Provision Redis co-located with terminus-primary (the heavy host that runs the proxy/tool
+     gateway): loopback + mesh bind, `requirepass` from the vault, appendonly on, `maxmemory` +
+     `noeviction` for durable DBs / `allkeys-lru` for the volatile cache DB (separate logical DBs).
+  2. Add the pooled Redis client + typed namespaces; expose `REDIS_URL` (SecretManager, never a
+     literal) to terminus-primary + the build hosts (for sccache).
+  3. Rate-limiting + queuing on the proxy surfaces: a Redis-backed token-bucket/sliding-window
+     limiter (atomic Lua) + a fair request queue, replacing any in-memory limiter — so limits hold
+     across restarts and (if ever) multiple gateway instances.
+  4. Wire the prefix-registry overlay to this Redis (fixes the "no overlay configured / not
+     persisted" gap so `plane_prefix_register` becomes durable cross-instance).
+  5. Secrets via SecretManager; bind private; no endpoint/password literals in any tracked file (S1/S7).
+
+  ## TEST PLAN
+  - Redis comes up bound to loopback/mesh only, auth required (a no-auth connect is refused).
+  - The pooled client round-trips each namespace; separate logical DBs isolate durable vs volatile.
+  - Rate-limiter: N concurrent requests over the limit are throttled/queued correctly (atomic Lua —
+    no oversubscription under concurrency); limits survive a gateway restart.
+  - Prefix overlay: `plane_prefix_register` now persists in Redis (cross-instance visible).
+  - sccache points at this Redis and shows cache hits (BLD-05 integration).
+  - Verify no hardcoded endpoints/passwords; secrets via SecretManager; Redis not exposed publicly.
+
+  ## EDGE CASES
+  - Redis down → the rate-limiter fails CLOSED for the proxy (protect the backends) but sccache fails
+    OPEN to a local dir (never block a build); the queue persists to its fallback (intake DB).
+  - maxmemory eviction must never evict durable queue/overlay keys → separate DB + `noeviction` there.
+  - Auth/bind misconfig exposing Redis → the install script asserts loopback/mesh-only + auth before enabling.
+
+- **Acceptance criteria:**
+  - [ ] A Redis owned by terminus-primary is provisioned (private bind + vault auth + appendonly), consumed by sccache, the compiler queue, the prefix overlay, and the proxy rate-limiter
+  - [ ] Redis-backed rate-limiting/queuing on the proxy surfaces is atomic under concurrency and survives restart
+  - [ ] The prefix-registry overlay is now durable cross-instance via this Redis
+  - [ ] Redis-down degrades safely (rate-limiter fail-closed for the proxy; sccache fail-open; queue falls back)
+  - [ ] README documents the Redis backend, namespaces, and rate-limit/queue surface (README updated)
+  - [ ] No hardcoded endpoints/passwords; secrets via SecretManager; Redis never publicly bound
+  - [ ] All existing tests still pass
+
 ---
 
 ## Phase 1 — The compiler tool (Terminus)
