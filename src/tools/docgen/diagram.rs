@@ -367,6 +367,20 @@ pub fn validate_mermaid_flowchart(source: &str) -> Result<(), String> {
             "unbalanced subgraph/end: {subgraph_count} subgraph(s) vs {end_count} end(s)"
         ));
     }
+    // A labeled dotted arrow (`-. "text" .->`) requires a space + quoted
+    // label between the two dots -- `-.text.->` (glued, unquoted) is
+    // invalid mermaid grammar and fails to render the WHOLE diagram on
+    // Gitea/GitHub, even though it passes every check above (found in
+    // review, DOCGEN-22).
+    static MALFORMED_DOTTED_LABEL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = MALFORMED_DOTTED_LABEL
+        .get_or_init(|| regex::Regex::new(r"-\.[A-Za-z0-9_]+\.-{1,2}>").expect("static regex is valid"));
+    if let Some(m) = re.find(trimmed) {
+        return Err(format!(
+            "malformed labeled dotted arrow {:?} -- use `-. \"label\" .->` (space + quoted label), not a glued/unquoted form",
+            m.as_str()
+        ));
+    }
     Ok(())
 }
 
@@ -817,6 +831,32 @@ mod tests {
         let src = mermaid("flowchart TD\n    subgraph core[\"Core\"]\n        A --> B\n");
         let err = mermaid_fence(&src).unwrap_err();
         assert!(err.contains("unbalanced"), "unexpected error: {err}");
+    }
+
+    /// Review finding (DOCGEN-22): a glued/unquoted labeled dotted arrow
+    /// (`-.text.->`) passes every other structural check here but is
+    /// invalid mermaid grammar and fails to render on Gitea/GitHub. Must be
+    /// rejected so this exact class of bug can't silently ship again.
+    #[test]
+    fn malformed_glued_dotted_arrow_label_is_rejected() {
+        let src = mermaid("flowchart LR\n    A -.optional.-> B\n");
+        let err = mermaid_fence(&src).unwrap_err();
+        assert!(err.contains("malformed labeled dotted arrow"), "unexpected error: {err}");
+    }
+
+    /// The correctly-spaced, quoted form is valid and must NOT be rejected.
+    #[test]
+    fn correctly_formed_dotted_arrow_label_is_accepted() {
+        let src = mermaid("flowchart LR\n    A -. \"optional\" .-> B\n");
+        assert!(mermaid_fence(&src).is_ok());
+    }
+
+    /// A plain (unlabeled) dotted arrow is valid mermaid and must not be
+    /// flagged by the labeled-arrow check.
+    #[test]
+    fn unlabeled_dotted_arrow_is_accepted() {
+        let src = mermaid("flowchart LR\n    A -.-> B\n");
+        assert!(mermaid_fence(&src).is_ok());
     }
 
     #[test]

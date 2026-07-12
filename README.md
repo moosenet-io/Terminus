@@ -66,7 +66,7 @@ flowchart LR
         Upstream["Federated Terminus-shaped<br/>MCP servers"]
     end
 
-    Personal -.optional.-> MeshGroup
+    Personal -. "optional" .-> MeshGroup
 
     Chord["Chord<br/>(inference proxy)"]
 ```
