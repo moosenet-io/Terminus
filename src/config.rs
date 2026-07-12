@@ -1164,6 +1164,58 @@ pub fn constellation_audit_log_path() -> String {
         .unwrap_or_else(|| "constellation-audit.jsonl".to_string())
 }
 
+// ── CONST-03: constellation control-plane auth ─────────────────────────────
+//
+// The session token itself is signed with `TERMINUS_JWT_SIGNING_KEY` (the
+// SAME signing key `crate::pki::enroll`'s TCLI-02 enrollment JWT uses —
+// `crate::pki::enroll::mint_jwt_with_ttl`/`verify_jwt`) and the operator
+// credential compared at login is `CONSTELLATION_OPERATOR_SECRET` — both are
+// secret-shaped, so per this crate's convention (see this file's "CONST-02"
+// section doc above, and `crate::pki`'s module doc: no separate
+// `SecretManager`/`vault::manager()` API here) they are read directly via
+// `std::env::var`/`env_nonempty` at the point of use in
+// `crate::constellation::auth` and `crate::pki::enroll`, never resolved by a
+// `crate::config` helper — this file only resolves the NON-secret knobs
+// below (TTL, a boolean flag).
+
+/// Operator shared secret compared (constant-time) against the submitted
+/// login password. From `CONSTELLATION_OPERATOR_SECRET`. `None` when unset
+/// — callers MUST fail-closed (reject every login attempt) in that case,
+/// never fall back to a default-allow. Deliberately returns the secret
+/// value itself (unlike every other helper in this section) because this
+/// crate has no separate secret-store API to route it through instead — see
+/// this section's doc comment; `crate::constellation::auth` is the only
+/// caller and never logs the returned value.
+pub fn constellation_operator_secret() -> Option<String> {
+    env_nonempty("CONSTELLATION_OPERATOR_SECRET")
+}
+
+/// Constellation session token TTL, in seconds. Independent of
+/// `TERMINUS_ENROLLMENT_JWT_TTL_SECONDS` (a different credential with a
+/// different lifecycle: an operator's browser session vs. a paired
+/// cert+JWT enrollment) — deliberately its own knob rather than reusing the
+/// enrollment TTL. From `CONSTELLATION_SESSION_TTL_SECONDS`; defaults to
+/// 3600s (1 hour), long enough for a normal operator session without being
+/// a durable credential.
+pub fn constellation_session_ttl_seconds() -> i64 {
+    env_nonempty("CONSTELLATION_SESSION_TTL_SECONDS")
+        .and_then(|v| v.parse().ok())
+        .filter(|s: &i64| *s > 0)
+        .unwrap_or(3600)
+}
+
+/// Whether the session cookie should carry the `Secure` attribute (only
+/// sent over HTTPS). From `CONSTELLATION_COOKIE_SECURE` (`"true"`/`"1"` ⇒
+/// true); defaults to `false` — a LAN-served dev/operator UI may run over
+/// plain HTTP, matching this layer's existing default posture (see
+/// `crate::constellation::auth`'s cookie-header doc). An operator serving
+/// this behind TLS should set this to `true`.
+pub fn constellation_cookie_secure() -> bool {
+    env_nonempty("CONSTELLATION_COOKIE_SECURE")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1"))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1868,5 +1920,35 @@ mod tests {
     fn constellation_audit_log_path_has_sane_default() {
         std::env::remove_var("CONSTELLATION_AUDIT_LOG_PATH");
         assert_eq!(constellation_audit_log_path(), "constellation-audit.jsonl");
+    }
+
+    #[test]
+    #[serial]
+    fn constellation_operator_secret_unset_is_none() {
+        std::env::remove_var("CONSTELLATION_OPERATOR_SECRET");
+        assert_eq!(constellation_operator_secret(), None);
+        std::env::set_var("CONSTELLATION_OPERATOR_SECRET", "op-secret"); // pii-test-fixture
+        assert_eq!(constellation_operator_secret(), Some("op-secret".to_string()));
+        std::env::remove_var("CONSTELLATION_OPERATOR_SECRET");
+    }
+
+    #[test]
+    #[serial]
+    fn constellation_session_ttl_seconds_default_and_override() {
+        std::env::remove_var("CONSTELLATION_SESSION_TTL_SECONDS");
+        assert_eq!(constellation_session_ttl_seconds(), 3_600);
+        std::env::set_var("CONSTELLATION_SESSION_TTL_SECONDS", "60");
+        assert_eq!(constellation_session_ttl_seconds(), 60);
+        std::env::remove_var("CONSTELLATION_SESSION_TTL_SECONDS");
+    }
+
+    #[test]
+    #[serial]
+    fn constellation_cookie_secure_defaults_false() {
+        std::env::remove_var("CONSTELLATION_COOKIE_SECURE");
+        assert!(!constellation_cookie_secure());
+        std::env::set_var("CONSTELLATION_COOKIE_SECURE", "true");
+        assert!(constellation_cookie_secure());
+        std::env::remove_var("CONSTELLATION_COOKIE_SECURE");
     }
 }

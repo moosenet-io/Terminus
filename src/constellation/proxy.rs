@@ -181,15 +181,18 @@ async fn proxy(
     }
 }
 
-/// `principal` extraction seam: the CONST-02 auth guard (see
-/// `crate::constellation::auth`) inserts a resolved session identity into
-/// request extensions when present; proxy handlers read it (if any) purely
-/// for audit attribution — access control enforcement itself is CONST-03's
-/// scope, not this module's.
+/// `principal` extraction: reads the caller's VERIFIED session identity
+/// (CONST-03 — `crate::constellation::auth::principal_from_cookie` verifies
+/// the cookie's JWT signature + expiry, not just the cookie's raw value) for
+/// audit attribution. Access control enforcement itself is
+/// `crate::constellation::auth::require_session`'s job (layered as `axum`
+/// middleware over these routes in `crate::constellation::mod`'s
+/// `protected_router`) — by the time a proxy handler runs at all, the guard
+/// has already confirmed a valid session exists, so this call always
+/// resolves to `Some` in practice for these routes; it stays a plain
+/// best-effort lookup rather than re-deriving that guarantee, since a
+/// second, possibly-divergent verification here would add nothing.
 fn principal_from_headers(headers: &HeaderMap) -> Option<String> {
-    // CONST-03: replace this cookie-name sniff with the real verified
-    // session/JWT principal once the auth seam is implemented. For now this
-    // is a best-effort audit label only — see `crate::constellation::auth`.
     crate::constellation::auth::principal_from_cookie(headers)
 }
 

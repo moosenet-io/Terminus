@@ -42,9 +42,10 @@ pub struct ConstellationAuditEntry {
     pub method: String,
     /// The request path, e.g. `/api/harmony/engine/stop`.
     pub path: String,
-    /// The resolved caller identity, when the CONST-03 auth seam has one
-    /// (see `crate::constellation::mod`'s `SessionSeam`). `None` for an
-    /// unauthenticated request (e.g. a pre-auth `/api/auth/login` attempt).
+    /// The resolved, JWT-VERIFIED caller identity, when the request carried
+    /// one (CONST-03 — see `crate::constellation::auth::SessionSeam`).
+    /// `None` for an unauthenticated request (e.g. a pre-auth
+    /// `/api/auth/login` attempt, or a login failure).
     pub principal: Option<String>,
     /// S6-sanitized, truncated summary of the request body — secret-shaped
     /// values redacted via [`sanitize`] (whole-body, before truncation), then
