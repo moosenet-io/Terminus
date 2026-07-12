@@ -22,10 +22,11 @@ use uuid::Uuid;
 
 use crate::error::ToolError;
 
-/// Embedding dimension for `kg_findings.embedding` (`vector(768)`), matching
-/// the default embeddings model used elsewhere in Atlas (see
+/// Embedding dimension for `kg_findings.embedding` (`vector(1024)`), matching
+/// the default embeddings model used elsewhere in Atlas (EMBED-02:
+/// Qwen3-Embedding via Chord's `/v1/embeddings` proxy — see
 /// `vec_store::KG_EMBED_DIM`).
-pub const FINDINGS_EMBED_DIM: usize = 768;
+pub const FINDINGS_EMBED_DIM: usize = 1024;
 
 /// Default cosine-similarity threshold at/above which a new finding is
 /// treated as a recurrence of an existing one in the same bucket, rather
@@ -140,7 +141,7 @@ const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS kg_findings ( \
     scope_kind text NOT NULL CHECK (scope_kind IN ('node','path','community','global')), \
     scope_ref text NOT NULL, \
     description text NOT NULL, \
-    embedding vector(768), \
+    embedding vector(1024), \
     provenance jsonb NOT NULL DEFAULT '[]'::jsonb, \
     first_seen timestamptz NOT NULL DEFAULT now(), \
     last_seen timestamptz NOT NULL DEFAULT now(), \
@@ -487,6 +488,19 @@ async fn migrate_locked(conn: &mut sqlx::PgConnection) -> Result<(), ToolError> 
         .await
         .map_err(|e| ToolError::Database(format!("create vector extension: {e}")))?;
 
+    // EMBED-02: an existing `kg_findings` table from before the 768 -> 1024
+    // dim change (Qwen3-Embedding via Chord's `/v1/embeddings` proxy) has
+    // `embedding` values that are invalid against the new model — unlike
+    // `vec_store::AtlasVecStore`'s single-purpose table, `kg_findings` carries
+    // durable non-embedding data (description, provenance, occurrences) that
+    // must survive the migration, so this drops+recreates just the nullable
+    // `embedding` column (existing rows keep everything else, embedding reset
+    // to NULL) rather than the whole table. Ops re-runs the KG build
+    // separately to repopulate embeddings at the new dimension; dedup by
+    // exact-text match (the `embedding = None` path in `record`) still works
+    // in the meantime.
+    drop_embedding_column_if_dim_mismatch(conn, FINDINGS_EMBED_DIM as i32).await?;
+
     sqlx::query(CREATE_TABLE_SQL)
         .execute(&mut *conn)
         .await
@@ -510,6 +524,53 @@ async fn migrate_locked(conn: &mut sqlx::PgConnection) -> Result<(), ToolError> 
     Ok(())
 }
 
+/// EMBED-02: idempotent dim-migration step for `kg_findings.embedding`. If
+/// the table already exists with an `embedding` column whose pgvector
+/// dimension (`pg_attribute.atttypmod`, which pgvector stores as the raw
+/// dimension, not offset) doesn't match `expected_dim`, the column is dropped
+/// and re-added (nullable, no default — same shape as the original) so the
+/// `CREATE TABLE IF NOT EXISTS` that follows is a no-op and the column ends
+/// up at the new dimension. A no-op when the table doesn't exist yet
+/// (`to_regclass` is `NULL`) or already matches.
+async fn drop_embedding_column_if_dim_mismatch(
+    conn: &mut sqlx::PgConnection,
+    expected_dim: i32,
+) -> Result<(), ToolError> {
+    let existing: Option<(i32,)> = sqlx::query_as(
+        "SELECT atttypmod FROM pg_attribute \
+         WHERE attrelid = to_regclass('kg_findings') AND attname = 'embedding' \
+         AND NOT attisdropped",
+    )
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| ToolError::Database(format!("kg_findings embedding dim check: {e}")))?;
+
+    if let Some((typmod,)) = existing {
+        if typmod != expected_dim {
+            tracing::warn!(
+                "kg_findings: existing embedding column is vector({typmod}), expected \
+                 vector({expected_dim}) — dropping and re-adding the column at the new \
+                 dimension (EMBED-02); other finding fields are preserved, ops re-runs \
+                 the KG build to repopulate embeddings"
+            );
+            sqlx::query("ALTER TABLE kg_findings DROP COLUMN embedding")
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| {
+                    ToolError::Database(format!("drop stale kg_findings.embedding: {e}"))
+                })?;
+            sqlx::query("ALTER TABLE kg_findings ADD COLUMN embedding vector(1024)")
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| {
+                    ToolError::Database(format!("re-add kg_findings.embedding: {e}"))
+                })?;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,8 +581,8 @@ mod tests {
     }
 
     #[test]
-    fn test_findings_embed_dim_is_768() {
-        assert_eq!(FINDINGS_EMBED_DIM, 768);
+    fn test_findings_embed_dim_is_1024() {
+        assert_eq!(FINDINGS_EMBED_DIM, 1024);
     }
 
     #[test]
@@ -637,8 +698,8 @@ mod tests {
     }
 
     #[test]
-    fn test_migration_sql_contains_vector_768() {
-        assert!(CREATE_TABLE_SQL.contains("vector(768)"));
+    fn test_migration_sql_contains_vector_1024() {
+        assert!(CREATE_TABLE_SQL.contains("vector(1024)"));
     }
 
     #[test]
