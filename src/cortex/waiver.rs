@@ -100,6 +100,12 @@ pub fn scope_covers(waiver_scope: &str, requested_scope: &str) -> (bool, bool) {
     let waiver_scope = waiver_scope.trim();
     let requested_scope = requested_scope.trim();
 
+    // An empty requested scope (nothing changed) matches NOTHING — check this
+    // before the "*" wildcard so a catch-all waiver can't "cover" an empty set.
+    if requested_scope.is_empty() {
+        return (false, false);
+    }
+
     if waiver_scope == "*" {
         return (true, requested_scope != "*");
     }
