@@ -4,10 +4,10 @@
 //! `GRANT`, `REVOKE`. Requires the `admin` identity by default (the DB ROLE
 //! behind that identity is the real privilege boundary — this tool's own
 //! class gate is defense in depth, not the boundary itself). Registered as a
-//! GUARDED tool (see the module note below — the guard entry itself lands in
-//! `crate::approval::GUARDED_BARE_NAMES` via PGT-06, not here) so every call
-//! goes through the gateway's human-approval flow before it ever reaches
-//! Postgres.
+//! GUARDED tool — PGT-06 added `pg_admin` to
+//! `crate::approval::GUARDED_BARE_NAMES` (see the module note below) — so
+//! every call goes through the gateway's human-approval flow before it ever
+//! reaches Postgres.
 //!
 //! ## S6 — password redaction is load-bearing, not cosmetic
 //! A `CREATE ROLE ... PASSWORD '...'` (or `ALTER ROLE ... PASSWORD '...'`)
@@ -40,17 +40,14 @@
 //! [`classify_admin_statement`].
 //!
 //! ## Guarding — NOTE for the reader
-//! This item (PGT-05) does NOT edit `crate::approval::GUARDED_BARE_NAMES` —
-//! that centralized wiring is PGT-06's job (it adds `pg_execute`, `pg_ddl`,
-//! AND `pg_admin` together, with the test that enumerates the registered
-//! `pg_*` names so no guard entry ever dangles). `pg_admin` MUST be added to
-//! `GUARDED_BARE_NAMES` before it is reachable in production — until then,
-//! this tool still calls [`crate::approval::gate`] itself at the top of
-//! `execute_structured` (matching the `openhands`/`<secret-manager>` precedent: the
-//! tool owns its own gate call; `GUARDED_BARE_NAMES` is a second, gateway-
-//! level check used for federated/mesh dispatch, not the only enforcement
-//! point), so the approval requirement is real even before PGT-06 lands the
-//! registry-level classification.
+//! PGT-06 added `pg_execute`, `pg_ddl`, AND `pg_admin` together to
+//! `crate::approval::GUARDED_BARE_NAMES`, with a test that enumerates the
+//! registered `pg_*` names so no guard entry ever dangles. `pg_admin` also
+//! calls [`crate::approval::gate`] itself at the top of `execute_structured`
+//! (matching the `openhands`/`<secret-manager>` precedent: the tool owns its own
+//! gate call; `GUARDED_BARE_NAMES` is a second, gateway-level check used for
+//! federated/mesh dispatch, not the only enforcement point) — both layers
+//! are in place.
 
 use std::sync::OnceLock;
 

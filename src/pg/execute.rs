@@ -23,15 +23,17 @@
 //! `TRUNCATE` reach that flag (`TRUNCATE` is DDL-shaped here and is rejected
 //! with a message pointing at `pg_ddl`, per S115's DML/DDL split).
 //!
-//! ## Guarding (PGT-06, not this item)
-//! Per the `S115` grounding summary, guarding is a name-level gate in
-//! `crate::approval::GUARDED_BARE_NAMES`, checked by the gateway
-//! (`src/mcp_server.rs`) before a call ever reaches `execute()` — this
-//! module deliberately does NOT invent a second, per-call gating mechanism.
-//! `pg_execute` MUST be added to `GUARDED_BARE_NAMES` (PGT-06) before this
-//! tool is exposed on a live gateway; until then, a reachable `pg_execute`
-//! runs DML unguarded (only the DB-role privilege boundary + audit trail
-//! apply), same as every other not-yet-guarded item in this suite mid-build.
+//! ## Guarding (PGT-06)
+//! `pg_execute` is a GUARDED tool: it is listed in
+//! `crate::approval::GUARDED_BARE_NAMES` (checked by the gateway,
+//! `src/mcp_server.rs`, for federated/mesh dispatch) AND calls
+//! [`crate::approval::gate`] itself at the top of `execute_structured`
+//! (after the statement-class + destructive-shape checks, before any DB
+//! connection is attempted) — matching the `pg_admin`/`openhands`/
+//! `<secret-manager>` precedent: the tool owns its own gate call as the real
+//! enforcement point; `GUARDED_BARE_NAMES` is a second, gateway-level
+//! classification used for federated dispatch, not the only place the
+//! approval requirement is enforced.
 //!
 //! ## Params — no `json` sqlx feature
 //! This crate's `sqlx` dependency does not enable the `json` feature (see
@@ -50,6 +52,7 @@ use sqlx::postgres::{PgArguments, PgRow};
 use sqlx::query::Query;
 use sqlx::{Column, Postgres, Row};
 
+use crate::approval::{gate, Gate};
 use crate::error::ToolError;
 use crate::registry::ToolRegistry;
 use crate::tool::{RustTool, ToolOutput};
@@ -295,6 +298,27 @@ impl RustTool for PgExecute {
             .unwrap_or_else(|| DEFAULT_EXECUTE_IDENTITY.to_string());
 
         let params: Vec<Value> = args.get("params").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+
+        // GUARDED (PGT-06): gate BEFORE any DB connection is attempted. The
+        // SQL text has no secret shape (unlike pg_admin's PASSWORD literals),
+        // so it is passed through to the approval audit trail as-is — same
+        // standard gate call, no redaction needed on this path.
+        let summary = format!(
+            "pg_execute {} via identity '{identity}'{}: {sql}",
+            class.as_str(),
+            if destructive { ", DESTRUCTIVE (no WHERE clause)" } else { "" }
+        );
+        let safe_args = json!({
+            "statement_class": class.as_str(),
+            "identity": identity,
+            "destructive": destructive,
+            "sql": sql,
+            "params": params,
+        });
+        match gate(self.name(), &safe_args, &summary).await {
+            Gate::Granted => {}
+            Gate::Pending(msg) | Gate::Denied(msg) => return Ok(ToolOutput::text_only(msg)),
+        }
 
         let pool = conn::resolve_connection(&identity).await?;
 
