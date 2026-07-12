@@ -77,9 +77,12 @@ pub use quality::{
     QualityScoreStore, QualityVerdict, DEFAULT_QUALITY_THRESHOLD,
 };
 pub use readme_layers::{
-    deepen_layers, parse_layers, render_diataxis_set, render_layered_readme, DiataxisArtifact,
-    DiataxisMode, ParsedLayers,
+    check_landing_length, deepen_layers, landing_line_count, parse_layers, render_diataxis_set,
+    render_layered_readme, DiataxisArtifact, DiataxisMode, ParsedLayers, CHANGELOG_PATH,
+    DOCS_ARCHITECTURE_PATH, DOCS_GETTING_STARTED_PATH, DOCS_GUIDES_INDEX_PATH, DOCS_INDEX_PATH,
+    DOCS_REFERENCE_INDEX_PATH, LANDING_MAX_LINES, LICENSE_PATH,
 };
+pub use render::docs_tree::{build_docs_tree, DocsTreeFile};
 pub use render::{render_all, RenderContext, RenderOutcome, RenderedArtifact};
 pub use trigger::{run_docgen_trigger, DocgenRun, TriggerOutcome};
 

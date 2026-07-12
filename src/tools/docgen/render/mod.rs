@@ -42,6 +42,7 @@
 //!   this item.
 
 pub mod blog;
+pub mod docs_tree;
 pub mod llms_txt;
 pub mod markdown;
 pub mod notion;
@@ -53,6 +54,8 @@ pub mod wiki_graph;
 use std::collections::BTreeSet;
 
 use super::config::{DocTargetType, ProjectDocConfig};
+use super::readme_layers::render_diataxis_set;
+use docs_tree::{build_docs_tree, DocsTreeFile};
 
 /// Everything a renderer needs about the piece of content being rendered.
 /// Deliberately plain data (no I/O) -- every renderer in this module is a
@@ -118,9 +121,25 @@ impl RenderedArtifact {
 /// [`RenderedArtifact`] per declared target, in declaration order. Never
 /// drops a declared target silently -- every target in the config produces
 /// exactly one entry here, rendered or skipped.
+///
+/// ## `docs_tree` (DOCGEN-21 wiring fix, S95 REVISION, TERM-334)
+/// When the `readme` target is declared AND actually renders, `render_all`
+/// ALSO builds the full `docs/` wiki-style tree ([`docs_tree::build_docs_tree`])
+/// from the SAME generated `content` -- reusing
+/// [`super::readme_layers::render_diataxis_set`]'s artifacts, never
+/// regenerating -- and returns it here. This is what makes the concise
+/// landing README's nav table / nav-link row (which link to
+/// `docs/index.md`, `docs/getting-started.md`, `docs/guides/index.md`,
+/// `docs/reference/index.md`, `docs/architecture.md`, `_Sidebar.md`)
+/// resolve: before this field existed, `build_docs_tree` had no production
+/// caller and those links were dead. Empty when the readme target isn't
+/// declared or didn't render -- there is no landing page to link out from
+/// in that case. Same write-model inversion as everything else in this
+/// module: these are RETURNED files, never placed/written here.
 #[derive(Debug, Clone, Default)]
 pub struct RenderOutcome {
     pub artifacts: Vec<RenderedArtifact>,
+    pub docs_tree: Vec<DocsTreeFile>,
 }
 
 impl RenderOutcome {
@@ -182,7 +201,26 @@ pub async fn render_all(
         artifacts.push(artifact);
     }
 
-    RenderOutcome { artifacts }
+    // DOCGEN-21 wiring fix: the concise landing README (the `readme` target,
+    // rendered above via `readme_layers::render_layered_readme`) links out to
+    // a docs/ tree instead of inlining -- so whenever that target actually
+    // rendered, also build that tree from the SAME generated `content`, via
+    // the SAME Diátaxis artifacts a caller would otherwise have to build a
+    // second time. Reuses `render_diataxis_set` (never regenerates), matching
+    // `docs_tree`'s own module doc comment ("Source: render_diataxis_set's
+    // artifacts, never regenerated here"). No readme target declared/rendered
+    // -> no landing page to link out from -> docs_tree stays empty.
+    let docs_tree = if artifacts
+        .iter()
+        .any(|a| a.target_type == DocTargetType::Readme && a.was_rendered())
+    {
+        let diataxis = render_diataxis_set(ctx, None);
+        build_docs_tree(ctx, &diataxis)
+    } else {
+        Vec::new()
+    };
+
+    RenderOutcome { artifacts, docs_tree }
 }
 
 fn format_tag(target_type: DocTargetType) -> &'static str {
@@ -404,5 +442,116 @@ mod tests {
     #[test]
     fn resolve_credential_returns_none_for_empty_key() {
         assert_eq!(resolve_credential(""), None);
+    }
+
+    // ── DOCGEN-21 wiring fix (TERM-334): docs/ tree is emitted alongside ─
+    // ── the landing README, and its nav links all resolve ───────────────
+
+    const SAMPLE_DIATAXIS_CONTENT: &str = "# Widget\n\n\
+A widget factory that builds widgets fast and safely.\n\n\
+## Tutorial\n\nFollow along to build your first widget from scratch.\n\n\
+## How-To\n\nTo reconfigure the widget, edit its config file.\n\n\
+## Reference\n\n`widget build [--flag]` -- builds a widget.\n\n\
+## Explanation\n\nThe widget pipeline exists because raw material varies.\n";
+
+    /// The bug this wiring fix closes: before it, `build_docs_tree` had NO
+    /// production caller, so `render_all` (and `run_docgen_trigger` above
+    /// it) never emitted the `docs/` tree the concise landing README's nav
+    /// table and nav-link row point at -- every one of those links was
+    /// dead. This asserts the full production path (`render_all` with a
+    /// `readme`-declaring config) now emits every page the module doc
+    /// comment promises.
+    #[tokio::test]
+    async fn render_all_emits_the_docs_tree_alongside_the_readme() {
+        let raw = json!({"targets": [{"type": "readme"}]});
+        let cfg = ProjectDocConfig::parse(Some(&raw)).unwrap();
+        let c = ctx(SAMPLE_DIATAXIS_CONTENT);
+        let out = render_all(&c, &cfg, &BTreeSet::new(), None, None).await;
+
+        assert!(out.artifacts[0].was_rendered(), "readme target must render");
+
+        let paths: Vec<&str> = out.docs_tree.iter().map(|f| f.path.as_str()).collect();
+        for expected in [
+            "docs/index.md",
+            "docs/getting-started.md",
+            "docs/guides/index.md",
+            "docs/reference/index.md",
+            "docs/architecture.md",
+            "_Sidebar.md",
+        ] {
+            assert!(paths.contains(&expected), "docs_tree missing {expected}: {paths:?}");
+        }
+    }
+
+    /// No `readme` target declared/rendered -> no docs_tree. There is no
+    /// landing page to link out from, so nothing should be emitted.
+    #[tokio::test]
+    async fn render_all_omits_docs_tree_when_readme_target_not_declared() {
+        let raw = json!({"targets": [{"type": "wiki"}]});
+        let cfg = ProjectDocConfig::parse(Some(&raw)).unwrap();
+        let c = ctx(SAMPLE_DIATAXIS_CONTENT);
+        let out = render_all(&c, &cfg, &BTreeSet::new(), None, None).await;
+
+        assert!(out.docs_tree.is_empty());
+    }
+
+    /// End-to-end: every link in the landing README's `## Documentation`
+    /// nav table and its nav-link row resolves to a path `render_all`
+    /// actually emitted in `docs_tree` (or is a known top-level file the
+    /// docs engine deliberately does not generate, e.g. CHANGELOG.md/
+    /// LICENSE -- those are repo-level files outside this engine's scope).
+    /// No dead links.
+    #[tokio::test]
+    async fn landing_readme_nav_links_all_resolve_to_emitted_docs_tree_files() {
+        let raw = json!({"targets": [{"type": "readme"}]});
+        let cfg = ProjectDocConfig::parse(Some(&raw)).unwrap();
+        let c = ctx(SAMPLE_DIATAXIS_CONTENT);
+        let out = render_all(&c, &cfg, &BTreeSet::new(), None, None).await;
+
+        let readme_content = out.artifacts[0].content.as_ref().expect("readme rendered");
+        let emitted: std::collections::BTreeSet<&str> =
+            out.docs_tree.iter().map(|f| f.path.as_str()).collect();
+
+        // Repo-level files the doc engine intentionally does not generate
+        // (CHANGELOG.md is versioned separately by DOCGEN-07/changelog.rs;
+        // LICENSE is a legal file, not a doc-engine artifact).
+        let out_of_scope = ["CHANGELOG.md", "LICENSE"];
+
+        // Every `docs/...`-relative link target referenced by the landing
+        // (nav-link row + `## Documentation` table) must be an emitted file.
+        let mut checked_any = false;
+        for line in readme_content.lines() {
+            for cap in extract_markdown_link_targets(line) {
+                if out_of_scope.contains(&cap) {
+                    continue;
+                }
+                if cap.starts_with("docs/") || cap == "_Sidebar.md" {
+                    checked_any = true;
+                    assert!(
+                        emitted.contains(cap),
+                        "landing README links to {cap}, which render_all never emitted \
+(dead link) -- docs_tree = {emitted:?}"
+                    );
+                }
+            }
+        }
+        assert!(checked_any, "expected the landing README to contain at least one docs/ link to check");
+    }
+
+    /// Tiny markdown `[text](target)` link extractor for the dead-link test
+    /// above -- no crate dependency needed for this narrow, test-only use.
+    fn extract_markdown_link_targets(line: &str) -> Vec<&str> {
+        let mut targets = Vec::new();
+        let mut rest = line;
+        while let Some(open_paren) = rest.find("](") {
+            let after = &rest[open_paren + 2..];
+            if let Some(close_paren) = after.find(')') {
+                targets.push(&after[..close_paren]);
+                rest = &after[close_paren + 1..];
+            } else {
+                break;
+            }
+        }
+        targets
     }
 }

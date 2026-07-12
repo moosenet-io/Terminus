@@ -1,6 +1,18 @@
 //! DOCGEN-13: multi-layered Diátaxis README + template set (progressive
 //! disclosure), S95, Plane TERM-164.
 //!
+//! ## DOCGEN-21 revision (S95 REVISION, Plane TERM-334, 2026-07-12)
+//! Operator feedback: the original DOCGEN-13 landing concatenated hero +
+//! quickstart + deep-dive + all four Diátaxis modes into ONE giant
+//! infinite-scroll README. [`build_layered_body`] is REWRITTEN to emit a
+//! CONCISE (~130-180 line, lint-checked via [`check_landing_length`])
+//! marketing-grade landing page in the fixed section order from the
+//! revision spec's §D1, that LINKS OUT to a `docs/` tree
+//! (`render::docs_tree`, built from this module's own
+//! [`render_diataxis_set`] output) instead of inlining anything deep. See
+//! the "DOCGEN-21" doc comment directly above [`build_layered_body`] for
+//! the exact section order and rationale.
+//!
 //! ## What this item adds
 //! Builds ON the merged render layer (DOCGEN-06, `render/markdown.rs`) --
 //! it does not replace it. The README target still goes through
@@ -99,7 +111,12 @@ use super::render::{RenderContext, RenderedArtifact};
 /// a minimal static fence in the (practically unreachable) case the sweep
 /// fully blocks the label -- this function must never panic, never emit an
 /// HTML comment, and never emit a broken `<img>`.
-fn architecture_slot(module: &str) -> String {
+///
+/// `pub(crate)`: DOCGEN-21 (S95 REVISION, TERM-334) reuses this SAME slot
+/// (never reinventing a second diagram embed) for `docs/architecture.md`'s
+/// full diagram in `render::docs_tree` -- one architecture mermaid source,
+/// embedded in both the README hero and the deep architecture page.
+pub(crate) fn architecture_slot(module: &str) -> String {
     const STATIC_FALLBACK: &str = "```mermaid\nflowchart LR\n    A[Client] --> B[Core]\n```";
     match default_architecture_mermaid_source(module) {
         Ok(source) => super::diagram::mermaid_fence(&source).unwrap_or_else(|_| STATIC_FALLBACK.to_string()),
@@ -211,7 +228,12 @@ fn extract_section(content: &str, header_name: &str) -> Option<String> {
 /// off the front of `rendered`, returning just the body. Used to recover a
 /// PRIOR layer's plain content before re-parsing it with [`parse_layers`] /
 /// [`extract_section`] for the deepen-per-layer merge.
-fn strip_frontmatter(rendered: &str) -> String {
+///
+/// `pub(crate)`: DOCGEN-21 (S95 REVISION, TERM-334) reuses this to recover
+/// the plain body out of a [`DiataxisArtifact`]'s `render_note`-framed
+/// content in `render::docs_tree`, rather than a second copy of the same
+/// frontmatter-stripping logic.
+pub(crate) fn strip_frontmatter(rendered: &str) -> String {
     const CLOSE: &str = "\n---\n\n";
     if rendered.starts_with("---\n") {
         if let Some(pos) = rendered.find(CLOSE) {
@@ -245,7 +267,12 @@ pub fn parse_layers(content: &str) -> ParsedLayers {
         // Without this, a round that OMITS a layer would drop the prior
         // content -- it lives under the rendered heading, not the generated
         // one (regression fixed here: preserves_prior_quickstart_when_round_omits_it).
-        quickstart: extract_section_any(content, &["Quickstart", "Usage"]).unwrap_or_default(),
+        // DOCGEN-21: the landing renders "## Quick Start" (not "## Usage"
+        // -- that heading name retired with the old giant-file layout), so
+        // the round-trip recognizer must accept it too or a previously-
+        // rendered landing's quickstart content would silently vanish on
+        // the next deepen pass.
+        quickstart: extract_section_any(content, &["Quickstart", "Quick Start", "Usage"]).unwrap_or_default(),
         deep_dive: extract_section_any(content, &["Deep Dive", "API"]).unwrap_or_default(),
     }
 }
@@ -301,7 +328,8 @@ fn shields_badges(project: &str) -> String {
 }
 
 /// Split the hero layer into a one-liner (the first non-empty, non-heading
-/// line) and the full hero text (used as the Background section body).
+/// line) and the full hero text (used to derive the "Why" bullets and the
+/// architecture-at-a-glance blurb).
 fn split_hero(hero: &str) -> (String, String) {
     let mut one_liner = String::new();
     for line in hero.lines() {
@@ -315,12 +343,153 @@ fn split_hero(hero: &str) -> (String, String) {
     (one_liner, hero.trim().to_string())
 }
 
-/// Build the layered README body (everything `render_note` wraps in
-/// frontmatter): badges -> one-liner -> architecture mermaid diagram ->
-/// table of contents -> standard-readme-ordered sections (Background /
-/// Install / Usage / API / Contributing / License), with Usage sourced from
-/// the quickstart layer and API sourced from the deep-dive layer -- the
-/// progressive-disclosure mapping this item exists to add.
+// ---------------------------------------------------------------------------
+// DOCGEN-21 (S95 REVISION, TERM-334): concise landing README
+// ---------------------------------------------------------------------------
+//
+// Operator feedback (2026-07-11): the pre-revision engine concatenated
+// EVERY layer/mode into one giant infinite-scroll README (Terminus's own
+// README hit 1469 lines). This section replaces that with the fixed
+// ~130-180 line landing template from the revision spec's §D1: hero -> ---
+// -> architecture mermaid -> Why -> Quick Start -> Documentation (nav
+// table) -> Architecture at a glance -> Contributing -> License.
+// Everything deeper LINKS OUT to `render::docs_tree`'s docs/ pages --
+// never inlined here again. The exact link targets are named constants so
+// this table and `render::docs_tree`'s real emitted paths can never
+// silently drift apart (see `documentation_nav_table_links_to_the_real_docs_tree_paths`).
+
+/// Repo-relative path constants for the docs/ tree this landing links out
+/// to (produced by `render::docs_tree::build_docs_tree`). Centralized here,
+/// not scattered string literals, so the landing's links and the real
+/// generated tree can never point at different paths.
+pub const DOCS_INDEX_PATH: &str = "docs/index.md";
+pub const DOCS_GETTING_STARTED_PATH: &str = "docs/getting-started.md";
+pub const DOCS_GUIDES_INDEX_PATH: &str = "docs/guides/index.md";
+pub const DOCS_REFERENCE_INDEX_PATH: &str = "docs/reference/index.md";
+pub const DOCS_ARCHITECTURE_PATH: &str = "docs/architecture.md";
+pub const CHANGELOG_PATH: &str = "CHANGELOG.md";
+pub const LICENSE_PATH: &str = "LICENSE";
+
+/// The landing README's target maximum length, in lines (spec §D1: "~130-
+/// 180 lines"). A concrete, testable ceiling rather than "keep it concise"
+/// left unchecked.
+pub const LANDING_MAX_LINES: usize = 180;
+
+/// Lint: how many lines does a rendered landing README (frontmatter
+/// included) have?
+pub fn landing_line_count(content: &str) -> usize {
+    content.lines().count()
+}
+
+/// Lint: is `content` at or under [`LANDING_MAX_LINES`]? A dedicated,
+/// callable check (not just a test assertion) so a future pipeline gate can
+/// reuse it, matching this crate's existing `quality::lint_prose` posture
+/// of exposing lints as plain functions.
+pub fn check_landing_length(content: &str) -> Result<(), String> {
+    let n = landing_line_count(content);
+    if n > LANDING_MAX_LINES {
+        Err(format!(
+            "landing README is {n} lines, exceeds the {LANDING_MAX_LINES}-line concise-landing \
+ceiling (spec §D1) -- move deep content into the docs/ tree instead of inlining it"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// The fixed nav-link row directly under the hero (spec §D1: "nav-link row
+/// `Docs · Quickstart · Reference · Architecture · Changelog`").
+fn nav_link_row() -> String {
+    format!(
+        "[Docs]({DOCS_INDEX_PATH}) · [Quickstart]({DOCS_GETTING_STARTED_PATH}) · \
+[Reference]({DOCS_REFERENCE_INDEX_PATH}) · [Architecture]({DOCS_ARCHITECTURE_PATH}) · \
+[Changelog]({CHANGELOG_PATH})"
+    )
+}
+
+/// The `## Documentation` nav table: every sub-page the landing links out
+/// to instead of inlining.
+fn documentation_nav_table() -> String {
+    format!(
+        "| Section | What's there |\n\
+|---|---|\n\
+| [Getting Started]({DOCS_GETTING_STARTED_PATH}) | A first working setup, tutorial-style. |\n\
+| [Guides]({DOCS_GUIDES_INDEX_PATH}) | Task-oriented how-tos. |\n\
+| [Reference]({DOCS_REFERENCE_INDEX_PATH}) | CLI, API, and configuration reference. |\n\
+| [Architecture]({DOCS_ARCHITECTURE_PATH}) | How the system fits together, in depth. |\n\
+| [Changelog]({CHANGELOG_PATH}) | What changed, release by release. |\n"
+    )
+}
+
+/// Turn the hero/background prose into 4-7 short benefit bullets for
+/// `## Why {project}` (spec §D1: "BENEFIT bullets, not capabilities"). A
+/// light heuristic (sentence splitting), not a re-generation -- this module
+/// has no model access (see the file doc comment's "Templating choice"), so
+/// a generator that already writes benefit-shaped prose renders well here,
+/// and a bare/near-empty hero gets an explicit placeholder rather than a
+/// fabricated bullet, matching this file's existing "no content yet"
+/// convention.
+fn why_bullets(background: &str, module: &str) -> String {
+    let sentences: Vec<String> = background
+        .split(|c| c == '.' || c == '\n')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.len() > 3 && !s.starts_with('#'))
+        .take(7)
+        .map(|s| format!("- {}.", s.trim_end_matches('.')))
+        .collect();
+    if sentences.len() < 2 {
+        format!(
+            "- _No benefit summary generated yet for {module} -- see \
+[Architecture at a glance](#architecture-at-a-glance) below._"
+        )
+    } else {
+        sentences.join("\n")
+    }
+}
+
+/// The `## Quick Start` body: the quickstart layer as-is (already
+/// step/command-shaped from generation, per the file doc comment's
+/// "Progressive disclosure" section), or an explicit placeholder pointing
+/// at the full tutorial when this round produced none.
+fn quick_start_section(quickstart: &str) -> String {
+    if quickstart.trim().is_empty() {
+        format!(
+            "_No quickstart content generated yet -- see [Getting Started]\
+({DOCS_GETTING_STARTED_PATH}) for the full tutorial._"
+        )
+    } else {
+        quickstart.trim().to_string()
+    }
+}
+
+/// The `## Architecture at a glance` body: a short (3-4 sentence) blurb
+/// plus a link to the full `docs/architecture.md` page -- never the full
+/// diagram breakdown itself (that lives only in the docs/ tree and the
+/// hero's diagram slot).
+fn architecture_glance(background: &str, module: &str) -> String {
+    let blurb = background
+        .split('.')
+        .map(str::trim)
+        .find(|s| !s.is_empty() && !s.starts_with('#'))
+        .map(|s| format!("{s}."))
+        .unwrap_or_else(|| format!("{module} is documented in depth on the architecture page."));
+    format!(
+        "{blurb} See [Architecture]({DOCS_ARCHITECTURE_PATH}) for the full component and \
+data-flow breakdown."
+    )
+}
+
+/// Build the CONCISE landing README body (everything `render_note` wraps in
+/// frontmatter), per the revision spec's §D1 fixed section order: hero
+/// (centered name + tagline + badges + nav-link row) -> `---` ->
+/// architecture mermaid -> `## Why {project}` -> `## Quick Start` ->
+/// `## Documentation` (nav table) -> `## Architecture at a glance` ->
+/// `## Contributing` -> `## License`. This STOPS concatenating every
+/// layer/mode into one file (the pre-revision behavior) -- the deep-dive
+/// layer and the Diátaxis tutorial/how-to/reference/explanation bodies are
+/// NEVER inlined here; they live in `render::docs_tree`'s docs/ pages,
+/// which this landing only links to. See [`check_landing_length`] for the
+/// paired ≤180-line lint.
 fn build_layered_body(ctx: &RenderContext<'_>, layers: &ParsedLayers) -> String {
     let (mut one_liner, background) = split_hero(&layers.hero);
     if one_liner.is_empty() {
@@ -329,40 +498,25 @@ fn build_layered_body(ctx: &RenderContext<'_>, layers: &ParsedLayers) -> String 
     let badges = shields_badges(ctx.project);
 
     let mut out = String::new();
-    out.push_str(&format!("# {}\n\n", ctx.module));
-    out.push_str(&badges);
-    out.push_str("\n\n> ");
-    out.push_str(&one_liner);
-    out.push_str("\n\n");
+    // Hero: centered name + tagline + badges + nav-link row.
+    out.push_str(&format!("<h1 align=\"center\">{}</h1>\n\n", ctx.module));
+    out.push_str(&format!("<p align=\"center\"><em>{one_liner}</em></p>\n\n"));
+    out.push_str(&format!("<p align=\"center\">\n\n{badges}\n\n</p>\n\n"));
+    out.push_str(&format!("<p align=\"center\">{}</p>\n\n", nav_link_row()));
+    out.push_str("---\n\n");
+    // Architecture mermaid (DOCGEN-22's slot -- reused, never reinvented).
     out.push_str(&architecture_slot(ctx.module));
-    out.push_str(
-        "\n\n## Table of Contents\n\n\
-- [Background](#background)\n\
-- [Install](#install)\n\
-- [Usage](#usage)\n\
-- [API](#api)\n\
-- [Contributing](#contributing)\n\
-- [License](#license)\n\n",
-    );
-    out.push_str("## Background\n\n");
-    out.push_str(if background.is_empty() { "_No background content yet._" } else { &background });
-    out.push_str("\n\n## Install\n\nSee Quickstart below for the fastest path to a working setup.\n\n");
-    out.push_str("## Usage\n\n");
-    out.push_str(if layers.quickstart.trim().is_empty() {
-        "_No quickstart content yet._"
-    } else {
-        layers.quickstart.trim()
-    });
-    out.push_str("\n\n## API\n\n");
-    out.push_str(if layers.deep_dive.trim().is_empty() {
-        "_No deep-dive content yet._"
-    } else {
-        layers.deep_dive.trim()
-    });
-    out.push_str(
-        "\n\n## Contributing\n\nSee the project's build pipeline docs for the contribution process.\n\n\
-## License\n\nSee LICENSE.\n",
-    );
+    out.push_str("\n\n");
+    out.push_str(&format!("## Why {}\n\n", ctx.project));
+    out.push_str(&why_bullets(&background, ctx.module));
+    out.push_str("\n\n## Quick Start\n\n");
+    out.push_str(&quick_start_section(&layers.quickstart));
+    out.push_str("\n\n## Documentation\n\n");
+    out.push_str(&documentation_nav_table());
+    out.push_str("\n## Architecture at a glance\n\n");
+    out.push_str(&architecture_glance(&background, ctx.module));
+    out.push_str("\n\n## Contributing\n\nSee the project's build pipeline docs for the contribution process.\n\n");
+    out.push_str(&format!("## License\n\nSee [LICENSE]({LICENSE_PATH}).\n"));
     out
 }
 
@@ -485,34 +639,106 @@ mod tests {
         assert!(layers.deep_dive.contains("three stages"));
     }
 
+    // ── DOCGEN-21 (S95 REVISION, TERM-334): concise landing, fixed order ──
+
     #[test]
-    fn render_layered_readme_produces_all_three_layers_in_standard_readme_order() {
+    fn render_layered_readme_follows_the_fixed_landing_section_order() {
         let artifact = render_layered_readme(&ctx(SAMPLE), None);
         assert!(artifact.was_rendered());
         let content = artifact.content.unwrap();
 
-        assert!(content.contains("The widget turns raw material"), "hero/background missing");
-        assert!(content.contains("widget build"), "quickstart missing");
-        assert!(content.contains("three stages"), "deep-dive missing");
+        assert!(content.contains("widget build"), "quickstart layer must reach Quick Start");
 
-        // Standard-readme section order: Background before Usage before API.
-        let bg = content.find("## Background").expect("Background section");
-        let usage = content.find("## Usage").expect("Usage section");
-        let api = content.find("## API").expect("API section");
-        assert!(bg < usage, "Background must precede Usage");
-        assert!(usage < api, "Usage must precede API");
+        let hero = content.find("src/widget").expect("module name in hero"); // ctx() uses module "src/widget"
+        let divider = content.find("\n---\n").expect("hero/body divider");
+        let mermaid = content.find("```mermaid").expect("architecture mermaid fence");
+        let why = content.find("## Why").expect("Why section");
+        let quickstart = content.find("## Quick Start").expect("Quick Start section");
+        let docs = content.find("## Documentation").expect("Documentation nav table");
+        let arch = content.find("## Architecture at a glance").expect("Architecture at a glance");
+        let contributing = content.find("## Contributing").expect("Contributing section");
+        let license = content.find("## License").expect("License section");
+
+        assert!(hero < divider, "hero must precede the --- divider");
+        assert!(divider < mermaid, "divider must precede the architecture diagram");
+        assert!(mermaid < why, "architecture diagram must precede Why");
+        assert!(why < quickstart, "Why must precede Quick Start");
+        assert!(quickstart < docs, "Quick Start must precede Documentation");
+        assert!(docs < arch, "Documentation must precede Architecture at a glance");
+        assert!(arch < contributing, "Architecture at a glance must precede Contributing");
+        assert!(contributing < license, "Contributing must precede License");
     }
 
     #[test]
     fn missing_layers_render_explicit_placeholders_not_silently_dropped() {
         let artifact = render_layered_readme(&ctx("# Bare\n\nJust a title, nothing else."), None);
         let content = artifact.content.unwrap();
-        assert!(content.contains("_No quickstart content yet._"));
-        assert!(content.contains("_No deep-dive content yet._"));
-        // Sections still present even when empty -- order/structure never
-        // silently collapses because a layer has no content yet.
-        assert!(content.contains("## Usage"));
-        assert!(content.contains("## API"));
+        // Sections still present even when a layer has no content yet --
+        // structure never silently collapses.
+        assert!(content.contains("## Quick Start"));
+        assert!(content.contains("## Why"));
+        assert!(
+            content.contains("No quickstart content generated yet"),
+            "empty quickstart layer must render an explicit placeholder, not vanish: {content}"
+        );
+    }
+
+    // ── DOCGEN-21: landing NEVER inlines deep content -- links out instead ──
+
+    #[test]
+    fn landing_readme_never_inlines_deep_dive_or_diataxis_bodies() {
+        let content_with_deep_dive =
+            "# Widget\n\nIntro sentence.\n\n## Deep Dive\n\nDEEPDIVEMARKER content.\n";
+        let artifact = render_layered_readme(&ctx(content_with_deep_dive), None);
+        let content = artifact.content.unwrap();
+        assert!(
+            !content.contains("DEEPDIVEMARKER"),
+            "landing must link out to docs/, never inline the deep-dive body: {content}"
+        );
+        // The old single-giant-file section headings must be gone entirely.
+        assert!(!content.contains("## API"));
+        assert!(!content.contains("## Background"));
+        assert!(!content.contains("## Install"));
+        assert!(!content.contains("## Usage"));
+        assert!(!content.contains("## Table of Contents"));
+    }
+
+    #[test]
+    fn documentation_nav_table_links_to_the_real_docs_tree_paths() {
+        let artifact = render_layered_readme(&ctx(SAMPLE), None);
+        let content = artifact.content.unwrap();
+        assert!(content.contains(DOCS_GETTING_STARTED_PATH));
+        assert!(content.contains(DOCS_GUIDES_INDEX_PATH));
+        assert!(content.contains(DOCS_REFERENCE_INDEX_PATH));
+        assert!(content.contains(DOCS_ARCHITECTURE_PATH));
+        // Nav-link row also points at the docs hub + reference + architecture.
+        assert!(content.contains(DOCS_INDEX_PATH));
+    }
+
+    // ── DOCGEN-21: ≤180-line concise-landing lint ────────────────────────
+
+    #[test]
+    fn landing_readme_stays_within_the_concise_line_ceiling() {
+        let artifact = render_layered_readme(&ctx(SAMPLE), None);
+        let content = artifact.content.unwrap();
+        assert!(
+            check_landing_length(&content).is_ok(),
+            "landing README exceeded {LANDING_MAX_LINES} lines: {} lines",
+            landing_line_count(&content)
+        );
+    }
+
+    #[test]
+    fn check_landing_length_flags_an_oversized_landing() {
+        let oversized = "line\n".repeat(LANDING_MAX_LINES + 1);
+        let err = check_landing_length(&oversized).unwrap_err();
+        assert!(err.contains("exceeds"));
+    }
+
+    #[test]
+    fn check_landing_length_accepts_a_landing_at_exactly_the_ceiling() {
+        let exact = "line\n".repeat(LANDING_MAX_LINES);
+        assert!(check_landing_length(&exact).is_ok());
     }
 
     // ── shields.io badges present ────────────────────────────────────────
@@ -590,6 +816,7 @@ mod tests {
     fn render_layered_readme_end_to_end_preserves_prior_quickstart_when_round_omits_it() {
         let first = render_layered_readme(&ctx(SAMPLE), None);
         let first_content = first.content.unwrap();
+        assert!(first_content.contains("widget build"));
 
         // Second round: only the deep-dive changed; quickstart section is
         // absent from this round's generated content entirely.
@@ -599,8 +826,13 @@ mod tests {
         let second = render_layered_readme(&ctx(second_round_content), Some(&first_content));
         let second_content = second.content.unwrap();
 
-        assert!(second_content.contains("widget build"), "prior quickstart must be preserved");
-        assert!(second_content.contains("fourth stage: package"), "new deep-dive must land");
+        assert!(second_content.contains("widget build"), "prior quickstart must be preserved on the landing");
+        // DOCGEN-21: the landing never inlines deep-dive content at all
+        // (regardless of round/deepen state) -- it links to docs/ instead.
+        assert!(
+            !second_content.contains("fourth stage: package"),
+            "deep-dive content must never be inlined on the landing, even a freshly-deepened one"
+        );
     }
 
     // ── Diátaxis mode tagging ────────────────────────────────────────────
