@@ -300,6 +300,171 @@ raster (SOURCE is still produced and versioned): {e}"
 }
 
 // ---------------------------------------------------------------------------
+// DOCGEN-22: native Mermaid fence embed (revision -- fixes the broken SVG)
+// ---------------------------------------------------------------------------
+//
+// Root cause (operator report, S95 REVISION-multipage-mermaid.md): a
+// filter-heavy, dark-background `assets/architecture.svg` embedded via
+// `<img src=...>` renders as a black/blank box on GitHub/Gitea (both
+// sanitize/rasterize `<img>`-embedded SVG, stripping `<filter>` and any
+// dark-mode adaptation) -- and this module's own d2 CLI path silently
+// produces nothing when `d2` isn't on PATH, so the embed slot never had a
+// real fallback. The fix: the DEFAULT / binary-absent embed is now a fenced
+// ```mermaid `flowchart` block -- a plain markdown string, renders natively
+// on GitHub (Viewscreen) and Gitea >=1.18 with **no binary**, theme-aware.
+// The d2/SVG raster path is kept, but ONLY as the embed when the `d2`
+// binary is actually present AND the render succeeded; every other case
+// (unavailable, failed, or the source was Mermaid to begin with) resolves
+// to a rendering mermaid fence -- never a skipped/broken `<img>`.
+
+/// Gitea's `MERMAID_MAX_SOURCE_CHARACTERS` default -- the fenced source must
+/// stay under this or Gitea refuses to render the diagram at all.
+pub const MERMAID_MAX_SOURCE_CHARS: usize = 5000;
+
+/// Validate that `source` is renderable Mermaid `flowchart` source per the
+/// DOCGEN-22 rules: non-empty, under [`MERMAID_MAX_SOURCE_CHARS`], a
+/// `flowchart` (never `architecture-beta`/`C4*` -- those need external
+/// icon packs/Kroki and are not safe auto-gen targets), no external icon
+/// references (`http(s)://` asset URLs, `fa:`/iconify shorthand, raw
+/// `<img`), and any `subgraph`/`end` pairs balanced (an unbalanced pair is
+/// invalid Mermaid and Gitea/GitHub simply fail to render the whole block).
+pub fn validate_mermaid_flowchart(source: &str) -> Result<(), String> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return Err("mermaid source is empty".to_string());
+    }
+    if trimmed.len() > MERMAID_MAX_SOURCE_CHARS {
+        return Err(format!(
+            "mermaid source is {} chars, over Gitea's MERMAID_MAX_SOURCE_CHARACTERS limit of {}",
+            trimmed.len(),
+            MERMAID_MAX_SOURCE_CHARS
+        ));
+    }
+    let first_line = trimmed.lines().next().unwrap_or("").trim();
+    if !first_line.starts_with("flowchart") {
+        return Err(format!(
+            "mermaid source must open with `flowchart LR`/`flowchart TD`, got: {first_line:?}"
+        ));
+    }
+    if trimmed.contains("architecture-beta") {
+        return Err("architecture-beta is not a supported auto-gen diagram type -- use flowchart".to_string());
+    }
+    for c4 in ["C4Context", "C4Container", "C4Component", "C4Dynamic", "C4Deployment"] {
+        if trimmed.contains(c4) {
+            return Err(format!("{c4} is not a supported auto-gen diagram type -- use flowchart"));
+        }
+    }
+    if trimmed.contains("http://") || trimmed.contains("https://") || trimmed.contains("<img") {
+        return Err("mermaid source must not reference external icon packs/images".to_string());
+    }
+    let subgraph_count = trimmed
+        .lines()
+        .filter(|l| l.trim_start().starts_with("subgraph "))
+        .count();
+    let end_count = trimmed.lines().filter(|l| l.trim() == "end").count();
+    if subgraph_count != end_count {
+        return Err(format!(
+            "unbalanced subgraph/end: {subgraph_count} subgraph(s) vs {end_count} end(s)"
+        ));
+    }
+    Ok(())
+}
+
+/// Wrap already-swept Mermaid diagram SOURCE (a [`SweptDiagramSource`] with
+/// [`DiagramFormat::Mermaid`]) in a fenced ```mermaid code block, after
+/// running [`validate_mermaid_flowchart`]. This -- not a raster SVG, not a
+/// skipped/broken `<img>` -- is what a README/docs architecture slot
+/// embeds by default.
+pub fn mermaid_fence(source: &SweptDiagramSource) -> Result<String, String> {
+    if source.format() != DiagramFormat::Mermaid {
+        return Err(format!(
+            "mermaid_fence requires DiagramFormat::Mermaid, got {:?}",
+            source.format()
+        ));
+    }
+    validate_mermaid_flowchart(source.as_str())?;
+    Ok(format!("```mermaid\n{}\n```", source.as_str().trim()))
+}
+
+/// A safe mermaid identifier derived from `label` -- non-alphanumeric
+/// characters (`/`, `-`, spaces, ...) become `_` so a project/module name
+/// like `src/widget` can be used as a `subgraph` id.
+fn mermaid_safe_id(label: &str) -> String {
+    let mut id: String = label
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    if id.is_empty() || !id.chars().next().unwrap().is_ascii_alphabetic() {
+        id = format!("m_{id}");
+    }
+    id
+}
+
+/// Build a generic, always-valid default architecture `flowchart` for
+/// `module` -- used whenever there is no project-specific diagram source
+/// available yet (e.g. the readme_layers architecture slot, which has no
+/// per-call access to a generated diagram) or the d2 binary path could not
+/// produce a raster. `module` is swept through the same DOCGEN-02 gate
+/// ([`sweep_input`]) as any other diagram source before being wrapped in a
+/// [`SweptDiagramSource`] -- even this generic template never embeds an
+/// unswept label (spec AC: "diagram source PII-swept before embed").
+pub fn default_architecture_mermaid_source(module: &str) -> Result<SweptDiagramSource, ToolError> {
+    // Sweep the RAW label first, then derive the mermaid-safe id from the
+    // already-sanitized text -- not the other way around. Deriving the id
+    // from the raw label and sweeping the composed template afterward would
+    // let a dotted IPv4/hostname survive undetected: `mermaid_safe_id`
+    // flattens `.`/`-` to `_`, so a private address would become an
+    // underscore-joined digit run in the id BEFORE the sweep ever runs,
+    // which no longer matches the dotted-quad PII pattern -- a real, still
+    // human-readable leak that would slip past `scan_for_pii`. Sweeping
+    // first closes that (see the diagram module's test coverage for a
+    // concrete before/after fixture).
+    let label_outcome = sweep_input(module)?;
+    let sanitized_label = label_outcome.sanitized_content();
+    let id = mermaid_safe_id(sanitized_label);
+    let raw = format!(
+        "flowchart LR\n    subgraph {id}[\"{sanitized_label}\"]\n        A[Client] --> B[Core]\n        B --> C[Output]\n    end\n"
+    );
+    // Belt-and-suspenders: sweep the fully composed template too, matching
+    // this module's existing "two independent sweep points" posture.
+    let outcome = sweep_input(&raw)?;
+    Ok(SweptDiagramSource::from_gate_outcome(&outcome, DiagramFormat::Mermaid))
+}
+
+/// The final embed markdown for a README/docs architecture slot, deciding
+/// between the SVG raster path and the mermaid-fence fallback per the
+/// DOCGEN-22 rule: SVG **only** when `source` is D2 AND `render_outcome`
+/// actually produced one (the binary was present and verified); every
+/// other case -- unavailable, failed, or `source` already being Mermaid --
+/// resolves to a rendering mermaid fence, embedded inline as raw `<svg>`
+/// markup (never an `<img>` tag, which is exactly the sanitize/rasterize
+/// hazard this item fixes) when a raster is available, or the fence
+/// otherwise. `fallback_label` seeds the generic default diagram when
+/// `source` cannot itself be expressed as mermaid (a D2 source with no
+/// raster available).
+pub fn architecture_embed_markdown(
+    source: &SweptDiagramSource,
+    render_outcome: &DiagramRenderOutcome,
+    fallback_label: &str,
+) -> Result<String, ToolError> {
+    if source.format() == DiagramFormat::D2 {
+        if let Some(svg) = &render_outcome.svg {
+            // Inline raw <svg> markup -- never an <img> tag, so there is no
+            // sanitize/rasterize step to strip filters or skip dark-mode.
+            return Ok(svg.trim().to_string());
+        }
+        // d2 unavailable/failed -- fall back to the generic mermaid default,
+        // since a D2 source string cannot be reinterpreted as mermaid.
+        let default_source = default_architecture_mermaid_source(fallback_label)?;
+        return mermaid_fence(&default_source)
+            .map_err(|e| ToolError::InvalidArgument(format!("default mermaid fence invalid: {e}")));
+    }
+
+    // Already mermaid -- fence it directly (this is the DEFAULT path).
+    mermaid_fence(source).map_err(|e| ToolError::InvalidArgument(format!("mermaid fence invalid: {e}")))
+}
+
+// ---------------------------------------------------------------------------
 // Versioning (DOCGEN-07 reuse)
 // ---------------------------------------------------------------------------
 
@@ -621,5 +786,195 @@ mod tests {
     fn diagram_format_extensions_match_spec_naming() {
         assert_eq!(DiagramFormat::D2.source_extension(), "d2");
         assert_eq!(DiagramFormat::Mermaid.source_extension(), "mmd");
+    }
+
+    // ── DOCGEN-22: mermaid fence validation + embed ─────────────────────
+
+    fn mermaid(raw: &str) -> SweptDiagramSource {
+        let outcome = sweep_input(raw).expect("fixture should not block");
+        SweptDiagramSource::from_gate_outcome(&outcome, DiagramFormat::Mermaid)
+    }
+
+    #[test]
+    fn valid_flowchart_fences_cleanly() {
+        let src = mermaid("flowchart LR\n    A[Client] --> B[Core]\n    B --> C[Output]\n");
+        let fence = mermaid_fence(&src).unwrap();
+        assert!(fence.starts_with("```mermaid\n"));
+        assert!(fence.trim_end().ends_with("```"));
+        assert!(fence.contains("flowchart LR"));
+    }
+
+    #[test]
+    fn valid_flowchart_with_balanced_subgraph_passes() {
+        let src = mermaid(
+            "flowchart TD\n    subgraph core[\"Core\"]\n        A --> B\n    end\n    B --> C\n",
+        );
+        assert!(mermaid_fence(&src).is_ok());
+    }
+
+    #[test]
+    fn unbalanced_subgraph_is_rejected() {
+        let src = mermaid("flowchart TD\n    subgraph core[\"Core\"]\n        A --> B\n");
+        let err = mermaid_fence(&src).unwrap_err();
+        assert!(err.contains("unbalanced"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn architecture_beta_is_rejected() {
+        let src = mermaid("architecture-beta\n    group api(cloud)[API]\n");
+        let err = mermaid_fence(&src).unwrap_err();
+        assert!(err.contains("architecture-beta"));
+    }
+
+    #[test]
+    fn c4_diagram_type_is_rejected() {
+        let src = mermaid("flowchart LR\n    C4Context\n    Person(a, \"User\")\n");
+        // starts with flowchart but embeds a C4 macro -- still rejected.
+        let err = mermaid_fence(&src).unwrap_err();
+        assert!(err.contains("C4Context"));
+    }
+
+    #[test]
+    fn external_icon_reference_is_rejected() {
+        let src = mermaid("flowchart LR\n    A[Client] --> B[<img src=\"https://example.com/icon.png\">]\n"); // pii-test-fixture
+        let err = mermaid_fence(&src).unwrap_err();
+        assert!(err.contains("external"));
+    }
+
+    #[test]
+    fn oversized_mermaid_source_is_rejected() {
+        let mut raw = "flowchart LR\n".to_string();
+        while raw.len() < MERMAID_MAX_SOURCE_CHARS + 100 {
+            raw.push_str("    A --> B\n");
+        }
+        let src = mermaid(&raw);
+        let err = mermaid_fence(&src).unwrap_err();
+        assert!(err.contains("MERMAID_MAX_SOURCE_CHARACTERS"));
+    }
+
+    #[test]
+    fn d2_format_is_rejected_by_mermaid_fence() {
+        let feat_outcome = sweep_input("a -> b: ok").unwrap();
+        let d2_source = SweptDiagramSource::from_gate_outcome(&feat_outcome, DiagramFormat::D2);
+        let err = mermaid_fence(&d2_source).unwrap_err();
+        assert!(err.contains("DiagramFormat::Mermaid"));
+    }
+
+    // ── DOCGEN-22: default template + PII sweep ordering ────────────────
+
+    /// LOAD-BEARING negative test (spec AC #5): even the generic default
+    /// diagram template is swept for PII before it can ever be embedded --
+    /// a module/project label carrying a hostname is redacted, exactly like
+    /// the existing model-output sweep test above but for the readme_layers
+    /// no-generation-available default path.
+    #[test]
+    fn default_template_sweeps_hostname_label_before_embed() {
+        let source = default_architecture_mermaid_source("host_pvf1.internal <internal-ip>") // pii-test-fixture
+            .expect("generic template should never be fully blocked");
+        assert!(!source.as_str().contains("<internal-ip>")); // pii-test-fixture
+        // Load-bearing: the id is derived from the SANITIZED label, so the
+        // flattened digit form (dots -> underscores) must not leak the
+        // address either -- this is the exact bypass a naive
+        // sweep-after-flatten implementation would miss.
+        assert!(!source.as_str().contains("192_168_0_104")); // pii-test-fixture
+        assert!(
+            crate::github::pii::scan_for_pii(source.as_str()).is_empty(),
+            "default architecture diagram source must be clean per the canonical scanner: {:?}",
+            source.as_str()
+        );
+        // Still valid, renderable mermaid despite the redaction.
+        assert!(mermaid_fence(&source).is_ok());
+    }
+
+    #[test]
+    fn default_template_is_valid_flowchart_for_plain_module_name() {
+        let source = default_architecture_mermaid_source("src/widget").unwrap();
+        assert_eq!(source.format(), DiagramFormat::Mermaid);
+        let fence = mermaid_fence(&source).unwrap();
+        assert!(fence.contains("flowchart LR"));
+        assert!(fence.contains("src/widget"));
+    }
+
+    // ── DOCGEN-22: architecture_embed_markdown decision table ───────────
+
+    #[test]
+    fn embed_uses_mermaid_fence_when_source_is_mermaid() {
+        let src = mermaid("flowchart LR\n    A --> B\n");
+        let no_render = DiagramRenderOutcome::skipped("mermaid rendering not wired");
+        let embed = architecture_embed_markdown(&src, &no_render, "fallback-module").unwrap();
+        assert!(embed.starts_with("```mermaid\n"));
+        assert!(!embed.contains("<img"));
+    }
+
+    /// AC #3: "tested skip -> mermaid, not broken img" -- when the source is
+    /// D2 and the renderer was unavailable/failed (no svg produced), the
+    /// embed falls back to a rendering mermaid fence built from the generic
+    /// default template, never a skipped/broken `<img>`.
+    #[test]
+    fn embed_falls_back_to_mermaid_when_d2_unrendered() {
+        let feat_outcome = sweep_input("a -> b: ok").unwrap();
+        let d2_source = SweptDiagramSource::from_gate_outcome(&feat_outcome, DiagramFormat::D2);
+        let skipped = DiagramRenderOutcome::skipped("d2 unavailable");
+
+        let embed = architecture_embed_markdown(&d2_source, &skipped, "src/worker").unwrap();
+        assert!(embed.starts_with("```mermaid\n"), "expected a mermaid fence, got: {embed}");
+        assert!(!embed.contains("<img"), "must never embed a broken <img> tag");
+        assert!(embed.contains("src/worker"));
+    }
+
+    /// The d2/SVG raster path is used ONLY when the binary is present AND
+    /// verified (i.e. `render_outcome` actually carries an SVG) -- in that
+    /// one case the embed is the raw inline SVG (never `<img>`).
+    #[test]
+    fn embed_uses_inline_svg_when_d2_actually_rendered() {
+        let feat_outcome = sweep_input("a -> b: ok").unwrap();
+        let d2_source = SweptDiagramSource::from_gate_outcome(&feat_outcome, DiagramFormat::D2);
+        let rendered = DiagramRenderOutcome::rendered("<svg>real diagram</svg>".to_string());
+
+        let embed = architecture_embed_markdown(&d2_source, &rendered, "src/worker").unwrap();
+        assert_eq!(embed, "<svg>real diagram</svg>");
+        assert!(!embed.contains("<img"));
+    }
+
+    #[test]
+    fn mermaid_embed_never_exceeds_gitea_source_limit() {
+        let src = mermaid("flowchart LR\n    A --> B\n");
+        let embed = architecture_embed_markdown(&src, &DiagramRenderOutcome::skipped("n/a"), "x").unwrap();
+        // The fence wrapper adds constant overhead; the SOURCE itself (what
+        // Gitea measures) must be under the limit -- already enforced by
+        // mermaid_fence/validate_mermaid_flowchart, asserted again here at
+        // the embed-function boundary.
+        assert!(embed.len() < MERMAID_MAX_SOURCE_CHARS + 20);
+    }
+
+    // ── DOCGEN-22: the LIVE README's architecture embed stays valid ─────
+
+    /// Regression guard for the repo's own `README.md` `## Architecture`
+    /// section, fixed as part of this item: extracts the fenced mermaid
+    /// block between `## Architecture` and the next `## ` heading and runs
+    /// it through the exact same [`validate_mermaid_flowchart`] rules the
+    /// engine enforces on generated diagrams, so the live README can never
+    /// silently drift back to a broken `<img>` embed or invalid mermaid
+    /// without this test catching it.
+    #[test]
+    fn live_readme_architecture_section_is_a_valid_mermaid_flowchart() {
+        let readme = include_str!("../../../README.md");
+        let arch_start = readme.find("\n## Architecture\n").expect("README must have an ## Architecture section");
+        let after = &readme[arch_start + 1..];
+        let section_end = after[1..]
+            .find("\n## ")
+            .map(|i| i + 1)
+            .unwrap_or(after.len());
+        let section = &after[..section_end];
+
+        assert!(!section.contains("<img"), "README Architecture section must not embed via <img>: {section}");
+
+        let fence_start = section.find("```mermaid\n").expect("README Architecture section must contain a ```mermaid fence");
+        let after_fence = &section[fence_start + "```mermaid\n".len()..];
+        let fence_end = after_fence.find("```").expect("unterminated ```mermaid fence in README");
+        let mermaid_source = &after_fence[..fence_end];
+
+        validate_mermaid_flowchart(mermaid_source)
+            .expect("README's architecture mermaid block must be valid renderable mermaid");
     }
 }
