@@ -801,6 +801,34 @@ Its risk/elegance surface is rebuilt over the following S115 items:
   and time are bounded (`CORTEX_AUDIT_MAX_CLONE_BYTES` /
   `CORTEX_AUDIT_CLONE_TIMEOUT_SECS`) — an oversized or slow clone is refused,
   not silently truncated.
+- `cortex_house_style` — live as of **CXEG-06**: house-style exemplar
+  extraction from Atlas (`src/cortex/house_style.rs`), so a future Tier-C
+  reviewer can cite "how THIS codebase does X" instead of generic opinion.
+  Scoped **per Leiden community** (KGRAPH-05), never a single global style —
+  a `pg/` subsystem and a `cortex/` subsystem can legitimately favor
+  different idioms. For `project_id` (+ optional `community`, else up to 25
+  communities ascending), returns each community's deterministic modal
+  `facts` (dominant node kind, an error-type idiom, a `from_env()`
+  config-read idiom, whether the `RustTool` 4-method shape is present — all
+  derived from graph metadata only: `kind`/`name`/`path`, never a
+  source-text read or an LLM call) plus per-kind `exemplars_by_kind` (node
+  id, file, span, rank, selection score), chosen by nearest-to-centroid
+  embedding similarity over each member's `node_card` (the same
+  `vec_embed::node_card`/`EmbedClient` path `metrics`'s semantic-duplication
+  detector and `scribe_kg_build`'s pipeline reuse). Degrades honestly rather
+  than misrepresenting a thin sample: a community below
+  `house_style::MIN_COMMUNITY_SIZE` is `profile:"unstable"` with no
+  exemplars; a `(community, kind)` bucket below `MIN_BUCKET_SIZE` flags
+  `sparse:true`; an unavailable/unreachable embeddings endpoint falls back to
+  centrality-only ranking and flags `degraded:true` (only for the affected
+  buckets — every other bucket in the same profile is unaffected). Every
+  distribution filters to the current bi-temporal view
+  (`graph.current_nodes()`), so an invalidated symbol never appears. Profiles
+  are cached in-process per `(project_id, community)`, keyed by the graph's
+  `build_seq` "generation" (`house_style::HouseStyleCache`), so a
+  `scribe_kg_build` rebuild transparently invalidates every stale entry on
+  next access. Degrades to `configured:false` (never an error) when the
+  project has no stored Atlas graph yet.
 
 The seven retired graph-relay tools are kept only as zero-I/O **deprecation
 aliases** (`src/cortex/deprecated.rs`) that return a structured

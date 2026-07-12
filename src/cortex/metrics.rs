@@ -549,6 +549,7 @@ mod tests {
             atlas_database_url: None,
             max_blast_nodes: crate::cortex::scope::DEFAULT_MAX_BLAST_NODES,
             tier_b_percentile: 90.0,
+            house_style_exemplars_k: crate::cortex::house_style::DEFAULT_EXEMPLARS_K,
             risk_weight_centrality_spike: 2.0,
             risk_weight_complexity_spike: 1.5,
             risk_weight_fan_out_explosion: 1.5,

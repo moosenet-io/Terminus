@@ -41,13 +41,31 @@
 //!   transient graph build + CXEG-03 structural scoring (see `audit.rs`'s
 //!   `run_audit` and the "Tool: cortex_audit" section below).
 //!
-//! Net result: this module registers 10 tool NAMES total (unchanged from
-//! before, so no MCP-surface churn for callers listing tools). Of those,
-//! `cortex_scope` (CXEG-02), `cortex_review` (CXEG-04), and `cortex_audit`
-//! (CXEG-11, merged from `main`) are all real, live Atlas-backed tools; and
+//! Net result: this module registers 11 tool NAMES total (the 10 from before
+//! CXEG-06, so no churn for callers listing them, plus `cortex_house_style`
+//! added live in **CXEG-06**). Of those, `cortex_scope` (CXEG-02),
+//! `cortex_review` (CXEG-04), `cortex_audit` (CXEG-11), and
+//! `cortex_house_style` (CXEG-06) are all real, live Atlas-backed tools; and
 //! the other 7 are pure deprecation aliases with no backend at all.
-//! `test_cortex_tools_registered` below asserts this shape (10 names
+//! `test_cortex_tools_registered` below asserts this shape (11 names
 //! present), not the old 10-live-relay-tools implementation.
+//!
+//! ## CXEG-06: `cortex_house_style` — Atlas-derived house-style exemplars
+//!
+//! `src/cortex/house_style.rs` derives, per project and per Leiden community
+//! (KGRAPH-05), the community's modal patterns (dominant kind/error-type
+//! idiom/config-read idiom/`RustTool`-shape presence — all graph-metadata-
+//! only, no source-text inspection) plus a handful of representative
+//! exemplar node refs, so a future Tier-C reviewer can cite "how THIS
+//! codebase does X" instead of generic opinion. Exemplars are selected by
+//! nearest-to-centroid embedding similarity (reusing `vec_embed::node_card`/
+//! `EmbedClient`, the same card+embed path `metrics`'s semantic-duplication
+//! detector and `scribe_kg_build`'s pipeline use), falling back to
+//! centrality-only ranking (`degraded:true`) when embeddings are
+//! unavailable. Profiles are cached per `(project_id, community)`, keyed by
+//! the graph's `build_seq` generation (`house_style::HouseStyleCache`), so a
+//! `scribe_kg_build` rebuild transparently invalidates stale entries. See
+//! `house_style`'s module doc for the full degrade contract.
 //!
 //! ## `project_id`, not `repo`
 //!
@@ -83,11 +101,14 @@ use crate::tool::RustTool;
 
 pub mod audit;
 pub mod deprecated;
+pub mod house_style;
 pub mod metrics;
 pub mod review;
 pub mod scope;
 
 use audit::validate_repo_url;
+use crate::scribe::graph::store::GraphStore;
+use crate::scribe::ScribeConfig;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -166,6 +187,13 @@ pub struct CortexConfig {
     /// design (see `metrics` module doc) — never a hardcoded absolute. From
     /// `CORTEX_TIER_B_PERCENTILE`, default `90.0`.
     pub tier_b_percentile: f64,
+    /// CXEG-06's `cortex_house_style`: how many exemplar nodes to select per
+    /// `(community, kind)` bucket. From `CORTEX_HOUSE_STYLE_K`, default
+    /// [`house_style::DEFAULT_EXEMPLARS_K`]. A zero/unparseable value falls
+    /// back to the default (a zero K would silently return no exemplars at
+    /// all, never the intent of an unset/misconfigured value — same
+    /// reasoning as `max_blast_nodes`).
+    pub house_style_exemplars_k: usize,
     /// CXEG-04's `cortex_review` risk-score weight for a `centrality_spike`
     /// structural signal (`points = weight * severity`). From
     /// `CORTEX_RISK_WEIGHT_CENTRALITY_SPIKE`, default `2.0`. Sane-conservative
@@ -224,6 +252,7 @@ impl CortexConfig {
             atlas_database_url: crate::config::atlas_database_url(),
             max_blast_nodes: env_usize("CORTEX_MAX_BLAST_NODES", scope::DEFAULT_MAX_BLAST_NODES),
             tier_b_percentile: env_f64("CORTEX_TIER_B_PERCENTILE", 90.0),
+            house_style_exemplars_k: env_usize("CORTEX_HOUSE_STYLE_K", house_style::DEFAULT_EXEMPLARS_K),
             risk_weight_centrality_spike: env_f64("CORTEX_RISK_WEIGHT_CENTRALITY_SPIKE", 2.0),
             risk_weight_complexity_spike: env_f64("CORTEX_RISK_WEIGHT_COMPLEXITY_SPIKE", 1.5),
             risk_weight_fan_out_explosion: env_f64("CORTEX_RISK_WEIGHT_FAN_OUT_EXPLOSION", 1.5),
@@ -561,20 +590,134 @@ impl RustTool for CortexAudit {
 }
 
 // ---------------------------------------------------------------------------
+// Tool: cortex_house_style (CXEG-06: Atlas-derived house-style exemplars)
+// ---------------------------------------------------------------------------
+
+/// A single `cortex_house_style` call with no explicit `community` computes
+/// at most this many communities (ascending cluster-id order) — a bound
+/// against enumerating every community of an enormous graph in one response,
+/// mirroring `CORTEX_MAX_BLAST_NODES`'s "cap, don't silently do unbounded
+/// work" posture. A caller that wants a SPECIFIC community beyond this bound
+/// still gets it by passing `community` explicitly.
+const MAX_HOUSE_STYLE_COMMUNITIES: usize = 25;
+
+pub struct CortexHouseStyle {
+    config: Arc<CortexConfig>,
+    cache: Arc<house_style::HouseStyleCache>,
+}
+
+#[async_trait]
+impl RustTool for CortexHouseStyle {
+    fn name(&self) -> &str {
+        "cortex_house_style"
+    }
+
+    fn description(&self) -> &str {
+        "Derive a project's house-style exemplars from its Atlas knowledge graph, \
+         scoped per Leiden community (subsystems legitimately differ, so this is \
+         never a single global style). project_id: one of TERM/LUM/HARM/CHRD/RAIL. \
+         community: optional cluster id; when omitted, returns up to 25 communities \
+         (ascending id). Each community's profile carries deterministic modal facts \
+         (dominant node kind, an error-type idiom, a from_env() config-read idiom, \
+         whether the RustTool 4-method shape is present -- all derived from graph \
+         metadata only, no source-text read, no LLM) plus per-kind exemplar node refs \
+         (id, file, span, rank, selection score) chosen by nearest-to-centroid \
+         embedding similarity, falling back to centrality-only ranking \
+         (degraded:true) when embeddings are unavailable. A community below the \
+         minimum sample size is flagged profile:'unstable' with no exemplars \
+         rather than silently misrepresenting it; a thin (community,kind) bucket \
+         is flagged sparse:true. Profiles are cached per (project_id, community), \
+         keyed by the graph's build_seq, so a scribe_kg_build rebuild transparently \
+         invalidates stale entries. Degrades to configured:false (never an error) \
+         when the project has no stored Atlas graph yet -- run scribe_kg_build first."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "project_id": { "type": "string", "description": "One of TERM/LUM/HARM/CHRD/RAIL", "enum": PROJECT_IDS },
+                "community": { "type": "integer", "description": "Leiden community/cluster id; omit for up to 25 communities (ascending id)" }
+            },
+            "required": ["project_id"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let project_id = require_str(&args, "project_id")?;
+        validate_project_id(project_id)?;
+        let requested_community = match args.get("community") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(
+                v.as_u64()
+                    .ok_or_else(|| ToolError::InvalidArgument("'community' must be a non-negative integer".to_string()))?
+                    as u32,
+            ),
+        };
+
+        let store = GraphStore::from_config(&ScribeConfig::from_env());
+        let graph = match store.load(project_id) {
+            Ok(Some(g)) => g,
+            Ok(None) | Err(_) => {
+                let response = json!({
+                    "configured": false,
+                    "project_id": project_id,
+                    "message": "no stored Atlas graph for this project yet -- run scribe_kg_build first",
+                });
+                return serde_json::to_string_pretty(&response)
+                    .map_err(|e| ToolError::Execution(format!("JSON render error: {e}")));
+            }
+        };
+
+        let communities: Vec<u32> = match requested_community {
+            Some(c) => vec![c],
+            None => house_style::current_communities(&graph)
+                .into_iter()
+                .take(MAX_HOUSE_STYLE_COMMUNITIES)
+                .collect(),
+        };
+
+        let mut profiles = Vec::with_capacity(communities.len());
+        for community in communities {
+            profiles.push(
+                self.cache
+                    .get_or_compute(&graph, project_id, community, self.config.house_style_exemplars_k)
+                    .await,
+            );
+        }
+
+        let response = json!({
+            "configured": true,
+            "project_id": project_id,
+            "generation": graph.build_seq,
+            "profiles": profiles,
+        });
+        serde_json::to_string_pretty(&response)
+            .map_err(|e| ToolError::Execution(format!("JSON render error: {e}")))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
-/// Register all Cortex tools into the ToolRegistry: the 3 "real" tools
+/// Register all Cortex tools into the ToolRegistry: the 4 "real" tools
 /// (`cortex_scope` — live Atlas-backed blast radius as of CXEG-02;
-/// `cortex_review` — live Atlas-backed risk scoring as of CXEG-04;
+/// `cortex_house_style` — live Atlas-derived house-style exemplars as of
+/// CXEG-06; `cortex_review` — live Atlas-backed risk scoring as of CXEG-04;
 /// `cortex_audit` — live Atlas-backed external-repo audit as of CXEG-11)
 /// plus the 7 deprecation aliases for the retired pure-relay tools (see
 /// [`deprecated`]).
 pub fn register(registry: &mut ToolRegistry) {
     let config = Arc::new(CortexConfig::from_env());
+    let house_style_cache = Arc::new(house_style::HouseStyleCache::new());
 
     let _ = registry.register(Box::new(CortexScope {
         config: Arc::clone(&config),
+    }));
+    let _ = registry.register(Box::new(CortexHouseStyle {
+        config: Arc::clone(&config),
+        cache: house_style_cache,
     }));
     let _ = registry.register(Box::new(CortexReview {
         config: Arc::clone(&config),
@@ -602,6 +745,7 @@ mod tests {
             atlas_database_url: None,
             max_blast_nodes: scope::DEFAULT_MAX_BLAST_NODES,
             tier_b_percentile: 90.0,
+            house_style_exemplars_k: house_style::DEFAULT_EXEMPLARS_K,
             risk_weight_centrality_spike: 2.0,
             risk_weight_complexity_spike: 1.5,
             risk_weight_fan_out_explosion: 1.5,
@@ -956,13 +1100,15 @@ mod tests {
     fn test_cortex_tools_registered() {
         let mut registry = ToolRegistry::new();
         register(&mut registry);
-        // 3 "real" tools (cortex_scope live since CXEG-02, cortex_review
-        // live since CXEG-04, cortex_audit live since CXEG-11) + 7 deprecation
-        // aliases = 10 names, matching the pre-CXEG-01 tool-name surface
-        // (no MCP-listing churn).
-        assert_eq!(registry.len(), 10);
+        // 4 "real" tools (cortex_scope live since CXEG-02, cortex_review
+        // live since CXEG-04, cortex_audit live since CXEG-11, and
+        // cortex_house_style live since CXEG-06) + 7 deprecation aliases
+        // = 11 names — the pre-CXEG-06 10-name surface plus CXEG-06's new
+        // `cortex_house_style` (an intentional, additive MCP-listing change).
+        assert_eq!(registry.len(), 11);
         for name in [
             "cortex_scope",
+            "cortex_house_style",
             "cortex_review",
             "cortex_audit",
             "cortex_stats",
@@ -975,5 +1121,51 @@ mod tests {
         ] {
             assert!(registry.contains(name), "missing tool {name}");
         }
+    }
+
+    // --- cortex_house_style (CXEG-06) ------------------------------------
+
+    #[tokio::test]
+    async fn test_house_style_rejects_unknown_project_id() {
+        let tool = CortexHouseStyle {
+            config: test_config(),
+            cache: Arc::new(house_style::HouseStyleCache::new()),
+        };
+        let err = tool.execute(json!({"project_id": "NOPE"})).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn test_house_style_rejects_non_integer_community() {
+        let tool = CortexHouseStyle {
+            config: test_config(),
+            cache: Arc::new(house_style::HouseStyleCache::new()),
+        };
+        let err = tool
+            .execute(json!({"project_id": "TERM", "community": "not-a-number"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_house_style_degrades_to_configured_false_without_a_stored_graph() {
+        let store_dir = std::env::temp_dir().join(format!("atlas-cortexmod-housestyle-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+
+        let tool = CortexHouseStyle {
+            config: test_config(),
+            cache: Arc::new(house_style::HouseStyleCache::new()),
+        };
+        let out = tool
+            .execute(json!({"project_id": "TERM"}))
+            .await
+            .expect("no stored graph must degrade, not error");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["configured"], false);
+        assert_eq!(v["project_id"], "TERM");
+
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
     }
 }
