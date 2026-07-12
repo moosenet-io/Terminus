@@ -493,28 +493,51 @@ async fn handle_mcp(
                     })
                 })
                 .collect();
+            // TMOD-04 precedence (IDENTICAL in `tools/list` here and in the
+            // `tools/call` dispatch order below): compiled-in > worker-route
+            // > personal-federation. A given bare tool name is advertised by
+            // -- and dispatched to -- the FIRST of those three sources that
+            // owns it, so `tools/list` and `tools/call` never disagree about
+            // which implementation a name resolves to.
+            //
+            // Worker routes are therefore merged BEFORE the personal set:
+            // `merge_catalog` skips any route whose name collides with a
+            // tool already in `tools` (so far, only compiled-in), so
+            // compiled-in wins over a worker route; then the personal set
+            // below is filtered to skip any name already present
+            // (compiled-in OR worker-route), so a worker route wins over a
+            // personal-federated tool of the same name -- matching the
+            // `tools/call` order (registry miss -> worker route -> personal
+            // federation). `broker_routes` empty (every deployment before a
+            // worker is ever installed) makes this a no-op.
+            tools = crate::broker::routes::merge_catalog(tools, &broker_routes).await;
             // TGW-02: aggregate in the personal-registry tool set (metadata
             // only, no network call -- see
             // `crate::registry::personal_only_tool_metadata`'s doc) when
             // this process is configured to federate personal-tool calls.
+            // Per the precedence above, a personal tool whose name is already
+            // served by a compiled-in tool or a worker route is dropped here
+            // (that higher-precedence source is what `tools/call` dispatches
+            // to), so list and call agree.
             if state.personal_federation.is_some() {
-                tools.extend(crate::registry::personal_only_tool_metadata().into_iter().map(|t| {
-                    json!({
-                        "name": t.name,
-                        "description": t.description,
-                        "inputSchema": t.parameters,
-                    })
-                }));
+                let existing: std::collections::HashSet<String> = tools
+                    .iter()
+                    .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+                    .map(str::to_string)
+                    .collect();
+                tools.extend(
+                    crate::registry::personal_only_tool_metadata()
+                        .into_iter()
+                        .filter(|t| !existing.contains(&t.name))
+                        .map(|t| {
+                            json!({
+                                "name": t.name,
+                                "description": t.description,
+                                "inputSchema": t.parameters,
+                            })
+                        }),
+                );
             }
-            // TMOD-04: merge in every currently-healthy broker-routed
-            // worker's tools (bare, unprefixed names) -- see
-            // `crate::broker::routes::merge_catalog`'s doc. A route whose
-            // name collides with a tool already in `tools` (compiled-in, or
-            // the personal-federation set above) is skipped: compiled-in/
-            // personal-federated wins, per this table's documented
-            // precedence. `broker_routes` empty (every deployment before a
-            // worker is ever installed) makes this byte-for-byte a no-op.
-            tools = crate::broker::routes::merge_catalog(tools, &broker_routes).await;
             // MESH-03: merge in every currently-healthy mesh upstream's
             // tools, namespaced `<namespace>__<tool>` -- see
             // `crate::mesh::merge::MergedCatalog`. `state.mesh_pool` is
@@ -883,6 +906,16 @@ async fn handle_mcp(
                         (sse_response(id, Ok(result), ""), true, None)
                     }
                     Some(Err(e)) => {
+                        // LIMITATION: every `WorkerTransport::call` failure is
+                        // audited as a transport failure -- an unhealthy
+                        // worker AND an application-level tool error the
+                        // worker deliberately returned both collapse to
+                        // `ToolError::Execution` at the TMOD-02 transport
+                        // boundary, so they're indistinguishable here.
+                        // Splitting them apart requires a TMOD-02
+                        // transport-contract change (a distinct app-error
+                        // wire shape); that is a documented follow-up, not
+                        // part of TMOD-04.
                         is_transport_failure = true;
                         let msg = e.to_string();
                         (
@@ -1463,6 +1496,81 @@ mod tests {
         assert_eq!(names.iter().filter(|n| **n == "health").count(), 1);
         let health = tools.iter().find(|t| t["name"] == "health").unwrap();
         assert_eq!(health["description"], "Health check", "compiled-in health wins on the name clash");
+    }
+
+    /// Round-2 review: a name present as BOTH a worker route AND a
+    /// personal-federated tool must be LISTED and CALLED as the SAME
+    /// implementation (the worker route), per the documented precedence
+    /// compiled-in > worker-route > personal-federation applied identically
+    /// in `tools/list` ordering and `tools/call` dispatch order.
+    #[tokio::test]
+    async fn tmod04_worker_route_wins_over_personal_federation_in_list_and_call() {
+        // A real personal-only tool name to collide with.
+        let personal_name = crate::registry::personal_only_tool_metadata()
+            .into_iter()
+            .next()
+            .expect("there is at least one personal-only tool")
+            .name;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoHealthTool)).unwrap();
+        let broker_routes = crate::broker::routes::RouteTable::new();
+        broker_routes.install(crate::broker::routes::WorkerRoute {
+            worker_id: "w1".to_string(),
+            transport: Arc::new(StubWorker { healthy: true, reply: "served by worker route".to_string() }),
+            tool: crate::registry::ToolInfo {
+                name: personal_name.clone(),
+                description: "worker-route implementation".to_string(),
+                parameters: json!({"type": "object"}),
+            },
+        });
+        let state = Arc::new(McpServerState {
+            registry: ArcSwap::from_pointee(registry),
+            server_name: "terminus-personal-test".to_string(),
+            server_version: "0.0.0-test".to_string(),
+            auth_token: None,
+            // Points at a dead address: if the worker route did NOT win, the
+            // call below would fall THROUGH to here and surface a
+            // "federation error" -- which the assertions would catch.
+            personal_federation: Some(
+                crate::federation::PersonalFederationClient::with_base_url("http://127.0.0.1:1")
+                    .with_timeout(std::time::Duration::from_millis(200)),
+            ),
+            inference_proxy: None,
+            gateway: None,
+            mesh_pool: None,
+            principal_resolver: PrincipalResolver::default(),
+            broker_routes,
+        });
+
+        // tools/list: the colliding name is advertised exactly ONCE, as the
+        // worker route (not the personal-federation metadata).
+        let router = build_router(state.clone());
+        let (_, list_body, _) =
+            post_mcp(router, json!({"jsonrpc": "2.0", "id": 50, "method": "tools/list"})).await;
+        let tools = list_body["result"]["tools"].as_array().unwrap();
+        let matching: Vec<&Value> = tools.iter().filter(|t| t["name"] == personal_name.as_str()).collect();
+        assert_eq!(matching.len(), 1, "the colliding name must be listed exactly once");
+        assert_eq!(
+            matching[0]["description"], "worker-route implementation",
+            "worker route wins over personal federation in tools/list"
+        );
+
+        // tools/call: dispatches to the worker route, NOT personal federation.
+        let router2 = build_router(state);
+        let (_, call_body, _) = post_mcp(
+            router2,
+            json!({
+                "jsonrpc": "2.0", "id": 51, "method": "tools/call",
+                "params": {"name": personal_name.clone(), "arguments": {}}
+            }),
+        )
+        .await;
+        assert_eq!(call_body["result"]["isError"], false, "worker route must serve the call cleanly");
+        assert_eq!(
+            call_body["result"]["content"][0]["text"], "served by worker route",
+            "worker route wins over personal federation in tools/call"
+        );
     }
 
     // ── EGJS-01: structuredContent ──────────────────────────────────────────
