@@ -31,6 +31,11 @@ use crate::manifest::WorkerManifest;
 pub enum ServeError {
     #[error("io error binding/serving worker socket: {0}")]
     Io(#[from] std::io::Error),
+    #[error(
+        "refusing to bind: \"{0}\" already exists and is not a Unix socket \
+         (won't delete a regular file/symlink/directory) -- remove it or pick a different path"
+    )]
+    NotASocket(String),
 }
 
 /// Shared, immutable state one bound worker socket serves from: the tool
@@ -40,7 +45,7 @@ pub struct WorkerState {
     pub(crate) tools: HashMap<String, Box<dyn RustTool>>,
 }
 
-/// Bind `socket_path` (removing any stale socket file left behind by a
+/// Bind `socket_path` (removing any stale *socket* file left behind by a
 /// prior, uncleanly-terminated run) and serve JSON-RPC requests forever, one
 /// task per accepted connection.
 ///
@@ -51,10 +56,7 @@ pub struct WorkerState {
 /// JSON-RPC 2.0 notification semantics and the daemon's own
 /// `notifications/initialized` handling.
 pub async fn serve(socket_path: &str, state: Arc<WorkerState>) -> Result<(), ServeError> {
-    // Best-effort cleanup of a stale socket file from a prior run that
-    // didn't shut down cleanly -- UnixListener::bind fails with AddrInUse
-    // otherwise, even though nothing is actually listening anymore.
-    let _ = std::fs::remove_file(socket_path);
+    prepare_socket_path(socket_path)?;
     let listener = UnixListener::bind(socket_path)?;
     tracing::info!(
         socket_path,
@@ -71,6 +73,35 @@ pub async fn serve(socket_path: &str, state: Arc<WorkerState>) -> Result<(), Ser
                 tracing::warn!("terminus-worker-sdk: connection error: {e}");
             }
         });
+    }
+}
+
+/// Reclaim `socket_path` for a fresh `bind()` — but ONLY if what's there is
+/// an actual Unix socket left over from a prior run.
+///
+/// A blanket `remove_file` here would delete whatever happens to sit at the
+/// path (a real file, a symlink, someone else's data) the moment a worker
+/// starts — a genuine footgun if the operator points two workers at the same
+/// path, or fat-fingers a real file's path. Instead: if the path doesn't
+/// exist, nothing to do; if it exists and IS a socket, remove it (stale from
+/// an unclean shutdown, so `bind` would otherwise fail with `AddrInUse`); if
+/// it exists and is NOT a socket, refuse with a clear error and delete
+/// nothing.
+fn prepare_socket_path(socket_path: &str) -> Result<(), ServeError> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let meta = match std::fs::symlink_metadata(socket_path) {
+        Ok(m) => m,
+        // Nothing at the path -- the common, clean case. `bind` creates it.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(ServeError::Io(e)),
+    };
+
+    if meta.file_type().is_socket() {
+        std::fs::remove_file(socket_path).map_err(ServeError::Io)?;
+        Ok(())
+    } else {
+        Err(ServeError::NotASocket(socket_path.to_string()))
     }
 }
 
@@ -136,16 +167,15 @@ async fn dispatch_line(line: &str, state: &WorkerState) -> Option<Value> {
 }
 
 fn initialize_result(state: &WorkerState) -> Value {
+    // The `manifest` field is the WorkerManifest's OWN serialization (not a
+    // hand-built lookalike), so the advertised JSON always matches the type's
+    // wire contract -- see `manifest::WorkerManifest`'s `Serialize` impl.
+    let manifest = serde_json::to_value(&state.manifest).unwrap_or_else(|_| json!({}));
     json!({
         "protocolVersion": "2024-11-05",
         "capabilities": {"tools": {"listChanged": false}},
         "serverInfo": {"name": state.manifest.name, "version": state.manifest.semver},
-        "manifest": {
-            "name": state.manifest.name,
-            "semver": state.manifest.semver,
-            "capabilityClass": state.manifest.capability_class,
-            "tools": tool_infos(state).iter().map(tool_info_json).collect::<Vec<_>>(),
-        }
+        "manifest": manifest,
     })
 }
 
@@ -319,9 +349,57 @@ mod tests {
         assert_eq!(resp["result"]["manifest"]["name"], "test-worker");
         assert_eq!(resp["result"]["manifest"]["semver"], "0.1.0");
         assert_eq!(resp["result"]["manifest"]["capabilityClass"], "core");
+        // Finding #1: the tool catalog is present in the SERIALIZED manifest
+        // (name + inputSchema), not just a hand-built lookalike.
         assert_eq!(resp["result"]["manifest"]["tools"][0]["name"], "echo");
+        assert_eq!(resp["result"]["manifest"]["tools"][0]["description"], "Echoes its input back");
+        assert_eq!(
+            resp["result"]["manifest"]["tools"][0]["inputSchema"]["properties"]["text"]["type"],
+            "string"
+        );
 
         let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn serve_refuses_non_socket_path_without_deleting_it() {
+        // Finding #3: a regular file at socket_path must NOT be deleted --
+        // serve() returns a clear error and leaves the file intact.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a-socket.txt");
+        std::fs::write(&path, b"precious data").unwrap();
+        let path_str = path.to_str().unwrap().to_string();
+
+        let state = test_state(vec![]);
+        let err = serve(&path_str, state).await.unwrap_err();
+        assert!(matches!(err, ServeError::NotASocket(_)), "got: {err:?}");
+
+        // The file was left untouched -- not deleted, contents intact.
+        assert!(path.exists(), "regular file must not be deleted");
+        assert_eq!(std::fs::read(&path).unwrap(), b"precious data");
+    }
+
+    #[tokio::test]
+    async fn serve_reclaims_a_stale_socket_file() {
+        // The counterpart to the guard above: a leftover *socket* from a
+        // prior unclean run IS reclaimed, so restart-after-crash works.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.sock");
+        let path_str = path.to_str().unwrap().to_string();
+
+        // Bind + drop a listener to leave a stale socket file on disk.
+        {
+            let _l = UnixListener::bind(&path_str).unwrap();
+        }
+        assert!(path.exists(), "precondition: stale socket file present");
+
+        let state = test_state(vec![]);
+        let serve_path = path_str.clone();
+        let handle = tokio::spawn(async move { serve(&serve_path, state).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!handle.is_finished(), "serve should have reclaimed the stale socket and be listening");
+        assert!(UnixStream::connect(&path_str).await.is_ok());
+        handle.abort();
     }
 
     #[tokio::test]

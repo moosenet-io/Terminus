@@ -97,13 +97,26 @@ worker built with this SDK) is a follow-up item**, not part of TMOD-03.
 fails closed with a clear error rather than starting in a broken state:
 
 - Empty worker name → `ManifestError::EmptyName`.
-- Malformed semver (anything other than plain `MAJOR.MINOR.PATCH`, e.g.
-  `"1.0"`, `"v1.0.0"`, `"1.0.0-beta"`) → `ManifestError::InvalidSemver`.
+- Malformed semver → `ManifestError::InvalidSemver`. The version must be a
+  real [SemVer 2.0.0](https://semver.org) string: a `MAJOR.MINOR.PATCH`
+  core of non-negative integers (no leading zeros), with an **optional**
+  `-prerelease` and/or `+build` suffix. So `1.2.3`, `1.0.0-beta`,
+  `1.0.0-alpha.1`, and `1.0.0-beta+exp.sha.5114f85` are all accepted;
+  `1.0`, `v1.0.0`, `01.2.3`, and `1.0.0-beta_1` are rejected.
 - Two tools registered under the same `name()` on one worker →
   `ManifestError::DuplicateTool`.
 
 A worker that registers zero tools is valid — it starts, advertises an
 empty catalog, and answers `tools/call` for any name with "Unknown tool".
+
+### Socket path safety
+
+`serve()` never blindly deletes whatever is at `socket_path`. If a **stale
+Unix socket** is there (left by a prior unclean shutdown) it is removed so
+`bind()` can reclaim the path; if a **non-socket** (a regular file, symlink,
+or directory) is there, `serve()` refuses with `ServeError::NotASocket` and
+deletes nothing — so pointing a worker at a real file's path can never
+destroy it.
 
 No secrets or infra literals are needed by this crate: a Unix domain socket
 is authorized by filesystem permissions on the socket path, not by any
