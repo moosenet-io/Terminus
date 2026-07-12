@@ -245,10 +245,10 @@ mod tests {
 
     #[test]
     fn humantime_rfc3339_renders_known_epoch() {
-        // 2026-07-16T00:00:00Z, a fixed known instant, sanity-checks the
-        // hand-rolled civil-calendar renderer against a value that's easy
-        // to verify by hand.
-        let unix_secs = 1_784_246_400_u64; // 2026-07-16T00:00:00Z
+        // A fixed known 2026 instant sanity-checks the hand-rolled
+        // civil-calendar renderer; we assert only the year prefix + `Z` suffix,
+        // so the exact day isn't load-bearing here.
+        let unix_secs = 1_784_246_400_u64;
         let rendered = humantime_rfc3339(unix_secs);
         assert!(rendered.starts_with("2026-"));
         assert!(rendered.ends_with('Z'));

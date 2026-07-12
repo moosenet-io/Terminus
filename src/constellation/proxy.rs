@@ -40,7 +40,7 @@
 //! backend call is attempted.
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
@@ -75,6 +75,18 @@ fn respond(status: StatusCode, body: Value) -> Response {
     (status, [("content-type", "application/json")], masked.to_string()).into_response()
 }
 
+/// Build the upstream target URL from the backend base, the wildcard sub-path,
+/// and the (optional, raw) query string. The query string MUST be preserved
+/// when forwarding — dropping it was an agy CONST-02 review finding
+/// (e.g. `/api/harmony/tree/LUM?depth=2` lost its `?depth=2`).
+fn build_target(base: &str, sub_path: &str, query: Option<&str>) -> String {
+    let path_target = format!("{}/{}", base.trim_end_matches('/'), sub_path.trim_start_matches('/'));
+    match query {
+        Some(q) if !q.is_empty() => format!("{path_target}?{q}"),
+        _ => path_target,
+    }
+}
+
 /// Shared implementation for all three namespaced proxy routes. `system` is
 /// the fixed literal namespace (`"harmony"`/`"chord"`/`"lumina"`);
 /// `base_url` is that system's configured backend base URL (`None` ⇒
@@ -84,11 +96,16 @@ async fn proxy(
     system: &'static str,
     base_url: Option<String>,
     sub_path: &str,
+    query: Option<&str>,
     method: Method,
     headers: &HeaderMap,
     body: Bytes,
     principal: Option<&str>,
 ) -> Response {
+    // Audit path deliberately excludes the query string: query params can
+    // themselves carry secret-shaped values, and unlike the body they are not
+    // run through the sanitizer, so keeping them out of the audit record avoids
+    // an unsanitized-secret-in-query leak. The query IS forwarded upstream.
     let request_path = format!("/api/{system}/{sub_path}");
 
     if audit::is_mutating_method(method.as_str()) {
@@ -108,7 +125,7 @@ async fn proxy(
         );
     };
 
-    let target = format!("{}/{}", base.trim_end_matches('/'), sub_path.trim_start_matches('/'));
+    let target = build_target(&base, sub_path, query);
     let timeout = Duration::from_millis(config::constellation_backend_timeout_ms());
 
     let content_type = headers
@@ -179,6 +196,7 @@ fn principal_from_headers(headers: &HeaderMap) -> Option<String> {
 pub async fn proxy_harmony(
     State(_state): State<Arc<McpServerState>>,
     Path(path): Path<String>,
+    RawQuery(query): RawQuery,
     method: Method,
     headers: HeaderMap,
     body: Bytes,
@@ -188,6 +206,7 @@ pub async fn proxy_harmony(
         "harmony",
         config::constellation_harmony_url(),
         &path,
+        query.as_deref(),
         method,
         &headers,
         body,
@@ -199,6 +218,7 @@ pub async fn proxy_harmony(
 pub async fn proxy_chord(
     State(_state): State<Arc<McpServerState>>,
     Path(path): Path<String>,
+    RawQuery(query): RawQuery,
     method: Method,
     headers: HeaderMap,
     body: Bytes,
@@ -208,6 +228,7 @@ pub async fn proxy_chord(
         "chord",
         config::constellation_chord_url(),
         &path,
+        query.as_deref(),
         method,
         &headers,
         body,
@@ -219,6 +240,7 @@ pub async fn proxy_chord(
 pub async fn proxy_lumina(
     State(_state): State<Arc<McpServerState>>,
     Path(path): Path<String>,
+    RawQuery(query): RawQuery,
     method: Method,
     headers: HeaderMap,
     body: Bytes,
@@ -228,6 +250,7 @@ pub async fn proxy_lumina(
         "lumina",
         config::constellation_lumina_url(),
         &path,
+        query.as_deref(),
         method,
         &headers,
         body,
@@ -248,6 +271,7 @@ mod tests {
             "harmony",
             None,
             "status",
+            None,
             Method::GET,
             &HeaderMap::new(),
             Bytes::new(),
@@ -271,6 +295,7 @@ mod tests {
             "chord",
             Some("http://127.0.0.1:1".to_string()), // pii-test-fixture
             "health",
+            None,
             Method::GET,
             &HeaderMap::new(),
             Bytes::new(),
@@ -282,6 +307,19 @@ mod tests {
         let parsed: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["system"], "chord");
         assert_eq!(parsed["available"], false);
+    }
+
+    #[test]
+    fn build_target_preserves_query_string() {
+        // Regression (agy CONST-02 review): the query string must survive
+        // forwarding, base trailing-slash and sub-path leading-slash normalize,
+        // and an empty/absent query adds no bare `?`.
+        assert_eq!(
+            build_target("http://h/", "tree/LUM", Some("depth=2&x=1")),
+            "http://h/tree/LUM?depth=2&x=1"
+        );
+        assert_eq!(build_target("http://h", "status", None), "http://h/status");
+        assert_eq!(build_target("http://h", "status", Some("")), "http://h/status");
     }
 
     #[test]
