@@ -20,9 +20,10 @@ use serde_json::{json, Value};
 use async_trait::async_trait;
 
 use super::findings_store::{FindingRow, FindingsStore, ScopeKind};
-use super::rules_store::{NewRule, RulesStore};
+use super::rules_store::{Enforcement, NewRule, RulesStore};
 use crate::error::ToolError;
 use crate::registry::ToolRegistry;
+use crate::review::ReviewRun;
 use crate::tool::{RustTool, ToolOutput};
 
 /// Default minimum occurrence count for a finding bucket to crystallize into
@@ -273,9 +274,275 @@ fn structured(v: Value) -> Result<ToolOutput, ToolError> {
     Ok(ToolOutput { text, structured: Some(v) })
 }
 
-/// Register the `kg_rule_crystallize` tool on the core registry.
+/// Register the `kg_rule_crystallize`/`kg_rule_promote` tools on the core registry.
 pub fn register(registry: &mut ToolRegistry) {
     let _ = registry.register(Box::new(KgRuleCrystallize));
+    let _ = registry.register(Box::new(KgRulePromote));
+}
+
+// ── kg_rule_promote (KGRULE-03) ─────────────────────────────────────────────
+
+/// Default adversarial review pair — the live daemon-backed providers
+/// (`review-daemon` reaches `codex`/`agy` over loopback HTTP; see
+/// `src/review/mod.rs`'s module docs), overridable per-call via the
+/// `providers` argument. Must stay exactly 2 entries: `structure` below is
+/// always `adversarial_pair`, which `review_run` itself requires exactly 2
+/// providers for.
+const DEFAULT_PROMOTION_PROVIDERS: [&str; 2] = ["codex", "agy"];
+
+/// Pure promotion DECISION: given the adversarial panel's aggregate verdict,
+/// whether it completed (every requested provider actually answered), the
+/// operator-requested target enforcement, and whether blocking promotion is
+/// operator-allowed, decide the final enforcement to promote to (or `None`
+/// to leave the rule a candidate). No I/O — fully unit-testable.
+///
+/// Rules (see KGRULE-03's spec):
+/// - Anything other than `"APPROVE"`, or an incomplete panel (a provider
+///   didn't answer), never promotes — fail-closed, mirroring the pipeline
+///   review gate.
+/// - `APPROVE` + complete promotes at `target`, EXCEPT `target == Blocking`
+///   is capped down to `LintCandidate` unless `allow_blocking` is `true`
+///   (the operator gate) — promotion to `blocking` is never automatic.
+pub fn promotion_decision(
+    aggregate_verdict: &str,
+    complete: bool,
+    target: Enforcement,
+    allow_blocking: bool,
+) -> Option<Enforcement> {
+    if aggregate_verdict != "APPROVE" || !complete {
+        return None;
+    }
+    if target == Enforcement::Blocking && !allow_blocking {
+        return Some(Enforcement::LintCandidate);
+    }
+    Some(target)
+}
+
+/// `kg_rule_promote(rule_id, target_enforcement?, allow_blocking?, providers?)`.
+///
+/// Runs an ADVERSARIAL `review_run` panel (`structure="adversarial_pair"`)
+/// whose job is to argue whether a candidate rule is real, correct, and
+/// earned, and only promotes (`candidate` → `active`) on an aggregate
+/// `APPROVE` from a *complete* panel. This is the single sanctioned review
+/// door (S9/v3.17) applied to rule governance — it calls
+/// `crate::review::ReviewRun` in-process rather than hand-rolling a
+/// reviewer.
+pub struct KgRulePromote;
+
+impl KgRulePromote {
+    /// Build the adversarial `review_run` call args for a candidate rule.
+    fn review_args(providers: &[String], rule: &super::rules_store::RuleRow) -> Value {
+        let criteria = format!(
+            "A durable coding RULE has been crystallized from {} recurring review findings on \
+{}:{} (category {}). Rule guidance: '{}'. Cortex risk: {}. ARGUE whether this is a REAL, \
+correct, non-spurious, generally-applicable rule that should govern future work — or whether \
+it is noise / overfit to a few findings / already covered by a compiler-lint. APPROVE only if \
+it is genuinely earned and worth enforcing.",
+            rule.recurrence_at_creation.unwrap_or(0),
+            rule.scope_kind,
+            rule.scope_ref,
+            rule.category,
+            rule.guidance,
+            rule.cortex_risk
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+        );
+
+        json!({
+            "structure": "adversarial_pair",
+            "providers": providers,
+            "criteria": criteria,
+            "context": {
+                "rule_id": rule.id.to_string(),
+                "scope_kind": rule.scope_kind,
+                "scope_ref": rule.scope_ref,
+                "category": rule.category,
+                "guidance": rule.guidance,
+                "recurrence_at_creation": rule.recurrence_at_creation,
+                "cortex_risk": rule.cortex_risk,
+            }
+        })
+    }
+}
+
+#[async_trait]
+impl RustTool for KgRulePromote {
+    fn name(&self) -> &str {
+        "kg_rule_promote"
+    }
+    fn description(&self) -> &str {
+        "Run an ADVERSARIAL review_run panel (S9's sanctioned review door) to decide whether a \
+candidate Atlas KG rule (kg_rules) is real, correct, and earned. Promotes candidate -> active \
+ONLY on an aggregate APPROVE from a complete panel; an incomplete panel or CHANGES_REQUESTED \
+leaves the rule a candidate. Promotion to 'blocking' enforcement is operator-gated via \
+allow_blocking and is never automatic -- without it, enforcement is capped at lint-candidate. \
+Degrades to `configured:false` when the rules store is unconfigured; never panics or errors on \
+a missing/already-active rule."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "rule_id": {"type": "string", "description": "uuid of the candidate rule to promote"},
+                "target_enforcement": {
+                    "type": "string",
+                    "enum": ["advisory", "lint-candidate", "blocking"],
+                    "description": "desired enforcement on promotion (default advisory); 'blocking' requires allow_blocking"
+                },
+                "allow_blocking": {
+                    "type": "boolean",
+                    "description": "operator gate: must be true for target_enforcement=blocking to actually promote to blocking (default false, capped at lint-candidate otherwise)"
+                },
+                "providers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "description": "exactly 2 review_run providers for the adversarial pair (default [\"codex\",\"agy\"])"
+                }
+            },
+            "required": ["rule_id"]
+        })
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.execute_structured(args).await?.text)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let rule_id_str = args
+            .get("rule_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                ToolError::InvalidArgument("'rule_id' is required and must be a non-empty string".into())
+            })?;
+        let rule_id = uuid::Uuid::parse_str(&rule_id_str)
+            .map_err(|e| ToolError::InvalidArgument(format!("'rule_id' is not a valid uuid: {e}")))?;
+
+        let target = match args.get("target_enforcement").and_then(|v| v.as_str()) {
+            None => Enforcement::Advisory,
+            Some(s) => Enforcement::parse(s).ok_or_else(|| {
+                ToolError::InvalidArgument(format!(
+                    "'target_enforcement' must be one of advisory|lint-candidate|blocking, got '{s}'"
+                ))
+            })?,
+        };
+        let allow_blocking = args
+            .get("allow_blocking")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let providers: Vec<String> = match args.get("providers").and_then(|v| v.as_array()) {
+            None => DEFAULT_PROMOTION_PROVIDERS.iter().map(|s| s.to_string()).collect(),
+            Some(arr) => {
+                let parsed: Option<Vec<String>> =
+                    arr.iter().map(|v| v.as_str().map(|s| s.to_string())).collect();
+                let parsed = parsed.ok_or_else(|| {
+                    ToolError::InvalidArgument("each entry in 'providers' must be a string".into())
+                })?;
+                if parsed.len() != 2 {
+                    return Err(ToolError::InvalidArgument(
+                        "'providers' must have exactly 2 entries for an adversarial pair".into(),
+                    ));
+                }
+                parsed
+            }
+        };
+
+        let rules_store = match RulesStore::from_env().await {
+            Ok(s) => s,
+            Err(ToolError::NotConfigured(_)) => {
+                return structured(json!({"configured": false, "rule_id": rule_id_str}));
+            }
+            Err(e) => {
+                return structured(json!({
+                    "configured": false, "rule_id": rule_id_str, "error": e.to_string(),
+                }));
+            }
+        };
+
+        let rule = match rules_store.get(rule_id).await? {
+            Some(r) => r,
+            None => {
+                return structured(json!({
+                    "configured": true,
+                    "promoted": false,
+                    "rule_id": rule_id_str,
+                    "reason": "rule not found",
+                }));
+            }
+        };
+
+        if rule.status == "active" {
+            return structured(json!({
+                "configured": true,
+                "promoted": false,
+                "rule_id": rule_id_str,
+                "reason": "already active",
+                "enforcement": rule.enforcement,
+            }));
+        }
+        if rule.status != "candidate" {
+            return structured(json!({
+                "configured": true,
+                "promoted": false,
+                "rule_id": rule_id_str,
+                "reason": format!("rule status is '{}', not 'candidate' -- cannot promote", rule.status),
+            }));
+        }
+
+        // THE sanctioned review door (S9/v3.17): an in-process, adversarial
+        // review_run call. Never a hand-rolled reviewer. Defensive against
+        // any error even though review_run itself degrades providers rather
+        // than erroring -- non-blocking per KGRULE-03's contract.
+        let review_args = Self::review_args(&providers, &rule);
+        let review_result: Value = match ReviewRun::new().execute(review_args).await {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|_| json!({
+                "aggregate_verdict": "UNKNOWN",
+                "complete": false,
+                "parse_error": true,
+            })),
+            Err(e) => json!({
+                "aggregate_verdict": "UNKNOWN",
+                "complete": false,
+                "error": e.to_string(),
+            }),
+        };
+
+        let aggregate_verdict = review_result
+            .get("aggregate_verdict")
+            .and_then(|v| v.as_str())
+            .unwrap_or("UNKNOWN")
+            .to_string();
+        let complete = review_result
+            .get("complete")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        match promotion_decision(&aggregate_verdict, complete, target, allow_blocking) {
+            Some(enforcement) => {
+                rules_store
+                    .promote(rule_id, enforcement, review_result.clone())
+                    .await?;
+                structured(json!({
+                    "configured": true,
+                    "promoted": true,
+                    "rule_id": rule_id_str,
+                    "enforcement": enforcement.as_str(),
+                    "aggregate_verdict": aggregate_verdict,
+                    "complete": complete,
+                }))
+            }
+            None => structured(json!({
+                "configured": true,
+                "promoted": false,
+                "rule_id": rule_id_str,
+                "aggregate_verdict": aggregate_verdict,
+                "complete": complete,
+                "reason": "adversarial panel did not approve (or was incomplete); rule remains a candidate",
+            })),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -460,5 +727,160 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    // ── promotion_decision: pure DECISION, no DB, no review_run ────────────
+
+    #[test]
+    fn promotion_decision_approve_complete_advisory_target_promotes_advisory() {
+        let d = promotion_decision("APPROVE", true, Enforcement::Advisory, false);
+        assert_eq!(d, Some(Enforcement::Advisory));
+    }
+
+    #[test]
+    fn promotion_decision_approve_complete_lint_candidate_target_promotes_lint_candidate() {
+        let d = promotion_decision("APPROVE", true, Enforcement::LintCandidate, false);
+        assert_eq!(d, Some(Enforcement::LintCandidate));
+    }
+
+    #[test]
+    fn promotion_decision_blocking_target_without_allow_blocking_caps_at_lint_candidate() {
+        let d = promotion_decision("APPROVE", true, Enforcement::Blocking, false);
+        assert_eq!(d, Some(Enforcement::LintCandidate));
+    }
+
+    #[test]
+    fn promotion_decision_blocking_target_with_allow_blocking_promotes_blocking() {
+        let d = promotion_decision("APPROVE", true, Enforcement::Blocking, true);
+        assert_eq!(d, Some(Enforcement::Blocking));
+    }
+
+    #[test]
+    fn promotion_decision_changes_requested_never_promotes() {
+        assert_eq!(
+            promotion_decision("CHANGES_REQUESTED", true, Enforcement::Advisory, false),
+            None
+        );
+        // Even with allow_blocking set — a rejected panel never promotes.
+        assert_eq!(
+            promotion_decision("CHANGES_REQUESTED", true, Enforcement::Blocking, true),
+            None
+        );
+    }
+
+    #[test]
+    fn promotion_decision_unknown_verdict_never_promotes() {
+        assert_eq!(
+            promotion_decision("UNKNOWN", true, Enforcement::Advisory, false),
+            None
+        );
+    }
+
+    #[test]
+    fn promotion_decision_incomplete_panel_never_promotes_even_on_approve() {
+        assert_eq!(
+            promotion_decision("APPROVE", false, Enforcement::Advisory, false),
+            None
+        );
+        assert_eq!(
+            promotion_decision("APPROVE", false, Enforcement::Blocking, true),
+            None
+        );
+    }
+
+    // ── kg_rule_promote tool: degrade + review_run construction ────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn promote_unconfigured_store_degrades_not_errors() {
+        if std::env::var("ATLAS_DATABASE_URL").is_ok() {
+            return;
+        }
+        let out = KgRulePromote
+            .execute_structured(json!({"rule_id": uuid::Uuid::new_v4().to_string()}))
+            .await
+            .unwrap();
+        let v = out.structured.expect("structured payload");
+        assert_eq!(v["configured"], false);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn promote_missing_rule_id_is_invalid_argument() {
+        let err = KgRulePromote.execute_structured(json!({})).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn promote_bad_uuid_is_invalid_argument() {
+        let err = KgRulePromote
+            .execute_structured(json!({"rule_id": "not-a-uuid"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn promote_bad_target_enforcement_is_invalid_argument() {
+        let err = KgRulePromote
+            .execute_structured(json!({
+                "rule_id": uuid::Uuid::new_v4().to_string(),
+                "target_enforcement": "bogus",
+            }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn promote_wrong_provider_count_is_invalid_argument() {
+        let err = KgRulePromote
+            .execute_structured(json!({
+                "rule_id": uuid::Uuid::new_v4().to_string(),
+                "providers": ["codex"],
+            }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn review_args_uses_adversarial_pair_structure_and_review_run_shape() {
+        // S9: confirm the flow constructs a review_run call (adversarial
+        // structure, providers/criteria/context) rather than hand-rolling a
+        // reviewer. No DB/network involved — just the pure request builder.
+        let rule = super::super::rules_store::RuleRow {
+            id: uuid::Uuid::new_v4(),
+            project_id: "TERM".to_string(),
+            scope_kind: "path".to_string(),
+            scope_ref: "src/lib.rs".to_string(),
+            category: "lint".to_string(),
+            guidance: "Address recurring lint: unused import.".to_string(),
+            enforcement: "advisory".to_string(),
+            status: "candidate".to_string(),
+            provenance: json!({}),
+            recurrence_at_creation: Some(4),
+            cortex_risk: Some(0.5),
+            created_at: chrono::Utc::now(),
+            valid_from: chrono::Utc::now(),
+            valid_to: None,
+        };
+        let providers = vec!["codex".to_string(), "agy".to_string()];
+        let args = KgRulePromote::review_args(&providers, &rule);
+        assert_eq!(args["structure"], "adversarial_pair");
+        assert_eq!(args["providers"], json!(["codex", "agy"]));
+        assert!(args["criteria"].as_str().unwrap().contains("ARGUE"));
+        assert!(args["criteria"].as_str().unwrap().contains("APPROVE"));
+        assert_eq!(args["context"]["rule_id"], rule.id.to_string());
+        assert_eq!(args["context"]["category"], "lint");
+    }
+
+    #[test]
+    fn default_promotion_providers_has_exactly_two_distinct_entries() {
+        assert_eq!(DEFAULT_PROMOTION_PROVIDERS.len(), 2);
+        assert_ne!(DEFAULT_PROMOTION_PROVIDERS[0], DEFAULT_PROMOTION_PROVIDERS[1]);
     }
 }
