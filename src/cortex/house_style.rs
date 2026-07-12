@@ -69,6 +69,7 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 
+use crate::cortex::metrics::round4;
 use crate::scribe::graph::model::{KgNode, KnowledgeGraph, NodeKind};
 use crate::scribe::graph::query::{one_hop_neighbors, EdgeDirection, NeighborFilter};
 use crate::scribe::graph::vec_embed::{node_card, EmbedClient};
@@ -286,10 +287,6 @@ fn centroid(vectors: &[Vec<f32>]) -> Vec<f32> {
     sum.into_iter().map(|x| x / n).collect()
 }
 
-fn round4(v: f64) -> f64 {
-    (v * 10_000.0).round() / 10_000.0
-}
-
 /// Centrality-only fallback ranking: `rank` desc, then `degree` desc, then
 /// `id` asc for a fully deterministic order. Used both when embeddings are
 /// unavailable and (implicitly, as the natural tie-break) it never needs to
@@ -384,7 +381,9 @@ fn fallback_exemplars(nodes: &[&KgNode], k: usize) -> Vec<ExemplarRef> {
             path: n.path.clone(),
             span: n.span,
             rank: n.rank,
-            score: n.rank as f64,
+            // Round for parity with the embedding path's `round4(cosine)`, so
+            // both selection modes emit scores at the same precision.
+            score: round4(n.rank as f64),
         })
         .collect()
 }
@@ -634,7 +633,7 @@ mod tests {
         assert!(degraded, "unreachable embeddings endpoint must degrade, not panic/error");
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].node_id, "crate::a::hi", "centrality fallback ranks by rank desc");
-        assert_eq!(out[0].score, 0.9_f32 as f64, "fallback score is the raw rank widened to f64");
+        assert_eq!(out[0].score, round4(0.9_f32 as f64), "fallback score is the rank, round4'd for parity with the embedding path");
 
         clear_embeddings_override();
     }

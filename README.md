@@ -465,6 +465,7 @@ This README is the front door; everything past "at a glance" lives in
 | [`docs/networking/`](docs/networking/) | WireGuard and Tailscale transport options for reaching a Terminus deployment off-LAN, including the optional embedded-tsnet mode (MESH-04, `tsnet` Cargo feature — no host `tailscaled` required; see [`docs/networking/tailscale.md`](docs/networking/tailscale.md#alternative-embedded-tsnet-mesh-04--no-host-tailscaled-at-all)). |
 | [`docs/deploy/`](docs/deploy/) | Client enrollment/deploy guide and the personal-services (`terminus_personal`/`terminus_primary`) deployment guide. |
 | [`docs/tools/`](docs/tools/README.md) | The full tool index — all 53 modules grouped by domain, plus the **MINT** flagship harness. |
+| [`docs/house-style.md`](docs/house-style.md) | The Tier-A house-style rule catalog (deterministic `syn`-AST checks run in the test gate via `cargo test -p terminus-rs`) — secret-shaped env vars, non-empty tool descriptions, no `panic!` in `execute`, and the `// house-style-allow: <reason>` waiver convention. |
 
 ## Atlas — knowledge-graph query tools
 
@@ -755,23 +756,51 @@ Its risk/elegance surface is rebuilt over the following S115 items:
   path over `MAX_TEXT_LEN`, a DoS-scale `diff`/string over `MAX_DIFF_LEN`, or an
   array over `MAX_CHANGED_FILES_ARG` — ceilings set far above the file-count
   cap so real diffs truncate, not reject).
-- `cortex_review` — post-change `risk_score` (0–10) + named `risk_signals`
-  from Atlas structural metrics and KGFIND recurrence (stub pending **CXEG-04**).
-  Its structural-metrics half now exists as a standalone library
+- `cortex_review` — post-change risk assessment, live as of **CXEG-04**:
+  given `project_id` + `changed_files`/`diff` (same argument shapes as
+  `cortex_scope`, sharing its validation via
+  `crate::cortex::validate_and_parse_changed_files`), it combines CXEG-03's
+  structural-elegance signals (`metrics::compute_signals`, over the diff's
+  touched Atlas nodes) with KGFIND-01 recurrence counts for the same touched
+  node/path/community scopes (`scribe::graph::findings_store::FindingsStore`
+  — the same store `kg_findings` reads, no second access path) into a single
+  `risk_score` (0–10, clamped), a `band` (`low`/`elevated`/`high`), the full
+  `risk_signals` list, and per-source `contributions` (`{source, weight,
+  points}`) whose `points` sum reconstructs the raw pre-clamp score —
+  nothing hidden. Recurrence is log-scaled (`log2(1 + occurrences)`) so one
+  pathologically-recurring finding bucket can't alone pin the score at the
+  ceiling. `recommendation` only ever ESCALATES review rigor for a high
+  band — never an auto-reject. Degrades cleanly, never erroring: no stored
+  Atlas graph yet → `configured:false` + `band:"unknown"` (mirrors
+  `cortex_scope`'s own degrade shape); an unconfigured/unreachable findings
+  store → a structural-only score labeled `findings:"unavailable"`; a
+  reachable store with no matching recurrence → `findings:"empty"` (distinct
+  from `"unavailable"`). See `src/cortex/review.rs` and
+  `docs/tools/code-git/cortex.md`'s `cortex_review` section for the full
+  rubric, weights, and response shape.
+  Its structural-metrics half is a standalone library
   (`src/cortex/metrics.rs`, **CXEG-03**): `metrics::compute_signals` turns a
   `cortex_scope` blast radius into five named, no-LLM structural-elegance
   signals — `centrality_spike`, `community_boundary_crossing`,
   `semantic_duplication`, `complexity_spike`, `fan_out_explosion` — each with
   a percentile-relative (self-calibrating, never hardcoded) threshold, a
-  non-empty deterministic `why`, and a resolvable anchor node. Not yet wired
-  into `cortex_review`'s response (that wiring is CXEG-04's job); see
+  non-empty deterministic `why`, and a resolvable anchor node; see
   `docs/tools/code-git/cortex.md`'s "Tier-B structural-elegance signals"
   section for the full signal catalog.
-- `cortex_audit` — audit an external public repo URL (stub pending **CXEG-11**);
-  its SSRF-hardened `validate_repo_url` front-gate (`src/cortex/audit.rs`) is
-  live now — it rejects non-http(s) schemes, embedded credentials, shell
-  metacharacters, and loopback/private/link-local/metadata hosts in their
-  common obfuscated encodings (fail-closed).
+- `cortex_audit` — audit an external public repo URL, live as of **CXEG-11**:
+  `url` first passes the unchanged SSRF-hardened `validate_repo_url`
+  front-gate (`src/cortex/audit.rs`) — it rejects non-http(s) schemes,
+  embedded credentials, shell metacharacters, and loopback/private/link-local
+  /metadata hosts in their common obfuscated encodings (fail-closed) — then
+  the tool clones the url into an isolated, always-cleaned-up scratch
+  directory (shallow, no submodules, no repo code ever executes), statically
+  extracts a transient (never persisted) Atlas graph via the same
+  `build_rust_graph`/`walk_rs` path `scribe_kg_build` uses, runs the CXEG-03
+  structural-elegance detectors (`metrics::compute_structural_signals`) over
+  the whole repo, and returns a report before deleting the clone. Clone size
+  and time are bounded (`CORTEX_AUDIT_MAX_CLONE_BYTES` /
+  `CORTEX_AUDIT_CLONE_TIMEOUT_SECS`) — an oversized or slow clone is refused,
+  not silently truncated.
 - `cortex_house_style` — live as of **CXEG-06**: house-style exemplar
   extraction from Atlas (`src/cortex/house_style.rs`), so a future Tier-C
   reviewer can cite "how THIS codebase does X" instead of generic opinion.

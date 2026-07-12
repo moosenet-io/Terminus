@@ -1,24 +1,51 @@
-//! URL validation for `cortex_audit` — the highest-risk tool in this module.
+//! `cortex_audit`: URL validation (the highest-risk piece of this module) plus
+//! the CXEG-11 Atlas-backed external-repo audit backend.
 //!
 //! `cortex_audit` audits an *external, operator-supplied* public git repository
-//! URL. As of CXEG-01 the retired SSH-exec-to-fleet-host relay is gone; the
-//! tool is currently a stub whose Atlas-backed clone → `scribe_kg_build` →
-//! report backend is rebuilt in CXEG-11. This file's job is unchanged and
-//! remains valuable independent of that rebuild: strict, fail-closed
-//! validation of the `url` argument.
+//! URL. As of CXEG-01 the retired SSH-exec-to-fleet-host relay was gone and
+//! the tool was a stub; CXEG-11 (this item) rebuilds a real backend:
+//! clone the URL into an isolated, ALWAYS-cleaned-up scratch directory ->
+//! statically extract a transient, never-persisted Atlas graph (tree-sitter
+//! only, no repo code ever executes) -> run the CXEG-03 structural-elegance
+//! detectors over it -> render a report -> delete the clone. See
+//! [`run_audit`] for the pipeline and [`ScratchClone`] for the isolation
+//! guarantee.
 //!
-//! `validate_repo_url` is the front-gate every `cortex_audit` call passes
-//! before the URL reaches any backend. It rejects URL shapes that have no
-//! legitimate reason to be passed to "clone a public git repo" — non-http(s)
-//! schemes, embedded credentials, shell metacharacters, and (crucially)
-//! loopback / private / link-local / metadata hosts in any of their common
-//! obfuscated encodings. That closes off SSRF-style redirection of a future
-//! clone step at internal/private network targets under the guise of a
-//! "public repo audit", regardless of what transport CXEG-11 lands on. The
-//! guard is deliberately backend-agnostic: it protects the input whether the
-//! clone eventually runs in-process on the terminus host or elsewhere.
+//! ## CXEG-11 clone-feasibility decision
+//! No sanctioned "clone an arbitrary public URL" tool exists in this crate:
+//! `crate::forge`'s `git_public`/`git_private` tools speak a fixed,
+//! credentialed, per-provider REST API surface (repos/issues/PRs/...) against
+//! a configured pool member — never a raw `git clone <arbitrary-url>`. Per the
+//! CXEG-11 spec, the sanctioned fallback for exactly this tool's designed
+//! operation (auditing an operator-supplied external repo) is a scoped
+//! `std::process::Command` git clone into an isolated temp dir with
+//! guaranteed cleanup — that is what [`ScratchClone`] implements. This is a
+//! narrower, more contained blast radius than the retired SSH-relay era ever
+//! had (that implementation didn't even clone locally — it shipped the URL to
+//! a remote fleet-host script and trusted whatever came back).
+//!
+//! ## `validate_repo_url`
+//! The front-gate every `cortex_audit` call passes before the URL reaches any
+//! backend. It rejects URL shapes that have no legitimate reason to be passed
+//! to "clone a public git repo" — non-http(s) schemes, embedded credentials,
+//! shell metacharacters, and (crucially) loopback / private / link-local /
+//! metadata hosts in any of their common obfuscated encodings. That closes
+//! off SSRF-style redirection of the clone step at internal/private network
+//! targets under the guise of a "public repo audit". **Kept byte-for-byte
+//! unchanged by CXEG-11** — it was already the strongest piece of this
+//! module and has no dependency on the backend behind it.
 
+use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde_json::{json, Value};
+
+use crate::cortex::{metrics, CortexConfig};
 use crate::error::ToolError;
+use crate::scribe::graph::{build_rust_graph, cluster, pagerank};
 
 const MAX_URL_LEN: usize = 500;
 
@@ -212,6 +239,225 @@ fn is_disallowed_ipv6(v6: std::net::Ipv6Addr) -> bool {
         || (0xfc00..=0xfdff).contains(&seg0) // unique local
 }
 
+// ---------------------------------------------------------------------------
+// CXEG-11: isolated scratch clone
+// ---------------------------------------------------------------------------
+
+/// An isolated scratch directory holding a shallow clone of one external
+/// repo, deleted on EVERY exit path: normal drop, an early `?`-propagated
+/// error, or an unwinding panic (`Drop::drop` still runs during unwind,
+/// which is the only case that matters here — this process never compiles
+/// with `panic = "abort"`, and if it ever did, the OS reclaims `temp_dir()`
+/// on the next boot rather than leaking silently forever).
+#[derive(Debug)]
+struct ScratchClone {
+    /// The scratch dir itself (parent of `repo/` and the isolated `home/`
+    /// handed to the `git` subprocess as `$HOME`) — removed wholesale on
+    /// drop, so cleaning up `dir` also cleans up the isolated home.
+    dir: PathBuf,
+    /// Opaque label for this run, used only as an in-memory, never-persisted
+    /// graph project id — carries no operator/host data.
+    slug: String,
+}
+
+impl ScratchClone {
+    fn repo_path(&self) -> PathBuf {
+        self.dir.join("repo")
+    }
+
+    /// Clone `url` into a fresh, isolated scratch dir with:
+    /// - `--depth 1 --single-branch --no-tags --no-recurse-submodules`: the
+    ///   smallest possible checkout (no history, no other branches, no tags,
+    ///   no submodule fetches — a malicious submodule URL never gets a
+    ///   second, unvalidated clone target).
+    /// - `core.hooksPath=/dev/null`: a cloned repo's hooks (if any shipped in
+    ///   its working tree) are never installed as executable hooks.
+    /// - an isolated `HOME` + `GIT_CONFIG_NOSYSTEM`/`GIT_CONFIG_GLOBAL=/dev/null`:
+    ///   no operator credential helper, global gitconfig, or stored token is
+    ///   ever reachable from this subprocess.
+    /// - `GIT_TERMINAL_PROMPT=0` + `GIT_ASKPASS` pointed at a no-op: a private
+    ///   or auth-walled URL fails fast instead of hanging on a prompt.
+    /// - a wall-clock timeout (`timeout_secs`, [`CortexConfig::audit_clone_timeout_secs`]):
+    ///   the subprocess is killed and the scratch dir is still cleaned up
+    ///   (via `Drop`) if the clone runs long — bounds clone TIME.
+    ///
+    /// Bounding clone SIZE is a separate step ([`dir_size`]) run by the
+    /// caller once the clone succeeds, since `git clone` itself has no
+    /// portable "abort past N bytes" flag.
+    async fn create(url: &str, timeout_secs: u64) -> Result<Self, ToolError> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let slug = format!("{}-{nanos}", std::process::id());
+        let dir = std::env::temp_dir().join(format!("terminus-cortex-audit-{slug}"));
+        let fake_home = dir.join("home");
+        fs::create_dir_all(&fake_home)
+            .map_err(|e| ToolError::Execution(format!("create audit scratch dir: {e}")))?;
+
+        // From this point on `scratch` owns `dir` and Drop::drop removes it
+        // on every remaining exit path in this function (`?` included).
+        let scratch = ScratchClone { dir: dir.clone(), slug };
+
+        let repo_dir = scratch.repo_path();
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.arg("clone")
+            .arg("--depth")
+            .arg("1")
+            .arg("--single-branch")
+            .arg("--no-tags")
+            .arg("--no-recurse-submodules")
+            .arg("--config")
+            .arg("core.hooksPath=/dev/null")
+            .arg(url)
+            .arg(&repo_dir)
+            .env("HOME", &fake_home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "true")
+            .env("GIT_SSH_COMMAND", "false") // no ssh:// transport ever, belt-and-suspenders w/ validate_repo_url
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| ToolError::Execution(format!("failed to spawn 'git clone': {e}")))?;
+
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
+            Ok(Ok(status)) if status.success() => Ok(scratch),
+            Ok(Ok(status)) => Err(ToolError::Execution(format!("'git clone' exited with {status}"))),
+            Ok(Err(e)) => Err(ToolError::Execution(format!("'git clone' failed to run: {e}"))),
+            Err(_) => {
+                // Timed out: kill the still-running subprocess before this
+                // function returns (and `scratch` drops, removing the dir).
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                Err(ToolError::Execution(format!(
+                    "'git clone' exceeded the {timeout_secs}s audit timeout"
+                )))
+            }
+        }
+    }
+}
+
+impl Drop for ScratchClone {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Sum of file sizes under `root`, walked without following symlinks (a
+/// malicious repo's symlink could otherwise point outside the clone and
+/// report/consume something never actually cloned). Best-effort: an
+/// unreadable entry is skipped rather than failing the whole walk, since this
+/// is a size ESTIMATE used only to enforce [`CortexConfig::audit_max_clone_bytes`],
+/// not a security boundary itself (`walk_rs`'s own symlink guard is that).
+fn dir_size(root: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else { continue };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                stack.push(path);
+            } else {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+/// The CXEG-11 pipeline: clone `url` into an isolated scratch dir, build a
+/// transient (never persisted to `GraphStore`, never given a real
+/// `project_id`) Atlas graph via pure static/tree-sitter extraction — the
+/// SAME `build_rust_graph`/`walk_rs` path `scribe_kg_build` uses, so no
+/// second extractor exists — run the CXEG-03 structural detectors over it,
+/// and render a report. The scratch dir (and everything under it) is removed
+/// before this function returns, success or failure, via [`ScratchClone`]'s
+/// `Drop`.
+///
+/// Deliberately calls `build_rust_graph`/`cluster`/`pagerank` directly rather
+/// than going through the `scribe_kg_build` TOOL: that tool's `repo_path`
+/// confinement (`SCRIBE_ALLOWED_REPO_ROOTS`) exists to stop an operator- or
+/// caller-supplied path from reading arbitrary host filesystem locations —
+/// a concern that doesn't apply here, since `repo_dir` was never
+/// caller-supplied; it's a scratch dir this function created and clone-wrote
+/// itself. It also deliberately uses [`metrics::compute_structural_signals`]
+/// (the sync, no-vector-store subset), not the full async
+/// [`metrics::compute_signals`]: semantic-duplication detection compares a
+/// touched node's embedding against the PROJECT's own persisted vector-store
+/// rows, and this graph is intentionally never persisted or embedded — there
+/// is no stored project to compare against, and embedding + storing vectors
+/// for an arbitrary external repo would leak its content into local
+/// infrastructure state, exactly what "transient" is meant to avoid.
+///
+/// No network beyond the clone itself, and — the untrusted-clone safety
+/// property this whole pipeline hinges on — **no code from the cloned repo is
+/// ever executed**: `walk_rs` only ever calls `fs::read_to_string` on
+/// allowlisted-extension files, and `build_rust_graph` is a pure tree-sitter
+/// PARSE (no build scripts, no `cargo`/`npm`/interpreter invocation, no
+/// import resolution that would need to load foreign code).
+pub async fn run_audit(url: &str, config: &CortexConfig) -> Result<Value, ToolError> {
+    let scratch = ScratchClone::create(url, config.audit_clone_timeout_secs).await?;
+    let repo_path = scratch.repo_path();
+
+    let clone_bytes = dir_size(&repo_path);
+    if clone_bytes > config.audit_max_clone_bytes {
+        return Err(ToolError::InvalidArgument(format!(
+            "cloned repository is {clone_bytes} bytes, exceeding the {}-byte audit ceiling \
+             (CORTEX_AUDIT_MAX_CLONE_BYTES) — refusing to build a graph over it",
+            config.audit_max_clone_bytes
+        )));
+    }
+
+    let (files, file_scan_capped) = crate::scribe::graph::build::walk_rs(&repo_path)?;
+    if files.is_empty() {
+        return Err(ToolError::InvalidArgument(
+            "no supported source files found in the cloned repository".to_string(),
+        ));
+    }
+
+    // Opaque, never-persisted graph id -- just needs to be stable within this
+    // one call, not globally meaningful (this graph is never saved to
+    // GraphStore and never reused across calls).
+    let project_id = format!("cortex-audit-transient-{}", scratch.slug);
+    let mut graph = build_rust_graph(&project_id, &files)?;
+    cluster(&mut graph);
+    pagerank(&mut graph);
+
+    let all_node_ids: Vec<String> = graph.nodes().map(|n| n.id.clone()).collect();
+    let signal_scope_capped = all_node_ids.len() > config.max_blast_nodes;
+    let touched: Vec<String> = all_node_ids.into_iter().take(config.max_blast_nodes).collect();
+
+    // Whole-repo audit -> every (capped) current node is "touched": there is
+    // no diff to scope to, the point of this tool is auditing the repo's
+    // overall structure, not one change against it.
+    let signals = metrics::compute_structural_signals(&touched, &graph, config);
+    let clusters: HashSet<u32> = graph.nodes().filter_map(|n| n.cluster).collect();
+
+    Ok(json!({
+        "status": "complete",
+        "tool": "cortex_audit",
+        "url": url,
+        "stats": {
+            "nodes": graph.node_count(),
+            "edges": graph.edge_count(),
+            "clusters": clusters.len(),
+            "files_scanned": files.len(),
+            "file_scan_cap_hit": file_scan_capped,
+            "signal_scope_cap_hit": signal_scope_capped,
+            "clone_bytes": clone_bytes,
+        },
+        "signals": signals,
+        "signal_count": signals.len(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,5 +615,193 @@ mod tests {
         assert!(validate_repo_url("https://github.com/owner/repo").is_ok());
         assert!(validate_repo_url("https://git.example.com:8443/owner/repo").is_ok());
         assert!(validate_repo_url("https://1a2b.example.com/owner/repo").is_ok());
+    }
+
+    // ── CXEG-11: clone -> transient-graph -> report pipeline ───────────────
+    //
+    // These tests clone LOCAL git fixture repos (created with `git init` in a
+    // temp dir, never a network URL) so they're hermetic and don't depend on
+    // external network access or `validate_repo_url`'s http(s)-only rule
+    // (that gate is enforced one layer up, in `CortexAudit::execute` /
+    // `mod.rs`'s tests -- `ScratchClone`/`run_audit` here take a raw clone
+    // source, matching `cortex_scope`'s split between `mod.rs` validation and
+    // `scope.rs`'s pure-ish derivation).
+
+    fn cfg() -> CortexConfig {
+        CortexConfig {
+            risk_score_threshold: 7.0,
+            enable_tier_b: false,
+            enable_tier_c: false,
+            elegance_advisory_only: true,
+            dup_cosine: 0.85,
+            atlas_database_url: None,
+            max_blast_nodes: crate::cortex::scope::DEFAULT_MAX_BLAST_NODES,
+            tier_b_percentile: 90.0,
+            house_style_exemplars_k: crate::cortex::house_style::DEFAULT_EXEMPLARS_K,
+            risk_weight_centrality_spike: 2.0,
+            risk_weight_complexity_spike: 1.5,
+            risk_weight_fan_out_explosion: 1.5,
+            risk_weight_community_boundary_crossing: 2.5,
+            risk_weight_semantic_duplication: 10.0,
+            risk_weight_recurrence: 1.0,
+            risk_band_elevated_cut: 4.0,
+            audit_clone_timeout_secs: 30,
+            audit_max_clone_bytes: 200_000_000,
+        }
+    }
+
+    /// Build a tiny local git repo fixture (no network) with the given
+    /// `(repo_relative_path, content)` files, `git init`+commit it, and
+    /// return its path -- usable directly as a `git clone` source.
+    fn make_local_git_repo(tag: &str, files: &[(&str, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cortex-audit-fixture-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for (rel, content) in files {
+            let p = dir.join(rel);
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(p, content).unwrap();
+        }
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .expect("git must be available to run CXEG-11's fixture-backed tests");
+            assert!(status.success(), "git {args:?} failed setting up the fixture repo");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "<email>"]); // pii-test-fixture
+        git(&["config", "user.name", "cortex-audit-test"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "fixture"]);
+        dir
+    }
+
+    fn count_scratch_dirs() -> usize {
+        fs::read_dir(std::env::temp_dir())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("terminus-cortex-audit-"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_scratch_clone_cleans_up_on_success() {
+        let fixture = make_local_git_repo(
+            "success",
+            &[("src/lib.rs", "pub fn helper() -> u8 { 1 }\npub fn caller() -> u8 { helper() }\n")],
+        );
+        let scratch_dir;
+        {
+            let scratch = ScratchClone::create(fixture.to_str().unwrap(), 30)
+                .await
+                .expect("cloning a local fixture repo should succeed");
+            scratch_dir = scratch.dir.clone();
+            assert!(scratch.repo_path().join("src/lib.rs").exists(), "cloned file present while scratch alive");
+        }
+        assert!(!scratch_dir.exists(), "scratch dir removed once ScratchClone drops");
+        let _ = fs::remove_dir_all(&fixture);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_scratch_clone_cleans_up_on_clone_failure() {
+        let before = count_scratch_dirs();
+        let bogus = std::env::temp_dir().join(format!("cortex-audit-bogus-source-{}", std::process::id()));
+        let err = ScratchClone::create(bogus.to_str().unwrap(), 30).await.unwrap_err();
+        assert!(matches!(err, ToolError::Execution(_)));
+        assert_eq!(count_scratch_dirs(), before, "a failed clone must not leak its scratch dir");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_scratch_clone_cleans_up_on_panic() {
+        let fixture = make_local_git_repo("panic", &[("src/lib.rs", "pub fn f() {}\n")]);
+        let before = count_scratch_dirs();
+        let fixture_str = fixture.to_str().unwrap().to_string();
+        let handle = tokio::spawn(async move {
+            let _scratch = ScratchClone::create(&fixture_str, 30)
+                .await
+                .expect("cloning a local fixture repo should succeed");
+            panic!("simulated failure after a successful clone");
+        });
+        let joined = handle.await;
+        assert!(joined.is_err(), "the spawned task should have panicked");
+        assert_eq!(
+            count_scratch_dirs(),
+            before,
+            "Drop still runs during unwind -- a panic mid-audit must not leak the scratch dir"
+        );
+        let _ = fs::remove_dir_all(&fixture);
+    }
+
+    #[test]
+    fn test_dir_size_sums_bytes_and_does_not_follow_symlinks() {
+        let dir = std::env::temp_dir().join(format!("cortex-audit-dirsize-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("a.txt"), "12345").unwrap(); // 5 bytes
+        fs::write(dir.join("sub/b.txt"), "1234567890").unwrap(); // 10 bytes
+
+        #[cfg(unix)]
+        {
+            let outside = std::env::temp_dir().join(format!("cortex-audit-dirsize-outside-{}", std::process::id()));
+            fs::write(&outside, "this content must never be counted via a symlink").unwrap();
+            std::os::unix::fs::symlink(&outside, dir.join("link.txt")).unwrap();
+            assert_eq!(dir_size(&dir), 15, "symlinked file must not be followed/counted");
+            let _ = fs::remove_file(&outside);
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(dir_size(&dir), 15);
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_run_audit_builds_report_from_local_clone() {
+        let fixture = make_local_git_repo(
+            "runaudit",
+            &[("src/lib.rs", "pub fn helper() -> u8 { 1 }\npub fn caller() -> u8 { helper() }\n")],
+        );
+        let config = cfg();
+        let report = run_audit(fixture.to_str().unwrap(), &config)
+            .await
+            .expect("audit of a small local repo should succeed");
+        assert_eq!(report["status"], "complete");
+        assert_eq!(report["url"], fixture.to_str().unwrap());
+        assert!(report["stats"]["nodes"].as_u64().unwrap() >= 2, "helper + caller functions at least: {report}");
+        assert!(report["stats"]["files_scanned"].as_u64().unwrap() >= 1);
+        assert!(report["signals"].is_array());
+        assert!(fixture.exists(), "the ORIGINAL fixture repo is untouched by the audit (only the clone is scratch)");
+        let _ = fs::remove_dir_all(&fixture);
+    }
+
+    #[tokio::test]
+    async fn test_run_audit_rejects_clone_over_size_ceiling() {
+        let fixture = make_local_git_repo("sizecap", &[("src/lib.rs", "pub fn f() {}\n")]);
+        let mut config = cfg();
+        config.audit_max_clone_bytes = 1; // any real clone (even just `.git/`) exceeds this
+        let err = run_audit(fixture.to_str().unwrap(), &config).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+        let _ = fs::remove_dir_all(&fixture);
+    }
+
+    #[tokio::test]
+    async fn test_run_audit_rejects_repo_with_no_supported_source_files() {
+        let fixture = make_local_git_repo("nosource", &[("README.md", "just docs, no source files")]);
+        let config = cfg();
+        let err = run_audit(fixture.to_str().unwrap(), &config).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+        let _ = fs::remove_dir_all(&fixture);
     }
 }

@@ -6,8 +6,10 @@
 //! recurring findings. As of CXEG-01 `crate::cortex` is Atlas-backed and no
 //! longer an SSH relay: it holds no SSH transport, no shell-quoting, and no
 //! remote fleet-host script. This bridge calls the in-process `cortex_review`
-//! tool (currently a stub pending its Atlas-backed rebuild in CXEG-04) and
-//! degrades cleanly to `None` until that rebuild lands a `risk_score` field.
+//! tool, which as of **CXEG-04** is a real Atlas-backed risk scorer (no
+//! longer a pending stub) returning a `risk_score` (0-10) — so this bridge
+//! now yields a real signal whenever a stored Atlas graph is available for
+//! the project, and degrades cleanly to `None` otherwise.
 //!
 //! ## Degrade contract (read before calling this from new code)
 //!
@@ -23,36 +25,36 @@
 //!   community or global-scope risk score, so these are skipped immediately.
 //! - The underlying `cortex_review` tool call errors for any reason
 //!   (`InvalidArgument`, task join failure, …).
-//! - The tool's response is valid JSON but carries no numeric `risk`/`score`
-//!   field. **As of CXEG-01, this is the expected case for every call**:
-//!   `crate::cortex`'s SSH-relay-era transport to the (now-retired) fleet
-//!   host was removed, and `cortex_review`'s `execute` body is a principled
-//!   stub pending its Atlas-backed rebuild in CXEG-04 — it returns a
-//!   `{"status":"pending","item":"CXEG-04",...}` pointer with no `risk_score`
-//!   field at all. This bridge is kept in place, unchanged in shape, as
-//!   forward-compatible wiring: once CXEG-04 lands a real `risk_score` in
-//!   `cortex_review`'s response, this bridge starts returning real signal
-//!   with no code change here.
+//! - The response is a `cortex_review` **degrade** response
+//!   (`"configured": false`, i.e. no Atlas graph is stored for the project,
+//!   so `band` is `"unknown"` and `risk_score` is a placeholder `0.0`). That
+//!   `0.0` is a "we don't know," not a real "zero risk," so the bridge treats
+//!   it as no signal (`None`) rather than surfacing a misleading `Some(0.0)`.
+//!   A `"configured": true` response — even one whose KGFIND `findings` are
+//!   `"unavailable"`/`"empty"` — DOES carry a real (structural) `risk_score`
+//!   and is surfaced as `Some(..)`.
+//! - The tool's response is valid JSON but carries no numeric `risk_score`/
+//!   `risk`/`score` field (defensive — a real `cortex_review` response always
+//!   carries `risk_score`, but this module never assumes that invariant).
 //! - The tool's response isn't valid JSON at all (defensive; `crate::cortex`
 //!   should never actually produce this, but this module never trusts that
 //!   invariant with an `unwrap`/`expect`).
 //!
 //! ## Which Cortex entry point this uses, and why
 //!
-//! `cortex_review` (post-change risk assessment, intended to return
-//! `risk_score` (0-10) once CXEG-04 lands — see its description in
-//! `crate::cortex`) is the one Cortex tool whose documented purpose is a
-//! risk *score* for a given set of files — exactly the "post-hoc risk on the
-//! scope" this bridge needs. `cortex_scope` is blast-radius for a change
-//! that hasn't happened yet (no risk score at all), and the 7 deprecated
-//! relay-tool aliases (`crate::cortex::deprecated`) return only a
-//! `{"deprecated":true,...}` pointer, never a risk field. Both
+//! `cortex_review` (post-change risk assessment, returning `risk_score`
+//! (0-10) as of CXEG-04 — see its description in `crate::cortex`) is the one
+//! Cortex tool whose purpose is a risk *score* for a given set of files —
+//! exactly the "post-hoc risk on the scope" this bridge needs. `cortex_scope`
+//! is blast-radius for a change that hasn't happened yet (no risk score at
+//! all), and the 7 deprecated relay-tool aliases (`crate::cortex::deprecated`)
+//! return only a `{"deprecated":true,...}` pointer, never a risk field. Both
 //! `scope_kind == "path"` (a file path) and `scope_kind == "node"` (a
 //! symbol) are passed through as `cortex_review`'s `changed_files` argument
-//! — that field is a free-text comma-separated list in the underlying tool,
-//! so a single file path or a single symbol name both round-trip through it
-//! unchanged; `crate::cortex` places no further structural requirement on
-//! the string.
+//! — a single file path or a single symbol name both round-trip through it
+//! unchanged (`cortex_review` derives the touched Atlas nodes for a path
+//! from the graph; a bare symbol id that matches no file simply yields no
+//! touched nodes, i.e. a low/zero structural score, not an error).
 //!
 //! `project_id` is fixed to `"TERM"` — this crate IS Terminus, so there's no
 //! ambiguity to parameterize, and the value is one of `crate::cortex`'s own
@@ -115,6 +117,21 @@ pub async fn cortex_risk_for_scope(scope_kind: &str, scope_ref: &str) -> Option<
     let result = registry.call("cortex_review", payload).await?;
     let text = result.ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
+
+    // CXEG-04: `cortex_review` is now real, but it degrades to a
+    // `{"configured": false, "band": "unknown", "risk_score": 0.0, ...}`
+    // response when no Atlas graph is stored for the project (see
+    // `cortex::review::compute_review`'s degrade contract). That `0.0` is a
+    // "we don't know," NOT a real "zero risk" — surfacing it as `Some(0.0)`
+    // would falsely tell KGRULE-02 the scope is risk-free. So a degrade
+    // response is treated as "no signal available" (`None`), exactly like a
+    // tool error or a missing risk field. Only a `configured: true` response
+    // (a real assessment ran against a stored graph) has its `risk_score`
+    // extracted — even if its `findings` are `"unavailable"`/`"empty"`, the
+    // structural half of that score IS a real signal.
+    if value.get("configured") == Some(&Value::Bool(false)) {
+        return None;
+    }
     extract_risk(&value)
 }
 
@@ -226,14 +243,25 @@ mod tests {
         assert!(!scope_kind_supported("global"));
     }
 
-    // --- cortex_risk_for_scope: no network of any kind, ever (CXEG-01) -----
+    // --- cortex_risk_for_scope: no network of any kind, ever (CXEG-01/04) --
 
     #[tokio::test]
     #[serial]
-    async fn test_cortex_review_pending_stub_returns_none_fast() {
-        // As of CXEG-01, cortex_review is a pending stub (no SSH transport
-        // exists at all in this crate anymore) — this must return fast and
-        // yield None, since the stub's response carries no risk_score field.
+    async fn test_cortex_review_degrade_without_graph_returns_none_fast() {
+        // As of CXEG-04, cortex_review is REAL (not a pending stub), but with
+        // no Atlas graph stored for the project it degrades to
+        // {configured:false, band:"unknown", risk_score:0.0}. The bridge
+        // treats that "we don't know" degrade as no signal (None), NOT a
+        // Some(0.0) that would falsely read as "zero risk" — see
+        // `cortex_risk_for_scope`'s configured-guard. An empty store dir is
+        // forced so the degrade path is deterministic regardless of any
+        // ambient SCRIBE_KG_STORE_DIR. Must return fast: GraphStore is a
+        // local filesystem load and FindingsStore is NotConfigured without a
+        // DSN, so no network is ever attempted.
+        let store_dir = std::env::temp_dir()
+            .join(format!("atlas-cortexbridge-nograph-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             cortex_risk_for_scope("path", "src/x.rs"),
@@ -241,7 +269,8 @@ mod tests {
         .await
         .expect("must return fast — no network attempt is ever made");
 
-        assert_eq!(result, None);
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
+        assert_eq!(result, None, "a configured:false degrade must yield no signal");
     }
 
     #[tokio::test]

@@ -26,25 +26,27 @@
 //!   blast-radius implementation (`src/cortex/scope.rs`) — it now walks the
 //!   project's stored Atlas graph via the same `GraphStore`/`KnowledgeGraph`
 //!   API `kg_neighbors`/`review::kg_context::build_kg_block` use, rather than
-//!   returning a pointer. `cortex_review`'s `execute` body remains a
-//!   principled stub — the real Atlas-backed risk-scoring logic lands in
-//!   **CXEG-04**. Until then it returns a structured
-//!   `{"status":"pending","item":"CXEG-04"}` pointer rather than silently
-//!   doing nothing or erroring opaquely.
+//!   returning a pointer. **CXEG-04** replaces `cortex_review`'s stub with a
+//!   real Atlas-backed risk-scoring implementation (`src/cortex/review.rs`),
+//!   combining **CXEG-03**'s structural-elegance signals
+//!   (`src/cortex/metrics.rs`) with KGFIND-01 recurrence into a `risk_score`/
+//!   `band`/`recommendation` — see `review`'s module doc and
+//!   `docs/tools/code-git/cortex.md`'s `cortex_review` section for the full
+//!   rubric.
 //! - `cortex_audit` keeps its `url` parameter and its existing
-//!   `validate_repo_url` front-gate (`audit.rs` — untouched, SSRF-hardened
-//!   URL validation with no dependency on the deleted SSH helpers), but its
-//!   `execute` body is likewise a stub: **CXEG-11** rebuilds its backend
-//!   (presumably against a sandboxed local clone + Atlas build, not a remote
-//!   relay). See the stub `execute` body below for the exact pending-item
-//!   reference.
+//!   `validate_repo_url` front-gate (`audit.rs` — SSRF-hardened URL
+//!   validation with no dependency on the deleted SSH helpers). **CXEG-11**
+//!   (merged from `main`) replaced its stub `execute` body with a real
+//!   Atlas-backed audit: an isolated, always-cleaned-up scratch clone +
+//!   transient graph build + CXEG-03 structural scoring (see `audit.rs`'s
+//!   `run_audit` and the "Tool: cortex_audit" section below).
 //!
-//! Net result: this module registers 11 tool NAMES total (10 unchanged from
-//! before CXEG-01, so no MCP-surface churn for callers listing tools, plus
-//! `cortex_house_style` added live in **CXEG-06**). Of those, `cortex_scope`
-//! and `cortex_house_style` are real, live Atlas-backed tools;
-//! `cortex_review`/`cortex_audit` remain Atlas-rebuild-pending stubs; and the
-//! other 7 are pure deprecation aliases with no backend at all.
+//! Net result: this module registers 11 tool NAMES total (the 10 from before
+//! CXEG-06, so no churn for callers listing them, plus `cortex_house_style`
+//! added live in **CXEG-06**). Of those, `cortex_scope` (CXEG-02),
+//! `cortex_review` (CXEG-04), `cortex_audit` (CXEG-11), and
+//! `cortex_house_style` (CXEG-06) are all real, live Atlas-backed tools; and
+//! the other 7 are pure deprecation aliases with no backend at all.
 //! `test_cortex_tools_registered` below asserts this shape (11 names
 //! present), not the old 10-live-relay-tools implementation.
 //!
@@ -101,6 +103,7 @@ pub mod audit;
 pub mod deprecated;
 pub mod house_style;
 pub mod metrics;
+pub mod review;
 pub mod scope;
 
 use audit::validate_repo_url;
@@ -191,6 +194,51 @@ pub struct CortexConfig {
     /// all, never the intent of an unset/misconfigured value — same
     /// reasoning as `max_blast_nodes`).
     pub house_style_exemplars_k: usize,
+    /// CXEG-04's `cortex_review` risk-score weight for a `centrality_spike`
+    /// structural signal (`points = weight * severity`). From
+    /// `CORTEX_RISK_WEIGHT_CENTRALITY_SPIKE`, default `2.0`. Sane-conservative
+    /// starting point; tunable in CXEG-10 calibration.
+    pub risk_weight_centrality_spike: f64,
+    /// CXEG-04 risk-score weight for a `complexity_spike` structural signal.
+    /// From `CORTEX_RISK_WEIGHT_COMPLEXITY_SPIKE`, default `1.5`.
+    pub risk_weight_complexity_spike: f64,
+    /// CXEG-04 risk-score weight for a `fan_out_explosion` structural signal.
+    /// From `CORTEX_RISK_WEIGHT_FAN_OUT_EXPLOSION`, default `1.5`.
+    pub risk_weight_fan_out_explosion: f64,
+    /// CXEG-04 risk-score weight for a `community_boundary_crossing`
+    /// structural signal (severity is always `1.0` for this kind, so this
+    /// weight is effectively its flat per-instance point value). From
+    /// `CORTEX_RISK_WEIGHT_COMMUNITY_BOUNDARY_CROSSING`, default `2.5`.
+    pub risk_weight_community_boundary_crossing: f64,
+    /// CXEG-04 risk-score weight for a `semantic_duplication` structural
+    /// signal. Weighted much higher than the others because this signal's
+    /// `severity` (`cosine - dup_cosine`) is bounded to a small `[0, ~0.15]`
+    /// range by construction, unlike the percentile-relative signals'
+    /// unbounded-above severities. From
+    /// `CORTEX_RISK_WEIGHT_SEMANTIC_DUPLICATION`, default `10.0`.
+    pub risk_weight_semantic_duplication: f64,
+    /// CXEG-04 risk-score weight applied to each KGFIND recurrence category's
+    /// log-scaled magnitude (`log2(1 + total_occurrences)`). From
+    /// `CORTEX_RISK_WEIGHT_RECURRENCE`, default `1.0`.
+    pub risk_weight_recurrence: f64,
+    /// CXEG-04 `cortex_review` band cut-point (0-10 scale): a `risk_score`
+    /// at or above this value (and below `risk_score_threshold`) reads as
+    /// `"elevated"`; below it reads as `"low"`. `risk_score_threshold` above
+    /// remains the `"elevated"` -> `"high"` cut-point (reused, not
+    /// duplicated — its doc already describes "at or above which a review
+    /// should be flagged for escalation," which is exactly the high-band
+    /// boundary). From `CORTEX_RISK_BAND_ELEVATED_CUT`, default `4.0`.
+    pub risk_band_elevated_cut: f64,
+    /// CXEG-11's `cortex_audit`: wall-clock ceiling (seconds) on the
+    /// isolated `git clone` of an external audit target before it is killed
+    /// and treated as a failure (scratch dir is still cleaned up). From
+    /// `CORTEX_AUDIT_CLONE_TIMEOUT_SECS`, default `60`.
+    pub audit_clone_timeout_secs: u64,
+    /// CXEG-11's `cortex_audit`: byte ceiling on a cloned external repo
+    /// (measured after clone, before any graph build) above which the audit
+    /// is refused rather than building a graph over an oversized checkout.
+    /// From `CORTEX_AUDIT_MAX_CLONE_BYTES`, default `200_000_000` (200MB).
+    pub audit_max_clone_bytes: u64,
 }
 
 impl CortexConfig {
@@ -205,8 +253,29 @@ impl CortexConfig {
             max_blast_nodes: env_usize("CORTEX_MAX_BLAST_NODES", scope::DEFAULT_MAX_BLAST_NODES),
             tier_b_percentile: env_f64("CORTEX_TIER_B_PERCENTILE", 90.0),
             house_style_exemplars_k: env_usize("CORTEX_HOUSE_STYLE_K", house_style::DEFAULT_EXEMPLARS_K),
+            risk_weight_centrality_spike: env_f64("CORTEX_RISK_WEIGHT_CENTRALITY_SPIKE", 2.0),
+            risk_weight_complexity_spike: env_f64("CORTEX_RISK_WEIGHT_COMPLEXITY_SPIKE", 1.5),
+            risk_weight_fan_out_explosion: env_f64("CORTEX_RISK_WEIGHT_FAN_OUT_EXPLOSION", 1.5),
+            risk_weight_community_boundary_crossing: env_f64("CORTEX_RISK_WEIGHT_COMMUNITY_BOUNDARY_CROSSING", 2.5),
+            risk_weight_semantic_duplication: env_f64("CORTEX_RISK_WEIGHT_SEMANTIC_DUPLICATION", 10.0),
+            risk_weight_recurrence: env_f64("CORTEX_RISK_WEIGHT_RECURRENCE", 1.0),
+            risk_band_elevated_cut: env_f64("CORTEX_RISK_BAND_ELEVATED_CUT", 4.0),
+            audit_clone_timeout_secs: env_u64("CORTEX_AUDIT_CLONE_TIMEOUT_SECS", 60),
+            audit_max_clone_bytes: env_u64("CORTEX_AUDIT_MAX_CLONE_BYTES", 200_000_000),
         }
     }
+}
+
+/// Read a non-secret unsigned 64-bit tuning flag; falls back to `default`
+/// when unset, unparseable, or `0` (mirrors [`env_usize`]'s zero-is-invalid
+/// convention — a zero clone timeout/size ceiling is never the intent of an
+/// unset/misconfigured value).
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
 }
 
 /// Read a non-secret float tuning flag; falls back to `default` when unset
@@ -274,6 +343,78 @@ fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, ToolError> {
         .ok_or_else(|| ToolError::InvalidArgument(format!("'{field}' must be a string")))
 }
 
+/// Shared `changed_files`/`diff` argument validation + derivation for
+/// `cortex_scope` (CXEG-02) and `cortex_review` (CXEG-04) — both tools accept
+/// the identical argument shapes (a `changed_files` CSV string or JSON array,
+/// or a unified `diff`) and must apply IDENTICAL DoS-ceiling / malformed-
+/// element validation before deriving the file list, so this is factored out
+/// once rather than duplicated per tool (S9).
+///
+/// Reconciles validation vs truncation exactly as `cortex_scope`'s own
+/// original CXEG-02 cycle-3 fix documented: an input oversized-*by-file-
+/// COUNT* (more files than `MAX_CHANGED_FILES`) TRUNCATES (flagged via the
+/// returned `input_truncated`, never rejected here); `InvalidArgument` is
+/// reserved for genuinely abusive/malformed input only — a single element/
+/// path longer than [`MAX_TEXT_LEN`], or a DoS-scale raw string/array/diff at
+/// a ceiling set far above what a `MAX_CHANGED_FILES`-file input would ever
+/// produce ([`MAX_DIFF_LEN`] / [`MAX_CHANGED_FILES_ARG`]).
+fn validate_and_parse_changed_files(args: &Value) -> Result<(Vec<String>, bool), ToolError> {
+    match args.get("changed_files") {
+        Some(Value::String(s)) => {
+            // A merely-long CSV of many short paths is NOT rejected (it
+            // truncates by count below); only a DoS-scale blob is.
+            if s.chars().count() > MAX_DIFF_LEN {
+                return Err(ToolError::InvalidArgument(format!(
+                    "'changed_files' exceeds {MAX_DIFF_LEN}-char DoS ceiling"
+                )));
+            }
+            // A single over-long path element is malformed → reject.
+            for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                validate_text_len(part, "changed_files element")?;
+            }
+        }
+        Some(Value::Array(arr)) => {
+            // Absolute array-size DoS ceiling, far above the file-count cap
+            // (arrays between the cap and this ceiling truncate, not reject).
+            if arr.len() > MAX_CHANGED_FILES_ARG {
+                return Err(ToolError::InvalidArgument(format!(
+                    "'changed_files' array exceeds {MAX_CHANGED_FILES_ARG}-element DoS ceiling"
+                )));
+            }
+            for (i, el) in arr.iter().enumerate() {
+                if let Some(s) = el.as_str() {
+                    validate_text_len(s, &format!("changed_files[{i}]"))?;
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let (changed_files, input_truncated) = scope::changed_files_from_args(args);
+    if changed_files.is_empty() {
+        return Err(ToolError::InvalidArgument(
+            "must provide a non-empty 'changed_files' (string or array) or 'diff'".to_string(),
+        ));
+    }
+
+    // A `diff`'s total-length DoS ceiling is applied ONLY when the parse
+    // did not already truncate by file count: an ordinary large multi-file
+    // diff (> MAX_CHANGED_FILES files) truncates + flags `truncated:true`
+    // rather than being rejected; rejection is reserved for a
+    // pathologically huge single blob (few files, enormous content).
+    if !input_truncated {
+        if let Some(diff) = args.get("diff").and_then(|v| v.as_str()) {
+            if diff.chars().count() > MAX_DIFF_LEN {
+                return Err(ToolError::InvalidArgument(format!(
+                    "'diff' exceeds {MAX_DIFF_LEN}-char DoS ceiling"
+                )));
+            }
+        }
+    }
+
+    Ok((changed_files, input_truncated))
+}
+
 // ---------------------------------------------------------------------------
 // Tool: cortex_scope (CXEG-02: real Atlas-backed blast-radius)
 // ---------------------------------------------------------------------------
@@ -325,66 +466,7 @@ impl RustTool for CortexScope {
         let project_id = require_str(&args, "project_id")?;
         validate_project_id(project_id)?;
 
-        // Reconcile validation vs truncation (CXEG-02 cycle-3): oversized
-        // -by-file-COUNT input must TRUNCATE + flag `truncated:true` (handled
-        // by the parse below via `input_truncated`), NEVER be rejected. Only
-        // genuinely abusive/malformed input is rejected here with
-        // InvalidArgument:
-        //   - a SINGLE element/path longer than MAX_TEXT_LEN (one absurd blob);
-        //   - a DoS-scale raw string/array/diff, at a ceiling set FAR above
-        //     what a MAX_CHANGED_FILES-file input would produce.
-        match args.get("changed_files") {
-            Some(Value::String(s)) => {
-                // A merely-long CSV of many short paths is NOT rejected (it
-                // truncates by count below); only a DoS-scale blob is.
-                if s.chars().count() > MAX_DIFF_LEN {
-                    return Err(ToolError::InvalidArgument(format!(
-                        "'changed_files' exceeds {MAX_DIFF_LEN}-char DoS ceiling"
-                    )));
-                }
-                // A single over-long path element is malformed → reject.
-                for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-                    validate_text_len(part, "changed_files element")?;
-                }
-            }
-            Some(Value::Array(arr)) => {
-                // Absolute array-size DoS ceiling, far above the file-count cap
-                // (arrays between the cap and this ceiling truncate, not reject).
-                if arr.len() > MAX_CHANGED_FILES_ARG {
-                    return Err(ToolError::InvalidArgument(format!(
-                        "'changed_files' array exceeds {MAX_CHANGED_FILES_ARG}-element DoS ceiling"
-                    )));
-                }
-                for (i, el) in arr.iter().enumerate() {
-                    if let Some(s) = el.as_str() {
-                        validate_text_len(s, &format!("changed_files[{i}]"))?;
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        let (changed_files, input_truncated) = scope::changed_files_from_args(&args);
-        if changed_files.is_empty() {
-            return Err(ToolError::InvalidArgument(
-                "must provide a non-empty 'changed_files' (string or array) or 'diff'".to_string(),
-            ));
-        }
-
-        // A `diff`'s total-length DoS ceiling is applied ONLY when the parse
-        // did not already truncate by file count: an ordinary large multi-file
-        // diff (> MAX_CHANGED_FILES files) truncates + flags `truncated:true`
-        // rather than being rejected; rejection is reserved for a
-        // pathologically huge single blob (few files, enormous content).
-        if !input_truncated {
-            if let Some(diff) = args.get("diff").and_then(|v| v.as_str()) {
-                if diff.chars().count() > MAX_DIFF_LEN {
-                    return Err(ToolError::InvalidArgument(format!(
-                        "'diff' exceeds {MAX_DIFF_LEN}-char DoS ceiling"
-                    )));
-                }
-            }
-        }
+        let (changed_files, input_truncated) = validate_and_parse_changed_files(&args)?;
 
         let response = scope::compute_scope(project_id, &changed_files, self.config.max_blast_nodes, input_truncated);
         serde_json::to_string_pretty(&response)
@@ -393,7 +475,7 @@ impl RustTool for CortexScope {
 }
 
 // ---------------------------------------------------------------------------
-// Tool: cortex_review (stub — real Atlas-backed rebuild is CXEG-04)
+// Tool: cortex_review (CXEG-04: real Atlas-backed risk scoring)
 // ---------------------------------------------------------------------------
 
 pub struct CortexReview {
@@ -407,12 +489,22 @@ impl RustTool for CortexReview {
     }
 
     fn description(&self) -> &str {
-        "PENDING REBUILD (CXEG-04): post-change risk assessment for modified \
-         files. The SSH-relay-era implementation has been retired; this tool \
-         currently returns a structured pending pointer instead of a live \
-         risk score. project_id: one of TERM/LUM/HARM/CHRD/RAIL. \
-         changed_files: comma-separated list of modified file paths. In the \
-         meantime, use kg_findings / kg_query directly against the Atlas KG."
+        "Post-change risk assessment for a diff, from the project's Atlas \
+         knowledge graph: a risk_score (0-10), a band (low/elevated/high), \
+         named risk_signals (CXEG-03's structural-elegance detectors), and \
+         per-source contributions that fully reconstruct the raw score \
+         (weight * severity per structural signal, plus a log-scaled term \
+         per KGFIND recurrence category). project_id: one of \
+         TERM/LUM/HARM/CHRD/RAIL. Provide EITHER changed_files (a \
+         comma-separated list, or a JSON array) OR diff (a unified diff -- \
+         changed files are parsed from its '+++ b/<path>' headers, same \
+         parser cortex_scope/review_run use). Never recommends rejection -- \
+         a high band only ever recommends escalating review rigor. \
+         Degrades cleanly: a project with no stored Atlas graph yet (run \
+         scribe_kg_build first) returns configured:false with band:unknown, \
+         never an error; an unreachable/unconfigured KGFIND findings store \
+         returns a structural-only score labeled findings:unavailable \
+         rather than failing the whole call."
     }
 
     fn parameters(&self) -> Value {
@@ -420,37 +512,33 @@ impl RustTool for CortexReview {
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "One of TERM/LUM/HARM/CHRD/RAIL", "enum": PROJECT_IDS },
-                "changed_files": { "type": "string", "description": "Comma-separated file paths that were modified" }
+                "changed_files": {
+                    "description": "Changed file paths: a comma-separated string or a JSON array e.g. 'src/cortex/mod.rs,src/cortex/audit.rs'",
+                    "oneOf": [
+                        { "type": "string" },
+                        { "type": "array", "items": { "type": "string" } }
+                    ]
+                },
+                "diff": { "type": "string", "description": "Unified diff; used to derive changed_files when changed_files is omitted" }
             },
-            "required": ["project_id", "changed_files"]
+            "required": ["project_id"]
         })
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
         let project_id = require_str(&args, "project_id")?;
-        let changed_files = require_str(&args, "changed_files")?;
         validate_project_id(project_id)?;
-        validate_text_len(changed_files, "changed_files")?;
 
-        let response = json!({
-            "status": "pending",
-            "item": "CXEG-04",
-            "tool": "cortex_review",
-            "project_id": project_id,
-            "message": "cortex_review's SSH-relay-era backend has been \
-                retired; an Atlas-backed risk-scoring implementation lands \
-                in CXEG-04. In the meantime, query kg_findings / kg_query \
-                directly against the Atlas KG.",
-            "risk_score_threshold": self.config.risk_score_threshold,
-            "elegance_advisory_only": self.config.elegance_advisory_only,
-        });
+        let (changed_files, input_truncated) = validate_and_parse_changed_files(&args)?;
+
+        let response = review::compute_review(project_id, &changed_files, &self.config, input_truncated).await;
         serde_json::to_string_pretty(&response)
             .map_err(|e| ToolError::Execution(format!("JSON render error: {e}")))
     }
 }
 
 // ---------------------------------------------------------------------------
-// Tool: cortex_audit (stub — real backend rebuild is CXEG-11)
+// Tool: cortex_audit (CXEG-11: live, Atlas-backed external-repo audit)
 // ---------------------------------------------------------------------------
 
 pub struct CortexAudit {
@@ -464,15 +552,18 @@ impl RustTool for CortexAudit {
     }
 
     fn description(&self) -> &str {
-        "PENDING REBUILD (CXEG-11): audit an external public Git repository. \
-         The SSH-relay-era implementation (which delegated clone + graph \
-         build + report generation to a script on the now-retired fleet \
-         host) has been retired. The url argument still passes through the \
-         existing SSRF-hardened validator (only public http/https URLs are \
-         accepted), but execute() currently returns a structured pending \
-         pointer rather than performing a live audit — the real backend \
-         (presumably a sandboxed local clone + Atlas build) lands in \
-         CXEG-11."
+        "Audit an external public Git repository's structural elegance. As \
+         of CXEG-11: clones the url into an isolated, always-cleaned-up \
+         scratch directory (shallow, no submodules, no repo code ever \
+         executes), statically extracts a transient (never persisted) Atlas \
+         knowledge graph, runs the CXEG-03 structural-elegance detectors \
+         (centrality/complexity/fan-out/community-boundary signals) over the \
+         whole repo, and returns a report -- then deletes the clone. The url \
+         first passes the unchanged SSRF-hardened validator (only public \
+         http/https URLs to non-private/loopback/link-local/metadata hosts \
+         are accepted). Clone size and time are bounded \
+         (CORTEX_AUDIT_MAX_CLONE_BYTES / CORTEX_AUDIT_CLONE_TIMEOUT_SECS); an \
+         oversized or slow clone is refused, not silently truncated."
     }
 
     fn parameters(&self) -> Value {
@@ -489,24 +580,10 @@ impl RustTool for CortexAudit {
         let url = require_str(&args, "url")?;
         // Front-gate unchanged from the SSH-relay era: SSRF-hardened URL
         // validation (`audit.rs`, no dependency on the deleted SSH helpers)
-        // runs BEFORE anything else, same as it always has.
+        // runs BEFORE anything else, including before the clone attempt.
         validate_repo_url(url)?;
 
-        // CXEG-11 rebuilds this tool's actual backend (sandboxed local
-        // clone + Atlas KG build, replacing the retired remote-script
-        // relay). Until then, a valid URL gets a structured pending
-        // pointer instead of a live audit -- no network I/O happens here.
-        let response = json!({
-            "status": "pending",
-            "item": "CXEG-11",
-            "tool": "cortex_audit",
-            "url": url,
-            "message": "cortex_audit's SSH-relay-era backend has been \
-                retired; a locally-sandboxed clone + Atlas-build \
-                implementation lands in CXEG-11. The url has passed \
-                SSRF-hardened validation but no audit has been performed.",
-            "dup_cosine_threshold": self.config.dup_cosine,
-        });
+        let response = audit::run_audit(url, &self.config).await?;
         serde_json::to_string_pretty(&response)
             .map_err(|e| ToolError::Execution(format!("JSON render error: {e}")))
     }
@@ -627,9 +704,10 @@ impl RustTool for CortexHouseStyle {
 /// Register all Cortex tools into the ToolRegistry: the 4 "real" tools
 /// (`cortex_scope` — live Atlas-backed blast radius as of CXEG-02;
 /// `cortex_house_style` — live Atlas-derived house-style exemplars as of
-/// CXEG-06; `cortex_review`/`cortex_audit` — still Atlas-rebuild-pending
-/// stubs) plus the 7 deprecation aliases for the retired pure-relay tools
-/// (see [`deprecated`]).
+/// CXEG-06; `cortex_review` — live Atlas-backed risk scoring as of CXEG-04;
+/// `cortex_audit` — live Atlas-backed external-repo audit as of CXEG-11)
+/// plus the 7 deprecation aliases for the retired pure-relay tools (see
+/// [`deprecated`]).
 pub fn register(registry: &mut ToolRegistry) {
     let config = Arc::new(CortexConfig::from_env());
     let house_style_cache = Arc::new(house_style::HouseStyleCache::new());
@@ -668,6 +746,15 @@ mod tests {
             max_blast_nodes: scope::DEFAULT_MAX_BLAST_NODES,
             tier_b_percentile: 90.0,
             house_style_exemplars_k: house_style::DEFAULT_EXEMPLARS_K,
+            risk_weight_centrality_spike: 2.0,
+            risk_weight_complexity_spike: 1.5,
+            risk_weight_fan_out_explosion: 1.5,
+            risk_weight_community_boundary_crossing: 2.5,
+            risk_weight_semantic_duplication: 10.0,
+            risk_weight_recurrence: 1.0,
+            risk_band_elevated_cut: 4.0,
+            audit_clone_timeout_secs: 60,
+            audit_max_clone_bytes: 200_000_000,
         })
     }
 
@@ -896,7 +983,13 @@ mod tests {
         std::env::remove_var("SCRIBE_KG_STORE_DIR");
     }
 
-    // --- cortex_review (stub) --------------------------------------------------
+    // --- cortex_review (CXEG-04: real Atlas-backed risk scoring) ---------------
+    //
+    // Full risk-scoring behavior (structural signals, recurrence, band
+    // cut-points, contributions/explainability, degrade paths) is covered by
+    // `review::tests` against fixture graphs/scores; these tests cover
+    // argument validation and the tool-trait wiring (`CortexReview::execute`
+    // -> `validate_and_parse_changed_files` / `review::compute_review`).
 
     #[tokio::test]
     async fn test_review_rejects_unknown_project_id() {
@@ -909,20 +1002,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_review_returns_pending_pointer_for_valid_input() {
+    async fn test_review_rejects_when_no_changed_files_or_diff() {
+        let tool = CortexReview { config: test_config() };
+        let err = tool.execute(json!({"project_id": "TERM"})).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_review_degrades_to_configured_false_without_a_stored_graph() {
+        let store_dir = std::env::temp_dir().join(format!("atlas-cortexmod-review-test-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+
         let tool = CortexReview { config: test_config() };
         let out = tool
             .execute(json!({"project_id": "LUM", "changed_files": "src/lib.rs"}))
             .await
-            .expect("valid input must succeed with a pending pointer, not an error");
+            .expect("no stored graph must degrade, not error");
         let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["status"], "pending");
-        assert_eq!(v["item"], "CXEG-04");
+        assert_eq!(v["configured"], false);
         assert_eq!(v["project_id"], "LUM");
-        assert_eq!(v["risk_score_threshold"], 7.0);
+        assert_eq!(v["band"], "unknown");
+        assert_eq!(v["findings"], "unavailable");
+        assert!(!v["recommendation"].as_str().unwrap().to_lowercase().contains("reject"));
+
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
     }
 
-    // --- cortex_audit (stub, still SSRF-gated) ---------------------------------
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_review_accepts_changed_files_array_and_diff_forms() {
+        // cortex_review shares cortex_scope's argument shapes as of CXEG-04
+        // -- array form and diff-only form must both be accepted (not just
+        // the legacy CSV-string form), parsed into the SAME `changed_files`
+        // list regardless of which shape supplied it.
+        let store_dir = std::env::temp_dir().join(format!("atlas-cortexmod-review-shapes-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+        let tool = CortexReview { config: test_config() };
+
+        let out_array = tool
+            .execute(json!({"project_id": "TERM", "changed_files": ["src/a.rs", "src/b.rs"]}))
+            .await
+            .expect("array form must be accepted");
+        let v_array: Value = serde_json::from_str(&out_array).unwrap();
+        assert_eq!(v_array["changed_files"], json!(["src/a.rs", "src/b.rs"]));
+
+        let diff = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-x\n+y\n";
+        let out_diff = tool.execute(json!({"project_id": "TERM", "diff": diff})).await.expect("diff form must be accepted");
+        let v_diff: Value = serde_json::from_str(&out_diff).unwrap();
+        assert_eq!(v_diff["changed_files"], json!(["src/a.rs"]));
+
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
+    }
+
+    // --- cortex_audit (CXEG-11 real, SSRF-gated; clone/build in audit::tests) --
 
     #[tokio::test]
     async fn test_audit_rejects_non_public_url_before_stub_response() {
@@ -945,17 +1078,20 @@ mod tests {
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
+    // NOTE: CXEG-11 made `cortex_audit` actually clone its `url` (into an
+    // isolated, cleaned-up scratch dir) and build a real Atlas graph over
+    // it, so a "valid URL succeeds" test through this wiring layer would
+    // require live network access to an external host -- not appropriate
+    // for a hermetic unit test. The full clone -> build -> report pipeline
+    // (success, size-ceiling rejection, no-supported-files rejection,
+    // cleanup-on-success/failure/panic) is covered against LOCAL git
+    // fixtures (no network) in `audit::tests`; this module's tests cover
+    // only argument validation and the SSRF front-gate ordering.
     #[tokio::test]
-    async fn test_audit_returns_pending_pointer_for_valid_url() {
+    async fn test_audit_missing_url_is_invalid_argument() {
         let tool = CortexAudit { config: test_config() };
-        let out = tool
-            .execute(json!({"url": "https://github.com/octocat/Hello-World"}))
-            .await
-            .expect("valid url must succeed with a pending pointer, not an error");
-        let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["status"], "pending");
-        assert_eq!(v["item"], "CXEG-11");
-        assert_eq!(v["url"], "https://github.com/octocat/Hello-World");
+        let err = tool.execute(json!({})).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
     // --- registration -----------------------------------------------------------
@@ -964,9 +1100,10 @@ mod tests {
     fn test_cortex_tools_registered() {
         let mut registry = ToolRegistry::new();
         register(&mut registry);
-        // 4 "real" tools (cortex_scope + cortex_house_style live,
-        // cortex_review/cortex_audit still pending) + 7 deprecation aliases
-        // = 11 names, the pre-CXEG-01 10-name surface plus CXEG-06's new
+        // 4 "real" tools (cortex_scope live since CXEG-02, cortex_review
+        // live since CXEG-04, cortex_audit live since CXEG-11, and
+        // cortex_house_style live since CXEG-06) + 7 deprecation aliases
+        // = 11 names — the pre-CXEG-06 10-name surface plus CXEG-06's new
         // `cortex_house_style` (an intentional, additive MCP-listing change).
         assert_eq!(registry.len(), 11);
         for name in [
