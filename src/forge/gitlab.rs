@@ -1275,7 +1275,19 @@ impl ForgeProvider for GitLabAdapter {
                 if let Some(m) = merge_msg {
                     body["merge_commit_message"] = json!(m);
                 }
-                if let Some(sq) = p.get("squash").and_then(Value::as_bool) {
+                // Honor an explicit `squash` bool, OR the shared `merge_method`
+                // vocabulary: "squash" → squash=true; "merge"/"rebase" → squash=false.
+                // Without this the GitHub/Gitea-honored `merge_method: "squash"` would
+                // be silently ignored on GitLab (it would keep individual commits).
+                let squash = p
+                    .get("squash")
+                    .and_then(Value::as_bool)
+                    .or_else(|| match p.get("merge_method").and_then(Value::as_str) {
+                        Some("squash") => Some(true),
+                        Some("merge") | Some("rebase") => Some(false),
+                        _ => None,
+                    });
+                if let Some(sq) = squash {
                     body["squash"] = json!(sq);
                 }
                 let url = format!("{api}/projects/{pid}/merge_requests/{iid}/merge");

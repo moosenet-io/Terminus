@@ -49,6 +49,10 @@ pub struct HistoryReport {
     pub idents_seen: usize,
     /// author/committer idents actually rewritten by the GHIST-03 attribution map.
     pub idents_remapped: usize,
+    /// commit/tag message payloads seen.
+    pub messages_total: usize,
+    /// commit/tag message payloads the cleaner actually changed.
+    pub messages_rewritten: usize,
 }
 
 /// Replay options.
@@ -930,9 +934,22 @@ fn transform_stream<R: BufRead, W: Write>(
                     }
                     scrubbed
                 }
-                // Commit message (or a stray data with no preceding blob/commit) —
-                // never scrubbed here (messages are prose; graph fidelity first).
-                _ => data,
+                // Commit / tag MESSAGE: scrub it too. Messages carry PII (hostnames,
+                // IPs, emails, ticket refs, pasted secrets) just like blobs, and the
+                // full-history gate only scans trees — so an unscrubbed message would
+                // leak to the public mirror. The same single-line-safe cleaner is used;
+                // graph structure (parents / dates / refs) rides on separate stream
+                // lines and is untouched, so fidelity is preserved. (GHIST-05 review.)
+                Pending::Message => {
+                    report.messages_total += 1;
+                    let scrubbed = DeterministicCleaner::scrub_bytes(&data);
+                    if scrubbed != data {
+                        report.messages_rewritten += 1;
+                    }
+                    scrubbed
+                }
+                // A stray data with no preceding blob/commit — passed through.
+                Pending::None => data,
             };
             pending = Pending::None;
             w.write_all(format!("data {}\n", out.len()).as_bytes())
@@ -1229,6 +1246,40 @@ mod tests {
         let err = replay_pr_slice(&src, &wd, &c1, &c2, &canon, "pr-mirror/9", &opts);
         assert!(err.is_err(), "must refuse an out-of-order PR replay: {err:?}");
         assert!(format!("{err:?}").contains("out of order"), "{err:?}");
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    // ── GHIST-05 review: commit MESSAGES are scrubbed, not just blobs ──
+    #[test]
+    fn replay_scrubs_commit_messages() {
+        let src = unique("msgsrc");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q", "-b", "main"]);
+        write(&src, "f.txt", b"clean content\n");
+        // The MESSAGE (not the blob) carries an internal IP.
+        let out = Command::new("git")
+            .arg("-C").arg(&src).args(HOOKS_OFF)
+            .args(["-c", "user.name=A", "-c", "user.email=<email>", // pii-test-fixture
+                   "add", "-A"])
+            .output().unwrap();
+        assert!(out.status.success());
+        let out = Command::new("git")
+            .arg("-C").arg(&src).args(HOOKS_OFF)
+            .args(["-c", "user.name=A", "-c", "user.email=<email>", // pii-test-fixture
+                   "commit", "-q", "-m", "deploy to <internal-ip> tonight"]) // pii-test-fixture
+            .output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        let wd = unique("msgwd");
+        let opts = ReplayOpts::with_author_map(bot_map());
+        let report = replay_full_history(&src, &wd, &opts).unwrap();
+        assert!(report.messages_rewritten >= 1, "a message was scrubbed: {report:?}");
+
+        // The replayed commit message no longer contains the internal IP.
+        let msg = git(&wd, &["log", "-1", "--format=%B"]);
+        assert!(!msg.contains("<internal-ip>"), "commit message scrubbed: {msg:?}"); // pii-test-fixture
 
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&wd);

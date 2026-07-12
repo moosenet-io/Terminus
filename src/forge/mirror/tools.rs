@@ -103,12 +103,27 @@ const REMOTE_ENV: &str = "TERMINUS_MIRROR_REMOTE";
 /// never a silent fallback to GitHub's credential.
 fn mirror_provider_token(provider: &str) -> Result<String, ToolError> {
     match provider {
+        // GitHub keeps its dedicated resolver (GITHUB_PAT_<NAME> / legacy GITHUB_TOKEN).
         "github" => github_token(),
-        other => Err(ToolError::NotConfigured(format!(
-            "mirror engine has no transport credential resolver configured for provider \
-             '{other}' yet (only 'github' is wired) — the engine is provider-routable, but \
-             this target has not been configured"
-        ))),
+        // Every other public destination resolves its own `<PROVIDER>_TOKEN` env (e.g.
+        // GITLAB_TOKEN, CODEBERG_TOKEN, GITEA_TOKEN) — provider-agnostic transport, no
+        // silent GitHub fallback. Absent env → a clean, honest NotConfigured.
+        other => {
+            let key = format!(
+                "{}_TOKEN",
+                other.to_uppercase().replace(|c: char| !c.is_ascii_alphanumeric(), "_")
+            );
+            std::env::var(&key)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    ToolError::NotConfigured(format!(
+                        "no transport credential for public provider '{other}': set {key} (the \
+                         engine is provider-routable; this target's token is not configured)"
+                    ))
+                })
+        }
     }
 }
 
