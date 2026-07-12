@@ -271,6 +271,12 @@ async fn read_all_comments(
             let key = c.get("id").map(|v| v.to_string()).unwrap_or_else(|| c.to_string());
             if seen.insert(key) {
                 new_in_page += 1;
+                // Skip auto-generated SYSTEM notes (GitLab marks lifecycle events —
+                // "changed milestone", "assigned", etc. — with `system: true`); those
+                // are not human review discussion and must not be mirrored as comments.
+                if c.get("system").and_then(Value::as_bool) == Some(true) {
+                    continue;
+                }
                 if let Some(b) = c.get("body").and_then(Value::as_str) {
                     if !b.trim().is_empty() {
                         out.push(scrub_text(b));
@@ -290,16 +296,16 @@ async fn read_all_comments(
 }
 
 /// Bounded scan of the PUBLIC forge for an existing PR whose head branch is `branch`
-/// (any state — open/closed/merged). This is the DURABLE idempotency check: even with
-/// no local `mirror-pr/<n>` tag (lost work-dir, or a crash after the public merge but
-/// before the local tag), an existing public PR means the work is already done.
-/// Returns the PR's state string if found.
-async fn public_pr_state_for_branch(
+/// (any state). Returns the matching PR object so the caller can distinguish a MERGED
+/// one (the work is done) from an OPEN/partial one (a prior run stalled — must NOT be
+/// treated as done). Used for durable idempotency across a lost work-dir / a crash
+/// after the public merge but before the local tag.
+async fn public_pr_for_branch(
     reg: &ForgeRegistry,
     cfg: &PrReplayConfig,
     pub_repo: &str,
     branch: &str,
-) -> Result<Option<String>, ToolError> {
+) -> Result<Option<Value>, ToolError> {
     let mut page = 1u64;
     loop {
         let mut params = json!({ "repo": pub_repo, "state": "all", "page": page, "limit": 50 });
@@ -313,8 +319,7 @@ async fn public_pr_state_for_branch(
         }
         for pr in &arr {
             if pr_head_ref(pr).as_deref() == Some(branch) {
-                let state = pr.get("state").and_then(Value::as_str).unwrap_or("unknown").to_string();
-                return Ok(Some(state));
+                return Ok(Some(pr.clone()));
             }
         }
         page += 1;
@@ -417,17 +422,27 @@ pub async fn replay_pr(
         return Ok(base_outcome);
     }
 
-    // Idempotency (DURABLE): even without a local tag (lost work-dir, or a crash after
-    // the public merge but before the local tag), an existing PUBLIC PR for this
-    // branch means the work is already done. Re-record the local tag and skip — never
-    // double-create.
+    // Idempotency (DURABLE): scan the public forge for an existing PR on this branch.
+    // Only a MERGED one means the work is done — reconcile the boundary from public
+    // main and tag, then skip. An OPEN/partial one is NOT treated as done: it falls
+    // through so the remote-branch guard below refuses it as an incomplete prior run
+    // (fail-closed), for the operator to reconcile.
     let pub_repo_probe = cfg.public_repo.clone().unwrap_or_else(|| cfg.repo.clone());
-    if let Some(state) = public_pr_state_for_branch(reg, cfg, &pub_repo_probe, &branch).await? {
-        let _ = git(&cfg.work_dir, &["tag", "-f", &pr_tag(internal_pr), "HEAD"]);
-        base_outcome.skipped = true;
-        base_outcome.note =
-            format!("public PR already exists for '{branch}' (state {state}) — skipped (durable idempotency)");
-        return Ok(base_outcome);
+    if let Some(existing) = public_pr_for_branch(reg, cfg, &pub_repo_probe, &branch).await? {
+        if pr_is_merged(&existing) {
+            let new_public = fetch_public_main(&cfg.work_dir, &cfg.remote, &cfg.transport_token)?;
+            set_pushed_sha(&cfg.work_dir, &new_public)?;
+            git(&cfg.work_dir, &["tag", "-f", &pr_tag(internal_pr), &new_public])?;
+            base_outcome.skipped = true;
+            base_outcome.public_head = Some(new_public);
+            base_outcome.note = format!(
+                "public PR for '{branch}' already MERGED — published boundary reconciled + tagged, \
+                 skipped (durable idempotency)"
+            );
+            return Ok(base_outcome);
+        }
+        // An OPEN / non-merged public PR exists — a stalled prior run. Fall through to
+        // the remote-branch guard, which refuses it (never silently 'done').
     }
 
     // 1. Read the internal PR.
