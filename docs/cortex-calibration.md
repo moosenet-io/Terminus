@@ -76,10 +76,34 @@ hotfix is exactly the case where that assumption doesn't hold.
    small sample can't reliably distinguish a real problem from noise. At or
    above the minimum, the recommendation either says "no change needed"
    (rate at or below target) or names the single highest-firing signal
-   (structural or consistency-lens category) as the first thing to retune,
-   pointing at the specific env var that controls it
-   (`CORTEX_RISK_WEIGHT_*`, `CORTEX_TIER_B_PERCENTILE`,
-   `CORTEX_RISK_BAND_ELEVATED_CUT`, `CORTEX_RISK_SCORE_THRESHOLD`).
+   (structural or consistency-lens category) as the first thing to retune —
+   **with a concrete recommended new value**, not just an env-var name (see
+   "Concrete numeric recommendations" below).
+
+### Concrete numeric recommendations
+
+When the false-positive rate is over target, the report doesn't just name a
+knob — it computes a recommended new value for the top over-firing signal's
+primary lever, derived transparently from the overshoot ratio
+`target / observed_fp`. All three levers are monotonic in the "fewer flags"
+direction, and the active margin is scaled by the overshoot so a 2×-over
+rate makes a roughly 2×-tighter cut. The exact model (`recommend_adjustment`
+in `src/cortex/calibrate.rs`):
+
+| Top signal | Lever (env var) | Recommended new value |
+| --- | --- | --- |
+| `centrality_spike` / `complexity_spike` / `fan_out_explosion` | `CORTEX_TIER_B_PERCENTILE` (current `p`) | `p' = 100 − (100 − p)·(target/fp)`, clamped to `(p, 99]` — shrinks the firing tail proportionally (e.g. p90 → p99 at 10× over, p90 → p95 at 2× over). |
+| `semantic_duplication` | `CORTEX_DUP_COSINE_THRESHOLD` (current `c`) | `c' = c + (1 − c)·(1 − target/fp)`, clamped to `(c, 0.99]` — only flags tighter matches (e.g. 0.85 → 0.99). |
+| `community_boundary_crossing` (structural, no dedicated knob) | `CORTEX_RISK_BAND_ELEVATED_CUT` (current `e`) | `e' = e·(fp/target)`, clamped to `(e, 9.0]` — moves borderline changes back to the `low` band (e.g. 4.0 → 8.0 at 2× over). |
+| A CXEG-07 consistency-lens category | *(none)* | The lens has **no** numeric threshold; its firing is governed by the pinned prompt/provider (`CONSISTENCY_REVIEW_PROVIDER`), so the report gives an honest "review the prompt / accept as advisory" message and **no fabricated number**. |
+
+The recommended value is always an **estimate to confirm by re-running** —
+the model uses the observed firing rate, not the underlying node-score
+distribution (which the harness deliberately doesn't retain), so apply the
+change, re-run calibration, and check the rate actually moved. The concrete
+adjustment is surfaced both as a `recommended_adjustment` object in the raw
+JSON (`env_var`/`current`/`recommended`/`rationale`) and as a "Concrete
+threshold change" table in the report.
 
 All of the above (steps 5-6) is pure, unit-tested math in
 `src/cortex/calibrate.rs` (`compute_fp_rate`) — independent of any live
@@ -100,7 +124,9 @@ A generated report (this file, after a live run) contains:
   consistency-lens finding category that fired at least once, each with its
   fired count, sample size, and rate, ranked highest-first.
 - **Recommendation** — the plain-language guidance described in step 6
-  above.
+  above, followed (when over target and the top signal has a numeric lever)
+  by a **Concrete threshold change** table naming the env var and its
+  current → recommended value.
 - **Raw report (JSON)** — the same numbers as machine-readable JSON
   (`cortex::calibrate::report_to_json`), for feeding into further tooling.
 - **Replayed PRs** — the full corpus (number, title, merged, band,

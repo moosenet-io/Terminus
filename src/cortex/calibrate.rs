@@ -27,6 +27,62 @@ pub const DEFAULT_MIN_SAMPLE: usize = 20;
 /// machinery to have flagged a PR that, in fact, merged and shipped fine.
 pub const DEFAULT_TARGET_FP_RATE: f64 = 0.10;
 
+/// The five CXEG-03 structural-signal kinds (mirrors `metrics::SignalKind`'s
+/// `as_str` values). Kept here as a local const rather than depending on
+/// `metrics` so this module stays a pure, dependency-light leaf — the
+/// mapping from a fired signal name to its controlling knob (below) only
+/// needs the string forms. A drift between this list and `SignalKind` is
+/// low-risk by construction: a new/renamed structural kind not listed here
+/// would only degrade a numeric recommendation to the generic band-cut lever
+/// (`is_structural_signal` still routes it there), never produce a wrong
+/// number — the values here match `metrics::SignalKind::as_str` as of
+/// CXEG-03.
+const STRUCTURAL_PERCENTILE_SIGNALS: &[&str] =
+    &["centrality_spike", "complexity_spike", "fan_out_explosion"];
+const SEMANTIC_DUP_SIGNAL: &str = "semantic_duplication";
+
+/// The current values of the tunable knobs a calibration recommendation can
+/// suggest concrete new numbers for. The pure FP-rate math needs these to
+/// emit an actionable `from → to` rather than only naming an env var; the
+/// harness fills them from the live `CortexConfig`, and tests pass explicit
+/// values so the recommendation numbers stay deterministically checkable.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct CalibrationKnobs {
+    /// `CORTEX_TIER_B_PERCENTILE` (default 90) — the percentile cut-point the
+    /// three percentile-relative structural signals fire above. Raising it
+    /// makes those signals fire on fewer nodes.
+    pub tier_b_percentile: f64,
+    /// `CORTEX_DUP_COSINE_THRESHOLD` (default 0.85) — cosine above which two
+    /// spans count as near-duplicates. Raising it makes `semantic_duplication`
+    /// fire less often.
+    pub dup_cosine: f64,
+    /// `CORTEX_RISK_BAND_ELEVATED_CUT` (default 4.0) — the risk score at/above
+    /// which a change reads `elevated`. Raising it moves borderline changes
+    /// back to `low`, reducing band-driven flags regardless of which signal
+    /// drove the score (the universally-valid lever for any structural
+    /// over-flagging the two signal-specific knobs above don't cover).
+    pub risk_band_elevated_cut: f64,
+}
+
+impl CalibrationKnobs {
+    /// The CXEG-03/04 defaults, matching `CortexConfig::from_env`'s own
+    /// fallbacks — handy for tests and for a caller with no live config.
+    pub fn defaults() -> Self {
+        Self { tier_b_percentile: 90.0, dup_cosine: 0.85, risk_band_elevated_cut: 4.0 }
+    }
+}
+
+/// A concrete, actionable threshold change: which env var, its current value,
+/// the recommended new value, and why. This is the "not just a variable name,
+/// an actual number" half of a recommendation.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RecommendedAdjustment {
+    pub env_var: String,
+    pub current: f64,
+    pub recommended: f64,
+    pub rationale: String,
+}
+
 /// One merged-PR replay record: what CXEG-04's structural review + CXEG-07's
 /// consistency lens WOULD have flagged, scored against a PR that actually
 /// merged (the FP proxy — it shipped, so a flag on it is a candidate false
@@ -93,6 +149,13 @@ pub struct CalibrationReport {
     pub sample_small: bool,
     pub min_sample: usize,
     pub signal_rates: Vec<SignalRate>,
+    /// The single concrete knob change most likely to move the false-positive
+    /// rate toward target: which env var, from what value to what value, and
+    /// why. `None` when no change is warranted (rate at/below target, sample
+    /// too small) OR when the top over-firing signal is the CXEG-07
+    /// consistency lens, which has no numeric threshold to turn (see
+    /// [`recommend_adjustment`]).
+    pub recommended_adjustment: Option<RecommendedAdjustment>,
     pub recommendation: String,
 }
 
@@ -106,11 +169,16 @@ pub struct CalibrationReport {
 /// record with `merged: false` is dropped too — defensive, since the harness
 /// should already only hand this function merged PRs, but this keeps the
 /// function a true total function over whatever fixture/corpus it's given.
+///
+/// `knobs` carries the current threshold values so the recommendation can
+/// emit a concrete `from → to` number for the top over-firing signal, not
+/// just an env-var name.
 pub fn compute_fp_rate(
     records: &[PrRecord],
     exclude_reverts: bool,
     min_sample: usize,
     target_fp_rate: f64,
+    knobs: &CalibrationKnobs,
 ) -> CalibrationReport {
     let total_prs = records.len();
     let excluded_revert_hotfix = records.iter().filter(|r| r.is_revert_or_hotfix).count();
@@ -157,8 +225,20 @@ pub fn compute_fp_rate(
     });
 
     let sample_small = scored_prs < min_sample;
-    let recommendation =
-        build_recommendation(false_positive_rate, target_fp_rate, sample_small, &signal_rates);
+    let recommended_adjustment = if sample_small || false_positive_rate <= target_fp_rate {
+        None
+    } else {
+        signal_rates
+            .first()
+            .and_then(|s| recommend_adjustment(&s.signal, false_positive_rate, target_fp_rate, knobs))
+    };
+    let recommendation = build_recommendation(
+        false_positive_rate,
+        target_fp_rate,
+        sample_small,
+        &signal_rates,
+        recommended_adjustment.as_ref(),
+    );
 
     CalibrationReport {
         total_prs,
@@ -171,8 +251,123 @@ pub fn compute_fp_rate(
         sample_small,
         min_sample,
         signal_rates,
+        recommended_adjustment,
         recommendation,
     }
+}
+
+/// Map the top over-firing signal to a concrete recommended new value for its
+/// primary controlling knob, derived from the overshoot ratio `target/fp`.
+///
+/// The model is deliberately transparent (and labeled an estimate in the
+/// prose, to be confirmed by re-running): all three levers are monotonic in
+/// the direction of "fewer flags," and we scale the active margin by the
+/// overshoot so a 2x-over-target rate makes roughly a 2x-tighter cut.
+///
+/// - Percentile signals (`centrality_spike`/`complexity_spike`/
+///   `fan_out_explosion`) → `CORTEX_TIER_B_PERCENTILE`. Only the top
+///   `100 - p` percent of nodes fire; scale that tail by `target/fp`:
+///   `p' = 100 - (100 - p) * (target/fp)`, clamped to `(p, 99]`.
+/// - `semantic_duplication` → `CORTEX_DUP_COSINE_THRESHOLD`. Close the gap to
+///   1.0 in proportion to the overshoot: `c' = c + (1 - c) * (1 - target/fp)`,
+///   clamped to `(c, 0.99]`.
+/// - Anything else structural (e.g. `community_boundary_crossing`,
+///   recurrence) → `CORTEX_RISK_BAND_ELEVATED_CUT`, the universally-valid
+///   lever: raise the elevated cut by the overshoot factor,
+///   `e' = e * (fp/target)`, clamped to `(e, 9.0]`.
+/// - A CXEG-07 consistency-lens category (any name that is NOT one of the
+///   five structural kinds) → `None`: the lens has no numeric threshold; its
+///   firing is governed by the pinned prompt/provider, not a cut-point, so
+///   there is no honest number to recommend here.
+fn recommend_adjustment(
+    signal: &str,
+    fp: f64,
+    target: f64,
+    knobs: &CalibrationKnobs,
+) -> Option<RecommendedAdjustment> {
+    // fp > target is guaranteed by the caller, and target > 0 in practice; be
+    // defensive so a degenerate target can never divide-by-zero or invert.
+    if fp <= 0.0 || target <= 0.0 || fp <= target {
+        return None;
+    }
+    let shrink = (target / fp).clamp(0.0, 1.0); // < 1 when over target
+    let grow = fp / target; // > 1 when over target
+
+    if STRUCTURAL_PERCENTILE_SIGNALS.contains(&signal) {
+        let p = knobs.tier_b_percentile;
+        let tail = (100.0 - p).max(0.0);
+        let new_p = round1((100.0 - tail * shrink).clamp(p, 99.0)).max(round1(p));
+        if new_p <= p {
+            return None;
+        }
+        Some(RecommendedAdjustment {
+            env_var: "CORTEX_TIER_B_PERCENTILE".to_string(),
+            current: round1(p),
+            recommended: new_p,
+            rationale: format!(
+                "'{signal}' is percentile-relative; raising the cut from p{:.0} to p{:.0} shrinks \
+                 the firing tail by ~{:.0}% (the target/observed ratio), the proportional cut to \
+                 bring the flag rate to target",
+                p,
+                new_p,
+                (1.0 - shrink) * 100.0
+            ),
+        })
+    } else if signal == SEMANTIC_DUP_SIGNAL {
+        let c = knobs.dup_cosine;
+        let new_c = round2((c + (1.0 - c) * (1.0 - shrink)).clamp(c, 0.99)).max(round2(c));
+        if new_c <= c {
+            return None;
+        }
+        Some(RecommendedAdjustment {
+            env_var: "CORTEX_DUP_COSINE_THRESHOLD".to_string(),
+            current: round2(c),
+            recommended: new_c,
+            rationale: format!(
+                "raising the near-duplicate cosine from {:.2} to {:.2} makes 'semantic_duplication' \
+                 fire only on tighter matches, proportional to the {:.0}% overshoot",
+                c,
+                new_c,
+                (grow - 1.0) * 100.0
+            ),
+        })
+    } else if is_structural_signal(signal) {
+        // A structural signal without its own dedicated knob -> the band cut.
+        let e = knobs.risk_band_elevated_cut;
+        let new_e = round1((e * grow).clamp(e, 9.0)).max(round1(e) + 0.1);
+        if new_e <= e {
+            return None;
+        }
+        Some(RecommendedAdjustment {
+            env_var: "CORTEX_RISK_BAND_ELEVATED_CUT".to_string(),
+            current: round1(e),
+            recommended: round1(new_e.min(9.0)),
+            rationale: format!(
+                "'{signal}' has no dedicated per-signal threshold; raising the elevated-band cut \
+                 from {:.1} to {:.1} (the overshoot factor) moves borderline changes back to the \
+                 'low' band without re-weighting any single signal",
+                e,
+                round1(new_e.min(9.0))
+            ),
+        })
+    } else {
+        // A CXEG-07 consistency-lens category: no numeric threshold governs it.
+        None
+    }
+}
+
+fn is_structural_signal(signal: &str) -> bool {
+    STRUCTURAL_PERCENTILE_SIGNALS.contains(&signal)
+        || signal == SEMANTIC_DUP_SIGNAL
+        || signal == "community_boundary_crossing"
+}
+
+fn round1(x: f64) -> f64 {
+    (x * 10.0).round() / 10.0
+}
+
+fn round2(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
 }
 
 fn build_recommendation(
@@ -180,6 +375,7 @@ fn build_recommendation(
     target: f64,
     sample_small: bool,
     signal_rates: &[SignalRate],
+    adjustment: Option<&RecommendedAdjustment>,
 ) -> String {
     if sample_small {
         return "sample too small to recommend threshold changes -- collect more merged PRs \
@@ -194,24 +390,53 @@ fn build_recommendation(
             target * 100.0
         );
     }
-    match signal_rates.first() {
-        Some(s) => format!(
+    let top = match signal_rates.first() {
+        Some(s) => s,
+        None => {
+            return format!(
+                "would-have-flagged rate ({:.1}%) exceeds target ({:.1}%) but no single signal \
+                 dominates -- consider raising CORTEX_RISK_BAND_ELEVATED_CUT / \
+                 CORTEX_RISK_SCORE_THRESHOLD broadly, then re-run calibration",
+                fp_rate * 100.0,
+                target * 100.0
+            );
+        }
+    };
+    match adjustment {
+        Some(adj) => format!(
             "would-have-flagged rate ({:.1}%) exceeds target ({:.1}%); '{}' fires on {:.1}% of \
-             scored merged PRs and is the top contributor -- raise its risk weight / percentile \
-             threshold (CORTEX_RISK_WEIGHT_* / CORTEX_TIER_B_PERCENTILE) or the band cut-point \
-             (CORTEX_RISK_BAND_ELEVATED_CUT) first, then re-run calibration",
+             scored merged PRs and is the top contributor. Estimated fix: set {} from {} to {} \
+             ({}). Apply it, then re-run calibration to confirm the rate moved toward target.",
             fp_rate * 100.0,
             target * 100.0,
-            s.signal,
-            s.rate * 100.0
+            top.signal,
+            top.rate * 100.0,
+            adj.env_var,
+            fmt_num(adj.current),
+            fmt_num(adj.recommended),
+            adj.rationale
         ),
         None => format!(
-            "would-have-flagged rate ({:.1}%) exceeds target ({:.1}%) but no single signal \
-             dominates -- consider raising CORTEX_RISK_BAND_ELEVATED_CUT / \
-             CORTEX_RISK_SCORE_THRESHOLD broadly",
+            "would-have-flagged rate ({:.1}%) exceeds target ({:.1}%); the top contributor '{}' \
+             is the CXEG-07 consistency lens, which has no numeric threshold -- its firing is \
+             governed by the pinned prompt/provider (CONSISTENCY_REVIEW_PROVIDER), not a \
+             cut-point. Review the lens prompt or accept these as advisory rather than tuning a \
+             number.",
             fp_rate * 100.0,
-            target * 100.0
+            target * 100.0,
+            top.signal
         ),
+    }
+}
+
+/// Format a knob value compactly: integers without a trailing `.0`, others to
+/// two decimals (so a percentile reads `93`, a cosine reads `0.95`).
+fn fmt_num(x: f64) -> String {
+    if (x.fract()).abs() < 1e-9 {
+        format!("{}", x as i64)
+    } else {
+        let s = format!("{x:.2}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
     }
 }
 
@@ -234,6 +459,12 @@ pub fn report_to_json(r: &CalibrationReport) -> Value {
             "sample": s.sample,
             "rate": s.rate,
         })).collect::<Vec<_>>(),
+        "recommended_adjustment": r.recommended_adjustment.as_ref().map(|a| json!({
+            "env_var": a.env_var,
+            "current": a.current,
+            "recommended": a.recommended,
+            "rationale": a.rationale,
+        })),
         "recommendation": r.recommendation,
     })
 }
@@ -314,7 +545,7 @@ mod tests {
             rec(9, "unknown", &[], &[]),
             rec(10, "low", &[], &[]),
         ];
-        let report = compute_fp_rate(&records, true, 5, 0.10);
+        let report = compute_fp_rate(&records, true, 5, 0.10, &CalibrationKnobs::defaults());
         assert_eq!(report.total_prs, 10);
         assert_eq!(report.scored_prs, 10);
         assert_eq!(report.would_have_flagged, 3);
@@ -324,7 +555,7 @@ mod tests {
 
     #[test]
     fn fp_rate_is_zero_for_empty_scored_sample() {
-        let report = compute_fp_rate(&[], true, 5, 0.10);
+        let report = compute_fp_rate(&[], true, 5, 0.10, &CalibrationKnobs::defaults());
         assert_eq!(report.scored_prs, 0);
         assert_eq!(report.false_positive_rate, 0.0);
         assert!(report.sample_small);
@@ -335,7 +566,7 @@ mod tests {
     #[test]
     fn small_sample_is_flagged_below_min() {
         let records: Vec<PrRecord> = (1..=4).map(|i| rec(i, "low", &[], &[])).collect();
-        let report = compute_fp_rate(&records, true, DEFAULT_MIN_SAMPLE, DEFAULT_TARGET_FP_RATE);
+        let report = compute_fp_rate(&records, true, DEFAULT_MIN_SAMPLE, DEFAULT_TARGET_FP_RATE, &CalibrationKnobs::defaults());
         assert!(report.sample_small);
         assert!(report.recommendation.contains("too small"));
     }
@@ -343,7 +574,7 @@ mod tests {
     #[test]
     fn sample_at_or_above_min_is_not_flagged_small() {
         let records: Vec<PrRecord> = (1..=20).map(|i| rec(i, "low", &[], &[])).collect();
-        let report = compute_fp_rate(&records, true, 20, DEFAULT_TARGET_FP_RATE);
+        let report = compute_fp_rate(&records, true, 20, DEFAULT_TARGET_FP_RATE, &CalibrationKnobs::defaults());
         assert!(!report.sample_small);
     }
 
@@ -357,14 +588,14 @@ mod tests {
         ];
         records[0].is_revert_or_hotfix = true;
 
-        let excluded = compute_fp_rate(&records, true, 1, 0.10);
+        let excluded = compute_fp_rate(&records, true, 1, 0.10, &CalibrationKnobs::defaults());
         assert_eq!(excluded.scored_prs, 1);
         assert_eq!(excluded.excluded_revert_hotfix, 1);
         // total_prs still counts everything, regardless of exclusion.
         assert_eq!(excluded.total_prs, 2);
         assert_eq!(excluded.would_have_flagged, 0, "the flagged revert must be dropped");
 
-        let included = compute_fp_rate(&records, false, 1, 0.10);
+        let included = compute_fp_rate(&records, false, 1, 0.10, &CalibrationKnobs::defaults());
         assert_eq!(included.scored_prs, 2);
         assert_eq!(included.would_have_flagged, 1);
     }
@@ -375,7 +606,7 @@ mod tests {
         records[0].diff_unavailable = true;
         records.push(rec(2, "low", &[], &[]));
 
-        let report = compute_fp_rate(&records, true, 1, 0.10);
+        let report = compute_fp_rate(&records, true, 1, 0.10, &CalibrationKnobs::defaults());
         assert_eq!(report.total_prs, 2);
         assert_eq!(report.diff_unavailable, 1);
         assert_eq!(report.scored_prs, 1);
@@ -385,7 +616,7 @@ mod tests {
     fn non_merged_records_are_never_scored() {
         let mut records = vec![rec(1, "high", &["centrality_spike"], &[])];
         records[0].merged = false;
-        let report = compute_fp_rate(&records, true, 1, 0.10);
+        let report = compute_fp_rate(&records, true, 1, 0.10, &CalibrationKnobs::defaults());
         assert_eq!(report.total_prs, 1);
         assert_eq!(report.scored_prs, 0);
     }
@@ -400,7 +631,7 @@ mod tests {
             rec(3, "elevated", &["fan_out_explosion"], &[]),
             rec(4, "low", &[], &[]),
         ];
-        let report = compute_fp_rate(&records, true, 1, 0.10);
+        let report = compute_fp_rate(&records, true, 1, 0.10, &CalibrationKnobs::defaults());
         let centrality = report.signal_rates.iter().find(|s| s.signal == "centrality_spike").unwrap();
         // fired on 2 distinct PRs (1 and 2), NOT 3 (the duplicate within PR 1
         // must not double count).
@@ -418,7 +649,7 @@ mod tests {
             rec(2, "elevated", &["centrality_spike"], &[]),
             rec(3, "low", &[], &[]),
         ];
-        let report = compute_fp_rate(&records, true, 1, 0.10);
+        let report = compute_fp_rate(&records, true, 1, 0.10, &CalibrationKnobs::defaults());
         assert!(report.false_positive_rate > report.target_fp_rate);
         assert!(report.recommendation.contains("centrality_spike"));
     }
@@ -426,9 +657,117 @@ mod tests {
     #[test]
     fn recommendation_notes_no_change_needed_when_at_or_below_target() {
         let records: Vec<PrRecord> = (1..=10).map(|i| rec(i, "low", &[], &[])).collect();
-        let report = compute_fp_rate(&records, true, 1, 0.10);
+        let report = compute_fp_rate(&records, true, 1, 0.10, &CalibrationKnobs::defaults());
         assert_eq!(report.false_positive_rate, 0.0);
         assert!(report.recommendation.contains("no threshold change"));
+    }
+
+    // ── concrete numeric recommendations ────────────────────────────────
+
+    #[test]
+    fn percentile_signal_gets_concrete_percentile_bump() {
+        // 3/3 scored PRs flag on centrality_spike (fp = 1.0), target 0.10.
+        // shrink = target/fp = 0.10; tail = 100-90 = 10; new_p = 100 - 10*0.10
+        // = 99.0 (clamped to 99). Hand-checked.
+        let records = vec![
+            rec(1, "elevated", &["centrality_spike"], &[]),
+            rec(2, "elevated", &["centrality_spike"], &[]),
+            rec(3, "elevated", &["centrality_spike"], &[]),
+        ];
+        let report = compute_fp_rate(&records, true, 1, 0.10, &CalibrationKnobs::defaults());
+        let adj = report.recommended_adjustment.expect("a percentile signal must yield a number");
+        assert_eq!(adj.env_var, "CORTEX_TIER_B_PERCENTILE");
+        assert_eq!(adj.current, 90.0);
+        assert!((adj.recommended - 99.0).abs() < 1e-9, "got {}", adj.recommended);
+        assert!(report.recommendation.contains("CORTEX_TIER_B_PERCENTILE"));
+        assert!(report.recommendation.contains("to 99"));
+    }
+
+    #[test]
+    fn percentile_bump_is_gentler_for_a_mild_overshoot() {
+        // fp = 0.5 (5/10 flag), target 0.25 -> shrink = 0.5; tail 10;
+        // new_p = 100 - 10*0.5 = 95.0. A milder overshoot -> a milder bump
+        // than the 99 above.
+        let mut records: Vec<PrRecord> =
+            (1..=5).map(|i| rec(i, "elevated", &["complexity_spike"], &[])).collect();
+        records.extend((6..=10).map(|i| rec(i, "low", &[], &[])));
+        let report = compute_fp_rate(&records, true, 1, 0.25, &CalibrationKnobs::defaults());
+        let adj = report.recommended_adjustment.unwrap();
+        assert_eq!(adj.env_var, "CORTEX_TIER_B_PERCENTILE");
+        assert!((adj.recommended - 95.0).abs() < 1e-9, "got {}", adj.recommended);
+    }
+
+    #[test]
+    fn semantic_duplication_gets_a_concrete_cosine_bump() {
+        // All flag on semantic_duplication, fp = 1.0, target 0.10:
+        // shrink = 0.10; new_c = 0.85 + (1-0.85)*(1-0.10) = 0.85 + 0.135
+        // = 0.985 -> round2 -> 0.99 (clamped at 0.99). Hand-checked.
+        let records = vec![
+            rec(1, "elevated", &["semantic_duplication"], &[]),
+            rec(2, "elevated", &["semantic_duplication"], &[]),
+        ];
+        let report = compute_fp_rate(&records, true, 1, 0.10, &CalibrationKnobs::defaults());
+        let adj = report.recommended_adjustment.unwrap();
+        assert_eq!(adj.env_var, "CORTEX_DUP_COSINE_THRESHOLD");
+        assert_eq!(adj.current, 0.85);
+        assert!((adj.recommended - 0.99).abs() < 1e-9, "got {}", adj.recommended);
+    }
+
+    #[test]
+    fn boundary_crossing_falls_back_to_a_concrete_band_cut() {
+        // community_boundary_crossing has no dedicated knob -> the band cut.
+        // Both scored PRs flag (fp = 1.0), target 0.5 -> grow = 2.0;
+        // new_e = 4.0 * 2.0 = 8.0 (<= 9.0 clamp). Hand-checked.
+        let records = vec![
+            rec(1, "elevated", &["community_boundary_crossing"], &[]),
+            rec(2, "elevated", &["community_boundary_crossing"], &[]),
+        ];
+        let report = compute_fp_rate(&records, true, 1, 0.5, &CalibrationKnobs::defaults());
+        let adj = report.recommended_adjustment.unwrap();
+        assert_eq!(adj.env_var, "CORTEX_RISK_BAND_ELEVATED_CUT");
+        assert_eq!(adj.current, 4.0);
+        assert!((adj.recommended - 8.0).abs() < 1e-9, "got {}", adj.recommended);
+    }
+
+    #[test]
+    fn consistency_lens_top_signal_yields_no_number_but_an_honest_message() {
+        // The top over-firing "signal" is a consistency-lens category, which
+        // has no numeric threshold -> no fabricated number, and the prose
+        // says so.
+        let records = vec![
+            rec(1, "low", &[], &["consistency"]),
+            rec(2, "low", &[], &["consistency"]),
+        ];
+        let report = compute_fp_rate(&records, true, 1, 0.10, &CalibrationKnobs::defaults());
+        assert!(report.false_positive_rate > report.target_fp_rate);
+        assert!(report.recommended_adjustment.is_none(), "consistency lens has no numeric knob");
+        assert!(report.recommendation.contains("no numeric threshold"));
+    }
+
+    #[test]
+    fn no_adjustment_when_at_or_below_target_or_small_sample() {
+        // At/below target -> no adjustment.
+        let ok: Vec<PrRecord> = (1..=10).map(|i| rec(i, "low", &[], &[])).collect();
+        assert!(compute_fp_rate(&ok, true, 1, 0.10, &CalibrationKnobs::defaults())
+            .recommended_adjustment
+            .is_none());
+        // Small sample -> no adjustment even if the (tiny) rate is over target.
+        let tiny = vec![rec(1, "elevated", &["centrality_spike"], &[])];
+        let report = compute_fp_rate(&tiny, true, 20, 0.10, &CalibrationKnobs::defaults());
+        assert!(report.sample_small);
+        assert!(report.recommended_adjustment.is_none());
+    }
+
+    #[test]
+    fn recommended_adjustment_survives_json_round_trip() {
+        let records = vec![
+            rec(1, "elevated", &["centrality_spike"], &[]),
+            rec(2, "elevated", &["centrality_spike"], &[]),
+        ];
+        let report = compute_fp_rate(&records, true, 1, 0.10, &CalibrationKnobs::defaults());
+        let v = report_to_json(&report);
+        assert_eq!(v["recommended_adjustment"]["env_var"], "CORTEX_TIER_B_PERCENTILE");
+        assert!(v["recommended_adjustment"]["recommended"].as_f64().unwrap() > 90.0);
     }
 
     // ── looks_like_revert_or_hotfix ──────────────────────────────────────
@@ -449,7 +788,7 @@ mod tests {
     #[test]
     fn report_to_json_round_trips_key_fields() {
         let records = vec![rec(1, "elevated", &["centrality_spike"], &[]), rec(2, "low", &[], &[])];
-        let report = compute_fp_rate(&records, true, 1, 0.10);
+        let report = compute_fp_rate(&records, true, 1, 0.10, &CalibrationKnobs::defaults());
         let v = report_to_json(&report);
         assert_eq!(v["total_prs"], 2);
         assert_eq!(v["scored_prs"], 2);

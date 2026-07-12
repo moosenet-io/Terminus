@@ -59,8 +59,8 @@ use clap::Parser;
 use serde_json::{json, Value};
 
 use terminus_rs::cortex::calibrate::{
-    compute_fp_rate, looks_like_revert_or_hotfix, report_to_json, PrRecord, DEFAULT_MIN_SAMPLE,
-    DEFAULT_TARGET_FP_RATE,
+    compute_fp_rate, looks_like_revert_or_hotfix, report_to_json, CalibrationKnobs, PrRecord,
+    DEFAULT_MIN_SAMPLE, DEFAULT_TARGET_FP_RATE,
 };
 use terminus_rs::cortex::house_style::HouseStyleCache;
 use terminus_rs::cortex::{CortexConfig, PROJECT_IDS};
@@ -253,12 +253,38 @@ async fn run(args: &Args) -> Result<String, String> {
         page += 1;
     }
 
-    let report = compute_fp_rate(&records, !args.include_reverts, args.min_sample, args.target_fp_rate);
+    // Current knob values from the live config, so the report's recommendation
+    // can emit a concrete `from → to` number, not just an env-var name.
+    let cortex_config = CortexConfig::from_env();
+    let knobs = CalibrationKnobs {
+        tier_b_percentile: cortex_config.tier_b_percentile,
+        dup_cosine: cortex_config.dup_cosine,
+        risk_band_elevated_cut: cortex_config.risk_band_elevated_cut,
+    };
+    let report = compute_fp_rate(
+        &records,
+        !args.include_reverts,
+        args.min_sample,
+        args.target_fp_rate,
+        &knobs,
+    );
     Ok(render_markdown(args, &report, &records))
 }
 
 fn forge_err_message(action: &str, e: &ForgeError) -> String {
     format!("{action} failed: {e}")
+}
+
+/// Compactly format a knob value for the report table: integers without a
+/// trailing `.0`, everything else to two decimals with trailing zeros
+/// trimmed (so a percentile reads `93`, a cosine `0.95`).
+fn trim_num(x: f64) -> String {
+    if x.fract().abs() < 1e-9 {
+        format!("{}", x as i64)
+    } else {
+        let s = format!("{x:.2}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
 }
 
 /// Resolve a PR's changed-file list via `CommitsCompareDiff` (S9: the same
@@ -415,6 +441,17 @@ fn render_markdown(args: &Args, report: &terminus_rs::cortex::calibrate::Calibra
     out.push_str("## Recommendation\n\n");
     out.push_str(&report.recommendation);
     out.push_str("\n\n");
+    if let Some(adj) = &report.recommended_adjustment {
+        out.push_str("### Concrete threshold change\n\n");
+        out.push_str("| env var | current | recommended |\n|---|---:|---:|\n");
+        out.push_str(&format!(
+            "| `{}` | {} | {} |\n\n",
+            adj.env_var,
+            trim_num(adj.current),
+            trim_num(adj.recommended)
+        ));
+        out.push_str(&format!("{}\n\n", adj.rationale));
+    }
 
     out.push_str("## Raw report (JSON)\n\n```json\n");
     out.push_str(&serde_json::to_string_pretty(&report_to_json(report)).unwrap_or_default());
