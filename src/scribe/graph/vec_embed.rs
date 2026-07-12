@@ -187,9 +187,19 @@ impl EmbedClient {
             // `buffer_unordered` completes items out of order, so tag each
             // with its input index and sort back into place afterward —
             // bounded concurrency without losing the caller's ordering.
+            //
+            // Each item is an OWNED `String` (not `&texts[i]`) moved into its
+            // async block, rather than a borrow of `texts` -- with a borrowed
+            // item, the closure's `Fn(Item<'a>) -> Fut` shape ties `Fut` to a
+            // per-item lifetime `'a`, and depending on what else in the crate
+            // gets type-checked alongside it, rustc's HRTB inference can fail
+            // this closure with "implementation of FnOnce is not general
+            // enough" (a known rustc limitation around async closures over a
+            // borrowed stream item). Owning the string sidesteps the
+            // per-item lifetime entirely.
             let mut ordered: Vec<(usize, Result<Vec<f32>, ToolError>)> =
-                stream::iter(texts.iter().enumerate())
-                    .map(|(i, text)| async move { (i, self.embed(text).await) })
+                stream::iter(texts.to_vec().into_iter().enumerate())
+                    .map(|(i, text)| async move { (i, self.embed(&text).await) })
                     .buffer_unordered(BATCH_CONCURRENCY.min(texts.len().max(1)))
                     .collect()
                     .await;

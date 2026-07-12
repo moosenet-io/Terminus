@@ -106,6 +106,14 @@ pub struct ScribeConfig {
     /// `{project_slug}.json` per project. Not a secret -- a filesystem path,
     /// same convention as `worktree_root` / `vault_local_dir`.
     pub kg_store_dir: String,
+    /// Gate for KGEMB-03's best-effort node-embedding step during
+    /// `scribe_kg_build` (`SCRIBE_KG_EMBED`, default off). Mirrors the
+    /// `SCRIBE_KG_SEMANTIC` env read (`build.rs`'s `semantic_on`) -- kept as a
+    /// separate flag rather than reusing that one because the two passes are
+    /// independent opt-ins (semantic-edge inference vs. vector embedding) with
+    /// different infra prerequisites (a review-daemon vs. an embeddings
+    /// endpoint + pgvector store).
+    pub embed_enabled: bool,
 }
 
 impl ScribeConfig {
@@ -175,6 +183,9 @@ impl ScribeConfig {
                     .to_string_lossy()
                     .to_string()
             });
+        let embed_enabled = std::env::var("SCRIBE_KG_EMBED")
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
 
         Self {
             worktree_root,
@@ -186,6 +197,7 @@ impl ScribeConfig {
             allow_subprocess_vault_write,
             pending_queue_path,
             kg_store_dir,
+            embed_enabled,
         }
     }
 }
@@ -1036,6 +1048,7 @@ mod tests {
                 .join("scribe-knowledge-graphs")
                 .to_string_lossy()
                 .to_string(),
+            embed_enabled: false,
         };
         assert!(cfg.worktree_root.contains("scribe-inspect"));
         assert!(cfg.repo_path.is_none());
