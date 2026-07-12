@@ -175,7 +175,11 @@ findings store is unconfigured."
         let threshold = args
             .get("min_occurrences")
             .and_then(|v| v.as_i64())
-            .map(|v| v as i32)
+            // Saturating clamp to a valid threshold [1, i32::MAX], never `as i32`:
+            // a huge JSON int would wrap to a negative threshold that accepts
+            // EVERY finding (minting candidates far below the intended
+            // recurrence). A threshold below 1 is meaningless, so floor at 1.
+            .map(|v| v.clamp(1, i32::MAX as i64) as i32)
             .unwrap_or_else(min_occurrences_default);
 
         let rules_store = match RulesStore::from_env().await {
