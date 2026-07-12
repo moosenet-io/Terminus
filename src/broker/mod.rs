@@ -12,3 +12,8 @@
 /// the full design.
 pub mod routes;
 pub mod transport;
+
+/// TMOD-05: the authenticated admin control plane (register/deregister/
+/// health/list) that mutates [`routes::RouteTable`] on a live path — see
+/// [`control`] for the full design.
+pub mod control;

@@ -194,7 +194,12 @@ impl McpServerState {
 /// is what makes a client-supplied `X-Terminus-Client-Identity` (or any
 /// other) header unable to elevate identity — this function never reads
 /// `HeaderMap` at all.
-fn resolve_principal(
+/// `pub(crate)`: TMOD-05's `crate::broker::control` admin handlers reuse this
+/// exact resolution rule (rather than re-deriving a `Principal` a second,
+/// possibly-divergent way) so an admin-control-plane caller's identity is
+/// resolved with the SAME configured-map-vs-legacy-passthrough precedence
+/// every `/mcp` and inference-proxy handler already uses.
+pub(crate) fn resolve_principal(
     resolver: &PrincipalResolver,
     cert: Option<&ClientIdentity>,
     tailnet: Option<&TailnetIdentity>,

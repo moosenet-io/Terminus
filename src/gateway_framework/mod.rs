@@ -102,6 +102,12 @@ pub enum ActionKind {
     /// An inference-proxy request (`crate::inference_proxy`) — `action` is
     /// the route path (e.g. `/v1/chat/completions`).
     Inference,
+    /// TMOD-05: a broker admin-control-plane request (worker
+    /// register/deregister/health/list) — `action` is an `"admin:<op>"`
+    /// label (e.g. `"admin:register_worker"`), never a bare tool name, so an
+    /// admin audit entry is never confusable with a `Tool`-kind one sharing
+    /// the same identity/action string.
+    Admin,
 }
 
 /// Identities scaffolded into every `from_env()`-built [`AllowlistPolicy`]
