@@ -46,6 +46,17 @@ use super::native_clean::DeterministicCleaner;
 
 const HOOKS_OFF: &[&str] = &["-c", "core.hooksPath=/dev/null"];
 
+/// Args for TOKENED transport (fetch/push/ls-remote): hooks off AND all ambient
+/// credential helpers disabled, so the token is supplied ONLY via GIT_ASKPASS and a
+/// global/system credential.helper can neither inject nor persist a credential from
+/// disk. (`credential.helper=` with an empty value resets the helper list to empty.)
+const TRANSPORT_ARGS: &[&str] = &[
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "credential.helper=",
+];
+
 /// Inputs for one PR replay.
 pub struct PrReplayConfig {
     /// Logical repo name (also the default private + public repo name).
@@ -159,7 +170,7 @@ fn git_transport(work_dir: &Path, args: &[&str], token: &str) -> Result<(), Tool
     let out = Command::new("git")
         .arg("-C")
         .arg(work_dir)
-        .args(HOOKS_OFF)
+        .args(TRANSPORT_ARGS)
         .args(args)
         .env("GIT_ASKPASS", &askpass)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -195,7 +206,7 @@ fn remote_branch_exists(work_dir: &Path, remote: &str, branch: &str, token: &str
     let out = Command::new("git")
         .arg("-C")
         .arg(work_dir)
-        .args(HOOKS_OFF)
+        .args(TRANSPORT_ARGS)
         .args(["ls-remote", "--heads", "--", remote, &format!("refs/heads/{branch}")])
         .env("GIT_ASKPASS", &askpass)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -522,8 +533,16 @@ pub async fn replay_pr(
             );
             return Ok(base_outcome);
         }
-        // An OPEN / non-merged public PR exists — a stalled prior run. Fall through to
-        // the remote-branch guard below, which refuses it (never silently 'done').
+        // An OPEN / non-merged public PR exists — a stalled prior run. REFUSE here
+        // (fail-closed) rather than falling through: a prior Phase-A cleanup may have
+        // deleted the feature branch without the forge auto-closing the PR, so the
+        // remote-branch guard alone would NOT catch it and the tool could open a
+        // DUPLICATE PR. The operator closes/deletes the stale PR before re-running.
+        return Err(ToolError::Conflict(format!(
+            "an OPEN public PR already exists for '{branch}' (a stalled prior replay of internal \
+             PR {internal_pr}) — reconcile it (close/delete the PR and any branch) before \
+             re-running; git_public_mirror_replay_pr never double-creates."
+        )));
     }
 
     // ORDER guard: this PR must be the NEXT unreplayed one, or base_int..head_int would
