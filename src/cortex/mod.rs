@@ -134,6 +134,7 @@ use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
 pub mod audit;
+pub mod calibrate;
 pub mod crystallize;
 pub mod deprecated;
 pub mod house_style;
