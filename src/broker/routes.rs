@@ -99,12 +99,38 @@ impl std::fmt::Debug for WorkerRoute {
 #[derive(Clone, Default)]
 pub struct RouteTableSnapshot {
     routes: HashMap<String, WorkerRoute>,
+    /// **TMOD-06**: the monotonic rollout GENERATION that currently OWNS each
+    /// worker_id. A fresh, globally-unique generation (drawn from
+    /// [`RouteTableSnapshot::next_gen`]) is stamped here on every
+    /// flip/replace/restore that changes a worker's active route set; a
+    /// worker's entry is dropped when it is removed entirely. A rollout
+    /// captures the generation stamped by ITS flip and, at rollback time,
+    /// restores ONLY if the worker's current generation still equals that —
+    /// so an away-and-back change (the ABA problem: routes swapped to another
+    /// instance and then back to a byte-identical / same-`Arc` one) is
+    /// detected by generation even though the routes themselves would compare
+    /// equal. See [`RouteTable::restore_worker_if_unchanged`].
+    worker_gen: HashMap<String, u64>,
+    /// A single monotonically-increasing counter that is the SOURCE of every
+    /// generation stamped into `worker_gen`. Each new generation takes this
+    /// value and bumps it, so generations are globally unique and strictly
+    /// increasing across the whole table for the process's lifetime — a
+    /// worker that is removed and later re-registered never reuses an old
+    /// generation number, closing the ABA window for good.
+    next_gen: u64,
 }
 
 impl RouteTableSnapshot {
     /// Look up the route for `name`, if any.
     pub fn get(&self, name: &str) -> Option<&WorkerRoute> {
         self.routes.get(name)
+    }
+
+    /// **TMOD-06**: the rollout generation currently owning `worker_id`, if
+    /// the worker has any routes. `None` once the worker is removed. Used by
+    /// tests and [`RouteTable::restore_worker_if_unchanged`]'s guard.
+    pub fn worker_generation(&self, worker_id: &str) -> Option<u64> {
+        self.worker_gen.get(worker_id).copied()
     }
 
     /// All routes currently in this snapshot, in arbitrary order — used by
@@ -160,7 +186,13 @@ impl RouteTable {
         self.snapshot.rcu(|current| {
             let mut routes = current.routes.clone();
             routes.insert(route.tool.name.clone(), route.clone());
-            RouteTableSnapshot { routes }
+            // Stamp a fresh generation for the installed worker (TMOD-06) so
+            // `worker_gen` always reflects the live owner of a worker's
+            // routes.
+            let g = current.next_gen;
+            let mut worker_gen = current.worker_gen.clone();
+            worker_gen.insert(route.worker_id.clone(), g);
+            RouteTableSnapshot { routes, worker_gen, next_gen: g + 1 }
         });
     }
 
@@ -176,7 +208,16 @@ impl RouteTable {
             for route in &new_routes {
                 routes.insert(route.tool.name.clone(), route.clone());
             }
-            RouteTableSnapshot { routes }
+            // Stamp a fresh generation for every distinct worker touched by
+            // this install (TMOD-06). They can share one generation number —
+            // ownership is per-worker, and no two flips of the SAME worker
+            // ever share a generation.
+            let g = current.next_gen;
+            let mut worker_gen = current.worker_gen.clone();
+            for route in &new_routes {
+                worker_gen.insert(route.worker_id.clone(), g);
+            }
+            RouteTableSnapshot { routes, worker_gen, next_gen: g + 1 }
         });
     }
 
@@ -186,7 +227,11 @@ impl RouteTable {
         self.snapshot.rcu(|current| {
             let mut routes = current.routes.clone();
             routes.remove(name);
-            RouteTableSnapshot { routes }
+            // Prune any `worker_gen` entry whose worker no longer has any
+            // routes (TMOD-06) so a removed worker cannot leave a stale
+            // generation a later rollout could false-match against.
+            let worker_gen = prune_worker_gen(&current.worker_gen, &routes);
+            RouteTableSnapshot { routes, worker_gen, next_gen: current.next_gen }
         });
     }
 
@@ -201,7 +246,14 @@ impl RouteTable {
                 .filter(|(_, r)| r.worker_id != worker_id)
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
-            RouteTableSnapshot { routes }
+            // Drop the worker's generation entry (TMOD-06): a deregister ends
+            // this worker's current ownership, so ANY in-flight rollout that
+            // flipped it earlier finds no matching generation at rollback
+            // time and cleanly no-ops rather than resurrecting the removed
+            // worker's previous instance.
+            let mut worker_gen = current.worker_gen.clone();
+            worker_gen.remove(worker_id);
+            RouteTableSnapshot { routes, worker_gen, next_gen: current.next_gen }
         });
     }
 
@@ -240,7 +292,17 @@ impl RouteTable {
             for route in &new_routes {
                 routes.insert(route.tool.name.clone(), route.clone());
             }
-            RouteTableSnapshot { routes }
+            // A replace is a flip: stamp a fresh generation for this worker
+            // (TMOD-06), or drop its entry if the new set is empty.
+            let mut worker_gen = current.worker_gen.clone();
+            if new_routes.is_empty() {
+                worker_gen.remove(worker_id);
+                RouteTableSnapshot { routes, worker_gen, next_gen: current.next_gen }
+            } else {
+                let g = current.next_gen;
+                worker_gen.insert(worker_id.to_string(), g);
+                RouteTableSnapshot { routes, worker_gen, next_gen: g + 1 }
+            }
         });
     }
 
@@ -253,22 +315,30 @@ impl RouteTable {
     /// its rollback state, so a caller never needs a separate (and
     /// therefore racy) "read the old routes, then replace" two-step.
     ///
-    /// Empty when `worker_id` had no prior routes (a first-ever
-    /// registration) — the caller's cue that there's nothing to roll back
-    /// to.
+    /// Empty routes / generation `0` when `worker_id` had no prior routes (a
+    /// first-ever registration) — the caller's cue that there's nothing to
+    /// roll back to. The returned `u64` is the fresh GENERATION this flip
+    /// stamped for `worker_id`: the caller passes it back to
+    /// [`RouteTable::restore_worker_if_unchanged`] as its ownership token, so
+    /// any intervening flip/replace/restore/deregister (each of which stamps
+    /// or drops the generation) makes a later rollback a clean no-op — this
+    /// is what closes the ABA hole a routes-value/`Arc::ptr_eq` comparison
+    /// alone could not (routes swapped away and back to a byte-identical set
+    /// would falsely compare equal; a strictly-increasing generation never
+    /// does).
     pub fn replace_worker_with_rollback(
         &self,
         worker_id: &str,
         new_routes: impl IntoIterator<Item = WorkerRoute>,
-    ) -> Vec<WorkerRoute> {
+    ) -> (Vec<WorkerRoute>, u64) {
         let new_routes: Vec<WorkerRoute> = new_routes.into_iter().collect();
         let mut displaced: Vec<WorkerRoute> = Vec::new();
+        let mut assigned_gen: u64 = 0;
         self.snapshot.rcu(|current| {
             // Re-captured on every retry attempt -- only the attempt whose
-            // CAS actually succeeds is the one whose `displaced` value
-            // survives past `rcu`'s return, so this always reflects the
-            // routes that were truly in place immediately before the swap
-            // that won.
+            // CAS actually succeeds is the one whose `displaced`/`assigned_gen`
+            // values survive past `rcu`'s return, so these always reflect the
+            // routes/generation that were truly in play for the swap that won.
             displaced = current.routes.values().filter(|r| r.worker_id == worker_id).cloned().collect();
             let mut routes: HashMap<String, WorkerRoute> = current
                 .routes
@@ -279,39 +349,51 @@ impl RouteTable {
             for route in &new_routes {
                 routes.insert(route.tool.name.clone(), route.clone());
             }
-            RouteTableSnapshot { routes }
+            let g = current.next_gen;
+            assigned_gen = g;
+            let mut worker_gen = current.worker_gen.clone();
+            worker_gen.insert(worker_id.to_string(), g);
+            RouteTableSnapshot { routes, worker_gen, next_gen: g + 1 }
         });
-        displaced
+        (displaced, assigned_gen)
     }
 
     /// **TMOD-06**: the rollback/cancel-safe half of the blue-green flip.
-    /// Atomically compare-and-swap: IF `worker_id`'s CURRENT routes are
-    /// still exactly `expected_current` (same tool names, each still
-    /// pointing at the identical transport `Arc` — compared via
-    /// `Arc::ptr_eq`, so a further re-registration or deregistration that
-    /// raced this call is detected even though it may share tool names),
-    /// replace them with `restore_routes` (the worker's prior instance, to
-    /// roll back to it; or an empty set, to remove a first-ever
+    /// Atomically compare-and-swap keyed on the rollout GENERATION, not the
+    /// routes' values: IF the generation currently owning `worker_id` still
+    /// equals `expected_gen` (the generation
+    /// [`RouteTable::replace_worker_with_rollback`] stamped for the caller's
+    /// flip), replace the worker's routes with `restore_routes` (the prior
+    /// instance, to roll back to it; or an empty set, to remove a first-ever
     /// registration that failed its post-flip window with nothing to fall
     /// back to) in the SAME atomic swap. Otherwise this is a clean NO-OP —
-    /// returns `false` — so a rollout whose worker was deregistered (or
-    /// re-registered again) mid-health-window never resurrects a stale
-    /// `previous` snapshot over top of what the operator (or a newer
-    /// rollout) intentionally put there.
+    /// returns `false`.
     ///
-    /// Race-safe by construction: `expected_current` is re-checked against
-    /// the LATEST snapshot on every `rcu` retry, exactly like every other
-    /// mutator on this type — there is no separate "check" step that could
-    /// go stale before the "swap" step runs.
+    /// Keying on the generation rather than on route values (or
+    /// `Arc::ptr_eq`) is what makes this ABA-safe: a competing rollout that
+    /// flips the worker AWAY and then a later one that flips it BACK to a
+    /// byte-identical (even same-`Arc`) route set would defeat a
+    /// value/pointer comparison, but every one of those intervening flips
+    /// draws a strictly-greater generation, so this caller's now-stale
+    /// `expected_gen` can never match again. A deregister drops the
+    /// generation entry entirely (also a mismatch). Race-safe by
+    /// construction: the generation is re-checked against the LATEST snapshot
+    /// on every `rcu` retry — there is no separate "check" step that could go
+    /// stale before the "swap" runs.
+    ///
+    /// A successful restore itself stamps a NEW generation (or drops the
+    /// entry, for an empty restore), so it too participates in the monotonic
+    /// ordering — no other in-flight rollout can later false-match the
+    /// restored state.
     pub fn restore_worker_if_unchanged(
         &self,
         worker_id: &str,
-        expected_current: &[WorkerRoute],
+        expected_gen: u64,
         restore_routes: Vec<WorkerRoute>,
     ) -> bool {
         let mut restored = false;
         self.snapshot.rcu(|current| {
-            if worker_routes_match(current, worker_id, expected_current) {
+            if current.worker_gen.get(worker_id) == Some(&expected_gen) {
                 restored = true;
                 let mut routes: HashMap<String, WorkerRoute> = current
                     .routes
@@ -322,44 +404,43 @@ impl RouteTable {
                 for route in &restore_routes {
                     routes.insert(route.tool.name.clone(), route.clone());
                 }
-                RouteTableSnapshot { routes }
+                let mut worker_gen = current.worker_gen.clone();
+                if restore_routes.is_empty() {
+                    // Nothing to roll back to (a first-ever registration that
+                    // failed its window): remove the worker entirely, dropping
+                    // its generation so nothing can match it again.
+                    worker_gen.remove(worker_id);
+                    RouteTableSnapshot { routes, worker_gen, next_gen: current.next_gen }
+                } else {
+                    let g = current.next_gen;
+                    worker_gen.insert(worker_id.to_string(), g);
+                    RouteTableSnapshot { routes, worker_gen, next_gen: g + 1 }
+                }
             } else {
                 restored = false;
-                // No-op: hand back an equivalent snapshot unchanged so this
-                // `rcu` attempt "succeeds" (stores the same content) without
-                // touching anything -- the worker's routes were already
-                // changed out from under this rollout (deregistered, or
-                // superseded by a newer rollout) by the time it tried to
-                // restore, so restoring `restore_routes` here would silently
-                // resurrect a stale previous instance.
-                RouteTableSnapshot { routes: current.routes.clone() }
+                // No-op: hand back an equivalent snapshot unchanged. The
+                // worker's owning generation is no longer `expected_gen` --
+                // it was deregistered, or superseded by a newer rollout (an
+                // ABA away-and-back cannot fool the generation check) -- so
+                // restoring here would resurrect a stale previous instance.
+                RouteTableSnapshot {
+                    routes: current.routes.clone(),
+                    worker_gen: current.worker_gen.clone(),
+                    next_gen: current.next_gen,
+                }
             }
         });
         restored
     }
 }
 
-/// Does `worker_id`'s CURRENT set of routes in `current` match
-/// `expected` exactly (same tool names, each still pointing at the SAME
-/// transport instance)? Used by [`RouteTable::restore_worker_if_unchanged`]
-/// to detect a concurrent deregister/re-register before blindly restoring a
-/// rollback snapshot over it.
-fn worker_routes_match(current: &RouteTableSnapshot, worker_id: &str, expected: &[WorkerRoute]) -> bool {
-    let current_for_worker: HashMap<&str, &WorkerRoute> = current
-        .routes
-        .iter()
-        .filter(|(_, r)| r.worker_id == worker_id)
-        .map(|(k, v)| (k.as_str(), v))
-        .collect();
-    if current_for_worker.len() != expected.len() {
-        return false;
-    }
-    expected.iter().all(|r| {
-        current_for_worker
-            .get(r.tool.name.as_str())
-            .map(|cur| Arc::ptr_eq(&cur.transport, &r.transport))
-            .unwrap_or(false)
-    })
+/// Drop any `worker_gen` entry whose worker no longer owns a route in
+/// `routes` (TMOD-06) — used by tool-name-granular mutators so a worker that
+/// loses its last route via [`RouteTable::remove`] cannot leave a stale
+/// generation behind.
+fn prune_worker_gen(worker_gen: &HashMap<String, u64>, routes: &HashMap<String, WorkerRoute>) -> HashMap<String, u64> {
+    let live: std::collections::HashSet<&str> = routes.values().map(|r| r.worker_id.as_str()).collect();
+    worker_gen.iter().filter(|(w, _)| live.contains(w.as_str())).map(|(w, g)| (w.clone(), *g)).collect()
 }
 
 /// Bounded per-worker health-probe timeout used by [`merge_catalog`] and

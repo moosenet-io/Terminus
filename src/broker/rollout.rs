@@ -46,16 +46,28 @@
 //! flaps during its own post-flip window is exactly the case this item
 //! exists to catch, so treating a flap as a pass would defeat the point.
 //!
-//! ## Rollback: atomic, and safe against a concurrent deregister
-//! On a failed window, [`RouteTable::restore_worker_if_unchanged`] restores
-//! the previous instance's routes (or, if there was no previous instance,
-//! removes the failed routes entirely — fail SAFE, never leave a route
-//! pointing at a proven-bad instance) IN THE SAME ATOMIC SWAP that checks
-//! the worker's routes are still exactly what this rollout flipped to. If
-//! they're not — because `handle_deregister` removed the worker, or a
-//! NEWER rollout already superseded this one, while this window was running
-//! — the restore is a clean no-op: no orphaned `previous` snapshot is ever
-//! written back over a state this rollout no longer owns.
+//! ## Rollback: atomic, generation-guarded, ABA-safe
+//! Each flip stamps a monotonic per-worker GENERATION (see
+//! [`RouteTable::replace_worker_with_rollback`]); this rollout captures the
+//! one its own flip stamped. On a failed window,
+//! [`RouteTable::restore_worker_if_unchanged`] restores the previous
+//! instance's routes (or, if there was no previous instance, removes the
+//! failed routes entirely — fail SAFE, never leave a route pointing at a
+//! proven-bad instance) IN THE SAME ATOMIC SWAP that checks the worker's
+//! CURRENT owning generation still equals this rollout's. If it doesn't —
+//! because `handle_deregister` removed the worker (dropping its generation),
+//! or a NEWER rollout already superseded this one (stamping a greater
+//! generation) while this window was running — the restore is a clean no-op:
+//! no orphaned `previous` snapshot is ever written back over a state this
+//! rollout no longer owns.
+//!
+//! Guarding on the generation rather than on route values (or `Arc::ptr_eq`)
+//! is what makes this ABA-safe: a competing rollout could flip the worker
+//! AWAY to another instance and a later one flip it BACK to a byte-identical
+//! (even same-`Arc`) route set, which a value/pointer comparison would
+//! wrongly accept as "unchanged" — but every intervening flip draws a
+//! strictly-greater generation, so this rollout's now-stale token can never
+//! match again.
 //!
 //! ## Flip-then-verify: the accepted in-window trade-off
 //! This is a flip-THEN-verify model: the pre-flip gate
@@ -153,8 +165,11 @@ pub async fn rollout_worker(routes: &RouteTable, worker_id: &str, new_routes: Ve
 
     // Flip: atomic swap, previous instance retained as this rollout's
     // rollback state (empty on a first-ever registration -- nothing to roll
-    // back to).
-    let previous_routes = routes.replace_worker_with_rollback(worker_id, new_routes.clone());
+    // back to). The stamped GENERATION is this rollout's ownership token: it
+    // is what a later rollback checks against, so an ABA away-and-back by a
+    // competing rollout can't fool the restore into resurrecting a stale
+    // instance.
+    let (previous_routes, flip_gen) = routes.replace_worker_with_rollback(worker_id, new_routes.clone());
 
     // Post-flip health window: bounded, fixed-count, fail-closed on the
     // FIRST failed probe (a flap during the window is exactly the failure
@@ -172,15 +187,16 @@ pub async fn rollout_worker(routes: &RouteTable, worker_id: &str, new_routes: Ve
         };
     }
 
-    // Roll back -- atomically, and ONLY if the worker's routes are still
-    // exactly what this rollout just flipped to (nobody deregistered or
-    // superseded it out from under this window). `restore_worker_if_unchanged`
-    // is the single primitive for both cases:
+    // Roll back -- atomically, and ONLY if this rollout still OWNS the worker
+    // (its flip generation is still the worker's current one: nobody
+    // deregistered it or superseded it with a newer flip, even an ABA one,
+    // out from under this window). `restore_worker_if_unchanged` is the
+    // single primitive for both cases:
     //  - previous instance existed  -> restore it (true rollback).
     //  - no previous instance       -> restore an EMPTY set (fail safe: a
     //    first-ever registration that fails its own post-flip window is
     //    removed entirely rather than left routed to a proven-bad instance).
-    let restored = routes.restore_worker_if_unchanged(worker_id, &new_routes, previous_routes.clone());
+    let restored = routes.restore_worker_if_unchanged(worker_id, flip_gen, previous_routes.clone());
     let active_route_count = if restored {
         previous_routes.len()
     } else {
@@ -491,21 +507,20 @@ mod tests {
 
         // Rollout A: v1 -> v2, where v2 fails its window.
         let v2: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_unhealthy("v2"));
-        let previous_a = routes.replace_worker_with_rollback("w1", vec![route("w1", "tool_a", &v2)]);
+        let (previous_a, gen_a) = routes.replace_worker_with_rollback("w1", vec![route("w1", "tool_a", &v2)]);
         assert_eq!(previous_a.len(), 1);
 
         // Before A's window resolves, a second, newer rollout (B) already
         // supersedes it: v2 -> v3 (say v3 is healthy).
         let v3: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_healthy("v3"));
-        let previous_b = routes.replace_worker_with_rollback("w1", vec![route("w1", "tool_a", &v3)]);
+        let (previous_b, gen_b) = routes.replace_worker_with_rollback("w1", vec![route("w1", "tool_a", &v3)]);
         assert_eq!(previous_b.len(), 1, "B's own previous is v2, not v1");
+        assert!(gen_b > gen_a, "a superseding flip must draw a strictly-greater generation");
 
-        // Now A's (stale) rollback attempt runs: it still thinks the
-        // current routes are v2 (what IT flipped to) and tries to restore
-        // v1 -- but the table has already moved on to v3. This must be a
-        // no-op.
-        let a_new_routes = vec![route("w1", "tool_a", &v2)];
-        let restored = routes.restore_worker_if_unchanged("w1", &a_new_routes, previous_a);
+        // Now A's (stale) rollback attempt runs: it still holds gen_a and
+        // tries to restore v1 -- but the table has already moved on to v3
+        // (its owning generation is gen_b). This must be a no-op.
+        let restored = routes.restore_worker_if_unchanged("w1", gen_a, previous_a);
         assert!(!restored, "a superseded rollout's rollback must not clobber a newer rollout's live routes");
 
         let snap = routes.load();
@@ -514,5 +529,54 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(out.text, "v3", "the newer rollout's flip must survive an older rollout's stale rollback");
+    }
+
+    // ── ABA: routes flipped AWAY and BACK to the same Arc must NOT fool the
+    //    older rollout's rollback (generation, not ptr_eq, is the guard) ──
+
+    /// The exact ABA codex flagged: rollout A flips v1->v2 (captures gen_a);
+    /// rollout B supersedes with v2->v3 and then B ITSELF rolls back to its
+    /// previous (v2) — so the table's CURRENT routes are once again the very
+    /// same v2 `Arc` that A flipped to. A value/`Arc::ptr_eq` guard would see
+    /// "current == what A flipped to" and let A's stale rollback restore v1,
+    /// resurrecting an orphaned instance. The generation guard must instead
+    /// make A's rollback a clean NO-OP: every one of B's flips (and B's own
+    /// rollback) drew a strictly-greater generation, so gen_a is stale.
+    #[tokio::test]
+    async fn aba_away_and_back_to_same_arc_does_not_fool_older_rollback() {
+        use crate::broker::routes::dispatch_call;
+
+        let routes = RouteTable::new();
+        let v1: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_healthy("v1"));
+        routes.install(route("w1", "tool_a", &v1));
+
+        // Rollout A flips v1 -> v2, capturing its generation.
+        let v2: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_healthy("v2"));
+        let (prev_a, gen_a) = routes.replace_worker_with_rollback("w1", vec![route("w1", "tool_a", &v2)]);
+        assert_eq!(prev_a.len(), 1, "A's previous is v1");
+
+        // Rollout B supersedes: v2 -> v3, capturing v2 as ITS previous.
+        let v3: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_healthy("v3"));
+        let (prev_b, gen_b) = routes.replace_worker_with_rollback("w1", vec![route("w1", "tool_a", &v3)]);
+
+        // B's own window fails, so B rolls back to its previous -- the SAME
+        // v2 Arc. The table's current route is now byte-identical (same Arc)
+        // to what A flipped to: the ABA "back to A's value" condition.
+        assert!(routes.restore_worker_if_unchanged("w1", gen_b, prev_b));
+        {
+            let snap = routes.load();
+            assert!(Arc::ptr_eq(&snap.get("tool_a").unwrap().transport, &v2), "table is back on the exact v2 Arc");
+            // ...and A's stale generation is decisively NOT the current owner.
+            assert_ne!(snap.worker_generation("w1"), Some(gen_a));
+        }
+
+        // A's (long-delayed) rollback now runs. Under a ptr_eq guard it would
+        // wrongly restore v1; under the generation guard it is a clean no-op.
+        let a_restored = routes.restore_worker_if_unchanged("w1", gen_a, prev_a);
+        assert!(!a_restored, "ABA: an older rollout's rollback must not fire just because routes are 'back' to its value");
+
+        let snap = routes.load();
+        let out = dispatch_call(&snap, "tool_a", serde_json::json!({})).await.unwrap().unwrap();
+        assert_eq!(out.text, "v2", "v1 must NOT be resurrected -- the table stays on v2");
     }
 }
