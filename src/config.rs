@@ -838,6 +838,230 @@ pub fn embeddings_timeout_ms() -> u64 {
         .unwrap_or(30_000)
 }
 
+// ── TMOD-02: broker-side per-worker transport config ───────────────────────
+//
+// Additive: per-worker transport-tier selection + the `MinTierPolicy`
+// minimum-tier-floor enforced at CONFIG-LOAD time (not merely at dial time),
+// so a `write_scoped`/`secret_holding` worker declared below T2 is rejected
+// before the broker ever attempts to reach it — see
+// `crate::broker::transport`'s module doc for the tiers and the floor policy
+// itself. Mirrors `crate::mesh::registry::UpstreamRegistry`'s
+// parse-from-env-JSON + `validate()` shape (unique names, one clear error at
+// a time), applied to worker transports instead of upstream mesh servers.
+//
+// All fields here are STRUCTURAL (tier, capability class, socket path,
+// host/port, expected uid/identity) — none of them are secret-shaped. The
+// actual cert/key material a T2/T0 worker transport needs comes from the
+// crate's embedded CA (`crate::pki::ca`), reused unmodified rather than
+// introducing a second secret surface for this item (see
+// `crate::broker::transport::uds_mtls`/`mtls_tcp`'s module docs).
+
+/// One worker's transport configuration, as authored by an operator into
+/// `TERMINUS_BROKER_WORKERS_JSON`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WorkerTransportEntry {
+    /// Stable, unique identifier for this worker (e.g. `"gitea-worker"`).
+    pub name: String,
+    /// The transport tier this worker registers at.
+    pub tier: crate::broker::transport::TransportTier,
+    /// This worker's declared capability class — what
+    /// [`crate::broker::transport::MinTierPolicy`] floors `tier` against.
+    pub capability_class: crate::broker::transport::CapabilityClass,
+    /// Required for T1/T2 (UDS-based tiers): the worker's listening socket
+    /// path.
+    #[serde(default)]
+    pub socket_path: Option<String>,
+    /// Required for T0 (TCP-based tier): the worker's host.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Required for T0: the worker's port.
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Required for T1/T2: the uid this worker's process is expected to run
+    /// as, checked against `SO_PEERCRED` before any request is sent.
+    #[serde(default)]
+    pub expected_uid: Option<u32>,
+    /// Required for T0/T2 (the mTLS-bearing tiers): the Subject CN this
+    /// worker's TLS leaf certificate must carry.
+    #[serde(default)]
+    pub expected_identity: Option<String>,
+}
+
+/// Errors from loading/validating the worker-transport registry. Every
+/// variant names the offending worker/field so a misconfigured
+/// `TERMINUS_BROKER_WORKERS_JSON` is easy to fix — none of them ever include
+/// secret material (this config carries none — see the section doc above).
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum WorkerTransportConfigError {
+    #[error("TERMINUS_BROKER_WORKERS_JSON is not valid JSON: {0}")]
+    InvalidJson(String),
+    #[error("worker entry at index {index} has an empty \"name\"")]
+    EmptyName { index: usize },
+    #[error("duplicate worker \"name\": \"{name}\"")]
+    DuplicateName { name: String },
+    #[error(
+        "worker \"{name}\" is declared at tier {tier} but its capability class \"{class}\" requires at least {minimum}"
+    )]
+    BelowMinimumTier {
+        name: String,
+        tier: crate::broker::transport::TransportTier,
+        class: String,
+        minimum: crate::broker::transport::TransportTier,
+    },
+    #[error("worker \"{name}\" (tier {tier}) is missing its required \"socket_path\"")]
+    MissingSocketPath { name: String, tier: crate::broker::transport::TransportTier },
+    #[error("worker \"{name}\" (tier {tier}) is missing its required \"expected_uid\"")]
+    MissingExpectedUid { name: String, tier: crate::broker::transport::TransportTier },
+    #[error("worker \"{name}\" (tier {tier}) is missing its required \"expected_identity\"")]
+    MissingExpectedIdentity { name: String, tier: crate::broker::transport::TransportTier },
+    #[error("worker \"{name}\" (tier {tier}) is missing its required \"host\"/\"port\"")]
+    MissingHostPort { name: String, tier: crate::broker::transport::TransportTier },
+}
+
+fn capability_class_label(class: crate::broker::transport::CapabilityClass) -> &'static str {
+    match class {
+        crate::broker::transport::CapabilityClass::ReadOnly => "read_only",
+        crate::broker::transport::CapabilityClass::WriteScoped => "write_scoped",
+        crate::broker::transport::CapabilityClass::SecretHolding => "secret_holding",
+    }
+}
+
+/// The validated set of worker-transport entries. Construct via
+/// [`WorkerTransportRegistry::from_env`] in production, or
+/// [`WorkerTransportRegistry::from_json`] directly in tests. There is no
+/// public constructor that skips validation.
+#[derive(Debug, Clone, Default)]
+pub struct WorkerTransportRegistry {
+    workers: Vec<WorkerTransportEntry>,
+}
+
+impl WorkerTransportRegistry {
+    /// An empty, dormant registry — the default when no broker workers are
+    /// configured. Never an error: a dormant feature is not a
+    /// misconfiguration.
+    pub fn empty() -> Self {
+        Self { workers: Vec::new() }
+    }
+
+    /// Build the registry from `TERMINUS_BROKER_WORKERS_JSON` (non-secret
+    /// structural JSON, read via plain `std::env::var` — nothing in this
+    /// shape is a credential). Unset/blank ⇒ `Ok(Self::empty())`, never an
+    /// error.
+    pub fn from_env() -> Result<Self, WorkerTransportConfigError> {
+        match env_nonempty("TERMINUS_BROKER_WORKERS_JSON") {
+            Some(raw) => Self::from_json(&raw),
+            None => Ok(Self::empty()),
+        }
+    }
+
+    /// Parse + validate a registry from a raw JSON array string.
+    pub fn from_json(json: &str) -> Result<Self, WorkerTransportConfigError> {
+        let workers: Vec<WorkerTransportEntry> = serde_json::from_str(json)
+            .map_err(|e| WorkerTransportConfigError::InvalidJson(e.to_string()))?;
+        validate_worker_transports(&workers)?;
+        Ok(Self { workers })
+    }
+
+    pub fn all(&self) -> &[WorkerTransportEntry] {
+        &self.workers
+    }
+
+    pub fn by_name(&self, name: &str) -> Option<&WorkerTransportEntry> {
+        self.workers.iter().find(|w| w.name == name)
+    }
+
+    pub fn len(&self) -> usize {
+        self.workers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.workers.is_empty()
+    }
+}
+
+/// Validate a parsed entry list: unique `name`, every entry's `tier` at or
+/// above its `capability_class`'s [`crate::broker::transport::MinTierPolicy`]
+/// floor (**the minimum-tier floor enforcement point**), and every
+/// tier-required field present. Stops at the first violation.
+fn validate_worker_transports(
+    workers: &[WorkerTransportEntry],
+) -> Result<(), WorkerTransportConfigError> {
+    use crate::broker::transport::{MinTierPolicy, TransportTier};
+    use std::collections::HashSet;
+
+    let mut seen_names: HashSet<String> = HashSet::new();
+
+    for (index, w) in workers.iter().enumerate() {
+        if w.name.trim().is_empty() {
+            return Err(WorkerTransportConfigError::EmptyName { index });
+        }
+        if !seen_names.insert(w.name.clone()) {
+            return Err(WorkerTransportConfigError::DuplicateName { name: w.name.clone() });
+        }
+
+        if !MinTierPolicy::permits(w.capability_class, w.tier) {
+            return Err(WorkerTransportConfigError::BelowMinimumTier {
+                name: w.name.clone(),
+                tier: w.tier,
+                class: capability_class_label(w.capability_class).to_string(),
+                minimum: MinTierPolicy::minimum_tier(w.capability_class),
+            });
+        }
+
+        match w.tier {
+            TransportTier::T1 => {
+                if w.socket_path.as_deref().unwrap_or("").trim().is_empty() {
+                    return Err(WorkerTransportConfigError::MissingSocketPath {
+                        name: w.name.clone(),
+                        tier: w.tier,
+                    });
+                }
+                if w.expected_uid.is_none() {
+                    return Err(WorkerTransportConfigError::MissingExpectedUid {
+                        name: w.name.clone(),
+                        tier: w.tier,
+                    });
+                }
+            }
+            TransportTier::T2 => {
+                if w.socket_path.as_deref().unwrap_or("").trim().is_empty() {
+                    return Err(WorkerTransportConfigError::MissingSocketPath {
+                        name: w.name.clone(),
+                        tier: w.tier,
+                    });
+                }
+                if w.expected_uid.is_none() {
+                    return Err(WorkerTransportConfigError::MissingExpectedUid {
+                        name: w.name.clone(),
+                        tier: w.tier,
+                    });
+                }
+                if w.expected_identity.as_deref().unwrap_or("").trim().is_empty() {
+                    return Err(WorkerTransportConfigError::MissingExpectedIdentity {
+                        name: w.name.clone(),
+                        tier: w.tier,
+                    });
+                }
+            }
+            TransportTier::T0 => {
+                if w.host.as_deref().unwrap_or("").trim().is_empty() || w.port.is_none() {
+                    return Err(WorkerTransportConfigError::MissingHostPort {
+                        name: w.name.clone(),
+                        tier: w.tier,
+                    });
+                }
+                if w.expected_identity.as_deref().unwrap_or("").trim().is_empty() {
+                    return Err(WorkerTransportConfigError::MissingExpectedIdentity {
+                        name: w.name.clone(),
+                        tier: w.tier,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1354,5 +1578,142 @@ mod tests {
         std::env::set_var("HF_DISCOVERY_RATE_LIMIT_PER_MIN", "not-a-number");
         assert_eq!(hf_discovery_rate_limit_per_min(), 30);
         std::env::remove_var("HF_DISCOVERY_RATE_LIMIT_PER_MIN");
+    }
+
+    // ── TMOD-02: WorkerTransportRegistry ────────────────────────────────
+
+    const VALID_WORKER_JSON: &str = r#"[
+        {
+            "name": "read-worker",
+            "tier": "T1",
+            "capability_class": "read_only",
+            "socket_path": "/run/terminus/read-worker.sock",
+            "expected_uid": 1000
+        },
+        {
+            "name": "write-worker",
+            "tier": "T2",
+            "capability_class": "write_scoped",
+            "socket_path": "/run/terminus/write-worker.sock",
+            "expected_uid": 1001,
+            "expected_identity": "write-worker"
+        },
+        {
+            "name": "offbox-worker",
+            "tier": "T0",
+            "capability_class": "read_only",
+            "host": "worker.example.test",
+            "port": 8443,
+            "expected_identity": "offbox-worker"
+        }
+    ]"#;
+
+    #[test]
+    fn worker_transport_registry_parses_valid_json() {
+        let reg = WorkerTransportRegistry::from_json(VALID_WORKER_JSON).expect("valid JSON should parse");
+        assert_eq!(reg.len(), 3);
+        assert_eq!(reg.by_name("read-worker").unwrap().tier, crate::broker::transport::TransportTier::T1);
+        assert_eq!(reg.by_name("write-worker").unwrap().tier, crate::broker::transport::TransportTier::T2);
+        assert_eq!(reg.by_name("offbox-worker").unwrap().tier, crate::broker::transport::TransportTier::T0);
+    }
+
+    #[test]
+    fn worker_transport_registry_rejects_write_scoped_below_t2() {
+        let json = r#"[{
+            "name": "under-floored",
+            "tier": "T1",
+            "capability_class": "write_scoped",
+            "socket_path": "/run/terminus/w.sock",
+            "expected_uid": 1000
+        }]"#;
+        let err = WorkerTransportRegistry::from_json(json)
+            .expect_err("a write_scoped worker declared at T1 must be rejected at config-load time");
+        assert!(matches!(err, WorkerTransportConfigError::BelowMinimumTier { name, .. } if name == "under-floored"));
+    }
+
+    #[test]
+    fn worker_transport_registry_rejects_secret_holding_below_t2() {
+        let json = r#"[{
+            "name": "under-floored-2",
+            "tier": "T0",
+            "capability_class": "secret_holding",
+            "host": "worker.example.test",
+            "port": 8443,
+            "expected_identity": "under-floored-2"
+        }]"#;
+        let err = WorkerTransportRegistry::from_json(json)
+            .expect_err("a secret_holding worker declared at T0 must be rejected -- T0 alone doesn't meet the T2 floor");
+        assert!(matches!(err, WorkerTransportConfigError::BelowMinimumTier { name, .. } if name == "under-floored-2"));
+    }
+
+    #[test]
+    fn worker_transport_registry_allows_read_only_at_t1() {
+        let json = r#"[{
+            "name": "reader",
+            "tier": "T1",
+            "capability_class": "read_only",
+            "socket_path": "/run/terminus/reader.sock",
+            "expected_uid": 1000
+        }]"#;
+        assert!(WorkerTransportRegistry::from_json(json).is_ok());
+    }
+
+    #[test]
+    fn worker_transport_registry_rejects_duplicate_name() {
+        let json = r#"[
+            {"name": "dup", "tier": "T1", "capability_class": "read_only", "socket_path": "/a.sock", "expected_uid": 1},
+            {"name": "dup", "tier": "T1", "capability_class": "read_only", "socket_path": "/b.sock", "expected_uid": 2}
+        ]"#;
+        let err = WorkerTransportRegistry::from_json(json).expect_err("duplicate name must be rejected");
+        assert!(matches!(err, WorkerTransportConfigError::DuplicateName { name } if name == "dup"));
+    }
+
+    #[test]
+    fn worker_transport_registry_rejects_t2_missing_expected_identity() {
+        let json = r#"[{
+            "name": "no-identity",
+            "tier": "T2",
+            "capability_class": "write_scoped",
+            "socket_path": "/run/terminus/w.sock",
+            "expected_uid": 1000
+        }]"#;
+        let err = WorkerTransportRegistry::from_json(json).expect_err("T2 worker missing expected_identity must be rejected");
+        assert!(matches!(err, WorkerTransportConfigError::MissingExpectedIdentity { .. }));
+    }
+
+    #[test]
+    fn worker_transport_registry_rejects_t0_missing_host_port() {
+        let json = r#"[{
+            "name": "no-host",
+            "tier": "T0",
+            "capability_class": "read_only",
+            "expected_identity": "no-host"
+        }]"#;
+        let err = WorkerTransportRegistry::from_json(json).expect_err("T0 worker missing host/port must be rejected");
+        assert!(matches!(err, WorkerTransportConfigError::MissingHostPort { .. }));
+    }
+
+    #[test]
+    fn worker_transport_registry_malformed_json_is_a_clear_error_not_a_panic() {
+        let err = WorkerTransportRegistry::from_json("not valid json {{{")
+            .expect_err("malformed JSON must error, never panic");
+        assert!(matches!(err, WorkerTransportConfigError::InvalidJson(_)));
+    }
+
+    #[test]
+    #[serial]
+    fn worker_transport_registry_from_env_is_empty_when_unset() {
+        std::env::remove_var("TERMINUS_BROKER_WORKERS_JSON");
+        let reg = WorkerTransportRegistry::from_env().expect("unset must never error");
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn worker_transport_registry_from_env_parses_when_set() {
+        std::env::set_var("TERMINUS_BROKER_WORKERS_JSON", VALID_WORKER_JSON);
+        let reg = WorkerTransportRegistry::from_env().expect("should parse");
+        assert_eq!(reg.len(), 3);
+        std::env::remove_var("TERMINUS_BROKER_WORKERS_JSON");
     }
 }
