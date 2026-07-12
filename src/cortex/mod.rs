@@ -163,6 +163,16 @@ pub struct CortexConfig {
     /// design (see `metrics` module doc) — never a hardcoded absolute. From
     /// `CORTEX_TIER_B_PERCENTILE`, default `90.0`.
     pub tier_b_percentile: f64,
+    /// CXEG-11's `cortex_audit`: wall-clock ceiling (seconds) on the
+    /// isolated `git clone` of an external audit target before it is killed
+    /// and treated as a failure (scratch dir is still cleaned up). From
+    /// `CORTEX_AUDIT_CLONE_TIMEOUT_SECS`, default `60`.
+    pub audit_clone_timeout_secs: u64,
+    /// CXEG-11's `cortex_audit`: byte ceiling on a cloned external repo
+    /// (measured after clone, before any graph build) above which the audit
+    /// is refused rather than building a graph over an oversized checkout.
+    /// From `CORTEX_AUDIT_MAX_CLONE_BYTES`, default `200_000_000` (200MB).
+    pub audit_max_clone_bytes: u64,
 }
 
 impl CortexConfig {
@@ -176,8 +186,22 @@ impl CortexConfig {
             atlas_database_url: crate::config::atlas_database_url(),
             max_blast_nodes: env_usize("CORTEX_MAX_BLAST_NODES", scope::DEFAULT_MAX_BLAST_NODES),
             tier_b_percentile: env_f64("CORTEX_TIER_B_PERCENTILE", 90.0),
+            audit_clone_timeout_secs: env_u64("CORTEX_AUDIT_CLONE_TIMEOUT_SECS", 60),
+            audit_max_clone_bytes: env_u64("CORTEX_AUDIT_MAX_CLONE_BYTES", 200_000_000),
         }
     }
+}
+
+/// Read a non-secret unsigned 64-bit tuning flag; falls back to `default`
+/// when unset, unparseable, or `0` (mirrors [`env_usize`]'s zero-is-invalid
+/// convention — a zero clone timeout/size ceiling is never the intent of an
+/// unset/misconfigured value).
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
 }
 
 /// Read a non-secret float tuning flag; falls back to `default` when unset
@@ -421,7 +445,7 @@ impl RustTool for CortexReview {
 }
 
 // ---------------------------------------------------------------------------
-// Tool: cortex_audit (stub — real backend rebuild is CXEG-11)
+// Tool: cortex_audit (CXEG-11: live, Atlas-backed external-repo audit)
 // ---------------------------------------------------------------------------
 
 pub struct CortexAudit {
@@ -435,15 +459,18 @@ impl RustTool for CortexAudit {
     }
 
     fn description(&self) -> &str {
-        "PENDING REBUILD (CXEG-11): audit an external public Git repository. \
-         The SSH-relay-era implementation (which delegated clone + graph \
-         build + report generation to a script on the now-retired fleet \
-         host) has been retired. The url argument still passes through the \
-         existing SSRF-hardened validator (only public http/https URLs are \
-         accepted), but execute() currently returns a structured pending \
-         pointer rather than performing a live audit — the real backend \
-         (presumably a sandboxed local clone + Atlas build) lands in \
-         CXEG-11."
+        "Audit an external public Git repository's structural elegance. As \
+         of CXEG-11: clones the url into an isolated, always-cleaned-up \
+         scratch directory (shallow, no submodules, no repo code ever \
+         executes), statically extracts a transient (never persisted) Atlas \
+         knowledge graph, runs the CXEG-03 structural-elegance detectors \
+         (centrality/complexity/fan-out/community-boundary signals) over the \
+         whole repo, and returns a report -- then deletes the clone. The url \
+         first passes the unchanged SSRF-hardened validator (only public \
+         http/https URLs to non-private/loopback/link-local/metadata hosts \
+         are accepted). Clone size and time are bounded \
+         (CORTEX_AUDIT_MAX_CLONE_BYTES / CORTEX_AUDIT_CLONE_TIMEOUT_SECS); an \
+         oversized or slow clone is refused, not silently truncated."
     }
 
     fn parameters(&self) -> Value {
@@ -460,24 +487,10 @@ impl RustTool for CortexAudit {
         let url = require_str(&args, "url")?;
         // Front-gate unchanged from the SSH-relay era: SSRF-hardened URL
         // validation (`audit.rs`, no dependency on the deleted SSH helpers)
-        // runs BEFORE anything else, same as it always has.
+        // runs BEFORE anything else, including before the clone attempt.
         validate_repo_url(url)?;
 
-        // CXEG-11 rebuilds this tool's actual backend (sandboxed local
-        // clone + Atlas KG build, replacing the retired remote-script
-        // relay). Until then, a valid URL gets a structured pending
-        // pointer instead of a live audit -- no network I/O happens here.
-        let response = json!({
-            "status": "pending",
-            "item": "CXEG-11",
-            "tool": "cortex_audit",
-            "url": url,
-            "message": "cortex_audit's SSH-relay-era backend has been \
-                retired; a locally-sandboxed clone + Atlas-build \
-                implementation lands in CXEG-11. The url has passed \
-                SSRF-hardened validation but no audit has been performed.",
-            "dup_cosine_threshold": self.config.dup_cosine,
-        });
+        let response = audit::run_audit(url, &self.config).await?;
         serde_json::to_string_pretty(&response)
             .map_err(|e| ToolError::Execution(format!("JSON render error: {e}")))
     }
@@ -524,6 +537,8 @@ mod tests {
             atlas_database_url: None,
             max_blast_nodes: scope::DEFAULT_MAX_BLAST_NODES,
             tier_b_percentile: 90.0,
+            audit_clone_timeout_secs: 60,
+            audit_max_clone_bytes: 200_000_000,
         })
     }
 
@@ -801,17 +816,20 @@ mod tests {
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
+    // NOTE: CXEG-11 made `cortex_audit` actually clone its `url` (into an
+    // isolated, cleaned-up scratch dir) and build a real Atlas graph over
+    // it, so a "valid URL succeeds" test through this wiring layer would
+    // require live network access to an external host -- not appropriate
+    // for a hermetic unit test. The full clone -> build -> report pipeline
+    // (success, size-ceiling rejection, no-supported-files rejection,
+    // cleanup-on-success/failure/panic) is covered against LOCAL git
+    // fixtures (no network) in `audit::tests`; this module's tests cover
+    // only argument validation and the SSRF front-gate ordering.
     #[tokio::test]
-    async fn test_audit_returns_pending_pointer_for_valid_url() {
+    async fn test_audit_missing_url_is_invalid_argument() {
         let tool = CortexAudit { config: test_config() };
-        let out = tool
-            .execute(json!({"url": "https://github.com/octocat/Hello-World"}))
-            .await
-            .expect("valid url must succeed with a pending pointer, not an error");
-        let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["status"], "pending");
-        assert_eq!(v["item"], "CXEG-11");
-        assert_eq!(v["url"], "https://github.com/octocat/Hello-World");
+        let err = tool.execute(json!({})).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
     // --- registration -----------------------------------------------------------

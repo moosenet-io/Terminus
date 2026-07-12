@@ -547,6 +547,8 @@ mod tests {
             atlas_database_url: None,
             max_blast_nodes: crate::cortex::scope::DEFAULT_MAX_BLAST_NODES,
             tier_b_percentile: 90.0,
+            audit_clone_timeout_secs: 60,
+            audit_max_clone_bytes: 200_000_000,
         }
     }
 
