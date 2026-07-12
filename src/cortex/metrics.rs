@@ -119,8 +119,10 @@ impl SignalKind {
 
 /// Round to 4 decimal places — the shared rounding rule every severity/score
 /// in this module uses, so run-to-run output is byte-identical (documented
-/// determinism contract, see module doc).
-fn round4(v: f64) -> f64 {
+/// determinism contract, see module doc). `pub(crate)` so CXEG-04's
+/// `cortex::review::score` reuses the exact same rounding rule for risk-score
+/// contributions instead of a second, potentially-divergent implementation.
+pub(crate) fn round4(v: f64) -> f64 {
     (v * 10_000.0).round() / 10_000.0
 }
 
@@ -547,6 +549,13 @@ mod tests {
             atlas_database_url: None,
             max_blast_nodes: crate::cortex::scope::DEFAULT_MAX_BLAST_NODES,
             tier_b_percentile: 90.0,
+            risk_weight_centrality_spike: 2.0,
+            risk_weight_complexity_spike: 1.5,
+            risk_weight_fan_out_explosion: 1.5,
+            risk_weight_community_boundary_crossing: 2.5,
+            risk_weight_semantic_duplication: 10.0,
+            risk_weight_recurrence: 1.0,
+            risk_band_elevated_cut: 4.0,
             audit_clone_timeout_secs: 60,
             audit_max_clone_bytes: 200_000_000,
         }
