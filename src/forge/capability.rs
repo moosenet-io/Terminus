@@ -109,6 +109,10 @@ pub enum ForgeEndpoint {
     // ── Pull / merge requests ─────────────────────────────────────────────────
     PullRequestsList,
     PullRequestsGet,
+    // READ of a PR's discussion/review thread (comments). The Review/Comment
+    // endpoints below are WRITE-only (post a review / a comment); this is the
+    // provider-agnostic read used by the PR-process mirror (GHIST-05).
+    PullRequestsListComments,
     PullRequestsCreate,
     PullRequestsUpdate,
     PullRequestsReview,
@@ -172,7 +176,8 @@ impl ForgeEndpoint {
             BranchesProtection, BranchesDefault,
             RefsList, RefsGet, RefsCreate, RefsDelete,
             CommitsList, CommitsGet, CommitsCompareDiff, CommitsStatus,
-            PullRequestsList, PullRequestsGet, PullRequestsCreate, PullRequestsUpdate,
+            PullRequestsList, PullRequestsGet, PullRequestsListComments,
+            PullRequestsCreate, PullRequestsUpdate,
             PullRequestsReview, PullRequestsComment, PullRequestsMerge, PullRequestsClose,
             IssuesList, IssuesGet, IssuesCreate, IssuesUpdate, IssuesComment,
             IssuesLabel, IssuesAssign, IssuesClose,
@@ -196,10 +201,9 @@ impl ForgeEndpoint {
             | BranchesProtection | BranchesDefault | RefsList | RefsGet | RefsCreate
             | RefsDelete => ForgeDomain::Branches,
             CommitsList | CommitsGet | CommitsCompareDiff | CommitsStatus => ForgeDomain::Commits,
-            PullRequestsList | PullRequestsGet | PullRequestsCreate | PullRequestsUpdate
-            | PullRequestsReview | PullRequestsComment | PullRequestsMerge | PullRequestsClose => {
-                ForgeDomain::PullRequests
-            }
+            PullRequestsList | PullRequestsGet | PullRequestsListComments | PullRequestsCreate
+            | PullRequestsUpdate | PullRequestsReview | PullRequestsComment | PullRequestsMerge
+            | PullRequestsClose => ForgeDomain::PullRequests,
             IssuesList | IssuesGet | IssuesCreate | IssuesUpdate | IssuesComment | IssuesLabel
             | IssuesAssign | IssuesClose => ForgeDomain::Issues,
             ReleasesList | ReleasesGet | ReleasesCreate | ReleasesUpdate | ReleasesDelete
@@ -257,6 +261,7 @@ impl ForgeEndpoint {
             CommitsStatus => "commits_status",
             PullRequestsList => "pull_requests_list",
             PullRequestsGet => "pull_requests_get",
+            PullRequestsListComments => "pull_requests_list_comments",
             PullRequestsCreate => "pull_requests_create",
             PullRequestsUpdate => "pull_requests_update",
             PullRequestsReview => "pull_requests_review",

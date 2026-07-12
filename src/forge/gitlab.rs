@@ -948,7 +948,8 @@ fn gitlab_capabilities() -> CapabilityMap {
         // Commits
         CommitsList, CommitsGet, CommitsCompareDiff, CommitsStatus,
         // Merge requests (PR)
-        PullRequestsList, PullRequestsGet, PullRequestsCreate, PullRequestsUpdate,
+        PullRequestsList, PullRequestsGet, PullRequestsListComments, PullRequestsCreate,
+        PullRequestsUpdate,
         PullRequestsReview, PullRequestsComment, PullRequestsMerge, PullRequestsClose,
         // Issues
         IssuesList, IssuesGet, IssuesCreate, IssuesUpdate, IssuesComment, IssuesLabel,
@@ -1190,6 +1191,13 @@ impl ForgeProvider for GitLabAdapter {
                 let iid = Self::req_num(p, "number")?;
                 let url = format!("{api}/projects/{pid}/merge_requests/{iid}");
                 ok(self.call(&token, Method::GET, &url, None).await?)
+            }
+            PullRequestsListComments => {
+                // GitLab exposes an MR's discussion thread as merge-request notes.
+                let pid = self.project_ref(p)?;
+                let iid = Self::req_num(p, "number")?;
+                let url = format!("{api}/projects/{pid}/merge_requests/{iid}/notes?per_page=100");
+                ok(self.call_paginated(&token, &url).await?)
             }
             PullRequestsCreate => {
                 let pid = self.project_ref(p)?;

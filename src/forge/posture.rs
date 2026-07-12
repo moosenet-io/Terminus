@@ -35,6 +35,7 @@ pub fn is_read_endpoint(endpoint: ForgeEndpoint) -> bool {
             | CommitsStatus
             | PullRequestsList
             | PullRequestsGet
+            | PullRequestsListComments
             | IssuesList
             | IssuesGet
             | ReleasesList
