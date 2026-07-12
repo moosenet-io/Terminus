@@ -647,6 +647,8 @@ mod tests {
             risk_band_elevated_cut: 4.0,
             audit_clone_timeout_secs: 30,
             audit_max_clone_bytes: 200_000_000,
+            escalation_enabled: true,
+            escalation_add_provider: "agy".to_string(),
         }
     }
 
