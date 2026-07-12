@@ -57,6 +57,8 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::cortex::house_style::HouseStyleCache;
+use crate::cortex::review::compute_review as cortex_compute_review;
+use crate::cortex::waiver;
 use crate::cortex::CortexConfig;
 use crate::error::ToolError;
 use crate::registry::ToolRegistry;
@@ -376,6 +378,211 @@ async fn maybe_record_findings(results: &[ProviderResult], context: &Value) -> V
     json!({"recorded": true, "created": created, "recurred": recurred, "errors": errors})
 }
 
+// ── CXEG-08: Stage-5b risk-gate escalation (governance only, no new scoring) ─
+//
+// See the module's execute() call site for the load-bearing safety property:
+// this ONLY ever widens the dispatched `providers` panel BEFORE dispatch --
+// it never reads or sets `aggregate_verdict`/`complete`, so a `high`
+// `cortex_review` band can never itself flip a verdict. Fail-open throughout:
+// any failure to compute a risk band, or to look up a waiver, degrades to "no
+// escalation" rather than blocking or altering the correctness gate.
+
+/// Decision computed by [`maybe_escalate`] BEFORE dispatch; finalized into
+/// the result's `"escalation"` block by [`finalize_escalation`] AFTER
+/// dispatch (once the added provider's own outcome, if any, is known).
+#[derive(Debug)]
+struct EscalationDecision {
+    escalated: bool,
+    added_provider: Option<String>,
+    band: String,
+    risk_score: Option<f64>,
+    waived: bool,
+    waiver: Option<Value>,
+    escalation_degraded: bool,
+    reason: String,
+}
+
+/// CXEG-08: consult `cortex_review`'s risk band for this change and, on
+/// `"high"` (and not actively waived), widen `providers` in place by
+/// appending `CortexConfig::escalation_add_provider` -- never removes,
+/// reorders, or otherwise touches the panel the caller already asked for.
+///
+/// Fail-open at every step:
+/// - `escalation_enabled == false`, no `project_id`, or no derivable changed
+///   files -> no escalation, `providers` untouched.
+/// - `cortex_review` itself never errors (it degrades internally to
+///   `configured:false`/`band:"unknown"`), so an ungraphed project simply
+///   reads as `band != "high"` here -- no escalation, `providers` untouched.
+///   This is exactly the "cortex_review unavailable -> gate proceeds on the
+///   correctness verdict alone" contract: nothing downstream ever blocks on
+///   it.
+/// - An active waiver for `HIGH_RISK_BAND_RULE`/this change's scope
+///   suppresses escalation; an expired one does not.
+/// - A waiver LOOKUP failure (store unconfigured/unreachable) is treated as
+///   "no active waiver found" -- logged, never propagated as an error.
+/// - `Structure::AdversarialPair`'s panel is fixed at exactly 2 providers
+///   (`defend`/`attack`); widening it would misassign roles, so escalation
+///   is recorded (`escalated:true`) but `providers` is left untouched, with
+///   `escalation_degraded:true`.
+/// - An invalid `escalation_add_provider` (not in `ALLOWED_PROVIDERS`), or a
+///   panel already at `MAX_PROVIDERS` that doesn't already include the
+///   configured add-provider, degrades the same way -- `escalated:true`,
+///   `escalation_degraded:true`, base panel proceeds untouched. Escalation
+///   can never deadlock dispatch.
+async fn maybe_escalate(
+    structure: Structure,
+    context: &Value,
+    providers: &mut Vec<String>,
+    cortex_config: &CortexConfig,
+) -> EscalationDecision {
+    let no_escalation = |band: &str, risk_score: Option<f64>, reason: &str| EscalationDecision {
+        escalated: false,
+        added_provider: None,
+        band: band.to_string(),
+        risk_score,
+        waived: false,
+        waiver: None,
+        escalation_degraded: false,
+        reason: reason.to_string(),
+    };
+
+    if !cortex_config.escalation_enabled {
+        return no_escalation("unknown", None, "disabled");
+    }
+
+    let Some(project_id) = context.get("project_id").and_then(Value::as_str).map(str::to_string) else {
+        return no_escalation("unknown", None, "no_project_id");
+    };
+
+    let changed_files = kg_context::derive_changed_files(context);
+    if changed_files.is_empty() {
+        return no_escalation("unknown", None, "no_changed_files");
+    }
+
+    let review = cortex_compute_review(&project_id, &changed_files, cortex_config, false).await;
+    let band = review.get("band").and_then(Value::as_str).unwrap_or("unknown").to_string();
+    let risk_score = review.get("risk_score").and_then(Value::as_f64);
+
+    if band != "high" {
+        return no_escalation(&band, risk_score, "band_not_high");
+    }
+
+    let requested_scope = changed_files.join(",");
+    let active = match waiver::active_waiver(&project_id, waiver::HIGH_RISK_BAND_RULE, &requested_scope).await {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(
+                "CXEG-08: waiver lookup failed for '{project_id}' ({e}) -- treating as no active \
+                 waiver (fail-open on the waiver lookup itself; the escalation/waiver layer never \
+                 blocks the correctness gate either way)"
+            );
+            None
+        }
+    };
+
+    if let Some(w) = active {
+        return EscalationDecision {
+            escalated: false,
+            added_provider: None,
+            band,
+            risk_score,
+            waived: true,
+            waiver: Some(w.to_json()),
+            escalation_degraded: false,
+            reason: "active_waiver_suppressed_escalation".to_string(),
+        };
+    }
+
+    if structure == Structure::AdversarialPair {
+        return EscalationDecision {
+            escalated: true,
+            added_provider: None,
+            band,
+            risk_score,
+            waived: false,
+            waiver: None,
+            escalation_degraded: true,
+            reason: "adversarial_pair panel is fixed at 2 providers (defend/attack); cannot widen".to_string(),
+        };
+    }
+
+    let add_provider = cortex_config.escalation_add_provider.clone();
+    if !ALLOWED_PROVIDERS.contains(&add_provider.as_str()) {
+        return EscalationDecision {
+            escalated: true,
+            added_provider: None,
+            band,
+            risk_score,
+            waived: false,
+            waiver: None,
+            escalation_degraded: true,
+            reason: format!("configured escalation_add_provider '{add_provider}' is not a valid provider"),
+        };
+    }
+
+    let already_present = providers.contains(&add_provider);
+    if !already_present && providers.len() >= MAX_PROVIDERS {
+        return EscalationDecision {
+            escalated: true,
+            added_provider: None,
+            band,
+            risk_score,
+            waived: false,
+            waiver: None,
+            escalation_degraded: true,
+            reason: "panel already at MAX_PROVIDERS; could not widen".to_string(),
+        };
+    }
+
+    if !already_present {
+        providers.push(add_provider.clone());
+    }
+
+    EscalationDecision {
+        escalated: true,
+        added_provider: Some(add_provider),
+        band,
+        risk_score,
+        waived: false,
+        waiver: None,
+        escalation_degraded: false,
+        reason: if already_present {
+            "high band; configured add-provider was already in the panel".to_string()
+        } else {
+            "high band; panel widened by one provider".to_string()
+        },
+    }
+}
+
+/// Fold in whether the escalation's `added_provider` (if any) actually came
+/// back degraded (an `error` on its `ProviderResult`) once dispatch has run.
+/// Never touches `aggregate_verdict`/`complete` -- purely descriptive.
+fn finalize_escalation(decision: EscalationDecision, results: &[ProviderResult]) -> Value {
+    let mut escalation_degraded = decision.escalation_degraded;
+    if let Some(provider) = &decision.added_provider {
+        if results.iter().find(|r| &r.provider == provider).map(|r| r.error.is_some()).unwrap_or(true) {
+            escalation_degraded = true;
+        }
+    }
+
+    let mut out = json!({
+        "escalated": decision.escalated,
+        "band": decision.band,
+        "risk_score": decision.risk_score,
+        "waived": decision.waived,
+        "escalation_degraded": escalation_degraded,
+        "reason": decision.reason,
+        "advisory_only": true,
+    });
+    if let Some(w) = decision.waiver {
+        out["waiver"] = w;
+    }
+    if let Some(provider) = decision.added_provider {
+        out["added_provider"] = json!(provider);
+    }
+    out
+}
+
 pub struct ReviewRun {
     // CXEG-07: shared across calls so the Tier-C consistency lens's
     // exemplar profiles benefit from `HouseStyleCache`'s own
@@ -558,7 +765,7 @@ than failing the whole call."
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        let (structure, providers, criteria, mut context) = parse_input(&args)?;
+        let (structure, mut providers, criteria, mut context) = parse_input(&args)?;
 
         // KGREV-02: a project with an in-flight incremental KG rebuild (from
         // a just-approved prior review) short-circuits here -- a re-review
@@ -591,6 +798,20 @@ than failing the whole call."
         // above, since `RulesStore` is sqlx-backed and awaits its queries.
         kg_context::inject_active_rules(&mut context).await;
         let cfg = ReviewConfig::from_env();
+        // CXEG-04's config is reused here (Stage-5b escalation) AND further
+        // below (CXEG-07's consistency lens) -- computed once, not twice.
+        let cortex_config = CortexConfig::from_env();
+
+        // CXEG-08: Stage-5b risk-gate escalation. Runs BEFORE dispatch (not
+        // after aggregate(), unlike CXEG-07's consistency lens) because its
+        // ONLY effect is widening the `providers` panel that gets dispatched
+        // below -- it never reads or mutates `aggregate_verdict`/`complete`
+        // itself, so risk structurally cannot flip the verdict: the extra
+        // reviewer's own correctness opinion is what (if anything) moves the
+        // outcome, exactly like any other panel member. Fail-open throughout
+        // (see `maybe_escalate`'s doc): any failure to compute a risk band or
+        // waiver just means no escalation, never a blocked/degraded panel.
+        let escalation_decision = maybe_escalate(structure, &context, &mut providers, &cortex_config).await;
 
         let mut set = tokio::task::JoinSet::new();
         // Tracks each spawned task's tokio::task::Id back to its (index,
@@ -648,7 +869,8 @@ than failing the whole call."
         // safety property; see `consistency`'s module doc). Advisory-only,
         // never an `Err`: disabled/unconfigured/degraded all resolve to an
         // empty, labeled `ConsistencyRun` rather than affecting this call.
-        let cortex_config = CortexConfig::from_env();
+        // `cortex_config` was already computed above (before dispatch) for
+        // CXEG-08's escalation decision; reused here rather than recomputed.
         let consistency_run =
             consistency::maybe_run(&context, &criteria, &results, &cfg, &cortex_config, &self.house_style_cache).await;
 
@@ -700,6 +922,14 @@ than failing the whole call."
         results_for_findings.extend(results.iter().cloned());
         let findings_recorded = maybe_record_findings(&results_for_findings, &findings_context).await;
 
+        // CXEG-08: finalize the escalation block now that dispatch has
+        // actually happened -- `escalation_decision` was computed BEFORE
+        // dispatch (it only widens `providers`); this step just folds in
+        // whether the ADDED provider itself came back degraded, so
+        // `escalation_degraded:true` reflects reality without ever touching
+        // `aggregate_verdict`/`complete` above.
+        let escalation = finalize_escalation(escalation_decision, &results);
+
         Ok(json!({
             "structure": args["structure"],
             "providers": results,
@@ -708,6 +938,7 @@ than failing the whole call."
             "kg_rebuild": kg_rebuild,
             "scribe_docs": scribe_docs,
             "findings_recorded": findings_recorded,
+            "escalation": escalation,
             "consistency": {
                 "status": consistency_run.status,
                 "provider": consistency_run.provider,
@@ -1195,5 +1426,338 @@ mod tests {
         let parsed: Value = serde_json::from_str(&out).unwrap();
         assert!(parsed["findings_recorded"].is_object(), "{parsed}");
         assert!(parsed["aggregate_verdict"].is_string(), "{parsed}");
+    }
+
+    // ── CXEG-08: Stage-5b risk-gate escalation ──────────────────────────────
+
+    fn escalation_cfg(enabled: bool, add_provider: &str, force_high: bool) -> CortexConfig {
+        CortexConfig {
+            risk_score_threshold: if force_high { 0.0 } else { 7.0 },
+            enable_tier_b: false,
+            enable_tier_c: false,
+            elegance_advisory_only: true,
+            dup_cosine: 0.85,
+            atlas_database_url: None,
+            max_blast_nodes: crate::cortex::scope::DEFAULT_MAX_BLAST_NODES,
+            tier_b_percentile: 90.0,
+            house_style_exemplars_k: crate::cortex::house_style::DEFAULT_EXEMPLARS_K,
+            risk_weight_centrality_spike: 2.0,
+            risk_weight_complexity_spike: 1.5,
+            risk_weight_fan_out_explosion: 1.5,
+            risk_weight_community_boundary_crossing: 2.5,
+            risk_weight_semantic_duplication: 10.0,
+            risk_weight_recurrence: 1.0,
+            risk_band_elevated_cut: if force_high { 0.0 } else { 4.0 },
+            audit_clone_timeout_secs: 60,
+            audit_max_clone_bytes: 200_000_000,
+            crystallize_min_recurrence: crate::cortex::crystallize::DEFAULT_MIN_RECURRENCE,
+            escalation_enabled: enabled,
+            escalation_add_provider: add_provider.to_string(),
+        }
+    }
+
+    fn seed_tiny_graph(project_id: &str, path: &str) {
+        use crate::scribe::graph::model::{KgNode, KnowledgeGraph, NodeKind};
+        use crate::scribe::graph::store::GraphStore;
+        use crate::scribe::ScribeConfig;
+
+        let store = GraphStore::from_config(&ScribeConfig::from_env());
+        let mut g = KnowledgeGraph::new(project_id);
+        g.insert_node(KgNode::new("crate::a::foo", NodeKind::Function, "foo", path));
+        g.recompute_degrees();
+        store.save(project_id, &g).unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn maybe_escalate_disabled_is_a_noop() {
+        let mut providers = vec!["opus".to_string()];
+        let context = json!({"project_id": "TERM", "changed_files": ["src/a.rs"]});
+        let cfg = escalation_cfg(false, "codex", true);
+        let decision = maybe_escalate(Structure::PanelMajority, &context, &mut providers, &cfg).await;
+        assert!(!decision.escalated, "{decision:?}");
+        assert_eq!(decision.reason, "disabled");
+        assert_eq!(providers, vec!["opus".to_string()], "disabled escalation must never touch the panel");
+    }
+
+    #[tokio::test]
+    async fn maybe_escalate_no_project_id_is_a_noop() {
+        let mut providers = vec!["opus".to_string()];
+        let context = json!({"changed_files": ["src/a.rs"]});
+        let cfg = escalation_cfg(true, "codex", true);
+        let decision = maybe_escalate(Structure::PanelMajority, &context, &mut providers, &cfg).await;
+        assert!(!decision.escalated, "{decision:?}");
+        assert_eq!(decision.reason, "no_project_id");
+        assert_eq!(providers.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn maybe_escalate_fail_open_when_cortex_review_unavailable() {
+        // No stored Atlas graph -> cortex_review degrades internally to
+        // configured:false/band:"unknown" (never an Err) -- the fail-open
+        // contract: escalation must read this as "band not high", never
+        // block/alter the correctness gate.
+        let store_dir = std::env::temp_dir().join(format!("review-cxeg08-nograph-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+
+        let mut providers = vec!["opus".to_string()];
+        let context = json!({"project_id": "TERM", "changed_files": ["src/a.rs"]});
+        let cfg = escalation_cfg(true, "codex", true);
+        let decision = maybe_escalate(Structure::PanelMajority, &context, &mut providers, &cfg).await;
+        assert!(!decision.escalated, "{decision:?}");
+        assert_eq!(decision.band, "unknown");
+        assert_eq!(providers.len(), 1, "no graph -> no escalation -> panel untouched");
+
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn maybe_escalate_high_band_widens_panel_and_sets_escalated_true() {
+        let store_dir = std::env::temp_dir().join(format!("review-cxeg08-high-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+        seed_tiny_graph("TERM", "src/a.rs");
+
+        let mut providers = vec!["opus".to_string()];
+        let context = json!({"project_id": "TERM", "changed_files": ["src/a.rs"]});
+        let cfg = escalation_cfg(true, "codex", true);
+        let decision = maybe_escalate(Structure::PanelMajority, &context, &mut providers, &cfg).await;
+
+        assert!(decision.escalated, "{decision:?}");
+        assert_eq!(decision.band, "high");
+        assert_eq!(decision.added_provider, Some("codex".to_string()));
+        assert_eq!(providers, vec!["opus".to_string(), "codex".to_string()], "panel must widen by exactly one provider");
+        assert!(!decision.waived);
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn maybe_escalate_does_not_duplicate_an_already_present_add_provider() {
+        let store_dir = std::env::temp_dir().join(format!("review-cxeg08-dup-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+        seed_tiny_graph("TERM", "src/a.rs");
+
+        let mut providers = vec!["opus".to_string(), "codex".to_string()];
+        let context = json!({"project_id": "TERM", "changed_files": ["src/a.rs"]});
+        let cfg = escalation_cfg(true, "codex", true);
+        let decision = maybe_escalate(Structure::PanelMajority, &context, &mut providers, &cfg).await;
+
+        assert!(decision.escalated, "{decision:?}");
+        assert_eq!(providers.len(), 2, "the configured add-provider is already present -- must not duplicate");
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn maybe_escalate_adversarial_pair_panel_is_never_widened() {
+        let store_dir = std::env::temp_dir().join(format!("review-cxeg08-adv-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+        seed_tiny_graph("TERM", "src/a.rs");
+
+        let mut providers = vec!["opus".to_string(), "codex".to_string()];
+        let context = json!({"project_id": "TERM", "changed_files": ["src/a.rs"]});
+        let cfg = escalation_cfg(true, "agy", true);
+        let decision = maybe_escalate(Structure::AdversarialPair, &context, &mut providers, &cfg).await;
+
+        assert!(decision.escalated, "{decision:?}");
+        assert!(decision.escalation_degraded, "{decision:?}");
+        assert_eq!(decision.added_provider, None);
+        assert_eq!(providers.len(), 2, "adversarial_pair's fixed defend/attack panel must never be widened");
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn maybe_escalate_invalid_add_provider_degrades_without_widening() {
+        let store_dir = std::env::temp_dir().join(format!("review-cxeg08-badprovider-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+        seed_tiny_graph("TERM", "src/a.rs");
+
+        let mut providers = vec!["opus".to_string()];
+        let context = json!({"project_id": "TERM", "changed_files": ["src/a.rs"]});
+        let cfg = escalation_cfg(true, "gpt5-not-a-real-provider", true);
+        let decision = maybe_escalate(Structure::PanelMajority, &context, &mut providers, &cfg).await;
+
+        assert!(decision.escalated, "{decision:?}");
+        assert!(decision.escalation_degraded, "{decision:?}");
+        assert_eq!(providers.len(), 1, "an invalid configured add-provider must never be pushed onto the panel");
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn maybe_escalate_panel_already_at_max_degrades_without_widening() {
+        let store_dir = std::env::temp_dir().join(format!("review-cxeg08-maxpanel-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+        seed_tiny_graph("TERM", "src/a.rs");
+
+        let mut providers = vec!["opus".to_string(), "codex".to_string(), "agy".to_string(), "nemotron".to_string(), "qwen_coder".to_string()];
+        assert_eq!(providers.len(), MAX_PROVIDERS);
+        let context = json!({"project_id": "TERM", "changed_files": ["src/a.rs"]});
+        let cfg = escalation_cfg(true, "free", true);
+        let decision = maybe_escalate(Structure::PanelMajority, &context, &mut providers, &cfg).await;
+
+        assert!(decision.escalated, "{decision:?}");
+        assert!(decision.escalation_degraded, "{decision:?}");
+        assert_eq!(providers.len(), MAX_PROVIDERS, "a full panel must never be exceeded to widen it");
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn maybe_escalate_active_waiver_suppresses_escalation() {
+        if std::env::var("ATLAS_DATABASE_URL").is_err() {
+            return; // no live Atlas DB in this test process -- skip cleanly
+        }
+        let project_id = format!("TERM-CXEG08-WAIVE-{}", uuid::Uuid::new_v4());
+        crate::cortex::waiver::record_waiver(
+            &project_id,
+            crate::cortex::waiver::HIGH_RISK_BAND_RULE,
+            "*",
+            "accepted risk for this sprint",
+            "test-author",
+            None,
+        )
+        .await
+        .expect("record_waiver");
+
+        let store_dir = std::env::temp_dir().join(format!("review-cxeg08-waived-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+        seed_tiny_graph(&project_id, "src/a.rs");
+
+        let mut providers = vec!["opus".to_string()];
+        let context = json!({"project_id": project_id, "changed_files": ["src/a.rs"]});
+        let cfg = escalation_cfg(true, "codex", true);
+        let decision = maybe_escalate(Structure::PanelMajority, &context, &mut providers, &cfg).await;
+
+        assert!(!decision.escalated, "{decision:?}");
+        assert!(decision.waived, "{decision:?}");
+        assert_eq!(decision.reason, "active_waiver_suppressed_escalation");
+        assert_eq!(providers.len(), 1, "a waived escalation must never widen the panel");
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn maybe_escalate_expired_waiver_does_not_suppress_escalation() {
+        if std::env::var("ATLAS_DATABASE_URL").is_err() {
+            return; // no live Atlas DB in this test process -- skip cleanly
+        }
+        let project_id = format!("TERM-CXEG08-EXPIRED-{}", uuid::Uuid::new_v4());
+        let expiry = chrono::Utc::now() - chrono::Duration::hours(1);
+        crate::cortex::waiver::record_waiver(
+            &project_id,
+            crate::cortex::waiver::HIGH_RISK_BAND_RULE,
+            "*",
+            "expired waiver, should no longer apply",
+            "test-author",
+            Some(expiry),
+        )
+        .await
+        .expect("record_waiver");
+
+        let store_dir = std::env::temp_dir().join(format!("review-cxeg08-expired-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+        seed_tiny_graph(&project_id, "src/a.rs");
+
+        let mut providers = vec!["opus".to_string()];
+        let context = json!({"project_id": project_id, "changed_files": ["src/a.rs"]});
+        let cfg = escalation_cfg(true, "codex", true);
+        let decision = maybe_escalate(Structure::PanelMajority, &context, &mut providers, &cfg).await;
+
+        assert!(decision.escalated, "an EXPIRED waiver must not suppress escalation: {decision:?}");
+        assert!(!decision.waived);
+        assert_eq!(providers.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn escalation_never_sets_changes_requested_from_risk_alone() {
+        // A high band alone must never drive `aggregate_verdict` -- it is
+        // computed by `aggregate()` purely from actual panel results, with
+        // no risk/escalation input at all (see `execute()`'s call-site
+        // comment). Here, every provider degrades (no daemon/OpenRouter
+        // configured), so if risk COULD flip the verdict this would surface
+        // as something other than "UNKNOWN"/incomplete.
+        let store_dir = std::env::temp_dir().join(format!("review-cxeg08-noflip-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+        seed_tiny_graph("TERM", "src/a.rs");
+        std::env::remove_var("REVIEW_DAEMON_TOKEN");
+        std::env::remove_var("OPENROUTER_API_KEY");
+
+        let args = json!({
+            "structure": "panel_majority",
+            "providers": ["opus"],
+            "criteria": "must compile",
+            "context": {"project_id": "TERM", "changed_files": ["src/a.rs"]}
+        });
+        let out = tool().execute(args).await.unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+
+        assert_eq!(parsed["aggregate_verdict"], "UNKNOWN", "{parsed}");
+        assert_eq!(parsed["complete"], false, "{parsed}");
+        assert_ne!(parsed["aggregate_verdict"], "REQUEST_CHANGES", "risk alone must never set REQUEST_CHANGES: {parsed}");
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_reports_escalation_degraded_when_added_provider_is_unavailable() {
+        // A default (non-forced) CortexConfig::from_env() picks up this
+        // test's real threshold, so force a high band via a stored graph +
+        // CORTEX_RISK_SCORE_THRESHOLD/CORTEX_RISK_BAND_ELEVATED_CUT env
+        // overrides (execute() calls `CortexConfig::from_env()` internally,
+        // not the test's own `escalation_cfg`).
+        let store_dir = std::env::temp_dir().join(format!("review-cxeg08-degraded-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+        seed_tiny_graph("TERM", "src/a.rs");
+        std::env::set_var("CORTEX_RISK_SCORE_THRESHOLD", "0.0");
+        std::env::set_var("CORTEX_RISK_BAND_ELEVATED_CUT", "0.0");
+        std::env::set_var("CORTEX_ESCALATION_ADD_PROVIDER", "codex");
+        std::env::remove_var("REVIEW_DAEMON_TOKEN");
+        std::env::remove_var("OPENROUTER_API_KEY");
+
+        let args = json!({
+            "structure": "panel_majority",
+            "providers": ["opus"],
+            "criteria": "must compile",
+            "context": {"project_id": "TERM", "changed_files": ["src/a.rs"]}
+        });
+        let out = tool().execute(args).await.unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+
+        assert_eq!(parsed["escalation"]["escalated"], true, "{parsed}");
+        assert_eq!(parsed["escalation"]["added_provider"], "codex", "{parsed}");
+        assert_eq!(
+            parsed["escalation"]["escalation_degraded"], true,
+            "codex has no REVIEW_DAEMON_TOKEN configured -- must degrade, not deadlock: {parsed}"
+        );
+        // No deadlock: the call still completed and returned both providers.
+        assert_eq!(parsed["providers"].as_array().unwrap().len(), 2, "{parsed}");
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
+        std::env::remove_var("CORTEX_RISK_SCORE_THRESHOLD");
+        std::env::remove_var("CORTEX_RISK_BAND_ELEVATED_CUT");
+        std::env::remove_var("CORTEX_ESCALATION_ADD_PROVIDER");
     }
 }

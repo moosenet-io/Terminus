@@ -829,6 +829,13 @@ Its risk/elegance surface is rebuilt over the following S115 items:
   `scribe_kg_build` rebuild transparently invalidates every stale entry on
   next access. Degrades to `configured:false` (never an error) when the
   project has no stored Atlas graph yet.
+- `cortex_waive` — live as of **CXEG-08**: record a tracked waiver
+  (`project_id`, `rule`, `scope`, a MANDATORY non-blank `reason`, `author`,
+  optional `expiry`) against `review_run`'s Stage-5b risk-gate escalation
+  (below), stored as a `category:"waiver"` finding on the same KGFIND-01
+  `FindingsStore` every other finding uses — no new database. See
+  "`review_run`'s Stage-5b risk-gate escalation + waivers (CXEG-08)" below
+  for the full escalation/waiver policy and response shapes.
 - `cortex_crystallize` — live as of **CXEG-09**: the rule crystallization
   loop (`src/cortex/crystallize.rs`). See "Rule crystallization loop
   (CXEG-09)" below for the full lifecycle.
@@ -990,6 +997,130 @@ this block, however populated, never altered `aggregate_verdict`/`complete`
 above it in the same result — those are computed and fixed BEFORE the
 consistency lens even runs (see `consistency`'s module doc for why this
 ordering is the load-bearing safety property, not just a convention).
+
+### `review_run`'s Stage-5b risk-gate escalation + waivers (CXEG-08) — GOVERNANCE ONLY, never a verdict input
+
+CXEG-04 gave `cortex_review` a `risk_score`/`band`, but explicitly scoped
+"what happens when a band is `high`" out (its `recommendation_for` only ever
+suggests escalating rigor — never auto-rejects). CXEG-08 is that governance
+wiring: it widens the `review_run` panel on a `high` band, and adds a tracked
+waiver mechanism so a project owner can accept elevated risk for a specific
+rule/scope without the escalation firing every time. **No new scoring** — the
+risk score itself is unchanged from CXEG-04.
+
+**Where it runs, and why that ordering matters.** Unlike CXEG-07's
+consistency lens (which runs strictly AFTER `aggregate()`), CXEG-08's
+escalation runs strictly BEFORE dispatch (`review::mod::maybe_escalate`,
+called right after `ReviewConfig`/`CortexConfig` are built and before the
+provider `JoinSet` is spawned). Its ONLY effect is appending one provider
+name to the `providers` list that is about to be dispatched — it never reads
+or sets `aggregate_verdict`/`complete`. This is the load-bearing safety
+property: **risk cannot flip the verdict**, because nothing about the
+escalation logic is in `aggregate()`'s input at all. What a `high` band buys
+is one more independent reviewer's *own* correctness opinion in the normal
+panel — same as if the caller had asked for a bigger panel up front.
+
+**Gating.** Controlled by `CortexConfig`:
+- `escalation_enabled` (`CORTEX_ESCALATION_ENABLED`, default `true`) — the
+  master switch. `false` is byte-for-byte the pre-CXEG-08 dispatch path plus
+  one additive `"escalation": {"escalated": false, "reason": "disabled"}`
+  field.
+- `escalation_add_provider` (`CORTEX_ESCALATION_ADD_PROVIDER`, default
+  `"agy"`) — which provider gets appended to the panel on escalation. Must be
+  one of `review::ALLOWED_PROVIDERS`; an invalid value degrades the
+  escalation attempt rather than erroring the call (see below).
+
+**Decision flow** (`maybe_escalate`), all fail-open:
+
+| Condition | Result |
+| --- | --- |
+| `escalation_enabled=false`, or no `context.project_id`, or no derivable `changed_files` | No escalation; `providers` untouched. |
+| `cortex_review`'s band isn't `"high"` (including an ungraphed project, which degrades internally to `band:"unknown"` — `cortex_review` itself never errors) | No escalation; `providers` untouched. This is the fail-open contract in full: `cortex_review` unavailable ⇒ the correctness gate proceeds on the panel's own verdict alone, exactly as if CXEG-08 didn't exist. |
+| An active (non-expired, rule + scope-matching) waiver exists for `HIGH_RISK_BAND_RULE` (`"cortex_review_high_band"`) | No escalation; `"waived": true` + the waiver's details in the result. An EXPIRED waiver does not suppress. |
+| `structure == "adversarial_pair"` | `"escalated": true`, `"escalation_degraded": true`, `providers` untouched — a fixed 2-provider defend/attack panel can't be widened without misassigning roles. |
+| `escalation_add_provider` isn't a valid provider name, or the panel is already at `MAX_PROVIDERS` (5) and doesn't already include it | `"escalated": true`, `"escalation_degraded": true`, `providers` untouched — escalation degrades gracefully rather than ever blocking dispatch. |
+| High band, unwaived, room in the panel | `providers` gains exactly one entry (the configured add-provider; a no-op if it's already present); `"escalated": true`. |
+
+After dispatch, `finalize_escalation` folds in whether the ADDED provider's
+own `ProviderResult` came back with an `error` (unreachable daemon/OpenRouter,
+same degrade path every other provider already has) — if so,
+`"escalation_degraded": true` even though `"escalated"` stayed `true`, so a
+caller can tell "we tried to widen the panel but that reviewer didn't answer"
+from "we didn't try." Either way, dispatch itself never deadlocks: a degraded
+extra reviewer is just one more `"unavailable: ..."` panel entry, handled by
+the exact same per-provider degrade path (`run_one_provider`) as any other.
+
+`review_run`'s result now includes:
+
+```json
+"escalation": {
+  "escalated": true,
+  "band": "high",
+  "risk_score": 8.2,
+  "waived": false,
+  "escalation_degraded": false,
+  "reason": "high band; panel widened by one provider",
+  "advisory_only": true,
+  "added_provider": "agy"
+}
+```
+
+(`"waiver": {...}` is present instead of `"added_provider"` when an active
+waiver suppressed escalation.) `"advisory_only": true` is always present for
+the same reason CXEG-07's `consistency` block carries it: a reminder that
+nothing in this block ever touched `aggregate_verdict`/`complete` above it.
+
+**Waivers — `cortex_waive`.** Records a tracked exception on the SAME
+KGFIND-01 `FindingsStore` every other `review_run` finding uses (`category:
+"waiver"`, `scope_kind: Global` — no second findings-access path, S9, and no
+new database table). `reason` is MANDATORY and non-blank —
+`ToolError::InvalidArgument` if empty or whitespace-only. `scope` is `"*"`
+(project-wide, the default) or a comma-separated file-path set; a waiver
+whose `scope` is broader than the change it later suppresses is still
+honored (never rejected for being "too broad"), but the escalation lookup
+flags `"broad": true` on the waiver it returns so over-broad waivers are
+visible rather than silently accepted. `expiry` is an optional RFC3339
+timestamp; an expired waiver is treated as absent (`scope_covers` in
+`src/cortex/waiver.rs` is the pure, unit-tested coverage check; matching
+happens against the LATEST recorded entry for a given `(rule, reason)` row).
+Every waiver is itself a `category:"waiver"` finding, so over-waiving a rule
+surfaces in the normal findings/trend tooling (`kg_findings`) exactly like
+any other recurring observation — this is deliberate, not an oversight.
+
+```json
+// cortex_waive
+{
+  "project_id": "TERM",
+  "rule": "cortex_review_high_band",
+  "scope": "*",
+  "reason": "accepted risk for the S115 sprint, revisit after CXEG-10 calibration",
+  "author": "<operator>",
+  "expiry": "2026-08-01T00:00:00Z"
+}
+```
+
+```json
+// response
+{
+  "recorded": true,
+  "created": true,
+  "waiver_id": "…",
+  "occurrences": 1,
+  "project_id": "TERM",
+  "rule": "cortex_review_high_band",
+  "scope": "*",
+  "reason": "accepted risk for the S115 sprint, revisit after CXEG-10 calibration",
+  "author": "<operator>",
+  "expiry": "2026-08-01T00:00:00Z"
+}
+```
+
+**What CXEG-08 deliberately does NOT do**: it never sets `aggregate_verdict`
+to `REQUEST_CHANGES`/`CHANGES_REQUESTED` from risk alone, never blocks a
+merge by itself, and never introduces a new risk-scoring signal — all of
+that is CXEG-04's `cortex_review` (unchanged) plus the correctness panel's
+own aggregation (unchanged). It is governance around an existing signal, not
+a new gate.
 
 ## Postgres tool suite — the single sanctioned Postgres door (S115)
 

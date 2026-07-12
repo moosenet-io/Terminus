@@ -556,6 +556,141 @@ looks for a top-level `risk_score` field (documented 0-10 scale, rescaled to
 KG rule crystallization — see its own module doc. `cortex_review`'s response
 shape as of CXEG-04 satisfies that contract with no code change needed there.
 
+## `review_run`'s Stage-5b risk-gate escalation + `cortex_waive` (CXEG-08)
+
+CXEG-04 deliberately scoped "what happens on a `high` band" out of
+`cortex_review` itself (`recommendation_for` only ever suggests escalating
+rigor). CXEG-08 is that governance layer: `review_run` widens its dispatched
+provider panel when a change's `cortex_review` band is `"high"`, unless an
+active waiver says otherwise — **no new risk scoring**, purely governance
+around the existing `risk_score`/`band`.
+
+**Where it runs.** `review::mod::maybe_escalate` runs BEFORE the provider
+`JoinSet` is spawned (unlike CXEG-07's consistency lens, which runs strictly
+AFTER `aggregate()`). Its only effect is appending a provider name to the
+`providers` list that dispatch is about to use — it never touches
+`aggregate_verdict`/`complete`. This is why risk cannot flip a verdict: the
+escalation logic isn't an input to `aggregate()` at all, only to which
+providers get asked.
+
+**Escalation decision** (`CortexConfig.escalation_enabled` /
+`CORTEX_ESCALATION_ENABLED`, default `true`; `escalation_add_provider` /
+`CORTEX_ESCALATION_ADD_PROVIDER`, default `"agy"`):
+
+1. Disabled, no `context.project_id`, or no derivable `changed_files` → no
+   escalation.
+2. Calls `cortex_review::compute_review` for the change. A `band` other than
+   `"high"` (including `"unknown"` on an ungraphed project — `cortex_review`
+   itself never errors) → no escalation. **This is the fail-open contract**:
+   `cortex_review` being unavailable/unconfigured is indistinguishable, from
+   this gate's perspective, from "not risky" — the correctness gate always
+   proceeds on the panel's own verdict alone.
+3. Looks up an active waiver via `crate::cortex::waiver::active_waiver`
+   for rule `"cortex_review_high_band"` (`waiver::HIGH_RISK_BAND_RULE`) and
+   this change's `changed_files` (joined, as the requested scope). A waiver
+   lookup failure (store unconfigured/unreachable) is treated as "no active
+   waiver found" — logged, never propagated as an error; the gate does not
+   distinguish "confirmed unwaived" from "couldn't check," by design (see
+   `src/cortex/waiver.rs`'s module doc, "Fail-open, always").
+4. An active, matching, non-expired waiver → no escalation;
+   `"waived": true` plus the waiver's `{finding_id, rule, scope, reason,
+   author, expiry, broad}` in the result. An EXPIRED waiver does not
+   suppress (checked against the waiver's own recorded `expiry`, not
+   `review_run`'s call time in any other sense).
+5. `structure == "adversarial_pair"` → `"escalated": true`,
+   `"escalation_degraded": true`, panel untouched (a fixed 2-provider
+   defend/attack shape can't be widened without misassigning `Role::Defend`/
+   `Role::Attack`).
+6. `escalation_add_provider` invalid, or the panel already at
+   `MAX_PROVIDERS` (5) without already containing it → `"escalated": true`,
+   `"escalation_degraded": true`, panel untouched. Escalation degrading can
+   never deadlock dispatch.
+7. Otherwise: `providers` gains exactly one entry (a no-op if the
+   add-provider is already present); `"escalated": true`.
+
+After dispatch, `review::mod::finalize_escalation` additionally sets
+`"escalation_degraded": true` if the ADDED provider's own `ProviderResult`
+came back with an `error` (same per-provider degrade path every other
+provider already goes through, e.g. no `REVIEW_DAEMON_TOKEN` configured) —
+so a caller can distinguish "we tried to widen the panel but that reviewer
+didn't answer" from "we didn't try."
+
+**`review_run` result shape** (new, additive `"escalation"` field):
+
+```json
+"escalation": {
+  "escalated": true,
+  "band": "high",
+  "risk_score": 8.2,
+  "waived": false,
+  "escalation_degraded": false,
+  "reason": "high band; panel widened by one provider",
+  "advisory_only": true,
+  "added_provider": "agy"
+}
+```
+
+`"waiver": {...}` replaces `"added_provider"` when an active waiver
+suppressed escalation. `"advisory_only": true` is always present, mirroring
+CXEG-07's `consistency` block — a reminder this field never altered
+`aggregate_verdict`/`complete`.
+
+### `cortex_waive` — record a risk-gate waiver
+
+**Input schema**: `project_id` (enum, required, one of `PROJECT_IDS`), `rule`
+(string, required — the gate rule id, e.g. `"cortex_review_high_band"`),
+`reason` (string, required, **MUST be non-blank** — `InvalidArgument` if
+empty/whitespace-only), `scope` (string, optional, default `"*"` — `"*"` for
+project-wide or a comma-separated file-path set), `author` (string, optional,
+default `"unknown"`), `expiry` (string, optional — an RFC3339 timestamp;
+`InvalidArgument` if present but not valid RFC3339).
+
+**Storage (S9, no new database)**: recorded as a `category:"waiver"` finding
+on the SAME KGFIND-01 `FindingsStore` every other `review_run` finding uses —
+`scope_kind: Global`, `scope_ref: project_id`, `description:
+"waiver[<rule>]: <reason>"` (the `rule` is folded into the description, not
+just `provenance`, so two waivers with the same reason text but different
+rules never collide in the store's exact-description dedup bucket). The
+`(rule, scope, reason, author, expiry, waived_at)` tuple lives in the
+finding's `provenance` JSON; repeating the identical `(rule, reason)` bumps
+`occurrences` and merges provenance (the store's existing exact-description
+dedup, unmodified) rather than duplicating a row — so over-waiving the same
+thing repeatedly is visible as a high-`occurrences` finding, not silently
+free.
+
+**Scope coverage** (`waiver::scope_covers`, pure/unit-tested,
+`src/cortex/waiver.rs`): a waiver's `scope` "covers" a requested scope when
+`scope == "*"`, or when every path in the requested (comma-separated) set is
+also in the waiver's set. Coverage is allowed to be broader than what's asked
+— a project-wide `"*"` waiver covers a single-file change — but
+`active_waiver` flags `"broad": true` on the match when the waiver's scope is
+strictly larger than the requested one, so over-broad waivers stay visible
+rather than silently accepted as "just right."
+
+**Response shape**:
+
+```json
+{
+  "recorded": true,
+  "created": true,
+  "waiver_id": "3f9c2e1a-...",
+  "occurrences": 1,
+  "project_id": "TERM",
+  "rule": "cortex_review_high_band",
+  "scope": "*",
+  "reason": "accepted risk for the S115 sprint, revisit after CXEG-10 calibration",
+  "author": "<operator>",
+  "expiry": "2026-08-01T00:00:00Z"
+}
+```
+
+`"created": false` (with `"occurrences" > 1`) when the identical `(rule,
+reason)` waiver was already recorded and this call just bumped it.
+
+**Error cases**: unknown `project_id`; blank `rule`; blank/missing `reason`;
+a present-but-invalid `expiry`. All `InvalidArgument`, checked before any
+store I/O.
+
 ## `cortex_audit` — external-repo structural-elegance audit (CXEG-11)
 
 **Input schema**: `url` (string, required) — a public git repository URL,
@@ -656,7 +791,7 @@ scratch directory is still removed.
 ## Configuration
 
 `CortexConfig::from_env()` (`src/cortex/mod.rs`) builds one shared
-`Arc<CortexConfig>` for all 4 real tools. No SSH/remote-script fields remain.
+`Arc<CortexConfig>` for all 5 real tools. No SSH/remote-script fields remain.
 
 | Env var | Type | Default | Notes |
 | --- | --- | --- | --- |
@@ -677,6 +812,8 @@ scratch directory is still removed.
 | `CORTEX_RISK_BAND_ELEVATED_CUT` | f64 | `4.0` | `cortex_review`'s `"low"` -> `"elevated"` band cut-point. |
 | `CORTEX_AUDIT_CLONE_TIMEOUT_SECS` | u64 | `60` | `cortex_audit`'s (CXEG-11) wall-clock ceiling on the isolated `git clone` of an external audit target; past this the subprocess is killed and the scratch dir is still cleaned up. A zero/unparseable value falls back to the default. |
 | `CORTEX_AUDIT_MAX_CLONE_BYTES` | u64 | `200000000` (200MB) | `cortex_audit`'s (CXEG-11) byte ceiling on a cloned external repo, measured after clone and before any graph build; exceeding it is an `InvalidArgument`, not a silent truncation. A zero/unparseable value falls back to the default. |
+| `CORTEX_ESCALATION_ENABLED` | bool | `true` | CXEG-08: master switch for `review_run`'s Stage-5b risk-gate escalation (`review::mod::maybe_escalate`). `false` -> byte-for-byte the pre-CXEG-08 dispatch path plus one additive `"escalation": {"escalated": false, "reason": "disabled"}` field. Never gates `cortex_review`/`cortex_waive` themselves. |
+| `CORTEX_ESCALATION_ADD_PROVIDER` | string | `"agy"` | CXEG-08: the provider `review_run` appends to the panel on a `"high"` `cortex_review` band (unwaived, room in the panel, not `adversarial_pair`). Must be one of `review::ALLOWED_PROVIDERS`; an invalid value degrades the escalation attempt (`escalation_degraded:true`) rather than erroring the whole call. Blank/unset falls back to the default. |
 | `ATLAS_DATABASE_URL` | secret-shaped | none | Read exclusively through `crate::config::atlas_database_url()` — this crate has no separate `SecretManager`/`vault::manager()` API of its own; the runtime secret store is materialized into the process environment at deploy time (same convention as `crate::pki` and `scribe::graph::vec_embed`). `None` means the Atlas KG store is not configured (`cortex_scope`/`cortex_review` still degrade cleanly in this case, via `GraphStore`/`ScribeConfig`'s own `SCRIBE_KG_STORE_DIR`, which is independent of the Postgres DSN; `cortex_review`'s `FindingsStore` connection is a SEPARATE consumer of this same DSN, degrading independently to `findings:"unavailable"`; `cortex_audit`'s transient graph never touches this DSN at all — it is never saved to `GraphStore`). |
 | `EMBEDDINGS_URL` / `EMBEDDINGS_MODEL` / `EMBEDDINGS_TIMEOUT_MS` / `EMBEDDINGS_API_KEY` | see `crate::config` / `scribe::graph::vec_embed` | see `crate::config` | Not read by this module directly — `cortex_house_style`'s (CXEG-06) exemplar selection goes through the SAME `EmbedClient::from_env()` `metrics`'s semantic-duplication detector and `scribe_kg_build` already use. An unreachable/misconfigured endpoint degrades that bucket to centrality-only ranking (`degraded:true`), never an error. |
 
@@ -722,9 +859,10 @@ arguments — the pointer is returned unconditionally.
 one shared `Arc<house_style::HouseStyleCache>` (CXEG-06 — a single cache
 instance across every `cortex_house_style` call, so its per-generation
 memoization actually accumulates hits rather than starting empty each call),
-registers the 4 real tools against them (`cortex_scope` live as of CXEG-02;
+registers the 5 real tools against them (`cortex_scope` live as of CXEG-02;
 `cortex_house_style` live as of CXEG-06; `cortex_review` live as of CXEG-04;
-`cortex_audit` live as of CXEG-11), then delegates to
+`cortex_audit` live as of CXEG-11; `cortex_waive` live as of CXEG-08 --
+stateless, no shared config needed), then delegates to
 `crate::cortex::deprecated::register()` for the 7 aliases. Cortex is wired
 into **both** top-level registries in `src/registry.rs`: `register_all` (the
 core registry, served by `terminus-primary`/Chord) and `register_personal`

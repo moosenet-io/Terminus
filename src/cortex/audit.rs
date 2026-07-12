@@ -648,6 +648,8 @@ mod tests {
             audit_clone_timeout_secs: 30,
             audit_max_clone_bytes: 200_000_000,
             crystallize_min_recurrence: crate::cortex::crystallize::DEFAULT_MIN_RECURRENCE,
+            escalation_enabled: true,
+            escalation_add_provider: "agy".to_string(),
         }
     }
 

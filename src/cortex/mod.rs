@@ -41,15 +41,16 @@
 //!   transient graph build + CXEG-03 structural scoring (see `audit.rs`'s
 //!   `run_audit` and the "Tool: cortex_audit" section below).
 //!
-//! Net result: this module registers 12 tool NAMES total (the 10 from before
+//! Net result: this module registers 13 tool NAMES total (the 10 from before
 //! CXEG-06, plus `cortex_house_style` added live in **CXEG-06**, plus
-//! `cortex_crystallize` added live in **CXEG-09**). Of those, `cortex_scope`
-//! (CXEG-02), `cortex_review` (CXEG-04), `cortex_audit` (CXEG-11),
-//! `cortex_house_style` (CXEG-06), and `cortex_crystallize` (CXEG-09) are all
-//! real, live Atlas-backed tools; and the other 7 are pure deprecation
-//! aliases with no backend at all. `test_cortex_tools_registered` below
-//! asserts this shape (12 names present), not the old 10-live-relay-tools
-//! implementation.
+//! `cortex_waive` added live in **CXEG-08**, plus `cortex_crystallize` added
+//! live in **CXEG-09**). Of those, `cortex_scope` (CXEG-02), `cortex_review`
+//! (CXEG-04), `cortex_audit` (CXEG-11), `cortex_house_style` (CXEG-06),
+//! `cortex_waive` (CXEG-08), and `cortex_crystallize` (CXEG-09) are all real,
+//! live tools (the Atlas-backed ones plus `cortex_waive`/`cortex_crystallize`,
+//! both KGFIND-backed); the other 7 are pure deprecation aliases with no
+//! backend at all. `test_cortex_tools_registered` below asserts this shape
+//! (13 names present), not the old 10/11/12-live-tool implementations.
 //!
 //! ## CXEG-09: `cortex_crystallize` — recurrence + adversarial rule crystallization
 //!
@@ -67,6 +68,21 @@
 //! generic enforcement-level rules across ANY category; this one is scoped
 //! specifically to consistency/elegance findings and always emits a
 //! CXEG-05-shaped artifact, never a `kg_rules` row).
+//!
+//! ## CXEG-08: `review_run`'s Stage-5b risk-gate escalation + `cortex_waive`
+//!
+//! `src/cortex/waiver.rs` adds `cortex_waive` (record a tracked, mandatory-
+//! reason waiver against a gate rule) and `waiver::active_waiver` (the
+//! matching lookup), both against the SAME KGFIND-01 `FindingsStore` every
+//! other finding-shaped tool in this crate already uses (`category:
+//! "waiver"`, no new database, S9). `review::mod::maybe_escalate` consumes
+//! `cortex_review`'s band + `active_waiver` to widen `review_run`'s
+//! dispatched provider panel on a `"high"` band, PURELY as a pre-dispatch
+//! panel-widening step -- it never reads or sets `aggregate_verdict`/
+//! `complete`, so risk cannot itself flip a verdict. See
+//! `docs/tools/code-git/cortex.md`'s "`review_run`'s Stage-5b risk-gate
+//! escalation + `cortex_waive` (CXEG-08)" section and `README.md`'s matching
+//! section for the full decision table and response shapes.
 //!
 //! ## CXEG-06: `cortex_house_style` — Atlas-derived house-style exemplars
 //!
@@ -124,6 +140,7 @@ pub mod house_style;
 pub mod metrics;
 pub mod review;
 pub mod scope;
+pub mod waiver;
 
 use audit::validate_repo_url;
 use crate::scribe::graph::store::GraphStore;
@@ -268,6 +285,25 @@ pub struct CortexConfig {
     /// artifact type, a lint stub or house-style doc rule, not a `kg_rules`
     /// row).
     pub crystallize_min_recurrence: i32,
+    /// CXEG-08: master switch for `review_run`'s Stage-5b risk-gate
+    /// escalation (`review::mod`'s pre-dispatch panel-widening on a `high`
+    /// `cortex_review` band). When `false`, `review_run` never consults
+    /// `cortex_review`/waivers for escalation at all -- byte-for-byte the
+    /// pre-CXEG-08 dispatch path, plus one additive
+    /// `"escalation": {"escalated": false, "reason": "disabled"}` field.
+    /// From `CORTEX_ESCALATION_ENABLED`, default `true`. This flag ONLY gates
+    /// the escalation/waiver governance layer -- it never gates
+    /// `cortex_review`/`cortex_waive` themselves, which remain independently
+    /// callable.
+    pub escalation_enabled: bool,
+    /// CXEG-08: the provider `review_run` adds to the panel when escalating
+    /// (a `high` `cortex_review` band, not actively waived). Must be one of
+    /// `review::ALLOWED_PROVIDERS`; an invalid value degrades the escalation
+    /// attempt (`escalation_degraded:true`, base panel proceeds -- see
+    /// `review::mod`'s `maybe_escalate`) rather than panicking or erroring
+    /// the whole `review_run` call. From `CORTEX_ESCALATION_ADD_PROVIDER`,
+    /// default `"agy"`.
+    pub escalation_add_provider: String,
 }
 
 impl CortexConfig {
@@ -292,8 +328,21 @@ impl CortexConfig {
             audit_clone_timeout_secs: env_u64("CORTEX_AUDIT_CLONE_TIMEOUT_SECS", 60),
             audit_max_clone_bytes: env_u64("CORTEX_AUDIT_MAX_CLONE_BYTES", 200_000_000),
             crystallize_min_recurrence: env_i32("CORTEX_CRYSTALLIZE_MIN_RECURRENCE", crystallize::DEFAULT_MIN_RECURRENCE),
+            escalation_enabled: env_flag("CORTEX_ESCALATION_ENABLED", true),
+            escalation_add_provider: env_string("CORTEX_ESCALATION_ADD_PROVIDER", "agy"),
         }
     }
+}
+
+/// Read a non-secret string tuning flag; falls back to `default` when unset
+/// or blank (matching `env_usize`/`env_u64`'s "blank/zero is never the
+/// intent of a real override" convention).
+fn env_string(key: &str, default: &str) -> String {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_string())
 }
 
 /// Read a non-secret unsigned 64-bit tuning flag; falls back to `default`
@@ -358,7 +407,11 @@ fn env_i32(key: &str, default: i32) -> i32 {
 
 /// Validate a `project_id` against [`PROJECT_IDS`], replacing the old
 /// fleet-host repo-name allowlist and its validation helper.
-fn validate_project_id(project_id: &str) -> Result<(), ToolError> {
+///
+/// `pub(crate)` (was module-private): CXEG-08's `waiver::CortexWaive` reuses
+/// this directly rather than re-declaring the `PROJECT_IDS` validation a
+/// second time (S9).
+pub(crate) fn validate_project_id(project_id: &str) -> Result<(), ToolError> {
     if PROJECT_IDS.contains(&project_id) {
         Ok(())
     } else {
@@ -379,7 +432,10 @@ fn validate_text_len(s: &str, field: &str) -> Result<(), ToolError> {
     }
 }
 
-fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, ToolError> {
+/// `pub(crate)` (was module-private): CXEG-08's `waiver::CortexWaive` reuses
+/// this directly rather than re-declaring required-string-argument extraction
+/// a second time (S9).
+pub(crate) fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, ToolError> {
     args[field]
         .as_str()
         .ok_or_else(|| ToolError::InvalidArgument(format!("'{field}' must be a string")))
@@ -743,13 +799,14 @@ impl RustTool for CortexHouseStyle {
 // Registration
 // ---------------------------------------------------------------------------
 
-/// Register all Cortex tools into the ToolRegistry: the 4 "real" tools
+/// Register all Cortex tools into the ToolRegistry: the 5 "real" tools
 /// (`cortex_scope` — live Atlas-backed blast radius as of CXEG-02;
 /// `cortex_house_style` — live Atlas-derived house-style exemplars as of
 /// CXEG-06; `cortex_review` — live Atlas-backed risk scoring as of CXEG-04;
-/// `cortex_audit` — live Atlas-backed external-repo audit as of CXEG-11)
-/// plus the 7 deprecation aliases for the retired pure-relay tools (see
-/// [`deprecated`]).
+/// `cortex_audit` — live Atlas-backed external-repo audit as of CXEG-11;
+/// `cortex_waive` — waiver recording as of CXEG-08; `cortex_crystallize` —
+/// rule crystallization loop as of CXEG-09) plus the 7 deprecation aliases
+/// for the retired pure-relay tools (see [`deprecated`]).
 pub fn register(registry: &mut ToolRegistry) {
     let config = Arc::new(CortexConfig::from_env());
     let house_style_cache = Arc::new(house_style::HouseStyleCache::new());
@@ -765,6 +822,7 @@ pub fn register(registry: &mut ToolRegistry) {
         config: Arc::clone(&config),
     }));
     let _ = registry.register(Box::new(CortexAudit { config }));
+    let _ = registry.register(Box::new(waiver::CortexWaive));
 
     // CXEG-09: rule crystallization loop (kg_findings recurrence + adversarial
     // review_run panel_majority promotion -> lint stub / prose house rule).
@@ -802,6 +860,8 @@ mod tests {
             audit_clone_timeout_secs: 60,
             audit_max_clone_bytes: 200_000_000,
             crystallize_min_recurrence: crystallize::DEFAULT_MIN_RECURRENCE,
+            escalation_enabled: true,
+            escalation_add_provider: "agy".to_string(),
         })
     }
 
@@ -1147,17 +1207,20 @@ mod tests {
     fn test_cortex_tools_registered() {
         let mut registry = ToolRegistry::new();
         register(&mut registry);
-        // 4 "real" tools (cortex_scope live since CXEG-02, cortex_review
-        // live since CXEG-04, cortex_audit live since CXEG-11, and
-        // cortex_house_style live since CXEG-06) + 7 deprecation aliases
-        // = 11 names — the pre-CXEG-06 10-name surface plus CXEG-06's new
-        // `cortex_house_style` (an intentional, additive MCP-listing change).
-        assert_eq!(registry.len(), 12);
+        // 6 "real" tools (cortex_scope live since CXEG-02, cortex_review
+        // live since CXEG-04, cortex_audit live since CXEG-11,
+        // cortex_house_style live since CXEG-06, cortex_waive live since
+        // CXEG-08, cortex_crystallize live since CXEG-09) + 7 deprecation
+        // aliases = 13 names — the pre-CXEG-08 11-name surface plus CXEG-08's
+        // `cortex_waive` and CXEG-09's `cortex_crystallize` (both intentional,
+        // additive MCP-listing changes).
+        assert_eq!(registry.len(), 13);
         for name in [
             "cortex_scope",
             "cortex_house_style",
             "cortex_review",
             "cortex_audit",
+            "cortex_waive",
             "cortex_crystallize",
             "cortex_stats",
             "cortex_build",
