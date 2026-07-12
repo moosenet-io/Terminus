@@ -767,11 +767,20 @@ Its risk/elegance surface is rebuilt over the following S115 items:
   into `cortex_review`'s response (that wiring is CXEG-04's job); see
   `docs/tools/code-git/cortex.md`'s "Tier-B structural-elegance signals"
   section for the full signal catalog.
-- `cortex_audit` — audit an external public repo URL (stub pending **CXEG-11**);
-  its SSRF-hardened `validate_repo_url` front-gate (`src/cortex/audit.rs`) is
-  live now — it rejects non-http(s) schemes, embedded credentials, shell
-  metacharacters, and loopback/private/link-local/metadata hosts in their
-  common obfuscated encodings (fail-closed).
+- `cortex_audit` — audit an external public repo URL, live as of **CXEG-11**:
+  `url` first passes the unchanged SSRF-hardened `validate_repo_url`
+  front-gate (`src/cortex/audit.rs`) — it rejects non-http(s) schemes,
+  embedded credentials, shell metacharacters, and loopback/private/link-local
+  /metadata hosts in their common obfuscated encodings (fail-closed) — then
+  the tool clones the url into an isolated, always-cleaned-up scratch
+  directory (shallow, no submodules, no repo code ever executes), statically
+  extracts a transient (never persisted) Atlas graph via the same
+  `build_rust_graph`/`walk_rs` path `scribe_kg_build` uses, runs the CXEG-03
+  structural-elegance detectors (`metrics::compute_structural_signals`) over
+  the whole repo, and returns a report before deleting the clone. Clone size
+  and time are bounded (`CORTEX_AUDIT_MAX_CLONE_BYTES` /
+  `CORTEX_AUDIT_CLONE_TIMEOUT_SECS`) — an oversized or slow clone is refused,
+  not silently truncated.
 
 The seven retired graph-relay tools are kept only as zero-I/O **deprecation
 aliases** (`src/cortex/deprecated.rs`) that return a structured

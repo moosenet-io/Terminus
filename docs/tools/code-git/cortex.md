@@ -1,12 +1,13 @@
 [← docs index](../../README.md)
 
-# Cortex — Atlas-backed code-intelligence gate (CXEG-01/02)
+# Cortex — Atlas-backed code-intelligence gate (CXEG-01/02/11)
 
 Cortex is a 10-tool-name module (`src/cortex/mod.rs`, `src/cortex/scope.rs`,
 `src/cortex/deprecated.rs`, `src/cortex/audit.rs`), but as of **CXEG-01** only
 3 of those names are "real" tools — the rest are structured deprecation
-aliases. As of **CXEG-02**, `cortex_scope` is the first of those 3 to be a
-fully live, Atlas-backed implementation rather than a pending-pointer stub.
+aliases. Of those 3, `cortex_scope` (**CXEG-02**) and `cortex_audit`
+(**CXEG-11**) are now fully live, Atlas-backed implementations rather than
+pending-pointer stubs; `cortex_review` remains a stub pending **CXEG-04**.
 This page describes the current shape; see the "History" section at the
 bottom for what changed and why.
 
@@ -27,7 +28,7 @@ no remote script, no "relay whatever the other end says" response shape.
 | --- | --- | --- |
 | `cortex_scope` | **live (CXEG-02)** | Resolves `project_id` + `changed_files`/`diff` against the project's Atlas graph and returns the blast radius: touched symbols, their 1-hop callers/callees, affected communities, `blast_count`, `token_reduction_pct`. Degrades to `configured:false` (no error) when the project has no stored graph. |
 | `cortex_review` | **pending rebuild (CXEG-04)** | Validates `project_id`/`changed_files`, returns `{"status":"pending","item":"CXEG-04",...}`. No risk scoring happens yet. |
-| `cortex_audit` | **pending rebuild (CXEG-11)** | Runs its existing SSRF-hardened `url` validation (unchanged, see below), then returns `{"status":"pending","item":"CXEG-11",...}`. No clone/graph-build happens yet. |
+| `cortex_audit` | **live (CXEG-11)** | Runs its existing SSRF-hardened `url` validation (unchanged, see below), clones `url` into an isolated scratch dir, builds a transient Atlas graph, runs the CXEG-03 structural detectors, and returns a report — see below. |
 | `cortex_stats` | **deprecated alias** | Returns `{"deprecated":true,"use":"kg_stats",...}`. Call `kg_stats` instead. |
 | `cortex_build` | **deprecated alias** | Returns `{"deprecated":true,"use":"scribe_kg_build",...}`. Call `scribe_kg_build` instead. |
 | `cortex_deps` | **deprecated alias** | Returns `{"deprecated":true,"use":"kg_neighbors",...}`. Call `kg_neighbors` instead. |
@@ -288,43 +289,102 @@ consumes it yet.
 **In the meantime**: call `kg_findings` / `kg_query` directly against the
 Atlas KG.
 
-## `cortex_audit` — the one tool that still does real validation work
+## `cortex_audit` — external-repo structural-elegance audit (CXEG-11)
 
 **Input schema**: `url` (string, required) — a public git repository URL,
 e.g. `"https://github.com/owner/repo"`.
 
+**Clone-feasibility decision (CXEG-11)**: no sanctioned "clone an arbitrary
+public URL" tool exists in this crate — `crate::forge`'s `git_public`/
+`git_private` tools speak a fixed, credentialed, per-provider REST API
+surface (repos/issues/PRs/...) against a configured pool member, never a raw
+`git clone <arbitrary-url>`. This tool's designed operation (audit an
+operator-supplied external repo) is exactly what a scoped, isolated clone is
+*for*, so CXEG-11 rebuilds it on a `std::process::Command`-driven `git clone`
+into a scratch directory with guaranteed cleanup, rather than retiring the
+tool. This is a narrower, more contained blast radius than the retired
+SSH-relay era ever had — that implementation didn't even clone locally, it
+shipped the URL to a remote fleet-host script and trusted whatever came back.
+
 **Behavior**: `url` passes through the **unchanged**, SSRF-hardened
-`validate_repo_url()` front-gate (`src/cortex/audit.rs` — this file was not
-touched by CXEG-01; it has no dependency on the deleted SSH transport). Only
-`http`/`https` URLs to public, non-private/loopback/link-local/metadata hosts
-are accepted — see `audit.rs`'s own doc comments for the full numeric-host
-SSRF-hardening rationale (decimal-integer, hex, octal-leading-zero, shorthand
-dotted-quad, and IPv4-mapped-IPv6 encodings of loopback/private addresses are
-all rejected, fail-closed). Once a `url` passes validation, `execute` returns:
+`validate_repo_url()` front-gate (`src/cortex/audit.rs` — this function was
+not touched by CXEG-01 or CXEG-11; it has no dependency on the deleted SSH
+transport or the new clone backend). Only `http`/`https` URLs to public,
+non-private/loopback/link-local/metadata hosts are accepted — see `audit.rs`'s
+own doc comments for the full numeric-host SSRF-hardening rationale
+(decimal-integer, hex, octal-leading-zero, shorthand dotted-quad, and
+IPv4-mapped-IPv6 encodings of loopback/private addresses are all rejected,
+fail-closed).
+
+Once `url` passes validation, `execute` runs the CXEG-11 pipeline
+(`audit::run_audit`):
+
+1. **Isolated scratch clone** (`ScratchClone`): `git clone --depth 1
+   --single-branch --no-tags --no-recurse-submodules --config
+   core.hooksPath=/dev/null <url> <scratch>/repo`, run with an isolated
+   `$HOME`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`,
+   `GIT_TERMINAL_PROMPT=0`, and a no-op `GIT_ASKPASS` (no operator credential
+   helper, gitconfig, or stored token is ever reachable from the subprocess;
+   an auth-walled URL fails fast instead of hanging). Bounded by
+   `CORTEX_AUDIT_CLONE_TIMEOUT_SECS` (default 60s) — past that the subprocess
+   is killed. The scratch directory is removed on **every** exit path —
+   success, an early error return, or an unwinding panic — via `Drop`.
+2. **Size ceiling**: the clone's on-disk size is measured (without following
+   symlinks) and checked against `CORTEX_AUDIT_MAX_CLONE_BYTES` (default
+   200MB, `InvalidArgument` if exceeded) *before* any graph build is
+   attempted.
+3. **Static extraction only, no repo code ever executes**: the same
+   `walk_rs` (now `pub(crate)`, shared with `scribe_kg_build`) +
+   `build_rust_graph` path scans allowlisted-extension files with
+   `fs::read_to_string` and parses them with tree-sitter — no build scripts,
+   no `cargo`/`npm`/interpreter invocation, no import resolution that would
+   need to load foreign code. The resulting graph is clustered (`cluster`)
+   and ranked (`pagerank`) exactly like a real `scribe_kg_build`, but is
+   **never** passed to `GraphStore::save` and never given a real
+   `project_id` — it's transient, in-process, and gone when the function
+   returns.
+4. **CXEG-03 structural detectors**: every (capped at
+   `CORTEX_MAX_BLAST_NODES`) current node is treated as "touched" — a
+   whole-repo audit has no diff to scope to — and passed to
+   `metrics::compute_structural_signals` (the sync, no-vector-store subset of
+   the CXEG-03 engine: `centrality_spike`, `complexity_spike`,
+   `fan_out_explosion`, `community_boundary_crossing`).
+   `semantic_duplication` is deliberately **not** run here — it compares a
+   node's embedding against the PROJECT's own persisted vector-store rows,
+   and this graph is intentionally never persisted or embedded (embedding +
+   storing vectors for an arbitrary external repo would leak its content
+   into local infrastructure state, exactly what "transient" is meant to
+   avoid).
+
+Successful response shape:
 
 ```json
 {
-  "status": "pending",
-  "item": "CXEG-11",
+  "status": "complete",
   "tool": "cortex_audit",
-  "url": "https://github.com/octocat/Hello-World",
-  "message": "cortex_audit's SSH-relay-era backend has been retired; a locally-sandboxed clone + Atlas-build implementation lands in CXEG-11. The url has passed SSRF-hardened validation but no audit has been performed.",
-  "dup_cosine_threshold": 0.85
+  "url": "https://github.com/owner/repo",
+  "stats": {
+    "nodes": 128,
+    "edges": 340,
+    "clusters": 6,
+    "files_scanned": 41,
+    "file_scan_cap_hit": false,
+    "signal_scope_cap_hit": false,
+    "clone_bytes": 934112
+  },
+  "signals": [ /* EleganceSignal[] — see metrics.rs / the Tier-B section above */ ],
+  "signal_count": 3
 }
 ```
-
-**No clone, no graph build, no HTML report generation happens yet** — CXEG-11
-is expected to rebuild this as a locally-sandboxed clone + Atlas KG build,
-replacing the old remote-script relay entirely (the retired implementation
-never actually performed the clone in this process either — it delegated
-that to the remote fleet-host script, so this is not a regression in local
-sandboxing, just a currently-unimplemented rebuild).
 
 **Error/edge cases**: `InvalidArgument` for any URL rejected by
 `validate_repo_url` (empty, oversized, wrong scheme, embedded credentials,
 shell metacharacters, whitespace/control chars, or a disallowed host) — all
-caught before the stub response is built, so a malicious/malformed URL never
-gets even a pending-pointer response, only a rejection.
+caught before the clone is even attempted. Also `InvalidArgument` for a clone
+that exceeds `CORTEX_AUDIT_MAX_CLONE_BYTES`, or a repo with no
+allowlisted-extension source files at all. `Execution` for a clone that fails
+outright or exceeds `CORTEX_AUDIT_CLONE_TIMEOUT_SECS`. In every case the
+scratch directory is still removed.
 
 ## Configuration
 
@@ -337,10 +397,12 @@ gets even a pending-pointer response, only a rejection.
 | `CORTEX_ENABLE_TIER_B` | bool | `false` | Feature flag for a not-yet-built Tier B analysis pass. No longer consumed by `cortex_scope` as of CXEG-02 (the pending stub used to echo it). |
 | `CORTEX_ENABLE_TIER_C` | bool | `false` | Feature flag for a not-yet-built Tier C analysis pass. |
 | `CORTEX_ELEGANCE_ADVISORY_ONLY` | bool | `true` | Whether elegance/style findings are advisory-only; echoed in `cortex_review`'s response. |
-| `CORTEX_DUP_COSINE_THRESHOLD` | f64 | `0.85` | Cosine-similarity threshold for a not-yet-built dup-detection pass; echoed in `cortex_audit`'s response. |
-| `CORTEX_MAX_BLAST_NODES` | usize | `200` | `cortex_scope`'s (CXEG-02) cap on the number of nodes enumerated into `blast_radius` before it sets `truncated:true` and stops walking. A zero/unparseable value falls back to the default rather than dropping every node. |
+| `CORTEX_DUP_COSINE_THRESHOLD` | f64 | `0.85` | Cosine-similarity threshold for `metrics::compute_signals`'s `semantic_duplication` detector. Not used by `cortex_audit` (CXEG-11) — that pipeline runs `compute_structural_signals`, the subset with no vector-store dependency. |
+| `CORTEX_MAX_BLAST_NODES` | usize | `200` | `cortex_scope`'s (CXEG-02) cap on the number of nodes enumerated into `blast_radius` before it sets `truncated:true` and stops walking. Also reused by `cortex_audit` (CXEG-11) as the cap on how many of a cloned repo's nodes are scored (`signal_scope_cap_hit`). A zero/unparseable value falls back to the default rather than dropping every node. |
 | `CORTEX_TIER_B_PERCENTILE` | f64 | `90.0` | `metrics::compute_signals`'s (CXEG-03) percentile cut-point (0-100) for `centrality_spike`/`complexity_spike`/`fan_out_explosion`, computed against the project's own current-node distribution — self-calibrating, never a hardcoded absolute. |
-| `ATLAS_DATABASE_URL` | secret-shaped | none | Read exclusively through `crate::config::atlas_database_url()` — this crate has no separate `SecretManager`/`vault::manager()` API of its own; the runtime secret store is materialized into the process environment at deploy time (same convention as `crate::pki` and `scribe::graph::vec_embed`). `None` means the Atlas KG store is not configured (`cortex_scope` still degrades cleanly in this case, via `GraphStore`/`ScribeConfig`'s own `SCRIBE_KG_STORE_DIR`, which is independent of the Postgres DSN). |
+| `CORTEX_AUDIT_CLONE_TIMEOUT_SECS` | u64 | `60` | `cortex_audit`'s (CXEG-11) wall-clock ceiling on the isolated `git clone` of an external audit target; past this the subprocess is killed and the scratch dir is still cleaned up. A zero/unparseable value falls back to the default. |
+| `CORTEX_AUDIT_MAX_CLONE_BYTES` | u64 | `200000000` (200MB) | `cortex_audit`'s (CXEG-11) byte ceiling on a cloned external repo, measured after clone and before any graph build; exceeding it is an `InvalidArgument`, not a silent truncation. A zero/unparseable value falls back to the default. |
+| `ATLAS_DATABASE_URL` | secret-shaped | none | Read exclusively through `crate::config::atlas_database_url()` — this crate has no separate `SecretManager`/`vault::manager()` API of its own; the runtime secret store is materialized into the process environment at deploy time (same convention as `crate::pki` and `scribe::graph::vec_embed`). `None` means the Atlas KG store is not configured (`cortex_scope` still degrades cleanly in this case, via `GraphStore`/`ScribeConfig`'s own `SCRIBE_KG_STORE_DIR`, which is independent of the Postgres DSN; `cortex_audit`'s transient graph never touches this DSN at all — it is never saved to `GraphStore`). |
 
 Boolean flags accept `"1"`/`"true"`/`"yes"` (case-insensitive) as truthy;
 anything else (including unset) falls back to the default.
@@ -462,6 +524,17 @@ stub with the real Atlas-backed blast-radius implementation described above
 and the same `GraphStore`/`KnowledgeGraph` query API `kg_neighbors`/
 `build_kg_block` already use rather than standing up a second graph-walk.
 `cortex_review`/`cortex_audit` remain pending CXEG-04/CXEG-11.
+
+**CXEG-11** then replaced `cortex_audit`'s pending-pointer stub with a real
+Atlas-backed external-repo audit: an isolated, always-cleaned-up
+`ScratchClone` (a scoped `std::process::Command` git clone — no sanctioned
+"clone an arbitrary public URL" tool exists in this crate, so this is the
+sanctioned fallback for exactly this tool's designed operation) feeds the
+same `walk_rs`/`build_rust_graph` extraction `scribe_kg_build` uses to build
+a transient, never-persisted graph, which CXEG-03's
+`metrics::compute_structural_signals` scores. `validate_repo_url` — already
+the strongest piece of this module — is untouched. `cortex_review` remains
+pending CXEG-04.
 
 ---
 
