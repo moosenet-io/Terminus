@@ -202,6 +202,14 @@ tower = { version = "0.4", features = ["util"] }
 # `CONSTELLATION_WEB_DIST_DIR` is configured). Feature-only addition to an
 # already-present dependency, not a new crate.
 tower-http = { version = "0.5", features = ["trace", "fs"] }
+# CONST-15: embeds the committed `constellation-web/dist` production build
+# directly into the `terminus_primary` binary at cargo-build time (see
+# `src/constellation/assets.rs`), so the build-on-dest pipeline needs no
+# npm/node toolchain to ship the UI. `mime_guess` resolves the correct
+# Content-Type per embedded asset extension for `src/constellation/mod.rs`'s
+# embedded-asset serving path.
+rust-embed = "8.5"
+mime_guess = "2.0"
 # S100 (TERM): distributed Redis-backed Plane GET cache + rate limiter.
 # connection-manager gives a multiplexed, auto-reconnecting async connection;
 # `script` powers the atomic distributed rate-limiter Lua reservation.

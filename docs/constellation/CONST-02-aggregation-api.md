@@ -30,7 +30,7 @@ contract:
 | `* /api/chord/*path` | `constellation::proxy::proxy_chord` | namespaced passthrough |
 | `* /api/lumina/*path` | `constellation::proxy::proxy_lumina` | namespaced passthrough |
 | `GET /ws` | `constellation::handle_ws_stub` | scaffold only — `501`, real relay is a follow-up item |
-| `GET /*` (fallback) | `ServeDir`/`ServeFile` | the built `constellation-web` SPA, when `CONSTELLATION_WEB_DIST_DIR` is set |
+| `GET /*` (fallback) | `assets::WebAssets` embedded assets, or `ServeDir`/`ServeFile` when `CONSTELLATION_WEB_DIST_DIR` is set | the built `constellation-web` SPA — CONST-15: served from assets embedded in the binary by default; `CONSTELLATION_WEB_DIST_DIR` is now an optional filesystem dev override, not required for the UI to be served |
 
 ## Architecture notes
 
