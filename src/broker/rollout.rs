@@ -1,0 +1,682 @@
+//! TMOD-06: health-gated blue-green rollout + rollback for a worker UPDATE.
+//!
+//! Before this item, [`crate::broker::control`]'s `register_verified_transport`
+//! treated re-registering an ALREADY-PRESENT worker exactly like a first-ever
+//! registration: connect + health-probe + `list()`-verify the new instance,
+//! then [`crate::broker::routes::RouteTable::replace_worker`] straight over
+//! the old one. That is safe against a worker that's dead *at registration
+//! time* (the pre-flip gate refuses it), but not against one that passes the
+//! gate and then goes bad moments later (a bad build that boots, answers one
+//! health probe, then wedges) — the old, known-good instance was already
+//! gone by the time that showed up.
+//!
+//! This module closes that gap with a blue-green flip: the new instance is
+//! routed in atomically WHILE the previous instance's routes are retained as
+//! rollback state, then watched over a bounded post-flip health window
+//! before the previous instance is finally let go. States mirror the fleet's
+//! `constellation-updater` gate/rollback pattern (stage a new version, gate
+//! it, roll back on failure) — see this crate's sibling `constellation-updater`
+//! repo for the model this follows:
+//!
+//! ```text
+//! Staging ──(pre-flip gate: connect+health+list, done by the CALLER)──> flip
+//!    flip ──(atomic swap, previous retained)──> Live
+//!    Live ──(post-flip health window: N consecutive probes)──┬─> pass ─> RetiredPrevious
+//!                                                             └─> fail ─> RolledBack
+//! ```
+//!
+//! ## Flip: atomic, previous retained
+//! [`rollout_worker`] flips via
+//! [`RouteTable::replace_worker_with_rollback`] — ONE `rcu` swap that
+//! installs `new_routes` for `worker_id` AND hands back whatever routes it
+//! just displaced (the worker's previous instance, or empty on a first-ever
+//! registration). A reader's `RouteTable::load()` never observes a mix of
+//! old and new routes for the worker (TMOD-04's no-tearing guarantee, which
+//! this item relies on rather than re-implements) — every in-flight call
+//! either dispatches against the pre-flip snapshot (old instance) or a
+//! post-flip one (new instance), never both.
+//!
+//! ## Post-flip health window: bounded, fail-closed on any flap
+//! [`POST_FLIP_HEALTH_CHECKS`] consecutive [`WorkerTransport::health`]
+//! probes, each individually bounded by
+//! [`crate::broker::routes::HEALTH_PROBE_TIMEOUT`] (same budget every other
+//! health check in this crate uses — a probe that hangs is a failed probe,
+//! never a stall). ANY single failed probe in the window fails the whole
+//! rollout — this is deliberately "N of N", not "N of M": a worker that
+//! flaps during its own post-flip window is exactly the case this item
+//! exists to catch, so treating a flap as a pass would defeat the point.
+//!
+//! ## Rollback: atomic, generation-guarded, ABA-safe
+//! Each flip stamps a monotonic per-worker GENERATION (see
+//! [`RouteTable::replace_worker_with_rollback`]); this rollout captures the
+//! one its own flip stamped. On a failed window,
+//! [`RouteTable::restore_worker_if_unchanged`] restores the previous
+//! instance's routes (or, if there was no previous instance, removes the
+//! failed routes entirely — fail SAFE, never leave a route pointing at a
+//! proven-bad instance) IN THE SAME ATOMIC SWAP that checks the worker's
+//! CURRENT owning generation still equals this rollout's. If it doesn't —
+//! because `handle_deregister` removed the worker (dropping its generation),
+//! or a NEWER rollout already superseded this one (stamping a greater
+//! generation) while this window was running — the restore is a clean no-op:
+//! no orphaned `previous` snapshot is ever written back over a state this
+//! rollout no longer owns.
+//!
+//! Guarding on the generation rather than on route values (or `Arc::ptr_eq`)
+//! is what makes this ABA-safe: a competing rollout could flip the worker
+//! AWAY to another instance and a later one flip it BACK to a byte-identical
+//! (even same-`Arc`) route set, which a value/pointer comparison would
+//! wrongly accept as "unchanged" — but every intervening flip draws a
+//! strictly-greater generation, so this rollout's now-stale token can never
+//! match again.
+//!
+//! ## Flip-then-verify: the accepted in-window trade-off
+//! This is a flip-THEN-verify model: the pre-flip gate
+//! (`control::register_verified_transport`'s connect + bounded health probe
+//! + `list()`-verify) makes the new instance healthy AT flip time, the
+//! post-flip window then catches a subsequent regression and rolls back
+//! atomically. A narrow window does exist where a call landing AFTER the
+//! flip but BEFORE a rollback can hit the just-regressed new instance —
+//! that is the accepted trade-off, not a bug: fully avoiding it would
+//! require dual-routing one tool name to both the old and new instance
+//! simultaneously and reconciling their answers, which the flat one-route-
+//! per-name table cannot express. The window is short, the pre-flip gate
+//! makes a healthy-at-flip instance the norm, and rollback is atomic.
+//!
+//! ## Degraded state (both old and new unhealthy)
+//! If a rollback's restored "previous" instance turns out to *also* be
+//! unhealthy (e.g. both instances share a common outage), this module does
+//! not paper over that: `RouteTable`'s per-call/per-list live health check
+//! (unchanged from TMOD-04) means every subsequent `tools/call`/`tools/list`
+//! against that worker still answers a clean "unavailable" rather than
+//! silently routing to (or claiming success from) a dead instance. Rollback
+//! restores the LAST-KNOWN-GOOD route identity, not a health guarantee.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use super::routes::{RouteTable, WorkerRoute, HEALTH_PROBE_TIMEOUT};
+use super::transport::WorkerTransport;
+
+/// Rollout state machine. Mirrors `constellation-updater`'s gate/rollback
+/// states:
+/// - `Staging` — the new instance is up but not yet routed to any traffic;
+///   this state is owned by the CALLER (`control::register_verified_transport`'s
+///   connect + bounded health probe + `list()`-verify), not this module —
+///   included here only so the full lifecycle is named in one place.
+/// - `Live` — the new instance has been flipped in and is currently serving
+///   (whether or not its post-flip window has finished).
+/// - `RolledBack` — the post-flip window failed; traffic is back on the
+///   previous instance (or, with no previous instance, removed entirely).
+/// - `RetiredPrevious` — the post-flip window passed; the previous instance
+///   has been let go and the new instance is the sole route.
+/// - `Superseded` — the window PASSED, but by the time it resolved this
+///   rollout no longer owned the worker: a deregister removed it, or a newer
+///   rollout replaced it, mid-window. Nothing is mutated (whoever intervened
+///   already owns the state) and the caller must NOT record success/metadata
+///   for a registration that no longer stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RolloutState {
+    Staging,
+    Live,
+    RolledBack,
+    RetiredPrevious,
+    Superseded,
+}
+
+/// Number of consecutive post-flip health probes the new instance must ALL
+/// pass before its previous instance is retired. Fixed and small (not a
+/// long wall-clock soak) so a rollout resolves quickly and tests stay fast
+/// and deterministic — a genuinely flapping worker fails this window on its
+/// first bad probe (fail-closed), it does not get "best of N" chances.
+pub const POST_FLIP_HEALTH_CHECKS: usize = 3;
+
+/// Interval between consecutive post-flip probes — long enough to give a
+/// truly-wedging instance a moment to show it (rather than probing the same
+/// instant three times back-to-back), short enough that a rollout resolves
+/// well within a caller's request timeout.
+pub const POST_FLIP_HEALTH_INTERVAL: Duration = Duration::from_millis(10);
+
+/// The outcome of one [`rollout_worker`] call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RolloutOutcome {
+    pub worker_id: String,
+    pub state: RolloutState,
+    /// Number of routes actively serving `worker_id` after this rollout
+    /// resolved (the new instance's route count on `RetiredPrevious`; the
+    /// restored previous instance's route count, or 0, on `RolledBack`).
+    pub active_route_count: usize,
+}
+
+/// Bounded liveness probe -- identical budget/semantics to
+/// `crate::broker::routes`'s own `health_bounded`/`crate::broker::control`'s
+/// `probe_health`: a worker that accepts a probe but never answers must not
+/// be able to stall a rollout's health window.
+async fn health_bounded(transport: &Arc<dyn WorkerTransport>) -> bool {
+    matches!(tokio::time::timeout(HEALTH_PROBE_TIMEOUT, transport.health()).await, Ok(true))
+}
+
+/// Perform a health-gated blue-green rollout of `new_routes` for
+/// `worker_id`.
+///
+/// Callers are expected to have ALREADY pre-flip-gated `new_routes`'s
+/// transport(s) — connect + bounded health probe + `list()`-verify, exactly
+/// what `control::register_verified_transport` does before calling this —
+/// this function's own job starts at the flip, not before it. Every route in
+/// `new_routes` must carry `worker_id` (same contract
+/// [`RouteTable::replace_worker`] documents).
+///
+/// See this module's doc for the full flip/window/rollback contract.
+pub async fn rollout_worker(routes: &RouteTable, worker_id: &str, new_routes: Vec<WorkerRoute>) -> RolloutOutcome {
+    let worker_id_owned = worker_id.to_string();
+
+    // Flip: atomic swap, previous instance retained as this rollout's
+    // rollback state (empty on a first-ever registration -- nothing to roll
+    // back to). The stamped GENERATION is this rollout's ownership token: it
+    // is what a later rollback checks against, so an ABA away-and-back by a
+    // competing rollout can't fool the restore into resurrecting a stale
+    // instance.
+    let (previous_routes, flip_gen) = routes.replace_worker_with_rollback(worker_id, new_routes.clone());
+
+    // Post-flip health window: bounded, fixed-count, fail-closed on the
+    // FIRST failed probe (a flap during the window is exactly the failure
+    // this item exists to catch).
+    let healthy = post_flip_window_passes(&new_routes).await;
+
+    if healthy {
+        // The window passed -- but only declare success if this rollout STILL
+        // OWNS the worker (its flip generation is still the current one). A
+        // deregister or a superseding rollout during a HEALTHY window means
+        // the worker's routes are already gone/replaced; there is no route
+        // mutation to undo (the flip's previous instance was already dropped),
+        // but the caller must not record a successful registration (or upsert
+        // admin metadata) for state that no longer exists.
+        if routes.load().worker_generation(worker_id) == Some(flip_gen) {
+            // Previous instance is simply dropped -- nothing left holding it,
+            // no route-table mutation needed (it is already gone from the
+            // table since the flip).
+            return RolloutOutcome {
+                worker_id: worker_id_owned,
+                state: RolloutState::RetiredPrevious,
+                active_route_count: new_routes.len(),
+            };
+        }
+        let active_route_count = routes.load().all().filter(|r| r.worker_id == worker_id_owned).count();
+        return RolloutOutcome { worker_id: worker_id_owned, state: RolloutState::Superseded, active_route_count };
+    }
+
+    // Roll back -- atomically, and ONLY if this rollout still OWNS the worker
+    // (its flip generation is still the worker's current one: nobody
+    // deregistered it or superseded it with a newer flip, even an ABA one,
+    // out from under this window). `restore_worker_if_unchanged` is the
+    // single primitive for both cases:
+    //  - previous instance existed  -> restore it (true rollback).
+    //  - no previous instance       -> restore an EMPTY set (fail safe: a
+    //    first-ever registration that fails its own post-flip window is
+    //    removed entirely rather than left routed to a proven-bad instance).
+    let restored = routes.restore_worker_if_unchanged(worker_id, flip_gen, previous_routes.clone());
+    let active_route_count = if restored {
+        previous_routes.len()
+    } else {
+        // Cancelled: the worker's routes had already changed (deregistered,
+        // or a newer rollout won) -- report whatever is ACTUALLY there now
+        // rather than guessing, so a caller logging this outcome sees
+        // reality, not this rollout's stale intent.
+        routes.load().all().filter(|r| r.worker_id == worker_id_owned).count()
+    };
+
+    RolloutOutcome { worker_id: worker_id_owned, state: RolloutState::RolledBack, active_route_count }
+}
+
+/// Run the fixed post-flip health window against every route's transport
+/// (typically all routes from `new_routes` share one transport per
+/// [`WorkerRoute::transport`]'s doc, but this probes each DISTINCT transport
+/// present, in case a future worker ever advertises tools split across more
+/// than one). Returns `true` only if every probe, across the whole window,
+/// passed -- fail-closed on the first failure.
+async fn post_flip_window_passes(new_routes: &[WorkerRoute]) -> bool {
+    if new_routes.is_empty() {
+        // Nothing to probe -- vacuously fine; a worker registering zero
+        // routes is refused upstream (`AdminError::NoTools`/`EmptyCatalog`)
+        // long before this module is ever reached.
+        return true;
+    }
+
+    let mut transports: Vec<Arc<dyn WorkerTransport>> = Vec::new();
+    for route in new_routes {
+        if !transports.iter().any(|t| Arc::ptr_eq(t, &route.transport)) {
+            transports.push(route.transport.clone());
+        }
+    }
+
+    for i in 0..POST_FLIP_HEALTH_CHECKS {
+        for transport in &transports {
+            if !health_bounded(transport).await {
+                return false;
+            }
+        }
+        if i + 1 < POST_FLIP_HEALTH_CHECKS {
+            tokio::time::sleep(POST_FLIP_HEALTH_INTERVAL).await;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::broker::transport::TransportError;
+    use crate::error::ToolError;
+    use crate::registry::ToolInfo;
+    use crate::tool::ToolOutput;
+    use serde_json::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A stub [`WorkerTransport`] whose `health()` answers `true` for the
+    /// first `fail_after` calls, then `false` forever after -- models an
+    /// instance that passes its pre-flip gate and then wedges during (or
+    /// after) the post-flip window.
+    struct FlakyTransport {
+        fail_after: usize,
+        health_calls: AtomicUsize,
+        text: String,
+    }
+
+    impl FlakyTransport {
+        fn always_healthy(text: &str) -> Self {
+            Self { fail_after: usize::MAX, health_calls: AtomicUsize::new(0), text: text.to_string() }
+        }
+        fn fails_after(fail_after: usize, text: &str) -> Self {
+            Self { fail_after, health_calls: AtomicUsize::new(0), text: text.to_string() }
+        }
+        fn always_unhealthy(text: &str) -> Self {
+            Self { fail_after: 0, health_calls: AtomicUsize::new(0), text: text.to_string() }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WorkerTransport for FlakyTransport {
+        async fn connect(&self) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn call(&self, _name: &str, _args: Value) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput { text: self.text.clone(), structured: None })
+        }
+        async fn list(&self) -> Result<Vec<String>, TransportError> {
+            Ok(vec![])
+        }
+        async fn health(&self) -> bool {
+            let n = self.health_calls.fetch_add(1, Ordering::SeqCst);
+            n < self.fail_after
+        }
+    }
+
+    fn tool_info(name: &str) -> ToolInfo {
+        ToolInfo { name: name.to_string(), description: String::new(), parameters: serde_json::json!({"type": "object"}) }
+    }
+
+    fn route(worker_id: &str, tool: &str, transport: &Arc<dyn WorkerTransport>) -> WorkerRoute {
+        WorkerRoute { worker_id: worker_id.to_string(), transport: transport.clone(), tool: tool_info(tool) }
+    }
+
+    // ── A healthy new instance flips live; previous is retired ──────────
+
+    #[tokio::test]
+    async fn healthy_new_instance_flips_live_and_retires_previous() {
+        let routes = RouteTable::new();
+        let old: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_healthy("old"));
+        routes.install(route("w1", "tool_a", &old));
+
+        let new: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_healthy("new"));
+        let new_routes = vec![route("w1", "tool_a", &new)];
+
+        let outcome = rollout_worker(&routes, "w1", new_routes).await;
+        assert_eq!(outcome.state, RolloutState::RetiredPrevious);
+        assert_eq!(outcome.active_route_count, 1);
+
+        let snap = routes.load();
+        let out = crate::broker::routes::dispatch_call(&snap, "tool_a", serde_json::json!({}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.text, "new", "the NEW instance serves after a passing rollout");
+    }
+
+    // ── A new instance that fails the post-flip window rolls back ───────
+
+    #[tokio::test]
+    async fn failing_new_instance_is_rolled_back_to_previous() {
+        let routes = RouteTable::new();
+        let old: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_healthy("old"));
+        routes.install(route("w1", "tool_a", &old));
+
+        // Passes the "pre-flip gate" (a caller-side concern this test
+        // doesn't model) but fails every post-flip probe.
+        let new: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_unhealthy("new"));
+        let new_routes = vec![route("w1", "tool_a", &new)];
+
+        let outcome = rollout_worker(&routes, "w1", new_routes).await;
+        assert_eq!(outcome.state, RolloutState::RolledBack);
+        assert_eq!(outcome.active_route_count, 1);
+
+        let snap = routes.load();
+        let out = crate::broker::routes::dispatch_call(&snap, "tool_a", serde_json::json!({}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.text, "old", "a rolled-back worker serves its PREVIOUS instance");
+    }
+
+    // ── Previous serves throughout -- no dropped calls across the flip+rollback ─
+
+    #[tokio::test]
+    async fn previous_serves_throughout_flip_and_rollback_no_dropped_calls() {
+        let routes = Arc::new(RouteTable::new());
+        let old: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_healthy("old"));
+        routes.install(route("w1", "tool_a", &old));
+
+        let new: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_unhealthy("new"));
+        let new_routes = vec![route("w1", "tool_a", &new)];
+
+        // Fire concurrent calls against fresh snapshots while the rollout
+        // (flip -> window -> rollback) runs. Every single one must succeed
+        // with EITHER "old" (pre-flip / post-rollback) or "new" (briefly
+        // live mid-window) -- never an error, never a torn/mixed result.
+        let routes_for_rollout = routes.clone();
+        let rollout_task =
+            tokio::spawn(async move { rollout_worker(&routes_for_rollout, "w1", new_routes).await });
+
+        let mut saw_error = false;
+        for _ in 0..200 {
+            let snap = routes.load();
+            match crate::broker::routes::dispatch_call(&snap, "tool_a", serde_json::json!({})).await {
+                Some(Ok(out)) => assert!(out.text == "old" || out.text == "new"),
+                Some(Err(_)) => saw_error = true,
+                None => panic!("tool_a must always have a route during a rollout"),
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!saw_error, "no call should ever observe the worker as unavailable across a flip/rollback");
+
+        let outcome = rollout_task.await.unwrap();
+        assert_eq!(outcome.state, RolloutState::RolledBack);
+
+        let final_snap = routes.load();
+        let out = crate::broker::routes::dispatch_call(&final_snap, "tool_a", serde_json::json!({}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.text, "old");
+    }
+
+    // ── Both old+new unhealthy: rollback restores the last-known-good
+    //    identity, but dispatch still cleanly refuses to route to it ──────
+
+    #[tokio::test]
+    async fn both_unhealthy_rolls_back_but_dispatch_stays_clean_unavailable() {
+        let routes = RouteTable::new();
+        let old: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_unhealthy("old"));
+        routes.install(route("w1", "tool_a", &old));
+
+        let new: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_unhealthy("new"));
+        let new_routes = vec![route("w1", "tool_a", &new)];
+
+        let outcome = rollout_worker(&routes, "w1", new_routes).await;
+        assert_eq!(outcome.state, RolloutState::RolledBack, "the new instance's window still fails closed");
+
+        // The table now points back at the previous instance (rollback
+        // happened -- last-known-good identity restored)...
+        let snap = routes.load();
+        assert!(snap.get("tool_a").is_some(), "rollback restores the previous route, it does not delete it");
+        // ...but a live call still gets a clean "unavailable", never a
+        // silent success and never routed to the (also-dead) new instance.
+        let res = crate::broker::routes::dispatch_call(&snap, "tool_a", serde_json::json!({})).await.unwrap();
+        assert!(res.is_err(), "an unhealthy restored instance must still answer 'unavailable' on call");
+    }
+
+    // ── Flapping mid-window (passes once, then fails) is fail-closed ────
+
+    #[tokio::test]
+    async fn flapping_mid_window_is_treated_as_a_failure_not_averaged() {
+        let routes = RouteTable::new();
+        let old: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_healthy("old"));
+        routes.install(route("w1", "tool_a", &old));
+
+        // Passes exactly ONE post-flip probe, then fails -- with
+        // POST_FLIP_HEALTH_CHECKS > 1 this must still roll back (fail
+        // closed on ANY flap, not "majority of the window").
+        assert!(POST_FLIP_HEALTH_CHECKS > 1);
+        let new: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::fails_after(1, "new"));
+        let new_routes = vec![route("w1", "tool_a", &new)];
+
+        let outcome = rollout_worker(&routes, "w1", new_routes).await;
+        assert_eq!(outcome.state, RolloutState::RolledBack, "a flap anywhere in the window must fail closed");
+    }
+
+    // ── No previous instance (first-ever registration): failure removes,
+    //    it does not "roll back" to nothing ─────────────────────────────
+
+    #[tokio::test]
+    async fn first_ever_registration_that_fails_its_window_is_removed_not_left_dangling() {
+        let routes = RouteTable::new();
+        let new: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_unhealthy("new"));
+        let new_routes = vec![route("fresh", "tool_a", &new)];
+
+        let outcome = rollout_worker(&routes, "fresh", new_routes).await;
+        assert_eq!(outcome.state, RolloutState::RolledBack);
+        assert_eq!(outcome.active_route_count, 0);
+
+        let snap = routes.load();
+        assert!(snap.get("tool_a").is_none(), "a first-ever registration failing its window leaves no route behind");
+    }
+
+    #[tokio::test]
+    async fn first_ever_registration_that_passes_its_window_goes_live() {
+        let routes = RouteTable::new();
+        let new: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_healthy("new"));
+        let new_routes = vec![route("fresh", "tool_a", &new)];
+
+        let outcome = rollout_worker(&routes, "fresh", new_routes).await;
+        assert_eq!(outcome.state, RolloutState::RetiredPrevious);
+        let snap = routes.load();
+        assert!(snap.get("tool_a").is_some());
+    }
+
+    // ── A deregister mid-rollout cancels cleanly -- no orphaned `previous` ─
+
+    #[tokio::test]
+    async fn deregister_mid_rollout_cancels_cleanly_no_orphaned_previous() {
+        let routes = Arc::new(RouteTable::new());
+        let old: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_healthy("old"));
+        routes.install(route("w1", "tool_a", &old));
+
+        // The new instance fails its window (would normally trigger a
+        // rollback to `old`) -- but the worker gets deregistered WHILE the
+        // window is running.
+        let new: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_unhealthy("new"));
+        let new_routes = vec![route("w1", "tool_a", &new)];
+
+        let routes_for_rollout = routes.clone();
+        let rollout_task =
+            tokio::spawn(async move { rollout_worker(&routes_for_rollout, "w1", new_routes).await });
+
+        // Give the flip a moment to land, then deregister the worker
+        // entirely while the post-flip window is still probing.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        routes.remove_worker("w1");
+
+        let outcome = rollout_task.await.unwrap();
+        assert_eq!(outcome.state, RolloutState::RolledBack, "the window still failed on its own terms");
+
+        // The critical assertion: deregistration WINS. No `previous`
+        // (old/"old") was resurrected over top of the intentional removal.
+        let snap = routes.load();
+        assert!(snap.get("tool_a").is_none(), "a mid-rollout deregister must not be undone by a late rollback");
+    }
+
+    // ── Concurrent rollouts: a newer flip's routes are never clobbered by
+    //    an older rollout's stale rollback ──────────────────────────────
+
+    #[tokio::test]
+    async fn a_superseding_rollout_is_not_clobbered_by_an_older_rollouts_rollback() {
+        let routes = Arc::new(RouteTable::new());
+        let v1: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_healthy("v1"));
+        routes.install(route("w1", "tool_a", &v1));
+
+        // Rollout A: v1 -> v2, where v2 fails its window.
+        let v2: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_unhealthy("v2"));
+        let (previous_a, gen_a) = routes.replace_worker_with_rollback("w1", vec![route("w1", "tool_a", &v2)]);
+        assert_eq!(previous_a.len(), 1);
+
+        // Before A's window resolves, a second, newer rollout (B) already
+        // supersedes it: v2 -> v3 (say v3 is healthy).
+        let v3: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_healthy("v3"));
+        let (previous_b, gen_b) = routes.replace_worker_with_rollback("w1", vec![route("w1", "tool_a", &v3)]);
+        assert_eq!(previous_b.len(), 1, "B's own previous is v2, not v1");
+        assert!(gen_b > gen_a, "a superseding flip must draw a strictly-greater generation");
+
+        // Now A's (stale) rollback attempt runs: it still holds gen_a and
+        // tries to restore v1 -- but the table has already moved on to v3
+        // (its owning generation is gen_b). This must be a no-op.
+        let restored = routes.restore_worker_if_unchanged("w1", gen_a, previous_a);
+        assert!(!restored, "a superseded rollout's rollback must not clobber a newer rollout's live routes");
+
+        let snap = routes.load();
+        let out = crate::broker::routes::dispatch_call(&snap, "tool_a", serde_json::json!({}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.text, "v3", "the newer rollout's flip must survive an older rollout's stale rollback");
+    }
+
+    // ── ABA: routes flipped AWAY and BACK to the same Arc must NOT fool the
+    //    older rollout's rollback (generation, not ptr_eq, is the guard) ──
+
+    /// The exact ABA codex flagged: rollout A flips v1->v2 (captures gen_a);
+    /// rollout B supersedes with v2->v3 and then B ITSELF rolls back to its
+    /// previous (v2) — so the table's CURRENT routes are once again the very
+    /// same v2 `Arc` that A flipped to. A value/`Arc::ptr_eq` guard would see
+    /// "current == what A flipped to" and let A's stale rollback restore v1,
+    /// resurrecting an orphaned instance. The generation guard must instead
+    /// make A's rollback a clean NO-OP: every one of B's flips (and B's own
+    /// rollback) drew a strictly-greater generation, so gen_a is stale.
+    #[tokio::test]
+    async fn aba_away_and_back_to_same_arc_does_not_fool_older_rollback() {
+        use crate::broker::routes::dispatch_call;
+
+        let routes = RouteTable::new();
+        let v1: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_healthy("v1"));
+        routes.install(route("w1", "tool_a", &v1));
+
+        // Rollout A flips v1 -> v2, capturing its generation.
+        let v2: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_healthy("v2"));
+        let (prev_a, gen_a) = routes.replace_worker_with_rollback("w1", vec![route("w1", "tool_a", &v2)]);
+        assert_eq!(prev_a.len(), 1, "A's previous is v1");
+
+        // Rollout B supersedes: v2 -> v3, capturing v2 as ITS previous.
+        let v3: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_healthy("v3"));
+        let (prev_b, gen_b) = routes.replace_worker_with_rollback("w1", vec![route("w1", "tool_a", &v3)]);
+
+        // B's own window fails, so B rolls back to its previous -- the SAME
+        // v2 Arc. The table's current route is now byte-identical (same Arc)
+        // to what A flipped to: the ABA "back to A's value" condition.
+        assert!(routes.restore_worker_if_unchanged("w1", gen_b, prev_b));
+        {
+            let snap = routes.load();
+            assert!(Arc::ptr_eq(&snap.get("tool_a").unwrap().transport, &v2), "table is back on the exact v2 Arc");
+            // ...and A's stale generation is decisively NOT the current owner.
+            assert_ne!(snap.worker_generation("w1"), Some(gen_a));
+        }
+
+        // A's (long-delayed) rollback now runs. Under a ptr_eq guard it would
+        // wrongly restore v1; under the generation guard it is a clean no-op.
+        let a_restored = routes.restore_worker_if_unchanged("w1", gen_a, prev_a);
+        assert!(!a_restored, "ABA: an older rollout's rollback must not fire just because routes are 'back' to its value");
+
+        let snap = routes.load();
+        let out = dispatch_call(&snap, "tool_a", serde_json::json!({})).await.unwrap().unwrap();
+        assert_eq!(out.text, "v2", "v1 must NOT be resurrected -- the table stays on v2");
+    }
+
+    // ── Cross-worker tool takeover prunes the overwritten worker's stale
+    //    generation, so its in-flight rollback can't resurrect its route ──
+
+    /// Worker X owns tool "t" (its own rollout in flight). Worker Y then
+    /// registers and OVERWRITES "t" (same tool name, different owner). X now
+    /// owns no route, so its `worker_gen` entry must be PRUNED — otherwise
+    /// X's later failed-window rollback would still match X's stale
+    /// generation and resurrect X's old route over Y's. With pruning, X's
+    /// restore is a clean no-op and Y's route survives.
+    #[tokio::test]
+    async fn cross_worker_tool_takeover_prunes_stale_generation_no_resurrect() {
+        use crate::broker::routes::dispatch_call;
+
+        let routes = RouteTable::new();
+
+        // X owns "t" via an old instance, then starts a rollout to a new
+        // instance (which will fail its window).
+        let x_old: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_healthy("x_old"));
+        routes.install(route("X", "t", &x_old));
+        let x_new: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_unhealthy("x_new"));
+        let (prev_x, gen_x) = routes.replace_worker_with_rollback("X", vec![route("X", "t", &x_new)]);
+        assert_eq!(prev_x.len(), 1, "X's previous instance is x_old");
+        assert_eq!(routes.load().worker_generation("X"), Some(gen_x));
+
+        // Worker Y registers and takes over the SAME tool name "t".
+        let y: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_healthy("y"));
+        routes.replace_worker_with_rollback("Y", vec![route("Y", "t", &y)]);
+
+        // X now owns nothing -- its stale generation must be gone.
+        assert_eq!(
+            routes.load().worker_generation("X"),
+            None,
+            "the overwritten worker's stale generation must be pruned on cross-worker takeover"
+        );
+
+        // X's rollout window fails; its rollback must be a clean NO-OP.
+        let x_restored = routes.restore_worker_if_unchanged("X", gen_x, prev_x);
+        assert!(!x_restored, "X's rollback must no-op after Y took over its only tool");
+
+        // Y's route survives; X's x_old is NOT resurrected.
+        let snap = routes.load();
+        let out = dispatch_call(&snap, "t", serde_json::json!({})).await.unwrap().unwrap();
+        assert_eq!(out.text, "y", "Y's route must survive; the overwritten worker's route must not resurrect");
+        assert!(snap.worker_generation("Y").is_some(), "Y owns the tool now");
+        assert!(snap.worker_generation("X").is_none());
+    }
+
+    // ── A deregister during a HEALTHY window is Superseded, not a stale
+    //    success (no metadata should be recorded for it) ─────────────────
+
+    /// The new instance passes its post-flip window, but the worker is
+    /// deregistered WHILE the window runs. `rollout_worker` must report
+    /// `Superseded` (not `RetiredPrevious`) so the caller records no route
+    /// and no stale admin metadata for a registration that no longer stands.
+    #[tokio::test]
+    async fn deregister_during_healthy_window_is_superseded_not_a_stale_success() {
+        let routes = Arc::new(RouteTable::new());
+
+        // First-ever registration of a HEALTHY new instance.
+        let new: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_healthy("new"));
+        let new_routes = vec![route("w1", "tool_a", &new)];
+
+        let routes_for_rollout = routes.clone();
+        let task = tokio::spawn(async move { rollout_worker(&routes_for_rollout, "w1", new_routes).await });
+
+        // Deregister the worker while its (healthy) post-flip window runs.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        routes.remove_worker("w1");
+
+        let outcome = task.await.unwrap();
+        assert_eq!(
+            outcome.state,
+            RolloutState::Superseded,
+            "a deregister during a healthy window must yield Superseded, not RetiredPrevious"
+        );
+        assert_eq!(outcome.active_route_count, 0, "the deregistered worker has no live routes");
+
+        // The deregistration stands -- no route was resurrected.
+        let snap = routes.load();
+        assert!(snap.get("tool_a").is_none());
+        assert!(snap.worker_generation("w1").is_none());
+    }
+}

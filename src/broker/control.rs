@@ -300,6 +300,21 @@ enum AdminError {
     EmptyCatalog(String),
     #[error("unknown worker '{0}'")]
     UnknownWorker(String),
+    /// TMOD-06: an already-present worker's UPDATE passed its pre-flip gate
+    /// (connect/health/`list()`, above) but failed its post-flip health
+    /// window and was rolled back — see `crate::broker::rollout`. The
+    /// worker is left on its last-known-good (previous) instance, not
+    /// removed, so this is reported as a gateway-style failure of the NEW
+    /// instance, not a worker outage.
+    #[error("worker '{0}' failed its post-flip health window and was rolled back to its previous instance")]
+    RolledBack(String),
+    /// TMOD-06: the new instance passed its post-flip window, but a
+    /// deregister or a newer registration for the same worker landed
+    /// mid-window, so this registration no longer owns the worker. No route
+    /// or metadata is recorded for it — reported as a conflict so the caller
+    /// knows its registration was superseded, not silently dropped.
+    #[error("worker '{0}' was deregistered or superseded by a newer registration during its rollout")]
+    Superseded(String),
 }
 
 impl AdminError {
@@ -309,8 +324,10 @@ impl AdminError {
             AdminError::Transport(_)
             | AdminError::Unhealthy(_, _)
             | AdminError::CatalogUnavailable { .. }
-            | AdminError::EmptyCatalog(_) => StatusCode::BAD_GATEWAY,
+            | AdminError::EmptyCatalog(_)
+            | AdminError::RolledBack(_) => StatusCode::BAD_GATEWAY,
             AdminError::UnknownWorker(_) => StatusCode::NOT_FOUND,
+            AdminError::Superseded(_) => StatusCode::CONFLICT,
         }
     }
 
@@ -330,6 +347,8 @@ impl AdminError {
             AdminError::CatalogUnavailable { .. } => "catalog_unavailable",
             AdminError::EmptyCatalog(_) => "empty_catalog",
             AdminError::UnknownWorker(_) => "unknown_worker",
+            AdminError::RolledBack(_) => "rolled_back",
+            AdminError::Superseded(_) => "superseded",
         }
     }
 }
@@ -585,13 +604,25 @@ async fn register_verified_transport(
     let mut declared: HashMap<String, ToolInfo> =
         declared_tools.into_iter().map(|t| (t.name.clone(), t.into())).collect();
 
-    // 4. Build a route for every tool the worker VERIFIABLY serves and
-    //    REPLACE the worker's prior route set in ONE atomic swap
-    //    (`replace_worker`, not `install_many`): a tool the worker used to
-    //    serve but no longer does is dropped rather than left as a stale
-    //    route to the old transport -- see `RouteTable::replace_worker`'s
-    //    doc. A reader never observes a half-registered or mixed old/new
-    //    worker.
+    // 4. Build a route for every tool the worker VERIFIABLY serves, then
+    //    install it through the blue-green rollout
+    //    (`crate::broker::rollout::rollout_worker`), never a bare
+    //    `replace_worker`. The new instance has passed the PRE-flip gate
+    //    above (connect + bounded health probe + `list()`-verify), but that
+    //    only proves it was alive a moment ago; the rollout module flips it
+    //    in atomically, watches a bounded post-flip health window, and — if
+    //    that window fails — automatically undoes the flip (atomically, and
+    //    safe against a concurrent deregister).
+    //
+    //    BOTH a first-ever registration AND an update of an already-present
+    //    worker go through this same path, deliberately: a brand-new worker
+    //    that passes the pre-flip gate but then regresses during its
+    //    post-flip window must be REMOVED (its rollout has no previous
+    //    instance to fall back to, so `rollout_worker` restores an EMPTY set
+    //    — the worker's routes are removed rather than left pointing at a
+    //    proven-bad instance), exactly like an update rolls back to its
+    //    previous instance. Routing only updates through the rollout would
+    //    leave a first-ever worker with NO post-flip window at all.
     let tool_count = verified_names.len();
     let routes: Vec<WorkerRoute> = verified_names
         .into_iter()
@@ -604,11 +635,27 @@ async fn register_verified_transport(
             WorkerRoute { worker_id: worker_id.clone(), transport: transport.clone(), tool }
         })
         .collect();
-    admin.mcp.broker_routes.replace_worker(&worker_id, routes);
+
+    let outcome = crate::broker::rollout::rollout_worker(&admin.mcp.broker_routes, &worker_id, routes).await;
+    match outcome.state {
+        crate::broker::rollout::RolloutState::RetiredPrevious => {}
+        crate::broker::rollout::RolloutState::RolledBack => {
+            return Err(AdminError::RolledBack(worker_id));
+        }
+        // The window passed but a deregister/supersede intervened mid-window,
+        // so this rollout no longer owns the worker. Do NOT upsert stale admin
+        // metadata for a registration that no longer stands -- report the
+        // clean superseded outcome instead. (`Staging`/`Live` are never
+        // returned by `rollout_worker`; treat any such value defensively as a
+        // non-owning outcome rather than recording success.)
+        _ => {
+            return Err(AdminError::Superseded(worker_id));
+        }
+    }
 
     // 5. Record admin-only bookkeeping (tier/capability_class/registered_at)
     //    in lock-step -- read by `handle_list`/`handle_health`, never by
-    //    dispatch.
+    //    dispatch. Only reached when this rollout still OWNS the worker.
     upsert_meta(
         &admin.meta,
         &worker_id,
@@ -1233,5 +1280,61 @@ mod tests {
         assert!(snap.get("b").is_none(), "the no-longer-served tool must be GONE, not a stale route");
         let out = dispatch_call(&snap, "a", json!({})).await.unwrap().unwrap();
         assert_eq!(out.text, "served a", "a resolves to the new transport");
+    }
+
+    /// TMOD-06: a FIRST-EVER worker registration must ALSO run the post-flip
+    /// health window — not just an update of an already-present worker. A
+    /// brand-new worker that passes the pre-flip gate (its first `health()`
+    /// probe + `list()`) but then regresses during the post-flip window must
+    /// be REMOVED (it has no previous instance to fall back to), never left
+    /// as a stale route to a proven-bad instance.
+    #[tokio::test]
+    async fn first_ever_registration_failing_post_flip_window_is_removed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Healthy for exactly the first `healthy_for` `health()` calls
+        /// (enough to pass the pre-flip probe), unhealthy forever after (so
+        /// the post-flip window fails).
+        struct RegressingStub {
+            health_calls: AtomicUsize,
+            healthy_for: usize,
+        }
+        #[async_trait::async_trait]
+        impl WorkerTransport for RegressingStub {
+            async fn connect(&self) -> Result<(), crate::broker::transport::TransportError> {
+                Ok(())
+            }
+            async fn call(&self, name: &str, _args: Value) -> Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                Ok(crate::tool::ToolOutput { text: format!("served {name}"), structured: None })
+            }
+            async fn list(&self) -> Result<Vec<String>, crate::broker::transport::TransportError> {
+                Ok(vec!["regressor_tool".to_string()])
+            }
+            async fn health(&self) -> bool {
+                self.health_calls.fetch_add(1, Ordering::SeqCst) < self.healthy_for
+            }
+        }
+
+        let state = test_mcp_state(Some(allow_all_gateway()));
+        let admin = AdminState { mcp: state.clone(), meta: Arc::new(ArcSwap::from_pointee(HashMap::new())) };
+
+        // Healthy for exactly ONE probe -- the pre-flip gate's
+        // `probe_health` -- then unhealthy for the whole post-flip window.
+        let transport: Arc<dyn WorkerTransport> =
+            Arc::new(RegressingStub { health_calls: AtomicUsize::new(0), healthy_for: 1 });
+
+        let err = register_verified_transport(&admin, &read_only_t1_entry("regressor"), vec![], transport)
+            .await
+            .expect_err("a first-ever worker that regresses in its post-flip window must be refused");
+        assert!(matches!(err, AdminError::RolledBack(_)), "got {err:?}");
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+
+        // The critical assertion: it was REMOVED, not left as a stale route.
+        let snap = state.broker_routes.load();
+        assert!(
+            snap.get("regressor_tool").is_none(),
+            "a first-ever registration failing its post-flip window must leave NO route behind"
+        );
+        assert!(snap.is_empty());
     }
 }
