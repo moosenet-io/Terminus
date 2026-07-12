@@ -58,6 +58,7 @@ it exposes).
 | Page | Description |
 | --- | --- |
 | [`house-style.md`](house-style.md) | The Tier-A house-style rule catalog enforced by `crate::house_style` (a deterministic `syn`-AST checker, run as part of `cargo test -p terminus-rs`) — the secret-shaped-env-var rule, the `RustTool::description()` non-empty check, the `panic!`-in-`execute` check, the allow-list, and the `// house-style-allow: <reason>` waiver convention. |
+| [`cortex-elegance-gate.md`](cortex-elegance-gate.md) | The end-to-end Cortex elegance/consistency gate reference: the Tier A (mechanical)/B (structural)/C (taste) model and why they're separate mechanisms, how to read a `cortex_review` risk score, the crystallization lifecycle, waivers, calibration, and the consistency-debt trend. See also [`specs/behavior/cortex-behavior.md`](../specs/behavior/cortex-behavior.md) for the checked safety-property contracts and [`cortex-calibration.md`](cortex-calibration.md) for the calibration report format. |
 
 ## Conventions used across these docs
 

@@ -839,6 +839,17 @@ Its risk/elegance surface is rebuilt over the following S115 items:
 - `cortex_crystallize` — live as of **CXEG-09**: the rule crystallization
   loop (`src/cortex/crystallize.rs`). See "Rule crystallization loop
   (CXEG-09)" below for the full lifecycle.
+- `cortex_consistency_debt` — live as of **CXEG-12**: a READ-ONLY,
+  per-community/per-category rollup of `consistency`/`elegance`/`waiver`
+  findings (`src/cortex/debt.rs`) over the SAME KGFIND-01 `FindingsStore`
+  every other finding-shaped Cortex tool already reads — no new store, no
+  writes. See "Consistency-debt trend (CXEG-12)" below.
+
+For the full three-tier mental model (mechanical Tier-A house-style lints,
+structural Tier-B metrics, taste-grounded Tier-C consistency review),
+the risk-score rubric, the crystallization lifecycle, and how waivers/
+calibration/the debt trend all fit together, see
+[`docs/cortex-elegance-gate.md`](docs/cortex-elegance-gate.md).
 
 The seven retired graph-relay tools are kept only as zero-I/O **deprecation
 aliases** (`src/cortex/deprecated.rs`) that return a structured
@@ -910,6 +921,74 @@ emits a CXEG-05-shaped artifact (a lint stub or a house-style doc entry),
 never a `kg_rules` row — the two loops read from the same `kg_findings`
 corpus but write to different destinations and are not layered on top of
 each other.
+
+### Consistency-debt trend (CXEG-12)
+
+`cortex_consistency_debt(project_id)` (`src/cortex/debt.rs`) is a READ-ONLY
+aggregation over the exact same KGFIND-01 `FindingsStore` corpus every other
+finding-shaped Cortex tool already reads (`cortex_review`'s recurrence
+lookup, `cortex_crystallize`'s candidate selection, `cortex_waive`'s waiver
+ledger) — no new store, no writes, no second findings-access path (S9). It
+answers the question none of the per-PR tools answer on their own: **across
+everything the review gates have already recorded, is house-style debt
+growing or shrinking, and which subsystems are accruing it?**
+
+It rolls up every `category: "consistency"` (CXEG-07's Tier-C lens),
+`"elegance"` (CXEG-04's structural signals when captured as a finding), and
+`"waiver"` (CXEG-08's `cortex_waive` — over-waiving is itself debt worth
+surfacing) finding for `project_id`, grouped by:
+- **community** — a `node`/`path`-scoped finding is resolved to its Leiden
+  community via the project's stored Atlas graph (the SAME `GraphStore`/
+  `KnowledgeGraph::get_node`/`current_nodes` lookups `cortex_scope`/
+  `cortex_review` already use — no second graph-walk implementation); a
+  `community`-scoped finding's `scope_ref` is the community id directly; a
+  `global`-scoped finding (most waivers) rolls up under `"project-wide"`; a
+  finding that can't be resolved (no stored Atlas graph, or an invalidated
+  node/path) rolls up under `"unmapped"` — never fabricated.
+- **category** — `consistency` / `elegance` / `waiver`, kept separate so a
+  community's debt profile is legible (e.g. "this community has 12 recurring
+  consistency findings and 3 waivers" is a very different signal than "15
+  waivers and nothing else").
+
+Each `(community, category)` bucket reports `distinct_findings`,
+`total_occurrences` (summed across every finding in the bucket — the same
+recurrence count `cortex_review`'s log-scaled recurrence term reads),
+`first_seen`, and `last_seen` — so a caller can eyeball "is this bucket's
+`last_seen` recent" as a growing-vs-stale signal without a second query.
+A project-wide `totals` object (one entry per category) gives the
+whole-project trend at a glance. Ordering is fully deterministic (community
+id ascending, then `"project-wide"`, then `"unmapped"`; category ascending
+within a bucket).
+
+**Degrades cleanly, never an error**: no `ATLAS_DATABASE_URL` configured (or
+the findings store otherwise unreachable) → `{"configured": false, ...}`,
+mirroring `cortex_scope`/`cortex_review`'s own posture. No stored Atlas graph
+for the project → the rollup still runs (the findings are real either way),
+but every `node`/`path`-scoped finding falls into `"unmapped"` and the
+response's `graph_available` is `false`, rather than guessing a community.
+
+```json
+{
+  "configured": true,
+  "project_id": "TERM",
+  "graph_available": true,
+  "generation": 5,
+  "rollups": [
+    { "community": 1, "category": "consistency", "distinct_findings": 3, "total_occurrences": 9, "first_seen": "2026-06-01T00:00:00Z", "last_seen": "2026-07-10T00:00:00Z" },
+    { "community": "project-wide", "category": "waiver", "distinct_findings": 1, "total_occurrences": 2, "first_seen": "2026-06-15T00:00:00Z", "last_seen": "2026-07-01T00:00:00Z" }
+  ],
+  "totals": {
+    "consistency": { "distinct_findings": 3, "total_occurrences": 9, "first_seen": "2026-06-01T00:00:00Z", "last_seen": "2026-07-10T00:00:00Z" },
+    "waiver": { "distinct_findings": 1, "total_occurrences": 2, "first_seen": "2026-06-15T00:00:00Z", "last_seen": "2026-07-01T00:00:00Z" }
+  }
+}
+```
+
+**No new config field.** Unlike most of Cortex, `cortex_consistency_debt`
+reuses `FindingsStore::from_env()` and `GraphStore::from_config`/
+`ScribeConfig::from_env()` directly — the same env vars (`ATLAS_DATABASE_URL`
+and the `SCRIBE_KG_*` family) every other Atlas-backed tool already reads,
+with no dedicated `CortexConfig` field of its own to keep in sync.
 
 ### `review_run`'s Tier-C consistency/elegance lens (CXEG-07) — ADVISORY ONLY
 

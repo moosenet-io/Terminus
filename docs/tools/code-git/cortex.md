@@ -1,9 +1,10 @@
 [← docs index](../../README.md)
 
-# Cortex — Atlas-backed code-intelligence gate (CXEG-01/02/03/04/06/11)
+# Cortex — Atlas-backed code-intelligence gate (CXEG-01/02/03/04/06/08/09/11/12)
 
-Cortex is an 11-tool-name module (`src/cortex/mod.rs`, `src/cortex/scope.rs`,
+Cortex is a 14-tool-name module (`src/cortex/mod.rs`, `src/cortex/scope.rs`,
 `src/cortex/metrics.rs`, `src/cortex/review.rs`, `src/cortex/house_style.rs`,
+`src/cortex/waiver.rs`, `src/cortex/crystallize.rs`, `src/cortex/debt.rs`,
 `src/cortex/deprecated.rs`, `src/cortex/audit.rs`), but as of **CXEG-01** only
 3 of those names were "real" tools — the rest are structured deprecation
 aliases. Those 3 are now fully live, Atlas-backed implementations rather than
@@ -11,10 +12,15 @@ pending-pointer stubs: `cortex_scope` (**CXEG-02**), `cortex_review`
 (**CXEG-04**, built on `cortex_scope`'s blast radius plus **CXEG-03**'s
 standalone structural-elegance signal library), and `cortex_audit`
 (**CXEG-11**). As of **CXEG-06**, a NEW 4th real tool, `cortex_house_style`,
-is added (an intentional, additive MCP-listing change — the module's
-registered tool-name count goes from 10 to 11). This page describes the
-current shape; see the "History" section at the bottom for what changed and
-why.
+was added; **CXEG-08** added `cortex_waive`; **CXEG-09** added
+`cortex_crystallize`; **CXEG-12** added `cortex_consistency_debt` — each an
+intentional, additive MCP-listing change (the module's registered tool-name
+count went 10 → 11 → 12 → 13 → 14). This page describes the current shape for
+`cortex_scope`/`cortex_review`/`cortex_audit`/`cortex_house_style` in depth;
+see `README.md`'s "Cortex" section for `cortex_waive`/`cortex_crystallize`/
+`cortex_consistency_debt` and `docs/cortex-elegance-gate.md` for the
+end-to-end operator/contributor reference across all three tiers. See the
+"History" section at the bottom for what changed and why.
 
 ## The single most important fact about this module: **the SSH-relay era is retired**
 
@@ -35,6 +41,9 @@ no remote script, no "relay whatever the other end says" response shape.
 | `cortex_house_style` | **live (CXEG-06)** | Resolves `project_id` (+ optional `community`) against the project's Atlas graph and returns, per Leiden community, deterministic modal `facts` plus per-kind `exemplars_by_kind` node refs. Degrades to `configured:false` (no error) when the project has no stored graph; degrades to `profile:"unstable"`/`sparse:true`/`degraded:true` per-community/per-bucket rather than misrepresenting a thin sample. |
 | `cortex_review` | **live (CXEG-04)** | Resolves `project_id` + `changed_files`/`diff` against the Atlas graph, computes CXEG-03's structural-elegance signals over the touched nodes plus KGFIND recurrence for the same scopes, and returns a `risk_score` (0-10), `band`, `risk_signals`, and fully-explainable `contributions`. Degrades to `configured:false`/`band:"unknown"` (no graph) or a structural-only score labeled `findings:"unavailable"` (no findings store) — never an error. |
 | `cortex_audit` | **live (CXEG-11)** | Runs its existing SSRF-hardened `url` validation (unchanged, see below), clones `url` into an isolated scratch dir, builds a transient Atlas graph, runs the CXEG-03 structural detectors, and returns a report — see below. |
+| `cortex_waive` | **live (CXEG-08)** | Records a tracked, mandatory-reason waiver against `review_run`'s Stage-5b risk-gate escalation. See `README.md`'s "Stage-5b risk-gate escalation + waivers" section. |
+| `cortex_crystallize` | **live (CXEG-09)** | The rule-crystallization loop: recurring `consistency`/`elegance` findings that survive an adversarial `review_run` panel graduate to a lint stub or a `docs/house-style.md` prose rule. See `README.md`'s "Rule crystallization loop" section. |
+| `cortex_consistency_debt` | **live (CXEG-12)** | Read-only per-community, per-category rollup of `consistency`/`elegance`/`waiver` findings from the same KGFIND corpus — no new store, no writes. See `src/cortex/debt.rs` and `docs/cortex-elegance-gate.md`'s "Consistency-debt trend" section. |
 | `cortex_stats` | **deprecated alias** | Returns `{"deprecated":true,"use":"kg_stats",...}`. Call `kg_stats` instead. |
 | `cortex_build` | **deprecated alias** | Returns `{"deprecated":true,"use":"scribe_kg_build",...}`. Call `scribe_kg_build` instead. |
 | `cortex_deps` | **deprecated alias** | Returns `{"deprecated":true,"use":"kg_neighbors",...}`. Call `kg_neighbors` instead. |
@@ -907,8 +916,16 @@ degrade smoke test against an empty store dir, `cortex_scope`'s own
 `configured:false` degrade smoke test, `cortex_audit`'s unchanged SSRF-guard
 rejections, `cortex_house_style`'s argument validation (unknown `project_id`,
 non-integer `community`) and a `configured:false` degrade smoke test against
-an empty store dir, and full registration (`register()` yields exactly 11
+an empty store dir, and full registration (`register()` yields exactly 14
 tool names, all `cortex_*`).
+`src/cortex/debt.rs`'s own test module covers `resolve_bucket`'s pure
+scope-to-community resolution (global → project-wide, a parseable/
+unparseable `community` scope_ref, node/path scopes without a loaded graph
+→ unmapped, an unknown scope_kind → unmapped, and deterministic bucket
+ordering), `Rollup::absorb`'s pure aggregation math, `compute_debt`'s
+`configured:false` degrade without a configured findings store, and the
+`cortex_consistency_debt` tool's argument validation (unknown/missing
+`project_id`) plus its own degrade smoke test.
 `src/cortex/house_style.rs`'s own test module covers the deeper behavior
 against a two-community fixture graph (one community with a `PgError` enum, a
 `from_env` function, and a full `RustTool`-shape file; one plain community
@@ -1036,6 +1053,20 @@ path `metrics` (CXEG-03) and `scribe_kg_build` already use, adds a small
 in-process generation-keyed cache (`house_style::HouseStyleCache`), and takes
 the module's registered tool-name count from 10 to 11 (an intentional,
 additive MCP-listing change).
+
+**CXEG-08** added `cortex_waive` and `review_run`'s Stage-5b risk-gate
+escalation (governance around CXEG-04's `risk_score`, never a new scoring
+signal — see `README.md`). **CXEG-09** added `cortex_crystallize`, the rule
+crystallization loop that promotes recurring `consistency`/`elegance`
+findings into a lint stub or a `docs/house-style.md` prose rule via an
+adversarial `review_run` panel. **CXEG-12** added the final tool,
+`cortex_consistency_debt` (`src/cortex/debt.rs`) — a read-only, per-community
+rollup of the same `consistency`/`elegance`/`waiver` findings CXEG-07/CXEG-08
+already capture, so the fleet can see whether house-style debt is trending up
+or down without standing up a second store. This took the module's
+registered tool-name count from 11 to 14 across CXEG-08/09/12 (11 → 12 → 13 →
+14). See `docs/cortex-elegance-gate.md` for the full end-to-end operator
+reference tying all of CXEG-01 through CXEG-12 together.
 
 ---
 
