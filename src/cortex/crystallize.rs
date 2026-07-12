@@ -59,6 +59,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use crate::cortex::CortexConfig;
 use crate::error::ToolError;
@@ -139,6 +140,23 @@ fn same_candidate_text(a: &FindingRow, b: &FindingRow) -> bool {
         && norm(&a.description) == norm(&b.description)
 }
 
+/// A selected crystallization candidate: the single representative
+/// `FindingRow` that carries the artifact's content, PLUS `member_ids` — the
+/// finding ids of EVERY near-duplicate that collapsed into this candidate
+/// during semantic dedup (including the representative's own id).
+///
+/// `member_ids` is load-bearing for convergence: when a candidate is
+/// promoted or refuted, EVERY member must be marked `crystallize_state`, not
+/// just the representative — otherwise the un-marked near-duplicates (at
+/// different `scope_ref`s) re-enter the next cycle and the loop never
+/// terminates. See the tool's `execute_structured` mark loop and the module
+/// doc's convergence section.
+#[derive(Debug, Clone)]
+pub struct Candidate<'a> {
+    pub representative: &'a FindingRow,
+    pub member_ids: Vec<Uuid>,
+}
+
 /// Pure crystallization candidate SELECTION: given the KGFIND findings for a
 /// project (via [`FindingsStore::list`] — KGFIND's own query path, no
 /// parallel SQL) and a recurrence threshold, decide which are eligible
@@ -152,21 +170,24 @@ fn same_candidate_text(a: &FindingRow, b: &FindingRow) -> bool {
 ///   the module doc's convergence section).
 ///
 /// Near-duplicate candidates (same category, same normalized description
-/// text, different `scope_ref`) are collapsed to the single
-/// highest-recurrence entry (see [`same_candidate_text`]).
+/// text, different `scope_ref`) are collapsed to a single [`Candidate`] whose
+/// `representative` is the highest-recurrence member and whose `member_ids`
+/// lists the FULL collapsed group (see [`same_candidate_text`]). Marking must
+/// then cover every `member_id`, not just the representative — the
+/// convergence guarantee.
 ///
 /// Ordering is deterministic: `occurrences` descending, then
 /// `(project_id, scope_kind, scope_ref, category, id)` ascending as a stable
 /// tiebreak — independent of whatever order the caller's `Vec` arrived in.
-pub fn select_candidates(findings: &[FindingRow], min_recurrence: i32) -> Vec<&FindingRow> {
-    let mut candidates: Vec<&FindingRow> = findings
+pub fn select_candidates(findings: &[FindingRow], min_recurrence: i32) -> Vec<Candidate<'_>> {
+    let mut filtered: Vec<&FindingRow> = findings
         .iter()
         .filter(|f| category_eligible(&f.category))
         .filter(|f| f.occurrences >= min_recurrence)
         .filter(|f| f.crystallize_state.is_none())
         .collect();
 
-    candidates.sort_by(|a, b| {
+    filtered.sort_by(|a, b| {
         b.occurrences
             .cmp(&a.occurrences)
             .then_with(|| a.project_id.cmp(&b.project_id))
@@ -176,10 +197,21 @@ pub fn select_candidates(findings: &[FindingRow], min_recurrence: i32) -> Vec<&F
             .then_with(|| a.id.cmp(&b.id))
     });
 
-    let mut deduped: Vec<&FindingRow> = Vec::with_capacity(candidates.len());
-    for c in candidates {
-        if !deduped.iter().any(|kept| same_candidate_text(kept, c)) {
-            deduped.push(c);
+    // Dedup while PRESERVING the full collapsed group. The first entry of a
+    // group (highest recurrence, by the sort above) becomes the
+    // representative; every later near-duplicate contributes its id to that
+    // representative's `member_ids` rather than being silently dropped, so a
+    // later promote/refute mark can cover the whole group and the loop
+    // converges.
+    let mut deduped: Vec<Candidate> = Vec::with_capacity(filtered.len());
+    for c in filtered {
+        if let Some(existing) = deduped
+            .iter_mut()
+            .find(|kept| same_candidate_text(kept.representative, c))
+        {
+            existing.member_ids.push(c.id);
+        } else {
+            deduped.push(Candidate { representative: c, member_ids: vec![c.id] });
         }
     }
     deduped
@@ -396,7 +428,8 @@ fn write_prose_rule(repo_root: &Path, finding: &FindingRow) -> Result<String, To
     )
 }
 
-fn candidate_summary(f: &FindingRow) -> Value {
+fn candidate_summary(c: &Candidate) -> Value {
+    let f = c.representative;
     json!({
         "finding_id": f.id.to_string(),
         "project_id": f.project_id,
@@ -405,11 +438,50 @@ fn candidate_summary(f: &FindingRow) -> Value {
         "scope_ref": f.scope_ref,
         "occurrences": f.occurrences,
         "description": f.description,
+        // Every finding id that collapsed into this candidate (incl. the
+        // representative) -- these ALL get marked on a later promote/refute,
+        // so surfacing them in the dry-run makes the convergence set visible.
+        "member_finding_ids": c.member_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
         "would_classify_as": match classify(&f.description) {
             Classification::LintStub => "lint_stub",
             Classification::Prose => "prose",
         },
     })
+}
+
+/// Which of the three mutually-exclusive execution modes a
+/// `cortex_crystallize` call resolves to, decided PURELY from `apply` and
+/// whether any review-panel transport is reachable. Extracted as a pure
+/// function (no I/O) so the two safety-critical gates — "dry-run never
+/// dispatches or writes" and "apply refuses without an adversarial panel" —
+/// are unit-testable without a live daemon or DB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrystallizeMode {
+    /// `apply:false` (default): list candidates, dispatch NOTHING, write
+    /// NOTHING, mark NOTHING. Independent of panel availability by design.
+    DryRun,
+    /// `apply:true` but no review-panel transport configured — REFUSE
+    /// (never crystallize on recurrence alone, the adversarial check is not
+    /// optional).
+    RefuseNoPanel,
+    /// `apply:true` with a reachable panel — run adversarial promotion and
+    /// write classified artifacts for survivors.
+    Apply,
+}
+
+/// Pure mode decision. `has_panel_transport` is whether ANY promotion-panel
+/// transport is configured (`REVIEW_DAEMON_TOKEN` OR `OPENROUTER_API_KEY`);
+/// it is deliberately IGNORED when `!apply`, so a dry-run is provably
+/// independent of panel availability (it can list candidates with no daemon
+/// and no key at all).
+pub fn decide_mode(apply: bool, has_panel_transport: bool) -> CrystallizeMode {
+    if !apply {
+        CrystallizeMode::DryRun
+    } else if !has_panel_transport {
+        CrystallizeMode::RefuseNoPanel
+    } else {
+        CrystallizeMode::Apply
+    }
 }
 
 fn structured(v: Value) -> Result<ToolOutput, ToolError> {
@@ -518,25 +590,30 @@ crystallization never happens on recurrence alone."
         let findings = findings_store.list(&project_id, None, None, Some(min_recurrence)).await?;
         let candidates = select_candidates(&findings, min_recurrence);
 
-        if !apply {
-            let listed: Vec<Value> = candidates.iter().map(|f| candidate_summary(f)).collect();
-            return structured(json!({
-                "configured": true,
-                "project_id": project_id,
-                "dry_run": true,
-                "applied": false,
-                "min_recurrence": min_recurrence,
-                "candidate_count": listed.len(),
-                "candidates": listed,
-            }));
-        }
-
-        // Apply mode: refuse outright without a reachable panel transport --
-        // reads ReviewConfig's already-materialized fields (not a raw
-        // std::env::var here), per the module doc's degrade contract.
+        // Reads ReviewConfig's already-materialized fields (not a raw
+        // std::env::var here) to decide reachability, per the module doc's
+        // degrade contract. The pure `decide_mode` seam then makes the two
+        // safety gates (dry-run never writes/dispatches; apply refuses
+        // without a panel) independently unit-testable.
         let review_cfg = ReviewConfig::from_env();
-        if review_cfg.daemon_token.is_none() && review_cfg.openrouter_key.is_none() {
-            return structured(json!({
+        let has_panel_transport = review_cfg.daemon_token.is_some() || review_cfg.openrouter_key.is_some();
+
+        match decide_mode(apply, has_panel_transport) {
+            CrystallizeMode::DryRun => {
+                // Dispatches NOTHING, marks NOTHING, writes NOTHING -- returns
+                // before any ReviewRun/mark/write below.
+                let listed: Vec<Value> = candidates.iter().map(candidate_summary).collect();
+                structured(json!({
+                    "configured": true,
+                    "project_id": project_id,
+                    "dry_run": true,
+                    "applied": false,
+                    "min_recurrence": min_recurrence,
+                    "candidate_count": listed.len(),
+                    "candidates": listed,
+                }))
+            }
+            CrystallizeMode::RefuseNoPanel => structured(json!({
                 "configured": true,
                 "project_id": project_id,
                 "dry_run": false,
@@ -545,85 +622,108 @@ crystallization never happens on recurrence alone."
                 "reason": "no review-panel transport configured (REVIEW_DAEMON_TOKEN / \
 OPENROUTER_API_KEY both unset) -- refusing to crystallize without an adversarial check",
                 "candidate_count": candidates.len(),
-            }));
-        }
+            })),
+            CrystallizeMode::Apply => {
+                let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+                let mut promoted = Vec::new();
+                let mut refuted = Vec::new();
+                let mut incomplete = Vec::new();
 
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut promoted = Vec::new();
-        let mut refuted = Vec::new();
-        let mut incomplete = Vec::new();
-
-        for finding in candidates {
-            let review_args = build_promotion_review_args(&providers, finding);
-            let review_result: Value = match ReviewRun::new().execute(review_args).await {
-                Ok(text) => serde_json::from_str(&text).unwrap_or_else(|_| {
-                    json!({"aggregate_verdict": "UNKNOWN", "complete": false, "parse_error": true})
-                }),
-                Err(e) => json!({"aggregate_verdict": "UNKNOWN", "complete": false, "error": e.to_string()}),
-            };
-            let aggregate_verdict = review_result
-                .get("aggregate_verdict")
-                .and_then(|v| v.as_str())
-                .unwrap_or("UNKNOWN");
-            let complete = review_result.get("complete").and_then(|v| v.as_bool()).unwrap_or(false);
-
-            match promotion_outcome(aggregate_verdict, complete) {
-                PromotionOutcome::Incomplete => {
-                    incomplete.push(json!({
-                        "finding_id": finding.id.to_string(),
-                        "reason": "promotion panel incomplete -- not marked, eligible again next cycle",
-                    }));
-                }
-                PromotionOutcome::Refuted => {
-                    findings_store.mark_crystallize_state(finding.id, "refuted").await?;
-                    refuted.push(json!({
-                        "finding_id": finding.id.to_string(),
-                        "aggregate_verdict": aggregate_verdict,
-                    }));
-                }
-                PromotionOutcome::Promoted => {
-                    let classification = classify(&finding.description);
-                    let write_result = match classification {
-                        Classification::LintStub => write_lint_stub(repo_root, finding),
-                        Classification::Prose => write_prose_rule(repo_root, finding),
+                for candidate in candidates {
+                    let finding = candidate.representative;
+                    let review_args = build_promotion_review_args(&providers, finding);
+                    let review_result: Value = match ReviewRun::new().execute(review_args).await {
+                        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|_| {
+                            json!({"aggregate_verdict": "UNKNOWN", "complete": false, "parse_error": true})
+                        }),
+                        Err(e) => json!({"aggregate_verdict": "UNKNOWN", "complete": false, "error": e.to_string()}),
                     };
-                    match write_result {
-                        Ok(artifact_path) => {
-                            findings_store.mark_crystallize_state(finding.id, "promoted").await?;
-                            promoted.push(json!({
-                                "finding_id": finding.id.to_string(),
-                                "classification": match classification {
-                                    Classification::LintStub => "lint_stub",
-                                    Classification::Prose => "prose",
-                                },
-                                "artifact": artifact_path,
-                            }));
-                        }
-                        Err(e) => {
-                            // Write failed -- do NOT mark the finding (never
-                            // record an outcome for an artifact that was never
-                            // actually produced); eligible again next cycle.
+                    let aggregate_verdict = review_result
+                        .get("aggregate_verdict")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("UNKNOWN");
+                    let complete = review_result.get("complete").and_then(|v| v.as_bool()).unwrap_or(false);
+
+                    match promotion_outcome(aggregate_verdict, complete) {
+                        PromotionOutcome::Incomplete => {
                             incomplete.push(json!({
                                 "finding_id": finding.id.to_string(),
-                                "reason": format!("artifact write failed, not marked: {e}"),
+                                "reason": "promotion panel incomplete -- not marked, eligible again next cycle",
                             }));
+                        }
+                        PromotionOutcome::Refuted => {
+                            // Convergence: mark EVERY member of the dedup group
+                            // refuted, not just the representative, so a
+                            // near-duplicate at a different scope_ref never
+                            // re-enters the next cycle.
+                            mark_group(&findings_store, &candidate.member_ids, "refuted").await?;
+                            refuted.push(json!({
+                                "finding_id": finding.id.to_string(),
+                                "member_finding_ids": ids_json(&candidate.member_ids),
+                                "aggregate_verdict": aggregate_verdict,
+                            }));
+                        }
+                        PromotionOutcome::Promoted => {
+                            let classification = classify(&finding.description);
+                            let write_result = match classification {
+                                Classification::LintStub => write_lint_stub(repo_root, finding),
+                                Classification::Prose => write_prose_rule(repo_root, finding),
+                            };
+                            match write_result {
+                                Ok(artifact_path) => {
+                                    // Convergence: mark the WHOLE group promoted.
+                                    mark_group(&findings_store, &candidate.member_ids, "promoted").await?;
+                                    promoted.push(json!({
+                                        "finding_id": finding.id.to_string(),
+                                        "member_finding_ids": ids_json(&candidate.member_ids),
+                                        "classification": match classification {
+                                            Classification::LintStub => "lint_stub",
+                                            Classification::Prose => "prose",
+                                        },
+                                        "artifact": artifact_path,
+                                    }));
+                                }
+                                Err(e) => {
+                                    // Write failed -- do NOT mark any member
+                                    // (never record an outcome for an artifact
+                                    // that was never produced); eligible again.
+                                    incomplete.push(json!({
+                                        "finding_id": finding.id.to_string(),
+                                        "reason": format!("artifact write failed, not marked: {e}"),
+                                    }));
+                                }
+                            }
                         }
                     }
                 }
+
+                structured(json!({
+                    "configured": true,
+                    "project_id": project_id,
+                    "dry_run": false,
+                    "applied": true,
+                    "min_recurrence": min_recurrence,
+                    "promoted": promoted,
+                    "refuted": refuted,
+                    "incomplete": incomplete,
+                }))
             }
         }
-
-        structured(json!({
-            "configured": true,
-            "project_id": project_id,
-            "dry_run": false,
-            "applied": true,
-            "min_recurrence": min_recurrence,
-            "promoted": promoted,
-            "refuted": refuted,
-            "incomplete": incomplete,
-        }))
     }
+}
+
+/// Mark every finding id in `member_ids` with `state` (`"promoted"` /
+/// `"refuted"`). The convergence primitive: a candidate that collapsed N
+/// near-duplicates marks all N, so none re-enters a later cycle.
+async fn mark_group(store: &FindingsStore, member_ids: &[Uuid], state: &str) -> Result<(), ToolError> {
+    for id in member_ids {
+        store.mark_crystallize_state(*id, state).await?;
+    }
+    Ok(())
+}
+
+fn ids_json(ids: &[Uuid]) -> Value {
+    json!(ids.iter().map(|id| id.to_string()).collect::<Vec<_>>())
 }
 
 /// Register `cortex_crystallize` on the core registry.
@@ -670,7 +770,7 @@ mod tests {
         ];
         let selected = select_candidates(&findings, 3);
         assert_eq!(selected.len(), 2);
-        assert!(selected.iter().all(|f| f.occurrences >= 3));
+        assert!(selected.iter().all(|c| c.representative.occurrences >= 3));
     }
 
     #[test]
@@ -683,7 +783,9 @@ mod tests {
         ];
         let selected = select_candidates(&findings, 3);
         assert_eq!(selected.len(), 2);
-        assert!(selected.iter().all(|f| f.category == "consistency" || f.category == "elegance"));
+        assert!(selected
+            .iter()
+            .all(|c| c.representative.category == "consistency" || c.representative.category == "elegance"));
     }
 
     #[test]
@@ -701,7 +803,7 @@ mod tests {
         ];
         let selected = select_candidates(&findings, 3);
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].description, "b");
+        assert_eq!(selected[0].representative.description, "b");
     }
 
     #[test]
@@ -712,7 +814,7 @@ mod tests {
         ];
         let selected = select_candidates(&findings, 3);
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].description, "b");
+        assert_eq!(selected[0].representative.description, "b");
     }
 
     #[test]
@@ -747,7 +849,7 @@ mod tests {
             finding("consistency", 5, "mid", None),
         ];
         let selected = select_candidates(&findings, 3);
-        let occ: Vec<i32> = selected.iter().map(|f| f.occurrences).collect();
+        let occ: Vec<i32> = selected.iter().map(|c| c.representative.occurrences).collect();
         assert_eq!(occ, vec![9, 5, 3]);
     }
 
@@ -757,10 +859,17 @@ mod tests {
         let mut b = finding("consistency", 4, "unused import found", None);
         a.scope_ref = "src/a.rs".to_string();
         b.scope_ref = "src/b.rs".to_string();
+        let a_id = a.id;
+        let b_id = b.id;
         let findings = vec![a, b];
         let selected = select_candidates(&findings, 3);
         assert_eq!(selected.len(), 1, "near-identical text across scope_refs must collapse");
-        assert_eq!(selected[0].occurrences, 5, "the higher-recurrence entry is kept");
+        assert_eq!(selected[0].representative.occurrences, 5, "the higher-recurrence entry is kept");
+        // Convergence: the collapsed group must carry BOTH ids so a later mark
+        // covers the near-duplicate too, not just the representative.
+        assert!(selected[0].member_ids.contains(&a_id), "representative id present");
+        assert!(selected[0].member_ids.contains(&b_id), "collapsed near-duplicate id present");
+        assert_eq!(selected[0].member_ids.len(), 2);
     }
 
     #[test]
@@ -770,6 +879,72 @@ mod tests {
             finding("elegance", 5, "duplicated logic", None),
         ];
         assert_eq!(select_candidates(&findings, 3).len(), 2);
+    }
+
+    #[test]
+    fn convergence_marking_the_whole_dedup_group_prevents_reselection_of_every_member() {
+        // The HIGH-severity convergence bug regression: two near-duplicate
+        // findings at DIFFERENT scope_refs collapse into ONE candidate; after
+        // a refute, EVERY member (not just the representative) must be marked,
+        // so NEITHER re-enters the next cycle. Simulates the mark by setting
+        // crystallize_state on each finding whose id is in `member_ids` --
+        // exactly what the tool's `mark_group` does against the DB.
+        let mut a = finding("consistency", 5, "  Unused   import  found  ", None);
+        let mut b = finding("consistency", 4, "unused import found", None);
+        a.scope_ref = "src/a.rs".to_string();
+        b.scope_ref = "src/b.rs".to_string();
+        let mut findings = vec![a, b];
+
+        // Cycle 1: one candidate, group covers BOTH ids.
+        let group_ids: Vec<Uuid> = {
+            let cycle1 = select_candidates(&findings, 3);
+            assert_eq!(cycle1.len(), 1, "the two near-duplicates collapse to one candidate");
+            assert_eq!(cycle1[0].member_ids.len(), 2, "group carries both member ids");
+            cycle1[0].member_ids.clone()
+        };
+
+        // Simulate `mark_group(.., "refuted")`: mark every member id.
+        for f in findings.iter_mut() {
+            if group_ids.contains(&f.id) {
+                f.crystallize_state = Some("refuted".to_string());
+            }
+        }
+
+        // Cycle 2: BOTH members are now excluded -- the loop converges.
+        let cycle2 = select_candidates(&findings, 3);
+        assert!(
+            cycle2.is_empty(),
+            "every member of a refuted dedup group must be excluded next cycle (convergence)"
+        );
+    }
+
+    #[test]
+    fn convergence_marking_only_the_representative_would_leave_a_member_reselectable() {
+        // Negative control proving the bug the fix closes: if ONLY the
+        // representative were marked (the old behavior), the near-duplicate
+        // at the other scope_ref would still be eligible -> non-convergence.
+        let mut a = finding("consistency", 5, "unused import found", None);
+        let mut b = finding("consistency", 4, "unused import found", None);
+        a.scope_ref = "src/a.rs".to_string();
+        b.scope_ref = "src/b.rs".to_string();
+        let rep_id = {
+            // representative is the higher-recurrence entry (a)
+            let sel = select_candidates(&[a.clone(), b.clone()], 3);
+            sel[0].representative.id
+        };
+        let mut findings = vec![a, b];
+        // Mark ONLY the representative (the buggy behavior).
+        for f in findings.iter_mut() {
+            if f.id == rep_id {
+                f.crystallize_state = Some("refuted".to_string());
+            }
+        }
+        let leftover = select_candidates(&findings, 3);
+        assert_eq!(
+            leftover.len(),
+            1,
+            "marking only the representative leaves the near-duplicate re-selectable (the bug)"
+        );
     }
 
     // ── promotion_outcome: pure decision, default-refute on uncertainty ────
@@ -807,6 +982,52 @@ mod tests {
         // never actually completed its adversarial argument is not a
         // definitive refutation.
         assert_eq!(promotion_outcome("REQUEST_CHANGES", false), PromotionOutcome::Incomplete);
+    }
+
+    // ── decide_mode: the two safety gates, unit-tested without infra ────────
+
+    #[test]
+    fn decide_mode_dry_run_by_default_regardless_of_panel() {
+        // apply:false is DryRun whether or not a panel is reachable -- proving
+        // the dry-run path (which returns BEFORE any ReviewRun dispatch, mark,
+        // or artifact write in `execute_structured`) never depends on, and
+        // never touches, the promotion panel. This is the "dry-run dispatches
+        // nothing and writes nothing" guarantee at its pure seam.
+        assert_eq!(decide_mode(false, true), CrystallizeMode::DryRun);
+        assert_eq!(decide_mode(false, false), CrystallizeMode::DryRun);
+    }
+
+    #[test]
+    fn decide_mode_apply_without_panel_refuses() {
+        // apply:true with NO reachable panel transport must REFUSE -- never
+        // crystallize on recurrence alone, the adversarial check is mandatory.
+        assert_eq!(decide_mode(true, false), CrystallizeMode::RefuseNoPanel);
+    }
+
+    #[test]
+    fn decide_mode_apply_with_panel_applies() {
+        assert_eq!(decide_mode(true, true), CrystallizeMode::Apply);
+    }
+
+    #[test]
+    fn dry_run_listing_is_a_pure_projection_with_no_side_effects() {
+        // The dry-run content is `select_candidates` + `candidate_summary`,
+        // both pure (no store, no ReviewRun, no filesystem). Building the
+        // listing therefore CANNOT dispatch a promotion panel or write an
+        // artifact -- exercised here end-to-end over the pure seam the tool's
+        // DryRun arm uses.
+        let findings = vec![
+            finding("consistency", 5, "raw std::env::var read", None),
+            finding("elegance", 4, "duplicated logic", None),
+            finding("bug", 9, "not eligible", None),
+        ];
+        let candidates = select_candidates(&findings, 3);
+        let listed: Vec<Value> = candidates.iter().map(candidate_summary).collect();
+        assert_eq!(listed.len(), 2, "only the two eligible findings are listed");
+        // Nothing here marked state or wrote a file -- the inputs are
+        // unchanged and the output is a plain projection.
+        assert!(findings.iter().all(|f| f.crystallize_state.is_none()));
+        assert!(listed.iter().all(|v| v.get("would_classify_as").is_some()));
     }
 
     // ── classify: deterministic, both branches reachable ────────────────────
@@ -925,11 +1146,13 @@ mod tests {
     // ── candidate_summary: pure projection ──────────────────────────────────
 
     #[test]
-    fn candidate_summary_includes_would_classify_as() {
-        let f = finding("consistency", 4, "raw std::env::var read", None);
-        let v = candidate_summary(&f);
+    fn candidate_summary_includes_would_classify_as_and_member_ids() {
+        let findings = vec![finding("consistency", 4, "raw std::env::var read", None)];
+        let selected = select_candidates(&findings, 3);
+        let v = candidate_summary(&selected[0]);
         assert_eq!(v["would_classify_as"], "lint_stub");
         assert_eq!(v["occurrences"], 4);
+        assert_eq!(v["member_finding_ids"].as_array().unwrap().len(), 1);
     }
 
     // ── cortex_crystallize tool: degrade + validation ───────────────────────
