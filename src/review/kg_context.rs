@@ -48,23 +48,45 @@ const MAX_RULES_BYTES: usize = 2048;
 /// since there's nothing left in the tree to look up in the graph). Capped at
 /// [`MAX_CHANGED_FILES`]. Returns an empty vec (never an error) on anything
 /// malformed or absent.
+///
+/// Thin wrapper over [`derive_changed_files_counted`] that discards the
+/// "input was truncated" signal — KGREV-01 callers (review grounding) don't
+/// surface an input-cap indicator, so their behavior is unchanged.
 pub fn derive_changed_files(context: &Value) -> Vec<String> {
+    derive_changed_files_counted(context).0
+}
+
+/// Like [`derive_changed_files`], but also reports whether the raw input
+/// exceeded [`MAX_CHANGED_FILES`] and entries were actually dropped.
+///
+/// Returns `(files, input_truncated)`: `input_truncated` is `true` iff the
+/// cap was reached AND at least one further input file (array element, or a
+/// distinct `+++ b/<path>` diff header) was discarded because of it — so a
+/// caller that must not silently cap its input (e.g. `cortex_scope`) can
+/// surface the drop. The explicit-array path counts distinct non-empty
+/// entries; the diff path counts distinct (deduped) touched paths, matching
+/// exactly what the returned `Vec` would have contained had the cap not
+/// fired.
+pub fn derive_changed_files_counted(context: &Value) -> (Vec<String>, bool) {
     if let Some(arr) = context.get("changed_files").and_then(|v| v.as_array()) {
-        let mut files: Vec<String> = arr
+        let all: Vec<String> = arr
             .iter()
             .filter_map(|v| v.as_str())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+        let input_truncated = all.len() > MAX_CHANGED_FILES;
+        let mut files = all;
         files.truncate(MAX_CHANGED_FILES);
-        return files;
+        return (files, input_truncated);
     }
 
     let Some(diff) = context.get("diff").and_then(|v| v.as_str()) else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
 
     let mut files = Vec::new();
+    let mut input_truncated = false;
     for line in diff.lines() {
         let Some(rest) = line.strip_prefix("+++ ") else { continue };
         let rest = rest.trim();
@@ -78,14 +100,18 @@ pub fn derive_changed_files(context: &Value) -> Vec<String> {
         if path.is_empty() {
             continue;
         }
-        if !files.iter().any(|f: &String| f == path) {
-            files.push(path.to_string());
+        if files.iter().any(|f: &String| f == path) {
+            continue; // already counted -- a dupe is not a dropped input
         }
         if files.len() >= MAX_CHANGED_FILES {
+            // A NEW, distinct path we cannot admit because the cap is full:
+            // this is a genuine dropped input, not a dedup.
+            input_truncated = true;
             break;
         }
+        files.push(path.to_string());
     }
-    files
+    (files, input_truncated)
 }
 
 /// A minimal neighbor summary: id, edge kind, direction-implied by which list
@@ -396,6 +422,52 @@ diff --git a/deleted.rs b/deleted.rs\n\
     fn derive_changed_files_empty_when_nothing_present() {
         assert_eq!(derive_changed_files(&json!({})), Vec::<String>::new());
         assert_eq!(derive_changed_files(&json!({"diff": "not a diff"})), Vec::<String>::new());
+    }
+
+    #[test]
+    fn derive_changed_files_counted_flags_no_truncation_under_cap() {
+        let ctx = json!({"changed_files": ["src/a.rs", "src/b.rs"]});
+        let (files, truncated) = derive_changed_files_counted(&ctx);
+        assert_eq!(files, vec!["src/a.rs", "src/b.rs"]);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn derive_changed_files_counted_flags_array_truncation_over_cap() {
+        let big: Vec<String> = (0..MAX_CHANGED_FILES + 5).map(|i| format!("src/f{i}.rs")).collect();
+        let ctx = json!({"changed_files": big});
+        let (files, truncated) = derive_changed_files_counted(&ctx);
+        assert_eq!(files.len(), MAX_CHANGED_FILES);
+        assert!(truncated, "an array over MAX_CHANGED_FILES must flag input truncation");
+    }
+
+    #[test]
+    fn derive_changed_files_counted_flags_diff_truncation_over_cap() {
+        let mut diff = String::new();
+        for i in 0..MAX_CHANGED_FILES + 5 {
+            diff.push_str(&format!("+++ b/src/f{i}.rs\n"));
+        }
+        let ctx = json!({"diff": diff});
+        let (files, truncated) = derive_changed_files_counted(&ctx);
+        assert_eq!(files.len(), MAX_CHANGED_FILES);
+        assert!(truncated, "a diff with more than MAX_CHANGED_FILES distinct paths must flag input truncation");
+    }
+
+    #[test]
+    fn derive_changed_files_counted_dupes_do_not_flag_truncation() {
+        // Exactly MAX_CHANGED_FILES distinct paths, but repeated many times:
+        // the dedup keeps us at the cap without ever dropping a NEW path, so
+        // this is not an input truncation.
+        let mut diff = String::new();
+        for _ in 0..3 {
+            for i in 0..MAX_CHANGED_FILES {
+                diff.push_str(&format!("+++ b/src/f{i}.rs\n"));
+            }
+        }
+        let ctx = json!({"diff": diff});
+        let (files, truncated) = derive_changed_files_counted(&ctx);
+        assert_eq!(files.len(), MAX_CHANGED_FILES);
+        assert!(!truncated, "repeated (deduped) paths at the cap are not a dropped input");
     }
 
     #[test]

@@ -271,14 +271,14 @@ impl RustTool for CortexScope {
             validate_text_len(cf, "changed_files")?;
         }
 
-        let changed_files = scope::changed_files_from_args(&args);
+        let (changed_files, input_truncated) = scope::changed_files_from_args(&args);
         if changed_files.is_empty() {
             return Err(ToolError::InvalidArgument(
                 "must provide a non-empty 'changed_files' (string or array) or 'diff'".to_string(),
             ));
         }
 
-        let response = scope::compute_scope(project_id, &changed_files, self.config.max_blast_nodes);
+        let response = scope::compute_scope(project_id, &changed_files, self.config.max_blast_nodes, input_truncated);
         serde_json::to_string_pretty(&response)
             .map_err(|e| ToolError::Execution(format!("JSON render error: {e}")))
     }
@@ -559,6 +559,28 @@ mod tests {
             .expect("diff-only input must be accepted");
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["changed_files"], json!(["src/a.rs"]));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_scope_flags_truncated_on_oversized_input_file_list() {
+        // An input file list far larger than MAX_CHANGED_FILES must surface
+        // `truncated:true` (input-file cap) rather than being silently capped
+        // by derive_changed_files. Runs against an empty store dir so the
+        // degrade path is exercised too; the input-cap flag must survive it.
+        let store_dir = std::env::temp_dir().join(format!("atlas-cortexmod-inputcap-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+
+        let big: Vec<String> = (0..500).map(|i| format!("src/f{i}.rs")).collect();
+        let tool = CortexScope { config: test_config() };
+        let out = tool
+            .execute(json!({"project_id": "TERM", "changed_files": big}))
+            .await
+            .expect("oversized input must degrade/scope, not error");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["truncated"], true, "oversized input file list must set truncated:true");
+
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
     }
 
     // --- cortex_review (stub) --------------------------------------------------

@@ -741,8 +741,9 @@ Its risk/elegance surface is rebuilt over the following S115 items:
   the whole project). Degrades to `configured:false` (the literal
   `changed_files` echoed back as unresolved entries) instead of erroring when
   the project has no stored Atlas graph yet — dispatch never breaks on a
-  missing graph. Oversized results are capped (`CORTEX_MAX_BLAST_NODES`,
-  default 200) with `truncated:true` and a logged warning, never a silent drop.
+  missing graph. Sets `truncated:true` (with a distinct logged warning, never
+  a silent drop) for either the input-file cap (`MAX_CHANGED_FILES`) or the
+  blast-node cap (`CORTEX_MAX_BLAST_NODES`, default 200).
 - `cortex_review` — post-change `risk_score` (0–10) + named `risk_signals`
   from Atlas structural metrics and KGFIND recurrence (stub pending **CXEG-04**).
 - `cortex_audit` — audit an external public repo URL (stub pending **CXEG-11**);

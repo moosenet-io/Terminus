@@ -103,9 +103,13 @@ with `review_run`'s KGREV-01 grounding, not reimplemented:
    (`crate::scribe::graph::vec_embed::node_card`), used here as a proxy for
    "how much smaller is the context a model needs to read than the whole
    project."
-6. If the walk would enumerate more than `CORTEX_MAX_BLAST_NODES` nodes (see
-   "Configuration" below), it stops and sets `"truncated": true` — plus a
-   `tracing::warn!` noting the drop — rather than silently capping.
+6. Sets `"truncated": true` (plus a distinct `tracing::warn!`) for EITHER of
+   two independent caps — never a silent drop:
+   - **input-file cap**: the raw `changed_files`/`diff` input exceeded
+     `MAX_CHANGED_FILES` (the shared `review::kg_context` limit) and files
+     were dropped before scoping;
+   - **blast-node cap**: the walk would enumerate more than
+     `CORTEX_MAX_BLAST_NODES` nodes (see "Configuration" below) and stopped.
 
 **Response shape** (live graph):
 
@@ -305,8 +309,14 @@ node is echoed back as an unresolved literal entry alongside resolved
 symbols; `compute_scope` against an unconfigured/empty store degrades to
 `configured:false` with every `changed_files` entry unresolved; an
 artificially low `max_blast_nodes` sets `truncated:true` and caps the
-returned `blast_radius`; and `token_reduction_pct` is `0.0` for an empty
-graph and high when only a small fraction of a larger graph is touched.
+returned `blast_radius`; an input file list over `MAX_CHANGED_FILES` sets
+`truncated:true` via the input-file cap (distinct from the node cap, and
+surfaced even on the `configured:false` degrade path); and
+`token_reduction_pct` is `0.0` for an empty graph and high when only a small
+fraction of a larger graph is touched. `src/review/kg_context.rs`'s tests add
+coverage for `derive_changed_files_counted`'s `(files, input_truncated)`
+signal (array- and diff-path caps flag truncation; deduped paths at the cap
+do not), while the existing `derive_changed_files` tests are unchanged.
 `src/cortex/deprecated.rs`'s test module covers: all 7 aliases register,
 each returns a `{"deprecated":true,"use":...}` pointer regardless of input
 shape (including empty args), and no alias's `execute` does any I/O.

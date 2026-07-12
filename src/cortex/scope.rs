@@ -32,7 +32,7 @@ use std::collections::HashSet;
 
 use serde_json::{json, Value};
 
-use crate::review::kg_context::derive_changed_files;
+use crate::review::kg_context::derive_changed_files_counted;
 use crate::scribe::graph::model::{KgNode, KnowledgeGraph};
 use crate::scribe::graph::store::GraphStore;
 use crate::scribe::graph::vec_embed::node_card;
@@ -45,8 +45,8 @@ use crate::scribe::ScribeConfig;
 pub const DEFAULT_MAX_BLAST_NODES: usize = 200;
 
 /// Adapt `cortex_scope`'s own argument shapes into the `{"changed_files"|
-/// "diff": ...}` shape [`derive_changed_files`] understands, then delegate to
-/// it -- no duplicate diff-parsing here.
+/// "diff": ...}` shape [`derive_changed_files_counted`] understands, then
+/// delegate to it -- no duplicate diff-parsing here.
 ///
 /// Accepts, in priority order:
 /// 1. `changed_files` as a JSON array of strings (same shape `review_run`'s
@@ -54,16 +54,21 @@ pub const DEFAULT_MAX_BLAST_NODES: usize = 200;
 /// 2. `changed_files` as a comma-separated string (the CXEG-01 stub's
 ///    original schema; kept for backward compatibility with existing
 ///    callers).
-/// 3. `diff`, a unified diff (parsed via `derive_changed_files`'s own
+/// 3. `diff`, a unified diff (parsed via `derive_changed_files_counted`'s own
 ///    `+++ b/<path>` header scan).
 ///
-/// Returns an empty vec (never an error) if none of the above are present or
-/// everything parses to nothing -- the caller (`CortexScope::execute`)
-/// decides whether an empty result is an `InvalidArgument`.
-pub fn changed_files_from_args(args: &Value) -> Vec<String> {
+/// Returns `(files, input_truncated)`. `input_truncated` is `true` when the
+/// raw input exceeded `MAX_CHANGED_FILES` and entries were dropped by
+/// `derive_changed_files_counted` -- so `cortex_scope` can surface that
+/// input-level cap instead of silently swallowing it (distinct from its own
+/// blast-radius `max_blast_nodes` cap). Returns an empty vec (never an error)
+/// if none of the above are present or everything parses to nothing -- the
+/// caller (`CortexScope::execute`) decides whether an empty result is an
+/// `InvalidArgument`.
+pub fn changed_files_from_args(args: &Value) -> (Vec<String>, bool) {
     if let Some(arr) = args.get("changed_files").and_then(|v| v.as_array()) {
         let ctx = json!({"changed_files": arr.clone()});
-        return derive_changed_files(&ctx);
+        return derive_changed_files_counted(&ctx);
     }
     if let Some(s) = args.get("changed_files").and_then(|v| v.as_str()) {
         let arr: Vec<Value> = s
@@ -74,41 +79,47 @@ pub fn changed_files_from_args(args: &Value) -> Vec<String> {
             .collect();
         if !arr.is_empty() {
             let ctx = json!({"changed_files": arr});
-            return derive_changed_files(&ctx);
+            return derive_changed_files_counted(&ctx);
         }
     }
     if let Some(diff) = args.get("diff").and_then(|v| v.as_str()) {
         let ctx = json!({"diff": diff});
-        return derive_changed_files(&ctx);
+        return derive_changed_files_counted(&ctx);
     }
-    Vec::new()
+    (Vec::new(), false)
 }
 
 /// Compute the pre-dispatch blast-radius response for `project_id` +
 /// `changed_files`: touched symbols, their 1-hop callers/callees, affected
 /// communities, `blast_count`, and a `token_reduction_pct` estimate.
 ///
+/// `input_truncated` is the signal from [`changed_files_from_args`] that the
+/// raw INPUT file list was itself capped at `MAX_CHANGED_FILES` before it
+/// reached here — when set, the response carries `truncated: true` (and the
+/// caller logs the input-cap drop distinctly), so an oversized input is never
+/// silently swallowed, independent of the blast-radius `max_blast_nodes` cap.
+///
 /// Loads the project's Atlas graph via the same `GraphStore` API `kg_*` uses.
 /// A store/graph-load failure or an unbuilt graph degrades to a
 /// `"configured": false` response (see module doc) rather than propagating
 /// an error.
-pub fn compute_scope(project_id: &str, changed_files: &[String], max_blast_nodes: usize) -> Value {
+pub fn compute_scope(project_id: &str, changed_files: &[String], max_blast_nodes: usize, input_truncated: bool) -> Value {
     let store = GraphStore::from_config(&ScribeConfig::from_env());
     match store.load(project_id) {
-        Ok(Some(graph)) => build_scope_response(project_id, changed_files, &graph, max_blast_nodes),
-        Ok(None) | Err(_) => unavailable_response(project_id, changed_files),
+        Ok(Some(graph)) => build_scope_response(project_id, changed_files, &graph, max_blast_nodes, input_truncated),
+        Ok(None) | Err(_) => unavailable_response(project_id, changed_files, input_truncated),
     }
 }
 
 /// The `"configured": false` degrade response: each changed file echoed back
 /// as a literal, unresolved `blast_radius` entry.
-fn unavailable_response(project_id: &str, changed_files: &[String]) -> Value {
+fn unavailable_response(project_id: &str, changed_files: &[String], input_truncated: bool) -> Value {
     let blast_radius: Vec<Value> = changed_files
         .iter()
         .map(|f| json!({"id": f, "path": f, "kind": "file", "resolved": false, "role": "touched"}))
         .collect();
     let blast_count = blast_radius.len();
-    json!({
+    let mut response = json!({
         "configured": false,
         "project_id": project_id,
         "changed_files": changed_files,
@@ -116,13 +127,17 @@ fn unavailable_response(project_id: &str, changed_files: &[String]) -> Value {
         "affected_communities": [],
         "blast_count": blast_count,
         "token_reduction_pct": 0.0,
-    })
+    });
+    if input_truncated {
+        response["truncated"] = json!(true);
+    }
+    response
 }
 
 /// The live-graph path: touched nodes (current nodes whose `path` is in
 /// `changed_files`) + their 1-hop callers/callees, capped at
 /// `max_blast_nodes`.
-fn build_scope_response(project_id: &str, changed_files: &[String], graph: &KnowledgeGraph, max_blast_nodes: usize) -> Value {
+fn build_scope_response(project_id: &str, changed_files: &[String], graph: &KnowledgeGraph, max_blast_nodes: usize, input_truncated: bool) -> Value {
     let changed: HashSet<&str> = changed_files.iter().map(|s| s.as_str()).collect();
 
     let mut touched: Vec<&KgNode> = graph.current_nodes().filter(|n| changed.contains(n.path.as_str())).collect();
@@ -133,12 +148,15 @@ fn build_scope_response(project_id: &str, changed_files: &[String], graph: &Know
     let mut blast_radius: Vec<Value> = Vec::new();
     let mut affected: HashSet<String> = HashSet::new();
     let mut communities: HashSet<u32> = HashSet::new();
-    let mut truncated = false;
+    // The node-cap (`max_blast_nodes`) truncation is tracked separately from
+    // the input-file cap so each can be warned distinctly; both fold into the
+    // single response `truncated` flag.
+    let mut node_truncated = false;
 
     // 1. Touched (resolved) symbols, deterministic id order.
     'touched: for n in &touched {
         if affected.len() >= max_blast_nodes {
-            truncated = true;
+            node_truncated = true;
             break 'touched;
         }
         if affected.insert(n.id.clone()) {
@@ -155,13 +173,13 @@ fn build_scope_response(project_id: &str, changed_files: &[String], graph: &Know
     // 2. Changed files with no matching graph node -- echoed back as literal,
     // unresolved entries so `blast_radius` always accounts for every input
     // file (e.g. a brand-new file not yet indexed by `scribe_kg_build`).
-    if !truncated {
+    if !node_truncated {
         'unresolved: for f in changed_files {
             if matched_paths.contains(f.as_str()) {
                 continue;
             }
             if affected.len() >= max_blast_nodes {
-                truncated = true;
+                node_truncated = true;
                 break 'unresolved;
             }
             if affected.insert(f.clone()) {
@@ -172,7 +190,7 @@ fn build_scope_response(project_id: &str, changed_files: &[String], graph: &Know
 
     // 3. 1-hop callers/callees of every touched (resolved) node, deterministic
     // (sorted, deduped) order.
-    if !truncated {
+    if !node_truncated {
         let mut neighbor_ids: Vec<(String, bool)> = Vec::new();
         for n in &touched {
             for e in graph.edges() {
@@ -191,7 +209,7 @@ fn build_scope_response(project_id: &str, changed_files: &[String], graph: &Know
                 continue;
             }
             if affected.len() >= max_blast_nodes {
-                truncated = true;
+                node_truncated = true;
                 break 'neighbors;
             }
             if let Some(node) = graph.get_node(&nid) {
@@ -208,13 +226,20 @@ fn build_scope_response(project_id: &str, changed_files: &[String], graph: &Know
         }
     }
 
-    if truncated {
+    if node_truncated {
         tracing::warn!(
             "cortex_scope: project '{project_id}' blast radius exceeded max_blast_nodes \
              ({max_blast_nodes}) with {} changed file(s); dropping remaining nodes \
              (enumerated {})",
             changed_files.len(),
             affected.len(),
+        );
+    }
+    if input_truncated {
+        tracing::warn!(
+            "cortex_scope: project '{project_id}' input file list exceeded MAX_CHANGED_FILES; \
+             some changed files were dropped before scoping (using {} file(s))",
+            changed_files.len(),
         );
     }
 
@@ -232,7 +257,7 @@ fn build_scope_response(project_id: &str, changed_files: &[String], graph: &Know
         "blast_count": affected.len(),
         "token_reduction_pct": token_reduction_pct,
     });
-    if truncated {
+    if node_truncated || input_truncated {
         response["truncated"] = json!(true);
     }
     response
@@ -304,26 +329,32 @@ mod tests {
     #[test]
     fn changed_files_from_args_prefers_array() {
         let args = json!({"changed_files": ["src/a.rs", "src/b.rs"], "diff": "ignored"});
-        assert_eq!(changed_files_from_args(&args), vec!["src/a.rs", "src/b.rs"]);
+        let (files, truncated) = changed_files_from_args(&args);
+        assert_eq!(files, vec!["src/a.rs", "src/b.rs"]);
+        assert!(!truncated);
     }
 
     #[test]
     fn changed_files_from_args_splits_csv_string() {
         let args = json!({"changed_files": "src/a.rs, src/b.rs ,,src/c.rs"});
-        assert_eq!(changed_files_from_args(&args), vec!["src/a.rs", "src/b.rs", "src/c.rs"]);
+        let (files, truncated) = changed_files_from_args(&args);
+        assert_eq!(files, vec!["src/a.rs", "src/b.rs", "src/c.rs"]);
+        assert!(!truncated);
     }
 
     #[test]
     fn changed_files_from_args_falls_back_to_diff() {
         let diff = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-x\n+y\n";
         let args = json!({"diff": diff});
-        assert_eq!(changed_files_from_args(&args), vec!["src/a.rs"]);
+        let (files, truncated) = changed_files_from_args(&args);
+        assert_eq!(files, vec!["src/a.rs"]);
+        assert!(!truncated);
     }
 
     #[test]
     fn changed_files_from_args_matches_csv_and_diff_forms() {
         // The explicit-CSV and diff-only forms must agree on the same file
-        // set, since both funnel through `derive_changed_files`.
+        // set, since both funnel through `derive_changed_files_counted`.
         let csv_args = json!({"changed_files": "src/a.rs"});
         let diff = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-x\n+y\n";
         let diff_args = json!({"diff": diff});
@@ -332,8 +363,19 @@ mod tests {
 
     #[test]
     fn changed_files_from_args_empty_when_nothing_present() {
-        assert_eq!(changed_files_from_args(&json!({})), Vec::<String>::new());
-        assert_eq!(changed_files_from_args(&json!({"changed_files": ""})), Vec::<String>::new());
+        assert_eq!(changed_files_from_args(&json!({})), (Vec::<String>::new(), false));
+        assert_eq!(changed_files_from_args(&json!({"changed_files": ""})), (Vec::<String>::new(), false));
+    }
+
+    #[test]
+    fn changed_files_from_args_flags_input_truncation_for_oversized_array() {
+        // An input array well over MAX_CHANGED_FILES must report the drop so
+        // cortex_scope can surface `truncated:true` for the INPUT cap.
+        let big: Vec<String> = (0..300).map(|i| format!("src/f{i}.rs")).collect();
+        let args = json!({"changed_files": big});
+        let (files, truncated) = changed_files_from_args(&args);
+        assert!(truncated, "oversized input array must flag input truncation");
+        assert!(files.len() < 300, "input must actually be capped");
     }
 
     // ── compute_scope: graph-unavailable degrade ─────────────────────────
@@ -345,7 +387,7 @@ mod tests {
         std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
 
         let changed = vec!["src/a.rs".to_string(), "src/missing.rs".to_string()];
-        let out = compute_scope("NOPE", &changed, DEFAULT_MAX_BLAST_NODES);
+        let out = compute_scope("NOPE", &changed, DEFAULT_MAX_BLAST_NODES, false);
 
         assert_eq!(out["configured"], false);
         assert_eq!(out["blast_count"], 2);
@@ -367,7 +409,7 @@ mod tests {
         let store = GraphStore::from_config(&ScribeConfig::from_env());
         seed_graph(&store, "TERM");
 
-        let out = compute_scope("TERM", &["src/a.rs".to_string()], DEFAULT_MAX_BLAST_NODES);
+        let out = compute_scope("TERM", &["src/a.rs".to_string()], DEFAULT_MAX_BLAST_NODES, false);
         assert_eq!(out["configured"], true);
 
         let ids: Vec<&str> = out["blast_radius"]
@@ -401,7 +443,7 @@ mod tests {
         seed_graph(&store, "TERM");
 
         let changed = vec!["src/a.rs".to_string(), "src/unindexed.rs".to_string()];
-        let out = compute_scope("TERM", &changed, DEFAULT_MAX_BLAST_NODES);
+        let out = compute_scope("TERM", &changed, DEFAULT_MAX_BLAST_NODES, false);
         assert_eq!(out["configured"], true);
 
         let radius = out["blast_radius"].as_array().unwrap();
@@ -423,11 +465,45 @@ mod tests {
         // Only 1 touched symbol allowed through before the cap bites, even
         // though the fixture graph has 2 touched nodes in src/a.rs plus a
         // cross-file caller.
-        let out = compute_scope("TERM", &["src/a.rs".to_string()], 1);
+        let out = compute_scope("TERM", &["src/a.rs".to_string()], 1, false);
         assert_eq!(out["truncated"], true);
         assert_eq!(out["blast_radius"].as_array().unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&store_dir);
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn compute_scope_sets_truncated_on_input_cap_distinct_from_node_cap() {
+        // Input-file cap path: a healthy node budget (nothing dropped by the
+        // blast-radius cap), but `input_truncated=true` propagated from the
+        // parse step must still surface `truncated:true`.
+        let store_dir = tmp_store("inputcap");
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+        let store = GraphStore::from_config(&ScribeConfig::from_env());
+        seed_graph(&store, "TERM");
+
+        let out = compute_scope("TERM", &["src/a.rs".to_string()], DEFAULT_MAX_BLAST_NODES, true);
+        assert_eq!(out["truncated"], true, "input-cap must set truncated even when node cap didn't fire");
+        // The node cap did NOT fire: the full fixture blast radius is present.
+        assert!(out["blast_radius"].as_array().unwrap().len() >= 3);
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn compute_scope_input_cap_sets_truncated_even_when_graph_unavailable() {
+        // The degrade (configured:false) path must also surface an input cap.
+        let store_dir = tmp_store("inputcap-nograph");
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+
+        let out = compute_scope("NOPE", &["src/a.rs".to_string()], DEFAULT_MAX_BLAST_NODES, true);
+        assert_eq!(out["configured"], false);
+        assert_eq!(out["truncated"], true);
+
         std::env::remove_var("SCRIBE_KG_STORE_DIR");
     }
 
@@ -439,7 +515,7 @@ mod tests {
         let store = GraphStore::from_config(&ScribeConfig::from_env());
         seed_graph(&store, "TERM");
 
-        let out = compute_scope("TERM", &["src/unrelated.rs".to_string()], DEFAULT_MAX_BLAST_NODES);
+        let out = compute_scope("TERM", &["src/unrelated.rs".to_string()], DEFAULT_MAX_BLAST_NODES, false);
         assert_eq!(out["configured"], true);
         assert_eq!(out.get("truncated"), None);
         let radius = out["blast_radius"].as_array().unwrap();
