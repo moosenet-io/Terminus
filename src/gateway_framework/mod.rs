@@ -103,12 +103,27 @@ pub enum ActionKind {
     /// the route path (e.g. `/v1/chat/completions`).
     Inference,
     /// TMOD-05: a broker admin-control-plane request (worker
-    /// register/deregister/health/list) — `action` is an `"admin:<op>"`
-    /// label (e.g. `"admin:register_worker"`), never a bare tool name, so an
-    /// admin audit entry is never confusable with a `Tool`-kind one sharing
-    /// the same identity/action string.
+    /// register/deregister/health/list) — `action` is an
+    /// [`ADMIN_ACTION_PREFIX`]-prefixed `"admin:<op>"` label (e.g.
+    /// `"admin:register_worker"`), never a bare tool name, so an admin audit
+    /// entry is never confusable with a `Tool`-kind one sharing the same
+    /// identity/action string, AND — critically — so admin authorization can
+    /// be made KIND-AWARE: an `Admin` action is authorized ONLY by an
+    /// explicitly admin-scoped grant entry, never by a generic tool wildcard
+    /// (see [`AllowlistPolicy::is_allowed_admin`] / [`Grant::permits_admin`]).
     Admin,
 }
+
+/// The action-string namespace every [`ActionKind::Admin`] action carries
+/// (`crate::broker::control` emits `"admin:register_worker"`,
+/// `"admin:deregister_worker"`, `"admin:health_worker"`,
+/// `"admin:list_workers"`). Authorization for an `Admin` action requires a
+/// grant entry WITHIN this namespace — an admin-scoped exact entry or an
+/// `"admin:*"`/`"admin:<prefix>*"` wildcard — never a bare `"*"` tool
+/// wildcard. This is what prevents a broad tool/inference identity
+/// (`Grant::List(["*"])` / `allow: ["*"]`) from silently escalating to
+/// worker-control admin (a route-hijack privilege escalation).
+pub const ADMIN_ACTION_PREFIX: &str = "admin:";
 
 /// Identities scaffolded into every `from_env()`-built [`AllowlistPolicy`]
 /// as recognized entries — LHEG-02 (Terminus S109 lumina/harmony
@@ -227,6 +242,29 @@ impl Grant {
             }
         }
     }
+
+    /// TMOD-05: whether this grant EXPLICITLY authorizes an admin `action`
+    /// (an [`ADMIN_ACTION_PREFIX`]-namespaced string). Identical in shape to
+    /// [`Grant::permits`] (deny still wins for an `AllowDeny` grant), but the
+    /// allow side uses [`admin_entry_matches`] instead of
+    /// [`grant_entry_matches`] — so a bare `"*"` tool wildcard NEVER
+    /// satisfies an admin action; only an admin-namespace-scoped entry
+    /// (`"admin:*"`, `"admin:<prefix>*"`, or an exact `"admin:<op>"`) does.
+    /// This is the kind-aware authorization the admin surface requires: a
+    /// broad tool identity is not, by that fact alone, a worker-control
+    /// admin.
+    fn permits_admin(&self, action: &str) -> bool {
+        match self {
+            Grant::List(actions) => actions.iter().any(|a| admin_entry_matches(a, action)),
+            Grant::AllowDeny { allow, deny } => {
+                let allowed = allow.iter().any(|a| admin_entry_matches(a, action));
+                if !allowed {
+                    return false;
+                }
+                !deny.iter().any(|d| deny_matches(d, action))
+            }
+        }
+    }
 }
 
 /// Whether allow/list `entry` matches `action`. Three shapes:
@@ -246,6 +284,36 @@ fn grant_entry_matches(entry: &str, action: &str) -> bool {
     match entry.strip_suffix('*') {
         Some(prefix) => action.starts_with(prefix),
         None => entry == action,
+    }
+}
+
+/// TMOD-05: whether allow/list `entry` EXPLICITLY authorizes admin `action`
+/// (an [`ADMIN_ACTION_PREFIX`]-namespaced string). Deliberately STRICTER
+/// than [`grant_entry_matches`]: a bare `"*"` (or any wildcard whose prefix
+/// is not itself within the admin namespace) does NOT match — an admin
+/// action is granted only by
+/// - an exact admin entry (`entry == action`, e.g.
+///   `"admin:register_worker"`), or
+/// - an admin-namespace-scoped wildcard whose prefix starts with
+///   [`ADMIN_ACTION_PREFIX`] (e.g. `"admin:*"`, `"admin:reg*"`).
+///
+/// So `Grant::List(["*"])` — a full tool wildcard — authorizes every TOOL
+/// call but NO admin op; only a grant that names the `admin:` namespace
+/// does. This is the fix for the privilege-escalation gap where a generic
+/// tool wildcard silently authorized worker register/deregister.
+fn admin_entry_matches(entry: &str, action: &str) -> bool {
+    if entry == action {
+        // An exact match is always explicit -- but only an admin-namespaced
+        // action can reach here as an `Admin`-kind action anyway; guard
+        // against a mis-scoped caller by still requiring the namespace.
+        return action.starts_with(ADMIN_ACTION_PREFIX);
+    }
+    match entry.strip_suffix('*') {
+        // A wildcard counts ONLY if its prefix is itself admin-scoped, so a
+        // bare "*" (prefix "") or a non-admin prefix ("tool_*") never grants
+        // an admin action.
+        Some(prefix) => prefix.starts_with(ADMIN_ACTION_PREFIX) && action.starts_with(prefix),
+        None => false,
     }
 }
 
@@ -393,6 +461,22 @@ impl AllowlistPolicy {
     pub fn is_allowed(&self, identity: &str, action: &str) -> bool {
         match self.entries.get(identity) {
             Some(grant) => grant.permits(action),
+            None => false,
+        }
+    }
+
+    /// TMOD-05: whether `identity` may perform an ADMIN `action` (an
+    /// [`ADMIN_ACTION_PREFIX`]-namespaced string). Same default-deny posture
+    /// as [`Self::is_allowed`] (no entry ⇒ denied), but backed by
+    /// [`Grant::permits_admin`] instead of [`Grant::permits`], so a generic
+    /// tool wildcard (`"*"`) does NOT authorize an admin op — only an
+    /// explicit admin-scoped grant does. [`GatewayFramework::guard`] routes
+    /// every [`ActionKind::Admin`] request through THIS check rather than
+    /// [`Self::is_allowed`], closing the wildcard-tool-grant privilege
+    /// escalation onto the worker-control surface.
+    pub fn is_allowed_admin(&self, identity: &str, action: &str) -> bool {
+        match self.entries.get(identity) {
+            Some(grant) => grant.permits_admin(action),
             None => false,
         }
     }
@@ -607,8 +691,24 @@ impl GatewayFramework {
             }
         };
 
-        if !self.inner.allowlist.is_allowed(&identity_str, action) {
-            let detail = if self.inner.allowlist.has_any_entry(&identity_str) {
+        // TMOD-05: authorization is KIND-AWARE. An `Admin` action is checked
+        // against `is_allowed_admin` (which requires an EXPLICIT admin-scoped
+        // grant -- a bare tool `"*"` wildcard never satisfies it); every
+        // other kind uses the ordinary tool/route `is_allowed`. This is what
+        // stops a broad tool/inference identity from silently escalating onto
+        // the worker-control admin surface.
+        let permitted = match kind {
+            ActionKind::Admin => self.inner.allowlist.is_allowed_admin(&identity_str, action),
+            ActionKind::Tool | ActionKind::Inference => self.inner.allowlist.is_allowed(&identity_str, action),
+        };
+        if !permitted {
+            let detail = if kind == ActionKind::Admin {
+                // Name-only: identity + action, never why-not internals.
+                format!(
+                    "identity '{identity_str}' lacks an explicit admin grant for '{action}' \
+                     (a generic tool wildcard does not authorize admin ops)"
+                )
+            } else if self.inner.allowlist.has_any_entry(&identity_str) {
                 format!("identity '{identity_str}' is not allowlisted for '{action}'")
             } else {
                 format!("identity '{identity_str}' has no allowlist entries configured")
@@ -713,6 +813,79 @@ mod tests {
             .guard(Some(&id), "/v1/chat/completions", ActionKind::Inference)
             .await
             .is_ok());
+    }
+
+    // ── TMOD-05: kind-aware admin authz (privilege-escalation fix) ────────
+
+    /// A generic tool wildcard (`"*"`) authorizes every TOOL/INFERENCE action
+    /// but NO `ActionKind::Admin` action — a broad tool identity cannot
+    /// silently become a worker-control admin.
+    #[tokio::test]
+    async fn tool_wildcard_does_not_authorize_admin_actions() {
+        let fw = framework_with(policy_allowing("broad-tool-id", &["*"]), 10);
+        let id = identity("broad-tool-id");
+
+        // Same identity, same "*" grant: tool call allowed, admin denied.
+        assert!(
+            fw.guard(Some(&id), "ledger_accounts", ActionKind::Tool).await.is_ok(),
+            "the tool wildcard must still allow ordinary tool calls (no regression)"
+        );
+        let admin = fw.guard(Some(&id), "admin:register_worker", ActionKind::Admin).await;
+        assert!(admin.is_err(), "a bare tool wildcard must NOT authorize an admin op");
+        assert_eq!(admin.unwrap_err().status(), StatusCode::FORBIDDEN);
+    }
+
+    /// An explicit admin-scoped grant (`"admin:*"`) authorizes admin actions.
+    #[tokio::test]
+    async fn explicit_admin_wildcard_authorizes_admin_actions() {
+        let fw = framework_with(policy_allowing("worker-admin", &["admin:*"]), 10);
+        let id = identity("worker-admin");
+        assert!(fw.guard(Some(&id), "admin:register_worker", ActionKind::Admin).await.is_ok());
+        assert!(fw.guard(Some(&id), "admin:deregister_worker", ActionKind::Admin).await.is_ok());
+    }
+
+    /// An exact admin entry authorizes exactly that admin op and no other.
+    #[tokio::test]
+    async fn exact_admin_entry_is_scoped_to_that_op() {
+        let fw = framework_with(policy_allowing("scoped-admin", &["admin:list_workers"]), 10);
+        let id = identity("scoped-admin");
+        assert!(fw.guard(Some(&id), "admin:list_workers", ActionKind::Admin).await.is_ok());
+        // A different admin op is NOT granted by the exact single-op entry.
+        assert!(fw.guard(Some(&id), "admin:register_worker", ActionKind::Admin).await.is_err());
+    }
+
+    /// The new admin rule does not touch ordinary tool authorization: an
+    /// identity with a specific (non-admin) tool grant is unaffected — the
+    /// tool it holds is still allowed, and it holds no admin power.
+    #[tokio::test]
+    async fn non_admin_tool_authorization_is_unaffected_by_the_admin_rule() {
+        let fw = framework_with(policy_allowing("dev-box", &["ledger_accounts", "admin:health_worker"]), 10);
+        let id = identity("dev-box");
+        // Tool call: unchanged, still allowed by the specific entry.
+        assert!(fw.guard(Some(&id), "ledger_accounts", ActionKind::Tool).await.is_ok());
+        // The explicit admin entry it DOES hold works for its op...
+        assert!(fw.guard(Some(&id), "admin:health_worker", ActionKind::Admin).await.is_ok());
+        // ...but not for an admin op it wasn't granted.
+        assert!(fw.guard(Some(&id), "admin:register_worker", ActionKind::Admin).await.is_err());
+    }
+
+    /// An `AllowDeny` grant with `allow: ["*"]` (broad tool access) still
+    /// grants no admin op — the deny layer isn't even needed; the `"*"` in
+    /// `allow` simply doesn't match an admin action under the kind-aware rule.
+    #[tokio::test]
+    async fn allow_deny_star_grant_still_denies_admin() {
+        let mut map = HashMap::new();
+        map.insert(
+            "scaffolded".to_string(),
+            Grant::AllowDeny { allow: vec!["*".to_string()], deny: vec!["github_".to_string()] },
+        );
+        let fw = framework_with(AllowlistPolicy::new(map), 10);
+        let id = identity("scaffolded");
+        assert!(fw.guard(Some(&id), "ledger_accounts", ActionKind::Tool).await.is_ok());
+        assert!(
+            fw.guard(Some(&id), "admin:register_worker", ActionKind::Admin).await.is_err(),
+            "an allow:[\"*\"] tool grant must not authorize admin either"
+        );
     }
 
     #[tokio::test]

@@ -28,7 +28,20 @@
 //! no new identity model, no bespoke header. That principal is then run
 //! through [`crate::gateway_framework::GatewayFramework::guard`] — the same
 //! allowlist + rate-limit + audit pipeline `/mcp`'s `tools/call` and the
-//! inference-proxy routes already use — via [`require_gate`].
+//! inference-proxy routes already use — via [`require_gate`], passing
+//! [`crate::gateway_framework::ActionKind::Admin`].
+//!
+//! ## AuthZ is KIND-AWARE — admin requires an EXPLICIT admin grant
+//! Because every admin op is guarded as `ActionKind::Admin` with an
+//! `"admin:<op>"` action string, `guard` authorizes it via
+//! [`crate::gateway_framework::AllowlistPolicy::is_allowed_admin`], NOT the
+//! ordinary tool `is_allowed`. A generic tool wildcard
+//! (`Grant::List(["*"])` / `allow: ["*"]`) therefore does NOT authorize any
+//! admin op — an identity must hold an admin-namespace-scoped grant
+//! (`"admin:*"` or an exact `"admin:register_worker"`). This closes a
+//! privilege-escalation gap where any broad tool/inference identity would
+//! otherwise silently gain worker register/deregister (route-hijack) power.
+//! Fail-closed: no grant, or a tool-only grant, ⇒ denied.
 //!
 //! Unlike `/mcp` (which stays USABLE, ungated, when
 //! `McpServerState::gateway` is `None`, preserving pre-TGW-04 behavior for
@@ -98,9 +111,14 @@
 //! Every handler runs through [`require_gate`], which — like
 //! `GatewayFramework::guard` itself — already audits every DENIAL. Each
 //! handler additionally calls `GatewayContext::record_result` exactly once
-//! after its operation completes, with a short, name-only detail string
-//! (worker id, tier, tool count — never a cert PEM, socket path contents, or
-//! any other secret-shaped value) — [`crate::gateway_framework::audit::sanitize`]
+//! after its operation completes, with a short, NAME-ONLY detail string
+//! (worker id, tier, capability class, tool count — never a cert PEM, socket
+//! path contents, host:port, or any other address/secret-shaped value). A
+//! FAILURE audit in particular logs only the fixed error CATEGORY token from
+//! [`AdminError::category`] (`"connect_failed"`, `"health_timeout"`,
+//! `"catalog_unavailable"`, …), NEVER the error's `Display` string — which,
+//! for a transport/catalog failure, can contain a worker host:port, UDS
+//! socket path, or cert-CN-mismatch detail. [`crate::gateway_framework::audit::sanitize`]
 //! (S6) still runs on that detail as a second, defense-in-depth layer.
 
 use std::collections::HashMap;
@@ -108,7 +126,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
-use axum::extract::{Extension, Json, Path, State};
+use axum::extract::{Extension, Json, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -116,7 +134,7 @@ use axum::Router;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::broker::routes::{RouteTable, WorkerRoute, HEALTH_PROBE_TIMEOUT};
+use crate::broker::routes::{WorkerRoute, HEALTH_PROBE_TIMEOUT};
 use crate::broker::transport::{
     mtls_tcp::MtlsTcpTransport, uds_mtls::UdsMtlsTransport, uds_peercred::UdsPeercredTransport,
     CapabilityClass, TransportTier, WorkerTransport,
@@ -295,6 +313,25 @@ impl AdminError {
             AdminError::UnknownWorker(_) => StatusCode::NOT_FOUND,
         }
     }
+
+    /// A short, fixed error CATEGORY token for the audit trail — never the
+    /// raw `Display` string, which (for `Transport`/`CatalogUnavailable`) can
+    /// carry a worker host:port, UDS socket path, or cert-CN-mismatch detail.
+    /// The audit records this category plus name-only worker identifiers
+    /// (id/tier/class), so a reviewer sees WHAT failed and for WHICH worker
+    /// without any address/identity material leaking into the log. This is
+    /// the "name-only detail" posture the admin surface documents.
+    fn category(&self) -> &'static str {
+        match self {
+            AdminError::InvalidManifest(_) => "invalid_manifest",
+            AdminError::NoTools => "no_tools",
+            AdminError::Transport(_) => "connect_failed",
+            AdminError::Unhealthy(_, _) => "health_timeout",
+            AdminError::CatalogUnavailable { .. } => "catalog_unavailable",
+            AdminError::EmptyCatalog(_) => "empty_catalog",
+            AdminError::UnknownWorker(_) => "unknown_worker",
+        }
+    }
 }
 
 fn error_response(err: &AdminError) -> Response {
@@ -437,12 +474,29 @@ async fn handle_register(
         Err(denial) => return denial,
     };
 
+    // Capture name-only identifiers BEFORE `req` is consumed, so a FAILURE
+    // audit can name the worker (id/tier/class/declared-tool-count) without
+    // ever logging the raw error string -- which, for a transport/catalog
+    // error, can carry a host:port, socket path, or cert CN. Only the fixed
+    // error CATEGORY (`AdminError::category`) is logged, never `Display`.
+    let worker_name = req.entry.name.clone();
+    let worker_tier = req.entry.tier;
+    let worker_class = req.entry.capability_class;
+    let declared_count = req.tools.len();
+
     let result = do_register(&admin, req).await;
     match &result {
         Ok((worker_id, tool_count)) => {
             gate_ctx.record_result(true, Some(&format!("registered worker '{worker_id}' ({tool_count} tools)")));
         }
-        Err(e) => gate_ctx.record_result(false, Some(&e.to_string())),
+        Err(e) => gate_ctx.record_result(
+            false,
+            Some(&format!(
+                "register failed: worker='{worker_name}' tier={worker_tier} class={worker_class:?} \
+                 declared_tools={declared_count} category={}",
+                e.category()
+            )),
+        ),
     }
 
     match result {
@@ -634,7 +688,9 @@ async fn handle_health(
         Some(id) => {
             if !by_worker.contains_key(id) {
                 let err = AdminError::UnknownWorker(id.clone());
-                gate_ctx.record_result(false, Some(&err.to_string()));
+                // Name-only detail: worker id + category, never a raw error
+                // string (consistent with the register failure audit).
+                gate_ctx.record_result(false, Some(&format!("health failed: worker='{id}' category={}", err.category())));
                 return error_response(&err);
             }
             vec![id.clone()]
@@ -707,13 +763,6 @@ async fn handle_list(
     json_response(StatusCode::OK, json!({"workers": summaries}))
 }
 
-// `Path` is imported for forward-compatibility with a future
-// `/admin/workers/:id`-shaped route but unused by the current body-driven
-// handlers above; silence the unused-import lint rather than dropping the
-// import and re-adding it the moment such a route is needed.
-#[allow(unused_imports)]
-use axum::extract::Path as _UnusedPathImportPlaceholder;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -741,10 +790,26 @@ mod tests {
         })
     }
 
-    /// Every identity is allowed every admin action, for tests that only
-    /// care about the register/health-gate/route-table mechanics, not
-    /// allowlist policy itself (that's covered separately below).
+    /// `test-admin` holds an EXPLICIT admin grant (`"admin:*"`) plus a tool
+    /// wildcard, for tests that only care about the register/health-gate/
+    /// route-table mechanics, not the admin-authz rule itself (that's covered
+    /// by the dedicated authz tests below). The explicit `"admin:*"` is
+    /// required now that a bare `"*"` no longer authorizes admin ops.
     fn allow_all_gateway() -> GatewayFramework {
+        use crate::gateway_framework::{AllowlistPolicy, Grant};
+        use std::collections::HashMap;
+        let mut entries = HashMap::new();
+        entries.insert(
+            "test-admin".to_string(),
+            Grant::List(vec!["*".to_string(), "admin:*".to_string()]),
+        );
+        GatewayFramework::new(AllowlistPolicy::new(entries), Arc::new(InProcessRateLimiter::new(1000, 1000.0)))
+    }
+
+    /// A gateway where `test-admin` has ONLY a generic tool wildcard (`"*"`)
+    /// and NO admin grant — used to prove a broad tool identity is denied
+    /// admin ops (the privilege-escalation fix).
+    fn tool_wildcard_only_gateway() -> GatewayFramework {
         use crate::gateway_framework::{AllowlistPolicy, Grant};
         use std::collections::HashMap;
         let mut entries = HashMap::new();
@@ -761,6 +826,41 @@ mod tests {
             .unwrap();
         req.extensions_mut().insert(ClientIdentity("test-admin".to_string()));
         req
+    }
+
+    // ── Kind-aware authz: a tool wildcard does NOT grant admin ──────────
+
+    /// An identity holding ONLY a generic tool wildcard (`"*"`) — enough for
+    /// every tool/inference call — is DENIED an admin op. This is the
+    /// privilege-escalation fix: a broad tool identity is not, by that fact
+    /// alone, a worker-control admin.
+    #[tokio::test]
+    async fn tool_wildcard_identity_is_denied_admin_ops() {
+        let state = test_mcp_state(Some(tool_wildcard_only_gateway()));
+        let router = build_control_router(state);
+
+        // A GET /admin/workers (list) is the cheapest admin op to probe.
+        let mut req = Request::builder().method("GET").uri("/admin/workers").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(ClientIdentity("test-admin".to_string()));
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a generic tool wildcard must NOT authorize an admin op"
+        );
+    }
+
+    /// An identity with an EXPLICIT admin grant (`"admin:*"`) IS allowed the
+    /// admin op (the complement of the deny test above).
+    #[tokio::test]
+    async fn explicit_admin_grant_is_allowed_admin_ops() {
+        let state = test_mcp_state(Some(allow_all_gateway())); // holds "admin:*"
+        let router = build_control_router(state);
+
+        let mut req = Request::builder().method("GET").uri("/admin/workers").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(ClientIdentity("test-admin".to_string()));
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "an explicit admin grant must authorize the admin op");
     }
 
     // ── Fail-closed: no GatewayFramework configured at all ─────────────
