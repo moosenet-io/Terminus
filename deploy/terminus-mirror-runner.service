@@ -1,0 +1,35 @@
+[Unit]
+# MRUN-01 — the mirror-runner (closes the S115 audit gap: TERMINUS_MIRROR_AUTO_APPROVE
+# was set to true, but no timer/runner ever existed to actually drive the git-public
+# mirror on a cadence, so a diverged/behind mirror could sit unnoticed indefinitely).
+# One oneshot call to the `git_public_mirror_run` tool, which discovers every
+# mirror_ready repo and runs one idempotent status -> backfill+gate -> fast-forward
+# sync/push pass per repo. Fast-forward-only, gate-gated, NEVER forces — a diverged /
+# un-bootstrapped mirror is reported for an operator to re-baseline (GHIST-07), never
+# auto-resolved.
+Description=Terminus git-public mirror runner (MRUN-01)
+# <placeholder> — replace with the actual unit this mirror engine's local MCP daemon
+# runs as on the mirror-engine host (referred to elsewhere as "terminus-primary").
+After=network-online.target <terminus-primary-unit>.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Runs on the SAME host the mirror engine (src/forge/mirror/*) runs on — the tool
+# reads TERMINUS_MIRROR_* and the git-public credential from that host's own runtime
+# env via the local MCP endpoint; this unit holds NO secrets of its own.
+ExecStart=<path-to-terminus-checkout>/deploy/terminus-mirror-runner.sh
+Environment=TERMINUS_MCP_URL=http://127.0.0.1:8310/mcp
+# A cold full-history backfill (first run for a newly mirror_ready repo, or a large
+# incremental catch-up) can take a while; give it real room. Routine runs (a handful
+# of new commits, already-established lineage) are fast.
+TimeoutStartSec=3600
+Nice=10
+# Non-zero exits are the fail-closed alert signal (see terminus-mirror-runner.sh's
+# header: 2 = at least one repo WITHHELD on residual PII; 3 = at least one repo
+# needs an operator re-baseline, or a transport/JSON-RPC error). These are
+# intentionally surfaced as unit failures — do NOT add them to SuccessExitStatus;
+# a timer run must never read as clean when a repo's mirror did not actually advance.
+
+[Install]
+WantedBy=multi-user.target

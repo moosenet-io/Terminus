@@ -1891,11 +1891,45 @@ impl RustTool for GitPublicMirrorReplayPr {
     }
 }
 
-/// Register all four GHMR-04 mirror subtools plus the GHIST history tools. Called
-/// from [`crate::github::register`], so they attach to whichever registry github is
-/// registered against (the CORE registry via `register_all`, the personal
-/// registry via `register_personal`). Unconditional: no GitHub credential is
-/// needed to construct them; `git_public_mirror_push` reads the token lazily at call
+// ── MRUN-01: thin execute() wrappers for the runner ─────────────────────────
+//
+// `runner::run_once` (MRUN-01) orchestrates the GHIST history tools above —
+// status, backfill+gate, sync — as a single idempotent per-repo pass driven by
+// a systemd timer instead of an operator. Its `RealHistoryOps` impl needs to
+// invoke `GitPublicHistoryStatus`/`Backfill`/`Sync`, but those structs are
+// private to this module (dispatch-only, like every other tool here). Rather
+// than making them `pub` (which would let other code construct/registrer them
+// outside `register()`), these three `pub(crate)` functions are the sole
+// crate-internal seam: they call the SAME `execute()` the registry dispatches
+// to, so the runner reuses 100% of the existing status/backfill/gate/sync
+// logic (including the fail-closed TERMINUS_MIRROR_AUTHOR_MAP checks, the
+// fast-forward analysis, and the never-force push transport) with zero
+// duplication.
+
+/// Invoke [`GitPublicHistoryStatus`] exactly as the registry would.
+pub(crate) async fn history_status(args: Value) -> Result<String, ToolError> {
+    GitPublicHistoryStatus.execute(args).await
+}
+
+/// Invoke [`GitPublicHistoryBackfill`] exactly as the registry would (full
+/// backfill on first run, incremental append + full-history gate thereafter;
+/// NEVER pushes).
+pub(crate) async fn history_backfill(args: Value) -> Result<String, ToolError> {
+    GitPublicHistoryBackfill.execute(args).await
+}
+
+/// Invoke [`GitPublicHistorySync`] exactly as the registry would (fast-
+/// forward-only, gate-gated, never creates a baseline, never forces).
+pub(crate) async fn history_sync(args: Value) -> Result<String, ToolError> {
+    GitPublicHistorySync.execute(args).await
+}
+
+/// Register all four GHMR-04 mirror subtools plus the GHIST history tools,
+/// plus the MRUN-01 runner tool. Called from [`crate::github::register`], so
+/// they attach to whichever registry github is registered against (the CORE
+/// registry via `register_all`, the personal registry via
+/// `register_personal`). Unconditional: no GitHub credential is needed to
+/// construct them; `git_public_mirror_push` reads the token lazily at call
 /// time and returns `NotConfigured` if it is absent.
 pub fn register(registry: &mut ToolRegistry) {
     registry.register_or_replace(Box::new(GitPublicMirrorStatus));
@@ -1907,6 +1941,7 @@ pub fn register(registry: &mut ToolRegistry) {
     registry.register_or_replace(Box::new(GitPublicHistoryBackfill));
     registry.register_or_replace(Box::new(GitPublicHistorySync));
     registry.register_or_replace(Box::new(GitPublicMirrorReplayPr));
+    registry.register_or_replace(Box::new(super::runner::GitPublicMirrorRun));
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
