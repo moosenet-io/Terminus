@@ -1043,6 +1043,7 @@ mod tests {
             audit_max_clone_bytes: 200_000_000,
             escalation_enabled: true,
             escalation_add_provider: "agy".to_string(),
+            crystallize_min_recurrence: crate::cortex::crystallize::DEFAULT_MIN_RECURRENCE,
         }
     }
 
