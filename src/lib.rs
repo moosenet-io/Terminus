@@ -16,6 +16,12 @@ pub mod commute;
 /// crate builds standalone with no `lumina-core` dependency (see `compat`).
 pub mod compat;
 pub mod config;
+/// CONST-02: the constellation aggregation API layer (`/api/*`, `/ws`, and
+/// the `constellation-web` static-asset host) -- a compiled-in module of
+/// the primary/gateway binary, merged into `crate::mcp_server::build_router`.
+/// See `crate::constellation`'s own module doc and
+/// `docs/architecture/broker.md` for why this is not a broker worker.
+pub mod constellation;
 pub mod cortex;
 pub mod council;
 pub mod crucible;

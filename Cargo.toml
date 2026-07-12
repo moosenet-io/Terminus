@@ -189,7 +189,12 @@ axum = { version = "0.7", features = ["json", "macros"] }
 # usage in mcp_server.rs/enroll.rs); promoted here since this item's runtime
 # code now needs it too.
 tower = { version = "0.4", features = ["util"] }
-tower-http = { version = "0.5", features = ["trace"] }
+# CONST-02: "fs" adds `tower_http::services::{ServeDir, ServeFile}`, used by
+# `crate::constellation::constellation_router`'s SPA static-asset fallback
+# for the built `constellation-web` bundle (mounted only when
+# `CONSTELLATION_WEB_DIST_DIR` is configured). Feature-only addition to an
+# already-present dependency, not a new crate.
+tower-http = { version = "0.5", features = ["trace", "fs"] }
 # S100 (TERM): distributed Redis-backed Plane GET cache + rate limiter.
 # connection-manager gives a multiplexed, auto-reconnecting async connection;
 # `script` powers the atomic distributed rate-limiter Lua reservation.
