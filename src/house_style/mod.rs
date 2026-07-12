@@ -48,7 +48,7 @@ use walkdir::WalkDir;
 /// don't call it). See `docs/house-style.md#allow-list`.
 const SANCTIONED_FILES: &[&str] = &[
     "src/config.rs",
-    "src/<secret-manager>/mod.rs",
+    "src/<secret-manager>/mod.rs", // pii-test-fixture
     "src/secrets_bootstrap.rs",
 ];
 
