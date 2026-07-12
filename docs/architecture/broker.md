@@ -138,17 +138,25 @@ comparisons — deliberately **not** the enum's declaration order, so a future
 refactor can't accidentally derive `Ord` from declaration order and silently
 invert the security ranking.
 
-**`MinTierPolicy`** maps a worker's declared `CapabilityClass`
-(`ReadOnly` / `WriteScoped` / `SecretHolding`) to the lowest tier it may
-register at:
+**`MinTierPolicy`** maps a worker's declared `CapabilityClass` to the lowest
+tier it may register at. The Rust enum variants are `ReadOnly` /
+`WriteScoped` / `SecretHolding`, but the **canonical string form** — the one
+you write in a registration manifest and in `TERMINUS_BROKER_WORKERS_JSON`
+config, and the exact form `MinTierPolicy` deserializes and evaluates — is
+**snake_case** (`#[serde(rename_all = "snake_case")]`): `read_only`,
+`write_scoped`, `secret_holding`. Use those exact snake_case strings
+everywhere a `capability_class` *value* is written; the rest of this doc
+does. (Note this is a different field from `terminus-worker-sdk`'s
+`Worker::capability_class` builder, which is a free-form coarse hint that
+defaults to `"core"` and is NOT what `MinTierPolicy` evaluates — see §6.)
 
-| Capability class | Minimum tier |
+| `capability_class` value | Minimum tier |
 |---|---|
-| `ReadOnly` | T1 |
-| `WriteScoped` | T2 |
-| `SecretHolding` | T2 |
+| `read_only` | T1 |
+| `write_scoped` | T2 |
+| `secret_holding` | T2 |
 
-A `write_scoped` or `secret_holding` worker registering below T2 is
+A worker declared `write_scoped` or `secret_holding` registering below T2 is
 rejected — enforced both at static config-load time
 (`crate::config::validate_worker_transport_entry`) and again, independently,
 inside the admin control plane's registration handler, so a future caller
@@ -157,11 +165,11 @@ silently under-provision a sensitive worker.
 
 **Picking a tier when extracting a domain:** classify the domain's actual
 side effects, not its name. A domain that only reads and never mutates
-external state or touches a credential is `ReadOnly`/T1. A domain that
+external state or touches a credential is `read_only`/T1. A domain that
 calls a mutating API (create/update/delete against Gitea, Plane, GitHub,
-etc.) is `WriteScoped`. A domain that holds or transmits secret material
-(API tokens, private keys) is `SecretHolding`. When in doubt, or when a
-domain mixes both, treat it as `SecretHolding`/T2 — the floor exists
+etc.) is `write_scoped`. A domain that holds or transmits secret material
+(API tokens, private keys) is `secret_holding`. When in doubt, or when a
+domain mixes both, treat it as `secret_holding`/T2 — the floor exists
 precisely so a misclassification defaults to the safer side.
 
 ## 4. The admin control plane
@@ -322,11 +330,20 @@ the live gateway serving that domain's tools throughout the migration.
 
    #[tokio::main]
    async fn main() -> Result<(), Box<dyn std::error::Error>> {
+       // A Rust string literal does NOT expand env vars -- read the socket
+       // path from the environment explicitly.
+       let socket_path = std::env::var("TERMINUS_WORKER_SOCKET_PATH")?;
        Worker::builder("<domain>-worker", "0.1.0")
-           .capability_class("<read_only|write_scoped|secret_holding>")
+           // NOTE: this SDK builder field is a free-form COARSE hint
+           // (defaults to "core") that goes in the worker's own manifest --
+           // it is NOT the security-relevant `capability_class` MinTierPolicy
+           // evaluates. That one (`read_only`/`write_scoped`/`secret_holding`,
+           // see §3) is declared at REGISTRATION time in the admin manifest
+           // (step 6), not here.
+           .capability_class("core")
            .tool(Box::new(MyDomainTool))
            // one .tool(...) call per RustTool the domain owns
-           .serve("${TERMINUS_WORKER_SOCKET_PATH}")
+           .serve(&socket_path)
            .await?;
        Ok(())
    }
@@ -343,9 +360,13 @@ the live gateway serving that domain's tools throughout the migration.
    has) — do not duplicate business logic across the monolith and the
    worker crate.
 
-4. **Pick a tier by capability class**, per §3's table. Read-only domain →
-   T1. Anything that mutates external state or touches a credential → T2.
-   Default to T2/`SecretHolding` when unsure.
+4. **Pick a tier by capability class**, per §3's table, using the canonical
+   snake_case `capability_class` value the registration manifest expects.
+   Read-only domain → `read_only`/T1. Anything that mutates external state or
+   touches a credential → `write_scoped` (or `secret_holding` if it holds
+   secret material) / T2. Default to `secret_holding`/T2 when unsure. (This
+   is the value you put in the registration manifest at step 6, not the SDK
+   builder's coarse hint from step 2.)
 
 5. **Do NOT yet remove the domain from `register_all`** (`src/registry.rs`).
    Leave the compiled-in copy in place for now — per §2's precedence rule
@@ -357,9 +378,10 @@ the live gateway serving that domain's tools throughout the migration.
    - Build and deploy the new `terminus-<domain>` binary (see the systemd
      unit template below).
    - Call `POST /admin/workers/register` with the worker's transport
-     manifest (name, tier, capability class, `socket_path`/`expected_uid`
-     for T1/T2, or `host`/`port` for T0, plus `expected_identity` for
-     T0/T2) and its declared tool list. Registration only succeeds once the
+     manifest — `name`, `tier`, `capability_class` (the snake_case value
+     from §3: `read_only` / `write_scoped` / `secret_holding`),
+     `socket_path`/`expected_uid` for T1/T2, or `host`/`port` for T0, plus
+     `expected_identity` for T0/T2 — and its declared tool list. Registration only succeeds once the
      pre-flip gate (§4) and the post-flip rollout window (§5) both pass —
      if it fails, the worker is removed/rolled back automatically and
      `register_all` still owns the tools, so nothing regresses.
@@ -442,11 +464,12 @@ live, and re-apply it whenever a worker's tool set changes:
       `vault::manager().get()` (per this repo's secrets-discipline rule),
       never a raw `std::env::var(...)` for anything token/key/password/
       secret-shaped, and never <secret-manager> fetched ad hoc outside that path.
-- [ ] The worker's declared `CapabilityClass` accurately reflects whether it
-      holds secret material (`SecretHolding`) — do not under-declare a
-      secret-holding worker as `ReadOnly`/`WriteScoped` to dodge the T2
-      floor; the floor exists specifically to force strong transport
-      security onto exactly this class.
+- [ ] The worker's declared `capability_class` (the snake_case registration
+      value) accurately reflects whether it holds secret material
+      (`secret_holding`) — do not under-declare a secret-holding worker as
+      `read_only`/`write_scoped` to dodge the T2 floor; the floor exists
+      specifically to force strong transport security onto exactly this
+      class.
 - [ ] The worker's systemd unit uses an `EnvironmentFile` populated at
       deploy time (never a literal secret in the unit file, in source, or in
       a commit) and appropriate hardening (`NoNewPrivileges`, `PrivateTmp`,
