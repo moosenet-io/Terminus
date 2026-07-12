@@ -552,6 +552,46 @@ fn coder_acquire_max_wait() -> std::time::Duration {
         .unwrap_or(std::time::Duration::from_secs(CODER_ACQUIRE_MAX_WAIT_DEFAULT_SECS))
 }
 
+/// #16 FIX: hard bound on the RESIL-03 Chord session register/reconcile at the
+/// top of a run. It is a best-effort secondary resume signal; a hang there must
+/// never wedge the whole sweep, so it degrades to file-checkpoint-only resume
+/// after this long. Small by design (the reconcile is a couple of localhost
+/// Chord calls, each already carrying its own 10s client timeout) — this is the
+/// backstop for the pathological all-threads-parked deadlock, not the expected
+/// wait. Override with `INTAKE_CODER_CHORD_RECONCILE_MAX_WAIT_SECS`.
+const CHORD_RECONCILE_MAX_WAIT_ENV: &str = "INTAKE_CODER_CHORD_RECONCILE_MAX_WAIT_SECS";
+const CHORD_RECONCILE_MAX_WAIT_DEFAULT_SECS: u64 = 45;
+
+fn chord_reconcile_max_wait() -> std::time::Duration {
+    std::env::var(CHORD_RECONCILE_MAX_WAIT_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(CHORD_RECONCILE_MAX_WAIT_DEFAULT_SECS))
+}
+
+/// JAM FIX: per-(model, backend) wall-clock cap on a full code suite. The
+/// per-case loop already does exhaustive transport-error retries; this bounds
+/// their TOTAL so a model whose inference wedges (every case timing out, GPU
+/// idle so the watchdog stays blind) can't stall the fleet forever. On elapse
+/// the cell is recorded non-viable (`timeout`) and the sweep ADVANCES — the
+/// model stays in the fleet/nominations (retryable in a future sweep), it is
+/// NOT removed. Generous by default so a genuinely slow-but-progressing large
+/// model isn't cut off; a jam blows past it. Override with
+/// `INTAKE_CODER_BACKEND_MAX_SECS`.
+pub const CODER_BACKEND_MAX_ENV: &str = "INTAKE_CODER_BACKEND_MAX_SECS";
+const CODER_BACKEND_MAX_DEFAULT_SECS: u64 = 90 * 60;
+
+fn coder_backend_max_wait() -> std::time::Duration {
+    std::env::var(CODER_BACKEND_MAX_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(CODER_BACKEND_MAX_DEFAULT_SECS))
+}
+
 /// RAII: releases `lock` on drop, exactly once — so a checkpoint-write
 /// failure (`?` early return out of `run_one_backend`) or a panic mid-pass
 /// still releases the GPU rather than leaking it for the rest of this
@@ -818,8 +858,16 @@ async fn run_one_backend(
     // `backend.as_str()` yields the short 'gpu'/'cpu' tag (matching the
     // assistant-side `backend_tag` convention), NOT `override_str` (which is
     // the longer serving-backend name like "ollama"/"ollama-cpu").
-    let outcome = match driver
-        .run_suite(
+    // JAM FIX: bound the whole suite by wall-clock. The per-case loop still does
+    // its exhaustive transport-error retries INSIDE this; the cap only stops a
+    // model that never converges (every case timing out) from stalling the fleet
+    // forever. On elapse the suite future is dropped (its reqwest inference call
+    // is cancelled; the GPU lock is released by `run_fleet`'s outer RAII guard,
+    // not here, so nothing leaks) and the `Err(_)` arm records it non-viable and
+    // advances.
+    let suite_result = tokio::time::timeout(
+        coder_backend_max_wait(),
+        driver.run_suite(
             &model_id,
             langs,
             profile_id,
@@ -827,10 +875,11 @@ async fn run_one_backend(
             backend.as_str(),
             mem_config,
             gpu_lock,
-        )
-        .await
-    {
-        Ok(res) => {
+        ),
+    )
+    .await;
+    let outcome = match suite_result {
+        Ok(Ok(res)) => {
             // Durable checkpoint AFTER rows are persisted — resume-safe ordering.
             checkpoint
                 .mark(&key)
@@ -890,7 +939,64 @@ async fn run_one_backend(
                 approved: res.approved,
             }
         }
-        Err(e) => BackendOutcome::Skipped(format!("code suite did not complete: {e}")),
+        Ok(Err(e)) => BackendOutcome::Skipped(format!("code suite did not complete: {e}")),
+        Err(_elapsed) => {
+            // JAM: the suite blew past its wall-clock cap. Record the cell
+            // non-viable (`timeout`) — the model STAYS in the fleet/nominations
+            // (retryable next sweep), it is NOT removed — mark the checkpoint so
+            // the sweep advances and a restart won't re-jam here, and mirror the
+            // advance onto Chord's session. This is the "exhaustive but never
+            // frozen" behavior: exhaustive per-case retries happened inside the
+            // cap; the cap guarantees we always move on.
+            let secs = coder_backend_max_wait().as_secs();
+            let reason = format!(
+                "code suite wall-clock cap exceeded ({secs}s): inference jammed \
+                 (exhaustive per-case retries did not converge). Recorded non-viable \
+                 (timeout) and advancing; model retained in fleet."
+            );
+            eprintln!(
+                "coder sweep: JAM on model={model_id} backend={} — {reason}",
+                backend.as_str()
+            );
+            if let Err(e) = driver
+                .record_non_viable_acquire(
+                    &model_id,
+                    backend.as_str(),
+                    &reason,
+                    mem_config,
+                    intake::code_v2::FailureClass::Timeout,
+                )
+                .await
+            {
+                eprintln!(
+                    "coder sweep: failed to record non-viable(timeout) row for jammed \
+                     model={model_id} backend={} (continuing): {e}",
+                    backend.as_str()
+                );
+            }
+            // Swallow a mark error here (unlike the success path's `?`): a jam is
+            // already a degraded path, so a checkpoint-write hiccup must not abort
+            // the whole sweep — worst case this cell is retried on a restart.
+            if let Err(e) = checkpoint.mark(&key) {
+                eprintln!(
+                    "coder sweep: failed to checkpoint jammed model={model_id} \
+                     backend={} (continuing; may retry on restart): {e}",
+                    backend.as_str()
+                );
+            }
+            if let Some(sid) = chord_session_id {
+                let action_key =
+                    chord_session::action_key("coder", &model_id, backend.as_str(), None);
+                if let Err(e) = chord_session::advance(sid, &[action_key]).await {
+                    eprintln!(
+                        "coder sweep: Chord session advance failed for jammed \
+                         model={model_id} backend={} (continuing): {e}",
+                        backend.as_str()
+                    );
+                }
+            }
+            BackendOutcome::Skipped(reason)
+        }
     };
 
     Ok(BackendReport {
@@ -1220,7 +1326,30 @@ pub async fn run(
     // unconfigured/unreachable, logged once inside) just means this run has
     // no Chord-side resume signal — the file checkpoint alone still works.
     let queued_units = build_queued_units(&fleet);
-    let chord_session_id = register_and_reconcile_chord_session(&queued_units, &checkpoint).await;
+    // #16 FIX (restart-deadlock): the Chord session register/reconcile is a
+    // best-effort SECONDARY resume signal — the file checkpoint is the primary,
+    // always-attempted one, and `run_fleet`'s skip logic already resumes from it
+    // alone. A restart-with-checkpoint was observed to hang here indefinitely
+    // (all runtime threads parked, zero network activity) before the fleet loop
+    // ever started, so bound it hard: if it can't complete promptly, degrade to
+    // file-checkpoint-only resume rather than deadlock the whole sweep. A `None`
+    // here is already a fully-supported "no Chord-side resume signal" state.
+    let chord_session_id = match tokio::time::timeout(
+        chord_reconcile_max_wait(),
+        register_and_reconcile_chord_session(&queued_units, &checkpoint),
+    )
+    .await
+    {
+        Ok(sid) => sid,
+        Err(_) => {
+            eprintln!(
+                "coder sweep: Chord session register/reconcile exceeded {}s — proceeding \
+                 file-checkpoint-only (resume still works via the file checkpoint; #16)",
+                chord_reconcile_max_wait().as_secs()
+            );
+            None
+        }
+    };
 
     let driver = LiveCoderDriver;
     let gpu_lock = LiveGpuLock::new(GPU_HOLDER, coder_acquire_max_wait());
@@ -1667,6 +1796,9 @@ mod tests {
     struct ScriptDriver {
         available: BTreeSet<String>,
         suite_fail: BTreeSet<String>,
+        /// JAM FIX: models whose `run_suite` sleeps past any realistic cap,
+        /// simulating an inference jam (every case timing out, never converging).
+        suite_hang: BTreeSet<String>,
         profile_calls: Mutex<Vec<String>>,
         suite_calls: Mutex<Vec<(String, String)>>,
         /// MINT2-02: (model_id, backend_tag, reason) per recorded non_viable
@@ -1682,6 +1814,7 @@ mod tests {
             ScriptDriver {
                 available: BTreeSet::new(),
                 suite_fail: BTreeSet::new(),
+                suite_hang: BTreeSet::new(),
                 profile_calls: Mutex::new(Vec::new()),
                 suite_calls: Mutex::new(Vec::new()),
                 non_viable_calls: Mutex::new(Vec::new()),
@@ -1761,6 +1894,11 @@ mod tests {
                 .push((model_id.to_string(), backend_tag.to_string()));
             if self.suite_fail.contains(model_id) {
                 return Err(ToolError::Execution("model hung mid-suite".to_string()));
+            }
+            if self.suite_hang.contains(model_id) {
+                // Sleep far past any test cap: the caller's wall-clock timeout
+                // must fire and cancel this future (the jam path).
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             }
             Ok(intake::CodeV2Outcome {
                 cases_run: 3,
@@ -1952,6 +2090,47 @@ mod tests {
             other => panic!("expected Skipped, got {other:?}"),
         }
         assert!(checkpoint.done().is_empty());
+    }
+
+    #[test]
+    fn jammed_model_is_bounded_recorded_non_viable_and_advanced_not_removed() {
+        // JAM FIX: a model whose suite never converges (inference wedged, GPU
+        // idle so the watchdog stays blind) must be BOUNDED by the wall-clock
+        // cap → recorded non-viable(timeout) → the sweep ADVANCES (checkpoint
+        // marked), WITHOUT being removed from the fleet. Exhaustive per-case
+        // retries happen inside the cap; the cap guarantees forward progress.
+        let fleet = Nominations::from_json(
+            r#"{"nominations":[{"id":"jammy:9b","size_b":9,"gfx1151_class":"experimental","acquisition":"ollama_pull","backends":["gpu"]}]}"#,
+        )
+        .unwrap();
+        let mut driver = ScriptDriver::new().available("jammy:9b");
+        driver.suite_hang.insert("jammy:9b".to_string());
+        let checkpoint = tmp_checkpoint("jam");
+
+        // Tiny cap so the hang trips promptly (fakes are instant, so a 1s cap
+        // never affects any other test's run_suite).
+        std::env::set_var(CODER_BACKEND_MAX_ENV, "1");
+        let reports =
+            block(run_fleet(&fleet, &[], None, &checkpoint, None, &driver, &NoopGpuLock, None)).unwrap();
+        std::env::remove_var(CODER_BACKEND_MAX_ENV);
+
+        assert_eq!(reports.len(), 1);
+        match &reports[0].outcome {
+            BackendOutcome::Skipped(reason) => {
+                assert!(reason.contains("wall-clock cap"), "reason: {reason}");
+                assert!(reason.contains("retained in fleet"), "reason: {reason}");
+            }
+            other => panic!("expected Skipped(jam), got {other:?}"),
+        }
+        // A non-viable(timeout) row was recorded for the cell — the model still
+        // EXISTS in the data (retryable), it was not dropped.
+        let calls = driver.non_viable_acquire_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "jammy:9b");
+        assert_eq!(calls[0].3, intake::code_v2::FailureClass::Timeout);
+        // The sweep ADVANCED past it: the cell is checkpointed so a restart
+        // won't re-jam here.
+        assert_eq!(checkpoint.done().len(), 1);
     }
 
     #[test]
