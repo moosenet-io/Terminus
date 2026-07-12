@@ -17,16 +17,31 @@ hand — nothing about git, PII scanning, or transport is reimplemented:
 
 1. **`git_public_history_status`** (read-only). No established lineage yet →
    `needs_operator_rebaseline` (a first baseline is always an operator
-   action — see below). `commits_behind == 0` → `up_to_date`, no-op.
-2. **`git_public_history_backfill`** — replays new internal commits into the
-   scrubbed full-history work dir and gates every commit's tree. NEVER
-   pushes. Residual PII → `gate_dirty` (with the `commit:file:line` spots),
-   nothing published.
-3. **`git_public_history_sync`** — fast-forward-only push of the gate-clean
-   result onto the established, operator-blessed baseline. A refusal here
-   (diverged / un-bootstrapped / non-fast-forward — surfaced as
-   `ToolError::Conflict`) → `needs_operator_rebaseline`; residual PII in the
-   sync's own incremental gate → `gate_dirty`; a clean push → `pushed`.
+   action — see below). Its `commits_behind` compares the SOURCE checkout to
+   the LOCAL history work dir only — it does **not** inspect the public
+   remote — so it is used ONLY to decide whether a backfill is needed, never
+   to conclude the mirror is current. (A prior tick may have replayed but
+   failed to push, leaving `commits_behind == 0` while the public mirror is
+   still behind; trusting status here would let the mirror sit behind forever
+   and defeat the runner.)
+2. **`ensure_push_boundary`** — pins the going-forward `pushed-head` boundary
+   from the pre-backfill baseline (see the ff-vs-force section) and confirms
+   remote lineage; divergence / un-bootstrapped remote →
+   `needs_operator_rebaseline` before anything is replayed or pushed.
+3. **`git_public_history_backfill`** — replays new internal commits into the
+   scrubbed full-history work dir and gates every commit's tree. Run only when
+   the local mirror is actually behind source; NEVER pushes. Residual PII →
+   `gate_dirty` (with the `commit:file:line` spots), nothing published.
+4. **`git_public_history_sync`** — the REMOTE-aware step: fast-forward-only
+   push onto the established, operator-blessed baseline. `up_to_date` is
+   returned ONLY here, when sync confirms the remote is genuinely at head; a
+   remote that is behind (including self-healing a prior failed push) is
+   fast-forward-pushed → `pushed`; a refusal (diverged / un-bootstrapped /
+   non-fast-forward — surfaced as `ToolError::Conflict`) →
+   `needs_operator_rebaseline`; residual PII in the sync's own incremental
+   gate → `gate_dirty`. Because up-to-date is decided from the remote, a
+   behind/failed-push mirror is retried and pushed on the next tick
+   (idempotent self-heal).
 
 `git_public_mirror_run` wraps `run_once` per repo. With an explicit `repo`
 arg it runs one pass; with none, it discovers every `mirror_ready` repo by
@@ -90,8 +105,8 @@ fast-forward.
   fail-closed exit code (0 = all `up_to_date`/`pushed`, 2 = at least one
   `gate_dirty`, 3 = at least one `needs_operator_rebaseline`/`error`).
 - `deploy/terminus-mirror-runner.timer` — every 30 minutes, jittered. Each
-  no-op run (repo already current) is cheap, since it's just the status
-  check.
+  no-op run (repo already current) is cheap: status plus a single
+  read-only remote check via sync, no replay when nothing is behind.
 
 This complements, and does not replace, the pre-existing
 `deploy/terminus-mirror-history-sync.{service,timer}` (GHIST-08), which

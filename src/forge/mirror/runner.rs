@@ -94,7 +94,9 @@ impl RunnerConfig {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum RunOutcome {
-    /// `commits_behind == 0` on the history-status read — nothing to do.
+    /// The public remote was confirmed at head by the sync step (a
+    /// remote-checked no-op) — nothing to push. NOT inferred from
+    /// history-status's source-vs-local `commits_behind` alone.
     UpToDate,
     /// The full-history PII gate (via backfill, or the sync tool's own
     /// incremental gate over newly-appended commits) reported residual
@@ -191,16 +193,25 @@ impl HistoryOps for RealHistoryOps {
 /// fast-forward-only, gate-verified push.
 ///
 /// Steps (see the module doc for the full safety rationale):
-/// 1. `git_public_history_status` — `commits_behind == 0` → [`RunOutcome::UpToDate`].
-///    No established lineage → [`RunOutcome::NeedsOperatorRebaseline`] (a first
-///    baseline is an operator action, never automatic).
-/// 2. `git_public_history_backfill` — replays + gates every commit. Residual
-///    PII → [`RunOutcome::GateDirty`], nothing pushed.
-/// 3. `git_public_history_sync` — fast-forward-only push of the gate-clean
-///    result. A [`ToolError::Conflict`] here (diverged / un-bootstrapped /
-///    non-fast-forward) → [`RunOutcome::NeedsOperatorRebaseline`]; residual PII
-///    reported by the sync's own incremental gate → [`RunOutcome::GateDirty`];
-///    otherwise a successful push → [`RunOutcome::Pushed`].
+/// 1. `git_public_history_status` — no established lineage →
+///    [`RunOutcome::NeedsOperatorRebaseline`] (a first baseline is an operator
+///    action, never automatic). Its `commits_behind` is used ONLY to decide
+///    whether a backfill is needed; it is NOT trusted for the up-to-date
+///    decision, because it compares source-vs-local and never inspects the
+///    public remote.
+/// 1b. `ensure_push_boundary` — pins the going-forward push boundary before
+///    backfill and confirms remote lineage (divergence / un-bootstrapped →
+///    [`RunOutcome::NeedsOperatorRebaseline`]).
+/// 2. `git_public_history_backfill` (only when the local mirror is behind
+///    source) — replays + gates every commit. Residual PII →
+///    [`RunOutcome::GateDirty`], nothing pushed.
+/// 3. `git_public_history_sync` — the REMOTE-aware step. Fast-forward-only push
+///    of the gate-clean result; a remote-checked no-op → [`RunOutcome::UpToDate`]
+///    (the ONLY path that yields it); a [`ToolError::Conflict`] (diverged /
+///    un-bootstrapped / non-fast-forward) → [`RunOutcome::NeedsOperatorRebaseline`];
+///    residual PII in the unpublished range → [`RunOutcome::GateDirty`]; a
+///    fast-forward push (including self-healing a prior failed push) →
+///    [`RunOutcome::Pushed`].
 pub async fn run_once(repo: &str, cfg: &RunnerConfig) -> MirrorRunReport {
     run_once_with(repo, cfg, &RealHistoryOps).await
 }
@@ -224,19 +235,26 @@ pub async fn run_once_with(repo: &str, cfg: &RunnerConfig, ops: &dyn HistoryOps)
              only extends an already-bootstrapped baseline, it never creates one",
         );
     }
-    let commits_behind = status.get("commits_behind").and_then(Value::as_u64);
-    if commits_behind == Some(0) {
-        return MirrorRunReport { repo: repo.to_string(), outcome: RunOutcome::UpToDate };
-    }
+    // `commits_behind` from status compares SOURCE vs the LOCAL history work-dir
+    // ONLY — it does NOT inspect the public remote or the `pushed-head` boundary.
+    // So `commits_behind == 0` means "the local mirror has replayed every source
+    // commit", NOT "the public mirror is current": a prior tick may have replayed
+    // but FAILED to push, or the remote may have been rewound / diverged. Returning
+    // up_to_date here (as an earlier version did) would let a behind/failed-push
+    // mirror silently stay behind forever, defeating the runner's entire purpose.
+    // Instead we ALWAYS proceed to the remote-aware sync below; `up_to_date` is only
+    // ever returned when SYNC confirms the remote is at head (MRUN-01 self-heal).
+    let source_behind = status.get("commits_behind").and_then(Value::as_u64);
 
-    // 1b. Establish the push boundary BEFORE backfill (MRUN-01 ff-detection fix).
+    // 1b. Establish the push boundary BEFORE any backfill (MRUN-01 ff-detection fix).
     // Backfill (step 2) advances the local history work-dir HEAD; if the
     // going-forward `pushed-head` marker isn't already set, git_public_history_sync
     // would try to initialise it from the POST-backfill HEAD and spuriously see a
     // non-fast-forward. Pinning the boundary to the pre-backfill baseline here keeps
     // sync's ff-detection correct so a genuinely fast-forwardable repo actually gets
-    // pushed. Genuine divergence / un-bootstrapped remote → needs_operator_rebaseline,
-    // reported WITHOUT running backfill and WITHOUT ever forcing.
+    // pushed. This step also confirms remote lineage: genuine divergence /
+    // un-bootstrapped remote → needs_operator_rebaseline, reported WITHOUT running
+    // backfill and WITHOUT ever forcing.
     match ops.ensure_boundary(repo, cfg).await {
         Ok(PushBoundary::Established) => {}
         Ok(PushBoundary::NeedsOperator(reason)) => {
@@ -245,18 +263,27 @@ pub async fn run_once_with(repo: &str, cfg: &RunnerConfig, ops: &dyn HistoryOps)
         Err(e) => return MirrorRunReport::error(repo, &e),
     }
 
-    // 2. Backfill (replay + full-history gate). NEVER pushes.
-    let backfill = match ops.backfill(repo, cfg).await {
-        Ok(v) => v,
-        Err(e) => return MirrorRunReport::error(repo, &e),
-    };
-    let gate = backfill.get("gate");
-    let gate_clean = gate.and_then(|g| g.get("clean")).and_then(Value::as_bool).unwrap_or(false);
-    if !gate_clean {
-        return MirrorRunReport::gate_dirty(repo, gate);
+    // 2. Backfill (replay new source commits + full-history gate) — ONLY when the
+    // local mirror is actually behind source. When `source_behind == 0` there is
+    // nothing new to replay, so the expensive full-history gate is skipped and we go
+    // straight to sync; sync's own incremental gate still scans (and can withhold)
+    // any commits that were replayed by a prior tick but never published. NEVER pushes.
+    if source_behind != Some(0) {
+        let backfill = match ops.backfill(repo, cfg).await {
+            Ok(v) => v,
+            Err(e) => return MirrorRunReport::error(repo, &e),
+        };
+        let gate = backfill.get("gate");
+        let gate_clean = gate.and_then(|g| g.get("clean")).and_then(Value::as_bool).unwrap_or(false);
+        if !gate_clean {
+            return MirrorRunReport::gate_dirty(repo, gate);
+        }
     }
 
-    // 3. Fast-forward-only sync/push of the gate-clean result.
+    // 3. Fast-forward-only sync/push — the REMOTE-aware step. It cleanly no-ops
+    // (up_to_date) ONLY when the remote is confirmed at head, ff-pushes when the
+    // remote is behind (self-heal after a prior failed push), withholds on residual
+    // PII in the unpublished range, and Conflicts (→ needs_operator) on divergence.
     let sync = match ops.sync(repo, cfg).await {
         Ok(v) => v,
         Err(ToolError::Conflict(reason)) => return MirrorRunReport::needs_rebaseline(repo, reason),
@@ -482,14 +509,86 @@ mod tests {
         })
     }
 
+    /// (c) Remote genuinely at head. `source_behind == 0` skips backfill, but the
+    /// runner STILL calls sync to confirm the REMOTE is current — only sync's
+    /// `up_to_date` (a remote-checked no-op) yields `UpToDate`. status alone is
+    /// never trusted for the up-to-date decision.
     #[tokio::test]
-    async fn up_to_date_when_zero_behind_never_calls_backfill_or_sync() {
-        let ops = StubOps { status: Some(Ok(status_json(true, Some(0)))), ..Default::default() };
+    async fn remote_at_head_reports_up_to_date_via_sync_not_status() {
+        let ops = StubOps {
+            status: Some(Ok(status_json(true, Some(0)))),
+            sync: Some(Ok(json!({
+                "repo": "demo",
+                "pushed": false,
+                "up_to_date": true,
+                "new_commits": 0,
+                "work_head": "head000",
+            }))),
+            ..Default::default()
+        };
         let report = run_once_with("demo", &RunnerConfig::default(), &ops).await;
         assert_eq!(report.outcome, RunOutcome::UpToDate);
         assert_eq!(ops.status_calls.load(Ordering::SeqCst), 1);
+        // Nothing new to replay → backfill skipped, but the remote WAS checked (sync).
         assert_eq!(ops.backfill_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(ops.sync_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ops.boundary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ops.sync_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// (a) Local mirror has replayed every source commit (`source_behind == 0`) but
+    /// the REMOTE is behind (a prior tick pushed-head lag / rewound remote). status
+    /// would say "0 behind", yet the runner must NOT report up_to_date — it reaches
+    /// sync, which ff-pushes the unpublished commits. Backfill is skipped (nothing
+    /// new to replay); the push still happens.
+    #[tokio::test]
+    async fn local_current_but_remote_behind_pushes_not_up_to_date() {
+        let ops = StubOps {
+            status: Some(Ok(status_json(true, Some(0)))),
+            sync: Some(Ok(json!({
+                "repo": "demo",
+                "pushed": true,
+                "new_commits": 1,
+                "old_head": "remote0",
+                "work_head": "local01",
+                "branch": "main",
+            }))),
+            ..Default::default()
+        };
+        let report = run_once_with("demo", &RunnerConfig::default(), &ops).await;
+        match report.outcome {
+            RunOutcome::Pushed { from, to } => {
+                assert_eq!(from.as_deref(), Some("remote0"));
+                assert_eq!(to, "local01");
+            }
+            other => panic!("a behind remote must push even when source_behind==0, got {other:?}"),
+        }
+        assert_eq!(ops.backfill_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ops.sync_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// (b) Idempotent self-heal: a PRIOR tick advanced the local mirror (backfill +
+    /// replay) but its push FAILED, so local == source (`source_behind == 0`) while
+    /// the remote sits behind. Every subsequent tick must retry the push (not report
+    /// up_to_date and exit success forever). Same stub shape as (a) but framed as the
+    /// repeat tick: sync pushes the still-unpublished range.
+    #[tokio::test]
+    async fn prior_failed_push_is_retried_on_next_tick() {
+        let ops = StubOps {
+            status: Some(Ok(status_json(true, Some(0)))),
+            sync: Some(Ok(json!({
+                "repo": "demo",
+                "pushed": true,
+                "new_commits": 3,
+                "old_head": "pushed00",
+                "work_head": "worktip9",
+                "branch": "main",
+            }))),
+            ..Default::default()
+        };
+        let report = run_once_with("demo", &RunnerConfig::default(), &ops).await;
+        assert!(matches!(report.outcome, RunOutcome::Pushed { .. }), "self-heal must push: {report:?}");
+        assert_eq!(ops.backfill_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ops.sync_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
