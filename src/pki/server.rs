@@ -124,7 +124,12 @@ impl std::fmt::Debug for GatewayServerConfig {
 /// [`spawn_mtls_listener`] for the second, mTLS-fronted listener.
 pub fn build_gateway_router(registry: ToolRegistry, config: &GatewayServerConfig) -> axum::Router {
     let state = Arc::new(McpServerState {
-        registry,
+        // TMOD-01: the registry is now a hot-swappable snapshot container --
+        // `from_pointee` is the ArcSwap-provided equivalent of
+        // `ArcSwap::new(Arc::new(registry))`, seeding the initial snapshot
+        // with exactly the registry the caller built (`register_all`/
+        // `register_personal`), unchanged.
+        registry: arc_swap::ArcSwap::from_pointee(registry),
         server_name: config.server_name.clone(),
         server_version: config.server_version.clone(),
         auth_token: config.auth_token.clone(),

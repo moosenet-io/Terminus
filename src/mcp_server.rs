@@ -33,6 +33,18 @@
 //! - `GET /healthz` — plain-text liveness probe for systemd/monitoring (not
 //!   part of the MCP wire protocol; a separate convenience route).
 //!
+//! ## TMOD-01: hot-swappable tool registry
+//! [`McpServerState::registry`] is an [`arc_swap::ArcSwap<ToolRegistry>`],
+//! not a bare `ToolRegistry` — this lets the active tool set be replaced
+//! WITHOUT restarting the process. Every handler that dispatches a request
+//! takes exactly ONE snapshot (`state.registry.load()`) at the top and uses
+//! that same `Arc<ToolRegistry>` for the entire request, so a swap that
+//! lands mid-request never tears a single call: in-flight calls finish
+//! against the snapshot they started with, and only calls that begin after
+//! a swap observe the new registry. [`McpServerState::swap_registry`]
+//! performs the atomic replacement; as of this item nothing on any live
+//! path calls it yet (this is foundation only, behavior-preserving).
+//!
 //! ## Auth
 //! Unauthenticated by default, matching the confirmed posture of the existing
 //! legacy Python `/mcp` host (no bearer token, no session validation) — this
@@ -43,6 +55,7 @@
 //! check is enforced instead (`Authorization: Bearer <token>`) — this gives
 //! the operator an opt-in upgrade path without forcing one.
 
+use arc_swap::ArcSwap;
 use axum::{
     body::Bytes,
     extract::{Extension, State},
@@ -68,7 +81,13 @@ use crate::registry::ToolRegistry;
 
 /// Shared server state.
 pub struct McpServerState {
-    pub registry: ToolRegistry,
+    /// TMOD-01: the active tool-registry SNAPSHOT, swappable at runtime
+    /// without a process restart. Every request handler takes exactly one
+    /// `load()` at the top and dispatches the whole request against that
+    /// snapshot — see this module's doc comment for the full invariant.
+    /// Construct with `ArcSwap::from_pointee(registry)`; replace atomically
+    /// via [`McpServerState::swap_registry`].
+    pub registry: ArcSwap<ToolRegistry>,
     pub server_name: String,
     pub server_version: String,
     /// If set, `Authorization: Bearer <token>` is required on `/mcp`.
@@ -121,6 +140,20 @@ pub struct McpServerState {
     /// existing single-identity deployments and every pre-MESH-07 test in
     /// this module keep working unmodified.
     pub principal_resolver: PrincipalResolver,
+}
+
+impl McpServerState {
+    /// TMOD-01: atomically replace the active tool-registry snapshot with
+    /// `new`. Any request that already captured the OLD snapshot (via
+    /// `state.registry.load()` at the top of its handler) keeps running
+    /// against it to completion — this call never blocks or invalidates an
+    /// in-flight call, it only changes what the NEXT `load()` returns.
+    ///
+    /// As of this item, nothing on any live path calls this yet — it exists
+    /// purely as the foundation for a future hot-reload/admin-tool item.
+    pub fn swap_registry(&self, new: ToolRegistry) {
+        self.registry.store(Arc::new(new));
+    }
 }
 
 /// MESH-07: resolve one request's [`Principal`] from its transport identity
@@ -367,6 +400,14 @@ async fn handle_mcp(
         return unauthorized();
     }
 
+    // TMOD-01: capture ONE tool-registry snapshot for the ENTIRE request —
+    // every dispatch branch below (`tools/list`, `tools/call`) reads from
+    // this same `Arc<ToolRegistry>`, so a `swap_registry` that lands
+    // mid-request can never tear this call: it either fully sees the old
+    // registry or (for a request that starts after the swap) fully sees the
+    // new one, never a mix of both.
+    let reg = state.registry.load();
+
     // MESH-07: resolve the ONE canonical `Principal` for this request up
     // front, from server-verified transport identity extensions only (never
     // from any inbound header -- notably NOT
@@ -425,8 +466,7 @@ async fn handle_mcp(
             sse_response(id, Ok(result), &session_id)
         }
         "tools/list" => {
-            let mut tools: Vec<Value> = state
-                .registry
+            let mut tools: Vec<Value> = reg
                 .list()
                 .into_iter()
                 .map(|t| {
@@ -760,8 +800,7 @@ async fn handle_mcp(
                         Some(msg),
                     )
                 }
-                Some(CallRoute::Local) | None => match state
-                .registry
+                Some(CallRoute::Local) | None => match reg
                 .call_structured(name, arguments.clone())
                 .await
             {
@@ -1047,7 +1086,7 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(EchoHealthTool)).unwrap();
         Arc::new(McpServerState {
-            registry,
+            registry: ArcSwap::from_pointee(registry),
             server_name: "terminus-personal-test".to_string(),
             server_version: "0.0.0-test".to_string(),
             auth_token: None,
@@ -1189,7 +1228,7 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(StructuredEchoTool)).unwrap();
         let state = Arc::new(McpServerState {
-            registry,
+            registry: ArcSwap::from_pointee(registry),
             server_name: "terminus-personal-test".to_string(),
             server_version: "0.0.0-test".to_string(),
             auth_token: None,
@@ -1258,7 +1297,7 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(AlwaysFailTool)).unwrap();
         let state = Arc::new(McpServerState {
-            registry,
+            registry: ArcSwap::from_pointee(registry),
             server_name: "terminus-personal-test".to_string(),
             server_version: "0.0.0-test".to_string(),
             auth_token: None,
@@ -1306,7 +1345,7 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(EchoHealthTool)).unwrap();
         let state = Arc::new(McpServerState {
-            registry,
+            registry: ArcSwap::from_pointee(registry),
             server_name: "terminus-personal-test".to_string(),
             server_version: "0.0.0-test".to_string(),
             auth_token: Some("secret-abc".to_string()),
@@ -1334,7 +1373,7 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(EchoHealthTool)).unwrap();
         let state = Arc::new(McpServerState {
-            registry,
+            registry: ArcSwap::from_pointee(registry),
             server_name: "terminus-personal-test".to_string(),
             server_version: "0.0.0-test".to_string(),
             auth_token: Some("secret-abc".to_string()),
@@ -1356,6 +1395,100 @@ mod tests {
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── TMOD-01: hot-swappable ArcSwap tool registry ────────────────────────
+
+    struct ExtraTool;
+
+    #[async_trait]
+    impl RustTool for ExtraTool {
+        fn name(&self) -> &str {
+            "extra_tool"
+        }
+        fn description(&self) -> &str {
+            "Only present after a swap"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: Value) -> Result<String, ToolError> {
+            Ok("extra ok".to_string())
+        }
+    }
+
+    /// After `swap_registry` installs a registry containing BOTH the
+    /// original tool and a newly added one, a fresh request (a fresh
+    /// `state.registry.load()`) can call either — the swap is additive from
+    /// the caller's point of view, not a full replacement of what's
+    /// reachable, as long as the new registry the caller builds includes
+    /// both.
+    #[tokio::test]
+    async fn swap_registry_makes_new_tool_callable_while_keeping_the_old_one() {
+        let state = test_state();
+
+        // Pre-swap: only "health" exists.
+        let (status, body, _) = post_mcp(build_router(state.clone()), health_call(1)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["isError"], false);
+
+        let mut new_registry = ToolRegistry::new();
+        new_registry.register(Box::new(EchoHealthTool)).unwrap();
+        new_registry.register(Box::new(ExtraTool)).unwrap();
+        state.swap_registry(new_registry);
+
+        // Post-swap: both "health" (still) and "extra_tool" (new) resolve.
+        let (status, body, _) = post_mcp(build_router(state.clone()), health_call(2)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["isError"], false, "original tool must still work after swap: {body}");
+
+        let (status, body, _) = post_mcp(
+            build_router(state.clone()),
+            json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "extra_tool", "arguments": {}}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["isError"], false, "newly swapped-in tool must be callable: {body}");
+        assert_eq!(body["result"]["content"][0]["text"], "extra ok");
+    }
+
+    /// A snapshot captured BEFORE a swap (`state.registry.load()`) keeps
+    /// resolving against the registry it was taken from — a swap changes
+    /// what the NEXT `load()` returns, never a snapshot already in hand.
+    /// This is the in-flight-call-finishes-on-its-old-snapshot invariant,
+    /// exercised directly against the snapshot API (a real concurrent HTTP
+    /// request racing a swap is inherently timing-dependent; this pins the
+    /// same guarantee deterministically).
+    #[tokio::test]
+    async fn snapshot_captured_before_swap_is_unaffected_by_a_later_swap() {
+        let state = test_state();
+
+        // Simulates `handle_mcp`'s `let reg = state.registry.load();` at the
+        // top of an in-flight request.
+        let in_flight_snapshot = state.registry.load();
+        assert!(in_flight_snapshot.contains("health"));
+        assert!(!in_flight_snapshot.contains("extra_tool"));
+
+        let mut new_registry = ToolRegistry::new();
+        new_registry.register(Box::new(ExtraTool)).unwrap(); // deliberately drops "health"
+        state.swap_registry(new_registry);
+
+        // The already-captured snapshot is untouched by the swap: it still
+        // resolves "health" and still has never heard of "extra_tool" — no
+        // panic, no missing-tool error mid-call, no tear.
+        let result = in_flight_snapshot.call("health", json!({})).await;
+        assert!(result.is_some(), "in-flight snapshot must still resolve its own tool after a swap");
+        assert_eq!(result.unwrap().unwrap(), "ok");
+        assert!(in_flight_snapshot.call("extra_tool", json!({})).await.is_none());
+
+        // A FRESH load (a new request arriving after the swap) sees only the
+        // new registry.
+        let post_swap_snapshot = state.registry.load();
+        assert!(!post_swap_snapshot.contains("health"));
+        assert!(post_swap_snapshot.contains("extra_tool"));
     }
 
     #[tokio::test]
@@ -1424,7 +1557,7 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(EchoHealthTool)).unwrap();
         Arc::new(McpServerState {
-            registry,
+            registry: ArcSwap::from_pointee(registry),
             server_name: "terminus-mesh07-test".to_string(),
             server_version: "0.0.0-test".to_string(),
             auth_token: None,
@@ -1595,7 +1728,7 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(EchoHealthTool)).unwrap();
         Arc::new(McpServerState {
-            registry,
+            registry: ArcSwap::from_pointee(registry),
             server_name: "terminus-mesh10-test".to_string(),
             server_version: "0.0.0-test".to_string(),
             auth_token: None,
