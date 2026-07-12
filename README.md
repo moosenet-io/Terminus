@@ -1526,6 +1526,58 @@ read-only tools — `pg_query`, `pg_list_tables`, `pg_describe_table`,
 alongside `crate::intake::register`) — Chord-served, never the
 `terminus_personal`/<host> personal registry.
 
+## Redis backend — the shared fleet cache/queue/limiter (BLD-20)
+
+terminus-primary owns the constellation's **one** Redis instance. It is a
+single managed service with many consumers, addressed in-process through
+`crate::redis` with **typed namespaces** so unrelated consumers never collide on
+keys.
+
+**Provisioning** (`deploy/redis/`): `install.sh` renders `redis.conf` +
+`redis.service` from vault-materialized environment values and installs the
+systemd unit. Redis binds **loopback + the mesh interface only**, requires a
+password (`requirepass`, from the vault), and runs `appendonly` for durability.
+`install.sh` is idempotent and **refuses to enable the service unless the
+rendered config is loopback/mesh-only AND auth is set** — an authed ping must
+succeed and an unauthenticated ping must be refused, both asserted post-install.
+No endpoint, IP, port, or password is committed to any tracked file (S1/S7); the
+endpoint reaches the process as `REDIS_URL` (password `REDIS_PASSWORD`),
+materialized from the vault at boot.
+
+**Namespaces** (`crate::redis::Namespace`) and their logical DB:
+
+| Namespace | Key prefix | Logical DB | Durability |
+|---|---|---|---|
+| `Queue` | `queue:` | durable (DB 0) | never evicted (no TTL) |
+| `Prefix` | `prefix:` | durable (DB 0) | never evicted (no TTL) |
+| `Ratelimit` | `ratelimit:` | volatile (DB 1) | TTL'd, LRU-evictable |
+| `Sccache` | `sccache:` | volatile (DB 1) | TTL'd, LRU-evictable |
+
+Redis's eviction policy is **global**, not per-DB, so durable keys are protected
+with `maxmemory-policy volatile-lru`: only keys carrying a TTL are eviction
+candidates. Durable keyspaces (queue/overlay) are written with **no** TTL and
+are therefore never evicted; volatile keyspaces carry a TTL and are the only
+ones the cap can reclaim — the practical equivalent of "noeviction for the
+durable DB, LRU for the volatile DB".
+
+**Rate-limit + request-queue surface** (`crate::ratelimit`): `RedisRateLimiter`
+implements the existing `gateway_framework::rate_limit::RateLimiter` trait — a
+drop-in for the in-process limiter — using an **atomic Lua token-bucket** so N
+concurrent over-limit requests are throttled correctly (no oversubscription) and
+limits **survive a gateway restart** (the bucket lives in Redis, not process
+memory). `RequestQueue` is a FIFO Redis-list queue for admitting over-limit
+requests in order.
+
+**Fail-safe degradation** (per consumer):
+- The **rate-limiter fails CLOSED** for the proxy — an unreachable Redis denies,
+  so an outage can never become an un-throttled flood at the backends.
+- **sccache fails OPEN** to a local dir — a cache outage never blocks a build.
+- The **prefix overlay fails OPEN** to the baseline TOML (`plane_prefix_*` still
+  answer from the reviewed baseline when the overlay is unreachable). Wiring the
+  overlay to this Redis makes `plane_prefix_register` **durable cross-instance**.
+- The **queue** persists to Redis; a caller with an intake-DB fallback keeps
+  working when Redis is down.
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
