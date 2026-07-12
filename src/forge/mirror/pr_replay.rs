@@ -344,6 +344,25 @@ fn pr_tag(n: u64) -> String {
     format!("mirror-pr/{n}")
 }
 
+/// Verify the fetched public-main tip actually reflects THIS PR's merged content
+/// before it is recorded as the published boundary: its TREE must equal the canonical
+/// scrubbed head's tree (work-dir HEAD, at scrubbed(head_int) after replay_pr_slice /
+/// on the consistent durable-reconcile path). Guards against recording an unrelated
+/// public tip — a concurrent public-main advance or an unexpected merge result — as
+/// the boundary. Fail closed on mismatch.
+fn verify_public_tip_matches_canonical(work_dir: &Path, public_tip: &str) -> Result<(), ToolError> {
+    let pub_tree = git(work_dir, &["rev-parse", &format!("{public_tip}^{{tree}}")])?.trim().to_string();
+    let canon_tree = git(work_dir, &["rev-parse", "HEAD^{tree}"])?.trim().to_string();
+    if pub_tree != canon_tree {
+        return Err(ToolError::Conflict(format!(
+            "public main {public_tip} (tree {pub_tree}) does not match this PR's scrubbed canonical \
+             head (tree {canon_tree}) — the public repo may have advanced concurrently or the merge \
+             landed an unexpected result. NOT recording the published boundary; reconcile the mirror."
+        )));
+    }
+    Ok(())
+}
+
 fn already_replayed(work_dir: &Path, n: u64) -> bool {
     git(work_dir, &["tag", "-l", &pr_tag(n)])
         .map(|s| s.lines().any(|l| l.trim() == pr_tag(n)))
@@ -474,6 +493,7 @@ pub async fn replay_pr(
                 )));
             }
             let new_public = fetch_public_main(&cfg.work_dir, &cfg.remote, &cfg.transport_token)?;
+            verify_public_tip_matches_canonical(&cfg.work_dir, &new_public)?;
             set_pushed_sha(&cfg.work_dir, &new_public)?;
             git(&cfg.work_dir, &["tag", "-f", &pr_tag(internal_pr), &new_public])?;
             base_outcome.skipped = true;
@@ -654,6 +674,7 @@ pub async fn replay_pr(
              via durable idempotency)"
         ))
     })?;
+    verify_public_tip_matches_canonical(&cfg.work_dir, &new_public)?;
     set_pushed_sha(&cfg.work_dir, &new_public)?;
     git(&cfg.work_dir, &["tag", "-f", &pr_tag(internal_pr), &new_public])?;
 
