@@ -589,6 +589,17 @@ impl GiteaForge {
                 get(format!("/repos/{owner}/{}/pulls?state={state}&limit={limit}&page={page}", repo()?)).await
             }
             PullRequestsGet => get(format!("/repos/{owner}/{}/pulls/{}", repo()?, idx("index")?)).await,
+            // Read the PR's discussion thread. In the Gitea/Forgejo API a PR shares
+            // the issue-comment stream, so this is the issue-comments listing for the
+            // same index (paginated). Read-only.
+            PullRequestsListComments => {
+                get(format!(
+                    "/repos/{owner}/{}/issues/{}/comments?limit={limit}&page={page}",
+                    repo()?,
+                    idx("index")?
+                ))
+                .await
+            }
             PullRequestsCreate => {
                 let mut body = json!({ "title": s("title")?, "head": s("head")?, "base": s("base")? });
                 if let Some(b) = params.get("body").and_then(Value::as_str) {
@@ -862,6 +873,12 @@ mod tests {
         let report = caps.report();
         assert_eq!(report["repos"]["repos_create"], "supported");
         assert_eq!(report["pull_requests"]["pull_requests_merge"], "supported");
+        // GHIST-05: the PR-comment read endpoint is advertised (derived from all()).
+        assert_eq!(report["pull_requests"]["pull_requests_list_comments"], "supported");
+        assert_eq!(
+            caps.level(ForgeEndpoint::PullRequestsListComments),
+            SupportLevel::Supported
+        );
         assert_eq!(report["packages"]["packages_publish"], "supported");
     }
 

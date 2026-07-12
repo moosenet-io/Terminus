@@ -49,6 +49,10 @@ pub struct HistoryReport {
     pub idents_seen: usize,
     /// author/committer idents actually rewritten by the GHIST-03 attribution map.
     pub idents_remapped: usize,
+    /// commit/tag message payloads seen.
+    pub messages_total: usize,
+    /// commit/tag message payloads the cleaner actually changed.
+    pub messages_rewritten: usize,
 }
 
 /// Replay options.
@@ -466,6 +470,65 @@ pub fn replay_range(
     Ok(report)
 }
 
+/// Replay EXACTLY `from_sha..to_sha` (bounded to `to_sha`'s ancestry) onto the
+/// canonical lineage, scrubbed + attributed, and advance the canonical branch to
+/// scrubbed(`to_sha`). Unlike [`replay_range`] — which exports `--all` up to the
+/// source's CURRENT refs (correct for a "catch up to HEAD" sync) — this exports ONLY
+/// `to_sha`, so a source checkout sitting BEYOND `to_sha` (e.g. at internal `main`
+/// during a per-PR replay) does NOT drag later commits into the slice. Used by
+/// [`replay_pr_slice`] (GHIST-05). `from_sha` must be an ancestor of `to_sha` and
+/// already mirrored (present in the marks).
+pub fn replay_range_bounded(
+    source: &Path,
+    work_dir: &Path,
+    from_sha: &str,
+    to_sha: &str,
+    opts: &ReplayOpts,
+) -> Result<HistoryReport, ToolError> {
+    run_git(source, &["rev-parse", "--git-dir"])
+        .map_err(|e| ToolError::Execution(format!("source is not a git repo: {e}")))?;
+    if !marks_paths(work_dir).src.exists() {
+        return Err(ToolError::Execution(
+            "no backfill marks present — run replay_full_history before a bounded range".into(),
+        ));
+    }
+    let anc = Command::new("git")
+        .arg("-C")
+        .arg(source)
+        .args(HOOKS_OFF)
+        .args(["merge-base", "--is-ancestor", from_sha, to_sha])
+        .status()
+        .map_err(|e| ToolError::Execution(format!("merge-base: {e}")))?;
+    if !anc.success() {
+        return Err(ToolError::Execution(format!(
+            "internal history is not a fast-forward: {from_sha}..{to_sha} — {to_sha} does not \
+             descend from {from_sha}; refusing to diverge the mirror"
+        )));
+    }
+    // A temporary NAMED source ref at to_sha BOUNDS the export to to_sha's ancestry
+    // AND names it, so fast-import re-creates the same ref in the work-dir at
+    // scrubbed(to_sha) (no `--all` over-export, no anonymous-ref/marks parsing). The
+    // `--import-marks` in run_export_import skips everything already mirrored, so only
+    // from_sha..to_sha is emitted. The temp ref is removed from both repos afterward.
+    let tmp = "refs/ghist-pr-slice-tmp";
+    git_capture(source, &["update-ref", tmp, to_sha])?;
+    let result = (|| -> Result<HistoryReport, ToolError> {
+        let report = run_export_import(source, work_dir, &[tmp], true, opts)?;
+        // Point the canonical branch at the imported slice tip (run_export_import left
+        // HEAD on the OLD canonical head; only the tmp ref advanced), then sync.
+        let canonical_branch = git_capture(work_dir, &["symbolic-ref", "--short", "HEAD"])?
+            .trim()
+            .to_string();
+        git_capture(work_dir, &["update-ref", &format!("refs/heads/{canonical_branch}"), tmp])?;
+        git_capture(work_dir, &["reset", "--hard", &canonical_branch])?;
+        let _ = git_capture(work_dir, &["update-ref", "-d", tmp]);
+        set_mirrored_sha(work_dir, to_sha)?;
+        Ok(report)
+    })();
+    let _ = git_capture(source, &["update-ref", "-d", tmp]); // always clean up the source temp ref
+    result
+}
+
 /// Bring `work_dir` up to `source`'s current HEAD: a full backfill on first run
 /// (no prior lineage), else an incremental append of the new commits. Returns
 /// `(is_full, report)`. A no-op (already at HEAD) returns a zero report.
@@ -480,6 +543,261 @@ pub fn replay_incremental_or_full(
         Some(last) => Ok((false, replay_range(source, work_dir, &last, &head, opts)?)),
         None => Ok((true, replay_full_history(source, work_dir, opts)?)),
     }
+}
+
+// ── GHIST-05: transactional canonical-lineage snapshot / restore ─────────────
+
+/// A snapshot of the canonical scrubbed lineage's mutable state — the marks files,
+/// the internal/pushed head markers, and the checked-out branch tip. Used to make a
+/// PR replay TRANSACTIONAL: if any public write (push / PR create / comment / merge)
+/// fails after the local replay advanced the lineage, [`restore_canonical`] rolls it
+/// back exactly so a retry starts clean instead of finding the lineage wedged past an
+/// unpublished PR.
+#[derive(Debug, Clone)]
+pub struct CanonicalSnapshot {
+    branch: String,
+    commit: String,
+    /// `(path, Some(bytes))` = file existed with these bytes; `(path, None)` = absent.
+    files: Vec<(PathBuf, Option<Vec<u8>>)>,
+}
+
+fn ghist_state_files(work_dir: &Path) -> Vec<PathBuf> {
+    let d = work_dir.join(".git").join("ghist");
+    ["src-marks", "import-marks", "internal-head", "pushed-head"]
+        .iter()
+        .map(|f| d.join(f))
+        .collect()
+}
+
+/// Capture the canonical lineage's mutable state before a PR replay.
+pub fn snapshot_canonical(work_dir: &Path) -> Result<CanonicalSnapshot, ToolError> {
+    let branch = git_capture(work_dir, &["symbolic-ref", "--short", "HEAD"])?.trim().to_string();
+    let commit = git_capture(work_dir, &["rev-parse", "HEAD"])?.trim().to_string();
+    let files = ghist_state_files(work_dir)
+        .into_iter()
+        .map(|p| {
+            let bytes = std::fs::read(&p).ok();
+            (p, bytes)
+        })
+        .collect();
+    Ok(CanonicalSnapshot { branch, commit, files })
+}
+
+/// Roll the canonical lineage back to a [`snapshot_canonical`] state: restore every
+/// marks/head file byte-for-byte (or remove it if it was absent), delete any leftover
+/// PR feature branch, and hard-reset the canonical branch to its snapshot commit.
+pub fn restore_canonical(
+    work_dir: &Path,
+    snap: &CanonicalSnapshot,
+    pr_branch: &str,
+) -> Result<(), ToolError> {
+    for (path, bytes) in &snap.files {
+        match bytes {
+            Some(b) => {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                std::fs::write(path, b)
+                    .map_err(|e| ToolError::Execution(format!("restore {}: {e}", path.display())))?;
+            }
+            None => {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+    // Get back onto the canonical branch and hard-reset it to the snapshot commit.
+    git_capture(work_dir, &["checkout", "-f", &snap.branch])?;
+    git_capture(work_dir, &["reset", "--hard", &snap.commit])?;
+    // Drop the (partial) PR feature branch if it was created.
+    let _ = git_capture(work_dir, &["branch", "-D", pr_branch]);
+    Ok(())
+}
+
+// ── GHIST-05: per-PR scrubbed feature-branch replay ──────────────────────────
+
+/// One PR's scrubbed feature branch, produced by [`replay_pr_slice`].
+#[derive(Debug, Clone)]
+pub struct PrSliceReport {
+    /// Canonical scrubbed tip BEFORE this slice (its tree equals `public_base`'s).
+    pub canonical_base: String,
+    /// Canonical scrubbed tip AFTER this slice.
+    pub canonical_head: String,
+    /// The PR feature-branch tip: the slice rebased onto `public_base`.
+    pub branch_tip: String,
+    /// Number of commits in the slice (0 = an empty PR range).
+    pub commits: usize,
+}
+
+/// The committer identity to stamp on rebased PR-branch commits: the author map's
+/// default (the public bot identity), so a rebase never leaks the build host's git
+/// user. Falls back to a neutral local identity when no map is configured (tests).
+fn committer_identity(opts: &ReplayOpts) -> (String, String) {
+    opts.author_map
+        .as_ref()
+        .map(|m| (m.default_name.clone(), m.default_email.clone()))
+        .unwrap_or_else(|| ("mirror-bot".to_string(), "mirror-bot@localhost".to_string()))
+}
+
+/// `git rebase --onto <newbase> <upstream> <branch>` with hooks off, a pinned
+/// committer identity, and author-dated committers. Aborts a partial rebase so the
+/// work-dir is never left mid-rebase on failure.
+fn rebase_slice_onto(
+    work_dir: &Path,
+    newbase: &str,
+    upstream: &str,
+    branch: &str,
+    committer_name: &str,
+    committer_email: &str,
+) -> Result<(), ToolError> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(work_dir)
+        .args(HOOKS_OFF)
+        .env("GIT_COMMITTER_NAME", committer_name)
+        .env("GIT_COMMITTER_EMAIL", committer_email)
+        .args([
+            "rebase",
+            // Preserve the slice's merge topology (an internal PR's merge commit and
+            // any merge-only conflict-resolution tree changes) — a default rebase would
+            // flatten/drop merges and could alter the published tree.
+            "--rebase-merges",
+            "--committer-date-is-author-date",
+            "--onto",
+            newbase,
+            upstream,
+            branch,
+        ])
+        .output()
+        .map_err(|e| ToolError::Execution(format!("spawn git rebase: {e}")))?;
+    if !out.status.success() {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(work_dir)
+            .args(HOOKS_OFF)
+            .args(["rebase", "--abort"])
+            .status();
+        return Err(ToolError::Execution(format!(
+            "git rebase --onto {newbase} {upstream} {branch} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Replay one internal PR's commit range `base_int..head_int` as a scrubbed feature
+/// branch rebased onto `public_base` (the current public-main tip, which MUST already
+/// be present in `work_dir`'s object DB — the caller fetches public main first).
+///
+/// The work-dir's canonical marks-based scrubbed lineage must be exactly at `base_int`
+/// (PRs replay in merge ORDER onto the canonical lineage). The range is replayed onto
+/// the canonical lineage (scrubbed + attributed via the marks), then the resulting
+/// slice is rebased onto `public_base` and `branch_name` is pointed at it — ready to
+/// push as the PR's head branch. Because `public_base`'s tree equals the canonical
+/// base's tree (the public tip is the merged/squashed equivalent of everything up to
+/// `base_int`), the rebase applies with no conflicts. The canonical branch is left at
+/// its advanced tip; only `branch_name` is based on `public_base`.
+pub fn replay_pr_slice(
+    source: &Path,
+    work_dir: &Path,
+    base_int: &str,
+    head_int: &str,
+    public_base: &str,
+    branch_name: &str,
+    opts: &ReplayOpts,
+) -> Result<PrSliceReport, ToolError> {
+    // Ordering guard: the canonical lineage must be exactly at base_int.
+    match last_mirrored_sha(work_dir) {
+        Some(l) if l == base_int => {}
+        other => {
+            return Err(ToolError::Execution(format!(
+                "PR replay out of order: canonical scrubbed lineage is at {other:?}, expected \
+                 base {base_int}. PRs must replay in merge order onto the canonical lineage."
+            )));
+        }
+    }
+    // public_base must be a known commit object (the caller fetched public main).
+    if git_capture(work_dir, &["cat-file", "-e", &format!("{public_base}^{{commit}}")]).is_err() {
+        return Err(ToolError::Execution(format!(
+            "public base {public_base} is not present in the mirror work-dir — fetch public main \
+             into the work-dir before replaying a PR slice onto it"
+        )));
+    }
+
+    let canonical_branch = git_capture(work_dir, &["symbolic-ref", "--short", "HEAD"])?
+        .trim()
+        .to_string();
+    let canonical_base = git_capture(work_dir, &["rev-parse", "HEAD"])?.trim().to_string();
+
+    // Fail closed unless public_base's TREE equals the canonical base's tree. The PR
+    // slice rebases onto public_base assuming its content is the merged/squashed
+    // equivalent of the canonical history up to base_int; if the public mirror has
+    // diverged / been altered / the recorded boundary is stale, the trees differ and a
+    // rebase would land the slice on the WRONG public lineage. Refuse rather than
+    // publish onto a divergent base.
+    let public_tree = git_capture(work_dir, &["rev-parse", &format!("{public_base}^{{tree}}")])?
+        .trim()
+        .to_string();
+    let canonical_tree = git_capture(work_dir, &["rev-parse", &format!("{canonical_base}^{{tree}}")])?
+        .trim()
+        .to_string();
+    if public_tree != canonical_tree {
+        return Err(ToolError::Conflict(format!(
+            "public base {public_base} (tree {public_tree}) does not match the canonical scrubbed \
+             base {canonical_base} (tree {canonical_tree}) — the public mirror has diverged from \
+             the scrubbed lineage. Refusing to rebase a PR slice onto a divergent base; reconcile \
+             the mirror (re-baseline via GHIST-07) first."
+        )));
+    }
+
+    // Advance the canonical scrubbed lineage over the PR range (marks-chained).
+    // BOUNDED replay: export ONLY base_int..head_int (not `--all`). The PR-replay source
+    // checkout may sit at internal main, well beyond head_int — a `--all` export would
+    // drag every later commit into this PR's slice and publish it under this PR.
+    replay_range_bounded(source, work_dir, base_int, head_int, opts)?;
+    let canonical_head = git_capture(work_dir, &["rev-parse", "HEAD"])?.trim().to_string();
+    let commits: usize = git_capture(
+        work_dir,
+        &["rev-list", "--count", &format!("{canonical_base}..{canonical_head}")],
+    )?
+    .trim()
+    .parse()
+    .unwrap_or(0);
+
+    // Rebase the slice canonical_base..canonical_head onto public_base → the PR head branch.
+    git_capture(work_dir, &["branch", "-f", branch_name, &canonical_head])?;
+    let (cname, cemail) = committer_identity(opts);
+    rebase_slice_onto(work_dir, public_base, &canonical_base, branch_name, &cname, &cemail)?;
+    let branch_tip = git_capture(work_dir, &["rev-parse", branch_name])?.trim().to_string();
+
+    // Post-rebase safety: the rebased branch tip's TREE MUST equal the canonical head's
+    // tree. Since public_base's tree equals the canonical base's tree, replaying the
+    // same slice onto it must reproduce identical content. If it differs, the rebase
+    // altered content (e.g. a dropped/mishandled merge commit) — refuse to publish
+    // divergent content rather than push a branch that doesn't match the scrubbed
+    // lineage. Fail closed.
+    let tip_tree = git_capture(work_dir, &["rev-parse", &format!("{branch_tip}^{{tree}}")])?
+        .trim()
+        .to_string();
+    let head_tree = git_capture(work_dir, &["rev-parse", &format!("{canonical_head}^{{tree}}")])?
+        .trim()
+        .to_string();
+    if tip_tree != head_tree {
+        // Leave the work-tree on the canonical lineage before erroring.
+        let _ = git_capture(work_dir, &["checkout", "-f", &canonical_branch]);
+        let _ = git_capture(work_dir, &["reset", "--hard", &canonical_head]);
+        let _ = git_capture(work_dir, &["branch", "-D", branch_name]);
+        return Err(ToolError::Conflict(format!(
+            "rebased PR branch '{branch_name}' tip tree {tip_tree} does not match the canonical \
+             scrubbed head tree {head_tree} — the rebase altered content (a merge commit's \
+             conflict resolution may have been dropped). Refusing to publish divergent content."
+        )));
+    }
+
+    // Restore the work-tree to the canonical lineage (the rebase left HEAD on branch_name).
+    git_capture(work_dir, &["checkout", "-f", &canonical_branch])?;
+    git_capture(work_dir, &["reset", "--hard", &canonical_head])?;
+
+    Ok(PrSliceReport { canonical_base, canonical_head, branch_tip, commits })
 }
 
 // ── GHIST-02: full-history PII gate ──────────────────────────────────────────
@@ -706,9 +1024,22 @@ fn transform_stream<R: BufRead, W: Write>(
                     }
                     scrubbed
                 }
-                // Commit message (or a stray data with no preceding blob/commit) —
-                // never scrubbed here (messages are prose; graph fidelity first).
-                _ => data,
+                // Commit / tag MESSAGE: scrub it too. Messages carry PII (hostnames,
+                // IPs, emails, ticket refs, pasted secrets) just like blobs, and the
+                // full-history gate only scans trees — so an unscrubbed message would
+                // leak to the public mirror. The same single-line-safe cleaner is used;
+                // graph structure (parents / dates / refs) rides on separate stream
+                // lines and is untouched, so fidelity is preserved. (GHIST-05 review.)
+                Pending::Message => {
+                    report.messages_total += 1;
+                    let scrubbed = DeterministicCleaner::scrub_bytes(&data);
+                    if scrubbed != data {
+                        report.messages_rewritten += 1;
+                    }
+                    scrubbed
+                }
+                // A stray data with no preceding blob/commit — passed through.
+                Pending::None => data,
             };
             pending = Pending::None;
             w.write_all(format!("data {}\n", out.len()).as_bytes())
@@ -897,6 +1228,338 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "commit: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    fn bot_map() -> IdentityMap {
+        IdentityMap {
+            rules: vec![],
+            default_name: "MoosenetBot".into(),
+            default_email: "<email>".into(), // pii-test-fixture
+        }
+    }
+
+    // ── GHIST-05: a PR slice is scrubbed, rebased onto the public base, dated ──
+    #[test]
+    fn replay_pr_slice_rebases_scrubbed_range_onto_public_base() {
+        // Source: C1 only at first (the canonical baseline), then a PR adds C2, C3.
+        let src = unique("prsrc");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q", "-b", "main"]);
+        write(&src, "a.txt", b"baseline\n");
+        commit_all(&src, "C1 baseline");
+        let c1 = git(&src, &["rev-parse", "HEAD"]).trim().to_string();
+
+        let wd = unique("prwd");
+        let opts = ReplayOpts::with_author_map(bot_map());
+        // Backfill C1 → canonical lineage at scrubbed(C1).
+        replay_full_history(&src, &wd, &opts).unwrap();
+        let canon_base = git(&wd, &["rev-parse", "HEAD"]).trim().to_string();
+        let base_tree = git(&wd, &["rev-parse", &format!("{canon_base}^{{tree}}")]).trim().to_string();
+
+        // The PR: two new internal commits, one carrying an internal IP to prove scrubbing.
+        write(&src, "feature.txt", b"new host <internal-ip> wired in\n"); // pii-test-fixture
+        commit_all(&src, "C2 feature");
+        write(&src, "more.txt", b"second feature commit\n");
+        commit_all(&src, "C3 feature");
+        let c3 = git(&src, &["rev-parse", "HEAD"]).trim().to_string();
+
+        // Simulate the PUBLIC main tip: a distinct commit with the SAME tree as the
+        // canonical base (as a squash/merge of everything up to C1 would be).
+        let pub_base = {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&wd)
+                .args(HOOKS_OFF)
+                .args(["-c", "user.name=Pub", "-c", "user.email=<email>", // pii-test-fixture
+                       "commit-tree", &base_tree, "-m", "public squash of C1"])
+                .env("GIT_COMMITTER_NAME", "Pub")
+                .env("GIT_COMMITTER_EMAIL", "<email>") // pii-test-fixture
+                .env("GIT_AUTHOR_NAME", "Pub")
+                .env("GIT_AUTHOR_EMAIL", "<email>") // pii-test-fixture
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "commit-tree: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        let rep = replay_pr_slice(&src, &wd, &c1, &c3, &pub_base, "pr-mirror/7", &opts).unwrap();
+        assert_eq!(rep.commits, 2, "the slice has both feature commits: {rep:?}");
+
+        // The PR branch is based on the public base (not the canonical lineage).
+        let is_anc = Command::new("git")
+            .arg("-C").arg(&wd).args(HOOKS_OFF)
+            .args(["merge-base", "--is-ancestor", &pub_base, "pr-mirror/7"])
+            .status().unwrap().success();
+        assert!(is_anc, "pr branch must descend from the public base");
+        // …and carries exactly the two commits on top of it.
+        let n = git(&wd, &["rev-list", "--count", &format!("{pub_base}..pr-mirror/7")]).trim().to_string();
+        assert_eq!(n, "2");
+
+        // The branch tip has the SAME tree as the canonical head (content-identical).
+        let branch_tree = git(&wd, &["rev-parse", "pr-mirror/7^{tree}"]).trim().to_string();
+        let canon_tree = git(&wd, &["rev-parse", &format!("{}^{{tree}}", rep.canonical_head)]).trim().to_string();
+        assert_eq!(branch_tree, canon_tree, "rebase preserved content");
+
+        // The internal IP was scrubbed everywhere in the PR branch.
+        let grep = git_capture(&wd, &["grep", "-I", "<internal-ip>", "pr-mirror/7"]); // pii-test-fixture
+        assert!(grep.is_err() || grep.unwrap().trim().is_empty(), "internal IP scrubbed in PR branch");
+
+        // The author is remapped to the bot on the PR-branch commits.
+        let author = git(&wd, &["log", "-1", "--format=%an <%ae>", "pr-mirror/7"]).trim().to_string();
+        assert!(author.contains("MoosenetBot"), "author remapped: {author}");
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    // ── GHIST-05 review (HIGH): the PR slice is BOUNDED to base..head, even when the
+    //    source checkout sits at a LATER commit (regression for the `--all` over-export).
+    #[test]
+    fn replay_pr_slice_is_bounded_when_source_is_ahead() {
+        let src = unique("boundsrc");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q", "-b", "main"]);
+        write(&src, "a.txt", b"base\n");
+        commit_all(&src, "C1 base");
+        let c1 = git(&src, &["rev-parse", "HEAD"]).trim().to_string();
+
+        let wd = unique("boundwd");
+        let opts = ReplayOpts::with_author_map(bot_map());
+        replay_full_history(&src, &wd, &opts).unwrap(); // canonical at scrubbed(C1)
+        let canon_base = git(&wd, &["rev-parse", "HEAD"]).trim().to_string();
+        let base_tree = git(&wd, &["rev-parse", &format!("{canon_base}^{{tree}}")]).trim().to_string();
+
+        // The PR: C2, C3.
+        write(&src, "feat1.txt", b"pr commit one\n");
+        commit_all(&src, "C2 pr");
+        write(&src, "feat2.txt", b"pr commit two\n");
+        commit_all(&src, "C3 pr head");
+        let c3 = git(&src, &["rev-parse", "HEAD"]).trim().to_string();
+        // LATER commits beyond the PR (the source now sits here, at main).
+        write(&src, "later1.txt", b"later work\n");
+        commit_all(&src, "C4 later");
+        write(&src, "later2.txt", b"even later\n");
+        commit_all(&src, "C5 later");
+
+        let pub_base = {
+            let out = Command::new("git")
+                .arg("-C").arg(&wd).args(HOOKS_OFF)
+                .args(["-c", "user.name=P", "-c", "user.email=<email>", // pii-test-fixture
+                       "commit-tree", &base_tree, "-m", "public base"])
+                .env("GIT_COMMITTER_NAME", "P").env("GIT_COMMITTER_EMAIL", "<email>") // pii-test-fixture
+                .env("GIT_AUTHOR_NAME", "P").env("GIT_AUTHOR_EMAIL", "<email>") // pii-test-fixture
+                .output().unwrap();
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // Replay ONLY C1..C3, though the source HEAD is at C5.
+        let rep = replay_pr_slice(&src, &wd, &c1, &c3, &pub_base, "pr-mirror/1", &opts).unwrap();
+        assert_eq!(rep.commits, 2, "slice is exactly the PR's 2 commits, not the later ones: {rep:?}");
+        assert_eq!(last_mirrored_sha(&wd).as_deref(), Some(c3.as_str()), "canonical stops at head_int");
+
+        // The PR branch (and canonical head) contain the PR's files but NOT the later ones.
+        let ls = git(&wd, &["ls-tree", "-r", "--name-only", "pr-mirror/1"]);
+        assert!(ls.contains("feat1.txt") && ls.contains("feat2.txt"), "PR files present: {ls}");
+        assert!(!ls.contains("later1.txt") && !ls.contains("later2.txt"), "later commits NOT dragged in: {ls}");
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    // ── GHIST-05 review: a merge-commit slice keeps its merge topology + tree ──
+    #[test]
+    fn replay_pr_slice_preserves_merge_commit() {
+        let src = unique("mergeprsrc");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q", "-b", "main"]);
+        write(&src, "a.txt", b"base\n");
+        commit_all(&src, "C1 base");
+        let c1 = git(&src, &["rev-parse", "HEAD"]).trim().to_string();
+
+        let wd = unique("mergeprwd");
+        let opts = ReplayOpts::with_author_map(bot_map());
+        replay_full_history(&src, &wd, &opts).unwrap(); // canonical at scrubbed(C1)
+        let canon_base = git(&wd, &["rev-parse", "HEAD"]).trim().to_string();
+        let base_tree = git(&wd, &["rev-parse", &format!("{canon_base}^{{tree}}")]).trim().to_string();
+
+        // Build a real MERGE commit on the source: a feature branch + a main commit,
+        // then a no-ff merge (two parents).
+        git(&src, &["checkout", "-q", "-b", "feat"]);
+        write(&src, "feature.txt", b"feature work\n");
+        commit_all(&src, "feature commit");
+        git(&src, &["checkout", "-q", "main"]);
+        write(&src, "mainline.txt", b"mainline work\n");
+        commit_all(&src, "mainline commit");
+        let out = Command::new("git")
+            .arg("-C").arg(&src).args(HOOKS_OFF)
+            .args(["-c", "user.name=M", "-c", "user.email=<email>", // pii-test-fixture
+                   "merge", "--no-ff", "-m", "Merge pull request feat", "feat"])
+            .output().unwrap();
+        assert!(out.status.success(), "merge: {}", String::from_utf8_lossy(&out.stderr));
+        let m = git(&src, &["rev-parse", "HEAD"]).trim().to_string();
+        // Sanity: m is a merge commit (2 parents).
+        assert_eq!(git(&src, &["rev-list", "--parents", "-n", "1", &m]).split_whitespace().count(), 3);
+
+        // Public base: distinct commit with the same tree as the canonical base.
+        let pub_base = {
+            let out = Command::new("git")
+                .arg("-C").arg(&wd).args(HOOKS_OFF)
+                .args(["-c", "user.name=P", "-c", "user.email=<email>", // pii-test-fixture
+                       "commit-tree", &base_tree, "-m", "public base"])
+                .env("GIT_COMMITTER_NAME", "P").env("GIT_COMMITTER_EMAIL", "<email>") // pii-test-fixture
+                .env("GIT_AUTHOR_NAME", "P").env("GIT_AUTHOR_EMAIL", "<email>") // pii-test-fixture
+                .output().unwrap();
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        let rep = replay_pr_slice(&src, &wd, &c1, &m, &pub_base, "pr-mirror/1", &opts).unwrap();
+        // The PR branch preserves the merge commit and matches the canonical head tree.
+        let branch_merges = git(&wd, &["rev-list", "--merges", "--count", &format!("{pub_base}..pr-mirror/1")]);
+        assert_eq!(branch_merges.trim(), "1", "the merge commit is preserved on the PR branch");
+        let branch_tree = git(&wd, &["rev-parse", "pr-mirror/1^{tree}"]).trim().to_string();
+        let canon_tree = git(&wd, &["rev-parse", &format!("{}^{{tree}}", rep.canonical_head)]).trim().to_string();
+        assert_eq!(branch_tree, canon_tree, "rebased merge slice is content-identical to canonical head");
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    // ── GHIST-05: refuse a PR replay when the canonical lineage isn't at the base ──
+    #[test]
+    fn replay_pr_slice_refuses_out_of_order() {
+        let src = unique("prsrc2");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q", "-b", "main"]);
+        write(&src, "a.txt", b"one\n");
+        commit_all(&src, "C1");
+        write(&src, "b.txt", b"two\n");
+        commit_all(&src, "C2");
+        let c2 = git(&src, &["rev-parse", "HEAD"]).trim().to_string();
+
+        let wd = unique("prwd2");
+        let opts = ReplayOpts::with_author_map(bot_map());
+        // Backfill BOTH commits → canonical lineage is at C2, not C1.
+        replay_full_history(&src, &wd, &opts).unwrap();
+        let canon = git(&wd, &["rev-parse", "HEAD"]).trim().to_string();
+
+        // Asking to replay a slice whose base is C2's parent (an earlier commit) must
+        // refuse — the canonical lineage is already past it.
+        let c1 = git(&src, &["rev-parse", "HEAD~1"]).trim().to_string();
+        let err = replay_pr_slice(&src, &wd, &c1, &c2, &canon, "pr-mirror/9", &opts);
+        assert!(err.is_err(), "must refuse an out-of-order PR replay: {err:?}");
+        assert!(format!("{err:?}").contains("out of order"), "{err:?}");
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    // ── GHIST-05 review: commit MESSAGES are scrubbed, not just blobs ──
+    #[test]
+    fn replay_scrubs_commit_messages() {
+        let src = unique("msgsrc");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q", "-b", "main"]);
+        write(&src, "f.txt", b"clean content\n");
+        // The MESSAGE (not the blob) carries an internal IP.
+        let out = Command::new("git")
+            .arg("-C").arg(&src).args(HOOKS_OFF)
+            .args(["-c", "user.name=A", "-c", "user.email=<email>", // pii-test-fixture
+                   "add", "-A"])
+            .output().unwrap();
+        assert!(out.status.success());
+        let out = Command::new("git")
+            .arg("-C").arg(&src).args(HOOKS_OFF)
+            .args(["-c", "user.name=A", "-c", "user.email=<email>", // pii-test-fixture
+                   "commit", "-q", "-m", "deploy to <internal-ip> tonight"]) // pii-test-fixture
+            .output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        let wd = unique("msgwd");
+        let opts = ReplayOpts::with_author_map(bot_map());
+        let report = replay_full_history(&src, &wd, &opts).unwrap();
+        assert!(report.messages_rewritten >= 1, "a message was scrubbed: {report:?}");
+
+        // The replayed commit message no longer contains the internal IP.
+        let msg = git(&wd, &["log", "-1", "--format=%B"]);
+        assert!(!msg.contains("<internal-ip>"), "commit message scrubbed: {msg:?}"); // pii-test-fixture
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    // ── GHIST-05: refuse a PR replay when the public base tree has diverged ──
+    #[test]
+    fn replay_pr_slice_refuses_divergent_public_base() {
+        let src = unique("prsrc3");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q", "-b", "main"]);
+        write(&src, "a.txt", b"one\n");
+        commit_all(&src, "C1");
+        write(&src, "b.txt", b"two\n");
+        commit_all(&src, "C2");
+        let c2 = git(&src, &["rev-parse", "HEAD"]).trim().to_string();
+
+        let wd = unique("prwd3");
+        let opts = ReplayOpts::with_author_map(bot_map());
+        // Backfill C1+C2 → canonical at scrubbed(C2), tree T2.
+        replay_full_history(&src, &wd, &opts).unwrap();
+        // A public base with a DIFFERENT tree: scrubbed(C1) = HEAD~1 (tree T1 != T2).
+        let divergent = git(&wd, &["rev-parse", "HEAD~1"]).trim().to_string();
+
+        // Even with a well-ordered base (C2 == last mirrored) and an empty range, the
+        // tree-equivalence guard must refuse a divergent public base BEFORE replaying.
+        let err = replay_pr_slice(&src, &wd, &c2, &c2, &divergent, "pr-mirror/3", &opts);
+        assert!(err.is_err(), "must refuse a divergent public base: {err:?}");
+        assert!(format!("{err:?}").contains("diverged"), "{err:?}");
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    // ── GHIST-05: snapshot → advance → restore rolls the canonical lineage back ──
+    #[test]
+    fn snapshot_restore_rolls_back_canonical_lineage() {
+        let src = unique("snapsrc");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q", "-b", "main"]);
+        write(&src, "a.txt", b"one\n");
+        commit_all(&src, "C1");
+        let c1 = git(&src, &["rev-parse", "HEAD"]).trim().to_string();
+
+        let wd = unique("snapwd");
+        let opts = ReplayOpts::with_author_map(bot_map());
+        replay_full_history(&src, &wd, &opts).unwrap(); // canonical at scrubbed(C1)
+
+        let snap = snapshot_canonical(&wd).unwrap();
+        let before_head = git(&wd, &["rev-parse", "HEAD"]).trim().to_string();
+        let before_mirrored = last_mirrored_sha(&wd);
+        assert_eq!(before_mirrored.as_deref(), Some(c1.as_str()));
+
+        // Advance the canonical lineage over a new commit (simulating a PR replay that
+        // then fails to publish), and drop a leftover PR branch.
+        write(&src, "b.txt", b"two\n");
+        commit_all(&src, "C2");
+        let c2 = git(&src, &["rev-parse", "HEAD"]).trim().to_string();
+        replay_range(&src, &wd, &c1, &c2, &opts).unwrap();
+        git(&wd, &["branch", "-f", "pr-mirror/1", "HEAD"]);
+        assert_ne!(git(&wd, &["rev-parse", "HEAD"]).trim(), before_head, "canonical advanced");
+
+        // Roll back — canonical returns to the snapshot, the PR branch is gone.
+        restore_canonical(&wd, &snap, "pr-mirror/1").unwrap();
+        assert_eq!(git(&wd, &["rev-parse", "HEAD"]).trim(), before_head, "HEAD restored");
+        assert_eq!(last_mirrored_sha(&wd).as_deref(), Some(c1.as_str()), "internal-head restored");
+        let branches = git(&wd, &["branch", "-l", "pr-mirror/1"]);
+        assert!(branches.trim().is_empty(), "leftover PR branch deleted");
+
+        // Marks restored: replaying the same range again re-advances identically (i.e.
+        // the marks were rolled back, not left stale so the commits get skipped).
+        replay_range(&src, &wd, &c1, &c2, &opts).unwrap();
+        assert_eq!(last_mirrored_sha(&wd).as_deref(), Some(c2.as_str()), "re-replay works after restore");
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&wd);
     }
 
     // ── GHIST-02: a secret present ONLY in a historical (non-tip) commit is caught ──

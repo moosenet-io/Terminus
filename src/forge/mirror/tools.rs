@@ -83,6 +83,8 @@ use super::history::{
     gate_commits, gate_full_history, last_mirrored_sha, last_pushed_sha, replay_incremental_or_full,
     set_pushed_sha, IdentityMap, ReplayOpts,
 };
+use super::pr_replay::{replay_pr, PrReplayConfig};
+use crate::forge::registry::{ForgePool, ForgeRegistry};
 use super::workdir::{assert_never_force, run_git, MirrorWorkDir, WORKDIR_ROOT_ENV};
 
 /// Environment variable holding the target GitHub mirror remote URL when a call
@@ -101,12 +103,27 @@ const REMOTE_ENV: &str = "TERMINUS_MIRROR_REMOTE";
 /// never a silent fallback to GitHub's credential.
 fn mirror_provider_token(provider: &str) -> Result<String, ToolError> {
     match provider {
+        // GitHub keeps its dedicated resolver (GITHUB_PAT_<NAME> / legacy GITHUB_TOKEN).
         "github" => github_token(),
-        other => Err(ToolError::NotConfigured(format!(
-            "mirror engine has no transport credential resolver configured for provider \
-             '{other}' yet (only 'github' is wired) — the engine is provider-routable, but \
-             this target has not been configured"
-        ))),
+        // Every other public destination resolves its own `<PROVIDER>_TOKEN` env (e.g.
+        // GITLAB_TOKEN, CODEBERG_TOKEN, GITEA_TOKEN) — provider-agnostic transport, no
+        // silent GitHub fallback. Absent env → a clean, honest NotConfigured.
+        other => {
+            let key = format!(
+                "{}_TOKEN",
+                other.to_uppercase().replace(|c: char| !c.is_ascii_alphanumeric(), "_")
+            );
+            std::env::var(&key)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    ToolError::NotConfigured(format!(
+                        "no transport credential for public provider '{other}': set {key} (the \
+                         engine is provider-routable; this target's token is not configured)"
+                    ))
+                })
+        }
     }
 }
 
@@ -1758,6 +1775,122 @@ impl RustTool for GitPublicHistorySync {
     }
 }
 
+/// `git_public_mirror_replay_pr` — the PR-process replay tool (GHIST-05). Reproduces
+/// one internal (private-forge) merged PR as a scrubbed, attributed PR on the PUBLIC
+/// forge (branch → open → mirror comments → merge), provider-agnostically. This is the
+/// going-forward publish path for repos that opt into showing the PR/review process
+/// (mutually exclusive with git_public_history_sync's direct ff-push for a repo).
+struct GitPublicMirrorReplayPr;
+
+#[async_trait]
+impl RustTool for GitPublicMirrorReplayPr {
+    fn name(&self) -> &str {
+        "git_public_mirror_replay_pr"
+    }
+    fn description(&self) -> &str {
+        "Reproduce one internal MERGED pull request as a scrubbed, attributed pull request on the \
+         PUBLIC forge (GHIST-05), so the public mirror shows the review PROCESS. Provider-agnostic: \
+         the internal PR + its discussion thread are read through the private forge pool and the \
+         public PR is opened/commented/merged through the public forge pool (never a forge-specific \
+         client). The PR's commit range is replayed as a PII-scrubbed feature branch rebased onto \
+         the current public-main tip, pushed, opened as a PR, each conversation comment mirrored \
+         (scrubbed), then merged — the merge lands the commits on public main. Comment scope is the \
+         PR CONVERSATION thread (not inline per-file review-diff comments). PII-scrubs title/body/ \
+         comments before any public write; only MERGED PRs are replayed; idempotent (a mirror-pr/<n> \
+         tag skips a completed PR; a leftover remote branch from a partial prior run is refused, never \
+         double-created). Fail-closed without TERMINUS_MIRROR_AUTHOR_MAP. Requires 'repo' and 'pr' (the \
+         internal PR number); 'source' defaults to TERMINUS_MIRROR_SOURCE_ROOT/<repo>; the remote \
+         comes from 'github_remote' or TERMINUS_MIRROR_REMOTE[_<REPO>]; 'merge_method' defaults to \
+         'squash'. NOTE: the internal PR must have been merged with a MERGE COMMIT (the fleet \
+         default) — a fast-forward/squash-merged internal PR (single-parent merge) is refused, \
+         because merge order (and therefore correct attribution) cannot be proven from git alone; \
+         such repos publish going-forward via git_public_history_sync instead."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "repo":           { "type": "string", "description": "Logical repo name" },
+                "pr":             { "type": "integer", "description": "Internal PR number to replay" },
+                "source":         { "type": "string", "description": "internal-main checkout (optional when TERMINUS_MIRROR_SOURCE_ROOT is set)" },
+                "github_remote":  { "type": "string", "description": "Public mirror remote URL (else TERMINUS_MIRROR_REMOTE[_<REPO>])" },
+                "merge_method":   { "type": "string", "description": "Public merge method: squash (default) | merge | rebase" },
+                "public_owner":   { "type": "string", "description": "Public forge owner override (else the public pool's configured owner)" },
+                "private_owner":  { "type": "string", "description": "Private forge owner override (else the private pool's configured owner)" },
+                "public_repo":    { "type": "string", "description": "Public repo name override (default = repo)" },
+                "private_repo":   { "type": "string", "description": "Private repo name override (default = repo)" },
+                "public_provider":  { "type": "string", "description": "Public pool provider id (default: pool default, e.g. github)" },
+                "private_provider": { "type": "string", "description": "Private pool provider id (default: pool default, e.g. gitea)" }
+            },
+            "required": ["repo", "pr"]
+        })
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let repo = req_str(&args, "repo")?;
+        validate_repo(repo)?;
+        let internal_pr = args
+            .get("pr")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| ToolError::InvalidArgument("'pr' (internal PR number) is required".into()))?;
+        let source = resolve_source(&args, repo)?;
+        ensure_source_is_main(&source)?;
+        let work_dir = history_workdir(repo)?;
+
+        // Fail-closed: a public PR replay must remap author identities.
+        let author_map = IdentityMap::from_env()?.ok_or_else(|| {
+            ToolError::NotConfigured(
+                "TERMINUS_MIRROR_AUTHOR_MAP is not set — a public PR replay must remap author \
+                 identities (attribution + internal-email scrub). Configure it (see .env.example) \
+                 before running."
+                    .into(),
+            )
+        })?;
+
+        // A replay extends an established baseline; refuse if none exists (same posture
+        // as git_public_history_sync — a first baseline is backfill + operator bless).
+        if last_mirrored_sha(&work_dir).is_none() || !work_dir.join(".git").is_dir() {
+            return Err(ToolError::Conflict(format!(
+                "no established history lineage for '{repo}' — run git_public_history_backfill and \
+                 have the operator bless + force re-baseline the public mirror first (GHIST-07) \
+                 before replaying PRs onto it."
+            )));
+        }
+
+        let remote = resolve_remote(&args, repo)?;
+        let opt_str = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_string);
+        let public_provider = opt_str("public_provider");
+        // Resolve the PUBLIC pool's ACTUAL provider (explicit arg, else the pool's
+        // configured default — which may be gitlab/codeberg, NOT necessarily github),
+        // then resolve its git-transport credential through the provider-agnostic
+        // mirror-token seam. No hardcoded GitHub default in the provider-agnostic path.
+        let reg = ForgeRegistry::from_env();
+        let public_provider_id = reg
+            .resolve(ForgePool::Public, public_provider.as_deref())?
+            .id()
+            .to_string();
+        let transport_token = mirror_provider_token(&public_provider_id)?;
+        let cfg = PrReplayConfig {
+            repo: repo.to_string(),
+            source,
+            work_dir,
+            remote,
+            public_owner: opt_str("public_owner"),
+            private_owner: opt_str("private_owner"),
+            public_repo: opt_str("public_repo"),
+            private_repo: opt_str("private_repo"),
+            private_provider: opt_str("private_provider"),
+            public_provider,
+            author_map,
+            merge_method: opt_str("merge_method").unwrap_or_else(|| "squash".to_string()),
+            transport_token,
+        };
+
+        let outcome = replay_pr(&reg, &cfg, internal_pr).await?;
+        serde_json::to_string(&outcome)
+            .map_err(|e| ToolError::Execution(format!("serialize outcome: {e}")))
+    }
+}
+
 /// Register all four GHMR-04 mirror subtools plus the GHIST history tools. Called
 /// from [`crate::github::register`], so they attach to whichever registry github is
 /// registered against (the CORE registry via `register_all`, the personal
@@ -1773,6 +1906,7 @@ pub fn register(registry: &mut ToolRegistry) {
     registry.register_or_replace(Box::new(GitPublicHistoryStatus));
     registry.register_or_replace(Box::new(GitPublicHistoryBackfill));
     registry.register_or_replace(Box::new(GitPublicHistorySync));
+    registry.register_or_replace(Box::new(GitPublicMirrorReplayPr));
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -2356,6 +2490,7 @@ mod tests {
         assert!(reg.contains("git_public_history_status"));
         assert!(reg.contains("git_public_history_backfill"));
         assert!(reg.contains("git_public_history_sync"));
+        assert!(reg.contains("git_public_mirror_replay_pr"));
     }
 
     #[test]

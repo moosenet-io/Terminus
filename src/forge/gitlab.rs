@@ -948,7 +948,8 @@ fn gitlab_capabilities() -> CapabilityMap {
         // Commits
         CommitsList, CommitsGet, CommitsCompareDiff, CommitsStatus,
         // Merge requests (PR)
-        PullRequestsList, PullRequestsGet, PullRequestsCreate, PullRequestsUpdate,
+        PullRequestsList, PullRequestsGet, PullRequestsListComments, PullRequestsCreate,
+        PullRequestsUpdate,
         PullRequestsReview, PullRequestsComment, PullRequestsMerge, PullRequestsClose,
         // Issues
         IssuesList, IssuesGet, IssuesCreate, IssuesUpdate, IssuesComment, IssuesLabel,
@@ -1191,6 +1192,13 @@ impl ForgeProvider for GitLabAdapter {
                 let url = format!("{api}/projects/{pid}/merge_requests/{iid}");
                 ok(self.call(&token, Method::GET, &url, None).await?)
             }
+            PullRequestsListComments => {
+                // GitLab exposes an MR's discussion thread as merge-request notes.
+                let pid = self.project_ref(p)?;
+                let iid = Self::req_num(p, "number")?;
+                let url = format!("{api}/projects/{pid}/merge_requests/{iid}/notes?per_page=100");
+                ok(self.call_paginated(&token, &url).await?)
+            }
             PullRequestsCreate => {
                 let pid = self.project_ref(p)?;
                 let body = json!({
@@ -1267,7 +1275,19 @@ impl ForgeProvider for GitLabAdapter {
                 if let Some(m) = merge_msg {
                     body["merge_commit_message"] = json!(m);
                 }
-                if let Some(sq) = p.get("squash").and_then(Value::as_bool) {
+                // Honor an explicit `squash` bool, OR the shared `merge_method`
+                // vocabulary: "squash" → squash=true; "merge"/"rebase" → squash=false.
+                // Without this the GitHub/Gitea-honored `merge_method: "squash"` would
+                // be silently ignored on GitLab (it would keep individual commits).
+                let squash = p
+                    .get("squash")
+                    .and_then(Value::as_bool)
+                    .or_else(|| match p.get("merge_method").and_then(Value::as_str) {
+                        Some("squash") => Some(true),
+                        Some("merge") | Some("rebase") => Some(false),
+                        _ => None,
+                    });
+                if let Some(sq) = squash {
                     body["squash"] = json!(sq);
                 }
                 let url = format!("{api}/projects/{pid}/merge_requests/{iid}/merge");
@@ -1736,6 +1756,7 @@ mod tests {
             // Gaps GitHub has that GitLab does NOT: mirror config + packages publish
             // are genuinely supported here.
             ForgeEndpoint::ReposMirrorConfig, ForgeEndpoint::PackagesPublish,
+            ForgeEndpoint::PullRequestsListComments, // GHIST-05 MR-notes read
         ] {
             assert_eq!(a.support_level(ep), SupportLevel::Supported, "{ep:?} should be supported");
         }

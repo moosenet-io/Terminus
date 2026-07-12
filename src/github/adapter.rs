@@ -618,7 +618,8 @@ fn github_capabilities() -> CapabilityMap {
         // Commits
         CommitsList, CommitsGet, CommitsCompareDiff, CommitsStatus,
         // Pull requests
-        PullRequestsList, PullRequestsGet, PullRequestsCreate, PullRequestsUpdate,
+        PullRequestsList, PullRequestsGet, PullRequestsListComments, PullRequestsCreate,
+        PullRequestsUpdate,
         PullRequestsReview, PullRequestsComment, PullRequestsMerge, PullRequestsClose,
         // Issues
         IssuesList, IssuesGet, IssuesCreate, IssuesUpdate, IssuesComment, IssuesLabel,
@@ -849,6 +850,13 @@ impl ForgeProvider for GitHubAdapter {
                 let n = Self::req_num(p, "number")?;
                 let url = format!("{api}/repos/{owner}/{repo}/pulls/{n}");
                 ok(self.call(&token, Method::GET, &url, None).await?)
+            }
+            PullRequestsListComments => {
+                // A PR's conversation comments are issue comments in GitHub's model.
+                let (owner, repo) = self.owner_repo(p)?;
+                let n = Self::req_num(p, "number")?;
+                let url = format!("{api}/repos/{owner}/{repo}/issues/{n}/comments");
+                ok(self.call_paginated(&token, &url).await?)
             }
             PullRequestsCreate => {
                 let (owner, repo) = self.owner_repo(p)?;
@@ -1276,6 +1284,7 @@ mod tests {
             ForgeEndpoint::ReposList, ForgeEndpoint::ReposCreate, ForgeEndpoint::PullRequestsCreate,
             ForgeEndpoint::IssuesCreate, ForgeEndpoint::ReleasesCreate, ForgeEndpoint::WebhooksCreate,
             ForgeEndpoint::ContentWriteFile, ForgeEndpoint::OrgMembers, ForgeEndpoint::RefsDelete,
+            ForgeEndpoint::PullRequestsListComments, // GHIST-05 PR-comment read
         ] {
             assert_eq!(a.support_level(ep), SupportLevel::Supported, "{ep:?} should be supported");
         }

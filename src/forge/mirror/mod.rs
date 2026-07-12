@@ -37,6 +37,7 @@
 pub mod clean;
 pub mod history;
 pub mod native_clean;
+pub mod pr_replay;
 pub mod sweep;
 pub mod tools;
 pub mod workdir;
