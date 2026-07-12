@@ -209,31 +209,24 @@ async fn maybe_scribe_docs(aggregate_verdict: &str, complete: bool, context: &Va
 
 // ── KGFIND-03: capture-only findings recording ─────────────────────────────
 
-/// Normalize a finding description for cross-provider dedup: collapse
-/// whitespace, lowercase, and cap to a short prefix so two reviewers'
-/// near-identical phrasing of the same issue still collide on the same key.
-/// Pure, no I/O.
-fn normalize_desc_prefix(s: &str) -> String {
-    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-    let trimmed = collapsed.trim_end_matches(['.', '!', '?']);
-    trimmed.chars().take(80).collect()
-}
-
 /// KGFIND-03: collapse findings that are the same issue reported by more than
-/// one provider -- same `(category, file, symbol)` plus a near-identical
-/// description prefix -- into one, keeping the first occurrence (in provider
-/// order). Pure, fully unit-testable without a store or a graph.
+/// one provider -- same `(category, file, symbol)`, regardless of description
+/// wording -- into one, keeping the first occurrence (in provider order). Pure,
+/// fully unit-testable without a store or a graph.
 fn dedup_across_providers(results: &[ProviderResult]) -> Vec<Finding> {
-    let mut seen: HashSet<(String, Option<String>, Option<String>, String)> = HashSet::new();
+    // Collapse a SINGLE review's cross-provider duplicates by (category, file,
+    // symbol) — NOT including the description text: two reviewers describing the
+    // same issue at the same location in different words must count as ONE
+    // occurrence, not two. The description wording is intentionally out of the
+    // key. The finer "is this really the same issue" judgement across reviews is
+    // the store's semantic (embedding) dedup within the (project, scope,
+    // category) bucket; this hook-level collapse only prevents one review's
+    // agreeing reviewers from double-counting recurrence.
+    let mut seen: HashSet<(String, Option<String>, Option<String>)> = HashSet::new();
     let mut out = Vec::new();
     for r in results {
         for f in &r.findings {
-            let key = (
-                f.category.clone(),
-                f.file.clone(),
-                f.symbol.clone(),
-                normalize_desc_prefix(&f.description),
-            );
+            let key = (f.category.clone(), f.file.clone(), f.symbol.clone());
             if seen.insert(key) {
                 out.push(f.clone());
             }
@@ -954,6 +947,26 @@ mod tests {
         let deduped = dedup_across_providers(&results);
         assert_eq!(deduped.len(), 1, "{deduped:?}");
         assert_eq!(deduped[0].description, "off-by-one error in loop bound");
+    }
+
+    #[test]
+    fn dedup_across_providers_collapses_same_location_despite_different_wording() {
+        // Two reviewers describe the SAME issue at the same (category, file,
+        // symbol) in COMPLETELY different words — they must still collapse to one
+        // occurrence (the description is intentionally out of the dedup key).
+        let results = vec![
+            provider_with(
+                "opus",
+                vec![finding("bug", Some("src/a.rs"), Some("crate::a::foo"), "loop can index one past the slice end")],
+            ),
+            provider_with(
+                "codex",
+                vec![finding("bug", Some("src/a.rs"), Some("crate::a::foo"), "the counter exceeds the array length")],
+            ),
+        ];
+        let deduped = dedup_across_providers(&results);
+        assert_eq!(deduped.len(), 1, "differently-worded same-location findings must collapse: {deduped:?}");
+        assert_eq!(deduped[0].description, "loop can index one past the slice end");
     }
 
     #[test]
