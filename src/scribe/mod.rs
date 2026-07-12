@@ -848,6 +848,8 @@ pub fn register(registry: &mut ToolRegistry) {
     // Atlas kg_* query tools (KGRAPH-06) + build/status orchestration (KGRAPH-10).
     graph::tools::register(registry);
     graph::build::register(registry);
+    // KGRULE-02: kg_rule_crystallize (candidate rule minting from recurring findings).
+    graph::rules::register(registry);
 }
 
 #[cfg(test)]

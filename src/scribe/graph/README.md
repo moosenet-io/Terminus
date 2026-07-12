@@ -194,3 +194,68 @@ reads `crate::config::atlas_database_url()` (`ATLAS_DATABASE_URL`) and returns
 | Env var | Purpose | Default |
 |---|---|---|
 | `ATLAS_DATABASE_URL` | Postgres DSN for the Atlas database (shared with the findings/vec stores) | none (`NotConfigured` if unset) |
+
+## Rule crystallization (`rules.rs`, KGRULE-02)
+
+`kg_rule_crystallize(project_id, min_occurrences?)` scans `kg_findings` for
+recurring `(scope_kind, scope_ref, category)` buckets and mints CANDIDATE
+rules on `kg_rules` — **always** `status=candidate`, `enforcement=advisory`.
+Crystallization never mints an `active` or `blocking` rule; that only
+happens through KGRULE-03's adversarial `review_run` promotion.
+
+### Flow
+
+1. `FindingsStore::list(project_id, None, None, Some(threshold))` — findings
+   at or above the occurrence threshold.
+2. `RulesStore::list_active(project_id, None, None, None)` — the buckets
+   already covered by an active rule, so an already-governed bucket isn't
+   redundantly re-crystallized.
+3. The pure decision function `crystallize_candidates(findings, existing,
+   min_occurrences)` picks which findings become new candidate seeds: a
+   finding qualifies iff `occurrences >= min_occurrences` and its bucket
+   isn't in `existing`. No DB/Cortex I/O — fully unit-testable.
+4. For each seed, `guidance` is derived by the pure `derive_guidance(category,
+   description)` (deterministic, non-empty, always mentions the category —
+   e.g. `"Address recurring lint: unused import."`), and `provenance` records
+   the source finding id(s) + occurrence count.
+5. Cortex risk is attached best-effort via
+   [`cortex_risk_for_scope`](#cortex-bridge-cortex_bridgers-kgrule-05)
+   (never fails crystallization — `None` on any Cortex failure or when
+   unconfigured).
+6. `RulesStore::create_candidate` is called for every seed. This is the
+   **authoritative** idempotency guarantee (KGRULE-01): even if the pure
+   pre-filter above were ever wrong, `create_candidate` still dedups per
+   bucket at the DB layer and never inserts a duplicate row.
+
+### Threshold
+
+Default `min_occurrences` is `3`, overridable via the
+`KGRULE_CRYSTALLIZE_MIN_OCCURRENCES` environment variable (parsed as `i32`;
+falls back to the default if unset or unparsable), or per-call via the tool's
+`min_occurrences` argument (argument wins over the env var).
+
+### Degrade contract
+
+`kg_rule_crystallize` returns `{"configured": false, "project_id": ...}`
+(never an error) when either `RulesStore` or `FindingsStore` is
+unconfigured (`ATLAS_DATABASE_URL` unset). A best-effort Cortex lookup
+failure never affects `configured` — it only means that seed's
+`cortex_risk` is `null`.
+
+### Return shape
+
+```json
+{
+  "configured": true,
+  "project_id": "TERM",
+  "created": 2,
+  "skipped": 1,
+  "candidates": [
+    {"id": "...", "scope_kind": "path", "scope_ref": "src/lib.rs", "category": "lint", "cortex_risk": 0.4}
+  ]
+}
+```
+
+| Env var | Purpose | Default |
+|---|---|---|
+| `KGRULE_CRYSTALLIZE_MIN_OCCURRENCES` | Minimum finding recurrence to crystallize into a candidate rule | `3` |
