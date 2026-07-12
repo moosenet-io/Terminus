@@ -16,12 +16,15 @@
 //! - `tool` (DISC-02): the read-only `model_discovery_brochure` MCP core
 //!   tool — a pure filter/render layer over `storage::read_brochure`'s
 //!   output, registered on the core registry via [`register`] below.
-//! - Later: `upsert` (DISC-03), etc.
+//! - `upsert` (DISC-03): the one write API (`upsert_candidate`/
+//!   `transition_status`/`record_eviction`) every other item uses to mutate
+//!   brochure rows.
 
 pub mod hf_client;
 pub mod schema;
 pub mod storage;
 pub mod tool;
+pub mod upsert;
 
 pub use schema::{CandidateStatus, DiscoveryCandidate, FleetCategory};
 
