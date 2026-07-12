@@ -97,6 +97,17 @@ pub const PROJECT_IDS: &[&str] = &["TERM", "LUM", "HARM", "CHRD", "RAIL"];
 
 const MAX_TEXT_LEN: usize = 2000;
 
+/// Max length (chars) of `cortex_scope`'s `diff` argument. A unified diff can
+/// legitimately be large, but is bounded so a pathological input can't force
+/// an unbounded parse. Rejected with `InvalidArgument` when exceeded.
+const MAX_DIFF_LEN: usize = 1_000_000;
+
+/// Max element count of a `cortex_scope` `changed_files` JSON array argument.
+/// The parse itself dedups and caps to `MAX_CHANGED_FILES` (setting
+/// `truncated:true`), but an absurdly large array is rejected outright before
+/// parsing. Each element is additionally length-bounded by [`MAX_TEXT_LEN`].
+const MAX_CHANGED_FILES_ARG: usize = 5000;
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -267,8 +278,33 @@ impl RustTool for CortexScope {
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
         let project_id = require_str(&args, "project_id")?;
         validate_project_id(project_id)?;
-        if let Some(cf) = args.get("changed_files").and_then(|v| v.as_str()) {
-            validate_text_len(cf, "changed_files")?;
+
+        // Bound every input surface BEFORE parsing (reject oversize with
+        // InvalidArgument). `changed_files` may be a CSV string OR a JSON
+        // array of strings; `diff` is a (potentially large but bounded)
+        // unified diff.
+        match args.get("changed_files") {
+            Some(Value::String(s)) => validate_text_len(s, "changed_files")?,
+            Some(Value::Array(arr)) => {
+                if arr.len() > MAX_CHANGED_FILES_ARG {
+                    return Err(ToolError::InvalidArgument(format!(
+                        "'changed_files' array exceeds {MAX_CHANGED_FILES_ARG} element limit"
+                    )));
+                }
+                for (i, el) in arr.iter().enumerate() {
+                    if let Some(s) = el.as_str() {
+                        validate_text_len(s, &format!("changed_files[{i}]"))?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let Some(diff) = args.get("diff").and_then(|v| v.as_str()) {
+            if diff.chars().count() > MAX_DIFF_LEN {
+                return Err(ToolError::InvalidArgument(format!(
+                    "'diff' exceeds {MAX_DIFF_LEN} character limit"
+                )));
+            }
         }
 
         let (changed_files, input_truncated) = scope::changed_files_from_args(&args);
@@ -559,6 +595,39 @@ mod tests {
             .expect("diff-only input must be accepted");
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["changed_files"], json!(["src/a.rs"]));
+    }
+
+    #[tokio::test]
+    async fn test_scope_rejects_oversized_changed_files_array_size() {
+        let tool = CortexScope { config: test_config() };
+        let big: Vec<String> = (0..MAX_CHANGED_FILES_ARG + 1).map(|i| format!("f{i}.rs")).collect();
+        let err = tool
+            .execute(json!({"project_id": "TERM", "changed_files": big}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn test_scope_rejects_oversized_changed_files_array_element() {
+        let tool = CortexScope { config: test_config() };
+        let huge = "x".repeat(MAX_TEXT_LEN + 1);
+        let err = tool
+            .execute(json!({"project_id": "TERM", "changed_files": ["ok.rs", huge]}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn test_scope_rejects_oversized_diff() {
+        let tool = CortexScope { config: test_config() };
+        let huge = "x".repeat(MAX_DIFF_LEN + 1);
+        let err = tool
+            .execute(json!({"project_id": "TERM", "diff": huge}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
     #[tokio::test]

@@ -5,18 +5,28 @@
 //! small fixture graph without going through the `RustTool` trait.
 //!
 //! ## Reuse (S9 single-source)
-//! - Changed-file parsing reuses `crate::review::kg_context::derive_changed_files`
-//!   — the SAME parser `review_run`'s KGREV-01 grounding uses — so
-//!   `cortex_scope` and `review_run` agree on which files a `diff` touches.
-//!   [`changed_files_from_args`] only adapts `cortex_scope`'s own argument
-//!   shapes (a comma-separated `changed_files` string, for backward
-//!   compatibility with the CXEG-01 stub's schema, or an array, or a `diff`)
-//!   into the `{"changed_files"|"diff": ...}` shape `derive_changed_files`
-//!   already understands; it does not re-implement any parsing itself.
-//! - Graph loading and the touched-node / 1-hop-neighbor walk reuse the same
-//!   `scribe::graph::store::GraphStore` + `KnowledgeGraph` API
-//!   `crate::review::kg_context::build_kg_block` and `scribe::graph::tools`'s
-//!   `kg_neighbors`/`kg_subgraph` use — no second graph-query backend.
+//! - Changed-file parsing reuses
+//!   `crate::review::kg_context::derive_changed_files_counted` — the SAME
+//!   parser `review_run`'s KGREV-01 grounding uses (via its thin
+//!   `derive_changed_files` wrapper) — so `cortex_scope` and `review_run`
+//!   agree on which files a `diff` touches. [`changed_files_from_args`] only
+//!   adapts `cortex_scope`'s own argument shapes (a comma-separated
+//!   `changed_files` string, for backward compatibility with the CXEG-01
+//!   stub's schema, or an array, or a `diff`) into the
+//!   `{"changed_files"|"diff": ...}` shape it already understands, and passes
+//!   through its `input_truncated` signal; it does not re-implement any
+//!   parsing itself.
+//! - The 1-hop caller/callee walk reuses
+//!   `crate::scribe::graph::query::one_hop_neighbors` — the SAME single-source
+//!   helper `kg_neighbors` (`scribe::graph::tools`) calls — so a node's
+//!   incident edges are iterated in exactly one place. Graph loading + touched
+//!   -node resolution use the same `scribe::graph::store::GraphStore` +
+//!   `KnowledgeGraph` API `crate::review::kg_context::build_kg_block` uses.
+//! - Node resolution (touched nodes via `current_nodes()`, neighbors via an
+//!   explicit `valid_to.is_none()` filter) uses the CURRENT bi-temporal view
+//!   only (KGRAPH-15 is invalidate-don't-delete), so a since-removed symbol
+//!   never appears in a live blast radius — matching the other live-view
+//!   `kg_*` tools.
 //!
 //! ## Degrade contract
 //! A missing/unloadable graph (store not configured, or no graph saved yet
@@ -34,6 +44,7 @@ use serde_json::{json, Value};
 
 use crate::review::kg_context::derive_changed_files_counted;
 use crate::scribe::graph::model::{KgNode, KnowledgeGraph};
+use crate::scribe::graph::query::{one_hop_neighbors, EdgeDirection, NeighborFilter};
 use crate::scribe::graph::store::GraphStore;
 use crate::scribe::graph::vec_embed::node_card;
 use crate::scribe::ScribeConfig;
@@ -104,6 +115,16 @@ pub fn changed_files_from_args(args: &Value) -> (Vec<String>, bool) {
 /// `"configured": false` response (see module doc) rather than propagating
 /// an error.
 pub fn compute_scope(project_id: &str, changed_files: &[String], max_blast_nodes: usize, input_truncated: bool) -> Value {
+    // Input-file cap warn lives HERE (not in `build_scope_response`) so it
+    // fires on EVERY path that drops input — the live-graph path AND the
+    // `configured:false` degrade/unavailable path — never a silent drop.
+    if input_truncated {
+        tracing::warn!(
+            "cortex_scope: project '{project_id}' input file list exceeded MAX_CHANGED_FILES; \
+             some changed files were dropped before scoping (using {} file(s))",
+            changed_files.len(),
+        );
+    }
     let store = GraphStore::from_config(&ScribeConfig::from_env());
     match store.load(project_id) {
         Ok(Some(graph)) => build_scope_response(project_id, changed_files, &graph, max_blast_nodes, input_truncated),
@@ -188,17 +209,19 @@ fn build_scope_response(project_id: &str, changed_files: &[String], graph: &Know
         }
     }
 
-    // 3. 1-hop callers/callees of every touched (resolved) node, deterministic
-    // (sorted, deduped) order.
+    // 3. 1-hop callers/callees of every touched (resolved) node, via the shared
+    // `scribe::graph::query::one_hop_neighbors` walk (single-source — the SAME
+    // helper `kg_neighbors` uses, no second edge iteration). Collected across
+    // all touched nodes, then deduped in a deterministic (sorted) order. The
+    // `bool` is `is_outgoing` (outgoing → callee, incoming → caller), matching
+    // the sort/dedup order the previous hand-rolled walk produced: a node
+    // reachable as BOTH sorts `false` (caller) before `true` (callee), so it is
+    // labeled `caller`.
     if !node_truncated {
         let mut neighbor_ids: Vec<(String, bool)> = Vec::new();
         for n in &touched {
-            for e in graph.edges() {
-                if e.from == n.id {
-                    neighbor_ids.push((e.to.clone(), true));
-                } else if e.to == n.id {
-                    neighbor_ids.push((e.from.clone(), false));
-                }
+            for nb in one_hop_neighbors(graph, &n.id, NeighborFilter::Both) {
+                neighbor_ids.push((nb.id, nb.direction == EdgeDirection::Outgoing));
             }
         }
         neighbor_ids.sort();
@@ -208,21 +231,26 @@ fn build_scope_response(project_id: &str, changed_files: &[String], graph: &Know
             if affected.contains(&nid) {
                 continue;
             }
+            // Resolve to a CURRENT node only (KGRAPH-15 is invalidate-don't-
+            // delete: `get_node` also returns bi-temporally invalidated nodes).
+            // A neighbor that points at a since-removed symbol must NOT appear
+            // in a live blast radius, and must not consume the node budget.
+            let Some(node) = graph.get_node(&nid).filter(|n| n.valid_to.is_none()) else {
+                continue;
+            };
             if affected.len() >= max_blast_nodes {
                 node_truncated = true;
                 break 'neighbors;
             }
-            if let Some(node) = graph.get_node(&nid) {
-                affected.insert(nid.clone());
-                if let Some(c) = node.cluster {
-                    communities.insert(c);
-                }
-                blast_radius.push(json!({
-                    "id": node.id, "path": node.path, "kind": node.kind.as_str(),
-                    "resolved": true,
-                    "role": if outgoing { "callee" } else { "caller" },
-                }));
+            affected.insert(nid.clone());
+            if let Some(c) = node.cluster {
+                communities.insert(c);
             }
+            blast_radius.push(json!({
+                "id": node.id, "path": node.path, "kind": node.kind.as_str(),
+                "resolved": true,
+                "role": if outgoing { "callee" } else { "caller" },
+            }));
         }
     }
 
@@ -235,13 +263,8 @@ fn build_scope_response(project_id: &str, changed_files: &[String], graph: &Know
             affected.len(),
         );
     }
-    if input_truncated {
-        tracing::warn!(
-            "cortex_scope: project '{project_id}' input file list exceeded MAX_CHANGED_FILES; \
-             some changed files were dropped before scoping (using {} file(s))",
-            changed_files.len(),
-        );
-    }
+    // NOTE: the input-file-cap warn is emitted in `compute_scope` (fires on the
+    // degrade path too); it is intentionally NOT duplicated here.
 
     let mut affected_communities: Vec<u32> = communities.into_iter().collect();
     affected_communities.sort_unstable();
@@ -522,6 +545,46 @@ mod tests {
         assert_eq!(radius.len(), 1);
         assert_eq!(radius[0]["resolved"], false);
         assert_eq!(out["token_reduction_pct"], 0.0, "nothing resolved -> no reduction");
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn compute_scope_excludes_bitemporally_invalidated_neighbors() {
+        // KGRAPH-15 is invalidate-don't-delete: a neighbor pointing at a
+        // since-removed symbol (valid_to set) must NOT appear in a live blast
+        // radius.
+        let store_dir = tmp_store("invalidated");
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+        let store = GraphStore::from_config(&ScribeConfig::from_env());
+
+        let mut g = KnowledgeGraph::new("TERM");
+        let mut foo = KgNode::new("crate::a::foo", NodeKind::Function, "foo", "src/a.rs");
+        foo.cluster = Some(1);
+        let mut bar = KgNode::new("crate::b::Bar", NodeKind::Struct, "Bar", "src/b.rs");
+        bar.cluster = Some(2);
+        g.insert_node(foo);
+        g.insert_node(bar);
+        // Bar references foo, so Bar is a 1-hop CALLER of foo...
+        g.insert_edge(KgEdge::new("crate::b::Bar", "crate::a::foo", EdgeKind::References, Confidence::Extracted))
+            .unwrap();
+        // ...but Bar has since been removed (its file invalidated).
+        let seq = g.next_build_seq();
+        assert_eq!(g.invalidate_path("src/b.rs", seq), 1);
+        g.recompute_degrees();
+        store.save("TERM", &g).unwrap();
+
+        let out = compute_scope("TERM", &["src/a.rs".to_string()], DEFAULT_MAX_BLAST_NODES, false);
+        let ids: Vec<&str> = out["blast_radius"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"crate::a::foo"), "touched node present: {ids:?}");
+        assert!(!ids.contains(&"crate::b::Bar"), "invalidated caller must be excluded: {ids:?}");
 
         let _ = std::fs::remove_dir_all(&store_dir);
         std::env::remove_var("SCRIBE_KG_STORE_DIR");

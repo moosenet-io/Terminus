@@ -18,6 +18,82 @@ use serde::Serialize;
 use super::community::{hierarchical_communities, Community};
 use super::model::KnowledgeGraph;
 
+// ── shared 1-hop neighbor walk (single-source) ───────────────────────────────
+
+/// Direction of a 1-hop edge relative to the anchor node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeDirection {
+    /// The anchor is the edge's `from` — an outgoing edge (anchor → neighbor);
+    /// for a `Calls` edge the neighbor is a CALLEE of the anchor.
+    Outgoing,
+    /// The anchor is the edge's `to` — an incoming edge (neighbor → anchor);
+    /// for a `Calls` edge the neighbor is a CALLER of the anchor.
+    Incoming,
+}
+
+/// Direction filter for [`one_hop_neighbors`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeighborFilter {
+    Out,
+    In,
+    Both,
+}
+
+/// A single 1-hop neighbor of an anchor node: the neighbor's id, the edge's
+/// relation kind and confidence tier, and which direction the edge runs
+/// relative to the anchor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Neighbor {
+    pub id: String,
+    pub kind: &'static str,
+    pub confidence: &'static str,
+    pub direction: EdgeDirection,
+}
+
+/// The single-source 1-hop neighbor walk shared by `kg_neighbors`
+/// (`scribe::graph::tools`) and `cortex_scope` (`crate::cortex::scope`) — the
+/// one place that iterates a node's incident edges, so the two tools can never
+/// drift.
+///
+/// Iterates the graph's edges ONCE, in the graph's own (insertion) edge order,
+/// and yields one [`Neighbor`] per matching edge endpoint: an outgoing entry
+/// (`id = edge.to`) when the anchor is the edge's `from`, and an incoming entry
+/// (`id = edge.from`) when the anchor is the edge's `to`. A self-loop (an edge
+/// from the anchor to itself) therefore yields BOTH an outgoing and an incoming
+/// entry — exactly as the original hand-rolled `kg_neighbors` walk did, so its
+/// output stays byte-identical after the refactor.
+///
+/// `filter` restricts to outgoing-only / incoming-only / both. This function
+/// does NOT filter bi-temporally invalidated nodes (an edge to a since-removed
+/// symbol still appears): `kg_neighbors` intentionally surfaces the raw edge
+/// set, so a caller that wants a current-only view (e.g. `cortex_scope`)
+/// filters resolved neighbors by `valid_to.is_none()` itself.
+pub fn one_hop_neighbors(g: &KnowledgeGraph, node_id: &str, filter: NeighborFilter) -> Vec<Neighbor> {
+    let want_out = matches!(filter, NeighborFilter::Out | NeighborFilter::Both);
+    let want_in = matches!(filter, NeighborFilter::In | NeighborFilter::Both);
+    let mut neighbors = Vec::new();
+    for e in g.edges() {
+        if want_out && e.from == node_id {
+            neighbors.push(Neighbor {
+                id: e.to.clone(),
+                kind: e.kind.as_str(),
+                confidence: e.confidence.as_str(),
+                direction: EdgeDirection::Outgoing,
+            });
+        }
+        if want_in && e.to == node_id {
+            neighbors.push(Neighbor {
+                id: e.from.clone(),
+                kind: e.kind.as_str(),
+                confidence: e.confidence.as_str(),
+                direction: EdgeDirection::Incoming,
+            });
+        }
+    }
+    neighbors
+}
+
 /// Which retrieval level a question routes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -177,5 +253,36 @@ mod tests {
         assert!(p.contains("subsystem/community summaries"));
         assert!(p.contains("QUESTION: what is X"));
         assert!(p.contains("CONTEXT:"));
+    }
+
+    // ── one_hop_neighbors (shared walk) ─────────────────────────────────────
+
+    #[test]
+    fn one_hop_neighbors_splits_incoming_and_outgoing() {
+        // send -> backoff (Calls). For `send`, backoff is a CALLEE (outgoing);
+        // for `backoff`, send is a CALLER (incoming).
+        let g = g();
+        let out = one_hop_neighbors(&g, "crate::http::send", NeighborFilter::Both);
+        assert!(out
+            .iter()
+            .any(|n| n.id == "crate::retry::backoff" && n.direction == EdgeDirection::Outgoing && n.kind == "calls"));
+
+        let inc = one_hop_neighbors(&g, "crate::retry::backoff", NeighborFilter::Both);
+        assert!(inc
+            .iter()
+            .any(|n| n.id == "crate::http::send" && n.direction == EdgeDirection::Incoming && n.kind == "calls"));
+    }
+
+    #[test]
+    fn one_hop_neighbors_filter_restricts_direction() {
+        let g = g();
+        let out_only = one_hop_neighbors(&g, "crate::http::send", NeighborFilter::Out);
+        assert!(out_only.iter().all(|n| n.direction == EdgeDirection::Outgoing));
+        assert!(out_only.iter().any(|n| n.id == "crate::retry::backoff"));
+
+        let in_only = one_hop_neighbors(&g, "crate::http::send", NeighborFilter::In);
+        assert!(in_only.iter().all(|n| n.direction == EdgeDirection::Incoming));
+        // `send` has no incoming edges in this fixture.
+        assert!(in_only.is_empty());
     }
 }

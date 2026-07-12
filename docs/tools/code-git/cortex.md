@@ -63,23 +63,33 @@ The pipeline's pre-dispatch scoping call: "if I touch these files, what else
 might I break, and how much of the project can I safely ignore?"
 
 **Input schema**: `project_id` (enum, required, one of `PROJECT_IDS`), plus
-EITHER `changed_files` (a comma-separated string OR a JSON array of file
-paths — the comma-separated form is kept for backward compatibility with the
-CXEG-01 stub's original schema) OR `diff` (a unified diff; changed files are
-parsed from its `+++ b/<path>` headers). At least one of `changed_files`/
-`diff` must yield a non-empty file list.
+EITHER `changed_files` (a comma-separated string ≤ `MAX_TEXT_LEN` (2000) chars,
+OR a JSON array of ≤ `MAX_CHANGED_FILES_ARG` (5000) file-path strings each ≤
+`MAX_TEXT_LEN` chars — the comma-separated form is kept for backward
+compatibility with the CXEG-01 stub's original schema) OR `diff` (a unified
+diff ≤ `MAX_DIFF_LEN` (1,000,000) chars; changed files are parsed from its
+`+++ b/<path>` headers). At least one of `changed_files`/`diff` must yield a
+non-empty file list. Oversize on any of these bounds is rejected with
+`InvalidArgument` before parsing.
 
 **Reuse**: both the CSV/array/diff parsing and the graph queries are shared
-with `review_run`'s KGREV-01 grounding, not reimplemented:
-- `crate::review::kg_context::derive_changed_files` does the actual `diff`/
-  array parsing (`src/cortex/scope.rs`'s `changed_files_from_args` only
+with `review_run`'s KGREV-01 grounding and the `kg_*` tools, not reimplemented:
+- `crate::review::kg_context::derive_changed_files_counted` does the actual
+  `diff`/array parsing (`src/cortex/scope.rs`'s `changed_files_from_args` only
   adapts `cortex_scope`'s own CSV-string/array argument shapes into the
-  `{"changed_files"|"diff": ...}` value `derive_changed_files` expects).
-- The graph load + touched-node + 1-hop-neighbor walk use the same
+  `{"changed_files"|"diff": ...}` value it expects, and surfaces its
+  `input_truncated` signal). `derive_changed_files` is the thin `Vec`-only
+  wrapper KGREV-01 callers still use, unchanged.
+- The 1-hop caller/callee walk uses `crate::scribe::graph::query::one_hop_neighbors`
+  — the SAME single-source helper `kg_neighbors` (`src/scribe/graph/tools.rs`)
+  now calls, so there is exactly one place a node's incident edges are
+  iterated. Graph load + touched-node resolution use the same
   `scribe::graph::store::GraphStore` / `KnowledgeGraph` API
-  `review::kg_context::build_kg_block` and the `kg_neighbors`/`kg_subgraph`
-  tools (`src/scribe/graph/tools.rs`) use — there is exactly one in-process
-  graph-query backend in this crate.
+  `review::kg_context::build_kg_block` and the other `kg_*` tools use.
+- Node resolution (touched nodes AND neighbors) is filtered to the **current**
+  bi-temporal view (`valid_to.is_none()`, via `current_nodes()` / an explicit
+  filter), matching the other live-view tools — a since-removed (invalidated)
+  symbol never appears in a live blast radius.
 
 **Behavior**:
 1. Validates `project_id` (`InvalidArgument` if not one of `PROJECT_IDS`).
@@ -128,7 +138,7 @@ with `review_run`'s KGREV-01 grounding, not reimplemented:
 }
 ```
 
-**Response shape** (no stored graph — degrade):
+**Response shape** (no stored graph — degrade), also showing `truncated`:
 
 ```json
 {
@@ -140,16 +150,37 @@ with `review_run`'s KGREV-01 grounding, not reimplemented:
   ],
   "affected_communities": [],
   "blast_count": 1,
-  "token_reduction_pct": 0.0
+  "token_reduction_pct": 0.0,
+  "truncated": true
 }
 ```
 
-**Error/edge cases**: `InvalidArgument` for an unknown `project_id`, an
-oversized `changed_files` CSV string (`≤2000` chars), or neither
-`changed_files` nor `diff` yielding any file. A missing/unloadable Atlas
-graph is NOT an error (see step 3 above) — that is the one deliberate
-exception to "validate first, then act" in this tool, since blast-radius
-unavailability is a data-availability fact, not a caller mistake.
+**Every response field:**
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `configured` | bool | `true` when a stored Atlas graph was loaded and walked; `false` on the degrade path (no graph stored for the project, or the store failed to load) — see the degrade contract in step 3. Not an error either way. |
+| `project_id` | string | Echo of the validated input `project_id` (one of `PROJECT_IDS`). |
+| `changed_files` | array of strings | Echo of the derived changed-file list actually scoped (post-parse, post-`MAX_CHANGED_FILES` cap). |
+| `blast_radius` | array of objects | The affected nodes (see the per-entry fields below). On the degrade path, one unresolved entry per `changed_files` item. |
+| `blast_radius[].id` | string | The graph node id (fully-qualified symbol) when `resolved:true`; the literal file path when `resolved:false`. |
+| `blast_radius[].path` | string | The node's repo-relative source path (`resolved:true`), or the file path itself (`resolved:false`). |
+| `blast_radius[].kind` | string | The node kind (`function`/`struct`/`enum`/`trait`/`class`/`module`/`doc_section`) when `resolved:true`; the literal `"file"` when `resolved:false`. |
+| `blast_radius[].resolved` | bool | `true` if the entry resolved to a current graph node; `false` for a literal changed file with no matching (current) node — e.g. a brand-new/unindexed file, or the whole degrade path. |
+| `blast_radius[].role` | string | `"touched"` (a changed file / a symbol defined in one), `"callee"` (a 1-hop outgoing neighbor of a touched symbol), or `"caller"` (a 1-hop incoming neighbor). A node reachable as both is labeled `"caller"`. |
+| `affected_communities` | array of ints | The distinct Leiden community/cluster ids (KGRAPH-05) of every resolved node in the blast radius, sorted ascending. Empty on the degrade path (no resolved nodes). |
+| `blast_count` | int | Count of distinct affected nodes = `blast_radius.len()` (each `id` is unique within the array). |
+| `token_reduction_pct` | float | `1 − (blast-radius node-card bytes / whole-project node-card bytes)`, ×100, clamped `[0,100]`, rounded to 2 dp. `0.0` when there is no resolved blast radius to compare against (empty graph, or an all-unresolved radius — a wholly-unresolved radius must not read as "100% reduction"). |
+| `truncated` | bool (present only when `true`) | Emitted (and logged via a distinct `tracing::warn!`) when EITHER cap fired: the **input-file cap** (raw input exceeded `MAX_CHANGED_FILES`, files dropped before scoping — fires on the live AND degrade paths) or the **blast-node cap** (`CORTEX_MAX_BLAST_NODES`, the walk stopped enumerating). Absent when neither cap fired — never a silent cap. |
+
+**Error/edge cases**: `InvalidArgument` for an unknown `project_id`; an
+oversized `changed_files` CSV string (`> MAX_TEXT_LEN`, 2000 chars); a
+`changed_files` array over `MAX_CHANGED_FILES_ARG` (5000) elements or with any
+element over `MAX_TEXT_LEN` chars; a `diff` over `MAX_DIFF_LEN` (1,000,000)
+chars; or neither `changed_files` nor `diff` yielding any file. A
+missing/unloadable Atlas graph is NOT an error (see step 3 above) — that is
+the one deliberate exception to "validate first, then act" in this tool, since
+blast-radius unavailability is a data-availability fact, not a caller mistake.
 
 ## `cortex_review` (pending — CXEG-04)
 
@@ -295,8 +326,9 @@ real `risk_score`; the bridge is forward-compatible as-is.
 unknowns and the old legacy repo names), free-text length capping,
 `cortex_review`/`cortex_audit`'s `InvalidArgument` rejection paths and
 pending-pointer success shape, `cortex_scope`'s argument-validation/wiring
-(`project_id` rejection, oversized CSV rejection, "neither changed_files nor
-diff" rejection, array-form and diff-only-form acceptance, and a
+(`project_id` rejection, oversized CSV rejection, oversized array-size and
+array-element rejection, oversized `diff` rejection, "neither changed_files
+nor diff" rejection, array-form and diff-only-form acceptance, and a
 `configured:false` degrade smoke test against an empty store dir),
 `cortex_audit`'s unchanged SSRF-guard rejections, and full registration
 (`register()` yields exactly 10 tool names, all `cortex_*`).
@@ -306,8 +338,9 @@ edge, 2 distinct clusters): `changed_files_from_args`'s array/CSV/diff
 parsing agree on the same file set; a touched node's documented caller AND
 callee both appear in `blast_radius`; a changed file with no matching graph
 node is echoed back as an unresolved literal entry alongside resolved
-symbols; `compute_scope` against an unconfigured/empty store degrades to
-`configured:false` with every `changed_files` entry unresolved; an
+symbols; a bi-temporally invalidated neighbor (its file removed) is excluded
+from a live blast radius; `compute_scope` against an unconfigured/empty store
+degrades to `configured:false` with every `changed_files` entry unresolved; an
 artificially low `max_blast_nodes` sets `truncated:true` and caps the
 returned `blast_radius`; an input file list over `MAX_CHANGED_FILES` sets
 `truncated:true` via the input-file cap (distinct from the node cap, and
@@ -317,6 +350,10 @@ fraction of a larger graph is touched. `src/review/kg_context.rs`'s tests add
 coverage for `derive_changed_files_counted`'s `(files, input_truncated)`
 signal (array- and diff-path caps flag truncation; deduped paths at the cap
 do not), while the existing `derive_changed_files` tests are unchanged.
+`src/scribe/graph/query.rs`'s tests add coverage for the shared
+`one_hop_neighbors` walk (incoming/outgoing split, direction filter), and
+`src/scribe/graph/tools.rs`'s existing `kg_neighbors` tests are unchanged —
+its output is byte-identical after being refactored onto that helper.
 `src/cortex/deprecated.rs`'s test module covers: all 7 aliases register,
 each returns a `{"deprecated":true,"use":...}` pointer regardless of input
 shape (including empty args), and no alias's `execute` does any I/O.

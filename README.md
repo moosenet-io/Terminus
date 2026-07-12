@@ -735,15 +735,23 @@ Its risk/elegance surface is rebuilt over the following S115 items:
 - `cortex_scope` — pre-change blast radius for a planned change, live as of
   **CXEG-02**: given `project_id` + `changed_files` (comma-separated string
   or array) or a unified `diff`, it resolves the touched symbols against the
-  project's Atlas graph, walks their 1-hop callers/callees, and returns
-  `blast_radius`, `affected_communities`, `blast_count`, and a
-  `token_reduction_pct` estimate (how much smaller the blast radius is than
-  the whole project). Degrades to `configured:false` (the literal
-  `changed_files` echoed back as unresolved entries) instead of erroring when
-  the project has no stored Atlas graph yet — dispatch never breaks on a
-  missing graph. Sets `truncated:true` (with a distinct logged warning, never
-  a silent drop) for either the input-file cap (`MAX_CHANGED_FILES`) or the
-  blast-node cap (`CORTEX_MAX_BLAST_NODES`, default 200).
+  project's Atlas graph and walks their 1-hop callers/callees via the shared
+  `scribe::graph::query::one_hop_neighbors` helper (the same single-source walk
+  `kg_neighbors` uses), filtered to the current bi-temporal view so a
+  since-removed symbol never appears. Returns a JSON object with fields
+  `configured` (bool), `project_id`, `changed_files`, `blast_radius[]` (each
+  entry `{id, path, kind, resolved, role}` where `role` is
+  `touched`/`caller`/`callee`), `affected_communities` (sorted cluster ids),
+  `blast_count`, `token_reduction_pct` (how much smaller the blast radius is
+  than the whole project), and `truncated` (present only when a cap fired).
+  Degrades to `configured:false` (the literal `changed_files` echoed back as
+  unresolved entries) instead of erroring when the project has no stored Atlas
+  graph yet — dispatch never breaks on a missing graph. Sets `truncated:true`
+  (with a distinct logged warning on the live AND degrade paths, never a
+  silent drop) for either the input-file cap (`MAX_CHANGED_FILES`) or the
+  blast-node cap (`CORTEX_MAX_BLAST_NODES`, default 200). Rejects oversized
+  input (`changed_files` string/array bounds, `diff` length) with
+  `InvalidArgument`.
 - `cortex_review` — post-change `risk_score` (0–10) + named `risk_signals`
   from Atlas structural metrics and KGFIND recurrence (stub pending **CXEG-04**).
 - `cortex_audit` — audit an external public repo URL (stub pending **CXEG-11**);
