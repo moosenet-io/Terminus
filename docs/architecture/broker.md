@@ -389,9 +389,13 @@ the live gateway serving that domain's tools throughout the migration.
      expected tool set, tier, and `last_health: true`.
 
 7. **Verify list/call/fault-isolation before touching `register_all`.**
-   - `tools/list` on the broker should show the tools twice-covered:
-     compiled-in (still winning) plus the worker's route (present but not
-     yet reachable via dispatch since compiled-in wins).
+   - `tools/list` on the broker still shows each colliding tool ONCE, owned
+     by the compiled-in implementation: `merge_catalog` explicitly skips any
+     worker route whose name collides with a compiled-in tool, so the worker's
+     route does not appear as a duplicate `tools/list` entry (this matches the
+     `tools/call` precedence — compiled-in still wins while it exists).
+     Confirm the worker's route is registered via `GET /admin/workers`, not via
+     a second `tools/list` entry.
    - Manually exercise `POST /admin/workers/health` and confirm the worker
      reports healthy.
    - Optionally, deliberately stop the worker process and confirm
