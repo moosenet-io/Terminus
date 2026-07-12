@@ -45,8 +45,16 @@ place the crate's own bootstrap credential, `INFISICAL_CLIENT_ID`/
 `INFISICAL_CLIENT_SECRET`, is read), and `src/secrets_bootstrap.rs` (the
 startup fetch that materializes downstream `GITEA_*`/`PLANE_*`/`GITHUB_*`/
 media-domain secrets into the process environment — see that file's module
-doc) are exempt from Rule 1 entirely: they ARE the sanctioned
-secret-materialization layer, not a call site of it.
+doc) are exempt from **Rule 1 only**: they ARE the sanctioned
+secret-materialization layer, so a raw secret read there is not a violation.
+
+This is a **Rule-1-only** exemption, applied precisely at the point a
+`RawSecretEnvVar` finding would be recorded — NOT a whole-file skip. Every
+file, sanctioned or not, is still parsed and visited, so **Rules 2 (empty
+description) and 4 (`panic!` in `execute`) apply everywhere**, including
+`src/<secret-manager>/mod.rs`, which contains real `RustTool` impls. (An earlier
+revision skipped sanctioned files entirely before parsing, which wrongly
+exempted them from Rules 2/4 too — fixed.)
 
 **What counts as an `env::var` call.** The rule does not rely on the read
 being spelled `std::env::var`. It matches all of:
@@ -228,26 +236,47 @@ A `// house-style-allow: <reason>` line comment — on the same line as the
 flagged code, or the line immediately above it — suppresses that one
 finding. This mirrors this crate's existing `// pii-test-fixture` line-exact
 convention (`crate::github::pii`), with one addition: **the reason is
-mandatory**. `// house-style-allow` with no colon, or with an empty reason
-after the colon, does NOT suppress anything — it is itself reported as a
-`house-style-waiver-reason` violation (the original finding is also included
-in that violation's message, so it stays visible; the waiver can never
-silently swallow a finding).
+mandatory**.
 
 ```rust
 // house-style-allow: legacy fixture path, tracked in TERM-123, not a real secret
 let x = std::env::var("SOME_TOKEN_LOOKALIKE");
 ```
 
+A reasonless waiver — `// house-style-allow` with no colon, or with an empty
+reason after the colon — is handled two ways, both of which fail the gate:
+
+- It does **not** suppress anything. An invalid waiver leaves the underlying
+  finding live, so wrapping a real violation in a reasonless waiver surfaces
+  *both* the original finding and the reasonless-waiver violation.
+- It is caught **independently of any finding**. A standalone line scan
+  flags every reasonless `// house-style-allow` comment as a
+  `house-style-waiver-reason` violation, whether or not it is attached to a
+  suppressed finding — so a bare, dangling reasonless waiver never passes
+  cleanly. (Earlier the reasonless check only ran when it happened to be
+  suppressing another finding; a standalone one slipped through. Fixed.)
+
+To avoid flagging the many *prose* mentions of the marker (in comments/docs
+that talk about it in backticks), the standalone scan only treats the marker
+as a waiver when it is a genuine `//` line comment followed immediately by
+`:`, whitespace, or end-of-line. A marker followed by any other character
+(e.g. `` `// house-style-allow` `` inside prose) is a mention, not a use, and
+is ignored. The checker's own source (`src/house_style/**`,
+`src/bin/house_style_check.rs`) is exempt from the standalone scan — it
+necessarily embeds marker examples in its docs, help strings, and test
+fixtures — mirroring how `crate::github::pii` self-exempts its own
+pattern-bearing source. The scan still runs on every other file.
+
 ## Allow-list
 
 | Scope | Why |
 | --- | --- |
-| `src/config.rs` | The central `crate::config` accessor module — the file IS the sanctioned accessor, not a caller of it. |
-| `src/<secret-manager>/mod.rs` | Reads the crate's own bootstrap credential (`INFISICAL_CLIENT_ID`/`INFISICAL_CLIENT_SECRET`) — this is the <secret-manager> client itself. |
-| `src/secrets_bootstrap.rs` | The startup fetch that materializes downstream secrets into the process environment (`std::env::set_var`) for every `*::from_env()` constructor to read afterward. |
-| Any code inside `#[cfg(test)]` / `#[test]` / `#[tokio::test]` | Test fixtures, mocks, and env-snapshot/restore helpers (e.g. `clear_github_credential_env`) routinely set/read/clear secret-shaped env vars to drive test scenarios — not production secret handling. |
+| `src/config.rs` (Rule 1 only) | The central `crate::config` accessor module — the file IS the sanctioned accessor, not a caller of it. Rules 2/4 still apply. |
+| `src/<secret-manager>/mod.rs` (Rule 1 only) | Reads the crate's own bootstrap credential (`INFISICAL_CLIENT_ID`/`INFISICAL_CLIENT_SECRET`) — this is the <secret-manager> client itself. Rules 2/4 still apply (it has real `RustTool` impls). |
+| `src/secrets_bootstrap.rs` (Rule 1 only) | The startup fetch that materializes downstream secrets into the process environment (`std::env::set_var`) for every `*::from_env()` constructor to read afterward. Rules 2/4 still apply. |
+| Any code inside `#[cfg(test)]` / `#[test]` / `#[tokio::test]` | Test fixtures, mocks, and env-snapshot/restore helpers (e.g. `clear_github_credential_env`) routinely set/read/clear secret-shaped env vars to drive test scenarios — not production secret handling. Test context is detected by *parsing* the `cfg` predicate, so `#[cfg(not(test))]` production code is not exempt. |
 | Any raw `std::env::var` read OUTSIDE a `RustTool::execute`/`execute_structured` body | Covered by Rule 1's scope decision above — this is the crate's established `from_env()`/dedicated-accessor pattern, not a violation. |
+| `src/house_style/**`, `src/bin/house_style_check.rs` (reasonless-waiver scan only) | The checker's own source embeds the `house-style-allow` marker in docs/help/test-fixtures; exempt from the standalone reasonless-waiver scan only. All other rules apply. |
 
 No additional per-name allow-list entries were needed: the segment-aware
 classification in [Rule 1 classification](#rule-1-classification) already

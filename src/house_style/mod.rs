@@ -48,13 +48,26 @@
 //! resolved (that needs real dataflow analysis, out of scope for a mechanical
 //! lint). See `docs/house-style.md#known-limitations`.
 //!
+//! ## Sanctioned files are exempt from RULE 1 ONLY
+//! `src/config.rs` / `src/<secret-manager>/mod.rs` / `src/secrets_bootstrap.rs` are
+//! the sanctioned secret-materialization layer, so a raw secret read there is
+//! not a Rule-1 violation. This exemption is applied at the point a
+//! `RawSecretEnvVar` finding would be recorded — every file is still parsed
+//! and visited, so Rules 2 (empty description) and 4 (`panic!` in `execute`)
+//! apply to them too (`src/<secret-manager>/mod.rs` has real `RustTool` impls).
+//!
 //! ## Waivers
 //! A `// house-style-allow: <reason>` line comment, on the same line as the
 //! violation or the line immediately above it, suppresses that one finding.
-//! An empty or missing reason after the colon does NOT suppress — it is
-//! itself reported as a [`Rule::ReasonlessWaiver`] violation, so a waiver can
-//! never silently swallow a finding. Mirrors this crate's existing
-//! `// pii-test-fixture` line-exact convention (`crate::github::pii`).
+//! An empty/missing reason after the colon does NOT suppress (the underlying
+//! finding stays live) AND is independently reported as a
+//! [`Rule::ReasonlessWaiver`] by a standalone line scan
+//! ([`Checker::scan_reasonless_waivers`]) — so even a dangling reasonless
+//! waiver attached to no finding fails the gate. Prose mentions of the marker
+//! (in backticks etc.) are not treated as waivers; the checker's own source
+//! is exempt from the standalone scan (see [`is_checker_own_source`]). Mirrors
+//! this crate's existing `// pii-test-fixture` line-exact convention
+//! (`crate::github::pii`).
 
 use std::collections::HashSet;
 use std::fs;
@@ -167,9 +180,11 @@ pub fn check_tree(repo_root: &Path) -> Vec<Violation> {
 
     for path in entries {
         let rel = rel_path(repo_root, &path);
-        if SANCTIONED_FILES.contains(&rel.as_str()) {
-            continue;
-        }
+        // NOTE: sanctioned files are NOT skipped here — every file is parsed
+        // and visited so Rules 2 (empty description) and 4 (panic in execute)
+        // apply everywhere, including `src/<secret-manager>/mod.rs` (which has real
+        // `RustTool` impls). The sanctioned exemption is Rule-1-only and is
+        // applied at the point a `RawSecretEnvVar` would be recorded.
         let source = match fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
@@ -207,16 +222,18 @@ pub fn check_tree(repo_root: &Path) -> Vec<Violation> {
         };
         let aliases = collect_env_var_aliases(&file);
         let lines: Vec<&str> = source.lines().collect();
+        let file_sanctioned = SANCTIONED_FILES.contains(&rel.as_str());
         let mut checker = Checker {
             file_rel: rel,
             lines: &lines,
             env_var_aliases: &aliases,
+            file_sanctioned,
             test_depth: 0,
             fn_stack: Vec::new(),
             in_rust_tool_impl: false,
             violations: Vec::new(),
         };
-        checker.visit_file(&file);
+        checker.run(&file);
         violations.extend(checker.violations);
     }
 
@@ -311,33 +328,81 @@ fn secret_shaped(name: &str) -> bool {
 
 // ── waiver resolution ───────────────────────────────────────────────────────
 
+const WAIVER_MARKER: &str = "house-style-allow";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Waiver {
-    /// No `house-style-allow` marker on this or the previous line.
+    /// No `house-style-allow` comment marker on the line.
     None,
-    /// Marker present with a non-empty reason after the colon — suppressed.
+    /// Marker present as a real comment with a non-empty reason after the colon.
     Reasoned,
-    /// Marker present but no (or empty) reason after the colon.
+    /// Marker present as a real comment but with no (or empty) reason.
     Reasonless,
 }
 
-/// Looks for `house-style-allow` on the violation's own source line, then the
-/// line above it (1-indexed `line`, matching `Violation::line` / span line
-/// numbers). Mirrors `crate::github::pii`'s existing `pii-test-fixture`
-/// line-exact convention, but additionally requires a non-empty reason.
+/// Classify a single source line for a `house-style-allow` comment marker.
+///
+/// To avoid flagging the many *prose* references to the marker (this module's
+/// own docs, help strings, and test fixtures all mention it), a line is only
+/// treated as carrying a waiver when the marker is a genuine `//` line comment
+/// AND the character immediately after the marker is `:`, whitespace, or
+/// end-of-line. A marker immediately followed by any other character (a
+/// backtick, a quote, an identifier char — i.e. it is being *talked about*,
+/// not *used*) yields [`Waiver::None`].
+fn classify_waiver_comment(text: &str) -> Waiver {
+    let Some(idx) = text.find(WAIVER_MARKER) else {
+        return Waiver::None;
+    };
+    // Must be an actual comment marker: the text just before it, trimmed, ends
+    // with `//` (e.g. `// house-style-allow`, `//house-style-allow`).
+    if !text[..idx].trim_end().ends_with("//") {
+        return Waiver::None;
+    }
+    let rest = &text[idx + WAIVER_MARKER.len()..];
+    if let Some(reason) = rest.strip_prefix(':') {
+        if reason.trim().trim_end_matches("*/").trim().is_empty() {
+            Waiver::Reasonless
+        } else {
+            Waiver::Reasoned
+        }
+    } else if rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace()) {
+        // `// house-style-allow` with no colon at all — reasonless.
+        Waiver::Reasonless
+    } else {
+        // e.g. `` `// house-style-allow` `` inside prose — a mention, not a use.
+        Waiver::None
+    }
+}
+
+/// Suppression lookup for a specific finding: is there a REASONED waiver on the
+/// finding's own source line, or the line above it (1-indexed `line`, matching
+/// `Violation::line` / span line numbers)? A reasonless waiver does NOT
+/// suppress — an invalid waiver leaves the underlying finding live (and is
+/// separately reported by [`Checker::scan_reasonless_waivers`]). Mirrors
+/// `crate::github::pii`'s `pii-test-fixture` line-exact convention, plus the
+/// mandatory-reason requirement.
 fn waiver_status(lines: &[&str], line: usize) -> Waiver {
     for candidate in [line, line.saturating_sub(1)] {
         if candidate == 0 {
             continue;
         }
         let Some(text) = lines.get(candidate - 1) else { continue };
-        let Some(idx) = text.find("house-style-allow") else { continue };
-        let rest = text[idx + "house-style-allow".len()..].trim_start();
-        return match rest.strip_prefix(':') {
-            Some(reason) if !reason.trim().trim_end_matches("*/").trim().is_empty() => Waiver::Reasoned,
-            _ => Waiver::Reasonless,
-        };
+        match classify_waiver_comment(text) {
+            Waiver::None => continue,
+            w => return w,
+        }
     }
     Waiver::None
+}
+
+/// The checker's OWN source files necessarily embed the `house-style-allow`
+/// marker in module docs, help strings, and test fixtures — scanning them for
+/// standalone reasonless waivers would flag those examples. They are exempt
+/// from the standalone-waiver scan only (Rule 1's sanctioned-file list is a
+/// separate concern). Mirrors how `crate::github::pii` self-exempts its own
+/// pattern-bearing source.
+fn is_checker_own_source(rel: &str) -> bool {
+    rel.starts_with("src/house_style/") || rel == "src/bin/house_style_check.rs"
 }
 
 // ── test-context detection ──────────────────────────────────────────────────
@@ -417,10 +482,22 @@ struct Checker<'s> {
     fn_stack: Vec<String>,
     /// True while visiting the body of an `impl RustTool for X` block.
     in_rust_tool_impl: bool,
+    /// True for `src/config.rs` / `src/<secret-manager>/mod.rs` /
+    /// `src/secrets_bootstrap.rs` — the sanctioned secret-materialization
+    /// layer. Suppresses RULE 1 (raw secret env read) ONLY; Rules 2/4 still
+    /// apply to these files.
+    file_sanctioned: bool,
     violations: Vec<Violation>,
 }
 
 impl<'s> Checker<'s> {
+    /// Run every check over a parsed file: the AST visitor (Rules 1/2/4) plus
+    /// the standalone reasonless-waiver line scan.
+    fn run(&mut self, file: &syn::File) {
+        self.visit_file(file);
+        self.scan_reasonless_waivers();
+    }
+
     /// True if the current node is lexically nested ANYWHERE inside a
     /// `RustTool::execute`/`execute_structured` body — not merely if the
     /// immediately-enclosing fn is one. This closes the "wrap the raw read in
@@ -432,25 +509,42 @@ impl<'s> Checker<'s> {
             .any(|f| f == "execute" || f == "execute_structured")
     }
 
+    /// Record a finding unless a REASONED waiver on the same/previous line
+    /// suppresses it. A reasonless waiver does NOT suppress (the finding stays
+    /// live); the reasonless waiver itself is reported separately by
+    /// [`Self::scan_reasonless_waivers`].
     fn record(&mut self, rule: Rule, line: usize, message: String, help: String) {
-        match waiver_status(self.lines, line) {
-            Waiver::Reasoned => {}
-            Waiver::Reasonless => {
+        if waiver_status(self.lines, line) == Waiver::Reasoned {
+            return;
+        }
+        self.violations.push(Violation {
+            file: PathBuf::from(self.file_rel.as_str()),
+            line,
+            rule,
+            message,
+            help,
+        });
+    }
+
+    /// Standalone scan (independent of any other finding): every reasonless
+    /// `// house-style-allow` comment is itself a violation, whether or not it
+    /// is attached to a suppressed finding. Skips the checker's own source
+    /// files (see [`is_checker_own_source`]).
+    fn scan_reasonless_waivers(&mut self) {
+        if is_checker_own_source(&self.file_rel) {
+            return;
+        }
+        for (i, text) in self.lines.iter().enumerate() {
+            if classify_waiver_comment(text) == Waiver::Reasonless {
                 self.violations.push(Violation {
                     file: PathBuf::from(self.file_rel.as_str()),
-                    line,
+                    line: i + 1,
                     rule: Rule::ReasonlessWaiver,
-                    message: format!(
-                        "`// house-style-allow` waiver near this line has no reason after the colon \
-                         (original finding, still live: {message})"
-                    ),
+                    message: "`// house-style-allow` waiver has no reason after the colon".to_string(),
                     help: "give the waiver a reason: `// house-style-allow: <why this is OK>` — a bare \
                            `// house-style-allow` (no colon, or an empty reason) is itself a violation"
                         .to_string(),
                 });
-            }
-            Waiver::None => {
-                self.violations.push(Violation { file: PathBuf::from(self.file_rel.as_str()), line, rule, message, help });
             }
         }
     }
@@ -560,7 +654,11 @@ impl<'s, 'ast> Visit<'ast> for Checker<'s> {
                 // `std::env::var` (possibly renamed); see `collect_env_var_aliases`.
                 let imported_env_var = n == 1
                     && self.env_var_aliases.contains(&path.segments[0].ident.to_string());
-                if qualified_env_var || imported_env_var {
+                // RULE 1 EXEMPTION (this rule only): the sanctioned
+                // secret-materialization files ARE the accessor layer, so a raw
+                // read there is not a violation. Rules 2/4 still ran on this
+                // file (they don't consult `file_sanctioned`).
+                if (qualified_env_var || imported_env_var) && !self.file_sanctioned {
                     if let Some(Expr::Lit(ExprLit { lit: Lit::Str(s), .. })) = node.args.first() {
                         let name = s.value();
                         if secret_shaped(&name) {
@@ -670,19 +768,27 @@ mod tests {
     // ── helper: run the whole per-file pipeline over an in-memory source ─────
 
     fn check_source(src: &str) -> Vec<Violation> {
+        check_source_as("src/x.rs", src)
+    }
+
+    /// Like [`check_source`] but with an explicit relative path, so a test can
+    /// simulate a sanctioned file (Rule 1 exempt) or the checker's own source
+    /// (reasonless-waiver-scan exempt).
+    fn check_source_as(rel: &str, src: &str) -> Vec<Violation> {
         let file = syn::parse_file(src).expect("test source must parse");
         let aliases = collect_env_var_aliases(&file);
         let lines: Vec<&str> = src.lines().collect();
         let mut checker = Checker {
-            file_rel: "src/x.rs".to_string(),
+            file_rel: rel.to_string(),
             lines: &lines,
             env_var_aliases: &aliases,
+            file_sanctioned: SANCTIONED_FILES.contains(&rel),
             test_depth: 0,
             fn_stack: Vec::new(),
             in_rust_tool_impl: false,
             violations: Vec::new(),
         };
-        checker.visit_file(&file);
+        checker.run(&file);
         checker.violations
     }
 
@@ -901,6 +1007,9 @@ mod tests {
         "#;
         assert!(check_source(reasoned).is_empty());
 
+        // A reasonless waiver attached to a real finding does NOT suppress it:
+        // the underlying finding stays live AND the reasonless waiver is its
+        // own violation.
         let reasonless = r#"
             struct T;
             impl RustTool for T {
@@ -910,6 +1019,101 @@ mod tests {
                 }
             }
         "#;
-        assert_eq!(rules(&check_source(reasonless)), vec![Rule::ReasonlessWaiver]);
+        let mut got = rules(&check_source(reasonless));
+        got.sort_by_key(|r| r.id());
+        assert_eq!(got, vec![Rule::RawSecretEnvVar, Rule::ReasonlessWaiver]);
+    }
+
+    // ── Fix #2 (cycle 2): a STANDALONE reasonless waiver is a violation ─────
+
+    #[test]
+    fn standalone_reasonless_waiver_is_flagged_even_without_a_finding() {
+        // No underlying finding anywhere — just a bare reasonless waiver line.
+        let src = r#"
+            struct T;
+            impl RustTool for T {
+                fn description(&self) -> &str { "ok" }
+                async fn execute(&self, _a: Value) -> Result<String, ToolError> {
+                    // house-style-allow
+                    Ok(String::new())
+                }
+            }
+        "#;
+        assert_eq!(rules(&check_source(src)), vec![Rule::ReasonlessWaiver]);
+    }
+
+    #[test]
+    fn standalone_reasonless_waiver_empty_colon_is_flagged() {
+        let src = "// house-style-allow:   \nstruct Z;\n";
+        assert_eq!(rules(&check_source(src)), vec![Rule::ReasonlessWaiver]);
+    }
+
+    #[test]
+    fn well_formed_standalone_waiver_is_allowed() {
+        let src = "// house-style-allow: documented reason\nstruct Z;\n";
+        assert!(check_source(src).is_empty());
+    }
+
+    #[test]
+    fn prose_mention_of_the_marker_is_not_a_waiver() {
+        // The marker appears inside backticks / as a bare word — a mention,
+        // not a use. Must not be flagged.
+        let src = r#"
+            /// See the `// house-style-allow` convention.
+            /// The house-style-allow marker lives in comments.
+            struct Z;
+        "#;
+        assert!(check_source(src).is_empty());
+    }
+
+    // ── Fix #1 (cycle 2): sanctioned files — Rule 1 exempt, Rules 2/4 apply ─
+
+    #[test]
+    fn sanctioned_file_rule1_exempt_but_rules_2_and_4_still_apply() {
+        // Same source, checked once as a sanctioned file and once as an
+        // ordinary file.
+        let src = r#"
+            struct T;
+            impl RustTool for T {
+                fn description(&self) -> &str { "" }
+                async fn execute(&self, _a: Value) -> Result<String, ToolError> {
+                    let _ = std::env::var("GITHUB_TOKEN");
+                    panic!("boom");
+                }
+            }
+        "#;
+        // Sanctioned (e.g. src/<secret-manager>/mod.rs): the raw secret read (Rule 1)
+        // is exempt, but the empty description (Rule 2) and panic! (Rule 4)
+        // are STILL flagged.
+        let mut sanctioned = rules(&check_source_as("src/<secret-manager>/mod.rs", src));
+        sanctioned.sort_by_key(|r| r.id());
+        assert_eq!(sanctioned, vec![Rule::EmptyToolDescription, Rule::PanicInExecute]);
+
+        // Ordinary file: all three fire.
+        let mut ordinary = rules(&check_source_as("src/foo/mod.rs", src));
+        ordinary.sort_by_key(|r| r.id());
+        assert_eq!(
+            ordinary,
+            vec![Rule::RawSecretEnvVar, Rule::EmptyToolDescription, Rule::PanicInExecute]
+        );
+    }
+
+    #[test]
+    fn all_three_sanctioned_files_are_rule1_exempt() {
+        let src = r#"
+            struct T;
+            impl RustTool for T {
+                async fn execute(&self, _a: Value) -> Result<String, ToolError> {
+                    let _ = std::env::var("PLANE_API_KEY");
+                    Ok(String::new())
+                }
+            }
+        "#;
+        for rel in ["src/config.rs", "src/<secret-manager>/mod.rs", "src/secrets_bootstrap.rs"] {
+            assert!(
+                check_source_as(rel, src).is_empty(),
+                "{rel} should be Rule-1 exempt"
+            );
+        }
     }
 }
