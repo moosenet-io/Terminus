@@ -473,24 +473,31 @@ pub async fn replay_pr(
         )
     })?;
 
-    // ORDER guard: this PR must be the NEXT unreplayed merged PR. Its merge commit's
-    // FIRST parent (internal main just BEFORE the merge) must equal the canonical
-    // lineage tip (base_int). If it doesn't, base_int..head_int would span earlier
-    // un-replayed PRs and this run would open one public PR carrying only THIS PR's
-    // title/body/comments over all those commits — mis-attributing earlier work. Refuse.
-    let first_parent = git(&cfg.source, &["rev-parse", "--verify", &format!("{head_int}^1")])
+    // ORDER guard: this PR must be the NEXT unreplayed one. Replaying it while an
+    // earlier merged PR is still pending would make base_int..head_int span both, and
+    // this run would open ONE public PR carrying only THIS PR's title/body/comments
+    // over all those commits — mis-attributing earlier work. Detect a skipped PR as a
+    // MERGE COMMIT sitting strictly between the canonical lineage tip (base_int) and
+    // this PR's merge (head_int). This works whether head_int is itself a merge commit
+    // (fleet default) or a single-parent fast-forward/squash commit — unlike a strict
+    // `head_int^1 == base_int` check, which wrongly rejects a valid multi-commit
+    // fast-forward PR. (An earlier FAST-FORWARD-merged PR leaves no merge commit and so
+    // cannot be detected from git alone; callers still replay in order.)
+    let intervening: Vec<String> = git(&cfg.source, &["rev-list", "--merges", &format!("{base_int}..{head_int}")])
         .map_err(|e| {
             ToolError::Execution(format!(
-                "cannot read the merge commit's first parent for PR {internal_pr} ({head_int}^1): {e}"
+                "cannot enumerate merges in {base_int}..{head_int} for PR {internal_pr}: {e}"
             ))
         })?
-        .trim()
-        .to_string();
-    if first_parent != base_int {
+        .split_whitespace()
+        .filter(|m| *m != head_int) // head_int itself, if a merge commit, is this PR's own merge
+        .map(String::from)
+        .collect();
+    if !intervening.is_empty() {
         return Err(ToolError::Conflict(format!(
-            "internal PR {internal_pr} is not the next unreplayed merged PR — its merge commit's \
-             first parent {first_parent} does not equal the canonical lineage tip {base_int}. \
-             Replay merged PRs in merge order (the immediately-following one first)."
+            "internal PR {internal_pr} is not the next unreplayed merged PR — merge commit(s) \
+             {intervening:?} sit between the canonical lineage tip {base_int} and this PR's merge \
+             {head_int}. Replay merged PRs in merge order (the immediately-following one first)."
         )));
     }
 
@@ -526,22 +533,28 @@ pub async fn replay_pr(
     let public_base = fetch_public_main(&cfg.work_dir, &cfg.remote, token)?;
     let opts = ReplayOpts::with_author_map(cfg.author_map.clone());
 
-    // TRANSACTION: snapshot the canonical lineage, then replay + publish. If ANY step
-    // fails (transport / forge), roll the canonical lineage back to the snapshot so the
-    // mirror is never wedged past an unpublished PR and a retry starts clean.
+    // The public MERGE is the point of no return: it advances the public repo
+    // irreversibly. So the work is split into two phases around it:
+    //   Phase A (replay → push → create PR → comments): fully roll-back-able — nothing
+    //     is published yet, so on ANY failure restore the canonical lineage so a retry
+    //     starts clean.
+    //   Phase B (merge → reconcile boundary → tag): once the merge SUCCEEDS, the
+    //     canonical lineage (already advanced to head_int by replay_pr_slice) MUST stay
+    //     advanced to match the published state — it is NEVER rolled back after a
+    //     successful merge. If a post-merge step (fetch/boundary/tag) fails, the error
+    //     is surfaced but canonical stays put; the durable-idempotency path finishes
+    //     the reconciliation on retry.
     let snap = snapshot_canonical(&cfg.work_dir)?;
-    let published: Result<(usize, u64, usize, String), ToolError> = async {
+
+    // ── Phase A (roll-back-able) ────────────────────────────────────────────────
+    let phase_a: Result<(usize, u64, usize), ToolError> = async {
         let slice =
             replay_pr_slice(&cfg.source, &cfg.work_dir, &base_int, &head_int, &public_base, &branch, &opts)?;
-
-        // 4. Push the scrubbed feature branch to the public remote (NOT force — new ref).
         git_transport(
             &cfg.work_dir,
             &["push", "--", &cfg.remote, &format!("{}:refs/heads/{branch}", slice.branch_tip)],
             token,
         )?;
-
-        // 5. Open the public PR with the scrubbed title/body.
         let mut create = json!({ "repo": pub_repo, "title": title, "head": branch, "base": "main", "body": body });
         if let Some(o) = &cfg.public_owner {
             create["owner"] = json!(o);
@@ -550,8 +563,6 @@ pub async fn replay_pr(
             call_public(reg, cfg.public_provider.as_deref(), ForgeEndpoint::PullRequestsCreate, create).await?;
         let public_pr = pr_number(&created)
             .ok_or_else(|| ToolError::Execution("public PR create returned no PR number/iid".into()))?;
-
-        // 6. Mirror each scrubbed comment onto the public PR.
         let mut mirrored = 0usize;
         for c in &scrubbed_comments {
             let mut cp = json!({ "repo": pub_repo, "index": public_pr, "number": public_pr, "comment": c, "body": c });
@@ -561,45 +572,52 @@ pub async fn replay_pr(
             call_public(reg, cfg.public_provider.as_deref(), ForgeEndpoint::PullRequestsComment, cp).await?;
             mirrored += 1;
         }
-
-        // 7. Merge the public PR — this is what lands the commits on public main.
-        let mut mp = json!({
-            "repo": pub_repo, "index": public_pr, "number": public_pr,
-            "style": cfg.merge_method, "merge_method": cfg.merge_method,
-        });
-        if let Some(o) = &cfg.public_owner {
-            mp["owner"] = json!(o);
-        }
-        call_public(reg, cfg.public_provider.as_deref(), ForgeEndpoint::PullRequestsMerge, mp).await?;
-
-        // 8. Reconcile: fetch the new public main and record it as the published
-        //    boundary so the next PR replays onto it, and tag the internal PR mirrored.
-        let new_public = fetch_public_main(&cfg.work_dir, &cfg.remote, token)?;
-        set_pushed_sha(&cfg.work_dir, &new_public)?;
-        git(&cfg.work_dir, &["tag", "-f", &pr_tag(internal_pr), &new_public])?;
-
-        Ok((slice.commits, public_pr, mirrored, new_public))
+        Ok((slice.commits, public_pr, mirrored))
     }
     .await;
-
-    match published {
-        Ok((commits, public_pr, mirrored, new_public)) => {
-            base_outcome.commits = commits;
-            base_outcome.public_pr = Some(public_pr);
-            base_outcome.comments_mirrored = mirrored;
-            base_outcome.replayed = true;
-            base_outcome.public_head = Some(new_public);
-            base_outcome.note =
-                "public PR opened, commented, and merged — the PR process is mirrored".into();
-            Ok(base_outcome)
-        }
+    let (commits, public_pr, mirrored) = match phase_a {
+        Ok(v) => v,
         Err(e) => {
-            // Roll the canonical lineage back so a retry is clean. (A branch that DID
-            // reach the remote is caught next run by the remote-branch guard.)
             restore_canonical(&cfg.work_dir, &snap, &branch)?;
-            Err(e)
+            return Err(e);
         }
+    };
+
+    // ── Phase B: merge (point of no return) ─────────────────────────────────────
+    let mut mp = json!({
+        "repo": pub_repo, "index": public_pr, "number": public_pr,
+        "style": cfg.merge_method, "merge_method": cfg.merge_method,
+    });
+    if let Some(o) = &cfg.public_owner {
+        mp["owner"] = json!(o);
     }
+    if let Err(e) = call_public(reg, cfg.public_provider.as_deref(), ForgeEndpoint::PullRequestsMerge, mp).await {
+        // The merge itself did NOT happen → still safe to roll back.
+        restore_canonical(&cfg.work_dir, &snap, &branch)?;
+        return Err(e);
+    }
+
+    // Merge SUCCEEDED. From here the canonical lineage stays at head_int (it matches the
+    // now-published state) and is NOT rolled back on failure. Reconcile the boundary +
+    // tag; on failure surface an error telling the caller to retry (the durable-
+    // idempotency path will finish reconciliation), but leave canonical advanced.
+    let new_public = fetch_public_main(&cfg.work_dir, &cfg.remote, token).map_err(|e| {
+        ToolError::Execution(format!(
+            "public PR for '{branch}' MERGED but reconciling the published boundary failed \
+             ({e}); the canonical lineage is correctly advanced — re-run to finish (it will skip \
+             via durable idempotency)"
+        ))
+    })?;
+    set_pushed_sha(&cfg.work_dir, &new_public)?;
+    git(&cfg.work_dir, &["tag", "-f", &pr_tag(internal_pr), &new_public])?;
+
+    base_outcome.commits = commits;
+    base_outcome.public_pr = Some(public_pr);
+    base_outcome.comments_mirrored = mirrored;
+    base_outcome.replayed = true;
+    base_outcome.public_head = Some(new_public);
+    base_outcome.note = "public PR opened, commented, and merged — the PR process is mirrored".into();
+    Ok(base_outcome)
 }
 
 #[cfg(test)]
