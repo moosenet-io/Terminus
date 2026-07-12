@@ -75,6 +75,7 @@ use crate::inference_proxy::{
     InferenceProxyClient, AGENT_EXECUTE_PATH, CHAT_COMPLETIONS_PATH, CODING_SELECT_PATH,
     INFER_PATH,
 };
+use crate::broker::routes::RouteTable;
 use crate::mesh::{CallRoute, MergedCatalog, Principal, PrincipalResolver, TailnetIdentity, UpstreamPool};
 use crate::pki::mtls::ClientIdentity;
 use crate::registry::ToolRegistry;
@@ -140,6 +141,17 @@ pub struct McpServerState {
     /// existing single-identity deployments and every pre-MESH-07 test in
     /// this module keep working unmodified.
     pub principal_resolver: PrincipalResolver,
+    /// TMOD-04: the broker-owned, atomically-swappable tool-name → worker
+    /// route table (see `crate::broker::routes` for the full design). A
+    /// `tools/call` for a name NOT present in `registry`'s snapshot resolves
+    /// against THIS table's snapshot before falling through to
+    /// `personal_federation`/"Unknown tool"; `tools/list` merges in every
+    /// currently-healthy routed worker's tools. Starts empty (`RouteTable::new()`)
+    /// for every process until something calls its install methods (nothing
+    /// on a live path does yet, as of this item — mutation is TMOD-05's
+    /// worker-onboarding scope) — an empty table is behavior-preserving,
+    /// identical to pre-TMOD-04 dispatch.
+    pub broker_routes: RouteTable,
 }
 
 impl McpServerState {
@@ -407,6 +419,10 @@ async fn handle_mcp(
     // registry or (for a request that starts after the swap) fully sees the
     // new one, never a mix of both.
     let reg = state.registry.load();
+    // TMOD-04: same one-snapshot-per-request contract as `reg` above, for
+    // the broker's worker route table — see `crate::broker::routes`'s
+    // module doc and `McpServerState::broker_routes`'s doc.
+    let broker_routes = state.broker_routes.load();
 
     // MESH-07: resolve the ONE canonical `Principal` for this request up
     // front, from server-verified transport identity extensions only (never
@@ -490,6 +506,15 @@ async fn handle_mcp(
                     })
                 }));
             }
+            // TMOD-04: merge in every currently-healthy broker-routed
+            // worker's tools (bare, unprefixed names) -- see
+            // `crate::broker::routes::merge_catalog`'s doc. A route whose
+            // name collides with a tool already in `tools` (compiled-in, or
+            // the personal-federation set above) is skipped: compiled-in/
+            // personal-federated wins, per this table's documented
+            // precedence. `broker_routes` empty (every deployment before a
+            // worker is ever installed) makes this byte-for-byte a no-op.
+            tools = crate::broker::routes::merge_catalog(tools, &broker_routes).await;
             // MESH-03: merge in every currently-healthy mesh upstream's
             // tools, namespaced `<namespace>__<tool>` -- see
             // `crate::mesh::merge::MergedCatalog`. `state.mesh_pool` is
@@ -835,11 +860,45 @@ async fn handle_mcp(
                         Some(msg),
                     )
                 }
-                // Not a core tool -- TGW-02: if this process federates
-                // personal-tool calls, proxy to Chord's
-                // `/v1/personal/tools/call` relay before giving up. Core
-                // dispatch above is completely unchanged by this branch.
-                None => match &state.personal_federation {
+                // Not a core tool -- TMOD-04: before falling through to
+                // personal-federation, try the broker's worker route table
+                // (see `crate::broker::routes::dispatch_call`'s doc). `None`
+                // here means no route at all (an empty table, or this name
+                // just isn't routed) -- falls through to
+                // personal_federation/"Unknown tool" exactly as before this
+                // item. `Some(..)` means a route exists: either the worker
+                // answered (success or an application-level tool error) or
+                // it's currently unhealthy (a clean transport failure) --
+                // either way this is authoritative and does NOT also try
+                // personal_federation for the same name.
+                None => match crate::broker::routes::dispatch_call(&broker_routes, name, arguments.clone()).await {
+                    Some(Ok(output)) => {
+                        let mut result = json!({
+                            "content": [{"type": "text", "text": output.text}],
+                            "isError": false
+                        });
+                        if let Some(structured) = output.structured {
+                            result["structuredContent"] = structured;
+                        }
+                        (sse_response(id, Ok(result), ""), true, None)
+                    }
+                    Some(Err(e)) => {
+                        is_transport_failure = true;
+                        let msg = e.to_string();
+                        (
+                            sse_response(
+                                id,
+                                Ok(json!({
+                                    "content": [{"type": "text", "text": msg.clone()}],
+                                    "isError": true
+                                })),
+                                "",
+                            ),
+                            false,
+                            Some(msg),
+                        )
+                    }
+                    None => match &state.personal_federation {
                     Some(client) => {
                         // MESH-07: propagate the resolved canonical
                         // `Principal` (not the raw `ClientIdentity`) so the
@@ -905,6 +964,7 @@ async fn handle_mcp(
                             Some(msg),
                         )
                     }
+                },
                 },
                 },
             };
@@ -1095,6 +1155,7 @@ mod tests {
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
+            broker_routes: crate::broker::routes::RouteTable::new(),
         })
     }
 
@@ -1237,6 +1298,7 @@ mod tests {
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
+            broker_routes: crate::broker::routes::RouteTable::new(),
         });
         let router = build_router(state);
         let (status, body, _) = post_mcp(
@@ -1306,6 +1368,7 @@ mod tests {
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
+            broker_routes: crate::broker::routes::RouteTable::new(),
         });
         let router = build_router(state);
         let (status, body, _) = post_mcp(
@@ -1354,6 +1417,7 @@ mod tests {
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
+            broker_routes: crate::broker::routes::RouteTable::new(),
         });
         let router = build_router(state);
         let req = Request::builder()
@@ -1382,6 +1446,7 @@ mod tests {
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
+            broker_routes: crate::broker::routes::RouteTable::new(),
         });
         let router = build_router(state);
         let req = Request::builder()
@@ -1566,6 +1631,7 @@ mod tests {
             gateway: Some(gateway),
             mesh_pool: None,
             principal_resolver,
+            broker_routes: crate::broker::routes::RouteTable::new(),
         })
     }
 
@@ -1737,6 +1803,7 @@ mod tests {
             gateway: Some(gateway),
             mesh_pool: Some(Arc::new(mesh_pool)),
             principal_resolver: PrincipalResolver::default(),
+            broker_routes: crate::broker::routes::RouteTable::new(),
         })
     }
 
