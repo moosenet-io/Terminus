@@ -41,14 +41,32 @@
 //!   transient graph build + CXEG-03 structural scoring (see `audit.rs`'s
 //!   `run_audit` and the "Tool: cortex_audit" section below).
 //!
-//! Net result: this module registers 11 tool NAMES total (the 10 from before
-//! CXEG-06, so no churn for callers listing them, plus `cortex_house_style`
-//! added live in **CXEG-06**). Of those, `cortex_scope` (CXEG-02),
-//! `cortex_review` (CXEG-04), `cortex_audit` (CXEG-11), and
-//! `cortex_house_style` (CXEG-06) are all real, live Atlas-backed tools; and
-//! the other 7 are pure deprecation aliases with no backend at all.
-//! `test_cortex_tools_registered` below asserts this shape (11 names
-//! present), not the old 10-live-relay-tools implementation.
+//! Net result: this module registers 12 tool NAMES total (the 10 from before
+//! CXEG-06, plus `cortex_house_style` added live in **CXEG-06**, plus
+//! `cortex_crystallize` added live in **CXEG-09**). Of those, `cortex_scope`
+//! (CXEG-02), `cortex_review` (CXEG-04), `cortex_audit` (CXEG-11),
+//! `cortex_house_style` (CXEG-06), and `cortex_crystallize` (CXEG-09) are all
+//! real, live Atlas-backed tools; and the other 7 are pure deprecation
+//! aliases with no backend at all. `test_cortex_tools_registered` below
+//! asserts this shape (12 names present), not the old 10-live-relay-tools
+//! implementation.
+//!
+//! ## CXEG-09: `cortex_crystallize` — recurrence + adversarial rule crystallization
+//!
+//! `src/cortex/crystallize.rs` closes the loop between KGFIND recurrence
+//! (`kg_findings`) and durable, enforced house-style guidance: a
+//! `category:consistency|elegance` finding that recurs at or above
+//! `crystallize_min_recurrence` AND survives an adversarial `review_run`
+//! `panel_majority` panel (each provider tries to REFUTE it; majority must
+//! FAIL to refute) graduates to either a Tier-A lint STUB (an inert
+//! scaffold under `src/house_style/`, never auto-wired live) or a prose
+//! house rule appended to `docs/house-style.md`. Dry-run by default; see
+//! `crystallize`'s module doc for the full convergence/degrade contract.
+//! Distinct from — and does not reuse the storage of — KGRULE-01..04's
+//! `kg_rules`/`kg_rule_crystallize`/`kg_rule_promote` (that loop mints
+//! generic enforcement-level rules across ANY category; this one is scoped
+//! specifically to consistency/elegance findings and always emits a
+//! CXEG-05-shaped artifact, never a `kg_rules` row).
 //!
 //! ## CXEG-06: `cortex_house_style` — Atlas-derived house-style exemplars
 //!
@@ -100,6 +118,7 @@ use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
 pub mod audit;
+pub mod crystallize;
 pub mod deprecated;
 pub mod house_style;
 pub mod metrics;
@@ -239,6 +258,16 @@ pub struct CortexConfig {
     /// is refused rather than building a graph over an oversized checkout.
     /// From `CORTEX_AUDIT_MAX_CLONE_BYTES`, default `200_000_000` (200MB).
     pub audit_max_clone_bytes: u64,
+    /// CXEG-09's `cortex_crystallize`: minimum KGFIND recurrence
+    /// (`occurrences`) a `category:consistency|elegance` finding must reach
+    /// before it is even considered a crystallization candidate (before the
+    /// adversarial promotion check runs). From
+    /// `CORTEX_CRYSTALLIZE_MIN_RECURRENCE`, default `3` (mirrors
+    /// `kg_rule_crystallize`'s `DEFAULT_MIN_OCCURRENCES` -- same order of
+    /// magnitude, deliberately a separate knob since this gates a distinct
+    /// artifact type, a lint stub or house-style doc rule, not a `kg_rules`
+    /// row).
+    pub crystallize_min_recurrence: i32,
 }
 
 impl CortexConfig {
@@ -262,6 +291,7 @@ impl CortexConfig {
             risk_band_elevated_cut: env_f64("CORTEX_RISK_BAND_ELEVATED_CUT", 4.0),
             audit_clone_timeout_secs: env_u64("CORTEX_AUDIT_CLONE_TIMEOUT_SECS", 60),
             audit_max_clone_bytes: env_u64("CORTEX_AUDIT_MAX_CLONE_BYTES", 200_000_000),
+            crystallize_min_recurrence: env_i32("CORTEX_CRYSTALLIZE_MIN_RECURRENCE", crystallize::DEFAULT_MIN_RECURRENCE),
         }
     }
 }
@@ -306,6 +336,18 @@ fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
+
+/// Read a non-secret positive `i32` tuning flag; falls back to `default` when
+/// unset, unparseable, or `<= 0` (mirrors [`env_usize`]'s zero-is-invalid
+/// convention -- a zero/negative recurrence threshold would accept every
+/// finding, never the intent of an unset/misconfigured value).
+fn env_i32(key: &str, default: i32) -> i32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(default)
 }
@@ -724,6 +766,10 @@ pub fn register(registry: &mut ToolRegistry) {
     }));
     let _ = registry.register(Box::new(CortexAudit { config }));
 
+    // CXEG-09: rule crystallization loop (kg_findings recurrence + adversarial
+    // review_run panel_majority promotion -> lint stub / prose house rule).
+    crystallize::register(registry);
+
     deprecated::register(registry);
 }
 
@@ -755,6 +801,7 @@ mod tests {
             risk_band_elevated_cut: 4.0,
             audit_clone_timeout_secs: 60,
             audit_max_clone_bytes: 200_000_000,
+            crystallize_min_recurrence: crystallize::DEFAULT_MIN_RECURRENCE,
         })
     }
 
@@ -1105,12 +1152,13 @@ mod tests {
         // cortex_house_style live since CXEG-06) + 7 deprecation aliases
         // = 11 names — the pre-CXEG-06 10-name surface plus CXEG-06's new
         // `cortex_house_style` (an intentional, additive MCP-listing change).
-        assert_eq!(registry.len(), 11);
+        assert_eq!(registry.len(), 12);
         for name in [
             "cortex_scope",
             "cortex_house_style",
             "cortex_review",
             "cortex_audit",
+            "cortex_crystallize",
             "cortex_stats",
             "cortex_build",
             "cortex_architecture",

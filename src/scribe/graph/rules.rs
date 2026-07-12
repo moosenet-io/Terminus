@@ -565,6 +565,7 @@ mod tests {
             first_seen: now,
             last_seen: now,
             occurrences,
+            crystallize_state: None,
         }
     }
 

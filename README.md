@@ -829,6 +829,9 @@ Its risk/elegance surface is rebuilt over the following S115 items:
   `scribe_kg_build` rebuild transparently invalidates every stale entry on
   next access. Degrades to `configured:false` (never an error) when the
   project has no stored Atlas graph yet.
+- `cortex_crystallize` — live as of **CXEG-09**: the rule crystallization
+  loop (`src/cortex/crystallize.rs`). See "Rule crystallization loop
+  (CXEG-09)" below for the full lifecycle.
 
 The seven retired graph-relay tools are kept only as zero-I/O **deprecation
 aliases** (`src/cortex/deprecated.rs`) that return a structured
@@ -837,6 +840,69 @@ equivalents: `cortex_stats`→`kg_stats`, `cortex_build`→`scribe_kg_build`,
 `cortex_deps`→`kg_neighbors`, `cortex_recent`→`kg_query`,
 `cortex_community`/`cortex_architecture`→`kg_communities`,
 `cortex_flows`→`kg_path`.
+
+### Rule crystallization loop (CXEG-09)
+
+`cortex_crystallize(project_id, min_recurrence?, apply?, providers?)`
+(`src/cortex/crystallize.rs`) closes the loop between KGFIND recurrence and
+durable, ENFORCED house-style guidance. A `category:consistency|elegance`
+finding in `kg_findings` graduates from "a reviewer noticed this a few
+times" to a standing rule only after two independent bars, never one alone:
+
+1. **Recurrence** — the finding's `occurrences` (queried via
+   `FindingsStore::list`, KGFIND's own query path — no parallel SQL) is at
+   or above `CortexConfig.crystallize_min_recurrence`
+   (`CORTEX_CRYSTALLIZE_MIN_RECURRENCE`, default `3`).
+2. **Adversarial promotion** — an in-process `review_run` call with
+   `structure="panel_majority"` (default a 3-provider panel: `codex`, `agy`,
+   `nemotron`; overridable via `providers`), whose `criteria` text
+   explicitly instructs every reviewer to try to REFUTE that the candidate
+   should become a durable, enforced rule — spurious, overfit to a handful
+   of findings, mere taste, already covered by an existing lint, or not
+   generalizable — and to DEFAULT to refuting (`VERDICT: REQUEST_CHANGES`)
+   when uncertain. Promotion requires a **complete** panel AND an aggregate
+   `APPROVE` (majority failed to refute); `review_run`'s own
+   `panel_majority` aggregation already fails safe to `REQUEST_CHANGES` on
+   any tie or split, so "uncertain" never accidentally promotes.
+
+A promoted candidate is then classified, deterministically and
+conservatively, by whether its description names a concrete, mechanically
+AST-checkable construct (`std::env::var`, `panic!`, `.unwrap()`, …):
+- **Lint-able** → an inert Markdown scaffold is appended to
+  `src/house_style/candidate_lint_stubs.md` (inside the CXEG-05 crate's own
+  directory, but never compiled or auto-wired) — a human still has to
+  confirm the pattern and hand-write the actual `Rule::` variant + `syn`
+  visitor logic before it's ever enforced.
+- **Everything else** → a prose house rule is appended to
+  `docs/house-style.md` under "Crystallized house rules (CXEG-09)".
+
+**Convergence.** `kg_findings` carries a `crystallize_state` column
+(`None` / `"promoted"` / `"refuted"`) that this loop is the sole writer of.
+A promoted or refuted finding is excluded from candidate selection on every
+later call — so a batch crystallization run terminates rather than
+re-arguing the same candidates forever. A candidate whose promotion panel
+comes back *incomplete* (a provider didn't answer) is left unmarked and
+stays eligible: a transient dispatch failure must never permanently and
+silently discard a candidate that was never actually argued.
+
+**Dry-run by default.** `apply` defaults to `false`: the tool lists
+candidates (with a `would_classify_as` preview) and writes/marks nothing.
+`apply:true` is required to actually dispatch the promotion panel and write
+an artifact — and if neither `REVIEW_DAEMON_TOKEN` nor `OPENROUTER_API_KEY`
+is configured at all, `apply` REFUSES outright (falls back to a dry
+listing) rather than ever crystallizing on recurrence alone.
+
+**Distinct from KGRULE.** `crate::scribe::graph::rules`
+(`kg_rule_crystallize`/`kg_rule_promote`, KGRULE-01..04) is a separate,
+more general crystallization loop: it mints enforcement-level `kg_rules`
+rows (`advisory`/`lint-candidate`/`blocking`) from recurring findings of
+ANY category, promoted via an `adversarial_pair` review, and its promoted
+rules feed back into `review_run`'s own prompt context (KGRULE-04). CXEG-09
+is scoped specifically to `consistency`/`elegance` findings and always
+emits a CXEG-05-shaped artifact (a lint stub or a house-style doc entry),
+never a `kg_rules` row — the two loops read from the same `kg_findings`
+corpus but write to different destinations and are not layered on top of
+each other.
 
 ### `review_run`'s Tier-C consistency/elegance lens (CXEG-07) — ADVISORY ONLY
 

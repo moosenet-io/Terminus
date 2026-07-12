@@ -100,6 +100,16 @@ pub struct FindingRow {
     pub first_seen: chrono::DateTime<chrono::Utc>,
     pub last_seen: chrono::DateTime<chrono::Utc>,
     pub occurrences: i32,
+    /// CXEG-09: crystallization-loop state for this finding — `None` (never
+    /// processed), `Some("promoted")` (survived adversarial promotion and
+    /// emitted a lint stub / prose rule), or `Some("refuted")` (a promotion
+    /// panel argued it should NOT become a standing rule). Read by
+    /// `crate::cortex::crystallize`'s candidate selection so a refuted (or
+    /// already-promoted) finding does not re-enter every crystallization
+    /// cycle — see that module's doc for the convergence contract. `None`
+    /// for every row written before this column existed (migration adds it
+    /// nullable, no backfill).
+    pub crystallize_state: Option<String>,
 }
 
 impl FindingRow {
@@ -120,6 +130,7 @@ impl FindingRow {
             first_seen: row.try_get("first_seen")?,
             last_seen: row.try_get("last_seen")?,
             occurrences: row.try_get("occurrences")?,
+            crystallize_state: row.try_get("crystallize_state")?,
         })
     }
 }
@@ -145,8 +156,25 @@ const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS kg_findings ( \
     provenance jsonb NOT NULL DEFAULT '[]'::jsonb, \
     first_seen timestamptz NOT NULL DEFAULT now(), \
     last_seen timestamptz NOT NULL DEFAULT now(), \
-    occurrences int NOT NULL DEFAULT 1 \
+    occurrences int NOT NULL DEFAULT 1, \
+    crystallize_state text \
 )";
+
+// CXEG-09: idempotent column add for a `kg_findings` table created before
+// `crystallize_state` existed -- `CREATE TABLE IF NOT EXISTS` above is a
+// no-op against an already-existing table, so an explicit `ADD COLUMN IF NOT
+// EXISTS` is the only way an upgrade actually gets the column. Nullable, no
+// default, no CHECK constraint (validated in Rust at the call site instead --
+// `ADD CONSTRAINT IF NOT EXISTS` is not supported by vanilla Postgres, so a
+// CHECK here would not be safely idempotent).
+const ADD_CRYSTALLIZE_STATE_COLUMN_SQL: &str =
+    "ALTER TABLE kg_findings ADD COLUMN IF NOT EXISTS crystallize_state text";
+
+/// CXEG-09: mark a finding's crystallization outcome. `state` must be
+/// `"promoted"` or `"refuted"` (validated here, not via a DB CHECK — see
+/// [`ADD_CRYSTALLIZE_STATE_COLUMN_SQL`]'s doc comment for why).
+const MARK_CRYSTALLIZE_STATE_SQL: &str =
+    "UPDATE kg_findings SET crystallize_state = $2 WHERE id = $1";
 
 const CREATE_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS kg_findings_bucket \
     ON kg_findings (project_id, scope_kind, scope_ref, category)";
@@ -340,7 +368,7 @@ impl FindingsStore {
     ) -> Result<Vec<FindingRow>, ToolError> {
         let mut sql = String::from(
             "SELECT id, project_id, category, severity, scope_kind, scope_ref, description, \
-             provenance, first_seen, last_seen, occurrences \
+             provenance, first_seen, last_seen, occurrences, crystallize_state \
              FROM kg_findings WHERE project_id = $1",
         );
 
@@ -379,6 +407,28 @@ impl FindingsStore {
             .map(FindingRow::from_row)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| ToolError::Database(format!("atlas findings store list decode: {e}")))
+    }
+
+    /// CXEG-09: record a finding's crystallization outcome (`"promoted"` or
+    /// `"refuted"`) so `crate::cortex::crystallize`'s candidate selection
+    /// never re-selects it — the convergence guarantee for the
+    /// crystallization loop. `state` is validated here rather than via a DB
+    /// CHECK constraint (see [`ADD_CRYSTALLIZE_STATE_COLUMN_SQL`]'s doc
+    /// comment). A no-op success (not an error) if `id` doesn't match any
+    /// row — mirrors this store's other best-effort update semantics.
+    pub async fn mark_crystallize_state(&self, id: Uuid, state: &str) -> Result<(), ToolError> {
+        if state != "promoted" && state != "refuted" {
+            return Err(ToolError::InvalidArgument(format!(
+                "crystallize_state must be 'promoted' or 'refuted', got '{state}'"
+            )));
+        }
+        sqlx::query(MARK_CRYSTALLIZE_STATE_SQL)
+            .bind(id)
+            .bind(state)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ToolError::Database(format!("atlas findings store mark crystallize state: {e}")))?;
+        Ok(())
     }
 }
 
@@ -531,6 +581,13 @@ async fn migrate_locked(conn: &mut sqlx::PgConnection) -> Result<(), ToolError> 
         .execute(&mut *conn)
         .await
         .map_err(|e| ToolError::Database(format!("create kg_findings table: {e}")))?;
+
+    // CXEG-09: idempotent upgrade for a table that pre-dates crystallize_state
+    // (CREATE TABLE IF NOT EXISTS above is a no-op on an existing table).
+    sqlx::query(ADD_CRYSTALLIZE_STATE_COLUMN_SQL)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| ToolError::Database(format!("add kg_findings.crystallize_state column: {e}")))?;
 
     sqlx::query(CREATE_INDEX_SQL)
         .execute(&mut *conn)
