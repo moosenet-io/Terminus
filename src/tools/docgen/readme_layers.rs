@@ -81,16 +81,31 @@
 use crate::scribe::vault::{render_note, NoteFrontmatter, NoteType};
 
 use super::config::DocTargetType;
+use super::diagram::default_architecture_mermaid_source;
 use super::render::{RenderContext, RenderedArtifact};
 
-/// A placeholder slot for the DOCGEN-11 architecture SVG. DOCGEN-11 builds
-/// concurrently with this item and owns the actual diagram renderer; this
-/// module only reserves the slot in the hero layer so the two items don't
-/// collide on the same region of the README. Kept as an HTML comment so it
-/// renders invisibly until DOCGEN-11 (or a later pass) replaces it with a
-/// real `![architecture](...)` embed.
-const ARCHITECTURE_SVG_PLACEHOLDER: &str =
-    "<!-- DOCGEN-11: architecture SVG slot -- replaced by the architecture-diagram renderer when available -->";
+/// Build the architecture slot's embed markdown for the hero layer.
+/// DOCGEN-22 (revision) replaces the original DOCGEN-11 HTML-comment
+/// placeholder (which rendered invisibly, since nothing ever replaced it --
+/// the module's own d2 raster path shells to a binary that isn't installed
+/// by default) with a REAL, rendering fenced ```mermaid `flowchart` block.
+/// This function has no per-call access to a project-specific generated
+/// diagram (`RenderContext` carries no diagram field -- that stays
+/// DOCGEN-11's/DOCGEN-22's concern), so it always renders the generic,
+/// always-valid default template
+/// ([`default_architecture_mermaid_source`]) -- itself swept through the
+/// DOCGEN-02 PII gate before ever reaching this string, so a module label
+/// carrying an internal hostname never leaks into the README. Falls back to
+/// a minimal static fence in the (practically unreachable) case the sweep
+/// fully blocks the label -- this function must never panic, never emit an
+/// HTML comment, and never emit a broken `<img>`.
+fn architecture_slot(module: &str) -> String {
+    const STATIC_FALLBACK: &str = "```mermaid\nflowchart LR\n    A[Client] --> B[Core]\n```";
+    match default_architecture_mermaid_source(module) {
+        Ok(source) => super::diagram::mermaid_fence(&source).unwrap_or_else(|_| STATIC_FALLBACK.to_string()),
+        Err(_) => STATIC_FALLBACK.to_string(),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Diátaxis mode
@@ -301,10 +316,10 @@ fn split_hero(hero: &str) -> (String, String) {
 }
 
 /// Build the layered README body (everything `render_note` wraps in
-/// frontmatter): badges -> one-liner -> architecture SVG slot -> table of
-/// contents -> standard-readme-ordered sections (Background / Install /
-/// Usage / API / Contributing / License), with Usage sourced from the
-/// quickstart layer and API sourced from the deep-dive layer -- the
+/// frontmatter): badges -> one-liner -> architecture mermaid diagram ->
+/// table of contents -> standard-readme-ordered sections (Background /
+/// Install / Usage / API / Contributing / License), with Usage sourced from
+/// the quickstart layer and API sourced from the deep-dive layer -- the
 /// progressive-disclosure mapping this item exists to add.
 fn build_layered_body(ctx: &RenderContext<'_>, layers: &ParsedLayers) -> String {
     let (mut one_liner, background) = split_hero(&layers.hero);
@@ -319,7 +334,7 @@ fn build_layered_body(ctx: &RenderContext<'_>, layers: &ParsedLayers) -> String 
     out.push_str("\n\n> ");
     out.push_str(&one_liner);
     out.push_str("\n\n");
-    out.push_str(ARCHITECTURE_SVG_PLACEHOLDER);
+    out.push_str(&architecture_slot(ctx.module));
     out.push_str(
         "\n\n## Table of Contents\n\n\
 - [Background](#background)\n\
@@ -510,13 +525,27 @@ mod tests {
         assert!(content.contains("build-passing"));
     }
 
-    // ── Architecture SVG placeholder slot ───────────────────────────────
+    // ── DOCGEN-22: architecture slot is a real rendering mermaid block ──
 
     #[test]
-    fn layered_readme_reserves_architecture_svg_slot() {
+    fn layered_readme_architecture_slot_is_a_rendering_mermaid_fence_not_a_placeholder() {
         let artifact = render_layered_readme(&ctx(SAMPLE), None);
         let content = artifact.content.unwrap();
-        assert!(content.contains("DOCGEN-11: architecture SVG slot"));
+        assert!(content.contains("```mermaid\n"), "expected a fenced mermaid block: {content}");
+        assert!(content.contains("flowchart"), "expected a flowchart diagram type: {content}");
+        // Never the old invisible HTML-comment placeholder.
+        assert!(!content.contains("<!--"), "must not fall back to an HTML-comment placeholder: {content}");
+        // Never a broken/sanitized <img> embed -- the whole point of this revision.
+        assert!(!content.contains("<img"), "must never embed via <img>: {content}");
+    }
+
+    #[test]
+    fn layered_readme_architecture_slot_carries_the_module_name() {
+        let artifact = render_layered_readme(&ctx(SAMPLE), None);
+        let content = artifact.content.unwrap();
+        // ctx() uses module "src/widget" -- the default template labels the
+        // diagram with the module it's for.
+        assert!(content.contains("src/widget"), "expected the module name in the diagram: {content}");
     }
 
     // ── Deepen-not-regenerate, per layer (before/after fixture) ─────────
