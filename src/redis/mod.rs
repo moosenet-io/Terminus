@@ -263,17 +263,26 @@ impl RedisBackend {
     }
 
     /// A timeout-bounded round-trip for a namespaced consumer. `f` receives a
-    /// pooled connection; the whole op is bounded by [`RedisBackend::timeout`].
-    /// `Err(())` means "unreachable / timed out / failed" — the caller degrades.
+    /// pooled connection; **both the connection acquisition AND the op** are
+    /// bounded by [`RedisBackend::timeout`] — a hung connect can never block
+    /// past the deadline, so a Redis-unreachable condition always degrades
+    /// within the op timeout (the fail-open/fail-closed edge cases all rely on
+    /// this bound). `Err(())` means "unreachable / timed out / failed" — the
+    /// caller degrades.
     pub async fn with_conn<T, F, Fut>(&self, ns: Namespace, f: F) -> Result<T, ()>
     where
         F: FnOnce(ConnectionManager) -> Fut,
         Fut: std::future::Future<Output = ::redis::RedisResult<T>>,
     {
-        let conn = self.conn(ns).await.ok_or(())?;
-        match tokio::time::timeout(self.op_timeout, f(conn)).await {
-            Ok(Ok(v)) => Ok(v),
-            _ => Err(()),
+        let op = async {
+            // Connection resolution (which itself may hang against a dead Redis)
+            // is INSIDE the timeout below.
+            let conn = self.conn(ns).await.ok_or(())?;
+            f(conn).await.map_err(|_| ())
+        };
+        match tokio::time::timeout(self.op_timeout, op).await {
+            Ok(res) => res,
+            Err(_) => Err(()),
         }
     }
 
