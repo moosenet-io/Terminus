@@ -48,6 +48,11 @@ use serde_json::{json, Value};
 
 use crate::error::ToolError;
 use crate::registry::ToolRegistry;
+use crate::scribe::graph::findings_store::{FindingsStore, NewFinding, RecordOutcome, ScopeKind};
+use crate::scribe::graph::model::KnowledgeGraph;
+use crate::scribe::graph::store::GraphStore;
+use crate::scribe::graph::vec_embed::EmbedClient;
+use crate::scribe::ScribeConfig;
 use crate::tool::RustTool;
 
 pub use aggregate::{aggregate, Finding, ProviderResult};
@@ -200,6 +205,170 @@ async fn maybe_scribe_docs(aggregate_verdict: &str, complete: bool, context: &Va
             json!({"ran": true, "ok": false, "error": e.to_string()})
         }
     }
+}
+
+// ── KGFIND-03: capture-only findings recording ─────────────────────────────
+
+/// Normalize a finding description for cross-provider dedup: collapse
+/// whitespace, lowercase, and cap to a short prefix so two reviewers'
+/// near-identical phrasing of the same issue still collide on the same key.
+/// Pure, no I/O.
+fn normalize_desc_prefix(s: &str) -> String {
+    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    let trimmed = collapsed.trim_end_matches(['.', '!', '?']);
+    trimmed.chars().take(80).collect()
+}
+
+/// KGFIND-03: collapse findings that are the same issue reported by more than
+/// one provider -- same `(category, file, symbol)` plus a near-identical
+/// description prefix -- into one, keeping the first occurrence (in provider
+/// order). Pure, fully unit-testable without a store or a graph.
+fn dedup_across_providers(results: &[ProviderResult]) -> Vec<Finding> {
+    let mut seen: HashSet<(String, Option<String>, Option<String>, String)> = HashSet::new();
+    let mut out = Vec::new();
+    for r in results {
+        for f in &r.findings {
+            let key = (
+                f.category.clone(),
+                f.file.clone(),
+                f.symbol.clone(),
+                normalize_desc_prefix(&f.description),
+            );
+            if seen.insert(key) {
+                out.push(f.clone());
+            }
+        }
+    }
+    out
+}
+
+/// KGFIND-03: resolve the KG scope a finding concerns. Prefers an exact node
+/// match by id, then by name among the graph's currently-valid nodes; falls
+/// back to the finding's file (path scope), then the project itself (global
+/// scope). `graph` is `None` when no store/graph is available for the
+/// project -- symbol findings then fall back to path/global just like a
+/// finding with no symbol at all. Pure, no I/O.
+fn resolve_scope(finding: &Finding, graph: Option<&KnowledgeGraph>, project_id: &str) -> (ScopeKind, String) {
+    if let Some(symbol) = finding.symbol.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(g) = graph {
+            if let Some(node) = g.get_node(symbol) {
+                return (ScopeKind::Node, node.id.clone());
+            }
+            if let Some(node) = g.current_nodes().find(|n| n.name == symbol) {
+                return (ScopeKind::Node, node.id.clone());
+            }
+        }
+    }
+    if let Some(file) = finding.file.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return (ScopeKind::Path, file.to_string());
+    }
+    (ScopeKind::Global, project_id.to_string())
+}
+
+/// Build a single finding's provenance entry from the review `context` plus
+/// the aggregate verdict and the set of reviewing providers -- `pr`,
+/// `review` (falling back to `spec_id`), and `git_ref` are carried through
+/// when present; anything absent from `context` is simply omitted rather
+/// than stored as null.
+fn build_finding_provenance(context: &Value, verdict: &str, providers: &[String]) -> Value {
+    let mut obj = serde_json::Map::new();
+    if let Some(pr) = context.get("pr") {
+        obj.insert("pr".to_string(), pr.clone());
+    }
+    if let Some(review) = context.get("review") {
+        obj.insert("review".to_string(), review.clone());
+    } else if let Some(spec_id) = context.get("spec_id") {
+        obj.insert("spec_id".to_string(), spec_id.clone());
+    }
+    if let Some(git_ref) = context.get("git_ref") {
+        obj.insert("git_ref".to_string(), git_ref.clone());
+    }
+    obj.insert("verdict".to_string(), json!(verdict));
+    obj.insert("providers".to_string(), json!(providers));
+    obj.insert("recorded_at".to_string(), json!(chrono::Utc::now().to_rfc3339()));
+    Value::Object(obj)
+}
+
+/// KGFIND-03 post-aggregate hook: record the providers' structured findings
+/// onto the Atlas KG findings store, anchored to scope, deduped across
+/// providers and (best-effort) semantically deduped by the store itself.
+/// Fires on ANY verdict -- findings matter most on `REQUEST_CHANGES` -- unlike
+/// [`maybe_rebuild`]/[`maybe_scribe_docs`], which only run on a clean
+/// `APPROVE`. CAPTURE ONLY: never mints a rule, never promotes, never blocks;
+/// always returns a `findings_recorded` value to merge into the tool result,
+/// and never propagates a store/embedding error (a findings failure must
+/// never change the verdict or fail the review call).
+///
+/// `context` is expected to already carry a `"verdict"` field (the caller
+/// stamps this in just before invoking the hook, mirroring how
+/// `kg_context::inject` stamps `"knowledge_graph"` in-place) -- this keeps the
+/// function's signature `(results, context)` while still giving provenance
+/// access to the aggregate verdict.
+async fn maybe_record_findings(results: &[ProviderResult], context: &Value) -> Value {
+    let Some(project_id) = context.get("project_id").and_then(|v| v.as_str()).map(|s| s.to_string()) else {
+        return json!({"recorded": false, "reason": "no project_id"});
+    };
+
+    let deduped = dedup_across_providers(results);
+    if deduped.is_empty() {
+        return json!({"recorded": false, "reason": "no findings"});
+    }
+
+    let store = match FindingsStore::from_env().await {
+        Ok(s) => s,
+        Err(e) => {
+            return json!({"recorded": false, "reason": format!("findings store unavailable: {e}")});
+        }
+    };
+
+    // Best-effort graph load for scope resolution -- absence (no store, no
+    // graph for this project) just means symbol findings fall back to
+    // path/global scope rather than node scope; never a hard failure.
+    let graph = GraphStore::from_config(&ScribeConfig::from_env()).load(&project_id).ok().flatten();
+
+    let embed_client = EmbedClient::from_env();
+    let verdict = context.get("verdict").and_then(|v| v.as_str()).unwrap_or("UNKNOWN").to_string();
+    let providers: Vec<String> = results.iter().map(|r| r.provider.clone()).collect();
+
+    let mut created = 0u32;
+    let mut recurred = 0u32;
+    let mut errors = 0u32;
+
+    for finding in &deduped {
+        let (scope_kind, scope_ref) = resolve_scope(finding, graph.as_ref(), &project_id);
+
+        // Best-effort embedding: on failure, record with no embedding so the
+        // store falls back to exact-text dedup rather than losing the finding.
+        let embedding = match embed_client.embed(&finding.description).await {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("KGFIND-03: embed failed for a finding, recording without embedding: {e}");
+                None
+            }
+        };
+
+        let provenance = build_finding_provenance(context, &verdict, &providers);
+        let new_finding = NewFinding {
+            project_id: project_id.clone(),
+            category: finding.category.clone(),
+            severity: finding.severity.clone(),
+            scope_kind,
+            scope_ref,
+            description: finding.description.clone(),
+            provenance,
+        };
+
+        match store.record(new_finding, embedding).await {
+            Ok(RecordOutcome::Created(_)) => created += 1,
+            Ok(RecordOutcome::Recurred { .. }) => recurred += 1,
+            Err(e) => {
+                tracing::warn!("KGFIND-03: failed to record a finding for '{project_id}': {e}");
+                errors += 1;
+            }
+        }
+    }
+
+    json!({"recorded": true, "created": created, "recurred": recurred, "errors": errors})
 }
 
 pub struct ReviewRun;
@@ -449,6 +618,19 @@ than failing the whole call."
         // see `maybe_scribe_docs` for the gating/S9 rationale.
         let scribe_docs = maybe_scribe_docs(&aggregate_verdict, complete, &context).await;
 
+        // KGFIND-03: best-effort, capture-only recording of structured
+        // findings onto the Atlas KG findings store. Unlike the two hooks
+        // above, this fires on ANY verdict (not just APPROVE) -- findings
+        // matter most on REQUEST_CHANGES. Stamp the verdict into a context
+        // copy so `maybe_record_findings` can attach it to provenance without
+        // widening its `(results, context)` signature. Never affects the
+        // verdict or errors the call.
+        let mut findings_context = context.clone();
+        if let Value::Object(map) = &mut findings_context {
+            map.insert("verdict".to_string(), json!(aggregate_verdict));
+        }
+        let findings_recorded = maybe_record_findings(&results, &findings_context).await;
+
         Ok(json!({
             "structure": args["structure"],
             "providers": results,
@@ -456,6 +638,7 @@ than failing the whole call."
             "complete": complete,
             "kg_rebuild": kg_rebuild,
             "scribe_docs": scribe_docs,
+            "findings_recorded": findings_recorded,
         })
         .to_string())
     }
@@ -727,5 +910,192 @@ mod tests {
 
         let scribe_docs = maybe_scribe_docs("UNKNOWN", false, &context).await;
         assert_eq!(scribe_docs["ran"], false, "{scribe_docs}");
+    }
+
+    // ── KGFIND-03: cross-provider dedup + scope resolution (pure) ──────────
+
+    fn finding(category: &str, file: Option<&str>, symbol: Option<&str>, description: &str) -> Finding {
+        Finding {
+            category: category.to_string(),
+            severity: "medium".to_string(),
+            file: file.map(str::to_string),
+            symbol: symbol.map(str::to_string),
+            description: description.to_string(),
+        }
+    }
+
+    fn provider_with(provider: &str, findings: Vec<Finding>) -> ProviderResult {
+        ProviderResult {
+            provider: provider.to_string(),
+            verdict: "REQUEST_CHANGES".to_string(),
+            reasoning: String::new(),
+            error: None,
+            findings,
+        }
+    }
+
+    #[test]
+    fn dedup_across_providers_collapses_same_issue_from_two_providers() {
+        let results = vec![
+            provider_with(
+                "opus",
+                vec![finding("bug", Some("src/a.rs"), Some("crate::a::foo"), "off-by-one error in loop bound")],
+            ),
+            provider_with(
+                "codex",
+                vec![finding(
+                    "bug",
+                    Some("src/a.rs"),
+                    Some("crate::a::foo"),
+                    "Off-by-one error in loop bound.",
+                )],
+            ),
+        ];
+        let deduped = dedup_across_providers(&results);
+        assert_eq!(deduped.len(), 1, "{deduped:?}");
+        assert_eq!(deduped[0].description, "off-by-one error in loop bound");
+    }
+
+    #[test]
+    fn dedup_across_providers_keeps_distinct_issues_separate() {
+        let results = vec![
+            provider_with("opus", vec![finding("bug", Some("src/a.rs"), Some("crate::a::foo"), "off-by-one")]),
+            provider_with(
+                "codex",
+                vec![finding("style", Some("src/b.rs"), Some("crate::b::Bar"), "missing doc comment")],
+            ),
+        ];
+        let deduped = dedup_across_providers(&results);
+        assert_eq!(deduped.len(), 2, "{deduped:?}");
+    }
+
+    #[test]
+    fn dedup_across_providers_empty_when_no_findings() {
+        let results = vec![provider_with("opus", vec![]), provider_with("codex", vec![])];
+        assert!(dedup_across_providers(&results).is_empty());
+    }
+
+    fn graph_with_node() -> KnowledgeGraph {
+        use crate::scribe::graph::model::{KgNode, NodeKind};
+        let mut g = KnowledgeGraph::new("TERM");
+        g.insert_node(KgNode::new("crate::a::foo", NodeKind::Function, "foo", "src/a.rs"));
+        g
+    }
+
+    #[test]
+    fn resolve_scope_symbol_matching_node_id_is_node_scope() {
+        let g = graph_with_node();
+        let f = finding("bug", Some("src/a.rs"), Some("crate::a::foo"), "d");
+        let (kind, ref_) = resolve_scope(&f, Some(&g), "TERM");
+        assert_eq!(kind, ScopeKind::Node);
+        assert_eq!(ref_, "crate::a::foo");
+    }
+
+    #[test]
+    fn resolve_scope_symbol_matching_node_name_is_node_scope() {
+        let g = graph_with_node();
+        let f = finding("bug", Some("src/a.rs"), Some("foo"), "d");
+        let (kind, ref_) = resolve_scope(&f, Some(&g), "TERM");
+        assert_eq!(kind, ScopeKind::Node);
+        assert_eq!(ref_, "crate::a::foo");
+    }
+
+    #[test]
+    fn resolve_scope_symbol_not_in_graph_falls_back_to_path() {
+        let g = graph_with_node();
+        let f = finding("bug", Some("src/z.rs"), Some("crate::z::nope"), "d");
+        let (kind, ref_) = resolve_scope(&f, Some(&g), "TERM");
+        assert_eq!(kind, ScopeKind::Path);
+        assert_eq!(ref_, "src/z.rs");
+    }
+
+    #[test]
+    fn resolve_scope_symbol_not_in_graph_no_file_falls_back_to_global() {
+        let g = graph_with_node();
+        let f = finding("bug", None, Some("crate::z::nope"), "d");
+        let (kind, ref_) = resolve_scope(&f, Some(&g), "TERM");
+        assert_eq!(kind, ScopeKind::Global);
+        assert_eq!(ref_, "TERM");
+    }
+
+    #[test]
+    fn resolve_scope_no_symbol_but_file_is_path_scope() {
+        let f = finding("bug", Some("src/a.rs"), None, "d");
+        let (kind, ref_) = resolve_scope(&f, None, "TERM");
+        assert_eq!(kind, ScopeKind::Path);
+        assert_eq!(ref_, "src/a.rs");
+    }
+
+    #[test]
+    fn resolve_scope_neither_symbol_nor_file_is_global_scope() {
+        let f = finding("bug", None, None, "d");
+        let (kind, ref_) = resolve_scope(&f, None, "TERM");
+        assert_eq!(kind, ScopeKind::Global);
+        assert_eq!(ref_, "TERM");
+    }
+
+    #[test]
+    fn resolve_scope_no_graph_available_symbol_falls_back_to_path() {
+        let f = finding("bug", Some("src/a.rs"), Some("crate::a::foo"), "d");
+        let (kind, ref_) = resolve_scope(&f, None, "TERM");
+        assert_eq!(kind, ScopeKind::Path);
+        assert_eq!(ref_, "src/a.rs");
+    }
+
+    // ── KGFIND-03: maybe_record_findings hook (capture-only, non-blocking) ─
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn maybe_record_findings_no_project_id_is_noop() {
+        let results = vec![provider_with("opus", vec![finding("bug", Some("src/a.rs"), None, "d")])];
+        let context = json!({"diff": "+ fn x() {}"});
+        let out = maybe_record_findings(&results, &context).await;
+        assert_eq!(out["recorded"], false, "{out}");
+        assert_eq!(out["reason"], "no project_id", "{out}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn maybe_record_findings_no_findings_at_all_is_noop() {
+        let results = vec![provider_with("opus", vec![]), provider_with("codex", vec![])];
+        let context = json!({"project_id": "TERM"});
+        let out = maybe_record_findings(&results, &context).await;
+        assert_eq!(out["recorded"], false, "{out}");
+        assert_eq!(out["reason"], "no findings", "{out}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn maybe_record_findings_project_and_findings_but_store_unset_is_noop() {
+        // Mirrors the NotConfigured-skip pattern used elsewhere in this
+        // workspace: never attempt a live DB connection from a unit test --
+        // if a real DSN happens to be configured in this process, skip.
+        if std::env::var("ATLAS_DATABASE_URL").is_ok() {
+            return;
+        }
+        let results = vec![provider_with(
+            "opus",
+            vec![finding("bug", Some("src/a.rs"), None, "off-by-one in loop bound")],
+        )];
+        let context = json!({"project_id": "TERM", "verdict": "REQUEST_CHANGES"});
+        let out = maybe_record_findings(&results, &context).await;
+        assert_eq!(out["recorded"], false, "{out}");
+
+        // The review's own verdict handling is entirely untouched by this
+        // hook -- confirmed by exercising the full `execute()` path with the
+        // same context shape and no daemon/OpenRouter config: the call stays
+        // `Ok` end-to-end with `findings_recorded` always present.
+        std::env::remove_var("REVIEW_DAEMON_TOKEN");
+        std::env::remove_var("OPENROUTER_API_KEY");
+        let args = json!({
+            "structure": "single",
+            "providers": ["opus"],
+            "criteria": "x",
+            "context": {"project_id": "TERM", "diff": "+ fn x() {}"}
+        });
+        let out = tool().execute(args).await.unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed["findings_recorded"].is_object(), "{parsed}");
+        assert!(parsed["aggregate_verdict"].is_string(), "{parsed}");
     }
 }
