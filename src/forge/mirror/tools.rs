@@ -84,7 +84,7 @@ use super::history::{
     set_pushed_sha, IdentityMap, ReplayOpts,
 };
 use super::pr_replay::{replay_pr, PrReplayConfig};
-use crate::forge::registry::ForgeRegistry;
+use crate::forge::registry::{ForgePool, ForgeRegistry};
 use super::workdir::{assert_never_force, run_git, MirrorWorkDir, WORKDIR_ROOT_ENV};
 
 /// Environment variable holding the target GitHub mirror remote URL when a call
@@ -1841,12 +1841,16 @@ impl RustTool for GitPublicMirrorReplayPr {
         let remote = resolve_remote(&args, repo)?;
         let opt_str = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_string);
         let public_provider = opt_str("public_provider");
-        // Resolve the PUBLIC git-transport credential through the provider-agnostic
-        // mirror-token seam (github wired today; a GitLab/Codeberg public destination
-        // supplies its own token here, or a clean NotConfigured) — never a hardcoded
-        // GitHub credential in the provider-agnostic replay path.
-        let transport_token =
-            mirror_provider_token(public_provider.as_deref().unwrap_or("github"))?;
+        // Resolve the PUBLIC pool's ACTUAL provider (explicit arg, else the pool's
+        // configured default — which may be gitlab/codeberg, NOT necessarily github),
+        // then resolve its git-transport credential through the provider-agnostic
+        // mirror-token seam. No hardcoded GitHub default in the provider-agnostic path.
+        let reg = ForgeRegistry::from_env();
+        let public_provider_id = reg
+            .resolve(ForgePool::Public, public_provider.as_deref())?
+            .id()
+            .to_string();
+        let transport_token = mirror_provider_token(&public_provider_id)?;
         let cfg = PrReplayConfig {
             repo: repo.to_string(),
             source,
@@ -1863,7 +1867,6 @@ impl RustTool for GitPublicMirrorReplayPr {
             transport_token,
         };
 
-        let reg = ForgeRegistry::from_env();
         let outcome = replay_pr(&reg, &cfg, internal_pr).await?;
         serde_json::to_string(&outcome)
             .map_err(|e| ToolError::Execution(format!("serialize outcome: {e}")))

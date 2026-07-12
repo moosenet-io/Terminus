@@ -482,6 +482,74 @@ pub fn replay_incremental_or_full(
     }
 }
 
+// ── GHIST-05: transactional canonical-lineage snapshot / restore ─────────────
+
+/// A snapshot of the canonical scrubbed lineage's mutable state — the marks files,
+/// the internal/pushed head markers, and the checked-out branch tip. Used to make a
+/// PR replay TRANSACTIONAL: if any public write (push / PR create / comment / merge)
+/// fails after the local replay advanced the lineage, [`restore_canonical`] rolls it
+/// back exactly so a retry starts clean instead of finding the lineage wedged past an
+/// unpublished PR.
+#[derive(Debug, Clone)]
+pub struct CanonicalSnapshot {
+    branch: String,
+    commit: String,
+    /// `(path, Some(bytes))` = file existed with these bytes; `(path, None)` = absent.
+    files: Vec<(PathBuf, Option<Vec<u8>>)>,
+}
+
+fn ghist_state_files(work_dir: &Path) -> Vec<PathBuf> {
+    let d = work_dir.join(".git").join("ghist");
+    ["src-marks", "import-marks", "internal-head", "pushed-head"]
+        .iter()
+        .map(|f| d.join(f))
+        .collect()
+}
+
+/// Capture the canonical lineage's mutable state before a PR replay.
+pub fn snapshot_canonical(work_dir: &Path) -> Result<CanonicalSnapshot, ToolError> {
+    let branch = git_capture(work_dir, &["symbolic-ref", "--short", "HEAD"])?.trim().to_string();
+    let commit = git_capture(work_dir, &["rev-parse", "HEAD"])?.trim().to_string();
+    let files = ghist_state_files(work_dir)
+        .into_iter()
+        .map(|p| {
+            let bytes = std::fs::read(&p).ok();
+            (p, bytes)
+        })
+        .collect();
+    Ok(CanonicalSnapshot { branch, commit, files })
+}
+
+/// Roll the canonical lineage back to a [`snapshot_canonical`] state: restore every
+/// marks/head file byte-for-byte (or remove it if it was absent), delete any leftover
+/// PR feature branch, and hard-reset the canonical branch to its snapshot commit.
+pub fn restore_canonical(
+    work_dir: &Path,
+    snap: &CanonicalSnapshot,
+    pr_branch: &str,
+) -> Result<(), ToolError> {
+    for (path, bytes) in &snap.files {
+        match bytes {
+            Some(b) => {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                std::fs::write(path, b)
+                    .map_err(|e| ToolError::Execution(format!("restore {}: {e}", path.display())))?;
+            }
+            None => {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+    // Get back onto the canonical branch and hard-reset it to the snapshot commit.
+    git_capture(work_dir, &["checkout", "-f", &snap.branch])?;
+    git_capture(work_dir, &["reset", "--hard", &snap.commit])?;
+    // Drop the (partial) PR feature branch if it was created.
+    let _ = git_capture(work_dir, &["branch", "-D", pr_branch]);
+    Ok(())
+}
+
 // ── GHIST-05: per-PR scrubbed feature-branch replay ──────────────────────────
 
 /// One PR's scrubbed feature branch, produced by [`replay_pr_slice`].
@@ -1190,6 +1258,50 @@ mod tests {
         let err = replay_pr_slice(&src, &wd, &c2, &c2, &divergent, "pr-mirror/3", &opts);
         assert!(err.is_err(), "must refuse a divergent public base: {err:?}");
         assert!(format!("{err:?}").contains("diverged"), "{err:?}");
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    // ── GHIST-05: snapshot → advance → restore rolls the canonical lineage back ──
+    #[test]
+    fn snapshot_restore_rolls_back_canonical_lineage() {
+        let src = unique("snapsrc");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q", "-b", "main"]);
+        write(&src, "a.txt", b"one\n");
+        commit_all(&src, "C1");
+        let c1 = git(&src, &["rev-parse", "HEAD"]).trim().to_string();
+
+        let wd = unique("snapwd");
+        let opts = ReplayOpts::with_author_map(bot_map());
+        replay_full_history(&src, &wd, &opts).unwrap(); // canonical at scrubbed(C1)
+
+        let snap = snapshot_canonical(&wd).unwrap();
+        let before_head = git(&wd, &["rev-parse", "HEAD"]).trim().to_string();
+        let before_mirrored = last_mirrored_sha(&wd);
+        assert_eq!(before_mirrored.as_deref(), Some(c1.as_str()));
+
+        // Advance the canonical lineage over a new commit (simulating a PR replay that
+        // then fails to publish), and drop a leftover PR branch.
+        write(&src, "b.txt", b"two\n");
+        commit_all(&src, "C2");
+        let c2 = git(&src, &["rev-parse", "HEAD"]).trim().to_string();
+        replay_range(&src, &wd, &c1, &c2, &opts).unwrap();
+        git(&wd, &["branch", "-f", "pr-mirror/1", "HEAD"]);
+        assert_ne!(git(&wd, &["rev-parse", "HEAD"]).trim(), before_head, "canonical advanced");
+
+        // Roll back — canonical returns to the snapshot, the PR branch is gone.
+        restore_canonical(&wd, &snap, "pr-mirror/1").unwrap();
+        assert_eq!(git(&wd, &["rev-parse", "HEAD"]).trim(), before_head, "HEAD restored");
+        assert_eq!(last_mirrored_sha(&wd).as_deref(), Some(c1.as_str()), "internal-head restored");
+        let branches = git(&wd, &["branch", "-l", "pr-mirror/1"]);
+        assert!(branches.trim().is_empty(), "leftover PR branch deleted");
+
+        // Marks restored: replaying the same range again re-advances identically (i.e.
+        // the marks were rolled back, not left stale so the commits get skipped).
+        replay_range(&src, &wd, &c1, &c2, &opts).unwrap();
+        assert_eq!(last_mirrored_sha(&wd).as_deref(), Some(c2.as_str()), "re-replay works after restore");
 
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&wd);

@@ -37,7 +37,10 @@ use crate::forge::capability::ForgeEndpoint;
 use crate::forge::provider::ForgeRequest;
 use crate::forge::registry::{ForgePool, ForgeRegistry};
 
-use super::history::{last_pushed_sha, replay_pr_slice, set_pushed_sha, IdentityMap, ReplayOpts};
+use super::history::{
+    last_mirrored_sha, replay_pr_slice, restore_canonical, set_pushed_sha, snapshot_canonical,
+    IdentityMap, ReplayOpts,
+};
 use super::native_clean::DeterministicCleaner;
 
 const HOOKS_OFF: &[&str] = &["-c", "core.hooksPath=/dev/null"];
@@ -203,21 +206,6 @@ fn remote_branch_exists(work_dir: &Path, remote: &str, branch: &str, token: &str
 // state=="merged"). These read either shape so the orchestration is truly
 // provider-agnostic, not gitea/github-only.
 
-fn pr_base_sha(pr: &Value) -> Option<String> {
-    pr.pointer("/base/sha")
-        .and_then(Value::as_str)
-        .or_else(|| pr.pointer("/diff_refs/base_sha").and_then(Value::as_str))
-        .map(String::from)
-}
-
-fn pr_head_sha(pr: &Value) -> Option<String> {
-    pr.pointer("/head/sha")
-        .and_then(Value::as_str)
-        .or_else(|| pr.pointer("/diff_refs/head_sha").and_then(Value::as_str))
-        .or_else(|| pr.get("sha").and_then(Value::as_str))
-        .map(String::from)
-}
-
 fn pr_is_merged(pr: &Value) -> bool {
     pr.get("merged").and_then(Value::as_bool).unwrap_or(false)
         || pr.get("state").and_then(Value::as_str) == Some("merged")
@@ -229,6 +217,17 @@ fn pr_number(created: &Value) -> Option<u64> {
         .get("number")
         .and_then(Value::as_u64)
         .or_else(|| created.get("iid").and_then(Value::as_u64))
+}
+
+/// The internal commit this PR's merge landed at — the internal-main tip after the
+/// merge. gitea/github: `merge_commit_sha`; gitlab MR: `merge_commit_sha` or `sha`.
+fn pr_merge_commit(pr: &Value) -> Option<String> {
+    pr.get("merge_commit_sha")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| pr.get("merged_commit_sha").and_then(Value::as_str))
+        .or_else(|| pr.get("sha").and_then(Value::as_str))
+        .map(String::from)
 }
 
 /// True if a remote URL embeds userinfo (`scheme://user[:pass]@host`). A `file://`
@@ -334,25 +333,22 @@ pub async fn replay_pr(
         base_outcome.note = "internal PR is not merged — nothing to replay yet".into();
         return Ok(base_outcome);
     }
-    let base_ref =
-        pr_base_sha(&pr).ok_or_else(|| ToolError::Execution("internal PR has no base sha".into()))?;
-    let head_sha =
-        pr_head_sha(&pr).ok_or_else(|| ToolError::Execution("internal PR has no head sha".into()))?;
-    // The PR object's `base.sha` is the base BRANCH tip, which — for an already-merged
-    // PR — already contains the PR. The true pre-PR fork point is the merge-base of the
-    // base branch and the PR head; replaying base_sha..head_sha from that point yields
-    // exactly the PR's own commits. (Assumes the internal merge preserved the head
-    // commits — i.e. a merge/rebase, not a squash that discards them; a squash makes
-    // the head unreachable and merge-base fails with a clear error.)
-    let base_sha = git(&cfg.source, &["merge-base", &base_ref, &head_sha])
-        .map_err(|e| {
-            ToolError::Execution(format!(
-                "cannot resolve the PR fork point (merge-base of base {base_ref} and head \
-                 {head_sha}) in the source — the PR head may be unreachable (squash-merged?): {e}"
-            ))
-        })?
-        .trim()
-        .to_string();
+    // The replay range is the internal commits this PR ADDED to internal main:
+    // base_int = the canonical scrubbed lineage's current internal position
+    // (last_mirrored_sha — i.e. internal main just BEFORE this PR), and head_int = the
+    // PR's merge commit (internal main just AFTER it). base_int..head_int is exactly the
+    // PR's commits (+ its merge commit). This auto-satisfies replay_pr_slice's order
+    // guard (base_int == last_mirrored) and ff guard (head_int descends from base_int),
+    // and — unlike the PR object's base.sha (the post-merge base-branch tip) — is never
+    // empty for a normal merged PR. It requires PRs to replay in merge ORDER.
+    let head_int = pr_merge_commit(&pr).ok_or_else(|| {
+        ToolError::Execution("internal PR has no merge commit sha — cannot determine its range".into())
+    })?;
+    let base_int = last_mirrored_sha(&cfg.work_dir).ok_or_else(|| {
+        ToolError::Conflict(
+            "no canonical scrubbed lineage — run git_public_history_backfill first".into(),
+        )
+    })?;
     let title = scrub_text(pr.get("title").and_then(Value::as_str).unwrap_or("mirrored pull request"));
     let body = scrub_text(pr.get("body").and_then(Value::as_str).unwrap_or(""));
 
@@ -389,60 +385,84 @@ pub async fn replay_pr(
         )));
     }
 
-    // 3. Fetch the current public main, then replay the PR range onto it as `branch`.
+    // 3. Fetch the current public main (a read — no canonical mutation yet).
     let public_base = fetch_public_main(&cfg.work_dir, &cfg.remote, token)?;
     let opts = ReplayOpts::with_author_map(cfg.author_map.clone());
-    let slice = replay_pr_slice(&cfg.source, &cfg.work_dir, &base_sha, &head_sha, &public_base, &branch, &opts)?;
-    base_outcome.commits = slice.commits;
 
-    // 4. Push the scrubbed feature branch to the public remote (NOT force — new ref).
-    git_transport(
-        &cfg.work_dir,
-        &["push", "--", &cfg.remote, &format!("{}:refs/heads/{branch}", slice.branch_tip)],
-        token,
-    )?;
+    // TRANSACTION: snapshot the canonical lineage, then replay + publish. If ANY step
+    // fails (transport / forge), roll the canonical lineage back to the snapshot so the
+    // mirror is never wedged past an unpublished PR and a retry starts clean.
+    let snap = snapshot_canonical(&cfg.work_dir)?;
+    let published: Result<(usize, u64, usize, String), ToolError> = async {
+        let slice =
+            replay_pr_slice(&cfg.source, &cfg.work_dir, &base_int, &head_int, &public_base, &branch, &opts)?;
 
-    // 5. Open the public PR with the scrubbed title/body.
-    let mut create = json!({ "repo": pub_repo, "title": title, "head": branch, "base": "main", "body": body });
-    if let Some(o) = &cfg.public_owner {
-        create["owner"] = json!(o);
-    }
-    let created = call_public(reg, cfg.public_provider.as_deref(), ForgeEndpoint::PullRequestsCreate, create).await?;
-    let public_pr = pr_number(&created)
-        .ok_or_else(|| ToolError::Execution("public PR create returned no PR number/iid".into()))?;
-    base_outcome.public_pr = Some(public_pr);
+        // 4. Push the scrubbed feature branch to the public remote (NOT force — new ref).
+        git_transport(
+            &cfg.work_dir,
+            &["push", "--", &cfg.remote, &format!("{}:refs/heads/{branch}", slice.branch_tip)],
+            token,
+        )?;
 
-    // 6. Mirror each scrubbed comment onto the public PR.
-    for c in &scrubbed_comments {
-        let mut cp = json!({ "repo": pub_repo, "index": public_pr, "number": public_pr, "comment": c, "body": c });
+        // 5. Open the public PR with the scrubbed title/body.
+        let mut create = json!({ "repo": pub_repo, "title": title, "head": branch, "base": "main", "body": body });
         if let Some(o) = &cfg.public_owner {
-            cp["owner"] = json!(o);
+            create["owner"] = json!(o);
         }
-        call_public(reg, cfg.public_provider.as_deref(), ForgeEndpoint::PullRequestsComment, cp).await?;
-        base_outcome.comments_mirrored += 1;
+        let created =
+            call_public(reg, cfg.public_provider.as_deref(), ForgeEndpoint::PullRequestsCreate, create).await?;
+        let public_pr = pr_number(&created)
+            .ok_or_else(|| ToolError::Execution("public PR create returned no PR number/iid".into()))?;
+
+        // 6. Mirror each scrubbed comment onto the public PR.
+        let mut mirrored = 0usize;
+        for c in &scrubbed_comments {
+            let mut cp = json!({ "repo": pub_repo, "index": public_pr, "number": public_pr, "comment": c, "body": c });
+            if let Some(o) = &cfg.public_owner {
+                cp["owner"] = json!(o);
+            }
+            call_public(reg, cfg.public_provider.as_deref(), ForgeEndpoint::PullRequestsComment, cp).await?;
+            mirrored += 1;
+        }
+
+        // 7. Merge the public PR — this is what lands the commits on public main.
+        let mut mp = json!({
+            "repo": pub_repo, "index": public_pr, "number": public_pr,
+            "style": cfg.merge_method, "merge_method": cfg.merge_method,
+        });
+        if let Some(o) = &cfg.public_owner {
+            mp["owner"] = json!(o);
+        }
+        call_public(reg, cfg.public_provider.as_deref(), ForgeEndpoint::PullRequestsMerge, mp).await?;
+
+        // 8. Reconcile: fetch the new public main and record it as the published
+        //    boundary so the next PR replays onto it, and tag the internal PR mirrored.
+        let new_public = fetch_public_main(&cfg.work_dir, &cfg.remote, token)?;
+        set_pushed_sha(&cfg.work_dir, &new_public)?;
+        git(&cfg.work_dir, &["tag", "-f", &pr_tag(internal_pr), &new_public])?;
+
+        Ok((slice.commits, public_pr, mirrored, new_public))
     }
+    .await;
 
-    // 7. Merge the public PR — this is what lands the commits on public main.
-    let mut mp = json!({
-        "repo": pub_repo, "index": public_pr, "number": public_pr,
-        "style": cfg.merge_method, "merge_method": cfg.merge_method,
-    });
-    if let Some(o) = &cfg.public_owner {
-        mp["owner"] = json!(o);
+    match published {
+        Ok((commits, public_pr, mirrored, new_public)) => {
+            base_outcome.commits = commits;
+            base_outcome.public_pr = Some(public_pr);
+            base_outcome.comments_mirrored = mirrored;
+            base_outcome.replayed = true;
+            base_outcome.public_head = Some(new_public);
+            base_outcome.note =
+                "public PR opened, commented, and merged — the PR process is mirrored".into();
+            Ok(base_outcome)
+        }
+        Err(e) => {
+            // Roll the canonical lineage back so a retry is clean. (A branch that DID
+            // reach the remote is caught next run by the remote-branch guard.)
+            restore_canonical(&cfg.work_dir, &snap, &branch)?;
+            Err(e)
+        }
     }
-    call_public(reg, cfg.public_provider.as_deref(), ForgeEndpoint::PullRequestsMerge, mp).await?;
-
-    // 8. Reconcile: fetch the new public main and record it as the published boundary
-    //    so the next PR replays onto it, and tag the internal PR as mirrored.
-    let new_public = fetch_public_main(&cfg.work_dir, &cfg.remote, token)?;
-    set_pushed_sha(&cfg.work_dir, &new_public)?;
-    let _ = last_pushed_sha(&cfg.work_dir); // (read-back is harmless; boundary now set)
-    git(&cfg.work_dir, &["tag", "-f", &pr_tag(internal_pr), &new_public])?;
-
-    base_outcome.replayed = true;
-    base_outcome.public_head = Some(new_public);
-    base_outcome.note = "public PR opened, commented, and merged — the PR process is mirrored".into();
-    Ok(base_outcome)
 }
 
 #[cfg(test)]
