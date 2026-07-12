@@ -818,6 +818,20 @@ destructive-shape checks and before any DB connection is attempted — every
 call requires per-occurrence operator approval, on top of the DB-role
 privilege boundary and the standard gateway audit trail.
 
+### `pg_admin` — role/privilege management (PGT-05, guarded)
+
+`pg_admin` runs exactly one role/privilege statement — `CREATE`/`ALTER`/`DROP ROLE`|`USER`,
+`GRANT`, or `REVOKE` — via either a structured `{ action, role, options, password, privileges,
+on, to, from }` form (preferred, so a password never has to be hand-formatted into a loggable
+`sql` string) or a raw single-statement `sql` string. Anything else (DDL/DML/reads/multi-statement)
+is a clean `InvalidArgument` pointing at `pg_ddl`/`pg_execute`/`pg_query`. Default identity:
+**`admin`**. Guarded — it calls the approval gate at the top of its execute.
+
+**Password redaction (mandatory).** Any `PASSWORD '...'` literal is rewritten to
+`PASSWORD '***REDACTED***'` before anything reaches the approval-gate summary, the audit args, or
+the tool response — the real password only ever lives in the local string used to run the
+statement. `DROP ROLE`/`REVOKE` are flagged `high_impact`.
+
 ### Identity / connection model
 
 Every `pg_*` tool accepts an optional `identity` argument selecting which
@@ -850,6 +864,9 @@ configured secret is refused with a clean "not configured" error naming the
 role, never guessing a fallback connection.
 
 ### Governance and the exemption boundary
+
+Full governance runbook (single-door rule, identity/role model, exemption boundary, operator provisioning): [`docs/tools/postgres-suite.md`](docs/tools/postgres-suite.md).
+
 
 This suite is the single door for AGENT/admin/ad-hoc Postgres access. It does
 **not** replace the application's own governed `sqlx` data paths — the MINT
