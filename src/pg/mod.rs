@@ -24,11 +24,12 @@
 //! surface are scoped (S9 posture).
 //!
 //! ## Guarding (future items)
-//! `pg_identities` (this item) is read-only and NOT guarded. `pg_execute` /
-//! `pg_ddl` / `pg_admin` (PGT-03/04/05) are destructive and MUST be added to
-//! `crate::approval::GUARDED_BARE_NAMES` when they land — every mutating
-//! `pg_*` tool added to this module MUST be evaluated for the guarded set,
-//! per PGT-06's governance rule.
+//! `pg_identities` (PGT-01) and `pg_query` / `pg_list_tables` /
+//! `pg_describe_table` (PGT-02, the read surface) are read-only and NOT
+//! guarded. `pg_execute` / `pg_ddl` / `pg_admin` (PGT-03/04/05) are
+//! destructive and MUST be added to `crate::approval::GUARDED_BARE_NAMES`
+//! when they land — every mutating `pg_*` tool added to this module MUST be
+//! evaluated for the guarded set, per PGT-06's governance rule.
 //!
 //! ## Exemption boundary (load-bearing, do not blur)
 //! This suite governs AGENT/admin/ad-hoc Postgres access. It does NOT
@@ -41,6 +42,7 @@
 pub mod conn;
 pub mod ddl;
 pub mod identities;
+pub mod query;
 
 use crate::registry::ToolRegistry;
 
@@ -74,6 +76,7 @@ impl PgConnections {
 /// registry only — see module docs).
 pub fn register(registry: &mut ToolRegistry) {
     identities::register(registry);
+    query::register(registry);
     ddl::register(registry);
 }
 
@@ -91,5 +94,14 @@ mod tests {
         let mut registry = ToolRegistry::new();
         register(&mut registry);
         assert!(registry.contains("pg_identities"));
+    }
+
+    #[test]
+    fn register_adds_the_pgt02_read_tools() {
+        let mut registry = ToolRegistry::new();
+        register(&mut registry);
+        assert!(registry.contains("pg_query"));
+        assert!(registry.contains("pg_list_tables"));
+        assert!(registry.contains("pg_describe_table"));
     }
 }

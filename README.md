@@ -713,10 +713,41 @@ This is the same S9 single-door posture Terminus already applies to
 GitHub/Gitea/Plane, applied to Postgres.
 
 **Status:** PGT-01 shipped the connection/identity foundation and the
-read-only `pg_identities` tool. PGT-04 (this item) adds `pg_ddl` (schema
-DDL). `pg_query` / `pg_list_tables` / `pg_describe_table` (read), `pg_execute`
-(DML), and `pg_admin` (roles/GRANT/REVOKE) are other S115 items and are not
-yet present.
+read-only `pg_identities` tool. PGT-02 adds the read surface (`pg_query` /
+`pg_list_tables` / `pg_describe_table`); PGT-04 adds `pg_ddl` (schema DDL).
+`pg_execute` (DML) and `pg_admin` (roles/GRANT/REVOKE) are other S115 items.
+
+### Read tools (PGT-02)
+
+All three default to the least-privileged `readonly` connection identity and
+are **not** guarded (read-only, no destructive capability) — same audit
+posture as every other tool call.
+
+- **`pg_query`** — runs exactly ONE read-only statement: `SELECT`,
+  `WITH ... SELECT` (a CTE), `EXPLAIN`, or `SHOW`. Args:
+  `{ sql, params?, identity?, max_rows? }`. `sql` must contain a single
+  statement — no `;`-chained multi-statement input — and no DML/DDL
+  keyword anywhere in the body (this also rejects a CTE that smuggles an
+  `INSERT`/`UPDATE`/`DELETE`/`DROP`/etc. inside a `WITH` clause). Any
+  violation is a clean `InvalidArgument` pointing at `pg_execute`/`pg_ddl`
+  instead. Values are passed as bound `$1, $2, ...` `params` and are
+  **always** bound via `sqlx`'s typed `Encode`, never string-interpolated
+  into the SQL text — SQL-injection safe by construction. Results are
+  row-capped (`max_rows`, default 500, hard ceiling 5000) and the response
+  reports `{ columns, rows, row_count, truncated }`.
+- **`pg_list_tables`** — lists tables visible to the connection (via
+  `information_schema.tables`), optionally restricted to one `schema`. Args:
+  `{ schema?, identity? }`.
+- **`pg_describe_table`** — describes one table's columns
+  (name/type/nullable/default), primary key, and indexes. Args:
+  `{ table, schema? (default "public"), identity? }`. A non-existent table
+  is a clean `NotFound`, not a panic.
+
+`pg_list_tables`/`pg_describe_table` validate `schema`/`table` against a
+conservative Postgres-identifier charset (`[A-Za-z_][A-Za-z0-9_]*`, max 63
+bytes) before splicing them into the introspection query (identifiers cannot
+be bound as ordinary query parameters); a name that fails it is a clean
+`InvalidArgument`.
 
 ### `pg_ddl` — schema DDL (PGT-04)
 
