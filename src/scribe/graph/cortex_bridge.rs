@@ -133,12 +133,20 @@ fn extract_risk(v: &Value) -> Option<f32> {
         v.get(key).and_then(Value::as_f64).map(|f| f as f32)
     }
 
-    let found = numeric_field(v, "risk")
-        .or_else(|| numeric_field(v, "score"))
-        .or_else(|| v.get("result").and_then(|r| numeric_field(r, "risk")))
-        .or_else(|| v.get("result").and_then(|r| numeric_field(r, "score")));
-
-    found.map(|f| f.clamp(0.0, 1.0))
+    // Cortex's `cortex_review` documents its field as `risk_score` on a 0-10
+    // scale — that's the PRIMARY field; `risk`/`score` are accepted as [0,1]
+    // fraction fallbacks. Search the top level first, then one level under
+    // `result`. `risk_score` is normalized 0-10 -> 0-1; the fraction fields are
+    // clamped as-is. Everything ends clamped to [0,1].
+    for obj in [Some(v), v.get("result")].into_iter().flatten() {
+        if let Some(rs) = numeric_field(obj, "risk_score") {
+            return Some((rs / 10.0).clamp(0.0, 1.0));
+        }
+        if let Some(frac) = numeric_field(obj, "risk").or_else(|| numeric_field(obj, "score")) {
+            return Some(frac.clamp(0.0, 1.0));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -193,6 +201,22 @@ mod tests {
     #[test]
     fn test_extract_risk_prefers_risk_over_score_when_both_present() {
         assert_eq!(extract_risk(&json!({"risk": 0.2, "score": 0.9})), Some(0.2));
+    }
+
+    #[test]
+    fn test_extract_risk_reads_cortex_risk_score_field_on_0_to_10_scale() {
+        // cortex_review's documented field is `risk_score` (0-10) — normalize to
+        // [0,1]. This is the field a REAL Cortex answer uses. Use approx compares
+        // for non-exact f32 divisions (7.2/10, 8.0/10 aren't exact in f32).
+        let approx = |v: Option<f32>, want: f32| {
+            assert!(matches!(v, Some(x) if (x - want).abs() < 1e-6), "got {v:?}, want ~{want}");
+        };
+        approx(extract_risk(&json!({"risk_score": 7.2})), 0.72);
+        assert_eq!(extract_risk(&json!({"risk_score": 10})), Some(1.0)); // exact
+        assert_eq!(extract_risk(&json!({"risk_score": 0})), Some(0.0)); // exact
+        assert_eq!(extract_risk(&json!({"result": {"risk_score": 5}})), Some(0.5)); // exact
+        // precedence over the fraction fallbacks
+        approx(extract_risk(&json!({"risk_score": 8.0, "risk": 0.1})), 0.8);
     }
 
     // --- scope_kind gating: pure ---------------------------------------------
