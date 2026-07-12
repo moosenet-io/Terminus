@@ -133,10 +133,14 @@ function baseUrl(): string {
 }
 
 async function httpJson<T>(path: string, init?: RequestInit): Promise<T> {
+  // Spread caller init FIRST, then enforce the aggregation-client invariants last so a
+  // caller can never override them: credentials:'include' (session cookie is the only auth
+  // the browser holds) is authoritative, and the JSON Content-Type is always present while
+  // still allowing callers to ADD headers. This keeps the single-auth discipline intact.
   const res = await fetch(`${baseUrl()}${path}`, {
+    ...init,
     credentials: 'include',
     headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
-    ...init,
   });
   if (!res.ok) {
     throw new Error(`HTTP ${res.status} for ${path}`);

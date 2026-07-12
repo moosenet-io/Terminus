@@ -62,17 +62,24 @@ export function Card({
           style={{ transition: `background var(--transition-fast)` }}
         >
           <div style={{ flex: 1 }}>{header ?? children}</div>
-          <span style={{
-            color: 'var(--text-tertiary)',
-            fontSize: 'var(--text-xs)',
-            display: 'inline-block',
-            transform: expanded ? 'rotate(180deg)' : 'none',
-            transition: `transform var(--transition-fast)`,
-            marginLeft: 'var(--space-2)',
-          }}>▼</span>
+          {/* Chevron only when there is a distinct header (i.e. a separate body to reveal).
+              Without a header the children ARE the summary, so there is nothing to expand. */}
+          {header != null && (
+            <span style={{
+              color: 'var(--text-tertiary)',
+              fontSize: 'var(--text-xs)',
+              display: 'inline-block',
+              transform: expanded ? 'rotate(180deg)' : 'none',
+              transition: `transform var(--transition-fast)`,
+              marginLeft: 'var(--space-2)',
+            }}>▼</span>
+          )}
         </div>
-        {expanded && header && (
-          <div style={{ borderTop: '1px solid var(--border-subtle)', padding: 'var(--space-3) var(--space-4)' }}>
+        {/* Body renders whenever there is a header; the .h-expandable-body class drives the
+            collapse/expand transition via data-expanded so children never fail to render. */}
+        {header != null && (
+          <div className="h-expandable-body" data-expanded={expanded}
+            style={{ borderTop: '1px solid var(--border-subtle)', padding: 'var(--space-3) var(--space-4)' }}>
             {children}
           </div>
         )}
