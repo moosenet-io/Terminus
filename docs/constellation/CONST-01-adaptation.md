@@ -116,6 +116,26 @@ hold no backend creds client-side.
 
 ---
 
+## 4b. Page → panel reuse map (LEVERAGE THIS — operator directive: reuse harmony-web maximally)
+
+harmony-web is ~7,500 LOC (13 pages, 42 components, 13 hooks). Most Constellation panels are a
+**generalization of an existing harmony-web page**, not a from-scratch build. The downstream panel items
+(CONST-05/06/12) should START from the mapped page + components and only re-point the backend calls
+through the aggregation client (namespaced) + register under the module registry.
+
+| Constellation panel (item) | System | Reuse directly from harmony-web |
+|---|---|---|
+| CONST-05 Chord (inference/routing/serving) | Chord | `pages/Inference.tsx` + `components/inference/*` (VRAMGauge, ModelInventory, ModelDownload, LifecycleControls, StorageManager, ProviderHealthCard); `pages/Providers.tsx` + ProviderCard/ProviderAnalytics/ProviderSummary + RoutingDiagram + InferenceMixSlider; hooks `useChord`, `useChordHealth`, `useProviders`, `useRoutingState` |
+| CONST-06 Harmony (build pipeline) | Harmony | `pages/{Projects,Tasks,Agents,PRs,Prompts,Sessions}.tsx` + BuildControls/EngineControls/TaskTree/AgentLane/EscalationStepper/HeldTasksPanel; hooks `useExecutorState`, `useRalphState`, `useTreeData`, `useEscalationData` |
+| CONST-12 Fleet status (read-only) | Status | `pages/{Dashboard,Analytics}.tsx` + `components/dashboard/*` (EngineNode/EnginePanel/FlowConnection/WorkerNode) + `components/analytics/*` (CostChart/ProviderPerformance/SavingsHero/TokenUsageChart) + StatusStrip/MetricCard; `useChordAnalytics` |
+| CONST-13 secret-masking/audit | (cross-cut) | `pages/AuditLog.tsx` as the audit-view surface |
+| CONST-07 Lumina / CONST-08 Terminus / CONST-09..11 providers | Lumina/Terminus/providers | Mostly NEW config forms, but reuse the shell primitives (Card, forms, confirmation) + the vault-ref control pattern |
+
+Net: CONST-05, CONST-06, and CONST-12 are **substantially pre-built** by harmony-web — the work is
+re-pointing hooks through the aggregation client + registry wiring, not building UI. Only Lumina/Terminus/
+provider config forms are genuinely new. This is the reuse the operator directed; CONST-04's port pulls
+the whole app across so these items start from working pages.
+
 ## 5. Build sequencing implication (for the orchestrator)
 
 - **UI-side items build now, no Terminus compile:** CONST-04 (shell + typed aggregation client w/ mock
