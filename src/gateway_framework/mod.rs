@@ -647,10 +647,32 @@ impl GatewayFramework {
     /// `crate::config::gateway_rate_limit_burst`/`gateway_rate_limit_refill_per_sec`)
     /// — what `terminus_primary`'s `main()` calls.
     pub fn from_env() -> Self {
-        Self::new(
-            AllowlistPolicy::from_env(),
-            Arc::new(InProcessRateLimiter::from_env()),
-        )
+        Self::new(AllowlistPolicy::from_env(), Self::rate_limiter_from_env())
+    }
+
+    /// Select the proxy rate-limiter backend (BLD-20). Every request already
+    /// passes through `self.inner.rate_limiter.check(..)` in [`guard`] — this
+    /// only chooses WHICH limiter backs that check:
+    ///
+    /// - When the shared Redis is configured (`REDIS_URL`, materialized from the
+    ///   vault), use the durable, cross-instance, atomic-Lua
+    ///   [`crate::ratelimit::RedisRateLimiter`]: limits then hold across a
+    ///   gateway restart and across multiple gateway instances, and an
+    ///   unreachable Redis **fails CLOSED** (the limiter returns `Limited` →
+    ///   `guard` denies with a 429) so a Redis outage can never become an
+    ///   un-throttled flood at the backends (BLD-20 EDGE CASE).
+    /// - Otherwise fall back to the interim in-process token bucket.
+    ///
+    /// NOTE (scope): this is the PROXY rate-limiter consumer of the BLD-20
+    /// Redis, wired here. The other two consumers — sccache shared cache
+    /// (BLD-05) and the compiler queue/scheduler state (BLD-06) — are wired by
+    /// those items, not BLD-20; the shared client + namespaces they use live in
+    /// `crate::redis`.
+    fn rate_limiter_from_env() -> Arc<dyn RateLimiter> {
+        match crate::redis::RedisBackend::from_env() {
+            Some(backend) => Arc::new(crate::ratelimit::RedisRateLimiter::from_env(backend)),
+            None => Arc::new(InProcessRateLimiter::from_env()),
+        }
     }
 
     /// Gate one request. `principal` must come from a server-verified
