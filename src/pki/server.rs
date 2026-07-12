@@ -164,6 +164,10 @@ pub fn build_gateway_router(registry: ToolRegistry, config: &GatewayServerConfig
             );
             crate::mesh::PrincipalResolver::default()
         }),
+        // TMOD-04: every process starts with an empty broker route table --
+        // nothing on a live path installs a route yet (TMOD-05's worker
+        // onboarding scope), so this is behavior-preserving.
+        broker_routes: crate::broker::routes::RouteTable::new(),
     });
 
     build_router(state).merge(build_enroll_router())

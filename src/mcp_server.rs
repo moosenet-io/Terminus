@@ -75,6 +75,7 @@ use crate::inference_proxy::{
     InferenceProxyClient, AGENT_EXECUTE_PATH, CHAT_COMPLETIONS_PATH, CODING_SELECT_PATH,
     INFER_PATH,
 };
+use crate::broker::routes::RouteTable;
 use crate::mesh::{CallRoute, MergedCatalog, Principal, PrincipalResolver, TailnetIdentity, UpstreamPool};
 use crate::pki::mtls::ClientIdentity;
 use crate::registry::ToolRegistry;
@@ -140,6 +141,17 @@ pub struct McpServerState {
     /// existing single-identity deployments and every pre-MESH-07 test in
     /// this module keep working unmodified.
     pub principal_resolver: PrincipalResolver,
+    /// TMOD-04: the broker-owned, atomically-swappable tool-name → worker
+    /// route table (see `crate::broker::routes` for the full design). A
+    /// `tools/call` for a name NOT present in `registry`'s snapshot resolves
+    /// against THIS table's snapshot before falling through to
+    /// `personal_federation`/"Unknown tool"; `tools/list` merges in every
+    /// currently-healthy routed worker's tools. Starts empty (`RouteTable::new()`)
+    /// for every process until something calls its install methods (nothing
+    /// on a live path does yet, as of this item — mutation is TMOD-05's
+    /// worker-onboarding scope) — an empty table is behavior-preserving,
+    /// identical to pre-TMOD-04 dispatch.
+    pub broker_routes: RouteTable,
 }
 
 impl McpServerState {
@@ -407,6 +419,10 @@ async fn handle_mcp(
     // registry or (for a request that starts after the swap) fully sees the
     // new one, never a mix of both.
     let reg = state.registry.load();
+    // TMOD-04: same one-snapshot-per-request contract as `reg` above, for
+    // the broker's worker route table — see `crate::broker::routes`'s
+    // module doc and `McpServerState::broker_routes`'s doc.
+    let broker_routes = state.broker_routes.load();
 
     // MESH-07: resolve the ONE canonical `Principal` for this request up
     // front, from server-verified transport identity extensions only (never
@@ -477,18 +493,50 @@ async fn handle_mcp(
                     })
                 })
                 .collect();
+            // TMOD-04 precedence (IDENTICAL in `tools/list` here and in the
+            // `tools/call` dispatch order below): compiled-in > worker-route
+            // > personal-federation. A given bare tool name is advertised by
+            // -- and dispatched to -- the FIRST of those three sources that
+            // owns it, so `tools/list` and `tools/call` never disagree about
+            // which implementation a name resolves to.
+            //
+            // Worker routes are therefore merged BEFORE the personal set:
+            // `merge_catalog` skips any route whose name collides with a
+            // tool already in `tools` (so far, only compiled-in), so
+            // compiled-in wins over a worker route; then the personal set
+            // below is filtered to skip any name already present
+            // (compiled-in OR worker-route), so a worker route wins over a
+            // personal-federated tool of the same name -- matching the
+            // `tools/call` order (registry miss -> worker route -> personal
+            // federation). `broker_routes` empty (every deployment before a
+            // worker is ever installed) makes this a no-op.
+            tools = crate::broker::routes::merge_catalog(tools, &broker_routes).await;
             // TGW-02: aggregate in the personal-registry tool set (metadata
             // only, no network call -- see
             // `crate::registry::personal_only_tool_metadata`'s doc) when
             // this process is configured to federate personal-tool calls.
+            // Per the precedence above, a personal tool whose name is already
+            // served by a compiled-in tool or a worker route is dropped here
+            // (that higher-precedence source is what `tools/call` dispatches
+            // to), so list and call agree.
             if state.personal_federation.is_some() {
-                tools.extend(crate::registry::personal_only_tool_metadata().into_iter().map(|t| {
-                    json!({
-                        "name": t.name,
-                        "description": t.description,
-                        "inputSchema": t.parameters,
-                    })
-                }));
+                let existing: std::collections::HashSet<String> = tools
+                    .iter()
+                    .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+                    .map(str::to_string)
+                    .collect();
+                tools.extend(
+                    crate::registry::personal_only_tool_metadata()
+                        .into_iter()
+                        .filter(|t| !existing.contains(&t.name))
+                        .map(|t| {
+                            json!({
+                                "name": t.name,
+                                "description": t.description,
+                                "inputSchema": t.parameters,
+                            })
+                        }),
+                );
             }
             // MESH-03: merge in every currently-healthy mesh upstream's
             // tools, namespaced `<namespace>__<tool>` -- see
@@ -835,11 +883,55 @@ async fn handle_mcp(
                         Some(msg),
                     )
                 }
-                // Not a core tool -- TGW-02: if this process federates
-                // personal-tool calls, proxy to Chord's
-                // `/v1/personal/tools/call` relay before giving up. Core
-                // dispatch above is completely unchanged by this branch.
-                None => match &state.personal_federation {
+                // Not a core tool -- TMOD-04: before falling through to
+                // personal-federation, try the broker's worker route table
+                // (see `crate::broker::routes::dispatch_call`'s doc). `None`
+                // here means no route at all (an empty table, or this name
+                // just isn't routed) -- falls through to
+                // personal_federation/"Unknown tool" exactly as before this
+                // item. `Some(..)` means a route exists: either the worker
+                // answered (success or an application-level tool error) or
+                // it's currently unhealthy (a clean transport failure) --
+                // either way this is authoritative and does NOT also try
+                // personal_federation for the same name.
+                None => match crate::broker::routes::dispatch_call(&broker_routes, name, arguments.clone()).await {
+                    Some(Ok(output)) => {
+                        let mut result = json!({
+                            "content": [{"type": "text", "text": output.text}],
+                            "isError": false
+                        });
+                        if let Some(structured) = output.structured {
+                            result["structuredContent"] = structured;
+                        }
+                        (sse_response(id, Ok(result), ""), true, None)
+                    }
+                    Some(Err(e)) => {
+                        // LIMITATION: every `WorkerTransport::call` failure is
+                        // audited as a transport failure -- an unhealthy
+                        // worker AND an application-level tool error the
+                        // worker deliberately returned both collapse to
+                        // `ToolError::Execution` at the TMOD-02 transport
+                        // boundary, so they're indistinguishable here.
+                        // Splitting them apart requires a TMOD-02
+                        // transport-contract change (a distinct app-error
+                        // wire shape); that is a documented follow-up, not
+                        // part of TMOD-04.
+                        is_transport_failure = true;
+                        let msg = e.to_string();
+                        (
+                            sse_response(
+                                id,
+                                Ok(json!({
+                                    "content": [{"type": "text", "text": msg.clone()}],
+                                    "isError": true
+                                })),
+                                "",
+                            ),
+                            false,
+                            Some(msg),
+                        )
+                    }
+                    None => match &state.personal_federation {
                     Some(client) => {
                         // MESH-07: propagate the resolved canonical
                         // `Principal` (not the raw `ClientIdentity`) so the
@@ -905,6 +997,7 @@ async fn handle_mcp(
                             Some(msg),
                         )
                     }
+                },
                 },
                 },
             };
@@ -1095,6 +1188,7 @@ mod tests {
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
+            broker_routes: crate::broker::routes::RouteTable::new(),
         })
     }
 
@@ -1194,6 +1288,291 @@ mod tests {
             .contains("does_not_exist"));
     }
 
+    // ── TMOD-04: broker worker route fallthrough through the MCP surface ────
+
+    /// A stub in-box [`crate::broker::transport::WorkerTransport`] for the
+    /// integration tests below -- no real I/O, programmable health + a fixed
+    /// reply.
+    struct StubWorker {
+        healthy: bool,
+        reply: String,
+    }
+
+    #[async_trait]
+    impl crate::broker::transport::WorkerTransport for StubWorker {
+        async fn connect(&self) -> Result<(), crate::broker::transport::TransportError> {
+            Ok(())
+        }
+        async fn call(
+            &self,
+            _name: &str,
+            _args: Value,
+        ) -> Result<crate::tool::ToolOutput, ToolError> {
+            Ok(crate::tool::ToolOutput { text: self.reply.clone(), structured: None })
+        }
+        async fn list(&self) -> Result<Vec<String>, crate::broker::transport::TransportError> {
+            Ok(vec![])
+        }
+        async fn health(&self) -> bool {
+            self.healthy
+        }
+    }
+
+    /// Build a `test_state()` whose broker route table has `route` installed.
+    fn state_with_broker_route(
+        worker_id: &str,
+        tool_name: &str,
+        transport: Arc<dyn crate::broker::transport::WorkerTransport>,
+    ) -> Arc<McpServerState> {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoHealthTool)).unwrap();
+        let broker_routes = crate::broker::routes::RouteTable::new();
+        broker_routes.install(crate::broker::routes::WorkerRoute {
+            worker_id: worker_id.to_string(),
+            transport,
+            tool: crate::registry::ToolInfo {
+                name: tool_name.to_string(),
+                description: format!("{tool_name} served by a worker"),
+                parameters: json!({"type": "object"}),
+            },
+        });
+        Arc::new(McpServerState {
+            registry: ArcSwap::from_pointee(registry),
+            server_name: "terminus-personal-test".to_string(),
+            server_version: "0.0.0-test".to_string(),
+            auth_token: None,
+            personal_federation: None,
+            inference_proxy: None,
+            gateway: None,
+            mesh_pool: None,
+            principal_resolver: PrincipalResolver::default(),
+            broker_routes,
+        })
+    }
+
+    /// (a) An unknown name (not compiled-in, no route) still surfaces as the
+    /// unchanged "Unknown tool" tool-call failure even with a broker route
+    /// table present -- fallthrough is registry-miss → route-miss → Unknown.
+    #[tokio::test]
+    async fn tmod04_unknown_name_with_route_table_present_is_unknown_tool() {
+        let state = state_with_broker_route(
+            "w1",
+            "worker_tool",
+            Arc::new(StubWorker { healthy: true, reply: "hi".to_string() }),
+        );
+        let router = build_router(state);
+        let (status, body, _) = post_mcp(
+            router,
+            json!({
+                "jsonrpc": "2.0", "id": 40, "method": "tools/call",
+                "params": {"name": "no_such_tool_anywhere", "arguments": {}}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["isError"], true);
+        assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains("no_such_tool_anywhere"));
+    }
+
+    /// A healthy worker route dispatches over its transport on a compiled-in
+    /// registry miss.
+    #[tokio::test]
+    async fn tmod04_healthy_worker_route_dispatches_through_mcp_surface() {
+        let state = state_with_broker_route(
+            "w1",
+            "worker_tool",
+            Arc::new(StubWorker { healthy: true, reply: "worker answered".to_string() }),
+        );
+        let router = build_router(state);
+        let (status, body, _) = post_mcp(
+            router,
+            json!({
+                "jsonrpc": "2.0", "id": 41, "method": "tools/call",
+                "params": {"name": "worker_tool", "arguments": {}}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["isError"], false);
+        assert_eq!(body["result"]["content"][0]["text"], "worker answered");
+    }
+
+    /// (b) A route whose worker is UNHEALTHY answers a clean "unavailable"
+    /// MCP result, while compiled-in tools on the same server still work.
+    #[tokio::test]
+    async fn tmod04_unhealthy_worker_route_is_unavailable_others_still_work() {
+        let state = state_with_broker_route(
+            "dead-worker",
+            "dead_tool",
+            Arc::new(StubWorker { healthy: false, reply: "unused".to_string() }),
+        );
+        let router = build_router(state.clone());
+        let (status, body, _) = post_mcp(
+            router,
+            json!({
+                "jsonrpc": "2.0", "id": 42, "method": "tools/call",
+                "params": {"name": "dead_tool", "arguments": {}}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["isError"], true);
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("dead-worker"));
+        assert!(text.to_lowercase().contains("unavailable"));
+
+        // A compiled-in tool on the SAME server is entirely unaffected.
+        let router2 = build_router(state);
+        let (status2, body2, _) = post_mcp(
+            router2,
+            json!({
+                "jsonrpc": "2.0", "id": 43, "method": "tools/call",
+                "params": {"name": "health", "arguments": {}}
+            }),
+        )
+        .await;
+        assert_eq!(status2, StatusCode::OK);
+        assert_eq!(body2["result"]["isError"], false);
+        assert_eq!(body2["result"]["content"][0]["text"], "ok");
+    }
+
+    /// (c) `tools/list` merges a healthy worker's catalog with the
+    /// compiled-in tools; a name present in BOTH is listed once as the
+    /// compiled-in tool (compiled-in wins on clash).
+    #[tokio::test]
+    async fn tmod04_tools_list_merges_worker_catalog_compiled_in_wins() {
+        // Worker advertises a NEW tool plus one that CLASHES with the
+        // compiled-in "health".
+        let state = {
+            let mut registry = ToolRegistry::new();
+            registry.register(Box::new(EchoHealthTool)).unwrap();
+            let broker_routes = crate::broker::routes::RouteTable::new();
+            let transport: Arc<dyn crate::broker::transport::WorkerTransport> =
+                Arc::new(StubWorker { healthy: true, reply: "x".to_string() });
+            broker_routes.install_many(vec![
+                crate::broker::routes::WorkerRoute {
+                    worker_id: "w1".to_string(),
+                    transport: transport.clone(),
+                    tool: crate::registry::ToolInfo {
+                        name: "worker_only_tool".to_string(),
+                        description: "only on the worker".to_string(),
+                        parameters: json!({"type": "object"}),
+                    },
+                },
+                crate::broker::routes::WorkerRoute {
+                    worker_id: "w1".to_string(),
+                    transport,
+                    tool: crate::registry::ToolInfo {
+                        name: "health".to_string(), // clashes with compiled-in
+                        description: "worker's rival health".to_string(),
+                        parameters: json!({"type": "object"}),
+                    },
+                },
+            ]);
+            Arc::new(McpServerState {
+                registry: ArcSwap::from_pointee(registry),
+                server_name: "terminus-personal-test".to_string(),
+                server_version: "0.0.0-test".to_string(),
+                auth_token: None,
+                personal_federation: None,
+                inference_proxy: None,
+                gateway: None,
+                mesh_pool: None,
+                principal_resolver: PrincipalResolver::default(),
+                broker_routes,
+            })
+        };
+        let router = build_router(state);
+        let (status, body, _) = post_mcp(
+            router,
+            json!({"jsonrpc": "2.0", "id": 44, "method": "tools/list"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let tools = body["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"worker_only_tool"), "worker's unique tool must be merged in");
+        // "health" appears exactly once -- the compiled-in one wins.
+        assert_eq!(names.iter().filter(|n| **n == "health").count(), 1);
+        let health = tools.iter().find(|t| t["name"] == "health").unwrap();
+        assert_eq!(health["description"], "Health check", "compiled-in health wins on the name clash");
+    }
+
+    /// Round-2 review: a name present as BOTH a worker route AND a
+    /// personal-federated tool must be LISTED and CALLED as the SAME
+    /// implementation (the worker route), per the documented precedence
+    /// compiled-in > worker-route > personal-federation applied identically
+    /// in `tools/list` ordering and `tools/call` dispatch order.
+    #[tokio::test]
+    async fn tmod04_worker_route_wins_over_personal_federation_in_list_and_call() {
+        // A real personal-only tool name to collide with.
+        let personal_name = crate::registry::personal_only_tool_metadata()
+            .into_iter()
+            .next()
+            .expect("there is at least one personal-only tool")
+            .name;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoHealthTool)).unwrap();
+        let broker_routes = crate::broker::routes::RouteTable::new();
+        broker_routes.install(crate::broker::routes::WorkerRoute {
+            worker_id: "w1".to_string(),
+            transport: Arc::new(StubWorker { healthy: true, reply: "served by worker route".to_string() }),
+            tool: crate::registry::ToolInfo {
+                name: personal_name.clone(),
+                description: "worker-route implementation".to_string(),
+                parameters: json!({"type": "object"}),
+            },
+        });
+        let state = Arc::new(McpServerState {
+            registry: ArcSwap::from_pointee(registry),
+            server_name: "terminus-personal-test".to_string(),
+            server_version: "0.0.0-test".to_string(),
+            auth_token: None,
+            // Points at a dead address: if the worker route did NOT win, the
+            // call below would fall THROUGH to here and surface a
+            // "federation error" -- which the assertions would catch.
+            personal_federation: Some(
+                crate::federation::PersonalFederationClient::with_base_url("http://127.0.0.1:1")
+                    .with_timeout(std::time::Duration::from_millis(200)),
+            ),
+            inference_proxy: None,
+            gateway: None,
+            mesh_pool: None,
+            principal_resolver: PrincipalResolver::default(),
+            broker_routes,
+        });
+
+        // tools/list: the colliding name is advertised exactly ONCE, as the
+        // worker route (not the personal-federation metadata).
+        let router = build_router(state.clone());
+        let (_, list_body, _) =
+            post_mcp(router, json!({"jsonrpc": "2.0", "id": 50, "method": "tools/list"})).await;
+        let tools = list_body["result"]["tools"].as_array().unwrap();
+        let matching: Vec<&Value> = tools.iter().filter(|t| t["name"] == personal_name.as_str()).collect();
+        assert_eq!(matching.len(), 1, "the colliding name must be listed exactly once");
+        assert_eq!(
+            matching[0]["description"], "worker-route implementation",
+            "worker route wins over personal federation in tools/list"
+        );
+
+        // tools/call: dispatches to the worker route, NOT personal federation.
+        let router2 = build_router(state);
+        let (_, call_body, _) = post_mcp(
+            router2,
+            json!({
+                "jsonrpc": "2.0", "id": 51, "method": "tools/call",
+                "params": {"name": personal_name.clone(), "arguments": {}}
+            }),
+        )
+        .await;
+        assert_eq!(call_body["result"]["isError"], false, "worker route must serve the call cleanly");
+        assert_eq!(
+            call_body["result"]["content"][0]["text"], "served by worker route",
+            "worker route wins over personal federation in tools/call"
+        );
+    }
+
     // ── EGJS-01: structuredContent ──────────────────────────────────────────
 
     struct StructuredEchoTool;
@@ -1237,6 +1616,7 @@ mod tests {
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
+            broker_routes: crate::broker::routes::RouteTable::new(),
         });
         let router = build_router(state);
         let (status, body, _) = post_mcp(
@@ -1306,6 +1686,7 @@ mod tests {
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
+            broker_routes: crate::broker::routes::RouteTable::new(),
         });
         let router = build_router(state);
         let (status, body, _) = post_mcp(
@@ -1354,6 +1735,7 @@ mod tests {
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
+            broker_routes: crate::broker::routes::RouteTable::new(),
         });
         let router = build_router(state);
         let req = Request::builder()
@@ -1382,6 +1764,7 @@ mod tests {
             gateway: None,
             mesh_pool: None,
             principal_resolver: PrincipalResolver::default(),
+            broker_routes: crate::broker::routes::RouteTable::new(),
         });
         let router = build_router(state);
         let req = Request::builder()
@@ -1566,6 +1949,7 @@ mod tests {
             gateway: Some(gateway),
             mesh_pool: None,
             principal_resolver,
+            broker_routes: crate::broker::routes::RouteTable::new(),
         })
     }
 
@@ -1737,6 +2121,7 @@ mod tests {
             gateway: Some(gateway),
             mesh_pool: Some(Arc::new(mesh_pool)),
             principal_resolver: PrincipalResolver::default(),
+            broker_routes: crate::broker::routes::RouteTable::new(),
         })
     }
 

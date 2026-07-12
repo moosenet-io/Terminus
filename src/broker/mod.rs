@@ -6,4 +6,9 @@
 //! selectable transports. See [`transport`] for the trait, tiers, and the
 //! minimum-tier floor policy.
 
+/// TMOD-04: the broker-owned, atomically-swappable tool-name → worker route
+/// table, and the dispatch/merge helpers `src/mcp_server.rs` uses to fall
+/// through to a worker on a compiled-in registry miss. See [`routes`] for
+/// the full design.
+pub mod routes;
 pub mod transport;
