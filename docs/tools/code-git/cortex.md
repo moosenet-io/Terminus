@@ -1,14 +1,16 @@
 [← docs index](../../README.md)
 
-# Cortex — Atlas-backed code-intelligence gate (CXEG-01/02)
+# Cortex — Atlas-backed code-intelligence gate (CXEG-01/02/03/04)
 
 Cortex is a 10-tool-name module (`src/cortex/mod.rs`, `src/cortex/scope.rs`,
-`src/cortex/deprecated.rs`, `src/cortex/audit.rs`), but as of **CXEG-01** only
-3 of those names are "real" tools — the rest are structured deprecation
-aliases. As of **CXEG-02**, `cortex_scope` is the first of those 3 to be a
-fully live, Atlas-backed implementation rather than a pending-pointer stub.
-This page describes the current shape; see the "History" section at the
-bottom for what changed and why.
+`src/cortex/metrics.rs`, `src/cortex/review.rs`, `src/cortex/deprecated.rs`,
+`src/cortex/audit.rs`), but as of **CXEG-01** only 3 of those names are
+"real" tools — the rest are structured deprecation aliases. **CXEG-02** made
+`cortex_scope` a fully live, Atlas-backed implementation rather than a
+pending-pointer stub; **CXEG-04** does the same for `cortex_review`, built on
+`cortex_scope`'s blast radius plus **CXEG-03**'s standalone structural-
+elegance signal library. This page describes the current shape; see the
+"History" section at the bottom for what changed and why.
 
 ## The single most important fact about this module: **the SSH-relay era is retired**
 
@@ -26,7 +28,7 @@ no remote script, no "relay whatever the other end says" response shape.
 | Tool | Status | What it does |
 | --- | --- | --- |
 | `cortex_scope` | **live (CXEG-02)** | Resolves `project_id` + `changed_files`/`diff` against the project's Atlas graph and returns the blast radius: touched symbols, their 1-hop callers/callees, affected communities, `blast_count`, `token_reduction_pct`. Degrades to `configured:false` (no error) when the project has no stored graph. |
-| `cortex_review` | **pending rebuild (CXEG-04)** | Validates `project_id`/`changed_files`, returns `{"status":"pending","item":"CXEG-04",...}`. No risk scoring happens yet. |
+| `cortex_review` | **live (CXEG-04)** | Resolves `project_id` + `changed_files`/`diff` against the Atlas graph, computes CXEG-03's structural-elegance signals over the touched nodes plus KGFIND recurrence for the same scopes, and returns a `risk_score` (0-10), `band`, `risk_signals`, and fully-explainable `contributions`. Degrades to `configured:false`/`band:"unknown"` (no graph) or a structural-only score labeled `findings:"unavailable"` (no findings store) — never an error. |
 | `cortex_audit` | **pending rebuild (CXEG-11)** | Runs its existing SSRF-hardened `url` validation (unchanged, see below), then returns `{"status":"pending","item":"CXEG-11",...}`. No clone/graph-build happens yet. |
 | `cortex_stats` | **deprecated alias** | Returns `{"deprecated":true,"use":"kg_stats",...}`. Call `kg_stats` instead. |
 | `cortex_build` | **deprecated alias** | Returns `{"deprecated":true,"use":"scribe_kg_build",...}`. Call `scribe_kg_build` instead. |
@@ -55,7 +57,7 @@ TERM, LUM, HARM, CHRD, RAIL
 This is the same `project_id` vocabulary the Atlas KG (`kg_*`) tools already
 use, and matches the current Plane-project-prefix convention (Terminus, Lumina,
 Harmony, Chord, Civic-Rail). Any other value is rejected with
-`ToolError::InvalidArgument` before the stub response is built.
+`ToolError::InvalidArgument` before any graph/scoring work happens.
 
 ## `cortex_scope` — live, Atlas-backed blast radius (CXEG-02)
 
@@ -205,9 +207,11 @@ data-availability fact, not a caller mistake.
 `metrics::compute_signals` is a standalone, PURE (no LLM) scoring library
 that turns a `cortex_scope` blast radius into named structural-elegance
 findings from the Atlas graph — "does this change quietly make the codebase
-worse-shaped," independent of correctness. It is not wired into
-`cortex_review`'s response yet (that's CXEG-04's job) but is fully
-unit-tested and importable as `crate::cortex::metrics::compute_signals`.
+worse-shaped," independent of correctness. As of **CXEG-04** it is the
+structural half of `cortex_review`'s `risk_score` (see the `cortex_review`
+section below for how its `EleganceSignal`s are weighted into the score); it
+remains fully unit-tested and independently importable as
+`crate::cortex::metrics::compute_signals`.
 
 **Entry points**:
 - `compute_signals(touched_node_ids, graph, project_id, config) -> Vec<EleganceSignal>`
@@ -258,35 +262,175 @@ graph + blast radius + config always produces byte-identical output.
 field (`CORTEX_TIER_B_PERCENTILE`, default `90.0`) shared by the three
 percentile-based detectors. See the "Configuration" section below.
 
-## `cortex_review` (pending — CXEG-04)
+## `cortex_review` — live, Atlas-backed risk scoring (CXEG-04)
 
-**Input schema**: identical shape to `cortex_scope` — `project_id` (enum,
-required), `changed_files` (string, required, ≤2000 chars, comma-separated
-modified file paths).
+The pipeline's post-change risk gate: "given what I just changed, how much
+review scrutiny does it deserve?" `cortex_review` combines CXEG-03's
+structural-elegance signals with KGFIND-01 recurrence into one transparent,
+deterministic `risk_score`.
 
-**Behavior**: validates both fields, then returns:
+**Input schema**: identical shape to `cortex_scope` (`src/cortex/mod.rs`'s
+`validate_and_parse_changed_files` is the SAME helper both tools call, S9
+single-source — extracted from `cortex_scope`'s own CXEG-02 validation so the
+two tools can never silently diverge in what they accept) — `project_id`
+(enum, required, one of `PROJECT_IDS`), plus EITHER `changed_files` (a
+comma-separated string OR a JSON array) OR `diff` (a unified diff; changed
+files parsed from `+++ b/<path>` headers). Same DoS-ceiling/truncation
+reconciliation as `cortex_scope` (see that section above) — an
+oversized-*by-file-count* input truncates with `truncated:true`; only
+genuinely abusive/malformed input (`MAX_TEXT_LEN`/`MAX_DIFF_LEN`/
+`MAX_CHANGED_FILES_ARG`) is rejected.
+
+**Behavior**:
+1. Validates `project_id` and derives `changed_files` exactly like
+   `cortex_scope` (steps 1-2 there).
+2. Loads the project's Atlas graph (`GraphStore`). If none is stored yet, or
+   the store fails to load, returns the degrade response below — **never an
+   error**.
+3. Resolves `changed_files` to their CURRENT touched Atlas node ids (same
+   resolution `cortex_scope` uses for `role: "touched"` entries).
+4. Computes CXEG-03's full structural-signal pipeline over those touched
+   nodes: `metrics::compute_signals(touched_node_ids, graph, project_id,
+   config)` — all five signal kinds, including the I/O-bound
+   `semantic_duplication` (silently absent if the vector store/embeddings
+   endpoint is unavailable — see the Tier-B section above).
+5. Looks up KGFIND-01 recurrence for the SAME touched scopes via
+   `scribe::graph::findings_store::FindingsStore` — the identical store the
+   `kg_findings` query tool reads (S9: no second findings access path):
+   `scope_kind = "node"` rows whose `scope_ref` is a touched node id,
+   `"path"` rows whose `scope_ref` is a changed file, and `"community"` rows
+   whose `scope_ref` is an affected community id (from the touched nodes'
+   `cluster`s). `FindingsStore::list` has no server-side `scope_ref` filter,
+   so each scope kind's bucket is listed once and matched client-side
+   against the touched sets; matches are summed into a `(category,
+   total_occurrences)` map.
+6. Combines both into a `RiskScore` via the pure `review::score` function
+   (see "Scoring rubric" below), and returns the full response shape below.
+
+**Scoring rubric** (`review::score(signals, recurrence, config) -> RiskScore`,
+`src/cortex/review.rs` — pure, sync, fully unit-tested with synthetic
+inputs, no I/O):
+
+- **Structural contribution**: every `EleganceSignal` contributes
+  `weight(kind) * severity` points, where `weight(kind)` is one of
+  `CortexConfig`'s `risk_weight_*` fields (see "Configuration" below) and
+  `severity` is the signal's own CXEG-03 relative-severity value.
+- **Recurrence contribution**: every `(category, total_occurrences)` bucket
+  from step 5 above contributes `risk_weight_recurrence *
+  log2(1 + total_occurrences)` points — **log-scaled, not linear**, so one
+  pathologically-recurring finding bucket (e.g. 1000 occurrences) cannot
+  alone pin the score at the ceiling the way a linear sum would (log2(1001)
+  ≈ 9.97 vs. log2(2) = 1 — roughly 10x growth for 1000x more occurrences).
+- **Raw score**: the sum of every contribution's `points` (unclamped). Every
+  contribution is returned in `contributions` (`{source, weight, points}`),
+  so a caller can always reconstruct this raw value exactly by summing
+  `points` — nothing about the score is hidden or lossy, even past the
+  ceiling.
+- **`risk_score`**: the raw score clamped to `[0, 10]`, rounded to 4
+  decimals.
+- **`band`**: `"low"` if `risk_score < risk_band_elevated_cut` (default
+  `4.0`); `"elevated"` if `< risk_score_threshold` (default `7.0`);
+  otherwise `"high"`. Both cut-points are inclusive at their lower bound
+  (`>=`), so a value exactly AT a cut-point always resolves to the HIGHER
+  band, deterministically — never ambiguous.
+- **`recommendation`**: a fixed, non-empty string per band. `"high"`
+  reads *"escalate review rigor: request an additional reviewer and a
+  closer read of the flagged risk_signals before merge — this is a signal
+  to escalate scrutiny, never an automatic rejection."* **No band ever
+  recommends rejecting/blocking a change** — auto-reject is explicitly out
+  of this item's scope.
+- **Determinism**: `signals` arrives pre-sorted by `(kind, anchor_node)`
+  (CXEG-03's `sort_signals`); `recurrence` is sorted by `category` inside
+  `score` regardless of caller order. The same signals+recurrence+config
+  always produce byte-identical `contributions`/`risk_score`/`band`.
+
+**Response shape** (live graph, structural signals fired, findings store
+reachable with a recurring match):
 
 ```json
 {
-  "status": "pending",
-  "item": "CXEG-04",
-  "tool": "cortex_review",
+  "configured": true,
   "project_id": "TERM",
-  "message": "cortex_review's SSH-relay-era backend has been retired; an Atlas-backed risk-scoring implementation lands in CXEG-04. In the meantime, query kg_findings / kg_query directly against the Atlas KG.",
-  "risk_score_threshold": 7.0,
-  "elegance_advisory_only": true
+  "changed_files": ["src/hub.rs"],
+  "risk_score": 6.7342,
+  "band": "elevated",
+  "risk_signals": [
+    {
+      "kind": "centrality_spike",
+      "severity": 1.6122,
+      "anchor_node": "crate::hub::Hub",
+      "anchor_file": "src/hub.rs",
+      "why": "crate::hub::Hub has PageRank 0.9000 (above the project's 90th-percentile cut-point 0.0345) and degree 15 (above the 90th-percentile cut-point 1) — a touched god-object-shaped hub, not a typical leaf/utility node.",
+      "evidence": { "rank": 0.9, "rank_cutoff": 0.0345, "degree": 15, "degree_cutoff": 1, "percentile": 90.0 }
+    }
+  ],
+  "contributions": [
+    { "source": "centrality_spike", "weight": 2.0, "points": 3.2244 },
+    { "source": "recurrence:complexity_debt", "weight": 1.0, "points": 3.5098 }
+  ],
+  "findings": "ok",
+  "recommendation": "apply standard review rigor with attention to the flagged risk_signals; no escalation required."
 }
 ```
 
-`risk_score_threshold` and `elegance_advisory_only` are read from
-`CortexConfig` (see "Configuration" below) and echoed here so the CXEG-04
-rebuild's threshold config is already visible/testable even though nothing
-consumes it yet.
+**Response shape** (no stored Atlas graph — degrade):
 
-**Error/edge cases**: same as `cortex_scope`.
+```json
+{
+  "configured": false,
+  "project_id": "TERM",
+  "changed_files": ["src/hub.rs"],
+  "risk_score": 0.0,
+  "band": "unknown",
+  "risk_signals": [],
+  "contributions": [],
+  "findings": "unavailable",
+  "recommendation": "insufficient data to assess risk for this change."
+}
+```
 
-**In the meantime**: call `kg_findings` / `kg_query` directly against the
-Atlas KG.
+`findings` also appears as `"unavailable"` (structural signals still
+computed and returned in full — just no recurrence term) when the Atlas
+graph loads fine but the KGFIND store is unconfigured/unreachable/erroring,
+and as `"empty"` (distinct from `"unavailable"`) when the store is reachable
+but nothing in the touched scopes has a recorded finding — a caller must not
+conflate "recurrence wasn't checked" with "recurrence was checked and found
+nothing."
+
+**Every response field:**
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `configured` | bool | `true` when a stored Atlas graph was loaded; `false` on the degrade path (no graph stored/loadable for the project) — mirrors `cortex_scope`'s own `configured` semantics. |
+| `project_id` | string | Echo of the validated input `project_id`. |
+| `changed_files` | array of strings | Echo of the derived changed-file list actually scored. |
+| `risk_score` | float | `0.0`-`10.0`, clamped, rounded to 4 decimals. `0.0` on the degrade path (not a real "zero risk" assessment — see `band:"unknown"`). |
+| `band` | string | `"low"` / `"elevated"` / `"high"`, or `"unknown"` on the degrade path. See the scoring rubric above for the cut-points. |
+| `risk_signals` | array of `EleganceSignal` | The full CXEG-03 structural signals fired for this change (see the Tier-B signal catalog above for each field). Empty on the degrade path, or when nothing fired. |
+| `contributions` | array of `{source, weight, points}` | Every scoring term: one entry per fired structural signal (`source` = its `kind`) plus one per recurring finding category (`source` = `"recurrence:<category>"`). Summing every `points` reconstructs the raw pre-clamp score exactly. |
+| `findings` | string | `"ok"` (recurrence looked up, at least one match), `"empty"` (looked up, no match), or `"unavailable"` (KGFIND store unconfigured/unreachable/erroring, OR the whole response is on the graph-unavailable degrade path). |
+| `recommendation` | string | Always non-empty. Only ever escalates review rigor for `"high"`; never recommends rejection/blocking. |
+| `truncated` | bool (present only when `true`) | Same input-file-cap semantics as `cortex_scope` — present when the raw `changed_files`/`diff` input exceeded `MAX_CHANGED_FILES` and was truncated before scoring. |
+
+**Error/edge cases**: same `InvalidArgument` conditions as `cortex_scope`
+(unknown `project_id`; an over-`MAX_TEXT_LEN` single element; a DoS-scale
+`changed_files`/`diff`; an over-`MAX_CHANGED_FILES_ARG` array; or neither
+`changed_files` nor `diff` yielding any file). A missing/unloadable Atlas
+graph and an unavailable/erroring KGFIND findings store are explicitly NOT
+errors — both degrade to a labeled response (see above).
+
+**Reuse (S9 single-source)**: argument validation/parsing
+(`validate_and_parse_changed_files`), the structural signal engine
+(`metrics::compute_signals`), and the findings store (`FindingsStore`, the
+same one `kg_findings` reads) are all reused verbatim, not reimplemented —
+`cortex_review` adds only the scoring/combination logic
+(`src/cortex/review.rs`'s `score`/`touched_recurrence`/`compute_review`).
+
+**Internal caller**: `crate::scribe::graph::cortex_bridge` (KGRULE-05) already
+looks for a top-level `risk_score` field (documented 0-10 scale, rescaled to
+`[0,1]`) in `cortex_review`'s response to attach a best-effort risk signal to
+KG rule crystallization — see its own module doc. `cortex_review`'s response
+shape as of CXEG-04 satisfies that contract with no code change needed there.
 
 ## `cortex_audit` — the one tool that still does real validation work
 
@@ -333,14 +477,24 @@ gets even a pending-pointer response, only a rejection.
 
 | Env var | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `CORTEX_RISK_SCORE_THRESHOLD` | f64 | `7.0` | Echoed in `cortex_review`'s pending-pointer response; will gate the CXEG-04 rebuild's escalation logic. |
-| `CORTEX_ENABLE_TIER_B` | bool | `false` | Feature flag for a not-yet-built Tier B analysis pass. No longer consumed by `cortex_scope` as of CXEG-02 (the pending stub used to echo it). |
+| `CORTEX_RISK_SCORE_THRESHOLD` | f64 | `7.0` | `cortex_review`'s (CXEG-04) `"elevated"` -> `"high"` band cut-point (a `risk_score` at or above this reads `"high"`). |
+| `CORTEX_ENABLE_TIER_B` | bool | `false` | Feature flag for a not-yet-built Tier B analysis pass. Not consumed by `cortex_scope`/`cortex_review`. |
 | `CORTEX_ENABLE_TIER_C` | bool | `false` | Feature flag for a not-yet-built Tier C analysis pass. |
-| `CORTEX_ELEGANCE_ADVISORY_ONLY` | bool | `true` | Whether elegance/style findings are advisory-only; echoed in `cortex_review`'s response. |
-| `CORTEX_DUP_COSINE_THRESHOLD` | f64 | `0.85` | Cosine-similarity threshold for a not-yet-built dup-detection pass; echoed in `cortex_audit`'s response. |
+| `CORTEX_ELEGANCE_ADVISORY_ONLY` | bool | `true` | Whether elegance/style findings are advisory-only. Not yet consumed by `cortex_review`'s scoring (its `recommendation` is already advisory-only by construction — see the scoring rubric above). |
+| `CORTEX_DUP_COSINE_THRESHOLD` | f64 | `0.85` | `metrics::compute_signals`'s `semantic_duplication` cosine-similarity threshold; echoed in `cortex_audit`'s response. |
 | `CORTEX_MAX_BLAST_NODES` | usize | `200` | `cortex_scope`'s (CXEG-02) cap on the number of nodes enumerated into `blast_radius` before it sets `truncated:true` and stops walking. A zero/unparseable value falls back to the default rather than dropping every node. |
 | `CORTEX_TIER_B_PERCENTILE` | f64 | `90.0` | `metrics::compute_signals`'s (CXEG-03) percentile cut-point (0-100) for `centrality_spike`/`complexity_spike`/`fan_out_explosion`, computed against the project's own current-node distribution — self-calibrating, never a hardcoded absolute. |
-| `ATLAS_DATABASE_URL` | secret-shaped | none | Read exclusively through `crate::config::atlas_database_url()` — this crate has no separate `SecretManager`/`vault::manager()` API of its own; the runtime secret store is materialized into the process environment at deploy time (same convention as `crate::pki` and `scribe::graph::vec_embed`). `None` means the Atlas KG store is not configured (`cortex_scope` still degrades cleanly in this case, via `GraphStore`/`ScribeConfig`'s own `SCRIBE_KG_STORE_DIR`, which is independent of the Postgres DSN). |
+| `CORTEX_RISK_WEIGHT_CENTRALITY_SPIKE` | f64 | `2.0` | `cortex_review`'s (CXEG-04) per-point weight for a `centrality_spike` structural signal (`points = weight * severity`). |
+| `CORTEX_RISK_WEIGHT_COMPLEXITY_SPIKE` | f64 | `1.5` | Weight for a `complexity_spike` structural signal. |
+| `CORTEX_RISK_WEIGHT_FAN_OUT_EXPLOSION` | f64 | `1.5` | Weight for a `fan_out_explosion` structural signal. |
+| `CORTEX_RISK_WEIGHT_COMMUNITY_BOUNDARY_CROSSING` | f64 | `2.5` | Weight for a `community_boundary_crossing` structural signal (severity is always `1.0` for this kind, so this is effectively its flat per-instance point value). |
+| `CORTEX_RISK_WEIGHT_SEMANTIC_DUPLICATION` | f64 | `10.0` | Weight for a `semantic_duplication` structural signal — set much higher than the others because this signal's severity (`cosine - dup_cosine`) is bounded to a small `[0, ~0.15]` range by construction, unlike the percentile-relative signals' unbounded-above severities. |
+| `CORTEX_RISK_WEIGHT_RECURRENCE` | f64 | `1.0` | Weight applied to each KGFIND recurrence category's log-scaled magnitude (`log2(1 + total_occurrences)`). |
+| `CORTEX_RISK_BAND_ELEVATED_CUT` | f64 | `4.0` | `cortex_review`'s `"low"` -> `"elevated"` band cut-point. |
+| `ATLAS_DATABASE_URL` | secret-shaped | none | Read exclusively through `crate::config::atlas_database_url()` — this crate has no separate `SecretManager`/`vault::manager()` API of its own; the runtime secret store is materialized into the process environment at deploy time (same convention as `crate::pki` and `scribe::graph::vec_embed`). `None` means the Atlas KG store is not configured (`cortex_scope`/`cortex_review` still degrade cleanly in this case, via `GraphStore`/`ScribeConfig`'s own `SCRIBE_KG_STORE_DIR`, which is independent of the Postgres DSN; `cortex_review`'s `FindingsStore` connection is a SEPARATE consumer of this same DSN, degrading independently to `findings:"unavailable"`). |
+
+All 7 `risk_weight_*`/band-cut fields are "sane conservative defaults, tunable
+in CXEG-10 calibration" — none is derived from a live calibration run yet.
 
 Boolean flags accept `"1"`/`"true"`/`"yes"` (case-insensitive) as truthy;
 anything else (including unset) falls back to the default.
@@ -379,39 +533,49 @@ arguments — the pointer is returned unconditionally.
 
 `register()` (`src/cortex/mod.rs`) builds one shared `Arc<CortexConfig>`,
 registers the 3 real tools against it (`cortex_scope` live as of CXEG-02;
-`cortex_review`/`cortex_audit` still pending), then delegates to
-`crate::cortex::deprecated::register()` for the 7 aliases. Cortex is wired
-into **both** top-level registries in `src/registry.rs`: `register_all` (the
-core registry, served by `terminus-primary`/Chord) and `register_personal`
-(the personal registry) — unchanged from before CXEG-01.
+`cortex_review` live as of CXEG-04; `cortex_audit` still pending CXEG-11),
+then delegates to `crate::cortex::deprecated::register()` for the 7 aliases.
+Cortex is wired into **both** top-level registries in `src/registry.rs`:
+`register_all` (the core registry, served by `terminus-primary`/Chord) and
+`register_personal` (the personal registry) — unchanged from before CXEG-01.
 
 ## `crate::scribe::graph::cortex_bridge` — the one internal caller
 
 `src/scribe/graph/cortex_bridge.rs` (KGRULE-05) calls `cortex_review`
-internally to attach a best-effort risk signal to KG findings. As of CXEG-01
-it always gets `None` back — `cortex_review`'s pending-stub response carries
-no `risk_score` field for `cortex_bridge::extract_risk` to find — which is
-within `cortex_bridge`'s own documented degrade contract ("returns `None`...
-whenever... the tool call errors for any reason... [or] carries no numeric
-`risk`/`score` field"). No code change is needed there once CXEG-04 lands a
-real `risk_score`; the bridge is forward-compatible as-is.
+internally to attach a best-effort risk signal to KG findings, via
+`extract_risk`'s pure JSON lookup for a top-level (or one-level-nested under
+`result`) numeric `risk_score` field, rescaled `0-10 -> 0-1`. As of **CXEG-04**
+`cortex_review`'s live response carries exactly that field
+(`response.risk_score`, `0.0`-`10.0`), so `cortex_bridge` now returns a real
+signal instead of always `None` — with **no code change** in `cortex_bridge.rs`
+itself, exactly as its own module doc predicted ("once CXEG-04 lands a real
+`risk_score`, this bridge starts returning real signal with no code change
+here"). `cortex_bridge`'s degrade contract (returns `None` on any tool error,
+or when the response carries no numeric `risk`/`score`/`risk_score` field) is
+otherwise unchanged — a `cortex_review` degrade response (`configured:false`
+or a findings-unavailable structural-only score) still carries a numeric
+`risk_score` (`0.0` on the graph-unavailable path, a real structural-only
+value otherwise), so `cortex_bridge` treats both as a legitimate (if low-
+confidence) signal rather than `None`.
 
 ## Testing notes for this module
 
 `src/cortex/mod.rs`'s test module covers, without any network access:
 `project_id` validation (accepts `TERM`/`LUM`/`HARM`/`CHRD`/`RAIL`, rejects
 unknowns and the old legacy repo names), free-text length capping,
-`cortex_review`/`cortex_audit`'s `InvalidArgument` rejection paths and
-pending-pointer success shape, `cortex_scope`'s argument-validation/wiring
-(`project_id` rejection; the count-vs-abuse reconciliation — a long CSV of
-short paths AND a many-file diff both TRUNCATE with `truncated:true` rather
-than erroring, while a single over-`MAX_TEXT_LEN` element, an over-
-`MAX_CHANGED_FILES_ARG` array, and a pathologically huge single-blob `diff`
-are each rejected; "neither changed_files nor diff" rejection; array-form and
-diff-only-form acceptance; and a `configured:false` degrade smoke test against
-an empty store dir),
-`cortex_audit`'s unchanged SSRF-guard rejections, and full registration
-(`register()` yields exactly 10 tool names, all `cortex_*`).
+`cortex_audit`'s `InvalidArgument` rejection path and pending-pointer success
+shape, `cortex_scope`'s AND `cortex_review`'s shared argument-validation/
+wiring via `validate_and_parse_changed_files` (`project_id` rejection; the
+count-vs-abuse reconciliation — a long CSV of short paths AND a many-file
+diff both TRUNCATE with `truncated:true` rather than erroring, while a single
+over-`MAX_TEXT_LEN` element, an over-`MAX_CHANGED_FILES_ARG` array, and a
+pathologically huge single-blob `diff` are each rejected; "neither
+changed_files nor diff" rejection; array-form and diff-only-form acceptance
+for both tools), `cortex_review`'s `configured:false`/`band:"unknown"`
+degrade smoke test against an empty store dir, `cortex_scope`'s own
+`configured:false` degrade smoke test, `cortex_audit`'s unchanged SSRF-guard
+rejections, and full registration (`register()` yields exactly 10 tool
+names, all `cortex_*`).
 `src/cortex/scope.rs`'s test module covers the full blast-radius derivation
 against a small fixture graph (2 files, a `calls` edge and a `references`
 edge, 2 distinct clusters): `changed_files_from_args`'s array/CSV/diff
@@ -440,6 +604,27 @@ shape (including empty args), and no alias's `execute` does any I/O.
 `src/cortex/audit.rs`'s test module is unchanged — it separately covers every
 branch of `validate_repo_url()`, including the SSRF bypass-encoding
 regression tests.
+`src/cortex/review.rs`'s test module (CXEG-04) covers `score` as a PURE
+function against synthetic `EleganceSignal`/recurrence inputs — no live
+Postgres needed: bands (`"low"` for no signals/recurrence, `"high"` for
+severe structural + heavy recurrence), `contributions` reconstructing the
+raw pre-clamp score exactly (a fixture deliberately exceeding the `10.0`
+ceiling), determinism (repeat calls, and recurrence-input order not
+affecting the result), band-boundary determinism (exactly-at-cut-point
+values resolve to the HIGHER band), the log-scaled (not linear) growth of
+`recurrence_magnitude`, and `recommendation_for` never containing "reject"
+for any band. `touched_recurrence` and `compute_review`'s async,
+I/O-touching paths are tested against a fixture `GraphStore` (seeded via
+`SCRIBE_KG_STORE_DIR`, `#[serial_test::serial]`) with `ATLAS_DATABASE_URL`
+absent (skipping gracefully, mirroring `metrics.rs`'s own
+`compute_signals_degrades_when_vector_store_unconfigured` pattern, if a real
+DSN happens to be live in the test process): a hub-touching change fires
+structural signals and scores `> 0`; a small uniform-distribution change
+scores `"low"`/`0.0`; the graph-unavailable path degrades to
+`configured:false`/`band:"unknown"`/`findings:"unavailable"` (never an
+error) and still propagates `truncated`; `touched_recurrence` itself degrades
+to `(vec![], "unavailable")` without a configured DSN; and repeated
+`compute_review` calls over the same fixture are byte-identical.
 
 ## History
 
@@ -461,7 +646,17 @@ stub with the real Atlas-backed blast-radius implementation described above
 (`src/cortex/scope.rs`), reusing `review::kg_context::derive_changed_files`
 and the same `GraphStore`/`KnowledgeGraph` query API `kg_neighbors`/
 `build_kg_block` already use rather than standing up a second graph-walk.
-`cortex_review`/`cortex_audit` remain pending CXEG-04/CXEG-11.
+**CXEG-03** added the standalone Tier-B structural-elegance signal library
+(`src/cortex/metrics.rs`) without yet wiring it into `cortex_review`. **CXEG-04**
+then replaced `cortex_review`'s pending-pointer stub with the real
+Atlas-backed risk-scoring implementation described above (`src/cortex/review.rs`):
+CXEG-03's structural signals plus KGFIND-01 recurrence, combined via a pure,
+fully-explainable, log-scaled scoring function into a `risk_score`/`band`/
+`recommendation` that only ever escalates review rigor, never auto-rejects.
+It also factored `cortex_scope`'s argument-validation logic out into the
+shared `validate_and_parse_changed_files` helper (`src/cortex/mod.rs`) so
+`cortex_review` reuses the identical validation rather than a second copy.
+`cortex_audit` remains pending CXEG-11.
 
 ---
 

@@ -755,16 +755,35 @@ Its risk/elegance surface is rebuilt over the following S115 items:
   path over `MAX_TEXT_LEN`, a DoS-scale `diff`/string over `MAX_DIFF_LEN`, or an
   array over `MAX_CHANGED_FILES_ARG` — ceilings set far above the file-count
   cap so real diffs truncate, not reject).
-- `cortex_review` — post-change `risk_score` (0–10) + named `risk_signals`
-  from Atlas structural metrics and KGFIND recurrence (stub pending **CXEG-04**).
-  Its structural-metrics half now exists as a standalone library
+- `cortex_review` — post-change risk assessment, live as of **CXEG-04**:
+  given `project_id` + `changed_files`/`diff` (same argument shapes as
+  `cortex_scope`, sharing its validation via
+  `crate::cortex::validate_and_parse_changed_files`), it combines CXEG-03's
+  structural-elegance signals (`metrics::compute_signals`, over the diff's
+  touched Atlas nodes) with KGFIND-01 recurrence counts for the same touched
+  node/path/community scopes (`scribe::graph::findings_store::FindingsStore`
+  — the same store `kg_findings` reads, no second access path) into a single
+  `risk_score` (0–10, clamped), a `band` (`low`/`elevated`/`high`), the full
+  `risk_signals` list, and per-source `contributions` (`{source, weight,
+  points}`) whose `points` sum reconstructs the raw pre-clamp score —
+  nothing hidden. Recurrence is log-scaled (`log2(1 + occurrences)`) so one
+  pathologically-recurring finding bucket can't alone pin the score at the
+  ceiling. `recommendation` only ever ESCALATES review rigor for a high
+  band — never an auto-reject. Degrades cleanly, never erroring: no stored
+  Atlas graph yet → `configured:false` + `band:"unknown"` (mirrors
+  `cortex_scope`'s own degrade shape); an unconfigured/unreachable findings
+  store → a structural-only score labeled `findings:"unavailable"`; a
+  reachable store with no matching recurrence → `findings:"empty"` (distinct
+  from `"unavailable"`). See `src/cortex/review.rs` and
+  `docs/tools/code-git/cortex.md`'s `cortex_review` section for the full
+  rubric, weights, and response shape.
+  Its structural-metrics half is a standalone library
   (`src/cortex/metrics.rs`, **CXEG-03**): `metrics::compute_signals` turns a
   `cortex_scope` blast radius into five named, no-LLM structural-elegance
   signals — `centrality_spike`, `community_boundary_crossing`,
   `semantic_duplication`, `complexity_spike`, `fan_out_explosion` — each with
   a percentile-relative (self-calibrating, never hardcoded) threshold, a
-  non-empty deterministic `why`, and a resolvable anchor node. Not yet wired
-  into `cortex_review`'s response (that wiring is CXEG-04's job); see
+  non-empty deterministic `why`, and a resolvable anchor node; see
   `docs/tools/code-git/cortex.md`'s "Tier-B structural-elegance signals"
   section for the full signal catalog.
 - `cortex_audit` — audit an external public repo URL (stub pending **CXEG-11**);
