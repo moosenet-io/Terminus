@@ -41,6 +41,7 @@
 
 pub mod conn;
 pub mod ddl;
+pub mod execute;
 pub mod identities;
 pub mod query;
 
@@ -77,6 +78,7 @@ impl PgConnections {
 pub fn register(registry: &mut ToolRegistry) {
     identities::register(registry);
     query::register(registry);
+    execute::register(registry);
     ddl::register(registry);
 }
 
