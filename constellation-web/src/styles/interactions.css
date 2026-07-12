@@ -1,0 +1,87 @@
+/* SPOL-07: Global interaction states and micro-animations */
+
+/* ── Buttons ─────────────────────────────────────────────────────────────── */
+.h-btn {
+  transition: background var(--transition-fast), opacity var(--transition-fast),
+              transform var(--transition-fast);
+}
+.h-btn:hover:not(:disabled) { filter: brightness(1.1); }
+.h-btn:active:not(:disabled) { filter: brightness(0.95); transform: scale(0.98); }
+.h-btn:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+.h-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ── Links ───────────────────────────────────────────────────────────────── */
+a, .h-link {
+  transition: color var(--transition-fast);
+}
+a:hover, .h-link:hover {
+  color: var(--accent-primary);
+  text-decoration: underline;
+}
+a:focus-visible, .h-link:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+/* ── Table / list rows ───────────────────────────────────────────────────── */
+.h-row {
+  transition: background var(--transition-fast);
+  cursor: default;
+}
+.h-row:hover { background: var(--bg-surface-raised); }
+
+/* ── Status dots ─────────────────────────────────────────────────────────── */
+.h-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.h-dot-pulse {
+  animation: dot-pulse 2s ease-in-out infinite;
+}
+@keyframes dot-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.6; }
+}
+
+/* ── Loading skeletons ───────────────────────────────────────────────────── */
+/* .h-skeleton + its shimmer keyframes are defined once in globals.css — not duplicated here. */
+
+/* ── Page / content transitions ──────────────────────────────────────────── */
+.h-fade-in {
+  animation: fade-in 150ms ease forwards;
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* ── Expandable sections ─────────────────────────────────────────────────── */
+.h-expandable-body {
+  overflow: hidden;
+  transition: max-height var(--transition-default), opacity var(--transition-default);
+}
+.h-expandable-body[data-expanded="false"] {
+  max-height: 0;
+  opacity: 0;
+}
+.h-expandable-body[data-expanded="true"] {
+  max-height: 9999px; /* large enough; real height unknown at expand time */
+  opacity: 1;
+}
+
+/* ── Reduced motion ──────────────────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+}

@@ -1,0 +1,274 @@
+/* Constellation Control Plane — Design System */
+/* CONST-04: ported from harmony-web's SPOL-01/02 design-token system (generic, no rebrand needed) */
+
+:root {
+  /* === SPOL-01: Design tokens === */
+
+  /* Backgrounds */
+  --bg-base: #0f1117;
+  --bg-surface: #161b22;
+  --bg-surface-raised: #1c2129;
+  --bg-surface-overlay: #242b35;
+
+  /* Borders */
+  --border-subtle: rgba(255,255,255,0.06);
+  --border-default: rgba(255,255,255,0.10);
+  --border-emphasis: rgba(255,255,255,0.16);
+
+  /* Text */
+  --text-primary: #e6edf3;
+  --text-secondary: #8b949e;
+  --text-tertiary: #6e7681;
+  --text-accent: #5ce0d8;
+
+  /* Status */
+  --status-success: #3fb950;
+  --status-warning: #d29922;
+  --status-error: #f85149;
+  --status-info: #58a6ff;
+
+  /* Accent */
+  --accent-primary: #5ce0d8;
+  --accent-primary-subtle: rgba(92,224,216,0.12);
+
+  /* Typography */
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 20px;
+  --text-metric: 24px;
+
+  /* Spacing */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+
+  /* Radius */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+
+  /* Shadows */
+  --shadow-card: 0 1px 3px rgba(0,0,0,0.3), 0 1px 2px rgba(0,0,0,0.2);
+  --shadow-card-elevated: 0 4px 12px rgba(0,0,0,0.3), 0 2px 4px rgba(0,0,0,0.2);
+
+  /* Transitions */
+  --transition-fast: 120ms ease;
+  --transition-default: 200ms ease;
+
+  /* === Legacy tokens (backward-compatible aliases) === */
+  --h-bg: var(--bg-base);
+  --h-bg-card: var(--bg-surface);
+  --h-bg-hover: var(--bg-surface-raised);
+  --h-bg-active: var(--accent-primary-subtle);
+  --h-border: var(--border-default);
+  --h-teal: var(--accent-primary);
+  --h-teal-dim: rgba(92, 224, 216, 0.6);
+  --h-green: var(--status-success);
+  --h-amber: var(--status-warning);
+  --h-red: var(--status-error);
+  --h-red-dim: color-mix(in srgb, var(--status-error) 70%, white); /* was #f07770 */
+  --h-blue: var(--status-info);
+  --h-text: var(--text-primary);
+  --h-text-dim: var(--text-secondary);
+  --h-text-muted: var(--text-tertiary);
+  --h-sidebar-w: 200px;
+  --h-radius: var(--radius-lg);
+  --h-font-mono: var(--font-mono);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--text-md);
+  line-height: 1.5;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--h-border); border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: var(--h-text-dim); }
+
+/* Card — SPOL-02: surface lift, subtle border, shadow */
+.h-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast), transform var(--transition-fast);
+}
+
+/* Interactive card variant: hover lift */
+.h-card-interactive {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast),
+              box-shadow var(--transition-fast), transform var(--transition-fast);
+}
+.h-card-interactive:hover {
+  background: var(--bg-surface-raised);
+  border-color: var(--border-emphasis);
+  box-shadow: var(--shadow-card-elevated);
+  transform: translateY(-1px);
+}
+
+.h-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-3) var(--space-4);
+  cursor: pointer;
+  user-select: none;
+  border-bottom: 1px solid var(--border-subtle);
+  gap: var(--space-2);
+  transition: background var(--transition-fast);
+}
+.h-card-header:hover { background: var(--bg-surface-raised); }
+
+.h-card-body {
+  padding: var(--space-3) var(--space-4);
+}
+
+/* Card grid — consistent gaps */
+.h-card-grid {
+  display: grid;
+  gap: var(--space-4);
+}
+.h-card-grid-2 { grid-template-columns: 1fr 1fr; }
+@media (max-width: 640px) {
+  .h-card-grid-2 { grid-template-columns: 1fr; }
+}
+
+/* Status dots */
+.h-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.h-dot-green { background: var(--status-success); }
+.h-dot-amber { background: var(--status-warning); }
+.h-dot-red { background: var(--status-error); }
+.h-dot-blue { background: var(--status-info); }
+.h-dot-dim { background: var(--text-tertiary); }
+.h-dot-teal { background: var(--accent-primary); }
+
+/* Pulse animation for waiting/active */
+@keyframes h-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+.h-pulse { animation: h-pulse 1.5s ease-in-out infinite; }
+
+/* Text utilities */
+.h-mono { font-family: var(--font-mono); font-size: var(--text-sm); }
+.h-dim { color: var(--text-secondary); }
+.h-muted { color: var(--text-tertiary); }
+.h-teal { color: var(--accent-primary); }
+.h-green { color: var(--status-success); }
+.h-amber { color: var(--status-warning); }
+.h-red { color: var(--status-error); }
+
+/* Layout helpers */
+.h-flex { display: flex; align-items: center; }
+.h-gap-sm { gap: var(--space-1); }
+.h-gap-md { gap: 10px; }
+.h-gap-lg { gap: var(--space-4); }
+.h-flex-1 { flex: 1; }
+.h-truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Button */
+.h-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-4);
+  border: none;
+  border-radius: var(--radius-md);
+  font-size: var(--text-base);
+  font-weight: 500;
+  cursor: pointer;
+  transition: opacity var(--transition-fast);
+}
+.h-btn:disabled { opacity: 0.4; cursor: default; }
+.h-btn-green { background: var(--status-success); color: #0a0a0a; }
+.h-btn-red { background: var(--status-error); color: #fff; }
+.h-btn-teal { background: var(--accent-primary); color: #0a0a0a; }
+.h-btn-ghost { background: var(--bg-surface); color: var(--text-primary); border: 1px solid var(--border-default); }
+.h-btn:not(:disabled):hover { opacity: 0.85; }
+
+/* Table */
+.h-table { width: 100%; border-collapse: collapse; }
+.h-table th, .h-table td { padding: 7px 10px; text-align: left; border-bottom: 1px solid var(--border-subtle); }
+.h-table th { color: var(--text-secondary); font-weight: 500; font-size: var(--text-sm); text-transform: uppercase; letter-spacing: 0.05em; }
+.h-table tr:last-child td { border-bottom: none; }
+.h-table tr:hover td { background: var(--bg-surface-raised); }
+
+/* Progress bar */
+.h-progress { height: 4px; border-radius: var(--radius-sm); background: var(--bg-surface-raised); overflow: hidden; }
+.h-progress-fill { height: 100%; border-radius: var(--radius-sm); transition: width 0.3s; }
+.h-progress-green .h-progress-fill { background: var(--status-success); }
+.h-progress-amber .h-progress-fill { background: var(--status-warning); }
+.h-progress-red .h-progress-fill { background: var(--status-error); }
+
+/* Badge/pill */
+.h-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: var(--space-1) var(--space-2);
+  border-radius: 10px;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+.h-badge-green { background: rgba(63,185,80,0.15); color: var(--status-success); }
+.h-badge-amber { background: rgba(210,153,34,0.15); color: var(--status-warning); }
+.h-badge-red { background: rgba(248,81,73,0.15); color: var(--status-error); }
+.h-badge-teal { background: var(--accent-primary-subtle); color: var(--accent-primary); }
+.h-badge-dim { background: var(--bg-surface-raised); color: var(--text-secondary); }
+
+/* Loading skeleton */
+@keyframes h-shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.h-skeleton {
+  background: linear-gradient(90deg, var(--bg-surface) 25%, var(--bg-surface-raised) 50%, var(--bg-surface) 75%);
+  background-size: 200% 100%;
+  animation: h-shimmer 1.5s infinite;
+  border-radius: var(--radius-sm);
+}
+
+/* Section segment bar for Ralph loop */
+.h-segments { display: flex; gap: 3px; width: 100%; }
+.h-segment {
+  flex: 1;
+  height: 5px;
+  border-radius: var(--radius-sm);
+  transition: opacity 0.3s;
+}
+.h-segment-pending { opacity: 0.15; }
+.h-segment-active { opacity: 1; box-shadow: 0 0 6px currentColor; }
+.h-segment-done { opacity: 1; }
+.h-segment-failed { background: var(--status-error) !important; }
