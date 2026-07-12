@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use crate::scribe::graph::model::KnowledgeGraph;
+use crate::scribe::graph::rules_store::{RuleRow, RulesStore};
 use crate::scribe::graph::store::GraphStore;
 use crate::scribe::ScribeConfig;
 
@@ -32,6 +33,12 @@ const MAX_NEIGHBORS_PER_SYMBOL: usize = 5;
 /// Approximate serialized-size cap (bytes); enforced by trimming symbols and
 /// setting `"truncated": true` rather than emitting an oversized block.
 const MAX_BLOCK_BYTES: usize = 2048;
+
+/// KGRULE-04: hard caps for the `active_rules` block, mirroring
+/// `MAX_SYMBOLS`/`MAX_BLOCK_BYTES` above but sized for rules (no
+/// per-file/per-symbol grouping, so a flat cap suffices).
+const MAX_RULES: usize = 20;
+const MAX_RULES_BYTES: usize = 2048;
 
 /// Derive the repo-relative changed-file list from a review `context`.
 ///
@@ -208,6 +215,137 @@ pub fn inject(context: &mut Value) {
     }
 }
 
+/// Sort priority mirroring `rules_store::Enforcement`'s own ordering
+/// (`Advisory < LintCandidate < Blocking`), duplicated here as a plain
+/// string match so `select_rules_for_context` stays free of any DB/async
+/// dependency and is trivially unit-testable.
+fn enforcement_priority(enforcement: &str) -> i32 {
+    match enforcement {
+        "blocking" => 2,
+        "lint-candidate" => 1,
+        _ => 0,
+    }
+}
+
+/// KGRULE-04: pure selection + bounding of active rules for a review context.
+///
+/// `rules` is the full set of active rules already loaded for the project
+/// (unordered — this function does its own ordering, so callers don't need
+/// to rely on the store's own `ORDER BY`). A rule applies if it is
+/// `scope_kind == "global"`, or its `scope_ref` is present in
+/// `changed_files` (the caller may pass both changed file paths AND touched
+/// symbol ids in this slice, so both `path`- and `node`-scoped rules can
+/// match). Applicable rules are ordered by enforcement (`blocking` >
+/// `lint-candidate` > `advisory`) then most-recently-created first, then
+/// truncated to `cap`. No I/O — fully unit-testable without a DB.
+pub fn select_rules_for_context(rules: Vec<RuleRow>, changed_files: &[String], cap: usize) -> Vec<Value> {
+    let changed: std::collections::HashSet<&str> = changed_files.iter().map(|s| s.as_str()).collect();
+
+    let mut applicable: Vec<RuleRow> = rules
+        .into_iter()
+        .filter(|r| r.scope_kind == "global" || changed.contains(r.scope_ref.as_str()))
+        .collect();
+
+    applicable.sort_by(|a, b| {
+        enforcement_priority(&b.enforcement)
+            .cmp(&enforcement_priority(&a.enforcement))
+            .then(b.created_at.cmp(&a.created_at))
+    });
+
+    applicable
+        .into_iter()
+        .take(cap)
+        .map(|r| {
+            json!({
+                "scope_kind": r.scope_kind,
+                "scope_ref": r.scope_ref,
+                "category": r.category,
+                "guidance": r.guidance,
+                "enforcement": r.enforcement,
+            })
+        })
+        .collect()
+}
+
+/// KGRULE-04: inject a bounded `"active_rules"` array into `context`,
+/// closing the loop between rule crystallization/promotion (KGRULE-01..03)
+/// and enforcement — the same rules the system has learned are now surfaced
+/// to every reviewer.
+///
+/// Best-effort and entirely additive:
+/// - No `project_id` in `context` -> no-op.
+/// - `RulesStore::from_env()` returns `NotConfigured` (no `ATLAS_DATABASE_URL`)
+///   -> no-op. This is what keeps a rules-store-unconfigured review's context
+///   byte-for-byte unchanged (backward compatible with pre-KGRULE-04
+///   behavior).
+/// - Any other store/lookup error -> also a no-op (never surfaces an error,
+///   never panics, never blocks/delays the review).
+/// - No applicable active rules for the changed files/symbols/global scope
+///   -> no-op (an empty `active_rules` array is never injected, mirroring
+///   `inject`'s own "no empty block" contract for `knowledge_graph`).
+///
+/// Must be called from an async context (this awaits `RulesStore`'s sqlx
+/// calls) — see `review::execute()`, which calls this right after the sync
+/// `inject()` KGREV-01 grounding step.
+pub async fn inject_active_rules(context: &mut Value) {
+    let Some(project_id) = context.get("project_id").and_then(|v| v.as_str()).map(|s| s.to_string()) else {
+        return;
+    };
+
+    let store = match RulesStore::from_env().await {
+        Ok(store) => store,
+        Err(_) => return, // NotConfigured or any other from_env error -> no-op
+    };
+
+    let changed_files = derive_changed_files(context);
+
+    // Include touched symbol ids alongside the changed file paths so
+    // node-scoped rules for symbols defined in the changed files are
+    // considered too (mirrors `inject`'s own "blast radius" grounding) --
+    // best-effort: no graph/no store for the project just means no node-scope
+    // ids get added, never an error.
+    let mut scope_refs = changed_files.clone();
+    if !changed_files.is_empty() {
+        let kg_store = GraphStore::from_config(&ScribeConfig::from_env());
+        if let Ok(Some(graph)) = kg_store.load(&project_id) {
+            let changed: std::collections::HashSet<&str> = changed_files.iter().map(|s| s.as_str()).collect();
+            for n in graph.current_nodes().filter(|n| changed.contains(n.path.as_str())) {
+                scope_refs.push(n.id.clone());
+            }
+        }
+    }
+
+    let rules = match store.list_active(&project_id, None, None, None).await {
+        Ok(rules) => rules,
+        Err(_) => return, // best-effort -- a lookup failure leaves context unchanged
+    };
+
+    let selected = select_rules_for_context(rules, &scope_refs, MAX_RULES);
+    if selected.is_empty() {
+        return;
+    }
+
+    let mut block = json!(selected);
+    // Enforce the serialized-size cap by progressively dropping the
+    // lowest-priority (trailing, per our enforcement/recency sort) entries
+    // rather than emitting an oversized prompt payload -- mirrors
+    // `build_kg_block`'s own size-cap loop.
+    while serde_json::to_string(&block).map(|s| s.len()).unwrap_or(0) > MAX_RULES_BYTES {
+        let Some(arr) = block.as_array_mut() else { break };
+        if arr.pop().is_none() || arr.is_empty() {
+            break;
+        }
+    }
+
+    if block.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+        return; // everything got trimmed away -- don't inject an empty array
+    }
+
+    if let Value::Object(map) = context {
+        map.insert("active_rules".to_string(), block);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +467,109 @@ diff --git a/deleted.rs b/deleted.rs\n\
 
         let _ = fs::remove_dir_all(&store_dir);
         std::env::remove_var("SCRIBE_KG_STORE_DIR");
+    }
+
+    // ── KGRULE-04: select_rules_for_context (pure) ─────────────────────
+
+    fn rule(scope_kind: &str, scope_ref: &str, category: &str, enforcement: &str, created_offset_secs: i64) -> RuleRow {
+        let now = chrono::Utc::now();
+        RuleRow {
+            id: uuid::Uuid::new_v4(),
+            project_id: "TERM".to_string(),
+            scope_kind: scope_kind.to_string(),
+            scope_ref: scope_ref.to_string(),
+            category: category.to_string(),
+            guidance: format!("guidance for {scope_ref}"),
+            enforcement: enforcement.to_string(),
+            status: "active".to_string(),
+            provenance: json!({}),
+            recurrence_at_creation: Some(3),
+            cortex_risk: None,
+            created_at: now + chrono::Duration::seconds(created_offset_secs),
+            valid_from: now,
+            valid_to: None,
+        }
+    }
+
+    #[test]
+    fn select_rules_includes_matching_path_and_global_excludes_unrelated() {
+        let rules = vec![
+            rule("path", "src/a.rs", "style", "advisory", 0),
+            rule("path", "src/unrelated.rs", "style", "advisory", 0),
+            rule("global", "*", "safety", "advisory", 0),
+        ];
+        let selected = select_rules_for_context(rules, &["src/a.rs".to_string()], 20);
+        let scope_refs: Vec<&str> = selected.iter().map(|v| v["scope_ref"].as_str().unwrap()).collect();
+        assert!(scope_refs.contains(&"src/a.rs"));
+        assert!(scope_refs.contains(&"*"), "global-scope rule always applies");
+        assert!(!scope_refs.contains(&"src/unrelated.rs"));
+        assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn select_rules_includes_node_scope_when_scope_ref_in_changed_set() {
+        // Callers pass touched symbol ids alongside file paths in the same
+        // slice; a node-scoped rule matches by scope_ref membership just like
+        // a path-scoped one.
+        let rules = vec![rule("node", "crate::a::foo", "correctness", "advisory", 0)];
+        let selected = select_rules_for_context(rules, &["src/a.rs".to_string(), "crate::a::foo".to_string()], 20);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0]["scope_ref"], "crate::a::foo");
+    }
+
+    #[test]
+    fn select_rules_orders_by_enforcement_then_recency() {
+        let rules = vec![
+            rule("global", "*", "a", "advisory", -100),
+            rule("global", "*", "b", "blocking", -50),
+            rule("global", "*", "c", "lint-candidate", 0),
+            rule("global", "*", "d", "advisory", -10),
+        ];
+        let selected = select_rules_for_context(rules, &[], 20);
+        let cats: Vec<&str> = selected.iter().map(|v| v["category"].as_str().unwrap()).collect();
+        // blocking first, then lint-candidate, then advisory-by-recency (d
+        // newer than a).
+        assert_eq!(cats, vec!["b", "c", "d", "a"]);
+    }
+
+    #[test]
+    fn select_rules_truncates_to_cap() {
+        let rules: Vec<RuleRow> = (0..30).map(|i| rule("global", "*", &format!("cat{i}"), "advisory", i)).collect();
+        let selected = select_rules_for_context(rules, &[], 5);
+        assert_eq!(selected.len(), 5);
+    }
+
+    #[test]
+    fn select_rules_empty_when_nothing_applies() {
+        let rules = vec![rule("path", "src/unrelated.rs", "style", "advisory", 0)];
+        let selected = select_rules_for_context(rules, &["src/a.rs".to_string()], 20);
+        assert!(selected.is_empty());
+    }
+
+    // ── KGRULE-04: inject_active_rules (async, degrade + backward compat) ─
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn inject_active_rules_unconfigured_store_leaves_context_unchanged() {
+        // Mirrors the sibling kg_* tool tests' own shape: never mutate global
+        // env to force NotConfigured if a real DSN is already present in this
+        // process.
+        if std::env::var("ATLAS_DATABASE_URL").is_ok() {
+            return;
+        }
+        let mut ctx = json!({"project_id": "TERM", "changed_files": ["src/a.rs"]});
+        let before = ctx.clone();
+        inject_active_rules(&mut ctx).await;
+        assert_eq!(ctx, before, "unconfigured rules store -> context unchanged, byte-for-byte");
+        assert!(ctx.get("active_rules").is_none());
+    }
+
+    #[tokio::test]
+    async fn inject_active_rules_is_noop_without_project_id() {
+        let mut ctx = json!({"changed_files": ["src/a.rs"]});
+        let before = ctx.clone();
+        inject_active_rules(&mut ctx).await;
+        assert_eq!(ctx, before);
+        assert!(ctx.get("active_rules").is_none());
     }
 }

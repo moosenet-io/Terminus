@@ -549,6 +549,15 @@ than failing the whole call."
         // KGREV-01: best-effort, backward-compatible KG grounding -- a no-op
         // unless `context.project_id` is present AND a matching graph exists.
         kg_context::inject(&mut context);
+        // KGRULE-04: best-effort, backward-compatible active-rules injection
+        // -- closes the loop between rule crystallization/promotion
+        // (KGRULE-01..03) and enforcement by surfacing the rules the system
+        // has learned to every reviewer. A no-op (context byte-for-byte
+        // unchanged) when the rules store is unconfigured, matching
+        // `kg_context::inject`'s own degrade contract. Must run here (in the
+        // async `execute()` body) rather than inside the sync `inject()`
+        // above, since `RulesStore` is sqlx-backed and awaits its queries.
+        kg_context::inject_active_rules(&mut context).await;
         let cfg = ReviewConfig::from_env();
 
         let mut set = tokio::task::JoinSet::new();
