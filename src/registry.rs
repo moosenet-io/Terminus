@@ -15,6 +15,14 @@ use crate::tool::{RustTool, ToolOutput};
 /// Tools are identified by name. On dispatch, the registry finds the matching
 /// tool and calls its `execute` method. Duplicate names are rejected at
 /// registration time (first registration wins and returns an error for duplicates).
+///
+/// TMOD-01: a whole `ToolRegistry` value is what gets installed as a fresh
+/// `ArcSwap` snapshot (`McpServerState::swap_registry`, see
+/// `crate::mcp_server`'s module doc for the hot-swap invariant) — a swap
+/// always builds a brand-new `ToolRegistry` (e.g. via `register_all` into an
+/// empty one) and moves it into a single `Arc::new(..)`, so no tool's boxed
+/// state is ever deep-cloned; only the one-time `Arc` allocation for the
+/// whole registry happens per swap.
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn RustTool>>,
     /// Ordered list for catalog output (preserves registration order)

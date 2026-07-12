@@ -74,6 +74,12 @@ log = "0.4"
 # direct dep here so `src/forge/mirror/clean.rs` can call it. unix-gated at use.
 libc = "0.2"
 async-trait = "0.1"
+# TMOD-01: lock-free hot-swap container for McpServerState's tool registry
+# snapshot (already present transitively via `redis`; pinned as a direct dep
+# here so `src/mcp_server.rs` can build/swap registry snapshots without a
+# deep clone of the boxed tool trait objects). Version matches the
+# transitive one already resolved in Cargo.lock.
+arc-swap = "1.9"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
