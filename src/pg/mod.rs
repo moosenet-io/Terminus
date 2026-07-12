@@ -39,6 +39,7 @@
 //! `PgPool`, unchanged and unrouted through this suite. See `S115`'s
 //! "Grounding summary" for the full rationale.
 
+pub mod admin;
 pub mod conn;
 pub mod ddl;
 pub mod execute;
@@ -80,6 +81,7 @@ pub fn register(registry: &mut ToolRegistry) {
     query::register(registry);
     execute::register(registry);
     ddl::register(registry);
+    admin::register(registry);
 }
 
 #[cfg(test)]
