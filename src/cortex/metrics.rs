@@ -179,8 +179,18 @@ fn complexity_proxy(n: &KgNode) -> Option<u32> {
 /// Out-degree via the shared [`one_hop_neighbors`] walk (reuse, not a second
 /// edge-iteration) — outgoing-only, so a node's *callee* fan-out specifically
 /// (not its total in+out `degree`).
+///
+/// `one_hop_neighbors` intentionally returns the RAW edge set (it does not
+/// filter bi-temporally invalidated endpoints — see its doc), so each
+/// neighbor id is resolved here and one pointing at a since-invalidated node
+/// (`valid_to.is_some()`) or a missing node is dropped: an outbound edge to a
+/// removed symbol must NOT inflate a live node's fan-out (matching the
+/// current-only view every other detector uses).
 fn out_degree(graph: &KnowledgeGraph, id: &str) -> usize {
-    one_hop_neighbors(graph, id, NeighborFilter::Out).len()
+    one_hop_neighbors(graph, id, NeighborFilter::Out)
+        .into_iter()
+        .filter(|nb| graph.get_node(&nb.id).is_some_and(|n| n.valid_to.is_none()))
+        .count()
 }
 
 // ── centrality_spike ────────────────────────────────────────────────────────
@@ -372,10 +382,19 @@ fn count_cross_community_edges(graph: &KnowledgeGraph, pair: (u32, u32)) -> usiz
 /// embed+query round trip ([`semantic_duplication_signals`]) so the
 /// decision logic is testable with a fixture hit list and no live vector
 /// store.
-fn duplication_signal_from_hits(anchor: &KgNode, hits: &[(String, f32)], dup_cosine: f64) -> Option<EleganceSignal> {
+///
+/// Hits are filtered to CURRENT graph nodes before ranking: the vector store
+/// may retain rows for nodes later invalidated in (or removed from) the
+/// graph, so a hit whose `node_id` resolves to no node — or to one with
+/// `valid_to.is_some()` — is DROPPED, never counted as a real duplication
+/// match. This mirrors `kg_semantic_search`'s own contract (it drops stale +
+/// bi-temporally invalidated hits via `map_topk_to_results`).
+fn duplication_signal_from_hits(anchor: &KgNode, hits: &[(String, f32)], graph: &KnowledgeGraph, dup_cosine: f64) -> Option<EleganceSignal> {
     let best = hits
         .iter()
         .filter(|(id, _)| id != &anchor.id)
+        // Only a CURRENT (non-invalidated, still-present) node counts.
+        .filter(|(id, _)| graph.get_node(id).is_some_and(|n| n.valid_to.is_none()))
         .max_by(|a, b| a.1.total_cmp(&b.1))?;
     let (dup_id, score) = best;
     let score = *score as f64;
@@ -457,7 +476,7 @@ async fn semantic_duplication_signals(touched: &[&KgNode], graph: &KnowledgeGrap
                 break;
             }
         };
-        if let Some(sig) = duplication_signal_from_hits(n, &hits, config.dup_cosine) {
+        if let Some(sig) = duplication_signal_from_hits(n, &hits, graph, config.dup_cosine) {
             out.push(sig);
         }
     }
@@ -698,6 +717,29 @@ mod tests {
         assert_eq!(sigs[0].kind, SignalKind::FanOutExplosion);
     }
 
+    #[test]
+    fn out_degree_excludes_edge_to_invalidated_node() {
+        // A node with two outbound edges, one to a node whose file was later
+        // invalidated: only the CURRENT neighbor counts toward out-degree.
+        let mut g = KnowledgeGraph::new("TERM");
+        g.insert_node(node("crate::a::caller", NodeKind::Function, "src/a.rs"));
+        g.insert_node(node("crate::b::live", NodeKind::Function, "src/b.rs"));
+        g.insert_node(node("crate::c::dead", NodeKind::Function, "src/c.rs"));
+        g.insert_edge(KgEdge::new("crate::a::caller", "crate::b::live", EdgeKind::Calls, Confidence::Extracted)).unwrap();
+        g.insert_edge(KgEdge::new("crate::a::caller", "crate::c::dead", EdgeKind::Calls, Confidence::Extracted)).unwrap();
+
+        assert_eq!(out_degree(&g, "crate::a::caller"), 2, "both edges current before invalidation");
+
+        let seq = g.next_build_seq();
+        assert_eq!(g.invalidate_path("src/c.rs", seq), 1);
+
+        assert_eq!(
+            out_degree(&g, "crate::a::caller"),
+            1,
+            "the edge to the invalidated node must be excluded from out-degree"
+        );
+    }
+
     // ── community_boundary_crossing ──────────────────────────────────────
 
     #[test]
@@ -763,11 +805,22 @@ mod tests {
 
     // ── semantic_duplication: pure decision helper ──────────────────────
 
+    /// A graph in which both the anchor and a candidate duplicate are CURRENT
+    /// nodes, so `duplication_signal_from_hits`'s current-node filter passes
+    /// them through and the ranking/threshold logic is what's under test.
+    fn dup_graph() -> KnowledgeGraph {
+        let mut g = KnowledgeGraph::new("TERM");
+        g.insert_node(node("crate::new::thing", NodeKind::Function, "src/new.rs"));
+        g.insert_node(node("crate::old::thing", NodeKind::Function, "src/old.rs"));
+        g
+    }
+
     #[test]
     fn duplication_signal_fires_above_threshold() {
-        let anchor = node("crate::new::thing", NodeKind::Function, "src/new.rs");
+        let g = dup_graph();
+        let anchor = g.get_node("crate::new::thing").unwrap().clone();
         let hits = vec![("crate::new::thing".to_string(), 1.0), ("crate::old::thing".to_string(), 0.92)];
-        let sig = duplication_signal_from_hits(&anchor, &hits, 0.85).unwrap();
+        let sig = duplication_signal_from_hits(&anchor, &hits, &g, 0.85).unwrap();
         assert_eq!(sig.kind, SignalKind::SemanticDuplication);
         assert_eq!(sig.anchor_node, "crate::new::thing");
         assert!(!sig.why.is_empty());
@@ -776,17 +829,49 @@ mod tests {
 
     #[test]
     fn duplication_signal_excludes_self_hit() {
-        let anchor = node("crate::new::thing", NodeKind::Function, "src/new.rs");
+        let g = dup_graph();
+        let anchor = g.get_node("crate::new::thing").unwrap().clone();
         // Only the anchor's own (stale) row is nearest -- nothing else to compare.
         let hits = vec![("crate::new::thing".to_string(), 1.0)];
-        assert!(duplication_signal_from_hits(&anchor, &hits, 0.85).is_none());
+        assert!(duplication_signal_from_hits(&anchor, &hits, &g, 0.85).is_none());
     }
 
     #[test]
     fn duplication_signal_below_threshold_does_not_fire() {
-        let anchor = node("crate::new::thing", NodeKind::Function, "src/new.rs");
+        let g = dup_graph();
+        let anchor = g.get_node("crate::new::thing").unwrap().clone();
         let hits = vec![("crate::old::thing".to_string(), 0.5)];
-        assert!(duplication_signal_from_hits(&anchor, &hits, 0.85).is_none());
+        assert!(duplication_signal_from_hits(&anchor, &hits, &g, 0.85).is_none());
+    }
+
+    #[test]
+    fn duplication_signal_drops_hit_pointing_at_invalidated_node() {
+        // The vector store may retain a row for a node later invalidated in
+        // the graph. A hit above threshold whose target is `valid_to.is_some()`
+        // must NOT produce a signal -- only a current node is a real match.
+        let mut g = KnowledgeGraph::new("TERM");
+        g.insert_node(node("crate::new::thing", NodeKind::Function, "src/new.rs"));
+        g.insert_node(node("crate::old::thing", NodeKind::Function, "src/old.rs"));
+        let seq = g.next_build_seq();
+        assert_eq!(g.invalidate_path("src/old.rs", seq), 1);
+
+        let anchor = g.get_node("crate::new::thing").unwrap().clone();
+        // A very high-similarity hit, but its target is now invalidated.
+        let hits = vec![("crate::old::thing".to_string(), 0.99)];
+        assert!(
+            duplication_signal_from_hits(&anchor, &hits, &g, 0.85).is_none(),
+            "an invalidated hit must not produce a semantic_duplication signal"
+        );
+    }
+
+    #[test]
+    fn duplication_signal_drops_hit_missing_from_graph() {
+        // A stale vector row for a node no longer present at all (never
+        // re-inserted) is likewise dropped, not ranked.
+        let g = dup_graph();
+        let anchor = g.get_node("crate::new::thing").unwrap().clone();
+        let hits = vec![("crate::ghost::gone".to_string(), 0.99)];
+        assert!(duplication_signal_from_hits(&anchor, &hits, &g, 0.85).is_none());
     }
 
     // ── compute_signals: embeddings-unavailable degrade ─────────────────
