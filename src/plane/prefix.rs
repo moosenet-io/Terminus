@@ -76,10 +76,6 @@ const BASELINE_TOML: &str = include_str!("../../data/prefix_registry.toml");
 /// Valid status values for a prefix entry.
 const VALID_STATUSES: &[&str] = &["active", "retired", "ingested", "complete"];
 
-/// Default per-op Redis timeout (ms); overridable via `PLANE_REDIS_TIMEOUT_MS`
-/// (shared with the S100 cache/limiter backend).
-const REDIS_DEFAULT_TIMEOUT_MS: u64 = 200;
-
 /// Redis hash key holding overlay claims: field = uppercased prefix, value =
 /// JSON-encoded [`PrefixEntry`]. Namespaced under the same `plane:` prefix the
 /// S100 backend uses so it shares one logical keyspace.
@@ -213,22 +209,21 @@ impl std::fmt::Debug for PrefixOverlay {
 }
 
 impl PrefixOverlay {
-    /// Build from `PLANE_REDIS_URL` (+ optional password/timeout). Returns
-    /// `None` when the URL is unset/empty or unparseable — the pure-baseline
+    /// Build from the shared BLD-20 Redis backend's endpoint resolution:
+    /// `REDIS_URL` (the managed terminus-primary Redis), falling back to the
+    /// legacy `PLANE_REDIS_URL` for backward compatibility. This is what makes
+    /// the prefix overlay DURABLE cross-instance against the one managed Redis
+    /// rather than an ad-hoc, separately-configured endpoint (BLD-20 step 4).
+    /// Returns `None` when neither URL is set/parseable — the pure-baseline
     /// path, identical to having no overlay.
+    ///
+    /// NOTE: the endpoint/password are resolved from the environment, which is
+    /// materialized from the vault at boot (S1/S7) — no literal here.
     fn from_env() -> Option<Arc<Self>> {
-        let url = std::env::var("PLANE_REDIS_URL")
-            .ok()
-            .filter(|v| !v.trim().is_empty())?;
-        let password = std::env::var("PLANE_REDIS_PASSWORD")
-            .ok()
-            .filter(|v| !v.is_empty());
-        let timeout_ms: u64 = std::env::var("PLANE_REDIS_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(REDIS_DEFAULT_TIMEOUT_MS)
-            .max(1);
-        Self::build(&url, password, Duration::from_millis(timeout_ms))
+        let url = crate::redis::resolve_url()?;
+        let password = crate::redis::resolve_password();
+        let op_timeout = crate::redis::resolve_timeout();
+        Self::build(&url, password, op_timeout)
     }
 
     /// Shared constructor: parse the URL, layer the password from its own env
@@ -239,7 +234,7 @@ impl PrefixOverlay {
             Ok(i) => i,
             Err(e) => {
                 warn!(
-                    "PLANE_REDIS_URL not a valid Redis URL ({:?}); prefix overlay disabled, baseline-only",
+                    "REDIS_URL/PLANE_REDIS_URL not a valid Redis URL ({:?}); prefix overlay disabled, baseline-only",
                     e.kind()
                 );
                 return None;
