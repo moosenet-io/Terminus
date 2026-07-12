@@ -764,7 +764,13 @@ returns `configured:false` (not an error) when the findings store is unconfigure
         let project_id = req_str(&args, "project_id")?;
         let scope = args.get("scope").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         let category = args.get("category").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        let min_occurrences = args.get("min_occurrences").and_then(|v| v.as_i64()).map(|v| v as i32);
+        // Saturating clamp, never `as i32`: a huge JSON integer would wrap to a
+        // negative i32 and silently broaden the filter. Clamp to [0, i32::MAX] so a
+        // very large value simply matches nothing (the expected behavior).
+        let min_occurrences = args
+            .get("min_occurrences")
+            .and_then(|v| v.as_i64())
+            .map(|v| v.clamp(0, i32::MAX as i64) as i32);
         let limit = clamp_findings_limit(args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50));
 
         let store = match super::findings_store::FindingsStore::from_env().await {
@@ -782,9 +788,21 @@ returns `configured:false` (not an error) when the findings store is unconfigure
             }
         };
 
-        let rows = store
+        // A list/query failure means the store isn't usable for this call — degrade
+        // (configured:false + error), never a hard tool error, matching the
+        // contract and the sibling kg_semantic_search store-failure handling.
+        let rows = match store
             .list(&project_id, scope.as_deref(), category.as_deref(), min_occurrences)
-            .await?;
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                return structured(json!({
+                    "configured": false, "found": false, "project_id": project_id, "results": [],
+                    "error": e.to_string(),
+                }));
+            }
+        };
 
         let results: Vec<Value> = rows
             .iter()
