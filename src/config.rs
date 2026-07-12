@@ -1068,6 +1068,30 @@ fn validate_worker_transports(
     Ok(())
 }
 
+/// TMOD-05: validate a single, already-deserialized [`WorkerTransportEntry`]
+/// against the exact same rule set [`WorkerTransportRegistry::from_json`]
+/// enforces on a whole batch (non-empty name, the
+/// [`crate::broker::transport::MinTierPolicy`] floor for `capability_class`
+/// vs `tier` -- **the minimum-tier floor enforcement point** for a live
+/// registration, not just a config-file load -- and every tier-required
+/// field present). Reused by the broker admin control plane
+/// (`crate::broker::control`) so an incoming `POST /admin/workers/register`
+/// manifest is checked against the identical logic
+/// `TERMINUS_BROKER_WORKERS_JSON` startup config already uses, rather than a
+/// second, drifting copy of the same rules.
+///
+/// Deliberately does NOT check for a duplicate name against any
+/// already-registered worker -- this function validates one entry in
+/// isolation; "is this name already in use" is a route-table-level
+/// (`crate::broker::routes::RouteTable`) concern the caller checks
+/// separately, since a `WorkerTransportEntry` alone has no view of what's
+/// currently registered.
+pub fn validate_worker_transport_entry(
+    entry: &WorkerTransportEntry,
+) -> Result<(), WorkerTransportConfigError> {
+    validate_worker_transports(std::slice::from_ref(entry))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

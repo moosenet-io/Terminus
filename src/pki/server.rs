@@ -170,7 +170,21 @@ pub fn build_gateway_router(registry: ToolRegistry, config: &GatewayServerConfig
         broker_routes: crate::broker::routes::RouteTable::new(),
     });
 
-    build_router(state).merge(build_enroll_router())
+    // TMOD-05: the admin control plane (`/admin/workers*`) is merged in
+    // alongside `/mcp` and `/enroll` -- it needs the SAME `Arc<McpServerState>`
+    // `/mcp` dispatch reads (`broker_routes`, `gateway`, `principal_resolver`)
+    // so a worker it registers is immediately routable by `/mcp`'s own
+    // `tools/call` fallthrough with no process restart. This does NOT make
+    // admin traffic reachable the same way public `/mcp` traffic is: every
+    // `/admin/workers*` handler independently gates itself via
+    // `crate::broker::control::require_gate`, which -- unlike `/mcp`'s
+    // gateway-optional posture -- fails closed whenever `config.gateway` is
+    // `None`, so a deployment that never provisions a `GatewayFramework`
+    // (no admin-auth secret) refuses every admin op rather than serving it
+    // unauthenticated. See `crate::broker::control`'s module doc.
+    build_router(state.clone())
+        .merge(build_enroll_router())
+        .merge(crate::broker::control::build_control_router(state))
 }
 
 /// Spawn the mTLS listener (TCLI-03 machinery) as a background task serving

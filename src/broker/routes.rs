@@ -204,6 +204,45 @@ impl RouteTable {
             RouteTableSnapshot { routes }
         });
     }
+
+    /// Atomically REPLACE every route belonging to `worker_id` with
+    /// `new_routes`, in ONE `rcu` snapshot: all of the worker's existing
+    /// routes are removed AND the new set inserted together, so a reader
+    /// never observes a mix of the worker's old and new routes.
+    ///
+    /// This is the correct primitive for a **re-registration / "worker
+    /// moved"** (TMOD-05's admin control plane), and is deliberately NOT the
+    /// same as [`RouteTable::install_many`]: `install_many` only inserts (or
+    /// overwrites) the tool names present in the new manifest, so a tool the
+    /// worker used to serve but no longer does would survive as a STALE route
+    /// still pointing at the worker's PREVIOUS transport. `replace_worker`
+    /// closes that gap — a name absent from `new_routes` is gone after the
+    /// swap, not orphaned. Every route in `new_routes` is expected to carry
+    /// this same `worker_id` (the caller's contract); routes owned by any
+    /// OTHER worker are left untouched.
+    ///
+    /// `rcu` retry loop, same lost-update-free guarantee as
+    /// [`RouteTable::install`] — `new_routes` is collected up front so the
+    /// closure (which may run more than once) re-applies the identical
+    /// remove-then-insert each attempt.
+    pub fn replace_worker(&self, worker_id: &str, new_routes: impl IntoIterator<Item = WorkerRoute>) {
+        let new_routes: Vec<WorkerRoute> = new_routes.into_iter().collect();
+        self.snapshot.rcu(|current| {
+            // Start from every route NOT owned by this worker (drops all of
+            // the worker's prior routes, including any tool it no longer
+            // serves), then insert the freshly-verified set.
+            let mut routes: HashMap<String, WorkerRoute> = current
+                .routes
+                .iter()
+                .filter(|(_, r)| r.worker_id != worker_id)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            for route in &new_routes {
+                routes.insert(route.tool.name.clone(), route.clone());
+            }
+            RouteTableSnapshot { routes }
+        });
+    }
 }
 
 /// Bounded per-worker health-probe timeout used by [`merge_catalog`] and
@@ -547,6 +586,70 @@ mod tests {
         table.remove_worker("multi");
         let snap2 = table.load();
         assert!(snap2.is_empty());
+    }
+
+    // ── replace_worker is a TRUE replace: a no-longer-served tool is gone ──
+
+    /// Register w1=[a,b], then re-register w1=[a] via `replace_worker`: tool
+    /// `b` must be GONE (not left as a stale route to the old transport),
+    /// and `a` must resolve to the NEW transport — all in a single snapshot,
+    /// no torn/mixed state. This is the bug `install_many` alone had:
+    /// `install_many` would leave `b` orphaned.
+    #[tokio::test]
+    async fn replace_worker_removes_a_no_longer_served_tool() {
+        let table = RouteTable::new();
+        let old: Arc<dyn WorkerTransport> = Arc::new(StubTransport::new(true, "old transport"));
+        table.install_many(vec![
+            WorkerRoute { worker_id: "w1".to_string(), transport: old.clone(), tool: tool_info("a") },
+            WorkerRoute { worker_id: "w1".to_string(), transport: old, tool: tool_info("b") },
+        ]);
+        assert_eq!(table.load().len(), 2);
+
+        // Re-register w1 with ONLY [a], pointing at a new transport.
+        let new: Arc<dyn WorkerTransport> = Arc::new(StubTransport::new(true, "new transport"));
+        table.replace_worker(
+            "w1",
+            vec![WorkerRoute { worker_id: "w1".to_string(), transport: new, tool: tool_info("a") }],
+        );
+
+        let snap = table.load();
+        // `b` is GONE -- no stale route to the old transport survives.
+        assert!(snap.get("b").is_none(), "a tool the worker no longer serves must not survive re-registration");
+        // `a` resolves to the NEW transport.
+        let out = dispatch_call(&snap, "a", serde_json::json!({})).await.unwrap().unwrap();
+        assert_eq!(out.text, "new transport");
+        assert_eq!(snap.len(), 1);
+    }
+
+    /// `replace_worker` only touches the named worker's routes — a different
+    /// worker's routes are untouched by the replace.
+    #[tokio::test]
+    async fn replace_worker_leaves_other_workers_untouched() {
+        let table = RouteTable::new();
+        table.install(WorkerRoute {
+            worker_id: "keep".to_string(),
+            transport: Arc::new(StubTransport::new(true, "keep")),
+            tool: tool_info("keep_tool"),
+        });
+        table.install(WorkerRoute {
+            worker_id: "w1".to_string(),
+            transport: Arc::new(StubTransport::new(true, "old")),
+            tool: tool_info("w1_tool"),
+        });
+
+        table.replace_worker(
+            "w1",
+            vec![WorkerRoute {
+                worker_id: "w1".to_string(),
+                transport: Arc::new(StubTransport::new(true, "new")),
+                tool: tool_info("w1_tool_v2"),
+            }],
+        );
+
+        let snap = table.load();
+        assert!(snap.get("keep_tool").is_some(), "another worker's route must be untouched");
+        assert!(snap.get("w1_tool").is_none(), "the replaced worker's old tool must be gone");
+        assert!(snap.get("w1_tool_v2").is_some());
     }
 
     // ── Concurrent installs both survive (no lost update via `rcu`) ───────
