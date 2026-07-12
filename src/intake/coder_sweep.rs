@@ -592,6 +592,140 @@ fn coder_backend_max_wait() -> std::time::Duration {
         .unwrap_or(std::time::Duration::from_secs(CODER_BACKEND_MAX_DEFAULT_SECS))
 }
 
+/// NO-PROGRESS JAM DETECTOR: the finer-grained companion to the total
+/// wall-clock cap above. A pure wall-clock cap cannot tell a
+/// slow-but-progressing large/reasoning model (finalizes a case every few
+/// minutes over a long suite) from a genuinely jammed one (finalizes NOTHING —
+/// every generate times out). This bounds the time with ZERO forward progress:
+/// if no code case reaches `finalized = true` for this (model, backend) pass in
+/// this long, the model is jammed → recorded non-viable(timeout) and the sweep
+/// ADVANCES (model retained in fleet). Because it keys on actual completed
+/// cases, a model that keeps finalizing cases — however slowly, however large —
+/// never trips it, so it can be MUCH tighter than the wall-clock cap without
+/// falsely killing the upcoming 32B/35B/70B/reasoning models. Default 30min: a
+/// legit single case (first pass + one retry pass, each bounded by the ~11min
+/// per-case timeout) lands well under it; a fully-jammed model produces nothing
+/// and bounces in 30min instead of the 150min wall-clock cap. Override with
+/// `INTAKE_CODER_NO_PROGRESS_MAX_SECS`; set to 0 to disable (wall-clock only).
+pub const CODER_NO_PROGRESS_ENV: &str = "INTAKE_CODER_NO_PROGRESS_MAX_SECS";
+const CODER_NO_PROGRESS_DEFAULT_SECS: u64 = 30 * 60;
+/// How often the no-progress monitor polls the DB for finalized-case count.
+const PROGRESS_POLL_SECS: u64 = 60;
+
+/// `None` (0 / unset-as-disabled → returns None) disables the no-progress
+/// monitor entirely, leaving only the wall-clock cap. A positive value is the
+/// zero-progress bound.
+fn coder_no_progress_max_wait() -> Option<std::time::Duration> {
+    match std::env::var(CODER_NO_PROGRESS_ENV) {
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(0) => None, // explicit disable
+            Ok(secs) => Some(std::time::Duration::from_secs(secs)),
+            Err(_) => Some(std::time::Duration::from_secs(CODER_NO_PROGRESS_DEFAULT_SECS)),
+        },
+        Err(_) => Some(std::time::Duration::from_secs(CODER_NO_PROGRESS_DEFAULT_SECS)),
+    }
+}
+
+/// Count of FINALIZED code cases persisted for this `(model, backend)` pass's
+/// profile row — the no-progress monitor's forward-progress signal. Finalized
+/// rows only (a jammed model may write unfinalized Phase-1 rows it never
+/// judges, which are NOT progress). Any DB error is surfaced to the caller,
+/// which treats a transient hiccup as "no reading this tick" (never a jam).
+async fn finalized_case_count(
+    pool: &sqlx::PgPool,
+    profile_id: uuid::Uuid,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM code_profile_runs WHERE profile_id = $1 AND finalized = true",
+    )
+    .bind(profile_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// Run the code suite under BOTH bounds: the total wall-clock cap
+/// (`coder_backend_max_wait`) and the no-progress detector
+/// (`coder_no_progress_max_wait`). Returns `Ok(suite_result)` if the suite
+/// completed (or errored) on its own, or `Err(reason)` if either bound tripped
+/// (the caller records non-viable + advances with that reason). The suite
+/// future is cancelled by drop on a bound trip; the GPU lock is released by
+/// `run_fleet`'s outer RAII guard, so nothing leaks.
+#[allow(clippy::too_many_arguments)]
+async fn run_suite_bounded(
+    driver: &dyn CoderSuiteDriver,
+    model_id: &str,
+    langs: &[String],
+    profile_id: uuid::Uuid,
+    case_limit: Option<usize>,
+    backend: BackendTag,
+    mem_config: Option<&str>,
+    gpu_lock: &dyn GpuLock,
+) -> Result<Result<intake::CodeV2Outcome, ToolError>, String> {
+    let cap = coder_backend_max_wait();
+    let no_progress = coder_no_progress_max_wait();
+    // The no-progress monitor needs a DB handle; if none is available (e.g. a
+    // no-DB test host) it is silently disabled and only the wall-clock cap
+    // applies — exactly the pre-existing behavior.
+    let pool = if no_progress.is_some() {
+        schema::get_pool().await.ok()
+    } else {
+        None
+    };
+
+    let suite = driver.run_suite(
+        model_id,
+        langs,
+        profile_id,
+        case_limit,
+        backend.as_str(),
+        mem_config,
+        gpu_lock,
+    );
+    tokio::pin!(suite);
+
+    let deadline = tokio::time::Instant::now() + cap;
+    let mut last_count: i64 = 0;
+    let mut last_progress = tokio::time::Instant::now();
+    let poll = std::time::Duration::from_secs(PROGRESS_POLL_SECS);
+
+    loop {
+        tokio::select! {
+            res = &mut suite => return Ok(res),
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(format!(
+                    "code suite wall-clock cap exceeded ({}s): inference jammed \
+                     (exhaustive per-case retries did not converge). Recorded non-viable \
+                     (timeout) and advancing; model retained in fleet.",
+                    cap.as_secs()
+                ));
+            }
+            _ = tokio::time::sleep(poll), if pool.is_some() && no_progress.is_some() => {
+                let np = no_progress.expect("guarded by if pool.is_some() && no_progress.is_some()");
+                let p = pool.as_ref().expect("guarded above");
+                match finalized_case_count(p, profile_id).await {
+                    Ok(count) => {
+                        if count > last_count {
+                            last_count = count;
+                            last_progress = tokio::time::Instant::now();
+                        } else if last_progress.elapsed() >= np {
+                            return Err(format!(
+                                "no code case finalized in {}s (0 forward progress → jammed, \
+                                 distinct from slow-but-progressing which keeps finalizing \
+                                 cases): recorded non-viable (timeout) and advancing; model \
+                                 retained in fleet.",
+                                np.as_secs()
+                            ));
+                        }
+                    }
+                    // Transient DB hiccup: skip this tick (do NOT reset the timer,
+                    // do NOT declare a jam) — the next poll re-reads.
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+}
+
 /// RAII: releases `lock` on drop, exactly once — so a checkpoint-write
 /// failure (`?` early return out of `run_one_backend`) or a panic mid-pass
 /// still releases the GPU rather than leaking it for the rest of this
@@ -858,24 +992,23 @@ async fn run_one_backend(
     // `backend.as_str()` yields the short 'gpu'/'cpu' tag (matching the
     // assistant-side `backend_tag` convention), NOT `override_str` (which is
     // the longer serving-backend name like "ollama"/"ollama-cpu").
-    // JAM FIX: bound the whole suite by wall-clock. The per-case loop still does
-    // its exhaustive transport-error retries INSIDE this; the cap only stops a
-    // model that never converges (every case timing out) from stalling the fleet
-    // forever. On elapse the suite future is dropped (its reqwest inference call
-    // is cancelled; the GPU lock is released by `run_fleet`'s outer RAII guard,
-    // not here, so nothing leaks) and the `Err(_)` arm records it non-viable and
-    // advances.
-    let suite_result = tokio::time::timeout(
-        coder_backend_max_wait(),
-        driver.run_suite(
-            &model_id,
-            langs,
-            profile_id,
-            case_limit,
-            backend.as_str(),
-            mem_config,
-            gpu_lock,
-        ),
+    // JAM FIX: bound the whole suite by BOTH a total wall-clock cap AND a
+    // no-progress detector (see `run_suite_bounded`). The per-case loop still
+    // does its exhaustive transport-error retries INSIDE this; the bounds only
+    // stop a model that never converges from stalling the fleet forever. On a
+    // bound trip the suite future is dropped (its reqwest inference call is
+    // cancelled; the GPU lock is released by `run_fleet`'s outer RAII guard, not
+    // here, so nothing leaks) and the `Err(reason)` arm records it non-viable
+    // and advances.
+    let suite_result = run_suite_bounded(
+        driver,
+        &model_id,
+        langs,
+        profile_id,
+        case_limit,
+        backend,
+        mem_config,
+        gpu_lock,
     )
     .await;
     let outcome = match suite_result {
@@ -940,20 +1073,15 @@ async fn run_one_backend(
             }
         }
         Ok(Err(e)) => BackendOutcome::Skipped(format!("code suite did not complete: {e}")),
-        Err(_elapsed) => {
-            // JAM: the suite blew past its wall-clock cap. Record the cell
-            // non-viable (`timeout`) — the model STAYS in the fleet/nominations
-            // (retryable next sweep), it is NOT removed — mark the checkpoint so
-            // the sweep advances and a restart won't re-jam here, and mirror the
-            // advance onto Chord's session. This is the "exhaustive but never
-            // frozen" behavior: exhaustive per-case retries happened inside the
-            // cap; the cap guarantees we always move on.
-            let secs = coder_backend_max_wait().as_secs();
-            let reason = format!(
-                "code suite wall-clock cap exceeded ({secs}s): inference jammed \
-                 (exhaustive per-case retries did not converge). Recorded non-viable \
-                 (timeout) and advancing; model retained in fleet."
-            );
+        Err(reason) => {
+            // JAM: a bound tripped (wall-clock cap OR no-progress detector; the
+            // `reason` says which). Record the cell non-viable (`timeout`) — the
+            // model STAYS in the fleet/nominations (retryable next sweep), it is
+            // NOT removed — mark the checkpoint so the sweep advances and a
+            // restart won't re-jam here, and mirror the advance onto Chord's
+            // session. This is the "exhaustive but never frozen" behavior:
+            // exhaustive per-case retries happened inside the bound; the bound
+            // guarantees we always move on.
             eprintln!(
                 "coder sweep: JAM on model={model_id} backend={} — {reason}",
                 backend.as_str()
@@ -1679,6 +1807,33 @@ mod tests {
         assert_eq!(normalize_case_limit(Some(0)), None);
         assert_eq!(normalize_case_limit(Some(5)), Some(5));
         assert_eq!(normalize_case_limit(None), None);
+    }
+
+    // ---- no-progress jam detector config ----
+
+    #[test]
+    fn coder_no_progress_max_wait_parses_disable_default_and_value() {
+        // Explicit 0 disables the monitor (wall-clock cap only).
+        std::env::set_var(CODER_NO_PROGRESS_ENV, "0");
+        assert_eq!(coder_no_progress_max_wait(), None);
+        // A positive value is honored verbatim.
+        std::env::set_var(CODER_NO_PROGRESS_ENV, "300");
+        assert_eq!(
+            coder_no_progress_max_wait(),
+            Some(std::time::Duration::from_secs(300))
+        );
+        // Garbage / unset falls back to the 30min default (fail-safe: the
+        // monitor stays ON rather than silently disabling on a typo).
+        std::env::set_var(CODER_NO_PROGRESS_ENV, "notanumber");
+        assert_eq!(
+            coder_no_progress_max_wait(),
+            Some(std::time::Duration::from_secs(CODER_NO_PROGRESS_DEFAULT_SECS))
+        );
+        std::env::remove_var(CODER_NO_PROGRESS_ENV);
+        assert_eq!(
+            coder_no_progress_max_wait(),
+            Some(std::time::Duration::from_secs(CODER_NO_PROGRESS_DEFAULT_SECS))
+        );
     }
 
     // ---- mem_config env threading (mem-config-tagging) ----
