@@ -57,13 +57,27 @@
 //!    uses) must return `true`. A worker that fails either check is REFUSED
 //!    registration — no route is ever installed for a worker that can't
 //!    prove it's alive at onboarding time.
-//! 4. Only once all of the above succeed does it call
-//!    [`crate::broker::routes::RouteTable::install_many`] — ONE atomic
-//!    snapshot swap for every tool the manifest advertises, so a reader can
-//!    never observe a half-registered worker (some tools routed, some not).
-//!    Registering an already-registered `name` replaces its tools in the
-//!    same atomic swap (install-or-replace), which is how a worker "moves"
-//!    to a new address/tier without a restart.
+//! 4. **Verifies the worker's ACTUAL catalog via
+//!    [`crate::broker::transport::WorkerTransport::list`]** — this `list()`
+//!    call IS the initialize+catalog gate: a successful answer proves the
+//!    worker speaks the wire protocol (the `initialize` equivalent) AND
+//!    reports what it TRULY serves. The routes installed come from THIS
+//!    verified list, never from the (untrusted) request-body tool set; the
+//!    body's tool entries only ENRICH each verified tool's catalog metadata
+//!    (description/inputSchema) by name, and a body-declared tool the worker
+//!    doesn't actually serve never becomes a route. A worker whose `list()`
+//!    fails (or times out, or is empty) is refused before any route is
+//!    installed.
+//! 5. Only once all of the above succeed does it call
+//!    [`crate::broker::routes::RouteTable::replace_worker`] — ONE atomic
+//!    snapshot swap that removes the worker's prior routes AND installs the
+//!    freshly-verified set together, so a reader can never observe a
+//!    half-registered worker (some tools routed, some not) AND a tool the
+//!    worker used to serve but no longer does is DROPPED rather than left as
+//!    a stale route to the old transport. This is how a worker "moves" to a
+//!    new address/tier (or narrows its tool set) without a restart, with no
+//!    orphaned routes — see that method's doc for why `install_many` alone
+//!    (insert-only) was insufficient.
 //!
 //! ## Deregistration / health / list
 //! [`handle_deregister`] removes every route for a `worker_id` in one atomic
@@ -262,6 +276,10 @@ enum AdminError {
     Transport(#[from] crate::broker::transport::TransportError),
     #[error("worker '{0}' failed its onboarding health probe (connect succeeded but health check did not report healthy within {1:?})")]
     Unhealthy(String, std::time::Duration),
+    #[error("worker '{worker}' failed the initialize+catalog gate — its list() did not answer: {detail}")]
+    CatalogUnavailable { worker: String, detail: String },
+    #[error("worker '{0}' answered the catalog gate but advertises no tools — nothing to route")]
+    EmptyCatalog(String),
     #[error("unknown worker '{0}'")]
     UnknownWorker(String),
 }
@@ -270,7 +288,10 @@ impl AdminError {
     fn status(&self) -> StatusCode {
         match self {
             AdminError::InvalidManifest(_) | AdminError::NoTools => StatusCode::BAD_REQUEST,
-            AdminError::Transport(_) | AdminError::Unhealthy(_, _) => StatusCode::BAD_GATEWAY,
+            AdminError::Transport(_)
+            | AdminError::Unhealthy(_, _)
+            | AdminError::CatalogUnavailable { .. }
+            | AdminError::EmptyCatalog(_) => StatusCode::BAD_GATEWAY,
             AdminError::UnknownWorker(_) => StatusCode::NOT_FOUND,
         }
     }
@@ -443,36 +464,103 @@ async fn do_register(admin: &AdminState, req: RegisterWorkerRequest) -> Result<(
         return Err(AdminError::NoTools);
     }
 
-    // 2. Open the transport and health-gate it BEFORE installing any route
-    //    -- a worker that can't be dialed or doesn't answer healthy never
-    //    gets a route.
+    // 2. Open the transport for the validated entry, then hand off to the
+    //    transport-injectable core (`register_verified_transport`) that does
+    //    connect → health → list-verify → atomic replace. Splitting the
+    //    concrete-transport CONSTRUCTION (which needs a real UDS/TCP dial)
+    //    from the health-gate/catalog-verify/install LOGIC is what lets that
+    //    logic be unit-tested against a stub transport.
     let transport = build_transport(&req.entry)?;
+    register_verified_transport(admin, &req.entry, req.tools, transport).await
+}
+
+/// The transport-injectable core of registration: connect + health-gate +
+/// catalog-verify (`list()`) + atomic replace + bookkeeping, given an
+/// already-constructed [`WorkerTransport`]. Split out of [`do_register`] so
+/// the health-gate/verify/install path can be exercised in tests with a stub
+/// transport (the real `build_transport` needs a live UDS/TCP dial). `entry`
+/// is assumed already validated by [`do_register`].
+async fn register_verified_transport(
+    admin: &AdminState,
+    entry: &WorkerTransportEntry,
+    declared_tools: Vec<WorkerToolManifestEntry>,
+    transport: Arc<dyn WorkerTransport>,
+) -> Result<(String, usize), AdminError> {
+    // 2. Health-gate it BEFORE installing any route -- a worker that can't be
+    //    dialed or doesn't answer healthy never gets a route.
     transport.connect().await?;
     if !probe_health(&transport).await {
-        return Err(AdminError::Unhealthy(req.entry.name.clone(), HEALTH_PROBE_TIMEOUT));
+        return Err(AdminError::Unhealthy(entry.name.clone(), HEALTH_PROBE_TIMEOUT));
     }
 
-    // 3. Build every route this worker's manifest advertises and install
-    //    them in ONE atomic swap (TMOD-04's `install_many`) -- a reader
-    //    never observes a half-registered worker.
-    let worker_id = req.entry.name.clone();
-    let tool_count = req.tools.len();
-    let routes: Vec<WorkerRoute> = req
-        .tools
-        .into_iter()
-        .map(|t| WorkerRoute { worker_id: worker_id.clone(), transport: transport.clone(), tool: t.into() })
-        .collect();
-    admin.mcp.broker_routes.install_many(routes);
+    // 3. Verify the worker's ACTUAL catalog via `WorkerTransport::list()` --
+    //    this is the initialize+catalog gate: a successful `list()` proves
+    //    the worker speaks the wire protocol (the initialize equivalent) AND
+    //    tells us what it TRULY serves, rather than trusting the tool set an
+    //    untrusted request body declared. The routes we install come from
+    //    THIS verified list, not the request body; the request body's tool
+    //    entries are used only to ENRICH each verified tool's catalog
+    //    metadata (description/inputSchema) by name, and a body-declared tool
+    //    the worker does NOT actually serve is silently ignored (it never
+    //    becomes a route). A worker whose `list()` fails is refused before
+    //    any route is installed; a worker that answers but serves nothing is
+    //    refused too (nothing to route). Bounded by the same
+    //    HEALTH_PROBE_TIMEOUT so a worker that accepts-but-never-answers the
+    //    list can't stall registration.
+    let worker_id = entry.name.clone();
+    let verified_names = match tokio::time::timeout(HEALTH_PROBE_TIMEOUT, transport.list()).await {
+        Ok(Ok(names)) => names,
+        Ok(Err(e)) => {
+            return Err(AdminError::CatalogUnavailable { worker: worker_id, detail: e.to_string() })
+        }
+        Err(_) => {
+            return Err(AdminError::CatalogUnavailable {
+                worker: worker_id,
+                detail: format!("list() did not answer within {HEALTH_PROBE_TIMEOUT:?}"),
+            })
+        }
+    };
+    if verified_names.is_empty() {
+        return Err(AdminError::EmptyCatalog(worker_id));
+    }
 
-    // 4. Record admin-only bookkeeping (tier/capability_class/registered_at)
+    // Index the request body's declared tools by name so a verified tool can
+    // borrow the operator-supplied description/inputSchema when the names
+    // match; a verified tool with no matching body entry gets a minimal
+    // default catalog metadata (empty description, permissive object schema).
+    let mut declared: HashMap<String, ToolInfo> =
+        declared_tools.into_iter().map(|t| (t.name.clone(), t.into())).collect();
+
+    // 4. Build a route for every tool the worker VERIFIABLY serves and
+    //    REPLACE the worker's prior route set in ONE atomic swap
+    //    (`replace_worker`, not `install_many`): a tool the worker used to
+    //    serve but no longer does is dropped rather than left as a stale
+    //    route to the old transport -- see `RouteTable::replace_worker`'s
+    //    doc. A reader never observes a half-registered or mixed old/new
+    //    worker.
+    let tool_count = verified_names.len();
+    let routes: Vec<WorkerRoute> = verified_names
+        .into_iter()
+        .map(|name| {
+            let tool = declared.remove(&name).unwrap_or_else(|| ToolInfo {
+                name: name.clone(),
+                description: String::new(),
+                parameters: default_input_schema(),
+            });
+            WorkerRoute { worker_id: worker_id.clone(), transport: transport.clone(), tool }
+        })
+        .collect();
+    admin.mcp.broker_routes.replace_worker(&worker_id, routes);
+
+    // 5. Record admin-only bookkeeping (tier/capability_class/registered_at)
     //    in lock-step -- read by `handle_list`/`handle_health`, never by
     //    dispatch.
     upsert_meta(
         &admin.meta,
         &worker_id,
         WorkerAdminMeta {
-            tier: req.entry.tier,
-            capability_class: req.entry.capability_class,
+            tier: entry.tier,
+            capability_class: entry.capability_class,
             registered_at_unix: now_unix(),
             last_health: Some(true),
         },
@@ -884,5 +972,166 @@ mod tests {
         route_table.remove_worker("stub-worker");
         let snap3 = route_table.load();
         assert!(dispatch_call(&snap3, "stub_tool", json!({})).await.is_none());
+    }
+
+    // ── list()-verified registration (the initialize+catalog gate) ─────────
+
+    /// A configurable stub whose `list()` (the initialize+catalog gate) and
+    /// `health()` outcomes are programmable, for exercising
+    /// `register_verified_transport` without a live socket.
+    struct CatalogStub {
+        listed: Result<Vec<String>, ()>,
+        healthy: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkerTransport for CatalogStub {
+        async fn connect(&self) -> Result<(), crate::broker::transport::TransportError> {
+            Ok(())
+        }
+        async fn call(&self, name: &str, _args: Value) -> Result<crate::tool::ToolOutput, crate::error::ToolError> {
+            Ok(crate::tool::ToolOutput { text: format!("served {name}"), structured: None })
+        }
+        async fn list(&self) -> Result<Vec<String>, crate::broker::transport::TransportError> {
+            self.listed
+                .clone()
+                .map_err(|_| crate::broker::transport::TransportError::Unavailable("stub list() failure".to_string()))
+        }
+        async fn health(&self) -> bool {
+            self.healthy
+        }
+    }
+
+    fn read_only_t1_entry(name: &str) -> WorkerTransportEntry {
+        WorkerTransportEntry {
+            name: name.to_string(),
+            tier: TransportTier::T1,
+            capability_class: CapabilityClass::ReadOnly,
+            socket_path: Some("/tmp/unused-in-stub-tests.sock".to_string()),
+            host: None,
+            port: None,
+            expected_uid: Some(0),
+            expected_identity: None,
+        }
+    }
+
+    /// The worker's REAL catalog (`list()`) — not the request body — decides
+    /// which routes are installed: the body declares `[declared_only,
+    /// shared]`, but the worker actually serves `[shared, worker_only]`, so
+    /// exactly `shared` + `worker_only` are routed and `declared_only`
+    /// (declared but not served) is dropped. `shared` keeps the body's
+    /// enriched description; `worker_only` gets default metadata.
+    #[tokio::test]
+    async fn registration_installs_the_workers_real_catalog_not_the_request_body() {
+        let state = test_mcp_state(Some(allow_all_gateway()));
+        let admin = AdminState { mcp: state.clone(), meta: Arc::new(ArcSwap::from_pointee(HashMap::new())) };
+
+        let declared = vec![
+            WorkerToolManifestEntry {
+                name: "declared_only".to_string(),
+                description: "body says this exists".to_string(),
+                parameters: default_input_schema(),
+            },
+            WorkerToolManifestEntry {
+                name: "shared".to_string(),
+                description: "enriched from body".to_string(),
+                parameters: json!({"type": "object", "properties": {"x": {"type": "number"}}}),
+            },
+        ];
+        let transport: Arc<dyn WorkerTransport> = Arc::new(CatalogStub {
+            listed: Ok(vec!["shared".to_string(), "worker_only".to_string()]),
+            healthy: true,
+        });
+
+        let (worker_id, count) =
+            register_verified_transport(&admin, &read_only_t1_entry("w1"), declared, transport).await.unwrap();
+        assert_eq!(worker_id, "w1");
+        assert_eq!(count, 2, "exactly the two tools the worker VERIFIABLY serves");
+
+        let snap = state.broker_routes.load();
+        // Only the worker's real tools are routed.
+        assert!(snap.get("shared").is_some());
+        assert!(snap.get("worker_only").is_some());
+        assert!(
+            snap.get("declared_only").is_none(),
+            "a body-declared tool the worker does NOT serve must never become a route"
+        );
+        // `shared` borrowed the body's enriched description; `worker_only`
+        // (no body entry) got default (empty) metadata.
+        assert_eq!(snap.get("shared").unwrap().tool.description, "enriched from body");
+        assert_eq!(snap.get("worker_only").unwrap().tool.description, "");
+    }
+
+    /// A worker whose `list()` (the initialize+catalog gate) FAILS is refused
+    /// registration before any route is installed.
+    #[tokio::test]
+    async fn worker_failing_list_is_refused_before_install() {
+        let state = test_mcp_state(Some(allow_all_gateway()));
+        let admin = AdminState { mcp: state.clone(), meta: Arc::new(ArcSwap::from_pointee(HashMap::new())) };
+
+        let transport: Arc<dyn WorkerTransport> = Arc::new(CatalogStub { listed: Err(()), healthy: true });
+        let declared = vec![WorkerToolManifestEntry {
+            name: "wishful".to_string(),
+            description: String::new(),
+            parameters: default_input_schema(),
+        }];
+
+        let err = register_verified_transport(&admin, &read_only_t1_entry("bad"), declared, transport)
+            .await
+            .expect_err("a worker whose list() fails must be refused");
+        assert!(matches!(err, AdminError::CatalogUnavailable { .. }));
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+        // No route was installed.
+        assert!(state.broker_routes.load().is_empty(), "a list()-failing worker must install NO route");
+    }
+
+    /// A worker that answers `list()` but serves NOTHING is refused (nothing
+    /// to route), even though it's healthy and the body declared tools.
+    #[tokio::test]
+    async fn worker_with_empty_catalog_is_refused() {
+        let state = test_mcp_state(Some(allow_all_gateway()));
+        let admin = AdminState { mcp: state.clone(), meta: Arc::new(ArcSwap::from_pointee(HashMap::new())) };
+
+        let transport: Arc<dyn WorkerTransport> = Arc::new(CatalogStub { listed: Ok(vec![]), healthy: true });
+        let declared = vec![WorkerToolManifestEntry {
+            name: "claimed".to_string(),
+            description: String::new(),
+            parameters: default_input_schema(),
+        }];
+
+        let err = register_verified_transport(&admin, &read_only_t1_entry("empty"), declared, transport)
+            .await
+            .expect_err("a worker serving no tools must be refused");
+        assert!(matches!(err, AdminError::EmptyCatalog(_)));
+        assert!(state.broker_routes.load().is_empty());
+    }
+
+    /// Re-registration is a TRUE replace end-to-end through
+    /// `register_verified_transport`: w1 first serves [a,b], then re-registers
+    /// serving only [a] at a new transport — `b` is GONE, `a` points at the
+    /// new transport, in one atomic snapshot (no stale route).
+    #[tokio::test]
+    async fn reregistration_is_a_true_replace_no_stale_route() {
+        use crate::broker::routes::dispatch_call;
+
+        let state = test_mcp_state(Some(allow_all_gateway()));
+        let admin = AdminState { mcp: state.clone(), meta: Arc::new(ArcSwap::from_pointee(HashMap::new())) };
+
+        // First registration: worker serves [a, b].
+        let first: Arc<dyn WorkerTransport> =
+            Arc::new(CatalogStub { listed: Ok(vec!["a".to_string(), "b".to_string()]), healthy: true });
+        register_verified_transport(&admin, &read_only_t1_entry("w1"), vec![], first).await.unwrap();
+        assert_eq!(state.broker_routes.load().len(), 2);
+
+        // Re-registration: same worker now serves ONLY [a], new transport.
+        let second: Arc<dyn WorkerTransport> =
+            Arc::new(CatalogStub { listed: Ok(vec!["a".to_string()]), healthy: true });
+        register_verified_transport(&admin, &read_only_t1_entry("w1"), vec![], second).await.unwrap();
+
+        let snap = state.broker_routes.load();
+        assert_eq!(snap.len(), 1, "re-register must not leave b behind");
+        assert!(snap.get("b").is_none(), "the no-longer-served tool must be GONE, not a stale route");
+        let out = dispatch_call(&snap, "a", json!({})).await.unwrap().unwrap();
+        assert_eq!(out.text, "served a", "a resolves to the new transport");
     }
 }
