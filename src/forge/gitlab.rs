@@ -1756,6 +1756,7 @@ mod tests {
             // Gaps GitHub has that GitLab does NOT: mirror config + packages publish
             // are genuinely supported here.
             ForgeEndpoint::ReposMirrorConfig, ForgeEndpoint::PackagesPublish,
+            ForgeEndpoint::PullRequestsListComments, // GHIST-05 MR-notes read
         ] {
             assert_eq!(a.support_level(ep), SupportLevel::Supported, "{ep:?} should be supported");
         }

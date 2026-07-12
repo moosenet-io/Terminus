@@ -620,6 +620,29 @@ pub async fn replay_pr(
             call_public(reg, cfg.public_provider.as_deref(), ForgeEndpoint::PullRequestsComment, cp).await?;
             mirrored += 1;
         }
+        // Live-verify the comment writes: re-read the public PR thread and confirm at
+        // least as many (non-system) comments are present as we posted. A shortfall
+        // means some did not land — fail so Phase A rolls back for a clean retry rather
+        // than merging an incomplete PR-process replay. (Still in the roll-back-able
+        // phase — nothing is merged yet.)
+        if !scrubbed_comments.is_empty() {
+            let landed = read_all_comments(
+                reg,
+                cfg.public_provider.as_deref(),
+                &pub_repo,
+                cfg.public_owner.as_deref(),
+                public_pr,
+            )
+            .await?;
+            if landed.len() < scrubbed_comments.len() {
+                return Err(ToolError::Execution(format!(
+                    "mirrored {} comment(s) to public PR #{public_pr} but only {} are present on \
+                     re-read — some did not land; failing so the replay rolls back for a clean retry.",
+                    scrubbed_comments.len(),
+                    landed.len()
+                )));
+            }
+        }
         Ok((slice.commits, public_pr, mirrored))
     }
     .await;

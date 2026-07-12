@@ -1284,6 +1284,7 @@ mod tests {
             ForgeEndpoint::ReposList, ForgeEndpoint::ReposCreate, ForgeEndpoint::PullRequestsCreate,
             ForgeEndpoint::IssuesCreate, ForgeEndpoint::ReleasesCreate, ForgeEndpoint::WebhooksCreate,
             ForgeEndpoint::ContentWriteFile, ForgeEndpoint::OrgMembers, ForgeEndpoint::RefsDelete,
+            ForgeEndpoint::PullRequestsListComments, // GHIST-05 PR-comment read
         ] {
             assert_eq!(a.support_level(ep), SupportLevel::Supported, "{ep:?} should be supported");
         }

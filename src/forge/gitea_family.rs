@@ -873,6 +873,12 @@ mod tests {
         let report = caps.report();
         assert_eq!(report["repos"]["repos_create"], "supported");
         assert_eq!(report["pull_requests"]["pull_requests_merge"], "supported");
+        // GHIST-05: the PR-comment read endpoint is advertised (derived from all()).
+        assert_eq!(report["pull_requests"]["pull_requests_list_comments"], "supported");
+        assert_eq!(
+            caps.level(ForgeEndpoint::PullRequestsListComments),
+            SupportLevel::Supported
+        );
         assert_eq!(report["packages"]["packages_publish"], "supported");
     }
 
