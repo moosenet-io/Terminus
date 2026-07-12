@@ -634,6 +634,33 @@ async fn run_one_backend(
         }
     }
 
+    // LIVE fleet-catalog refresh after each (model, backend) assistant pass —
+    // same rationale + best-effort swallow posture as the coder sweep's live
+    // refresh (see coder_sweep.rs): keep `model_fleet_catalog`'s assistant cells
+    // current as tests land, not only at end-of-run (the MintHarness lifecycle
+    // refresh still fires as the final one). Per-(model, backend), not
+    // per-dimension. Any DB error is logged and swallowed — never fails the run,
+    // never touches the rows/checkpoints already persisted above.
+    match schema::get_pool().await {
+        Ok(pool) => match crate::intake::catalog::refresh_fleet_catalog(&pool).await {
+            Ok(n) => eprintln!(
+                "assistant sweep: live fleet-catalog refresh after model={} backend={} ({n} card(s))",
+                model_id.as_str(),
+                backend_tag.as_str()
+            ),
+            Err(e) => eprintln!(
+                "assistant sweep: live fleet-catalog refresh failed for model={} (continuing — \
+                 recomputes next model / at end-of-run): {e}",
+                model_id.as_str()
+            ),
+        },
+        Err(e) => eprintln!(
+            "assistant sweep: live fleet-catalog refresh skipped for model={} \
+             (pool connect failed, continuing): {e}",
+            model_id.as_str()
+        ),
+    }
+
     let survived = !persisted.is_empty() || !resumed.is_empty();
     BackendRunReport {
         backend_tag,

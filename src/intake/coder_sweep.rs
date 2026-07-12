@@ -853,6 +853,34 @@ async fn run_one_backend(
                     );
                 }
             }
+            // LIVE fleet-catalog refresh: re-derive + persist the Model Fleet
+            // Catalog after EACH (model, backend) completes — so
+            // `model_fleet_catalog` reflects coverage as tests land, not only at
+            // end-of-run (the MintHarness lifecycle refresh still fires as the
+            // final one). Best-effort with the SAME swallow posture as that
+            // lifecycle refresh: a DB hiccup / missing catalog tables / no-DB
+            // host is logged and swallowed — it NEVER fails the sweep and never
+            // blocks the checkpoint that already landed above. Per-(model,
+            // backend), not per-case, so a full re-derivation isn't run
+            // thousands of times a sweep.
+            match schema::get_pool().await {
+                Ok(pool) => match crate::intake::catalog::refresh_fleet_catalog(&pool).await {
+                    Ok(n) => eprintln!(
+                        "coder sweep: live fleet-catalog refresh after model={model_id} \
+                         backend={} ({n} card(s))",
+                        backend.as_str()
+                    ),
+                    Err(e) => eprintln!(
+                        "coder sweep: live fleet-catalog refresh failed for model={model_id} \
+                         backend={} (continuing — recomputes next model / at end-of-run): {e}",
+                        backend.as_str()
+                    ),
+                },
+                Err(e) => eprintln!(
+                    "coder sweep: live fleet-catalog refresh skipped for model={model_id} \
+                     (pool connect failed, continuing): {e}"
+                ),
+            }
             BackendOutcome::Profiled {
                 cases_run: res.cases_run,
                 scored: res.scored,
