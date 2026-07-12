@@ -52,6 +52,7 @@ pub mod ledger;
 pub mod myelin;
 pub mod news;
 pub mod nexus;
+pub mod pg;
 pub mod pki;
 pub mod plane;
 pub mod registry;

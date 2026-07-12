@@ -117,6 +117,25 @@ pub fn atlas_database_url() -> Option<String> {
     env_nonempty("ATLAS_DATABASE_URL")
 }
 
+/// Key-NAME prefix for `crate::pg`'s per-identity Postgres connection secrets.
+/// A secret named `POSTGRES_URL_<NAME>` (e.g. `POSTGRES_URL_READONLY`)
+/// configures the `<name>` (lowercased) connection identity. Single source of
+/// truth for the prefix, mirroring `crate::plane`'s `PLANE_PAT_<NAME>`
+/// convention for Plane identities.
+const PG_CONNECTION_SECRET_PREFIX: &str = "POSTGRES_URL_";
+
+/// The vault/secret-store KEY NAME (never the value) that carries the
+/// connection URL for a given `pg_*` connection identity, e.g.
+/// `pg_connection_secret_name("readonly")` => `"POSTGRES_URL_READONLY"`.
+///
+/// This function ONLY builds and returns the key NAME — it never reads the
+/// secret store itself. The one sanctioned read site for the VALUE is
+/// `crate::pg::conn` (mirroring how `crate::plane::PLANE_IDENTITY_PREFIX`
+/// names a prefix without itself reading any `PLANE_PAT_<NAME>` value).
+pub fn pg_connection_secret_name(identity: &str) -> String {
+    format!("{PG_CONNECTION_SECRET_PREFIX}{}", identity.trim().to_uppercase())
+}
+
 // ── ASMT-09 consolidated runner: resilient staging + acquisition ──────────────
 //
 // The runner mirrors S83's reboot-survivable architecture: write-heavy small-file
@@ -823,6 +842,30 @@ pub fn embeddings_timeout_ms() -> u64 {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    // ── S115/PGT-01: pg connection secret naming ────────────────────────
+
+    #[test]
+    fn pg_connection_secret_name_builds_expected_key() {
+        assert_eq!(pg_connection_secret_name("readonly"), "POSTGRES_URL_READONLY");
+        assert_eq!(pg_connection_secret_name("writer"), "POSTGRES_URL_WRITER");
+        assert_eq!(pg_connection_secret_name("admin"), "POSTGRES_URL_ADMIN");
+    }
+
+    #[test]
+    fn pg_connection_secret_name_normalizes_case_and_whitespace() {
+        assert_eq!(pg_connection_secret_name("  Readonly  "), "POSTGRES_URL_READONLY");
+        assert_eq!(pg_connection_secret_name("CamelCaseName"), "POSTGRES_URL_CAMELCASENAME");
+    }
+
+    #[test]
+    fn pg_connection_secret_name_never_reads_the_environment() {
+        // This function only builds a key NAME; it must not itself resolve a
+        // secret VALUE. Setting a matching env var must not change its output.
+        std::env::set_var("POSTGRES_URL_PROBE", "postgres://should-not-be-read@example/db");
+        assert_eq!(pg_connection_secret_name("probe"), "POSTGRES_URL_PROBE");
+        std::env::remove_var("POSTGRES_URL_PROBE");
+    }
 
     // ── KGEMB-02: embeddings config ─────────────────────────────────────
 
