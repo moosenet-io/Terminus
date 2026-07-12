@@ -17,3 +17,8 @@ pub mod transport;
 /// health/list) that mutates [`routes::RouteTable`] on a live path — see
 /// [`control`] for the full design.
 pub mod control;
+
+/// TMOD-06: health-gated blue-green rollout + rollback for a worker UPDATE
+/// (an already-present worker re-registering) — see [`rollout`] for the full
+/// design.
+pub mod rollout;

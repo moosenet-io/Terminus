@@ -243,6 +243,123 @@ impl RouteTable {
             RouteTableSnapshot { routes }
         });
     }
+
+    /// **TMOD-06**: exactly like [`RouteTable::replace_worker`] (one atomic
+    /// remove-old-then-insert-new swap), but additionally returns the
+    /// routes it just DISPLACED for `worker_id` — i.e. the worker's
+    /// previous instance, captured from the SAME `rcu` attempt that wins the
+    /// compare-and-swap. This is the blue-green "flip" primitive:
+    /// `crate::broker::rollout::rollout_worker` uses the returned routes as
+    /// its rollback state, so a caller never needs a separate (and
+    /// therefore racy) "read the old routes, then replace" two-step.
+    ///
+    /// Empty when `worker_id` had no prior routes (a first-ever
+    /// registration) — the caller's cue that there's nothing to roll back
+    /// to.
+    pub fn replace_worker_with_rollback(
+        &self,
+        worker_id: &str,
+        new_routes: impl IntoIterator<Item = WorkerRoute>,
+    ) -> Vec<WorkerRoute> {
+        let new_routes: Vec<WorkerRoute> = new_routes.into_iter().collect();
+        let mut displaced: Vec<WorkerRoute> = Vec::new();
+        self.snapshot.rcu(|current| {
+            // Re-captured on every retry attempt -- only the attempt whose
+            // CAS actually succeeds is the one whose `displaced` value
+            // survives past `rcu`'s return, so this always reflects the
+            // routes that were truly in place immediately before the swap
+            // that won.
+            displaced = current.routes.values().filter(|r| r.worker_id == worker_id).cloned().collect();
+            let mut routes: HashMap<String, WorkerRoute> = current
+                .routes
+                .iter()
+                .filter(|(_, r)| r.worker_id != worker_id)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            for route in &new_routes {
+                routes.insert(route.tool.name.clone(), route.clone());
+            }
+            RouteTableSnapshot { routes }
+        });
+        displaced
+    }
+
+    /// **TMOD-06**: the rollback/cancel-safe half of the blue-green flip.
+    /// Atomically compare-and-swap: IF `worker_id`'s CURRENT routes are
+    /// still exactly `expected_current` (same tool names, each still
+    /// pointing at the identical transport `Arc` — compared via
+    /// `Arc::ptr_eq`, so a further re-registration or deregistration that
+    /// raced this call is detected even though it may share tool names),
+    /// replace them with `restore_routes` (the worker's prior instance, to
+    /// roll back to it; or an empty set, to remove a first-ever
+    /// registration that failed its post-flip window with nothing to fall
+    /// back to) in the SAME atomic swap. Otherwise this is a clean NO-OP —
+    /// returns `false` — so a rollout whose worker was deregistered (or
+    /// re-registered again) mid-health-window never resurrects a stale
+    /// `previous` snapshot over top of what the operator (or a newer
+    /// rollout) intentionally put there.
+    ///
+    /// Race-safe by construction: `expected_current` is re-checked against
+    /// the LATEST snapshot on every `rcu` retry, exactly like every other
+    /// mutator on this type — there is no separate "check" step that could
+    /// go stale before the "swap" step runs.
+    pub fn restore_worker_if_unchanged(
+        &self,
+        worker_id: &str,
+        expected_current: &[WorkerRoute],
+        restore_routes: Vec<WorkerRoute>,
+    ) -> bool {
+        let mut restored = false;
+        self.snapshot.rcu(|current| {
+            if worker_routes_match(current, worker_id, expected_current) {
+                restored = true;
+                let mut routes: HashMap<String, WorkerRoute> = current
+                    .routes
+                    .iter()
+                    .filter(|(_, r)| r.worker_id != worker_id)
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                for route in &restore_routes {
+                    routes.insert(route.tool.name.clone(), route.clone());
+                }
+                RouteTableSnapshot { routes }
+            } else {
+                restored = false;
+                // No-op: hand back an equivalent snapshot unchanged so this
+                // `rcu` attempt "succeeds" (stores the same content) without
+                // touching anything -- the worker's routes were already
+                // changed out from under this rollout (deregistered, or
+                // superseded by a newer rollout) by the time it tried to
+                // restore, so restoring `restore_routes` here would silently
+                // resurrect a stale previous instance.
+                RouteTableSnapshot { routes: current.routes.clone() }
+            }
+        });
+        restored
+    }
+}
+
+/// Does `worker_id`'s CURRENT set of routes in `current` match
+/// `expected` exactly (same tool names, each still pointing at the SAME
+/// transport instance)? Used by [`RouteTable::restore_worker_if_unchanged`]
+/// to detect a concurrent deregister/re-register before blindly restoring a
+/// rollback snapshot over it.
+fn worker_routes_match(current: &RouteTableSnapshot, worker_id: &str, expected: &[WorkerRoute]) -> bool {
+    let current_for_worker: HashMap<&str, &WorkerRoute> = current
+        .routes
+        .iter()
+        .filter(|(_, r)| r.worker_id == worker_id)
+        .map(|(k, v)| (k.as_str(), v))
+        .collect();
+    if current_for_worker.len() != expected.len() {
+        return false;
+    }
+    expected.iter().all(|r| {
+        current_for_worker
+            .get(r.tool.name.as_str())
+            .map(|cur| Arc::ptr_eq(&cur.transport, &r.transport))
+            .unwrap_or(false)
+    })
 }
 
 /// Bounded per-worker health-probe timeout used by [`merge_catalog`] and

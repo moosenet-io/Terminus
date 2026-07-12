@@ -300,6 +300,14 @@ enum AdminError {
     EmptyCatalog(String),
     #[error("unknown worker '{0}'")]
     UnknownWorker(String),
+    /// TMOD-06: an already-present worker's UPDATE passed its pre-flip gate
+    /// (connect/health/`list()`, above) but failed its post-flip health
+    /// window and was rolled back — see `crate::broker::rollout`. The
+    /// worker is left on its last-known-good (previous) instance, not
+    /// removed, so this is reported as a gateway-style failure of the NEW
+    /// instance, not a worker outage.
+    #[error("worker '{0}' failed its post-flip health window and was rolled back to its previous instance")]
+    RolledBack(String),
 }
 
 impl AdminError {
@@ -309,7 +317,8 @@ impl AdminError {
             AdminError::Transport(_)
             | AdminError::Unhealthy(_, _)
             | AdminError::CatalogUnavailable { .. }
-            | AdminError::EmptyCatalog(_) => StatusCode::BAD_GATEWAY,
+            | AdminError::EmptyCatalog(_)
+            | AdminError::RolledBack(_) => StatusCode::BAD_GATEWAY,
             AdminError::UnknownWorker(_) => StatusCode::NOT_FOUND,
         }
     }
@@ -330,6 +339,7 @@ impl AdminError {
             AdminError::CatalogUnavailable { .. } => "catalog_unavailable",
             AdminError::EmptyCatalog(_) => "empty_catalog",
             AdminError::UnknownWorker(_) => "unknown_worker",
+            AdminError::RolledBack(_) => "rolled_back",
         }
     }
 }
@@ -585,13 +595,23 @@ async fn register_verified_transport(
     let mut declared: HashMap<String, ToolInfo> =
         declared_tools.into_iter().map(|t| (t.name.clone(), t.into())).collect();
 
-    // 4. Build a route for every tool the worker VERIFIABLY serves and
-    //    REPLACE the worker's prior route set in ONE atomic swap
-    //    (`replace_worker`, not `install_many`): a tool the worker used to
-    //    serve but no longer does is dropped rather than left as a stale
-    //    route to the old transport -- see `RouteTable::replace_worker`'s
-    //    doc. A reader never observes a half-registered or mixed old/new
-    //    worker.
+    // 4. Build a route for every tool the worker VERIFIABLY serves.
+    //
+    //    TMOD-06: if `worker_id` is ALREADY present (this is an UPDATE, not
+    //    a first-ever registration), installing it is a blue-green rollout
+    //    (`crate::broker::rollout::rollout_worker`), not a bare
+    //    `replace_worker` -- the new instance has passed the PRE-flip gate
+    //    above (connect + bounded health probe + `list()`-verify), but that
+    //    only proves it was alive a moment ago; the rollout module flips it
+    //    in while retaining the previous instance as rollback state, watches
+    //    a bounded post-flip health window, and automatically rolls back to
+    //    the previous instance (atomically, and safe against a concurrent
+    //    deregister) if that window fails. A worker with no prior routes has
+    //    nothing to roll back to -- a plain atomic `replace_worker` (== a
+    //    first install) is the correct, simpler primitive for that case; see
+    //    `RouteTable::replace_worker`'s doc for why this is still not the
+    //    same as `install_many` (a no-longer-served tool is dropped, not
+    //    orphaned).
     let tool_count = verified_names.len();
     let routes: Vec<WorkerRoute> = verified_names
         .into_iter()
@@ -604,7 +624,16 @@ async fn register_verified_transport(
             WorkerRoute { worker_id: worker_id.clone(), transport: transport.clone(), tool }
         })
         .collect();
-    admin.mcp.broker_routes.replace_worker(&worker_id, routes);
+
+    let already_present = admin.mcp.broker_routes.load().all().any(|r| r.worker_id == worker_id);
+    if already_present {
+        let outcome = crate::broker::rollout::rollout_worker(&admin.mcp.broker_routes, &worker_id, routes).await;
+        if outcome.state == crate::broker::rollout::RolloutState::RolledBack {
+            return Err(AdminError::RolledBack(worker_id));
+        }
+    } else {
+        admin.mcp.broker_routes.replace_worker(&worker_id, routes);
+    }
 
     // 5. Record admin-only bookkeeping (tier/capability_class/registered_at)
     //    in lock-step -- read by `handle_list`/`handle_health`, never by
