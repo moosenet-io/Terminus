@@ -248,6 +248,7 @@ fn pr_head_ref(pr: &Value) -> Option<String> {
 /// non-empty comment bodies in order.
 async fn read_all_comments(
     reg: &ForgeRegistry,
+    pool: ForgePool,
     provider: Option<&str>,
     repo: &str,
     owner: Option<&str>,
@@ -261,7 +262,16 @@ async fn read_all_comments(
         if let Some(o) = owner {
             params["owner"] = json!(o);
         }
-        let body = read_private(reg, provider, ForgeEndpoint::PullRequestsListComments, params).await?;
+        // Dispatch through the CALLER'S pool: Private for the internal PR thread,
+        // Public for verifying the mirrored public PR thread — never assume one.
+        let p = reg.resolve(pool, provider)?;
+        let body = p
+            .dispatch(ForgeEndpoint::PullRequestsListComments, ForgeRequest::new(params))
+            .await
+            .map_err(|e| {
+                ToolError::Execution(format!("{} forge list-comments: {e}", pool.as_str()))
+            })?
+            .body;
         let arr = body.as_array().cloned().unwrap_or_default();
         if arr.is_empty() {
             break;
@@ -555,6 +565,7 @@ pub async fn replay_pr(
     // 2. Read + scrub the FULL discussion thread (paged, provider-agnostic).
     let scrubbed_comments = read_all_comments(
         reg,
+        ForgePool::Private,
         cfg.private_provider.as_deref(),
         &priv_repo,
         cfg.private_owner.as_deref(),
@@ -628,6 +639,7 @@ pub async fn replay_pr(
         if !scrubbed_comments.is_empty() {
             let landed = read_all_comments(
                 reg,
+                ForgePool::Public,
                 cfg.public_provider.as_deref(),
                 &pub_repo,
                 cfg.public_owner.as_deref(),
