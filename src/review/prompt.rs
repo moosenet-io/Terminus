@@ -205,12 +205,44 @@ pub fn parse_findings(text: &str) -> Vec<Finding> {
     let Some(start) = after.find('[') else {
         return Vec::new();
     };
-    let Some(end) = after.rfind(']') else {
+    // Depth-match from the first '[' to ITS matching ']', respecting string
+    // contents (a ']' inside a description must not terminate the array) and
+    // backslash escapes. `rfind(']')` was greedy — trailing prose, a fenced
+    // block, or a second FINDINGS_JSON: marker with a later ']' overshot the
+    // slice and made deserialization fail. `[`/`]`/`"`/`\` are all ASCII, so
+    // byte iteration lands on char boundaries for the slice below.
+    let bytes = after.as_bytes();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut end: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(end) = end else {
         return Vec::new();
     };
-    if end <= start {
-        return Vec::new();
-    }
     let json_slice = &after[start..=end];
 
     let findings: Vec<Finding> = serde_json::from_str(json_slice).unwrap_or_default();
@@ -435,6 +467,20 @@ mod tests {
         let findings = parse_findings(raw);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].description, "d");
+    }
+
+    #[test]
+    fn parse_findings_ignores_brackets_in_trailing_prose_and_strings() {
+        // The bug rfind(']') hit: a ']' AFTER the array (in prose, a fenced
+        // block, or a second marker) OR a ']' inside a description string made
+        // the greedy slice overshoot and fail to deserialize. Depth-matching
+        // from the first '[' to ITS matching ']' fixes both.
+        let raw = "VERDICT: REQUEST_CHANGES\n\
+FINDINGS_JSON: [{\"category\":\"bug\",\"severity\":\"high\",\"description\":\"index [0] out of bounds\"}]\n\
+See also FINDINGS_JSON: [ignore this] and arr[3] in the notes.";
+        let findings = parse_findings(raw);
+        assert_eq!(findings.len(), 1, "must stop at the first array's matching ]");
+        assert_eq!(findings[0].description, "index [0] out of bounds");
     }
 
     #[test]
