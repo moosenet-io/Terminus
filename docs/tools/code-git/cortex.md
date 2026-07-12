@@ -63,14 +63,28 @@ The pipeline's pre-dispatch scoping call: "if I touch these files, what else
 might I break, and how much of the project can I safely ignore?"
 
 **Input schema**: `project_id` (enum, required, one of `PROJECT_IDS`), plus
-EITHER `changed_files` (a comma-separated string ≤ `MAX_TEXT_LEN` (2000) chars,
-OR a JSON array of ≤ `MAX_CHANGED_FILES_ARG` (5000) file-path strings each ≤
-`MAX_TEXT_LEN` chars — the comma-separated form is kept for backward
-compatibility with the CXEG-01 stub's original schema) OR `diff` (a unified
-diff ≤ `MAX_DIFF_LEN` (1,000,000) chars; changed files are parsed from its
-`+++ b/<path>` headers). At least one of `changed_files`/`diff` must yield a
-non-empty file list. Oversize on any of these bounds is rejected with
-`InvalidArgument` before parsing.
+EITHER `changed_files` (a comma-separated string OR a JSON array of file-path
+strings — the comma-separated form is kept for backward compatibility with the
+CXEG-01 stub's original schema) OR `diff` (a unified diff; changed files are
+parsed from its `+++ b/<path>` headers). At least one of `changed_files`/`diff`
+must yield a non-empty file list.
+
+**Oversized input truncates, it does not error** (CXEG-02 reconciliation of
+count-cap vs abuse-reject): an input with *more files* than the file-count cap
+(`MAX_CHANGED_FILES`, 200) — a long CSV/array, or a many-file diff — is
+truncated to the cap and flagged with `truncated:true` + a `tracing::warn!`, so
+an ordinary big change degrades gracefully. `InvalidArgument` is reserved for
+genuinely abusive/malformed input only:
+- a **single** path element longer than `MAX_TEXT_LEN` (2000) chars — one
+  absurd path/blob, not "too many files";
+- a **DoS-scale** raw `changed_files` string or `diff` exceeding `MAX_DIFF_LEN`
+  (5,000,000) chars. For a `diff` this ceiling is checked ONLY when the parse
+  did not already truncate by file count — so a big *many-file* diff truncates
+  rather than being rejected; rejection is reserved for a pathologically huge
+  *single blob* (few files, enormous content);
+- a `changed_files` array with more than `MAX_CHANGED_FILES_ARG` (5000)
+  elements — a DoS ceiling set far above the file-count cap, so arrays between
+  the cap and this ceiling truncate rather than reject.
 
 **Reuse**: both the CSV/array/diff parsing and the graph queries are shared
 with `review_run`'s KGREV-01 grounding and the `kg_*` tools, not reimplemented:
@@ -171,16 +185,20 @@ with `review_run`'s KGREV-01 grounding and the `kg_*` tools, not reimplemented:
 | `affected_communities` | array of ints | The distinct Leiden community/cluster ids (KGRAPH-05) of every resolved node in the blast radius, sorted ascending. Empty on the degrade path (no resolved nodes). |
 | `blast_count` | int | Count of distinct affected nodes = `blast_radius.len()` (each `id` is unique within the array). |
 | `token_reduction_pct` | float | `1 − (blast-radius node-card bytes / whole-project node-card bytes)`, ×100, clamped `[0,100]`, rounded to 2 dp. `0.0` when there is no resolved blast radius to compare against (empty graph, or an all-unresolved radius — a wholly-unresolved radius must not read as "100% reduction"). |
-| `truncated` | bool (present only when `true`) | Emitted (and logged via a distinct `tracing::warn!`) when EITHER cap fired: the **input-file cap** (raw input exceeded `MAX_CHANGED_FILES`, files dropped before scoping — fires on the live AND degrade paths) or the **blast-node cap** (`CORTEX_MAX_BLAST_NODES`, the walk stopped enumerating). Absent when neither cap fired — never a silent cap. |
+| `truncated` | bool (present only when `true`) | Emitted (and logged via a distinct `tracing::warn!`) when EITHER cap fired: the **input-file cap** (the input file list/diff exceeded `MAX_CHANGED_FILES` and files were dropped before scoping — a long CSV/array or a many-file diff; fires on the live AND degrade paths) or the **blast-node cap** (`CORTEX_MAX_BLAST_NODES`, the walk stopped enumerating). Oversized-by-count input truncates here rather than erroring. Absent when neither cap fired — never a silent cap. |
 
-**Error/edge cases**: `InvalidArgument` for an unknown `project_id`; an
-oversized `changed_files` CSV string (`> MAX_TEXT_LEN`, 2000 chars); a
-`changed_files` array over `MAX_CHANGED_FILES_ARG` (5000) elements or with any
-element over `MAX_TEXT_LEN` chars; a `diff` over `MAX_DIFF_LEN` (1,000,000)
-chars; or neither `changed_files` nor `diff` yielding any file. A
-missing/unloadable Atlas graph is NOT an error (see step 3 above) — that is
-the one deliberate exception to "validate first, then act" in this tool, since
-blast-radius unavailability is a data-availability fact, not a caller mistake.
+**Error/edge cases**: `InvalidArgument` is reserved for abusive/malformed
+input (see "Oversized input truncates" above) — an unknown `project_id`; a
+**single** `changed_files` path element (or CSV token) over `MAX_TEXT_LEN`
+(2000) chars; a DoS-scale raw `changed_files` string or `diff` over
+`MAX_DIFF_LEN` (5,000,000) chars (the `diff` ceiling only when the parse did
+not already truncate by file count); a `changed_files` array over
+`MAX_CHANGED_FILES_ARG` (5000) elements; or neither `changed_files` nor `diff`
+yielding any file. Note an oversized-*by-file-count* list/diff is NOT here — it
+truncates with `truncated:true` (above). A missing/unloadable Atlas graph is
+also NOT an error (see step 3 above) — that is the one deliberate exception to
+"validate first, then act" in this tool, since blast-radius unavailability is a
+data-availability fact, not a caller mistake.
 
 ## `cortex_review` (pending — CXEG-04)
 
@@ -326,10 +344,13 @@ real `risk_score`; the bridge is forward-compatible as-is.
 unknowns and the old legacy repo names), free-text length capping,
 `cortex_review`/`cortex_audit`'s `InvalidArgument` rejection paths and
 pending-pointer success shape, `cortex_scope`'s argument-validation/wiring
-(`project_id` rejection, oversized CSV rejection, oversized array-size and
-array-element rejection, oversized `diff` rejection, "neither changed_files
-nor diff" rejection, array-form and diff-only-form acceptance, and a
-`configured:false` degrade smoke test against an empty store dir),
+(`project_id` rejection; the count-vs-abuse reconciliation — a long CSV of
+short paths AND a many-file diff both TRUNCATE with `truncated:true` rather
+than erroring, while a single over-`MAX_TEXT_LEN` element, an over-
+`MAX_CHANGED_FILES_ARG` array, and a pathologically huge single-blob `diff`
+are each rejected; "neither changed_files nor diff" rejection; array-form and
+diff-only-form acceptance; and a `configured:false` degrade smoke test against
+an empty store dir),
 `cortex_audit`'s unchanged SSRF-guard rejections, and full registration
 (`register()` yields exactly 10 tool names, all `cortex_*`).
 `src/cortex/scope.rs`'s test module covers the full blast-radius derivation

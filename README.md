@@ -749,9 +749,12 @@ Its risk/elegance surface is rebuilt over the following S115 items:
   graph yet — dispatch never breaks on a missing graph. Sets `truncated:true`
   (with a distinct logged warning on the live AND degrade paths, never a
   silent drop) for either the input-file cap (`MAX_CHANGED_FILES`) or the
-  blast-node cap (`CORTEX_MAX_BLAST_NODES`, default 200). Rejects oversized
-  input (`changed_files` string/array bounds, `diff` length) with
-  `InvalidArgument`.
+  blast-node cap (`CORTEX_MAX_BLAST_NODES`, default 200). An oversized-*by-file
+  -count* list/diff truncates (with `truncated:true`) rather than erroring;
+  `InvalidArgument` is reserved for genuinely abusive/malformed input (a single
+  path over `MAX_TEXT_LEN`, a DoS-scale `diff`/string over `MAX_DIFF_LEN`, or an
+  array over `MAX_CHANGED_FILES_ARG` — ceilings set far above the file-count
+  cap so real diffs truncate, not reject).
 - `cortex_review` — post-change `risk_score` (0–10) + named `risk_signals`
   from Atlas structural metrics and KGFIND recurrence (stub pending **CXEG-04**).
 - `cortex_audit` — audit an external public repo URL (stub pending **CXEG-11**);

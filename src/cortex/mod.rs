@@ -97,15 +97,22 @@ pub const PROJECT_IDS: &[&str] = &["TERM", "LUM", "HARM", "CHRD", "RAIL"];
 
 const MAX_TEXT_LEN: usize = 2000;
 
-/// Max length (chars) of `cortex_scope`'s `diff` argument. A unified diff can
-/// legitimately be large, but is bounded so a pathological input can't force
-/// an unbounded parse. Rejected with `InvalidArgument` when exceeded.
-const MAX_DIFF_LEN: usize = 1_000_000;
+/// Absolute DoS ceiling (chars) on a raw `diff` blob or a `changed_files` CSV
+/// string. Set FAR above what a `MAX_CHANGED_FILES`-file diff/list would ever
+/// produce, so ordinary oversized-*by-file-count* input TRUNCATES (and flags
+/// `truncated:true`) rather than being rejected. Rejection at this ceiling is
+/// reserved for a pathologically huge SINGLE blob (few files, enormous
+/// content). For a `diff` this is checked only when the parse did NOT already
+/// truncate by file count — so a big many-file diff degrades gracefully
+/// instead of erroring.
+const MAX_DIFF_LEN: usize = 5_000_000;
 
-/// Max element count of a `cortex_scope` `changed_files` JSON array argument.
-/// The parse itself dedups and caps to `MAX_CHANGED_FILES` (setting
-/// `truncated:true`), but an absurdly large array is rejected outright before
-/// parsing. Each element is additionally length-bounded by [`MAX_TEXT_LEN`].
+/// Absolute DoS ceiling on a `changed_files` JSON array's element count. Set
+/// FAR above the file-count cap (`MAX_CHANGED_FILES`, 200): arrays between the
+/// cap and this ceiling TRUNCATE to the cap (with `truncated:true`), and only
+/// a truly abusive array is rejected outright. Each element is additionally
+/// length-bounded by [`MAX_TEXT_LEN`] (a single over-long path is malformed →
+/// rejected).
 const MAX_CHANGED_FILES_ARG: usize = 5000;
 
 // ---------------------------------------------------------------------------
@@ -279,16 +286,34 @@ impl RustTool for CortexScope {
         let project_id = require_str(&args, "project_id")?;
         validate_project_id(project_id)?;
 
-        // Bound every input surface BEFORE parsing (reject oversize with
-        // InvalidArgument). `changed_files` may be a CSV string OR a JSON
-        // array of strings; `diff` is a (potentially large but bounded)
-        // unified diff.
+        // Reconcile validation vs truncation (CXEG-02 cycle-3): oversized
+        // -by-file-COUNT input must TRUNCATE + flag `truncated:true` (handled
+        // by the parse below via `input_truncated`), NEVER be rejected. Only
+        // genuinely abusive/malformed input is rejected here with
+        // InvalidArgument:
+        //   - a SINGLE element/path longer than MAX_TEXT_LEN (one absurd blob);
+        //   - a DoS-scale raw string/array/diff, at a ceiling set FAR above
+        //     what a MAX_CHANGED_FILES-file input would produce.
         match args.get("changed_files") {
-            Some(Value::String(s)) => validate_text_len(s, "changed_files")?,
+            Some(Value::String(s)) => {
+                // A merely-long CSV of many short paths is NOT rejected (it
+                // truncates by count below); only a DoS-scale blob is.
+                if s.chars().count() > MAX_DIFF_LEN {
+                    return Err(ToolError::InvalidArgument(format!(
+                        "'changed_files' exceeds {MAX_DIFF_LEN}-char DoS ceiling"
+                    )));
+                }
+                // A single over-long path element is malformed → reject.
+                for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    validate_text_len(part, "changed_files element")?;
+                }
+            }
             Some(Value::Array(arr)) => {
+                // Absolute array-size DoS ceiling, far above the file-count cap
+                // (arrays between the cap and this ceiling truncate, not reject).
                 if arr.len() > MAX_CHANGED_FILES_ARG {
                     return Err(ToolError::InvalidArgument(format!(
-                        "'changed_files' array exceeds {MAX_CHANGED_FILES_ARG} element limit"
+                        "'changed_files' array exceeds {MAX_CHANGED_FILES_ARG}-element DoS ceiling"
                     )));
                 }
                 for (i, el) in arr.iter().enumerate() {
@@ -299,19 +324,27 @@ impl RustTool for CortexScope {
             }
             _ => {}
         }
-        if let Some(diff) = args.get("diff").and_then(|v| v.as_str()) {
-            if diff.chars().count() > MAX_DIFF_LEN {
-                return Err(ToolError::InvalidArgument(format!(
-                    "'diff' exceeds {MAX_DIFF_LEN} character limit"
-                )));
-            }
-        }
 
         let (changed_files, input_truncated) = scope::changed_files_from_args(&args);
         if changed_files.is_empty() {
             return Err(ToolError::InvalidArgument(
                 "must provide a non-empty 'changed_files' (string or array) or 'diff'".to_string(),
             ));
+        }
+
+        // A `diff`'s total-length DoS ceiling is applied ONLY when the parse
+        // did not already truncate by file count: an ordinary large multi-file
+        // diff (> MAX_CHANGED_FILES files) truncates + flags `truncated:true`
+        // rather than being rejected; rejection is reserved for a
+        // pathologically huge single blob (few files, enormous content).
+        if !input_truncated {
+            if let Some(diff) = args.get("diff").and_then(|v| v.as_str()) {
+                if diff.chars().count() > MAX_DIFF_LEN {
+                    return Err(ToolError::InvalidArgument(format!(
+                        "'diff' exceeds {MAX_DIFF_LEN}-char DoS ceiling"
+                    )));
+                }
+            }
         }
 
         let response = scope::compute_scope(project_id, &changed_files, self.config.max_blast_nodes, input_truncated);
@@ -538,7 +571,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scope_rejects_oversized_changed_files() {
+    async fn test_scope_rejects_oversized_single_changed_file_element() {
+        // A SINGLE over-MAX_TEXT_LEN path element is malformed -> InvalidArgument
+        // (the CSV string has no commas, so it is one element). This is the
+        // per-element reject that must SURVIVE the cycle-3 truncation
+        // reconciliation (count overflow truncates, single-blob rejects).
         let tool = CortexScope { config: test_config() };
         let huge = "x".repeat(MAX_TEXT_LEN + 1);
         let err = tool
@@ -546,6 +583,28 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_scope_truncates_long_csv_of_short_paths_not_rejects() {
+        // A CSV whose TOTAL length far exceeds MAX_TEXT_LEN but is just many
+        // short paths must TRUNCATE (truncated:true), not be rejected — the
+        // cycle-3 fix for the count-vs-length reconciliation.
+        let store_dir = std::env::temp_dir().join(format!("atlas-cortexmod-csv-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+
+        let csv = (0..500).map(|i| format!("src/f{i}.rs")).collect::<Vec<_>>().join(",");
+        assert!(csv.len() > MAX_TEXT_LEN, "fixture must exceed the per-element cap in total");
+        let tool = CortexScope { config: test_config() };
+        let out = tool
+            .execute(json!({"project_id": "TERM", "changed_files": csv}))
+            .await
+            .expect("a long CSV of short paths must truncate, not error");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["truncated"], true, "count-overflow CSV must set truncated:true");
+
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
     }
 
     #[tokio::test]
@@ -620,14 +679,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scope_rejects_oversized_diff() {
+    async fn test_scope_rejects_pathologically_huge_single_blob_diff() {
+        // A diff with FEW files (one) but DoS-scale content (> MAX_DIFF_LEN)
+        // is rejected: it did not truncate by file count, so the total-length
+        // ceiling applies. One valid `+++` header ensures the parse yields a
+        // (non-empty, non-truncated) file so we exercise the length reject,
+        // not the empty-input reject.
         let tool = CortexScope { config: test_config() };
-        let huge = "x".repeat(MAX_DIFF_LEN + 1);
+        let diff = format!("+++ b/src/a.rs\n{}", "x".repeat(MAX_DIFF_LEN + 1));
         let err = tool
-            .execute(json!({"project_id": "TERM", "diff": huge}))
+            .execute(json!({"project_id": "TERM", "diff": diff}))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_scope_truncates_diff_with_many_files_not_rejects() {
+        // An ordinary big multi-file diff (far MORE files than the file-count
+        // cap, but well under the DoS byte ceiling) must TRUNCATE + flag
+        // `truncated:true`, NEVER be rejected — the core cycle-3 fix.
+        let store_dir = std::env::temp_dir().join(format!("atlas-cortexmod-diffcount-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+
+        let mut diff = String::new();
+        for i in 0..1000 {
+            diff.push_str(&format!("+++ b/src/f{i}.rs\n"));
+        }
+        assert!(diff.len() < MAX_DIFF_LEN, "fixture must stay under the DoS byte ceiling");
+        let tool = CortexScope { config: test_config() };
+        let out = tool
+            .execute(json!({"project_id": "TERM", "diff": diff}))
+            .await
+            .expect("a many-file diff must truncate, not error");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["truncated"], true, "count-overflow diff must set truncated:true");
+
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
     }
 
     #[tokio::test]
