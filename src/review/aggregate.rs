@@ -21,6 +21,17 @@ pub struct Finding {
     #[serde(default)]
     pub symbol: Option<String>,
     pub description: String,
+    /// CXEG-07: set only by the Tier-C consistency/elegance lens's
+    /// cross-source disagreement check (`review::consistency`) when two or
+    /// more independent sources (the pinned lens provider, or a correctness
+    /// reviewer's own `category:consistency|elegance` tag) reported a
+    /// DIFFERING take on the same `(category, file, symbol)` anchor. `None`
+    /// for every other finding (the plain KGFIND-02 correctness-reviewer
+    /// path never sets this). Advisory metadata only -- never affects dedup
+    /// keying, scope resolution, or (per CXEG-07's load-bearing safety
+    /// property) `aggregate_verdict`/`complete`.
+    #[serde(default)]
+    pub subjective: Option<bool>,
 }
 
 /// One provider's outcome, as surfaced in the tool's `providers` output array.
