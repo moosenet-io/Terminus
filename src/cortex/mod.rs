@@ -41,16 +41,35 @@
 //!   transient graph build + CXEG-03 structural scoring (see `audit.rs`'s
 //!   `run_audit` and the "Tool: cortex_audit" section below).
 //!
-//! Net result: this module registers 13 tool NAMES total (the 10 from before
+//! Net result: this module registers 14 tool NAMES total (the 10 from before
 //! CXEG-06, plus `cortex_house_style` added live in **CXEG-06**, plus
 //! `cortex_waive` added live in **CXEG-08**, plus `cortex_crystallize` added
-//! live in **CXEG-09**). Of those, `cortex_scope` (CXEG-02), `cortex_review`
+//! live in **CXEG-09**, plus `cortex_consistency_debt` added live in
+//! **CXEG-12**). Of those, `cortex_scope` (CXEG-02), `cortex_review`
 //! (CXEG-04), `cortex_audit` (CXEG-11), `cortex_house_style` (CXEG-06),
-//! `cortex_waive` (CXEG-08), and `cortex_crystallize` (CXEG-09) are all real,
-//! live tools (the Atlas-backed ones plus `cortex_waive`/`cortex_crystallize`,
-//! both KGFIND-backed); the other 7 are pure deprecation aliases with no
-//! backend at all. `test_cortex_tools_registered` below asserts this shape
-//! (13 names present), not the old 10/11/12-live-tool implementations.
+//! `cortex_waive` (CXEG-08), `cortex_crystallize` (CXEG-09), and
+//! `cortex_consistency_debt` (CXEG-12) are all real, live tools (the
+//! Atlas-backed ones plus `cortex_waive`/`cortex_crystallize`/
+//! `cortex_consistency_debt`, all KGFIND-backed); the other 7 are pure
+//! deprecation aliases with no backend at all. `test_cortex_tools_registered`
+//! below asserts this shape (14 names present), not the old
+//! 10/11/12/13-live-tool implementations.
+//!
+//! ## CXEG-12: `cortex_consistency_debt` — read-only consistency-debt trend
+//!
+//! `src/cortex/debt.rs` adds `cortex_consistency_debt`, a READ-ONLY
+//! aggregation over the SAME KGFIND-01 `FindingsStore` every other
+//! finding-shaped Cortex tool already reads — no new store, no writes. It
+//! rolls up `category: consistency|elegance|waiver` findings per Leiden
+//! community (resolved via the project's stored Atlas graph, same
+//! `GraphStore`/`KnowledgeGraph` lookups `cortex_scope`/`cortex_review` use)
+//! and per category, so the fleet can see whether house-style debt is
+//! growing/shrinking and which subsystems accrue it. Degrades to
+//! `configured:false` (never an error) without a configured findings store;
+//! degrades a `node`/`path`-scoped finding to an `"unmapped"` bucket
+//! (`graph_available:false`) without a stored Atlas graph, rather than
+//! fabricating a community. See `debt`'s module doc and
+//! `docs/cortex-elegance-gate.md`'s "Consistency-debt trend" section.
 //!
 //! ## CXEG-09: `cortex_crystallize` — recurrence + adversarial rule crystallization
 //!
@@ -136,6 +155,7 @@ use crate::tool::RustTool;
 pub mod audit;
 pub mod calibrate;
 pub mod crystallize;
+pub mod debt;
 pub mod deprecated;
 pub mod house_style;
 pub mod metrics;
@@ -800,14 +820,15 @@ impl RustTool for CortexHouseStyle {
 // Registration
 // ---------------------------------------------------------------------------
 
-/// Register all Cortex tools into the ToolRegistry: the 5 "real" tools
+/// Register all Cortex tools into the ToolRegistry: the 6 "real" tools
 /// (`cortex_scope` — live Atlas-backed blast radius as of CXEG-02;
 /// `cortex_house_style` — live Atlas-derived house-style exemplars as of
 /// CXEG-06; `cortex_review` — live Atlas-backed risk scoring as of CXEG-04;
 /// `cortex_audit` — live Atlas-backed external-repo audit as of CXEG-11;
 /// `cortex_waive` — waiver recording as of CXEG-08; `cortex_crystallize` —
-/// rule crystallization loop as of CXEG-09) plus the 7 deprecation aliases
-/// for the retired pure-relay tools (see [`deprecated`]).
+/// rule crystallization loop as of CXEG-09; `cortex_consistency_debt` —
+/// read-only KGFIND consistency-debt trend as of CXEG-12) plus the 7
+/// deprecation aliases for the retired pure-relay tools (see [`deprecated`]).
 pub fn register(registry: &mut ToolRegistry) {
     let config = Arc::new(CortexConfig::from_env());
     let house_style_cache = Arc::new(house_style::HouseStyleCache::new());
@@ -828,6 +849,9 @@ pub fn register(registry: &mut ToolRegistry) {
     // CXEG-09: rule crystallization loop (kg_findings recurrence + adversarial
     // review_run panel_majority promotion -> lint stub / prose house rule).
     crystallize::register(registry);
+
+    // CXEG-12: read-only consistency-debt trend over the same KGFIND corpus.
+    debt::register(registry);
 
     deprecated::register(registry);
 }
@@ -1208,14 +1232,15 @@ mod tests {
     fn test_cortex_tools_registered() {
         let mut registry = ToolRegistry::new();
         register(&mut registry);
-        // 6 "real" tools (cortex_scope live since CXEG-02, cortex_review
+        // 7 "real" tools (cortex_scope live since CXEG-02, cortex_review
         // live since CXEG-04, cortex_audit live since CXEG-11,
         // cortex_house_style live since CXEG-06, cortex_waive live since
-        // CXEG-08, cortex_crystallize live since CXEG-09) + 7 deprecation
-        // aliases = 13 names — the pre-CXEG-08 11-name surface plus CXEG-08's
-        // `cortex_waive` and CXEG-09's `cortex_crystallize` (both intentional,
-        // additive MCP-listing changes).
-        assert_eq!(registry.len(), 13);
+        // CXEG-08, cortex_crystallize live since CXEG-09,
+        // cortex_consistency_debt live since CXEG-12) + 7 deprecation
+        // aliases = 14 names — the pre-CXEG-12 13-name surface plus CXEG-12's
+        // `cortex_consistency_debt` (an intentional, additive MCP-listing
+        // change).
+        assert_eq!(registry.len(), 14);
         for name in [
             "cortex_scope",
             "cortex_house_style",
@@ -1223,6 +1248,7 @@ mod tests {
             "cortex_audit",
             "cortex_waive",
             "cortex_crystallize",
+            "cortex_consistency_debt",
             "cortex_stats",
             "cortex_build",
             "cortex_architecture",
