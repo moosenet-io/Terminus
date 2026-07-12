@@ -271,12 +271,12 @@ fn record_use_tree(tree: &UseTree, prefix: &mut Vec<String>, out: &mut HashSet<S
             prefix.pop();
         }
         UseTree::Name(n) => {
-            if prefix == ["std", "env"] && n.ident == "var" {
+            if prefix.len() == 2 && prefix[0] == "std" && prefix[1] == "env" && n.ident == "var" {
                 out.insert("var".to_string());
             }
         }
         UseTree::Rename(r) => {
-            if prefix == ["std", "env"] && r.ident == "var" {
+            if prefix.len() == 2 && prefix[0] == "std" && prefix[1] == "env" && r.ident == "var" {
                 out.insert(r.rename.to_string());
             }
         }
