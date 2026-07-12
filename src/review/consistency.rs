@@ -290,7 +290,15 @@ fn merge_and_flag_disagreement(
     let mut groups: std::collections::BTreeMap<(String, Option<String>, Option<String>), Group> = std::collections::BTreeMap::new();
 
     for f in lens_findings {
-        let key = (f.category.clone(), f.file.clone(), f.symbol.clone());
+        // Normalize category case/whitespace for the grouping key so a
+        // reviewer's "Consistency" and the lens's "consistency" collapse into
+        // the SAME group (agy review finding). file/symbol stay case-sensitive
+        // (paths/identifiers are case-significant on Linux).
+        let key = (
+            f.category.trim().to_ascii_lowercase(),
+            f.file.clone(),
+            f.symbol.clone(),
+        );
         groups.entry(key).or_default().entries.push((format!("lens:{lens_provider}"), f.clone()));
     }
     for r in panel_results {
@@ -298,7 +306,15 @@ fn merge_and_flag_disagreement(
             if !is_consistency_like(&f.category) {
                 continue;
             }
-            let key = (f.category.clone(), f.file.clone(), f.symbol.clone());
+            // Normalize category case/whitespace for the grouping key so a
+        // reviewer's "Consistency" and the lens's "consistency" collapse into
+        // the SAME group (agy review finding). file/symbol stay case-sensitive
+        // (paths/identifiers are case-significant on Linux).
+        let key = (
+            f.category.trim().to_ascii_lowercase(),
+            f.file.clone(),
+            f.symbol.clone(),
+        );
             groups.entry(key).or_default().entries.push((format!("reviewer:{}", r.provider), f.clone()));
         }
     }
@@ -515,6 +531,21 @@ mod tests {
         let out = merge_and_flag_disagreement("qwen_coder", &lens, &panel);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|f| f.subjective), "differing descriptions at the same anchor must all be flagged subjective");
+    }
+
+    #[test]
+    fn category_case_mismatch_still_groups_and_flags_subjective() {
+        // agy review finding: a reviewer emitting "Consistency" (capitalized)
+        // and the lens emitting "consistency" must collapse into ONE group so
+        // the disagreement is detected — the grouping key normalizes case.
+        let lens = vec![finding("consistency", Some("src/a.rs"), Some("crate::a::foo"), "deviates from house style")];
+        let panel = vec![provider_with(
+            "opus",
+            vec![finding("Consistency", Some("src/a.rs"), Some("crate::a::foo"), "looks fine to me")],
+        )];
+        let out = merge_and_flag_disagreement("qwen_coder", &lens, &panel);
+        assert_eq!(out.len(), 2, "case-variant categories at the same anchor must group together");
+        assert!(out.iter().all(|f| f.subjective), "a case-only category difference must not hide a real disagreement");
     }
 
     #[test]
