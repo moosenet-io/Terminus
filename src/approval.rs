@@ -44,8 +44,12 @@ const MESH_UPSTREAM_ARG: &str = "_mesh_upstream";
 /// Bare tool names that are approval-gated locally: every tool in the
 /// `ansible`/`openhands`/`<secret-manager>` modules calls [`gate`] at the top of its  // pii-test-fixture
 /// own `execute()`, plus the state-mutating `routines_propose`/
-/// `routines_pending`/`routines_approve` and the irreversible
-/// `git_public_mirror_approve`/`git_public_mirror_push`. Mirrored here as a
+/// `routines_pending`/`routines_approve`, the irreversible
+/// `git_public_mirror_approve`/`git_public_mirror_push`, and the three
+/// mutating Postgres tools (PGT-06) `pg_execute`/`pg_ddl`/`pg_admin` — the
+/// four read-only `pg_*` tools (`pg_query`/`pg_list_tables`/
+/// `pg_describe_table`/`pg_identities`) are deliberately NOT guarded.
+/// Mirrored here as a
 /// static classification (MESH-09) so a federated call routed to
 /// `<namespace>__<bare_name>` (see `crate::mesh::merge::CallRoute::Upstream`)
 /// can be gated AT THE GATEWAY, before it ever leaves this process, using the
@@ -71,6 +75,9 @@ const GUARDED_BARE_NAMES: &[&str] = &[
     "routines_approve",
     "git_public_mirror_approve",
     "git_public_mirror_push",
+    "pg_execute",
+    "pg_ddl",
+    "pg_admin",
 ];
 
 /// Is `bare_name` (already de-namespaced — see `crate::mesh::merge::split_namespaced`)
@@ -420,6 +427,9 @@ mod tests {
             "routines_approve",
             "git_public_mirror_approve",
             "git_public_mirror_push",
+            "pg_execute",
+            "pg_ddl",
+            "pg_admin",
         ] {
             assert!(is_guarded(name), "{name} should be classified as guarded");
         }
@@ -430,8 +440,38 @@ mod tests {
         // Ungated tools (no `gate(...)` call in their `execute()`), and a
         // namespace-shaped bare name that just happens to collide with
         // nothing in the guarded list.
-        for name in ["health", "weather_get", "routines_list", "routines_history", "git_public_mirror_status"] {
+        for name in [
+            "health",
+            "weather_get",
+            "routines_list",
+            "routines_history",
+            "git_public_mirror_status",
+            "pg_query",
+            "pg_list_tables",
+            "pg_describe_table",
+            "pg_identities",
+        ] {
             assert!(!is_guarded(name), "{name} should NOT be classified as guarded");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // PGT-06 — the three mutating pg_* tools are guarded; the four read
+    // pg_* tools are not. Kept as its own focused pair of assertions (in
+    // addition to the two general lists above) per the PGT-06 spec's
+    // explicit test requirement.
+    // ------------------------------------------------------------------
+    #[test]
+    fn pgt06_mutating_pg_tools_are_guarded() {
+        for name in ["pg_execute", "pg_ddl", "pg_admin"] {
+            assert!(is_guarded(name), "{name} must be guarded (PGT-06)");
+        }
+    }
+
+    #[test]
+    fn pgt06_read_pg_tools_are_not_guarded() {
+        for name in ["pg_query", "pg_list_tables", "pg_describe_table", "pg_identities"] {
+            assert!(!is_guarded(name), "{name} must NOT be guarded (PGT-06)");
         }
     }
 

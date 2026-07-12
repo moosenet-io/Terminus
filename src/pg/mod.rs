@@ -23,13 +23,18 @@
 //! `model_fleet_catalog` and the rest of the build-pipeline-facing core
 //! surface are scoped (S9 posture).
 //!
-//! ## Guarding (future items)
+//! ## Guarding
 //! `pg_identities` (PGT-01) and `pg_query` / `pg_list_tables` /
 //! `pg_describe_table` (PGT-02, the read surface) are read-only and NOT
-//! guarded. `pg_execute` / `pg_ddl` / `pg_admin` (PGT-03/04/05) are
-//! destructive and MUST be added to `crate::approval::GUARDED_BARE_NAMES`
-//! when they land — every mutating `pg_*` tool added to this module MUST be
-//! evaluated for the guarded set, per PGT-06's governance rule.
+//! guarded — no per-occurrence approval is required to call them. The three
+//! mutating tools, `pg_execute` / `pg_ddl` / `pg_admin` (PGT-03/04/05), ARE
+//! guarded (PGT-06): each is listed in `crate::approval::GUARDED_BARE_NAMES`
+//! AND calls `crate::approval::gate(...)` itself at the top of its
+//! `execute`/`execute_structured`, after statement-class validation and
+//! before any DB connection is attempted — every call requires per-
+//! occurrence operator approval via the `tool_approvals` gate before it
+//! reaches Postgres. Every future mutating `pg_*` tool added to this module
+//! MUST be evaluated for the guarded set, per PGT-06's governance rule.
 //!
 //! ## Exemption boundary (load-bearing, do not blur)
 //! This suite governs AGENT/admin/ad-hoc Postgres access. It does NOT
@@ -107,5 +112,39 @@ mod tests {
         assert!(registry.contains("pg_query"));
         assert!(registry.contains("pg_list_tables"));
         assert!(registry.contains("pg_describe_table"));
+    }
+
+    // ------------------------------------------------------------------
+    // PGT-06 — no dangling guard entry: every `pg_*` name that
+    // `crate::approval::is_guarded` classifies as guarded must correspond
+    // to a tool that is actually registered by this module (and vice
+    // versa within the pg_* namespace) so the guarded set in
+    // `GUARDED_BARE_NAMES` can never drift from what's really wired up.
+    // ------------------------------------------------------------------
+    #[test]
+    fn pgt06_guarded_pg_tools_are_all_actually_registered() {
+        let mut registry = ToolRegistry::new();
+        register(&mut registry);
+
+        let guarded_pg_tools = ["pg_execute", "pg_ddl", "pg_admin"];
+        for name in guarded_pg_tools {
+            assert!(
+                crate::approval::is_guarded(name),
+                "{name} should be classified as guarded"
+            );
+            assert!(
+                registry.contains(name),
+                "{name} is in GUARDED_BARE_NAMES but is not a registered tool — dangling guard entry"
+            );
+        }
+
+        let read_pg_tools = ["pg_query", "pg_list_tables", "pg_describe_table", "pg_identities"];
+        for name in read_pg_tools {
+            assert!(
+                !crate::approval::is_guarded(name),
+                "{name} is a read tool and must NOT be guarded"
+            );
+            assert!(registry.contains(name), "{name} should be registered");
+        }
     }
 }

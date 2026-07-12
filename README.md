@@ -714,8 +714,10 @@ GitHub/Gitea/Plane, applied to Postgres.
 
 **Status:** PGT-01 shipped the connection/identity foundation and the
 read-only `pg_identities` tool. PGT-02 adds the read surface (`pg_query` /
-`pg_list_tables` / `pg_describe_table`); PGT-04 adds `pg_ddl` (schema DDL).
-`pg_execute` (DML) is present; `pg_admin` (roles/GRANT/REVOKE) is a later S115 item.
+`pg_list_tables` / `pg_describe_table`); PGT-04 adds `pg_ddl` (schema DDL);
+PGT-03 adds `pg_execute` (DML); PGT-05 adds `pg_admin` (roles/GRANT/REVOKE).
+PGT-06 wires all three mutating tools into the gateway's per-occurrence
+approval gate (see "Governance" below) — the suite is now fully guarded.
 
 ### Read tools (PGT-02)
 
@@ -776,11 +778,11 @@ both the response summary and structured payload, so an approval prompt or
 audit reviewer can immediately see the blast radius. Returns
 `{ statement_class, object, irreversible, identity, ok }`.
 
-`pg_ddl` is destructive by design and **MUST be treated as guarded** — it is
-registered on the tool registry here, but PGT-06 is the item that adds it to
-`crate::approval::GUARDED_BARE_NAMES` (and confirms audit sanitization)
-alongside `pg_execute`/`pg_admin` in one governance pass; see the note at the
-bottom of `src/pg/ddl.rs`.
+`pg_ddl` is destructive by design and is **GUARDED** (PGT-06): it is in
+`crate::approval::GUARDED_BARE_NAMES` and calls `crate::approval::gate(...)`
+itself at the top of `execute_structured`, after the statement-class gate and
+before any DB connection is attempted — every call requires per-occurrence
+operator approval. See the note at the bottom of `src/pg/ddl.rs`.
 
 ### `pg_execute` — parameterized DML (PGT-03)
 
@@ -809,12 +811,12 @@ DDL-shaped (pointing the caller at `pg_ddl`) — the detector exists as one
 shared, reusable classifier for later `pg_*` items, not only for what
 `pg_execute` itself accepts.
 
-`pg_execute` is a mutating tool and per the "Governance" section below MUST
-be added to `crate::approval::GUARDED_BARE_NAMES` — that addition is PGT-06's
-centralized change (adding every mutating `pg_*` tool to the guarded set at
-once), not made by this item. Until PGT-06 lands, a reachable `pg_execute`
-runs DML ungated by the approval flow (the DB-role privilege boundary and
-the standard gateway audit trail still apply).
+`pg_execute` is a mutating tool and is **GUARDED** (PGT-06): it is in
+`crate::approval::GUARDED_BARE_NAMES` and calls `crate::approval::gate(...)`
+itself at the top of `execute_structured`, after the statement-class and
+destructive-shape checks and before any DB connection is attempted — every
+call requires per-occurrence operator approval, on top of the DB-role
+privilege boundary and the standard gateway audit trail.
 
 ### Identity / connection model
 
@@ -855,14 +857,20 @@ sweep (`crate::intake::storage::get_pool`), the fleet-catalog/discovery
 read+write tools, and any other in-process data path keep their direct
 `PgPool`, unrouted through this suite and undisturbed by it.
 
-Destructive `pg_*` tools (`pg_execute`, `pg_ddl`, `pg_admin`) are meant to be
-registered in `crate::approval::GUARDED_BARE_NAMES` so the gateway requires
-approval before execution, on top of the DB-role privilege boundary and the
-standard gateway audit trail every tool call already gets — `pg_ddl` (PGT-04)
-is implemented and registered on the tool registry, but PGT-06 is the item
-that actually adds the guarded-set entries + confirms audit sanitization for
-the whole destructive set in one governance pass. Every mutating `pg_*` tool
-added to this suite MUST be evaluated for the guarded set.
+The three mutating `pg_*` tools — `pg_execute`, `pg_ddl`, `pg_admin` — are
+**guarded** (PGT-06): each is registered in
+`crate::approval::GUARDED_BARE_NAMES` (so a federated/mesh call is gated at
+the gateway before it can be laundered through a remote upstream) AND each
+calls `crate::approval::gate(...)` itself at the top of its
+`execute`/`execute_structured`, after statement-class validation (and, for
+`pg_admin`, after password redaction — see `src/pg/admin.rs`'s S6 note) and
+before any DB connection is attempted — no mutating call reaches Postgres
+without per-occurrence operator approval via the `tool_approvals` gate. This
+is on top of, not instead of, the DB-role privilege boundary and the
+standard gateway audit trail every tool call already gets. The four
+read-only tools — `pg_query`, `pg_list_tables`, `pg_describe_table`,
+`pg_identities` — are deliberately **not** guarded. Every future mutating
+`pg_*` tool added to this suite MUST be evaluated for the guarded set.
 
 `pg` registers on the CORE tool registry only (`crate::registry::register_all`,
 alongside `crate::intake::register`) — Chord-served, never the

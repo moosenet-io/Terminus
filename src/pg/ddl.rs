@@ -1,8 +1,11 @@
 //! `pg_ddl` — schema DDL: CREATE/ALTER/DROP TABLE/INDEX/VIEW/SEQUENCE/SCHEMA
-//! (PGT-04). Guarded (gateway approval, wired centrally by PGT-06 into
-//! `crate::approval::GUARDED_BARE_NAMES` — see the module note at the bottom
-//! of this file), audited, destructive by design: the operator's explicit
-//! goal is an audited door replacing SSH+psql schema edits.
+//! (PGT-04). GUARDED (PGT-06 wired `pg_ddl` into
+//! `crate::approval::GUARDED_BARE_NAMES` AND this tool calls
+//! [`crate::approval::gate`] itself at the top of `execute_structured`,
+//! after the statement-class gate and before any DB connection — see the
+//! module note at the bottom of this file), audited, destructive by design:
+//! the operator's explicit goal is an audited door replacing SSH+psql schema
+//! edits.
 //!
 //! ## Statement-class gate (pure string checks, no DB required)
 //! [`classify_ddl`] accepts ONLY a single DDL statement whose leading keyword
@@ -24,6 +27,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::approval::{gate, Gate};
 use crate::error::ToolError;
 use crate::registry::ToolRegistry;
 use crate::tool::{RustTool, ToolOutput};
@@ -217,6 +221,28 @@ impl RustTool for PgDdl {
             .map(str::to_lowercase)
             .unwrap_or_else(|| DEFAULT_DDL_IDENTITY.to_string());
 
+        // GUARDED (PGT-06): gate BEFORE any DB connection is attempted. The
+        // SQL text has no secret shape (unlike pg_admin's PASSWORD
+        // literals), so it is passed through to the approval audit trail
+        // as-is — same standard gate call, no redaction needed on this path.
+        let summary = format!(
+            "pg_ddl {} {} via identity '{identity}'{}: {sql}",
+            classification.statement_class,
+            classification.object,
+            if classification.irreversible { ", IRREVERSIBLE" } else { "" }
+        );
+        let safe_args = json!({
+            "statement_class": classification.statement_class,
+            "object": classification.object,
+            "identity": identity,
+            "irreversible": classification.irreversible,
+            "sql": sql,
+        });
+        match gate(self.name(), &safe_args, &summary).await {
+            Gate::Granted => {}
+            Gate::Pending(msg) | Gate::Denied(msg) => return Ok(ToolOutput::text_only(msg)),
+        }
+
         let pool = conn::resolve_connection(&identity).await?;
 
         sqlx::query(sql)
@@ -253,12 +279,9 @@ pub fn register(registry: &mut ToolRegistry) {
     registry.register_or_replace(Box::new(PgDdl));
 }
 
-// NOTE for PGT-06 (do not implement here — see PGT-04's dispatch note):
-// `pg_ddl` MUST be added to `crate::approval::GUARDED_BARE_NAMES` alongside
-// `pg_execute`/`pg_admin`. This module intentionally does not touch
-// `src/approval.rs` — PGT-06 wires the full guarded set + audit
-// sanitization confirmation in one place per the suite's governance rule.
-// Until that lands, `pg_ddl` is registered but NOT gateway-guarded.
+// PGT-06: `pg_ddl` is now guarded — see `crate::approval::GUARDED_BARE_NAMES`
+// (alongside `pg_execute`/`pg_admin`) and the `gate(...)` call in
+// `execute_structured` above.
 
 #[cfg(test)]
 mod tests {
