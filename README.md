@@ -40,7 +40,36 @@ dispatch, duplicate detection, and catalog listing.
 
 ## Architecture
 
-<img src="assets/architecture.svg" alt="Terminus architecture" width="100%">
+```mermaid
+flowchart LR
+    Clients["MCP clients<br/>(stdio / HTTP+mTLS)"] --> Gateway
+
+    subgraph Gateway["terminus-primary (gateway)"]
+        Dispatch["Dispatch +<br/>JSON-Schema validation"]
+        Gov["Governance:<br/>path-jail, vault secrets,<br/>PII gate, audit log"]
+        Dispatch --> Gov
+    end
+
+    Gateway --> Core
+    Gateway --> Personal
+    Gateway --> Chord
+
+    subgraph Core["Core tool registry (local)"]
+        CoreTools["~52 domain tool modules<br/>(git forges, trackers, infra, ...)"]
+    end
+
+    subgraph Personal["terminus_personal (federated)"]
+        PersonalTools["Personal-registry tools"]
+    end
+
+    subgraph MeshGroup["Mesh (optional, N upstreams)"]
+        Upstream["Federated Terminus-shaped<br/>MCP servers"]
+    end
+
+    Personal -.optional.-> MeshGroup
+
+    Chord["Chord<br/>(inference proxy)"]
+```
 
 MCP clients connect over stdio or HTTP/mTLS transports to the Terminus core
 MCP server, which owns dispatch, JSON-Schema validation, and governance.
