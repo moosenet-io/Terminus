@@ -173,6 +173,14 @@ fn git_transport(work_dir: &Path, args: &[&str], token: &str) -> Result<(), Tool
     Ok(())
 }
 
+/// Best-effort delete the pushed PR feature branch from the public remote (used when a
+/// pre-merge replay step fails, so a retry starts clean instead of tripping the
+/// remote-branch guard). Deleting the branch also auto-closes any open PR the forge
+/// opened on it. Errors are swallowed — this is cleanup, not a gate.
+fn cleanup_public_branch(work_dir: &Path, remote: &str, branch: &str, token: &str) {
+    let _ = git_transport(work_dir, &["push", "--delete", "--", remote, branch], token);
+}
+
 /// Fetch the public mirror's `main` into the work-dir and return its tip sha.
 fn fetch_public_main(work_dir: &Path, remote: &str, token: &str) -> Result<String, ToolError> {
     git_transport(work_dir, &["fetch", "--quiet", remote, "refs/heads/main"], token)?;
@@ -661,10 +669,29 @@ pub async fn replay_pr(
     let (commits, public_pr, mirrored) = match phase_a {
         Ok(v) => v,
         Err(e) => {
+            // Nothing is merged yet — clean up any pushed public branch (so a retry is
+            // clean, not blocked by the remote-branch guard) and roll back canonical.
+            cleanup_public_branch(&cfg.work_dir, &cfg.remote, &branch, token);
             restore_canonical(&cfg.work_dir, &snap, &branch)?;
             return Err(e);
         }
     };
+
+    // Pre-merge compare-and-set: re-verify public main is STILL at the tip we rebased
+    // the PR slice onto. If it advanced (a concurrent public writer), abort BEFORE
+    // merging so we never merge onto a divergent lineage. This is still the roll-back-
+    // able window (the merge has not happened); the post-merge tree verify catches the
+    // residual tiny race between this check and the merge call.
+    let public_now = fetch_public_main(&cfg.work_dir, &cfg.remote, token)?;
+    if public_now != public_base {
+        cleanup_public_branch(&cfg.work_dir, &cfg.remote, &branch, token);
+        restore_canonical(&cfg.work_dir, &snap, &branch)?;
+        return Err(ToolError::Conflict(format!(
+            "public main advanced from {public_base} to {public_now} during the replay — aborting \
+             before merge to avoid merging onto a divergent lineage. Retry (it re-rebases onto the \
+             new public tip)."
+        )));
+    }
 
     // ── Phase B: merge (point of no return) ─────────────────────────────────────
     let mut mp = json!({
@@ -683,7 +710,9 @@ pub async fn replay_pr(
         match public_pr_for_branch(reg, cfg, &pub_repo, &branch).await {
             Ok(Some(existing)) if pr_is_merged(&existing) => { /* merged despite the error */ }
             Ok(Some(_)) => {
-                // Positively still open → the merge did not happen → safe to roll back.
+                // Positively still open → the merge did not happen → safe to roll back
+                // and clean up the pushed branch / open PR for a clean retry.
+                cleanup_public_branch(&cfg.work_dir, &cfg.remote, &branch, token);
                 restore_canonical(&cfg.work_dir, &snap, &branch)?;
                 return Err(e);
             }
