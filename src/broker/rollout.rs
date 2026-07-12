@@ -57,6 +57,19 @@
 //! — the restore is a clean no-op: no orphaned `previous` snapshot is ever
 //! written back over a state this rollout no longer owns.
 //!
+//! ## Flip-then-verify: the accepted in-window trade-off
+//! This is a flip-THEN-verify model: the pre-flip gate
+//! (`control::register_verified_transport`'s connect + bounded health probe
+//! + `list()`-verify) makes the new instance healthy AT flip time, the
+//! post-flip window then catches a subsequent regression and rolls back
+//! atomically. A narrow window does exist where a call landing AFTER the
+//! flip but BEFORE a rollback can hit the just-regressed new instance —
+//! that is the accepted trade-off, not a bug: fully avoiding it would
+//! require dual-routing one tool name to both the old and new instance
+//! simultaneously and reconciling their answers, which the flat one-route-
+//! per-name table cannot express. The window is short, the pre-flip gate
+//! makes a healthy-at-flip instance the norm, and rollback is atomic.
+//!
 //! ## Degraded state (both old and new unhealthy)
 //! If a rollback's restored "previous" instance turns out to *also* be
 //! unhealthy (e.g. both instances share a common outage), this module does
