@@ -7,8 +7,14 @@
 # NOT depend on `terminus-rs`; it only talks to a terminus primary over
 # HTTP/mTLS on the wire, matching field shapes by convention (see that
 # crate's doc comments), not by sharing Rust types.
+#
+# TMOD-03: `terminus-worker-sdk` joins as a third member -- unlike
+# `terminus-client`, it DOES depend on `terminus-rs` (path dependency) to
+# re-export the existing `RustTool`/`ToolOutput`/`ToolError`/`ToolInfo`
+# authoring types rather than duplicating or relocating them. See that
+# crate's `src/lib.rs` doc comment for what it is/isn't.
 [workspace]
-members = ["terminus-client"]
+members = ["terminus-client", "terminus-worker-sdk"]
 
 [package]
 name = "terminus-rs"
