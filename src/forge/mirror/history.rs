@@ -598,6 +598,10 @@ fn rebase_slice_onto(
         .env("GIT_COMMITTER_EMAIL", committer_email)
         .args([
             "rebase",
+            // Preserve the slice's merge topology (an internal PR's merge commit and
+            // any merge-only conflict-resolution tree changes) — a default rebase would
+            // flatten/drop merges and could alter the published tree.
+            "--rebase-merges",
             "--committer-date-is-author-date",
             "--onto",
             newbase,
@@ -702,6 +706,30 @@ pub fn replay_pr_slice(
     let (cname, cemail) = committer_identity(opts);
     rebase_slice_onto(work_dir, public_base, &canonical_base, branch_name, &cname, &cemail)?;
     let branch_tip = git_capture(work_dir, &["rev-parse", branch_name])?.trim().to_string();
+
+    // Post-rebase safety: the rebased branch tip's TREE MUST equal the canonical head's
+    // tree. Since public_base's tree equals the canonical base's tree, replaying the
+    // same slice onto it must reproduce identical content. If it differs, the rebase
+    // altered content (e.g. a dropped/mishandled merge commit) — refuse to publish
+    // divergent content rather than push a branch that doesn't match the scrubbed
+    // lineage. Fail closed.
+    let tip_tree = git_capture(work_dir, &["rev-parse", &format!("{branch_tip}^{{tree}}")])?
+        .trim()
+        .to_string();
+    let head_tree = git_capture(work_dir, &["rev-parse", &format!("{canonical_head}^{{tree}}")])?
+        .trim()
+        .to_string();
+    if tip_tree != head_tree {
+        // Leave the work-tree on the canonical lineage before erroring.
+        let _ = git_capture(work_dir, &["checkout", "-f", &canonical_branch]);
+        let _ = git_capture(work_dir, &["reset", "--hard", &canonical_head]);
+        let _ = git_capture(work_dir, &["branch", "-D", branch_name]);
+        return Err(ToolError::Conflict(format!(
+            "rebased PR branch '{branch_name}' tip tree {tip_tree} does not match the canonical \
+             scrubbed head tree {head_tree} — the rebase altered content (a merge commit's \
+             conflict resolution may have been dropped). Refusing to publish divergent content."
+        )));
+    }
 
     // Restore the work-tree to the canonical lineage (the rebase left HEAD on branch_name).
     git_capture(work_dir, &["checkout", "-f", &canonical_branch])?;
@@ -1217,6 +1245,65 @@ mod tests {
         // The author is remapped to the bot on the PR-branch commits.
         let author = git(&wd, &["log", "-1", "--format=%an <%ae>", "pr-mirror/7"]).trim().to_string();
         assert!(author.contains("MoosenetBot"), "author remapped: {author}");
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    // ── GHIST-05 review: a merge-commit slice keeps its merge topology + tree ──
+    #[test]
+    fn replay_pr_slice_preserves_merge_commit() {
+        let src = unique("mergeprsrc");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q", "-b", "main"]);
+        write(&src, "a.txt", b"base\n");
+        commit_all(&src, "C1 base");
+        let c1 = git(&src, &["rev-parse", "HEAD"]).trim().to_string();
+
+        let wd = unique("mergeprwd");
+        let opts = ReplayOpts::with_author_map(bot_map());
+        replay_full_history(&src, &wd, &opts).unwrap(); // canonical at scrubbed(C1)
+        let canon_base = git(&wd, &["rev-parse", "HEAD"]).trim().to_string();
+        let base_tree = git(&wd, &["rev-parse", &format!("{canon_base}^{{tree}}")]).trim().to_string();
+
+        // Build a real MERGE commit on the source: a feature branch + a main commit,
+        // then a no-ff merge (two parents).
+        git(&src, &["checkout", "-q", "-b", "feat"]);
+        write(&src, "feature.txt", b"feature work\n");
+        commit_all(&src, "feature commit");
+        git(&src, &["checkout", "-q", "main"]);
+        write(&src, "mainline.txt", b"mainline work\n");
+        commit_all(&src, "mainline commit");
+        let out = Command::new("git")
+            .arg("-C").arg(&src).args(HOOKS_OFF)
+            .args(["-c", "user.name=M", "-c", "user.email=<email>", // pii-test-fixture
+                   "merge", "--no-ff", "-m", "Merge pull request feat", "feat"])
+            .output().unwrap();
+        assert!(out.status.success(), "merge: {}", String::from_utf8_lossy(&out.stderr));
+        let m = git(&src, &["rev-parse", "HEAD"]).trim().to_string();
+        // Sanity: m is a merge commit (2 parents).
+        assert_eq!(git(&src, &["rev-list", "--parents", "-n", "1", &m]).split_whitespace().count(), 3);
+
+        // Public base: distinct commit with the same tree as the canonical base.
+        let pub_base = {
+            let out = Command::new("git")
+                .arg("-C").arg(&wd).args(HOOKS_OFF)
+                .args(["-c", "user.name=P", "-c", "user.email=<email>", // pii-test-fixture
+                       "commit-tree", &base_tree, "-m", "public base"])
+                .env("GIT_COMMITTER_NAME", "P").env("GIT_COMMITTER_EMAIL", "<email>") // pii-test-fixture
+                .env("GIT_AUTHOR_NAME", "P").env("GIT_AUTHOR_EMAIL", "<email>") // pii-test-fixture
+                .output().unwrap();
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        let rep = replay_pr_slice(&src, &wd, &c1, &m, &pub_base, "pr-mirror/1", &opts).unwrap();
+        // The PR branch preserves the merge commit and matches the canonical head tree.
+        let branch_merges = git(&wd, &["rev-list", "--merges", "--count", &format!("{pub_base}..pr-mirror/1")]);
+        assert_eq!(branch_merges.trim(), "1", "the merge commit is preserved on the PR branch");
+        let branch_tree = git(&wd, &["rev-parse", "pr-mirror/1^{tree}"]).trim().to_string();
+        let canon_tree = git(&wd, &["rev-parse", &format!("{}^{{tree}}", rep.canonical_head)]).trim().to_string();
+        assert_eq!(branch_tree, canon_tree, "rebased merge slice is content-identical to canonical head");
 
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&wd);

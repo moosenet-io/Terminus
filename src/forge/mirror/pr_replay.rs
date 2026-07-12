@@ -473,31 +473,37 @@ pub async fn replay_pr(
         )
     })?;
 
-    // ORDER guard: this PR must be the NEXT unreplayed one. Replaying it while an
-    // earlier merged PR is still pending would make base_int..head_int span both, and
-    // this run would open ONE public PR carrying only THIS PR's title/body/comments
-    // over all those commits — mis-attributing earlier work. Detect a skipped PR as a
-    // MERGE COMMIT sitting strictly between the canonical lineage tip (base_int) and
-    // this PR's merge (head_int). This works whether head_int is itself a merge commit
-    // (fleet default) or a single-parent fast-forward/squash commit — unlike a strict
-    // `head_int^1 == base_int` check, which wrongly rejects a valid multi-commit
-    // fast-forward PR. (An earlier FAST-FORWARD-merged PR leaves no merge commit and so
-    // cannot be detected from git alone; callers still replay in order.)
-    let intervening: Vec<String> = git(&cfg.source, &["rev-list", "--merges", &format!("{base_int}..{head_int}")])
+    // ORDER guard: this PR must be the NEXT unreplayed one, or base_int..head_int would
+    // span an earlier pending PR and publish its work under THIS PR's title/body/
+    // comments (mis-attribution). The only way to VERIFY order from git is via a merge
+    // commit's parents: a merge commit's FIRST parent is internal main just before the
+    // merge, so it must equal the canonical tip (base_int). A single-parent merge
+    // (fast-forward / squash) leaves no such marker — order cannot be guaranteed — so
+    // we REFUSE rather than risk a silent mis-attribution (fail-closed). The fleet uses
+    // merge-commit PRs, so this is the normal path; a FF/squash-merged repo must
+    // publish going-forward via git_public_history_sync instead.
+    let parents: Vec<String> = git(&cfg.source, &["rev-list", "--parents", "-n", "1", &head_int])
         .map_err(|e| {
-            ToolError::Execution(format!(
-                "cannot enumerate merges in {base_int}..{head_int} for PR {internal_pr}: {e}"
-            ))
+            ToolError::Execution(format!("cannot read parents of {head_int} for PR {internal_pr}: {e}"))
         })?
         .split_whitespace()
-        .filter(|m| *m != head_int) // head_int itself, if a merge commit, is this PR's own merge
+        .skip(1) // first token is head_int itself; the rest are its parents
         .map(String::from)
         .collect();
-    if !intervening.is_empty() {
+    if parents.len() < 2 {
         return Err(ToolError::Conflict(format!(
-            "internal PR {internal_pr} is not the next unreplayed merged PR — merge commit(s) \
-             {intervening:?} sit between the canonical lineage tip {base_int} and this PR's merge \
-             {head_int}. Replay merged PRs in merge order (the immediately-following one first)."
+            "internal PR {internal_pr} was fast-forward/squash-merged (its merge commit {head_int} \
+             has a single parent) — git_public_mirror_replay_pr needs merge-commit-style internal \
+             merges to guarantee ordered, correctly-attributed replay. Use merge commits internally, \
+             or publish going-forward via git_public_history_sync."
+        )));
+    }
+    if parents[0] != base_int {
+        return Err(ToolError::Conflict(format!(
+            "internal PR {internal_pr} is not the next unreplayed merged PR — its merge commit's \
+             first parent {} does not equal the canonical lineage tip {base_int}. Replay merged \
+             PRs in merge order (the immediately-following one first).",
+            parents[0]
         )));
     }
 
