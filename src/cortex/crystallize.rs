@@ -928,8 +928,11 @@ mod tests {
         a.scope_ref = "src/a.rs".to_string();
         b.scope_ref = "src/b.rs".to_string();
         let rep_id = {
-            // representative is the higher-recurrence entry (a)
-            let sel = select_candidates(&[a.clone(), b.clone()], 3);
+            // representative is the higher-recurrence entry (a). Bind the input
+            // rows to a local so they outlive `sel` — Candidate.representative
+            // borrows from this slice (E0716 if it's a temporary).
+            let rows = [a.clone(), b.clone()];
+            let sel = select_candidates(&rows, 3);
             sel[0].representative.id
         };
         let mut findings = vec![a, b];
