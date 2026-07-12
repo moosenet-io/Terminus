@@ -296,7 +296,10 @@ async fn fetch_changed_files(
 /// versions embed per-commit file stats there). Never fabricates a path.
 fn extract_changed_files(body: &Value) -> Vec<String> {
     let mut paths = Vec::new();
-    let mut push_from_array = |arr: &[Value]| {
+    // Takes `paths` as an explicit `&mut` param rather than capturing it, so it
+    // holds no long-lived borrow that would conflict with the `paths.is_empty()`
+    // read below (E0502).
+    fn push_from_array(paths: &mut Vec<String>, arr: &[Value]) {
         for f in arr {
             if let Some(p) = f
                 .get("filename")
@@ -307,15 +310,15 @@ fn extract_changed_files(body: &Value) -> Vec<String> {
                 paths.push(p);
             }
         }
-    };
+    }
     if let Some(arr) = body.get("files").and_then(Value::as_array) {
-        push_from_array(arr);
+        push_from_array(&mut paths, arr);
     }
     if paths.is_empty() {
         if let Some(commits) = body.get("commits").and_then(Value::as_array) {
             for c in commits {
                 if let Some(arr) = c.get("files").and_then(Value::as_array) {
-                    push_from_array(arr);
+                    push_from_array(&mut paths, arr);
                 }
             }
         }
