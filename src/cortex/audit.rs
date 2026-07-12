@@ -684,6 +684,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_scratch_clone_cleans_up_on_success() {
         let fixture = make_local_git_repo(
             "success",
@@ -758,6 +759,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_run_audit_builds_report_from_local_clone() {
         let fixture = make_local_git_repo(
             "runaudit",
