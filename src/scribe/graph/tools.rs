@@ -700,6 +700,123 @@ or unreachable, so callers should fall back to the lexical `kg_search` in that c
     }
 }
 
+// ── kg_findings ─────────────────────────────────────────────────────────────
+
+/// Read-only lister over the KGFIND-01 [`super::findings_store::FindingsStore`]:
+/// captured findings for a project, ordered by recurrence
+/// (`occurrences DESC, last_seen DESC`), optionally filtered by scope kind,
+/// category, and a minimum occurrence count.
+pub struct KgFindings;
+
+/// Maximum `limit` accepted by `kg_findings` (default 50, clamped to
+/// `[1, KG_FINDINGS_MAX]`).
+const KG_FINDINGS_MAX: i64 = 200;
+
+fn clamp_findings_limit(limit: i64) -> i64 {
+    limit.clamp(1, KG_FINDINGS_MAX)
+}
+
+/// Map a stored [`super::findings_store::FindingRow`] to its result JSON.
+/// Pure — no I/O — so the field mapping is unit-testable without a live
+/// store.
+fn finding_row_json(row: &super::findings_store::FindingRow) -> Value {
+    json!({
+        "id": row.id.to_string(),
+        "category": row.category,
+        "severity": row.severity,
+        "scope_kind": row.scope_kind,
+        "scope_ref": row.scope_ref,
+        "description": row.description,
+        "occurrences": row.occurrences,
+        "first_seen": row.first_seen.to_rfc3339(),
+        "last_seen": row.last_seen.to_rfc3339(),
+    })
+}
+
+#[async_trait]
+impl RustTool for KgFindings {
+    fn name(&self) -> &str {
+        "kg_findings"
+    }
+    fn description(&self) -> &str {
+        "Lists captured Atlas knowledge-graph findings (lint-like observations, review notes, \
+anomalies) for a project, ordered by recurrence (most-repeated first). Optionally filter by \
+`scope` (node/path/community/global), `category`, and `min_occurrences`. Degrades cleanly — \
+returns `configured:false` (not an error) when the findings store is unconfigured."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "Plane project id, e.g. TERM"},
+                "scope": {"type": "string", "description": "optional scope filter: node/path/community/global"},
+                "category": {"type": "string", "description": "optional category filter"},
+                "min_occurrences": {"type": "integer", "description": "optional minimum recurrence count"},
+                "limit": {"type": "integer", "description": "max results, clamped to [1,200] (default 50)"}
+            },
+            "required": ["project_id"]
+        })
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.execute_structured(args).await?.text)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let project_id = req_str(&args, "project_id")?;
+        let scope = args.get("scope").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let category = args.get("category").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        // Saturating clamp, never `as i32`: a huge JSON integer would wrap to a
+        // negative i32 and silently broaden the filter. Clamp to [0, i32::MAX] so a
+        // very large value simply matches nothing (the expected behavior).
+        let min_occurrences = args
+            .get("min_occurrences")
+            .and_then(|v| v.as_i64())
+            .map(|v| v.clamp(0, i32::MAX as i64) as i32);
+        let limit = clamp_findings_limit(args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50));
+
+        let store = match super::findings_store::FindingsStore::from_env().await {
+            Ok(store) => store,
+            Err(ToolError::NotConfigured(_)) => {
+                return structured(json!({
+                    "configured": false, "found": false, "project_id": project_id, "results": [],
+                }));
+            }
+            Err(e) => {
+                return structured(json!({
+                    "configured": false, "found": false, "project_id": project_id, "results": [],
+                    "error": e.to_string(),
+                }));
+            }
+        };
+
+        // A list/query failure means the store isn't usable for this call — degrade
+        // (configured:false + error), never a hard tool error, matching the
+        // contract and the sibling kg_semantic_search store-failure handling.
+        let rows = match store
+            .list(&project_id, scope.as_deref(), category.as_deref(), min_occurrences)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                return structured(json!({
+                    "configured": false, "found": false, "project_id": project_id, "results": [],
+                    "error": e.to_string(),
+                }));
+            }
+        };
+
+        let results: Vec<Value> = rows
+            .iter()
+            .take(limit as usize)
+            .map(finding_row_json)
+            .collect();
+
+        structured(json!({
+            "configured": true, "found": !results.is_empty(), "project_id": project_id,
+            "count": results.len(), "results": results,
+        }))
+    }
+}
+
 /// Register the `kg_*` tools on the core registry.
 pub fn register(registry: &mut ToolRegistry) {
     let _ = registry.register(Box::new(KgSearch));
@@ -711,6 +828,7 @@ pub fn register(registry: &mut ToolRegistry) {
     let _ = registry.register(Box::new(KgQuery));
     let _ = registry.register(Box::new(KgFileSymbols));
     let _ = registry.register(Box::new(KgSemanticSearch));
+    let _ = registry.register(Box::new(KgFindings));
 }
 
 #[cfg(test)]
@@ -1028,5 +1146,77 @@ pub struct Widget;
         assert_eq!(r["path"], "src/a.rs");
         assert_eq!(r["score"], 0.42_f32);
         assert!(r["cluster"].is_null());
+    }
+
+    // ── kg_findings ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn findings_unconfigured_store_degrades_not_errors() {
+        // Mirrors kg_semantic_search's own test shape: never mutate global env
+        // to force NotConfigured if a real DSN is already present in this
+        // process.
+        if std::env::var("ATLAS_DATABASE_URL").is_ok() {
+            return;
+        }
+        let out = KgFindings
+            .execute_structured(json!({"project_id": "FIND"}))
+            .await
+            .unwrap();
+        let v = val(out);
+        assert_eq!(v["configured"], false);
+        assert_eq!(v["found"], false);
+        assert_eq!(v["results"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn clamp_findings_limit_clamps_zero_and_over_cap() {
+        assert_eq!(clamp_findings_limit(0), 1);
+        assert_eq!(clamp_findings_limit(300), 200);
+        assert_eq!(clamp_findings_limit(50), 50);
+        assert_eq!(clamp_findings_limit(-5), 1);
+        assert_eq!(clamp_findings_limit(200), 200);
+        assert_eq!(clamp_findings_limit(1), 1);
+    }
+
+    fn sample_finding_row() -> super::super::findings_store::FindingRow {
+        let now = chrono::Utc::now();
+        super::super::findings_store::FindingRow {
+            id: uuid::Uuid::new_v4(),
+            project_id: "FIND".to_string(),
+            category: "lint".to_string(),
+            severity: "warning".to_string(),
+            scope_kind: "path".to_string(),
+            scope_ref: "src/lib.rs".to_string(),
+            description: "unused import".to_string(),
+            provenance: json!([]),
+            first_seen: now,
+            last_seen: now,
+            occurrences: 3,
+        }
+    }
+
+    #[test]
+    fn finding_row_json_preserves_fields() {
+        let row = sample_finding_row();
+        let v = finding_row_json(&row);
+        assert_eq!(v["id"], row.id.to_string());
+        assert_eq!(v["category"], "lint");
+        assert_eq!(v["severity"], "warning");
+        assert_eq!(v["scope_kind"], "path");
+        assert_eq!(v["scope_ref"], "src/lib.rs");
+        assert_eq!(v["description"], "unused import");
+        assert_eq!(v["occurrences"], 3);
+        assert_eq!(v["first_seen"], row.first_seen.to_rfc3339());
+        assert_eq!(v["last_seen"], row.last_seen.to_rfc3339());
+    }
+
+    #[test]
+    fn finding_row_json_empty_rows_maps_to_empty_results() {
+        let rows: Vec<super::super::findings_store::FindingRow> = Vec::new();
+        let results: Vec<Value> = rows.iter().map(finding_row_json).collect();
+        assert!(results.is_empty());
+        // Mirrors the tool's own found:false-on-empty contract.
+        assert_eq!(!results.is_empty(), false);
     }
 }

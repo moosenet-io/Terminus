@@ -485,6 +485,7 @@ on the core registry, so a model can query the graph instead of grepping source:
 | `kg_query` | Answer a natural-language question — routes automatically to entity-level retrieval (specific symbols) or community-level retrieval (architecture/subsystems), returns the context plus a synthesized answer when a model is available. |
 | `kg_file_symbols` | The symbols a given repo-relative file defines, sorted by PageRank importance. |
 | `kg_semantic_search` | Meaning-based (embedding) search — finds nodes related to `query` even without a shared substring. Degrades to `configured:false` when embeddings aren't set up; see [KGEMB-04](#kg-semantic-search-tool-kgemb-04) below. |
+| `kg_findings` | Lists captured analysis findings (lint-like observations, review notes, anomalies) for a project, ordered by recurrence, with optional `scope`/`category`/`min_occurrences` filters. Degrades to `configured:false` when the findings store isn't set up; see [KGFIND-04](#kg-findings-tool-kgfind-04) below. |
 
 All take a `project_id` and read the per-project graph store
 (`SCRIBE_KG_STORE_DIR`); a project with no graph yet returns `found: false`
@@ -702,6 +703,25 @@ A vector-store row whose `node_id` is no longer present in the currently
 loaded graph (e.g. the graph was rebuilt and the symbol was removed/renamed)
 is silently dropped from the results rather than surfaced — stale-row
 tolerance, so a query never returns a dangling reference.
+
+### `kg_findings` tool (KGFIND-04)
+
+`kg_findings(project_id, scope?, category?, min_occurrences?, limit?)`
+(`src/scribe/graph/tools.rs`) is the read-only query counterpart to the
+KGFIND-01 `FindingsStore`: it lists a project's captured findings ordered by
+recurrence (`occurrences DESC, last_seen DESC`), so the corpus is inspectable
+independent of the write path. `scope` filters to one of
+`node`/`path`/`community`/`global`; `category` and `min_occurrences` narrow
+further; `limit` is optional (default 50) and clamped to `[1, 200]`.
+
+**Degrade contract**, mirroring `kg_semantic_search`:
+
+| Condition | Result |
+| --- | --- |
+| `FindingsStore::from_env()` returns `NotConfigured` (`ATLAS_DATABASE_URL` unset) | `{"configured": false, "found": false, "results": []}` — a normal result, not a tool error. |
+| The store is configured but some other error occurs (e.g. connect failure) | Also degrades to `{"configured": false, "found": false, "results": [], "error": "..."}` rather than a hard error. |
+| Store configured, query ran, no matching rows | `{"configured": true, "found": false, "project_id", "count": 0, "results": []}` — a genuine empty result, not a config problem. |
+| Store configured, matches found | `{"configured": true, "found": true, "project_id", "count", "results": [{id, category, severity, scope_kind, scope_ref, description, occurrences, first_seen, last_seen}, ...]}` ordered by recurrence. |
 
 ## Postgres tool suite — the single sanctioned Postgres door (S115)
 
