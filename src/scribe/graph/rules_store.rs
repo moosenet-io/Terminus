@@ -190,6 +190,11 @@ const PROMOTE_SQL: &str = "UPDATE kg_rules SET \
 
 const SELECT_STATUS_SQL: &str = "SELECT status FROM kg_rules WHERE id = $1";
 
+const SELECT_BY_ID_SQL: &str = "SELECT id, project_id, scope_kind, scope_ref, category, \
+    guidance, enforcement, status, provenance, recurrence_at_creation, cortex_risk, \
+    created_at, valid_from, valid_to \
+    FROM kg_rules WHERE id = $1";
+
 const RETIRE_SQL: &str = "UPDATE kg_rules SET status = 'retired', valid_to = now() \
     WHERE id = $1 \
     RETURNING id";
@@ -340,6 +345,23 @@ impl RulesStore {
             Some(_) => Ok(()),
             None => Err(ToolError::NotFound(format!("kg_rules id {id} not found"))),
         }
+    }
+
+    /// Load a single rule row by id, regardless of status. `None` if no such
+    /// id exists — the caller (KGRULE-03's promotion flow) is responsible for
+    /// turning that into whatever "missing" behavior it needs (e.g. a clear
+    /// degrade rather than a panic).
+    pub async fn get(&self, id: Uuid) -> Result<Option<RuleRow>, ToolError> {
+        let row = sqlx::query(SELECT_BY_ID_SQL)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ToolError::Database(format!("atlas rules store get: {e}")))?;
+
+        row.as_ref()
+            .map(RuleRow::from_row)
+            .transpose()
+            .map_err(|e| ToolError::Database(format!("atlas rules store get decode: {e}")))
     }
 
     /// List active, non-expired rules for a project, optionally filtered by
@@ -565,6 +587,12 @@ mod tests {
     fn test_migration_sql_contains_bitemporal_columns() {
         assert!(CREATE_TABLE_SQL.contains("valid_from"));
         assert!(CREATE_TABLE_SQL.contains("valid_to"));
+    }
+
+    #[test]
+    fn test_select_by_id_sql_selects_from_kg_rules_by_id() {
+        assert!(SELECT_BY_ID_SQL.contains("FROM kg_rules"));
+        assert!(SELECT_BY_ID_SQL.contains("WHERE id = $1"));
     }
 
     #[tokio::test]

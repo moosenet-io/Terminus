@@ -318,3 +318,86 @@ and promoted from past reviews are now enforced by future ones.
   rule grounding must never block or fail a review. No applicable rules for
   the changed scope → no-op (an empty `active_rules` array is never
   injected, mirroring `knowledge_graph`'s own "no empty block" rule).
+
+## Adversarial rule promotion (`rules.rs`, KGRULE-03)
+
+`kg_rule_promote(rule_id, target_enforcement?, allow_blocking?, providers?)` is
+the ONLY way a candidate rule (KGRULE-02) becomes `active`. It runs an
+ADVERSARIAL `review_run` panel (`structure="adversarial_pair"`) whose job is
+to argue whether the candidate is a REAL, correct, generally-applicable rule
+— or noise/overfit/already-covered-by-a-lint — and promotes `candidate` →
+`active` **only** on an aggregate `APPROVE` from a *complete* panel (every
+requested provider answered). This is the single sanctioned review door
+(S9/v3.17) applied to rule governance: the flow calls
+`crate::review::ReviewRun::new().execute(...)` **in-process**, and never
+hand-rolls or shells out to a reviewer itself.
+
+### Flow
+
+1. Load the candidate rule via `RulesStore::get(rule_id)`. Missing id, or a
+   `retired` rule → not promoted, clear reason, no panic. An already-`active`
+   rule is a no-op success (idempotent) — returns its current enforcement.
+2. Build the adversarial `review_run` call: `structure="adversarial_pair"`,
+   `providers` (exactly 2, default `["codex", "agy"]` — the live
+   daemon-backed pair — overridable per-call), `criteria` framing the panel
+   adversarially around the rule's recurrence/scope/category/guidance/Cortex
+   risk, `context` carrying the same fields structured. Call
+   `ReviewRun::new().execute(review_args)` — the sanctioned door.
+3. Parse `aggregate_verdict` + `complete` from the (JSON-string) result;
+   feed into the pure decision function:
+
+   ```rust
+   fn promotion_decision(
+       aggregate_verdict: &str, complete: bool,
+       target: Enforcement, allow_blocking: bool,
+   ) -> Option<Enforcement>
+   ```
+
+   - Not `"APPROVE"`, or `complete == false` → `None` (fail-closed; rule
+     stays a candidate).
+   - `APPROVE` + complete → `Some(target)`, **except** `target ==
+     Enforcement::Blocking` is capped down to `Enforcement::LintCandidate`
+     unless the caller passed `allow_blocking: true` — promotion to
+     `blocking` is **never automatic**, only operator-gated.
+4. `Some(enforcement)` → `RulesStore::promote(rule_id, enforcement,
+   provenance = the full review_run result)`. `None` → the rule is left a
+   candidate; the panel verdict is returned in the tool's own output but not
+   written to the row.
+
+### Degrade contract
+
+`kg_rule_promote` never panics and never fails the caller for a governance
+reason:
+
+- `RulesStore` unconfigured (`ATLAS_DATABASE_URL` unset) → `{"configured":
+  false, "rule_id": ...}`.
+- Missing rule id, or rule not in `candidate`/`active` status → `{"promoted":
+  false, "reason": ...}`.
+- Already `active` → `{"promoted": false, "reason": "already active",
+  "enforcement": ...}` (idempotent).
+- `review_run` erroring or returning unparsable JSON is treated defensively
+  as an incomplete `UNKNOWN` panel (never promotes) rather than propagating —
+  `review_run` itself already degrades individual provider failures instead
+  of erroring, so this is a belt-and-suspenders guard, not the primary path.
+- `InvalidArgument` is returned only for caller input errors (missing/bad
+  `rule_id`, bad `target_enforcement`, wrong `providers` shape) — never for
+  governance outcomes.
+
+### Return shape (promoted)
+
+```json
+{
+  "configured": true,
+  "promoted": true,
+  "rule_id": "...",
+  "enforcement": "lint-candidate",
+  "aggregate_verdict": "APPROVE",
+  "complete": true
+}
+```
+
+| Param | Purpose | Default |
+|---|---|---|
+| `target_enforcement` | desired enforcement on promotion | `advisory` |
+| `allow_blocking` | operator gate required for `target_enforcement=blocking` to actually land as `blocking` (else capped at `lint-candidate`) | `false` |
+| `providers` | the 2 `review_run` providers for the adversarial pair | `["codex", "agy"]` |
