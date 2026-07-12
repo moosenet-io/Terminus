@@ -65,7 +65,7 @@ CREATE TABLE kg_findings (
     scope_kind text NOT NULL CHECK (scope_kind IN ('node','path','community','global')),
     scope_ref text NOT NULL,
     description text NOT NULL,
-    embedding vector(768),
+    embedding vector(1024),
     provenance jsonb NOT NULL DEFAULT '[]'::jsonb,
     first_seen timestamptz NOT NULL DEFAULT now(),
     last_seen timestamptz NOT NULL DEFAULT now(),

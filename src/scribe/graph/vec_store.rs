@@ -20,10 +20,13 @@ use sqlx::PgPool;
 
 use crate::error::ToolError;
 
-/// Embedding dimension for `kg_embeddings.embedding` (`vector(768)`). Fixed by
-/// the default embeddings model (`nomic-embed-text`, 768-dim); a future model
-/// swap that changes dimension needs its own migration, not a const bump.
-pub const KG_EMBED_DIM: usize = 768;
+/// Embedding dimension for `kg_embeddings.embedding` (`vector(1024)`). Fixed
+/// by the default embeddings model (EMBED-02: Qwen3-Embedding, 1024-dim,
+/// served via Chord's `/v1/embeddings` proxy — previously `nomic-embed-text`
+/// at 768-dim); a future model swap that changes dimension needs its own
+/// migration, not a const bump. See `migrate_locked`'s column-drop step for
+/// how an existing 768-dim table converges to this dimension.
+pub const KG_EMBED_DIM: usize = 1024;
 
 /// Fixed advisory-lock key for the `kg_embeddings` migration. Distinct from
 /// other modules' keys (e.g. `src/intake/assistant/schema.rs`'s
@@ -38,7 +41,7 @@ const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS kg_embeddings ( \
     node_id text NOT NULL, \
     model text NOT NULL, \
     dim int NOT NULL, \
-    embedding vector(768) NOT NULL, \
+    embedding vector(1024) NOT NULL, \
     card_hash text NOT NULL, \
     updated_at timestamptz NOT NULL DEFAULT now(), \
     PRIMARY KEY (project_id, node_id) \
@@ -235,6 +238,18 @@ async fn migrate_locked(conn: &mut sqlx::PgConnection) -> Result<(), ToolError> 
         .await
         .map_err(|e| ToolError::Database(format!("create vector extension: {e}")))?;
 
+    // EMBED-02: an existing `kg_embeddings` table from before the
+    // 768 -> 1024 dim change (Qwen3-Embedding via Chord's `/v1/embeddings`)
+    // has vectors that are simply invalid against the new model — there is
+    // no meaningful in-place cast from a 768-dim to a 1024-dim embedding.
+    // Every row here is embedding-derived (rebuilt wholesale by the KG build
+    // pipeline), so converging a stale table is a straight drop-and-recreate
+    // rather than a column-level ALTER; ops re-runs the graph build
+    // separately to repopulate at the new dimension. A fresh DB (no table
+    // yet) and an existing 768-dim DB both end up at `vector(1024)` via the
+    // `CREATE TABLE IF NOT EXISTS` right below this.
+    drop_table_if_dim_mismatch(conn, "kg_embeddings", KG_EMBED_DIM as i32).await?;
+
     sqlx::query(CREATE_TABLE_SQL)
         .execute(&mut *conn)
         .await
@@ -250,6 +265,46 @@ async fn migrate_locked(conn: &mut sqlx::PgConnection) -> Result<(), ToolError> 
             "atlas vector store migrate: hnsw index creation failed (best-effort, \
              continuing without ANN index): {e}"
         );
+    }
+
+    Ok(())
+}
+
+/// EMBED-02: idempotent dim-migration step. If `table` already exists with an
+/// `embedding` column whose pgvector dimension (`pg_attribute.atttypmod`,
+/// which pgvector stores as the raw dimension, not offset) doesn't match
+/// `expected_dim`, the table is dropped so the `CREATE TABLE IF NOT EXISTS`
+/// that follows recreates it at the new dimension. A no-op when the table
+/// doesn't exist yet (`to_regclass` is `NULL`, so the query returns no rows)
+/// or already matches. `table` is always one of this module's own constant
+/// identifiers, never caller/user input, so string-formatting it into the
+/// DDL here is not an injection risk (sqlx has no identifier-bind API).
+async fn drop_table_if_dim_mismatch(
+    conn: &mut sqlx::PgConnection,
+    table: &str,
+    expected_dim: i32,
+) -> Result<(), ToolError> {
+    let existing: Option<(i32,)> = sqlx::query_as(
+        "SELECT atttypmod FROM pg_attribute \
+         WHERE attrelid = to_regclass($1) AND attname = 'embedding' AND NOT attisdropped",
+    )
+    .bind(table)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| ToolError::Database(format!("{table} dim check: {e}")))?;
+
+    if let Some((typmod,)) = existing {
+        if typmod != expected_dim {
+            tracing::warn!(
+                "{table}: existing embedding column is vector({typmod}), expected \
+                 vector({expected_dim}) — dropping stale table to re-create at the new \
+                 dimension (EMBED-02); ops re-runs the KG build to repopulate"
+            );
+            sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| ToolError::Database(format!("drop stale {table}: {e}")))?;
+        }
     }
 
     Ok(())
@@ -278,8 +333,8 @@ mod tests {
     use serial_test::serial;
 
     #[test]
-    fn test_kg_embed_dim_is_768() {
-        assert_eq!(KG_EMBED_DIM, 768);
+    fn test_kg_embed_dim_is_1024() {
+        assert_eq!(KG_EMBED_DIM, 1024);
     }
 
     #[test]
@@ -304,8 +359,8 @@ mod tests {
     }
 
     #[test]
-    fn test_migration_sql_contains_vector_768() {
-        assert!(CREATE_TABLE_SQL.contains("vector(768)"));
+    fn test_migration_sql_contains_vector_1024() {
+        assert!(CREATE_TABLE_SQL.contains("vector(1024)"));
     }
 
     #[test]

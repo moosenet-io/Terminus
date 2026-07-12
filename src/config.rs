@@ -808,23 +808,29 @@ pub fn hf_discovery_rate_limit_per_min() -> u32 {
 // SecretManager read here), not in this non-secret config section.
 
 /// HTTP endpoint the KG embeddings client POSTs to. From `EMBEDDINGS_URL`;
-/// defaults to the secondary (CPU) ollama unit's `/api/embeddings` route
-/// ([`ollama_secondary_url`]) so a deployment with `OLLAMA_CPU_URL` already
-/// set gets embeddings "for free"; with neither set, falls back to a bare
-/// loopback CPU-ollama default (never a real non-loopback host baked in,
-/// consistent with [`chord_personal_federation_url`]'s loopback-only default).
+/// EMBED-02: now defaults to the co-located Chord process's OpenAI-compatible
+/// `/v1/embeddings` proxy ([`chord_personal_federation_url`]'s loopback-only
+/// default) rather than a raw Ollama endpoint — Chord fronts the actual
+/// embeddings backend (Qwen3-Embedding), so the KG embeddings client should
+/// go through the same relay every other Chord-routed call in this crate
+/// uses, not talk to Ollama directly. An operator with a non-co-located or
+/// still-Ollama deployment overrides via `EMBEDDINGS_URL` (e.g. back to
+/// [`ollama_secondary_url`]'s `/api/embeddings` route) — never a real
+/// non-loopback host baked in here.
 pub fn embeddings_url() -> String {
     env_nonempty("EMBEDDINGS_URL").unwrap_or_else(|| {
-        let base = ollama_secondary_url().unwrap_or_else(|| "http://127.0.0.1:11435".to_string()); // pii-test-fixture
-        format!("{}/api/embeddings", base.trim_end_matches('/'))
+        format!("{}/v1/embeddings", chord_personal_federation_url().trim_end_matches('/'))
     })
 }
 
 /// Embeddings model name sent on each request. From `EMBEDDINGS_MODEL`;
-/// defaults to `"nomic-embed-text"` (a small, widely-mirrored Ollama
-/// embeddings model — not tied to any specific deployment).
+/// EMBED-02: defaults to `"Qwen3-Embedding"` (1024-dim; see
+/// `scribe::graph::vec_store::KG_EMBED_DIM`) now that the default endpoint
+/// above is Chord's `/v1/embeddings` proxy rather than raw Ollama — the model
+/// name is still just a routing tag Chord resolves, never a literal
+/// host/infra value, and is fully overridable.
 pub fn embeddings_model() -> String {
-    env_nonempty("EMBEDDINGS_MODEL").unwrap_or_else(|| "nomic-embed-text".to_string())
+    env_nonempty("EMBEDDINGS_MODEL").unwrap_or_else(|| "Qwen3-Embedding".to_string())
 }
 
 /// Per-request timeout, in milliseconds, for the embeddings client. From
@@ -1095,13 +1101,16 @@ mod tests {
 
     #[test]
     #[serial]
-    fn embeddings_url_defaults_from_ollama_cpu_url() {
+    fn embeddings_url_defaults_from_chord_personal_federation_url() {
+        // EMBED-02: default now follows the co-located Chord loopback proxy
+        // (TERMINUS_PRIMARY_CHORD_URL / chord_personal_federation_url), not a
+        // raw Ollama endpoint.
         std::env::remove_var("EMBEDDINGS_URL");
-        std::env::remove_var("OLLAMA_CPU_URL");
-        assert_eq!(embeddings_url(), "http://127.0.0.1:11435/api/embeddings"); // pii-test-fixture
-        std::env::set_var("OLLAMA_CPU_URL", "http://127.0.0.1:11499"); // pii-test-fixture
-        assert_eq!(embeddings_url(), "http://127.0.0.1:11499/api/embeddings"); // pii-test-fixture
-        std::env::remove_var("OLLAMA_CPU_URL");
+        std::env::remove_var("TERMINUS_PRIMARY_CHORD_URL");
+        assert_eq!(embeddings_url(), "http://127.0.0.1:8099/v1/embeddings"); // pii-test-fixture
+        std::env::set_var("TERMINUS_PRIMARY_CHORD_URL", "http://127.0.0.1:9199"); // pii-test-fixture
+        assert_eq!(embeddings_url(), "http://127.0.0.1:9199/v1/embeddings"); // pii-test-fixture
+        std::env::remove_var("TERMINUS_PRIMARY_CHORD_URL");
     }
 
     #[test]
@@ -1116,7 +1125,7 @@ mod tests {
     #[serial]
     fn embeddings_model_defaults_and_overrides() {
         std::env::remove_var("EMBEDDINGS_MODEL");
-        assert_eq!(embeddings_model(), "nomic-embed-text");
+        assert_eq!(embeddings_model(), "Qwen3-Embedding");
         std::env::set_var("EMBEDDINGS_MODEL", "custom-embed");
         assert_eq!(embeddings_model(), "custom-embed");
         std::env::remove_var("EMBEDDINGS_MODEL");
