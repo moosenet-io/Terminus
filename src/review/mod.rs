@@ -37,7 +37,12 @@ mod aggregate;
 // through the daemon vs. OpenRouter", not two.
 pub(crate) mod dispatch;
 pub(crate) mod free_pool;
-mod kg_context;
+// `pub(crate)` (was module-private): CXEG-02's `cortex_scope`
+// (`crate::cortex::scope`) reuses `derive_changed_files` directly so it and
+// `review_run`'s KGREV-01 grounding agree on which files a `diff`/
+// `changed_files` input touches, rather than re-implementing the same
+// CSV/array/unified-diff parsing a second time.
+pub(crate) mod kg_context;
 mod prompt;
 
 use std::collections::HashSet;

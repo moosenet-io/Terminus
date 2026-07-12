@@ -21,12 +21,16 @@
 //!   pointing at its `kg_*` (or `scribe_kg_build`) successor — no network, no
 //!   SSH, just a pointer.
 //! - `cortex_scope` and `cortex_review` keep their tool names/parameter
-//!   surface (now keyed by `project_id` instead of the old `repo` enum) but
-//!   their `execute` bodies are principled stubs — the real Atlas-backed
-//!   blast-radius (`cortex_scope`) and risk-scoring (`cortex_review`) logic
-//!   lands in **CXEG-02** and **CXEG-04** respectively. Until then they
-//!   return a structured `{"status":"pending","item":"CXEG-0N"}` pointer
-//!   rather than silently doing nothing or erroring opaquely.
+//!   surface (now keyed by `project_id` instead of the old `repo` enum).
+//!   **CXEG-02** replaces `cortex_scope`'s stub with a real Atlas-backed
+//!   blast-radius implementation (`src/cortex/scope.rs`) — it now walks the
+//!   project's stored Atlas graph via the same `GraphStore`/`KnowledgeGraph`
+//!   API `kg_neighbors`/`review::kg_context::build_kg_block` use, rather than
+//!   returning a pointer. `cortex_review`'s `execute` body remains a
+//!   principled stub — the real Atlas-backed risk-scoring logic lands in
+//!   **CXEG-04**. Until then it returns a structured
+//!   `{"status":"pending","item":"CXEG-04"}` pointer rather than silently
+//!   doing nothing or erroring opaquely.
 //! - `cortex_audit` keeps its `url` parameter and its existing
 //!   `validate_repo_url` front-gate (`audit.rs` — untouched, SSRF-hardened
 //!   URL validation with no dependency on the deleted SSH helpers), but its
@@ -36,11 +40,12 @@
 //!   reference.
 //!
 //! Net result: this module registers 10 tool NAMES total (unchanged from
-//! before, so no MCP-surface churn for callers listing tools), but only 3 are
-//! "real" (Atlas-rebuild-pending) tools — `cortex_scope`/`cortex_review`/
-//! `cortex_audit` — and the other 7 are pure deprecation aliases with no
-//! backend at all. `test_cortex_tools_registered` below asserts this new
-//! reality, not the old 10-live-relay-tools shape.
+//! before, so no MCP-surface churn for callers listing tools). Of those,
+//! `cortex_scope` is a real, live Atlas-backed tool as of CXEG-02;
+//! `cortex_review`/`cortex_audit` remain Atlas-rebuild-pending stubs; and the
+//! other 7 are pure deprecation aliases with no backend at all.
+//! `test_cortex_tools_registered` below asserts this shape (10 names
+//! present), not the old 10-live-relay-tools implementation.
 //!
 //! ## `project_id`, not `repo`
 //!
@@ -76,6 +81,7 @@ use crate::tool::RustTool;
 
 pub mod audit;
 pub mod deprecated;
+pub mod scope;
 
 use audit::validate_repo_url;
 
@@ -90,6 +96,24 @@ use audit::validate_repo_url;
 pub const PROJECT_IDS: &[&str] = &["TERM", "LUM", "HARM", "CHRD", "RAIL"];
 
 const MAX_TEXT_LEN: usize = 2000;
+
+/// Absolute DoS ceiling (chars) on a raw `diff` blob or a `changed_files` CSV
+/// string. Set FAR above what a `MAX_CHANGED_FILES`-file diff/list would ever
+/// produce, so ordinary oversized-*by-file-count* input TRUNCATES (and flags
+/// `truncated:true`) rather than being rejected. Rejection at this ceiling is
+/// reserved for a pathologically huge SINGLE blob (few files, enormous
+/// content). For a `diff` this is checked only when the parse did NOT already
+/// truncate by file count — so a big many-file diff degrades gracefully
+/// instead of erroring.
+const MAX_DIFF_LEN: usize = 5_000_000;
+
+/// Absolute DoS ceiling on a `changed_files` JSON array's element count. Set
+/// FAR above the file-count cap (`MAX_CHANGED_FILES`, 200): arrays between the
+/// cap and this ceiling TRUNCATE to the cap (with `truncated:true`), and only
+/// a truly abusive array is rejected outright. Each element is additionally
+/// length-bounded by [`MAX_TEXT_LEN`] (a single over-long path is malformed →
+/// rejected).
+const MAX_CHANGED_FILES_ARG: usize = 5000;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -121,9 +145,15 @@ pub struct CortexConfig {
     /// The Atlas KG's Postgres DSN, read exclusively through
     /// `crate::config::atlas_database_url()` (see module doc's "Secrets /
     /// config" section) — never a raw `std::env::var` in this module.
-    /// `None` means the Atlas KG store is not configured; the CXEG-02/04/11
+    /// `None` means the Atlas KG store is not configured; the CXEG-04/11
     /// rebuilds will raise `NotConfigured` rather than guess a DSN.
+    /// `cortex_scope` (CXEG-02) does NOT raise on a missing/unloadable graph
+    /// -- see `scope::compute_scope`'s degrade contract.
     pub atlas_database_url: Option<String>,
+    /// `cortex_scope`'s (CXEG-02) cap on the number of nodes enumerated into
+    /// `blast_radius` before it sets `"truncated": true` and stops walking.
+    /// From `CORTEX_MAX_BLAST_NODES`, default [`scope::DEFAULT_MAX_BLAST_NODES`].
+    pub max_blast_nodes: usize,
 }
 
 impl CortexConfig {
@@ -135,6 +165,7 @@ impl CortexConfig {
             elegance_advisory_only: env_flag("CORTEX_ELEGANCE_ADVISORY_ONLY", true),
             dup_cosine: env_f64("CORTEX_DUP_COSINE_THRESHOLD", 0.85),
             atlas_database_url: crate::config::atlas_database_url(),
+            max_blast_nodes: env_usize("CORTEX_MAX_BLAST_NODES", scope::DEFAULT_MAX_BLAST_NODES),
         }
     }
 }
@@ -157,6 +188,18 @@ fn env_flag(key: &str, default: bool) -> bool {
         Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"),
         Err(_) => default,
     }
+}
+
+/// Read a non-secret unsigned-integer tuning flag; falls back to `default`
+/// when unset, unparseable, or `0` (a zero bound would silently drop every
+/// blast-radius node, which is never the intent of an unset/misconfigured
+/// value).
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
 }
 
 // ---------------------------------------------------------------------------
@@ -193,7 +236,7 @@ fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, ToolError> {
 }
 
 // ---------------------------------------------------------------------------
-// Tool: cortex_scope (stub — real Atlas-backed rebuild is CXEG-02)
+// Tool: cortex_scope (CXEG-02: real Atlas-backed blast-radius)
 // ---------------------------------------------------------------------------
 
 pub struct CortexScope {
@@ -207,13 +250,18 @@ impl RustTool for CortexScope {
     }
 
     fn description(&self) -> &str {
-        "PENDING REBUILD (CXEG-02): blast-radius for a planned code change. \
-         The SSH-relay-era implementation has been retired; this tool \
-         currently returns a structured pending pointer instead of \
-         performing a live analysis. project_id: one of TERM/LUM/HARM/CHRD/ \
-         RAIL. changed_files: comma-separated list of files. In the \
-         meantime, use kg_neighbors / kg_subgraph directly against the \
-         Atlas KG for a manual blast-radius query."
+        "Pre-change blast radius for a planned code change, from the \
+         project's Atlas knowledge graph: the touched symbols plus their \
+         1-hop callers/callees, the affected communities, a blast_count, \
+         and a token_reduction_pct estimate (how much smaller the blast \
+         radius is than the whole project, as a proxy for context budget \
+         saved). project_id: one of TERM/LUM/HARM/CHRD/RAIL. Provide EITHER \
+         changed_files (a comma-separated list, or a JSON array) OR diff (a \
+         unified diff -- changed files are parsed from its '+++ b/<path>' \
+         headers, same parser review_run uses). Degrades cleanly: if the \
+         project has no stored Atlas graph yet (run scribe_kg_build first), \
+         returns configured:false with the literal changed_files echoed \
+         back as unresolved blast_radius entries, never an error."
     }
 
     fn parameters(&self) -> Value {
@@ -221,29 +269,85 @@ impl RustTool for CortexScope {
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "One of TERM/LUM/HARM/CHRD/RAIL", "enum": PROJECT_IDS },
-                "changed_files": { "type": "string", "description": "Comma-separated list of file paths e.g. 'src/cortex/mod.rs,src/cortex/audit.rs'" }
+                "changed_files": {
+                    "description": "Changed file paths: a comma-separated string or a JSON array e.g. 'src/cortex/mod.rs,src/cortex/audit.rs'",
+                    "oneOf": [
+                        { "type": "string" },
+                        { "type": "array", "items": { "type": "string" } }
+                    ]
+                },
+                "diff": { "type": "string", "description": "Unified diff; used to derive changed_files when changed_files is omitted" }
             },
-            "required": ["project_id", "changed_files"]
+            "required": ["project_id"]
         })
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
         let project_id = require_str(&args, "project_id")?;
-        let changed_files = require_str(&args, "changed_files")?;
         validate_project_id(project_id)?;
-        validate_text_len(changed_files, "changed_files")?;
 
-        let response = json!({
-            "status": "pending",
-            "item": "CXEG-02",
-            "tool": "cortex_scope",
-            "project_id": project_id,
-            "message": "cortex_scope's SSH-relay-era backend has been retired; \
-                an Atlas-backed blast-radius implementation lands in CXEG-02. \
-                In the meantime, query kg_neighbors / kg_subgraph directly \
-                against the Atlas KG.",
-            "tier_b_enabled": self.config.enable_tier_b,
-        });
+        // Reconcile validation vs truncation (CXEG-02 cycle-3): oversized
+        // -by-file-COUNT input must TRUNCATE + flag `truncated:true` (handled
+        // by the parse below via `input_truncated`), NEVER be rejected. Only
+        // genuinely abusive/malformed input is rejected here with
+        // InvalidArgument:
+        //   - a SINGLE element/path longer than MAX_TEXT_LEN (one absurd blob);
+        //   - a DoS-scale raw string/array/diff, at a ceiling set FAR above
+        //     what a MAX_CHANGED_FILES-file input would produce.
+        match args.get("changed_files") {
+            Some(Value::String(s)) => {
+                // A merely-long CSV of many short paths is NOT rejected (it
+                // truncates by count below); only a DoS-scale blob is.
+                if s.chars().count() > MAX_DIFF_LEN {
+                    return Err(ToolError::InvalidArgument(format!(
+                        "'changed_files' exceeds {MAX_DIFF_LEN}-char DoS ceiling"
+                    )));
+                }
+                // A single over-long path element is malformed → reject.
+                for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    validate_text_len(part, "changed_files element")?;
+                }
+            }
+            Some(Value::Array(arr)) => {
+                // Absolute array-size DoS ceiling, far above the file-count cap
+                // (arrays between the cap and this ceiling truncate, not reject).
+                if arr.len() > MAX_CHANGED_FILES_ARG {
+                    return Err(ToolError::InvalidArgument(format!(
+                        "'changed_files' array exceeds {MAX_CHANGED_FILES_ARG}-element DoS ceiling"
+                    )));
+                }
+                for (i, el) in arr.iter().enumerate() {
+                    if let Some(s) = el.as_str() {
+                        validate_text_len(s, &format!("changed_files[{i}]"))?;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let (changed_files, input_truncated) = scope::changed_files_from_args(&args);
+        if changed_files.is_empty() {
+            return Err(ToolError::InvalidArgument(
+                "must provide a non-empty 'changed_files' (string or array) or 'diff'".to_string(),
+            ));
+        }
+
+        // A `diff`'s total-length DoS ceiling is applied ONLY when the parse
+        // did not already truncate by file count: an ordinary large multi-file
+        // diff (> MAX_CHANGED_FILES files) truncates + flags `truncated:true`
+        // rather than being rejected; rejection is reserved for a
+        // pathologically huge single blob (few files, enormous content).
+        if !input_truncated {
+            if let Some(diff) = args.get("diff").and_then(|v| v.as_str()) {
+                if diff.chars().count() > MAX_DIFF_LEN {
+                    return Err(ToolError::InvalidArgument(format!(
+                        "'diff' exceeds {MAX_DIFF_LEN}-char DoS ceiling"
+                    )));
+                }
+            }
+        }
+
+        let response = scope::compute_scope(project_id, &changed_files, self.config.max_blast_nodes, input_truncated);
         serde_json::to_string_pretty(&response)
             .map_err(|e| ToolError::Execution(format!("JSON render error: {e}")))
     }
@@ -373,9 +477,11 @@ impl RustTool for CortexAudit {
 // Registration
 // ---------------------------------------------------------------------------
 
-/// Register all Cortex tools into the ToolRegistry: the 3 Atlas-rebuild-
-/// pending stubs (`cortex_scope`/`cortex_review`/`cortex_audit`) plus the 7
-/// deprecation aliases for the retired pure-relay tools (see [`deprecated`]).
+/// Register all Cortex tools into the ToolRegistry: the 3 "real" tools
+/// (`cortex_scope` — live Atlas-backed blast radius as of CXEG-02;
+/// `cortex_review`/`cortex_audit` — still Atlas-rebuild-pending stubs) plus
+/// the 7 deprecation aliases for the retired pure-relay tools (see
+/// [`deprecated`]).
 pub fn register(registry: &mut ToolRegistry) {
     let config = Arc::new(CortexConfig::from_env());
 
@@ -406,6 +512,7 @@ mod tests {
             elegance_advisory_only: true,
             dup_cosine: 0.85,
             atlas_database_url: None,
+            max_blast_nodes: scope::DEFAULT_MAX_BLAST_NODES,
         })
     }
 
@@ -445,7 +552,13 @@ mod tests {
         assert!(validate_text_len("short", "changed_files").is_ok());
     }
 
-    // --- cortex_scope (stub) ---------------------------------------------------
+    // --- cortex_scope (CXEG-02: real, Atlas-backed) -----------------------
+    //
+    // Full blast-radius derivation behavior (touched-node resolution, 1-hop
+    // neighbors, communities, truncation, token_reduction_pct) is covered by
+    // `scope::tests` against a fixture graph; these tests cover argument
+    // validation and the tool-trait wiring (`CortexScope::execute` ->
+    // `scope::changed_files_from_args` / `scope::compute_scope`).
 
     #[tokio::test]
     async fn test_scope_rejects_unknown_project_id() {
@@ -458,7 +571,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scope_rejects_oversized_changed_files() {
+    async fn test_scope_rejects_oversized_single_changed_file_element() {
+        // A SINGLE over-MAX_TEXT_LEN path element is malformed -> InvalidArgument
+        // (the CSV string has no commas, so it is one element). This is the
+        // per-element reject that must SURVIVE the cycle-3 truncation
+        // reconciliation (count overflow truncates, single-blob rejects).
         let tool = CortexScope { config: test_config() };
         let huge = "x".repeat(MAX_TEXT_LEN + 1);
         let err = tool
@@ -469,16 +586,159 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scope_returns_pending_pointer_for_valid_input() {
+    #[serial_test::serial]
+    async fn test_scope_truncates_long_csv_of_short_paths_not_rejects() {
+        // A CSV whose TOTAL length far exceeds MAX_TEXT_LEN but is just many
+        // short paths must TRUNCATE (truncated:true), not be rejected — the
+        // cycle-3 fix for the count-vs-length reconciliation.
+        let store_dir = std::env::temp_dir().join(format!("atlas-cortexmod-csv-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+
+        let csv = (0..500).map(|i| format!("src/f{i}.rs")).collect::<Vec<_>>().join(",");
+        assert!(csv.len() > MAX_TEXT_LEN, "fixture must exceed the per-element cap in total");
+        let tool = CortexScope { config: test_config() };
+        let out = tool
+            .execute(json!({"project_id": "TERM", "changed_files": csv}))
+            .await
+            .expect("a long CSV of short paths must truncate, not error");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["truncated"], true, "count-overflow CSV must set truncated:true");
+
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
+    }
+
+    #[tokio::test]
+    async fn test_scope_rejects_when_no_changed_files_or_diff() {
+        let tool = CortexScope { config: test_config() };
+        let err = tool.execute(json!({"project_id": "TERM"})).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_scope_degrades_to_configured_false_without_a_stored_graph() {
+        let store_dir = std::env::temp_dir().join(format!("atlas-cortexmod-test-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+
         let tool = CortexScope { config: test_config() };
         let out = tool
             .execute(json!({"project_id": "TERM", "changed_files": "src/cortex/mod.rs"}))
             .await
-            .expect("valid input must succeed with a pending pointer, not an error");
+            .expect("no stored graph must degrade, not error");
         let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["status"], "pending");
-        assert_eq!(v["item"], "CXEG-02");
+        assert_eq!(v["configured"], false);
         assert_eq!(v["project_id"], "TERM");
+        assert_eq!(v["blast_radius"][0]["resolved"], false);
+
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
+    }
+
+    #[tokio::test]
+    async fn test_scope_accepts_changed_files_array_form() {
+        let tool = CortexScope { config: test_config() };
+        let out = tool
+            .execute(json!({"project_id": "TERM", "changed_files": ["src/a.rs", "src/b.rs"]}))
+            .await
+            .expect("array changed_files must be accepted");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["changed_files"], json!(["src/a.rs", "src/b.rs"]));
+    }
+
+    #[tokio::test]
+    async fn test_scope_accepts_diff_only_input() {
+        let tool = CortexScope { config: test_config() };
+        let diff = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-x\n+y\n";
+        let out = tool
+            .execute(json!({"project_id": "TERM", "diff": diff}))
+            .await
+            .expect("diff-only input must be accepted");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["changed_files"], json!(["src/a.rs"]));
+    }
+
+    #[tokio::test]
+    async fn test_scope_rejects_oversized_changed_files_array_size() {
+        let tool = CortexScope { config: test_config() };
+        let big: Vec<String> = (0..MAX_CHANGED_FILES_ARG + 1).map(|i| format!("f{i}.rs")).collect();
+        let err = tool
+            .execute(json!({"project_id": "TERM", "changed_files": big}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn test_scope_rejects_oversized_changed_files_array_element() {
+        let tool = CortexScope { config: test_config() };
+        let huge = "x".repeat(MAX_TEXT_LEN + 1);
+        let err = tool
+            .execute(json!({"project_id": "TERM", "changed_files": ["ok.rs", huge]}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn test_scope_rejects_pathologically_huge_single_blob_diff() {
+        // A diff with FEW files (one) but DoS-scale content (> MAX_DIFF_LEN)
+        // is rejected: it did not truncate by file count, so the total-length
+        // ceiling applies. One valid `+++` header ensures the parse yields a
+        // (non-empty, non-truncated) file so we exercise the length reject,
+        // not the empty-input reject.
+        let tool = CortexScope { config: test_config() };
+        let diff = format!("+++ b/src/a.rs\n{}", "x".repeat(MAX_DIFF_LEN + 1));
+        let err = tool
+            .execute(json!({"project_id": "TERM", "diff": diff}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_scope_truncates_diff_with_many_files_not_rejects() {
+        // An ordinary big multi-file diff (far MORE files than the file-count
+        // cap, but well under the DoS byte ceiling) must TRUNCATE + flag
+        // `truncated:true`, NEVER be rejected — the core cycle-3 fix.
+        let store_dir = std::env::temp_dir().join(format!("atlas-cortexmod-diffcount-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+
+        let mut diff = String::new();
+        for i in 0..1000 {
+            diff.push_str(&format!("+++ b/src/f{i}.rs\n"));
+        }
+        assert!(diff.len() < MAX_DIFF_LEN, "fixture must stay under the DoS byte ceiling");
+        let tool = CortexScope { config: test_config() };
+        let out = tool
+            .execute(json!({"project_id": "TERM", "diff": diff}))
+            .await
+            .expect("a many-file diff must truncate, not error");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["truncated"], true, "count-overflow diff must set truncated:true");
+
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_scope_flags_truncated_on_oversized_input_file_list() {
+        // An input file list far larger than MAX_CHANGED_FILES must surface
+        // `truncated:true` (input-file cap) rather than being silently capped
+        // by derive_changed_files. Runs against an empty store dir so the
+        // degrade path is exercised too; the input-cap flag must survive it.
+        let store_dir = std::env::temp_dir().join(format!("atlas-cortexmod-inputcap-{}", std::process::id()));
+        std::env::set_var("SCRIBE_KG_STORE_DIR", &store_dir);
+
+        let big: Vec<String> = (0..500).map(|i| format!("src/f{i}.rs")).collect();
+        let tool = CortexScope { config: test_config() };
+        let out = tool
+            .execute(json!({"project_id": "TERM", "changed_files": big}))
+            .await
+            .expect("oversized input must degrade/scope, not error");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["truncated"], true, "oversized input file list must set truncated:true");
+
+        std::env::remove_var("SCRIBE_KG_STORE_DIR");
     }
 
     // --- cortex_review (stub) --------------------------------------------------
@@ -549,9 +809,9 @@ mod tests {
     fn test_cortex_tools_registered() {
         let mut registry = ToolRegistry::new();
         register(&mut registry);
-        // 3 Atlas-rebuild-pending stubs + 7 deprecation aliases = 10 names,
-        // matching the pre-CXEG-01 tool-name surface (no MCP-listing churn)
-        // even though only 3 are "real" tools now.
+        // 3 "real" tools (cortex_scope live, cortex_review/cortex_audit
+        // still pending) + 7 deprecation aliases = 10 names, matching the
+        // pre-CXEG-01 tool-name surface (no MCP-listing churn).
         assert_eq!(registry.len(), 10);
         for name in [
             "cortex_scope",

@@ -163,21 +163,28 @@ references (outgoing) and what calls/references it (incoming). direction = out|i
         if g.get_node(&node_id).is_none() {
             return structured(json!({"project_id": project_id, "found": false, "message": format!("no node '{node_id}'")}));
         }
-        let mut out = Vec::new();
-        let mut incoming = Vec::new();
-        for e in g.edges() {
-            if e.from == node_id {
-                out.push(json!({"id": e.to, "kind": e.kind.as_str(), "confidence": e.confidence.as_str()}));
-            }
-            if e.to == node_id {
-                incoming.push(json!({"id": e.from, "kind": e.kind.as_str(), "confidence": e.confidence.as_str()}));
-            }
-        }
+        // Single-source 1-hop walk (KGRAPH/CXEG-02): `super::query::one_hop_neighbors`
+        // is the one place edges are iterated for a node's neighbors, shared with
+        // `cortex_scope`. Splitting its (edge-order) result by direction here
+        // reproduces the previous hand-rolled `outgoing`/`incoming` arrays
+        // byte-for-byte.
+        use super::query::{one_hop_neighbors, EdgeDirection, NeighborFilter};
+        let neighbors = one_hop_neighbors(&g, &node_id, NeighborFilter::Both);
         let mut res = json!({"project_id": project_id, "found": true, "node_id": node_id});
         if direction == "out" || direction == "both" {
+            let out: Vec<Value> = neighbors
+                .iter()
+                .filter(|nb| nb.direction == EdgeDirection::Outgoing)
+                .map(|nb| json!({"id": nb.id, "kind": nb.kind, "confidence": nb.confidence}))
+                .collect();
             res["outgoing"] = json!(out);
         }
         if direction == "in" || direction == "both" {
+            let incoming: Vec<Value> = neighbors
+                .iter()
+                .filter(|nb| nb.direction == EdgeDirection::Incoming)
+                .map(|nb| json!({"id": nb.id, "kind": nb.kind, "confidence": nb.confidence}))
+                .collect();
             res["incoming"] = json!(incoming);
         }
         structured(res)
