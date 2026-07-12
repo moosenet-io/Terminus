@@ -17,7 +17,10 @@
 //!    `src/config.rs`" — the wider scope does not match this crate's actual,
 //!    already-documented secret-materialization architecture (`crate::cortex`'s
 //!    module doc, `crate::secrets_bootstrap`) and would flag ~100 pre-existing,
-//!    correctly-routed reads.
+//!    correctly-routed reads. The rule matches `std::env::var`, `env::var`, and
+//!    an imported/aliased `var(...)`/`<alias>(...)` (from `use std::env::var
+//!    [as X];`), and fires for a read nested ANYWHERE inside `execute` — e.g.
+//!    inside a local helper fn — not just the immediately-enclosing fn.
 //! 2. Every `impl RustTool for X`'s `description()` returns a non-empty string
 //!    literal (best-effort: only a plain literal tail expression is checked;
 //!    a computed description is not statically verifiable and is skipped).
@@ -25,6 +28,25 @@
 //! 4. No `panic!` inside a `RustTool::execute`/`execute_structured` body
 //!    (`.unwrap()` was evaluated and intentionally scoped out — see
 //!    `docs/house-style.md#rule-4`).
+//!
+//! ## Deny-by-default
+//! A source-tree gate must fail closed: any `src/**/*.rs` file that cannot be
+//! walked, read, or parsed is reported as a [`Rule::FileError`] violation (the
+//! gate fails), never silently skipped — a file the checker can't inspect
+//! could be hiding real violations.
+//!
+//! ## Test code is exempt
+//! Rules 1/4 never fire in test code. Test context is detected by PARSING the
+//! `#[cfg(...)]` predicate (via [`cfg_predicate_is_test`]), not substring-
+//! matching "test": `#[cfg(test)]` / `#[cfg(all(test, …))]` / `#[cfg(any(test,
+//! …))]` are test context, but `#[cfg(not(test))]` (production code) is NOT
+//! and is fully checked.
+//!
+//! ## Known limitation (documented, not a bug)
+//! Rule 1 matches a STRING-LITERAL var name only. An indirected name — a
+//! `const`/`let`/`format!`-built key passed to `env::var(key)` — is not
+//! resolved (that needs real dataflow analysis, out of scope for a mechanical
+//! lint). See `docs/house-style.md#known-limitations`.
 //!
 //! ## Waivers
 //! A `// house-style-allow: <reason>` line comment, on the same line as the
@@ -34,13 +56,17 @@
 //! never silently swallow a finding. Mirrors this crate's existing
 //! `// pii-test-fixture` line-exact convention (`crate::github::pii`).
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use proc_macro2::Span;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
-use syn::{Attribute, Expr, ExprCall, ExprLit, ExprPath, ImplItem, ItemImpl, ItemFn, ItemMod, Lit};
+use syn::{
+    Attribute, Expr, ExprCall, ExprLit, ExprPath, ImplItem, ItemFn, ItemImpl, ItemMod, ItemUse,
+    Lit, Meta, UseTree,
+};
 use walkdir::WalkDir;
 
 /// Files that are themselves the sanctioned secret-materialization layer —
@@ -63,6 +89,10 @@ pub enum Rule {
     PanicInExecute,
     /// Meta-rule: a `// house-style-allow:` waiver with no reason after the colon.
     ReasonlessWaiver,
+    /// Infra: a `src/**/*.rs` file could not be read or parsed. A source-tree
+    /// gate is deny-by-default — an unreadable/unparseable file could hide any
+    /// number of violations, so it FAILS the gate rather than being skipped.
+    FileError,
 }
 
 impl Rule {
@@ -72,6 +102,7 @@ impl Rule {
             Rule::EmptyToolDescription => "house-style-2-empty-description",
             Rule::PanicInExecute => "house-style-4-panic-in-execute",
             Rule::ReasonlessWaiver => "house-style-waiver-reason",
+            Rule::FileError => "house-style-file-error",
         }
     }
 }
@@ -101,38 +132,85 @@ pub fn check_tree(repo_root: &Path) -> Vec<Violation> {
     let src_dir = repo_root.join("src");
     let mut violations = Vec::new();
 
-    let mut entries: Vec<PathBuf> = WalkDir::new(&src_dir)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
-        .map(|e| e.into_path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rs"))
-        .collect();
+    // Deny-by-default: a WalkDir error (e.g. an unreadable directory) is a gate
+    // failure, not something to silently drop — it could be hiding files that
+    // contain violations.
+    let mut entries: Vec<PathBuf> = Vec::new();
+    for entry in WalkDir::new(&src_dir) {
+        match entry {
+            Ok(e) if e.file_type().is_file() => {
+                let p = e.into_path();
+                if p.extension().and_then(|x| x.to_str()) == Some("rs") {
+                    entries.push(p);
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                let path = err
+                    .path()
+                    .map(|p| rel_path(repo_root, p))
+                    .unwrap_or_else(|| src_dir.to_string_lossy().replace('\\', "/"));
+                violations.push(Violation {
+                    file: PathBuf::from(path),
+                    line: 0,
+                    rule: Rule::FileError,
+                    message: format!("failed to walk the source tree: {err}"),
+                    help: "the checker is deny-by-default — resolve the I/O error so every `.rs` \
+                           file under `src/` can be scanned"
+                        .to_string(),
+                });
+            }
+        }
+    }
     // Deterministic ordering regardless of filesystem iteration order.
     entries.sort();
 
     for path in entries {
-        let rel = path
-            .strip_prefix(repo_root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = rel_path(repo_root, &path);
         if SANCTIONED_FILES.contains(&rel.as_str()) {
             continue;
         }
-        let Ok(source) = fs::read_to_string(&path) else {
-            continue;
+        let source = match fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                violations.push(Violation {
+                    file: PathBuf::from(rel),
+                    line: 0,
+                    rule: Rule::FileError,
+                    message: format!("failed to read file: {e}"),
+                    help: "the checker is deny-by-default — an unreadable source file could hide \
+                           violations, so it fails the gate rather than being skipped"
+                        .to_string(),
+                });
+                continue;
+            }
         };
-        // A parse failure here means the tree doesn't compile at all — `cargo
-        // build`/`cargo test` itself will already fail loudly on that, so the
-        // checker skips rather than duplicating that report.
-        let Ok(file) = syn::parse_file(&source) else {
-            continue;
+        // A parse failure means the checker cannot inspect this file's AST. It
+        // is NOT silently skipped (that would let a malformed file hide
+        // violations): it is reported as a failure. In practice `cargo
+        // build`/`cargo test` would also fail on a genuinely un-parseable file,
+        // but this gate must stand on its own and fail closed.
+        let file = match syn::parse_file(&source) {
+            Ok(f) => f,
+            Err(e) => {
+                violations.push(Violation {
+                    file: PathBuf::from(rel),
+                    line: line_of(e.span()),
+                    rule: Rule::FileError,
+                    message: format!("failed to parse file with `syn`: {e}"),
+                    help: "the checker is deny-by-default — a file it cannot parse could hide \
+                           violations; fix the syntax so it parses (the compiler will need this too)"
+                        .to_string(),
+                });
+                continue;
+            }
         };
+        let aliases = collect_env_var_aliases(&file);
         let lines: Vec<&str> = source.lines().collect();
         let mut checker = Checker {
             file_rel: rel,
             lines: &lines,
+            env_var_aliases: &aliases,
             test_depth: 0,
             fn_stack: Vec::new(),
             in_rust_tool_impl: false,
@@ -144,6 +222,71 @@ pub fn check_tree(repo_root: &Path) -> Vec<Violation> {
 
     violations.sort_by(|a, b| (&a.file, a.line, a.rule.id()).cmp(&(&b.file, b.line, b.rule.id())));
     violations
+}
+
+/// Repo-relative, forward-slashed path string for a file (falls back to the
+/// full path if it is somehow not under `repo_root`).
+fn rel_path(repo_root: &Path, path: &Path) -> String {
+    path.strip_prefix(repo_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+// ── import detection (Rule 1, aliased/imported `std::env::var`) ──────────────
+
+/// Collect the set of bare identifiers in a file that resolve to
+/// `std::env::var` via a `use` import — so that a call like `var("TOKEN")`
+/// (from `use std::env::var;`) or `evar("TOKEN")` (from
+/// `use std::env::var as evar;`) is matched by Rule 1 just like a fully-spelled
+/// `std::env::var(...)`. A bare `var(...)` is only treated as `env::var` when
+/// such an import is present in the SAME file, keeping false-positive risk low.
+///
+/// NOTE: `use std::env;` + `env::var(...)` needs no entry here — that call site
+/// is already a 2-segment `env::var` path, matched directly in
+/// [`Checker::visit_expr_call`].
+fn collect_env_var_aliases(file: &syn::File) -> HashSet<String> {
+    struct UseCollector {
+        aliases: HashSet<String>,
+    }
+    impl<'ast> Visit<'ast> for UseCollector {
+        fn visit_item_use(&mut self, node: &'ast ItemUse) {
+            record_use_tree(&node.tree, &mut Vec::new(), &mut self.aliases);
+        }
+    }
+    let mut c = UseCollector { aliases: HashSet::new() };
+    // `syn::visit` descends into nested modules and function bodies, so a
+    // `use std::env::var;` anywhere in the file (not just at the top) is seen.
+    c.visit_file(file);
+    c.aliases
+}
+
+/// Walk a `use` tree accumulating the path prefix; when the leaf is
+/// `std::env::var` (optionally renamed), record the bound name.
+fn record_use_tree(tree: &UseTree, prefix: &mut Vec<String>, out: &mut HashSet<String>) {
+    match tree {
+        UseTree::Path(p) => {
+            prefix.push(p.ident.to_string());
+            record_use_tree(&p.tree, prefix, out);
+            prefix.pop();
+        }
+        UseTree::Name(n) => {
+            if prefix == ["std", "env"] && n.ident == "var" {
+                out.insert("var".to_string());
+            }
+        }
+        UseTree::Rename(r) => {
+            if prefix == ["std", "env"] && r.ident == "var" {
+                out.insert(r.rename.to_string());
+            }
+        }
+        UseTree::Group(g) => {
+            for item in &g.items {
+                record_use_tree(item, prefix, out);
+            }
+        }
+        UseTree::Glob(_) => {}
+    }
 }
 
 // ── secret-shape classification (Rule 1) ───────────────────────────────────
@@ -199,36 +342,56 @@ fn waiver_status(lines: &[&str], line: usize) -> Waiver {
 
 // ── test-context detection ──────────────────────────────────────────────────
 
-/// True if `attrs` marks this item as test-only: `#[test]`, `#[tokio::test]`,
-/// `#[async_std::test]` (matched by trailing path segment `test`), or
-/// `#[cfg(test)]` / `#[cfg(all(test, ...))]` / `#[cfg(any(test, ...))]`.
+/// True if `attrs` marks this item as test-only: a `test` attribute
+/// (`#[test]`, `#[tokio::test]`, `#[async_std::test]` — matched by trailing
+/// path segment `test`), or a `#[cfg(...)]` whose predicate contains `test` as
+/// a POSITIVE predicate.
+///
+/// Crucially, this PARSES the `cfg` predicate rather than substring-matching
+/// "test": `#[cfg(not(test))]` (and any `not(...)` wrapping `test`) is
+/// PRODUCTION code and must NOT be treated as test context. `#[cfg(test)]`,
+/// `#[cfg(all(test, ...))]`, and `#[cfg(any(test, ...))]` are test context.
 fn has_test_context(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|a| {
-        if a.path().segments.last().map(|s| s.ident == "test").unwrap_or(false) {
-            return true;
-        }
+        // `#[test]` / `#[tokio::test]` — but NOT `#[cfg(...)]` (its last
+        // segment is `cfg`, handled below).
         if a.path().is_ident("cfg") {
-            if let Ok(meta) = a.parse_args::<syn::Meta>() {
-                return meta_mentions_test(&meta);
-            }
+            return a
+                .parse_args::<Meta>()
+                .map(|meta| cfg_predicate_is_test(&meta, false))
+                .unwrap_or(false);
         }
-        false
+        a.path().segments.last().map(|s| s.ident == "test").unwrap_or(false)
     })
 }
 
-fn meta_mentions_test(meta: &syn::Meta) -> bool {
+/// Evaluate whether a `cfg` predicate makes the annotated item test-only —
+/// i.e. whether `test` appears as a POSITIVE predicate (nested under an even
+/// number of `not(...)`). `negated` tracks the parity of enclosing `not`s.
+///
+/// - `test` → positive when not negated.
+/// - `not(P)` → recurse into `P` with the negation flipped.
+/// - `all(P, ...)` / `any(P, ...)` → positive if ANY child is positive under
+///   the current negation (a build with `--test` compiles `any(test, ...)`,
+///   and `all(test, ...)` is by definition test-gated).
+/// - anything else (`feature = "x"`, `unix`, ...) → not test.
+fn cfg_predicate_is_test(meta: &Meta, negated: bool) -> bool {
     match meta {
-        syn::Meta::Path(p) => p.is_ident("test"),
-        syn::Meta::List(l) => {
-            if let Ok(nested) =
-                l.parse_args_with(syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
-            {
-                nested.iter().any(meta_mentions_test)
-            } else {
-                false
+        Meta::Path(p) => p.is_ident("test") && !negated,
+        Meta::List(l) => {
+            let op = l.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+            let Ok(nested) = l.parse_args_with(
+                syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
+            ) else {
+                return false;
+            };
+            match op.as_str() {
+                "not" => nested.iter().any(|m| cfg_predicate_is_test(m, !negated)),
+                "all" | "any" => nested.iter().any(|m| cfg_predicate_is_test(m, negated)),
+                _ => false,
             }
         }
-        syn::Meta::NameValue(_) => false,
+        Meta::NameValue(_) => false,
     }
 }
 
@@ -241,11 +404,16 @@ fn line_of(span: Span) -> usize {
 struct Checker<'s> {
     file_rel: String,
     lines: &'s [&'s str],
+    /// Bare identifiers that resolve to `std::env::var` in THIS file via a
+    /// `use` import (e.g. `var` from `use std::env::var;`, or an alias).
+    env_var_aliases: &'s HashSet<String>,
     /// >0 while inside any `#[cfg(test)]`/`#[test]`-marked item. Rules 1/4
     /// never fire in test code (fixtures, mocks, and assertion helpers are
     /// not production secret handling or user-facing tool execution).
     test_depth: u32,
-    /// Innermost enclosing named-function stack (free fns and impl methods).
+    /// Enclosing named-function stack (free fns and impl methods), outermost
+    /// first. Used to tell whether the current node is lexically nested
+    /// anywhere inside an `execute`/`execute_structured` body.
     fn_stack: Vec<String>,
     /// True while visiting the body of an `impl RustTool for X` block.
     in_rust_tool_impl: bool,
@@ -253,8 +421,15 @@ struct Checker<'s> {
 }
 
 impl<'s> Checker<'s> {
+    /// True if the current node is lexically nested ANYWHERE inside a
+    /// `RustTool::execute`/`execute_structured` body — not merely if the
+    /// immediately-enclosing fn is one. This closes the "wrap the raw read in
+    /// a local helper fn defined inside `execute`" bypass: such a helper's
+    /// body still has an `execute` frame below it on `fn_stack`.
     fn in_execute(&self) -> bool {
-        matches!(self.fn_stack.last().map(String::as_str), Some("execute") | Some("execute_structured"))
+        self.fn_stack
+            .iter()
+            .any(|f| f == "execute" || f == "execute_structured")
     }
 
     fn record(&mut self, rule: Rule, line: usize, message: String, help: String) {
@@ -374,10 +549,18 @@ impl<'s, 'ast> Visit<'ast> for Checker<'s> {
     fn visit_expr_call(&mut self, node: &'ast ExprCall) {
         if self.test_depth == 0 && self.in_rust_tool_impl && self.in_execute() {
             if let Expr::Path(ExprPath { path, .. }) = node.func.as_ref() {
-                let is_env_var = path.segments.len() >= 2
-                    && path.segments[path.segments.len() - 1].ident == "var"
-                    && path.segments[path.segments.len() - 2].ident == "env";
-                if is_env_var {
+                let n = path.segments.len();
+                // Fully-qualified `std::env::var(...)` (3-seg) or `env::var(...)`
+                // (2-seg, e.g. via `use std::env;`) — matched by the trailing
+                // `env::var` regardless of the leading segments.
+                let qualified_env_var = n >= 2
+                    && path.segments[n - 1].ident == "var"
+                    && path.segments[n - 2].ident == "env";
+                // Bare `var(...)` / `alias(...)` — only when the file imported
+                // `std::env::var` (possibly renamed); see `collect_env_var_aliases`.
+                let imported_env_var = n == 1
+                    && self.env_var_aliases.contains(&path.segments[0].ident.to_string());
+                if qualified_env_var || imported_env_var {
                     if let Some(Expr::Lit(ExprLit { lit: Lit::Str(s), .. })) = node.args.first() {
                         let name = s.value();
                         if secret_shaped(&name) {
@@ -482,5 +665,251 @@ mod tests {
             "house-style violations on the current tree:\n{}",
             violations.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n\n")
         );
+    }
+
+    // ── helper: run the whole per-file pipeline over an in-memory source ─────
+
+    fn check_source(src: &str) -> Vec<Violation> {
+        let file = syn::parse_file(src).expect("test source must parse");
+        let aliases = collect_env_var_aliases(&file);
+        let lines: Vec<&str> = src.lines().collect();
+        let mut checker = Checker {
+            file_rel: "src/x.rs".to_string(),
+            lines: &lines,
+            env_var_aliases: &aliases,
+            test_depth: 0,
+            fn_stack: Vec::new(),
+            in_rust_tool_impl: false,
+            violations: Vec::new(),
+        };
+        checker.visit_file(&file);
+        checker.violations
+    }
+
+    fn rules(vs: &[Violation]) -> Vec<Rule> {
+        vs.iter().map(|v| v.rule).collect()
+    }
+
+    // ── Fix #1: cfg(not(test)) is PRODUCTION, not test context ──────────────
+
+    fn cfg_meta(src: &str) -> Meta {
+        // Parse `cfg(<pred>)` out of a `#[cfg(<pred>)]` attribute.
+        let item: syn::ItemFn = syn::parse_str(&format!("{src}\nfn f() {{}}")).unwrap();
+        item.attrs[0].parse_args::<Meta>().unwrap()
+    }
+
+    #[test]
+    fn cfg_test_positive_forms_are_test_context() {
+        assert!(cfg_predicate_is_test(&cfg_meta("#[cfg(test)]"), false));
+        assert!(cfg_predicate_is_test(&cfg_meta("#[cfg(all(test, unix))]"), false));
+        assert!(cfg_predicate_is_test(&cfg_meta("#[cfg(any(test, feature = \"x\"))]"), false));
+    }
+
+    #[test]
+    fn cfg_not_test_is_not_test_context() {
+        // The critical regression: production code guarded by `not(test)` must
+        // NOT be treated as test context (else it is wrongly skipped).
+        assert!(!cfg_predicate_is_test(&cfg_meta("#[cfg(not(test))]"), false));
+        assert!(!cfg_predicate_is_test(&cfg_meta("#[cfg(all(not(test), unix))]"), false));
+        assert!(!cfg_predicate_is_test(&cfg_meta("#[cfg(feature = \"x\")]"), false));
+        // Double negation is positive again.
+        assert!(cfg_predicate_is_test(&cfg_meta("#[cfg(not(not(test)))]"), false));
+    }
+
+    #[test]
+    fn secret_read_in_cfg_not_test_fn_is_flagged() {
+        // A `#[cfg(not(test))]` execute body is PRODUCTION — Rule 1 must fire.
+        let src = r#"
+            struct T;
+            impl RustTool for T {
+                #[cfg(not(test))]
+                async fn execute(&self, _a: Value) -> Result<String, ToolError> {
+                    let _ = std::env::var("GITHUB_TOKEN");
+                    Ok(String::new())
+                }
+            }
+        "#;
+        assert_eq!(rules(&check_source(src)), vec![Rule::RawSecretEnvVar]);
+    }
+
+    // ── Fix #2: imported / aliased std::env::var ────────────────────────────
+
+    #[test]
+    fn imported_bare_var_is_flagged() {
+        let src = r#"
+            use std::env::var;
+            struct T;
+            impl RustTool for T {
+                async fn execute(&self, _a: Value) -> Result<String, ToolError> {
+                    let _ = var("PLANE_API_KEY");
+                    Ok(String::new())
+                }
+            }
+        "#;
+        assert_eq!(rules(&check_source(src)), vec![Rule::RawSecretEnvVar]);
+    }
+
+    #[test]
+    fn aliased_var_is_flagged() {
+        let src = r#"
+            use std::env::var as getenv;
+            struct T;
+            impl RustTool for T {
+                async fn execute(&self, _a: Value) -> Result<String, ToolError> {
+                    let _ = getenv("GITEA_PAT_MOOSE");
+                    Ok(String::new())
+                }
+            }
+        "#;
+        assert_eq!(rules(&check_source(src)), vec![Rule::RawSecretEnvVar]);
+    }
+
+    #[test]
+    fn two_segment_env_var_is_flagged() {
+        let src = r#"
+            use std::env;
+            struct T;
+            impl RustTool for T {
+                async fn execute(&self, _a: Value) -> Result<String, ToolError> {
+                    let _ = env::var("OPENROUTER_API_KEY");
+                    Ok(String::new())
+                }
+            }
+        "#;
+        assert_eq!(rules(&check_source(src)), vec![Rule::RawSecretEnvVar]);
+    }
+
+    #[test]
+    fn bare_var_without_import_is_not_flagged() {
+        // No `use std::env::var;` in the file, so a bare `var(...)` is some
+        // other function — must NOT be treated as env::var.
+        let src = r#"
+            struct T;
+            impl RustTool for T {
+                async fn execute(&self, _a: Value) -> Result<String, ToolError> {
+                    let _ = var("GITHUB_TOKEN");
+                    Ok(String::new())
+                }
+            }
+            fn var(_k: &str) -> String { String::new() }
+        "#;
+        assert!(check_source(src).is_empty());
+    }
+
+    // ── Fix #3: read nested in a local helper fn inside execute ─────────────
+
+    #[test]
+    fn secret_read_in_nested_helper_inside_execute_is_flagged() {
+        let src = r#"
+            struct T;
+            impl RustTool for T {
+                async fn execute(&self, _a: Value) -> Result<String, ToolError> {
+                    fn inner() -> Result<String, ()> {
+                        std::env::var("GITHUB_TOKEN").map_err(|_| ())
+                    }
+                    let _ = inner();
+                    Ok(String::new())
+                }
+            }
+        "#;
+        assert_eq!(rules(&check_source(src)), vec![Rule::RawSecretEnvVar]);
+    }
+
+    #[test]
+    fn secret_read_in_non_execute_method_is_not_flagged() {
+        // A sibling impl method (not execute, not nested in it) is the crate's
+        // sanctioned accessor pattern — must NOT be flagged.
+        let src = r#"
+            struct T;
+            impl RustTool for T {
+                async fn execute(&self, _a: Value) -> Result<String, ToolError> { Ok(String::new()) }
+            }
+            impl T {
+                fn from_env() -> Option<String> { std::env::var("GITHUB_TOKEN").ok() }
+            }
+        "#;
+        assert!(check_source(src).is_empty());
+    }
+
+    // ── Rule 2 / Rule 4 quick coverage ──────────────────────────────────────
+
+    #[test]
+    fn empty_description_is_flagged_and_panic_in_execute_is_flagged() {
+        let src = r#"
+            struct T;
+            impl RustTool for T {
+                fn description(&self) -> &str { "" }
+                async fn execute(&self, _a: Value) -> Result<String, ToolError> {
+                    panic!("boom");
+                }
+            }
+        "#;
+        let mut got = rules(&check_source(src));
+        got.sort_by_key(|r| r.id());
+        assert_eq!(got, vec![Rule::EmptyToolDescription, Rule::PanicInExecute]);
+    }
+
+    #[test]
+    fn test_only_code_is_skipped() {
+        // A full RustTool impl (with a secret read + panic! in execute AND an
+        // empty description) nested in a `#[cfg(test)]` mod must be entirely
+        // exempt — it's a mock, not production.
+        let src = r#"
+            #[cfg(test)]
+            mod tests {
+                struct MockTool;
+                impl RustTool for MockTool {
+                    fn description(&self) -> &str { "" }
+                    async fn execute(&self, _a: Value) -> Result<String, ToolError> {
+                        let _ = std::env::var("GITHUB_TOKEN");
+                        panic!("mock");
+                    }
+                }
+            }
+        "#;
+        assert!(check_source(src).is_empty());
+    }
+
+    // ── Fix #4: deny-by-default on an unparseable file ──────────────────────
+
+    #[test]
+    fn unparseable_file_fails_the_gate() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        // Not valid Rust — `syn::parse_file` must reject it.
+        let mut f = std::fs::File::create(dir.path().join("src/bad.rs")).unwrap();
+        write!(f, "fn broken( {{ this is not rust ").unwrap();
+        let violations = check_tree(dir.path());
+        assert!(
+            violations.iter().any(|v| v.rule == Rule::FileError),
+            "an unparseable file must produce a FileError, got: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn waiver_suppresses_and_reasonless_waiver_is_itself_a_violation() {
+        let reasoned = r#"
+            struct T;
+            impl RustTool for T {
+                async fn execute(&self, _a: Value) -> Result<String, ToolError> {
+                    // house-style-allow: legacy one-off, tracked in TERM-999
+                    let _ = std::env::var("GITHUB_TOKEN");
+                    Ok(String::new())
+                }
+            }
+        "#;
+        assert!(check_source(reasoned).is_empty());
+
+        let reasonless = r#"
+            struct T;
+            impl RustTool for T {
+                async fn execute(&self, _a: Value) -> Result<String, ToolError> {
+                    let _ = std::env::var("GITHUB_TOKEN"); // house-style-allow
+                    Ok(String::new())
+                }
+            }
+        "#;
+        assert_eq!(rules(&check_source(reasonless)), vec![Rule::ReasonlessWaiver]);
     }
 }

@@ -48,6 +48,30 @@ media-domain secrets into the process environment — see that file's module
 doc) are exempt from Rule 1 entirely: they ARE the sanctioned
 secret-materialization layer, not a call site of it.
 
+**What counts as an `env::var` call.** The rule does not rely on the read
+being spelled `std::env::var`. It matches all of:
+- fully-qualified `std::env::var("NAME")`,
+- `env::var("NAME")` (2-segment, e.g. via `use std::env;`), and
+- a bare `var("NAME")` or aliased `getenv("NAME")` **when the same file has a
+  `use std::env::var;` / `use std::env::var as getenv;` import** — a bare
+  `var(...)` in a file WITHOUT such an import is treated as some other
+  function and left alone (keeps false positives low).
+
+**What counts as "inside `execute`".** The read is flagged if it is lexically
+nested *anywhere* inside an `execute`/`execute_structured` body — including
+inside a local helper fn or closure defined within `execute` — not only when
+`execute` is the immediately-enclosing function. (Wrapping the raw read in a
+nested helper does not evade the rule.) A read in a *sibling* impl method
+(e.g. a `from_env()` next to `execute`) is the sanctioned accessor pattern
+and is correctly NOT flagged.
+
+**Test code is exempt, and `cfg(not(test))` is not test code.** Reads inside
+`#[test]`/`#[cfg(test)]`/`#[cfg(all(test, …))]`/`#[cfg(any(test, …))]` items
+are skipped (fixtures/mocks routinely set and read secret-shaped vars). The
+checker PARSES the `cfg` predicate rather than substring-matching "test", so
+production code guarded by `#[cfg(not(test))]` (or any `not(...)` wrapping
+`test`) is fully checked, not wrongly skipped.
+
 #### Why "inside `execute`", not "outside `src/config.rs`"
 
 The CXEG-05 spec's grounding note said the sanctioned accessor is
@@ -230,6 +254,40 @@ classification in [Rule 1 classification](#rule-1-classification) already
 avoids the false positives a blanket substring match would have produced
 (the `*_URL`/`*PATH` cases above), so nothing needed a name-specific carve-out
 on top of it.
+
+## Deny-by-default
+
+The checker is a source-tree gate, so it fails **closed**: any `src/**/*.rs`
+file that cannot be walked, read, or parsed by `syn` is reported as a
+`house-style-file-error` violation (which fails `cargo test`/the gate), never
+silently skipped. A file the checker can't inspect could be hiding real
+violations, so "couldn't look at it" must be a failure, not a pass. (In
+practice `cargo build`/`cargo test` would also fail on a genuinely
+un-parseable file, but the gate stands on its own rather than assuming an
+upstream step already caught it.)
+
+## Known limitations
+
+These are deliberate scope boundaries of a *mechanical* lint, documented so
+nobody mistakes a green result for a stronger guarantee than it gives:
+
+- **Rule 1 matches string-literal var names only.** A read whose key is
+  indirected — a `const KEY: &str = "…"; env::var(KEY)`, a `let`-bound name,
+  or a `format!("{prefix}_TOKEN")`-built key — is **not** resolved or
+  classified. Statically deciding whether such a computed value is
+  secret-shaped needs real dataflow/const-evaluation analysis, which is out
+  of scope for an AST-shape checker. This is the one class of Rule-1 blind
+  spot; it is accepted, not accidental. (The crate's actual reads are all
+  string literals today, so this doesn't hide anything currently — but a
+  future indirected read would slip past, so reviewers should still treat
+  "reads a secret inline in `execute`" as a code-review item, not something
+  the lint fully guarantees against.)
+- **Rule 2** only verifies a `description()` whose body is a single string
+  literal (the shape every tool uses today); a computed description is
+  skipped (see Rule 2 above).
+- **Rule 3** is unimplemented (see Rule 3 above).
+- **Rule 4** covers `panic!` but intentionally not `.unwrap()` (see Rule 4
+  above).
 
 ## Why not dylint
 
