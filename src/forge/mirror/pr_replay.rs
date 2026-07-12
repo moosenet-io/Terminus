@@ -353,8 +353,14 @@ async fn public_pr_for_branch(
             }
         }
         page += 1;
-        if page > 10 {
-            break; // bounded — a freshly-created mirror PR is on the first pages.
+        if page > 40 {
+            // Bounded scan (~2000 PRs). A freshly-created mirror PR from a crash-retry
+            // is on the first pages; going-forward replay is sequential so the relevant
+            // PR is recent. A scan MISS of an old merged PR does NOT cause a duplicate:
+            // the merge-order guard (head_int^1 == base_int) below rejects any replay
+            // whose PR is not the immediate next one, so an out-of-order / stale re-run
+            // fails closed regardless of this scan.
+            break;
         }
     }
     Ok(None)
@@ -396,6 +402,17 @@ fn already_replayed(work_dir: &Path, n: u64) -> bool {
     git(work_dir, &["tag", "-l", &pr_tag(n)])
         .map(|s| s.lines().any(|l| l.trim() == pr_tag(n)))
         .unwrap_or(false)
+}
+
+/// Best-effort CLOSE a public PR (provider-agnostic, via PullRequestsClose) — used to
+/// tear down a partially-created PR on a Phase-A rollback so no visible incomplete
+/// replay is left behind. Errors are swallowed (cleanup, not a gate).
+async fn close_public_pr(reg: &ForgeRegistry, cfg: &PrReplayConfig, pub_repo: &str, pr: u64) {
+    let mut params = json!({ "repo": pub_repo, "index": pr, "number": pr });
+    if let Some(o) = &cfg.public_owner {
+        params["owner"] = json!(o);
+    }
+    let _ = call_public(reg, cfg.public_provider.as_deref(), ForgeEndpoint::PullRequestsClose, params).await;
 }
 
 /// A private-pool read: dispatch `endpoint` with `params`, returning the response body.
@@ -632,8 +649,8 @@ pub async fn replay_pr(
     //     the reconciliation on retry.
     let snap = snapshot_canonical(&cfg.work_dir)?;
 
-    // ── Phase A (roll-back-able) ────────────────────────────────────────────────
-    let phase_a: Result<(usize, u64, usize), ToolError> = async {
+    // ── Phase A1: replay → push → create PR (roll-back-able) ────────────────────
+    let a1: Result<(usize, u64), ToolError> = async {
         let slice =
             replay_pr_slice(&cfg.source, &cfg.work_dir, &base_int, &head_int, &public_base, &branch, &opts)?;
         git_transport(
@@ -649,6 +666,21 @@ pub async fn replay_pr(
             call_public(reg, cfg.public_provider.as_deref(), ForgeEndpoint::PullRequestsCreate, create).await?;
         let public_pr = pr_number(&created)
             .ok_or_else(|| ToolError::Execution("public PR create returned no PR number/iid".into()))?;
+        Ok((slice.commits, public_pr))
+    }
+    .await;
+    let (commits, public_pr) = match a1 {
+        Ok(v) => v,
+        Err(e) => {
+            // Nothing published — clean up any pushed branch and roll back canonical.
+            cleanup_public_branch(&cfg.work_dir, &cfg.remote, &branch, token);
+            restore_canonical(&cfg.work_dir, &snap, &branch)?;
+            return Err(e);
+        }
+    };
+
+    // ── Phase A2: mirror comments + verify their CONTENT (roll-back-able) ────────
+    let a2: Result<usize, ToolError> = async {
         let mut mirrored = 0usize;
         for c in &scrubbed_comments {
             let mut cp = json!({ "repo": pub_repo, "index": public_pr, "number": public_pr, "comment": c, "body": c });
@@ -658,11 +690,10 @@ pub async fn replay_pr(
             call_public(reg, cfg.public_provider.as_deref(), ForgeEndpoint::PullRequestsComment, cp).await?;
             mirrored += 1;
         }
-        // Live-verify the comment writes: re-read the public PR thread and confirm at
-        // least as many (non-system) comments are present as we posted. A shortfall
-        // means some did not land — fail so Phase A rolls back for a clean retry rather
-        // than merging an incomplete PR-process replay. (Still in the roll-back-able
-        // phase — nothing is merged yet.)
+        // Live-verify the comment writes by CONTENT (not just count): re-read the public
+        // PR thread and confirm every scrubbed body we posted is present. A miss means
+        // a comment did not land — fail so we roll back for a clean retry rather than
+        // merging an incomplete PR-process replay. (Still roll-back-able — not merged.)
         if !scrubbed_comments.is_empty() {
             let landed = read_all_comments(
                 reg,
@@ -673,23 +704,25 @@ pub async fn replay_pr(
                 public_pr,
             )
             .await?;
-            if landed.len() < scrubbed_comments.len() {
-                return Err(ToolError::Execution(format!(
-                    "mirrored {} comment(s) to public PR #{public_pr} but only {} are present on \
-                     re-read — some did not land; failing so the replay rolls back for a clean retry.",
-                    scrubbed_comments.len(),
-                    landed.len()
-                )));
+            for want in &scrubbed_comments {
+                if !landed.iter().any(|got| got == want) {
+                    return Err(ToolError::Execution(format!(
+                        "a mirrored comment did not land on public PR #{public_pr} (content missing \
+                         on re-read); failing so the replay rolls back for a clean retry."
+                    )));
+                }
             }
         }
-        Ok((slice.commits, public_pr, mirrored))
+        Ok(mirrored)
     }
     .await;
-    let (commits, public_pr, mirrored) = match phase_a {
+    let mirrored = match a2 {
         Ok(v) => v,
         Err(e) => {
-            // Nothing is merged yet — clean up any pushed public branch (so a retry is
-            // clean, not blocked by the remote-branch guard) and roll back canonical.
+            // Explicitly CLOSE the public PR (provider-agnostic — do NOT rely on the
+            // forge auto-closing when the branch is deleted), then clean the branch and
+            // roll back canonical, so no visible incomplete public PR is left behind.
+            close_public_pr(reg, cfg, &pub_repo, public_pr).await;
             cleanup_public_branch(&cfg.work_dir, &cfg.remote, &branch, token);
             restore_canonical(&cfg.work_dir, &snap, &branch)?;
             return Err(e);
