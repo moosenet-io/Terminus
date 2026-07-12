@@ -3,6 +3,51 @@
 This directory holds the Rust-native Atlas knowledge-graph subsystem of the
 Scribe documentation engine (see `mod.rs` for the module overview).
 
+## Cortex bridge (`cortex_bridge.rs`, KGRULE-05)
+
+`cortex_risk_for_scope(scope_kind, scope_ref) -> Option<f32>` turns a KG scope
+(`path`/`node`/`community`/`global`, matching `findings_store::ScopeKind`)
+into a best-effort Cortex risk score in `0.0..=1.0`, so rule crystallization
+(KGRULE-02) can prioritize high-risk recurring findings. It is intentionally
+thin: it does not talk SSH itself, does not read `CORTEX_SSH_*` beyond a
+single "is it set" check, and does not know anything about Cortex's wire
+protocol — it calls the existing `crate::cortex` tool (`cortex_review`)
+through a scratch `ToolRegistry` and parses its JSON response.
+
+**Degrade contract — this function can never fail the caller:**
+
+- Returns `None`, not an `Err` — the return type is `Option<f32>`. It never
+  panics.
+- `scope_kind` of `"community"` or `"global"` → `None` immediately (Cortex
+  has no per-community/global risk concept; only `"path"` and `"node"` are
+  supported).
+- `CORTEX_SSH_HOST` unset/empty → `None` immediately, with **no SSH attempt
+  at all** — this is checked before `crate::cortex` is touched.
+- Any failure in the underlying `cortex_review` call (unreachable host, auth
+  failure, remote error, `NotConfigured` surfacing late, task join error) →
+  `None`.
+- A well-formed but risk-less response (including `crate::cortex`'s
+  `{"raw": "..."}` shape for non-JSON remote stdout) → `None`.
+
+Risk extraction (`extract_risk`, private, pure, fully unit-tested) looks for a
+numeric risk field at the top level and one level deep under `result`, and
+normalizes to this bridge's `0.0..=1.0` contract:
+- **`risk_score`** — Cortex's own DOCUMENTED field (`cortex_review`'s `0-10`
+  scale) — is the primary field and is **rescaled** `0-10 → 0-1` (÷10), then
+  clamped. This rescales against Cortex's *documented* scale, not a guess.
+- **`risk`/`score`** — accepted as fallbacks, treated as already-normalized
+  `[0,1]` fractions and clamped as-is (never rescaled).
+
+Non-numeric values at those keys are treated as absent, not as a parse error.
+
+Uses `cortex_review` (not `cortex_scope`) because its documented purpose is
+a post-hoc risk *score* for a set of files — exactly what this bridge needs
+— whereas `cortex_scope` returns blast-radius with no risk score, and the
+crate's other eight Cortex tools return stats/architecture/dependency shapes
+with no risk field at all. `repo` is fixed to `"lumina-terminus"` (this
+crate), one of `crate::cortex`'s own two known-repo values — not an
+infra/host literal.
+
 ## Findings store (`findings_store.rs`, KGFIND-01)
 
 `FindingsStore` owns the `kg_findings` Postgres/pgvector table: durable,

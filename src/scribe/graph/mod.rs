@@ -18,6 +18,7 @@
 pub mod build;
 pub mod cluster;
 pub mod community;
+pub mod cortex_bridge;
 pub mod embed;
 pub mod extract;
 pub mod findings_store;
