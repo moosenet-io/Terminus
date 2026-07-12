@@ -109,9 +109,12 @@ pub enum ForgeEndpoint {
     // ── Pull / merge requests ─────────────────────────────────────────────────
     PullRequestsList,
     PullRequestsGet,
-    // READ of a PR's discussion/review thread (comments). The Review/Comment
-    // endpoints below are WRITE-only (post a review / a comment); this is the
-    // provider-agnostic read used by the PR-process mirror (GHIST-05).
+    // READ of a PR's CONVERSATION thread — the issue-style discussion comments on
+    // the PR (gitea/github: `/issues/{n}/comments`; gitlab: MR `/notes`). This is the
+    // provider-agnostic read used by the PR-process mirror (GHIST-05). The Review/
+    // Comment endpoints below are WRITE-only. NOTE (explicit scope, not a silent gap):
+    // this is the conversation thread, NOT inline per-file review-diff comments —
+    // those live on a separate reviews surface and are out of scope for the mirror.
     PullRequestsListComments,
     PullRequestsCreate,
     PullRequestsUpdate,

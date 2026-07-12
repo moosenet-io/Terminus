@@ -1778,10 +1778,12 @@ impl RustTool for GitPublicMirrorReplayPr {
          the internal PR + its discussion thread are read through the private forge pool and the \
          public PR is opened/commented/merged through the public forge pool (never a forge-specific \
          client). The PR's commit range is replayed as a PII-scrubbed feature branch rebased onto \
-         the current public-main tip, pushed, opened as a PR, each review comment mirrored (scrubbed), \
-         then merged — the merge lands the commits on public main. PII-scrubs title/body/comments \
-         before any public write; only MERGED PRs are replayed; idempotent (a mirror-pr/<n> tag skips \
-         a re-run). Fail-closed without TERMINUS_MIRROR_AUTHOR_MAP. Requires 'repo' and 'pr' (the \
+         the current public-main tip, pushed, opened as a PR, each conversation comment mirrored \
+         (scrubbed), then merged — the merge lands the commits on public main. Comment scope is the \
+         PR CONVERSATION thread (not inline per-file review-diff comments). PII-scrubs title/body/ \
+         comments before any public write; only MERGED PRs are replayed; idempotent (a mirror-pr/<n> \
+         tag skips a completed PR; a leftover remote branch from a partial prior run is refused, never \
+         double-created). Fail-closed without TERMINUS_MIRROR_AUTHOR_MAP. Requires 'repo' and 'pr' (the \
          internal PR number); 'source' defaults to TERMINUS_MIRROR_SOURCE_ROOT/<repo>; the remote \
          comes from 'github_remote' or TERMINUS_MIRROR_REMOTE[_<REPO>]; 'merge_method' defaults to \
          'squash'."
@@ -1838,6 +1840,13 @@ impl RustTool for GitPublicMirrorReplayPr {
 
         let remote = resolve_remote(&args, repo)?;
         let opt_str = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_string);
+        let public_provider = opt_str("public_provider");
+        // Resolve the PUBLIC git-transport credential through the provider-agnostic
+        // mirror-token seam (github wired today; a GitLab/Codeberg public destination
+        // supplies its own token here, or a clean NotConfigured) — never a hardcoded
+        // GitHub credential in the provider-agnostic replay path.
+        let transport_token =
+            mirror_provider_token(public_provider.as_deref().unwrap_or("github"))?;
         let cfg = PrReplayConfig {
             repo: repo.to_string(),
             source,
@@ -1848,9 +1857,10 @@ impl RustTool for GitPublicMirrorReplayPr {
             public_repo: opt_str("public_repo"),
             private_repo: opt_str("private_repo"),
             private_provider: opt_str("private_provider"),
-            public_provider: opt_str("public_provider"),
+            public_provider,
             author_map,
             merge_method: opt_str("merge_method").unwrap_or_else(|| "squash".to_string()),
+            transport_token,
         };
 
         let reg = ForgeRegistry::from_env();

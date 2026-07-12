@@ -11,10 +11,17 @@
 //!
 //! Safety spine, mirroring the rest of the engine:
 //! - Only MERGED internal PRs are replayed (an open PR has no final content).
-//! - Title / body / every comment is PII-SCRUBBED (the same `DeterministicCleaner`
-//!   the blob replay uses) before any public write.
-//! - Idempotent: a `mirror-pr/<n>` tag in the work-dir records a replayed PR, so
-//!   re-runs (and the going-forward hook) never double-create.
+//! - Title / body / every conversation comment is PII-SCRUBBED (the same
+//!   `DeterministicCleaner` the blob replay uses) before any public write. Comment
+//!   scope is the PR CONVERSATION thread (issue-style comments) — inline per-file
+//!   review-diff comments live on a separate surface and are out of scope.
+//! - Provider-agnostic transport: the public fetch/push credential is supplied by the
+//!   caller (resolved through the mirror-token seam), NOT a hardcoded GitHub token, so
+//!   a GitLab/Codeberg public destination works too. Internal-PR fields are read
+//!   tolerantly across gitea/github/gitlab response shapes.
+//! - Idempotent: a `mirror-pr/<n>` tag records a completed PR (skip); a leftover
+//!   remote feature branch from a partial prior run is refused rather than
+//!   double-created.
 //! - The public PR's MERGE is what lands the commits on public main; afterwards the
 //!   engine fetches public main and records it as the published boundary, so the
 //!   next PR replays onto it (PRs replay in merge order — enforced by
@@ -29,7 +36,6 @@ use crate::error::ToolError;
 use crate::forge::capability::ForgeEndpoint;
 use crate::forge::provider::ForgeRequest;
 use crate::forge::registry::{ForgePool, ForgeRegistry};
-use crate::github::github_token;
 
 use super::history::{last_pushed_sha, replay_pr_slice, set_pushed_sha, IdentityMap, ReplayOpts};
 use super::native_clean::DeterministicCleaner;
@@ -59,6 +65,11 @@ pub struct PrReplayConfig {
     pub author_map: IdentityMap,
     /// Public merge method: "squash" (default) | "merge" | "rebase".
     pub merge_method: String,
+    /// The git-transport credential for the PUBLIC remote (fetch/push), resolved by
+    /// the caller through the provider-agnostic mirror-token seam (so a GitLab/
+    /// Codeberg public destination supplies its own token, not GitHub's). Provider-
+    /// agnostic: `pr_replay` only ever sees an opaque token string here.
+    pub transport_token: String,
 }
 
 /// Outcome of a single PR replay.
@@ -164,6 +175,62 @@ fn fetch_public_main(work_dir: &Path, remote: &str, token: &str) -> Result<Strin
     Ok(git(work_dir, &["rev-parse", "FETCH_HEAD"])?.trim().to_string())
 }
 
+/// True if the public remote already has a `refs/heads/<branch>` — used to detect a
+/// PARTIAL prior run (branch pushed, PR create/merge incomplete) and refuse rather
+/// than create a duplicate. ls-remote reads the public repo (no write).
+fn remote_branch_exists(work_dir: &Path, remote: &str, branch: &str, token: &str) -> Result<bool, ToolError> {
+    let (askpass, _guard) = write_askpass()?;
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(work_dir)
+        .args(HOOKS_OFF)
+        .args(["ls-remote", "--heads", "--", remote, &format!("refs/heads/{branch}")])
+        .env("GIT_ASKPASS", &askpass)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_MIRROR_TOKEN", token)
+        .output()
+        .map_err(|e| ToolError::Execution(format!("git ls-remote: {e}")))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).replace(token, "<redacted>");
+        return Err(ToolError::Execution(format!("git ls-remote failed: {}", stderr.trim())));
+    }
+    Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
+}
+
+// ── Provider-tolerant field extraction ───────────────────────────────────────
+// Forge adapters return raw provider JSON. gitea/github share a shape (base.sha /
+// head.sha / merged:bool / number); GitLab MRs differ (diff_refs.*_sha / sha / iid /
+// state=="merged"). These read either shape so the orchestration is truly
+// provider-agnostic, not gitea/github-only.
+
+fn pr_base_sha(pr: &Value) -> Option<String> {
+    pr.pointer("/base/sha")
+        .and_then(Value::as_str)
+        .or_else(|| pr.pointer("/diff_refs/base_sha").and_then(Value::as_str))
+        .map(String::from)
+}
+
+fn pr_head_sha(pr: &Value) -> Option<String> {
+    pr.pointer("/head/sha")
+        .and_then(Value::as_str)
+        .or_else(|| pr.pointer("/diff_refs/head_sha").and_then(Value::as_str))
+        .or_else(|| pr.get("sha").and_then(Value::as_str))
+        .map(String::from)
+}
+
+fn pr_is_merged(pr: &Value) -> bool {
+    pr.get("merged").and_then(Value::as_bool).unwrap_or(false)
+        || pr.get("state").and_then(Value::as_str) == Some("merged")
+        || pr.get("merged_at").map(|v| !v.is_null()).unwrap_or(false)
+}
+
+fn pr_number(created: &Value) -> Option<u64> {
+    created
+        .get("number")
+        .and_then(Value::as_u64)
+        .or_else(|| created.get("iid").and_then(Value::as_u64))
+}
+
 fn pr_tag(n: u64) -> String {
     format!("mirror-pr/{n}")
 }
@@ -243,21 +310,14 @@ pub async fn replay_pr(
     }
     let pr = read_private(reg, cfg.private_provider.as_deref(), ForgeEndpoint::PullRequestsGet, pr_params).await?;
 
-    let merged = pr.get("merged").and_then(Value::as_bool).unwrap_or(false);
-    if !merged {
+    if !pr_is_merged(&pr) {
         base_outcome.note = "internal PR is not merged — nothing to replay yet".into();
         return Ok(base_outcome);
     }
-    let base_sha = pr
-        .pointer("/base/sha")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ToolError::Execution("internal PR has no base.sha".into()))?
-        .to_string();
-    let head_sha = pr
-        .pointer("/head/sha")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ToolError::Execution("internal PR has no head.sha".into()))?
-        .to_string();
+    let base_sha =
+        pr_base_sha(&pr).ok_or_else(|| ToolError::Execution("internal PR has no base sha".into()))?;
+    let head_sha =
+        pr_head_sha(&pr).ok_or_else(|| ToolError::Execution("internal PR has no head sha".into()))?;
     let title = scrub_text(pr.get("title").and_then(Value::as_str).unwrap_or("mirrored pull request"));
     let body = scrub_text(pr.get("body").and_then(Value::as_str).unwrap_or(""));
 
@@ -279,9 +339,23 @@ pub async fn replay_pr(
         })
         .unwrap_or_default();
 
+    // Partial-prior-run guard: if the feature branch already exists on the remote,
+    // a previous run pushed it but did not finish (create/comment/merge + the
+    // mirror-pr tag). Re-running would open a DUPLICATE PR, so refuse and let the
+    // operator reconcile (delete the remote branch / any stale PR) — fail-safe, never
+    // double-create. (A fully completed run is caught earlier by the mirror-pr tag.)
+    let token = &cfg.transport_token;
+    if remote_branch_exists(&cfg.work_dir, &cfg.remote, &branch, token)? {
+        return Err(ToolError::Conflict(format!(
+            "public remote already has branch '{branch}' but internal PR {internal_pr} is not \
+             tagged mirrored — a prior replay did not complete. Reconcile (remove the stale remote \
+             branch and any partial PR) before re-running; git_public_mirror_replay_pr never \
+             double-creates."
+        )));
+    }
+
     // 3. Fetch the current public main, then replay the PR range onto it as `branch`.
-    let token = github_token()?;
-    let public_base = fetch_public_main(&cfg.work_dir, &cfg.remote, &token)?;
+    let public_base = fetch_public_main(&cfg.work_dir, &cfg.remote, token)?;
     let opts = ReplayOpts::with_author_map(cfg.author_map.clone());
     let slice = replay_pr_slice(&cfg.source, &cfg.work_dir, &base_sha, &head_sha, &public_base, &branch, &opts)?;
     base_outcome.commits = slice.commits;
@@ -290,7 +364,7 @@ pub async fn replay_pr(
     git_transport(
         &cfg.work_dir,
         &["push", "--", &cfg.remote, &format!("{}:refs/heads/{branch}", slice.branch_tip)],
-        &token,
+        token,
     )?;
 
     // 5. Open the public PR with the scrubbed title/body.
@@ -299,10 +373,8 @@ pub async fn replay_pr(
         create["owner"] = json!(o);
     }
     let created = call_public(reg, cfg.public_provider.as_deref(), ForgeEndpoint::PullRequestsCreate, create).await?;
-    let public_pr = created
-        .get("number")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| ToolError::Execution("public PR create returned no number".into()))?;
+    let public_pr = pr_number(&created)
+        .ok_or_else(|| ToolError::Execution("public PR create returned no PR number/iid".into()))?;
     base_outcome.public_pr = Some(public_pr);
 
     // 6. Mirror each scrubbed comment onto the public PR.
@@ -327,7 +399,7 @@ pub async fn replay_pr(
 
     // 8. Reconcile: fetch the new public main and record it as the published boundary
     //    so the next PR replays onto it, and tag the internal PR as mirrored.
-    let new_public = fetch_public_main(&cfg.work_dir, &cfg.remote, &token)?;
+    let new_public = fetch_public_main(&cfg.work_dir, &cfg.remote, token)?;
     set_pushed_sha(&cfg.work_dir, &new_public)?;
     let _ = last_pushed_sha(&cfg.work_dir); // (read-back is harmless; boundary now set)
     git(&cfg.work_dir, &["tag", "-f", &pr_tag(internal_pr), &new_public])?;
@@ -375,6 +447,7 @@ mod tests {
             public_provider: None,
             author_map: bot_map(),
             merge_method: "squash".into(),
+            transport_token: "<REDACTED-SECRET>".into(),
         }
     }
 
