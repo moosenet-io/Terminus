@@ -231,6 +231,15 @@ fn pr_number(created: &Value) -> Option<u64> {
         .or_else(|| created.get("iid").and_then(Value::as_u64))
 }
 
+/// True if a remote URL embeds userinfo (`scheme://user[:pass]@host`). A `file://`
+/// path or a bare `https://host/…` URL has no `@` before the first path `/`, so this
+/// stays false for legitimate remotes and true for a credential-bearing one.
+fn remote_has_userinfo(remote: &str) -> bool {
+    let after_scheme = remote.split_once("://").map(|(_, rest)| rest).unwrap_or(remote);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    authority.contains('@')
+}
+
 fn pr_tag(n: u64) -> String {
     format!("mirror-pr/{n}")
 }
@@ -296,6 +305,17 @@ pub async fn replay_pr(
         note: String::new(),
     };
 
+    // The credential is injected only via GIT_ASKPASS — a remote URL must never carry
+    // embedded userinfo (`scheme://user:pass@host`), which would leak into process
+    // listings / reflogs and bypass the askpass path. Refuse it.
+    if remote_has_userinfo(&cfg.remote) {
+        return Err(ToolError::InvalidArgument(
+            "the public remote URL must not embed credentials (scheme://user:pass@host) — the \
+             token is supplied via GIT_ASKPASS only. Configure a bare remote URL."
+                .into(),
+        ));
+    }
+
     // Idempotency: a recorded PR is never re-created.
     if already_replayed(&cfg.work_dir, internal_pr) {
         base_outcome.skipped = true;
@@ -314,10 +334,25 @@ pub async fn replay_pr(
         base_outcome.note = "internal PR is not merged — nothing to replay yet".into();
         return Ok(base_outcome);
     }
-    let base_sha =
+    let base_ref =
         pr_base_sha(&pr).ok_or_else(|| ToolError::Execution("internal PR has no base sha".into()))?;
     let head_sha =
         pr_head_sha(&pr).ok_or_else(|| ToolError::Execution("internal PR has no head sha".into()))?;
+    // The PR object's `base.sha` is the base BRANCH tip, which — for an already-merged
+    // PR — already contains the PR. The true pre-PR fork point is the merge-base of the
+    // base branch and the PR head; replaying base_sha..head_sha from that point yields
+    // exactly the PR's own commits. (Assumes the internal merge preserved the head
+    // commits — i.e. a merge/rebase, not a squash that discards them; a squash makes
+    // the head unreachable and merge-base fails with a clear error.)
+    let base_sha = git(&cfg.source, &["merge-base", &base_ref, &head_sha])
+        .map_err(|e| {
+            ToolError::Execution(format!(
+                "cannot resolve the PR fork point (merge-base of base {base_ref} and head \
+                 {head_sha}) in the source — the PR head may be unreachable (squash-merged?): {e}"
+            ))
+        })?
+        .trim()
+        .to_string();
     let title = scrub_text(pr.get("title").and_then(Value::as_str).unwrap_or("mirrored pull request"));
     let body = scrub_text(pr.get("body").and_then(Value::as_str).unwrap_or(""));
 
@@ -479,6 +514,17 @@ mod tests {
         assert!(!outcome.replayed);
 
         let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    #[test]
+    fn remote_userinfo_is_detected() {
+        assert!(remote_has_userinfo("https://user:<email>/o/r.git")); // pii-test-fixture
+        assert!(remote_has_userinfo("https://<email>/o/r.git")); // pii-test-fixture
+        // Bare URLs and file paths have no embedded credentials.
+        assert!(!remote_has_userinfo("https://github.com/o/r.git"));
+        assert!(!remote_has_userinfo("file:///tmp/mirror-bare"));
+        // An `@` in a path/query, not the authority, is not userinfo.
+        assert!(!remote_has_userinfo("https://github.com/o/r.git?x=a@b"));
     }
 
     #[test]

@@ -593,6 +593,27 @@ pub fn replay_pr_slice(
         .to_string();
     let canonical_base = git_capture(work_dir, &["rev-parse", "HEAD"])?.trim().to_string();
 
+    // Fail closed unless public_base's TREE equals the canonical base's tree. The PR
+    // slice rebases onto public_base assuming its content is the merged/squashed
+    // equivalent of the canonical history up to base_int; if the public mirror has
+    // diverged / been altered / the recorded boundary is stale, the trees differ and a
+    // rebase would land the slice on the WRONG public lineage. Refuse rather than
+    // publish onto a divergent base.
+    let public_tree = git_capture(work_dir, &["rev-parse", &format!("{public_base}^{{tree}}")])?
+        .trim()
+        .to_string();
+    let canonical_tree = git_capture(work_dir, &["rev-parse", &format!("{canonical_base}^{{tree}}")])?
+        .trim()
+        .to_string();
+    if public_tree != canonical_tree {
+        return Err(ToolError::Conflict(format!(
+            "public base {public_base} (tree {public_tree}) does not match the canonical scrubbed \
+             base {canonical_base} (tree {canonical_tree}) — the public mirror has diverged from \
+             the scrubbed lineage. Refusing to rebase a PR slice onto a divergent base; reconcile \
+             the mirror (re-baseline via GHIST-07) first."
+        )));
+    }
+
     // Advance the canonical scrubbed lineage over the PR range (marks-chained).
     replay_range(source, work_dir, base_int, head_int, opts)?;
     let canonical_head = git_capture(work_dir, &["rev-parse", "HEAD"])?.trim().to_string();
@@ -1140,6 +1161,35 @@ mod tests {
         let err = replay_pr_slice(&src, &wd, &c1, &c2, &canon, "pr-mirror/9", &opts);
         assert!(err.is_err(), "must refuse an out-of-order PR replay: {err:?}");
         assert!(format!("{err:?}").contains("out of order"), "{err:?}");
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    // ── GHIST-05: refuse a PR replay when the public base tree has diverged ──
+    #[test]
+    fn replay_pr_slice_refuses_divergent_public_base() {
+        let src = unique("prsrc3");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q", "-b", "main"]);
+        write(&src, "a.txt", b"one\n");
+        commit_all(&src, "C1");
+        write(&src, "b.txt", b"two\n");
+        commit_all(&src, "C2");
+        let c2 = git(&src, &["rev-parse", "HEAD"]).trim().to_string();
+
+        let wd = unique("prwd3");
+        let opts = ReplayOpts::with_author_map(bot_map());
+        // Backfill C1+C2 → canonical at scrubbed(C2), tree T2.
+        replay_full_history(&src, &wd, &opts).unwrap();
+        // A public base with a DIFFERENT tree: scrubbed(C1) = HEAD~1 (tree T1 != T2).
+        let divergent = git(&wd, &["rev-parse", "HEAD~1"]).trim().to_string();
+
+        // Even with a well-ordered base (C2 == last mirrored) and an empty range, the
+        // tree-equivalence guard must refuse a divergent public base BEFORE replaying.
+        let err = replay_pr_slice(&src, &wd, &c2, &c2, &divergent, "pr-mirror/3", &opts);
+        assert!(err.is_err(), "must refuse a divergent public base: {err:?}");
+        assert!(format!("{err:?}").contains("diverged"), "{err:?}");
 
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&wd);
