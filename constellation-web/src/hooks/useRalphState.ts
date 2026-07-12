@@ -44,5 +44,7 @@ export function useRalphState(): { loops: RalphLoop[]; handleEvent: (e: WsEvent)
     };
   }, []);
 
-  return { loops: loops.filter(l => l.phase !== 'done' || true), handleEvent };
+  // Show all loops (including 'done'); completedTimers above remove done loops after a delay,
+  // so no filter here — the previous `l.phase !== 'done' || true` was a dead no-op.
+  return { loops, handleEvent };
 }
