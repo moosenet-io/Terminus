@@ -569,6 +569,137 @@ retrieved context plus, when a model is available, a synthesized answer."
     }
 }
 
+// ── kg_semantic_search ────────────────────────────────────────────────────────
+pub struct KgSemanticSearch;
+
+/// Clamp a user-supplied `limit` into `[1, KG_SEMANTIC_SEARCH_MAX]` (0 → 1,
+/// values above the cap → the cap).
+const KG_SEMANTIC_SEARCH_MAX: i64 = 50;
+
+fn clamp_limit(limit: i64) -> i64 {
+    limit.clamp(1, KG_SEMANTIC_SEARCH_MAX)
+}
+
+/// Join top-K `(node_id, score)` hits against the loaded graph: drop ids not
+/// present in the graph (stale vector rows — e.g. the graph was rebuilt and
+/// the node no longer exists), map the rest to their result JSON, and
+/// preserve the input (score-descending) order. Pure — no DB/HTTP — so the
+/// stale-row-drop and field-mapping behavior is testable without live infra.
+fn map_topk_to_results(hits: &[(String, f32)], g: &KnowledgeGraph) -> Vec<Value> {
+    hits.iter()
+        .filter_map(|(node_id, score)| {
+            // Only surface CURRENTLY-VALID nodes. `get_node` also returns
+            // bi-temporally invalidated nodes (a removed/renamed symbol kept in
+            // the graph with `valid_to` set) — a stale vector row must not
+            // resurrect a deleted symbol, so drop anything not current.
+            g.get_node(node_id)
+                .filter(|n| n.valid_to.is_none())
+                .map(|n| {
+                    json!({
+                        "id": n.id, "name": n.name, "kind": n.kind.as_str(),
+                        "path": n.path, "score": score, "cluster": n.cluster,
+                    })
+                })
+        })
+        .collect()
+}
+
+#[async_trait]
+impl RustTool for KgSemanticSearch {
+    fn name(&self) -> &str {
+        "kg_semantic_search"
+    }
+    fn description(&self) -> &str {
+        "Semantic (embedding) search over a project's Atlas knowledge graph: embeds `query` and \
+returns the nearest nodes by meaning, not substring. Degrades cleanly — returns \
+`configured:false` (not an error) when the vector store or embeddings endpoint is unconfigured \
+or unreachable, so callers should fall back to the lexical `kg_search` in that case."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "Plane project id, e.g. TERM"},
+                "query": {"type": "string", "description": "natural-language search text"},
+                "limit": {"type": "integer", "description": "max results, clamped to [1,50] (default 10)"}
+            },
+            "required": ["project_id", "query"]
+        })
+    }
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.execute_structured(args).await?.text)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let project_id = req_str(&args, "project_id")?;
+        let query = req_str(&args, "query")?;
+        let limit = clamp_limit(args.get("limit").and_then(|v| v.as_i64()).unwrap_or(10));
+
+        let store = match super::vec_store::AtlasVecStore::from_env().await {
+            Ok(store) => store,
+            Err(ToolError::NotConfigured(_)) => {
+                return structured(json!({
+                    "configured": false, "found": false, "project_id": project_id, "results": [],
+                }));
+            }
+            Err(e) => {
+                return structured(json!({
+                    "configured": false, "found": false, "project_id": project_id, "results": [],
+                    "error": e.to_string(),
+                }));
+            }
+        };
+
+        let client = super::vec_embed::EmbedClient::from_env();
+        let qvec = match client.embed(&query).await {
+            Ok(v) => v,
+            Err(e) => {
+                // Store IS configured; only the embedding STEP failed (endpoint
+                // transiently down). Per the KGEMB-04 edge-case contract this is
+                // `configured:true, found:false, error` — semantic search is set
+                // up but momentarily unusable — distinct from an unset store.
+                return structured(json!({
+                    "configured": true, "found": false, "project_id": project_id, "results": [],
+                    "error": e.to_string(),
+                }));
+            }
+        };
+
+        let hits = match store.query_topk(&project_id, &qvec, limit).await {
+            Ok(h) => h,
+            Err(e) => {
+                // A vector-query failure means the STORE itself is unusable — the
+                // store gates "configured", so this is configured:false (fall
+                // back to lexical), the same signal as an unset/unreachable store.
+                return structured(json!({
+                    "configured": false, "found": false, "project_id": project_id, "results": [],
+                    "error": e.to_string(),
+                }));
+            }
+        };
+
+        // No graph for this project is NOT a config problem (the store/embeddings
+        // are configured) — it's a genuine found:false, following the same
+        // no_graph convention as the other kg_* tools. Callers should NOT fall
+        // back to lexical here (there is nothing to search either way).
+        let Some(g) = load_graph(&project_id)? else {
+            return structured(json!({
+                "configured": true, "found": false, "project_id": project_id, "count": 0, "results": [],
+                "message": "no knowledge graph for this project (run scribe_kg_build first)",
+            }));
+        };
+
+        // `found` reflects whether there are actual semantic matches: zero hits,
+        // or every hit dropped as a stale vector row (node deleted from the
+        // graph), is found:false — a caller can distinguish "search ran, nothing
+        // matched" from a genuine hit set without inspecting count.
+        let results = map_topk_to_results(&hits, &g);
+        structured(json!({
+            "configured": true, "found": !results.is_empty(), "project_id": project_id,
+            "count": results.len(), "results": results,
+        }))
+    }
+}
+
 /// Register the `kg_*` tools on the core registry.
 pub fn register(registry: &mut ToolRegistry) {
     let _ = registry.register(Box::new(KgSearch));
@@ -579,6 +710,7 @@ pub fn register(registry: &mut ToolRegistry) {
     let _ = registry.register(Box::new(KgCommunities));
     let _ = registry.register(Box::new(KgQuery));
     let _ = registry.register(Box::new(KgFileSymbols));
+    let _ = registry.register(Box::new(KgSemanticSearch));
 }
 
 #[cfg(test)]
@@ -782,5 +914,119 @@ pub struct Widget;
     async fn missing_required_arg_is_invalid_argument() {
         let err = KgSearch.execute_structured(json!({"project_id": "X"})).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)), "missing query must be InvalidArgument, got {err:?}");
+    }
+
+    // ── kg_semantic_search ────────────────────────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn semantic_search_unconfigured_store_degrades_not_errors() {
+        // Mirrors vec_store's own test shape: never mutate global env to force
+        // NotConfigured if a real DSN is already present in this process.
+        if std::env::var("ATLAS_DATABASE_URL").is_ok() {
+            return;
+        }
+        let _g = seed_project("SEMSRCH");
+        let out = KgSemanticSearch
+            .execute_structured(json!({"project_id": "SEMSRCH", "query": "helper function"}))
+            .await
+            .unwrap();
+        let v = val(out);
+        assert_eq!(v["configured"], false);
+        assert_eq!(v["found"], false);
+        assert_eq!(v["results"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn clamp_limit_clamps_zero_and_over_cap() {
+        assert_eq!(clamp_limit(0), 1);
+        assert_eq!(clamp_limit(100), 50);
+        assert_eq!(clamp_limit(10), 10);
+        assert_eq!(clamp_limit(-5), 1);
+        assert_eq!(clamp_limit(50), 50);
+        assert_eq!(clamp_limit(1), 1);
+    }
+
+    fn semantic_test_graph() -> KnowledgeGraph {
+        let mut g = KnowledgeGraph::new("SEM");
+        g.insert_node(super::super::model::KgNode::new(
+            "crate::a::foo",
+            super::super::model::NodeKind::Function,
+            "foo",
+            "src/a.rs",
+        ));
+        g.insert_node(super::super::model::KgNode::new(
+            "crate::b::bar",
+            super::super::model::NodeKind::Function,
+            "bar",
+            "src/b.rs",
+        ));
+        g
+    }
+
+    #[test]
+    fn map_topk_drops_stale_node_ids_not_in_graph() {
+        let g = semantic_test_graph();
+        let hits = vec![
+            ("crate::a::foo".to_string(), 0.9_f32),
+            ("crate::gone::stale".to_string(), 0.85_f32),
+            ("crate::b::bar".to_string(), 0.5_f32),
+        ];
+        let results = map_topk_to_results(&hits, &g);
+        assert_eq!(results.len(), 2, "stale id must be dropped");
+        assert_eq!(results[0]["id"], "crate::a::foo");
+        assert_eq!(results[0]["score"], 0.9_f32);
+        assert_eq!(results[1]["id"], "crate::b::bar");
+    }
+
+    #[test]
+    fn map_topk_drops_bitemporally_invalidated_nodes() {
+        // A vector row can outlive the symbol it points at: the node is still in
+        // the graph but bi-temporally invalidated (valid_to set). It must NOT be
+        // returned — a deleted symbol resurrected by a stale embedding.
+        let mut g = semantic_test_graph();
+        g.invalidate_path("src/b.rs", 100); // `bar` removed at build-seq 100
+        let hits = vec![
+            ("crate::a::foo".to_string(), 0.9_f32),
+            ("crate::b::bar".to_string(), 0.8_f32), // stale vector row
+        ];
+        let results = map_topk_to_results(&hits, &g);
+        assert_eq!(results.len(), 1, "invalidated node must be dropped");
+        assert_eq!(results[0]["id"], "crate::a::foo");
+    }
+
+    #[test]
+    fn map_topk_preserves_input_order() {
+        let g = semantic_test_graph();
+        // Reverse of pagerank/degree order — order must come purely from the
+        // input slice (already score-sorted by query_topk), not re-sorted.
+        let hits = vec![
+            ("crate::b::bar".to_string(), 0.99_f32),
+            ("crate::a::foo".to_string(), 0.1_f32),
+        ];
+        let results = map_topk_to_results(&hits, &g);
+        assert_eq!(results[0]["id"], "crate::b::bar");
+        assert_eq!(results[1]["id"], "crate::a::foo");
+    }
+
+    #[test]
+    fn map_topk_empty_hits_is_empty_results() {
+        let g = semantic_test_graph();
+        let results = map_topk_to_results(&[], &g);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn map_topk_includes_all_expected_fields() {
+        let g = semantic_test_graph();
+        let hits = vec![("crate::a::foo".to_string(), 0.42_f32)];
+        let results = map_topk_to_results(&hits, &g);
+        let r = &results[0];
+        assert_eq!(r["id"], "crate::a::foo");
+        assert_eq!(r["name"], "foo");
+        assert_eq!(r["kind"], "function");
+        assert_eq!(r["path"], "src/a.rs");
+        assert_eq!(r["score"], 0.42_f32);
+        assert!(r["cluster"].is_null());
     }
 }

@@ -484,6 +484,7 @@ on the core registry, so a model can query the graph instead of grepping source:
 | `kg_communities` | The community structure (level-0 clusters + a coarser level-1), each with members and — when a model is available — a short summary, for answering subsystem/architecture questions at the right zoom. |
 | `kg_query` | Answer a natural-language question — routes automatically to entity-level retrieval (specific symbols) or community-level retrieval (architecture/subsystems), returns the context plus a synthesized answer when a model is available. |
 | `kg_file_symbols` | The symbols a given repo-relative file defines, sorted by PageRank importance. |
+| `kg_semantic_search` | Meaning-based (embedding) search — finds nodes related to `query` even without a shared substring. Degrades to `configured:false` when embeddings aren't set up; see [KGEMB-04](#kg-semantic-search-tool-kgemb-04) below. |
 
 All take a `project_id` and read the per-project graph store
 (`SCRIBE_KG_STORE_DIR`); a project with no graph yet returns `found: false`
@@ -675,6 +676,32 @@ boundary).
 
 This item ships only the client + card builder — it is not yet wired into
 `scribe_kg_build` (that's KGEMB-03).
+
+### `kg_semantic_search` tool (KGEMB-04)
+
+`kg_semantic_search(project_id, query, limit?)` (`src/scribe/graph/tools.rs`)
+is the query-side counterpart to KGEMB-01/02/03: it embeds `query` with
+`EmbedClient`, asks `AtlasVecStore::query_topk` for the nearest node ids by
+cosine similarity, joins the hits against the project's currently-loaded
+Atlas graph, and returns `{id,name,kind,path,score,cluster}` per hit ordered
+by similarity (descending — the store's own order is preserved, never
+re-sorted). `limit` is optional (default 10) and clamped to `[1, 50]`.
+
+**Degrade-to-lexical contract:** this tool is safe to call unconditionally,
+including in a deployment that has never enabled embeddings:
+
+| Condition | Result |
+| --- | --- |
+| `AtlasVecStore::from_env()` returns `NotConfigured` (`ATLAS_DATABASE_URL` unset) | `{"configured": false, "found": false, "results": []}` — a normal result, not a tool error. Callers should fall back to `kg_search`. |
+| The store is configured but some other error occurs (e.g. connect failure) | Also degrades to `{"configured": false, "found": false, "results": [], "error": "..."}` rather than a hard error. |
+| The embeddings endpoint is down/unreachable at query time | `{"configured": true, "found": false, "results": [], "error": "..."}` — the store IS configured, but the query embedding itself failed. |
+| No knowledge graph exists for `project_id` yet | `{"configured": true, "found": false, "count": 0, "message": "..."}` — a genuine empty result, not a config problem (run `scribe_kg_build` first). |
+| Both are up, query ran | `{"configured": true, "found": <has-results>, "project_id", "count", "results": [...]}` — `found` reflects whether there were actual matches (zero hits, or every hit dropped as a stale row, is `found:false`). |
+
+A vector-store row whose `node_id` is no longer present in the currently
+loaded graph (e.g. the graph was rebuilt and the symbol was removed/renamed)
+is silently dropped from the results rather than surfaced — stale-row
+tolerance, so a query never returns a dangling reference.
 
 ## License
 
