@@ -1083,6 +1083,10 @@ pub fn register(registry: &mut ToolRegistry) {
     // in `catalog.rs`, mirroring how plane/gitea keep registration next to the
     // tool). Core registry only — no personal registry.
     catalog::register(registry);
+    // DISC-02 (S114): the read-only `model_discovery_brochure` core tool (its
+    // own register() in `discovery/tool.rs`, wired through `discovery::register`).
+    // Core registry only — no personal registry.
+    discovery::register(registry);
 }
 
 #[cfg(test)]

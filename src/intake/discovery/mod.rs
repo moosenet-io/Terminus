@@ -11,9 +11,23 @@
 //!   `FleetCategory`/`CandidateStatus` types (storage only).
 //! - `hf_client` (DISC-04): the public HF Hub listing client that feeds
 //!   discovery; a later DISC-05/DISC-06 classifies and persists its output.
-//! - Later: `tool`/`storage` (DISC-02), `upsert` (DISC-03), etc.
+//! - `storage` (DISC-02): the one Postgres read touch point
+//!   (`storage::read_brochure`), reusing `crate::intake::storage::get_pool`.
+//! - `tool` (DISC-02): the read-only `model_discovery_brochure` MCP core
+//!   tool — a pure filter/render layer over `storage::read_brochure`'s
+//!   output, registered on the core registry via [`register`] below.
+//! - Later: `upsert` (DISC-03), etc.
 
 pub mod hf_client;
 pub mod schema;
+pub mod storage;
+pub mod tool;
 
 pub use schema::{CandidateStatus, DiscoveryCandidate, FleetCategory};
+
+/// Register the brochure's MCP tools on the CORE registry. Wired into
+/// `crate::intake::register` (the same Chord-served core surface
+/// `catalog::register` uses) — never the personal registry.
+pub fn register(registry: &mut crate::registry::ToolRegistry) {
+    tool::register(registry);
+}
