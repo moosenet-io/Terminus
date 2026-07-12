@@ -470,6 +470,65 @@ pub fn replay_range(
     Ok(report)
 }
 
+/// Replay EXACTLY `from_sha..to_sha` (bounded to `to_sha`'s ancestry) onto the
+/// canonical lineage, scrubbed + attributed, and advance the canonical branch to
+/// scrubbed(`to_sha`). Unlike [`replay_range`] — which exports `--all` up to the
+/// source's CURRENT refs (correct for a "catch up to HEAD" sync) — this exports ONLY
+/// `to_sha`, so a source checkout sitting BEYOND `to_sha` (e.g. at internal `main`
+/// during a per-PR replay) does NOT drag later commits into the slice. Used by
+/// [`replay_pr_slice`] (GHIST-05). `from_sha` must be an ancestor of `to_sha` and
+/// already mirrored (present in the marks).
+pub fn replay_range_bounded(
+    source: &Path,
+    work_dir: &Path,
+    from_sha: &str,
+    to_sha: &str,
+    opts: &ReplayOpts,
+) -> Result<HistoryReport, ToolError> {
+    run_git(source, &["rev-parse", "--git-dir"])
+        .map_err(|e| ToolError::Execution(format!("source is not a git repo: {e}")))?;
+    if !marks_paths(work_dir).src.exists() {
+        return Err(ToolError::Execution(
+            "no backfill marks present — run replay_full_history before a bounded range".into(),
+        ));
+    }
+    let anc = Command::new("git")
+        .arg("-C")
+        .arg(source)
+        .args(HOOKS_OFF)
+        .args(["merge-base", "--is-ancestor", from_sha, to_sha])
+        .status()
+        .map_err(|e| ToolError::Execution(format!("merge-base: {e}")))?;
+    if !anc.success() {
+        return Err(ToolError::Execution(format!(
+            "internal history is not a fast-forward: {from_sha}..{to_sha} — {to_sha} does not \
+             descend from {from_sha}; refusing to diverge the mirror"
+        )));
+    }
+    // A temporary NAMED source ref at to_sha BOUNDS the export to to_sha's ancestry
+    // AND names it, so fast-import re-creates the same ref in the work-dir at
+    // scrubbed(to_sha) (no `--all` over-export, no anonymous-ref/marks parsing). The
+    // `--import-marks` in run_export_import skips everything already mirrored, so only
+    // from_sha..to_sha is emitted. The temp ref is removed from both repos afterward.
+    let tmp = "refs/ghist-pr-slice-tmp";
+    git_capture(source, &["update-ref", tmp, to_sha])?;
+    let result = (|| -> Result<HistoryReport, ToolError> {
+        let report = run_export_import(source, work_dir, &[tmp], true, opts)?;
+        // Point the canonical branch at the imported slice tip (run_export_import left
+        // HEAD on the OLD canonical head; only the tmp ref advanced), then sync.
+        let canonical_branch = git_capture(work_dir, &["symbolic-ref", "--short", "HEAD"])?
+            .trim()
+            .to_string();
+        git_capture(work_dir, &["update-ref", &format!("refs/heads/{canonical_branch}"), tmp])?;
+        git_capture(work_dir, &["reset", "--hard", &canonical_branch])?;
+        let _ = git_capture(work_dir, &["update-ref", "-d", tmp]);
+        set_mirrored_sha(work_dir, to_sha)?;
+        Ok(report)
+    })();
+    let _ = git_capture(source, &["update-ref", "-d", tmp]); // always clean up the source temp ref
+    result
+}
+
 /// Bring `work_dir` up to `source`'s current HEAD: a full backfill on first run
 /// (no prior lineage), else an incremental append of the new commits. Returns
 /// `(is_full, report)`. A no-op (already at HEAD) returns a zero report.
@@ -691,7 +750,10 @@ pub fn replay_pr_slice(
     }
 
     // Advance the canonical scrubbed lineage over the PR range (marks-chained).
-    replay_range(source, work_dir, base_int, head_int, opts)?;
+    // BOUNDED replay: export ONLY base_int..head_int (not `--all`). The PR-replay source
+    // checkout may sit at internal main, well beyond head_int — a `--all` export would
+    // drag every later commit into this PR's slice and publish it under this PR.
+    replay_range_bounded(source, work_dir, base_int, head_int, opts)?;
     let canonical_head = git_capture(work_dir, &["rev-parse", "HEAD"])?.trim().to_string();
     let commits: usize = git_capture(
         work_dir,
@@ -1245,6 +1307,61 @@ mod tests {
         // The author is remapped to the bot on the PR-branch commits.
         let author = git(&wd, &["log", "-1", "--format=%an <%ae>", "pr-mirror/7"]).trim().to_string();
         assert!(author.contains("MoosenetBot"), "author remapped: {author}");
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    // ── GHIST-05 review (HIGH): the PR slice is BOUNDED to base..head, even when the
+    //    source checkout sits at a LATER commit (regression for the `--all` over-export).
+    #[test]
+    fn replay_pr_slice_is_bounded_when_source_is_ahead() {
+        let src = unique("boundsrc");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q", "-b", "main"]);
+        write(&src, "a.txt", b"base\n");
+        commit_all(&src, "C1 base");
+        let c1 = git(&src, &["rev-parse", "HEAD"]).trim().to_string();
+
+        let wd = unique("boundwd");
+        let opts = ReplayOpts::with_author_map(bot_map());
+        replay_full_history(&src, &wd, &opts).unwrap(); // canonical at scrubbed(C1)
+        let canon_base = git(&wd, &["rev-parse", "HEAD"]).trim().to_string();
+        let base_tree = git(&wd, &["rev-parse", &format!("{canon_base}^{{tree}}")]).trim().to_string();
+
+        // The PR: C2, C3.
+        write(&src, "feat1.txt", b"pr commit one\n");
+        commit_all(&src, "C2 pr");
+        write(&src, "feat2.txt", b"pr commit two\n");
+        commit_all(&src, "C3 pr head");
+        let c3 = git(&src, &["rev-parse", "HEAD"]).trim().to_string();
+        // LATER commits beyond the PR (the source now sits here, at main).
+        write(&src, "later1.txt", b"later work\n");
+        commit_all(&src, "C4 later");
+        write(&src, "later2.txt", b"even later\n");
+        commit_all(&src, "C5 later");
+
+        let pub_base = {
+            let out = Command::new("git")
+                .arg("-C").arg(&wd).args(HOOKS_OFF)
+                .args(["-c", "user.name=P", "-c", "user.email=<email>", // pii-test-fixture
+                       "commit-tree", &base_tree, "-m", "public base"])
+                .env("GIT_COMMITTER_NAME", "P").env("GIT_COMMITTER_EMAIL", "<email>") // pii-test-fixture
+                .env("GIT_AUTHOR_NAME", "P").env("GIT_AUTHOR_EMAIL", "<email>") // pii-test-fixture
+                .output().unwrap();
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // Replay ONLY C1..C3, though the source HEAD is at C5.
+        let rep = replay_pr_slice(&src, &wd, &c1, &c3, &pub_base, "pr-mirror/1", &opts).unwrap();
+        assert_eq!(rep.commits, 2, "slice is exactly the PR's 2 commits, not the later ones: {rep:?}");
+        assert_eq!(last_mirrored_sha(&wd).as_deref(), Some(c3.as_str()), "canonical stops at head_int");
+
+        // The PR branch (and canonical head) contain the PR's files but NOT the later ones.
+        let ls = git(&wd, &["ls-tree", "-r", "--name-only", "pr-mirror/1"]);
+        assert!(ls.contains("feat1.txt") && ls.contains("feat2.txt"), "PR files present: {ls}");
+        assert!(!ls.contains("later1.txt") && !ls.contains("later2.txt"), "later commits NOT dragged in: {ls}");
 
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&wd);
