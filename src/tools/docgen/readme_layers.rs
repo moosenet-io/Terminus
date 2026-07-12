@@ -267,7 +267,12 @@ pub fn parse_layers(content: &str) -> ParsedLayers {
         // Without this, a round that OMITS a layer would drop the prior
         // content -- it lives under the rendered heading, not the generated
         // one (regression fixed here: preserves_prior_quickstart_when_round_omits_it).
-        quickstart: extract_section_any(content, &["Quickstart", "Usage"]).unwrap_or_default(),
+        // DOCGEN-21: the landing renders "## Quick Start" (not "## Usage"
+        // -- that heading name retired with the old giant-file layout), so
+        // the round-trip recognizer must accept it too or a previously-
+        // rendered landing's quickstart content would silently vanish on
+        // the next deepen pass.
+        quickstart: extract_section_any(content, &["Quickstart", "Quick Start", "Usage"]).unwrap_or_default(),
         deep_dive: extract_section_any(content, &["Deep Dive", "API"]).unwrap_or_default(),
     }
 }
@@ -644,7 +649,7 @@ mod tests {
 
         assert!(content.contains("widget build"), "quickstart layer must reach Quick Start");
 
-        let hero = content.find("Widget").expect("module name in hero");
+        let hero = content.find("src/widget").expect("module name in hero"); // ctx() uses module "src/widget"
         let divider = content.find("\n---\n").expect("hero/body divider");
         let mermaid = content.find("```mermaid").expect("architecture mermaid fence");
         let why = content.find("## Why").expect("Why section");

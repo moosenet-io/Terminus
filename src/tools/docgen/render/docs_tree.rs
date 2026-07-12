@@ -356,9 +356,12 @@ mod tests {
         let bare = "# Widget\n\n## Tutorial\n\nOnly a tutorial section this round.\n";
         let artifacts = render_diataxis_set(&ctx(bare), None);
         let files = build_docs_tree(&ctx(bare), &artifacts);
-        assert!(find(&files, GUIDES_OVERVIEW).content.contains("_No how-to content yet._"));
-        assert!(find(&files, REFERENCE_API).content.contains("_No reference content yet._"));
-        assert!(find(&files, ARCHITECTURE).content.contains("_No explanation content yet._"));
+        // render_diataxis_set itself already placeholders an absent mode
+        // ("_No {mode} content yet for {module}._") -- mode_body recovers
+        // that text verbatim rather than double-placeholdering it.
+        assert!(find(&files, GUIDES_OVERVIEW).content.contains("No how-to content yet"));
+        assert!(find(&files, REFERENCE_API).content.contains("No reference content yet"));
+        assert!(find(&files, ARCHITECTURE).content.contains("No explanation content yet"));
     }
 
     // ── Breadcrumbs + cross-links present, correct relative depth ───────
