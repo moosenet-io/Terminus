@@ -221,13 +221,14 @@ fn pr_number(created: &Value) -> Option<u64> {
 }
 
 /// The internal commit this PR's merge landed at — the internal-main tip after the
-/// merge. gitea/github: `merge_commit_sha`; gitlab MR: `merge_commit_sha` or `sha`.
+/// merge. gitea/github: `merge_commit_sha`; gitlab merged MR: `merge_commit_sha` (or
+/// `squash_commit_sha` when squashed). NOTE: gitlab's `sha` is the MR's HEAD diff sha,
+/// NOT the merge commit — never use it here.
 fn pr_merge_commit(pr: &Value) -> Option<String> {
     pr.get("merge_commit_sha")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .or_else(|| pr.get("merged_commit_sha").and_then(Value::as_str))
-        .or_else(|| pr.get("sha").and_then(Value::as_str))
+        .or_else(|| pr.get("squash_commit_sha").and_then(Value::as_str).filter(|s| !s.is_empty()))
         .map(String::from)
 }
 
@@ -422,29 +423,6 @@ pub async fn replay_pr(
         return Ok(base_outcome);
     }
 
-    // Idempotency (DURABLE): scan the public forge for an existing PR on this branch.
-    // Only a MERGED one means the work is done — reconcile the boundary from public
-    // main and tag, then skip. An OPEN/partial one is NOT treated as done: it falls
-    // through so the remote-branch guard below refuses it as an incomplete prior run
-    // (fail-closed), for the operator to reconcile.
-    let pub_repo_probe = cfg.public_repo.clone().unwrap_or_else(|| cfg.repo.clone());
-    if let Some(existing) = public_pr_for_branch(reg, cfg, &pub_repo_probe, &branch).await? {
-        if pr_is_merged(&existing) {
-            let new_public = fetch_public_main(&cfg.work_dir, &cfg.remote, &cfg.transport_token)?;
-            set_pushed_sha(&cfg.work_dir, &new_public)?;
-            git(&cfg.work_dir, &["tag", "-f", &pr_tag(internal_pr), &new_public])?;
-            base_outcome.skipped = true;
-            base_outcome.public_head = Some(new_public);
-            base_outcome.note = format!(
-                "public PR for '{branch}' already MERGED — published boundary reconciled + tagged, \
-                 skipped (durable idempotency)"
-            );
-            return Ok(base_outcome);
-        }
-        // An OPEN / non-merged public PR exists — a stalled prior run. Fall through to
-        // the remote-branch guard, which refuses it (never silently 'done').
-    }
-
     // 1. Read the internal PR.
     let mut pr_params = json!({ "repo": priv_repo, "index": internal_pr, "number": internal_pr });
     if let Some(o) = &cfg.private_owner {
@@ -472,6 +450,43 @@ pub async fn replay_pr(
             "no canonical scrubbed lineage — run git_public_history_backfill first".into(),
         )
     })?;
+
+    // Idempotency (DURABLE): scan the public forge for an existing PR on this branch.
+    // Now that head_int is known we can verify consistency, not just presence:
+    //   - a MERGED public PR AND the canonical lineage already at head_int
+    //     (base_int == head_int) → the work is truly done; reconcile the boundary from
+    //     public main + tag, then skip.
+    //   - a MERGED public PR but the canonical lineage is NOT at head_int → an
+    //     inconsistent state (a stale / manual / out-of-band merge): REFUSE
+    //     (fail-closed) rather than advance the boundary and desync merge order.
+    //   - an OPEN/partial public PR → fall through to the remote-branch guard, which
+    //     refuses it as an incomplete prior run.
+    let pub_repo_probe = cfg.public_repo.clone().unwrap_or_else(|| cfg.repo.clone());
+    if let Some(existing) = public_pr_for_branch(reg, cfg, &pub_repo_probe, &branch).await? {
+        if pr_is_merged(&existing) {
+            if base_int != head_int {
+                return Err(ToolError::Conflict(format!(
+                    "public PR for '{branch}' is MERGED but the canonical scrubbed lineage is at \
+                     {base_int}, not this PR's merge {head_int} — the mirror is out of sync with \
+                     the public repo (a stale / manual / out-of-band merge). Reconcile before \
+                     re-running; git_public_mirror_replay_pr will not advance the boundary over an \
+                     inconsistent state."
+                )));
+            }
+            let new_public = fetch_public_main(&cfg.work_dir, &cfg.remote, &cfg.transport_token)?;
+            set_pushed_sha(&cfg.work_dir, &new_public)?;
+            git(&cfg.work_dir, &["tag", "-f", &pr_tag(internal_pr), &new_public])?;
+            base_outcome.skipped = true;
+            base_outcome.public_head = Some(new_public);
+            base_outcome.note = format!(
+                "public PR for '{branch}' already MERGED and canonical lineage consistent — \
+                 boundary reconciled + tagged, skipped (durable idempotency)"
+            );
+            return Ok(base_outcome);
+        }
+        // An OPEN / non-merged public PR exists — a stalled prior run. Fall through to
+        // the remote-branch guard below, which refuses it (never silently 'done').
+    }
 
     // ORDER guard: this PR must be the NEXT unreplayed one, or base_int..head_int would
     // span an earlier pending PR and publish its work under THIS PR's title/body/
@@ -730,10 +745,13 @@ mod tests {
         assert_eq!(pr_merge_commit(&gh).as_deref(), Some("abc123"));
         assert_eq!(pr_head_ref(&gh).as_deref(), Some("pr-mirror/7"));
         assert_eq!(pr_number(&json!({"number": 12})), Some(12));
-        // gitlab MR merged
-        let gl = json!({"state": "merged", "sha": "def456", "source_branch": "pr-mirror/9", "iid": 9});
+        // gitlab MR merged: merge_commit_sha (NOT `sha`, which is the MR head diff sha)
+        let gl = json!({"state": "merged", "sha": "headdiff", "merge_commit_sha": "def456", "source_branch": "pr-mirror/9", "iid": 9});
         assert!(pr_is_merged(&gl));
         assert_eq!(pr_merge_commit(&gl).as_deref(), Some("def456"));
+        // gitlab squashed MR
+        let gls = json!({"state": "merged", "squash_commit_sha": "sq789", "source_branch": "pr-mirror/9"});
+        assert_eq!(pr_merge_commit(&gls).as_deref(), Some("sq789"));
         assert_eq!(pr_head_ref(&gl).as_deref(), Some("pr-mirror/9"));
         assert_eq!(pr_number(&gl), Some(9));
         // an open PR is not merged
