@@ -109,12 +109,18 @@ use super::transport::WorkerTransport;
 ///   previous instance (or, with no previous instance, removed entirely).
 /// - `RetiredPrevious` — the post-flip window passed; the previous instance
 ///   has been let go and the new instance is the sole route.
+/// - `Superseded` — the window PASSED, but by the time it resolved this
+///   rollout no longer owned the worker: a deregister removed it, or a newer
+///   rollout replaced it, mid-window. Nothing is mutated (whoever intervened
+///   already owns the state) and the caller must NOT record success/metadata
+///   for a registration that no longer stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RolloutState {
     Staging,
     Live,
     RolledBack,
     RetiredPrevious,
+    Superseded,
 }
 
 /// Number of consecutive post-flip health probes the new instance must ALL
@@ -177,14 +183,25 @@ pub async fn rollout_worker(routes: &RouteTable, worker_id: &str, new_routes: Ve
     let healthy = post_flip_window_passes(&new_routes).await;
 
     if healthy {
-        // Previous instance is simply dropped -- nothing left holding it, no
-        // route-table mutation needed (it is already gone from the table
-        // since the flip).
-        return RolloutOutcome {
-            worker_id: worker_id_owned,
-            state: RolloutState::RetiredPrevious,
-            active_route_count: new_routes.len(),
-        };
+        // The window passed -- but only declare success if this rollout STILL
+        // OWNS the worker (its flip generation is still the current one). A
+        // deregister or a superseding rollout during a HEALTHY window means
+        // the worker's routes are already gone/replaced; there is no route
+        // mutation to undo (the flip's previous instance was already dropped),
+        // but the caller must not record a successful registration (or upsert
+        // admin metadata) for state that no longer exists.
+        if routes.load().worker_generation(worker_id) == Some(flip_gen) {
+            // Previous instance is simply dropped -- nothing left holding it,
+            // no route-table mutation needed (it is already gone from the
+            // table since the flip).
+            return RolloutOutcome {
+                worker_id: worker_id_owned,
+                state: RolloutState::RetiredPrevious,
+                active_route_count: new_routes.len(),
+            };
+        }
+        let active_route_count = routes.load().all().filter(|r| r.worker_id == worker_id_owned).count();
+        return RolloutOutcome { worker_id: worker_id_owned, state: RolloutState::Superseded, active_route_count };
     }
 
     // Roll back -- atomically, and ONLY if this rollout still OWNS the worker
@@ -578,5 +595,88 @@ mod tests {
         let snap = routes.load();
         let out = dispatch_call(&snap, "tool_a", serde_json::json!({})).await.unwrap().unwrap();
         assert_eq!(out.text, "v2", "v1 must NOT be resurrected -- the table stays on v2");
+    }
+
+    // ── Cross-worker tool takeover prunes the overwritten worker's stale
+    //    generation, so its in-flight rollback can't resurrect its route ──
+
+    /// Worker X owns tool "t" (its own rollout in flight). Worker Y then
+    /// registers and OVERWRITES "t" (same tool name, different owner). X now
+    /// owns no route, so its `worker_gen` entry must be PRUNED — otherwise
+    /// X's later failed-window rollback would still match X's stale
+    /// generation and resurrect X's old route over Y's. With pruning, X's
+    /// restore is a clean no-op and Y's route survives.
+    #[tokio::test]
+    async fn cross_worker_tool_takeover_prunes_stale_generation_no_resurrect() {
+        use crate::broker::routes::dispatch_call;
+
+        let routes = RouteTable::new();
+
+        // X owns "t" via an old instance, then starts a rollout to a new
+        // instance (which will fail its window).
+        let x_old: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_healthy("x_old"));
+        routes.install(route("X", "t", &x_old));
+        let x_new: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_unhealthy("x_new"));
+        let (prev_x, gen_x) = routes.replace_worker_with_rollback("X", vec![route("X", "t", &x_new)]);
+        assert_eq!(prev_x.len(), 1, "X's previous instance is x_old");
+        assert_eq!(routes.load().worker_generation("X"), Some(gen_x));
+
+        // Worker Y registers and takes over the SAME tool name "t".
+        let y: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_healthy("y"));
+        routes.replace_worker_with_rollback("Y", vec![route("Y", "t", &y)]);
+
+        // X now owns nothing -- its stale generation must be gone.
+        assert_eq!(
+            routes.load().worker_generation("X"),
+            None,
+            "the overwritten worker's stale generation must be pruned on cross-worker takeover"
+        );
+
+        // X's rollout window fails; its rollback must be a clean NO-OP.
+        let x_restored = routes.restore_worker_if_unchanged("X", gen_x, prev_x);
+        assert!(!x_restored, "X's rollback must no-op after Y took over its only tool");
+
+        // Y's route survives; X's x_old is NOT resurrected.
+        let snap = routes.load();
+        let out = dispatch_call(&snap, "t", serde_json::json!({})).await.unwrap().unwrap();
+        assert_eq!(out.text, "y", "Y's route must survive; the overwritten worker's route must not resurrect");
+        assert!(snap.worker_generation("Y").is_some(), "Y owns the tool now");
+        assert!(snap.worker_generation("X").is_none());
+    }
+
+    // ── A deregister during a HEALTHY window is Superseded, not a stale
+    //    success (no metadata should be recorded for it) ─────────────────
+
+    /// The new instance passes its post-flip window, but the worker is
+    /// deregistered WHILE the window runs. `rollout_worker` must report
+    /// `Superseded` (not `RetiredPrevious`) so the caller records no route
+    /// and no stale admin metadata for a registration that no longer stands.
+    #[tokio::test]
+    async fn deregister_during_healthy_window_is_superseded_not_a_stale_success() {
+        let routes = Arc::new(RouteTable::new());
+
+        // First-ever registration of a HEALTHY new instance.
+        let new: Arc<dyn WorkerTransport> = Arc::new(FlakyTransport::always_healthy("new"));
+        let new_routes = vec![route("w1", "tool_a", &new)];
+
+        let routes_for_rollout = routes.clone();
+        let task = tokio::spawn(async move { rollout_worker(&routes_for_rollout, "w1", new_routes).await });
+
+        // Deregister the worker while its (healthy) post-flip window runs.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        routes.remove_worker("w1");
+
+        let outcome = task.await.unwrap();
+        assert_eq!(
+            outcome.state,
+            RolloutState::Superseded,
+            "a deregister during a healthy window must yield Superseded, not RetiredPrevious"
+        );
+        assert_eq!(outcome.active_route_count, 0, "the deregistered worker has no live routes");
+
+        // The deregistration stands -- no route was resurrected.
+        let snap = routes.load();
+        assert!(snap.get("tool_a").is_none());
+        assert!(snap.worker_generation("w1").is_none());
     }
 }

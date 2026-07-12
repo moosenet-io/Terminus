@@ -192,6 +192,12 @@ impl RouteTable {
             let g = current.next_gen;
             let mut worker_gen = current.worker_gen.clone();
             worker_gen.insert(route.worker_id.clone(), g);
+            // Prune (TMOD-06): if this insert OVERWROTE the only route of a
+            // DIFFERENT worker (same tool name, different owner), that worker
+            // now owns nothing -- drop its stale generation so an in-flight
+            // rollout of it can't later false-match and resurrect its route
+            // over this one.
+            let worker_gen = prune_worker_gen(&worker_gen, &routes);
             RouteTableSnapshot { routes, worker_gen, next_gen: g + 1 }
         });
     }
@@ -217,6 +223,9 @@ impl RouteTable {
             for route in &new_routes {
                 worker_gen.insert(route.worker_id.clone(), g);
             }
+            // Prune any worker whose last route was just overwritten by one
+            // of these inserts (TMOD-06 -- cross-worker tool takeover).
+            let worker_gen = prune_worker_gen(&worker_gen, &routes);
             RouteTableSnapshot { routes, worker_gen, next_gen: g + 1 }
         });
     }
@@ -293,16 +302,21 @@ impl RouteTable {
                 routes.insert(route.tool.name.clone(), route.clone());
             }
             // A replace is a flip: stamp a fresh generation for this worker
-            // (TMOD-06), or drop its entry if the new set is empty.
+            // (TMOD-06), or drop its entry if the new set is empty. Then
+            // prune any OTHER worker whose last route these inserts just
+            // overwrote (cross-worker tool takeover), so no stale generation
+            // survives for a worker that now owns nothing.
             let mut worker_gen = current.worker_gen.clone();
-            if new_routes.is_empty() {
+            let next_gen = if new_routes.is_empty() {
                 worker_gen.remove(worker_id);
-                RouteTableSnapshot { routes, worker_gen, next_gen: current.next_gen }
+                current.next_gen
             } else {
                 let g = current.next_gen;
                 worker_gen.insert(worker_id.to_string(), g);
-                RouteTableSnapshot { routes, worker_gen, next_gen: g + 1 }
-            }
+                g + 1
+            };
+            let worker_gen = prune_worker_gen(&worker_gen, &routes);
+            RouteTableSnapshot { routes, worker_gen, next_gen }
         });
     }
 
@@ -353,6 +367,11 @@ impl RouteTable {
             assigned_gen = g;
             let mut worker_gen = current.worker_gen.clone();
             worker_gen.insert(worker_id.to_string(), g);
+            // Prune any OTHER worker whose last route this flip just
+            // overwrote (TMOD-06 -- cross-worker tool takeover): its stale
+            // generation must not survive for an in-flight rollout to
+            // false-match at rollback time.
+            let worker_gen = prune_worker_gen(&worker_gen, &routes);
             RouteTableSnapshot { routes, worker_gen, next_gen: g + 1 }
         });
         (displaced, assigned_gen)
@@ -405,17 +424,22 @@ impl RouteTable {
                     routes.insert(route.tool.name.clone(), route.clone());
                 }
                 let mut worker_gen = current.worker_gen.clone();
-                if restore_routes.is_empty() {
+                let next_gen = if restore_routes.is_empty() {
                     // Nothing to roll back to (a first-ever registration that
                     // failed its window): remove the worker entirely, dropping
                     // its generation so nothing can match it again.
                     worker_gen.remove(worker_id);
-                    RouteTableSnapshot { routes, worker_gen, next_gen: current.next_gen }
+                    current.next_gen
                 } else {
                     let g = current.next_gen;
                     worker_gen.insert(worker_id.to_string(), g);
-                    RouteTableSnapshot { routes, worker_gen, next_gen: g + 1 }
-                }
+                    g + 1
+                };
+                // Prune any OTHER worker whose last route this restore just
+                // overwrote (TMOD-06 -- restoring a previous instance's tool
+                // name that a different worker had since taken over).
+                let worker_gen = prune_worker_gen(&worker_gen, &routes);
+                RouteTableSnapshot { routes, worker_gen, next_gen }
             } else {
                 restored = false;
                 // No-op: hand back an equivalent snapshot unchanged. The

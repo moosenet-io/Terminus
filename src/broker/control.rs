@@ -308,6 +308,13 @@ enum AdminError {
     /// instance, not a worker outage.
     #[error("worker '{0}' failed its post-flip health window and was rolled back to its previous instance")]
     RolledBack(String),
+    /// TMOD-06: the new instance passed its post-flip window, but a
+    /// deregister or a newer registration for the same worker landed
+    /// mid-window, so this registration no longer owns the worker. No route
+    /// or metadata is recorded for it — reported as a conflict so the caller
+    /// knows its registration was superseded, not silently dropped.
+    #[error("worker '{0}' was deregistered or superseded by a newer registration during its rollout")]
+    Superseded(String),
 }
 
 impl AdminError {
@@ -320,6 +327,7 @@ impl AdminError {
             | AdminError::EmptyCatalog(_)
             | AdminError::RolledBack(_) => StatusCode::BAD_GATEWAY,
             AdminError::UnknownWorker(_) => StatusCode::NOT_FOUND,
+            AdminError::Superseded(_) => StatusCode::CONFLICT,
         }
     }
 
@@ -340,6 +348,7 @@ impl AdminError {
             AdminError::EmptyCatalog(_) => "empty_catalog",
             AdminError::UnknownWorker(_) => "unknown_worker",
             AdminError::RolledBack(_) => "rolled_back",
+            AdminError::Superseded(_) => "superseded",
         }
     }
 }
@@ -628,13 +637,25 @@ async fn register_verified_transport(
         .collect();
 
     let outcome = crate::broker::rollout::rollout_worker(&admin.mcp.broker_routes, &worker_id, routes).await;
-    if outcome.state == crate::broker::rollout::RolloutState::RolledBack {
-        return Err(AdminError::RolledBack(worker_id));
+    match outcome.state {
+        crate::broker::rollout::RolloutState::RetiredPrevious => {}
+        crate::broker::rollout::RolloutState::RolledBack => {
+            return Err(AdminError::RolledBack(worker_id));
+        }
+        // The window passed but a deregister/supersede intervened mid-window,
+        // so this rollout no longer owns the worker. Do NOT upsert stale admin
+        // metadata for a registration that no longer stands -- report the
+        // clean superseded outcome instead. (`Staging`/`Live` are never
+        // returned by `rollout_worker`; treat any such value defensively as a
+        // non-owning outcome rather than recording success.)
+        _ => {
+            return Err(AdminError::Superseded(worker_id));
+        }
     }
 
     // 5. Record admin-only bookkeeping (tier/capability_class/registered_at)
     //    in lock-step -- read by `handle_list`/`handle_health`, never by
-    //    dispatch.
+    //    dispatch. Only reached when this rollout still OWNS the worker.
     upsert_meta(
         &admin.meta,
         &worker_id,
