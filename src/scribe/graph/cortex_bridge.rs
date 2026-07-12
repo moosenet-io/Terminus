@@ -3,10 +3,11 @@
 //! A small, dependency-light helper that turns a KG scope (`scope_kind`,
 //! `scope_ref` — see `findings_store::ScopeKind`) into a best-effort Cortex
 //! risk score, so KGRULE-02's rule crystallization can prioritize high-risk
-//! recurring findings. This module does NOT talk SSH itself — it reuses the
-//! existing `crate::cortex` tool implementation (config, shell-quoting,
-//! degrade behavior, everything) verbatim, exactly as `crate::cortex`
-//! reuses `crucible`/`sentinel`'s SSH-exec mechanics.
+//! recurring findings. As of CXEG-01 `crate::cortex` is Atlas-backed and no
+//! longer an SSH relay: it holds no SSH transport, no shell-quoting, and no
+//! remote fleet-host script. This bridge calls the in-process `cortex_review`
+//! tool (currently a stub pending its Atlas-backed rebuild in CXEG-04) and
+//! degrades cleanly to `None` until that rebuild lands a `risk_score` field.
 //!
 //! ## Degrade contract (read before calling this from new code)
 //!
