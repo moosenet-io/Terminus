@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 /// best-effort from an optional `FINDINGS_JSON:` block in the provider's raw
 /// reply (see `prompt::parse_findings`); absence never affects verdict
 /// parsing or aggregation.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Finding {
     pub category: String,
     pub severity: String,
