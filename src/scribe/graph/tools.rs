@@ -588,12 +588,18 @@ fn clamp_limit(limit: i64) -> i64 {
 fn map_topk_to_results(hits: &[(String, f32)], g: &KnowledgeGraph) -> Vec<Value> {
     hits.iter()
         .filter_map(|(node_id, score)| {
-            g.get_node(node_id).map(|n| {
-                json!({
-                    "id": n.id, "name": n.name, "kind": n.kind.as_str(),
-                    "path": n.path, "score": score, "cluster": n.cluster,
+            // Only surface CURRENTLY-VALID nodes. `get_node` also returns
+            // bi-temporally invalidated nodes (a removed/renamed symbol kept in
+            // the graph with `valid_to` set) — a stale vector row must not
+            // resurrect a deleted symbol, so drop anything not current.
+            g.get_node(node_id)
+                .filter(|n| n.valid_to.is_none())
+                .map(|n| {
+                    json!({
+                        "id": n.id, "name": n.name, "kind": n.kind.as_str(),
+                        "path": n.path, "score": score, "cluster": n.cluster,
+                    })
                 })
-            })
         })
         .collect()
 }
@@ -971,6 +977,22 @@ pub struct Widget;
         assert_eq!(results[0]["id"], "crate::a::foo");
         assert_eq!(results[0]["score"], 0.9_f32);
         assert_eq!(results[1]["id"], "crate::b::bar");
+    }
+
+    #[test]
+    fn map_topk_drops_bitemporally_invalidated_nodes() {
+        // A vector row can outlive the symbol it points at: the node is still in
+        // the graph but bi-temporally invalidated (valid_to set). It must NOT be
+        // returned — a deleted symbol resurrected by a stale embedding.
+        let mut g = semantic_test_graph();
+        g.invalidate_path("src/b.rs", 100); // `bar` removed at build-seq 100
+        let hits = vec![
+            ("crate::a::foo".to_string(), 0.9_f32),
+            ("crate::b::bar".to_string(), 0.8_f32), // stale vector row
+        ];
+        let results = map_topk_to_results(&hits, &g);
+        assert_eq!(results.len(), 1, "invalidated node must be dropped");
+        assert_eq!(results[0]["id"], "crate::a::foo");
     }
 
     #[test]
