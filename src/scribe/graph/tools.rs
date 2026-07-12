@@ -647,12 +647,12 @@ or unreachable, so callers should fall back to the lexical `kg_search` in that c
         let qvec = match client.embed(&query).await {
             Ok(v) => v,
             Err(e) => {
-                // Any unusable component (embeddings endpoint down, or the
-                // vector query failing) means semantic search cannot produce
-                // results — report configured:false so the caller falls back to
-                // lexical kg_search, the SAME single signal as an unset store.
+                // Store IS configured; only the embedding STEP failed (endpoint
+                // transiently down). Per the KGEMB-04 edge-case contract this is
+                // `configured:true, found:false, error` — semantic search is set
+                // up but momentarily unusable — distinct from an unset store.
                 return structured(json!({
-                    "configured": false, "found": false, "project_id": project_id, "results": [],
+                    "configured": true, "found": false, "project_id": project_id, "results": [],
                     "error": e.to_string(),
                 }));
             }
@@ -661,10 +661,9 @@ or unreachable, so callers should fall back to the lexical `kg_search` in that c
         let hits = match store.query_topk(&project_id, &qvec, limit).await {
             Ok(h) => h,
             Err(e) => {
-                // Any unusable component (embeddings endpoint down, or the
-                // vector query failing) means semantic search cannot produce
-                // results — report configured:false so the caller falls back to
-                // lexical kg_search, the SAME single signal as an unset store.
+                // A vector-query failure means the STORE itself is unusable — the
+                // store gates "configured", so this is configured:false (fall
+                // back to lexical), the same signal as an unset/unreachable store.
                 return structured(json!({
                     "configured": false, "found": false, "project_id": project_id, "results": [],
                     "error": e.to_string(),
