@@ -1,14 +1,17 @@
 [← docs index](../../README.md)
 
-# Cortex — Atlas-backed code-intelligence gate (CXEG-01/02)
+# Cortex — Atlas-backed code-intelligence gate (CXEG-01/02/06)
 
-Cortex is a 10-tool-name module (`src/cortex/mod.rs`, `src/cortex/scope.rs`,
-`src/cortex/deprecated.rs`, `src/cortex/audit.rs`), but as of **CXEG-01** only
-3 of those names are "real" tools — the rest are structured deprecation
-aliases. As of **CXEG-02**, `cortex_scope` is the first of those 3 to be a
-fully live, Atlas-backed implementation rather than a pending-pointer stub.
-This page describes the current shape; see the "History" section at the
-bottom for what changed and why.
+Cortex is an 11-tool-name module (`src/cortex/mod.rs`, `src/cortex/scope.rs`,
+`src/cortex/house_style.rs`, `src/cortex/deprecated.rs`, `src/cortex/audit.rs`),
+but as of **CXEG-01** only 3 of those names were "real" tools — the rest are
+structured deprecation aliases. As of **CXEG-02**, `cortex_scope` is the first
+of those 3 to be a fully live, Atlas-backed implementation rather than a
+pending-pointer stub. As of **CXEG-06**, a NEW 4th real tool,
+`cortex_house_style`, is added (an intentional, additive MCP-listing change —
+the module's registered tool-name count goes from 10 to 11). This page
+describes the current shape; see the "History" section at the bottom for what
+changed and why.
 
 ## The single most important fact about this module: **the SSH-relay era is retired**
 
@@ -26,6 +29,7 @@ no remote script, no "relay whatever the other end says" response shape.
 | Tool | Status | What it does |
 | --- | --- | --- |
 | `cortex_scope` | **live (CXEG-02)** | Resolves `project_id` + `changed_files`/`diff` against the project's Atlas graph and returns the blast radius: touched symbols, their 1-hop callers/callees, affected communities, `blast_count`, `token_reduction_pct`. Degrades to `configured:false` (no error) when the project has no stored graph. |
+| `cortex_house_style` | **live (CXEG-06)** | Resolves `project_id` (+ optional `community`) against the project's Atlas graph and returns, per Leiden community, deterministic modal `facts` plus per-kind `exemplars_by_kind` node refs. Degrades to `configured:false` (no error) when the project has no stored graph; degrades to `profile:"unstable"`/`sparse:true`/`degraded:true` per-community/per-bucket rather than misrepresenting a thin sample. |
 | `cortex_review` | **pending rebuild (CXEG-04)** | Validates `project_id`/`changed_files`, returns `{"status":"pending","item":"CXEG-04",...}`. No risk scoring happens yet. |
 | `cortex_audit` | **pending rebuild (CXEG-11)** | Runs its existing SSRF-hardened `url` validation (unchanged, see below), then returns `{"status":"pending","item":"CXEG-11",...}`. No clone/graph-build happens yet. |
 | `cortex_stats` | **deprecated alias** | Returns `{"deprecated":true,"use":"kg_stats",...}`. Call `kg_stats` instead. |
@@ -36,10 +40,11 @@ no remote script, no "relay whatever the other end says" response shape.
 | `cortex_architecture` | **deprecated alias** | Returns `{"deprecated":true,"use":"kg_communities",...}`. Call `kg_communities` instead. |
 | `cortex_flows` | **deprecated alias** | Returns `{"deprecated":true,"use":"kg_path",...}`. Call `kg_path` instead. |
 
-All 10 tool NAMES stay registered (no MCP-listing churn for a caller that
-enumerates tools), but 7 of them do **zero I/O** — no network, no SSH, no
-filesystem, no database — they only build and return a small JSON pointer
-object (`src/cortex/deprecated.rs`).
+The original 10 tool NAMES from before CXEG-01 all stay registered (no
+MCP-listing churn for a caller that enumerates tools), and CXEG-06 adds one
+NEW name (`cortex_house_style`) on top — 11 total. 7 of the original 10 do
+**zero I/O** — no network, no SSH, no filesystem, no database — they only
+build and return a small JSON pointer object (`src/cortex/deprecated.rs`).
 
 ## `project_id`, not `repo`
 
@@ -200,6 +205,124 @@ also NOT an error (see step 3 above) — that is the one deliberate exception to
 "validate first, then act" in this tool, since blast-radius unavailability is a
 data-availability fact, not a caller mistake.
 
+## `cortex_house_style` — live, Atlas-derived house-style exemplars (`src/cortex/house_style.rs`, CXEG-06)
+
+"How does THIS codebase do X" instead of generic opinion, for a future Tier-C
+reviewer (CXEG-07) — derives, per project and per **Leiden community**
+(KGRAPH-05, i.e. one of the graph's `cluster` ids, never the whole project),
+the community's MODAL patterns plus a few representative EXEMPLARS.
+House-style is deliberately **community-scoped**: a `pg/` subsystem and a
+`cortex/` subsystem can legitimately favor different idioms, so this tool
+never computes a single project-wide style.
+
+**Input schema**: `project_id` (enum, required, one of `PROJECT_IDS`),
+`community` (integer, optional — when omitted, up to 25 communities are
+returned, ascending cluster-id order; `MAX_HOUSE_STYLE_COMMUNITIES` in
+`src/cortex/mod.rs`). A non-integer `community` is `InvalidArgument`.
+
+**No source-text inspection, no LLM**: every [`ModalFacts`] signal is derived
+purely from `KgNode` METADATA already in the graph (`kind`, `name`, `path`) —
+matching every other Atlas-consuming module in this crate (`cortex::scope`,
+`cortex::metrics`, `review::kg_context`), none of which re-reads source off
+disk:
+- `dominant_kind` — the community's most common `NodeKind` (ties broken
+  toward the declaration-order-earlier kind, deterministic).
+- `dominant_error_type` — a struct/enum member whose name contains `"Error"`
+  (lowest node id wins a tie), or `None`.
+- `config_read_idiom` — `"from_env"` when the community has a function member
+  named exactly `from_env` (this crate's own config-constructor convention —
+  see `CortexConfig::from_env`, `EmbedClient::from_env`,
+  `AtlasVecStore::from_env`), else `"none_detected"`.
+- `rust_tool_shape_present` — `true` when some single file among the
+  community's members defines all 4 `RustTool` method names
+  (`name`/`description`/`parameters`/`execute`).
+
+**Exemplar selection**: for each `(community, kind)` bucket, every member's
+`node_card` (`crate::scribe::graph::vec_embed::node_card` — the SAME text
+builder `metrics`'s semantic-duplication detector and `scribe_kg_build`'s
+embedding pipeline use, built from the member's current 1-hop callers/callees
+via the shared `one_hop_neighbors` walk) is embedded (`EmbedClient`), the
+batch is averaged into a centroid vector, and members are ranked by cosine
+similarity to that centroid (ties: `rank` desc, then `id` asc) — nearest to
+the bucket's own MODAL shape, not an arbitrary/extreme example. The top `K`
+(`CortexConfig::house_style_exemplars_k`, see "Configuration" below) become
+that kind's `exemplars_by_kind` entries.
+
+**Degrade contract — no silent misrepresentation**:
+- A community with fewer than `house_style::MIN_COMMUNITY_SIZE` (2) CURRENT
+  members is too small a sample to trust at all: `"profile": "unstable"`, no
+  exemplars, `facts` is the all-`None`/`"none_detected"`/`false` default.
+- A `(community, kind)` bucket with fewer than `house_style::MIN_BUCKET_SIZE`
+  (3) members still returns what exists, but the profile is flagged
+  `"sparse": true`.
+- When the embeddings endpoint/vector batch call fails or is unusable for a
+  bucket, that bucket's selection falls back to centrality-only ranking
+  (`rank` desc, then `degree` desc, then `id` asc) and the profile is flagged
+  `"degraded": true` — every OTHER bucket in the same profile is unaffected.
+- Every distribution is filtered to CURRENT nodes only
+  (`graph.current_nodes()`, KGRAPH-15 bi-temporal view) — an invalidated
+  symbol never appears as an exemplar or skews a modal fact.
+- A missing/unloadable Atlas graph degrades to `"configured": false` (never
+  an error), same posture as `cortex_scope`.
+
+**Caching**: profiles are memoized in-process per `(project_id, community)`
+(`house_style::HouseStyleCache`, one shared `Arc` built once in `register()`),
+keyed additionally by the graph's `build_seq` — KGRAPH-15's monotonic
+per-project refresh counter, the closest thing the model exposes to a build
+"generation." A cache hit requires the stored generation to match the
+CURRENT graph's `build_seq`; any other generation recomputes and overwrites
+the entry, so a `scribe_kg_build` rebuild transparently invalidates every
+profile computed against the prior graph — no explicit eviction pass needed.
+
+**Response shape** (live graph):
+
+```json
+{
+  "configured": true,
+  "project_id": "TERM",
+  "generation": 3,
+  "profiles": [
+    {
+      "project_id": "TERM",
+      "community": 1,
+      "generation": 3,
+      "member_count": 8,
+      "profile": "ready",
+      "sparse": true,
+      "degraded": false,
+      "facts": {
+        "dominant_kind": "function",
+        "dominant_error_type": "PgError",
+        "config_read_idiom": "from_env",
+        "rust_tool_shape_present": true
+      },
+      "exemplars_by_kind": {
+        "function": [
+          { "node_id": "crate::pg::Config::from_env", "kind": "function", "path": "src/pg/config.rs", "span": [10, 22], "rank": 0.42, "score": 0.9123 }
+        ],
+        "enum": [
+          { "node_id": "crate::pg::PgError", "kind": "enum", "path": "src/pg/error.rs", "span": [1, 15], "rank": 0.31, "score": 0.31 }
+        ]
+      }
+    }
+  ]
+}
+```
+
+**Response shape** (no stored graph — degrade):
+
+```json
+{
+  "configured": false,
+  "project_id": "TERM",
+  "message": "no stored Atlas graph for this project yet -- run scribe_kg_build first"
+}
+```
+
+**Error/edge cases**: `InvalidArgument` for an unknown `project_id` or a
+non-integer `community`. A missing/unloadable Atlas graph is NOT an error
+(see the degrade contract above).
+
 ## Tier-B structural-elegance signals (`src/cortex/metrics.rs`, CXEG-03)
 
 `metrics::compute_signals` is a standalone, PURE (no LLM) scoring library
@@ -329,7 +452,7 @@ gets even a pending-pointer response, only a rejection.
 ## Configuration
 
 `CortexConfig::from_env()` (`src/cortex/mod.rs`) builds one shared
-`Arc<CortexConfig>` for all 3 real tools. No SSH/remote-script fields remain.
+`Arc<CortexConfig>` for all 4 real tools. No SSH/remote-script fields remain.
 
 | Env var | Type | Default | Notes |
 | --- | --- | --- | --- |
@@ -340,7 +463,9 @@ gets even a pending-pointer response, only a rejection.
 | `CORTEX_DUP_COSINE_THRESHOLD` | f64 | `0.85` | Cosine-similarity threshold for a not-yet-built dup-detection pass; echoed in `cortex_audit`'s response. |
 | `CORTEX_MAX_BLAST_NODES` | usize | `200` | `cortex_scope`'s (CXEG-02) cap on the number of nodes enumerated into `blast_radius` before it sets `truncated:true` and stops walking. A zero/unparseable value falls back to the default rather than dropping every node. |
 | `CORTEX_TIER_B_PERCENTILE` | f64 | `90.0` | `metrics::compute_signals`'s (CXEG-03) percentile cut-point (0-100) for `centrality_spike`/`complexity_spike`/`fan_out_explosion`, computed against the project's own current-node distribution — self-calibrating, never a hardcoded absolute. |
+| `CORTEX_HOUSE_STYLE_K` | usize | `3` (`house_style::DEFAULT_EXEMPLARS_K`) | `cortex_house_style`'s (CXEG-06) `K` — exemplars selected per `(community, kind)` bucket. A zero/unparseable value falls back to the default (same "never silently drop everything" reasoning as `CORTEX_MAX_BLAST_NODES`). |
 | `ATLAS_DATABASE_URL` | secret-shaped | none | Read exclusively through `crate::config::atlas_database_url()` — this crate has no separate `SecretManager`/`vault::manager()` API of its own; the runtime secret store is materialized into the process environment at deploy time (same convention as `crate::pki` and `scribe::graph::vec_embed`). `None` means the Atlas KG store is not configured (`cortex_scope` still degrades cleanly in this case, via `GraphStore`/`ScribeConfig`'s own `SCRIBE_KG_STORE_DIR`, which is independent of the Postgres DSN). |
+| `EMBEDDINGS_URL` / `EMBEDDINGS_MODEL` / `EMBEDDINGS_TIMEOUT_MS` / `EMBEDDINGS_API_KEY` | see `crate::config` / `scribe::graph::vec_embed` | see `crate::config` | Not read by this module directly — `cortex_house_style`'s exemplar selection goes through the SAME `EmbedClient::from_env()` `metrics`'s semantic-duplication detector and `scribe_kg_build` already use. An unreachable/misconfigured endpoint degrades that bucket to centrality-only ranking (`degraded:true`), never an error. |
 
 Boolean flags accept `"1"`/`"true"`/`"yes"` (case-insensitive) as truthy;
 anything else (including unset) falls back to the default.
@@ -377,9 +502,12 @@ arguments — the pointer is returned unconditionally.
 
 ## Registration
 
-`register()` (`src/cortex/mod.rs`) builds one shared `Arc<CortexConfig>`,
-registers the 3 real tools against it (`cortex_scope` live as of CXEG-02;
-`cortex_review`/`cortex_audit` still pending), then delegates to
+`register()` (`src/cortex/mod.rs`) builds one shared `Arc<CortexConfig>` and
+one shared `Arc<house_style::HouseStyleCache>` (CXEG-06 — a single cache
+instance across every `cortex_house_style` call, so its per-generation
+memoization actually accumulates hits rather than starting empty each call),
+registers the 4 real tools against them (`cortex_scope`/`cortex_house_style`
+live; `cortex_review`/`cortex_audit` still pending), then delegates to
 `crate::cortex::deprecated::register()` for the 7 aliases. Cortex is wired
 into **both** top-level registries in `src/registry.rs`: `register_all` (the
 core registry, served by `terminus-primary`/Chord) and `register_personal`
@@ -410,8 +538,30 @@ than erroring, while a single over-`MAX_TEXT_LEN` element, an over-
 are each rejected; "neither changed_files nor diff" rejection; array-form and
 diff-only-form acceptance; and a `configured:false` degrade smoke test against
 an empty store dir),
-`cortex_audit`'s unchanged SSRF-guard rejections, and full registration
-(`register()` yields exactly 10 tool names, all `cortex_*`).
+`cortex_audit`'s unchanged SSRF-guard rejections, `cortex_house_style`'s
+argument validation (unknown `project_id`, non-integer `community`) and a
+`configured:false` degrade smoke test against an empty store dir, and full
+registration (`register()` yields exactly 11 tool names, all `cortex_*`).
+`src/cortex/house_style.rs`'s own test module covers the deeper behavior
+against a two-community fixture graph (one community with a `PgError` enum, a
+`from_env` function, and a full `RustTool`-shape file; one plain community
+with neither): `modal_facts` detects the error type/`from_env`
+idiom/`RustTool` shape for the first community and their absence for the
+second (proving house-style is community-scoped, not global); dominant-kind
+tie-breaking is deterministic; `select_exemplars` falls back to
+centrality-only ranking (`degraded:true`) when the embeddings endpoint is
+forced unreachable (`EMBEDDINGS_URL` pointed at a refused port —
+`#[serial_test::serial]`, since a real Chord embeddings proxy IS reachable on
+the <host> build host this suite runs on, and a unit test must never silently
+round-trip to it) and respects the `K` cap; `compute_profile` returns
+`profile:"unstable"` below `MIN_COMMUNITY_SIZE` (and doesn't panic on a
+wholly-empty community), flags `sparse:true` for a thin bucket, filters
+bi-temporally invalidated nodes out of both facts and exemplars, and is
+deterministic; `HouseStyleCache` returns a STALE (proven via mutating the
+underlying graph's content between two same-generation calls and asserting
+the second call returns the FIRST result verbatim) cached profile when the
+generation is unchanged, recomputes when `build_seq` bumps, and keys
+independently per `(project_id, community)`.
 `src/cortex/scope.rs`'s test module covers the full blast-radius derivation
 against a small fixture graph (2 files, a `calls` edge and a `references`
 edge, 2 distinct clusters): `changed_files_from_args`'s array/CSV/diff
@@ -461,7 +611,15 @@ stub with the real Atlas-backed blast-radius implementation described above
 (`src/cortex/scope.rs`), reusing `review::kg_context::derive_changed_files`
 and the same `GraphStore`/`KnowledgeGraph` query API `kg_neighbors`/
 `build_kg_block` already use rather than standing up a second graph-walk.
-`cortex_review`/`cortex_audit` remain pending CXEG-04/CXEG-11.
+`cortex_review`/`cortex_audit` remain pending CXEG-04/CXEG-11. **CXEG-06**
+added the module's first entirely NEW tool name since CXEG-01,
+`cortex_house_style` (`src/cortex/house_style.rs`) — house-style exemplar
+extraction from Atlas, scoped per Leiden community, built for a future Tier-C
+reviewer (CXEG-07) to cite concrete in-repo precedent rather than generic
+opinion. It reuses the same `vec_embed::node_card`/`EmbedClient` card+embed
+path `metrics` (CXEG-03) and `scribe_kg_build` already use, adds a small
+in-process generation-keyed cache (`house_style::HouseStyleCache`), and takes
+the module's registered tool-name count from 10 to 11.
 
 ---
 

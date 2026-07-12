@@ -547,6 +547,7 @@ mod tests {
             atlas_database_url: None,
             max_blast_nodes: crate::cortex::scope::DEFAULT_MAX_BLAST_NODES,
             tier_b_percentile: 90.0,
+            house_style_exemplars_k: crate::cortex::house_style::DEFAULT_EXEMPLARS_K,
         }
     }
 
