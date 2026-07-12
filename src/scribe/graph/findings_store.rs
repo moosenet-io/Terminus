@@ -254,22 +254,24 @@ impl FindingsStore {
                     .filter_map(|(id, v)| v.map(|v| (id, v.to_vec())))
                     .collect();
 
-                dedup_decision(candidate, &existing, threshold)
+                // Primary: embedding-similarity match among rows that HAVE a
+                // stored embedding (SELECT_BUCKET_SQL filters `embedding IS NOT
+                // NULL`). EMBED-02 fallback: if none matched, still fall back to
+                // an exact-description match — `SELECT_BUCKET_SQL` deliberately
+                // skips NULL-embedding rows, so after the 768->1024 migration
+                // reset existing `kg_findings.embedding` to NULL, a repeated
+                // exact finding would otherwise DUPLICATE against the migrated
+                // (NULL-embedding) row until it's re-embedded. This makes the
+                // healthy `Some(embedding)` path dedup exact recurrences even
+                // when the stored row's embedding is NULL (or when embedding
+                // generation is transiently unavailable), matching the
+                // exact-text path the `None` branch already uses.
+                match dedup_decision(candidate, &existing, threshold) {
+                    Some(id) => Some(id),
+                    None => exact_description_match(&mut tx, &f).await?,
+                }
             }
-            None => {
-                let row: Option<(Uuid,)> = sqlx::query_as(SELECT_EXACT_SQL)
-                    .bind(&f.project_id)
-                    .bind(f.scope_kind.as_str())
-                    .bind(&f.scope_ref)
-                    .bind(&f.category)
-                    .bind(&f.description)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| {
-                        ToolError::Database(format!("atlas findings store select exact: {e}"))
-                    })?;
-                row.map(|(id,)| id)
-            }
+            None => exact_description_match(&mut tx, &f).await?,
         };
 
         let outcome = if let Some(id) = matched_id {
@@ -378,6 +380,30 @@ impl FindingsStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| ToolError::Database(format!("atlas findings store list decode: {e}")))
     }
+}
+
+/// Exact-description dedup lookup within a bucket: the id of an existing
+/// `kg_findings` row with the same `(project_id, scope_kind, scope_ref,
+/// category, description)`, if any. Shared by both `record` paths — the
+/// `None`-embedding branch (its only dedup signal) and, since EMBED-02, the
+/// `Some(embedding)` branch's fallback when no embedding-similarity match is
+/// found (so exact recurrences still dedup against NULL-embedding rows left
+/// by the 768->1024 migration). Runs inside the caller's transaction so it
+/// shares the bucket advisory lock.
+async fn exact_description_match(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    f: &NewFinding,
+) -> Result<Option<Uuid>, ToolError> {
+    let row: Option<(Uuid,)> = sqlx::query_as(SELECT_EXACT_SQL)
+        .bind(&f.project_id)
+        .bind(f.scope_kind.as_str())
+        .bind(&f.scope_ref)
+        .bind(&f.category)
+        .bind(&f.description)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| ToolError::Database(format!("atlas findings store select exact: {e}")))?;
+    Ok(row.map(|(id,)| id))
 }
 
 /// Merge a new provenance entry into an existing jsonb array, keeping only
@@ -725,5 +751,65 @@ mod tests {
 
         let result = FindingsStore::from_env().await;
         assert!(matches!(result, Err(ToolError::NotConfigured(_))));
+    }
+
+    /// EMBED-02 regression: after the 768->1024 migration resets existing
+    /// `kg_findings.embedding` to NULL, a repeated exact finding recorded on
+    /// the healthy `Some(embedding)` path must still dedup against the
+    /// migrated NULL-embedding row (via the exact-description fallback), not
+    /// insert a duplicate. Requires a live Atlas DB; skips cleanly when
+    /// `ATLAS_DATABASE_URL` is unset, mirroring the DSN-gating convention the
+    /// other DB-touching tests here use.
+    #[tokio::test]
+    #[serial]
+    async fn record_with_embedding_dedups_against_null_embedding_row() {
+        if std::env::var("ATLAS_DATABASE_URL").is_err() {
+            return; // no DB available — integration assertion skipped
+        }
+
+        let store = FindingsStore::from_env().await.expect("store from_env");
+        // Unique bucket per run so parallel/repeat runs never interfere.
+        let project_id = format!("EMBED02-TEST-{}", Uuid::new_v4());
+
+        let mk = || NewFinding {
+            project_id: project_id.clone(),
+            category: "lint".into(),
+            severity: "low".into(),
+            scope_kind: ScopeKind::Path,
+            scope_ref: "src/lib.rs".into(),
+            description: "unused import: std::io".into(),
+            provenance: serde_json::json!({ "run": "embed02-test" }),
+        };
+
+        // Simulate the migrated state: an existing row whose embedding is NULL
+        // (recording without an embedding leaves the column NULL, exactly as
+        // the migration's DROP/re-add of the embedding column does).
+        let created_id = match store.record(mk(), None).await.expect("first record") {
+            RecordOutcome::Created(id) => id,
+            other => panic!("expected Created on first record, got {other:?}"),
+        };
+
+        // Healthy path: same finding WITH an embedding. The NULL-embedding row
+        // is invisible to the similarity search (SELECT_BUCKET_SQL filters
+        // `embedding IS NOT NULL`), so this must dedup via the exact-description
+        // fallback — bumping the existing row rather than inserting a duplicate.
+        match store
+            .record(mk(), Some(vec![0.1_f32; FINDINGS_EMBED_DIM]))
+            .await
+            .expect("second record")
+        {
+            RecordOutcome::Recurred { id, occurrences } => {
+                assert_eq!(id, created_id, "must bump the existing NULL-embedding row");
+                assert_eq!(occurrences, 2, "occurrences bumped, not a new row");
+            }
+            other => panic!("expected Recurred (exact-fallback dedup), got {other:?}"),
+        }
+
+        // And exactly one row exists for the bucket — no duplicate inserted.
+        let rows = store
+            .list(&project_id, None, None, None)
+            .await
+            .expect("list");
+        assert_eq!(rows.len(), 1, "exactly one finding row — no duplicate");
     }
 }
