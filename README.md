@@ -712,10 +712,44 @@ door for all agent/client/tool Postgres access — no more direct SSH+`psql`.
 This is the same S9 single-door posture Terminus already applies to
 GitHub/Gitea/Plane, applied to Postgres.
 
-**Status:** PGT-01 (this item) ships the connection/identity foundation and
-the read-only `pg_identities` tool. `pg_query` / `pg_list_tables` /
-`pg_describe_table` (read), `pg_execute` (DML), `pg_ddl` (schema), and
-`pg_admin` (roles/GRANT/REVOKE) are later S115 items and are not yet present.
+**Status:** PGT-01 shipped the connection/identity foundation and the
+read-only `pg_identities` tool. PGT-04 (this item) adds `pg_ddl` (schema
+DDL). `pg_query` / `pg_list_tables` / `pg_describe_table` (read), `pg_execute`
+(DML), and `pg_admin` (roles/GRANT/REVOKE) are other S115 items and are not
+yet present.
+
+### `pg_ddl` — schema DDL (PGT-04)
+
+Runs a single schema-DDL statement: `CREATE`/`ALTER`/`DROP` on `TABLE` /
+`INDEX` / `VIEW` (including `MATERIALIZED VIEW`) / `SEQUENCE` / `SCHEMA`.
+Args: `{ sql, identity? }`. Default identity: **`admin`** (the DB role is the
+real privilege boundary, matching every other `pg_*` tool's identity model).
+
+A pure string-level statement-class gate (`src/pg/ddl.rs::classify_ddl`, unit
+tested without a DB connection) runs before any connection is attempted:
+
+- Accepts only a single statement (one optional trailing `;`; any other `;`
+  is rejected as multi-statement input).
+- Accepts only `CREATE`/`ALTER`/`DROP` as the leading keyword — DML
+  (`INSERT`/`UPDATE`/`DELETE`) and reads (`SELECT`/`EXPLAIN`/`SHOW`) are
+  rejected with a clean `InvalidArgument` pointing at `pg_execute`/`pg_query`.
+- Rejects role/privilege management (`CREATE`/`ALTER`/`DROP ROLE`/`USER`/
+  `GROUP`, `GRANT`, `REVOKE`) even though some share a leading keyword with
+  schema DDL — those belong to `pg_admin` (PGT-05).
+- Rejects a DDL statement whose target object isn't one of
+  `TABLE`/`INDEX`/`VIEW`/`SEQUENCE`/`SCHEMA` (e.g. `CREATE EXTENSION`).
+
+`DROP` statements, and `ALTER` statements that themselves contain a `DROP`
+(dropping a column/constraint/default), are flagged `irreversible: true` in
+both the response summary and structured payload, so an approval prompt or
+audit reviewer can immediately see the blast radius. Returns
+`{ statement_class, object, irreversible, identity, ok }`.
+
+`pg_ddl` is destructive by design and **MUST be treated as guarded** — it is
+registered on the tool registry here, but PGT-06 is the item that adds it to
+`crate::approval::GUARDED_BARE_NAMES` (and confirms audit sanitization)
+alongside `pg_execute`/`pg_admin` in one governance pass; see the note at the
+bottom of `src/pg/ddl.rs`.
 
 ### Identity / connection model
 
@@ -756,12 +790,14 @@ sweep (`crate::intake::storage::get_pool`), the fleet-catalog/discovery
 read+write tools, and any other in-process data path keep their direct
 `PgPool`, unrouted through this suite and undisturbed by it.
 
-Destructive `pg_*` tools (`pg_execute`, `pg_ddl`, `pg_admin` — later items)
-are registered in `crate::approval::GUARDED_BARE_NAMES` so the gateway
-requires approval before execution, on top of the DB-role privilege
-boundary and the standard gateway audit trail every tool call already gets.
-Every mutating `pg_*` tool added to this suite MUST be evaluated for the
-guarded set.
+Destructive `pg_*` tools (`pg_execute`, `pg_ddl`, `pg_admin`) are meant to be
+registered in `crate::approval::GUARDED_BARE_NAMES` so the gateway requires
+approval before execution, on top of the DB-role privilege boundary and the
+standard gateway audit trail every tool call already gets — `pg_ddl` (PGT-04)
+is implemented and registered on the tool registry, but PGT-06 is the item
+that actually adds the guarded-set entries + confirms audit sanitization for
+the whole destructive set in one governance pass. Every mutating `pg_*` tool
+added to this suite MUST be evaluated for the guarded set.
 
 `pg` registers on the CORE tool registry only (`crate::registry::register_all`,
 alongside `crate::intake::register`) — Chord-served, never the

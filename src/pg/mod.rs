@@ -39,6 +39,7 @@
 //! "Grounding summary" for the full rationale.
 
 pub mod conn;
+pub mod ddl;
 pub mod identities;
 
 use crate::registry::ToolRegistry;
@@ -73,6 +74,7 @@ impl PgConnections {
 /// registry only — see module docs).
 pub fn register(registry: &mut ToolRegistry) {
     identities::register(registry);
+    ddl::register(registry);
 }
 
 #[cfg(test)]
