@@ -1801,7 +1801,10 @@ impl RustTool for GitPublicMirrorReplayPr {
          double-created). Fail-closed without TERMINUS_MIRROR_AUTHOR_MAP. Requires 'repo' and 'pr' (the \
          internal PR number); 'source' defaults to TERMINUS_MIRROR_SOURCE_ROOT/<repo>; the remote \
          comes from 'github_remote' or TERMINUS_MIRROR_REMOTE[_<REPO>]; 'merge_method' defaults to \
-         'squash'."
+         'squash'. NOTE: the internal PR must have been merged with a MERGE COMMIT (the fleet \
+         default) — a fast-forward/squash-merged internal PR (single-parent merge) is refused, \
+         because merge order (and therefore correct attribution) cannot be proven from git alone; \
+         such repos publish going-forward via git_public_history_sync instead."
     }
     fn parameters(&self) -> Value {
         json!({
