@@ -777,10 +777,95 @@ pub fn hf_discovery_rate_limit_per_min() -> u32 {
         .unwrap_or(30)
 }
 
+// ── KGEMB-02: KG semantic-embeddings client config ────────────────────────
+// `crate::scribe::graph::vec_embed::EmbedClient` turns a node "card" (short
+// text) into a vector against a configurable endpoint. URL/model/timeout are
+// non-secret knobs resolved here; the optional bearer key for hosted
+// providers (`EMBEDDINGS_API_KEY`) is secret material and is read directly
+// from the env-materialized runtime secret store in `vec_embed` itself (same
+// "no separate SecretManager/vault API in this crate" convention documented
+// in `crate::pki`'s module doc and used by `review::dispatch`'s
+// `OPENROUTER_API_KEY` — a plain env read post-materialization IS the
+// SecretManager read here), not in this non-secret config section.
+
+/// HTTP endpoint the KG embeddings client POSTs to. From `EMBEDDINGS_URL`;
+/// defaults to the secondary (CPU) ollama unit's `/api/embeddings` route
+/// ([`ollama_secondary_url`]) so a deployment with `OLLAMA_CPU_URL` already
+/// set gets embeddings "for free"; with neither set, falls back to a bare
+/// loopback CPU-ollama default (never a real non-loopback host baked in,
+/// consistent with [`chord_personal_federation_url`]'s loopback-only default).
+pub fn embeddings_url() -> String {
+    env_nonempty("EMBEDDINGS_URL").unwrap_or_else(|| {
+        let base = ollama_secondary_url().unwrap_or_else(|| "http://127.0.0.1:11435".to_string()); // pii-test-fixture
+        format!("{}/api/embeddings", base.trim_end_matches('/'))
+    })
+}
+
+/// Embeddings model name sent on each request. From `EMBEDDINGS_MODEL`;
+/// defaults to `"nomic-embed-text"` (a small, widely-mirrored Ollama
+/// embeddings model — not tied to any specific deployment).
+pub fn embeddings_model() -> String {
+    env_nonempty("EMBEDDINGS_MODEL").unwrap_or_else(|| "nomic-embed-text".to_string())
+}
+
+/// Per-request timeout, in milliseconds, for the embeddings client. From
+/// `EMBEDDINGS_TIMEOUT_MS`; defaults to 30000 (30s) — generous enough for a
+/// CPU-tier embeddings backend, bounded so a dead/unreachable endpoint fails
+/// a single embed call instead of hanging a build indefinitely.
+pub fn embeddings_timeout_ms() -> u64 {
+    env_nonempty("EMBEDDINGS_TIMEOUT_MS")
+        .and_then(|v| v.parse().ok())
+        .filter(|ms: &u64| *ms > 0)
+        .unwrap_or(30_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    // ── KGEMB-02: embeddings config ─────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn embeddings_url_defaults_from_ollama_cpu_url() {
+        std::env::remove_var("EMBEDDINGS_URL");
+        std::env::remove_var("OLLAMA_CPU_URL");
+        assert_eq!(embeddings_url(), "http://127.0.0.1:11435/api/embeddings"); // pii-test-fixture
+        std::env::set_var("OLLAMA_CPU_URL", "http://127.0.0.1:11499"); // pii-test-fixture
+        assert_eq!(embeddings_url(), "http://127.0.0.1:11499/api/embeddings"); // pii-test-fixture
+        std::env::remove_var("OLLAMA_CPU_URL");
+    }
+
+    #[test]
+    #[serial]
+    fn embeddings_url_explicit_override_wins() {
+        std::env::set_var("EMBEDDINGS_URL", "http://127.0.0.1:9/v1/embeddings"); // pii-test-fixture
+        assert_eq!(embeddings_url(), "http://127.0.0.1:9/v1/embeddings"); // pii-test-fixture
+        std::env::remove_var("EMBEDDINGS_URL");
+    }
+
+    #[test]
+    #[serial]
+    fn embeddings_model_defaults_and_overrides() {
+        std::env::remove_var("EMBEDDINGS_MODEL");
+        assert_eq!(embeddings_model(), "nomic-embed-text");
+        std::env::set_var("EMBEDDINGS_MODEL", "custom-embed");
+        assert_eq!(embeddings_model(), "custom-embed");
+        std::env::remove_var("EMBEDDINGS_MODEL");
+    }
+
+    #[test]
+    #[serial]
+    fn embeddings_timeout_ms_defaults_and_rejects_nonpositive() {
+        std::env::remove_var("EMBEDDINGS_TIMEOUT_MS");
+        assert_eq!(embeddings_timeout_ms(), 30_000);
+        std::env::set_var("EMBEDDINGS_TIMEOUT_MS", "0");
+        assert_eq!(embeddings_timeout_ms(), 30_000);
+        std::env::set_var("EMBEDDINGS_TIMEOUT_MS", "5000");
+        assert_eq!(embeddings_timeout_ms(), 5_000);
+        std::env::remove_var("EMBEDDINGS_TIMEOUT_MS");
+    }
 
     // ── TGW-02: Chord federation config ─────────────────────────────────
 

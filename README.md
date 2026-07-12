@@ -484,6 +484,7 @@ on the core registry, so a model can query the graph instead of grepping source:
 | `kg_communities` | The community structure (level-0 clusters + a coarser level-1), each with members and — when a model is available — a short summary, for answering subsystem/architecture questions at the right zoom. |
 | `kg_query` | Answer a natural-language question — routes automatically to entity-level retrieval (specific symbols) or community-level retrieval (architecture/subsystems), returns the context plus a synthesized answer when a model is available. |
 | `kg_file_symbols` | The symbols a given repo-relative file defines, sorted by PageRank importance. |
+| `kg_semantic_search` | Meaning-based (embedding) search — finds nodes related to `query` even without a shared substring. Degrades to `configured:false` when embeddings aren't set up; see [KGEMB-04](#kg-semantic-search-tool-kgemb-04) below. |
 
 All take a `project_id` and read the per-project graph store
 (`SCRIBE_KG_STORE_DIR`); a project with no graph yet returns `found: false`
@@ -630,6 +631,77 @@ cosine-similarity index for fast top-K search.
 - This module lands only the store. The embeddings client, the gated
   build-time wiring, and the `kg_semantic_search` tool are later items in
   spec `S113-kg-semantic-embeddings` (KGEMB-02/03/04).
+
+### KG embeddings client (KGEMB-02)
+
+`EmbedClient` (`src/scribe/graph/vec_embed.rs`) turns text into a vector
+against a configurable endpoint, provider-agnostic between the local Ollama
+shape and hosted OpenAI-style APIs, auto-detected from the URL:
+
+- Ollama (`/api/embeddings`, `{"model","prompt"}` → `{"embedding":[...]}`) —
+  the default, matching the CPU-tier ollama unit already used elsewhere.
+- OpenAI-style (any URL containing `/v1/embeddings`, `{"model","input"}` →
+  `{"data":[{"embedding":[...]}]}`) — for hosted providers (e.g. an
+  OpenRouter-compatible embeddings endpoint), with bearer auth.
+
+Config (non-secret, via `crate::config`):
+
+- **`EMBEDDINGS_URL`** — the embeddings endpoint. Defaults to the secondary
+  (CPU) ollama unit's `OLLAMA_CPU_URL` + `/api/embeddings`; with neither set,
+  falls back to a loopback CPU-ollama default (never a real non-loopback host
+  baked in).
+- **`EMBEDDINGS_MODEL`** — the model name sent on each request. Defaults to
+  `nomic-embed-text`.
+- **`EMBEDDINGS_TIMEOUT_MS`** — per-request timeout. Defaults to 30000 (30s).
+
+**`EMBEDDINGS_API_KEY`** (optional, for hosted providers) is secret material
+and is read directly from the env-materialized runtime secret store inside
+`vec_embed` itself, not from `crate::config` — this crate has no separate
+`SecretManager`/`vault` API of its own (same convention as `crate::pki`'s CA
+material and `review::dispatch`'s `OPENROUTER_API_KEY`: the deployment's
+secret store materializes into env at startup, so a plain env read afterward
+already IS the SecretManager read). When unset, no `Authorization` header is
+sent (Ollama needs none).
+
+`EmbedClient::embed`/`embed_batch` never panic: transport, HTTP-status, and
+parse failures all become a `ToolError` for the caller to log and skip — a
+best-effort contract, since KGEMB-03's build-time wiring must never block on
+an embeddings outage.
+
+`node_card(node, callers, callees)` builds the deterministic short text that
+gets embedded for a `KgNode`: `"{kind} {name} in {path}"`, plus (if any
+neighbors) `" — calls: ...; called by: ..."`, each neighbor list capped at 6
+names and the whole card capped at 512 characters (truncated on a char
+boundary).
+
+This item ships only the client + card builder — it is not yet wired into
+`scribe_kg_build` (that's KGEMB-03).
+
+### `kg_semantic_search` tool (KGEMB-04)
+
+`kg_semantic_search(project_id, query, limit?)` (`src/scribe/graph/tools.rs`)
+is the query-side counterpart to KGEMB-01/02/03: it embeds `query` with
+`EmbedClient`, asks `AtlasVecStore::query_topk` for the nearest node ids by
+cosine similarity, joins the hits against the project's currently-loaded
+Atlas graph, and returns `{id,name,kind,path,score,cluster}` per hit ordered
+by similarity (descending — the store's own order is preserved, never
+re-sorted). `limit` is optional (default 10) and clamped to `[1, 50]`.
+
+**Degrade-to-lexical contract:** this tool is safe to call unconditionally,
+including in a deployment that has never enabled embeddings:
+
+| Condition | Result |
+| --- | --- |
+| `AtlasVecStore::from_env()` returns `NotConfigured` (`ATLAS_DATABASE_URL` unset) | `{"configured": false, "found": false, "results": []}` — a normal result, not a tool error. Callers should fall back to `kg_search`. |
+| The store is configured but some other error occurs (e.g. connect failure) | Also degrades to `{"configured": false, "found": false, "results": [], "error": "..."}` rather than a hard error. |
+| The embeddings endpoint is down/unreachable at query time | `{"configured": true, "found": false, "results": [], "error": "..."}` — the store IS configured, but the query embedding itself failed. |
+| No knowledge graph exists for `project_id` yet | `{"configured": true, "found": false, "count": 0, "message": "..."}` — a genuine empty result, not a config problem (run `scribe_kg_build` first). |
+| Both are up, query ran | `{"configured": true, "found": <has-results>, "project_id", "count", "results": [...]}` — `found` reflects whether there were actual matches (zero hits, or every hit dropped as a stale row, is `found:false`). |
+
+A vector-store row whose `node_id` is no longer present in the currently
+loaded graph (e.g. the graph was rebuilt and the symbol was removed/renamed)
+is silently dropped from the results rather than surfaced — stale-row
+tolerance, so a query never returns a dangling reference.
 
 ## License
 
