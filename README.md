@@ -838,6 +838,93 @@ equivalents: `cortex_stats`→`kg_stats`, `cortex_build`→`scribe_kg_build`,
 `cortex_community`/`cortex_architecture`→`kg_communities`,
 `cortex_flows`→`kg_path`.
 
+### `review_run`'s Tier-C consistency/elegance lens (CXEG-07) — ADVISORY ONLY
+
+`review_run` gains an optional additional lens (`src/review/consistency.rs`)
+that asks a reviewer to flag deviations from **this repository's own**
+established patterns — never generic style opinion, and never a rule the
+codebase doesn't already exhibit. It is a **strictly advisory** capture path:
+it can never influence `aggregate_verdict`/`complete`, and a total failure of
+any of its dependencies degrades cleanly to a no-op.
+
+**Gating.** The lens only runs when BOTH are true: `CortexConfig.enable_tier_c`
+(`CORTEX_ENABLE_TIER_C`, default `false`) and `context.project_id` is present
+on the `review_run` call. With `enable_tier_c=false` (the default),
+`review_run` behaves byte-for-byte as it did before CXEG-07 except for one
+additive `"consistency": {"status": "disabled", ...}` field in the result —
+no other field, and no dispatched-provider count, changes.
+
+**What it injects.** For the touched community/ies (the Atlas graph's Leiden
+clusters covering the changed files, up to 5 communities), the lens's prompt
+carries:
+- CXEG-06's house-style exemplars + modal facts for each touched community
+  (`cortex::house_style`, via the SAME `HouseStyleCache` `cortex_house_style`
+  uses — a per-`ReviewRun`-instance cache, so repeated reviews of the same
+  project benefit from its generation-keyed memoization);
+- CXEG-04's structural `risk_signals` for the change (`cortex::review::compute_review`,
+  the same function `cortex_review` calls).
+
+No source-text is re-read for this — every signal is graph-metadata-only
+(same posture as `cortex_house_style` itself).
+
+**Pinning.** `CONSISTENCY_REVIEW_PROVIDER` (default a cheap, code-specialized
+free-tier OpenRouter model) fixes exactly which provider the lens dispatches
+to, routed through the same `is_daemon_provider`/`openrouter_model_for`/`"free"`
+table the correctness panel uses (`review::dispatch_provider_raw`, S9
+single-source) — a hard guarantee. `CONSISTENCY_REVIEW_TEMPERATURE` (default
+`0.0`) is currently **best-effort only**: neither `ReviewConfig::dispatch_daemon`
+nor `ReviewConfig::dispatch_openrouter` expose a temperature parameter today,
+so it is surfaced to the model as an explicit prompt instruction rather than
+an API-level pin — a known, documented gap, not a silent over-claim.
+
+**Findings capture.** The lens's structured output (an optional
+`CONSISTENCY_FINDINGS_JSON:` block, distinct from the correctness lens's own
+`FINDINGS_JSON:` sentinel so the two are never confused) is tagged
+`category: "consistency"` or `"elegance"` and recorded through the SAME
+KGFIND-03 `FindingsStore` path every other `review_run` finding goes through
+— no second findings-access path (S9). Every entry is anchored to a KG scope
+exactly like a correctness finding (`resolve_scope`); a finding with no KG
+anchor falls back to `scope: "path"` then `"global"`, never dropped.
+
+**Disagreement, not escalation.** The lens's findings are cross-checked
+against any correctness reviewer that independently tagged
+`category:consistency|elegance` on its own `FINDINGS_JSON:` block (KGFIND-02):
+findings at the same `(category, file, symbol)` anchor from 2+ distinct
+sources with DIFFERING description text are marked `subjective: true` on
+every entry in that group. A subjective finding is still captured — it is
+never escalated or dropped; escalation (if ever built) is explicitly out of
+this item's scope (a hypothetical future CXEG-08).
+
+**Degrade contract** — none of the following ever affects the correctness
+gate or raises an error from `review_run`:
+
+| Condition | Result |
+| --- | --- |
+| `enable_tier_c=false`, or no `project_id`/`changed_files` on the call | Clean no-op; `"consistency": {"status": "disabled"\|"no_project_id"\|"no_changed_files", "findings_count": 0, ...}`. |
+| No stored Atlas graph, no touched community, or every touched community below `house_style::MIN_COMMUNITY_SIZE` | `"status": "no_graph_or_exemplars"` — never fabricates exemplars for an absent/unstable community; the OTHER touched communities (if any) are unaffected by one unstable one. |
+| Lens provider unreachable/unconfigured | `"status": "lens_unavailable"`, `"findings_count": 0`. |
+| Embeddings endpoint down during exemplar selection | Exemplars still returned via `cortex_house_style`'s own centrality-only fallback; `"degraded": true` on the result, lens still runs. |
+| Lens ran, produced findings | `"status": "ok"`, `"findings_count"`, `"subjective_count"`. |
+
+`review_run`'s result now includes:
+
+```json
+"consistency": {
+  "status": "disabled" | "no_project_id" | "no_changed_files" | "no_graph_or_exemplars" | "lens_unavailable" | "ok",
+  "provider": "qwen_coder" | null,
+  "degraded": false,
+  "advisory_only": true,
+  "findings_count": 0,
+  "subjective_count": 0
+}
+```
+
+`"advisory_only": true` is always present as a reminder at the call site that
+this block, however populated, never altered `aggregate_verdict`/`complete`
+above it in the same result — those are computed and fixed BEFORE the
+consistency lens even runs (see `consistency`'s module doc for why this
+ordering is the load-bearing safety property, not just a convention).
+
 ## Postgres tool suite — the single sanctioned Postgres door (S115)
 
 Coder agents historically SSHed directly into DB hosts and ran `psql` for

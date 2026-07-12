@@ -188,7 +188,21 @@ const MAX_FINDINGS: usize = 50;
 
 /// KGFIND-02: extract structured findings from a provider's raw reply, if it
 /// emitted an optional `FINDINGS_JSON:` block (see [`FINDINGS_INSTRUCTION`]).
-/// Mirrors `scribe::graph::semantic::extract_json_array`'s tolerant
+/// Thin wrapper over [`parse_findings_with_marker`] pinned to the
+/// correctness-review marker -- see that function for the actual
+/// tolerant-parse behavior/degrade contract.
+pub fn parse_findings(text: &str) -> Vec<Finding> {
+    parse_findings_with_marker(text, "FINDINGS_JSON:")
+}
+
+/// CXEG-07: like [`parse_findings`], but scans for an arbitrary `marker`
+/// instead of the hardcoded `"FINDINGS_JSON:"` -- reused by the Tier-C
+/// consistency/elegance lens (`review::consistency`), which asks the
+/// reviewer for a DIFFERENT sentinel (`"CONSISTENCY_FINDINGS_JSON:"`) so its
+/// advisory-only output can never be confused with (or accidentally
+/// double-count against) the correctness lens's own `FINDINGS_JSON:` block
+/// in the same or a different reply. Mirrors
+/// `scribe::graph::semantic::extract_json_array`'s tolerant
 /// brace/bracket-matching approach (first `[` after the marker to its
 /// matching `]`), tolerating any prose/fencing around it. Absent marker,
 /// unparseable JSON, or a JSON shape that doesn't deserialize into
@@ -196,11 +210,30 @@ const MAX_FINDINGS: usize = 50;
 /// panics and never errors, since findings are strictly best-effort and must
 /// never affect verdict parsing or aggregation. Results are capped at
 /// [`MAX_FINDINGS`].
-pub fn parse_findings(text: &str) -> Vec<Finding> {
-    let Some(marker_pos) = text.find("FINDINGS_JSON:") else {
+pub fn parse_findings_with_marker(text: &str, marker: &str) -> Vec<Finding> {
+    // Anchor the marker to a LINE START (index 0 or immediately after a '\n').
+    // A plain `text.find(marker)` cross-matches: the correctness marker
+    // `FINDINGS_JSON:` is a suffix-substring of the lens marker
+    // `CONSISTENCY_FINDINGS_JSON:`, so an unanchored find would let the
+    // correctness parser latch onto a consistency block (and vice-versa).
+    let marker_pos = {
+        let bytes = text.as_bytes();
+        let mut from = 0usize;
+        let mut found = None;
+        while let Some(rel) = text[from..].find(marker) {
+            let abs = from + rel;
+            if abs == 0 || bytes[abs - 1] == b'\n' {
+                found = Some(abs);
+                break;
+            }
+            from = abs + marker.len();
+        }
+        found
+    };
+    let Some(marker_pos) = marker_pos else {
         return Vec::new();
     };
-    let after = &text[marker_pos + "FINDINGS_JSON:".len()..];
+    let after = &text[marker_pos + marker.len()..];
 
     let Some(start) = after.find('[') else {
         return Vec::new();
@@ -491,6 +524,32 @@ See also FINDINGS_JSON: [ignore this] and arr[3] in the notes.";
         let raw = format!("VERDICT: APPROVE\nFINDINGS_JSON: [{}]", items.join(","));
         let findings = parse_findings(&raw);
         assert_eq!(findings.len(), 50);
+    }
+
+    // ── CXEG-07: parse_findings_with_marker (distinct-marker reuse) ────────
+
+    #[test]
+    fn parse_findings_with_marker_uses_a_different_sentinel() {
+        let raw = "VERDICT: APPROVE\nCONSISTENCY_FINDINGS_JSON: [{\"category\":\"consistency\",\"severity\":\"low\",\"description\":\"d\"}]";
+        // The correctness-review marker must NOT match this text at all.
+        assert!(parse_findings(raw).is_empty());
+        let findings = parse_findings_with_marker(raw, "CONSISTENCY_FINDINGS_JSON:");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].category, "consistency");
+    }
+
+    #[test]
+    fn parse_findings_with_marker_does_not_cross_match_other_markers() {
+        // A reply carrying BOTH sentinels must resolve each independently.
+        let raw = "VERDICT: APPROVE\n\
+FINDINGS_JSON: [{\"category\":\"bug\",\"severity\":\"high\",\"description\":\"x\"}]\n\
+CONSISTENCY_FINDINGS_JSON: [{\"category\":\"elegance\",\"severity\":\"low\",\"description\":\"y\"}]";
+        let correctness = parse_findings(raw);
+        let consistency = parse_findings_with_marker(raw, "CONSISTENCY_FINDINGS_JSON:");
+        assert_eq!(correctness.len(), 1);
+        assert_eq!(correctness[0].category, "bug");
+        assert_eq!(consistency.len(), 1);
+        assert_eq!(consistency[0].category, "elegance");
     }
 
     #[test]

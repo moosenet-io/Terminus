@@ -44,13 +44,20 @@ pub(crate) mod free_pool;
 // CSV/array/unified-diff parsing a second time.
 pub(crate) mod kg_context;
 mod prompt;
+// CXEG-07: the Tier-C consistency/elegance lens. Not re-exported -- only
+// `execute()` below calls into it, strictly AFTER `aggregate()` has already
+// fixed `aggregate_verdict`/`complete` (see `consistency`'s module doc for
+// why that ordering is the load-bearing advisory-only safety property).
+mod consistency;
 
 use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::cortex::house_style::HouseStyleCache;
+use crate::cortex::CortexConfig;
 use crate::error::ToolError;
 use crate::registry::ToolRegistry;
 use crate::scribe::graph::findings_store::{FindingsStore, NewFinding, RecordOutcome, ScopeKind};
@@ -369,11 +376,17 @@ async fn maybe_record_findings(results: &[ProviderResult], context: &Value) -> V
     json!({"recorded": true, "created": created, "recurred": recurred, "errors": errors})
 }
 
-pub struct ReviewRun;
+pub struct ReviewRun {
+    // CXEG-07: shared across calls so the Tier-C consistency lens's
+    // exemplar profiles benefit from `HouseStyleCache`'s own
+    // generation-keyed memoization (see `cortex::house_style`'s module
+    // doc) instead of recomputing from scratch on every `review_run` call.
+    house_style_cache: Arc<HouseStyleCache>,
+}
 
 impl ReviewRun {
     pub fn new() -> Self {
-        Self
+        Self { house_style_cache: Arc::new(HouseStyleCache::new()) }
     }
 }
 
@@ -446,21 +459,35 @@ fn role_for(structure: Structure, index: usize) -> Role {
     }
 }
 
-async fn run_one_provider(cfg: ReviewConfig, provider: String, prompt_text: String) -> ProviderResult {
-    let raw = if dispatch::is_daemon_provider(&provider) {
-        cfg.dispatch_daemon(&provider, &prompt_text).await
+/// Route `provider` to the right transport (daemon / free-pool / direct
+/// OpenRouter) and return its raw reply text, or a human-readable
+/// `"unavailable: ..."` degrade reason. Single source (S9) for that routing
+/// table: [`run_one_provider`] (the correctness panel) and CXEG-07's
+/// `consistency::maybe_run` (the Tier-C lens's dedicated pinned-provider
+/// dispatch) both call this rather than each re-deriving which transport a
+/// provider name maps to.
+async fn dispatch_provider_raw(cfg: &ReviewConfig, provider: &str, prompt_text: &str) -> Result<String, String> {
+    if dispatch::is_daemon_provider(provider) {
+        cfg.dispatch_daemon(provider, prompt_text).await
     } else if provider == "free" {
         // Seamless free-tier: round-robin the daily-curated free-model pool
         // with 429 failover (see free_pool). Used as the tail of a 3-5 provider
         // panel, after the sub/OAuth providers.
-        cfg.dispatch_free_pool(&prompt_text).await
-    } else if let Some(model) = dispatch::openrouter_model_for(&provider) {
-        cfg.dispatch_openrouter(model, &prompt_text).await
+        cfg.dispatch_free_pool(prompt_text).await
+    } else if let Some(model) = dispatch::openrouter_model_for(provider) {
+        cfg.dispatch_openrouter(model, prompt_text).await
     } else {
-        // Unreachable given parse_input's validation, but fail safe rather
-        // than panic if it ever were.
+        // Unreachable given parse_input's validation for the correctness
+        // panel, but fail safe rather than panic if it ever were -- and a
+        // real, reachable path for the Tier-C lens, whose provider name is
+        // NOT validated against `ALLOWED_PROVIDERS` (see
+        // `consistency::ConsistencyReviewConfig::from_env`).
         Err(format!("unavailable: unknown provider '{provider}'"))
-    };
+    }
+}
+
+async fn run_one_provider(cfg: ReviewConfig, provider: String, prompt_text: String) -> ProviderResult {
+    let raw = dispatch_provider_raw(&cfg, &provider, &prompt_text).await;
 
     match raw {
         Ok(text) => {
@@ -615,6 +642,16 @@ than failing the whole call."
 
         let (aggregate_verdict, complete) = aggregate(structure, &results);
 
+        // CXEG-07: Tier-C consistency/elegance lens. Runs strictly AFTER the
+        // line above -- `aggregate_verdict`/`complete` are already fixed and
+        // nothing below can reach back and change them (the load-bearing
+        // safety property; see `consistency`'s module doc). Advisory-only,
+        // never an `Err`: disabled/unconfigured/degraded all resolve to an
+        // empty, labeled `ConsistencyRun` rather than affecting this call.
+        let cortex_config = CortexConfig::from_env();
+        let consistency_run =
+            consistency::maybe_run(&context, &criteria, &results, &cfg, &cortex_config, &self.house_style_cache).await;
+
         // KGREV-02: on a successful, complete pass, incrementally rebuild the
         // project's KG (best-effort, never fails the review); see
         // `maybe_rebuild` for the lock semantics.
@@ -636,7 +673,32 @@ than failing the whole call."
         if let Value::Object(map) = &mut findings_context {
             map.insert("verdict".to_string(), json!(aggregate_verdict));
         }
-        let findings_recorded = maybe_record_findings(&results, &findings_context).await;
+
+        // CXEG-07: fold the consistency lens's (subjective-flagged,
+        // cross-source-merged) findings through the SAME KGFIND-03 record
+        // path as the correctness panel -- no second findings-access path
+        // (S9). Placed FIRST in `results_for_findings` so
+        // `dedup_across_providers`'s (category, file, symbol) first-wins
+        // collapse keeps the richer, disagreement-flagged entry over a
+        // correctness reviewer's own plain duplicate tag of the same anchor,
+        // rather than silently losing the `subjective` flag to dedup order.
+        let mut results_for_findings: Vec<ProviderResult> = Vec::with_capacity(results.len() + 1);
+        if !consistency_run.findings.is_empty() {
+            results_for_findings.push(ProviderResult {
+                provider: "consistency_lens".to_string(),
+                verdict: "ADVISORY".to_string(),
+                reasoning: String::new(),
+                error: None,
+                findings: consistency_run
+                    .findings
+                    .iter()
+                    .cloned()
+                    .map(|cf| Finding { subjective: Some(cf.subjective), ..cf.finding })
+                    .collect(),
+            });
+        }
+        results_for_findings.extend(results.iter().cloned());
+        let findings_recorded = maybe_record_findings(&results_for_findings, &findings_context).await;
 
         Ok(json!({
             "structure": args["structure"],
@@ -646,6 +708,14 @@ than failing the whole call."
             "kg_rebuild": kg_rebuild,
             "scribe_docs": scribe_docs,
             "findings_recorded": findings_recorded,
+            "consistency": {
+                "status": consistency_run.status,
+                "provider": consistency_run.provider,
+                "degraded": consistency_run.degraded,
+                "advisory_only": true,
+                "findings_count": consistency_run.findings.len(),
+                "subjective_count": consistency_run.findings.iter().filter(|f| f.subjective).count(),
+            },
         })
         .to_string())
     }
@@ -928,6 +998,7 @@ mod tests {
             file: file.map(str::to_string),
             symbol: symbol.map(str::to_string),
             description: description.to_string(),
+            subjective: None,
         }
     }
 
