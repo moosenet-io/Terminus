@@ -63,6 +63,25 @@ export interface AggregationClient {
    * new panels (CONST-05..12) land ahead of their typed methods being added here.
    */
   request<T>(system: SystemId, path: string, init?: RequestInit): Promise<T>;
+  /**
+   * CONST-04: The one permitted WebSocket entry point. harmony-web's daemon pushes live
+   * engine/ralph-loop/log events over a single same-origin `/ws` socket; this wraps that so
+   * no hook or component ever constructs a `WebSocket`/reads `window.location` itself.
+   */
+  ws: {
+    connect(handlers: WsHandlers): WsConnection;
+  };
+}
+
+export interface WsHandlers {
+  onEvent: (event: unknown) => void;
+  onOpen?: () => void;
+  onClose?: () => void;
+}
+
+export interface WsConnection {
+  send(data: unknown): void;
+  close(): void;
 }
 
 // ── Mock adapter ─────────────────────────────────────────────────────────────
@@ -90,6 +109,147 @@ const MOCK_TERMINUS_CONFIG: TerminusConfigSummary = {
   workerCount: 3,
 };
 
+// ── Mock data for the ported harmony-web / Chord surface (CONST-04) ──────────
+// Keyed by `${system} ${METHOD} ${pathname}` (query string stripped, dynamic
+// segments handled by prefix match below). This is the canned-data contract
+// CONST-02's real `/api/{harmony,chord}/*` aggregation endpoints must satisfy.
+
+const MOCK_STATUS = {
+  engine_state: 'STOPPED',
+  workers: 0,
+  projects: [
+    {
+      identifier: 'LUM', name: 'Lumina Constellation', progress_pct: 62, enrichment_pct: 80,
+      counts: { todo: 4, in_progress: 2, done: 9, enriched: 9, enrichable: 11 },
+    },
+    {
+      identifier: 'CHRD', name: 'Chord', progress_pct: 40, enrichment_pct: 55,
+      counts: { todo: 6, in_progress: 1, done: 4, enriched: 5, enrichable: 9 },
+    },
+  ],
+  cached: false, cached_ago_secs: 0, loading: false,
+  inference_mix: 50, mode: 'local', uptime_seconds: 3600, verify_score: 'N/A',
+};
+
+const MOCK_AGENTS = {
+  agents: [
+    {
+      agent_id: 'local-1', provider: 'local', display_name: 'local', model: 'qwen3-coder:30b',
+      tier: 'standard', status: 'idle', elapsed_seconds: 0, task: null, loop_state: null,
+      active_providers: ['local'],
+    },
+    {
+      agent_id: 'claude-1', provider: 'claude', display_name: 'claude', model: 'sonnet',
+      tier: 'standard', status: 'idle', elapsed_seconds: 0, task: null, loop_state: null,
+      active_providers: ['claude'],
+    },
+  ],
+};
+
+const MOCK_ESCALATION = {
+  total_tasks: 0,
+  pass_rate_by_tier: {},
+  failure_mode_counts: {},
+  complexity_distribution: {},
+  enrichment_quality: {},
+  problem_specs: [],
+};
+
+const MOCK_MODE = {
+  mode: 'local', display_name: 'Local', cost: '$0/day', limited: false,
+  updated_at: new Date().toISOString(),
+};
+
+const MOCK_TREE = { project: '', specs: [], stale: false };
+
+const MOCK_CHORD_HEALTH = {
+  engines: [],
+  vram: { total_mb: 0, used_mb: 0, free_mb: 0, allocations: [] },
+  timestamp: new Date().toISOString(),
+};
+
+const MOCK_PROFILES = { profiles: {}, total_outcomes: 0, window_days: 30 };
+
+/** GET-style mock lookups, keyed by "{system} {pathname}" (pathname without query string). */
+const MOCK_GET: Record<string, unknown> = {
+  'harmony /status': MOCK_STATUS,
+  'harmony /agents/activity': MOCK_AGENTS,
+  'harmony /analytics/completion-rate': [],
+  'harmony /analytics/provider-comparison': [],
+  'harmony /analytics/cost-tracking': [],
+  'harmony /analytics/build-duration': [],
+  'harmony /analytics/quality-scores': [],
+  'harmony /analytics/escalation': MOCK_ESCALATION,
+  'harmony /state/analytics': {},
+  'harmony /sessions': { sessions: [] },
+  'harmony /prompts': { versions: [] },
+  'harmony /mode': MOCK_MODE,
+  'chord /health': MOCK_CHORD_HEALTH,
+  'chord /models': [],
+  'chord /models/aliases': {},
+  'chord /storage': [],
+  'chord /analytics/savings': null,
+  'chord /analytics/cost': [],
+  'chord /providers': [],
+  'chord /providers/profiles': MOCK_PROFILES,
+};
+
+function mockGetFor(system: SystemId, pathname: string): unknown {
+  const key = `${system} ${pathname}`;
+  if (key in MOCK_GET) return MOCK_GET[key];
+  if (system === 'harmony' && pathname.startsWith('/tree/')) {
+    return { ...MOCK_TREE, project: decodeURIComponent(pathname.slice('/tree/'.length)) };
+  }
+  return null;
+}
+
+/** POST/PUT-style mock acks — every write in the mock world just succeeds with a canned shape. */
+function mockWriteFor(system: SystemId, pathname: string): unknown {
+  if (system === 'harmony' && pathname === '/engine/stop') {
+    return { state: 'stopped', pid: null, active_count: 0, uptime_secs: 0, stop_reason: 'mock', executor_active: false };
+  }
+  if (system === 'harmony' && pathname === '/engine/restart') {
+    return { state: 'executing', pid: null, active_count: 0, uptime_secs: 0, stop_reason: null, executor_active: true };
+  }
+  if (system === 'harmony' && pathname === '/mode') {
+    return MOCK_MODE;
+  }
+  if (system === 'harmony' && pathname === '/command') {
+    return { ok: true, command: '' };
+  }
+  if (system === 'harmony' && pathname === '/commands/inference-mix') {
+    return { ok: true, inference_mix: 50 };
+  }
+  if (system === 'harmony' && pathname === '/commands/compression-level') {
+    return { ok: true };
+  }
+  if (system === 'chord' && pathname === '/playground/run') {
+    return {
+      response: '(mock adapter — no live model backend) This is a canned playground response.',
+      tokens_in: 12, tokens_out: 18, latency_ms: 120, cost: 0, model: 'mock',
+    };
+  }
+  return { ok: true };
+}
+
+function mockRequest<T>(system: SystemId, path: string, init?: RequestInit): Promise<T> {
+  const method = (init?.method ?? 'GET').toUpperCase();
+  const pathname = path.split('?')[0];
+  const value = method === 'GET'
+    ? mockGetFor(system, pathname)
+    : mockWriteFor(system, pathname);
+  return delay(value as T);
+}
+
+/** Mock WS: reports "connected" immediately, never emits events (mock has no live daemon). */
+function mockWsConnect(handlers: WsHandlers): WsConnection {
+  const id = setTimeout(() => handlers.onOpen?.(), 50);
+  return {
+    send() { /* no-op in mock mode */ },
+    close() { clearTimeout(id); handlers.onClose?.(); },
+  };
+}
+
 const mockAdapter: AggregationClient = {
   auth: {
     async me() {
@@ -112,8 +272,11 @@ const mockAdapter: AggregationClient = {
       return delay(MOCK_TERMINUS_CONFIG);
     },
   },
-  async request<T>(_system: SystemId, _path: string, _init?: RequestInit): Promise<T> {
-    return delay(null as unknown as T);
+  async request<T>(system: SystemId, path: string, init?: RequestInit): Promise<T> {
+    return mockRequest<T>(system, path, init);
+  },
+  ws: {
+    connect: mockWsConnect,
   },
 };
 
@@ -125,6 +288,20 @@ const mockAdapter: AggregationClient = {
 //   GET  /api/health             -> HealthStatus[]
 //   GET  /api/terminus/config    -> TerminusConfigSummary
 //   *    /api/{system}/{path}    -> generic passthrough for `request<T>()`
+//   WS   /ws                     -> same-origin, session-cookie-authenticated event stream
+//                                    (engine/ralph-loop/log/tree_update events); see ws.connect()
+//
+// CONST-04: full harmony-web port. Endpoints the generic request<T>() passthrough now needs to
+// serve (see MOCK_GET/mockWriteFor below for the exact mock shapes — that's the contract):
+//   harmony: GET /status, GET /agents/activity,
+//            GET /analytics/{completion-rate,provider-comparison,cost-tracking,build-duration,
+//                             quality-scores,escalation}, GET /state/analytics, GET /sessions,
+//            GET /prompts, GET /mode, PUT /mode, GET /tree/{project},
+//            POST /engine/stop, POST /engine/restart, POST /command,
+//            POST /commands/inference-mix, POST /commands/compression-level
+//   chord:   GET /health, GET /models, GET /models/aliases, GET /storage,
+//            GET /analytics/savings, GET /analytics/cost, GET /providers, GET /providers/profiles,
+//            POST /playground/run
 
 function baseUrl(): string {
   // Same-origin only — never a hardcoded host/port. This is the one place in the app
@@ -202,6 +379,47 @@ const httpAdapter: AggregationClient = {
   async request<T>(system: SystemId, path: string, init?: RequestInit): Promise<T> {
     const normalized = path.startsWith('/') ? path : `/${path}`;
     return httpJson<T>(`/api/${system}${normalized}`, init);
+  },
+  ws: {
+    connect(handlers: WsHandlers): WsConnection {
+      // Same-origin only, derived from window.location — this is the one other spot (besides
+      // baseUrl() above) permitted to touch it, and only inside this adapter.
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      let ws: WebSocket | null = null;
+      let closedByCaller = false;
+      let attempt = 0;
+      let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const open = () => {
+        ws = new WebSocket(`${proto}//${window.location.host}/ws`);
+        ws.onopen = () => { attempt = 0; handlers.onOpen?.(); };
+        ws.onmessage = (e) => {
+          try {
+            handlers.onEvent(JSON.parse(e.data as string));
+          } catch { /* ignore malformed */ }
+        };
+        ws.onclose = () => {
+          handlers.onClose?.();
+          if (closedByCaller) return;
+          const delayMs = Math.min(1000 * 2 ** attempt, 30000);
+          attempt += 1;
+          reconnectTimer = setTimeout(open, delayMs);
+        };
+        ws.onerror = () => { ws?.close(); };
+      };
+      open();
+
+      return {
+        send(data: unknown) {
+          if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
+        },
+        close() {
+          closedByCaller = true;
+          if (reconnectTimer) clearTimeout(reconnectTimer);
+          ws?.close();
+        },
+      };
+    },
   },
 };
 
