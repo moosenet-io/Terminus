@@ -683,9 +683,13 @@ or unreachable, so callers should fall back to the lexical `kg_search` in that c
             }));
         };
 
+        // `found` reflects whether there are actual semantic matches: zero hits,
+        // or every hit dropped as a stale vector row (node deleted from the
+        // graph), is found:false — a caller can distinguish "search ran, nothing
+        // matched" from a genuine hit set without inspecting count.
         let results = map_topk_to_results(&hits, &g);
         structured(json!({
-            "configured": true, "found": true, "project_id": project_id,
+            "configured": true, "found": !results.is_empty(), "project_id": project_id,
             "count": results.len(), "results": results,
         }))
     }
