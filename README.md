@@ -757,6 +757,16 @@ Its risk/elegance surface is rebuilt over the following S115 items:
   cap so real diffs truncate, not reject).
 - `cortex_review` — post-change `risk_score` (0–10) + named `risk_signals`
   from Atlas structural metrics and KGFIND recurrence (stub pending **CXEG-04**).
+  Its structural-metrics half now exists as a standalone library
+  (`src/cortex/metrics.rs`, **CXEG-03**): `metrics::compute_signals` turns a
+  `cortex_scope` blast radius into five named, no-LLM structural-elegance
+  signals — `centrality_spike`, `community_boundary_crossing`,
+  `semantic_duplication`, `complexity_spike`, `fan_out_explosion` — each with
+  a percentile-relative (self-calibrating, never hardcoded) threshold, a
+  non-empty deterministic `why`, and a resolvable anchor node. Not yet wired
+  into `cortex_review`'s response (that wiring is CXEG-04's job); see
+  `docs/tools/code-git/cortex.md`'s "Tier-B structural-elegance signals"
+  section for the full signal catalog.
 - `cortex_audit` — audit an external public repo URL (stub pending **CXEG-11**);
   its SSRF-hardened `validate_repo_url` front-gate (`src/cortex/audit.rs`) is
   live now — it rejects non-http(s) schemes, embedded credentials, shell

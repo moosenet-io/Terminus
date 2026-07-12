@@ -81,6 +81,7 @@ use crate::tool::RustTool;
 
 pub mod audit;
 pub mod deprecated;
+pub mod metrics;
 pub mod scope;
 
 use audit::validate_repo_url;
@@ -154,6 +155,14 @@ pub struct CortexConfig {
     /// `blast_radius` before it sets `"truncated": true` and stops walking.
     /// From `CORTEX_MAX_BLAST_NODES`, default [`scope::DEFAULT_MAX_BLAST_NODES`].
     pub max_blast_nodes: usize,
+    /// CXEG-03's Tier-B metrics engine (`metrics::compute_signals`): the
+    /// percentile cut-point (0-100) a touched node's PageRank/degree/
+    /// complexity-proxy/out-degree must exceed, relative to the PROJECT'S
+    /// OWN current-node distribution, to fire a `centrality_spike`/
+    /// `complexity_spike`/`fan_out_explosion` signal. Self-calibrating by
+    /// design (see `metrics` module doc) — never a hardcoded absolute. From
+    /// `CORTEX_TIER_B_PERCENTILE`, default `90.0`.
+    pub tier_b_percentile: f64,
 }
 
 impl CortexConfig {
@@ -166,6 +175,7 @@ impl CortexConfig {
             dup_cosine: env_f64("CORTEX_DUP_COSINE_THRESHOLD", 0.85),
             atlas_database_url: crate::config::atlas_database_url(),
             max_blast_nodes: env_usize("CORTEX_MAX_BLAST_NODES", scope::DEFAULT_MAX_BLAST_NODES),
+            tier_b_percentile: env_f64("CORTEX_TIER_B_PERCENTILE", 90.0),
         }
     }
 }
@@ -513,6 +523,7 @@ mod tests {
             dup_cosine: 0.85,
             atlas_database_url: None,
             max_blast_nodes: scope::DEFAULT_MAX_BLAST_NODES,
+            tier_b_percentile: 90.0,
         })
     }
 

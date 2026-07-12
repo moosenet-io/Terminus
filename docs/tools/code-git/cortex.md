@@ -200,6 +200,64 @@ also NOT an error (see step 3 above) — that is the one deliberate exception to
 "validate first, then act" in this tool, since blast-radius unavailability is a
 data-availability fact, not a caller mistake.
 
+## Tier-B structural-elegance signals (`src/cortex/metrics.rs`, CXEG-03)
+
+`metrics::compute_signals` is a standalone, PURE (no LLM) scoring library
+that turns a `cortex_scope` blast radius into named structural-elegance
+findings from the Atlas graph — "does this change quietly make the codebase
+worse-shaped," independent of correctness. It is not wired into
+`cortex_review`'s response yet (that's CXEG-04's job) but is fully
+unit-tested and importable as `crate::cortex::metrics::compute_signals`.
+
+**Entry points**:
+- `compute_signals(touched_node_ids, graph, project_id, config) -> Vec<EleganceSignal>`
+  (async) — the full pipeline, including the one I/O-bound detector
+  (`semantic_duplication`).
+- `compute_structural_signals(touched_node_ids, graph, config) -> Vec<EleganceSignal>`
+  (sync) — the four non-I/O detectors only, for callers/tests that don't want
+  an async runtime or a vector-store dependency.
+
+`touched_node_ids` are the blast radius's `role == "touched"` node ids
+(`cortex_scope`'s output); ids that don't resolve to a CURRENT graph node
+(unindexed file, or a since-invalidated symbol) are silently skipped.
+
+**Signal catalog** — every `EleganceSignal` carries `kind`, `severity`
+(relative "how far past the trigger," rounded to 4 decimals), `anchor_node`
+(always a touched node, never a bystander neighbor), `anchor_file`, a
+non-empty deterministic `why`, and signal-specific `evidence`:
+
+| `kind` | Fires when | Notes |
+| --- | --- | --- |
+| `centrality_spike` | A touched node's PageRank **and** degree both exceed the project's own `tier_b_percentile`-th percentile cut-point (god-object drift). | Both metrics must exceed their own cut-point independently — a node that's merely high-rank OR merely high-degree doesn't fire. |
+| `community_boundary_crossing` | A touched node has a 1-hop edge into a different Leiden community, and that community pair has no OTHER edge crossing it elsewhere in the graph (i.e. this change is the sole/first carrier of that coupling). | Baseline is computed from the WHOLE current graph, so an already-established (≥2 independent crossing edges) coupling between two communities is never re-flagged. |
+| `semantic_duplication` | A touched node's card (`vec_embed::node_card` — same builder `scribe_kg_build`'s embedding pipeline uses) has an existing, DIFFERENT node whose embedding cosine similarity is `>= config.dup_cosine` (default 0.85). | The only signal that does I/O: embeds via `EmbedClient` and queries `AtlasVecStore::query_topk` — the exact path `kg_semantic_search` uses. Silently absent (not an error) when the vector store/embeddings endpoint is unconfigured or unreachable; every other signal still computes. |
+| `complexity_spike` | A touched node's line-span size (`end - start + 1`) exceeds the project's own percentile cut-point. | `KgNode` has no dedicated complexity metric yet — span size is documented as an explicit proxy. A node with no `span` is skipped (nothing to measure), never treated as zero. |
+| `fan_out_explosion` | A touched node's out-degree (via the shared `one_hop_neighbors(.., NeighborFilter::Out)` walk) exceeds the project's own percentile cut-point. | Out-degree specifically, not total (in+out) `degree` — a node with many callees but few callers reads differently from `centrality_spike`. |
+
+**Self-calibrating thresholds**: `centrality_spike`/`complexity_spike`/
+`fan_out_explosion` all compare against a cut-point computed from the
+PROJECT'S OWN current-node distribution (`percentile_cutoff`, nearest-rank
+method, at `config.tier_b_percentile`), never a hardcoded absolute — the
+same absolute PageRank value fires in a repo where it's an outlier and does
+NOT fire in a repo where it's the median. The comparison is strict
+greater-than (not `>=`): a value that merely EQUALS the cut-point (e.g. a
+uniform distribution where every node shares the same value) never fires,
+since there is no outlier there by construction.
+
+**Bi-temporal filtering**: every distribution (`graph.current_nodes()`) and
+every anchor/neighbor lookup (`get_node(..).filter(|n| n.valid_to.is_none())`)
+is restricted to CURRENT nodes — an invalidated symbol never appears in a
+signal or skews a cut-point (a CXEG-02 review finding, front-loaded here).
+
+**Determinism**: signals are sorted by `(kind, anchor_node)` before being
+returned, and every numeric score is rounded to 4 decimal places — the same
+graph + blast radius + config always produces byte-identical output.
+
+**Configuration**: reuses `CortexConfig` (`src/cortex/mod.rs`) —
+`dup_cosine` for `semantic_duplication`, plus a new `tier_b_percentile`
+field (`CORTEX_TIER_B_PERCENTILE`, default `90.0`) shared by the three
+percentile-based detectors. See the "Configuration" section below.
+
 ## `cortex_review` (pending — CXEG-04)
 
 **Input schema**: identical shape to `cortex_scope` — `project_id` (enum,
@@ -281,6 +339,7 @@ gets even a pending-pointer response, only a rejection.
 | `CORTEX_ELEGANCE_ADVISORY_ONLY` | bool | `true` | Whether elegance/style findings are advisory-only; echoed in `cortex_review`'s response. |
 | `CORTEX_DUP_COSINE_THRESHOLD` | f64 | `0.85` | Cosine-similarity threshold for a not-yet-built dup-detection pass; echoed in `cortex_audit`'s response. |
 | `CORTEX_MAX_BLAST_NODES` | usize | `200` | `cortex_scope`'s (CXEG-02) cap on the number of nodes enumerated into `blast_radius` before it sets `truncated:true` and stops walking. A zero/unparseable value falls back to the default rather than dropping every node. |
+| `CORTEX_TIER_B_PERCENTILE` | f64 | `90.0` | `metrics::compute_signals`'s (CXEG-03) percentile cut-point (0-100) for `centrality_spike`/`complexity_spike`/`fan_out_explosion`, computed against the project's own current-node distribution — self-calibrating, never a hardcoded absolute. |
 | `ATLAS_DATABASE_URL` | secret-shaped | none | Read exclusively through `crate::config::atlas_database_url()` — this crate has no separate `SecretManager`/`vault::manager()` API of its own; the runtime secret store is materialized into the process environment at deploy time (same convention as `crate::pki` and `scribe::graph::vec_embed`). `None` means the Atlas KG store is not configured (`cortex_scope` still degrades cleanly in this case, via `GraphStore`/`ScribeConfig`'s own `SCRIBE_KG_STORE_DIR`, which is independent of the Postgres DSN). |
 
 Boolean flags accept `"1"`/`"true"`/`"yes"` (case-insensitive) as truthy;
