@@ -147,50 +147,78 @@ impl RouteTable {
     }
 
     /// Install (or replace, if `tool.name` already has a route) one route.
-    /// Builds a brand-new snapshot (copy-on-write over the current one) and
-    /// atomically swaps it in — never mutates a snapshot a reader may
-    /// already hold.
+    ///
+    /// Uses `ArcSwap::rcu` — a compare-and-swap RETRY loop — rather than a
+    /// bare load→clone→store, so two writers racing (e.g. TMOD-05's worker
+    /// onboarding and a concurrent health-eviction) can never lose an
+    /// update: if a competing writer stores a new snapshot after this call's
+    /// `load` but before its `store`, `rcu` observes the mismatch and
+    /// re-applies this mutation against the newer snapshot instead of
+    /// clobbering it. The closure must be pure/idempotent (it can run more
+    /// than once) — it only clones + inserts, so it is.
     pub fn install(&self, route: WorkerRoute) {
-        let current = self.snapshot.load();
-        let mut routes = current.routes.clone();
-        routes.insert(route.tool.name.clone(), route);
-        self.snapshot.store(Arc::new(RouteTableSnapshot { routes }));
+        self.snapshot.rcu(|current| {
+            let mut routes = current.routes.clone();
+            routes.insert(route.tool.name.clone(), route.clone());
+            RouteTableSnapshot { routes }
+        });
     }
 
     /// Install every route a worker's manifest advertises in one atomic
     /// swap (rather than one `install` per tool, which would otherwise
-    /// expose a partially-installed worker to a reader mid-loop).
+    /// expose a partially-installed worker to a reader mid-loop). Collected
+    /// up front so the `rcu` retry closure — which may run more than once —
+    /// re-applies the SAME set each attempt.
     pub fn install_many(&self, new_routes: impl IntoIterator<Item = WorkerRoute>) {
-        let current = self.snapshot.load();
-        let mut routes = current.routes.clone();
-        for route in new_routes {
-            routes.insert(route.tool.name.clone(), route);
-        }
-        self.snapshot.store(Arc::new(RouteTableSnapshot { routes }));
+        let new_routes: Vec<WorkerRoute> = new_routes.into_iter().collect();
+        self.snapshot.rcu(|current| {
+            let mut routes = current.routes.clone();
+            for route in &new_routes {
+                routes.insert(route.tool.name.clone(), route.clone());
+            }
+            RouteTableSnapshot { routes }
+        });
     }
 
-    /// Remove a single named route, if present.
+    /// Remove a single named route, if present. `rcu` retry loop, same
+    /// lost-update-free guarantee as [`RouteTable::install`].
     pub fn remove(&self, name: &str) {
-        let current = self.snapshot.load();
-        if !current.routes.contains_key(name) {
-            return;
-        }
-        let mut routes = current.routes.clone();
-        routes.remove(name);
-        self.snapshot.store(Arc::new(RouteTableSnapshot { routes }));
+        self.snapshot.rcu(|current| {
+            let mut routes = current.routes.clone();
+            routes.remove(name);
+            RouteTableSnapshot { routes }
+        });
     }
 
     /// Remove every route belonging to `worker_id` in one atomic swap — used
-    /// when a worker is deregistered/evicted entirely.
+    /// when a worker is deregistered/evicted entirely. `rcu` retry loop, same
+    /// lost-update-free guarantee as [`RouteTable::install`].
     pub fn remove_worker(&self, worker_id: &str) {
-        let current = self.snapshot.load();
-        if !current.routes.values().any(|r| r.worker_id == worker_id) {
-            return;
-        }
-        let routes: HashMap<String, WorkerRoute> =
-            current.routes.iter().filter(|(_, r)| r.worker_id != worker_id).map(|(k, v)| (k.clone(), v.clone())).collect();
-        self.snapshot.store(Arc::new(RouteTableSnapshot { routes }));
+        self.snapshot.rcu(|current| {
+            let routes: HashMap<String, WorkerRoute> = current
+                .routes
+                .iter()
+                .filter(|(_, r)| r.worker_id != worker_id)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            RouteTableSnapshot { routes }
+        });
     }
+}
+
+/// Bounded per-worker health-probe timeout used by [`merge_catalog`] and
+/// [`dispatch_call`]. A worker that ACCEPTS a probe but never answers must
+/// not be able to stall `tools/list`/`tools/call` — a probe exceeding this
+/// budget is treated as unhealthy (skip in list, "unavailable" on call), so
+/// one hung worker only ever fails its own tools. Deliberately small: a
+/// health check is a liveness ping, not real work.
+pub const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Run one worker's health probe under [`HEALTH_PROBE_TIMEOUT`]. A probe that
+/// times out (accepts-but-never-answers) is reported as unhealthy rather
+/// than allowed to block the caller indefinitely.
+async fn health_bounded(transport: &Arc<dyn WorkerTransport>) -> bool {
+    matches!(tokio::time::timeout(HEALTH_PROBE_TIMEOUT, transport.health()).await, Ok(true))
 }
 
 impl Default for RouteTable {
@@ -226,7 +254,10 @@ pub async fn dispatch_call(
     args: Value,
 ) -> Option<Result<ToolOutput, ToolError>> {
     let route = snapshot.get(name)?;
-    if !route.transport.health().await {
+    // Bounded probe: a worker that accepts but never answers a health check
+    // must surface as "unavailable", never hang this call (fault isolation —
+    // one dead worker only fails its own tools).
+    if !health_bounded(&route.transport).await {
         return Some(Err(ToolError::Execution(worker_unavailable_text(&route.worker_id))));
     }
     Some(route.transport.call(name, args).await)
@@ -252,23 +283,30 @@ pub async fn merge_catalog(local_tools: Vec<Value>, snapshot: &RouteTableSnapsho
     let mut tools = local_tools;
 
     // De-dupe workers so a worker advertising many tools is health-checked
-    // once, not once per tool.
-    let mut checked: HashMap<String, bool> = HashMap::new();
+    // ONCE, not once per tool. Probe every distinct worker CONCURRENTLY,
+    // each under a bounded timeout (see `health_bounded`), so one worker
+    // that accepts-but-never-answers can neither block its siblings nor
+    // stall `tools/list` as a whole — fault isolation: a hung/dead worker
+    // only fails its own tools.
+    let mut unique_workers: HashMap<String, Arc<dyn WorkerTransport>> = HashMap::new();
+    for route in snapshot.all() {
+        if local_names.contains(route.tool.name.as_str()) {
+            continue; // compiled-in wins -- documented precedence
+        }
+        unique_workers.entry(route.worker_id.clone()).or_insert_with(|| route.transport.clone());
+    }
+
+    let probes = unique_workers.into_iter().map(|(worker_id, transport)| async move {
+        (worker_id, health_bounded(&transport).await)
+    });
+    let checked: HashMap<String, bool> = futures_util::future::join_all(probes).await.into_iter().collect();
 
     for route in snapshot.all() {
         if local_names.contains(route.tool.name.as_str()) {
             // Compiled-in wins -- documented precedence.
             continue;
         }
-        let healthy = match checked.get(&route.worker_id) {
-            Some(h) => *h,
-            None => {
-                let h = route.transport.health().await;
-                checked.insert(route.worker_id.clone(), h);
-                h
-            }
-        };
-        if !healthy {
+        if !checked.get(&route.worker_id).copied().unwrap_or(false) {
             continue;
         }
         tools.push(serde_json::json!({
@@ -509,5 +547,106 @@ mod tests {
         table.remove_worker("multi");
         let snap2 = table.load();
         assert!(snap2.is_empty());
+    }
+
+    // ── Concurrent installs both survive (no lost update via `rcu`) ───────
+
+    /// Two writers racing to install DIFFERENT tools must both land — a bare
+    /// load→clone→store would let one clobber the other; the `rcu` retry
+    /// loop re-applies against the latest snapshot.
+    #[tokio::test]
+    async fn concurrent_installs_do_not_lose_updates() {
+        let table = Arc::new(RouteTable::new());
+
+        // Many concurrent single-tool installs, each a distinct name from a
+        // distinct worker. With a lost-update bug, the final table would have
+        // far fewer than N routes; with `rcu`, all N survive.
+        const N: usize = 64;
+        let mut handles = Vec::with_capacity(N);
+        for i in 0..N {
+            let table = table.clone();
+            handles.push(tokio::spawn(async move {
+                table.install(WorkerRoute {
+                    worker_id: format!("w{i}"),
+                    transport: Arc::new(StubTransport::new(true, "x")),
+                    tool: tool_info(&format!("tool_{i}")),
+                });
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let snap = table.load();
+        assert_eq!(snap.len(), N, "every concurrent install must survive -- no lost update");
+        for i in 0..N {
+            assert!(snap.get(&format!("tool_{i}")).is_some(), "tool_{i} was lost");
+        }
+    }
+
+    // ── A worker whose health probe HANGS doesn't stall list/call ────────
+
+    /// A [`WorkerTransport`] whose `health()` never returns — models a worker
+    /// that accepts a probe but never answers.
+    struct HangingHealthTransport;
+
+    #[async_trait::async_trait]
+    impl WorkerTransport for HangingHealthTransport {
+        async fn connect(&self) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn call(&self, _name: &str, _args: Value) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput { text: "should never be reached".to_string(), structured: None })
+        }
+        async fn list(&self) -> Result<Vec<String>, TransportError> {
+            Ok(vec![])
+        }
+        async fn health(&self) -> bool {
+            // Never resolves -- `health_bounded`'s timeout must fire.
+            std::future::pending::<()>().await;
+            true
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hanging_worker_does_not_block_tools_list_of_healthy_workers() {
+        let table = RouteTable::new();
+        table.install(WorkerRoute {
+            worker_id: "hung".to_string(),
+            transport: Arc::new(HangingHealthTransport),
+            tool: tool_info("hung_tool"),
+        });
+        table.install(WorkerRoute {
+            worker_id: "alive".to_string(),
+            transport: Arc::new(StubTransport::new(true, "alive")),
+            tool: tool_info("alive_tool"),
+        });
+
+        let snap = table.load();
+        // With paused time, the concurrent probes' `HEALTH_PROBE_TIMEOUT`
+        // auto-advances the clock; the hung worker resolves as unhealthy via
+        // timeout and is skipped, while the healthy worker is listed. If the
+        // hung probe blocked its sibling, this call would never return.
+        let merged = merge_catalog(vec![tool_json("health")], &snap).await;
+        let names: Vec<&str> = merged.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str())).collect();
+        assert!(names.contains(&"health"));
+        assert!(names.contains(&"alive_tool"));
+        assert!(!names.contains(&"hung_tool"), "a hung worker must be excluded from tools/list");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hanging_worker_call_is_a_clean_unavailable_not_a_hang() {
+        let table = RouteTable::new();
+        table.install(WorkerRoute {
+            worker_id: "hung".to_string(),
+            transport: Arc::new(HangingHealthTransport),
+            tool: tool_info("hung_tool"),
+        });
+        let snap = table.load();
+        let res = dispatch_call(&snap, "hung_tool", serde_json::json!({})).await.expect("route present");
+        match res {
+            Err(ToolError::Execution(msg)) => assert!(msg.to_lowercase().contains("unavailable")),
+            other => panic!("expected a clean unavailable error, got {other:?}"),
+        }
     }
 }
