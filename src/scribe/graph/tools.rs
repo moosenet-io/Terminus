@@ -1302,6 +1302,7 @@ pub struct Widget;
             first_seen: now,
             last_seen: now,
             occurrences: 3,
+            crystallize_state: None,
         }
     }
 

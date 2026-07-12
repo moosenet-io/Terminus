@@ -41,15 +41,33 @@
 //!   transient graph build + CXEG-03 structural scoring (see `audit.rs`'s
 //!   `run_audit` and the "Tool: cortex_audit" section below).
 //!
-//! Net result: this module registers 12 tool NAMES total (the 10 from before
+//! Net result: this module registers 13 tool NAMES total (the 10 from before
 //! CXEG-06, plus `cortex_house_style` added live in **CXEG-06**, plus
-//! `cortex_waive` added live in **CXEG-08**). Of those, `cortex_scope`
-//! (CXEG-02), `cortex_review` (CXEG-04), `cortex_audit` (CXEG-11),
-//! `cortex_house_style` (CXEG-06), and `cortex_waive` (CXEG-08) are all real,
-//! live tools (the first four Atlas-backed, `cortex_waive` KGFIND-backed);
-//! the other 7 are pure deprecation aliases with no backend at all.
-//! `test_cortex_tools_registered` below asserts this shape (12 names
-//! present), not the old 10/11-live-tool implementations.
+//! `cortex_waive` added live in **CXEG-08**, plus `cortex_crystallize` added
+//! live in **CXEG-09**). Of those, `cortex_scope` (CXEG-02), `cortex_review`
+//! (CXEG-04), `cortex_audit` (CXEG-11), `cortex_house_style` (CXEG-06),
+//! `cortex_waive` (CXEG-08), and `cortex_crystallize` (CXEG-09) are all real,
+//! live tools (the Atlas-backed ones plus `cortex_waive`/`cortex_crystallize`,
+//! both KGFIND-backed); the other 7 are pure deprecation aliases with no
+//! backend at all. `test_cortex_tools_registered` below asserts this shape
+//! (13 names present), not the old 10/11/12-live-tool implementations.
+//!
+//! ## CXEG-09: `cortex_crystallize` — recurrence + adversarial rule crystallization
+//!
+//! `src/cortex/crystallize.rs` closes the loop between KGFIND recurrence
+//! (`kg_findings`) and durable, enforced house-style guidance: a
+//! `category:consistency|elegance` finding that recurs at or above
+//! `crystallize_min_recurrence` AND survives an adversarial `review_run`
+//! `panel_majority` panel (each provider tries to REFUTE it; majority must
+//! FAIL to refute) graduates to either a Tier-A lint STUB (an inert
+//! scaffold under `src/house_style/`, never auto-wired live) or a prose
+//! house rule appended to `docs/house-style.md`. Dry-run by default; see
+//! `crystallize`'s module doc for the full convergence/degrade contract.
+//! Distinct from — and does not reuse the storage of — KGRULE-01..04's
+//! `kg_rules`/`kg_rule_crystallize`/`kg_rule_promote` (that loop mints
+//! generic enforcement-level rules across ANY category; this one is scoped
+//! specifically to consistency/elegance findings and always emits a
+//! CXEG-05-shaped artifact, never a `kg_rules` row).
 //!
 //! ## CXEG-08: `review_run`'s Stage-5b risk-gate escalation + `cortex_waive`
 //!
@@ -116,6 +134,7 @@ use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
 pub mod audit;
+pub mod crystallize;
 pub mod deprecated;
 pub mod house_style;
 pub mod metrics;
@@ -256,6 +275,16 @@ pub struct CortexConfig {
     /// is refused rather than building a graph over an oversized checkout.
     /// From `CORTEX_AUDIT_MAX_CLONE_BYTES`, default `200_000_000` (200MB).
     pub audit_max_clone_bytes: u64,
+    /// CXEG-09's `cortex_crystallize`: minimum KGFIND recurrence
+    /// (`occurrences`) a `category:consistency|elegance` finding must reach
+    /// before it is even considered a crystallization candidate (before the
+    /// adversarial promotion check runs). From
+    /// `CORTEX_CRYSTALLIZE_MIN_RECURRENCE`, default `3` (mirrors
+    /// `kg_rule_crystallize`'s `DEFAULT_MIN_OCCURRENCES` -- same order of
+    /// magnitude, deliberately a separate knob since this gates a distinct
+    /// artifact type, a lint stub or house-style doc rule, not a `kg_rules`
+    /// row).
+    pub crystallize_min_recurrence: i32,
     /// CXEG-08: master switch for `review_run`'s Stage-5b risk-gate
     /// escalation (`review::mod`'s pre-dispatch panel-widening on a `high`
     /// `cortex_review` band). When `false`, `review_run` never consults
@@ -298,6 +327,7 @@ impl CortexConfig {
             risk_band_elevated_cut: env_f64("CORTEX_RISK_BAND_ELEVATED_CUT", 4.0),
             audit_clone_timeout_secs: env_u64("CORTEX_AUDIT_CLONE_TIMEOUT_SECS", 60),
             audit_max_clone_bytes: env_u64("CORTEX_AUDIT_MAX_CLONE_BYTES", 200_000_000),
+            crystallize_min_recurrence: env_i32("CORTEX_CRYSTALLIZE_MIN_RECURRENCE", crystallize::DEFAULT_MIN_RECURRENCE),
             escalation_enabled: env_flag("CORTEX_ESCALATION_ENABLED", true),
             escalation_add_provider: env_string("CORTEX_ESCALATION_ADD_PROVIDER", "agy"),
         }
@@ -355,6 +385,18 @@ fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
+
+/// Read a non-secret positive `i32` tuning flag; falls back to `default` when
+/// unset, unparseable, or `<= 0` (mirrors [`env_usize`]'s zero-is-invalid
+/// convention -- a zero/negative recurrence threshold would accept every
+/// finding, never the intent of an unset/misconfigured value).
+fn env_i32(key: &str, default: i32) -> i32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(default)
 }
@@ -762,8 +804,9 @@ impl RustTool for CortexHouseStyle {
 /// `cortex_house_style` — live Atlas-derived house-style exemplars as of
 /// CXEG-06; `cortex_review` — live Atlas-backed risk scoring as of CXEG-04;
 /// `cortex_audit` — live Atlas-backed external-repo audit as of CXEG-11;
-/// `cortex_waive` — waiver recording as of CXEG-08) plus the 7 deprecation
-/// aliases for the retired pure-relay tools (see [`deprecated`]).
+/// `cortex_waive` — waiver recording as of CXEG-08; `cortex_crystallize` —
+/// rule crystallization loop as of CXEG-09) plus the 7 deprecation aliases
+/// for the retired pure-relay tools (see [`deprecated`]).
 pub fn register(registry: &mut ToolRegistry) {
     let config = Arc::new(CortexConfig::from_env());
     let house_style_cache = Arc::new(house_style::HouseStyleCache::new());
@@ -780,6 +823,10 @@ pub fn register(registry: &mut ToolRegistry) {
     }));
     let _ = registry.register(Box::new(CortexAudit { config }));
     let _ = registry.register(Box::new(waiver::CortexWaive));
+
+    // CXEG-09: rule crystallization loop (kg_findings recurrence + adversarial
+    // review_run panel_majority promotion -> lint stub / prose house rule).
+    crystallize::register(registry);
 
     deprecated::register(registry);
 }
@@ -812,6 +859,7 @@ mod tests {
             risk_band_elevated_cut: 4.0,
             audit_clone_timeout_secs: 60,
             audit_max_clone_bytes: 200_000_000,
+            crystallize_min_recurrence: crystallize::DEFAULT_MIN_RECURRENCE,
             escalation_enabled: true,
             escalation_add_provider: "agy".to_string(),
         })
@@ -1159,19 +1207,21 @@ mod tests {
     fn test_cortex_tools_registered() {
         let mut registry = ToolRegistry::new();
         register(&mut registry);
-        // 5 "real" tools (cortex_scope live since CXEG-02, cortex_review
+        // 6 "real" tools (cortex_scope live since CXEG-02, cortex_review
         // live since CXEG-04, cortex_audit live since CXEG-11,
         // cortex_house_style live since CXEG-06, cortex_waive live since
-        // CXEG-08) + 7 deprecation aliases = 12 names — the pre-CXEG-08
-        // 11-name surface plus CXEG-08's new `cortex_waive` (an intentional,
-        // additive MCP-listing change).
-        assert_eq!(registry.len(), 12);
+        // CXEG-08, cortex_crystallize live since CXEG-09) + 7 deprecation
+        // aliases = 13 names — the pre-CXEG-08 11-name surface plus CXEG-08's
+        // `cortex_waive` and CXEG-09's `cortex_crystallize` (both intentional,
+        // additive MCP-listing changes).
+        assert_eq!(registry.len(), 13);
         for name in [
             "cortex_scope",
             "cortex_house_style",
             "cortex_review",
             "cortex_audit",
             "cortex_waive",
+            "cortex_crystallize",
             "cortex_stats",
             "cortex_build",
             "cortex_architecture",

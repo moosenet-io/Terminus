@@ -1450,6 +1450,7 @@ mod tests {
             risk_band_elevated_cut: if force_high { 0.0 } else { 4.0 },
             audit_clone_timeout_secs: 60,
             audit_max_clone_bytes: 200_000_000,
+            crystallize_min_recurrence: crate::cortex::crystallize::DEFAULT_MIN_RECURRENCE,
             escalation_enabled: enabled,
             escalation_add_provider: add_provider.to_string(),
         }
