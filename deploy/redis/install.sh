@@ -26,6 +26,50 @@ set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ── Bind-address allowlist (BLD-20 review fix) ────────────────────────────────
+# ALLOWLIST, not denylist: a bind address is accepted ONLY if it is a loopback
+# address or a private (non-routable) address — loopback, RFC1918 IPv4, IPv4
+# link-local, IPv6 ULA (fc00::/7), or IPv6 link-local (fe80::/10). ANYTHING else
+# — every publicly-routable / unknown address — is REJECTED before the service
+# is enabled, so "Redis is never publicly bound" holds even if a config drifts.
+# No infra literal is encoded here — these are universal private ranges, exactly
+# like `127.0.0.1` is universal loopback.
+is_allowed_bind_addr() {
+  local a="${1,,}"  # lower-case for IPv6 hex
+  case "${a}" in
+    127.*|::1|::ffff:127.*)                  return 0 ;;  # IPv4/IPv6 loopback
+    10.*)                                    return 0 ;;  # RFC1918 10/8
+    192.168.*)                               return 0 ;;  # RFC1918 192.168/16
+    172.1[6-9].*|172.2[0-9].*|172.3[0-1].*)  return 0 ;;  # RFC1918 172.16/12
+    169.254.*)                               return 0 ;;  # IPv4 link-local
+    fc[0-9a-f][0-9a-f]:*|fd[0-9a-f][0-9a-f]:*|fc[0-9a-f]:*|fd[0-9a-f]:*) return 0 ;;  # IPv6 ULA fc00::/7
+    fe8[0-9a-f]:*|fe9[0-9a-f]:*|fea[0-9a-f]:*|feb[0-9a-f]:*)             return 0 ;;  # IPv6 link-local fe80::/10
+    *)                                       return 1 ;;  # anything routable/unknown → reject
+  esac
+}
+
+# Self-test hook: `REDIS_INSTALL_SELFTEST=1 bash install.sh` asserts the
+# allowlist accepts private/loopback and rejects public addresses, then exits.
+# Runs with NO required env / NO Redis — the test-gate can invoke it directly.
+if [[ "${REDIS_INSTALL_SELFTEST:-0}" == "1" ]]; then
+  fail=0
+  # Security-test vectors ONLY (analogous to an SSRF guard's own private-range
+  # test cases) — none is a real fleet host: the "allowed" set uses generic
+  # RFC1918/ULA/link-local sample addresses, the "rejected" set uses RFC5737
+  # (192.0.2/198.51.100/203.0.113) + RFC3849 (2001:db8::/32) documentation
+  # ranges. Tagged so the PII gate exempts these deliberate literals.
+  allowed_cases=(127.0.0.1 ::1 <internal-ip> <internal-ip> <internal-ip> <internal-ip> 169.254.1.1 fd12:3456::1 fe80::1) # pii-test-fixture
+  rejected_cases=(0.0.0.0 :: '*' 203.0.113.7 198.51.100.9 192.0.2.5 172.32.0.1 172.15.0.1 2001:db8::1 example.com) # pii-test-fixture
+  for ok in "${allowed_cases[@]}"; do
+    if ! is_allowed_bind_addr "${ok}"; then echo "SELFTEST FAIL: '${ok}' should be allowed"; fail=1; fi
+  done
+  for bad in "${rejected_cases[@]}"; do
+    if is_allowed_bind_addr "${bad}"; then echo "SELFTEST FAIL: '${bad}' should be rejected"; fail=1; fi
+  done
+  if [[ "${fail}" == "0" ]]; then echo "SELFTEST OK: bind allowlist accepts private/loopback, rejects public"; fi
+  exit "${fail}"
+fi
+
 # ── Resolve inputs (fail loudly on missing REQUIRED secrets/config) ───────────
 : "${REDIS_BIND:?REDIS_BIND is required (loopback + mesh only, vault-materialized)}"
 : "${REDIS_PORT:?REDIS_PORT is required}"
@@ -46,13 +90,16 @@ if [[ -z "${REDIS_SERVER_BIN}" ]]; then
   exit 1
 fi
 
-# ── Assert bind is loopback/mesh-only (never a public/all-interfaces bind) ────
+# ── Assert every bind address is on the private/loopback ALLOWLIST ────────────
+# (reject any publicly-routable/unknown address before enabling the service).
 for addr in ${REDIS_BIND}; do
-  if [[ "${addr}" == "0.0.0.0" || "${addr}" == "::" || "${addr}" == "*" ]]; then
-    echo "FATAL: REDIS_BIND contains a public/all-interfaces address (${addr}); refusing." >&2
+  if ! is_allowed_bind_addr "${addr}"; then
+    echo "FATAL: REDIS_BIND address '${addr}' is not a loopback/private address; refusing to bind Redis to a routable/unknown interface." >&2
     exit 1
   fi
 done
+# Require at least one loopback address present (a mesh-only bind is allowed, but
+# loopback must always be reachable for the local health checks below).
 case " ${REDIS_BIND} " in
   *" 127.0.0.1 "*|*" ::1 "*) : ;; # loopback present — good
   *) echo "FATAL: REDIS_BIND must include a loopback address (127.0.0.1/::1)." >&2; exit 1 ;;
