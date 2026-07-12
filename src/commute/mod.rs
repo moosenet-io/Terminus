@@ -61,6 +61,14 @@ impl CommuteConfig {
             .map_err(|e| ToolError::Http(e.to_string()))
     }
 
+    /// CXEG-05 house-style: `SF511_API_TOKEN` is secret-shaped, so it is read
+    /// through this one dedicated accessor (mirrors `wizard_db_url`/
+    /// `vector_db_url`/this file's own `CommuteConfig::from_env` above)
+    /// rather than inline in `TransitPlan::execute` below.
+    fn sf511_api_token() -> Option<String> {
+        std::env::var("SF511_API_TOKEN").ok().filter(|s| !s.is_empty())
+    }
+
     /// Resolve a user-supplied location into a concrete address string.
     /// Named keywords map to the configured env values; everything else is
     /// returned as-is (a literal address or "lat,lon") for geocoding.
@@ -522,13 +530,10 @@ Muni, SamTrans, VTA) via 511.org. Pass origin and destination addresses or 'lat,
     async fn execute(&self, _args: Value) -> Result<String, ToolError> {
         // 511.org requires a free API token. Until SF511_API_TOKEN is set, return a
         // clear, actionable message rather than fabricating transit data.
-        let _token = std::env::var("SF511_API_TOKEN")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| ToolError::NotConfigured(
-                "Public transit needs a free 511.org token. Get one at \
-                 https://511.org/open-data/token and set SF511_API_TOKEN.".into()
-            ))?;
+        let _token = CommuteConfig::sf511_api_token().ok_or_else(|| ToolError::NotConfigured(
+            "Public transit needs a free 511.org token. Get one at \
+             https://511.org/open-data/token and set SF511_API_TOKEN.".into()
+        ))?;
         // NOTE: 511.org trip-planning wiring lands once a token is configured.
         Err(ToolError::NotConfigured(
             "SF511_API_TOKEN is set but the 511 trip-planner is not yet wired. \

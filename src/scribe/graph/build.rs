@@ -69,7 +69,14 @@ fn req_str(args: &Value, key: &str) -> Result<String, ToolError> {
 /// Recursively collect `(repo_relative_path, source)` for every `.rs` file
 /// under `root`, skipping build/vcs dirs and oversized files. Returns whether
 /// the file cap was hit.
-fn walk_rs(root: &Path) -> Result<(Vec<(String, String)>, bool), ToolError> {
+/// `pub(crate)` (not just module-private) so `cortex::audit`'s CXEG-11
+/// external-repo audit can reuse the exact same allowlisted-language file
+/// walk (skip dirs, symlink-escape guard, file-count/size caps) instead of a
+/// second implementation — the walk itself has no opinion on WHERE `root`
+/// came from; `scribe_kg_build`'s caller confines `root` via
+/// `is_repo_path_allowed`, `cortex_audit`'s confines it by construction (an
+/// isolated scratch dir it just cloned into, never operator input).
+pub(crate) fn walk_rs(root: &Path) -> Result<(Vec<(String, String)>, bool), ToolError> {
     let mut out = Vec::new();
     let mut capped = false;
     let mut stack = vec![root.to_path_buf()];

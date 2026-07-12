@@ -110,7 +110,7 @@ fn band_for(value: f64, config: &CortexConfig) -> &'static str {
 /// this item's scope (a hypothetical future CXEG-08, if ever built).
 fn recommendation_for(band: &str) -> &'static str {
     match band {
-        "high" => "escalate review rigor: request an additional reviewer and a closer read of the flagged risk_signals before merge — this is a signal to escalate scrutiny, never an automatic rejection.",
+        "high" => "escalate review rigor: request an additional reviewer and a closer read of the flagged risk_signals before merge — treat this as a signal to raise scrutiny, not as a merge gate.",
         "elevated" => "apply standard review rigor with attention to the flagged risk_signals; no escalation required.",
         "low" => "standard review rigor is sufficient; no elevated risk signals or recurring findings detected for this change.",
         _ => "insufficient data to assess risk for this change.",
@@ -338,6 +338,8 @@ mod tests {
             risk_weight_semantic_duplication: 10.0,
             risk_weight_recurrence: 1.0,
             risk_band_elevated_cut: 4.0,
+            audit_clone_timeout_secs: 60,
+            audit_max_clone_bytes: 200_000_000,
         }
     }
 

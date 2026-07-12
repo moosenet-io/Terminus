@@ -465,6 +465,7 @@ This README is the front door; everything past "at a glance" lives in
 | [`docs/networking/`](docs/networking/) | WireGuard and Tailscale transport options for reaching a Terminus deployment off-LAN, including the optional embedded-tsnet mode (MESH-04, `tsnet` Cargo feature — no host `tailscaled` required; see [`docs/networking/tailscale.md`](docs/networking/tailscale.md#alternative-embedded-tsnet-mesh-04--no-host-tailscaled-at-all)). |
 | [`docs/deploy/`](docs/deploy/) | Client enrollment/deploy guide and the personal-services (`terminus_personal`/`terminus_primary`) deployment guide. |
 | [`docs/tools/`](docs/tools/README.md) | The full tool index — all 53 modules grouped by domain, plus the **MINT** flagship harness. |
+| [`docs/house-style.md`](docs/house-style.md) | The Tier-A house-style rule catalog (deterministic `syn`-AST checks run in the test gate via `cargo test -p terminus-rs`) — secret-shaped env vars, non-empty tool descriptions, no `panic!` in `execute`, and the `// house-style-allow: <reason>` waiver convention. |
 
 ## Atlas — knowledge-graph query tools
 
@@ -786,11 +787,20 @@ Its risk/elegance surface is rebuilt over the following S115 items:
   non-empty deterministic `why`, and a resolvable anchor node; see
   `docs/tools/code-git/cortex.md`'s "Tier-B structural-elegance signals"
   section for the full signal catalog.
-- `cortex_audit` — audit an external public repo URL (stub pending **CXEG-11**);
-  its SSRF-hardened `validate_repo_url` front-gate (`src/cortex/audit.rs`) is
-  live now — it rejects non-http(s) schemes, embedded credentials, shell
-  metacharacters, and loopback/private/link-local/metadata hosts in their
-  common obfuscated encodings (fail-closed).
+- `cortex_audit` — audit an external public repo URL, live as of **CXEG-11**:
+  `url` first passes the unchanged SSRF-hardened `validate_repo_url`
+  front-gate (`src/cortex/audit.rs`) — it rejects non-http(s) schemes,
+  embedded credentials, shell metacharacters, and loopback/private/link-local
+  /metadata hosts in their common obfuscated encodings (fail-closed) — then
+  the tool clones the url into an isolated, always-cleaned-up scratch
+  directory (shallow, no submodules, no repo code ever executes), statically
+  extracts a transient (never persisted) Atlas graph via the same
+  `build_rust_graph`/`walk_rs` path `scribe_kg_build` uses, runs the CXEG-03
+  structural-elegance detectors (`metrics::compute_structural_signals`) over
+  the whole repo, and returns a report before deleting the clone. Clone size
+  and time are bounded (`CORTEX_AUDIT_MAX_CLONE_BYTES` /
+  `CORTEX_AUDIT_CLONE_TIMEOUT_SECS`) — an oversized or slow clone is refused,
+  not silently truncated.
 
 The seven retired graph-relay tools are kept only as zero-I/O **deprecation
 aliases** (`src/cortex/deprecated.rs`) that return a structured

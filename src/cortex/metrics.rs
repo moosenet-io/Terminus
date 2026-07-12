@@ -556,6 +556,8 @@ mod tests {
             risk_weight_semantic_duplication: 10.0,
             risk_weight_recurrence: 1.0,
             risk_band_elevated_cut: 4.0,
+            audit_clone_timeout_secs: 60,
+            audit_max_clone_bytes: 200_000_000,
         }
     }
 

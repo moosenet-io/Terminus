@@ -34,18 +34,18 @@
 //!   `docs/tools/code-git/cortex.md`'s `cortex_review` section for the full
 //!   rubric.
 //! - `cortex_audit` keeps its `url` parameter and its existing
-//!   `validate_repo_url` front-gate (`audit.rs` — untouched, SSRF-hardened
-//!   URL validation with no dependency on the deleted SSH helpers), but its
-//!   `execute` body is likewise a stub: **CXEG-11** rebuilds its backend
-//!   (presumably against a sandboxed local clone + Atlas build, not a remote
-//!   relay). See the stub `execute` body below for the exact pending-item
-//!   reference.
+//!   `validate_repo_url` front-gate (`audit.rs` — SSRF-hardened URL
+//!   validation with no dependency on the deleted SSH helpers). **CXEG-11**
+//!   (merged from `main`) replaced its stub `execute` body with a real
+//!   Atlas-backed audit: an isolated, always-cleaned-up scratch clone +
+//!   transient graph build + CXEG-03 structural scoring (see `audit.rs`'s
+//!   `run_audit` and the "Tool: cortex_audit" section below).
 //!
 //! Net result: this module registers 10 tool NAMES total (unchanged from
 //! before, so no MCP-surface churn for callers listing tools). Of those,
-//! `cortex_scope` (CXEG-02) and `cortex_review` (CXEG-04) are real, live
-//! Atlas-backed tools; `cortex_audit` remains an Atlas-rebuild-pending stub;
-//! and the other 7 are pure deprecation aliases with no backend at all.
+//! `cortex_scope` (CXEG-02), `cortex_review` (CXEG-04), and `cortex_audit`
+//! (CXEG-11, merged from `main`) are all real, live Atlas-backed tools; and
+//! the other 7 are pure deprecation aliases with no backend at all.
 //! `test_cortex_tools_registered` below asserts this shape (10 names
 //! present), not the old 10-live-relay-tools implementation.
 //!
@@ -201,6 +201,16 @@ pub struct CortexConfig {
     /// should be flagged for escalation," which is exactly the high-band
     /// boundary). From `CORTEX_RISK_BAND_ELEVATED_CUT`, default `4.0`.
     pub risk_band_elevated_cut: f64,
+    /// CXEG-11's `cortex_audit`: wall-clock ceiling (seconds) on the
+    /// isolated `git clone` of an external audit target before it is killed
+    /// and treated as a failure (scratch dir is still cleaned up). From
+    /// `CORTEX_AUDIT_CLONE_TIMEOUT_SECS`, default `60`.
+    pub audit_clone_timeout_secs: u64,
+    /// CXEG-11's `cortex_audit`: byte ceiling on a cloned external repo
+    /// (measured after clone, before any graph build) above which the audit
+    /// is refused rather than building a graph over an oversized checkout.
+    /// From `CORTEX_AUDIT_MAX_CLONE_BYTES`, default `200_000_000` (200MB).
+    pub audit_max_clone_bytes: u64,
 }
 
 impl CortexConfig {
@@ -221,8 +231,22 @@ impl CortexConfig {
             risk_weight_semantic_duplication: env_f64("CORTEX_RISK_WEIGHT_SEMANTIC_DUPLICATION", 10.0),
             risk_weight_recurrence: env_f64("CORTEX_RISK_WEIGHT_RECURRENCE", 1.0),
             risk_band_elevated_cut: env_f64("CORTEX_RISK_BAND_ELEVATED_CUT", 4.0),
+            audit_clone_timeout_secs: env_u64("CORTEX_AUDIT_CLONE_TIMEOUT_SECS", 60),
+            audit_max_clone_bytes: env_u64("CORTEX_AUDIT_MAX_CLONE_BYTES", 200_000_000),
         }
     }
+}
+
+/// Read a non-secret unsigned 64-bit tuning flag; falls back to `default`
+/// when unset, unparseable, or `0` (mirrors [`env_usize`]'s zero-is-invalid
+/// convention — a zero clone timeout/size ceiling is never the intent of an
+/// unset/misconfigured value).
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
 }
 
 /// Read a non-secret float tuning flag; falls back to `default` when unset
@@ -485,7 +509,7 @@ impl RustTool for CortexReview {
 }
 
 // ---------------------------------------------------------------------------
-// Tool: cortex_audit (stub — real backend rebuild is CXEG-11)
+// Tool: cortex_audit (CXEG-11: live, Atlas-backed external-repo audit)
 // ---------------------------------------------------------------------------
 
 pub struct CortexAudit {
@@ -499,15 +523,18 @@ impl RustTool for CortexAudit {
     }
 
     fn description(&self) -> &str {
-        "PENDING REBUILD (CXEG-11): audit an external public Git repository. \
-         The SSH-relay-era implementation (which delegated clone + graph \
-         build + report generation to a script on the now-retired fleet \
-         host) has been retired. The url argument still passes through the \
-         existing SSRF-hardened validator (only public http/https URLs are \
-         accepted), but execute() currently returns a structured pending \
-         pointer rather than performing a live audit — the real backend \
-         (presumably a sandboxed local clone + Atlas build) lands in \
-         CXEG-11."
+        "Audit an external public Git repository's structural elegance. As \
+         of CXEG-11: clones the url into an isolated, always-cleaned-up \
+         scratch directory (shallow, no submodules, no repo code ever \
+         executes), statically extracts a transient (never persisted) Atlas \
+         knowledge graph, runs the CXEG-03 structural-elegance detectors \
+         (centrality/complexity/fan-out/community-boundary signals) over the \
+         whole repo, and returns a report -- then deletes the clone. The url \
+         first passes the unchanged SSRF-hardened validator (only public \
+         http/https URLs to non-private/loopback/link-local/metadata hosts \
+         are accepted). Clone size and time are bounded \
+         (CORTEX_AUDIT_MAX_CLONE_BYTES / CORTEX_AUDIT_CLONE_TIMEOUT_SECS); an \
+         oversized or slow clone is refused, not silently truncated."
     }
 
     fn parameters(&self) -> Value {
@@ -524,24 +551,10 @@ impl RustTool for CortexAudit {
         let url = require_str(&args, "url")?;
         // Front-gate unchanged from the SSH-relay era: SSRF-hardened URL
         // validation (`audit.rs`, no dependency on the deleted SSH helpers)
-        // runs BEFORE anything else, same as it always has.
+        // runs BEFORE anything else, including before the clone attempt.
         validate_repo_url(url)?;
 
-        // CXEG-11 rebuilds this tool's actual backend (sandboxed local
-        // clone + Atlas KG build, replacing the retired remote-script
-        // relay). Until then, a valid URL gets a structured pending
-        // pointer instead of a live audit -- no network I/O happens here.
-        let response = json!({
-            "status": "pending",
-            "item": "CXEG-11",
-            "tool": "cortex_audit",
-            "url": url,
-            "message": "cortex_audit's SSH-relay-era backend has been \
-                retired; a locally-sandboxed clone + Atlas-build \
-                implementation lands in CXEG-11. The url has passed \
-                SSRF-hardened validation but no audit has been performed.",
-            "dup_cosine_threshold": self.config.dup_cosine,
-        });
+        let response = audit::run_audit(url, &self.config).await?;
         serde_json::to_string_pretty(&response)
             .map_err(|e| ToolError::Execution(format!("JSON render error: {e}")))
     }
@@ -554,8 +567,9 @@ impl RustTool for CortexAudit {
 /// Register all Cortex tools into the ToolRegistry: the 3 "real" tools
 /// (`cortex_scope` — live Atlas-backed blast radius as of CXEG-02;
 /// `cortex_review` — live Atlas-backed risk scoring as of CXEG-04;
-/// `cortex_audit` — still an Atlas-rebuild-pending stub) plus the 7
-/// deprecation aliases for the retired pure-relay tools (see [`deprecated`]).
+/// `cortex_audit` — live Atlas-backed external-repo audit as of CXEG-11)
+/// plus the 7 deprecation aliases for the retired pure-relay tools (see
+/// [`deprecated`]).
 pub fn register(registry: &mut ToolRegistry) {
     let config = Arc::new(CortexConfig::from_env());
 
@@ -595,6 +609,8 @@ mod tests {
             risk_weight_semantic_duplication: 10.0,
             risk_weight_recurrence: 1.0,
             risk_band_elevated_cut: 4.0,
+            audit_clone_timeout_secs: 60,
+            audit_max_clone_bytes: 200_000_000,
         })
     }
 
@@ -895,7 +911,7 @@ mod tests {
         std::env::remove_var("SCRIBE_KG_STORE_DIR");
     }
 
-    // --- cortex_audit (stub, still SSRF-gated) ---------------------------------
+    // --- cortex_audit (CXEG-11 real, SSRF-gated; clone/build in audit::tests) --
 
     #[tokio::test]
     async fn test_audit_rejects_non_public_url_before_stub_response() {
@@ -918,17 +934,20 @@ mod tests {
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
+    // NOTE: CXEG-11 made `cortex_audit` actually clone its `url` (into an
+    // isolated, cleaned-up scratch dir) and build a real Atlas graph over
+    // it, so a "valid URL succeeds" test through this wiring layer would
+    // require live network access to an external host -- not appropriate
+    // for a hermetic unit test. The full clone -> build -> report pipeline
+    // (success, size-ceiling rejection, no-supported-files rejection,
+    // cleanup-on-success/failure/panic) is covered against LOCAL git
+    // fixtures (no network) in `audit::tests`; this module's tests cover
+    // only argument validation and the SSRF front-gate ordering.
     #[tokio::test]
-    async fn test_audit_returns_pending_pointer_for_valid_url() {
+    async fn test_audit_missing_url_is_invalid_argument() {
         let tool = CortexAudit { config: test_config() };
-        let out = tool
-            .execute(json!({"url": "https://github.com/octocat/Hello-World"}))
-            .await
-            .expect("valid url must succeed with a pending pointer, not an error");
-        let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["status"], "pending");
-        assert_eq!(v["item"], "CXEG-11");
-        assert_eq!(v["url"], "https://github.com/octocat/Hello-World");
+        let err = tool.execute(json!({})).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
     // --- registration -----------------------------------------------------------
@@ -938,7 +957,7 @@ mod tests {
         let mut registry = ToolRegistry::new();
         register(&mut registry);
         // 3 "real" tools (cortex_scope live since CXEG-02, cortex_review
-        // live since CXEG-04, cortex_audit still pending) + 7 deprecation
+        // live since CXEG-04, cortex_audit live since CXEG-11) + 7 deprecation
         // aliases = 10 names, matching the pre-CXEG-01 tool-name surface
         // (no MCP-listing churn).
         assert_eq!(registry.len(), 10);
