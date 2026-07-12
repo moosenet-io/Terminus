@@ -21,7 +21,15 @@ export function useRalphState(): { loops: RalphLoop[]; handleEvent: (e: WsEvent)
         return [...prev, loop];
       });
 
-      // Schedule fade-out for completed loops
+      // Always clear any pending fade-out timer for this loop before (re)deciding — prevents
+      // a leaked/duplicate timer when a completed loop receives another update, and cancels a
+      // stale deletion if the loop comes back to life (done/failed -> running).
+      const existing = completedTimers.current.get(loop.id);
+      if (existing) {
+        clearTimeout(existing);
+        completedTimers.current.delete(loop.id);
+      }
+      // Schedule a single fade-out for completed loops.
       if (loop.phase === 'done' || loop.phase === 'failed') {
         const timer = setTimeout(() => {
           setLoops(prev => prev.filter(l => l.id !== loop.id));
