@@ -9,10 +9,20 @@ Scribe documentation engine (see `mod.rs` for the module overview).
 (`path`/`node`/`community`/`global`, matching `findings_store::ScopeKind`)
 into a best-effort Cortex risk score in `0.0..=1.0`, so rule crystallization
 (KGRULE-02) can prioritize high-risk recurring findings. It is intentionally
-thin: it does not talk SSH itself, does not read `CORTEX_SSH_*` beyond a
-single "is it set" check, and does not know anything about Cortex's wire
-protocol — it calls the existing `crate::cortex` tool (`cortex_review`)
-through a scratch `ToolRegistry` and parses its JSON response.
+thin: it does not know anything about Cortex's internals — it calls the
+existing `crate::cortex` tool (`cortex_review`) through a scratch
+`ToolRegistry` and parses its JSON response.
+
+**CXEG-01 update:** Cortex's SSH-relay-era transport to the (now-retired)
+fleet host has been removed entirely — there is no SSH client, no host, no
+`CORTEX_SSH_*` config surface left in `crate::cortex` at all. `cortex_review`
+is currently a principled pending-rebuild stub (its real Atlas-backed
+implementation lands in CXEG-04) that always returns a
+`{"status":"pending","item":"CXEG-04",...}` pointer with no `risk_score`
+field, so `cortex_risk_for_scope` always returns `None` today, by design —
+this is within its own documented degrade contract ("a well-formed but
+risk-less response → `None`"), not a bug. No code change will be needed here
+once CXEG-04 lands a real `risk_score`.
 
 **Degrade contract — this function can never fail the caller:**
 
@@ -21,20 +31,18 @@ through a scratch `ToolRegistry` and parses its JSON response.
 - `scope_kind` of `"community"` or `"global"` → `None` immediately (Cortex
   has no per-community/global risk concept; only `"path"` and `"node"` are
   supported).
-- `CORTEX_SSH_HOST` unset/empty → `None` immediately, with **no SSH attempt
-  at all** — this is checked before `crate::cortex` is touched.
-- Any failure in the underlying `cortex_review` call (unreachable host, auth
-  failure, remote error, `NotConfigured` surfacing late, task join error) →
-  `None`.
-- A well-formed but risk-less response (including `crate::cortex`'s
-  `{"raw": "..."}` shape for non-JSON remote stdout) → `None`.
+- Any failure in the underlying `cortex_review` call (`InvalidArgument`, task
+  join error) → `None`.
+- A well-formed but risk-less response (as of CXEG-01, this is the expected
+  case for every call — see above) → `None`.
 
 Risk extraction (`extract_risk`, private, pure, fully unit-tested) looks for a
 numeric risk field at the top level and one level deep under `result`, and
 normalizes to this bridge's `0.0..=1.0` contract:
 - **`risk_score`** — Cortex's own DOCUMENTED field (`cortex_review`'s `0-10`
-  scale) — is the primary field and is **rescaled** `0-10 → 0-1` (÷10), then
-  clamped. This rescales against Cortex's *documented* scale, not a guess.
+  scale, once CXEG-04 lands it) — is the primary field and is **rescaled**
+  `0-10 → 0-1` (÷10), then clamped. This rescales against Cortex's
+  *documented* scale, not a guess.
 - **`risk`/`score`** — accepted as fallbacks, treated as already-normalized
   `[0,1]` fractions and clamped as-is (never rescaled).
 
@@ -43,10 +51,10 @@ Non-numeric values at those keys are treated as absent, not as a parse error.
 Uses `cortex_review` (not `cortex_scope`) because its documented purpose is
 a post-hoc risk *score* for a set of files — exactly what this bridge needs
 — whereas `cortex_scope` returns blast-radius with no risk score, and the
-crate's other eight Cortex tools return stats/architecture/dependency shapes
-with no risk field at all. `repo` is fixed to `"lumina-terminus"` (this
-crate), one of `crate::cortex`'s own two known-repo values — not an
-infra/host literal.
+crate's 7 deprecated relay-tool aliases return only a
+`{"deprecated":true,...}` pointer, never a risk field. `project_id` is fixed
+to `"TERM"` (this crate), one of `crate::cortex::PROJECT_IDS`' allow-listed
+values — not an infra/host literal.
 
 ## Findings store (`findings_store.rs`, KGFIND-01)
 

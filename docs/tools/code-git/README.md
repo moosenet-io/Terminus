@@ -28,7 +28,7 @@ examples.
 | [`forge.md`](forge.md) | 4 (+4 mirror subtools) | A provider-agnostic git-forge abstraction — one shared endpoint vocabulary with per-adapter capability introspection (`git_private`/`git_public` and their `*_capabilities` companions), split into a private (full R/W) and public (PII-gated, first-publish-gated) pool by governance posture, topped by a fast-forward-only mirror engine (`git_public_mirror_status`/`_prepare`/`_approve`/`_push`). |
 | [`dev.md`](dev.md) | 6 | Path-jailed read/write/run access to a dev workstation over SSH — list/open workspaces, run commands, read/write files, trigger OpenHands. The path-jail is a textual prefix check on filesystem arguments only; command strings are not allowlisted and command execution is not approval-gated (documented explicitly on the page). |
 | [`openhands.md`](openhands.md) | 3 | Drives an external OpenHands agentic-coding runtime over its HTTP API — submit a task, poll its status, list conversations. All three tools are approval-gated (`approval::gate()`), distinct from and stricter than `dev`'s ungated `dev_trigger_openhands`. |
-| [`cortex.md`](cortex.md) | 10 | Code-graph / blast-radius / risk-scoring intelligence over a repo — scope, review, audit, stats, build/index, architecture, deps, recent, community, flows. An SSH-relay module with no local graph engine; `cortex_audit` carries an SSRF-hardened URL validator for external-repo auditing. |
+| [`cortex.md`](cortex.md) | 10 (3 live + 7 deprecated aliases) | **CXEG-01: SSH-relay era retired.** `cortex_scope`/`cortex_review`/`cortex_audit` are principled pending-rebuild stubs (Atlas-backed rebuilds land in CXEG-02/04/11); `cortex_audit` keeps its SSRF-hardened URL validator. The other 7 names (`cortex_stats`/`cortex_build`/`cortex_deps`/`cortex_recent`/`cortex_community`/`cortex_architecture`/`cortex_flows`) are zero-I/O deprecation aliases pointing at the Atlas KG's `kg_*` tools. |
 | [`scribe.md`](scribe.md) | 5 | Terminus's in-repo, LLM-backed documentation agent — inspects real source via read-only git worktrees, generates READMEs / wiki pages / build-diary entries through the review daemon, writes them to a git-backed Obsidian vault, and files doc/code discrepancies as deduplicated Plane issues. |
 | [`docgen.md`](docgen.md) | 5+ | **S95.** The sovereign, config-driven documentation engine that replaces Mintlify — per-project doc-target config (readme/wiki/pdf/notion/obsidian/blog), `docgen_status`, PII-swept generation via Chord's SLM router, multi-format rendering, versioning, and `docgen_run` — the post-feat build-skill trigger (DOCGEN-08) that assembles the whole flow into one entry point and returns versioned artifacts for the harness to place. |
 
@@ -47,7 +47,9 @@ examples.
   to an external runtime and gates every call behind operator approval. The page for each
   states its exact guardrails rather than assuming symmetry.
 - **`cortex` and `scribe` are read-oriented.** `cortex` analyzes a repository's shape and
-  risk without mutating it; `scribe` reads source and *produces* documentation artifacts.
+  risk without mutating it (as of CXEG-01, its `cortex_scope`/`cortex_review`/`cortex_audit`
+  tools are pending Atlas-backed rebuilds and return structured pointers rather than live
+  analysis — see `cortex.md`); `scribe` reads source and *produces* documentation artifacts.
   Neither is a substitute for the source-control write tools — they inform and document the
   work those tools carry out.
 
