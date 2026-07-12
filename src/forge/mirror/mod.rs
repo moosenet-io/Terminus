@@ -29,6 +29,14 @@
 //!     residuals to 0 (tag-able) or escalates the exact `file:line` spots to the
 //!     operator. Wired into `git_public_mirror_prepare` (GHMR-04).
 //!   * mirror subtools (GHMR-04) build on top.
+//!   * [`runner`] (MRUN-01) — the missing scheduling piece: a single
+//!     idempotent per-repo "run once" orchestration
+//!     (status → backfill+gate → fast-forward sync/push) plus the
+//!     `git_public_mirror_run` tool, driven by
+//!     `deploy/terminus-mirror-runner.timer` so the public mirror keeps
+//!     advancing without an operator remembering to run the GHIST tools by
+//!     hand. Orchestration only — see the module doc for why it never
+//!     duplicates git/PII/transport logic and never force-pushes.
 //!
 //! The mechanical rewrite writes ONLY into a provided work-dir copy — never the
 //! source repo. Producing and syncing that copy is GHMR-03's ([`workdir`])
@@ -38,6 +46,7 @@ pub mod clean;
 pub mod history;
 pub mod native_clean;
 pub mod pr_replay;
+pub mod runner;
 pub mod sweep;
 pub mod tools;
 pub mod workdir;

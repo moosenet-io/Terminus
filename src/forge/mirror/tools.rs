@@ -1891,11 +1891,139 @@ impl RustTool for GitPublicMirrorReplayPr {
     }
 }
 
-/// Register all four GHMR-04 mirror subtools plus the GHIST history tools. Called
-/// from [`crate::github::register`], so they attach to whichever registry github is
-/// registered against (the CORE registry via `register_all`, the personal
-/// registry via `register_personal`). Unconditional: no GitHub credential is
-/// needed to construct them; `git_public_mirror_push` reads the token lazily at call
+// ── MRUN-01: thin execute() wrappers for the runner ─────────────────────────
+//
+// `runner::run_once` (MRUN-01) orchestrates the GHIST history tools above —
+// status, backfill+gate, sync — as a single idempotent per-repo pass driven by
+// a systemd timer instead of an operator. Its `RealHistoryOps` impl needs to
+// invoke `GitPublicHistoryStatus`/`Backfill`/`Sync`, but those structs are
+// private to this module (dispatch-only, like every other tool here). Rather
+// than making them `pub` (which would let other code construct/registrer them
+// outside `register()`), these three `pub(crate)` functions are the sole
+// crate-internal seam: they call the SAME `execute()` the registry dispatches
+// to, so the runner reuses 100% of the existing status/backfill/gate/sync
+// logic (including the fail-closed TERMINUS_MIRROR_AUTHOR_MAP checks, the
+// fast-forward analysis, and the never-force push transport) with zero
+// duplication.
+
+/// Invoke [`GitPublicHistoryStatus`] exactly as the registry would.
+pub(crate) async fn history_status(args: Value) -> Result<String, ToolError> {
+    GitPublicHistoryStatus.execute(args).await
+}
+
+/// Invoke [`GitPublicHistoryBackfill`] exactly as the registry would (full
+/// backfill on first run, incremental append + full-history gate thereafter;
+/// NEVER pushes).
+pub(crate) async fn history_backfill(args: Value) -> Result<String, ToolError> {
+    GitPublicHistoryBackfill.execute(args).await
+}
+
+/// Invoke [`GitPublicHistorySync`] exactly as the registry would (fast-
+/// forward-only, gate-gated, never creates a baseline, never forces).
+pub(crate) async fn history_sync(args: Value) -> Result<String, ToolError> {
+    GitPublicHistorySync.execute(args).await
+}
+
+/// The going-forward push-boundary state a mirror-runner pass needs to know
+/// BEFORE it advances the local history work-dir via backfill (MRUN-01).
+pub(crate) enum PushBoundary {
+    /// `.git/ghist/pushed-head` is (now) established at a commit the public
+    /// remote's `main` is an ancestor of — a runner-driven backfill can safely
+    /// advance HEAD and `git_public_history_sync` will still fast-forward.
+    Established,
+    /// The remote is un-bootstrapped, or diverged from the local blessed
+    /// baseline — the runner must report `needs_operator_rebaseline` (the
+    /// one-time GHIST-07 bootstrap) and must NOT backfill or push.
+    NeedsOperator(String),
+}
+
+/// Establish the going-forward push boundary for `repo` from the PRE-backfill
+/// baseline, so a mirror-runner (MRUN-01) can safely backfill (which advances
+/// the local history work-dir HEAD) BEFORE calling `git_public_history_sync`.
+///
+/// ## Why this exists — the ordering bug it fixes
+/// `git_public_history_sync` initialises its `.git/ghist/pushed-head` marker,
+/// on the FIRST sync after an operator's GHIST-07 bless, by requiring the
+/// public remote's `main` tip to equal the PRE-replay local baseline (see the
+/// `pushed_head` match in [`GitPublicHistorySync::execute`]). The runner,
+/// however, runs `git_public_history_backfill` FIRST (to full-history-gate the
+/// new commits), which advances the work-dir HEAD from baseline `B` to the new
+/// tip `C`. If `sync` then ran its own first-time init it would compare the
+/// remote (still at `B`) against the already-advanced HEAD (`C`), see `B != C`,
+/// and wrongly return `Conflict` — so a genuinely fast-forwardable `B -> C`
+/// would be misclassified as needing an operator re-baseline and never pushed.
+///
+/// Calling this BEFORE backfill pins `pushed-head` to `B` (the pre-backfill
+/// baseline) exactly as `sync` itself would have, so `sync` later takes its
+/// marker-present path and its ff-detection stays correct — WITHOUT relaxing
+/// `sync`'s own (deliberately strict) first-run semantics for direct callers.
+/// It never force-pushes: genuine divergence (remote not an ancestor of the
+/// local baseline) or an un-bootstrapped remote returns
+/// [`PushBoundary::NeedsOperator`], and the runner stops there.
+pub(crate) fn ensure_push_boundary(args: &Value) -> Result<PushBoundary, ToolError> {
+    let repo = req_str(args, "repo")?;
+    validate_repo(repo)?;
+    let source = resolve_source(args, repo)?;
+    ensure_source_is_main(&source)?;
+    let hwd = history_workdir(repo)?;
+
+    // No established lineage → a first baseline is strictly an operator action
+    // (GHIST-07); never auto-created here.
+    if last_mirrored_sha(&hwd).is_none() || !hwd.join(".git").is_dir() {
+        return Ok(PushBoundary::NeedsOperator(format!(
+            "no established history lineage for '{repo}' — establish it via \
+             git_public_history_backfill + operator bless + force re-baseline (GHIST-07) first; \
+             the runner only extends an already-bootstrapped baseline, never creates one"
+        )));
+    }
+
+    // Marker already present (a prior sync established it): sync's own
+    // pushed_head..HEAD logic is already correct — nothing to do.
+    if last_pushed_sha(&hwd).is_some() {
+        return Ok(PushBoundary::Established);
+    }
+
+    // First sync since the baseline was blessed. Establish the boundary from the
+    // PRE-backfill baseline (the current work-dir HEAD), which is what sync would
+    // have used had the runner not advanced HEAD via backfill first.
+    let base = run_git(&hwd, &["rev-parse", "HEAD"])?.trim().to_string();
+    let remote = resolve_remote(args, repo)?;
+    match remote_main_tip(&remote)? {
+        None => Ok(PushBoundary::NeedsOperator(format!(
+            "mirror remote for '{repo}' has no 'main' branch — the baseline was never pushed. \
+             Establish it via git_public_history_backfill + operator bless + force re-baseline \
+             (GHIST-07); the runner is fast-forward-only and never bootstraps a remote."
+        ))),
+        // Remote already at the blessed baseline — the expected post-GHIST-07 state.
+        Some(tip) if tip == base => {
+            set_pushed_sha(&hwd, &base)?;
+            Ok(PushBoundary::Established)
+        }
+        // Remote strictly BEHIND the local blessed baseline (an ancestor of it in
+        // the work-dir's shared lineage): still a clean fast-forward — anchor the
+        // boundary at the remote tip so the in-between commits are gated + pushed.
+        // `merge-base --is-ancestor` errors (→ false) when `tip` is unknown to the
+        // work-dir, i.e. a truly diverged mirror, which correctly falls through to
+        // the NeedsOperator arm below. Never force.
+        Some(tip) if git_exit_ok(&hwd, &["merge-base", "--is-ancestor", &tip, &base]) => {
+            set_pushed_sha(&hwd, &tip)?;
+            Ok(PushBoundary::Established)
+        }
+        Some(tip) => Ok(PushBoundary::NeedsOperator(format!(
+            "public mirror 'main' is at {tip}, which is not an ancestor of the local blessed \
+             baseline {base} — the mirror has diverged from the history lineage. Reconcile via \
+             git_public_history_backfill + operator bless + force re-baseline (GHIST-07); the \
+             runner never force-pushes."
+        ))),
+    }
+}
+
+/// Register all four GHMR-04 mirror subtools plus the GHIST history tools,
+/// plus the MRUN-01 runner tool. Called from [`crate::github::register`], so
+/// they attach to whichever registry github is registered against (the CORE
+/// registry via `register_all`, the personal registry via
+/// `register_personal`). Unconditional: no GitHub credential is needed to
+/// construct them; `git_public_mirror_push` reads the token lazily at call
 /// time and returns `NotConfigured` if it is absent.
 pub fn register(registry: &mut ToolRegistry) {
     registry.register_or_replace(Box::new(GitPublicMirrorStatus));
@@ -1907,6 +2035,7 @@ pub fn register(registry: &mut ToolRegistry) {
     registry.register_or_replace(Box::new(GitPublicHistoryBackfill));
     registry.register_or_replace(Box::new(GitPublicHistorySync));
     registry.register_or_replace(Box::new(GitPublicMirrorReplayPr));
+    registry.register_or_replace(Box::new(super::runner::GitPublicMirrorRun));
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -2150,6 +2279,86 @@ mod tests {
         std::env::remove_var("TERMINUS_MIRROR_AUTHOR_MAP");
         std::env::remove_var("TERMINUS_MIRROR_REMOTE");
         cleanup(&[&src, &root, &bare]);
+        let _ = std::fs::remove_file(&map_path);
+    }
+
+    // MRUN-01 regression: the runner runs git_public_history_backfill (which advances
+    // the local history work-dir HEAD) BEFORE git_public_history_sync. On the first
+    // sync after a GHIST-07 bless there is no `pushed-head` marker yet, so sync would
+    // initialise it from the POST-backfill HEAD and spuriously see a non-fast-forward.
+    // `ensure_push_boundary` (called by the runner before backfill) pins the boundary
+    // to the pre-backfill baseline, so a genuinely fast-forwardable repo still pushes.
+    // This test reproduces the exact ordering and asserts the push happens.
+    #[tokio::test]
+    #[serial]
+    async fn ensure_push_boundary_lets_runner_ordering_fast_forward() {
+        clear_env();
+        std::env::set_var("GITHUB_TOKEN", "dummy-token-unused-for-local-remote");
+        let (src, root, bare, map_path) =
+            baselined_history("Terminus", &[("a.txt", "hello\n")]).await;
+
+        // New internal commit on source.
+        write_file(&src, "b.txt", "second\n");
+        commit_all(&src, "second");
+
+        let args = json!({ "repo": "Terminus", "source": src.display().to_string() });
+
+        // Runner step 2 FIRST: backfill advances the local work-dir HEAD past the
+        // baseline (this is what breaks sync's own first-run boundary init).
+        GitPublicHistoryBackfill.execute(args.clone()).await.unwrap();
+
+        // Runner step 1b (the fix): establish the boundary from the PRE-backfill
+        // baseline. It must report Established (remote is at the blessed baseline),
+        // and must have persisted the pushed-head marker.
+        let hwd = history_workdir("Terminus").unwrap();
+        assert!(last_pushed_sha(&hwd).is_none(), "no pushed-head marker before the fix runs");
+        match ensure_push_boundary(&args).unwrap() {
+            PushBoundary::Established => {}
+            PushBoundary::NeedsOperator(m) => panic!("expected Established, got NeedsOperator: {m}"),
+        }
+        assert!(last_pushed_sha(&hwd).is_some(), "boundary must persist pushed-head");
+
+        // Runner step 3: sync now fast-forwards (marker present → correct range).
+        let out = GitPublicHistorySync.execute(args).await.unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["pushed"], true, "runner ordering must still ff-push: {v}");
+        let work_head = run_git(&hwd, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let remote_main = run_git(&bare, &["rev-parse", "main"]).unwrap().trim().to_string();
+        assert_eq!(remote_main, work_head, "remote advanced to the new tip");
+
+        std::env::remove_var("GITHUB_TOKEN");
+        std::env::remove_var("TERMINUS_MIRROR_AUTHOR_MAP");
+        std::env::remove_var("TERMINUS_MIRROR_REMOTE");
+        cleanup(&[&src, &root, &bare]);
+        let _ = std::fs::remove_file(&map_path);
+    }
+
+    // MRUN-01: ensure_push_boundary must report NeedsOperator (never force) when the
+    // public mirror has genuinely diverged from the blessed baseline.
+    #[tokio::test]
+    #[serial]
+    async fn ensure_push_boundary_reports_needs_operator_on_divergence() {
+        clear_env();
+        let (src, root, bare, map_path) =
+            baselined_history("Terminus", &[("a.txt", "hello\n")]).await;
+
+        // Diverge the remote: force an unrelated orphan over its main.
+        let other = init_source(&[("z.txt", "unrelated\n")]);
+        let orphan = run_git(&other, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        raw_git(&other, &["push", "-f", &bare.display().to_string(), &format!("{orphan}:refs/heads/main")]);
+
+        let args = json!({ "repo": "Terminus", "source": src.display().to_string() });
+        match ensure_push_boundary(&args).unwrap() {
+            PushBoundary::NeedsOperator(m) => assert!(m.contains("diverged"), "{m}"),
+            PushBoundary::Established => panic!("diverged mirror must not be Established"),
+        }
+        // Divergence must NOT have persisted a pushed-head marker.
+        let hwd = history_workdir("Terminus").unwrap();
+        assert!(last_pushed_sha(&hwd).is_none(), "no boundary persisted on divergence");
+
+        std::env::remove_var("TERMINUS_MIRROR_AUTHOR_MAP");
+        std::env::remove_var("TERMINUS_MIRROR_REMOTE");
+        cleanup(&[&src, &root, &bare, &other]);
         let _ = std::fs::remove_file(&map_path);
     }
 

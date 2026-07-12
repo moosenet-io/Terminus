@@ -1,0 +1,18 @@
+[Unit]
+# MRUN-01 — periodic driver for terminus-mirror-runner.service. This is what was
+# missing per the S115 audit: without this timer, TERMINUS_MIRROR_AUTO_APPROVE=true
+# had nothing scheduling it, so a repo's public mirror could silently stop advancing
+# (diverge / fall behind) until an operator happened to notice.
+Description=Periodic Terminus git-public mirror runner (MRUN-01)
+
+[Timer]
+# Every 30 minutes, with jitter so this doesn't collide with other cron/timer jobs on
+# the same host (e.g. terminus-mirror-history-sync.timer's hourly :07 slot). Each run
+# is a cheap no-op (git_public_mirror_run's status check) for any repo already
+# up to date, so a tighter cadence than the hourly GHIST-08 sync is fine.
+OnCalendar=*-*-* *:00/30:00
+RandomizedDelaySec=120
+Persistent=true
+
+[Install]
+WantedBy=timers.target
