@@ -465,7 +465,14 @@ only those files."
         } else {
             None
         };
-        let embed_stats = embed_graph_nodes(&cfg, &project_id, &graph, changed_node_scope.as_ref()).await;
+        // Only run + surface the embed step when embeddings are enabled, so a
+        // deployment that hasn't opted in (SCRIBE_KG_EMBED unset) gets a
+        // scribe_kg_build result byte-for-byte identical to pre-KGEMB-03.
+        let embed_stats = if cfg.embed_enabled {
+            Some(embed_graph_nodes(&cfg, &project_id, &graph, changed_node_scope.as_ref()).await)
+        } else {
+            None
+        };
 
         let lay = layout(&graph);
         let svg = render::to_svg(&graph, &lay);
@@ -477,7 +484,7 @@ only those files."
         let artifacts = write_artifacts(&cfg.kg_store_dir, &slug, &svg, &graphml, &html)?;
 
         let clusters = graph.nodes().filter_map(|n| n.cluster).collect::<std::collections::HashSet<_>>().len();
-        Ok(structured(json!({
+        let mut result = json!({
             "project_id": project_id,
             "ok": true,
             "mode": if incremental && !changed.is_empty() { "incremental" } else { "full" },
@@ -486,8 +493,11 @@ only those files."
             "clusters": clusters,
             "artifacts": artifacts,
             "file_cap_hit": capped,
-            "embed": embed_stats,
-        })))
+        });
+        if let Some(embed) = embed_stats {
+            result["embed"] = embed;
+        }
+        Ok(structured(result))
     }
 }
 
@@ -726,8 +736,10 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["mode"], "full");
         assert!(v["nodes"].as_u64().unwrap() >= 4);
-        assert_eq!(v["embed"]["ran"], false);
-        assert_eq!(v["embed"]["reason"], "SCRIBE_KG_EMBED not set");
+        // The `embed` key is entirely ABSENT when SCRIBE_KG_EMBED is unset — the
+        // result is byte-for-byte identical to pre-KGEMB-03 (no observability
+        // field is added for a deployment that hasn't opted in).
+        assert!(v.get("embed").is_none(), "embed field must be absent when SCRIBE_KG_EMBED unset");
     }
 
     #[tokio::test]
