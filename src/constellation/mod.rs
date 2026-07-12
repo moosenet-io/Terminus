@@ -178,17 +178,43 @@ async fn embedded_asset_fallback(
     }
 }
 
-/// Build the `Response` for one embedded file: its raw bytes plus a
-/// Content-Type resolved from the path's extension via `mime_guess`
-/// (falling back to `application/octet-stream` for an unrecognized
-/// extension, `mime_guess`'s own documented default).
+/// Map a path's extension to a Content-Type for the small, fixed set of asset
+/// kinds a Vite build emits (js/css/html/svg/json/ico/fonts/images), defaulting
+/// to `application/octet-stream`. A tiny in-crate table deliberately replaces
+/// the `mime_guess` crate here: `mime_guess`'s build script pulls a
+/// self-contained-linker toolchain that isn't present on the build-on-dest host
+/// (CONST-15 review) — and a static UI bundle only ever serves this handful of
+/// extensions, so a full MIME database is unnecessary.
+fn content_type_for(path: &str) -> &'static str {
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "js" | "mjs" => "text/javascript",
+        "css" => "text/css",
+        "html" | "htm" => "text/html; charset=utf-8",
+        "json" | "map" => "application/json",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        "wasm" => "application/wasm",
+        "txt" => "text/plain; charset=utf-8",
+        "webmanifest" => "application/manifest+json",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Build the `Response` for one embedded file: its raw bytes plus a Content-Type
+/// resolved from the path's extension (see [`content_type_for`]).
 fn embedded_file_response(path: &str, file: rust_embed::EmbeddedFile) -> Response {
-    let mime = mime_guess::from_path(path).first_or_octet_stream();
     let mut resp = Response::new(axum::body::Body::from(file.data.into_owned()));
     resp.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
-        HeaderValue::from_str(mime.as_ref())
-            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+        HeaderValue::from_static(content_type_for(path)),
     );
     resp
 }
