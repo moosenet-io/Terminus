@@ -244,6 +244,13 @@ walkdir = "2"
 name = "house_style_check"
 path = "src/bin/house_style_check.rs"
 
+# CXEG-10: retroactive calibration harness for cortex_review + the CXEG-07
+# consistency lens. See `src/bin/cortex_calibrate.rs` and
+# `docs/cortex-calibration.md`.
+[[bin]]
+name = "cortex_calibrate"
+path = "src/bin/cortex_calibrate.rs"
+
 [dev-dependencies]
 # mcp_server tests drive the axum Router directly via `ServiceExt::oneshot`.
 tower = { version = "0.4", features = ["util"] }

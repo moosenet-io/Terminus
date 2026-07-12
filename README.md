@@ -925,6 +925,75 @@ above it in the same result — those are computed and fixed BEFORE the
 consistency lens even runs (see `consistency`'s module doc for why this
 ordering is the load-bearing safety property, not just a convention).
 
+### Calibration — `cortex_calibrate` (CXEG-10)
+
+Before the CXEG-04 structural review or the CXEG-07 consistency lens is
+allowed to influence a live `review_run` (i.e. before `CORTEX_ENABLE_TIER_C`
+ever flips to `true` in a real deployment, and before any threshold weight is
+trusted), run the **retroactive calibration harness**: it replays the last N
+merged PRs of a project, scores each diff with both engines in a
+DRY/capture-only mode, and reports how often that scoring WOULD have flagged
+code that in fact shipped and merged — a proxy false-positive rate. This is
+the guardrail against a taste-gate that blocks PRs on a reviewer's mood: tune
+thresholds against real merged history first, not vibes.
+
+```text
+cargo run --bin cortex_calibrate -- \
+    --project-id TERM --owner moosenet --repo Terminus --n 50
+```
+
+Key flags (see `cortex_calibrate --help` for the full list):
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--project-id` | required | Atlas KG project id (`TERM`/`LUM`/`HARM`/`CHRD`/`RAIL`) — the corpus is SCORED against this project's Atlas graph, independent of which Gitea repo the PRs come from. |
+| `--owner` / `--repo` | required | Gitea/Forgejo repo the merged-PR corpus is fetched from. |
+| `--provider` | pool default | Explicit git-private forge provider id (`gitea`, `forgejo`, …). |
+| `--n` | 50 | Target number of merged PRs to replay. |
+| `--min-sample` | 20 | Below this many SCORED PRs, the report flags `sample_small: true` and declines to recommend a threshold change. |
+| `--target-fp-rate` | 0.10 | The would-have-flagged rate calibration tries to get under. |
+| `--include-reverts` | false | By default, PRs that look like a revert/hotfix are excluded from the scored sample (excludable, not a hard drop — they're still counted in the corpus total) so a rushed hotfix's noise doesn't skew the FP rate. |
+| `--consistency-lens` | true | Also score with the CXEG-07 lens (LLM calls, one pinned provider per PR). Pass `--consistency-lens false` for a faster structural-only pass. |
+| `--out` | `docs/cortex-calibration.md` | Where the generated report is written. |
+
+**S9 — single door.** Every PR-list and diff-compare call goes through
+`crate::forge`'s provider-agnostic dispatch (`ForgeRegistry::from_env()` →
+`ForgeProvider::dispatch`) — the same mechanism the `git_private` MCP tool
+itself uses — never a raw HTTP client. If the git-private forge tool isn't
+configured/reachable, the harness fails cleanly (a clear stderr message, no
+partial `docs/cortex-calibration.md` write), matching the rest of this
+codebase's Terminus-Plane/Gitea "one sanctioned door" discipline.
+
+**Dry mode, structurally.** The harness calls
+`review::run_consistency_lens_dry` — a narrow wrapper around the SAME
+`consistency::maybe_run` `review_run` itself calls — and never calls
+`review::maybe_record_findings` (that function isn't even exported outside
+`review::mod`). Nothing in the calibration path can write to the KGFIND
+findings store; this is a structural guarantee, not a flag that could drift.
+
+**Interpreting the report.** `docs/cortex-calibration.md` is regenerated on
+every run: total/scored PR counts, the excluded-revert and diff-unavailable
+counts, the overall would-have-flagged rate against `--target-fp-rate`, a
+per-signal firing-rate breakdown (ranked, highest first), and a
+plain-language recommendation — either "no change needed" or "raise the
+weight/percentile/band-cut for signal X first" (the top contributor), or (for
+a small sample) "collect more merged PRs before tuning." See
+`docs/cortex-calibration.md` itself for the full report-format and
+methodology writeup. The pure FP-rate math lives in
+`crate::cortex::calibrate` and is unit-tested independent of any live corpus
+(`cargo test -p terminus-rs calibrate::`).
+
+**Known limitation.** The shared forge vocabulary's only diff-capable
+endpoint today is `CommitsCompareDiff` (`GET /repos/{owner}/{repo}/compare/{basehead}`),
+whose JSON body may or may not carry a per-file list depending on the
+Gitea/Forgejo server version (see `src/bin/cortex_calibrate.rs`'s module doc).
+A PR whose compare response has no recognizable file list is flagged
+`diff_unavailable: true` and excluded from the scored sample rather than
+scored against a fabricated/empty diff. If a live run shows most PRs landing
+in `diff_unavailable`, that's the honest signal to add a
+`PullRequestsListFiles`-shaped endpoint to the forge vocabulary in a
+follow-up item, not something to work around in the harness itself.
+
 ## Postgres tool suite — the single sanctioned Postgres door (S115)
 
 Coder agents historically SSHed directly into DB hosts and ran `psql` for

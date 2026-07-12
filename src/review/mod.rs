@@ -44,10 +44,13 @@ pub(crate) mod free_pool;
 // CSV/array/unified-diff parsing a second time.
 pub(crate) mod kg_context;
 mod prompt;
-// CXEG-07: the Tier-C consistency/elegance lens. Not re-exported -- only
-// `execute()` below calls into it, strictly AFTER `aggregate()` has already
-// fixed `aggregate_verdict`/`complete` (see `consistency`'s module doc for
-// why that ordering is the load-bearing advisory-only safety property).
+// CXEG-07: the Tier-C consistency/elegance lens. Module stays private --
+// `execute()` below calls into it directly, strictly AFTER `aggregate()` has
+// already fixed `aggregate_verdict`/`complete` (see `consistency`'s module
+// doc for why that ordering is the load-bearing advisory-only safety
+// property). CXEG-10's calibration harness gets a narrow, purpose-built
+// door (`run_consistency_lens_dry` below) instead of a wider `pub mod` --
+// same S9 rationale as everywhere else in this crate: one sanctioned way in.
 mod consistency;
 
 use std::collections::HashSet;
@@ -70,6 +73,11 @@ use crate::tool::RustTool;
 pub use aggregate::{aggregate, Finding, ProviderResult};
 pub use dispatch::ReviewConfig;
 pub use prompt::{build_docs_prompt, build_prompt, parse_findings, parse_verdict, Role, Structure};
+// CXEG-10: the calibration harness needs to name the CXEG-07 lens's result
+// types to read back what it would have flagged. Re-exported rather than
+// widening `consistency` itself to `pub` -- see the `mod consistency;` note
+// above.
+pub use consistency::{ConsistencyFinding, ConsistencyRun};
 
 const ALLOWED_PROVIDERS: &[&str] = &["opus", "codex", "agy", "nemotron", "qwen_coder", "free"];
 const MAX_PROVIDERS: usize = 5;
@@ -292,6 +300,30 @@ fn build_finding_provenance(context: &Value, verdict: &str, providers: &[String]
     obj.insert("providers".to_string(), json!(providers));
     obj.insert("recorded_at".to_string(), json!(chrono::Utc::now().to_rfc3339()));
     Value::Object(obj)
+}
+
+/// CXEG-10: calibration-only entry point for the Tier-C consistency lens in
+/// dry/capture-only mode. Delegates directly to `consistency::maybe_run` --
+/// the EXACT SAME function `execute()` above calls after `aggregate()` --
+/// with no other code path involved (S9: one door). The critical property
+/// for calibration is what this function does NOT do: unlike `execute()`,
+/// it never folds the returned findings into `maybe_record_findings`, so a
+/// caller that only ever calls this (as `cortex_calibrate` does) can never
+/// write to the KGFIND store, structurally rather than by a flag that could
+/// drift. `panel_results` may be empty (calibration replays no live
+/// correctness panel) -- `consistency::maybe_run` only reads it to detect
+/// cross-source disagreement on the SAME `(category, file, symbol)` anchor,
+/// which degrades cleanly to "no disagreement observed" when there is no
+/// panel to compare against.
+pub async fn run_consistency_lens_dry(
+    context: &Value,
+    criteria: &str,
+    panel_results: &[ProviderResult],
+    review_cfg: &ReviewConfig,
+    cortex_config: &CortexConfig,
+    house_style_cache: &HouseStyleCache,
+) -> ConsistencyRun {
+    consistency::maybe_run(context, criteria, panel_results, review_cfg, cortex_config, house_style_cache).await
 }
 
 /// KGFIND-03 post-aggregate hook: record the providers' structured findings
@@ -754,6 +786,67 @@ mod tests {
         let args = json!({"structure": "single", "providers": [], "criteria": "x"});
         let err = tool().execute(args).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    // ── CXEG-10: run_consistency_lens_dry wiring ────────────────────────────
+
+    fn calibration_cortex_config(enable_tier_c: bool) -> CortexConfig {
+        CortexConfig {
+            risk_score_threshold: 7.0,
+            enable_tier_b: false,
+            enable_tier_c,
+            elegance_advisory_only: true,
+            dup_cosine: 0.85,
+            atlas_database_url: None,
+            max_blast_nodes: crate::cortex::scope::DEFAULT_MAX_BLAST_NODES,
+            tier_b_percentile: 90.0,
+            house_style_exemplars_k: crate::cortex::house_style::DEFAULT_EXEMPLARS_K,
+            risk_weight_centrality_spike: 2.0,
+            risk_weight_complexity_spike: 1.5,
+            risk_weight_fan_out_explosion: 1.5,
+            risk_weight_community_boundary_crossing: 2.5,
+            risk_weight_semantic_duplication: 10.0,
+            risk_weight_recurrence: 1.0,
+            risk_band_elevated_cut: 4.0,
+            audit_clone_timeout_secs: 60,
+            audit_max_clone_bytes: 200_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_consistency_lens_dry_disabled_makes_no_network_call_and_returns_empty() {
+        // enable_tier_c: false short-circuits before any provider dispatch or
+        // graph load -- this is the same first check `consistency::maybe_run`
+        // performs, exercised here through the calibration door instead of
+        // `execute()`. A disabled run must carry zero findings.
+        let ctx = json!({"project_id": "TERM", "changed_files": ["src/lib.rs"]});
+        let run = run_consistency_lens_dry(
+            &ctx,
+            "calibration replay",
+            &[],
+            &ReviewConfig::from_env(),
+            &calibration_cortex_config(false),
+            &HouseStyleCache::new(),
+        )
+        .await;
+        assert_eq!(run.status, "disabled");
+        assert!(run.findings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_consistency_lens_dry_missing_project_id_degrades_cleanly() {
+        let ctx = json!({"changed_files": ["src/lib.rs"]});
+        let run = run_consistency_lens_dry(
+            &ctx,
+            "calibration replay",
+            &[],
+            &ReviewConfig::from_env(),
+            &calibration_cortex_config(true),
+            &HouseStyleCache::new(),
+        )
+        .await;
+        assert_eq!(run.status, "no_project_id");
+        assert!(run.findings.is_empty());
     }
 
     #[tokio::test]
