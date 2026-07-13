@@ -881,6 +881,12 @@ impl CompilerBuild {
         // BLD-19: the request is accepted → `queued`. A per-build tap streams the
         // cargo `{step,total}` into the bus during the build (progress bar).
         let bus = events::bus();
+        // BEGIN a fresh stream FIRST: rotate the track to a new generation so that
+        // REUSING a request_id that is still tracked (a previous build's live or
+        // terminal track) starts a CLEAN per-build stream — no stale terminal state
+        // shown, no events dropped by the old track's terminal-close, and any
+        // reader mid-poll on the old generation resolves to not_found.
+        bus.begin(request_id);
         bus.emit(
             request_id,
             events::Emit::stage(events::Stage::Queued).message(format!("{module}@{git_ref}")),
@@ -2440,5 +2446,59 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err2, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn compiler_build_reusing_a_terminal_id_starts_a_fresh_stream() {
+        // Fix 2 (end-to-end): a prior build A ended terminal `published` under an
+        // id; a NEW compiler_build B reusing that id must ROTATE the stream (via
+        // begin) so compiler_progress reflects B's fresh stream, not A's stale
+        // terminal state.
+        let id = format!("reuse-{}", uuid::Uuid::new_v4());
+        // Simulate build A's terminal published stream on the shared bus.
+        events::bus().emit(&id, events::Emit::stage(events::Stage::Queued));
+        events::bus().emit(
+            &id,
+            events::Emit::stage(events::Stage::Published).sha("oldshaA"),
+        );
+        let a = events::bus().snapshot(&id, 0).unwrap();
+        assert!(a.terminal, "build A is terminal published");
+        let gen_a = a.generation;
+
+        // Build B reuses the id via compiler_build. It fails post-`queued` (no
+        // dataset root), but build_inner's begin() rotates the track first.
+        let _env = ScopedEnv::new().unset("BUILD_DATASET_ROOT");
+        let _ = CompilerBuild
+            .execute_structured(json!({
+                "module": "terminus",
+                "ref": "abc123",
+                "request_id": id,
+            }))
+            .await
+            .unwrap_err();
+
+        // compiler_progress now reflects B's FRESH stream: a new generation, starts
+        // at `queued`, ends `failed`, and carries NONE of A's stale published sha.
+        let prog = CompilerProgress
+            .execute_structured(json!({ "request_id": id }))
+            .await
+            .unwrap();
+        let s = prog.structured.unwrap();
+        assert_ne!(
+            s["generation"].as_u64().unwrap(),
+            gen_a,
+            "reused id started a fresh generation"
+        );
+        assert_eq!(s["stage"], "failed");
+        let evs = s["events"].as_array().unwrap();
+        assert_eq!(
+            evs.first().unwrap()["stage"],
+            "queued",
+            "B's fresh stream starts at queued, not A's published"
+        );
+        assert!(
+            !evs.iter().any(|e| e["sha"] == "oldshaA"),
+            "no stale published sha from build A"
+        );
     }
 }

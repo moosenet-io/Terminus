@@ -438,6 +438,41 @@ impl ProgressBus {
         }
     }
 
+    /// BEGIN a fresh progress stream for `request_id`, ROTATING the track to a new
+    /// generation: any existing track for this id (still-live OR already-terminal)
+    /// is REPLACED by a brand-new one — fresh generation, empty event ring,
+    /// non-terminal. A build calls this before its first `queued` emit, so reusing
+    /// a request_id that is still tracked always yields a CLEAN per-build stream:
+    /// no stale terminal state is shown, and the new build's events are never
+    /// dropped by the old track's terminal-close.
+    ///
+    /// Race-safe with concurrent readers: the rotation replaces the map entry under
+    /// the lock, which DROPS the old track (and its broadcast sender), so a reader
+    /// mid-poll on the OLD generation wakes (channel closed) and resolves via the
+    /// generation check to not_found — it never mixes the two builds' data.
+    /// Returns the new generation. Panic-safe (fail-open).
+    pub fn begin(&self, request_id: &str) -> u64 {
+        fail_open("begin", || self.begin_inner(request_id)).unwrap_or(0)
+    }
+
+    fn begin_inner(&self, request_id: &str) -> u64 {
+        let now = now_ms();
+        let touched = self.touch.fetch_add(1, Ordering::Relaxed);
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed);
+        let max_events = self.max_events;
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        Self::sweep_locked(&mut map, self.ttl_ms, now);
+        // Make room only if this is a genuinely NEW id (rotation replaces in place).
+        Self::evict_if_full_locked(&mut map, self.max_builds, request_id);
+        // `insert` REPLACES any existing track → the old one (and its tx) is
+        // dropped, closing old subscribers' channels.
+        map.insert(
+            request_id.to_string(),
+            Track::new(now, touched, generation, max_events),
+        );
+        generation
+    }
+
     /// Emit an event for `request_id`, creating the track if new. Returns the
     /// assigned seq. PANIC-SAFE (fail-open): any unexpected panic inside the bus is
     /// caught + logged and never propagates, so the bus can't abort the build that
@@ -553,6 +588,40 @@ impl ProgressBus {
         ttl_ms != 0 && now.saturating_sub(updated_ms) > ttl_ms
     }
 
+    /// Build a [`Snapshot`] from a `&Track` under the caller's lock (no re-lock).
+    /// The generation is read from THIS track, so a snapshot's generation always
+    /// belongs to the exact track it was read from — the invariant the atomic
+    /// [`subscribe`](Self::subscribe) relies on.
+    fn build_snapshot(request_id: &str, since: u64, track: &Track) -> Snapshot {
+        let events: Vec<ProgressEvent> = track
+            .events
+            .iter()
+            .filter(|e| e.seq > since)
+            .cloned()
+            .collect();
+        let (step, total) = track
+            .events
+            .iter()
+            .rev()
+            .find_map(|e| match (e.step, e.total) {
+                (Some(s), Some(t)) => Some((Some(s), Some(t))),
+                _ => None,
+            })
+            .unwrap_or((None, None));
+        Snapshot {
+            request_id: request_id.to_string(),
+            generation: track.generation,
+            stage: track.snapshot_stage(),
+            terminal: track.terminal.is_some(),
+            created_ms: track.created_ms,
+            updated_ms: track.updated_ms,
+            last_seq: track.next_seq.saturating_sub(1),
+            step,
+            total,
+            events,
+        }
+    }
+
     /// The current snapshot for `request_id`, returning events with `seq > since`.
     /// `None` when the build is unknown (never tracked or already swept), OR when
     /// it is EXPIRED past the TTL — checked on the READ so a quiet process (no
@@ -572,61 +641,39 @@ impl ProgressBus {
             return None;
         }
         let track = map.get(request_id)?;
-        let events: Vec<ProgressEvent> = track
-            .events
-            .iter()
-            .filter(|e| e.seq > since)
-            .cloned()
-            .collect();
-        let (step, total) = track
-            .events
-            .iter()
-            .rev()
-            .find_map(|e| match (e.step, e.total) {
-                (Some(s), Some(t)) => Some((Some(s), Some(t))),
-                _ => None,
-            })
-            .unwrap_or((None, None));
-        Some(Snapshot {
-            request_id: request_id.to_string(),
-            generation: track.generation,
-            stage: track.snapshot_stage(),
-            terminal: track.terminal.is_some(),
-            created_ms: track.created_ms,
-            updated_ms: track.updated_ms,
-            last_seq: track.next_seq.saturating_sub(1),
-            step,
-            total,
-            events,
-        })
+        Some(Self::build_snapshot(request_id, since, track))
     }
 
     /// A live subscription for `request_id`: the current snapshot (events since
     /// `since`) plus a broadcast [`Receiver`](broadcast::Receiver) for events
-    /// emitted AFTER this call. Returns `None` for an unknown build. Taking the
-    /// receiver under the same lock that reads the snapshot closes the race where
-    /// an event could slip between the snapshot read and the subscribe.
+    /// emitted AFTER this call — captured ATOMICALLY, under ONE lock hold on the
+    /// SAME [`Track`], together with that track's generation (carried in the
+    /// snapshot). There is NO window between "which track did I subscribe to" and
+    /// "which track's snapshot/generation did I capture": the receiver, the
+    /// snapshot, and the generation all come from the same track instance, so a
+    /// concurrent evict+reuse of the id can never pair an OLD receiver with a
+    /// NEW-generation snapshot. Returns `None` for an unknown/expired build.
     pub fn subscribe(
         &self,
         request_id: &str,
         since: u64,
     ) -> Option<(Snapshot, broadcast::Receiver<ProgressEvent>)> {
-        let rx = {
-            let now = now_ms();
-            let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            // Read-side expiry applies here too (subscribing to an expired id must
-            // not resurrect it): expired → lazily evict + not_found.
-            let expired = match map.get(request_id) {
-                Some(t) => Self::is_expired(self.ttl_ms, t.updated_ms, now),
-                None => return None,
-            };
-            if expired {
-                map.remove(request_id);
-                return None;
-            }
-            map.get(request_id)?.tx.subscribe()
+        let now = now_ms();
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        // Read-side expiry applies here too (subscribing to an expired id must not
+        // resurrect it): expired → lazily evict + not_found.
+        let expired = match map.get(request_id) {
+            Some(t) => Self::is_expired(self.ttl_ms, t.updated_ms, now),
+            None => return None,
         };
-        let snap = self.snapshot(request_id, since)?;
+        if expired {
+            map.remove(request_id);
+            return None;
+        }
+        let track = map.get(request_id)?;
+        // rx + snapshot + generation ALL from the same `track`, under one lock.
+        let rx = track.tx.subscribe();
+        let snap = Self::build_snapshot(request_id, since, track);
         Some((snap, rx))
     }
 
@@ -638,11 +685,12 @@ impl ProgressBus {
     /// the TTL mid-wait, the post-wait `snapshot` applies read-side expiry and
     /// resolves to `None` (not_found) rather than returning stale data.
     ///
-    /// GENERATION SAFETY: the subscribe captures the track's generation; if the id
-    /// is EVICTED and REUSED by a NEW build mid-wait, the post-wait snapshot has a
-    /// different generation and resolves to `None` (not_found) — the old waiter
-    /// never receives the new build's data (tracks are per-build-request, not
-    /// per-key-slot).
+    /// GENERATION SAFETY: `subscribe` captures the receiver AND the generation from
+    /// the SAME track atomically, so `gen0` below is the generation of the exact
+    /// track this waiter subscribed to. If that track is EVICTED/ROTATED and the id
+    /// is REUSED by a NEW build mid-wait, the post-wait snapshot has a different
+    /// generation and resolves to `None` (not_found) — the old waiter never
+    /// receives the new build's data (tracks are per-build-request, not per-slot).
     pub async fn poll(
         &self,
         request_id: &str,
@@ -650,10 +698,12 @@ impl ProgressBus {
         wait: std::time::Duration,
     ) -> Option<Snapshot> {
         let (snap, mut rx) = self.subscribe(request_id, since)?;
+        // `gen0` is the SUBSCRIBED track's generation (from the atomic subscribe),
+        // NOT a separately-taken snapshot — no cross-generation TOCTOU.
+        let gen0 = snap.generation;
         if !snap.events.is_empty() || snap.terminal || wait.is_zero() {
             return Some(snap);
         }
-        let gen0 = snap.generation;
         // Nothing new yet — await a live event (or timeout), then re-snapshot so
         // the caller always gets the full current state, not just one delta. The
         // re-snapshot also re-checks TTL, so an id that expired during the wait
@@ -1146,6 +1196,73 @@ mod tests {
         assert!(
             res.is_none(),
             "the stale waiter resolves not_found, never the new build's data"
+        );
+    }
+
+    #[test]
+    fn subscribe_captures_snapshot_and_generation_from_the_same_track() {
+        // Fix 1: subscribe returns the snapshot (with generation) atomically with
+        // the receiver, from the SAME track. Rotating the id afterwards must NOT
+        // retroactively change the already-captured snapshot's generation.
+        let bus = ProgressBus::with_bounds(16, 8, 0);
+        bus.emit("id", Emit::stage(Stage::Scheduled));
+        let (snap0, _rx0) = bus.subscribe("id", 0).unwrap();
+        let gen0 = snap0.generation;
+        // A NEW build reuses the id → rotate to a fresh generation.
+        let gen1 = bus.begin("id");
+        assert_ne!(gen0, gen1, "begin rotates to a new generation");
+        // The captured subscription snapshot keeps the OLD generation …
+        assert_eq!(snap0.generation, gen0);
+        // … and a fresh snapshot now reflects the NEW generation.
+        assert_eq!(bus.snapshot("id", 0).unwrap().generation, gen1);
+    }
+
+    #[tokio::test]
+    async fn poll_returns_not_found_when_id_rotated_by_new_build_midwait() {
+        // Fix 1/2: a waiter blocked on the OLD track must resolve to not_found when
+        // the id is ROTATED (begin) by a new build mid-wait — never the new data.
+        let bus = std::sync::Arc::new(ProgressBus::with_bounds(16, 8, 0));
+        bus.emit("x", Emit::stage(Stage::Scheduled)); // old track, non-terminal, seq=1
+        let b2 = bus.clone();
+        let waiter =
+            tokio::spawn(async move { b2.poll("x", 1, std::time::Duration::from_secs(5)).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        bus.begin("x"); // NEW build reuses the id → rotate (drops old tx → wakes waiter)
+        bus.emit("x", Emit::stage(Stage::Queued));
+        let res = waiter.await.unwrap();
+        assert!(
+            res.is_none(),
+            "the stale waiter resolves not_found after the id was rotated"
+        );
+    }
+
+    #[test]
+    fn begin_rotates_a_terminal_id_to_a_fresh_clean_stream() {
+        // Fix 2: reusing an id whose prior build is already TERMINAL must start a
+        // clean stream — no stale terminal state, no dropped events.
+        let bus = ProgressBus::with_bounds(16, 8, 0);
+        // Build A → terminal published.
+        bus.emit("id", Emit::stage(Stage::Queued));
+        bus.emit("id", Emit::stage(Stage::Published).sha("oldsha"));
+        let a = bus.snapshot("id", 0).unwrap();
+        assert!(a.terminal && a.stage == Stage::Published);
+        let gen_a = a.generation;
+        // Build B reuses the id → begin rotates to a fresh stream.
+        bus.begin("id");
+        bus.emit("id", Emit::stage(Stage::Queued));
+        bus.emit("id", Emit::stage(Stage::Building).progress(1, 5));
+        let b = bus.snapshot("id", 0).unwrap();
+        assert_ne!(b.generation, gen_a, "fresh generation for the reused id");
+        assert!(!b.terminal, "the fresh stream is not terminal");
+        assert_eq!(b.stage, Stage::Building, "B's own stage, not A's published");
+        assert_eq!(
+            b.events.first().unwrap().stage,
+            Stage::Queued,
+            "B's stream starts at queued"
+        );
+        assert!(
+            b.events.iter().all(|e| e.sha.is_none()),
+            "no stale published sha from A"
         );
     }
 

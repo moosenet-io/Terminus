@@ -275,10 +275,19 @@ Every event has a monotonic per-build `seq`, a timestamp (`ts_ms`), the `stage`,
   you saw and advance it each call: `compiler_progress(id, since=last_seq, wait_ms=5000)`.
 
 An unknown or expired `request_id` returns `{"status":"not_found"}` — never an error. Each
-snapshot also carries a per-build `generation`: if a build's track is evicted and the id is
-**reused** by a new build while a long-poller is waiting, the waiter's post-wake snapshot has a
-different `generation` and resolves to `not_found` — a stale waiter never receives a different
-build's data (tracks are per-build-request, not per-key-slot).
+snapshot carries a per-build `generation` so reused ids stay isolated (tracks are
+per-build-request, not per-key-slot):
+
+- **A build beginning rotates the stream.** `compiler_build` calls `begin(request_id)` before
+  its first `queued` — replacing any existing track for that id (live OR already-terminal) with
+  a fresh one (new generation, empty ring, non-terminal). Reusing a still-tracked id therefore
+  always shows a **clean per-build stream** — never a previous build's stale terminal state, and
+  never dropping the new build's events into a closed terminal track.
+- **Long-poll is generation-safe.** `subscribe` captures the receiver, the snapshot, and the
+  generation from the **same track under one lock** (no TOCTOU). If that track is
+  evicted/rotated and the id is reused while a long-poller is waiting, the waiter's post-wake
+  snapshot has a different `generation` and resolves to `not_found` — a stale waiter never
+  receives a different build's data.
 
 ### Seam with `compiler_status` (BLD-08)
 
