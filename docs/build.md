@@ -26,6 +26,50 @@ components = ["rust-src"]
 Pinned/installed at rustc **1.97.0** on: the GPU primary build host, the harmony build
 host, and the dev box. New build hosts install the pinned version on first use.
 
+# Build discipline — one door (BLD-14)
+
+Building on a **shared** host is a single-door operation, exactly like `review_run` is the
+one door for reviews: **no agent, pipeline, or Harmony build-space runs an ad-hoc
+`cargo build` / `cargo test` on a shared host.** Every shared-host build goes through the
+compiler queue (`compiler_request` → the scheduler → `compiler_build`).
+
+## Why
+Ad-hoc `cargo build`/`cargo test` on shared infrastructure has repeatedly caused real
+outages: a cold target dir filling a host's disk, a parallel build OOM-ing the box,
+uncoordinated toolchain drift (`rustup update` mid-build breaking the linker), and GPU/RAM
+contention with the always-on serving workloads (e.g. the permanent coder serve, Plex).
+The compiler exists to make shared-host builds **capped, serialized, idle-coordinated, and
+observable** (per-host concurrency caps, per-module locks, heavy-build windows + idle-mode
+lease, sccache, live progress) — running `cargo` directly bypasses all of that.
+
+## The rule
+- On a **shared** host: build **only** via `compiler_*`. A direct `cargo build`/`cargo test`
+  on a shared host is a **reviewable violation** — treat it the way an unsanctioned Plane or
+  git access path is treated.
+- **Boundary.** A quick local `cargo check`/`cargo test` on the **dev box's own capped,
+  appdata-backed disk** (not a shared host) is allowed — the rule targets shared-host
+  contention, not a developer's own isolated, capacity-bounded workspace. State this boundary
+  explicitly at any call site that could build.
+
+## The pattern (worktree-local → compiler relay)
+An agent/gate that needs a shared-host build submits the work to the compiler rather than
+compiling inline:
+1. Produce the exact source to build as a **committed** tree — scope it to only the intended
+   change (a throwaway index staging only the candidate paths → `commit-tree`, without
+   advancing any branch), so what's built is exactly what's under test and a failed candidate
+   never pollutes history.
+2. **Stage** that committed tree where the compiler resolves sources
+   (`${BUILD_DATASET_ROOT}/src/<module>/<ref>`) — or, if the source can't be made resolvable
+   from this host, **do not submit**; report the build as not-verified.
+3. Submit `compiler_request(module, ref)`, follow `compiler_progress` to a terminal state, and
+   consume the resulting artifact sha (from the build's own terminal `published` event).
+4. There is **no inline-`cargo` fallback** on the shared-host path: if the compiler is
+   unavailable, the gate reports *not verified* (which blocks advance) rather than silently
+   building locally.
+
+Harmony's Stage-4 test-gate implements exactly this via `harmony-core/src/compiler_client.rs`
+(gated by `HARMONY_COMPILER_ROUTING`), routing through the sanctioned Terminus egress door.
+
 # Artifact store & channels (BLD-07)
 
 Deploy is **build-once → publish → promote** — the `stable` train is never rebuilt, only
