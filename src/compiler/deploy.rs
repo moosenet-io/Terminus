@@ -918,11 +918,13 @@ impl RustTool for CompilerDeploy {
             .unwrap_or("all")
             .to_string();
 
-        // Finding 4: a malformed `COMPILER_DEPLOY_SYSTEMCTL` is a hard config error
-        // for a direct caller (a clean `InvalidArgument`, not a silent all-failed
-        // fan-out). The error message never echoes the raw value (S1).
-        validate_systemctl_cmd(&systemctl_env_raw())?;
-
+        // Tool-level ARGUMENT errors (a malformed `module`/`channel`/`hosts` the
+        // caller passed) are `InvalidArgument` above. But an OPERATOR-CONFIG failure
+        // (a malformed `COMPILER_DEPLOY_SYSTEMCTL`) is NOT a caller error: it flows
+        // through `deploy_report`, which marks every chosen host `failed` with a
+        // config-error note (no raw value echoed) — so the direct tool returns the
+        // SAME best-effort per-host aggregate as the auto-promote hook, rather than
+        // aborting with a bare error that drops the report.
         let report = deploy_report(&module, &channel, &hosts_filter).await;
         let text = report.summary();
         Ok(ToolOutput::with_structured(text, report.to_payload()))
@@ -1557,5 +1559,50 @@ mod tests {
         assert_eq!(p["counts"]["total"], json!(1));
         assert_eq!(p["degraded"], json!(false));
         assert!(p["notes"].is_array());
+    }
+
+    /// Serializes the env-mutating test below (env is process-global).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[tokio::test]
+    async fn malformed_systemctl_config_surfaces_in_aggregate_not_bare_error() {
+        // A malformed OPERATOR-CONFIG `COMPILER_DEPLOY_SYSTEMCTL` must NOT abort the
+        // direct tool with a bare InvalidArgument that drops the per-host report — it
+        // must surface in the STRUCTURED aggregate (every chosen host `failed` + a
+        // config-error note, no raw value echoed), IDENTICAL to the auto-promote hook
+        // path (both go through `deploy_report`).
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("COMPILER_DEPLOY_HOSTS", "host-a|u@host-a; host-b|u@host-b");
+        let raw = "systemctl; secret_raw_123"; // metacharacter → malformed
+        std::env::set_var("COMPILER_DEPLOY_SYSTEMCTL", raw);
+
+        // (1) The DIRECT tool returns Ok(structured aggregate), NOT a bare error.
+        let out = CompilerDeploy
+            .execute_structured(json!({"module": "chord", "channel": "stable"}))
+            .await
+            .expect("malformed operator config must not abort the tool with a bare error");
+        let payload = out.structured.clone().unwrap();
+
+        // Every chosen host is `failed`; a config-error note NAMES the problem.
+        assert_eq!(payload["counts"]["failed"], json!(2));
+        assert_eq!(payload["counts"]["total"], json!(2));
+        for r in payload["results"].as_array().unwrap() {
+            assert_eq!(r["outcome"], json!("failed"));
+        }
+        assert_eq!(payload["degraded"], json!(true));
+        let notes = serde_json::to_string(&payload["notes"]).unwrap();
+        assert!(notes.contains("COMPILER_DEPLOY_SYSTEMCTL"), "note names the config: {notes}");
+
+        // (2) S1: the raw malformed config value is NEVER echoed anywhere.
+        let whole = serde_json::to_string(&payload).unwrap();
+        assert!(!whole.contains("secret_raw_123"), "raw config must not be echoed: {whole}");
+        assert!(!out.text.contains("secret_raw_123"));
+
+        // (3) CONSISTENCY: the direct-tool aggregate == the promote-hook aggregate.
+        let hook = deploy_report("chord", "stable", "all").await;
+        assert_eq!(payload, hook.to_payload(), "direct tool matches the promote-hook report");
+
+        std::env::remove_var("COMPILER_DEPLOY_HOSTS");
+        std::env::remove_var("COMPILER_DEPLOY_SYSTEMCTL");
     }
 }

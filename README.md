@@ -540,7 +540,12 @@ compiler_deploy(module, channel="stable", hosts="all")
   into structured output; an **unknown requested host** is reported by **count only** (never
   reflecting arbitrary caller input / ssh targets back); and `COMPILER_DEPLOY_SYSTEMCTL` is a
   **constrained** command whose **executable must be `systemctl`** (bare tokens only, shell
-  metacharacters rejected with a config error — not arbitrary shell).
+  metacharacters rejected — not arbitrary shell). A malformed `COMPILER_DEPLOY_SYSTEMCTL` is an
+  **operator-config** failure, not a caller error: it surfaces **in the aggregate report** (every
+  chosen host `failed` + a config-error note naming the problem, no raw value echoed) — identical
+  for the direct tool and the auto-promote hook — rather than aborting with a bare error that
+  would drop the per-host report. (Genuinely caller-supplied bad args — `module`/`channel`/`hosts`
+  — remain a clean `InvalidArgument`.)
 - **Aggregation:** the result carries every host's `{host, outcome, detail}` plus `counts`
   (`deployed`/`skipped`/`rolled_back`/`failed`/`timed_out`/`unknown`/`unreachable`/`total`), a
   `degraded` flag and
