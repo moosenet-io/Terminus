@@ -810,15 +810,34 @@ pub struct ExclusiveGuard {
 
 impl ExclusiveGuard {
     pub fn acquire(mode: GpuMode, holder: &str) -> Result<Self, String> {
-        // BLD-10 admission gate (authoritative drain): refuse the acquire outright if
-        // MINT is idling for a compiler build; otherwise take a counted in-flight guard
-        // that lives exactly as long as this GPU hold. Non-MINT holders are not gated.
-        let _mint_admission = crate::mint::idle::try_admit_mint_gpu(holder)?;
+        // BLD-10 admission gate (authoritative drain), cycle-5 TOCTOU fix.
+        //
+        // 1. Fast pre-check (no guard): if MINT is already idling, refuse BEFORE running
+        //    `acquire`'s side effects (stopping services / notifying Chord). Non-MINT
+        //    holders are ungated. This is a cheap early-out, not the correctness point.
+        if !crate::mint::idle::mint_gpu_admission_open(holder) {
+            return Err(crate::mint::idle::MINT_IDLE_GPU_REFUSAL.to_string());
+        }
+        // 2. Take the one-shot lock (this call does not wait — a foreign holder makes it
+        //    fail fast, dropping nothing since no guard is held yet).
         acquire(mode, holder)?;
-        Ok(ExclusiveGuard {
-            holder: holder.to_string(),
-            _mint_admission,
-        })
+        // 3. AUTHORITATIVE atomic re-check at the moment the lock is held: take the
+        //    in-flight guard only if still `Active`. If idle started in the window between
+        //    the pre-check and here, hand the lock back and refuse — no work begins.
+        match crate::mint::idle::try_admit_mint_gpu(holder) {
+            Ok(_mint_admission) => Ok(ExclusiveGuard {
+                holder: holder.to_string(),
+                _mint_admission,
+            }),
+            Err(e) => {
+                if let Err(re) = release(holder) {
+                    tracing::warn!(
+                        "{holder}: releasing after an idle-refused acquire failed: {re}"
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 }
 
@@ -1178,30 +1197,66 @@ impl LiveGpuLock {
 #[async_trait::async_trait]
 impl GpuLock for LiveGpuLock {
     async fn acquire(&self) -> Result<(), String> {
-        // BLD-10 admission gate (authoritative drain): before taking the lock for the
-        // next unit, admit through idle-mode. If MINT is idling for a compiler build the
-        // admit is REFUSED and we return `Err` WITHOUT acquiring — the sweep skips this
-        // pass this run (resumable), rather than starting GPU work under the build.
-        // Non-MINT holders are not gated. Hold the guard for the unit's GPU span.
-        let admission = crate::mint::idle::try_admit_mint_gpu(self.holder)?;
-        *self.mint_admission.lock().expect("mint_admission poisoned") = admission;
-
-        match acquire_with_backoff(
+        // BLD-10 admission gate (authoritative drain), cycle-5 TOCTOU fix.
+        //
+        // The idle check must be validated at the moment the GPU lock is ACTUALLY held,
+        // NOT only once at entry before the bounded-backoff wait. Otherwise a waiter that
+        // was admissible while `Active`, then blocked waiting for another sweep to release,
+        // could win the lock AFTER a compiler `enter_idle` flipped the phase — and begin
+        // real GPU work during idle. Two coordinated steps close that window:
+        //
+        // 1. IN THE BACKOFF LOOP: each attempt first peeks idle admission
+        //    (`mint_gpu_admission_open`, which takes NO guard). If MINT is idling, the
+        //    attempt returns the non-retryable `MINT_IDLE_GPU_REFUSAL` so the wait aborts
+        //    promptly instead of spinning to `max_wait`, and the raw lock is never taken.
+        //    Because no guard is held while waiting, a queued waiter never inflates the
+        //    in-flight drain count (so it can never stall `enter_idle`).
+        // 2. AT SUCCESS: once the lock is truly held, re-validate atomically via
+        //    `try_admit_mint_gpu`. Only here is the in-flight guard taken (and only while
+        //    still `Active`). If idle began in the tiny window between the last peek and
+        //    the lock being granted, this returns `Err`; we hand the lock straight back
+        //    and refuse — no MINT GPU work begins during idle.
+        //
+        // Non-MINT holders (e.g. the compiler lease) short-circuit both steps as
+        // admissible/ungated, so they incur no gating and no added latency.
+        let holder = self.holder;
+        let acquired = acquire_with_backoff(
             &RealClock,
-            || acquire(GpuMode::Exclusive, self.holder),
+            || {
+                if !crate::mint::idle::mint_gpu_admission_open(holder) {
+                    return Err(crate::mint::idle::MINT_IDLE_GPU_REFUSAL.to_string());
+                }
+                acquire(GpuMode::Exclusive, holder)
+            },
             is_live_holder_refusal,
             ACQUIRE_POLL_INTERVAL,
             ACQUIRE_PROGRESS_LOG_INTERVAL,
             self.max_wait,
-            self.holder,
+            holder,
         )
-        .await
-        {
-            Ok(()) => Ok(()),
+        .await;
+
+        if let Err(e) = acquired {
+            // Never took the lock (idle refusal, a foreign holder past max_wait, or a
+            // broken acquire). No guard was held while waiting, so nothing to release.
+            return Err(e);
+        }
+
+        // Lock is held. AUTHORITATIVE atomic re-check: take the in-flight guard only if
+        // still `Active`. If idle started at the last instant, hand the lock back.
+        match crate::mint::idle::try_admit_mint_gpu(holder) {
+            Ok(admission) => {
+                *self.mint_admission.lock().expect("mint_admission poisoned") = admission;
+                Ok(())
+            }
             Err(e) => {
-                // Never took the lock — drop the admission guard so the in-flight count
-                // is not left inflated for a unit that did not start.
-                *self.mint_admission.lock().expect("mint_admission poisoned") = None;
+                // Admitted-then-idle race: release the lock we just won and refuse, so no
+                // MINT GPU work begins under the compiler build.
+                if let Err(re) = release(holder) {
+                    tracing::warn!(
+                        "{holder}: releasing after an idle-refused acquire failed: {re}"
+                    );
+                }
                 Err(e)
             }
         }
