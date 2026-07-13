@@ -62,7 +62,7 @@
 //! orchestration functions and are best-effort.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -502,6 +502,18 @@ pub struct IdleController {
     /// was force-recovered by the watchdog and superseded by a newer one) becomes a
     /// no-op instead of clobbering the newer transition (the ABA hazard).
     next_gen: AtomicU64,
+    /// The POINT-OF-NO-RETURN latch: set for the exact span the (non-abortable)
+    /// blocking GPU release is executing, and cleared only once that release has
+    /// actually finished. While it is set, NO path is allowed to flip the controller
+    /// out of `EnteringIdle` back to `Active` — not the dropped-guard rollback
+    /// ([`abort_enter`](Self::abort_enter)) and not the watchdog's stale-recovery
+    /// ([`recover_stale_transition`](Self::recover_stale_transition)). This is what
+    /// actually ENFORCES "admission never reopens mid-release": a `tokio::spawn_blocking`
+    /// release cannot be cancelled once started, so bounding only the *async wrapper*
+    /// (as the first cut did) would reopen admission while the blocking release was
+    /// still running. The latch closes that hole — admission (which is gated on the
+    /// `Active` phase) can only reopen after the release has cleared it.
+    releasing: AtomicBool,
     /// Where the manifest is persisted across restarts. `None` ⇒ persistence
     /// disabled (in-memory only) — behaviourally fine, the watchdog still bounds it.
     state_path: Option<PathBuf>,
@@ -520,6 +532,7 @@ impl IdleController {
             inner: RwLock::new(IdleState::Active),
             inflight: Arc::new(AtomicUsize::new(0)),
             next_gen: AtomicU64::new(0),
+            releasing: AtomicBool::new(false),
             state_path: None,
         }
     }
@@ -542,8 +555,27 @@ impl IdleController {
             inner: RwLock::new(seed),
             inflight: Arc::new(AtomicUsize::new(0)),
             next_gen: AtomicU64::new(0),
+            releasing: AtomicBool::new(false),
             state_path,
         }
+    }
+
+    /// Mark the start of the point-of-no-return blocking GPU release. From here until
+    /// [`clear_releasing`](Self::clear_releasing), no path may flip out of
+    /// `EnteringIdle` back to `Active`, so admission stays closed for the whole release.
+    fn set_releasing(&self) {
+        self.releasing.store(true, Ordering::SeqCst);
+    }
+
+    /// Mark the blocking GPU release as finished — only now may the phase leave
+    /// `EnteringIdle` (via commit → `Idle`, or via a rollback/recovery → `Active`).
+    fn clear_releasing(&self) {
+        self.releasing.store(false, Ordering::SeqCst);
+    }
+
+    /// Is a blocking GPU release currently in progress (point of no return)?
+    pub fn is_releasing(&self) -> bool {
+        self.releasing.load(Ordering::SeqCst)
     }
 
     /// From `MINT_IDLE_STATE_PATH` (unset ⇒ in-memory only, no infra path guessed).
@@ -708,7 +740,16 @@ impl IdleController {
     /// `EnteringIdle` this transition installed. If the phase advanced (committed), was
     /// recovered by the watchdog, or was superseded by a newer transition, it is a
     /// NO-OP — so a stale/late drop can never clobber a newer transition's state.
-    fn abort_enter(&self, generation: u64) {
+    ///
+    /// RELEASE-GUARDED: it is ALSO a no-op while [`is_releasing`](Self::is_releasing) is
+    /// set (the blocking GPU release is mid-flight). A dropped/cancelled enter future
+    /// whose blocking release is still running must NOT reopen admission — the detached
+    /// blocking task will clear the latch when it finishes, and the watchdog then
+    /// recovers the (now safe) `EnteringIdle` to `Active`. Returns whether it rolled back.
+    fn abort_enter(&self, generation: u64) -> bool {
+        if self.is_releasing() {
+            return false; // point of no return — release still running, keep admission closed
+        }
         let mut guard = self.inner.write().expect("mint idle lock poisoned");
         if let IdleState::EnteringIdle {
             generation: cur, ..
@@ -717,8 +758,10 @@ impl IdleController {
             if *cur == generation {
                 *guard = IdleState::Active;
                 self.persist_locked(&guard);
+                return true;
             }
         }
+        false
     }
 
     /// Internal CAS `Idle → Activating{generation}`, returning the manifest to clear
@@ -796,7 +839,16 @@ impl IdleController {
     /// `Active` and return `true`. Never touches a steady `Active`/`Idle` phase. Bumps
     /// the generation so any outstanding guard for the recovered transition is
     /// invalidated (its finish/abort become no-ops). Insurance behind the RAII guard.
+    ///
+    /// RELEASE-GUARDED: it is a no-op while [`is_releasing`](Self::is_releasing) is set —
+    /// the watchdog must never force a stuck `EnteringIdle` back to `Active` while the
+    /// (non-abortable) blocking GPU release is still executing, or it would reopen
+    /// admission mid-release. The blocking task clears the latch when it finishes, and
+    /// only a subsequent tick recovers the transition.
     pub fn recover_stale_transition(&self, now: u64, max_age: u64) -> bool {
+        if self.is_releasing() {
+            return false; // point of no return — release still running, keep admission closed
+        }
         let mut guard = self.inner.write().expect("mint idle lock poisoned");
         let Some(since) = guard.transition_since() else {
             return false;
@@ -869,13 +921,23 @@ impl EnterTransition<'_> {
 impl Drop for EnterTransition<'_> {
     fn drop(&mut self) {
         if !self.committed {
-            // Generation-guarded inside `abort_enter`: a stale guard (its transition
-            // recovered by the watchdog and superseded by a newer one) is a no-op here.
-            self.ctl.abort_enter(self.generation);
-            warn!(
-                "mint idle-mode: enter transition dropped before commit (future cancelled/panicked) \
-                 — rolled EnteringIdle back to Active (if still the live transition)"
-            );
+            // Generation-guarded AND release-guarded inside `abort_enter`: a stale guard
+            // (recovered by the watchdog, superseded by a newer transition) is a no-op,
+            // and — critically — so is a drop while the blocking GPU release is still
+            // running (`is_releasing`). In that case admission stays closed until the
+            // detached release finishes and the watchdog recovers the transition; we do
+            // NOT reopen admission mid-release.
+            if self.ctl.abort_enter(self.generation) {
+                warn!(
+                    "mint idle-mode: enter transition dropped before commit (future cancelled/panicked) \
+                     — rolled EnteringIdle back to Active"
+                );
+            } else {
+                warn!(
+                    "mint idle-mode: enter transition dropped before commit but rollback withheld \
+                     (superseded, or a blocking release is still running — admission stays closed)"
+                );
+            }
         }
     }
 }
@@ -891,15 +953,19 @@ impl std::fmt::Debug for EnterTransition<'_> {
 }
 
 /// The process-global MINT idle-mode controller, lazily initialised from the
-/// environment on first use (Terminus's `OnceLock` idiom — see `pki::ca`). The
-/// admission hook and the watchdog reference this via [`mint_idle`]; unit tests use
-/// isolated [`IdleController::new`] instances so they never touch global state.
-static MINT_IDLE_CELL: std::sync::OnceLock<IdleController> = std::sync::OnceLock::new();
+/// environment on first use (Terminus's `OnceLock` idiom — see `pki::ca`). Held in an
+/// `Arc` so the (non-abortable) blocking release task in [`enter_idle_on`] can own a
+/// clone that outlives a cancelled enter future and still clear the release latch when
+/// it finishes. The admission hook and the watchdog reference this via [`mint_idle`];
+/// unit tests use isolated [`IdleController::new`] instances so they never touch it.
+static MINT_IDLE_CELL: std::sync::OnceLock<Arc<IdleController>> = std::sync::OnceLock::new();
 
 /// Accessor for the process-global MINT idle-mode controller (initialised once, from
-/// the environment). Prefer this over touching the cell directly.
-pub fn mint_idle() -> &'static IdleController {
-    MINT_IDLE_CELL.get_or_init(IdleController::from_env)
+/// the environment). Returns a cheap `Arc` clone of the single shared controller.
+pub fn mint_idle() -> Arc<IdleController> {
+    MINT_IDLE_CELL
+        .get_or_init(|| Arc::new(IdleController::from_env()))
+        .clone()
 }
 
 /// Load a persisted manifest from `path`. Missing/unreadable/malformed ⇒ `None`
@@ -1065,16 +1131,48 @@ fn release_mint_gpu_lock() -> GpuReleaseResult {
 // ── Orchestration (async, best-effort side effects) ──────────────────────────
 
 /// Enter idle: drain in-flight MINT runs, release MINT's GPU-authority lock, sample
-/// freed RAM, record the resume manifest. The transition marker is installed atomically
-/// FIRST, so concurrent callers never double-run release and no new run is admitted once
-/// release begins. Returns the controller outcome plus (only on a real transition) the
-/// freed-RAM report.
+/// freed RAM, record the resume manifest. Delegates to [`enter_idle_on`] against the
+/// process-global controller with the real GPU-lock release.
 pub async fn enter_idle(reason: &str) -> (EnterOutcome, Option<IdleReport>) {
+    enter_idle_on(mint_idle(), reason, release_mint_gpu_lock).await
+}
+
+/// The generic enter-idle orchestration, parameterised over the controller and the
+/// (blocking) GPU-release function so it is unit-testable offline with an injected
+/// fake slow release (see `admission_stays_closed_until_blocking_release_completes`).
+///
+/// ## Why the release budget does NOT wrap the blocking release (codex review fix)
+/// A `tokio::spawn_blocking` task cannot be cancelled once it has started. The first
+/// cut wrapped the WHOLE release (drain + `spawn_blocking`) in a `timeout`; on timeout
+/// the wrapper future was dropped and the [`EnterTransition`] guard rolled the phase
+/// back to `Active`, reopening admission WHILE the blocking release was still running —
+/// exactly the "admission never reopens mid-release" violation. The fix splits release
+/// into two parts:
+///
+/// 1. **Drain + async prep** (cancellable, no external side effects): bounded by the
+///    release budget. On timeout the guard drops and rolls back to `Active` cleanly —
+///    safe, because the blocking release has NOT started yet (the latch is not set).
+/// 2. **Point of no return** — the blocking GPU release: guarded by
+///    [`IdleController::set_releasing`]/[`clear_releasing`](IdleController::clear_releasing)
+///    and awaited UNCONDITIONALLY (no timeout can abandon it). While the latch is set,
+///    neither the dropped-guard rollback nor the watchdog's stale-recovery may flip the
+///    phase back to `Active`, so admission (which is gated on the `Active` phase) stays
+///    closed until the release has actually completed. The blocking closure clears the
+///    latch as its final act, so even if THIS future is cancelled mid-release the
+///    detached task still completes the release and reopens the door — never before.
+pub async fn enter_idle_on<F>(
+    ctl: Arc<IdleController>,
+    reason: &str,
+    release_fn: F,
+) -> (EnterOutcome, Option<IdleReport>)
+where
+    F: FnOnce() -> GpuReleaseResult + Send + 'static,
+{
     // Atomically CLAIM the transition FIRST (fixes the TOCTOU: two concurrent enters
     // can no longer both observe "active" and both run release). Only the `Begin`
     // winner proceeds; everyone else returns a no-op with no side effects. The RAII
-    // `transition` guard makes this cancellation-safe.
-    let transition = match mint_idle().try_begin_enter() {
+    // `transition` guard makes the pre-release phase cancellation-safe.
+    let transition = match ctl.try_begin_enter() {
         Ok(t) => t,
         Err(BeginEnter::AlreadyIdle(m)) => return (EnterOutcome::AlreadyIdle(m), None),
         Err(_) => return (EnterOutcome::InTransition, None),
@@ -1087,17 +1185,14 @@ pub async fn enter_idle(reason: &str) -> (EnterOutcome, Option<IdleReport>) {
         "mint idle-mode: entering — draining runs and releasing GPU lock"
     );
 
-    // Bound the ENTIRE release sequence with an explicit budget kept STRICTLY BELOW the
-    // stale-recovery threshold. If release overruns, the timeout fires, we do NOT
-    // commit, and the RAII `transition` guard drops → clean rollback to `Active`.
-    // Admission was CLOSED for the whole `EnteringIdle` window and only reopens AFTER
-    // that consistent rollback — never with the lock half-released still admitting, and
-    // never concurrently with the watchdog's stale-recovery (which, by the config
-    // ordering invariant, cannot fire before this budget elapses).
+    // ── Part 1: drain + prep, bounded by the release budget (CANCELLABLE) ──────────
+    // If this overruns, the timeout fires, we do NOT commit, and the RAII `transition`
+    // guard drops → clean rollback to `Active`. This is safe to abandon precisely
+    // because the blocking release has NOT started (the latch is still clear), so no
+    // point-of-no-return work is left running.
     let release_budget = Duration::from_secs(release_budget_secs_from_env());
-    let release = tokio::time::timeout(release_budget, async {
-        // 1. Drain in-flight runs (bounded, closed-world).
-        let inflight_remaining = mint_idle()
+    let prep = tokio::time::timeout(release_budget, async {
+        let inflight_remaining = ctl
             .drain_inflight(Duration::from_secs(drain_secs_from_env()))
             .await;
         if inflight_remaining > 0 {
@@ -1106,47 +1201,65 @@ pub async fn enter_idle(reason: &str) -> (EnterOutcome, Option<IdleReport>) {
                 "mint idle-mode: drain bound hit — releasing anyway (overrunning runs finish on their own)"
             );
         }
-
-        // 2. Sample RAM before release.
         let mem_before = read_mem_available_gb();
-
-        // 3. Release MINT's own GPU-authority lock (hands the shared GPU back). The
-        //    blocking `gpu_authority` calls (systemctl/file IO) run on a blocking thread
-        //    so they never stall the async runtime.
-        let gpu = tokio::task::spawn_blocking(release_mint_gpu_lock)
-            .await
-            .unwrap_or(GpuReleaseResult {
-                holders_released: Vec::new(),
-                foreign_holder: None,
-            });
-
-        // 4. Sample RAM after release.
-        let mem_after = read_mem_available_gb();
-
-        let report = IdleReport {
-            mem_available_before_gb: mem_before,
-            mem_available_after_gb: mem_after,
-            freed_gb: freed_gb(mem_before, mem_after),
-            holders_released: gpu.holders_released.clone(),
-            inflight_remaining,
-            foreign_gpu_lock_holder: gpu.foreign_holder,
-        };
-        report
+        (inflight_remaining, mem_before)
     })
     .await;
 
-    let report = match release {
-        Ok(r) => r,
+    let (inflight_remaining, mem_before) = match prep {
+        Ok(v) => v,
         Err(_elapsed) => {
             warn!(
                 reason,
                 budget_secs = release_budget.as_secs(),
-                "mint idle-mode: release exceeded its budget — aborting enter; guard rolls EnteringIdle back to Active (admission was closed throughout)"
+                "mint idle-mode: drain/prep exceeded its budget — aborting enter BEFORE releasing (guard rolls EnteringIdle back to Active; no blocking release was started)"
             );
-            // `transition` drops here → clean rollback to Active; admission reopens only
-            // now, after a consistent rollback.
+            // `transition` drops here → clean rollback to Active (latch clear, so the
+            // rollback is allowed); admission reopens only after this consistent rollback.
             return (EnterOutcome::InTransition, None);
         }
+    };
+
+    // ── Part 2: POINT OF NO RETURN — the non-abortable blocking GPU release ─────────
+    // Set the latch BEFORE spawning so any concurrent drop/watchdog already sees
+    // "releasing" and refuses to reopen admission. The blocking closure clears the
+    // latch as its FINAL act (so a cancelled enter future still reopens the door only
+    // after the detached release finished). We await the join UNCONDITIONALLY — no
+    // timeout may abandon it.
+    ctl.set_releasing();
+    let ctl_for_task = ctl.clone();
+    let handle = tokio::task::spawn_blocking(move || {
+        let result = release_fn();
+        ctl_for_task.clear_releasing();
+        result
+    });
+    let gpu = match handle.await {
+        Ok(r) => r,
+        Err(_join_err) => {
+            // The blocking release panicked (its closure could not clear the latch);
+            // clear it here so the phase can resolve. The release is no longer running.
+            ctl.clear_releasing();
+            warn!(
+                reason,
+                "mint idle-mode: blocking GPU release task panicked — treated as best-effort (no resources reported freed)"
+            );
+            GpuReleaseResult {
+                holders_released: Vec::new(),
+                foreign_holder: None,
+            }
+        }
+    };
+
+    // Release is now fully COMPLETE and the latch is clear; it is safe for the phase to
+    // leave `EnteringIdle`.
+    let mem_after = read_mem_available_gb();
+    let report = IdleReport {
+        mem_available_before_gb: mem_before,
+        mem_available_after_gb: mem_after,
+        freed_gb: freed_gb(mem_before, mem_after),
+        holders_released: gpu.holders_released.clone(),
+        inflight_remaining,
+        foreign_gpu_lock_holder: gpu.foreign_holder,
     };
 
     let now = now_epoch();
@@ -1159,12 +1272,13 @@ pub async fn enter_idle(reason: &str) -> (EnterOutcome, Option<IdleReport>) {
     };
     // Complete the transition: `EnteringIdle{gen} → Idle` (consumes the guard so its
     // Drop rollback becomes a no-op). Generation-guarded: if our transition was
-    // force-recovered by the watchdog while we were releasing, `commit` returns `None`
-    // — our enter did NOT take effect, so report `InTransition` with no report.
+    // force-recovered while releasing (only possible AFTER the latch cleared, i.e. the
+    // release already finished), `commit` returns `None` — our enter did NOT take
+    // effect, so report `InTransition` with no report.
     let Some(stored) = transition.commit(manifest) else {
         warn!(
             reason,
-            "mint idle-mode: enter superseded (watchdog recovered a stale transition mid-release) — not reporting Entered"
+            "mint idle-mode: enter superseded (transition recovered after release finished) — not reporting Entered"
         );
         return (EnterOutcome::InTransition, None);
     };
@@ -1785,31 +1899,208 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_exceeding_budget_rolls_back_with_admission_closed() {
-        // While EnteringIdle, admission is CLOSED; a release that overruns its budget
-        // self-aborts (timeout) and the guard rollback reopens admission ONLY after a
-        // consistent return to Active — never mid-release. Mirrors enter_idle's structure
-        // using the controller primitives.
+    async fn prep_timeout_before_release_rolls_back_with_admission_closed() {
+        // The drain/prep phase (BEFORE the point of no return) is cancellable: on a
+        // budget timeout the guard rollback reopens admission — but only because the
+        // blocking release has NOT started (the latch is clear), so this rollback is
+        // consistent, not a mid-release reopen.
         let ctl = IdleController::new();
         let transition = ctl.try_begin_enter().expect("Active ⇒ transition begins");
 
         assert!(matches!(ctl.try_admit(), AdmitOutcome::Transitioning));
+        assert!(!ctl.is_releasing(), "no blocking release started yet");
 
         let budget = Duration::from_millis(20);
-        let release = tokio::time::timeout(budget, async {
+        let prep = tokio::time::timeout(budget, async {
             tokio::time::sleep(Duration::from_millis(500)).await;
         })
         .await;
-        assert!(release.is_err(), "release must exceed its budget");
+        assert!(prep.is_err(), "prep must exceed its budget");
 
         // STILL EnteringIdle and STILL closed — not committed or rolled back.
         assert_eq!(ctl.phase(), Phase::EnteringIdle);
         assert!(matches!(ctl.try_admit(), AdmitOutcome::Transitioning));
 
-        // On timeout we drop the guard → clean rollback to Active.
+        // Latch clear ⇒ dropping the guard rolls back to Active (safe: nothing running).
         drop(transition);
         assert_eq!(ctl.phase(), Phase::Active);
         assert!(matches!(ctl.try_admit(), AdmitOutcome::Admitted(_)));
+    }
+
+    #[test]
+    fn abort_enter_withheld_while_releasing() {
+        // The dropped-guard rollback (abort_enter) must be a NO-OP while a blocking
+        // release is in progress — otherwise a cancelled enter would reopen admission
+        // mid-release. Once the latch clears, the rollback is allowed again.
+        let ctl = IdleController::new();
+        let t = ctl.try_begin_enter().expect("Active ⇒ transition begins");
+        assert_eq!(ctl.phase(), Phase::EnteringIdle);
+
+        ctl.set_releasing();
+        // Drop the guard WHILE releasing: abort must be withheld, phase stays EnteringIdle,
+        // admission stays closed.
+        drop(t);
+        assert_eq!(
+            ctl.phase(),
+            Phase::EnteringIdle,
+            "rollback must be withheld while releasing"
+        );
+        assert!(matches!(ctl.try_admit(), AdmitOutcome::Transitioning));
+
+        // After the release finishes (latch clear), the watchdog can recover it.
+        ctl.clear_releasing();
+        let now = now_epoch();
+        assert!(ctl.recover_stale_transition(now + 10_000, 1));
+        assert_eq!(ctl.phase(), Phase::Active);
+    }
+
+    #[test]
+    fn recover_stale_transition_withheld_while_releasing() {
+        // The watchdog's stale-recovery must ALSO be a no-op while releasing — it must
+        // never force a stuck EnteringIdle back to Active mid-release.
+        let ctl = IdleController::new();
+        assert_eq!(ctl.begin_enter(), BeginEnter::Begin);
+        let now = now_epoch();
+        ctl.set_releasing();
+        // Even a wildly-past deadline must NOT recover while releasing.
+        assert!(!ctl.recover_stale_transition(now + 10_000, 1));
+        assert_eq!(ctl.phase(), Phase::EnteringIdle);
+        // Once release finishes, recovery proceeds.
+        ctl.clear_releasing();
+        assert!(ctl.recover_stale_transition(now + 10_000, 1));
+        assert_eq!(ctl.phase(), Phase::Active);
+    }
+
+    #[tokio::test]
+    async fn admission_stays_closed_until_blocking_release_completes() {
+        // THE codex-review invariant: a spawn_blocking release cannot be cancelled once
+        // started, so admission must stay CLOSED for the ENTIRE blocking release — not
+        // just the async wrapper — and reopen only after the release actually completes.
+        // Drive the real `enter_idle_on` with an injected fake release that blocks until
+        // the test signals it, and prove no admission ever succeeds until then.
+        use std::sync::mpsc;
+
+        let ctl = Arc::new(IdleController::new());
+        let (unblock_tx, unblock_rx) = mpsc::channel::<()>();
+        let started = Arc::new(AtomicBool::new(false));
+
+        let started_in = started.clone();
+        let slow_release = move || {
+            started_in.store(true, Ordering::SeqCst);
+            // Block the blocking thread until the test lets it finish — simulating a
+            // release that runs far longer than any async budget.
+            let _ = unblock_rx.recv();
+            GpuReleaseResult {
+                holders_released: vec!["intake_coder_sweep".into()],
+                foreign_holder: None,
+            }
+        };
+
+        let ctl_task = ctl.clone();
+        let enter =
+            tokio::spawn(async move { enter_idle_on(ctl_task, "test", slow_release).await });
+
+        // Wait until the blocking release has actually started.
+        while !started.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // Release is mid-flight: admission MUST be closed (Transitioning), never Admitted,
+        // across repeated attempts and real elapsed time — the whole release, not a wrapper.
+        assert!(
+            ctl.is_releasing(),
+            "latch must be set during the blocking release"
+        );
+        for _ in 0..10 {
+            match ctl.try_admit() {
+                AdmitOutcome::Transitioning => {}
+                AdmitOutcome::Admitted(_) => {
+                    panic!("admission reopened MID-RELEASE — invariant violated")
+                }
+                AdmitOutcome::Idle => panic!("must not be Idle until release completes"),
+            }
+            assert_eq!(ctl.phase(), Phase::EnteringIdle);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // Let the blocking release complete.
+        unblock_tx.send(()).unwrap();
+        let (outcome, report) = enter.await.expect("enter task joins");
+
+        // Only now does the phase resolve — to Idle (never Active/Admitted mid-release).
+        assert!(matches!(outcome, EnterOutcome::Entered(_)));
+        assert!(report.is_some());
+        assert!(
+            !ctl.is_releasing(),
+            "latch cleared once the release finished"
+        );
+        assert!(ctl.is_idle());
+        assert!(
+            matches!(ctl.try_admit(), AdmitOutcome::Idle),
+            "post-release admission is the lazy Idle path, never a stale Admitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_enter_mid_release_keeps_admission_closed_until_release_done() {
+        // Even if the enter FUTURE is cancelled mid-release, the detached blocking task
+        // keeps running and admission must stay closed until it finishes; only then may
+        // the phase leave EnteringIdle.
+        use std::sync::mpsc;
+
+        let ctl = Arc::new(IdleController::new());
+        let (unblock_tx, unblock_rx) = mpsc::channel::<()>();
+        let started = Arc::new(AtomicBool::new(false));
+
+        let started_in = started.clone();
+        let slow_release = move || {
+            started_in.store(true, Ordering::SeqCst);
+            let _ = unblock_rx.recv();
+            GpuReleaseResult {
+                holders_released: Vec::new(),
+                foreign_holder: None,
+            }
+        };
+
+        let ctl_task = ctl.clone();
+        let enter =
+            tokio::spawn(async move { enter_idle_on(ctl_task, "test", slow_release).await });
+
+        while !started.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(ctl.is_releasing());
+
+        // Cancel the enter future mid-release (client disconnect). The guard drops, but
+        // its rollback is WITHHELD because the latch is set — admission stays closed.
+        enter.abort();
+        let _ = enter.await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(
+            ctl.phase(),
+            Phase::EnteringIdle,
+            "cancelled enter must not reopen admission while the release runs"
+        );
+        assert!(matches!(ctl.try_admit(), AdmitOutcome::Transitioning));
+
+        // Let the detached release finish — it clears the latch as its final act.
+        unblock_tx.send(()).unwrap();
+        // Wait for the latch to clear (the detached blocking task ran to completion).
+        for _ in 0..500 {
+            if !ctl.is_releasing() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            !ctl.is_releasing(),
+            "detached release must clear the latch when done"
+        );
+
+        // Now (release finished) the watchdog may recover the abandoned transition.
+        let now = now_epoch();
+        assert!(ctl.recover_stale_transition(now + 10_000, 1));
+        assert_eq!(ctl.phase(), Phase::Active);
     }
 
     // ── env parsing + holder config ──────────────────────────────────────────
