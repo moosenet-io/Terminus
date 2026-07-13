@@ -1293,6 +1293,8 @@ pub(crate) mod fake {
         fail_finalizes: usize,
         /// The next N `release` calls fail as Unavailable (completion-time outage).
         fail_releases: usize,
+        /// The next N `requeue` calls fail as Unavailable (idle-abort requeue outage).
+        fail_requeues: usize,
     }
 
     /// An offline `QueueStore` mirroring the Lua semantics exactly.
@@ -1322,6 +1324,11 @@ pub(crate) mod fake {
         /// Make the next `n` `finalize` calls fail as Unavailable.
         pub(crate) fn fail_finalizes(&self, n: usize) {
             self.state.lock().unwrap().fail_finalizes = n;
+        }
+
+        /// Make the next `n` `requeue` calls fail as Unavailable (idle-abort outage).
+        pub(crate) fn fail_requeues(&self, n: usize) {
+            self.state.lock().unwrap().fail_requeues = n;
         }
 
         /// Whether a job carries a durable terminal-outcome marker (test helper).
@@ -1662,6 +1669,11 @@ pub(crate) mod fake {
         ) -> Result<(), QueueError> {
             let mut s = self.state.lock().unwrap();
             if s.down {
+                return Err(QueueError::Unavailable);
+            }
+            // Simulate a transient requeue outage (retried by the scheduler).
+            if s.fail_requeues > 0 {
+                s.fail_requeues -= 1;
                 return Err(QueueError::Unavailable);
             }
             // FENCE: only the current claim token may requeue; a mismatch (already

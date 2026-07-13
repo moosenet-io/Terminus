@@ -500,16 +500,41 @@ impl Scheduler {
                         );
                         // Token-fenced requeue: free the module lock + host slot and
                         // return the job to the queue (clearing stale error state). A
-                        // stale token (reconciled/re-claimed) is a safe no-op.
-                        if let Err(re) = queue
-                            .requeue(&job.job_id, &job.module, host, &token, "idle-lease-unavailable")
-                            .await
-                        {
+                        // stale token (reconciled/re-claimed) is a safe no-op. RETRY with
+                        // bounded backoff so a transient Redis blip does not pin the heavy
+                        // host slot (F3).
+                        let requeued = retry(base, max_attempts, || {
+                            queue.requeue(
+                                &job.job_id,
+                                &job.module,
+                                host,
+                                &token,
+                                "idle-lease-unavailable",
+                            )
+                        })
+                        .await;
+                        if !requeued {
+                            // Requeue still failing after retries → do NOT leave the job
+                            // claimed (pinning the heavy host slot + module lock until
+                            // reconcile). Explicitly FREE the slot (finalize Failed +
+                            // release, token-fenced). Reconcile remains the ultimate
+                            // backstop if even this fails.
                             tracing::error!(
                                 module = %job.module, job = %job.job_id,
-                                "compiler scheduler: requeue after idle-lease failure did not \
-                                 land ({re}); the reconcile backstop will requeue it"
+                                "compiler scheduler: requeue after idle-lease failure exhausted \
+                                 retries; RELEASING the job's lock+slot so the heavy host is \
+                                 not tied up (reconcile is the backstop)"
                             );
+                            if let Err(re) = queue
+                                .complete(&job.job_id, &job.module, host, JobState::Failed, &token)
+                                .await
+                            {
+                                tracing::error!(
+                                    module = %job.module, job = %job.job_id,
+                                    "compiler scheduler: could neither requeue NOR release the \
+                                     job ({re}); the reconcile backstop will recover the slot"
+                                );
+                            }
                         }
                         return;
                     }
@@ -897,6 +922,56 @@ mod tests {
         }
         assert_eq!(*ex.built.lock().unwrap(), vec!["harmony".to_string()]);
         assert_eq!(idle_ok.releases.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_abort_requeue_retries_a_transient_failure_and_frees_the_slot() {
+        // FINDING 3: an idle-abort whose FIRST requeue attempt fails (transient Redis
+        // blip) must NOT pin the heavy host slot — the scheduler retries and the job
+        // ends requeued with its slot freed.
+        let q = Arc::new(InMemoryQueue::new());
+        let enq = q.enqueue(&req("harmony", "big", true)).await.unwrap();
+        let ex = RecordingExecutor::new(false);
+        let idle = Arc::new(CountingIdle::new(true)); // acquire fails ⇒ abort path
+        let s = sched(q.clone(), ex.clone(), idle.clone(), cfg(1, 1, vec![]));
+        q.fail_requeues(1); // first requeue attempt fails, then succeeds on retry
+        let r = s.tick_once(12, true).await;
+        assert_eq!(r.dispatched.len(), 1);
+        for h in r.handles {
+            h.await.unwrap();
+        }
+        assert!(ex.built.lock().unwrap().is_empty(), "never built");
+        // The retry landed the requeue: back to queued, slot freed, no stale outcome.
+        assert_eq!(q.state_of(&enq.job_id).as_deref(), Some("queued"));
+        assert_eq!(q.inflight_count(HostRole::Heavy), 0, "host slot NOT tied up");
+    }
+
+    #[tokio::test]
+    async fn idle_abort_releases_the_slot_when_requeue_never_succeeds() {
+        // FINDING 3: if requeue keeps failing past its retries, the scheduler must still
+        // FREE the slot (finalize Failed + release) rather than leave the job claimed and
+        // pin the heavy host — reconcile is only the ultimate backstop.
+        let q = Arc::new(InMemoryQueue::new());
+        let enq = q.enqueue(&req("harmony", "big", true)).await.unwrap();
+        let ex = RecordingExecutor::new(false);
+        let idle = Arc::new(CountingIdle::new(true)); // acquire fails ⇒ abort path
+        // Fail every requeue attempt (cfg's complete_retry_max is 50) so the fallback
+        // release path runs.
+        let s = sched(q.clone(), ex.clone(), idle.clone(), cfg(1, 1, vec![]));
+        q.fail_requeues(1000);
+        let r = s.tick_once(12, true).await;
+        assert_eq!(r.dispatched.len(), 1);
+        for h in r.handles {
+            h.await.unwrap();
+        }
+        assert!(ex.built.lock().unwrap().is_empty(), "never built");
+        // Requeue never landed → the slot was RELEASED (job terminal, not left building).
+        assert_ne!(
+            q.state_of(&enq.job_id).as_deref(),
+            Some("building"),
+            "job must NOT be left claimed/building (that would pin the host slot)"
+        );
+        assert_eq!(q.inflight_count(HostRole::Heavy), 0, "host slot freed by the fallback release");
     }
 
     #[tokio::test]

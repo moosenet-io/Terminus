@@ -413,6 +413,10 @@ struct LeaseInner {
     /// is dead — `acquire_lease`'s wait loop checks this and REFUSES to hand back a lease
     /// whose services are being reactivated (F1: never build under an expired lease).
     expired: AtomicBool,
+    /// Woken the instant `expired` is set, so `acquire_lease`'s budget wait is
+    /// INTERRUPTIBLE — it returns `LeaseExpired` immediately on expiry instead of
+    /// sleeping out the rest of a (possibly long) `BUILD_IDLE_POLL_MS` interval.
+    expired_notify: tokio::sync::Notify,
 }
 
 impl LeaseInner {
@@ -461,8 +465,10 @@ impl LeaseInner {
         // Mark the lease dead the instant release begins, so a concurrent
         // `acquire_lease` wait loop observes the expiry and refuses to hand back a lease
         // whose services are being reactivated (F1). Set BEFORE the fast-path return so
-        // even an already-fully-released lease reads as expired.
+        // even an already-fully-released lease reads as expired. Wake any interruptible
+        // acquire wait immediately (F2) so it returns without sleeping out its poll.
         self.expired.store(true, Ordering::SeqCst);
+        self.expired_notify.notify_waiters();
         // Fast path: already done (lock-free).
         if self.fully_released() {
             return;
@@ -520,6 +526,12 @@ impl LeaseGuard {
     /// no-op guard is never expired. `acquire_lease` checks this during its wait.
     fn is_expired(&self) -> bool {
         self.inner.as_ref().map(|i| i.is_expired()).unwrap_or(false)
+    }
+
+    /// A clone of the shared inner (present for a real, non-noop guard) so
+    /// `acquire_lease` can await the expiry notifier for an interruptible wait (F2).
+    fn inner_handle(&self) -> Option<Arc<LeaseInner>> {
+        self.inner.clone()
     }
 
     /// Explicit, AWAITED release for the normal completion path. Idempotent with the
@@ -688,9 +700,14 @@ pub async fn acquire_lease(
     }
 
     // Budget configured ⇒ WAIT until enough RAM is established, bounded by the acquire
-    // timeout. PRIMARY gate: total AVAILABLE RAM (`MemAvailable`) ≥ budget (F2 — a build
+    // timeout. PRIMARY gate: total AVAILABLE RAM (`MemAvailable`) ≥ budget (a build
     // needs that much available). FALLBACK when MemAvailable is unreadable: the services'
-    // REPORTED freed-RAM ≥ budget (F2 — never abort-forever just because /proc is blind).
+    // REPORTED freed-RAM ≥ budget (never abort-forever just because /proc is blind).
+    // The wait is INTERRUPTIBLE by expiry (F2): the max-lease watchdog wakes it at once
+    // via `expired_notify`, so it never sleeps out a large poll interval under a dead lease.
+    let inner = guard
+        .inner_handle()
+        .expect("a real (armed) guard always has inner");
     let deadline = tokio::time::Instant::now() + cfg.acquire_timeout;
     loop {
         // F1: if the lease was released/expired (watchdog fired) mid-wait, the services
@@ -730,7 +747,19 @@ pub async fn acquire_lease(
                 budget_gb,
             });
         }
-        tokio::time::sleep(cfg.poll).await;
+        // INTERRUPTIBLE poll (F2): register for the expiry notification and enable it
+        // BEFORE re-checking `is_expired`, so an expiry that races the registration is
+        // never missed — then wait for the poll tick OR an immediate expiry wake.
+        let notified = inner.expired_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if guard.is_expired() {
+            return expired_abort(guard, "lease expired just before the interruptible sleep");
+        }
+        tokio::select! {
+            _ = &mut notified => { /* woken by expiry — loop re-checks and aborts */ }
+            _ = tokio::time::sleep(cfg.poll) => { /* normal poll tick */ }
+        }
     }
 }
 
@@ -779,6 +808,7 @@ fn arm_guard(
         op_timeout,
         release_lock: tokio::sync::Mutex::new(()),
         expired: AtomicBool::new(false),
+        expired_notify: tokio::sync::Notify::new(),
     });
     let wd_inner = inner.clone();
     let watchdog = tokio::spawn(async move {
@@ -1319,6 +1349,7 @@ mod tests {
             op_timeout: Duration::from_secs(5),
             release_lock: tokio::sync::Mutex::new(()),
             expired: AtomicBool::new(false),
+            expired_notify: tokio::sync::Notify::new(),
         });
         let (i1, i2) = (inner.clone(), inner.clone());
         tokio::join!(async { i1.release().await }, async { i2.release().await });
@@ -1350,22 +1381,26 @@ mod tests {
 
     #[tokio::test]
     async fn watchdog_covers_the_budget_wait_even_when_acquire_timeout_is_longer() {
-        // FINDING 4: the max-lease watchdog is armed as soon as services are IDLED, so
-        // it bounds the WHOLE idle window including the budget wait. With max_lease=0, a
-        // long acquire_timeout, and RAM below budget (wait never completes), the watchdog
-        // force-activates DURING the wait — not governed by acquire_timeout.
+        // FINDING 4 + FINDING 2: the max-lease watchdog is armed as soon as services are
+        // IDLED, so it bounds the WHOLE idle window including the budget wait — and the
+        // wait is INTERRUPTIBLE, so acquire returns Err(LeaseExpired) PROMPTLY when the
+        // watchdog fires, NOT bounded by the (5s) acquire_timeout nor the (60s) poll.
+        // A huge poll proves interruption; we do NOT abort the task to sidestep it.
         let be = MockBackend::new(None, None).with_mem(vec![50.0]); // stays below budget
-        let c = cfg(5, 0); // acquire_timeout = 5s >> max_lease = 0
-        let be2 = be.clone();
-        let handle = tokio::spawn(async move { acquire_lease(be2, &c, true, 120.0).await });
-        // Long before the 5s acquire timeout, the max-lease=0 watchdog fires mid-wait.
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        let mut c = cfg(5, 0); // acquire_timeout = 5s >> max_lease = 0
+        c.poll = Duration::from_secs(60); // huge: acquire must NOT be poll-bound
+        let res = tokio::time::timeout(Duration::from_secs(1), acquire_lease(be.clone(), &c, true, 120.0))
+            .await
+            .expect("acquire returned PROMPTLY (interrupted by the watchdog, not poll/acquire-timeout-bound)");
+        assert!(
+            matches!(res, Err(LeaseError::LeaseExpired { .. })),
+            "watchdog fired mid-wait ⇒ Err(LeaseExpired), never Ok — got {res:?}"
+        );
         assert_eq!(
             be.activates(),
             (1, 1),
             "watchdog force-activated DURING the wait (bounded by max_lease, not acquire_timeout)"
         );
-        handle.abort(); // stop the still-waiting acquire (would otherwise run to 5s)
     }
 
     #[tokio::test]
@@ -1398,19 +1433,18 @@ mod tests {
 
     #[tokio::test]
     async fn watchdog_release_mid_wait_makes_acquire_fail_not_build_under_dead_lease() {
-        // FINDING 1 (BLOCKER): if the max-lease watchdog RELEASES services while acquire
-        // is still waiting for RAM, acquire must FAIL (LeaseExpired → requeue), NEVER
-        // return Ok(guard) — the heavy build must not start under a dead/reactivated lease.
+        // FINDING 1 (BLOCKER) + FINDING 2 (interruptible): if the max-lease watchdog
+        // RELEASES services while acquire is still waiting for RAM, acquire must FAIL
+        // (LeaseExpired → requeue) PROMPTLY — never Ok, and never sleeping out a big poll
+        // interval. A HUGE poll (60s) proves the wait is interrupted by expiry, not
+        // poll-bound: acquire returns well within a second of the 30ms watchdog firing.
         let be = MockBackend::new(None, None).with_mem(vec![50.0]); // stays below budget
         let mut c = cfg(5, 3600); // acquire_timeout = 5s (won't be hit)
         c.max_lease = Duration::from_millis(30); // watchdog fires DURING the wait
-        let be2 = be.clone();
-        let handle = tokio::spawn(async move { acquire_lease(be2, &c, true, 120.0).await });
-        // After the watchdog has fired (services reactivated), make RAM reach budget —
-        // acquire must STILL fail (it observed the expiry), not return Ok.
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        *be.mem_samples.lock().unwrap() = vec![200.0];
-        let res = handle.await.unwrap();
+        c.poll = Duration::from_secs(60); // huge: without interruption, acquire would hang here
+        let res = tokio::time::timeout(Duration::from_secs(1), acquire_lease(be.clone(), &c, true, 120.0))
+            .await
+            .expect("acquire returned PROMPTLY after expiry (interruptible wait, not poll-bound)");
         assert!(
             matches!(res, Err(LeaseError::LeaseExpired { .. })),
             "expired lease ⇒ acquire must Err(LeaseExpired), never Ok — got {res:?}"
@@ -1449,6 +1483,7 @@ mod tests {
             op_timeout: Duration::from_secs(5),
             release_lock: tokio::sync::Mutex::new(()),
             expired: AtomicBool::new(false),
+            expired_notify: tokio::sync::Notify::new(),
         });
         // Manually build a guard with NO watchdog (simulating a guard whose ambient
         // runtime is gone), then drop it with no ambient runtime.
