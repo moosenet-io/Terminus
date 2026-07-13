@@ -529,20 +529,22 @@ compiler_deploy(module, channel="stable", hosts="all")
   others still proceed and the nightly timer catches the straggler.
 - **No-masked-failures / no-raw-echo hardening:** the trigger forces **non-interactive sudo**
   (`sudo -n`) so a password prompt fails fast instead of hanging the whole per-host budget; the
-  outcome marker is **mtime-fresh / run-scoped** — the wrapper records a run-start epoch and reads
-  the token **only if the marker's mtime is ≥ (start − 1s)**, so a stale prior-run marker the ssh
-  user could not remove (a root-owned marker) is never trusted and can't mask a current run (the
-  1-second tolerance absorbs `stat`/`date` second-granularity so a same-second write is not
-  spuriously rejected, while a genuinely stale marker — seconds-to-minutes older — is still
-  rejected); a
+  (only `-n` is permitted before `systemctl`, never an argument-taking sudo flag like `-u`/`-h`
+  that could make sudo read `systemctl` as a username); the outcome marker is **truly run-scoped**
+  — the wrapper creates a fresh **run-reference file** it owns (mtime = now) at run start and
+  trusts the marker **only if its mtime is ≥ the reference's** (both real files, same host clock),
+  so a stale prior-run marker the ssh user could not remove (a root-owned marker) provably predates
+  this run and is rejected, with **no absolute-time tolerance window**; a
   non-zero `systemctl start` rc is classified `failed` regardless of the unit's (possibly stale)
-  `Result`; the **outer wall-clock timeout is strictly greater than the ssh connect budget**, so
-  a connect/auth hang surfaces as `unreachable` (never `timed_out`); the per-host `detail` is
-  **fixed-vocabulary only** (`outcome=… rc=…`) — the raw updater marker token is **never echoed**
-  into structured output; an **unknown requested host** is reported by **count only** (never
-  reflecting arbitrary caller input / ssh targets back); and `COMPILER_DEPLOY_SYSTEMCTL` is a
-  **constrained** command whose **executable must be `systemctl`** (bare tokens only, shell
-  metacharacters rejected — not arbitrary shell). A malformed `COMPILER_DEPLOY_SYSTEMCTL` is an
+  `Result`; an **absent marker** trusts `deployed` only when `rc == 0` **AND** the systemd
+  `Result` is `success` (a non-success `Result` → `failed` even with rc==0; an indeterminate
+  `Result` → `unknown` — exit code alone is not enough); the **outer wall-clock timeout is strictly
+  greater than the ssh connect budget**, so a connect/auth hang surfaces as `unreachable` (never
+  `timed_out`); the per-host `detail` is **fixed-vocabulary only** (`outcome=… rc=…`) — the raw
+  updater marker token is **never echoed** into structured output; an **unknown requested host** is
+  reported by **count only** (never reflecting arbitrary caller input / ssh targets back); and
+  `COMPILER_DEPLOY_SYSTEMCTL` is a **constrained** command whose **executable must be `systemctl`**
+  (bare tokens only, shell metacharacters rejected — not arbitrary shell). A malformed `COMPILER_DEPLOY_SYSTEMCTL` is an
   **operator-config** failure, not a caller error: it surfaces **in the aggregate report** (every
   chosen host `failed` + a config-error note naming the problem, no raw value echoed) — identical
   for the direct tool and the auto-promote hook — rather than aborting with a bare error that
@@ -572,12 +574,14 @@ Config (all optional, no infra literals — S1): `COMPILER_DEPLOY_HOSTS` (shared
 `compiler_status`; `;`-separated `label|ssh_target`), `COMPILER_DEPLOY_UNIT_TEMPLATE` (default
 `constellation-update@{module}.service`; `{module}`/`{channel}` substituted),
 `COMPILER_DEPLOY_SYSTEMCTL` (default `systemctl`; a **constrained** command — bare tokens
-`[A-Za-z0-9._/-]` whose **executable must be `systemctl`** after an optional leading `sudo [-n …]`,
+`[A-Za-z0-9._/-]` whose **executable must be `systemctl`** after an optional leading `sudo`
+followed by ONLY the non-interactive flag `-n` (no other/argument-taking sudo flag),
 e.g. `sudo systemctl` / `sudo -n /usr/bin/systemctl`; shell metacharacters and a non-systemctl
 executable are rejected. A `sudo` prefix is auto-forced non-interactive with `-n`),
 `COMPILER_DEPLOY_RESULT_MARKER_TEMPLATE` (default
-`/opt/{module}/.deploy_result` — the updater's outcome-token file, trusted only when mtime-fresh;
-absent/stale, the outcome degrades to the systemd `Result` + exit code),
+`/opt/{module}/.deploy_result` — the updater's outcome-token file, trusted only when its mtime is
+≥ this run's run-reference file; absent/stale, the outcome degrades to the systemd `Result` + exit
+code, and `deployed` requires `rc == 0` AND `Result=success`),
 `COMPILER_DEPLOY_TRIGGER_TIMEOUT_SECS` (default 300 — the post-connect RUN budget; larger than the
 BLD-08 marker read since the trigger runs the updater synchronously),
 `COMPILER_DEPLOY_CONNECT_TIMEOUT_SECS` (default 10 — the ssh `ConnectTimeout`; the outer

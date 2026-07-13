@@ -143,17 +143,38 @@ fn is_systemctl_exe(t: &str) -> bool {
     t == "systemctl" || t.ends_with("/systemctl")
 }
 
+/// Whether a token is an ACCEPTED `sudo` option — ONLY the non-interactive flag, in
+/// its short/long/bundled forms (`-n`, `--non-interactive`, or a bundled short group
+/// that is nothing but `n`s like `-nn`). Every OTHER sudo flag is rejected — crucially
+/// the ARGUMENT-TAKING ones (`-u user`, `-g group`, `-h host`, `-p prompt`, `-C fd`,
+/// `-r role`, `-T timeout`, `-U user`, …), whose argument the naive "skip all dash
+/// flags" parser would mistake for the executable (`sudo -u systemctl` → sudo reads
+/// `systemctl` as the USERNAME). Only `-n` is ever needed here.
+fn is_accepted_sudo_flag(t: &str) -> bool {
+    t == "-n"
+        || t == "--non-interactive"
+        // A bundled short group of only `n` (e.g. `-nn`); `-n` takes no argument, so
+        // bundling is unambiguous and can never swallow the executable.
+        || (t.starts_with('-')
+            && !t.starts_with("--")
+            && t.len() > 1
+            && t[1..].chars().all(|c| c == 'n'))
+}
+
 /// Validate `COMPILER_DEPLOY_SYSTEMCTL`: it is a CONSTRAINED systemctl invocation,
 /// **not** arbitrary operator shell. It must be a whitespace-separated token list of
-/// safe bare words (`[A-Za-z0-9._/-]`, no shell metacharacters/control chars), and
-/// — crucially — the ACTUAL EXECUTABLE must be `systemctl` (finding 3): after an
-/// optional leading `sudo` and its `-…` flags, the first non-flag token is the
-/// executable and MUST be `systemctl` (or a `.../systemctl` path). So `systemctl`,
-/// `sudo systemctl`, `sudo -n systemctl`, `sudo -n /usr/bin/systemctl` are accepted,
-/// while `reboot systemctl` / `sudo reboot systemctl` (executable is `reboot`) are
-/// REJECTED. Any metacharacter or a non-systemctl executable is a clear config error
-/// (never inserted into the remote shell). Empty/unset ⇒ the default `systemctl`.
-/// The error message NEVER echoes the raw value back (S1).
+/// safe bare words (`[A-Za-z0-9._/-]`, no shell metacharacters/control chars). The
+/// permitted grammar is TIGHT (findings 1 & 3): an optional leading `sudo`, then
+/// optionally ONLY the non-interactive flag `-n` (no other sudo option — especially
+/// no argument-taking flag like `-u`/`-g`/`-h`/`-p` that could make sudo read the
+/// next token as a username/host and treat `systemctl` as data), then the EXECUTABLE
+/// which MUST be `systemctl` (or a `.../systemctl` path), then only systemctl args.
+/// So `systemctl`, `sudo systemctl`, `sudo -n systemctl`, `/usr/bin/systemctl`,
+/// `sudo -n /usr/bin/systemctl` are accepted; `sudo -u systemctl`, `sudo reboot
+/// systemctl`, `reboot systemctl` are REJECTED. Any metacharacter, a disallowed sudo
+/// flag, or a non-systemctl executable is a clear config error (never inserted into
+/// the remote shell). Empty/unset ⇒ the default `systemctl`. The error message NEVER
+/// echoes the raw value back (S1).
 fn validate_systemctl_cmd(raw: &str) -> Result<String, ToolError> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -179,11 +200,18 @@ fn validate_systemctl_cmd(raw: &str) -> Result<String, ToolError> {
              (bare tokens of [A-Za-z0-9._/-] only — no shell metacharacters); rejected"
         )));
     }
-    // Locate the EXECUTABLE: skip an optional leading `sudo` and its dash-flags.
+    // Locate the EXECUTABLE under the TIGHT grammar: optional `sudo`, then ONLY `-n`
+    // (never any other/argument-taking sudo flag), then `systemctl`.
     let mut i = 0;
     if toks.get(i) == Some(&"sudo") {
         i += 1;
         while matches!(toks.get(i), Some(t) if t.starts_with('-')) {
+            if !is_accepted_sudo_flag(toks[i]) {
+                return Err(ToolError::InvalidArgument(format!(
+                    "{COMPILER_DEPLOY_SYSTEMCTL}: the only sudo option permitted before \
+                     `systemctl` is `-n` (no other/argument-taking flag); rejected"
+                )));
+            }
             i += 1;
         }
     }
@@ -484,22 +512,25 @@ fn ensure_non_interactive_sudo(prefix: &str) -> String {
 
 /// Render the remote shell command that TRIGGERS the updater synchronously and
 /// prints a deterministic outcome line. It:
-///   1. records a run START epoch (`__start`), then best-effort clears any prior
-///      marker (`rm -f`),
-///   2. runs `<systemctl> start <unit>` (a `Type=oneshot` updater unit blocks until
+///   1. creates a fresh RUN-REFERENCE FILE this run provably owns — `mktemp` in a
+///      writable temp dir (fallback: a pid-named `/tmp` file), then `: >` to stamp its
+///      mtime to NOW — and records that reference's mtime (`__refmt`),
+///   2. best-effort clears any prior marker (`rm -f`),
+///   3. runs `<systemctl> start <unit>` (a `Type=oneshot` updater unit blocks until
 ///      the whole fetch→swap→health→rollback→marker flow finishes), captures its
 ///      exit code — with `sudo` forced non-interactive (`-n`) so it fails fast
 ///      instead of hanging on a password prompt,
-///   3. reads the systemd `Result`, then reads the outcome-token file ONLY IF its
-///      MTIME is `>= __start - 1` (finding 2: MTIME-FRESH, with a 1-second tolerance).
-///      A marker whose mtime predates this run — a stale token the ssh user could NOT
-///      `rm` (root-owned marker) — is NEVER trusted, so it can't mask a current run
-///      that wrote no fresh marker. The 1s tolerance is deliberate: `stat`/`date` are
-///      second-granularity, so a marker written in the SAME second as `__start` could
-///      otherwise round just below it and be wrongly rejected; a genuinely stale
-///      marker is seconds-to-minutes older, so the anti-stale guarantee is unaffected,
-///   4. prints `COMPILER_DEPLOY rc=<rc> result=<result> token=<token>`,
-///   5. ALWAYS `exit 0` — so ssh's OWN exit code reflects only CONNECTIVITY (a
+///   4. reads the systemd `Result`, then reads the outcome-token file ONLY IF the
+///      run-reference was genuinely created (`__refmt > 0`) AND the marker's mtime is
+///      `>= __refmt` (finding 4: TRULY RUN-SCOPED). Because the reference is created
+///      at run start and a fresh marker is written DURING the run (causally after it),
+///      a fresh marker's mtime is always `>= __refmt`; a STALE marker from a PRIOR run
+///      predates this run's reference and is rejected — regardless of whether `rm`
+///      could remove it (a root-owned marker) and with NO absolute-time tolerance
+///      window. If the reference could not be created, NO marker is trusted (degrade
+///      to `Result` + rc). The reference file is removed afterward,
+///   5. prints `COMPILER_DEPLOY rc=<rc> result=<result> token=<token>`,
+///   6. ALWAYS `exit 0` — so ssh's OWN exit code reflects only CONNECTIVITY (a
 ///      non-zero ssh exit ⇒ unreachable, never merely a failed deploy). This is
 ///      the same tri-state trick BLD-08 uses for its marker read.
 ///
@@ -511,13 +542,15 @@ pub fn render_remote_trigger_cmd(systemctl: &str, unit: &str, result_marker: &st
     let u = shell_quote(unit);
     let m = shell_quote(result_marker);
     format!(
-        "__start=$(date +%s); \
-         __floor=$((__start - 1)); \
+        "__ref=$(mktemp 2>/dev/null || echo /tmp/.compiler-deploy-ref-$$); \
+         : > \"$__ref\" 2>/dev/null; \
+         __refmt=$(stat -c %Y -- \"$__ref\" 2>/dev/null || echo 0); \
          rm -f -- {m} 2>/dev/null; \
          {systemctl} start {u}; __rc=$?; \
          __res=$({systemctl} show {u} --property=Result --value 2>/dev/null); \
          __mt=$(stat -c %Y -- {m} 2>/dev/null || echo 0); \
-         if [ \"$__mt\" -ge \"$__floor\" ] 2>/dev/null; then __tok=$(cat -- {m} 2>/dev/null); else __tok=; fi; \
+         if [ \"$__refmt\" -gt 0 ] && [ \"$__mt\" -ge \"$__refmt\" ] 2>/dev/null; then __tok=$(cat -- {m} 2>/dev/null); else __tok=; fi; \
+         rm -f -- \"$__ref\" 2>/dev/null; \
          printf '{sentinel} rc=%s result=%s token=%s\\n' \"$__rc\" \"$__res\" \"$__tok\"; \
          exit 0",
         sentinel = RESULT_SENTINEL
@@ -559,20 +592,25 @@ fn parse_result_line(body: &str) -> (Option<i64>, String, String) {
 ///
 /// When start succeeded, the updater's own outcome TOKEN drives the result (the only
 /// signal that distinguishes a rollback or a no-op from a plain success — and it is
-/// run-scoped: the wrapper clears any prior marker before triggering, so only THIS
-/// run's token is read). The token is mapped through a FIXED VOCABULARY (finding 2):
+/// run-scoped: only THIS run's mtime-fresh token is read). The token is mapped through
+/// a FIXED VOCABULARY:
 ///   - a recognized token ⇒ the matching outcome,
-///   - an EMPTY token (no marker written) ⇒ degrade to the systemd `Result`,
+///   - an EMPTY token (no marker written) ⇒ degrade to the systemd `Result` AND rc,
 ///   - a NON-EMPTY but UNRECOGNIZED token ⇒ `unknown` (non-converged, must-not-trust).
 ///
 /// CRITICAL (finding 1): a CONVERGED/success outcome (`deployed`/`skipped`) is only
 /// ever trusted when a REAL `rc == 0` was actually PARSED from the wrapper's sentinel.
 /// If `rc` is absent/unparseable — a stale/damaged/truncated sentinel line that still
-/// says `result=success`, or a token that reads `deployed` with no exit code — we do
-/// NOT trust it: it degrades to `unknown` (never masked as `deployed`). Only failure/
-/// rollback outcomes (already non-converged) are reported without a parsed rc, since
-/// reporting a failure can't mask a success. The raw token is never returned; only
-/// the classified outcome is.
+/// says `result=success`, or a token that reads `deployed` with no exit code — it
+/// degrades to `unknown` (never masked as `deployed`). Only failure/rollback outcomes
+/// are reported without a parsed rc, since reporting a failure can't mask a success.
+///
+/// ABSENT-MARKER (finding 2): the degrade path requires BOTH `rc == 0` AND a systemd
+/// `Result` of `success`. A non-success `Result` (`failed`/`timeout`/`signal`/
+/// `core-dump`/…) is `failed` even with `rc == 0` (a non-success Result must never be
+/// reported as deployed); an INDETERMINATE `Result` (empty/unreadable) with `rc == 0`
+/// is `unknown` (exit code alone is not enough). The raw token/Result are never
+/// returned; only the classified outcome is.
 pub fn classify_reachable(rc: Option<i64>, result: &str, token: &str) -> DeployOutcome {
     // A start that failed is `failed`, full stop — never overridden by a stale
     // success Result or a stale marker token.
@@ -584,14 +622,8 @@ pub fn classify_reachable(rc: Option<i64>, result: &str, token: &str) -> DeployO
     let started_ok = rc == Some(0);
     let token = token.trim().to_ascii_lowercase();
     let naive = match token.as_str() {
-        // Empty token → no marker this run → degrade to the systemd signal.
-        "" => {
-            if started_ok || result.eq_ignore_ascii_case("success") {
-                DeployOutcome::Deployed
-            } else {
-                DeployOutcome::Failed
-            }
-        }
+        // Empty token → no marker this run → degrade to the systemd `Result` AND rc.
+        "" => classify_absent_marker(started_ok, result),
         "rolled_back" | "rolledback" | "rollback" => DeployOutcome::RolledBack,
         "deployed" | "updated" | "swapped" | "success" => DeployOutcome::Deployed,
         "skipped" | "noop" | "no-op" | "unchanged" | "up-to-date" | "current" => {
@@ -608,6 +640,45 @@ pub fn classify_reachable(rc: Option<i64>, result: &str, token: &str) -> DeployO
         return DeployOutcome::Unknown;
     }
     naive
+}
+
+/// The three kinds of systemd unit `Result` (`systemctl show -p Result`).
+enum ResultKind {
+    /// `success`.
+    Success,
+    /// A definite non-success (`failed`/`timeout`/`exit-code`/`signal`/`core-dump`/
+    /// `watchdog`/`start-limit-hit`/…) — any recognized non-`success` value.
+    Failure,
+    /// Empty/unreadable — we could not determine the unit's result.
+    Indeterminate,
+}
+
+fn systemd_result_kind(result: &str) -> ResultKind {
+    let r = result.trim();
+    if r.is_empty() {
+        ResultKind::Indeterminate
+    } else if r.eq_ignore_ascii_case("success") {
+        ResultKind::Success
+    } else {
+        ResultKind::Failure
+    }
+}
+
+/// Classify an ABSENT-MARKER run from `rc` AND the systemd `Result` (finding 2):
+/// `deployed` requires BOTH `rc == 0` AND `Result=success`; a non-success Result is
+/// `failed` (never deployed); an indeterminate Result is `unknown` when the start
+/// looked ok (exit code alone is not enough) and `failed` otherwise (fail-visible).
+fn classify_absent_marker(started_ok: bool, result: &str) -> DeployOutcome {
+    match systemd_result_kind(result) {
+        // A definite non-success Result is a failure even with rc==0.
+        ResultKind::Failure => DeployOutcome::Failed,
+        // Success Result trusted only WITH a real rc==0; else not trusted → unknown.
+        ResultKind::Success if started_ok => DeployOutcome::Deployed,
+        ResultKind::Success => DeployOutcome::Unknown,
+        // No Result to corroborate: rc==0 alone is not enough → unknown; no rc → failed.
+        ResultKind::Indeterminate if started_ok => DeployOutcome::Unknown,
+        ResultKind::Indeterminate => DeployOutcome::Failed,
+    }
 }
 
 /// Build the short, redaction-safe `detail` string. FIXED VOCABULARY ONLY (finding
@@ -1087,6 +1158,40 @@ mod tests {
     }
 
     #[test]
+    fn absent_marker_gates_on_result_and_rc() {
+        // Finding 2: with an ABSENT marker, `deployed` requires BOTH rc==0 AND
+        // Result=success. A non-success Result is `failed` even with rc==0 (a
+        // non-success Result must never be reported as deployed); an indeterminate
+        // (empty/unreadable) Result with rc==0 is `unknown` (exit code alone is not
+        // enough).
+        assert_eq!(
+            classify_reachable(Some(0), "success", ""),
+            DeployOutcome::Deployed,
+            "rc=0 + Result=success → deployed"
+        );
+        assert_eq!(
+            classify_reachable(Some(0), "failed", ""),
+            DeployOutcome::Failed,
+            "rc=0 + Result=failed → failed (non-success Result never deployed)"
+        );
+        assert_eq!(
+            classify_reachable(Some(0), "timeout", ""),
+            DeployOutcome::Failed,
+            "rc=0 + Result=timeout → failed"
+        );
+        assert_eq!(
+            classify_reachable(Some(0), "core-dump", ""),
+            DeployOutcome::Failed,
+            "rc=0 + Result=core-dump → failed"
+        );
+        assert_eq!(
+            classify_reachable(Some(0), "", ""),
+            DeployOutcome::Unknown,
+            "rc=0 + indeterminate Result → unknown (exit code alone insufficient)"
+        );
+    }
+
+    #[test]
     fn nonzero_start_rc_is_failed_despite_stale_success_result() {
         // Finding 3: a non-zero `systemctl start` rc must NOT be overridden by a
         // stale `Result=success` (a previous run's cached systemd Result).
@@ -1179,18 +1284,23 @@ mod tests {
             "<email>",
             "<path>/.deploy_result",
         );
-        // The marker is cleared BEFORE the trigger (run-scoped best-effort).
+        // The marker is cleared BEFORE the trigger (best-effort).
         assert!(cmd.contains("rm -f -- '<path>/.deploy_result'"));
-        let start_ts_at = cmd.find("__start=$(date +%s)").expect("run start captured");
-        let rm_at = cmd.find("rm -f --").unwrap();
+        // Finding 4: a fresh RUN-REFERENCE file is created (mtime = now) BEFORE the
+        // trigger, and the marker is trusted only if it is >= that reference — truly
+        // run-scoped, no absolute-time tolerance window.
+        let ref_at = cmd.find("__ref=$(mktemp").expect("run-reference created");
+        let refmt_at = cmd.find("__refmt=$(stat").expect("reference mtime recorded");
         let start_at = cmd.find("systemctl start").unwrap();
-        assert!(start_ts_at < rm_at && rm_at < start_at, "start-epoch, then rm, then trigger");
-        // Finding 2: the token is read ONLY when the marker mtime is fresh, with a
-        // 1-second tolerance floor (`__start - 1`) so a same-second write is not
-        // spuriously rejected while a genuinely stale (much older) marker still is.
+        assert!(ref_at < refmt_at && refmt_at < start_at, "reference created before trigger");
         assert!(cmd.contains("stat -c %Y -- '<path>/.deploy_result'"));
-        assert!(cmd.contains("__floor=$((__start - 1))"), "1s tolerance floor: {cmd}");
-        assert!(cmd.contains("[ \"$__mt\" -ge \"$__floor\" ]"), "mtime-fresh gate: {cmd}");
+        // The gate compares the marker mtime to the run reference (not an epoch±tolerance),
+        // and requires the reference to have been genuinely created.
+        assert!(cmd.contains("[ \"$__refmt\" -gt 0 ]"), "reference-created guard: {cmd}");
+        assert!(cmd.contains("[ \"$__mt\" -ge \"$__refmt\" ]"), "run-scoped gate: {cmd}");
+        assert!(!cmd.contains("__floor"), "no absolute-time tolerance hack: {cmd}");
+        // The run-reference is cleaned up afterward.
+        assert!(cmd.contains("rm -f -- \"$__ref\""), "reference cleaned up: {cmd}");
         assert!(cmd.contains("systemctl start '<email>'"));
         assert!(cmd.contains("--property=Result --value"));
         assert!(cmd.contains("cat -- '<path>/.deploy_result'"));
@@ -1256,10 +1366,34 @@ mod tests {
                 "executable must be systemctl; must reject: {bad:?}"
             );
         }
-        // …and the accepted forms all have systemctl as the executable.
+        // Finding 1: the ONLY sudo option permitted before `systemctl` is `-n`. Any
+        // OTHER sudo flag is rejected — especially the ARGUMENT-TAKING ones, which the
+        // naive "skip all dash flags" parser would let bypass (e.g. `sudo -u systemctl`
+        // makes sudo read `systemctl` as the USERNAME and run whatever follows).
+        for bad in [
+            "sudo -u systemctl",
+            "sudo -g x systemctl",
+            "sudo -h h systemctl",
+            "sudo -p p systemctl",
+            "sudo -C 3 systemctl",
+            "sudo -r role systemctl",
+            "sudo -U user systemctl",
+            "sudo -i systemctl", // any non-`-n` flag, even argument-less, is out
+            "sudo -n -u systemctl",
+        ] {
+            assert!(
+                matches!(validate_systemctl_cmd(bad), Err(ToolError::InvalidArgument(_))),
+                "only `-n` may precede systemctl; must reject: {bad:?}"
+            );
+        }
+        // …and the accepted forms all have systemctl as the executable, with only `-n`.
         assert_eq!(
             validate_systemctl_cmd("sudo -n /usr/bin/systemctl").unwrap(),
             "sudo -n /usr/bin/systemctl"
+        );
+        assert_eq!(
+            validate_systemctl_cmd("sudo --non-interactive systemctl").unwrap(),
+            "sudo --non-interactive systemctl"
         );
 
         // The error never echoes the raw (potentially sensitive) value back.
@@ -1532,8 +1666,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("deploy_result");
         let marker_s = marker.to_string_lossy().to_string();
-        // `1000000000` ≈ 2001-09-09 — decades before any run, so far below the
-        // `__start - 1` floor that second-granularity/scheduling can't flip it.
+        // `1000000000` ≈ 2001-09-09 — decades before any run, so far below this run's
+        // reference mtime that second-granularity/scheduling can't flip it.
         let backdate = if force_stale {
             format!("touch -m -d @1000000000 -- '{marker_s}';")
         } else {
@@ -1552,9 +1686,10 @@ mod tests {
 
     #[tokio::test]
     async fn stale_marker_old_mtime_is_not_trusted() {
-        // Finding 2: a marker whose mtime predates this run (decades old) is NOT
-        // trusted — it can't mask a current run. Deterministic + root-independent: the
-        // fake updater writes the marker then back-dates it far into the past.
+        // Finding 4: a marker whose mtime predates this run's REFERENCE (decades old)
+        // is NOT trusted — it can't mask a current run, with NO absolute-time tolerance
+        // window. Deterministic + root-independent: the fake updater writes the marker
+        // then back-dates it far into the past (a marker `rm` could not have removed).
         let token = wrapper_token_with_fake_updater(true, "deployed").await;
         assert!(
             token.is_empty(),
@@ -1564,15 +1699,14 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_marker_written_this_run_is_trusted() {
-        // The realistic path: the updater writes the marker DURING the run (natural
-        // "now" mtime, same second as `__start`). The `__start - 1` tolerance means a
-        // same-second write is never spuriously rejected — this is exactly the
-        // second-granularity case that flipped on <host>. Deterministic (mtime is set by
-        // the fake updater's write, always >= the run start).
+        // The realistic path: the updater writes the marker DURING the run, so its
+        // mtime is >= the run-reference created at run start (same-second writes pass
+        // the `>=` gate). Deterministic (mtime is set by the fake updater's write,
+        // causally after the reference).
         let token = wrapper_token_with_fake_updater(false, "rolled_back").await;
         assert_eq!(
             token, "rolled_back",
-            "a marker written during the run (same-second mtime) is trusted"
+            "a marker written during the run (mtime >= run reference) is trusted"
         );
     }
 
