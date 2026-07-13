@@ -81,6 +81,11 @@ REDIS_USER="${REDIS_USER:-redis}"
 REDIS_SERVER_BIN="${REDIS_SERVER_BIN:-$(command -v redis-server || true)}"
 REDIS_CLI_BIN="${REDIS_CLI_BIN:-$(command -v redis-cli || echo redis-cli)}"
 REDIS_CONF_PATH="${REDIS_CONF_PATH:-/etc/redis/terminus-primary.conf}"
+# systemd EnvironmentFile holding REDISCLI_AUTH so ExecStop's `redis-cli
+# shutdown` authenticates (the server always sets requirepass) WITHOUT a secret
+# literal in the unit and WITHOUT the password landing on argv (`ps`). Same
+# vault-materialized value as requirepass; rendered 0600, owned by REDIS_USER.
+REDIS_ENV_FILE="${REDIS_ENV_FILE:-/etc/redis/terminus-primary.env}"
 REDIS_UNIT_NAME="${REDIS_UNIT_NAME:-terminus-redis}"
 REDIS_DB_DURABLE="${REDIS_DB_DURABLE:-0}"
 REDIS_DB_VOLATILE="${REDIS_DB_VOLATILE:-1}"
@@ -123,6 +128,7 @@ render() {
     -e "s|__REDIS_USER__|${REDIS_USER}|g" \
     -e "s|__REDIS_SERVER_BIN__|${REDIS_SERVER_BIN}|g" \
     -e "s|__REDIS_CLI_BIN__|${REDIS_CLI_BIN}|g" \
+    -e "s|__REDIS_ENV_FILE__|${REDIS_ENV_FILE}|g" \
     -e "s|__REDIS_CONF_PATH__|${REDIS_CONF_PATH}|g"
 }
 
@@ -136,6 +142,7 @@ render < "${SRC_DIR}/redis.conf" \
 
 install -d -o "${REDIS_USER}" -g "${REDIS_USER}" "${REDIS_DATA_DIR}"
 install -d "$(dirname "${REDIS_CONF_PATH}")"
+install -d "$(dirname "${REDIS_ENV_FILE}")"
 
 CONF_CHANGED=0
 if ! cmp -s "${TMP_CONF}" "${REDIS_CONF_PATH}" 2>/dev/null; then
@@ -143,9 +150,23 @@ if ! cmp -s "${TMP_CONF}" "${REDIS_CONF_PATH}" 2>/dev/null; then
   CONF_CHANGED=1
 fi
 
+# Render the EnvironmentFile: REDISCLI_AUTH=<requirepass> (same vault value),
+# via perl so the secret never appears on argv. 0600, owned by the service user.
+# This is what lets ExecStop's `redis-cli shutdown` authenticate — otherwise the
+# always-on requirepass makes shutdown NOAUTH and systemd SIGKILLs the server,
+# defeating the graceful `nosave` stop.
+TMP_ENV="$(mktemp)"
+trap 'rm -f "${TMP_CONF}" "${TMP_ENV}"' EXIT
+REQ="${REDIS_REQUIREPASS}" perl -e 'print "REDISCLI_AUTH=$ENV{REQ}\n"' > "${TMP_ENV}"
+ENV_CHANGED=0
+if ! cmp -s "${TMP_ENV}" "${REDIS_ENV_FILE}" 2>/dev/null; then
+  install -m 0600 -o "${REDIS_USER}" -g "${REDIS_USER}" "${TMP_ENV}" "${REDIS_ENV_FILE}"
+  ENV_CHANGED=1
+fi
+
 UNIT_PATH="/etc/systemd/system/${REDIS_UNIT_NAME}.service"
 TMP_UNIT="$(mktemp)"
-trap 'rm -f "${TMP_CONF}" "${TMP_UNIT}"' EXIT
+trap 'rm -f "${TMP_CONF}" "${TMP_ENV}" "${TMP_UNIT}"' EXIT
 render < "${SRC_DIR}/redis.service" > "${TMP_UNIT}"
 UNIT_CHANGED=0
 if ! cmp -s "${TMP_UNIT}" "${UNIT_PATH}" 2>/dev/null; then
@@ -158,7 +179,7 @@ if [[ "${UNIT_CHANGED}" == 1 ]]; then
   systemctl daemon-reload
 fi
 systemctl enable "${REDIS_UNIT_NAME}" >/dev/null 2>&1 || true
-if [[ "${CONF_CHANGED}" == 1 || "${UNIT_CHANGED}" == 1 ]] || ! systemctl is-active --quiet "${REDIS_UNIT_NAME}"; then
+if [[ "${CONF_CHANGED}" == 1 || "${UNIT_CHANGED}" == 1 || "${ENV_CHANGED}" == 1 ]] || ! systemctl is-active --quiet "${REDIS_UNIT_NAME}"; then
   systemctl restart "${REDIS_UNIT_NAME}"
 fi
 

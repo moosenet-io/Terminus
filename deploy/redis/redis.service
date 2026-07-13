@@ -14,6 +14,12 @@ Wants=network-online.target
 Type=notify
 User=__REDIS_USER__
 Group=__REDIS_USER__
+# Renders to a 0600, service-user-owned file exporting REDISCLI_AUTH=<requirepass>
+# (the same vault-materialized password install.sh writes to requirepass — no
+# secret literal in this unit). redis-cli auto-uses REDISCLI_AUTH, so ExecStop
+# authenticates for a graceful `shutdown nosave` (the server always requires
+# auth); without it shutdown is NOAUTH and systemd SIGKILLs the server.
+EnvironmentFile=__REDIS_ENV_FILE__
 ExecStart=__REDIS_SERVER_BIN__ __REDIS_CONF_PATH__ --supervised systemd
 ExecStop=__REDIS_CLI_BIN__ -p __REDIS_PORT__ shutdown nosave
 Restart=on-failure
