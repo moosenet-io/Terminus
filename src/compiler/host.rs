@@ -14,8 +14,8 @@
 //! Every host address, cap value, and threshold comes from config env vars
 //! (materialized from the vault where sensitive) — NO literals in source (S1).
 
-use crate::error::ToolError;
 use crate::compiler::scope::ScopeCaps;
+use crate::error::ToolError;
 
 /// A build host role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,11 +104,9 @@ fn env_nonempty(key: &str) -> Option<String> {
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    env_nonempty(key).and_then(|v| v.parse().ok()).unwrap_or(default)
-}
-
-fn env_u32(key: &str, default: u32) -> u32 {
-    env_nonempty(key).and_then(|v| v.parse().ok()).unwrap_or(default)
+    env_nonempty(key)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 /// The configured heavy threshold (`BUILD_HEAVY_THRESHOLD_MB`).
@@ -126,7 +124,13 @@ pub fn module_peak_mb(module: &str) -> Option<u64> {
 
 fn env_key_fragment(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -149,39 +153,68 @@ impl ResolvedHost {
     }
 }
 
-/// Resolve the caps for a role from config, with role-appropriate defaults.
-///
-/// Primary defaults are conservative (fits a moderate-RAM dev box co-located
-/// with user services); heavy defaults assume the big host freed by idle-mode.
-pub fn caps_for(role: HostRole) -> ScopeCaps {
-    let (mem_key, cpu_key, io_key, jobs_key, mem_def, cpu_def, io_def, jobs_def) = match role {
+/// The four config env-var names carrying a role's resource caps.
+fn cap_keys(role: HostRole) -> (&'static str, &'static str, &'static str, &'static str) {
+    match role {
         HostRole::Primary => (
             "BUILD_PRIMARY_MEMORY_MAX",
             "BUILD_PRIMARY_CPU_QUOTA",
             "BUILD_PRIMARY_IO_WEIGHT",
             "BUILD_PRIMARY_JOBS",
-            "12G",
-            "400%",
-            "50",
-            4u32,
         ),
         HostRole::Heavy => (
             "BUILD_HEAVY_MEMORY_MAX",
             "BUILD_HEAVY_CPU_QUOTA",
             "BUILD_HEAVY_IO_WEIGHT",
             "BUILD_HEAVY_JOBS",
-            "100G",
-            "3200%",
-            "100",
-            32u32,
         ),
-    };
-    ScopeCaps {
-        memory_max: env_nonempty(mem_key).unwrap_or_else(|| mem_def.to_string()),
-        cpu_quota: env_nonempty(cpu_key).unwrap_or_else(|| cpu_def.to_string()),
-        io_weight: env_nonempty(io_key).unwrap_or_else(|| io_def.to_string()),
-        jobs: env_u32(jobs_key, jobs_def),
     }
+}
+
+/// Pure cap resolver (the test entry point): EVERY cap comes from config via
+/// `lookup`; there are **no hardcoded literal defaults** for these
+/// host-capacity / Plex-protection values (S1). A missing/blank var is a hard
+/// [`ToolError::NotConfigured`] naming the exact var — the operator MUST size
+/// the caps per host, because a wrong default could either starve the build or,
+/// worse, under-protect Plex (the whole point of the swap-off cap). Config vars:
+/// `BUILD_{PRIMARY,HEAVY}_{MEMORY_MAX,CPU_QUOTA,IO_WEIGHT,JOBS}`.
+pub fn caps_from_lookup(
+    role: HostRole,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<ScopeCaps, ToolError> {
+    let (mem_key, cpu_key, io_key, jobs_key) = cap_keys(role);
+    let require = |key: &str| -> Result<String, ToolError> {
+        lookup(key)
+            .filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| ToolError::NotConfigured(format!("{key} is not configured")))
+    };
+    let memory_max = require(mem_key)?;
+    let cpu_quota = require(cpu_key)?;
+    let io_weight = require(io_key)?;
+    let jobs_raw = require(jobs_key)?;
+    let jobs: u32 = jobs_raw.trim().parse().map_err(|_| {
+        ToolError::InvalidArgument(format!(
+            "{jobs_key} must be a positive integer, got {jobs_raw:?}"
+        ))
+    })?;
+    if jobs == 0 {
+        return Err(ToolError::InvalidArgument(format!(
+            "{jobs_key} must be >= 1"
+        )));
+    }
+    Ok(ScopeCaps {
+        memory_max: memory_max.trim().to_string(),
+        cpu_quota: cpu_quota.trim().to_string(),
+        io_weight: io_weight.trim().to_string(),
+        jobs,
+    })
+}
+
+/// Env-backed caps for a role (delegates to [`caps_from_lookup`], reading each
+/// cap from its `BUILD_{ROLE}_*` config var). Errors (`NotConfigured`) when any
+/// cap var for the selected role is unset.
+pub fn caps_for(role: HostRole) -> Result<ScopeCaps, ToolError> {
+    caps_from_lookup(role, env_nonempty)
 }
 
 /// Resolve the full host for a build, reading config from the environment.
@@ -190,11 +223,7 @@ pub fn caps_for(role: HostRole) -> ScopeCaps {
 /// `BUILD_HOST_PRIMARY` is explicitly set (some topologies relay to it too). The
 /// heavy host always resolves an address (`BUILD_HOST_HEAVY`) — it's a remote
 /// hop — and it is an error for `Heavy` to be selected without that address.
-pub fn resolve(
-    request: HostRequest,
-    module: &str,
-    fast: bool,
-) -> Result<ResolvedHost, ToolError> {
+pub fn resolve(request: HostRequest, module: &str, fast: bool) -> Result<ResolvedHost, ToolError> {
     let role = select_role(request, fast, module_peak_mb(module), heavy_threshold_mb());
     let address = env_nonempty(role.host_env());
     if role == HostRole::Heavy && address.is_none() {
@@ -206,7 +235,7 @@ pub fn resolve(
     Ok(ResolvedHost {
         role,
         address,
-        caps: caps_for(role),
+        caps: caps_for(role)?,
     })
 }
 
@@ -264,10 +293,58 @@ mod tests {
     }
 
     #[test]
-    fn primary_caps_have_defaults() {
-        // With no env set, defaults apply (this test does not mutate env).
-        let caps = caps_for(HostRole::Primary);
-        assert!(!caps.memory_max.is_empty());
-        assert!(caps.jobs >= 1);
+    fn caps_require_every_config_var() {
+        // S1/finding-3: no hardcoded literal defaults — an unset cap var is a
+        // hard NotConfigured naming the exact missing var.
+        let err = caps_from_lookup(HostRole::Primary, |_| None).unwrap_err();
+        assert!(matches!(err, ToolError::NotConfigured(_)));
+        // A partial config (jobs missing) still fails, naming the missing var.
+        let partial = |k: &str| match k {
+            "BUILD_PRIMARY_MEMORY_MAX" => Some("8G".to_string()),
+            "BUILD_PRIMARY_CPU_QUOTA" => Some("200%".to_string()),
+            "BUILD_PRIMARY_IO_WEIGHT" => Some("40".to_string()),
+            _ => None,
+        };
+        match caps_from_lookup(HostRole::Primary, partial) {
+            Err(ToolError::NotConfigured(m)) => assert!(m.contains("BUILD_PRIMARY_JOBS")),
+            other => panic!("expected NotConfigured naming JOBS, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn caps_parse_from_config() {
+        let cfg = |k: &str| match k {
+            "BUILD_HEAVY_MEMORY_MAX" => Some("100G".to_string()),
+            "BUILD_HEAVY_CPU_QUOTA" => Some("3200%".to_string()),
+            "BUILD_HEAVY_IO_WEIGHT" => Some("100".to_string()),
+            "BUILD_HEAVY_JOBS" => Some("32".to_string()),
+            _ => None,
+        };
+        let caps = caps_from_lookup(HostRole::Heavy, cfg).unwrap();
+        assert_eq!(caps.memory_max, "100G");
+        assert_eq!(caps.cpu_quota, "3200%");
+        assert_eq!(caps.io_weight, "100");
+        assert_eq!(caps.jobs, 32);
+    }
+
+    #[test]
+    fn caps_reject_bad_jobs() {
+        let with_jobs = |jobs: &'static str| {
+            move |k: &str| match k {
+                "BUILD_PRIMARY_MEMORY_MAX" => Some("8G".to_string()),
+                "BUILD_PRIMARY_CPU_QUOTA" => Some("200%".to_string()),
+                "BUILD_PRIMARY_IO_WEIGHT" => Some("40".to_string()),
+                "BUILD_PRIMARY_JOBS" => Some(jobs.to_string()),
+                _ => None,
+            }
+        };
+        assert!(caps_from_lookup(HostRole::Primary, with_jobs("0")).is_err());
+        assert!(caps_from_lookup(HostRole::Primary, with_jobs("notanint")).is_err());
+        assert_eq!(
+            caps_from_lookup(HostRole::Primary, with_jobs("4"))
+                .unwrap()
+                .jobs,
+            4
+        );
     }
 }

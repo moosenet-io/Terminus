@@ -21,8 +21,8 @@
 
 pub mod host;
 pub mod publish;
-pub mod scope;
 pub mod sccache;
+pub mod scope;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -54,6 +54,14 @@ const BUILD_DATASET_RELAY_HOST: &str = "BUILD_DATASET_RELAY_HOST";
 /// Env var: the dataset root PATH on the relay host (defaults to the local
 /// `BUILD_DATASET_ROOT` value when unset — same share, same layout).
 const BUILD_DATASET_RELAY_ROOT: &str = "BUILD_DATASET_RELAY_ROOT";
+/// Env var: the exec-safe LOCAL/tmpfs cargo target dir ON THE HEAVY host (used
+/// for the remote build). Required for a heavy build (a target dir on the shared
+/// NFS dataset would break exec — the same guard applies remotely).
+const BUILD_HEAVY_LOCAL_TARGET_DIR: &str = "BUILD_HEAVY_LOCAL_TARGET_DIR";
+/// Env var: the dataset root PATH on the heavy host (where source is staged +
+/// where the remote build's env-file lives under the target dir). Defaults to
+/// `BUILD_DATASET_RELAY_ROOT`, else the local `BUILD_DATASET_ROOT`.
+const BUILD_HEAVY_DATASET_ROOT: &str = "BUILD_HEAVY_DATASET_ROOT";
 
 const DEFAULT_TARGET_TRIPLE: &str = "x86_64-unknown-linux-musl";
 
@@ -69,9 +77,7 @@ fn env_nonempty(key: &str) -> Option<String> {
 fn dataset_root() -> Result<PathBuf, ToolError> {
     env_nonempty(BUILD_DATASET_ROOT)
         .map(PathBuf::from)
-        .ok_or_else(|| {
-            ToolError::NotConfigured(format!("{BUILD_DATASET_ROOT} is not configured"))
-        })
+        .ok_or_else(|| ToolError::NotConfigured(format!("{BUILD_DATASET_ROOT} is not configured")))
 }
 
 /// The LOCAL/tmpfs exec-safe cargo target dir. Defaults to a stable temp path so
@@ -84,6 +90,66 @@ fn local_target_dir() -> PathBuf {
 
 fn target_triple() -> String {
     env_nonempty(BUILD_TARGET_TRIPLE).unwrap_or_else(|| DEFAULT_TARGET_TRIPLE.to_string())
+}
+
+/// The exec-safe LOCAL/tmpfs cargo target dir on the HEAVY host. Required for a
+/// remote build — there is deliberately NO default (a wrong default could put the
+/// live target on the shared NFS dataset; the operator sizes it per host).
+fn heavy_local_target_dir() -> Result<PathBuf, ToolError> {
+    env_nonempty(BUILD_HEAVY_LOCAL_TARGET_DIR)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            ToolError::NotConfigured(format!(
+                "{BUILD_HEAVY_LOCAL_TARGET_DIR} is required for a heavy (remote) build"
+            ))
+        })
+}
+
+/// The dataset root PATH on the heavy host (source-stage + env-file location).
+/// Prefers `BUILD_HEAVY_DATASET_ROOT`, then `BUILD_DATASET_RELAY_ROOT`, then the
+/// local `BUILD_DATASET_ROOT` value.
+fn heavy_dataset_root(local_root: &str) -> String {
+    env_nonempty(BUILD_HEAVY_DATASET_ROOT)
+        .or_else(|| env_nonempty(BUILD_DATASET_RELAY_ROOT))
+        .unwrap_or_else(|| local_root.to_string())
+}
+
+/// Single-quote-escape one shell argument so it can be embedded in a remote
+/// command string passed to `ssh` (which runs its argument through the remote
+/// login shell). `'` → `'\''`.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Join an argv into a single shell command string (each element quoted).
+fn shell_join(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| shell_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Write `body` to a fresh **0600** file under the system temp dir and return its
+/// path. Used to STAGE the remote secret env file before `scp` — created 0600
+/// from the start so the secret is never briefly world-readable, and with no
+/// runtime `tempfile` dependency. The caller deletes it after transfer.
+fn write_local_0600(body: &str, tag: &str) -> Result<PathBuf, ToolError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = std::env::temp_dir().join(format!(
+        "terminus-build-secret-{tag}-{}.env",
+        std::process::id()
+    ));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| ToolError::Execution(format!("create secret staging file: {e}")))?;
+    f.write_all(body.as_bytes())
+        .map_err(|e| ToolError::Execution(format!("write secret staging file: {e}")))?;
+    Ok(path)
 }
 
 /// Map a profile name to (the cargo flag(s) that select it, the target subdir it
@@ -102,11 +168,26 @@ fn profile_flags_and_subdir(profile: &str) -> (Vec<String>, String) {
 
 /// Build the `cargo build` argv (pure — testable). `bin` selects a single
 /// binary target (defaults to the module name); `--locked` keeps the build
-/// reproducible against the committed lockfile.
-fn cargo_build_argv(profile: &str, triple: &str, jobs: u32, bin: &str) -> Vec<String> {
+/// reproducible against the committed lockfile. `manifest_path` points cargo at
+/// the source tree's `Cargo.toml` so the build is independent of the process
+/// CWD — which is what makes the REMOTE (ssh) heavy path correct (the scoped
+/// cargo need not rely on an ssh working directory).
+fn cargo_build_argv(
+    profile: &str,
+    triple: &str,
+    jobs: u32,
+    bin: &str,
+    manifest_path: &str,
+) -> Vec<String> {
     let (profile_flags, _subdir) = profile_flags_and_subdir(profile);
-    let mut argv = vec!["cargo".to_string(), "build".to_string(), "--locked".to_string()];
+    let mut argv = vec![
+        "cargo".to_string(),
+        "build".to_string(),
+        "--locked".to_string(),
+    ];
     argv.extend(profile_flags);
+    argv.push("--manifest-path".to_string());
+    argv.push(manifest_path.to_string());
     argv.push("--target".to_string());
     argv.push(triple.to_string());
     argv.push("-j".to_string());
@@ -164,7 +245,15 @@ async fn run(
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     } else {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let tail: String = stderr.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+        let tail: String = stderr
+            .lines()
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
         Err(ToolError::Execution(format!(
             "{} exited {}: {tail}",
             argv[0],
@@ -238,9 +327,8 @@ impl RustTool for CompilerBuild {
     async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
         let module = str_arg(&args, "module")?;
         let git_ref = str_arg(&args, "ref")?;
-        let host_req = HostRequest::parse(
-            args.get("host").and_then(Value::as_str).unwrap_or("auto"),
-        )?;
+        let host_req =
+            HostRequest::parse(args.get("host").and_then(Value::as_str).unwrap_or("auto"))?;
         let profile = args
             .get("profile")
             .and_then(Value::as_str)
@@ -258,63 +346,256 @@ impl RustTool for CompilerBuild {
         let root_str = root.to_string_lossy().to_string();
         let resolved = host::resolve(host_req, &module, fast)?;
         let triple = target_triple();
-        let target_dir = local_target_dir();
-
-        // GUARD: the live cargo target dir must be exec-safe local/tmpfs, never
-        // the file-level NFS dataset.
-        scope::validate_target_dir(&target_dir, &root)?;
+        let unit = scope::scope_unit_name(&module, &git_ref);
 
         // sccache env (fail-open to a local dir if Redis is unconfigured).
         let sccache_env = sccache::resolve(&root_str);
 
-        // Source tree (staged on the file-level NFS share is fine — it's only a
-        // source stage, not the live target).
-        let source_dir = match args.get("source_dir").and_then(Value::as_str) {
+        // The local source stage (staged on the shared NFS share is fine — it's a
+        // source stage, not the live target). Also the rsync source for a remote
+        // build.
+        let local_source_dir = match args.get("source_dir").and_then(Value::as_str) {
             Some(s) => PathBuf::from(s),
             None => root.join("src").join(&module).join(&git_ref),
         };
 
-        // Build env: sccache split env + the exec-safe target dir.
-        let mut build_env = sccache_env.vars.clone();
-        build_env.insert(
-            "CARGO_TARGET_DIR".to_string(),
-            target_dir.to_string_lossy().to_string(),
-        );
+        // Pinned toolchain channel to ensure (idempotent; never `rustup update`).
+        let pinned = env_nonempty(RUST_TOOLCHAIN_PINNED);
 
-        // ── Ensure the pinned toolchain (idempotent; never `rustup update`) ──
-        if let Some(channel) = env_nonempty(RUST_TOOLCHAIN_PINNED) {
-            let install = vec![
-                "rustup".to_string(),
-                "toolchain".to_string(),
-                "install".to_string(),
-                channel,
-            ];
-            // Best-effort: run from the source dir so rustup honors rust-toolchain.toml.
-            run(&install, Some(&source_dir), &BTreeMap::new(), Duration::from_secs(600)).await?;
+        // The build produces a LOCALLY-readable binary at `built_bin` in BOTH the
+        // local and remote paths, so the publish step below is host-agnostic.
+        let built_bin: PathBuf;
+
+        if resolved.is_local() {
+            // ── LOCAL build (primary, in place) ──────────────────────────────
+            let target_dir = local_target_dir();
+            // GUARD: exec-safe local/tmpfs target, never the file-level NFS dataset.
+            scope::validate_target_dir(&target_dir, &root)?;
+
+            let mut build_env = sccache_env.vars.clone();
+            build_env.insert(
+                "CARGO_TARGET_DIR".to_string(),
+                target_dir.to_string_lossy().to_string(),
+            );
+            // S7: non-secret vars → `--setenv` (argv); secret vars → the INHERITED
+            // process environment of systemd-run (which `--scope` passes to the
+            // cargo child) — never argv.
+            let (setenv, secret_env) = scope::partition_env(&build_env);
+
+            if let Some(channel) = &pinned {
+                run(
+                    &[
+                        "rustup".into(),
+                        "toolchain".into(),
+                        "install".into(),
+                        channel.clone(),
+                    ],
+                    Some(&local_source_dir),
+                    &BTreeMap::new(),
+                    Duration::from_secs(600),
+                )
+                .await?;
+            }
+
+            let manifest = local_source_dir.join("Cargo.toml");
+            let cargo_argv = cargo_build_argv(
+                &profile,
+                &triple,
+                resolved.caps.jobs,
+                &bin,
+                &manifest.to_string_lossy(),
+            );
+            let scope_argv = scope::render_scope_argv(&unit, &resolved.caps, &setenv, &cargo_argv);
+            // Secret env is delivered via the inherited environment (last arg),
+            // NOT argv.
+            run(
+                &scope_argv,
+                Some(&local_source_dir),
+                &secret_env,
+                Duration::from_secs(3600),
+            )
+            .await?;
+
+            built_bin = target_dir.join(built_bin_rel(&triple, &profile, &bin));
+        } else {
+            // ── REMOTE build (heavy host, over ssh) ──────────────────────────
+            let host_addr = resolved
+                .address
+                .clone()
+                .expect("a non-local resolved host always has an ssh address");
+            let remote_root = heavy_dataset_root(&root_str);
+            let remote_target = heavy_local_target_dir()?;
+            // GUARD applies remotely too: the remote cargo target must be exec-safe,
+            // never under the remote NFS dataset.
+            scope::validate_target_dir(&remote_target, std::path::Path::new(&remote_root))?;
+            let remote_target_str = remote_target.to_string_lossy().to_string();
+            let remote_source = format!(
+                "{}/src/{}/{}",
+                remote_root.trim_end_matches('/'),
+                module,
+                git_ref
+            );
+
+            // Stage source to the remote + ensure the remote dirs exist.
+            run(
+                &[
+                    "ssh".into(),
+                    host_addr.clone(),
+                    "mkdir".into(),
+                    "-p".into(),
+                    remote_source.clone(),
+                    remote_target_str.clone(),
+                ],
+                None,
+                &BTreeMap::new(),
+                Duration::from_secs(120),
+            )
+            .await?;
+            run(
+                &[
+                    "rsync".into(),
+                    "-a".into(),
+                    "--delete".into(),
+                    format!("{}/", local_source_dir.to_string_lossy()),
+                    format!("{host_addr}:{remote_source}/"),
+                ],
+                None,
+                &BTreeMap::new(),
+                Duration::from_secs(1800),
+            )
+            .await?;
+
+            let mut build_env = sccache_env.vars.clone();
+            build_env.insert("CARGO_TARGET_DIR".to_string(), remote_target_str.clone());
+            let (setenv, secret_env) = scope::partition_env(&build_env);
+
+            // Secret env (if any) → a 0600 file ON THE REMOTE, `source`d inside the
+            // ssh wrapper before `exec systemd-run` so it reaches the scoped build's
+            // inherited env WITHOUT ever touching a command line (S7). The local
+            // staging file is created 0600 and deleted right after transfer.
+            let remote_env_path = format!("{remote_target_str}/.terminus-build-{unit}.env");
+            let have_secret = !secret_env.is_empty();
+            if have_secret {
+                let body = scope::render_secret_env_file(&secret_env);
+                let local_secret = write_local_0600(&body, &unit)?;
+                let scp_res = run(
+                    &[
+                        "scp".into(),
+                        local_secret.to_string_lossy().to_string(),
+                        format!("{host_addr}:{remote_env_path}"),
+                    ],
+                    None,
+                    &BTreeMap::new(),
+                    Duration::from_secs(120),
+                )
+                .await;
+                // Delete the local staging copy immediately, whether scp succeeded
+                // or not (the secret must not linger on disk).
+                let _ = tokio::fs::remove_file(&local_secret).await;
+                scp_res?;
+                run(
+                    &[
+                        "ssh".into(),
+                        host_addr.clone(),
+                        "chmod".into(),
+                        "600".into(),
+                        remote_env_path.clone(),
+                    ],
+                    None,
+                    &BTreeMap::new(),
+                    Duration::from_secs(60),
+                )
+                .await?;
+            }
+
+            if let Some(channel) = &pinned {
+                // `rustup toolchain install <channel>` is cwd-independent.
+                run(
+                    &[
+                        "ssh".into(),
+                        host_addr.clone(),
+                        "rustup".into(),
+                        "toolchain".into(),
+                        "install".into(),
+                        channel.clone(),
+                    ],
+                    None,
+                    &BTreeMap::new(),
+                    Duration::from_secs(600),
+                )
+                .await?;
+            }
+
+            let manifest = format!("{remote_source}/Cargo.toml");
+            let cargo_argv =
+                cargo_build_argv(&profile, &triple, resolved.caps.jobs, &bin, &manifest);
+            let scope_argv = scope::render_scope_argv(&unit, &resolved.caps, &setenv, &cargo_argv);
+            // Remote wrapper: source the secret env file (if any), delete it, then
+            // exec the scoped build. The secret lives only in the 0600 file, never argv.
+            let scope_cmd = shell_join(&scope_argv);
+            let remote_cmd = if have_secret {
+                format!(
+                    "set -a; . {f}; rm -f {f}; set +a; exec {scope_cmd}",
+                    f = shell_quote(&remote_env_path)
+                )
+            } else {
+                format!("exec {scope_cmd}")
+            };
+            let build_res = run(
+                &["ssh".into(), host_addr.clone(), remote_cmd],
+                None,
+                &BTreeMap::new(),
+                Duration::from_secs(3600),
+            )
+            .await;
+            // Best-effort scrub in case the build failed before the wrapper's rm ran.
+            if have_secret {
+                let _ = run(
+                    &[
+                        "ssh".into(),
+                        host_addr.clone(),
+                        "rm".into(),
+                        "-f".into(),
+                        remote_env_path.clone(),
+                    ],
+                    None,
+                    &BTreeMap::new(),
+                    Duration::from_secs(60),
+                )
+                .await;
+            }
+            build_res?;
+
+            // Retrieve the built binary back to a local temp path so publish is
+            // host-agnostic (the build ran remotely; publish reads it locally).
+            let remote_bin = format!(
+                "{}/{}",
+                remote_target_str.trim_end_matches('/'),
+                built_bin_rel(&triple, &profile, &bin).to_string_lossy()
+            );
+            let local_tmp_dir = std::env::temp_dir().join(format!("terminus-artifact-{unit}"));
+            tokio::fs::create_dir_all(&local_tmp_dir)
+                .await
+                .map_err(|e| ToolError::Execution(format!("mk artifact tmp dir: {e}")))?;
+            let local_bin = local_tmp_dir.join(&bin);
+            run(
+                &[
+                    "rsync".into(),
+                    "-a".into(),
+                    format!("{host_addr}:{remote_bin}"),
+                    local_bin.to_string_lossy().to_string(),
+                ],
+                None,
+                &BTreeMap::new(),
+                Duration::from_secs(600),
+            )
+            .await?;
+            built_bin = local_bin;
         }
 
-        // ── Build inside the capped scope ────────────────────────────────────
-        let cargo_argv = cargo_build_argv(&profile, &triple, resolved.caps.jobs, &bin);
-        let unit = scope::scope_unit_name(&module, &git_ref);
-        let scope_argv = scope::render_scope_argv(&unit, &resolved.caps, &build_env, &cargo_argv);
-
-        // On a remote heavy host, wrap the scope command in ssh; on a local
-        // (primary in-place) host, run it directly. The env is carried into the
-        // scope via `--setenv=` (rendered above), so ssh needs no env passthrough.
-        let exec_argv = match (&resolved.address, resolved.role) {
-            (Some(addr), host::HostRole::Heavy) => {
-                let mut a = vec!["ssh".to_string(), addr.clone()];
-                a.extend(scope_argv.clone());
-                a
-            }
-            _ => scope_argv.clone(),
-        };
-        let build_cwd = if resolved.is_local() { Some(source_dir.as_path()) } else { None };
-        // Build timeout is generous — a cold full build can take minutes.
-        run(&exec_argv, build_cwd, &BTreeMap::new(), Duration::from_secs(3600)).await?;
-
         // ── Publish the artifact (checksummed; no `current` flip) ────────────
-        let built_bin = target_dir.join(built_bin_rel(&triple, &profile, &bin));
+        // `built_bin` is a locally-readable path (built in place locally, or
+        // retrieved from the heavy host above), so publish is host-agnostic.
         let channel = publish::DEFAULT_CHANNEL;
         let published = if let Some(relay_host) = env_nonempty(BUILD_DATASET_RELAY_HOST) {
             // Interim: relay-publish over a single hop to a host with the dataset RW.
@@ -322,9 +603,22 @@ impl RustTool for CompilerBuild {
                 env_nonempty(BUILD_DATASET_RELAY_ROOT).unwrap_or_else(|| root_str.clone());
             let sha = publish::sha256_file(&built_bin).await?;
             let relay_argv = publish::render_relay_argv(
-                &relay_host, &remote_root, &module, channel, &sha, &triple, &bin, &built_bin,
+                &relay_host,
+                &remote_root,
+                &module,
+                channel,
+                &sha,
+                &triple,
+                &bin,
+                &built_bin,
             );
-            run(&relay_argv, None, &BTreeMap::new(), Duration::from_secs(600)).await?;
+            run(
+                &relay_argv,
+                None,
+                &BTreeMap::new(),
+                Duration::from_secs(600),
+            )
+            .await?;
             // Relay the sidecar too.
             let sidecar_tmp = built_bin.with_file_name(format!("{bin}.sha256"));
             tokio::fs::write(&sidecar_tmp, publish::sidecar_contents(&sha, &bin))
@@ -340,11 +634,18 @@ impl RustTool for CompilerBuild {
                 &format!("{bin}.sha256"),
                 &sidecar_tmp,
             );
-            run(&sidecar_relay, None, &BTreeMap::new(), Duration::from_secs(120)).await?;
+            run(
+                &sidecar_relay,
+                None,
+                &BTreeMap::new(),
+                Duration::from_secs(120),
+            )
+            .await?;
             publish::Published {
                 sha256: sha.clone(),
-                artifact_path: PathBuf::from(&remote_root)
-                    .join(publish::artifact_rel_path(&module, channel, &sha, &triple, &bin)),
+                artifact_path: PathBuf::from(&remote_root).join(publish::artifact_rel_path(
+                    &module, channel, &sha, &triple, &bin,
+                )),
                 sha256_path: PathBuf::from(&remote_root).join(publish::artifact_rel_path(
                     &module,
                     channel,
@@ -370,6 +671,7 @@ impl RustTool for CompilerBuild {
             "module": module,
             "ref": git_ref,
             "host": resolved.role.as_str(),
+            "remote": !resolved.is_local(),
             "profile": profile,
             "target": triple,
             "channel": channel,
@@ -412,9 +714,16 @@ mod tests {
 
     #[test]
     fn cargo_argv_release_musl() {
-        let argv = cargo_build_argv("release", "x86_64-unknown-linux-musl", 4, "chord");
+        let argv = cargo_build_argv(
+            "release",
+            "x86_64-unknown-linux-musl",
+            4,
+            "chord",
+            "/src/chord/Cargo.toml",
+        );
         let j = argv.join(" ");
         assert!(j.starts_with("cargo build --locked --release"));
+        assert!(j.contains("--manifest-path /src/chord/Cargo.toml"));
         assert!(j.contains("--target x86_64-unknown-linux-musl"));
         assert!(j.contains("-j 4"));
         assert!(j.contains("--bin chord"));
@@ -422,16 +731,44 @@ mod tests {
 
     #[test]
     fn cargo_argv_debug_has_no_release_flag() {
-        let argv = cargo_build_argv("debug", "t", 8, "m");
+        let argv = cargo_build_argv("debug", "t", 8, "m", "/s/Cargo.toml");
         assert!(!argv.iter().any(|a| a == "--release"));
         assert!(argv.contains(&"-j".to_string()));
         assert!(argv.windows(2).any(|w| w[0] == "-j" && w[1] == "8"));
+        // Manifest-path makes the build CWD-independent (correct for remote ssh).
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "--manifest-path" && w[1] == "/s/Cargo.toml"));
     }
 
     #[test]
     fn cargo_argv_named_profile() {
-        let argv = cargo_build_argv("release-dist", "t", 2, "m");
-        assert!(argv.windows(2).any(|w| w[0] == "--profile" && w[1] == "release-dist"));
+        let argv = cargo_build_argv("release-dist", "t", 2, "m", "/s/Cargo.toml");
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "--profile" && w[1] == "release-dist"));
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        // An embedded single quote is closed, escaped, reopened.
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn shell_join_quotes_every_arg() {
+        let argv = vec![
+            "systemd-run".to_string(),
+            "--setenv=SCCACHE_REDIS_ENDPOINT=redis://h:6379".to_string(),
+            "cargo".to_string(),
+        ];
+        let s = shell_join(&argv);
+        assert_eq!(
+            s,
+            "'systemd-run' '--setenv=SCCACHE_REDIS_ENDPOINT=redis://h:6379' 'cargo'"
+        );
     }
 
     #[test]
@@ -440,10 +777,7 @@ mod tests {
             built_bin_rel("x86_64-unknown-linux-musl", "release", "chord"),
             PathBuf::from("x86_64-unknown-linux-musl/release/chord")
         );
-        assert_eq!(
-            built_bin_rel("t", "debug", "m"),
-            PathBuf::from("t/debug/m")
-        );
+        assert_eq!(built_bin_rel("t", "debug", "m"), PathBuf::from("t/debug/m"));
         assert_eq!(
             built_bin_rel("t", "release-dist", "m"),
             PathBuf::from("t/release-dist/m")

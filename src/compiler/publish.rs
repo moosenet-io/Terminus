@@ -199,7 +199,14 @@ mod tests {
     #[test]
     fn artifact_layout_is_content_addressed() {
         let root = Path::new("/data/build");
-        let p = artifact_abs_path(root, "chord", "experimental", "deadbeef", "x86_64-unknown-linux-musl", "chord");
+        let p = artifact_abs_path(
+            root,
+            "chord",
+            "experimental",
+            "deadbeef",
+            "x86_64-unknown-linux-musl",
+            "chord",
+        );
         assert_eq!(
             p,
             PathBuf::from(
@@ -226,9 +233,16 @@ mod tests {
         let payload = b"ELF...pretend-binary...";
         tokio::fs::write(&bin, payload).await.unwrap();
 
-        let pub_ = publish_local(&root, "mymod", "experimental", "x86_64-unknown-linux-musl", "mymod", &bin)
-            .await
-            .unwrap();
+        let pub_ = publish_local(
+            &root,
+            "mymod",
+            "experimental",
+            "x86_64-unknown-linux-musl",
+            "mymod",
+            &bin,
+        )
+        .await
+        .unwrap();
 
         // Sha matches the payload.
         assert_eq!(pub_.sha256, sha256_hex(payload));
@@ -255,7 +269,9 @@ mod tests {
         let bin = dir.path().join("bin");
         tokio::fs::write(&bin, b"x").await.unwrap();
 
-        publish_local(&root, "m", "experimental", "t", "bin", &bin).await.unwrap();
+        publish_local(&root, "m", "experimental", "t", "bin", &bin)
+            .await
+            .unwrap();
 
         let channel_dir = root.join("artifacts/m/experimental");
         let mut found_current = false;
@@ -271,7 +287,10 @@ mod tests {
                 }
             }
         }
-        assert!(!found_current, "publish must not create a `current` pointer");
+        assert!(
+            !found_current,
+            "publish must not create a `current` pointer"
+        );
     }
 
     #[test]
