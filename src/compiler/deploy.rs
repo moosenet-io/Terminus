@@ -489,9 +489,13 @@ fn ensure_non_interactive_sudo(prefix: &str) -> String {
 ///      exit code — with `sudo` forced non-interactive (`-n`) so it fails fast
 ///      instead of hanging on a password prompt,
 ///   3. reads the systemd `Result`, then reads the outcome-token file ONLY IF its
-///      MTIME is `>= __start` (finding 2: MTIME-FRESH). A marker whose mtime predates
-///      this run — a stale token the ssh user could NOT `rm` (root-owned marker) — is
-///      NEVER trusted, so it can't mask a current run that wrote no fresh marker,
+///      MTIME is `>= __start - 1` (finding 2: MTIME-FRESH, with a 1-second tolerance).
+///      A marker whose mtime predates this run — a stale token the ssh user could NOT
+///      `rm` (root-owned marker) — is NEVER trusted, so it can't mask a current run
+///      that wrote no fresh marker. The 1s tolerance is deliberate: `stat`/`date` are
+///      second-granularity, so a marker written in the SAME second as `__start` could
+///      otherwise round just below it and be wrongly rejected; a genuinely stale
+///      marker is seconds-to-minutes older, so the anti-stale guarantee is unaffected,
 ///   4. prints `COMPILER_DEPLOY rc=<rc> result=<result> token=<token>`,
 ///   5. ALWAYS `exit 0` — so ssh's OWN exit code reflects only CONNECTIVITY (a
 ///      non-zero ssh exit ⇒ unreachable, never merely a failed deploy). This is
@@ -506,11 +510,12 @@ pub fn render_remote_trigger_cmd(systemctl: &str, unit: &str, result_marker: &st
     let m = shell_quote(result_marker);
     format!(
         "__start=$(date +%s); \
+         __floor=$((__start - 1)); \
          rm -f -- {m} 2>/dev/null; \
          {systemctl} start {u}; __rc=$?; \
          __res=$({systemctl} show {u} --property=Result --value 2>/dev/null); \
          __mt=$(stat -c %Y -- {m} 2>/dev/null || echo 0); \
-         if [ \"$__mt\" -ge \"$__start\" ] 2>/dev/null; then __tok=$(cat -- {m} 2>/dev/null); else __tok=; fi; \
+         if [ \"$__mt\" -ge \"$__floor\" ] 2>/dev/null; then __tok=$(cat -- {m} 2>/dev/null); else __tok=; fi; \
          printf '{sentinel} rc=%s result=%s token=%s\\n' \"$__rc\" \"$__res\" \"$__tok\"; \
          exit 0",
         sentinel = RESULT_SENTINEL
@@ -1129,9 +1134,12 @@ mod tests {
         let rm_at = cmd.find("rm -f --").unwrap();
         let start_at = cmd.find("systemctl start").unwrap();
         assert!(start_ts_at < rm_at && rm_at < start_at, "start-epoch, then rm, then trigger");
-        // Finding 2: the token is read ONLY when the marker mtime is fresh (>= run start).
+        // Finding 2: the token is read ONLY when the marker mtime is fresh, with a
+        // 1-second tolerance floor (`__start - 1`) so a same-second write is not
+        // spuriously rejected while a genuinely stale (much older) marker still is.
         assert!(cmd.contains("stat -c %Y -- '<path>/.deploy_result'"));
-        assert!(cmd.contains("[ \"$__mt\" -ge \"$__start\" ]"), "mtime-fresh gate: {cmd}");
+        assert!(cmd.contains("__floor=$((__start - 1))"), "1s tolerance floor: {cmd}");
+        assert!(cmd.contains("[ \"$__mt\" -ge \"$__floor\" ]"), "mtime-fresh gate: {cmd}");
         assert!(cmd.contains("systemctl start '<email>'"));
         assert!(cmd.contains("--property=Result --value"));
         assert!(cmd.contains("cat -- '<path>/.deploy_result'"));
@@ -1460,43 +1468,43 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
-    fn set_mtime(path: &std::path::Path, epoch: i64) {
-        // Use `touch -m -d @<epoch>` (GNU/BusyBox) to set a deterministic mtime.
-        let status = std::process::Command::new("touch")
-            .arg("-m")
-            .arg("-d")
-            .arg(format!("@{epoch}"))
-            .arg(path)
-            .status()
-            .expect("touch mtime");
-        assert!(status.success(), "touch must succeed");
-    }
-
-    /// Run the wrapper against a marker that lives in a NON-WRITABLE directory, so
-    /// the wrapper's best-effort `rm` CANNOT delete it (mirrors a root-owned marker
-    /// the ssh user can't clear) — isolating the MTIME-freshness gate. `systemctl`
-    /// is `true` (writes no fresh marker), so only the mtime gate decides.
-    async fn wrapper_token_with_readonly_marker(content: &str, mtime_epoch: i64) -> String {
+    /// Drive the wrapper with a FAKE `systemctl` script that, on `start`, WRITES the
+    /// outcome marker — so the marker is produced BY THIS RUN (exactly the real path:
+    /// the wrapper `rm`s any prior marker, the updater writes a fresh one). Root-
+    /// independent: it never relies on the wrapper's `rm` failing. When `force_stale`
+    /// is set, the fake updater back-dates the marker's mtime far into the past
+    /// (simulating a marker NOT refreshed this run — e.g. an updater that aborted
+    /// before writing but left an old marker); otherwise the marker keeps its natural
+    /// write-time mtime (= "now", during the run). Returns the parsed token.
+    async fn wrapper_token_with_fake_updater(force_stale: bool, content: &str) -> String {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("deploy_result");
-        std::fs::write(&marker, content).unwrap();
-        set_mtime(&marker, mtime_epoch);
-        // Drop write on the dir so `rm` fails (non-root can't unlink without dir write).
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
-        let body = run_wrapper("true", "unit", &marker).await;
-        // Restore so the tempdir can be cleaned up.
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        let (_rc, _res, token) = parse_result_line(&body);
+        let marker_s = marker.to_string_lossy().to_string();
+        // `1000000000` ≈ 2001-09-09 — decades before any run, so far below the
+        // `__start - 1` floor that second-granularity/scheduling can't flip it.
+        let backdate = if force_stale {
+            format!("touch -m -d @1000000000 -- '{marker_s}';")
+        } else {
+            String::new()
+        };
+        let script = dir.path().join("fake-systemctl.sh");
+        let body = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  start) printf '%s' '{content}' > '{marker_s}'; {backdate} ;;\nesac\nexit 0\n"
+        );
+        std::fs::write(&script, &body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = run_wrapper(&script.to_string_lossy(), "unit", &marker).await;
+        let (_rc, _res, token) = parse_result_line(&out);
         token
     }
 
     #[tokio::test]
     async fn stale_marker_old_mtime_is_not_trusted() {
-        // Finding 2: a pre-existing STALE marker (old mtime) that survives an
-        // unpermitted `rm` must NOT be read — the mtime gate rejects it, so it can't
-        // mask a current run that wrote no fresh marker.
-        let token = wrapper_token_with_readonly_marker("deployed", 1_000_000_000).await;
+        // Finding 2: a marker whose mtime predates this run (decades old) is NOT
+        // trusted — it can't mask a current run. Deterministic + root-independent: the
+        // fake updater writes the marker then back-dates it far into the past.
+        let token = wrapper_token_with_fake_updater(true, "deployed").await;
         assert!(
             token.is_empty(),
             "a stale (old-mtime) marker must not be trusted; got token={token:?}"
@@ -1504,11 +1512,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_marker_new_mtime_is_trusted() {
-        // A marker with a mtime at/after the run start IS trusted (this run's write).
-        let future = chrono::Utc::now().timestamp() + 3600;
-        let token = wrapper_token_with_readonly_marker("rolled_back", future).await;
-        assert_eq!(token, "rolled_back", "a fresh-mtime marker is trusted");
+    async fn fresh_marker_written_this_run_is_trusted() {
+        // The realistic path: the updater writes the marker DURING the run (natural
+        // "now" mtime, same second as `__start`). The `__start - 1` tolerance means a
+        // same-second write is never spuriously rejected — this is exactly the
+        // second-granularity case that flipped on <host>. Deterministic (mtime is set by
+        // the fake updater's write, always >= the run start).
+        let token = wrapper_token_with_fake_updater(false, "rolled_back").await;
+        assert_eq!(
+            token, "rolled_back",
+            "a marker written during the run (same-second mtime) is trusted"
+        );
     }
 
     #[tokio::test]

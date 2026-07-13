@@ -528,8 +528,11 @@ compiler_deploy(module, channel="stable", hosts="all")
 - **No-masked-failures / no-raw-echo hardening:** the trigger forces **non-interactive sudo**
   (`sudo -n`) so a password prompt fails fast instead of hanging the whole per-host budget; the
   outcome marker is **mtime-fresh / run-scoped** — the wrapper records a run-start epoch and reads
-  the token **only if the marker's mtime is ≥ that start**, so a stale prior-run marker the ssh
-  user could not remove (a root-owned marker) is never trusted and can't mask a current run; a
+  the token **only if the marker's mtime is ≥ (start − 1s)**, so a stale prior-run marker the ssh
+  user could not remove (a root-owned marker) is never trusted and can't mask a current run (the
+  1-second tolerance absorbs `stat`/`date` second-granularity so a same-second write is not
+  spuriously rejected, while a genuinely stale marker — seconds-to-minutes older — is still
+  rejected); a
   non-zero `systemctl start` rc is classified `failed` regardless of the unit's (possibly stale)
   `Result`; the **outer wall-clock timeout is strictly greater than the ssh connect budget**, so
   a connect/auth hang surfaces as `unreachable` (never `timed_out`); the per-host `detail` is
