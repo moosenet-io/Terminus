@@ -91,6 +91,11 @@ const OP_TIMEOUT_ENV: &str = "BUILD_IDLE_OP_TIMEOUT_SECS";
 /// directly, no idle). Unset ⇒ AUTO (enabled when the backend is available). A truthy
 /// value forces ON. From `BUILD_IDLE_ENABLED`.
 const ENABLED_ENV: &str = "BUILD_IDLE_ENABLED";
+/// Backoff (secs) between rounds of the PERSISTENT reactivation backstop — the
+/// never-give-up loop that keeps retrying activation after the bounded immediate
+/// attempts exhaust, so a service is never stranded idle. From
+/// `BUILD_IDLE_PERSISTENT_RETRY_SECS`.
+const PERSISTENT_RETRY_SECS_ENV: &str = "BUILD_IDLE_PERSISTENT_RETRY_SECS";
 
 const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 120;
 /// Default max-lease: a full build timeout plus generous headroom, so the watchdog
@@ -103,9 +108,12 @@ const DEFAULT_ACTIVATE_RETRY_MS: u64 = 500;
 /// above the Chord HTTP timeout and a normal MINT drain, short enough that a hung
 /// backend degrades promptly instead of stalling dispatch/finalization.
 const DEFAULT_OP_TIMEOUT_SECS: u64 = 60;
-/// Bounded rounds of reactivation retry per release call (backstopped by later
-/// release calls, the max-lease watchdog, and each service's own idle watchdog).
+/// Bounded rounds of the IMMEDIATE reactivation retry per release call. After these
+/// exhaust with a service still idle, a PERSISTENT background backstop takes over and
+/// never gives up (see `spawn_persistent_backstop`).
 const RELEASE_MAX_ATTEMPTS: u32 = 5;
+/// Default backoff between PERSISTENT reactivation-backstop rounds.
+const DEFAULT_PERSISTENT_RETRY_SECS: u64 = 30;
 
 /// The idle-lease reason label (diagnostic only; recorded in MINT's resume
 /// manifest). Not an infra identifier.
@@ -146,6 +154,8 @@ pub struct IdleLeaseConfig {
     /// Per-OPERATION timeout bounding EACH idle/activate call (Chord and MINT) so a
     /// hung backend can never hang dispatch or finalization.
     pub op_timeout: Duration,
+    /// Backoff between PERSISTENT reactivation-backstop rounds (never-give-up loop).
+    pub persistent_retry: Duration,
 }
 
 impl IdleLeaseConfig {
@@ -167,6 +177,10 @@ impl IdleLeaseConfig {
                 DEFAULT_ACTIVATE_RETRY_MS,
             )),
             op_timeout: Duration::from_secs(env_u64(OP_TIMEOUT_ENV, DEFAULT_OP_TIMEOUT_SECS)),
+            persistent_retry: Duration::from_secs(env_u64(
+                PERSISTENT_RETRY_SECS_ENV,
+                DEFAULT_PERSISTENT_RETRY_SECS,
+            )),
         }
     }
 }
@@ -417,6 +431,11 @@ struct LeaseInner {
     /// INTERRUPTIBLE — it returns `LeaseExpired` immediately on expiry instead of
     /// sleeping out the rest of a (possibly long) `BUILD_IDLE_POLL_MS` interval.
     expired_notify: tokio::sync::Notify,
+    /// Backoff between rounds of the PERSISTENT reactivation backstop.
+    persistent_backoff: Duration,
+    /// Set while a persistent reactivation backstop task is running, so at most ONE
+    /// runs (a later release that finds a service still idle does not spawn a second).
+    persistent_running: AtomicBool,
 }
 
 impl LeaseInner {
@@ -458,10 +477,16 @@ impl LeaseInner {
     /// transient partial failure self-heals instead of leaving a service stuck idle.
     /// Idempotent + re-entrant: a service already confirmed active is never touched
     /// again by this call, and re-invoking after a partial failure resumes ONLY the
-    /// still-pending service. SERIALIZED under `release_lock` (F5): concurrent callers
+    /// still-pending service. SERIALIZED under `release_lock`: concurrent callers
     /// coalesce — the second waits, then finds the work already done (or resumes the
     /// still-pending service) rather than racing a duplicate concurrent activation.
-    async fn release(&self) {
+    ///
+    /// NEVER GIVES UP (F1): if the bounded IMMEDIATE attempts exhaust with a service
+    /// still idle, a PERSISTENT background backstop is started that keeps retrying until
+    /// BOTH services are ACTIVE. `release` itself does NOT block on that backstop (so the
+    /// scheduler's completion path never hangs on a down backend), but a service is never
+    /// stranded idle: the backstop runs until fully released.
+    async fn release(self: Arc<Self>) {
         // Mark the lease dead the instant release begins, so a concurrent
         // `acquire_lease` wait loop observes the expiry and refuses to hand back a lease
         // whose services are being reactivated (F1). Set BEFORE the fast-path return so
@@ -473,27 +498,69 @@ impl LeaseInner {
         if self.fully_released() {
             return;
         }
-        // Serialize: only one activation sequence at a time.
-        let _seq = self.release_lock.lock().await;
-        // Another caller may have finished while we waited for the lock.
-        if self.fully_released() {
-            return;
-        }
-        for attempt in 0..self.max_attempts.max(1) {
-            if self.try_activate_pending().await {
-                info!("idle lease released — Chord + MINT reactivated");
+        {
+            // Serialize: only one activation sequence at a time.
+            let _seq = self.release_lock.lock().await;
+            // Another caller may have finished while we waited for the lock.
+            if self.fully_released() {
                 return;
             }
-            if attempt + 1 < self.max_attempts.max(1) {
-                tokio::time::sleep(self.retry_backoff).await;
+            for attempt in 0..self.max_attempts.max(1) {
+                if self.try_activate_pending().await {
+                    info!("idle lease released — Chord + MINT reactivated");
+                    return;
+                }
+                if attempt + 1 < self.max_attempts.max(1) {
+                    tokio::time::sleep(self.retry_backoff).await;
+                }
             }
-        }
+        } // drop the lock BEFORE spawning the persistent backstop (it re-acquires it)
+        // Bounded immediate attempts exhausted with a service still idle → NEVER give up:
+        // hand off to a persistent background backstop that retries until fully active.
         warn!(
             chord_active = self.chord_active.load(Ordering::SeqCst),
             mint_active = self.mint_active.load(Ordering::SeqCst),
-            "idle lease: a service is still not confirmed active after release retries — \
-             a later release/watchdog or the per-service idle watchdog remains the backstop"
+            "idle lease: a service is still idle after the bounded retries — starting the \
+             PERSISTENT reactivation backstop (never gives up until active)"
         );
+        self.spawn_persistent_backstop();
+    }
+
+    /// Ensure a PERSISTENT reactivation backstop is running: a detached task that keeps
+    /// retrying activation (with `persistent_backoff` between rounds) until BOTH services
+    /// are ACTIVE, then stops. At most ONE runs at a time (a later release that still
+    /// finds a service idle relies on the existing one). A service is thus NEVER stranded
+    /// idle after the bounded immediate attempts (F1). Requires an ambient runtime to
+    /// spawn; without one (a rare no-runtime crash drop) the immediate blocking attempts
+    /// already ran and there is nothing further to do without a runtime.
+    fn spawn_persistent_backstop(self: &Arc<Self>) {
+        if self.fully_released() {
+            return;
+        }
+        // Claim the single backstop slot; if one is already running it will converge.
+        if self.persistent_running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            self.persistent_running.store(false, Ordering::SeqCst);
+            warn!("idle lease: no ambient runtime for a persistent reactivation backstop (blocking attempts already ran)");
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            loop {
+                {
+                    let _seq = this.release_lock.lock().await;
+                    if this.try_activate_pending().await {
+                        info!("idle lease: persistent backstop reactivated all services — stopping");
+                        break;
+                    }
+                }
+                warn!("idle lease: a service is STILL idle — persistent reactivation backstop will retry (never gives up)");
+                tokio::time::sleep(this.persistent_backoff).await;
+            }
+            this.persistent_running.store(false, Ordering::SeqCst);
+        });
     }
 }
 
@@ -674,10 +741,46 @@ pub async fn acquire_lease(
     enabled: bool,
     budget_gb: f64,
 ) -> Result<LeaseGuard, LeaseError> {
-    // Coordination disabled/unavailable ⇒ the ONLY no-idle path: build directly.
+    // Coordination disabled/unavailable ⇒ no idle call is made. BUT disabling
+    // COORDINATION must NOT disable the RAM GATE (F2): if a budget is configured, still
+    // enforce it before building — WITHOUT idling (we can't free RAM with coordination
+    // off), so we can only wait for the host to already have enough available, else
+    // abort + requeue (never build under budget). No lease/watchdog is needed (nothing
+    // is idled), so a `noop` guard is returned on success.
     if !enabled {
-        info!("idle lease: coordination disabled/unavailable — building directly (no idle)");
-        return Ok(LeaseGuard::noop());
+        if budget_gb <= 0.0 {
+            info!("idle lease: coordination disabled/unavailable + no budget — building directly (no idle)");
+            return Ok(LeaseGuard::noop());
+        }
+        info!(
+            budget_gb,
+            "idle lease: coordination disabled — enforcing the RAM gate WITHOUT idling"
+        );
+        let deadline = tokio::time::Instant::now() + cfg.acquire_timeout;
+        loop {
+            let available = backend.mem_available_gb();
+            if available.map(|a| a >= budget_gb).unwrap_or(false) {
+                info!(
+                    available_gb = available,
+                    budget_gb,
+                    "idle lease: available RAM already meets the budget — building directly (noop lease, no idle)"
+                );
+                return Ok(LeaseGuard::noop());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!(
+                    available_gb = available,
+                    budget_gb,
+                    "idle lease: available RAM below budget with idle coordination DISABLED \
+                     (cannot free RAM) — refusing the heavy build (it will be requeued)"
+                );
+                return Err(LeaseError::InsufficientRam {
+                    available_gb: available.unwrap_or(0.0),
+                    budget_gb,
+                });
+            }
+            tokio::time::sleep(cfg.poll).await;
+        }
     }
 
     // Chord is part of the lease ONLY when configured (F1: never call an absent Chord).
@@ -696,6 +799,7 @@ pub async fn acquire_lease(
         backend.clone(),
         cfg.activate_retry,
         cfg.op_timeout,
+        cfg.persistent_retry,
         chord_in_lease,
     ));
 
@@ -830,6 +934,7 @@ fn build_lease_inner(
     backend: Arc<dyn IdleBackend>,
     activate_retry: Duration,
     op_timeout: Duration,
+    persistent_retry: Duration,
     chord_in_lease: bool,
 ) -> Arc<LeaseInner> {
     Arc::new(LeaseInner {
@@ -842,6 +947,8 @@ fn build_lease_inner(
         release_lock: tokio::sync::Mutex::new(()),
         expired: AtomicBool::new(false),
         expired_notify: tokio::sync::Notify::new(),
+        persistent_backoff: persistent_retry,
+        persistent_running: AtomicBool::new(false),
     })
 }
 
@@ -856,8 +963,13 @@ fn arm_guard(
     op_timeout: Duration,
     chord_in_lease: bool,
 ) -> LeaseGuard {
-    let mut guard =
-        LeaseGuard::held(build_lease_inner(backend, activate_retry, op_timeout, chord_in_lease));
+    let mut guard = LeaseGuard::held(build_lease_inner(
+        backend,
+        activate_retry,
+        op_timeout,
+        Duration::from_millis(1), // fast persistent backstop in tests
+        chord_in_lease,
+    ));
     guard.arm_watchdog(max_lease);
     guard
 }
@@ -1153,17 +1265,49 @@ mod tests {
             chord_timeout: Duration::from_secs(1),
             activate_retry: Duration::from_millis(1),
             op_timeout: Duration::from_secs(5),
+            persistent_retry: Duration::from_millis(1),
         }
     }
 
     #[tokio::test]
-    async fn coordination_disabled_builds_directly_with_no_idle_calls() {
-        // FINDING 2 (a): coordination DISABLED (enabled=false — e.g. no backends /
-        // BUILD_IDLE_ENABLED=0) ⇒ NO idle call at all, builds directly, no-op guard.
+    async fn coordination_disabled_no_budget_builds_directly_with_no_idle_calls() {
+        // Coordination DISABLED (enabled=false) + NO budget ⇒ NO idle call at all,
+        // builds directly, no-op guard.
         let be = MockBackend::new(None, None);
         let guard = acquire_lease(be.clone(), &cfg(5, 3600), false, 0.0)
             .await
-            .expect("disabled ⇒ builds directly");
+            .expect("disabled + no budget ⇒ builds directly");
+        assert_eq!(be.chord_idles.load(Ordering::SeqCst), 0, "no chord idle attempted");
+        assert_eq!(be.mint_idles.load(Ordering::SeqCst), 0, "no mint idle attempted");
+        guard.release().await;
+        assert_eq!(be.activates(), (0, 0), "nothing idled ⇒ nothing to reactivate");
+    }
+
+    #[tokio::test]
+    async fn coordination_disabled_still_enforces_budget_aborts_when_under() {
+        // FINDING 2: disabling COORDINATION must NOT bypass the RAM GATE. Disabled +
+        // budget set + MemAvailable < budget ⇒ abort + requeue (never build under
+        // budget), and NO idle call is made (coordination is off).
+        let be = MockBackend::new(None, None).with_mem(vec![50.0]);
+        let err = acquire_lease(be.clone(), &cfg(0, 3600), false, 120.0)
+            .await
+            .expect_err("disabled + under budget ⇒ InsufficientRam");
+        assert!(
+            matches!(err, LeaseError::InsufficientRam { .. }),
+            "must refuse to build under budget even with coordination off, got {err:?}"
+        );
+        assert_eq!(be.chord_idles.load(Ordering::SeqCst), 0, "no idle attempted (coordination off)");
+        assert_eq!(be.mint_idles.load(Ordering::SeqCst), 0, "no idle attempted (coordination off)");
+    }
+
+    #[tokio::test]
+    async fn coordination_disabled_proceeds_when_available_ram_meets_budget_no_idle() {
+        // FINDING 2: disabled + budget set + MemAvailable >= budget ⇒ proceed with a
+        // NOOP lease (the host already has the room; no idle calls are made).
+        let be = MockBackend::new(None, None).with_mem(vec![200.0]);
+        let guard = acquire_lease(be.clone(), &cfg(5, 3600), false, 120.0)
+            .await
+            .expect("disabled + ample available RAM ⇒ proceeds");
         assert_eq!(be.chord_idles.load(Ordering::SeqCst), 0, "no chord idle attempted");
         assert_eq!(be.mint_idles.load(Ordering::SeqCst), 0, "no mint idle attempted");
         guard.release().await;
@@ -1399,6 +1543,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persistent_backstop_keeps_retrying_past_bounded_attempts_until_active() {
+        // FINDING 1: activation fails MORE than RELEASE_MAX_ATTEMPTS times, then succeeds.
+        // The bounded immediate attempts exhaust, but the PERSISTENT reactivation backstop
+        // keeps retrying until the service ends ACTIVE — never stranded idle after N.
+        let fails = RELEASE_MAX_ATTEMPTS as usize + 2; // strictly more than the bounded attempts
+        let be = MockBackend::new(None, None)
+            .with_mem(vec![200.0])
+            .with_chord_activate_fails(fails);
+        let guard = acquire_lease(be.clone(), &cfg(5, 3600), true, 120.0)
+            .await
+            .expect("acquired");
+        // Immediate release exhausts its bounded attempts (all fail) → hands off to the
+        // persistent backstop, then RETURNS promptly (never blocks on a down backend).
+        guard.release().await;
+        // The persistent backstop consumes the remaining failures and finally succeeds.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !be.is_stuck_idle(),
+            "persistent backstop reactivated the service (not stranded after bounded attempts)"
+        );
+        assert_eq!(
+            be.chord_activates.load(Ordering::SeqCst),
+            1,
+            "exactly one SUCCESSFUL chord activate (after all the forced failures)"
+        );
+        assert_eq!(
+            be.chord_activate_fail_times.load(Ordering::SeqCst),
+            0,
+            "every forced failure was consumed — the backstop never gave up"
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_release_calls_coalesce_to_a_single_activation_set() {
         // FINDING 5: two concurrent release() calls (e.g. the watchdog waking exactly
         // as the build finishes) must COALESCE — a single set of activation attempts,
@@ -1414,6 +1591,8 @@ mod tests {
             release_lock: tokio::sync::Mutex::new(()),
             expired: AtomicBool::new(false),
             expired_notify: tokio::sync::Notify::new(),
+            persistent_backoff: Duration::from_millis(1),
+            persistent_running: AtomicBool::new(false),
         });
         let (i1, i2) = (inner.clone(), inner.clone());
         tokio::join!(async { i1.release().await }, async { i2.release().await });
@@ -1575,6 +1754,8 @@ mod tests {
             release_lock: tokio::sync::Mutex::new(()),
             expired: AtomicBool::new(false),
             expired_notify: tokio::sync::Notify::new(),
+            persistent_backoff: Duration::from_millis(1),
+            persistent_running: AtomicBool::new(false),
         });
         // Manually build a guard with NO watchdog (simulating a guard whose ambient
         // runtime is gone), then drop it with no ambient runtime.
