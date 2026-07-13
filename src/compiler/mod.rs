@@ -20,6 +20,7 @@
 //! literal in source. Nothing token/URL-with-creds shaped is read outside the
 //! sccache secret wiring, and the parsed password never logs.
 
+pub mod events;
 pub mod host;
 pub mod publish;
 pub mod queue; // BLD-06: the durable compiler job queue (Namespace::Queue)
@@ -248,6 +249,18 @@ fn cargo_build_argv(
     argv
 }
 
+/// Force cargo to render its `N/M` progress bar EVEN on the piped (non-TTY)
+/// stdio the build runs under, so the live `{step,total}` progress the tap parses
+/// is actually emitted. `CARGO_TERM_PROGRESS_WHEN=always` renders the bar
+/// unconditionally; a fixed `CARGO_TERM_PROGRESS_WIDTH` keeps the `N/M` format
+/// stable (independent of a non-existent terminal width). Both are NON-SECRET
+/// term vars (they go via `--setenv`, never the secret env-file), inserted into
+/// the build child's env for BOTH the local and remote (heavy) build paths.
+fn inject_cargo_progress_env(build_env: &mut BTreeMap<String, String>) {
+    build_env.insert("CARGO_TERM_PROGRESS_WHEN".to_string(), "always".to_string());
+    build_env.insert("CARGO_TERM_PROGRESS_WIDTH".to_string(), "100".to_string());
+}
+
 /// The path (relative to CARGO_TARGET_DIR) where the built binary lands:
 /// `<triple>/<profile-subdir>/<bin>`.
 fn built_bin_rel(triple: &str, profile: &str, bin: &str) -> PathBuf {
@@ -279,6 +292,32 @@ fn redact_secrets(text: &str, secrets: &[String]) -> String {
         }
     }
     out
+}
+
+/// The S7 redaction set for a build: every secret-shaped VALUE that could be
+/// echoed by a child (or embedded in a `ToolError`) and must be scrubbed before
+/// it reaches captured output, a log, or the progress bus. That is every secret
+/// value in the sccache env (`SCCACHE_REDIS_PASSWORD`, …) PLUS the ambient full
+/// `SCCACHE_REDIS` URL the child inherits. `root_str` only seeds sccache's
+/// non-secret local-dir fallback, so `""` is fine when only the secret values are
+/// needed (e.g. redacting a failed-event message before the build resolves root).
+fn redaction_set(root_str: &str) -> Vec<String> {
+    let sccache_env = sccache::resolve(root_str);
+    let mut redact: Vec<String> = sccache_env
+        .vars
+        .iter()
+        .filter(|(k, _)| scope::is_secret_env_key(k))
+        .map(|(_, v)| v.clone())
+        .filter(|v| !v.is_empty())
+        .collect();
+    if let Some(url) = sccache::ambient_secret_url() {
+        if !url.is_empty() {
+            redact.push(url);
+        }
+    }
+    redact.sort();
+    redact.dedup();
+    redact
 }
 
 /// On a REMOTE (ssh heavy) build, killing the LOCAL `ssh` process group does not
@@ -324,6 +363,7 @@ async fn remote_scope_kill(rk: &RemoteScopeKill, redact: &[String]) {
         &BTreeMap::new(),
         Duration::from_secs(30),
         redact,
+        None,
         None,
     ))
     .await
@@ -473,6 +513,84 @@ impl Drop for RemoteSecretGuard {
 /// `systemctl kill <unit>.scope` over ssh to tear down the remote build tree — so
 /// a timed-out heavy build cannot keep running remotely (holding the inherited
 /// secret env + capped host resources) after the tool returns.
+/// Flush one segment (a `\r`/`\n`-delimited line) to the build tap: lossily decode
+/// (non-UTF-8 → U+FFFD), redact (S6/S7), feed the progress tap, and append the
+/// redacted bytes to the captured output. An empty segment is a no-op (nothing to
+/// parse), so consecutive delimiters (`\r\n`) don't fire a spurious tap.
+fn tap_flush_segment(seg: &[u8], tap: &events::BuildTap, redact: &[String], buf: &mut Vec<u8>) {
+    if seg.is_empty() {
+        return;
+    }
+    let redacted = redact_secrets(&String::from_utf8_lossy(seg), redact);
+    tap.on_line(&redacted);
+    buf.extend_from_slice(redacted.as_bytes());
+}
+
+/// Drain one child pipe to completion (so a chatty child never deadlocks on a
+/// full pipe). Without a `tap` it is a byte-exact `read_to_end` (unchanged for
+/// every non-build subprocess). With a `tap` (the cargo build) it reads RAW BYTES
+/// in chunks and splits on BOTH `\r` AND `\n` so a cargo progress bar (which
+/// updates with CARRIAGE RETURNS, no newline until it finishes) reaches the tap
+/// LIVE — each `12/34`→`20/34` update fires immediately instead of buffering
+/// until the next newline. Each segment is redacted (S6/S7) BEFORE it reaches the
+/// tap, and the redacted segments are kept as the captured output so a failed
+/// build's error tail can never carry a raw secret. Byte-level reads never choke
+/// on non-UTF-8 (lossy decode) and drain to EOF; only a true read error breaks.
+async fn drain_pipe<R>(
+    pipe: Option<R>,
+    tap: Option<events::BuildTap>,
+    redact: Vec<String>,
+) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut pipe = match pipe {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let tap = match tap {
+        // No tap → preserve the original byte-exact capture.
+        None => {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf).await;
+            return buf;
+        }
+        Some(t) => t,
+    };
+    let mut buf: Vec<u8> = Vec::new(); // full captured (redacted) output
+    let mut seg: Vec<u8> = Vec::new(); // current in-progress segment (line/bar)
+    let mut chunk = [0u8; 8192];
+    loop {
+        match pipe.read(&mut chunk).await {
+            Ok(0) => {
+                // EOF: flush any trailing partial segment (no delimiter).
+                tap_flush_segment(&seg, &tap, &redact, &mut buf);
+                break;
+            }
+            Ok(n) => {
+                for &b in &chunk[..n] {
+                    if b == b'\n' || b == b'\r' {
+                        // A `\r` OR `\n` closes the current segment → tap it LIVE.
+                        tap_flush_segment(&seg, &tap, &redact, &mut buf);
+                        buf.push(b); // preserve the delimiter in the capture
+                        seg.clear();
+                    } else {
+                        seg.push(b);
+                    }
+                }
+            }
+            // A genuine I/O read error: flush the remainder and stop (the child is
+            // unaffected; the remaining bytes just don't reach the tail).
+            Err(_) => {
+                tap_flush_segment(&seg, &tap, &redact, &mut buf);
+                break;
+            }
+        }
+    }
+    buf
+}
+
 async fn run(
     argv: &[String],
     cwd: Option<&std::path::Path>,
@@ -480,8 +598,8 @@ async fn run(
     timeout: Duration,
     redact: &[String],
     remote_kill: Option<&RemoteScopeKill>,
+    tap: Option<&events::BuildTap>,
 ) -> Result<String, ToolError> {
-    use tokio::io::AsyncReadExt;
     if argv.is_empty() {
         return Err(ToolError::Execution("empty command".into()));
     }
@@ -509,22 +627,22 @@ async fn run(
 
     // Drain stdout/stderr concurrently while we wait, so a chatty child can't
     // deadlock on a full pipe and we still have the output after `wait()`.
+    //
+    // BLD-19: when a `tap` is present (the cargo build calls), the drain reads
+    // LINE BY LINE and forwards each already-redacted line to the tap so a live
+    // `{step,total}` building event is emitted DURING the build (progress bar,
+    // not a spinner). Without a tap (every non-build subprocess) the drain keeps
+    // its byte-exact `read_to_end` behavior unchanged.
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
-    let stdout_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(p) = stdout_pipe.as_mut() {
-            let _ = p.read_to_end(&mut buf).await;
-        }
-        buf
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(p) = stderr_pipe.as_mut() {
-            let _ = p.read_to_end(&mut buf).await;
-        }
-        buf
-    });
+    let out_tap = tap.cloned();
+    let out_redact = redact.to_vec();
+    let stdout_task =
+        tokio::spawn(async move { drain_pipe(stdout_pipe.take(), out_tap, out_redact).await });
+    let err_tap = tap.cloned();
+    let err_redact = redact.to_vec();
+    let stderr_task =
+        tokio::spawn(async move { drain_pipe(stderr_pipe.take(), err_tap, err_redact).await });
 
     let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(s)) => s,
@@ -633,6 +751,10 @@ impl RustTool for CompilerBuild {
                 "source_dir": {
                     "type": "string",
                     "description": "Override the source tree location (defaults to ${BUILD_DATASET_ROOT}/src/<module>/<ref>)."
+                },
+                "request_id": {
+                    "type": "string",
+                    "description": "Optional stable id for this build request; progress/events are keyed by it (query with compiler_progress). Auto-generated when omitted and returned in the result."
                 }
             },
             "required": ["module", "ref"]
@@ -644,6 +766,202 @@ impl RustTool for CompilerBuild {
     }
 
     async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        // BLD-19: decide the effective request_id FIRST, so EVERY compiler_build
+        // path (success OR failure) carries a discoverable id. A caller may supply
+        // one (to subscribe before/while the build runs); if it is missing OR
+        // INVALID (bad chars / overlong), we FALL BACK to an auto-generated id
+        // rather than returning early with no surfaced id (AC-1). The invalid id is
+        // discarded, never clamped — so two distinct ids can't fold onto one track.
+        // The substitution is made OBSERVABLE (not silent): a warn log + a
+        // `supplied_request_id_invalid` signal in the result (structured field on
+        // success, an `[supplied_request_id_invalid]` marker in the error on
+        // failure), so a client can correlate the id it sent with the one used.
+        let (request_id, supplied_invalid) = resolve_request_id(&args);
+        if supplied_invalid {
+            tracing::warn!(
+                effective_request_id = %request_id,
+                "compiler_build: supplied request_id was invalid; using a generated id"
+            );
+        }
+        // BLD-19: ROTATE the progress track to a FRESH stream NOW — before any
+        // validation and before build_inner. This is the single rotation per build
+        // attempt (build_inner does NOT rotate again). Doing it here (not inside
+        // build_inner) means EVEN a PRE-ACCEPTANCE failure (invalid module/ref/
+        // profile, missing config) lands its terminal `failed` on a fresh,
+        // non-terminal track — so a reused request_id whose prior build ended
+        // terminal can never mask THIS attempt's failure with the old build's
+        // stale `published`/`failed` state.
+        events::bus().begin(&request_id);
+        // Run the build. On ANY error path: emit the terminal Failed event AND
+        // surface the request_id back to the caller in the returned error, so a
+        // failed build's progress stream stays discoverable even when the caller
+        // did not supply an id (invariant: every compiler_build call — success OR
+        // build-failure — returns the stable request_id). The happy path emits
+        // Published + returns the id in the structured output from build_inner.
+        //
+        // NOTE (by design): a PRE-ACCEPTANCE failure — one that occurs before
+        // `build_inner` emits `queued` (an invalid/absent config, a validation
+        // error, etc.) — yields a TERMINAL-ONLY `failed` track on the fresh track
+        // (no `queued → … → failed` shape). That is intentional: the id is still
+        // surfaced and the failed stream is discoverable; we do NOT synthesize a
+        // fake `queued` event just to pad the shape.
+        match self.build_inner(&request_id, args).await {
+            Ok(mut out) => {
+                // Surface the invalid-supplied-id substitution in the structured
+                // output so a client can correlate (only when it happened).
+                if supplied_invalid {
+                    if let Some(obj) = out.structured.as_mut().and_then(Value::as_object_mut) {
+                        obj.insert("supplied_request_id_invalid".into(), Value::Bool(true));
+                    }
+                }
+                Ok(out)
+            }
+            Err(e) => {
+                // Sanitize the error at the EMITTER boundary — secret VALUES (S6/S7)
+                // AND infrastructure LITERALS (S1) — before it reaches the bus
+                // (see `redacted_failed_message`).
+                events::bus().emit(
+                    &request_id,
+                    events::Emit::stage(events::Stage::Failed).message(redacted_failed_message(&e)),
+                );
+                Err(tag_error_with_request_id(e, &request_id, supplied_invalid))
+            }
+        }
+    }
+}
+
+/// Resolve the EFFECTIVE `request_id` for a build attempt and whether a
+/// caller-supplied id was INVALID and substituted. The caller value is validated
+/// RAW — NO trimming/normalization (a lossy trim could collapse `" build-1 "` and
+/// `"build-1"` onto the same track). Outcomes:
+/// - ABSENT (key missing or explicit `null`) → auto-generate SILENTLY (→ `false`);
+///   nothing was supplied to invalidate.
+/// - PRESENT string that is a valid `[A-Za-z0-9._-]` segment within the length
+///   bound → used VERBATIM (→ `false`).
+/// - PRESENT string that is invalid (whitespace, empty, disallowed char, overlong)
+///   OR PRESENT but NOT a string (number/bool/array/object) → DISCARDED and
+///   replaced by an auto-generated id (→ `true`, an OBSERVABLE substitution).
+/// The fallback (never a hard reject) preserves the "a discoverable id always
+/// exists" invariant.
+fn resolve_request_id(args: &Value) -> (String, bool) {
+    match args.get("request_id") {
+        // Absent / explicit null → nothing supplied to invalidate.
+        None | Some(Value::Null) => (uuid::Uuid::new_v4().simple().to_string(), false),
+        // Present string + valid (validated RAW, no trimming) → use verbatim.
+        Some(Value::String(s)) if is_valid_request_id(s) => (s.clone(), false),
+        // Present but invalid — a bad string OR a non-string type → substitute
+        // (observable). No silent normalization, and a non-string is NOT treated
+        // as "absent".
+        Some(_) => (uuid::Uuid::new_v4().simple().to_string(), true),
+    }
+}
+
+/// Prepend `[request_id=<id>] ` (and, when the supplied id was invalid, a
+/// `[supplied_request_id_invalid]` marker) to a build error's message, preserving
+/// the `ToolError` variant, so a FAILED build still hands the caller the stable
+/// request_id — the caller extracts it and queries `compiler_progress` to read
+/// the failed build's stream. This is how the "every build returns a stable
+/// request_id" invariant holds on the failure path (the success path returns it
+/// in the structured output/text); the marker makes the invalid-id substitution
+/// observable on the failure path too.
+fn tag_error_with_request_id(e: ToolError, request_id: &str, supplied_invalid: bool) -> ToolError {
+    let mut tag = format!("[request_id={request_id}] ");
+    if supplied_invalid {
+        tag.push_str("[supplied_request_id_invalid] ");
+    }
+    match e {
+        ToolError::NotConfigured(m) => ToolError::NotConfigured(format!("{tag}{m}")),
+        ToolError::InvalidArgument(m) => ToolError::InvalidArgument(format!("{tag}{m}")),
+        ToolError::Http(m) => ToolError::Http(format!("{tag}{m}")),
+        ToolError::Database(m) => ToolError::Database(format!("{tag}{m}")),
+        ToolError::Execution(m) => ToolError::Execution(format!("{tag}{m}")),
+        ToolError::NotFound(m) => ToolError::NotFound(format!("{tag}{m}")),
+        ToolError::Conflict(m) => ToolError::Conflict(format!("{tag}{m}")),
+    }
+}
+
+/// Sanitize a build error's full message at the EMITTER boundary before it is
+/// persisted on the progress bus (and later returned by `compiler_progress`).
+/// TWO passes, in order:
+///   1. **Secret VALUES** (S6/S7) — the build's redaction set (`SCCACHE_REDIS`
+///      password/URL). `run()` already scrubs subprocess tails, but OTHER
+///      `ToolError` sources reach the emit verbatim.
+///   2. **Infrastructure LITERALS** (S1) — IP addresses, and the emitter-known
+///      configured host/relay-host and dataset/deploy path values, plus the
+///      sanctioned repo-wide S1/PII scanner as a catch-all. So a configured path,
+///      internal host/IP, or relay location can never leave through the stream.
+/// Only IPs + configured literals + known PII spans are replaced; generic
+/// diagnostic prose is left intact.
+fn redacted_failed_message(e: &ToolError) -> String {
+    let secret_scrubbed = redact_secrets(&e.to_string(), &redaction_set(""));
+    scrub_infra_literals(&secret_scrubbed)
+}
+
+/// One IPv4 dotted-quad matcher (all ranges, not just private) → `<ip>`.
+fn ipv4_regex() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\b(?:\d{1,3}\.){3}\d{1,3}\b").expect("ipv4 regex"))
+}
+
+/// Scrub infrastructure LITERALS from a message (S1) — see [`redacted_failed_message`].
+/// Replaces the emitter-known CONFIGURED values (arbitrary paths/hosts the generic
+/// PII patterns can't know) with `<host>`/`<path>`, every IPv4 with `<ip>`, then
+/// runs the sanctioned repo-wide S1/PII scanner (`github::pii::scan_and_redact`)
+/// as a catch-all for known internal hosts/paths/domains/container-ids.
+fn scrub_infra_literals(input: &str) -> String {
+    let mut out = input.to_string();
+
+    // (a) Configured host / relay-host values → <host> (longest-first, so a value
+    // that is a prefix of another is not partially replaced).
+    let mut hosts = host::configured_addresses();
+    if let Some(relay) = env_nonempty(BUILD_DATASET_RELAY_HOST) {
+        hosts.push(relay);
+    }
+    hosts.retain(|h| !h.is_empty());
+    hosts.sort_by_key(|h| std::cmp::Reverse(h.len()));
+    hosts.dedup();
+    for h in hosts {
+        out = out.replace(&h, "<host>");
+    }
+
+    // (b) Configured dataset/deploy/target path roots → <path> (longest-first).
+    let mut paths: Vec<String> = [
+        BUILD_DATASET_ROOT,
+        BUILD_DATASET_RELAY_ROOT,
+        BUILD_HEAVY_DATASET_ROOT,
+        BUILD_HEAVY_LOCAL_TARGET_DIR,
+        BUILD_LOCAL_TARGET_DIR,
+    ]
+    .iter()
+    .filter_map(|k| env_nonempty(k))
+    .collect();
+    paths.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    paths.dedup();
+    for p in paths {
+        out = out.replace(&p, "<path>");
+    }
+
+    // (c) Any IPv4 literal → <ip>.
+    out = ipv4_regex().replace_all(&out, "<ip>").into_owned();
+
+    // (d) Sanctioned repo-wide S1/PII catch-all (internal hosts/paths/domains/
+    // container-ids/private-IPs the explicit set above didn't cover). Only matched
+    // spans are replaced; generic text is preserved.
+    let (scrubbed, _violations) = crate::github::pii::scan_and_redact(&out);
+    scrubbed
+}
+
+/// A caller-supplied `request_id` is VALID iff it is a safe single segment (no
+/// separators/whitespace/metachars) AND within the hard length bound. This is a
+/// hard validation rule, NOT a clamp: `compiler_build` falls back to an
+/// auto-generated id when it is invalid, and `compiler_progress` rejects it — so
+/// an overlong or malformed id can never be truncated into a colliding key.
+fn is_valid_request_id(s: &str) -> bool {
+    !s.is_empty() && events::request_id_len_ok(s) && validate_segment("request_id", s).is_ok()
+}
+
+impl CompilerBuild {
+    async fn build_inner(&self, request_id: &str, args: Value) -> Result<ToolOutput, ToolError> {
         let module = str_arg(&args, "module")?;
         let git_ref = str_arg(&args, "ref")?;
         let host_req =
@@ -668,10 +986,29 @@ impl RustTool for CompilerBuild {
         validate_segment("profile", &profile)?;
         validate_git_ref(&git_ref)?;
 
+        // BLD-19: the request is accepted → `queued`. A per-build tap streams the
+        // cargo `{step,total}` into the bus during the build (progress bar). The
+        // stream was already ROTATED to a fresh, non-terminal track by the wrapper
+        // (`execute_structured`) before validation — so this `queued` lands on the
+        // fresh track. build_inner does NOT rotate again (single rotation per
+        // attempt), so the `queued → … → published/failed` shape is preserved.
+        let bus = events::bus();
+        bus.emit(
+            request_id,
+            events::Emit::stage(events::Stage::Queued).message(format!("{module}@{git_ref}")),
+        );
+        let tap = events::BuildTap::new(request_id);
+
         // ── Resolve config (fail fast, no side effects) ──────────────────────
         let root = dataset_root()?;
         let root_str = root.to_string_lossy().to_string();
         let resolved = host::resolve(host_req, &module, fast)?;
+        // Host selected → `scheduled` (which role, local vs remote).
+        bus.emit(
+            request_id,
+            events::Emit::stage(events::Stage::Scheduled)
+                .message(resolved.role.as_str().to_string()),
+        );
         let triple = target_triple();
         // `target` (the triple) comes from config but is used as a path segment.
         validate_segment("target", &triple)?;
@@ -690,24 +1027,9 @@ impl RustTool for CompilerBuild {
 
         // Redaction set (S7): the secret VALUES that could be echoed by a child
         // build (a build script printing its env, etc.) and must be scrubbed from
-        // ANY captured stdout/stderr before it reaches an error/log. That is every
-        // secret-shaped value in the sccache env (SCCACHE_REDIS_PASSWORD, …) PLUS
-        // the ambient full `SCCACHE_REDIS` URL (which the child inherits). Passed
-        // to `run()` for both the local and remote build paths.
-        let mut redact: Vec<String> = sccache_env
-            .vars
-            .iter()
-            .filter(|(k, _)| scope::is_secret_env_key(k))
-            .map(|(_, v)| v.clone())
-            .filter(|v| !v.is_empty())
-            .collect();
-        if let Some(url) = sccache::ambient_secret_url() {
-            if !url.is_empty() {
-                redact.push(url);
-            }
-        }
-        redact.sort();
-        redact.dedup();
+        // ANY captured stdout/stderr before it reaches an error/log. Shared with
+        // the failed-event redaction on the wrapper's error path.
+        let redact = redaction_set(&root_str);
 
         // The local source stage (staged on the shared NFS share is fine — it's a
         // source stage, not the live target). Also the rsync source for a remote
@@ -744,6 +1066,9 @@ impl RustTool for CompilerBuild {
                 "CARGO_TARGET_DIR".to_string(),
                 target_dir.to_string_lossy().to_string(),
             );
+            // Force cargo's N/M progress bar on the piped (non-TTY) stdio so the
+            // tap gets live {step,total} updates (BLD-19).
+            inject_cargo_progress_env(&mut build_env);
             // S7: non-secret vars → `--setenv` (argv); secret vars → the INHERITED
             // process environment of systemd-run (which `--scope` passes to the
             // cargo child) — never argv.
@@ -762,6 +1087,7 @@ impl RustTool for CompilerBuild {
                     Duration::from_secs(600),
                     &redact,
                     None,
+                    None,
                 )
                 .await?;
             }
@@ -775,8 +1101,10 @@ impl RustTool for CompilerBuild {
                 &manifest.to_string_lossy(),
             );
             let scope_argv = scope::render_scope_argv(&unit, &resolved.caps, &setenv, &cargo_argv);
+            // Compilation starts → `building`; the tap streams `{step,total}`.
+            bus.emit(request_id, events::Emit::stage(events::Stage::Building));
             // Secret env is delivered via the inherited environment (last arg),
-            // NOT argv.
+            // NOT argv. The build tap streams cargo progress lines live.
             run(
                 &scope_argv,
                 Some(&local_source_dir),
@@ -784,6 +1112,7 @@ impl RustTool for CompilerBuild {
                 Duration::from_secs(MAX_BUILD_TIMEOUT_SECS),
                 &redact,
                 None,
+                Some(&tap),
             )
             .await?;
 
@@ -807,6 +1136,12 @@ impl RustTool for CompilerBuild {
                 git_ref
             );
 
+            // Staging source to the heavy host → `relaying`.
+            bus.emit(
+                request_id,
+                events::Emit::stage(events::Stage::Relaying)
+                    .message(resolved.role.as_str().to_string()),
+            );
             // Stage source to the remote + ensure the remote dirs exist. Every
             // interpolated remote path is shell-quoted (defense-in-depth on top of
             // the segment validation above), and rsync uses `-s`/--protect-args so
@@ -826,6 +1161,7 @@ impl RustTool for CompilerBuild {
                 Duration::from_secs(120),
                 &redact,
                 None,
+                None,
             )
             .await?;
             run(
@@ -842,11 +1178,15 @@ impl RustTool for CompilerBuild {
                 Duration::from_secs(1800),
                 &redact,
                 None,
+                None,
             )
             .await?;
 
             let mut build_env = sccache_env.vars.clone();
             build_env.insert("CARGO_TARGET_DIR".to_string(), remote_target_str.clone());
+            // Force cargo's N/M progress bar on the piped (non-TTY, over-ssh) stdio
+            // so the tap gets live {step,total} updates (BLD-19).
+            inject_cargo_progress_env(&mut build_env);
             let (setenv, secret_env) = scope::partition_env(&build_env);
 
             // Secret env (if any) → a 0600 file ON THE REMOTE, `source`d inside the
@@ -894,6 +1234,7 @@ impl RustTool for CompilerBuild {
                     Duration::from_secs(120),
                     &redact,
                     None,
+                    None,
                 )
                 .await;
                 // Delete the local staging copy immediately (minimize its on-disk
@@ -921,6 +1262,7 @@ impl RustTool for CompilerBuild {
                     Duration::from_secs(600),
                     &redact,
                     None,
+                    None,
                 )
                 .await?;
             }
@@ -946,6 +1288,9 @@ impl RustTool for CompilerBuild {
                 host: host_addr.clone(),
                 unit: unit.clone(),
             };
+            // Remote compilation starts → `building`; the tap streams the remote
+            // cargo `{step,total}` (over ssh stdout/stderr) into the bus live.
+            bus.emit(request_id, events::Emit::stage(events::Stage::Building));
             let build_res = run(
                 &["ssh".into(), host_addr.clone(), remote_cmd],
                 None,
@@ -953,6 +1298,7 @@ impl RustTool for CompilerBuild {
                 Duration::from_secs(3600),
                 &redact,
                 Some(&remote_kill),
+                Some(&tap),
             )
             .await;
             // If the build FAILED/timed out, propagate now — `secret_guard` drops on
@@ -990,6 +1336,7 @@ impl RustTool for CompilerBuild {
                 Duration::from_secs(600),
                 &redact,
                 None,
+                None,
             )
             .await?;
             built_bin = local_bin;
@@ -1000,6 +1347,8 @@ impl RustTool for CompilerBuild {
         // retrieved from the heavy host above), so publish is host-agnostic.
         let channel = publish::DEFAULT_CHANNEL;
         validate_segment("channel", channel)?;
+        // Build done, artifact being checksummed + written → `publishing`.
+        bus.emit(request_id, events::Emit::stage(events::Stage::Publishing));
         let published = if let Some(relay_host) = env_nonempty(BUILD_DATASET_RELAY_HOST) {
             // Interim: relay-publish over a single hop to a host with the dataset RW.
             // The plan bundles BOTH the binary and its `.sha256` sidecar so the
@@ -1030,6 +1379,7 @@ impl RustTool for CompilerBuild {
                 Duration::from_secs(600),
                 &redact,
                 None,
+                None,
             )
             .await;
             let sc_res = if bin_res.is_ok() {
@@ -1039,6 +1389,7 @@ impl RustTool for CompilerBuild {
                     &BTreeMap::new(),
                     Duration::from_secs(120),
                     &redact,
+                    None,
                     None,
                 )
                 .await
@@ -1084,15 +1435,24 @@ impl RustTool for CompilerBuild {
             pruned = bless.pruned;
         }
 
+        // Terminal success for this tool's scope → `published` (with the sha).
+        // (`deployed`/`rolled_back` belong to the downstream updater stage.)
+        bus.emit(
+            request_id,
+            events::Emit::stage(events::Stage::Published).sha(published.sha256.clone()),
+        );
+
         let text = format!(
-            "Built {module}@{git_ref} on {host} ({sccache}); artifact {sha} → {path}{relayed}",
+            "Built {module}@{git_ref} on {host} ({sccache}); artifact {sha} → {path}{relayed} [request_id={rid}]",
             host = resolved.role.as_str(),
             sccache = sccache_env.describe(),
             sha = &published.sha256,
             path = published.artifact_path.display(),
             relayed = if published.relayed { " (relayed)" } else { "" },
+            rid = request_id,
         );
         let structured = json!({
+            "request_id": request_id,
             "module": module,
             "ref": git_ref,
             "host": resolved.role.as_str(),
@@ -1418,6 +1778,124 @@ fn validate_source_dir(
     )))
 }
 
+/// The `compiler_progress` tool (BLD-19): a live progress/events surface keyed by
+/// a build's `request_id`. It returns the current snapshot (stage + `{step,total}`
+/// + timing) and the recent event tail; with `wait_ms > 0` it LONG-POLLS — it
+/// blocks until the next event (or the timeout) and returns a fresh snapshot, so
+/// a GUI/agent can subscribe to a running build without busy-looping. Pair
+/// `since` (the last seen `seq`) with `wait_ms` to stream: each call returns the
+/// events after `since`, and the caller advances `since` to the last `seq`.
+///
+/// Seam with `compiler_status` (BLD-08): status is the point-in-time aggregate
+/// (what is deployed where); this is the live per-request event stream.
+struct CompilerProgress;
+
+/// Default long-poll wait cap (ms) and the hard ceiling, so a caller can't pin a
+/// worker indefinitely. Numeric tuning knobs, not infra literals.
+const PROGRESS_DEFAULT_WAIT_MS: u64 = 0;
+const PROGRESS_MAX_WAIT_MS: u64 = 30_000;
+
+#[async_trait]
+impl RustTool for CompilerProgress {
+    fn name(&self) -> &str {
+        "compiler_progress"
+    }
+
+    fn description(&self) -> &str {
+        "Live build progress/events for a compiler_build request_id: current stage \
+         (queued→scheduled→relaying→building→publishing→published|failed), a \
+         {step,total} progress signal, timing, and the recent (secret-sanitized) \
+         event tail. Pass `since` (last seen seq) to get only new events, and \
+         `wait_ms`>0 to long-poll (block until the next event or the timeout). \
+         Point-in-time deploy state is compiler_status; this is the live stream."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "request_id": {
+                    "type": "string",
+                    "description": "The build request id (returned by compiler_build) to query."
+                },
+                "since": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Return only events with seq greater than this cursor (0 = the whole retained tail)."
+                },
+                "wait_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Long-poll: block up to this many ms for the next event, then return a fresh snapshot. 0 (default) returns immediately. Capped server-side."
+                }
+            },
+            "required": ["request_id"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.execute_structured(args).await?.text)
+    }
+
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let request_id = str_arg(&args, "request_id")?;
+        // Reject a malformed / overlong / whitespace-bearing id at the boundary
+        // with a CLEAR validation error — validated RAW, NO trimming (a lossy trim
+        // could collapse distinct ids like `" x "` and `"x"` onto one stream). A
+        // well-formed unknown id still returns not_found below.
+        if !is_valid_request_id(&request_id) {
+            return Err(ToolError::InvalidArgument(format!(
+                "request_id must be a single [A-Za-z0-9._-] segment of at most {} bytes (no surrounding or inner whitespace)",
+                events::MAX_REQUEST_ID_LEN
+            )));
+        }
+        let since = args.get("since").and_then(Value::as_u64).unwrap_or(0);
+        let wait_ms = args
+            .get("wait_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(PROGRESS_DEFAULT_WAIT_MS)
+            .min(PROGRESS_MAX_WAIT_MS);
+
+        let snapshot = events::bus()
+            .poll(
+                &request_id,
+                since,
+                std::time::Duration::from_millis(wait_ms),
+            )
+            .await;
+
+        match snapshot {
+            Some(snap) => {
+                let text = format!(
+                    "{rid}: {stage}{prog}{term} — {n} new event(s) since seq {since} (last seq {last})",
+                    rid = snap.request_id,
+                    stage = snap.stage.as_str(),
+                    prog = match (snap.step, snap.total) {
+                        (Some(s), Some(t)) => format!(" {s}/{t}"),
+                        _ => String::new(),
+                    },
+                    term = if snap.terminal { " [terminal]" } else { "" },
+                    n = snap.events.len(),
+                    since = since,
+                    last = snap.last_seq,
+                );
+                Ok(ToolOutput::with_structured(text, snap.to_json()))
+            }
+            // Unknown/ swept build → `not_found`, NOT an error (edge case).
+            None => {
+                let text =
+                    format!("{request_id}: not_found (no such build, or its progress has expired)");
+                let structured = json!({
+                    "request_id": request_id,
+                    "status": "not_found",
+                });
+                Ok(ToolOutput::with_structured(text, structured))
+            }
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // BLD-06 — the queue entry point (`compiler_request`) + the scheduler's bridge
 // back into `compiler_build` (`invoke_build`).
@@ -1676,6 +2154,7 @@ pub fn render_queue_status(snapshot: &queue::QueueSnapshot) -> Value {
 ///
 /// Tool ownership (intentional decomposition): BLD-06 owns `compiler_build`
 /// (from BLD-05) + `compiler_request` (the queue door) + the scheduler.
+/// BLD-19 adds `compiler_progress` (the live per-request event stream).
 /// `compiler_status` is a SEPARATE item (BLD-08); it consumes
 /// [`render_queue_status`] over [`queue::QueueStore::snapshot`] rather than being
 /// registered here, so the two items don't collide on the tool name.
@@ -1685,6 +2164,9 @@ pub fn register(registry: &mut ToolRegistry) {
     }
     if let Err(e) = registry.register(Box::new(CompilerRequest)) {
         tracing::error!("compiler: failed to register compiler_request: {e}");
+    }
+    if let Err(e) = registry.register(Box::new(CompilerProgress)) {
+        tracing::error!("compiler: failed to register compiler_progress: {e}");
     }
     if let Err(e) = registry.register(Box::new(CompilerRelease)) {
         tracing::error!("compiler: failed to register compiler_release: {e}");
@@ -2064,6 +2546,7 @@ mod tests {
             Duration::from_secs(30),
             &redact,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -2085,6 +2568,7 @@ mod tests {
             &BTreeMap::new(),
             Duration::from_secs(30),
             &redact,
+            None,
             None,
         )
         .await
@@ -2116,6 +2600,7 @@ mod tests {
             &BTreeMap::new(),
             Duration::from_millis(300),
             &[],
+            None,
             None,
         )
         .await
@@ -2243,6 +2728,7 @@ mod tests {
             Duration::from_secs(30),
             &redact,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -2288,6 +2774,672 @@ mod tests {
         assert_eq!(p["type"], "object");
         assert_eq!(p["required"][0], "module");
         assert_eq!(p["required"][1], "ref");
+    }
+
+    #[test]
+    fn progress_tool_metadata_is_stable() {
+        let t = CompilerProgress;
+        assert_eq!(t.name(), "compiler_progress");
+        let p = t.parameters();
+        assert_eq!(p["type"], "object");
+        assert_eq!(p["required"][0], "request_id");
+    }
+
+    #[tokio::test]
+    async fn progress_tool_reports_lifecycle_and_not_found() {
+        use events::{Emit, Stage};
+        // Drive a build's stages through the GLOBAL bus (unique id → no clash),
+        // then read them back through the tool exactly as a client would.
+        let id = format!("tool-{}", uuid::Uuid::new_v4());
+        let bus = events::bus();
+        bus.emit(&id, Emit::stage(Stage::Queued).message("terminus@abc"));
+        bus.emit(&id, Emit::stage(Stage::Scheduled).message("heavy"));
+        bus.emit(&id, Emit::stage(Stage::Building).progress(3, 12));
+        bus.emit(&id, Emit::stage(Stage::Publishing));
+        bus.emit(&id, Emit::stage(Stage::Published).sha("cafebabe"));
+
+        let tool = CompilerProgress;
+        let out = tool
+            .execute_structured(json!({ "request_id": id, "since": 0 }))
+            .await
+            .unwrap();
+        let s = out.structured.unwrap();
+        assert_eq!(s["request_id"], id);
+        assert_eq!(s["stage"], "published");
+        assert_eq!(s["terminal"], true);
+        assert_eq!(s["step"], 3);
+        assert_eq!(s["total"], 12);
+        // The event tail is present + ordered + terminal carries the sha.
+        let evs = s["events"].as_array().unwrap();
+        assert_eq!(evs.first().unwrap()["stage"], "queued");
+        assert_eq!(evs.last().unwrap()["stage"], "published");
+        assert_eq!(evs.last().unwrap()["sha"], "cafebabe");
+
+        // `since` cursor → only the events after it.
+        let last_seq = s["last_seq"].as_u64().unwrap();
+        let out2 = tool
+            .execute_structured(json!({ "request_id": id, "since": last_seq }))
+            .await
+            .unwrap();
+        assert!(out2.structured.unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        // Unknown build → not_found, never an error.
+        let miss = tool
+            .execute_structured(json!({ "request_id": "no-such-build-xyz" }))
+            .await
+            .unwrap();
+        assert_eq!(miss.structured.unwrap()["status"], "not_found");
+    }
+
+    #[test]
+    fn error_tag_carries_request_id_preserving_variant() {
+        let e = tag_error_with_request_id(
+            ToolError::NotConfigured("BUILD_DATASET_ROOT is not configured".into()),
+            "abc123",
+            false,
+        );
+        // Variant preserved; message prefixed with the discoverable id; no marker.
+        assert!(matches!(e, ToolError::NotConfigured(_)));
+        assert!(e.to_string().contains("[request_id=abc123]"));
+        assert!(!e.to_string().contains("supplied_request_id_invalid"));
+        // With the invalid-supplied flag, the marker is added (id still clean).
+        let e2 = tag_error_with_request_id(ToolError::Execution("boom".into()), "abc123", true);
+        assert!(e2.to_string().contains("[request_id=abc123]"));
+        assert!(e2.to_string().contains("[supplied_request_id_invalid]"));
+    }
+
+    #[test]
+    fn resolve_request_id_valid_absent_and_invalid() {
+        // Valid caller id → used as-is, not a substitution.
+        let (id, inv) = resolve_request_id(&json!({ "request_id": "my-build-1" }));
+        assert_eq!(id, "my-build-1");
+        assert!(!inv);
+        // Absent → auto-generated, NOT flagged (nothing was supplied to invalidate).
+        let (id2, inv2) = resolve_request_id(&json!({}));
+        assert!(is_valid_request_id(&id2) && !inv2);
+        // Present but invalid (separator) → substituted + flagged.
+        let (id3, inv3) = resolve_request_id(&json!({ "request_id": "a/b" }));
+        assert!(is_valid_request_id(&id3) && !id3.contains('/'));
+        assert!(inv3, "invalid supplied id is an observable substitution");
+        // Present but overlong → substituted + flagged.
+        let (id4, inv4) = resolve_request_id(
+            &json!({ "request_id": "z".repeat(events::MAX_REQUEST_ID_LEN + 1) }),
+        );
+        assert!(is_valid_request_id(&id4) && inv4);
+        // WHITESPACE-BEARING ids are INVALID — validated RAW, never trimmed. Both a
+        // surrounding-whitespace and an inner-space id are substituted + flagged,
+        // and the effective id is NOT the trimmed caller value.
+        for bad in [" build-1 ", "build-1 ", " build-1", "a b", "\tbuild-1"] {
+            let (idw, invw) = resolve_request_id(&json!({ "request_id": bad }));
+            assert!(
+                invw,
+                "whitespace-bearing id {bad:?} is an observable substitution"
+            );
+            assert!(is_valid_request_id(&idw), "effective id is valid: {idw:?}");
+            assert_ne!(idw, "build-1", "no silent trim/normalize of {bad:?}");
+        }
+        // A clean id is used VERBATIM (byte-identical).
+        let (idc, invc) = resolve_request_id(&json!({ "request_id": "build-1" }));
+        assert_eq!(idc, "build-1");
+        assert!(!invc);
+    }
+
+    #[test]
+    fn resolve_request_id_present_non_string_is_an_observable_substitution() {
+        // A PRESENT but NON-STRING request_id is INVALID (not treated as absent):
+        // substituted + flagged so the replacement is observable.
+        for v in [
+            json!({ "request_id": 123 }),
+            json!({ "request_id": true }),
+            json!({ "request_id": ["x"] }),
+            json!({ "request_id": { "a": 1 } }),
+        ] {
+            let (id, inv) = resolve_request_id(&v);
+            assert!(
+                inv,
+                "present non-string request_id is an observable substitution: {v}"
+            );
+            assert!(is_valid_request_id(&id), "effective id is valid: {id:?}");
+        }
+        // Explicit null is treated as ABSENT (nothing supplied) → not flagged.
+        let (idn, invn) = resolve_request_id(&json!({ "request_id": null }));
+        assert!(is_valid_request_id(&idn) && !invn);
+        // Truly absent → not flagged.
+        let (_ida, inva) = resolve_request_id(&json!({}));
+        assert!(!inva);
+    }
+
+    /// Process-wide serializer for the rare test that must toggle an env var, so
+    /// parallel tests can never interleave the mutation.
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: set/unset one or more env vars for the test's duration and
+    /// RESTORE every prior value on drop (fixes the earlier flake where a bare
+    /// `remove_var` was never restored). Holds the process-wide env lock so no
+    /// other env-touching test interleaves.
+    struct ScopedEnv {
+        prev: Vec<(&'static str, Option<String>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl ScopedEnv {
+        fn new() -> Self {
+            Self {
+                prev: Vec::new(),
+                _lock: ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner()),
+            }
+        }
+        fn unset(mut self, key: &'static str) -> Self {
+            self.prev.push((key, std::env::var(key).ok()));
+            std::env::remove_var(key);
+            self
+        }
+        fn set(mut self, key: &'static str, val: &str) -> Self {
+            self.prev.push((key, std::env::var(key).ok()));
+            std::env::set_var(key, val);
+            self
+        }
+    }
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            // Restore in reverse so a key touched twice ends at its original value.
+            for (key, prev) in self.prev.iter().rev() {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_build_surfaces_request_id_and_is_discoverable() {
+        // Force a DETERMINISTIC post-`queued` failure with no subprocess: unset the
+        // dataset root so `dataset_root()` returns NotConfigured right after the
+        // build emits `queued`. The scoped guard RESTORES the prior value on drop
+        // and serializes via a process-wide lock, so this cannot flake other tests
+        // (the earlier version left `remove_var` unrestored).
+        let _env = ScopedEnv::new().unset("BUILD_DATASET_ROOT");
+
+        // NO caller-supplied request_id → one is auto-generated and MUST come back.
+        let err = CompilerBuild
+            .execute_structured(json!({ "module": "terminus", "ref": "abc123" }))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        let rid = msg
+            .split("request_id=")
+            .nth(1)
+            .and_then(|s| s.split(']').next())
+            .map(|s| s.trim().to_string())
+            .expect("a failed build's error must carry request_id=<id>");
+        assert!(
+            !rid.is_empty(),
+            "auto-generated request_id surfaced on failure"
+        );
+
+        // The invariant's payoff: compiler_progress(rid) FINDS the failed build's
+        // stream — a terminal `failed` event with the (redacted) error tail.
+        let prog = CompilerProgress
+            .execute_structured(json!({ "request_id": rid }))
+            .await
+            .unwrap();
+        let s = prog.structured.unwrap();
+        assert_eq!(s["request_id"], rid);
+        assert_eq!(s["stage"], "failed");
+        assert_eq!(s["terminal"], true);
+        let evs = s["events"].as_array().unwrap();
+        // queued was emitted before the failure, then the terminal failed event.
+        assert_eq!(evs.first().unwrap()["stage"], "queued");
+        assert_eq!(evs.last().unwrap()["stage"], "failed");
+        assert!(
+            evs.last().unwrap()["message"].is_string(),
+            "failed event carries the (redacted) error tail"
+        );
+    }
+
+    #[test]
+    fn redacted_failed_message_scrubs_secret_from_non_subprocess_error() {
+        // A ToolError NOT from a subprocess (so it never went through run()'s
+        // redaction) that embeds a secret-shaped value: the emitter-boundary
+        // redaction must scrub it before it reaches the bus. Set the ambient
+        // sccache secret so the redaction set contains it (guard restores it). The
+        // token is deliberately NOT email/URL-shaped (keeps the PII self-check
+        // happy) — redaction is a plain substring scrub of the secret value.
+        let secret = "<REDACTED-SECRET>";
+        let _env = ScopedEnv::new().set("SCCACHE_REDIS", secret);
+        let err = ToolError::Execution(format!("cache connect failed with {secret} (timeout)"));
+        let msg = redacted_failed_message(&err);
+        assert!(
+            !msg.contains("TOPSECRETTOKEN"),
+            "secret must be redacted from the failed-event message: {msg}"
+        );
+        assert!(msg.contains("<redacted>"));
+    }
+
+    #[tokio::test]
+    async fn failed_message_scrubs_infra_literals_ip_path_host() {
+        // S1: an error embedding an IP, the configured dataset root path, and a
+        // configured (relay) host must have ALL THREE replaced by placeholders
+        // before the failed event is persisted on the bus / returned by
+        // compiler_progress. Generic diagnostic prose stays intact.
+        let ds_root = "/tmp/bld19-scrub-dataset-root";
+        let relay_host = "internal-buildbox-01";
+        let ip = "<internal-ip>"; // pii-test-fixture — a fake LAN IP for the S1 scrub test
+        let _env = ScopedEnv::new()
+            .set("BUILD_DATASET_ROOT", ds_root)
+            .set("BUILD_DATASET_RELAY_HOST", relay_host);
+
+        let err = ToolError::Execution(format!(
+            "publish to {ds_root}/artifacts failed: ssh {relay_host} ({ip}) connection refused"
+        ));
+        let msg = redacted_failed_message(&err);
+
+        // Raw infra literals are gone; placeholders present; prose preserved.
+        assert!(!msg.contains(ds_root), "dataset path scrubbed: {msg}");
+        assert!(!msg.contains(relay_host), "host scrubbed: {msg}");
+        assert!(!msg.contains(ip), "IP scrubbed: {msg}");
+        assert!(msg.contains("<path>"), "path placeholder: {msg}");
+        assert!(msg.contains("<host>"), "host placeholder: {msg}");
+        assert!(msg.contains("<ip>"), "ip placeholder: {msg}");
+        assert!(
+            msg.contains("publish") && msg.contains("connection refused"),
+            "generic diagnostic text is preserved: {msg}"
+        );
+
+        // Round-trips through the bus AND compiler_progress with the literals gone
+        // — asserted via BOTH the failed Stage event and the structured output.
+        let id = format!("infra-{}", uuid::Uuid::new_v4());
+        events::bus().emit(
+            &id,
+            events::Emit::stage(events::Stage::Failed).message(msg.clone()),
+        );
+        let ev_msg = events::bus()
+            .snapshot(&id, 0)
+            .unwrap()
+            .events
+            .last()
+            .unwrap()
+            .message
+            .clone()
+            .unwrap();
+        assert!(
+            !ev_msg.contains(ds_root) && !ev_msg.contains(relay_host) && !ev_msg.contains(ip),
+            "failed Stage event carries no infra literals: {ev_msg}"
+        );
+        let prog = CompilerProgress
+            .execute_structured(json!({ "request_id": id }))
+            .await
+            .unwrap();
+        let out = prog.structured.unwrap();
+        let out_msg = out["events"].as_array().unwrap().last().unwrap()["message"]
+            .as_str()
+            .unwrap();
+        assert!(
+            !out_msg.contains(ds_root) && !out_msg.contains(relay_host) && !out_msg.contains(ip),
+            "compiler_progress structured output carries no infra literals: {out_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_pipe_keeps_draining_past_invalid_utf8() {
+        // A chatty child emitting NON-UTF-8 bytes must NOT stop the drain (that
+        // would block the child on a full pipe → the build hangs). Feed invalid
+        // bytes BEFORE a valid progress line + a secret tail; assert the drain
+        // reaches EOF (all lines captured, lossily), the tap saw the progress
+        // line, and the secret was redacted.
+        let id = format!("drain-{}", uuid::Uuid::new_v4());
+        let tap = events::BuildTap::new(&id);
+        let redact = vec!["SECRETXYZ".to_string()];
+        // \xff\xfe are invalid UTF-8; read_line would Err here and stop draining.
+        let input: Vec<u8> =
+            b"\xff\xfe garbage\n   Building [==>] 5/9: serde\nleak=SECRETXYZ tail\n".to_vec();
+        let captured = drain_pipe(Some(&input[..]), Some(tap), redact).await;
+        let text = String::from_utf8_lossy(&captured);
+        // Reached EOF past the invalid line: the LATER lines are present.
+        assert!(text.contains("5/9"), "progress line captured: {text:?}");
+        assert!(
+            text.contains("tail"),
+            "post-invalid line captured (no early break)"
+        );
+        // Secret redacted; raw secret never in the capture.
+        assert!(!text.contains("SECRETXYZ"), "secret redacted in capture");
+        assert!(text.contains("<redacted>"));
+        // The tap parsed the progress line into a building {5,9} event.
+        let snap = events::bus()
+            .snapshot(&id, 0)
+            .expect("tap created the track");
+        assert_eq!(snap.stage, events::Stage::Building);
+        assert_eq!((snap.step, snap.total), (Some(5), Some(9)));
+    }
+
+    #[tokio::test]
+    async fn drain_pipe_splits_carriage_return_progress_updates_live() {
+        // Cargo's progress bar updates with CARRIAGE RETURNS (no newline until the
+        // bar finishes). The tap must fire on EACH `\r` so live {step,total}
+        // populates as the build compiles — not buffer until a newline. Feed
+        // CR-separated updates, an embedded newline, and a non-UTF-8 byte.
+        let id = format!("cr-{}", uuid::Uuid::new_v4());
+        let tap = events::BuildTap::new(&id);
+        let redact = vec!["SEKRET".to_string()];
+        // \r-separated progress + a \n + an invalid byte before a final line.
+        let input: Vec<u8> =
+            b"\r   Building [=>   ] 12/34: a\r   Building [==>  ] 20/34: b\r   Building [===> ] 34/34: c\nCompiling done\r\xffleak=SEKRET\n"
+                .to_vec();
+        let captured = drain_pipe(Some(&input[..]), Some(tap), redact).await;
+        let text = String::from_utf8_lossy(&captured);
+
+        // Each CR update reached the tap live; the parser advanced step/total in
+        // order → the ring holds building events for {12,34},{20,34},{34,34}.
+        let snap = events::bus()
+            .snapshot(&id, 0)
+            .expect("tap created the track");
+        let steps: Vec<(Option<u32>, Option<u32>)> = snap
+            .events
+            .iter()
+            .filter(|e| e.stage == events::Stage::Building)
+            .map(|e| (e.step, e.total))
+            .collect();
+        assert!(
+            steps.contains(&(Some(12), Some(34)))
+                && steps.contains(&(Some(20), Some(34)))
+                && steps.contains(&(Some(34), Some(34))),
+            "each CR progress update fired live: {steps:?}"
+        );
+        assert!(
+            steps.len() >= 3,
+            "multiple live building events, not one: {steps:?}"
+        );
+        assert_eq!(snap.step, Some(34), "latest step reflects the final update");
+        assert_eq!(snap.total, Some(34));
+        // Drained past the non-UTF-8 byte to EOF; secret redacted; output captured.
+        assert!(
+            text.contains("Compiling done"),
+            "post-CR newline line captured"
+        );
+        assert!(
+            !text.contains("SEKRET"),
+            "secret redacted in capture: {text:?}"
+        );
+        assert!(text.contains("<redacted>"));
+        assert!(
+            text.contains("12/34") && text.contains("34/34"),
+            "full output captured"
+        );
+    }
+
+    #[test]
+    fn build_env_forces_cargo_nm_progress_on_non_tty() {
+        // Part 1: the build child env forces cargo's N/M progress even non-TTY.
+        let mut env = std::collections::BTreeMap::new();
+        inject_cargo_progress_env(&mut env);
+        assert_eq!(
+            env.get("CARGO_TERM_PROGRESS_WHEN").map(String::as_str),
+            Some("always")
+        );
+        assert!(env.contains_key("CARGO_TERM_PROGRESS_WIDTH"));
+        // These are NON-secret term vars → they go via `--setenv`, not the secret
+        // env-file (so they reach the cargo child on argv, never leak).
+        assert!(!scope::is_secret_env_key("CARGO_TERM_PROGRESS_WHEN"));
+        assert!(!scope::is_secret_env_key("CARGO_TERM_PROGRESS_WIDTH"));
+    }
+
+    #[tokio::test]
+    async fn invalid_caller_request_id_still_surfaces_a_discoverable_id() {
+        // AC-1: an INVALID caller request_id must NOT return early with no id.
+        // The build falls back to an auto-generated id; a subsequent failure still
+        // carries a valid `[request_id=<id>]` and a discoverable failed stream.
+        let _env = ScopedEnv::new().unset("BUILD_DATASET_ROOT"); // deterministic post-queued failure
+        let err = CompilerBuild
+            .execute_structured(json!({
+                "module": "terminus",
+                "ref": "abc123",
+                // Invalid: contains a path separator + is absurdly long.
+                "request_id": format!("bad/id-{}", "z".repeat(events::MAX_REQUEST_ID_LEN + 50)),
+            }))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        let rid = msg
+            .split("request_id=")
+            .nth(1)
+            .and_then(|s| s.split(']').next())
+            .map(|s| s.trim().to_string())
+            .expect("error must carry a surfaced request_id even for an invalid caller id");
+        // The surfaced id is a VALID auto-generated one (not the caller's bad id).
+        assert!(is_valid_request_id(&rid), "surfaced id is valid: {rid:?}");
+        assert!(!rid.contains('/'), "the invalid caller id was not used");
+        // The substitution is OBSERVABLE on the failure path: a marker in the error.
+        assert!(
+            msg.contains("[supplied_request_id_invalid]"),
+            "invalid-supplied-id substitution is signalled: {msg}"
+        );
+        // And the failed stream is discoverable under that id.
+        let prog = CompilerProgress
+            .execute_structured(json!({ "request_id": rid }))
+            .await
+            .unwrap();
+        let s = prog.structured.unwrap();
+        assert_eq!(s["stage"], "failed");
+        assert_eq!(s["terminal"], true);
+    }
+
+    #[tokio::test]
+    async fn valid_supplied_id_is_used_with_no_substitution_marker() {
+        // A VALID supplied id is used as-is: no substitution, no marker on failure.
+        let _env = ScopedEnv::new().unset("BUILD_DATASET_ROOT");
+        let id = format!("caller-{}", uuid::Uuid::new_v4());
+        let err = CompilerBuild
+            .execute_structured(json!({
+                "module": "terminus",
+                "ref": "abc123",
+                "request_id": id,
+            }))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("request_id={id}")),
+            "the caller's valid id is used verbatim: {msg}"
+        );
+        assert!(
+            !msg.contains("supplied_request_id_invalid"),
+            "no substitution marker for a valid id: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn present_non_string_request_id_surfaces_the_substitution_marker() {
+        // End-to-end: a PRESENT non-string request_id is an observable substitution
+        // — the failure error carries a valid effective id AND the marker.
+        let _env = ScopedEnv::new().unset("BUILD_DATASET_ROOT");
+        let err = CompilerBuild
+            .execute_structured(json!({
+                "module": "terminus",
+                "ref": "abc123",
+                "request_id": 123, // non-string → invalid supplied id
+            }))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("[supplied_request_id_invalid]"),
+            "non-string id substitution is signalled: {msg}"
+        );
+        let rid = msg
+            .split("request_id=")
+            .nth(1)
+            .and_then(|s| s.split(']').next())
+            .map(|s| s.trim().to_string())
+            .expect("effective id surfaced");
+        assert!(
+            is_valid_request_id(&rid),
+            "effective auto-gen id is valid: {rid:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compiler_progress_rejects_overlong_id() {
+        // #3: an overlong id is REJECTED at the boundary (clear validation error),
+        // never truncated into a colliding key.
+        let overlong = "z".repeat(events::MAX_REQUEST_ID_LEN + 1);
+        let err = CompilerProgress
+            .execute_structured(json!({ "request_id": overlong }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+        // A malformed (separator) id is likewise rejected, not not_found.
+        let err2 = CompilerProgress
+            .execute_structured(json!({ "request_id": "a/b" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err2, ToolError::InvalidArgument(_)));
+        // WHITESPACE-BEARING ids are rejected RAW (not silently trimmed to a valid
+        // id): surrounding whitespace and inner space both → InvalidArgument.
+        for bad in [" build-1 ", "build-1 ", "a b"] {
+            let e = CompilerProgress
+                .execute_structured(json!({ "request_id": bad }))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(e, ToolError::InvalidArgument(_)),
+                "whitespace-bearing id {bad:?} must be rejected, not trimmed"
+            );
+        }
+    }
+
+    #[test]
+    fn ids_differing_only_in_surrounding_whitespace_never_share_a_track() {
+        // Directly on the bus: the clean id and a whitespace-bearing variant are
+        // DISTINCT keys — verbatim, never normalized — so they never collide. (The
+        // tool boundary rejects/substitutes the whitespace one; this proves the
+        // underlying store keys are byte-exact.)
+        let bus = events::ProgressBus::with_bounds(16, 8, 0);
+        bus.emit("build-1", events::Emit::stage(events::Stage::Queued));
+        bus.emit(
+            " build-1 ",
+            events::Emit::stage(events::Stage::Failed).message("other"),
+        );
+        let clean = bus.snapshot("build-1", 0).unwrap();
+        let spaced = bus.snapshot(" build-1 ", 0).unwrap();
+        assert_eq!(clean.request_id, "build-1");
+        assert_eq!(spaced.request_id, " build-1 ");
+        assert!(!clean.terminal, "clean id keeps its own (queued) stream");
+        assert!(spaced.terminal, "spaced id is a separate (failed) stream");
+        assert_ne!(clean.generation, spaced.generation);
+    }
+
+    #[tokio::test]
+    async fn compiler_build_reusing_a_terminal_id_starts_a_fresh_stream() {
+        // Fix 2 (end-to-end): a prior build A ended terminal `published` under an
+        // id; a NEW compiler_build B reusing that id must ROTATE the stream (via
+        // begin) so compiler_progress reflects B's fresh stream, not A's stale
+        // terminal state.
+        let id = format!("reuse-{}", uuid::Uuid::new_v4());
+        // Simulate build A's terminal published stream on the shared bus.
+        events::bus().emit(&id, events::Emit::stage(events::Stage::Queued));
+        events::bus().emit(
+            &id,
+            events::Emit::stage(events::Stage::Published).sha("oldshaA"),
+        );
+        let a = events::bus().snapshot(&id, 0).unwrap();
+        assert!(a.terminal, "build A is terminal published");
+        let gen_a = a.generation;
+
+        // Build B reuses the id via compiler_build. It fails post-`queued` (no
+        // dataset root), but build_inner's begin() rotates the track first.
+        let _env = ScopedEnv::new().unset("BUILD_DATASET_ROOT");
+        let _ = CompilerBuild
+            .execute_structured(json!({
+                "module": "terminus",
+                "ref": "abc123",
+                "request_id": id,
+            }))
+            .await
+            .unwrap_err();
+
+        // compiler_progress now reflects B's FRESH stream: a new generation, starts
+        // at `queued`, ends `failed`, and carries NONE of A's stale published sha.
+        let prog = CompilerProgress
+            .execute_structured(json!({ "request_id": id }))
+            .await
+            .unwrap();
+        let s = prog.structured.unwrap();
+        assert_ne!(
+            s["generation"].as_u64().unwrap(),
+            gen_a,
+            "reused id started a fresh generation"
+        );
+        assert_eq!(s["stage"], "failed");
+        let evs = s["events"].as_array().unwrap();
+        assert_eq!(
+            evs.first().unwrap()["stage"],
+            "queued",
+            "B's fresh stream starts at queued, not A's published"
+        );
+        assert!(
+            !evs.iter().any(|e| e["sha"] == "oldshaA"),
+            "no stale published sha from build A"
+        );
+    }
+
+    #[tokio::test]
+    async fn reused_terminal_id_pre_acceptance_failure_is_not_masked() {
+        // The rotation now happens in the WRAPPER, before validation — so even a
+        // PRE-ACCEPTANCE failure (invalid module, before build_inner emits
+        // `queued`) on a reused id whose prior build ended TERMINAL is not masked
+        // by the old track: compiler_progress reflects THIS failure, not A's stale
+        // `published`.
+        let id = format!("preacc-{}", uuid::Uuid::new_v4());
+        // Build A → terminal published (simulated on the shared bus).
+        events::bus().emit(&id, events::Emit::stage(events::Stage::Queued));
+        events::bus().emit(
+            &id,
+            events::Emit::stage(events::Stage::Published).sha("oldshaA"),
+        );
+        let a = events::bus().snapshot(&id, 0).unwrap();
+        assert!(a.terminal, "build A is terminal published");
+        let gen_a = a.generation;
+
+        // Build B reuses the id but FAILS VALIDATION before acceptance: an invalid
+        // `module` (path separator) → validate_segment rejects it inside
+        // build_inner, BEFORE `queued`. The wrapper already rotated the track.
+        let err = CompilerBuild
+            .execute_structured(json!({
+                "module": "bad/module",
+                "ref": "abc123",
+                "request_id": id,
+            }))
+            .await
+            .unwrap_err();
+        // The id is still surfaced on this pre-acceptance failure.
+        assert!(
+            err.to_string().contains(&format!("request_id={id}")),
+            "request_id surfaced: {err}"
+        );
+
+        // compiler_progress reflects B's FRESH terminal failure, not A's state.
+        let prog = CompilerProgress
+            .execute_structured(json!({ "request_id": id }))
+            .await
+            .unwrap();
+        let s = prog.structured.unwrap();
+        assert_ne!(
+            s["generation"].as_u64().unwrap(),
+            gen_a,
+            "reused id started a fresh generation before validation"
+        );
+        assert_eq!(s["stage"], "failed", "B's own failure, not A's published");
+        let evs = s["events"].as_array().unwrap();
+        // Pre-acceptance failure → terminal-only failed (no synthesized queued).
+        assert_eq!(evs.len(), 1, "terminal-only failed track: {evs:?}");
+        assert_eq!(evs[0]["stage"], "failed");
+        assert!(
+            !evs.iter().any(|e| e["sha"] == "oldshaA"),
+            "no stale published sha from build A"
+        );
     }
 
     #[test]
