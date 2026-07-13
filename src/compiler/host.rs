@@ -97,20 +97,41 @@ fn env_nonempty(key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Parse an OPTIONAL numeric (u64) config value: absent/empty ⇒ `Ok(None)`; a
+/// PRESENT-but-unparsable value is a HARD ERROR naming the var + the bad value —
+/// never silently dropped (which would silently change host selection). Pure over
+/// `raw` so it is unit-testable without mutating the process environment.
+fn parse_u64_config(key: &str, raw: Option<String>) -> Result<Option<u64>, ToolError> {
+    match raw {
+        None => Ok(None),
+        Some(v) => match v.trim().parse::<u64>() {
+            Ok(n) => Ok(Some(n)),
+            Err(_) => Err(ToolError::InvalidArgument(format!(
+                "{key}={v:?} is not a valid u64 (MB)"
+            ))),
+        },
+    }
+}
+
 /// The heavy-selection threshold (`BUILD_HEAVY_THRESHOLD_MB`, MB of peak build
-/// RSS) from config, with NO hardcoded default (S1): unset ⇒ `None`. The caller
+/// RSS) from config, with NO hardcoded default (S1): absent ⇒ `Ok(None)`. A
+/// present-but-unparsable value is an ERROR (never silently ignored). The caller
 /// only requires it when it would actually change the decision (an `auto`,
 /// non-`fast` build of a module with a KNOWN peak); see [`resolve`].
-pub fn heavy_threshold_mb() -> Option<u64> {
-    env_nonempty("BUILD_HEAVY_THRESHOLD_MB").and_then(|v| v.parse().ok())
+pub fn heavy_threshold_mb() -> Result<Option<u64>, ToolError> {
+    let key = "BUILD_HEAVY_THRESHOLD_MB";
+    parse_u64_config(key, env_nonempty(key))
 }
 
 /// A module's known peak build RSS in MB, from `BUILD_MODULE_PEAK_MB_<MODULE>`
-/// (module upper-cased, non-alphanumerics → `_`). `None` when unset (⇒ the
-/// heuristic treats it as "fits the primary" unless `fast`).
-pub fn module_peak_mb(module: &str) -> Option<u64> {
+/// (module upper-cased, non-alphanumerics → `_`). Absent ⇒ `Ok(None)` (⇒ the
+/// heuristic treats it as "fits the primary" unless `fast`); a present-but-
+/// unparsable value is an ERROR naming the var, so a typo can't silently flip
+/// host selection.
+pub fn module_peak_mb(module: &str) -> Result<Option<u64>, ToolError> {
     let key = format!("BUILD_MODULE_PEAK_MB_{}", env_key_fragment(module));
-    env_nonempty(&key).and_then(|v| v.parse().ok())
+    let raw = env_nonempty(&key);
+    parse_u64_config(&key, raw)
 }
 
 fn env_key_fragment(s: &str) -> String {
@@ -215,14 +236,17 @@ pub fn caps_for(role: HostRole) -> Result<ScopeCaps, ToolError> {
 /// heavy host always resolves an address (`BUILD_HOST_HEAVY`) — it's a remote
 /// hop — and it is an error for `Heavy` to be selected without that address.
 pub fn resolve(request: HostRequest, module: &str, fast: bool) -> Result<ResolvedHost, ToolError> {
-    let peak = module_peak_mb(module);
+    // A present-but-unparsable peak is a hard error (never silently ignored).
+    let peak = module_peak_mb(module)?;
     // The threshold is only consulted for an `auto`, non-`fast` build of a module
     // whose peak IS known — require it (NotConfigured) only then, so it stays a
     // config value with no baked-in default (S1) without forcing every build to
     // set it. `u64::MAX` is passed when it will not be consulted.
     let needs_threshold = matches!(request, HostRequest::Auto) && !fast && peak.is_some();
     let threshold = if needs_threshold {
-        heavy_threshold_mb().ok_or_else(|| {
+        // A present-but-unparsable threshold errors via `?`; an ABSENT one hits
+        // the NotConfigured below (it's required precisely here).
+        heavy_threshold_mb()?.ok_or_else(|| {
             ToolError::NotConfigured(
                 "BUILD_HEAVY_THRESHOLD_MB is not configured (required to size an \
                  auto build of a module with a known peak)"
@@ -309,6 +333,46 @@ mod tests {
     fn env_key_fragment_uppercases_and_replaces() {
         assert_eq!(env_key_fragment("lumina-core"), "LUMINA_CORE");
         assert_eq!(env_key_fragment("Chord"), "CHORD");
+    }
+
+    #[test]
+    fn parse_u64_config_fails_loud_on_garbage() {
+        // Absent ⇒ None (→ primary unless fast).
+        assert_eq!(
+            parse_u64_config("BUILD_MODULE_PEAK_MB_CHORD", None).unwrap(),
+            None
+        );
+        // Valid ⇒ Some.
+        assert_eq!(
+            parse_u64_config("BUILD_MODULE_PEAK_MB_CHORD", Some("24000".to_string())).unwrap(),
+            Some(24_000)
+        );
+        assert_eq!(
+            parse_u64_config("k", Some("  42 ".to_string())).unwrap(),
+            Some(42)
+        );
+        // Present-but-unparsable ⇒ ERROR naming the var + the bad value (never a
+        // silent None that would flip host selection).
+        match parse_u64_config("BUILD_MODULE_PEAK_MB_CHORD", Some("notanum".to_string())) {
+            Err(ToolError::InvalidArgument(m)) => {
+                assert!(
+                    m.contains("BUILD_MODULE_PEAK_MB_CHORD"),
+                    "names the var: {m}"
+                );
+                assert!(m.contains("notanum"), "names the bad value: {m}");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn module_peak_mb_absent_is_none() {
+        // A module with no configured peak var yields Ok(None) — the env var name
+        // is deliberately unlikely to be set in the test environment.
+        assert_eq!(
+            module_peak_mb("a-module-with-no-configured-peak-xyz").unwrap(),
+            None
+        );
     }
 
     #[test]
