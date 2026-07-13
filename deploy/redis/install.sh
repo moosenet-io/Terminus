@@ -27,25 +27,85 @@ set -euo pipefail
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── Bind-address allowlist (BLD-20 review fix) ────────────────────────────────
-# ALLOWLIST, not denylist: a bind address is accepted ONLY if it is a loopback
-# address or a private (non-routable) address — loopback, RFC1918 IPv4, IPv4
-# link-local, IPv6 ULA (fc00::/7), or IPv6 link-local (fe80::/10). ANYTHING else
-# — every publicly-routable / unknown address — is REJECTED before the service
-# is enabled, so "Redis is never publicly bound" holds even if a config drifts.
-# No infra literal is encoded here — these are universal private ranges, exactly
-# like `127.0.0.1` is universal loopback.
+# ALLOWLIST, not denylist, and a STRICT IP-LITERAL parse — never a glob prefix
+# match (which would wrongly accept `10.example.com` or malformed strings). Each
+# bind token must PARSE as a valid IPv4 or IPv6 literal AND classify as private:
+# loopback, RFC1918 IPv4, IPv4 link-local (169.254/16), IPv6 ULA (fc00::/7), or
+# IPv6 link-local (fe80::/10). A hostname, a public address, or anything that is
+# not a parseable IP literal is REJECTED — so "Redis is never publicly bound"
+# holds even if config drifts. No infra literal is encoded here (these are
+# universal private ranges, exactly like `127.0.0.1` is universal loopback).
+
+# Strict dotted-quad IPv4 literal: exactly 4 numeric octets, each 0-255, no
+# leading zeros, no host labels, no trailing junk.
+_is_ipv4_literal() {
+  local ip="$1"
+  [[ "${ip}" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+  local IFS=. o
+  local -a oct
+  read -ra oct <<< "${ip}"
+  for o in "${oct[@]}"; do
+    [[ ${#o} -gt 1 && ${o:0:1} == 0 ]] && return 1   # reject leading zeros (010)
+    (( 10#$o <= 255 )) || return 1
+  done
+  return 0
+}
+
+# Classify a validated IPv4 literal as private (loopback/RFC1918/link-local).
+_ipv4_is_private() {
+  local IFS=. a b
+  local -a oct
+  read -ra oct <<< "$1"
+  a=${oct[0]}; b=${oct[1]}
+  (( 10#$a == 127 )) && return 0                       # loopback 127/8
+  (( 10#$a == 10 )) && return 0                        # RFC1918 10/8
+  (( 10#$a == 192 && 10#$b == 168 )) && return 0       # RFC1918 192.168/16
+  (( 10#$a == 172 && 10#$b >= 16 && 10#$b <= 31 )) && return 0  # RFC1918 172.16/12
+  (( 10#$a == 169 && 10#$b == 254 )) && return 0       # IPv4 link-local 169.254/16
+  return 1
+}
+
+# Strict-ish IPv6 literal: only hex + colons, ≥1 colon, at most one '::', each
+# group 1-4 hex digits, ≤8 groups (exactly 8 when there is no '::'). Rejects
+# v4-mapped/dotted forms (a bind literal never needs them) and any non-IP string.
+_is_ipv6_literal() {
+  local ip="${1,,}"
+  [[ "${ip}" =~ ^[0-9a-f:]+$ ]] || return 1
+  [[ "${ip}" == *:* ]] || return 1
+  local tmp="${ip}" doubles=0
+  while [[ "${tmp}" == *"::"* ]]; do doubles=$((doubles + 1)); tmp=${tmp/::/:}; done
+  (( doubles <= 1 )) || return 1
+  local IFS=: grp nonempty=0
+  local -a groups
+  read -ra groups <<< "${ip}"
+  for grp in "${groups[@]}"; do
+    [[ -z "${grp}" ]] && continue
+    [[ "${grp}" =~ ^[0-9a-f]{1,4}$ ]] || return 1
+    nonempty=$((nonempty + 1))
+  done
+  (( nonempty <= 8 )) || return 1
+  if (( doubles == 0 )); then (( nonempty == 8 )) || return 1; fi
+  return 0
+}
+
+# Classify a validated IPv6 literal as private (loopback/ULA/link-local).
+_ipv6_is_private() {
+  local ip="${1,,}"
+  [[ "${ip}" == "::1" ]] && return 0                   # loopback
+  local first
+  if [[ "${ip}" == ::* ]]; then first=0; else first=${ip%%:*}; fi
+  [[ "${first}" =~ ^[0-9a-f]{1,4}$ ]] || return 1
+  local n=$((16#${first}))
+  (( n >= 0xfc00 && n <= 0xfdff )) && return 0          # ULA fc00::/7
+  (( n >= 0xfe80 && n <= 0xfebf )) && return 0          # link-local fe80::/10
+  return 1
+}
+
 is_allowed_bind_addr() {
-  local a="${1,,}"  # lower-case for IPv6 hex
-  case "${a}" in
-    127.*|::1|::ffff:127.*)                  return 0 ;;  # IPv4/IPv6 loopback
-    10.*)                                    return 0 ;;  # RFC1918 10/8
-    192.168.*)                               return 0 ;;  # RFC1918 192.168/16
-    172.1[6-9].*|172.2[0-9].*|172.3[0-1].*)  return 0 ;;  # RFC1918 172.16/12
-    169.254.*)                               return 0 ;;  # IPv4 link-local
-    fc[0-9a-f][0-9a-f]:*|fd[0-9a-f][0-9a-f]:*|fc[0-9a-f]:*|fd[0-9a-f]:*) return 0 ;;  # IPv6 ULA fc00::/7
-    fe8[0-9a-f]:*|fe9[0-9a-f]:*|fea[0-9a-f]:*|feb[0-9a-f]:*)             return 0 ;;  # IPv6 link-local fe80::/10
-    *)                                       return 1 ;;  # anything routable/unknown → reject
-  esac
+  local a="${1,,}"
+  if _is_ipv4_literal "${a}"; then _ipv4_is_private "${a}"; return $?; fi
+  if _is_ipv6_literal "${a}"; then _ipv6_is_private "${a}"; return $?; fi
+  return 1   # not a parseable IP literal (hostname/garbage) → reject
 }
 
 # Self-test hook: `REDIS_INSTALL_SELFTEST=1 bash install.sh` asserts the
@@ -58,8 +118,19 @@ if [[ "${REDIS_INSTALL_SELFTEST:-0}" == "1" ]]; then
   # RFC1918/ULA/link-local sample addresses, the "rejected" set uses RFC5737
   # (192.0.2/198.51.100/203.0.113) + RFC3849 (2001:db8::/32) documentation
   # ranges. Tagged so the PII gate exempts these deliberate literals.
-  allowed_cases=(127.0.0.1 ::1 <internal-ip> <internal-ip> <internal-ip> <internal-ip> 169.254.1.1 fd12:3456::1 fe80::1) # pii-test-fixture
-  rejected_cases=(0.0.0.0 :: '*' 203.0.113.7 198.51.100.9 192.0.2.5 172.32.0.1 172.15.0.1 2001:db8::1 example.com) # pii-test-fixture
+  allowed_cases=(127.0.0.1 ::1 <internal-ip> <internal-ip> <internal-ip> <internal-ip> 169.254.1.1 fc00::1 fd12:3456::1 fe80::1) # pii-test-fixture
+  # Rejections: public (RFC5737/RFC3849 docs), all-interfaces, RFC1918 boundary
+  # misses, AND — the point of the strict parse — hostnames and malformed
+  # literals that a glob prefix-match would have wrongly accepted.
+  rejected_cases=(
+    0.0.0.0 :: '*'                                   # all-interfaces / unspecified
+    203.0.113.7 198.51.100.9 192.0.2.5 2001:db8::1   # public documentation ranges
+    172.32.0.1 172.15.0.1 fec0::1                    # just outside RFC1918 / not ULA-or-LL
+    10.example.com 192.168.0.example example.com hostname  # hostnames (glob would accept 1st/2nd)
+    <internal-ip> 256.1.1.1 10.0.0 <internal-ip>.5 <internal-ip> # malformed IPv4
+    '<internal-ip> ' ' <internal-ip>' 10..0.1 ''               # whitespace / empty / empty octet
+    'fe80::z' 'fizz::1' '12345::1' 'gggg::'          # malformed IPv6
+  ) # pii-test-fixture
   for ok in "${allowed_cases[@]}"; do
     if ! is_allowed_bind_addr "${ok}"; then echo "SELFTEST FAIL: '${ok}' should be allowed"; fail=1; fi
   done
