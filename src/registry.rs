@@ -121,6 +121,7 @@ pub struct ToolInfo {
 pub fn register_all(registry: &mut ToolRegistry) {
     crate::ansible::register(registry);
     crate::approval::register(registry);
+    crate::compiler::register(registry); // BLD-05: compiler_build (single build door)
     crate::cortex::register(registry);
     crate::council::register(registry);
     crate::crucible::register(registry);

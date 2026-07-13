@@ -15,6 +15,7 @@ pub mod commute;
 /// references (the S84 assistant-sweep prompt/conversation types), so the
 /// crate builds standalone with no `lumina-core` dependency (see `compat`).
 pub mod compat;
+pub mod compiler; // BLD-05: compiler_build — the single build door (S117 CI/CD)
 pub mod config;
 /// CONST-02: the constellation aggregation API layer (`/api/*`, `/ws`, and
 /// the `constellation-web` static-asset host) -- a compiled-in module of

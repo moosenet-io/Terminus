@@ -208,6 +208,11 @@ redis = { version = "0.24", default-features = false, features = ["tokio-comp", 
 # builds sharing one Redis never fragment the cache (unlike std DefaultHasher).
 # Already in the tree (redis uses it for EVALSHA), so no new build cost.
 sha1_smol = "1"
+# BLD-05: SHA-256 of published build artifacts (the `.sha256` sidecar the
+# constellation-updater verifies before an atomic-mv swap). A pure-Rust digest
+# so the artifact checksum is computed in-process (testable offline) rather than
+# shelling out to `sha256sum`.
+sha2 = "0.10"
 # TCLI-03: mTLS listener (`src/pki/mtls.rs`) needs to parse the peer leaf
 # cert's Extended Key Usage + validity window at runtime (post-handshake,
 # fail-closed EKU/expiry check independent of rustls's own chain
