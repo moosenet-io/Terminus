@@ -554,6 +554,39 @@ impl LeaseInner {
         self.fully_released()
     }
 
+    /// Activate MINT (in-process) if not yet confirmed active; mark active ONLY on a
+    /// successful activate (never falsely). Used by the remote-recovery window to keep
+    /// MINT active promptly while the Chord late-idle override loop runs.
+    async fn try_activate_mint(&self) {
+        if !self.mint_active.load(Ordering::SeqCst)
+            && with_op_timeout(self.op_timeout, "MINT activate", self.backend.mint_activate())
+                .await
+                .is_ok()
+        {
+            self.mint_active.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The ONE persistent "until confirmed active" reactivation loop, shared by BOTH the
+    /// release-exhaustion backstop AND the abort/idle-timeout/remote-recovery backstop.
+    /// Retries [`try_activate_pending`] (which marks a service active ONLY on a real
+    /// success — NEVER on a failed/timed-out activate) with `persistent_backoff` between
+    /// rounds, NEVER giving up, until BOTH in-lease services are confirmed active — then
+    /// stops. An out-of-lease Chord starts already-"active", so it is skipped entirely.
+    async fn persistent_reactivate_loop(&self) {
+        loop {
+            {
+                let _seq = self.release_lock.lock().await;
+                if self.try_activate_pending().await {
+                    info!("idle lease: reactivation backstop confirmed all in-lease services active — stopping");
+                    return;
+                }
+            }
+            warn!("idle lease: a service is STILL idle — reactivation backstop will retry (never gives up)");
+            tokio::time::sleep(self.persistent_backoff).await;
+        }
+    }
+
     /// Reactivate both services, retrying any that fail with bounded backoff so a
     /// transient partial failure self-heals instead of leaving a service stuck idle.
     /// Idempotent + re-entrant: a service already confirmed active is never touched
@@ -629,37 +662,34 @@ impl LeaseInner {
         }
         let this = self.clone();
         tokio::spawn(async move {
-            loop {
-                {
-                    let _seq = this.release_lock.lock().await;
-                    if this.try_activate_pending().await {
-                        info!("idle lease: persistent backstop reactivated all services — stopping");
-                        break;
-                    }
-                }
-                warn!("idle lease: a service is STILL idle — persistent reactivation backstop will retry (never gives up)");
-                tokio::time::sleep(this.persistent_backoff).await;
-            }
+            this.persistent_reactivate_loop().await;
             this.persistent_running.store(false, Ordering::SeqCst);
         });
     }
 
-    /// DURABLE remote-idle-recovery backstop for an idle-TIMEOUT/failure abort. A
-    /// client-side `chord_idle` timeout does NOT stop the REMOTE server — a late `/idle`
-    /// can land AFTER the abort's `/activate`, leaving Chord stuck idle. A single activate
-    /// cannot defend against that, so this spawns a task that, for `remote_recovery_window`
-    /// (which safely exceeds Chord's max idle-processing time), keeps Chord ACTIVE: each
-    /// round it checks Chord's actual state via [`IdleBackend::chord_is_idle`] and
-    /// re-activates whenever Chord is observed idle (or the status is unknown — re-activate
-    /// defensively). MINT is in-process (no remote race) and only needs one activate. After
-    /// the window a late idle can no longer arrive, so a final confirming activate stops it.
-    /// At most one backstop runs at a time (shares the `persistent_running` slot). Requires
-    /// an ambient runtime (the abort path is always async / in a runtime).
+    /// DURABLE remote-idle-recovery backstop for an idle-TIMEOUT/failure abort, wrapping
+    /// the SAME persistent "until confirmed active" guarantee ([`persistent_reactivate_loop`])
+    /// the release path uses, with a Chord late-idle OVERRIDE window in front of it.
+    ///
+    /// A client-side `chord_idle` timeout does NOT stop the REMOTE server — a late `/idle`
+    /// can land AFTER the abort's `/activate`, leaving Chord stuck idle. So (only when Chord
+    /// is in the lease) it first runs a bounded window (`remote_recovery_window`, which
+    /// safely exceeds Chord's max idle-processing time): each round it checks Chord's actual
+    /// state via [`IdleBackend::chord_is_idle`] and re-activates whenever Chord is observed
+    /// idle (or unknown), OVERRIDING any late-landing idle — WITHOUT marking `chord_active`
+    /// (a later late idle could still arrive within the window). It also activates MINT
+    /// promptly. Then — window done (a late idle can no longer arrive) OR out-of-lease Chord
+    /// — it hands off to [`persistent_reactivate_loop`], which confirms BOTH in-lease
+    /// services ACTIVE, marking a service active ONLY on a real success (NEVER falsely on a
+    /// failed/timed-out activate) and NEVER giving up until confirmed.
     ///
     /// **Chord-out-of-lease invariant:** when Chord was NOT part of the lease
-    /// (`chord_in_lease == false`, MINT-only mode), Chord is NEVER queried or activated —
-    /// there is no remote Chord to race, so the backstop only ensures MINT is active and
-    /// makes ZERO `chord_is_idle`/`chord_activate` calls.
+    /// (`chord_in_lease == false`, MINT-only mode), the override window is SKIPPED and the
+    /// persistent loop skips an already-"active" out-of-lease Chord — so ZERO
+    /// `chord_is_idle`/`chord_activate` calls are made; only MINT is (persistently) ensured.
+    ///
+    /// At most one backstop runs at a time (shares the `persistent_running` slot). Requires
+    /// an ambient runtime (the abort path is always async / in a runtime).
     fn spawn_remote_recovery_backstop(self: &Arc<Self>) {
         if self.persistent_running.swap(true, Ordering::SeqCst) {
             return; // a backstop is already running; it covers reactivation
@@ -671,84 +701,44 @@ impl LeaseInner {
         }
         let this = self.clone();
         tokio::spawn(async move {
-            // MINT-only (Chord out of lease): no remote race — never touch Chord. Just
-            // ensure MINT (in-process) is active; no windowed recovery loop is needed.
-            if !this.chord_in_lease {
-                {
-                    let _seq = this.release_lock.lock().await;
-                    if !this.mint_active.load(Ordering::SeqCst)
-                        && with_op_timeout(
-                            this.op_timeout,
-                            "MINT activate (remote recovery)",
-                            this.backend.mint_activate(),
-                        )
-                        .await
-                        .is_ok()
+            // Phase 1 — Chord late-idle OVERRIDE window (in-lease Chord only). Re-activate
+            // Chord whenever observed idle/unknown to override a late-landing /idle, WITHOUT
+            // marking chord_active (never falsely; a later late idle could still arrive).
+            if this.chord_in_lease {
+                let deadline = tokio::time::Instant::now() + this.remote_recovery_window;
+                loop {
                     {
-                        this.mint_active.store(true, Ordering::SeqCst);
+                        let _seq = this.release_lock.lock().await;
+                        let chord_idle_now = match this.backend.chord_is_idle().await {
+                            Ok(Some(idle)) => idle,
+                            Ok(None) | Err(_) => true, // unknown ⇒ override defensively
+                        };
+                        if chord_idle_now {
+                            // best-effort override; do NOT mark active (F1: never falsely).
+                            let _ = with_op_timeout(
+                                this.op_timeout,
+                                "Chord activate (remote-idle override)",
+                                this.backend.chord_activate(),
+                            )
+                            .await;
+                        }
+                        // MINT (in-process): activate promptly (mark only on success).
+                        this.try_activate_mint().await;
                     }
-                }
-                this.persistent_running.store(false, Ordering::SeqCst);
-                info!("idle lease: remote-idle-recovery backstop — MINT-only (Chord out of lease); no Chord recovery");
-                return;
-            }
-            let deadline = tokio::time::Instant::now() + this.remote_recovery_window;
-            loop {
-                {
-                    let _seq = this.release_lock.lock().await;
-                    // CHORD (remote): re-activate whenever observed idle, or defensively
-                    // when its state is unknown/unqueryable — overriding any late idle.
-                    let chord_idle_now = match this.backend.chord_is_idle().await {
-                        Ok(Some(idle)) => idle,
-                        Ok(None) | Err(_) => true, // unknown ⇒ re-activate defensively
-                    };
-                    if chord_idle_now {
-                        let _ = with_op_timeout(
-                            this.op_timeout,
-                            "Chord activate (remote recovery)",
-                            this.backend.chord_activate(),
-                        )
-                        .await;
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
                     }
-                    // MINT (in-process, no remote race): activate once if not yet active.
-                    if !this.mint_active.load(Ordering::SeqCst)
-                        && with_op_timeout(
-                            this.op_timeout,
-                            "MINT activate (remote recovery)",
-                            this.backend.mint_activate(),
-                        )
-                        .await
-                        .is_ok()
-                    {
-                        this.mint_active.store(true, Ordering::SeqCst);
-                    }
+                    tokio::time::sleep(this.remote_recovery_poll).await;
                 }
-                if tokio::time::Instant::now() >= deadline {
-                    break;
-                }
-                tokio::time::sleep(this.remote_recovery_poll).await;
             }
-            // After the window a late idle can no longer arrive. If Chord is STILL observed
-            // idle (or its state is unknown), one final confirming activate; then mark Chord
-            // active and release the backstop slot.
-            {
-                let _seq = this.release_lock.lock().await;
-                let chord_idle_final = match this.backend.chord_is_idle().await {
-                    Ok(Some(idle)) => idle,
-                    Ok(None) | Err(_) => true, // unknown ⇒ activate defensively
-                };
-                if chord_idle_final {
-                    let _ = with_op_timeout(
-                        this.op_timeout,
-                        "Chord activate (remote recovery final)",
-                        this.backend.chord_activate(),
-                    )
-                    .await;
-                }
-                this.chord_active.store(true, Ordering::SeqCst);
-            }
+            // Phase 2 — the SAME persistent "until confirmed active" guarantee used on the
+            // release path. Confirms every in-lease service ACTIVE (a late idle can no
+            // longer arrive post-window), marking active ONLY on a real success, never
+            // giving up. An out-of-lease Chord starts already-"active" ⇒ skipped (ZERO
+            // chord calls in MINT-only mode).
+            this.persistent_reactivate_loop().await;
             this.persistent_running.store(false, Ordering::SeqCst);
-            info!("idle lease: remote-idle-recovery backstop completed — Chord confirmed active");
+            info!("idle lease: remote-idle-recovery backstop completed — all in-lease services confirmed active");
         });
     }
 }
@@ -1350,6 +1340,9 @@ mod tests {
         /// Count of `chord_is_idle` STATUS queries — proves an out-of-lease Chord is never
         /// even status-queried by the remote-recovery backstop (MINT-only mode).
         chord_is_idle_calls: AtomicUsize,
+        /// The next N `mint_activate` calls fail (transient); after that, succeed. Proves
+        /// MINT reactivation on the abort path is PERSISTENT (retried, not one-shot).
+        mint_activate_fail_times: AtomicUsize,
     }
 
     impl MockBackend {
@@ -1373,6 +1366,7 @@ mod tests {
                 mint_is_idle: Arc::new(AtomicBool::new(false)),
                 chord_idle_delayed_side_effect_ms: AtomicU64::new(0),
                 chord_is_idle_calls: AtomicUsize::new(0),
+                mint_activate_fail_times: AtomicUsize::new(0),
             })
         }
         fn with_mint_idle_delay_ms(self: Arc<Self>, ms: u64) -> Arc<Self> {
@@ -1407,6 +1401,10 @@ mod tests {
         }
         fn with_chord_activate_fails(self: Arc<Self>, n: usize) -> Arc<Self> {
             self.chord_activate_fail_times.store(n, Ordering::SeqCst);
+            self
+        }
+        fn with_mint_activate_fails(self: Arc<Self>, n: usize) -> Arc<Self> {
+            self.mint_activate_fail_times.store(n, Ordering::SeqCst);
             self
         }
         fn with_chord_activate_hangs(self: Arc<Self>, n: usize) -> Arc<Self> {
@@ -1480,6 +1478,10 @@ mod tests {
             }
         }
         async fn mint_activate(&self) -> Result<(), String> {
+            if self.mint_activate_fail_times.load(Ordering::SeqCst) > 0 {
+                self.mint_activate_fail_times.fetch_sub(1, Ordering::SeqCst);
+                return Err("mint activate transient failure".into());
+            }
             self.mint_activates.fetch_add(1, Ordering::SeqCst);
             self.mint_is_idle.store(false, Ordering::SeqCst); // reactivated
             Ok(())
@@ -1852,6 +1854,83 @@ mod tests {
         assert_eq!(be.chord_activates.load(Ordering::SeqCst), 0, "out-of-lease Chord never activated");
         // MINT is handled (not stuck idle).
         assert!(!be.is_stuck_idle(), "no service left stuck idle (MINT handled)");
+    }
+
+    #[tokio::test]
+    async fn remote_recovery_failed_final_activate_does_not_mark_chord_active_and_keeps_retrying() {
+        // FINDING 1: on the abort/remote-recovery path, Chord must NEVER be marked active
+        // on a FAILED activate. Chord goes idle (server, late) and chord_activate FAILS
+        // more than the bounded attempts, then succeeds → the persistent backstop keeps
+        // retrying (never gives up) and Chord ends CONFIRMED active — never falsely marked.
+        let fails = RELEASE_MAX_ATTEMPTS as usize + 5; // more than any window can consume
+        let be = MockBackend::new(None, None)
+            .with_mem(vec![200.0])
+            .with_chord_idle_delayed_side_effect_ms(10) // Chord goes idle LATE (server side)
+            .with_chord_activate_fails(fails);
+        let mut c = cfg(5, 3600);
+        c.op_timeout = Duration::from_millis(20);
+        c.remote_recovery_window = Duration::from_millis(1); // short: fails spill into persistent
+        c.remote_recovery_poll = Duration::from_millis(1);
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            acquire_lease(be.clone(), &c, true, 120.0),
+        )
+        .await
+        .expect("acquire returned (did not hang)")
+        .expect_err("idle timeout ⇒ IdleFailed abort");
+        assert!(matches!(err, LeaseError::IdleFailed { .. }), "got {err:?}");
+        // The persistent backstop retries past ALL the failures and confirms Chord active.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // If Chord had been FALSELY marked active on a failed activate, the loop would have
+        // stopped early — leaving Chord idle and forced failures unconsumed. These prove it
+        // did not: Chord ended active, and every failure was consumed by a real retry.
+        assert!(!be.chord_is_idle.load(Ordering::SeqCst), "Chord ended CONFIRMED active (not stranded)");
+        assert_eq!(
+            be.chord_activate_fail_times.load(Ordering::SeqCst),
+            0,
+            "all forced failures consumed — never marked active on failure, never gave up"
+        );
+        assert!(
+            be.chord_activates.load(Ordering::SeqCst) >= 1,
+            "at least one REAL successful chord activate"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_path_mint_activation_failure_is_retried_persistently_until_active() {
+        // FINDING 2: MINT reactivation on the abort path must be PERSISTENT (retried until
+        // active), NOT a one-shot. MINT-only mode; mint_idle times out ⇒ abort; the first N
+        // mint_activate calls FAIL (more than the bounded attempts) then succeed → the SAME
+        // persistent backstop brings MINT active. ZERO chord calls (Chord out of lease).
+        let fails = RELEASE_MAX_ATTEMPTS as usize + 3;
+        let be = MockBackend::new(None, None)
+            .with_chord_unavailable() // MINT-only
+            .with_mem(vec![200.0])
+            .with_mint_idle_delay_ms(3_600_000) // mint_idle times out ⇒ abort
+            .with_mint_activate_fails(fails);
+        let mut c = cfg(5, 3600);
+        c.op_timeout = Duration::from_millis(20);
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            acquire_lease(be.clone(), &c, true, 120.0),
+        )
+        .await
+        .expect("acquire returned (did not hang)")
+        .expect_err("MINT idle timeout ⇒ IdleFailed abort");
+        assert!(matches!(err, LeaseError::IdleFailed { .. }), "got {err:?}");
+        // The persistent backstop retries MINT past the failures (not a one-shot).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            be.mint_activate_fail_times.load(Ordering::SeqCst),
+            0,
+            "all forced MINT failures consumed — MINT reactivation is persistent, never gave up"
+        );
+        assert_eq!(be.mint_activates.load(Ordering::SeqCst), 1, "exactly one SUCCESSFUL mint activate");
+        assert!(!be.is_stuck_idle(), "MINT ended active (not stranded)");
+        // ZERO chord interaction (out of lease).
+        assert_eq!(be.chord_idles.load(Ordering::SeqCst), 0);
+        assert_eq!(be.chord_is_idle_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(be.chord_activates.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
