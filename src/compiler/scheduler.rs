@@ -39,6 +39,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::compiler::host::HostRole;
+use crate::compiler::idle_lease::{IdleModeLease, LeaseError, LeaseGuard};
 use crate::compiler::queue::{
     ClaimOutcome, FinalizeOutcome, JobState, QueueError, QueueStore, QueuedJob,
 };
@@ -276,30 +277,35 @@ pub trait BuildExecutor: Send + Sync {
     async fn build(&self, job: &QueuedJob) -> Result<(), String>;
 }
 
-/// Coordinates the heavy host's idle-mode lease around a heavy build. **BLD-11
-/// owns the real implementation**; this seam is called ONLY around a heavy build
-/// actually being dispatched. The default is an explicit, logged no-op so heavy
-/// builds work (uncoordinated) until BLD-11 lands.
+/// Coordinates the heavy host's idle-mode lease around a heavy build (BLD-11). This
+/// seam is invoked ONLY around a heavy build actually being dispatched. [`acquire`]
+/// idles Chord + MINT and WAITS for the freed-RAM budget:
+/// - `Ok(guard)` ⇒ enough RAM was freed; run the build while holding the guard. Its
+///   drop/watchdog guarantee reactivation even on a crash/hang (see [`LeaseGuard`]).
+/// - `Err(`[`LeaseError`]`)` ⇒ the budget could not be freed; the heavy build MUST
+///   NOT run — the scheduler requeues it. Both services are already reactivated.
+///
+/// [`acquire`]: IdleCoordinator::acquire
 #[async_trait]
 pub trait IdleCoordinator: Send + Sync {
-    async fn acquire(&self, job: &QueuedJob);
-    async fn release(&self, job: &QueuedJob);
+    async fn acquire(&self, job: &QueuedJob) -> Result<LeaseGuard, LeaseError>;
 }
 
-/// The default idle coordinator: a no-op that records the seam. BLD-11 replaces
-/// it with the real heavy-host idle-mode acquire/release.
+/// A no-op idle coordinator (used when no idle-mode wiring is desired): acquires a
+/// do-nothing lease so heavy builds run uncoordinated. The production wiring uses
+/// [`IdleModeLease`] (see [`Scheduler::from_env`]).
 pub struct NoopIdle;
 
 #[async_trait]
 impl IdleCoordinator for NoopIdle {
-    async fn acquire(&self, job: &QueuedJob) {
+    async fn acquire(&self, job: &QueuedJob) -> Result<LeaseGuard, LeaseError> {
         tracing::debug!(
             module = %job.module,
-            "compiler scheduler: heavy build dispatched; idle-mode acquire is a no-op \
-             until BLD-11 wires the real coordinator"
+            "compiler scheduler: heavy build dispatched with the no-op idle coordinator \
+             (no Chord/MINT idle-mode wiring)"
         );
+        Ok(LeaseGuard::noop())
     }
-    async fn release(&self, _job: &QueuedJob) {}
 }
 
 /// The production executor: dispatches to the `compiler_build` tool with the
@@ -363,14 +369,15 @@ impl Scheduler {
     }
 
     /// The production scheduler over the shared durable queue, the real
-    /// `compiler_build` executor, and the BLD-11 idle seam (no-op default).
+    /// `compiler_build` executor, and the real BLD-11 idle-mode coordinator
+    /// ([`IdleModeLease`], which idles Chord + MINT around a heavy build).
     /// `None` when Redis is not configured (nothing to schedule).
     pub fn from_env() -> Option<Self> {
         let queue = super::queue::RedisQueue::from_env()?;
         Some(Self::new(
             Arc::new(queue),
             Arc::new(CompilerBuildExecutor),
-            Arc::new(NoopIdle),
+            Arc::new(IdleModeLease::from_env()),
             SchedulerConfig::from_env(),
         ))
     }
@@ -475,12 +482,84 @@ impl Scheduler {
         let (base, max_attempts) =
             (self.config.complete_retry_base, self.config.complete_retry_max);
         tokio::spawn(async move {
-            if job.heavy {
-                idle.acquire(&job).await;
-            }
-            let result = executor.build(&job).await;
-            if job.heavy {
-                idle.release(&job).await;
+            // HEAVY builds take the idle-mode lease FIRST (idle Chord+MINT, wait for
+            // the freed-RAM budget). If it can't be acquired (budget never freed),
+            // the build MUST NOT run: requeue the job (token-fenced) so a later tick
+            // retries, and STOP — never build under budget. The `LeaseGuard` is held
+            // across the whole build; on a normal return we release it explicitly
+            // below, and on an early return / PANIC its `Drop` reactivates both
+            // services (a crashed build never leaves them stuck idle).
+            let lease = if job.heavy {
+                match idle.acquire(&job).await {
+                    Ok(guard) => Some(guard),
+                    Err(e) => {
+                        tracing::warn!(
+                            module = %job.module, job = %job.job_id,
+                            "compiler scheduler: heavy build could not acquire the idle-mode \
+                             lease ({e}); requeueing (NOT building under budget)"
+                        );
+                        // Token-fenced requeue: free the module lock + host slot and
+                        // return the job to the queue (clearing stale error state). A
+                        // stale token (reconciled/re-claimed) is a safe no-op. RETRY with
+                        // bounded backoff so a transient Redis blip does not pin the heavy
+                        // host slot (F3).
+                        let requeued = retry(base, max_attempts, || {
+                            queue.requeue(
+                                &job.job_id,
+                                &job.module,
+                                host,
+                                &token,
+                                "idle-lease-unavailable",
+                            )
+                        })
+                        .await;
+                        if !requeued {
+                            // Requeue still failing after retries → leave the job for the
+                            // BLD-06 reconcile backstop. A job that never completed has NO
+                            // finalize/terminal marker, so reconcile's crashed-path
+                            // REQUEUES it (never FAILS it) after the stale floor. We must
+                            // NOT convert an idle-gate abort into a terminal Failed build,
+                            // so there is deliberately NO complete(Failed) here.
+                            tracing::error!(
+                                module = %job.module, job = %job.job_id,
+                                "compiler scheduler: requeue after idle-lease failure exhausted \
+                                 retries; leaving the (never-run) job for the reconcile backstop, \
+                                 which will REQUEUE it (not fail it) after the stale floor"
+                            );
+                        }
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            // PANIC BOUNDARY: run the build in a nested task so a panicking build
+            // surfaces here as a `JoinError` instead of unwinding THIS scheduler task.
+            // That makes crash handling DETERMINISTIC: we always fall through to
+            // release the idle lease AND finalize+release the queue job (Failed),
+            // rather than leaking the claim to the (slow) reconcile backstop.
+            let build_outcome = {
+                let job_for_build = job.clone();
+                let exec = executor.clone();
+                tokio::spawn(async move { exec.build(&job_for_build).await }).await
+            };
+            let result: Result<(), String> = match build_outcome {
+                Ok(r) => r,
+                Err(join_err) => {
+                    tracing::error!(
+                        module = %job.module, job = %job.job_id,
+                        "compiler scheduler: build task PANICKED ({join_err}); releasing the \
+                         idle lease and finalizing the job as Failed (deterministic, not via \
+                         the reconcile backstop)"
+                    );
+                    Err(format!("build panicked: {join_err}"))
+                }
+            };
+            // Release the lease (awaited, deterministic) whether the build returned
+            // Ok, Err, or PANICKED — the panic was caught above so we ALWAYS reach
+            // here. The guard's `Drop` remains a backstop for any other early return.
+            if let Some(guard) = lease {
+                guard.release().await;
             }
             let state = if result.is_ok() {
                 JobState::Done
@@ -608,20 +687,47 @@ mod tests {
         }
     }
 
-    /// A fake idle coordinator counting acquire/release so we can prove it's
-    /// only touched for heavy builds.
-    #[derive(Default)]
+    /// An executor that PANICS mid-build, to prove the scheduler's panic boundary
+    /// releases the lease AND finalizes+releases the queue job deterministically.
+    struct PanickingExecutor;
+    #[async_trait]
+    impl BuildExecutor for PanickingExecutor {
+        async fn build(&self, _job: &QueuedJob) -> Result<(), String> {
+            panic!("simulated build crash");
+        }
+    }
+
+    /// A fake idle coordinator counting acquires (to prove idle-mode is touched
+    /// ONLY for heavy builds) and releases (via a real counting `LeaseGuard`), and
+    /// optionally failing the acquire (to exercise the insufficient-RAM abort +
+    /// requeue path — the build must NOT run).
     struct CountingIdle {
         acquires: AtomicUsize,
-        releases: AtomicUsize,
+        releases: Arc<AtomicUsize>,
+        /// When set, `acquire` returns `InsufficientRam` (never a lease).
+        fail_acquire: bool,
+    }
+    impl CountingIdle {
+        fn new(fail_acquire: bool) -> Self {
+            Self {
+                acquires: AtomicUsize::new(0),
+                releases: Arc::new(AtomicUsize::new(0)),
+                fail_acquire,
+            }
+        }
     }
     #[async_trait]
     impl IdleCoordinator for CountingIdle {
-        async fn acquire(&self, _job: &QueuedJob) {
+        async fn acquire(&self, _job: &QueuedJob) -> Result<LeaseGuard, LeaseError> {
             self.acquires.fetch_add(1, Ordering::SeqCst);
-        }
-        async fn release(&self, _job: &QueuedJob) {
-            self.releases.fetch_add(1, Ordering::SeqCst);
+            if self.fail_acquire {
+                Err(LeaseError::InsufficientRam {
+                    available_gb: 0.0,
+                    budget_gb: 100.0,
+                })
+            } else {
+                Ok(crate::compiler::idle_lease::test_guard(self.releases.clone()))
+            }
         }
     }
 
@@ -742,7 +848,7 @@ mod tests {
         let q = Arc::new(InMemoryQueue::new());
         q.enqueue(&req("harmony", "big", true)).await.unwrap();
         let ex = RecordingExecutor::new(false);
-        let idle = Arc::new(CountingIdle::default());
+        let idle = Arc::new(CountingIdle::new(false));
         let s = sched(
             q.clone(),
             ex.clone(),
@@ -766,6 +872,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heavy_build_under_budget_is_requeued_and_never_built() {
+        // BLD-11: when the idle lease can't be acquired (insufficient freed RAM),
+        // the heavy build must NOT run and must NOT be lost — it is requeued for a
+        // later tick. `fail_acquire=true` makes the coordinator return InsufficientRam.
+        let q = Arc::new(InMemoryQueue::new());
+        let enq = q.enqueue(&req("harmony", "big", true)).await.unwrap();
+        let ex = RecordingExecutor::new(false);
+        let idle = Arc::new(CountingIdle::new(true));
+        let s = sched(q.clone(), ex.clone(), idle.clone(), cfg(1, 1, vec![]));
+        // Fleet-quiet so the heavy build is dispatch-eligible (window gate passes),
+        // isolating the idle-lease gate as the reason it doesn't run.
+        let r = s.tick_once(12, true).await;
+        assert_eq!(r.dispatched.len(), 1, "claimed + spawned this tick");
+        for h in r.handles {
+            h.await.unwrap();
+        }
+        // Acquire was attempted, but the build NEVER ran (never under budget)...
+        assert_eq!(idle.acquires.load(Ordering::SeqCst), 1);
+        assert!(
+            ex.built.lock().unwrap().is_empty(),
+            "under-budget heavy build must never execute"
+        );
+        // ...and the job was requeued (back to `queued`, no terminal outcome), so a
+        // later tick can retry it once the host is quiet enough to free the budget.
+        assert_eq!(q.state_of(&enq.job_id).as_deref(), Some("queued"));
+        assert!(!q.has_outcome(&enq.job_id), "no terminal outcome recorded");
+        assert_eq!(
+            q.inflight_count(HostRole::Heavy),
+            0,
+            "host slot freed by the requeue"
+        );
+        // A subsequent tick with a coordinator that CAN acquire builds it exactly once.
+        let idle_ok = Arc::new(CountingIdle::new(false));
+        let s2 = sched(q.clone(), ex.clone(), idle_ok.clone(), cfg(1, 1, vec![]));
+        let r2 = s2.tick_once(12, true).await;
+        assert_eq!(r2.dispatched.len(), 1, "the requeued job is dispatchable again");
+        for h in r2.handles {
+            h.await.unwrap();
+        }
+        assert_eq!(*ex.built.lock().unwrap(), vec!["harmony".to_string()]);
+        assert_eq!(idle_ok.releases.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_abort_requeue_retries_a_transient_failure_and_frees_the_slot() {
+        // FINDING 3: an idle-abort whose FIRST requeue attempt fails (transient Redis
+        // blip) must NOT pin the heavy host slot — the scheduler retries and the job
+        // ends requeued with its slot freed.
+        let q = Arc::new(InMemoryQueue::new());
+        let enq = q.enqueue(&req("harmony", "big", true)).await.unwrap();
+        let ex = RecordingExecutor::new(false);
+        let idle = Arc::new(CountingIdle::new(true)); // acquire fails ⇒ abort path
+        let s = sched(q.clone(), ex.clone(), idle.clone(), cfg(1, 1, vec![]));
+        q.fail_requeues(1); // first requeue attempt fails, then succeeds on retry
+        let r = s.tick_once(12, true).await;
+        assert_eq!(r.dispatched.len(), 1);
+        for h in r.handles {
+            h.await.unwrap();
+        }
+        assert!(ex.built.lock().unwrap().is_empty(), "never built");
+        // The retry landed the requeue: back to queued, slot freed, no stale outcome.
+        assert_eq!(q.state_of(&enq.job_id).as_deref(), Some("queued"));
+        assert_eq!(q.inflight_count(HostRole::Heavy), 0, "host slot NOT tied up");
+    }
+
+    #[tokio::test]
+    async fn idle_abort_never_fails_the_build_leaves_it_for_reconcile_when_requeue_exhausted() {
+        // FINDING 2: an idle-gate abort must NEVER be converted into a terminal FAILED
+        // build. If requeue keeps failing past its retries, the scheduler leaves the
+        // (never-run) job for the BLD-06 reconcile backstop — a job with NO terminal
+        // marker is REQUEUED by reconcile (not failed) after the stale floor. There is
+        // deliberately NO complete(Failed) fallback.
+        let q = Arc::new(InMemoryQueue::new());
+        let enq = q.enqueue(&req("harmony", "big", true)).await.unwrap();
+        let ex = RecordingExecutor::new(false);
+        let idle = Arc::new(CountingIdle::new(true)); // acquire fails ⇒ abort path
+        // Fail every requeue attempt so the exhausted-retries branch runs.
+        let s = sched(q.clone(), ex.clone(), idle.clone(), cfg(1, 1, vec![]));
+        q.fail_requeues(1000);
+        let r = s.tick_once(12, true).await;
+        assert_eq!(r.dispatched.len(), 1);
+        for h in r.handles {
+            h.await.unwrap();
+        }
+        assert!(ex.built.lock().unwrap().is_empty(), "never built");
+        // The build must NOT be terminally Failed (or Done) — no terminal outcome at all,
+        // so reconcile will REQUEUE it. Acceptable states: "queued" (a retry landed) or
+        // "building" with no outcome (left for reconcile); NEVER "failed"/"done".
+        let state = q.state_of(&enq.job_id);
+        assert!(
+            matches!(state.as_deref(), Some("queued") | Some("building")),
+            "idle-abort must requeue or leave-for-reconcile, never terminalize — got {state:?}"
+        );
+        assert_ne!(state.as_deref(), Some("failed"), "must NEVER be terminally Failed");
+        assert!(
+            !q.has_outcome(&enq.job_id),
+            "no terminal outcome marker ⇒ reconcile requeues (never fails) this never-run job"
+        );
+    }
+
+    #[tokio::test]
+    async fn panicking_heavy_build_releases_lease_and_finalizes_through_dispatch() {
+        // FINDING 3: a build that PANICS must, END-TO-END THROUGH DISPATCH (not just a
+        // simulated guard drop), (a) release the idle lease and (b) finalize+release
+        // the queue job as Failed — deterministically, not left to reconcile.
+        let q = Arc::new(InMemoryQueue::new());
+        let enq = q.enqueue(&req("harmony", "big", true)).await.unwrap();
+        let ex: Arc<dyn BuildExecutor> = Arc::new(PanickingExecutor);
+        let idle = Arc::new(CountingIdle::new(false));
+        let s = sched(q.clone(), ex, idle.clone(), cfg(1, 1, vec![]));
+        let r = s.tick_once(12, true).await; // fleet-quiet ⇒ heavy dispatchable
+        assert_eq!(r.dispatched.len(), 1);
+        // The scheduler task itself must NOT panic (the boundary caught it).
+        for h in r.handles {
+            h.await.expect("scheduler task survived the build panic");
+        }
+        // (a) idle lease released despite the panic.
+        assert_eq!(
+            idle.releases.load(Ordering::SeqCst),
+            1,
+            "idle lease released after a panicking build"
+        );
+        // (b) job finalized as Failed + released: terminal state, slot freed.
+        assert_eq!(q.state_of(&enq.job_id).as_deref(), Some("failed"));
+        assert!(q.has_outcome(&enq.job_id), "terminal outcome recorded");
+        assert_eq!(q.inflight_count(HostRole::Heavy), 0, "host slot freed");
+    }
+
+    #[tokio::test]
     async fn small_job_coalesced_to_heavy_becomes_window_gated() {
         let q = Arc::new(InMemoryQueue::new());
         // First request is small (would dispatch immediately on primary)...
@@ -773,7 +1008,7 @@ mod tests {
         // ...but a later heavy request for the same module@ref upgrades it.
         q.enqueue(&req("harmony", "r", true)).await.unwrap();
         let ex = RecordingExecutor::new(false);
-        let idle = Arc::new(CountingIdle::default());
+        let idle = Arc::new(CountingIdle::new(false));
         let s = sched(
             q.clone(),
             ex.clone(),
@@ -792,7 +1027,7 @@ mod tests {
         let q = Arc::new(InMemoryQueue::new());
         q.enqueue(&req("terminus", "r", false)).await.unwrap();
         let ex = RecordingExecutor::new(false);
-        let idle = Arc::new(CountingIdle::default());
+        let idle = Arc::new(CountingIdle::new(false));
         let s = sched(q.clone(), ex.clone(), idle.clone(), cfg(1, 1, vec![]));
         let r = s.tick_once(12, false).await;
         for h in r.handles {

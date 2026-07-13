@@ -358,6 +358,27 @@ pub trait QueueStore: Send + Sync {
         token: &str,
     ) -> Result<(), QueueError>;
 
+    /// Token-fenced IMMEDIATE requeue of a claimed (`building`) job back to
+    /// `queued`, WITHOUT recording any terminal outcome: free the module lock +
+    /// host slot (both derived in-Lua from the job's OWN stored fields — A1),
+    /// clear the fence token, and re-add the job to the dispatch set so a later
+    /// scheduler tick picks it up. Used by the scheduler when a heavy build cannot
+    /// acquire its idle-mode lease (insufficient freed RAM) — the build must NOT
+    /// run, but the request must NOT be lost (BLD-11). Idempotent + token-fenced:
+    /// a wrong/stale token (already released, or reconciled + re-claimed) is a safe
+    /// no-op. Mirrors the crash-requeue branch of [`reconcile`](Self::reconcile),
+    /// but is immediate and token-gated rather than lease-age gated. Also CLEARS any
+    /// stale terminal/error metadata so the re-queued job carries no prior-attempt
+    /// failure state, and records `reason` as a light `last_requeue_reason`.
+    async fn requeue(
+        &self,
+        job_id: &str,
+        module: &str,
+        host: HostRole,
+        token: &str,
+        reason: &str,
+    ) -> Result<(), QueueError>;
+
     /// The SANCTIONED completion entry for a direct (non-scheduler) caller:
     /// [`finalize`](Self::finalize) THEN [`release`](Self::release), each an
     /// individually-atomic idempotent transition, EACH RETRIED with bounded
@@ -819,6 +840,67 @@ return 1
     )
 }
 
+/// Token-fenced IMMEDIATE requeue of a claimed job back to `queued` (BLD-11): free
+/// the module lock + host slot — both DERIVED in-Lua from the job hash's OWN stored
+/// module/host (A1, never a caller arg) — clear the fence token, and re-add to the
+/// dispatch ZSET at the job's stored priority/seq. Records NO terminal outcome (the
+/// build never ran).
+///
+/// DOUBLE FENCE: requeue proceeds ONLY when ALL of (a) the caller's `claim_token`
+/// matches, (b) the job is still `state == 'building'`, AND (c) NO terminal `outcome`
+/// marker exists. A terminal job (`done`/`failed`), a non-`building` state, OR a
+/// finalized-but-not-yet-released job (a terminal `outcome` written while the token is
+/// still present) is NEVER resurrected back to `queued` — even with a matching token
+/// (e.g. if an idle-abort requeue races completion/finalization). A token mismatch
+/// returns `0`; a non-requeuable (terminal / finalized / non-building) job returns `2`;
+/// a genuine requeue returns `1`.
+///
+/// Also CLEARS stale error metadata (last_error) so a requeued job carries no
+/// prior-attempt failure state, and records a light `last_requeue_reason`.
+/// KEYS: 1=jobhash 2=zset
+/// ARGV: 1=id 2=token 3=modulelock_prefix 4=host_set_prefix 5=requeue_reason
+fn requeue_lua() -> String {
+    r#"
+if redis.call('HGET', KEYS[1], 'claim_token') ~= ARGV[2] then return 0 end
+-- STATE FENCE: only a still-`building` job with NO terminal outcome may be requeued. A
+-- terminal (done/failed) job, a non-building job, OR a finalized-but-unreleased job (a
+-- terminal `outcome` marker present) is NEVER resurrected, even with a matching token.
+if redis.call('HGET', KEYS[1], 'state') ~= 'building' then return 2 end
+if redis.call('HGET', KEYS[1], 'outcome') then return 2 end
+local jobkey=KEYS[1]
+local zsetkey=KEYS[2]
+local jobid=ARGV[1]
+local lockprefix=ARGV[3]
+local hostprefix=ARGV[4]
+-- Free the per-module lock iff this job owns it (derived from the hash's module).
+local module=redis.call('HGET', jobkey, 'module')
+if module then
+  local lockkey=lockprefix..module
+  if redis.call('GET', lockkey)==jobid then redis.call('DEL', lockkey) end
+end
+-- Free the host slot (derived from the hash's stored host).
+local host=redis.call('HGET', jobkey, 'host')
+if host then redis.call('SREM', hostprefix..host, jobid) end
+-- Clear the claim so a late completion no-ops, and return to the queued state.
+redis.call('HDEL', jobkey, 'claim_token')
+redis.call('HDEL', jobkey, 'host')
+redis.call('HDEL', jobkey, 'started_at')
+-- Clear STALE non-terminal error metadata so a requeued job carries no prior-attempt
+-- failure state (the fence above already guarantees NO terminal `outcome` is present).
+-- Record a light requeue reason for observability instead.
+redis.call('HDEL', jobkey, 'last_error')
+redis.call('HSET', jobkey, 'last_requeue_reason', ARGV[5])
+redis.call('HSET', jobkey, 'state', 'queued')
+-- Re-add to the dispatch ZSET at the stored priority/seq score.
+local seq=tonumber(redis.call('HGET', jobkey, 'seq') or '0')
+local prank=tonumber(redis.call('HGET', jobkey, 'prank') or '1')
+local score=seq-(prank*1000000000000)
+redis.call('ZADD', zsetkey, score, jobid)
+return 1
+"#
+    .to_string()
+}
+
 fn priority_from_rank(rank: i64) -> Priority {
     match rank {
         r if r >= 2 => Priority::High,
@@ -1032,6 +1114,39 @@ impl QueueStore for RedisQueue {
         out.map(|_| ()).map_err(|()| QueueError::Unavailable)
     }
 
+    async fn requeue(
+        &self,
+        job_id: &str,
+        module: &str,
+        host: HostRole,
+        token: &str,
+        reason: &str,
+    ) -> Result<(), QueueError> {
+        // `module`/`host` args are advisory only — the lock + host-slot keys are
+        // DERIVED in-Lua from the job hash's OWN stored fields (A1).
+        let _ = (module, host);
+        let (jk, zset) = (job_key(job_id), zset_key());
+        let (id, token, reason) = (job_id.to_string(), token.to_string(), reason.to_string());
+        let (lock_prefix, host_prefix) = (module_lock_prefix(), host_set_prefix());
+        let script = redis::Script::new(&requeue_lua());
+        let out: Result<i64, ()> = self
+            .backend
+            .with_conn(Namespace::Queue, |mut conn| async move {
+                script
+                    .key(jk)
+                    .key(zset)
+                    .arg(id)
+                    .arg(token)
+                    .arg(lock_prefix)
+                    .arg(host_prefix)
+                    .arg(reason)
+                    .invoke_async::<_, i64>(&mut conn)
+                    .await
+            })
+            .await;
+        out.map(|_| ()).map_err(|()| QueueError::Unavailable)
+    }
+
     async fn reconcile(
         &self,
         stale_after: std::time::Duration,
@@ -1172,6 +1287,11 @@ pub(crate) mod fake {
         outcome: Option<String>,
         /// A single pending re-run requested while this job was building.
         rerun: bool,
+        /// Light observability marker recorded by `requeue` (F4).
+        last_requeue_reason: Option<String>,
+        /// A NON-terminal transient error recorded while still building (cleared on
+        /// requeue so a re-queued job carries no prior-attempt failure state).
+        last_error: Option<String>,
     }
 
     #[derive(Default)]
@@ -1189,6 +1309,8 @@ pub(crate) mod fake {
         fail_finalizes: usize,
         /// The next N `release` calls fail as Unavailable (completion-time outage).
         fail_releases: usize,
+        /// The next N `requeue` calls fail as Unavailable (idle-abort requeue outage).
+        fail_requeues: usize,
     }
 
     /// An offline `QueueStore` mirroring the Lua semantics exactly.
@@ -1218,6 +1340,29 @@ pub(crate) mod fake {
         /// Make the next `n` `finalize` calls fail as Unavailable.
         pub(crate) fn fail_finalizes(&self, n: usize) {
             self.state.lock().unwrap().fail_finalizes = n;
+        }
+
+        /// Make the next `n` `requeue` calls fail as Unavailable (idle-abort outage).
+        pub(crate) fn fail_requeues(&self, n: usize) {
+            self.state.lock().unwrap().fail_requeues = n;
+        }
+
+        /// Record a NON-terminal transient error on a job (test helper), to prove
+        /// `requeue` clears stale error state on a still-building job.
+        pub(crate) fn set_last_error(&self, job_id: &str, err: &str) {
+            if let Some(j) = self.state.lock().unwrap().jobs.get_mut(job_id) {
+                j.last_error = Some(err.to_string());
+            }
+        }
+
+        /// The current `last_error` on a job, if any (test helper).
+        pub(crate) fn last_error(&self, job_id: &str) -> Option<String> {
+            self.state
+                .lock()
+                .unwrap()
+                .jobs
+                .get(job_id)
+                .and_then(|j| j.last_error.clone())
         }
 
         /// Whether a job carries a durable terminal-outcome marker (test helper).
@@ -1330,6 +1475,8 @@ pub(crate) mod fake {
                     claim_token: None,
                     outcome: None,
                     rerun: false,
+                    last_requeue_reason: None,
+                    last_error: None,
                 },
             );
             s.dedupe.insert(dk, nid);
@@ -1412,6 +1559,8 @@ pub(crate) mod fake {
                     claim_token: None,
                     outcome: None,
                     rerun: false,
+                    last_requeue_reason: None,
+                    last_error: None,
                 },
             );
             s.dedupe.insert(dk, id.clone());
@@ -1543,6 +1692,61 @@ pub(crate) mod fake {
                 .and_then(|j| j.outcome.clone())
                 .unwrap_or_else(|| "done".into());
             release_locked(&mut s, job_id, &final_state);
+            Ok(())
+        }
+
+        async fn requeue(
+            &self,
+            job_id: &str,
+            module: &str,
+            host: HostRole,
+            token: &str,
+            reason: &str,
+        ) -> Result<(), QueueError> {
+            let mut s = self.state.lock().unwrap();
+            if s.down {
+                return Err(QueueError::Unavailable);
+            }
+            // Simulate a transient requeue outage (retried by the scheduler).
+            if s.fail_requeues > 0 {
+                s.fail_requeues -= 1;
+                return Err(QueueError::Unavailable);
+            }
+            // DOUBLE FENCE: requeue proceeds ONLY with a matching claim token AND a
+            // still-`building` job that has NO terminal `outcome` marker. A token mismatch
+            // (already released / reconciled + re-claimed), a terminal (done/failed) job,
+            // a non-building job, OR a finalized-but-unreleased job (outcome present with
+            // the token still matching) is a safe no-op — a terminal/finalized job is
+            // NEVER resurrected back to queued, even with a matching token.
+            match s.jobs.get(job_id) {
+                Some(j)
+                    if j.claim_token.as_deref() == Some(token)
+                        && j.state == "building"
+                        && j.outcome.is_none() => {}
+                _ => return Ok(()),
+            }
+            // `module`/`host` args are advisory — derive from the job's OWN fields.
+            let _ = (module, host);
+            let stored_module = s.jobs.get(job_id).map(|j| j.module.clone());
+            if let Some(m) = stored_module {
+                if s.module_lock.get(&m).map(String::as_str) == Some(job_id) {
+                    s.module_lock.remove(&m);
+                }
+            }
+            for v in s.host_inflight.values_mut() {
+                v.retain(|x| x != job_id);
+            }
+            if let Some(j) = s.jobs.get_mut(job_id) {
+                j.state = "queued".into();
+                j.host = None;
+                j.started_at = 0;
+                j.claim_token = None; // fence: a late completion no-ops
+                // Clear STALE non-terminal error metadata + record the requeue reason.
+                // (The fence above guarantees `outcome` is absent, so nothing terminal is
+                // being cleared/resurrected here.)
+                j.last_error = None;
+                j.last_requeue_reason = Some(reason.to_string());
+            }
             Ok(())
         }
 
@@ -1908,6 +2112,97 @@ mod tests {
             q.claim(&contender.job_id, "m1", HostRole::Primary, 1).await.unwrap(),
             ClaimOutcome::Claimed { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn requeue_returns_a_claimed_job_to_queued_and_frees_lock_and_slot() {
+        // BLD-11: a token-fenced requeue puts a claimed heavy job back to `queued`,
+        // frees its module lock + host slot, records NO terminal outcome, and lets a
+        // later claim pick it up.
+        let q = InMemoryQueue::new();
+        let j = q.enqueue(&req("harmony", "big", Priority::Normal, true)).await.unwrap();
+        let tok = claim_ok(&q, &j.job_id, "harmony", HostRole::Heavy, 1).await;
+        assert_eq!(q.state_of(&j.job_id).as_deref(), Some("building"));
+        assert_eq!(q.inflight_count(HostRole::Heavy), 1);
+        // Requeue (advisory wrong module/host args still derive the correct keys).
+        q.requeue(&j.job_id, "bogus", HostRole::Primary, &tok, "idle-lease-unavailable").await.unwrap();
+        assert_eq!(q.state_of(&j.job_id).as_deref(), Some("queued"), "back to queued");
+        assert!(!q.has_outcome(&j.job_id), "no terminal outcome recorded");
+        assert_eq!(q.inflight_count(HostRole::Heavy), 0, "host slot freed");
+        // The module lock + host slot were freed and the token cleared → the requeued
+        // job is fully re-claimable (a claim re-takes the module lock, which proves it
+        // was released), and the OLD token no longer owns anything.
+        let tok2 = claim_ok(&q, &j.job_id, "harmony", HostRole::Heavy, 1).await;
+        assert_ne!(tok, tok2, "a fresh claim mints a new fence token");
+    }
+
+    #[tokio::test]
+    async fn requeue_clears_stale_error_metadata_on_a_building_job() {
+        // A requeue of a still-BUILDING job (the intended path) clears any NON-terminal
+        // stale error recorded during the prior attempt — the re-queued job carries no
+        // prior failure state. (It does NOT finalize-then-requeue: a terminal job must
+        // never be requeued — see `requeue_never_resurrects_a_finalized_job`.)
+        let q = InMemoryQueue::new();
+        let j = q.enqueue(&req("harmony", "big", Priority::Normal, true)).await.unwrap();
+        let tok = claim_ok(&q, &j.job_id, "harmony", HostRole::Heavy, 1).await;
+        assert_eq!(q.state_of(&j.job_id).as_deref(), Some("building"));
+        // A transient error was recorded WHILE the job was still building (non-terminal).
+        q.set_last_error(&j.job_id, "transient network blip");
+        assert_eq!(q.last_error(&j.job_id).as_deref(), Some("transient network blip"));
+        // Requeue (job is building ⇒ the double fence passes) clears the stale error.
+        q.requeue(&j.job_id, "harmony", HostRole::Heavy, &tok, "idle-lease-unavailable").await.unwrap();
+        assert_eq!(q.state_of(&j.job_id).as_deref(), Some("queued"));
+        assert!(q.last_error(&j.job_id).is_none(), "requeue cleared the stale last_error");
+        assert!(!q.has_outcome(&j.job_id), "no terminal outcome recorded");
+    }
+
+    #[tokio::test]
+    async fn requeue_never_resurrects_a_finalized_job_even_with_a_matching_token() {
+        // STATE FENCE: a FINALIZED job must NOT be requeued back to `queued`, even with a
+        // MATCHING token. This is the exact race the finding calls out — finalize records
+        // a terminal `outcome` while the claim token is STILL present (release hasn't run
+        // yet); a stale idle-abort requeue with that matching token must be a NO-OP.
+        let q = InMemoryQueue::new();
+        let j = q.enqueue(&req("harmony", "big", Priority::Normal, true)).await.unwrap();
+        let tok = claim_ok(&q, &j.job_id, "harmony", HostRole::Heavy, 1).await;
+        // Finalize (terminal outcome recorded) but do NOT release yet → the token still
+        // matches AND a terminal marker exists.
+        q.finalize(&j.job_id, JobState::Failed, &tok).await.unwrap();
+        assert!(q.has_outcome(&j.job_id), "terminal outcome present, token still matches");
+        // Requeue with the SAME (matching) token must be a NO-OP — the fence rejects it.
+        q.requeue(&j.job_id, "harmony", HostRole::Heavy, &tok, "idle-lease-unavailable").await.unwrap();
+        assert_ne!(
+            q.state_of(&j.job_id).as_deref(),
+            Some("queued"),
+            "finalized job NOT resurrected to queued despite a matching token"
+        );
+        assert!(q.has_outcome(&j.job_id), "terminal outcome marker preserved (not cleared)");
+
+        // Also verify a fully-RELEASED terminal job (state failed, token cleared) is a
+        // no-op too (both fences reject).
+        q.release(&j.job_id, "harmony", HostRole::Heavy, &tok).await.unwrap();
+        assert_eq!(q.state_of(&j.job_id).as_deref(), Some("failed"));
+        q.requeue(&j.job_id, "harmony", HostRole::Heavy, &tok, "idle-lease-unavailable").await.unwrap();
+        assert_eq!(
+            q.state_of(&j.job_id).as_deref(),
+            Some("failed"),
+            "released terminal job stays failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn requeue_with_a_stale_token_is_a_safe_noop() {
+        // A wrong/stale token must not requeue (it would clobber a live re-claim).
+        let q = InMemoryQueue::new();
+        let j = q.enqueue(&req("m1", "r1", Priority::Normal, false)).await.unwrap();
+        let tok = claim_ok(&q, &j.job_id, "m1", HostRole::Primary, 1).await;
+        // A stale token no-ops: the job stays building, the slot stays held.
+        q.requeue(&j.job_id, "m1", HostRole::Primary, "wrong-token", "x").await.unwrap();
+        assert_eq!(q.state_of(&j.job_id).as_deref(), Some("building"));
+        assert_eq!(q.inflight_count(HostRole::Primary), 1);
+        // The correct token still requeues.
+        q.requeue(&j.job_id, "m1", HostRole::Primary, &tok, "x").await.unwrap();
+        assert_eq!(q.state_of(&j.job_id).as_deref(), Some("queued"));
     }
 
     #[tokio::test]
