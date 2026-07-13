@@ -1061,16 +1061,22 @@ impl RustTool for CompilerBuild {
         if !published.relayed {
             publish::write_manifest(&root, &module, channel, &published.sha256, &triple, &bin)
                 .await?;
-            let set =
-                publish::set_current(&root, &module, channel, &published.sha256, "bless", None)
-                    .await?;
+            // set_current verifies the just-published sha before flipping (the
+            // pointer flip is itself the fail-closed choke point).
+            let set = publish::set_current(
+                &root,
+                &module,
+                channel,
+                &published.sha256,
+                &triple,
+                &bin,
+                "bless",
+                None,
+            )
+            .await?;
             blessed_current = set.changed;
-            let mut keep = vec![published.sha256.clone()];
-            if let Some(prev) = &set.previous {
-                keep.push(prev.clone());
-            }
-            pruned =
-                publish::prune_channel(&root, &module, channel, retain_per_channel(), &keep).await?;
+            // Prune reads the real current + current.prev pointers itself.
+            pruned = publish::prune_channel(&root, &module, channel, retain_per_channel()).await?;
         }
 
         let text = format!(
@@ -1190,6 +1196,20 @@ impl RustTool for CompilerRelease {
             .unwrap_or("stable")
             .to_string();
         validate_segment("channel", &to_channel)?;
+        // The artifact address for verify-before-bless (used by promote AND
+        // rollback so the rollback target is verified too — fail closed).
+        let bin = args
+            .get("bin")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| module.clone());
+        validate_segment("bin", &bin)?;
+        let target = args
+            .get("target")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(target_triple);
+        validate_segment("target", &target)?;
 
         let root = dataset_root()?;
 
@@ -1211,7 +1231,8 @@ impl RustTool for CompilerRelease {
                 Ok(ToolOutput::with_structured(text, structured))
             }
             "rollback" => {
-                let out = publish::rollback_current(&root, &module, &to_channel).await?;
+                let out =
+                    publish::rollback_current(&root, &module, &to_channel, &target, &bin).await?;
                 let text = format!(
                     "Rolled {module}/{to_channel} back to {sha} (was {was})",
                     sha = out.sha,
@@ -1236,18 +1257,6 @@ impl RustTool for CompilerRelease {
                     .unwrap_or(publish::DEFAULT_CHANNEL)
                     .to_string();
                 validate_segment("channel", &from_channel)?;
-                let bin = args
-                    .get("bin")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| module.clone());
-                validate_segment("bin", &bin)?;
-                let target = args
-                    .get("target")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .unwrap_or_else(target_triple);
-                validate_segment("target", &target)?;
 
                 let out = publish::promote(
                     &root,

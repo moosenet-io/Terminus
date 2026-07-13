@@ -583,14 +583,28 @@ pub struct SetCurrentOutcome {
 /// `current` already equals `sha` this is a no-op (no history churn). Writes the
 /// `current.prev` (rollback) pointer BEFORE `current`, so a crash between the two
 /// leaves a consistent (prev=old, current=old) state, never a dangling rollback.
+///
+/// VERIFY-BEFORE-BLESS (defense-in-depth): this SAFE PRIMITIVE runs
+/// [`verify_sha_artifact`] on `sha` FIRST — before the idempotent short-circuit
+/// and before any pointer write — so NO caller (present or future) can bless a sha
+/// whose binary/`.sha256` is missing, corrupt, or checksum-mismatched. The flip is
+/// refused (fail closed) on any verification failure. Callers must therefore pass
+/// the `target`/`bin` that address the artifact.
+#[allow(clippy::too_many_arguments)]
 pub async fn set_current(
     dataset_root: &Path,
     module: &str,
     channel: &str,
     sha: &str,
+    target: &str,
+    bin: &str,
     action: &str,
     from_channel: Option<&str>,
 ) -> Result<SetCurrentOutcome, ToolError> {
+    // Never move `current` onto an unverified sha — the pointer flip itself is the
+    // choke point, independent of what the caller already checked.
+    verify_sha_artifact(dataset_root, module, channel, sha, target, bin).await?;
+
     let previous = read_current(dataset_root, module, channel).await?;
     if previous.as_deref() == Some(sha) {
         return Ok(SetCurrentOutcome {
@@ -629,10 +643,19 @@ pub async fn set_current(
 /// Records the rollback as its own history entry, and (because it goes through
 /// `set_current`) sets the now-old current as the new rollback target — so a
 /// rollback is itself reversible. Errors if there is no previous sha to revert to.
+///
+/// FAIL-CLOSED: the rollback TARGET is verified with the SAME
+/// [`verify_sha_artifact`] (binary + `.sha256` exist AND dir-name == actual
+/// sha256 == sidecar sha) BEFORE the pointer moves — using the caller's
+/// `target`/`bin`. If the previous sha's artifact is missing or corrupt (e.g. it
+/// was pruned), the rollback is REFUSED with a clear error and `current` is left
+/// untouched — a broken sha is never blessed.
 pub async fn rollback_current(
     dataset_root: &Path,
     module: &str,
     channel: &str,
+    target: &str,
+    bin: &str,
 ) -> Result<SetCurrentOutcome, ToolError> {
     let prev = read_previous(dataset_root, module, channel)
         .await?
@@ -641,7 +664,17 @@ pub async fn rollback_current(
                 "no previous blessed sha recorded for {module}/{channel}; nothing to roll back to"
             ))
         })?;
-    set_current(dataset_root, module, channel, &prev, "rollback", None).await
+    // Explicit, clearly-attributed verification of the rollback target (in
+    // addition to the check inside `set_current`), so the refusal names rollback.
+    verify_sha_artifact(dataset_root, module, channel, &prev, target, bin)
+        .await
+        .map_err(|e| {
+            ToolError::NotFound(format!(
+                "refusing to roll {module}/{channel} back to {prev}: the rollback target is not \
+                 a verified artifact (missing/corrupt): {e}"
+            ))
+        })?;
+    set_current(dataset_root, module, channel, &prev, target, bin, "rollback", None).await
 }
 
 /// Recursively copy a directory tree (files + subdirs; no symlinks in an artifact
@@ -682,18 +715,27 @@ async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), ToolError> {
 }
 
 /// Prune old sha dirs in a channel, RETAINING the newest `retain` (never fewer
-/// than 2) plus the pinned `keep` shas (the current + previous pointers). Age is
-/// judged by sha-dir mtime. Returns the pruned shas. Only immediate SUBDIRECTORIES
-/// are considered (the pointer/history/manifest files are never touched).
+/// than 2) PLUS the sha dirs the `current` and `current.prev` pointer files
+/// actually reference. Age is judged by sha-dir mtime. Returns the pruned shas.
+/// Only immediate SUBDIRECTORIES are considered (the pointer/history/manifest
+/// files are never touched).
+///
+/// The current/previous targets are read from the POINTER FILES at prune time —
+/// never inferred from a caller-passed value — so an older sha that
+/// `current.prev` still points to (e.g. after an idempotent re-bless whose
+/// "previous" is the current sha) is always protected.
 pub async fn prune_channel(
     dataset_root: &Path,
     module: &str,
     channel: &str,
     retain: usize,
-    keep: &[String],
 ) -> Result<Vec<String>, ToolError> {
     let retain = retain.max(2);
     let dir = channel_dir(dataset_root, module, channel);
+    // Read the REAL pointer targets now, so retention protects them regardless of
+    // their age or of any caller-supplied hint.
+    let current = read_current(dataset_root, module, channel).await?;
+    let previous = read_previous(dataset_root, module, channel).await?;
     let mut rd = match tokio::fs::read_dir(&dir).await {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -728,7 +770,15 @@ pub async fn prune_channel(
     }
     // Newest first, so `take(retain)` keeps the most recent shas.
     shas.sort_by(|a, b| b.1.cmp(&a.1));
-    let mut keep_set: HashSet<String> = keep.iter().cloned().collect();
+    // Protected set = the ACTUAL current + current.prev pointer targets, plus the
+    // newest `retain` shas by mtime.
+    let mut keep_set: HashSet<String> = HashSet::new();
+    if let Some(c) = &current {
+        keep_set.insert(c.clone());
+    }
+    if let Some(p) = &previous {
+        keep_set.insert(p.clone());
+    }
     for (name, _) in shas.iter().take(retain) {
         keep_set.insert(name.clone());
     }
@@ -842,17 +892,16 @@ pub async fn promote(
         module,
         to_channel,
         sha,
+        target,
+        bin,
         action,
         Some(from_channel),
     )
     .await?;
 
-    // 5. Retention: keep ≥2, plus the new current and the prior current.
-    let mut keep = vec![sha.to_string()];
-    if let Some(prev) = &set.previous {
-        keep.push(prev.clone());
-    }
-    let pruned = prune_channel(dataset_root, module, to_channel, retain, &keep).await?;
+    // 5. Retention: keep ≥2 plus the ACTUAL current + current.prev pointer targets
+    //    (prune reads the pointer files itself, so an older rollback target is safe).
+    let pruned = prune_channel(dataset_root, module, to_channel, retain).await?;
 
     Ok(PromoteOutcome {
         module: module.to_string(),
@@ -1101,7 +1150,7 @@ mod tests {
         let root = dir.path();
         let sha = seed_artifact(root, "m", "experimental", "m", b"v1").await;
 
-        let out = set_current(root, "m", "experimental", &sha, "bless", None)
+        let out = set_current(root, "m", "experimental", &sha, T, "m", "bless", None)
             .await
             .unwrap();
         assert!(out.changed);
@@ -1127,11 +1176,11 @@ mod tests {
         let root = dir.path();
         let sha = seed_artifact(root, "m", "experimental", "m", b"v1").await;
 
-        let a = set_current(root, "m", "experimental", &sha, "bless", None)
+        let a = set_current(root, "m", "experimental", &sha, T, "m", "bless", None)
             .await
             .unwrap();
         assert!(a.changed);
-        let b = set_current(root, "m", "experimental", &sha, "bless", None)
+        let b = set_current(root, "m", "experimental", &sha, T, "m", "bless", None)
             .await
             .unwrap();
         assert!(!b.changed, "re-blessing the same sha must be a no-op");
@@ -1147,7 +1196,7 @@ mod tests {
         let root = dir.path();
         assert_eq!(read_current(root, "m", "stable").await.unwrap(), None);
         let sha = seed_artifact(root, "m", "stable", "m", b"blob").await;
-        set_current(root, "m", "stable", &sha, "bless", None)
+        set_current(root, "m", "stable", &sha, T, "m", "bless", None)
             .await
             .unwrap();
         assert_eq!(read_current(root, "m", "stable").await.unwrap(), Some(sha));
@@ -1244,7 +1293,7 @@ mod tests {
         assert_eq!(read_current(root, "m", "stable").await.unwrap(), Some(sha2.clone()));
         assert_eq!(read_previous(root, "m", "stable").await.unwrap(), Some(sha1.clone()));
 
-        let rb = rollback_current(root, "m", "stable").await.unwrap();
+        let rb = rollback_current(root, "m", "stable", T, "m").await.unwrap();
         assert!(rb.changed);
         assert_eq!(read_current(root, "m", "stable").await.unwrap(), Some(sha1.clone()));
         // Rollback is itself reversible: prev now points at sha2.
@@ -1257,7 +1306,108 @@ mod tests {
     async fn rollback_with_no_previous_errors() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        assert!(rollback_current(root, "m", "stable").await.is_err());
+        assert!(rollback_current(root, "m", "stable", T, "m").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rollback_to_missing_or_corrupt_prev_is_refused_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let sha1 = seed_artifact(root, "m", "experimental", "m", b"one").await;
+        let sha2 = seed_artifact(root, "m", "experimental", "m", b"two").await;
+        promote(root, "m", "experimental", "stable", &sha1, T, "m", 2)
+            .await
+            .unwrap();
+        promote(root, "m", "experimental", "stable", &sha2, T, "m", 2)
+            .await
+            .unwrap();
+        // current=sha2, current.prev=sha1.
+        assert_eq!(read_previous(root, "m", "stable").await.unwrap(), Some(sha1.clone()));
+
+        // (a) Corrupt the rollback target's binary under stable → verify fails.
+        let binp = artifact_abs_path(root, "m", "stable", &sha1, T, "m");
+        tokio::fs::write(&binp, b"tampered").await.unwrap();
+        let err = rollback_current(root, "m", "stable", T, "m")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("refusing to roll"),
+            "corrupt rollback target must be refused: {err:?}"
+        );
+        // current is UNTOUCHED — the broken sha was never blessed.
+        assert_eq!(read_current(root, "m", "stable").await.unwrap(), Some(sha2.clone()));
+
+        // (b) Delete the rollback target's tree entirely → still refused.
+        tokio::fs::remove_dir_all(sha_dir(root, "m", "stable", &sha1))
+            .await
+            .unwrap();
+        assert!(rollback_current(root, "m", "stable", T, "m").await.is_err());
+        assert_eq!(read_current(root, "m", "stable").await.unwrap(), Some(sha2));
+    }
+
+    #[tokio::test]
+    async fn set_current_refuses_an_unverified_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A sha whose artifact was never published → the pointer flip is refused.
+        let err = set_current(root, "m", "experimental", "deadbeef", T, "m", "bless", None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::NotFound(_)),
+            "unverified target must be refused: {err:?}"
+        );
+        assert_eq!(read_current(root, "m", "experimental").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn idempotent_rebless_does_not_prune_the_real_current_prev_target() {
+        // Regression: an idempotent set_current returns previous == the CURRENT sha,
+        // NOT the current.prev file's target. Prune must read the pointer FILES, so
+        // an OLDER sha that current.prev still references is protected.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Three shas with strictly increasing mtimes: sha1 (oldest) .. sha3 (newest).
+        let mut shas = Vec::new();
+        for i in 0..3u8 {
+            let sha = seed_artifact(root, "m", "experimental", "m", &[b'p', i]).await;
+            set_mtime(&sha_dir(root, "m", "experimental", &sha), 5_000 + i as i64);
+            shas.push(sha);
+        }
+        // Bless sha1 then sha3 → current=sha3, current.prev=sha1 (the OLDEST).
+        set_current(root, "m", "experimental", &shas[0], T, "m", "bless", None)
+            .await
+            .unwrap();
+        set_current(root, "m", "experimental", &shas[2], T, "m", "bless", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_previous(root, "m", "experimental").await.unwrap(),
+            Some(shas[0].clone())
+        );
+        // Idempotent re-bless of the current sha (its `previous` return is sha3).
+        let set = set_current(root, "m", "experimental", &shas[2], T, "m", "bless", None)
+            .await
+            .unwrap();
+        assert!(!set.changed);
+        // Prune retain=2: newest-2 = {sha3, sha2}. WITHOUT reading current.prev,
+        // sha1 (oldest, and the rollback target) would be pruned — the bug.
+        let pruned = prune_channel(root, "m", "experimental", 2).await.unwrap();
+        assert!(
+            !pruned.contains(&shas[0]),
+            "current.prev target (sha1) must NOT be pruned; pruned={pruned:?}"
+        );
+        assert!(
+            tokio::fs::try_exists(sha_dir(root, "m", "experimental", &shas[0]))
+                .await
+                .unwrap(),
+            "the rollback target sha dir must survive"
+        );
+        // And a rollback to it still succeeds (proves it stayed verifiable).
+        let rb = rollback_current(root, "m", "experimental", T, "m")
+            .await
+            .unwrap();
+        assert_eq!(rb.sha, shas[0]);
     }
 
     #[tokio::test]
@@ -1271,14 +1421,14 @@ mod tests {
             // Ensure a distinct, increasing mtime ordering for the sha dirs.
             let d = sha_dir(root, "m", "experimental", &sha);
             set_mtime(&d, 1_000 + i as i64);
-            set_current(root, "m", "experimental", &sha, "bless", None)
+            set_current(root, "m", "experimental", &sha, T, "m", "bless", None)
                 .await
                 .unwrap();
             shas.push(sha);
         }
         // retain=2 → keep newest 2 (shas[1], shas[2]) + current(shas[2]) + prev(shas[1]).
         // The oldest (shas[0]) is pruned.
-        let pruned = prune_channel(root, "m", "experimental", 2, &[shas[2].clone(), shas[1].clone()])
+        let pruned = prune_channel(root, "m", "experimental", 2)
             .await
             .unwrap();
         assert_eq!(pruned, vec![shas[0].clone()]);
@@ -1305,7 +1455,7 @@ mod tests {
             shas.push(sha);
         }
         // retain=1 is clamped up to 2 → two survive.
-        prune_channel(root, "m", "experimental", 1, &[]).await.unwrap();
+        prune_channel(root, "m", "experimental", 1).await.unwrap();
         let mut surviving = 0;
         let mut rd = tokio::fs::read_dir(channel_dir(root, "m", "experimental"))
             .await

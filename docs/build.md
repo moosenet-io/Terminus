@@ -56,13 +56,15 @@ ${BUILD_DATASET_ROOT}/artifacts/<module>/<channel>/
 - **Atomic flips.** `current`/`current.prev` are written to a uniquely-named temp file in the
   same directory and `rename(2)`d into place — a reader sees the old or new sha, never a
   partial/truncated pointer.
-- **Verify before bless.** A pointer is only moved onto a sha after the store confirms the
-  binary AND its `.sha256` exist and the content-address dir name equals both the binary's
-  actual SHA-256 and the sidecar's recorded sha. A missing/corrupt/checksum-mismatched sha is
-  refused (fail closed).
+- **Verify before bless.** The pointer flip itself is the fail-closed choke point: `current`
+  is moved onto a sha only after the store confirms the binary AND its `.sha256` exist and the
+  content-address dir name equals both the binary's actual SHA-256 and the sidecar's recorded
+  sha. A missing/corrupt/checksum-mismatched sha is refused — for promote, the build-time
+  flip, AND rollback alike, so no caller can bless an unverified sha.
 - **Rollback.** Each flip records the prior `current` as `current.prev` and appends a
   `history.jsonl` entry, so a channel can be reverted one step (and the rollback is itself
-  reversible).
+  reversible). The rollback TARGET is verified the same way before the flip — if the previous
+  sha was pruned or corrupted, the rollback is refused and `current` is left untouched.
 
 ## Tools
 
@@ -78,4 +80,5 @@ ${BUILD_DATASET_ROOT}/artifacts/<module>/<channel>/
 ## Retention
 
 Pruning keeps the newest **`BUILD_RETAIN_PER_CHANNEL`** shas per channel (default **2**,
-floored at 2), and never prunes the `current` or `current.prev` targets.
+floored at 2), and never prunes the `current` or `current.prev` targets — which it reads from
+the pointer FILES at prune time, so an older rollback target is always protected.
