@@ -296,6 +296,7 @@ local prank=tonumber(ARGV[2])
 local now=ARGV[3]
 local jp=ARGV[4]
 local ready=ARGV[9]
+local heavy=ARGV[8]
 local existing=redis.call('GET', dedupe)
 if existing then
   local jk=jp..existing
@@ -305,6 +306,11 @@ if existing then
     local cur=tonumber(redis.call('HGET', jk, 'prank') or '0')
     if prank>cur then
       redis.call('HSET', jk, 'prank', prank, 'priority', ARGV[7])
+    end
+    -- Monotonic host-class upgrade: a later heavy/fast request promotes the job
+    -- to heavy so it respects the heavy-build window; never downgrade heavy→small.
+    if heavy=='1' then
+      redis.call('HSET', jk, 'heavy', '1')
     end
     local newst=st
     if ready=='1' and st=='held' then
@@ -316,6 +322,23 @@ if existing then
       local eff=tonumber(redis.call('HGET', jk, 'prank') or '0')
       local score=seq-(eff*1000000000000)
       redis.call('ZADD', zset, score, existing)
+    end
+    return {existing, 0}
+  end
+  if st=='building' then
+    -- The build is ALREADY happening. Never create a second job for the same
+    -- module@ref. Record a SINGLE idempotent pending re-run (a third request
+    -- does not stack another) so at most ONE follow-up build is queued when the
+    -- current one completes (see COMPLETE_LUA). Still apply the monotonic heavy
+    -- upgrade + priority bump so the re-run respects them.
+    redis.call('HSET', jk, 'rerun', '1')
+    redis.call('HINCRBY', jk, 'coalesced', 1)
+    local cur=tonumber(redis.call('HGET', jk, 'prank') or '0')
+    if prank>cur then
+      redis.call('HSET', jk, 'prank', prank, 'priority', ARGV[7])
+    end
+    if heavy=='1' then
+      redis.call('HSET', jk, 'heavy', '1')
     end
     return {existing, 0}
   end
@@ -351,16 +374,44 @@ redis.call('SADD', KEYS[4], ARGV[1])
 return {1, 'claimed'}
 "#;
 
-/// Release a finished build. Returns `1`.
-/// KEYS: 1=jobhash 2=modulelock 3=hostset 4=dedupe
-/// ARGV: 1=id 2=state 3=now 4=retain_secs
+/// Release a finished build, re-enqueuing exactly ONCE if a re-run was requested
+/// (the `rerun` flag set by an enqueue that arrived while this job was building).
+/// Returns `{rerun_queued(0/1), new_job_id_or_empty}`.
+/// KEYS: 1=jobhash 2=modulelock 3=hostset 4=dedupe 5=zset 6=seq
+/// ARGV: 1=id 2=state 3=now 4=retain_secs 5=rerun_candidate_id 6=job_prefix
 const COMPLETE_LUA: &str = r#"
+-- Always release the per-module lock (only if it still points to this job) and
+-- the host slot, so a completed/failed build never wedges the lock.
 if redis.call('GET', KEYS[2])==ARGV[1] then redis.call('DEL', KEYS[2]) end
 redis.call('SREM', KEYS[3], ARGV[1])
+local rerun=redis.call('HGET', KEYS[1], 'rerun')
+if rerun=='1' then
+  -- Re-enqueue EXACTLY ONE follow-up build for the same module@ref, carrying the
+  -- (possibly upgraded) priority + heavy class forward. The dedupe pointer now
+  -- targets the NEW job (not deleted) so it stays the single owner for module@ref.
+  local module=redis.call('HGET', KEYS[1], 'module')
+  local ref=redis.call('HGET', KEYS[1], 'ref')
+  local prank=tonumber(redis.call('HGET', KEYS[1], 'prank') or '1')
+  local prio=redis.call('HGET', KEYS[1], 'priority') or 'normal'
+  local heavy=redis.call('HGET', KEYS[1], 'heavy') or '0'
+  local seq=redis.call('INCR', KEYS[6])
+  local nid=ARGV[5]
+  local njk=ARGV[6]..nid
+  redis.call('HSET', njk, 'module', module, 'ref', ref, 'prank', prank,
+    'priority', prio, 'heavy', heavy, 'seq', seq, 'requested_at', ARGV[3],
+    'coalesced', 1, 'state', 'queued')
+  redis.call('SET', KEYS[4], nid)
+  local score=seq-(prank*1000000000000)
+  redis.call('ZADD', KEYS[5], score, nid)
+  redis.call('HSET', KEYS[1], 'state', ARGV[2], 'finished_at', ARGV[3])
+  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
+  return {1, nid}
+end
+-- No re-run: clear the dedupe pointer (if still ours) and finalize.
 if redis.call('GET', KEYS[4])==ARGV[1] then redis.call('DEL', KEYS[4]) end
 redis.call('HSET', KEYS[1], 'state', ARGV[2], 'finished_at', ARGV[3])
 redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
-return 1
+return {0, ''}
 "#;
 
 /// Peek the top-N dispatchable jobs, flattened as 5 fields each:
@@ -544,16 +595,22 @@ impl QueueStore for RedisQueue {
         // so resolve the ref from the job hash (one bounded read; still degrades
         // on Unavailable) to clear the right dedupe pointer.
         let git_ref = self.job_ref(job_id).await?;
-        let (jk, lock, hset, dedupe) = (
+        let (jk, lock, hset, dedupe, zset, seq) = (
             job_key(job_id),
             module_lock_key(module),
             host_set_key(host),
             dedupe_key(module, &git_ref),
+            zset_key(),
+            seq_key(),
         );
         let (id, st, now, retain) =
             (job_id.to_string(), state.as_str().to_string(), now_ms(), retain_secs());
+        // Candidate id for a re-run job (used iff the completing job has the
+        // `rerun` flag set); globally unique like every enqueue-minted id.
+        let rerun_id = uuid::Uuid::new_v4().simple().to_string();
+        let jp = job_prefix();
         let script = redis::Script::new(COMPLETE_LUA);
-        let out: Result<i64, ()> = self
+        let out: Result<(i64, String), ()> = self
             .backend
             .with_conn(Namespace::Queue, |mut conn| async move {
                 script
@@ -561,11 +618,15 @@ impl QueueStore for RedisQueue {
                     .key(lock)
                     .key(hset)
                     .key(dedupe)
+                    .key(zset)
+                    .key(seq)
                     .arg(id)
                     .arg(st)
                     .arg(now)
                     .arg(retain)
-                    .invoke_async::<_, i64>(&mut conn)
+                    .arg(rerun_id)
+                    .arg(jp)
+                    .invoke_async::<_, (i64, String)>(&mut conn)
                     .await
             })
             .await;
@@ -652,6 +713,8 @@ pub(crate) mod fake {
         state: String, // held | queued | building | done | failed
         host: Option<HostRole>,
         started_at: i64,
+        /// A single pending re-run requested while this job was building.
+        rerun: bool,
     }
 
     #[derive(Default)]
@@ -683,6 +746,12 @@ pub(crate) mod fake {
             self.state.lock().unwrap().down = down;
         }
 
+        /// Total number of jobs ever recorded (test assertion helper — proves
+        /// a building-state coalesce creates NO second job).
+        pub(crate) fn total_jobs(&self) -> usize {
+            self.state.lock().unwrap().jobs.len()
+        }
+
         /// How many times `module@ref` coalesced (test assertion helper).
         pub(crate) fn coalesced(&self, module: &str, git_ref: &str) -> i64 {
             let s = self.state.lock().unwrap();
@@ -708,23 +777,44 @@ pub(crate) mod fake {
             }
             let dk = format!("{}@{}", req.module, req.git_ref);
             if let Some(existing) = s.dedupe.get(&dk).cloned() {
-                let promote = matches!(
-                    s.jobs.get(&existing).map(|j| j.state.as_str()),
-                    Some("queued") | Some("held")
-                );
-                if promote {
-                    let j = s.jobs.get_mut(&existing).unwrap();
-                    j.coalesced += 1;
-                    if req.priority.rank() > j.prank {
-                        j.prank = req.priority.rank();
+                let st = s.jobs.get(&existing).map(|j| j.state.clone());
+                match st.as_deref() {
+                    Some("queued") | Some("held") => {
+                        let j = s.jobs.get_mut(&existing).unwrap();
+                        j.coalesced += 1;
+                        if req.priority.rank() > j.prank {
+                            j.prank = req.priority.rank();
+                        }
+                        // Monotonic host-class upgrade (never downgrade heavy→small).
+                        if req.heavy {
+                            j.heavy = true;
+                        }
+                        if req.ready && j.state == "held" {
+                            j.state = "queued".into();
+                        }
+                        return Ok(Enqueued {
+                            job_id: existing,
+                            created: false,
+                        });
                     }
-                    if req.ready && j.state == "held" {
-                        j.state = "queued".into();
+                    Some("building") => {
+                        // Already building: record a single idempotent re-run,
+                        // never a second job; still upgrade priority/heavy.
+                        let j = s.jobs.get_mut(&existing).unwrap();
+                        j.rerun = true;
+                        j.coalesced += 1;
+                        if req.priority.rank() > j.prank {
+                            j.prank = req.priority.rank();
+                        }
+                        if req.heavy {
+                            j.heavy = true;
+                        }
+                        return Ok(Enqueued {
+                            job_id: existing,
+                            created: false,
+                        });
                     }
-                    return Ok(Enqueued {
-                        job_id: existing,
-                        created: false,
-                    });
+                    _ => {}
                 }
             }
             s.seq += 1;
@@ -743,6 +833,7 @@ pub(crate) mod fake {
                     state: if req.ready { "queued".into() } else { "held".into() },
                     host: None,
                     started_at: 0,
+                    rerun: false,
                 },
             );
             s.dedupe.insert(dk, id.clone());
@@ -826,11 +917,47 @@ pub(crate) mod fake {
             if let Some(v) = s.host_inflight.get_mut(host.as_str()) {
                 v.retain(|id| id != job_id);
             }
-            if let Some(j) = s.jobs.get(job_id) {
-                let dk = format!("{}@{}", j.module, j.git_ref);
-                if s.dedupe.get(&dk).map(String::as_str) == Some(job_id) {
-                    s.dedupe.remove(&dk);
+            // Capture the completing job's identity + whether a re-run is pending.
+            let done = match s.jobs.get(job_id) {
+                Some(j) => (
+                    j.module.clone(),
+                    j.git_ref.clone(),
+                    j.prank,
+                    j.heavy,
+                    j.rerun,
+                ),
+                None => {
+                    return Ok(());
                 }
+            };
+            let (dmod, dref, dprank, dheavy, rerun) = done;
+            let dk = format!("{dmod}@{dref}");
+            if rerun {
+                // Re-enqueue EXACTLY one follow-up job for the same module@ref,
+                // carrying the upgraded priority/heavy forward; dedupe now points
+                // to the new job (never two jobs for one module@ref).
+                s.seq += 1;
+                let seq = s.seq;
+                s.next_id += 1;
+                let nid = format!("job-{}", s.next_id);
+                s.jobs.insert(
+                    nid.clone(),
+                    Job {
+                        module: dmod,
+                        git_ref: dref,
+                        prank: dprank,
+                        heavy: dheavy,
+                        seq,
+                        coalesced: 1,
+                        state: "queued".into(),
+                        host: None,
+                        started_at: 0,
+                        rerun: false,
+                    },
+                );
+                s.dedupe.insert(dk, nid);
+            } else if s.dedupe.get(&dk).map(String::as_str) == Some(job_id) {
+                s.dedupe.remove(&dk);
             }
             if let Some(j) = s.jobs.get_mut(job_id) {
                 j.state = state.as_str().into();
@@ -999,6 +1126,55 @@ mod tests {
         let b = q.enqueue(&req("m", "r", Priority::Normal, false)).await.unwrap();
         assert_eq!(a.job_id, b.job_id);
         assert_eq!(q.peek(10).await.unwrap().len(), 1, "promoted to dispatchable");
+    }
+
+    #[tokio::test]
+    async fn enqueue_while_building_queues_one_rerun_never_a_second_job() {
+        let q = InMemoryQueue::new();
+        let a = q.enqueue(&req("chord", "abc", Priority::Normal, false)).await.unwrap();
+        // Dispatch it (now building).
+        assert_eq!(
+            q.claim(&a.job_id, "chord", HostRole::Primary, 4).await.unwrap(),
+            ClaimOutcome::Claimed
+        );
+        // Two agents mark the SAME module@ref ready WHILE it's building. Neither
+        // creates a second job; both coalesce onto the building job as a single
+        // pending re-run.
+        let b = q.enqueue(&req("chord", "abc", Priority::Normal, false)).await.unwrap();
+        let c = q.enqueue(&req("chord", "abc", Priority::Normal, false)).await.unwrap();
+        assert!(!b.created && !c.created);
+        assert_eq!(b.job_id, a.job_id);
+        assert_eq!(c.job_id, a.job_id);
+        assert_eq!(q.total_jobs(), 1, "no second job while one is building");
+        assert_eq!(q.peek(10).await.unwrap().len(), 0, "nothing dispatchable yet");
+        // On completion, EXACTLY ONE follow-up build is re-enqueued (not two).
+        q.complete(&a.job_id, "chord", HostRole::Primary, JobState::Done).await.unwrap();
+        let queued = q.peek(10).await.unwrap();
+        assert_eq!(queued.len(), 1, "exactly one coalesced re-run queued");
+        assert_ne!(queued[0].job_id, a.job_id, "the re-run is a fresh job");
+        assert_eq!((queued[0].module.as_str(), queued[0].git_ref.as_str()), ("chord", "abc"));
+        // Completing the re-run (no new readiness) leaves the queue empty — the
+        // re-run pile is bounded, never unbounded.
+        let rid = queued[0].job_id.clone();
+        q.claim(&rid, "chord", HostRole::Primary, 4).await.unwrap();
+        q.complete(&rid, "chord", HostRole::Primary, JobState::Done).await.unwrap();
+        assert_eq!(q.peek(10).await.unwrap().len(), 0);
+        assert_eq!(q.total_jobs(), 2, "one original + exactly one re-run");
+    }
+
+    #[tokio::test]
+    async fn coalesce_upgrades_host_class_to_heavy_monotonically() {
+        let q = InMemoryQueue::new();
+        // First recorded as a small/primary build.
+        let a = q.enqueue(&req("harmony", "r", Priority::Normal, false)).await.unwrap();
+        assert!(!q.peek(10).await.unwrap()[0].heavy);
+        // A later heavy request for the same module@ref upgrades it to heavy.
+        let b = q.enqueue(&req("harmony", "r", Priority::Normal, true)).await.unwrap();
+        assert_eq!(a.job_id, b.job_id);
+        assert!(q.peek(10).await.unwrap()[0].heavy, "coalesce upgraded to heavy");
+        // A subsequent small request must NOT downgrade it (monotonic).
+        q.enqueue(&req("harmony", "r", Priority::Normal, false)).await.unwrap();
+        assert!(q.peek(10).await.unwrap()[0].heavy, "heavy is never downgraded");
     }
 
     #[tokio::test]

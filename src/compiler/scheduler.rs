@@ -529,6 +529,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn small_job_coalesced_to_heavy_becomes_window_gated() {
+        let q = Arc::new(InMemoryQueue::new());
+        // First request is small (would dispatch immediately on primary)...
+        q.enqueue(&req("harmony", "r", false)).await.unwrap();
+        // ...but a later heavy request for the same module@ref upgrades it.
+        q.enqueue(&req("harmony", "r", true)).await.unwrap();
+        let ex = RecordingExecutor::new(false);
+        let idle = Arc::new(CountingIdle::default());
+        let s = sched(
+            q.clone(),
+            ex.clone(),
+            idle.clone(),
+            cfg(1, 1, vec![Window { start: 0, end: 6 }]),
+        );
+        // Outside the window: the now-heavy job is HELD, not dispatched on primary.
+        let r = s.tick_once(12, false).await;
+        assert_eq!(r.held_window.len(), 1, "coalesced-to-heavy job is window-gated");
+        assert!(r.dispatched.is_empty());
+        assert!(ex.built.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn idle_mode_untouched_for_small_builds() {
         let q = Arc::new(InMemoryQueue::new());
         q.enqueue(&req("terminus", "r", false)).await.unwrap();
