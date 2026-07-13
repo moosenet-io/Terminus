@@ -776,23 +776,23 @@ impl RustTool for CompilerBuild {
 }
 
 /// Resolve the EFFECTIVE `request_id` for a build attempt and whether a
-/// caller-supplied id was INVALID and substituted. A caller value that is a valid
-/// `[A-Za-z0-9._-]` segment within the length bound is used as-is (→ `false`); a
-/// present-but-invalid value is DISCARDED and replaced by an auto-generated id
-/// (→ `true`, an observable substitution); an absent value auto-generates
-/// silently (→ `false`, nothing was supplied to invalidate). The fallback (never
-/// a hard reject) preserves the "a discoverable id always exists" invariant.
+/// caller-supplied id was INVALID and substituted. The caller value is validated
+/// RAW — NO trimming/normalization (a lossy trim could collapse `" build-1 "` and
+/// `"build-1"` onto the same track). A present value that is a valid
+/// `[A-Za-z0-9._-]` segment within the length bound is used VERBATIM (→ `false`);
+/// a present-but-invalid value (leading/trailing/inner whitespace, empty, any
+/// disallowed char, overlong) is DISCARDED and replaced by an auto-generated id
+/// (→ `true`, an observable substitution); an ABSENT value auto-generates silently
+/// (→ `false`, nothing was supplied to invalidate). The fallback (never a hard
+/// reject) preserves the "a discoverable id always exists" invariant.
 fn resolve_request_id(args: &Value) -> (String, bool) {
-    match args
-        .get("request_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-    {
-        Some(s) if !s.is_empty() && is_valid_request_id(s) => (s.to_string(), false),
-        // Present but invalid → substitute (observable).
-        Some(s) if !s.is_empty() => (uuid::Uuid::new_v4().simple().to_string(), true),
-        // Absent/blank → auto-generate (nothing supplied, not a substitution).
-        _ => (uuid::Uuid::new_v4().simple().to_string(), false),
+    match args.get("request_id").and_then(Value::as_str) {
+        // Present + valid (validated RAW, no trimming) → use verbatim.
+        Some(s) if is_valid_request_id(s) => (s.to_string(), false),
+        // Present but invalid → substitute (observable). No silent normalization.
+        Some(_) => (uuid::Uuid::new_v4().simple().to_string(), true),
+        // Absent / not a string → auto-generate (nothing supplied to invalidate).
+        None => (uuid::Uuid::new_v4().simple().to_string(), false),
     }
 }
 
@@ -1557,16 +1557,16 @@ impl RustTool for CompilerProgress {
 
     async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
         let request_id = str_arg(&args, "request_id")?;
-        // Reject a malformed / overlong id at the boundary with a CLEAR validation
-        // error (never truncate it to a colliding key). A well-formed unknown id
-        // still returns not_found below.
-        if !is_valid_request_id(request_id.trim()) {
+        // Reject a malformed / overlong / whitespace-bearing id at the boundary
+        // with a CLEAR validation error — validated RAW, NO trimming (a lossy trim
+        // could collapse distinct ids like `" x "` and `"x"` onto one stream). A
+        // well-formed unknown id still returns not_found below.
+        if !is_valid_request_id(&request_id) {
             return Err(ToolError::InvalidArgument(format!(
-                "request_id must be a single [A-Za-z0-9._-] segment of at most {} bytes",
+                "request_id must be a single [A-Za-z0-9._-] segment of at most {} bytes (no surrounding or inner whitespace)",
                 events::MAX_REQUEST_ID_LEN
             )));
         }
-        let request_id = request_id.trim().to_string();
         let since = args.get("since").and_then(Value::as_u64).unwrap_or(0);
         let wait_ms = args
             .get("wait_ms")
@@ -2262,6 +2262,22 @@ mod tests {
             &json!({ "request_id": "z".repeat(events::MAX_REQUEST_ID_LEN + 1) }),
         );
         assert!(is_valid_request_id(&id4) && inv4);
+        // WHITESPACE-BEARING ids are INVALID — validated RAW, never trimmed. Both a
+        // surrounding-whitespace and an inner-space id are substituted + flagged,
+        // and the effective id is NOT the trimmed caller value.
+        for bad in [" build-1 ", "build-1 ", " build-1", "a b", "\tbuild-1"] {
+            let (idw, invw) = resolve_request_id(&json!({ "request_id": bad }));
+            assert!(
+                invw,
+                "whitespace-bearing id {bad:?} is an observable substitution"
+            );
+            assert!(is_valid_request_id(&idw), "effective id is valid: {idw:?}");
+            assert_ne!(idw, "build-1", "no silent trim/normalize of {bad:?}");
+        }
+        // A clean id is used VERBATIM (byte-identical).
+        let (idc, invc) = resolve_request_id(&json!({ "request_id": "build-1" }));
+        assert_eq!(idc, "build-1");
+        assert!(!invc);
     }
 
     /// Process-wide serializer for the rare test that must toggle an env var, so
@@ -2547,6 +2563,39 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err2, ToolError::InvalidArgument(_)));
+        // WHITESPACE-BEARING ids are rejected RAW (not silently trimmed to a valid
+        // id): surrounding whitespace and inner space both → InvalidArgument.
+        for bad in [" build-1 ", "build-1 ", "a b"] {
+            let e = CompilerProgress
+                .execute_structured(json!({ "request_id": bad }))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(e, ToolError::InvalidArgument(_)),
+                "whitespace-bearing id {bad:?} must be rejected, not trimmed"
+            );
+        }
+    }
+
+    #[test]
+    fn ids_differing_only_in_surrounding_whitespace_never_share_a_track() {
+        // Directly on the bus: the clean id and a whitespace-bearing variant are
+        // DISTINCT keys — verbatim, never normalized — so they never collide. (The
+        // tool boundary rejects/substitutes the whitespace one; this proves the
+        // underlying store keys are byte-exact.)
+        let bus = events::ProgressBus::with_bounds(16, 8, 0);
+        bus.emit("build-1", events::Emit::stage(events::Stage::Queued));
+        bus.emit(
+            " build-1 ",
+            events::Emit::stage(events::Stage::Failed).message("other"),
+        );
+        let clean = bus.snapshot("build-1", 0).unwrap();
+        let spaced = bus.snapshot(" build-1 ", 0).unwrap();
+        assert_eq!(clean.request_id, "build-1");
+        assert_eq!(spaced.request_id, " build-1 ");
+        assert!(!clean.terminal, "clean id keeps its own (queued) stream");
+        assert!(spaced.terminal, "spaced id is a separate (failed) stream");
+        assert_ne!(clean.generation, spaced.generation);
     }
 
     #[tokio::test]

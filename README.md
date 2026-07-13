@@ -222,14 +222,16 @@ The `request_id` is returned on **both** outcomes: on success in the result text
 redacted error tail) stays discoverable even when the caller did not supply an id up front.
 
 A caller-supplied `request_id` must be a single `[A-Za-z0-9._-]` segment of at most 128 bytes.
-This is a **hard validation rule, not a lossy clamp** (so two distinct ids can never be
-truncated onto one track): `compiler_build` **falls back to an auto-generated id** when the
-supplied one is missing or invalid (never returning without a surfaced id), and
-`compiler_progress` **rejects** an invalid/overlong id with a clear validation error. When a
-supplied id is invalid and substituted, the fallback is **observable, not silent**: a
-`tracing::warn`, a `supplied_request_id_invalid: true` field in the success structured output,
-and a `[supplied_request_id_invalid]` marker in the returned error on failure — so a client can
-correlate the id it sent with the effective id used.
+This is a **hard validation rule, not a lossy clamp** — and it is validated **RAW, with no
+trimming or normalization** (so `" build-1 "` and `"build-1"` are *distinct* values, neither
+collapsed onto the other's track): a value with leading/trailing/inner whitespace (or any
+disallowed char, or overlong) is **invalid**. `compiler_build` **falls back to an
+auto-generated id** when the supplied one is missing or invalid (never returning without a
+surfaced id), and `compiler_progress` **rejects** an invalid/overlong/whitespace-bearing id
+with a clear validation error. When a supplied id is invalid and substituted, the fallback is
+**observable, not silent**: a `tracing::warn`, a `supplied_request_id_invalid: true` field in
+the success structured output, and a `[supplied_request_id_invalid]` marker in the returned
+error on failure — so a client can correlate the id it sent with the effective id used.
 
 ```
 compiler_progress(request_id, since=0, wait_ms=0)
