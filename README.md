@@ -286,7 +286,7 @@ process restarts. Three numeric, env-tunable bounds keep memory bounded:
 | --- | --- | --- |
 | `COMPILER_PROGRESS_MAX_EVENTS` | `256` | Ring-buffer depth per build (oldest events fall off). |
 | `COMPILER_PROGRESS_MAX_BUILDS` | `64` | Max tracked builds (least-recently-updated evicted at capacity). |
-| `COMPILER_PROGRESS_TTL_SECS` | `3600` | Idle TTL; a build untouched this long is swept on the next write. |
+| `COMPILER_PROGRESS_TTL_SECS` | `3600` | Idle TTL; a build untouched this long is swept on the next write **and** enforced on every read, so a quiet process still returns `not_found` for an expired id. |
 
 Log-tail lines are **secret-sanitized by the emitter** (`compiler_build` runs every captured
 cargo output line through its existing S6/S7 redaction set) *before* they enter the bus, so a

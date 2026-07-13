@@ -51,7 +51,9 @@
 //!   recent tail).
 //! - At most [`max_builds`](ProgressBus::max_builds) tracked; the
 //!   least-recently-updated build is evicted when the map is full, and any build
-//!   idle past the TTL is swept on the next write.
+//!   idle past the TTL is swept on the next write AND enforced on every READ
+//!   (`snapshot`/`poll`), so a quiet process still returns `not_found` for an
+//!   expired id (the stale track is lazily evicted on that read).
 //! All three bounds are env-tunable numeric knobs (not infra literals — S1).
 //!
 //! ## Secret discipline (S6/S7)
@@ -453,11 +455,32 @@ impl ProgressBus {
         seq
     }
 
+    /// Whether a build whose last wall-clock activity was `updated_ms` is expired
+    /// under `ttl_ms` at `now`. `ttl_ms == 0` disables expiry. Uses the WALL CLOCK
+    /// (the same field the emit-side sweep uses), NOT the monotonic LRU ordinal
+    /// (that orders eviction only).
+    fn is_expired(ttl_ms: u64, updated_ms: u64, now: u64) -> bool {
+        ttl_ms != 0 && now.saturating_sub(updated_ms) > ttl_ms
+    }
+
     /// The current snapshot for `request_id`, returning events with `seq > since`.
-    /// `None` when the build is unknown (never tracked or already swept) — an
-    /// unknown id is `not_found`, not an error.
+    /// `None` when the build is unknown (never tracked or already swept), OR when
+    /// it is EXPIRED past the TTL — checked on the READ so a quiet process (no
+    /// intervening `emit` to run the sweep) still returns `not_found` for an
+    /// expired id, and the stale track is lazily evicted here. An unknown/expired
+    /// id is `not_found`, not an error.
     pub fn snapshot(&self, request_id: &str, since: u64) -> Option<Snapshot> {
-        let map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let now = now_ms();
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        // Read-side expiry: an expired build reads as not_found even with no emit.
+        let expired = match map.get(request_id) {
+            Some(t) => Self::is_expired(self.ttl_ms, t.updated_ms, now),
+            None => return None,
+        };
+        if expired {
+            map.remove(request_id); // lazily evict so it does not linger
+            return None;
+        }
         let track = map.get(request_id)?;
         let events: Vec<ProgressEvent> = track
             .events
@@ -498,7 +521,18 @@ impl ProgressBus {
         since: u64,
     ) -> Option<(Snapshot, broadcast::Receiver<ProgressEvent>)> {
         let rx = {
-            let map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let now = now_ms();
+            let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            // Read-side expiry applies here too (subscribing to an expired id must
+            // not resurrect it): expired → lazily evict + not_found.
+            let expired = match map.get(request_id) {
+                Some(t) => Self::is_expired(self.ttl_ms, t.updated_ms, now),
+                None => return None,
+            };
+            if expired {
+                map.remove(request_id);
+                return None;
+            }
             map.get(request_id)?.tx.subscribe()
         };
         let snap = self.snapshot(request_id, since)?;
@@ -509,7 +543,9 @@ impl ProgressBus {
     /// wait up to `wait` for the next event, then return a fresh snapshot. A
     /// terminal build returns at once (nothing more will come). An unknown build
     /// returns `None`. On subscriber disconnect the receiver simply drops — the
-    /// build is unaffected (the tx lives in the track).
+    /// build is unaffected (the tx lives in the track). If the build EXPIRES past
+    /// the TTL mid-wait, the post-wait `snapshot` applies read-side expiry and
+    /// resolves to `None` (not_found) rather than returning stale data.
     pub async fn poll(
         &self,
         request_id: &str,
@@ -521,7 +557,9 @@ impl ProgressBus {
             return Some(snap);
         }
         // Nothing new yet — await a live event (or timeout), then re-snapshot so
-        // the caller always gets the full current state, not just one delta.
+        // the caller always gets the full current state, not just one delta. The
+        // re-snapshot also re-checks TTL, so an id that expired during the wait
+        // resolves to not_found instead of hanging or returning stale data.
         let _ = tokio::time::timeout(wait, rx.recv()).await;
         self.snapshot(request_id, since)
     }
@@ -530,6 +568,15 @@ impl ProgressBus {
     #[cfg(test)]
     fn tracked(&self) -> usize {
         self.inner.lock().unwrap().len()
+    }
+
+    /// Test helper: backdate a build's wall-clock activity so read-side TTL expiry
+    /// can be exercised without sleeping. No-op if the build is unknown.
+    #[cfg(test)]
+    fn force_updated_ms(&self, request_id: &str, updated_ms: u64) {
+        if let Some(t) = self.inner.lock().unwrap().get_mut(request_id) {
+            t.updated_ms = updated_ms;
+        }
     }
 }
 
@@ -816,6 +863,50 @@ mod tests {
     fn unknown_build_is_none_not_error() {
         let bus = ProgressBus::with_bounds(16, 8, 0);
         assert!(bus.snapshot("never", 0).is_none());
+    }
+
+    #[tokio::test]
+    async fn read_side_ttl_expiry_returns_not_found_without_emit() {
+        // A QUIET process: no emit runs the sweep, so expiry must be enforced on
+        // the READ. ttl = 1000ms; backdate "stale" well past it, leave "live"
+        // fresh. Neither snapshot nor poll receives an intervening emit.
+        let bus = ProgressBus::with_bounds(16, 8, 1000);
+        bus.emit("live", Emit::stage(Stage::Queued));
+        bus.emit("stale", Emit::stage(Stage::Queued));
+        bus.force_updated_ms("stale", now_ms().saturating_sub(5_000));
+
+        // snapshot: expired → not_found (None); within-TTL build unaffected.
+        assert!(
+            bus.snapshot("stale", 0).is_none(),
+            "expired build reads as not_found via snapshot with no emit"
+        );
+        assert!(
+            bus.snapshot("live", 0).is_some(),
+            "within-TTL build unaffected"
+        );
+        // The stale track was lazily evicted on the expired read.
+        assert!(bus.snapshot("stale", 0).is_none());
+
+        // poll: same contract — expired → None, live → Some.
+        assert!(bus
+            .poll("stale", 0, std::time::Duration::from_millis(0))
+            .await
+            .is_none());
+        assert!(bus
+            .poll("live", 0, std::time::Duration::from_millis(0))
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn poll_resolves_not_found_if_build_expires_mid_wait() {
+        // ttl = 1ms; a caught-up poller (since = last_seq) with no incoming emit
+        // waits 60ms → the build expires DURING the wait → the post-wait snapshot
+        // applies read-side expiry and resolves to not_found (not stale data).
+        let bus = ProgressBus::with_bounds(16, 8, 1);
+        bus.emit("q", Emit::stage(Stage::Scheduled)); // non-terminal, last_seq = 1
+        let snap = bus.poll("q", 1, std::time::Duration::from_millis(60)).await;
+        assert!(snap.is_none(), "id expired mid-wait resolves to not_found");
     }
 
     #[test]
