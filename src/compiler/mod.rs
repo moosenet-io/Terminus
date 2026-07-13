@@ -689,20 +689,44 @@ impl RustTool for CompilerBuild {
             }
             _ => uuid::Uuid::new_v4().simple().to_string(),
         };
-        // Run the build; emit the terminal Failed event on any error path so a
-        // subscriber always sees a terminal state (the happy path emits Published
-        // from inside build_inner, next to the artifact sha).
-        let result = self.build_inner(&request_id, args).await;
-        if let Err(e) = &result {
-            // The error Display is already secret-sanitized: `run()` redacts every
-            // subprocess stdout/stderr tail before it becomes a ToolError, and the
-            // config/validation errors carry no secrets (S6/S7).
-            events::bus().emit(
-                &request_id,
-                events::Emit::stage(events::Stage::Failed).message(e.to_string()),
-            );
+        // Run the build. On ANY error path: emit the terminal Failed event AND
+        // surface the request_id back to the caller in the returned error, so a
+        // failed build's progress stream stays discoverable even when the caller
+        // did not supply an id (invariant: every compiler_build call — success OR
+        // build-failure — returns the stable request_id). The happy path emits
+        // Published + returns the id in the structured output from build_inner.
+        match self.build_inner(&request_id, args).await {
+            Ok(out) => Ok(out),
+            Err(e) => {
+                // The error Display is already secret-sanitized: `run()` redacts
+                // every subprocess stdout/stderr tail before it becomes a
+                // ToolError, and config/validation errors carry no secrets (S6/S7).
+                events::bus().emit(
+                    &request_id,
+                    events::Emit::stage(events::Stage::Failed).message(e.to_string()),
+                );
+                Err(tag_error_with_request_id(e, &request_id))
+            }
         }
-        result
+    }
+}
+
+/// Prepend `[request_id=<id>] ` to a build error's message, preserving the
+/// `ToolError` variant, so a FAILED build still hands the caller the stable
+/// request_id — the caller extracts it and queries `compiler_progress` to read
+/// the failed build's stream (terminal `failed` event + redacted error tail).
+/// This is how the "every build returns a stable request_id" invariant holds on
+/// the failure path (the success path returns it in the structured output/text).
+fn tag_error_with_request_id(e: ToolError, request_id: &str) -> ToolError {
+    let tag = format!("[request_id={request_id}] ");
+    match e {
+        ToolError::NotConfigured(m) => ToolError::NotConfigured(format!("{tag}{m}")),
+        ToolError::InvalidArgument(m) => ToolError::InvalidArgument(format!("{tag}{m}")),
+        ToolError::Http(m) => ToolError::Http(format!("{tag}{m}")),
+        ToolError::Database(m) => ToolError::Database(format!("{tag}{m}")),
+        ToolError::Execution(m) => ToolError::Execution(format!("{tag}{m}")),
+        ToolError::NotFound(m) => ToolError::NotFound(format!("{tag}{m}")),
+        ToolError::Conflict(m) => ToolError::Conflict(format!("{tag}{m}")),
     }
 }
 
@@ -2032,5 +2056,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(miss.structured.unwrap()["status"], "not_found");
+    }
+
+    #[test]
+    fn error_tag_carries_request_id_preserving_variant() {
+        let e = tag_error_with_request_id(
+            ToolError::NotConfigured("BUILD_DATASET_ROOT is not configured".into()),
+            "abc123",
+        );
+        // Variant preserved; message prefixed with the discoverable id.
+        assert!(matches!(e, ToolError::NotConfigured(_)));
+        assert!(e.to_string().contains("[request_id=abc123]"));
+    }
+
+    #[tokio::test]
+    async fn failed_build_surfaces_request_id_and_is_discoverable() {
+        // Force a DETERMINISTIC post-`queued` failure with no subprocess: unset the
+        // dataset root so `dataset_root()` returns NotConfigured right after the
+        // build emits `queued`. (Only build_inner reads this var, and only this
+        // test drives build_inner, so the removal can't disturb other tests.)
+        std::env::remove_var("BUILD_DATASET_ROOT");
+
+        // NO caller-supplied request_id → one is auto-generated and MUST come back.
+        let err = CompilerBuild
+            .execute_structured(json!({ "module": "terminus", "ref": "abc123" }))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        let rid = msg
+            .split("request_id=")
+            .nth(1)
+            .and_then(|s| s.split(']').next())
+            .map(|s| s.trim().to_string())
+            .expect("a failed build's error must carry request_id=<id>");
+        assert!(
+            !rid.is_empty(),
+            "auto-generated request_id surfaced on failure"
+        );
+
+        // The invariant's payoff: compiler_progress(rid) FINDS the failed build's
+        // stream — a terminal `failed` event with the (redacted) error tail.
+        let prog = CompilerProgress
+            .execute_structured(json!({ "request_id": rid }))
+            .await
+            .unwrap();
+        let s = prog.structured.unwrap();
+        assert_eq!(s["request_id"], rid);
+        assert_eq!(s["stage"], "failed");
+        assert_eq!(s["terminal"], true);
+        let evs = s["events"].as_array().unwrap();
+        // queued was emitted before the failure, then the terminal failed event.
+        assert_eq!(evs.first().unwrap()["stage"], "queued");
+        assert_eq!(evs.last().unwrap()["stage"], "failed");
+        assert!(
+            evs.last().unwrap()["message"].is_string(),
+            "failed event carries the (redacted) error tail"
+        );
     }
 }

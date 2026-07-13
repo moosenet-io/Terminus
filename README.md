@@ -216,6 +216,11 @@ a spinner. Every `compiler_build` call carries a stable `request_id` (supply one
 auto-generated id back from the build result / its `structured.request_id`), and each stage of
 the build emits a typed event into a per-request ring buffer + a live broadcast channel.
 
+The `request_id` is returned on **both** outcomes: on success in the result text +
+`structured.request_id`; on a build **failure** it is prefixed into the returned error
+(`[request_id=<id>] …`), so a failed build's progress stream (terminal `failed` event + the
+redacted error tail) stays discoverable even when the caller did not supply an id up front.
+
 ```
 compiler_progress(request_id, since=0, wait_ms=0)
 ```
