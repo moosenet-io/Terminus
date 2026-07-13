@@ -70,6 +70,8 @@ pub mod nexus;
 pub mod pg;
 pub mod pki;
 pub mod plane;
+pub mod ratelimit;
+pub mod redis;
 pub mod registry;
 pub mod relay;
 pub mod scribe;

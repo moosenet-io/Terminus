@@ -613,6 +613,13 @@ fn is_approval_required_marker(detail: &str) -> bool {
 struct GatewayFrameworkInner {
     allowlist: AllowlistPolicy,
     rate_limiter: Arc<dyn RateLimiter>,
+    /// BLD-20: bounded FIFO admission queue for over-limit requests. `None` =
+    /// no queuing (immediate 429 on over-limit) — the case for the in-process
+    /// limiter / tests. `Some` when the shared Redis is configured.
+    request_queue: Option<Arc<crate::ratelimit::RequestQueue>>,
+    queue_max_depth: i64,
+    queue_max_wait: std::time::Duration,
+    queue_poll: std::time::Duration,
 }
 
 /// The shared gateway pipeline itself: owns the allowlist policy and rate
@@ -636,20 +643,127 @@ impl std::fmt::Debug for GatewayFramework {
 }
 
 impl GatewayFramework {
+    /// Build with an explicit limiter and NO admission queue (immediate 429 on
+    /// over-limit). Used by tests and the in-process path.
     pub fn new(allowlist: AllowlistPolicy, rate_limiter: Arc<dyn RateLimiter>) -> Self {
+        Self::with_queue(allowlist, rate_limiter, None)
+    }
+
+    /// Build with an explicit limiter and an optional bounded FIFO admission
+    /// queue (BLD-20). Queue knobs come from `crate::config`.
+    pub fn with_queue(
+        allowlist: AllowlistPolicy,
+        rate_limiter: Arc<dyn RateLimiter>,
+        request_queue: Option<Arc<crate::ratelimit::RequestQueue>>,
+    ) -> Self {
         Self {
-            inner: Arc::new(GatewayFrameworkInner { allowlist, rate_limiter }),
+            inner: Arc::new(GatewayFrameworkInner {
+                allowlist,
+                rate_limiter,
+                request_queue,
+                queue_max_depth: crate::config::gateway_queue_max_depth(),
+                queue_max_wait: crate::config::gateway_queue_max_wait(),
+                queue_poll: crate::config::gateway_queue_poll(),
+            }),
         }
     }
 
     /// Build the production framework from env config
     /// (`crate::config::gateway_allowlist_json` +
     /// `crate::config::gateway_rate_limit_burst`/`gateway_rate_limit_refill_per_sec`)
-    /// — what `terminus_primary`'s `main()` calls.
+    /// — what `terminus_primary`'s `main()` calls. When the shared Redis is
+    /// configured, the Redis limiter AND the FIFO admission queue are built from
+    /// the SAME pool; see [`Self::rate_limiter_from_env`] for the selection rule.
     pub fn from_env() -> Self {
-        Self::new(
-            AllowlistPolicy::from_env(),
-            Arc::new(InProcessRateLimiter::from_env()),
+        let allowlist = AllowlistPolicy::from_env();
+        // Build both proxy consumers (limiter + queue) from ONE shared backend.
+        if let Some(backend) = crate::redis::RedisBackend::from_env() {
+            let limiter = Arc::new(crate::ratelimit::RedisRateLimiter::from_env(backend.clone()));
+            let queue = Arc::new(crate::ratelimit::RequestQueue::new(backend, "proxy"));
+            return Self::with_queue(allowlist, limiter, Some(queue));
+        }
+        // Redis not constructed → no queue; pick the limiter by config-presence.
+        Self::with_queue(allowlist, Self::rate_limiter_from_env(), None)
+    }
+
+    /// Select the proxy rate-limiter backend (BLD-20). Every request already
+    /// passes through `self.inner.rate_limiter.check(..)` in [`guard`] — this
+    /// only chooses WHICH limiter backs that check:
+    ///
+    /// - When the shared Redis is configured (`REDIS_URL`, materialized from the
+    ///   vault), use the durable, cross-instance, atomic-Lua
+    ///   [`crate::ratelimit::RedisRateLimiter`]: limits then hold across a
+    ///   gateway restart and across multiple gateway instances, and an
+    ///   unreachable Redis **fails CLOSED** (the limiter returns `Limited` →
+    ///   `guard` denies with a 429) so a Redis outage can never become an
+    ///   un-throttled flood at the backends (BLD-20 EDGE CASE).
+    /// - Otherwise (only when `REDIS_URL` is genuinely ABSENT) fall back to the
+    ///   interim in-process token bucket.
+    ///
+    /// The selection is gated on whether Redis is CONFIGURED (the URL is
+    /// present), NOT on whether a live connection can be made — backend
+    /// construction is lazy (no connect), so a configured-but-unreachable Redis
+    /// still selects the Redis limiter and fails CLOSED at runtime rather than
+    /// silently downgrading to in-process at construction. If the URL is present
+    /// but unparseable (a hard misconfiguration), we select a fail-closed
+    /// sentinel — never a silent downgrade.
+    ///
+    /// NOTE (scope): this is the PROXY rate-limiter consumer of the BLD-20
+    /// Redis, wired here. The other two consumers — sccache shared cache
+    /// (BLD-05) and the compiler queue/scheduler state (BLD-06) — are wired by
+    /// those items, not BLD-20; the shared client + namespaces they use live in
+    /// `crate::redis`.
+    fn rate_limiter_from_env() -> Arc<dyn RateLimiter> {
+        if crate::redis::resolve_url().is_none() {
+            // Redis genuinely not configured → the interim in-process limiter.
+            return Arc::new(InProcessRateLimiter::from_env());
+        }
+        // REDIS_URL is set ⇒ a Redis-backed limiter MUST be selected.
+        match crate::redis::RedisBackend::from_env() {
+            Some(backend) => Arc::new(crate::ratelimit::RedisRateLimiter::from_env(backend)),
+            None => {
+                // Configured but the URL would not parse — do NOT downgrade to
+                // in-process (that would drop the cross-instance + fail-closed
+                // guarantees). Fail CLOSED and surface the misconfiguration.
+                tracing::error!(
+                    "REDIS_URL is set but unparseable; proxy rate-limiter selecting the \
+                     fail-closed sentinel (all requests denied until REDIS_URL is fixed)"
+                );
+                Arc::new(crate::ratelimit::AlwaysLimited)
+            }
+        }
+    }
+
+    /// BLD-20: attempt bounded FIFO admission for an over-limit request. Returns
+    /// `true` if the request was admitted (proceed), `false` if it should be
+    /// 429'd. `false` when no queue is configured (immediate shed), or on
+    /// `QueueFull`/`TimedOut`/`Unavailable` (Redis down ⇒ fail CLOSED). While
+    /// waiting at the head, it re-checks the rate limiter — so it admits exactly
+    /// when a token frees, preserving the limit rather than bypassing it.
+    async fn try_admit(&self, key: &str) -> bool {
+        let Some(queue) = &self.inner.request_queue else {
+            return false; // no queuing configured → immediate 429
+        };
+        // The queue allocates a GLOBALLY-UNIQUE ticket internally (per-instance
+        // salt + Redis-atomic INCR) — no caller-side counter, so two gateway
+        // instances can never collide on a ticket for the same rate-limit key.
+        let limiter = self.inner.rate_limiter.clone();
+        let k = key.to_string();
+        let acquire = || {
+            let limiter = limiter.clone();
+            let k = k.clone();
+            async move { limiter.check(&k).await == RateLimitDecision::Allowed }
+        };
+        matches!(
+            queue
+                .admit(
+                    self.inner.queue_max_depth,
+                    self.inner.queue_max_wait,
+                    self.inner.queue_poll,
+                    acquire,
+                )
+                .await,
+            crate::ratelimit::Admission::Admitted
         )
     }
 
@@ -720,10 +834,17 @@ impl GatewayFramework {
 
         let key = rate_limit_key(&identity_str, action);
         if self.inner.rate_limiter.check(&key).await == RateLimitDecision::Limited {
-            let detail = format!("rate limit exceeded for '{identity_str}' on '{action}'");
-            AuditEntry::new(&identity_str, action, kind, AuditResult::DeniedRateLimited, Some(&detail))
-                .log();
-            return Err(denied_response(StatusCode::TOO_MANY_REQUESTS, &detail));
+            // BLD-20: over-limit → don't 429 immediately. If a bounded FIFO
+            // admission queue is configured, ADMIT the request through it
+            // (FIFO fairness + a bounded wait for a token to free); only shed
+            // load (429) when the queue is full or the wait times out. Redis
+            // unreachable ⇒ fail CLOSED (429), never admit unbounded.
+            if !self.try_admit(&key).await {
+                let detail = format!("rate limit exceeded for '{identity_str}' on '{action}'");
+                AuditEntry::new(&identity_str, action, kind, AuditResult::DeniedRateLimited, Some(&detail))
+                    .log();
+                return Err(denied_response(StatusCode::TOO_MANY_REQUESTS, &detail));
+            }
         }
 
         Ok(GatewayContext {

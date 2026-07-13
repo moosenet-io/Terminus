@@ -1,0 +1,41 @@
+# BLD-20 — systemd unit for the terminus-primary-owned Redis.
+#
+# This is a TEMPLATE. `deploy/redis/install.sh` renders `__TOKEN__` placeholders
+# from vault-materialized env (paths only — no infra literals) and installs it.
+# The rendered config it points at is itself asserted loopback/mesh-only + auth
+# by install.sh BEFORE this unit is enabled.
+
+[Unit]
+Description=terminus-primary shared Redis (BLD-20: sccache/queue/prefix-overlay/proxy-ratelimit backend)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=__REDIS_USER__
+Group=__REDIS_USER__
+# Renders to a 0600, service-user-owned file exporting REDISCLI_AUTH=<requirepass>
+# (the same vault-materialized password install.sh writes to requirepass — no
+# secret literal in this unit). redis-cli auto-uses REDISCLI_AUTH, so ExecStop
+# authenticates for a graceful `shutdown nosave` (the server always requires
+# auth); without it shutdown is NOAUTH and systemd SIGKILLs the server.
+EnvironmentFile=__REDIS_ENV_FILE__
+ExecStart=__REDIS_SERVER_BIN__ __REDIS_CONF_PATH__ --supervised systemd
+ExecStop=__REDIS_CLI_BIN__ -p __REDIS_PORT__ shutdown nosave
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=30s
+
+# Hardening — this instance holds durable fleet state; keep its blast radius small.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=__REDIS_DATA_DIR__
+
+[Install]
+WantedBy=multi-user.target
