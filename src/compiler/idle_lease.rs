@@ -96,6 +96,16 @@ const ENABLED_ENV: &str = "BUILD_IDLE_ENABLED";
 /// attempts exhaust, so a service is never stranded idle. From
 /// `BUILD_IDLE_PERSISTENT_RETRY_SECS`.
 const PERSISTENT_RETRY_SECS_ENV: &str = "BUILD_IDLE_PERSISTENT_RETRY_SECS";
+/// The DURABLE remote-idle-recovery WINDOW (secs): after an idle-call timeout/failure
+/// aborts, keep re-activating the REMOTE (Chord) backend for this long so a late-landing
+/// `/idle` (the server may finish processing AFTER our client-side timeout) is overridden
+/// — Chord is never left idle by a timed-out idle that lands after the abort's activate.
+/// MUST safely exceed Chord's max idle-processing time. From
+/// `BUILD_IDLE_REMOTE_RECOVERY_SECS`.
+const REMOTE_RECOVERY_SECS_ENV: &str = "BUILD_IDLE_REMOTE_RECOVERY_SECS";
+/// Poll cadence (ms) within the remote-idle-recovery window. From
+/// `BUILD_IDLE_REMOTE_RECOVERY_POLL_MS`.
+const REMOTE_RECOVERY_POLL_MS_ENV: &str = "BUILD_IDLE_REMOTE_RECOVERY_POLL_MS";
 
 const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 120;
 /// Default max-lease: a full build timeout plus generous headroom, so the watchdog
@@ -114,6 +124,12 @@ const DEFAULT_OP_TIMEOUT_SECS: u64 = 60;
 const RELEASE_MAX_ATTEMPTS: u32 = 5;
 /// Default backoff between PERSISTENT reactivation-backstop rounds.
 const DEFAULT_PERSISTENT_RETRY_SECS: u64 = 30;
+/// Default remote-idle-recovery window: generous, safely exceeding any plausible Chord
+/// max idle-processing time so a late-landing idle is always overridden within it.
+const DEFAULT_REMOTE_RECOVERY_SECS: u64 = 120;
+/// Default poll cadence within the remote-idle-recovery window (prompt override of a
+/// late idle without hammering the control endpoint).
+const DEFAULT_REMOTE_RECOVERY_POLL_MS: u64 = 5000;
 
 /// The idle-lease reason label (diagnostic only; recorded in MINT's resume
 /// manifest). Not an infra identifier.
@@ -156,6 +172,11 @@ pub struct IdleLeaseConfig {
     pub op_timeout: Duration,
     /// Backoff between PERSISTENT reactivation-backstop rounds (never-give-up loop).
     pub persistent_retry: Duration,
+    /// DURABLE remote-idle-recovery window after an idle-timeout abort (see
+    /// `REMOTE_RECOVERY_SECS_ENV`).
+    pub remote_recovery_window: Duration,
+    /// Poll cadence within the remote-idle-recovery window.
+    pub remote_recovery_poll: Duration,
 }
 
 impl IdleLeaseConfig {
@@ -180,6 +201,14 @@ impl IdleLeaseConfig {
             persistent_retry: Duration::from_secs(env_u64(
                 PERSISTENT_RETRY_SECS_ENV,
                 DEFAULT_PERSISTENT_RETRY_SECS,
+            )),
+            remote_recovery_window: Duration::from_secs(env_u64(
+                REMOTE_RECOVERY_SECS_ENV,
+                DEFAULT_REMOTE_RECOVERY_SECS,
+            )),
+            remote_recovery_poll: Duration::from_millis(env_u64(
+                REMOTE_RECOVERY_POLL_MS_ENV,
+                DEFAULT_REMOTE_RECOVERY_POLL_MS,
             )),
         }
     }
@@ -228,6 +257,15 @@ pub trait IdleBackend: Send + Sync {
     /// part of the lease — it is never idled or activated (MINT-only coordination), so
     /// an UNCONFIGURED Chord can never fail an idle call and requeue-forever (F1).
     fn chord_available(&self) -> bool;
+    /// Best-effort query of CHORD's ACTUAL idle state (BLD-09 control status), used by
+    /// the durable remote-idle-recovery backstop to detect a late-landing idle after an
+    /// idle-timeout abort. `Ok(Some(true))` ⇒ Chord is idle (re-activate it);
+    /// `Ok(Some(false))` ⇒ confirmed active; `Ok(None)` ⇒ no status query available (the
+    /// backstop then re-activates defensively each round). `Err` ⇒ query failed (treated
+    /// like `None`). Default: no status endpoint ⇒ `Ok(None)`.
+    async fn chord_is_idle(&self) -> Result<Option<bool>, String> {
+        Ok(None)
+    }
 }
 
 /// The production backend: Chord over its HTTP control endpoint (the sanctioned
@@ -469,6 +507,11 @@ struct LeaseInner {
     /// Set while a persistent reactivation backstop task is running, so at most ONE
     /// runs (a later release that finds a service still idle does not spawn a second).
     persistent_running: AtomicBool,
+    /// DURABLE remote-idle-recovery window: after an idle-timeout abort, keep overriding
+    /// a possible late-landing remote (Chord) idle for this long.
+    remote_recovery_window: Duration,
+    /// Poll cadence within the remote-idle-recovery window.
+    remote_recovery_poll: Duration,
 }
 
 impl LeaseInner {
@@ -595,6 +638,88 @@ impl LeaseInner {
             this.persistent_running.store(false, Ordering::SeqCst);
         });
     }
+
+    /// DURABLE remote-idle-recovery backstop for an idle-TIMEOUT/failure abort. A
+    /// client-side `chord_idle` timeout does NOT stop the REMOTE server — a late `/idle`
+    /// can land AFTER the abort's `/activate`, leaving Chord stuck idle. A single activate
+    /// cannot defend against that, so this spawns a task that, for `remote_recovery_window`
+    /// (which safely exceeds Chord's max idle-processing time), keeps Chord ACTIVE: each
+    /// round it checks Chord's actual state via [`IdleBackend::chord_is_idle`] and
+    /// re-activates whenever Chord is observed idle (or the status is unknown — re-activate
+    /// defensively). MINT is in-process (no remote race) and only needs one activate. After
+    /// the window a late idle can no longer arrive, so a final confirming activate stops it.
+    /// At most one backstop runs at a time (shares the `persistent_running` slot). Requires
+    /// an ambient runtime (the abort path is always async / in a runtime).
+    fn spawn_remote_recovery_backstop(self: &Arc<Self>) {
+        if self.persistent_running.swap(true, Ordering::SeqCst) {
+            return; // a backstop is already running; it covers reactivation
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            self.persistent_running.store(false, Ordering::SeqCst);
+            warn!("idle lease: no ambient runtime for the remote-idle-recovery backstop");
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + this.remote_recovery_window;
+            loop {
+                {
+                    let _seq = this.release_lock.lock().await;
+                    // CHORD (remote): re-activate whenever observed idle, or defensively
+                    // when its state is unknown/unqueryable — overriding any late idle.
+                    let chord_idle_now = match this.backend.chord_is_idle().await {
+                        Ok(Some(idle)) => idle,
+                        Ok(None) | Err(_) => true, // unknown ⇒ re-activate defensively
+                    };
+                    if chord_idle_now {
+                        let _ = with_op_timeout(
+                            this.op_timeout,
+                            "Chord activate (remote recovery)",
+                            this.backend.chord_activate(),
+                        )
+                        .await;
+                    }
+                    // MINT (in-process, no remote race): activate once if not yet active.
+                    if !this.mint_active.load(Ordering::SeqCst)
+                        && with_op_timeout(
+                            this.op_timeout,
+                            "MINT activate (remote recovery)",
+                            this.backend.mint_activate(),
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        this.mint_active.store(true, Ordering::SeqCst);
+                    }
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(this.remote_recovery_poll).await;
+            }
+            // After the window a late idle can no longer arrive. If Chord is STILL observed
+            // idle (or its state is unknown), one final confirming activate; then mark Chord
+            // active and release the backstop slot.
+            {
+                let _seq = this.release_lock.lock().await;
+                let chord_idle_final = match this.backend.chord_is_idle().await {
+                    Ok(Some(idle)) => idle,
+                    Ok(None) | Err(_) => true, // unknown ⇒ activate defensively
+                };
+                if chord_idle_final {
+                    let _ = with_op_timeout(
+                        this.op_timeout,
+                        "Chord activate (remote recovery final)",
+                        this.backend.chord_activate(),
+                    )
+                    .await;
+                }
+                this.chord_active.store(true, Ordering::SeqCst);
+            }
+            this.persistent_running.store(false, Ordering::SeqCst);
+            info!("idle lease: remote-idle-recovery backstop completed — Chord confirmed active");
+        });
+    }
 }
 
 /// An RAII handle to a held idle-mode lease. Dropping it (normal completion, an
@@ -683,6 +808,18 @@ impl LeaseGuard {
         let _ = self.watchdog.take();
         if let Some(inner) = self.inner.take() {
             drive_release(inner);
+        }
+    }
+
+    /// Abort path for an idle-call TIMEOUT/failure: a client-side idle timeout does NOT
+    /// stop the REMOTE (Chord) server, so a late `/idle` can land after a single activate.
+    /// Arm the DURABLE remote-idle-recovery backstop (overrides a late idle across a
+    /// bounded window) instead of a one-shot reactivation. Consumes the guard; caller
+    /// returns the abort error.
+    fn arm_remote_recovery(mut self) {
+        let _ = self.watchdog.take(); // (none armed during idle) — be defensive
+        if let Some(inner) = self.inner.take() {
+            inner.spawn_remote_recovery_backstop();
         }
     }
 }
@@ -833,6 +970,8 @@ pub async fn acquire_lease(
         cfg.activate_retry,
         cfg.op_timeout,
         cfg.persistent_retry,
+        cfg.remote_recovery_window,
+        cfg.remote_recovery_poll,
         chord_in_lease,
     ));
 
@@ -945,16 +1084,18 @@ fn expired_abort(guard: LeaseGuard, reason: &str) -> Result<LeaseGuard, LeaseErr
     })
 }
 
-/// Idle-coordination failure/timeout while enabled: GUARANTEE reactivation of anything
-/// idled (retry + the guard's still-armed watchdog, F3), then abort so the scheduler
-/// requeues (never build uncoordinated after a failed idle call).
+/// Idle-coordination failure/timeout while enabled: a client-side idle timeout does NOT
+/// prove the REMOTE server stopped, so arm the DURABLE remote-idle-recovery backstop
+/// (overrides a late-landing `/idle` across a bounded window — never leaves Chord stuck
+/// idle after our compensating activate), then abort so the scheduler requeues (never
+/// build uncoordinated after a failed idle call).
 fn abort_with_guard(
     guard: LeaseGuard,
     what: &str,
     err: String,
 ) -> Result<LeaseGuard, LeaseError> {
-    warn!(error = %err, "idle lease: {what} failed/timed out — aborting (safe degrade), guaranteeing reactivation, the build is requeued");
-    guard.reactivate_detached();
+    warn!(error = %err, "idle lease: {what} failed/timed out — aborting (safe degrade), arming the durable remote-idle-recovery backstop, the build is requeued");
+    guard.arm_remote_recovery();
     Err(LeaseError::IdleFailed {
         reason: format!("{what}: {err}"),
     })
@@ -963,11 +1104,14 @@ fn abort_with_guard(
 /// Build the shared release machinery (`LeaseInner`) for a lease, WITHOUT a watchdog.
 /// `chord_in_lease` false ⇒ Chord starts already-"active" (not part of the lease, never
 /// idled/activated).
+#[allow(clippy::too_many_arguments)]
 fn build_lease_inner(
     backend: Arc<dyn IdleBackend>,
     activate_retry: Duration,
     op_timeout: Duration,
     persistent_retry: Duration,
+    remote_recovery_window: Duration,
+    remote_recovery_poll: Duration,
     chord_in_lease: bool,
 ) -> Arc<LeaseInner> {
     Arc::new(LeaseInner {
@@ -982,6 +1126,8 @@ fn build_lease_inner(
         expired_notify: tokio::sync::Notify::new(),
         persistent_backoff: persistent_retry,
         persistent_running: AtomicBool::new(false),
+        remote_recovery_window,
+        remote_recovery_poll,
     })
 }
 
@@ -1001,6 +1147,8 @@ fn arm_guard(
         activate_retry,
         op_timeout,
         Duration::from_millis(1), // fast persistent backstop in tests
+        Duration::from_millis(1), // fast remote-recovery window in tests
+        Duration::from_millis(1), // fast remote-recovery poll in tests
         chord_in_lease,
     ));
     guard.arm_watchdog(max_lease);
@@ -1150,11 +1298,17 @@ mod tests {
         /// If >0, `mint_idle` sleeps this long BEFORE it actually idles — an in-flight
         /// window used to prove the watchdog can't fire mid-idle (F1).
         mint_idle_delay_ms: AtomicU64,
-        /// REAL current idle state per service: set true when its idle lands, false when
-        /// its activate lands. Lets a test detect a service left STUCK idle (unlike the
-        /// call counters, which can't distinguish a premature activate from a real one).
-        chord_is_idle: AtomicBool,
-        mint_is_idle: AtomicBool,
+        /// REAL current idle state per service (behind `Arc` so a delayed remote side-
+        /// effect task can flip it): set true when its idle lands, false when its activate
+        /// lands. Lets a test detect a service left STUCK idle (unlike the call counters,
+        /// which can't distinguish a premature activate from a real one).
+        chord_is_idle: Arc<AtomicBool>,
+        mint_is_idle: Arc<AtomicBool>,
+        /// If >0, `chord_idle` models a REMOTE idle whose SERVER-side effect lands LATE:
+        /// it spawns a task that sets `chord_is_idle` true after this delay, then the call
+        /// itself HANGS (so the client-side per-op timeout cancels US) — exercising the
+        /// real "a timed-out /idle still lands on the server after the abort's /activate".
+        chord_idle_delayed_side_effect_ms: AtomicU64,
     }
 
     impl MockBackend {
@@ -1174,12 +1328,20 @@ mod tests {
                 available: AtomicBool::new(true),
                 chord_available: AtomicBool::new(true),
                 mint_idle_delay_ms: AtomicU64::new(0),
-                chord_is_idle: AtomicBool::new(false),
-                mint_is_idle: AtomicBool::new(false),
+                chord_is_idle: Arc::new(AtomicBool::new(false)),
+                mint_is_idle: Arc::new(AtomicBool::new(false)),
+                chord_idle_delayed_side_effect_ms: AtomicU64::new(0),
             })
         }
         fn with_mint_idle_delay_ms(self: Arc<Self>, ms: u64) -> Arc<Self> {
             self.mint_idle_delay_ms.store(ms, Ordering::SeqCst);
+            self
+        }
+        /// Model a REMOTE chord idle that TIMES OUT client-side but whose server-side
+        /// effect (Chord goes idle) lands `ms` LATER — the exact race the durable
+        /// remote-idle-recovery backstop must defend against.
+        fn with_chord_idle_delayed_side_effect_ms(self: Arc<Self>, ms: u64) -> Arc<Self> {
+            self.chord_idle_delayed_side_effect_ms.store(ms, Ordering::SeqCst);
             self
         }
         fn is_stuck_idle(&self) -> bool {
@@ -1226,6 +1388,18 @@ mod tests {
     impl IdleBackend for MockBackend {
         async fn chord_idle(&self) -> Result<Option<f64>, String> {
             self.chord_idles.fetch_add(1, Ordering::SeqCst);
+            // REMOTE late-side-effect model: spawn a task that idles the server LATER, then
+            // HANG so our client-side per-op timeout cancels this call. This reproduces
+            // production: a timed-out /idle still lands on the server after the abort.
+            let delayed = self.chord_idle_delayed_side_effect_ms.load(Ordering::SeqCst);
+            if delayed > 0 {
+                let flag = self.chord_is_idle.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(delayed)).await;
+                    flag.store(true, Ordering::SeqCst); // server goes idle LATE
+                });
+                tokio::time::sleep(HANG).await; // cancelled by the client-side op timeout
+            }
             if self.chord_idle_hangs.load(Ordering::SeqCst) {
                 tokio::time::sleep(HANG).await; // cancelled by the per-op timeout
             }
@@ -1285,6 +1459,11 @@ mod tests {
         fn chord_available(&self) -> bool {
             self.chord_available.load(Ordering::SeqCst)
         }
+        async fn chord_is_idle(&self) -> Result<Option<bool>, String> {
+            // The mock exposes Chord's ACTUAL (possibly late-set) idle state, so the
+            // remote-idle-recovery backstop exercises the status-aware option-(a) path.
+            Ok(Some(self.chord_is_idle.load(Ordering::SeqCst)))
+        }
     }
 
     /// Config with the RAM budget + `enabled` passed SEPARATELY to `acquire_lease`.
@@ -1299,6 +1478,8 @@ mod tests {
             activate_retry: Duration::from_millis(1),
             op_timeout: Duration::from_secs(5),
             persistent_retry: Duration::from_millis(1),
+            remote_recovery_window: Duration::from_millis(1),
+            remote_recovery_poll: Duration::from_millis(1),
         }
     }
 
@@ -1415,8 +1596,9 @@ mod tests {
             "must be IdleFailed, got {err:?}"
         );
         assert_eq!(be.chord_idles.load(Ordering::SeqCst), 1);
+        // The durable remote-idle-recovery backstop ensures no service is left stuck idle.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(be.activates(), (1, 1), "guaranteed reactivation on abort");
+        assert!(!be.is_stuck_idle(), "no service left stuck idle after the abort");
     }
 
     #[tokio::test]
@@ -1440,9 +1622,9 @@ mod tests {
             matches!(err, LeaseError::IdleFailed { .. }),
             "hung idle degrades to IdleFailed, got {err:?}"
         );
-        // Guaranteed (detached) reactivation on abort — nothing left idle.
+        // The durable remote-idle-recovery backstop ensures no service is left stuck idle.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(be.activates(), (1, 1));
+        assert!(!be.is_stuck_idle(), "no service left stuck idle after the timeout abort");
     }
 
     // ── MINT `InTransition` must not count as a clean idle (rev-10 finding) ──────────
@@ -1556,9 +1738,43 @@ mod tests {
             matches!(err, LeaseError::IdleFailed { .. }),
             "MINT never confirmed idle ⇒ IdleFailed, got {err:?}"
         );
-        // Reactivated on abort (chord was idled first, then the MINT idle timed out).
+        // The remote-idle-recovery backstop reactivates chord (idled first) + mint; nothing
+        // is left stuck idle after the abort.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(be.activates(), (1, 1));
+        assert!(!be.is_stuck_idle(), "no service left stuck idle after the MINT-timeout abort");
+    }
+
+    #[tokio::test]
+    async fn remote_idle_timeout_late_landing_idle_is_overridden_chord_ends_active() {
+        // BLOCKER: a `chord_idle` that TIMES OUT client-side but whose SERVER-side effect
+        // (Chord actually goes idle) lands AFTER the abort's compensating activate must NOT
+        // leave Chord stuck idle. The mock applies the idle side-effect 60ms LATE — modelling
+        // the real remote behaviour (client timeout ≠ server stopped), NOT the "cancellation
+        // prevents the side effect" assumption. The DURABLE remote-idle-recovery backstop
+        // must detect the late idle (via chord_is_idle status) and re-activate → Chord ends
+        // CONFIRMED active.
+        let be = MockBackend::new(None, None)
+            .with_mem(vec![200.0])
+            .with_chord_idle_delayed_side_effect_ms(60); // server idles 60ms after our timeout
+        let mut c = cfg(5, 3600);
+        c.op_timeout = Duration::from_millis(20); // chord_idle times out CLIENT-side at 20ms
+        c.remote_recovery_window = Duration::from_millis(400); // window safely exceeds the late idle
+        c.remote_recovery_poll = Duration::from_millis(10);
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            acquire_lease(be.clone(), &c, true, 120.0),
+        )
+        .await
+        .expect("acquire returned (did not hang)")
+        .expect_err("idle timeout ⇒ IdleFailed abort");
+        assert!(matches!(err, LeaseError::IdleFailed { .. }), "got {err:?}");
+        // Wait past the late-idle landing (60ms), the overriding poll, and the window end
+        // (~420ms) + final confirming activate.
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        assert!(
+            !be.chord_is_idle.load(Ordering::SeqCst),
+            "the late-landing /idle was OVERRIDDEN by the durable backstop — Chord ends CONFIRMED active"
+        );
     }
 
     #[tokio::test]
@@ -1742,6 +1958,8 @@ mod tests {
             expired_notify: tokio::sync::Notify::new(),
             persistent_backoff: Duration::from_millis(1),
             persistent_running: AtomicBool::new(false),
+            remote_recovery_window: Duration::from_millis(1),
+            remote_recovery_poll: Duration::from_millis(1),
         });
         let (i1, i2) = (inner.clone(), inner.clone());
         tokio::join!(async { i1.release().await }, async { i2.release().await });
@@ -1905,6 +2123,8 @@ mod tests {
             expired_notify: tokio::sync::Notify::new(),
             persistent_backoff: Duration::from_millis(1),
             persistent_running: AtomicBool::new(false),
+            remote_recovery_window: Duration::from_millis(1),
+            remote_recovery_poll: Duration::from_millis(1),
         });
         // Manually build a guard with NO watchdog (simulating a guard whose ambient
         // runtime is gone), then drop it with no ambient runtime.
