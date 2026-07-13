@@ -1258,26 +1258,36 @@ where
         let _latch = ReleasingLatchGuard { ctl: ctl_for_task };
         release_fn()
     });
+    // A FAILED release (the blocking task panicked ⇒ `JoinError`) must NOT be reported as
+    // a successful idle: the GPU/RAM may not have been released, so committing
+    // `EnteringIdle → Idle` and persisting an idle manifest would be a lie the compiler
+    // (and a restart) would trust. On failure we therefore do NOT commit — we return a
+    // non-`Entered` outcome and let the `transition` guard's `Drop` roll the phase back to
+    // `Active` (the SAFE direction when release may not have happened). The in-task RAII
+    // guard has already cleared the latch on the panic unwind, so the rollback is allowed
+    // and the transition is never wedged. Only a SUCCESSFUL release (`Ok`) proceeds to
+    // commit. (If `release_fn` ever becomes fallible and returns an error value, that
+    // error path must be handled here identically — never commit Idle after a failed
+    // release.)
     let gpu = match handle.await {
         Ok(r) => r,
         Err(_join_err) => {
-            // The blocking release panicked. The in-task RAII guard already cleared the
-            // latch on unwind; this is a defensive, idempotent re-clear (in case the join
-            // failed for any other reason) so the phase can always resolve.
+            // Defensive, idempotent re-clear (the in-task RAII guard already cleared it).
             ctl.clear_releasing();
             warn!(
                 reason,
-                "mint idle-mode: blocking GPU release task panicked — treated as best-effort (no resources reported freed); releasing latch cleared by the in-task RAII guard"
+                "mint idle-mode: blocking GPU release FAILED (task panicked) — NOT committing Idle; \
+                 dropping the transition rolls EnteringIdle back to Active (resources may not be released)"
             );
-            GpuReleaseResult {
-                holders_released: Vec::new(),
-                foreign_holder: None,
-            }
+            // `transition` drops on return → generation- and (now-clear) latch-guarded
+            // `abort_enter` rolls EnteringIdle back to Active. No idle manifest is
+            // installed or persisted.
+            return (EnterOutcome::InTransition, None);
         }
     };
 
-    // Release is now fully COMPLETE and the latch is clear; it is safe for the phase to
-    // leave `EnteringIdle`.
+    // Release SUCCEEDED and the latch is clear; it is safe for the phase to leave
+    // `EnteringIdle` and commit to `Idle`.
     let mem_after = read_mem_available_gb();
     let report = IdleReport {
         mem_available_before_gb: mem_before,
@@ -2194,6 +2204,57 @@ mod tests {
             EnterOutcome::Entered(_) => {}
             other => panic!("expected a fresh enter to succeed after recovery, got {other:?}"),
         }
+        assert!(ctl.is_idle());
+    }
+
+    #[tokio::test]
+    async fn awaited_failed_release_does_not_commit_idle_and_ends_active() {
+        // codex cycle-3: when the caller is STILL awaiting the blocking release and it
+        // FAILS (panics), enter_idle_on must NOT fabricate success — it must not commit
+        // EnteringIdle→Idle nor persist an idle manifest (the GPU/RAM may not be freed).
+        // It ends Active (rolled back) with a non-Entered outcome and no idle persisted.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mint_idle_state.json");
+        let ctl = Arc::new(IdleController::with_state(Some(path.clone())));
+
+        let failing_release = || -> GpuReleaseResult {
+            panic!("simulated GPU-release failure");
+        };
+
+        // Await to completion (NOT cancelled): the JoinError path must decline to commit.
+        let (outcome, report) = enter_idle_on(ctl.clone(), "test", failing_release).await;
+
+        assert!(
+            matches!(outcome, EnterOutcome::InTransition),
+            "a failed release must yield a non-Entered outcome, got {outcome:?}"
+        );
+        assert!(report.is_none(), "a failed release reports no freed-RAM");
+        assert!(
+            !ctl.is_releasing(),
+            "latch cleared by the in-task RAII guard"
+        );
+        assert!(
+            !ctl.is_idle(),
+            "a failed release must not leave the controller Idle"
+        );
+        assert_eq!(
+            ctl.phase(),
+            Phase::Active,
+            "a failed release rolls the transition back to Active (safe direction)"
+        );
+
+        // No idle manifest was persisted: a fresh reload from the same path is not idle.
+        let reloaded = IdleController::with_state(Some(path));
+        assert!(
+            !reloaded.is_idle(),
+            "no idle manifest may be persisted after a failed release"
+        );
+
+        // The controller is fully usable afterwards (a real enter still works).
+        assert!(matches!(
+            ctl.enter(manifest("compiler", 1, 2)),
+            EnterOutcome::Entered(_)
+        ));
         assert!(ctl.is_idle());
     }
 
