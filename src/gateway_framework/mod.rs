@@ -744,10 +744,9 @@ impl GatewayFramework {
         let Some(queue) = &self.inner.request_queue else {
             return false; // no queuing configured → immediate 429
         };
-        // Unique, non-colliding ticket for this attempt (per-process seq + key).
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let ticket = format!("{key}#{n}");
+        // The queue allocates a GLOBALLY-UNIQUE ticket internally (per-instance
+        // salt + Redis-atomic INCR) — no caller-side counter, so two gateway
+        // instances can never collide on a ticket for the same rate-limit key.
         let limiter = self.inner.rate_limiter.clone();
         let k = key.to_string();
         let acquire = || {
@@ -758,7 +757,6 @@ impl GatewayFramework {
         matches!(
             queue
                 .admit(
-                    &ticket,
                     self.inner.queue_max_depth,
                     self.inner.queue_max_wait,
                     self.inner.queue_poll,

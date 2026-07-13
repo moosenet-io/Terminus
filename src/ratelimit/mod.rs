@@ -189,6 +189,22 @@ pub struct RequestQueue {
     backend: Arc<RedisBackend>,
     /// The queue name (becomes `ratelimit:queue:{name}`).
     name: String,
+    /// Per-INSTANCE random salt (see [`instance_salt`]). Combined with a
+    /// Redis-atomic `INCR` sequence, it makes every admission ticket globally
+    /// unique across ALL gateway instances — so ownership-by-value
+    /// (`LINDEX head == my ticket`) and `LREM` can never touch another
+    /// instance's entry.
+    instance_salt: String,
+}
+
+/// A per-PROCESS random salt, generated ONCE at first use (uuid v4 — random, NOT
+/// derived from hostname/IP, so no S1 infra literal). Every `RequestQueue` in
+/// this process shares it. Two distinct gateway processes get distinct salts, so
+/// even a Redis reset (which would restart the `INCR` counter) cannot make two
+/// live instances collide on a ticket.
+fn instance_salt() -> &'static str {
+    static SALT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SALT.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
 }
 
 impl RequestQueue {
@@ -196,11 +212,17 @@ impl RequestQueue {
         Self {
             backend,
             name: name.into(),
+            instance_salt: instance_salt().to_string(),
         }
     }
 
     fn list_key(&self) -> String {
         Namespace::Ratelimit.key(&format!("queue:{}", self.name))
+    }
+
+    /// The Redis key holding this queue's atomic ticket sequence counter.
+    fn seq_key(&self) -> String {
+        Namespace::Ratelimit.key(&format!("queue:{}:seq", self.name))
     }
 
     /// Append `item` to the tail (FIFO). `Err(())` if Redis is unreachable — the
@@ -243,17 +265,19 @@ impl RequestQueue {
             .await
     }
 
-    /// Bounded FIFO admission for an over-limit proxy request. Enqueues `ticket`
-    /// (only if the queue has room), then waits — in FIFO order — until this
-    /// ticket is at the head AND `acquire` (a re-check of the rate limiter)
-    /// succeeds, or until `max_wait` elapses. Returns [`Admission::Admitted`] on
-    /// success, [`Admission::QueueFull`] if the queue is at `max_depth`,
+    /// Bounded FIFO admission for an over-limit proxy request. Atomically
+    /// allocates a GLOBALLY-UNIQUE ticket and enqueues it (only if the queue has
+    /// room), then waits — in FIFO order — until this ticket is at the head AND
+    /// `acquire` (a re-check of the rate limiter) succeeds, or until `max_wait`
+    /// elapses. Returns [`Admission::Admitted`] on success,
+    /// [`Admission::QueueFull`] if the queue is at `max_depth`,
     /// [`Admission::TimedOut`] if the wait elapsed (the ticket is removed), or
-    /// [`Admission::Unavailable`] (fail CLOSED) on any Redis error. See
+    /// [`Admission::Unavailable`] (fail CLOSED) on any Redis error. The ticket is
+    /// generated internally (per-instance salt + Redis-atomic `INCR`), never by
+    /// the caller — so it is unique across gateway instances. See
     /// [`run_admission`] for the backend-agnostic loop this delegates to.
     pub async fn admit<F, Fut>(
         &self,
-        ticket: &str,
         max_depth: i64,
         max_wait: Duration,
         poll: Duration,
@@ -263,21 +287,28 @@ impl RequestQueue {
         F: Fn() -> Fut,
         Fut: Future<Output = bool>,
     {
-        run_admission(self, ticket, max_depth, max_wait, poll, acquire).await
+        run_admission(self, max_depth, max_wait, poll, acquire).await
     }
 }
 
-/// Atomic bounded enqueue: RPUSH `ticket` only if `LLEN < max_depth`, and set a
-/// TTL so an abandoned queue self-cleans (volatile DB). `KEYS[1]` = list key,
-/// `ARGV[1]` = max_depth, `ARGV[2]` = ticket, `ARGV[3]` = ttl secs. Returns 1
-/// enqueued, 0 full. Atomic (single-threaded Lua) so a burst cannot overfill.
-pub const ENQUEUE_BOUNDED_LUA: &str = r#"
+/// Atomic bounded enqueue with GLOBALLY-UNIQUE ticket allocation. In one
+/// server-side script: refuse if `LLEN(list) >= max_depth`; else `INCR` the
+/// per-queue sequence counter, form `ticket = "{salt}:{seq}"`, `RPUSH` it, and
+/// TTL both keys. `KEYS[1]` = list key, `KEYS[2]` = seq key; `ARGV[1]` =
+/// max_depth, `ARGV[2]` = instance salt, `ARGV[3]` = ttl secs. Returns
+/// `{1, ticket}` enqueued or `{0, ""}` full. Because the salt is per-instance
+/// and the `INCR` is atomic across ALL instances, the ticket is globally unique
+/// — so ownership-by-value + `LREM` can never match another instance's entry.
+pub const ENQUEUE_UNIQUE_LUA: &str = r#"
 if redis.call('LLEN', KEYS[1]) >= tonumber(ARGV[1]) then
-  return 0
+  return {0, ''}
 end
-redis.call('RPUSH', KEYS[1], ARGV[2])
+local seq = redis.call('INCR', KEYS[2])
+local ticket = ARGV[2] .. ':' .. seq
+redis.call('RPUSH', KEYS[1], ticket)
 redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
-return 1
+redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3]))
+return {1, ticket}
 "#;
 
 /// TTL (secs) applied to an active admission queue so an abandoned one is
@@ -302,9 +333,10 @@ pub enum Admission {
 /// the admission/timeout/full/unavailable paths are covered OFFLINE.
 #[async_trait]
 pub(crate) trait AdmissionQueue: Send + Sync {
-    /// Atomically enqueue `ticket` iff depth < `max_depth`. `Ok(true)` enqueued,
-    /// `Ok(false)` full, `Err(())` unreachable.
-    async fn enqueue_bounded(&self, ticket: &str, max_depth: i64) -> Result<bool, ()>;
+    /// Atomically allocate a globally-unique ticket and enqueue it iff depth <
+    /// `max_depth`. `Ok(Some(ticket))` enqueued (the caller owns exactly this
+    /// value), `Ok(None)` full, `Err(())` unreachable.
+    async fn enqueue_unique(&self, max_depth: i64) -> Result<Option<String>, ()>;
     /// Is `ticket` currently at the head of the queue? `Err(())` unreachable.
     async fn at_head(&self, ticket: &str) -> Result<bool, ()>;
     /// Remove `ticket` from the queue (best-effort on give-up). `Err(())` unreachable.
@@ -314,11 +346,11 @@ pub(crate) trait AdmissionQueue: Send + Sync {
 }
 
 /// Backend-agnostic bounded-FIFO admission loop (see [`RequestQueue::admit`]).
-/// Fails CLOSED (`Unavailable`) on any queue error so a Redis outage never
-/// admits unbounded.
+/// The queue allocates its own globally-unique ticket, so no two instances can
+/// hold the same value. Fails CLOSED (`Unavailable`) on any queue error so a
+/// Redis outage never admits unbounded.
 pub(crate) async fn run_admission<Q, F, Fut>(
     queue: &Q,
-    ticket: &str,
     max_depth: i64,
     max_wait: Duration,
     poll: Duration,
@@ -329,14 +361,14 @@ where
     F: Fn() -> Fut,
     Fut: Future<Output = bool>,
 {
-    match queue.enqueue_bounded(ticket, max_depth).await {
-        Ok(true) => {}
-        Ok(false) => return Admission::QueueFull,
+    let ticket = match queue.enqueue_unique(max_depth).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return Admission::QueueFull,
         Err(()) => return Admission::Unavailable, // fail closed
-    }
+    };
     let deadline = Instant::now() + max_wait;
     loop {
-        match queue.at_head(ticket).await {
+        match queue.at_head(&ticket).await {
             Ok(true) => {
                 if acquire().await {
                     let _ = queue.pop_head().await; // best-effort: drop our head slot
@@ -345,13 +377,13 @@ where
             }
             Ok(false) => {}
             Err(()) => {
-                let _ = queue.remove_ticket(ticket).await;
+                let _ = queue.remove_ticket(&ticket).await;
                 return Admission::Unavailable; // fail closed
             }
         }
         let now = Instant::now();
         if now >= deadline {
-            let _ = queue.remove_ticket(ticket).await;
+            let _ = queue.remove_ticket(&ticket).await;
             return Admission::TimedOut;
         }
         let remaining = deadline.saturating_duration_since(now);
@@ -361,22 +393,25 @@ where
 
 #[async_trait]
 impl AdmissionQueue for RequestQueue {
-    async fn enqueue_bounded(&self, ticket: &str, max_depth: i64) -> Result<bool, ()> {
-        let key = self.list_key();
-        let ticket = ticket.to_string();
-        let script = redis::Script::new(ENQUEUE_BOUNDED_LUA);
+    async fn enqueue_unique(&self, max_depth: i64) -> Result<Option<String>, ()> {
+        let list = self.list_key();
+        let seq = self.seq_key();
+        let salt = self.instance_salt.clone();
+        let script = redis::Script::new(ENQUEUE_UNIQUE_LUA);
         self.backend
             .with_conn(Namespace::Ratelimit, |mut conn| async move {
-                script
-                    .key(key)
+                // Lua returns {enqueued(0/1), ticket-or-empty}.
+                let (ok, ticket): (i64, String) = script
+                    .key(list)
+                    .key(seq)
                     .arg(max_depth)
-                    .arg(ticket)
+                    .arg(salt)
                     .arg(QUEUE_TTL_SECS)
-                    .invoke_async::<_, i64>(&mut conn)
-                    .await
+                    .invoke_async(&mut conn)
+                    .await?;
+                Ok(if ok == 1 { Some(ticket) } else { None })
             })
             .await
-            .map(|v| v == 1)
     }
 
     async fn at_head(&self, ticket: &str) -> Result<bool, ()> {
@@ -399,9 +434,11 @@ impl AdmissionQueue for RequestQueue {
         let ticket = ticket.to_string();
         self.backend
             .with_conn(Namespace::Ratelimit, |mut conn| async move {
+                // count=1: the ticket value is globally unique, so at most one
+                // match exists; removing the single first occurrence is exact.
                 redis::cmd("LREM")
                     .arg(&key)
-                    .arg(0)
+                    .arg(1)
                     .arg(&ticket)
                     .query_async::<_, i64>(&mut conn)
                     .await
@@ -434,29 +471,44 @@ mod tests {
 
     // ── In-memory fake queue: exercises the admission loop (`run_admission`)
     // OFFLINE — the SAME control flow the Redis `RequestQueue` uses via the
-    // shared `AdmissionQueue` trait. `fail` forces the unreachable/fail-closed
-    // path.
+    // shared `AdmissionQueue` trait. A `salt` + per-instance `seq` model the
+    // globally-unique ticket allocation; the `items` list can be SHARED between
+    // two fakes to model two gateway instances contending on one Redis key.
+    // `fail` forces the unreachable/fail-closed path.
     struct FakeQueue {
-        items: Mutex<std::collections::VecDeque<String>>,
+        items: Arc<Mutex<std::collections::VecDeque<String>>>,
+        salt: String,
+        seq: AtomicUsize,
         fail: bool,
     }
     impl FakeQueue {
         fn new(fail: bool) -> Self {
-            Self { items: Mutex::new(std::collections::VecDeque::new()), fail }
+            Self::with_shared(Arc::new(Mutex::new(std::collections::VecDeque::new())), "inst", fail)
+        }
+        fn with_shared(
+            items: Arc<Mutex<std::collections::VecDeque<String>>>,
+            salt: &str,
+            fail: bool,
+        ) -> Self {
+            Self { items, salt: salt.to_string(), seq: AtomicUsize::new(0), fail }
         }
     }
     #[async_trait]
     impl AdmissionQueue for FakeQueue {
-        async fn enqueue_bounded(&self, ticket: &str, max_depth: i64) -> Result<bool, ()> {
+        async fn enqueue_unique(&self, max_depth: i64) -> Result<Option<String>, ()> {
             if self.fail {
                 return Err(());
             }
             let mut q = self.items.lock().unwrap();
             if q.len() as i64 >= max_depth {
-                return Ok(false);
+                return Ok(None);
             }
-            q.push_back(ticket.to_string());
-            Ok(true)
+            // salt + per-instance monotonic seq (models the Redis-atomic INCR;
+            // the salt guarantees uniqueness even if two instances' seqs align).
+            let n = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+            let ticket = format!("{}:{}", self.salt, n);
+            q.push_back(ticket.clone());
+            Ok(Some(ticket))
         }
         async fn at_head(&self, ticket: &str) -> Result<bool, ()> {
             if self.fail {
@@ -483,7 +535,7 @@ mod tests {
             calls.fetch_add(1, Ordering::SeqCst) >= 1
         };
         let out = run_admission(
-            &q, "t1", 128, Duration::from_millis(500), Duration::from_millis(5), acquire,
+            &q, 128, Duration::from_millis(500), Duration::from_millis(5), acquire,
         )
         .await;
         assert_eq!(out, Admission::Admitted);
@@ -498,7 +550,7 @@ mod tests {
         q.items.lock().unwrap().push_back("existing".into());
         let acquire = || async { true };
         let out = run_admission(
-            &q, "t2", 1, Duration::from_millis(200), Duration::from_millis(5), acquire,
+            &q, 1, Duration::from_millis(200), Duration::from_millis(5), acquire,
         )
         .await;
         assert_eq!(out, Admission::QueueFull);
@@ -509,7 +561,7 @@ mod tests {
         let q = FakeQueue::new(false);
         let acquire = || async { false }; // never acquirable
         let out = run_admission(
-            &q, "t3", 128, Duration::from_millis(60), Duration::from_millis(10), acquire,
+            &q, 128, Duration::from_millis(60), Duration::from_millis(10), acquire,
         )
         .await;
         assert_eq!(out, Admission::TimedOut);
@@ -522,10 +574,45 @@ mod tests {
         let q = FakeQueue::new(true); // every op errors
         let acquire = || async { true };
         let out = run_admission(
-            &q, "t4", 128, Duration::from_millis(200), Duration::from_millis(5), acquire,
+            &q, 128, Duration::from_millis(200), Duration::from_millis(5), acquire,
         )
         .await;
         assert_eq!(out, Admission::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn admission_tickets_are_cross_instance_unique() {
+        // Two gateway instances (distinct salts) contending on the SAME queue
+        // key (shared list). Their per-instance seqs BOTH start at 1 — modelling
+        // the worst case (e.g. just after a Redis reset restarted the counter) —
+        // so only the salt keeps the tickets apart.
+        let shared = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let inst_a = FakeQueue::with_shared(shared.clone(), "instA", false);
+        let inst_b = FakeQueue::with_shared(shared.clone(), "instB", false);
+
+        let ta = inst_a.enqueue_unique(128).await.unwrap().unwrap();
+        let tb = inst_b.enqueue_unique(128).await.unwrap().unwrap();
+
+        // Distinct even though both seqs are 1 — the old per-process counter bug
+        // would have produced identical `key#0` tickets here.
+        assert_ne!(ta, tb, "distinct instances must produce distinct tickets");
+        assert!(ta.starts_with("instA:"), "ticket carries its instance salt: {ta}");
+        assert!(tb.starts_with("instB:"), "ticket carries its instance salt: {tb}");
+
+        // Ownership-by-value is now safe: A owns the head (ta); B's ticket is NOT
+        // the head, so B cannot mistake A's entry for its own.
+        assert!(inst_a.at_head(&ta).await.unwrap());
+        assert!(!inst_b.at_head(&tb).await.unwrap());
+
+        // A removing ITS OWN ticket leaves B's entry intact (no double-remove /
+        // wrong-remove across instances).
+        inst_a.remove_ticket(&ta).await.unwrap();
+        {
+            let q = shared.lock().unwrap();
+            assert_eq!(q.len(), 1, "only A's ticket was removed");
+            assert_eq!(q.front().unwrap(), &tb, "B's ticket survives and is now head");
+        }
+        assert!(inst_b.at_head(&tb).await.unwrap());
     }
 
     // Offline unit tests: no live Redis. They cover the pure/derivable surface
