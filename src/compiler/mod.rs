@@ -22,6 +22,8 @@
 
 pub mod host;
 pub mod publish;
+pub mod queue; // BLD-06: the durable compiler job queue (Namespace::Queue)
+pub mod scheduler; // BLD-06: window/quiet gating + per-host caps + idle seam
 pub mod sccache;
 pub mod scope;
 pub mod status;
@@ -37,7 +39,8 @@ use crate::error::ToolError;
 use crate::registry::ToolRegistry;
 use crate::tool::{RustTool, ToolOutput};
 
-use host::HostRequest;
+use host::{HostRequest, HostRole};
+use queue::{JobRequest, Priority, QueueStore, RedisQueue};
 
 /// Env var naming the shared build dataset root (appdata-backed NFS share).
 const BUILD_DATASET_ROOT: &str = "BUILD_DATASET_ROOT";
@@ -73,6 +76,11 @@ const BUILD_ALLOWED_SOURCE_ROOTS: &str = "BUILD_ALLOWED_SOURCE_ROOTS";
 const BUILD_RETAIN_PER_CHANNEL: &str = "BUILD_RETAIN_PER_CHANNEL";
 
 const DEFAULT_TARGET_TRIPLE: &str = "x86_64-unknown-linux-musl";
+
+/// The longest a single `compiler_build` may run (the local/primary cargo build
+/// timeout; the remote/heavy path is shorter). The scheduler's stale-reconcile
+/// lease floor is derived from this so a genuinely-live build is never reconciled.
+pub const MAX_BUILD_TIMEOUT_SECS: u64 = 3600;
 
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key)
@@ -773,7 +781,7 @@ impl RustTool for CompilerBuild {
                 &scope_argv,
                 Some(&local_source_dir),
                 &secret_env,
-                Duration::from_secs(3600),
+                Duration::from_secs(MAX_BUILD_TIMEOUT_SECS),
                 &redact,
                 None,
             )
@@ -1410,15 +1418,334 @@ fn validate_source_dir(
     )))
 }
 
-/// Register the `compiler_*` tool surface on the registry.
+// ─────────────────────────────────────────────────────────────────────────────
+// BLD-06 — the queue entry point (`compiler_request`) + the scheduler's bridge
+// back into `compiler_build` (`invoke_build`).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Request-time classification of whether a build must be treated as HEAVY
+/// (heavy host ⇒ scheduler window + heavy-cap gated). It tags the queued job so
+/// the scheduler gates it; `compiler_build` still does the authoritative host
+/// selection at dispatch.
+///
+/// SAFETY-AUTHORITATIVE (AC-6): heavy classification overrides the host
+/// preference. A build is treated as `heavy` (window + cap gated) UNLESS it is
+/// POSITIVELY determined small. `fast=true` and an explicit `Heavy` request are
+/// always heavy. An explicit `Primary` request is only a PREFERENCE: it
+/// fast-paths ONLY a positively-known-small module (a known peak at/under a known
+/// threshold, or no heavy signal); a known-heavy — or any ambiguous/unreadable —
+/// module requested with `host=primary` is still GATED through the heavy path, so
+/// a possibly-heavy build can never bypass the window/cap by asking for primary.
+fn request_is_heavy(req: HostRequest, module: &str, fast: bool) -> bool {
+    classify_request_heavy(
+        req,
+        fast,
+        // `.ok()` maps a read ERROR (present-but-unparsable) to `None`
+        // (unknown ⇒ safe/heavy), and a successful read to `Some(Option<u64>)`.
+        host::module_peak_mb(module).ok(),
+        host::heavy_threshold_mb().ok(),
+    )
+}
+
+/// Pure core of [`request_is_heavy`] (the test entry point): decide heaviness
+/// from the request, `fast`, and the (already-read) module peak + threshold.
+/// `fast=true`/explicit `Heavy` ⇒ heavy. `Primary`/`Auto` defer to the
+/// safety-authoritative [`classify_heavy_auto`], so an explicit primary is
+/// honored only for a positively-small module.
+fn classify_request_heavy(
+    req: HostRequest,
+    fast: bool,
+    peak: Option<Option<u64>>,
+    threshold: Option<Option<u64>>,
+) -> bool {
+    if fast {
+        return true;
+    }
+    match req {
+        HostRequest::Heavy => true,
+        // Explicit primary is a PREFERENCE overridable by heavy-safety: it only
+        // fast-paths a positively-small module (classify_heavy_auto ⇒ false).
+        HostRequest::Primary | HostRequest::Auto => classify_heavy_auto(false, peak, threshold),
+    }
+}
+
+/// Pure heavy classifier for a module (auto/primary): `peak`/`threshold` use
+/// `Some(inner)` for a successful read (`inner` itself `None` = "not configured")
+/// and the OUTER `None` for an unreadable value. Fails to the SAFE side (heavy)
+/// on anything not positively small.
+fn classify_heavy_auto(fast: bool, peak: Option<Option<u64>>, threshold: Option<Option<u64>>) -> bool {
+    if fast {
+        return true;
+    }
+    match (peak, threshold) {
+        // No known peak (read OK, unset) ⇒ compiler_build authoritatively picks
+        // the primary — positively small.
+        (Some(None), _) => false,
+        // Both known ⇒ authoritative comparison (matches select_role).
+        (Some(Some(p)), Some(Some(t))) => p > t,
+        // Anything else — unreadable peak/threshold, or a known peak with no
+        // configured threshold — is ambiguous ⇒ SAFE side: heavy (window+cap gated).
+        _ => true,
+    }
+}
+
+/// The scheduler's bridge into the single build door: dispatch a queued job to
+/// `compiler_build` with the host the scheduler selected (heavy vs primary). A
+/// thin wrapper so `scheduler::CompilerBuildExecutor` need not know the tool's
+/// arg shape.
+pub(crate) async fn invoke_build(module: &str, git_ref: &str, heavy: bool) -> Result<(), ToolError> {
+    let args = json!({
+        "module": module,
+        "ref": git_ref,
+        "host": if heavy { "heavy" } else { "primary" },
+    });
+    CompilerBuild.execute_structured(args).await.map(|_| ())
+}
+
+/// The `compiler_request` tool: an agent marks a module@ref "ready to build".
+/// Enqueues durably (deduped/coalesced by module@ref) into the shared Redis
+/// queue; the scheduler dispatches it. Multiple agents requesting the same
+/// module@ref coalesce into ONE run.
+struct CompilerRequest;
+
+#[async_trait]
+impl RustTool for CompilerRequest {
+    fn name(&self) -> &str {
+        "compiler_request"
+    }
+
+    fn description(&self) -> &str {
+        "Mark a constellation module@ref ready for a compiler run: enqueue a durable, \
+         deduped build request onto the shared job queue. Multiple agents requesting the \
+         same module@ref coalesce into one run. The scheduler dispatches small builds \
+         immediately on the primary and heavy builds within a configured window / \
+         fleet-quiet gate, one/few at a time per host. Returns the job id."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "module": {
+                    "type": "string",
+                    "description": "Module/repo to build (e.g. terminus, chord, harmony, lumina-core)."
+                },
+                "ref": {
+                    "type": "string",
+                    "description": "Git ref (sha or branch) to build."
+                },
+                "priority": {
+                    "type": "string",
+                    "enum": ["low", "normal", "high"],
+                    "default": "normal",
+                    "description": "Queue priority. Higher orders the queue sooner but never preempts a running build."
+                },
+                "host": {
+                    "type": "string",
+                    "enum": ["auto", "primary", "heavy"],
+                    "default": "auto",
+                    "description": "Requested build host role; also tags the job heavy (window-gated) vs small (immediate)."
+                },
+                "fast": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Prefer the heavy host for a full-parallelism build (tags the job heavy)."
+                },
+                "ready": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "true → dispatchable now; false → record the intent as held until a later ready=true request promotes it."
+                }
+            },
+            "required": ["module", "ref"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.execute_structured(args).await?.text)
+    }
+
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let module = str_arg(&args, "module")?;
+        let git_ref = str_arg(&args, "ref")?;
+        // Validate the same way compiler_build does (these become path segments
+        // + the dedupe/scope key), so a bad ref is rejected at enqueue, not build.
+        validate_segment("module", &module)?;
+        validate_git_ref(&git_ref)?;
+
+        let priority = Priority::parse(args.get("priority").and_then(Value::as_str).unwrap_or("normal"));
+        let host_req =
+            HostRequest::parse(args.get("host").and_then(Value::as_str).unwrap_or("auto"))?;
+        let fast = args.get("fast").and_then(Value::as_bool).unwrap_or(false);
+        let ready = args.get("ready").and_then(Value::as_bool).unwrap_or(true);
+        let heavy = request_is_heavy(host_req, &module, fast);
+
+        let store = RedisQueue::from_env().ok_or_else(|| {
+            ToolError::NotConfigured(
+                "compiler job queue is not configured (REDIS_URL unset) — cannot enqueue a build \
+                 request; the queue is durable Redis (BLD-20 Namespace::Queue)"
+                    .to_string(),
+            )
+        })?;
+        let enq = store
+            .enqueue(&JobRequest {
+                module: module.clone(),
+                git_ref: git_ref.clone(),
+                priority,
+                heavy,
+                ready,
+            })
+            .await
+            .map_err(|e| ToolError::Execution(e.to_string()))?;
+
+        let text = format!(
+            "{verb} {module}@{git_ref} ({prio}, {host}){ready}; job {id}",
+            verb = if enq.created { "Queued" } else { "Coalesced onto existing" },
+            prio = priority.as_str(),
+            host = if heavy { "heavy" } else { "primary" },
+            ready = if ready { "" } else { " [held]" },
+            id = enq.job_id,
+        );
+        let structured = json!({
+            "job_id": enq.job_id,
+            "created": enq.created,
+            "coalesced": !enq.created,
+            "module": module,
+            "ref": git_ref,
+            "priority": priority.as_str(),
+            "heavy": heavy,
+            "ready": ready,
+        });
+        Ok(ToolOutput::with_structured(text, structured))
+    }
+}
+
+/// Render a `compiler_status`-style view of the queue + in-flight leases from a
+/// snapshot. Exposed (not a registered tool here — BLD-08 owns the
+/// `compiler_status` tool surface) so the status item consumes ONE queue view
+/// rather than re-deriving the keyspace. `sccache_hit_rate` is left to the
+/// caller to fill (BLD-03 owns sccache stats); this reports the queue facts.
+pub fn render_queue_status(snapshot: &queue::QueueSnapshot) -> Value {
+    let queued: Vec<Value> = snapshot
+        .queued
+        .iter()
+        .enumerate()
+        .map(|(pos, j)| {
+            json!({
+                "position": pos,
+                "job_id": j.job_id,
+                "module": j.module,
+                "ref": j.git_ref,
+                "priority": j.priority.as_str(),
+                "heavy": j.heavy,
+            })
+        })
+        .collect();
+    let leases: Vec<Value> = snapshot
+        .leases
+        .iter()
+        .map(|l| {
+            json!({
+                "job_id": l.job_id,
+                "module": l.module,
+                "ref": l.git_ref,
+                "host": l.host.as_str(),
+                "started_at_ms": l.started_at_ms,
+            })
+        })
+        .collect();
+    let (primary_inflight, heavy_inflight) = snapshot
+        .leases
+        .iter()
+        .fold((0u32, 0u32), |(p, h), l| match l.host {
+            HostRole::Primary => (p + 1, h),
+            HostRole::Heavy => (p, h + 1),
+        });
+    json!({
+        "queue_depth": snapshot.queued.len(),
+        "queued": queued,
+        "in_flight": snapshot.leases.len(),
+        "leases": leases,
+        "inflight_primary": primary_inflight,
+        "inflight_heavy": heavy_inflight,
+    })
+}
+
+/// Register the `compiler_*` tool surface on the registry, and — when the shared
+/// Redis is configured — spawn the background scheduler that drains the queue.
+///
+/// Tool ownership (intentional decomposition): BLD-06 owns `compiler_build`
+/// (from BLD-05) + `compiler_request` (the queue door) + the scheduler.
+/// `compiler_status` is a SEPARATE item (BLD-08); it consumes
+/// [`render_queue_status`] over [`queue::QueueStore::snapshot`] rather than being
+/// registered here, so the two items don't collide on the tool name.
 pub fn register(registry: &mut ToolRegistry) {
     if let Err(e) = registry.register(Box::new(CompilerBuild)) {
         tracing::error!("compiler: failed to register compiler_build: {e}");
+    }
+    if let Err(e) = registry.register(Box::new(CompilerRequest)) {
+        tracing::error!("compiler: failed to register compiler_request: {e}");
     }
     if let Err(e) = registry.register(Box::new(CompilerRelease)) {
         tracing::error!("compiler: failed to register compiler_release: {e}");
     }
     status::register(registry);
+    // Spawn the scheduler loop iff we're inside a tokio runtime AND Redis is
+    // configured — but AT MOST ONCE per process. CRUCIALLY, the once-slot is
+    // claimed ONLY when the scheduler actually spawns: if `register()` runs before
+    // Redis is materialized, the no-scheduler path must NOT burn the slot, so a
+    // LATER `register()` (once config has arrived) can still spawn exactly once.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        static SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let sched = scheduler::Scheduler::from_env();
+        match decide_scheduler_spawn(&SPAWNED, sched.is_some()) {
+            SpawnDecision::Spawn => {
+                sched
+                    .expect("scheduler present when decide returns Spawn")
+                    .spawn();
+                tracing::info!("compiler: scheduler loop spawned (durable Redis queue)");
+            }
+            SpawnDecision::AlreadySpawned => {
+                tracing::debug!("compiler: scheduler already spawned; skipping");
+            }
+            SpawnDecision::NoScheduler => {
+                tracing::info!(
+                    "compiler: no Redis configured; compiler_request will report NotConfigured, \
+                     the scheduler is not running, and the spawn slot is NOT burned (a later \
+                     register() after Redis is materialized can still spawn it)"
+                );
+            }
+        }
+    }
+}
+
+/// The outcome of the scheduler-spawn once-guard decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnDecision {
+    /// This caller wins the single spawn slot — it must spawn.
+    Spawn,
+    /// A prior caller already spawned — do nothing.
+    AlreadySpawned,
+    /// No scheduler is available (no Redis) — do nothing AND do NOT burn the slot.
+    NoScheduler,
+}
+
+/// Decide whether to spawn the scheduler, consuming the once-slot ONLY on an
+/// actual spawn. When `scheduler_available` is false the slot is left untouched
+/// (so a later call, once Redis is configured, can still spawn exactly once).
+/// Pure over the passed-in flag → unit-testable without a runtime or Redis.
+fn decide_scheduler_spawn(
+    slot: &std::sync::atomic::AtomicBool,
+    scheduler_available: bool,
+) -> SpawnDecision {
+    use std::sync::atomic::Ordering;
+    if !scheduler_available {
+        return SpawnDecision::NoScheduler;
+    }
+    match slot.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(_) => SpawnDecision::Spawn,
+        Err(_) => SpawnDecision::AlreadySpawned,
+    }
 }
 
 #[cfg(test)]
@@ -1961,6 +2288,80 @@ mod tests {
         assert_eq!(p["type"], "object");
         assert_eq!(p["required"][0], "module");
         assert_eq!(p["required"][1], "ref");
+    }
+
+    #[test]
+    fn heavy_classification_fails_to_the_safe_side_when_unknown() {
+        // fast → always heavy.
+        assert!(classify_heavy_auto(true, Some(None), Some(None)));
+        // No known peak (read OK, unset) → positively small.
+        assert!(!classify_heavy_auto(false, Some(None), Some(Some(100))));
+        assert!(!classify_heavy_auto(false, Some(None), None));
+        // Both known → authoritative comparison.
+        assert!(classify_heavy_auto(false, Some(Some(200)), Some(Some(100))));
+        assert!(!classify_heavy_auto(false, Some(Some(50)), Some(Some(100))));
+        // UNKNOWN cases must route to the SAFE (heavy/gated) side, NOT primary:
+        // - unreadable peak (present-but-unparsable → None)
+        assert!(classify_heavy_auto(false, None, Some(Some(100))));
+        // - unreadable threshold
+        assert!(classify_heavy_auto(false, Some(Some(50)), None));
+        // - a known peak but NO configured threshold (ambiguous)
+        assert!(classify_heavy_auto(false, Some(Some(50)), Some(None)));
+        // Explicit host requests are honored as-is.
+        assert!(request_is_heavy(HostRequest::Heavy, "m", false));
+        assert!(!request_is_heavy(HostRequest::Primary, "m", false));
+    }
+
+    #[test]
+    fn fast_forces_the_heavy_gated_path_even_with_explicit_primary() {
+        // B2: fast=true means a full-parallelism heavy build; it must route
+        // through the heavy (window+cap gated) path regardless of an explicit
+        // primary host request — never bypass the heavy window/cap.
+        let heavy = |req, fast| classify_request_heavy(req, fast, Some(Some(10)), Some(Some(1000)));
+        assert!(heavy(HostRequest::Primary, true));
+        assert!(heavy(HostRequest::Auto, true));
+        assert!(heavy(HostRequest::Heavy, true));
+    }
+
+    #[test]
+    fn heavy_safety_overrides_explicit_primary_for_a_known_heavy_module() {
+        // Fix 3 / AC-6: an explicit primary request is only a preference. A
+        // known-HEAVY module (peak over threshold) requested with host=primary,
+        // fast=false is STILL gated through the heavy path; a known-SMALL one
+        // still fast-paths on primary.
+        let known_heavy = (Some(Some(99_999u64)), Some(Some(1_000u64)));
+        let known_small = (Some(Some(10u64)), Some(Some(1_000u64)));
+        assert!(
+            classify_request_heavy(HostRequest::Primary, false, known_heavy.0, known_heavy.1),
+            "explicit primary must NOT let a known-heavy module skip the heavy gate"
+        );
+        assert!(
+            !classify_request_heavy(HostRequest::Primary, false, known_small.0, known_small.1),
+            "explicit primary still fast-paths a positively-known-small module"
+        );
+        // An ambiguous/unreadable module under explicit primary also stays gated.
+        assert!(classify_request_heavy(HostRequest::Primary, false, None, Some(Some(1_000))));
+        // Explicit heavy stays heavy; no-heavy-signal (no known peak) primary is small.
+        assert!(classify_request_heavy(HostRequest::Heavy, false, Some(None), None));
+        assert!(!classify_request_heavy(HostRequest::Primary, false, Some(None), Some(Some(1_000))));
+    }
+
+    #[test]
+    fn spawn_guard_does_not_burn_the_slot_before_redis_is_available() {
+        // Fix 2: a register() with NO scheduler must NOT consume the once-slot, so
+        // a later register() (once Redis is materialized) can still spawn exactly
+        // once; a third does not double-spawn.
+        use std::sync::atomic::AtomicBool;
+        let slot = AtomicBool::new(false);
+        // Pre-Redis registrations: no scheduler, slot untouched.
+        assert_eq!(decide_scheduler_spawn(&slot, false), SpawnDecision::NoScheduler);
+        assert_eq!(decide_scheduler_spawn(&slot, false), SpawnDecision::NoScheduler);
+        // Redis now configured → the first available registration spawns.
+        assert_eq!(decide_scheduler_spawn(&slot, true), SpawnDecision::Spawn);
+        // Subsequent registrations never double-spawn.
+        assert_eq!(decide_scheduler_spawn(&slot, true), SpawnDecision::AlreadySpawned);
+        assert_eq!(decide_scheduler_spawn(&slot, false), SpawnDecision::NoScheduler);
+        assert_eq!(decide_scheduler_spawn(&slot, true), SpawnDecision::AlreadySpawned);
     }
 
     #[test]
