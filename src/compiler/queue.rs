@@ -259,9 +259,15 @@ fn zset_key() -> String {
 fn seq_key() -> String {
     Namespace::Queue.key("seq")
 }
+/// The namespaced prefix for the per-`module@ref` dedupe pointers. Passed to
+/// `COMPLETE_LUA` so it can derive the dedupe key from the job hash's own
+/// module@ref without a separate round-trip.
+fn dedupe_prefix() -> String {
+    Namespace::Queue.key("dedupe:")
+}
 /// Per-`module@ref` dedupe pointer → the owning job id.
 fn dedupe_key(module: &str, git_ref: &str) -> String {
-    Namespace::Queue.key(&format!("dedupe:{module}@{git_ref}"))
+    format!("{}{module}@{git_ref}", dedupe_prefix())
 }
 /// The per-job hash prefix (the Lua scripts append the id).
 fn job_prefix() -> String {
@@ -374,41 +380,53 @@ redis.call('SADD', KEYS[4], ARGV[1])
 return {1, 'claimed'}
 "#;
 
-/// Release a finished build, re-enqueuing exactly ONCE if a re-run was requested
-/// (the `rerun` flag set by an enqueue that arrived while this job was building).
-/// Returns `{rerun_queued(0/1), new_job_id_or_empty}`.
-/// KEYS: 1=jobhash 2=modulelock 3=hostset 4=dedupe 5=zset 6=seq
+/// Release a finished build in ONE atomic script (no pre-read outside Lua): the
+/// module lock + host slot are released, the dedupe pointer is cleared (or
+/// repointed at the re-run), and — if a re-run was requested (the `rerun` flag
+/// set by an enqueue that arrived while this job was building) — exactly ONE
+/// follow-up build is re-enqueued. The dedupe key is derived INSIDE Lua from the
+/// job hash's own `module`/`ref` (via the `dedupe_prefix`), so there is no
+/// separate HGET round-trip that could fail independently and leave the lock/slot
+/// wedged: a Redis-down completion fails as a WHOLE with the lock/slot unchanged,
+/// and the scheduler retries. Returns `{rerun_queued(0/1), new_job_id_or_empty}`.
+/// KEYS: 1=jobhash 2=modulelock 3=hostset 4=zset 5=seq
 /// ARGV: 1=id 2=state 3=now 4=retain_secs 5=rerun_candidate_id 6=job_prefix
+///       7=dedupe_prefix
 const COMPLETE_LUA: &str = r#"
 -- Always release the per-module lock (only if it still points to this job) and
--- the host slot, so a completed/failed build never wedges the lock.
+-- the host slot FIRST, so a completed/failed build never wedges either.
 if redis.call('GET', KEYS[2])==ARGV[1] then redis.call('DEL', KEYS[2]) end
 redis.call('SREM', KEYS[3], ARGV[1])
+-- Derive the dedupe key from the job's OWN module@ref (no external pre-read).
+-- The hash may be gone (expired) → module/ref false → skip dedupe ops, but the
+-- lock/slot release above still stands.
+local module=redis.call('HGET', KEYS[1], 'module')
+local ref=redis.call('HGET', KEYS[1], 'ref')
+local dedupe=false
+if module and ref then dedupe=ARGV[7]..module..'@'..ref end
 local rerun=redis.call('HGET', KEYS[1], 'rerun')
 if rerun=='1' then
   -- Re-enqueue EXACTLY ONE follow-up build for the same module@ref, carrying the
   -- (possibly upgraded) priority + heavy class forward. The dedupe pointer now
   -- targets the NEW job (not deleted) so it stays the single owner for module@ref.
-  local module=redis.call('HGET', KEYS[1], 'module')
-  local ref=redis.call('HGET', KEYS[1], 'ref')
   local prank=tonumber(redis.call('HGET', KEYS[1], 'prank') or '1')
   local prio=redis.call('HGET', KEYS[1], 'priority') or 'normal'
   local heavy=redis.call('HGET', KEYS[1], 'heavy') or '0'
-  local seq=redis.call('INCR', KEYS[6])
+  local seq=redis.call('INCR', KEYS[5])
   local nid=ARGV[5]
   local njk=ARGV[6]..nid
   redis.call('HSET', njk, 'module', module, 'ref', ref, 'prank', prank,
     'priority', prio, 'heavy', heavy, 'seq', seq, 'requested_at', ARGV[3],
     'coalesced', 1, 'state', 'queued')
-  redis.call('SET', KEYS[4], nid)
+  if dedupe then redis.call('SET', dedupe, nid) end
   local score=seq-(prank*1000000000000)
-  redis.call('ZADD', KEYS[5], score, nid)
+  redis.call('ZADD', KEYS[4], score, nid)
   redis.call('HSET', KEYS[1], 'state', ARGV[2], 'finished_at', ARGV[3])
   redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
   return {1, nid}
 end
 -- No re-run: clear the dedupe pointer (if still ours) and finalize.
-if redis.call('GET', KEYS[4])==ARGV[1] then redis.call('DEL', KEYS[4]) end
+if dedupe and redis.call('GET', dedupe)==ARGV[1] then redis.call('DEL', dedupe) end
 redis.call('HSET', KEYS[1], 'state', ARGV[2], 'finished_at', ARGV[3])
 redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
 return {0, ''}
@@ -591,15 +609,16 @@ impl QueueStore for RedisQueue {
         host: HostRole,
         state: JobState,
     ) -> Result<(), QueueError> {
-        // The dedupe key is `module@ref`; complete() is given the id + module,
-        // so resolve the ref from the job hash (one bounded read; still degrades
-        // on Unavailable) to clear the right dedupe pointer.
-        let git_ref = self.job_ref(job_id).await?;
-        let (jk, lock, hset, dedupe, zset, seq) = (
+        // ONE atomic script — no external pre-read. The dedupe key is derived
+        // INSIDE Lua from the job hash's own module@ref (via `dedupe_prefix`), so
+        // a Redis-down completion fails as a whole with the lock/slot unchanged
+        // (the scheduler retries) rather than half-releasing and wedging them.
+        // The module lock + host set keys come from the caller's own `module`/
+        // `host` args (no read needed for those).
+        let (jk, lock, hset, zset, seq) = (
             job_key(job_id),
             module_lock_key(module),
             host_set_key(host),
-            dedupe_key(module, &git_ref),
             zset_key(),
             seq_key(),
         );
@@ -609,6 +628,7 @@ impl QueueStore for RedisQueue {
         // `rerun` flag set); globally unique like every enqueue-minted id.
         let rerun_id = uuid::Uuid::new_v4().simple().to_string();
         let jp = job_prefix();
+        let dedupe_prefix = dedupe_prefix();
         let script = redis::Script::new(COMPLETE_LUA);
         let out: Result<(i64, String), ()> = self
             .backend
@@ -617,7 +637,6 @@ impl QueueStore for RedisQueue {
                     .key(jk)
                     .key(lock)
                     .key(hset)
-                    .key(dedupe)
                     .key(zset)
                     .key(seq)
                     .arg(id)
@@ -626,6 +645,7 @@ impl QueueStore for RedisQueue {
                     .arg(retain)
                     .arg(rerun_id)
                     .arg(jp)
+                    .arg(dedupe_prefix)
                     .invoke_async::<_, (i64, String)>(&mut conn)
                     .await
             })
@@ -665,27 +685,6 @@ impl QueueStore for RedisQueue {
             }
         }
         Ok(QueueSnapshot { queued, leases })
-    }
-}
-
-impl RedisQueue {
-    /// Read a job's git ref from its hash (needed to reconstruct the dedupe key
-    /// on `complete`). `Unavailable` on a down Redis; an empty string when the
-    /// hash is gone (already expired) — harmless, the dedupe DEL then no-ops.
-    async fn job_ref(&self, job_id: &str) -> Result<String, QueueError> {
-        let jk = job_key(job_id);
-        let out: Result<Option<String>, ()> = self
-            .backend
-            .with_conn(Namespace::Queue, |mut conn| async move {
-                redis::cmd("HGET")
-                    .arg(jk)
-                    .arg("ref")
-                    .query_async::<_, Option<String>>(&mut conn)
-                    .await
-            })
-            .await;
-        out.map(|o| o.unwrap_or_default())
-            .map_err(|()| QueueError::Unavailable)
     }
 }
 
@@ -1175,6 +1174,70 @@ mod tests {
         // A subsequent small request must NOT downgrade it (monotonic).
         q.enqueue(&req("harmony", "r", Priority::Normal, false)).await.unwrap();
         assert!(q.peek(10).await.unwrap()[0].heavy, "heavy is never downgraded");
+    }
+
+    #[tokio::test]
+    async fn complete_releases_module_lock_and_host_slot_atomically() {
+        let q = InMemoryQueue::new();
+        // j1 (module m1) claimed on primary cap=1: holds the module lock AND the
+        // one primary host slot.
+        let j1 = q.enqueue(&req("m1", "r1", Priority::Normal, false)).await.unwrap();
+        let j2 = q.enqueue(&req("m2", "r2", Priority::Normal, false)).await.unwrap();
+        let j1b = q.enqueue(&req("m1", "rB", Priority::Normal, false)).await.unwrap();
+        assert_eq!(
+            q.claim(&j1.job_id, "m1", HostRole::Primary, 1).await.unwrap(),
+            ClaimOutcome::Claimed
+        );
+        // While j1 builds: a different module is host-capped, and same module is locked.
+        assert_eq!(
+            q.claim(&j2.job_id, "m2", HostRole::Primary, 1).await.unwrap(),
+            ClaimOutcome::HostFull
+        );
+        assert_eq!(
+            q.claim(&j1b.job_id, "m1", HostRole::Primary, 1).await.unwrap(),
+            ClaimOutcome::ModuleBusy
+        );
+        // One complete releases BOTH the host slot and the module lock atomically.
+        q.complete(&j1.job_id, "m1", HostRole::Primary, JobState::Done).await.unwrap();
+        assert_eq!(
+            q.claim(&j2.job_id, "m2", HostRole::Primary, 1).await.unwrap(),
+            ClaimOutcome::Claimed,
+            "host slot was freed by complete"
+        );
+        // Free m2's slot, then the same-module job can claim (module lock was freed).
+        q.complete(&j2.job_id, "m2", HostRole::Primary, JobState::Done).await.unwrap();
+        assert_eq!(
+            q.claim(&j1b.job_id, "m1", HostRole::Primary, 1).await.unwrap(),
+            ClaimOutcome::Claimed,
+            "module lock was freed by complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_on_redis_down_does_not_half_release_the_lock() {
+        let q = InMemoryQueue::new();
+        let j1 = q.enqueue(&req("m1", "r1", Priority::Normal, false)).await.unwrap();
+        let j1b = q.enqueue(&req("m1", "rB", Priority::Normal, false)).await.unwrap();
+        q.claim(&j1.job_id, "m1", HostRole::Primary, 1).await.unwrap();
+        // Redis goes down at completion time → the whole release fails; NOTHING
+        // is partially released (the module lock is still held).
+        q.set_down(true);
+        assert_eq!(
+            q.complete(&j1.job_id, "m1", HostRole::Primary, JobState::Done).await,
+            Err(QueueError::Unavailable)
+        );
+        q.set_down(false);
+        assert_eq!(
+            q.claim(&j1b.job_id, "m1", HostRole::Primary, 1).await.unwrap(),
+            ClaimOutcome::ModuleBusy,
+            "a failed (whole) completion left the lock intact — no half-release wedge"
+        );
+        // A later successful completion cleanly releases, and the retry claims.
+        q.complete(&j1.job_id, "m1", HostRole::Primary, JobState::Done).await.unwrap();
+        assert_eq!(
+            q.claim(&j1b.job_id, "m1", HostRole::Primary, 1).await.unwrap(),
+            ClaimOutcome::Claimed
+        );
     }
 
     #[tokio::test]
