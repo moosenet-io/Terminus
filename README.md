@@ -92,6 +92,54 @@ Chord-integration deep-dives.
 | **Flagship harness** | **MINT** — the model-intake/serving-profile CLI and tool suite. One `MintHarness` orchestrator drives both sweep families (`RunKind::Coder` for the code sweep, `RunKind::Assistant` for the Lumina seven-dimension sweep) through one lifecycle over the shared `lumina_intake` DB; the two standalone sweep binaries are thin `MintHarness::run(RunKind::…)` entrypoints. See [`docs/tools/README.md`](docs/tools/README.md#mint-flagship) |
 | **Inference** | proxied to the separate [Chord](https://github.com/moosenet-io/Chord) process — Terminus does tool egress, Chord does inference egress |
 
+## `compiler_build` — the single build door (BLD-05)
+
+The constellation CI/CD (S117) routes **every** shared-host build through one Terminus
+tool, exactly as `review_run` is the single review door. `compiler_build` selects a build
+host, ensures the pinned toolchain, runs an sccache-backed `cargo` build inside a
+resource-capped systemd scope, and publishes a checksummed artifact to the shared build
+dataset (`crate::compiler`).
+
+```
+compiler_build(module, ref, host="auto", profile="release", fast=false, bin?, source_dir?)
+```
+
+- **Host selection** (`compiler/host.rs`) — `auto` builds on the **primary** (dev box,
+  moderate RAM, capped) unless the module's known peak (`BUILD_MODULE_PEAK_MB_<MODULE>`)
+  exceeds `BUILD_HEAVY_THRESHOLD_MB`, or `fast=true`, in which case it uses the **heavy**
+  host (`BUILD_HOST_HEAVY`). `host="primary"|"heavy"` forces a role. Per-host caps come
+  from `BUILD_{PRIMARY,HEAVY}_{MEMORY_MAX,CPU_QUOTA,IO_WEIGHT,JOBS}`.
+- **Resource caps — Plex protection** (`compiler/scope.rs`) — the build runs under
+  `systemd-run --scope` with `MemoryMax` + **`MemorySwapMax=0`** + `CPUQuota` + `IOWeight`.
+  The swap-off is load-bearing: an over-budget build is OOM-killed inside its own cgroup
+  instead of triggering node-wide swap thrash that would interrupt Plex. Verify the live
+  caps with `systemctl show <scope-unit>`.
+- **Exec-safe target dir** — `CARGO_TARGET_DIR` is a LOCAL/tmpfs path
+  (`BUILD_LOCAL_TARGET_DIR`, default a temp dir); a hard guard **rejects** any target dir
+  inside the file-level NFS build dataset (cargo compiles then *executes* build scripts —
+  NFS breaks exec and adds lock/mtime hazards). The NFS dataset is for source-staging +
+  sccache + artifact publish only.
+- **sccache → Redis** (`compiler/sccache.rs`) — the auth'd Redis URL is read from the
+  vault-materialized `SCCACHE_REDIS` env var and parsed into the **split**
+  `SCCACHE_REDIS_ENDPOINT`/`_USERNAME`/`_PASSWORD`/`_DB`/`_KEY_PREFIX` form (the reliable
+  one; a bare `SCCACHE_REDIS` URL fell back to local disk in testing). It **fails OPEN**:
+  when Redis is unconfigured/unparseable, sccache uses a local dir
+  (`${BUILD_DATASET_ROOT}/cache/sccache`) so a cache outage never blocks a build. The
+  parsed password is never logged.
+- **Pinned toolchain** — `RUST_TOOLCHAIN_PINNED` is installed idempotently
+  (`rustup toolchain install`, never `rustup update`); when unset, rustup auto-installs
+  from the source tree's `rust-toolchain.toml`.
+- **Publish** (`compiler/publish.rs`) — on success the binary is SHA-256'd and copied to
+  `${BUILD_DATASET_ROOT}/artifacts/<module>/<channel>/<sha>/<target>/<bin>` with a
+  `<bin>.sha256` sidecar (the `sha256sum -c` format the constellation-updater verifies).
+  It does **not** flip a `current` pointer — channel promotion is `compiler_release`
+  (BLD-07). When the dataset is not mounted RW on the build host, publish relays the
+  artifact over a single rsync hop to `BUILD_DATASET_RELAY_HOST` (interim path, pre-BLD-01).
+
+All hosts, paths, caps, thresholds, and the cache endpoint come from config env
+(materialized from the vault where sensitive); there are no infrastructure literals in the
+source (S1), and `SCCACHE_REDIS` is read as a secret, never logged (S7).
+
 ## Fleet clock — `time_now` (CLK-01)
 
 `time_now` is a core tool that returns the **authoritative fleet date/time**
