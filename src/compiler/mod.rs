@@ -21,6 +21,8 @@
 
 pub mod host;
 pub mod publish;
+pub mod queue; // BLD-06: the durable compiler job queue (Namespace::Queue)
+pub mod scheduler; // BLD-06: window/quiet gating + per-host caps + idle seam
 pub mod sccache;
 pub mod scope;
 
@@ -35,7 +37,8 @@ use crate::error::ToolError;
 use crate::registry::ToolRegistry;
 use crate::tool::{RustTool, ToolOutput};
 
-use host::HostRequest;
+use host::{HostRequest, HostRole};
+use queue::{JobRequest, Priority, QueueStore, RedisQueue};
 
 /// Env var naming the shared build dataset root (appdata-backed NFS share).
 const BUILD_DATASET_ROOT: &str = "BUILD_DATASET_ROOT";
@@ -1178,10 +1181,242 @@ fn validate_source_dir(
     )))
 }
 
-/// Register the `compiler_*` tool surface on the registry.
+// ─────────────────────────────────────────────────────────────────────────────
+// BLD-06 — the queue entry point (`compiler_request`) + the scheduler's bridge
+// back into `compiler_build` (`invoke_build`).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Best-effort, request-time guess of whether a build WOULD land on the heavy
+/// host, mirroring `compiler_build`'s `host::select_role` heuristic — used only
+/// to tag the queued job so the scheduler can window-gate it. The AUTHORITATIVE
+/// host selection still happens in `compiler_build` at dispatch (which also
+/// enforces the required config); a missing/unparsable threshold here simply
+/// defaults the tag to "not heavy" rather than failing the enqueue.
+fn request_is_heavy(req: HostRequest, module: &str, fast: bool) -> bool {
+    match req {
+        HostRequest::Primary => false,
+        HostRequest::Heavy => true,
+        HostRequest::Auto => {
+            if fast {
+                return true;
+            }
+            let peak = host::module_peak_mb(module).ok().flatten();
+            let threshold = host::heavy_threshold_mb().ok().flatten();
+            matches!((peak, threshold), (Some(p), Some(t)) if p > t)
+        }
+    }
+}
+
+/// The scheduler's bridge into the single build door: dispatch a queued job to
+/// `compiler_build` with the host the scheduler selected (heavy vs primary). A
+/// thin wrapper so `scheduler::CompilerBuildExecutor` need not know the tool's
+/// arg shape.
+pub(crate) async fn invoke_build(module: &str, git_ref: &str, heavy: bool) -> Result<(), ToolError> {
+    let args = json!({
+        "module": module,
+        "ref": git_ref,
+        "host": if heavy { "heavy" } else { "primary" },
+    });
+    CompilerBuild.execute_structured(args).await.map(|_| ())
+}
+
+/// The `compiler_request` tool: an agent marks a module@ref "ready to build".
+/// Enqueues durably (deduped/coalesced by module@ref) into the shared Redis
+/// queue; the scheduler dispatches it. Multiple agents requesting the same
+/// module@ref coalesce into ONE run.
+struct CompilerRequest;
+
+#[async_trait]
+impl RustTool for CompilerRequest {
+    fn name(&self) -> &str {
+        "compiler_request"
+    }
+
+    fn description(&self) -> &str {
+        "Mark a constellation module@ref ready for a compiler run: enqueue a durable, \
+         deduped build request onto the shared job queue. Multiple agents requesting the \
+         same module@ref coalesce into one run. The scheduler dispatches small builds \
+         immediately on the primary and heavy builds within a configured window / \
+         fleet-quiet gate, one/few at a time per host. Returns the job id."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "module": {
+                    "type": "string",
+                    "description": "Module/repo to build (e.g. terminus, chord, harmony, lumina-core)."
+                },
+                "ref": {
+                    "type": "string",
+                    "description": "Git ref (sha or branch) to build."
+                },
+                "priority": {
+                    "type": "string",
+                    "enum": ["low", "normal", "high"],
+                    "default": "normal",
+                    "description": "Queue priority. Higher orders the queue sooner but never preempts a running build."
+                },
+                "host": {
+                    "type": "string",
+                    "enum": ["auto", "primary", "heavy"],
+                    "default": "auto",
+                    "description": "Requested build host role; also tags the job heavy (window-gated) vs small (immediate)."
+                },
+                "fast": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Prefer the heavy host for a full-parallelism build (tags the job heavy)."
+                },
+                "ready": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "true → dispatchable now; false → record the intent as held until a later ready=true request promotes it."
+                }
+            },
+            "required": ["module", "ref"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.execute_structured(args).await?.text)
+    }
+
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let module = str_arg(&args, "module")?;
+        let git_ref = str_arg(&args, "ref")?;
+        // Validate the same way compiler_build does (these become path segments
+        // + the dedupe/scope key), so a bad ref is rejected at enqueue, not build.
+        validate_segment("module", &module)?;
+        validate_git_ref(&git_ref)?;
+
+        let priority = Priority::parse(args.get("priority").and_then(Value::as_str).unwrap_or("normal"));
+        let host_req =
+            HostRequest::parse(args.get("host").and_then(Value::as_str).unwrap_or("auto"))?;
+        let fast = args.get("fast").and_then(Value::as_bool).unwrap_or(false);
+        let ready = args.get("ready").and_then(Value::as_bool).unwrap_or(true);
+        let heavy = request_is_heavy(host_req, &module, fast);
+
+        let store = RedisQueue::from_env().ok_or_else(|| {
+            ToolError::NotConfigured(
+                "compiler job queue is not configured (REDIS_URL unset) — cannot enqueue a build \
+                 request; the queue is durable Redis (BLD-20 Namespace::Queue)"
+                    .to_string(),
+            )
+        })?;
+        let enq = store
+            .enqueue(&JobRequest {
+                module: module.clone(),
+                git_ref: git_ref.clone(),
+                priority,
+                heavy,
+                ready,
+            })
+            .await
+            .map_err(|e| ToolError::Execution(e.to_string()))?;
+
+        let text = format!(
+            "{verb} {module}@{git_ref} ({prio}, {host}){ready}; job {id}",
+            verb = if enq.created { "Queued" } else { "Coalesced onto existing" },
+            prio = priority.as_str(),
+            host = if heavy { "heavy" } else { "primary" },
+            ready = if ready { "" } else { " [held]" },
+            id = enq.job_id,
+        );
+        let structured = json!({
+            "job_id": enq.job_id,
+            "created": enq.created,
+            "coalesced": !enq.created,
+            "module": module,
+            "ref": git_ref,
+            "priority": priority.as_str(),
+            "heavy": heavy,
+            "ready": ready,
+        });
+        Ok(ToolOutput::with_structured(text, structured))
+    }
+}
+
+/// Render a `compiler_status`-style view of the queue + in-flight leases from a
+/// snapshot. Exposed (not a registered tool here — BLD-08 owns the
+/// `compiler_status` tool surface) so the status item consumes ONE queue view
+/// rather than re-deriving the keyspace. `sccache_hit_rate` is left to the
+/// caller to fill (BLD-03 owns sccache stats); this reports the queue facts.
+pub fn render_queue_status(snapshot: &queue::QueueSnapshot) -> Value {
+    let queued: Vec<Value> = snapshot
+        .queued
+        .iter()
+        .enumerate()
+        .map(|(pos, j)| {
+            json!({
+                "position": pos,
+                "job_id": j.job_id,
+                "module": j.module,
+                "ref": j.git_ref,
+                "priority": j.priority.as_str(),
+                "heavy": j.heavy,
+            })
+        })
+        .collect();
+    let leases: Vec<Value> = snapshot
+        .leases
+        .iter()
+        .map(|l| {
+            json!({
+                "job_id": l.job_id,
+                "module": l.module,
+                "ref": l.git_ref,
+                "host": l.host.as_str(),
+                "started_at_ms": l.started_at_ms,
+            })
+        })
+        .collect();
+    let (primary_inflight, heavy_inflight) = snapshot
+        .leases
+        .iter()
+        .fold((0u32, 0u32), |(p, h), l| match l.host {
+            HostRole::Primary => (p + 1, h),
+            HostRole::Heavy => (p, h + 1),
+        });
+    json!({
+        "queue_depth": snapshot.queued.len(),
+        "queued": queued,
+        "in_flight": snapshot.leases.len(),
+        "leases": leases,
+        "inflight_primary": primary_inflight,
+        "inflight_heavy": heavy_inflight,
+    })
+}
+
+/// Register the `compiler_*` tool surface on the registry, and — when the shared
+/// Redis is configured — spawn the background scheduler that drains the queue.
+///
+/// Tool ownership (intentional decomposition): BLD-06 owns `compiler_build`
+/// (from BLD-05) + `compiler_request` (the queue door) + the scheduler.
+/// `compiler_status` is a SEPARATE item (BLD-08); it consumes
+/// [`render_queue_status`] over [`queue::QueueStore::snapshot`] rather than being
+/// registered here, so the two items don't collide on the tool name.
 pub fn register(registry: &mut ToolRegistry) {
     if let Err(e) = registry.register(Box::new(CompilerBuild)) {
         tracing::error!("compiler: failed to register compiler_build: {e}");
+    }
+    if let Err(e) = registry.register(Box::new(CompilerRequest)) {
+        tracing::error!("compiler: failed to register compiler_request: {e}");
+    }
+    // Spawn the scheduler loop iff we're inside a tokio runtime AND Redis is
+    // configured. Guarded so a non-async caller (or a Redis-less deployment)
+    // simply skips scheduling — the tools still register and degrade loudly.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        if let Some(sched) = scheduler::Scheduler::from_env() {
+            sched.spawn();
+            tracing::info!("compiler: scheduler loop spawned (durable Redis queue)");
+        } else {
+            tracing::info!(
+                "compiler: no Redis configured; compiler_request will report NotConfigured \
+                 and the scheduler is not running"
+            );
+        }
     }
 }
 

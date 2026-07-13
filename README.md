@@ -208,6 +208,50 @@ All hosts, paths, caps, thresholds, and the cache endpoint come from config env
 source (S1), and `SCCACHE_REDIS`/its password are read as secrets, never logged and never
 placed on a command line (S7).
 
+## `compiler_request` — queue + scheduler (BLD-06)
+
+`compiler_build` is the single build *door*; `compiler_request` is how agents *ask* for a
+build without racing each other. Multiple agents mark a `module@ref` "ready for a compiler
+run"; the request is enqueued durably and the **scheduler** turns queued readiness into
+gracefully-serialized builds.
+
+```
+compiler_request(module, ref, priority="normal", host="auto", fast=false, ready=true)
+  → { job_id, created, coalesced, module, ref, priority, heavy, ready }
+```
+
+- **Durable queue** — the shared Redis provisioned by BLD-20, under the reserved
+  `Namespace::Queue` (`queue:*`, logical DB `noeviction`) so a queued build is never evicted
+  under memory pressure. When Redis is not configured, `compiler_request` reports
+  `NotConfigured` and the scheduler does not run — it never silently drops a build request.
+- **Dedupe / coalesce** — requests are deduped by `module@ref`: several agents marking the
+  same `module@ref` ready coalesce into ONE run (the coalesce count is tracked). `ready=false`
+  records the intent as *held* until a later `ready=true` for the same `module@ref` promotes it.
+- **Atomicity** — enqueue+dedupe+coalesce, claim (queued→building under a per-module lock and
+  a per-host cap), and complete (release lock + slot) are each a single atomic Lua script, so
+  concurrent agents/schedulers can never double-enqueue, start two conflicting builds of one
+  module, or exceed a host's cap.
+- **Graceful serialization + windows** — the scheduler dispatches small/primary builds
+  immediately (bounded by `BUILD_HOST_CAP_PRIMARY`), and holds **heavy** builds (the ones the
+  `select_role` heuristic routes to the heavy host) for a configured window
+  (`BUILD_WINDOW_HOURS`, e.g. `22-24,0-6`, wrap-aware) or a fleet-quiet signal
+  (`BUILD_FLEET_QUIET`). One build per host at a time unless the per-host cap is raised. A
+  window closing mid-build never cancels the in-flight build — it only stops new heavy dispatch.
+  Priority (`low|normal|high`) orders the queue but never preempts a running build.
+- **Idle-mode seam (BLD-11)** — a heavy build acquires/releases the heavy host's idle-mode
+  lease around the build; that coordination is a clean trait seam (`IdleCoordinator`), a
+  no-op by default, wired for real by BLD-11 — and touched only for a heavy build actually
+  being dispatched.
+- **`compiler_status`** — the status tool is a separate item (BLD-08); it renders
+  `compiler::render_queue_status` over the queue snapshot (queue depth, queued jobs,
+  in-flight leases per host).
+
+Scheduler knobs are all config env with safe serialize-everything defaults (cap 1, no heavy
+window ⇒ heavy builds wait for a window/quiet signal): `BUILD_HOST_CAP_PRIMARY`,
+`BUILD_HOST_CAP_HEAVY`, `BUILD_WINDOW_HOURS`, `BUILD_FLEET_QUIET`, `BUILD_SCHED_INTERVAL_SECS`,
+`BUILD_SCHED_PEEK`, `BUILD_JOB_RETAIN_SECS` — no infrastructure literals (S1). Redis endpoint
++ password come from the vault-materialized env via the shared `RedisBackend` (S7).
+
 ## Fleet clock — `time_now` (CLK-01)
 
 `time_now` is a core tool that returns the **authoritative fleet date/time**
