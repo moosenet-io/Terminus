@@ -24,6 +24,7 @@ pub mod host;
 pub mod publish;
 pub mod sccache;
 pub mod scope;
+pub mod status;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -1417,6 +1418,7 @@ pub fn register(registry: &mut ToolRegistry) {
     if let Err(e) = registry.register(Box::new(CompilerRelease)) {
         tracing::error!("compiler: failed to register compiler_release: {e}");
     }
+    status::register(registry);
 }
 
 #[cfg(test)]
