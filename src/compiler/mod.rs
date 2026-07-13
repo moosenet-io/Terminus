@@ -717,13 +717,17 @@ impl RustTool for CompilerBuild {
         // INVALID (bad chars / overlong), we FALL BACK to an auto-generated id
         // rather than returning early with no surfaced id (AC-1). The invalid id is
         // discarded, never clamped — so two distinct ids can't fold onto one track.
-        let request_id = args
-            .get("request_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| is_valid_request_id(s))
-            .map(str::to_string)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+        // The substitution is made OBSERVABLE (not silent): a warn log + a
+        // `supplied_request_id_invalid` signal in the result (structured field on
+        // success, an `[supplied_request_id_invalid]` marker in the error on
+        // failure), so a client can correlate the id it sent with the one used.
+        let (request_id, supplied_invalid) = resolve_request_id(&args);
+        if supplied_invalid {
+            tracing::warn!(
+                effective_request_id = %request_id,
+                "compiler_build: supplied request_id was invalid; using a generated id"
+            );
+        }
         // BLD-19: ROTATE the progress track to a FRESH stream NOW — before any
         // validation and before build_inner. This is the single rotation per build
         // attempt (build_inner does NOT rotate again). Doing it here (not inside
@@ -747,7 +751,16 @@ impl RustTool for CompilerBuild {
         // surfaced and the failed stream is discoverable; we do NOT synthesize a
         // fake `queued` event just to pad the shape.
         match self.build_inner(&request_id, args).await {
-            Ok(out) => Ok(out),
+            Ok(mut out) => {
+                // Surface the invalid-supplied-id substitution in the structured
+                // output so a client can correlate (only when it happened).
+                if supplied_invalid {
+                    if let Some(obj) = out.structured.as_mut().and_then(Value::as_object_mut) {
+                        obj.insert("supplied_request_id_invalid".into(), Value::Bool(true));
+                    }
+                }
+                Ok(out)
+            }
             Err(e) => {
                 // Sanitize the error at the EMITTER boundary — secret VALUES (S6/S7)
                 // AND infrastructure LITERALS (S1) — before it reaches the bus
@@ -756,20 +769,46 @@ impl RustTool for CompilerBuild {
                     &request_id,
                     events::Emit::stage(events::Stage::Failed).message(redacted_failed_message(&e)),
                 );
-                Err(tag_error_with_request_id(e, &request_id))
+                Err(tag_error_with_request_id(e, &request_id, supplied_invalid))
             }
         }
     }
 }
 
-/// Prepend `[request_id=<id>] ` to a build error's message, preserving the
-/// `ToolError` variant, so a FAILED build still hands the caller the stable
+/// Resolve the EFFECTIVE `request_id` for a build attempt and whether a
+/// caller-supplied id was INVALID and substituted. A caller value that is a valid
+/// `[A-Za-z0-9._-]` segment within the length bound is used as-is (→ `false`); a
+/// present-but-invalid value is DISCARDED and replaced by an auto-generated id
+/// (→ `true`, an observable substitution); an absent value auto-generates
+/// silently (→ `false`, nothing was supplied to invalidate). The fallback (never
+/// a hard reject) preserves the "a discoverable id always exists" invariant.
+fn resolve_request_id(args: &Value) -> (String, bool) {
+    match args
+        .get("request_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(s) if !s.is_empty() && is_valid_request_id(s) => (s.to_string(), false),
+        // Present but invalid → substitute (observable).
+        Some(s) if !s.is_empty() => (uuid::Uuid::new_v4().simple().to_string(), true),
+        // Absent/blank → auto-generate (nothing supplied, not a substitution).
+        _ => (uuid::Uuid::new_v4().simple().to_string(), false),
+    }
+}
+
+/// Prepend `[request_id=<id>] ` (and, when the supplied id was invalid, a
+/// `[supplied_request_id_invalid]` marker) to a build error's message, preserving
+/// the `ToolError` variant, so a FAILED build still hands the caller the stable
 /// request_id — the caller extracts it and queries `compiler_progress` to read
-/// the failed build's stream (terminal `failed` event + redacted error tail).
-/// This is how the "every build returns a stable request_id" invariant holds on
-/// the failure path (the success path returns it in the structured output/text).
-fn tag_error_with_request_id(e: ToolError, request_id: &str) -> ToolError {
-    let tag = format!("[request_id={request_id}] ");
+/// the failed build's stream. This is how the "every build returns a stable
+/// request_id" invariant holds on the failure path (the success path returns it
+/// in the structured output/text); the marker makes the invalid-id substitution
+/// observable on the failure path too.
+fn tag_error_with_request_id(e: ToolError, request_id: &str, supplied_invalid: bool) -> ToolError {
+    let mut tag = format!("[request_id={request_id}] ");
+    if supplied_invalid {
+        tag.push_str("[supplied_request_id_invalid] ");
+    }
     match e {
         ToolError::NotConfigured(m) => ToolError::NotConfigured(format!("{tag}{m}")),
         ToolError::InvalidArgument(m) => ToolError::InvalidArgument(format!("{tag}{m}")),
@@ -2193,10 +2232,36 @@ mod tests {
         let e = tag_error_with_request_id(
             ToolError::NotConfigured("BUILD_DATASET_ROOT is not configured".into()),
             "abc123",
+            false,
         );
-        // Variant preserved; message prefixed with the discoverable id.
+        // Variant preserved; message prefixed with the discoverable id; no marker.
         assert!(matches!(e, ToolError::NotConfigured(_)));
         assert!(e.to_string().contains("[request_id=abc123]"));
+        assert!(!e.to_string().contains("supplied_request_id_invalid"));
+        // With the invalid-supplied flag, the marker is added (id still clean).
+        let e2 = tag_error_with_request_id(ToolError::Execution("boom".into()), "abc123", true);
+        assert!(e2.to_string().contains("[request_id=abc123]"));
+        assert!(e2.to_string().contains("[supplied_request_id_invalid]"));
+    }
+
+    #[test]
+    fn resolve_request_id_valid_absent_and_invalid() {
+        // Valid caller id → used as-is, not a substitution.
+        let (id, inv) = resolve_request_id(&json!({ "request_id": "my-build-1" }));
+        assert_eq!(id, "my-build-1");
+        assert!(!inv);
+        // Absent → auto-generated, NOT flagged (nothing was supplied to invalidate).
+        let (id2, inv2) = resolve_request_id(&json!({}));
+        assert!(is_valid_request_id(&id2) && !inv2);
+        // Present but invalid (separator) → substituted + flagged.
+        let (id3, inv3) = resolve_request_id(&json!({ "request_id": "a/b" }));
+        assert!(is_valid_request_id(&id3) && !id3.contains('/'));
+        assert!(inv3, "invalid supplied id is an observable substitution");
+        // Present but overlong → substituted + flagged.
+        let (id4, inv4) = resolve_request_id(
+            &json!({ "request_id": "z".repeat(events::MAX_REQUEST_ID_LEN + 1) }),
+        );
+        assert!(is_valid_request_id(&id4) && inv4);
     }
 
     /// Process-wide serializer for the rare test that must toggle an env var, so
@@ -2427,6 +2492,11 @@ mod tests {
         // The surfaced id is a VALID auto-generated one (not the caller's bad id).
         assert!(is_valid_request_id(&rid), "surfaced id is valid: {rid:?}");
         assert!(!rid.contains('/'), "the invalid caller id was not used");
+        // The substitution is OBSERVABLE on the failure path: a marker in the error.
+        assert!(
+            msg.contains("[supplied_request_id_invalid]"),
+            "invalid-supplied-id substitution is signalled: {msg}"
+        );
         // And the failed stream is discoverable under that id.
         let prog = CompilerProgress
             .execute_structured(json!({ "request_id": rid }))
@@ -2435,6 +2505,30 @@ mod tests {
         let s = prog.structured.unwrap();
         assert_eq!(s["stage"], "failed");
         assert_eq!(s["terminal"], true);
+    }
+
+    #[tokio::test]
+    async fn valid_supplied_id_is_used_with_no_substitution_marker() {
+        // A VALID supplied id is used as-is: no substitution, no marker on failure.
+        let _env = ScopedEnv::new().unset("BUILD_DATASET_ROOT");
+        let id = format!("caller-{}", uuid::Uuid::new_v4());
+        let err = CompilerBuild
+            .execute_structured(json!({
+                "module": "terminus",
+                "ref": "abc123",
+                "request_id": id,
+            }))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("request_id={id}")),
+            "the caller's valid id is used verbatim: {msg}"
+        );
+        assert!(
+            !msg.contains("supplied_request_id_invalid"),
+            "no substitution marker for a valid id: {msg}"
+        );
     }
 
     #[tokio::test]

@@ -225,7 +225,11 @@ A caller-supplied `request_id` must be a single `[A-Za-z0-9._-]` segment of at m
 This is a **hard validation rule, not a lossy clamp** (so two distinct ids can never be
 truncated onto one track): `compiler_build` **falls back to an auto-generated id** when the
 supplied one is missing or invalid (never returning without a surfaced id), and
-`compiler_progress` **rejects** an invalid/overlong id with a clear validation error.
+`compiler_progress` **rejects** an invalid/overlong id with a clear validation error. When a
+supplied id is invalid and substituted, the fallback is **observable, not silent**: a
+`tracing::warn`, a `supplied_request_id_invalid: true` field in the success structured output,
+and a `[supplied_request_id_invalid]` marker in the returned error on failure — so a client can
+correlate the id it sent with the effective id used.
 
 ```
 compiler_progress(request_id, since=0, wait_ms=0)
@@ -244,6 +248,10 @@ output has no parseable `{step,total}` line still shows a `building` (started) e
 throttling below applies **only** to intermediate `{step,total}` progress updates, never to a
 stage transition.
 
+- `pending` — **snapshot-only, never an emitted event.** The track exists (it was
+  `begin`-rotated) but no event has been emitted yet — the brief window between the wrapper's
+  rotation and the build's first `queued`. Reported as `pending` (non-terminal) so a poller in
+  that window never observes a *fabricated* `queued` that was never emitted.
 - `queued` — request accepted (carries `module@ref`).
 - `scheduled` — build host selected (`primary`/`heavy`).
 - `relaying` — source staged (rsync) to the heavy host. **Remote/heavy path only** — a local
@@ -292,6 +300,9 @@ per-build-request, not per-key-slot):
   evicted/rotated and the id is reused while a long-poller is waiting, the waiter's post-wake
   snapshot has a different `generation` and resolves to `not_found` — a stale waiter never
   receives a different build's data.
+- **Long-poll is TTL-bounded.** The wait is bounded by the earlier of `wait_ms` and the track's
+  remaining TTL, so an id that expires *during* a long-poll wakes promptly (≈ at the TTL, not at
+  the `wait_ms` cap) and resolves to `not_found` — it never hangs to the cap.
 
 ### Seam with `compiler_status` (BLD-08)
 

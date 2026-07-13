@@ -88,6 +88,10 @@ const DEFAULT_TTL_SECS: u64 = 3600;
 /// just observes a `Lagged` skip and re-reads the snapshot — the ring buffer is
 /// the durable record, the channel is only the live wakeup.
 const BROADCAST_DEPTH: usize = 64;
+/// A tiny floor added to the remaining-TTL poll bound so the post-wait snapshot
+/// observes the track as already expired (avoids waking one tick too early and
+/// re-waiting). Not a busy-spin: it's a single bounded wait.
+const POLL_TTL_FLOOR_MS: u64 = 5;
 /// Max stored length of an event `message` (a few KB): one huge error/log line
 /// must not escape the ring/capacity memory bound. Longer messages are truncated
 /// with a marker. A char-boundary-safe cut.
@@ -165,8 +169,17 @@ fn now_ms() -> u64 {
 /// updater/deploy stage (BLD-13) — `deployed` / `rolled_back` — is a SEPARATE
 /// lifecycle NOT emitted onto this stream (the stream is closed at `published`/
 /// `failed`), so there is no `Deployed`/`RolledBack` variant here.
+///
+/// [`Stage::Pending`] is a SNAPSHOT-ONLY state, never an emitted event: a track
+/// that has been [`begin`](ProgressBus::begin)-rotated but has no events yet
+/// (the window between the wrapper's `begin()` and the build's first `queued`
+/// emit) reports `pending` — "tracked, no stage yet" — so a poller never observes
+/// a FABRICATED `queued` that was never emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
+    /// Snapshot-only: the track exists (begin-rotated) but no event was emitted
+    /// yet. Non-terminal, never emitted as an event.
+    Pending,
     Queued,
     Scheduled,
     /// Staging source to the heavy build host. REMOTE path only — a local
@@ -183,6 +196,7 @@ pub enum Stage {
 impl Stage {
     pub fn as_str(self) -> &'static str {
         match self {
+            Stage::Pending => "pending",
             Stage::Queued => "queued",
             Stage::Scheduled => "scheduled",
             Stage::Relaying => "relaying",
@@ -318,7 +332,12 @@ impl Track {
     }
 
     fn snapshot_stage(&self) -> Stage {
-        self.events.last().map(|e| e.stage).unwrap_or(Stage::Queued)
+        // Derive from the LAST ACTUAL event. An event-less (freshly begin-rotated)
+        // track reports the neutral `Pending` — NEVER a fabricated `queued`.
+        self.events
+            .last()
+            .map(|e| e.stage)
+            .unwrap_or(Stage::Pending)
     }
 }
 
@@ -691,6 +710,11 @@ impl ProgressBus {
     /// is REUSED by a NEW build mid-wait, the post-wait snapshot has a different
     /// generation and resolves to `None` (not_found) — the old waiter never
     /// receives the new build's data (tracks are per-build-request, not per-slot).
+    ///
+    /// TTL BOUND (AC-3): the wait is bounded by the EARLIER of `wait` and the
+    /// track's remaining TTL, so an id that expires DURING a long-poll wakes
+    /// promptly (≈ at the TTL, not at the `wait` cap) and the post-wait read-side
+    /// expiry check resolves it to `not_found` instead of hanging.
     pub async fn poll(
         &self,
         request_id: &str,
@@ -704,11 +728,25 @@ impl ProgressBus {
         if !snap.events.is_empty() || snap.terminal || wait.is_zero() {
             return Some(snap);
         }
+        // Bound the wait by the track's remaining TTL (when TTL is enabled): wait
+        // no longer than until the track would expire (+ a tiny floor so the
+        // post-wait snapshot sees it as expired), so an expiring id resolves to
+        // not_found at ≈ its TTL rather than after the full `wait` cap.
+        let effective = if self.ttl_ms > 0 {
+            let elapsed = now_ms().saturating_sub(snap.updated_ms);
+            let remaining = self
+                .ttl_ms
+                .saturating_sub(elapsed)
+                .saturating_add(POLL_TTL_FLOOR_MS);
+            std::time::Duration::from_millis(remaining.min(wait.as_millis() as u64))
+        } else {
+            wait
+        };
         // Nothing new yet — await a live event (or timeout), then re-snapshot so
         // the caller always gets the full current state, not just one delta. The
         // re-snapshot also re-checks TTL, so an id that expired during the wait
         // resolves to not_found instead of hanging or returning stale data.
-        let _ = tokio::time::timeout(wait, rx.recv()).await;
+        let _ = tokio::time::timeout(effective, rx.recv()).await;
         let after = self.snapshot(request_id, since)?;
         // If the id was reused by a NEW build mid-wait, the generation differs →
         // do NOT return the new build's data to this (stale) waiter.
@@ -1061,6 +1099,44 @@ mod tests {
         bus.emit("q", Emit::stage(Stage::Scheduled)); // non-terminal, last_seq = 1
         let snap = bus.poll("q", 1, std::time::Duration::from_millis(60)).await;
         assert!(snap.is_none(), "id expired mid-wait resolves to not_found");
+    }
+
+    #[tokio::test]
+    async fn poll_wait_is_bounded_by_remaining_ttl_not_the_wait_cap() {
+        // AC-3: with a short TTL (60ms) and a LONG wait (5s), a caught-up poller
+        // with no further emit must resolve to not_found near the TTL — NOT after
+        // the full wait cap. Proves the wait is bounded by remaining TTL.
+        let bus = ProgressBus::with_bounds(16, 8, 60); // ttl 60ms
+        bus.emit("x", Emit::stage(Stage::Scheduled)); // seq = 1, non-terminal
+        let start = std::time::Instant::now();
+        let res = bus.poll("x", 1, std::time::Duration::from_secs(5)).await;
+        let elapsed = start.elapsed();
+        assert!(res.is_none(), "expired id resolves to not_found");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "resolved near the TTL, not the 5s wait cap: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn eventless_begun_track_reports_pending_not_queued() {
+        // #2: a freshly begin-rotated track with NO events is `pending`, NOT a
+        // fabricated `queued`; it is non-terminal.
+        let bus = ProgressBus::with_bounds(16, 8, 0);
+        bus.begin("id");
+        let s = bus.snapshot("id", 0).unwrap();
+        assert_eq!(s.stage, Stage::Pending, "event-less track is pending");
+        assert!(!s.terminal);
+        assert!(s.events.is_empty());
+        // After the first `queued` emit → queued.
+        bus.emit("id", Emit::stage(Stage::Queued));
+        assert_eq!(bus.snapshot("id", 0).unwrap().stage, Stage::Queued);
+        // A pre-acceptance `failed` (no queued) → terminal failed.
+        bus.begin("id2");
+        bus.emit("id2", Emit::stage(Stage::Failed).message("bad"));
+        let f = bus.snapshot("id2", 0).unwrap();
+        assert_eq!(f.stage, Stage::Failed);
+        assert!(f.terminal);
     }
 
     #[test]
