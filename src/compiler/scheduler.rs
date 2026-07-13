@@ -514,27 +514,18 @@ impl Scheduler {
                         })
                         .await;
                         if !requeued {
-                            // Requeue still failing after retries → do NOT leave the job
-                            // claimed (pinning the heavy host slot + module lock until
-                            // reconcile). Explicitly FREE the slot (finalize Failed +
-                            // release, token-fenced). Reconcile remains the ultimate
-                            // backstop if even this fails.
+                            // Requeue still failing after retries → leave the job for the
+                            // BLD-06 reconcile backstop. A job that never completed has NO
+                            // finalize/terminal marker, so reconcile's crashed-path
+                            // REQUEUES it (never FAILS it) after the stale floor. We must
+                            // NOT convert an idle-gate abort into a terminal Failed build,
+                            // so there is deliberately NO complete(Failed) here.
                             tracing::error!(
                                 module = %job.module, job = %job.job_id,
                                 "compiler scheduler: requeue after idle-lease failure exhausted \
-                                 retries; RELEASING the job's lock+slot so the heavy host is \
-                                 not tied up (reconcile is the backstop)"
+                                 retries; leaving the (never-run) job for the reconcile backstop, \
+                                 which will REQUEUE it (not fail it) after the stale floor"
                             );
-                            if let Err(re) = queue
-                                .complete(&job.job_id, &job.module, host, JobState::Failed, &token)
-                                .await
-                            {
-                                tracing::error!(
-                                    module = %job.module, job = %job.job_id,
-                                    "compiler scheduler: could neither requeue NOR release the \
-                                     job ({re}); the reconcile backstop will recover the slot"
-                                );
-                            }
                         }
                         return;
                     }
@@ -947,16 +938,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_abort_releases_the_slot_when_requeue_never_succeeds() {
-        // FINDING 3: if requeue keeps failing past its retries, the scheduler must still
-        // FREE the slot (finalize Failed + release) rather than leave the job claimed and
-        // pin the heavy host — reconcile is only the ultimate backstop.
+    async fn idle_abort_never_fails_the_build_leaves_it_for_reconcile_when_requeue_exhausted() {
+        // FINDING 2: an idle-gate abort must NEVER be converted into a terminal FAILED
+        // build. If requeue keeps failing past its retries, the scheduler leaves the
+        // (never-run) job for the BLD-06 reconcile backstop — a job with NO terminal
+        // marker is REQUEUED by reconcile (not failed) after the stale floor. There is
+        // deliberately NO complete(Failed) fallback.
         let q = Arc::new(InMemoryQueue::new());
         let enq = q.enqueue(&req("harmony", "big", true)).await.unwrap();
         let ex = RecordingExecutor::new(false);
         let idle = Arc::new(CountingIdle::new(true)); // acquire fails ⇒ abort path
-        // Fail every requeue attempt (cfg's complete_retry_max is 50) so the fallback
-        // release path runs.
+        // Fail every requeue attempt so the exhausted-retries branch runs.
         let s = sched(q.clone(), ex.clone(), idle.clone(), cfg(1, 1, vec![]));
         q.fail_requeues(1000);
         let r = s.tick_once(12, true).await;
@@ -965,13 +957,19 @@ mod tests {
             h.await.unwrap();
         }
         assert!(ex.built.lock().unwrap().is_empty(), "never built");
-        // Requeue never landed → the slot was RELEASED (job terminal, not left building).
-        assert_ne!(
-            q.state_of(&enq.job_id).as_deref(),
-            Some("building"),
-            "job must NOT be left claimed/building (that would pin the host slot)"
+        // The build must NOT be terminally Failed (or Done) — no terminal outcome at all,
+        // so reconcile will REQUEUE it. Acceptable states: "queued" (a retry landed) or
+        // "building" with no outcome (left for reconcile); NEVER "failed"/"done".
+        let state = q.state_of(&enq.job_id);
+        assert!(
+            matches!(state.as_deref(), Some("queued") | Some("building")),
+            "idle-abort must requeue or leave-for-reconcile, never terminalize — got {state:?}"
         );
-        assert_eq!(q.inflight_count(HostRole::Heavy), 0, "host slot freed by the fallback release");
+        assert_ne!(state.as_deref(), Some("failed"), "must NEVER be terminally Failed");
+        assert!(
+            !q.has_outcome(&enq.job_id),
+            "no terminal outcome marker ⇒ reconcile requeues (never fails) this never-run job"
+        );
     }
 
     #[tokio::test]

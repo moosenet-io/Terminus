@@ -534,6 +534,33 @@ impl LeaseGuard {
         self.inner.clone()
     }
 
+    /// A guard HOLDING `inner` but with NO max-lease watchdog armed yet. Used during the
+    /// idle calls; [`arm_watchdog`](Self::arm_watchdog) arms it only AFTER idle completes
+    /// (F1), so the watchdog can never fire against an in-flight idle.
+    fn held(inner: Arc<LeaseInner>) -> Self {
+        Self {
+            inner: Some(inner),
+            watchdog: None,
+        }
+    }
+
+    /// Arm (or replace) the max-lease watchdog: after `max_lease`, force a release that
+    /// reactivates the (genuinely-idled) services — the fail-safe against a hung/forgotten
+    /// build. Called only once both idle calls have COMPLETED.
+    fn arm_watchdog(&mut self, max_lease: Duration) {
+        if let Some(inner) = self.inner.clone() {
+            let handle = tokio::spawn(async move {
+                tokio::time::sleep(max_lease).await;
+                warn!(
+                    max_lease_secs = max_lease.as_secs(),
+                    "idle lease: MAX-LEASE timeout reached — force-activating (a build hung or was forgotten)"
+                );
+                inner.release().await;
+            });
+            self.watchdog = Some(handle);
+        }
+    }
+
     /// Explicit, AWAITED release for the normal completion path. Idempotent with the
     /// `Drop` and the watchdog (the inner once-guard means reactivation runs once).
     pub async fn release(mut self) {
@@ -660,20 +687,22 @@ pub async fn acquire_lease(
         chord_in_lease, "idle lease: idling for a heavy build (MINT always; Chord iff configured)"
     );
 
-    // Arm the guard NOW (before any wait) so its max-lease watchdog bounds the ENTIRE
-    // idle window, including the budget wait below (F4). A Chord left out of the lease
-    // starts already-"active" so release never touches it (F1).
-    let guard = arm_guard(
+    // Build the release machinery (inner) but DO NOT arm the max-lease watchdog yet
+    // (F1): the watchdog must never fire against an IN-FLIGHT idle call — if it did, a
+    // premature release would mark services active and the idle call would then land,
+    // stranding the service idle. So we arm the watchdog ONLY AFTER both idle calls
+    // COMPLETE. A Chord left out of the lease starts already-"active" (release skips it).
+    let mut guard = LeaseGuard::held(build_lease_inner(
         backend.clone(),
-        cfg.max_lease,
         cfg.activate_retry,
         cfg.op_timeout,
         chord_in_lease,
-    );
+    ));
 
     // Idle the available backends (bounded by the per-op timeout). Capture the freed-RAM
     // each reports, used ONLY as a fallback when `/proc/meminfo` is unreadable (F2). A
-    // FAILED or HUNG idle ⇒ degrade safely: GUARANTEED reactivation + abort (requeue, F3).
+    // FAILED or HUNG idle ⇒ degrade safely: reactivate anything that landed + abort
+    // (requeue, F3). No watchdog is armed yet, so none can race an in-flight idle.
     let mut chord_freed = None;
     if chord_in_lease {
         match with_op_timeout(cfg.op_timeout, "Chord idle", backend.chord_idle()).await {
@@ -688,10 +717,15 @@ pub async fn acquire_lease(
     // Sum the reported freed (fallback budget estimate when MemAvailable is unreadable).
     let reported_freed = chord_freed.unwrap_or(0.0).max(0.0) + mint_freed.unwrap_or(0.0).max(0.0);
 
+    // Both idle calls have COMPLETED (services actually idled) → NOW arm the max-lease
+    // watchdog. It still bounds the ENTIRE budget wait below (F4), but can only ever fire
+    // against genuinely-idled services, so its release always correctly reactivates them.
+    guard.arm_watchdog(cfg.max_lease);
+
     // No budget ⇒ idle confirmed; proceed WITHOUT waiting on an available-RAM threshold.
     if budget_gb <= 0.0 {
-        // Even here, if the lease already expired (a max_lease≈0 watchdog fired during
-        // idling) do NOT hand back a dead lease.
+        // Even here, if the lease already expired (a max_lease≈0 watchdog fired the
+        // instant we armed it) do NOT hand back a dead lease.
         if guard.is_expired() {
             return expired_abort(guard, "lease expired during idle");
         }
@@ -789,17 +823,16 @@ fn abort_with_guard(
     })
 }
 
-/// Build a `LeaseGuard` and arm its max-lease watchdog (force-activate after the hard
-/// bound so a hung/aborted build can never wedge Chord/MINT idle). `chord_in_lease`
-/// false ⇒ Chord starts already-"active" (not part of the lease, never activated).
-fn arm_guard(
+/// Build the shared release machinery (`LeaseInner`) for a lease, WITHOUT a watchdog.
+/// `chord_in_lease` false ⇒ Chord starts already-"active" (not part of the lease, never
+/// idled/activated).
+fn build_lease_inner(
     backend: Arc<dyn IdleBackend>,
-    max_lease: Duration,
     activate_retry: Duration,
     op_timeout: Duration,
     chord_in_lease: bool,
-) -> LeaseGuard {
-    let inner = Arc::new(LeaseInner {
+) -> Arc<LeaseInner> {
+    Arc::new(LeaseInner {
         backend,
         chord_active: AtomicBool::new(!chord_in_lease),
         mint_active: AtomicBool::new(false),
@@ -809,20 +842,24 @@ fn arm_guard(
         release_lock: tokio::sync::Mutex::new(()),
         expired: AtomicBool::new(false),
         expired_notify: tokio::sync::Notify::new(),
-    });
-    let wd_inner = inner.clone();
-    let watchdog = tokio::spawn(async move {
-        tokio::time::sleep(max_lease).await;
-        warn!(
-            max_lease_secs = max_lease.as_secs(),
-            "idle lease: MAX-LEASE timeout reached — force-activating (a build hung or was forgotten)"
-        );
-        wd_inner.release().await;
-    });
-    LeaseGuard {
-        inner: Some(inner),
-        watchdog: Some(watchdog),
-    }
+    })
+}
+
+/// Build a fully-armed `LeaseGuard` (inner + max-lease watchdog). Used by tests; the
+/// production `acquire_lease` builds the inner first and arms the watchdog only AFTER the
+/// idle calls complete (F1). `chord_in_lease` false ⇒ Chord is not part of the lease.
+#[cfg(test)]
+fn arm_guard(
+    backend: Arc<dyn IdleBackend>,
+    max_lease: Duration,
+    activate_retry: Duration,
+    op_timeout: Duration,
+    chord_in_lease: bool,
+) -> LeaseGuard {
+    let mut guard =
+        LeaseGuard::held(build_lease_inner(backend, activate_retry, op_timeout, chord_in_lease));
+    guard.arm_watchdog(max_lease);
+    guard
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -934,7 +971,7 @@ pub fn test_guard(counter: Arc<std::sync::atomic::AtomicUsize>) -> LeaseGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
     use std::sync::Mutex;
 
     /// A long "hang" used by hung-call tests: longer than any test's per-op timeout,
@@ -965,6 +1002,14 @@ mod tests {
         available: AtomicBool,
         /// Whether CHORD specifically is configured/part of the lease.
         chord_available: AtomicBool,
+        /// If >0, `mint_idle` sleeps this long BEFORE it actually idles — an in-flight
+        /// window used to prove the watchdog can't fire mid-idle (F1).
+        mint_idle_delay_ms: AtomicU64,
+        /// REAL current idle state per service: set true when its idle lands, false when
+        /// its activate lands. Lets a test detect a service left STUCK idle (unlike the
+        /// call counters, which can't distinguish a premature activate from a real one).
+        chord_is_idle: AtomicBool,
+        mint_is_idle: AtomicBool,
     }
 
     impl MockBackend {
@@ -983,7 +1028,17 @@ mod tests {
                 chord_activate_hang_times: AtomicUsize::new(0),
                 available: AtomicBool::new(true),
                 chord_available: AtomicBool::new(true),
+                mint_idle_delay_ms: AtomicU64::new(0),
+                chord_is_idle: AtomicBool::new(false),
+                mint_is_idle: AtomicBool::new(false),
             })
+        }
+        fn with_mint_idle_delay_ms(self: Arc<Self>, ms: u64) -> Arc<Self> {
+            self.mint_idle_delay_ms.store(ms, Ordering::SeqCst);
+            self
+        }
+        fn is_stuck_idle(&self) -> bool {
+            self.chord_is_idle.load(Ordering::SeqCst) || self.mint_is_idle.load(Ordering::SeqCst)
         }
         fn with_fail_idle(self: Arc<Self>) -> Arc<Self> {
             self.fail_idle.store(true, Ordering::SeqCst);
@@ -1032,6 +1087,7 @@ mod tests {
             if self.fail_idle.load(Ordering::SeqCst) {
                 Err("chord down".into())
             } else {
+                self.chord_is_idle.store(true, Ordering::SeqCst); // actually idled now
                 Ok(self.chord_freed)
             }
         }
@@ -1045,18 +1101,26 @@ mod tests {
                 tokio::time::sleep(HANG).await; // cancelled by the per-op timeout
             }
             self.chord_activates.fetch_add(1, Ordering::SeqCst);
+            self.chord_is_idle.store(false, Ordering::SeqCst); // reactivated
             Ok(())
         }
         async fn mint_idle(&self) -> Result<Option<f64>, String> {
+            // Optional in-flight delay BEFORE the service actually idles (F1 test).
+            let delay = self.mint_idle_delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
             self.mint_idles.fetch_add(1, Ordering::SeqCst);
             if self.fail_idle.load(Ordering::SeqCst) {
                 Err("mint down".into())
             } else {
+                self.mint_is_idle.store(true, Ordering::SeqCst); // actually idled now
                 Ok(self.mint_freed)
             }
         }
         async fn mint_activate(&self) -> Result<(), String> {
             self.mint_activates.fetch_add(1, Ordering::SeqCst);
+            self.mint_is_idle.store(false, Ordering::SeqCst); // reactivated
             Ok(())
         }
         fn mem_available_gb(&self) -> Option<f64> {
@@ -1377,6 +1441,33 @@ mod tests {
         );
         guard.release().await;
         assert_eq!(be.activates(), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn watchdog_never_fires_against_an_in_flight_idle_no_stuck_service() {
+        // FINDING 1: the max-lease watchdog is armed ONLY AFTER the idle calls COMPLETE,
+        // so it can never fire mid-idle and strand a service. mint_idle takes 40ms (an
+        // in-flight window); max_lease=0 makes the watchdog fire the instant it's armed.
+        // The service must end ACTIVE (never stuck idle) — with the old ordering the
+        // watchdog would fire DURING mint_idle, prematurely reactivate, then mint_idle
+        // would land and leave MINT stuck idle.
+        let be = MockBackend::new(None, None)
+            .with_mem(vec![200.0])
+            .with_mint_idle_delay_ms(40);
+        let res = acquire_lease(be.clone(), &cfg(5, 0), true, 120.0).await; // max_lease=0
+        // acquire may return Ok (watchdog fires while holding) or Err(LeaseExpired) (it
+        // fired during the budget re-check) — either way, drive reactivation and observe.
+        if let Ok(guard) = res {
+            guard.release().await;
+        }
+        // MINT was genuinely idled during acquire...
+        assert_eq!(be.mint_idles.load(Ordering::SeqCst), 1, "MINT actually idled");
+        // ...and after the watchdog/release fired, NO service is left stuck idle.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            !be.is_stuck_idle(),
+            "no service left stuck idle after a watchdog that could only fire post-idle"
+        );
     }
 
     #[tokio::test]
