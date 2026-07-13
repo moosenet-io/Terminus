@@ -108,6 +108,23 @@ is_allowed_bind_addr() {
   return 1   # not a parseable IP literal (hostname/garbage) → reject
 }
 
+# Validate a full REDIS_BIND value (space-separated). Every token must be an
+# allowed private/loopback literal AND 127.0.0.1 (IPv4 loopback) MUST be present:
+# the post-install health checks and redis.service ExecStop call `redis-cli -p`
+# WITHOUT `-h`, which resolves to 127.0.0.1 — so an IPv6-loopback-only (::1)
+# bind, though otherwise permitted, would fail those checks and graceful
+# shutdown. Requiring 127.0.0.1 keeps every redis-cli call consistent. Silent
+# (returns 0/1) so the self-test can assert on it.
+validate_bind_list() {
+  local list="$1" addr have_ipv4_loopback=0
+  for addr in ${list}; do
+    is_allowed_bind_addr "${addr}" || return 1
+    [[ "${addr}" == "127.0.0.1" ]] && have_ipv4_loopback=1
+  done
+  (( have_ipv4_loopback == 1 )) || return 1
+  return 0
+}
+
 # Self-test hook: `REDIS_INSTALL_SELFTEST=1 bash install.sh` asserts the
 # allowlist accepts private/loopback and rejects public addresses, then exits.
 # Runs with NO required env / NO Redis — the test-gate can invoke it directly.
@@ -137,7 +154,32 @@ if [[ "${REDIS_INSTALL_SELFTEST:-0}" == "1" ]]; then
   for bad in "${rejected_cases[@]}"; do
     if is_allowed_bind_addr "${bad}"; then echo "SELFTEST FAIL: '${bad}' should be rejected"; fail=1; fi
   done
-  if [[ "${fail}" == "0" ]]; then echo "SELFTEST OK: bind allowlist accepts private/loopback, rejects public"; fi
+
+  # Whole-REDIS_BIND validation: 127.0.0.1 (IPv4 loopback) must be present so
+  # every `redis-cli` call (health checks + ExecStop, no `-h`) resolves.
+  bind_ok_cases=(
+    "127.0.0.1"                       # IPv4 loopback only
+    "127.0.0.1 ::1"                   # + IPv6 loopback
+    "127.0.0.1 <internal-ip>"             # + mesh (RFC1918)
+    "127.0.0.1 ::1 fd12:3456::1"     # + IPv6 loopback + ULA mesh
+  )
+  bind_bad_cases=(
+    "::1"                             # IPv6-loopback-only → redis-cli would miss it
+    "::1 <internal-ip>"                   # IPv6 loopback + mesh, NO 127.0.0.1
+    "<internal-ip>"                        # mesh only, no loopback at all
+    "127.0.0.1 8.8.8.8"             # a public address slipped in
+    ""                                # empty
+  )
+  for b in "${bind_ok_cases[@]}"; do
+    if ! validate_bind_list "${b}"; then echo "SELFTEST FAIL: REDIS_BIND '${b}' should be accepted"; fail=1; fi
+  done
+  for b in "${bind_bad_cases[@]}"; do
+    if validate_bind_list "${b}"; then echo "SELFTEST FAIL: REDIS_BIND '${b}' should be rejected (needs 127.0.0.1, all-private)"; fail=1; fi
+  done
+
+  if [[ "${fail}" == "0" ]]; then
+    echo "SELFTEST OK: per-addr allowlist + REDIS_BIND requires 127.0.0.1 (rejects ::1-only), rejects public"
+  fi
   exit "${fail}"
 fi
 
@@ -174,12 +216,15 @@ for addr in ${REDIS_BIND}; do
     exit 1
   fi
 done
-# Require at least one loopback address present (a mesh-only bind is allowed, but
-# loopback must always be reachable for the local health checks below).
-case " ${REDIS_BIND} " in
-  *" 127.0.0.1 "*|*" ::1 "*) : ;; # loopback present — good
-  *) echo "FATAL: REDIS_BIND must include a loopback address (127.0.0.1/::1)." >&2; exit 1 ;;
-esac
+# Require 127.0.0.1 (IPv4 loopback) SPECIFICALLY: the health checks below and the
+# unit's ExecStop call `redis-cli -p` without `-h`, which resolves to 127.0.0.1.
+# A ::1-only bind (though allowlisted) would fail those, so mandate IPv4 loopback
+# — add it alongside any ::1/mesh bind. `validate_bind_list` is the single source
+# of truth (also asserted by the self-test).
+if ! validate_bind_list "${REDIS_BIND}"; then
+  echo "FATAL: REDIS_BIND must include 127.0.0.1 (IPv4 loopback) so redis-cli health checks and ExecStop resolve consistently; add 127.0.0.1 alongside any ::1/mesh bind." >&2
+  exit 1
+fi
 if [[ -z "${REDIS_REQUIREPASS//[[:space:]]/}" ]]; then
   echo "FATAL: REDIS_REQUIREPASS is empty; refusing to provision an unauthenticated Redis." >&2
   exit 1
