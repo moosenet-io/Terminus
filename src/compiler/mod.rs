@@ -284,7 +284,12 @@ fn render_remote_scope_kill_argv(host: &str, unit: &str) -> Vec<String> {
 /// Best-effort remote scope kill (own short timeout, non-fatal). Spawned when a
 /// remote heavy build times out, so the remote build tree does not keep running
 /// (and keep the secret-bearing inherited env alive) after the tool returns.
-async fn remote_scope_kill(rk: &RemoteScopeKill) {
+///
+/// SECURITY (S7): the SAME `redact` set as the build is threaded into the cleanup
+/// `run()` — this ssh/systemctl child inherits the parent process env (including
+/// ambient `SCCACHE_REDIS`), so a failing cleanup command could otherwise surface
+/// an unredacted secret in the returned error we log at `warn!` below.
+async fn remote_scope_kill(rk: &RemoteScopeKill, redact: &[String]) {
     let argv = render_remote_scope_kill_argv(&rk.host, &rk.unit);
     // Reuse `run` with no further remote-kill (None) and a small timeout; ignore
     // the outcome — this is cleanup, the caller already returns the timeout error.
@@ -295,7 +300,7 @@ async fn remote_scope_kill(rk: &RemoteScopeKill) {
         None,
         &BTreeMap::new(),
         Duration::from_secs(30),
-        &[],
+        redact,
         None,
     ))
     .await
@@ -400,9 +405,10 @@ async fn run(
             let _ = child.start_kill();
             let _ = child.wait().await;
             // REMOTE builds: the local kill only reached `ssh`; tear down the
-            // remote scope by name too (best-effort, non-fatal).
+            // remote scope by name too (best-effort, non-fatal). Thread the same
+            // redaction set so a failing cleanup command can't leak a secret.
             if let Some(rk) = remote_kill {
-                remote_scope_kill(rk).await;
+                remote_scope_kill(rk, redact).await;
             }
             return Err(ToolError::Execution(format!(
                 "{} timed out after {}s (child process group killed)",
@@ -1457,6 +1463,37 @@ mod tests {
             cmd.contains(&format!("systemctl stop '{unit}.scope'")),
             "stop fallback: {cmd}"
         );
+    }
+
+    #[tokio::test]
+    async fn cleanup_run_redacts_secret_like_the_build() {
+        // The remote-scope-kill cleanup goes through `run(argv, .., redact, None)`
+        // — the SAME redaction path as the build. This guards the property that a
+        // secret emitted by a FAILING cleanup command is redacted before it lands
+        // in the error `remote_scope_kill` logs at `warn!`. (The cleanup child
+        // inherits the parent env incl. ambient SCCACHE_REDIS, so this matters.)
+        let secret = "<REDACTED-SECRET>".to_string();
+        let redact = vec![secret.clone()];
+        let err = run(
+            &[
+                "sh".into(),
+                "-c".into(),
+                format!("echo leak={secret} 1>&2; exit 1"),
+            ],
+            None,
+            &BTreeMap::new(),
+            Duration::from_secs(30),
+            &redact,
+            None,
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            !msg.contains("topsecretvalue123"),
+            "cleanup output must be redacted: {msg}"
+        );
+        assert!(msg.contains("<redacted>"));
     }
 
     #[test]
