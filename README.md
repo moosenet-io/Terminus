@@ -513,13 +513,23 @@ compiler_deploy(module, channel="stable", hosts="all")
 - **Division of responsibility:** the compiler **only triggers**. The updater still **owns the
   swap safety** (health-gate + rollback). `compiler_deploy` never touches a binary, symlink, or
   health check — it fires the unit and reports what the updater reports.
-- **Per-host outcome** (unreachable / rollback are **reported, never masked**): `deployed`
-  (swapped, health-gate passed), `skipped` (already on `current`, a no-op), `rolled_back`
-  (swapped, health-gate failed, rolled back to backup), `failed` (updater errored), or
-  `unreachable` (ssh-level connect/auth/timeout). One unreachable host **never aborts** the
-  fan-out — the others still proceed and the nightly timer catches the straggler.
+- **Per-host outcome** (unreachable / rollback / timeout are **reported, never masked**):
+  `deployed` (swapped, health-gate passed), `skipped` (already on `current`, a no-op),
+  `rolled_back` (swapped, health-gate failed, rolled back to backup), `failed` (the updater
+  errored **or the `systemctl start` itself failed** — a non-zero start rc is never masked by a
+  stale success `Result`/marker token), `timed_out` (the host was **reached** and the updater
+  triggered, but the synchronous run exceeded the budget — an in-flight/hung deploy, surfaced
+  **distinctly from** `unreachable`), or `unreachable` (an ssh-level **connect/auth** failure,
+  never a run timeout). One bad host **never aborts** the fan-out — the others still proceed and
+  the nightly timer catches the straggler.
+- **No-masked-failures hardening:** the trigger forces **non-interactive sudo** (`sudo -n`) so a
+  password prompt fails fast instead of hanging the whole per-host budget; the outcome marker is
+  **run-scoped** (cleared before each trigger) so a stale prior-run token can't mask a current
+  failure; and a non-zero `systemctl start` rc is classified `failed` regardless of the unit's
+  (possibly stale) `Result`.
 - **Aggregation:** the result carries every host's `{host, outcome, detail}` plus `counts`
-  (`deployed`/`skipped`/`rolled_back`/`failed`/`unreachable`/`total`), a `degraded` flag and
+  (`deployed`/`skipped`/`rolled_back`/`failed`/`timed_out`/`unreachable`/`total`), a `degraded`
+  flag and
   `stragglers` count (the hosts that did not converge), and `notes`. A **partial fleet** result
   is surfaced as `degraded=true` with a note that the nightly timer remains the catch-all.
 - **Host reach (S7):** the trigger uses the *same* non-mutating BatchMode ssh reach as BLD-08
@@ -541,7 +551,8 @@ Config (all optional, no infra literals — S1): `COMPILER_DEPLOY_HOSTS` (shared
 `compiler_status`; `;`-separated `label|ssh_target`), `COMPILER_DEPLOY_UNIT_TEMPLATE` (default
 `constellation-update@{module}.service`; `{module}`/`{channel}` substituted),
 `COMPILER_DEPLOY_SYSTEMCTL` (default `systemctl`; set e.g. `sudo systemctl` where the reach
-user needs elevation), `COMPILER_DEPLOY_RESULT_MARKER_TEMPLATE` (default
+user needs elevation — a `sudo` prefix is auto-forced non-interactive with `-n`),
+`COMPILER_DEPLOY_RESULT_MARKER_TEMPLATE` (default
 `/opt/{module}/.deploy_result` — the updater's outcome-token file; absent it, the outcome
 degrades to the systemd `Result` + exit code), `COMPILER_DEPLOY_TRIGGER_TIMEOUT_SECS` (default
 300 — larger than the BLD-08 marker read since the trigger runs the updater synchronously),

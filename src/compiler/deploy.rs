@@ -20,10 +20,16 @@
 //!   - `skipped`     — a no-op: the host was already on `current` (unchanged).
 //!   - `rolled_back` — the updater swapped, the health-gate FAILED, and it rolled
 //!                     back to the backup. Surfaced distinctly, never as success.
-//!   - `failed`      — the updater ran but errored (e.g. missing/corrupt artifact).
-//!   - `unreachable` — an ssh-level failure (connect/auth/timeout). One bad host
-//!                     never aborts the fan-out; the others still proceed and the
-//!                     nightly timer catches the straggler.
+//!   - `failed`      — the updater ran but errored (e.g. missing/corrupt artifact),
+//!                     OR the `systemctl start` itself failed (non-zero rc — never
+//!                     masked by a stale success `Result`/marker token).
+//!   - `timed_out`   — the host was REACHED and the updater triggered, but the
+//!                     synchronous run exceeded the trigger budget: an in-flight/
+//!                     hung deploy of unknown outcome, surfaced DISTINCTLY from
+//!                     `unreachable` (a slow deploy is not a connectivity failure).
+//!   - `unreachable` — an ssh-level CONNECT/AUTH failure (never a run timeout). One
+//!                     bad host never aborts the fan-out; the others still proceed
+//!                     and the nightly timer catches the straggler.
 //!
 //! ## Discipline
 //! - **S1** — every host, unit name, systemctl invocation, marker path, timeout,
@@ -151,7 +157,12 @@ pub enum DeployOutcome {
     RolledBack,
     /// Updater ran but errored (missing/corrupt artifact, restart failure, …).
     Failed,
-    /// ssh-level failure: connect/auth/timeout. Others still proceed.
+    /// The host was REACHED and the updater was triggered, but the synchronous
+    /// run exceeded `COMPILER_DEPLOY_TRIGGER_TIMEOUT_SECS` — the deploy is
+    /// in-flight/hung/unknown, NOT a connectivity failure. Surfaced distinctly so a
+    /// slow/stuck deploy is never masked as `unreachable`.
+    TimedOut,
+    /// ssh-level CONNECT/AUTH failure (never a timeout). Others still proceed.
     Unreachable,
 }
 
@@ -162,6 +173,7 @@ impl DeployOutcome {
             DeployOutcome::Skipped => "skipped",
             DeployOutcome::RolledBack => "rolled_back",
             DeployOutcome::Failed => "failed",
+            DeployOutcome::TimedOut => "timed_out",
             DeployOutcome::Unreachable => "unreachable",
         }
     }
@@ -194,24 +206,36 @@ pub struct DeployReport {
     pub notes: Vec<String>,
 }
 
+/// Per-outcome tallies across a fleet fan-out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Counts {
+    deployed: usize,
+    skipped: usize,
+    rolled_back: usize,
+    failed: usize,
+    timed_out: usize,
+    unreachable: usize,
+}
+
 impl DeployReport {
-    /// Per-outcome counts: `(deployed, skipped, rolled_back, failed, unreachable)`.
-    fn counts(&self) -> (usize, usize, usize, usize, usize) {
-        let mut c = (0, 0, 0, 0, 0);
+    /// Per-outcome counts.
+    fn counts(&self) -> Counts {
+        let mut c = Counts::default();
         for r in &self.results {
             match r.outcome {
-                DeployOutcome::Deployed => c.0 += 1,
-                DeployOutcome::Skipped => c.1 += 1,
-                DeployOutcome::RolledBack => c.2 += 1,
-                DeployOutcome::Failed => c.3 += 1,
-                DeployOutcome::Unreachable => c.4 += 1,
+                DeployOutcome::Deployed => c.deployed += 1,
+                DeployOutcome::Skipped => c.skipped += 1,
+                DeployOutcome::RolledBack => c.rolled_back += 1,
+                DeployOutcome::Failed => c.failed += 1,
+                DeployOutcome::TimedOut => c.timed_out += 1,
+                DeployOutcome::Unreachable => c.unreachable += 1,
             }
         }
         c
     }
 
-    /// The number of hosts NOT fully converged (rolled_back + failed + unreachable)
-    /// — the stragglers the nightly timer remains the catch-all for.
+    /// The number of hosts NOT fully converged (rolled_back + failed + timed_out +
+    /// unreachable) — the stragglers the nightly timer remains the catch-all for.
     fn stragglers(&self) -> usize {
         self.results
             .iter()
@@ -225,13 +249,19 @@ impl DeployReport {
     }
 
     fn summary(&self) -> String {
-        let (dep, skip, rb, fail, unreach) = self.counts();
+        let c = self.counts();
         format!(
             "compiler_deploy {module}/{channel}: {n} host(s) — {dep} deployed, {skip} skipped, \
-             {rb} rolled_back, {fail} failed, {unreach} unreachable{tail}",
+             {rb} rolled_back, {fail} failed, {to} timed_out, {unreach} unreachable{tail}",
             module = self.module,
             channel = self.channel,
             n = self.results.len(),
+            dep = c.deployed,
+            skip = c.skipped,
+            rb = c.rolled_back,
+            fail = c.failed,
+            to = c.timed_out,
+            unreach = c.unreachable,
             tail = if self.degraded() {
                 format!(" [{} straggler(s); nightly timer catches them]", self.stragglers())
             } else {
@@ -241,17 +271,18 @@ impl DeployReport {
     }
 
     pub fn to_payload(&self) -> Value {
-        let (dep, skip, rb, fail, unreach) = self.counts();
+        let c = self.counts();
         json!({
             "module": self.module,
             "channel": self.channel,
             "results": self.results,
             "counts": {
-                "deployed": dep,
-                "skipped": skip,
-                "rolled_back": rb,
-                "failed": fail,
-                "unreachable": unreach,
+                "deployed": c.deployed,
+                "skipped": c.skipped,
+                "rolled_back": c.rolled_back,
+                "failed": c.failed,
+                "timed_out": c.timed_out,
+                "unreachable": c.unreachable,
                 "total": self.results.len(),
             },
             "degraded": self.degraded(),
@@ -295,24 +326,60 @@ fn select_hosts(all: &[DeployHost], filter: &str) -> (Vec<DeployHost>, Vec<Strin
 
 // ── Remote trigger command + argv (pure, offline-testable) ───────────────────
 
+/// Normalize a configured `systemctl` prefix to be NON-INTERACTIVE (finding 2):
+/// when it uses `sudo`, inject `-n` (`--non-interactive`) so sudo NEVER blocks on
+/// a password prompt — `BatchMode=yes` bounds ssh's own auth but NOT sudo's, so a
+/// sudo needing a password would otherwise hang for the entire per-host trigger
+/// timeout. With `-n`, a sudo that would prompt instead fails IMMEDIATELY (non-zero
+/// rc → a `failed` outcome), so a missing/expired sudo credential is a fast,
+/// visible config/permission failure, never a hang. A prefix without `sudo` (the
+/// default bare `systemctl`) is returned unchanged; an already-`-n` prefix is left
+/// as-is (idempotent).
+fn ensure_non_interactive_sudo(prefix: &str) -> String {
+    let toks: Vec<&str> = prefix.split_whitespace().collect();
+    if !toks.iter().any(|t| *t == "sudo") {
+        return toks.join(" ");
+    }
+    let already_non_interactive = toks
+        .iter()
+        .any(|t| *t == "-n" || *t == "--non-interactive");
+    let mut out: Vec<String> = Vec::with_capacity(toks.len() + 1);
+    let mut injected = false;
+    for t in &toks {
+        out.push((*t).to_string());
+        if *t == "sudo" && !already_non_interactive && !injected {
+            out.push("-n".to_string());
+            injected = true;
+        }
+    }
+    out.join(" ")
+}
+
 /// Render the remote shell command that TRIGGERS the updater synchronously and
 /// prints a deterministic outcome line. It:
-///   1. runs `<systemctl> start <unit>` (a `Type=oneshot` updater unit blocks
-///      until the whole fetch→swap→health→rollback→marker flow finishes), captures
-///      its exit code,
-///   2. reads the systemd `Result` and the updater's optional outcome-token file,
-///   3. prints `COMPILER_DEPLOY rc=<rc> result=<result> token=<token>`,
-///   4. ALWAYS `exit 0` — so ssh's OWN exit code reflects only CONNECTIVITY (a
+///   1. CLEARS any pre-existing outcome-token marker (finding 4: run-scoped) so a
+///      STALE `deployed`/`skipped` token from a PREVIOUS run can never be read back
+///      and mask a current failure that aborts before writing a fresh marker,
+///   2. runs `<systemctl> start <unit>` (a `Type=oneshot` updater unit blocks until
+///      the whole fetch→swap→health→rollback→marker flow finishes), captures its
+///      exit code — with `sudo` forced non-interactive (`-n`) so it fails fast
+///      instead of hanging on a password prompt,
+///   3. reads the systemd `Result` and the (now run-scoped) outcome-token file,
+///   4. prints `COMPILER_DEPLOY rc=<rc> result=<result> token=<token>`,
+///   5. ALWAYS `exit 0` — so ssh's OWN exit code reflects only CONNECTIVITY (a
 ///      non-zero ssh exit ⇒ unreachable, never merely a failed deploy). This is
 ///      the same tri-state trick BLD-08 uses for its marker read.
 ///
-/// `systemctl` is inserted verbatim (operator-trusted config, may be `sudo
-/// systemctl`); the unit + marker path are shell-quoted.
+/// `systemctl` is inserted verbatim after non-interactive normalization
+/// (operator-trusted config, may be `sudo systemctl`); the unit + marker path are
+/// shell-quoted.
 pub fn render_remote_trigger_cmd(systemctl: &str, unit: &str, result_marker: &str) -> String {
+    let systemctl = ensure_non_interactive_sudo(systemctl);
     let u = shell_quote(unit);
     let m = shell_quote(result_marker);
     format!(
-        "{systemctl} start {u}; __rc=$?; \
+        "rm -f -- {m} 2>/dev/null; \
+         {systemctl} start {u}; __rc=$?; \
          __res=$({systemctl} show {u} --property=Result --value 2>/dev/null); \
          __tok=$(cat -- {m} 2>/dev/null); \
          printf '{sentinel} rc=%s result=%s token=%s\\n' \"$__rc\" \"$__res\" \"$__tok\"; \
@@ -365,12 +432,25 @@ fn parse_result_line(body: &str) -> (Option<i64>, String, String) {
 
 /// Classify a reachable host's outcome from `(rc, systemd Result, updater token)`.
 ///
-/// The updater's own outcome TOKEN is authoritative when present (it is the only
-/// signal that distinguishes a rollback or a no-op from a plain success); absent a
-/// recognized token we degrade to the systemd `Result` + exit code:
-///   - rc == 0 (or `Result=success`) ⇒ `deployed`,
+/// A NON-ZERO `systemctl start` rc means the TRIGGER ITSELF failed (findings 3 & 4):
+/// neither a stale `Result=success` (a previous run's cached systemd Result) nor a
+/// stale marker token may override it, so a non-zero rc is ALWAYS `failed` — the
+/// `Result`/token are only consulted when the start actually succeeded. This is
+/// what stops a failed start being masked as `deployed`.
+///
+/// When start succeeded (rc == 0, or rc unknown as a defensive fallback), the
+/// updater's own outcome TOKEN is authoritative (the only signal that distinguishes
+/// a rollback or a no-op from a plain success — and it is run-scoped: the wrapper
+/// clears any prior marker before triggering, so only THIS run's token is read).
+/// Absent a recognized token we degrade to the systemd `Result`:
+///   - `Result=success` (or rc == 0) ⇒ `deployed`,
 ///   - otherwise ⇒ `failed`.
 pub fn classify_reachable(rc: Option<i64>, result: &str, token: &str) -> DeployOutcome {
+    // A start that failed is `failed`, full stop — never overridden by a stale
+    // success Result or a stale marker token.
+    if matches!(rc, Some(code) if code != 0) {
+        return DeployOutcome::Failed;
+    }
     match token.trim().to_ascii_lowercase().as_str() {
         "rolled_back" | "rolledback" | "rollback" => DeployOutcome::RolledBack,
         "deployed" | "updated" | "swapped" | "success" => DeployOutcome::Deployed,
@@ -399,17 +479,26 @@ fn detail_string(rc: Option<i64>, result: &str, token: &str) -> Option<String> {
 
 // ── Remote execution (the real trigger path) ─────────────────────────────────
 
-/// Whether the ssh command connected (exit 0, given the remote always `exit 0`),
-/// carrying its stdout; else it is unreachable.
+/// The three distinct ways an ssh trigger can end (finding 1):
+///   - `Reachable(stdout)` — ssh exited 0 (the remote always `exit 0`s), carrying
+///     the outcome line to classify,
+///   - `Unreachable` — an ssh-level CONNECT/AUTH failure: a spawn error, or a
+///     non-zero ssh exit (255), which — because the remote always `exit 0`s — can
+///     ONLY be ssh's own connect/auth/host-key error (incl. ssh's `ConnectTimeout`
+///     firing), never a slow deploy,
+///   - `TimedOut` — the OUTER wall-clock timeout fired: the host was reached and the
+///     synchronous updater run simply took too long. This is an in-flight/hung
+///     deploy of UNKNOWN outcome, NOT a connectivity failure, so it must NEVER be
+///     reported as `unreachable`.
 enum SshOutcome {
     Reachable(String),
     Unreachable,
+    TimedOut,
 }
 
-/// Spawn the ssh trigger argv, bounded by `timeout`. Never errors — an unreachable
-/// host is a normal, expected result classified as `Unreachable`. Because the
-/// remote command always `exit 0`s, a non-zero ssh exit can ONLY be a connectivity
-/// failure.
+/// Spawn the ssh trigger argv, bounded by `timeout`. Never errors. Distinguishes a
+/// connectivity failure (`Unreachable`) from the outer run timeout (`TimedOut`) so
+/// a reachable-but-slow deploy is not masked as unreachable.
 async fn ssh_trigger(argv: &[String], timeout: Duration) -> SshOutcome {
     use tokio::io::AsyncReadExt;
     let mut cmd = tokio::process::Command::new(&argv[0]);
@@ -419,6 +508,7 @@ async fn ssh_trigger(argv: &[String], timeout: Duration) -> SshOutcome {
     cmd.stdin(std::process::Stdio::null());
     cmd.kill_on_drop(true);
     let Ok(mut child) = cmd.spawn() else {
+        // Could not even spawn ssh — a local/connectivity failure.
         return SshOutcome::Unreachable;
     };
     let mut pipe = child.stdout.take();
@@ -432,17 +522,29 @@ async fn ssh_trigger(argv: &[String], timeout: Duration) -> SshOutcome {
     let out = tokio::spawn(read);
     let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(s)) => s,
-        _ => {
+        // A wait error (rare) is treated as a connectivity failure.
+        Ok(Err(_)) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
             out.abort();
             return SshOutcome::Unreachable;
         }
+        // The OUTER wall-clock timeout fired: reached, but the synchronous updater
+        // run exceeded the budget → TimedOut (distinct from unreachable).
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            out.abort();
+            return SshOutcome::TimedOut;
+        }
     };
     let bytes = out.await.unwrap_or_default();
     if status.success() {
+        // ssh exited 0 → the remote wrapper ran; classify from its outcome line.
         SshOutcome::Reachable(String::from_utf8_lossy(&bytes).into_owned())
     } else {
+        // A non-zero ssh exit (the remote always `exit 0`s, so this is ssh's own
+        // 255 connect/auth/host-key error) → unreachable.
         SshOutcome::Unreachable
     }
 }
@@ -463,6 +565,11 @@ async fn trigger_one(
             host: host.label,
             outcome: DeployOutcome::Unreachable,
             detail: None,
+        },
+        SshOutcome::TimedOut => HostDeployResult {
+            host: host.label,
+            outcome: DeployOutcome::TimedOut,
+            detail: Some(format!("trigger exceeded {}s (deploy in-flight/unknown)", timeout.as_secs())),
         },
         SshOutcome::Reachable(body) => {
             let (rc, result, token) = parse_result_line(&body);
@@ -732,6 +839,34 @@ mod tests {
     }
 
     #[test]
+    fn nonzero_start_rc_is_failed_despite_stale_success_result() {
+        // Finding 3: a non-zero `systemctl start` rc must NOT be overridden by a
+        // stale `Result=success` (a previous run's cached systemd Result).
+        assert_eq!(
+            classify_reachable(Some(1), "success", ""),
+            DeployOutcome::Failed
+        );
+        assert_eq!(
+            classify_reachable(Some(3), "success", ""),
+            DeployOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn nonzero_start_rc_ignores_stale_success_token() {
+        // Finding 4: a STALE `deployed`/`skipped` marker token from a prior run must
+        // not mask a current failure when the start itself failed (rc != 0).
+        assert_eq!(
+            classify_reachable(Some(1), "success", "deployed"),
+            DeployOutcome::Failed
+        );
+        assert_eq!(
+            classify_reachable(Some(1), "", "skipped"),
+            DeployOutcome::Failed
+        );
+    }
+
+    #[test]
     fn parse_result_line_extracts_fields() {
         let body = "some updater chatter\nCOMPILER_DEPLOY rc=0 result=success token=rolled_back\n";
         let (rc, result, token) = parse_result_line(body);
@@ -759,6 +894,11 @@ mod tests {
             "<email>",
             "<path>/.deploy_result",
         );
+        // Finding 4: the STALE marker is cleared BEFORE the trigger (run-scoped).
+        assert!(cmd.contains("rm -f -- '<path>/.deploy_result'"));
+        let rm_at = cmd.find("rm -f --").unwrap();
+        let start_at = cmd.find("systemctl start").unwrap();
+        assert!(rm_at < start_at, "marker cleared before start (run-scoped)");
         assert!(cmd.contains("systemctl start '<email>'"));
         assert!(cmd.contains("--property=Result --value"));
         assert!(cmd.contains("cat -- '<path>/.deploy_result'"));
@@ -768,10 +908,28 @@ mod tests {
     }
 
     #[test]
-    fn remote_cmd_honors_a_privileged_systemctl_prefix() {
+    fn remote_cmd_forces_non_interactive_sudo() {
+        // Finding 2: a `sudo` prefix is made non-interactive (`-n`) so a password
+        // prompt fails fast instead of hanging for the whole trigger timeout.
         let cmd = render_remote_trigger_cmd("sudo systemctl", "<email>", "/m");
-        assert!(cmd.starts_with("sudo systemctl start "));
-        assert!(cmd.contains("sudo systemctl show '<email>'"));
+        assert!(cmd.contains("sudo -n systemctl start "), "{cmd}");
+        assert!(cmd.contains("sudo -n systemctl show '<email>'"), "{cmd}");
+        // No bare `sudo systemctl` (would be interactive) survives.
+        assert!(!cmd.contains("sudo systemctl"), "{cmd}");
+    }
+
+    #[test]
+    fn ensure_non_interactive_sudo_cases() {
+        // Bare systemctl: unchanged.
+        assert_eq!(ensure_non_interactive_sudo("systemctl"), "systemctl");
+        // sudo → sudo -n.
+        assert_eq!(ensure_non_interactive_sudo("sudo systemctl"), "sudo -n systemctl");
+        // Already non-interactive: idempotent (no double -n).
+        assert_eq!(ensure_non_interactive_sudo("sudo -n systemctl"), "sudo -n systemctl");
+        assert_eq!(
+            ensure_non_interactive_sudo("sudo --non-interactive systemctl"),
+            "sudo --non-interactive systemctl"
+        );
     }
 
     #[test]
@@ -840,8 +998,11 @@ mod tests {
         ]);
         let report = canned(map).await;
         assert_eq!(report.results.len(), 3, "no host dropped");
-        let (dep, skip, rb, fail, unreach) = report.counts();
-        assert_eq!((dep, skip, rb, fail, unreach), (1, 1, 1, 0, 0));
+        let c = report.counts();
+        assert_eq!(
+            (c.deployed, c.skipped, c.rolled_back, c.failed, c.timed_out, c.unreachable),
+            (1, 1, 1, 0, 0, 0)
+        );
         // The rollback is surfaced distinctly, not masked as success.
         let c = report.results.iter().find(|r| r.host == "host-c").unwrap();
         assert_eq!(c.outcome, DeployOutcome::RolledBack);
@@ -856,9 +1017,9 @@ mod tests {
         ]);
         let report = canned(map).await;
         // The unreachable host did NOT abort the fan-out: the other two deployed.
-        let (dep, _skip, _rb, _fail, unreach) = report.counts();
-        assert_eq!(dep, 2);
-        assert_eq!(unreach, 1);
+        let c = report.counts();
+        assert_eq!(c.deployed, 2);
+        assert_eq!(c.unreachable, 1);
         let b = report.results.iter().find(|r| r.host == "host-b").unwrap();
         assert_eq!(b.outcome, DeployOutcome::Unreachable);
     }
@@ -881,6 +1042,81 @@ mod tests {
         assert_eq!(payload["counts"]["unreachable"], json!(1));
         // The summary names the straggler catch-all (nightly timer).
         assert!(report.summary().contains("straggler"));
+    }
+
+    #[tokio::test]
+    async fn timed_out_dest_is_a_distinct_straggler_not_unreachable() {
+        // Finding 1: a reached-but-slow host is `timed_out`, counted distinctly from
+        // `unreachable`, and is a non-converged straggler (never masked as either
+        // success or a connectivity failure).
+        let map = std::collections::HashMap::from([
+            ("host-a", DeployOutcome::Deployed),
+            ("host-b", DeployOutcome::TimedOut),
+            ("host-c", DeployOutcome::Unreachable),
+        ]);
+        let report = canned(map).await;
+        let c = report.counts();
+        assert_eq!(c.timed_out, 1);
+        assert_eq!(c.unreachable, 1);
+        assert!(report.degraded());
+        assert_eq!(report.stragglers(), 2, "timed_out + unreachable are stragglers");
+        let payload = report.to_payload();
+        assert_eq!(payload["counts"]["timed_out"], json!(1));
+        assert_eq!(payload["counts"]["unreachable"], json!(1));
+        let b = report.results.iter().find(|r| r.host == "host-b").unwrap();
+        assert_eq!(b.outcome, DeployOutcome::TimedOut);
+        assert!(report.summary().contains("timed_out"));
+    }
+
+    // ── ssh_trigger: timeout != unreachable (finding 1) ─────────────────────
+
+    #[tokio::test]
+    async fn ssh_trigger_run_timeout_is_timed_out_not_unreachable() {
+        // The child is reachable (spawns, runs) but exceeds the wall-clock budget →
+        // TimedOut, NOT Unreachable.
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 5".to_string(),
+        ];
+        assert!(matches!(
+            ssh_trigger(&argv, Duration::from_millis(300)).await,
+            SshOutcome::TimedOut
+        ));
+    }
+
+    #[tokio::test]
+    async fn ssh_trigger_nonzero_exit_is_unreachable() {
+        // The remote always exits 0, so a non-zero exit == ssh's own 255
+        // connect/auth error → Unreachable.
+        let argv = vec!["sh".to_string(), "-c".to_string(), "exit 255".to_string()];
+        assert!(matches!(
+            ssh_trigger(&argv, Duration::from_secs(2)).await,
+            SshOutcome::Unreachable
+        ));
+    }
+
+    #[tokio::test]
+    async fn ssh_trigger_spawn_failure_is_unreachable() {
+        let argv = vec!["this-binary-does-not-exist-xyz".to_string()];
+        assert!(matches!(
+            ssh_trigger(&argv, Duration::from_secs(2)).await,
+            SshOutcome::Unreachable
+        ));
+    }
+
+    #[tokio::test]
+    async fn ssh_trigger_exit0_is_reachable_with_body() {
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf 'COMPILER_DEPLOY rc=0 result=success token=deployed\\n'".to_string(),
+        ];
+        let SshOutcome::Reachable(body) = ssh_trigger(&argv, Duration::from_secs(2)).await else {
+            panic!("expected Reachable");
+        };
+        let (rc, result, token) = parse_result_line(&body);
+        assert_eq!(classify_reachable(rc, &result, &token), DeployOutcome::Deployed);
     }
 
     #[tokio::test]
