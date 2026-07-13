@@ -661,7 +661,16 @@ impl GatewayFramework {
     ///   unreachable Redis **fails CLOSED** (the limiter returns `Limited` →
     ///   `guard` denies with a 429) so a Redis outage can never become an
     ///   un-throttled flood at the backends (BLD-20 EDGE CASE).
-    /// - Otherwise fall back to the interim in-process token bucket.
+    /// - Otherwise (only when `REDIS_URL` is genuinely ABSENT) fall back to the
+    ///   interim in-process token bucket.
+    ///
+    /// The selection is gated on whether Redis is CONFIGURED (the URL is
+    /// present), NOT on whether a live connection can be made — backend
+    /// construction is lazy (no connect), so a configured-but-unreachable Redis
+    /// still selects the Redis limiter and fails CLOSED at runtime rather than
+    /// silently downgrading to in-process at construction. If the URL is present
+    /// but unparseable (a hard misconfiguration), we select a fail-closed
+    /// sentinel — never a silent downgrade.
     ///
     /// NOTE (scope): this is the PROXY rate-limiter consumer of the BLD-20
     /// Redis, wired here. The other two consumers — sccache shared cache
@@ -669,9 +678,23 @@ impl GatewayFramework {
     /// those items, not BLD-20; the shared client + namespaces they use live in
     /// `crate::redis`.
     fn rate_limiter_from_env() -> Arc<dyn RateLimiter> {
+        if crate::redis::resolve_url().is_none() {
+            // Redis genuinely not configured → the interim in-process limiter.
+            return Arc::new(InProcessRateLimiter::from_env());
+        }
+        // REDIS_URL is set ⇒ a Redis-backed limiter MUST be selected.
         match crate::redis::RedisBackend::from_env() {
             Some(backend) => Arc::new(crate::ratelimit::RedisRateLimiter::from_env(backend)),
-            None => Arc::new(InProcessRateLimiter::from_env()),
+            None => {
+                // Configured but the URL would not parse — do NOT downgrade to
+                // in-process (that would drop the cross-instance + fail-closed
+                // guarantees). Fail CLOSED and surface the misconfiguration.
+                tracing::error!(
+                    "REDIS_URL is set but unparseable; proxy rate-limiter selecting the \
+                     fail-closed sentinel (all requests denied until REDIS_URL is fixed)"
+                );
+                Arc::new(crate::ratelimit::AlwaysLimited)
+            }
         }
     }
 

@@ -164,6 +164,21 @@ impl RateLimiter for RedisRateLimiter {
     }
 }
 
+/// A fail-CLOSED sentinel limiter: every `check` returns `Limited`. Used when
+/// the proxy is CONFIGURED for Redis (`REDIS_URL` set) but the backend could not
+/// be constructed (e.g. an unparseable URL) — a misconfiguration must not
+/// silently downgrade to the in-process limiter (which would drop the
+/// cross-instance + fail-closed guarantees). Denying every request makes the
+/// misconfiguration loud and safe rather than invisibly permissive.
+pub struct AlwaysLimited;
+
+#[async_trait]
+impl RateLimiter for AlwaysLimited {
+    async fn check(&self, _key: &str) -> RateLimitDecision {
+        RateLimitDecision::Limited
+    }
+}
+
 /// A fair (FIFO) request queue backed by a Redis list under the `ratelimit:`
 /// namespace. Used to admit over-limit proxy requests in order rather than
 /// dropping them. Enqueue/dequeue are single atomic list ops (`RPUSH`/`LPOP`),
@@ -267,6 +282,15 @@ mod tests {
     #[test]
     fn now_ms_is_populated() {
         assert!(now_ms() > 0, "epoch millis must be non-zero");
+    }
+
+    #[tokio::test]
+    async fn always_limited_denies_every_request() {
+        // The sentinel used when REDIS_URL is configured-but-unparseable must
+        // deny unconditionally (fail closed), never allow.
+        let sentinel = AlwaysLimited;
+        assert_eq!(sentinel.check("anything").await, RateLimitDecision::Limited);
+        assert_eq!(sentinel.check("").await, RateLimitDecision::Limited);
     }
 
     #[tokio::test]
