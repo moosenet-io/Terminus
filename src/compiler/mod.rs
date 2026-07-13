@@ -730,11 +730,19 @@ impl RustTool for CompilerBuild {
         // did not supply an id (invariant: every compiler_build call — success OR
         // build-failure — returns the stable request_id). The happy path emits
         // Published + returns the id in the structured output from build_inner.
+        //
+        // NOTE (by design): a PRE-ACCEPTANCE failure — one that occurs before
+        // `build_inner` emits `queued` (an invalid/absent config, a validation
+        // error, etc.) — yields a TERMINAL-ONLY `failed` track (no
+        // `queued → … → failed` shape). That is intentional: the id is still
+        // surfaced and the failed stream is discoverable; we do NOT synthesize a
+        // fake `queued` event just to pad the shape.
         match self.build_inner(&request_id, args).await {
             Ok(out) => Ok(out),
             Err(e) => {
-                // Redact the error message at the EMITTER boundary (S6/S7) before
-                // it reaches the bus (see `redacted_failed_message`).
+                // Sanitize the error at the EMITTER boundary — secret VALUES (S6/S7)
+                // AND infrastructure LITERALS (S1) — before it reaches the bus
+                // (see `redacted_failed_message`).
                 events::bus().emit(
                     &request_id,
                     events::Emit::stage(events::Stage::Failed).message(redacted_failed_message(&e)),
@@ -764,15 +772,75 @@ fn tag_error_with_request_id(e: ToolError, request_id: &str) -> ToolError {
     }
 }
 
-/// Redact a build error's full message at the EMITTER boundary (S6/S7) before it
-/// is emitted onto the progress bus. `run()` already scrubs subprocess stdout/
-/// stderr tails, but OTHER `ToolError` sources (command/path/host/config text)
-/// reach the failed-event emit verbatim — so run the whole message through the
-/// SAME redaction set the build uses, so no secret or infra literal can leave via
-/// the stream. `""` seeds only sccache's non-secret local-dir fallback, so the
-/// secret set is complete even when the build failed before it resolved root.
+/// Sanitize a build error's full message at the EMITTER boundary before it is
+/// persisted on the progress bus (and later returned by `compiler_progress`).
+/// TWO passes, in order:
+///   1. **Secret VALUES** (S6/S7) — the build's redaction set (`SCCACHE_REDIS`
+///      password/URL). `run()` already scrubs subprocess tails, but OTHER
+///      `ToolError` sources reach the emit verbatim.
+///   2. **Infrastructure LITERALS** (S1) — IP addresses, and the emitter-known
+///      configured host/relay-host and dataset/deploy path values, plus the
+///      sanctioned repo-wide S1/PII scanner as a catch-all. So a configured path,
+///      internal host/IP, or relay location can never leave through the stream.
+/// Only IPs + configured literals + known PII spans are replaced; generic
+/// diagnostic prose is left intact.
 fn redacted_failed_message(e: &ToolError) -> String {
-    redact_secrets(&e.to_string(), &redaction_set(""))
+    let secret_scrubbed = redact_secrets(&e.to_string(), &redaction_set(""));
+    scrub_infra_literals(&secret_scrubbed)
+}
+
+/// One IPv4 dotted-quad matcher (all ranges, not just private) → `<ip>`.
+fn ipv4_regex() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\b(?:\d{1,3}\.){3}\d{1,3}\b").expect("ipv4 regex"))
+}
+
+/// Scrub infrastructure LITERALS from a message (S1) — see [`redacted_failed_message`].
+/// Replaces the emitter-known CONFIGURED values (arbitrary paths/hosts the generic
+/// PII patterns can't know) with `<host>`/`<path>`, every IPv4 with `<ip>`, then
+/// runs the sanctioned repo-wide S1/PII scanner (`github::pii::scan_and_redact`)
+/// as a catch-all for known internal hosts/paths/domains/container-ids.
+fn scrub_infra_literals(input: &str) -> String {
+    let mut out = input.to_string();
+
+    // (a) Configured host / relay-host values → <host> (longest-first, so a value
+    // that is a prefix of another is not partially replaced).
+    let mut hosts = host::configured_addresses();
+    if let Some(relay) = env_nonempty(BUILD_DATASET_RELAY_HOST) {
+        hosts.push(relay);
+    }
+    hosts.retain(|h| !h.is_empty());
+    hosts.sort_by_key(|h| std::cmp::Reverse(h.len()));
+    hosts.dedup();
+    for h in hosts {
+        out = out.replace(&h, "<host>");
+    }
+
+    // (b) Configured dataset/deploy/target path roots → <path> (longest-first).
+    let mut paths: Vec<String> = [
+        BUILD_DATASET_ROOT,
+        BUILD_DATASET_RELAY_ROOT,
+        BUILD_HEAVY_DATASET_ROOT,
+        BUILD_HEAVY_LOCAL_TARGET_DIR,
+        BUILD_LOCAL_TARGET_DIR,
+    ]
+    .iter()
+    .filter_map(|k| env_nonempty(k))
+    .collect();
+    paths.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    paths.dedup();
+    for p in paths {
+        out = out.replace(&p, "<path>");
+    }
+
+    // (c) Any IPv4 literal → <ip>.
+    out = ipv4_regex().replace_all(&out, "<ip>").into_owned();
+
+    // (d) Sanctioned repo-wide S1/PII catch-all (internal hosts/paths/domains/
+    // container-ids/private-IPs the explicit set above didn't cover). Only matched
+    // spans are replaced; generic text is preserved.
+    let (scrubbed, _violations) = crate::github::pii::scan_and_redact(&out);
+    scrubbed
 }
 
 /// A caller-supplied `request_id` is VALID iff it is a safe single segment (no
@@ -2223,6 +2291,70 @@ mod tests {
             "secret must be redacted from the failed-event message: {msg}"
         );
         assert!(msg.contains("<redacted>"));
+    }
+
+    #[tokio::test]
+    async fn failed_message_scrubs_infra_literals_ip_path_host() {
+        // S1: an error embedding an IP, the configured dataset root path, and a
+        // configured (relay) host must have ALL THREE replaced by placeholders
+        // before the failed event is persisted on the bus / returned by
+        // compiler_progress. Generic diagnostic prose stays intact.
+        let ds_root = "/tmp/bld19-scrub-dataset-root";
+        let relay_host = "internal-buildbox-01";
+        let ip = "<internal-ip>"; // pii-test-fixture — a fake LAN IP for the S1 scrub test
+        let _env = ScopedEnv::new()
+            .set("BUILD_DATASET_ROOT", ds_root)
+            .set("BUILD_DATASET_RELAY_HOST", relay_host);
+
+        let err = ToolError::Execution(format!(
+            "publish to {ds_root}/artifacts failed: ssh {relay_host} ({ip}) connection refused"
+        ));
+        let msg = redacted_failed_message(&err);
+
+        // Raw infra literals are gone; placeholders present; prose preserved.
+        assert!(!msg.contains(ds_root), "dataset path scrubbed: {msg}");
+        assert!(!msg.contains(relay_host), "host scrubbed: {msg}");
+        assert!(!msg.contains(ip), "IP scrubbed: {msg}");
+        assert!(msg.contains("<path>"), "path placeholder: {msg}");
+        assert!(msg.contains("<host>"), "host placeholder: {msg}");
+        assert!(msg.contains("<ip>"), "ip placeholder: {msg}");
+        assert!(
+            msg.contains("publish") && msg.contains("connection refused"),
+            "generic diagnostic text is preserved: {msg}"
+        );
+
+        // Round-trips through the bus AND compiler_progress with the literals gone
+        // — asserted via BOTH the failed Stage event and the structured output.
+        let id = format!("infra-{}", uuid::Uuid::new_v4());
+        events::bus().emit(
+            &id,
+            events::Emit::stage(events::Stage::Failed).message(msg.clone()),
+        );
+        let ev_msg = events::bus()
+            .snapshot(&id, 0)
+            .unwrap()
+            .events
+            .last()
+            .unwrap()
+            .message
+            .clone()
+            .unwrap();
+        assert!(
+            !ev_msg.contains(ds_root) && !ev_msg.contains(relay_host) && !ev_msg.contains(ip),
+            "failed Stage event carries no infra literals: {ev_msg}"
+        );
+        let prog = CompilerProgress
+            .execute_structured(json!({ "request_id": id }))
+            .await
+            .unwrap();
+        let out = prog.structured.unwrap();
+        let out_msg = out["events"].as_array().unwrap().last().unwrap()["message"]
+            .as_str()
+            .unwrap();
+        assert!(
+            !out_msg.contains(ds_root) && !out_msg.contains(relay_host) && !out_msg.contains(ip),
+            "compiler_progress structured output carries no infra literals: {out_msg}"
+        );
     }
 
     #[tokio::test]

@@ -41,6 +41,16 @@ impl HostRole {
     }
 }
 
+/// The configured build-host addresses (primary + heavy) that are actually set,
+/// for S1 infra-literal scrubbing of an error message before it leaves the
+/// process (a failed-event on the progress bus). Empty when neither is set.
+pub fn configured_addresses() -> Vec<String> {
+    [HostRole::Primary, HostRole::Heavy]
+        .into_iter()
+        .filter_map(|r| env_nonempty(r.host_env()))
+        .collect()
+}
+
 /// The requested host from the tool argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostRequest {

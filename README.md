@@ -305,8 +305,17 @@ reporting on. Three numeric, env-tunable bounds keep memory bounded:
 
 Log-tail lines are **secret-sanitized by the emitter** (`compiler_build` runs every captured
 cargo output line through its existing S6/S7 redaction set) *before* they enter the bus, so a
-secret never leaves the process through the stream. The bus stores only stage/timing/step
-data and already-redacted text — no infrastructure literals (S1), no secrets (S6/S7).
+secret never leaves the process through the stream. A **failed-event message** is sanitized in
+two passes before it is persisted: secret **values** (S6/S7) then infrastructure **literals**
+(S1) — IP addresses, the emitter-known configured host/relay-host and dataset/deploy path
+values, and the sanctioned repo-wide S1/PII scanner as a catch-all — each replaced by a
+placeholder (`<ip>`/`<host>`/`<path>`), so no configured path, internal host, or IP can leave
+through the stream. The bus stores only stage/timing/step data and already-sanitized text — no
+infrastructure literals (S1), no secrets (S6/S7).
+
+A **pre-acceptance failure** (a validation/config error before the build emits `queued`)
+yields a discoverable **terminal-only** `failed` track — the id is still surfaced and the
+stream is queryable; no fake `queued` event is synthesized to pad the shape.
 
 ## Fleet clock — `time_now` (CLK-01)
 
