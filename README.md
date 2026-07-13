@@ -119,10 +119,15 @@ compiler_build(module, ref, host="auto", profile="release", fast=false, bin?, so
   defaults** (an unset cap is a hard `NotConfigured` naming the var): the operator sizes
   the caps per host, because a wrong default could starve the build or under-protect Plex.
 - **Bounded, leak-free subprocesses** — every subprocess runs in its **own process group**
-  (`process_group(0)`) with `kill_on_drop`. On timeout the whole group is `killpg(SIGKILL)`-ed
-  — so a build tree (`systemd-run`/`ssh` and their `cargo`/`rustc` descendants) is torn down,
-  not just the direct child — then the child is reaped (no zombie, no leaked process keeping
-  the secret-bearing inherited environment alive past the timeout).
+  (`process_group(0)`) with `kill_on_drop`. On timeout the whole LOCAL group is
+  `killpg(SIGKILL)`-ed — so a local build tree (`systemd-run` and its `cargo`/`rustc`
+  descendants) is torn down, not just the direct child — then the child is reaped (no zombie,
+  no leaked process keeping the secret-bearing inherited environment alive past the timeout).
+  For a **remote heavy build** the local `ssh` kill can't reach the remote tree, so each build
+  runs under a deterministic, unique named scope (`systemd-run --scope --unit=terminus-build-<module>-<ref>-<uuid>`)
+  and a timeout ALSO issues a best-effort `ssh host systemctl kill --signal=SIGKILL <unit>.scope`
+  (fallback `systemctl stop`) to terminate the remote scope + all its descendants; the remote
+  secret env file is removed regardless.
 - **Secrets never on a command line** (S7) — the sccache Redis **password** (and the full
   `SCCACHE_REDIS` URL) are never rendered into `--setenv=`/argv (which would leak into `ps`,
   shell history, and journald). `render_scope_argv` defensively drops any secret-shaped key;

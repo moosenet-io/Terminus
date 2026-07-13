@@ -258,6 +258,55 @@ fn redact_secrets(text: &str, secrets: &[String]) -> String {
     out
 }
 
+/// On a REMOTE (ssh heavy) build, killing the LOCAL `ssh` process group does not
+/// reach the remote `systemd-run --scope` / `cargo` / `rustc` tree. This carries
+/// the info needed to tear that remote tree down by name on timeout: the ssh
+/// host and the transient scope's unit name (so `systemctl kill <unit>.scope`
+/// terminates the scope + all its descendants remotely).
+struct RemoteScopeKill {
+    host: String,
+    unit: String,
+}
+
+/// Render the argv that kills a remote transient scope by unit name over ssh:
+/// `systemctl kill --signal=SIGKILL <unit>.scope`, falling back to
+/// `systemctl stop <unit>.scope`. Pure (returns the argv) so it is testable
+/// offline; the unit is shell-quoted for the remote shell.
+fn render_remote_scope_kill_argv(host: &str, unit: &str) -> Vec<String> {
+    let scope = shell_quote(&format!("{unit}.scope"));
+    vec![
+        "ssh".to_string(),
+        host.to_string(),
+        format!("systemctl kill --signal=SIGKILL {scope} || systemctl stop {scope}"),
+    ]
+}
+
+/// Best-effort remote scope kill (own short timeout, non-fatal). Spawned when a
+/// remote heavy build times out, so the remote build tree does not keep running
+/// (and keep the secret-bearing inherited env alive) after the tool returns.
+async fn remote_scope_kill(rk: &RemoteScopeKill) {
+    let argv = render_remote_scope_kill_argv(&rk.host, &rk.unit);
+    // Reuse `run` with no further remote-kill (None) and a small timeout; ignore
+    // the outcome — this is cleanup, the caller already returns the timeout error.
+    // `Box::pin` breaks the `run`↔`remote_scope_kill` async recursion cycle (the
+    // `None` remote_kill above means this never actually recurses at runtime).
+    if let Err(e) = Box::pin(run(
+        &argv,
+        None,
+        &BTreeMap::new(),
+        Duration::from_secs(30),
+        &[],
+        None,
+    ))
+    .await
+    {
+        tracing::warn!(
+            "compiler: best-effort remote scope kill of {}.scope failed: {e}",
+            rk.unit
+        );
+    }
+}
+
 /// Run a subprocess argv with an optional cwd + extra env, bounded by `timeout`.
 /// Returns `Ok(stdout)` on success (exit 0), else an `Execution` error with a
 /// trimmed stderr tail. The env is applied on top of the inherited environment.
@@ -271,17 +320,24 @@ fn redact_secrets(text: &str, secrets: &[String]) -> String {
 ///
 /// PROCESS LIFECYCLE: the child is spawned in its OWN process group
 /// (`process_group(0)` ⇒ pgid == child pid) with `kill_on_drop(true)`. On timeout
-/// the WHOLE group is `killpg(SIGKILL)`-ed (so a build tree — systemd-run/ssh and
-/// their `cargo`/`rustc` descendants — dies, not just the direct child), then the
-/// direct child is `start_kill`-ed and `wait`-ed to REAP it (no zombie, no leaked
-/// process keeping the secret-bearing inherited env alive). `kill_on_drop`
-/// guarantees any early return / panic also tears the child down.
+/// the WHOLE LOCAL group is `killpg(SIGKILL)`-ed (so a local build tree —
+/// systemd-run and its `cargo`/`rustc` descendants — dies, not just the direct
+/// child), then the direct child is `start_kill`-ed and `wait`-ed to REAP it (no
+/// zombie). `kill_on_drop` guarantees any early return / panic also tears the
+/// child down.
+///
+/// REMOTE builds: killing the local `ssh` process group does NOT reach the remote
+/// scope. When `remote_kill` is `Some`, a timeout ALSO issues a best-effort
+/// `systemctl kill <unit>.scope` over ssh to tear down the remote build tree — so
+/// a timed-out heavy build cannot keep running remotely (holding the inherited
+/// secret env + capped host resources) after the tool returns.
 async fn run(
     argv: &[String],
     cwd: Option<&std::path::Path>,
     env: &BTreeMap<String, String>,
     timeout: Duration,
     redact: &[String],
+    remote_kill: Option<&RemoteScopeKill>,
 ) -> Result<String, ToolError> {
     use tokio::io::AsyncReadExt;
     if argv.is_empty() {
@@ -332,8 +388,8 @@ async fn run(
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(ToolError::Execution(format!("{}: {e}", argv[0]))),
         Err(_) => {
-            // TIMEOUT: kill the whole process group (the build tree), then reap
-            // the direct child so it can never become a zombie or leak.
+            // TIMEOUT: kill the whole LOCAL process group (the build tree), then
+            // reap the direct child so it can never become a zombie or leak.
             if let Some(pgid) = pgid {
                 // Safe: killpg takes plain integers and has no memory effects; an
                 // ESRCH (already-empty group) is a harmless no-op.
@@ -343,6 +399,11 @@ async fn run(
             }
             let _ = child.start_kill();
             let _ = child.wait().await;
+            // REMOTE builds: the local kill only reached `ssh`; tear down the
+            // remote scope by name too (best-effort, non-fatal).
+            if let Some(rk) = remote_kill {
+                remote_scope_kill(rk).await;
+            }
             return Err(ToolError::Execution(format!(
                 "{} timed out after {}s (child process group killed)",
                 argv[0],
@@ -471,7 +532,15 @@ impl RustTool for CompilerBuild {
         let triple = target_triple();
         // `target` (the triple) comes from config but is used as a path segment.
         validate_segment("target", &triple)?;
-        let unit = scope::scope_unit_name(&module, &git_ref);
+        // A DETERMINISTIC, UNIQUE transient-scope unit name: `<module>-<ref>` plus
+        // a per-invocation uuid so it can never collide with a concurrent build of
+        // the same module@ref and is unambiguously addressable for `systemctl kill
+        // <unit>.scope` if a (remote) build times out.
+        let unit = format!(
+            "{}-{}",
+            scope::scope_unit_name(&module, &git_ref),
+            uuid::Uuid::new_v4().simple()
+        );
 
         // sccache env (fail-open to a local dir if Redis is unconfigured).
         let sccache_env = sccache::resolve(&root_str);
@@ -549,6 +618,7 @@ impl RustTool for CompilerBuild {
                     &BTreeMap::new(),
                     Duration::from_secs(600),
                     &redact,
+                    None,
                 )
                 .await?;
             }
@@ -570,6 +640,7 @@ impl RustTool for CompilerBuild {
                 &secret_env,
                 Duration::from_secs(3600),
                 &redact,
+                None,
             )
             .await?;
 
@@ -611,6 +682,7 @@ impl RustTool for CompilerBuild {
                 &BTreeMap::new(),
                 Duration::from_secs(120),
                 &redact,
+                None,
             )
             .await?;
             run(
@@ -626,6 +698,7 @@ impl RustTool for CompilerBuild {
                 &BTreeMap::new(),
                 Duration::from_secs(1800),
                 &redact,
+                None,
             )
             .await?;
 
@@ -661,6 +734,7 @@ impl RustTool for CompilerBuild {
                     &BTreeMap::new(),
                     Duration::from_secs(120),
                     &redact,
+                    None,
                 )
                 .await;
                 // Delete the local staging copy immediately, whether the transfer
@@ -682,6 +756,7 @@ impl RustTool for CompilerBuild {
                     &BTreeMap::new(),
                     Duration::from_secs(600),
                     &redact,
+                    None,
                 )
                 .await?;
             }
@@ -701,12 +776,19 @@ impl RustTool for CompilerBuild {
             } else {
                 format!("exec {scope_cmd}")
             };
+            // On timeout, tear down the REMOTE scope by its unit name too — the
+            // local ssh process-group kill can't reach the remote build tree.
+            let remote_kill = RemoteScopeKill {
+                host: host_addr.clone(),
+                unit: unit.clone(),
+            };
             let build_res = run(
                 &["ssh".into(), host_addr.clone(), remote_cmd],
                 None,
                 &BTreeMap::new(),
                 Duration::from_secs(3600),
                 &redact,
+                Some(&remote_kill),
             )
             .await;
             // Best-effort scrub in case the build failed before the wrapper's rm ran.
@@ -721,6 +803,7 @@ impl RustTool for CompilerBuild {
                     &BTreeMap::new(),
                     Duration::from_secs(60),
                     &redact,
+                    None,
                 )
                 .await;
             }
@@ -750,6 +833,7 @@ impl RustTool for CompilerBuild {
                 &BTreeMap::new(),
                 Duration::from_secs(600),
                 &redact,
+                None,
             )
             .await?;
             built_bin = local_bin;
@@ -789,6 +873,7 @@ impl RustTool for CompilerBuild {
                 &BTreeMap::new(),
                 Duration::from_secs(600),
                 &redact,
+                None,
             )
             .await;
             let sc_res = if bin_res.is_ok() {
@@ -798,6 +883,7 @@ impl RustTool for CompilerBuild {
                     &BTreeMap::new(),
                     Duration::from_secs(120),
                     &redact,
+                    None,
                 )
                 .await
             } else {
@@ -1281,6 +1367,7 @@ mod tests {
             &BTreeMap::new(),
             Duration::from_secs(30),
             &redact,
+            None,
         )
         .await
         .unwrap_err();
@@ -1302,6 +1389,7 @@ mod tests {
             &BTreeMap::new(),
             Duration::from_secs(30),
             &redact,
+            None,
         )
         .await
         .unwrap();
@@ -1332,6 +1420,7 @@ mod tests {
             &BTreeMap::new(),
             Duration::from_millis(300),
             &[],
+            None,
         )
         .await
         .unwrap_err();
@@ -1349,6 +1438,51 @@ mod tests {
             !marker.exists(),
             "the timed-out child was not killed — its process tree leaked"
         );
+    }
+
+    #[test]
+    fn remote_scope_kill_argv_targets_the_named_scope() {
+        let unit = "terminus-build-chord-abc-deadbeefcafe";
+        let argv = render_remote_scope_kill_argv("builduser@heavy", unit);
+        assert_eq!(argv[0], "ssh");
+        assert_eq!(argv[1], "builduser@heavy");
+        let cmd = &argv[2];
+        // SIGKILL the scope, falling back to stop — both target the exact unit's
+        // `.scope`, shell-quoted.
+        assert!(
+            cmd.contains(&format!("systemctl kill --signal=SIGKILL '{unit}.scope'")),
+            "kill cmd: {cmd}"
+        );
+        assert!(
+            cmd.contains(&format!("systemctl stop '{unit}.scope'")),
+            "stop fallback: {cmd}"
+        );
+    }
+
+    #[test]
+    fn remote_scope_is_addressable_by_the_same_unit_the_kill_targets() {
+        // The remote build's scope argv carries `--unit=<unit>`, and the timeout
+        // kill targets exactly `<unit>.scope` — so a timed-out remote build IS
+        // reachable by name (the fix's core invariant).
+        let unit = "terminus-build-chord-abc-deadbeefcafe";
+        let caps = scope::ScopeCaps {
+            memory_max: "12G".to_string(),
+            cpu_quota: "400%".to_string(),
+            io_weight: "50".to_string(),
+            jobs: 4,
+        };
+        let scope_argv = scope::render_scope_argv(
+            unit,
+            &caps,
+            &BTreeMap::new(),
+            &["cargo".into(), "build".into()],
+        );
+        assert!(
+            scope_argv.iter().any(|a| a == &format!("--unit={unit}")),
+            "remote scope must be named --unit={unit}: {scope_argv:?}"
+        );
+        let kill = render_remote_scope_kill_argv("h", unit);
+        assert!(kill[2].contains(&format!("{unit}.scope")));
     }
 
     #[test]
