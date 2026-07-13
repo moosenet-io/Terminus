@@ -130,26 +130,50 @@ fn shell_join(argv: &[String]) -> String {
 }
 
 /// Write `body` to a fresh **0600** file under the system temp dir and return its
-/// path. Used to STAGE the remote secret env file before `scp` — created 0600
-/// from the start so the secret is never briefly world-readable, and with no
-/// runtime `tempfile` dependency. The caller deletes it after transfer.
+/// path. Used to STAGE the remote secret env file before transfer.
+///
+/// SECURITY (S7, symlink/predictable-tmp attack): the filename carries an
+/// unguessable random component (a v4 UUID, OS-CSPRNG-backed) so an attacker on a
+/// multi-user build host cannot pre-plant a file or symlink at a predictable path;
+/// and the file is opened with **`O_EXCL`** (`create_new` — an existing path is a
+/// hard error, never a truncate/overwrite) **+ `O_NOFOLLOW`** (a symlink at the
+/// path is not followed). Because `O_EXCL` guarantees a brand-new file, the
+/// `mode(0o600)` applies from creation — the "0600-from-creation" guarantee
+/// genuinely holds. On write failure the partial file is unlinked. The caller
+/// unlinks it after transfer (on both success and error paths).
 fn write_local_0600(body: &str, tag: &str) -> Result<PathBuf, ToolError> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let path = std::env::temp_dir().join(format!(
         "terminus-build-secret-{tag}-{}.env",
-        std::process::id()
+        uuid::Uuid::new_v4()
     ));
+    write_secret_0600_at(&path, body)?;
+    Ok(path)
+}
+
+/// Exclusively create `path` with mode 0600, refusing to follow a symlink or
+/// touch an existing path, and write `body`. The load-bearing security core of
+/// [`write_local_0600`], split out so the O_EXCL/O_NOFOLLOW semantics are
+/// directly testable at a known path.
+fn write_secret_0600_at(path: &std::path::Path, body: &str) -> Result<(), ToolError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|e| ToolError::Execution(format!("create secret staging file: {e}")))?;
-    f.write_all(body.as_bytes())
-        .map_err(|e| ToolError::Execution(format!("write secret staging file: {e}")))?;
-    Ok(path)
+        .create_new(true) // O_CREAT | O_EXCL — never open/truncate an existing path
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC) // don't follow a symlink
+        .mode(0o600) // applies because O_EXCL guarantees a brand-new file
+        .open(path)
+        .map_err(|e| {
+            ToolError::Execution(format!("create exclusive 0600 secret staging file: {e}"))
+        })?;
+    if let Err(e) = f.write_all(body.as_bytes()) {
+        // Never leave a partial secret file behind on a write error.
+        let _ = std::fs::remove_file(path);
+        return Err(ToolError::Execution(format!(
+            "write secret staging file: {e}"
+        )));
+    }
+    Ok(())
 }
 
 /// Map a profile name to (the cargo flag(s) that select it, the target subdir it
@@ -486,9 +510,13 @@ impl RustTool for CompilerBuild {
 
             // Secret env (if any) → a 0600 file ON THE REMOTE, `source`d inside the
             // ssh wrapper before `exec systemd-run` so it reaches the scoped build's
-            // inherited env WITHOUT ever touching a command line (S7). The local
-            // staging file is created 0600 and deleted right after transfer.
-            let remote_env_path = format!("{remote_target_str}/.terminus-build-{unit}.env");
+            // inherited env WITHOUT ever touching a command line (S7). The remote
+            // filename carries an unguessable random component (defense-in-depth vs
+            // a pre-planted file/symlink), matching the local staging file below.
+            let remote_env_path = format!(
+                "{remote_target_str}/.terminus-build-{unit}-{}.env",
+                uuid::Uuid::new_v4()
+            );
             let have_secret = !secret_env.is_empty();
             if have_secret {
                 let body = scope::render_secret_env_file(&secret_env);
@@ -958,6 +986,45 @@ mod tests {
         assert!(
             !marker.exists(),
             "shell_quote must prevent command execution"
+        );
+    }
+
+    #[test]
+    fn secret_file_is_exclusive_0600_no_symlink_follow() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+
+        // The body content is arbitrary for this test (we're exercising the
+        // creation semantics, not the payload) — a non-secret-shaped literal.
+        let body = "payload-line-one\n";
+
+        // (a) Fresh path → succeeds, mode exactly 0600, contents match.
+        let fresh = dir.path().join("fresh.env");
+        write_secret_0600_at(&fresh, body).unwrap();
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), body);
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "must be 0600 from creation, got {mode:o}");
+
+        // (b) Pre-existing path → O_EXCL makes it a hard error, and the existing
+        // file is NOT truncated/overwritten.
+        let existing = dir.path().join("existing.env");
+        std::fs::write(&existing, "PREEXISTING").unwrap();
+        assert!(write_secret_0600_at(&existing, body).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&existing).unwrap(),
+            "PREEXISTING",
+            "an existing file must never be truncated/overwritten"
+        );
+
+        // (c) Symlink at the path → O_NOFOLLOW refuses to follow it; the symlink
+        // target is NOT created or written.
+        let target = dir.path().join("target-should-not-be-written");
+        let link = dir.path().join("link.env");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(write_secret_0600_at(&link, body).is_err());
+        assert!(
+            !target.exists(),
+            "a symlink must not be followed to create/write its target"
         );
     }
 

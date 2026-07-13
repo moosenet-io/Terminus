@@ -125,7 +125,10 @@ compiler_build(module, ref, host="auto", profile="release", fast=false, bin?, so
   (`systemd-run --scope` runs cargo as a direct child that inherits systemd-run's env). On
   the remote/heavy path the secret is written to a **0600 file on the build host** and
   `source`d inside the ssh wrapper immediately before `exec systemd-run`, then deleted —
-  again never on a command line. That file is **shell-injection-safe**: each value is emitted
+  again never on a command line. The local staging file is created safely against a
+  predictable-`/tmp`/symlink attack: an **unguessable random (v4-UUID) filename**, opened
+  with **`O_EXCL`** (never opens/truncates an existing path) **+ `O_NOFOLLOW`** (never follows
+  a symlink), so `0600` genuinely holds from creation. That file is **shell-injection-safe**: each value is emitted
   single-quoted with embedded quotes escaped as `'\''`, so a hostile Redis password (spaces,
   `$(...)`, backticks, `;`, `|`, newlines, quotes) is fully literal and can neither be
   corrupted nor execute during `source`. Non-secret vars (`SCCACHE_REDIS_ENDPOINT`/`_DB`/
