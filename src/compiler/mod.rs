@@ -724,6 +724,15 @@ impl RustTool for CompilerBuild {
             .filter(|s| is_valid_request_id(s))
             .map(str::to_string)
             .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+        // BLD-19: ROTATE the progress track to a FRESH stream NOW — before any
+        // validation and before build_inner. This is the single rotation per build
+        // attempt (build_inner does NOT rotate again). Doing it here (not inside
+        // build_inner) means EVEN a PRE-ACCEPTANCE failure (invalid module/ref/
+        // profile, missing config) lands its terminal `failed` on a fresh,
+        // non-terminal track — so a reused request_id whose prior build ended
+        // terminal can never mask THIS attempt's failure with the old build's
+        // stale `published`/`failed` state.
+        events::bus().begin(&request_id);
         // Run the build. On ANY error path: emit the terminal Failed event AND
         // surface the request_id back to the caller in the returned error, so a
         // failed build's progress stream stays discoverable even when the caller
@@ -733,8 +742,8 @@ impl RustTool for CompilerBuild {
         //
         // NOTE (by design): a PRE-ACCEPTANCE failure — one that occurs before
         // `build_inner` emits `queued` (an invalid/absent config, a validation
-        // error, etc.) — yields a TERMINAL-ONLY `failed` track (no
-        // `queued → … → failed` shape). That is intentional: the id is still
+        // error, etc.) — yields a TERMINAL-ONLY `failed` track on the fresh track
+        // (no `queued → … → failed` shape). That is intentional: the id is still
         // surfaced and the failed stream is discoverable; we do NOT synthesize a
         // fake `queued` event just to pad the shape.
         match self.build_inner(&request_id, args).await {
@@ -879,14 +888,12 @@ impl CompilerBuild {
         validate_git_ref(&git_ref)?;
 
         // BLD-19: the request is accepted → `queued`. A per-build tap streams the
-        // cargo `{step,total}` into the bus during the build (progress bar).
+        // cargo `{step,total}` into the bus during the build (progress bar). The
+        // stream was already ROTATED to a fresh, non-terminal track by the wrapper
+        // (`execute_structured`) before validation — so this `queued` lands on the
+        // fresh track. build_inner does NOT rotate again (single rotation per
+        // attempt), so the `queued → … → published/failed` shape is preserved.
         let bus = events::bus();
-        // BEGIN a fresh stream FIRST: rotate the track to a new generation so that
-        // REUSING a request_id that is still tracked (a previous build's live or
-        // terminal track) starts a CLEAN per-build stream — no stale terminal state
-        // shown, no events dropped by the old track's terminal-close, and any
-        // reader mid-poll on the old generation resolves to not_found.
-        bus.begin(request_id);
         bus.emit(
             request_id,
             events::Emit::stage(events::Stage::Queued).message(format!("{module}@{git_ref}")),
@@ -2496,6 +2503,63 @@ mod tests {
             "queued",
             "B's fresh stream starts at queued, not A's published"
         );
+        assert!(
+            !evs.iter().any(|e| e["sha"] == "oldshaA"),
+            "no stale published sha from build A"
+        );
+    }
+
+    #[tokio::test]
+    async fn reused_terminal_id_pre_acceptance_failure_is_not_masked() {
+        // The rotation now happens in the WRAPPER, before validation — so even a
+        // PRE-ACCEPTANCE failure (invalid module, before build_inner emits
+        // `queued`) on a reused id whose prior build ended TERMINAL is not masked
+        // by the old track: compiler_progress reflects THIS failure, not A's stale
+        // `published`.
+        let id = format!("preacc-{}", uuid::Uuid::new_v4());
+        // Build A → terminal published (simulated on the shared bus).
+        events::bus().emit(&id, events::Emit::stage(events::Stage::Queued));
+        events::bus().emit(
+            &id,
+            events::Emit::stage(events::Stage::Published).sha("oldshaA"),
+        );
+        let a = events::bus().snapshot(&id, 0).unwrap();
+        assert!(a.terminal, "build A is terminal published");
+        let gen_a = a.generation;
+
+        // Build B reuses the id but FAILS VALIDATION before acceptance: an invalid
+        // `module` (path separator) → validate_segment rejects it inside
+        // build_inner, BEFORE `queued`. The wrapper already rotated the track.
+        let err = CompilerBuild
+            .execute_structured(json!({
+                "module": "bad/module",
+                "ref": "abc123",
+                "request_id": id,
+            }))
+            .await
+            .unwrap_err();
+        // The id is still surfaced on this pre-acceptance failure.
+        assert!(
+            err.to_string().contains(&format!("request_id={id}")),
+            "request_id surfaced: {err}"
+        );
+
+        // compiler_progress reflects B's FRESH terminal failure, not A's state.
+        let prog = CompilerProgress
+            .execute_structured(json!({ "request_id": id }))
+            .await
+            .unwrap();
+        let s = prog.structured.unwrap();
+        assert_ne!(
+            s["generation"].as_u64().unwrap(),
+            gen_a,
+            "reused id started a fresh generation before validation"
+        );
+        assert_eq!(s["stage"], "failed", "B's own failure, not A's published");
+        let evs = s["events"].as_array().unwrap();
+        // Pre-acceptance failure → terminal-only failed (no synthesized queued).
+        assert_eq!(evs.len(), 1, "terminal-only failed track: {evs:?}");
+        assert_eq!(evs[0]["stage"], "failed");
         assert!(
             !evs.iter().any(|e| e["sha"] == "oldshaA"),
             "no stale published sha from build A"

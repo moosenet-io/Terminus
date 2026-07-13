@@ -278,11 +278,15 @@ An unknown or expired `request_id` returns `{"status":"not_found"}` — never an
 snapshot carries a per-build `generation` so reused ids stay isolated (tracks are
 per-build-request, not per-key-slot):
 
-- **A build beginning rotates the stream.** `compiler_build` calls `begin(request_id)` before
-  its first `queued` — replacing any existing track for that id (live OR already-terminal) with
-  a fresh one (new generation, empty ring, non-terminal). Reusing a still-tracked id therefore
-  always shows a **clean per-build stream** — never a previous build's stale terminal state, and
-  never dropping the new build's events into a closed terminal track.
+- **A build beginning rotates the stream.** `compiler_build` calls `begin(request_id)` in the
+  tool wrapper **before any validation** (the single rotation per attempt) — replacing any
+  existing track for that id (live OR already-terminal) with a fresh one (new generation, empty
+  ring, non-terminal). Reusing a still-tracked id therefore always shows a **clean per-build
+  stream** — never a previous build's stale terminal state, and never dropping the new build's
+  events into a closed terminal track. Because rotation precedes validation, even a
+  **pre-acceptance failure** (invalid `module`/`ref`, before `queued`) lands its terminal
+  `failed` on the fresh track, so a reused id's failure is never masked by a prior terminal
+  build; that attempt is a discoverable terminal-only `failed` track (no synthesized `queued`).
 - **Long-poll is generation-safe.** `subscribe` captures the receiver, the snapshot, and the
   generation from the **same track under one lock** (no TOCTOU). If that track is
   evicted/rotated and the id is reused while a long-poller is waiting, the waiter's post-wake
