@@ -10,9 +10,10 @@
 //!
 //! ## The model
 //! One [`ProgressEvent`] per stage transition (plus throttled log-tail lines
-//! during the build). Stages, in order:
+//! during the build). This stream covers `compiler_build`'s OWN scope only —
+//! stages, in order:
 //!   `queued → scheduled → [relaying (remote only)] → building{step,total} →
-//!    publishing → deployed | failed | rolled_back`
+//!    publishing → published | failed`
 //!
 //! `relaying` is a REMOTE-path stage: it means "rsync the source to the heavy
 //! build host". A LOCAL (primary, in-place) build has nothing to relay, so it
@@ -28,12 +29,14 @@
 //! (streamed from cargo's `N/M`); only those are throttled — a duplicate/unchanged
 //! step is coalesced. The throttle NEVER drops a stage transition.
 //!
-//! `compiler_build`'s own scope ends at publish, so it emits the terminal
-//! [`Stage::Published`] (with the artifact sha) on success and [`Stage::Failed`]
-//! (with a sanitized error tail) on failure. [`Stage::Deployed`] and
-//! [`Stage::RolledBack`] are reserved for the downstream updater stage so the
-//! model spans the whole request lifecycle the GUI renders — they are valid
-//! events any pipeline stage may emit against the same `request_id`.
+//! ## Terminal stages (and what is NOT on this stream)
+//! `compiler_build`'s scope ENDS at publish, so this stream has exactly two
+//! terminal stages: [`Stage::Published`] (with the artifact sha) on success and
+//! [`Stage::Failed`] (with a sanitized error tail) on failure. Once terminal, the
+//! stream is CLOSED — later events are ignored. The downstream updater/deploy
+//! stage (BLD-13) — `deployed` / `rolled_back` — is a SEPARATE lifecycle that is
+//! NOT emitted onto this stream (there is no `Deployed`/`RolledBack` variant), so
+//! the code and this doc agree: nothing follows `published`/`failed` here.
 //!
 //! ## Seam with `compiler_status` (BLD-08)
 //! `compiler_status` is a POINT-IN-TIME aggregate (queue + store `current`
@@ -89,9 +92,18 @@ const BROADCAST_DEPTH: usize = 64;
 /// must not escape the ring/capacity memory bound. Longer messages are truncated
 /// with a marker. A char-boundary-safe cut.
 const MAX_MESSAGE_LEN: usize = 4096;
-/// Max stored length of a `request_id` (it is a map key + echoed in every event);
-/// bound it so a pathological id can't blow the memory bound either.
-const MAX_REQUEST_ID_LEN: usize = 128;
+/// Max length of a `request_id`. This is a HARD VALIDATION bound enforced at the
+/// tool boundary (`compiler_build`/`compiler_progress`), NOT a lossy clamp — an
+/// overlong id is REJECTED, never truncated, so two distinct ids can never be
+/// silently folded onto one track. Bounds memory (the id is a map key + echoed in
+/// every event) without any collision risk.
+pub const MAX_REQUEST_ID_LEN: usize = 128;
+
+/// Whether `id` is within the bounded length. The tool boundary rejects a longer
+/// id with a clear validation error rather than clamping it.
+pub fn request_id_len_ok(id: &str) -> bool {
+    id.len() <= MAX_REQUEST_ID_LEN
+}
 
 /// Truncate `s` to at most `max` BYTES on a char boundary; when cut, append
 /// `marker` (so a truncated message is noted). Returns `s` unchanged if it fits.
@@ -106,11 +118,18 @@ fn clamp_str(s: &str, max: usize, marker: &str) -> String {
     format!("{}{marker}", &s[..end])
 }
 
-/// A `request_id` clamped to the bounded key length (no marker — it stays a plain
-/// key). Applied consistently on write (emit) and read (snapshot/subscribe) so a
-/// clamped key always matches itself.
-fn clamp_request_id(id: &str) -> String {
-    clamp_str(id, MAX_REQUEST_ID_LEN, "")
+/// Run `f` at the progress-bus boundary FAIL-OPEN: an unexpected panic inside bus
+/// logic is caught + logged and MUST NOT propagate, so a bus hiccup can never
+/// abort the build that is only reporting progress. (The bus is panic-free by
+/// construction — this is defense in depth.) Returns `None` if `f` panicked.
+fn fail_open<T>(what: &str, f: impl FnOnce() -> T) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::error!("compiler progress bus: {what} panicked (swallowed, fail-open)");
+            None
+        }
+    }
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
@@ -137,8 +156,15 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// A build lifecycle stage. Ordered as emitted; the terminal stages
-/// ([`is_terminal`](Stage::is_terminal)) close the stream.
+/// A build lifecycle stage on the `compiler_build` progress stream. Ordered as
+/// emitted; the two terminal stages ([`is_terminal`](Stage::is_terminal)) close
+/// the stream.
+///
+/// This stream covers `compiler_build`'s OWN scope only — `queued → scheduled →
+/// [relaying] → building → publishing → published | failed`. The downstream
+/// updater/deploy stage (BLD-13) — `deployed` / `rolled_back` — is a SEPARATE
+/// lifecycle NOT emitted onto this stream (the stream is closed at `published`/
+/// `failed`), so there is no `Deployed`/`RolledBack` variant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     Queued,
@@ -152,10 +178,6 @@ pub enum Stage {
     Published,
     /// Terminal failure (a sanitized error tail is attached).
     Failed,
-    /// Terminal success reserved for the downstream updater stage.
-    Deployed,
-    /// Terminal rollback reserved for the downstream updater stage.
-    RolledBack,
 }
 
 impl Stage {
@@ -168,17 +190,14 @@ impl Stage {
             Stage::Publishing => "publishing",
             Stage::Published => "published",
             Stage::Failed => "failed",
-            Stage::Deployed => "deployed",
-            Stage::RolledBack => "rolled_back",
         }
     }
 
-    /// Whether this stage closes the stream (no further events expected).
+    /// Whether this stage closes the stream (no further events expected). Only
+    /// `published`/`failed` are terminal for this bus; `deployed`/`rolled_back`
+    /// are the downstream updater's concern and never reach this stream.
     pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Stage::Published | Stage::Failed | Stage::Deployed | Stage::RolledBack
-        )
+        matches!(self, Stage::Published | Stage::Failed)
     }
 }
 
@@ -197,7 +216,7 @@ pub struct ProgressEvent {
     pub total: Option<u32>,
     /// A short, ALREADY-SANITIZED note or log-tail line (never a raw secret).
     pub message: Option<String>,
-    /// On [`Stage::Published`]/[`Stage::Deployed`]: the artifact sha256.
+    /// On [`Stage::Published`]: the artifact sha256.
     pub sha: Option<String>,
 }
 
@@ -262,6 +281,13 @@ struct Track {
     next_seq: u64,
     created_ms: u64,
     updated_ms: u64,
+    /// A globally-unique EPOCH assigned when THIS track is created. If the track
+    /// is evicted (LRU/TTL) and a NEW build reuses the same `request_id`, the new
+    /// track gets a fresh generation. A long-poller captures the generation at
+    /// subscribe and, after waking, only returns a snapshot whose generation still
+    /// matches — otherwise the id was reused mid-wait and it resolves to not_found
+    /// (never the WRONG build's data). The API is per-build-request, not per-slot.
+    generation: u64,
     /// Monotonic "last-touched" ordinal from the bus's global touch counter,
     /// bumped on every emit. This — NOT the wall clock — is the LRU key, so two
     /// updates in the same `SystemTime` tick still have a strict, deterministic
@@ -275,7 +301,7 @@ struct Track {
 }
 
 impl Track {
-    fn new(now: u64, touched: u64, max_events: usize) -> Self {
+    fn new(now: u64, touched: u64, generation: u64, max_events: usize) -> Self {
         let depth = BROADCAST_DEPTH.max(max_events.min(1024));
         let (tx, _rx) = broadcast::channel(depth);
         Self {
@@ -283,6 +309,7 @@ impl Track {
             next_seq: 1,
             created_ms: now,
             updated_ms: now,
+            generation,
             last_touched: touched,
             last_step: None,
             terminal: None,
@@ -303,6 +330,10 @@ pub struct ProgressBus {
     /// build's `last_touched`, giving a strict LRU order independent of wall-clock
     /// resolution (so eviction is deterministic even under test parallelism).
     touch: AtomicU64,
+    /// Monotonic generation counter: every NEW track gets the next value, so a
+    /// reused `request_id` (old track evicted, new build under the same id) is
+    /// distinguishable by a long-poller (see `Track::generation`).
+    generation: AtomicU64,
     max_events: usize,
     max_builds: usize,
     ttl_ms: u64,
@@ -318,6 +349,8 @@ pub fn bus() -> &'static ProgressBus {
 /// A snapshot returned to a client: the current stage + a bounded recent tail.
 pub struct Snapshot {
     pub request_id: String,
+    /// The track generation this snapshot was read from (see `Track::generation`).
+    pub generation: u64,
     pub stage: Stage,
     pub terminal: bool,
     pub created_ms: u64,
@@ -334,6 +367,7 @@ impl Snapshot {
     pub fn to_json(&self) -> Value {
         json!({
             "request_id": self.request_id,
+            "generation": self.generation,
             "stage": self.stage.as_str(),
             "terminal": self.terminal,
             "created_ms": self.created_ms,
@@ -351,6 +385,7 @@ impl ProgressBus {
         Self {
             inner: Mutex::new(HashMap::new()),
             touch: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
             max_events: env_usize(ENV_MAX_EVENTS, DEFAULT_MAX_EVENTS),
             max_builds: env_usize(ENV_MAX_BUILDS, DEFAULT_MAX_BUILDS),
             ttl_ms: env_u64(ENV_TTL_SECS, DEFAULT_TTL_SECS).saturating_mul(1000),
@@ -363,6 +398,7 @@ impl ProgressBus {
         Self {
             inner: Mutex::new(HashMap::new()),
             touch: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
             max_events: max_events.max(1),
             max_builds: max_builds.max(1),
             ttl_ms,
@@ -403,13 +439,22 @@ impl ProgressBus {
     }
 
     /// Emit an event for `request_id`, creating the track if new. Returns the
-    /// assigned seq. Applies TTL sweep + capacity eviction + ring-buffer bound,
-    /// and (for the building stage) throttles unchanged `{step,total}`.
+    /// assigned seq. PANIC-SAFE (fail-open): any unexpected panic inside the bus is
+    /// caught + logged and never propagates, so the bus can't abort the build that
+    /// is only reporting progress. Applies TTL sweep + capacity eviction +
+    /// ring-buffer bound, and (for the building stage) throttles unchanged
+    /// `{step,total}`.
     pub fn emit(&self, request_id: &str, e: Emit) -> u64 {
+        fail_open("emit", || self.emit_inner(request_id, e)).unwrap_or(0)
+    }
+
+    fn emit_inner(&self, request_id: &str, e: Emit) -> u64 {
         let now = now_ms();
-        // Bound the id length (map key + echoed in every event) so a pathological
-        // id can't escape the memory bound; clamp identically on read.
-        let rid = clamp_request_id(request_id);
+        // The id length is a HARD validation rule enforced at the tool boundary
+        // (`compiler_build`/`compiler_progress`), so an id reaching the bus is
+        // already bounded and is used VERBATIM — never clamped (a lossy clamp
+        // could fold two distinct ids onto one track).
+        let rid = request_id;
         // A strictly-increasing LRU ordinal for THIS emit — assigned to the
         // touched build below so eviction order never depends on wall-clock
         // resolution (two emits in the same tick still order strictly).
@@ -417,17 +462,19 @@ impl ProgressBus {
         let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
 
         Self::sweep_locked(&mut map, self.ttl_ms, now);
-        Self::evict_if_full_locked(&mut map, self.max_builds, &rid);
+        Self::evict_if_full_locked(&mut map, self.max_builds, rid);
 
         let max_events = self.max_events;
+        // A fresh generation for a NEW track (so a reused id is distinguishable).
+        let new_gen = self.generation.fetch_add(1, Ordering::Relaxed);
         let track = map
-            .entry(rid.clone())
-            .or_insert_with(|| Track::new(now, touched, max_events));
+            .entry(rid.to_string())
+            .or_insert_with(|| Track::new(now, touched, new_gen, max_events));
 
-        // TERMINAL INTEGRITY: once a stream is terminal (published/failed/deployed/
-        // rolled_back) it is CLOSED — a later event is ignored, so a terminal
-        // snapshot can never report an inconsistent later stage (e.g. building
-        // after published). Deterministic close.
+        // TERMINAL INTEGRITY: once a stream is terminal (published/failed) it is
+        // CLOSED — a later event is ignored, so a terminal snapshot can never
+        // report an inconsistent later stage (e.g. building after published).
+        // Deterministic close.
         if track.terminal.is_some() {
             return track.next_seq.saturating_sub(1);
         }
@@ -478,7 +525,7 @@ impl ProgressBus {
             .message
             .map(|m| clamp_str(&m, MAX_MESSAGE_LEN, "…[truncated]"));
         let event = ProgressEvent {
-            request_id: rid.clone(),
+            request_id: rid.to_string(),
             seq,
             ts_ms: now,
             stage: e.stage,
@@ -514,9 +561,6 @@ impl ProgressBus {
     /// id is `not_found`, not an error.
     pub fn snapshot(&self, request_id: &str, since: u64) -> Option<Snapshot> {
         let now = now_ms();
-        // Clamp identically to the write path so a bounded key matches itself.
-        let request_id = clamp_request_id(request_id);
-        let request_id = request_id.as_str();
         let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         // Read-side expiry: an expired build reads as not_found even with no emit.
         let expired = match map.get(request_id) {
@@ -545,6 +589,7 @@ impl ProgressBus {
             .unwrap_or((None, None));
         Some(Snapshot {
             request_id: request_id.to_string(),
+            generation: track.generation,
             stage: track.snapshot_stage(),
             terminal: track.terminal.is_some(),
             created_ms: track.created_ms,
@@ -566,9 +611,6 @@ impl ProgressBus {
         request_id: &str,
         since: u64,
     ) -> Option<(Snapshot, broadcast::Receiver<ProgressEvent>)> {
-        // Clamp identically to the write path so a bounded key matches itself.
-        let request_id = clamp_request_id(request_id);
-        let request_id = request_id.as_str();
         let rx = {
             let now = now_ms();
             let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -595,6 +637,12 @@ impl ProgressBus {
     /// build is unaffected (the tx lives in the track). If the build EXPIRES past
     /// the TTL mid-wait, the post-wait `snapshot` applies read-side expiry and
     /// resolves to `None` (not_found) rather than returning stale data.
+    ///
+    /// GENERATION SAFETY: the subscribe captures the track's generation; if the id
+    /// is EVICTED and REUSED by a NEW build mid-wait, the post-wait snapshot has a
+    /// different generation and resolves to `None` (not_found) — the old waiter
+    /// never receives the new build's data (tracks are per-build-request, not
+    /// per-key-slot).
     pub async fn poll(
         &self,
         request_id: &str,
@@ -605,12 +653,19 @@ impl ProgressBus {
         if !snap.events.is_empty() || snap.terminal || wait.is_zero() {
             return Some(snap);
         }
+        let gen0 = snap.generation;
         // Nothing new yet — await a live event (or timeout), then re-snapshot so
         // the caller always gets the full current state, not just one delta. The
         // re-snapshot also re-checks TTL, so an id that expired during the wait
         // resolves to not_found instead of hanging or returning stale data.
         let _ = tokio::time::timeout(wait, rx.recv()).await;
-        self.snapshot(request_id, since)
+        let after = self.snapshot(request_id, since)?;
+        // If the id was reused by a NEW build mid-wait, the generation differs →
+        // do NOT return the new build's data to this (stale) waiter.
+        if after.generation != gen0 {
+            return None;
+        }
+        Some(after)
     }
 
     /// Test helper: number of tracked builds.
@@ -980,15 +1035,8 @@ mod tests {
             f.events.last().unwrap().message.as_deref(),
             Some("error: could not compile foo")
         );
-
-        // Downstream lifecycle stages are valid too.
-        bus.emit("dep", Emit::stage(Stage::Deployed).sha("deadbeef"));
-        assert_eq!(bus.snapshot("dep", 0).unwrap().stage, Stage::Deployed);
-        bus.emit(
-            "rb",
-            Emit::stage(Stage::RolledBack).message("health gate failed"),
-        );
-        assert!(bus.snapshot("rb", 0).unwrap().terminal);
+        // `published` and `failed` are the ONLY terminal stages on this stream;
+        // deployed/rolled_back are the downstream updater's concern (no variant).
     }
 
     #[test]
@@ -1027,17 +1075,77 @@ mod tests {
     }
 
     #[test]
-    fn oversized_request_id_is_bounded_and_matches_on_read() {
+    fn distinct_ids_sharing_a_prefix_never_collide() {
+        // The bus stores ids VERBATIM (no lossy clamp), so two distinct ids that
+        // share a long common prefix are separate tracks — never folded into one.
+        // (The length bound is a hard validation rule at the TOOL boundary.)
         let bus = ProgressBus::with_bounds(64, 8, 0);
-        let long = "z".repeat(MAX_REQUEST_ID_LEN * 3);
-        bus.emit(&long, Emit::stage(Stage::Queued));
-        // Stored id is clamped, and a read with the SAME long id still finds it
-        // (read path clamps identically).
-        let snap = bus.snapshot(&long, 0).unwrap();
-        assert!(snap.request_id.len() <= MAX_REQUEST_ID_LEN);
-        assert_eq!(
-            snap.events.last().unwrap().request_id.len(),
-            snap.request_id.len()
+        let base = "p".repeat(MAX_REQUEST_ID_LEN);
+        let a = format!("{base}A");
+        let b = format!("{base}B");
+        bus.emit(&a, Emit::stage(Stage::Queued));
+        bus.emit(&b, Emit::stage(Stage::Failed).message("b failed"));
+        let sa = bus.snapshot(&a, 0).unwrap();
+        let sb = bus.snapshot(&b, 0).unwrap();
+        assert_eq!(sa.request_id, a);
+        assert_eq!(sb.request_id, b);
+        assert!(!sa.terminal, "a is its own track (queued)");
+        assert!(sb.terminal, "b is its own track (failed)");
+        assert_eq!(bus.tracked(), 2, "two distinct ids, two tracks");
+    }
+
+    #[test]
+    fn request_id_len_ok_bounds_at_the_boundary() {
+        assert!(request_id_len_ok(&"x".repeat(MAX_REQUEST_ID_LEN)));
+        assert!(!request_id_len_ok(&"x".repeat(MAX_REQUEST_ID_LEN + 1)));
+    }
+
+    #[test]
+    fn emit_is_fail_open_on_a_panicking_boundary() {
+        // The emit boundary must SWALLOW a panic (fail-open) rather than propagate
+        // it into the build. `fail_open` is the wrapper `emit` uses.
+        let n = fail_open("test-panic", || -> u64 { panic!("boom") });
+        assert_eq!(n, None, "a panicking bus op is swallowed, not propagated");
+        let ok = fail_open("test-ok", || 42u64);
+        assert_eq!(ok, Some(42));
+        // And a normal emit path returns without panicking.
+        let bus = ProgressBus::with_bounds(8, 4, 0);
+        let seq = bus.emit("fo", Emit::stage(Stage::Queued));
+        assert_eq!(seq, 1);
+    }
+
+    #[test]
+    fn a_reused_id_gets_a_fresh_generation() {
+        // cap = 1 forces eviction; a same track keeps its generation, but a NEW
+        // track under a reused id gets a distinct (higher) generation.
+        let bus = ProgressBus::with_bounds(16, 1, 0);
+        bus.emit("reuse", Emit::stage(Stage::Queued));
+        let g0 = bus.snapshot("reuse", 0).unwrap().generation;
+        bus.emit("other", Emit::stage(Stage::Queued)); // evicts "reuse"
+        assert!(bus.snapshot("reuse", 0).is_none(), "old track evicted");
+        bus.emit("reuse", Emit::stage(Stage::Queued)); // NEW track, same id
+        let g1 = bus.snapshot("reuse", 0).unwrap().generation;
+        assert!(g1 > g0, "the reused id got a fresh, higher generation");
+    }
+
+    #[tokio::test]
+    async fn poll_returns_not_found_if_id_reused_by_new_build_midwait() {
+        // A waiter blocked on an id's OLD track must NOT receive a DIFFERENT build's
+        // data if the id is evicted + reused mid-wait — it resolves to not_found.
+        let bus = std::sync::Arc::new(ProgressBus::with_bounds(16, 1, 0)); // cap 1
+        bus.emit("x", Emit::stage(Stage::Scheduled)); // old track (gen G0), seq=1
+        let b2 = bus.clone();
+        // Caught up (since = last_seq) so the poller actually blocks on the old rx.
+        let waiter =
+            tokio::spawn(async move { b2.poll("x", 1, std::time::Duration::from_secs(5)).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // Evict the old "x" (cap 1), then reuse the id for a brand-new build.
+        bus.emit("y", Emit::stage(Stage::Queued)); // evicts old "x"
+        bus.emit("x", Emit::stage(Stage::Queued)); // NEW "x" track (gen G1)
+        let res = waiter.await.unwrap();
+        assert!(
+            res.is_none(),
+            "the stale waiter resolves not_found, never the new build's data"
         );
     }
 

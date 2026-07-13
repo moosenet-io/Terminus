@@ -711,18 +711,19 @@ impl RustTool for CompilerBuild {
     }
 
     async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
-        // BLD-19: a stable request_id keys the whole progress stream. Accept a
-        // caller-supplied id (so it can subscribe before/while the build runs) or
-        // mint one; validate it as a safe segment (it is only ever a map key +
-        // returned to the caller, never a path/argv, but keep it well-formed).
-        let request_id = match args.get("request_id").and_then(Value::as_str) {
-            Some(s) if !s.trim().is_empty() => {
-                let s = s.trim().to_string();
-                validate_segment("request_id", &s)?;
-                s
-            }
-            _ => uuid::Uuid::new_v4().simple().to_string(),
-        };
+        // BLD-19: decide the effective request_id FIRST, so EVERY compiler_build
+        // path (success OR failure) carries a discoverable id. A caller may supply
+        // one (to subscribe before/while the build runs); if it is missing OR
+        // INVALID (bad chars / overlong), we FALL BACK to an auto-generated id
+        // rather than returning early with no surfaced id (AC-1). The invalid id is
+        // discarded, never clamped — so two distinct ids can't fold onto one track.
+        let request_id = args
+            .get("request_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| is_valid_request_id(s))
+            .map(str::to_string)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
         // Run the build. On ANY error path: emit the terminal Failed event AND
         // surface the request_id back to the caller in the returned error, so a
         // failed build's progress stream stays discoverable even when the caller
@@ -772,6 +773,15 @@ fn tag_error_with_request_id(e: ToolError, request_id: &str) -> ToolError {
 /// secret set is complete even when the build failed before it resolved root.
 fn redacted_failed_message(e: &ToolError) -> String {
     redact_secrets(&e.to_string(), &redaction_set(""))
+}
+
+/// A caller-supplied `request_id` is VALID iff it is a safe single segment (no
+/// separators/whitespace/metachars) AND within the hard length bound. This is a
+/// hard validation rule, NOT a clamp: `compiler_build` falls back to an
+/// auto-generated id when it is invalid, and `compiler_progress` rejects it — so
+/// an overlong or malformed id can never be truncated into a colliding key.
+fn is_valid_request_id(s: &str) -> bool {
+    !s.is_empty() && events::request_id_len_ok(s) && validate_segment("request_id", s).is_ok()
 }
 
 impl CompilerBuild {
@@ -1427,6 +1437,16 @@ impl RustTool for CompilerProgress {
 
     async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
         let request_id = str_arg(&args, "request_id")?;
+        // Reject a malformed / overlong id at the boundary with a CLEAR validation
+        // error (never truncate it to a colliding key). A well-formed unknown id
+        // still returns not_found below.
+        if !is_valid_request_id(request_id.trim()) {
+            return Err(ToolError::InvalidArgument(format!(
+                "request_id must be a single [A-Za-z0-9._-] segment of at most {} bytes",
+                events::MAX_REQUEST_ID_LEN
+            )));
+        }
+        let request_id = request_id.trim().to_string();
         let since = args.get("since").and_then(Value::as_u64).unwrap_or(0);
         let wait_ms = args
             .get("wait_ms")
@@ -2235,5 +2255,58 @@ mod tests {
             .expect("tap created the track");
         assert_eq!(snap.stage, events::Stage::Building);
         assert_eq!((snap.step, snap.total), (Some(5), Some(9)));
+    }
+
+    #[tokio::test]
+    async fn invalid_caller_request_id_still_surfaces_a_discoverable_id() {
+        // AC-1: an INVALID caller request_id must NOT return early with no id.
+        // The build falls back to an auto-generated id; a subsequent failure still
+        // carries a valid `[request_id=<id>]` and a discoverable failed stream.
+        let _env = ScopedEnv::new().unset("BUILD_DATASET_ROOT"); // deterministic post-queued failure
+        let err = CompilerBuild
+            .execute_structured(json!({
+                "module": "terminus",
+                "ref": "abc123",
+                // Invalid: contains a path separator + is absurdly long.
+                "request_id": format!("bad/id-{}", "z".repeat(events::MAX_REQUEST_ID_LEN + 50)),
+            }))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        let rid = msg
+            .split("request_id=")
+            .nth(1)
+            .and_then(|s| s.split(']').next())
+            .map(|s| s.trim().to_string())
+            .expect("error must carry a surfaced request_id even for an invalid caller id");
+        // The surfaced id is a VALID auto-generated one (not the caller's bad id).
+        assert!(is_valid_request_id(&rid), "surfaced id is valid: {rid:?}");
+        assert!(!rid.contains('/'), "the invalid caller id was not used");
+        // And the failed stream is discoverable under that id.
+        let prog = CompilerProgress
+            .execute_structured(json!({ "request_id": rid }))
+            .await
+            .unwrap();
+        let s = prog.structured.unwrap();
+        assert_eq!(s["stage"], "failed");
+        assert_eq!(s["terminal"], true);
+    }
+
+    #[tokio::test]
+    async fn compiler_progress_rejects_overlong_id() {
+        // #3: an overlong id is REJECTED at the boundary (clear validation error),
+        // never truncated into a colliding key.
+        let overlong = "z".repeat(events::MAX_REQUEST_ID_LEN + 1);
+        let err = CompilerProgress
+            .execute_structured(json!({ "request_id": overlong }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+        // A malformed (separator) id is likewise rejected, not not_found.
+        let err2 = CompilerProgress
+            .execute_structured(json!({ "request_id": "a/b" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err2, ToolError::InvalidArgument(_)));
     }
 }

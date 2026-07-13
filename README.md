@@ -221,6 +221,12 @@ The `request_id` is returned on **both** outcomes: on success in the result text
 (`[request_id=<id>] …`), so a failed build's progress stream (terminal `failed` event + the
 redacted error tail) stays discoverable even when the caller did not supply an id up front.
 
+A caller-supplied `request_id` must be a single `[A-Za-z0-9._-]` segment of at most 128 bytes.
+This is a **hard validation rule, not a lossy clamp** (so two distinct ids can never be
+truncated onto one track): `compiler_build` **falls back to an auto-generated id** when the
+supplied one is missing or invalid (never returning without a surfaced id), and
+`compiler_progress` **rejects** an invalid/overlong id with a clear validation error.
+
 ```
 compiler_progress(request_id, since=0, wait_ms=0)
 ```
@@ -247,11 +253,14 @@ stage transition.
   `{step,total}` is parsed from cargo's build progress (`N/M`) and streamed live as the crates
   compile, throttled so an unchanged step is not re-emitted.
 - `publishing` — artifact being checksummed + written.
-- `published` — **terminal success**, carries the artifact `sha256`. (`compiler_build`'s
-  scope ends at publish; `deployed` / `rolled_back` are reserved terminal stages the
-  downstream constellation-updater emits against the same `request_id`, so the model spans
-  the whole request lifecycle a GUI renders.)
+- `published` — **terminal success**, carries the artifact `sha256`.
 - `failed` — **terminal failure**, carries a **secret-sanitized** error tail.
+
+`published` and `failed` are the **only** terminal stages on this stream — once terminal, the
+stream is **closed** and any later event is ignored. `compiler_build`'s scope ends at publish;
+the downstream updater/deploy lifecycle (`deployed` / `rolled_back`, BLD-13) is a **separate**
+concern that is **not** emitted onto this stream, so the code and docs agree that nothing
+follows `published`/`failed` here.
 
 Every event has a monotonic per-build `seq`, a timestamp (`ts_ms`), the `stage`, optional
 `{step,total}`, an optional short `message`, and (on a terminal success) the `sha`.
@@ -265,7 +274,11 @@ Every event has a monotonic per-build `seq`, a timestamp (`ts_ms`), the `stage`,
   the timeout), then returns a fresh snapshot. To **stream**, pass `since` = the last `seq`
   you saw and advance it each call: `compiler_progress(id, since=last_seq, wait_ms=5000)`.
 
-An unknown or expired `request_id` returns `{"status":"not_found"}` — never an error.
+An unknown or expired `request_id` returns `{"status":"not_found"}` — never an error. Each
+snapshot also carries a per-build `generation`: if a build's track is evicted and the id is
+**reused** by a new build while a long-poller is waiting, the waiter's post-wake snapshot has a
+different `generation` and resolves to `not_found` — a stale waiter never receives a different
+build's data (tracks are per-build-request, not per-key-slot).
 
 ### Seam with `compiler_status` (BLD-08)
 
@@ -280,7 +293,9 @@ watch a specific build.
 The event store is **in-process and ephemeral** (a ring buffer + broadcast channel per
 build) — progress is transient, exactly like the BLD-20 admission queue; it fails open and
 never blocks a build, and `compiler_status` remains the durable point-in-time truth if the
-process restarts. Three numeric, env-tunable bounds keep memory bounded:
+process restarts. The emit boundary is **panic-safe**: an unexpected panic in bus logic is
+caught + logged and never propagates, so a bus hiccup can never abort the build it is only
+reporting on. Three numeric, env-tunable bounds keep memory bounded:
 
 | Env knob | Default | Meaning |
 | --- | --- | --- |
