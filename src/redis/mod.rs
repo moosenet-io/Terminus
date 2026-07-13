@@ -57,15 +57,29 @@ const DEFAULT_DB_VOLATILE: i64 = 1;
 /// A namespace is the ONLY sanctioned way to form a key: call [`Namespace::key`]
 /// — never hand-concatenate a bare string — so the prefix + DB invariants hold
 /// fleet-wide.
+///
+/// SCOPE / consumer ownership (intentional decomposition): BLD-20 PROVIDES this
+/// shared pool + typed namespaces; it does NOT wire every consumer. The
+/// `Sccache` and `Queue` namespaces are reserved here as the shared backend for
+/// two SEPARATE downstream items — `Sccache` for the sccache shared compile
+/// cache (BLD-05/BLD-03) and `Queue` for the durable compiler job queue /
+/// scheduler (BLD-06). Those consumers land in THOSE items, not here; the only
+/// consumers BLD-20 itself wires are the proxy rate-limiter/admission queue
+/// (`Ratelimit`) and the Plane prefix overlay (`Prefix`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Namespace {
-    /// sccache shared compile cache index (BLD-05). Volatile.
+    /// sccache shared compile-cache index. Volatile. **Consumer: BLD-05/BLD-03**
+    /// (the sccache backend) — reserved here, wired in that item, not BLD-20.
     Sccache,
-    /// Compiler queue / scheduler state (BLD-06). Durable.
+    /// Compiler job-queue / scheduler state. Durable (DB `noeviction`).
+    /// **Consumer: BLD-06** (the compiler queue) — reserved here, wired in that
+    /// item, not BLD-20. This is the DURABLE job queue, distinct from the
+    /// ephemeral proxy admission queue under `Ratelimit`.
     Queue,
-    /// Plane prefix-registry overlay (durable cross-instance claims).
+    /// Plane prefix-registry overlay (durable cross-instance claims). Wired by BLD-20.
     Prefix,
-    /// Proxy rate-limit counters + request-queue metadata. Volatile.
+    /// Proxy rate-limit counters + (ephemeral) request-admission queue metadata.
+    /// Volatile. Wired by BLD-20.
     Ratelimit,
 }
 

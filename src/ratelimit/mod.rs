@@ -306,13 +306,27 @@ end
 local seq = redis.call('INCR', KEYS[2])
 local ticket = ARGV[2] .. ':' .. seq
 redis.call('RPUSH', KEYS[1], ticket)
+-- EPHEMERAL BY DESIGN (not a durability regression): this is the PROXY
+-- ADMISSION queue — each entry is an in-flight HTTP request waiting for a rate
+-- token, and those requests die when their gateway process restarts. The TTL is
+-- a crash-safety janitor that bounds stale tickets left by a crashed instance;
+-- it must self-expire. Durability lives ELSEWHERE and is untouched by this TTL:
+-- the rate-limiter COUNTERS, the PREFIX OVERLAY (durable DB), and the durable
+-- BLD-06 compiler JOB queue (Namespace::Queue, noeviction) all have their own
+-- non-expiring persistence. Do NOT reuse this list as the durable job queue.
 redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
 redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3]))
 return {1, ticket}
 "#;
 
-/// TTL (secs) applied to an active admission queue so an abandoned one is
-/// reclaimed by the volatile DB rather than lingering.
+/// TTL (secs) for an active PROXY ADMISSION queue. Intentionally EPHEMERAL /
+/// self-cleaning: an admission entry is an in-flight HTTP request waiting for a
+/// rate token, which cannot outlive its gateway process, so the TTL exists to
+/// reclaim stale tickets from a CRASHED instance — it is a crash-safety janitor,
+/// NOT a durability regression. This is NOT the durable compiler job queue: the
+/// rate-limiter counters, the prefix overlay, and the durable
+/// `crate::redis::Namespace::Queue` job queue (BLD-06, `noeviction`) persist
+/// without expiry and are unaffected by this TTL.
 const QUEUE_TTL_SECS: i64 = 300;
 
 /// [`Outcome`](Admission) of a bounded queue-admission attempt.
