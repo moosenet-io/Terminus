@@ -168,13 +168,17 @@ fn is_accepted_sudo_flag(t: &str) -> bool {
 /// optionally ONLY the non-interactive flag `-n` (no other sudo option — especially
 /// no argument-taking flag like `-u`/`-g`/`-h`/`-p` that could make sudo read the
 /// next token as a username/host and treat `systemctl` as data), then the EXECUTABLE
-/// which MUST be `systemctl` (or a `.../systemctl` path), then only systemctl args.
-/// So `systemctl`, `sudo systemctl`, `sudo -n systemctl`, `/usr/bin/systemctl`,
+/// which MUST be `systemctl` (or a `.../systemctl` path), then — CRUCIALLY (finding
+/// 1) — NO trailing subcommand/verb: only option FLAGS (tokens starting with `-`) may
+/// follow `systemctl`, never a bare word, because the wrapper always supplies the verb
+/// (`start`) + unit itself (`systemctl reboot` would become `systemctl reboot start
+/// <unit>`). So `systemctl`, `sudo systemctl`, `sudo -n systemctl`, `/usr/bin/systemctl`,
 /// `sudo -n /usr/bin/systemctl` are accepted; `sudo -u systemctl`, `sudo reboot
-/// systemctl`, `reboot systemctl` are REJECTED. Any metacharacter, a disallowed sudo
-/// flag, or a non-systemctl executable is a clear config error (never inserted into
-/// the remote shell). Empty/unset ⇒ the default `systemctl`. The error message NEVER
-/// echoes the raw value back (S1).
+/// systemctl`, `reboot systemctl`, `systemctl reboot`, `systemctl stop` are REJECTED.
+/// Any metacharacter, a disallowed sudo flag, a non-systemctl executable, or a
+/// trailing verb is a clear config error (never inserted into the remote shell).
+/// Empty/unset ⇒ the default `systemctl`. The error message NEVER echoes the raw
+/// value back (S1).
 fn validate_systemctl_cmd(raw: &str) -> Result<String, ToolError> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -221,6 +225,20 @@ fn validate_systemctl_cmd(raw: &str) -> Result<String, ToolError> {
             return Err(ToolError::InvalidArgument(format!(
                 "{COMPILER_DEPLOY_SYSTEMCTL} executable must be `systemctl` (optionally via a \
                  leading `sudo [-n]`); e.g. `systemctl` or `sudo -n systemctl`; rejected"
+            )));
+        }
+    }
+    // Finding 1: NO trailing subcommand/verb after `systemctl`. The wrapper ALWAYS
+    // supplies the verb (`start`) + the unit, so a configured `systemctl reboot`
+    // would render as `systemctl reboot start <unit>` — an arbitrary subcommand. Any
+    // trailing BARE WORD (a verb like `reboot`/`stop`/`enable`) is rejected; only
+    // option FLAGS (tokens beginning with `-`, e.g. `--no-block`/`-q`) are permitted
+    // after the executable.
+    for tok in &toks[i + 1..] {
+        if !tok.starts_with('-') {
+            return Err(ToolError::InvalidArgument(format!(
+                "{COMPILER_DEPLOY_SYSTEMCTL} must be just `[sudo [-n]] systemctl` with no \
+                 trailing subcommand (the trigger supplies `start <unit>` itself); rejected"
             )));
         }
     }
@@ -512,25 +530,25 @@ fn ensure_non_interactive_sudo(prefix: &str) -> String {
 
 /// Render the remote shell command that TRIGGERS the updater synchronously and
 /// prints a deterministic outcome line. It:
-///   1. creates a fresh RUN-REFERENCE FILE this run provably owns — `mktemp` in a
-///      writable temp dir (fallback: a pid-named `/tmp` file), then `: >` to stamp its
-///      mtime to NOW — and records that reference's mtime (`__refmt`),
-///   2. best-effort clears any prior marker (`rm -f`),
-///   3. runs `<systemctl> start <unit>` (a `Type=oneshot` updater unit blocks until
+///   1. `rm -f`s any prior marker, then CAPTURES whether the marker is now provably
+///      ABSENT (`__cleared=1` iff `[ -e marker ]` is false after the rm). This is the
+///      TRULY RUN-SCOPED gate (finding 3): it does NOT depend on `rm`'s exit code or
+///      any second-granularity mtime — either the old marker is gone (so any marker
+///      present afterward was written by THIS run) or it survived (a root-owned marker
+///      we could not remove) in which case we do NOT trust it at all,
+///   2. runs `<systemctl> start <unit>` (a `Type=oneshot` updater unit blocks until
 ///      the whole fetch→swap→health→rollback→marker flow finishes), captures its
 ///      exit code — with `sudo` forced non-interactive (`-n`) so it fails fast
 ///      instead of hanging on a password prompt,
-///   4. reads the systemd `Result`, then reads the outcome-token file ONLY IF the
-///      run-reference was genuinely created (`__refmt > 0`) AND the marker's mtime is
-///      `>= __refmt` (finding 4: TRULY RUN-SCOPED). Because the reference is created
-///      at run start and a fresh marker is written DURING the run (causally after it),
-///      a fresh marker's mtime is always `>= __refmt`; a STALE marker from a PRIOR run
-///      predates this run's reference and is rejected — regardless of whether `rm`
-///      could remove it (a root-owned marker) and with NO absolute-time tolerance
-///      window. If the reference could not be created, NO marker is trusted (degrade
-///      to `Result` + rc). The reference file is removed afterward,
-///   5. prints `COMPILER_DEPLOY rc=<rc> result=<result> token=<token>`,
-///   6. ALWAYS `exit 0` — so ssh's OWN exit code reflects only CONNECTIVITY (a
+///   3. reads the systemd `Result`, then reads the outcome-token file ONLY IF the
+///      pre-trigger clear SUCCEEDED (`__cleared=1`). The token is SANITIZED against
+///      sentinel spoofing (finding 2): `head -n1` takes only the first line and
+///      `tr -cd 'A-Za-z0-9_-'` strips it to a safe charset — so a malformed marker
+///      containing a newline + a forged `COMPILER_DEPLOY … token=deployed` line can
+///      neither inject a second sentinel line nor smuggle spaces/metacharacters,
+///   4. prints `COMPILER_DEPLOY rc=<rc> result=<result> token=<token>` (exactly one
+///      sentinel line — the token can never contain a newline),
+///   5. ALWAYS `exit 0` — so ssh's OWN exit code reflects only CONNECTIVITY (a
 ///      non-zero ssh exit ⇒ unreachable, never merely a failed deploy). This is
 ///      the same tri-state trick BLD-08 uses for its marker read.
 ///
@@ -542,15 +560,11 @@ pub fn render_remote_trigger_cmd(systemctl: &str, unit: &str, result_marker: &st
     let u = shell_quote(unit);
     let m = shell_quote(result_marker);
     format!(
-        "__ref=$(mktemp 2>/dev/null || echo /tmp/.compiler-deploy-ref-$$); \
-         : > \"$__ref\" 2>/dev/null; \
-         __refmt=$(stat -c %Y -- \"$__ref\" 2>/dev/null || echo 0); \
-         rm -f -- {m} 2>/dev/null; \
+        "rm -f -- {m} 2>/dev/null; \
+         if [ -e {m} ]; then __cleared=0; else __cleared=1; fi; \
          {systemctl} start {u}; __rc=$?; \
          __res=$({systemctl} show {u} --property=Result --value 2>/dev/null); \
-         __mt=$(stat -c %Y -- {m} 2>/dev/null || echo 0); \
-         if [ \"$__refmt\" -gt 0 ] && [ \"$__mt\" -ge \"$__refmt\" ] 2>/dev/null; then __tok=$(cat -- {m} 2>/dev/null); else __tok=; fi; \
-         rm -f -- \"$__ref\" 2>/dev/null; \
+         if [ \"$__cleared\" = 1 ]; then __tok=$(head -n1 -- {m} 2>/dev/null | tr -cd 'A-Za-z0-9_-'); else __tok=; fi; \
          printf '{sentinel} rc=%s result=%s token=%s\\n' \"$__rc\" \"$__res\" \"$__tok\"; \
          exit 0",
         sentinel = RESULT_SENTINEL
@@ -563,14 +577,22 @@ pub fn render_remote_trigger_cmd(systemctl: &str, unit: &str, result_marker: &st
 
 // ── Outcome classification (pure) ────────────────────────────────────────────
 
-/// Parse the `rc` / `result` / `token` fields out of the remote wrapper's
-/// sentinel line. Tolerant: a missing field ⇒ `None`/empty.
+/// Parse the `rc` / `result` / `token` fields out of the remote wrapper's sentinel
+/// line. Tolerant: a missing field ⇒ `None`/empty.
+///
+/// SENTINEL-SPOOFING DEFENCE (finding 2, Rust side): the real wrapper emits EXACTLY
+/// ONE sentinel line, and it sanitizes the marker token so it can never contain a
+/// newline. If the body somehow carries MORE THAN ONE `COMPILER_DEPLOY …` line — a
+/// marker that forged one — the token is untrustworthy, so we substitute a
+/// non-vocabulary sentinel token (`__ambiguous_sentinel__`) that `classify_reachable`
+/// maps to `unknown`, never a masked `deployed`. rc/result still come from the real
+/// trailing line (rc is `$?`, result is `systemctl show` — neither is marker-derived).
 fn parse_result_line(body: &str) -> (Option<i64>, String, String) {
-    let line = body
+    let sentinel_lines: Vec<&str> = body
         .lines()
-        .rev()
-        .find(|l| l.trim_start().starts_with(RESULT_SENTINEL))
-        .unwrap_or("");
+        .filter(|l| l.trim_start().starts_with(RESULT_SENTINEL))
+        .collect();
+    let line = sentinel_lines.last().copied().unwrap_or("");
     let field = |key: &str| -> Option<String> {
         line.split_whitespace().find_map(|tok| {
             tok.strip_prefix(&format!("{key}=")).map(str::to_string)
@@ -578,7 +600,14 @@ fn parse_result_line(body: &str) -> (Option<i64>, String, String) {
     };
     let rc = field("rc").and_then(|v| v.parse::<i64>().ok());
     let result = field("result").unwrap_or_default();
-    let token = field("token").unwrap_or_default();
+    // More than one sentinel line ⇒ a spoof/garbage stream (the real wrapper emits
+    // exactly one) ⇒ do NOT trust the token; force `unknown` via a non-vocabulary
+    // value rather than degrading to a possibly-`deployed` empty-token path.
+    let token = if sentinel_lines.len() > 1 {
+        "__ambiguous_sentinel__".to_string()
+    } else {
+        field("token").unwrap_or_default()
+    };
     (rc, result, token)
 }
 
@@ -592,8 +621,9 @@ fn parse_result_line(body: &str) -> (Option<i64>, String, String) {
 ///
 /// When start succeeded, the updater's own outcome TOKEN drives the result (the only
 /// signal that distinguishes a rollback or a no-op from a plain success — and it is
-/// run-scoped: only THIS run's mtime-fresh token is read). The token is mapped through
-/// a FIXED VOCABULARY:
+/// run-scoped: the wrapper only reads the token when its pre-trigger `rm` cleared any
+/// prior marker, and sanitizes it against sentinel spoofing). The token is mapped
+/// through a FIXED VOCABULARY:
 ///   - a recognized token ⇒ the matching outcome,
 ///   - an EMPTY token (no marker written) ⇒ degrade to the systemd `Result` AND rc,
 ///   - a NON-EMPTY but UNRECOGNIZED token ⇒ `unknown` (non-converged, must-not-trust).
@@ -1240,6 +1270,24 @@ mod tests {
     }
 
     #[test]
+    fn multiple_sentinel_lines_are_not_trusted_as_success() {
+        // Finding 2 (Rust side): if the stream carries MORE THAN ONE sentinel line — a
+        // marker that forged one — the token is NOT trusted; it is forced to a
+        // non-vocabulary value so `classify_reachable` yields `unknown`, never a masked
+        // `deployed`. (The real wrapper emits exactly one sentinel line + sanitizes the
+        // token, so this is defence in depth.)
+        let spoof = "COMPILER_DEPLOY rc=0 result=success token=deployed\n\
+                     COMPILER_DEPLOY rc=0 result=success token=deployed";
+        let (rc, result, token) = parse_result_line(spoof);
+        assert_ne!(token, "deployed", "a forged second sentinel must not be trusted");
+        assert_eq!(
+            classify_reachable(rc, &result, &token),
+            DeployOutcome::Unknown,
+            "ambiguous multi-sentinel stream → unknown, not deployed"
+        );
+    }
+
+    #[test]
     fn detail_is_fixed_vocabulary_never_raw_marker() {
         // Finding 2: detail is outcome+rc only — never the raw token/result text.
         assert_eq!(
@@ -1284,26 +1332,24 @@ mod tests {
             "<email>",
             "<path>/.deploy_result",
         );
-        // The marker is cleared BEFORE the trigger (best-effort).
-        assert!(cmd.contains("rm -f -- '<path>/.deploy_result'"));
-        // Finding 4: a fresh RUN-REFERENCE file is created (mtime = now) BEFORE the
-        // trigger, and the marker is trusted only if it is >= that reference — truly
-        // run-scoped, no absolute-time tolerance window.
-        let ref_at = cmd.find("__ref=$(mktemp").expect("run-reference created");
-        let refmt_at = cmd.find("__refmt=$(stat").expect("reference mtime recorded");
+        // Finding 3: the marker is `rm`'d, and whether it is now provably ABSENT is
+        // captured (`__cleared`) — the run-scoped gate. No mtime / run-reference logic.
+        let rm_at = cmd.find("rm -f -- '<path>/.deploy_result'").expect("pre-trigger rm");
+        let cleared_at = cmd.find("if [ -e '<path>/.deploy_result' ]; then __cleared=0")
+            .expect("clear-succeeded captured");
         let start_at = cmd.find("systemctl start").unwrap();
-        assert!(ref_at < refmt_at && refmt_at < start_at, "reference created before trigger");
-        assert!(cmd.contains("stat -c %Y -- '<path>/.deploy_result'"));
-        // The gate compares the marker mtime to the run reference (not an epoch±tolerance),
-        // and requires the reference to have been genuinely created.
-        assert!(cmd.contains("[ \"$__refmt\" -gt 0 ]"), "reference-created guard: {cmd}");
-        assert!(cmd.contains("[ \"$__mt\" -ge \"$__refmt\" ]"), "run-scoped gate: {cmd}");
-        assert!(!cmd.contains("__floor"), "no absolute-time tolerance hack: {cmd}");
-        // The run-reference is cleaned up afterward.
-        assert!(cmd.contains("rm -f -- \"$__ref\""), "reference cleaned up: {cmd}");
+        assert!(rm_at < cleared_at && cleared_at < start_at, "rm then clear-check then trigger");
+        // The token is read ONLY when the clear succeeded.
+        assert!(cmd.contains("if [ \"$__cleared\" = 1 ]; then __tok="), "cleared gate: {cmd}");
+        // Finding 2: the token is sanitized (first line only + safe charset) so a
+        // malformed marker can't inject a second sentinel line.
+        assert!(cmd.contains("head -n1 -- '<path>/.deploy_result'"), "first-line only: {cmd}");
+        assert!(cmd.contains("tr -cd 'A-Za-z0-9_-'"), "safe-charset strip: {cmd}");
+        // No leftover mtime/run-reference machinery.
+        assert!(!cmd.contains("__refmt") && !cmd.contains("__floor") && !cmd.contains("stat -c %Y"),
+            "no mtime/run-reference logic remains: {cmd}");
         assert!(cmd.contains("systemctl start '<email>'"));
         assert!(cmd.contains("--property=Result --value"));
-        assert!(cmd.contains("cat -- '<path>/.deploy_result'"));
         assert!(cmd.contains("COMPILER_DEPLOY rc="));
         // Always exit 0 so ssh's exit reflects only connectivity (tri-state trick).
         assert!(cmd.trim_end().ends_with("exit 0"));
@@ -1386,7 +1432,22 @@ mod tests {
                 "only `-n` may precede systemctl; must reject: {bad:?}"
             );
         }
-        // …and the accepted forms all have systemctl as the executable, with only `-n`.
+        // Finding 1: NO trailing subcommand/verb after `systemctl` (the wrapper owns
+        // `start <unit>`). A trailing bare word is rejected; only option flags are ok.
+        for bad in [
+            "systemctl reboot",
+            "systemctl start",
+            "systemctl stop",
+            "sudo -n systemctl poweroff",
+            "/usr/bin/systemctl enable",
+        ] {
+            assert!(
+                matches!(validate_systemctl_cmd(bad), Err(ToolError::InvalidArgument(_))),
+                "no trailing verb allowed; must reject: {bad:?}"
+            );
+        }
+        // …and the accepted forms all have systemctl as the executable, with only `-n`
+        // and NO trailing subcommand.
         assert_eq!(
             validate_systemctl_cmd("sudo -n /usr/bin/systemctl").unwrap(),
             "sudo -n /usr/bin/systemctl"
@@ -1394,6 +1455,11 @@ mod tests {
         assert_eq!(
             validate_systemctl_cmd("sudo --non-interactive systemctl").unwrap(),
             "sudo --non-interactive systemctl"
+        );
+        // A trailing OPTION flag (not a verb) after systemctl is permitted.
+        assert_eq!(
+            validate_systemctl_cmd("systemctl --no-block").unwrap(),
+            "systemctl --no-block"
         );
 
         // The error never echoes the raw (potentially sensitive) value back.
@@ -1640,7 +1706,7 @@ mod tests {
         ));
     }
 
-    // ── Marker MTIME-freshness (finding 2), exercised end-to-end via `sh` ────
+    // ── Marker run-scoping + spoof-sanitization (findings 2 & 3) end-to-end via `sh` ──
 
     async fn run_wrapper(systemctl: &str, unit: &str, marker: &std::path::Path) -> String {
         let cmd = render_remote_trigger_cmd(systemctl, unit, &marker.to_string_lossy());
@@ -1653,61 +1719,116 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
-    /// Drive the wrapper with a FAKE `systemctl` script that, on `start`, WRITES the
-    /// outcome marker — so the marker is produced BY THIS RUN (exactly the real path:
-    /// the wrapper `rm`s any prior marker, the updater writes a fresh one). Root-
-    /// independent: it never relies on the wrapper's `rm` failing. When `force_stale`
-    /// is set, the fake updater back-dates the marker's mtime far into the past
-    /// (simulating a marker NOT refreshed this run — e.g. an updater that aborted
-    /// before writing but left an old marker); otherwise the marker keeps its natural
-    /// write-time mtime (= "now", during the run). Returns the parsed token.
-    async fn wrapper_token_with_fake_updater(force_stale: bool, content: &str) -> String {
+    /// Build a FAKE `systemctl` script whose `start` action runs `start_action` (a
+    /// shell snippet — typically a `printf … > <marker>` that writes the outcome
+    /// marker) and whose `show` prints nothing. Returns its path (kept alive by `dir`).
+    fn fake_systemctl(dir: &std::path::Path, start_action: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("deploy_result");
-        let marker_s = marker.to_string_lossy().to_string();
-        // `1000000000` ≈ 2001-09-09 — decades before any run, so far below this run's
-        // reference mtime that second-granularity/scheduling can't flip it.
-        let backdate = if force_stale {
-            format!("touch -m -d @1000000000 -- '{marker_s}';")
-        } else {
-            String::new()
-        };
-        let script = dir.path().join("fake-systemctl.sh");
-        let body = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  start) printf '%s' '{content}' > '{marker_s}'; {backdate} ;;\nesac\nexit 0\n"
-        );
+        let script = dir.join("fake-systemctl.sh");
+        let body =
+            format!("#!/bin/sh\ncase \"$1\" in\n  start) {start_action} ;;\nesac\nexit 0\n");
         std::fs::write(&script, &body).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let out = run_wrapper(&script.to_string_lossy(), "unit", &marker).await;
-        let (_rc, _res, token) = parse_result_line(&out);
-        token
+        script
+    }
+
+    fn count_sentinel_lines(body: &str) -> usize {
+        body.lines()
+            .filter(|l| l.trim_start().starts_with(RESULT_SENTINEL))
+            .count()
     }
 
     #[tokio::test]
-    async fn stale_marker_old_mtime_is_not_trusted() {
-        // Finding 4: a marker whose mtime predates this run's REFERENCE (decades old)
-        // is NOT trusted — it can't mask a current run, with NO absolute-time tolerance
-        // window. Deterministic + root-independent: the fake updater writes the marker
-        // then back-dates it far into the past (a marker `rm` could not have removed).
-        let token = wrapper_token_with_fake_updater(true, "deployed").await;
+    async fn unremovable_marker_is_not_trusted() {
+        // Finding 3: a pre-existing marker the wrapper's `rm` CANNOT clear must NOT be
+        // trusted (degrade to Result+rc). Root-independent: the marker is a DIRECTORY,
+        // which `rm -f` can never remove (no `-r`) regardless of privileges — so the
+        // clear provably fails and any prior "result" is ignored. `systemctl`=`true`
+        // writes nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("deploy_result");
+        std::fs::create_dir(&marker).unwrap();
+        let out = run_wrapper("true", "unit", &marker).await;
+        let (rc, result, token) = parse_result_line(&out);
         assert!(
             token.is_empty(),
-            "a stale (old-mtime) marker must not be trusted; got token={token:?}"
+            "an unremovable pre-existing marker must not be trusted; got token={token:?}"
+        );
+        assert_ne!(
+            classify_reachable(rc, &result, &token),
+            DeployOutcome::Deployed,
+            "an unclearable marker must never yield deployed"
         );
     }
 
     #[tokio::test]
-    async fn fresh_marker_written_this_run_is_trusted() {
-        // The realistic path: the updater writes the marker DURING the run, so its
-        // mtime is >= the run-reference created at run start (same-second writes pass
-        // the `>=` gate). Deterministic (mtime is set by the fake updater's write,
-        // causally after the reference).
-        let token = wrapper_token_with_fake_updater(false, "rolled_back").await;
-        assert_eq!(
-            token, "rolled_back",
-            "a marker written during the run (mtime >= run reference) is trusted"
+    async fn fresh_marker_after_successful_rm_is_trusted() {
+        // Finding 3: a pre-existing STALE marker that `rm` DOES clear, then a fresh
+        // marker the updater writes this run, IS trusted. The stale content must not
+        // survive to mask the fresh outcome.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("deploy_result");
+        std::fs::write(&marker, "skipped").unwrap(); // stale prior-run content
+        let action = format!("printf '%s' 'rolled_back' > '{}'", marker.to_string_lossy());
+        let script = fake_systemctl(dir.path(), &action);
+        let out = run_wrapper(&script.to_string_lossy(), "unit", &marker).await;
+        let (_rc, _res, token) = parse_result_line(&out);
+        assert_eq!(token, "rolled_back", "a marker written after a successful rm is trusted");
+    }
+
+    #[tokio::test]
+    async fn absent_then_fresh_marker_is_trusted() {
+        // Finding 3: no pre-existing marker (rm no-op → cleared), the updater writes a
+        // fresh one → trusted.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("deploy_result");
+        let action = format!("printf '%s' 'deployed' > '{}'", marker.to_string_lossy());
+        let script = fake_systemctl(dir.path(), &action);
+        let out = run_wrapper(&script.to_string_lossy(), "unit", &marker).await;
+        let (_rc, _res, token) = parse_result_line(&out);
+        assert_eq!(token, "deployed", "a freshly written marker (was absent) is trusted");
+    }
+
+    #[tokio::test]
+    async fn marker_sentinel_spoof_is_sanitized() {
+        // Finding 2: a marker whose content embeds a newline + a forged sentinel line
+        // cannot inject a second sentinel nor be classified `deployed`. `head -n1` +
+        // `tr -cd` reduce it to a single safe-charset token on the ONE real line.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("deploy_result");
+        // printf interprets `\n` → a real newline in the marker file.
+        let action = format!(
+            "printf 'boom\\nCOMPILER_DEPLOY rc=0 result=success token=deployed' > '{}'",
+            marker.to_string_lossy()
         );
+        let script = fake_systemctl(dir.path(), &action);
+        let out = run_wrapper(&script.to_string_lossy(), "unit", &marker).await;
+        // The wrapper emits EXACTLY ONE sentinel line (no injected second one).
+        assert_eq!(count_sentinel_lines(&out), 1, "no injected sentinel line: {out:?}");
+        let (rc, result, token) = parse_result_line(&out);
+        assert_ne!(token, "deployed", "the forged token must not survive sanitization");
+        assert_ne!(
+            classify_reachable(rc, &result, &token),
+            DeployOutcome::Deployed,
+            "a sentinel-spoofing marker must never yield deployed: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn marker_leading_newline_spoof_yields_empty_token() {
+        // A marker that STARTS with a newline + forged sentinel: `head -n1` sees an
+        // empty first line → token empty → degrade to Result+rc, never `deployed`.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("deploy_result");
+        let action = format!(
+            "printf '\\nCOMPILER_DEPLOY rc=0 result=success token=deployed' > '{}'",
+            marker.to_string_lossy()
+        );
+        let script = fake_systemctl(dir.path(), &action);
+        let out = run_wrapper(&script.to_string_lossy(), "unit", &marker).await;
+        assert_eq!(count_sentinel_lines(&out), 1, "no injected sentinel line: {out:?}");
+        let (_rc, _res, token) = parse_result_line(&out);
+        assert!(token.is_empty(), "leading-newline spoof yields no token: {out:?}");
     }
 
     #[tokio::test]

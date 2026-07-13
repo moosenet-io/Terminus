@@ -530,13 +530,17 @@ compiler_deploy(module, channel="stable", hosts="all")
 - **No-masked-failures / no-raw-echo hardening:** the trigger forces **non-interactive sudo**
   (`sudo -n`) so a password prompt fails fast instead of hanging the whole per-host budget; the
   (only `-n` is permitted before `systemctl`, never an argument-taking sudo flag like `-u`/`-h`
-  that could make sudo read `systemctl` as a username); the outcome marker is **truly run-scoped**
-  — the wrapper creates a fresh **run-reference file** it owns (mtime = now) at run start and
-  trusts the marker **only if its mtime is ≥ the reference's** (both real files, same host clock),
-  so a stale prior-run marker the ssh user could not remove (a root-owned marker) provably predates
-  this run and is rejected, with **no absolute-time tolerance window**; a
-  non-zero `systemctl start` rc is classified `failed` regardless of the unit's (possibly stale)
-  `Result`; an **absent marker** trusts `deployed` only when `rc == 0` **AND** the systemd
+  that could make sudo read `systemctl` as a username); the outcome marker is **truly run-scoped
+  via an rm-succeeded gate** — at run start the wrapper `rm`s the marker and captures whether it is
+  now **provably absent** (`[ -e marker ]` is false); the marker is trusted only when that clear
+  succeeded, so any marker present afterward was written by THIS run. If a pre-existing marker could
+  NOT be removed (a root-owned marker), it is **not trusted at all** (degrade to `Result`+`rc`) —
+  no second-granularity mtime window; the marker token is **sanitized against sentinel spoofing**
+  (`head -n1` + `tr -cd 'A-Za-z0-9_-'`), so a marker containing a newline + a forged
+  `COMPILER_DEPLOY … token=deployed` line can neither inject a second sentinel line nor smuggle
+  metacharacters (the Rust parser also refuses to trust a stream carrying more than one sentinel
+  line); a non-zero `systemctl start` rc is classified `failed` regardless of the unit's (possibly
+  stale) `Result`; an **absent marker** trusts `deployed` only when `rc == 0` **AND** the systemd
   `Result` is `success` (a non-success `Result` → `failed` even with rc==0; an indeterminate
   `Result` → `unknown` — exit code alone is not enough); the **outer wall-clock timeout is strictly
   greater than the ssh connect budget**, so a connect/auth hang surfaces as `unreachable` (never
@@ -544,7 +548,9 @@ compiler_deploy(module, channel="stable", hosts="all")
   updater marker token is **never echoed** into structured output; an **unknown requested host** is
   reported by **count only** (never reflecting arbitrary caller input / ssh targets back); and
   `COMPILER_DEPLOY_SYSTEMCTL` is a **constrained** command whose **executable must be `systemctl`**
-  (bare tokens only, shell metacharacters rejected — not arbitrary shell). A malformed `COMPILER_DEPLOY_SYSTEMCTL` is an
+  with **no trailing subcommand** (the trigger owns `start <unit>`; only option flags may follow —
+  a verb like `reboot`/`stop` is rejected), bare tokens only, shell metacharacters rejected — not
+  arbitrary shell. A malformed `COMPILER_DEPLOY_SYSTEMCTL` is an
   **operator-config** failure, not a caller error: it surfaces **in the aggregate report** (every
   chosen host `failed` + a config-error note naming the problem, no raw value echoed) — identical
   for the direct tool and the auto-promote hook — rather than aborting with a bare error that
@@ -575,13 +581,16 @@ Config (all optional, no infra literals — S1): `COMPILER_DEPLOY_HOSTS` (shared
 `constellation-update@{module}.service`; `{module}`/`{channel}` substituted),
 `COMPILER_DEPLOY_SYSTEMCTL` (default `systemctl`; a **constrained** command — bare tokens
 `[A-Za-z0-9._/-]` whose **executable must be `systemctl`** after an optional leading `sudo`
-followed by ONLY the non-interactive flag `-n` (no other/argument-taking sudo flag),
-e.g. `sudo systemctl` / `sudo -n /usr/bin/systemctl`; shell metacharacters and a non-systemctl
-executable are rejected. A `sudo` prefix is auto-forced non-interactive with `-n`),
-`COMPILER_DEPLOY_RESULT_MARKER_TEMPLATE` (default
-`/opt/{module}/.deploy_result` — the updater's outcome-token file, trusted only when its mtime is
-≥ this run's run-reference file; absent/stale, the outcome degrades to the systemd `Result` + exit
-code, and `deployed` requires `rc == 0` AND `Result=success`),
+followed by ONLY the non-interactive flag `-n` (no other/argument-taking sudo flag), with **no
+trailing subcommand** (the trigger supplies `start <unit>`; only option flags may follow),
+e.g. `sudo systemctl` / `sudo -n /usr/bin/systemctl`; shell metacharacters, a non-systemctl
+executable, and a trailing verb are rejected. A `sudo` prefix is auto-forced non-interactive with
+`-n`), `COMPILER_DEPLOY_RESULT_MARKER_TEMPLATE` (default
+`/opt/{module}/.deploy_result` — the updater's outcome-token file, trusted only when the wrapper's
+pre-trigger `rm` cleared it (so any marker present after is this run's; a marker that could not be
+removed is not trusted), its first line sanitized to `[A-Za-z0-9_-]`; absent/uncleared, the outcome
+degrades to the systemd `Result` + exit code, and `deployed` requires `rc == 0` AND
+`Result=success`),
 `COMPILER_DEPLOY_TRIGGER_TIMEOUT_SECS` (default 300 — the post-connect RUN budget; larger than the
 BLD-08 marker read since the trigger runs the updater synchronously),
 `COMPILER_DEPLOY_CONNECT_TIMEOUT_SECS` (default 10 — the ssh `ConnectTimeout`; the outer
