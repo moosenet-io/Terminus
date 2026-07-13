@@ -146,21 +146,32 @@ impl Window {
 /// Parse `BUILD_WINDOW_HOURS` (e.g. `"22-24, 0-6"`) into windows. Bad/empty
 /// tokens are skipped; the whole thing empty ⇒ `[]` (no window).
 pub fn parse_windows(raw: &str) -> Vec<Window> {
-    raw.split(',')
-        .filter_map(|tok| {
-            let tok = tok.trim();
-            if tok.is_empty() {
-                return None;
-            }
-            let (a, b) = tok.split_once('-')?;
+    parse_windows_checked(raw).0
+}
+
+/// Like [`parse_windows`] but also reports whether any NON-EMPTY token was
+/// invalid (so the caller can warn — a typo that silently drops a window would
+/// otherwise make all heavy builds wait indefinitely). Returns `(windows,
+/// had_invalid_token)`.
+pub fn parse_windows_checked(raw: &str) -> (Vec<Window>, bool) {
+    let mut windows = Vec::new();
+    let mut had_invalid = false;
+    for tok in raw.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        let parsed = tok.split_once('-').and_then(|(a, b)| {
             let start: u8 = a.trim().parse().ok()?;
             let end: u8 = b.trim().parse().ok()?;
-            if start > 24 || end > 24 {
-                return None;
-            }
-            Some(Window { start, end })
-        })
-        .collect()
+            (start <= 24 && end <= 24).then_some(Window { start, end })
+        });
+        match parsed {
+            Some(w) => windows.push(w),
+            None => had_invalid = true,
+        }
+    }
+    (windows, had_invalid)
 }
 
 /// The pure heavy-dispatch decision: a heavy build may dispatch iff the fleet is
@@ -201,10 +212,21 @@ impl SchedulerConfig {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|n| *n >= 1)
             .unwrap_or(DEFAULT_PEEK);
+        let raw_windows = std::env::var(WINDOW_ENV).unwrap_or_default();
+        let (windows, had_invalid) = parse_windows_checked(&raw_windows);
+        // Degrade LOUDLY: a typo that drops windows would silently make every
+        // heavy build wait forever (absent a fleet-quiet signal).
+        if !raw_windows.trim().is_empty() && (had_invalid || windows.is_empty()) {
+            tracing::warn!(
+                "BUILD_WINDOW_HOURS ({:?}) contains invalid tokens or yielded no valid \
+                 windows; heavy builds will wait for a fleet-quiet signal until it is fixed",
+                raw_windows
+            );
+        }
         Self {
             primary_cap: env_u32(CAP_PRIMARY_ENV, DEFAULT_CAP),
             heavy_cap: env_u32(CAP_HEAVY_ENV, DEFAULT_CAP),
-            windows: parse_windows(&std::env::var(WINDOW_ENV).unwrap_or_default()),
+            windows,
             interval: Duration::from_secs(secs(INTERVAL_ENV, DEFAULT_INTERVAL_SECS)),
             peek_limit: peek,
             stale_after: {
@@ -404,6 +426,15 @@ impl Scheduler {
                     report.contended.push(job.job_id.clone());
                 }
                 Ok(ClaimOutcome::NotQueued) => {}
+                Ok(ClaimOutcome::Rejected) => {
+                    // A module-arg mismatch is a bug, not a normal contention;
+                    // skip it (never retried into a wrong lock) and surface it.
+                    tracing::error!(
+                        module = %job.module, job = %job.job_id,
+                        "compiler scheduler: claim rejected (module arg mismatched the job's \
+                         stored module) — skipping"
+                    );
+                }
                 Err(QueueError::Unavailable) => {
                     report.unavailable = true;
                     break;
@@ -600,6 +631,25 @@ mod tests {
             complete_retry_base: Duration::from_millis(1),
             complete_retry_max: 50,
         }
+    }
+
+    #[test]
+    fn malformed_window_tokens_are_flagged_for_a_loud_warning() {
+        // B5: a typo in BUILD_WINDOW_HOURS must be detectable (the operator is
+        // warned) — silently dropping windows would make heavy builds wait forever.
+        let (ws, had_invalid) = parse_windows_checked("22-24, junk, 30-40");
+        assert_eq!(ws, vec![Window { start: 22, end: 24 }]);
+        assert!(had_invalid, "invalid tokens must be reported");
+        // An all-invalid string yields zero windows AND flags invalid.
+        let (ws, had_invalid) = parse_windows_checked("nope, 99-100");
+        assert!(ws.is_empty() && had_invalid);
+        // A clean string flags nothing.
+        let (ws, had_invalid) = parse_windows_checked("22-24, 0-6");
+        assert_eq!(ws.len(), 2);
+        assert!(!had_invalid);
+        // Empty / whitespace-only is not "invalid" (just no window configured).
+        let (ws, had_invalid) = parse_windows_checked("  ,  ");
+        assert!(ws.is_empty() && !had_invalid);
     }
 
     #[test]

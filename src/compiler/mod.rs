@@ -1204,11 +1204,17 @@ fn validate_source_dir(
 /// no configured threshold) falls to the SAFE side — heavy — so a possibly-heavy
 /// build is never run immediately on the primary, skipping the window/cap.
 fn request_is_heavy(req: HostRequest, module: &str, fast: bool) -> bool {
+    // `fast` means "full-parallelism heavy build" per the tool schema — it forces
+    // the heavy (window + cap gated) path REGARDLESS of an explicit primary host
+    // request, so `fast` can never bypass the heavy window/cap (B2).
+    if fast {
+        return true;
+    }
     match req {
         HostRequest::Primary => false,
         HostRequest::Heavy => true,
         HostRequest::Auto => classify_heavy_auto(
-            fast,
+            false,
             // `.ok()` maps a read ERROR (present-but-unparsable) to `None`
             // (unknown ⇒ safe/heavy), and a successful read to `Some(Option<u64>)`.
             host::module_peak_mb(module).ok(),
@@ -1435,9 +1441,10 @@ pub fn register(registry: &mut ToolRegistry) {
         tracing::error!("compiler: failed to register compiler_request: {e}");
     }
     // Spawn the scheduler loop iff we're inside a tokio runtime AND Redis is
-    // configured. Guarded so a non-async caller (or a Redis-less deployment)
-    // simply skips scheduling — the tools still register and degrade loudly.
-    if tokio::runtime::Handle::try_current().is_ok() {
+    // configured — but AT MOST ONCE per process (registry setup / hot-swaps may
+    // call register() repeatedly; a second scheduler loop would double-dispatch
+    // and add Redis pressure). The once-guard claims the single spawn slot.
+    if tokio::runtime::Handle::try_current().is_ok() && claim_scheduler_spawn_slot() {
         if let Some(sched) = scheduler::Scheduler::from_env() {
             sched.spawn();
             tracing::info!("compiler: scheduler loop spawned (durable Redis queue)");
@@ -1448,6 +1455,19 @@ pub fn register(registry: &mut ToolRegistry) {
             );
         }
     }
+}
+
+/// Process-global once-guard for the scheduler loop: returns `true` for exactly
+/// ONE caller per process, `false` thereafter, so `register()` (which may run
+/// more than once) spawns at most one scheduler loop. Separated for unit testing.
+fn claim_scheduler_spawn_slot() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SPAWNED: AtomicBool = AtomicBool::new(false);
+    // Succeeds (returns Ok, i.e. true here) only for the first caller that flips
+    // false→true; all later callers see it already true and get false.
+    SPAWNED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -2012,5 +2032,24 @@ mod tests {
         // Explicit host requests are honored as-is.
         assert!(request_is_heavy(HostRequest::Heavy, "m", false));
         assert!(!request_is_heavy(HostRequest::Primary, "m", false));
+    }
+
+    #[test]
+    fn fast_forces_the_heavy_gated_path_even_with_explicit_primary() {
+        // B2: fast=true means a full-parallelism heavy build; it must route
+        // through the heavy (window+cap gated) path regardless of an explicit
+        // primary host request — never bypass the heavy window/cap.
+        assert!(request_is_heavy(HostRequest::Primary, "m", true));
+        assert!(request_is_heavy(HostRequest::Auto, "m", true));
+        assert!(request_is_heavy(HostRequest::Heavy, "m", true));
+    }
+
+    #[test]
+    fn scheduler_spawn_slot_is_claimed_at_most_once_per_process() {
+        // B3: the once-guard yields the spawn slot to exactly one caller, so a
+        // repeated register() cannot spawn multiple scheduler loops.
+        assert!(claim_scheduler_spawn_slot(), "first caller claims the spawn slot");
+        assert!(!claim_scheduler_spawn_slot(), "second caller is refused");
+        assert!(!claim_scheduler_spawn_slot(), "still refused thereafter");
     }
 }

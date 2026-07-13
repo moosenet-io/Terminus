@@ -40,13 +40,21 @@
 //!   for `compiler_status`) then self-expire; the dedupe pointer is cleared on
 //!   release (or repointed at a re-run).
 //!
-//! ## Completion is two durable steps (no double-BUILD on self-heal)
-//! `finalize` writes a durable terminal-outcome marker FIRST (token-fenced, does
-//! not release); `release` then frees the module lock + host slot. Both are
-//! idempotent and independently retried. The reconcile backstop distinguishes a
-//! job that is *finished but not yet released* (marker present ⇒ release only, NO
-//! rebuild) from one that *crashed mid-build* (no marker + stale ⇒ requeue) — so a
-//! worker that finished but could not release is never rebuilt.
+//! ## Completion is two individually-atomic idempotent transitions (vs AC2)
+//! Completion is realized as TWO transitions rather than one atomic Lua, a
+//! deliberate departure from the "single atomic complete" wording: `finalize`
+//! writes a durable terminal-outcome marker FIRST (one atomic, token-fenced Lua;
+//! does not release), then `release` frees the module lock + host slot (one
+//! atomic, token-fenced Lua; keys DERIVED from the job hash, never a caller arg).
+//! Each step is individually atomic + idempotent + independently retried. The two
+//! steps EXIST precisely to enable the no-rebuild self-heal: the reconcile
+//! backstop distinguishes a job that is *finished but not yet released* (marker
+//! present ⇒ release only, NO rebuild) from one that *crashed mid-build* (no
+//! marker + stale ⇒ requeue). A single atomic complete could not leave that
+//! observable "finished-but-unreleased" state, so a completion outage would
+//! otherwise force a wasteful rebuild. `finalize`/`release` are LOW-LEVEL; a
+//! direct caller should use the retrying [`QueueStore::complete`] (the scheduler
+//! drives the two steps directly with its own config-tuned retry).
 //!
 //! ## Discipline (S1/S7)
 //! No infra literals: every key is formed through [`Namespace::Queue`], the
@@ -83,6 +91,18 @@ fn retain_secs() -> i64 {
         .and_then(|v| v.trim().parse::<i64>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_RETAIN_SECS)
+}
+
+/// Bounded-backoff schedule for the queue-layer [`QueueStore::complete`] retry
+/// (the sanctioned entry for DIRECT callers — the scheduler uses its own
+/// config-tuned retry). Kept modest so an ad-hoc caller isn't a footgun on a
+/// brief Redis blip; reconcile is the ultimate backstop for a long outage.
+const COMPLETE_RETRY_MAX: u32 = 8;
+const COMPLETE_RETRY_BASE_MS: u64 = 25;
+
+/// Exponential backoff (capped) for attempt `n` of a `complete` retry.
+fn complete_backoff(n: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(COMPLETE_RETRY_BASE_MS.saturating_mul(1u64 << n.min(5)))
 }
 
 fn held_intent_ttl_secs() -> i64 {
@@ -209,6 +229,10 @@ pub enum ClaimOutcome {
     ModuleBusy,
     /// The target host is already at its concurrency cap.
     HostFull,
+    /// The call was REFUSED as malformed: the caller's `module` arg does not match
+    /// the job's own stored module (a buggy call that must never take a foreign
+    /// module lock — A2). The job is left untouched.
+    Rejected,
 }
 
 /// An in-flight (building) job — a "lease" — surfaced by `compiler_status`.
@@ -274,18 +298,21 @@ pub trait QueueStore: Send + Sync {
         cap: u32,
     ) -> Result<ClaimOutcome, QueueError>;
 
-    /// STEP 1 of completion: durably record the terminal outcome (a marker), the
-    /// FIRST thing a worker does when a build finishes. Token-fenced; does NOT
-    /// release the lock/slot. Idempotent + retryable. This marker is what lets
+    /// LOW-LEVEL step 1 of completion: durably record the terminal outcome (a
+    /// marker) in ONE atomic, token-fenced, idempotent Lua. Does NOT release the
+    /// lock/slot and does NOT retry. This marker is what lets
     /// [`reconcile`](Self::reconcile) release (never rebuild) a finished-but-
-    /// unreleased job.
+    /// unreleased job. **Direct callers should prefer [`complete`](Self::complete)**
+    /// (which retries); the scheduler drives `finalize`/`release` directly with its
+    /// own config-tuned retry.
     async fn finalize(&self, job_id: &str, state: JobState, token: &str) -> Result<(), QueueError>;
 
-    /// STEP 2 of completion: release the module lock + host slot (and honor a
-    /// re-run / clear the dedupe entry), recording the terminal state from the
-    /// `finalize` marker. `token` is the fence from [`ClaimOutcome::Claimed`]; a
-    /// mismatch (already released, or reconciled + re-claimed) is a safe no-op —
-    /// so this is idempotent and safe to RETRY across Redis outages.
+    /// LOW-LEVEL step 2 of completion: release the module lock + host slot (keys
+    /// DERIVED from the job hash's own module/host — A1), honor a re-run / clear
+    /// the dedupe entry, and record the terminal state from the `finalize` marker,
+    /// in ONE atomic, token-fenced, idempotent Lua. Does NOT retry. A token
+    /// mismatch (already released, or reconciled + re-claimed) is a safe no-op.
+    /// **Direct callers should prefer [`complete`](Self::complete).**
     async fn release(
         &self,
         job_id: &str,
@@ -294,11 +321,13 @@ pub trait QueueStore: Send + Sync {
         token: &str,
     ) -> Result<(), QueueError>;
 
-    /// Convenience: [`finalize`](Self::finalize) then [`release`](Self::release).
-    /// Callers that can tolerate losing the no-rebuild guarantee on a partial
-    /// failure may use this; the scheduler drives the two steps with independent
-    /// retries so a finalized-but-unreleased job is reconciled (released, not
-    /// rebuilt) rather than lost.
+    /// The SANCTIONED completion entry for a direct (non-scheduler) caller:
+    /// [`finalize`](Self::finalize) THEN [`release`](Self::release), each an
+    /// individually-atomic idempotent transition, EACH RETRIED with bounded
+    /// backoff so a Redis outage self-heals instead of surfacing raw. Recording
+    /// the outcome first preserves the no-rebuild guarantee: if `release` never
+    /// lands, reconcile finds the marker and releases (never rebuilds); the
+    /// scheduler uses the same two-step shape with its own tuned retry.
     async fn complete(
         &self,
         job_id: &str,
@@ -307,8 +336,26 @@ pub trait QueueStore: Send + Sync {
         state: JobState,
         token: &str,
     ) -> Result<(), QueueError> {
-        self.finalize(job_id, state, token).await?;
-        self.release(job_id, module, host, token).await
+        // STEP 1: record the outcome (retry until it lands).
+        let mut finalized = false;
+        for attempt in 0..COMPLETE_RETRY_MAX.max(1) {
+            if self.finalize(job_id, state, token).await.is_ok() {
+                finalized = true;
+                break;
+            }
+            tokio::time::sleep(complete_backoff(attempt)).await;
+        }
+        if !finalized {
+            return Err(QueueError::Unavailable);
+        }
+        // STEP 2: free the lock/slot (retry until it lands).
+        for attempt in 0..COMPLETE_RETRY_MAX.max(1) {
+            if self.release(job_id, module, host, token).await.is_ok() {
+                return Ok(());
+            }
+            tokio::time::sleep(complete_backoff(attempt)).await;
+        }
+        Err(QueueError::Unavailable)
     }
 
     /// Crash/restart backstop: sweep every `building` job. A job whose worker
@@ -368,13 +415,22 @@ fn job_key(job_id: &str) -> String {
 fn module_lock_prefix() -> String {
     Namespace::Queue.key("modulelock:")
 }
-/// Per-module serialization lock (held for the duration of a build).
+/// Per-module serialization lock (held for the duration of a build). The Lua now
+/// derives this key from the job hash's own module (A1/A2); retained as the
+/// canonical key constructor used by tests + the namespace assertion.
+#[allow(dead_code)]
 fn module_lock_key(module: &str) -> String {
     format!("{}{module}", module_lock_prefix())
 }
+/// The namespaced prefix for per-host in-flight sets. Passed to the Lua so
+/// `release`/`reconcile` can derive the host-slot key from the job hash's OWN
+/// stored `host` field (not a caller arg).
+fn host_set_prefix() -> String {
+    Namespace::Queue.key("inflight:")
+}
 /// Per-host set of in-flight job ids (its cardinality is the host's live load).
 fn host_set_key(host: HostRole) -> String {
-    Namespace::Queue.key(&format!("inflight:{}", host.as_str()))
+    format!("{}{}", host_set_prefix(), host.as_str())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -470,21 +526,28 @@ end
 return {id, 1}
 "#;
 
-/// Claim queued→building under the module lock + host cap. On success writes the
-/// claim FENCE token + `started_at` (the reconcile lease clock) into the job.
+/// Claim queued→building under the module lock + host cap. The module-lock key is
+/// DERIVED from the job hash's OWN stored module (A2), and the caller's `module`
+/// arg is VERIFIED against it — a mismatch is refused so a buggy call can never
+/// take a foreign module lock and break per-module serialization. On success
+/// writes the claim FENCE token + `started_at` (the reconcile lease clock).
 /// Returns `{ok(0/1), token_or_reason}`.
-/// KEYS: 1=zset 2=jobhash 3=modulelock 4=hostset
-/// ARGV: 1=id 2=cap 3=now 4=host 5=claim_token
+/// KEYS: 1=zset 2=jobhash 3=hostset
+/// ARGV: 1=id 2=cap 3=now 4=host 5=claim_token 6=modulelock_prefix 7=expected_module
 const CLAIM_LUA: &str = r#"
 local st=redis.call('HGET', KEYS[2], 'state')
 if st~='queued' then return {0, 'not_queued'} end
-if redis.call('EXISTS', KEYS[3])==1 then return {0, 'module_busy'} end
-if redis.call('SCARD', KEYS[4])>=tonumber(ARGV[2]) then return {0, 'host_full'} end
+local module=redis.call('HGET', KEYS[2], 'module')
+if not module then return {0, 'rejected'} end
+if ARGV[7] ~= '' and ARGV[7] ~= module then return {0, 'rejected'} end
+local lockkey=ARGV[6]..module
+if redis.call('EXISTS', lockkey)==1 then return {0, 'module_busy'} end
+if redis.call('SCARD', KEYS[3])>=tonumber(ARGV[2]) then return {0, 'host_full'} end
 redis.call('ZREM', KEYS[1], ARGV[1])
 redis.call('HSET', KEYS[2], 'state', 'building', 'host', ARGV[4],
   'started_at', ARGV[3], 'claim_token', ARGV[5])
-redis.call('SET', KEYS[3], ARGV[1])
-redis.call('SADD', KEYS[4], ARGV[1])
+redis.call('SET', lockkey, ARGV[1])
+redis.call('SADD', KEYS[3], ARGV[1])
 return {1, ARGV[5]}
 "#;
 
@@ -504,16 +567,26 @@ return 1
 /// Shared release body (Lua fragment). Frees the module lock + host slot, clears
 /// the fence token, re-enqueues exactly one re-run if flagged (else clears the
 /// dedupe pointer), and finalizes the hash state with the retain TTL. Requires
-/// these locals to be set by the including script: `jobkey lockkey hostkey
-/// zsetkey seqkey jobid nowv retainv rerun_id jobprefix dedupeprefix
-/// final_state`. Sets `rr_flag`(0/1) + `rr_id`. The dedupe key is derived from
-/// the job's OWN module@ref (no external pre-read), so release never wedges.
+/// these locals: `jobkey zsetkey seqkey jobid nowv retainv rerun_id jobprefix
+/// dedupeprefix lockprefix hostprefix final_state`. Sets `rr_flag`(0/1) + `rr_id`.
+///
+/// The module-lock key, host-slot key, AND dedupe key are ALL derived from the
+/// job hash's OWN stored `module`/`host`/`ref` fields (never a caller arg), so a
+/// release/reconcile called with a wrong or stale module/host still frees the
+/// CORRECT lock/slot and can never wedge the real ones (A1). The module lock is
+/// only deleted if it still points to THIS job (fence).
 const RELEASE_BODY: &str = r#"
-if redis.call('GET', lockkey)==jobid then redis.call('DEL', lockkey) end
-redis.call('SREM', hostkey, jobid)
-redis.call('HDEL', jobkey, 'claim_token')
 local module=redis.call('HGET', jobkey, 'module')
 local ref=redis.call('HGET', jobkey, 'ref')
+local host=redis.call('HGET', jobkey, 'host')
+if module then
+  local lockkey=lockprefix..module
+  if redis.call('GET', lockkey)==jobid then redis.call('DEL', lockkey) end
+end
+if host then
+  redis.call('SREM', hostprefix..host, jobid)
+end
+redis.call('HDEL', jobkey, 'claim_token')
 local dedupe=false
 if module and ref then dedupe=dedupeprefix..module..'@'..ref end
 local rerun=redis.call('HGET', jobkey, 'rerun')
@@ -541,29 +614,31 @@ redis.call('EXPIRE', jobkey, retainv)
 "#;
 
 /// RELEASE: free the lock/slot in ONE atomic, token-fenced, idempotent script.
+/// The module-lock + host-slot keys are DERIVED from the job hash's own stored
+/// module/host (A1), so a wrong/stale caller arg cannot free the wrong lock/slot.
 /// `final_state` comes from the durable `outcome` marker written by FINALIZE
 /// (defaulting to `done` if a caller releases without finalizing). A mismatched
 /// token (already released, or reconciled + re-claimed) is a safe no-op — it
 /// never double-frees the host slot (a SET SREM is a no-op the 2nd time) and
 /// never frees another claim's lock/slot. Returns `{rerun_queued(0/1), new_id}`.
-/// KEYS: 1=jobhash 2=modulelock 3=hostset 4=zset 5=seq
+/// KEYS: 1=jobhash 2=zset 3=seq
 /// ARGV: 1=id 2=now 3=retain_secs 4=rerun_candidate_id 5=job_prefix
-///       6=dedupe_prefix 7=claim_token
+///       6=dedupe_prefix 7=claim_token 8=modulelock_prefix 9=host_set_prefix
 fn release_lua() -> String {
     format!(
         r#"
 if redis.call('HGET', KEYS[1], 'claim_token') ~= ARGV[7] then return {{0, ''}} end
 local jobkey=KEYS[1]
-local lockkey=KEYS[2]
-local hostkey=KEYS[3]
-local zsetkey=KEYS[4]
-local seqkey=KEYS[5]
+local zsetkey=KEYS[2]
+local seqkey=KEYS[3]
 local jobid=ARGV[1]
 local nowv=ARGV[2]
 local retainv=tonumber(ARGV[3])
 local rerun_id=ARGV[4]
 local jobprefix=ARGV[5]
 local dedupeprefix=ARGV[6]
+local lockprefix=ARGV[8]
+local hostprefix=ARGV[9]
 local final_state=redis.call('HGET', jobkey, 'outcome') or 'done'
 {RELEASE_BODY}
 return {{rr_flag, rr_id}}
@@ -614,11 +689,12 @@ return out
 ///     free the lock/slot, clear the token, re-add to the dispatch ZSET (return `1`).
 ///   - otherwise (a live, fresh build) ⇒ untouched (return `0`).
 /// A crashed/finished worker can never permanently wedge the module lock + host
-/// slot, and a finished build is never rebuilt. The module lock + dedupe keys are
-/// derived in-Lua from the job's own module@ref via the prefix ARGVs.
-/// KEYS: 1=jobhash 2=hostset 3=zset 4=seq
+/// slot, and a finished build is never rebuilt. The module lock, host-slot, and
+/// dedupe keys are ALL derived in-Lua from the job hash's own module/host/ref via
+/// the prefix ARGVs (A1) — never a caller arg.
+/// KEYS: 1=jobhash 2=hostset(enumerated) 3=zset 4=seq
 /// ARGV: 1=id 2=now 3=stale_ms 4=modulelock_prefix 5=retain 6=rerun_id
-///       7=job_prefix 8=dedupe_prefix
+///       7=job_prefix 8=dedupe_prefix 9=host_set_prefix
 fn reconcile_lua() -> String {
     format!(
         r#"
@@ -628,6 +704,8 @@ local zsetkey=KEYS[3]
 local seqkey=KEYS[4]
 local jobid=ARGV[1]
 local nowv=ARGV[2]
+local lockprefix=ARGV[4]
+local hostprefix=ARGV[9]
 local st=redis.call('HGET', jobkey, 'state')
 if st~='building' then
   -- Not building (already released/gone) → ensure it isn't lingering in the host
@@ -635,12 +713,10 @@ if st~='building' then
   redis.call('SREM', hostkey, jobid)
   return 0
 end
-local module=redis.call('HGET', jobkey, 'module')
-local lockkey=''
-if module then lockkey=ARGV[4]..module end
 local outcome=redis.call('HGET', jobkey, 'outcome')
 if outcome then
-  -- FINISHED but not yet released → release only, NO rebuild.
+  -- FINISHED but not yet released → release only, NO rebuild. RELEASE_BODY
+  -- derives the module-lock + host-slot keys from the hash's own fields.
   local retainv=tonumber(ARGV[5])
   local rerun_id=ARGV[6]
   local jobprefix=ARGV[7]
@@ -654,7 +730,14 @@ local started=tonumber(redis.call('HGET', jobkey, 'started_at') or '0')
 if (tonumber(nowv) - started) < tonumber(ARGV[3]) then
   return 0
 end
-if lockkey~='' and redis.call('GET', lockkey)==jobid then redis.call('DEL', lockkey) end
+-- Derive the module lock + host slot from the hash's OWN fields.
+local module=redis.call('HGET', jobkey, 'module')
+if module then
+  local lockkey=lockprefix..module
+  if redis.call('GET', lockkey)==jobid then redis.call('DEL', lockkey) end
+end
+local host=redis.call('HGET', jobkey, 'host')
+if host then redis.call('SREM', hostprefix..host, jobid) end
 redis.call('SREM', hostkey, jobid)
 redis.call('HDEL', jobkey, 'claim_token')
 redis.call('HSET', jobkey, 'state', 'queued')
@@ -770,14 +853,10 @@ impl QueueStore for RedisQueue {
         host: HostRole,
         cap: u32,
     ) -> Result<ClaimOutcome, QueueError> {
-        let (zset, jk, lock, hset) = (
-            zset_key(),
-            job_key(job_id),
-            module_lock_key(module),
-            host_set_key(host),
-        );
+        let (zset, jk, hset) = (zset_key(), job_key(job_id), host_set_key(host));
         let (id, now, host_s) = (job_id.to_string(), now_ms(), host.as_str().to_string());
         let token = uuid::Uuid::new_v4().simple().to_string();
+        let (lock_prefix, expected_module) = (module_lock_prefix(), module.to_string());
         let cap = cap.max(1) as i64;
         let script = redis::Script::new(CLAIM_LUA);
         let out: Result<(i64, String), ()> = self
@@ -786,13 +865,14 @@ impl QueueStore for RedisQueue {
                 script
                     .key(zset)
                     .key(jk)
-                    .key(lock)
                     .key(hset)
                     .arg(id)
                     .arg(cap)
                     .arg(now)
                     .arg(host_s)
                     .arg(token)
+                    .arg(lock_prefix)
+                    .arg(expected_module)
                     .invoke_async::<_, (i64, String)>(&mut conn)
                     .await
             })
@@ -802,6 +882,7 @@ impl QueueStore for RedisQueue {
             Ok((_, reason)) => Ok(match reason.as_str() {
                 "module_busy" => ClaimOutcome::ModuleBusy,
                 "host_full" => ClaimOutcome::HostFull,
+                "rejected" => ClaimOutcome::Rejected,
                 _ => ClaimOutcome::NotQueued,
             }),
             Err(()) => Err(QueueError::Unavailable),
@@ -834,29 +915,24 @@ impl QueueStore for RedisQueue {
         host: HostRole,
         token: &str,
     ) -> Result<(), QueueError> {
-        // ONE atomic script — no external pre-read. The dedupe key is derived
-        // INSIDE Lua from the job hash's own module@ref, so a Redis-down release
-        // fails as a whole with the lock/slot unchanged (the caller retries)
-        // rather than half-releasing and wedging them. Lock + host set keys come
-        // from the caller's own `module`/`host` args (no read needed).
-        let (jk, lock, hset, zset, seq) = (
-            job_key(job_id),
-            module_lock_key(module),
-            host_set_key(host),
-            zset_key(),
-            seq_key(),
-        );
+        // The `module`/`host` args are advisory only — the module-lock + host-slot
+        // keys are DERIVED inside the Lua from the job hash's OWN stored fields
+        // (A1), so a wrong/stale caller arg can never free the wrong lock/slot.
+        let _ = (module, host);
+        // ONE atomic script — no external pre-read (dedupe/lock/host all derived
+        // in-Lua from the hash), so a Redis-down release fails as a whole with the
+        // lock/slot unchanged (the caller retries) rather than half-releasing.
+        let (jk, zset, seq) = (job_key(job_id), zset_key(), seq_key());
         let (id, now, retain) = (job_id.to_string(), now_ms(), retain_secs());
         let rerun_id = uuid::Uuid::new_v4().simple().to_string();
         let (jp, dedupe_prefix, token) = (job_prefix(), dedupe_prefix(), token.to_string());
+        let (lock_prefix, host_prefix) = (module_lock_prefix(), host_set_prefix());
         let script = redis::Script::new(&release_lua());
         let out: Result<(i64, String), ()> = self
             .backend
             .with_conn(Namespace::Queue, |mut conn| async move {
                 script
                     .key(jk)
-                    .key(lock)
-                    .key(hset)
                     .key(zset)
                     .key(seq)
                     .arg(id)
@@ -866,6 +942,8 @@ impl QueueStore for RedisQueue {
                     .arg(jp)
                     .arg(dedupe_prefix)
                     .arg(token)
+                    .arg(lock_prefix)
+                    .arg(host_prefix)
                     .invoke_async::<_, (i64, String)>(&mut conn)
                     .await
             })
@@ -879,8 +957,13 @@ impl QueueStore for RedisQueue {
     ) -> Result<ReconcileReport, QueueError> {
         let now = now_ms();
         let stale_ms = stale_after.as_millis() as i64;
-        let (lock_prefix, jp, dedupe_prefix, retain) =
-            (module_lock_prefix(), job_prefix(), dedupe_prefix(), retain_secs());
+        let (lock_prefix, host_prefix, jp, dedupe_prefix, retain) = (
+            module_lock_prefix(),
+            host_set_prefix(),
+            job_prefix(),
+            dedupe_prefix(),
+            retain_secs(),
+        );
         let mut report = ReconcileReport::default();
         for host in [HostRole::Primary, HostRole::Heavy] {
             // Enumerate the host's in-flight ids (the reconcile candidates). A
@@ -899,15 +982,16 @@ impl QueueStore for RedisQueue {
             for id in ids {
                 let (jk, hset, zset, seq) =
                     (job_key(&id), host_set_key(host), zset_key(), seq_key());
-                let (id_a, lp, rerun_id) = (
+                let (id_a, lp, hp, rerun_id) = (
                     id.clone(),
                     lock_prefix.clone(),
+                    host_prefix.clone(),
                     uuid::Uuid::new_v4().simple().to_string(),
                 );
                 let (jp, dp) = (jp.clone(), dedupe_prefix.clone());
-                // The module lock + dedupe keys are derived in-Lua from the job
-                // hash's own module@ref via the prefix ARGVs (as `release` does),
-                // so only the 4 fixed keys are passed.
+                // The module-lock, host-slot, and dedupe keys are all derived
+                // in-Lua from the job hash's own fields via the prefix ARGVs (as
+                // `release` does), so only the 4 fixed keys are passed.
                 let script = redis::Script::new(&reconcile_lua());
                 let out: Result<i64, ()> = self
                     .backend
@@ -925,6 +1009,7 @@ impl QueueStore for RedisQueue {
                             .arg(rerun_id)
                             .arg(jp)
                             .arg(dp)
+                            .arg(hp)
                             .invoke_async::<_, i64>(&mut conn)
                             .await
                     })
@@ -1114,23 +1199,34 @@ pub(crate) mod fake {
     }
 
     /// The shared release body (mirrors `RELEASE_BODY` Lua): free the module lock
-    /// + host slot, clear the fence token, honor a re-run (else clear dedupe), set
-    /// the terminal state. Assumes the caller holds the state lock.
-    fn release_locked(s: &mut State, job_id: &str, module: &str, host: HostRole, final_state: &str) {
-        if s.module_lock.get(module).map(String::as_str) == Some(job_id) {
-            s.module_lock.remove(module);
+    /// + host slot — both derived from the job's OWN stored module/host (A1, never
+    /// a caller arg) — clear the fence token, honor a re-run (else clear dedupe),
+    /// set the terminal state. Assumes the caller holds the state lock.
+    fn release_locked(s: &mut State, job_id: &str, final_state: &str) {
+        let done = match s.jobs.get(job_id) {
+            Some(j) => (
+                j.module.clone(),
+                j.git_ref.clone(),
+                j.host,
+                j.prank,
+                j.heavy,
+                j.rerun,
+            ),
+            None => return,
+        };
+        let (dmod, dref, dhost, dprank, dheavy, rerun) = done;
+        // Derive the module lock + host slot from the STORED fields.
+        if s.module_lock.get(&dmod).map(String::as_str) == Some(job_id) {
+            s.module_lock.remove(&dmod);
         }
-        if let Some(v) = s.host_inflight.get_mut(host.as_str()) {
-            v.retain(|id| id != job_id);
+        if let Some(h) = dhost {
+            if let Some(v) = s.host_inflight.get_mut(h.as_str()) {
+                v.retain(|id| id != job_id);
+            }
         }
         if let Some(j) = s.jobs.get_mut(job_id) {
             j.claim_token = None;
         }
-        let done = match s.jobs.get(job_id) {
-            Some(j) => (j.module.clone(), j.git_ref.clone(), j.prank, j.heavy, j.rerun),
-            None => return,
-        };
-        let (dmod, dref, dprank, dheavy, rerun) = done;
         let dk = format!("{dmod}@{dref}");
         if rerun {
             // Re-enqueue EXACTLY one follow-up job for the same module@ref.
@@ -1276,11 +1372,15 @@ pub(crate) mod fake {
             if s.down {
                 return Err(QueueError::Unavailable);
             }
-            match s.jobs.get(job_id).map(|j| j.state.clone()) {
-                Some(st) if st == "queued" => {}
-                _ => return Ok(ClaimOutcome::NotQueued),
+            // Derive the module from the job's OWN stored field; verify the arg.
+            let stored_module = match s.jobs.get(job_id) {
+                Some(j) if j.state == "queued" => j.module.clone(),
+                Some(_) | None => return Ok(ClaimOutcome::NotQueued),
+            };
+            if !module.is_empty() && module != stored_module {
+                return Ok(ClaimOutcome::Rejected);
             }
-            if s.module_lock.contains_key(module) {
+            if s.module_lock.contains_key(&stored_module) {
                 return Ok(ClaimOutcome::ModuleBusy);
             }
             let live = s.host_inflight.get(host.as_str()).map(Vec::len).unwrap_or(0);
@@ -1296,7 +1396,7 @@ pub(crate) mod fake {
                 j.started_at = now_ms();
                 j.claim_token = Some(token.clone());
             }
-            s.module_lock.insert(module.to_string(), job_id.to_string());
+            s.module_lock.insert(stored_module, job_id.to_string());
             s.host_inflight
                 .entry(host.as_str())
                 .or_default()
@@ -1352,12 +1452,15 @@ pub(crate) mod fake {
                 Some(t) if t == token => {}
                 _ => return Ok(()),
             }
+            // `module`/`host` args are advisory — release derives keys from the
+            // job's OWN stored fields (A1).
+            let _ = (module, host);
             let final_state = s
                 .jobs
                 .get(job_id)
                 .and_then(|j| j.outcome.clone())
                 .unwrap_or_else(|| "done".into());
-            release_locked(&mut s, job_id, module, host, &final_state);
+            release_locked(&mut s, job_id, &final_state);
             Ok(())
         }
 
@@ -1387,11 +1490,10 @@ pub(crate) mod fake {
                 })
                 .collect();
             let mut report = ReconcileReport::default();
-            for (id, module, host, outcome, started) in building {
-                let host = host.unwrap_or(HostRole::Primary);
+            for (id, module, _host, outcome, started) in building {
                 if let Some(outcome) = outcome {
                     // FINISHED but not released → release only, NO rebuild.
-                    release_locked(&mut s, &id, &module, host, &outcome);
+                    release_locked(&mut s, &id, &outcome);
                     report.released.push(id);
                 } else if (now - started) >= stale_ms {
                     // Crashed mid-build → requeue.
@@ -1654,22 +1756,84 @@ mod tests {
         let j1 = q.enqueue(&req("m1", "r1", Priority::Normal, false)).await.unwrap();
         let j1b = q.enqueue(&req("m1", "rB", Priority::Normal, false)).await.unwrap();
         let tok1 = claim_ok(&q, &j1.job_id, "m1", HostRole::Primary, 1).await;
-        // Redis goes down at completion time → the whole release fails; NOTHING
-        // is partially released (the module lock is still held).
+        // Redis goes down at release time → the LOW-LEVEL release fails as a whole;
+        // NOTHING is partially released (the module lock is still held). (Uses the
+        // low-level `release` so we test the single-shot atomicity, not the
+        // retrying `complete`.)
+        q.finalize(&j1.job_id, JobState::Done, &tok1).await.unwrap();
         q.set_down(true);
         assert_eq!(
-            q.complete(&j1.job_id, "m1", HostRole::Primary, JobState::Done, &tok1).await,
+            q.release(&j1.job_id, "m1", HostRole::Primary, &tok1).await,
             Err(QueueError::Unavailable)
         );
         q.set_down(false);
         assert_eq!(
             q.claim(&j1b.job_id, "m1", HostRole::Primary, 1).await.unwrap(),
             ClaimOutcome::ModuleBusy,
-            "a failed (whole) completion left the lock intact — no half-release wedge"
+            "a failed (whole) release left the lock intact — no half-release wedge"
         );
-        // A later successful completion cleanly releases, and the retry claims.
-        q.complete(&j1.job_id, "m1", HostRole::Primary, JobState::Done, &tok1).await.unwrap();
+        // A later successful release cleanly frees, and the retry claims.
+        q.release(&j1.job_id, "m1", HostRole::Primary, &tok1).await.unwrap();
         claim_ok(&q, &j1b.job_id, "m1", HostRole::Primary, 1).await;
+    }
+
+    #[tokio::test]
+    async fn release_with_wrong_module_and_host_args_still_frees_the_correct_lock_and_slot() {
+        // A1: release/complete derive the lock+host keys from the job's OWN stored
+        // fields, so a wrong/stale caller arg still frees the CORRECT ones.
+        let q = InMemoryQueue::new();
+        let j = q.enqueue(&req("m1", "r1", Priority::Normal, false)).await.unwrap();
+        let contender = q.enqueue(&req("m1", "r2", Priority::Normal, false)).await.unwrap();
+        let tok = claim_ok(&q, &j.job_id, "m1", HostRole::Primary, 1).await;
+        assert_eq!(q.inflight_count(HostRole::Primary), 1);
+        q.finalize(&j.job_id, JobState::Done, &tok).await.unwrap();
+        // Release with a WRONG module ("bogus") and WRONG host (Heavy). Because the
+        // keys are derived from the hash, this still frees m1's lock + the primary
+        // slot — and does NOT touch the heavy slot.
+        q.release(&j.job_id, "bogus", HostRole::Heavy, &tok).await.unwrap();
+        assert_eq!(q.inflight_count(HostRole::Primary), 0, "correct (primary) slot freed");
+        assert_eq!(q.inflight_count(HostRole::Heavy), 0, "wrong (heavy) slot untouched");
+        // The m1 module lock was freed → the same-module contender can now claim.
+        assert!(matches!(
+            q.claim(&contender.job_id, "m1", HostRole::Primary, 1).await.unwrap(),
+            ClaimOutcome::Claimed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn claim_with_mismatched_module_arg_is_rejected_and_takes_no_foreign_lock() {
+        // A2: a claim whose module arg disagrees with the job's stored module is
+        // REFUSED — it must never take a foreign module lock.
+        let q = InMemoryQueue::new();
+        let j = q.enqueue(&req("m1", "r1", Priority::Normal, false)).await.unwrap();
+        assert_eq!(
+            q.claim(&j.job_id, "not-m1", HostRole::Primary, 4).await.unwrap(),
+            ClaimOutcome::Rejected,
+            "a mismatched module arg is refused"
+        );
+        // It took no lock under the wrong name, and the job is still queued: a
+        // correct claim still succeeds and same-module serialization holds.
+        assert_eq!(q.state_of(&j.job_id).as_deref(), Some("queued"));
+        let j2 = q.enqueue(&req("m1", "r2", Priority::Normal, false)).await.unwrap();
+        claim_ok(&q, &j.job_id, "m1", HostRole::Primary, 4).await;
+        assert_eq!(
+            q.claim(&j2.job_id, "m1", HostRole::Primary, 4).await.unwrap(),
+            ClaimOutcome::ModuleBusy,
+            "the correct module lock still serializes same-module builds"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_caller_complete_self_heals_across_a_release_outage() {
+        // A3/B1: the retrying `complete` (sanctioned direct-caller entry) rides out
+        // a brief release outage and frees the slot without the caller retrying.
+        let q = InMemoryQueue::new();
+        let j = q.enqueue(&req("m1", "r1", Priority::Normal, false)).await.unwrap();
+        let tok = claim_ok(&q, &j.job_id, "m1", HostRole::Primary, 1).await;
+        q.fail_releases(2); // first two releases fail, then succeed
+        q.complete(&j.job_id, "m1", HostRole::Primary, JobState::Done, &tok).await.unwrap();
+        assert_eq!(q.inflight_count(HostRole::Primary), 0, "self-healed: slot freed");
+        assert_eq!(q.state_of(&j.job_id).as_deref(), Some("done"));
     }
 
     #[tokio::test]
@@ -1905,6 +2069,19 @@ mod tests {
         let keys: Vec<String> = raw(&backend, "KEYS", &["queue:*".into()]).await;
         assert!(!keys.is_empty() && keys.iter().all(|k| k.starts_with("queue:")));
 
+        // 2b) DURABILITY (A4): the durable DB the queue relies on must be
+        // `noeviction` so a queued/in-flight build is never evicted under memory
+        // pressure. Prove it against the live server (the deploy sets this), not
+        // just via namespace routing.
+        let policy: Vec<String> =
+            raw(&backend, "CONFIG", &["GET".into(), "maxmemory-policy".into()]).await;
+        assert_eq!(policy.get(1).map(String::as_str), Some("noeviction"),
+            "the durable queue DB must run under a noeviction maxmemory-policy");
+        // And confirm the queue keeps working under that policy (a queued job
+        // survives) — the reliance is real, not incidental.
+        let _: () = raw(&backend, "CONFIG", &["SET".into(), "maxmemory-policy".into(), "noeviction".into()]).await;
+        assert_eq!(q.peek(10).await.unwrap().len(), 1, "queued job persists under noeviction");
+
         // 3) Claim writes a fence token + module lock; a 2nd claim is ModuleBusy.
         let tok = match q.claim(&a.job_id, "chord", HostRole::Primary, 1).await.unwrap() {
             ClaimOutcome::Claimed { token } => token,
@@ -1962,6 +2139,43 @@ mod tests {
         let ttl_dedupe: i64 = raw(&backend, "TTL", &[dedupe_key]).await;
         assert_eq!(ttl_job, -1, "promoted job must be persistent (durable)");
         assert_eq!(ttl_dedupe, -1, "promoted dedupe pointer must be persistent");
+    }
+
+    #[tokio::test]
+    async fn redis_concurrent_claim_serializes_same_module() {
+        // B4: two schedulers race to claim TWO DIFFERENT refs of the SAME module,
+        // against the real CLAIM_LUA — exactly one wins, the other is ModuleBusy
+        // (per-module serialization holds under real concurrency).
+        let Some(server) = EphemeralRedis::start() else {
+            eprintln!("SKIP redis_concurrent_claim: redis-server not installed");
+            return;
+        };
+        let backend =
+            RedisBackend::build(&server.url(), None, 0, 1, Duration::from_millis(500)).unwrap();
+        let _: () = raw(&backend, "FLUSHALL", &[]).await;
+        let q = Arc::new(RedisQueue::new(backend.clone()));
+        let mk = |r: &str| JobRequest {
+            module: "chord".into(),
+            git_ref: r.into(),
+            priority: Priority::Normal,
+            heavy: false,
+            ready: true,
+        };
+        let j1 = q.enqueue(&mk("r1")).await.unwrap();
+        let j2 = q.enqueue(&mk("r2")).await.unwrap();
+        // Race both claims concurrently.
+        let (qa, qb) = (q.clone(), q.clone());
+        let (ia, ib) = (j1.job_id.clone(), j2.job_id.clone());
+        let ta = tokio::spawn(async move { qa.claim(&ia, "chord", HostRole::Primary, 4).await.unwrap() });
+        let tb = tokio::spawn(async move { qb.claim(&ib, "chord", HostRole::Primary, 4).await.unwrap() });
+        let (ra, rb) = (ta.await.unwrap(), tb.await.unwrap());
+        let claimed = [&ra, &rb]
+            .iter()
+            .filter(|o| matches!(o, ClaimOutcome::Claimed { .. }))
+            .count();
+        let busy = [&ra, &rb].iter().filter(|o| matches!(o, ClaimOutcome::ModuleBusy)).count();
+        assert_eq!(claimed, 1, "exactly one racer claims the module: {ra:?} / {rb:?}");
+        assert_eq!(busy, 1, "the other is serialized out (ModuleBusy): {ra:?} / {rb:?}");
     }
 
     #[test]

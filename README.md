@@ -242,10 +242,23 @@ compiler_request(module, ref, priority="normal", host="auto", fast=false, ready=
   lease around the build; that coordination is a clean trait seam (`IdleCoordinator`), a
   no-op by default, wired for real by BLD-11 — and touched only for a heavy build actually
   being dispatched.
+- **Lock/host keys derived from the job, module verified** — `claim` derives the per-module
+  lock key from the job hash's OWN stored module and VERIFIES the caller's module arg against
+  it (a mismatch is refused), so a buggy call can never take a foreign lock and break
+  serialization. `release`/`reconcile` likewise derive the module-lock + host-slot keys from
+  the job's own stored fields, so a wrong/stale caller arg still frees the correct lock+slot
+  and can never wedge the real ones.
+- **`fast` cannot bypass the heavy path** — `fast=true` forces the heavy (window+cap gated)
+  path even with an explicit `host=primary`, matching the tool schema.
+- **One scheduler loop per process** — `register()` spawns the scheduler behind a process
+  once-guard, so repeated registry setup / hot-swaps never start multiple dispatch loops.
 - **No permanent wedge, no double-build on a completion outage** — the claim writes a fence
-  token; completion is two durable, token-fenced, idempotent atomic steps: `finalize`
-  (record the terminal outcome FIRST) then `release` (free the lock/slot). Both are RETRIED
-  with bounded backoff (`BUILD_COMPLETE_RETRY_BASE_MS`/`BUILD_COMPLETE_RETRY_MAX`). As a
+  token; completion is two individually-atomic, token-fenced, idempotent transitions:
+  `finalize` (record the terminal outcome FIRST) then `release` (free the lock/slot) — a
+  deliberate two-step design (vs one atomic Lua) that is what lets reconcile tell a finished
+  job from a crashed one. The queue-layer `complete()` is the sanctioned retrying entry for
+  direct callers; the scheduler drives the two steps with its own bounded backoff
+  (`BUILD_COMPLETE_RETRY_BASE_MS`/`BUILD_COMPLETE_RETRY_MAX`). As a
   crash/restart backstop, each tick RECONCILES `building` jobs whose claim is older than
   `BUILD_STALE_BUILDING_SECS` (clamped UP to a safe floor of max-build-timeout + retry window,
   so a live build is never reconciled): a job that FINISHED (marker present) but never
@@ -264,8 +277,10 @@ compiler_request(module, ref, priority="normal", host="auto", fast=false, ready=
   arrival while a build is in flight records intent but does NOT schedule a re-run — only a
   `ready=true` does.
 - The durable-queue binding is enforced in code (a test asserts `Namespace::Queue` routes to
-  the `noeviction` DB), and the actual Lua scripts have a real-Redis contract test that spins
-  an ephemeral `redis-server` (auto-skips where none is installed).
+  the durable DB), and the actual Lua scripts have a real-Redis contract test that spins an
+  ephemeral `redis-server` (auto-skips where none is installed) — it also asserts the durable
+  DB runs under a `noeviction` `maxmemory-policy` and that concurrent claims of the same
+  module serialize to exactly one winner.
 - **`compiler_status`** — the status tool is a separate item (BLD-08); it renders
   `compiler::render_queue_status` over the queue snapshot (queue depth, queued jobs,
   in-flight leases per host).
