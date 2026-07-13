@@ -20,6 +20,7 @@
 //! literal in source. Nothing token/URL-with-creds shaped is read outside the
 //! sccache secret wiring, and the parsed password never logs.
 
+pub mod deploy; // BLD-13: compiler_deploy — trigger the updater fleet-wide on publish/promote
 pub mod events;
 pub mod host;
 pub mod idle_lease; // BLD-11: compiler↔idle-mode lease (Chord+MINT idle around heavy builds)
@@ -1650,7 +1651,18 @@ impl RustTool for CompilerRelease {
                         },
                     )
                 };
-                let structured = json!({
+                // BLD-13: trigger-on-publish. When `COMPILER_AUTO_DEPLOY` is set AND
+                // this promote actually flipped `current` (not a no-op), fire the
+                // fleet-wide updater trigger so the change lands in seconds instead
+                // of waiting for the nightly timer. Best-effort — never fails or
+                // masks the promote; the deploy report is ATTACHED to the result.
+                let auto_deploy = if out.already_current {
+                    None
+                } else {
+                    deploy::auto_trigger_after_promote(&module, &to_channel).await
+                };
+
+                let mut structured = json!({
                     "op": "promote",
                     "module": out.module,
                     "sha256": out.sha256,
@@ -1662,6 +1674,9 @@ impl RustTool for CompilerRelease {
                     "pruned": out.pruned,
                     "current_path": out.current_path.to_string_lossy(),
                 });
+                if let (Some(dep), Some(obj)) = (auto_deploy, structured.as_object_mut()) {
+                    obj.insert("auto_deploy".into(), dep);
+                }
                 Ok(ToolOutput::with_structured(text, structured))
             }
             other => Err(ToolError::InvalidArgument(format!(
@@ -2173,6 +2188,8 @@ pub fn register(registry: &mut ToolRegistry) {
         tracing::error!("compiler: failed to register compiler_release: {e}");
     }
     status::register(registry);
+    // BLD-13: the trigger-on-publish fleet fan-out (compiler_deploy).
+    deploy::register(registry);
     // Spawn the scheduler loop iff we're inside a tokio runtime AND Redis is
     // configured — but AT MOST ONCE per process. CRUCIALLY, the once-slot is
     // claimed ONLY when the scheduler actually spawns: if `register()` runs before

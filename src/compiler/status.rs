@@ -99,6 +99,16 @@ pub fn parse_deploy_hosts(s: &str) -> Vec<DeployHost> {
         .collect()
 }
 
+/// The configured deploy hosts (`COMPILER_DEPLOY_HOSTS`), or empty when unset.
+/// Shared with BLD-13 (`compiler_deploy`) so the read matrix (this module) and the
+/// deploy TRIGGER fan out over the exact same operator-configured host set — a
+/// single source of truth for "which hosts the fleet deploys to".
+pub fn configured_deploy_hosts() -> Vec<DeployHost> {
+    env_nonempty(COMPILER_DEPLOY_HOSTS)
+        .map(|s| parse_deploy_hosts(&s))
+        .unwrap_or_default()
+}
+
 fn marker_template() -> String {
     env_nonempty(COMPILER_DEPLOY_MARKER_TEMPLATE)
         .unwrap_or_else(|| DEFAULT_MARKER_TEMPLATE.to_string())
@@ -414,19 +424,32 @@ fn shell_quote(s: &str) -> String {
 /// credentials — this reuses whatever ssh access the build reach-path relies on.
 pub fn render_marker_read_argv(ssh_target: &str, marker: &str, timeout_secs: u64) -> Vec<String> {
     let remote = format!("cat -- {} 2>/dev/null || true", shell_quote(marker));
+    sanctioned_ssh_argv(ssh_target, &remote, timeout_secs)
+}
+
+/// The SINGLE authoritative non-mutating ssh reach the compiler uses to touch a
+/// deploy host — shared by BLD-08 (`compiler_status`, the read/marker probe) AND
+/// BLD-13 (`compiler_deploy`, the updater trigger) so there is exactly ONE
+/// definition of the sanctioned option set (if it changes, both move together; no
+/// drift). Options: `BatchMode=yes` (never prompt) + `ConnectTimeout` (bound a dead
+/// host) + `StrictHostKeyChecking=no` + `UserKnownHostsFile=/dev/null` (a first-seen
+/// host can NEVER mutate the user's `known_hosts`). No new credentials — it reuses
+/// whatever ambient ssh key the reach path already relies on. `remote_cmd` is the
+/// (already-quoted-internally) remote shell command to run.
+pub fn sanctioned_ssh_argv(ssh_target: &str, remote_cmd: &str, connect_timeout_secs: u64) -> Vec<String> {
     vec![
         "ssh".to_string(),
         "-o".to_string(),
         "BatchMode=yes".to_string(),
         "-o".to_string(),
-        format!("ConnectTimeout={timeout_secs}"),
-        // Read-only probe: never write known_hosts.
+        format!("ConnectTimeout={connect_timeout_secs}"),
+        // Never write known_hosts (a first-seen host has no side effect).
         "-o".to_string(),
         "StrictHostKeyChecking=no".to_string(),
         "-o".to_string(),
         "UserKnownHostsFile=/dev/null".to_string(),
         ssh_target.to_string(),
-        remote,
+        remote_cmd.to_string(),
     ]
 }
 
