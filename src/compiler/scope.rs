@@ -197,17 +197,29 @@ pub fn scope_unit_name(module: &str, git_ref: &str) -> String {
 /// Returns `Ok(())` when `target_dir` is safe, `Err(InvalidArgument)` when it is
 /// inside `dataset_root` (the file-level NFS dir).
 pub fn validate_target_dir(target_dir: &Path, dataset_root: &Path) -> Result<(), ToolError> {
-    // Compare on a lexical, normalized basis (both may be non-existent at check
-    // time). Any target dir that is the dataset root or nested under it is
-    // rejected; the dataset root is for source-staging + sccache + artifact
-    // publish ONLY, never a live cargo target.
-    let t = normalize(target_dir);
-    let root = normalize(dataset_root);
-    if t == root || t.starts_with(&format!("{root}/")) {
+    // Compare on a LEXICALLY-normalized basis (both may be non-existent at check
+    // time — so we resolve `.`/`..` textually, never via canonicalize which needs
+    // the path to exist). Any target dir that lexically resolves to the dataset
+    // root or nested under it is rejected; the dataset root is for source-staging
+    // + sccache + artifact publish ONLY, never a live cargo target.
+    let t = lexical_normalize(target_dir);
+    let root = lexical_normalize(dataset_root);
+    // Containment: identical, or `t` begins with `root` + a path boundary. The
+    // trailing-slash form prevents a false match on a sibling that merely shares
+    // a string prefix (e.g. `/data/build-x` vs root `/data/build`). `root == "/"`
+    // is handled specially (every absolute path is nested under it).
+    let contained = t == root
+        || if root == "/" {
+            t.starts_with('/')
+        } else {
+            t.starts_with(&format!("{root}/"))
+        };
+    if contained {
         return Err(ToolError::InvalidArgument(format!(
-            "CARGO_TARGET_DIR ({}) is inside the file-level NFS build dataset ({}); \
-             cargo targets must be on exec-safe local disk or tmpfs (build scripts \
-             are compiled then executed — NFS breaks exec + adds lock/mtime hazards)",
+            "CARGO_TARGET_DIR ({}) lexically resolves inside the file-level NFS build \
+             dataset ({}); cargo targets must be on exec-safe local disk or tmpfs \
+             (build scripts are compiled then executed — NFS breaks exec + adds \
+             lock/mtime hazards)",
             target_dir.display(),
             dataset_root.display()
         )));
@@ -215,29 +227,42 @@ pub fn validate_target_dir(target_dir: &Path, dataset_root: &Path) -> Result<(),
     Ok(())
 }
 
-/// Lexical path normalization sufficient for the containment check: trims a
-/// trailing slash and collapses `//`. (We deliberately avoid canonicalize() so
-/// the guard works on paths that don't exist yet at plan time.)
-fn normalize(p: &Path) -> String {
+/// Lexically normalize a path: resolve `.` and `..` PURELY TEXTUALLY (no
+/// filesystem access, so it works for non-existent paths — unlike
+/// `canonicalize`), collapse `//`, and trim a trailing slash. Preserves whether
+/// the path is absolute; a leading `..` in a RELATIVE path is preserved, and a
+/// `..` at/above an absolute root is dropped. This is what makes the containment
+/// guard robust against traversal inputs like `/mnt/other/../build/target`.
+fn lexical_normalize(p: &Path) -> String {
     let s = p.to_string_lossy();
-    let mut out = String::with_capacity(s.len());
-    let mut prev_slash = false;
-    for ch in s.chars() {
-        if ch == '/' {
-            if !prev_slash {
-                out.push(ch);
-            }
-            prev_slash = true;
-        } else {
-            out.push(ch);
-            prev_slash = false;
+    let absolute = s.starts_with('/');
+    let mut stack: Vec<&str> = Vec::new();
+    for comp in s.split('/') {
+        match comp {
+            "" | "." => continue,
+            ".." => match stack.last().copied() {
+                // Pop a real component…
+                Some(prev) if prev != ".." => {
+                    stack.pop();
+                }
+                // …but keep leading `..` for a relative path; for an absolute
+                // path a `..` above root is simply dropped.
+                _ => {
+                    if !absolute {
+                        stack.push("..");
+                    }
+                }
+            },
+            other => stack.push(other),
         }
     }
-    // Trim a single trailing slash (but keep root "/").
-    if out.len() > 1 {
-        out.trim_end_matches('/').to_string()
+    let joined = stack.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else if joined.is_empty() {
+        ".".to_string()
     } else {
-        out
+        joined
     }
 }
 
@@ -456,5 +481,42 @@ mod tests {
         // A sibling that merely shares a prefix STRING but not a path segment
         // must NOT be falsely rejected.
         assert!(validate_target_dir(&PathBuf::from("/data/build-target"), &root).is_ok());
+    }
+
+    #[test]
+    fn target_dir_guard_resolves_dotdot_lexically() {
+        // The traversal-bypass case: `/mnt/other/../build/target` LEXICALLY
+        // resolves to `/mnt/build/target`, which is under the dataset root — must
+        // be REJECTED even though the naive string prefix check would miss it.
+        let root = PathBuf::from("/mnt/build");
+        assert!(
+            validate_target_dir(&PathBuf::from("/mnt/other/../build/target"), &root).is_err(),
+            "a `..` that lands under the dataset must be rejected"
+        );
+        // `.` components and redundant slashes also resolve then reject.
+        assert!(validate_target_dir(&PathBuf::from("/mnt/build/./target"), &root).is_err());
+        assert!(validate_target_dir(&PathBuf::from("/mnt/build//sub/../target"), &root).is_err());
+        // A `..` that resolves BACK to the root itself is rejected.
+        assert!(validate_target_dir(&PathBuf::from("/mnt/build/x/.."), &root).is_err());
+        // A genuinely-separate dir (even reached via `..`) is allowed.
+        assert!(validate_target_dir(&PathBuf::from("/mnt/other/target"), &root).is_ok());
+        assert!(
+            validate_target_dir(&PathBuf::from("/mnt/build/../other/target"), &root).is_ok(),
+            "a `..` that escapes the dataset is fine"
+        );
+    }
+
+    #[test]
+    fn lexical_normalize_resolves_dot_and_dotdot() {
+        assert_eq!(
+            lexical_normalize(Path::new("/mnt/other/../build/target")),
+            "/mnt/build/target"
+        );
+        assert_eq!(lexical_normalize(Path::new("/a/./b//c/")), "/a/b/c");
+        assert_eq!(lexical_normalize(Path::new("/a/b/../..")), "/");
+        assert_eq!(lexical_normalize(Path::new("/a/../../x")), "/x"); // `..` above root dropped
+                                                                      // Relative paths keep a leading `..`.
+        assert_eq!(lexical_normalize(Path::new("../a/b")), "../a/b");
+        assert_eq!(lexical_normalize(Path::new("a/./b")), "a/b");
     }
 }

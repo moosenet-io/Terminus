@@ -164,6 +164,9 @@ pub fn render_relay_argv(
         "rsync".to_string(),
         "-a".to_string(),
         "--mkpath".to_string(),
+        // `-s`/--protect-args: the remote path (built from module/channel/target/
+        // bin) is sent verbatim, never re-split by the remote shell.
+        "-s".to_string(),
         local_bin.to_string_lossy().to_string(),
         remote,
     ]
@@ -307,6 +310,10 @@ mod tests {
         );
         let j = argv.join(" ");
         assert!(argv[0] == "rsync");
+        assert!(
+            argv.contains(&"-s".to_string()),
+            "relay rsync must protect remote path args"
+        );
         assert!(j.contains("/tmp/out/chord"));
         assert!(j.contains(
             "builduser@relay:/data/build/artifacts/chord/experimental/abcd/x86_64-unknown-linux-musl/chord"

@@ -130,18 +130,28 @@ compiler_build(module, ref, host="auto", profile="release", fast=false, bin?, so
   `$(...)`, backticks, `;`, `|`, newlines, quotes) is fully literal and can neither be
   corrupted nor execute during `source`. Non-secret vars (`SCCACHE_REDIS_ENDPOINT`/`_DB`/
   `_KEY_PREFIX`, `CARGO_TARGET_DIR`, `RUSTC_WRAPPER`) still travel via `--setenv`.
+- **Path-input validation** — every user-controlled value that becomes a path segment
+  (`module`, `bin`, `profile`, `target`, `channel`) is validated at the tool entry as a safe
+  single segment (allowlist `[A-Za-z0-9._-]`, no empty/`.`/`..`, no separators or shell
+  metacharacters) BEFORE any path join / rsync / ssh; `ref` uses the same rules per `/`-segment
+  (a branch may contain `/` but never a traversal). This blocks path-traversal (an absolute or
+  `../` value escaping `${BUILD_DATASET_ROOT}`) and command injection.
 - **Exec-safe target dir** — `CARGO_TARGET_DIR` is a LOCAL/tmpfs path
   (`BUILD_LOCAL_TARGET_DIR` locally, `BUILD_HEAVY_LOCAL_TARGET_DIR` on the heavy host); a
   hard guard **rejects** any target dir inside the file-level NFS build dataset — applied to
   BOTH the local target and the remote target (cargo compiles then *executes* build scripts;
-  NFS breaks exec + adds lock/mtime hazards). The NFS dataset is for source-staging +
-  sccache + artifact publish only.
+  NFS breaks exec + adds lock/mtime hazards). The guard **lexically normalizes** `.`/`..`
+  (without touching the filesystem, so it works for non-existent paths) so a traversal like
+  `/mnt/other/../build/target` that resolves under the dataset is caught. The NFS dataset is
+  for source-staging + sccache + artifact publish only.
 - **Heavy (remote) build** — for a heavy build the compiler `rsync`s the source to
   `<remote-dataset>/src/<module>/<ref>` on `BUILD_HOST_HEAVY`, runs the capped scoped cargo
   there over ssh with `--manifest-path` (so it needs no remote CWD) and a remote exec-safe
   `CARGO_TARGET_DIR`, then retrieves the built binary back so publish is host-agnostic. The
   remote dataset root is `BUILD_HEAVY_DATASET_ROOT` (falls back to `BUILD_DATASET_RELAY_ROOT`,
-  then the local `BUILD_DATASET_ROOT`).
+  then the local `BUILD_DATASET_ROOT`). Every interpolated value in the remote ssh command
+  strings is shell-quoted, and rsync uses `-s`/`--protect-args`, so no path can inject into the
+  remote shell (defense-in-depth on top of the segment validation above).
 - **sccache → Redis** (`compiler/sccache.rs`) — the auth'd Redis URL is read from the
   vault-materialized `SCCACHE_REDIS` env var and parsed into the **split**
   `SCCACHE_REDIS_ENDPOINT`/`_USERNAME`/`_PASSWORD`/`_DB`/`_KEY_PREFIX` form (the reliable

@@ -341,11 +341,21 @@ impl RustTool for CompilerBuild {
             .map(str::to_string)
             .unwrap_or_else(|| module.clone());
 
+        // ── Validate user-controlled path inputs BEFORE any path join / rsync /
+        // ssh (no traversal, no separators, no injection). After this, joining
+        // and interpolation are safe. ───────────────────────────────────────
+        validate_segment("module", &module)?;
+        validate_segment("bin", &bin)?;
+        validate_segment("profile", &profile)?;
+        validate_git_ref(&git_ref)?;
+
         // ── Resolve config (fail fast, no side effects) ──────────────────────
         let root = dataset_root()?;
         let root_str = root.to_string_lossy().to_string();
         let resolved = host::resolve(host_req, &module, fast)?;
         let triple = target_triple();
+        // `target` (the triple) comes from config but is used as a path segment.
+        validate_segment("target", &triple)?;
         let unit = scope::scope_unit_name(&module, &git_ref);
 
         // sccache env (fail-open to a local dir if Redis is unconfigured).
@@ -436,15 +446,19 @@ impl RustTool for CompilerBuild {
                 git_ref
             );
 
-            // Stage source to the remote + ensure the remote dirs exist.
+            // Stage source to the remote + ensure the remote dirs exist. Every
+            // interpolated remote path is shell-quoted (defense-in-depth on top of
+            // the segment validation above), and rsync uses `-s`/--protect-args so
+            // the remote path is never re-split by the remote shell.
             run(
                 &[
                     "ssh".into(),
                     host_addr.clone(),
-                    "mkdir".into(),
-                    "-p".into(),
-                    remote_source.clone(),
-                    remote_target_str.clone(),
+                    format!(
+                        "mkdir -p {} {}",
+                        shell_quote(&remote_source),
+                        shell_quote(&remote_target_str)
+                    ),
                 ],
                 None,
                 &BTreeMap::new(),
@@ -456,6 +470,7 @@ impl RustTool for CompilerBuild {
                     "rsync".into(),
                     "-a".into(),
                     "--delete".into(),
+                    "-s".into(),
                     format!("{}/", local_source_dir.to_string_lossy()),
                     format!("{host_addr}:{remote_source}/"),
                 ],
@@ -478,9 +493,14 @@ impl RustTool for CompilerBuild {
             if have_secret {
                 let body = scope::render_secret_env_file(&secret_env);
                 let local_secret = write_local_0600(&body, &unit)?;
-                let scp_res = run(
+                // `rsync -a` preserves the local 0600 mode on the remote (so the
+                // remote secret file is 0600 without a separate chmod), and `-s`
+                // protects the remote path from remote-shell re-splitting.
+                let xfer_res = run(
                     &[
-                        "scp".into(),
+                        "rsync".into(),
+                        "-a".into(),
+                        "-s".into(),
                         local_secret.to_string_lossy().to_string(),
                         format!("{host_addr}:{remote_env_path}"),
                     ],
@@ -489,35 +509,20 @@ impl RustTool for CompilerBuild {
                     Duration::from_secs(120),
                 )
                 .await;
-                // Delete the local staging copy immediately, whether scp succeeded
-                // or not (the secret must not linger on disk).
+                // Delete the local staging copy immediately, whether the transfer
+                // succeeded or not (the secret must not linger on disk).
                 let _ = tokio::fs::remove_file(&local_secret).await;
-                scp_res?;
-                run(
-                    &[
-                        "ssh".into(),
-                        host_addr.clone(),
-                        "chmod".into(),
-                        "600".into(),
-                        remote_env_path.clone(),
-                    ],
-                    None,
-                    &BTreeMap::new(),
-                    Duration::from_secs(60),
-                )
-                .await?;
+                xfer_res?;
             }
 
             if let Some(channel) = &pinned {
-                // `rustup toolchain install <channel>` is cwd-independent.
+                // `rustup toolchain install <channel>` is cwd-independent; the
+                // channel is shell-quoted for the remote shell.
                 run(
                     &[
                         "ssh".into(),
                         host_addr.clone(),
-                        "rustup".into(),
-                        "toolchain".into(),
-                        "install".into(),
-                        channel.clone(),
+                        format!("rustup toolchain install {}", shell_quote(channel)),
                     ],
                     None,
                     &BTreeMap::new(),
@@ -554,9 +559,7 @@ impl RustTool for CompilerBuild {
                     &[
                         "ssh".into(),
                         host_addr.clone(),
-                        "rm".into(),
-                        "-f".into(),
-                        remote_env_path.clone(),
+                        format!("rm -f {}", shell_quote(&remote_env_path)),
                     ],
                     None,
                     &BTreeMap::new(),
@@ -582,6 +585,7 @@ impl RustTool for CompilerBuild {
                 &[
                     "rsync".into(),
                     "-a".into(),
+                    "-s".into(),
                     format!("{host_addr}:{remote_bin}"),
                     local_bin.to_string_lossy().to_string(),
                 ],
@@ -597,6 +601,7 @@ impl RustTool for CompilerBuild {
         // `built_bin` is a locally-readable path (built in place locally, or
         // retrieved from the heavy host above), so publish is host-agnostic.
         let channel = publish::DEFAULT_CHANNEL;
+        validate_segment("channel", channel)?;
         let published = if let Some(relay_host) = env_nonempty(BUILD_DATASET_RELAY_HOST) {
             // Interim: relay-publish over a single hop to a host with the dataset RW.
             let remote_root =
@@ -701,6 +706,64 @@ fn str_arg(args: &Value, key: &str) -> Result<String, ToolError> {
         .ok_or_else(|| ToolError::InvalidArgument(format!("`{key}` is required")))
 }
 
+/// The conservative allowlist for one path segment: ASCII alphanumerics plus
+/// `.`, `_`, `-`. No `/`, `\`, whitespace, control chars, NUL, or any shell/path
+/// metacharacter.
+fn is_segment_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
+}
+
+/// Validate a user-controlled value as a SAFE single path segment — no
+/// traversal, no path separator, no injection — BEFORE it is ever joined into a
+/// path or interpolated into an rsync/ssh command. Rejects empty, `.`/`..`, and
+/// anything containing a byte outside `[A-Za-z0-9._-]` (which also excludes `/`,
+/// `\`, whitespace, control chars, and shell metacharacters). Used for
+/// module/bin/profile/target/channel.
+fn validate_segment(kind: &str, value: &str) -> Result<(), ToolError> {
+    if value.is_empty() {
+        return Err(ToolError::InvalidArgument(format!(
+            "{kind} must not be empty"
+        )));
+    }
+    if value == "." || value == ".." {
+        return Err(ToolError::InvalidArgument(format!(
+            "{kind} must not be '.' or '..'"
+        )));
+    }
+    if !value.chars().all(is_segment_char) {
+        return Err(ToolError::InvalidArgument(format!(
+            "{kind} {value:?} contains characters outside [A-Za-z0-9._-] \
+             (no path separators, whitespace, control chars, or shell metacharacters)"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a git ref: like [`validate_segment`] but MAY contain `/` between
+/// otherwise-valid segments (a branch such as `feature/foo`), and never a
+/// traversal. Rejects an absolute ref (`/`-leading), a trailing `/`, `\`, any
+/// empty/`.`/`..` component, and any disallowed byte. This keeps a ref usable as
+/// a nested-but-contained path fragment under the dataset root.
+fn validate_git_ref(value: &str) -> Result<(), ToolError> {
+    if value.is_empty() {
+        return Err(ToolError::InvalidArgument("ref must not be empty".into()));
+    }
+    if value.starts_with('/') || value.ends_with('/') {
+        return Err(ToolError::InvalidArgument(format!(
+            "ref {value:?} must not start or end with '/'"
+        )));
+    }
+    if value.contains('\\') {
+        return Err(ToolError::InvalidArgument(format!(
+            "ref {value:?} must not contain '\\'"
+        )));
+    }
+    for comp in value.split('/') {
+        validate_segment("ref component", comp)?;
+    }
+    Ok(())
+}
+
 /// Register the `compiler_*` tool surface on the registry.
 pub fn register(registry: &mut ToolRegistry) {
     if let Err(e) = registry.register(Box::new(CompilerBuild)) {
@@ -800,6 +863,102 @@ mod tests {
         assert!(str_arg(&v, "module").is_err());
         assert_eq!(str_arg(&v, "ref").unwrap(), "abc");
         assert!(str_arg(&v, "missing").is_err());
+    }
+
+    #[test]
+    fn segment_validation_accepts_normal_and_rejects_traversal() {
+        // Normal segments accepted.
+        for ok in [
+            "chord",
+            "lumina-core",
+            "terminus_rs",
+            "release-dist",
+            "v1.2.3",
+            "abc123",
+        ] {
+            assert!(
+                validate_segment("module", ok).is_ok(),
+                "should accept {ok:?}"
+            );
+        }
+        // Traversal / separators / injection / control chars all rejected.
+        for bad in [
+            "",            // empty
+            ".",           // dot
+            "..",          // parent
+            "../..",       // traversal (contains '/')
+            "a/b",         // separator
+            "a/../b",      // embedded traversal
+            "/etc/passwd", // absolute (leading '/')
+            "a\\b",        // backslash
+            "a b",         // whitespace
+            "a;rm -rf /",  // shell metachars + space
+            "$(touch x)",  // command substitution
+            "a`b`",        // backticks
+            "a\0b",        // NUL
+            "a\nb",        // newline / control
+        ] {
+            assert!(
+                validate_segment("module", bad).is_err(),
+                "should REJECT {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_ref_validation_allows_branch_slashes_but_not_traversal() {
+        // A real branch/sha is accepted, including a single '/'.
+        for ok in [
+            "main",
+            "feature/foo",
+            "release/2026-07",
+            "0a1b2c3d",
+            "v1.0.0",
+        ] {
+            assert!(validate_git_ref(ok).is_ok(), "should accept ref {ok:?}");
+        }
+        // Traversal and injection are rejected even with the looser ref charset.
+        for bad in [
+            "",         // empty
+            "/etc",     // absolute
+            "feature/", // trailing slash
+            "../..",    // traversal
+            "a/../b",   // embedded '..'
+            "a//b",     // empty component
+            "a\\b",     // backslash
+            "a b",      // whitespace
+            "$(x)",     // injection
+            "a;b",      // shell metachar
+        ] {
+            assert!(validate_git_ref(bad).is_err(), "should REJECT ref {bad:?}");
+        }
+    }
+
+    #[test]
+    fn shell_metachar_segment_is_rejected_and_quoting_is_injection_safe() {
+        // Finding #1 already rejects a metachar-laden segment outright…
+        let nasty = "m;$(touch PWNED)`id`";
+        assert!(validate_segment("module", nasty).is_err());
+        // …and even if some interpolated value reached the ssh layer, shell_quote
+        // renders it a single inert word (round-trips through a real shell with no
+        // command execution).
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("PWNED");
+        let payload = format!("x $(touch '{m}') `touch '{m}'` ; y", m = marker.display());
+        let script = format!("printf %s {}", shell_quote(&payload));
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(script.as_bytes()).unwrap();
+        let out = std::process::Command::new("sh")
+            .arg(f.path())
+            .output()
+            .expect("run sh");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), payload);
+        assert!(
+            !marker.exists(),
+            "shell_quote must prevent command execution"
+        );
     }
 
     #[test]
