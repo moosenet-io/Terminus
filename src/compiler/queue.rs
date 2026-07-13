@@ -367,13 +367,16 @@ pub trait QueueStore: Send + Sync {
     /// run, but the request must NOT be lost (BLD-11). Idempotent + token-fenced:
     /// a wrong/stale token (already released, or reconciled + re-claimed) is a safe
     /// no-op. Mirrors the crash-requeue branch of [`reconcile`](Self::reconcile),
-    /// but is immediate and token-gated rather than lease-age gated.
+    /// but is immediate and token-gated rather than lease-age gated. Also CLEARS any
+    /// stale terminal/error metadata so the re-queued job carries no prior-attempt
+    /// failure state, and records `reason` as a light `last_requeue_reason`.
     async fn requeue(
         &self,
         job_id: &str,
         module: &str,
         host: HostRole,
         token: &str,
+        reason: &str,
     ) -> Result<(), QueueError>;
 
     /// The SANCTIONED completion entry for a direct (non-scheduler) caller:
@@ -843,9 +846,11 @@ return 1
 /// dispatch ZSET at the job's stored priority/seq. Records NO terminal outcome (the
 /// build never ran). A token mismatch (already released / reconciled + re-claimed)
 /// is a safe no-op (`return 0`). Returns `1` when it requeued, `0` on the fenced
-/// no-op.
+/// no-op. Also CLEARS stale terminal/error metadata (outcome/finished_at/last_error)
+/// so a requeued job carries no prior-attempt failure state, and records a light
+/// `last_requeue_reason` for observability.
 /// KEYS: 1=jobhash 2=zset
-/// ARGV: 1=id 2=token 3=modulelock_prefix 4=host_set_prefix
+/// ARGV: 1=id 2=token 3=modulelock_prefix 4=host_set_prefix 5=requeue_reason
 fn requeue_lua() -> String {
     r#"
 if redis.call('HGET', KEYS[1], 'claim_token') ~= ARGV[2] then return 0 end
@@ -867,6 +872,11 @@ if host then redis.call('SREM', hostprefix..host, jobid) end
 redis.call('HDEL', jobkey, 'claim_token')
 redis.call('HDEL', jobkey, 'host')
 redis.call('HDEL', jobkey, 'started_at')
+-- Clear STALE terminal/error metadata so a requeued job carries no prior-attempt
+-- failure state (an idle-lease requeue records NO terminal outcome). Record a light
+-- requeue reason for observability instead.
+redis.call('HDEL', jobkey, 'outcome', 'finished_at', 'last_error')
+redis.call('HSET', jobkey, 'last_requeue_reason', ARGV[5])
 redis.call('HSET', jobkey, 'state', 'queued')
 -- Re-add to the dispatch ZSET at the stored priority/seq score.
 local seq=tonumber(redis.call('HGET', jobkey, 'seq') or '0')
@@ -1097,12 +1107,13 @@ impl QueueStore for RedisQueue {
         module: &str,
         host: HostRole,
         token: &str,
+        reason: &str,
     ) -> Result<(), QueueError> {
         // `module`/`host` args are advisory only — the lock + host-slot keys are
         // DERIVED in-Lua from the job hash's OWN stored fields (A1).
         let _ = (module, host);
         let (jk, zset) = (job_key(job_id), zset_key());
-        let (id, token) = (job_id.to_string(), token.to_string());
+        let (id, token, reason) = (job_id.to_string(), token.to_string(), reason.to_string());
         let (lock_prefix, host_prefix) = (module_lock_prefix(), host_set_prefix());
         let script = redis::Script::new(&requeue_lua());
         let out: Result<i64, ()> = self
@@ -1115,6 +1126,7 @@ impl QueueStore for RedisQueue {
                     .arg(token)
                     .arg(lock_prefix)
                     .arg(host_prefix)
+                    .arg(reason)
                     .invoke_async::<_, i64>(&mut conn)
                     .await
             })
@@ -1262,6 +1274,8 @@ pub(crate) mod fake {
         outcome: Option<String>,
         /// A single pending re-run requested while this job was building.
         rerun: bool,
+        /// Light observability marker recorded by `requeue` (F4).
+        last_requeue_reason: Option<String>,
     }
 
     #[derive(Default)]
@@ -1420,6 +1434,7 @@ pub(crate) mod fake {
                     claim_token: None,
                     outcome: None,
                     rerun: false,
+                    last_requeue_reason: None,
                 },
             );
             s.dedupe.insert(dk, nid);
@@ -1502,6 +1517,7 @@ pub(crate) mod fake {
                     claim_token: None,
                     outcome: None,
                     rerun: false,
+                    last_requeue_reason: None,
                 },
             );
             s.dedupe.insert(dk, id.clone());
@@ -1642,6 +1658,7 @@ pub(crate) mod fake {
             module: &str,
             host: HostRole,
             token: &str,
+            reason: &str,
         ) -> Result<(), QueueError> {
             let mut s = self.state.lock().unwrap();
             if s.down {
@@ -1669,6 +1686,9 @@ pub(crate) mod fake {
                 j.host = None;
                 j.started_at = 0;
                 j.claim_token = None; // fence: a late completion no-ops
+                // Clear STALE terminal/error metadata (F4) + record the requeue reason.
+                j.outcome = None;
+                j.last_requeue_reason = Some(reason.to_string());
             }
             Ok(())
         }
@@ -2048,7 +2068,7 @@ mod tests {
         assert_eq!(q.state_of(&j.job_id).as_deref(), Some("building"));
         assert_eq!(q.inflight_count(HostRole::Heavy), 1);
         // Requeue (advisory wrong module/host args still derive the correct keys).
-        q.requeue(&j.job_id, "bogus", HostRole::Primary, &tok).await.unwrap();
+        q.requeue(&j.job_id, "bogus", HostRole::Primary, &tok, "idle-lease-unavailable").await.unwrap();
         assert_eq!(q.state_of(&j.job_id).as_deref(), Some("queued"), "back to queued");
         assert!(!q.has_outcome(&j.job_id), "no terminal outcome recorded");
         assert_eq!(q.inflight_count(HostRole::Heavy), 0, "host slot freed");
@@ -2060,17 +2080,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn requeue_clears_stale_error_metadata() {
+        // F4: a requeue after an idle-abort must NOT leave stale failure metadata on the
+        // now-queued job. A prior-attempt `outcome`/error marker is cleared on requeue.
+        let q = InMemoryQueue::new();
+        let j = q.enqueue(&req("harmony", "big", Priority::Normal, true)).await.unwrap();
+        let tok = claim_ok(&q, &j.job_id, "harmony", HostRole::Heavy, 1).await;
+        // Simulate stale failure metadata attached to the (still-building) job.
+        q.finalize(&j.job_id, JobState::Failed, &tok).await.unwrap();
+        assert!(q.has_outcome(&j.job_id), "stale outcome present before requeue");
+        // Requeue clears it (records no terminal outcome / no stale error).
+        q.requeue(&j.job_id, "harmony", HostRole::Heavy, &tok, "idle-lease-unavailable").await.unwrap();
+        assert_eq!(q.state_of(&j.job_id).as_deref(), Some("queued"));
+        assert!(!q.has_outcome(&j.job_id), "requeue cleared the stale outcome/error metadata");
+    }
+
+    #[tokio::test]
     async fn requeue_with_a_stale_token_is_a_safe_noop() {
         // A wrong/stale token must not requeue (it would clobber a live re-claim).
         let q = InMemoryQueue::new();
         let j = q.enqueue(&req("m1", "r1", Priority::Normal, false)).await.unwrap();
         let tok = claim_ok(&q, &j.job_id, "m1", HostRole::Primary, 1).await;
         // A stale token no-ops: the job stays building, the slot stays held.
-        q.requeue(&j.job_id, "m1", HostRole::Primary, "wrong-token").await.unwrap();
+        q.requeue(&j.job_id, "m1", HostRole::Primary, "wrong-token", "x").await.unwrap();
         assert_eq!(q.state_of(&j.job_id).as_deref(), Some("building"));
         assert_eq!(q.inflight_count(HostRole::Primary), 1);
         // The correct token still requeues.
-        q.requeue(&j.job_id, "m1", HostRole::Primary, &tok).await.unwrap();
+        q.requeue(&j.job_id, "m1", HostRole::Primary, &tok, "x").await.unwrap();
         assert_eq!(q.state_of(&j.job_id).as_deref(), Some("queued"));
     }
 

@@ -337,6 +337,10 @@ pub enum LeaseError {
     /// cannot guarantee the host is free — degrade SAFELY by aborting + requeueing
     /// rather than building uncoordinated.
     IdleFailed { reason: String },
+    /// The lease was RELEASED/EXPIRED (e.g. the max-lease watchdog fired) WHILE acquire
+    /// was still waiting for RAM — the services are (being) reactivated, so the build
+    /// must NOT start under a dead lease. Abort + requeue.
+    LeaseExpired { reason: String },
 }
 
 impl std::fmt::Display for LeaseError {
@@ -353,6 +357,10 @@ impl std::fmt::Display for LeaseError {
             LeaseError::IdleFailed { reason } => write!(
                 f,
                 "idle coordination failed ({reason}) — refusing to build uncoordinated"
+            ),
+            LeaseError::LeaseExpired { reason } => write!(
+                f,
+                "idle lease expired mid-acquire ({reason}) — refusing to build under a dead lease"
             ),
         }
     }
@@ -401,12 +409,22 @@ struct LeaseInner {
     /// concurrent `release()` calls (explicit release racing the watchdog / a drop)
     /// COALESCE instead of firing redundant concurrent activate calls.
     release_lock: tokio::sync::Mutex<()>,
+    /// Set the instant ANY release begins (watchdog, explicit, drop). Signals the lease
+    /// is dead — `acquire_lease`'s wait loop checks this and REFUSES to hand back a lease
+    /// whose services are being reactivated (F1: never build under an expired lease).
+    expired: AtomicBool,
 }
 
 impl LeaseInner {
     /// Both services confirmed reactivated?
     fn fully_released(&self) -> bool {
         self.chord_active.load(Ordering::SeqCst) && self.mint_active.load(Ordering::SeqCst)
+    }
+
+    /// Has release begun (watchdog fired / explicit release / drop)? Once true, the
+    /// lease is dead and must never be handed to a build.
+    fn is_expired(&self) -> bool {
+        self.expired.load(Ordering::SeqCst)
     }
 
     /// One activation pass: attempt each service NOT yet confirmed active (bounded by
@@ -440,6 +458,11 @@ impl LeaseInner {
     /// coalesce — the second waits, then finds the work already done (or resumes the
     /// still-pending service) rather than racing a duplicate concurrent activation.
     async fn release(&self) {
+        // Mark the lease dead the instant release begins, so a concurrent
+        // `acquire_lease` wait loop observes the expiry and refuses to hand back a lease
+        // whose services are being reactivated (F1). Set BEFORE the fast-path return so
+        // even an already-fully-released lease reads as expired.
+        self.expired.store(true, Ordering::SeqCst);
         // Fast path: already done (lock-free).
         if self.fully_released() {
             return;
@@ -493,6 +516,12 @@ impl LeaseGuard {
         }
     }
 
+    /// Has this lease been released/expired (watchdog fired, or a release began)? A
+    /// no-op guard is never expired. `acquire_lease` checks this during its wait.
+    fn is_expired(&self) -> bool {
+        self.inner.as_ref().map(|i| i.is_expired()).unwrap_or(false)
+    }
+
     /// Explicit, AWAITED release for the normal completion path. Idempotent with the
     /// `Drop` and the watchdog (the inner once-guard means reactivation runs once).
     pub async fn release(mut self) {
@@ -504,21 +533,38 @@ impl LeaseGuard {
         }
     }
 
-    /// Abort path (F3): the build is being ABANDONED (insufficient RAM / idle failure)
-    /// but services were already idled — guarantee they return to ACTIVE. Kicks off a
-    /// retrying reactivation NOW and, crucially, LEAVES the max-lease watchdog armed as
-    /// the ultimate backstop (it is NOT aborted), so even if the immediate retries
-    /// transiently fail the watchdog keeps bounding the idle window until services are
-    /// active. Consumes the guard; caller then returns the abort error.
+    /// Abort path (F3): the build is being ABANDONED (insufficient RAM / idle failure /
+    /// expired lease) but services were already idled — GUARANTEE they return to ACTIVE.
+    /// Kicks off a retrying reactivation NOW and LEAVES the max-lease watchdog armed as
+    /// the ultimate backstop (it is NOT aborted). Consumes the guard; caller returns the
+    /// abort error.
     fn reactivate_detached(mut self) {
         // Detach (but DO NOT abort) the watchdog so it survives as a backstop; it holds
         // its own Arc<LeaseInner>, so dropping this handle keeps the task running.
         let _ = self.watchdog.take();
         if let Some(inner) = self.inner.take() {
-            if tokio::runtime::Handle::try_current().is_ok() {
-                tokio::spawn(async move { inner.release().await });
-            }
-            // (No runtime ⇒ can't spawn; the watchdog, still armed, remains the backstop.)
+            drive_release(inner);
+        }
+    }
+}
+
+/// Drive `inner.release()` to completion, GUARANTEED even without an ambient Tokio
+/// runtime (F3). In a runtime we detach it (spawn); with NO runtime we block on a
+/// short-lived current-thread runtime so services are never left idle after a
+/// crash-drop that happens outside async context.
+fn drive_release(inner: Arc<LeaseInner>) {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::spawn(async move { inner.release().await });
+    } else {
+        // No ambient runtime: block on a private current-thread runtime so reactivation
+        // still runs to completion (the `release()` internals use tokio time/sync/timeout).
+        match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt.block_on(inner.release()),
+            Err(e) => warn!(error = %e,
+                "idle lease: no ambient runtime and could not build one — cannot guarantee reactivation"),
         }
     }
 }
@@ -536,21 +582,20 @@ impl std::fmt::Debug for LeaseGuard {
 
 impl Drop for LeaseGuard {
     fn drop(&mut self) {
-        if let Some(w) = self.watchdog.take() {
-            w.abort();
+        // In an ambient runtime the watchdog is aborted (the release below covers it);
+        // with NO runtime the watchdog task can't run here anyway, so we leave its handle
+        // and GUARANTEE reactivation via a blocking release in `drive_release`.
+        let in_runtime = tokio::runtime::Handle::try_current().is_ok();
+        if in_runtime {
+            if let Some(w) = self.watchdog.take() {
+                w.abort();
+            }
         }
         if let Some(inner) = self.inner.take() {
-            // The build returned early or PANICKED without an explicit release.
-            // Reactivate on a detached task (Drop can't await). The once-guard makes
-            // this safe even if the watchdog already fired.
-            if tokio::runtime::Handle::try_current().is_ok() {
-                warn!("idle lease guard dropped without explicit release (early return/panic) — reactivating Chord + MINT");
-                tokio::spawn(async move { inner.release().await });
-            } else {
-                // No runtime (e.g. a synchronous test drop): reactivation can't be
-                // spawned; the per-service watchdogs remain the backstop.
-                warn!("idle lease guard dropped outside a runtime — relying on per-service idle watchdogs to reactivate");
-            }
+            // The build returned early or PANICKED without an explicit release — GUARANTEE
+            // reactivation (detached in a runtime; blocking otherwise, F3).
+            warn!("idle lease guard dropped without explicit release (early return/panic) — reactivating Chord + MINT");
+            drive_release(inner);
         }
     }
 }
@@ -614,56 +659,90 @@ pub async fn acquire_lease(
         chord_in_lease,
     );
 
-    // Idle the available backends (bounded by the per-op timeout). A FAILED or HUNG idle
-    // call means we can't guarantee the host is free — degrade safely: GUARANTEED
-    // reactivation (via the guard's retry + still-armed watchdog) + abort (requeue, F3).
+    // Idle the available backends (bounded by the per-op timeout). Capture the freed-RAM
+    // each reports, used ONLY as a fallback when `/proc/meminfo` is unreadable (F2). A
+    // FAILED or HUNG idle ⇒ degrade safely: GUARANTEED reactivation + abort (requeue, F3).
+    let mut chord_freed = None;
     if chord_in_lease {
-        if let Err(e) =
-            with_op_timeout(cfg.op_timeout, "Chord idle", backend.chord_idle()).await
-        {
-            return abort_with_guard(guard, "Chord idle", e);
+        match with_op_timeout(cfg.op_timeout, "Chord idle", backend.chord_idle()).await {
+            Ok(f) => chord_freed = f,
+            Err(e) => return abort_with_guard(guard, "Chord idle", e),
         }
     }
-    if let Err(e) = with_op_timeout(cfg.op_timeout, "MINT idle", backend.mint_idle()).await {
-        return abort_with_guard(guard, "MINT idle", e);
-    }
+    let mint_freed = match with_op_timeout(cfg.op_timeout, "MINT idle", backend.mint_idle()).await {
+        Ok(f) => f,
+        Err(e) => return abort_with_guard(guard, "MINT idle", e),
+    };
+    // Sum the reported freed (fallback budget estimate when MemAvailable is unreadable).
+    let reported_freed = chord_freed.unwrap_or(0.0).max(0.0) + mint_freed.unwrap_or(0.0).max(0.0);
 
     // No budget ⇒ idle confirmed; proceed WITHOUT waiting on an available-RAM threshold.
     if budget_gb <= 0.0 {
+        // Even here, if the lease already expired (a max_lease≈0 watchdog fired during
+        // idling) do NOT hand back a dead lease.
+        if guard.is_expired() {
+            return expired_abort(guard, "lease expired during idle");
+        }
         info!("idle lease acquired — idled (no available-RAM budget to wait on)");
         return Ok(guard);
     }
 
-    // Budget configured ⇒ WAIT until TOTAL AVAILABLE RAM ≥ budget (F2), bounded by the
-    // acquire timeout. Gate on what the build NEEDS available, not on how much was freed.
+    // Budget configured ⇒ WAIT until enough RAM is established, bounded by the acquire
+    // timeout. PRIMARY gate: total AVAILABLE RAM (`MemAvailable`) ≥ budget (F2 — a build
+    // needs that much available). FALLBACK when MemAvailable is unreadable: the services'
+    // REPORTED freed-RAM ≥ budget (F2 — never abort-forever just because /proc is blind).
     let deadline = tokio::time::Instant::now() + cfg.acquire_timeout;
     loop {
+        // F1: if the lease was released/expired (watchdog fired) mid-wait, the services
+        // are being reactivated — NEVER hand back a dead lease; abort + requeue.
+        if guard.is_expired() {
+            return expired_abort(guard, "max-lease watchdog fired during the budget wait");
+        }
         let available = backend.mem_available_gb();
-        if available.map(|a| a >= budget_gb).unwrap_or(false) {
+        let estimate = available.unwrap_or(reported_freed); // available if measurable, else reported
+        if estimate >= budget_gb {
+            // Re-check expiry immediately before returning Ok (watchdog could fire right
+            // as the budget is met) — never return Ok(guard) after expiry (F1).
+            if guard.is_expired() {
+                return expired_abort(guard, "max-lease watchdog fired as the budget was met");
+            }
             info!(
                 available_gb = available,
-                budget_gb, "idle lease acquired — available RAM meets the budget; heavy build may start"
+                reported_freed,
+                budget_gb,
+                "idle lease acquired — RAM budget established (available RAM, or reported-freed fallback)"
             );
             return Ok(guard);
         }
         if tokio::time::Instant::now() >= deadline {
             warn!(
                 available_gb = available,
+                reported_freed,
                 budget_gb,
-                "idle lease: available RAM below budget after the acquire timeout — \
-                 guaranteeing reactivation and refusing the heavy build (it will be requeued)"
+                "idle lease: RAM below budget after the acquire timeout — guaranteeing \
+                 reactivation and refusing the heavy build (it will be requeued)"
             );
             // Guaranteed reactivation (retry + watchdog) — never leave services idle for
             // a build we're not going to run (F3).
-            let available_gb = available.unwrap_or(0.0);
             guard.reactivate_detached();
             return Err(LeaseError::InsufficientRam {
-                available_gb,
+                available_gb: estimate,
                 budget_gb,
             });
         }
         tokio::time::sleep(cfg.poll).await;
     }
+}
+
+/// The lease released/expired while acquire was still waiting (F1): guarantee
+/// reactivation of the (being-torn-down) services and return a requeue error — the
+/// heavy build must NEVER start under a dead lease.
+fn expired_abort(guard: LeaseGuard, reason: &str) -> Result<LeaseGuard, LeaseError> {
+    warn!(reason, "idle lease: expired mid-acquire — refusing to build under a dead lease; requeueing");
+    guard.reactivate_detached();
+    Err(LeaseError::LeaseExpired {
+        reason: reason.to_string(),
+    })
 }
 
 /// Idle-coordination failure/timeout while enabled: GUARANTEE reactivation of anything
@@ -699,6 +778,7 @@ fn arm_guard(
         max_attempts: RELEASE_MAX_ATTEMPTS,
         op_timeout,
         release_lock: tokio::sync::Mutex::new(()),
+        expired: AtomicBool::new(false),
     });
     let wd_inner = inner.clone();
     let watchdog = tokio::spawn(async move {
@@ -1238,6 +1318,7 @@ mod tests {
             max_attempts: 5,
             op_timeout: Duration::from_secs(5),
             release_lock: tokio::sync::Mutex::new(()),
+            expired: AtomicBool::new(false),
         });
         let (i1, i2) = (inner.clone(), inner.clone());
         tokio::join!(async { i1.release().await }, async { i2.release().await });
@@ -1313,6 +1394,74 @@ mod tests {
         // A non-heavy build's guard holds no lease and touches no backend.
         let g = LeaseGuard::noop();
         g.release().await; // no panic, nothing to release
+    }
+
+    #[tokio::test]
+    async fn watchdog_release_mid_wait_makes_acquire_fail_not_build_under_dead_lease() {
+        // FINDING 1 (BLOCKER): if the max-lease watchdog RELEASES services while acquire
+        // is still waiting for RAM, acquire must FAIL (LeaseExpired → requeue), NEVER
+        // return Ok(guard) — the heavy build must not start under a dead/reactivated lease.
+        let be = MockBackend::new(None, None).with_mem(vec![50.0]); // stays below budget
+        let mut c = cfg(5, 3600); // acquire_timeout = 5s (won't be hit)
+        c.max_lease = Duration::from_millis(30); // watchdog fires DURING the wait
+        let be2 = be.clone();
+        let handle = tokio::spawn(async move { acquire_lease(be2, &c, true, 120.0).await });
+        // After the watchdog has fired (services reactivated), make RAM reach budget —
+        // acquire must STILL fail (it observed the expiry), not return Ok.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        *be.mem_samples.lock().unwrap() = vec![200.0];
+        let res = handle.await.unwrap();
+        assert!(
+            matches!(res, Err(LeaseError::LeaseExpired { .. })),
+            "expired lease ⇒ acquire must Err(LeaseExpired), never Ok — got {res:?}"
+        );
+        // Services ended ACTIVE (watchdog reactivated them; the build never started).
+        assert_eq!(be.activates(), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn reported_freed_fallback_satisfies_budget_when_meminfo_unreadable() {
+        // FINDING 2: MemAvailable is the PRIMARY gate, but when it is UNREADABLE
+        // (no /proc), fall back to the services' reported freed-RAM rather than
+        // aborting forever. chord+mint report 70+60=130 ≥ 120 ⇒ acquire.
+        let be = MockBackend::new(Some(70.0), Some(60.0)); // reports freed; NO mem samples ⇒ None
+        let guard = acquire_lease(be.clone(), &cfg(5, 3600), true, 120.0)
+            .await
+            .expect("reported-freed fallback satisfies the budget when meminfo is unreadable");
+        assert_eq!(be.chord_idles.load(Ordering::SeqCst), 1);
+        assert_eq!(be.mint_idles.load(Ordering::SeqCst), 1);
+        guard.release().await;
+        assert_eq!(be.activates(), (1, 1));
+    }
+
+    #[test]
+    fn drop_without_an_ambient_runtime_still_activates() {
+        // FINDING 3: a crash-drop of the guard OUTSIDE any Tokio runtime must STILL
+        // reactivate (blocking best-effort), never leaving services idle. This is a
+        // plain #[test] ⇒ no ambient runtime.
+        let be = MockBackend::new(None, None);
+        let inner = Arc::new(LeaseInner {
+            backend: be.clone(),
+            chord_active: AtomicBool::new(false),
+            mint_active: AtomicBool::new(false),
+            retry_backoff: Duration::from_millis(1),
+            max_attempts: 5,
+            op_timeout: Duration::from_secs(5),
+            release_lock: tokio::sync::Mutex::new(()),
+            expired: AtomicBool::new(false),
+        });
+        // Manually build a guard with NO watchdog (simulating a guard whose ambient
+        // runtime is gone), then drop it with no ambient runtime.
+        let guard = LeaseGuard {
+            inner: Some(inner),
+            watchdog: None,
+        };
+        drop(guard);
+        assert_eq!(
+            be.activates(),
+            (1, 1),
+            "no-runtime drop guaranteed reactivation (blocking release)"
+        );
     }
 
     #[test]

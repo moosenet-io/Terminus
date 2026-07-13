@@ -499,10 +499,10 @@ impl Scheduler {
                              lease ({e}); requeueing (NOT building under budget)"
                         );
                         // Token-fenced requeue: free the module lock + host slot and
-                        // return the job to the queue. A stale token (reconciled/re-
-                        // claimed) is a safe no-op.
+                        // return the job to the queue (clearing stale error state). A
+                        // stale token (reconciled/re-claimed) is a safe no-op.
                         if let Err(re) = queue
-                            .requeue(&job.job_id, &job.module, host, &token)
+                            .requeue(&job.job_id, &job.module, host, &token, "idle-lease-unavailable")
                             .await
                         {
                             tracing::error!(
