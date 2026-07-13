@@ -1399,6 +1399,55 @@ pub async fn admit_run() -> RunAdmission {
     RunAdmission::Refused("mint idle transition in progress")
 }
 
+// ── GPU-acquisition admission gate (makes idle-mode AUTHORITATIVE) ─────────────
+
+/// The single choke point that ties MINT's REAL GPU work to the idle admission gate.
+/// Called at each place MINT takes the shared `gpu_authority` exclusive lock (via
+/// [`gpu_authority::ExclusiveGuard`](crate::intake::gpu_authority::ExclusiveGuard) and
+/// [`gpu_authority::LiveGpuLock`](crate::intake::gpu_authority::LiveGpuLock)) BEFORE the
+/// lock is acquired:
+///
+/// - **`holder` is NOT a MINT holder** (e.g. a compiler build lease, or an operator's
+///   ad-hoc `mint gpu acquire`): returns `Ok(None)` — NOT gated. Critically, this is why
+///   the compiler can still acquire the GPU while MINT is idle (gating it would deadlock
+///   the very build MINT idled for).
+/// - **`holder` IS a MINT holder** and the harness is `Active`: returns `Ok(Some(guard))`
+///   — the caller MUST hold the [`InflightGuard`] for the whole unit of GPU work, so the
+///   in-flight counter reflects REAL work and a concurrent [`enter_idle`] drains it (not
+///   zero). The admit increment is atomic with the phase check (see
+///   [`IdleController::try_admit`]).
+/// - **`holder` IS a MINT holder** but the harness is `EnteringIdle`/`Idle`/`Activating`:
+///   returns `Err(_)` — the MINT GPU work MUST NOT start (the caller backs off / skips /
+///   returns a "retry later" result rather than acquiring the GPU under an in-progress
+///   compiler build).
+///
+/// Controller-scoped so it is unit-testable offline; [`try_admit_mint_gpu`] wraps it
+/// against the process-global controller + configured MINT holders.
+pub fn try_admit_gpu_on(
+    ctl: &IdleController,
+    holder: &str,
+    mint_holders: &[String],
+) -> Result<Option<InflightGuard>, String> {
+    if !is_mint_holder(holder, mint_holders) {
+        return Ok(None); // not MINT's work — never gated (e.g. the compiler lease itself)
+    }
+    match ctl.try_admit() {
+        AdmitOutcome::Admitted(guard) => Ok(Some(guard)),
+        AdmitOutcome::Idle | AdmitOutcome::Transitioning => Err(format!(
+            "MINT is idling for a compiler build — refusing GPU work for '{holder}' (retry later)"
+        )),
+    }
+}
+
+/// Process-global wrapper for [`try_admit_gpu_on`]: gate a MINT GPU acquisition against
+/// the live idle controller and the configured MINT holder labels. Call this at every
+/// MINT GPU-lock acquisition site and hold the returned guard (if any) for the unit of
+/// work. `Ok(None)` ⇒ ungated (non-MINT holder); `Ok(Some)` ⇒ admitted, hold the guard;
+/// `Err` ⇒ refused (MINT is idling) — do NOT acquire the GPU.
+pub fn try_admit_mint_gpu(holder: &str) -> Result<Option<InflightGuard>, String> {
+    try_admit_gpu_on(&mint_idle(), holder, &mint_gpu_holders_from_env())
+}
+
 // ── Watchdog ──────────────────────────────────────────────────────────────────
 
 /// Background fail-safe: every `interval`, if idle and the watchdog deadline has passed
@@ -2314,5 +2363,96 @@ mod tests {
 
         std::env::remove_var("MINT_IDLE_STALE_TRANSITION_SECS");
         std::env::remove_var("MINT_IDLE_RELEASE_BUDGET_SECS");
+    }
+
+    // ── GPU-acquisition admission gate (authoritative drain wiring) ───────────
+
+    fn mint_labels() -> Vec<String> {
+        vec![
+            "intake_coder_sweep".to_string(),
+            "intake_assistant_sweep".to_string(),
+            "intake_coder_case".to_string(),
+            "mint_breakfix".to_string(),
+        ]
+    }
+
+    #[test]
+    fn mint_gpu_admission_refused_while_idling_but_compiler_never_gated() {
+        // Proves the gate MINT's real entry points call (ExclusiveGuard / LiveGpuLock
+        // via try_admit_mint_gpu) refuses MINT GPU work while EnteringIdle/Idle, and
+        // never gates a non-MINT (compiler) holder.
+        let mints = mint_labels();
+
+        // Active: a MINT holder is admitted (Some guard); a non-MINT holder is ungated.
+        let ctl = IdleController::new();
+        let g = try_admit_gpu_on(&ctl, "intake_coder_sweep", &mints)
+            .expect("Active admits MINT work")
+            .expect("MINT holder yields a counted guard");
+        assert_eq!(ctl.inflight_count(), 1, "an admitted MINT unit is counted");
+        assert!(
+            try_admit_gpu_on(&ctl, "bld-05-compiler", &mints)
+                .expect("compiler is never gated")
+                .is_none(),
+            "a non-MINT holder is ungated (no in-flight guard)"
+        );
+        drop(g);
+        assert_eq!(ctl.inflight_count(), 0);
+
+        // Idle: MINT GPU work is REFUSED; the compiler is STILL ungated (must be able to
+        // acquire the GPU it idled MINT for).
+        let idle_ctl = IdleController::new();
+        idle_ctl.enter(manifest("compiler", 1, 2));
+        assert!(idle_ctl.is_idle());
+        assert!(
+            try_admit_gpu_on(&idle_ctl, "intake_coder_sweep", &mints).is_err(),
+            "MINT GPU work must be refused while idle"
+        );
+        assert!(
+            try_admit_gpu_on(&idle_ctl, "mint_breakfix", &mints).is_err(),
+            "every MINT holder is refused while idle"
+        );
+        assert!(
+            try_admit_gpu_on(&idle_ctl, "bld-05-compiler", &mints)
+                .expect("compiler never gated, even while MINT idle")
+                .is_none(),
+            "the compiler must still be able to acquire the GPU while MINT is idle"
+        );
+        assert_eq!(idle_ctl.inflight_count(), 0, "no refused work is counted");
+
+        // EnteringIdle (transient): MINT GPU work is likewise refused.
+        let entering = IdleController::new();
+        assert_eq!(entering.begin_enter(), BeginEnter::Begin);
+        assert!(
+            try_admit_gpu_on(&entering, "intake_coder_case", &mints).is_err(),
+            "MINT GPU work must be refused while EnteringIdle"
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_mint_unit_is_counted_so_a_concurrent_enter_drains_it_not_zero() {
+        // Proves the in-flight counter reflects REAL held MINT work: a concurrent enter's
+        // closed-world drain sees a non-zero count until the unit's guard is dropped.
+        let mints = mint_labels();
+        let ctl = IdleController::new();
+
+        // A MINT unit acquires the GPU (holds the admission guard for the unit).
+        let unit = try_admit_gpu_on(&ctl, "intake_coder_sweep", &mints)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ctl.inflight_count(), 1);
+
+        // A concurrent enter would drain this: drain_inflight sees the real unit and does
+        // NOT reach zero within its bound while the unit is still held.
+        let still = ctl.drain_inflight(Duration::from_millis(30)).await;
+        assert_eq!(
+            still, 1,
+            "drain must see the real in-flight MINT unit (not zero)"
+        );
+
+        // Once the unit finishes and releases (guard drops), drain completes.
+        drop(unit);
+        assert_eq!(ctl.inflight_count(), 0);
+        let drained = ctl.drain_inflight(Duration::from_millis(30)).await;
+        assert_eq!(drained, 0, "drain completes once the MINT unit releases");
     }
 }
