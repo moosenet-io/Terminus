@@ -385,8 +385,21 @@ where
         match queue.at_head(&ticket).await {
             Ok(true) => {
                 if acquire().await {
-                    let _ = queue.pop_head().await; // best-effort: drop our head slot
-                    return Admission::Admitted;
+                    // The limiter granted a token — but we must still remove our
+                    // ticket from the head to actually admit. If that dequeue
+                    // ERRORS (Redis went unavailable after the grant), FAIL
+                    // CLOSED: do NOT admit (mirrors the enqueue/at_head error
+                    // paths). Best-effort clear our head slot so a transient blip
+                    // doesn't wedge later queued requests behind stale head state
+                    // (TTL is the final backstop); the fail-closed decision stands
+                    // regardless of whether that cleanup succeeds.
+                    return match queue.pop_head().await {
+                        Ok(()) => Admission::Admitted,
+                        Err(()) => {
+                            let _ = queue.remove_ticket(&ticket).await;
+                            Admission::Unavailable
+                        }
+                    };
                 }
             }
             Ok(false) => {}
@@ -494,6 +507,9 @@ mod tests {
         salt: String,
         seq: AtomicUsize,
         fail: bool,
+        /// When set, ONLY `pop_head` errors — models Redis going unavailable
+        /// AFTER the limiter grant but before the FIFO dequeue.
+        pop_fail: bool,
     }
     impl FakeQueue {
         fn new(fail: bool) -> Self {
@@ -504,7 +520,13 @@ mod tests {
             salt: &str,
             fail: bool,
         ) -> Self {
-            Self { items, salt: salt.to_string(), seq: AtomicUsize::new(0), fail }
+            Self { items, salt: salt.to_string(), seq: AtomicUsize::new(0), fail, pop_fail: false }
+        }
+        /// A queue whose enqueue/at_head succeed but whose `pop_head` errors.
+        fn with_pop_fail() -> Self {
+            let mut q = Self::new(false);
+            q.pop_fail = true;
+            q
         }
     }
     #[async_trait]
@@ -535,6 +557,9 @@ mod tests {
             Ok(())
         }
         async fn pop_head(&self) -> Result<(), ()> {
+            if self.pop_fail {
+                return Err(());
+            }
             self.items.lock().unwrap().pop_front();
             Ok(())
         }
@@ -592,6 +617,30 @@ mod tests {
         )
         .await;
         assert_eq!(out, Admission::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn admission_fails_closed_when_dequeue_errors_after_grant() {
+        // Redis goes unavailable AFTER the limiter grants a token but BEFORE the
+        // FIFO dequeue: enqueue + at_head succeed, acquire() succeeds, but
+        // pop_head errors. The request MUST be rejected (fail closed), never
+        // admitted — and the ticket must not be left wedging the head.
+        let q = FakeQueue::with_pop_fail();
+        let acquire = || async { true }; // limiter grants immediately
+        let out = run_admission(
+            &q, 128, Duration::from_millis(200), Duration::from_millis(5), acquire,
+        )
+        .await;
+        assert_eq!(
+            out,
+            Admission::Unavailable,
+            "a dequeue error after the grant must fail CLOSED, not admit"
+        );
+        // Best-effort cleanup removed our ticket so it can't wedge the head.
+        assert!(
+            q.items.lock().unwrap().is_empty(),
+            "the ticket must not linger at the head after the fail-closed path"
+        );
     }
 
     #[tokio::test]
