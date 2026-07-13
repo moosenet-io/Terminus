@@ -259,6 +259,32 @@ fn redact_secrets(text: &str, secrets: &[String]) -> String {
     out
 }
 
+/// The S7 redaction set for a build: every secret-shaped VALUE that could be
+/// echoed by a child (or embedded in a `ToolError`) and must be scrubbed before
+/// it reaches captured output, a log, or the progress bus. That is every secret
+/// value in the sccache env (`SCCACHE_REDIS_PASSWORD`, …) PLUS the ambient full
+/// `SCCACHE_REDIS` URL the child inherits. `root_str` only seeds sccache's
+/// non-secret local-dir fallback, so `""` is fine when only the secret values are
+/// needed (e.g. redacting a failed-event message before the build resolves root).
+fn redaction_set(root_str: &str) -> Vec<String> {
+    let sccache_env = sccache::resolve(root_str);
+    let mut redact: Vec<String> = sccache_env
+        .vars
+        .iter()
+        .filter(|(k, _)| scope::is_secret_env_key(k))
+        .map(|(_, v)| v.clone())
+        .filter(|v| !v.is_empty())
+        .collect();
+    if let Some(url) = sccache::ambient_secret_url() {
+        if !url.is_empty() {
+            redact.push(url);
+        }
+    }
+    redact.sort();
+    redact.dedup();
+    redact
+}
+
 /// On a REMOTE (ssh heavy) build, killing the LOCAL `ssh` process group does not
 /// reach the remote `systemd-run --scope` / `cargo` / `rustc` tree. This carries
 /// the info needed to tear that remote tree down by name on timeout: the ssh
@@ -480,21 +506,29 @@ where
         }
         Some(t) => t,
     };
+    // Read RAW BYTES up to each newline — NOT `read_line`, which requires valid
+    // UTF-8 and returns Err on an invalid byte, which would stop the drain and
+    // let a chatty child block on a full pipe → the whole BUILD hangs. With
+    // `read_until` a non-UTF-8 line is lossily decoded, redacted, tapped, and
+    // captured, and draining continues to EOF. Only a TRUE read error breaks.
     let mut reader = tokio::io::BufReader::new(pipe);
     let mut buf: Vec<u8> = Vec::new();
-    let mut line = String::new();
+    let mut raw: Vec<u8> = Vec::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
+        raw.clear();
+        match reader.read_until(b'\n', &mut raw).await {
             Ok(0) => break, // EOF
             Ok(_) => {
+                // Lossily decode (non-UTF-8 bytes → U+FFFD), strip the trailing
+                // newline, redact (S6/S7), tap for progress, and capture.
+                let line = String::from_utf8_lossy(&raw);
                 let redacted =
                     redact_secrets(line.trim_end_matches(|c| c == '\n' || c == '\r'), &redact);
                 tap.on_line(&redacted);
                 buf.extend_from_slice(redacted.as_bytes());
                 buf.push(b'\n');
             }
-            // Non-UTF-8 / read error: stop tapping this pipe (the build itself is
+            // A genuine I/O read error: stop draining this pipe (the child is
             // unaffected; the remaining bytes just don't reach the tail).
             Err(_) => break,
         }
@@ -698,12 +732,11 @@ impl RustTool for CompilerBuild {
         match self.build_inner(&request_id, args).await {
             Ok(out) => Ok(out),
             Err(e) => {
-                // The error Display is already secret-sanitized: `run()` redacts
-                // every subprocess stdout/stderr tail before it becomes a
-                // ToolError, and config/validation errors carry no secrets (S6/S7).
+                // Redact the error message at the EMITTER boundary (S6/S7) before
+                // it reaches the bus (see `redacted_failed_message`).
                 events::bus().emit(
                     &request_id,
-                    events::Emit::stage(events::Stage::Failed).message(e.to_string()),
+                    events::Emit::stage(events::Stage::Failed).message(redacted_failed_message(&e)),
                 );
                 Err(tag_error_with_request_id(e, &request_id))
             }
@@ -728,6 +761,17 @@ fn tag_error_with_request_id(e: ToolError, request_id: &str) -> ToolError {
         ToolError::NotFound(m) => ToolError::NotFound(format!("{tag}{m}")),
         ToolError::Conflict(m) => ToolError::Conflict(format!("{tag}{m}")),
     }
+}
+
+/// Redact a build error's full message at the EMITTER boundary (S6/S7) before it
+/// is emitted onto the progress bus. `run()` already scrubs subprocess stdout/
+/// stderr tails, but OTHER `ToolError` sources (command/path/host/config text)
+/// reach the failed-event emit verbatim — so run the whole message through the
+/// SAME redaction set the build uses, so no secret or infra literal can leave via
+/// the stream. `""` seeds only sccache's non-secret local-dir fallback, so the
+/// secret set is complete even when the build failed before it resolved root.
+fn redacted_failed_message(e: &ToolError) -> String {
+    redact_secrets(&e.to_string(), &redaction_set(""))
 }
 
 impl CompilerBuild {
@@ -793,24 +837,9 @@ impl CompilerBuild {
 
         // Redaction set (S7): the secret VALUES that could be echoed by a child
         // build (a build script printing its env, etc.) and must be scrubbed from
-        // ANY captured stdout/stderr before it reaches an error/log. That is every
-        // secret-shaped value in the sccache env (SCCACHE_REDIS_PASSWORD, …) PLUS
-        // the ambient full `SCCACHE_REDIS` URL (which the child inherits). Passed
-        // to `run()` for both the local and remote build paths.
-        let mut redact: Vec<String> = sccache_env
-            .vars
-            .iter()
-            .filter(|(k, _)| scope::is_secret_env_key(k))
-            .map(|(_, v)| v.clone())
-            .filter(|v| !v.is_empty())
-            .collect();
-        if let Some(url) = sccache::ambient_secret_url() {
-            if !url.is_empty() {
-                redact.push(url);
-            }
-        }
-        redact.sort();
-        redact.dedup();
+        // ANY captured stdout/stderr before it reaches an error/log. Shared with
+        // the failed-event redaction on the wrapper's error path.
+        let redact = redaction_set(&root_str);
 
         // The local source stage (staged on the shared NFS share is fine — it's a
         // source stage, not the live target). Also the rsync source for a remote
@@ -2069,13 +2098,56 @@ mod tests {
         assert!(e.to_string().contains("[request_id=abc123]"));
     }
 
+    /// Process-wide serializer for the rare test that must toggle an env var, so
+    /// parallel tests can never interleave the mutation.
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: set/unset one or more env vars for the test's duration and
+    /// RESTORE every prior value on drop (fixes the earlier flake where a bare
+    /// `remove_var` was never restored). Holds the process-wide env lock so no
+    /// other env-touching test interleaves.
+    struct ScopedEnv {
+        prev: Vec<(&'static str, Option<String>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl ScopedEnv {
+        fn new() -> Self {
+            Self {
+                prev: Vec::new(),
+                _lock: ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner()),
+            }
+        }
+        fn unset(mut self, key: &'static str) -> Self {
+            self.prev.push((key, std::env::var(key).ok()));
+            std::env::remove_var(key);
+            self
+        }
+        fn set(mut self, key: &'static str, val: &str) -> Self {
+            self.prev.push((key, std::env::var(key).ok()));
+            std::env::set_var(key, val);
+            self
+        }
+    }
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            // Restore in reverse so a key touched twice ends at its original value.
+            for (key, prev) in self.prev.iter().rev() {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn failed_build_surfaces_request_id_and_is_discoverable() {
         // Force a DETERMINISTIC post-`queued` failure with no subprocess: unset the
         // dataset root so `dataset_root()` returns NotConfigured right after the
-        // build emits `queued`. (Only build_inner reads this var, and only this
-        // test drives build_inner, so the removal can't disturb other tests.)
-        std::env::remove_var("BUILD_DATASET_ROOT");
+        // build emits `queued`. The scoped guard RESTORES the prior value on drop
+        // and serializes via a process-wide lock, so this cannot flake other tests
+        // (the earlier version left `remove_var` unrestored).
+        let _env = ScopedEnv::new().unset("BUILD_DATASET_ROOT");
 
         // NO caller-supplied request_id → one is auto-generated and MUST come back.
         let err = CompilerBuild
@@ -2112,5 +2184,56 @@ mod tests {
             evs.last().unwrap()["message"].is_string(),
             "failed event carries the (redacted) error tail"
         );
+    }
+
+    #[test]
+    fn redacted_failed_message_scrubs_secret_from_non_subprocess_error() {
+        // A ToolError NOT from a subprocess (so it never went through run()'s
+        // redaction) that embeds a secret-shaped value: the emitter-boundary
+        // redaction must scrub it before it reaches the bus. Set the ambient
+        // sccache secret so the redaction set contains it (guard restores it). The
+        // token is deliberately NOT email/URL-shaped (keeps the PII self-check
+        // happy) — redaction is a plain substring scrub of the secret value.
+        let secret = "<REDACTED-SECRET>";
+        let _env = ScopedEnv::new().set("SCCACHE_REDIS", secret);
+        let err = ToolError::Execution(format!("cache connect failed with {secret} (timeout)"));
+        let msg = redacted_failed_message(&err);
+        assert!(
+            !msg.contains("TOPSECRETTOKEN"),
+            "secret must be redacted from the failed-event message: {msg}"
+        );
+        assert!(msg.contains("<redacted>"));
+    }
+
+    #[tokio::test]
+    async fn drain_pipe_keeps_draining_past_invalid_utf8() {
+        // A chatty child emitting NON-UTF-8 bytes must NOT stop the drain (that
+        // would block the child on a full pipe → the build hangs). Feed invalid
+        // bytes BEFORE a valid progress line + a secret tail; assert the drain
+        // reaches EOF (all lines captured, lossily), the tap saw the progress
+        // line, and the secret was redacted.
+        let id = format!("drain-{}", uuid::Uuid::new_v4());
+        let tap = events::BuildTap::new(&id);
+        let redact = vec!["SECRETXYZ".to_string()];
+        // \xff\xfe are invalid UTF-8; read_line would Err here and stop draining.
+        let input: Vec<u8> =
+            b"\xff\xfe garbage\n   Building [==>] 5/9: serde\nleak=SECRETXYZ tail\n".to_vec();
+        let captured = drain_pipe(Some(&input[..]), Some(tap), redact).await;
+        let text = String::from_utf8_lossy(&captured);
+        // Reached EOF past the invalid line: the LATER lines are present.
+        assert!(text.contains("5/9"), "progress line captured: {text:?}");
+        assert!(
+            text.contains("tail"),
+            "post-invalid line captured (no early break)"
+        );
+        // Secret redacted; raw secret never in the capture.
+        assert!(!text.contains("SECRETXYZ"), "secret redacted in capture");
+        assert!(text.contains("<redacted>"));
+        // The tap parsed the progress line into a building {5,9} event.
+        let snap = events::bus()
+            .snapshot(&id, 0)
+            .expect("tap created the track");
+        assert_eq!(snap.stage, events::Stage::Building);
+        assert_eq!((snap.step, snap.total), (Some(5), Some(9)));
     }
 }

@@ -85,6 +85,33 @@ const DEFAULT_TTL_SECS: u64 = 3600;
 /// just observes a `Lagged` skip and re-reads the snapshot — the ring buffer is
 /// the durable record, the channel is only the live wakeup.
 const BROADCAST_DEPTH: usize = 64;
+/// Max stored length of an event `message` (a few KB): one huge error/log line
+/// must not escape the ring/capacity memory bound. Longer messages are truncated
+/// with a marker. A char-boundary-safe cut.
+const MAX_MESSAGE_LEN: usize = 4096;
+/// Max stored length of a `request_id` (it is a map key + echoed in every event);
+/// bound it so a pathological id can't blow the memory bound either.
+const MAX_REQUEST_ID_LEN: usize = 128;
+
+/// Truncate `s` to at most `max` BYTES on a char boundary; when cut, append
+/// `marker` (so a truncated message is noted). Returns `s` unchanged if it fits.
+fn clamp_str(s: &str, max: usize, marker: &str) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{marker}", &s[..end])
+}
+
+/// A `request_id` clamped to the bounded key length (no marker — it stays a plain
+/// key). Applied consistently on write (emit) and read (snapshot/subscribe) so a
+/// clamped key always matches itself.
+fn clamp_request_id(id: &str) -> String {
+    clamp_str(id, MAX_REQUEST_ID_LEN, "")
+}
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
@@ -380,6 +407,9 @@ impl ProgressBus {
     /// and (for the building stage) throttles unchanged `{step,total}`.
     pub fn emit(&self, request_id: &str, e: Emit) -> u64 {
         let now = now_ms();
+        // Bound the id length (map key + echoed in every event) so a pathological
+        // id can't escape the memory bound; clamp identically on read.
+        let rid = clamp_request_id(request_id);
         // A strictly-increasing LRU ordinal for THIS emit — assigned to the
         // touched build below so eviction order never depends on wall-clock
         // resolution (two emits in the same tick still order strictly).
@@ -387,12 +417,20 @@ impl ProgressBus {
         let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
 
         Self::sweep_locked(&mut map, self.ttl_ms, now);
-        Self::evict_if_full_locked(&mut map, self.max_builds, request_id);
+        Self::evict_if_full_locked(&mut map, self.max_builds, &rid);
 
         let max_events = self.max_events;
         let track = map
-            .entry(request_id.to_string())
+            .entry(rid.clone())
             .or_insert_with(|| Track::new(now, touched, max_events));
+
+        // TERMINAL INTEGRITY: once a stream is terminal (published/failed/deployed/
+        // rolled_back) it is CLOSED — a later event is ignored, so a terminal
+        // snapshot can never report an inconsistent later stage (e.g. building
+        // after published). Deterministic close.
+        if track.terminal.is_some() {
+            return track.next_seq.saturating_sub(1);
+        }
 
         // Throttle applies ONLY to intermediate `{step,total}` progress UPDATES —
         // the building ticks the tap streams from cargo's `N/M` output — NEVER to a
@@ -434,14 +472,19 @@ impl ProgressBus {
             track.terminal = Some(e.stage);
         }
 
+        // Bound the stored message so one huge error/log line can't escape the
+        // ring/capacity memory bound; a truncated message is marked.
+        let message = e
+            .message
+            .map(|m| clamp_str(&m, MAX_MESSAGE_LEN, "…[truncated]"));
         let event = ProgressEvent {
-            request_id: request_id.to_string(),
+            request_id: rid.clone(),
             seq,
             ts_ms: now,
             stage: e.stage,
             step: e.step,
             total: e.total,
-            message: e.message,
+            message,
             sha: e.sha,
         };
         track.events.push(event.clone());
@@ -471,6 +514,9 @@ impl ProgressBus {
     /// id is `not_found`, not an error.
     pub fn snapshot(&self, request_id: &str, since: u64) -> Option<Snapshot> {
         let now = now_ms();
+        // Clamp identically to the write path so a bounded key matches itself.
+        let request_id = clamp_request_id(request_id);
+        let request_id = request_id.as_str();
         let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         // Read-side expiry: an expired build reads as not_found even with no emit.
         let expired = match map.get(request_id) {
@@ -520,6 +566,9 @@ impl ProgressBus {
         request_id: &str,
         since: u64,
     ) -> Option<(Snapshot, broadcast::Receiver<ProgressEvent>)> {
+        // Clamp identically to the write path so a bounded key matches itself.
+        let request_id = clamp_request_id(request_id);
+        let request_id = request_id.as_str();
         let rx = {
             let now = now_ms();
             let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -940,6 +989,56 @@ mod tests {
             Emit::stage(Stage::RolledBack).message("health gate failed"),
         );
         assert!(bus.snapshot("rb", 0).unwrap().terminal);
+    }
+
+    #[test]
+    fn terminal_stream_ignores_later_events() {
+        // Terminal integrity: once a stream is terminal, later events are ignored,
+        // so a terminal snapshot can never report an inconsistent later stage.
+        let bus = ProgressBus::with_bounds(64, 8, 0);
+        let id = "req-terminal";
+        bus.emit(id, Emit::stage(Stage::Building).progress(1, 3));
+        bus.emit(id, Emit::stage(Stage::Published).sha("abc"));
+        // A late (buggy/racing) building event AFTER the terminal is dropped.
+        bus.emit(id, Emit::stage(Stage::Building).progress(2, 3));
+        bus.emit(id, Emit::stage(Stage::Failed).message("too late"));
+        let snap = bus.snapshot(id, 0).unwrap();
+        assert!(snap.terminal);
+        assert_eq!(snap.stage, Stage::Published, "stays at the terminal stage");
+        // No event past the terminal `published` was retained.
+        assert_eq!(snap.events.last().unwrap().stage, Stage::Published);
+        assert!(!snap
+            .events
+            .iter()
+            .any(|e| e.stage == Stage::Building && e.step == Some(2)));
+    }
+
+    #[test]
+    fn huge_message_is_truncated_to_the_bound() {
+        let bus = ProgressBus::with_bounds(64, 8, 0);
+        let id = "req-hugemsg";
+        let huge = "x".repeat(MAX_MESSAGE_LEN * 4);
+        bus.emit(id, Emit::stage(Stage::Failed).message(huge));
+        let snap = bus.snapshot(id, 0).unwrap();
+        let msg = snap.events.last().unwrap().message.as_ref().unwrap();
+        // Bounded: at most the cap plus the marker, and it notes the truncation.
+        assert!(msg.len() <= MAX_MESSAGE_LEN + "…[truncated]".len());
+        assert!(msg.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn oversized_request_id_is_bounded_and_matches_on_read() {
+        let bus = ProgressBus::with_bounds(64, 8, 0);
+        let long = "z".repeat(MAX_REQUEST_ID_LEN * 3);
+        bus.emit(&long, Emit::stage(Stage::Queued));
+        // Stored id is clamped, and a read with the SAME long id still finds it
+        // (read path clamps identically).
+        let snap = bus.snapshot(&long, 0).unwrap();
+        assert!(snap.request_id.len() <= MAX_REQUEST_ID_LEN);
+        assert_eq!(
+            snap.events.last().unwrap().request_id.len(),
+            snap.request_id.len()
+        );
     }
 
     #[test]
