@@ -706,7 +706,7 @@ mod tests {
             self.acquires.fetch_add(1, Ordering::SeqCst);
             if self.fail_acquire {
                 Err(LeaseError::InsufficientRam {
-                    freed_gb: 0.0,
+                    available_gb: 0.0,
                     budget_gb: 100.0,
                 })
             } else {
