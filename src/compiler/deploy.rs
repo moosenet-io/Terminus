@@ -96,6 +96,13 @@ const COMPILER_DEPLOY_MAX_CONCURRENCY: &str = "COMPILER_DEPLOY_MAX_CONCURRENCY";
 /// Env: auto-fire `compiler_deploy` after a successful `compiler_release` promote
 /// that actually flipped `current`. Truthy (`1`/`true`/`yes`/`on`) → on.
 pub const COMPILER_AUTO_DEPLOY: &str = "COMPILER_AUTO_DEPLOY";
+/// Env: the SMALL best-effort budget (seconds) the auto-after-promote deploy may run
+/// INLINE before the promote returns. If the fleet fan-out finishes within it, the
+/// per-host report is attached to the promote result; otherwise the deploy continues
+/// DETACHED and the promote returns promptly (never held hostage by a long fleet
+/// deploy). Only affects the AUTO path — the manual `compiler_deploy` tool stays fully
+/// synchronous.
+const COMPILER_AUTO_DEPLOY_INLINE_BUDGET_SECS: &str = "COMPILER_AUTO_DEPLOY_INLINE_BUDGET_SECS";
 
 /// A generic unit-name convention (not an infra identifier), overridable.
 const DEFAULT_UNIT_TEMPLATE: &str = "constellation-update@{module}.service";
@@ -105,6 +112,9 @@ const DEFAULT_SYSTEMCTL: &str = "systemctl";
 const DEFAULT_TRIGGER_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_MAX_CONCURRENCY: usize = 4;
+/// Default inline budget for the auto-after-promote deploy (seconds) — short, so the
+/// promote is not delayed; the deploy continues detached past it.
+const DEFAULT_AUTO_DEPLOY_INLINE_BUDGET_SECS: u64 = 10;
 /// HARD CEILING on concurrent host triggers, regardless of config — a malformed/huge
 /// `COMPILER_DEPLOY_MAX_CONCURRENCY` can never spawn an absurd number of workers.
 const MAX_CONCURRENCY_CEILING: usize = 64;
@@ -1015,16 +1025,70 @@ pub async fn deploy_report(module: &str, channel: &str, hosts_filter: &str) -> D
     report
 }
 
-/// Auto-trigger hook for `compiler_release` promote. When `COMPILER_AUTO_DEPLOY`
-/// is truthy, fire a fleet-wide deploy and return its payload (for attaching to the
-/// promote result); otherwise `None`. Best-effort: it never errors and never
-/// affects the promote's own success.
+/// The inline budget the auto-after-promote deploy may run before the promote
+/// returns (clamped like the other timeouts).
+fn auto_deploy_inline_budget() -> Duration {
+    parse_timeout_secs(
+        env_nonempty(COMPILER_AUTO_DEPLOY_INLINE_BUDGET_SECS),
+        DEFAULT_AUTO_DEPLOY_INLINE_BUDGET_SECS,
+    )
+}
+
+/// The `auto_deploy` payload returned when the fan-out did NOT finish within the
+/// inline budget (or its task errored): the promote returns promptly and the deploy
+/// continues DETACHED. Fixed-vocabulary, no infra echoed.
+fn detached_auto_deploy_note(reason: &str) -> Value {
+    json!({
+        "kicked_off": true,
+        "awaited": false,
+        "reason": reason,
+        "note": "auto-deploy kicked off in the background and not awaited (the promote is not \
+                 held hostage by the fleet deploy); query compiler_status / compiler_deploy for \
+                 per-host results",
+    })
+}
+
+/// Run a fleet-deploy future on a BACKGROUND task and wait AT MOST `budget` for it. If
+/// it finishes in time, return its report payload (attached inline to the promote);
+/// otherwise return promptly with a detached note — the task is left running (dropping
+/// the `JoinHandle` detaches, never aborts, the task), so the deploy continues in the
+/// background. Generic over the future so it is unit-testable with a mock deploy.
+async fn attach_deploy_within_budget<F>(fut: F, budget: Duration) -> Value
+where
+    F: std::future::Future<Output = DeployReport> + Send + 'static,
+{
+    let handle = tokio::spawn(fut);
+    match tokio::time::timeout(budget, handle).await {
+        // Finished within budget → attach the real per-host report.
+        Ok(Ok(report)) => report.to_payload(),
+        // The background task panicked (should not happen — deploy_report never
+        // panics); surface a detached note rather than propagating.
+        Ok(Err(_join_err)) => detached_auto_deploy_note("auto-deploy task error"),
+        // Budget exceeded → return promptly; the task keeps running detached.
+        Err(_elapsed) => detached_auto_deploy_note("inline budget exceeded"),
+    }
+}
+
+/// Auto-trigger hook for `compiler_release` promote. When `COMPILER_AUTO_DEPLOY` is
+/// truthy, fire a fleet-wide deploy and return a payload to attach to the promote
+/// result; otherwise `None`. BEST-EFFORT AND NON-BLOCKING: the fan-out runs on a
+/// background task and is awaited only up to a small inline budget
+/// (`COMPILER_AUTO_DEPLOY_INLINE_BUDGET_SECS`). A long/6h fleet deploy therefore NEVER
+/// holds the promote response hostage — the promote's own success/latency is
+/// independent of the deploy outcome. (The manual `compiler_deploy` tool remains fully
+/// synchronous — only THIS auto path is budgeted/detached.)
 pub async fn auto_trigger_after_promote(module: &str, channel: &str) -> Option<Value> {
     if !env_truthy(COMPILER_AUTO_DEPLOY) {
         return None;
     }
-    let report = deploy_report(module, channel, "all").await;
-    Some(report.to_payload())
+    // If there is no tokio runtime (should not happen in the live tool path), fall
+    // back to a plain inline await rather than panicking on `tokio::spawn`.
+    if tokio::runtime::Handle::try_current().is_err() {
+        return Some(deploy_report(module, channel, "all").await.to_payload());
+    }
+    let (m, c) = (module.to_string(), channel.to_string());
+    let fut = async move { deploy_report(&m, &c, "all").await };
+    Some(attach_deploy_within_budget(fut, auto_deploy_inline_budget()).await)
 }
 
 // ── The tool ─────────────────────────────────────────────────────────────────
@@ -1872,6 +1936,54 @@ mod tests {
         })
         .await;
         assert!(results.is_empty());
+    }
+
+    fn sample_report() -> DeployReport {
+        DeployReport {
+            module: "chord".into(),
+            channel: "stable".into(),
+            results: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_deploy_fast_fan_out_attaches_report_inline() {
+        // A fan-out that finishes within the budget → the real per-host report is
+        // attached inline (not a detached note).
+        let payload =
+            attach_deploy_within_budget(async { sample_report() }, Duration::from_secs(5)).await;
+        assert_eq!(payload["module"], json!("chord"));
+        assert_eq!(payload["channel"], json!("stable"));
+        assert!(
+            payload.get("awaited").is_none(),
+            "an inline report has no detached-note fields: {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_deploy_slow_fan_out_returns_promptly_detached() {
+        // Finding 2: a SLOW fleet deploy must NOT delay the promote past the small
+        // inline budget — it returns promptly with a detached note; the deploy keeps
+        // running in the background.
+        let start = std::time::Instant::now();
+        let slow = async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            sample_report()
+        };
+        let payload = attach_deploy_within_budget(slow, Duration::from_millis(100)).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the promote must not block on the slow deploy; elapsed={elapsed:?}"
+        );
+        assert_eq!(payload["kicked_off"], json!(true));
+        assert_eq!(
+            payload["awaited"], json!(false),
+            "budget exceeded → detached note, not the (unfinished) report"
+        );
+        // Never masks/echoes anything infra-shaped.
+        assert!(payload.get("module").is_none());
     }
 
     #[tokio::test]

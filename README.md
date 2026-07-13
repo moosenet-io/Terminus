@@ -577,12 +577,19 @@ compiler_deploy(module, channel="stable", hosts="all")
   connectivity** (that is what distinguishes `unreachable` from a failed deploy) — the same
   tri-state trick `compiler_status` uses.
 
-**Auto-trigger after promote (optional).** When `COMPILER_AUTO_DEPLOY` is truthy
+**Auto-trigger after promote (optional, non-blocking).** When `COMPILER_AUTO_DEPLOY` is truthy
 (`1`/`true`/`yes`/`on`), a successful `compiler_release` **promote** that actually flips
-`current` (not a no-op) auto-fires `compiler_deploy(module, to_channel)` and **attaches** the
-deploy report to the promote result under `auto_deploy`. It is **best-effort** — it never fails
-or masks the promote. Left unset, `compiler_deploy` is simply exposed as a tool for the GUI /
-manual use.
+`current` (not a no-op) auto-fires `compiler_deploy(module, to_channel)`. It is **best-effort and
+never holds the promote response hostage**: the fleet fan-out runs on a **background task** awaited
+only up to a small budget (`COMPILER_AUTO_DEPLOY_INLINE_BUDGET_SECS`, default 10s). If it finishes
+within the budget, the per-host report is **attached** to the promote result under `auto_deploy`;
+otherwise the promote returns **promptly** with a `{kicked_off, awaited:false}` note under
+`auto_deploy` and the deploy **continues detached** (query `compiler_status` / `compiler_deploy`
+for results). So a long/6h fleet deploy can never make a successful promote appear hung, and the
+promote's own success/latency is independent of the deploy outcome. The **manual `compiler_deploy`
+tool call stays fully synchronous** (that is its contract) — only the auto-after-promote path is
+budgeted/detached. Left unset, `compiler_deploy` is simply exposed as a tool for the GUI / manual
+use.
 
 Config (all optional, no infra literals — S1): `COMPILER_DEPLOY_HOSTS` (shared with
 `compiler_status`; `;`-separated `label|ssh_target`), `COMPILER_DEPLOY_UNIT_TEMPLATE` (default
@@ -609,8 +616,11 @@ outer wall-clock is `connect + run + 1s` via **saturating** arithmetic, strictly
 connect hang is `unreachable` not `timed_out` and no combination can overflow/panic),
 `COMPILER_DEPLOY_MAX_CONCURRENCY` (default 4 — the effective worker count is **bounded to
 `min(configured, number-of-selected-hosts, 64)`**, so a huge/malformed value or an empty host list
-can never spawn an absurd number of workers), and `COMPILER_AUTO_DEPLOY`. Every one of these is
-robust to malformed config — a `0`/unparseable/absent value falls back to its safe default.
+can never spawn an absurd number of workers), `COMPILER_AUTO_DEPLOY`, and
+`COMPILER_AUTO_DEPLOY_INLINE_BUDGET_SECS` (default 10 — the small budget the auto-after-promote
+deploy is awaited inline before the promote returns and the deploy continues detached; clamped).
+Every one of these is robust to malformed config — a `0`/unparseable/absent value falls back to its
+safe default.
 
 ## Fleet clock — `time_now` (CLK-01)
 
