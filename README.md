@@ -225,15 +225,22 @@ compiler_progress(request_id, since=0, wait_ms=0)
 Each build progresses through ordered **stages**:
 
 ```
-queued → scheduled → relaying → building{step,total} → publishing → published | failed
+queued → scheduled → [relaying (remote only)] → building{step,total} → publishing → published | failed
 ```
+
+Every **stage transition** is emitted and retained exactly once — even a build whose cargo
+output has no parseable `{step,total}` line still shows a `building` (started) event. The
+throttling below applies **only** to intermediate `{step,total}` progress updates, never to a
+stage transition.
 
 - `queued` — request accepted (carries `module@ref`).
 - `scheduled` — build host selected (`primary`/`heavy`).
-- `relaying` — source staged to the heavy host (remote builds only).
-- `building` — compilation in progress; `{step,total}` is parsed from cargo's build
-  progress (`N/M`) and streamed live as the crates compile, throttled so an unchanged step
-  is not re-emitted.
+- `relaying` — source staged (rsync) to the heavy host. **Remote/heavy path only** — a local
+  (in-place) build has nothing to relay and legitimately goes `scheduled → building` directly;
+  a local stream without a `relaying` event is valid, not a gap.
+- `building` — compilation in progress. The started transition is always emitted; then
+  `{step,total}` is parsed from cargo's build progress (`N/M`) and streamed live as the crates
+  compile, throttled so an unchanged step is not re-emitted.
 - `publishing` — artifact being checksummed + written.
 - `published` — **terminal success**, carries the artifact `sha256`. (`compiler_build`'s
   scope ends at publish; `deployed` / `rolled_back` are reserved terminal stages the

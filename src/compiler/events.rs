@@ -11,8 +11,23 @@
 //! ## The model
 //! One [`ProgressEvent`] per stage transition (plus throttled log-tail lines
 //! during the build). Stages, in order:
-//!   `queued → scheduled → relaying → building{step,total} → publishing →
-//!    deployed | failed | rolled_back`
+//!   `queued → scheduled → [relaying (remote only)] → building{step,total} →
+//!    publishing → deployed | failed | rolled_back`
+//!
+//! `relaying` is a REMOTE-path stage: it means "rsync the source to the heavy
+//! build host". A LOCAL (primary, in-place) build has nothing to relay, so it
+//! legitimately goes `scheduled → building` directly — a local stream without a
+//! `relaying` event is valid and expected, not a gap.
+//!
+//! ## Stage TRANSITIONS vs. progress UPDATES
+//! Two kinds of event share the stream. A STAGE TRANSITION (each of
+//! queued/scheduled/relaying/building-STARTED/publishing/published/failed) is
+//! always emitted and retained exactly once — even a build whose cargo output has
+//! no parseable `{step,total}` line still shows a `building` (started) event. A
+//! progress UPDATE is an intermediate building tick carrying `{step,total}`
+//! (streamed from cargo's `N/M`); only those are throttled — a duplicate/unchanged
+//! step is coalesced. The throttle NEVER drops a stage transition.
+//!
 //! `compiler_build`'s own scope ends at publish, so it emits the terminal
 //! [`Stage::Published`] (with the artifact sha) on success and [`Stage::Failed`]
 //! (with a sanitized error tail) on failure. [`Stage::Deployed`] and
@@ -99,6 +114,8 @@ fn now_ms() -> u64 {
 pub enum Stage {
     Queued,
     Scheduled,
+    /// Staging source to the heavy build host. REMOTE path only — a local
+    /// (in-place) build has nothing to relay and skips straight to `Building`.
     Relaying,
     Building,
     Publishing,
@@ -375,22 +392,31 @@ impl ProgressBus {
             .entry(request_id.to_string())
             .or_insert_with(|| Track::new(now, touched, max_events));
 
-        // Throttle: a building event that neither advances the step nor carries a
-        // message is redundant — drop it (avoid a flood of identical progress).
-        if e.stage == Stage::Building && e.message.is_none() {
-            match (e.step, e.total) {
-                (Some(step), Some(total)) => {
-                    if track.last_step == Some((step, total)) {
-                        return track.next_seq.saturating_sub(1);
-                    }
-                    track.last_step = Some((step, total));
-                }
-                _ => {
-                    // A contentless building event carries nothing new — drop it.
-                    return track.next_seq.saturating_sub(1);
-                }
+        // Throttle applies ONLY to intermediate `{step,total}` progress UPDATES —
+        // the building ticks the tap streams from cargo's `N/M` output — NEVER to a
+        // STAGE TRANSITION. A stage transition (queued/scheduled/relaying/building-
+        // STARTED/publishing/published/failed) is always emitted + retained exactly
+        // once per transition, so even a build whose cargo emits no parseable `N/M`
+        // line still shows `building` (started) → `publishing`.
+        //
+        // A building progress UPDATE is a building event that carries `{step,total}`
+        // and no message; only its duplicate (same step) is coalesced. A contentless
+        // `building` (the intentional "build started" transition) falls straight
+        // through and is retained.
+        let is_progress_update = e.stage == Stage::Building
+            && e.message.is_none()
+            && e.step.is_some()
+            && e.total.is_some();
+        if is_progress_update {
+            let pair = (e.step.unwrap(), e.total.unwrap());
+            if track.last_step == Some(pair) {
+                // Duplicate/unchanged progress tick — coalesce (do not retain).
+                return track.next_seq.saturating_sub(1);
             }
+            track.last_step = pair.into();
         } else if e.stage == Stage::Building {
+            // A building event that also carries `{step,total}` (e.g. a started
+            // transition annotated with progress) still updates the latest step.
             if let (Some(step), Some(total)) = (e.step, e.total) {
                 track.last_step = Some((step, total));
             }
@@ -650,6 +676,87 @@ mod tests {
             .collect();
         assert_eq!(building.len(), 2, "duplicate step throttled");
         assert_eq!(snap.step, Some(2));
+    }
+
+    #[test]
+    fn building_started_transition_is_always_retained_without_progress() {
+        // A build whose cargo output has NO parseable N/M line: the tap never
+        // emits a `{step,total}` tick, but the explicit "build started" transition
+        // MUST still be retained, so the stream shows the full stage sequence.
+        let bus = ProgressBus::with_bounds(64, 8, 0);
+        let id = "req-no-progress";
+        bus.emit(id, Emit::stage(Stage::Queued));
+        bus.emit(id, Emit::stage(Stage::Scheduled));
+        bus.emit(id, Emit::stage(Stage::Relaying)); // remote-style; still valid
+        bus.emit(id, Emit::stage(Stage::Building)); // STARTED, no {step,total}
+        bus.emit(id, Emit::stage(Stage::Publishing));
+        bus.emit(id, Emit::stage(Stage::Published).sha("f00d"));
+        let snap = bus.snapshot(id, 0).unwrap();
+        let stages: Vec<&str> = snap.events.iter().map(|e| e.stage.as_str()).collect();
+        assert_eq!(
+            stages,
+            vec![
+                "queued",
+                "scheduled",
+                "relaying",
+                "building",
+                "publishing",
+                "published"
+            ],
+            "every stage transition retained even with no progress ticks"
+        );
+        // The building-started event carries no {step,total} (it's a transition).
+        let b = snap
+            .events
+            .iter()
+            .find(|e| e.stage == Stage::Building)
+            .unwrap();
+        assert_eq!((b.step, b.total), (None, None));
+    }
+
+    #[test]
+    fn relaying_is_remote_only_local_stream_valid_without_it() {
+        // Contract: `relaying` appears only on the REMOTE/heavy path (rsync to the
+        // build host). A LOCAL build's stream is valid WITHOUT it.
+        let bus = ProgressBus::with_bounds(64, 8, 0);
+
+        // LOCAL: scheduled → building directly, NO relaying.
+        let local = "req-local";
+        for st in [
+            Stage::Queued,
+            Stage::Scheduled,
+            Stage::Building,
+            Stage::Publishing,
+            Stage::Published,
+        ] {
+            bus.emit(local, Emit::stage(st));
+        }
+        let ls = bus.snapshot(local, 0).unwrap();
+        assert!(
+            !ls.events.iter().any(|e| e.stage == Stage::Relaying),
+            "local build must not emit relaying"
+        );
+        assert!(ls.terminal && ls.stage == Stage::Published);
+
+        // REMOTE: includes relaying between scheduled and building.
+        let remote = "req-remote";
+        for st in [
+            Stage::Queued,
+            Stage::Scheduled,
+            Stage::Relaying,
+            Stage::Building,
+            Stage::Publishing,
+            Stage::Published,
+        ] {
+            bus.emit(remote, Emit::stage(st));
+        }
+        let rs = bus.snapshot(remote, 0).unwrap();
+        let idx = |st: Stage| rs.events.iter().position(|e| e.stage == st).unwrap();
+        assert!(
+            idx(Stage::Scheduled) < idx(Stage::Relaying)
+                && idx(Stage::Relaying) < idx(Stage::Building),
+            "remote build emits relaying between scheduled and building"
+        );
     }
 
     #[test]
