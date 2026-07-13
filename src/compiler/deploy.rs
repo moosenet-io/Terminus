@@ -19,10 +19,15 @@
 //!   - `deployed`    — the updater swapped to a new version, health-gate passed.
 //!   - `skipped`     — a no-op: the host was already on `current` (unchanged).
 //!   - `rolled_back` — the updater swapped, the health-gate FAILED, and it rolled
-//!                     back to the backup. Surfaced distinctly, never as success.
-//!   - `failed`      — the updater ran but errored (e.g. missing/corrupt artifact),
-//!                     OR the `systemctl start` itself failed (non-zero rc — never
-//!                     masked by a stale success `Result`/marker token).
+//!                     back to the backup. Surfaced distinctly, never as success. A
+//!                     trusted `rolled_back` marker is AUTHORITATIVE over the exit
+//!                     code (a rollback legitimately exits non-zero), so it is never
+//!                     masked into a generic `failed`.
+//!   - `failed`      — the updater ran but errored (e.g. missing/corrupt artifact) —
+//!                     a trusted `failed` marker, OR (with NO trusted marker) a
+//!                     non-zero `systemctl start` rc / a non-success systemd `Result`.
+//!                     The rc gate applies only to SUCCESS outcomes + the no-marker
+//!                     path — it never overrides a trusted non-success marker.
 //!   - `timed_out`   — the host was REACHED and the updater triggered, but the
 //!                     synchronous run exceeded the trigger budget: an in-flight/
 //!                     hung deploy of unknown outcome, surfaced DISTINCTLY from
@@ -618,63 +623,64 @@ fn parse_result_line(body: &str) -> (Option<i64>, String, String) {
 
 /// Classify a reachable host's outcome from `(rc, systemd Result, updater token)`.
 ///
-/// A NON-ZERO `systemctl start` rc means the TRIGGER ITSELF failed (findings 3 & 4):
-/// neither a stale `Result=success` (a previous run's cached systemd Result) nor a
-/// stale marker token may override it, so a non-zero rc is ALWAYS `failed` — the
-/// `Result`/token are only consulted when the start actually succeeded. This is
-/// what stops a failed start being masked as `deployed`.
+/// PRECEDENCE — the TRUSTED marker token is consulted FIRST, and the `rc` gate applies
+/// ONLY to success outcomes:
 ///
-/// When start succeeded, the updater's own outcome TOKEN drives the result (the only
-/// signal that distinguishes a rollback or a no-op from a plain success — and it is
-/// run-scoped: the wrapper only reads the token when its pre-trigger `rm` cleared any
-/// prior marker, and sanitizes it against sentinel spoofing). The token is mapped
-/// through a FIXED VOCABULARY:
-///   - a recognized token ⇒ the matching outcome,
-///   - an EMPTY token (no marker written) ⇒ degrade to the systemd `Result` AND rc,
-///   - a NON-EMPTY but UNRECOGNIZED token ⇒ `unknown` (non-converged, must-not-trust).
+/// 1. A TRUSTED marker with a NON-SUCCESS authoritative token is AUTHORITATIVE OVER
+///    `rc` (finding, cycle-9): `rolled_back` ⇒ `rolled_back` and `failed` ⇒ `failed`,
+///    EVEN with a non-zero `systemctl start` rc — a rollback legitimately exits
+///    non-zero, and its own marker is the ground truth, so it must never be masked
+///    into a generic `failed`. (The marker is only read when the wrapper's pre-trigger
+///    `rm` cleared any prior marker and it survived sanitization/single-sentinel, so a
+///    trusted token is genuinely THIS run's.)
 ///
-/// CRITICAL (finding 1): a CONVERGED/success outcome (`deployed`/`skipped`) is only
-/// ever trusted when a REAL `rc == 0` was actually PARSED from the wrapper's sentinel.
-/// If `rc` is absent/unparseable — a stale/damaged/truncated sentinel line that still
-/// says `result=success`, or a token that reads `deployed` with no exit code — it
-/// degrades to `unknown` (never masked as `deployed`). Only failure/rollback outcomes
-/// are reported without a parsed rc, since reporting a failure can't mask a success.
+/// 2. A TRUSTED marker with a SUCCESS token (`deployed`/`skipped`/no-op) is trusted
+///    ONLY when a REAL `rc == 0` was parsed — the exit code gates SUCCESS so a
+///    failed/absent-rc start can't be masked as `deployed`. Otherwise ⇒ `unknown`.
 ///
-/// ABSENT-MARKER (finding 2): the degrade path requires BOTH `rc == 0` AND a systemd
-/// `Result` of `success`. A non-success `Result` (`failed`/`timeout`/`signal`/
-/// `core-dump`/…) is `failed` even with `rc == 0` (a non-success Result must never be
-/// reported as deployed); an INDETERMINATE `Result` (empty/unreadable) with `rc == 0`
-/// is `unknown` (exit code alone is not enough). The raw token/Result are never
-/// returned; only the classified outcome is.
+/// 3. A NON-EMPTY but UNRECOGNIZED token ⇒ `unknown` (non-converged, must-not-trust).
+///
+/// 4. NO trusted marker (empty token) ⇒ classify from systemd `Result` AND `rc`: a
+///    non-zero rc ⇒ `failed`; `rc == 0` + `Result=success` ⇒ `deployed`; `rc == 0` +
+///    a non-success `Result` ⇒ `failed`; `rc == 0` + an indeterminate `Result` ⇒
+///    `unknown` (exit code alone is not enough).
+///
+/// The raw token/Result are never returned; only the classified outcome is.
 pub fn classify_reachable(rc: Option<i64>, result: &str, token: &str) -> DeployOutcome {
-    // A start that failed is `failed`, full stop — never overridden by a stale
-    // success Result or a stale marker token.
-    if matches!(rc, Some(code) if code != 0) {
-        return DeployOutcome::Failed;
-    }
-    // The ONLY signal that lets us trust a converged/success outcome: a real parsed
-    // exit code of 0. An absent/unparseable rc must never be trusted as success.
     let started_ok = rc == Some(0);
     let token = token.trim().to_ascii_lowercase();
-    let naive = match token.as_str() {
-        // Empty token → no marker this run → degrade to the systemd `Result` AND rc.
-        "" => classify_absent_marker(started_ok, result),
+    match token.as_str() {
+        // (1) NON-SUCCESS authoritative marker — beats rc (a rollback exits non-zero).
         "rolled_back" | "rolledback" | "rollback" => DeployOutcome::RolledBack,
-        "deployed" | "updated" | "swapped" | "success" => DeployOutcome::Deployed,
-        "skipped" | "noop" | "no-op" | "unchanged" | "up-to-date" | "current" => {
-            DeployOutcome::Skipped
-        }
         "failed" | "error" | "abort" | "aborted" => DeployOutcome::Failed,
-        // A non-empty token we don't recognize → `unknown` (never trusted as
+        // (2) SUCCESS marker — trusted ONLY with a real parsed rc==0, else `unknown`.
+        "deployed" | "updated" | "swapped" | "success" => {
+            if started_ok {
+                DeployOutcome::Deployed
+            } else {
+                DeployOutcome::Unknown
+            }
+        }
+        "skipped" | "noop" | "no-op" | "unchanged" | "up-to-date" | "current" => {
+            if started_ok {
+                DeployOutcome::Skipped
+            } else {
+                DeployOutcome::Unknown
+            }
+        }
+        // (4) No trusted marker → systemd `Result` AND rc. A non-zero rc is `failed`
+        // here (no authoritative marker to say otherwise).
+        "" => {
+            if matches!(rc, Some(code) if code != 0) {
+                DeployOutcome::Failed
+            } else {
+                classify_absent_marker(started_ok, result)
+            }
+        }
+        // (3) A non-empty token we don't recognize → `unknown` (never trusted as
         // success, never echoed).
         _ => DeployOutcome::Unknown,
-    };
-    // Without a REAL parsed `rc == 0`, a converged/success outcome cannot be trusted →
-    // `unknown`. A failure/rollback outcome is reported as-is (it can't mask success).
-    if !started_ok && matches!(naive, DeployOutcome::Deployed | DeployOutcome::Skipped) {
-        return DeployOutcome::Unknown;
     }
-    naive
 }
 
 /// The three kinds of systemd unit `Result` (`systemctl show -p Result`).
@@ -1241,16 +1247,48 @@ mod tests {
     }
 
     #[test]
-    fn nonzero_start_rc_ignores_stale_success_token() {
-        // Finding 4: a STALE `deployed`/`skipped` marker token from a prior run must
-        // not mask a current failure when the start itself failed (rc != 0).
+    fn nonzero_start_rc_downgrades_success_token_to_unknown() {
+        // A SUCCESS marker token (`deployed`/`skipped`) with a non-zero start rc is NOT
+        // trusted as success — success requires rc==0 — so it degrades to `unknown`
+        // (never a masked `deployed`).
         assert_eq!(
             classify_reachable(Some(1), "success", "deployed"),
-            DeployOutcome::Failed
+            DeployOutcome::Unknown
         );
         assert_eq!(
             classify_reachable(Some(1), "", "skipped"),
-            DeployOutcome::Failed
+            DeployOutcome::Unknown
+        );
+    }
+
+    #[test]
+    fn trusted_non_success_marker_is_authoritative_over_rc() {
+        // Cycle-9 finding: a TRUSTED non-success marker beats the rc gate — a rollback
+        // legitimately exits non-zero, so a `rolled_back` marker must be reported as
+        // `rolled_back`, NEVER masked into a generic `failed`. A `failed` marker → failed.
+        assert_eq!(
+            classify_reachable(Some(1), "failed", "rolled_back"),
+            DeployOutcome::RolledBack,
+            "rolled_back marker + non-zero rc → rolled_back (not failed)"
+        );
+        assert_eq!(
+            classify_reachable(Some(3), "", "rollback"),
+            DeployOutcome::RolledBack
+        );
+        assert_eq!(
+            classify_reachable(None, "success", "rolled_back"),
+            DeployOutcome::RolledBack,
+            "rolled_back marker is authoritative even with an unparseable rc"
+        );
+        assert_eq!(
+            classify_reachable(Some(2), "failed", "failed"),
+            DeployOutcome::Failed,
+            "failed marker → failed"
+        );
+        // And a rollback with a clean rc is of course still rolled_back.
+        assert_eq!(
+            classify_reachable(Some(0), "success", "rolled_back"),
+            DeployOutcome::RolledBack
         );
     }
 

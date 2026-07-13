@@ -539,10 +539,15 @@ compiler_deploy(module, channel="stable", hosts="all")
   (`head -n1` + `tr -cd 'A-Za-z0-9_-'`), so a marker containing a newline + a forged
   `COMPILER_DEPLOY … token=deployed` line can neither inject a second sentinel line nor smuggle
   metacharacters (the Rust parser also refuses to trust a stream carrying more than one sentinel
-  line); a non-zero `systemctl start` rc is classified `failed` regardless of the unit's (possibly
-  stale) `Result`; an **absent marker** trusts `deployed` only when `rc == 0` **AND** the systemd
-  `Result` is `success` (a non-success `Result` → `failed` even with rc==0; an indeterminate
-  `Result` → `unknown` — exit code alone is not enough); the **outer wall-clock timeout is strictly
+  line); a **trusted non-success marker is authoritative over the exit code** — a `rolled_back`
+  marker is reported as `rolled_back` and a `failed` marker as `failed` EVEN with a non-zero
+  `systemctl start` rc (a rollback legitimately exits non-zero), so a rollback is never masked
+  into a generic `failed`; the **rc gate applies only to SUCCESS outcomes** — a `deployed`/`skipped`
+  marker is trusted only with a real `rc == 0`, else it degrades to `unknown` (success is never
+  trusted without a clean exit); an **absent marker** classifies from the systemd `Result` **AND**
+  `rc` — a non-zero rc → `failed`; `rc == 0` + `Result=success` → `deployed`; `rc == 0` + a
+  non-success `Result` → `failed`; `rc == 0` + an indeterminate `Result` → `unknown` (exit code
+  alone is not enough); the **outer wall-clock timeout is strictly
   greater than the ssh connect budget**, so a connect/auth hang surfaces as `unreachable` (never
   `timed_out`); the per-host `detail` is **fixed-vocabulary only** (`outcome=… rc=…`) — the raw
   updater marker token is **never echoed** into structured output; an **unknown requested host** is
