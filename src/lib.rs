@@ -87,6 +87,7 @@ pub mod synapse;
 /// searxng_search).
 pub mod sundry;
 pub mod sysversion;
+pub mod time; // CLK-01: authoritative fleet clock (time_now)
 pub mod tool;
 pub mod tools;
 pub mod vector;

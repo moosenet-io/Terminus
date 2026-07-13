@@ -172,6 +172,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     crate::synapse::register(registry);
     crate::sundry::register(registry);
     crate::sysversion::register(registry);
+    crate::time::register(registry); // CLK-01: time_now authoritative clock
     crate::vector::register(registry);
     crate::vigil::register(registry);
     crate::vitals::register(registry);
