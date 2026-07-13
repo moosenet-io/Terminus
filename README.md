@@ -509,7 +509,9 @@ compiler_deploy(module, channel="stable", hosts="all")
   `constellation-update@<module>` systemd unit (BLD-12) over ssh — `systemctl start <unit>`,
   which blocks until the updater's whole `fetch → sha-verify → backup → atomic-mv → restart →
   health-gate → rollback → marker` flow finishes — then reads back the systemd `Result` and
-  the updater's optional outcome-token file to classify a **per-host outcome**.
+  the updater's optional outcome-token file to classify a **per-host outcome**. It reuses the
+  **single shared sanctioned reach** (`status::sanctioned_ssh_argv`) that `compiler_status`
+  uses — one authoritative non-mutating ssh option set, no duplicate/drifting definition.
 - **Division of responsibility:** the compiler **only triggers**. The updater still **owns the
   swap safety** (health-gate + rollback). `compiler_deploy` never touches a binary, symlink, or
   health check — it fires the unit and reports what the updater reports.
@@ -519,17 +521,22 @@ compiler_deploy(module, channel="stable", hosts="all")
   errored **or the `systemctl start` itself failed** — a non-zero start rc is never masked by a
   stale success `Result`/marker token), `timed_out` (the host was **reached** and the updater
   triggered, but the synchronous run exceeded the budget — an in-flight/hung deploy, surfaced
-  **distinctly from** `unreachable`), or `unreachable` (an ssh-level **connect/auth** failure,
-  never a run timeout). One bad host **never aborts** the fan-out — the others still proceed and
-  the nightly timer catches the straggler.
-- **No-masked-failures hardening:** the trigger forces **non-interactive sudo** (`sudo -n`) so a
-  password prompt fails fast instead of hanging the whole per-host budget; the outcome marker is
-  **run-scoped** (cleared before each trigger) so a stale prior-run token can't mask a current
-  failure; and a non-zero `systemctl start` rc is classified `failed` regardless of the unit's
-  (possibly stale) `Result`.
+  **distinctly from** `unreachable`), `unknown` (the updater wrote an outcome token the compiler
+  does not recognize — a non-converged, must-not-trust result), or `unreachable` (an ssh-level
+  **connect/auth** failure, never a run timeout). One bad host **never aborts** the fan-out — the
+  others still proceed and the nightly timer catches the straggler.
+- **No-masked-failures / no-raw-echo hardening:** the trigger forces **non-interactive sudo**
+  (`sudo -n`) so a password prompt fails fast instead of hanging the whole per-host budget; the
+  outcome marker is **run-scoped** (cleared before each trigger) so a stale prior-run token can't
+  mask a current failure; a non-zero `systemctl start` rc is classified `failed` regardless of
+  the unit's (possibly stale) `Result`; the per-host `detail` is **fixed-vocabulary only**
+  (`outcome=… rc=…`) — the raw updater marker token is **never echoed** into structured output;
+  an **unknown requested host** is reported by **count only** (never reflecting arbitrary caller
+  input / ssh targets back); and `COMPILER_DEPLOY_SYSTEMCTL` is a **constrained** command (bare
+  tokens only, shell metacharacters rejected with a config error — not arbitrary shell).
 - **Aggregation:** the result carries every host's `{host, outcome, detail}` plus `counts`
-  (`deployed`/`skipped`/`rolled_back`/`failed`/`timed_out`/`unreachable`/`total`), a `degraded`
-  flag and
+  (`deployed`/`skipped`/`rolled_back`/`failed`/`timed_out`/`unknown`/`unreachable`/`total`), a
+  `degraded` flag and
   `stragglers` count (the hosts that did not converge), and `notes`. A **partial fleet** result
   is surfaced as `degraded=true` with a note that the nightly timer remains the catch-all.
 - **Host reach (S7):** the trigger uses the *same* non-mutating BatchMode ssh reach as BLD-08
@@ -550,8 +557,9 @@ manual use.
 Config (all optional, no infra literals — S1): `COMPILER_DEPLOY_HOSTS` (shared with
 `compiler_status`; `;`-separated `label|ssh_target`), `COMPILER_DEPLOY_UNIT_TEMPLATE` (default
 `constellation-update@{module}.service`; `{module}`/`{channel}` substituted),
-`COMPILER_DEPLOY_SYSTEMCTL` (default `systemctl`; set e.g. `sudo systemctl` where the reach
-user needs elevation — a `sudo` prefix is auto-forced non-interactive with `-n`),
+`COMPILER_DEPLOY_SYSTEMCTL` (default `systemctl`; a **constrained** command — bare tokens
+`[A-Za-z0-9._/-]` that must invoke `systemctl`, e.g. `sudo systemctl`; shell metacharacters are
+rejected. A `sudo` prefix is auto-forced non-interactive with `-n`),
 `COMPILER_DEPLOY_RESULT_MARKER_TEMPLATE` (default
 `/opt/{module}/.deploy_result` — the updater's outcome-token file; absent it, the outcome
 degrades to the systemd `Result` + exit code), `COMPILER_DEPLOY_TRIGGER_TIMEOUT_SECS` (default

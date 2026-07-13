@@ -5,9 +5,9 @@
 //! constellation-updater timer. `compiler_deploy(module, channel, hosts="all")`
 //! TRIGGERS the already-deployed `constellation-update@<module>` systemd unit —
 //! in its BLD-12 fetch mode — on each configured deploy host over the EXISTING
-//! sanctioned host-reach path (the same BatchMode ssh reach BLD-08's
-//! `compiler_status` uses to read `.deployed_sha` markers), then AGGREGATES a
-//! per-host outcome.
+//! sanctioned host-reach path (the SINGLE shared `status::sanctioned_ssh_argv`
+//! BLD-08's `compiler_status` uses to read `.deployed_sha` markers — deploy defines
+//! no ssh option set of its own), then AGGREGATES a per-host outcome.
 //!
 //! ## Division of responsibility (do NOT reimplement swap safety here)
 //! The compiler ONLY triggers. The updater (BLD-12) still owns the whole swap:
@@ -27,17 +27,25 @@
 //!                     synchronous run exceeded the trigger budget: an in-flight/
 //!                     hung deploy of unknown outcome, surfaced DISTINCTLY from
 //!                     `unreachable` (a slow deploy is not a connectivity failure).
+//!   - `unknown`     — the updater wrote an outcome token the compiler does not
+//!                     recognize (not in the fixed vocabulary): non-converged and
+//!                     NOT trusted as success; the raw token is never surfaced.
 //!   - `unreachable` — an ssh-level CONNECT/AUTH failure (never a run timeout). One
 //!                     bad host never aborts the fan-out; the others still proceed
 //!                     and the nightly timer catches the straggler.
 //!
 //! ## Discipline
-//! - **S1** — every host, unit name, systemctl invocation, marker path, timeout,
-//!   and concurrency bound comes from config env with a GENERIC default (the
-//!   `constellation-update@{module}.service` unit name and `/opt/{module}/...`
-//!   marker are conventions, exactly like BLD-08's `.deployed_sha` default), never
-//!   an infra literal. The only values surfaced back to a caller are the small,
-//!   fixed outcome vocabulary + systemd `Result` enum + `rc` — no host/path echo.
+//! - **S1 (no raw echo)** — every host, unit name, systemctl invocation, marker
+//!   path, timeout, and concurrency bound comes from config env with a GENERIC
+//!   default (the `constellation-update@{module}.service` unit and `/opt/{module}/…`
+//!   marker are conventions, like BLD-08's `.deployed_sha`), never an infra literal.
+//!   The ONLY thing surfaced back to a caller is the fixed outcome vocabulary + an
+//!   integer `rc` — the raw updater marker token, free-form `Result` text, and any
+//!   caller-supplied requested-host string are NEVER echoed (an unknown host is a
+//!   count; a bad marker classifies to `unknown`; `detail` is `outcome=… rc=…`).
+//!   `COMPILER_DEPLOY_SYSTEMCTL` is a CONSTRAINED command (bare tokens invoking
+//!   `systemctl`), not arbitrary shell — metacharacters are rejected with a config
+//!   error, so nothing unsanitized reaches the remote shell.
 //! - **S7** — the trigger authenticates with the ambient ssh key of the sanctioned
 //!   reach path (same as BLD-08); it reads NO token/key/password from the env, so
 //!   there is nothing secret-shaped to route through `SecretManager` here.
@@ -52,7 +60,7 @@ use crate::error::ToolError;
 use crate::registry::ToolRegistry;
 use crate::tool::{RustTool, ToolOutput};
 
-use super::status::{configured_deploy_hosts, DeployHost};
+use super::status::{configured_deploy_hosts, sanctioned_ssh_argv, DeployHost};
 
 /// Env: the systemd unit-name template to trigger, `{module}` (and, if present,
 /// `{channel}`) substituted. Generic FHS-style convention, overridable.
@@ -110,8 +118,66 @@ fn result_marker_template() -> String {
         .unwrap_or_else(|| DEFAULT_RESULT_MARKER_TEMPLATE.to_string())
 }
 
-fn systemctl_cmd() -> String {
-    env_nonempty(COMPILER_DEPLOY_SYSTEMCTL).unwrap_or_else(|| DEFAULT_SYSTEMCTL.to_string())
+/// A single token of the systemctl command is SAFE iff it is a bare word of
+/// `[A-Za-z0-9._/-]` (a binary name / absolute path / a `-n`-style flag) — NO shell
+/// metacharacters, whitespace-within, or quoting. This is what makes it safe to
+/// insert verbatim into the remote shell command.
+fn is_safe_systemctl_token(t: &str) -> bool {
+    !t.is_empty()
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+}
+
+/// Validate `COMPILER_DEPLOY_SYSTEMCTL` (finding 4): it is a CONSTRAINED systemctl
+/// invocation, **not** arbitrary operator shell. It must be a whitespace-separated
+/// token list where every token is a safe bare word (`[A-Za-z0-9._/-]`) and one
+/// token is `systemctl` (or a `.../systemctl` path) — so `systemctl`,
+/// `sudo systemctl`, `sudo -n systemctl`, `/usr/bin/systemctl` are accepted, while
+/// anything carrying a shell metacharacter (`; | & $ > < \` \ ( ) { } * ? quotes
+/// newlines`) or an unexpected token is REJECTED with a clear config error (never
+/// inserted into the remote shell). Empty/unset ⇒ the default `systemctl`. The
+/// error message NEVER echoes the raw value back (S1).
+fn validate_systemctl_cmd(raw: &str) -> Result<String, ToolError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(DEFAULT_SYSTEMCTL.to_string());
+    }
+    // Reject any control character (incl. embedded newline/tab/CR, which
+    // `split_whitespace` would otherwise silently swallow) or shell metacharacter
+    // outright, BEFORE tokenizing — defence in depth over the per-token allowlist.
+    const META: &[char] = &[
+        ';', '|', '&', '$', '>', '<', '`', '\\', '(', ')', '{', '}', '[', ']', '*', '?', '!',
+        '~', '#', '"', '\'', '=', ':',
+    ];
+    if raw.chars().any(|c| c.is_control() || META.contains(&c)) {
+        return Err(ToolError::InvalidArgument(format!(
+            "{COMPILER_DEPLOY_SYSTEMCTL} must be a constrained systemctl command \
+             (no control characters or shell metacharacters); rejected"
+        )));
+    }
+    let toks: Vec<&str> = raw.split_whitespace().collect();
+    if !toks.iter().all(|t| is_safe_systemctl_token(t)) {
+        return Err(ToolError::InvalidArgument(format!(
+            "{COMPILER_DEPLOY_SYSTEMCTL} must be a constrained systemctl command \
+             (bare tokens of [A-Za-z0-9._/-] only — no shell metacharacters); rejected"
+        )));
+    }
+    if !toks
+        .iter()
+        .any(|t| *t == "systemctl" || t.ends_with("/systemctl"))
+    {
+        return Err(ToolError::InvalidArgument(format!(
+            "{COMPILER_DEPLOY_SYSTEMCTL} must invoke `systemctl` (e.g. `systemctl` or \
+             `sudo -n systemctl`); rejected"
+        )));
+    }
+    Ok(raw.to_string())
+}
+
+/// The raw configured systemctl command (unvalidated) — validated by
+/// [`validate_systemctl_cmd`] before use.
+fn systemctl_env_raw() -> String {
+    env_nonempty(COMPILER_DEPLOY_SYSTEMCTL).unwrap_or_default()
 }
 
 fn trigger_timeout() -> Duration {
@@ -162,6 +228,10 @@ pub enum DeployOutcome {
     /// in-flight/hung/unknown, NOT a connectivity failure. Surfaced distinctly so a
     /// slow/stuck deploy is never masked as `unreachable`.
     TimedOut,
+    /// The updater wrote an outcome token the compiler does NOT recognize (not in
+    /// the fixed vocabulary). A non-converged, must-not-trust outcome — the raw
+    /// token is NEVER surfaced (S1/S7), only this classification.
+    Unknown,
     /// ssh-level CONNECT/AUTH failure (never a timeout). Others still proceed.
     Unreachable,
 }
@@ -174,6 +244,7 @@ impl DeployOutcome {
             DeployOutcome::RolledBack => "rolled_back",
             DeployOutcome::Failed => "failed",
             DeployOutcome::TimedOut => "timed_out",
+            DeployOutcome::Unknown => "unknown",
             DeployOutcome::Unreachable => "unreachable",
         }
     }
@@ -214,6 +285,7 @@ struct Counts {
     rolled_back: usize,
     failed: usize,
     timed_out: usize,
+    unknown: usize,
     unreachable: usize,
 }
 
@@ -228,6 +300,7 @@ impl DeployReport {
                 DeployOutcome::RolledBack => c.rolled_back += 1,
                 DeployOutcome::Failed => c.failed += 1,
                 DeployOutcome::TimedOut => c.timed_out += 1,
+                DeployOutcome::Unknown => c.unknown += 1,
                 DeployOutcome::Unreachable => c.unreachable += 1,
             }
         }
@@ -252,7 +325,7 @@ impl DeployReport {
         let c = self.counts();
         format!(
             "compiler_deploy {module}/{channel}: {n} host(s) — {dep} deployed, {skip} skipped, \
-             {rb} rolled_back, {fail} failed, {to} timed_out, {unreach} unreachable{tail}",
+             {rb} rolled_back, {fail} failed, {to} timed_out, {unk} unknown, {unreach} unreachable{tail}",
             module = self.module,
             channel = self.channel,
             n = self.results.len(),
@@ -261,6 +334,7 @@ impl DeployReport {
             rb = c.rolled_back,
             fail = c.failed,
             to = c.timed_out,
+            unk = c.unknown,
             unreach = c.unreachable,
             tail = if self.degraded() {
                 format!(" [{} straggler(s); nightly timer catches them]", self.stragglers())
@@ -282,6 +356,7 @@ impl DeployReport {
                 "rolled_back": c.rolled_back,
                 "failed": c.failed,
                 "timed_out": c.timed_out,
+                "unknown": c.unknown,
                 "unreachable": c.unreachable,
                 "total": self.results.len(),
             },
@@ -308,7 +383,7 @@ fn select_hosts(all: &[DeployHost], filter: &str) -> (Vec<DeployHost>, Vec<Strin
         .map(str::to_string)
         .collect();
     let mut chosen = Vec::new();
-    let mut notes = Vec::new();
+    let mut unmatched = 0usize;
     for w in &wanted {
         match all
             .iter()
@@ -318,8 +393,16 @@ fn select_hosts(all: &[DeployHost], filter: &str) -> (Vec<DeployHost>, Vec<Strin
                 chosen.push(h.clone())
             }
             Some(_) => {} // already chosen (dedup)
-            None => notes.push(format!("requested host {w:?} is not a configured deploy target")),
+            // Finding 3: NEVER echo the raw requested-host string back (it can carry
+            // ssh targets / arbitrary caller input / infra literals). Count only.
+            None => unmatched += 1,
         }
+    }
+    let mut notes = Vec::new();
+    if unmatched > 0 {
+        notes.push(format!(
+            "{unmatched} requested host(s) not in the configured deploy set (ignored)"
+        ));
     }
     (chosen, notes)
 }
@@ -388,26 +471,9 @@ pub fn render_remote_trigger_cmd(systemctl: &str, unit: &str, result_marker: &st
     )
 }
 
-/// Render the full ssh argv over the EXISTING sanctioned host-reach path — the
-/// same BatchMode / non-known_hosts-mutating options BLD-08 uses, so no new
-/// credential path is introduced. `ConnectTimeout` bounds a dead host; the outer
-/// wall-clock timeout (applied by the caller) bounds the synchronous updater run.
-pub fn render_trigger_argv(ssh_target: &str, remote_cmd: &str, connect_timeout_secs: u64) -> Vec<String> {
-    vec![
-        "ssh".to_string(),
-        "-o".to_string(),
-        "BatchMode=yes".to_string(),
-        "-o".to_string(),
-        format!("ConnectTimeout={connect_timeout_secs}"),
-        // Reuse BLD-08's non-mutating host-key posture (never write known_hosts).
-        "-o".to_string(),
-        "StrictHostKeyChecking=no".to_string(),
-        "-o".to_string(),
-        "UserKnownHostsFile=/dev/null".to_string(),
-        ssh_target.to_string(),
-        remote_cmd.to_string(),
-    ]
-}
+// The ssh reach is NOT defined here: the trigger fans out over the SINGLE shared
+// `status::sanctioned_ssh_argv` (BLD-08), so the sanctioned option set has exactly
+// one authoritative definition and the deploy trigger can never drift from it.
 
 // ── Outcome classification (pure) ────────────────────────────────────────────
 
@@ -439,42 +505,52 @@ fn parse_result_line(body: &str) -> (Option<i64>, String, String) {
 /// what stops a failed start being masked as `deployed`.
 ///
 /// When start succeeded (rc == 0, or rc unknown as a defensive fallback), the
-/// updater's own outcome TOKEN is authoritative (the only signal that distinguishes
+/// updater's own outcome TOKEN drives the result (the only signal that distinguishes
 /// a rollback or a no-op from a plain success — and it is run-scoped: the wrapper
-/// clears any prior marker before triggering, so only THIS run's token is read).
-/// Absent a recognized token we degrade to the systemd `Result`:
-///   - `Result=success` (or rc == 0) ⇒ `deployed`,
-///   - otherwise ⇒ `failed`.
+/// clears any prior marker before triggering, so only THIS run's token is read). The
+/// token is mapped through a FIXED VOCABULARY (finding 2):
+///   - a recognized token ⇒ the matching outcome,
+///   - an EMPTY token (no marker written) ⇒ degrade to the systemd `Result`
+///     (`success`/rc==0 ⇒ `deployed`, else `failed`),
+///   - a NON-EMPTY but UNRECOGNIZED token ⇒ `unknown` (non-converged, must-not-trust)
+///     — we do NOT fall through to an rc-success `deployed`, because the updater
+///     wrote something we can't validate. The raw token is NEVER returned to a
+///     caller; only the classified outcome is.
 pub fn classify_reachable(rc: Option<i64>, result: &str, token: &str) -> DeployOutcome {
     // A start that failed is `failed`, full stop — never overridden by a stale
     // success Result or a stale marker token.
     if matches!(rc, Some(code) if code != 0) {
         return DeployOutcome::Failed;
     }
-    match token.trim().to_ascii_lowercase().as_str() {
-        "rolled_back" | "rolledback" | "rollback" => DeployOutcome::RolledBack,
-        "deployed" | "updated" | "swapped" | "success" => DeployOutcome::Deployed,
-        "skipped" | "noop" | "no-op" | "unchanged" | "up-to-date" | "current" => {
-            DeployOutcome::Skipped
-        }
-        "failed" | "error" | "abort" | "aborted" => DeployOutcome::Failed,
-        // No recognized token → fall back to the systemd signal.
-        _ => {
+    let token = token.trim().to_ascii_lowercase();
+    match token.as_str() {
+        // Empty token → no marker this run → degrade to the systemd signal.
+        "" => {
             if rc == Some(0) || result.eq_ignore_ascii_case("success") {
                 DeployOutcome::Deployed
             } else {
                 DeployOutcome::Failed
             }
         }
+        "rolled_back" | "rolledback" | "rollback" => DeployOutcome::RolledBack,
+        "deployed" | "updated" | "swapped" | "success" => DeployOutcome::Deployed,
+        "skipped" | "noop" | "no-op" | "unchanged" | "up-to-date" | "current" => {
+            DeployOutcome::Skipped
+        }
+        "failed" | "error" | "abort" | "aborted" => DeployOutcome::Failed,
+        // A non-empty token we don't recognize → `unknown` (never trusted as
+        // success, never echoed).
+        _ => DeployOutcome::Unknown,
     }
 }
 
-/// Build the short, redaction-safe `detail` string (fixed vocabulary only).
-fn detail_string(rc: Option<i64>, result: &str, token: &str) -> Option<String> {
+/// Build the short, redaction-safe `detail` string. FIXED VOCABULARY ONLY (finding
+/// 2): it surfaces the CLASSIFIED outcome plus the integer `rc` — it NEVER echoes
+/// the raw updater marker token or free-form `Result` text, so a marker carrying a
+/// path / secret-shaped / malformed string can never reach the structured output.
+fn detail_string(outcome: DeployOutcome, rc: Option<i64>) -> Option<String> {
     let rc = rc.map(|n| n.to_string()).unwrap_or_else(|| "?".to_string());
-    let result = if result.is_empty() { "?" } else { result };
-    let token = if token.is_empty() { "-" } else { token };
-    Some(format!("rc={rc} result={result} token={token}"))
+    Some(format!("outcome={} rc={rc}", outcome.as_str()))
 }
 
 // ── Remote execution (the real trigger path) ─────────────────────────────────
@@ -549,17 +625,21 @@ async fn ssh_trigger(argv: &[String], timeout: Duration) -> SshOutcome {
     }
 }
 
-/// Trigger one host and classify. Never errors.
+/// Trigger one host and classify. Never errors. `systemctl` is the ALREADY-VALIDATED
+/// constrained command (see [`validate_systemctl_cmd`]) — trigger_one never reads it
+/// raw from the env.
 async fn trigger_one(
     host: DeployHost,
     module: String,
     channel: String,
+    systemctl: String,
     timeout: Duration,
 ) -> HostDeployResult {
     let unit = render_template(&unit_template(), &module, &channel);
     let marker = render_template(&result_marker_template(), &module, &channel);
-    let remote = render_remote_trigger_cmd(&systemctl_cmd(), &unit, &marker);
-    let argv = render_trigger_argv(&host.ssh_target, &remote, timeout.as_secs());
+    let remote = render_remote_trigger_cmd(&systemctl, &unit, &marker);
+    // Reuse the SINGLE sanctioned ssh reach shared with compiler_status (BLD-08).
+    let argv = sanctioned_ssh_argv(&host.ssh_target, &remote, timeout.as_secs());
     match ssh_trigger(&argv, timeout).await {
         SshOutcome::Unreachable => HostDeployResult {
             host: host.label,
@@ -569,14 +649,17 @@ async fn trigger_one(
         SshOutcome::TimedOut => HostDeployResult {
             host: host.label,
             outcome: DeployOutcome::TimedOut,
-            detail: Some(format!("trigger exceeded {}s (deploy in-flight/unknown)", timeout.as_secs())),
+            detail: detail_string(DeployOutcome::TimedOut, None),
         },
         SshOutcome::Reachable(body) => {
             let (rc, result, token) = parse_result_line(&body);
+            // Classify through the FIXED VOCABULARY; the raw token/result are used
+            // ONLY to classify and are never surfaced (detail is outcome+rc).
+            let outcome = classify_reachable(rc, &result, &token);
             HostDeployResult {
                 host: host.label,
-                outcome: classify_reachable(rc, &result, &token),
-                detail: detail_string(rc, &result, &token),
+                outcome,
+                detail: detail_string(outcome, rc),
             }
         }
     }
@@ -637,11 +720,46 @@ pub async fn deploy_report(module: &str, channel: &str, hosts_filter: &str) -> D
         );
     }
 
+    // Finding 4: validate the constrained systemctl command ONCE, up front. On a bad
+    // config we do NOT trigger with an unsafe command — every chosen host is marked
+    // `failed` (a visible, non-masked config error), never silently skipped.
+    let systemctl = match validate_systemctl_cmd(&systemctl_env_raw()) {
+        Ok(s) => s,
+        Err(_) => {
+            let results = chosen
+                .into_iter()
+                .map(|h| HostDeployResult {
+                    host: h.label,
+                    outcome: DeployOutcome::Failed,
+                    detail: detail_string(DeployOutcome::Failed, None),
+                })
+                .collect();
+            notes.push(
+                "COMPILER_DEPLOY_SYSTEMCTL is not a valid constrained systemctl command \
+                 (disallowed characters, or it does not invoke systemctl) — not triggered"
+                    .to_string(),
+            );
+            let mut report = DeployReport {
+                module: module.to_string(),
+                channel: channel.to_string(),
+                results,
+                notes,
+            };
+            if report.degraded() {
+                report.notes.push(format!(
+                    "{} host(s) did not converge (config error) — nightly timer catches them",
+                    report.stragglers()
+                ));
+            }
+            return report;
+        }
+    };
+
     let timeout = trigger_timeout();
     let module_s = module.to_string();
     let channel_s = channel.to_string();
     let results = aggregate(chosen, max_concurrency(), |h| {
-        trigger_one(h, module_s.clone(), channel_s.clone(), timeout)
+        trigger_one(h, module_s.clone(), channel_s.clone(), systemctl.clone(), timeout)
     })
     .await;
 
@@ -653,7 +771,7 @@ pub async fn deploy_report(module: &str, channel: &str, hosts_filter: &str) -> D
     };
     if report.degraded() {
         report.notes.push(format!(
-            "{} host(s) did not converge (rolled_back/failed/unreachable) — nightly timer catches them",
+            "{} host(s) did not converge (rolled_back/failed/timed_out/unknown/unreachable) — nightly timer catches them",
             report.stragglers()
         ));
     }
@@ -734,6 +852,11 @@ impl RustTool for CompilerDeploy {
             .unwrap_or("all")
             .to_string();
 
+        // Finding 4: a malformed `COMPILER_DEPLOY_SYSTEMCTL` is a hard config error
+        // for a direct caller (a clean `InvalidArgument`, not a silent all-failed
+        // fan-out). The error message never echoes the raw value (S1).
+        validate_systemctl_cmd(&systemctl_env_raw())?;
+
         let report = deploy_report(&module, &channel, &hosts_filter).await;
         let text = report.summary();
         Ok(ToolOutput::with_structured(text, report.to_payload()))
@@ -780,14 +903,22 @@ mod tests {
     }
 
     #[test]
-    fn select_hosts_filters_by_label_and_target_and_notes_unknown() {
-        let (chosen, notes) = select_hosts(&hosts(), "host-a, u@host-b ; nope");
+    fn select_hosts_filters_by_label_and_target_and_counts_unknown_without_echo() {
+        // Finding 3: an unknown/garbage requested host is NOT echoed verbatim — it is
+        // reported only by count (it can carry ssh targets / arbitrary caller input).
+        let (chosen, notes) =
+            select_hosts(&hosts(), "host-a, u@host-b ; nope$secret@<internal-ip> ; junk");
         assert_eq!(
             chosen.iter().map(|h| h.label.as_str()).collect::<Vec<_>>(),
             vec!["host-a", "host-b"]
         );
         assert_eq!(notes.len(), 1);
-        assert!(notes[0].contains("nope"));
+        // Count present; raw unknown strings absent.
+        assert!(notes[0].contains('2'), "{}", notes[0]);
+        assert!(!notes[0].contains("nope"));
+        assert!(!notes[0].contains("secret"));
+        assert!(!notes[0].contains("<internal-ip>"));
+        assert!(!notes[0].contains("junk"));
     }
 
     #[test]
@@ -880,9 +1011,46 @@ mod tests {
         let (rc, result, token) = parse_result_line("no sentinel here");
         assert_eq!(rc, None);
         assert!(result.is_empty() && token.is_empty());
-        // Empty token renders as `-` (a no-value marker), rc `?`.
         let (rc, result, token) = parse_result_line("COMPILER_DEPLOY rc=2 result=failed token=");
-        assert_eq!(detail_string(rc, &result, &token).unwrap(), "rc=2 result=failed token=-");
+        assert_eq!(rc, Some(2));
+        assert_eq!(result, "failed");
+        assert!(token.is_empty());
+    }
+
+    #[test]
+    fn detail_is_fixed_vocabulary_never_raw_marker() {
+        // Finding 2: detail is outcome+rc only — never the raw token/result text.
+        assert_eq!(
+            detail_string(DeployOutcome::Deployed, Some(0)).unwrap(),
+            "outcome=deployed rc=0"
+        );
+        assert_eq!(
+            detail_string(DeployOutcome::TimedOut, None).unwrap(),
+            "outcome=timed_out rc=?"
+        );
+    }
+
+    #[test]
+    fn unrecognized_marker_token_is_unknown_and_never_echoed() {
+        // Finding 2: an arbitrary / secret-shaped / path-bearing marker token is
+        // classified `unknown` (non-converged, not trusted as success) and its raw
+        // content NEVER appears in the surfaced detail.
+        let secret = "<REDACTED-SECRET>";
+        let outcome = classify_reachable(Some(0), "success", secret);
+        assert_eq!(outcome, DeployOutcome::Unknown, "unrecognized → unknown, not deployed");
+        let detail = detail_string(outcome, Some(0)).unwrap();
+        assert_eq!(detail, "outcome=unknown rc=0");
+        assert!(!detail.contains("SECRET_ABC123"), "raw token must not be echoed");
+        assert!(!detail.contains("/etc/shadow"));
+        // And it never appears anywhere in a rendered per-host result.
+        let res = HostDeployResult {
+            host: "h".into(),
+            outcome,
+            detail: Some(detail),
+        };
+        let json = serde_json::to_string(&res).unwrap();
+        assert!(!json.contains("SECRET_ABC123"));
+        assert!(!json.contains("shadow"));
     }
 
     // ── Remote command / argv shape (S1: no infra literals) ─────────────────
@@ -919,6 +1087,51 @@ mod tests {
     }
 
     #[test]
+    fn validate_systemctl_cmd_allows_constrained_rejects_metacharacters() {
+        // Finding 4: plain `systemctl`, `sudo -n systemctl`, an absolute path, and
+        // `sudo systemctl` are accepted (constrained bare-token commands).
+        assert_eq!(validate_systemctl_cmd("systemctl").unwrap(), "systemctl");
+        assert_eq!(
+            validate_systemctl_cmd("sudo -n systemctl").unwrap(),
+            "sudo -n systemctl"
+        );
+        assert_eq!(validate_systemctl_cmd("sudo systemctl").unwrap(), "sudo systemctl");
+        assert_eq!(
+            validate_systemctl_cmd("/usr/bin/systemctl").unwrap(),
+            "/usr/bin/systemctl"
+        );
+        // Empty/unset → default.
+        assert_eq!(validate_systemctl_cmd("   ").unwrap(), "systemctl");
+
+        // Any shell metacharacter is rejected as a config error.
+        for bad in [
+            "systemctl; rm -rf /",
+            "systemctl && curl evil",
+            "systemctl | tee x",
+            "systemctl $(id)",
+            "systemctl > /etc/x",
+            "systemctl `id`",
+            "sudo\nsystemctl",
+        ] {
+            assert!(
+                matches!(validate_systemctl_cmd(bad), Err(ToolError::InvalidArgument(_))),
+                "must reject: {bad:?}"
+            );
+        }
+        // A command that does not invoke systemctl is rejected.
+        assert!(matches!(
+            validate_systemctl_cmd("sudo reboot"),
+            Err(ToolError::InvalidArgument(_))
+        ));
+        // The error never echoes the raw (potentially sensitive) value back.
+        if let Err(ToolError::InvalidArgument(m)) = validate_systemctl_cmd("systemctl; secret123") {
+            assert!(!m.contains("secret123"), "error must not echo raw value: {m}");
+        } else {
+            panic!("expected rejection");
+        }
+    }
+
+    #[test]
     fn ensure_non_interactive_sudo_cases() {
         // Bare systemctl: unchanged.
         assert_eq!(ensure_non_interactive_sudo("systemctl"), "systemctl");
@@ -933,17 +1146,23 @@ mod tests {
     }
 
     #[test]
-    fn trigger_argv_uses_the_existing_nonmutating_reach_path() {
-        let argv = render_trigger_argv("u@host", "echo hi", 300);
+    fn trigger_reuses_the_single_shared_sanctioned_reach() {
+        // Finding 1: the deploy trigger fans out over the SAME shared
+        // `status::sanctioned_ssh_argv` the read path uses — deploy.rs defines no
+        // ssh option set of its own. Assert the shared helper carries the sanctioned
+        // non-mutating posture, and that the marker read is built on top of it.
+        let argv = sanctioned_ssh_argv("u@host", "echo hi", 300);
         assert_eq!(argv[0], "ssh");
         assert!(argv.iter().any(|a| a == "BatchMode=yes"));
         assert!(argv.iter().any(|a| a == "ConnectTimeout=300"));
-        // Same non-mutating host-key posture as BLD-08's read path.
         assert!(!argv.iter().any(|a| a.contains("accept-new")));
         assert!(argv.iter().any(|a| a == "StrictHostKeyChecking=no"));
         assert!(argv.iter().any(|a| a == "UserKnownHostsFile=/dev/null"));
         assert!(argv.iter().any(|a| a == "u@host"));
         assert_eq!(argv.last().unwrap(), "echo hi");
+        // The BLD-08 marker read is the SAME reach with a cat remote → single source.
+        let read = super::super::status::render_marker_read_argv("u@host", "/m", 300);
+        assert_eq!(read[..read.len() - 1], argv[..argv.len() - 1]);
     }
 
     #[test]
