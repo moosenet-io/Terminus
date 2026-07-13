@@ -1130,6 +1130,24 @@ fn release_mint_gpu_lock() -> GpuReleaseResult {
 
 // ── Orchestration (async, best-effort side effects) ──────────────────────────
 
+/// RAII guard that clears the controller's `releasing` latch on drop. Lives INSIDE the
+/// `spawn_blocking` release closure so the latch is cleared on every exit path of the
+/// blocking thread — including an unwinding panic from the release function. This is the
+/// panic-safety net behind the point-of-no-return latch: without it, a panicking release
+/// on a cancelled enter future (whose `JoinHandle` was dropped, so the async-side clear
+/// never runs) would leave the latch stuck, permanently closing admission and blocking
+/// `recover_stale_transition`. `clear_releasing` is idempotent, so a later defensive
+/// clear on the async side is harmless.
+struct ReleasingLatchGuard {
+    ctl: Arc<IdleController>,
+}
+
+impl Drop for ReleasingLatchGuard {
+    fn drop(&mut self) {
+        self.ctl.clear_releasing();
+    }
+}
+
 /// Enter idle: drain in-flight MINT runs, release MINT's GPU-authority lock, sample
 /// freed RAM, record the resume manifest. Delegates to [`enter_idle_on`] against the
 /// process-global controller with the real GPU-lock release.
@@ -1229,19 +1247,27 @@ where
     ctl.set_releasing();
     let ctl_for_task = ctl.clone();
     let handle = tokio::task::spawn_blocking(move || {
-        let result = release_fn();
-        ctl_for_task.clear_releasing();
-        result
+        // PANIC-SAFE latch clear: construct the RAII guard BEFORE calling release_fn(),
+        // so the latch is cleared on EVERY exit path of the blocking thread — normal
+        // return, early return, OR an unwinding panic in release_fn(). Without this, a
+        // release_fn() panic would skip a bare `clear_releasing()` call and, since the
+        // enter future may have been cancelled (its JoinHandle dropped, so the async-side
+        // clear never runs either), leave `releasing` set forever — permanently wedging
+        // admission and defeating recover_stale_transition (which early-returns while
+        // releasing). Clear is idempotent, so the async-side fallback below is harmless.
+        let _latch = ReleasingLatchGuard { ctl: ctl_for_task };
+        release_fn()
     });
     let gpu = match handle.await {
         Ok(r) => r,
         Err(_join_err) => {
-            // The blocking release panicked (its closure could not clear the latch);
-            // clear it here so the phase can resolve. The release is no longer running.
+            // The blocking release panicked. The in-task RAII guard already cleared the
+            // latch on unwind; this is a defensive, idempotent re-clear (in case the join
+            // failed for any other reason) so the phase can always resolve.
             ctl.clear_releasing();
             warn!(
                 reason,
-                "mint idle-mode: blocking GPU release task panicked — treated as best-effort (no resources reported freed)"
+                "mint idle-mode: blocking GPU release task panicked — treated as best-effort (no resources reported freed); releasing latch cleared by the in-task RAII guard"
             );
             GpuReleaseResult {
                 holders_released: Vec::new(),
@@ -2101,6 +2127,74 @@ mod tests {
         let now = now_epoch();
         assert!(ctl.recover_stale_transition(now + 10_000, 1));
         assert_eq!(ctl.phase(), Phase::Active);
+    }
+
+    #[tokio::test]
+    async fn panicking_release_on_cancelled_enter_clears_latch_and_is_recoverable() {
+        // codex cycle-2 hole: if the enter future is cancelled (JoinHandle dropped, so
+        // the async-side clear never runs) AND the blocking release then PANICS before a
+        // bare clear could run, a naive impl leaves `releasing` set forever — permanently
+        // wedging admission and defeating recover_stale_transition. The in-task RAII
+        // ReleasingLatchGuard must clear the latch on the panic unwind regardless.
+        use std::sync::mpsc;
+
+        let ctl = Arc::new(IdleController::new());
+        let (unblock_tx, unblock_rx) = mpsc::channel::<()>();
+        let started = Arc::new(AtomicBool::new(false));
+
+        let started_in = started.clone();
+        let panicking_release = move || -> GpuReleaseResult {
+            started_in.store(true, Ordering::SeqCst);
+            let _ = unblock_rx.recv(); // block until the test lets it run
+            panic!("simulated GPU-release failure mid-release");
+        };
+
+        let ctl_task = ctl.clone();
+        let enter =
+            tokio::spawn(async move { enter_idle_on(ctl_task, "test", panicking_release).await });
+
+        // Wait until the blocking release has started (latch set, blocked on recv).
+        while !started.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(ctl.is_releasing());
+
+        // Cancel the enter future mid-release: JoinHandle dropped, guard rollback withheld.
+        enter.abort();
+        let _ = enter.await;
+        assert_eq!(
+            ctl.phase(),
+            Phase::EnteringIdle,
+            "cancelled enter keeps admission closed while the release runs"
+        );
+        assert!(ctl.is_releasing());
+
+        // Let the detached release run — it PANICS. The in-task RAII guard must STILL
+        // clear the latch on the unwind (the panic is contained at the spawn_blocking
+        // boundary, so the test process does not abort).
+        unblock_tx.send(()).unwrap();
+        for _ in 0..500 {
+            if !ctl.is_releasing() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            !ctl.is_releasing(),
+            "a panicking release must still clear the latch via the RAII drop-guard"
+        );
+
+        // The stuck EnteringIdle transition is now recoverable (not permanently wedged).
+        let now = now_epoch();
+        assert!(ctl.recover_stale_transition(now + 10_000, 1));
+        assert_eq!(ctl.phase(), Phase::Active);
+
+        // And a subsequent enter proceeds normally — admission is not permanently closed.
+        match ctl.enter(manifest("compiler", 1, 2)) {
+            EnterOutcome::Entered(_) => {}
+            other => panic!("expected a fresh enter to succeed after recovery, got {other:?}"),
+        }
+        assert!(ctl.is_idle());
     }
 
     // ── env parsing + holder config ──────────────────────────────────────────
