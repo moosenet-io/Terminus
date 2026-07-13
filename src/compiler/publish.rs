@@ -837,22 +837,16 @@ pub async fn promote(
     bin: &str,
     retain: usize,
 ) -> Result<PromoteOutcome, ToolError> {
-    // 1. The sha MUST be a verified build in the source channel. Fail closed.
-    verify_sha_artifact(dataset_root, module, from_channel, sha, target, bin)
-        .await
-        .map_err(|e| {
-            ToolError::NotFound(format!(
-                "refusing to promote {module}@{sha}: not a verified build in channel \
-                 {from_channel}: {e}"
-            ))
-        })?;
-
+    // 1. Idempotent no-op FIRST — checked against the DESTINATION only. If the
+    //    destination is already blessed at this sha AND its own copy verifies,
+    //    re-promoting is a no-op regardless of the source: `stable` is independent
+    //    from `experimental` after the copy, so the source `experimental/<sha>` may
+    //    have since been pruned. Requiring the source here would wrongly fail a
+    //    repeat promote of an already-released sha.
     let dest_verified = verify_sha_artifact(dataset_root, module, to_channel, sha, target, bin)
         .await
         .is_ok();
     let current = read_current(dataset_root, module, to_channel).await?;
-
-    // 2. Idempotent: already blessed here and the artifact verifies → no-op.
     if current.as_deref() == Some(sha) && dest_verified {
         return Ok(PromoteOutcome {
             module: module.to_string(),
@@ -866,6 +860,17 @@ pub async fn promote(
             current_path: current_pointer_path(dataset_root, module, to_channel),
         });
     }
+
+    // 2. The real promote path is fail-closed on the SOURCE: the sha MUST be a
+    //    verified build in `from_channel` before we copy/bless it.
+    verify_sha_artifact(dataset_root, module, from_channel, sha, target, bin)
+        .await
+        .map_err(|e| {
+            ToolError::NotFound(format!(
+                "refusing to promote {module}@{sha}: not a verified build in channel \
+                 {from_channel}: {e}"
+            ))
+        })?;
 
     // 3. Ensure the destination channel has its own verified copy of the sha.
     let copied = if !dest_verified && from_channel != to_channel {
@@ -1274,6 +1279,46 @@ mod tests {
         // Only one promote in the history.
         let hist = read_history(root, "m", "stable").await.unwrap();
         assert_eq!(hist.iter().filter(|h| h.action == "promote").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn promote_is_idempotent_even_after_source_is_pruned() {
+        // Once a sha is released, `stable` holds its own copy and is independent of
+        // `experimental`. Re-promoting the already-blessed sha must be a no-op even
+        // if the source `experimental/<sha>` tree has since been pruned — NOT an
+        // error. (The dest-already-blessed check must precede the source check.)
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let sha = seed_artifact(root, "m", "experimental", "m", b"v1").await;
+        let first = promote(root, "m", "experimental", "stable", &sha, T, "m", 2)
+            .await
+            .unwrap();
+        assert!(first.copied && !first.already_current);
+
+        // Prune the SOURCE copy entirely (simulates experimental retention rolling
+        // past this sha). stable/current still points at the verified dest copy.
+        tokio::fs::remove_dir_all(sha_dir(root, "m", "experimental", &sha))
+            .await
+            .unwrap();
+        assert!(
+            !tokio::fs::try_exists(sha_dir(root, "m", "experimental", &sha))
+                .await
+                .unwrap()
+        );
+
+        let repeat = promote(root, "m", "experimental", "stable", &sha, T, "m", 2)
+            .await
+            .expect("re-promote of an already-released sha must succeed, not error");
+        assert!(repeat.already_current, "must be an idempotent no-op");
+        assert!(!repeat.copied);
+        // Still exactly one promote recorded (no churn).
+        let hist = read_history(root, "m", "stable").await.unwrap();
+        assert_eq!(hist.iter().filter(|h| h.action == "promote").count(), 1);
+        // And the destination is still blessed + verifiable.
+        assert_eq!(read_current(root, "m", "stable").await.unwrap(), Some(sha.clone()));
+        verify_sha_artifact(root, "m", "stable", &sha, T, "m")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
