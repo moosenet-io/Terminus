@@ -208,6 +208,79 @@ All hosts, paths, caps, thresholds, and the cache endpoint come from config env
 source (S1), and `SCCACHE_REDIS`/its password are read as secrets, never logged and never
 placed on a command line (S7).
 
+## `compiler_progress` — live build progress/events (BLD-19)
+
+`compiler_progress` is the **live progress surface** over `compiler_build`, so a client (the
+fleet GUI, a requesting agent, the Harmony adapter) can render a real progress bar instead of
+a spinner. Every `compiler_build` call carries a stable `request_id` (supply one, or read the
+auto-generated id back from the build result / its `structured.request_id`), and each stage of
+the build emits a typed event into a per-request ring buffer + a live broadcast channel.
+
+```
+compiler_progress(request_id, since=0, wait_ms=0)
+```
+
+### The event model
+
+Each build progresses through ordered **stages**:
+
+```
+queued → scheduled → relaying → building{step,total} → publishing → published | failed
+```
+
+- `queued` — request accepted (carries `module@ref`).
+- `scheduled` — build host selected (`primary`/`heavy`).
+- `relaying` — source staged to the heavy host (remote builds only).
+- `building` — compilation in progress; `{step,total}` is parsed from cargo's build
+  progress (`N/M`) and streamed live as the crates compile, throttled so an unchanged step
+  is not re-emitted.
+- `publishing` — artifact being checksummed + written.
+- `published` — **terminal success**, carries the artifact `sha256`. (`compiler_build`'s
+  scope ends at publish; `deployed` / `rolled_back` are reserved terminal stages the
+  downstream constellation-updater emits against the same `request_id`, so the model spans
+  the whole request lifecycle a GUI renders.)
+- `failed` — **terminal failure**, carries a **secret-sanitized** error tail.
+
+Every event has a monotonic per-build `seq`, a timestamp (`ts_ms`), the `stage`, optional
+`{step,total}`, an optional short `message`, and (on a terminal success) the `sha`.
+
+### Query vs. subscribe (snapshot + long-poll)
+
+- **Snapshot** (`wait_ms` omitted/0): returns the current stage, the latest `{step,total}`,
+  timing, `last_seq`, and the events with `seq > since` (or the whole retained tail when
+  `since = 0`) — so a *late* subscriber still gets the current state plus the recent tail.
+- **Long-poll / subscribe** (`wait_ms > 0`, capped at 30s): blocks until the next event (or
+  the timeout), then returns a fresh snapshot. To **stream**, pass `since` = the last `seq`
+  you saw and advance it each call: `compiler_progress(id, since=last_seq, wait_ms=5000)`.
+
+An unknown or expired `request_id` returns `{"status":"not_found"}` — never an error.
+
+### Seam with `compiler_status` (BLD-08)
+
+`compiler_status` is the **point-in-time** aggregate — the queue, the store `current`
+pointers, and the module×host deployed-sha matrix (*what is deployed where, right now*).
+`compiler_progress` is the **live per-request event stream** (*how is this build going,
+second by second*). They do not overlap: use status for fleet deploy state, progress to
+watch a specific build.
+
+### Store, bounds & discipline
+
+The event store is **in-process and ephemeral** (a ring buffer + broadcast channel per
+build) — progress is transient, exactly like the BLD-20 admission queue; it fails open and
+never blocks a build, and `compiler_status` remains the durable point-in-time truth if the
+process restarts. Three numeric, env-tunable bounds keep memory bounded:
+
+| Env knob | Default | Meaning |
+| --- | --- | --- |
+| `COMPILER_PROGRESS_MAX_EVENTS` | `256` | Ring-buffer depth per build (oldest events fall off). |
+| `COMPILER_PROGRESS_MAX_BUILDS` | `64` | Max tracked builds (least-recently-updated evicted at capacity). |
+| `COMPILER_PROGRESS_TTL_SECS` | `3600` | Idle TTL; a build untouched this long is swept on the next write. |
+
+Log-tail lines are **secret-sanitized by the emitter** (`compiler_build` runs every captured
+cargo output line through its existing S6/S7 redaction set) *before* they enter the bus, so a
+secret never leaves the process through the stream. The bus stores only stage/timing/step
+data and already-redacted text — no infrastructure literals (S1), no secrets (S6/S7).
+
 ## Fleet clock — `time_now` (CLK-01)
 
 `time_now` is a core tool that returns the **authoritative fleet date/time**

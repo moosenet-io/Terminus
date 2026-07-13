@@ -19,6 +19,7 @@
 //! literal in source. Nothing token/URL-with-creds shaped is read outside the
 //! sccache secret wiring, and the parsed password never logs.
 
+pub mod events;
 pub mod host;
 pub mod publish;
 pub mod sccache;
@@ -302,6 +303,7 @@ async fn remote_scope_kill(rk: &RemoteScopeKill, redact: &[String]) {
         Duration::from_secs(30),
         redact,
         None,
+        None,
     ))
     .await
     {
@@ -450,6 +452,56 @@ impl Drop for RemoteSecretGuard {
 /// `systemctl kill <unit>.scope` over ssh to tear down the remote build tree — so
 /// a timed-out heavy build cannot keep running remotely (holding the inherited
 /// secret env + capped host resources) after the tool returns.
+/// Drain one child pipe to completion (so a chatty child never deadlocks on a
+/// full pipe). Without a `tap` it is a byte-exact `read_to_end` (unchanged for
+/// every non-build subprocess). With a `tap` (the cargo build) it reads LINE BY
+/// LINE, redacts each line (S6/S7) BEFORE forwarding it to the tap — which emits
+/// a live `{step,total}` building event — and keeps the redacted lines as the
+/// captured output so a failed build's error tail can never carry a raw secret.
+async fn drain_pipe<R>(
+    pipe: Option<R>,
+    tap: Option<events::BuildTap>,
+    redact: Vec<String>,
+) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let mut pipe = match pipe {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let tap = match tap {
+        // No tap → preserve the original byte-exact capture.
+        None => {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf).await;
+            return buf;
+        }
+        Some(t) => t,
+    };
+    let mut reader = tokio::io::BufReader::new(pipe);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                let redacted =
+                    redact_secrets(line.trim_end_matches(|c| c == '\n' || c == '\r'), &redact);
+                tap.on_line(&redacted);
+                buf.extend_from_slice(redacted.as_bytes());
+                buf.push(b'\n');
+            }
+            // Non-UTF-8 / read error: stop tapping this pipe (the build itself is
+            // unaffected; the remaining bytes just don't reach the tail).
+            Err(_) => break,
+        }
+    }
+    buf
+}
+
 async fn run(
     argv: &[String],
     cwd: Option<&std::path::Path>,
@@ -457,8 +509,8 @@ async fn run(
     timeout: Duration,
     redact: &[String],
     remote_kill: Option<&RemoteScopeKill>,
+    tap: Option<&events::BuildTap>,
 ) -> Result<String, ToolError> {
-    use tokio::io::AsyncReadExt;
     if argv.is_empty() {
         return Err(ToolError::Execution("empty command".into()));
     }
@@ -486,22 +538,22 @@ async fn run(
 
     // Drain stdout/stderr concurrently while we wait, so a chatty child can't
     // deadlock on a full pipe and we still have the output after `wait()`.
+    //
+    // BLD-19: when a `tap` is present (the cargo build calls), the drain reads
+    // LINE BY LINE and forwards each already-redacted line to the tap so a live
+    // `{step,total}` building event is emitted DURING the build (progress bar,
+    // not a spinner). Without a tap (every non-build subprocess) the drain keeps
+    // its byte-exact `read_to_end` behavior unchanged.
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
-    let stdout_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(p) = stdout_pipe.as_mut() {
-            let _ = p.read_to_end(&mut buf).await;
-        }
-        buf
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(p) = stderr_pipe.as_mut() {
-            let _ = p.read_to_end(&mut buf).await;
-        }
-        buf
-    });
+    let out_tap = tap.cloned();
+    let out_redact = redact.to_vec();
+    let stdout_task =
+        tokio::spawn(async move { drain_pipe(stdout_pipe.take(), out_tap, out_redact).await });
+    let err_tap = tap.cloned();
+    let err_redact = redact.to_vec();
+    let stderr_task =
+        tokio::spawn(async move { drain_pipe(stderr_pipe.take(), err_tap, err_redact).await });
 
     let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(s)) => s,
@@ -610,6 +662,10 @@ impl RustTool for CompilerBuild {
                 "source_dir": {
                     "type": "string",
                     "description": "Override the source tree location (defaults to ${BUILD_DATASET_ROOT}/src/<module>/<ref>)."
+                },
+                "request_id": {
+                    "type": "string",
+                    "description": "Optional stable id for this build request; progress/events are keyed by it (query with compiler_progress). Auto-generated when omitted and returned in the result."
                 }
             },
             "required": ["module", "ref"]
@@ -621,6 +677,37 @@ impl RustTool for CompilerBuild {
     }
 
     async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        // BLD-19: a stable request_id keys the whole progress stream. Accept a
+        // caller-supplied id (so it can subscribe before/while the build runs) or
+        // mint one; validate it as a safe segment (it is only ever a map key +
+        // returned to the caller, never a path/argv, but keep it well-formed).
+        let request_id = match args.get("request_id").and_then(Value::as_str) {
+            Some(s) if !s.trim().is_empty() => {
+                let s = s.trim().to_string();
+                validate_segment("request_id", &s)?;
+                s
+            }
+            _ => uuid::Uuid::new_v4().simple().to_string(),
+        };
+        // Run the build; emit the terminal Failed event on any error path so a
+        // subscriber always sees a terminal state (the happy path emits Published
+        // from inside build_inner, next to the artifact sha).
+        let result = self.build_inner(&request_id, args).await;
+        if let Err(e) = &result {
+            // The error Display is already secret-sanitized: `run()` redacts every
+            // subprocess stdout/stderr tail before it becomes a ToolError, and the
+            // config/validation errors carry no secrets (S6/S7).
+            events::bus().emit(
+                &request_id,
+                events::Emit::stage(events::Stage::Failed).message(e.to_string()),
+            );
+        }
+        result
+    }
+}
+
+impl CompilerBuild {
+    async fn build_inner(&self, request_id: &str, args: Value) -> Result<ToolOutput, ToolError> {
         let module = str_arg(&args, "module")?;
         let git_ref = str_arg(&args, "ref")?;
         let host_req =
@@ -645,10 +732,25 @@ impl RustTool for CompilerBuild {
         validate_segment("profile", &profile)?;
         validate_git_ref(&git_ref)?;
 
+        // BLD-19: the request is accepted → `queued`. A per-build tap streams the
+        // cargo `{step,total}` into the bus during the build (progress bar).
+        let bus = events::bus();
+        bus.emit(
+            request_id,
+            events::Emit::stage(events::Stage::Queued).message(format!("{module}@{git_ref}")),
+        );
+        let tap = events::BuildTap::new(request_id);
+
         // ── Resolve config (fail fast, no side effects) ──────────────────────
         let root = dataset_root()?;
         let root_str = root.to_string_lossy().to_string();
         let resolved = host::resolve(host_req, &module, fast)?;
+        // Host selected → `scheduled` (which role, local vs remote).
+        bus.emit(
+            request_id,
+            events::Emit::stage(events::Stage::Scheduled)
+                .message(resolved.role.as_str().to_string()),
+        );
         let triple = target_triple();
         // `target` (the triple) comes from config but is used as a path segment.
         validate_segment("target", &triple)?;
@@ -739,6 +841,7 @@ impl RustTool for CompilerBuild {
                     Duration::from_secs(600),
                     &redact,
                     None,
+                    None,
                 )
                 .await?;
             }
@@ -752,8 +855,10 @@ impl RustTool for CompilerBuild {
                 &manifest.to_string_lossy(),
             );
             let scope_argv = scope::render_scope_argv(&unit, &resolved.caps, &setenv, &cargo_argv);
+            // Compilation starts → `building`; the tap streams `{step,total}`.
+            bus.emit(request_id, events::Emit::stage(events::Stage::Building));
             // Secret env is delivered via the inherited environment (last arg),
-            // NOT argv.
+            // NOT argv. The build tap streams cargo progress lines live.
             run(
                 &scope_argv,
                 Some(&local_source_dir),
@@ -761,6 +866,7 @@ impl RustTool for CompilerBuild {
                 Duration::from_secs(3600),
                 &redact,
                 None,
+                Some(&tap),
             )
             .await?;
 
@@ -784,6 +890,12 @@ impl RustTool for CompilerBuild {
                 git_ref
             );
 
+            // Staging source to the heavy host → `relaying`.
+            bus.emit(
+                request_id,
+                events::Emit::stage(events::Stage::Relaying)
+                    .message(resolved.role.as_str().to_string()),
+            );
             // Stage source to the remote + ensure the remote dirs exist. Every
             // interpolated remote path is shell-quoted (defense-in-depth on top of
             // the segment validation above), and rsync uses `-s`/--protect-args so
@@ -803,6 +915,7 @@ impl RustTool for CompilerBuild {
                 Duration::from_secs(120),
                 &redact,
                 None,
+                None,
             )
             .await?;
             run(
@@ -818,6 +931,7 @@ impl RustTool for CompilerBuild {
                 &BTreeMap::new(),
                 Duration::from_secs(1800),
                 &redact,
+                None,
                 None,
             )
             .await?;
@@ -871,6 +985,7 @@ impl RustTool for CompilerBuild {
                     Duration::from_secs(120),
                     &redact,
                     None,
+                    None,
                 )
                 .await;
                 // Delete the local staging copy immediately (minimize its on-disk
@@ -898,6 +1013,7 @@ impl RustTool for CompilerBuild {
                     Duration::from_secs(600),
                     &redact,
                     None,
+                    None,
                 )
                 .await?;
             }
@@ -923,6 +1039,9 @@ impl RustTool for CompilerBuild {
                 host: host_addr.clone(),
                 unit: unit.clone(),
             };
+            // Remote compilation starts → `building`; the tap streams the remote
+            // cargo `{step,total}` (over ssh stdout/stderr) into the bus live.
+            bus.emit(request_id, events::Emit::stage(events::Stage::Building));
             let build_res = run(
                 &["ssh".into(), host_addr.clone(), remote_cmd],
                 None,
@@ -930,6 +1049,7 @@ impl RustTool for CompilerBuild {
                 Duration::from_secs(3600),
                 &redact,
                 Some(&remote_kill),
+                Some(&tap),
             )
             .await;
             // If the build FAILED/timed out, propagate now — `secret_guard` drops on
@@ -967,6 +1087,7 @@ impl RustTool for CompilerBuild {
                 Duration::from_secs(600),
                 &redact,
                 None,
+                None,
             )
             .await?;
             built_bin = local_bin;
@@ -977,6 +1098,8 @@ impl RustTool for CompilerBuild {
         // retrieved from the heavy host above), so publish is host-agnostic.
         let channel = publish::DEFAULT_CHANNEL;
         validate_segment("channel", channel)?;
+        // Build done, artifact being checksummed + written → `publishing`.
+        bus.emit(request_id, events::Emit::stage(events::Stage::Publishing));
         let published = if let Some(relay_host) = env_nonempty(BUILD_DATASET_RELAY_HOST) {
             // Interim: relay-publish over a single hop to a host with the dataset RW.
             // The plan bundles BOTH the binary and its `.sha256` sidecar so the
@@ -1007,6 +1130,7 @@ impl RustTool for CompilerBuild {
                 Duration::from_secs(600),
                 &redact,
                 None,
+                None,
             )
             .await;
             let sc_res = if bin_res.is_ok() {
@@ -1016,6 +1140,7 @@ impl RustTool for CompilerBuild {
                     &BTreeMap::new(),
                     Duration::from_secs(120),
                     &redact,
+                    None,
                     None,
                 )
                 .await
@@ -1036,15 +1161,24 @@ impl RustTool for CompilerBuild {
             publish::publish_local(&root, &module, channel, &triple, &bin, &built_bin).await?
         };
 
+        // Terminal success for this tool's scope → `published` (with the sha).
+        // (`deployed`/`rolled_back` belong to the downstream updater stage.)
+        bus.emit(
+            request_id,
+            events::Emit::stage(events::Stage::Published).sha(published.sha256.clone()),
+        );
+
         let text = format!(
-            "Built {module}@{git_ref} on {host} ({sccache}); artifact {sha} → {path}{relayed}",
+            "Built {module}@{git_ref} on {host} ({sccache}); artifact {sha} → {path}{relayed} [request_id={rid}]",
             host = resolved.role.as_str(),
             sccache = sccache_env.describe(),
             sha = &published.sha256,
             path = published.artifact_path.display(),
             relayed = if published.relayed { " (relayed)" } else { "" },
+            rid = request_id,
         );
         let structured = json!({
+            "request_id": request_id,
             "module": module,
             "ref": git_ref,
             "host": resolved.role.as_str(),
@@ -1178,10 +1312,121 @@ fn validate_source_dir(
     )))
 }
 
+/// The `compiler_progress` tool (BLD-19): a live progress/events surface keyed by
+/// a build's `request_id`. It returns the current snapshot (stage + `{step,total}`
+/// + timing) and the recent event tail; with `wait_ms > 0` it LONG-POLLS — it
+/// blocks until the next event (or the timeout) and returns a fresh snapshot, so
+/// a GUI/agent can subscribe to a running build without busy-looping. Pair
+/// `since` (the last seen `seq`) with `wait_ms` to stream: each call returns the
+/// events after `since`, and the caller advances `since` to the last `seq`.
+///
+/// Seam with `compiler_status` (BLD-08): status is the point-in-time aggregate
+/// (what is deployed where); this is the live per-request event stream.
+struct CompilerProgress;
+
+/// Default long-poll wait cap (ms) and the hard ceiling, so a caller can't pin a
+/// worker indefinitely. Numeric tuning knobs, not infra literals.
+const PROGRESS_DEFAULT_WAIT_MS: u64 = 0;
+const PROGRESS_MAX_WAIT_MS: u64 = 30_000;
+
+#[async_trait]
+impl RustTool for CompilerProgress {
+    fn name(&self) -> &str {
+        "compiler_progress"
+    }
+
+    fn description(&self) -> &str {
+        "Live build progress/events for a compiler_build request_id: current stage \
+         (queued→scheduled→relaying→building→publishing→published|failed), a \
+         {step,total} progress signal, timing, and the recent (secret-sanitized) \
+         event tail. Pass `since` (last seen seq) to get only new events, and \
+         `wait_ms`>0 to long-poll (block until the next event or the timeout). \
+         Point-in-time deploy state is compiler_status; this is the live stream."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "request_id": {
+                    "type": "string",
+                    "description": "The build request id (returned by compiler_build) to query."
+                },
+                "since": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Return only events with seq greater than this cursor (0 = the whole retained tail)."
+                },
+                "wait_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Long-poll: block up to this many ms for the next event, then return a fresh snapshot. 0 (default) returns immediately. Capped server-side."
+                }
+            },
+            "required": ["request_id"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.execute_structured(args).await?.text)
+    }
+
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let request_id = str_arg(&args, "request_id")?;
+        let since = args.get("since").and_then(Value::as_u64).unwrap_or(0);
+        let wait_ms = args
+            .get("wait_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(PROGRESS_DEFAULT_WAIT_MS)
+            .min(PROGRESS_MAX_WAIT_MS);
+
+        let snapshot = events::bus()
+            .poll(
+                &request_id,
+                since,
+                std::time::Duration::from_millis(wait_ms),
+            )
+            .await;
+
+        match snapshot {
+            Some(snap) => {
+                let text = format!(
+                    "{rid}: {stage}{prog}{term} — {n} new event(s) since seq {since} (last seq {last})",
+                    rid = snap.request_id,
+                    stage = snap.stage.as_str(),
+                    prog = match (snap.step, snap.total) {
+                        (Some(s), Some(t)) => format!(" {s}/{t}"),
+                        _ => String::new(),
+                    },
+                    term = if snap.terminal { " [terminal]" } else { "" },
+                    n = snap.events.len(),
+                    since = since,
+                    last = snap.last_seq,
+                );
+                Ok(ToolOutput::with_structured(text, snap.to_json()))
+            }
+            // Unknown/ swept build → `not_found`, NOT an error (edge case).
+            None => {
+                let text =
+                    format!("{request_id}: not_found (no such build, or its progress has expired)");
+                let structured = json!({
+                    "request_id": request_id,
+                    "status": "not_found",
+                });
+                Ok(ToolOutput::with_structured(text, structured))
+            }
+        }
+    }
+}
+
 /// Register the `compiler_*` tool surface on the registry.
 pub fn register(registry: &mut ToolRegistry) {
     if let Err(e) = registry.register(Box::new(CompilerBuild)) {
         tracing::error!("compiler: failed to register compiler_build: {e}");
+    }
+    if let Err(e) = registry.register(Box::new(CompilerProgress)) {
+        tracing::error!("compiler: failed to register compiler_progress: {e}");
     }
 }
 
@@ -1501,6 +1746,7 @@ mod tests {
             Duration::from_secs(30),
             &redact,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -1522,6 +1768,7 @@ mod tests {
             &BTreeMap::new(),
             Duration::from_secs(30),
             &redact,
+            None,
             None,
         )
         .await
@@ -1553,6 +1800,7 @@ mod tests {
             &BTreeMap::new(),
             Duration::from_millis(300),
             &[],
+            None,
             None,
         )
         .await
@@ -1680,6 +1928,7 @@ mod tests {
             Duration::from_secs(30),
             &redact,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -1725,5 +1974,63 @@ mod tests {
         assert_eq!(p["type"], "object");
         assert_eq!(p["required"][0], "module");
         assert_eq!(p["required"][1], "ref");
+    }
+
+    #[test]
+    fn progress_tool_metadata_is_stable() {
+        let t = CompilerProgress;
+        assert_eq!(t.name(), "compiler_progress");
+        let p = t.parameters();
+        assert_eq!(p["type"], "object");
+        assert_eq!(p["required"][0], "request_id");
+    }
+
+    #[tokio::test]
+    async fn progress_tool_reports_lifecycle_and_not_found() {
+        use events::{Emit, Stage};
+        // Drive a build's stages through the GLOBAL bus (unique id → no clash),
+        // then read them back through the tool exactly as a client would.
+        let id = format!("tool-{}", uuid::Uuid::new_v4());
+        let bus = events::bus();
+        bus.emit(&id, Emit::stage(Stage::Queued).message("terminus@abc"));
+        bus.emit(&id, Emit::stage(Stage::Scheduled).message("heavy"));
+        bus.emit(&id, Emit::stage(Stage::Building).progress(3, 12));
+        bus.emit(&id, Emit::stage(Stage::Publishing));
+        bus.emit(&id, Emit::stage(Stage::Published).sha("cafebabe"));
+
+        let tool = CompilerProgress;
+        let out = tool
+            .execute_structured(json!({ "request_id": id, "since": 0 }))
+            .await
+            .unwrap();
+        let s = out.structured.unwrap();
+        assert_eq!(s["request_id"], id);
+        assert_eq!(s["stage"], "published");
+        assert_eq!(s["terminal"], true);
+        assert_eq!(s["step"], 3);
+        assert_eq!(s["total"], 12);
+        // The event tail is present + ordered + terminal carries the sha.
+        let evs = s["events"].as_array().unwrap();
+        assert_eq!(evs.first().unwrap()["stage"], "queued");
+        assert_eq!(evs.last().unwrap()["stage"], "published");
+        assert_eq!(evs.last().unwrap()["sha"], "cafebabe");
+
+        // `since` cursor → only the events after it.
+        let last_seq = s["last_seq"].as_u64().unwrap();
+        let out2 = tool
+            .execute_structured(json!({ "request_id": id, "since": last_seq }))
+            .await
+            .unwrap();
+        assert!(out2.structured.unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        // Unknown build → not_found, never an error.
+        let miss = tool
+            .execute_structured(json!({ "request_id": "no-such-build-xyz" }))
+            .await
+            .unwrap();
+        assert_eq!(miss.structured.unwrap()["status"], "not_found");
     }
 }
