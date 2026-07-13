@@ -118,6 +118,11 @@ compiler_build(module, ref, host="auto", profile="release", fast=false, bin?, so
   `BUILD_{PRIMARY,HEAVY}_{MEMORY_MAX,CPU_QUOTA,IO_WEIGHT,JOBS}` — with **no hardcoded
   defaults** (an unset cap is a hard `NotConfigured` naming the var): the operator sizes
   the caps per host, because a wrong default could starve the build or under-protect Plex.
+- **Bounded, leak-free subprocesses** — every subprocess runs in its **own process group**
+  (`process_group(0)`) with `kill_on_drop`. On timeout the whole group is `killpg(SIGKILL)`-ed
+  — so a build tree (`systemd-run`/`ssh` and their `cargo`/`rustc` descendants) is torn down,
+  not just the direct child — then the child is reaped (no zombie, no leaked process keeping
+  the secret-bearing inherited environment alive past the timeout).
 - **Secrets never on a command line** (S7) — the sccache Redis **password** (and the full
   `SCCACHE_REDIS` URL) are never rendered into `--setenv=`/argv (which would leak into `ps`,
   shell history, and journald). `render_scope_argv` defensively drops any secret-shaped key;
@@ -169,11 +174,13 @@ compiler_build(module, ref, host="auto", profile="release", fast=false, bin?, so
   vault-materialized `SCCACHE_REDIS` env var and parsed into the **split**
   `SCCACHE_REDIS_ENDPOINT`/`_USERNAME`/`_PASSWORD`/`_DB`/`_KEY_PREFIX` form (the reliable
   one; a bare `SCCACHE_REDIS` URL fell back to local disk in testing). It **fails OPEN**:
-  when Redis is unconfigured, unparseable, **or unreachable** — a fast sub-second bounded TCP
-  probe of the resolved endpoint (`SCCACHE_REDIS_PROBE_MS`, default 300ms) gates Redis mode, so
-  a syntactically-valid-but-dead endpoint degrades to a local dir
-  (`${BUILD_DATASET_ROOT}/cache/sccache`) rather than making the build depend on sccache
-  runtime behavior. A cache outage never blocks a build. The parsed password is never logged.
+  when Redis is unconfigured, unparseable (including a **present-but-invalid port** — a
+  non-numeric or out-of-`1..=65535` port fails the whole parse rather than silently defaulting
+  to 6379), **or unreachable** — a fast sub-second bounded TCP probe of the resolved endpoint
+  (`SCCACHE_REDIS_PROBE_MS`, default 300ms) gates Redis mode, so a syntactically-valid-but-dead
+  endpoint degrades to a local dir (`${BUILD_DATASET_ROOT}/cache/sccache`) rather than making
+  the build depend on sccache runtime behavior. A cache outage never blocks a build. The parsed
+  password is never logged.
 - **Pinned toolchain** — `RUST_TOOLCHAIN_PINNED` is installed idempotently
   (`rustup toolchain install`, never `rustup update`); when unset, rustup auto-installs
   from the source tree's `rust-toolchain.toml`.

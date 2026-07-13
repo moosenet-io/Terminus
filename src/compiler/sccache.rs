@@ -109,16 +109,65 @@ pub struct RedisUrlParts {
     /// Endpoint WITHOUT auth or db, e.g. `redis://host:6379` — the value
     /// sccache's `SCCACHE_REDIS_ENDPOINT` expects.
     pub endpoint: String,
+    /// Host without brackets (for the reachability probe).
+    pub host: String,
+    /// Port, ALREADY validated (1..=65535) when present. `None` when the URL
+    /// omitted the port (a caller defaults it to 6379 for the probe). A
+    /// present-but-invalid port never reaches here — it fails the whole parse.
+    pub port: Option<u16>,
     pub username: Option<String>,
     pub password: Option<String>,
     /// Logical DB index as a string (sccache wants it as text), if present.
     pub db: Option<String>,
 }
 
+/// Parse a port string as a valid TCP port (1..=65535). Empty / non-numeric /
+/// zero / overflow ⇒ `None` (treated as invalid by the caller).
+fn parse_port(s: &str) -> Option<u16> {
+    match s.parse::<u16>() {
+        Ok(p) if p >= 1 => Some(p),
+        _ => None,
+    }
+}
+
+/// Split `host[:port]` (or `[ipv6][:port]`) into `(host, Option<port>)`. Returns
+/// `None` when a port is PRESENT but invalid (non-numeric / zero / out of range /
+/// empty after `:`), so the caller treats the whole URL as unparseable. An ABSENT
+/// port ⇒ `None` port (defaulted downstream). Strips IPv6 brackets from the host.
+fn split_host_port(hostport: &str) -> Option<(String, Option<u16>)> {
+    // IPv6 literal: `[::1]` or `[::1]:6379`.
+    if let Some(rest) = hostport.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        if host.is_empty() {
+            return None;
+        }
+        return match tail {
+            "" => Some((host.to_string(), None)),
+            // Anything after `]` must be exactly `:port`.
+            t => {
+                let p = t.strip_prefix(':')?;
+                Some((host.to_string(), Some(parse_port(p)?)))
+            }
+        };
+    }
+    match hostport.rsplit_once(':') {
+        Some((h, p)) => {
+            if h.is_empty() {
+                return None;
+            }
+            Some((h.to_string(), Some(parse_port(p)?)))
+        }
+        None => Some((hostport.to_string(), None)),
+    }
+}
+
 /// Parse a `redis://` / `rediss://` URL into its endpoint + auth + db parts.
-/// `None` when the scheme is not a redis scheme or the host is empty. Deliberately
-/// dependency-free (no `url` crate) so parsing is trivially unit-testable and the
-/// password never transits a logging-prone type.
+/// `None` when the scheme is not a redis scheme, the host is empty, OR a port is
+/// present but invalid (non-numeric / zero / out of 1..=65535) — a malformed port
+/// makes the URL unparseable so the caller fails OPEN to the local cache dir
+/// rather than exporting a bogus endpoint (S7). Deliberately dependency-free (no
+/// `url` crate) so parsing is trivially unit-testable and the password never
+/// transits a logging-prone type.
 pub fn parse_redis_url(url: &str) -> Option<RedisUrlParts> {
     let url = url.trim();
     let (scheme, rest) = url.split_once("://")?;
@@ -144,6 +193,9 @@ pub fn parse_redis_url(url: &str) -> Option<RedisUrlParts> {
         return None;
     }
 
+    // Validate host + optional port; a present-but-invalid port fails the parse.
+    let (host, port) = split_host_port(hostport)?;
+
     let (username, password) = match userinfo {
         Some(ui) => match ui.split_once(':') {
             Some((u, p)) => (
@@ -157,6 +209,8 @@ pub fn parse_redis_url(url: &str) -> Option<RedisUrlParts> {
 
     Some(RedisUrlParts {
         endpoint: format!("{scheme}://{hostport}"),
+        host,
+        port,
         username,
         password,
         db,
@@ -216,28 +270,11 @@ fn tcp_reachable(host: &str, port: u16, timeout: std::time::Duration) -> bool {
     }
 }
 
-/// Split a `RedisUrlParts.endpoint` (`redis://host[:port]`) into `(host, port)`,
-/// defaulting the port to 6379 and stripping IPv6 brackets for the probe.
+/// The `(host, port)` for the reachability probe. The port was already validated
+/// during parsing (a malformed one would have failed the parse), so an absent
+/// port is the ONLY reason to default — to the standard Redis port 6379.
 pub fn endpoint_host_port(parts: &RedisUrlParts) -> (String, u16) {
-    let hostport = parts
-        .endpoint
-        .strip_prefix("redis://")
-        .or_else(|| parts.endpoint.strip_prefix("rediss://"))
-        .unwrap_or(&parts.endpoint);
-    // IPv6 literal: `[::1]:6379` or `[::1]`.
-    if let Some(rest) = hostport.strip_prefix('[') {
-        if let Some((h, tail)) = rest.split_once(']') {
-            let port = tail
-                .strip_prefix(':')
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(6379);
-            return (h.to_string(), port);
-        }
-    }
-    match hostport.rsplit_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(6379)),
-        None => (hostport.to_string(), 6379),
-    }
+    (parts.host.clone(), parts.port.unwrap_or(6379))
 }
 
 /// Pure builder (a test entry point): OPTIONAL secret URL + dataset root, with
@@ -460,6 +497,40 @@ mod tests {
         // IPv6 literal with port — brackets stripped.
         let p3 = parse_redis_url("redis://[::1]:6380").unwrap();
         assert_eq!(endpoint_host_port(&p3), ("::1".to_string(), 6380));
+    }
+
+    #[test]
+    fn malformed_port_makes_url_unparseable() {
+        // A PRESENT-but-invalid port fails the whole parse (→ caller fails open),
+        // never silently defaults to 6379.
+        assert!(parse_redis_url("redis://host:notaport/1").is_none());
+        assert!(parse_redis_url("redis://host:0/1").is_none()); // zero out of range
+        assert!(parse_redis_url("redis://host:99999/1").is_none()); // > 65535
+        assert!(parse_redis_url("redis://host:/1").is_none()); // empty after ':'
+        assert!(parse_redis_url("redis://[::1]:notaport").is_none()); // ipv6 bad port
+                                                                      // Absent port parses (defaulted to 6379 downstream); a valid port is kept.
+        let absent = parse_redis_url("redis://host/1").unwrap();
+        assert_eq!(absent.port, None);
+        assert_eq!(endpoint_host_port(&absent), ("host".to_string(), 6379));
+        let valid = parse_redis_url("redis://host:6380/1").unwrap();
+        assert_eq!(valid.port, Some(6380));
+        assert_eq!(endpoint_host_port(&valid), ("host".to_string(), 6380));
+    }
+
+    #[test]
+    fn malformed_port_url_fails_open_to_local_dir() {
+        // End-to-end: a valid-scheme URL with a bad port must degrade to the local
+        // SCCACHE_DIR exactly like a missing/garbage URL — with a probe that would
+        // otherwise say "reachable" (proving the port, not reachability, decided it).
+        let env = from_secret_with_probe(
+            Some("redis://default:pw@host:notaport/1"),
+            DATASET,
+            |_, _| true, // even if host:6379 were reachable…
+        );
+        assert_eq!(env.mode, SccacheMode::LocalDir);
+        assert!(env.vars.contains_key("SCCACHE_DIR"));
+        assert!(!env.vars.contains_key("SCCACHE_REDIS_ENDPOINT"));
+        assert!(!env.vars.contains_key("SCCACHE_REDIS_PASSWORD"));
     }
 
     #[test]

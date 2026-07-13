@@ -268,6 +268,14 @@ fn redact_secrets(text: &str, secrets: &[String]) -> String {
 /// so a build script that prints its environment can never leak
 /// `SCCACHE_REDIS_PASSWORD` / the `SCCACHE_REDIS` URL into an error or log. This
 /// is the single choke point covering both the local and remote (ssh) paths.
+///
+/// PROCESS LIFECYCLE: the child is spawned in its OWN process group
+/// (`process_group(0)` ⇒ pgid == child pid) with `kill_on_drop(true)`. On timeout
+/// the WHOLE group is `killpg(SIGKILL)`-ed (so a build tree — systemd-run/ssh and
+/// their `cargo`/`rustc` descendants — dies, not just the direct child), then the
+/// direct child is `start_kill`-ed and `wait`-ed to REAP it (no zombie, no leaked
+/// process keeping the secret-bearing inherited env alive). `kill_on_drop`
+/// guarantees any early return / panic also tears the child down.
 async fn run(
     argv: &[String],
     cwd: Option<&std::path::Path>,
@@ -275,6 +283,7 @@ async fn run(
     timeout: Duration,
     redact: &[String],
 ) -> Result<String, ToolError> {
+    use tokio::io::AsyncReadExt;
     if argv.is_empty() {
         return Err(ToolError::Execution("empty command".into()));
     }
@@ -288,30 +297,68 @@ async fn run(
     }
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    // Own process group (pgid == child pid) so a timeout can signal the whole
+    // build tree; kill_on_drop so an early return also cleans up the child.
+    cmd.process_group(0);
+    cmd.kill_on_drop(true);
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| ToolError::Execution(format!("spawn {}: {e}", argv[0])))?;
-    let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(o)) => o,
+    // Capture the pgid up front (== the child pid, from process_group(0)); it is
+    // available now because the child has not yet exited.
+    let pgid = child.id().map(|p| p as libc::pid_t);
+
+    // Drain stdout/stderr concurrently while we wait, so a chatty child can't
+    // deadlock on a full pipe and we still have the output after `wait()`.
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(p) = stdout_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(p) = stderr_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(ToolError::Execution(format!("{}: {e}", argv[0]))),
         Err(_) => {
+            // TIMEOUT: kill the whole process group (the build tree), then reap
+            // the direct child so it can never become a zombie or leak.
+            if let Some(pgid) = pgid {
+                // Safe: killpg takes plain integers and has no memory effects; an
+                // ESRCH (already-empty group) is a harmless no-op.
+                unsafe {
+                    libc::killpg(pgid, libc::SIGKILL);
+                }
+            }
+            let _ = child.start_kill();
+            let _ = child.wait().await;
             return Err(ToolError::Execution(format!(
-                "{} timed out after {}s",
+                "{} timed out after {}s (child process group killed)",
                 argv[0],
                 timeout.as_secs()
-            )))
+            )));
         }
     };
-    if out.status.success() {
+
+    let stdout = stdout_task.await.unwrap_or_default();
+    let stderr = stderr_task.await.unwrap_or_default();
+    if status.success() {
         // Redact even the success stdout — it is returned to callers and may be
         // logged; a sub-tool could have echoed a secret onto it too.
-        Ok(redact_secrets(
-            &String::from_utf8_lossy(&out.stdout),
-            redact,
-        ))
+        Ok(redact_secrets(&String::from_utf8_lossy(&stdout), redact))
     } else {
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr = String::from_utf8_lossy(&stderr);
         let tail: String = stderr
             .lines()
             .rev()
@@ -325,7 +372,7 @@ async fn run(
         Err(ToolError::Execution(format!(
             "{} exited {}: {tail}",
             argv[0],
-            out.status.code().unwrap_or(-1)
+            status.code().unwrap_or(-1)
         )))
     }
 }
@@ -1263,6 +1310,45 @@ mod tests {
             "secret leaked into stdout: {out}"
         );
         assert!(out.contains("<redacted>"));
+    }
+
+    #[tokio::test]
+    async fn run_timeout_kills_the_child_process_tree() {
+        // A child that would create a marker AFTER a sleep longer than the timeout.
+        // If the timeout path merely dropped the future without killing the process
+        // group, the sleep would finish and the marker would appear. The kill must
+        // prevent that. `sh -c 'sleep …; touch marker'` — sh is the group leader and
+        // sleep is in its group, so killpg(SIGKILL) tears down the whole tree.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("SHOULD_NOT_EXIST");
+        let start = std::time::Instant::now();
+        let err = run(
+            &[
+                "sh".into(),
+                "-c".into(),
+                format!("sleep 3; : > {}", marker.display()),
+            ],
+            None,
+            &BTreeMap::new(),
+            Duration::from_millis(300),
+            &[],
+        )
+        .await
+        .unwrap_err();
+        // Timed out promptly (did not block for the full sleep).
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "run should return at the timeout"
+        );
+        assert!(format!("{err:?}").contains("timed out"));
+
+        // Wait past when the marker WOULD have been created had the child survived;
+        // it must never appear, proving the process was killed.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(
+            !marker.exists(),
+            "the timed-out child was not killed — its process tree leaked"
+        );
     }
 
     #[test]
