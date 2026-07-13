@@ -47,6 +47,7 @@
 //! infra literals.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -215,6 +216,11 @@ struct Track {
     next_seq: u64,
     created_ms: u64,
     updated_ms: u64,
+    /// Monotonic "last-touched" ordinal from the bus's global touch counter,
+    /// bumped on every emit. This — NOT the wall clock — is the LRU key, so two
+    /// updates in the same `SystemTime` tick still have a strict, deterministic
+    /// order and eviction can never tie (fixes the flaky eviction test).
+    last_touched: u64,
     /// Last emitted `{step,total}`, so building-progress lines that don't advance
     /// the step are dropped (throttle — never a flood of identical events).
     last_step: Option<(u32, u32)>,
@@ -223,7 +229,7 @@ struct Track {
 }
 
 impl Track {
-    fn new(now: u64, max_events: usize) -> Self {
+    fn new(now: u64, touched: u64, max_events: usize) -> Self {
         let depth = BROADCAST_DEPTH.max(max_events.min(1024));
         let (tx, _rx) = broadcast::channel(depth);
         Self {
@@ -231,6 +237,7 @@ impl Track {
             next_seq: 1,
             created_ms: now,
             updated_ms: now,
+            last_touched: touched,
             last_step: None,
             terminal: None,
             tx,
@@ -246,6 +253,10 @@ impl Track {
 /// bounds; all `compiler_*` progress goes through the single instance.
 pub struct ProgressBus {
     inner: Mutex<HashMap<String, Track>>,
+    /// Monotonic touch counter: every emit assigns the next value to the touched
+    /// build's `last_touched`, giving a strict LRU order independent of wall-clock
+    /// resolution (so eviction is deterministic even under test parallelism).
+    touch: AtomicU64,
     max_events: usize,
     max_builds: usize,
     ttl_ms: u64,
@@ -293,6 +304,7 @@ impl ProgressBus {
     fn from_env() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            touch: AtomicU64::new(0),
             max_events: env_usize(ENV_MAX_EVENTS, DEFAULT_MAX_EVENTS),
             max_builds: env_usize(ENV_MAX_BUILDS, DEFAULT_MAX_BUILDS),
             ttl_ms: env_u64(ENV_TTL_SECS, DEFAULT_TTL_SECS).saturating_mul(1000),
@@ -304,6 +316,7 @@ impl ProgressBus {
     pub fn with_bounds(max_events: usize, max_builds: usize, ttl_ms: u64) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            touch: AtomicU64::new(0),
             max_events: max_events.max(1),
             max_builds: max_builds.max(1),
             ttl_ms,
@@ -326,12 +339,13 @@ impl ProgressBus {
     }
 
     /// Evict the least-recently-updated build while at capacity (never the build
-    /// we are about to write to). Caller holds the lock.
+    /// we are about to write to). Caller holds the lock. Ordering is by the
+    /// monotonic `last_touched` ordinal (strict, tie-free), NOT the wall clock.
     fn evict_if_full_locked(map: &mut HashMap<String, Track>, max_builds: usize, keep: &str) {
         while map.len() >= max_builds && !map.contains_key(keep) {
             let victim = map
                 .iter()
-                .min_by_key(|(_, t)| t.updated_ms)
+                .min_by_key(|(_, t)| t.last_touched)
                 .map(|(k, _)| k.clone());
             match victim {
                 Some(v) => {
@@ -347,6 +361,10 @@ impl ProgressBus {
     /// and (for the building stage) throttles unchanged `{step,total}`.
     pub fn emit(&self, request_id: &str, e: Emit) -> u64 {
         let now = now_ms();
+        // A strictly-increasing LRU ordinal for THIS emit — assigned to the
+        // touched build below so eviction order never depends on wall-clock
+        // resolution (two emits in the same tick still order strictly).
+        let touched = self.touch.fetch_add(1, Ordering::Relaxed);
         let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
 
         Self::sweep_locked(&mut map, self.ttl_ms, now);
@@ -355,7 +373,7 @@ impl ProgressBus {
         let max_events = self.max_events;
         let track = map
             .entry(request_id.to_string())
-            .or_insert_with(|| Track::new(now, max_events));
+            .or_insert_with(|| Track::new(now, touched, max_events));
 
         // Throttle: a building event that neither advances the step nor carries a
         // message is redundant — drop it (avoid a flood of identical progress).
@@ -381,6 +399,9 @@ impl ProgressBus {
         let seq = track.next_seq;
         track.next_seq += 1;
         track.updated_ms = now;
+        // Mark this build most-recently-used (a newly-created track already holds
+        // this same ordinal; an existing one advances to it).
+        track.last_touched = touched;
         if e.stage.is_terminal() {
             track.terminal = Some(e.stage);
         }
@@ -647,17 +668,30 @@ mod tests {
 
     #[test]
     fn evicts_least_recently_updated_when_full() {
+        // DETERMINISTIC regardless of wall-clock resolution or test parallelism:
+        // LRU order is the monotonic touch ordinal, so even though a/b/c are
+        // emitted within the same clock tick their order is strict (a<b<c) and
+        // eviction can never tie.
         let bus = ProgressBus::with_bounds(16, 2, 0);
-        bus.emit("a", Emit::stage(Stage::Queued));
-        bus.emit("b", Emit::stage(Stage::Queued));
-        // At capacity (2); emitting a 3rd distinct build evicts the LRU ("a").
-        bus.emit("c", Emit::stage(Stage::Queued));
+        bus.emit("a", Emit::stage(Stage::Queued)); // touch 0 → LRU
+        bus.emit("b", Emit::stage(Stage::Queued)); // touch 1
+                                                   // At capacity (2); a 3rd distinct build evicts the strict LRU ("a").
+        bus.emit("c", Emit::stage(Stage::Queued)); // touch 2
         assert_eq!(bus.tracked(), 2);
-        assert!(bus.snapshot("a", 0).is_none(), "LRU build evicted");
-        assert!(bus.snapshot("c", 0).is_some());
-        // An existing build is never evicted by its own emit.
-        bus.emit("b", Emit::stage(Stage::Scheduled));
+        assert!(bus.snapshot("a", 0).is_none(), "strict LRU build evicted");
         assert!(bus.snapshot("b", 0).is_some());
+        assert!(bus.snapshot("c", 0).is_some());
+        // Touching "b" makes it most-recently-used, so the next distinct build
+        // evicts "c" (now the strict LRU) — proving order tracks activity.
+        bus.emit("b", Emit::stage(Stage::Scheduled)); // touch 3 → b now MRU
+        bus.emit("d", Emit::stage(Stage::Queued)); // touch 4 → evicts LRU "c"
+        assert_eq!(bus.tracked(), 2);
+        assert!(
+            bus.snapshot("c", 0).is_none(),
+            "c became LRU and was evicted"
+        );
+        assert!(bus.snapshot("b", 0).is_some(), "b was refreshed, retained");
+        assert!(bus.snapshot("d", 0).is_some());
     }
 
     #[test]
