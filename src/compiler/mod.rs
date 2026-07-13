@@ -226,6 +226,18 @@ fn cargo_build_argv(
     argv
 }
 
+/// Force cargo to render its `N/M` progress bar EVEN on the piped (non-TTY)
+/// stdio the build runs under, so the live `{step,total}` progress the tap parses
+/// is actually emitted. `CARGO_TERM_PROGRESS_WHEN=always` renders the bar
+/// unconditionally; a fixed `CARGO_TERM_PROGRESS_WIDTH` keeps the `N/M` format
+/// stable (independent of a non-existent terminal width). Both are NON-SECRET
+/// term vars (they go via `--setenv`, never the secret env-file), inserted into
+/// the build child's env for BOTH the local and remote (heavy) build paths.
+fn inject_cargo_progress_env(build_env: &mut BTreeMap<String, String>) {
+    build_env.insert("CARGO_TERM_PROGRESS_WHEN".to_string(), "always".to_string());
+    build_env.insert("CARGO_TERM_PROGRESS_WIDTH".to_string(), "100".to_string());
+}
+
 /// The path (relative to CARGO_TARGET_DIR) where the built binary lands:
 /// `<triple>/<profile-subdir>/<bin>`.
 fn built_bin_rel(triple: &str, profile: &str, bin: &str) -> PathBuf {
@@ -478,12 +490,29 @@ impl Drop for RemoteSecretGuard {
 /// `systemctl kill <unit>.scope` over ssh to tear down the remote build tree — so
 /// a timed-out heavy build cannot keep running remotely (holding the inherited
 /// secret env + capped host resources) after the tool returns.
+/// Flush one segment (a `\r`/`\n`-delimited line) to the build tap: lossily decode
+/// (non-UTF-8 → U+FFFD), redact (S6/S7), feed the progress tap, and append the
+/// redacted bytes to the captured output. An empty segment is a no-op (nothing to
+/// parse), so consecutive delimiters (`\r\n`) don't fire a spurious tap.
+fn tap_flush_segment(seg: &[u8], tap: &events::BuildTap, redact: &[String], buf: &mut Vec<u8>) {
+    if seg.is_empty() {
+        return;
+    }
+    let redacted = redact_secrets(&String::from_utf8_lossy(seg), redact);
+    tap.on_line(&redacted);
+    buf.extend_from_slice(redacted.as_bytes());
+}
+
 /// Drain one child pipe to completion (so a chatty child never deadlocks on a
 /// full pipe). Without a `tap` it is a byte-exact `read_to_end` (unchanged for
-/// every non-build subprocess). With a `tap` (the cargo build) it reads LINE BY
-/// LINE, redacts each line (S6/S7) BEFORE forwarding it to the tap — which emits
-/// a live `{step,total}` building event — and keeps the redacted lines as the
-/// captured output so a failed build's error tail can never carry a raw secret.
+/// every non-build subprocess). With a `tap` (the cargo build) it reads RAW BYTES
+/// in chunks and splits on BOTH `\r` AND `\n` so a cargo progress bar (which
+/// updates with CARRIAGE RETURNS, no newline until it finishes) reaches the tap
+/// LIVE — each `12/34`→`20/34` update fires immediately instead of buffering
+/// until the next newline. Each segment is redacted (S6/S7) BEFORE it reaches the
+/// tap, and the redacted segments are kept as the captured output so a failed
+/// build's error tail can never carry a raw secret. Byte-level reads never choke
+/// on non-UTF-8 (lossy decode) and drain to EOF; only a true read error breaks.
 async fn drain_pipe<R>(
     pipe: Option<R>,
     tap: Option<events::BuildTap>,
@@ -492,7 +521,7 @@ async fn drain_pipe<R>(
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    use tokio::io::AsyncReadExt;
     let mut pipe = match pipe {
         Some(p) => p,
         None => return Vec::new(),
@@ -506,31 +535,34 @@ where
         }
         Some(t) => t,
     };
-    // Read RAW BYTES up to each newline — NOT `read_line`, which requires valid
-    // UTF-8 and returns Err on an invalid byte, which would stop the drain and
-    // let a chatty child block on a full pipe → the whole BUILD hangs. With
-    // `read_until` a non-UTF-8 line is lossily decoded, redacted, tapped, and
-    // captured, and draining continues to EOF. Only a TRUE read error breaks.
-    let mut reader = tokio::io::BufReader::new(pipe);
-    let mut buf: Vec<u8> = Vec::new();
-    let mut raw: Vec<u8> = Vec::new();
+    let mut buf: Vec<u8> = Vec::new(); // full captured (redacted) output
+    let mut seg: Vec<u8> = Vec::new(); // current in-progress segment (line/bar)
+    let mut chunk = [0u8; 8192];
     loop {
-        raw.clear();
-        match reader.read_until(b'\n', &mut raw).await {
-            Ok(0) => break, // EOF
-            Ok(_) => {
-                // Lossily decode (non-UTF-8 bytes → U+FFFD), strip the trailing
-                // newline, redact (S6/S7), tap for progress, and capture.
-                let line = String::from_utf8_lossy(&raw);
-                let redacted =
-                    redact_secrets(line.trim_end_matches(|c| c == '\n' || c == '\r'), &redact);
-                tap.on_line(&redacted);
-                buf.extend_from_slice(redacted.as_bytes());
-                buf.push(b'\n');
+        match pipe.read(&mut chunk).await {
+            Ok(0) => {
+                // EOF: flush any trailing partial segment (no delimiter).
+                tap_flush_segment(&seg, &tap, &redact, &mut buf);
+                break;
             }
-            // A genuine I/O read error: stop draining this pipe (the child is
+            Ok(n) => {
+                for &b in &chunk[..n] {
+                    if b == b'\n' || b == b'\r' {
+                        // A `\r` OR `\n` closes the current segment → tap it LIVE.
+                        tap_flush_segment(&seg, &tap, &redact, &mut buf);
+                        buf.push(b); // preserve the delimiter in the capture
+                        seg.clear();
+                    } else {
+                        seg.push(b);
+                    }
+                }
+            }
+            // A genuine I/O read error: flush the remainder and stop (the child is
             // unaffected; the remaining bytes just don't reach the tail).
-            Err(_) => break,
+            Err(_) => {
+                tap_flush_segment(&seg, &tap, &redact, &mut buf);
+                break;
+            }
         }
     }
     buf
@@ -1011,6 +1043,9 @@ impl CompilerBuild {
                 "CARGO_TARGET_DIR".to_string(),
                 target_dir.to_string_lossy().to_string(),
             );
+            // Force cargo's N/M progress bar on the piped (non-TTY) stdio so the
+            // tap gets live {step,total} updates (BLD-19).
+            inject_cargo_progress_env(&mut build_env);
             // S7: non-secret vars → `--setenv` (argv); secret vars → the INHERITED
             // process environment of systemd-run (which `--scope` passes to the
             // cargo child) — never argv.
@@ -1126,6 +1161,9 @@ impl CompilerBuild {
 
             let mut build_env = sccache_env.vars.clone();
             build_env.insert("CARGO_TARGET_DIR".to_string(), remote_target_str.clone());
+            // Force cargo's N/M progress bar on the piped (non-TTY, over-ssh) stdio
+            // so the tap gets live {step,total} updates (BLD-19).
+            inject_cargo_progress_env(&mut build_env);
             let (setenv, secret_env) = scope::partition_env(&build_env);
 
             // Secret env (if any) → a 0600 file ON THE REMOTE, `source`d inside the
@@ -2511,6 +2549,77 @@ mod tests {
             .expect("tap created the track");
         assert_eq!(snap.stage, events::Stage::Building);
         assert_eq!((snap.step, snap.total), (Some(5), Some(9)));
+    }
+
+    #[tokio::test]
+    async fn drain_pipe_splits_carriage_return_progress_updates_live() {
+        // Cargo's progress bar updates with CARRIAGE RETURNS (no newline until the
+        // bar finishes). The tap must fire on EACH `\r` so live {step,total}
+        // populates as the build compiles — not buffer until a newline. Feed
+        // CR-separated updates, an embedded newline, and a non-UTF-8 byte.
+        let id = format!("cr-{}", uuid::Uuid::new_v4());
+        let tap = events::BuildTap::new(&id);
+        let redact = vec!["SEKRET".to_string()];
+        // \r-separated progress + a \n + an invalid byte before a final line.
+        let input: Vec<u8> =
+            b"\r   Building [=>   ] 12/34: a\r   Building [==>  ] 20/34: b\r   Building [===> ] 34/34: c\nCompiling done\r\xffleak=SEKRET\n"
+                .to_vec();
+        let captured = drain_pipe(Some(&input[..]), Some(tap), redact).await;
+        let text = String::from_utf8_lossy(&captured);
+
+        // Each CR update reached the tap live; the parser advanced step/total in
+        // order → the ring holds building events for {12,34},{20,34},{34,34}.
+        let snap = events::bus()
+            .snapshot(&id, 0)
+            .expect("tap created the track");
+        let steps: Vec<(Option<u32>, Option<u32>)> = snap
+            .events
+            .iter()
+            .filter(|e| e.stage == events::Stage::Building)
+            .map(|e| (e.step, e.total))
+            .collect();
+        assert!(
+            steps.contains(&(Some(12), Some(34)))
+                && steps.contains(&(Some(20), Some(34)))
+                && steps.contains(&(Some(34), Some(34))),
+            "each CR progress update fired live: {steps:?}"
+        );
+        assert!(
+            steps.len() >= 3,
+            "multiple live building events, not one: {steps:?}"
+        );
+        assert_eq!(snap.step, Some(34), "latest step reflects the final update");
+        assert_eq!(snap.total, Some(34));
+        // Drained past the non-UTF-8 byte to EOF; secret redacted; output captured.
+        assert!(
+            text.contains("Compiling done"),
+            "post-CR newline line captured"
+        );
+        assert!(
+            !text.contains("SEKRET"),
+            "secret redacted in capture: {text:?}"
+        );
+        assert!(text.contains("<redacted>"));
+        assert!(
+            text.contains("12/34") && text.contains("34/34"),
+            "full output captured"
+        );
+    }
+
+    #[test]
+    fn build_env_forces_cargo_nm_progress_on_non_tty() {
+        // Part 1: the build child env forces cargo's N/M progress even non-TTY.
+        let mut env = std::collections::BTreeMap::new();
+        inject_cargo_progress_env(&mut env);
+        assert_eq!(
+            env.get("CARGO_TERM_PROGRESS_WHEN").map(String::as_str),
+            Some("always")
+        );
+        assert!(env.contains_key("CARGO_TERM_PROGRESS_WIDTH"));
+        // These are NON-secret term vars → they go via `--setenv`, not the secret
+        // env-file (so they reach the cargo child on argv, never leak).
+        assert!(!scope::is_secret_env_key("CARGO_TERM_PROGRESS_WHEN"));
+        assert!(!scope::is_secret_env_key("CARGO_TERM_PROGRESS_WIDTH"));
     }
 
     #[tokio::test]

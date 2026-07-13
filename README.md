@@ -261,7 +261,11 @@ stage transition.
   a local stream without a `relaying` event is valid, not a gap.
 - `building` — compilation in progress. The started transition is always emitted; then
   `{step,total}` is parsed from cargo's build progress (`N/M`) and streamed live as the crates
-  compile, throttled so an unchanged step is not re-emitted.
+  compile, throttled so an unchanged step is not re-emitted. To make this work on the build's
+  **piped, non-TTY** stdio, the build child env forces `CARGO_TERM_PROGRESS_WHEN=always` (with a
+  fixed `CARGO_TERM_PROGRESS_WIDTH`) so cargo renders the `N/M` bar, and the output drain splits
+  on **both `\r` and `\n`** so each carriage-return progress update reaches the tap live (cargo
+  redraws the bar with `\r`, not newlines) rather than buffering until the next newline.
 - `publishing` — artifact being checksummed + written.
 - `published` — **terminal success**, carries the artifact `sha256`.
 - `failed` — **terminal failure**, carries a **secret-sanitized** error tail.
