@@ -762,6 +762,43 @@ pub fn gateway_rate_limit_refill_per_sec() -> f64 {
         .unwrap_or(5.0)
 }
 
+// BLD-20: bounded FIFO request-queue knobs for the proxy admission path. When
+// the rate limiter says over-limit, the gateway admits the request through the
+// Redis FIFO queue with a BOUNDED wait instead of an immediate 429 — only
+// shedding load (429) when the queue is full or the wait times out.
+
+/// Max depth of the proxy admission queue. From
+/// `TERMINUS_GATEWAY_QUEUE_MAX_DEPTH`; defaults to 128. A request that arrives
+/// when the queue is at this depth is shed immediately (429) rather than piling
+/// on unbounded backlog.
+pub fn gateway_queue_max_depth() -> i64 {
+    env_nonempty("TERMINUS_GATEWAY_QUEUE_MAX_DEPTH")
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &i64| *n > 0)
+        .unwrap_or(128)
+}
+
+/// Max time an over-limit request waits in the admission queue before it is shed
+/// (429). From `TERMINUS_GATEWAY_QUEUE_MAX_WAIT_MS`; defaults to 500ms — bounded
+/// so a caller never blocks indefinitely behind the queue.
+pub fn gateway_queue_max_wait() -> std::time::Duration {
+    let ms = env_nonempty("TERMINUS_GATEWAY_QUEUE_MAX_WAIT_MS")
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &u64| *n > 0)
+        .unwrap_or(500);
+    std::time::Duration::from_millis(ms)
+}
+
+/// Poll interval while waiting in the admission queue. From
+/// `TERMINUS_GATEWAY_QUEUE_POLL_MS`; defaults to 25ms.
+pub fn gateway_queue_poll() -> std::time::Duration {
+    let ms = env_nonempty("TERMINUS_GATEWAY_QUEUE_POLL_MS")
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &u64| *n > 0)
+        .unwrap_or(25);
+    std::time::Duration::from_millis(ms)
+}
+
 // ── DISC-04: HF Hub public model-listing client ──────────────────────────────
 //
 // `intake::discovery::hf_client::HfHubClient` queries the PUBLIC HuggingFace Hub

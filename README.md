@@ -1565,12 +1565,18 @@ implements the existing `gateway_framework::rate_limit::RateLimiter` trait — a
 drop-in for the in-process limiter — using an **atomic Lua token-bucket** so N
 concurrent over-limit requests are throttled correctly (no oversubscription) and
 limits **survive a gateway restart** (the bucket lives in Redis, not process
-memory). `RequestQueue` is a FIFO Redis-list queue for admitting over-limit
-requests in order. It is wired into `GatewayFramework::guard` — every proxy
-request passes through it — and the backend is chosen by **configuration**, not
-liveness: when `REDIS_URL` is set the Redis limiter is always selected (a
-configured-but-unreachable Redis fails CLOSED at runtime, never a silent
-downgrade); only a genuinely absent `REDIS_URL` uses the in-process limiter.
+memory). `RequestQueue` is a FIFO Redis-list queue wired into
+`GatewayFramework::guard`'s admission path: when the limiter says over-limit, the
+request is **admitted through the bounded FIFO queue** rather than 429'd
+immediately — it waits (in FIFO order, up to `TERMINUS_GATEWAY_QUEUE_MAX_WAIT_MS`,
+default 500ms) for a token to free, and only sheds load (429) when the queue is
+full (`TERMINUS_GATEWAY_QUEUE_MAX_DEPTH`, default 128) or the wait times out. The
+bounded enqueue is atomic (Lua `LLEN`-then-`RPUSH`), and an unreachable Redis
+fails CLOSED (429). Every proxy request passes through `guard`, and the limiter
+backend is chosen by **configuration**, not liveness: when `REDIS_URL` is set the
+Redis limiter + queue are always selected (a configured-but-unreachable Redis
+fails CLOSED at runtime, never a silent downgrade); only a genuinely absent
+`REDIS_URL` uses the in-process limiter (with no queue).
 
 All consumers share the ONE pooled `RedisBackend` — the prefix overlay included:
 it stores its claims in the durable `prefix:overlay:v1` key via

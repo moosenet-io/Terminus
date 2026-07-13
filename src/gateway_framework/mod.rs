@@ -613,6 +613,13 @@ fn is_approval_required_marker(detail: &str) -> bool {
 struct GatewayFrameworkInner {
     allowlist: AllowlistPolicy,
     rate_limiter: Arc<dyn RateLimiter>,
+    /// BLD-20: bounded FIFO admission queue for over-limit requests. `None` =
+    /// no queuing (immediate 429 on over-limit) — the case for the in-process
+    /// limiter / tests. `Some` when the shared Redis is configured.
+    request_queue: Option<Arc<crate::ratelimit::RequestQueue>>,
+    queue_max_depth: i64,
+    queue_max_wait: std::time::Duration,
+    queue_poll: std::time::Duration,
 }
 
 /// The shared gateway pipeline itself: owns the allowlist policy and rate
@@ -636,18 +643,47 @@ impl std::fmt::Debug for GatewayFramework {
 }
 
 impl GatewayFramework {
+    /// Build with an explicit limiter and NO admission queue (immediate 429 on
+    /// over-limit). Used by tests and the in-process path.
     pub fn new(allowlist: AllowlistPolicy, rate_limiter: Arc<dyn RateLimiter>) -> Self {
+        Self::with_queue(allowlist, rate_limiter, None)
+    }
+
+    /// Build with an explicit limiter and an optional bounded FIFO admission
+    /// queue (BLD-20). Queue knobs come from `crate::config`.
+    pub fn with_queue(
+        allowlist: AllowlistPolicy,
+        rate_limiter: Arc<dyn RateLimiter>,
+        request_queue: Option<Arc<crate::ratelimit::RequestQueue>>,
+    ) -> Self {
         Self {
-            inner: Arc::new(GatewayFrameworkInner { allowlist, rate_limiter }),
+            inner: Arc::new(GatewayFrameworkInner {
+                allowlist,
+                rate_limiter,
+                request_queue,
+                queue_max_depth: crate::config::gateway_queue_max_depth(),
+                queue_max_wait: crate::config::gateway_queue_max_wait(),
+                queue_poll: crate::config::gateway_queue_poll(),
+            }),
         }
     }
 
     /// Build the production framework from env config
     /// (`crate::config::gateway_allowlist_json` +
     /// `crate::config::gateway_rate_limit_burst`/`gateway_rate_limit_refill_per_sec`)
-    /// — what `terminus_primary`'s `main()` calls.
+    /// — what `terminus_primary`'s `main()` calls. When the shared Redis is
+    /// configured, the Redis limiter AND the FIFO admission queue are built from
+    /// the SAME pool; see [`Self::rate_limiter_from_env`] for the selection rule.
     pub fn from_env() -> Self {
-        Self::new(AllowlistPolicy::from_env(), Self::rate_limiter_from_env())
+        let allowlist = AllowlistPolicy::from_env();
+        // Build both proxy consumers (limiter + queue) from ONE shared backend.
+        if let Some(backend) = crate::redis::RedisBackend::from_env() {
+            let limiter = Arc::new(crate::ratelimit::RedisRateLimiter::from_env(backend.clone()));
+            let queue = Arc::new(crate::ratelimit::RequestQueue::new(backend, "proxy"));
+            return Self::with_queue(allowlist, limiter, Some(queue));
+        }
+        // Redis not constructed → no queue; pick the limiter by config-presence.
+        Self::with_queue(allowlist, Self::rate_limiter_from_env(), None)
     }
 
     /// Select the proxy rate-limiter backend (BLD-20). Every request already
@@ -696,6 +732,41 @@ impl GatewayFramework {
                 Arc::new(crate::ratelimit::AlwaysLimited)
             }
         }
+    }
+
+    /// BLD-20: attempt bounded FIFO admission for an over-limit request. Returns
+    /// `true` if the request was admitted (proceed), `false` if it should be
+    /// 429'd. `false` when no queue is configured (immediate shed), or on
+    /// `QueueFull`/`TimedOut`/`Unavailable` (Redis down ⇒ fail CLOSED). While
+    /// waiting at the head, it re-checks the rate limiter — so it admits exactly
+    /// when a token frees, preserving the limit rather than bypassing it.
+    async fn try_admit(&self, key: &str) -> bool {
+        let Some(queue) = &self.inner.request_queue else {
+            return false; // no queuing configured → immediate 429
+        };
+        // Unique, non-colliding ticket for this attempt (per-process seq + key).
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ticket = format!("{key}#{n}");
+        let limiter = self.inner.rate_limiter.clone();
+        let k = key.to_string();
+        let acquire = || {
+            let limiter = limiter.clone();
+            let k = k.clone();
+            async move { limiter.check(&k).await == RateLimitDecision::Allowed }
+        };
+        matches!(
+            queue
+                .admit(
+                    &ticket,
+                    self.inner.queue_max_depth,
+                    self.inner.queue_max_wait,
+                    self.inner.queue_poll,
+                    acquire,
+                )
+                .await,
+            crate::ratelimit::Admission::Admitted
+        )
     }
 
     /// Gate one request. `principal` must come from a server-verified
@@ -765,10 +836,17 @@ impl GatewayFramework {
 
         let key = rate_limit_key(&identity_str, action);
         if self.inner.rate_limiter.check(&key).await == RateLimitDecision::Limited {
-            let detail = format!("rate limit exceeded for '{identity_str}' on '{action}'");
-            AuditEntry::new(&identity_str, action, kind, AuditResult::DeniedRateLimited, Some(&detail))
-                .log();
-            return Err(denied_response(StatusCode::TOO_MANY_REQUESTS, &detail));
+            // BLD-20: over-limit → don't 429 immediately. If a bounded FIFO
+            // admission queue is configured, ADMIT the request through it
+            // (FIFO fairness + a bounded wait for a token to free); only shed
+            // load (429) when the queue is full or the wait times out. Redis
+            // unreachable ⇒ fail CLOSED (429), never admit unbounded.
+            if !self.try_admit(&key).await {
+                let detail = format!("rate limit exceeded for '{identity_str}' on '{action}'");
+                AuditEntry::new(&identity_str, action, kind, AuditResult::DeniedRateLimited, Some(&detail))
+                    .log();
+                return Err(denied_response(StatusCode::TOO_MANY_REQUESTS, &detail));
+            }
         }
 
         Ok(GatewayContext {

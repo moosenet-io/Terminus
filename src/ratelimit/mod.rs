@@ -30,7 +30,9 @@
 //! resolution (`REDIS_URL` from the vault). This module only forms keys via the
 //! `ratelimit:` [`Namespace`].
 
+use std::future::Future;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
@@ -240,13 +242,291 @@ impl RequestQueue {
             })
             .await
     }
+
+    /// Bounded FIFO admission for an over-limit proxy request. Enqueues `ticket`
+    /// (only if the queue has room), then waits — in FIFO order — until this
+    /// ticket is at the head AND `acquire` (a re-check of the rate limiter)
+    /// succeeds, or until `max_wait` elapses. Returns [`Admission::Admitted`] on
+    /// success, [`Admission::QueueFull`] if the queue is at `max_depth`,
+    /// [`Admission::TimedOut`] if the wait elapsed (the ticket is removed), or
+    /// [`Admission::Unavailable`] (fail CLOSED) on any Redis error. See
+    /// [`run_admission`] for the backend-agnostic loop this delegates to.
+    pub async fn admit<F, Fut>(
+        &self,
+        ticket: &str,
+        max_depth: i64,
+        max_wait: Duration,
+        poll: Duration,
+        acquire: F,
+    ) -> Admission
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        run_admission(self, ticket, max_depth, max_wait, poll, acquire).await
+    }
+}
+
+/// Atomic bounded enqueue: RPUSH `ticket` only if `LLEN < max_depth`, and set a
+/// TTL so an abandoned queue self-cleans (volatile DB). `KEYS[1]` = list key,
+/// `ARGV[1]` = max_depth, `ARGV[2]` = ticket, `ARGV[3]` = ttl secs. Returns 1
+/// enqueued, 0 full. Atomic (single-threaded Lua) so a burst cannot overfill.
+pub const ENQUEUE_BOUNDED_LUA: &str = r#"
+if redis.call('LLEN', KEYS[1]) >= tonumber(ARGV[1]) then
+  return 0
+end
+redis.call('RPUSH', KEYS[1], ARGV[2])
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
+return 1
+"#;
+
+/// TTL (secs) applied to an active admission queue so an abandoned one is
+/// reclaimed by the volatile DB rather than lingering.
+const QUEUE_TTL_SECS: i64 = 300;
+
+/// [`Outcome`](Admission) of a bounded queue-admission attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// Admitted — the caller proceeds (a rate-limit token was acquired at the head).
+    Admitted,
+    /// The queue was already at `max_depth` — shed load (429).
+    QueueFull,
+    /// The bounded wait elapsed before admission — shed load (429).
+    TimedOut,
+    /// Redis was unreachable — fail CLOSED (429), never admit unbounded.
+    Unavailable,
+}
+
+/// The FIFO-queue operations [`run_admission`] needs. Implemented by
+/// [`RequestQueue`] over Redis, and by an in-memory fake in the unit tests so
+/// the admission/timeout/full/unavailable paths are covered OFFLINE.
+#[async_trait]
+pub(crate) trait AdmissionQueue: Send + Sync {
+    /// Atomically enqueue `ticket` iff depth < `max_depth`. `Ok(true)` enqueued,
+    /// `Ok(false)` full, `Err(())` unreachable.
+    async fn enqueue_bounded(&self, ticket: &str, max_depth: i64) -> Result<bool, ()>;
+    /// Is `ticket` currently at the head of the queue? `Err(())` unreachable.
+    async fn at_head(&self, ticket: &str) -> Result<bool, ()>;
+    /// Remove `ticket` from the queue (best-effort on give-up). `Err(())` unreachable.
+    async fn remove_ticket(&self, ticket: &str) -> Result<(), ()>;
+    /// Pop the head element (called once this ticket has been admitted at the head).
+    async fn pop_head(&self) -> Result<(), ()>;
+}
+
+/// Backend-agnostic bounded-FIFO admission loop (see [`RequestQueue::admit`]).
+/// Fails CLOSED (`Unavailable`) on any queue error so a Redis outage never
+/// admits unbounded.
+pub(crate) async fn run_admission<Q, F, Fut>(
+    queue: &Q,
+    ticket: &str,
+    max_depth: i64,
+    max_wait: Duration,
+    poll: Duration,
+    acquire: F,
+) -> Admission
+where
+    Q: AdmissionQueue + ?Sized,
+    F: Fn() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    match queue.enqueue_bounded(ticket, max_depth).await {
+        Ok(true) => {}
+        Ok(false) => return Admission::QueueFull,
+        Err(()) => return Admission::Unavailable, // fail closed
+    }
+    let deadline = Instant::now() + max_wait;
+    loop {
+        match queue.at_head(ticket).await {
+            Ok(true) => {
+                if acquire().await {
+                    let _ = queue.pop_head().await; // best-effort: drop our head slot
+                    return Admission::Admitted;
+                }
+            }
+            Ok(false) => {}
+            Err(()) => {
+                let _ = queue.remove_ticket(ticket).await;
+                return Admission::Unavailable; // fail closed
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            let _ = queue.remove_ticket(ticket).await;
+            return Admission::TimedOut;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        tokio::time::sleep(poll.min(remaining)).await;
+    }
+}
+
+#[async_trait]
+impl AdmissionQueue for RequestQueue {
+    async fn enqueue_bounded(&self, ticket: &str, max_depth: i64) -> Result<bool, ()> {
+        let key = self.list_key();
+        let ticket = ticket.to_string();
+        let script = redis::Script::new(ENQUEUE_BOUNDED_LUA);
+        self.backend
+            .with_conn(Namespace::Ratelimit, |mut conn| async move {
+                script
+                    .key(key)
+                    .arg(max_depth)
+                    .arg(ticket)
+                    .arg(QUEUE_TTL_SECS)
+                    .invoke_async::<_, i64>(&mut conn)
+                    .await
+            })
+            .await
+            .map(|v| v == 1)
+    }
+
+    async fn at_head(&self, ticket: &str) -> Result<bool, ()> {
+        let key = self.list_key();
+        let ticket = ticket.to_string();
+        self.backend
+            .with_conn(Namespace::Ratelimit, |mut conn| async move {
+                let head: Option<String> = redis::cmd("LINDEX")
+                    .arg(&key)
+                    .arg(0)
+                    .query_async(&mut conn)
+                    .await?;
+                Ok(head.as_deref() == Some(ticket.as_str()))
+            })
+            .await
+    }
+
+    async fn remove_ticket(&self, ticket: &str) -> Result<(), ()> {
+        let key = self.list_key();
+        let ticket = ticket.to_string();
+        self.backend
+            .with_conn(Namespace::Ratelimit, |mut conn| async move {
+                redis::cmd("LREM")
+                    .arg(&key)
+                    .arg(0)
+                    .arg(&ticket)
+                    .query_async::<_, i64>(&mut conn)
+                    .await
+                    .map(|_| ())
+            })
+            .await
+    }
+
+    async fn pop_head(&self) -> Result<(), ()> {
+        let key = self.list_key();
+        self.backend
+            .with_conn(Namespace::Ratelimit, |mut conn| async move {
+                redis::cmd("LPOP")
+                    .arg(&key)
+                    .query_async::<_, Option<String>>(&mut conn)
+                    .await
+                    .map(|_| ())
+            })
+            .await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::gateway_framework::rate_limit::rate_limit_key;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use std::time::Duration;
+
+    // ── In-memory fake queue: exercises the admission loop (`run_admission`)
+    // OFFLINE — the SAME control flow the Redis `RequestQueue` uses via the
+    // shared `AdmissionQueue` trait. `fail` forces the unreachable/fail-closed
+    // path.
+    struct FakeQueue {
+        items: Mutex<std::collections::VecDeque<String>>,
+        fail: bool,
+    }
+    impl FakeQueue {
+        fn new(fail: bool) -> Self {
+            Self { items: Mutex::new(std::collections::VecDeque::new()), fail }
+        }
+    }
+    #[async_trait]
+    impl AdmissionQueue for FakeQueue {
+        async fn enqueue_bounded(&self, ticket: &str, max_depth: i64) -> Result<bool, ()> {
+            if self.fail {
+                return Err(());
+            }
+            let mut q = self.items.lock().unwrap();
+            if q.len() as i64 >= max_depth {
+                return Ok(false);
+            }
+            q.push_back(ticket.to_string());
+            Ok(true)
+        }
+        async fn at_head(&self, ticket: &str) -> Result<bool, ()> {
+            if self.fail {
+                return Err(());
+            }
+            Ok(self.items.lock().unwrap().front().map(|s| s.as_str()) == Some(ticket))
+        }
+        async fn remove_ticket(&self, ticket: &str) -> Result<(), ()> {
+            self.items.lock().unwrap().retain(|t| t != ticket);
+            Ok(())
+        }
+        async fn pop_head(&self) -> Result<(), ()> {
+            self.items.lock().unwrap().pop_front();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_admits_when_a_slot_frees_at_head() {
+        let q = FakeQueue::new(false);
+        // acquire succeeds on the 2nd poll (simulating a token refilling).
+        let calls = AtomicUsize::new(0);
+        let acquire = || async {
+            calls.fetch_add(1, Ordering::SeqCst) >= 1
+        };
+        let out = run_admission(
+            &q, "t1", 128, Duration::from_millis(500), Duration::from_millis(5), acquire,
+        )
+        .await;
+        assert_eq!(out, Admission::Admitted);
+        // Our ticket was popped on admit → queue drained.
+        assert!(q.items.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn admission_queue_full_sheds_load() {
+        let q = FakeQueue::new(false);
+        // Pre-fill to the cap so enqueue is refused.
+        q.items.lock().unwrap().push_back("existing".into());
+        let acquire = || async { true };
+        let out = run_admission(
+            &q, "t2", 1, Duration::from_millis(200), Duration::from_millis(5), acquire,
+        )
+        .await;
+        assert_eq!(out, Admission::QueueFull);
+    }
+
+    #[tokio::test]
+    async fn admission_times_out_and_removes_ticket() {
+        let q = FakeQueue::new(false);
+        let acquire = || async { false }; // never acquirable
+        let out = run_admission(
+            &q, "t3", 128, Duration::from_millis(60), Duration::from_millis(10), acquire,
+        )
+        .await;
+        assert_eq!(out, Admission::TimedOut);
+        // The abandoned ticket must be removed on give-up (no leak).
+        assert!(q.items.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn admission_fails_closed_when_queue_unreachable() {
+        let q = FakeQueue::new(true); // every op errors
+        let acquire = || async { true };
+        let out = run_admission(
+            &q, "t4", 128, Duration::from_millis(200), Duration::from_millis(5), acquire,
+        )
+        .await;
+        assert_eq!(out, Admission::Unavailable);
+    }
 
     // Offline unit tests: no live Redis. They cover the pure/derivable surface
     // (key derivation, script text, fail-closed decision). Behavior against a
