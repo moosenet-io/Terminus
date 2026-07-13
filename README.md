@@ -133,6 +133,12 @@ compiler_build(module, ref, host="auto", profile="release", fast=false, bin?, so
   `$(...)`, backticks, `;`, `|`, newlines, quotes) is fully literal and can neither be
   corrupted nor execute during `source`. Non-secret vars (`SCCACHE_REDIS_ENDPOINT`/`_DB`/
   `_KEY_PREFIX`, `CARGO_TARGET_DIR`, `RUSTC_WRAPPER`) still travel via `--setenv`.
+- **Child-output redaction** — a build script / proc-macro / wrapper could print its
+  environment and echo a secret. The single subprocess choke point redacts every secret VALUE
+  (the `SCCACHE_REDIS_PASSWORD` and the full `SCCACHE_REDIS` URL) from ALL captured child
+  output — the failure stderr tail AND the returned stdout — replacing it with `<redacted>`
+  before it can reach a `ToolError`, a log line, or a returned string. Covers both the local
+  and remote (ssh) build paths.
 - **Path-input validation** — every user-controlled value that becomes a path segment
   (`module`, `bin`, `profile`, `target`, `channel`) is validated at the tool entry as a safe
   single segment (allowlist `[A-Za-z0-9._-]`, no empty/`.`/`..`, no separators or shell

@@ -168,6 +168,15 @@ pub fn parse_redis_url(url: &str) -> Option<RedisUrlParts> {
 /// sccache backend never stalls a build; a dead endpoint fails open fast.
 const DEFAULT_PROBE_MS: u64 = 300;
 
+/// The ambient `SCCACHE_REDIS` secret URL from the process environment (the full
+/// `redis://user:pass@host:port/db` value), if configured. Exposed so callers can
+/// add it to a redaction set — the child build inherits this ambient env var, so
+/// a build script could echo the full URL even though the compiler wires the
+/// split form. Returns the raw value (a secret) — do not log it.
+pub fn ambient_secret_url() -> Option<String> {
+    env_nonempty(SCCACHE_REDIS_SECRET)
+}
+
 /// Build the sccache env for a build, reading the `SCCACHE_REDIS` secret from the
 /// process environment (materialized from the vault). Fails OPEN to a local disk
 /// cache under `dataset_root` when the secret is absent, unparseable, **or the

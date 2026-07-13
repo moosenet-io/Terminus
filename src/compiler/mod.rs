@@ -228,14 +228,40 @@ fn built_bin_rel(triple: &str, profile: &str, bin: &str) -> PathBuf {
     PathBuf::from(triple).join(subdir).join(bin)
 }
 
+/// Replace every non-empty secret value in `text` with a fixed placeholder, so a
+/// secret that a build script / proc-macro / wrapper / sub-tool echoed to
+/// stdout/stderr never reaches a `ToolError`, a log line, or a returned string
+/// (S7). Plain substring replace of each raw value; empty values are skipped;
+/// an empty `secrets` set is a no-op. This helper never logs the secret itself.
+fn redact_secrets(text: &str, secrets: &[String]) -> String {
+    let mut out = text.to_string();
+    for s in secrets {
+        if s.is_empty() {
+            continue;
+        }
+        if out.contains(s.as_str()) {
+            out = out.replace(s.as_str(), "<redacted>");
+        }
+    }
+    out
+}
+
 /// Run a subprocess argv with an optional cwd + extra env, bounded by `timeout`.
 /// Returns `Ok(stdout)` on success (exit 0), else an `Execution` error with a
 /// trimmed stderr tail. The env is applied on top of the inherited environment.
+///
+/// SECURITY (S7): ALL captured child output (the success stdout AND the failure
+/// stderr tail) is passed through [`redact_secrets`] with `redact` — the set of
+/// secret env VALUES in play for this build — BEFORE it is returned or surfaced,
+/// so a build script that prints its environment can never leak
+/// `SCCACHE_REDIS_PASSWORD` / the `SCCACHE_REDIS` URL into an error or log. This
+/// is the single choke point covering both the local and remote (ssh) paths.
 async fn run(
     argv: &[String],
     cwd: Option<&std::path::Path>,
     env: &BTreeMap<String, String>,
     timeout: Duration,
+    redact: &[String],
 ) -> Result<String, ToolError> {
     if argv.is_empty() {
         return Err(ToolError::Execution("empty command".into()));
@@ -266,7 +292,12 @@ async fn run(
         }
     };
     if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+        // Redact even the success stdout — it is returned to callers and may be
+        // logged; a sub-tool could have echoed a secret onto it too.
+        Ok(redact_secrets(
+            &String::from_utf8_lossy(&out.stdout),
+            redact,
+        ))
     } else {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let tail: String = stderr
@@ -278,6 +309,7 @@ async fn run(
             .rev()
             .collect::<Vec<_>>()
             .join("\n");
+        let tail = redact_secrets(&tail, redact);
         Err(ToolError::Execution(format!(
             "{} exited {}: {tail}",
             argv[0],
@@ -385,6 +417,27 @@ impl RustTool for CompilerBuild {
         // sccache env (fail-open to a local dir if Redis is unconfigured).
         let sccache_env = sccache::resolve(&root_str);
 
+        // Redaction set (S7): the secret VALUES that could be echoed by a child
+        // build (a build script printing its env, etc.) and must be scrubbed from
+        // ANY captured stdout/stderr before it reaches an error/log. That is every
+        // secret-shaped value in the sccache env (SCCACHE_REDIS_PASSWORD, …) PLUS
+        // the ambient full `SCCACHE_REDIS` URL (which the child inherits). Passed
+        // to `run()` for both the local and remote build paths.
+        let mut redact: Vec<String> = sccache_env
+            .vars
+            .iter()
+            .filter(|(k, _)| scope::is_secret_env_key(k))
+            .map(|(_, v)| v.clone())
+            .filter(|v| !v.is_empty())
+            .collect();
+        if let Some(url) = sccache::ambient_secret_url() {
+            if !url.is_empty() {
+                redact.push(url);
+            }
+        }
+        redact.sort();
+        redact.dedup();
+
         // The local source stage (staged on the shared NFS share is fine — it's a
         // source stage, not the live target). Also the rsync source for a remote
         // build.
@@ -427,6 +480,7 @@ impl RustTool for CompilerBuild {
                     Some(&local_source_dir),
                     &BTreeMap::new(),
                     Duration::from_secs(600),
+                    &redact,
                 )
                 .await?;
             }
@@ -447,6 +501,7 @@ impl RustTool for CompilerBuild {
                 Some(&local_source_dir),
                 &secret_env,
                 Duration::from_secs(3600),
+                &redact,
             )
             .await?;
 
@@ -487,6 +542,7 @@ impl RustTool for CompilerBuild {
                 None,
                 &BTreeMap::new(),
                 Duration::from_secs(120),
+                &redact,
             )
             .await?;
             run(
@@ -501,6 +557,7 @@ impl RustTool for CompilerBuild {
                 None,
                 &BTreeMap::new(),
                 Duration::from_secs(1800),
+                &redact,
             )
             .await?;
 
@@ -535,6 +592,7 @@ impl RustTool for CompilerBuild {
                     None,
                     &BTreeMap::new(),
                     Duration::from_secs(120),
+                    &redact,
                 )
                 .await;
                 // Delete the local staging copy immediately, whether the transfer
@@ -555,6 +613,7 @@ impl RustTool for CompilerBuild {
                     None,
                     &BTreeMap::new(),
                     Duration::from_secs(600),
+                    &redact,
                 )
                 .await?;
             }
@@ -579,6 +638,7 @@ impl RustTool for CompilerBuild {
                 None,
                 &BTreeMap::new(),
                 Duration::from_secs(3600),
+                &redact,
             )
             .await;
             // Best-effort scrub in case the build failed before the wrapper's rm ran.
@@ -592,6 +652,7 @@ impl RustTool for CompilerBuild {
                     None,
                     &BTreeMap::new(),
                     Duration::from_secs(60),
+                    &redact,
                 )
                 .await;
             }
@@ -620,6 +681,7 @@ impl RustTool for CompilerBuild {
                 None,
                 &BTreeMap::new(),
                 Duration::from_secs(600),
+                &redact,
             )
             .await?;
             built_bin = local_bin;
@@ -650,6 +712,7 @@ impl RustTool for CompilerBuild {
                 None,
                 &BTreeMap::new(),
                 Duration::from_secs(600),
+                &redact,
             )
             .await?;
             // Relay the sidecar too.
@@ -672,6 +735,7 @@ impl RustTool for CompilerBuild {
                 None,
                 &BTreeMap::new(),
                 Duration::from_secs(120),
+                &redact,
             )
             .await?;
             publish::Published {
@@ -1026,6 +1090,82 @@ mod tests {
             !target.exists(),
             "a symlink must not be followed to create/write its target"
         );
+    }
+
+    #[test]
+    fn redact_secrets_replaces_values_and_is_a_noop_when_empty() {
+        let secret = "<REDACTED-SECRET>".to_string();
+        let url = "redis://default:topsecretvalue123@h:6379/1".to_string();
+        let secrets = vec![secret.clone(), url.clone(), String::new()];
+
+        // A line echoing the secret is scrubbed; the raw value is absent.
+        let leaked = format!("error: a build script printed the secret {secret} to stderr");
+        let red = redact_secrets(&leaked, &secrets);
+        assert!(
+            !red.contains("topsecretvalue123"),
+            "raw secret must be gone: {red}"
+        );
+        assert!(red.contains("<redacted>"));
+
+        // The full URL value is scrubbed too.
+        let leaked_url = format!("connecting to {url} ...");
+        assert!(!redact_secrets(&leaked_url, &secrets).contains("topsecretvalue123"));
+
+        // A non-secret line passes through unchanged.
+        let benign = "warning: unused variable `x`";
+        assert_eq!(redact_secrets(benign, &secrets), benign);
+
+        // Empty secret set / empty values are a no-op.
+        assert_eq!(redact_secrets(&leaked, &[]), leaked);
+        assert_eq!(redact_secrets("plain", &[String::new()]), "plain");
+    }
+
+    #[tokio::test]
+    async fn run_redacts_secret_from_stderr_tail_and_stdout() {
+        let secret = "<REDACTED-SECRET>".to_string();
+        let redact = vec![secret.clone()];
+
+        // Failing child that echoes the secret to stderr → the error tail must be
+        // redacted (this is the exact leak path: a build.rs printing its env).
+        let err = run(
+            &[
+                "sh".into(),
+                "-c".into(),
+                format!("echo leak={secret} 1>&2; exit 1"),
+            ],
+            None,
+            &BTreeMap::new(),
+            Duration::from_secs(30),
+            &redact,
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            !msg.contains("topsecretvalue123"),
+            "secret leaked into error: {msg}"
+        );
+        assert!(msg.contains("<redacted>"));
+
+        // Successful child that echoes the secret to stdout → returned stdout redacted.
+        let out = run(
+            &[
+                "sh".into(),
+                "-c".into(),
+                format!("echo out={secret}; exit 0"),
+            ],
+            None,
+            &BTreeMap::new(),
+            Duration::from_secs(30),
+            &redact,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !out.contains("topsecretvalue123"),
+            "secret leaked into stdout: {out}"
+        );
+        assert!(out.contains("<redacted>"));
     }
 
     #[test]
