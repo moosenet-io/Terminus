@@ -57,11 +57,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use redis::aio::ConnectionManager;
-use redis::IntoConnectionInfo;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::OnceCell;
 use tracing::warn;
 
 use crate::error::ToolError;
@@ -75,11 +72,6 @@ const BASELINE_TOML: &str = include_str!("../../data/prefix_registry.toml");
 
 /// Valid status values for a prefix entry.
 const VALID_STATUSES: &[&str] = &["active", "retired", "ingested", "complete"];
-
-/// Redis hash key holding overlay claims: field = uppercased prefix, value =
-/// JSON-encoded [`PrefixEntry`]. Namespaced under the same `plane:` prefix the
-/// S100 backend uses so it shares one logical keyspace.
-const OVERLAY_HASH_KEY: &str = "plane:prefix:overlay:v1";
 
 // ─── Data model ──────────────────────────────────────────────────────────────
 
@@ -187,117 +179,77 @@ enum OverlayError {
     Unavailable,
 }
 
-/// Runtime overlay store backed by the shared Plane Redis. Reuses the S100
-/// config surface (`PLANE_REDIS_URL` / `PLANE_REDIS_PASSWORD` /
-/// `PLANE_REDIS_TIMEOUT_MS`) so every terminus instance sees the same claims.
+/// Runtime overlay store backed by the SHARED BLD-20 Redis pool
+/// (`crate::redis::RedisBackend`), addressed through the typed
+/// [`crate::redis::Namespace::Prefix`] — i.e. the DURABLE logical DB
+/// (`REDIS_DB_DURABLE`, server-side `noeviction`) and the `prefix:*` keyspace.
+/// It does NOT open its own connection or choose its own DB: it borrows the one
+/// shared pool every other consumer uses, so overlay claims are cross-instance
+/// visible and always land in the durable DB (never the volatile cache DB).
+/// Per-op timeout + fail-open are handled uniformly by `RedisBackend::with_conn`
+/// (which bounds connection acquisition AND the op in one deadline).
 struct PrefixOverlay {
-    client: redis::Client,
-    /// Built lazily so construction stays synchronous and an unreachable Redis
-    /// at startup never blocks. A failed init is not cached (retries later).
-    conn: OnceCell<ConnectionManager>,
-    op_timeout: Duration,
+    backend: Arc<crate::redis::RedisBackend>,
+    /// Durable overlay hash key in the typed `prefix:*` namespace
+    /// (`prefix:overlay:v1`). One hash; field = uppercased prefix,
+    /// value = JSON-encoded [`PrefixEntry`].
+    hash_key: String,
 }
 
-/// Hand-written `Debug` that never prints `client` (its `Debug` includes the
-/// ConnectionInfo, which can carry the Redis password).
+/// Hand-written `Debug` that never touches `backend` (whose internals carry the
+/// Redis password) — only the non-secret hash key is shown.
 impl std::fmt::Debug for PrefixOverlay {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PrefixOverlay")
-            .field("op_timeout", &self.op_timeout)
+            .field("hash_key", &self.hash_key)
             .finish_non_exhaustive()
     }
 }
 
 impl PrefixOverlay {
-    /// Build from the shared BLD-20 Redis backend's endpoint resolution:
-    /// `REDIS_URL` (the managed terminus-primary Redis), falling back to the
-    /// legacy `PLANE_REDIS_URL` for backward compatibility. This is what makes
-    /// the prefix overlay DURABLE cross-instance against the one managed Redis
-    /// rather than an ad-hoc, separately-configured endpoint (BLD-20 step 4).
-    /// Returns `None` when neither URL is set/parseable — the pure-baseline
-    /// path, identical to having no overlay.
-    ///
-    /// NOTE: the endpoint/password are resolved from the environment, which is
-    /// materialized from the vault at boot (S1/S7) — no literal here.
+    /// Build over the shared BLD-20 Redis pool. The endpoint is resolved by
+    /// `RedisBackend` from `REDIS_URL` (legacy `PLANE_REDIS_URL` fallback),
+    /// materialized from the vault at boot (S1/S7). Returns `None` when Redis is
+    /// not configured — the pure-baseline path, identical to having no overlay.
+    /// Routing the overlay through the SAME pool + durable namespace is what
+    /// makes `plane_prefix_register` durable cross-instance (BLD-20 step 4).
     fn from_env() -> Option<Arc<Self>> {
-        let url = crate::redis::resolve_url()?;
-        let password = crate::redis::resolve_password();
-        let op_timeout = crate::redis::resolve_timeout();
-        Self::build(&url, password, op_timeout)
+        Some(Self::with_backend(crate::redis::RedisBackend::from_env()?))
     }
 
-    /// Shared constructor: parse the URL, layer the password from its own env
-    /// var (kept out of the URL so it never lands in a log line), build the
-    /// client. Any failure logs once and yields `None` (pure-baseline path).
-    fn build(url: &str, password: Option<String>, op_timeout: Duration) -> Option<Arc<Self>> {
-        let mut info = match url.into_connection_info() {
-            Ok(i) => i,
-            Err(e) => {
-                warn!(
-                    "REDIS_URL/PLANE_REDIS_URL not a valid Redis URL ({:?}); prefix overlay disabled, baseline-only",
-                    e.kind()
-                );
-                return None;
-            }
-        };
-        if let Some(pw) = password {
-            info.redis.password = Some(pw);
-        }
-        let client = match redis::Client::open(info) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(
-                    "failed to construct prefix overlay Redis client ({:?}); baseline-only",
-                    e.kind()
-                );
-                return None;
-            }
-        };
-        Some(Arc::new(Self {
-            client,
-            conn: OnceCell::new(),
-            op_timeout,
-        }))
-    }
-
-    async fn conn(&self) -> Option<ConnectionManager> {
-        match self
-            .conn
-            .get_or_try_init(|| ConnectionManager::new(self.client.clone()))
-            .await
-        {
-            Ok(m) => Some(m.clone()),
-            Err(_) => None,
-        }
+    /// Build over an already-constructed shared backend (the wiring seam + test
+    /// entry point). The overlay lives in the durable `prefix:*` namespace, so
+    /// its logical DB and eviction protection follow `Namespace::Prefix`.
+    fn with_backend(backend: Arc<crate::redis::RedisBackend>) -> Arc<Self> {
+        Arc::new(Self {
+            hash_key: crate::redis::Namespace::Prefix.key("overlay:v1"),
+            backend,
+        })
     }
 
     /// All overlay claims (field -> entry). `Err(Unavailable)` on any
     /// Redis error/timeout — the caller treats that as "no overlay".
     async fn list(&self) -> Result<Vec<PrefixEntry>, OverlayError> {
-        let fut = async {
-            let mut conn = self.conn().await.ok_or(OverlayError::Unavailable)?;
-            let map: std::collections::HashMap<String, String> = redis::cmd("HGETALL")
-                .arg(OVERLAY_HASH_KEY)
-                .query_async(&mut conn)
-                .await
-                .map_err(|_| OverlayError::Unavailable)?;
-            let mut out = Vec::with_capacity(map.len());
-            for (_field, raw) in map {
-                match serde_json::from_str::<PrefixEntry>(&raw) {
-                    Ok(mut e) => {
-                        e.prefix = e.prefix.trim().to_uppercase();
-                        out.push(e);
-                    }
-                    // A single corrupt field must not sink the whole read.
-                    Err(e) => warn!("skipping unparseable overlay claim: {e}"),
+        let key = self.hash_key.clone();
+        let map: std::collections::HashMap<String, String> = self
+            .backend
+            .with_conn(crate::redis::Namespace::Prefix, |mut conn| async move {
+                redis::cmd("HGETALL").arg(&key).query_async(&mut conn).await
+            })
+            .await
+            .map_err(|_| OverlayError::Unavailable)?;
+        let mut out = Vec::with_capacity(map.len());
+        for (_field, raw) in map {
+            match serde_json::from_str::<PrefixEntry>(&raw) {
+                Ok(mut e) => {
+                    e.prefix = e.prefix.trim().to_uppercase();
+                    out.push(e);
                 }
+                // A single corrupt field must not sink the whole read.
+                Err(e) => warn!("skipping unparseable overlay claim: {e}"),
             }
-            Ok(out)
-        };
-        match tokio::time::timeout(self.op_timeout, fut).await {
-            Ok(res) => res,
-            Err(_) => Err(OverlayError::Unavailable),
         }
+        Ok(out)
     }
 
     /// Atomically create a claim only if the field does not already exist
@@ -310,21 +262,20 @@ impl PrefixOverlay {
     async fn put_new(&self, entry: &PrefixEntry) -> Result<bool, OverlayError> {
         let field = entry.prefix.to_uppercase();
         let payload = serde_json::to_string(entry).map_err(|_| OverlayError::Unavailable)?;
-        let fut = async {
-            let mut conn = self.conn().await.ok_or(OverlayError::Unavailable)?;
-            let created: i64 = redis::cmd("HSETNX")
-                .arg(OVERLAY_HASH_KEY)
-                .arg(&field)
-                .arg(&payload)
-                .query_async(&mut conn)
-                .await
-                .map_err(|_| OverlayError::Unavailable)?;
-            Ok(created == 1)
-        };
-        match tokio::time::timeout(self.op_timeout, fut).await {
-            Ok(res) => res,
-            Err(_) => Err(OverlayError::Unavailable),
-        }
+        let key = self.hash_key.clone();
+        let created: i64 = self
+            .backend
+            .with_conn(crate::redis::Namespace::Prefix, |mut conn| async move {
+                redis::cmd("HSETNX")
+                    .arg(&key)
+                    .arg(&field)
+                    .arg(&payload)
+                    .query_async(&mut conn)
+                    .await
+            })
+            .await
+            .map_err(|_| OverlayError::Unavailable)?;
+        Ok(created == 1)
     }
 
     /// Delete one claim from the overlay hash (best-effort). Used by
@@ -333,20 +284,19 @@ impl PrefixOverlay {
     /// callers treat that as "left the pending claim in place" — never fatal.
     async fn del(&self, prefix: &str) -> Result<bool, OverlayError> {
         let field = prefix.to_uppercase();
-        let fut = async {
-            let mut conn = self.conn().await.ok_or(OverlayError::Unavailable)?;
-            let removed: i64 = redis::cmd("HDEL")
-                .arg(OVERLAY_HASH_KEY)
-                .arg(&field)
-                .query_async(&mut conn)
-                .await
-                .map_err(|_| OverlayError::Unavailable)?;
-            Ok(removed == 1)
-        };
-        match tokio::time::timeout(self.op_timeout, fut).await {
-            Ok(res) => res,
-            Err(_) => Err(OverlayError::Unavailable),
-        }
+        let key = self.hash_key.clone();
+        let removed: i64 = self
+            .backend
+            .with_conn(crate::redis::Namespace::Prefix, |mut conn| async move {
+                redis::cmd("HDEL")
+                    .arg(&key)
+                    .arg(&field)
+                    .query_async(&mut conn)
+                    .await
+            })
+            .await
+            .map_err(|_| OverlayError::Unavailable)?;
+        Ok(removed == 1)
     }
 
     /// Write/replace one claim (overwrite). Used by retire, which intentionally
@@ -355,20 +305,18 @@ impl PrefixOverlay {
     async fn put(&self, entry: &PrefixEntry) -> Result<(), OverlayError> {
         let field = entry.prefix.to_uppercase();
         let payload = serde_json::to_string(entry).map_err(|_| OverlayError::Unavailable)?;
-        let fut = async {
-            let mut conn = self.conn().await.ok_or(OverlayError::Unavailable)?;
-            redis::cmd("HSET")
-                .arg(OVERLAY_HASH_KEY)
-                .arg(&field)
-                .arg(&payload)
-                .query_async::<_, ()>(&mut conn)
-                .await
-                .map_err(|_| OverlayError::Unavailable)
-        };
-        match tokio::time::timeout(self.op_timeout, fut).await {
-            Ok(res) => res,
-            Err(_) => Err(OverlayError::Unavailable),
-        }
+        let key = self.hash_key.clone();
+        self.backend
+            .with_conn(crate::redis::Namespace::Prefix, |mut conn| async move {
+                redis::cmd("HSET")
+                    .arg(&key)
+                    .arg(&field)
+                    .arg(&payload)
+                    .query_async::<_, ()>(&mut conn)
+                    .await
+            })
+            .await
+            .map_err(|_| OverlayError::Unavailable)
     }
 }
 
@@ -1735,12 +1683,15 @@ mod tests {
     // routable-but-dead port so the connect attempt fails fast.
     #[tokio::test]
     async fn overlay_unreachable_is_fail_open() {
-        let ov = PrefixOverlay::build(
-            "redis://127.0.0.1:1/0", // pii-test-fixture
+        let backend = crate::redis::RedisBackend::build(
+            "redis://127.0.0.1:1", // pii-test-fixture — routable but dead
             None,
+            0,
+            1,
             Duration::from_millis(150),
         )
-        .expect("client builds for a well-formed URL");
+        .expect("backend builds for a well-formed URL");
+        let ov = PrefixOverlay::with_backend(backend);
 
         // Direct overlay ops report Unavailable, promptly.
         let start = std::time::Instant::now();
@@ -2104,16 +2055,19 @@ mod tests {
         std::fs::remove_dir_all(&repo).ok();
     }
 
-    // ── No-secret-leak: the overlay's Debug must never print the password even
-    // though it is layered into the client's connection info.
+    // ── No-secret-leak: the overlay's Debug must never surface the password
+    // (which now lives in the shared backend, not the overlay).
     #[test]
     fn overlay_debug_hides_password() {
-        let ov = PrefixOverlay::build(
-            "redis://127.0.0.1:6399/0", // pii-test-fixture
-            Some("hunter2SuperSecret".into()),
+        let backend = crate::redis::RedisBackend::build(
+            "redis://127.0.0.1:6399", // pii-test-fixture
+            Some("hunter2SuperSecret"),
+            0,
+            1,
             Duration::from_millis(100),
         )
-        .expect("client builds");
+        .expect("backend builds");
+        let ov = PrefixOverlay::with_backend(backend);
         let dbg = format!("{ov:?}");
         assert!(!dbg.contains("hunter2SuperSecret"), "password leaked in Debug: {dbg}");
     }
