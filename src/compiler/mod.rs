@@ -778,21 +778,26 @@ impl RustTool for CompilerBuild {
 /// Resolve the EFFECTIVE `request_id` for a build attempt and whether a
 /// caller-supplied id was INVALID and substituted. The caller value is validated
 /// RAW — NO trimming/normalization (a lossy trim could collapse `" build-1 "` and
-/// `"build-1"` onto the same track). A present value that is a valid
-/// `[A-Za-z0-9._-]` segment within the length bound is used VERBATIM (→ `false`);
-/// a present-but-invalid value (leading/trailing/inner whitespace, empty, any
-/// disallowed char, overlong) is DISCARDED and replaced by an auto-generated id
-/// (→ `true`, an observable substitution); an ABSENT value auto-generates silently
-/// (→ `false`, nothing was supplied to invalidate). The fallback (never a hard
-/// reject) preserves the "a discoverable id always exists" invariant.
+/// `"build-1"` onto the same track). Outcomes:
+/// - ABSENT (key missing or explicit `null`) → auto-generate SILENTLY (→ `false`);
+///   nothing was supplied to invalidate.
+/// - PRESENT string that is a valid `[A-Za-z0-9._-]` segment within the length
+///   bound → used VERBATIM (→ `false`).
+/// - PRESENT string that is invalid (whitespace, empty, disallowed char, overlong)
+///   OR PRESENT but NOT a string (number/bool/array/object) → DISCARDED and
+///   replaced by an auto-generated id (→ `true`, an OBSERVABLE substitution).
+/// The fallback (never a hard reject) preserves the "a discoverable id always
+/// exists" invariant.
 fn resolve_request_id(args: &Value) -> (String, bool) {
-    match args.get("request_id").and_then(Value::as_str) {
-        // Present + valid (validated RAW, no trimming) → use verbatim.
-        Some(s) if is_valid_request_id(s) => (s.to_string(), false),
-        // Present but invalid → substitute (observable). No silent normalization.
+    match args.get("request_id") {
+        // Absent / explicit null → nothing supplied to invalidate.
+        None | Some(Value::Null) => (uuid::Uuid::new_v4().simple().to_string(), false),
+        // Present string + valid (validated RAW, no trimming) → use verbatim.
+        Some(Value::String(s)) if is_valid_request_id(s) => (s.clone(), false),
+        // Present but invalid — a bad string OR a non-string type → substitute
+        // (observable). No silent normalization, and a non-string is NOT treated
+        // as "absent".
         Some(_) => (uuid::Uuid::new_v4().simple().to_string(), true),
-        // Absent / not a string → auto-generate (nothing supplied to invalidate).
-        None => (uuid::Uuid::new_v4().simple().to_string(), false),
     }
 }
 
@@ -2280,6 +2285,31 @@ mod tests {
         assert!(!invc);
     }
 
+    #[test]
+    fn resolve_request_id_present_non_string_is_an_observable_substitution() {
+        // A PRESENT but NON-STRING request_id is INVALID (not treated as absent):
+        // substituted + flagged so the replacement is observable.
+        for v in [
+            json!({ "request_id": 123 }),
+            json!({ "request_id": true }),
+            json!({ "request_id": ["x"] }),
+            json!({ "request_id": { "a": 1 } }),
+        ] {
+            let (id, inv) = resolve_request_id(&v);
+            assert!(
+                inv,
+                "present non-string request_id is an observable substitution: {v}"
+            );
+            assert!(is_valid_request_id(&id), "effective id is valid: {id:?}");
+        }
+        // Explicit null is treated as ABSENT (nothing supplied) → not flagged.
+        let (idn, invn) = resolve_request_id(&json!({ "request_id": null }));
+        assert!(is_valid_request_id(&idn) && !invn);
+        // Truly absent → not flagged.
+        let (_ida, inva) = resolve_request_id(&json!({}));
+        assert!(!inva);
+    }
+
     /// Process-wide serializer for the rare test that must toggle an env var, so
     /// parallel tests can never interleave the mutation.
     static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2544,6 +2574,36 @@ mod tests {
         assert!(
             !msg.contains("supplied_request_id_invalid"),
             "no substitution marker for a valid id: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn present_non_string_request_id_surfaces_the_substitution_marker() {
+        // End-to-end: a PRESENT non-string request_id is an observable substitution
+        // — the failure error carries a valid effective id AND the marker.
+        let _env = ScopedEnv::new().unset("BUILD_DATASET_ROOT");
+        let err = CompilerBuild
+            .execute_structured(json!({
+                "module": "terminus",
+                "ref": "abc123",
+                "request_id": 123, // non-string → invalid supplied id
+            }))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("[supplied_request_id_invalid]"),
+            "non-string id substitution is signalled: {msg}"
+        );
+        let rid = msg
+            .split("request_id=")
+            .nth(1)
+            .and_then(|s| s.split(']').next())
+            .map(|s| s.trim().to_string())
+            .expect("effective id surfaced");
+        assert!(
+            is_valid_request_id(&rid),
+            "effective auto-gen id is valid: {rid:?}"
         );
     }
 

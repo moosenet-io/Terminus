@@ -178,7 +178,8 @@ fn now_ms() -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     /// Snapshot-only: the track exists (begin-rotated) but no event was emitted
-    /// yet. Non-terminal, never emitted as an event.
+    /// yet. Non-terminal, and NEVER an emitted event — `emit` treats a `pending`
+    /// stage as a strict no-op (enforced in the bus, not by call-site discipline).
     Pending,
     Queued,
     Scheduled,
@@ -503,6 +504,19 @@ impl ProgressBus {
     }
 
     fn emit_inner(&self, request_id: &str, e: Emit) -> u64 {
+        // `Stage::Pending` is SNAPSHOT-ONLY (the neutral "tracked, no stage yet"
+        // state) and MUST NEVER be persisted as an event. Enforce it in the bus,
+        // not by call-site discipline: a `pending` emit is a strict NO-OP — no
+        // event appended, no `last_seq` advance, no stage change, no track created,
+        // no counters touched. Return the current `last_seq` (0 if the id is
+        // unknown) so the caller observes no advance.
+        if e.stage == Stage::Pending {
+            let map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            return map
+                .get(request_id)
+                .map(|t| t.next_seq.saturating_sub(1))
+                .unwrap_or(0);
+        }
         let now = now_ms();
         // The id length is a HARD validation rule enforced at the tool boundary
         // (`compiler_build`/`compiler_progress`), so an id reaching the bus is
@@ -1137,6 +1151,49 @@ mod tests {
         let f = bus.snapshot("id2", 0).unwrap();
         assert_eq!(f.stage, Stage::Failed);
         assert!(f.terminal);
+    }
+
+    #[test]
+    fn emitting_pending_is_a_strict_noop() {
+        // #1: `Stage::Pending` is snapshot-only — emitting it must NOT append an
+        // event, advance last_seq, change the stage, or create a track.
+        let bus = ProgressBus::with_bounds(16, 8, 0);
+
+        // Unknown id: a pending emit creates nothing and returns 0.
+        assert_eq!(bus.emit("ghost", Emit::stage(Stage::Pending)), 0);
+        assert!(bus.snapshot("ghost", 0).is_none(), "no track created");
+
+        // Begun-but-event-less track: still pending, last_seq stays 0.
+        bus.begin("id");
+        assert_eq!(bus.emit("id", Emit::stage(Stage::Pending)), 0, "no advance");
+        let s = bus.snapshot("id", 0).unwrap();
+        assert_eq!(s.stage, Stage::Pending);
+        assert_eq!(s.last_seq, 0);
+        assert!(s.events.is_empty(), "no pending event appended");
+
+        // With real events: a pending emit leaves last_seq + stage + events intact.
+        bus.emit("id", Emit::stage(Stage::Queued));
+        bus.emit("id", Emit::stage(Stage::Building).progress(1, 3));
+        let before = bus.snapshot("id", 0).unwrap();
+        assert_eq!(before.last_seq, 2);
+        assert_eq!(
+            bus.emit("id", Emit::stage(Stage::Pending)),
+            2,
+            "returns current last_seq"
+        );
+        let after = bus.snapshot("id", 0).unwrap();
+        assert_eq!(after.last_seq, 2, "pending did not advance last_seq");
+        assert_eq!(
+            after.stage,
+            Stage::Building,
+            "stage unchanged (last real event)"
+        );
+        assert_eq!(
+            after.events.len(),
+            before.events.len(),
+            "no pending event added"
+        );
+        assert!(after.events.iter().all(|e| e.stage != Stage::Pending));
     }
 
     #[test]
