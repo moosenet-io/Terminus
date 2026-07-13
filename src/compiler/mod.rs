@@ -1196,37 +1196,51 @@ fn validate_source_dir(
 /// the scheduler gates it; `compiler_build` still does the authoritative host
 /// selection at dispatch.
 ///
-/// SAFE-BY-DEFAULT (AC-6): a build is treated as `heavy` UNLESS it can be
-/// POSITIVELY determined small. "Positively small" means an `auto`, non-`fast`
-/// request whose module has NO known peak (⇒ `compiler_build` authoritatively
-/// picks the primary) or a KNOWN peak at/under a KNOWN threshold. Any
-/// ambiguous/unreadable case (unparsable peak or threshold, or a known peak with
-/// no configured threshold) falls to the SAFE side — heavy — so a possibly-heavy
-/// build is never run immediately on the primary, skipping the window/cap.
+/// SAFETY-AUTHORITATIVE (AC-6): heavy classification overrides the host
+/// preference. A build is treated as `heavy` (window + cap gated) UNLESS it is
+/// POSITIVELY determined small. `fast=true` and an explicit `Heavy` request are
+/// always heavy. An explicit `Primary` request is only a PREFERENCE: it
+/// fast-paths ONLY a positively-known-small module (a known peak at/under a known
+/// threshold, or no heavy signal); a known-heavy — or any ambiguous/unreadable —
+/// module requested with `host=primary` is still GATED through the heavy path, so
+/// a possibly-heavy build can never bypass the window/cap by asking for primary.
 fn request_is_heavy(req: HostRequest, module: &str, fast: bool) -> bool {
-    // `fast` means "full-parallelism heavy build" per the tool schema — it forces
-    // the heavy (window + cap gated) path REGARDLESS of an explicit primary host
-    // request, so `fast` can never bypass the heavy window/cap (B2).
+    classify_request_heavy(
+        req,
+        fast,
+        // `.ok()` maps a read ERROR (present-but-unparsable) to `None`
+        // (unknown ⇒ safe/heavy), and a successful read to `Some(Option<u64>)`.
+        host::module_peak_mb(module).ok(),
+        host::heavy_threshold_mb().ok(),
+    )
+}
+
+/// Pure core of [`request_is_heavy`] (the test entry point): decide heaviness
+/// from the request, `fast`, and the (already-read) module peak + threshold.
+/// `fast=true`/explicit `Heavy` ⇒ heavy. `Primary`/`Auto` defer to the
+/// safety-authoritative [`classify_heavy_auto`], so an explicit primary is
+/// honored only for a positively-small module.
+fn classify_request_heavy(
+    req: HostRequest,
+    fast: bool,
+    peak: Option<Option<u64>>,
+    threshold: Option<Option<u64>>,
+) -> bool {
     if fast {
         return true;
     }
     match req {
-        HostRequest::Primary => false,
         HostRequest::Heavy => true,
-        HostRequest::Auto => classify_heavy_auto(
-            false,
-            // `.ok()` maps a read ERROR (present-but-unparsable) to `None`
-            // (unknown ⇒ safe/heavy), and a successful read to `Some(Option<u64>)`.
-            host::module_peak_mb(module).ok(),
-            host::heavy_threshold_mb().ok(),
-        ),
+        // Explicit primary is a PREFERENCE overridable by heavy-safety: it only
+        // fast-paths a positively-small module (classify_heavy_auto ⇒ false).
+        HostRequest::Primary | HostRequest::Auto => classify_heavy_auto(false, peak, threshold),
     }
 }
 
-/// Pure core of [`request_is_heavy`] for an `auto` request (the test entry
-/// point). `peak`/`threshold` use `Some(inner)` for a successful read (`inner`
-/// itself `None` = "not configured") and the OUTER `None` for an unreadable
-/// value. Fails to the SAFE side (heavy) on anything not positively small.
+/// Pure heavy classifier for a module (auto/primary): `peak`/`threshold` use
+/// `Some(inner)` for a successful read (`inner` itself `None` = "not configured")
+/// and the OUTER `None` for an unreadable value. Fails to the SAFE side (heavy)
+/// on anything not positively small.
 fn classify_heavy_auto(fast: bool, peak: Option<Option<u64>>, threshold: Option<Option<u64>>) -> bool {
     if fast {
         return true;
@@ -1441,33 +1455,61 @@ pub fn register(registry: &mut ToolRegistry) {
         tracing::error!("compiler: failed to register compiler_request: {e}");
     }
     // Spawn the scheduler loop iff we're inside a tokio runtime AND Redis is
-    // configured — but AT MOST ONCE per process (registry setup / hot-swaps may
-    // call register() repeatedly; a second scheduler loop would double-dispatch
-    // and add Redis pressure). The once-guard claims the single spawn slot.
-    if tokio::runtime::Handle::try_current().is_ok() && claim_scheduler_spawn_slot() {
-        if let Some(sched) = scheduler::Scheduler::from_env() {
-            sched.spawn();
-            tracing::info!("compiler: scheduler loop spawned (durable Redis queue)");
-        } else {
-            tracing::info!(
-                "compiler: no Redis configured; compiler_request will report NotConfigured \
-                 and the scheduler is not running"
-            );
+    // configured — but AT MOST ONCE per process. CRUCIALLY, the once-slot is
+    // claimed ONLY when the scheduler actually spawns: if `register()` runs before
+    // Redis is materialized, the no-scheduler path must NOT burn the slot, so a
+    // LATER `register()` (once config has arrived) can still spawn exactly once.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        static SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let sched = scheduler::Scheduler::from_env();
+        match decide_scheduler_spawn(&SPAWNED, sched.is_some()) {
+            SpawnDecision::Spawn => {
+                sched
+                    .expect("scheduler present when decide returns Spawn")
+                    .spawn();
+                tracing::info!("compiler: scheduler loop spawned (durable Redis queue)");
+            }
+            SpawnDecision::AlreadySpawned => {
+                tracing::debug!("compiler: scheduler already spawned; skipping");
+            }
+            SpawnDecision::NoScheduler => {
+                tracing::info!(
+                    "compiler: no Redis configured; compiler_request will report NotConfigured, \
+                     the scheduler is not running, and the spawn slot is NOT burned (a later \
+                     register() after Redis is materialized can still spawn it)"
+                );
+            }
         }
     }
 }
 
-/// Process-global once-guard for the scheduler loop: returns `true` for exactly
-/// ONE caller per process, `false` thereafter, so `register()` (which may run
-/// more than once) spawns at most one scheduler loop. Separated for unit testing.
-fn claim_scheduler_spawn_slot() -> bool {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static SPAWNED: AtomicBool = AtomicBool::new(false);
-    // Succeeds (returns Ok, i.e. true here) only for the first caller that flips
-    // false→true; all later callers see it already true and get false.
-    SPAWNED
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
+/// The outcome of the scheduler-spawn once-guard decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnDecision {
+    /// This caller wins the single spawn slot — it must spawn.
+    Spawn,
+    /// A prior caller already spawned — do nothing.
+    AlreadySpawned,
+    /// No scheduler is available (no Redis) — do nothing AND do NOT burn the slot.
+    NoScheduler,
+}
+
+/// Decide whether to spawn the scheduler, consuming the once-slot ONLY on an
+/// actual spawn. When `scheduler_available` is false the slot is left untouched
+/// (so a later call, once Redis is configured, can still spawn exactly once).
+/// Pure over the passed-in flag → unit-testable without a runtime or Redis.
+fn decide_scheduler_spawn(
+    slot: &std::sync::atomic::AtomicBool,
+    scheduler_available: bool,
+) -> SpawnDecision {
+    use std::sync::atomic::Ordering;
+    if !scheduler_available {
+        return SpawnDecision::NoScheduler;
+    }
+    match slot.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(_) => SpawnDecision::Spawn,
+        Err(_) => SpawnDecision::AlreadySpawned,
+    }
 }
 
 #[cfg(test)]
@@ -2039,17 +2081,50 @@ mod tests {
         // B2: fast=true means a full-parallelism heavy build; it must route
         // through the heavy (window+cap gated) path regardless of an explicit
         // primary host request — never bypass the heavy window/cap.
-        assert!(request_is_heavy(HostRequest::Primary, "m", true));
-        assert!(request_is_heavy(HostRequest::Auto, "m", true));
-        assert!(request_is_heavy(HostRequest::Heavy, "m", true));
+        let heavy = |req, fast| classify_request_heavy(req, fast, Some(Some(10)), Some(Some(1000)));
+        assert!(heavy(HostRequest::Primary, true));
+        assert!(heavy(HostRequest::Auto, true));
+        assert!(heavy(HostRequest::Heavy, true));
     }
 
     #[test]
-    fn scheduler_spawn_slot_is_claimed_at_most_once_per_process() {
-        // B3: the once-guard yields the spawn slot to exactly one caller, so a
-        // repeated register() cannot spawn multiple scheduler loops.
-        assert!(claim_scheduler_spawn_slot(), "first caller claims the spawn slot");
-        assert!(!claim_scheduler_spawn_slot(), "second caller is refused");
-        assert!(!claim_scheduler_spawn_slot(), "still refused thereafter");
+    fn heavy_safety_overrides_explicit_primary_for_a_known_heavy_module() {
+        // Fix 3 / AC-6: an explicit primary request is only a preference. A
+        // known-HEAVY module (peak over threshold) requested with host=primary,
+        // fast=false is STILL gated through the heavy path; a known-SMALL one
+        // still fast-paths on primary.
+        let known_heavy = (Some(Some(99_999u64)), Some(Some(1_000u64)));
+        let known_small = (Some(Some(10u64)), Some(Some(1_000u64)));
+        assert!(
+            classify_request_heavy(HostRequest::Primary, false, known_heavy.0, known_heavy.1),
+            "explicit primary must NOT let a known-heavy module skip the heavy gate"
+        );
+        assert!(
+            !classify_request_heavy(HostRequest::Primary, false, known_small.0, known_small.1),
+            "explicit primary still fast-paths a positively-known-small module"
+        );
+        // An ambiguous/unreadable module under explicit primary also stays gated.
+        assert!(classify_request_heavy(HostRequest::Primary, false, None, Some(Some(1_000))));
+        // Explicit heavy stays heavy; no-heavy-signal (no known peak) primary is small.
+        assert!(classify_request_heavy(HostRequest::Heavy, false, Some(None), None));
+        assert!(!classify_request_heavy(HostRequest::Primary, false, Some(None), Some(Some(1_000))));
+    }
+
+    #[test]
+    fn spawn_guard_does_not_burn_the_slot_before_redis_is_available() {
+        // Fix 2: a register() with NO scheduler must NOT consume the once-slot, so
+        // a later register() (once Redis is materialized) can still spawn exactly
+        // once; a third does not double-spawn.
+        use std::sync::atomic::AtomicBool;
+        let slot = AtomicBool::new(false);
+        // Pre-Redis registrations: no scheduler, slot untouched.
+        assert_eq!(decide_scheduler_spawn(&slot, false), SpawnDecision::NoScheduler);
+        assert_eq!(decide_scheduler_spawn(&slot, false), SpawnDecision::NoScheduler);
+        // Redis now configured → the first available registration spawns.
+        assert_eq!(decide_scheduler_spawn(&slot, true), SpawnDecision::Spawn);
+        // Subsequent registrations never double-spawn.
+        assert_eq!(decide_scheduler_spawn(&slot, true), SpawnDecision::AlreadySpawned);
+        assert_eq!(decide_scheduler_spawn(&slot, false), SpawnDecision::NoScheduler);
+        assert_eq!(decide_scheduler_spawn(&slot, true), SpawnDecision::AlreadySpawned);
     }
 }

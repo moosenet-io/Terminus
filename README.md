@@ -248,10 +248,19 @@ compiler_request(module, ref, priority="normal", host="auto", fast=false, ready=
   serialization. `release`/`reconcile` likewise derive the module-lock + host-slot keys from
   the job's own stored fields, so a wrong/stale caller arg still frees the correct lock+slot
   and can never wedge the real ones.
-- **`fast` cannot bypass the heavy path** — `fast=true` forces the heavy (window+cap gated)
-  path even with an explicit `host=primary`, matching the tool schema.
-- **One scheduler loop per process** — `register()` spawns the scheduler behind a process
-  once-guard, so repeated registry setup / hot-swaps never start multiple dispatch loops.
+- **Heavy classification is safety-authoritative** — an explicit `host=primary` is only a
+  preference: a known-heavy module (peak over threshold), an ambiguous/unreadable one, or a
+  `fast=true` request is still gated through the heavy (window+cap) path even under
+  `host=primary`; only a positively-known-small module fast-paths on primary. Explicit `heavy`
+  and `fast` are always heavy.
+- **Collision-free dedupe identity** — the per-`(module, ref)` dedupe key is a length-prefixed
+  encoding (`{len(module)}:{module}:{ref}`), injective even when a component contains `@`/`:`,
+  so distinct pairs never alias and coalesce into one (which would silently drop a build); the
+  identical construction is used in Rust and in the release/reconcile Lua.
+- **One scheduler loop per process, no pre-Redis wedge** — `register()` spawns the scheduler
+  behind a process once-guard that is consumed ONLY on an actual spawn: a `register()` that
+  runs before Redis is materialized does not burn the slot, so a later `register()` (once
+  config arrives) can still spawn exactly one loop; further calls never double-spawn.
 - **No permanent wedge, no double-build on a completion outage** — the claim writes a fence
   token; completion is two individually-atomic, token-fenced, idempotent transitions:
   `finalize` (record the terminal outcome FIRST) then `release` (free the lock/slot) — a

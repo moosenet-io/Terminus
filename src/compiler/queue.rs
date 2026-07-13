@@ -393,15 +393,24 @@ fn zset_key() -> String {
 fn seq_key() -> String {
     Namespace::Queue.key("seq")
 }
-/// The namespaced prefix for the per-`module@ref` dedupe pointers. Passed to
-/// `COMPLETE_LUA` so it can derive the dedupe key from the job hash's own
-/// module@ref without a separate round-trip.
+/// The namespaced prefix for the per-`(module, ref)` dedupe pointers. Passed to
+/// the release/reconcile Lua so it can derive the dedupe key from the job hash's
+/// own module/ref without a separate round-trip.
 fn dedupe_prefix() -> String {
     Namespace::Queue.key("dedupe:")
 }
-/// Per-`module@ref` dedupe pointer → the owning job id.
+/// A COLLISION-FREE identity for a `(module, ref)` pair: `"{len(module)}:{module}:{ref}"`.
+/// The decimal length prefix marks exactly where `module` ends, so the encoding
+/// is injective even when either component contains `:` or `@` — distinct pairs
+/// never alias (e.g. `("a","b@c")` ≠ `("a@b","c")`). The IDENTICAL construction
+/// is used in the release/reconcile Lua (`#module..':'..module..':'..ref`), so
+/// Rust-built and Lua-derived dedupe keys always agree. Encode-only (never decoded).
+fn dedupe_id(module: &str, git_ref: &str) -> String {
+    format!("{}:{module}:{git_ref}", module.len())
+}
+/// Per-`(module, ref)` dedupe pointer → the owning job id.
 fn dedupe_key(module: &str, git_ref: &str) -> String {
-    format!("{}{module}@{git_ref}", dedupe_prefix())
+    format!("{}{}", dedupe_prefix(), dedupe_id(module, git_ref))
 }
 /// The per-job hash prefix (the Lua scripts append the id).
 fn job_prefix() -> String {
@@ -588,7 +597,7 @@ if host then
 end
 redis.call('HDEL', jobkey, 'claim_token')
 local dedupe=false
-if module and ref then dedupe=dedupeprefix..module..'@'..ref end
+if module and ref then dedupe=dedupeprefix..string.len(module)..':'..module..':'..ref end
 local rerun=redis.call('HGET', jobkey, 'rerun')
 local rr_flag=0
 local rr_id=''
@@ -1185,7 +1194,7 @@ pub(crate) mod fake {
         /// How many times `module@ref` coalesced (test assertion helper).
         pub(crate) fn coalesced(&self, module: &str, git_ref: &str) -> i64 {
             let s = self.state.lock().unwrap();
-            let dk = format!("{module}@{git_ref}");
+            let dk = dedupe_id(module, git_ref);
             s.dedupe
                 .get(&dk)
                 .and_then(|id| s.jobs.get(id))
@@ -1227,7 +1236,7 @@ pub(crate) mod fake {
         if let Some(j) = s.jobs.get_mut(job_id) {
             j.claim_token = None;
         }
-        let dk = format!("{dmod}@{dref}");
+        let dk = dedupe_id(&dmod, &dref);
         if rerun {
             // Re-enqueue EXACTLY one follow-up job for the same module@ref.
             s.seq += 1;
@@ -1267,7 +1276,7 @@ pub(crate) mod fake {
             if s.down {
                 return Err(QueueError::Unavailable);
             }
-            let dk = format!("{}@{}", req.module, req.git_ref);
+            let dk = dedupe_id(&req.module, &req.git_ref);
             if let Some(existing) = s.dedupe.get(&dk).cloned() {
                 let st = s.jobs.get(&existing).map(|j| j.state.clone());
                 match st.as_deref() {
@@ -1567,6 +1576,34 @@ mod tests {
         assert_eq!(a.job_id, b.job_id);
         assert_eq!(q.peek(10).await.unwrap().len(), 1, "one coalesced job queued");
         assert_eq!(q.coalesced("chord", "abc"), 2, "both readiness signals counted");
+    }
+
+    #[test]
+    fn dedupe_identity_is_collision_free_across_at_signs() {
+        // Fix 1: raw `{module}@{ref}` aliased distinct pairs. The length-prefixed
+        // identity keeps them distinct.
+        assert_ne!(dedupe_id("a", "b@c"), dedupe_id("a@b", "c"));
+        assert_ne!(dedupe_key("a", "b@c"), dedupe_key("a@b", "c"));
+        // Same pair → identical (coalescing still works).
+        assert_eq!(dedupe_id("chord", "abc"), dedupe_id("chord", "abc"));
+        // A `:` in a component can't alias either (length prefix disambiguates).
+        assert_ne!(dedupe_id("a", "b:c"), dedupe_id("a:b", "c"));
+    }
+
+    #[tokio::test]
+    async fn colliding_pairs_do_not_falsely_coalesce_but_same_pair_still_does() {
+        // Fix 1 (behavioral): (a, b@c) and (a@b, c) — which aliased under the raw
+        // `@` concat — must NOT coalesce; a genuine same-pair reuse still does.
+        let q = InMemoryQueue::new();
+        let x = q.enqueue(&req("a", "b@c", Priority::Normal, false)).await.unwrap();
+        let y = q.enqueue(&req("a@b", "c", Priority::Normal, false)).await.unwrap();
+        assert!(x.created && y.created, "distinct pairs create distinct jobs");
+        assert_ne!(x.job_id, y.job_id);
+        assert_eq!(q.peek(10).await.unwrap().len(), 2, "no false coalesce (would drop a build)");
+        // A real same-pair reuse coalesces onto the existing job.
+        let z = q.enqueue(&req("a", "b@c", Priority::Normal, false)).await.unwrap();
+        assert!(!z.created && z.job_id == x.job_id);
+        assert_eq!(q.peek(10).await.unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -2100,6 +2137,12 @@ mod tests {
         let after = q.peek(10).await.unwrap();
         let rerun = after.iter().find(|j| j.module == "chord" && j.git_ref == "abc").unwrap();
         assert_ne!(rerun.job_id, a.job_id, "re-run is a fresh job");
+        // Rust-built and Lua-derived dedupe keys must AGREE on the collision-free
+        // encoding: a fresh enqueue of the same pair coalesces onto the Lua-written
+        // rerun pointer (rather than creating a 2nd job).
+        let recoalesce = q.enqueue(&mk("chord", "abc", Priority::Normal, false, true)).await.unwrap();
+        assert!(!recoalesce.created && recoalesce.job_id == rerun.job_id,
+            "Rust dedupe_key must match the release-Lua's derived dedupe key");
 
         // 5) reconcile: a CRASHED build (no outcome, stale) is requeued.
         let rtok = match q.claim(&rerun.job_id, "chord", HostRole::Primary, 1).await.unwrap() {
@@ -2130,7 +2173,7 @@ mod tests {
         //    ready=true promotion PERSISTs both (durable).
         let held = q.enqueue(&mk("harmony", "h1", Priority::Normal, false, false)).await.unwrap();
         let held_key = Namespace::Queue.key(&format!("job:{}", held.job_id));
-        let dedupe_key = Namespace::Queue.key("dedupe:harmony@h1");
+        let dedupe_key = super::dedupe_key("harmony", "h1");
         let ttl_job: i64 = raw(&backend, "TTL", &[held_key.clone()]).await;
         let ttl_dedupe: i64 = raw(&backend, "TTL", &[dedupe_key.clone()]).await;
         assert!(ttl_job > 0 && ttl_dedupe > 0, "held intent + dedupe must have a TTL");
