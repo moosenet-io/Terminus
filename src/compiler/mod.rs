@@ -22,6 +22,7 @@
 
 pub mod events;
 pub mod host;
+pub mod idle_lease; // BLD-11: compiler↔idle-mode lease (Chord+MINT idle around heavy builds)
 pub mod publish;
 pub mod queue; // BLD-06: the durable compiler job queue (Namespace::Queue)
 pub mod scheduler; // BLD-06: window/quiet gating + per-host caps + idle seam

@@ -358,6 +358,24 @@ pub trait QueueStore: Send + Sync {
         token: &str,
     ) -> Result<(), QueueError>;
 
+    /// Token-fenced IMMEDIATE requeue of a claimed (`building`) job back to
+    /// `queued`, WITHOUT recording any terminal outcome: free the module lock +
+    /// host slot (both derived in-Lua from the job's OWN stored fields — A1),
+    /// clear the fence token, and re-add the job to the dispatch set so a later
+    /// scheduler tick picks it up. Used by the scheduler when a heavy build cannot
+    /// acquire its idle-mode lease (insufficient freed RAM) — the build must NOT
+    /// run, but the request must NOT be lost (BLD-11). Idempotent + token-fenced:
+    /// a wrong/stale token (already released, or reconciled + re-claimed) is a safe
+    /// no-op. Mirrors the crash-requeue branch of [`reconcile`](Self::reconcile),
+    /// but is immediate and token-gated rather than lease-age gated.
+    async fn requeue(
+        &self,
+        job_id: &str,
+        module: &str,
+        host: HostRole,
+        token: &str,
+    ) -> Result<(), QueueError>;
+
     /// The SANCTIONED completion entry for a direct (non-scheduler) caller:
     /// [`finalize`](Self::finalize) THEN [`release`](Self::release), each an
     /// individually-atomic idempotent transition, EACH RETRIED with bounded
@@ -819,6 +837,47 @@ return 1
     )
 }
 
+/// Token-fenced IMMEDIATE requeue of a claimed job back to `queued` (BLD-11): free
+/// the module lock + host slot — both DERIVED in-Lua from the job hash's OWN stored
+/// module/host (A1, never a caller arg) — clear the fence token, and re-add to the
+/// dispatch ZSET at the job's stored priority/seq. Records NO terminal outcome (the
+/// build never ran). A token mismatch (already released / reconciled + re-claimed)
+/// is a safe no-op (`return 0`). Returns `1` when it requeued, `0` on the fenced
+/// no-op.
+/// KEYS: 1=jobhash 2=zset
+/// ARGV: 1=id 2=token 3=modulelock_prefix 4=host_set_prefix
+fn requeue_lua() -> String {
+    r#"
+if redis.call('HGET', KEYS[1], 'claim_token') ~= ARGV[2] then return 0 end
+local jobkey=KEYS[1]
+local zsetkey=KEYS[2]
+local jobid=ARGV[1]
+local lockprefix=ARGV[3]
+local hostprefix=ARGV[4]
+-- Free the per-module lock iff this job owns it (derived from the hash's module).
+local module=redis.call('HGET', jobkey, 'module')
+if module then
+  local lockkey=lockprefix..module
+  if redis.call('GET', lockkey)==jobid then redis.call('DEL', lockkey) end
+end
+-- Free the host slot (derived from the hash's stored host).
+local host=redis.call('HGET', jobkey, 'host')
+if host then redis.call('SREM', hostprefix..host, jobid) end
+-- Clear the claim so a late completion no-ops, and return to the queued state.
+redis.call('HDEL', jobkey, 'claim_token')
+redis.call('HDEL', jobkey, 'host')
+redis.call('HDEL', jobkey, 'started_at')
+redis.call('HSET', jobkey, 'state', 'queued')
+-- Re-add to the dispatch ZSET at the stored priority/seq score.
+local seq=tonumber(redis.call('HGET', jobkey, 'seq') or '0')
+local prank=tonumber(redis.call('HGET', jobkey, 'prank') or '1')
+local score=seq-(prank*1000000000000)
+redis.call('ZADD', zsetkey, score, jobid)
+return 1
+"#
+    .to_string()
+}
+
 fn priority_from_rank(rank: i64) -> Priority {
     match rank {
         r if r >= 2 => Priority::High,
@@ -1026,6 +1085,37 @@ impl QueueStore for RedisQueue {
                     .arg(lock_prefix)
                     .arg(host_prefix)
                     .invoke_async::<_, (i64, String)>(&mut conn)
+                    .await
+            })
+            .await;
+        out.map(|_| ()).map_err(|()| QueueError::Unavailable)
+    }
+
+    async fn requeue(
+        &self,
+        job_id: &str,
+        module: &str,
+        host: HostRole,
+        token: &str,
+    ) -> Result<(), QueueError> {
+        // `module`/`host` args are advisory only — the lock + host-slot keys are
+        // DERIVED in-Lua from the job hash's OWN stored fields (A1).
+        let _ = (module, host);
+        let (jk, zset) = (job_key(job_id), zset_key());
+        let (id, token) = (job_id.to_string(), token.to_string());
+        let (lock_prefix, host_prefix) = (module_lock_prefix(), host_set_prefix());
+        let script = redis::Script::new(&requeue_lua());
+        let out: Result<i64, ()> = self
+            .backend
+            .with_conn(Namespace::Queue, |mut conn| async move {
+                script
+                    .key(jk)
+                    .key(zset)
+                    .arg(id)
+                    .arg(token)
+                    .arg(lock_prefix)
+                    .arg(host_prefix)
+                    .invoke_async::<_, i64>(&mut conn)
                     .await
             })
             .await;
@@ -1546,6 +1636,43 @@ pub(crate) mod fake {
             Ok(())
         }
 
+        async fn requeue(
+            &self,
+            job_id: &str,
+            module: &str,
+            host: HostRole,
+            token: &str,
+        ) -> Result<(), QueueError> {
+            let mut s = self.state.lock().unwrap();
+            if s.down {
+                return Err(QueueError::Unavailable);
+            }
+            // FENCE: only the current claim token may requeue; a mismatch (already
+            // released, or reconciled + re-claimed) is a safe no-op.
+            match s.jobs.get(job_id).and_then(|j| j.claim_token.clone()) {
+                Some(t) if t == token => {}
+                _ => return Ok(()),
+            }
+            // `module`/`host` args are advisory — derive from the job's OWN fields.
+            let _ = (module, host);
+            let stored_module = s.jobs.get(job_id).map(|j| j.module.clone());
+            if let Some(m) = stored_module {
+                if s.module_lock.get(&m).map(String::as_str) == Some(job_id) {
+                    s.module_lock.remove(&m);
+                }
+            }
+            for v in s.host_inflight.values_mut() {
+                v.retain(|x| x != job_id);
+            }
+            if let Some(j) = s.jobs.get_mut(job_id) {
+                j.state = "queued".into();
+                j.host = None;
+                j.started_at = 0;
+                j.claim_token = None; // fence: a late completion no-ops
+            }
+            Ok(())
+        }
+
         async fn reconcile(
             &self,
             stale_after: std::time::Duration,
@@ -1908,6 +2035,43 @@ mod tests {
             q.claim(&contender.job_id, "m1", HostRole::Primary, 1).await.unwrap(),
             ClaimOutcome::Claimed { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn requeue_returns_a_claimed_job_to_queued_and_frees_lock_and_slot() {
+        // BLD-11: a token-fenced requeue puts a claimed heavy job back to `queued`,
+        // frees its module lock + host slot, records NO terminal outcome, and lets a
+        // later claim pick it up.
+        let q = InMemoryQueue::new();
+        let j = q.enqueue(&req("harmony", "big", Priority::Normal, true)).await.unwrap();
+        let tok = claim_ok(&q, &j.job_id, "harmony", HostRole::Heavy, 1).await;
+        assert_eq!(q.state_of(&j.job_id).as_deref(), Some("building"));
+        assert_eq!(q.inflight_count(HostRole::Heavy), 1);
+        // Requeue (advisory wrong module/host args still derive the correct keys).
+        q.requeue(&j.job_id, "bogus", HostRole::Primary, &tok).await.unwrap();
+        assert_eq!(q.state_of(&j.job_id).as_deref(), Some("queued"), "back to queued");
+        assert!(!q.has_outcome(&j.job_id), "no terminal outcome recorded");
+        assert_eq!(q.inflight_count(HostRole::Heavy), 0, "host slot freed");
+        // The module lock + host slot were freed and the token cleared → the requeued
+        // job is fully re-claimable (a claim re-takes the module lock, which proves it
+        // was released), and the OLD token no longer owns anything.
+        let tok2 = claim_ok(&q, &j.job_id, "harmony", HostRole::Heavy, 1).await;
+        assert_ne!(tok, tok2, "a fresh claim mints a new fence token");
+    }
+
+    #[tokio::test]
+    async fn requeue_with_a_stale_token_is_a_safe_noop() {
+        // A wrong/stale token must not requeue (it would clobber a live re-claim).
+        let q = InMemoryQueue::new();
+        let j = q.enqueue(&req("m1", "r1", Priority::Normal, false)).await.unwrap();
+        let tok = claim_ok(&q, &j.job_id, "m1", HostRole::Primary, 1).await;
+        // A stale token no-ops: the job stays building, the slot stays held.
+        q.requeue(&j.job_id, "m1", HostRole::Primary, "wrong-token").await.unwrap();
+        assert_eq!(q.state_of(&j.job_id).as_deref(), Some("building"));
+        assert_eq!(q.inflight_count(HostRole::Primary), 1);
+        // The correct token still requeues.
+        q.requeue(&j.job_id, "m1", HostRole::Primary, &tok).await.unwrap();
+        assert_eq!(q.state_of(&j.job_id).as_deref(), Some("queued"));
     }
 
     #[tokio::test]
