@@ -478,6 +478,11 @@ where
 /// `op_timeout`, so a HUNG activate is treated as a (retryable) failure, never a hang.
 struct LeaseInner {
     backend: Arc<dyn IdleBackend>,
+    /// Whether CHORD is part of this lease (configured/reachable). When `false`
+    /// (MINT-only mode), Chord is NEVER idled or activated — `release` and the
+    /// remote-recovery backstop skip it entirely (invariant: never touch an
+    /// out-of-lease Chord).
+    chord_in_lease: bool,
     /// Confirmed-active flags — set ONLY after that service's `activate` returns Ok.
     /// `chord_active` is initialised `true` when Chord is NOT part of the lease (not
     /// configured), so release never waits on / touches an absent Chord (F1).
@@ -650,6 +655,11 @@ impl LeaseInner {
     /// the window a late idle can no longer arrive, so a final confirming activate stops it.
     /// At most one backstop runs at a time (shares the `persistent_running` slot). Requires
     /// an ambient runtime (the abort path is always async / in a runtime).
+    ///
+    /// **Chord-out-of-lease invariant:** when Chord was NOT part of the lease
+    /// (`chord_in_lease == false`, MINT-only mode), Chord is NEVER queried or activated —
+    /// there is no remote Chord to race, so the backstop only ensures MINT is active and
+    /// makes ZERO `chord_is_idle`/`chord_activate` calls.
     fn spawn_remote_recovery_backstop(self: &Arc<Self>) {
         if self.persistent_running.swap(true, Ordering::SeqCst) {
             return; // a backstop is already running; it covers reactivation
@@ -661,6 +671,27 @@ impl LeaseInner {
         }
         let this = self.clone();
         tokio::spawn(async move {
+            // MINT-only (Chord out of lease): no remote race — never touch Chord. Just
+            // ensure MINT (in-process) is active; no windowed recovery loop is needed.
+            if !this.chord_in_lease {
+                {
+                    let _seq = this.release_lock.lock().await;
+                    if !this.mint_active.load(Ordering::SeqCst)
+                        && with_op_timeout(
+                            this.op_timeout,
+                            "MINT activate (remote recovery)",
+                            this.backend.mint_activate(),
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        this.mint_active.store(true, Ordering::SeqCst);
+                    }
+                }
+                this.persistent_running.store(false, Ordering::SeqCst);
+                info!("idle lease: remote-idle-recovery backstop — MINT-only (Chord out of lease); no Chord recovery");
+                return;
+            }
             let deadline = tokio::time::Instant::now() + this.remote_recovery_window;
             loop {
                 {
@@ -928,6 +959,12 @@ pub async fn acquire_lease(
         );
         let deadline = tokio::time::Instant::now() + cfg.acquire_timeout;
         loop {
+            // NOTE (intended behavior — NOT a missing fallback): with coordination
+            // DISABLED, NO idle call is made, so there is NO services'-reported-freed value
+            // to fall back on (that fallback only exists on the ENABLED path, where an idle
+            // call returns a freed figure). Here `MemAvailable` is the ONLY signal — an
+            // UNREADABLE `MemAvailable` (`None`) safely aborts+requeues below (never build
+            // under an unverifiable budget), rather than silently proceeding.
             let available = backend.mem_available_gb();
             if available.map(|a| a >= budget_gb).unwrap_or(false) {
                 info!(
@@ -1116,6 +1153,7 @@ fn build_lease_inner(
 ) -> Arc<LeaseInner> {
     Arc::new(LeaseInner {
         backend,
+        chord_in_lease,
         chord_active: AtomicBool::new(!chord_in_lease),
         mint_active: AtomicBool::new(false),
         retry_backoff: activate_retry,
@@ -1309,6 +1347,9 @@ mod tests {
         /// itself HANGS (so the client-side per-op timeout cancels US) — exercising the
         /// real "a timed-out /idle still lands on the server after the abort's /activate".
         chord_idle_delayed_side_effect_ms: AtomicU64,
+        /// Count of `chord_is_idle` STATUS queries — proves an out-of-lease Chord is never
+        /// even status-queried by the remote-recovery backstop (MINT-only mode).
+        chord_is_idle_calls: AtomicUsize,
     }
 
     impl MockBackend {
@@ -1331,6 +1372,7 @@ mod tests {
                 chord_is_idle: Arc::new(AtomicBool::new(false)),
                 mint_is_idle: Arc::new(AtomicBool::new(false)),
                 chord_idle_delayed_side_effect_ms: AtomicU64::new(0),
+                chord_is_idle_calls: AtomicUsize::new(0),
             })
         }
         fn with_mint_idle_delay_ms(self: Arc<Self>, ms: u64) -> Arc<Self> {
@@ -1462,6 +1504,7 @@ mod tests {
         async fn chord_is_idle(&self) -> Result<Option<bool>, String> {
             // The mock exposes Chord's ACTUAL (possibly late-set) idle state, so the
             // remote-idle-recovery backstop exercises the status-aware option-(a) path.
+            self.chord_is_idle_calls.fetch_add(1, Ordering::SeqCst);
             Ok(Some(self.chord_is_idle.load(Ordering::SeqCst)))
         }
     }
@@ -1778,6 +1821,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mint_only_remote_recovery_never_touches_out_of_lease_chord() {
+        // FINDING: in MINT-only mode (Chord unconfigured / out-of-lease), an idle-timeout
+        // abort's remote-recovery backstop must make ZERO chord_is_idle / chord_activate
+        // calls — an out-of-lease Chord is NEVER queried or activated — while MINT is still
+        // handled. Here MINT idle times out (never confirms), triggering the abort path.
+        let be = MockBackend::new(None, None)
+            .with_chord_unavailable() // Chord NOT in the lease (MINT-only)
+            .with_mem(vec![200.0])
+            .with_mint_idle_delay_ms(3_600_000); // mint_idle never returns ⇒ abort
+        let mut c = cfg(5, 3600);
+        c.op_timeout = Duration::from_millis(20);
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            acquire_lease(be.clone(), &c, true, 120.0),
+        )
+        .await
+        .expect("acquire returned (did not hang)")
+        .expect_err("MINT idle timeout ⇒ IdleFailed abort");
+        assert!(matches!(err, LeaseError::IdleFailed { .. }), "got {err:?}");
+        // Give the (MINT-only) remote-recovery backstop time to run.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // ZERO Chord interaction — Chord was out of lease and must never be touched.
+        assert_eq!(be.chord_idles.load(Ordering::SeqCst), 0, "out-of-lease Chord never idled");
+        assert_eq!(
+            be.chord_is_idle_calls.load(Ordering::SeqCst),
+            0,
+            "out-of-lease Chord never status-queried by the backstop"
+        );
+        assert_eq!(be.chord_activates.load(Ordering::SeqCst), 0, "out-of-lease Chord never activated");
+        // MINT is handled (not stuck idle).
+        assert!(!be.is_stuck_idle(), "no service left stuck idle (MINT handled)");
+    }
+
+    #[tokio::test]
     async fn hung_activate_call_times_out_then_retries_no_stuck_idle() {
         // FINDING 3 (release side): a HUNG chord_activate must trip the per-op timeout
         // (treated as a retryable failure, NOT marking Chord done), and a retry round
@@ -1948,6 +2025,7 @@ mod tests {
         let be = MockBackend::new(None, None);
         let inner = Arc::new(LeaseInner {
             backend: be.clone(),
+            chord_in_lease: true,
             chord_active: AtomicBool::new(false),
             mint_active: AtomicBool::new(false),
             retry_backoff: Duration::from_millis(1),
@@ -2113,6 +2191,7 @@ mod tests {
         let be = MockBackend::new(None, None);
         let inner = Arc::new(LeaseInner {
             backend: be.clone(),
+            chord_in_lease: true,
             chord_active: AtomicBool::new(false),
             mint_active: AtomicBool::new(false),
             retry_backoff: Duration::from_millis(1),
