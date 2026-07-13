@@ -517,10 +517,31 @@ impl Scheduler {
             } else {
                 None
             };
-            let result = executor.build(&job).await;
-            // Release the lease on the normal path (awaited, deterministic). On a
-            // panic in `executor.build` above we never reach here, but `lease` drops
-            // during the unwind and its `Drop` reactivates both services.
+            // PANIC BOUNDARY: run the build in a nested task so a panicking build
+            // surfaces here as a `JoinError` instead of unwinding THIS scheduler task.
+            // That makes crash handling DETERMINISTIC: we always fall through to
+            // release the idle lease AND finalize+release the queue job (Failed),
+            // rather than leaking the claim to the (slow) reconcile backstop.
+            let build_outcome = {
+                let job_for_build = job.clone();
+                let exec = executor.clone();
+                tokio::spawn(async move { exec.build(&job_for_build).await }).await
+            };
+            let result: Result<(), String> = match build_outcome {
+                Ok(r) => r,
+                Err(join_err) => {
+                    tracing::error!(
+                        module = %job.module, job = %job.job_id,
+                        "compiler scheduler: build task PANICKED ({join_err}); releasing the \
+                         idle lease and finalizing the job as Failed (deterministic, not via \
+                         the reconcile backstop)"
+                    );
+                    Err(format!("build panicked: {join_err}"))
+                }
+            };
+            // Release the lease (awaited, deterministic) whether the build returned
+            // Ok, Err, or PANICKED — the panic was caught above so we ALWAYS reach
+            // here. The guard's `Drop` remains a backstop for any other early return.
             if let Some(guard) = lease {
                 guard.release().await;
             }
@@ -647,6 +668,16 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    /// An executor that PANICS mid-build, to prove the scheduler's panic boundary
+    /// releases the lease AND finalizes+releases the queue job deterministically.
+    struct PanickingExecutor;
+    #[async_trait]
+    impl BuildExecutor for PanickingExecutor {
+        async fn build(&self, _job: &QueuedJob) -> Result<(), String> {
+            panic!("simulated build crash");
         }
     }
 
@@ -866,6 +897,34 @@ mod tests {
         }
         assert_eq!(*ex.built.lock().unwrap(), vec!["harmony".to_string()]);
         assert_eq!(idle_ok.releases.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn panicking_heavy_build_releases_lease_and_finalizes_through_dispatch() {
+        // FINDING 3: a build that PANICS must, END-TO-END THROUGH DISPATCH (not just a
+        // simulated guard drop), (a) release the idle lease and (b) finalize+release
+        // the queue job as Failed — deterministically, not left to reconcile.
+        let q = Arc::new(InMemoryQueue::new());
+        let enq = q.enqueue(&req("harmony", "big", true)).await.unwrap();
+        let ex: Arc<dyn BuildExecutor> = Arc::new(PanickingExecutor);
+        let idle = Arc::new(CountingIdle::new(false));
+        let s = sched(q.clone(), ex, idle.clone(), cfg(1, 1, vec![]));
+        let r = s.tick_once(12, true).await; // fleet-quiet ⇒ heavy dispatchable
+        assert_eq!(r.dispatched.len(), 1);
+        // The scheduler task itself must NOT panic (the boundary caught it).
+        for h in r.handles {
+            h.await.expect("scheduler task survived the build panic");
+        }
+        // (a) idle lease released despite the panic.
+        assert_eq!(
+            idle.releases.load(Ordering::SeqCst),
+            1,
+            "idle lease released after a panicking build"
+        );
+        // (b) job finalized as Failed + released: terminal state, slot freed.
+        assert_eq!(q.state_of(&enq.job_id).as_deref(), Some("failed"));
+        assert!(q.has_outcome(&enq.job_id), "terminal outcome recorded");
+        assert_eq!(q.inflight_count(HostRole::Heavy), 0, "host slot freed");
     }
 
     #[tokio::test]

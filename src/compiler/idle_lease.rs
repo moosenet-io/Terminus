@@ -71,6 +71,9 @@ const POLL_MS_ENV: &str = "BUILD_IDLE_POLL_MS";
 /// Per-request HTTP timeout (secs) for a Chord idle/activate control call. From
 /// `BUILD_IDLE_CHORD_TIMEOUT_SECS`.
 const CHORD_TIMEOUT_ENV: &str = "BUILD_IDLE_CHORD_TIMEOUT_SECS";
+/// Backoff (ms) between release/reactivation retry rounds — so a transient partial
+/// activation failure self-heals. From `BUILD_IDLE_ACTIVATE_RETRY_MS`.
+const ACTIVATE_RETRY_MS_ENV: &str = "BUILD_IDLE_ACTIVATE_RETRY_MS";
 
 const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 120;
 /// Default max-lease: a full build timeout plus generous headroom, so the watchdog
@@ -78,6 +81,10 @@ const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_MAX_LEASE_SECS: u64 = super::MAX_BUILD_TIMEOUT_SECS + 1800;
 const DEFAULT_POLL_MS: u64 = 1000;
 const DEFAULT_CHORD_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_ACTIVATE_RETRY_MS: u64 = 500;
+/// Bounded rounds of reactivation retry per release call (backstopped by later
+/// release calls, the max-lease watchdog, and each service's own idle watchdog).
+const RELEASE_MAX_ATTEMPTS: u32 = 5;
 
 /// The idle-lease reason label (diagnostic only; recorded in MINT's resume
 /// manifest). Not an infra identifier.
@@ -113,6 +120,8 @@ pub struct IdleLeaseConfig {
     pub poll: Duration,
     /// Per-request HTTP timeout for a Chord idle/activate call.
     pub chord_timeout: Duration,
+    /// Backoff between reactivation retry rounds (partial-failure self-heal).
+    pub activate_retry: Duration,
 }
 
 impl IdleLeaseConfig {
@@ -128,6 +137,10 @@ impl IdleLeaseConfig {
             chord_timeout: Duration::from_secs(env_u64(
                 CHORD_TIMEOUT_ENV,
                 DEFAULT_CHORD_TIMEOUT_SECS,
+            )),
+            activate_retry: Duration::from_millis(env_u64(
+                ACTIVATE_RETRY_MS_ENV,
+                DEFAULT_ACTIVATE_RETRY_MS,
             )),
         }
     }
@@ -251,13 +264,17 @@ impl IdleBackend for ProdIdleBackend {
 // The lease + its guaranteed release
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Why a heavy build could not take its idle lease.
+/// Why a heavy build could not take its idle lease. In BOTH cases the heavy build
+/// MUST NOT run and the scheduler requeues it; any service that was idled is
+/// reactivated (best-effort) before the error is returned, so nothing is left idle.
 #[derive(Debug)]
 pub enum LeaseError {
-    /// The freed RAM never reached the configured budget within the acquire
-    /// timeout. The heavy build MUST NOT run; the scheduler requeues it. Both
-    /// services have already been reactivated before this is returned.
+    /// The freed RAM never reached the configured budget within the acquire timeout.
     InsufficientRam { freed_gb: f64, budget_gb: f64 },
+    /// Idle coordination itself FAILED with the RAM gate ON (a service could not be
+    /// idled), so we cannot guarantee the host was freed — degrade SAFELY by
+    /// aborting + requeueing rather than building uncoordinated.
+    IdleFailed { reason: String },
 }
 
 impl std::fmt::Display for LeaseError {
@@ -271,33 +288,85 @@ impl std::fmt::Display for LeaseError {
                 "idle-mode freed only {freed_gb:.1} GiB (< {budget_gb:.1} GiB budget) \
                  within the acquire timeout — refusing to build under budget"
             ),
+            LeaseError::IdleFailed { reason } => write!(
+                f,
+                "idle coordination failed ({reason}) with a RAM budget configured — \
+                 refusing to build uncoordinated"
+            ),
         }
     }
 }
 
-/// The shared release core behind a lease. Reactivating both services is a
-/// RUN-AT-MOST-ONCE, best-effort operation (both `activate` calls are idempotent on
-/// their service's side, so a double fire from the watchdog + the guard drop is
-/// harmless). `activate` is always attempted for BOTH services even if one errors.
+/// The shared release core behind a lease. Reactivation is tracked PER SERVICE so a
+/// PARTIAL failure never leaves a service stuck idle: a single `released` once-flag
+/// (set before activation) was wrong — if Chord activation failed but the flag was
+/// already burned, every later attempt no-oped and Chord stayed idle forever.
+/// Instead, [`release`](Self::release) only ever marks a service done once ITS OWN
+/// activate SUCCEEDS, retries the not-yet-confirmed service(s) with bounded backoff,
+/// and is safe to call repeatedly (explicit release, guard drop, watchdog) — each
+/// call re-attempts only the services still not confirmed active. Every `activate`
+/// is idempotent on its service's side, so re-attempting one that already succeeded
+/// (in a rare concurrent double-fire) is harmless.
 struct LeaseInner {
     backend: Arc<dyn IdleBackend>,
-    released: AtomicBool,
+    /// Confirmed-active flags — set ONLY after that service's `activate` returns Ok.
+    chord_active: AtomicBool,
+    mint_active: AtomicBool,
+    /// Backoff between release retry rounds.
+    retry_backoff: Duration,
+    /// Max release retry rounds before giving up this call (a later call, or the
+    /// per-service idle watchdogs, remain the backstop).
+    max_attempts: u32,
 }
 
 impl LeaseInner {
+    /// Both services confirmed reactivated?
+    fn fully_released(&self) -> bool {
+        self.chord_active.load(Ordering::SeqCst) && self.mint_active.load(Ordering::SeqCst)
+    }
+
+    /// One activation pass: attempt each service NOT yet confirmed active; mark it
+    /// done only on a successful `activate`. Returns whether both are now confirmed.
+    async fn try_activate_pending(&self) -> bool {
+        if !self.chord_active.load(Ordering::SeqCst) {
+            match self.backend.chord_activate().await {
+                Ok(()) => self.chord_active.store(true, Ordering::SeqCst),
+                Err(e) => warn!(error = %e, "idle lease: Chord activate failed — will retry (not marking released)"),
+            }
+        }
+        if !self.mint_active.load(Ordering::SeqCst) {
+            match self.backend.mint_activate().await {
+                Ok(()) => self.mint_active.store(true, Ordering::SeqCst),
+                Err(e) => warn!(error = %e, "idle lease: MINT activate failed — will retry (not marking released)"),
+            }
+        }
+        self.fully_released()
+    }
+
+    /// Reactivate both services, retrying any that fail with bounded backoff so a
+    /// transient partial failure self-heals instead of leaving a service stuck idle.
+    /// Idempotent + re-entrant: a service already confirmed active is never touched
+    /// again by this call, and re-invoking after a partial failure resumes ONLY the
+    /// still-pending service.
     async fn release(&self) {
-        // Once-guard: whichever of {explicit release, guard drop, max-lease
-        // watchdog} fires first performs the reactivation; the rest no-op.
-        if self.released.swap(true, Ordering::SeqCst) {
+        if self.fully_released() {
             return;
         }
-        if let Err(e) = self.backend.chord_activate().await {
-            warn!(error = %e, "idle lease: Chord activate failed (best-effort; per-service watchdog also covers it)");
+        for attempt in 0..self.max_attempts.max(1) {
+            if self.try_activate_pending().await {
+                info!("idle lease released — Chord + MINT reactivated");
+                return;
+            }
+            if attempt + 1 < self.max_attempts.max(1) {
+                tokio::time::sleep(self.retry_backoff).await;
+            }
         }
-        if let Err(e) = self.backend.mint_activate().await {
-            warn!(error = %e, "idle lease: MINT activate failed (best-effort; MINT's own watchdog also covers it)");
-        }
-        info!("idle lease released — Chord + MINT reactivated");
+        warn!(
+            chord_active = self.chord_active.load(Ordering::SeqCst),
+            mint_active = self.mint_active.load(Ordering::SeqCst),
+            "idle lease: a service is still not confirmed active after release retries — \
+             a later release/watchdog or the per-service idle watchdog remains the backstop"
+        );
     }
 }
 
@@ -391,49 +460,50 @@ fn estimate_freed(
     measured.max(reported)
 }
 
-/// Acquire the idle-mode lease: idle Chord + MINT, WAIT for the freed RAM to reach
-/// the budget (if a budget is configured), then hand back a [`LeaseGuard`] whose
-/// drop/watchdog guarantee reactivation. On timeout (budget never met) both services
-/// are reactivated and [`LeaseError::InsufficientRam`] is returned — the caller must
-/// NOT build (it requeues instead). Generic over [`IdleBackend`] so it is fully
-/// testable offline.
+/// Acquire the idle-mode lease for a build whose freed-RAM budget is `budget_gb`.
+///
+/// ## Gate OFF (`budget_gb <= 0.0`) — idle coordination DISABLED
+/// No idle call is made at all: the build runs directly, exactly as the pre-BLD-11
+/// no-op seam did. This removes any "idle failed but we proceeded uncoordinated"
+/// path — with no budget there is nothing to coordinate, so there is nothing to
+/// fail. A [`LeaseGuard::noop`] is returned (nothing to release).
+///
+/// ## Gate ON (`budget_gb > 0.0`) — idle coordination REQUIRED
+/// Idle Chord + MINT; if EITHER idle call FAILS we cannot guarantee the host was
+/// freed, so we degrade SAFELY: reactivate whatever we idled and return
+/// [`LeaseError::IdleFailed`] (the scheduler requeues — never builds uncoordinated).
+/// On success, WAIT for the freed RAM to reach `budget_gb`, bounded by the acquire
+/// timeout; on timeout reactivate both and return [`LeaseError::InsufficientRam`]
+/// (requeue — never builds under budget). On success, hand back a [`LeaseGuard`]
+/// whose drop/watchdog guarantee reactivation. Generic over [`IdleBackend`] so it is
+/// fully testable offline.
 pub async fn acquire_lease(
     backend: Arc<dyn IdleBackend>,
     cfg: &IdleLeaseConfig,
+    budget_gb: f64,
 ) -> Result<LeaseGuard, LeaseError> {
-    let mem_before = backend.mem_available_gb();
-    info!(
-        budget_gb = cfg.freed_ram_budget_gb,
-        "idle lease: idling Chord + MINT for a heavy build"
-    );
+    // Gate OFF ⇒ do NOT attempt idle coordination at all (no failed-idle-then-proceed
+    // path): build directly, holding a no-op lease.
+    if budget_gb <= 0.0 {
+        info!("idle lease: no freed-RAM budget for this build (gate off) — building directly, no idle coordination attempted");
+        return Ok(LeaseGuard::noop());
+    }
 
-    // Idle both. An idle error is logged but not fatal on its own — the freed-RAM
-    // gate below is the authority on whether the build may start. (With the gate
-    // OFF, an idle failure means we simply proceed less-idle, which the per-service
-    // watchdogs will tidy up; with the gate ON, a failure to free RAM leads to the
-    // timeout → abort/requeue path, which is the safe outcome.)
+    let mem_before = backend.mem_available_gb();
+    info!(budget_gb, "idle lease: idling Chord + MINT for a heavy build");
+
+    // Gate ON: a FAILED idle call means we can't guarantee the host was freed. Do NOT
+    // proceed uncoordinated — reactivate whatever we touched and abort (→ requeue).
     let chord_freed = match backend.chord_idle().await {
         Ok(f) => f,
-        Err(e) => {
-            warn!(error = %e, "idle lease: Chord idle failed (continuing; the freed-RAM gate governs the build)");
-            None
-        }
+        Err(e) => return abort_on_idle_failure(backend, "Chord idle failed", e).await,
     };
     let mint_freed = match backend.mint_idle().await {
         Ok(f) => f,
-        Err(e) => {
-            warn!(error = %e, "idle lease: MINT idle failed (continuing; the freed-RAM gate governs the build)");
-            None
-        }
+        Err(e) => return abort_on_idle_failure(backend, "MINT idle failed", e).await,
     };
 
-    // No configured budget ⇒ the hard RAM gate is OFF: idle was signalled, proceed.
-    if cfg.freed_ram_budget_gb <= 0.0 {
-        info!("idle lease: no freed-RAM budget configured (gate off) — proceeding after idling");
-        return Ok(arm_guard(backend, cfg.max_lease));
-    }
-
-    // Gate ON: WAIT for the freed RAM to reach the budget, bounded by the timeout.
+    // WAIT for the freed RAM to reach the budget, bounded by the timeout.
     let deadline = tokio::time::Instant::now() + cfg.acquire_timeout;
     loop {
         let freed = estimate_freed(
@@ -442,43 +512,68 @@ pub async fn acquire_lease(
             chord_freed,
             mint_freed,
         );
-        if freed >= cfg.freed_ram_budget_gb {
+        if freed >= budget_gb {
             info!(
                 freed_gb = freed,
-                budget_gb = cfg.freed_ram_budget_gb,
-                "idle lease acquired — freed RAM meets the budget; heavy build may start"
+                budget_gb, "idle lease acquired — freed RAM meets the budget; heavy build may start"
             );
-            return Ok(arm_guard(backend, cfg.max_lease));
+            return Ok(arm_guard(backend, cfg.max_lease, cfg.activate_retry));
         }
         if tokio::time::Instant::now() >= deadline {
             warn!(
                 freed_gb = freed,
-                budget_gb = cfg.freed_ram_budget_gb,
+                budget_gb,
                 "idle lease: freed RAM below budget after the acquire timeout — \
                  reactivating Chord + MINT and refusing the heavy build (it will be requeued)"
             );
             // Never leave services idle for a build we're not going to run.
-            if let Err(e) = backend.chord_activate().await {
-                warn!(error = %e, "idle lease: Chord reactivate after abort failed (best-effort)");
-            }
-            if let Err(e) = backend.mint_activate().await {
-                warn!(error = %e, "idle lease: MINT reactivate after abort failed (best-effort)");
-            }
+            reactivate_best_effort(&backend).await;
             return Err(LeaseError::InsufficientRam {
                 freed_gb: freed,
-                budget_gb: cfg.freed_ram_budget_gb,
+                budget_gb,
             });
         }
         tokio::time::sleep(cfg.poll).await;
     }
 }
 
+/// Reactivate both services best-effort (used on an abort — the build won't run).
+async fn reactivate_best_effort(backend: &Arc<dyn IdleBackend>) {
+    if let Err(e) = backend.chord_activate().await {
+        warn!(error = %e, "idle lease: Chord reactivate after abort failed (best-effort)");
+    }
+    if let Err(e) = backend.mint_activate().await {
+        warn!(error = %e, "idle lease: MINT reactivate after abort failed (best-effort)");
+    }
+}
+
+/// Gate-ON idle-coordination failure: reactivate anything we idled, then abort so the
+/// scheduler requeues (never build uncoordinated after a failed idle call).
+async fn abort_on_idle_failure(
+    backend: Arc<dyn IdleBackend>,
+    what: &str,
+    err: String,
+) -> Result<LeaseGuard, LeaseError> {
+    warn!(error = %err, "idle lease: {what} with a RAM budget configured — aborting (safe degrade), the build is requeued");
+    reactivate_best_effort(&backend).await;
+    Err(LeaseError::IdleFailed {
+        reason: format!("{what}: {err}"),
+    })
+}
+
 /// Build a `LeaseGuard` and arm its max-lease watchdog (force-activate after the
 /// hard bound so a hung build can never wedge Chord/MINT idle).
-fn arm_guard(backend: Arc<dyn IdleBackend>, max_lease: Duration) -> LeaseGuard {
+fn arm_guard(
+    backend: Arc<dyn IdleBackend>,
+    max_lease: Duration,
+    activate_retry: Duration,
+) -> LeaseGuard {
     let inner = Arc::new(LeaseInner {
         backend,
-        released: AtomicBool::new(false),
+        chord_active: AtomicBool::new(false),
+        mint_active: AtomicBool::new(false),
+        retry_backoff: activate_retry,
+        max_attempts: RELEASE_MAX_ATTEMPTS,
     });
     let wd_inner = inner.clone();
     let watchdog = tokio::spawn(async move {
@@ -521,10 +616,26 @@ impl IdleModeLease {
     }
 }
 
+impl IdleModeLease {
+    /// The freed-RAM budget (GiB) for THIS build: the module's own known peak build
+    /// RSS (`BUILD_MODULE_PEAK_MB_<MODULE>`, the same per-build config host selection
+    /// already uses) when configured — so the gate reflects what the build actually
+    /// needs — falling back to the process-wide `BUILD_IDLE_FREED_RAM_BUDGET_GB`
+    /// default only when the job has no per-build figure. A present-but-unparsable
+    /// module peak degrades to the global default rather than erroring the build path.
+    fn budget_for(&self, job: &QueuedJob) -> f64 {
+        match super::host::module_peak_mb(&job.module) {
+            Ok(Some(mb)) => mb as f64 / 1024.0,
+            _ => self.cfg.freed_ram_budget_gb,
+        }
+    }
+}
+
 #[async_trait]
 impl IdleCoordinator for IdleModeLease {
-    async fn acquire(&self, _job: &QueuedJob) -> Result<LeaseGuard, LeaseError> {
-        acquire_lease(self.backend.clone(), &self.cfg).await
+    async fn acquire(&self, job: &QueuedJob) -> Result<LeaseGuard, LeaseError> {
+        let budget = self.budget_for(job);
+        acquire_lease(self.backend.clone(), &self.cfg, budget).await
     }
 }
 
@@ -547,7 +658,8 @@ pub fn test_guard(counter: Arc<std::sync::atomic::AtomicUsize>) -> LeaseGuard {
             Ok(None)
         }
         async fn chord_activate(&self) -> Result<(), String> {
-            // Counted once per release (LeaseInner::release is run-at-most-once).
+            // Always succeeds ⇒ counted exactly once per full release (a re-invoked
+            // release sees both services confirmed active and no-ops).
             self.counter.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -564,6 +676,7 @@ pub fn test_guard(counter: Arc<std::sync::atomic::AtomicUsize>) -> LeaseGuard {
     arm_guard(
         Arc::new(CountingReleaseBackend { counter }),
         Duration::from_secs(3600),
+        Duration::from_millis(1),
     )
 }
 
@@ -578,7 +691,8 @@ mod tests {
     use std::sync::Mutex;
 
     /// A mock backend recording every call and returning scripted freed figures /
-    /// a scripted `MemAvailable` sequence.
+    /// a scripted `MemAvailable` sequence. `chord_activates`/`mint_activates` count
+    /// only SUCCESSFUL activations, so a count of 1 proves that service ended active.
     struct MockBackend {
         chord_idles: AtomicUsize,
         chord_activates: AtomicUsize,
@@ -590,6 +704,8 @@ mod tests {
         mem_samples: Mutex<Vec<f64>>,
         /// If true, chord_idle/mint_idle return Err.
         fail_idle: bool,
+        /// The next N `chord_activate` calls fail (transient); after that, succeed.
+        chord_activate_fail_times: AtomicUsize,
     }
 
     impl MockBackend {
@@ -603,12 +719,31 @@ mod tests {
                 mint_freed,
                 mem_samples: Mutex::new(Vec::new()),
                 fail_idle: false,
+                chord_activate_fail_times: AtomicUsize::new(0),
+            })
+        }
+        fn failing_idle() -> Arc<Self> {
+            Arc::new(Self {
+                chord_idles: AtomicUsize::new(0),
+                chord_activates: AtomicUsize::new(0),
+                mint_idles: AtomicUsize::new(0),
+                mint_activates: AtomicUsize::new(0),
+                chord_freed: None,
+                mint_freed: None,
+                mem_samples: Mutex::new(Vec::new()),
+                fail_idle: true,
+                chord_activate_fail_times: AtomicUsize::new(0),
             })
         }
         fn with_mem(self: Arc<Self>, samples: Vec<f64>) -> Arc<Self> {
             *self.mem_samples.lock().unwrap() = samples;
             self
         }
+        fn with_chord_activate_fails(self: Arc<Self>, n: usize) -> Arc<Self> {
+            self.chord_activate_fail_times.store(n, Ordering::SeqCst);
+            self
+        }
+        /// (successful chord activations, successful mint activations)
         fn activates(&self) -> (usize, usize) {
             (
                 self.chord_activates.load(Ordering::SeqCst),
@@ -628,6 +763,10 @@ mod tests {
             }
         }
         async fn chord_activate(&self) -> Result<(), String> {
+            if self.chord_activate_fail_times.load(Ordering::SeqCst) > 0 {
+                self.chord_activate_fail_times.fetch_sub(1, Ordering::SeqCst);
+                return Err("chord activate transient failure".into());
+            }
             self.chord_activates.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -656,13 +795,15 @@ mod tests {
         }
     }
 
-    fn cfg(budget: f64, acquire_secs: u64, max_lease_secs: u64) -> IdleLeaseConfig {
+    /// Config with the RAM budget passed SEPARATELY to `acquire_lease` (per-build).
+    fn cfg(acquire_secs: u64, max_lease_secs: u64) -> IdleLeaseConfig {
         IdleLeaseConfig {
-            freed_ram_budget_gb: budget,
+            freed_ram_budget_gb: 0.0, // global default; per-call budget is explicit
             acquire_timeout: Duration::from_secs(acquire_secs),
             max_lease: Duration::from_secs(max_lease_secs),
             poll: Duration::from_millis(1),
             chord_timeout: Duration::from_secs(1),
+            activate_retry: Duration::from_millis(1),
         }
     }
 
@@ -682,24 +823,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn budget_off_proceeds_after_idling_both() {
-        // Gate OFF (budget 0): idle is signalled once each; the build may start.
+    async fn gate_off_makes_no_idle_calls_and_builds_directly() {
+        // FINDING 1: with NO budget (gate off), idle coordination is NOT attempted at
+        // all — no chord_idle/mint_idle call is made, so there is no "idle failed but
+        // proceeded" path. The guard is a no-op (nothing to release).
         let be = MockBackend::new(None, None);
-        let guard = acquire_lease(be.clone(), &cfg(0.0, 5, 3600))
+        let guard = acquire_lease(be.clone(), &cfg(5, 3600), 0.0)
             .await
-            .expect("gate off ⇒ acquired");
-        assert_eq!(be.chord_idles.load(Ordering::SeqCst), 1);
-        assert_eq!(be.mint_idles.load(Ordering::SeqCst), 1);
-        // Explicit release reactivates both exactly once.
+            .expect("gate off ⇒ builds directly");
+        assert_eq!(be.chord_idles.load(Ordering::SeqCst), 0, "no chord idle attempted");
+        assert_eq!(be.mint_idles.load(Ordering::SeqCst), 0, "no mint idle attempted");
         guard.release().await;
-        assert_eq!(be.activates(), (1, 1));
+        assert_eq!(be.activates(), (0, 0), "nothing was idled ⇒ nothing to reactivate");
+    }
+
+    #[tokio::test]
+    async fn gate_on_idle_failure_aborts_and_requeues_never_uncoordinated() {
+        // FINDING 4 (+1): with a budget configured (gate ON), a FAILED idle call must
+        // abort + requeue — NEVER proceed to build uncoordinated. Anything idled is
+        // reactivated best-effort.
+        let be = MockBackend::failing_idle();
+        let err = acquire_lease(be.clone(), &cfg(5, 3600), 120.0)
+            .await
+            .expect_err("gate on + idle failure ⇒ abort");
+        assert!(
+            matches!(err, LeaseError::IdleFailed { .. }),
+            "must be IdleFailed, got {err:?}"
+        );
+        // chord_idle was attempted (and failed); reactivation was attempted for both.
+        assert_eq!(be.chord_idles.load(Ordering::SeqCst), 1);
+        assert_eq!(be.activates(), (1, 1), "reactivated best-effort on abort");
     }
 
     #[tokio::test]
     async fn happy_path_acquires_when_reported_freed_meets_budget() {
         // Chord+MINT report 60+70=130 GiB freed ≥ 120 budget ⇒ acquire immediately.
         let be = MockBackend::new(Some(60.0), Some(70.0));
-        let guard = acquire_lease(be.clone(), &cfg(120.0, 5, 3600))
+        let guard = acquire_lease(be.clone(), &cfg(5, 3600), 120.0)
             .await
             .expect("budget met ⇒ acquired");
         assert_eq!(be.chord_idles.load(Ordering::SeqCst), 1);
@@ -715,7 +875,7 @@ mod tests {
         // No reported figures; MemAvailable climbs 10 → 40 → 135 GiB across polls.
         // Delta from the first sample (10) reaches 125 ≥ 120 on the third sample.
         let be = MockBackend::new(None, None).with_mem(vec![10.0, 40.0, 135.0]);
-        let guard = acquire_lease(be.clone(), &cfg(120.0, 5, 3600))
+        let guard = acquire_lease(be.clone(), &cfg(5, 3600), 120.0)
             .await
             .expect("measured RAM reaches budget ⇒ acquired");
         guard.release().await;
@@ -728,7 +888,7 @@ mod tests {
         // BOTH services are reactivated, and InsufficientRam is returned so the
         // scheduler requeues instead of building.
         let be = MockBackend::new(Some(10.0), Some(20.0));
-        let err = acquire_lease(be.clone(), &cfg(120.0, 0, 3600))
+        let err = acquire_lease(be.clone(), &cfg(0, 3600), 120.0)
             .await
             .expect_err("under budget ⇒ InsufficientRam");
         match err {
@@ -739,9 +899,34 @@ mod tests {
                 assert_eq!(freed_gb, 30.0);
                 assert_eq!(budget_gb, 120.0);
             }
+            other => panic!("expected InsufficientRam, got {other:?}"),
         }
         // Reactivated on abort — never left idle for a build that won't run.
         assert_eq!(be.activates(), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn partial_activation_failure_retries_until_both_active_no_stuck_idle() {
+        // FINDING 2: chord_activate fails ONCE then succeeds; MINT (which succeeds
+        // first try) must not be double-fired, and Chord must end ACTIVE (not stuck
+        // idle) after the retry — the once-flag is never burned on a partial failure.
+        let be = MockBackend::new(Some(200.0), Some(0.0)).with_chord_activate_fails(1);
+        let guard = acquire_lease(be.clone(), &cfg(5, 3600), 120.0)
+            .await
+            .expect("budget met ⇒ acquired");
+        guard.release().await;
+        // Chord ended active (exactly one SUCCESSFUL activate, after one failure), and
+        // MINT was activated exactly once (not double-fired on the retry round).
+        assert_eq!(
+            be.activates(),
+            (1, 1),
+            "Chord retried to ACTIVE; MINT not double-fired"
+        );
+        assert_eq!(
+            be.chord_activate_fail_times.load(Ordering::SeqCst),
+            0,
+            "the forced failure was consumed by the first attempt"
+        );
     }
 
     #[tokio::test]
@@ -749,7 +934,7 @@ mod tests {
         // A tiny max-lease: the guard is held (build "hangs") and never released
         // explicitly; the watchdog must reactivate both on its own.
         let be = MockBackend::new(Some(200.0), Some(0.0));
-        let guard = acquire_lease(be.clone(), &cfg(120.0, 5, 0))
+        let guard = acquire_lease(be.clone(), &cfg(5, 0), 120.0)
             .await
             .expect("budget met ⇒ acquired");
         // Hold the guard (do NOT release). max_lease=0 ⇒ the watchdog fires promptly.
@@ -759,7 +944,7 @@ mod tests {
             (1, 1),
             "watchdog force-activated Chord + MINT after the max-lease timeout"
         );
-        // A later explicit release is a harmless no-op (once-guard).
+        // A later explicit release is a harmless no-op (both already active).
         guard.release().await;
         assert_eq!(be.activates(), (1, 1));
     }
@@ -770,7 +955,7 @@ mod tests {
         // without an explicit release. Reactivation must still happen (detached).
         let be = MockBackend::new(Some(200.0), Some(0.0));
         {
-            let guard = acquire_lease(be.clone(), &cfg(120.0, 5, 3600))
+            let guard = acquire_lease(be.clone(), &cfg(5, 3600), 120.0)
                 .await
                 .expect("acquired");
             // No explicit release: drop it here (as a panic unwind would).
@@ -792,24 +977,32 @@ mod tests {
         g.release().await; // no panic, nothing to release
     }
 
-    #[tokio::test]
-    async fn idle_failure_with_gate_off_still_proceeds() {
-        // Both idle calls fail, but with the gate OFF the build still proceeds
-        // (the per-service watchdogs tidy up); release still reactivates.
-        let be = Arc::new(MockBackend {
-            chord_idles: AtomicUsize::new(0),
-            chord_activates: AtomicUsize::new(0),
-            mint_idles: AtomicUsize::new(0),
-            mint_activates: AtomicUsize::new(0),
-            chord_freed: None,
-            mint_freed: None,
-            mem_samples: Mutex::new(Vec::new()),
-            fail_idle: true,
-        });
-        let guard = acquire_lease(be.clone(), &cfg(0.0, 5, 3600))
-            .await
-            .expect("gate off ⇒ proceeds despite idle failure");
-        guard.release().await;
-        assert_eq!(be.activates(), (1, 1));
+    #[test]
+    fn per_job_budget_prefers_module_peak_over_the_global_default() {
+        // FINDING 5: the build's OWN budget (its module peak RSS, MB→GiB) is used when
+        // configured; the process-wide default is only the fallback.
+        use crate::compiler::queue::Priority;
+        let be = MockBackend::new(None, None);
+        let mut c = cfg(5, 3600);
+        c.freed_ram_budget_gb = 7.0; // global default
+        let lease = IdleModeLease::new(be, c);
+        let job = QueuedJob {
+            job_id: "j".into(),
+            module: "budgetprobe_uniqzz".into(),
+            git_ref: "r".into(),
+            priority: Priority::Normal,
+            heavy: true,
+        };
+        let key = "BUILD_MODULE_PEAK_MB_BUDGETPROBE_UNIQZZ";
+        // No per-module peak ⇒ falls back to the global default (7 GiB).
+        std::env::remove_var(key);
+        assert_eq!(lease.budget_for(&job), 7.0);
+        // A per-module peak (20480 MB) drives the budget (20 GiB), overriding default.
+        std::env::set_var(key, "20480");
+        assert_eq!(lease.budget_for(&job), 20.0);
+        // An unparsable peak degrades to the global default (never errors the build).
+        std::env::set_var(key, "notanumber");
+        assert_eq!(lease.budget_for(&job), 7.0);
+        std::env::remove_var(key);
     }
 }
