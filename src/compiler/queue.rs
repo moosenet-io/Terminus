@@ -260,6 +260,13 @@ pub enum QueueError {
     /// Redis is not configured or is unreachable — the durable queue is down.
     /// The tool surface degrades LOUDLY on this (never silently drops a build).
     Unavailable,
+    /// A completion was attempted with a token that does NOT own the current
+    /// claim (wrong or stale — e.g. the job was reconciled + re-claimed, or was
+    /// never owned by this caller). The transition did NOT happen; surfaced so a
+    /// direct caller can never observe a FALSE success that masks an unfinished
+    /// build. NOT returned for the genuine in-flight retry of the same correct
+    /// token (which still owns the build until release clears it).
+    StaleToken,
 }
 
 impl std::fmt::Display for QueueError {
@@ -269,8 +276,23 @@ impl std::fmt::Display for QueueError {
                 f,
                 "compiler job queue is unavailable (Redis not configured or unreachable)"
             ),
+            QueueError::StaleToken => write!(
+                f,
+                "completion token does not own the current claim (wrong/stale); \
+                 the build was not completed by this caller"
+            ),
         }
     }
+}
+
+/// The result of a [`QueueStore::finalize`]: did THIS token's completion record
+/// the terminal outcome, or is the token stale/wrong (not the owner)?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizeOutcome {
+    /// The terminal-outcome marker was recorded — this token owns the build.
+    Finalized,
+    /// The token did not match the job's current claim; nothing was recorded.
+    StaleToken,
 }
 
 /// The durable compiler job queue. Implemented by [`RedisQueue`] over the shared
@@ -300,12 +322,20 @@ pub trait QueueStore: Send + Sync {
 
     /// LOW-LEVEL step 1 of completion: durably record the terminal outcome (a
     /// marker) in ONE atomic, token-fenced, idempotent Lua. Does NOT release the
-    /// lock/slot and does NOT retry. This marker is what lets
-    /// [`reconcile`](Self::reconcile) release (never rebuild) a finished-but-
-    /// unreleased job. **Direct callers should prefer [`complete`](Self::complete)**
-    /// (which retries); the scheduler drives `finalize`/`release` directly with its
-    /// own config-tuned retry.
-    async fn finalize(&self, job_id: &str, state: JobState, token: &str) -> Result<(), QueueError>;
+    /// lock/slot and does NOT retry. Returns [`FinalizeOutcome::Finalized`] when
+    /// THIS token owns the claim (the marker was written — idempotent on retry of
+    /// the same token), or [`FinalizeOutcome::StaleToken`] when the token does not
+    /// match (nothing recorded) — the caller must NOT treat that as success. This
+    /// marker is what lets [`reconcile`](Self::reconcile) release (never rebuild) a
+    /// finished-but-unreleased job. **Direct callers should prefer
+    /// [`complete`](Self::complete)** (which retries + surfaces a stale token); the
+    /// scheduler drives `finalize`/`release` directly with its own config-tuned retry.
+    async fn finalize(
+        &self,
+        job_id: &str,
+        state: JobState,
+        token: &str,
+    ) -> Result<FinalizeOutcome, QueueError>;
 
     /// LOW-LEVEL step 2 of completion: release the module lock + host slot (keys
     /// DERIVED from the job hash's own module/host — A1), honor a re-run / clear
@@ -328,6 +358,11 @@ pub trait QueueStore: Send + Sync {
     /// the outcome first preserves the no-rebuild guarantee: if `release` never
     /// lands, reconcile finds the marker and releases (never rebuilds); the
     /// scheduler uses the same two-step shape with its own tuned retry.
+    ///
+    /// A WRONG/STALE token surfaces as `Err(`[`QueueError::StaleToken`]`)` — never
+    /// a false `Ok(())` — so a direct caller cannot mask a build it does not own.
+    /// The genuine in-flight retry of the SAME correct token still succeeds (the
+    /// token owns the build until `release` clears it).
     async fn complete(
         &self,
         job_id: &str,
@@ -336,19 +371,29 @@ pub trait QueueStore: Send + Sync {
         state: JobState,
         token: &str,
     ) -> Result<(), QueueError> {
-        // STEP 1: record the outcome (retry until it lands).
+        // STEP 1: record the outcome (retry a transient outage; a stale token is
+        // a definitive non-success — do NOT report Ok for a transition that did
+        // not happen).
         let mut finalized = false;
         for attempt in 0..COMPLETE_RETRY_MAX.max(1) {
-            if self.finalize(job_id, state, token).await.is_ok() {
-                finalized = true;
-                break;
+            match self.finalize(job_id, state, token).await {
+                Ok(FinalizeOutcome::Finalized) => {
+                    finalized = true;
+                    break;
+                }
+                Ok(FinalizeOutcome::StaleToken) => return Err(QueueError::StaleToken),
+                Err(QueueError::StaleToken) => return Err(QueueError::StaleToken),
+                Err(QueueError::Unavailable) => {
+                    tokio::time::sleep(complete_backoff(attempt)).await;
+                }
             }
-            tokio::time::sleep(complete_backoff(attempt)).await;
         }
         if !finalized {
             return Err(QueueError::Unavailable);
         }
-        // STEP 2: free the lock/slot (retry until it lands).
+        // STEP 2: free the lock/slot (retry until it lands; on the correct token
+        // it succeeds — release is a token-fenced no-op only for a stale token,
+        // which cannot occur here since finalize just confirmed ownership).
         for attempt in 0..COMPLETE_RETRY_MAX.max(1) {
             if self.release(job_id, module, host, token).await.is_ok() {
                 return Ok(());
@@ -898,10 +943,18 @@ impl QueueStore for RedisQueue {
         }
     }
 
-    async fn finalize(&self, job_id: &str, state: JobState, token: &str) -> Result<(), QueueError> {
+    async fn finalize(
+        &self,
+        job_id: &str,
+        state: JobState,
+        token: &str,
+    ) -> Result<FinalizeOutcome, QueueError> {
         let jk = job_key(job_id);
         let (outcome, now, token) = (state.as_str().to_string(), now_ms(), token.to_string());
         let script = redis::Script::new(FINALIZE_LUA);
+        // FINALIZE_LUA returns 1 when the marker was written (this token owns the
+        // claim) and 0 on a token MISMATCH — distinguish them so `complete` can
+        // surface a stale token instead of a false success.
         let out: Result<i64, ()> = self
             .backend
             .with_conn(Namespace::Queue, |mut conn| async move {
@@ -914,7 +967,11 @@ impl QueueStore for RedisQueue {
                     .await
             })
             .await;
-        out.map(|_| ()).map_err(|()| QueueError::Unavailable)
+        match out {
+            Ok(1) => Ok(FinalizeOutcome::Finalized),
+            Ok(_) => Ok(FinalizeOutcome::StaleToken),
+            Err(()) => Err(QueueError::Unavailable),
+        }
     }
 
     async fn release(
@@ -1418,7 +1475,7 @@ pub(crate) mod fake {
             job_id: &str,
             state: JobState,
             token: &str,
-        ) -> Result<(), QueueError> {
+        ) -> Result<FinalizeOutcome, QueueError> {
             let mut s = self.state.lock().unwrap();
             if s.down {
                 return Err(QueueError::Unavailable);
@@ -1427,15 +1484,16 @@ pub(crate) mod fake {
                 s.fail_finalizes -= 1;
                 return Err(QueueError::Unavailable);
             }
-            // FENCE: only the current claim's worker may mark the outcome.
+            // FENCE: only the current claim's worker may mark the outcome. A
+            // mismatch is a distinct, surfaced outcome (never a false success).
             match s.jobs.get(job_id).and_then(|j| j.claim_token.clone()) {
                 Some(t) if t == token => {}
-                _ => return Ok(()),
+                _ => return Ok(FinalizeOutcome::StaleToken),
             }
             if let Some(j) = s.jobs.get_mut(job_id) {
                 j.outcome = Some(state.as_str().to_string());
             }
-            Ok(())
+            Ok(FinalizeOutcome::Finalized)
         }
 
         async fn release(
@@ -1952,6 +2010,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wrong_token_completion_surfaces_stale_never_false_success() {
+        // Fix 1: a complete()/finalize() with a WRONG token must NOT report Ok —
+        // it must surface a non-success (StaleToken) so a direct caller cannot
+        // mask a build that is neither finished nor released.
+        let q = InMemoryQueue::new();
+        let j = q.enqueue(&req("m1", "r1", Priority::Normal, false)).await.unwrap();
+        let tok = claim_ok(&q, &j.job_id, "m1", HostRole::Primary, 1).await;
+
+        // finalize with a wrong token → StaleToken (no marker written).
+        assert_eq!(
+            q.finalize(&j.job_id, JobState::Done, "wrong-token").await.unwrap(),
+            FinalizeOutcome::StaleToken
+        );
+        // complete with a wrong token → Err(StaleToken), NOT Ok(()).
+        assert_eq!(
+            q.complete(&j.job_id, "m1", HostRole::Primary, JobState::Done, "wrong-token").await,
+            Err(QueueError::StaleToken)
+        );
+        // The build is genuinely UNFINISHED — not masked as complete/released.
+        assert_eq!(q.state_of(&j.job_id).as_deref(), Some("building"));
+        assert!(!q.has_outcome(&j.job_id), "no outcome marker for a wrong token");
+        assert_eq!(q.inflight_count(HostRole::Primary), 1, "slot still held");
+
+        // The correct token finalizes, and complete() is idempotent across an
+        // in-flight release outage (retries the SAME correct token to success).
+        assert_eq!(
+            q.finalize(&j.job_id, JobState::Done, &tok).await.unwrap(),
+            FinalizeOutcome::Finalized
+        );
+        q.fail_releases(2);
+        q.complete(&j.job_id, "m1", HostRole::Primary, JobState::Done, &tok).await.unwrap();
+        assert_eq!(q.inflight_count(HostRole::Primary), 0, "correct token self-heals + releases");
+        assert_eq!(q.state_of(&j.job_id).as_deref(), Some("done"));
+    }
+
+    #[tokio::test]
     async fn stale_completion_and_double_release_are_idempotent_no_slot_underflow() {
         let q = InMemoryQueue::new();
         let j = q.enqueue(&req("m1", "r1", Priority::Normal, false)).await.unwrap();
@@ -1962,9 +2056,12 @@ mod tests {
         let new_tok = claim_ok(&q, &j.job_id, "m1", HostRole::Primary, 1).await;
         assert_ne!(stale_tok, new_tok);
         assert_eq!(q.inflight_count(HostRole::Primary), 1);
-        // The crashed worker's LATE completion (old token) must be a NO-OP — it
-        // must NOT free the new claim's host slot or module lock.
-        q.complete(&j.job_id, "m1", HostRole::Primary, JobState::Done, &stale_tok).await.unwrap();
+        // The crashed worker's LATE completion (old token) surfaces StaleToken —
+        // it must NOT free the new claim's host slot or module lock.
+        assert_eq!(
+            q.complete(&j.job_id, "m1", HostRole::Primary, JobState::Done, &stale_tok).await,
+            Err(QueueError::StaleToken)
+        );
         assert_eq!(
             q.inflight_count(HostRole::Primary),
             1,
@@ -1974,8 +2071,12 @@ mod tests {
         // The rightful completion releases exactly once...
         q.complete(&j.job_id, "m1", HostRole::Primary, JobState::Done, &new_tok).await.unwrap();
         assert_eq!(q.inflight_count(HostRole::Primary), 0);
-        // ...and a DUPLICATE of it is also a no-op (no underflow / double free).
-        q.complete(&j.job_id, "m1", HostRole::Primary, JobState::Done, &new_tok).await.unwrap();
+        // ...and a DUPLICATE of it (token now cleared) surfaces StaleToken and does
+        // NOT underflow / double-free the host-slot count.
+        assert_eq!(
+            q.complete(&j.job_id, "m1", HostRole::Primary, JobState::Done, &new_tok).await,
+            Err(QueueError::StaleToken)
+        );
         assert_eq!(
             q.inflight_count(HostRole::Primary),
             0,
@@ -2153,8 +2254,12 @@ mod tests {
         let _: () = raw(&backend, "HSET", &[job_key.clone(), "started_at".into(), "1".into()]).await;
         let rep = q.reconcile(Duration::from_secs(1)).await.unwrap();
         assert!(rep.requeued.contains(&rerun.job_id) && rep.released.is_empty());
-        // The stale worker's late completion (old token) is fenced off.
-        q.complete(&rerun.job_id, "chord", HostRole::Primary, JobState::Done, &rtok).await.unwrap();
+        // The stale worker's late completion (old token) is fenced off: it
+        // surfaces StaleToken (never a false Ok) and touches nothing.
+        assert_eq!(
+            q.complete(&rerun.job_id, "chord", HostRole::Primary, JobState::Done, &rtok).await,
+            Err(QueueError::StaleToken)
+        );
 
         // 6) reconcile: a FINISHED build (outcome marker, stale) is released, NOT rebuilt.
         let ftok = match q.claim(&rerun.job_id, "chord", HostRole::Primary, 1).await.unwrap() {

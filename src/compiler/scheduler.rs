@@ -39,7 +39,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::compiler::host::HostRole;
-use crate::compiler::queue::{ClaimOutcome, JobState, QueueError, QueueStore, QueuedJob};
+use crate::compiler::queue::{
+    ClaimOutcome, FinalizeOutcome, JobState, QueueError, QueueStore, QueuedJob,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config (S1 — every value from env, with a safe conservative fallback)
@@ -164,7 +166,12 @@ pub fn parse_windows_checked(raw: &str) -> (Vec<Window>, bool) {
         let parsed = tok.split_once('-').and_then(|(a, b)| {
             let start: u8 = a.trim().parse().ok()?;
             let end: u8 = b.trim().parse().ok()?;
-            (start <= 24 && end <= 24).then_some(Window { start, end })
+            // `24` is only meaningful as an END (an all-day/`0-24` upper bound).
+            // A START of 24 (e.g. `24-6`) can never be an active hour (`contains`
+            // needs `hour >= 24`), so it is a nonsensical never-active window —
+            // reject it as invalid so it hits the loud warn path rather than
+            // silently stranding every heavy build.
+            (start < 24 && end <= 24).then_some(Window { start, end })
         });
         match parsed {
             Some(w) => windows.push(w),
@@ -389,14 +396,15 @@ impl Scheduler {
                 report.reconciled.append(&mut rep.requeued);
                 report.self_healed.append(&mut rep.released);
             }
-            Err(QueueError::Unavailable) => {
+            // reconcile only ever fails Unavailable; any error degrades this tick.
+            Err(_) => {
                 report.unavailable = true;
                 return report;
             }
         }
         let jobs = match self.queue.peek(self.config.peek_limit).await {
             Ok(j) => j,
-            Err(QueueError::Unavailable) => {
+            Err(_) => {
                 report.unavailable = true;
                 return report;
             }
@@ -435,7 +443,7 @@ impl Scheduler {
                          stored module) — skipping"
                     );
                 }
-                Err(QueueError::Unavailable) => {
+                Err(_) => {
                     report.unavailable = true;
                     break;
                 }
@@ -499,11 +507,29 @@ impl Scheduler {
             }
 
             // STEP 1: durably record the terminal outcome FIRST (so reconcile can
-            // release, not rebuild, a finished job).
-            let finalized = retry(base, max_attempts, || {
-                queue.finalize(&job.job_id, state, &token)
-            })
-            .await;
+            // release, not rebuild, a finished job). A STALE token means this job
+            // was reconciled + re-claimed (or already released) — we no longer own
+            // it, so STOP (do not retry, do not release the new claim's slot).
+            let mut finalized = false;
+            for attempt in 0..max_attempts.max(1) {
+                match queue.finalize(&job.job_id, state, &token).await {
+                    Ok(FinalizeOutcome::Finalized) => {
+                        finalized = true;
+                        break;
+                    }
+                    Ok(FinalizeOutcome::StaleToken) => {
+                        tracing::warn!(
+                            module = %job.module, job = %job.job_id,
+                            "compiler scheduler: completion token is stale (job reconciled/\
+                             re-claimed); yielding without releasing the current claim"
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        tokio::time::sleep(base.saturating_mul(1u32 << attempt.min(5))).await;
+                    }
+                }
+            }
             if !finalized {
                 tracing::error!(
                     module = %job.module, job = %job.job_id,
@@ -650,6 +676,30 @@ mod tests {
         // Empty / whitespace-only is not "invalid" (just no window configured).
         let (ws, had_invalid) = parse_windows_checked("  ,  ");
         assert!(ws.is_empty() && !had_invalid);
+    }
+
+    #[test]
+    fn window_start_of_24_is_rejected_as_invalid() {
+        // A START of 24 is a never-active window (e.g. `24-6`); it must be flagged
+        // invalid (loud warn), not silently accepted (which would strand heavy builds).
+        let (ws, had_invalid) = parse_windows_checked("24-6");
+        assert!(ws.is_empty() && had_invalid, "start=24 must be rejected as invalid");
+        let (ws, had_invalid) = parse_windows_checked("24-24");
+        assert!(ws.is_empty() && had_invalid);
+        // A mix: the bad start=24 token is dropped + flagged; the good one parses.
+        let (ws, had_invalid) = parse_windows_checked("24-6, 0-6");
+        assert_eq!(ws, vec![Window { start: 0, end: 6 }]);
+        assert!(had_invalid);
+        // Legitimate ranges still parse: a wrap (22-6), an all-day (0-24), and a
+        // normal range — none flagged.
+        let (ws, had_invalid) = parse_windows_checked("22-6");
+        assert_eq!(ws, vec![Window { start: 22, end: 6 }]);
+        assert!(!had_invalid);
+        assert!(ws[0].contains(23) && ws[0].contains(3) && !ws[0].contains(12));
+        let (ws, had_invalid) = parse_windows_checked("0-24");
+        assert_eq!(ws, vec![Window { start: 0, end: 24 }]);
+        assert!(!had_invalid);
+        assert!(ws[0].contains(0) && ws[0].contains(23), "0-24 is all-day");
     }
 
     #[test]

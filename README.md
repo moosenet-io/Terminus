@@ -234,10 +234,12 @@ compiler_request(module, ref, priority="normal", host="auto", fast=false, ready=
 - **Graceful serialization + windows** — the scheduler dispatches small/primary builds
   immediately (bounded by `BUILD_HOST_CAP_PRIMARY`), and holds **heavy** builds (the ones the
   `select_role` heuristic routes to the heavy host) for a configured window
-  (`BUILD_WINDOW_HOURS`, e.g. `22-24,0-6`, wrap-aware) or a fleet-quiet signal
-  (`BUILD_FLEET_QUIET`). One build per host at a time unless the per-host cap is raised. A
-  window closing mid-build never cancels the in-flight build — it only stops new heavy dispatch.
-  Priority (`low|normal|high`) orders the queue but never preempts a running build.
+  (`BUILD_WINDOW_HOURS`, e.g. `22-24,0-6`, wrap-aware; `0-24` is all-day) or a fleet-quiet
+  signal (`BUILD_FLEET_QUIET`). A malformed window token — including a never-active `start=24`
+  (e.g. `24-6`; `24` is valid only as an end) — is dropped and logged loudly rather than
+  silently stranding heavy builds. One build per host at a time unless the per-host cap is
+  raised. A window closing mid-build never cancels the in-flight build — it only stops new heavy
+  dispatch. Priority (`low|normal|high`) orders the queue but never preempts a running build.
 - **Idle-mode seam (BLD-11)** — a heavy build acquires/releases the heavy host's idle-mode
   lease around the build; that coordination is a clean trait seam (`IdleCoordinator`), a
   no-op by default, wired for real by BLD-11 — and touched only for a heavy build actually
@@ -265,9 +267,13 @@ compiler_request(module, ref, priority="normal", host="auto", fast=false, ready=
   token; completion is two individually-atomic, token-fenced, idempotent transitions:
   `finalize` (record the terminal outcome FIRST) then `release` (free the lock/slot) — a
   deliberate two-step design (vs one atomic Lua) that is what lets reconcile tell a finished
-  job from a crashed one. The queue-layer `complete()` is the sanctioned retrying entry for
+  job from a crashed one. `finalize` returns a typed outcome (`Finalized` vs `StaleToken`), so
+  a completion attempted with a WRONG/stale token surfaces `Err(StaleToken)` — never a false
+  `Ok` that would mask an unfinished build; the genuine in-flight retry of the same correct
+  token still succeeds. The queue-layer `complete()` is the sanctioned retrying entry for
   direct callers; the scheduler drives the two steps with its own bounded backoff
-  (`BUILD_COMPLETE_RETRY_BASE_MS`/`BUILD_COMPLETE_RETRY_MAX`). As a
+  (`BUILD_COMPLETE_RETRY_BASE_MS`/`BUILD_COMPLETE_RETRY_MAX`) and yields (no release) if its
+  token has gone stale. As a
   crash/restart backstop, each tick RECONCILES `building` jobs whose claim is older than
   `BUILD_STALE_BUILDING_SECS` (clamped UP to a safe floor of max-build-timeout + retry window,
   so a live build is never reconciled): a job that FINISHED (marker present) but never
