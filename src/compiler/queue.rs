@@ -28,10 +28,30 @@
 //! timeout-bounded by the backend; an unreachable Redis surfaces as
 //! `Unavailable` and the caller decides.
 //!
+//! ## Retention model (per job state — bounded growth, durable where it matters)
+//! - `queued` / `building` (in-flight): **durable, never expire** — a pending or
+//!   running build must survive memory pressure (`noeviction` DB). Their dedupe
+//!   pointer is durable too (it is the single-owner claim for `module@ref`).
+//! - `held` (an agent's `ready=false` intent that was never promoted): bounded by
+//!   a **held-intent TTL** (`BUILD_HELD_INTENT_TTL_SECS`) on BOTH the job hash and
+//!   its dedupe pointer, so an abandoned intent (and its dedupe entry) cannot grow
+//!   unbounded. Promotion to `queued` (a later `ready=true`) `PERSIST`s both.
+//! - `done` / `failed` (terminal): retained for `BUILD_JOB_RETAIN_SECS` (history
+//!   for `compiler_status`) then self-expire; the dedupe pointer is cleared on
+//!   release (or repointed at a re-run).
+//!
+//! ## Completion is two durable steps (no double-BUILD on self-heal)
+//! `finalize` writes a durable terminal-outcome marker FIRST (token-fenced, does
+//! not release); `release` then frees the module lock + host slot. Both are
+//! idempotent and independently retried. The reconcile backstop distinguishes a
+//! job that is *finished but not yet released* (marker present ⇒ release only, NO
+//! rebuild) from one that *crashed mid-build* (no marker + stale ⇒ requeue) — so a
+//! worker that finished but could not release is never rebuilt.
+//!
 //! ## Discipline (S1/S7)
 //! No infra literals: every key is formed through [`Namespace::Queue`], the
 //! endpoint/password come from the vault-materialized env via [`RedisBackend`],
-//! and the one tunable (completed-job retention) is a config env var. No secret
+//! and every tunable (retention, held-intent TTL) is a config env var. No secret
 //! is read here.
 
 use std::sync::Arc;
@@ -50,12 +70,27 @@ use crate::redis::{Namespace, RedisBackend};
 const RETAIN_SECS_ENV: &str = "BUILD_JOB_RETAIN_SECS";
 const DEFAULT_RETAIN_SECS: i64 = 86_400;
 
+/// Env var: how long (secs) a never-promoted `held` intent (a `ready=false`
+/// marker) — and its dedupe pointer — live before self-expiring, so an abandoned
+/// intent cannot grow unbounded. A `ready=true` promotion `PERSIST`s them (they
+/// become durable queued jobs). Default a day.
+const HELD_INTENT_TTL_ENV: &str = "BUILD_HELD_INTENT_TTL_SECS";
+const DEFAULT_HELD_INTENT_TTL_SECS: i64 = 86_400;
+
 fn retain_secs() -> i64 {
     std::env::var(RETAIN_SECS_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<i64>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_RETAIN_SECS)
+}
+
+fn held_intent_ttl_secs() -> i64 {
+    std::env::var(HELD_INTENT_TTL_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_HELD_INTENT_TTL_SECS)
 }
 
 /// Milliseconds since the Unix epoch (a wall clock for request/dispatch
@@ -239,11 +274,31 @@ pub trait QueueStore: Send + Sync {
         cap: u32,
     ) -> Result<ClaimOutcome, QueueError>;
 
-    /// Atomically finish a claimed build: release the module lock and the host
-    /// slot, clear the dedupe entry, and record the terminal `state`. `token` is
-    /// the fence from [`ClaimOutcome::Claimed`]; a mismatch (already released, or
-    /// reconciled + re-claimed) is a safe no-op — so this is idempotent and safe
-    /// to RETRY across Redis outages.
+    /// STEP 1 of completion: durably record the terminal outcome (a marker), the
+    /// FIRST thing a worker does when a build finishes. Token-fenced; does NOT
+    /// release the lock/slot. Idempotent + retryable. This marker is what lets
+    /// [`reconcile`](Self::reconcile) release (never rebuild) a finished-but-
+    /// unreleased job.
+    async fn finalize(&self, job_id: &str, state: JobState, token: &str) -> Result<(), QueueError>;
+
+    /// STEP 2 of completion: release the module lock + host slot (and honor a
+    /// re-run / clear the dedupe entry), recording the terminal state from the
+    /// `finalize` marker. `token` is the fence from [`ClaimOutcome::Claimed`]; a
+    /// mismatch (already released, or reconciled + re-claimed) is a safe no-op —
+    /// so this is idempotent and safe to RETRY across Redis outages.
+    async fn release(
+        &self,
+        job_id: &str,
+        module: &str,
+        host: HostRole,
+        token: &str,
+    ) -> Result<(), QueueError>;
+
+    /// Convenience: [`finalize`](Self::finalize) then [`release`](Self::release).
+    /// Callers that can tolerate losing the no-rebuild guarantee on a partial
+    /// failure may use this; the scheduler drives the two steps with independent
+    /// retries so a finalized-but-unreleased job is reconciled (released, not
+    /// rebuilt) rather than lost.
     async fn complete(
         &self,
         job_id: &str,
@@ -251,16 +306,32 @@ pub trait QueueStore: Send + Sync {
         host: HostRole,
         state: JobState,
         token: &str,
-    ) -> Result<(), QueueError>;
+    ) -> Result<(), QueueError> {
+        self.finalize(job_id, state, token).await?;
+        self.release(job_id, module, host, token).await
+    }
 
-    /// Crash/restart backstop: requeue every `building` job whose claim is older
-    /// than `stale_after` (no live worker completed it), freeing its module lock
-    /// + host slot. Returns the requeued job ids. Atomic per job; a Redis-down
-    /// sweep degrades to `Unavailable` (nothing partially changed — retry next tick).
-    async fn reconcile(&self, stale_after: std::time::Duration) -> Result<Vec<String>, QueueError>;
+    /// Crash/restart backstop: sweep every `building` job. A job whose worker
+    /// FINISHED (a durable `outcome` marker) but never released is released only
+    /// (NO rebuild); a job with no marker whose claim is older than `stale_after`
+    /// (crashed mid-build) is requeued. Atomic per job; a Redis-down sweep
+    /// degrades to `Unavailable` (nothing partially changed — retry next tick).
+    async fn reconcile(
+        &self,
+        stale_after: std::time::Duration,
+    ) -> Result<ReconcileReport, QueueError>;
 
     /// A snapshot of queued jobs + in-flight leases for `compiler_status`.
     async fn snapshot(&self) -> Result<QueueSnapshot, QueueError>;
+}
+
+/// What a [`QueueStore::reconcile`] sweep did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// Crashed-mid-build jobs requeued for a fresh dispatch.
+    pub requeued: Vec<String>,
+    /// Finished-but-unreleased jobs released WITHOUT a rebuild (self-heal).
+    pub released: Vec<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -313,7 +384,7 @@ fn host_set_key(host: HostRole) -> String {
 /// Enqueue with dedupe/coalesce/promote. Returns `{job_id, created(0/1)}`.
 /// KEYS: 1=dedupe 2=zset 3=seq
 /// ARGV: 1=candidate_id 2=prank 3=now 4=job_prefix 5=module 6=ref 7=prio_label
-///       8=heavy(0/1) 9=ready(0/1)
+///       8=heavy(0/1) 9=ready(0/1) 10=held_ttl_secs
 const ENQUEUE_LUA: &str = r#"
 local dedupe=KEYS[1]
 local zset=KEYS[2]
@@ -322,8 +393,9 @@ local id=ARGV[1]
 local prank=tonumber(ARGV[2])
 local now=ARGV[3]
 local jp=ARGV[4]
-local ready=ARGV[9]
 local heavy=ARGV[8]
+local ready=ARGV[9]
+local held_ttl=tonumber(ARGV[10])
 local existing=redis.call('GET', dedupe)
 if existing then
   local jk=jp..existing
@@ -343,6 +415,10 @@ if existing then
     if ready=='1' and st=='held' then
       redis.call('HSET', jk, 'state', 'queued')
       newst='queued'
+      -- Promoted to a durable dispatchable job: drop the held-intent TTL on the
+      -- job hash AND its dedupe pointer so they can no longer expire.
+      redis.call('PERSIST', jk)
+      redis.call('PERSIST', dedupe)
     end
     if newst=='queued' then
       local seq=tonumber(redis.call('HGET', jk, 'seq') or '0')
@@ -354,11 +430,13 @@ if existing then
   end
   if st=='building' then
     -- The build is ALREADY happening. Never create a second job for the same
-    -- module@ref. Record a SINGLE idempotent pending re-run (a third request
-    -- does not stack another) so at most ONE follow-up build is queued when the
-    -- current one completes (see COMPLETE_LUA). Still apply the monotonic heavy
-    -- upgrade + priority bump so the re-run respects them.
-    redis.call('HSET', jk, 'rerun', '1')
+    -- module@ref. Only a READY=true request schedules a single idempotent pending
+    -- re-run (a held ready=false arrival records intent but must NOT become a
+    -- dispatchable re-run); a third ready request does not stack another. Still
+    -- apply the monotonic heavy upgrade + priority bump so the re-run respects them.
+    if ready=='1' then
+      redis.call('HSET', jk, 'rerun', '1')
+    end
     redis.call('HINCRBY', jk, 'coalesced', 1)
     local cur=tonumber(redis.call('HGET', jk, 'prank') or '0')
     if prank>cur then
@@ -375,12 +453,19 @@ local jk=jp..id
 local state='held'
 if ready=='1' then state='queued' end
 redis.call('HSET', jk, 'module', ARGV[5], 'ref', ARGV[6], 'prank', prank,
-  'priority', ARGV[7], 'heavy', ARGV[8], 'seq', seq, 'requested_at', now,
+  'priority', ARGV[7], 'heavy', heavy, 'seq', seq, 'requested_at', now,
   'coalesced', 1, 'state', state)
 redis.call('SET', dedupe, id)
 if ready=='1' then
   local score=seq-(prank*1000000000000)
   redis.call('ZADD', zset, score, id)
+else
+  -- Held (never-dispatched) intent: bound its lifetime so an abandoned
+  -- ready=false marker (and its dedupe entry) cannot grow unbounded.
+  if held_ttl>0 then
+    redis.call('EXPIRE', jk, held_ttl)
+    redis.call('EXPIRE', dedupe, held_ttl)
+  end
 end
 return {id, 1}
 "#;
@@ -403,72 +488,88 @@ redis.call('SADD', KEYS[4], ARGV[1])
 return {1, ARGV[5]}
 "#;
 
-/// Release a finished build in ONE atomic script (no pre-read outside Lua): the
-/// module lock + host slot are released, the dedupe pointer is cleared (or
-/// repointed at the re-run), and — if a re-run was requested (the `rerun` flag
-/// set by an enqueue that arrived while this job was building) — exactly ONE
-/// follow-up build is re-enqueued. The dedupe key is derived INSIDE Lua from the
-/// job hash's own `module`/`ref` (via the `dedupe_prefix`), so there is no
-/// separate HGET round-trip that could fail independently and leave the lock/slot
-/// wedged: a Redis-down completion fails as a WHOLE with the lock/slot unchanged,
-/// and the caller retries. Returns `{rerun_queued(0/1), new_job_id_or_empty}`.
-///
-/// IDEMPOTENT + FENCED: it acts only when the job's current `claim_token` matches
-/// the token this completion was claimed under (ARGV[8]). A duplicate/retried
-/// completion (token already cleared) or a stale completion from a worker whose
-/// job was reconciled + re-claimed under a NEW token is a safe no-op — it never
-/// double-frees the host slot (a SET SREM is a no-op the 2nd time anyway) and
-/// never frees another claim's lock/slot. On success the token is cleared so a
-/// later retry no-ops.
-/// KEYS: 1=jobhash 2=modulelock 3=hostset 4=zset 5=seq
-/// ARGV: 1=id 2=state 3=now 4=retain_secs 5=rerun_candidate_id 6=job_prefix
-///       7=dedupe_prefix 8=claim_token
-const COMPLETE_LUA: &str = r#"
--- FENCE: only the current claim may release. A mismatch (already released, or
--- reconciled + re-claimed under a new token) is a safe no-op.
-if redis.call('HGET', KEYS[1], 'claim_token') ~= ARGV[8] then
-  return {0, ''}
-end
--- Release the per-module lock (only if it still points to this job) and the host
--- slot FIRST, so a completed/failed build never wedges either. Clear the fence
--- token so a duplicate/retried completion no-ops.
-if redis.call('GET', KEYS[2])==ARGV[1] then redis.call('DEL', KEYS[2]) end
-redis.call('SREM', KEYS[3], ARGV[1])
-redis.call('HDEL', KEYS[1], 'claim_token')
--- Derive the dedupe key from the job's OWN module@ref (no external pre-read).
--- The hash may be gone (expired) → module/ref false → skip dedupe ops, but the
--- lock/slot release above still stands.
-local module=redis.call('HGET', KEYS[1], 'module')
-local ref=redis.call('HGET', KEYS[1], 'ref')
-local dedupe=false
-if module and ref then dedupe=ARGV[7]..module..'@'..ref end
-local rerun=redis.call('HGET', KEYS[1], 'rerun')
-if rerun=='1' then
-  -- Re-enqueue EXACTLY ONE follow-up build for the same module@ref, carrying the
-  -- (possibly upgraded) priority + heavy class forward. The dedupe pointer now
-  -- targets the NEW job (not deleted) so it stays the single owner for module@ref.
-  local prank=tonumber(redis.call('HGET', KEYS[1], 'prank') or '1')
-  local prio=redis.call('HGET', KEYS[1], 'priority') or 'normal'
-  local heavy=redis.call('HGET', KEYS[1], 'heavy') or '0'
-  local seq=redis.call('INCR', KEYS[5])
-  local nid=ARGV[5]
-  local njk=ARGV[6]..nid
-  redis.call('HSET', njk, 'module', module, 'ref', ref, 'prank', prank,
-    'priority', prio, 'heavy', heavy, 'seq', seq, 'requested_at', ARGV[3],
-    'coalesced', 1, 'state', 'queued')
-  if dedupe then redis.call('SET', dedupe, nid) end
-  local score=seq-(prank*1000000000000)
-  redis.call('ZADD', KEYS[4], score, nid)
-  redis.call('HSET', KEYS[1], 'state', ARGV[2], 'finished_at', ARGV[3])
-  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
-  return {1, nid}
-end
--- No re-run: clear the dedupe pointer (if still ours) and finalize.
-if dedupe and redis.call('GET', dedupe)==ARGV[1] then redis.call('DEL', dedupe) end
-redis.call('HSET', KEYS[1], 'state', ARGV[2], 'finished_at', ARGV[3])
-redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
-return {0, ''}
+/// FINALIZE: durable terminal-outcome marker, the FIRST step a worker takes when
+/// a build finishes — token-fenced, and it does NOT release the lock/slot. This
+/// is what lets the reconcile backstop tell "finished, just needs release" apart
+/// from "crashed mid-build", so a job whose worker finished successfully is never
+/// rebuilt. Idempotent (re-finalizing with the same token is a no-op-ish HSET).
+/// Returns `1` if applied, `0` on a token mismatch (stale/duplicate).
+/// KEYS: 1=jobhash   ARGV: 1=outcome(done/failed) 2=now 3=claim_token
+const FINALIZE_LUA: &str = r#"
+if redis.call('HGET', KEYS[1], 'claim_token') ~= ARGV[3] then return 0 end
+redis.call('HSET', KEYS[1], 'outcome', ARGV[1], 'finished_at', ARGV[2])
+return 1
 "#;
+
+/// Shared release body (Lua fragment). Frees the module lock + host slot, clears
+/// the fence token, re-enqueues exactly one re-run if flagged (else clears the
+/// dedupe pointer), and finalizes the hash state with the retain TTL. Requires
+/// these locals to be set by the including script: `jobkey lockkey hostkey
+/// zsetkey seqkey jobid nowv retainv rerun_id jobprefix dedupeprefix
+/// final_state`. Sets `rr_flag`(0/1) + `rr_id`. The dedupe key is derived from
+/// the job's OWN module@ref (no external pre-read), so release never wedges.
+const RELEASE_BODY: &str = r#"
+if redis.call('GET', lockkey)==jobid then redis.call('DEL', lockkey) end
+redis.call('SREM', hostkey, jobid)
+redis.call('HDEL', jobkey, 'claim_token')
+local module=redis.call('HGET', jobkey, 'module')
+local ref=redis.call('HGET', jobkey, 'ref')
+local dedupe=false
+if module and ref then dedupe=dedupeprefix..module..'@'..ref end
+local rerun=redis.call('HGET', jobkey, 'rerun')
+local rr_flag=0
+local rr_id=''
+if rerun=='1' then
+  local prank=tonumber(redis.call('HGET', jobkey, 'prank') or '1')
+  local prio=redis.call('HGET', jobkey, 'priority') or 'normal'
+  local heavy=redis.call('HGET', jobkey, 'heavy') or '0'
+  local seq=redis.call('INCR', seqkey)
+  rr_id=rerun_id
+  local njk=jobprefix..rr_id
+  redis.call('HSET', njk, 'module', module, 'ref', ref, 'prank', prank,
+    'priority', prio, 'heavy', heavy, 'seq', seq, 'requested_at', nowv,
+    'coalesced', 1, 'state', 'queued')
+  if dedupe then redis.call('SET', dedupe, rr_id) end
+  local score=seq-(prank*1000000000000)
+  redis.call('ZADD', zsetkey, score, rr_id)
+  rr_flag=1
+else
+  if dedupe and redis.call('GET', dedupe)==jobid then redis.call('DEL', dedupe) end
+end
+redis.call('HSET', jobkey, 'state', final_state, 'finished_at', nowv)
+redis.call('EXPIRE', jobkey, retainv)
+"#;
+
+/// RELEASE: free the lock/slot in ONE atomic, token-fenced, idempotent script.
+/// `final_state` comes from the durable `outcome` marker written by FINALIZE
+/// (defaulting to `done` if a caller releases without finalizing). A mismatched
+/// token (already released, or reconciled + re-claimed) is a safe no-op — it
+/// never double-frees the host slot (a SET SREM is a no-op the 2nd time) and
+/// never frees another claim's lock/slot. Returns `{rerun_queued(0/1), new_id}`.
+/// KEYS: 1=jobhash 2=modulelock 3=hostset 4=zset 5=seq
+/// ARGV: 1=id 2=now 3=retain_secs 4=rerun_candidate_id 5=job_prefix
+///       6=dedupe_prefix 7=claim_token
+fn release_lua() -> String {
+    format!(
+        r#"
+if redis.call('HGET', KEYS[1], 'claim_token') ~= ARGV[7] then return {{0, ''}} end
+local jobkey=KEYS[1]
+local lockkey=KEYS[2]
+local hostkey=KEYS[3]
+local zsetkey=KEYS[4]
+local seqkey=KEYS[5]
+local jobid=ARGV[1]
+local nowv=ARGV[2]
+local retainv=tonumber(ARGV[3])
+local rerun_id=ARGV[4]
+local jobprefix=ARGV[5]
+local dedupeprefix=ARGV[6]
+local final_state=redis.call('HGET', jobkey, 'outcome') or 'done'
+{RELEASE_BODY}
+return {{rr_flag, rr_id}}
+"#
+    )
+}
 
 /// Peek the top-N dispatchable jobs, flattened as 5 fields each:
 /// `id, module, ref, prank, heavy`.
@@ -503,41 +604,68 @@ end
 return out
 "#;
 
-/// Reconcile ONE (potentially stale) building job atomically: if it is still
-/// `building` and its claim is older than the lease, requeue it — free the module
-/// lock + host slot, clear the fence token (so the crashed/hung worker's eventual
-/// completion no-ops), and re-add it to the dispatch ZSET as `queued`. This is
-/// the crash/restart backstop: a worker that died mid-build can never permanently
-/// wedge the module lock + host slot. Returns `1` iff it requeued the job.
-/// KEYS: 1=jobhash 2=hostset 3=zset
-/// ARGV: 1=id 2=now 3=stale_ms 4=modulelock_prefix
-const RECONCILE_LUA: &str = r#"
-local st=redis.call('HGET', KEYS[1], 'state')
+/// Reconcile ONE `building` job atomically, distinguishing two cases via the
+/// durable `outcome` marker (written by FINALIZE):
+///   - `outcome` present ⇒ the worker FINISHED but never released (its completion
+///     retries were exhausted). RELEASE only — free the lock/slot, honor a re-run,
+///     record the terminal state — and do NOT rebuild (return `2`). This closes
+///     the double-BUILD hole in the self-heal path.
+///   - no `outcome` + claim older than the lease ⇒ CRASHED mid-build. Requeue —
+///     free the lock/slot, clear the token, re-add to the dispatch ZSET (return `1`).
+///   - otherwise (a live, fresh build) ⇒ untouched (return `0`).
+/// A crashed/finished worker can never permanently wedge the module lock + host
+/// slot, and a finished build is never rebuilt. The module lock + dedupe keys are
+/// derived in-Lua from the job's own module@ref via the prefix ARGVs.
+/// KEYS: 1=jobhash 2=hostset 3=zset 4=seq
+/// ARGV: 1=id 2=now 3=stale_ms 4=modulelock_prefix 5=retain 6=rerun_id
+///       7=job_prefix 8=dedupe_prefix
+fn reconcile_lua() -> String {
+    format!(
+        r#"
+local jobkey=KEYS[1]
+local hostkey=KEYS[2]
+local zsetkey=KEYS[3]
+local seqkey=KEYS[4]
+local jobid=ARGV[1]
+local nowv=ARGV[2]
+local st=redis.call('HGET', jobkey, 'state')
 if st~='building' then
-  -- Not building (already completed/gone) → make sure it isn't lingering in the
-  -- host set, then no-op.
-  redis.call('SREM', KEYS[2], ARGV[1])
+  -- Not building (already released/gone) → ensure it isn't lingering in the host
+  -- set, then no-op.
+  redis.call('SREM', hostkey, jobid)
   return 0
 end
-local started=tonumber(redis.call('HGET', KEYS[1], 'started_at') or '0')
-if (tonumber(ARGV[2]) - started) < tonumber(ARGV[3]) then
+local module=redis.call('HGET', jobkey, 'module')
+local lockkey=''
+if module then lockkey=ARGV[4]..module end
+local outcome=redis.call('HGET', jobkey, 'outcome')
+if outcome then
+  -- FINISHED but not yet released → release only, NO rebuild.
+  local retainv=tonumber(ARGV[5])
+  local rerun_id=ARGV[6]
+  local jobprefix=ARGV[7]
+  local dedupeprefix=ARGV[8]
+  local final_state=outcome
+{RELEASE_BODY}
+  return 2
+end
+-- No terminal marker: crashed/hung mid-build. Requeue only once stale.
+local started=tonumber(redis.call('HGET', jobkey, 'started_at') or '0')
+if (tonumber(nowv) - started) < tonumber(ARGV[3]) then
   return 0
 end
--- Stale: requeue.
-local module=redis.call('HGET', KEYS[1], 'module')
-if module then
-  local lock=ARGV[4]..module
-  if redis.call('GET', lock)==ARGV[1] then redis.call('DEL', lock) end
-end
-redis.call('SREM', KEYS[2], ARGV[1])
-redis.call('HDEL', KEYS[1], 'claim_token')
-redis.call('HSET', KEYS[1], 'state', 'queued')
-local seq=tonumber(redis.call('HGET', KEYS[1], 'seq') or '0')
-local prank=tonumber(redis.call('HGET', KEYS[1], 'prank') or '1')
+if lockkey~='' and redis.call('GET', lockkey)==jobid then redis.call('DEL', lockkey) end
+redis.call('SREM', hostkey, jobid)
+redis.call('HDEL', jobkey, 'claim_token')
+redis.call('HSET', jobkey, 'state', 'queued')
+local seq=tonumber(redis.call('HGET', jobkey, 'seq') or '0')
+local prank=tonumber(redis.call('HGET', jobkey, 'prank') or '1')
 local score=seq-(prank*1000000000000)
-redis.call('ZADD', KEYS[3], score, ARGV[1])
+redis.call('ZADD', zsetkey, score, jobid)
 return 1
-"#;
+"#
+    )
+}
 
 fn priority_from_rank(rank: i64) -> Priority {
     match rank {
@@ -574,6 +702,7 @@ impl QueueStore for RedisQueue {
         let (module, git_ref, label) =
             (req.module.clone(), req.git_ref.clone(), req.priority.as_str());
         let (heavy, ready) = (req.heavy as i64, req.ready as i64);
+        let held_ttl = held_intent_ttl_secs();
         let script = redis::Script::new(ENQUEUE_LUA);
         let out: Result<(String, i64), ()> = self
             .backend
@@ -591,6 +720,7 @@ impl QueueStore for RedisQueue {
                     .arg(label)
                     .arg(heavy)
                     .arg(ready)
+                    .arg(held_ttl)
                     .invoke_async::<_, (String, i64)>(&mut conn)
                     .await
             })
@@ -678,20 +808,37 @@ impl QueueStore for RedisQueue {
         }
     }
 
-    async fn complete(
+    async fn finalize(&self, job_id: &str, state: JobState, token: &str) -> Result<(), QueueError> {
+        let jk = job_key(job_id);
+        let (outcome, now, token) = (state.as_str().to_string(), now_ms(), token.to_string());
+        let script = redis::Script::new(FINALIZE_LUA);
+        let out: Result<i64, ()> = self
+            .backend
+            .with_conn(Namespace::Queue, |mut conn| async move {
+                script
+                    .key(jk)
+                    .arg(outcome)
+                    .arg(now)
+                    .arg(token)
+                    .invoke_async::<_, i64>(&mut conn)
+                    .await
+            })
+            .await;
+        out.map(|_| ()).map_err(|()| QueueError::Unavailable)
+    }
+
+    async fn release(
         &self,
         job_id: &str,
         module: &str,
         host: HostRole,
-        state: JobState,
         token: &str,
     ) -> Result<(), QueueError> {
         // ONE atomic script — no external pre-read. The dedupe key is derived
-        // INSIDE Lua from the job hash's own module@ref (via `dedupe_prefix`), so
-        // a Redis-down completion fails as a whole with the lock/slot unchanged
-        // (the scheduler retries) rather than half-releasing and wedging them.
-        // The module lock + host set keys come from the caller's own `module`/
-        // `host` args (no read needed for those).
+        // INSIDE Lua from the job hash's own module@ref, so a Redis-down release
+        // fails as a whole with the lock/slot unchanged (the caller retries)
+        // rather than half-releasing and wedging them. Lock + host set keys come
+        // from the caller's own `module`/`host` args (no read needed).
         let (jk, lock, hset, zset, seq) = (
             job_key(job_id),
             module_lock_key(module),
@@ -699,15 +846,10 @@ impl QueueStore for RedisQueue {
             zset_key(),
             seq_key(),
         );
-        let (id, st, now, retain) =
-            (job_id.to_string(), state.as_str().to_string(), now_ms(), retain_secs());
-        // Candidate id for a re-run job (used iff the completing job has the
-        // `rerun` flag set); globally unique like every enqueue-minted id.
+        let (id, now, retain) = (job_id.to_string(), now_ms(), retain_secs());
         let rerun_id = uuid::Uuid::new_v4().simple().to_string();
-        let jp = job_prefix();
-        let dedupe_prefix = dedupe_prefix();
-        let token = token.to_string();
-        let script = redis::Script::new(COMPLETE_LUA);
+        let (jp, dedupe_prefix, token) = (job_prefix(), dedupe_prefix(), token.to_string());
+        let script = redis::Script::new(&release_lua());
         let out: Result<(i64, String), ()> = self
             .backend
             .with_conn(Namespace::Queue, |mut conn| async move {
@@ -718,7 +860,6 @@ impl QueueStore for RedisQueue {
                     .key(zset)
                     .key(seq)
                     .arg(id)
-                    .arg(st)
                     .arg(now)
                     .arg(retain)
                     .arg(rerun_id)
@@ -732,11 +873,15 @@ impl QueueStore for RedisQueue {
         out.map(|_| ()).map_err(|()| QueueError::Unavailable)
     }
 
-    async fn reconcile(&self, stale_after: std::time::Duration) -> Result<Vec<String>, QueueError> {
+    async fn reconcile(
+        &self,
+        stale_after: std::time::Duration,
+    ) -> Result<ReconcileReport, QueueError> {
         let now = now_ms();
         let stale_ms = stale_after.as_millis() as i64;
-        let lock_prefix = module_lock_prefix();
-        let mut requeued = Vec::new();
+        let (lock_prefix, jp, dedupe_prefix, retain) =
+            (module_lock_prefix(), job_prefix(), dedupe_prefix(), retain_secs());
+        let mut report = ReconcileReport::default();
         for host in [HostRole::Primary, HostRole::Heavy] {
             // Enumerate the host's in-flight ids (the reconcile candidates). A
             // failed read degrades the whole sweep — nothing was mutated.
@@ -752,9 +897,18 @@ impl QueueStore for RedisQueue {
                 .await;
             let ids = ids.map_err(|()| QueueError::Unavailable)?;
             for id in ids {
-                let (jk, hset, zset) = (job_key(&id), host_set_key(host), zset_key());
-                let (id_a, lp) = (id.clone(), lock_prefix.clone());
-                let script = redis::Script::new(RECONCILE_LUA);
+                let (jk, hset, zset, seq) =
+                    (job_key(&id), host_set_key(host), zset_key(), seq_key());
+                let (id_a, lp, rerun_id) = (
+                    id.clone(),
+                    lock_prefix.clone(),
+                    uuid::Uuid::new_v4().simple().to_string(),
+                );
+                let (jp, dp) = (jp.clone(), dedupe_prefix.clone());
+                // The module lock + dedupe keys are derived in-Lua from the job
+                // hash's own module@ref via the prefix ARGVs (as `release` does),
+                // so only the 4 fixed keys are passed.
+                let script = redis::Script::new(&reconcile_lua());
                 let out: Result<i64, ()> = self
                     .backend
                     .with_conn(Namespace::Queue, |mut conn| async move {
@@ -762,22 +916,28 @@ impl QueueStore for RedisQueue {
                             .key(jk)
                             .key(hset)
                             .key(zset)
+                            .key(seq)
                             .arg(id_a)
                             .arg(now)
                             .arg(stale_ms)
                             .arg(lp)
+                            .arg(retain)
+                            .arg(rerun_id)
+                            .arg(jp)
+                            .arg(dp)
                             .invoke_async::<_, i64>(&mut conn)
                             .await
                     })
                     .await;
                 match out {
-                    Ok(1) => requeued.push(id),
+                    Ok(1) => report.requeued.push(id),
+                    Ok(2) => report.released.push(id),
                     Ok(_) => {}
                     Err(()) => return Err(QueueError::Unavailable),
                 }
             }
         }
-        Ok(requeued)
+        Ok(report)
     }
 
     async fn snapshot(&self) -> Result<QueueSnapshot, QueueError> {
@@ -841,6 +1001,9 @@ pub(crate) mod fake {
         started_at: i64,
         /// The fence token of the current claim (None when not building).
         claim_token: Option<String>,
+        /// Durable terminal-outcome marker (set by `finalize`; drives reconcile's
+        /// release-vs-rebuild decision).
+        outcome: Option<String>,
         /// A single pending re-run requested while this job was building.
         rerun: bool,
     }
@@ -856,9 +1019,10 @@ pub(crate) mod fake {
         next_token: u64,
         /// When set, every op behaves as an unreachable Redis (degradation test).
         down: bool,
-        /// The next N `complete` calls fail as Unavailable (simulate a Redis
-        /// outage at completion time only — claim/build already succeeded).
-        fail_completes: usize,
+        /// The next N `finalize` calls fail as Unavailable (completion-time outage).
+        fail_finalizes: usize,
+        /// The next N `release` calls fail as Unavailable (completion-time outage).
+        fail_releases: usize,
     }
 
     /// An offline `QueueStore` mirroring the Lua semantics exactly.
@@ -878,10 +1042,27 @@ pub(crate) mod fake {
             self.state.lock().unwrap().down = down;
         }
 
-        /// Make the next `n` `complete` calls fail as Unavailable (a completion-
-        /// time outage) so the retry path can be exercised.
-        pub(crate) fn fail_completes(&self, n: usize) {
-            self.state.lock().unwrap().fail_completes = n;
+        /// Make the next `n` `release` calls fail as Unavailable (a completion-
+        /// time outage AFTER finalize) so the retry / reconcile paths can be
+        /// exercised.
+        pub(crate) fn fail_releases(&self, n: usize) {
+            self.state.lock().unwrap().fail_releases = n;
+        }
+
+        /// Make the next `n` `finalize` calls fail as Unavailable.
+        pub(crate) fn fail_finalizes(&self, n: usize) {
+            self.state.lock().unwrap().fail_finalizes = n;
+        }
+
+        /// Whether a job carries a durable terminal-outcome marker (test helper).
+        pub(crate) fn has_outcome(&self, job_id: &str) -> bool {
+            self.state
+                .lock()
+                .unwrap()
+                .jobs
+                .get(job_id)
+                .map(|j| j.outcome.is_some())
+                .unwrap_or(false)
         }
 
         /// Back-date a building job's claim so a reconcile with a positive lease
@@ -932,6 +1113,57 @@ pub(crate) mod fake {
         seq - prank * 1_000_000_000_000
     }
 
+    /// The shared release body (mirrors `RELEASE_BODY` Lua): free the module lock
+    /// + host slot, clear the fence token, honor a re-run (else clear dedupe), set
+    /// the terminal state. Assumes the caller holds the state lock.
+    fn release_locked(s: &mut State, job_id: &str, module: &str, host: HostRole, final_state: &str) {
+        if s.module_lock.get(module).map(String::as_str) == Some(job_id) {
+            s.module_lock.remove(module);
+        }
+        if let Some(v) = s.host_inflight.get_mut(host.as_str()) {
+            v.retain(|id| id != job_id);
+        }
+        if let Some(j) = s.jobs.get_mut(job_id) {
+            j.claim_token = None;
+        }
+        let done = match s.jobs.get(job_id) {
+            Some(j) => (j.module.clone(), j.git_ref.clone(), j.prank, j.heavy, j.rerun),
+            None => return,
+        };
+        let (dmod, dref, dprank, dheavy, rerun) = done;
+        let dk = format!("{dmod}@{dref}");
+        if rerun {
+            // Re-enqueue EXACTLY one follow-up job for the same module@ref.
+            s.seq += 1;
+            let seq = s.seq;
+            s.next_id += 1;
+            let nid = format!("job-{}", s.next_id);
+            s.jobs.insert(
+                nid.clone(),
+                Job {
+                    module: dmod,
+                    git_ref: dref,
+                    prank: dprank,
+                    heavy: dheavy,
+                    seq,
+                    coalesced: 1,
+                    state: "queued".into(),
+                    host: None,
+                    started_at: 0,
+                    claim_token: None,
+                    outcome: None,
+                    rerun: false,
+                },
+            );
+            s.dedupe.insert(dk, nid);
+        } else if s.dedupe.get(&dk).map(String::as_str) == Some(job_id) {
+            s.dedupe.remove(&dk);
+        }
+        if let Some(j) = s.jobs.get_mut(job_id) {
+            j.state = final_state.to_string();
+        }
+    }
+
     #[async_trait]
     impl QueueStore for InMemoryQueue {
         async fn enqueue(&self, req: &JobRequest) -> Result<Enqueued, QueueError> {
@@ -962,10 +1194,13 @@ pub(crate) mod fake {
                         });
                     }
                     Some("building") => {
-                        // Already building: record a single idempotent re-run,
-                        // never a second job; still upgrade priority/heavy.
+                        // Already building: never a second job. Only a READY=true
+                        // request schedules a single idempotent re-run; a held
+                        // (ready=false) arrival records intent but does NOT.
                         let j = s.jobs.get_mut(&existing).unwrap();
-                        j.rerun = true;
+                        if req.ready {
+                            j.rerun = true;
+                        }
                         j.coalesced += 1;
                         if req.priority.rank() > j.prank {
                             j.prank = req.priority.rank();
@@ -998,6 +1233,7 @@ pub(crate) mod fake {
                     host: None,
                     started_at: 0,
                     claim_token: None,
+                    outcome: None,
                     rerun: false,
                 },
             );
@@ -1068,12 +1304,36 @@ pub(crate) mod fake {
             Ok(ClaimOutcome::Claimed { token })
         }
 
-        async fn complete(
+        async fn finalize(
+            &self,
+            job_id: &str,
+            state: JobState,
+            token: &str,
+        ) -> Result<(), QueueError> {
+            let mut s = self.state.lock().unwrap();
+            if s.down {
+                return Err(QueueError::Unavailable);
+            }
+            if s.fail_finalizes > 0 {
+                s.fail_finalizes -= 1;
+                return Err(QueueError::Unavailable);
+            }
+            // FENCE: only the current claim's worker may mark the outcome.
+            match s.jobs.get(job_id).and_then(|j| j.claim_token.clone()) {
+                Some(t) if t == token => {}
+                _ => return Ok(()),
+            }
+            if let Some(j) = s.jobs.get_mut(job_id) {
+                j.outcome = Some(state.as_str().to_string());
+            }
+            Ok(())
+        }
+
+        async fn release(
             &self,
             job_id: &str,
             module: &str,
             host: HostRole,
-            state: JobState,
             token: &str,
         ) -> Result<(), QueueError> {
             let mut s = self.state.lock().unwrap();
@@ -1082,8 +1342,8 @@ pub(crate) mod fake {
             }
             // Simulate a completion-time outage: the whole op fails, NOTHING is
             // released (mirrors the atomic Lua failing as a whole).
-            if s.fail_completes > 0 {
-                s.fail_completes -= 1;
+            if s.fail_releases > 0 {
+                s.fail_releases -= 1;
                 return Err(QueueError::Unavailable);
             }
             // FENCE: only the current claim token may release; a mismatch (already
@@ -1092,98 +1352,64 @@ pub(crate) mod fake {
                 Some(t) if t == token => {}
                 _ => return Ok(()),
             }
-            if s.module_lock.get(module).map(String::as_str) == Some(job_id) {
-                s.module_lock.remove(module);
-            }
-            if let Some(v) = s.host_inflight.get_mut(host.as_str()) {
-                v.retain(|id| id != job_id);
-            }
-            if let Some(j) = s.jobs.get_mut(job_id) {
-                j.claim_token = None;
-            }
-            // Capture the completing job's identity + whether a re-run is pending.
-            let done = match s.jobs.get(job_id) {
-                Some(j) => (
-                    j.module.clone(),
-                    j.git_ref.clone(),
-                    j.prank,
-                    j.heavy,
-                    j.rerun,
-                ),
-                None => {
-                    return Ok(());
-                }
-            };
-            let (dmod, dref, dprank, dheavy, rerun) = done;
-            let dk = format!("{dmod}@{dref}");
-            if rerun {
-                // Re-enqueue EXACTLY one follow-up job for the same module@ref,
-                // carrying the upgraded priority/heavy forward; dedupe now points
-                // to the new job (never two jobs for one module@ref).
-                s.seq += 1;
-                let seq = s.seq;
-                s.next_id += 1;
-                let nid = format!("job-{}", s.next_id);
-                s.jobs.insert(
-                    nid.clone(),
-                    Job {
-                        module: dmod,
-                        git_ref: dref,
-                        prank: dprank,
-                        heavy: dheavy,
-                        seq,
-                        coalesced: 1,
-                        state: "queued".into(),
-                        host: None,
-                        started_at: 0,
-                        claim_token: None,
-                        rerun: false,
-                    },
-                );
-                s.dedupe.insert(dk, nid);
-            } else if s.dedupe.get(&dk).map(String::as_str) == Some(job_id) {
-                s.dedupe.remove(&dk);
-            }
-            if let Some(j) = s.jobs.get_mut(job_id) {
-                j.state = state.as_str().into();
-            }
+            let final_state = s
+                .jobs
+                .get(job_id)
+                .and_then(|j| j.outcome.clone())
+                .unwrap_or_else(|| "done".into());
+            release_locked(&mut s, job_id, module, host, &final_state);
             Ok(())
         }
 
         async fn reconcile(
             &self,
             stale_after: std::time::Duration,
-        ) -> Result<Vec<String>, QueueError> {
+        ) -> Result<ReconcileReport, QueueError> {
             let mut s = self.state.lock().unwrap();
             if s.down {
                 return Err(QueueError::Unavailable);
             }
             let now = now_ms();
             let stale_ms = stale_after.as_millis() as i64;
-            // Snapshot the building jobs that are stale.
-            let stale: Vec<(String, String)> = s
+            // Snapshot the building candidates + whether each finished (marker).
+            let building: Vec<(String, String, Option<HostRole>, Option<String>, i64)> = s
                 .jobs
                 .iter()
-                .filter(|(_, j)| j.state == "building" && (now - j.started_at) >= stale_ms)
-                .map(|(id, j)| (id.clone(), j.module.clone()))
+                .filter(|(_, j)| j.state == "building")
+                .map(|(id, j)| {
+                    (
+                        id.clone(),
+                        j.module.clone(),
+                        j.host,
+                        j.outcome.clone(),
+                        j.started_at,
+                    )
+                })
                 .collect();
-            let mut requeued = Vec::new();
-            for (id, module) in stale {
-                // Free the module lock (only if it's ours) + the host slot.
-                if s.module_lock.get(&module).map(String::as_str) == Some(id.as_str()) {
-                    s.module_lock.remove(&module);
+            let mut report = ReconcileReport::default();
+            for (id, module, host, outcome, started) in building {
+                let host = host.unwrap_or(HostRole::Primary);
+                if let Some(outcome) = outcome {
+                    // FINISHED but not released → release only, NO rebuild.
+                    release_locked(&mut s, &id, &module, host, &outcome);
+                    report.released.push(id);
+                } else if (now - started) >= stale_ms {
+                    // Crashed mid-build → requeue.
+                    if s.module_lock.get(&module).map(String::as_str) == Some(id.as_str()) {
+                        s.module_lock.remove(&module);
+                    }
+                    for v in s.host_inflight.values_mut() {
+                        v.retain(|x| x != &id);
+                    }
+                    if let Some(j) = s.jobs.get_mut(&id) {
+                        j.state = "queued".into();
+                        j.host = None;
+                        j.claim_token = None; // fence: a late completion no-ops
+                    }
+                    report.requeued.push(id);
                 }
-                for v in s.host_inflight.values_mut() {
-                    v.retain(|x| x != &id);
-                }
-                if let Some(j) = s.jobs.get_mut(&id) {
-                    j.state = "queued".into();
-                    j.host = None;
-                    j.claim_token = None; // fence: the crashed worker's completion no-ops
-                }
-                requeued.push(id);
             }
-            Ok(requeued)
+            Ok(report)
         }
 
         async fn snapshot(&self) -> Result<QueueSnapshot, QueueError> {
@@ -1454,8 +1680,9 @@ mod tests {
         assert_eq!(q.inflight_count(HostRole::Primary), 1);
         // Make the claim look old (crashed/hung worker), then reconcile.
         q.backdate_started(&j.job_id, 60_000);
-        let requeued = q.reconcile(Duration::from_secs(1)).await.unwrap();
-        assert_eq!(requeued, vec![j.job_id.clone()]);
+        let report = q.reconcile(Duration::from_secs(1)).await.unwrap();
+        assert_eq!(report.requeued, vec![j.job_id.clone()]);
+        assert!(report.released.is_empty(), "a crashed build is requeued, not 'released'");
         // Module lock + host slot freed; the job is dispatchable again.
         assert_eq!(q.inflight_count(HostRole::Primary), 0);
         assert_eq!(q.state_of(&j.job_id).as_deref(), Some("queued"));
@@ -1470,10 +1697,57 @@ mod tests {
         let j = q.enqueue(&req("m1", "r1", Priority::Normal, false)).await.unwrap();
         claim_ok(&q, &j.job_id, "m1", HostRole::Primary, 1).await;
         // Just claimed → not stale under a 1h lease → untouched.
-        let requeued = q.reconcile(Duration::from_secs(3600)).await.unwrap();
-        assert!(requeued.is_empty());
+        let report = q.reconcile(Duration::from_secs(3600)).await.unwrap();
+        assert!(report.requeued.is_empty() && report.released.is_empty());
         assert_eq!(q.state_of(&j.job_id).as_deref(), Some("building"));
         assert_eq!(q.inflight_count(HostRole::Primary), 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_releases_a_finished_but_unreleased_job_without_rebuild() {
+        // C: a worker FINISHED (finalize wrote the marker) but its release never
+        // landed (Redis outage). Reconcile must RELEASE it — never requeue/rebuild.
+        let q = InMemoryQueue::new();
+        let j = q.enqueue(&req("m1", "r1", Priority::Normal, false)).await.unwrap();
+        let tok = claim_ok(&q, &j.job_id, "m1", HostRole::Primary, 1).await;
+        // The build finished: the worker durably records the terminal outcome...
+        q.finalize(&j.job_id, JobState::Done, &tok).await.unwrap();
+        assert!(q.has_outcome(&j.job_id));
+        // ...but the release is stuck (make it look old, as if retries were spent).
+        q.backdate_started(&j.job_id, 60_000);
+        let report = q.reconcile(Duration::from_secs(1)).await.unwrap();
+        assert_eq!(report.released, vec![j.job_id.clone()], "finished job is released");
+        assert!(report.requeued.is_empty(), "a FINISHED job must NEVER be requeued/rebuilt");
+        // Lock + slot freed, terminal state recorded, nothing re-dispatchable.
+        assert_eq!(q.inflight_count(HostRole::Primary), 0);
+        assert_eq!(q.state_of(&j.job_id).as_deref(), Some("done"));
+        assert_eq!(q.peek(10).await.unwrap().len(), 0, "no rebuild was queued");
+    }
+
+    #[tokio::test]
+    async fn ready_false_while_building_does_not_schedule_a_rerun() {
+        // A: a held (ready=false) arrival during a build must NOT become a
+        // dispatchable re-run; only a later ready=true schedules one.
+        let q = InMemoryQueue::new();
+        let a = q.enqueue(&req("chord", "abc", Priority::Normal, false)).await.unwrap();
+        let tok = claim_ok(&q, &a.job_id, "chord", HostRole::Primary, 1).await;
+        // ready=false while building → coalesces intent, but NO rerun.
+        let held = JobRequest { ready: false, ..req("chord", "abc", Priority::Normal, false) };
+        let b = q.enqueue(&held).await.unwrap();
+        assert_eq!(b.job_id, a.job_id);
+        assert!(!b.created);
+        q.complete(&a.job_id, "chord", HostRole::Primary, JobState::Done, &tok).await.unwrap();
+        assert_eq!(q.peek(10).await.unwrap().len(), 0, "ready=false must NOT schedule a re-run");
+
+        // Now a ready=true while building DOES schedule exactly one re-run.
+        let c = q.enqueue(&req("chord", "abc", Priority::Normal, false)).await.unwrap();
+        let tok2 = claim_ok(&q, &c.job_id, "chord", HostRole::Primary, 1).await;
+        q.enqueue(&JobRequest { ready: false, ..req("chord", "abc", Priority::Normal, false) })
+            .await
+            .unwrap();
+        q.enqueue(&req("chord", "abc", Priority::Normal, false)).await.unwrap(); // ready=true
+        q.complete(&c.job_id, "chord", HostRole::Primary, JobState::Done, &tok2).await.unwrap();
+        assert_eq!(q.peek(10).await.unwrap().len(), 1, "a ready=true arrival schedules one re-run");
     }
 
     #[tokio::test]
@@ -1530,6 +1804,196 @@ mod tests {
         assert_eq!(Priority::parse("weird"), Priority::Normal);
         assert!(Priority::High.rank() > Priority::Normal.rank());
         assert!(Priority::Normal.rank() > Priority::Low.rank());
+    }
+
+    // ── F: real-Redis Lua contract test ────────────────────────────────────
+    // Exercises the ACTUAL Lua scripts against an EPHEMERAL redis-server bound to
+    // loopback on an unused port (flushed, torn down after). Auto-SKIPS cleanly
+    // when `redis-server` is not installed (e.g. a Redis-less CI/dev box) rather
+    // than failing. NEVER touches the prod Redis. The loopback literal here is
+    // test-only harness wiring, not production infra config.
+
+    struct EphemeralRedis {
+        child: std::process::Child,
+        port: u16,
+    }
+    impl EphemeralRedis {
+        fn start() -> Option<Self> {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .ok()?
+                .local_addr()
+                .ok()?
+                .port();
+            let child = std::process::Command::new("redis-server")
+                .args([
+                    "--port",
+                    &port.to_string(),
+                    "--bind",
+                    "127.0.0.1",
+                    "--save",
+                    "",
+                    "--appendonly",
+                    "no",
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok()?; // binary missing ⇒ Err ⇒ None ⇒ clean skip
+            for _ in 0..100 {
+                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    return Some(Self { child, port });
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let mut c = child;
+            let _ = c.kill();
+            None
+        }
+        fn url(&self) -> String {
+            format!("redis://127.0.0.1:{}", self.port)
+        }
+    }
+    impl Drop for EphemeralRedis {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    async fn raw<T: redis::FromRedisValue>(b: &RedisBackend, cmd: &str, args: &[String]) -> T {
+        let (cmd, args) = (cmd.to_string(), args.to_vec());
+        b.with_conn(Namespace::Queue, |mut conn| async move {
+            let mut c = redis::cmd(&cmd);
+            for a in &args {
+                c.arg(a);
+            }
+            c.query_async::<_, T>(&mut conn).await
+        })
+        .await
+        .expect("raw redis cmd")
+    }
+
+    #[tokio::test]
+    async fn redis_lua_contract_against_ephemeral_server() {
+        let Some(server) = EphemeralRedis::start() else {
+            eprintln!("SKIP redis_lua_contract: redis-server not installed");
+            return;
+        };
+        let backend =
+            RedisBackend::build(&server.url(), None, 0, 1, Duration::from_millis(500)).unwrap();
+        assert!(backend.ping().await, "ephemeral redis must answer PING");
+        let _: () = raw(&backend, "FLUSHALL", &[]).await;
+        let q = RedisQueue::new(backend.clone());
+
+        let mk = |m: &str, r: &str, p: Priority, heavy: bool, ready: bool| JobRequest {
+            module: m.into(),
+            git_ref: r.into(),
+            priority: p,
+            heavy,
+            ready,
+        };
+
+        // 1) Dedupe/coalesce + monotonic priority bump (real ENQUEUE_LUA).
+        let a = q.enqueue(&mk("chord", "abc", Priority::Normal, false, true)).await.unwrap();
+        let b = q.enqueue(&mk("chord", "abc", Priority::High, false, true)).await.unwrap();
+        assert!(a.created && !b.created && a.job_id == b.job_id);
+        let queued = q.peek(10).await.unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].priority, Priority::High, "priority bumped in-place");
+
+        // 2) Keys live under the Namespace::Queue prefix in the durable DB 0.
+        let keys: Vec<String> = raw(&backend, "KEYS", &["queue:*".into()]).await;
+        assert!(!keys.is_empty() && keys.iter().all(|k| k.starts_with("queue:")));
+
+        // 3) Claim writes a fence token + module lock; a 2nd claim is ModuleBusy.
+        let tok = match q.claim(&a.job_id, "chord", HostRole::Primary, 1).await.unwrap() {
+            ClaimOutcome::Claimed { token } => token,
+            o => panic!("{o:?}"),
+        };
+        let j2 = q.enqueue(&mk("chord", "z", Priority::Normal, false, true)).await.unwrap();
+        assert_eq!(
+            q.claim(&j2.job_id, "chord", HostRole::Primary, 4).await.unwrap(),
+            ClaimOutcome::ModuleBusy
+        );
+
+        // 4) ready=true while building → exactly one re-run after finalize+release.
+        q.enqueue(&mk("chord", "abc", Priority::Normal, false, true)).await.unwrap();
+        q.finalize(&a.job_id, JobState::Done, &tok).await.unwrap();
+        q.release(&a.job_id, "chord", HostRole::Primary, &tok).await.unwrap();
+        let after = q.peek(10).await.unwrap();
+        let rerun = after.iter().find(|j| j.module == "chord" && j.git_ref == "abc").unwrap();
+        assert_ne!(rerun.job_id, a.job_id, "re-run is a fresh job");
+
+        // 5) reconcile: a CRASHED build (no outcome, stale) is requeued.
+        let rtok = match q.claim(&rerun.job_id, "chord", HostRole::Primary, 1).await.unwrap() {
+            ClaimOutcome::Claimed { token } => token,
+            o => panic!("{o:?}"),
+        };
+        let job_key = Namespace::Queue.key(&format!("job:{}", rerun.job_id));
+        let _: () = raw(&backend, "HSET", &[job_key.clone(), "started_at".into(), "1".into()]).await;
+        let rep = q.reconcile(Duration::from_secs(1)).await.unwrap();
+        assert!(rep.requeued.contains(&rerun.job_id) && rep.released.is_empty());
+        // The stale worker's late completion (old token) is fenced off.
+        q.complete(&rerun.job_id, "chord", HostRole::Primary, JobState::Done, &rtok).await.unwrap();
+
+        // 6) reconcile: a FINISHED build (outcome marker, stale) is released, NOT rebuilt.
+        let ftok = match q.claim(&rerun.job_id, "chord", HostRole::Primary, 1).await.unwrap() {
+            ClaimOutcome::Claimed { token } => token,
+            o => panic!("{o:?}"),
+        };
+        q.finalize(&rerun.job_id, JobState::Done, &ftok).await.unwrap();
+        let _: () = raw(&backend, "HSET", &[job_key.clone(), "started_at".into(), "1".into()]).await;
+        let rep = q.reconcile(Duration::from_secs(1)).await.unwrap();
+        assert!(
+            rep.released.contains(&rerun.job_id) && rep.requeued.is_empty(),
+            "a FINISHED build is released, never requeued/rebuilt"
+        );
+
+        // 7) Held-intent TTL: a ready=false intent (+ its dedupe) expires; a later
+        //    ready=true promotion PERSISTs both (durable).
+        let held = q.enqueue(&mk("harmony", "h1", Priority::Normal, false, false)).await.unwrap();
+        let held_key = Namespace::Queue.key(&format!("job:{}", held.job_id));
+        let dedupe_key = Namespace::Queue.key("dedupe:harmony@h1");
+        let ttl_job: i64 = raw(&backend, "TTL", &[held_key.clone()]).await;
+        let ttl_dedupe: i64 = raw(&backend, "TTL", &[dedupe_key.clone()]).await;
+        assert!(ttl_job > 0 && ttl_dedupe > 0, "held intent + dedupe must have a TTL");
+        q.enqueue(&mk("harmony", "h1", Priority::Normal, false, true)).await.unwrap(); // promote
+        let ttl_job: i64 = raw(&backend, "TTL", &[held_key]).await;
+        let ttl_dedupe: i64 = raw(&backend, "TTL", &[dedupe_key]).await;
+        assert_eq!(ttl_job, -1, "promoted job must be persistent (durable)");
+        assert_eq!(ttl_dedupe, -1, "promoted dedupe pointer must be persistent");
+    }
+
+    #[test]
+    fn queue_namespace_binds_to_the_durable_noeviction_db() {
+        // E: the durable-queue criterion must be enforced in code. Namespace::Queue
+        // is a DURABLE namespace, and the shared backend routes it to the durable
+        // logical DB (DB0, server-side `noeviction`) — distinct from the volatile
+        // DB — so a queued/in-flight build can never be evicted under pressure.
+        assert!(
+            Namespace::Queue.is_durable(),
+            "the compiler job queue namespace MUST be durable (noeviction)"
+        );
+        // Build an offline backend (durable DB 0, volatile DB 1 — the defaults).
+        let backend = RedisBackend::build(
+            "redis://127.0.0.1:6379",
+            None,
+            0,
+            1,
+            std::time::Duration::from_millis(200),
+        )
+        .expect("offline construction");
+        assert_eq!(
+            backend.db_for(Namespace::Queue),
+            0,
+            "Queue must resolve to the durable DB"
+        );
+        // And it must NOT share the volatile DB that the LRU-evicted namespaces use.
+        assert_ne!(
+            backend.db_for(Namespace::Queue),
+            backend.db_for(Namespace::Ratelimit),
+            "the durable queue must not live in the volatile (evictable) DB"
+        );
     }
 
     #[test]

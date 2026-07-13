@@ -72,6 +72,11 @@ const BUILD_ALLOWED_SOURCE_ROOTS: &str = "BUILD_ALLOWED_SOURCE_ROOTS";
 
 const DEFAULT_TARGET_TRIPLE: &str = "x86_64-unknown-linux-musl";
 
+/// The longest a single `compiler_build` may run (the local/primary cargo build
+/// timeout; the remote/heavy path is shorter). The scheduler's stale-reconcile
+/// lease floor is derived from this so a genuinely-live build is never reconciled.
+pub const MAX_BUILD_TIMEOUT_SECS: u64 = 3600;
+
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
@@ -761,7 +766,7 @@ impl RustTool for CompilerBuild {
                 &scope_argv,
                 Some(&local_source_dir),
                 &secret_env,
-                Duration::from_secs(3600),
+                Duration::from_secs(MAX_BUILD_TIMEOUT_SECS),
                 &redact,
                 None,
             )
@@ -1186,24 +1191,49 @@ fn validate_source_dir(
 // back into `compiler_build` (`invoke_build`).
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Best-effort, request-time guess of whether a build WOULD land on the heavy
-/// host, mirroring `compiler_build`'s `host::select_role` heuristic — used only
-/// to tag the queued job so the scheduler can window-gate it. The AUTHORITATIVE
-/// host selection still happens in `compiler_build` at dispatch (which also
-/// enforces the required config); a missing/unparsable threshold here simply
-/// defaults the tag to "not heavy" rather than failing the enqueue.
+/// Request-time classification of whether a build must be treated as HEAVY
+/// (heavy host ⇒ scheduler window + heavy-cap gated). It tags the queued job so
+/// the scheduler gates it; `compiler_build` still does the authoritative host
+/// selection at dispatch.
+///
+/// SAFE-BY-DEFAULT (AC-6): a build is treated as `heavy` UNLESS it can be
+/// POSITIVELY determined small. "Positively small" means an `auto`, non-`fast`
+/// request whose module has NO known peak (⇒ `compiler_build` authoritatively
+/// picks the primary) or a KNOWN peak at/under a KNOWN threshold. Any
+/// ambiguous/unreadable case (unparsable peak or threshold, or a known peak with
+/// no configured threshold) falls to the SAFE side — heavy — so a possibly-heavy
+/// build is never run immediately on the primary, skipping the window/cap.
 fn request_is_heavy(req: HostRequest, module: &str, fast: bool) -> bool {
     match req {
         HostRequest::Primary => false,
         HostRequest::Heavy => true,
-        HostRequest::Auto => {
-            if fast {
-                return true;
-            }
-            let peak = host::module_peak_mb(module).ok().flatten();
-            let threshold = host::heavy_threshold_mb().ok().flatten();
-            matches!((peak, threshold), (Some(p), Some(t)) if p > t)
-        }
+        HostRequest::Auto => classify_heavy_auto(
+            fast,
+            // `.ok()` maps a read ERROR (present-but-unparsable) to `None`
+            // (unknown ⇒ safe/heavy), and a successful read to `Some(Option<u64>)`.
+            host::module_peak_mb(module).ok(),
+            host::heavy_threshold_mb().ok(),
+        ),
+    }
+}
+
+/// Pure core of [`request_is_heavy`] for an `auto` request (the test entry
+/// point). `peak`/`threshold` use `Some(inner)` for a successful read (`inner`
+/// itself `None` = "not configured") and the OUTER `None` for an unreadable
+/// value. Fails to the SAFE side (heavy) on anything not positively small.
+fn classify_heavy_auto(fast: bool, peak: Option<Option<u64>>, threshold: Option<Option<u64>>) -> bool {
+    if fast {
+        return true;
+    }
+    match (peak, threshold) {
+        // No known peak (read OK, unset) ⇒ compiler_build authoritatively picks
+        // the primary — positively small.
+        (Some(None), _) => false,
+        // Both known ⇒ authoritative comparison (matches select_role).
+        (Some(Some(p)), Some(Some(t))) => p > t,
+        // Anything else — unreadable peak/threshold, or a known peak with no
+        // configured threshold — is ambiguous ⇒ SAFE side: heavy (window+cap gated).
+        _ => true,
     }
 }
 
@@ -1960,5 +1990,27 @@ mod tests {
         assert_eq!(p["type"], "object");
         assert_eq!(p["required"][0], "module");
         assert_eq!(p["required"][1], "ref");
+    }
+
+    #[test]
+    fn heavy_classification_fails_to_the_safe_side_when_unknown() {
+        // fast → always heavy.
+        assert!(classify_heavy_auto(true, Some(None), Some(None)));
+        // No known peak (read OK, unset) → positively small.
+        assert!(!classify_heavy_auto(false, Some(None), Some(Some(100))));
+        assert!(!classify_heavy_auto(false, Some(None), None));
+        // Both known → authoritative comparison.
+        assert!(classify_heavy_auto(false, Some(Some(200)), Some(Some(100))));
+        assert!(!classify_heavy_auto(false, Some(Some(50)), Some(Some(100))));
+        // UNKNOWN cases must route to the SAFE (heavy/gated) side, NOT primary:
+        // - unreadable peak (present-but-unparsable → None)
+        assert!(classify_heavy_auto(false, None, Some(Some(100))));
+        // - unreadable threshold
+        assert!(classify_heavy_auto(false, Some(Some(50)), None));
+        // - a known peak but NO configured threshold (ambiguous)
+        assert!(classify_heavy_auto(false, Some(Some(50)), Some(None)));
+        // Explicit host requests are honored as-is.
+        assert!(request_is_heavy(HostRequest::Heavy, "m", false));
+        assert!(!request_is_heavy(HostRequest::Primary, "m", false));
     }
 }
