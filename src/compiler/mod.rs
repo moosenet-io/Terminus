@@ -62,6 +62,10 @@ const BUILD_HEAVY_LOCAL_TARGET_DIR: &str = "BUILD_HEAVY_LOCAL_TARGET_DIR";
 /// where the remote build's env-file lives under the target dir). Defaults to
 /// `BUILD_DATASET_RELAY_ROOT`, else the local `BUILD_DATASET_ROOT`.
 const BUILD_HEAVY_DATASET_ROOT: &str = "BUILD_HEAVY_DATASET_ROOT";
+/// Env var: extra `:`-separated roots a caller-supplied `source_dir` may live
+/// under, ON TOP OF the always-allowed `${BUILD_DATASET_ROOT}/src` tree. Lets an
+/// operator permit a dedicated staging mount without opening arbitrary paths.
+const BUILD_ALLOWED_SOURCE_ROOTS: &str = "BUILD_ALLOWED_SOURCE_ROOTS";
 
 const DEFAULT_TARGET_TRIPLE: &str = "x86_64-unknown-linux-musl";
 
@@ -234,13 +238,21 @@ fn built_bin_rel(triple: &str, profile: &str, bin: &str) -> PathBuf {
 /// (S7). Plain substring replace of each raw value; empty values are skipped;
 /// an empty `secrets` set is a no-op. This helper never logs the secret itself.
 fn redact_secrets(text: &str, secrets: &[String]) -> String {
+    // Replace LONGEST values first: if one secret is a substring of another (the
+    // `SCCACHE_REDIS_PASSWORD` value is embedded in the full `SCCACHE_REDIS` URL),
+    // redacting the short one first would break the longer match and leak the
+    // URL's non-password parts. Longest-first guarantees the full value is
+    // scrubbed before any of its substrings.
+    let mut ordered: Vec<&str> = secrets
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+        .collect();
+    ordered.sort_by_key(|s| std::cmp::Reverse(s.len()));
     let mut out = text.to_string();
-    for s in secrets {
-        if s.is_empty() {
-            continue;
-        }
-        if out.contains(s.as_str()) {
-            out = out.replace(s.as_str(), "<redacted>");
+    for s in ordered {
+        if out.contains(s) {
+            out = out.replace(s, "<redacted>");
         }
     }
     out
@@ -440,9 +452,18 @@ impl RustTool for CompilerBuild {
 
         // The local source stage (staged on the shared NFS share is fine — it's a
         // source stage, not the live target). Also the rsync source for a remote
-        // build.
+        // build. A caller-supplied `source_dir` is a FULL PATH (not a segment), so
+        // it is validated by CONTAINMENT — it must lexically resolve inside an
+        // allowed root (the dataset `src` tree, plus any `BUILD_ALLOWED_SOURCE_ROOTS`)
+        // BEFORE it is used for current_dir / --manifest-path / rsync, so an
+        // absolute-elsewhere or `../`-escaping override can't build/sync source
+        // outside the dataset. The default staged path is already safe.
         let local_source_dir = match args.get("source_dir").and_then(Value::as_str) {
-            Some(s) => PathBuf::from(s),
+            Some(s) => {
+                let sd = PathBuf::from(s);
+                validate_source_dir(&sd, &root)?;
+                sd
+            }
             None => root.join("src").join(&module).join(&git_ref),
         };
 
@@ -694,10 +715,13 @@ impl RustTool for CompilerBuild {
         validate_segment("channel", channel)?;
         let published = if let Some(relay_host) = env_nonempty(BUILD_DATASET_RELAY_HOST) {
             // Interim: relay-publish over a single hop to a host with the dataset RW.
+            // The plan bundles BOTH the binary and its `.sha256` sidecar so the
+            // relayed artifact is verifiable by the updater (never binary-only).
             let remote_root =
                 env_nonempty(BUILD_DATASET_RELAY_ROOT).unwrap_or_else(|| root_str.clone());
             let sha = publish::sha256_file(&built_bin).await?;
-            let relay_argv = publish::render_relay_argv(
+            let sidecar_tmp = built_bin.with_file_name(format!("{bin}.sha256"));
+            let plan = publish::render_relay_plan(
                 &relay_host,
                 &remote_root,
                 &module,
@@ -706,50 +730,40 @@ impl RustTool for CompilerBuild {
                 &triple,
                 &bin,
                 &built_bin,
+                &sidecar_tmp,
             );
-            run(
-                &relay_argv,
+            // Stage the sidecar locally, then relay the binary + sidecar.
+            tokio::fs::write(&sidecar_tmp, &plan.sidecar_body)
+                .await
+                .map_err(|e| ToolError::Execution(format!("write sidecar: {e}")))?;
+            let bin_res = run(
+                &plan.binary_argv,
                 None,
                 &BTreeMap::new(),
                 Duration::from_secs(600),
                 &redact,
             )
-            .await?;
-            // Relay the sidecar too.
-            let sidecar_tmp = built_bin.with_file_name(format!("{bin}.sha256"));
-            tokio::fs::write(&sidecar_tmp, publish::sidecar_contents(&sha, &bin))
+            .await;
+            let sc_res = if bin_res.is_ok() {
+                run(
+                    &plan.sidecar_argv,
+                    None,
+                    &BTreeMap::new(),
+                    Duration::from_secs(120),
+                    &redact,
+                )
                 .await
-                .map_err(|e| ToolError::Execution(format!("write sidecar: {e}")))?;
-            let sidecar_relay = publish::render_relay_argv(
-                &relay_host,
-                &remote_root,
-                &module,
-                channel,
-                &sha,
-                &triple,
-                &format!("{bin}.sha256"),
-                &sidecar_tmp,
-            );
-            run(
-                &sidecar_relay,
-                None,
-                &BTreeMap::new(),
-                Duration::from_secs(120),
-                &redact,
-            )
-            .await?;
+            } else {
+                Ok(String::new())
+            };
+            // Clean up the local staging sidecar regardless of outcome.
+            let _ = tokio::fs::remove_file(&sidecar_tmp).await;
+            bin_res?;
+            sc_res?;
             publish::Published {
                 sha256: sha.clone(),
-                artifact_path: PathBuf::from(&remote_root).join(publish::artifact_rel_path(
-                    &module, channel, &sha, &triple, &bin,
-                )),
-                sha256_path: PathBuf::from(&remote_root).join(publish::artifact_rel_path(
-                    &module,
-                    channel,
-                    &sha,
-                    &triple,
-                    &format!("{bin}.sha256"),
-                )),
+                artifact_path: plan.remote_binary,
+                sha256_path: plan.remote_sidecar,
                 relayed: true,
             }
         } else {
@@ -854,6 +868,48 @@ fn validate_git_ref(value: &str) -> Result<(), ToolError> {
         validate_segment("ref component", comp)?;
     }
     Ok(())
+}
+
+/// The allowed roots a caller-supplied `source_dir` may resolve under: always
+/// `${BUILD_DATASET_ROOT}/src`, plus any `:`-separated `BUILD_ALLOWED_SOURCE_ROOTS`.
+fn allowed_source_roots(dataset_root: &std::path::Path) -> Vec<PathBuf> {
+    let mut roots = vec![dataset_root.join("src")];
+    if let Some(extra) = env_nonempty(BUILD_ALLOWED_SOURCE_ROOTS) {
+        for r in extra.split(':') {
+            let r = r.trim();
+            if !r.is_empty() {
+                roots.push(PathBuf::from(r));
+            }
+        }
+    }
+    roots
+}
+
+/// Validate a caller-supplied `source_dir` (a FULL PATH, not a segment) by
+/// CONTAINMENT: it must lexically resolve (no filesystem access) to a path inside
+/// one of the [`allowed_source_roots`]. Rejects an absolute path elsewhere or a
+/// `../`-escaping override, so the build/relay never touches source outside the
+/// dataset. Checked before `source_dir` is used for current_dir / --manifest-path
+/// / rsync.
+fn validate_source_dir(
+    source_dir: &std::path::Path,
+    dataset_root: &std::path::Path,
+) -> Result<(), ToolError> {
+    let roots = allowed_source_roots(dataset_root);
+    if roots.iter().any(|root| scope::is_within(source_dir, root)) {
+        return Ok(());
+    }
+    Err(ToolError::InvalidArgument(format!(
+        "source_dir ({}) resolves outside the allowed source roots ({}); a \
+         caller-supplied source path must stay within the dataset src tree \
+         (set BUILD_ALLOWED_SOURCE_ROOTS to permit an additional staging root)",
+        source_dir.display(),
+        roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
 }
 
 /// Register the `compiler_*` tool surface on the registry.
@@ -1118,6 +1174,47 @@ mod tests {
         // Empty secret set / empty values are a no-op.
         assert_eq!(redact_secrets(&leaked, &[]), leaked);
         assert_eq!(redact_secrets("plain", &[String::new()]), "plain");
+    }
+
+    #[test]
+    fn redact_secrets_handles_overlapping_values_longest_first() {
+        // The exact overlap case: the password is a SUBSTRING of the full URL.
+        // Order the input worst-case (password first) — longest-first ordering
+        // inside the helper must still fully scrub the URL, leaving no partial
+        // `redis://...@host` fragment.
+        let password = "abc".to_string();
+        let url = "redis://u:abc@host:6379/1".to_string();
+        let secrets = vec![password.clone(), url.clone()];
+
+        let text = format!("dump: url={url} pw={password}");
+        let red = redact_secrets(&text, &secrets);
+        assert!(
+            !red.contains("abc"),
+            "no secret substring may survive: {red}"
+        );
+        assert!(!red.contains("redis://"), "no partial URL may leak: {red}");
+        assert!(!red.contains("@host"), "URL host/port must not leak: {red}");
+        // Both occurrences became the placeholder.
+        assert_eq!(red, "dump: url=<redacted> pw=<redacted>");
+    }
+
+    #[test]
+    fn source_dir_containment() {
+        let root = std::path::Path::new("/data/build");
+        // Under the dataset src tree → accepted.
+        assert!(
+            validate_source_dir(std::path::Path::new("/data/build/src/chord/abc"), root).is_ok()
+        );
+        assert!(validate_source_dir(std::path::Path::new("/data/build/src"), root).is_ok());
+        // Absolute elsewhere → rejected.
+        assert!(validate_source_dir(std::path::Path::new("/etc"), root).is_err());
+        assert!(validate_source_dir(std::path::Path::new("/data/build/cache/x"), root).is_err());
+        // `..`-escape that lexically leaves the src tree → rejected.
+        assert!(
+            validate_source_dir(std::path::Path::new("/data/build/src/../../etc"), root).is_err()
+        );
+        // A sibling sharing a string prefix but not the path → rejected.
+        assert!(validate_source_dir(std::path::Path::new("/data/build/src-evil/x"), root).is_err());
     }
 
     #[tokio::test]

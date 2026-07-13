@@ -197,24 +197,10 @@ pub fn scope_unit_name(module: &str, git_ref: &str) -> String {
 /// Returns `Ok(())` when `target_dir` is safe, `Err(InvalidArgument)` when it is
 /// inside `dataset_root` (the file-level NFS dir).
 pub fn validate_target_dir(target_dir: &Path, dataset_root: &Path) -> Result<(), ToolError> {
-    // Compare on a LEXICALLY-normalized basis (both may be non-existent at check
-    // time — so we resolve `.`/`..` textually, never via canonicalize which needs
-    // the path to exist). Any target dir that lexically resolves to the dataset
-    // root or nested under it is rejected; the dataset root is for source-staging
-    // + sccache + artifact publish ONLY, never a live cargo target.
-    let t = lexical_normalize(target_dir);
-    let root = lexical_normalize(dataset_root);
-    // Containment: identical, or `t` begins with `root` + a path boundary. The
-    // trailing-slash form prevents a false match on a sibling that merely shares
-    // a string prefix (e.g. `/data/build-x` vs root `/data/build`). `root == "/"`
-    // is handled specially (every absolute path is nested under it).
-    let contained = t == root
-        || if root == "/" {
-            t.starts_with('/')
-        } else {
-            t.starts_with(&format!("{root}/"))
-        };
-    if contained {
+    // Any target dir that lexically resolves to the dataset root or nested under
+    // it is rejected; the dataset root is for source-staging + sccache + artifact
+    // publish ONLY, never a live cargo target.
+    if is_within(target_dir, dataset_root) {
         return Err(ToolError::InvalidArgument(format!(
             "CARGO_TARGET_DIR ({}) lexically resolves inside the file-level NFS build \
              dataset ({}); cargo targets must be on exec-safe local disk or tmpfs \
@@ -225,6 +211,25 @@ pub fn validate_target_dir(target_dir: &Path, dataset_root: &Path) -> Result<(),
         )));
     }
     Ok(())
+}
+
+/// Whether `path` lexically resolves to `root` or a path nested under it — the
+/// containment primitive shared by the target-dir guard (reject-if-within) and
+/// the `source_dir` check (require-within). Both operands are lexically
+/// normalized first (`.`/`..` resolved textually, no filesystem access — works
+/// for non-existent paths), so a traversal like `/mnt/other/../build/x` is
+/// judged by where it actually lands. The trailing-slash boundary prevents a
+/// sibling that merely shares a string prefix (`/data/build-x` vs `/data/build`)
+/// from matching; `root == "/"` contains every absolute path.
+pub fn is_within(path: &Path, root: &Path) -> bool {
+    let p = lexical_normalize(path);
+    let r = lexical_normalize(root);
+    p == r
+        || if r == "/" {
+            p.starts_with('/')
+        } else {
+            p.starts_with(&format!("{r}/"))
+        }
 }
 
 /// Lexically normalize a path: resolve `.` and `..` PURELY TEXTUALLY (no
@@ -518,5 +523,17 @@ mod tests {
                                                                       // Relative paths keep a leading `..`.
         assert_eq!(lexical_normalize(Path::new("../a/b")), "../a/b");
         assert_eq!(lexical_normalize(Path::new("a/./b")), "a/b");
+    }
+
+    #[test]
+    fn is_within_containment() {
+        let root = Path::new("/data/build/src");
+        assert!(is_within(Path::new("/data/build/src"), root)); // identical
+        assert!(is_within(Path::new("/data/build/src/chord/x"), root)); // nested
+        assert!(is_within(Path::new("/data/build/src/../src/y"), root)); // resolves back in
+        assert!(!is_within(Path::new("/data/build/srcx"), root)); // prefix-string sibling
+        assert!(!is_within(Path::new("/etc/passwd"), root)); // elsewhere
+        assert!(!is_within(Path::new("/data/build/src/../../etc"), root)); // escapes
+        assert!(is_within(Path::new("/anything"), Path::new("/"))); // root contains all
     }
 }

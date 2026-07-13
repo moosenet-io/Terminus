@@ -172,6 +172,79 @@ pub fn render_relay_argv(
     ]
 }
 
+/// A complete relay-publish plan for the no-dataset-mount path: the two rsync
+/// commands that deliver BOTH the binary AND its `<bin>.sha256` sidecar into the
+/// content-addressed layout on the relay host, plus the sidecar body to stage
+/// locally first. Bundling them here guarantees the sidecar is never dropped — an
+/// artifact without its `.sha256` is unverifiable by the constellation-updater,
+/// so relay must mirror the local publish's binary+sidecar pair.
+pub struct RelayPlan {
+    pub binary_argv: Vec<String>,
+    pub sidecar_argv: Vec<String>,
+    /// The `<bin>.sha256` body to write to the local staging sidecar path (the
+    /// same `sha256sum -c` format as the local publish) before the sidecar rsync.
+    pub sidecar_body: String,
+    /// Remote destination paths (for the returned [`Published`]).
+    pub remote_binary: PathBuf,
+    pub remote_sidecar: PathBuf,
+}
+
+/// Build the [`RelayPlan`] for `(module, channel, sha, target, bin)`: the binary
+/// is relayed from `local_bin` and the sidecar from `local_sidecar` (the caller
+/// writes `sidecar_body` there first), both into
+/// `<remote_dataset_root>/artifacts/<module>/<channel>/<sha>/<target>/`.
+#[allow(clippy::too_many_arguments)]
+pub fn render_relay_plan(
+    relay_host: &str,
+    remote_dataset_root: &str,
+    module: &str,
+    channel: &str,
+    sha: &str,
+    target: &str,
+    bin_name: &str,
+    local_bin: &Path,
+    local_sidecar: &Path,
+) -> RelayPlan {
+    let sidecar_name = format!("{bin_name}.sha256");
+    let binary_argv = render_relay_argv(
+        relay_host,
+        remote_dataset_root,
+        module,
+        channel,
+        sha,
+        target,
+        bin_name,
+        local_bin,
+    );
+    let sidecar_argv = render_relay_argv(
+        relay_host,
+        remote_dataset_root,
+        module,
+        channel,
+        sha,
+        target,
+        &sidecar_name,
+        local_sidecar,
+    );
+    let root = remote_dataset_root.trim_end_matches('/');
+    let remote_binary =
+        PathBuf::from(root).join(artifact_rel_path(module, channel, sha, target, bin_name));
+    let remote_sidecar = PathBuf::from(root).join(artifact_rel_path(
+        module,
+        channel,
+        sha,
+        target,
+        &sidecar_name,
+    ));
+    RelayPlan {
+        binary_argv,
+        sidecar_argv,
+        sidecar_body: sidecar_contents(sha, bin_name),
+        remote_binary,
+        remote_sidecar,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +391,47 @@ mod tests {
         assert!(j.contains(
             "builduser@relay:/data/build/artifacts/chord/experimental/abcd/x86_64-unknown-linux-musl/chord"
         ));
+    }
+
+    #[test]
+    fn relay_plan_delivers_both_binary_and_sha256_sidecar() {
+        let plan = render_relay_plan(
+            "builduser@relay",
+            "/data/build/",
+            "chord",
+            "experimental",
+            "abcd",
+            "x86_64-unknown-linux-musl",
+            "chord",
+            Path::new("/tmp/out/chord"),
+            Path::new("/tmp/out/chord.sha256"),
+        );
+        let base = "builduser@relay:/data/build/artifacts/chord/experimental/abcd/x86_64-unknown-linux-musl";
+        // The binary relay targets `<...>/chord`.
+        let bj = plan.binary_argv.join(" ");
+        assert!(bj.contains(&format!("{base}/chord")), "binary dest: {bj}");
+        assert!(bj.contains("/tmp/out/chord"));
+        // The sidecar relay targets `<...>/chord.sha256` — the required, previously
+        // missing, verifiable companion.
+        let sj = plan.sidecar_argv.join(" ");
+        assert!(
+            sj.contains(&format!("{base}/chord.sha256")),
+            "sidecar dest: {sj}"
+        );
+        assert!(sj.contains("/tmp/out/chord.sha256"));
+        // The sidecar body is the sha256sum-format line for the binary.
+        assert_eq!(plan.sidecar_body, "abcd  chord\n");
+        // Reported remote paths match the content-addressed layout, sidecar next
+        // to the binary.
+        assert_eq!(
+            plan.remote_binary,
+            PathBuf::from(
+                "/data/build/artifacts/chord/experimental/abcd/x86_64-unknown-linux-musl/chord"
+            )
+        );
+        assert_eq!(
+            plan.remote_sidecar,
+            PathBuf::from("/data/build/artifacts/chord/experimental/abcd/x86_64-unknown-linux-musl/chord.sha256")
+        );
     }
 }

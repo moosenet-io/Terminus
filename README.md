@@ -143,8 +143,12 @@ compiler_build(module, ref, host="auto", profile="release", fast=false, bin?, so
   (`module`, `bin`, `profile`, `target`, `channel`) is validated at the tool entry as a safe
   single segment (allowlist `[A-Za-z0-9._-]`, no empty/`.`/`..`, no separators or shell
   metacharacters) BEFORE any path join / rsync / ssh; `ref` uses the same rules per `/`-segment
-  (a branch may contain `/` but never a traversal). This blocks path-traversal (an absolute or
-  `../` value escaping `${BUILD_DATASET_ROOT}`) and command injection.
+  (a branch may contain `/` but never a traversal). A caller-supplied `source_dir` is a full
+  path (not a segment), so it is validated by **containment** instead — it must lexically
+  resolve inside an allowed root (`${BUILD_DATASET_ROOT}/src`, plus any `BUILD_ALLOWED_SOURCE_ROOTS`)
+  before it is used for `current_dir` / `--manifest-path` / rsync, so an absolute-elsewhere or
+  `../`-escaping override can't build/sync source outside the dataset. This blocks path-traversal
+  (an absolute or `../` value escaping `${BUILD_DATASET_ROOT}`) and command injection.
 - **Exec-safe target dir** — `CARGO_TARGET_DIR` is a LOCAL/tmpfs path
   (`BUILD_LOCAL_TARGET_DIR` locally, `BUILD_HEAVY_LOCAL_TARGET_DIR` on the heavy host); a
   hard guard **rejects** any target dir inside the file-level NFS build dataset — applied to
@@ -178,7 +182,9 @@ compiler_build(module, ref, host="auto", profile="release", fast=false, bin?, so
   `<bin>.sha256` sidecar (the `sha256sum -c` format the constellation-updater verifies).
   It does **not** flip a `current` pointer — channel promotion is `compiler_release`
   (BLD-07). When the dataset is not mounted RW on the build host, publish relays the
-  artifact over a single rsync hop to `BUILD_DATASET_RELAY_HOST` (interim path, pre-BLD-01).
+  artifact over a single rsync hop to `BUILD_DATASET_RELAY_HOST` (interim path, pre-BLD-01) —
+  relaying **both** the binary and its `<bin>.sha256` sidecar (bundled in one `RelayPlan`), so a
+  relay-published artifact is verifiable by the updater, exactly like the local publish.
 
 All hosts, paths, caps, thresholds, and the cache endpoint come from config env
 (materialized from the vault where sensitive); there are no infrastructure literals in the
