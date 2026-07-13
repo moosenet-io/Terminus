@@ -516,8 +516,7 @@ struct ChordHeartbeat {
 /// [`stop_chord_heartbeat`] (called from `acquire`/`release`), NOT by the guard
 /// struct — so a nested-guard release (see `is_idempotent_reacquire`) that runs
 /// on whichever guard drops first still tears the heartbeat down correctly.
-static CHORD_HEARTBEAT: std::sync::Mutex<Option<ChordHeartbeat>> =
-    std::sync::Mutex::new(None);
+static CHORD_HEARTBEAT: std::sync::Mutex<Option<ChordHeartbeat>> = std::sync::Mutex::new(None);
 
 /// Fast-retry backoff (seconds) tried on a failed heartbeat before falling
 /// back to waiting the full interval — a transient blip (one dropped
@@ -802,20 +801,55 @@ pub fn status() -> GpuStatus {
 /// self-heals the abandoned lock).
 pub struct ExclusiveGuard {
     holder: String,
+    /// BLD-10: when `holder` is a MINT sweep/case/breakfix holder, this holds the
+    /// idle-mode in-flight admission guard for the whole life of the GPU hold, so a
+    /// concurrent MINT idle drains real work and no new MINT unit starts while idling.
+    /// `None` for non-MINT holders (ungated — e.g. the compiler lease itself).
+    _mint_admission: Option<crate::mint::idle::InflightGuard>,
 }
 
 impl ExclusiveGuard {
     pub fn acquire(mode: GpuMode, holder: &str) -> Result<Self, String> {
+        // BLD-10 admission gate (authoritative drain), cycle-5 TOCTOU fix.
+        //
+        // 1. Fast pre-check (no guard): if MINT is already idling, refuse BEFORE running
+        //    `acquire`'s side effects (stopping services / notifying Chord). Non-MINT
+        //    holders are ungated. This is a cheap early-out, not the correctness point.
+        if !crate::mint::idle::mint_gpu_admission_open(holder) {
+            return Err(crate::mint::idle::MINT_IDLE_GPU_REFUSAL.to_string());
+        }
+        // 2. Take the one-shot lock (this call does not wait — a foreign holder makes it
+        //    fail fast, dropping nothing since no guard is held yet).
         acquire(mode, holder)?;
-        Ok(ExclusiveGuard { holder: holder.to_string() })
+        // 3. AUTHORITATIVE atomic re-check at the moment the lock is held: take the
+        //    in-flight guard only if still `Active`. If idle started in the window between
+        //    the pre-check and here, hand the lock back and refuse — no work begins.
+        match crate::mint::idle::try_admit_mint_gpu(holder) {
+            Ok(_mint_admission) => Ok(ExclusiveGuard {
+                holder: holder.to_string(),
+                _mint_admission,
+            }),
+            Err(e) => {
+                if let Err(re) = release(holder) {
+                    tracing::warn!(
+                        "{holder}: releasing after an idle-refused acquire failed: {re}"
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 }
 
 impl Drop for ExclusiveGuard {
     fn drop(&mut self) {
         if let Err(e) = release(&self.holder) {
-            tracing::warn!("gpu_authority: release on drop failed for '{}': {e}", self.holder);
+            tracing::warn!(
+                "gpu_authority: release on drop failed for '{}': {e}",
+                self.holder
+            );
         }
+        // `_mint_admission` (if any) drops here → decrements the idle in-flight counter.
     }
 }
 
@@ -1084,7 +1118,9 @@ fn hold_duration_for(existing: &LockState, holder: &str, now_epoch_secs: u64) ->
     if existing.holder != holder {
         return None;
     }
-    Some(Duration::from_secs(now_epoch_secs.saturating_sub(existing.acquired_at)))
+    Some(Duration::from_secs(
+        now_epoch_secs.saturating_sub(existing.acquired_at),
+    ))
 }
 
 /// THIS `holder`'s current continuous hold duration, if it currently owns the
@@ -1139,27 +1175,91 @@ pub struct LiveGpuLock {
     /// read directly so this module stays agnostic of which binary is
     /// calling it.
     max_wait: Duration,
+    /// BLD-10: the idle-mode in-flight admission guard for the CURRENT per-unit GPU
+    /// hold (when `holder` is a MINT holder). `acquire` installs it before taking the
+    /// lock; `release` drops it when handing the lock back between units — so the idle
+    /// in-flight count tracks real per-unit MINT work and a concurrent idle drains it.
+    /// A mid-unit max-hold reacquire uses the free `acquire()` directly and does NOT
+    /// touch this slot (the unit stays admitted throughout).
+    mint_admission: std::sync::Mutex<Option<crate::mint::idle::InflightGuard>>,
 }
 
 impl LiveGpuLock {
     pub fn new(holder: &'static str, max_wait: Duration) -> Self {
-        LiveGpuLock { holder, max_wait }
+        LiveGpuLock {
+            holder,
+            max_wait,
+            mint_admission: std::sync::Mutex::new(None),
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl GpuLock for LiveGpuLock {
     async fn acquire(&self) -> Result<(), String> {
-        acquire_with_backoff(
+        // BLD-10 admission gate (authoritative drain), cycle-5 TOCTOU fix.
+        //
+        // The idle check must be validated at the moment the GPU lock is ACTUALLY held,
+        // NOT only once at entry before the bounded-backoff wait. Otherwise a waiter that
+        // was admissible while `Active`, then blocked waiting for another sweep to release,
+        // could win the lock AFTER a compiler `enter_idle` flipped the phase — and begin
+        // real GPU work during idle. Two coordinated steps close that window:
+        //
+        // 1. IN THE BACKOFF LOOP: each attempt first peeks idle admission
+        //    (`mint_gpu_admission_open`, which takes NO guard). If MINT is idling, the
+        //    attempt returns the non-retryable `MINT_IDLE_GPU_REFUSAL` so the wait aborts
+        //    promptly instead of spinning to `max_wait`, and the raw lock is never taken.
+        //    Because no guard is held while waiting, a queued waiter never inflates the
+        //    in-flight drain count (so it can never stall `enter_idle`).
+        // 2. AT SUCCESS: once the lock is truly held, re-validate atomically via
+        //    `try_admit_mint_gpu`. Only here is the in-flight guard taken (and only while
+        //    still `Active`). If idle began in the tiny window between the last peek and
+        //    the lock being granted, this returns `Err`; we hand the lock straight back
+        //    and refuse — no MINT GPU work begins during idle.
+        //
+        // Non-MINT holders (e.g. the compiler lease) short-circuit both steps as
+        // admissible/ungated, so they incur no gating and no added latency.
+        let holder = self.holder;
+        let acquired = acquire_with_backoff(
             &RealClock,
-            || acquire(GpuMode::Exclusive, self.holder),
+            || {
+                if !crate::mint::idle::mint_gpu_admission_open(holder) {
+                    return Err(crate::mint::idle::MINT_IDLE_GPU_REFUSAL.to_string());
+                }
+                acquire(GpuMode::Exclusive, holder)
+            },
             is_live_holder_refusal,
             ACQUIRE_POLL_INTERVAL,
             ACQUIRE_PROGRESS_LOG_INTERVAL,
             self.max_wait,
-            self.holder,
+            holder,
         )
-        .await
+        .await;
+
+        if let Err(e) = acquired {
+            // Never took the lock (idle refusal, a foreign holder past max_wait, or a
+            // broken acquire). No guard was held while waiting, so nothing to release.
+            return Err(e);
+        }
+
+        // Lock is held. AUTHORITATIVE atomic re-check: take the in-flight guard only if
+        // still `Active`. If idle started at the last instant, hand the lock back.
+        match crate::mint::idle::try_admit_mint_gpu(holder) {
+            Ok(admission) => {
+                *self.mint_admission.lock().expect("mint_admission poisoned") = admission;
+                Ok(())
+            }
+            Err(e) => {
+                // Admitted-then-idle race: release the lock we just won and refuse, so no
+                // MINT GPU work begins under the compiler build.
+                if let Err(re) = release(holder) {
+                    tracing::warn!(
+                        "{holder}: releasing after an idle-refused acquire failed: {re}"
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 
     fn release(&self) {
@@ -1170,6 +1270,8 @@ impl GpuLock for LiveGpuLock {
                 self.holder
             );
         }
+        // Drop the per-unit admission guard → decrements the idle in-flight counter.
+        *self.mint_admission.lock().expect("mint_admission poisoned") = None;
     }
 
     fn release_pause(&self) -> Duration {
@@ -1353,7 +1455,9 @@ mod tests {
         assert!(!p.stop_services.contains(&"chord.service".to_string()));
         assert!(p.notify_chord_exclusive);
         // lemonade-coder keeps the simple systemctl stop/start mechanism.
-        assert!(p.stop_services.contains(&"lemonade-coder.service".to_string()));
+        assert!(p
+            .stop_services
+            .contains(&"lemonade-coder.service".to_string()));
     }
 
     #[test]
@@ -1423,7 +1527,10 @@ mod tests {
         // real `/proc` check instead of a hardcoded bool.
         let current = my_pid();
         assert_ne!(current, 1, "test process must not itself be pid 1");
-        assert!(pid_alive(1), "pid 1 (init) must be alive for this test to be meaningful");
+        assert!(
+            pid_alive(1),
+            "pid 1 (init) must be alive for this test to be meaningful"
+        );
 
         let existing = LockState {
             holder: "intake_coder_sweep".into(),
@@ -1434,8 +1541,17 @@ mod tests {
             chord_notified: false,
         };
 
-        assert!(!is_idempotent_reacquire(&existing, "intake_coder_sweep", current));
-        assert!(is_blocked(&existing, "intake_coder_sweep", pid_alive(existing.pid), current));
+        assert!(!is_idempotent_reacquire(
+            &existing,
+            "intake_coder_sweep",
+            current
+        ));
+        assert!(is_blocked(
+            &existing,
+            "intake_coder_sweep",
+            pid_alive(existing.pid),
+            current
+        ));
     }
 
     // ---- is_idempotent_reacquire (Phase 2 item 7 + PID-aware fix) ----
@@ -1452,7 +1568,11 @@ mod tests {
             stopped_services: vec!["lemonade-coder.service".to_string()],
             chord_notified: false,
         };
-        assert!(is_idempotent_reacquire(&existing, "intake_coder_sweep", current));
+        assert!(is_idempotent_reacquire(
+            &existing,
+            "intake_coder_sweep",
+            current
+        ));
     }
 
     #[test]
@@ -1469,7 +1589,11 @@ mod tests {
             stopped_services: vec!["lemonade-coder.service".to_string()],
             chord_notified: false,
         };
-        assert!(!is_idempotent_reacquire(&existing, "intake_coder_case", current));
+        assert!(!is_idempotent_reacquire(
+            &existing,
+            "intake_coder_case",
+            current
+        ));
     }
 
     #[test]
@@ -1487,7 +1611,11 @@ mod tests {
             chord_notified: false,
         };
         assert_ne!(existing.pid, current);
-        assert!(!is_idempotent_reacquire(&existing, "intake_coder_sweep", current));
+        assert!(!is_idempotent_reacquire(
+            &existing,
+            "intake_coder_sweep",
+            current
+        ));
     }
 
     #[test]
@@ -1512,7 +1640,7 @@ mod tests {
     fn chord_url_builds_the_v1_gpu_exclusive_path() {
         assert_eq!(
             chord_url("http://127.0.0.1:8099", "acquire"), // pii-test-fixture
-            "http://127.0.0.1:8099/v1/gpu-exclusive/acquire" // pii-test-fixture
+            "http://127.0.0.1:8099/v1/gpu-exclusive/acquire"  // pii-test-fixture
         );
         // Trailing slash on the base is normalized away (no double slash).
         assert_eq!(
@@ -1648,7 +1776,10 @@ mod tests {
 
     impl FakeClock {
         fn new() -> Self {
-            FakeClock { elapsed: StdMutex::new(Duration::ZERO), sleep_calls: StdMutex::new(0) }
+            FakeClock {
+                elapsed: StdMutex::new(Duration::ZERO),
+                sleep_calls: StdMutex::new(0),
+            }
         }
 
         fn sleep_call_count(&self) -> u32 {
@@ -1699,8 +1830,16 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result, Ok(4), "must return the value from the attempt that finally succeeded");
-        assert_eq!(*attempts.lock().unwrap(), 4, "must have tried exactly 4 times (3 refusals + 1 success)");
+        assert_eq!(
+            result,
+            Ok(4),
+            "must return the value from the attempt that finally succeeded"
+        );
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            4,
+            "must have tried exactly 4 times (3 refusals + 1 success)"
+        );
         assert_eq!(
             clock.sleep_call_count(),
             3,
@@ -1723,7 +1862,11 @@ mod tests {
         .await;
 
         assert_eq!(result, Ok(42));
-        assert_eq!(clock.sleep_call_count(), 0, "a first-try success must never sleep");
+        assert_eq!(
+            clock.sleep_call_count(),
+            0,
+            "a first-try success must never sleep"
+        );
     }
 
     #[tokio::test]
@@ -1758,7 +1901,10 @@ mod tests {
         // With a 60s poll interval and a 300s cap, the loop must terminate
         // (bounded attempts), not spin unboundedly.
         let tries = *attempts.lock().unwrap();
-        assert!(tries >= 5 && tries <= 6, "expected roughly max_wait/poll_interval attempts, got {tries}");
+        assert!(
+            tries >= 5 && tries <= 6,
+            "expected roughly max_wait/poll_interval attempts, got {tries}"
+        );
     }
 
     #[tokio::test]
@@ -1782,7 +1928,11 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        assert_eq!(*attempts.lock().unwrap(), 1, "max_wait=0 must not retry at all");
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            1,
+            "max_wait=0 must not retry at all"
+        );
         assert_eq!(clock.sleep_call_count(), 0);
     }
 
@@ -1800,9 +1950,11 @@ mod tests {
             &clock,
             || {
                 *attempts.lock().unwrap() += 1;
-                Err("chord rejected the GPU-exclusive acquire (401/403) — set CHORD_JWT \
+                Err(
+                    "chord rejected the GPU-exclusive acquire (401/403) — set CHORD_JWT \
                      to a valid lumina token for this harness host"
-                    .to_string())
+                        .to_string(),
+                )
             },
             is_live_holder_refusal,
             Duration::from_secs(60),
@@ -1852,9 +2004,15 @@ mod tests {
             "chord rejected the GPU-exclusive acquire (401/403) — set CHORD_JWT to a valid \
              lumina token for this harness host"
         ));
-        assert!(!is_live_holder_refusal("chord GPU-exclusive acquire failed: connection reset"));
-        assert!(!is_live_holder_refusal("failed to write GPU lock file: permission denied"));
-        assert!(!is_live_holder_refusal("some entirely unrecognized message"));
+        assert!(!is_live_holder_refusal(
+            "chord GPU-exclusive acquire failed: connection reset"
+        ));
+        assert!(!is_live_holder_refusal(
+            "failed to write GPU lock file: permission denied"
+        ));
+        assert!(!is_live_holder_refusal(
+            "some entirely unrecognized message"
+        ));
     }
 
     // ── S86: does the release-between-units fix actually achieve alternation? ──
@@ -1880,7 +2038,14 @@ mod tests {
 
     impl SweepSim {
         fn new(unit_secs: u64, pause_secs: u64, poll_secs: u64) -> Self {
-            SweepSim { unit_secs, pause_secs, poll_secs, next_attempt: 0, release_at: None, turns: 0 }
+            SweepSim {
+                unit_secs,
+                pause_secs,
+                poll_secs,
+                next_attempt: 0,
+                release_at: None,
+                turns: 0,
+            }
         }
     }
 
@@ -1935,7 +2100,10 @@ mod tests {
         // implements.
         let poll = ACQUIRE_POLL_INTERVAL.as_secs();
         let pause = INTER_UNIT_RELEASE_PAUSE.as_secs();
-        assert!(pause > poll, "the whole proof below depends on pause > poll_interval");
+        assert!(
+            pause > poll,
+            "the whole proof below depends on pause > poll_interval"
+        );
 
         let a = SweepSim::new(600, pause, poll);
         let b = SweepSim::new(120, pause, poll);
@@ -1943,7 +2111,10 @@ mod tests {
         // 3 hours of virtual time — long enough for many alternations.
         let (a_turns, b_turns) = simulate_alternation(3 * 60 * 60, a, b);
 
-        assert!(a_turns > 3, "coder-sweep-like side must get multiple real turns, got {a_turns}");
+        assert!(
+            a_turns > 3,
+            "coder-sweep-like side must get multiple real turns, got {a_turns}"
+        );
         assert!(
             b_turns > 3,
             "assistant-sweep-like side must ALSO get multiple real turns (not starved), got {b_turns}"
@@ -2003,7 +2174,10 @@ mod tests {
         let (a_turns, b_turns) = simulate_alternation(3 * 60 * 60, a, b);
 
         assert!(a_turns > 3);
-        assert!(b_turns > 3, "must NOT reproduce the phase-lock starvation seen with a too-short pause");
+        assert!(
+            b_turns > 3,
+            "must NOT reproduce the phase-lock starvation seen with a too-short pause"
+        );
     }
 
     // ── Max lock-hold safety valve ──────────────────────────────────────────
@@ -2011,14 +2185,24 @@ mod tests {
     #[test]
     fn max_lock_hold_env_default_and_override() {
         std::env::remove_var(MAX_LOCK_HOLD_ENV);
-        assert_eq!(max_lock_hold_duration(), Duration::from_secs(MAX_LOCK_HOLD_DEFAULT_SECS));
+        assert_eq!(
+            max_lock_hold_duration(),
+            Duration::from_secs(MAX_LOCK_HOLD_DEFAULT_SECS)
+        );
         assert_eq!(max_lock_hold_duration(), Duration::from_secs(45 * 60));
 
         std::env::set_var(MAX_LOCK_HOLD_ENV, "0");
-        assert_eq!(max_lock_hold_duration(), Duration::from_secs(MAX_LOCK_HOLD_DEFAULT_SECS), "zero rejected");
+        assert_eq!(
+            max_lock_hold_duration(),
+            Duration::from_secs(MAX_LOCK_HOLD_DEFAULT_SECS),
+            "zero rejected"
+        );
 
         std::env::set_var(MAX_LOCK_HOLD_ENV, "not-a-number");
-        assert_eq!(max_lock_hold_duration(), Duration::from_secs(MAX_LOCK_HOLD_DEFAULT_SECS));
+        assert_eq!(
+            max_lock_hold_duration(),
+            Duration::from_secs(MAX_LOCK_HOLD_DEFAULT_SECS)
+        );
 
         std::env::set_var(MAX_LOCK_HOLD_ENV, "600");
         assert_eq!(max_lock_hold_duration(), Duration::from_secs(600));
@@ -2051,10 +2235,22 @@ mod tests {
 
     #[test]
     fn should_yield_for_max_hold_pure_decision() {
-        assert!(!should_yield_for_max_hold(None, Duration::from_secs(60)), "no hold at all ⇒ never yield");
-        assert!(!should_yield_for_max_hold(Some(Duration::from_secs(59)), Duration::from_secs(60)));
-        assert!(should_yield_for_max_hold(Some(Duration::from_secs(60)), Duration::from_secs(60)), "boundary is inclusive");
-        assert!(should_yield_for_max_hold(Some(Duration::from_secs(600)), Duration::from_secs(60)));
+        assert!(
+            !should_yield_for_max_hold(None, Duration::from_secs(60)),
+            "no hold at all ⇒ never yield"
+        );
+        assert!(!should_yield_for_max_hold(
+            Some(Duration::from_secs(59)),
+            Duration::from_secs(60)
+        ));
+        assert!(
+            should_yield_for_max_hold(Some(Duration::from_secs(60)), Duration::from_secs(60)),
+            "boundary is inclusive"
+        );
+        assert!(should_yield_for_max_hold(
+            Some(Duration::from_secs(600)),
+            Duration::from_secs(60)
+        ));
     }
 
     #[tokio::test]
@@ -2119,7 +2315,11 @@ mod tests {
         .unwrap();
 
         assert!(fired);
-        assert_eq!(*calls.lock().unwrap(), vec!["release", "acquire"], "release must happen BEFORE reacquire");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["release", "acquire"],
+            "release must happen BEFORE reacquire"
+        );
         // The pause between release and reacquire went through the clock
         // (fake/instant — no real time elapses in the test), never a raw
         // real sleep.
@@ -2234,7 +2434,10 @@ mod tests {
             stopped_services: vec![],
             chord_notified: false,
         };
-        assert_eq!(hold_duration_for(&existing, "intake_coder_sweep", 100_000), None);
+        assert_eq!(
+            hold_duration_for(&existing, "intake_coder_sweep", 100_000),
+            None
+        );
     }
 
     #[test]
