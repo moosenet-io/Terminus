@@ -1059,24 +1059,20 @@ impl RustTool for CompilerBuild {
         let mut blessed_current = false;
         let mut pruned: Vec<String> = Vec::new();
         if !published.relayed {
-            publish::write_manifest(&root, &module, channel, &published.sha256, &triple, &bin)
-                .await?;
-            // set_current verifies the just-published sha before flipping (the
-            // pointer flip is itself the fail-closed choke point).
-            let set = publish::set_current(
+            // A build blesses ONLY the experimental/build channel; `bless_build`
+            // refuses any promote-only channel (stable is compiler_release-only).
+            let bless = publish::bless_build(
                 &root,
                 &module,
                 channel,
                 &published.sha256,
                 &triple,
                 &bin,
-                "bless",
-                None,
+                retain_per_channel(),
             )
             .await?;
-            blessed_current = set.changed;
-            // Prune reads the real current + current.prev pointers itself.
-            pruned = publish::prune_channel(&root, &module, channel, retain_per_channel()).await?;
+            blessed_current = bless.blessed;
+            pruned = bless.pruned;
         }
 
         let text = format!(

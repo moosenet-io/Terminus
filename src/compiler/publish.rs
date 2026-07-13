@@ -32,6 +32,19 @@ use crate::error::ToolError;
 /// `stable` is a separate pointer-flip (BLD-07), never a rebuild.
 pub const DEFAULT_CHANNEL: &str = "experimental";
 
+/// The build/un-promoted channel — the ONLY channel `compiler_build` may bless.
+pub const BUILD_CHANNEL: &str = DEFAULT_CHANNEL;
+
+/// The promote-only release channel — reachable ONLY via `compiler_release`
+/// (promote-by-copy), never by a rebuild blessing it directly.
+pub const STABLE_CHANNEL: &str = "stable";
+
+/// Whether a channel may only be blessed by `compiler_release` (promote), never by
+/// a build. Keeps release discipline: a rebuild can never write `stable/current`.
+pub fn is_promote_only_channel(channel: &str) -> bool {
+    channel == STABLE_CHANNEL
+}
+
 /// The relative artifact path (under the dataset root) for a built binary:
 /// `artifacts/<module>/<channel>/<sha>/<target>/<bin>`.
 pub fn artifact_rel_path(
@@ -921,6 +934,52 @@ pub async fn promote(
     })
 }
 
+/// The outcome of a build-time bless.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildBlessOutcome {
+    pub channel: String,
+    /// False when `current` already pointed at this sha (idempotent no-op).
+    pub blessed: bool,
+    pub pruned: Vec<String>,
+}
+
+/// Bless a JUST-BUILT sha as `<channel>/current` on a local publish — writing the
+/// per-sha manifest, flipping the pointer (verify-before-bless via
+/// [`set_current`]), and pruning to retention.
+///
+/// RELEASE DISCIPLINE: a build may bless ONLY the build/experimental channel. A
+/// promote-only channel (`stable`) is REFUSED — a rebuild must never write
+/// `stable/current`; the sole path to stable is `compiler_release`
+/// (promote-by-copy, no recompile). This guard is the structural guarantee that
+/// the CURRENT-pointer bless at build time is experimental-only, independent of
+/// whatever channel a caller might route the build into.
+pub async fn bless_build(
+    dataset_root: &Path,
+    module: &str,
+    channel: &str,
+    sha: &str,
+    target: &str,
+    bin: &str,
+    retain: usize,
+) -> Result<BuildBlessOutcome, ToolError> {
+    if is_promote_only_channel(channel) {
+        return Err(ToolError::InvalidArgument(format!(
+            "compiler_build may not bless the promote-only channel {channel:?}; a build blesses \
+             only {BUILD_CHANNEL} — use compiler_release to promote a built sha to {channel}"
+        )));
+    }
+    write_manifest(dataset_root, module, channel, sha, target, bin).await?;
+    // set_current verifies the just-published sha before flipping (fail-closed).
+    let set = set_current(dataset_root, module, channel, sha, target, bin, "bless", None).await?;
+    // Prune reads the real current + current.prev pointers itself.
+    let pruned = prune_channel(dataset_root, module, channel, retain).await?;
+    Ok(BuildBlessOutcome {
+        channel: channel.to_string(),
+        blessed: set.changed,
+        pruned,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1319,6 +1378,52 @@ mod tests {
         verify_sha_artifact(root, "m", "stable", &sha, T, "m")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bless_build_blesses_experimental_and_never_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let sha = seed_artifact(root, "m", "experimental", "m", b"v1").await;
+
+        let out = bless_build(root, "m", "experimental", &sha, T, "m", 2)
+            .await
+            .unwrap();
+        assert!(out.blessed);
+        assert_eq!(out.channel, "experimental");
+        // experimental/current is flipped …
+        assert_eq!(
+            read_current(root, "m", "experimental").await.unwrap(),
+            Some(sha.clone())
+        );
+        // … and stable/current is NEVER touched by a build.
+        assert_eq!(read_current(root, "m", "stable").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn bless_build_refuses_the_promote_only_stable_channel() {
+        // Even if a build were routed at channel=stable, blessing stable/current
+        // via a rebuild is refused (stable is compiler_release-only). The artifact
+        // may exist under stable/<sha>, but the CURRENT pointer must not move.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let sha = seed_artifact(root, "m", "stable", "m", b"v1").await;
+
+        let err = bless_build(root, "m", "stable", &sha, T, "m", 2)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArgument(_)),
+            "a build must not bless the stable channel: {err:?}"
+        );
+        assert!(
+            format!("{err:?}").contains("compiler_release"),
+            "the error should point at compiler_release: {err:?}"
+        );
+        // stable/current was NOT blessed by the build.
+        assert_eq!(read_current(root, "m", "stable").await.unwrap(), None);
+        assert!(is_promote_only_channel("stable"));
+        assert!(!is_promote_only_channel("experimental"));
     }
 
     #[tokio::test]
