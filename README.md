@@ -242,6 +242,15 @@ compiler_request(module, ref, priority="normal", host="auto", fast=false, ready=
   lease around the build; that coordination is a clean trait seam (`IdleCoordinator`), a
   no-op by default, wired for real by BLD-11 — and touched only for a heavy build actually
   being dispatched.
+- **No permanent wedge on a completion outage** — the claim writes a fence token; the
+  completion release is a single atomic Lua fenced on that token (idempotent). If Redis is
+  down at completion time the scheduler RETRIES the release with bounded backoff
+  (`BUILD_COMPLETE_RETRY_BASE_MS`/`BUILD_COMPLETE_RETRY_MAX`) until it lands. As a
+  crash/restart backstop, each tick RECONCILES `building` jobs whose claim is older than
+  `BUILD_STALE_BUILDING_SECS` (a dead worker's lease) — freeing the module lock + host slot
+  and requeuing them. The fence token guarantees a crashed worker's late completion can never
+  free a reconciled + re-claimed job's slot, and a double release never underflows the
+  host-slot count.
 - **`compiler_status`** — the status tool is a separate item (BLD-08); it renders
   `compiler::render_queue_status` over the queue snapshot (queue depth, queued jobs,
   in-flight leases per host).
@@ -249,8 +258,9 @@ compiler_request(module, ref, priority="normal", host="auto", fast=false, ready=
 Scheduler knobs are all config env with safe serialize-everything defaults (cap 1, no heavy
 window ⇒ heavy builds wait for a window/quiet signal): `BUILD_HOST_CAP_PRIMARY`,
 `BUILD_HOST_CAP_HEAVY`, `BUILD_WINDOW_HOURS`, `BUILD_FLEET_QUIET`, `BUILD_SCHED_INTERVAL_SECS`,
-`BUILD_SCHED_PEEK`, `BUILD_JOB_RETAIN_SECS` — no infrastructure literals (S1). Redis endpoint
-+ password come from the vault-materialized env via the shared `RedisBackend` (S7).
+`BUILD_SCHED_PEEK`, `BUILD_JOB_RETAIN_SECS`, `BUILD_STALE_BUILDING_SECS`,
+`BUILD_COMPLETE_RETRY_BASE_MS`, `BUILD_COMPLETE_RETRY_MAX` — no infrastructure literals (S1).
+Redis endpoint + password come from the vault-materialized env via the shared `RedisBackend` (S7).
 
 ## Fleet clock — `time_now` (CLK-01)
 

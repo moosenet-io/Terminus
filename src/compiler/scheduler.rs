@@ -61,10 +61,22 @@ const FLEET_QUIET_ENV: &str = "BUILD_FLEET_QUIET";
 const INTERVAL_ENV: &str = "BUILD_SCHED_INTERVAL_SECS";
 /// How many queued jobs to consider per tick.
 const PEEK_ENV: &str = "BUILD_SCHED_PEEK";
+/// Reconcile lease (secs): a `building` job whose claim is older than this with
+/// no completion is treated as a crashed worker and requeued. Default an hour —
+/// safely longer than any build + the complete-retry window, so a live build is
+/// never wrongly requeued.
+const STALE_BUILDING_ENV: &str = "BUILD_STALE_BUILDING_SECS";
+/// Base backoff (ms) for retrying a completion after a Redis-down failure.
+const COMPLETE_RETRY_BASE_ENV: &str = "BUILD_COMPLETE_RETRY_BASE_MS";
+/// Max completion retry attempts before falling back to the reconcile backstop.
+const COMPLETE_RETRY_MAX_ENV: &str = "BUILD_COMPLETE_RETRY_MAX";
 
 const DEFAULT_CAP: u32 = 1;
 const DEFAULT_INTERVAL_SECS: u64 = 15;
 const DEFAULT_PEEK: usize = 64;
+const DEFAULT_STALE_BUILDING_SECS: u64 = 3600;
+const DEFAULT_COMPLETE_RETRY_BASE_MS: u64 = 500;
+const DEFAULT_COMPLETE_RETRY_MAX: u32 = 20;
 
 fn env_u32(key: &str, default: u32) -> u32 {
     std::env::var(key)
@@ -145,15 +157,23 @@ pub struct SchedulerConfig {
     pub windows: Vec<Window>,
     pub interval: Duration,
     pub peek_limit: usize,
+    /// Reconcile lease: a building job older than this (no completion) is requeued.
+    pub stale_after: Duration,
+    /// Backoff base for retrying a completion after a Redis-down failure.
+    pub complete_retry_base: Duration,
+    /// Max completion retry attempts (then the reconcile backstop takes over).
+    pub complete_retry_max: u32,
 }
 
 impl SchedulerConfig {
     pub fn from_env() -> Self {
-        let interval = std::env::var(INTERVAL_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|n| *n >= 1)
-            .unwrap_or(DEFAULT_INTERVAL_SECS);
+        let secs = |key: &str, default: u64| {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(default)
+        };
         let peek = std::env::var(PEEK_ENV)
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
@@ -163,8 +183,15 @@ impl SchedulerConfig {
             primary_cap: env_u32(CAP_PRIMARY_ENV, DEFAULT_CAP),
             heavy_cap: env_u32(CAP_HEAVY_ENV, DEFAULT_CAP),
             windows: parse_windows(&std::env::var(WINDOW_ENV).unwrap_or_default()),
-            interval: Duration::from_secs(interval),
+            interval: Duration::from_secs(secs(INTERVAL_ENV, DEFAULT_INTERVAL_SECS)),
             peek_limit: peek,
+            stale_after: Duration::from_secs(secs(STALE_BUILDING_ENV, DEFAULT_STALE_BUILDING_SECS)),
+            complete_retry_base: Duration::from_millis(std::env::var(COMPLETE_RETRY_BASE_ENV)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(DEFAULT_COMPLETE_RETRY_BASE_MS)),
+            complete_retry_max: env_u32(COMPLETE_RETRY_MAX_ENV, DEFAULT_COMPLETE_RETRY_MAX),
         }
     }
 
@@ -232,6 +259,8 @@ impl BuildExecutor for CompilerBuildExecutor {
 
 /// What one [`Scheduler::tick_once`] did (counts are ids for test assertions).
 pub struct TickReport {
+    /// Stale `building` jobs requeued by the reconcile backstop this tick.
+    pub reconciled: Vec<String>,
     /// Jobs claimed + dispatched to a build this tick.
     pub dispatched: Vec<String>,
     /// Heavy jobs held because they're outside a window and the fleet isn't quiet.
@@ -287,12 +316,22 @@ impl Scheduler {
     /// loop supplies the live values.
     pub async fn tick_once(&self, hour: u8, fleet_quiet: bool) -> TickReport {
         let mut report = TickReport {
+            reconciled: Vec::new(),
             dispatched: Vec::new(),
             held_window: Vec::new(),
             contended: Vec::new(),
             unavailable: false,
             handles: Vec::new(),
         };
+        // Crash/restart backstop FIRST: requeue any stale building jobs so their
+        // module lock + host slot free up before we try to dispatch this tick.
+        match self.queue.reconcile(self.config.stale_after).await {
+            Ok(mut ids) => report.reconciled.append(&mut ids),
+            Err(QueueError::Unavailable) => {
+                report.unavailable = true;
+                return report;
+            }
+        }
         let jobs = match self.queue.peek(self.config.peek_limit).await {
             Ok(j) => j,
             Err(QueueError::Unavailable) => {
@@ -317,9 +356,9 @@ impl Scheduler {
                 .claim(&job.job_id, &job.module, host, self.config.cap_for(host))
                 .await
             {
-                Ok(ClaimOutcome::Claimed) => {
+                Ok(ClaimOutcome::Claimed { token }) => {
                     report.dispatched.push(job.job_id.clone());
-                    report.handles.push(self.spawn_build(job, host));
+                    report.handles.push(self.spawn_build(job, host, token));
                 }
                 Ok(ClaimOutcome::ModuleBusy) | Ok(ClaimOutcome::HostFull) => {
                     report.contended.push(job.job_id.clone());
@@ -336,12 +375,24 @@ impl Scheduler {
 
     /// Spawn the build for a claimed job: acquire idle-mode (heavy only), run the
     /// build, release idle-mode, then release the queue slot with the outcome.
-    /// The queue lock/host-slot is ALWAYS released (complete) even if the build
-    /// errors — so a failure can't wedge the module lock.
-    fn spawn_build(&self, job: QueuedJob, host: HostRole) -> tokio::task::JoinHandle<()> {
+    ///
+    /// The release (`complete`) is RETRIED with bounded backoff on a Redis-down
+    /// failure — the build outcome is already known and `complete` is idempotent
+    /// (fenced by `token`), so retrying eventually frees the module lock + host
+    /// slot once Redis is back. If every retry fails, the tick's reconcile
+    /// backstop requeues the (now stale) job — so a completion outage can never
+    /// permanently wedge the lock/slot.
+    fn spawn_build(
+        &self,
+        job: QueuedJob,
+        host: HostRole,
+        token: String,
+    ) -> tokio::task::JoinHandle<()> {
         let queue = self.queue.clone();
         let executor = self.executor.clone();
         let idle = self.idle.clone();
+        let (base, max_attempts) =
+            (self.config.complete_retry_base, self.config.complete_retry_max);
         tokio::spawn(async move {
             if job.heavy {
                 idle.acquire(&job).await;
@@ -355,12 +406,31 @@ impl Scheduler {
             } else {
                 JobState::Failed
             };
-            if let Err(e) = queue.complete(&job.job_id, &job.module, host, state).await {
-                tracing::warn!(
-                    module = %job.module, job = %job.job_id,
-                    "compiler scheduler: failed to release job slot after build: {e}"
-                );
+            // Retry the release until it lands (or the bounded attempts run out;
+            // the reconcile backstop covers the extreme case).
+            for attempt in 0..max_attempts.max(1) {
+                match queue
+                    .complete(&job.job_id, &job.module, host, state, &token)
+                    .await
+                {
+                    Ok(()) => return,
+                    Err(e) => {
+                        // Exponential backoff, capped, so a long outage does not
+                        // spin hot; the last attempt logs and yields to reconcile.
+                        let backoff = base.saturating_mul(1u32 << attempt.min(5));
+                        tracing::warn!(
+                            module = %job.module, job = %job.job_id, attempt,
+                            "compiler scheduler: completion failed ({e}); retrying release"
+                        );
+                        tokio::time::sleep(backoff).await;
+                    }
+                }
             }
+            tracing::error!(
+                module = %job.module, job = %job.job_id,
+                "compiler scheduler: completion still failing after {max_attempts} retries; \
+                 the reconcile backstop will requeue the stale job"
+            );
         })
     }
 
@@ -462,6 +532,11 @@ mod tests {
             windows,
             interval: Duration::from_secs(1),
             peek_limit: 64,
+            // Long lease by default so tests that don't exercise reconcile never
+            // trip it; fast retry so the retry test doesn't sleep long.
+            stale_after: Duration::from_secs(3600),
+            complete_retry_base: Duration::from_millis(1),
+            complete_retry_max: 50,
         }
     }
 
@@ -604,10 +679,10 @@ mod tests {
         // The failed build released its host slot + module lock, so a new job of
         // the SAME module can now be claimed (no wedged lock).
         let j2 = q.enqueue(&req("m1", "r2", false)).await.unwrap();
-        assert_eq!(
+        assert!(matches!(
             q.claim(&j2.job_id, "m1", HostRole::Primary, 1).await.unwrap(),
-            ClaimOutcome::Claimed
-        );
+            ClaimOutcome::Claimed { .. }
+        ));
     }
 
     #[tokio::test]
@@ -619,5 +694,55 @@ mod tests {
         let r = s.tick_once(12, false).await;
         assert!(r.unavailable);
         assert!(r.dispatched.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completion_retried_after_redis_down_eventually_releases_the_slot() {
+        let q = Arc::new(InMemoryQueue::new());
+        q.enqueue(&req("m1", "r1", false)).await.unwrap();
+        // The first 3 completion attempts fail (Redis-down at completion time),
+        // then succeed — the retry loop must self-heal the wedge.
+        q.fail_completes(3);
+        let ex = RecordingExecutor::new(false);
+        let s = sched(q.clone(), ex.clone(), Arc::new(NoopIdle), cfg(1, 1, vec![]));
+        let r = s.tick_once(12, false).await;
+        assert_eq!(r.dispatched.len(), 1);
+        // Await the build task: it retries complete until it lands.
+        for h in r.handles {
+            h.await.unwrap();
+        }
+        // The slot + module lock were released once Redis came back — a new job
+        // of the same module can claim (the wedge self-healed).
+        assert_eq!(q.inflight_count(HostRole::Primary), 0, "host slot released after retries");
+        let j2 = q.enqueue(&req("m1", "r2", false)).await.unwrap();
+        assert!(matches!(
+            q.claim(&j2.job_id, "m1", HostRole::Primary, 1).await.unwrap(),
+            ClaimOutcome::Claimed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn tick_reconciles_a_stale_building_job_and_redispatches_it() {
+        let q = Arc::new(InMemoryQueue::new());
+        let j = q.enqueue(&req("m1", "r1", false)).await.unwrap();
+        // Simulate a crashed worker: the job is claimed (building) but never
+        // completes, and its claim is old.
+        let _ = q.claim(&j.job_id, "m1", HostRole::Primary, 1).await.unwrap();
+        q.backdate_started(&j.job_id, 60_000);
+        assert_eq!(q.inflight_count(HostRole::Primary), 1);
+        let ex = RecordingExecutor::new(false);
+        // Zero-length lease so the tick's reconcile treats the stale job as
+        // reclaimable, frees its lock/slot, and re-dispatches it the same tick.
+        let mut c = cfg(1, 1, vec![]);
+        c.stale_after = Duration::ZERO;
+        let s = sched(q.clone(), ex.clone(), Arc::new(NoopIdle), c);
+        let r = s.tick_once(12, false).await;
+        assert_eq!(r.reconciled, vec![j.job_id.clone()], "stale job requeued by tick");
+        assert_eq!(r.dispatched, vec![j.job_id.clone()], "and re-dispatched");
+        for h in r.handles {
+            h.await.unwrap();
+        }
+        assert_eq!(*ex.built.lock().unwrap(), vec!["m1".to_string()]);
+        assert_eq!(q.inflight_count(HostRole::Primary), 0, "slot freed after the rebuild");
     }
 }
