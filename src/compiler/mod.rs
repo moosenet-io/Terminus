@@ -4,7 +4,8 @@
 //! selects a build host, ensures the pinned toolchain, runs an sccache-backed
 //! `cargo` build inside a resource-capped systemd scope (`MemorySwapMax=0` — Plex
 //! protection), and publishes a SHA-256-checksummed artifact into the shared
-//! build dataset. It does NOT flip a `current` pointer (that is BLD-07).
+//! build dataset. On a local publish it also flips `experimental/current` onto the
+//! new sha (BLD-07 store); promotion to `stable` is `compiler_release` (no rebuild).
 //!
 //! The keystone of the S117 constellation CI/CD. Submodules:
 //!   - [`host`]    — primary-vs-heavy selection from RAM/module-size heuristics.
@@ -66,6 +67,9 @@ const BUILD_HEAVY_DATASET_ROOT: &str = "BUILD_HEAVY_DATASET_ROOT";
 /// under, ON TOP OF the always-allowed `${BUILD_DATASET_ROOT}/src` tree. Lets an
 /// operator permit a dedicated staging mount without opening arbitrary paths.
 const BUILD_ALLOWED_SOURCE_ROOTS: &str = "BUILD_ALLOWED_SOURCE_ROOTS";
+/// Env var (BLD-07): the number of sha dirs the store retains per channel when
+/// pruning after a bless/promote. The store floors this at 2 regardless.
+const BUILD_RETAIN_PER_CHANNEL: &str = "BUILD_RETAIN_PER_CHANNEL";
 
 const DEFAULT_TARGET_TRIPLE: &str = "x86_64-unknown-linux-musl";
 
@@ -94,6 +98,16 @@ fn local_target_dir() -> PathBuf {
 
 fn target_triple() -> String {
     env_nonempty(BUILD_TARGET_TRIPLE).unwrap_or_else(|| DEFAULT_TARGET_TRIPLE.to_string())
+}
+
+/// The per-channel retention count for the artifact store's pruning (BLD-07).
+/// Config-driven and floored at 2 — the store never keeps fewer than 2 shas nor
+/// prunes the current/previous pointer targets.
+fn retain_per_channel() -> usize {
+    env_nonempty(BUILD_RETAIN_PER_CHANNEL)
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.max(2))
+        .unwrap_or(publish::DEFAULT_RETAIN_PER_CHANNEL)
 }
 
 /// The exec-safe LOCAL/tmpfs cargo target dir on the HEAVY host. Required for a
@@ -571,8 +585,8 @@ impl RustTool for CompilerBuild {
         "Build a constellation module at a git ref on a selected build host: pinned \
          toolchain, sccache→Redis (fail-open), inside a resource-capped systemd scope \
          (MemorySwapMax=0, Plex-safe), then publish a sha256-checksummed artifact to the \
-         shared build dataset. Does not flip the `current` channel pointer (that is \
-         compiler_release)."
+         shared build dataset and flip `experimental/current` onto it. Promotion to the \
+         `stable` channel is a separate pointer-flip (compiler_release), never a rebuild."
     }
 
     fn parameters(&self) -> Value {
@@ -1036,6 +1050,29 @@ impl RustTool for CompilerBuild {
             publish::publish_local(&root, &module, channel, &triple, &bin, &built_bin).await?
         };
 
+        // ── BLD-07 store: on a LOCAL publish (dataset mounted RW on this host),
+        // write the per-sha manifest and flip `experimental/current` onto the new
+        // sha (atomic temp+rename), then prune the channel to the retention policy.
+        // Skipped on the INTERIM relay path — the build host lacks the dataset
+        // mount, so it cannot (and must not) write a local pointer; the relay
+        // target host owns that flip. `compiler_release` promotes to `stable`.
+        let mut blessed_current = false;
+        let mut pruned: Vec<String> = Vec::new();
+        if !published.relayed {
+            publish::write_manifest(&root, &module, channel, &published.sha256, &triple, &bin)
+                .await?;
+            let set =
+                publish::set_current(&root, &module, channel, &published.sha256, "bless", None)
+                    .await?;
+            blessed_current = set.changed;
+            let mut keep = vec![published.sha256.clone()];
+            if let Some(prev) = &set.previous {
+                keep.push(prev.clone());
+            }
+            pruned =
+                publish::prune_channel(&root, &module, channel, retain_per_channel(), &keep).await?;
+        }
+
         let text = format!(
             "Built {module}@{git_ref} on {host} ({sccache}); artifact {sha} → {path}{relayed}",
             host = resolved.role.as_str(),
@@ -1057,6 +1094,9 @@ impl RustTool for CompilerBuild {
             "artifact_path": published.artifact_path.to_string_lossy(),
             "sha256_path": published.sha256_path.to_string_lossy(),
             "relayed": published.relayed,
+            "current_channel": channel,
+            "blessed_current": blessed_current,
+            "pruned": pruned,
             "sccache_mode": sccache_env.mode.as_str(),
             "caps": {
                 "memory_max": resolved.caps.memory_max,
@@ -1067,6 +1107,192 @@ impl RustTool for CompilerBuild {
             },
         });
         Ok(ToolOutput::with_structured(text, structured))
+    }
+}
+
+/// BLD-07 — the `compiler_release` tool: the channel-pointer surface over the
+/// artifact store. It NEVER rebuilds — it promotes an already-built sha into a
+/// channel by an atomic `current` pointer flip (Rust-train model), rolls a
+/// channel back to its previous blessed sha, or queries the current blessed sha.
+struct CompilerRelease;
+
+#[async_trait]
+impl RustTool for CompilerRelease {
+    fn name(&self) -> &str {
+        "compiler_release"
+    }
+
+    fn description(&self) -> &str {
+        "Manage the artifact-store channel pointers (no rebuild). op=promote blesses an \
+         already-built sha into a channel by an atomic `current` pointer flip after verifying \
+         the artifact + its .sha256 (fail-closed on an unbuilt/corrupt sha), giving the target \
+         channel its own copy (Rust-train) and pruning to the retention floor; op=rollback \
+         reverts a channel to its previous blessed sha; op=current returns the blessed sha for \
+         a (module, channel). This is the `current` the constellation-updater fetches."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "op": {
+                    "type": "string",
+                    "enum": ["promote", "rollback", "current"],
+                    "default": "promote",
+                    "description": "promote an already-built sha (default) | rollback to the previous blessed sha | query the current blessed sha."
+                },
+                "module": {
+                    "type": "string",
+                    "description": "Module/repo whose channel pointer is being managed."
+                },
+                "sha": {
+                    "type": "string",
+                    "description": "The already-built content-address sha to promote (required for op=promote)."
+                },
+                "from_channel": {
+                    "type": "string",
+                    "default": "experimental",
+                    "description": "Source channel the sha was built/published into (op=promote)."
+                },
+                "to_channel": {
+                    "type": "string",
+                    "default": "stable",
+                    "description": "Target channel: the one promoted into, rolled back, or queried."
+                },
+                "bin": {
+                    "type": "string",
+                    "description": "Binary name to verify (defaults to the module name)."
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Target triple to verify (defaults to the configured build target)."
+                }
+            },
+            "required": ["module"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.execute_structured(args).await?.text)
+    }
+
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let op = args
+            .get("op")
+            .and_then(Value::as_str)
+            .unwrap_or("promote")
+            .to_string();
+        let module = str_arg(&args, "module")?;
+        validate_segment("module", &module)?;
+        let to_channel = args
+            .get("to_channel")
+            .and_then(Value::as_str)
+            .unwrap_or("stable")
+            .to_string();
+        validate_segment("channel", &to_channel)?;
+
+        let root = dataset_root()?;
+
+        match op.as_str() {
+            "current" => {
+                let current = publish::read_current(&root, &module, &to_channel).await?;
+                let previous = publish::read_previous(&root, &module, &to_channel).await?;
+                let text = match &current {
+                    Some(sha) => format!("{module}/{to_channel} current = {sha}"),
+                    None => format!("{module}/{to_channel} has no blessed sha yet"),
+                };
+                let structured = json!({
+                    "op": "current",
+                    "module": module,
+                    "channel": to_channel,
+                    "current": current,
+                    "previous": previous,
+                });
+                Ok(ToolOutput::with_structured(text, structured))
+            }
+            "rollback" => {
+                let out = publish::rollback_current(&root, &module, &to_channel).await?;
+                let text = format!(
+                    "Rolled {module}/{to_channel} back to {sha} (was {was})",
+                    sha = out.sha,
+                    was = out.previous.as_deref().unwrap_or("<none>"),
+                );
+                let structured = json!({
+                    "op": "rollback",
+                    "module": module,
+                    "channel": to_channel,
+                    "current": out.sha,
+                    "previous": out.previous,
+                    "changed": out.changed,
+                });
+                Ok(ToolOutput::with_structured(text, structured))
+            }
+            "promote" => {
+                let sha = str_arg(&args, "sha")?;
+                validate_segment("sha", &sha)?;
+                let from_channel = args
+                    .get("from_channel")
+                    .and_then(Value::as_str)
+                    .unwrap_or(publish::DEFAULT_CHANNEL)
+                    .to_string();
+                validate_segment("channel", &from_channel)?;
+                let bin = args
+                    .get("bin")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| module.clone());
+                validate_segment("bin", &bin)?;
+                let target = args
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(target_triple);
+                validate_segment("target", &target)?;
+
+                let out = publish::promote(
+                    &root,
+                    &module,
+                    &from_channel,
+                    &to_channel,
+                    &sha,
+                    &target,
+                    &bin,
+                    retain_per_channel(),
+                )
+                .await?;
+
+                let text = if out.already_current {
+                    format!("{module}@{sha} already current on {to_channel} (no-op)")
+                } else {
+                    format!(
+                        "Promoted {module}@{sha} {from_channel} → {to_channel} (no rebuild{copied}); \
+                         current flipped{pruned}",
+                        copied = if out.copied { ", copied" } else { "" },
+                        pruned = if out.pruned.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; pruned {}", out.pruned.len())
+                        },
+                    )
+                };
+                let structured = json!({
+                    "op": "promote",
+                    "module": out.module,
+                    "sha256": out.sha256,
+                    "from_channel": out.from_channel,
+                    "to_channel": out.to_channel,
+                    "previous_current": out.previous_current,
+                    "copied": out.copied,
+                    "already_current": out.already_current,
+                    "pruned": out.pruned,
+                    "current_path": out.current_path.to_string_lossy(),
+                });
+                Ok(ToolOutput::with_structured(text, structured))
+            }
+            other => Err(ToolError::InvalidArgument(format!(
+                "unknown op {other:?} (expected promote | rollback | current)"
+            ))),
+        }
     }
 }
 
@@ -1182,6 +1408,9 @@ fn validate_source_dir(
 pub fn register(registry: &mut ToolRegistry) {
     if let Err(e) = registry.register(Box::new(CompilerBuild)) {
         tracing::error!("compiler: failed to register compiler_build: {e}");
+    }
+    if let Err(e) = registry.register(Box::new(CompilerRelease)) {
+        tracing::error!("compiler: failed to register compiler_release: {e}");
     }
 }
 
@@ -1725,5 +1954,28 @@ mod tests {
         assert_eq!(p["type"], "object");
         assert_eq!(p["required"][0], "module");
         assert_eq!(p["required"][1], "ref");
+    }
+
+    #[test]
+    fn release_tool_metadata_is_stable() {
+        let t = CompilerRelease;
+        assert_eq!(t.name(), "compiler_release");
+        let p = t.parameters();
+        assert_eq!(p["type"], "object");
+        assert_eq!(p["required"][0], "module");
+        // The op enum offers promote (default) | rollback | current.
+        let ops = p["properties"]["op"]["enum"].as_array().unwrap();
+        assert!(ops.iter().any(|v| v == "promote"));
+        assert!(ops.iter().any(|v| v == "rollback"));
+        assert!(ops.iter().any(|v| v == "current"));
+        assert_eq!(p["properties"]["op"]["default"], "promote");
+        assert_eq!(p["properties"]["from_channel"]["default"], "experimental");
+        assert_eq!(p["properties"]["to_channel"]["default"], "stable");
+    }
+
+    #[test]
+    fn retain_per_channel_is_floored_at_two() {
+        // Default when unset is the store's ≥2 default.
+        assert!(retain_per_channel() >= 2);
     }
 }
