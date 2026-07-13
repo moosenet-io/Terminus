@@ -118,7 +118,7 @@ same UTC instant regardless of `tz`. An **invalid** `tz` is not an error — the
 tool falls back to UTC and adds a `note` field naming the bad zone.
 
 ```json
-{ "utc_iso8601": "2026-07-12T20:30:45Z", "unix": 1783024245,
+{ "utc_iso8601": "2026-07-12T20:30:45Z", "unix": 1783888245,
   "date": "2026-07-12", "time": "20:30:45", "weekday": "Sunday", "tz": "UTC" }
 ```
 
