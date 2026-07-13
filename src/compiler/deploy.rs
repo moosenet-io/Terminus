@@ -105,6 +105,13 @@ const DEFAULT_SYSTEMCTL: &str = "systemctl";
 const DEFAULT_TRIGGER_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_MAX_CONCURRENCY: usize = 4;
+/// HARD CEILING on concurrent host triggers, regardless of config — a malformed/huge
+/// `COMPILER_DEPLOY_MAX_CONCURRENCY` can never spawn an absurd number of workers.
+const MAX_CONCURRENCY_CEILING: usize = 64;
+/// Clamp for any parsed `*_TIMEOUT_SECS` (6 hours) — a huge-but-parse-valid value is
+/// clamped rather than risking Duration-arithmetic overflow. Well above any real
+/// synchronous updater run.
+const MAX_TIMEOUT_SECS: u64 = 6 * 60 * 60;
 
 /// The sentinel line the remote wrapper prints so we can parse the outcome from a
 /// deterministic, redaction-safe token line (never free-form updater log output).
@@ -261,38 +268,71 @@ fn systemctl_env_raw() -> String {
     env_nonempty(COMPILER_DEPLOY_SYSTEMCTL).unwrap_or_default()
 }
 
-/// The RUN budget for the synchronous updater (post-connect).
-fn trigger_timeout() -> Duration {
-    let secs = env_nonempty(COMPILER_DEPLOY_TRIGGER_TIMEOUT_SECS)
-        .and_then(|v| v.parse::<u64>().ok())
+/// Parse a `*_TIMEOUT_SECS` env value, CLAMPED to `[1, MAX_TIMEOUT_SECS]` so a huge
+/// (but parse-valid) value can never overflow Duration arithmetic downstream; a
+/// `0`/unparseable/absent value falls back to `default`. Pure over `raw` for testing.
+fn parse_timeout_secs(raw: Option<String>, default: u64) -> Duration {
+    let secs = raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_TRIGGER_TIMEOUT_SECS);
+        .unwrap_or(default)
+        .min(MAX_TIMEOUT_SECS);
     Duration::from_secs(secs)
 }
 
-/// The ssh CONNECT budget (passed as `ConnectTimeout`).
+/// The RUN budget for the synchronous updater (post-connect), clamped.
+fn trigger_timeout() -> Duration {
+    parse_timeout_secs(
+        env_nonempty(COMPILER_DEPLOY_TRIGGER_TIMEOUT_SECS),
+        DEFAULT_TRIGGER_TIMEOUT_SECS,
+    )
+}
+
+/// The ssh CONNECT budget (passed as `ConnectTimeout`), clamped.
 fn connect_timeout() -> Duration {
-    let secs = env_nonempty(COMPILER_DEPLOY_CONNECT_TIMEOUT_SECS)
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS);
-    Duration::from_secs(secs)
+    parse_timeout_secs(
+        env_nonempty(COMPILER_DEPLOY_CONNECT_TIMEOUT_SECS),
+        DEFAULT_CONNECT_TIMEOUT_SECS,
+    )
 }
 
 /// The OUTER wall-clock timeout for the whole trigger: STRICTLY GREATER than the ssh
 /// `ConnectTimeout` (it is connect + run, +1s of slack). This headroom guarantees a
 /// connect/auth hang is surfaced as ssh's own non-zero exit (→ `unreachable`) BEFORE
 /// the outer timer fires — so `timed_out` can only mean "connected, updater ran too
-/// long," never "couldn't connect." Pure over its inputs for unit-testing.
+/// long," never "couldn't connect." Uses SATURATING addition so no combination of
+/// inputs can overflow/panic (both inputs are already clamped by `parse_timeout_secs`,
+/// so the saturation is a belt-and-suspenders guard). Pure over its inputs for testing.
 fn outer_timeout(connect: Duration, run: Duration) -> Duration {
-    connect + run + Duration::from_secs(1)
+    connect
+        .saturating_add(run)
+        .saturating_add(Duration::from_secs(1))
 }
 
+/// The configured max concurrent host triggers (`0`/unparseable/absent → the default),
+/// itself capped at `MAX_CONCURRENCY_CEILING`. The EFFECTIVE worker count is further
+/// bounded to the number of selected hosts by [`aggregate`] — see [`effective_concurrency`].
 fn max_concurrency() -> usize {
     env_nonempty(COMPILER_DEPLOY_MAX_CONCURRENCY)
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_MAX_CONCURRENCY)
+        .min(MAX_CONCURRENCY_CEILING)
+}
+
+/// The EFFECTIVE number of concurrent workers: `0` for an EMPTY host list (spawn
+/// nothing), otherwise `min(configured, host_count, ceiling)` floored at 1. This is
+/// what stops a huge/malformed `COMPILER_DEPLOY_MAX_CONCURRENCY` from spawning an
+/// absurd number of workers (never more than there are hosts, never above the
+/// ceiling). Pure for unit-testing.
+fn effective_concurrency(configured: usize, host_count: usize) -> usize {
+    if host_count == 0 {
+        return 0;
+    }
+    configured
+        .min(host_count)
+        .min(MAX_CONCURRENCY_CEILING)
+        .max(1)
 }
 
 /// Substitute `{module}`/`{channel}` in a template.
@@ -864,8 +904,13 @@ where
 {
     use futures_util::stream::{FuturesUnordered, StreamExt};
     let mut pending = FuturesUnordered::new();
+    // Bound the worker count to min(configured, hosts, ceiling) BEFORE the prime loop —
+    // so a huge/malformed `concurrency` (or an empty host list) can never spin an
+    // absurd number of iterations. Empty hosts ⇒ 0 workers ⇒ the loop and the whole
+    // aggregate return promptly.
+    let workers = effective_concurrency(concurrency, hosts.len());
     let mut iter = hosts.into_iter();
-    for _ in 0..concurrency.max(1) {
+    for _ in 0..workers {
         if let Some(h) = iter.next() {
             pending.push(trigger(h));
         }
@@ -1732,6 +1777,101 @@ mod tests {
         assert_eq!(outer, Duration::from_secs(311));
         // Even with a tiny run budget, outer still exceeds connect.
         assert!(outer_timeout(Duration::from_secs(10), Duration::from_secs(0)) > connect);
+    }
+
+    #[test]
+    fn parse_timeout_secs_clamps_and_defaults() {
+        // Finding 2: a huge (but parse-valid) value CLAMPS to the max, never overflows.
+        assert_eq!(
+            parse_timeout_secs(Some(u64::MAX.to_string()), 300),
+            Duration::from_secs(MAX_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            parse_timeout_secs(Some("999999999999".into()), 300),
+            Duration::from_secs(MAX_TIMEOUT_SECS)
+        );
+        // A normal value passes through.
+        assert_eq!(parse_timeout_secs(Some("120".into()), 300), Duration::from_secs(120));
+        // 0 / unparseable / absent → the safe default.
+        assert_eq!(parse_timeout_secs(Some("0".into()), 300), Duration::from_secs(300));
+        assert_eq!(parse_timeout_secs(Some("nope".into()), 300), Duration::from_secs(300));
+        assert_eq!(parse_timeout_secs(None, 300), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn outer_timeout_saturates_without_panic_on_absurd_inputs() {
+        // Finding 2: even with absurd Durations (which the clamp prevents in practice),
+        // the saturating arithmetic yields a valid Duration and never panics, and it is
+        // still > the connect budget.
+        let connect = Duration::from_secs(MAX_TIMEOUT_SECS);
+        let run = Duration::from_secs(MAX_TIMEOUT_SECS);
+        let outer = outer_timeout(connect, run);
+        assert!(outer > connect, "outer > connect even at the clamp ceiling");
+        // A pathological pre-clamp value can't overflow either (saturates to Duration::MAX).
+        let huge = Duration::MAX;
+        let outer = outer_timeout(huge, huge);
+        assert_eq!(outer, Duration::MAX, "saturates, never panics");
+    }
+
+    #[test]
+    fn effective_concurrency_bounds_workers() {
+        // Finding 1: never more than the configured value, the host count, or the ceiling.
+        assert_eq!(effective_concurrency(1_000_000, 3), 3, "capped to host count");
+        assert_eq!(
+            effective_concurrency(1_000_000, 10_000),
+            MAX_CONCURRENCY_CEILING,
+            "capped to the hard ceiling"
+        );
+        assert_eq!(effective_concurrency(2, 8), 2, "honors a small configured value");
+        assert_eq!(effective_concurrency(1_000_000, 0), 0, "empty host list → zero workers");
+        assert_eq!(effective_concurrency(0, 4), 1, "0 configured floors at 1 worker");
+    }
+
+    #[tokio::test]
+    async fn aggregate_bounds_workers_and_returns_all_hosts() {
+        // A huge configured concurrency with N hosts spawns at most min(N, ceiling)
+        // workers (not the huge value) and still returns EVERY host's result. The
+        // worker count is observed via a shared max-in-flight counter.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let hosts: Vec<DeployHost> = (0..5)
+            .map(|n| DeployHost {
+                label: format!("host-{n}"),
+                ssh_target: format!("u@host-{n}"),
+            })
+            .collect();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let results = aggregate(hosts, usize::MAX, |h| {
+            let in_flight = in_flight.clone();
+            let max_seen = max_seen.clone();
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(now, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                HostDeployResult {
+                    host: h.label,
+                    outcome: DeployOutcome::Deployed,
+                    detail: None,
+                }
+            }
+        })
+        .await;
+        assert_eq!(results.len(), 5, "every host's result returned");
+        let peak = max_seen.load(Ordering::SeqCst);
+        assert!(peak <= 5, "never more workers than hosts; peak={peak}");
+        assert!(peak <= MAX_CONCURRENCY_CEILING, "never above the ceiling; peak={peak}");
+    }
+
+    #[tokio::test]
+    async fn aggregate_empty_hosts_spawns_none_and_returns_promptly() {
+        // An empty host list with a huge configured concurrency must NOT loop/spawn.
+        let results = aggregate(Vec::new(), usize::MAX, |h: DeployHost| async move {
+            HostDeployResult { host: h.label, outcome: DeployOutcome::Deployed, detail: None }
+        })
+        .await;
+        assert!(results.is_empty());
     }
 
     #[tokio::test]

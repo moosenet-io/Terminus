@@ -602,10 +602,15 @@ removed is not trusted), its first line sanitized to `[A-Za-z0-9_-]`; absent/unc
 degrades to the systemd `Result` + exit code, and `deployed` requires `rc == 0` AND
 `Result=success`),
 `COMPILER_DEPLOY_TRIGGER_TIMEOUT_SECS` (default 300 — the post-connect RUN budget; larger than the
-BLD-08 marker read since the trigger runs the updater synchronously),
-`COMPILER_DEPLOY_CONNECT_TIMEOUT_SECS` (default 10 — the ssh `ConnectTimeout`; the outer
-wall-clock is `connect + run + 1s`, strictly greater, so a connect hang is `unreachable` not
-`timed_out`), `COMPILER_DEPLOY_MAX_CONCURRENCY` (default 4), and `COMPILER_AUTO_DEPLOY`.
+BLD-08 marker read since the trigger runs the updater synchronously; **clamped** to a 6-hour max so
+a huge value can't overflow),
+`COMPILER_DEPLOY_CONNECT_TIMEOUT_SECS` (default 10 — the ssh `ConnectTimeout`; also clamped; the
+outer wall-clock is `connect + run + 1s` via **saturating** arithmetic, strictly greater, so a
+connect hang is `unreachable` not `timed_out` and no combination can overflow/panic),
+`COMPILER_DEPLOY_MAX_CONCURRENCY` (default 4 — the effective worker count is **bounded to
+`min(configured, number-of-selected-hosts, 64)`**, so a huge/malformed value or an empty host list
+can never spawn an absurd number of workers), and `COMPILER_AUTO_DEPLOY`. Every one of these is
+robust to malformed config — a `0`/unparseable/absent value falls back to its safe default.
 
 ## Fleet clock — `time_now` (CLK-01)
 
