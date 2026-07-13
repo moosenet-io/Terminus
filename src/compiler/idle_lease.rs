@@ -284,6 +284,42 @@ fn freed_from_body(body: &serde_json::Value) -> Option<f64> {
     None
 }
 
+/// Poll interval while waiting for a mid-transition MINT to settle to a CONFIRMED idle.
+const MINT_SETTLE_POLL: Duration = Duration::from_millis(100);
+
+/// Turn a MINT `enter_idle` outcome into a clean idle result. A CONFIRMED idle
+/// (`Entered`/`AlreadyIdle`) yields the freed figure. An `InTransition` did NOT reach a
+/// clean idle this call (a concurrent enter/activate was in flight), so — instead of
+/// falsely reporting success — this WAITS (polling `is_idle` every `poll`) until MINT is
+/// CONFIRMED idle, then returns `Ok(None)`. It never returns on its own while MINT is
+/// still mid-transition: the caller's per-op `timeout` bounds the wait and, on expiry,
+/// cancels this future so `acquire_lease` treats it as a FAILED idle (abort + requeue).
+/// This guarantees acquire never proceeds to a build while MINT is merely mid-transition.
+/// Generic over the idle observer so it is unit-testable without the global controller.
+async fn settle_mint_idle<F>(
+    enter: (crate::mint::idle::EnterOutcome, Option<crate::mint::idle::IdleReport>),
+    is_idle: F,
+    poll: Duration,
+) -> Result<Option<f64>, String>
+where
+    F: Fn() -> bool,
+{
+    use crate::mint::idle::EnterOutcome;
+    let (outcome, report) = enter;
+    match outcome {
+        // Confirmed idle now (or already idle from a prior lease) — surface the freed figure.
+        EnterOutcome::Entered(_) | EnterOutcome::AlreadyIdle(_) => Ok(report.and_then(|r| r.freed_gb)),
+        // NOT a clean idle: wait until CONFIRMED idle (bounded by the caller's op timeout,
+        // which cancels this if MINT never settles → treated as a failed idle).
+        EnterOutcome::InTransition => loop {
+            if is_idle() {
+                return Ok(None);
+            }
+            tokio::time::sleep(poll).await;
+        },
+    }
+}
+
 #[async_trait]
 impl IdleBackend for ProdIdleBackend {
     async fn chord_idle(&self) -> Result<Option<f64>, String> {
@@ -296,19 +332,16 @@ impl IdleBackend for ProdIdleBackend {
     }
 
     async fn mint_idle(&self) -> Result<Option<f64>, String> {
-        use crate::mint::idle::{enter_idle, EnterOutcome};
-        let (outcome, report) = enter_idle(LEASE_REASON).await;
-        match outcome {
-            // Entered now, or already idle from a prior lease — either way MINT's
-            // RAM is released. Surface whatever freed figure we have.
-            EnterOutcome::Entered(_) | EnterOutcome::AlreadyIdle(_) => {
-                Ok(report.and_then(|r| r.freed_gb))
-            }
-            // A concurrent transition means we didn't get a clean idle this call;
-            // report no figure but do NOT hard-fail (the wait loop + budget gate
-            // still governs whether the build may start).
-            EnterOutcome::InTransition => Ok(None),
-        }
+        use crate::mint::idle::{enter_idle, mint_idle as mint_controller};
+        let enter = enter_idle(LEASE_REASON).await;
+        // On `InTransition`, poll the process-global MINT controller's settled state.
+        // Bounded by the caller's per-op timeout (which cancels this if it never settles).
+        settle_mint_idle(
+            enter,
+            || mint_controller().is_idle(),
+            MINT_SETTLE_POLL,
+        )
+        .await
     }
 
     async fn mint_activate(&self) -> Result<(), String> {
@@ -1408,6 +1441,122 @@ mod tests {
             "hung idle degrades to IdleFailed, got {err:?}"
         );
         // Guaranteed (detached) reactivation on abort — nothing left idle.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(be.activates(), (1, 1));
+    }
+
+    // ── MINT `InTransition` must not count as a clean idle (rev-10 finding) ──────────
+
+    fn manifest() -> crate::mint::idle::ResumeManifest {
+        crate::mint::idle::ResumeManifest {
+            reason: "compiler-heavy-build".into(),
+            entered_at: 0,
+            watchdog_deadline: 0,
+            released_holders: vec![],
+            mem_available_before_gb: 0.0,
+        }
+    }
+    fn idle_report(freed: Option<f64>) -> crate::mint::idle::IdleReport {
+        crate::mint::idle::IdleReport {
+            mem_available_before_gb: None,
+            mem_available_after_gb: None,
+            freed_gb: freed,
+            holders_released: vec![],
+            inflight_remaining: 0,
+            foreign_gpu_lock_holder: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn settle_confirmed_idle_returns_freed_without_polling() {
+        // A CONFIRMED idle (Entered/AlreadyIdle) returns the freed figure immediately and
+        // never polls the settled-state observer.
+        use crate::mint::idle::EnterOutcome;
+        let polled = std::sync::Arc::new(AtomicBool::new(false));
+        let p = polled.clone();
+        let out = settle_mint_idle(
+            (EnterOutcome::Entered(manifest()), Some(idle_report(Some(42.0)))),
+            move || {
+                p.store(true, Ordering::SeqCst);
+                true
+            },
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(out, Ok(Some(42.0)));
+        assert!(!polled.load(Ordering::SeqCst), "confirmed idle must not poll the observer");
+
+        // AlreadyIdle behaves the same (idle from a prior lease).
+        let out = settle_mint_idle(
+            (EnterOutcome::AlreadyIdle(manifest()), None),
+            || true,
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(out, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn settle_in_transition_waits_until_confirmed_idle() {
+        // An `InTransition` is NOT a clean idle — it must WAIT until the observer reports
+        // a settled idle, THEN return Ok (a transient in-transition converges, no requeue).
+        use crate::mint::idle::EnterOutcome;
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let out = settle_mint_idle(
+            (EnterOutcome::InTransition, None),
+            move || c.fetch_add(1, Ordering::SeqCst) >= 2, // idle only from the 3rd poll on
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(out, Ok(None), "settled to idle ⇒ Ok");
+        assert!(calls.load(Ordering::SeqCst) >= 3, "polled until confirmed idle");
+    }
+
+    #[tokio::test]
+    async fn settle_in_transition_that_never_settles_never_returns_ok() {
+        // An `InTransition` that NEVER settles must NOT return Ok (never a false idle). It
+        // loops until the caller's per-op timeout cancels it — modelled here by an outer
+        // timeout. On expiry the (real) acquire path treats it as a FAILED idle → abort.
+        use crate::mint::idle::EnterOutcome;
+        let res = tokio::time::timeout(
+            Duration::from_millis(50),
+            settle_mint_idle(
+                (EnterOutcome::InTransition, None),
+                || false, // never settles
+                Duration::from_millis(1),
+            ),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "unsettled InTransition must never return Ok — it waits (until cancelled)"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_mid_transition_that_never_settles_aborts_requeue_never_builds() {
+        // End-to-end: when MINT never reaches a clean idle (modelled as a mint_idle that
+        // does not return within the per-op timeout — exactly how `settle_mint_idle`
+        // behaves on an unsettled InTransition), acquire must ABORT + requeue (IdleFailed),
+        // NEVER proceed to a build, and both services are reactivated.
+        let be = MockBackend::new(None, None)
+            .with_mem(vec![200.0]) // ample RAM — proves the abort is due to MINT, not budget
+            .with_mint_idle_delay_ms(3_600_000); // mint_idle never returns in time
+        let mut c = cfg(5, 3600);
+        c.op_timeout = Duration::from_millis(20);
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            acquire_lease(be.clone(), &c, true, 120.0),
+        )
+        .await
+        .expect("acquire returned (did not hang)")
+        .expect_err("unsettled MINT ⇒ IdleFailed abort (never builds)");
+        assert!(
+            matches!(err, LeaseError::IdleFailed { .. }),
+            "MINT never confirmed idle ⇒ IdleFailed, got {err:?}"
+        );
+        // Reactivated on abort (chord was idled first, then the MINT idle timed out).
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(be.activates(), (1, 1));
     }
