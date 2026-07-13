@@ -108,13 +108,17 @@ is_allowed_bind_addr() {
   return 1   # not a parseable IP literal (hostname/garbage) → reject
 }
 
-# Validate a full REDIS_BIND value (space-separated). Every token must be an
-# allowed private/loopback literal AND 127.0.0.1 (IPv4 loopback) MUST be present:
-# the post-install health checks and redis.service ExecStop call `redis-cli -p`
-# WITHOUT `-h`, which resolves to 127.0.0.1 — so an IPv6-loopback-only (::1)
-# bind, though otherwise permitted, would fail those checks and graceful
-# shutdown. Requiring 127.0.0.1 keeps every redis-cli call consistent. Silent
-# (returns 0/1) so the self-test can assert on it.
+# Validate a full REDIS_BIND value (space-separated). Bind-policy contract:
+#   - 127.0.0.1 (IPv4 loopback) is REQUIRED: the post-install health checks and
+#     redis.service ExecStop call `redis-cli -p` WITHOUT `-h`, which resolves to
+#     127.0.0.1, so an IPv6-loopback-only (::1) bind — though otherwise permitted
+#     — would fail those. Requiring it keeps every redis-cli call consistent.
+#   - A private MESH address (RFC1918/ULA/link-local) is PERMITTED and typical
+#     for a FLEET deploy (federated consumers reach Redis over the mesh) but is
+#     NOT required: a single-node / co-located-consumer deploy is a valid
+#     loopback-only bind. We do NOT force a mesh address.
+#   - Any PUBLIC / non-parseable address is always REJECTED (per is_allowed_bind_addr).
+# Silent (returns 0/1) so the self-test can assert on it.
 validate_bind_list() {
   local list="$1" addr have_ipv4_loopback=0
   for addr in ${list}; do

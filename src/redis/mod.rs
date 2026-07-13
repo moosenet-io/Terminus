@@ -216,11 +216,39 @@ impl std::fmt::Debug for RedisBackend {
     }
 }
 
+/// Test-only counter of how many times the shared-singleton initializer has
+/// run. `from_env`'s `get_or_init` runs its closure at most once per process, so
+/// this proves memoization (see `from_env_is_a_process_global_singleton`).
+#[cfg(test)]
+static SHARED_INIT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 impl RedisBackend {
-    /// Build from the environment. Returns `None` when Redis is not configured
-    /// (`REDIS_URL`/`PLANE_REDIS_URL` unset) — the fully-degraded path each
-    /// consumer already tolerates.
+    /// The PROCESS-GLOBAL shared backend, returning a clone of the SAME
+    /// `Arc<RedisBackend>` (hence the same `DbPool`/`ConnectionManager` per
+    /// logical DB) on every call. This is what makes "one shared pooled backend"
+    /// real: `GatewayFramework` (proxy limiter + admission queue) and
+    /// `PrefixOverlay` both call this, so they reuse the ONE pool rather than
+    /// each opening their own. Initialized ONCE from the environment (env is
+    /// materialized from the vault at boot, before any consumer builds), and
+    /// `None` when Redis is not configured — the fully-degraded path each
+    /// consumer already tolerates. Fail-closed/degradation behavior is
+    /// unchanged (each op still degrades via `with_conn`).
     pub fn from_env() -> Option<Arc<Self>> {
+        static SHARED: std::sync::OnceLock<Option<Arc<RedisBackend>>> = std::sync::OnceLock::new();
+        SHARED
+            .get_or_init(|| {
+                #[cfg(test)]
+                SHARED_INIT_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Self::from_env_uncached()
+            })
+            .clone()
+    }
+
+    /// Build a FRESH backend from the environment (not the shared singleton).
+    /// Used by the live integration tests so the process-global cache is never
+    /// poisoned by a CI run with `REDIS_URL` unset. Production consumers use
+    /// [`from_env`](Self::from_env) to share the one pool.
+    pub(crate) fn from_env_uncached() -> Option<Arc<Self>> {
         let url = resolve_url()?;
         let password = resolve_password();
         let db_durable = resolve_db("REDIS_DB_DURABLE", DEFAULT_DB_DURABLE);
@@ -393,5 +421,33 @@ mod tests {
                 .expect("offline construction");
         let rendered = format!("{backend:?}");
         assert!(!rendered.contains("s3cr3t"), "Debug must not print the password");
+    }
+
+    #[test]
+    fn from_env_is_a_process_global_singleton() {
+        use std::sync::atomic::Ordering;
+        // Two "consumers" (mirroring GatewayFramework + PrefixOverlay) call the
+        // shared accessor. They must obtain the SAME backend — one pool, reused.
+        let a = RedisBackend::from_env();
+        let b = RedisBackend::from_env();
+        match (a, b) {
+            // Configured: the exact same Arc → the same DbPool/ConnectionManager.
+            (Some(x), Some(y)) => assert!(
+                Arc::ptr_eq(&x, &y),
+                "both consumers must share ONE Arc<RedisBackend> (same pool)"
+            ),
+            // Not configured (no REDIS_URL, e.g. CI): still memoized as one None.
+            (None, None) => {}
+            _ => panic!("from_env must be deterministic across calls (memoized singleton)"),
+        }
+        // The initializer ran AT MOST once for the whole process — proving the
+        // singleton is not rebuilt per call (this is the crux of finding #1).
+        // `get_or_init` guarantees <= 1; and since we called `from_env` above it
+        // is exactly 1.
+        assert_eq!(
+            SHARED_INIT_COUNT.load(Ordering::SeqCst),
+            1,
+            "the shared backend must be constructed exactly once, then reused"
+        );
     }
 }

@@ -747,9 +747,11 @@ mod tests {
     // ── Live tests (require a real Redis; run by the test-gate) ───────────────
 
     async fn live_backend() -> Option<Arc<RedisBackend>> {
-        // Only runs where REDIS_URL is materialized. `from_env` returns None
-        // otherwise, so these self-skip off the build farm.
-        RedisBackend::from_env()
+        // Only runs where REDIS_URL is materialized. Use the UNCACHED constructor
+        // (not the process-global singleton) so these live tests neither depend
+        // on nor poison the shared cache — a fresh backend reflects the current
+        // REDIS_URL regardless of whether a non-live test already memoized None.
+        RedisBackend::from_env_uncached()
     }
 
     #[tokio::test]
