@@ -527,13 +527,17 @@ compiler_deploy(module, channel="stable", hosts="all")
   others still proceed and the nightly timer catches the straggler.
 - **No-masked-failures / no-raw-echo hardening:** the trigger forces **non-interactive sudo**
   (`sudo -n`) so a password prompt fails fast instead of hanging the whole per-host budget; the
-  outcome marker is **run-scoped** (cleared before each trigger) so a stale prior-run token can't
-  mask a current failure; a non-zero `systemctl start` rc is classified `failed` regardless of
-  the unit's (possibly stale) `Result`; the per-host `detail` is **fixed-vocabulary only**
-  (`outcome=… rc=…`) — the raw updater marker token is **never echoed** into structured output;
-  an **unknown requested host** is reported by **count only** (never reflecting arbitrary caller
-  input / ssh targets back); and `COMPILER_DEPLOY_SYSTEMCTL` is a **constrained** command (bare
-  tokens only, shell metacharacters rejected with a config error — not arbitrary shell).
+  outcome marker is **mtime-fresh / run-scoped** — the wrapper records a run-start epoch and reads
+  the token **only if the marker's mtime is ≥ that start**, so a stale prior-run marker the ssh
+  user could not remove (a root-owned marker) is never trusted and can't mask a current run; a
+  non-zero `systemctl start` rc is classified `failed` regardless of the unit's (possibly stale)
+  `Result`; the **outer wall-clock timeout is strictly greater than the ssh connect budget**, so
+  a connect/auth hang surfaces as `unreachable` (never `timed_out`); the per-host `detail` is
+  **fixed-vocabulary only** (`outcome=… rc=…`) — the raw updater marker token is **never echoed**
+  into structured output; an **unknown requested host** is reported by **count only** (never
+  reflecting arbitrary caller input / ssh targets back); and `COMPILER_DEPLOY_SYSTEMCTL` is a
+  **constrained** command whose **executable must be `systemctl`** (bare tokens only, shell
+  metacharacters rejected with a config error — not arbitrary shell).
 - **Aggregation:** the result carries every host's `{host, outcome, detail}` plus `counts`
   (`deployed`/`skipped`/`rolled_back`/`failed`/`timed_out`/`unknown`/`unreachable`/`total`), a
   `degraded` flag and
@@ -558,13 +562,17 @@ Config (all optional, no infra literals — S1): `COMPILER_DEPLOY_HOSTS` (shared
 `compiler_status`; `;`-separated `label|ssh_target`), `COMPILER_DEPLOY_UNIT_TEMPLATE` (default
 `constellation-update@{module}.service`; `{module}`/`{channel}` substituted),
 `COMPILER_DEPLOY_SYSTEMCTL` (default `systemctl`; a **constrained** command — bare tokens
-`[A-Za-z0-9._/-]` that must invoke `systemctl`, e.g. `sudo systemctl`; shell metacharacters are
-rejected. A `sudo` prefix is auto-forced non-interactive with `-n`),
+`[A-Za-z0-9._/-]` whose **executable must be `systemctl`** after an optional leading `sudo [-n …]`,
+e.g. `sudo systemctl` / `sudo -n /usr/bin/systemctl`; shell metacharacters and a non-systemctl
+executable are rejected. A `sudo` prefix is auto-forced non-interactive with `-n`),
 `COMPILER_DEPLOY_RESULT_MARKER_TEMPLATE` (default
-`/opt/{module}/.deploy_result` — the updater's outcome-token file; absent it, the outcome
-degrades to the systemd `Result` + exit code), `COMPILER_DEPLOY_TRIGGER_TIMEOUT_SECS` (default
-300 — larger than the BLD-08 marker read since the trigger runs the updater synchronously),
-`COMPILER_DEPLOY_MAX_CONCURRENCY` (default 4), and `COMPILER_AUTO_DEPLOY`.
+`/opt/{module}/.deploy_result` — the updater's outcome-token file, trusted only when mtime-fresh;
+absent/stale, the outcome degrades to the systemd `Result` + exit code),
+`COMPILER_DEPLOY_TRIGGER_TIMEOUT_SECS` (default 300 — the post-connect RUN budget; larger than the
+BLD-08 marker read since the trigger runs the updater synchronously),
+`COMPILER_DEPLOY_CONNECT_TIMEOUT_SECS` (default 10 — the ssh `ConnectTimeout`; the outer
+wall-clock is `connect + run + 1s`, strictly greater, so a connect hang is `unreachable` not
+`timed_out`), `COMPILER_DEPLOY_MAX_CONCURRENCY` (default 4), and `COMPILER_AUTO_DEPLOY`.
 
 ## Fleet clock — `time_now` (CLK-01)
 

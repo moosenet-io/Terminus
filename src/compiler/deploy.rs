@@ -74,10 +74,16 @@ const COMPILER_DEPLOY_SYSTEMCTL: &str = "COMPILER_DEPLOY_SYSTEMCTL";
 /// `rolled_back` / `skipped` / `failed`) the compiler reads it back to classify
 /// the outcome authoritatively; absent, it degrades to the systemd `Result`.
 const COMPILER_DEPLOY_RESULT_MARKER_TEMPLATE: &str = "COMPILER_DEPLOY_RESULT_MARKER_TEMPLATE";
-/// Env: ssh connect + trigger timeout seconds. The trigger runs the updater
-/// SYNCHRONOUSLY (fetch + swap + health-gate), so this is much larger than the
-/// BLD-08 marker-read timeout.
+/// Env: the RUN budget (seconds) for the SYNCHRONOUS updater once connected (fetch
+/// + swap + health-gate), so it is much larger than the BLD-08 marker-read timeout.
+/// The OUTER wall-clock timeout is this PLUS the connect budget (see below), so it
+/// is always strictly greater than the ssh `ConnectTimeout` — a connect/auth hang
+/// surfaces as ssh's OWN non-zero exit (→ `unreachable`) before the outer timer
+/// could fire, so `timed_out` only ever means "connected, updater ran too long."
 const COMPILER_DEPLOY_TRIGGER_TIMEOUT_SECS: &str = "COMPILER_DEPLOY_TRIGGER_TIMEOUT_SECS";
+/// Env: the ssh CONNECT budget (seconds) — passed as ssh `ConnectTimeout`. Kept
+/// small; a dead/hung host fails connect within this and is reported `unreachable`.
+const COMPILER_DEPLOY_CONNECT_TIMEOUT_SECS: &str = "COMPILER_DEPLOY_CONNECT_TIMEOUT_SECS";
 /// Env: max concurrent host triggers.
 const COMPILER_DEPLOY_MAX_CONCURRENCY: &str = "COMPILER_DEPLOY_MAX_CONCURRENCY";
 /// Env: auto-fire `compiler_deploy` after a successful `compiler_release` promote
@@ -90,6 +96,7 @@ const DEFAULT_UNIT_TEMPLATE: &str = "constellation-update@{module}.service";
 const DEFAULT_RESULT_MARKER_TEMPLATE: &str = "/opt/{module}/.deploy_result";
 const DEFAULT_SYSTEMCTL: &str = "systemctl";
 const DEFAULT_TRIGGER_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_MAX_CONCURRENCY: usize = 4;
 
 /// The sentinel line the remote wrapper prints so we can parse the outcome from a
@@ -128,15 +135,23 @@ fn is_safe_systemctl_token(t: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
 }
 
-/// Validate `COMPILER_DEPLOY_SYSTEMCTL` (finding 4): it is a CONSTRAINED systemctl
-/// invocation, **not** arbitrary operator shell. It must be a whitespace-separated
-/// token list where every token is a safe bare word (`[A-Za-z0-9._/-]`) and one
-/// token is `systemctl` (or a `.../systemctl` path) — so `systemctl`,
-/// `sudo systemctl`, `sudo -n systemctl`, `/usr/bin/systemctl` are accepted, while
-/// anything carrying a shell metacharacter (`; | & $ > < \` \ ( ) { } * ? quotes
-/// newlines`) or an unexpected token is REJECTED with a clear config error (never
-/// inserted into the remote shell). Empty/unset ⇒ the default `systemctl`. The
-/// error message NEVER echoes the raw value back (S1).
+/// Whether a token is `systemctl` or a `.../systemctl` absolute/relative path — the
+/// only permitted EXECUTABLE for the deploy trigger.
+fn is_systemctl_exe(t: &str) -> bool {
+    t == "systemctl" || t.ends_with("/systemctl")
+}
+
+/// Validate `COMPILER_DEPLOY_SYSTEMCTL`: it is a CONSTRAINED systemctl invocation,
+/// **not** arbitrary operator shell. It must be a whitespace-separated token list of
+/// safe bare words (`[A-Za-z0-9._/-]`, no shell metacharacters/control chars), and
+/// — crucially — the ACTUAL EXECUTABLE must be `systemctl` (finding 3): after an
+/// optional leading `sudo` and its `-…` flags, the first non-flag token is the
+/// executable and MUST be `systemctl` (or a `.../systemctl` path). So `systemctl`,
+/// `sudo systemctl`, `sudo -n systemctl`, `sudo -n /usr/bin/systemctl` are accepted,
+/// while `reboot systemctl` / `sudo reboot systemctl` (executable is `reboot`) are
+/// REJECTED. Any metacharacter or a non-systemctl executable is a clear config error
+/// (never inserted into the remote shell). Empty/unset ⇒ the default `systemctl`.
+/// The error message NEVER echoes the raw value back (S1).
 fn validate_systemctl_cmd(raw: &str) -> Result<String, ToolError> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -162,14 +177,22 @@ fn validate_systemctl_cmd(raw: &str) -> Result<String, ToolError> {
              (bare tokens of [A-Za-z0-9._/-] only — no shell metacharacters); rejected"
         )));
     }
-    if !toks
-        .iter()
-        .any(|t| *t == "systemctl" || t.ends_with("/systemctl"))
-    {
-        return Err(ToolError::InvalidArgument(format!(
-            "{COMPILER_DEPLOY_SYSTEMCTL} must invoke `systemctl` (e.g. `systemctl` or \
-             `sudo -n systemctl`); rejected"
-        )));
+    // Locate the EXECUTABLE: skip an optional leading `sudo` and its dash-flags.
+    let mut i = 0;
+    if toks.get(i) == Some(&"sudo") {
+        i += 1;
+        while matches!(toks.get(i), Some(t) if t.starts_with('-')) {
+            i += 1;
+        }
+    }
+    match toks.get(i) {
+        Some(exe) if is_systemctl_exe(exe) => {}
+        _ => {
+            return Err(ToolError::InvalidArgument(format!(
+                "{COMPILER_DEPLOY_SYSTEMCTL} executable must be `systemctl` (optionally via a \
+                 leading `sudo [-n]`); e.g. `systemctl` or `sudo -n systemctl`; rejected"
+            )));
+        }
     }
     Ok(raw.to_string())
 }
@@ -180,12 +203,31 @@ fn systemctl_env_raw() -> String {
     env_nonempty(COMPILER_DEPLOY_SYSTEMCTL).unwrap_or_default()
 }
 
+/// The RUN budget for the synchronous updater (post-connect).
 fn trigger_timeout() -> Duration {
     let secs = env_nonempty(COMPILER_DEPLOY_TRIGGER_TIMEOUT_SECS)
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_TRIGGER_TIMEOUT_SECS);
     Duration::from_secs(secs)
+}
+
+/// The ssh CONNECT budget (passed as `ConnectTimeout`).
+fn connect_timeout() -> Duration {
+    let secs = env_nonempty(COMPILER_DEPLOY_CONNECT_TIMEOUT_SECS)
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// The OUTER wall-clock timeout for the whole trigger: STRICTLY GREATER than the ssh
+/// `ConnectTimeout` (it is connect + run, +1s of slack). This headroom guarantees a
+/// connect/auth hang is surfaced as ssh's own non-zero exit (→ `unreachable`) BEFORE
+/// the outer timer fires — so `timed_out` can only mean "connected, updater ran too
+/// long," never "couldn't connect." Pure over its inputs for unit-testing.
+fn outer_timeout(connect: Duration, run: Duration) -> Duration {
+    connect + run + Duration::from_secs(1)
 }
 
 fn max_concurrency() -> usize {
@@ -440,14 +482,16 @@ fn ensure_non_interactive_sudo(prefix: &str) -> String {
 
 /// Render the remote shell command that TRIGGERS the updater synchronously and
 /// prints a deterministic outcome line. It:
-///   1. CLEARS any pre-existing outcome-token marker (finding 4: run-scoped) so a
-///      STALE `deployed`/`skipped` token from a PREVIOUS run can never be read back
-///      and mask a current failure that aborts before writing a fresh marker,
+///   1. records a run START epoch (`__start`), then best-effort clears any prior
+///      marker (`rm -f`),
 ///   2. runs `<systemctl> start <unit>` (a `Type=oneshot` updater unit blocks until
 ///      the whole fetch→swap→health→rollback→marker flow finishes), captures its
 ///      exit code — with `sudo` forced non-interactive (`-n`) so it fails fast
 ///      instead of hanging on a password prompt,
-///   3. reads the systemd `Result` and the (now run-scoped) outcome-token file,
+///   3. reads the systemd `Result`, then reads the outcome-token file ONLY IF its
+///      MTIME is `>= __start` (finding 2: MTIME-FRESH). A marker whose mtime predates
+///      this run — a stale token the ssh user could NOT `rm` (root-owned marker) — is
+///      NEVER trusted, so it can't mask a current run that wrote no fresh marker,
 ///   4. prints `COMPILER_DEPLOY rc=<rc> result=<result> token=<token>`,
 ///   5. ALWAYS `exit 0` — so ssh's OWN exit code reflects only CONNECTIVITY (a
 ///      non-zero ssh exit ⇒ unreachable, never merely a failed deploy). This is
@@ -455,16 +499,18 @@ fn ensure_non_interactive_sudo(prefix: &str) -> String {
 ///
 /// `systemctl` is inserted verbatim after non-interactive normalization
 /// (operator-trusted config, may be `sudo systemctl`); the unit + marker path are
-/// shell-quoted.
+/// shell-quoted. No `${…}` brace-expansion is used (it would collide with `format!`).
 pub fn render_remote_trigger_cmd(systemctl: &str, unit: &str, result_marker: &str) -> String {
     let systemctl = ensure_non_interactive_sudo(systemctl);
     let u = shell_quote(unit);
     let m = shell_quote(result_marker);
     format!(
-        "rm -f -- {m} 2>/dev/null; \
+        "__start=$(date +%s); \
+         rm -f -- {m} 2>/dev/null; \
          {systemctl} start {u}; __rc=$?; \
          __res=$({systemctl} show {u} --property=Result --value 2>/dev/null); \
-         __tok=$(cat -- {m} 2>/dev/null); \
+         __mt=$(stat -c %Y -- {m} 2>/dev/null || echo 0); \
+         if [ \"$__mt\" -ge \"$__start\" ] 2>/dev/null; then __tok=$(cat -- {m} 2>/dev/null); else __tok=; fi; \
          printf '{sentinel} rc=%s result=%s token=%s\\n' \"$__rc\" \"$__res\" \"$__tok\"; \
          exit 0",
         sentinel = RESULT_SENTINEL
@@ -633,14 +679,18 @@ async fn trigger_one(
     module: String,
     channel: String,
     systemctl: String,
-    timeout: Duration,
+    connect: Duration,
+    outer: Duration,
 ) -> HostDeployResult {
     let unit = render_template(&unit_template(), &module, &channel);
     let marker = render_template(&result_marker_template(), &module, &channel);
     let remote = render_remote_trigger_cmd(&systemctl, &unit, &marker);
     // Reuse the SINGLE sanctioned ssh reach shared with compiler_status (BLD-08).
-    let argv = sanctioned_ssh_argv(&host.ssh_target, &remote, timeout.as_secs());
-    match ssh_trigger(&argv, timeout).await {
+    // ssh `ConnectTimeout` = the small CONNECT budget; the OUTER wall-clock bound
+    // (`outer` > connect) is applied by `ssh_trigger`. So a connect/auth hang exits
+    // ssh (255 → unreachable) BEFORE the outer timer can fire (finding 1).
+    let argv = sanctioned_ssh_argv(&host.ssh_target, &remote, connect.as_secs());
+    match ssh_trigger(&argv, outer).await {
         SshOutcome::Unreachable => HostDeployResult {
             host: host.label,
             outcome: DeployOutcome::Unreachable,
@@ -755,11 +805,21 @@ pub async fn deploy_report(module: &str, channel: &str, hosts_filter: &str) -> D
         }
     };
 
-    let timeout = trigger_timeout();
+    // Connect budget and OUTER wall-clock (strictly greater) so a connect/auth hang
+    // is `unreachable`, never `timed_out` (finding 1).
+    let connect = connect_timeout();
+    let outer = outer_timeout(connect, trigger_timeout());
     let module_s = module.to_string();
     let channel_s = channel.to_string();
     let results = aggregate(chosen, max_concurrency(), |h| {
-        trigger_one(h, module_s.clone(), channel_s.clone(), systemctl.clone(), timeout)
+        trigger_one(
+            h,
+            module_s.clone(),
+            channel_s.clone(),
+            systemctl.clone(),
+            connect,
+            outer,
+        )
     })
     .await;
 
@@ -805,8 +865,9 @@ impl RustTool for CompilerDeploy {
          in seconds (nightly timers remain the catch-all). Fires the fetch-mode \
          `constellation-update@<module>` unit on each configured deploy host over the existing \
          host-reach path and aggregates a per-host outcome (deployed | skipped | rolled_back | \
-         failed | unreachable). The compiler ONLY triggers; the updater owns the swap safety \
-         (health-gate + rollback). Unreachable and rolled-back hosts are reported, never masked."
+         failed | timed_out | unknown | unreachable). The compiler ONLY triggers; the updater \
+         owns the swap safety (health-gate + rollback). Rolled-back, timed-out, unknown, and \
+         unreachable hosts are all reported, never masked."
     }
 
     fn parameters(&self) -> Value {
@@ -1062,11 +1123,15 @@ mod tests {
             "<email>",
             "<path>/.deploy_result",
         );
-        // Finding 4: the STALE marker is cleared BEFORE the trigger (run-scoped).
+        // The marker is cleared BEFORE the trigger (run-scoped best-effort).
         assert!(cmd.contains("rm -f -- '<path>/.deploy_result'"));
+        let start_ts_at = cmd.find("__start=$(date +%s)").expect("run start captured");
         let rm_at = cmd.find("rm -f --").unwrap();
         let start_at = cmd.find("systemctl start").unwrap();
-        assert!(rm_at < start_at, "marker cleared before start (run-scoped)");
+        assert!(start_ts_at < rm_at && rm_at < start_at, "start-epoch, then rm, then trigger");
+        // Finding 2: the token is read ONLY when the marker mtime is fresh (>= run start).
+        assert!(cmd.contains("stat -c %Y -- '<path>/.deploy_result'"));
+        assert!(cmd.contains("[ \"$__mt\" -ge \"$__start\" ]"), "mtime-fresh gate: {cmd}");
         assert!(cmd.contains("systemctl start '<email>'"));
         assert!(cmd.contains("--property=Result --value"));
         assert!(cmd.contains("cat -- '<path>/.deploy_result'"));
@@ -1118,11 +1183,26 @@ mod tests {
                 "must reject: {bad:?}"
             );
         }
-        // A command that does not invoke systemctl is rejected.
-        assert!(matches!(
-            validate_systemctl_cmd("sudo reboot"),
-            Err(ToolError::InvalidArgument(_))
-        ));
+        // Finding 3: the EXECUTABLE must be systemctl. A command whose executable is
+        // NOT systemctl is rejected even if a later arg happens to be `systemctl`.
+        for bad in [
+            "sudo reboot",
+            "reboot systemctl",         // executable is `reboot`, not systemctl
+            "sudo reboot systemctl",    // after sudo, executable is `reboot`
+            "sudo -n reboot systemctl", // after sudo -n, executable is `reboot`
+            "curl systemctl",
+        ] {
+            assert!(
+                matches!(validate_systemctl_cmd(bad), Err(ToolError::InvalidArgument(_))),
+                "executable must be systemctl; must reject: {bad:?}"
+            );
+        }
+        // …and the accepted forms all have systemctl as the executable.
+        assert_eq!(
+            validate_systemctl_cmd("sudo -n /usr/bin/systemctl").unwrap(),
+            "sudo -n /usr/bin/systemctl"
+        );
+
         // The error never echoes the raw (potentially sensitive) value back.
         if let Err(ToolError::InvalidArgument(m)) = validate_systemctl_cmd("systemctl; secret123") {
             assert!(!m.contains("secret123"), "error must not echo raw value: {m}");
@@ -1336,6 +1416,99 @@ mod tests {
         };
         let (rc, result, token) = parse_result_line(&body);
         assert_eq!(classify_reachable(rc, &result, &token), DeployOutcome::Deployed);
+    }
+
+    #[test]
+    fn outer_timeout_has_headroom_over_connect() {
+        // Finding 1: the OUTER wall-clock is STRICTLY greater than the connect budget,
+        // so ssh's own ConnectTimeout (== connect) fires (→ unreachable) before the
+        // outer timer could misfire as timed_out.
+        let connect = Duration::from_secs(10);
+        let outer = outer_timeout(connect, Duration::from_secs(300));
+        assert!(outer > connect, "outer must exceed the connect budget");
+        assert_eq!(outer, Duration::from_secs(311));
+        // Even with a tiny run budget, outer still exceeds connect.
+        assert!(outer_timeout(Duration::from_secs(10), Duration::from_secs(0)) > connect);
+    }
+
+    #[tokio::test]
+    async fn ssh_trigger_connect_fail_before_outer_deadline_is_unreachable() {
+        // Simulate ssh's ConnectTimeout firing: the process exits non-zero (255)
+        // shortly BEFORE the (larger) outer deadline → Unreachable, NOT TimedOut.
+        // This is the guarantee `outer > connect` buys us.
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 0.2; exit 255".to_string(),
+        ];
+        assert!(matches!(
+            ssh_trigger(&argv, Duration::from_secs(3)).await,
+            SshOutcome::Unreachable
+        ));
+    }
+
+    // ── Marker MTIME-freshness (finding 2), exercised end-to-end via `sh` ────
+
+    async fn run_wrapper(systemctl: &str, unit: &str, marker: &std::path::Path) -> String {
+        let cmd = render_remote_trigger_cmd(systemctl, unit, &marker.to_string_lossy());
+        let out = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .output()
+            .await
+            .expect("run wrapper");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn set_mtime(path: &std::path::Path, epoch: i64) {
+        // Use `touch -m -d @<epoch>` (GNU/BusyBox) to set a deterministic mtime.
+        let status = std::process::Command::new("touch")
+            .arg("-m")
+            .arg("-d")
+            .arg(format!("@{epoch}"))
+            .arg(path)
+            .status()
+            .expect("touch mtime");
+        assert!(status.success(), "touch must succeed");
+    }
+
+    /// Run the wrapper against a marker that lives in a NON-WRITABLE directory, so
+    /// the wrapper's best-effort `rm` CANNOT delete it (mirrors a root-owned marker
+    /// the ssh user can't clear) — isolating the MTIME-freshness gate. `systemctl`
+    /// is `true` (writes no fresh marker), so only the mtime gate decides.
+    async fn wrapper_token_with_readonly_marker(content: &str, mtime_epoch: i64) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("deploy_result");
+        std::fs::write(&marker, content).unwrap();
+        set_mtime(&marker, mtime_epoch);
+        // Drop write on the dir so `rm` fails (non-root can't unlink without dir write).
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let body = run_wrapper("true", "unit", &marker).await;
+        // Restore so the tempdir can be cleaned up.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (_rc, _res, token) = parse_result_line(&body);
+        token
+    }
+
+    #[tokio::test]
+    async fn stale_marker_old_mtime_is_not_trusted() {
+        // Finding 2: a pre-existing STALE marker (old mtime) that survives an
+        // unpermitted `rm` must NOT be read — the mtime gate rejects it, so it can't
+        // mask a current run that wrote no fresh marker.
+        let token = wrapper_token_with_readonly_marker("deployed", 1_000_000_000).await;
+        assert!(
+            token.is_empty(),
+            "a stale (old-mtime) marker must not be trusted; got token={token:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_marker_new_mtime_is_trusted() {
+        // A marker with a mtime at/after the run start IS trusted (this run's write).
+        let future = chrono::Utc::now().timestamp() + 3600;
+        let token = wrapper_token_with_readonly_marker("rolled_back", future).await;
+        assert_eq!(token, "rolled_back", "a fresh-mtime marker is trusted");
     }
 
     #[tokio::test]
