@@ -59,6 +59,7 @@ pub mod meridian;
 /// Upstream Terminus mesh registry (MESH-01) — config-driven federation
 /// targets, replacing the two hard-coded backends.
 pub mod mesh;
+pub mod mint; // BLD-10: MINT test-harness idle-mode (release GPU/RAM for a compiler run)
 pub mod model_advisor;
 pub mod <container-mgr>; // pii-test-fixture
 pub mod prometheus;
