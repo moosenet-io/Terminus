@@ -390,30 +390,59 @@ async fn read_store(dataset_root: &Path, only: &[String]) -> StoreView {
 
 // ── Remote deploy-marker probe (bounded, best-effort) ────────────────────────
 
+/// Single-quote-escape one argument so it can be embedded in the remote shell
+/// command string ssh runs (`'` → `'\''`). The marker path is operator-config +
+/// module-derived, so quoting keeps a path with shell metacharacters inert.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Render the ssh argv that reads one host's marker file over the existing
-/// host-reach path. BatchMode + ConnectTimeout so a dead host fails fast and never
-/// prompts; `cat --` guards against an option-like path. No new credentials — this
-/// reuses whatever ssh access the build path already relies on.
+/// host-reach path.
+///
+/// TRI-STATE: the remote command `cat -- <path> 2>/dev/null || true` ALWAYS exits 0
+/// at the remote shell level, so ssh's own exit code reflects ONLY connectivity —
+/// a non-zero ssh exit means the host is UNREACHABLE (connect/auth/timeout), never
+/// merely a missing marker. A reachable host with no marker yields exit 0 + empty
+/// stdout. This is what lets the caller separate `unreachable → unknown` from
+/// `reachable-but-no-marker → undeployed`.
+///
+/// SIDE-EFFECT-FREE (read-only status path): `StrictHostKeyChecking=no` +
+/// `UserKnownHostsFile=/dev/null` so a first-seen host can NEVER mutate the user's
+/// `known_hosts` (unlike `accept-new`). `BatchMode` (never prompts) + `ConnectTimeout`
+/// bound a dead host. `cat --` guards against an option-like path. No new
+/// credentials — this reuses whatever ssh access the build reach-path relies on.
 pub fn render_marker_read_argv(ssh_target: &str, marker: &str, timeout_secs: u64) -> Vec<String> {
+    let remote = format!("cat -- {} 2>/dev/null || true", shell_quote(marker));
     vec![
         "ssh".to_string(),
         "-o".to_string(),
         "BatchMode=yes".to_string(),
         "-o".to_string(),
         format!("ConnectTimeout={timeout_secs}"),
+        // Read-only probe: never write known_hosts.
         "-o".to_string(),
-        "StrictHostKeyChecking=accept-new".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
         ssh_target.to_string(),
-        "cat".to_string(),
-        "--".to_string(),
-        marker.to_string(),
+        remote,
     ]
 }
 
-/// Run an argv, returning its stdout on exit 0, else `None` (any spawn/timeout/
-/// non-zero exit → best-effort miss, the caller renders the cell `unknown`). The
-/// marker holds no secrets, so no redaction machinery is needed here.
-async fn capture_stdout(argv: &[String], timeout: Duration) -> Option<String> {
+/// The result of running the ssh probe command: `Reachable(stdout)` on a clean
+/// (exit 0) connection, else `Unreachable` (spawn failure / connect timeout / any
+/// non-zero ssh exit). Because the remote command is `… || true`, a non-zero exit
+/// can only come from ssh itself, i.e. an unreachable host.
+enum SshResult {
+    Reachable(String),
+    Unreachable,
+}
+
+/// Run the ssh probe argv, classifying the outcome as reachable/unreachable. Never
+/// errors — an unreachable host is a normal, expected outcome. The marker holds no
+/// secrets, so no redaction machinery is needed here.
+async fn ssh_capture(argv: &[String], timeout: Duration) -> SshResult {
     use tokio::io::AsyncReadExt;
     let mut cmd = tokio::process::Command::new(&argv[0]);
     cmd.args(&argv[1..]);
@@ -421,7 +450,9 @@ async fn capture_stdout(argv: &[String], timeout: Duration) -> Option<String> {
     cmd.stderr(std::process::Stdio::null());
     cmd.stdin(std::process::Stdio::null());
     cmd.kill_on_drop(true);
-    let mut child = cmd.spawn().ok()?;
+    let Ok(mut child) = cmd.spawn() else {
+        return SshResult::Unreachable;
+    };
     let mut pipe = child.stdout.take();
     let read = async move {
         let mut buf = Vec::new();
@@ -437,24 +468,37 @@ async fn capture_stdout(argv: &[String], timeout: Duration) -> Option<String> {
             let _ = child.start_kill();
             let _ = child.wait().await;
             out.abort();
-            return None;
+            return SshResult::Unreachable;
         }
     };
     let bytes = out.await.unwrap_or_default();
-    status
-        .success()
-        .then(|| String::from_utf8_lossy(&bytes).into_owned())
+    if status.success() {
+        SshResult::Reachable(String::from_utf8_lossy(&bytes).into_owned())
+    } else {
+        SshResult::Unreachable
+    }
 }
 
-/// Probe every `(host, module)` marker with bounded concurrency. Returns a map keyed
-/// by `(host_label, module)` → parsed marker for the cells that answered; a missing
-/// key means unreachable/absent (rendered `unknown`/`undeployed` downstream).
+/// The tri-state outcome of one `(host, module)` marker probe:
+///   - `Marker` — reachable, a non-empty marker was read (→ up_to_date/update_available),
+///   - `NoMarker` — reachable, but the marker is absent/empty (→ `undeployed`),
+///   - `Unreachable` — ssh-level failure: connect/auth/timeout (→ `unknown`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    Marker(DeployMarker),
+    NoMarker,
+    Unreachable,
+}
+
+/// Probe every `(host, module)` marker with bounded concurrency. Returns a map with
+/// a tri-state outcome for EVERY probed pair (never dropped), so the matrix can
+/// render `unreachable → unknown` distinctly from `missing-marker → undeployed`.
 async fn probe_markers(
     hosts: &[DeployHost],
     modules: &[String],
     template: &str,
     timeout: Duration,
-) -> BTreeMap<(String, String), DeployMarker> {
+) -> BTreeMap<(String, String), ProbeOutcome> {
     use futures_util::stream::{FuturesUnordered, StreamExt};
 
     let mut pending = FuturesUnordered::new();
@@ -473,10 +517,8 @@ async fn probe_markers(
             pending.push(probe_one(host, module, template.to_string(), timeout));
         }
     }
-    while let Some(result) = pending.next().await {
-        if let Some((host, module, marker)) = result {
-            out.insert((host, module), marker);
-        }
+    while let Some((key, outcome)) = pending.next().await {
+        out.insert(key, outcome);
         if let Some((host, module)) = iter.next() {
             pending.push(probe_one(host, module, template.to_string(), timeout));
         }
@@ -484,22 +526,29 @@ async fn probe_markers(
     out
 }
 
-/// One marker probe. `None` when the host was unreachable or the marker was
-/// absent/blank — the cell degrades to `unknown`/`undeployed`, not an error.
+/// One marker probe → a tri-state outcome keyed by `(host_label, module)`. Never
+/// errors: an unreachable host is `Unreachable`, a reachable host with no/empty
+/// marker is `NoMarker`, a read marker is `Marker`.
 async fn probe_one(
     host: DeployHost,
     module: String,
     template: String,
     timeout: Duration,
-) -> Option<(String, String, DeployMarker)> {
+) -> ((String, String), ProbeOutcome) {
     let path = marker_path(&template, &module);
     let argv = render_marker_read_argv(&host.ssh_target, &path, timeout.as_secs());
-    let body = capture_stdout(&argv, timeout).await?;
-    let marker = parse_deploy_marker(&body);
-    if marker.is_empty() {
-        return None;
-    }
-    Some((host.label, module, marker))
+    let outcome = match ssh_capture(&argv, timeout).await {
+        SshResult::Unreachable => ProbeOutcome::Unreachable,
+        SshResult::Reachable(body) => {
+            let marker = parse_deploy_marker(&body);
+            if marker.is_empty() {
+                ProbeOutcome::NoMarker
+            } else {
+                ProbeOutcome::Marker(marker)
+            }
+        }
+    };
+    ((host.label, module), outcome)
 }
 
 // ── Matrix + payload assembly (pure, offline-testable) ───────────────────────
@@ -521,32 +570,46 @@ pub struct ModuleDeployment {
     pub status: String,
 }
 
-/// Build the module × host matrix from the store view + probed markers. Emits a cell
-/// for every `(host, module)` pair; a host/module with no marker degrades to a
-/// `deployed_sha`-less `undeployed`/`unknown` cell rather than being dropped.
+/// Build the module × host matrix from the store view + tri-state probe outcomes.
+/// Emits a cell for every `(host, module)` pair (never dropped), mapping the
+/// outcome:
+///   - `Marker`     → `deployed_sha` set, status derived vs the store's `current`,
+///   - `NoMarker`   → reachable host, no marker → `undeployed`,
+///   - `Unreachable`/absent → `unknown` (we could not determine the deployed sha).
 pub fn assemble_matrix(
     hosts: &[DeployHost],
     modules: &[String],
-    markers: &BTreeMap<(String, String), DeployMarker>,
+    outcomes: &BTreeMap<(String, String), ProbeOutcome>,
     store: &StoreView,
 ) -> Vec<ModuleDeployment> {
     let mut rows = Vec::new();
     for host in hosts {
         for module in modules {
-            let marker = markers
-                .get(&(host.label.clone(), module.clone()))
-                .cloned()
-                .unwrap_or_default();
             let current_sha = store.blessed_sha(module);
-            let status =
-                derive_status(marker.sha.as_deref(), current_sha.as_deref()).to_string();
+            let (deployed_sha, channel, built_at, status) =
+                match outcomes.get(&(host.label.clone(), module.clone())) {
+                    Some(ProbeOutcome::Marker(m)) => {
+                        let status =
+                            derive_status(m.sha.as_deref(), current_sha.as_deref()).to_string();
+                        (m.sha.clone(), m.channel.clone(), m.built_at.clone(), status)
+                    }
+                    Some(ProbeOutcome::NoMarker) => {
+                        (None, None, None, "undeployed".to_string())
+                    }
+                    // Unreachable host, or a cell that was not probed at all: we
+                    // could NOT determine the deployed sha → `unknown`, never
+                    // silently `undeployed`.
+                    Some(ProbeOutcome::Unreachable) | None => {
+                        (None, None, None, "unknown".to_string())
+                    }
+                };
             rows.push(ModuleDeployment {
                 module: module.clone(),
                 host: host.label.clone(),
-                deployed_sha: marker.sha,
+                deployed_sha,
                 current_sha,
-                channel: marker.channel,
-                built_at: marker.built_at,
+                channel,
+                built_at,
                 status,
             });
         }
@@ -690,8 +753,8 @@ impl RustTool for CompilerStatus {
             only.clone()
         };
 
-        // Remote marker probe (bounded, best-effort).
-        let markers = if probe && !hosts.is_empty() && !matrix_modules.is_empty() {
+        // Remote marker probe (bounded, best-effort, tri-state per cell).
+        let outcomes = if probe && !hosts.is_empty() && !matrix_modules.is_empty() {
             let template = marker_template();
             probe_markers(&hosts, &matrix_modules, &template, ssh_timeout()).await
         } else {
@@ -705,28 +768,38 @@ impl RustTool for CompilerStatus {
             BTreeMap::new()
         };
 
-        let matrix = assemble_matrix(&hosts, &matrix_modules, &markers, &store);
-        // A cell we couldn't read (host configured but no marker answered) means a
-        // partial matrix → degraded.
+        let matrix = assemble_matrix(&hosts, &matrix_modules, &outcomes, &store);
+        // A cell we could not reach (ssh-level failure) means a partial matrix →
+        // degraded. A reachable host with no marker is a definite `undeployed`, NOT
+        // a degradation.
         if probe && !hosts.is_empty() {
-            let answered = markers.len();
+            let unreachable = outcomes
+                .values()
+                .filter(|o| matches!(o, ProbeOutcome::Unreachable))
+                .count();
             let expected = hosts.len() * matrix_modules.len();
-            if answered < expected {
+            let unprobed = expected.saturating_sub(outcomes.len());
+            let indeterminate = unreachable + unprobed;
+            if indeterminate > 0 {
                 degraded = true;
                 notes.push(format!(
-                    "deploy matrix partial: {answered}/{expected} host×module marker(s) answered"
+                    "deploy matrix partial: {indeterminate}/{expected} host×module cell(s) unreachable/undetermined (unknown)"
                 ));
             }
         }
 
-        // Host rows (the fleet `hosts` shape). Reachability from whether any of the
-        // host's markers answered.
+        // Host rows (the fleet `hosts` shape). A host is reachable when any of its
+        // cells answered at the ssh level (Marker or NoMarker); an all-Unreachable
+        // host is `unknown`.
         let host_rows: Vec<Value> = hosts
             .iter()
             .map(|h| {
-                let reachable = matrix_modules
-                    .iter()
-                    .any(|m| markers.contains_key(&(h.label.clone(), m.clone())));
+                let reachable = matrix_modules.iter().any(|m| {
+                    matches!(
+                        outcomes.get(&(h.label.clone(), m.clone())),
+                        Some(ProbeOutcome::Marker(_)) | Some(ProbeOutcome::NoMarker)
+                    )
+                });
                 let health = if !probe {
                     "unknown"
                 } else if reachable {
@@ -856,16 +929,33 @@ mod tests {
     }
 
     #[test]
-    fn render_marker_read_argv_is_batchmode_and_guarded() {
+    fn render_marker_read_argv_is_batchmode_nonmutating_and_guarded() {
         let argv = render_marker_read_argv("deploy@host", "<path>/.deployed_sha", 8);
         assert_eq!(argv[0], "ssh");
         assert!(argv.iter().any(|a| a == "BatchMode=yes"));
         assert!(argv.iter().any(|a| a == "ConnectTimeout=8"));
-        // `cat --` guards against an option-like path; the path is the final arg.
-        let cat = argv.iter().position(|a| a == "cat").unwrap();
-        assert_eq!(argv[cat + 1], "--");
-        assert_eq!(argv.last().unwrap(), "<path>/.deployed_sha");
+        // Read-only: must NOT accept-new (which mutates known_hosts); must pin a
+        // throwaway known_hosts so a first-seen host has no side effect.
+        assert!(
+            !argv.iter().any(|a| a.contains("accept-new")),
+            "read-only probe must not mutate known_hosts"
+        );
+        assert!(argv.iter().any(|a| a == "StrictHostKeyChecking=no"));
+        assert!(argv.iter().any(|a| a == "UserKnownHostsFile=/dev/null"));
         assert!(argv.iter().any(|a| a == "deploy@host"));
+        // The remote command always exits 0 at the shell level (`|| true`) so ssh's
+        // exit reflects only connectivity; `cat --` guards an option-like path,
+        // which is single-quoted.
+        let remote = argv.last().unwrap();
+        assert!(remote.contains("cat -- '<path>/.deployed_sha'"), "{remote}");
+        assert!(remote.contains("|| true"), "{remote}");
+    }
+
+    #[test]
+    fn shell_quote_neutralizes_metacharacters() {
+        assert_eq!(shell_quote("<path>/x"), "'<path>/x'");
+        // An embedded quote is escaped, so `; rm -rf` can't break out.
+        assert_eq!(shell_quote("a'b; rm -rf /"), "'a'\\''b; rm -rf /'");
     }
 
     fn hosts() -> Vec<DeployHost> {
@@ -905,68 +995,110 @@ mod tests {
         assert_eq!(v.blessed_sha("absent"), None);
     }
 
+    fn marker_outcome(sha: &str, channel: Option<&str>, built_at: Option<&str>) -> ProbeOutcome {
+        ProbeOutcome::Marker(DeployMarker {
+            sha: Some(sha.into()),
+            channel: channel.map(str::to_string),
+            built_at: built_at.map(str::to_string),
+        })
+    }
+
     #[test]
     fn assemble_matrix_covers_every_host_module_and_derives_status() {
         let hosts = hosts();
         let modules = vec!["chord".to_string()];
         let store = store_with("chord", "stable", "abcdef");
-        // <host> up-to-date, ct327 has an old sha, no marker for a would-be third host.
-        let mut markers = BTreeMap::new();
-        markers.insert(
+        // host-a up-to-date, host-b has an old sha.
+        let mut outcomes = BTreeMap::new();
+        outcomes.insert(
             ("host-a".to_string(), "chord".to_string()),
-            DeployMarker {
-                sha: Some("abcdef123".into()),
-                channel: Some("stable".into()),
-                built_at: Some("t1".into()),
-            },
+            marker_outcome("abcdef123", Some("stable"), Some("t1")),
         );
-        markers.insert(
+        outcomes.insert(
             ("host-b".to_string(), "chord".to_string()),
-            DeployMarker {
-                sha: Some("999999".into()),
-                channel: Some("stable".into()),
-                built_at: None,
-            },
+            marker_outcome("999999", Some("stable"), None),
         );
-        let matrix = assemble_matrix(&hosts, &modules, &markers, &store);
+        let matrix = assemble_matrix(&hosts, &modules, &outcomes, &store);
         assert_eq!(matrix.len(), 2);
-        let <host> = matrix.iter().find(|m| m.host == "host-a").unwrap();
-        assert_eq!(<host>.status, "up_to_date");
-        assert_eq!(<host>.current_sha.as_deref(), Some("abcdef"));
-        let ct327 = matrix.iter().find(|m| m.host == "host-b").unwrap();
-        assert_eq!(ct327.status, "update_available");
+        let a = matrix.iter().find(|m| m.host == "host-a").unwrap();
+        assert_eq!(a.status, "up_to_date");
+        assert_eq!(a.current_sha.as_deref(), Some("abcdef"));
+        let b = matrix.iter().find(|m| m.host == "host-b").unwrap();
+        assert_eq!(b.status, "update_available");
     }
 
     #[test]
-    fn assemble_matrix_missing_marker_is_undeployed_not_dropped() {
-        let hosts = hosts();
+    fn assemble_matrix_unreachable_is_unknown_missing_marker_is_undeployed() {
+        // The core BLD-08 review fix: an UNREACHABLE host must be `unknown` (we could
+        // not determine its sha), while a REACHABLE host with no marker is a definite
+        // `undeployed`. They must NOT be conflated.
+        let hosts = vec![
+            DeployHost {
+                label: "reachable-no-marker".into(),
+                ssh_target: "u@a".into(),
+            },
+            DeployHost {
+                label: "unreachable".into(),
+                ssh_target: "u@b".into(),
+            },
+            DeployHost {
+                label: "not-probed".into(),
+                ssh_target: "u@c".into(),
+            },
+        ];
         let modules = vec!["chord".to_string()];
         let store = store_with("chord", "stable", "abcdef");
-        let markers = BTreeMap::new(); // nothing answered
-        let matrix = assemble_matrix(&hosts, &modules, &markers, &store);
-        assert_eq!(matrix.len(), 2, "both cells present even with no markers");
-        assert!(matrix.iter().all(|m| m.status == "undeployed"));
-        assert!(matrix.iter().all(|m| m.deployed_sha.is_none()));
+        let mut outcomes = BTreeMap::new();
+        outcomes.insert(
+            ("reachable-no-marker".to_string(), "chord".to_string()),
+            ProbeOutcome::NoMarker,
+        );
+        outcomes.insert(
+            ("unreachable".to_string(), "chord".to_string()),
+            ProbeOutcome::Unreachable,
+        );
+        // "not-probed" intentionally has no entry.
+        let matrix = assemble_matrix(&hosts, &modules, &outcomes, &store);
+        assert_eq!(matrix.len(), 3, "every cell present, none dropped");
+
+        let no_marker = matrix
+            .iter()
+            .find(|m| m.host == "reachable-no-marker")
+            .unwrap();
+        assert_eq!(
+            no_marker.status, "undeployed",
+            "reachable host, no marker → undeployed"
+        );
+        assert!(no_marker.deployed_sha.is_none());
+
+        let unreachable = matrix.iter().find(|m| m.host == "unreachable").unwrap();
+        assert_eq!(
+            unreachable.status, "unknown",
+            "unreachable host → unknown, NOT undeployed"
+        );
+        assert!(unreachable.deployed_sha.is_none());
+
+        let not_probed = matrix.iter().find(|m| m.host == "not-probed").unwrap();
+        assert_eq!(
+            not_probed.status, "unknown",
+            "un-probed cell → unknown, not undeployed"
+        );
     }
 
     #[test]
     fn payload_shape_matches_fleet_api_contract() {
         // The exact keys BLD-16's `parse_compiler_status` reads.
         let store = store_with("chord", "stable", "abcdef");
-        let markers = BTreeMap::from([(
+        let outcomes = BTreeMap::from([(
             ("host-a".to_string(), "chord".to_string()),
-            DeployMarker {
-                sha: Some("abcdef123".into()),
-                channel: Some("stable".into()),
-                built_at: Some("t1".into()),
-            },
+            marker_outcome("abcdef123", Some("stable"), Some("t1")),
         )]);
         let hosts = vec![DeployHost {
             label: "host-a".into(),
             ssh_target: "u@host-a".into(),
         }];
         let modules = vec!["chord".to_string()];
-        let matrix = assemble_matrix(&hosts, &modules, &markers, &store);
+        let matrix = assemble_matrix(&hosts, &modules, &outcomes, &store);
         let host_rows = vec![json!({"host": "host-a", "health": "ok", "source": "compiler"})];
         let payload = build_payload(
             "2026-07-12T00:00:00Z",
@@ -1087,20 +1219,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capture_stdout_unreachable_returns_none() {
-        // A command that exits non-zero → None (best-effort miss).
-        let argv = vec!["sh".to_string(), "-c".to_string(), "exit 3".to_string()];
-        assert!(capture_stdout(&argv, Duration::from_secs(2)).await.is_none());
+    async fn ssh_capture_nonzero_exit_is_unreachable() {
+        // A non-zero exit at the ssh level (connect/auth failure) → Unreachable.
+        let argv = vec!["sh".to_string(), "-c".to_string(), "exit 255".to_string()];
+        assert!(matches!(
+            ssh_capture(&argv, Duration::from_secs(2)).await,
+            SshResult::Unreachable
+        ));
     }
 
     #[tokio::test]
-    async fn capture_stdout_success_returns_stdout() {
+    async fn ssh_capture_spawn_failure_is_unreachable() {
+        let argv = vec!["this-binary-does-not-exist-xyz".to_string()];
+        assert!(matches!(
+            ssh_capture(&argv, Duration::from_secs(2)).await,
+            SshResult::Unreachable
+        ));
+    }
+
+    #[tokio::test]
+    async fn ssh_capture_exit0_with_marker_is_reachable_marker() {
+        // Reachable + a marker on stdout → Reachable(body) → parses to a Marker.
         let argv = vec![
             "sh".to_string(),
             "-c".to_string(),
             "printf 'sha=abc\\n'".to_string(),
         ];
-        let out = capture_stdout(&argv, Duration::from_secs(2)).await.unwrap();
-        assert_eq!(parse_deploy_marker(&out).sha.as_deref(), Some("abc"));
+        let SshResult::Reachable(body) = ssh_capture(&argv, Duration::from_secs(2)).await else {
+            panic!("expected Reachable");
+        };
+        assert_eq!(parse_deploy_marker(&body).sha.as_deref(), Some("abc"));
+    }
+
+    #[tokio::test]
+    async fn ssh_capture_exit0_empty_is_reachable_no_marker() {
+        // Reachable but empty stdout (the `cat … || true` no-marker case) → Reachable
+        // with an empty body, which probe_one classifies as NoMarker (→ undeployed).
+        let argv = vec!["sh".to_string(), "-c".to_string(), "true".to_string()];
+        let SshResult::Reachable(body) = ssh_capture(&argv, Duration::from_secs(2)).await else {
+            panic!("expected Reachable");
+        };
+        assert!(parse_deploy_marker(&body).is_empty());
     }
 }

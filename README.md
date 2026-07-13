@@ -228,7 +228,11 @@ It aggregates three sources and returns one structured JSON payload:
    in the channel. It also lists every available sha per channel (`available`).
 2. **module × host deployed-sha matrix** — each configured deploy host's `.deployed_sha`
    marker (what the constellation-updater wrote), read over the **existing host-reach path**
-   (ssh `BatchMode`, `ConnectTimeout`, `cat --` — *no new credentials*). Each cell carries
+   (ssh `BatchMode`, `ConnectTimeout`, `cat --` — *no new credentials*). The probe is
+   **side-effect-free**: `StrictHostKeyChecking=no` + `UserKnownHostsFile=/dev/null` so a
+   read-only status call never mutates `known_hosts`. The remote command always exits 0 at
+   the shell level, so ssh's exit code reflects **only connectivity** — that is what lets the
+   matrix report an *unreachable* host distinctly from a *missing marker*. Each cell carries
    `deployed_sha`, the store's `current_sha`, `channel`, `built_at`, and a derived `status`
    (`up_to_date` / `update_available` / `undeployed` / `unknown`). An **unreachable host**
    degrades that cell to `unknown` and a **missing marker** to `undeployed` — never an error.
