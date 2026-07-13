@@ -62,12 +62,6 @@ impl HostRequest {
     }
 }
 
-/// Default heavy-selection threshold (MB of peak build RSS) when
-/// `BUILD_HEAVY_THRESHOLD_MB` is unset. A release build of the big workspaces
-/// peaks ~5GB capped; the heavy host is for genuinely large/uncapped/fast work,
-/// so the default threshold sits above the capped-primary budget.
-const DEFAULT_HEAVY_THRESHOLD_MB: u64 = 16_000;
-
 /// Pure host-selection heuristic (the test entry point). Deterministic given its
 /// inputs so the selection rule is unit-testable without touching the env.
 ///
@@ -103,15 +97,12 @@ fn env_nonempty(key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-fn env_u64(key: &str, default: u64) -> u64 {
-    env_nonempty(key)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
-/// The configured heavy threshold (`BUILD_HEAVY_THRESHOLD_MB`).
-pub fn heavy_threshold_mb() -> u64 {
-    env_u64("BUILD_HEAVY_THRESHOLD_MB", DEFAULT_HEAVY_THRESHOLD_MB)
+/// The heavy-selection threshold (`BUILD_HEAVY_THRESHOLD_MB`, MB of peak build
+/// RSS) from config, with NO hardcoded default (S1): unset ⇒ `None`. The caller
+/// only requires it when it would actually change the decision (an `auto`,
+/// non-`fast` build of a module with a KNOWN peak); see [`resolve`].
+pub fn heavy_threshold_mb() -> Option<u64> {
+    env_nonempty("BUILD_HEAVY_THRESHOLD_MB").and_then(|v| v.parse().ok())
 }
 
 /// A module's known peak build RSS in MB, from `BUILD_MODULE_PEAK_MB_<MODULE>`
@@ -224,7 +215,24 @@ pub fn caps_for(role: HostRole) -> Result<ScopeCaps, ToolError> {
 /// heavy host always resolves an address (`BUILD_HOST_HEAVY`) — it's a remote
 /// hop — and it is an error for `Heavy` to be selected without that address.
 pub fn resolve(request: HostRequest, module: &str, fast: bool) -> Result<ResolvedHost, ToolError> {
-    let role = select_role(request, fast, module_peak_mb(module), heavy_threshold_mb());
+    let peak = module_peak_mb(module);
+    // The threshold is only consulted for an `auto`, non-`fast` build of a module
+    // whose peak IS known — require it (NotConfigured) only then, so it stays a
+    // config value with no baked-in default (S1) without forcing every build to
+    // set it. `u64::MAX` is passed when it will not be consulted.
+    let needs_threshold = matches!(request, HostRequest::Auto) && !fast && peak.is_some();
+    let threshold = if needs_threshold {
+        heavy_threshold_mb().ok_or_else(|| {
+            ToolError::NotConfigured(
+                "BUILD_HEAVY_THRESHOLD_MB is not configured (required to size an \
+                 auto build of a module with a known peak)"
+                    .to_string(),
+            )
+        })?
+    } else {
+        u64::MAX
+    };
+    let role = select_role(request, fast, peak, threshold);
     let address = env_nonempty(role.host_env());
     if role == HostRole::Heavy && address.is_none() {
         return Err(ToolError::NotConfigured(format!(
@@ -245,7 +253,8 @@ mod tests {
 
     #[test]
     fn auto_defaults_to_primary_for_small_module() {
-        let r = select_role(HostRequest::Auto, false, None, DEFAULT_HEAVY_THRESHOLD_MB);
+        // Unknown peak ⇒ primary regardless of threshold.
+        let r = select_role(HostRequest::Auto, false, None, 16_000);
         assert_eq!(r, HostRole::Primary);
         let r = select_role(HostRequest::Auto, false, Some(4_000), 16_000);
         assert_eq!(r, HostRole::Primary);
@@ -261,6 +270,16 @@ mod tests {
     fn auto_picks_heavy_when_fast_even_for_small_module() {
         let r = select_role(HostRequest::Auto, true, Some(1_000), 16_000);
         assert_eq!(r, HostRole::Heavy);
+    }
+
+    #[test]
+    fn threshold_max_sentinel_keeps_primary() {
+        // `resolve` passes u64::MAX when the threshold is not consulted (so a dead
+        // threshold config never forces heavy); a known peak never exceeds MAX.
+        assert_eq!(
+            select_role(HostRequest::Auto, false, Some(99_000), u64::MAX),
+            HostRole::Primary
+        );
     }
 
     #[test]

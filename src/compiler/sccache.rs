@@ -25,6 +25,8 @@
 
 use std::collections::BTreeMap;
 
+use tracing::warn;
+
 /// The env-var name (materialized from the vault) carrying the auth'd Redis URL
 /// sccache should use — a full `redis://default:<pass>@<host>:<port>/<db>`.
 const SCCACHE_REDIS_SECRET: &str = "SCCACHE_REDIS";
@@ -87,7 +89,7 @@ impl SccacheEnv {
                     .get("SCCACHE_DIR")
                     .map(String::as_str)
                     .unwrap_or("?");
-                format!("sccache→local-dir {dir} (fail-open: Redis not configured)")
+                format!("sccache→local-dir {dir} (fail-open: Redis unavailable)")
             }
         }
     }
@@ -161,55 +163,137 @@ pub fn parse_redis_url(url: &str) -> Option<RedisUrlParts> {
     })
 }
 
+/// Default reachability-probe timeout (ms) for the resolved Redis endpoint,
+/// overridable via `SCCACHE_REDIS_PROBE_MS`. Kept sub-second so resolving the
+/// sccache backend never stalls a build; a dead endpoint fails open fast.
+const DEFAULT_PROBE_MS: u64 = 300;
+
 /// Build the sccache env for a build, reading the `SCCACHE_REDIS` secret from the
 /// process environment (materialized from the vault). Fails OPEN to a local disk
-/// cache under `dataset_root` when the secret is absent or unparseable.
+/// cache under `dataset_root` when the secret is absent, unparseable, **or the
+/// endpoint is unreachable** — so a syntactically-valid-but-dead Redis never
+/// makes a build depend on sccache runtime behavior.
 ///
 /// `dataset_root` is `${BUILD_DATASET_ROOT}`; the local fallback lives at
 /// `${BUILD_DATASET_ROOT}/cache/sccache` (per the BLD-05 spec edge case).
 pub fn resolve(dataset_root: &str) -> SccacheEnv {
-    from_secret(env_nonempty(SCCACHE_REDIS_SECRET).as_deref(), dataset_root)
+    let timeout = probe_timeout();
+    from_secret_with_probe(
+        env_nonempty(SCCACHE_REDIS_SECRET).as_deref(),
+        dataset_root,
+        |host, port| tcp_reachable(host, port, timeout),
+    )
 }
 
-/// Pure builder (the test entry point): given an OPTIONAL secret URL and the
-/// dataset root, produce the sccache env + mode. `None`/unparseable ⇒ fail-open
-/// local dir.
+/// The configured probe timeout.
+fn probe_timeout() -> std::time::Duration {
+    let ms = env_nonempty("SCCACHE_REDIS_PROBE_MS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_PROBE_MS)
+        .max(1);
+    std::time::Duration::from_millis(ms)
+}
+
+/// Fast bounded TCP-connect reachability check. `true` iff a connection to any
+/// resolved address of `host:port` succeeds within `timeout`. Non-fatal —
+/// callers fall open when it is `false`.
+fn tcp_reachable(host: &str, port: u16, timeout: std::time::Duration) -> bool {
+    use std::net::ToSocketAddrs;
+    match (host, port).to_socket_addrs() {
+        Ok(addrs) => addrs
+            .into_iter()
+            .any(|addr| std::net::TcpStream::connect_timeout(&addr, timeout).is_ok()),
+        Err(_) => false,
+    }
+}
+
+/// Split a `RedisUrlParts.endpoint` (`redis://host[:port]`) into `(host, port)`,
+/// defaulting the port to 6379 and stripping IPv6 brackets for the probe.
+pub fn endpoint_host_port(parts: &RedisUrlParts) -> (String, u16) {
+    let hostport = parts
+        .endpoint
+        .strip_prefix("redis://")
+        .or_else(|| parts.endpoint.strip_prefix("rediss://"))
+        .unwrap_or(&parts.endpoint);
+    // IPv6 literal: `[::1]:6379` or `[::1]`.
+    if let Some(rest) = hostport.strip_prefix('[') {
+        if let Some((h, tail)) = rest.split_once(']') {
+            let port = tail
+                .strip_prefix(':')
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(6379);
+            return (h.to_string(), port);
+        }
+    }
+    match hostport.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(6379)),
+        None => (hostport.to_string(), 6379),
+    }
+}
+
+/// Pure builder (a test entry point): OPTIONAL secret URL + dataset root, with
+/// no reachability check (assumes the endpoint is reachable). `None`/unparseable
+/// ⇒ fail-open local dir. Retained for the split-env / fail-open-on-missing
+/// tests; production goes through [`resolve`] (which probes).
 pub fn from_secret(secret_url: Option<&str>, dataset_root: &str) -> SccacheEnv {
+    from_secret_with_probe(secret_url, dataset_root, |_, _| true)
+}
+
+/// The full builder (the injectable test entry point): selects Redis mode ONLY
+/// when the URL parses AND `probe(host, port)` returns `true`; otherwise fails
+/// OPEN to the local disk cache. Injecting `probe` makes the unreachable-endpoint
+/// decision offline-testable.
+pub fn from_secret_with_probe(
+    secret_url: Option<&str>,
+    dataset_root: &str,
+    probe: impl Fn(&str, u16) -> bool,
+) -> SccacheEnv {
     let mut vars = BTreeMap::new();
     // Always wrap rustc with sccache; the backend below decides where objects go.
     vars.insert("RUSTC_WRAPPER".to_string(), SccacheEnv::binary());
 
-    match secret_url.and_then(parse_redis_url) {
-        Some(parts) => {
-            vars.insert("SCCACHE_REDIS_ENDPOINT".to_string(), parts.endpoint);
-            if let Some(u) = parts.username {
-                vars.insert("SCCACHE_REDIS_USERNAME".to_string(), u);
-            }
-            if let Some(p) = parts.password {
-                vars.insert("SCCACHE_REDIS_PASSWORD".to_string(), p);
-            }
-            if let Some(db) = parts.db {
-                vars.insert("SCCACHE_REDIS_DB".to_string(), db);
-            }
-            vars.insert(
-                "SCCACHE_REDIS_KEY_PREFIX".to_string(),
-                KEY_PREFIX.to_string(),
-            );
-            SccacheEnv {
-                vars,
-                mode: SccacheMode::Redis,
-            }
+    let fail_open = |mut vars: BTreeMap<String, String>| {
+        // Fail OPEN: point sccache at a local disk directory so a Redis outage,
+        // an unconfigured endpoint, or an unreachable one never blocks a build.
+        vars.insert("SCCACHE_DIR".to_string(), local_cache_dir(dataset_root));
+        SccacheEnv {
+            vars,
+            mode: SccacheMode::LocalDir,
         }
-        None => {
-            // Fail OPEN: point sccache at a local disk directory so a Redis
-            // outage (or an unconfigured endpoint) never blocks a build.
-            let dir = local_cache_dir(dataset_root);
-            vars.insert("SCCACHE_DIR".to_string(), dir);
-            SccacheEnv {
-                vars,
-                mode: SccacheMode::LocalDir,
-            }
-        }
+    };
+
+    let parts = match secret_url.and_then(parse_redis_url) {
+        Some(p) => p,
+        None => return fail_open(vars),
+    };
+
+    // Reachability gate: a syntactically valid but dead endpoint falls open.
+    let (host, port) = endpoint_host_port(&parts);
+    if !probe(&host, port) {
+        warn!(
+            "sccache: Redis endpoint {}:{} unreachable — falling open to local cache dir",
+            host, port
+        );
+        return fail_open(vars);
+    }
+
+    vars.insert("SCCACHE_REDIS_ENDPOINT".to_string(), parts.endpoint);
+    if let Some(u) = parts.username {
+        vars.insert("SCCACHE_REDIS_USERNAME".to_string(), u);
+    }
+    if let Some(p) = parts.password {
+        vars.insert("SCCACHE_REDIS_PASSWORD".to_string(), p);
+    }
+    if let Some(db) = parts.db {
+        vars.insert("SCCACHE_REDIS_DB".to_string(), db);
+    }
+    vars.insert(
+        "SCCACHE_REDIS_KEY_PREFIX".to_string(),
+        KEY_PREFIX.to_string(),
+    );
+    SccacheEnv {
+        vars,
+        mode: SccacheMode::Redis,
     }
 }
 
@@ -314,6 +398,59 @@ mod tests {
         let env = from_secret(Some("totally-not-a-redis-url"), DATASET);
         assert_eq!(env.mode, SccacheMode::LocalDir);
         assert!(env.vars.contains_key("SCCACHE_DIR"));
+    }
+
+    #[test]
+    fn unreachable_endpoint_falls_open_to_local_dir() {
+        // A syntactically valid but DEAD endpoint (probe returns false) must fall
+        // open to the local dir — never select Redis mode.
+        let env = from_secret_with_probe(
+            Some("redis://default:pw@dead-host:6379/1"),
+            DATASET,
+            |_, _| false, // injected: endpoint unreachable
+        );
+        assert_eq!(env.mode, SccacheMode::LocalDir);
+        assert_eq!(
+            env.vars.get("SCCACHE_DIR").map(String::as_str),
+            Some("/data/build/cache/sccache")
+        );
+        // No Redis vars leaked (notably no password) when we fell open.
+        assert!(!env.vars.contains_key("SCCACHE_REDIS_ENDPOINT"));
+        assert!(!env.vars.contains_key("SCCACHE_REDIS_PASSWORD"));
+    }
+
+    #[test]
+    fn reachable_endpoint_selects_redis_and_probes_right_hostport() {
+        // The probe is called with the endpoint's host+port; when it passes,
+        // Redis mode is selected with the split env.
+        let seen = std::cell::RefCell::new((String::new(), 0u16));
+        let env = from_secret_with_probe(
+            Some("redis://default:pw@cache-host:6390/2"),
+            DATASET,
+            |h, p| {
+                *seen.borrow_mut() = (h.to_string(), p);
+                true
+            },
+        );
+        assert_eq!(env.mode, SccacheMode::Redis);
+        assert_eq!(seen.borrow().0, "cache-host");
+        assert_eq!(seen.borrow().1, 6390);
+        assert_eq!(
+            env.vars.get("SCCACHE_REDIS_ENDPOINT").map(String::as_str),
+            Some("redis://cache-host:6390")
+        );
+    }
+
+    #[test]
+    fn endpoint_host_port_parses_default_and_ipv6() {
+        let p = parse_redis_url("redis://h:6379").unwrap();
+        assert_eq!(endpoint_host_port(&p), ("h".to_string(), 6379));
+        // No explicit port ⇒ default 6379.
+        let p2 = parse_redis_url("redis://onlyhost").unwrap();
+        assert_eq!(endpoint_host_port(&p2), ("onlyhost".to_string(), 6379));
+        // IPv6 literal with port — brackets stripped.
+        let p3 = parse_redis_url("redis://[::1]:6380").unwrap();
+        assert_eq!(endpoint_host_port(&p3), ("::1".to_string(), 6380));
     }
 
     #[test]

@@ -135,20 +135,37 @@ pub fn partition_env(
     (non_secret, secret)
 }
 
-/// Render a 0600 env-file body (`KEY=VALUE` lines) for the secret vars, used ONLY
-/// for the REMOTE (ssh heavy) path: the file is written 0600 on the build host
-/// and `source`d inside the ssh wrapper before `exec systemd-run`, so the secret
-/// reaches the scoped build's inherited environment WITHOUT ever touching a
-/// command line. Deterministic order (BTreeMap).
+/// Render a 0600 env-file body for the secret vars, used ONLY for the REMOTE
+/// (ssh heavy) path: the file is written 0600 on the build host and `source`d
+/// inside the ssh wrapper before `exec systemd-run`, so the secret reaches the
+/// scoped build's inherited environment WITHOUT ever touching a command line.
+/// Deterministic order (BTreeMap).
+///
+/// SECURITY (shell-injection, S7): the file is `source`d by the remote shell, so
+/// each value is emitted **SINGLE-QUOTED with embedded single-quotes escaped as
+/// `'\''`** (`KEY='...'`). Single-quoting makes the value a fully literal byte
+/// string — spaces, `"`, `$(...)`, backticks, `;`, `&`, `|`, newlines, etc. are
+/// all inert, so a hostile Redis password can neither be corrupted nor trigger
+/// shell execution during `. <file>`. Keys are our own fixed `[A-Za-z0-9_]`
+/// names (not attacker-controlled), so they are written verbatim.
 pub fn render_secret_env_file(secret: &BTreeMap<String, String>) -> String {
     let mut s = String::new();
     for (k, v) in secret {
         s.push_str(k);
         s.push('=');
-        s.push_str(v);
+        s.push_str(&shell_single_quote(v));
         s.push('\n');
     }
     s
+}
+
+/// Wrap `v` in single quotes for POSIX shell, escaping any embedded single quote
+/// as `'\''` (close-quote, escaped-quote, reopen-quote). The result is a single
+/// shell word whose expansion is EXACTLY the input bytes — no metacharacter is
+/// interpreted. Used by [`render_secret_env_file`] (and safe for any shell
+/// context). Newlines are preserved literally inside the single quotes.
+fn shell_single_quote(v: &str) -> String {
+    format!("'{}'", v.replace('\'', "'\\''"))
 }
 
 /// A transient scope unit name derived from module + ref, sanitized to the
@@ -352,18 +369,63 @@ mod tests {
     }
 
     #[test]
-    fn secret_env_file_body_is_key_value_lines() {
+    fn secret_env_file_body_is_single_quoted_key_value_lines() {
         // Keys/values are assembled at runtime (never a literal `KEY=value`
         // string) so the render is verified without embedding a secret-shaped
-        // literal in source.
+        // literal in source. Values are single-quoted (shell-safe).
         let pass_key = "SCCACHE_REDIS_PASSWORD";
         let tok_key = "A_TOKEN";
         let mut secret = BTreeMap::new();
         secret.insert(pass_key.to_string(), "pw".to_string());
         secret.insert(tok_key.to_string(), "t".to_string());
         // BTreeMap order: A_TOKEN before SCCACHE_...
-        let expected = format!("{tok_key}={}\n{pass_key}={}\n", "t", "pw");
+        let expected = format!("{tok_key}='{}'\n{pass_key}='{}'\n", "t", "pw");
         assert_eq!(render_secret_env_file(&secret), expected);
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_embedded_quote() {
+        assert_eq!(shell_single_quote("plain"), "'plain'");
+        // a'b → 'a'\''b'
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+        // A pure injection token is neutralized (stays inside the quotes).
+        assert_eq!(shell_single_quote("$(x)"), "'$(x)'");
+    }
+
+    #[test]
+    fn secret_env_file_is_shell_injection_safe() {
+        // A hostile Redis password with EVERY dangerous shell construct: space,
+        // single quote, double quote, $(...), backtick, ;, |, &, and a newline.
+        // After `source`ing the rendered file in a REAL shell, the value must
+        // round-trip EXACTLY and NO injected command may have executed.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("PWNED");
+        let nasty = format!(
+            "a b$(touch '{m}')`touch '{m}'`;| & \"dq\" 'sq'\nsecond-line",
+            m = marker.display()
+        );
+
+        let mut secret = BTreeMap::new();
+        secret.insert("SCCACHE_REDIS_PASSWORD".to_string(), nasty.clone());
+        let body = render_secret_env_file(&secret);
+        let envf = dir.path().join("secret.env");
+        std::fs::write(&envf, &body).unwrap();
+
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "set -a; . '{}'; printf %s \"$SCCACHE_REDIS_PASSWORD\"",
+                envf.display()
+            ))
+            .output()
+            .expect("run sh");
+        assert!(out.status.success(), "sourcing the env file must succeed");
+        let parsed = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(parsed, nasty, "value must round-trip byte-for-byte");
+        assert!(
+            !marker.exists(),
+            "no injected command (touch) may have executed — shell injection!"
+        );
     }
 
     #[test]

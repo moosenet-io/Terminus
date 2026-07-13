@@ -107,7 +107,9 @@ compiler_build(module, ref, host="auto", profile="release", fast=false, bin?, so
 - **Host selection** (`compiler/host.rs`) — `auto` builds on the **primary** (dev box,
   moderate RAM, capped) unless the module's known peak (`BUILD_MODULE_PEAK_MB_<MODULE>`)
   exceeds `BUILD_HEAVY_THRESHOLD_MB`, or `fast=true`, in which case it uses the **heavy**
-  host (`BUILD_HOST_HEAVY`). `host="primary"|"heavy"` forces a role.
+  host (`BUILD_HOST_HEAVY`). `host="primary"|"heavy"` forces a role. `BUILD_HEAVY_THRESHOLD_MB`
+  has **no baked-in default** (S1) — it is required only when it would actually change the
+  decision (an `auto`, non-`fast` build of a module with a known peak), else `NotConfigured`.
 - **Resource caps — Plex protection** (`compiler/scope.rs`) — the build runs under
   `systemd-run --scope` with `MemoryMax` + **`MemorySwapMax=0`** + `CPUQuota` + `IOWeight`.
   The swap-off is load-bearing: an over-budget build is OOM-killed inside its own cgroup
@@ -123,8 +125,11 @@ compiler_build(module, ref, host="auto", profile="release", fast=false, bin?, so
   (`systemd-run --scope` runs cargo as a direct child that inherits systemd-run's env). On
   the remote/heavy path the secret is written to a **0600 file on the build host** and
   `source`d inside the ssh wrapper immediately before `exec systemd-run`, then deleted —
-  again never on a command line. Non-secret vars (`SCCACHE_REDIS_ENDPOINT`/`_DB`/`_KEY_PREFIX`,
-  `CARGO_TARGET_DIR`, `RUSTC_WRAPPER`) still travel via `--setenv`.
+  again never on a command line. That file is **shell-injection-safe**: each value is emitted
+  single-quoted with embedded quotes escaped as `'\''`, so a hostile Redis password (spaces,
+  `$(...)`, backticks, `;`, `|`, newlines, quotes) is fully literal and can neither be
+  corrupted nor execute during `source`. Non-secret vars (`SCCACHE_REDIS_ENDPOINT`/`_DB`/
+  `_KEY_PREFIX`, `CARGO_TARGET_DIR`, `RUSTC_WRAPPER`) still travel via `--setenv`.
 - **Exec-safe target dir** — `CARGO_TARGET_DIR` is a LOCAL/tmpfs path
   (`BUILD_LOCAL_TARGET_DIR` locally, `BUILD_HEAVY_LOCAL_TARGET_DIR` on the heavy host); a
   hard guard **rejects** any target dir inside the file-level NFS build dataset — applied to
@@ -141,9 +146,11 @@ compiler_build(module, ref, host="auto", profile="release", fast=false, bin?, so
   vault-materialized `SCCACHE_REDIS` env var and parsed into the **split**
   `SCCACHE_REDIS_ENDPOINT`/`_USERNAME`/`_PASSWORD`/`_DB`/`_KEY_PREFIX` form (the reliable
   one; a bare `SCCACHE_REDIS` URL fell back to local disk in testing). It **fails OPEN**:
-  when Redis is unconfigured/unparseable, sccache uses a local dir
-  (`${BUILD_DATASET_ROOT}/cache/sccache`) so a cache outage never blocks a build. The
-  parsed password is never logged.
+  when Redis is unconfigured, unparseable, **or unreachable** — a fast sub-second bounded TCP
+  probe of the resolved endpoint (`SCCACHE_REDIS_PROBE_MS`, default 300ms) gates Redis mode, so
+  a syntactically-valid-but-dead endpoint degrades to a local dir
+  (`${BUILD_DATASET_ROOT}/cache/sccache`) rather than making the build depend on sccache
+  runtime behavior. A cache outage never blocks a build. The parsed password is never logged.
 - **Pinned toolchain** — `RUST_TOOLCHAIN_PINNED` is installed idempotently
   (`rustup toolchain install`, never `rustup update`); when unset, rustup auto-installs
   from the source tree's `rust-toolchain.toml`.
