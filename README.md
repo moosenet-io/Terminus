@@ -135,7 +135,12 @@ compiler_build(module, ref, host="auto", profile="release", fast=false, bin?, so
   (`systemd-run --scope` runs cargo as a direct child that inherits systemd-run's env). On
   the remote/heavy path the secret is written to a **0600 file on the build host** and
   `source`d inside the ssh wrapper immediately before `exec systemd-run`, then deleted —
-  again never on a command line. The local staging file is created safely against a
+  again never on a command line. Its removal is **RAII-guaranteed on every post-transfer exit
+  path** — the happy path (the wrapper's own `rm`), any `?` error (e.g. a failing
+  pinned-toolchain install), a timeout, or a panic — via a scope guard whose `Drop` issues a
+  bounded (`ConnectTimeout`) best-effort `ssh host rm -f <file>` (with the local staging file
+  unlinked as a backstop), so a leftover remote secret file can never survive an early return.
+  The local staging file is created safely against a
   predictable-`/tmp`/symlink attack: an **unguessable random (v4-UUID) filename**, opened
   with **`O_EXCL`** (never opens/truncates an existing path) **+ `O_NOFOLLOW`** (never follows
   a symlink), so `0600` genuinely holds from creation. That file is **shell-injection-safe**: each value is emitted

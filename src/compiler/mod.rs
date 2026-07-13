@@ -312,6 +312,120 @@ async fn remote_scope_kill(rk: &RemoteScopeKill, redact: &[String]) {
     }
 }
 
+/// Render the argv that removes the remote 0600 secret env file over ssh:
+/// `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> rm -f <quoted-path>`. Pure
+/// (returns the argv) so it is testable offline; the path is shell-quoted for the
+/// remote shell, and the ssh options bound a hung connect (so a synchronous Drop
+/// cleanup can never block indefinitely).
+fn render_remote_secret_rm_argv(host: &str, remote_path: &str) -> Vec<String> {
+    vec![
+        "ssh".to_string(),
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=10".to_string(),
+        host.to_string(),
+        format!("rm -f {}", shell_quote(remote_path)),
+    ]
+}
+
+/// Synchronous, bounded, best-effort remote `rm -f` of the secret env file — used
+/// by [`RemoteSecretGuard`]'s `Drop` (which cannot run async). `ssh -o
+/// ConnectTimeout` bounds a hung connect; the `rm` itself is instant. Any failure
+/// output is redacted (S7) before it is logged.
+fn blocking_ssh_rm(argv: &[String], redact: &[String]) {
+    use std::process::{Command, Stdio};
+    let child = Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    match child {
+        Ok(c) => match c.wait_with_output() {
+            Ok(out) if !out.status.success() => {
+                let tail = redact_secrets(&String::from_utf8_lossy(&out.stderr), redact);
+                tracing::warn!("compiler: remote secret-file cleanup rm failed: {tail}");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("compiler: remote secret-file cleanup wait failed: {e}"),
+        },
+        Err(e) => tracing::warn!("compiler: remote secret-file cleanup spawn failed: {e}"),
+    }
+}
+
+/// RAII guard that GUARANTEES the secret env file is removed on EVERY post-transfer
+/// exit path — success, any `?` error, a timeout, or a panic — closing the whole
+/// leak class (not just one code path). Armed right after the secret file is
+/// transferred to the remote; its `Drop` issues a bounded best-effort remote
+/// `rm -f` (and, as a backstop, unlinks the local staging file if it wasn't
+/// already). On the happy path the remote build's own wrapper `rm`s the file, so
+/// the guard is [`disarm`](Self::disarm)ed after a successful build to avoid a
+/// redundant ssh; on any earlier exit it stays armed and fires.
+struct RemoteSecretGuard {
+    host: String,
+    remote_path: String,
+    redact: Vec<String>,
+    /// Local staging file to unlink as a backstop (cleared once removed inline).
+    local_path: Option<PathBuf>,
+    /// When false, `Drop` performs no remote cleanup (the file is already gone).
+    armed: bool,
+    /// Test-only sink: when set, `Drop` RECORDS the rendered rm argv here instead
+    /// of spawning a real ssh — so the "cleanup fires on the error path" property
+    /// is unit-testable offline. `None` in production.
+    recorder: Option<std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>>,
+}
+
+impl RemoteSecretGuard {
+    fn new(
+        host: String,
+        remote_path: String,
+        local_path: Option<PathBuf>,
+        redact: Vec<String>,
+    ) -> Self {
+        Self {
+            host,
+            remote_path,
+            redact,
+            local_path,
+            armed: true,
+            recorder: None,
+        }
+    }
+
+    /// Clear the local-staging backstop after it has been unlinked inline (so
+    /// `Drop` doesn't try again — harmless either way).
+    fn clear_local(&mut self) {
+        self.local_path = None;
+    }
+
+    /// Disarm the REMOTE cleanup (call after a successful build, whose own wrapper
+    /// already removed the remote file). The local backstop is still honored.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RemoteSecretGuard {
+    fn drop(&mut self) {
+        // Local staging backstop (instant, sync) — always, even when disarmed.
+        if let Some(p) = self.local_path.take() {
+            let _ = std::fs::remove_file(&p);
+        }
+        if !self.armed {
+            return;
+        }
+        let argv = render_remote_secret_rm_argv(&self.host, &self.remote_path);
+        if let Some(rec) = &self.recorder {
+            if let Ok(mut g) = rec.lock() {
+                g.push(argv);
+            }
+            return;
+        }
+        blocking_ssh_rm(&argv, &self.redact);
+    }
+}
+
 /// Run a subprocess argv with an optional cwd + extra env, bounded by `timeout`.
 /// Returns `Ok(stdout)` on success (exit 0), else an `Execution` error with a
 /// trimmed stderr tail. The env is applied on top of the inherited environment.
@@ -722,9 +836,25 @@ impl RustTool for CompilerBuild {
                 uuid::Uuid::new_v4()
             );
             let have_secret = !secret_env.is_empty();
+            // RAII guard: once the secret file is (about to be) on the remote, its
+            // removal is GUARANTEED on every subsequent exit — the happy path, any
+            // `?` (e.g. a failing pinned-toolchain install), a timeout, or a panic —
+            // via `Drop`. It stays in scope for the whole remote build below (it is
+            // disarmed after a successful build, whose own wrapper already `rm`s the
+            // file, to avoid a redundant ssh).
+            let mut secret_guard: Option<RemoteSecretGuard> = None;
             if have_secret {
                 let body = scope::render_secret_env_file(&secret_env);
                 let local_secret = write_local_0600(&body, &unit)?;
+                // Arm the guard BEFORE the transfer (covers a partial/failed rsync
+                // that may still have created the remote file); the local staging
+                // file is a Drop backstop until we unlink it inline just below.
+                secret_guard = Some(RemoteSecretGuard::new(
+                    host_addr.clone(),
+                    remote_env_path.clone(),
+                    Some(local_secret.clone()),
+                    redact.clone(),
+                ));
                 // `rsync -a` preserves the local 0600 mode on the remote (so the
                 // remote secret file is 0600 without a separate chmod), and `-s`
                 // protects the remote path from remote-shell re-splitting.
@@ -743,9 +873,14 @@ impl RustTool for CompilerBuild {
                     None,
                 )
                 .await;
-                // Delete the local staging copy immediately, whether the transfer
-                // succeeded or not (the secret must not linger on disk).
+                // Delete the local staging copy immediately (minimize its on-disk
+                // lifetime), whether the transfer succeeded or not, then clear the
+                // guard's local backstop. If `xfer_res` is an error, `secret_guard`
+                // drops on the `?` below → the remote file is cleaned up.
                 let _ = tokio::fs::remove_file(&local_secret).await;
+                if let Some(g) = secret_guard.as_mut() {
+                    g.clear_local();
+                }
                 xfer_res?;
             }
 
@@ -797,23 +932,15 @@ impl RustTool for CompilerBuild {
                 Some(&remote_kill),
             )
             .await;
-            // Best-effort scrub in case the build failed before the wrapper's rm ran.
-            if have_secret {
-                let _ = run(
-                    &[
-                        "ssh".into(),
-                        host_addr.clone(),
-                        format!("rm -f {}", shell_quote(&remote_env_path)),
-                    ],
-                    None,
-                    &BTreeMap::new(),
-                    Duration::from_secs(60),
-                    &redact,
-                    None,
-                )
-                .await;
-            }
+            // If the build FAILED/timed out, propagate now — `secret_guard` drops on
+            // this `?` and cleans up the remote file (it may still exist if the build
+            // never reached the wrapper's own `rm`). On SUCCESS the wrapper already
+            // removed the file, so disarm the guard's remote cleanup (avoids a
+            // redundant ssh); the guard object stays alive but Drop becomes a no-op.
             build_res?;
+            if let Some(g) = secret_guard.as_mut() {
+                g.disarm();
+            }
 
             // Retrieve the built binary back to a local temp path so publish is
             // host-agnostic (the build ran remotely; publish reads it locally).
@@ -1443,6 +1570,74 @@ mod tests {
         assert!(
             !marker.exists(),
             "the timed-out child was not killed — its process tree leaked"
+        );
+    }
+
+    #[test]
+    fn remote_secret_rm_argv_is_bounded_and_quoted() {
+        let argv = render_remote_secret_rm_argv("builduser@heavy", "/mnt/x/.terminus-build-y.env");
+        assert_eq!(argv[0], "ssh");
+        let j = argv.join(" ");
+        // Bounded connect so a synchronous Drop cleanup can't hang; batch mode so
+        // it never prompts; path shell-quoted.
+        assert!(j.contains("-o BatchMode=yes"), "{j}");
+        assert!(j.contains("-o ConnectTimeout=10"), "{j}");
+        assert!(j.contains("builduser@heavy"));
+        assert_eq!(argv.last().unwrap(), "rm -f '/mnt/x/.terminus-build-y.env'");
+    }
+
+    #[test]
+    fn secret_guard_cleans_remote_and_local_on_drop_error_path() {
+        use std::sync::{Arc, Mutex};
+        // A local staging file that must be unlinked when the guard drops.
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("staging.env");
+        std::fs::write(&local, "secret-bytes").unwrap();
+
+        let rec: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            // Guard armed after transfer; NO disarm ⇒ models ANY post-transfer
+            // early return (a failing pinned-toolchain install, a build error, a
+            // timeout, or a panic) — Drop must clean up.
+            let mut g = RemoteSecretGuard::new(
+                "builduser@heavy".to_string(),
+                "/mnt/build-target/.terminus-build-chord-deadbeef.env".to_string(),
+                Some(local.clone()),
+                vec![],
+            );
+            g.recorder = Some(rec.clone());
+        } // <- early-return / scope-exit: Drop fires here
+
+        // Remote rm was issued (exactly once) with the expected bounded, quoted argv.
+        let calls = rec.lock().unwrap();
+        assert_eq!(calls.len(), 1, "remote rm must fire on the error path");
+        assert_eq!(calls[0][0], "ssh");
+        assert_eq!(
+            calls[0].last().unwrap(),
+            "rm -f '/mnt/build-target/.terminus-build-chord-deadbeef.env'"
+        );
+        // Local staging file was unlinked too.
+        assert!(
+            !local.exists(),
+            "local staging secret must be removed on drop"
+        );
+    }
+
+    #[test]
+    fn secret_guard_disarmed_skips_remote_cleanup() {
+        use std::sync::{Arc, Mutex};
+        let rec: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            // Happy path: the build's own wrapper already removed the remote file,
+            // so the guard is disarmed — Drop must NOT issue a redundant remote rm.
+            let mut g =
+                RemoteSecretGuard::new("h".to_string(), "/p/.env".to_string(), None, vec![]);
+            g.recorder = Some(rec.clone());
+            g.disarm();
+        }
+        assert!(
+            rec.lock().unwrap().is_empty(),
+            "a disarmed guard must not issue a remote rm"
         );
     }
 
