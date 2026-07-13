@@ -521,8 +521,10 @@ compiler_deploy(module, channel="stable", hosts="all")
   errored **or the `systemctl start` itself failed** — a non-zero start rc is never masked by a
   stale success `Result`/marker token), `timed_out` (the host was **reached** and the updater
   triggered, but the synchronous run exceeded the budget — an in-flight/hung deploy, surfaced
-  **distinctly from** `unreachable`), `unknown` (the updater wrote an outcome token the compiler
-  does not recognize — a non-converged, must-not-trust result), or `unreachable` (an ssh-level
+  **distinctly from** `unreachable`), `unknown` (the outcome can't be trusted as a success — the
+  updater wrote an unrecognized token, OR the wrapper's exit code couldn't be parsed, so a
+  stale/damaged `result=success` line is not trusted without a real `rc == 0`), or `unreachable`
+  (an ssh-level
   **connect/auth** failure, never a run timeout). One bad host **never aborts** the fan-out — the
   others still proceed and the nightly timer catches the straggler.
 - **No-masked-failures / no-raw-echo hardening:** the trigger forces **non-interactive sudo**

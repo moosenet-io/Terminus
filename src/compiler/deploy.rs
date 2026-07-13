@@ -27,9 +27,11 @@
 //!                     synchronous run exceeded the trigger budget: an in-flight/
 //!                     hung deploy of unknown outcome, surfaced DISTINCTLY from
 //!                     `unreachable` (a slow deploy is not a connectivity failure).
-//!   - `unknown`     — the updater wrote an outcome token the compiler does not
-//!                     recognize (not in the fixed vocabulary): non-converged and
-//!                     NOT trusted as success; the raw token is never surfaced.
+//!   - `unknown`     — the outcome cannot be trusted as a success: the updater wrote
+//!                     a token the compiler does not recognize, OR the wrapper's exit
+//!                     code could not be parsed (a stale/damaged sentinel that still
+//!                     says `result=success` is NOT trusted without a real `rc == 0`).
+//!                     Non-converged; the raw token is never surfaced.
 //!   - `unreachable` — an ssh-level CONNECT/AUTH failure (never a run timeout). One
 //!                     bad host never aborts the fan-out; the others still proceed
 //!                     and the nightly timer catches the straggler.
@@ -555,29 +557,36 @@ fn parse_result_line(body: &str) -> (Option<i64>, String, String) {
 /// `Result`/token are only consulted when the start actually succeeded. This is
 /// what stops a failed start being masked as `deployed`.
 ///
-/// When start succeeded (rc == 0, or rc unknown as a defensive fallback), the
-/// updater's own outcome TOKEN drives the result (the only signal that distinguishes
-/// a rollback or a no-op from a plain success — and it is run-scoped: the wrapper
-/// clears any prior marker before triggering, so only THIS run's token is read). The
-/// token is mapped through a FIXED VOCABULARY (finding 2):
+/// When start succeeded, the updater's own outcome TOKEN drives the result (the only
+/// signal that distinguishes a rollback or a no-op from a plain success — and it is
+/// run-scoped: the wrapper clears any prior marker before triggering, so only THIS
+/// run's token is read). The token is mapped through a FIXED VOCABULARY (finding 2):
 ///   - a recognized token ⇒ the matching outcome,
-///   - an EMPTY token (no marker written) ⇒ degrade to the systemd `Result`
-///     (`success`/rc==0 ⇒ `deployed`, else `failed`),
-///   - a NON-EMPTY but UNRECOGNIZED token ⇒ `unknown` (non-converged, must-not-trust)
-///     — we do NOT fall through to an rc-success `deployed`, because the updater
-///     wrote something we can't validate. The raw token is NEVER returned to a
-///     caller; only the classified outcome is.
+///   - an EMPTY token (no marker written) ⇒ degrade to the systemd `Result`,
+///   - a NON-EMPTY but UNRECOGNIZED token ⇒ `unknown` (non-converged, must-not-trust).
+///
+/// CRITICAL (finding 1): a CONVERGED/success outcome (`deployed`/`skipped`) is only
+/// ever trusted when a REAL `rc == 0` was actually PARSED from the wrapper's sentinel.
+/// If `rc` is absent/unparseable — a stale/damaged/truncated sentinel line that still
+/// says `result=success`, or a token that reads `deployed` with no exit code — we do
+/// NOT trust it: it degrades to `unknown` (never masked as `deployed`). Only failure/
+/// rollback outcomes (already non-converged) are reported without a parsed rc, since
+/// reporting a failure can't mask a success. The raw token is never returned; only
+/// the classified outcome is.
 pub fn classify_reachable(rc: Option<i64>, result: &str, token: &str) -> DeployOutcome {
     // A start that failed is `failed`, full stop — never overridden by a stale
     // success Result or a stale marker token.
     if matches!(rc, Some(code) if code != 0) {
         return DeployOutcome::Failed;
     }
+    // The ONLY signal that lets us trust a converged/success outcome: a real parsed
+    // exit code of 0. An absent/unparseable rc must never be trusted as success.
+    let started_ok = rc == Some(0);
     let token = token.trim().to_ascii_lowercase();
-    match token.as_str() {
+    let naive = match token.as_str() {
         // Empty token → no marker this run → degrade to the systemd signal.
         "" => {
-            if rc == Some(0) || result.eq_ignore_ascii_case("success") {
+            if started_ok || result.eq_ignore_ascii_case("success") {
                 DeployOutcome::Deployed
             } else {
                 DeployOutcome::Failed
@@ -592,7 +601,13 @@ pub fn classify_reachable(rc: Option<i64>, result: &str, token: &str) -> DeployO
         // A non-empty token we don't recognize → `unknown` (never trusted as
         // success, never echoed).
         _ => DeployOutcome::Unknown,
+    };
+    // Without a REAL parsed `rc == 0`, a converged/success outcome cannot be trusted →
+    // `unknown`. A failure/rollback outcome is reported as-is (it can't mask success).
+    if !started_ok && matches!(naive, DeployOutcome::Deployed | DeployOutcome::Skipped) {
+        return DeployOutcome::Unknown;
     }
+    naive
 }
 
 /// Build the short, redaction-safe `detail` string. FIXED VOCABULARY ONLY (finding
@@ -1028,13 +1043,47 @@ mod tests {
             classify_reachable(Some(1), "failed", ""),
             DeployOutcome::Failed
         );
-        // rc unknown but Result=success still deploys.
-        assert_eq!(
-            classify_reachable(None, "success", ""),
-            DeployOutcome::Deployed
-        );
         // rc unknown and no success signal → failed (fail-visible, not masked).
         assert_eq!(classify_reachable(None, "", ""), DeployOutcome::Failed);
+    }
+
+    #[test]
+    fn unparseable_rc_never_trusts_success() {
+        // Finding 1: without a REAL parsed `rc == 0`, a converged/success outcome is
+        // NOT trusted — a stale/damaged sentinel that still says `result=success`, or
+        // a `deployed`/`skipped` token with no exit code, degrades to `unknown` (never
+        // masked as a successful deploy).
+        assert_eq!(
+            classify_reachable(None, "success", ""),
+            DeployOutcome::Unknown,
+            "absent rc + Result=success must NOT be trusted as deployed"
+        );
+        assert_eq!(
+            classify_reachable(None, "success", "deployed"),
+            DeployOutcome::Unknown,
+            "absent rc + deployed token must NOT be trusted"
+        );
+        assert_eq!(
+            classify_reachable(None, "", "skipped"),
+            DeployOutcome::Unknown,
+            "absent rc + skipped token must NOT be trusted"
+        );
+        // A REAL parsed rc==0 + Result=success still deploys.
+        assert_eq!(
+            classify_reachable(Some(0), "success", ""),
+            DeployOutcome::Deployed
+        );
+        assert_eq!(
+            classify_reachable(Some(0), "success", "deployed"),
+            DeployOutcome::Deployed
+        );
+        // Failure/rollback outcomes ARE still reported without a parsed rc (reporting
+        // a failure can't mask a success).
+        assert_eq!(
+            classify_reachable(None, "", "rolled_back"),
+            DeployOutcome::RolledBack
+        );
+        assert_eq!(classify_reachable(None, "", "failed"), DeployOutcome::Failed);
     }
 
     #[test]
@@ -1541,13 +1590,19 @@ mod tests {
 
     #[test]
     fn payload_shape_is_stable() {
+        // Build `detail` the way production does — the fixed-vocabulary `outcome=… rc=…`
+        // form (finding 2) — so this shape assertion can't drift from the no-raw-echo
+        // rule (never `rc=… result=… token=<raw>`).
+        let outcome = DeployOutcome::Deployed;
+        let detail = detail_string(outcome, Some(0));
+        assert_eq!(detail.as_deref(), Some("outcome=deployed rc=0"));
         let report = DeployReport {
             module: "chord".into(),
             channel: "stable".into(),
             results: vec![HostDeployResult {
                 host: "host-a".into(),
-                outcome: DeployOutcome::Deployed,
-                detail: Some("rc=0 result=success token=deployed".into()),
+                outcome,
+                detail,
             }],
             notes: vec!["n".into()],
         };
@@ -1556,6 +1611,11 @@ mod tests {
         assert_eq!(p["channel"], json!("stable"));
         assert_eq!(p["results"][0]["host"], json!("host-a"));
         assert_eq!(p["results"][0]["outcome"], json!("deployed"));
+        assert_eq!(p["results"][0]["detail"], json!("outcome=deployed rc=0"));
+        // Fixed-vocabulary: no raw `result=`/`token=` fields leak into the payload.
+        let whole = serde_json::to_string(&p).unwrap();
+        assert!(!whole.contains("token="), "no raw token echoed: {whole}");
+        assert!(!whole.contains("result="), "no raw systemd Result echoed: {whole}");
         assert_eq!(p["counts"]["total"], json!(1));
         assert_eq!(p["degraded"], json!(false));
         assert!(p["notes"].is_array());
