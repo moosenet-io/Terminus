@@ -168,17 +168,19 @@ fn is_accepted_sudo_flag(t: &str) -> bool {
 /// optionally ONLY the non-interactive flag `-n` (no other sudo option — especially
 /// no argument-taking flag like `-u`/`-g`/`-h`/`-p` that could make sudo read the
 /// next token as a username/host and treat `systemctl` as data), then the EXECUTABLE
-/// which MUST be `systemctl` (or a `.../systemctl` path), then — CRUCIALLY (finding
-/// 1) — NO trailing subcommand/verb: only option FLAGS (tokens starting with `-`) may
-/// follow `systemctl`, never a bare word, because the wrapper always supplies the verb
-/// (`start`) + unit itself (`systemctl reboot` would become `systemctl reboot start
-/// <unit>`). So `systemctl`, `sudo systemctl`, `sudo -n systemctl`, `/usr/bin/systemctl`,
-/// `sudo -n /usr/bin/systemctl` are accepted; `sudo -u systemctl`, `sudo reboot
-/// systemctl`, `reboot systemctl`, `systemctl reboot`, `systemctl stop` are REJECTED.
-/// Any metacharacter, a disallowed sudo flag, a non-systemctl executable, or a
-/// trailing verb is a clear config error (never inserted into the remote shell).
-/// Empty/unset ⇒ the default `systemctl`. The error message NEVER echoes the raw
-/// value back (S1).
+/// which MUST be `systemctl` (or a `.../systemctl` path), then — CRUCIALLY — NOTHING
+/// after it: the override is EXECUTABLE-PREFIX ONLY (no verb AND no flag). The deploy
+/// trigger must be SYNCHRONOUS — the wrapper supplies `start <unit>` and blocks until
+/// the BLD-12 unit finishes so it can classify this run's authoritative outcome — so
+/// no trailing flag that changes blocking/result semantics is permitted (notably
+/// `--no-block`, which would make `systemctl start` return before the updater writes
+/// its marker / completes rollback/health-gate). So EXACTLY `systemctl`, `sudo
+/// systemctl`, `sudo -n systemctl`, `/usr/bin/systemctl`, `sudo -n /usr/bin/systemctl`
+/// are accepted; `sudo -u systemctl`, `reboot systemctl`, `systemctl reboot`,
+/// `systemctl --no-block`, `systemctl -q`, `systemctl --user` are all REJECTED. Any
+/// metacharacter, a disallowed sudo flag, a non-systemctl executable, or ANY trailing
+/// token is a clear config error (never inserted into the remote shell). Empty/unset ⇒
+/// the default `systemctl`. The error message NEVER echoes the raw value back (S1).
 fn validate_systemctl_cmd(raw: &str) -> Result<String, ToolError> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -228,19 +230,22 @@ fn validate_systemctl_cmd(raw: &str) -> Result<String, ToolError> {
             )));
         }
     }
-    // Finding 1: NO trailing subcommand/verb after `systemctl`. The wrapper ALWAYS
-    // supplies the verb (`start`) + the unit, so a configured `systemctl reboot`
-    // would render as `systemctl reboot start <unit>` — an arbitrary subcommand. Any
-    // trailing BARE WORD (a verb like `reboot`/`stop`/`enable`) is rejected; only
-    // option FLAGS (tokens beginning with `-`, e.g. `--no-block`/`-q`) are permitted
-    // after the executable.
-    for tok in &toks[i + 1..] {
-        if !tok.starts_with('-') {
-            return Err(ToolError::InvalidArgument(format!(
-                "{COMPILER_DEPLOY_SYSTEMCTL} must be just `[sudo [-n]] systemctl` with no \
-                 trailing subcommand (the trigger supplies `start <unit>` itself); rejected"
-            )));
-        }
+    // EXECUTABLE-PREFIX ONLY: reject ALL trailing tokens after `systemctl` — no verbs
+    // AND no flags. The deploy trigger must be SYNCHRONOUS: the wrapper itself supplies
+    // `start <unit>` and blocks until the BLD-12 unit finishes
+    // (fetch→swap→health→rollback→marker) so it can classify THIS run's authoritative
+    // per-host outcome. A trailing flag that changes blocking/result semantics —
+    // notably `--no-block` (`systemctl start` returns BEFORE the updater writes its
+    // marker or completes rollback/health-gate) — would break that contract, so no
+    // trailing token is permitted at all. The accepted set is exactly `[sudo [-n]]
+    // systemctl` (`systemctl`, `/usr/bin/systemctl`, `sudo systemctl`, `sudo -n
+    // systemctl`, `sudo -n /usr/bin/systemctl`).
+    if i + 1 < toks.len() {
+        return Err(ToolError::InvalidArgument(format!(
+            "{COMPILER_DEPLOY_SYSTEMCTL} must be exactly `[sudo [-n]] systemctl` with NO trailing \
+             token (no verb and no flag — the trigger supplies `start <unit>` and must stay \
+             synchronous); rejected"
+        )));
     }
     Ok(raw.to_string())
 }
@@ -1432,22 +1437,28 @@ mod tests {
                 "only `-n` may precede systemctl; must reject: {bad:?}"
             );
         }
-        // Finding 1: NO trailing subcommand/verb after `systemctl` (the wrapper owns
-        // `start <unit>`). A trailing bare word is rejected; only option flags are ok.
+        // EXECUTABLE-PREFIX ONLY: reject ALL trailing tokens after `systemctl` — no
+        // verbs AND no flags. A trailing flag that changes blocking/result semantics
+        // (esp. `--no-block`, which returns before the updater finishes) would break
+        // the SYNCHRONOUS-deploy contract; the wrapper owns `start <unit>`.
         for bad in [
-            "systemctl reboot",
-            "systemctl start",
-            "systemctl stop",
+            "systemctl reboot",       // verb
+            "systemctl start",        // verb
+            "systemctl stop",         // verb
             "sudo -n systemctl poweroff",
             "/usr/bin/systemctl enable",
+            "systemctl --no-block",   // flag that breaks blocking semantics
+            "systemctl -q",           // any trailing flag is out
+            "systemctl --user",
+            "sudo -n systemctl --no-block",
         ] {
             assert!(
                 matches!(validate_systemctl_cmd(bad), Err(ToolError::InvalidArgument(_))),
-                "no trailing verb allowed; must reject: {bad:?}"
+                "no trailing token allowed (executable-prefix only); must reject: {bad:?}"
             );
         }
-        // …and the accepted forms all have systemctl as the executable, with only `-n`
-        // and NO trailing subcommand.
+        // …and the accepted forms are EXACTLY `[sudo [-n]] systemctl` — nothing after
+        // the executable.
         assert_eq!(
             validate_systemctl_cmd("sudo -n /usr/bin/systemctl").unwrap(),
             "sudo -n /usr/bin/systemctl"
@@ -1455,11 +1466,6 @@ mod tests {
         assert_eq!(
             validate_systemctl_cmd("sudo --non-interactive systemctl").unwrap(),
             "sudo --non-interactive systemctl"
-        );
-        // A trailing OPTION flag (not a verb) after systemctl is permitted.
-        assert_eq!(
-            validate_systemctl_cmd("systemctl --no-block").unwrap(),
-            "systemctl --no-block"
         );
 
         // The error never echoes the raw (potentially sensitive) value back.

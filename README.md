@@ -547,10 +547,13 @@ compiler_deploy(module, channel="stable", hosts="all")
   `timed_out`); the per-host `detail` is **fixed-vocabulary only** (`outcome=… rc=…`) — the raw
   updater marker token is **never echoed** into structured output; an **unknown requested host** is
   reported by **count only** (never reflecting arbitrary caller input / ssh targets back); and
-  `COMPILER_DEPLOY_SYSTEMCTL` is a **constrained** command whose **executable must be `systemctl`**
-  with **no trailing subcommand** (the trigger owns `start <unit>`; only option flags may follow —
-  a verb like `reboot`/`stop` is rejected), bare tokens only, shell metacharacters rejected — not
-  arbitrary shell. A malformed `COMPILER_DEPLOY_SYSTEMCTL` is an
+  `COMPILER_DEPLOY_SYSTEMCTL` is a **constrained, executable-prefix-only** command whose
+  **executable must be `systemctl`** with **NO trailing token at all** — no verb AND no flag. The
+  trigger owns `start <unit>` and must stay **synchronous** (it classifies this run's authoritative
+  outcome only after the BLD-12 unit finishes), so a trailing flag that changes blocking/result
+  semantics — notably `--no-block`, which returns before the updater writes its marker — is
+  rejected along with any verb; bare tokens only, shell metacharacters rejected — not arbitrary
+  shell. A malformed `COMPILER_DEPLOY_SYSTEMCTL` is an
   **operator-config** failure, not a caller error: it surfaces **in the aggregate report** (every
   chosen host `failed` + a config-error note naming the problem, no raw value echoed) — identical
   for the direct tool and the auto-promote hook — rather than aborting with a bare error that
@@ -579,12 +582,14 @@ manual use.
 Config (all optional, no infra literals — S1): `COMPILER_DEPLOY_HOSTS` (shared with
 `compiler_status`; `;`-separated `label|ssh_target`), `COMPILER_DEPLOY_UNIT_TEMPLATE` (default
 `constellation-update@{module}.service`; `{module}`/`{channel}` substituted),
-`COMPILER_DEPLOY_SYSTEMCTL` (default `systemctl`; a **constrained** command — bare tokens
-`[A-Za-z0-9._/-]` whose **executable must be `systemctl`** after an optional leading `sudo`
-followed by ONLY the non-interactive flag `-n` (no other/argument-taking sudo flag), with **no
-trailing subcommand** (the trigger supplies `start <unit>`; only option flags may follow),
-e.g. `sudo systemctl` / `sudo -n /usr/bin/systemctl`; shell metacharacters, a non-systemctl
-executable, and a trailing verb are rejected. A `sudo` prefix is auto-forced non-interactive with
+`COMPILER_DEPLOY_SYSTEMCTL` (default `systemctl`; an **executable-prefix-only** command — bare
+tokens `[A-Za-z0-9._/-]` whose **executable must be `systemctl`** after an optional leading `sudo`
+followed by ONLY the non-interactive flag `-n` (no other/argument-taking sudo flag), with **NO
+trailing token — no verb and no flag** (the trigger supplies `start <unit>` and must stay
+synchronous; a flag like `--no-block` would return before the updater finishes and is rejected).
+The accepted set is exactly `systemctl`, `/usr/bin/systemctl`, `sudo systemctl`, `sudo -n
+systemctl`, `sudo -n /usr/bin/systemctl`; shell metacharacters, a non-systemctl executable, and
+any trailing token are rejected. A `sudo` prefix is auto-forced non-interactive with
 `-n`), `COMPILER_DEPLOY_RESULT_MARKER_TEMPLATE` (default
 `/opt/{module}/.deploy_result` — the updater's outcome-token file, trusted only when the wrapper's
 pre-trigger `rm` cleared it (so any marker present after is this run's; a marker that could not be
