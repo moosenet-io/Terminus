@@ -972,4 +972,62 @@ mod tests {
             h.await.unwrap();
         }
     }
+
+    #[tokio::test]
+    async fn reconcile_releases_a_finished_job_immediately_not_after_the_stale_floor() {
+        // codex cycle-4: a job whose finalize SUCCEEDED but whose release keeps
+        // failing past the retry max sits FINISHED-but-unreleased holding its
+        // lock+slot. The next reconcile tick must release it PROMPTLY — the stale
+        // floor gates ONLY the crashed (no-marker) requeue path, NOT the finished
+        // release. Proven with a FRESH claim (age far under the stale floor).
+        let q = Arc::new(InMemoryQueue::new());
+        let j_fin = q.enqueue(&req("m1", "r1", false)).await.unwrap();
+        // A second, genuinely-CRASHED build (claimed, no marker, fresh) that must
+        // stay untouched — the floor still gates the crashed path.
+        let j_crash = q.enqueue(&req("m2", "r2", false)).await.unwrap();
+        let _ = q.claim(&j_crash.job_id, "m2", HostRole::Primary, 2).await.unwrap();
+
+        // Make every release fail (a release outage that outlasts the retry max).
+        q.fail_releases(1_000);
+        let ex = RecordingExecutor::new(false);
+        let mut c = cfg(2, 1, vec![]); // primary cap 2 so both can build
+        c.complete_retry_max = 3; // give up quickly after finalize succeeds
+        c.complete_retry_base = Duration::from_millis(1);
+        // A LONG stale floor: if the finished-release were (wrongly) age-gated it
+        // would NOT fire on a fresh claim.
+        c.stale_after = Duration::from_secs(MIN_STALE_BUILDING_SECS);
+        let s = sched(q.clone(), ex.clone(), Arc::new(NoopIdle), c);
+
+        // Tick 1: dispatches j_fin; its build finishes + finalizes, but release
+        // fails past the retry max → finished-but-unreleased (slot still held).
+        let r1 = s.tick_once(12, false).await;
+        assert_eq!(r1.dispatched, vec![j_fin.job_id.clone()]);
+        for h in r1.handles {
+            h.await.unwrap();
+        }
+        assert!(q.has_outcome(&j_fin.job_id), "finalize recorded the terminal marker");
+        assert_eq!(q.state_of(&j_fin.job_id).as_deref(), Some("building"), "not yet released");
+        assert_eq!(q.inflight_count(HostRole::Primary), 2, "both slots held");
+
+        // Tick 2 (claims are FRESH, far under the stale floor): reconcile releases
+        // the FINISHED job immediately — no age wait — and leaves the CRASHED one.
+        let r2 = s.tick_once(12, false).await;
+        assert_eq!(r2.self_healed, vec![j_fin.job_id.clone()], "finished job released now");
+        assert!(r2.reconciled.is_empty(), "crashed fresh-claim NOT requeued under the floor");
+        for h in r2.handles {
+            h.await.unwrap();
+        }
+        // Finished job: released, terminal, NEVER rebuilt (executor ran once).
+        assert_eq!(q.state_of(&j_fin.job_id).as_deref(), Some("done"));
+        assert_eq!(ex.built.lock().unwrap().as_slice(), ["m1".to_string()]);
+        // Crashed fresh-claim job: still building, still holding its slot.
+        assert_eq!(q.state_of(&j_crash.job_id).as_deref(), Some("building"));
+        // The finished job's slot + module lock were freed → a same-module (m1)
+        // build can now claim.
+        let j_next = q.enqueue(&req("m1", "r3", false)).await.unwrap();
+        assert!(matches!(
+            q.claim(&j_next.job_id, "m1", HostRole::Primary, 2).await.unwrap(),
+            ClaimOutcome::Claimed { .. }
+        ));
+    }
 }

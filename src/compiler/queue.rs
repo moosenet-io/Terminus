@@ -56,6 +56,13 @@
 //! direct caller should use the retrying [`QueueStore::complete`] (the scheduler
 //! drives the two steps directly with its own config-tuned retry).
 //!
+//! The self-heal is PROMPT, not delayed: reconcile releases a finished-but-
+//! unreleased job IMMEDIATELY (the `BUILD_STALE_BUILDING_SECS` age gate applies
+//! ONLY to the crashed-requeue path), so if the worker's `release` retries are
+//! exhausted, the very next reconcile tick after Redis recovers frees the lock +
+//! slot — no waiting out the stale floor. The fence token still prevents any
+//! double-free or rebuild.
+//!
 //! ## Discipline (S1/S7)
 //! No infra literals: every key is formed through [`Namespace::Queue`], the
 //! endpoint/password come from the vault-materialized env via [`RedisBackend`],
@@ -403,11 +410,19 @@ pub trait QueueStore: Send + Sync {
         Err(QueueError::Unavailable)
     }
 
-    /// Crash/restart backstop: sweep every `building` job. A job whose worker
-    /// FINISHED (a durable `outcome` marker) but never released is released only
-    /// (NO rebuild); a job with no marker whose claim is older than `stale_after`
-    /// (crashed mid-build) is requeued. Atomic per job; a Redis-down sweep
-    /// degrades to `Unavailable` (nothing partially changed — retry next tick).
+    /// Crash/restart backstop: sweep every `building` job. TWO paths with DISTINCT
+    /// timing:
+    ///   - **FINISHED-but-unreleased** (a durable `outcome` marker present, e.g.
+    ///     the worker's `release` retries were exhausted): released IMMEDIATELY on
+    ///     this sweep, NO rebuild — the `stale_after` age gate is NOT applied, so
+    ///     the lock/slot self-heal PROMPTLY on the next tick once Redis recovers
+    ///     (including the scheduler's first tick after a restart).
+    ///   - **CRASHED mid-build** (NO marker): requeued only once the claim is older
+    ///     than `stale_after` (the safe floor), so a genuinely-live long build is
+    ///     never wrongly requeued.
+    /// The `stale_after` age gate therefore applies ONLY to the crashed-requeue
+    /// path. Atomic + token-fenced per job (no double-free/rebuild); a Redis-down
+    /// sweep degrades to `Unavailable` (nothing partially changed — retry next tick).
     async fn reconcile(
         &self,
         stale_after: std::time::Duration,

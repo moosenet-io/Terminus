@@ -273,12 +273,15 @@ compiler_request(module, ref, priority="normal", host="auto", fast=false, ready=
   token still succeeds. The queue-layer `complete()` is the sanctioned retrying entry for
   direct callers; the scheduler drives the two steps with its own bounded backoff
   (`BUILD_COMPLETE_RETRY_BASE_MS`/`BUILD_COMPLETE_RETRY_MAX`) and yields (no release) if its
-  token has gone stale. As a
-  crash/restart backstop, each tick RECONCILES `building` jobs whose claim is older than
-  `BUILD_STALE_BUILDING_SECS` (clamped UP to a safe floor of max-build-timeout + retry window,
-  so a live build is never reconciled): a job that FINISHED (marker present) but never
-  released is released only — **never rebuilt** — while a job that CRASHED mid-build (no
-  marker) is requeued. The fence token guarantees a crashed worker's late completion can never
+  token has gone stale. As a crash/restart backstop, each tick RECONCILES `building` jobs via
+  two paths with **distinct timing**: a job that FINISHED (terminal-outcome marker present)
+  but was never released is released **immediately** on the next tick — **never rebuilt**, and
+  NOT gated on the stale age — so once Redis recovers a finished job's lock/slot self-heal
+  promptly (including on the scheduler's first tick after a restart); a job that CRASHED
+  mid-build (no marker) is requeued only once its claim is older than `BUILD_STALE_BUILDING_SECS`
+  (clamped UP to a safe floor of max-build-timeout + retry window, so a genuinely-live build is
+  never wrongly requeued). The `BUILD_STALE_BUILDING_SECS` age gate applies ONLY to the
+  crashed-requeue path. The fence token guarantees a crashed worker's late completion can never
   free a reconciled + re-claimed job's slot, and a double release never underflows the
   host-slot count.
 - **Safe heavy classification** — an `auto` request whose heaviness is unreadable/ambiguous
