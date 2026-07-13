@@ -99,6 +99,16 @@ pub fn parse_deploy_hosts(s: &str) -> Vec<DeployHost> {
         .collect()
 }
 
+/// The configured deploy hosts (`COMPILER_DEPLOY_HOSTS`), or empty when unset.
+/// Shared with BLD-13 (`compiler_deploy`) so the read matrix (this module) and the
+/// deploy TRIGGER fan out over the exact same operator-configured host set — a
+/// single source of truth for "which hosts the fleet deploys to".
+pub fn configured_deploy_hosts() -> Vec<DeployHost> {
+    env_nonempty(COMPILER_DEPLOY_HOSTS)
+        .map(|s| parse_deploy_hosts(&s))
+        .unwrap_or_default()
+}
+
 fn marker_template() -> String {
     env_nonempty(COMPILER_DEPLOY_MARKER_TEMPLATE)
         .unwrap_or_else(|| DEFAULT_MARKER_TEMPLATE.to_string())

@@ -492,6 +492,61 @@ Config (all optional, no infra literals — S1): `COMPILER_DEPLOY_HOSTS`
 enumerate the store), and `COMPILER_DEPLOY_SSH_TIMEOUT_SECS`. It reads no secrets from the
 environment (S7).
 
+## `compiler_deploy` — trigger-on-publish, fleet-wide (BLD-13)
+
+`compiler_deploy` (`compiler/deploy.rs`) closes the CI/CD loop: after a successful
+publish/promote moves the store's `current` sha, it **triggers the constellation-updater on
+the fleet** so the change lands in **seconds** instead of waiting for the nightly timer (which
+stays the catch-all). It is the *write*-side counterpart to `compiler_status`'s read-side
+matrix — both fan out over the **same configured deploy hosts** and the **same existing
+host-reach path**.
+
+```
+compiler_deploy(module, channel="stable", hosts="all")
+```
+
+- **What it does:** for each selected deploy host it fires the fetch-mode
+  `constellation-update@<module>` systemd unit (BLD-12) over ssh — `systemctl start <unit>`,
+  which blocks until the updater's whole `fetch → sha-verify → backup → atomic-mv → restart →
+  health-gate → rollback → marker` flow finishes — then reads back the systemd `Result` and
+  the updater's optional outcome-token file to classify a **per-host outcome**.
+- **Division of responsibility:** the compiler **only triggers**. The updater still **owns the
+  swap safety** (health-gate + rollback). `compiler_deploy` never touches a binary, symlink, or
+  health check — it fires the unit and reports what the updater reports.
+- **Per-host outcome** (unreachable / rollback are **reported, never masked**): `deployed`
+  (swapped, health-gate passed), `skipped` (already on `current`, a no-op), `rolled_back`
+  (swapped, health-gate failed, rolled back to backup), `failed` (updater errored), or
+  `unreachable` (ssh-level connect/auth/timeout). One unreachable host **never aborts** the
+  fan-out — the others still proceed and the nightly timer catches the straggler.
+- **Aggregation:** the result carries every host's `{host, outcome, detail}` plus `counts`
+  (`deployed`/`skipped`/`rolled_back`/`failed`/`unreachable`/`total`), a `degraded` flag and
+  `stragglers` count (the hosts that did not converge), and `notes`. A **partial fleet** result
+  is surfaced as `degraded=true` with a note that the nightly timer remains the catch-all.
+- **Host reach (S7):** the trigger uses the *same* non-mutating BatchMode ssh reach as BLD-08
+  (`StrictHostKeyChecking=no` + `UserKnownHostsFile=/dev/null`, no `known_hosts` mutation) and
+  authenticates with the **ambient ssh key** of the sanctioned reach path — it reads **no**
+  token/key/password from the environment, so there is nothing secret-shaped to route through
+  the vault here. The remote wrapper always `exit 0`s, so ssh's own exit reflects **only
+  connectivity** (that is what distinguishes `unreachable` from a failed deploy) — the same
+  tri-state trick `compiler_status` uses.
+
+**Auto-trigger after promote (optional).** When `COMPILER_AUTO_DEPLOY` is truthy
+(`1`/`true`/`yes`/`on`), a successful `compiler_release` **promote** that actually flips
+`current` (not a no-op) auto-fires `compiler_deploy(module, to_channel)` and **attaches** the
+deploy report to the promote result under `auto_deploy`. It is **best-effort** — it never fails
+or masks the promote. Left unset, `compiler_deploy` is simply exposed as a tool for the GUI /
+manual use.
+
+Config (all optional, no infra literals — S1): `COMPILER_DEPLOY_HOSTS` (shared with
+`compiler_status`; `;`-separated `label|ssh_target`), `COMPILER_DEPLOY_UNIT_TEMPLATE` (default
+`constellation-update@{module}.service`; `{module}`/`{channel}` substituted),
+`COMPILER_DEPLOY_SYSTEMCTL` (default `systemctl`; set e.g. `sudo systemctl` where the reach
+user needs elevation), `COMPILER_DEPLOY_RESULT_MARKER_TEMPLATE` (default
+`/opt/{module}/.deploy_result` — the updater's outcome-token file; absent it, the outcome
+degrades to the systemd `Result` + exit code), `COMPILER_DEPLOY_TRIGGER_TIMEOUT_SECS` (default
+300 — larger than the BLD-08 marker read since the trigger runs the updater synchronously),
+`COMPILER_DEPLOY_MAX_CONCURRENCY` (default 4), and `COMPILER_AUTO_DEPLOY`.
+
 ## Fleet clock — `time_now` (CLK-01)
 
 `time_now` is a core tool that returns the **authoritative fleet date/time**
