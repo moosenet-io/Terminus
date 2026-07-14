@@ -83,8 +83,11 @@ const AGY_MODEL: &str = "gemini-3.1-pro";
 /// pre-existing call site (routine reviews, the Epic capstone) passes `None`
 /// and is byte-for-byte unaffected.
 const CLAUDE_REASONING_EFFORT_FLAG: &str = "--effort";
-/// The `codex exec` config-override flag (`-c key=value`, codex's documented TOML
-/// override syntax) and the specific key codex uses for reasoning effort.
+/// The specific key codex uses for reasoning effort, emitted via codex's
+/// long-form config-override flag (`--config key=value`; the short form is
+/// `-c`, but that literal is a `SHELL_MARKERS` member and would trip the
+/// `assert_no_shell_markers` anti-`sh -c` invariant, so the long form is used).
+/// codex parses the value as TOML (cf. its `-c model="o3"` example).
 const CODEX_REASONING_EFFORT_KEY: &str = "model_reasoning_effort";
 
 /// A fully-built, ready-to-spawn command: binary name + argv array. Never a
@@ -132,9 +135,17 @@ pub fn build_command(
             ];
             // REVCAP-01 PART B: only appended for an intensive-substitute dispatch
             // -- a routine/epic codex call (`reasoning_effort: None`) produces the
-            // exact same argv as before this change.
+            // exact same argv as before this change. Uses codex's LONG-form
+            // `--config <key=value>` (not the `-c` short form): `-c` is a member
+            // of this module's `SHELL_MARKERS` security invariant (which proves
+            // the daemon never builds an `sh -c` shell invocation), so emitting a
+            // literal `-c` argv element would trip `assert_no_shell_markers`.
+            // `--config` is codex's own documented equivalent (`-c, --config
+            // <key=value>`) and is not a shell marker. The value keeps its TOML
+            // quotes -- codex parses `--config` values as TOML (cf. its
+            // `-c model="o3"` example).
             if let Some(effort) = reasoning_effort {
-                args.push("-c".into());
+                args.push("--config".into());
                 args.push(format!("{CODEX_REASONING_EFFORT_KEY}=\"{effort}\""));
             }
             args.push("--output-last-message".into());
@@ -359,23 +370,35 @@ mod tests {
         let cmd = build_command(Provider::Codex, "x", false, None);
         assert!(
             !cmd.args.iter().any(|a| a.contains(CODEX_REASONING_EFFORT_KEY)),
-            "routine codex call must not carry the -c override: {:?}",
+            "routine codex call must not carry the --config override: {:?}",
             cmd.args
         );
+        // And never a bare `--config` flag either.
+        assert!(!cmd.args.iter().any(|a| a == "--config"), "{:?}", cmd.args);
     }
 
     #[test]
     fn codex_command_appends_effort_override_when_some() {
         let cmd = build_command(Provider::Codex, "x", false, Some("high"));
-        let pos = cmd.args.iter().position(|a| a == "-c").expect("must carry -c flag");
+        // Long-form `--config` (not `-c`): `-c` is a SHELL_MARKERS member (the
+        // anti-`sh -c` invariant), so the effort override must use codex's
+        // documented long form to keep `assert_no_shell_markers` passing.
+        let pos = cmd
+            .args
+            .iter()
+            .position(|a| a == "--config")
+            .expect("must carry --config flag");
         assert_eq!(
             cmd.args.get(pos + 1).map(String::as_str),
             Some(format!("{CODEX_REASONING_EFFORT_KEY}=\"high\"").as_str())
         );
+        // The short-form `-c` must NOT appear (it would trip the shell-marker guard).
+        assert!(!cmd.args.iter().any(|a| a == "-c"), "{:?}", cmd.args);
         // The prompt's "--" terminator + trailing prompt arg must still be intact
-        // regardless of the extra -c pair inserted before them.
+        // regardless of the extra --config pair inserted before them.
         assert_eq!(cmd.args.last().map(String::as_str), Some("x"));
         assert_eq!(cmd.args.get(cmd.args.len() - 2).map(String::as_str), Some("--"));
+        // The load-bearing security invariant must still hold WITH the override present.
         assert_no_shell_markers(&cmd);
     }
 
