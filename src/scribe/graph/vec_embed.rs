@@ -32,6 +32,28 @@ use crate::scribe::graph::model::KgNode;
 /// Bounded concurrency for `embed_batch`'s per-item Ollama fan-out.
 const BATCH_CONCURRENCY: usize = 4;
 
+/// Whether `url`'s HOST is a loopback address — parsed exactly, never a substring
+/// match (which `localhost.attacker.com` / `127.0.0.1.evil.com` / a path or query
+/// containing "localhost" would defeat, leaking a self-minted JWT to an external
+/// host). Extracts the authority between `://` and the next `/`?`#`, strips any
+/// `user@`, drops the `:port` (and unwraps a `[::1]` IPv6 literal), and matches the
+/// bare host against the loopback set. No `url` crate dependency.
+fn is_loopback_url(url: &str) -> bool {
+    let Some((_, rest)) = url.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if let Some(after_bracket) = host_port.strip_prefix('[') {
+        // `[::1]:port` → the bracketed IPv6 literal.
+        after_bracket.split(']').next().unwrap_or("")
+    } else {
+        // `host:port` or bare `host`.
+        host_port.split(':').next().unwrap_or("")
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
 /// Overall `node_card` length cap, in bytes (truncated on a char boundary).
 const CARD_MAX_LEN: usize = 512;
 
@@ -50,6 +72,12 @@ pub struct EmbedClient {
     /// `true` when `url` is an OpenAI-style `/v1/embeddings` endpoint;
     /// `false` for the Ollama `/api/embeddings` shape.
     openai_shape: bool,
+    /// `true` when we must SELF-MINT a Chord JWT per request: no static
+    /// `api_key` was supplied AND the endpoint is the co-located (loopback)
+    /// Chord `/v1/embeddings` proxy, which requires a Bearer JWT (same
+    /// `TERMINUS_JWT_SIGNING_KEY` this process already holds). This closes the
+    /// EMBED-02 auth gap without provisioning a static `EMBEDDINGS_API_KEY`.
+    self_mint_jwt: bool,
 }
 
 impl EmbedClient {
@@ -73,11 +101,40 @@ impl EmbedClient {
     pub fn new(url: impl Into<String>, model: impl Into<String>, api_key: Option<String>, timeout_ms: u64) -> Self {
         let url = url.into();
         let openai_shape = url.contains("/v1/embeddings");
+        // Self-mint a Chord JWT only for the co-located (loopback) OpenAI-shape
+        // proxy when no static key is set — never for a real external host (a
+        // terminus-signed JWT is meaningless to a hosted provider AND would leak
+        // signing capability) and never when a key is explicitly provided. The
+        // loopback test parses the URL's HOST and matches it EXACTLY — a substring
+        // check would be bypassed by `localhost.attacker.com` / `127.0.0.1.evil`.
+        let self_mint_jwt = api_key.is_none() && openai_shape && is_loopback_url(&url);
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_millis(timeout_ms.max(1)))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { http, url, model: model.into(), api_key, openai_shape }
+        Self { http, url, model: model.into(), api_key, openai_shape, self_mint_jwt }
+    }
+
+    /// The Bearer token for a request: the explicit `api_key` if provided, else
+    /// a freshly-minted Chord service JWT when [`self_mint_jwt`]. It reuses the
+    /// federation module's [`crate::federation::mint_service_jwt`] — the ONE
+    /// correct Chord-shaped JWT (`sub == "lumina"` — Chord's `validate_jwt` hard-
+    /// rejects any other subject as `InvalidSubject` — signed with the shared
+    /// `TERMINUS_PRIMARY_CHORD_JWT_SECRET`, NOT the enrollment `TERMINUS_JWT_SIGNING_KEY`).
+    /// Minted PER REQUEST immediately before send (federation's standard short TTL,
+    /// ~120s), so it can never expire mid-call. TTL is intentionally the federation
+    /// value — terminus-primary and Chord are CO-LOCATED on the same host (loopback
+    /// is the only case this fires), so they share one system clock and there is no
+    /// skew for `exp` to trip. A mint failure (secret unset) degrades to no auth →
+    /// the endpoint's own 401, never a panic.
+    fn bearer_token(&self) -> Option<String> {
+        if let Some(key) = &self.api_key {
+            return Some(key.clone());
+        }
+        if self.self_mint_jwt {
+            return crate::federation::mint_service_jwt().ok();
+        }
+        None
     }
 
     /// Embed a single piece of text. Never panics: transport, HTTP-status,
@@ -90,8 +147,8 @@ impl EmbedClient {
         };
 
         let mut req = self.http.post(&self.url).json(&body);
-        if let Some(key) = &self.api_key {
-            req = req.bearer_auth(key);
+        if let Some(tok) = self.bearer_token() {
+            req = req.bearer_auth(tok);
         }
 
         let resp = req
@@ -141,8 +198,8 @@ impl EmbedClient {
         if self.openai_shape {
             let body = json!({ "model": self.model, "input": texts });
             let mut req = self.http.post(&self.url).json(&body);
-            if let Some(key) = &self.api_key {
-                req = req.bearer_auth(key);
+            if let Some(tok) = self.bearer_token() {
+                req = req.bearer_auth(tok);
             }
             let resp = req
                 .send()
@@ -275,6 +332,46 @@ mod tests {
 
     fn node(kind: NodeKind, name: &str, path: &str) -> KgNode {
         KgNode::new(format!("{path}::{name}"), kind, name, path)
+    }
+
+    // ── EMBED-02 self-mint gating ─────────────────────────────────────────
+    #[test]
+    fn self_mint_only_for_loopback_chord_proxy_without_a_key() {
+        // co-located Chord proxy, no static key → self-mint.
+        let c = EmbedClient::new("http://127.0.0.1:8099/v1/embeddings", "Qwen3-Embedding", None, 1000);
+        assert!(c.self_mint_jwt);
+        // an explicit key wins → never self-mint.
+        let c = EmbedClient::new("http://127.0.0.1:8099/v1/embeddings", "m", Some("static".into()), 1000);
+        assert!(!c.self_mint_jwt);
+        assert_eq!(c.bearer_token().as_deref(), Some("static"));
+        // raw Ollama shape (not /v1/embeddings) → never self-mint.
+        let c = EmbedClient::new("http://127.0.0.1:11435/api/embeddings", "nomic", None, 1000);
+        assert!(!c.self_mint_jwt);
+        assert!(c.bearer_token().is_none());
+        // an EXTERNAL /v1/embeddings host → never self-mint (a terminus JWT is
+        // meaningless there; a real key would be required).
+        let c = EmbedClient::new("https://openrouter.ai/api/v1/embeddings", "m", None, 1000);
+        assert!(!c.self_mint_jwt);
+        assert!(c.bearer_token().is_none());
+    }
+
+    #[test]
+    fn is_loopback_url_matches_host_exactly_not_substring() {
+        // Real loopback authorities → true (with/without port, ipv6, userinfo).
+        assert!(is_loopback_url("http://127.0.0.1:8099/v1/embeddings"));
+        assert!(is_loopback_url("http://localhost/v1/embeddings"));
+        assert!(is_loopback_url("http://[::1]:8099/v1/embeddings"));
+        assert!(is_loopback_url("http://user@127.0.0.1:8099/v1/embeddings"));
+        // The bypasses both reviewers flagged → MUST be false (external hosts).
+        assert!(!is_loopback_url("http://localhost.attacker.example/v1/embeddings"));
+        assert!(!is_loopback_url("http://127.0.0.1.attacker.example/v1/embeddings"));
+        assert!(!is_loopback_url("https://attacker.example/v1/embeddings/localhost"));
+        assert!(!is_loopback_url("https://attacker.example/v1/embeddings?target=127.0.0.1"));
+        assert!(!is_loopback_url("not-a-url"));
+        // And the gate consequence: an attacker-substring host never self-mints.
+        let c = EmbedClient::new("http://localhost.attacker.example/v1/embeddings", "m", None, 1000);
+        assert!(!c.self_mint_jwt);
+        assert!(c.bearer_token().is_none());
     }
 
     // ── shape detection ──────────────────────────────────────────────────
