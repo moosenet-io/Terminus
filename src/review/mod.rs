@@ -29,6 +29,12 @@
 //!                             unset, those two degrade similarly
 
 mod aggregate;
+// REVCAP-01 PART A: the reviewer-provider capacity core (two-tier cooldown/
+// shelve state machine + the frontier capacity gate). `pub(crate)` for the
+// same reason as `dispatch`/`kg_context` below -- `review_provider_status`
+// (this module, further down) and `execute()`'s capacity gate both need it,
+// and it has no reason to be reachable outside this crate.
+pub(crate) mod capacity;
 // `pub(crate)` (was module-private): DOCGEN-10's mismatch detector
 // (`crate::tools::docgen::mismatch`) reuses `is_daemon_provider` /
 // `openrouter_model_for` / the model-tag constants directly rather than
@@ -779,6 +785,12 @@ async fn run_one_provider(
 
     match raw {
         Ok(text) => {
+            // REVCAP-01: a genuine reply demonstrates the provider is up --
+            // self-populate the capacity registry at zero extra dispatch cost
+            // (clears any stale cap and resets the consecutive-cap/backoff
+            // counters). See `record_dispatch_outcome`'s doc for why this
+            // lives in one place shared with the error arm below.
+            record_dispatch_outcome(&provider, &Ok(()));
             let (verdict, reasoning) = parse_verdict(&text);
             let findings = parse_findings(&text);
             ProviderResult {
@@ -789,13 +801,42 @@ async fn run_one_provider(
                 findings,
             }
         }
-        Err(reason) => ProviderResult {
-            provider,
-            verdict: "UNKNOWN".to_string(),
-            reasoning: String::new(),
-            error: Some(reason),
-            findings: Vec::new(),
-        },
+        Err(reason) => {
+            record_dispatch_outcome(&provider, &Err(reason.clone()));
+            ProviderResult {
+                provider,
+                verdict: "UNKNOWN".to_string(),
+                reasoning: String::new(),
+                error: Some(reason),
+                findings: Vec::new(),
+            }
+        }
+    }
+}
+
+/// REVCAP-01: record a real dispatch outcome into the process-global
+/// [`capacity::registry`] -- the exact hook that makes the registry
+/// self-populating at zero extra provider usage (no separate probe dispatch
+/// needed for `review_run`'s own callers; only `review_provider_status`'s
+/// opt-in `probe:true` spends an extra dispatch). Classifies an error into
+/// rate-limit (two-tier cooldown/shelve) vs. timeout (latency, never a cap)
+/// vs. any other dispatch error (tracked as a diagnostic, still available).
+/// A success clears any cap state outright.
+fn record_dispatch_outcome(provider: &str, outcome: &Result<(), String>) {
+    let now = std::time::SystemTime::now();
+    match outcome {
+        Ok(()) => capacity::registry().update(provider, |s| s.mark_success()),
+        Err(reason) => {
+            if capacity::is_rate_limit_error(reason) {
+                let horizon = capacity::parse_horizon_secs(reason);
+                capacity::registry()
+                    .update(provider, |s| s.mark_rate_limited(horizon, now, reason.clone()));
+            } else if capacity::is_timeout_error(reason) {
+                capacity::registry().update(provider, |s| s.mark_latency(reason.clone()));
+            } else {
+                capacity::registry().update(provider, |s| s.mark_error(reason.clone()));
+            }
+        }
     }
 }
 
@@ -897,6 +938,66 @@ than failing the whole call."
         // (see `maybe_escalate`'s doc): any failure to compute a risk band or
         // waiver just means no escalation, never a blocked/degraded panel.
         let escalation_decision = maybe_escalate(structure, &context, &mut providers, &cortex_config).await;
+
+        // REVCAP-01 PART A: capacity gate. Consult the self-populating
+        // capacity registry (fed by `record_dispatch_outcome` on every past
+        // real dispatch) BEFORE spending a dispatch on this call. If >= 2 of
+        // the FRONTIER providers (codex/agy/opus) are currently down
+        // (Shelved, or Cooldown not yet elapsed), a panel must not silently
+        // return a degraded verdict -- return a distinct, structurally
+        // detectable PAUSE outcome instead (`aggregate_verdict:
+        // "CAPACITY_PAUSED"` + `capacity_paused: true`), dispatching NO
+        // providers. Backward-compat: an empty/fresh registry (nothing ever
+        // recorded a cap) always reads as "0 down" here, so this is a total
+        // no-op until the registry has real data -- identical to today's
+        // behavior.
+        let now = std::time::SystemTime::now();
+        let (paused, down_providers) =
+            capacity::frontier_capacity_paused(capacity::registry(), now);
+        if paused {
+            let earliest = capacity::earliest_recovery(capacity::registry(), &down_providers)
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs_f64());
+            return Ok(json!({
+                "structure": args["structure"],
+                "providers": [],
+                "aggregate_verdict": "CAPACITY_PAUSED",
+                "complete": false,
+                "capacity_paused": true,
+                "down_providers": down_providers,
+                "earliest_recovery_unix": earliest,
+                "reason": "insufficient adversarial capacity: 2 or more frontier reviewer \
+                           providers (codex/agy/opus) are currently capped; refusing to return \
+                           a degraded verdict",
+            })
+            .to_string());
+        }
+        // Fewer than 2 frontier providers down: proceed, but ANNOTATE (never
+        // alter) when a requested frontier provider is itself down and an
+        // available frontier substitute exists -- the actual intensity
+        // escalation (swapping dispatch params) is PART B; here we only
+        // record the substitution note for the caller's visibility.
+        let capacity_substitutions: Vec<Value> = providers
+            .iter()
+            .filter(|p| {
+                capacity::FRONTIER.contains(&p.as_str()) && capacity::registry().is_down(p, now)
+            })
+            .filter_map(|down_provider| {
+                capacity::FRONTIER
+                    .iter()
+                    .find(|alt| {
+                        !providers.contains(&alt.to_string())
+                            && !capacity::registry().is_down(alt, now)
+                    })
+                    .map(|alt| {
+                        json!({
+                            "requested": down_provider,
+                            "available_substitute": alt,
+                            "applied": false,
+                        })
+                    })
+            })
+            .collect();
 
         let mut set = tokio::task::JoinSet::new();
         // Tracks each spawned task's tokio::task::Id back to its (index,
@@ -1049,6 +1150,7 @@ than failing the whole call."
             "scribe_docs": scribe_docs,
             "findings_recorded": findings_recorded,
             "escalation": escalation,
+            "capacity_substitutions": capacity_substitutions,
             "consistency": {
                 "status": consistency_run.status,
                 "provider": consistency_run.provider,
@@ -1115,6 +1217,106 @@ impl RustTool for OpenRouterCredits {
     }
 }
 
+/// The providers `review_provider_status` reports on -- every provider name
+/// `review_run` itself accepts EXCEPT the two capstone-only lenses
+/// (`claude-fable-5`, `gpt56`), which aren't part of the routine
+/// panel/capacity-gate story this tool exists for.
+const STATUS_PROVIDERS: &[&str] = &["opus", "codex", "agy", "free", "nemotron", "qwen_coder"];
+
+/// `review_provider_status` — REVCAP-01 PART A: report the reviewer-provider
+/// capacity registry's current state per provider (cached, zero extra
+/// dispatch cost by default), or optionally refresh it with a minimal probe
+/// dispatch per provider (`probe: true`).
+struct ReviewProviderStatus;
+
+impl ReviewProviderStatus {
+    /// Minimal probe dispatch: a trivial prompt, routine daemon opts, routed
+    /// through the SAME `dispatch_provider_raw` transport table `review_run`
+    /// itself uses (S9: one dispatch routing table, not a second one for
+    /// probing) -- its outcome is folded into the registry via the same
+    /// `record_dispatch_outcome` hook a real review uses.
+    async fn probe_one(cfg: &ReviewConfig, provider: &str) {
+        let daemon_opts = dispatch::DaemonOpts::routine();
+        let raw = dispatch_provider_raw(cfg, provider, "ping", &daemon_opts).await;
+        record_dispatch_outcome(provider, &raw.map(|_| ()));
+    }
+}
+
+#[async_trait::async_trait]
+impl RustTool for ReviewProviderStatus {
+    fn name(&self) -> &str {
+        "review_provider_status"
+    }
+
+    fn description(&self) -> &str {
+        "Report each review provider's (opus, codex, agy, free, nemotron, qwen_coder) \
+         current capacity-registry state: available/cooldown/shelved/latency/error, the \
+         absolute capped_until time, the reset horizon, provenance, and consecutive-cap \
+         count. Default returns the CACHED registry state (no extra provider dispatch). \
+         Pass 'probe: true' to refresh every provider with one minimal dispatch first."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "probe": {
+                    "type": "boolean",
+                    "description": "If true, dispatch one minimal probe per provider to refresh \
+                                     the registry before reporting (spends real provider usage)."
+                }
+            },
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.execute_structured(args).await?.text)
+    }
+
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let probe = args.get("probe").and_then(Value::as_bool).unwrap_or(false);
+        if probe {
+            let cfg = ReviewConfig::from_env();
+            for provider in STATUS_PROVIDERS {
+                Self::probe_one(&cfg, provider).await;
+            }
+        }
+
+        let now = std::time::SystemTime::now();
+        let providers: Vec<Value> = STATUS_PROVIDERS
+            .iter()
+            .map(|name| {
+                let s = capacity::registry().get(name);
+                let capped_until = s
+                    .cooldown_until
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs_f64());
+                json!({
+                    "provider": s.name,
+                    "status": s.last_status,
+                    "available": s.available,
+                    "capped_until": capped_until,
+                    "horizon_secs": s.last_horizon_secs,
+                    "consecutive_caps": s.consecutive_caps,
+                    "backoff_secs": s.backoff_secs,
+                    "source": s.source,
+                })
+            })
+            .collect();
+        let (paused, down_providers) =
+            capacity::frontier_capacity_paused(capacity::registry(), now);
+
+        let structured = json!({
+            "probed": probe,
+            "providers": providers,
+            "frontier_capacity_paused": paused,
+            "frontier_down": down_providers,
+        });
+        Ok(ToolOutput::with_structured(structured.to_string(), structured))
+    }
+}
+
 pub fn register(registry: &mut ToolRegistry) {
     registry
         .register(Box::new(ReviewRun::new()))
@@ -1122,6 +1324,9 @@ pub fn register(registry: &mut ToolRegistry) {
     registry
         .register(Box::new(OpenRouterCredits))
         .expect("openrouter_credits must register cleanly");
+    registry
+        .register(Box::new(ReviewProviderStatus))
+        .expect("review_provider_status must register cleanly");
 }
 
 #[cfg(test)]
@@ -2107,5 +2312,133 @@ mod tests {
         std::env::remove_var("CORTEX_RISK_SCORE_THRESHOLD");
         std::env::remove_var("CORTEX_RISK_BAND_ELEVATED_CUT");
         std::env::remove_var("CORTEX_ESCALATION_ADD_PROVIDER");
+    }
+
+    // ── REVCAP-01 PART A: capacity gate + review_provider_status wiring ────
+    //
+    // `#[serial_test::serial]` on every test in this section: they mutate the
+    // process-global `capacity::registry()` singleton (shared with every
+    // other test in this binary), same reason `free_pool`'s tests use it.
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn capacity_gate_pauses_review_run_and_dispatches_no_providers() {
+        capacity::registry().update("codex", |s| s.mark_success());
+        capacity::registry().update("agy", |s| s.mark_success());
+        let now = std::time::SystemTime::now();
+        // >1800s -> Shelved, well within the "down" window for the gate check.
+        capacity::registry()
+            .update("codex", |s| s.mark_rate_limited(Some(3000), now, "test shelve"));
+        capacity::registry()
+            .update("agy", |s| s.mark_rate_limited(Some(3000), now, "test shelve"));
+
+        let args = json!({
+            "structure": "panel_majority",
+            "providers": ["codex", "agy", "opus"],
+            "criteria": "x"
+        });
+        let out = tool().execute(args).await.unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+
+        assert_eq!(v["aggregate_verdict"], "CAPACITY_PAUSED", "{v}");
+        assert_eq!(v["capacity_paused"], true, "{v}");
+        assert_eq!(v["complete"], false, "{v}");
+        assert!(v["providers"].as_array().unwrap().is_empty(), "gate must dispatch nothing: {v}");
+        let down: Vec<String> = v["down_providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            down.contains(&"codex".to_string()) && down.contains(&"agy".to_string()),
+            "{v}"
+        );
+        assert!(v["earliest_recovery_unix"].as_f64().is_some(), "{v}");
+
+        capacity::registry().update("codex", |s| s.mark_success());
+        capacity::registry().update("agy", |s| s.mark_success());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn capacity_gate_proceeds_when_only_one_frontier_provider_is_down() {
+        capacity::registry().update("codex", |s| s.mark_success());
+        capacity::registry().update("agy", |s| s.mark_success());
+        let now = std::time::SystemTime::now();
+        capacity::registry()
+            .update("codex", |s| s.mark_rate_limited(Some(3000), now, "test shelve"));
+
+        std::env::remove_var("REVIEW_DAEMON_TOKEN");
+        let args = json!({"structure": "single", "providers": ["agy"], "criteria": "x"});
+        let out = tool().execute(args).await.unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+
+        // Only 1 frontier provider down -> proceeds normally (dispatches `agy`,
+        // which degrades on the missing daemon token, but that's an ordinary
+        // per-provider degrade, NOT the capacity-pause outcome).
+        assert_ne!(v["aggregate_verdict"], "CAPACITY_PAUSED", "{v}");
+        assert!(v["capacity_paused"].is_null(), "{v}");
+        assert_eq!(v["providers"].as_array().unwrap().len(), 1, "{v}");
+
+        capacity::registry().update("codex", |s| s.mark_success());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn capacity_gate_is_a_no_op_on_an_empty_fresh_registry_backward_compat() {
+        capacity::registry().update("codex", |s| s.mark_success());
+        capacity::registry().update("agy", |s| s.mark_success());
+        capacity::registry().update("opus", |s| s.mark_success());
+
+        std::env::remove_var("REVIEW_DAEMON_TOKEN");
+        let args = json!({"structure": "single", "providers": ["codex"], "criteria": "x"});
+        let out = tool().execute(args).await.unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+
+        assert_ne!(v["aggregate_verdict"], "CAPACITY_PAUSED", "{v}");
+        assert!(v["capacity_paused"].is_null(), "{v}");
+        assert_eq!(v["providers"].as_array().unwrap().len(), 1, "{v}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn review_run_records_a_real_dispatch_error_into_the_capacity_registry() {
+        capacity::registry().update("codex", |s| s.mark_success());
+        // -> "unavailable: REVIEW_DAEMON_TOKEN not configured"
+        std::env::remove_var("REVIEW_DAEMON_TOKEN");
+
+        let args = json!({"structure": "single", "providers": ["codex"], "criteria": "x"});
+        let _ = tool().execute(args).await.unwrap();
+
+        // Not a rate-limit/timeout phrase, so this must record as a plain
+        // Error status (still available), never a Cooldown/Shelved cap.
+        let s = capacity::registry().get("codex");
+        assert_eq!(s.last_status, capacity::CapStatus::Error, "{s:?}");
+        assert!(s.available, "a non-cap dispatch error must never mark the provider down");
+
+        capacity::registry().update("codex", |s| s.mark_success());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn review_provider_status_reports_cached_state_without_dispatching() {
+        capacity::registry().update("codex", |s| s.mark_success());
+        let now = std::time::SystemTime::now();
+        capacity::registry().update("agy", |s| s.mark_rate_limited(Some(3000), now, "test cap"));
+
+        let out = ReviewProviderStatus.execute_structured(json!({})).await.unwrap();
+        let v: Value = serde_json::from_str(&out.text).unwrap();
+
+        assert_eq!(v["probed"], false, "{v}");
+        let providers = v["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), STATUS_PROVIDERS.len(), "{v}");
+        let agy = providers.iter().find(|p| p["provider"] == "agy").unwrap();
+        assert_eq!(agy["status"], "shelved", "{agy}"); // 3000s > SHELVE_THRESHOLD_SECS
+        assert!(agy["capped_until"].as_f64().is_some(), "{agy}");
+        let codex = providers.iter().find(|p| p["provider"] == "codex").unwrap();
+        assert_eq!(codex["status"], "available", "{codex}");
+
+        capacity::registry().update("agy", |s| s.mark_success());
     }
 }
