@@ -30,13 +30,16 @@
 //! step is coalesced. The throttle NEVER drops a stage transition.
 //!
 //! ## Terminal stages (and what is NOT on this stream)
-//! `compiler_build`'s scope ENDS at publish, so this stream has exactly two
-//! terminal stages: [`Stage::Published`] (with the artifact sha) on success and
-//! [`Stage::Failed`] (with a sanitized error tail) on failure. Once terminal, the
-//! stream is CLOSED — later events are ignored. The downstream updater/deploy
-//! stage (BLD-13) — `deployed` / `rolled_back` — is a SEPARATE lifecycle that is
+//! `compiler_build`'s scope ENDS at publish (or, for `mode=test`, at the test
+//! result), so this stream has exactly three terminal stages:
+//! [`Stage::Published`] (with the artifact sha) on a `mode=build` success,
+//! [`Stage::Tested`] (with a structured pass/fail summary) on EITHER outcome of a
+//! `mode=test` gate run, and [`Stage::Failed`] (with a sanitized error tail) on an
+//! execution failure (either mode). Once terminal, the stream is CLOSED — later
+//! events are ignored. The downstream updater/deploy stage (BLD-13) — `deployed`
+//! / `rolled_back` — is a SEPARATE lifecycle that is
 //! NOT emitted onto this stream (there is no `Deployed`/`RolledBack` variant), so
-//! the code and this doc agree: nothing follows `published`/`failed` here.
+//! the code and this doc agree: nothing follows `published`/`tested`/`failed` here.
 //!
 //! ## Seam with `compiler_status` (BLD-08)
 //! `compiler_status` is a POINT-IN-TIME aggregate (queue + store `current`
@@ -190,6 +193,13 @@ pub enum Stage {
     Publishing,
     /// Terminal success for `compiler_build` (artifact published, sha known).
     Published,
+    /// Terminal outcome for a `mode=test` (BLD-COMPTEST) gate run — EITHER a pass
+    /// OR a fail (a failing test suite is a normal gate outcome, not an execution
+    /// error, so it is NOT `Failed`). The `message` field carries a JSON-encoded
+    /// [`CargoTestSummary`]-shaped structured summary (pass/fail, counts,
+    /// failing-test names) — see `compiler::parse_cargo_test_output`. A gate run
+    /// never reaches `Publishing`/`Published`: it stops here either way.
+    Tested,
     /// Terminal failure (a sanitized error tail is attached).
     Failed,
 }
@@ -204,15 +214,17 @@ impl Stage {
             Stage::Building => "building",
             Stage::Publishing => "publishing",
             Stage::Published => "published",
+            Stage::Tested => "tested",
             Stage::Failed => "failed",
         }
     }
 
-    /// Whether this stage closes the stream (no further events expected). Only
-    /// `published`/`failed` are terminal for this bus; `deployed`/`rolled_back`
-    /// are the downstream updater's concern and never reach this stream.
+    /// Whether this stage closes the stream (no further events expected).
+    /// `published`/`tested`/`failed` are terminal for this bus; `deployed`/
+    /// `rolled_back` are the downstream updater's concern and never reach this
+    /// stream.
     pub fn is_terminal(self) -> bool {
-        matches!(self, Stage::Published | Stage::Failed)
+        matches!(self, Stage::Published | Stage::Tested | Stage::Failed)
     }
 }
 
