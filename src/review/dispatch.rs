@@ -33,6 +33,17 @@ pub const NEMOTRON_MODEL: &str = "nvidia/nemotron-3-ultra-550b-a55b:free";
 /// free-tier, and frontier-class (480B total params, 1M token context),
 /// with a code-specialization that fits this tool's review use case well.
 pub const QWEN_CODER_MODEL: &str = "qwen/qwen3-coder:free";
+/// `gpt56`'s OpenRouter model tag: the GPT-5.6 **Luna** tier ($1/$6 per 1M in/out) —
+/// the cost-conscious "middle of the road" GPT-5.6 (the deep Sol tier is $5/$30). A
+/// PAID model (no `:free` suffix), so its dispatch is credit-guarded (see
+/// [`ReviewConfig::openrouter_credits`] and the `gpt56` path in `dispatch_provider_raw`).
+pub const GPT56_MODEL: &str = "openai/gpt-5.6-luna";
+
+/// The default minimum OpenRouter credit balance (USD) below which a PAID model
+/// dispatch is refused (degrades that provider rather than spending the last of the
+/// balance). Overridable via `OPENROUTER_MIN_CREDITS`. Keeps a paid capstone lens
+/// from bottoming out the account / becoming a money sink.
+const DEFAULT_MIN_OPENROUTER_CREDITS: f64 = 1.0;
 
 pub const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:8790"; // pii-test-fixture
 const DEFAULT_OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
@@ -77,8 +88,17 @@ impl ReviewConfig {
     }
 
     fn client() -> Result<reqwest::Client, ToolError> {
+        Self::client_with_timeout(150)
+    }
+
+    /// A client with a caller-chosen request timeout. The Epic capstone's explore
+    /// mode needs a MUCH larger HTTP timeout than a routine review because its
+    /// auditors legitimately run for many minutes (the review-daemon's progress /
+    /// stall-detector — not this wall-clock — decides when a genuinely-stalled
+    /// provider is killed; this ceiling is only a backstop against a wedged socket).
+    fn client_with_timeout(secs: u64) -> Result<reqwest::Client, ToolError> {
         reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(150))
+            .timeout(std::time::Duration::from_secs(secs))
             .build()
             .map_err(|e| ToolError::Http(e.to_string()))
     }
@@ -87,16 +107,38 @@ impl ReviewConfig {
     /// `POST /dispatch`. Returns `Ok(text)` on a genuine reply, `Err(reason)`
     /// (always prefixed `"unavailable: "`) on anything else -- daemon not
     /// configured, unreachable, or itself reporting a structured error.
-    pub async fn dispatch_daemon(&self, provider: &str, prompt: &str) -> Result<String, String> {
+    pub async fn dispatch_daemon(
+        &self,
+        provider: &str,
+        prompt: &str,
+        opts: &DaemonOpts,
+    ) -> Result<String, String> {
         let Some(token) = &self.daemon_token else {
             return Err("unavailable: REVIEW_DAEMON_TOKEN not configured".to_string());
         };
-        let client = Self::client().map_err(|e| format!("unavailable: {e}"))?;
+        let client =
+            Self::client_with_timeout(opts.client_timeout_secs).map_err(|e| format!("unavailable: {e}"))?;
         let url = format!("{}/dispatch", self.daemon_url);
+        let mut req_body = json!({
+            "provider": provider,
+            "prompt": prompt,
+            "timeout_secs": opts.timeout_secs,
+        });
+        // Epic capstone extras (the daemon defaults them off for a routine review):
+        // explore mode (read-only tools + repo cwd) + progress/stall detection.
+        if opts.explore {
+            req_body["explore"] = json!(true);
+        }
+        if let Some(stall) = opts.stall_secs {
+            req_body["stall_secs"] = json!(stall);
+        }
+        if let Some(repo) = &opts.repo_path {
+            req_body["repo_path"] = json!(repo);
+        }
         let resp = client
             .post(&url)
             .bearer_auth(token)
-            .json(&json!({"provider": provider, "prompt": prompt, "timeout_secs": 120}))
+            .json(&req_body)
             .send()
             .await
             .map_err(|e| format!("unavailable: daemon unreachable: {e}"))?;
@@ -116,6 +158,68 @@ impl ReviewConfig {
             let kind = body.get("error").and_then(Value::as_str).unwrap_or("other");
             let detail = body.get("detail").and_then(Value::as_str).unwrap_or("");
             Err(format!("unavailable: {kind}: {detail}"))
+        }
+    }
+
+    /// Query OpenRouter's credits endpoint (`GET /api/v1/credits`) → `(remaining,
+    /// total_granted, total_usage)` in USD. Used both by the `openrouter_credits`
+    /// tracker tool and by the pre-flight guard that refuses a PAID model dispatch
+    /// when the balance is below the floor (so a paid capstone lens can never bottom
+    /// out the account). `Err` (unconfigured / unreachable / malformed) is a
+    /// human-readable degrade reason, never a panic.
+    pub async fn openrouter_credits(&self) -> Result<(f64, f64, f64), String> {
+        let Some(key) = &self.openrouter_key else {
+            return Err("unavailable: OPENROUTER_API_KEY not configured".to_string());
+        };
+        let client = Self::client().map_err(|e| format!("unavailable: {e}"))?;
+        let url = openrouter_credits_url();
+        let resp = client
+            .get(&url)
+            .bearer_auth(key)
+            .send()
+            .await
+            .map_err(|e| format!("unavailable: openrouter credits unreachable: {e}"))?;
+        let status = resp.status();
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("unavailable: malformed credits response: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("unavailable: openrouter credits http {status}"));
+        }
+        // OpenRouter shape: {"data": {"total_credits": <granted>, "total_usage": <spent>}}.
+        let data = body.get("data").unwrap_or(&body);
+        let granted = data.get("total_credits").and_then(Value::as_f64).unwrap_or(0.0);
+        let usage = data.get("total_usage").and_then(Value::as_f64).unwrap_or(0.0);
+        Ok((granted - usage, granted, usage))
+    }
+
+    /// Pre-flight credit guard for a PAID OpenRouter model. Free models (`:free`)
+    /// skip the check (they cost nothing). For a paid model, refuse the dispatch
+    /// when the remaining balance is below [`min_openrouter_credits`] — degrading
+    /// that one provider (`"unavailable: openrouter credits low ..."`) rather than
+    /// spending the last of the balance. A credits-lookup failure FAILS OPEN (we do
+    /// not block a review on an inability to read the balance) but is logged.
+    pub(crate) async fn guard_paid_model(&self, model: &str) -> Result<(), String> {
+        if !is_paid_openrouter_model(model) {
+            return Ok(());
+        }
+        match self.openrouter_credits().await {
+            Ok((remaining, _, _)) => {
+                let floor = min_openrouter_credits();
+                if remaining < floor {
+                    Err(format!(
+                        "unavailable: openrouter credits low (${remaining:.2} < ${floor:.2} floor) — \
+                         refusing paid model '{model}' to avoid bottoming out the account"
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Err(e) => {
+                tracing::warn!("openrouter credit guard: could not read balance ({e}); failing open");
+                Ok(())
+            }
         }
     }
 
@@ -266,13 +370,84 @@ pub fn openrouter_model_for(provider: &str) -> Option<&'static str> {
     match provider {
         "nemotron" => Some(NEMOTRON_MODEL),
         "qwen_coder" => Some(QWEN_CODER_MODEL),
+        "gpt56" => Some(GPT56_MODEL),
         _ => None,
     }
 }
 
-/// Whether `provider` is one of the daemon-backed CLI providers.
+/// Whether `provider` is one of the daemon-backed CLI providers. `claude-fable-5`
+/// (the capstone Fable lens) routes to the daemon's `claude` CLI like `opus`.
 pub fn is_daemon_provider(provider: &str) -> bool {
-    matches!(provider, "opus" | "codex" | "agy")
+    matches!(provider, "opus" | "codex" | "agy" | "claude-fable-5")
+}
+
+/// OpenRouter credits endpoint: `OPENROUTER_CREDITS_URL` if set, else the default
+/// (parallels [`openrouter_chat_url`]; lets tests point at a mock).
+fn openrouter_credits_url() -> String {
+    std::env::var("OPENROUTER_CREDITS_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://openrouter.ai/api/v1/credits".to_string())
+}
+
+/// Whether an OpenRouter model tag is PAID (costs credits). OpenRouter marks free
+/// models with a `:free` suffix; everything else is paid and credit-guarded.
+pub fn is_paid_openrouter_model(model: &str) -> bool {
+    !model.ends_with(":free")
+}
+
+/// The minimum remaining OpenRouter balance (USD) below which a paid dispatch is
+/// refused. From `OPENROUTER_MIN_CREDITS`, else [`DEFAULT_MIN_OPENROUTER_CREDITS`].
+pub fn min_openrouter_credits() -> f64 {
+    std::env::var("OPENROUTER_MIN_CREDITS")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| *v >= 0.0)
+        .unwrap_or(DEFAULT_MIN_OPENROUTER_CREDITS)
+}
+
+/// Per-dispatch options for the review-daemon. A routine review uses [`Self::routine`]
+/// (tools off, 120s budget); the Epic capstone uses [`Self::epic`] (explore mode +
+/// progress/stall detection + a long wall-clock BACKSTOP, since a whole-repo audit
+/// legitimately runs for many minutes and the daemon's stall-detector — not a
+/// wall-clock timeout — decides when to kill a genuinely-stalled provider).
+#[derive(Clone, Debug)]
+pub struct DaemonOpts {
+    /// Wall-clock backstop (secs) sent to the daemon; the stall-detector is primary.
+    pub timeout_secs: u64,
+    /// HTTP client ceiling (secs); must exceed `timeout_secs`.
+    pub client_timeout_secs: u64,
+    /// Explore mode: the claude slots get read-only tools + a repo cwd.
+    pub explore: bool,
+    /// Kill a provider only after this many secs of NO output (a genuine stall).
+    pub stall_secs: Option<u64>,
+    /// Repo checkout the auditors may read from in explore mode.
+    pub repo_path: Option<String>,
+}
+
+impl DaemonOpts {
+    /// Routine per-item/per-sprint review: unchanged pre-capstone behavior.
+    pub fn routine() -> Self {
+        Self {
+            timeout_secs: 120,
+            client_timeout_secs: 150,
+            explore: false,
+            stall_secs: None,
+            repo_path: None,
+        }
+    }
+
+    /// Epic capstone: explore + stall detection + long backstop.
+    pub fn epic(repo_path: Option<String>) -> Self {
+        Self {
+            timeout_secs: 1800,
+            client_timeout_secs: 1900,
+            explore: true,
+            stall_secs: Some(180),
+            repo_path,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -298,7 +473,7 @@ mod tests {
             then.status(200).json_body(json!({"text": "Looks good.\nVERDICT: APPROVE"}));
         });
         let cfg = cfg_for(&server, "testtoken");
-        let result = cfg.dispatch_daemon("opus", "review this").await.unwrap();
+        let result = cfg.dispatch_daemon("opus", "review this", &DaemonOpts::routine()).await.unwrap();
         assert_eq!(result, "Looks good.\nVERDICT: APPROVE");
         mock.assert();
     }
@@ -311,7 +486,7 @@ mod tests {
             then.status(502).json_body(json!({"error": "binary_not_found", "detail": "'claude' not found"}));
         });
         let cfg = cfg_for(&server, "testtoken");
-        let err = cfg.dispatch_daemon("opus", "x").await.unwrap_err();
+        let err = cfg.dispatch_daemon("opus", "x", &DaemonOpts::routine()).await.unwrap_err();
         assert!(err.contains("unavailable"));
         assert!(err.contains("binary_not_found"));
     }
@@ -323,7 +498,7 @@ mod tests {
             daemon_token: None,
             openrouter_key: None,
         };
-        let err = cfg.dispatch_daemon("opus", "x").await.unwrap_err();
+        let err = cfg.dispatch_daemon("opus", "x", &DaemonOpts::routine()).await.unwrap_err();
         assert!(err.contains("REVIEW_DAEMON_TOKEN"));
     }
 
@@ -350,9 +525,36 @@ mod tests {
         assert!(is_daemon_provider("opus"));
         assert!(is_daemon_provider("codex"));
         assert!(is_daemon_provider("agy"));
+        // The Fable capstone lens routes to the daemon's claude CLI.
+        assert!(is_daemon_provider("claude-fable-5"));
         assert!(!is_daemon_provider("nemotron"));
         assert!(!is_daemon_provider("qwen_coder"));
         assert!(!is_daemon_provider("free"));
+        // gpt56 is an OpenRouter model, NOT a daemon provider.
+        assert!(!is_daemon_provider("gpt56"));
+    }
+
+    #[test]
+    fn gpt56_maps_to_the_luna_tier_and_is_paid() {
+        assert_eq!(openrouter_model_for("gpt56"), Some(GPT56_MODEL));
+        assert_eq!(GPT56_MODEL, "openai/gpt-5.6-luna");
+        // gpt56 is PAID (credit-guarded); the free lenses are not.
+        assert!(is_paid_openrouter_model(GPT56_MODEL));
+        assert!(!is_paid_openrouter_model(NEMOTRON_MODEL));
+        assert!(!is_paid_openrouter_model(QWEN_CODER_MODEL));
+        assert!(!is_paid_openrouter_model("anything:free"));
+    }
+
+    #[test]
+    fn epic_daemon_opts_enable_explore_and_stall() {
+        let routine = DaemonOpts::routine();
+        assert!(!routine.explore && routine.stall_secs.is_none() && routine.timeout_secs == 120);
+        let epic = DaemonOpts::epic(Some("/repo".into()));
+        assert!(epic.explore);
+        assert!(epic.stall_secs.is_some());
+        assert!(epic.timeout_secs > routine.timeout_secs);
+        assert!(epic.client_timeout_secs > epic.timeout_secs);
+        assert_eq!(epic.repo_path.as_deref(), Some("/repo"));
     }
 
     #[test]

@@ -6,11 +6,16 @@
 //! behavior against a synthetic env map, without mutating real process env
 //! vars (which would be racy across parallel tests).
 
-/// Hard cap on `timeout_secs` a caller may request, regardless of what value
-/// is sent in the request body.
-pub const MAX_TIMEOUT_SECS: u64 = 600;
+/// Hard cap on `timeout_secs` (the WALL-CLOCK backstop) a caller may request. Raised
+/// to 30 min for the Epic capstone: a whole-repo explore-mode audit legitimately runs
+/// for many minutes, and the progress/stall detector — not this backstop — is the
+/// primary bound (this only catches a truly wedged process).
+pub const MAX_TIMEOUT_SECS: u64 = 1800;
 /// Default timeout when a request omits `timeout_secs`.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
+/// Hard cap on the stall window (secs of no output before a kill). Bounds a caller's
+/// `stall_secs` so a huge value can't effectively disable stall detection.
+pub const MAX_STALL_SECS: u64 = 600;
 /// Hard cap on prompt size (200 KB), enforced before any provider dispatch.
 pub const MAX_PROMPT_BYTES: usize = 200 * 1024;
 /// Max concurrent subprocess spawns.
@@ -64,6 +69,12 @@ pub fn clamp_timeout(requested: Option<u64>) -> u64 {
         Some(v) => v.min(MAX_TIMEOUT_SECS),
         None => DEFAULT_TIMEOUT_SECS,
     }
+}
+
+/// Clamp a caller-supplied stall window to `[1, MAX_STALL_SECS]`. A `0` floors to 1
+/// (kill on the first no-output tick would be absurd, but never disable the guard).
+pub fn clamp_stall(requested: u64) -> u64 {
+    requested.clamp(1, MAX_STALL_SECS)
 }
 
 #[cfg(test)]
@@ -126,5 +137,19 @@ mod tests {
     #[test]
     fn clamp_timeout_passes_through_valid_value() {
         assert_eq!(clamp_timeout(Some(30)), 30);
+    }
+
+    #[test]
+    fn clamp_stall_bounds_the_window() {
+        assert_eq!(clamp_stall(0), 1); // never disable the guard
+        assert_eq!(clamp_stall(180), 180);
+        assert_eq!(clamp_stall(999_999), MAX_STALL_SECS);
+    }
+
+    #[test]
+    fn epic_wall_clock_backstop_is_generous() {
+        // A whole-repo explore audit needs far more than the routine 600s ceiling.
+        assert!(MAX_TIMEOUT_SECS >= 1800);
+        assert_eq!(clamp_timeout(Some(1800)), 1800);
     }
 }

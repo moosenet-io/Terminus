@@ -98,7 +98,7 @@ async fn main() {
     // request -- a binary missing at boot stays "not found" for the process
     // lifetime.
     let mut resolved = HashMap::new();
-    for p in [Provider::Opus, Provider::Codex, Provider::Agy] {
+    for p in [Provider::Opus, Provider::Codex, Provider::Agy, Provider::Fable] {
         resolved.insert(p.as_str(), resolve::resolve_on_path(p.binary()));
     }
     // bwrap is agy's sandbox wrapper -- resolved once at startup exactly like
@@ -277,6 +277,17 @@ struct DispatchBody {
     prompt: String,
     #[serde(default)]
     timeout_secs: Option<u64>,
+    /// Epic-capstone explore mode: the claude slots get read-only tools + a repo
+    /// cwd. Defaults off (routine reviews are unchanged).
+    #[serde(default)]
+    explore: bool,
+    /// Progress/stall window (secs): kill a provider only after this many secs of
+    /// NO output. `None` → pure wall-clock (`timeout_secs`), the pre-capstone behavior.
+    #[serde(default)]
+    stall_secs: Option<u64>,
+    /// Repo checkout the explore-mode auditors may read from (the subprocess cwd).
+    #[serde(default)]
+    repo_path: Option<String>,
 }
 
 /// Parse + validate + dispatch a `/dispatch` request body. Returns
@@ -329,10 +340,39 @@ async fn handle_dispatch(
         );
     };
 
+    // Explore-mode cwd: only honored when `explore` is set. Must be an EXISTING
+    // directory (canonicalized); an absent/invalid path silently falls back to no
+    // cwd (the auditor still runs, just without repo read access) rather than
+    // failing the dispatch. Read-only tools mean the cwd only grants READ access.
+    let cwd: Option<std::path::PathBuf> = if parsed.explore {
+        parsed
+            .repo_path
+            .as_deref()
+            .and_then(|p| std::fs::canonicalize(p).ok())
+            .filter(|p| p.is_dir())
+    } else {
+        None
+    };
+    let stall = StallConfig {
+        timeout_secs,
+        stall_secs: parsed.stall_secs.map(config::clamp_stall),
+    };
+
     // Bounded concurrency: at most MAX_CONCURRENCY subprocesses in flight.
     let _permit = state.semaphore.acquire().await;
 
-    match run_provider(parsed.provider, resolved_path, &parsed.prompt, timeout_secs, &state.sanitized_env, &state).await {
+    match run_provider(
+        parsed.provider,
+        resolved_path,
+        &parsed.prompt,
+        parsed.explore,
+        &stall,
+        cwd.as_deref(),
+        &state.sanitized_env,
+        &state,
+    )
+    .await
+    {
         Ok(text) => (200, "OK", serde_json::json!({"text": text})),
         Err((kind, detail)) => (
             502,
@@ -350,15 +390,30 @@ async fn handle_dispatch(
 /// `resolved_path` is the ABSOLUTE path cached in `AppState` at startup --
 /// spawning always uses this, never `Command::new(provider.binary())` by bare
 /// name, so PATH changes after startup can't change which binary runs.
+/// How a subprocess run is time-bounded. `timeout_secs` is the wall-clock BACKSTOP
+/// (always enforced). When `stall_secs` is `Some(n)`, the primary bound is PROGRESS:
+/// AFTER the first output, the run is killed only after `n` secs with NO new output.
+/// Before ANY output it is bounded solely by the wall-clock backstop — so a live
+/// provider that thinks silently for a while (LLM CLIs commonly buffer output; a
+/// whole-repo Fable audit can be silent for minutes before its first token) is never
+/// mistaken for a stall. `None` → pure wall-clock (pre-capstone behavior).
+#[derive(Clone, Copy)]
+struct StallConfig {
+    timeout_secs: u64,
+    stall_secs: Option<u64>,
+}
+
 async fn run_provider(
     provider: Provider,
     resolved_path: &std::path::Path,
     prompt: &str,
-    timeout_secs: u64,
+    explore: bool,
+    stall: &StallConfig,
+    cwd: Option<&std::path::Path>,
     env: &HashMap<String, String>,
     state: &AppState,
 ) -> Result<String, (&'static str, String)> {
-    let built = provider::build_command(provider, prompt);
+    let built = provider::build_command(provider, prompt, explore);
 
     // agy is the only provider that runs inside the bwrap sandbox (see
     // sandbox.rs / egress_proxy.rs for why: agy's own tool-approval gate is
@@ -408,9 +463,10 @@ async fn run_provider(
     // rapid succession -- route it through the serialize+retry wrapper. Every
     // other provider spawns directly, unchanged.
     let result = if matches!(provider, Provider::Agy) {
-        run_agy_with_retry(&spawn_built, &spawn_binary_path, timeout_secs, env).await
+        // agy is sandboxed (bwrap) and never explore-mode → no cwd.
+        run_agy_with_retry(&spawn_built, &spawn_binary_path, stall, env).await
     } else {
-        run_built_command(&spawn_built, &spawn_binary_path, timeout_secs, env).await
+        run_built_command(&spawn_built, &spawn_binary_path, stall, cwd, env).await
     };
 
     // Clean up the codex --output-last-message temp file on EVERY exit path
@@ -482,13 +538,14 @@ fn agy_auth_exhausted_error() -> (&'static str, String) {
 async fn run_agy_with_retry(
     built: &provider::BuiltCommand,
     resolved_path: &std::path::Path,
-    timeout_secs: u64,
+    stall: &StallConfig,
     env: &HashMap<String, String>,
 ) -> Result<String, (&'static str, String)> {
     let _guard = agy_serialize_lock().lock().await;
     let mut attempt = 0usize;
     loop {
-        let result = run_built_command(built, resolved_path, timeout_secs, env).await;
+        // agy never runs explore-mode → no cwd.
+        let result = run_built_command(built, resolved_path, stall, None, env).await;
         let is_transient = matches!(&result, Err((_, d)) if is_agy_auth_transient(d));
         if is_transient && attempt < AGY_AUTH_RETRIES {
             attempt += 1;
@@ -517,10 +574,43 @@ async fn run_agy_with_retry(
 /// Core spawn-and-collect logic, split out from [`run_provider`] so the
 /// caller can run cleanup (temp-file removal) unconditionally on every exit
 /// path, including the early-return error cases here.
+/// Drain a child pipe into `buf`, stamping `last_ms` (elapsed-ms since `start`) on
+/// every chunk so the watchdog can tell "making progress" from "stalled". Ends at
+/// EOF or on a read error (both mean the pipe is done).
+async fn pump_pipe<R>(
+    pipe: Option<R>,
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    last_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    start: std::time::Instant,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+    let Some(mut r) = pipe else { return };
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if let Ok(mut b) = buf.lock() {
+                    b.extend_from_slice(&chunk[..n]);
+                }
+                // Store elapsed-ms + 1 so 0 is an UNAMBIGUOUS "no output yet"
+                // sentinel: a first chunk read within the first millisecond
+                // (elapsed_ms == 0) must not be mistaken for "never spoke", or a
+                // print-then-wedge provider would escape stall detection.
+                let stamp = (start.elapsed().as_millis() as u64).saturating_add(1);
+                last_ms.store(stamp, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 async fn run_built_command(
     built: &provider::BuiltCommand,
     resolved_path: &std::path::Path,
-    timeout_secs: u64,
+    stall: &StallConfig,
+    cwd: Option<&std::path::Path>,
     env: &HashMap<String, String>,
 ) -> Result<String, (&'static str, String)> {
     let mut command = tokio::process::Command::new(resolved_path);
@@ -531,32 +621,93 @@ async fn run_built_command(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        // On a timeout below, the `command.output()` future is dropped.
-        // Without kill_on_drop, tokio's Child does NOT kill the underlying
-        // process on drop -- it would keep running as an orphan after the
-        // daemon has already returned a "timeout" error and released its
-        // concurrency-cap permit, silently defeating MAX_CONCURRENCY.
+        // kill_on_drop so an early return / dropped future never leaves an orphan
+        // subprocess running after the daemon released its concurrency permit.
         .kill_on_drop(true);
+    // Explore mode only: run in the repo checkout so read-only tools can read it.
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
 
-    let output = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), command.output())
-        .await
-        .map_err(|_| ("timeout", format!("{} timed out after {timeout_secs}s", built.binary)))?
+    let mut child = command
+        .spawn()
         .map_err(|e| ("other", format!("failed to spawn {}: {e}", built.binary)))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+    // Drain both pipes concurrently, stamping last-output time — so a chatty child
+    // never deadlocks on a full pipe AND the watchdog can distinguish progress from
+    // a stall. Buffers + activity clock are shared with the reader tasks.
+    let start = std::time::Instant::now();
+    let last_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let out_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let err_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let out_task = tokio::spawn(pump_pipe(child.stdout.take(), out_buf.clone(), last_ms.clone(), start));
+    let err_task = tokio::spawn(pump_pipe(child.stderr.take(), err_buf.clone(), last_ms.clone(), start));
+
+    // Wait for exit, watching for a stall (no output for `stall_secs`) and a
+    // wall-clock backstop (`timeout_secs`). `child.wait()` is cancel-safe, so
+    // re-entering it after each watchdog tick is fine.
+    let tick = std::time::Duration::from_secs(2);
+    let exit_status = loop {
+        tokio::select! {
+            waited = child.wait() => {
+                break waited.map_err(|e| ("other", format!("{}: {e}", built.binary)))?;
+            }
+            _ = tokio::time::sleep(tick) => {
+                let elapsed = start.elapsed().as_secs();
+                if elapsed >= stall.timeout_secs {
+                    let _ = child.kill().await;
+                    return Err((
+                        "timeout",
+                        format!("{} timed out after {}s (wall-clock backstop)", built.binary, stall.timeout_secs),
+                    ));
+                }
+                if let Some(stall_window) = stall.stall_secs {
+                    // Only enforce stall detection AFTER the first output. A live
+                    // provider that is legitimately silent while it works (many LLM
+                    // CLIs buffer everything until the final answer, and a whole-repo
+                    // audit can think for minutes before its first token) must NOT be
+                    // killed as "stalled" — pre-first-output it is bounded only by the
+                    // generous wall-clock backstop above. Once output has FLOWED, a
+                    // subsequent `stall_window` of silence is a genuine stall.
+                    let stamp = last_ms.load(std::sync::atomic::Ordering::Relaxed);
+                    if stamp > 0 {
+                        // Undo the +1 sentinel to recover the real elapsed-ms of the
+                        // last output (see `pump_pipe`).
+                        let last_out_ms = stamp - 1;
+                        let idle = elapsed.saturating_sub(last_out_ms / 1000);
+                        if idle >= stall_window {
+                            let _ = child.kill().await;
+                            return Err((
+                                "timeout",
+                                format!("{} stalled: no output for {stall_window}s after starting", built.binary),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    // Child exited on its own — let the readers finish draining, then collect.
+    let _ = out_task.await;
+    let _ = err_task.await;
+    let stdout_bytes = out_buf.lock().map(|b| b.clone()).unwrap_or_default();
+    let stderr_bytes = err_buf.lock().map(|b| b.clone()).unwrap_or_default();
+
+    if !exit_status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
         let combined: String = format!("{stderr}\n{stdout}").trim().chars().take(500).collect();
         return Err((
             "other",
-            format!("{} exited rc={}: {combined}", built.binary, output.status.code().unwrap_or(-1)),
+            format!("{} exited rc={}: {combined}", built.binary, exit_status.code().unwrap_or(-1)),
         ));
     }
 
     let text = if let Some(path) = &built.output_path {
         tokio::fs::read_to_string(path).await.unwrap_or_default().trim().to_string()
     } else {
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
+        String::from_utf8_lossy(&stdout_bytes).trim().to_string()
     };
 
     if text.is_empty() {
@@ -572,6 +723,74 @@ async fn run_built_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The codex-caught case: a process SILENT for longer than the stall window and
+    /// THEN producing output must NOT be stall-killed (stall detection only applies
+    /// after the first output). Uses a real subprocess.
+    #[tokio::test]
+    async fn stall_does_not_kill_a_silent_then_speaking_process() {
+        let built = provider::BuiltCommand {
+            binary: "sh",
+            args: vec!["-c".into(), "sleep 2 && echo READY".into()],
+            output_path: None,
+        };
+        let stall = StallConfig { timeout_secs: 30, stall_secs: Some(1) };
+        let out = run_built_command(
+            &built,
+            std::path::Path::new("/bin/sh"),
+            &stall,
+            None,
+            &HashMap::new(),
+        )
+        .await;
+        assert_eq!(out.expect("silent-then-speaking must complete"), "READY");
+    }
+
+    /// The `last_ms==0` sentinel edge case: a provider that prints IMMEDIATELY
+    /// (first output within the first ms → elapsed 0) and THEN wedges must still be
+    /// stall-killed — not mistaken for "never spoke". The +1 sentinel guarantees this.
+    #[tokio::test]
+    async fn stall_kills_a_print_then_wedge_process() {
+        let built = provider::BuiltCommand {
+            binary: "sh",
+            args: vec!["-c".into(), "printf READY; sleep 60".into()],
+            output_path: None,
+        };
+        // stall window 1s, wall-clock backstop 30s: the stall detector (not the
+        // backstop) must fire — fast — once output stops after the immediate print.
+        let stall = StallConfig { timeout_secs: 30, stall_secs: Some(1) };
+        let start = std::time::Instant::now();
+        let out = run_built_command(
+            &built,
+            std::path::Path::new("/bin/sh"),
+            &stall,
+            None,
+            &HashMap::new(),
+        )
+        .await;
+        assert!(matches!(out, Err(("timeout", _))), "print-then-wedge must be stall-killed");
+        assert!(start.elapsed().as_secs() < 15, "killed by the STALL window, not the wall-clock backstop");
+    }
+
+    /// The wall-clock backstop still kills a genuinely wedged (silent, endless) process.
+    #[tokio::test]
+    async fn wall_clock_backstop_kills_a_wedged_process() {
+        let built = provider::BuiltCommand {
+            binary: "sh",
+            args: vec!["-c".into(), "sleep 30".into()],
+            output_path: None,
+        };
+        let stall = StallConfig { timeout_secs: 1, stall_secs: Some(10) };
+        let out = run_built_command(
+            &built,
+            std::path::Path::new("/bin/sh"),
+            &stall,
+            None,
+            &HashMap::new(),
+        )
+        .await;
+        assert!(matches!(out, Err(("timeout", _))), "wedged process must hit the backstop");
+    }
 
     /// Shared test-state builder so each test only specifies what it cares
     /// about; defaults leave agy's sandbox prerequisites absent (bwrap

@@ -374,7 +374,7 @@ impl PanelDispatcher for RealPanelDispatcher {
     async fn dispatch(&self, provider: &str, prompt: &str) -> Result<String, String> {
         use crate::review::dispatch::{is_daemon_provider, openrouter_model_for};
         if is_daemon_provider(provider) {
-            self.cfg.dispatch_daemon(provider, prompt).await
+            self.cfg.dispatch_daemon(provider, prompt, &crate::review::dispatch::DaemonOpts::routine()).await
         } else if let Some(model) = openrouter_model_for(provider) {
             self.cfg.dispatch_openrouter(model, prompt).await
         } else {

@@ -70,7 +70,7 @@ use crate::scribe::graph::model::KnowledgeGraph;
 use crate::scribe::graph::store::GraphStore;
 use crate::scribe::graph::vec_embed::EmbedClient;
 use crate::scribe::ScribeConfig;
-use crate::tool::RustTool;
+use crate::tool::{RustTool, ToolOutput};
 
 pub use aggregate::{aggregate, Finding, ProviderResult};
 pub use dispatch::ReviewConfig;
@@ -81,8 +81,23 @@ pub use prompt::{build_docs_prompt, build_prompt, parse_findings, parse_verdict,
 // above.
 pub use consistency::{ConsistencyFinding, ConsistencyRun};
 
-const ALLOWED_PROVIDERS: &[&str] = &["opus", "codex", "agy", "nemotron", "qwen_coder", "free"];
+const ALLOWED_PROVIDERS: &[&str] =
+    &["opus", "codex", "agy", "nemotron", "qwen_coder", "free", "claude-fable-5", "gpt56"];
+/// Routine review panel cap (per one `review_run` call).
 const MAX_PROVIDERS: usize = 5;
+/// The Epic capstone runs the widest possible panel once per build, so it may
+/// exceed the routine 5-provider cap (opus+codex+agy+free+claude-fable-5+gpt56 = 6,
+/// with headroom for the local nemotron/qwen_coder lenses).
+const MAX_PROVIDERS_EPIC: usize = 8;
+
+/// The provider-count cap for a given structure (Epic gets the wider panel).
+fn max_providers_for(structure: Structure) -> usize {
+    if structure == Structure::Epic {
+        MAX_PROVIDERS_EPIC
+    } else {
+        MAX_PROVIDERS
+    }
+}
 
 /// KGREV-02: process-wide set of `project_id`s with an in-flight KG rebuild.
 /// A re-review of the SAME project short-circuits (see `execute()`'s top-of-
@@ -650,9 +665,10 @@ fn parse_input(args: &Value) -> Result<(Structure, Vec<String>, String, Value), 
     let providers_val = args["providers"]
         .as_array()
         .ok_or_else(|| ToolError::InvalidArgument("'providers' must be a non-empty array".into()))?;
-    if providers_val.is_empty() || providers_val.len() > MAX_PROVIDERS {
+    let provider_cap = max_providers_for(structure);
+    if providers_val.is_empty() || providers_val.len() > provider_cap {
         return Err(ToolError::InvalidArgument(format!(
-            "'providers' must have between 1 and {MAX_PROVIDERS} entries, got {}",
+            "'providers' must have between 1 and {provider_cap} entries, got {}",
             providers_val.len()
         )));
     }
@@ -724,15 +740,24 @@ fn role_for(structure: Structure, index: usize) -> Role {
 /// `consistency::maybe_run` (the Tier-C lens's dedicated pinned-provider
 /// dispatch) both call this rather than each re-deriving which transport a
 /// provider name maps to.
-async fn dispatch_provider_raw(cfg: &ReviewConfig, provider: &str, prompt_text: &str) -> Result<String, String> {
+async fn dispatch_provider_raw(
+    cfg: &ReviewConfig,
+    provider: &str,
+    prompt_text: &str,
+    daemon_opts: &dispatch::DaemonOpts,
+) -> Result<String, String> {
     if dispatch::is_daemon_provider(provider) {
-        cfg.dispatch_daemon(provider, prompt_text).await
+        cfg.dispatch_daemon(provider, prompt_text, daemon_opts).await
     } else if provider == "free" {
         // Seamless free-tier: round-robin the daily-curated free-model pool
         // with 429 failover (see free_pool). Used as the tail of a 3-5 provider
         // panel, after the sub/OAuth providers.
         cfg.dispatch_free_pool(prompt_text).await
     } else if let Some(model) = dispatch::openrouter_model_for(provider) {
+        // Credit guard: refuse a PAID model (e.g. gpt56 = gpt-5.6-luna) when the
+        // OpenRouter balance is below the floor, so a paid lens can never bottom
+        // out the account. Free models pass through untouched.
+        cfg.guard_paid_model(model).await?;
         cfg.dispatch_openrouter(model, prompt_text).await
     } else {
         // Unreachable given parse_input's validation for the correctness
@@ -744,8 +769,13 @@ async fn dispatch_provider_raw(cfg: &ReviewConfig, provider: &str, prompt_text: 
     }
 }
 
-async fn run_one_provider(cfg: ReviewConfig, provider: String, prompt_text: String) -> ProviderResult {
-    let raw = dispatch_provider_raw(&cfg, &provider, &prompt_text).await;
+async fn run_one_provider(
+    cfg: ReviewConfig,
+    provider: String,
+    prompt_text: String,
+    daemon_opts: dispatch::DaemonOpts,
+) -> ProviderResult {
+    let raw = dispatch_provider_raw(&cfg, &provider, &prompt_text, &daemon_opts).await;
 
     match raw {
         Ok(text) => {
@@ -800,7 +830,7 @@ than failing the whole call."
                 "providers": {
                     "type": "array",
                     "minItems": 1,
-                    "maxItems": MAX_PROVIDERS,
+                    "maxItems": MAX_PROVIDERS_EPIC,
                     "items": {
                         "type": "string",
                         "enum": ALLOWED_PROVIDERS
@@ -875,14 +905,27 @@ than failing the whole call."
         // matters for adversarial_pair, where index 0/1 = defend/attack.
         let mut id_to_slot: std::collections::HashMap<tokio::task::Id, (usize, String)> =
             std::collections::HashMap::with_capacity(providers.len());
+        // Epic capstone auditors run in EXPLORE mode (read-only tools + repo cwd)
+        // with progress/stall detection; every other structure keeps the routine
+        // (tools-off, fixed-budget) daemon behavior unchanged.
+        let daemon_opts = if structure == Structure::Epic {
+            let repo_path = context
+                .get("repo_path")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            dispatch::DaemonOpts::epic(repo_path)
+        } else {
+            dispatch::DaemonOpts::routine()
+        };
         for (idx, provider) in providers.iter().enumerate() {
             let role = role_for(structure, idx);
             let prompt_text = build_prompt(role, &criteria, &context);
             let cfg = cfg.clone();
             let provider = provider.clone();
             let provider_for_map = provider.clone();
+            let daemon_opts = daemon_opts.clone();
             let handle = set.spawn(async move {
-                let result = run_one_provider(cfg, provider, prompt_text).await;
+                let result = run_one_provider(cfg, provider, prompt_text, daemon_opts).await;
                 (idx, result)
             });
             id_to_slot.insert(handle.id(), (idx, provider_for_map));
@@ -1019,10 +1062,66 @@ than failing the whole call."
     }
 }
 
+/// `openrouter_credits` — the OpenRouter spend/credits tracker. Reports the
+/// remaining balance, total granted, and total usage (USD) from OpenRouter's cost
+/// API, plus the paid-dispatch floor below which the credit guard refuses a paid
+/// model. Lets an operator SEE spend before/after a paid capstone lens (gpt56) runs,
+/// and is the same signal the pre-flight guard uses so a paid review never bottoms
+/// out the account.
+struct OpenRouterCredits;
+
+#[async_trait::async_trait]
+impl RustTool for OpenRouterCredits {
+    fn name(&self) -> &str {
+        "openrouter_credits"
+    }
+
+    fn description(&self) -> &str {
+        "Report OpenRouter spend + remaining credits (USD) from the cost API: \
+         remaining, total_granted, total_usage, and the paid-dispatch floor below \
+         which review_run refuses a paid model (e.g. gpt56 = gpt-5.6-luna) to avoid \
+         bottoming out the account. Takes no arguments."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {}, "additionalProperties": false})
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.execute_structured(args).await?.text)
+    }
+
+    async fn execute_structured(&self, _args: Value) -> Result<ToolOutput, ToolError> {
+        let cfg = ReviewConfig::from_env();
+        match cfg.openrouter_credits().await {
+            Ok((remaining, granted, usage)) => {
+                let floor = dispatch::min_openrouter_credits();
+                let structured = json!({
+                    "remaining_usd": remaining,
+                    "total_granted_usd": granted,
+                    "total_usage_usd": usage,
+                    "paid_dispatch_floor_usd": floor,
+                    "below_floor": remaining < floor,
+                });
+                let text = format!(
+                    "OpenRouter credits: ${remaining:.4} remaining (granted ${granted:.4}, used ${usage:.4}); \
+                     paid-dispatch floor ${floor:.2}{}",
+                    if remaining < floor { " — BELOW FLOOR: paid models (gpt56) are refused" } else { "" }
+                );
+                Ok(ToolOutput::with_structured(text, structured))
+            }
+            Err(e) => Ok(ToolOutput::text_only(format!("openrouter_credits unavailable: {e}"))),
+        }
+    }
+}
+
 pub fn register(registry: &mut ToolRegistry) {
     registry
         .register(Box::new(ReviewRun::new()))
         .expect("review_run must register cleanly");
+    registry
+        .register(Box::new(OpenRouterCredits))
+        .expect("openrouter_credits must register cleanly");
 }
 
 #[cfg(test)]
@@ -1031,6 +1130,16 @@ mod tests {
 
     fn tool() -> ReviewRun {
         ReviewRun::new()
+    }
+
+    #[test]
+    fn epic_gets_a_wider_provider_cap() {
+        // The routine panel stays capped at 5; the once-per-build capstone may run
+        // the full royal panel (opus+codex+agy+free+claude-fable-5+gpt56).
+        assert_eq!(max_providers_for(Structure::PanelUnanimous), MAX_PROVIDERS);
+        assert_eq!(max_providers_for(Structure::Single), MAX_PROVIDERS);
+        assert_eq!(max_providers_for(Structure::Epic), MAX_PROVIDERS_EPIC);
+        assert!(MAX_PROVIDERS_EPIC >= 6);
     }
 
     #[test]
