@@ -89,12 +89,16 @@ pub fn clamp_stall(requested: u64) -> u64 {
 pub const ALLOWED_REASONING_EFFORTS: &[&str] = &["low", "medium", "high"];
 
 /// Validate a caller-supplied `reasoning_effort` against
-/// [`ALLOWED_REASONING_EFFORTS`]. Anything absent, blank, or not an exact
-/// (case-insensitive) match is dropped to `None` -- fails closed to "no effort
-/// override" (the pre-PART-B argv shape) rather than forwarding an
-/// unrecognized value into the provider's own config-parsing.
+/// [`ALLOWED_REASONING_EFFORTS`]. Anything absent, or not an EXACT
+/// (case-insensitive) match, is dropped to `None` -- fails closed to "no effort
+/// override" (the pre-PART-B argv shape) rather than forwarding an unrecognized
+/// value into the provider's own config-parsing. The match is against the RAW
+/// input with NO trimming: a padded value like `" high "` is deliberately
+/// rejected (returns `None`), satisfying the strict "exact allowlist member,
+/// reject anything else" contract -- only ASCII case differs from a canonical
+/// level (`"HIGH"` -> `"high"`), never surrounding whitespace or other chars.
 pub fn clamp_reasoning_effort(requested: Option<&str>) -> Option<String> {
-    let level = requested?.trim();
+    let level = requested?;
     ALLOWED_REASONING_EFFORTS
         .iter()
         .find(|allowed| allowed.eq_ignore_ascii_case(level))
@@ -191,6 +195,21 @@ mod tests {
         // via a quote character must never pass through into the provider's
         // own -c/flag value unrecognized.
         assert_eq!(clamp_reasoning_effort(Some("high\" extra=\"evil")), None);
+        assert_eq!(clamp_reasoning_effort(Some("ultra")), None);
+    }
+
+    #[test]
+    fn clamp_reasoning_effort_matches_exactly_no_whitespace_trimming() {
+        // Strict "exact allowlist member, reject anything else" contract: the
+        // match is against the RAW input, so a whitespace-padded value is NOT
+        // silently accepted-and-normalized -- it is rejected outright.
+        assert_eq!(clamp_reasoning_effort(Some(" high ")), None);
+        assert_eq!(clamp_reasoning_effort(Some("high ")), None);
+        assert_eq!(clamp_reasoning_effort(Some(" high")), None);
+        assert_eq!(clamp_reasoning_effort(Some("\thigh")), None);
+        // Only ASCII case may differ from a canonical level -- never whitespace.
+        assert_eq!(clamp_reasoning_effort(Some("HIGH")), Some("high".to_string()));
+        assert_eq!(clamp_reasoning_effort(Some("high")), Some("high".to_string()));
         assert_eq!(clamp_reasoning_effort(Some("ultra")), None);
     }
 
