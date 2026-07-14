@@ -75,6 +75,12 @@ pub fn aggregate(structure: Structure, results: &[ProviderResult]) -> (String, b
         Structure::PanelMajority => aggregate_panel_majority(results),
         Structure::PanelUnanimous => aggregate_panel_unanimous(results),
         Structure::AdversarialPair => aggregate_adversarial_pair(results),
+        // The Epic capstone verdict is ADVISORY: it summarizes the audit (majority
+        // of the auditors, fail-safe on a split) but never gates a merge. What
+        // makes the capstone's END drive the KG refresh + doc engine is its
+        // COMPLETION, not this verdict (see `run`'s post-hook gate) — so a
+        // REQUEST_CHANGES epic that surfaced findings still refreshes docs/graph.
+        Structure::Epic => aggregate_panel_majority(results),
     }
 }
 
@@ -220,6 +226,17 @@ mod tests {
     }
 
     // ── panel_unanimous ──────────────────────────────────────────────────
+
+    #[test]
+    fn epic_capstone_verdict_is_advisory_majority() {
+        // Epic aggregates as a fail-safe majority (its verdict is advisory; the
+        // capstone never gates a merge — see `should_run_post_hooks`).
+        let all_approve = vec![ok("opus", "APPROVE"), ok("codex", "APPROVE"), ok("agy", "APPROVE")];
+        assert_eq!(aggregate(Structure::Epic, &all_approve), ("APPROVE".to_string(), true));
+        // Findings from a majority ⇒ advisory REQUEST_CHANGES, still "complete".
+        let with_findings = vec![ok("opus", "REQUEST_CHANGES"), ok("codex", "REQUEST_CHANGES"), ok("agy", "APPROVE")];
+        assert_eq!(aggregate(Structure::Epic, &with_findings), ("REQUEST_CHANGES".to_string(), true));
+    }
 
     #[test]
     fn panel_unanimous_all_approve_is_approve() {

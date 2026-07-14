@@ -115,8 +115,8 @@ impl Drop for InFlightGuard {
 /// mid-rebuild graph. Always returns a `kg_rebuild` value to merge into the
 /// tool result -- never propagates a rebuild error (the review already
 /// passed; a rebuild failure is reported, not fatal).
-async fn maybe_rebuild(aggregate_verdict: &str, complete: bool, context: &Value) -> Value {
-    if aggregate_verdict != "APPROVE" || !complete {
+async fn maybe_rebuild(run_hooks: bool, context: &Value) -> Value {
+    if !run_hooks {
         return json!({"ran": false, "reason": "review did not pass"});
     }
     let Some(project_id) = context.get("project_id").and_then(|v| v.as_str()).map(|s| s.to_string()) else {
@@ -172,8 +172,8 @@ async fn maybe_rebuild(aggregate_verdict: &str, complete: bool, context: &Value)
 /// docgen error (the review already passed; a doc-gen failure is reported,
 /// not fatal). Most reviews won't supply doc params at all; this wire only
 /// fires for real merge-time reviews that do (S9: no ad-hoc doc path).
-async fn maybe_scribe_docs(aggregate_verdict: &str, complete: bool, context: &Value) -> Value {
-    if aggregate_verdict != "APPROVE" || !complete {
+async fn maybe_scribe_docs(run_hooks: bool, context: &Value) -> Value {
+    if !run_hooks {
         return json!({"ran": false, "reason": "not an approved pass"});
     }
     let Some(project) = context.get("project").and_then(|v| v.as_str()).map(|s| s.to_string()) else {
@@ -643,7 +643,7 @@ fn parse_input(args: &Value) -> Result<(Structure, Vec<String>, String, Value), 
         .ok_or_else(|| ToolError::InvalidArgument("'structure' is required".into()))?;
     let structure = Structure::parse(structure_str).ok_or_else(|| {
         ToolError::InvalidArgument(format!(
-            "'structure' must be one of single|adversarial_pair|panel_majority|panel_unanimous, got '{structure_str}'"
+            "'structure' must be one of single|adversarial_pair|panel_majority|panel_unanimous|epic, got '{structure_str}'"
         ))
     })?;
 
@@ -685,6 +685,15 @@ fn parse_input(args: &Value) -> Result<(Structure, Vec<String>, String, Value), 
     Ok((structure, providers, criteria, context))
 }
 
+/// Whether the post-review hooks (KGREV-02 graph rebuild + KGREV-03 doc engine)
+/// should fire. A normal review runs them only on a completed APPROVE pass; the
+/// Epic capstone (S111C) is ADVISORY and runs them on ANY completed audit — so the
+/// capstone's END drives the KG refresh + doc engine even when it surfaces
+/// findings (the "capstone → doc engine" hook). Pure/testable.
+fn should_run_post_hooks(structure: Structure, aggregate_verdict: &str, complete: bool) -> bool {
+    complete && (structure == Structure::Epic || aggregate_verdict == "APPROVE")
+}
+
 fn role_for(structure: Structure, index: usize) -> Role {
     match structure {
         Structure::AdversarialPair => {
@@ -694,6 +703,8 @@ fn role_for(structure: Structure, index: usize) -> Role {
                 Role::Attack
             }
         }
+        // Every provider in an Epic capstone is a whole-repo auditor.
+        Structure::Epic => Role::Auditor,
         _ => Role::Reviewer,
     }
 }
@@ -758,7 +769,11 @@ impl RustTool for ReviewRun {
 
     fn description(&self) -> &str {
         "Run a multi-provider code/change review. 'structure' is one of single, \
-adversarial_pair, panel_majority, panel_unanimous. 'providers' (1-5) picks from \
+adversarial_pair, panel_majority, panel_unanimous, epic. 'epic' is the whole-repo \
+Epic Review capstone (run ONCE at the end of a build): every provider audits the \
+entire codebase against the contracts and emits findings — ADVISORY (never gates a \
+merge), and a COMPLETED epic audit drives the KG refresh + doc engine (docgen) at \
+its end regardless of findings. 'providers' (1-5) picks from \
 opus, codex, agy (CLI-backed via review-daemon), nemotron, qwen_coder (OpenRouter, \
 frontier-class free-tier models). 'criteria' is the acceptance criteria text; \
 'context' is a free-form JSON object (diff/files/description). Providers are \
@@ -772,7 +787,7 @@ than failing the whole call."
             "properties": {
                 "structure": {
                     "type": "string",
-                    "enum": ["single", "adversarial_pair", "panel_majority", "panel_unanimous"]
+                    "enum": ["single", "adversarial_pair", "panel_majority", "panel_unanimous", "epic"]
                 },
                 "providers": {
                     "type": "array",
@@ -906,15 +921,23 @@ than failing the whole call."
         let consistency_run =
             consistency::maybe_run(&context, &criteria, &results, &cfg, &cortex_config, &self.house_style_cache).await;
 
-        // KGREV-02: on a successful, complete pass, incrementally rebuild the
-        // project's KG (best-effort, never fails the review); see
-        // `maybe_rebuild` for the lock semantics.
-        let kg_rebuild = maybe_rebuild(&aggregate_verdict, complete, &context).await;
+        // The post-review hooks (KG refresh + doc engine) fire on a completed
+        // APPROVE pass — OR, for the Epic capstone, on ANY completed audit. The
+        // capstone is advisory: it surfaces findings but never "fails", so its END
+        // (a completed whole-repo audit) is what drives the graph refresh and the
+        // doc engine — the operator-visible "capstone → doc engine" hook — even
+        // when the audit reports work-items. A non-epic review keeps the strict
+        // APPROVE gate.
+        let run_post_hooks = should_run_post_hooks(structure, &aggregate_verdict, complete);
+
+        // KGREV-02: incrementally rebuild the project's KG (best-effort, never
+        // fails the review); see `maybe_rebuild` for the lock semantics.
+        let kg_rebuild = maybe_rebuild(run_post_hooks, &context).await;
 
         // KGREV-03: after the KG rebuild (so docs see the refreshed graph),
         // best-effort doc refresh through the sanctioned `docgen_run` door;
         // see `maybe_scribe_docs` for the gating/S9 rationale.
-        let scribe_docs = maybe_scribe_docs(&aggregate_verdict, complete, &context).await;
+        let scribe_docs = maybe_scribe_docs(run_post_hooks, &context).await;
 
         // KGFIND-03: best-effort, capture-only recording of structured
         // findings onto the Atlas KG findings store. Unlike the two hooks
@@ -996,6 +1019,28 @@ mod tests {
 
     fn tool() -> ReviewRun {
         ReviewRun::new()
+    }
+
+    #[test]
+    fn epic_structure_maps_every_provider_to_auditor() {
+        assert_eq!(role_for(Structure::Epic, 0), Role::Auditor);
+        assert_eq!(role_for(Structure::Epic, 3), Role::Auditor);
+        // non-epic panels stay plain reviewers
+        assert_eq!(role_for(Structure::PanelUnanimous, 0), Role::Reviewer);
+    }
+
+    #[test]
+    fn epic_capstone_runs_post_hooks_on_any_completed_audit() {
+        // A normal review runs the KG/doc hooks only on a completed APPROVE.
+        assert!(should_run_post_hooks(Structure::PanelUnanimous, "APPROVE", true));
+        assert!(!should_run_post_hooks(Structure::PanelUnanimous, "REQUEST_CHANGES", true));
+        assert!(!should_run_post_hooks(Structure::PanelUnanimous, "APPROVE", false));
+        // The Epic capstone is advisory: a COMPLETED audit fires the hooks even when
+        // it surfaces findings (REQUEST_CHANGES) — this is the capstone→doc-engine hook.
+        assert!(should_run_post_hooks(Structure::Epic, "REQUEST_CHANGES", true));
+        assert!(should_run_post_hooks(Structure::Epic, "APPROVE", true));
+        // ...but an INCOMPLETE epic audit (a provider unavailable) does not.
+        assert!(!should_run_post_hooks(Structure::Epic, "REQUEST_CHANGES", false));
     }
 
     #[tokio::test]
@@ -1251,7 +1296,7 @@ mod tests {
             "project_id": project_id,
             "repo_path": repo_dir.to_string_lossy().to_string(),
         });
-        let kg_rebuild = maybe_rebuild("APPROVE", true, &context).await;
+        let kg_rebuild = maybe_rebuild(true, &context).await;
 
         assert_eq!(kg_rebuild["ran"], true, "{kg_rebuild}");
         assert_eq!(kg_rebuild["ok"], true, "{kg_rebuild}");
@@ -1279,7 +1324,7 @@ mod tests {
             "project_id": project_id,
             "repo_path": "/nonexistent/bogus/repo/path",
         });
-        let kg_rebuild = maybe_rebuild("APPROVE", true, &context).await;
+        let kg_rebuild = maybe_rebuild(true, &context).await;
 
         assert_eq!(kg_rebuild["ran"], true, "{kg_rebuild}");
         assert_eq!(kg_rebuild["ok"], false, "{kg_rebuild}");
@@ -1298,7 +1343,7 @@ mod tests {
     #[serial_test::serial]
     async fn no_project_id_no_lock_no_rebuild() {
         let context = json!({"diff": "+ fn x() {}"});
-        let kg_rebuild = maybe_rebuild("APPROVE", true, &context).await;
+        let kg_rebuild = maybe_rebuild(true, &context).await;
         assert_eq!(kg_rebuild["ran"], false, "{kg_rebuild}");
         assert!(
             in_flight().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
@@ -1335,7 +1380,7 @@ mod tests {
             "spec_id": "S112-review-kg-integration",
             "diff": "+ fn hello() {}",
         });
-        let scribe_docs = maybe_scribe_docs("APPROVE", true, &context).await;
+        let scribe_docs = maybe_scribe_docs(true, &context).await;
 
         assert_eq!(scribe_docs["ran"], true, "{scribe_docs}");
         let outcome = scribe_docs["outcome"].as_str().unwrap_or_default();
@@ -1372,7 +1417,7 @@ mod tests {
     #[serial_test::serial]
     async fn approve_without_doc_params_skips_docgen() {
         let context = json!({"diff": "+ fn x() {}"});
-        let scribe_docs = maybe_scribe_docs("APPROVE", true, &context).await;
+        let scribe_docs = maybe_scribe_docs(true, &context).await;
         assert_eq!(scribe_docs["ran"], false, "{scribe_docs}");
         assert_eq!(scribe_docs["reason"], "no doc params", "{scribe_docs}");
     }
@@ -1384,10 +1429,10 @@ mod tests {
             "project": "TERM",
             "spec_id": "S112-review-kg-integration",
         });
-        let scribe_docs = maybe_scribe_docs("REQUEST_CHANGES", true, &context).await;
+        let scribe_docs = maybe_scribe_docs(false, &context).await;
         assert_eq!(scribe_docs["ran"], false, "{scribe_docs}");
 
-        let scribe_docs = maybe_scribe_docs("UNKNOWN", false, &context).await;
+        let scribe_docs = maybe_scribe_docs(false, &context).await;
         assert_eq!(scribe_docs["ran"], false, "{scribe_docs}");
     }
 
