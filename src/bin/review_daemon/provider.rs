@@ -75,15 +75,14 @@ const CODEX_MODEL: &str = "gpt-5.5";
 /// agy (Antigravity CLI) model for the "agy" provider slot.
 const AGY_MODEL: &str = "gemini-3.1-pro";
 
-/// REVCAP-01 PART B: the `claude` CLI flag assumed to raise the model's
-/// extended-thinking/reasoning effort in headless (`-p`) mode. NOT independently
-/// confirmed against the installed `claude` CLI's own `--help` in this session --
-/// flag review MUST verify this is the correct flag (or supply the right one)
-/// before an intensive-substitute dispatch is relied on in production. Kept
-/// behind `Option<&str>` throughout this module specifically so a wrong/unknown
-/// flag only affects the NEW intensive path: every pre-existing call site (routine
-/// reviews, the Epic capstone) passes `None` and is byte-for-byte unaffected.
-const CLAUDE_REASONING_EFFORT_FLAG: &str = "--reasoning-effort";
+/// REVCAP-01 PART B: the `claude` CLI flag that sets the model's reasoning
+/// effort level for the session. CONFIRMED against the installed `claude` CLI's
+/// own `--help` (`--effort <level>`, level values low/medium/high, guarded by
+/// `config::clamp_reasoning_effort`'s allowlist). Kept behind `Option<&str>`
+/// throughout this module so it only affects the NEW intensive path: every
+/// pre-existing call site (routine reviews, the Epic capstone) passes `None`
+/// and is byte-for-byte unaffected.
+const CLAUDE_REASONING_EFFORT_FLAG: &str = "--effort";
 /// The `codex exec` config-override flag (`-c key=value`, codex's documented TOML
 /// override syntax) and the specific key codex uses for reasoning effort.
 const CODEX_REASONING_EFFORT_KEY: &str = "model_reasoning_effort";
@@ -190,8 +189,8 @@ fn claude_command(model: &str, prompt: &str, explore: bool, reasoning_effort: Op
     }
     // REVCAP-01 PART B: only appended for an intensive-substitute dispatch --
     // routine/Epic calls (`reasoning_effort: None`) produce the exact same argv
-    // as before this change. ASSUMED flag name, see
-    // `CLAUDE_REASONING_EFFORT_FLAG`'s doc -- confirm before relying on this.
+    // as before this change. Flag is the CONFIRMED `--effort <level>` (see
+    // `CLAUDE_REASONING_EFFORT_FLAG`'s doc).
     if let Some(effort) = reasoning_effort {
         args.push(CLAUDE_REASONING_EFFORT_FLAG.to_string());
         args.push(effort.to_string());
@@ -320,8 +319,10 @@ mod tests {
     fn claude_command_omits_effort_flag_when_none() {
         for prov in [Provider::Opus, Provider::Fable] {
             let cmd = build_command(prov, "x", false, None);
+            // Assert against the confirmed literal flag, not just the constant,
+            // so a wrong flag rename can't silently keep this test passing.
             assert!(
-                !cmd.args.iter().any(|a| a == CLAUDE_REASONING_EFFORT_FLAG),
+                !cmd.args.iter().any(|a| a == "--effort"),
                 "routine claude call must not carry the effort flag: {:?}",
                 cmd.args
             );
@@ -332,11 +333,14 @@ mod tests {
     fn claude_command_appends_effort_flag_when_some() {
         for prov in [Provider::Opus, Provider::Fable] {
             let cmd = build_command(prov, "x", false, Some("high"));
+            // The confirmed claude CLI flag is `--effort <level>` (verified
+            // against `claude --help`), passed as two argv elements.
             assert!(
-                cmd.args.windows(2).any(|w| w[0] == CLAUDE_REASONING_EFFORT_FLAG && w[1] == "high"),
-                "intensive claude call must carry the effort flag+value: {:?}",
+                cmd.args.windows(2).any(|w| w[0] == "--effort" && w[1] == "high"),
+                "intensive claude call must carry `--effort high`: {:?}",
                 cmd.args
             );
+            assert_eq!(CLAUDE_REASONING_EFFORT_FLAG, "--effort");
         }
     }
 
@@ -347,7 +351,7 @@ mod tests {
         // other if ever combined -- both independently toggleable.
         let cmd = build_command(Provider::Opus, "x", true, Some("high"));
         assert!(cmd.args.iter().any(|a| a == "--allowedTools"));
-        assert!(cmd.args.windows(2).any(|w| w[0] == CLAUDE_REASONING_EFFORT_FLAG && w[1] == "high"));
+        assert!(cmd.args.windows(2).any(|w| w[0] == "--effort" && w[1] == "high"));
     }
 
     #[test]
