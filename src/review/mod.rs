@@ -685,13 +685,21 @@ fn parse_input(args: &Value) -> Result<(Structure, Vec<String>, String, Value), 
     Ok((structure, providers, criteria, context))
 }
 
-/// Whether the post-review hooks (KGREV-02 graph rebuild + KGREV-03 doc engine)
-/// should fire. A normal review runs them only on a completed APPROVE pass; the
-/// Epic capstone (S111C) is ADVISORY and runs them on ANY completed audit — so the
-/// capstone's END drives the KG refresh + doc engine even when it surfaces
-/// findings (the "capstone → doc engine" hook). Pure/testable.
-fn should_run_post_hooks(structure: Structure, aggregate_verdict: &str, complete: bool) -> bool {
+/// Whether the KGREV-02 graph rebuild should fire. The Atlas graph is refreshed
+/// on every completed review pass (APPROVE — the review-time complement to the
+/// Stage 7c merge-time `scribe_kg_build`) AND at the end of every completed Epic
+/// capstone audit (advisory — fires regardless of the audit's verdict). Pure/testable.
+fn should_run_kg_rebuild(structure: Structure, aggregate_verdict: &str, complete: bool) -> bool {
     complete && (structure == Structure::Epic || aggregate_verdict == "APPROVE")
+}
+
+/// Whether the KGREV-03 doc engine (`docgen_run`) should fire. `docgen_run` is
+/// TOKEN-INTENSIVE, so it runs ONLY after a **PASSING Epic capstone** — a completed
+/// epic audit whose verdict is APPROVE (the whole build audited clean). It NEVER
+/// runs on a per-item/per-merge review, and NEVER on an epic that surfaced findings
+/// (REQUEST_CHANGES). Pure/testable.
+fn should_run_docgen(structure: Structure, aggregate_verdict: &str, complete: bool) -> bool {
+    complete && structure == Structure::Epic && aggregate_verdict == "APPROVE"
 }
 
 fn role_for(structure: Structure, index: usize) -> Role {
@@ -928,16 +936,20 @@ than failing the whole call."
         // doc engine — the operator-visible "capstone → doc engine" hook — even
         // when the audit reports work-items. A non-epic review keeps the strict
         // APPROVE gate.
-        let run_post_hooks = should_run_post_hooks(structure, &aggregate_verdict, complete);
+        // KGREV-02: incrementally rebuild the project's KG on a completed pass
+        // (or a completed epic audit) — best-effort, never fails the review; see
+        // `maybe_rebuild` for the lock semantics.
+        let kg_rebuild =
+            maybe_rebuild(should_run_kg_rebuild(structure, &aggregate_verdict, complete), &context)
+                .await;
 
-        // KGREV-02: incrementally rebuild the project's KG (best-effort, never
-        // fails the review); see `maybe_rebuild` for the lock semantics.
-        let kg_rebuild = maybe_rebuild(run_post_hooks, &context).await;
-
-        // KGREV-03: after the KG rebuild (so docs see the refreshed graph),
-        // best-effort doc refresh through the sanctioned `docgen_run` door;
-        // see `maybe_scribe_docs` for the gating/S9 rationale.
-        let scribe_docs = maybe_scribe_docs(run_post_hooks, &context).await;
+        // KGREV-03: the doc engine is TOKEN-INTENSIVE, so it fires ONLY after a
+        // PASSING Epic capstone (a completed epic audit that verdicts APPROVE),
+        // never per-merge — sequenced after the KG rebuild so docs see the fresh
+        // graph. Best-effort through the sanctioned `docgen_run` door (S9).
+        let scribe_docs =
+            maybe_scribe_docs(should_run_docgen(structure, &aggregate_verdict, complete), &context)
+                .await;
 
         // KGFIND-03: best-effort, capture-only recording of structured
         // findings onto the Atlas KG findings store. Unlike the two hooks
@@ -1030,17 +1042,28 @@ mod tests {
     }
 
     #[test]
-    fn epic_capstone_runs_post_hooks_on_any_completed_audit() {
-        // A normal review runs the KG/doc hooks only on a completed APPROVE.
-        assert!(should_run_post_hooks(Structure::PanelUnanimous, "APPROVE", true));
-        assert!(!should_run_post_hooks(Structure::PanelUnanimous, "REQUEST_CHANGES", true));
-        assert!(!should_run_post_hooks(Structure::PanelUnanimous, "APPROVE", false));
-        // The Epic capstone is advisory: a COMPLETED audit fires the hooks even when
-        // it surfaces findings (REQUEST_CHANGES) — this is the capstone→doc-engine hook.
-        assert!(should_run_post_hooks(Structure::Epic, "REQUEST_CHANGES", true));
-        assert!(should_run_post_hooks(Structure::Epic, "APPROVE", true));
-        // ...but an INCOMPLETE epic audit (a provider unavailable) does not.
-        assert!(!should_run_post_hooks(Structure::Epic, "REQUEST_CHANGES", false));
+    fn kg_rebuild_fires_on_completed_pass_or_epic_audit() {
+        // KG refresh: on a completed APPROVE review (review-time complement to the
+        // merge-time refresh) OR on ANY completed epic audit (advisory).
+        assert!(should_run_kg_rebuild(Structure::PanelUnanimous, "APPROVE", true));
+        assert!(!should_run_kg_rebuild(Structure::PanelUnanimous, "REQUEST_CHANGES", true));
+        assert!(!should_run_kg_rebuild(Structure::PanelUnanimous, "APPROVE", false));
+        assert!(should_run_kg_rebuild(Structure::Epic, "REQUEST_CHANGES", true));
+        assert!(should_run_kg_rebuild(Structure::Epic, "APPROVE", true));
+        assert!(!should_run_kg_rebuild(Structure::Epic, "REQUEST_CHANGES", false));
+    }
+
+    #[test]
+    fn docgen_fires_only_after_a_passing_epic_capstone() {
+        // Token-intensive: ONLY a completed epic audit that verdicts APPROVE.
+        assert!(should_run_docgen(Structure::Epic, "APPROVE", true));
+        // NOT a failing/advisory epic (surfaced findings) ...
+        assert!(!should_run_docgen(Structure::Epic, "REQUEST_CHANGES", true));
+        // ... NOT an incomplete epic ...
+        assert!(!should_run_docgen(Structure::Epic, "APPROVE", false));
+        // ... and NEVER a per-item/per-merge review, even a clean APPROVE.
+        assert!(!should_run_docgen(Structure::PanelUnanimous, "APPROVE", true));
+        assert!(!should_run_docgen(Structure::Single, "APPROVE", true));
     }
 
     #[tokio::test]
