@@ -26,6 +26,14 @@ pub enum Structure {
     AdversarialPair,
     PanelMajority,
     PanelUnanimous,
+    /// The Epic Review capstone (S111C): a whole-repo strategic audit that runs
+    /// ONCE at the end of a build (all sprints merged+verified). Providers audit
+    /// the ENTIRE codebase against the spec/behavior contracts — surfacing deep
+    /// correctness bugs, cross-module integration gaps, and architecture drift a
+    /// per-diff review can't see — and EMIT findings (never edit code). It is
+    /// ADVISORY: its verdict summarizes the audit but never gates a merge, and its
+    /// completion (not its verdict) drives the KG refresh + doc engine at the end.
+    Epic,
 }
 
 impl Structure {
@@ -35,6 +43,7 @@ impl Structure {
             "adversarial_pair" => Some(Structure::AdversarialPair),
             "panel_majority" => Some(Structure::PanelMajority),
             "panel_unanimous" => Some(Structure::PanelUnanimous),
+            "epic" => Some(Structure::Epic),
             _ => None,
         }
     }
@@ -47,6 +56,9 @@ pub enum Role {
     Reviewer,
     /// The "defend" side of an adversarial pair.
     Defend,
+    /// The Epic Review capstone auditor: audits the WHOLE codebase against the
+    /// contracts (not a diff) and emits findings; advisory, never fixes code.
+    Auditor,
     /// The "attack" side of an adversarial pair -- explicitly instructed to try
     /// to refute the change / find rejection reasons.
     Attack,
@@ -95,6 +107,24 @@ response with EXACTLY one line, verbatim:\n\
 VERDICT: APPROVE\n\
 or\n\
 VERDICT: REQUEST_CHANGES\n"
+        ),
+        Role::Auditor => format!(
+            "You are conducting an EPIC REVIEW — a whole-system capstone audit run ONCE at the end \
+of a completed build (all sprints merged + verified). You are NOT reviewing a diff: audit the \
+ENTIRE codebase and its stated contracts as a whole.\n\n\
+{kg_pointer}\
+Contracts / acceptance criteria for the build:\n{criteria}\n\n\
+Context (whole-repo pointers / spec contracts / description):\n{context_str}\n\n\
+Your job is a STRATEGIC audit, not a line edit: surface deep correctness bugs, cross-module \
+integration gaps, contract violations, and architecture drift that per-diff reviews cannot see. \
+Do NOT fix code and do NOT nitpick per-function style — produce durable, actionable FINDINGS that \
+cheaper implementer agents can turn into work items. Give your reasoning, emit your findings in the \
+FINDINGS block, then end your response with EXACTLY one line, verbatim:\n\
+VERDICT: APPROVE\n\
+(if the build faithfully satisfies its contracts with no material findings)\n\
+or\n\
+VERDICT: REQUEST_CHANGES\n\
+(if you surfaced material findings for follow-up — this is ADVISORY, it does not revert the build)\n"
         ),
         Role::Attack => format!(
             "You are ATTACKING this change. Your job is to actively try to REFUTE it: find every \
@@ -336,6 +366,7 @@ mod tests {
         assert_eq!(Structure::parse("adversarial_pair"), Some(Structure::AdversarialPair));
         assert_eq!(Structure::parse("panel_majority"), Some(Structure::PanelMajority));
         assert_eq!(Structure::parse("panel_unanimous"), Some(Structure::PanelUnanimous));
+        assert_eq!(Structure::parse("epic"), Some(Structure::Epic));
         assert_eq!(Structure::parse("bogus"), None);
     }
 
@@ -366,6 +397,18 @@ mod tests {
         assert!(p.contains("DEFENDING"));
         assert!(p.contains("VERDICT: APPROVE"));
         assert!(p.contains("VERDICT: REQUEST_CHANGES"));
+    }
+
+    #[test]
+    fn auditor_prompt_frames_whole_repo_capstone_audit() {
+        let ctx = json!({});
+        let p = build_prompt(Role::Auditor, "the build contracts", &ctx);
+        assert!(p.contains("EPIC REVIEW"), "epic capstone framing");
+        assert!(p.to_uppercase().contains("ENTIRE CODEBASE") || p.contains("whole-system"));
+        assert!(p.contains("FINDINGS"), "auditor must emit findings");
+        assert!(p.contains("VERDICT: APPROVE") && p.contains("VERDICT: REQUEST_CHANGES"));
+        // It is an audit, not a fix: never instructs code edits.
+        assert!(p.contains("ADVISORY"));
     }
 
     #[test]
