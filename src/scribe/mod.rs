@@ -229,7 +229,7 @@ pub(crate) async fn dispatch_docs_generation(
 ) -> Result<String, ToolError> {
     let mut errors = Vec::new();
     for provider in DOCS_PROVIDER_CHAIN {
-        match cfg.dispatch_daemon(provider, prompt).await {
+        match cfg.dispatch_daemon(provider, prompt, &crate::review::dispatch::DaemonOpts::routine()).await {
             Ok(text) => return Ok(text),
             Err(e) => errors.push(format!("{provider}: {e}")),
         }

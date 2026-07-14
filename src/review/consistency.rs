@@ -372,7 +372,7 @@ pub async fn maybe_run(
     let lens_cfg = ConsistencyReviewConfig::from_env();
     let prompt_text = build_prompt_block(criteria, &ctx.block, &lens_cfg);
 
-    let raw = match super::dispatch_provider_raw(review_cfg, &lens_cfg.provider, &prompt_text).await {
+    let raw = match super::dispatch_provider_raw(review_cfg, &lens_cfg.provider, &prompt_text, &crate::review::dispatch::DaemonOpts::routine()).await {
         Ok(text) => text,
         Err(e) => {
             tracing::warn!(

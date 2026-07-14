@@ -24,6 +24,10 @@ pub enum Provider {
     Opus,
     Codex,
     Agy,
+    /// The Epic-capstone Fable lens — the `claude` CLI at the `claude-fable-5`
+    /// model (Fable OAuth). Wire name is `claude-fable-5` to match `review_run`.
+    #[serde(rename = "claude-fable-5")]
+    Fable,
 }
 
 impl Provider {
@@ -32,6 +36,7 @@ impl Provider {
             Provider::Opus => "opus",
             Provider::Codex => "codex",
             Provider::Agy => "agy",
+            Provider::Fable => "claude-fable-5",
         }
     }
 
@@ -43,6 +48,7 @@ impl Provider {
             Provider::Opus => CLAUDE_BIN,
             Provider::Codex => CODEX_BIN,
             Provider::Agy => AGY_BIN,
+            Provider::Fable => CLAUDE_BIN,
         }
     }
 }
@@ -55,6 +61,15 @@ const AGY_BIN: &str = "agy";
 
 /// Claude CLI model alias for the "opus" provider slot.
 const OPUS_MODEL: &str = "opus";
+/// Claude CLI model for the Fable capstone lens (Fable OAuth).
+const FABLE_MODEL: &str = "claude-fable-5";
+/// Read-ONLY exploration tools pre-approved for the claude slots in explore mode.
+/// Deliberately excludes Bash/Write/Edit — a capstone auditor may READ the repo
+/// (audit real code) but never execute a command or mutate anything. Passed as
+/// pre-approved (`--allowedTools`) so tool use never blocks on a permission prompt
+/// (the daemon has no stdin), WITHOUT `--dangerously-skip-permissions` (which the
+/// claude CLI refuses to run as root anyway).
+const EXPLORE_TOOLS: &[&str] = &["Read", "Grep", "Glob", "LS"];
 /// Codex CLI model for the "codex" provider slot.
 const CODEX_MODEL: &str = "gpt-5.5";
 /// agy (Antigravity CLI) model for the "agy" provider slot.
@@ -75,20 +90,10 @@ pub struct BuiltCommand {
 /// The prompt is passed as a single argv element (`claude`/`agy`) or, for
 /// `codex`, as the single trailing positional argument — never split, never
 /// interpolated into a larger string that a shell would re-parse.
-pub fn build_command(provider: Provider, prompt: &str) -> BuiltCommand {
+pub fn build_command(provider: Provider, prompt: &str, explore: bool) -> BuiltCommand {
     match provider {
-        Provider::Opus => BuiltCommand {
-            binary: CLAUDE_BIN,
-            // --tools "" disables built-in tool use so a subprocess with no
-            // interactive stdin never blocks on a permission prompt.
-            args: vec![
-                "--model".into(), OPUS_MODEL.into(),
-                "-p".into(), prompt.to_string(),
-                "--output-format".into(), "text".into(),
-                "--tools".into(), "".into(),
-            ],
-            output_path: None,
-        },
+        Provider::Opus => claude_command(OPUS_MODEL, prompt, explore),
+        Provider::Fable => claude_command(FABLE_MODEL, prompt, explore),
         Provider::Codex => {
             let output_path = std::env::temp_dir()
                 .join(format!("review-daemon-codex-{}.txt", Uuid::new_v4()))
@@ -129,9 +134,73 @@ pub fn build_command(provider: Provider, prompt: &str) -> BuiltCommand {
     }
 }
 
+/// The `claude` CLI command for the Opus/Fable slots. Routine reviews disable
+/// tools (`--tools ""`) so a stdin-less subprocess never blocks on a permission
+/// prompt. In EXPLORE mode (the Epic capstone) the auditor instead gets the
+/// READ-ONLY [`EXPLORE_TOOLS`] pre-approved via `--allowedTools` — so it can read
+/// the repo (run in the request's repo cwd) to audit real code, but can never
+/// execute a command or mutate anything. Verified live: `--allowedTools Read Grep
+/// Glob LS` pre-approves those tools without a prompt and without the root-blocked
+/// `--dangerously-skip-permissions`.
+fn claude_command(model: &str, prompt: &str, explore: bool) -> BuiltCommand {
+    let mut args = vec![
+        "--model".into(), model.to_string(),
+        "-p".into(), prompt.to_string(),
+        "--output-format".into(), "text".into(),
+    ];
+    if explore {
+        args.push("--allowedTools".into());
+        for t in EXPLORE_TOOLS {
+            args.push((*t).to_string());
+        }
+    } else {
+        args.push("--tools".into());
+        args.push("".into());
+    }
+    BuiltCommand { binary: CLAUDE_BIN, args, output_path: None }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fable_slot_uses_claude_cli_at_the_fable_model() {
+        let cmd = build_command(Provider::Fable, "audit", false);
+        assert_eq!(cmd.binary, CLAUDE_BIN);
+        assert_eq!(Provider::Fable.as_str(), "claude-fable-5");
+        assert!(cmd.args.windows(2).any(|w| w[0] == "--model" && w[1] == FABLE_MODEL));
+    }
+
+    #[test]
+    fn fable_deserializes_from_the_wire_name() {
+        // The daemon receives the review_run provider string "claude-fable-5".
+        let p: Provider = serde_json::from_value(serde_json::json!("claude-fable-5")).unwrap();
+        assert_eq!(p, Provider::Fable);
+    }
+
+    #[test]
+    fn explore_mode_enables_readonly_tools_never_bash_or_write() {
+        for prov in [Provider::Opus, Provider::Fable] {
+            let routine = build_command(prov, "x", false);
+            assert!(
+                routine.args.windows(2).any(|w| w[0] == "--tools" && w[1].is_empty()),
+                "routine claude disables tools"
+            );
+            let explore = build_command(prov, "x", true);
+            assert!(explore.args.iter().any(|a| a == "--allowedTools"));
+            for t in ["Read", "Grep", "Glob", "LS"] {
+                assert!(explore.args.iter().any(|a| a == t), "explore allows {t}");
+            }
+            // NEVER an exec/mutate tool or the root-blocked bypass flag.
+            for forbidden in ["Bash", "Write", "Edit", "--dangerously-skip-permissions"] {
+                assert!(
+                    !explore.args.iter().any(|a| a == forbidden),
+                    "explore must not grant {forbidden}"
+                );
+            }
+        }
+    }
 
     const SHELL_MARKERS: &[&str] = &["sh", "-c", "bash"];
 
@@ -153,7 +222,7 @@ mod tests {
     #[test]
     fn opus_command_has_no_shell_markers_and_prompt_is_single_arg() {
         let prompt = "review this; rm -rf / && echo pwned";
-        let cmd = build_command(Provider::Opus, prompt);
+        let cmd = build_command(Provider::Opus, prompt, false);
         assert_no_shell_markers(&cmd);
         // The (potentially adversarial) prompt text must appear as exactly ONE
         // argv element, verbatim -- never split/re-tokenized.
@@ -164,7 +233,7 @@ mod tests {
     #[test]
     fn codex_command_has_no_shell_markers_and_prompt_is_single_trailing_arg() {
         let prompt = "$(whoami) `id` && rm -rf ~";
-        let cmd = build_command(Provider::Codex, prompt);
+        let cmd = build_command(Provider::Codex, prompt, false);
         assert_no_shell_markers(&cmd);
         assert_eq!(cmd.args.last().map(String::as_str), Some(prompt));
         assert_eq!(cmd.binary, "codex");
@@ -179,7 +248,7 @@ mod tests {
         // The second-to-last argv element must be the literal "--" terminator
         // immediately before the prompt.
         let prompt = "-not-a-flag, reply with the word HELLO";
-        let cmd = build_command(Provider::Codex, prompt);
+        let cmd = build_command(Provider::Codex, prompt, false);
         assert_eq!(cmd.args.last().map(String::as_str), Some(prompt));
         assert_eq!(
             cmd.args.get(cmd.args.len() - 2).map(String::as_str),
@@ -192,7 +261,7 @@ mod tests {
     #[test]
     fn agy_command_has_no_shell_markers_and_prompt_is_single_arg() {
         let prompt = "; cat /etc/passwd #";
-        let cmd = build_command(Provider::Agy, prompt);
+        let cmd = build_command(Provider::Agy, prompt, false);
         assert_no_shell_markers(&cmd);
         assert_eq!(cmd.args.iter().filter(|a| a.as_str() == prompt).count(), 1);
         assert_eq!(cmd.binary, "agy");
@@ -202,7 +271,7 @@ mod tests {
     fn model_strings_are_fixed_not_caller_controlled() {
         // build_command's signature takes no model parameter at all -- there is
         // no code path by which request JSON can influence the model string.
-        let cmd = build_command(Provider::Opus, "x");
+        let cmd = build_command(Provider::Opus, "x", false);
         assert!(cmd.args.contains(&OPUS_MODEL.to_string()));
     }
 
