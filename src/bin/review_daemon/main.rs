@@ -288,6 +288,12 @@ struct DispatchBody {
     /// Repo checkout the explore-mode auditors may read from (the subprocess cwd).
     #[serde(default)]
     repo_path: Option<String>,
+    /// REVCAP-01 PART B: requested reasoning/thinking effort (e.g. `"high"`) for
+    /// an intensive-substitute review. `None` (the default, and every pre-PART-B
+    /// caller) reproduces the exact pre-PART-B argv -- see
+    /// `provider::build_command`'s doc.
+    #[serde(default)]
+    reasoning_effort: Option<String>,
 }
 
 /// Parse + validate + dispatch a `/dispatch` request body. Returns
@@ -361,11 +367,17 @@ async fn handle_dispatch(
     // Bounded concurrency: at most MAX_CONCURRENCY subprocesses in flight.
     let _permit = state.semaphore.acquire().await;
 
+    // REVCAP-01 PART B: validate against the closed allowlist -- an
+    // unrecognized/blank/absent value drops to `None` (the pre-PART-B argv
+    // shape), never forwarded verbatim into a provider's own config syntax.
+    let reasoning_effort = config::clamp_reasoning_effort(parsed.reasoning_effort.as_deref());
+
     match run_provider(
         parsed.provider,
         resolved_path,
         &parsed.prompt,
         parsed.explore,
+        reasoning_effort.as_deref(),
         &stall,
         cwd.as_deref(),
         &state.sanitized_env,
@@ -408,12 +420,13 @@ async fn run_provider(
     resolved_path: &std::path::Path,
     prompt: &str,
     explore: bool,
+    reasoning_effort: Option<&str>,
     stall: &StallConfig,
     cwd: Option<&std::path::Path>,
     env: &HashMap<String, String>,
     state: &AppState,
 ) -> Result<String, (&'static str, String)> {
-    let built = provider::build_command(provider, prompt, explore);
+    let built = provider::build_command(provider, prompt, explore, reasoning_effort);
 
     // agy is the only provider that runs inside the bwrap sandbox (see
     // sandbox.rs / egress_proxy.rs for why: agy's own tool-approval gate is

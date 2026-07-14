@@ -59,6 +59,12 @@ fn openrouter_chat_url() -> String {
         .unwrap_or_else(|| DEFAULT_OPENROUTER_URL.to_string())
 }
 
+/// REVCAP-01 PART B: the effort level sent for an INTENSIVE-SUBSTITUTE review
+/// (a substitute standing in for a down frontier provider must review HARDER,
+/// not at parity -- see `DaemonOpts::intensive`). Value convention mirrors
+/// `codex`'s own `model_reasoning_effort` levels (`"low"|"medium"|"high"`).
+const INTENSIVE_REASONING_EFFORT: &str = "high";
+
 /// Config for reaching the review-daemon and OpenRouter. Follows this repo's
 /// existing plain-env-var secret convention (see `src/litellm/mod.rs`'s
 /// `LITELLM_MASTER_KEY`) rather than inventing a new one.
@@ -134,6 +140,12 @@ impl ReviewConfig {
         }
         if let Some(repo) = &opts.repo_path {
             req_body["repo_path"] = json!(repo);
+        }
+        // REVCAP-01 PART B: intensive-substitute extra -- omitted entirely (routine
+        // reviews, and the Epic capstone, are byte-for-byte unchanged) unless this
+        // dispatch is an intensive-substitute review (see `DaemonOpts::intensive`).
+        if let Some(effort) = &opts.reasoning_effort {
+            req_body["reasoning_effort"] = json!(effort);
         }
         let resp = client
             .post(&url)
@@ -411,7 +423,13 @@ pub fn min_openrouter_credits() -> f64 {
 /// (tools off, 120s budget); the Epic capstone uses [`Self::epic`] (explore mode +
 /// progress/stall detection + a long wall-clock BACKSTOP, since a whole-repo audit
 /// legitimately runs for many minutes and the daemon's stall-detector — not a
-/// wall-clock timeout — decides when to kill a genuinely-stalled provider).
+/// wall-clock timeout — decides when to kill a genuinely-stalled provider);
+/// REVCAP-01 PART B's [`Self::intensive`] is for a provider standing in for a
+/// currently-DOWN frontier reviewer -- it must review HARDER than parity, which
+/// this codebase proved (live, this session) needs BOTH a raised reasoning effort
+/// AND a longer wall-clock budget: a genuinely deep 2-pass-equivalent review of a
+/// large diff at the routine 120s backstop reliably TIMES OUT before it can emit a
+/// verdict.
 #[derive(Clone, Debug)]
 pub struct DaemonOpts {
     /// Wall-clock backstop (secs) sent to the daemon; the stall-detector is primary.
@@ -424,6 +442,16 @@ pub struct DaemonOpts {
     pub stall_secs: Option<u64>,
     /// Repo checkout the auditors may read from in explore mode.
     pub repo_path: Option<String>,
+    /// REVCAP-01 PART B: requested reasoning/thinking effort (e.g. `"high"`),
+    /// forwarded to the review-daemon's `/dispatch` body and from there into the
+    /// spawned CLI's own effort flag (see `provider::build_command`). `None` on
+    /// every pre-PART-B preset ([`Self::routine`], [`Self::epic`]) -- omitted from
+    /// the wire body entirely, so routine/epic dispatches are byte-for-byte
+    /// unchanged. Distinct from `explore`: intensity here is effort + time budget
+    /// + a harder-refutation prompt role, NOT repo-read access -- explore mode
+    /// makes opus enter an agentic tool-loop and never emit a `VERDICT:` line
+    /// (proven live), so [`Self::intensive`] deliberately keeps `explore: false`.
+    pub reasoning_effort: Option<String>,
 }
 
 impl DaemonOpts {
@@ -435,6 +463,7 @@ impl DaemonOpts {
             explore: false,
             stall_secs: None,
             repo_path: None,
+            reasoning_effort: None,
         }
     }
 
@@ -446,6 +475,29 @@ impl DaemonOpts {
             explore: true,
             stall_secs: Some(180),
             repo_path,
+            reasoning_effort: None,
+        }
+    }
+
+    /// REVCAP-01 PART B: an INTENSIVE-SUBSTITUTE review -- dispatched when this
+    /// provider is standing in for a currently-DOWN frontier reviewer (see
+    /// `review::mod`'s per-provider selection). Raises reasoning effort to
+    /// [`INTENSIVE_REASONING_EFFORT`] and gives the run a 900s wall-clock backstop
+    /// (vs. routine's 120s, the proven failure point for a genuinely deep review of
+    /// a large diff) plus a 240s no-output stall window (mirrors the Epic
+    /// capstone's stall-detection shape, scaled down from its whole-repo 180s/1800s
+    /// budget). Deliberately `explore: false` and no `repo_path` -- this is a
+    /// deeper single-pass read of the SAME diff/context every other panel member
+    /// gets, not a repo-exploring audit; explore mode is proven to make opus enter
+    /// an agentic tool-loop and never emit a `VERDICT:` line.
+    pub fn intensive() -> Self {
+        Self {
+            timeout_secs: 900,
+            client_timeout_secs: 950,
+            explore: false,
+            stall_secs: Some(240),
+            repo_path: None,
+            reasoning_effort: Some(INTENSIVE_REASONING_EFFORT.to_string()),
         }
     }
 }
@@ -555,6 +607,55 @@ mod tests {
         assert!(epic.timeout_secs > routine.timeout_secs);
         assert!(epic.client_timeout_secs > epic.timeout_secs);
         assert_eq!(epic.repo_path.as_deref(), Some("/repo"));
+    }
+
+    #[test]
+    fn intensive_daemon_opts_raise_effort_and_timeout_but_stay_out_of_explore_mode() {
+        let routine = DaemonOpts::routine();
+        let intensive = DaemonOpts::intensive();
+        // The proven failure point: routine's 120s backstop is too short for a
+        // genuinely deep review of a large diff -- intensive must exceed it.
+        assert!(intensive.timeout_secs > routine.timeout_secs);
+        assert!(intensive.client_timeout_secs > intensive.timeout_secs);
+        assert_eq!(intensive.reasoning_effort.as_deref(), Some(INTENSIVE_REASONING_EFFORT));
+        assert!(routine.reasoning_effort.is_none());
+        // explore stays false: explore mode is proven to make opus enter an
+        // agentic tool-loop and never emit a VERDICT: line -- intensity here is
+        // effort + time budget + prompt role, never repo-read access.
+        assert!(!intensive.explore);
+        assert!(intensive.repo_path.is_none());
+        assert!(intensive.stall_secs.is_some());
+    }
+
+    #[tokio::test]
+    async fn dispatch_daemon_sends_reasoning_effort_only_when_set() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/dispatch")
+                .json_body_partial(r#"{"reasoning_effort": "high"}"#);
+            then.status(200).json_body(json!({"text": "VERDICT: APPROVE"}));
+        });
+        let cfg = cfg_for(&server, "testtoken");
+        cfg.dispatch_daemon("opus", "review this", &DaemonOpts::intensive()).await.unwrap();
+        mock.assert();
+
+        // A routine dispatch (no reasoning_effort set) must NOT include the key at
+        // all -- verified by asserting the mock only matches a body lacking it (a
+        // regression that always includes the key would make this mock miss).
+        fn body_excludes_reasoning_effort(req: &httpmock::prelude::HttpMockRequest) -> bool {
+            let body = req.body.as_deref().unwrap_or(&[]);
+            let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            v.get("reasoning_effort").is_none()
+        }
+        let server2 = MockServer::start();
+        let mock2 = server2.mock(|when, then| {
+            when.method(POST).path("/dispatch").matches(body_excludes_reasoning_effort);
+            then.status(200).json_body(json!({"text": "VERDICT: APPROVE"}));
+        });
+        let cfg2 = cfg_for(&server2, "testtoken");
+        cfg2.dispatch_daemon("opus", "review this", &DaemonOpts::routine()).await.unwrap();
+        mock2.assert();
     }
 
     #[test]

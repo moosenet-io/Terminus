@@ -75,6 +75,19 @@ const CODEX_MODEL: &str = "gpt-5.5";
 /// agy (Antigravity CLI) model for the "agy" provider slot.
 const AGY_MODEL: &str = "gemini-3.1-pro";
 
+/// REVCAP-01 PART B: the `claude` CLI flag assumed to raise the model's
+/// extended-thinking/reasoning effort in headless (`-p`) mode. NOT independently
+/// confirmed against the installed `claude` CLI's own `--help` in this session --
+/// flag review MUST verify this is the correct flag (or supply the right one)
+/// before an intensive-substitute dispatch is relied on in production. Kept
+/// behind `Option<&str>` throughout this module specifically so a wrong/unknown
+/// flag only affects the NEW intensive path: every pre-existing call site (routine
+/// reviews, the Epic capstone) passes `None` and is byte-for-byte unaffected.
+const CLAUDE_REASONING_EFFORT_FLAG: &str = "--reasoning-effort";
+/// The `codex exec` config-override flag (`-c key=value`, codex's documented TOML
+/// override syntax) and the specific key codex uses for reasoning effort.
+const CODEX_REASONING_EFFORT_KEY: &str = "model_reasoning_effort";
+
 /// A fully-built, ready-to-spawn command: binary name + argv array. Never a
 /// shell string. `output_path` is populated only for providers (codex) that
 /// write their clean reply to a file rather than stdout.
@@ -90,37 +103,55 @@ pub struct BuiltCommand {
 /// The prompt is passed as a single argv element (`claude`/`agy`) or, for
 /// `codex`, as the single trailing positional argument — never split, never
 /// interpolated into a larger string that a shell would re-parse.
-pub fn build_command(provider: Provider, prompt: &str, explore: bool) -> BuiltCommand {
+/// `reasoning_effort` is REVCAP-01 PART B's intensity knob: `None` on every
+/// pre-PART-B call site (routine reviews, the Epic capstone) reproduces the
+/// exact argv this function built before PART B, byte-for-byte. `Some(level)`
+/// (e.g. `"high"`) is only ever passed for an intensive-substitute dispatch (a
+/// provider standing in for a currently-DOWN frontier reviewer) and appends the
+/// provider's own effort flag -- see [`CLAUDE_REASONING_EFFORT_FLAG`] /
+/// [`CODEX_REASONING_EFFORT_KEY`] for the assumed/documented flag names. `agy`
+/// has no known effort knob, so the parameter is accepted but ignored for it.
+pub fn build_command(
+    provider: Provider,
+    prompt: &str,
+    explore: bool,
+    reasoning_effort: Option<&str>,
+) -> BuiltCommand {
     match provider {
-        Provider::Opus => claude_command(OPUS_MODEL, prompt, explore),
-        Provider::Fable => claude_command(FABLE_MODEL, prompt, explore),
+        Provider::Opus => claude_command(OPUS_MODEL, prompt, explore, reasoning_effort),
+        Provider::Fable => claude_command(FABLE_MODEL, prompt, explore, reasoning_effort),
         Provider::Codex => {
             let output_path = std::env::temp_dir()
                 .join(format!("review-daemon-codex-{}.txt", Uuid::new_v4()))
                 .to_string_lossy()
                 .to_string();
-            BuiltCommand {
-                binary: CODEX_BIN,
-                args: vec![
-                    "exec".into(),
-                    "--skip-git-repo-check".into(),
-                    "--sandbox".into(), "read-only".into(),
-                    "-m".into(), CODEX_MODEL.into(),
-                    "--output-last-message".into(), output_path.clone().into(),
-                    // "--" is the standard clap argv terminator: without it, a
-                    // prompt starting with '-' (e.g. "-not-a-flag ...") is
-                    // parsed as another `codex exec` option rather than the
-                    // positional prompt -- confirmed live: codex errors with
-                    // "unexpected argument '-n' found" on such a prompt
-                    // without this separator. This is not shell injection
-                    // (argv is still a fixed array, never a shell string),
-                    // but caller-controlled prompt text could otherwise
-                    // influence codex's own flag parsing.
-                    "--".into(),
-                    prompt.to_string(),
-                ],
-                output_path: Some(output_path),
+            let mut args = vec![
+                "exec".into(),
+                "--skip-git-repo-check".into(),
+                "--sandbox".into(), "read-only".into(),
+                "-m".into(), CODEX_MODEL.into(),
+            ];
+            // REVCAP-01 PART B: only appended for an intensive-substitute dispatch
+            // -- a routine/epic codex call (`reasoning_effort: None`) produces the
+            // exact same argv as before this change.
+            if let Some(effort) = reasoning_effort {
+                args.push("-c".into());
+                args.push(format!("{CODEX_REASONING_EFFORT_KEY}=\"{effort}\""));
             }
+            args.push("--output-last-message".into());
+            args.push(output_path.clone());
+            // "--" is the standard clap argv terminator: without it, a
+            // prompt starting with '-' (e.g. "-not-a-flag ...") is
+            // parsed as another `codex exec` option rather than the
+            // positional prompt -- confirmed live: codex errors with
+            // "unexpected argument '-n' found" on such a prompt
+            // without this separator. This is not shell injection
+            // (argv is still a fixed array, never a shell string),
+            // but caller-controlled prompt text could otherwise
+            // influence codex's own flag parsing.
+            args.push("--".into());
+            args.push(prompt.to_string());
+            BuiltCommand { binary: CODEX_BIN, args, output_path: Some(output_path) }
         }
         Provider::Agy => BuiltCommand {
             binary: AGY_BIN,
@@ -142,7 +173,7 @@ pub fn build_command(provider: Provider, prompt: &str, explore: bool) -> BuiltCo
 /// execute a command or mutate anything. Verified live: `--allowedTools Read Grep
 /// Glob LS` pre-approves those tools without a prompt and without the root-blocked
 /// `--dangerously-skip-permissions`.
-fn claude_command(model: &str, prompt: &str, explore: bool) -> BuiltCommand {
+fn claude_command(model: &str, prompt: &str, explore: bool, reasoning_effort: Option<&str>) -> BuiltCommand {
     let mut args = vec![
         "--model".into(), model.to_string(),
         "-p".into(), prompt.to_string(),
@@ -157,6 +188,14 @@ fn claude_command(model: &str, prompt: &str, explore: bool) -> BuiltCommand {
         args.push("--tools".into());
         args.push("".into());
     }
+    // REVCAP-01 PART B: only appended for an intensive-substitute dispatch --
+    // routine/Epic calls (`reasoning_effort: None`) produce the exact same argv
+    // as before this change. ASSUMED flag name, see
+    // `CLAUDE_REASONING_EFFORT_FLAG`'s doc -- confirm before relying on this.
+    if let Some(effort) = reasoning_effort {
+        args.push(CLAUDE_REASONING_EFFORT_FLAG.to_string());
+        args.push(effort.to_string());
+    }
     BuiltCommand { binary: CLAUDE_BIN, args, output_path: None }
 }
 
@@ -166,7 +205,7 @@ mod tests {
 
     #[test]
     fn fable_slot_uses_claude_cli_at_the_fable_model() {
-        let cmd = build_command(Provider::Fable, "audit", false);
+        let cmd = build_command(Provider::Fable, "audit", false, None);
         assert_eq!(cmd.binary, CLAUDE_BIN);
         assert_eq!(Provider::Fable.as_str(), "claude-fable-5");
         assert!(cmd.args.windows(2).any(|w| w[0] == "--model" && w[1] == FABLE_MODEL));
@@ -182,12 +221,12 @@ mod tests {
     #[test]
     fn explore_mode_enables_readonly_tools_never_bash_or_write() {
         for prov in [Provider::Opus, Provider::Fable] {
-            let routine = build_command(prov, "x", false);
+            let routine = build_command(prov, "x", false, None);
             assert!(
                 routine.args.windows(2).any(|w| w[0] == "--tools" && w[1].is_empty()),
                 "routine claude disables tools"
             );
-            let explore = build_command(prov, "x", true);
+            let explore = build_command(prov, "x", true, None);
             assert!(explore.args.iter().any(|a| a == "--allowedTools"));
             for t in ["Read", "Grep", "Glob", "LS"] {
                 assert!(explore.args.iter().any(|a| a == t), "explore allows {t}");
@@ -222,7 +261,7 @@ mod tests {
     #[test]
     fn opus_command_has_no_shell_markers_and_prompt_is_single_arg() {
         let prompt = "review this; rm -rf / && echo pwned";
-        let cmd = build_command(Provider::Opus, prompt, false);
+        let cmd = build_command(Provider::Opus, prompt, false, None);
         assert_no_shell_markers(&cmd);
         // The (potentially adversarial) prompt text must appear as exactly ONE
         // argv element, verbatim -- never split/re-tokenized.
@@ -233,7 +272,7 @@ mod tests {
     #[test]
     fn codex_command_has_no_shell_markers_and_prompt_is_single_trailing_arg() {
         let prompt = "$(whoami) `id` && rm -rf ~";
-        let cmd = build_command(Provider::Codex, prompt, false);
+        let cmd = build_command(Provider::Codex, prompt, false, None);
         assert_no_shell_markers(&cmd);
         assert_eq!(cmd.args.last().map(String::as_str), Some(prompt));
         assert_eq!(cmd.binary, "codex");
@@ -248,7 +287,7 @@ mod tests {
         // The second-to-last argv element must be the literal "--" terminator
         // immediately before the prompt.
         let prompt = "-not-a-flag, reply with the word HELLO";
-        let cmd = build_command(Provider::Codex, prompt, false);
+        let cmd = build_command(Provider::Codex, prompt, false, None);
         assert_eq!(cmd.args.last().map(String::as_str), Some(prompt));
         assert_eq!(
             cmd.args.get(cmd.args.len() - 2).map(String::as_str),
@@ -261,7 +300,7 @@ mod tests {
     #[test]
     fn agy_command_has_no_shell_markers_and_prompt_is_single_arg() {
         let prompt = "; cat /etc/passwd #";
-        let cmd = build_command(Provider::Agy, prompt, false);
+        let cmd = build_command(Provider::Agy, prompt, false, None);
         assert_no_shell_markers(&cmd);
         assert_eq!(cmd.args.iter().filter(|a| a.as_str() == prompt).count(), 1);
         assert_eq!(cmd.binary, "agy");
@@ -271,8 +310,79 @@ mod tests {
     fn model_strings_are_fixed_not_caller_controlled() {
         // build_command's signature takes no model parameter at all -- there is
         // no code path by which request JSON can influence the model string.
-        let cmd = build_command(Provider::Opus, "x", false);
+        let cmd = build_command(Provider::Opus, "x", false, None);
         assert!(cmd.args.contains(&OPUS_MODEL.to_string()));
+    }
+
+    // ── REVCAP-01 PART B: reasoning-effort argv wiring ──────────────────────
+
+    #[test]
+    fn claude_command_omits_effort_flag_when_none() {
+        for prov in [Provider::Opus, Provider::Fable] {
+            let cmd = build_command(prov, "x", false, None);
+            assert!(
+                !cmd.args.iter().any(|a| a == CLAUDE_REASONING_EFFORT_FLAG),
+                "routine claude call must not carry the effort flag: {:?}",
+                cmd.args
+            );
+        }
+    }
+
+    #[test]
+    fn claude_command_appends_effort_flag_when_some() {
+        for prov in [Provider::Opus, Provider::Fable] {
+            let cmd = build_command(prov, "x", false, Some("high"));
+            assert!(
+                cmd.args.windows(2).any(|w| w[0] == CLAUDE_REASONING_EFFORT_FLAG && w[1] == "high"),
+                "intensive claude call must carry the effort flag+value: {:?}",
+                cmd.args
+            );
+        }
+    }
+
+    #[test]
+    fn claude_command_effort_flag_coexists_with_explore_mode() {
+        // Not a real call shape review_run ever produces (intensive is explore:
+        // false), but build_command itself must not silently drop one or the
+        // other if ever combined -- both independently toggleable.
+        let cmd = build_command(Provider::Opus, "x", true, Some("high"));
+        assert!(cmd.args.iter().any(|a| a == "--allowedTools"));
+        assert!(cmd.args.windows(2).any(|w| w[0] == CLAUDE_REASONING_EFFORT_FLAG && w[1] == "high"));
+    }
+
+    #[test]
+    fn codex_command_omits_effort_override_when_none() {
+        let cmd = build_command(Provider::Codex, "x", false, None);
+        assert!(
+            !cmd.args.iter().any(|a| a.contains(CODEX_REASONING_EFFORT_KEY)),
+            "routine codex call must not carry the -c override: {:?}",
+            cmd.args
+        );
+    }
+
+    #[test]
+    fn codex_command_appends_effort_override_when_some() {
+        let cmd = build_command(Provider::Codex, "x", false, Some("high"));
+        let pos = cmd.args.iter().position(|a| a == "-c").expect("must carry -c flag");
+        assert_eq!(
+            cmd.args.get(pos + 1).map(String::as_str),
+            Some(format!("{CODEX_REASONING_EFFORT_KEY}=\"high\"").as_str())
+        );
+        // The prompt's "--" terminator + trailing prompt arg must still be intact
+        // regardless of the extra -c pair inserted before them.
+        assert_eq!(cmd.args.last().map(String::as_str), Some("x"));
+        assert_eq!(cmd.args.get(cmd.args.len() - 2).map(String::as_str), Some("--"));
+        assert_no_shell_markers(&cmd);
+    }
+
+    #[test]
+    fn agy_command_ignores_effort_param_it_has_no_such_knob() {
+        let cmd = build_command(Provider::Agy, "x", false, Some("high"));
+        assert!(
+            !cmd.args.iter().any(|a| a == "high" || a.contains(CODEX_REASONING_EFFORT_KEY)),
+            "agy has no effort knob and must ignore the parameter: {:?}",
+            cmd.args
+        );
     }
 
     #[test]

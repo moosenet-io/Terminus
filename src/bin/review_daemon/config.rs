@@ -77,6 +77,30 @@ pub fn clamp_stall(requested: u64) -> u64 {
     requested.clamp(1, MAX_STALL_SECS)
 }
 
+/// REVCAP-01 PART B: the only reasoning-effort levels this daemon will forward
+/// into a spawned provider's argv. `reasoning_effort` ends up embedded directly
+/// in `codex exec`'s `-c model_reasoning_effort="<value>"` config-override value
+/// and the `claude` CLI's own effort flag value (see `provider::build_command`) --
+/// still a single, non-shell argv element (never shell-interpolated), but a
+/// closed allowlist here means a caller-supplied string can never smuggle an
+/// unexpected quote/value into that provider-specific config syntax, mirroring
+/// this module's existing "closed set, never derived from raw request input"
+/// invariant for provider/binary/model (see `provider.rs`'s module doc).
+pub const ALLOWED_REASONING_EFFORTS: &[&str] = &["low", "medium", "high"];
+
+/// Validate a caller-supplied `reasoning_effort` against
+/// [`ALLOWED_REASONING_EFFORTS`]. Anything absent, blank, or not an exact
+/// (case-insensitive) match is dropped to `None` -- fails closed to "no effort
+/// override" (the pre-PART-B argv shape) rather than forwarding an
+/// unrecognized value into the provider's own config-parsing.
+pub fn clamp_reasoning_effort(requested: Option<&str>) -> Option<String> {
+    let level = requested?.trim();
+    ALLOWED_REASONING_EFFORTS
+        .iter()
+        .find(|allowed| allowed.eq_ignore_ascii_case(level))
+        .map(|allowed| allowed.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +168,30 @@ mod tests {
         assert_eq!(clamp_stall(0), 1); // never disable the guard
         assert_eq!(clamp_stall(180), 180);
         assert_eq!(clamp_stall(999_999), MAX_STALL_SECS);
+    }
+
+    #[test]
+    fn clamp_reasoning_effort_passes_through_allowed_levels() {
+        assert_eq!(clamp_reasoning_effort(Some("high")), Some("high".to_string()));
+        assert_eq!(clamp_reasoning_effort(Some("low")), Some("low".to_string()));
+        assert_eq!(clamp_reasoning_effort(Some("medium")), Some("medium".to_string()));
+    }
+
+    #[test]
+    fn clamp_reasoning_effort_normalizes_case() {
+        assert_eq!(clamp_reasoning_effort(Some("HIGH")), Some("high".to_string()));
+    }
+
+    #[test]
+    fn clamp_reasoning_effort_drops_absent_blank_or_unrecognized_to_none() {
+        assert_eq!(clamp_reasoning_effort(None), None);
+        assert_eq!(clamp_reasoning_effort(Some("")), None);
+        assert_eq!(clamp_reasoning_effort(Some("   ")), None);
+        // Not a recognized level -- and, load-bearing: an attempted injection
+        // via a quote character must never pass through into the provider's
+        // own -c/flag value unrecognized.
+        assert_eq!(clamp_reasoning_effort(Some("high\" extra=\"evil")), None);
+        assert_eq!(clamp_reasoning_effort(Some("ultra")), None);
     }
 
     #[test]

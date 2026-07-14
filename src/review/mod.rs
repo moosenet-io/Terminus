@@ -739,6 +739,31 @@ fn role_for(structure: Structure, index: usize) -> Role {
     }
 }
 
+/// REVCAP-01 PART B: whether `provider` is currently STANDING IN for a down
+/// frontier reviewer -- i.e. `provider` is itself an up FRONTIER provider
+/// (opus/codex/agy) while at least one OTHER frontier provider is down
+/// (Shelved, or Cooldown not yet elapsed per [`capacity::ReviewerStatus::is_down`]).
+/// Reuses the exact "an up frontier alternate exists" definition PART A's own
+/// `capacity_substitutions` annotation (in `execute()`, above) already
+/// established for this codebase, rather than inventing a second notion of
+/// "substitute". A non-frontier provider (nemotron/qwen_coder/free/gpt56) is
+/// NEVER intensive-eligible -- only opus/codex/agy can stand in for each other.
+/// `provider` itself being down does NOT count (that's just the requested,
+/// degrading provider -- not a substitute for anything). Backward compatible:
+/// on an empty/healthy registry (nothing has ever recorded a cap) this is
+/// `false` for every provider, so a normal panel's dispatch opts are completely
+/// unaffected -- byte-for-byte the pre-PART-B behavior.
+fn is_intensive_substitute(provider: &str, now: std::time::SystemTime) -> bool {
+    if !capacity::FRONTIER.contains(&provider) {
+        return false;
+    }
+    let reg = capacity::registry();
+    if reg.is_down(provider, now) {
+        return false;
+    }
+    capacity::FRONTIER.iter().any(|other| *other != provider && reg.is_down(other, now))
+}
+
 /// Route `provider` to the right transport (daemon / free-pool / direct
 /// OpenRouter) and return its raw reply text, or a human-readable
 /// `"unavailable: ..."` degrade reason. Single source (S9) for that routing
@@ -1019,14 +1044,36 @@ than failing the whole call."
             dispatch::DaemonOpts::routine()
         };
         for (idx, provider) in providers.iter().enumerate() {
-            let role = role_for(structure, idx);
+            let mut role = role_for(structure, idx);
+            // REVCAP-01 PART B: a provider standing in for a currently-DOWN
+            // frontier reviewer gets the INTENSIVE preset (raised effort + a
+            // longer wall-clock budget -- the proven fix for the 120s-timeout
+            // failure of a genuinely deep review) and the harder,
+            // refutation-first `IntensiveReviewer` role, instead of the
+            // structure's normal opts/role. Deliberately scoped to the plain
+            // panel roles (`Structure::Single`/`PanelMajority`/`PanelUnanimous`,
+            // where `role_for` returns `Role::Reviewer`) -- `AdversarialPair`'s
+            // defend/attack verdict sentinels (`APPROVE`/`REQUEST_CHANGES` vs.
+            // `REFUTED`/`NOT_REFUTED`) are load-bearing for
+            // `aggregate_adversarial_pair`, and the Epic capstone already runs
+            // every provider in its own explore+long-budget `epic()` preset --
+            // overriding either would change verdict semantics or double-apply
+            // intensity, not "review harder". Any panel where no frontier is
+            // down (the common case, and every pre-PART-B call site) is
+            // completely unaffected: `is_intensive_substitute` is `false` for
+            // every provider, so this is a no-op there.
+            let opts = if role == Role::Reviewer && is_intensive_substitute(provider, now) {
+                role = Role::IntensiveReviewer;
+                dispatch::DaemonOpts::intensive()
+            } else {
+                daemon_opts.clone()
+            };
             let prompt_text = build_prompt(role, &criteria, &context);
             let cfg = cfg.clone();
             let provider = provider.clone();
             let provider_for_map = provider.clone();
-            let daemon_opts = daemon_opts.clone();
             let handle = set.spawn(async move {
-                let result = run_one_provider(cfg, provider, prompt_text, daemon_opts).await;
+                let result = run_one_provider(cfg, provider, prompt_text, opts).await;
                 (idx, result)
             });
             id_to_slot.insert(handle.id(), (idx, provider_for_map));
@@ -2440,5 +2487,104 @@ mod tests {
         assert_eq!(codex["status"], "available", "{codex}");
 
         capacity::registry().update("agy", |s| s.mark_success());
+    }
+
+    // ── REVCAP-01 PART B: intensive-substitute per-provider selection ──────
+    //
+    // `#[serial_test::serial]`, same reason as the PART A section above: these
+    // mutate the process-global `capacity::registry()` singleton.
+
+    #[test]
+    #[serial_test::serial]
+    fn is_intensive_substitute_true_for_an_up_frontier_peer_of_a_down_frontier() {
+        capacity::registry().update("codex", |s| s.mark_success());
+        capacity::registry().update("agy", |s| s.mark_success());
+        capacity::registry().update("opus", |s| s.mark_success());
+        let now = std::time::SystemTime::now();
+        capacity::registry().update("codex", |s| s.mark_rate_limited(Some(3000), now, "shelved"));
+
+        // opus and agy are both up frontier providers while codex is down ->
+        // either is eligible to review harder in codex's place.
+        assert!(is_intensive_substitute("opus", now), "opus should substitute for shelved codex");
+        assert!(is_intensive_substitute("agy", now), "agy should substitute for shelved codex");
+
+        capacity::registry().update("codex", |s| s.mark_success());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn is_intensive_substitute_false_for_the_down_provider_itself() {
+        capacity::registry().update("codex", |s| s.mark_success());
+        capacity::registry().update("agy", |s| s.mark_success());
+        let now = std::time::SystemTime::now();
+        capacity::registry().update("codex", |s| s.mark_rate_limited(Some(3000), now, "shelved"));
+
+        // A down provider dispatched anyway is not "standing in" for anything --
+        // it's just the requested, degrading provider.
+        assert!(!is_intensive_substitute("codex", now));
+
+        capacity::registry().update("codex", |s| s.mark_success());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn is_intensive_substitute_false_for_a_non_frontier_provider() {
+        capacity::registry().update("codex", |s| s.mark_success());
+        let now = std::time::SystemTime::now();
+        capacity::registry().update("codex", |s| s.mark_rate_limited(Some(3000), now, "shelved"));
+
+        // nemotron/qwen_coder/free/gpt56 are never frontier -- never intensive.
+        assert!(!is_intensive_substitute("nemotron", now));
+        assert!(!is_intensive_substitute("free", now));
+
+        capacity::registry().update("codex", |s| s.mark_success());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn is_intensive_substitute_false_on_an_empty_or_healthy_registry_backward_compat() {
+        capacity::registry().update("codex", |s| s.mark_success());
+        capacity::registry().update("agy", |s| s.mark_success());
+        capacity::registry().update("opus", |s| s.mark_success());
+        let now = std::time::SystemTime::now();
+
+        // Nothing down anywhere -> every provider (frontier or not) reads as a
+        // normal, non-substitute dispatch -- identical to pre-PART-B behavior.
+        assert!(!is_intensive_substitute("opus", now));
+        assert!(!is_intensive_substitute("codex", now));
+        assert!(!is_intensive_substitute("agy", now));
+        assert!(!is_intensive_substitute("nemotron", now));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn substitute_provider_is_dispatched_with_the_intensive_role_and_records_normally() {
+        // End-to-end through `execute()`: with codex shelved and opus/agy up, a
+        // panel of [codex, opus] must NOT hit the >=2-down capacity gate (only 1
+        // frontier down) and must proceed to dispatch -- opus (the up frontier
+        // peer) is the intensive substitute. No REVIEW_DAEMON_TOKEN is configured
+        // here, so both providers degrade on dispatch (no real subprocess is
+        // spawned, per this task's hard contract) -- this test asserts the run
+        // completes normally (no capacity pause) and codex's degrade is recorded
+        // as a plain dispatch error, exactly like the PART A behavior it builds
+        // on; the opts/role selection itself is covered directly by the
+        // `is_intensive_substitute` unit tests above (dispatch internals are not
+        // observable without a real daemon).
+        capacity::registry().update("codex", |s| s.mark_success());
+        capacity::registry().update("agy", |s| s.mark_success());
+        capacity::registry().update("opus", |s| s.mark_success());
+        let now = std::time::SystemTime::now();
+        capacity::registry().update("codex", |s| s.mark_rate_limited(Some(3000), now, "shelved"));
+
+        std::env::remove_var("REVIEW_DAEMON_TOKEN");
+        let args = json!({"structure": "panel_majority", "providers": ["codex", "opus"], "criteria": "x"});
+        let out = tool().execute(args).await.unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+
+        assert_ne!(v["aggregate_verdict"], "CAPACITY_PAUSED", "{v}");
+        assert!(v["capacity_paused"].is_null(), "{v}");
+        assert_eq!(v["providers"].as_array().unwrap().len(), 2, "{v}");
+
+        capacity::registry().update("codex", |s| s.mark_success());
     }
 }
