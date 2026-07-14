@@ -230,7 +230,7 @@ mod tests {
     #[test]
     fn epic_capstone_verdict_is_advisory_majority() {
         // Epic aggregates as a fail-safe majority (its verdict is advisory; the
-        // capstone never gates a merge — see `should_run_post_hooks`).
+        // capstone never gates a merge — see `should_run_kg_rebuild`).
         let all_approve = vec![ok("opus", "APPROVE"), ok("codex", "APPROVE"), ok("agy", "APPROVE")];
         assert_eq!(aggregate(Structure::Epic, &all_approve), ("APPROVE".to_string(), true));
         // Findings from a majority ⇒ advisory REQUEST_CHANGES, still "complete".
