@@ -196,6 +196,11 @@ pub struct JobRequest {
     pub priority: Priority,
     pub heavy: bool,
     pub ready: bool,
+    /// Optional cargo `--bin` target to build (BLD/TERM #360). `None` ⇒ the build
+    /// defaults `--bin <module>`; set it when the deployable binary's name differs
+    /// from the module name (e.g. module `terminus` → bin `terminus_primary`), so
+    /// the AUTOMATED queue path can build such modules without an inline override.
+    pub bin: Option<String>,
 }
 
 /// Outcome of an [`QueueStore::enqueue`].
@@ -217,6 +222,9 @@ pub struct QueuedJob {
     pub git_ref: String,
     pub priority: Priority,
     pub heavy: bool,
+    /// The cargo `--bin` target carried from the enqueue request (BLD/TERM #360).
+    /// `None` ⇒ the executor defaults `--bin <module>`.
+    pub bin: Option<String>,
 }
 
 /// Why a [`QueueStore::claim`] did not take the job.
@@ -530,6 +538,7 @@ fn host_set_key(host: HostRole) -> String {
 /// Enqueue with dedupe/coalesce/promote. Returns `{job_id, created(0/1)}`.
 /// KEYS: 1=dedupe 2=zset 3=seq
 /// ARGV: 1=candidate_id 2=prank 3=now 4=job_prefix 5=module 6=ref 7=prio_label
+///       8=heavy 9=ready 10=held_ttl 11=bin(''=none)
 ///       8=heavy(0/1) 9=ready(0/1) 10=held_ttl_secs
 const ENQUEUE_LUA: &str = r#"
 local dedupe=KEYS[1]
@@ -542,12 +551,17 @@ local jp=ARGV[4]
 local heavy=ARGV[8]
 local ready=ARGV[9]
 local held_ttl=tonumber(ARGV[10])
+local bin=ARGV[11]
 local existing=redis.call('GET', dedupe)
 if existing then
   local jk=jp..existing
   local st=redis.call('HGET', jk, 'state')
   if st=='queued' or st=='held' then
     redis.call('HINCRBY', jk, 'coalesced', 1)
+    -- BLD/TERM #360: a later request may supply the cargo bin a binless job lacked
+    -- (or correct it). bin is a deterministic property of module@ref, so adopt any
+    -- non-empty incoming value; the scheduler then builds the right binary.
+    if bin~='' then redis.call('HSET', jk, 'bin', bin) end
     local cur=tonumber(redis.call('HGET', jk, 'prank') or '0')
     if prank>cur then
       redis.call('HSET', jk, 'prank', prank, 'priority', ARGV[7])
@@ -584,6 +598,10 @@ if existing then
       redis.call('HSET', jk, 'rerun', '1')
     end
     redis.call('HINCRBY', jk, 'coalesced', 1)
+    -- BLD/TERM #360: adopt a non-empty incoming bin on the CURRENT job hash so the
+    -- rerun that `release` clones from it carries the correct (possibly newly
+    -- supplied) cargo bin, not a stale/absent one.
+    if bin~='' then redis.call('HSET', jk, 'bin', bin) end
     local cur=tonumber(redis.call('HGET', jk, 'prank') or '0')
     if prank>cur then
       redis.call('HSET', jk, 'prank', prank, 'priority', ARGV[7])
@@ -600,7 +618,7 @@ local state='held'
 if ready=='1' then state='queued' end
 redis.call('HSET', jk, 'module', ARGV[5], 'ref', ARGV[6], 'prank', prank,
   'priority', ARGV[7], 'heavy', heavy, 'seq', seq, 'requested_at', now,
-  'coalesced', 1, 'state', state)
+  'coalesced', 1, 'state', state, 'bin', ARGV[11])
 redis.call('SET', dedupe, id)
 if ready=='1' then
   local score=seq-(prank*1000000000000)
@@ -686,12 +704,13 @@ if rerun=='1' then
   local prank=tonumber(redis.call('HGET', jobkey, 'prank') or '1')
   local prio=redis.call('HGET', jobkey, 'priority') or 'normal'
   local heavy=redis.call('HGET', jobkey, 'heavy') or '0'
+  local bin=redis.call('HGET', jobkey, 'bin') or ''
   local seq=redis.call('INCR', seqkey)
   rr_id=rerun_id
   local njk=jobprefix..rr_id
   redis.call('HSET', njk, 'module', module, 'ref', ref, 'prank', prank,
     'priority', prio, 'heavy', heavy, 'seq', seq, 'requested_at', nowv,
-    'coalesced', 1, 'state', 'queued')
+    'coalesced', 1, 'state', 'queued', 'bin', bin)
   if dedupe then redis.call('SET', dedupe, rr_id) end
   local score=seq-(prank*1000000000000)
   redis.call('ZADD', zsetkey, score, rr_id)
@@ -736,8 +755,8 @@ return {{rr_flag, rr_id}}
     )
 }
 
-/// Peek the top-N dispatchable jobs, flattened as 5 fields each:
-/// `id, module, ref, prank, heavy`.
+/// Peek the top-N dispatchable jobs, flattened as 6 fields each:
+/// `id, module, ref, prank, heavy, bin`.
 /// KEYS: 1=zset  ARGV: 1=limit 2=job_prefix
 const PEEK_LUA: &str = r#"
 local ids=redis.call('ZRANGE', KEYS[1], 0, tonumber(ARGV[1])-1)
@@ -749,6 +768,7 @@ for _, id in ipairs(ids) do
   out[#out+1]=redis.call('HGET', jk, 'ref') or ''
   out[#out+1]=redis.call('HGET', jk, 'prank') or '0'
   out[#out+1]=redis.call('HGET', jk, 'heavy') or '0'
+  out[#out+1]=redis.call('HGET', jk, 'bin') or ''
 end
 return out
 "#;
@@ -937,6 +957,8 @@ impl QueueStore for RedisQueue {
             (req.module.clone(), req.git_ref.clone(), req.priority.as_str());
         let (heavy, ready) = (req.heavy as i64, req.ready as i64);
         let held_ttl = held_intent_ttl_secs();
+        // BLD/TERM #360: carry the optional cargo bin (''=none) as ARGV[11].
+        let bin = req.bin.clone().unwrap_or_default();
         let script = redis::Script::new(ENQUEUE_LUA);
         let out: Result<(String, i64), ()> = self
             .backend
@@ -955,6 +977,7 @@ impl QueueStore for RedisQueue {
                     .arg(heavy)
                     .arg(ready)
                     .arg(held_ttl)
+                    .arg(bin)
                     .invoke_async::<_, (String, i64)>(&mut conn)
                     .await
             })
@@ -984,13 +1007,14 @@ impl QueueStore for RedisQueue {
             .await;
         match out {
             Ok(flat) => Ok(flat
-                .chunks_exact(5)
+                .chunks_exact(6)
                 .map(|c| QueuedJob {
                     job_id: c[0].clone(),
                     module: c[1].clone(),
                     git_ref: c[2].clone(),
                     priority: priority_from_rank(c[3].parse().unwrap_or(1)),
                     heavy: c[4] == "1",
+                    bin: Some(c[5].clone()).filter(|s| !s.is_empty()),
                 })
                 .collect()),
             Err(()) => Err(QueueError::Unavailable),
@@ -1275,6 +1299,7 @@ pub(crate) mod fake {
         git_ref: String,
         prank: i64,
         heavy: bool,
+        bin: Option<String>,
         seq: i64,
         coalesced: i64,
         state: String, // held | queued | building | done | failed
@@ -1437,10 +1462,11 @@ pub(crate) mod fake {
                 j.prank,
                 j.heavy,
                 j.rerun,
+                j.bin.clone(),
             ),
             None => return,
         };
-        let (dmod, dref, dhost, dprank, dheavy, rerun) = done;
+        let (dmod, dref, dhost, dprank, dheavy, rerun, dbin) = done;
         // Derive the module lock + host slot from the STORED fields.
         if s.module_lock.get(&dmod).map(String::as_str) == Some(job_id) {
             s.module_lock.remove(&dmod);
@@ -1467,6 +1493,7 @@ pub(crate) mod fake {
                     git_ref: dref,
                     prank: dprank,
                     heavy: dheavy,
+                    bin: dbin,
                     seq,
                     coalesced: 1,
                     state: "queued".into(),
@@ -1509,6 +1536,10 @@ pub(crate) mod fake {
                         if req.heavy {
                             j.heavy = true;
                         }
+                        // BLD/TERM #360: adopt a non-empty incoming bin (mirrors ENQUEUE_LUA).
+                        if req.bin.is_some() {
+                            j.bin = req.bin.clone();
+                        }
                         if req.ready && j.state == "held" {
                             j.state = "queued".into();
                         }
@@ -1532,6 +1563,11 @@ pub(crate) mod fake {
                         if req.heavy {
                             j.heavy = true;
                         }
+                        // BLD/TERM #360: adopt a non-empty incoming bin so the rerun
+                        // cloned by release carries it (mirrors ENQUEUE_LUA).
+                        if req.bin.is_some() {
+                            j.bin = req.bin.clone();
+                        }
                         return Ok(Enqueued {
                             job_id: existing,
                             created: false,
@@ -1551,6 +1587,7 @@ pub(crate) mod fake {
                     git_ref: req.git_ref.clone(),
                     prank: req.priority.rank(),
                     heavy: req.heavy,
+                    bin: req.bin.clone(),
                     seq,
                     coalesced: 1,
                     state: if req.ready { "queued".into() } else { "held".into() },
@@ -1587,6 +1624,7 @@ pub(crate) mod fake {
                     git_ref: j.git_ref.clone(),
                     priority: priority_from_rank(j.prank),
                     heavy: j.heavy,
+                    bin: j.bin.clone(),
                 })
                 .collect())
         }
@@ -1827,6 +1865,7 @@ mod tests {
 
     fn req(module: &str, git_ref: &str, prio: Priority, heavy: bool) -> JobRequest {
         JobRequest {
+            bin: None,
             module: module.into(),
             git_ref: git_ref.into(),
             priority: prio,
@@ -1989,6 +2028,80 @@ mod tests {
         let b = q.enqueue(&req("m", "r", Priority::Normal, false)).await.unwrap();
         assert_eq!(a.job_id, b.job_id);
         assert_eq!(q.peek(10).await.unwrap().len(), 1, "promoted to dispatchable");
+    }
+
+    // BLD/TERM #360: a fresh request carries its cargo bin onto the queued job, and
+    // `peek` surfaces it so the scheduler builds the right binary.
+    #[tokio::test]
+    async fn enqueue_carries_bin_to_peek() {
+        let q = InMemoryQueue::new();
+        let jr = JobRequest {
+            bin: Some("terminus_primary".into()),
+            ..req("terminus", "main", Priority::Normal, false)
+        };
+        q.enqueue(&jr).await.unwrap();
+        let queued = q.peek(10).await.unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].bin.as_deref(), Some("terminus_primary"));
+    }
+
+    // BLD/TERM #360 (the review-caught coalesce gap): a binless job that already
+    // exists (queued OR held) must ADOPT a bin supplied by a later coalescing
+    // request — otherwise the scheduler builds `--bin <module>` and fails.
+    #[tokio::test]
+    async fn coalesce_adopts_later_supplied_bin() {
+        let q = InMemoryQueue::new();
+        // 1) queued-state coalesce.
+        let a = q.enqueue(&req("terminus", "main", Priority::Normal, false)).await.unwrap();
+        assert_eq!(q.peek(10).await.unwrap()[0].bin, None, "no bin yet");
+        let with_bin = JobRequest {
+            bin: Some("terminus_primary".into()),
+            ..req("terminus", "main", Priority::Normal, false)
+        };
+        let b = q.enqueue(&with_bin).await.unwrap();
+        assert_eq!(a.job_id, b.job_id, "coalesced onto the same job");
+        assert_eq!(
+            q.peek(10).await.unwrap()[0].bin.as_deref(),
+            Some("terminus_primary"),
+            "queued coalesce must adopt the later-supplied bin"
+        );
+
+        // 2) held→ready coalesce also adopts a bin arriving with the promotion.
+        let q2 = InMemoryQueue::new();
+        let held = JobRequest { ready: false, ..req("terminus", "dev", Priority::Normal, false) };
+        q2.enqueue(&held).await.unwrap();
+        let promote = JobRequest {
+            bin: Some("terminus_primary".into()),
+            ..req("terminus", "dev", Priority::Normal, false)
+        };
+        q2.enqueue(&promote).await.unwrap();
+        let queued = q2.peek(10).await.unwrap();
+        assert_eq!(queued.len(), 1, "promoted to dispatchable");
+        assert_eq!(queued[0].bin.as_deref(), Some("terminus_primary"));
+    }
+
+    // BLD/TERM #360: a bin supplied while the job is BUILDING must reach the
+    // coalesced re-run (release clones the current hash's bin).
+    #[tokio::test]
+    async fn rerun_carries_bin_supplied_while_building() {
+        let q = InMemoryQueue::new();
+        let a = q.enqueue(&req("terminus", "main", Priority::Normal, false)).await.unwrap();
+        let tok = claim_ok(&q, &a.job_id, "terminus", HostRole::Primary, 4).await;
+        // A later ready request WITH a bin arrives while building → schedules a rerun
+        // AND records the bin on the building job.
+        let with_bin = JobRequest {
+            bin: Some("terminus_primary".into()),
+            ..req("terminus", "main", Priority::Normal, false)
+        };
+        q.enqueue(&with_bin).await.unwrap();
+        q.complete(&a.job_id, "terminus", HostRole::Primary, JobState::Done, &tok).await.unwrap();
+        let queued = q.peek(10).await.unwrap();
+        assert_eq!(queued.len(), 1, "one coalesced re-run");
+        assert_eq!(
+            queued[0].bin.as_deref(),
+            Some("terminus_primary"),
+            "the re-run must carry the bin supplied while building"
+        );
     }
 
     #[tokio::test]
@@ -2503,6 +2616,7 @@ mod tests {
             priority: p,
             heavy,
             ready,
+            bin: None,
         };
 
         // 1) Dedupe/coalesce + monotonic priority bump (real ENQUEUE_LUA).
@@ -2512,6 +2626,21 @@ mod tests {
         let queued = q.peek(10).await.unwrap();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].priority, Priority::High, "priority bumped in-place");
+        assert_eq!(queued[0].bin, None, "no bin supplied yet");
+
+        // 1b) BLD/TERM #360 against the REAL ENQUEUE_LUA: a later coalescing request
+        // that supplies a cargo bin updates the binless job's hash field (HSET in the
+        // queued/held coalesce arm), and PEEK_LUA surfaces it (6th field).
+        let with_bin = JobRequest {
+            bin: Some("chord".into()),
+            ..mk("chord", "abc", Priority::High, false, true)
+        };
+        q.enqueue(&with_bin).await.unwrap();
+        assert_eq!(
+            q.peek(10).await.unwrap()[0].bin.as_deref(),
+            Some("chord"),
+            "real ENQUEUE_LUA coalesce must adopt the later-supplied bin"
+        );
 
         // 2) Keys live under the Namespace::Queue prefix in the durable DB 0.
         let keys: Vec<String> = raw(&backend, "KEYS", &["queue:*".into()]).await;
@@ -2618,6 +2747,7 @@ mod tests {
             priority: Priority::Normal,
             heavy: false,
             ready: true,
+            bin: None,
         };
         let j1 = q.enqueue(&mk("r1")).await.unwrap();
         let j2 = q.enqueue(&mk("r2")).await.unwrap();

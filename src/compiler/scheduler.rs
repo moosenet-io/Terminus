@@ -315,7 +315,7 @@ pub struct CompilerBuildExecutor;
 #[async_trait]
 impl BuildExecutor for CompilerBuildExecutor {
     async fn build(&self, job: &QueuedJob) -> Result<(), String> {
-        super::invoke_build(&job.module, &job.git_ref, job.heavy)
+        super::invoke_build(&job.module, &job.git_ref, job.heavy, job.bin.as_deref())
             .await
             .map_err(|e| e.to_string())
     }
@@ -738,6 +738,7 @@ mod tests {
             priority: Priority::Normal,
             heavy,
             ready: true,
+            bin: None,
         }
     }
 
