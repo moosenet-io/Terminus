@@ -62,6 +62,20 @@ pub enum Role {
     /// The "attack" side of an adversarial pair -- explicitly instructed to try
     /// to refute the change / find rejection reasons.
     Attack,
+    /// REVCAP-01 PART B: an INTENSIVE-SUBSTITUTE reviewer -- this provider is
+    /// standing in for a currently-DOWN frontier reviewer (codex/agy/opus) and
+    /// must review HARDER than parity, per the operator's explicit ask.
+    /// Refutation-first, single-deep-pass framing (deliberately NOT the
+    /// `Attack` role's two-sided-debate framing, and NOT a literal 2-pass
+    /// self-critique loop -- that shape is what timed out at the routine 120s
+    /// daemon backstop in the incident that motivated this; a longer
+    /// [`crate::review::dispatch::DaemonOpts::intensive`] budget plus a
+    /// deliberately harder single pass is the safer shape under a time limit).
+    /// Still emits a plain `VERDICT: APPROVE`/`REQUEST_CHANGES` line (like
+    /// [`Role::Reviewer`]), NOT `Attack`'s `REFUTED`/`NOT_REFUTED` pair, so this
+    /// substitute's verdict aggregates into the SAME panel as every other
+    /// non-substitute member without special-casing `aggregate()`.
+    IntensiveReviewer,
 }
 
 /// Build the review prompt for one provider: role framing + criteria +
@@ -125,6 +139,29 @@ VERDICT: APPROVE\n\
 or\n\
 VERDICT: REQUEST_CHANGES\n\
 (if you surfaced material findings for follow-up — this is ADVISORY, it does not revert the build)\n"
+        ),
+        Role::IntensiveReviewer => format!(
+            "You are an INTENSIVE substitute reviewer, standing in for a frontier reviewer that is \
+currently unavailable (rate-limited or shelved). Because adversarial coverage is reduced for this \
+review, you must review HARDER than a normal single pass: actively try to REFUTE this change before \
+you approve it. Work through this checklist and only reach VERDICT: APPROVE if the change survives \
+every step with no surviving counterexample:\n\
+1. Try to construct a concrete input, sequence, or edge case that breaks the change.\n\
+2. Check every claim in the change's own reasoning/comments against the actual code -- do not take \
+stated intent at face value.\n\
+3. Look for what the criteria below does NOT explicitly cover, and check the change is still correct \
+there (silent gaps are not passes).\n\
+4. Only if you worked through 1-3 and found no valid, concrete counterexample, approve.\n\n\
+{kg_pointer}\
+Criteria to check against:\n{criteria}\n\n\
+Context (diff/files/description):\n{context_str}\n\n\
+Give your reasoning (including what you tried to break and why it held, or what you found), then end \
+your response with EXACTLY one line, verbatim:\n\
+VERDICT: APPROVE\n\
+(only if no counterexample survived your attempt to refute it)\n\
+or\n\
+VERDICT: REQUEST_CHANGES\n\
+(if you found a valid, concrete issue)\n"
         ),
         Role::Attack => format!(
             "You are ATTACKING this change. Your job is to actively try to REFUTE it: find every \
@@ -379,6 +416,29 @@ mod tests {
         assert!(p.contains("VERDICT: APPROVE"));
         assert!(p.contains("VERDICT: REQUEST_CHANGES"));
         assert!(!p.to_uppercase().contains("REFUTED"));
+    }
+
+    #[test]
+    fn intensive_reviewer_prompt_instructs_refutation_first_and_uses_reviewer_sentinel() {
+        let ctx = json!({"diff": "+ fn foo() {}"});
+        let p = build_prompt(Role::IntensiveReviewer, "must compile", &ctx);
+        assert!(p.to_uppercase().contains("REFUTE"), "must instruct refutation attempts");
+        assert!(p.contains("must compile"));
+        assert!(p.contains("fn foo()"));
+        // Same VERDICT sentinel as Role::Reviewer (APPROVE/REQUEST_CHANGES), NOT
+        // Attack's REFUTED/NOT_REFUTED -- so this substitute's verdict aggregates
+        // into the same panel as any other member without special-casing.
+        assert!(p.contains("VERDICT: APPROVE"));
+        assert!(p.contains("VERDICT: REQUEST_CHANGES"));
+        assert!(!p.contains("VERDICT: REFUTED"));
+        assert!(!p.contains("VERDICT: NOT_REFUTED"));
+    }
+
+    #[test]
+    fn intensive_reviewer_prompt_also_carries_the_findings_instruction() {
+        let ctx = json!({});
+        let p = build_prompt(Role::IntensiveReviewer, "criteria", &ctx);
+        assert!(p.contains("FINDINGS_JSON:"));
     }
 
     #[test]
