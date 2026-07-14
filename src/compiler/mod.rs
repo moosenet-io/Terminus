@@ -613,6 +613,16 @@ async fn run(
     for (k, v) in env {
         cmd.env(k, v);
     }
+    // BLD/TERM #359: drop the ambient full `SCCACHE_REDIS` URL from the child env.
+    // sccache::resolve reads it from THIS process (materialized from the vault) and
+    // exports the SPLIT form (`SCCACHE_REDIS_ENDPOINT` + `_PASSWORD` + `_DB`) into the
+    // build scope; but `systemd-run --scope` also INHERITS this process's env, so the
+    // raw URL would leak in alongside the split endpoint — and sccache 0.10's opendal
+    // backend hard-errors "Only one of `endpoint`, `cluster_endpoints`, `url` must be
+    // set", failing EVERY build. The URL is never the intended delivery (the split
+    // form carries endpoint+auth), so removing it here is always safe and leaves the
+    // split form as the single, unambiguous redis config.
+    cmd.env_remove("SCCACHE_REDIS");
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     // Own process group (pgid == child pid) so a timeout can signal the whole
@@ -1987,12 +1997,23 @@ fn classify_heavy_auto(fast: bool, peak: Option<Option<u64>>, threshold: Option<
 /// `compiler_build` with the host the scheduler selected (heavy vs primary). A
 /// thin wrapper so `scheduler::CompilerBuildExecutor` need not know the tool's
 /// arg shape.
-pub(crate) async fn invoke_build(module: &str, git_ref: &str, heavy: bool) -> Result<(), ToolError> {
-    let args = json!({
+pub(crate) async fn invoke_build(
+    module: &str,
+    git_ref: &str,
+    heavy: bool,
+    bin: Option<&str>,
+) -> Result<(), ToolError> {
+    let mut args = json!({
         "module": module,
         "ref": git_ref,
         "host": if heavy { "heavy" } else { "primary" },
     });
+    // BLD/TERM #360: forward the queued bin override so the automated path can build
+    // a module whose cargo bin name differs from the module name (e.g. terminus →
+    // terminus_primary). Absent ⇒ compiler_build defaults `--bin <module>`.
+    if let Some(b) = bin.filter(|b| !b.is_empty()) {
+        args["bin"] = json!(b);
+    }
     CompilerBuild.execute_structured(args).await.map(|_| ())
 }
 
@@ -2049,6 +2070,10 @@ impl RustTool for CompilerRequest {
                     "type": "boolean",
                     "default": true,
                     "description": "true → dispatchable now; false → record the intent as held until a later ready=true request promotes it."
+                },
+                "bin": {
+                    "type": "string",
+                    "description": "Optional cargo --bin target. Defaults to the module name; set it when the deployable binary's name differs from the module (e.g. module 'terminus' → bin 'terminus_primary')."
                 }
             },
             "required": ["module", "ref"]
@@ -2073,6 +2098,17 @@ impl RustTool for CompilerRequest {
         let fast = args.get("fast").and_then(Value::as_bool).unwrap_or(false);
         let ready = args.get("ready").and_then(Value::as_bool).unwrap_or(true);
         let heavy = request_is_heavy(host_req, &module, fast);
+        // BLD/TERM #360: optional cargo bin override, carried durably on the job so
+        // the scheduler builds the right binary for a module whose bin name differs
+        // from the module name. Validated as a path/target segment like `bin` in
+        // compiler_build. Absent ⇒ defaults `--bin <module>` at build time.
+        let bin = match args.get("bin").and_then(Value::as_str) {
+            Some(b) => {
+                validate_segment("bin", b)?;
+                Some(b.to_string())
+            }
+            None => None,
+        };
 
         let store = RedisQueue::from_env().ok_or_else(|| {
             ToolError::NotConfigured(
@@ -2088,6 +2124,7 @@ impl RustTool for CompilerRequest {
                 priority,
                 heavy,
                 ready,
+                bin,
             })
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;

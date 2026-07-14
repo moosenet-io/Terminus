@@ -2313,6 +2313,7 @@ mod tests {
             git_ref: "r".into(),
             priority: Priority::Normal,
             heavy: true,
+            bin: None,
         };
         let key = "BUILD_MODULE_PEAK_MB_BUDGETPROBE_UNIQZZ";
         // No per-module peak ⇒ falls back to the global default (7 GiB).
