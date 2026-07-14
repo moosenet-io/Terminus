@@ -251,6 +251,33 @@ fn cargo_build_argv(
     argv
 }
 
+/// Build the `cargo test` argv (pure — testable; a sibling of [`cargo_build_argv`]
+/// for BLD-COMPTEST's test/gate mode). Mirrors the build argv's `--locked` /
+/// profile / `--target` / `-j` / `--manifest-path` flags exactly (same
+/// reproducibility + CWD-independence guarantees — see `cargo_build_argv`'s
+/// doc), but tests the WHOLE crate/workspace at `manifest_path` rather than a
+/// single `--bin` target (a gate wants every test in the crate, not one binary's
+/// tests), and adds `--no-fail-fast` so a gate observes every failure in one run
+/// instead of stopping at the first (needed for the structured pass/fail +
+/// failing-test summary the gate returns).
+fn cargo_test_argv(profile: &str, triple: &str, jobs: u32, manifest_path: &str) -> Vec<String> {
+    let (profile_flags, _subdir) = profile_flags_and_subdir(profile);
+    let mut argv = vec![
+        "cargo".to_string(),
+        "test".to_string(),
+        "--locked".to_string(),
+    ];
+    argv.extend(profile_flags);
+    argv.push("--manifest-path".to_string());
+    argv.push(manifest_path.to_string());
+    argv.push("--target".to_string());
+    argv.push(triple.to_string());
+    argv.push("-j".to_string());
+    argv.push(jobs.to_string());
+    argv.push("--no-fail-fast".to_string());
+    argv
+}
+
 /// Force cargo to render its `N/M` progress bar EVEN on the piped (non-TTY)
 /// stdio the build runs under, so the live `{step,total}` progress the tap parses
 /// is actually emitted. `CARGO_TERM_PROGRESS_WHEN=always` renders the bar
@@ -268,6 +295,91 @@ fn inject_cargo_progress_env(build_env: &mut BTreeMap<String, String>) {
 fn built_bin_rel(triple: &str, profile: &str, bin: &str) -> PathBuf {
     let (_flags, subdir) = profile_flags_and_subdir(profile);
     PathBuf::from(triple).join(subdir).join(bin)
+}
+
+/// Structured summary parsed (best-effort) from `cargo test --no-fail-fast`
+/// output — the format cargo has printed a `test result: ok|FAILED. N passed; M
+/// failed; ...` line in since 1.0, one per test binary (a crate/workspace run
+/// prints several; this sums them). Also captures the FAILING test names (from
+/// `test <name> ... FAILED` lines) for the gate's failure summary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CargoTestSummary {
+    passed: u32,
+    failed: u32,
+    ignored: u32,
+    measured: u32,
+    filtered_out: u32,
+    /// Names of individually failing tests, sorted + deduped.
+    failing_tests: Vec<String>,
+    /// Whether at least one `test result:` line was found. Distinguishes "ran
+    /// zero tests, all fine" from "cargo never reached a summary at all" (e.g. a
+    /// compile error before any test binary ran) — the latter is never a pass,
+    /// regardless of the process exit status.
+    summary_found: bool,
+}
+
+impl CargoTestSummary {
+    /// The gate PASSES iff at least one summary line was found and it reports
+    /// zero failures. A run with no summary line at all (a compile error, or the
+    /// harness crashing before any test binary printed its result) is a FAIL.
+    fn all_passed(&self) -> bool {
+        self.summary_found && self.failed == 0
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "summary_found": self.summary_found,
+            "passed": self.passed,
+            "failed": self.failed,
+            "ignored": self.ignored,
+            "measured": self.measured,
+            "filtered_out": self.filtered_out,
+            "failing_tests": self.failing_tests,
+        })
+    }
+}
+
+fn cargo_test_result_regex() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(
+            r"test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out",
+        )
+        .expect("cargo test result regex")
+    })
+}
+
+fn cargo_test_failed_line_regex() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"^test (\S+) \.\.\. FAILED$").expect("cargo test FAILED-line regex")
+    })
+}
+
+/// Parse cargo's `test result: ...` summary line(s) + individual `... FAILED`
+/// lines out of a `cargo test` run's (already-redacted) combined stdout+stderr.
+/// Pure — testable without spawning cargo.
+fn parse_cargo_test_output(output: &str) -> CargoTestSummary {
+    let result_re = cargo_test_result_regex();
+    let failed_re = cargo_test_failed_line_regex();
+
+    let mut summary = CargoTestSummary::default();
+    for cap in result_re.captures_iter(output) {
+        summary.summary_found = true;
+        summary.passed += cap[1].parse::<u32>().unwrap_or(0);
+        summary.failed += cap[2].parse::<u32>().unwrap_or(0);
+        summary.ignored += cap[3].parse::<u32>().unwrap_or(0);
+        summary.measured += cap[4].parse::<u32>().unwrap_or(0);
+        summary.filtered_out += cap[5].parse::<u32>().unwrap_or(0);
+    }
+    for line in output.lines() {
+        if let Some(cap) = failed_re.captures(line.trim()) {
+            summary.failing_tests.push(cap[1].to_string());
+        }
+    }
+    summary.failing_tests.sort();
+    summary.failing_tests.dedup();
+    summary
 }
 
 /// Replace every non-empty secret value in `text` with a fixed placeholder, so a
@@ -711,6 +823,95 @@ async fn run(
     }
 }
 
+/// Like [`run`], but for a **test-mode** (`mode=test`) build: a non-zero exit is
+/// an EXPECTED outcome (failing tests), not an execution error. Returns
+/// `(success, combined_redacted_output)` on ANY exit status — the combined,
+/// redacted stdout+stderr — so a `mode=test` caller can parse the `cargo test`
+/// summary regardless of pass/fail. This is deliberately NOT built on top of
+/// [`run`]: `run()` discards stdout entirely on a non-zero exit (fine for a
+/// build's error tail — a build failure has nothing useful on stdout — but wrong
+/// here, since cargo prints its `test result: ...` summary to STDOUT even when
+/// tests fail). Spawn/timeout/IO failures still return `Err` — those are genuine
+/// execution errors, not a test result, and are handled identically to `run()`.
+async fn run_test(
+    argv: &[String],
+    cwd: Option<&std::path::Path>,
+    env: &BTreeMap<String, String>,
+    timeout: Duration,
+    redact: &[String],
+    remote_kill: Option<&RemoteScopeKill>,
+    tap: Option<&events::BuildTap>,
+) -> Result<(bool, String), ToolError> {
+    if argv.is_empty() {
+        return Err(ToolError::Execution("empty command".into()));
+    }
+    let mut cmd = tokio::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    // Same rationale as `run()`: drop the ambient full SCCACHE_REDIS URL from the
+    // child env — the split form (endpoint/password/db) is the intended delivery.
+    cmd.env_remove("SCCACHE_REDIS");
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.process_group(0);
+    cmd.kill_on_drop(true);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| ToolError::Execution(format!("spawn {}: {e}", argv[0])))?;
+    let pgid = child.id().map(|p| p as libc::pid_t);
+
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let out_tap = tap.cloned();
+    let out_redact = redact.to_vec();
+    let stdout_task =
+        tokio::spawn(async move { drain_pipe(stdout_pipe.take(), out_tap, out_redact).await });
+    let err_tap = tap.cloned();
+    let err_redact = redact.to_vec();
+    let stderr_task =
+        tokio::spawn(async move { drain_pipe(stderr_pipe.take(), err_tap, err_redact).await });
+
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(ToolError::Execution(format!("{}: {e}", argv[0]))),
+        Err(_) => {
+            // TIMEOUT: same teardown as `run()` — kill the local process group,
+            // reap the child, and (for a remote/heavy test run) tear down the
+            // remote scope by name too.
+            if let Some(pgid) = pgid {
+                unsafe {
+                    libc::killpg(pgid, libc::SIGKILL);
+                }
+            }
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            if let Some(rk) = remote_kill {
+                remote_scope_kill(rk, redact).await;
+            }
+            return Err(ToolError::Execution(format!(
+                "{} timed out after {}s (child process group killed)",
+                argv[0],
+                timeout.as_secs()
+            )));
+        }
+    };
+
+    let stdout = stdout_task.await.unwrap_or_default();
+    let stderr = stderr_task.await.unwrap_or_default();
+    // Redact BOTH streams (S6/S7) and combine — unlike `run()`, a non-zero exit
+    // here does not discard stdout, since cargo's pass/fail summary lives there.
+    let stdout_s = redact_secrets(&String::from_utf8_lossy(&stdout), redact);
+    let stderr_s = redact_secrets(&String::from_utf8_lossy(&stderr), redact);
+    let combined = format!("{stdout_s}\n{stderr_s}");
+    Ok((status.success(), combined))
+}
+
 /// The `compiler_build` tool.
 struct CompilerBuild;
 
@@ -725,7 +926,10 @@ impl RustTool for CompilerBuild {
          toolchain, sccache→Redis (fail-open), inside a resource-capped systemd scope \
          (MemorySwapMax=0, Plex-safe), then publish a sha256-checksummed artifact to the \
          shared build dataset and flip `experimental/current` onto it. Promotion to the \
-         `stable` channel is a separate pointer-flip (compiler_release), never a rebuild."
+         `stable` channel is a separate pointer-flip (compiler_release), never a rebuild. \
+         `mode=test` runs the test-gate instead: `cargo test` in the SAME capped single-door \
+         scope, returning structured pass/fail with NO publish and NO channel flip — a gate \
+         is not a release."
     }
 
     fn parameters(&self) -> Value {
@@ -767,6 +971,12 @@ impl RustTool for CompilerBuild {
                 "request_id": {
                     "type": "string",
                     "description": "Optional stable id for this build request; progress/events are keyed by it (query with compiler_progress). Auto-generated when omitted and returned in the result."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["build", "test"],
+                    "default": "build",
+                    "description": "build (default) compiles + publishes an artifact and flips experimental/current, exactly as before. test runs `cargo test` in the SAME capped single-door scope (same toolchain/caps/sccache) as a GATE — it never publishes an artifact and never flips a channel pointer; it returns a structured pass/fail (+ test counts, + the failing-test summary on failure) via the same compiler_progress/events mechanism."
                 }
             },
             "required": ["module", "ref"]
@@ -989,6 +1199,19 @@ impl CompilerBuild {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| module.clone());
+        // BLD-COMPTEST: mode=build (default, unchanged behavior) | mode=test (the
+        // gate — same capped single-door scope, no publish, no channel flip).
+        let mode = args
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("build")
+            .to_string();
+        if mode != "build" && mode != "test" {
+            return Err(ToolError::InvalidArgument(format!(
+                "mode must be \"build\" or \"test\", got {mode:?}"
+            )));
+        }
+        let is_test_mode = mode == "test";
 
         // ── Validate user-controlled path inputs BEFORE any path join / rsync /
         // ssh (no traversal, no separators, no injection). After this, joining
@@ -1065,7 +1288,13 @@ impl CompilerBuild {
 
         // The build produces a LOCALLY-readable binary at `built_bin` in BOTH the
         // local and remote paths, so the publish step below is host-agnostic.
+        // BLD-COMPTEST: for `mode=test` there is no binary to publish — `built_bin`
+        // is left as an unused placeholder on that path (the function returns with
+        // the gate result, below, before the publish section ever reads it), and
+        // `test_outcome` (process-exit-success, parsed [`CargoTestSummary`]) is set
+        // instead.
         let built_bin: PathBuf;
+        let mut test_outcome: Option<(bool, CargoTestSummary)> = None;
 
         if resolved.is_local() {
             // ── LOCAL build (primary, in place) ──────────────────────────────
@@ -1105,30 +1334,58 @@ impl CompilerBuild {
             }
 
             let manifest = local_source_dir.join("Cargo.toml");
-            let cargo_argv = cargo_build_argv(
-                &profile,
-                &triple,
-                resolved.caps.jobs,
-                &bin,
-                &manifest.to_string_lossy(),
-            );
+            let cargo_argv = if is_test_mode {
+                cargo_test_argv(
+                    &profile,
+                    &triple,
+                    resolved.caps.jobs,
+                    &manifest.to_string_lossy(),
+                )
+            } else {
+                cargo_build_argv(
+                    &profile,
+                    &triple,
+                    resolved.caps.jobs,
+                    &bin,
+                    &manifest.to_string_lossy(),
+                )
+            };
             let scope_argv = scope::render_scope_argv(&unit, &resolved.caps, &setenv, &cargo_argv);
-            // Compilation starts → `building`; the tap streams `{step,total}`.
+            // Compilation (or the test run) starts → `building`; the tap streams
+            // `{step,total}` when cargo renders one.
             bus.emit(request_id, events::Emit::stage(events::Stage::Building));
             // Secret env is delivered via the inherited environment (last arg),
             // NOT argv. The build tap streams cargo progress lines live.
-            run(
-                &scope_argv,
-                Some(&local_source_dir),
-                &secret_env,
-                Duration::from_secs(MAX_BUILD_TIMEOUT_SECS),
-                &redact,
-                None,
-                Some(&tap),
-            )
-            .await?;
-
-            built_bin = target_dir.join(built_bin_rel(&triple, &profile, &bin));
+            if is_test_mode {
+                // `run_test` (unlike `run`) does NOT error on a non-zero exit — a
+                // failing test suite is an expected gate outcome, not an execution
+                // error — and preserves stdout (where cargo prints its `test
+                // result: ...` summary) on every exit status.
+                let (exit_success, output) = run_test(
+                    &scope_argv,
+                    Some(&local_source_dir),
+                    &secret_env,
+                    Duration::from_secs(MAX_BUILD_TIMEOUT_SECS),
+                    &redact,
+                    None,
+                    Some(&tap),
+                )
+                .await?;
+                test_outcome = Some((exit_success, parse_cargo_test_output(&output)));
+                built_bin = PathBuf::new(); // unused: mode=test never reaches publish
+            } else {
+                run(
+                    &scope_argv,
+                    Some(&local_source_dir),
+                    &secret_env,
+                    Duration::from_secs(MAX_BUILD_TIMEOUT_SECS),
+                    &redact,
+                    None,
+                    Some(&tap),
+                )
+                .await?;
+                built_bin = target_dir.join(built_bin_rel(&triple, &profile, &bin));
+            }
         } else {
             // ── REMOTE build (heavy host, over ssh) ──────────────────────────
             let host_addr = resolved
@@ -1280,8 +1537,11 @@ impl CompilerBuild {
             }
 
             let manifest = format!("{remote_source}/Cargo.toml");
-            let cargo_argv =
-                cargo_build_argv(&profile, &triple, resolved.caps.jobs, &bin, &manifest);
+            let cargo_argv = if is_test_mode {
+                cargo_test_argv(&profile, &triple, resolved.caps.jobs, &manifest)
+            } else {
+                cargo_build_argv(&profile, &triple, resolved.caps.jobs, &bin, &manifest)
+            };
             let scope_argv = scope::render_scope_argv(&unit, &resolved.caps, &setenv, &cargo_argv);
             // Remote wrapper: source the secret env file (if any), delete it, then
             // exec the scoped build. The secret lives only in the 0600 file, never argv.
@@ -1300,58 +1560,135 @@ impl CompilerBuild {
                 host: host_addr.clone(),
                 unit: unit.clone(),
             };
-            // Remote compilation starts → `building`; the tap streams the remote
-            // cargo `{step,total}` (over ssh stdout/stderr) into the bus live.
+            // Remote compilation (or test run) starts → `building`; the tap streams
+            // the remote cargo `{step,total}` (over ssh stdout/stderr) live.
             bus.emit(request_id, events::Emit::stage(events::Stage::Building));
-            let build_res = run(
-                &["ssh".into(), host_addr.clone(), remote_cmd],
-                None,
-                &BTreeMap::new(),
-                Duration::from_secs(3600),
-                &redact,
-                Some(&remote_kill),
-                Some(&tap),
-            )
-            .await;
-            // If the build FAILED/timed out, propagate now — `secret_guard` drops on
-            // this `?` and cleans up the remote file (it may still exist if the build
-            // never reached the wrapper's own `rm`). On SUCCESS the wrapper already
-            // removed the file, so disarm the guard's remote cleanup (avoids a
-            // redundant ssh); the guard object stays alive but Drop becomes a no-op.
-            build_res?;
-            if let Some(g) = secret_guard.as_mut() {
-                g.disarm();
-            }
+            if is_test_mode {
+                // Same rationale as the local path: a non-zero exit is an expected
+                // "tests failed" outcome, and stdout (cargo's summary) must survive
+                // either way — `run_test`, not `run`.
+                let (exit_success, output) = run_test(
+                    &["ssh".into(), host_addr.clone(), remote_cmd],
+                    None,
+                    &BTreeMap::new(),
+                    Duration::from_secs(3600),
+                    &redact,
+                    Some(&remote_kill),
+                    Some(&tap),
+                )
+                .await?;
+                if let Some(g) = secret_guard.as_mut() {
+                    g.disarm();
+                }
+                test_outcome = Some((exit_success, parse_cargo_test_output(&output)));
+                // No binary was produced to retrieve/publish for mode=test.
+                built_bin = PathBuf::new();
+            } else {
+                let build_res = run(
+                    &["ssh".into(), host_addr.clone(), remote_cmd],
+                    None,
+                    &BTreeMap::new(),
+                    Duration::from_secs(3600),
+                    &redact,
+                    Some(&remote_kill),
+                    Some(&tap),
+                )
+                .await;
+                // If the build FAILED/timed out, propagate now — `secret_guard` drops
+                // on this `?` and cleans up the remote file (it may still exist if the
+                // build never reached the wrapper's own `rm`). On SUCCESS the wrapper
+                // already removed the file, so disarm the guard's remote cleanup
+                // (avoids a redundant ssh); the guard object stays alive but Drop
+                // becomes a no-op.
+                build_res?;
+                if let Some(g) = secret_guard.as_mut() {
+                    g.disarm();
+                }
 
-            // Retrieve the built binary back to a local temp path so publish is
-            // host-agnostic (the build ran remotely; publish reads it locally).
-            let remote_bin = format!(
-                "{}/{}",
-                remote_target_str.trim_end_matches('/'),
-                built_bin_rel(&triple, &profile, &bin).to_string_lossy()
+                // Retrieve the built binary back to a local temp path so publish is
+                // host-agnostic (the build ran remotely; publish reads it locally).
+                let remote_bin = format!(
+                    "{}/{}",
+                    remote_target_str.trim_end_matches('/'),
+                    built_bin_rel(&triple, &profile, &bin).to_string_lossy()
+                );
+                let local_tmp_dir = std::env::temp_dir().join(format!("terminus-artifact-{unit}"));
+                tokio::fs::create_dir_all(&local_tmp_dir)
+                    .await
+                    .map_err(|e| ToolError::Execution(format!("mk artifact tmp dir: {e}")))?;
+                let local_bin = local_tmp_dir.join(&bin);
+                run(
+                    &[
+                        "rsync".into(),
+                        "-a".into(),
+                        "-s".into(),
+                        format!("{host_addr}:{remote_bin}"),
+                        local_bin.to_string_lossy().to_string(),
+                    ],
+                    None,
+                    &BTreeMap::new(),
+                    Duration::from_secs(600),
+                    &redact,
+                    None,
+                    None,
+                )
+                .await?;
+                built_bin = local_bin;
+            }
+        }
+
+        // BLD-COMPTEST: mode=test stops HERE — no publish, no channel flip (a
+        // gate is not a release). The gate's structured result (pass/fail, test
+        // counts, and the failing-test summary on failure) is returned directly
+        // AND mirrored onto the same events/compiler_progress stream via a
+        // terminal `Tested` event, so a caller polls `compiler_progress` for a
+        // gate exactly as it would for a build.
+        if is_test_mode {
+            let (exit_success, summary) =
+                test_outcome.expect("mode=test always sets test_outcome before this point");
+            let passed = summary.all_passed();
+            let structured = json!({
+                "request_id": request_id,
+                "module": module,
+                "ref": git_ref,
+                "host": resolved.role.as_str(),
+                "remote": !resolved.is_local(),
+                "profile": profile,
+                "target": triple,
+                "mode": "test",
+                "bin": bin,
+                "passed": passed,
+                "process_exit_success": exit_success,
+                "test_counts": summary.to_json(),
+                "failing_tests": summary.failing_tests,
+                "published": false,
+                "blessed_current": false,
+                "caps": {
+                    "memory_max": resolved.caps.memory_max,
+                    "memory_swap_max": "0",
+                    "cpu_quota": resolved.caps.cpu_quota,
+                    "io_weight": resolved.caps.io_weight,
+                    "jobs": resolved.caps.jobs,
+                },
+            });
+            // Terminal `Tested` event: the SAME structured pass/fail summary
+            // (JSON-encoded into `message`) is mirrored onto the progress bus, so
+            // `compiler_progress` gives a polling caller the identical result.
+            bus.emit(
+                request_id,
+                events::Emit::stage(events::Stage::Tested).message(structured.to_string()),
             );
-            let local_tmp_dir = std::env::temp_dir().join(format!("terminus-artifact-{unit}"));
-            tokio::fs::create_dir_all(&local_tmp_dir)
-                .await
-                .map_err(|e| ToolError::Execution(format!("mk artifact tmp dir: {e}")))?;
-            let local_bin = local_tmp_dir.join(&bin);
-            run(
-                &[
-                    "rsync".into(),
-                    "-a".into(),
-                    "-s".into(),
-                    format!("{host_addr}:{remote_bin}"),
-                    local_bin.to_string_lossy().to_string(),
-                ],
-                None,
-                &BTreeMap::new(),
-                Duration::from_secs(600),
-                &redact,
-                None,
-                None,
-            )
-            .await?;
-            built_bin = local_bin;
+            let text = format!(
+                "cargo test {module}@{git_ref} on {host}: {verdict} ({passed_n} passed, \
+                 {failed_n} failed, {ignored_n} ignored) [request_id={rid}]",
+                host = resolved.role.as_str(),
+                verdict = if passed { "PASS" } else { "FAIL" },
+                passed_n = summary.passed,
+                failed_n = summary.failed,
+                ignored_n = summary.ignored,
+                rid = request_id,
+            );
+            return Ok(ToolOutput::with_structured(text, structured));
         }
 
         // ── Publish the artifact (checksummed; no `current` flip) ────────────
@@ -2324,6 +2661,142 @@ mod tests {
         assert!(argv
             .windows(2)
             .any(|w| w[0] == "--profile" && w[1] == "release-dist"));
+    }
+
+    // ── BLD-COMPTEST: cargo_test_argv (mirrors the cargo_build_argv tests above) ──
+
+    #[test]
+    fn cargo_test_argv_release_musl() {
+        let argv = cargo_test_argv(
+            "release",
+            "x86_64-unknown-linux-musl",
+            4,
+            "/src/chord/Cargo.toml",
+        );
+        let j = argv.join(" ");
+        assert!(j.starts_with("cargo test --locked --release"));
+        assert!(j.contains("--manifest-path /src/chord/Cargo.toml"));
+        assert!(j.contains("--target x86_64-unknown-linux-musl"));
+        assert!(j.contains("-j 4"));
+        assert!(j.contains("--no-fail-fast"));
+        // Unlike cargo_build_argv, there is no --bin (a gate tests the whole
+        // crate/workspace at the manifest, not one binary's tests).
+        assert!(!argv.iter().any(|a| a == "--bin"));
+    }
+
+    #[test]
+    fn cargo_test_argv_debug_has_no_release_flag() {
+        let argv = cargo_test_argv("debug", "t", 8, "/s/Cargo.toml");
+        assert!(!argv.iter().any(|a| a == "--release"));
+        assert!(argv.windows(2).any(|w| w[0] == "-j" && w[1] == "8"));
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "--manifest-path" && w[1] == "/s/Cargo.toml"));
+    }
+
+    #[test]
+    fn cargo_test_argv_named_profile() {
+        let argv = cargo_test_argv("release-dist", "t", 2, "/s/Cargo.toml");
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "--profile" && w[1] == "release-dist"));
+    }
+
+    #[test]
+    fn cargo_test_argv_starts_with_cargo_test_not_cargo_build() {
+        // The load-bearing distinction between mode=test and mode=build: the
+        // subcommand itself differs, everything else (locked/profile/target/-j/
+        // manifest-path) stays parallel.
+        let test_argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml");
+        let build_argv = cargo_build_argv("release", "t", 4, "m", "/s/Cargo.toml");
+        assert_eq!(test_argv[0], "cargo");
+        assert_eq!(test_argv[1], "test");
+        assert_eq!(build_argv[0], "cargo");
+        assert_eq!(build_argv[1], "build");
+    }
+
+    #[test]
+    fn cargo_build_argv_unchanged_by_the_mode_test_addition() {
+        // mode=build's argv-building path is untouched — same assertion as the
+        // pre-existing `cargo_argv_release_musl` test, kept here explicitly next
+        // to the new test-mode tests so the "mode=build is byte-for-byte
+        // unchanged" claim is directly checkable in one place.
+        let argv = cargo_build_argv(
+            "release",
+            "x86_64-unknown-linux-musl",
+            4,
+            "chord",
+            "/src/chord/Cargo.toml",
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "cargo",
+                "build",
+                "--locked",
+                "--release",
+                "--manifest-path",
+                "/src/chord/Cargo.toml",
+                "--target",
+                "x86_64-unknown-linux-musl",
+                "-j",
+                "4",
+                "--bin",
+                "chord",
+            ]
+        );
+    }
+
+    // ── BLD-COMPTEST: parse_cargo_test_output ─────────────────────────
+
+    #[test]
+    fn parse_cargo_test_output_all_passed_single_binary() {
+        let out = "\nrunning 3 tests\ntest a ... ok\ntest b ... ok\ntest c ... ok\n\n\
+                    test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n";
+        let s = parse_cargo_test_output(out);
+        assert!(s.summary_found);
+        assert!(s.all_passed());
+        assert_eq!(s.passed, 3);
+        assert_eq!(s.failed, 0);
+        assert!(s.failing_tests.is_empty());
+    }
+
+    #[test]
+    fn parse_cargo_test_output_failures_captured() {
+        let out = "\nrunning 2 tests\ntest foo::bar ... FAILED\ntest foo::baz ... ok\n\n\
+                    failures:\n\n---- foo::bar stdout ----\nassertion failed\n\n\
+                    failures:\n    foo::bar\n\n\
+                    test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s\n";
+        let s = parse_cargo_test_output(out);
+        assert!(s.summary_found);
+        assert!(!s.all_passed());
+        assert_eq!(s.passed, 1);
+        assert_eq!(s.failed, 1);
+        assert_eq!(s.failing_tests, vec!["foo::bar".to_string()]);
+    }
+
+    #[test]
+    fn parse_cargo_test_output_aggregates_multiple_binaries() {
+        // A workspace/crate run prints one `test result:` line per test binary —
+        // the gate sums them.
+        let out = "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n\
+                    test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s\n";
+        let s = parse_cargo_test_output(out);
+        assert!(s.summary_found);
+        assert_eq!(s.passed, 3);
+        assert_eq!(s.failed, 1);
+        assert!(!s.all_passed());
+    }
+
+    #[test]
+    fn parse_cargo_test_output_no_summary_line_is_not_a_pass() {
+        // A compile error (or a crash before any test binary reports) never
+        // prints a `test result:` line — that must never be read as a pass.
+        let out = "error[E0433]: failed to resolve\nerror: could not compile `chord` (lib)\n";
+        let s = parse_cargo_test_output(out);
+        assert!(!s.summary_found);
+        assert!(!s.all_passed());
+        assert!(s.failing_tests.is_empty());
     }
 
     #[test]
