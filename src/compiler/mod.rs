@@ -319,9 +319,13 @@ struct CargoTestSummary {
 }
 
 impl CargoTestSummary {
-    /// The gate PASSES iff at least one summary line was found and it reports
-    /// zero failures. A run with no summary line at all (a compile error, or the
-    /// harness crashing before any test binary printed its result) is a FAIL.
+    /// Whether the PARSED SUMMARY is clean: at least one summary line was found
+    /// and it reports zero failures. A run with no summary line at all (a compile
+    /// error, or the harness crashing before any test binary printed its result)
+    /// is unclean. NOTE: this is the summary verdict ONLY — the GATE verdict
+    /// ([`test_gate_passed`]) additionally requires the process to have exited 0,
+    /// which catches a LATER cargo/rustdoc/link failure that emits no further
+    /// failed-summary line (so `all_passed()` alone would wrongly read as clean).
     fn all_passed(&self) -> bool {
         self.summary_found && self.failed == 0
     }
@@ -337,6 +341,21 @@ impl CargoTestSummary {
             "failing_tests": self.failing_tests,
         })
     }
+}
+
+/// The GATE verdict for a `mode=test` run (pure — testable). PASSES iff BOTH the
+/// cargo process exited 0 (`exit_success`) AND the parsed summary is clean
+/// (`summary.all_passed()`). Requiring the exit code is the load-bearing half for
+/// a gate: cargo prints per-test-binary `test result:` lines as it goes, but a
+/// LATER failure — a second crate failing to COMPILE, a rustdoc/doctest error, a
+/// linker error, or the harness itself aborting — can make cargo exit NON-ZERO
+/// WITHOUT emitting an additional `... failed` summary line. In that case
+/// `summary.all_passed()` alone (seeing only the earlier clean summary) would
+/// wrongly read PASS; gating on `exit_success` too makes the gate fail-closed on
+/// any real non-zero cargo exit. The happy path is unaffected: a fully-green run
+/// exits 0, so `exit_success == true` and the verdict is unchanged.
+fn test_gate_passed(exit_success: bool, summary: &CargoTestSummary) -> bool {
+    exit_success && summary.all_passed()
 }
 
 fn cargo_test_result_regex() -> &'static regex::Regex {
@@ -1646,7 +1665,11 @@ impl CompilerBuild {
         if is_test_mode {
             let (exit_success, summary) =
                 test_outcome.expect("mode=test always sets test_outcome before this point");
-            let passed = summary.all_passed();
+            // GATE verdict: require BOTH a zero cargo exit AND a clean parsed
+            // summary — see `test_gate_passed`. A clean earlier summary followed
+            // by a later non-zero exit (a compile/rustdoc/link failure that emits
+            // no further failed-summary line) is a FAIL, not a false PASS.
+            let passed = test_gate_passed(exit_success, &summary);
             let structured = json!({
                 "request_id": request_id,
                 "module": module,
@@ -2797,6 +2820,46 @@ mod tests {
         assert!(!s.summary_found);
         assert!(!s.all_passed());
         assert!(s.failing_tests.is_empty());
+    }
+
+    // ── BLD-COMPTEST: test_gate_passed — the exit-code half of the gate verdict ──
+
+    #[test]
+    fn test_gate_fails_on_nonzero_exit_even_with_a_clean_summary() {
+        // codex review gap: a clean earlier `test result:` summary line followed
+        // by a LATER non-zero cargo exit (a second crate failing to compile, a
+        // rustdoc/doctest/link error) emits NO further failed-summary line, so the
+        // parsed summary looks all-passed. The GATE must still FAIL — a non-zero
+        // cargo exit is never a pass for a gate.
+        let clean_summary = parse_cargo_test_output(
+            "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n",
+        );
+        assert!(clean_summary.all_passed(), "summary alone reads clean");
+        // exit_success = false (the dangerous case) ⇒ gate FAILS.
+        assert!(!test_gate_passed(false, &clean_summary));
+        // exit_success = true ⇒ gate PASSES (happy path unchanged).
+        assert!(test_gate_passed(true, &clean_summary));
+    }
+
+    #[test]
+    fn test_gate_fails_on_failed_tests_even_with_a_zero_exit() {
+        // The other half: a parsed failure fails the gate regardless of exit code
+        // (defense in depth — `--no-fail-fast` still exits non-zero, but the gate
+        // must not depend on that).
+        let failing = parse_cargo_test_output(
+            "test x ... FAILED\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n",
+        );
+        assert!(!test_gate_passed(true, &failing));
+        assert!(!test_gate_passed(false, &failing));
+    }
+
+    #[test]
+    fn test_gate_fails_when_no_summary_line_at_all() {
+        // No `test result:` line (compile error before any test binary ran) is a
+        // FAIL whether or not the process somehow exited 0.
+        let none = parse_cargo_test_output("error: could not compile `chord`\n");
+        assert!(!test_gate_passed(true, &none));
+        assert!(!test_gate_passed(false, &none));
     }
 
     #[test]
