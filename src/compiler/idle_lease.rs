@@ -29,7 +29,17 @@
 //!   channel the serving tools already use — an HTTP POST to `CHORD_CONTROL_URL`
 //!   (see [`crate::config::chord_control_url`]), exactly like
 //!   `serving_profile_refresh` POSTs to `{base}/serving/reload`. Here it is
-//!   `{base}/idle` and `{base}/activate` (Chord's BLD-09 control endpoints).
+//!   `{base}/admin/idle` and `{base}/admin/activate` (Chord's BLD-09 control
+//!   endpoints, `src/admin/idle.rs` wired in Chord's `src/control.rs` — confirmed
+//!   against the merged Chord routes, NOT the `{base}/idle`/`{base}/activate` this
+//!   module originally (and wrongly) assumed). Chord's `admin_idle_enter`/
+//!   `admin_activate` handlers gate on `auth_check(&headers, &state.jwt_secret)`
+//!   (401 without a valid JWT), so every call here presents the SAME short-lived
+//!   service JWT [`crate::federation::mint_service_jwt`] already mints for Chord's
+//!   other protected routes (TGW-02's `/v1/personal/tools/*`, TGW-03's inference
+//!   routes) — signed with `TERMINUS_PRIMARY_CHORD_JWT_SECRET`, the same shared
+//!   secret Chord validates against (`CHORD_JWT_SECRET` on Chord's side). No new
+//!   auth scheme is introduced; this reuses the existing minter as-is.
 //! - **MINT** runs in *this* process (the intake harness embedded in Terminus), so
 //!   idle/activate are the IN-PROCESS calls MINT already exposes:
 //!   [`crate::mint::idle::enter_idle`] / [`crate::mint::idle::activate`], driving the
@@ -279,20 +289,31 @@ impl ProdIdleBackend {
         Self { chord_timeout }
     }
 
-    /// POST to a Chord control sub-path (`idle`/`activate`), returning the parsed
-    /// JSON body on 2xx. A missing `CHORD_CONTROL_URL`, an unreachable endpoint, or
-    /// a non-2xx status is an `Err` with a GENERICIZED message (no host echoed — the
-    /// same discipline as `serving_profile_refresh`).
+    /// POST to a Chord control sub-path (`admin/idle`/`admin/activate`), returning
+    /// the parsed JSON body on 2xx. A missing `CHORD_CONTROL_URL`, a JWT-minting
+    /// failure, an unreachable endpoint, or a non-2xx status (including Chord's
+    /// `401` when `auth_check` rejects the credential) is an `Err` with a
+    /// GENERICIZED message (no host echoed — the same discipline as
+    /// `serving_profile_refresh`). The request carries a freshly-minted Chord
+    /// service JWT via [`crate::federation::mint_service_jwt`] — the SAME
+    /// authenticated-Chord-control-call mechanism `serving_profile_refresh`'s
+    /// sibling federation/inference-proxy callers already use, sourced from
+    /// `TERMINUS_PRIMARY_CHORD_JWT_SECRET` (never a literal), since Chord's
+    /// `admin_idle_enter`/`admin_activate` handlers HARD-REQUIRE
+    /// `auth_check(&headers, &state.jwt_secret)` to pass.
     async fn chord_post(&self, sub_path: &str) -> Result<serde_json::Value, String> {
         let base = crate::config::chord_control_url()
             .ok_or_else(|| "CHORD_CONTROL_URL not set — cannot reach Chord idle control".to_string())?;
         let url = format!("{}/{}", base.trim_end_matches('/'), sub_path);
+        let jwt = crate::federation::mint_service_jwt()
+            .map_err(|e| format!("could not mint Chord control service credential: {e}"))?;
         let client = reqwest::Client::builder()
             .timeout(self.chord_timeout)
             .build()
             .map_err(|_| "could not build Chord control client".to_string())?;
         let resp = client
             .post(&url)
+            .bearer_auth(jwt)
             .send()
             .await
             .map_err(|_| "Chord control endpoint unreachable".to_string())?;
@@ -361,12 +382,12 @@ where
 #[async_trait]
 impl IdleBackend for ProdIdleBackend {
     async fn chord_idle(&self) -> Result<Option<f64>, String> {
-        let body = self.chord_post("idle").await?;
+        let body = self.chord_post("admin/idle").await?;
         Ok(freed_from_body(&body))
     }
 
     async fn chord_activate(&self) -> Result<(), String> {
-        self.chord_post("activate").await.map(|_| ())
+        self.chord_post("admin/activate").await.map(|_| ())
     }
 
     async fn mint_idle(&self) -> Result<Option<f64>, String> {
@@ -2326,5 +2347,203 @@ mod tests {
         std::env::set_var(key, "notanumber");
         assert_eq!(lease.budget_for(&job), 7.0);
         std::env::remove_var(key);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // BLD-IDLE-FIX — ProdIdleBackend's Chord HTTP contract (path + auth)
+    //
+    // These exercise the REAL `ProdIdleBackend::chord_idle`/`chord_activate` over
+    // an `httpmock` server (never a real Chord) to prove the client-side contract
+    // fix: the merged Chord BLD-09 routes are `POST /admin/idle` and
+    // `POST /admin/activate` (NOT the old `/idle`/`/activate`), gated by
+    // `auth_check` — so every call must carry a Bearer JWT. `#[serial]` because
+    // these mutate the process-global `CHORD_CONTROL_URL` /
+    // `TERMINUS_PRIMARY_CHORD_JWT_SECRET` env vars, same convention
+    // `crate::inference_proxy`'s and `crate::federation`'s own tests use for the
+    // identical env vars.
+    mod prod_backend_chord_contract {
+        use super::*;
+        use httpmock::MockServer;
+        use jsonwebtoken::{decode, DecodingKey, Validation};
+        use serde::Deserialize;
+        use serde_json::json;
+        use serial_test::serial;
+
+        #[derive(Debug, Deserialize)]
+        struct DecodedClaims {
+            sub: String,
+        }
+
+        fn set_jwt_secret() {
+            std::env::set_var(
+                "TERMINUS_PRIMARY_CHORD_JWT_SECRET",
+                "test-idle-lease-shared-secret",
+            );
+        }
+        fn clear_jwt_secret() {
+            std::env::remove_var("TERMINUS_PRIMARY_CHORD_JWT_SECRET");
+        }
+        fn set_control_url(url: &str) {
+            std::env::set_var("CHORD_CONTROL_URL", url);
+        }
+        fn clear_control_url() {
+            std::env::remove_var("CHORD_CONTROL_URL");
+        }
+
+        /// AC: the idle-lease client POSTs to `{base}/admin/idle` (the corrected
+        /// path, matching Chord's merged BLD-09 route) — NOT the old `{base}/idle`.
+        #[tokio::test]
+        #[serial]
+        async fn chord_idle_posts_to_admin_idle_path() {
+            set_jwt_secret();
+            let server = MockServer::start();
+            set_control_url(&server.base_url());
+            let mock = server.mock(|when, then| {
+                when.method(httpmock::Method::POST).path("/admin/idle");
+                then.status(200).json_body(json!({"freed_gb": 12.5}));
+            });
+
+            let backend = ProdIdleBackend::new(Duration::from_secs(5));
+            let freed = backend
+                .chord_idle()
+                .await
+                .expect("chord_idle should succeed");
+
+            mock.assert();
+            assert_eq!(freed, Some(12.5));
+            clear_control_url();
+            clear_jwt_secret();
+        }
+
+        /// AC: the idle-lease client POSTs to `{base}/admin/activate` (the
+        /// corrected path) — NOT the old `{base}/activate`.
+        #[tokio::test]
+        #[serial]
+        async fn chord_activate_posts_to_admin_activate_path() {
+            set_jwt_secret();
+            let server = MockServer::start();
+            set_control_url(&server.base_url());
+            let mock = server.mock(|when, then| {
+                when.method(httpmock::Method::POST).path("/admin/activate");
+                then.status(200).json_body(json!({}));
+            });
+
+            let backend = ProdIdleBackend::new(Duration::from_secs(5));
+            backend
+                .chord_activate()
+                .await
+                .expect("chord_activate should succeed");
+
+            mock.assert();
+            clear_control_url();
+            clear_jwt_secret();
+        }
+
+        /// AC: every Chord control call from the idle-lease client carries a Bearer
+        /// JWT shaped exactly as Chord's `auth_check`/`validate_jwt` requires
+        /// (`sub == "lumina"`, a valid/unexpired `exp`), signed with
+        /// `TERMINUS_PRIMARY_CHORD_JWT_SECRET` — the SAME mechanism
+        /// `crate::federation::mint_service_jwt` mints for Chord's other protected
+        /// routes.
+        ///
+        /// CRITICAL: the assertion is on the token the client REALLY sent, not a
+        /// fresh one minted in the test. httpmock 0.7's matcher is a bare `fn`
+        /// pointer (no capture) and the version exposes no recorded-request
+        /// readback, so the check is done INSIDE the matcher: the mock responds
+        /// `200` ONLY when the ACTUAL `Authorization: Bearer <token>` the request
+        /// carried decodes — with the shared secret and `Validation::default()`
+        /// (which validates `exp`, so an expired/garbage token fails) — to
+        /// `sub == "lumina"`. So `chord_idle` only succeeds (and `mock.assert()`
+        /// only passes) when the real sent token is a valid lumina JWT.
+        ///
+        /// NEGATIVE CASE (why this is not vacuous): if `chord_post` sent
+        /// `Bearer garbage` (or omitted auth, or a wrong-secret/expired token),
+        /// `decode(..)` inside the matcher returns `Err` ⇒ the matcher returns
+        /// `false` ⇒ no mock matches ⇒ the mock server returns a non-2xx default ⇒
+        /// `chord_idle` returns `Err` (the `.expect` below panics) AND
+        /// `mock.assert()` fails (the mock was never hit). Both guard the AC.
+        #[tokio::test]
+        #[serial]
+        async fn chord_idle_presents_a_valid_lumina_service_jwt() {
+            set_jwt_secret();
+            let server = MockServer::start();
+            set_control_url(&server.base_url());
+            // The mock matches ONLY when the ACTUAL Authorization header the
+            // request sent carries a Bearer token that decodes to a valid lumina
+            // JWT under the shared secret (the same literal `set_jwt_secret` uses —
+            // duplicated here because a bare-`fn` matcher cannot capture it).
+            let mock = server.mock(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/admin/idle")
+                    .matches(|req| {
+                        let auth = req
+                            .headers
+                            .as_ref()
+                            .and_then(|hs| {
+                                hs.iter()
+                                    .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                            })
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or_default();
+                        let token = match auth.strip_prefix("Bearer ") {
+                            Some(t) => t,
+                            None => return false, // no bearer token sent ⇒ fail
+                        };
+                        // Decode the REAL sent token; `Validation::default()`
+                        // validates `exp`, so an expired/garbage/wrong-secret token
+                        // returns Err ⇒ matcher false ⇒ AC fails (see doc comment).
+                        match decode::<DecodedClaims>(
+                            token,
+                            &DecodingKey::from_secret("test-idle-lease-shared-secret".as_bytes()),
+                            &Validation::default(),
+                        ) {
+                            Ok(data) => data.claims.sub == "lumina",
+                            Err(_) => false,
+                        }
+                    });
+                then.status(200).json_body(json!({}));
+            });
+
+            let backend = ProdIdleBackend::new(Duration::from_secs(5));
+            backend
+                .chord_idle()
+                .await
+                .expect("chord_idle should succeed (the REAL sent token is a valid lumina JWT)");
+            // Confirms the request matched — i.e. the token the client ACTUALLY
+            // sent decoded to a valid lumina JWT. A garbage/absent token would have
+            // failed the matcher and left this un-hit.
+            mock.assert();
+
+            clear_control_url();
+            clear_jwt_secret();
+        }
+
+        /// AC/edge case: if the JWT secret is unset, chord_idle fails FAST with a
+        /// clear (genericized) error — the call to Chord is never attempted
+        /// unauthenticated (no silent no-auth fallback, no new auth scheme).
+        #[tokio::test]
+        #[serial]
+        async fn chord_idle_fails_fast_with_no_jwt_secret_configured() {
+            clear_jwt_secret();
+            let server = MockServer::start();
+            set_control_url(&server.base_url());
+            let mock = server.mock(|when, then| {
+                when.method(httpmock::Method::POST).path("/admin/idle");
+                then.status(200).json_body(json!({}));
+            });
+
+            let backend = ProdIdleBackend::new(Duration::from_secs(5));
+            let err = backend
+                .chord_idle()
+                .await
+                .expect_err("must fail without a JWT secret");
+            assert!(
+                err.contains("service credential"),
+                "unexpected error: {err}"
+            );
+            mock.assert_hits(0);
+
+            clear_control_url();
+        }
     }
 }
