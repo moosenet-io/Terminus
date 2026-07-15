@@ -131,9 +131,15 @@ impl RedisRateLimiter {
     }
 }
 
-#[async_trait]
-impl RateLimiter for RedisRateLimiter {
-    async fn check(&self, key: &str) -> RateLimitDecision {
+impl RedisRateLimiter {
+    /// Run the atomic token-bucket script for `key` with `requested` tokens
+    /// and interpret the `{allowed, tokens_remaining_millitokens}` result.
+    /// `requested = 1` is a check-and-consume (`check`); `requested = 0` is a
+    /// non-consuming refill+read (`peek`, RLQ-01 fix #3) — the script still
+    /// applies time-based refill and returns the current token count, but
+    /// consumes nothing. Both derive the SAME decision shape from the SAME
+    /// atomic read the Lua already did (exact, not an approximation).
+    async fn run_bucket(&self, key: &str, requested: i64) -> RateLimitDecision {
         let bucket = Self::bucket_key(key);
         let capacity = self.capacity;
         let refill = self.refill_per_sec;
@@ -150,34 +156,103 @@ impl RateLimiter for RedisRateLimiter {
                     .arg(capacity)
                     .arg(refill)
                     .arg(now)
-                    .arg(1)
+                    .arg(requested)
                     .invoke_async::<_, Vec<i64>>(&mut conn)
                     .await
             })
             .await;
 
         match outcome {
-            Ok(v) if v.first().copied() == Some(1) => RateLimitDecision::Allowed,
-            Ok(_) => RateLimitDecision::Limited,
-            // FAIL CLOSED for the proxy: an unreachable limiter denies, so a
-            // Redis outage cannot become an un-throttled flood at the backends.
-            Err(()) => RateLimitDecision::Limited,
+            // Derive the decision from the returned token count, NOT the
+            // `allowed` flag: with `requested = 0` the script always reports
+            // allowed=1, so we must key off remaining tokens to tell a genuine
+            // Allowed (>= 1 token) from an over-limit peek (< 1 token). For
+            // `requested = 1` this agrees with the `allowed` flag exactly.
+            Ok(v) => {
+                let allowed_flag = v.first().copied() == Some(1);
+                let tokens_millitokens = v.get(1).copied().unwrap_or(0).max(0) as f64;
+                let tokens = tokens_millitokens / 1000.0;
+                // A consuming call (requested==1) that the script admitted is
+                // definitively Allowed. Otherwise decide from remaining tokens.
+                if (requested >= 1 && allowed_flag) || tokens >= 1.0 {
+                    RateLimitDecision::Allowed
+                } else {
+                    let deficit = (1.0 - tokens).max(0.0);
+                    let retry_after_secs = if refill > 0.0 { deficit / refill } else { deficit };
+                    RateLimitDecision::Limited { retry_after_secs, refill_per_sec: refill }
+                }
+            }
+            // RLQ-01 (the outage fix): a genuine BACKEND fault (unreachable
+            // Redis, command error — e.g. the disk-full AOF-write failure
+            // that caused the S117-era misdiagnosed outage) is NOT the same
+            // thing as a real over-limit. We still deny (fail CLOSED — see
+            // the module doc: a proxy must never fail open on an unreachable
+            // limiter), but as a DISTINCT `Degraded` decision so `guard()`
+            // can emit a response that says "the limiter backend is down",
+            // not "you are rate limited" — the two used to be
+            // indistinguishable 429s, which cost hours of misdiagnosis.
+            // `retry_after_secs` here is a conservative CONFIG-driven
+            // backoff (`crate::config::gateway_rate_limit_degraded_retry_secs`),
+            // not derived from bucket state, because on a backend fault
+            // there IS no bucket state to read; `refill_per_sec` is this
+            // limiter instance's own configured rate (RLQ-01 fix #2).
+            Err(()) => RateLimitDecision::Degraded {
+                retry_after_secs: crate::config::gateway_rate_limit_degraded_retry_secs(),
+                refill_per_sec: refill,
+            },
         }
     }
 }
 
-/// A fail-CLOSED sentinel limiter: every `check` returns `Limited`. Used when
-/// the proxy is CONFIGURED for Redis (`REDIS_URL` set) but the backend could not
-/// be constructed (e.g. an unparseable URL) — a misconfiguration must not
+#[async_trait]
+impl RateLimiter for RedisRateLimiter {
+    async fn check(&self, key: &str) -> RateLimitDecision {
+        self.run_bucket(key, 1).await
+    }
+
+    async fn peek(&self, key: &str) -> RateLimitDecision {
+        // requested = 0 ⇒ refill + read, never consume.
+        self.run_bucket(key, 0).await
+    }
+}
+
+/// A fail-CLOSED sentinel limiter: every `check` denies. Used when the proxy
+/// is CONFIGURED for Redis (`REDIS_URL` set) but the backend could not be
+/// constructed (e.g. an unparseable URL) — a misconfiguration must not
 /// silently downgrade to the in-process limiter (which would drop the
 /// cross-instance + fail-closed guarantees). Denying every request makes the
 /// misconfiguration loud and safe rather than invisibly permissive.
+///
+/// RLQ-01: this is a BACKEND/config fault, not a real over-limit — same
+/// reasoning as [`RedisRateLimiter`]'s `Err(())` path — so it now returns
+/// `Degraded`, not `Limited`, giving `guard()` a distinct, diagnosable
+/// signal instead of an indistinguishable "rate limited" 429.
 pub struct AlwaysLimited;
 
 #[async_trait]
 impl RateLimiter for AlwaysLimited {
     async fn check(&self, _key: &str) -> RateLimitDecision {
-        RateLimitDecision::Limited
+        Self::decision()
+    }
+
+    async fn peek(&self, _key: &str) -> RateLimitDecision {
+        // A misconfigured/degraded sentinel has no bucket to refill — a peek
+        // is identical to a check (still the distinct `Degraded` signal, no
+        // consumption to avoid since there is none).
+        Self::decision()
+    }
+}
+
+impl AlwaysLimited {
+    fn decision() -> RateLimitDecision {
+        // No limiter INSTANCE rate exists for the misconfiguration sentinel
+        // (it has no bucket), so `refill_per_sec` reports the deployment's
+        // configured rate — the closest meaningful value — and
+        // `retry_after_secs` is the conservative degraded backoff.
+        RateLimitDecision::Degraded {
+            retry_after_secs: crate::config::gateway_rate_limit_degraded_retry_secs(),
+            refill_per_sec: crate::config::gateway_rate_limit_refill_per_sec(),
+        }
     }
 }
 
@@ -719,8 +794,19 @@ mod tests {
         // The sentinel used when REDIS_URL is configured-but-unparseable must
         // deny unconditionally (fail closed), never allow.
         let sentinel = AlwaysLimited;
-        assert_eq!(sentinel.check("anything").await, RateLimitDecision::Limited);
-        assert_eq!(sentinel.check("").await, RateLimitDecision::Limited);
+        assert!(sentinel.check("anything").await.is_over_budget());
+        assert!(sentinel.check("").await.is_over_budget());
+    }
+
+    /// RLQ-01: the misconfiguration sentinel is a BACKEND fault, not a real
+    /// over-limit — it must surface as `Degraded`, distinct from `Limited`,
+    /// so an operator/agent can tell "limiter down" from "throttled".
+    #[tokio::test]
+    async fn always_limited_is_degraded_not_a_real_limit() {
+        let sentinel = AlwaysLimited;
+        let decision = sentinel.check("anything").await;
+        assert!(decision.is_degraded(), "{decision:?}");
+        assert!(decision.retry_after_secs().unwrap() > 0.0);
     }
 
     #[tokio::test]
@@ -737,10 +823,34 @@ mod tests {
         .expect("offline construction");
         let limiter = RedisRateLimiter::new(backend, 10, 5.0);
         let key = rate_limit_key("dev-box", "ledger_accounts");
-        assert_eq!(
-            limiter.check(&key).await,
-            RateLimitDecision::Limited,
-            "an unreachable limiter must fail CLOSED for the proxy"
+        let decision = limiter.check(&key).await;
+        assert!(decision.is_over_budget(), "an unreachable limiter must fail CLOSED for the proxy");
+    }
+
+    /// RLQ-01 (the outage fix): a genuine backend fault (unreachable Redis)
+    /// must surface as `Degraded`, NOT `Limited` — this is the exact
+    /// distinction that was missing when a Redis outage was misdiagnosed as
+    /// a real rate limit.
+    #[tokio::test]
+    async fn unreachable_backend_is_degraded_distinct_from_limited() {
+        let backend = RedisBackend::build(
+            "redis://127.0.0.1:6390", // nothing listening
+            None,
+            0,
+            1,
+            Duration::from_millis(150),
+        )
+        .expect("offline construction");
+        let limiter = RedisRateLimiter::new(backend, 10, 5.0);
+        let key = rate_limit_key("dev-box", "ledger_accounts");
+        let decision = limiter.check(&key).await;
+        assert!(
+            decision.is_degraded(),
+            "an unreachable Redis backend must be Degraded, not a real Limited: {decision:?}"
+        );
+        assert!(
+            !matches!(decision, RateLimitDecision::Limited { .. }),
+            "must not be misreported as a genuine over-limit: {decision:?}"
         );
     }
 
@@ -766,7 +876,8 @@ mod tests {
         assert_eq!(limiter.check(&key).await, RateLimitDecision::Allowed);
         assert_eq!(limiter.check(&key).await, RateLimitDecision::Allowed);
         assert_eq!(limiter.check(&key).await, RateLimitDecision::Allowed);
-        assert_eq!(limiter.check(&key).await, RateLimitDecision::Limited);
+        let decision = limiter.check(&key).await;
+        assert!(matches!(decision, RateLimitDecision::Limited { .. }), "{decision:?}");
     }
 
     #[tokio::test]

@@ -799,6 +799,23 @@ pub fn gateway_queue_poll() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
+/// RLQ-01: conservative backoff (seconds) handed to a caller when the
+/// rate-limiter BACKEND itself is degraded (Redis unreachable/erroring, or a
+/// misconfigured `REDIS_URL` selecting the fail-closed sentinel) — i.e.
+/// `RateLimitDecision::Degraded`, not a real over-limit. There is no bucket
+/// state to derive an exact recovery time from in this case, so this is a
+/// fixed, operator-tunable value rather than a computed one. From
+/// `TERMINUS_GATEWAY_RATE_LIMIT_DEGRADED_RETRY_SECS`; defaults to 2.0 — long
+/// enough that a naive immediate-retry loop doesn't hammer an already-broken
+/// backend, short enough that a caller notices recovery promptly once the
+/// backend is fixed.
+pub fn gateway_rate_limit_degraded_retry_secs() -> f64 {
+    env_nonempty("TERMINUS_GATEWAY_RATE_LIMIT_DEGRADED_RETRY_SECS")
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &f64| *n > 0.0)
+        .unwrap_or(2.0)
+}
+
 // ── DISC-04: HF Hub public model-listing client ──────────────────────────────
 //
 // `intake::discovery::hf_client::HfHubClient` queries the PUBLIC HuggingFace Hub

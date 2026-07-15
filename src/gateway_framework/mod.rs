@@ -610,6 +610,21 @@ fn is_approval_required_marker(detail: &str) -> bool {
     detail.contains("APPROVAL REQUIRED")
 }
 
+/// RLQ-01: the result of [`GatewayFramework::try_admit`] — richer than a
+/// bare bool so [`GatewayFramework::guard`] can build a structured feedback
+/// response instead of a bare 429.
+struct AdmitOutcome {
+    /// The request was admitted through the queue; proceed.
+    admitted: bool,
+    /// `true` when the shed was caused by the QUEUE's own backend faulting
+    /// (`Admission::Unavailable`), not by real capacity/timeout — mirrors
+    /// `RateLimitDecision::Degraded`'s distinction at the limiter layer.
+    degraded: bool,
+    /// Best-effort snapshot of queue depth at admission time, when a queue
+    /// is configured and reachable.
+    queue_depth: Option<u64>,
+}
+
 struct GatewayFrameworkInner {
     allowlist: AllowlistPolicy,
     rate_limiter: Arc<dyn RateLimiter>,
@@ -734,16 +749,23 @@ impl GatewayFramework {
         }
     }
 
-    /// BLD-20: attempt bounded FIFO admission for an over-limit request. Returns
-    /// `true` if the request was admitted (proceed), `false` if it should be
-    /// 429'd. `false` when no queue is configured (immediate shed), or on
-    /// `QueueFull`/`TimedOut`/`Unavailable` (Redis down ⇒ fail CLOSED). While
-    /// waiting at the head, it re-checks the rate limiter — so it admits exactly
-    /// when a token frees, preserving the limit rather than bypassing it.
-    async fn try_admit(&self, key: &str) -> bool {
+    /// BLD-20 / RLQ-01: attempt bounded FIFO admission for an over-limit
+    /// request. While waiting at the head, it re-checks the rate limiter — so
+    /// it admits exactly when a token frees, preserving the limit rather than
+    /// bypassing it.
+    async fn try_admit(&self, key: &str) -> AdmitOutcome {
         let Some(queue) = &self.inner.request_queue else {
-            return false; // no queuing configured → immediate 429
+            // No queuing configured → immediate shed. Not a queue/backend
+            // fault, just "this deployment has no queue wired up".
+            return AdmitOutcome { admitted: false, degraded: false, queue_depth: None };
         };
+        // Best-effort depth snapshot for the feedback response (RLQ-01 part
+        // 4 — "funnel semantics": a caller shed here can see roughly how
+        // contended the queue was). Never fails the admission attempt itself
+        // — a `depth()` error just omits the field, `admit()` below is the
+        // authority on whether the request proceeds.
+        let queue_depth = queue.depth().await.ok();
+
         // The queue allocates a GLOBALLY-UNIQUE ticket internally (per-instance
         // salt + Redis-atomic INCR) — no caller-side counter, so two gateway
         // instances can never collide on a ticket for the same rate-limit key.
@@ -754,17 +776,31 @@ impl GatewayFramework {
             let k = k.clone();
             async move { limiter.check(&k).await == RateLimitDecision::Allowed }
         };
-        matches!(
-            queue
-                .admit(
-                    self.inner.queue_max_depth,
-                    self.inner.queue_max_wait,
-                    self.inner.queue_poll,
-                    acquire,
-                )
-                .await,
-            crate::ratelimit::Admission::Admitted
-        )
+        let admission = queue
+            .admit(
+                self.inner.queue_max_depth,
+                self.inner.queue_max_wait,
+                self.inner.queue_poll,
+                acquire,
+            )
+            .await;
+        match admission {
+            crate::ratelimit::Admission::Admitted => {
+                AdmitOutcome { admitted: true, degraded: false, queue_depth }
+            }
+            // QueueFull / TimedOut: a REAL shed decision (the queue itself
+            // works fine, it's just at capacity or the wait elapsed) — not a
+            // backend fault.
+            crate::ratelimit::Admission::QueueFull | crate::ratelimit::Admission::TimedOut => {
+                AdmitOutcome { admitted: false, degraded: false, queue_depth }
+            }
+            // Unavailable: the queue's own backend (Redis) errored — this is
+            // the same "backend degraded, not a real limit" distinction as
+            // `RateLimitDecision::Degraded`, so it's surfaced the same way.
+            crate::ratelimit::Admission::Unavailable => {
+                AdmitOutcome { admitted: false, degraded: true, queue_depth }
+            }
+        }
     }
 
     /// Gate one request. `principal` must come from a server-verified
@@ -833,17 +869,121 @@ impl GatewayFramework {
         }
 
         let key = rate_limit_key(&identity_str, action);
-        if self.inner.rate_limiter.check(&key).await == RateLimitDecision::Limited {
-            // BLD-20: over-limit → don't 429 immediately. If a bounded FIFO
-            // admission queue is configured, ADMIT the request through it
-            // (FIFO fairness + a bounded wait for a token to free); only shed
-            // load (429) when the queue is full or the wait times out. Redis
-            // unreachable ⇒ fail CLOSED (429), never admit unbounded.
-            if !self.try_admit(&key).await {
-                let detail = format!("rate limit exceeded for '{identity_str}' on '{action}'");
-                AuditEntry::new(&identity_str, action, kind, AuditResult::DeniedRateLimited, Some(&detail))
+        let decision = self.inner.rate_limiter.check(&key).await;
+        match decision {
+            RateLimitDecision::Allowed => {}
+            RateLimitDecision::Degraded { retry_after_secs, refill_per_sec } => {
+                // RLQ-01 (the outage fix): the LIMITER BACKEND itself is
+                // degraded (e.g. Redis unreachable) — not a real over-limit.
+                // Do NOT attempt queue admission (the queue shares the same
+                // Redis backend and would almost certainly also be
+                // unreachable; attempting it would just add a doomed round
+                // trip on the denial path). Fail CLOSED like a real limit
+                // (never allow-by-default on a broken backend), but with a
+                // response that says so explicitly.
+                let detail = format!(
+                    "rate-limiter backend unavailable for '{identity_str}' on '{action}' \
+                     (retry_after {retry_after_secs:.1}s) — this is a LIMITER BACKEND fault, \
+                     not a real rate limit"
+                );
+                AuditEntry::new(
+                    &identity_str,
+                    action,
+                    kind,
+                    AuditResult::DeniedRateLimiterDegraded,
+                    Some(&detail),
+                )
+                .log();
+                return Err(rate_limit_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &detail,
+                    RateLimitFeedback {
+                        retry_after_secs,
+                        queue_depth: None,
+                        // RLQ-01 fix #2: the ACTUAL limiter's rate, from the
+                        // decision it produced — not a re-read of the config
+                        // global (which an injected/custom limiter may differ
+                        // from).
+                        refill_per_sec,
+                        degraded: true,
+                    },
+                ));
+            }
+            RateLimitDecision::Limited { retry_after_secs, refill_per_sec } => {
+                // BLD-20 / RLQ-01: over-limit → don't 429 immediately. If a
+                // bounded FIFO admission queue is configured, ADMIT the
+                // request through it (FIFO fairness + a bounded wait for a
+                // token to free); only shed load (429) when the queue is full
+                // or the wait times out. The queue's own backend going
+                // unreachable is handled as its own `degraded` case below,
+                // distinct from a real shed.
+                let admission = self.try_admit(&key).await;
+                if !admission.admitted {
+                    if admission.degraded {
+                        // The admission QUEUE's own backend faulted — same
+                        // "backend degraded, not a real limit" signal as the
+                        // limiter's `Degraded`. Carry the limiter's
+                        // pre-wait figures (a re-peek would hit the same dead
+                        // backend), fail CLOSED as 503.
+                        let detail = format!(
+                            "rate-limiter backend unavailable for '{identity_str}' on \
+                             '{action}' (retry_after {retry_after_secs:.1}s) — the admission \
+                             QUEUE backend faulted, not a real rate limit"
+                        );
+                        AuditEntry::new(
+                            &identity_str,
+                            action,
+                            kind,
+                            AuditResult::DeniedRateLimiterDegraded,
+                            Some(&detail),
+                        )
+                        .log();
+                        return Err(rate_limit_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &detail,
+                            RateLimitFeedback {
+                                retry_after_secs,
+                                queue_depth: admission.queue_depth,
+                                refill_per_sec,
+                                degraded: true,
+                            },
+                        ));
+                    }
+                    // A REAL shed (queue full or the bounded wait timed out).
+                    // RLQ-01 fix #3: the `retry_after_secs` computed BEFORE
+                    // the wait is now stale — the bucket has been refilling
+                    // the whole time we waited. Re-derive the recovery window
+                    // from the CURRENT bucket state via a non-consuming
+                    // `peek`, so the reported figure reflects reality at the
+                    // moment we shed, not when we entered the queue. (`peek`
+                    // never consumes, so this cannot itself deny a later
+                    // legitimate call.)
+                    let fresh = self.inner.rate_limiter.peek(&key).await;
+                    let retry_after_secs = fresh.retry_after_secs().unwrap_or(0.0);
+                    let refill_per_sec = fresh.refill_per_sec().unwrap_or(refill_per_sec);
+                    let detail = format!(
+                        "rate limit exceeded for '{identity_str}' on '{action}' \
+                         (retry_after {retry_after_secs:.1}s)"
+                    );
+                    AuditEntry::new(
+                        &identity_str,
+                        action,
+                        kind,
+                        AuditResult::DeniedRateLimited,
+                        Some(&detail),
+                    )
                     .log();
-                return Err(denied_response(StatusCode::TOO_MANY_REQUESTS, &detail));
+                    return Err(rate_limit_response(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        &detail,
+                        RateLimitFeedback {
+                            retry_after_secs,
+                            queue_depth: admission.queue_depth,
+                            refill_per_sec,
+                            degraded: false,
+                        },
+                    ));
+                }
             }
         }
 
@@ -877,6 +1017,87 @@ impl GatewayFramework {
 fn denied_response(status: StatusCode, message: &str) -> Response {
     (status, [("content-type", "application/json")], json!({"error": message}).to_string())
         .into_response()
+}
+
+/// RLQ-01: the queue-with-feedback fields attached to an over-limit /
+/// backend-degraded denial — see [`rate_limit_response`].
+struct RateLimitFeedback {
+    /// Seconds until the caller should retry. For `Limited`, derived from
+    /// the token bucket's own deficit/refill (exact). For a `degraded`
+    /// backend fault, a conservative config-driven backoff (no bucket state
+    /// exists to derive an exact figure from).
+    retry_after_secs: f64,
+    /// Best-effort FIFO admission-queue depth at decision time, when a queue
+    /// is configured and reachable.
+    queue_depth: Option<u64>,
+    /// The configured refill rate (tokens/sec) — lets a caller reason about
+    /// its own retry cadence, not just this one denial's `retry_after_secs`.
+    refill_per_sec: f64,
+    /// `true` when this denial was caused by the rate-limiter (or admission
+    /// queue) BACKEND faulting, `false` for a genuine over-limit. Mirrors
+    /// [`RateLimitDecision::Degraded`] — kept as an explicit body field (not
+    /// just the distinct message text) so a programmatic caller doesn't have
+    /// to string-match to tell the two apart.
+    degraded: bool,
+}
+
+/// RLQ-01 (queue-with-feedback): build the structured over-limit /
+/// backend-degraded response. Puts the recovery estimate + queue depth +
+/// refill rate in BOTH the JSON body (for a caller that parses it) and
+/// response headers (`Retry-After` is the standard HTTP header a generic
+/// HTTP client already understands; the `X-RateLimit-*` headers carry the
+/// same data for a caller that only reads headers). `recover_at` is an
+/// absolute Unix timestamp (seconds) so a caller doesn't need to add
+/// `retry_after_secs` to "now" itself and risk clock/latency skew between
+/// receiving the response and scheduling the retry.
+fn rate_limit_response(status: StatusCode, message: &str, feedback: RateLimitFeedback) -> Response {
+    let RateLimitFeedback { retry_after_secs, queue_depth, refill_per_sec, degraded } = feedback;
+    let retry_after_secs = retry_after_secs.max(0.0);
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    // The PRECISE (sub-second) recovery instant — kept as-is in the JSON body
+    // for a caller that wants exactness.
+    let recover_at = now_unix + retry_after_secs;
+    // RLQ-01 codex fix #1: the HEADERS a client OBEYS must round UP, never
+    // down. `Retry-After` is defined in whole seconds (RFC 9110 §10.2.3) and
+    // `X-RateLimit-Recover-At` we emit as a whole-second timestamp — if
+    // either rounded DOWN (e.g. the old `format!("{recover_at:.0}")`, which
+    // rounds to nearest and so can land BEFORE the bucket actually refills) a
+    // caller that honors it would retry early and be denied again. Ceil both
+    // so the reported time is never earlier than the real refill.
+    let retry_after_header = retry_after_secs.ceil().max(1.0) as u64;
+    let recover_at_header = recover_at.ceil() as u64;
+
+    let mut body = json!({
+        "error": message,
+        "degraded": degraded,
+        "retry_after_secs": retry_after_secs,
+        "recover_at": recover_at,
+        "refill_per_sec": refill_per_sec,
+    });
+    if let (Value::Object(map), Some(depth)) = (&mut body, queue_depth) {
+        map.insert("queue_depth".to_string(), json!(depth));
+    }
+
+    let mut response = (
+        status,
+        [
+            ("content-type".to_string(), "application/json".to_string()),
+            ("retry-after".to_string(), retry_after_header.to_string()),
+            ("x-ratelimit-recover-at".to_string(), recover_at_header.to_string()),
+            ("x-ratelimit-refill-per-sec".to_string(), format!("{refill_per_sec}")),
+        ],
+        body.to_string(),
+    )
+        .into_response();
+    if let Some(depth) = queue_depth {
+        if let Ok(value) = depth.to_string().parse::<axum::http::HeaderValue>() {
+            response.headers_mut().insert("x-ratelimit-queue-depth", value);
+        }
+    }
+    response
 }
 
 #[cfg(test)]
@@ -1053,6 +1274,193 @@ mod tests {
         assert!(fw.guard(Some(&id), "tool_b", ActionKind::Tool).await.is_ok());
         // But repeating tool_a again is now limited.
         assert!(fw.guard(Some(&id), "tool_a", ActionKind::Tool).await.is_err());
+    }
+
+    // ── RLQ-01: queue-with-feedback ──────────────────────────────────────
+
+    async fn body_json(resp: Response) -> Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// AC: "over-limit returns a structured signal with an accurate
+    /// retry_after/recover_at". No queue configured here (immediate shed on
+    /// over-limit), so this exercises the `Limited` branch of `guard()`
+    /// directly.
+    #[tokio::test]
+    async fn over_limit_response_carries_retry_after_and_recover_at() {
+        // capacity 1, refill 2 tokens/sec ⇒ retry_after ≈ 0.5s after the 2nd
+        // call exhausts the single token.
+        let fw = GatewayFramework::new(
+            policy_allowing("dev-box", &["*"]),
+            Arc::new(InProcessRateLimiter::new(1, 2.0)),
+        );
+        let id = identity("dev-box");
+        assert!(fw.guard(Some(&id), "ledger_accounts", ActionKind::Tool).await.is_ok());
+        let denied = fw.guard(Some(&id), "ledger_accounts", ActionKind::Tool).await.unwrap_err();
+        assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let retry_after_header =
+            denied.headers().get("retry-after").expect("Retry-After header present");
+        assert!(retry_after_header.to_str().unwrap().parse::<u64>().unwrap() >= 1);
+        let recover_at_header = denied
+            .headers()
+            .get("x-ratelimit-recover-at")
+            .expect("X-RateLimit-Recover-At header present");
+        let recover_at_from_header: f64 = recover_at_header.to_str().unwrap().parse().unwrap();
+
+        let body = body_json(denied).await;
+        assert_eq!(body["degraded"], false, "a real over-limit must not report degraded");
+        let retry_after_secs = body["retry_after_secs"].as_f64().unwrap();
+        assert!(
+            (retry_after_secs - 0.5).abs() < 0.1,
+            "expected ~0.5s retry_after, got {retry_after_secs}"
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let recover_at = body["recover_at"].as_f64().unwrap();
+        assert!(
+            recover_at > now && recover_at < now + 5.0,
+            "recover_at should be a near-future absolute timestamp, got {recover_at} (now={now})"
+        );
+        // RLQ-01 fix #1: the header a client OBEYS must be rounded UP — never
+        // earlier than the precise body value (else a caller retries early
+        // and is denied again). Ceil ⇒ header >= body, within one second.
+        assert!(
+            recover_at_from_header >= recover_at,
+            "recover_at header ({recover_at_from_header}) must NOT under-report the precise \
+             recover_at ({recover_at}) — it must round up"
+        );
+        assert!(
+            recover_at_from_header < recover_at + 1.0,
+            "recover_at header must round up by at most a second, got {recover_at_from_header} \
+             vs {recover_at}"
+        );
+        // RLQ-01 fix #2: the reported refill_per_sec is the ACTUAL limiter's
+        // rate (2.0 here), not some config global.
+        assert_eq!(body["refill_per_sec"].as_f64().unwrap(), 2.0);
+    }
+
+    /// AC: "backend-degraded (Redis error) returns a DISTINCT signal/message
+    /// from a real over-limit". Uses `crate::ratelimit::AlwaysLimited` (the
+    /// same sentinel `terminus_primary` selects on a genuine backend fault)
+    /// as the mock — its `check()` now returns `Degraded`, not `Limited`.
+    #[tokio::test]
+    async fn backend_degraded_response_is_distinct_from_real_limit() {
+        let fw = GatewayFramework::new(
+            policy_allowing("dev-box", &["*"]),
+            Arc::new(crate::ratelimit::AlwaysLimited),
+        );
+        let id = identity("dev-box");
+        let denied = fw.guard(Some(&id), "ledger_accounts", ActionKind::Tool).await.unwrap_err();
+
+        // Distinct HTTP status from a real rate limit (503, not 429).
+        assert_eq!(denied.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_json(denied).await;
+        assert_eq!(body["degraded"], true, "must be flagged degraded, not a real limit");
+        let message = body["error"].as_str().unwrap();
+        assert!(
+            message.contains("backend unavailable") || message.contains("BACKEND"),
+            "message must say the LIMITER BACKEND is degraded, not that the caller is rate \
+             limited: {message}"
+        );
+        assert!(
+            !message.to_lowercase().contains("rate limit exceeded"),
+            "must not read like a real rate-limit denial: {message}"
+        );
+    }
+
+    /// AC: "the Allowed path + existing behavior unchanged when under
+    /// limit". A generous burst never trips the limiter; `guard` must still
+    /// return `Ok` with no rate-limit-shaped denial anywhere in the path.
+    #[tokio::test]
+    async fn allowed_path_unchanged_when_under_limit() {
+        let fw = framework_with(policy_allowing("dev-box", &["*"]), 50);
+        let id = identity("dev-box");
+        for _ in 0..10 {
+            let ctx = fw.guard(Some(&id), "ledger_accounts", ActionKind::Tool).await;
+            assert!(ctx.is_ok(), "well under burst capacity must always be admitted");
+        }
+    }
+
+    /// AC: "recovery estimate is accurate (retry at recover_at succeeds)".
+    /// RLQ-01 codex fix #4: prove the estimate is EXACT, not merely
+    /// eventually-true. Retrying clearly BEFORE the reported window still
+    /// FAILS (the bucket has not refilled a whole token yet), and retrying
+    /// AT/just-after the window SUCCEEDS — so `retry_after_secs` bounds the
+    /// real refill, it isn't a loose over- or under-estimate. Uses the
+    /// deterministic in-process token bucket so timing is a pure function of
+    /// the (capacity, refill) it reports.
+    #[tokio::test]
+    async fn reported_retry_after_is_an_exact_recovery_bound() {
+        // capacity 1, refill 2 tokens/sec ⇒ retry_after is exactly 0.5s after
+        // the single token is spent. Intermediate denied `guard` calls do NOT
+        // consume (the `Limited` path never decrements), so they don't perturb
+        // the timeline.
+        let fw = GatewayFramework::new(
+            policy_allowing("dev-box", &["*"]),
+            Arc::new(InProcessRateLimiter::new(1, 2.0)),
+        );
+        let id = identity("dev-box");
+
+        assert!(fw.guard(Some(&id), "ledger_accounts", ActionKind::Tool).await.is_ok());
+        let denied = fw.guard(Some(&id), "ledger_accounts", ActionKind::Tool).await.unwrap_err();
+        let body = body_json(denied).await;
+        let retry_after_secs = body["retry_after_secs"].as_f64().unwrap();
+        assert!(
+            (retry_after_secs - 0.5).abs() < 0.05,
+            "expected ~0.5s window, got {retry_after_secs}"
+        );
+
+        // BEFORE the window (40% of it): the bucket has accrued < 1 token, so
+        // a retry MUST still be denied. If the estimate were an under-report
+        // (too small), this is where it would wrongly succeed.
+        tokio::time::sleep(std::time::Duration::from_secs_f64(retry_after_secs * 0.4)).await;
+        assert!(
+            fw.guard(Some(&id), "ledger_accounts", ActionKind::Tool).await.is_err(),
+            "retrying well BEFORE the reported recover window must still be denied — the \
+             estimate must not under-report"
+        );
+
+        // AT/just-after the window (cumulative ~1.3x): a full token has
+        // accrued, so the retry MUST now succeed. If the estimate were a gross
+        // over-report (too large), the caller would still be stuck here.
+        tokio::time::sleep(std::time::Duration::from_secs_f64(retry_after_secs * 0.9)).await;
+        assert!(
+            fw.guard(Some(&id), "ledger_accounts", ActionKind::Tool).await.is_ok(),
+            "retrying AT/after the reported recover window must succeed (no stuck-drained bucket, \
+             estimate not an over-report)"
+        );
+    }
+
+    /// RLQ-01 codex fix #3: at admission-queue timeout, `guard` re-derives
+    /// the recovery window from CURRENT bucket state via a non-consuming
+    /// `peek` rather than reusing the stale value computed before the wait.
+    /// This pins the freshness property that path relies on: after time
+    /// spent refilling, the re-derived window is strictly SMALLER than the
+    /// full initial deficit (and `peek` didn't consume, so a real token is
+    /// still there to grant).
+    #[tokio::test]
+    async fn peek_reports_fresh_smaller_window_after_refill() {
+        // capacity 1, refill 1 token/sec ⇒ a fresh over-limit deficit is a
+        // full ~1.0s window.
+        let limiter = InProcessRateLimiter::new(1, 1.0);
+        let key = rate_limit_key("dev-box", "ledger_accounts");
+        assert_eq!(limiter.check(&key).await, RateLimitDecision::Allowed);
+        let initial = limiter.check(&key).await.retry_after_secs().unwrap();
+        assert!((initial - 1.0).abs() < 0.05, "fresh deficit ~1.0s, got {initial}");
+
+        // Time passes (as it would while a request waited in the queue), then
+        // re-derive via peek — exactly what `guard`'s fix-#3 timeout path does.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let fresh = limiter.peek(&key).await.retry_after_secs().unwrap();
+        assert!(
+            fresh < initial - 0.1,
+            "re-derived window ({fresh}) must be SMALLER than the stale pre-wait value \
+             ({initial}) — the refill during the wait must be reflected"
+        );
     }
 
     // ── Uniform pipeline: same code path for tool vs inference actions ──
