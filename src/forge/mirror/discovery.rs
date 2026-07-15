@@ -177,26 +177,56 @@ pub(crate) async fn discover_public_remote(gitea_repo: &str) -> Option<String> {
 
 /// Parse `(host, owner, repo)` from a git remote URL. Handles the HTTPS form
 /// `https://<host>[:port]/<owner>/<repo>[.git][/]` and the scp-like
-/// `[user@]<host>:<owner>/<repo>[.git]` form. Crucially it extracts the HOST
-/// (not just the trailing path segments) so callers can pin it — an override
-/// like `https://evil.example/moosenet-io/Terminus.git` parses with
+/// `[user@]<host>:<owner>/<repo>[.git]` form. Crucially it extracts the TRUE
+/// HOST (not just the trailing path segments) so callers can pin it — an
+/// override like `https://evil.example/moosenet-io/Terminus.git` parses with
 /// `host = "evil.example"`, letting [`verify_public_remote`] reject it even
-/// though its owner/repo would pass a github.com existence check. Returns
-/// `None` when host or the two path segments can't be found — a parse failure
-/// is a hard "cannot verify", which callers treat as fail-closed (do NOT push).
+/// though its owner/repo would pass a github.com existence check.
+///
+/// ## Fail-closed RFC-3986 authority parsing (userinfo hijack defense)
+/// The HTTPS authority is isolated as the substring between `://` and the
+/// first `/`, `?`, or `#`, and the whole remote is REJECTED if that authority
+/// contains an `@` — i.e. any userinfo. This defeats the
+/// `https://github.com:<email>/<org>/<repo>.git` hijack, where per
+/// URL semantics the real host is `evil.example` and `github.com:443` is
+/// userinfo (a naive `split(':')` would wrongly read the host as
+/// `github.com`). Userinfo is never legitimate for our mirror remotes anyway —
+/// the GitHub credential is injected via `GIT_ASKPASS`, never embedded in the
+/// URL — so its mere presence is a hard reject. This is the same
+/// isolate-the-authority-before-splitting lesson as the DSN guard.
+///
+/// For the scp form the host is the token between an optional trailing-most
+/// `user@` and the `:` (scp legitimately has `<email>:` — the `@` is
+/// separating userinfo there, so we take the piece after the LAST `@`; a
+/// spoof like `<email>:o/r` correctly yields `evil.example`).
+///
+/// Returns `None` when the host or the two path segments can't be found, or
+/// when https userinfo is present — every parse failure is a hard "cannot
+/// verify", which callers treat as fail-closed (do NOT push).
 pub(crate) fn parse_github_remote(remote: &str) -> Option<(String, String, String)> {
     let s = remote.trim().trim_end_matches('/');
     let s = s.strip_suffix(".git").unwrap_or(s);
 
     let (host, path): (&str, &str) = if let Some(rest) = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")) {
-        // rest = host[:port]/owner/repo…
-        let (h, p) = rest.split_once('/')?;
-        // Strip an optional :port from the host.
-        let h = h.split(':').next().unwrap_or(h);
-        (h, p)
+        // rest = authority[/path…]. Isolate the RFC-3986 authority: everything
+        // up to the first '/', '?', or '#'. A remote with no path can't name an
+        // owner/repo, so a missing delimiter is a reject.
+        let authority_end = rest.find(|c| c == '/' || c == '?' || c == '#')?;
+        let authority = &rest[..authority_end];
+        let path = &rest[authority_end..];
+        // FAIL-CLOSED: userinfo (anything before an '@' in the authority) is
+        // never legitimate here — reject the whole remote rather than trust a
+        // host parsed around it. This blocks the `host:<email>`
+        // userinfo hijack.
+        if authority.contains('@') {
+            return None;
+        }
+        // host = authority minus an optional :port.
+        let h = authority.split(':').next().unwrap_or(authority);
+        (h, path)
     } else if let Some((userhost, p)) = s.split_once(':') {
         // scp-like: [user@]host:owner/repo (the ':' here is the path
-        // separator, NOT a port). host = the part after an optional `user@`.
+        // separator, NOT a port). host = the part after the LAST `@`.
         let h = userhost.rsplit('@').next().unwrap_or(userhost);
         (h, p)
     } else {
@@ -427,6 +457,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_remote_rejects_https_userinfo_hijack() {
+        // RFC-3986: the real host is `evil.example`; `github.com:443` is
+        // USERINFO (before the '@'). A naive split(':') would read the host as
+        // `github.com`. Userinfo is never legitimate for our mirror remotes →
+        // reject the whole remote (fail-closed), so verify can't be fooled.
+        assert_eq!(parse_github_remote("https://github.com:<email>/moosenet-io/Terminus.git"), None);
+        // …also without a port, and with a plain userinfo token.
+        assert_eq!(parse_github_remote("https://<email>/moosenet-io/Terminus.git"), None);
+        assert_eq!(parse_github_remote("https://user:<email>/moosenet-io/Terminus.git"), None);
+    }
+
+    #[test]
+    fn parse_remote_scp_spoof_takes_host_after_last_at() {
+        // scp `<email>:o/r` → the true host is `evil.example`
+        // (after the LAST '@'), NOT github.com — captured as such so verify
+        // rejects it on the host mismatch.
+        assert_eq!(
+            parse_github_remote("<email>:moosenet-io/Terminus.git"),
+            Some(("evil.example".to_string(), "moosenet-io".to_string(), "Terminus".to_string()))
+        );
+    }
+
+    #[test]
     fn parse_remote_rejects_garbage() {
         assert_eq!(parse_github_remote("not-a-url"), None);
         assert_eq!(parse_github_remote(""), None);
@@ -525,6 +578,72 @@ mod tests {
         assert!(https.unwrap_err().contains("not the configured GitHub host"));
         assert!(scp.is_err(), "scp on a non-GitHub host must be rejected");
         assert!(scp.unwrap_err().contains("not the configured GitHub host"));
+    }
+
+    /// THE codex RFC-3986 userinfo-hijack hole:
+    /// `https://github.com:<email>/moosenet-io/Terminus.git` — the
+    /// REAL host is `evil.example` (github.com:443 is userinfo). The stub says
+    /// moosenet-io/Terminus exists, so ONLY correct authority parsing (reject
+    /// on userinfo) prevents a Verified→push to evil.example. Must be rejected.
+    #[tokio::test]
+    #[serial]
+    async fn verify_public_remote_rejects_userinfo_hijack_even_though_owner_repo_exist() {
+        let had_org = std::env::var(GITHUB_ORG_ENV).ok();
+        let had_host = std::env::var(GITHUB_HOST_ENV).ok();
+        // SAFETY (test-only): #[serial]. Default org=moosenet-io, host=github.com.
+        unsafe {
+            std::env::remove_var(GITHUB_ORG_ENV);
+            std::env::remove_var(GITHUB_HOST_ENV);
+        }
+        let ops = StubExists::ok(true);
+        let res =
+            verify_public_remote(&ops, "https://github.com:<email>/moosenet-io/Terminus.git").await;
+        // scp analogue: true host after the last '@' is evil.example.
+        let scp = verify_public_remote(&ops, "<email>:moosenet-io/Terminus.git").await;
+        unsafe {
+            match had_org {
+                Some(v) => std::env::set_var(GITHUB_ORG_ENV, v),
+                None => std::env::remove_var(GITHUB_ORG_ENV),
+            }
+            match had_host {
+                Some(v) => std::env::set_var(GITHUB_HOST_ENV, v),
+                None => std::env::remove_var(GITHUB_HOST_ENV),
+            }
+        }
+        assert!(res.is_err(), "an https userinfo-hijack remote must be rejected, never pushed");
+        // Parse rejects userinfo outright → "could not parse host/owner/repo".
+        assert!(res.unwrap_err().contains("could not parse"), "userinfo hijack must fail parsing (fail-closed)");
+        assert!(scp.is_err(), "an scp host-spoof remote must be rejected (host is after the last '@')");
+        assert!(scp.unwrap_err().contains("not the configured GitHub host"));
+    }
+
+    /// A normal, credential-free remote (no userinfo) still verifies on both
+    /// forms — the hijack defense must not break the happy path.
+    #[tokio::test]
+    #[serial]
+    async fn verify_public_remote_ok_for_normal_https_and_scp() {
+        let had_org = std::env::var(GITHUB_ORG_ENV).ok();
+        let had_host = std::env::var(GITHUB_HOST_ENV).ok();
+        // SAFETY (test-only): #[serial].
+        unsafe {
+            std::env::remove_var(GITHUB_ORG_ENV);
+            std::env::remove_var(GITHUB_HOST_ENV);
+        }
+        let ops = StubExists::ok(true);
+        let https = verify_public_remote(&ops, "https://github.com/moosenet-io/Muse.git").await;
+        let scp = verify_public_remote(&ops, "<email>:moosenet-io/Muse.git").await;
+        unsafe {
+            match had_org {
+                Some(v) => std::env::set_var(GITHUB_ORG_ENV, v),
+                None => std::env::remove_var(GITHUB_ORG_ENV),
+            }
+            match had_host {
+                Some(v) => std::env::set_var(GITHUB_HOST_ENV, v),
+                None => std::env::remove_var(GITHUB_HOST_ENV),
+            }
+        }
+        assert!(https.is_ok(), "normal https remote must verify: {https:?}");
+        assert!(scp.is_ok(), "normal scp remote must verify: {scp:?}");
     }
 
     #[tokio::test]

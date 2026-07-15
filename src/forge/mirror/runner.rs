@@ -1430,6 +1430,39 @@ mod tests {
         }
     }
 
+    /// THE codex RFC-3986 userinfo-hijack hole, at the funnel: an override
+    /// `https://github.com:<email>/…` (real host evil.example) whose
+    /// owner/repo WOULD pass repo_exists is Rejected — never reaches run_once,
+    /// so internal code is never pushed to the attacker host.
+    #[tokio::test]
+    #[serial]
+    async fn resolve_rejects_override_with_userinfo_hijack() {
+        let had_org = std::env::var(super::super::discovery::GITHUB_ORG_ENV).ok();
+        let had_host = std::env::var(super::super::discovery::GITHUB_HOST_ENV).ok();
+        // SAFETY (test-only): `#[serial]`. Default org + host (github.com).
+        unsafe {
+            std::env::remove_var(super::super::discovery::GITHUB_ORG_ENV);
+            std::env::remove_var(super::super::discovery::GITHUB_HOST_ENV);
+        }
+        let verifier = MapExists::new(&[("Terminus", true)]);
+        let hijack = "https://github.com:<email>/moosenet-io/Terminus.git";
+        let res = resolve_and_verify_remote(&verifier, "Terminus", Some(hijack)).await;
+        unsafe {
+            match had_org {
+                Some(v) => std::env::set_var(super::super::discovery::GITHUB_ORG_ENV, v),
+                None => std::env::remove_var(super::super::discovery::GITHUB_ORG_ENV),
+            }
+            match had_host {
+                Some(v) => std::env::set_var(super::super::discovery::GITHUB_HOST_ENV, v),
+                None => std::env::remove_var(super::super::discovery::GITHUB_HOST_ENV),
+            }
+        }
+        match res {
+            RemoteResolution::Rejected { remote, .. } => assert_eq!(remote, hijack),
+            other => panic!("a userinfo-hijack override must be Rejected (never pushed), got {other:?}"),
+        }
+    }
+
     /// AC (c) override happy path — an override that IS verified (host + org +
     /// exists) resolves to Verified and thus DOES push.
     #[tokio::test]
