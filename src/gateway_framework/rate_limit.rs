@@ -29,25 +29,33 @@ use async_trait::async_trait;
 /// broken" — see the module doc on `crate::ratelimit` for the outage this
 /// distinction fixes.
 ///
-/// `PartialEq` only (no `Eq`) because `retry_after_secs: f64` isn't
-/// `Eq`-able; every comparison site already only needs `==`/`matches!`.
+/// Both over-budget variants also carry `refill_per_sec` — the refill rate
+/// of the ACTUAL limiter instance that produced this decision (RLQ-01 codex
+/// fix #2), NOT a re-read of the config global. This matters for an injected
+/// / custom-rate limiter (tests, or a future per-tenant rate): the feedback
+/// a caller keys off of must reflect the bucket that actually denied it.
+///
+/// `PartialEq` only (no `Eq`) because the `f64` fields aren't `Eq`-able;
+/// every comparison site already only needs `==`/`matches!`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RateLimitDecision {
     /// Under budget; the request proceeds (and budget was consumed as a
-    /// side effect of `check`).
+    /// side effect of `check` — NOT of `peek`).
     Allowed,
     /// A REAL over-limit: the caller has exhausted its budget. Retry after
     /// approximately `retry_after_secs` (derived from the token bucket:
-    /// `(requested - tokens) / refill_per_sec`).
-    Limited { retry_after_secs: f64 },
+    /// `(1 - tokens) / refill_per_sec`), where `refill_per_sec` is this
+    /// limiter instance's own rate.
+    Limited { retry_after_secs: f64, refill_per_sec: f64 },
     /// The limiter backend itself is unavailable/erroring (e.g. Redis
     /// unreachable) — NOT a real rate limit. Distinct from `Limited` so a
     /// caller/operator can tell "you're throttled" apart from "the
     /// rate-limiter is broken" (conflating the two cost a multi-hour
     /// misdiagnosed outage — see `crate::ratelimit`). `retry_after_secs` is
     /// a conservative, config-driven backoff (there is no real bucket state
-    /// to derive it from).
-    Degraded { retry_after_secs: f64 },
+    /// to derive it from); `refill_per_sec` is the limiter's configured rate,
+    /// carried for the feedback response's benefit.
+    Degraded { retry_after_secs: f64, refill_per_sec: f64 },
 }
 
 impl RateLimitDecision {
@@ -68,8 +76,18 @@ impl RateLimitDecision {
     /// `Allowed`.
     pub fn retry_after_secs(&self) -> Option<f64> {
         match self {
-            RateLimitDecision::Limited { retry_after_secs }
-            | RateLimitDecision::Degraded { retry_after_secs } => Some(*retry_after_secs),
+            RateLimitDecision::Limited { retry_after_secs, .. }
+            | RateLimitDecision::Degraded { retry_after_secs, .. } => Some(*retry_after_secs),
+            RateLimitDecision::Allowed => None,
+        }
+    }
+
+    /// The refill rate (tokens/sec) of the limiter instance that produced
+    /// this decision, carried by `Limited`/`Degraded`; `None` for `Allowed`.
+    pub fn refill_per_sec(&self) -> Option<f64> {
+        match self {
+            RateLimitDecision::Limited { refill_per_sec, .. }
+            | RateLimitDecision::Degraded { refill_per_sec, .. } => Some(*refill_per_sec),
             RateLimitDecision::Allowed => None,
         }
     }
@@ -89,6 +107,16 @@ pub trait RateLimiter: Send + Sync {
     /// is decremented as a side effect — this is a check-and-consume call,
     /// not a peek).
     async fn check(&self, key: &str) -> RateLimitDecision;
+
+    /// Report the CURRENT decision for `key` WITHOUT consuming budget (RLQ-01
+    /// codex fix #3). Used to re-derive an accurate recovery window at
+    /// admission-queue timeout time — the pre-wait estimate is stale after a
+    /// bounded wait, so `guard()` re-peeks the bucket at the moment it sheds.
+    /// Refill accrual (time-based) may be applied as a side effect, but no
+    /// token is ever consumed, so calling `peek` never itself changes whether
+    /// a subsequent `check` is admitted. A `Degraded`/backend-fault limiter
+    /// returns the same distinct signal it would from `check`.
+    async fn peek(&self, key: &str) -> RateLimitDecision;
 }
 
 /// Build the canonical rate-limit / audit key for an `(identity, action)`
@@ -155,15 +183,51 @@ impl InProcessRateLimiter {
             bucket.tokens -= 1.0;
             RateLimitDecision::Allowed
         } else {
-            // RLQ-01: derive an accurate recovery estimate straight from the
-            // bucket's own deficit — the same math the token bucket already
-            // uses to refill, just solved for "seconds until >= 1.0 tokens".
-            // `refill_per_sec` is clamped to >= 0.001 in `new`, so this never
-            // divides by zero.
-            let deficit = (1.0 - bucket.tokens).max(0.0);
-            let retry_after_secs = deficit / self.refill_per_sec;
-            RateLimitDecision::Limited { retry_after_secs }
+            RateLimitDecision::Limited {
+                retry_after_secs: self.retry_after_for(bucket.tokens),
+                refill_per_sec: self.refill_per_sec,
+            }
         }
+    }
+
+    /// Refill (time-accrual only — NO consumption) and report the current
+    /// decision. RLQ-01 codex fix #3: this is the non-consuming re-derivation
+    /// `guard()` uses to get a FRESH recovery window at admission-queue
+    /// timeout time. It updates `last_refill`/`tokens` from elapsed time
+    /// exactly like `check_sync`, but never decrements — so a `peek` can
+    /// never itself deny a later legitimate `check`.
+    fn peek_sync(&self, key: &str) -> RateLimitDecision {
+        let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let bucket = buckets.entry(key.to_string()).or_insert_with(|| Bucket {
+            tokens: self.capacity,
+            last_refill: now,
+        });
+
+        let elapsed = now.saturating_duration_since(bucket.last_refill);
+        if elapsed > Duration::ZERO {
+            let refill = elapsed.as_secs_f64() * self.refill_per_sec;
+            bucket.tokens = (bucket.tokens + refill).min(self.capacity);
+            bucket.last_refill = now;
+        }
+
+        if bucket.tokens >= 1.0 {
+            RateLimitDecision::Allowed
+        } else {
+            RateLimitDecision::Limited {
+                retry_after_secs: self.retry_after_for(bucket.tokens),
+                refill_per_sec: self.refill_per_sec,
+            }
+        }
+    }
+
+    /// Seconds until this bucket accrues back to a full token, from its
+    /// current `tokens`. The same math the bucket uses to refill, solved for
+    /// "time until >= 1.0". `refill_per_sec` is clamped to >= 0.001 in `new`,
+    /// so this never divides by zero.
+    fn retry_after_for(&self, tokens: f64) -> f64 {
+        let deficit = (1.0 - tokens).max(0.0);
+        deficit / self.refill_per_sec
     }
 }
 
@@ -175,6 +239,10 @@ impl RateLimiter for InProcessRateLimiter {
         // this is safe to call directly from an async context without a
         // `spawn_blocking` hop.
         self.check_sync(key)
+    }
+
+    async fn peek(&self, key: &str) -> RateLimitDecision {
+        self.peek_sync(key)
     }
 }
 
@@ -209,14 +277,37 @@ mod tests {
         assert_eq!(limiter.check(&key).await, RateLimitDecision::Allowed);
         let decision = limiter.check(&key).await;
         match decision {
-            RateLimitDecision::Limited { retry_after_secs } => {
+            RateLimitDecision::Limited { retry_after_secs, refill_per_sec } => {
                 assert!(
                     (retry_after_secs - 0.5).abs() < 0.05,
                     "expected ~0.5s retry_after, got {retry_after_secs}"
                 );
+                // RLQ-01 fix #2: the decision carries the ACTUAL limiter's
+                // refill rate, not a config global.
+                assert_eq!(refill_per_sec, 2.0);
             }
             other => panic!("expected Limited, got {other:?}"),
         }
+    }
+
+    /// RLQ-01 fix #3: `peek` reports the current recovery estimate WITHOUT
+    /// consuming budget — so re-deriving the window at timeout can't itself
+    /// deny a later legitimate call.
+    #[tokio::test]
+    async fn peek_does_not_consume_budget() {
+        let limiter = InProcessRateLimiter::new(1, 0.0001); // negligible refill
+        let key = rate_limit_key("dev-box", "ledger_accounts");
+
+        // Peeking a fresh (full) bucket reports Allowed and consumes nothing…
+        assert_eq!(limiter.peek(&key).await, RateLimitDecision::Allowed);
+        assert_eq!(limiter.peek(&key).await, RateLimitDecision::Allowed);
+        // …so the single real token is still there for `check` to consume.
+        assert_eq!(limiter.check(&key).await, RateLimitDecision::Allowed);
+        // Now exhausted: both check and peek report Limited.
+        let checked = limiter.check(&key).await;
+        assert!(matches!(checked, RateLimitDecision::Limited { .. }), "{checked:?}");
+        let peeked = limiter.peek(&key).await;
+        assert!(matches!(peeked, RateLimitDecision::Limited { .. }), "{peeked:?}");
     }
 
     #[tokio::test]

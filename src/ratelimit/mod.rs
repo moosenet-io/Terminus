@@ -131,9 +131,15 @@ impl RedisRateLimiter {
     }
 }
 
-#[async_trait]
-impl RateLimiter for RedisRateLimiter {
-    async fn check(&self, key: &str) -> RateLimitDecision {
+impl RedisRateLimiter {
+    /// Run the atomic token-bucket script for `key` with `requested` tokens
+    /// and interpret the `{allowed, tokens_remaining_millitokens}` result.
+    /// `requested = 1` is a check-and-consume (`check`); `requested = 0` is a
+    /// non-consuming refill+read (`peek`, RLQ-01 fix #3) — the script still
+    /// applies time-based refill and returns the current token count, but
+    /// consumes nothing. Both derive the SAME decision shape from the SAME
+    /// atomic read the Lua already did (exact, not an approximation).
+    async fn run_bucket(&self, key: &str, requested: i64) -> RateLimitDecision {
         let bucket = Self::bucket_key(key);
         let capacity = self.capacity;
         let refill = self.refill_per_sec;
@@ -150,27 +156,31 @@ impl RateLimiter for RedisRateLimiter {
                     .arg(capacity)
                     .arg(refill)
                     .arg(now)
-                    .arg(1)
+                    .arg(requested)
                     .invoke_async::<_, Vec<i64>>(&mut conn)
                     .await
             })
             .await;
 
         match outcome {
-            Ok(v) if v.first().copied() == Some(1) => RateLimitDecision::Allowed,
-            // RLQ-01: a REAL over-limit. The Lua script's second return value
-            // is `tokens_remaining` (post-refill, pre-consumption when
-            // denied) in millitokens — reuse it client-side to derive
-            // `retry_after_secs` (`(requested - tokens) / refill`) rather
-            // than re-deriving bucket state or round-tripping again. This is
-            // the SAME atomic read the Lua script already did, so it's exact,
-            // not an approximation.
+            // Derive the decision from the returned token count, NOT the
+            // `allowed` flag: with `requested = 0` the script always reports
+            // allowed=1, so we must key off remaining tokens to tell a genuine
+            // Allowed (>= 1 token) from an over-limit peek (< 1 token). For
+            // `requested = 1` this agrees with the `allowed` flag exactly.
             Ok(v) => {
+                let allowed_flag = v.first().copied() == Some(1);
                 let tokens_millitokens = v.get(1).copied().unwrap_or(0).max(0) as f64;
                 let tokens = tokens_millitokens / 1000.0;
-                let deficit = (1.0 - tokens).max(0.0);
-                let retry_after_secs = if refill > 0.0 { deficit / refill } else { deficit };
-                RateLimitDecision::Limited { retry_after_secs }
+                // A consuming call (requested==1) that the script admitted is
+                // definitively Allowed. Otherwise decide from remaining tokens.
+                if (requested >= 1 && allowed_flag) || tokens >= 1.0 {
+                    RateLimitDecision::Allowed
+                } else {
+                    let deficit = (1.0 - tokens).max(0.0);
+                    let retry_after_secs = if refill > 0.0 { deficit / refill } else { deficit };
+                    RateLimitDecision::Limited { retry_after_secs, refill_per_sec: refill }
+                }
             }
             // RLQ-01 (the outage fix): a genuine BACKEND fault (unreachable
             // Redis, command error — e.g. the disk-full AOF-write failure
@@ -184,11 +194,25 @@ impl RateLimiter for RedisRateLimiter {
             // `retry_after_secs` here is a conservative CONFIG-driven
             // backoff (`crate::config::gateway_rate_limit_degraded_retry_secs`),
             // not derived from bucket state, because on a backend fault
-            // there IS no bucket state to read.
+            // there IS no bucket state to read; `refill_per_sec` is this
+            // limiter instance's own configured rate (RLQ-01 fix #2).
             Err(()) => RateLimitDecision::Degraded {
                 retry_after_secs: crate::config::gateway_rate_limit_degraded_retry_secs(),
+                refill_per_sec: refill,
             },
         }
+    }
+}
+
+#[async_trait]
+impl RateLimiter for RedisRateLimiter {
+    async fn check(&self, key: &str) -> RateLimitDecision {
+        self.run_bucket(key, 1).await
+    }
+
+    async fn peek(&self, key: &str) -> RateLimitDecision {
+        // requested = 0 ⇒ refill + read, never consume.
+        self.run_bucket(key, 0).await
     }
 }
 
@@ -208,8 +232,26 @@ pub struct AlwaysLimited;
 #[async_trait]
 impl RateLimiter for AlwaysLimited {
     async fn check(&self, _key: &str) -> RateLimitDecision {
+        Self::decision()
+    }
+
+    async fn peek(&self, _key: &str) -> RateLimitDecision {
+        // A misconfigured/degraded sentinel has no bucket to refill — a peek
+        // is identical to a check (still the distinct `Degraded` signal, no
+        // consumption to avoid since there is none).
+        Self::decision()
+    }
+}
+
+impl AlwaysLimited {
+    fn decision() -> RateLimitDecision {
+        // No limiter INSTANCE rate exists for the misconfiguration sentinel
+        // (it has no bucket), so `refill_per_sec` reports the deployment's
+        // configured rate — the closest meaningful value — and
+        // `retry_after_secs` is the conservative degraded backoff.
         RateLimitDecision::Degraded {
             retry_after_secs: crate::config::gateway_rate_limit_degraded_retry_secs(),
+            refill_per_sec: crate::config::gateway_rate_limit_refill_per_sec(),
         }
     }
 }
