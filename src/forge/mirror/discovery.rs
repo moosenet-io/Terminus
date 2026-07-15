@@ -38,6 +38,19 @@ pub(crate) const NAME_MAP_ENV: &str = "TERMINUS_MIRROR_NAME_MAP";
 /// against the gitea repo (directory) name.
 pub(crate) const BLACKLIST_ENV: &str = "TERMINUS_MIRROR_BLACKLIST";
 
+/// The git remote HOST public mirrors live on. `TERMINUS_MIRROR_GITHUB_HOST`,
+/// default `github.com`. This is the host of the git remote we PUSH to (and
+/// build discovered remote URLs from) — distinct from the API base
+/// (`api.github.com` / `GITHUB_API_BASE`) the credential/existence-check path
+/// uses. It is REQUIRED to match on any override remote (see
+/// [`verify_public_remote`]): the existence check confirms a repo on
+/// `api.github.com`, so the push remote's host must be pinned to the same
+/// GitHub host — otherwise an override like
+/// `https://evil.example/<org>/<name>.git` would pass a github.com
+/// `repo_exists` check yet push internal code to `evil.example`.
+pub(crate) const GITHUB_HOST_ENV: &str = "TERMINUS_MIRROR_GITHUB_HOST";
+const DEFAULT_GITHUB_HOST: &str = "github.com";
+
 /// The configured public-mirror GitHub org (`TERMINUS_MIRROR_GITHUB_ORG`,
 /// default `moosenet-io`).
 pub(crate) fn github_org() -> String {
@@ -46,6 +59,17 @@ pub(crate) fn github_org() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_GITHUB_ORG.to_string())
+}
+
+/// The configured GitHub git-remote host (`TERMINUS_MIRROR_GITHUB_HOST`,
+/// default `github.com`). Not an arbitrary host — the default is GitHub and
+/// an operator must explicitly opt into a different one.
+pub(crate) fn github_host() -> String {
+    std::env::var(GITHUB_HOST_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_GITHUB_HOST.to_string())
 }
 
 /// Parse `TERMINUS_MIRROR_NAME_MAP` into a gitea-name → public-name map.
@@ -113,9 +137,10 @@ impl PublicRepoExists for RealPublicRepoExists {
 /// logic (both mean "don't mirror this tick").
 pub(crate) async fn discover_public_remote_with(ops: &dyn PublicRepoExists, gitea_repo: &str) -> Option<String> {
     let org = github_org();
+    let host = github_host();
     let public_name = name_map().get(gitea_repo).cloned().unwrap_or_else(|| gitea_repo.to_string());
     match ops.exists(&org, &public_name).await {
-        Ok(true) => Some(format!("https://github.com/{org}/{public_name}.git")),
+        Ok(true) => Some(format!("https://{host}/{org}/{public_name}.git")),
         Ok(false) => None,
         Err(e) => {
             tracing::warn!(
@@ -150,41 +175,73 @@ pub(crate) async fn discover_public_remote(gitea_repo: &str) -> Option<String> {
 // otherwise an override could redirect an auto-baseline at an
 // unverified/wrong/foreign remote. [`verify_public_remote`] is that check.
 
-/// Parse `(owner, repo)` from a GitHub remote URL. Handles the HTTPS form
-/// `https://github.com/<owner>/<repo>[.git][/]` and the scp-like
-/// `<email>:<owner>/<repo>[.git]` form by taking the last two path
-/// segments (and stripping a `host:` prefix off the owner in the scp form).
-/// Returns `None` when two segments can't be found — a parse failure is a
-/// hard "cannot verify", which callers treat as fail-closed (do NOT push).
-pub(crate) fn parse_github_owner_repo(remote: &str) -> Option<(String, String)> {
+/// Parse `(host, owner, repo)` from a git remote URL. Handles the HTTPS form
+/// `https://<host>[:port]/<owner>/<repo>[.git][/]` and the scp-like
+/// `[user@]<host>:<owner>/<repo>[.git]` form. Crucially it extracts the HOST
+/// (not just the trailing path segments) so callers can pin it — an override
+/// like `https://evil.example/moosenet-io/Terminus.git` parses with
+/// `host = "evil.example"`, letting [`verify_public_remote`] reject it even
+/// though its owner/repo would pass a github.com existence check. Returns
+/// `None` when host or the two path segments can't be found — a parse failure
+/// is a hard "cannot verify", which callers treat as fail-closed (do NOT push).
+pub(crate) fn parse_github_remote(remote: &str) -> Option<(String, String, String)> {
     let s = remote.trim().trim_end_matches('/');
     let s = s.strip_suffix(".git").unwrap_or(s);
-    let parts: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
+
+    let (host, path): (&str, &str) = if let Some(rest) = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")) {
+        // rest = host[:port]/owner/repo…
+        let (h, p) = rest.split_once('/')?;
+        // Strip an optional :port from the host.
+        let h = h.split(':').next().unwrap_or(h);
+        (h, p)
+    } else if let Some((userhost, p)) = s.split_once(':') {
+        // scp-like: [user@]host:owner/repo (the ':' here is the path
+        // separator, NOT a port). host = the part after an optional `user@`.
+        let h = userhost.rsplit('@').next().unwrap_or(userhost);
+        (h, p)
+    } else {
+        // No scheme and no ':' — not a remote URL we can safely attribute a
+        // host to. Reject rather than guess (fail-closed).
+        return None;
+    };
+
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
     if parts.len() < 2 {
         return None;
     }
+    let owner = parts[parts.len() - 2];
     let repo = parts[parts.len() - 1];
-    let owner_raw = parts[parts.len() - 2];
-    // scp-like `<email>:owner` → keep only the segment after the last ':'.
-    let owner = owner_raw.rsplit(':').next().unwrap_or(owner_raw);
-    if owner.is_empty() || repo.is_empty() {
+    if host.is_empty() || owner.is_empty() || repo.is_empty() {
         return None;
     }
-    Some((owner.to_string(), repo.to_string()))
+    Some((host.to_string(), owner.to_string(), repo.to_string()))
 }
 
-/// Verify that an override remote URL points to an existing public repo we
-/// can see AND is under the configured mirror org (`TERMINUS_MIRROR_GITHUB_ORG`,
-/// default `moosenet-io`). `Ok(())` = verified, safe to push. `Err(reason)` =
-/// do NOT push — one of: the URL can't be parsed, its owner isn't the
-/// configured org (a foreign/wrong target — e.g. `github.com/attacker/x`),
+/// Verify that an override remote URL is a safe push target: its HOST is the
+/// configured GitHub host (`TERMINUS_MIRROR_GITHUB_HOST`, default
+/// `github.com`), its owner is the configured mirror org
+/// (`TERMINUS_MIRROR_GITHUB_ORG`, default `moosenet-io`), AND `repo_exists`
+/// confirms it. `Ok(())` = verified, safe to push. `Err(reason)` = do NOT
+/// push — one of: the URL can't be parsed, the host is NOT the GitHub host
+/// (e.g. `evil.example` / a gitea host — the verification-target-≠-push-target
+/// bypass), the owner isn't the configured org (e.g. `github.com/attacker/x`),
 /// `repo_exists` is `false`, or the existence check itself errored (→
-/// fail-closed, never assume it exists). This is the sole gate an override
-/// must pass, mirroring the guarantee `discover_public_remote_with` already
-/// bakes into discovered remotes.
+/// fail-closed). Host + org + existence are ALL checked on the EXACT remote
+/// that would be pushed, so the invariant "we only ever push to
+/// `<github-host>/<org>/<name>` proven to exist" holds. This mirrors the
+/// guarantee `discover_public_remote_with` bakes into discovered remotes
+/// (which are built from the same host + org).
 pub(crate) async fn verify_public_remote(ops: &dyn PublicRepoExists, remote: &str) -> Result<(), String> {
-    let (owner, repo) =
-        parse_github_owner_repo(remote).ok_or_else(|| format!("could not parse owner/repo from remote URL '{remote}'"))?;
+    let (host, owner, repo) = parse_github_remote(remote)
+        .ok_or_else(|| format!("could not parse host/owner/repo from remote URL '{remote}'"))?;
+    let expected_host = github_host();
+    if !host.eq_ignore_ascii_case(&expected_host) {
+        return Err(format!(
+            "remote host '{host}' is not the configured GitHub host '{expected_host}' — refusing to push \
+             to a non-GitHub host (the existence check verifies a repo on GitHub, so the push target's \
+             host must match; set TERMINUS_MIRROR_GITHUB_HOST if this host is intended)"
+        ));
+    }
     let org = github_org();
     if owner != org {
         return Err(format!(
@@ -324,36 +381,57 @@ mod tests {
         assert_eq!(seen_repo.as_deref(), Some("public-name"));
     }
 
-    // ── parse_github_owner_repo / verify_public_remote ───────────────────────
+    // ── parse_github_remote / verify_public_remote ───────────────────────────
 
     #[test]
-    fn parse_owner_repo_https_with_and_without_dot_git() {
+    fn parse_remote_https_extracts_host_owner_repo() {
         assert_eq!(
-            parse_github_owner_repo("https://github.com/moosenet-io/Terminus.git"),
-            Some(("moosenet-io".to_string(), "Terminus".to_string()))
+            parse_github_remote("https://github.com/moosenet-io/Terminus.git"),
+            Some(("github.com".to_string(), "moosenet-io".to_string(), "Terminus".to_string()))
         );
         assert_eq!(
-            parse_github_owner_repo("https://github.com/moosenet-io/Terminus"),
-            Some(("moosenet-io".to_string(), "Terminus".to_string()))
+            parse_github_remote("https://github.com/moosenet-io/Terminus"),
+            Some(("github.com".to_string(), "moosenet-io".to_string(), "Terminus".to_string()))
         );
         assert_eq!(
-            parse_github_owner_repo("https://github.com/moosenet-io/Terminus/"),
-            Some(("moosenet-io".to_string(), "Terminus".to_string()))
+            parse_github_remote("https://github.com/moosenet-io/Terminus/"),
+            Some(("github.com".to_string(), "moosenet-io".to_string(), "Terminus".to_string()))
+        );
+        // Host with a port is still attributed correctly.
+        assert_eq!(
+            parse_github_remote("https://github.com:443/moosenet-io/Terminus.git"),
+            Some(("github.com".to_string(), "moosenet-io".to_string(), "Terminus".to_string()))
         );
     }
 
     #[test]
-    fn parse_owner_repo_scp_like_form() {
+    fn parse_remote_scp_like_extracts_host_owner_repo() {
         assert_eq!(
-            parse_github_owner_repo("<email>:moosenet-io/Terminus.git"),
-            Some(("moosenet-io".to_string(), "Terminus".to_string()))
+            parse_github_remote("<email>:moosenet-io/Terminus.git"),
+            Some(("github.com".to_string(), "moosenet-io".to_string(), "Terminus".to_string()))
         );
     }
 
     #[test]
-    fn parse_owner_repo_rejects_garbage() {
-        assert_eq!(parse_github_owner_repo("not-a-url"), None);
-        assert_eq!(parse_github_owner_repo(""), None);
+    fn parse_remote_captures_non_github_host() {
+        // The load-bearing case: a foreign host is captured as such (NOT
+        // silently reduced to owner/repo), so verify can reject it.
+        assert_eq!(
+            parse_github_remote("https://evil.example/moosenet-io/Terminus.git"),
+            Some(("evil.example".to_string(), "moosenet-io".to_string(), "Terminus".to_string()))
+        );
+        assert_eq!(
+            parse_github_remote("<email>:moosenet-io/Terminus.git"),
+            Some(("evil.example".to_string(), "moosenet-io".to_string(), "Terminus".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_remote_rejects_garbage() {
+        assert_eq!(parse_github_remote("not-a-url"), None);
+        assert_eq!(parse_github_remote(""), None);
+        // No scheme and no ':' → can't attribute a host → reject.
+        assert_eq!(parse_github_remote("github.com/moosenet-io/Terminus"), None);
     }
 
     #[tokio::test]
@@ -412,6 +490,41 @@ mod tests {
         }
         assert!(res.is_err(), "a foreign-org remote must be rejected even if it exists");
         assert!(res.unwrap_err().contains("not the configured mirror org"));
+    }
+
+    /// THE codex/opus hole: an override on a NON-GitHub host whose owner/repo
+    /// WOULD pass a github.com existence check must be REJECTED on the host
+    /// mismatch — the push target's host must equal the GitHub host the
+    /// existence check verifies against, or internal code would be pushed to
+    /// the attacker host. Covers both https and scp forms; stub says exists=true
+    /// to prove the host check fires first.
+    #[tokio::test]
+    #[serial]
+    async fn verify_public_remote_rejects_non_github_host_even_though_owner_repo_exist() {
+        let had_org = std::env::var(GITHUB_ORG_ENV).ok();
+        let had_host = std::env::var(GITHUB_HOST_ENV).ok();
+        // SAFETY (test-only): #[serial]. Default org=moosenet-io, host=github.com.
+        unsafe {
+            std::env::remove_var(GITHUB_ORG_ENV);
+            std::env::remove_var(GITHUB_HOST_ENV);
+        }
+        let ops = StubExists::ok(true);
+        let https = verify_public_remote(&ops, "https://evil.example/moosenet-io/Terminus.git").await;
+        let scp = verify_public_remote(&ops, "<email>:moosenet-io/Terminus.git").await;
+        unsafe {
+            match had_org {
+                Some(v) => std::env::set_var(GITHUB_ORG_ENV, v),
+                None => std::env::remove_var(GITHUB_ORG_ENV),
+            }
+            match had_host {
+                Some(v) => std::env::set_var(GITHUB_HOST_ENV, v),
+                None => std::env::remove_var(GITHUB_HOST_ENV),
+            }
+        }
+        assert!(https.is_err(), "https on a non-GitHub host must be rejected");
+        assert!(https.unwrap_err().contains("not the configured GitHub host"));
+        assert!(scp.is_err(), "scp on a non-GitHub host must be rejected");
+        assert!(scp.unwrap_err().contains("not the configured GitHub host"));
     }
 
     #[tokio::test]

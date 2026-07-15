@@ -1393,7 +1393,44 @@ mod tests {
         }
     }
 
-    /// AC (c) override happy path — an override that IS verified (org-matched +
+    /// THE codex/opus host hole, at the funnel: an override whose owner/repo
+    /// WOULD pass repo_exists but whose HOST is not GitHub (evil.example) is
+    /// Rejected — never reaches run_once, so internal code is never pushed to
+    /// the attacker host. The stub says the repo exists to prove the host
+    /// check, not the existence result, is what blocks it.
+    #[tokio::test]
+    #[serial]
+    async fn resolve_rejects_override_on_non_github_host() {
+        let had_org = std::env::var(super::super::discovery::GITHUB_ORG_ENV).ok();
+        let had_host = std::env::var(super::super::discovery::GITHUB_HOST_ENV).ok();
+        // SAFETY (test-only): `#[serial]`. Default org + host (github.com).
+        unsafe {
+            std::env::remove_var(super::super::discovery::GITHUB_ORG_ENV);
+            std::env::remove_var(super::super::discovery::GITHUB_HOST_ENV);
+        }
+        let verifier = MapExists::new(&[("Terminus", true)]);
+        let res =
+            resolve_and_verify_remote(&verifier, "Terminus", Some("https://evil.example/moosenet-io/Terminus.git")).await;
+        unsafe {
+            match had_org {
+                Some(v) => std::env::set_var(super::super::discovery::GITHUB_ORG_ENV, v),
+                None => std::env::remove_var(super::super::discovery::GITHUB_ORG_ENV),
+            }
+            match had_host {
+                Some(v) => std::env::set_var(super::super::discovery::GITHUB_HOST_ENV, v),
+                None => std::env::remove_var(super::super::discovery::GITHUB_HOST_ENV),
+            }
+        }
+        match res {
+            RemoteResolution::Rejected { remote, reason } => {
+                assert_eq!(remote, "https://evil.example/moosenet-io/Terminus.git");
+                assert!(reason.contains("not the configured GitHub host"), "reason: {reason}");
+            }
+            other => panic!("an override on a non-GitHub host must be Rejected (never pushed), got {other:?}"),
+        }
+    }
+
+    /// AC (c) override happy path — an override that IS verified (host + org +
     /// exists) resolves to Verified and thus DOES push.
     #[tokio::test]
     #[serial]
