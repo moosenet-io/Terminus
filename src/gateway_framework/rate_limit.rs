@@ -18,10 +18,61 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
 /// Outcome of a rate-limit check for one `(identity, action)` key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// RLQ-01 (queue-with-feedback): `Limited` and `Degraded` both carry
+/// `retry_after_secs` — the estimated number of seconds until a caller
+/// should retry — so `crate::gateway_framework::guard` can hand every
+/// over-limit caller an actionable recovery time instead of a bare 429 wall.
+/// They are kept as SEPARATE variants (not one `Limited { degraded: bool,
+/// .. }`) specifically so `match`/`matches!` call sites can't accidentally
+/// conflate "you are over budget" with "the limiter backend itself is
+/// broken" — see the module doc on `crate::ratelimit` for the outage this
+/// distinction fixes.
+///
+/// `PartialEq` only (no `Eq`) because `retry_after_secs: f64` isn't
+/// `Eq`-able; every comparison site already only needs `==`/`matches!`.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RateLimitDecision {
+    /// Under budget; the request proceeds (and budget was consumed as a
+    /// side effect of `check`).
     Allowed,
-    Limited,
+    /// A REAL over-limit: the caller has exhausted its budget. Retry after
+    /// approximately `retry_after_secs` (derived from the token bucket:
+    /// `(requested - tokens) / refill_per_sec`).
+    Limited { retry_after_secs: f64 },
+    /// The limiter backend itself is unavailable/erroring (e.g. Redis
+    /// unreachable) — NOT a real rate limit. Distinct from `Limited` so a
+    /// caller/operator can tell "you're throttled" apart from "the
+    /// rate-limiter is broken" (conflating the two cost a multi-hour
+    /// misdiagnosed outage — see `crate::ratelimit`). `retry_after_secs` is
+    /// a conservative, config-driven backoff (there is no real bucket state
+    /// to derive it from).
+    Degraded { retry_after_secs: f64 },
+}
+
+impl RateLimitDecision {
+    /// `true` for `Limited`/`Degraded` — i.e. `guard()` must not admit the
+    /// request outright. `false` only for `Allowed`.
+    pub fn is_over_budget(&self) -> bool {
+        !matches!(self, RateLimitDecision::Allowed)
+    }
+
+    /// `true` only for `Degraded` — the limiter backend fault case, as
+    /// opposed to a genuine over-limit (`Limited`) or a clean pass
+    /// (`Allowed`).
+    pub fn is_degraded(&self) -> bool {
+        matches!(self, RateLimitDecision::Degraded { .. })
+    }
+
+    /// The recovery estimate carried by `Limited`/`Degraded`, `None` for
+    /// `Allowed`.
+    pub fn retry_after_secs(&self) -> Option<f64> {
+        match self {
+            RateLimitDecision::Limited { retry_after_secs }
+            | RateLimitDecision::Degraded { retry_after_secs } => Some(*retry_after_secs),
+            RateLimitDecision::Allowed => None,
+        }
+    }
 }
 
 /// Seam a later Redis-backed limiter (Phase P4) implements as a drop-in
@@ -104,7 +155,14 @@ impl InProcessRateLimiter {
             bucket.tokens -= 1.0;
             RateLimitDecision::Allowed
         } else {
-            RateLimitDecision::Limited
+            // RLQ-01: derive an accurate recovery estimate straight from the
+            // bucket's own deficit — the same math the token bucket already
+            // uses to refill, just solved for "seconds until >= 1.0 tokens".
+            // `refill_per_sec` is clamped to >= 0.001 in `new`, so this never
+            // divides by zero.
+            let deficit = (1.0 - bucket.tokens).max(0.0);
+            let retry_after_secs = deficit / self.refill_per_sec;
+            RateLimitDecision::Limited { retry_after_secs }
         }
     }
 }
@@ -133,7 +191,32 @@ mod tests {
         assert_eq!(limiter.check(&key).await, RateLimitDecision::Allowed);
         assert_eq!(limiter.check(&key).await, RateLimitDecision::Allowed);
         // 4th call within the same instant exhausts the burst of 3.
-        assert_eq!(limiter.check(&key).await, RateLimitDecision::Limited);
+        let decision = limiter.check(&key).await;
+        assert!(matches!(decision, RateLimitDecision::Limited { .. }), "{decision:?}");
+    }
+
+    /// RLQ-01: `retry_after_secs` must be a real, accurate estimate — not a
+    /// zero/placeholder — derived from the bucket's own deficit and refill
+    /// rate, so a caller that retries at `recover_at` actually succeeds
+    /// (acceptance criterion: recovery estimate accuracy).
+    #[tokio::test]
+    async fn limited_carries_accurate_retry_after() {
+        // capacity 1, refill 2 tokens/sec: after exhausting the single
+        // token, the deficit is 1.0 token, so retry_after should be ~0.5s.
+        let limiter = InProcessRateLimiter::new(1, 2.0);
+        let key = rate_limit_key("dev-box", "ledger_accounts");
+
+        assert_eq!(limiter.check(&key).await, RateLimitDecision::Allowed);
+        let decision = limiter.check(&key).await;
+        match decision {
+            RateLimitDecision::Limited { retry_after_secs } => {
+                assert!(
+                    (retry_after_secs - 0.5).abs() < 0.05,
+                    "expected ~0.5s retry_after, got {retry_after_secs}"
+                );
+            }
+            other => panic!("expected Limited, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -142,7 +225,8 @@ mod tests {
         let key = rate_limit_key("dev-box", "ledger_accounts");
 
         assert_eq!(limiter.check(&key).await, RateLimitDecision::Allowed);
-        assert_eq!(limiter.check(&key).await, RateLimitDecision::Limited);
+        let decision = limiter.check(&key).await;
+        assert!(matches!(decision, RateLimitDecision::Limited { .. }), "{decision:?}");
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(
@@ -159,7 +243,8 @@ mod tests {
         let key_b = rate_limit_key("harmony-primary", "ledger_accounts");
 
         assert_eq!(limiter.check(&key_a).await, RateLimitDecision::Allowed);
-        assert_eq!(limiter.check(&key_a).await, RateLimitDecision::Limited);
+        let decision = limiter.check(&key_a).await;
+        assert!(matches!(decision, RateLimitDecision::Limited { .. }), "{decision:?}");
         // A different identity on the same action has its own budget.
         assert_eq!(limiter.check(&key_b).await, RateLimitDecision::Allowed);
     }

@@ -88,8 +88,16 @@ pub enum AuditResult {
     /// this action.
     DeniedNotAllowlisted,
     /// Rejected before dispatch: identity's rate-limit budget for this
-    /// action is exhausted.
+    /// action is exhausted (a REAL over-limit).
     DeniedRateLimited,
+    /// RLQ-01: rejected before dispatch, but NOT because of a real
+    /// over-limit — the rate-limiter BACKEND itself is degraded (e.g. Redis
+    /// unreachable, or a misconfigured `REDIS_URL`). Kept distinct from
+    /// `DeniedRateLimited` in the audit trail for the same reason
+    /// `RateLimitDecision::Degraded` is kept distinct from `Limited`: a
+    /// backend outage must be diagnosable from the log, not indistinguishable
+    /// from ordinary throttling.
+    DeniedRateLimiterDegraded,
 }
 
 impl AuditResult {
