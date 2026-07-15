@@ -165,6 +165,49 @@ fn auto_approve_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Environment variable gating MIRROR-AUTO's auto-baseline first-push (see
+/// [`bootstrap_first_push`]). Unlike [`AUTO_APPROVE_ENV`] (default OFF), this
+/// defaults ON per the MIRROR-AUTO operator directive: opt-out discovery
+/// (`crate::forge::mirror::discovery`) already only ever surfaces a repo that
+/// has a real public GitHub target, so an operator who wants NO automatic
+/// first publish at all sets this to `"false"` explicitly — the flag exists
+/// so the behavior is auditable/disableable, not because the default is
+/// intended to be off. This flag NEVER weakens the PII hard-block: the
+/// full-history gate in `git_public_history_backfill` runs (and can withhold)
+/// unconditionally, regardless of this flag's value — see
+/// `runner::run_once_with`'s no-lineage branch, which always gates BEFORE
+/// even checking this flag's effect on the push step.
+const AUTO_BASELINE_ENV: &str = "TERMINUS_MIRROR_AUTO_BASELINE";
+
+/// Whether [`AUTO_BASELINE_ENV`] is enabled: default TRUE (unset, or any
+/// value other than a case-insensitive `"false"`), matching the operator
+/// directive. `pub(crate)` so `runner` can resolve the production default
+/// without duplicating this parsing.
+pub(crate) fn auto_baseline_enabled() -> bool {
+    std::env::var(AUTO_BASELINE_ENV).ok().map(|s| !s.trim().eq_ignore_ascii_case("false")).unwrap_or(true)
+}
+
+/// Env-only remote override check for a repo — the SAME lookup order
+/// `resolve_remote` uses (`TERMINUS_MIRROR_REMOTE_<REPO_UPPER>` then
+/// `TERMINUS_MIRROR_REMOTE`) but never erroring: no override configured is a
+/// plain `None`. Used by MIRROR-AUTO's bulk discovery pass (`runner`) to
+/// decide, per repo, whether an operator-set env override should win over a
+/// freshly `discover_public_remote`-ed target — "use the discovered remote
+/// when no explicit `github_remote`/`TERMINUS_MIRROR_REMOTE` override is
+/// set" from the MIRROR-AUTO spec.
+pub(crate) fn remote_env_override(repo: &str) -> Option<String> {
+    let per_repo = format!("{REMOTE_ENV}_{}", repo.to_uppercase().replace(|c: char| !c.is_ascii_alphanumeric(), "_"));
+    for key in [per_repo.as_str(), REMOTE_ENV] {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 /// Tag namespace marking a snapshot the OPERATOR has authorised for push. Created
 /// ONLY by `git_public_mirror_approve` after the approval gate grants — distinct from
 /// GHMR-03's `mirror-approved/*` (gate-clean, but machine-created by prepare). Push
@@ -1924,6 +1967,14 @@ pub(crate) async fn history_sync(args: Value) -> Result<String, ToolError> {
     GitPublicHistorySync.execute(args).await
 }
 
+/// MIRROR-AUTO: invoke [`bootstrap_first_push`] — NOT a registered tool (see
+/// its doc comment), reachable only from `runner::run_once_with`'s no-lineage
+/// auto-baseline branch, after that caller has already confirmed a
+/// gate-clean full-history backfill.
+pub(crate) async fn history_bootstrap_first_push(args: Value) -> Result<Value, ToolError> {
+    bootstrap_first_push(&args)
+}
+
 /// The going-forward push-boundary state a mirror-runner pass needs to know
 /// BEFORE it advances the local history work-dir via backfill (MRUN-01).
 pub(crate) enum PushBoundary {
@@ -2015,6 +2066,97 @@ pub(crate) fn ensure_push_boundary(args: &Value) -> Result<PushBoundary, ToolErr
              git_public_history_backfill + operator bless + force re-baseline (GHIST-07); the \
              runner never force-pushes."
         ))),
+    }
+}
+
+/// MIRROR-AUTO — the SAFE, non-force "first publish" for a genuinely
+/// first-time repo (no established public lineage at all). Called by
+/// [`crate::forge::mirror::runner::run_once_with`] ONLY after
+/// `git_public_history_backfill` has ALREADY run a FULL history replay +
+/// FULL-HISTORY PII gate and reported `gate.clean == true` — this function
+/// does not re-run the PII gate itself and is NOT a registered `RustTool`
+/// (unreachable from the model/registry), keeping the auto-publish surface
+/// to exactly one call site: the runner's automated pass.
+///
+/// ## Why this never needs `--force` (load-bearing)
+/// A first push to a `main` ref that does not yet exist on the remote is not
+/// a force-push in git terms — there is nothing to overwrite. This function
+/// pushes ONLY when [`remote_main_tip`] confirms the remote genuinely has no
+/// `main` branch; if the remote unexpectedly already has ONE (however it got
+/// there), that is treated as a possible divergence/pre-existing-content
+/// hazard and refused with [`ToolError::Conflict`] — mapped by the runner to
+/// `NeedsOperatorRebaseline`, exactly like every other divergence signal in
+/// this module. This function therefore never calls `assert_never_force` (no
+/// force flag is ever present to strip) and never touches an existing ref.
+///
+/// ## Gated, audited, and disableable
+/// Requires [`auto_baseline_enabled`] (`TERMINUS_MIRROR_AUTO_BASELINE`,
+/// default true) even though the runner already checks this before calling —
+/// defense in depth for any future direct caller. Every successful
+/// auto-baseline push is logged via `tracing::warn!(target: "mirror_audit",
+/// event = "auto_baseline_push", ...)`, matching the existing
+/// `auto_approve`/`auto_push` audit convention.
+pub(crate) fn bootstrap_first_push(args: &Value) -> Result<Value, ToolError> {
+    if !auto_baseline_enabled() {
+        return Err(ToolError::NotConfigured(format!(
+            "{AUTO_BASELINE_ENV} is disabled — auto-baseline first-push will not run \
+             (unset it, or set it to anything other than \"false\", to re-enable)"
+        )));
+    }
+    let repo = req_str(args, "repo")?;
+    validate_repo(repo)?;
+    let source = resolve_source(args, repo)?;
+    ensure_source_is_main(&source)?;
+    let hwd = history_workdir(repo)?;
+
+    // The runner only calls this after a successful, gate-clean
+    // git_public_history_backfill, which establishes local lineage as a
+    // side effect (see replay_incremental_or_full) — so this should always
+    // hold. Checked anyway: an ungated direct call must fail closed, not
+    // assume backfill already ran.
+    if last_mirrored_sha(&hwd).is_none() || !hwd.join(".git").is_dir() {
+        return Err(ToolError::Conflict(format!(
+            "no established local history lineage for '{repo}' — run git_public_history_backfill \
+             (gate-clean) first; bootstrap_first_push only publishes an already-backfilled snapshot, \
+             it never creates local lineage itself"
+        )));
+    }
+
+    let remote = resolve_remote(args, repo)?;
+    match remote_main_tip(&remote)? {
+        Some(tip) => Err(ToolError::Conflict(format!(
+            "public mirror 'main' for '{repo}' already exists at {tip} — refusing auto-baseline \
+             (this is not a genuine first-time repo, or a prior publish already happened out of \
+             band). Nothing was pushed. Reconcile via the operator-blessed GHIST-07 procedure; \
+             auto-baseline never force-pushes or overwrites an existing ref."
+        ))),
+        None => {
+            let tip = run_git(&hwd, &["rev-parse", "HEAD"])?.trim().to_string();
+            // No remote 'main' ref exists yet, so this creates it from
+            // nothing — never a --force/-f/--force-with-lease, and git
+            // itself would refuse this exact command if a 'main' ref DID
+            // exist without --force, so the safety property holds even if
+            // the remote_main_tip() check above raced with an external
+            // change between the check and this push.
+            run_git(&hwd, &["push", &remote, &format!("{tip}:refs/heads/main")])?;
+            set_pushed_sha(&hwd, &tip)?;
+            tracing::warn!(
+                target: "mirror_audit",
+                event = "auto_baseline_push",
+                repo = %repo,
+                remote = %remote,
+                to = %tip,
+                "MIRROR-AUTO: established first public-mirror baseline automatically (gate-clean backfill, empty remote — no --force used)"
+            );
+            Ok(json!({
+                "repo": repo,
+                "pushed": true,
+                "bootstrap": true,
+                "old_head": Value::Null,
+                "work_head": tip,
+                "branch": "main",
+            }))
+        }
     }
 }
 
