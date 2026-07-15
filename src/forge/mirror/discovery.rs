@@ -138,6 +138,67 @@ pub(crate) async fn discover_public_remote(gitea_repo: &str) -> Option<String> {
     discover_public_remote_with(&RealPublicRepoExists, gitea_repo).await
 }
 
+// ── Override-remote verification (closes the two verification-bypass gaps) ─────
+//
+// The safety invariant of MIRROR-AUTO's auto-push is: we ONLY ever push to a
+// verified, org-matched public repo that `github::repo_exists` confirms.
+// `discover_public_remote_with` already enforces that for DISCOVERED remotes
+// (it only returns `Some` when the repo exists, and always builds the URL
+// under the configured org). But an operator-supplied OVERRIDE remote
+// (call-level `github_remote`, or `TERMINUS_MIRROR_REMOTE[_<REPO>]`), and the
+// explicit-`repo` path, must be run through the SAME check before any push —
+// otherwise an override could redirect an auto-baseline at an
+// unverified/wrong/foreign remote. [`verify_public_remote`] is that check.
+
+/// Parse `(owner, repo)` from a GitHub remote URL. Handles the HTTPS form
+/// `https://github.com/<owner>/<repo>[.git][/]` and the scp-like
+/// `<email>:<owner>/<repo>[.git]` form by taking the last two path
+/// segments (and stripping a `host:` prefix off the owner in the scp form).
+/// Returns `None` when two segments can't be found — a parse failure is a
+/// hard "cannot verify", which callers treat as fail-closed (do NOT push).
+pub(crate) fn parse_github_owner_repo(remote: &str) -> Option<(String, String)> {
+    let s = remote.trim().trim_end_matches('/');
+    let s = s.strip_suffix(".git").unwrap_or(s);
+    let parts: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let repo = parts[parts.len() - 1];
+    let owner_raw = parts[parts.len() - 2];
+    // scp-like `<email>:owner` → keep only the segment after the last ':'.
+    let owner = owner_raw.rsplit(':').next().unwrap_or(owner_raw);
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((owner.to_string(), repo.to_string()))
+}
+
+/// Verify that an override remote URL points to an existing public repo we
+/// can see AND is under the configured mirror org (`TERMINUS_MIRROR_GITHUB_ORG`,
+/// default `moosenet-io`). `Ok(())` = verified, safe to push. `Err(reason)` =
+/// do NOT push — one of: the URL can't be parsed, its owner isn't the
+/// configured org (a foreign/wrong target — e.g. `github.com/attacker/x`),
+/// `repo_exists` is `false`, or the existence check itself errored (→
+/// fail-closed, never assume it exists). This is the sole gate an override
+/// must pass, mirroring the guarantee `discover_public_remote_with` already
+/// bakes into discovered remotes.
+pub(crate) async fn verify_public_remote(ops: &dyn PublicRepoExists, remote: &str) -> Result<(), String> {
+    let (owner, repo) =
+        parse_github_owner_repo(remote).ok_or_else(|| format!("could not parse owner/repo from remote URL '{remote}'"))?;
+    let org = github_org();
+    if owner != org {
+        return Err(format!(
+            "remote owner '{owner}' is not the configured mirror org '{org}' — refusing to push to a \
+             non-org target (set TERMINUS_MIRROR_GITHUB_ORG if this org is intended)"
+        ));
+    }
+    match ops.exists(&owner, &repo).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!("remote '{remote}' does not point to an existing public repo (repo_exists=false)")),
+        Err(e) => Err(format!("could not verify remote '{remote}' (repo_exists check errored → fail-closed): {e}")),
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -261,6 +322,123 @@ mod tests {
         }
         assert_eq!(remote.as_deref(), Some("https://github.com/moosenet-io/public-name.git"));
         assert_eq!(seen_repo.as_deref(), Some("public-name"));
+    }
+
+    // ── parse_github_owner_repo / verify_public_remote ───────────────────────
+
+    #[test]
+    fn parse_owner_repo_https_with_and_without_dot_git() {
+        assert_eq!(
+            parse_github_owner_repo("https://github.com/moosenet-io/Terminus.git"),
+            Some(("moosenet-io".to_string(), "Terminus".to_string()))
+        );
+        assert_eq!(
+            parse_github_owner_repo("https://github.com/moosenet-io/Terminus"),
+            Some(("moosenet-io".to_string(), "Terminus".to_string()))
+        );
+        assert_eq!(
+            parse_github_owner_repo("https://github.com/moosenet-io/Terminus/"),
+            Some(("moosenet-io".to_string(), "Terminus".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_owner_repo_scp_like_form() {
+        assert_eq!(
+            parse_github_owner_repo("<email>:moosenet-io/Terminus.git"),
+            Some(("moosenet-io".to_string(), "Terminus".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_owner_repo_rejects_garbage() {
+        assert_eq!(parse_github_owner_repo("not-a-url"), None);
+        assert_eq!(parse_github_owner_repo(""), None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn verify_public_remote_ok_when_org_matches_and_exists() {
+        let had = std::env::var(GITHUB_ORG_ENV).ok();
+        // SAFETY (test-only): #[serial].
+        unsafe {
+            std::env::remove_var(GITHUB_ORG_ENV);
+        }
+        let ops = StubExists::ok(true);
+        let res = verify_public_remote(&ops, "https://github.com/moosenet-io/Terminus.git").await;
+        unsafe {
+            if let Some(v) = had {
+                std::env::set_var(GITHUB_ORG_ENV, v);
+            }
+        }
+        assert!(res.is_ok(), "org-matched + existing remote must verify: {res:?}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn verify_public_remote_rejects_nonexistent_repo() {
+        let had = std::env::var(GITHUB_ORG_ENV).ok();
+        // SAFETY (test-only): #[serial].
+        unsafe {
+            std::env::remove_var(GITHUB_ORG_ENV);
+        }
+        let ops = StubExists::ok(false);
+        let res = verify_public_remote(&ops, "https://github.com/moosenet-io/Ghost.git").await;
+        unsafe {
+            if let Some(v) = had {
+                std::env::set_var(GITHUB_ORG_ENV, v);
+            }
+        }
+        assert!(res.is_err(), "a remote whose repo_exists=false must be rejected");
+        assert!(res.unwrap_err().contains("repo_exists=false"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn verify_public_remote_rejects_foreign_org_without_even_checking_existence() {
+        let had = std::env::var(GITHUB_ORG_ENV).ok();
+        // SAFETY (test-only): #[serial].
+        unsafe {
+            std::env::remove_var(GITHUB_ORG_ENV);
+        }
+        // exists() would return true, but the owner is NOT the configured org
+        // — must be rejected before the (irrelevant) existence result matters.
+        let ops = StubExists::ok(true);
+        let res = verify_public_remote(&ops, "https://github.com/attacker/moosenet-secret.git").await;
+        unsafe {
+            if let Some(v) = had {
+                std::env::set_var(GITHUB_ORG_ENV, v);
+            }
+        }
+        assert!(res.is_err(), "a foreign-org remote must be rejected even if it exists");
+        assert!(res.unwrap_err().contains("not the configured mirror org"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn verify_public_remote_fails_closed_on_check_error() {
+        let had = std::env::var(GITHUB_ORG_ENV).ok();
+        // SAFETY (test-only): #[serial].
+        unsafe {
+            std::env::remove_var(GITHUB_ORG_ENV);
+        }
+        let ops = StubExists::err("rate limited");
+        let res = verify_public_remote(&ops, "https://github.com/moosenet-io/Terminus.git").await;
+        unsafe {
+            if let Some(v) = had {
+                std::env::set_var(GITHUB_ORG_ENV, v);
+            }
+        }
+        assert!(res.is_err(), "a check error must fail closed (reject), never assume existence");
+        assert!(res.unwrap_err().contains("fail-closed"));
+    }
+
+    #[tokio::test]
+    async fn verify_public_remote_rejects_unparseable_url() {
+        let ops = StubExists::ok(true);
+        let res = verify_public_remote(&ops, "not-a-real-url").await;
+        assert!(res.is_err(), "an unparseable remote can't be verified → reject");
+        assert!(res.unwrap_err().contains("could not parse"));
     }
 
     #[test]

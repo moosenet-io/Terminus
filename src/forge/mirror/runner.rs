@@ -50,14 +50,17 @@
 //!   1. **Discovery flips from opt-in to opt-out.** The old
 //!      `discover_mirror_ready_repos` required an explicit
 //!      `mirror_ready: true` in each repo's `.moosenet-pipeline.yaml`. Now
-//!      [`discover_mirror_targets`] treats every repo under
+//!      [`list_mirror_candidates`] treats every repo under
 //!      `TERMINUS_MIRROR_SOURCE_ROOT` as a CANDIDATE unless blacklisted
 //!      (`TERMINUS_MIRROR_BLACKLIST`) or explicitly `mirror_ready: false`,
-//!      and only actually mirrors a candidate once
-//!      [`super::discovery::discover_public_remote`] confirms a real public
-//!      GitHub repo already exists for it (name-mapped/org-configured via
-//!      `TERMINUS_MIRROR_GITHUB_ORG`/`TERMINUS_MIRROR_NAME_MAP`) — that
-//!      existence check IS the opt-out.
+//!      and [`resolve_and_verify_remote`] only actually mirrors a candidate
+//!      once [`super::discovery::discover_public_remote`] confirms a real
+//!      public GitHub repo already exists for it (name-mapped/org-configured
+//!      via `TERMINUS_MIRROR_GITHUB_ORG`/`TERMINUS_MIRROR_NAME_MAP`) — that
+//!      existence check IS the opt-out. An operator-supplied override remote
+//!      is subjected to the SAME existence/org check
+//!      ([`super::discovery::verify_public_remote`]) so it can never redirect
+//!      an auto-push at an unverified target (codex security fix).
 //!   2. **Auto-baseline for the safe first-time case.** [`run_once_with`]'s
 //!      no-lineage branch, when `cfg.auto_baseline` is set (production
 //!      default: `TERMINUS_MIRROR_AUTO_BASELINE`, default TRUE), runs the
@@ -155,6 +158,17 @@ pub enum RunOutcome {
     /// one-time operator-blessed GHIST-07 force re-baseline. NEVER
     /// auto-resolved by this module.
     NeedsOperatorRebaseline { reason: String },
+    /// MIRROR-AUTO security gate: the resolved push target could NOT be
+    /// verified as an existing public repo under the configured mirror org —
+    /// because an operator override (`github_remote` / `TERMINUS_MIRROR_REMOTE`)
+    /// or the explicit-`repo` call pointed at a remote that failed
+    /// `github::repo_exists` (repo_exists=false), a foreign/unparseable URL,
+    /// or the existence check itself errored (→ fail-closed). NOTHING was
+    /// pushed. This is the enforcement point that makes "we only ever push to
+    /// a verified, name/org-matched public repo we own" hold on EVERY path,
+    /// including auto-baseline — an unverified override can never redirect an
+    /// auto-push at the wrong remote.
+    SkippedUnverifiedRemote { remote: Option<String>, reason: String },
     /// A tool call failed for a reason that isn't a known divergence signal
     /// (e.g. a transient git/IO error, missing credential). Surfaced, not
     /// panicked.
@@ -430,8 +444,8 @@ fn repo_explicitly_opted_out(checkout: &Path) -> bool {
 /// List every immediate subdirectory of `TERMINUS_MIRROR_SOURCE_ROOT` that is
 /// a mirror CANDIDATE: not blacklisted (`TERMINUS_MIRROR_BLACKLIST`) and not
 /// explicitly opted out (`mirror_ready: false`). Does NOT check public-repo
-/// existence — that's [`discover_mirror_targets_with`]'s job, kept separate
-/// so it can be tested (blacklist/opt-out logic) without any network seam.
+/// existence — that's [`resolve_and_verify_remote`]'s job, kept separate so
+/// this blacklist/opt-out logic can be tested without any network seam.
 /// READ-ONLY scan; sorted + deduplicated for stable, reproducible runs.
 fn list_mirror_candidates() -> Result<Vec<String>, ToolError> {
     let root = std::env::var(SOURCE_ROOT_ENV)
@@ -470,37 +484,79 @@ fn list_mirror_candidates() -> Result<Vec<String>, ToolError> {
     Ok(repos)
 }
 
-/// Full MIRROR-AUTO discovery pass: every candidate from
-/// [`list_mirror_candidates`], filtered down to those with a confirmed
-/// public GitHub target, paired with the discovered remote URL. Sorted by
-/// repo name (inherited from `list_mirror_candidates`'s sort).
-pub(crate) async fn discover_mirror_targets_with(
-    repo_exists: &dyn super::discovery::PublicRepoExists,
-) -> Result<Vec<(String, String)>, ToolError> {
-    let candidates = list_mirror_candidates()?;
-    let mut targets = Vec::with_capacity(candidates.len());
-    for repo in candidates {
-        if let Some(remote) = super::discovery::discover_public_remote_with(repo_exists, &repo).await {
-            targets.push((repo, remote));
-        }
-    }
-    Ok(targets)
+// ── Verified per-repo remote resolution (closes the two verification-bypass gaps) ─
+//
+// codex security finding: the public-repo existence VERIFICATION must hold on
+// EVERY push path, not only the discovered-remote path. Two bypasses existed:
+//   1. OVERRIDE bypass — in bulk mode an override (`github_remote` /
+//      `TERMINUS_MIRROR_REMOTE[_<REPO>]`) replaced the discovered (verified)
+//      remote without re-verifying the override.
+//   2. EXPLICIT-REPO bypass — an explicit `repo` arg skipped discovery
+//      entirely, so it could auto-baseline to a configured remote that was
+//      never proven to exist.
+// [`resolve_and_verify_remote`] is the single funnel every repo now passes
+// through: whatever remote we would push to (override OR discovered) is
+// verified via `github::repo_exists` (org-matched + exists) BEFORE the repo
+// ever reaches `run_once`/bootstrap. An unverifiable target yields
+// [`RemoteResolution::Rejected`] and NO push.
+
+/// The verified push-target decision for one repo, produced BEFORE any
+/// push/bootstrap can run.
+#[derive(Debug, PartialEq)]
+enum RemoteResolution {
+    /// A verified public target under the configured org — safe to push here.
+    Verified(String),
+    /// An override (or explicitly-targeted) remote was configured but FAILED
+    /// verification (repo_exists=false, foreign/unparseable URL, or the check
+    /// errored → fail-closed). Do NOT push; surface as `SkippedUnverifiedRemote`.
+    Rejected { remote: String, reason: String },
+    /// No override was set and name-based discovery found no existing public
+    /// target — a plain opt-out. In bulk mode this repo is silently skipped
+    /// (exactly as before); for an explicit single-repo call it is surfaced
+    /// as `SkippedUnverifiedRemote` so the caller learns why nothing happened.
+    NoTarget,
 }
 
-/// [`discover_mirror_targets_with`] wired to the real GitHub existence check
-/// — the entry point `GitPublicMirrorRun::execute` uses in production.
-pub async fn discover_mirror_targets() -> Result<Vec<(String, String)>, ToolError> {
-    discover_mirror_targets_with(&super::discovery::RealPublicRepoExists).await
+/// Resolve AND verify the push remote for `repo`. Precedence:
+///   1. an override — call-level `explicit_remote` (the tool's `github_remote`
+///      arg), else `TERMINUS_MIRROR_REMOTE[_<REPO>]` env — which is honored
+///      ONLY if it passes [`super::discovery::verify_public_remote`]
+///      (org-matched + `repo_exists`); otherwise `Rejected`.
+///   2. no override → name-based discovery
+///      ([`super::discovery::discover_public_remote_with`]), which itself only
+///      yields a remote when the public repo exists, so a discovered remote is
+///      verified by construction; no match → `NoTarget`.
+/// Either way, the ONLY variant that leads to a push is `Verified` — every
+/// push path is now behind existence verification.
+async fn resolve_and_verify_remote(
+    verifier: &dyn super::discovery::PublicRepoExists,
+    repo: &str,
+    explicit_remote: Option<&str>,
+) -> RemoteResolution {
+    let override_remote = explicit_remote.map(str::to_string).or_else(|| remote_env_override(repo));
+    match override_remote {
+        Some(remote) => match super::discovery::verify_public_remote(verifier, &remote).await {
+            Ok(()) => RemoteResolution::Verified(remote),
+            Err(reason) => RemoteResolution::Rejected { remote, reason },
+        },
+        None => match super::discovery::discover_public_remote_with(verifier, repo).await {
+            Some(remote) => RemoteResolution::Verified(remote),
+            None => RemoteResolution::NoTarget,
+        },
+    }
 }
 
 // ── git_public_mirror_run (core tool) ───────────────────────────────────────
 
 /// `git_public_mirror_run` — the MRUN-01 tool wrapping [`run_once`]. With an
-/// explicit `repo`, runs one pass for that repo. Without one, runs
-/// MIRROR-AUTO opt-out discovery ([`discover_mirror_targets`]) and runs a
-/// pass for every repo that has a confirmed public GitHub target, returning
-/// a per-repo report array — this is the call
-/// `deploy/terminus-mirror-runner.service` makes on a timer.
+/// explicit `repo`, runs one pass for that repo; without one, iterates the
+/// MIRROR-AUTO opt-out candidate list ([`list_mirror_candidates`]). On BOTH
+/// paths, every repo's push target is resolved AND verified via
+/// [`resolve_and_verify_remote`] before any push — an override or explicit
+/// target that fails `github::repo_exists` is reported as
+/// `SkippedUnverifiedRemote` and never pushed. Returns a per-repo report
+/// array — this is the call `deploy/terminus-mirror-runner.service` makes on
+/// a timer.
 pub(crate) struct GitPublicMirrorRun;
 
 #[async_trait]
@@ -535,7 +591,7 @@ impl RustTool for GitPublicMirrorRun {
             "properties": {
                 "repo":          { "type": "string", "description": "Logical repo name; omit to run MIRROR-AUTO discovery over every candidate under TERMINUS_MIRROR_SOURCE_ROOT" },
                 "source":        { "type": "string", "description": "internal-main checkout override (else TERMINUS_MIRROR_SOURCE_ROOT/<repo>)" },
-                "github_remote": { "type": "string", "description": "Target mirror remote override for ALL repos in this call (else per-repo TERMINUS_MIRROR_REMOTE[_<REPO>], else the MIRROR-AUTO discovered remote)" },
+                "github_remote": { "type": "string", "description": "Target mirror remote override for ALL repos in this call (else per-repo TERMINUS_MIRROR_REMOTE[_<REPO>], else the MIRROR-AUTO discovered remote). An override is honored ONLY if it points to an existing repo under the configured org (github::repo_exists) — otherwise the repo is skipped, never pushed." },
                 "provider":      { "type": "string", "description": "Mirror-push target provider (default 'github')" }
             }
         })
@@ -548,34 +604,67 @@ impl RustTool for GitPublicMirrorRun {
         let provider = args.get("provider").and_then(Value::as_str).map(str::to_string);
         let auto_baseline = auto_baseline_enabled();
 
-        // (repo, discovered_remote) — discovered_remote is only populated in
-        // the no-'repo'-arg MIRROR-AUTO discovery path; an explicit single
-        // 'repo' call keeps its prior behavior exactly (github_remote/env
-        // resolution happens the same way it always did, with no discovery
-        // gating at all).
-        let repos_with_discovered: Vec<(String, Option<String>)> = match args.get("repo").and_then(Value::as_str) {
-            Some(r) if !r.trim().is_empty() => vec![(r.trim().to_string(), None)],
-            _ => discover_mirror_targets().await?.into_iter().map(|(repo, remote)| (repo, Some(remote))).collect(),
+        // Explicit single-repo call vs. bulk opt-out candidate list. In BOTH
+        // cases each repo's target is resolved+verified below before any push.
+        let explicit_repo = args.get("repo").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+        let (repos, is_explicit): (Vec<String>, bool) = match explicit_repo {
+            Some(r) => (vec![r.to_string()], true),
+            None => (list_mirror_candidates()?, false),
         };
 
-        let mut reports = Vec::with_capacity(repos_with_discovered.len());
-        for (repo, discovered_remote) in &repos_with_discovered {
-            // Priority: explicit call-level override → per-repo/global env
-            // override → the MIRROR-AUTO discovered remote. "Use the
-            // discovered remote when no explicit github_remote/
-            // TERMINUS_MIRROR_REMOTE override is set."
-            let github_remote =
-                explicit_remote.clone().or_else(|| remote_env_override(repo)).or_else(|| discovered_remote.clone());
-            let cfg = RunnerConfig {
-                source: source.clone(),
-                github_remote,
-                provider: provider.clone(),
-                auto_baseline,
-            };
-            reports.push(run_once(repo, &cfg).await);
+        let verifier = super::discovery::RealPublicRepoExists;
+        let mut reports = Vec::with_capacity(repos.len());
+        for repo in &repos {
+            // SECURITY GATE (codex fix): resolve the FINAL push remote and
+            // VERIFY it on every path. Only `Verified` reaches run_once — an
+            // override/explicit target that can't be proven to exist under the
+            // configured org never gets an auto-baseline or any push.
+            match resolve_and_verify_remote(&verifier, repo, explicit_remote.as_deref()).await {
+                RemoteResolution::Verified(remote) => {
+                    let cfg = RunnerConfig {
+                        source: source.clone(),
+                        github_remote: Some(remote),
+                        provider: provider.clone(),
+                        auto_baseline,
+                    };
+                    reports.push(run_once(repo, &cfg).await);
+                }
+                RemoteResolution::Rejected { remote, reason } => {
+                    tracing::warn!(
+                        target: "mirror_audit",
+                        event = "skipped_unverified_remote",
+                        repo = %repo,
+                        remote = %remote,
+                        reason = %reason,
+                        "MIRROR-AUTO: refused to push — configured override/target remote did not verify"
+                    );
+                    reports.push(MirrorRunReport {
+                        repo: repo.clone(),
+                        outcome: RunOutcome::SkippedUnverifiedRemote { remote: Some(remote), reason },
+                    });
+                }
+                RemoteResolution::NoTarget => {
+                    if is_explicit {
+                        // The caller asked for THIS repo by name; tell them why
+                        // nothing happened rather than silently dropping it.
+                        reports.push(MirrorRunReport {
+                            repo: repo.clone(),
+                            outcome: RunOutcome::SkippedUnverifiedRemote {
+                                remote: None,
+                                reason: "no verified public mirror target exists for this repo (no override set and \
+                                         github::repo_exists found no matching public repo under the configured org) \
+                                         — refusing to auto-baseline/push to an unverified target"
+                                    .into(),
+                            },
+                        });
+                    }
+                    // Bulk mode: a candidate with no public target is a plain
+                    // opt-out — silently skipped, exactly as before.
+                }
+            }
         }
 
-        serde_json::to_string(&json!({ "repos_run": repos_with_discovered.len(), "reports": reports }))
+        serde_json::to_string(&json!({ "repos_run": reports.len(), "reports": reports }))
             .map_err(|e| ToolError::Execution(format!("serialize reports: {e}")))
     }
 }
@@ -1206,47 +1295,154 @@ mod tests {
         assert!(matches!(result, Err(ToolError::NotConfigured(_))));
     }
 
-    /// End-to-end MIRROR-AUTO discovery: a candidate with a confirmed public
-    /// target is included (with its discovered remote); a candidate whose
-    /// public repo doesn't exist is silently skipped (the opt-out); an
-    /// explicitly-opted-out repo is excluded before the existence check even
-    /// runs (so it never shows up as a call to the stub for that repo).
+    // ── MIRROR-AUTO verification gate (codex fix): resolve_and_verify_remote ──
+    //
+    // These are the security-critical tests: `Verified` is the ONLY resolution
+    // that reaches `run_once`/a push (see `GitPublicMirrorRun::execute`), so a
+    // `Rejected`/`NoTarget` result is precisely "NOT pushed". Every push path —
+    // bulk-discovered, override, and explicit-repo — funnels through this
+    // function, so verifying it here proves no unverified target is ever pushed.
+
+    /// A per-name-configurable existence stub: `repo` → exists bool. Any repo
+    /// not listed resolves to `false` (absent), matching real discovery.
+    struct MapExists {
+        answers: std::collections::HashMap<String, bool>,
+    }
+    impl MapExists {
+        fn new(pairs: &[(&str, bool)]) -> Self {
+            Self { answers: pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect() }
+        }
+    }
+    #[async_trait]
+    impl super::super::discovery::PublicRepoExists for MapExists {
+        async fn exists(&self, _owner: &str, repo: &str) -> Result<bool, ToolError> {
+            Ok(self.answers.get(repo).copied().unwrap_or(false))
+        }
+    }
+
+    /// AC (c) happy path — no override, the discovered public repo exists → a
+    /// Verified remote (the one thing that leads to a push).
     #[tokio::test]
     #[serial]
-    async fn discover_mirror_targets_includes_only_repos_with_a_public_target() {
-        struct StubExists;
-        #[async_trait]
-        impl super::super::discovery::PublicRepoExists for StubExists {
-            async fn exists(&self, _owner: &str, repo: &str) -> Result<bool, ToolError> {
-                // Only "HasPublicRepo" resolves to an existing public mirror.
-                Ok(repo == "HasPublicRepo")
-            }
-        }
-
-        let dir = std::env::temp_dir().join(format!(
-            "mirror-auto-discover-targets-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        std::fs::create_dir_all(dir.join("HasPublicRepo")).unwrap();
-        std::fs::create_dir_all(dir.join("NoPublicRepoYet")).unwrap();
-        std::fs::create_dir_all(dir.join("OptedOut")).unwrap();
-        std::fs::write(dir.join("OptedOut").join(".moosenet-pipeline.yaml"), "mirror_ready: false\n").unwrap();
-
+    async fn resolve_verified_when_discovered_public_repo_exists() {
+        let had = std::env::var(super::super::discovery::GITHUB_ORG_ENV).ok();
         // SAFETY (test-only): `#[serial]`.
         unsafe {
-            std::env::set_var(SOURCE_ROOT_ENV, &dir);
+            std::env::remove_var(super::super::discovery::GITHUB_ORG_ENV);
         }
-        let targets = discover_mirror_targets_with(&StubExists).await;
+        let verifier = MapExists::new(&[("HasPublicRepo", true)]);
+        let res = resolve_and_verify_remote(&verifier, "HasPublicRepo", None).await;
         unsafe {
-            std::env::remove_var(SOURCE_ROOT_ENV);
+            if let Some(v) = had {
+                std::env::set_var(super::super::discovery::GITHUB_ORG_ENV, v);
+            }
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(res, RemoteResolution::Verified("https://github.com/moosenet-io/HasPublicRepo.git".to_string()));
+    }
 
-        assert_eq!(
-            targets.unwrap(),
-            vec![("HasPublicRepo".to_string(), "https://github.com/moosenet-io/HasPublicRepo.git".to_string())]
-        );
+    /// AC (b) explicit-repo / no override, and the public repo does NOT exist →
+    /// NoTarget (so execute skips it, never auto-baselines). This is the
+    /// explicit-repo-bypass fix: discovery+verification now runs on this path.
+    #[tokio::test]
+    #[serial]
+    async fn resolve_no_target_when_no_override_and_public_repo_absent() {
+        let had = std::env::var(super::super::discovery::GITHUB_ORG_ENV).ok();
+        // SAFETY (test-only): `#[serial]`.
+        unsafe {
+            std::env::remove_var(super::super::discovery::GITHUB_ORG_ENV);
+        }
+        let verifier = MapExists::new(&[("NoPublicRepoYet", false)]);
+        let res = resolve_and_verify_remote(&verifier, "NoPublicRepoYet", None).await;
+        unsafe {
+            if let Some(v) = had {
+                std::env::set_var(super::super::discovery::GITHUB_ORG_ENV, v);
+            }
+        }
+        assert_eq!(res, RemoteResolution::NoTarget, "no verified target → never pushed");
+    }
+
+    /// AC (a) override BYPASS fix — a call-level `github_remote` override whose
+    /// repo_exists=false is REJECTED (not pushed), even though an override was
+    /// explicitly supplied.
+    #[tokio::test]
+    #[serial]
+    async fn resolve_rejects_override_to_nonexistent_public_repo() {
+        let had = std::env::var(super::super::discovery::GITHUB_ORG_ENV).ok();
+        // SAFETY (test-only): `#[serial]`.
+        unsafe {
+            std::env::remove_var(super::super::discovery::GITHUB_ORG_ENV);
+        }
+        let verifier = MapExists::new(&[("Ghost", false)]);
+        let res = resolve_and_verify_remote(
+            &verifier,
+            "SomeInternalRepo",
+            Some("https://github.com/moosenet-io/Ghost.git"),
+        )
+        .await;
+        unsafe {
+            if let Some(v) = had {
+                std::env::set_var(super::super::discovery::GITHUB_ORG_ENV, v);
+            }
+        }
+        match res {
+            RemoteResolution::Rejected { remote, reason } => {
+                assert_eq!(remote, "https://github.com/moosenet-io/Ghost.git");
+                assert!(reason.contains("repo_exists=false"), "reason: {reason}");
+            }
+            other => panic!("an override to a nonexistent repo must be Rejected, got {other:?}"),
+        }
+    }
+
+    /// AC (c) override happy path — an override that IS verified (org-matched +
+    /// exists) resolves to Verified and thus DOES push.
+    #[tokio::test]
+    #[serial]
+    async fn resolve_verified_when_override_is_org_matched_and_exists() {
+        let had = std::env::var(super::super::discovery::GITHUB_ORG_ENV).ok();
+        // SAFETY (test-only): `#[serial]`.
+        unsafe {
+            std::env::remove_var(super::super::discovery::GITHUB_ORG_ENV);
+        }
+        let verifier = MapExists::new(&[("Terminus", true)]);
+        let res = resolve_and_verify_remote(
+            &verifier,
+            "Terminus",
+            Some("https://github.com/moosenet-io/Terminus.git"),
+        )
+        .await;
+        unsafe {
+            if let Some(v) = had {
+                std::env::set_var(super::super::discovery::GITHUB_ORG_ENV, v);
+            }
+        }
+        assert_eq!(res, RemoteResolution::Verified("https://github.com/moosenet-io/Terminus.git".to_string()));
+    }
+
+    /// A per-repo env override (`TERMINUS_MIRROR_REMOTE_<REPO>`) that fails
+    /// verification is Rejected too — the env-override facet of the same gap.
+    #[tokio::test]
+    #[serial]
+    async fn resolve_rejects_env_override_to_nonexistent_public_repo() {
+        let had_org = std::env::var(super::super::discovery::GITHUB_ORG_ENV).ok();
+        let had_env = std::env::var("TERMINUS_MIRROR_REMOTE_SOMEREPO").ok();
+        // SAFETY (test-only): `#[serial]`.
+        unsafe {
+            std::env::remove_var(super::super::discovery::GITHUB_ORG_ENV);
+            std::env::set_var("TERMINUS_MIRROR_REMOTE_SOMEREPO", "https://github.com/moosenet-io/Ghost.git");
+        }
+        let verifier = MapExists::new(&[("Ghost", false)]);
+        let res = resolve_and_verify_remote(&verifier, "SomeRepo", None).await;
+        unsafe {
+            match had_org {
+                Some(v) => std::env::set_var(super::super::discovery::GITHUB_ORG_ENV, v),
+                None => std::env::remove_var(super::super::discovery::GITHUB_ORG_ENV),
+            }
+            match had_env {
+                Some(v) => std::env::set_var("TERMINUS_MIRROR_REMOTE_SOMEREPO", v),
+                None => std::env::remove_var("TERMINUS_MIRROR_REMOTE_SOMEREPO"),
+            }
+        }
+        assert!(matches!(res, RemoteResolution::Rejected { .. }), "env-override to nonexistent repo must be Rejected: {res:?}");
     }
 
     #[test]
