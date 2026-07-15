@@ -2441,21 +2441,66 @@ mod tests {
 
         /// AC: every Chord control call from the idle-lease client carries a Bearer
         /// JWT shaped exactly as Chord's `auth_check`/`validate_jwt` requires
-        /// (`sub == "lumina"`), signed with `TERMINUS_PRIMARY_CHORD_JWT_SECRET` —
-        /// the SAME mechanism `crate::federation::mint_service_jwt` mints for
-        /// Chord's other protected routes. This decodes the presented token with
-        /// the shared secret to prove it is a genuine, correctly-shaped service
-        /// credential, not just an opaque header.
+        /// (`sub == "lumina"`, a valid/unexpired `exp`), signed with
+        /// `TERMINUS_PRIMARY_CHORD_JWT_SECRET` — the SAME mechanism
+        /// `crate::federation::mint_service_jwt` mints for Chord's other protected
+        /// routes.
+        ///
+        /// CRITICAL: the assertion is on the token the client REALLY sent, not a
+        /// fresh one minted in the test. httpmock 0.7's matcher is a bare `fn`
+        /// pointer (no capture) and the version exposes no recorded-request
+        /// readback, so the check is done INSIDE the matcher: the mock responds
+        /// `200` ONLY when the ACTUAL `Authorization: Bearer <token>` the request
+        /// carried decodes — with the shared secret and `Validation::default()`
+        /// (which validates `exp`, so an expired/garbage token fails) — to
+        /// `sub == "lumina"`. So `chord_idle` only succeeds (and `mock.assert()`
+        /// only passes) when the real sent token is a valid lumina JWT.
+        ///
+        /// NEGATIVE CASE (why this is not vacuous): if `chord_post` sent
+        /// `Bearer garbage` (or omitted auth, or a wrong-secret/expired token),
+        /// `decode(..)` inside the matcher returns `Err` ⇒ the matcher returns
+        /// `false` ⇒ no mock matches ⇒ the mock server returns a non-2xx default ⇒
+        /// `chord_idle` returns `Err` (the `.expect` below panics) AND
+        /// `mock.assert()` fails (the mock was never hit). Both guard the AC.
         #[tokio::test]
         #[serial]
         async fn chord_idle_presents_a_valid_lumina_service_jwt() {
             set_jwt_secret();
             let server = MockServer::start();
             set_control_url(&server.base_url());
+            // The mock matches ONLY when the ACTUAL Authorization header the
+            // request sent carries a Bearer token that decodes to a valid lumina
+            // JWT under the shared secret (the same literal `set_jwt_secret` uses —
+            // duplicated here because a bare-`fn` matcher cannot capture it).
             let mock = server.mock(|when, then| {
                 when.method(httpmock::Method::POST)
                     .path("/admin/idle")
-                    .header_exists("authorization");
+                    .matches(|req| {
+                        let auth = req
+                            .headers
+                            .as_ref()
+                            .and_then(|hs| {
+                                hs.iter()
+                                    .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                            })
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or_default();
+                        let token = match auth.strip_prefix("Bearer ") {
+                            Some(t) => t,
+                            None => return false, // no bearer token sent ⇒ fail
+                        };
+                        // Decode the REAL sent token; `Validation::default()`
+                        // validates `exp`, so an expired/garbage/wrong-secret token
+                        // returns Err ⇒ matcher false ⇒ AC fails (see doc comment).
+                        match decode::<DecodedClaims>(
+                            token,
+                            &DecodingKey::from_secret("test-idle-lease-shared-secret".as_bytes()),
+                            &Validation::default(),
+                        ) {
+                            Ok(data) => data.claims.sub == "lumina",
+                            Err(_) => false,
+                        }
+                    });
                 then.status(200).json_body(json!({}));
             });
 
@@ -2463,22 +2508,11 @@ mod tests {
             backend
                 .chord_idle()
                 .await
-                .expect("chord_idle should succeed");
+                .expect("chord_idle should succeed (the REAL sent token is a valid lumina JWT)");
+            // Confirms the request matched — i.e. the token the client ACTUALLY
+            // sent decoded to a valid lumina JWT. A garbage/absent token would have
+            // failed the matcher and left this un-hit.
             mock.assert();
-
-            // Independently mint the same-shaped JWT and confirm the SAME secret
-            // decodes it with sub == "lumina" (Chord's `validate_jwt` hard
-            // requirement) — i.e. this is the real federation minter, not a
-            // fabricated header.
-            let jwt =
-                crate::federation::mint_service_jwt().expect("mint should succeed with secret set");
-            let decoded = decode::<DecodedClaims>(
-                &jwt,
-                &DecodingKey::from_secret("test-idle-lease-shared-secret".as_bytes()),
-                &Validation::default(),
-            )
-            .expect("token must decode with the shared secret");
-            assert_eq!(decoded.claims.sub, "lumina");
 
             clear_control_url();
             clear_jwt_secret();
