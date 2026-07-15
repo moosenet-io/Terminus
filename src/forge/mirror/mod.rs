@@ -43,6 +43,7 @@
 //! concern; the sweep here operates on whatever tree path it is handed.
 
 pub mod clean;
+pub(crate) mod discovery;
 pub mod history;
 pub mod native_clean;
 pub mod pr_replay;

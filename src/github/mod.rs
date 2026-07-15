@@ -134,6 +134,43 @@ pub(crate) fn github_token() -> Result<String, ToolError> {
     Ok(adapter.resolve_token(None)?)
 }
 
+// ── Public-repo existence check (MIRROR-AUTO name-based discovery) ─────────────
+
+/// `GET {api_base}/repos/{owner}/{repo}` — does this GitHub repo exist and is
+/// it reachable with the resolved credential? `404` → `Ok(false)` (a normal,
+/// expected "not published yet" case — never an error). Any other non-2xx
+/// (auth failure, rate limit, 5xx, …) is a REAL failure and is surfaced as
+/// `Err`, never silently coerced to `false` — callers (MIRROR-AUTO discovery)
+/// must not treat "the check itself broke" the same as "confirmed absent",
+/// since that would fail OPEN into publishing a repo whose target existence
+/// was never actually verified. Read-only: no PII gate needed (no outbound
+/// content, just a GET).
+async fn repo_exists_with_cfg(cfg: &GitHubConfig, owner: &str, repo: &str) -> Result<bool, ToolError> {
+    let client = GitHubConfig::client()?;
+    let url = format!("{}/repos/{owner}/{repo}", cfg.api_base);
+    let resp = cfg.apply_headers(client.get(&url)).send().await.map_err(|e| ToolError::Http(e.to_string()))?;
+    let status = resp.status();
+    if status.as_u16() == 404 {
+        return Ok(false);
+    }
+    if status.is_success() {
+        return Ok(true);
+    }
+    let body = resp.text().await.unwrap_or_default();
+    Err(ToolError::Http(format!("HTTP {}: {}", status.as_u16(), body)))
+}
+
+/// Crate-facing entry point: resolves `GitHubConfig` from the environment
+/// (the same credential/org/api-base resolution every other GitHub call in
+/// this module uses — see [`GitHubConfig::from_env`]) and checks whether
+/// `{owner}/{repo}` exists. This is the sole existence-check surface
+/// `crate::forge::mirror::discovery` calls for MIRROR-AUTO's name-based
+/// public-remote discovery.
+pub(crate) async fn repo_exists(owner: &str, repo: &str) -> Result<bool, ToolError> {
+    let cfg = GitHubConfig::from_env()?;
+    repo_exists_with_cfg(&cfg, owner, repo).await
+}
+
 // ── Response shaping ──────────────────────────────────────────────────────────
 
 /// Map one GitHub repo object to the compact shape the Python tool returns.
@@ -1000,6 +1037,47 @@ mod tests {
 
     fn cfg_with_base(api_base: String) -> GitHubConfig {
         GitHubConfig { api_base, ..cfg() }
+    }
+
+    // ── repo_exists (MIRROR-AUTO discovery's existence check) ─────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn repo_exists_true_on_2xx() {
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(GET).path("/repos/moosenet-io/Terminus");
+            then.status(200).json_body(json!({ "name": "Terminus", "full_name": "moosenet-io/Terminus" }));
+        });
+        let ok = repo_exists_with_cfg(&cfg_with_base(server.base_url()), "moosenet-io", "Terminus").await.unwrap();
+        assert!(ok);
+        m.assert();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn repo_exists_false_on_404() {
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(GET).path("/repos/moosenet-io/NotPublicYet");
+            then.status(404).json_body(json!({ "message": "Not Found" }));
+        });
+        let ok = repo_exists_with_cfg(&cfg_with_base(server.base_url()), "moosenet-io", "NotPublicYet").await.unwrap();
+        assert!(!ok);
+        m.assert();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn repo_exists_errors_on_non_404_failure_never_treated_as_absent() {
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(GET).path("/repos/moosenet-io/RateLimited");
+            then.status(403).json_body(json!({ "message": "API rate limit exceeded" }));
+        });
+        let err = repo_exists_with_cfg(&cfg_with_base(server.base_url()), "moosenet-io", "RateLimited").await;
+        assert!(err.is_err(), "a real HTTP failure must surface as Err, not be coerced to false");
+        m.assert();
     }
 
     #[test]
