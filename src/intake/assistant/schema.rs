@@ -219,8 +219,8 @@ async fn migrate_locked(conn: &mut PgConnection) -> Result<(), ToolError> {
             language TEXT, \
             task_type TEXT, \
             harness_version TEXT, \
-            first_pass_score DOUBLE PRECISION, \
-            retry_score DOUBLE PRECISION, \
+            first_pass_score INTEGER, \
+            retry_score INTEGER, \
             compiles BOOLEAN, \
             tests_pass BOOLEAN, \
             change_correct BOOLEAN, \
