@@ -36,6 +36,17 @@ pub struct ScopeCaps {
     pub jobs: u32,
 }
 
+/// Absolute path to `systemd-run`. Used instead of the bare name `"systemd-run"`
+/// because the local build spawn (`tokio::process::Command::new(argv[0])`)
+/// resolves a bare program name via the CHILD's `PATH`, and the build env map
+/// this argv is spawned with can override `PATH` with one that lacks
+/// `/usr/bin` — so a bare `"systemd-run"` failed with "No such file or directory
+/// (os error 2)" even though the binary exists and terminus-primary's own PATH
+/// has `/usr/bin`. An absolute path bypasses `PATH` resolution entirely. It is
+/// also correct for the remote (ssh-rendered) path: `/usr/bin/systemd-run` is
+/// the canonical location on every systemd host in the fleet (merged-`/usr`).
+pub(crate) const SYSTEMD_RUN_BIN: &str = "/usr/bin/systemd-run";
+
 /// Render the `systemd-run --scope` argv that runs `cargo_argv` under the caps,
 /// with the NON-SECRET build env injected via `--setenv=` so the child (and its
 /// build scripts) see the sccache endpoint/target-dir/toolchain environment.
@@ -63,7 +74,7 @@ pub fn render_scope_argv(
     cargo_argv: &[String],
 ) -> Vec<String> {
     let mut argv: Vec<String> = vec![
-        "systemd-run".to_string(),
+        SYSTEMD_RUN_BIN.to_string(),
         "--scope".to_string(),
         format!("--unit={unit_name}"),
         // Reap the transient unit when the command exits.
@@ -305,6 +316,16 @@ mod tests {
         assert!(argv.contains(&"--scope".to_string()));
         assert!(argv.iter().any(|a| a == "-p"));
         assert!(argv.iter().any(|a| a.starts_with("--unit=")));
+    }
+
+    #[test]
+    fn scope_argv0_is_absolute_systemd_run_not_a_bare_name() {
+        // Regression guard: the local build spawn resolves argv[0] via the
+        // child env's PATH, which the build env can override — a bare
+        // "systemd-run" then fails "No such file". argv[0] must be absolute.
+        let argv = render_scope_argv("u", &caps(), &BTreeMap::new(), &["cargo".into()]);
+        assert_eq!(argv[0], "/usr/bin/systemd-run", "argv[0] must be an absolute path, never a bare name");
+        assert!(argv[0].starts_with('/'), "argv[0] must be absolute so PATH resolution can't fail");
     }
 
     #[test]
