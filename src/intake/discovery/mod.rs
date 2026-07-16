@@ -21,6 +21,7 @@
 //!   brochure rows.
 
 pub mod hf_client;
+pub mod refresh;
 pub mod schema;
 pub mod storage;
 pub mod tool;
@@ -31,6 +32,10 @@ pub use schema::{CandidateStatus, DiscoveryCandidate, FleetCategory};
 /// Register the brochure's MCP tools on the CORE registry. Wired into
 /// `crate::intake::register` (the same Chord-served core surface
 /// `catalog::register` uses) — never the personal registry.
+///
+/// DISC-02's read-only `model_discovery_brochure` (`tool`) plus DISC-06's
+/// `model_discovery_refresh` curator (`refresh`) that populates it.
 pub fn register(registry: &mut crate::registry::ToolRegistry) {
     tool::register(registry);
+    refresh::register(registry);
 }

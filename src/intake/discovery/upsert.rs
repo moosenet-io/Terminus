@@ -70,6 +70,15 @@ use crate::intake::discovery::schema::{CandidateStatus, DiscoveryCandidate};
 /// lifecycle status is owned by [`transition_status`]/[`record_eviction`],
 /// never silently reset by a re-observation (DISC-06's "already fleet-tested
 /// candidate keeps whatever status it already has" edge case).
+///
+/// Likewise PRESERVES measured fit metadata on conflict when the incoming row
+/// doesn't have it: `size_b`/`vram_footprint_gb` are `COALESCE`d (kept if the
+/// new value is `NULL`) and `gfx1151_class` is kept when the new value is the
+/// `'unknown'` sentinel. DISC-06's discovery re-observation always carries
+/// `unknown`/`NULL` fit (a listing exposes no parameter count), so without this
+/// a daily refresh would erase the `size_b`/`vram_footprint_gb`/`gfx1151_class`
+/// a fetch/measure step had recorded on a `Fetching`/`Swept` model. A real
+/// measurement (non-`NULL`, non-`'unknown'`) still overwrites as before.
 pub async fn upsert_candidate(
     pool: &PgPool,
     candidate: &DiscoveryCandidate,
@@ -83,13 +92,16 @@ pub async fn upsert_candidate(
          ON CONFLICT (model_name) DO UPDATE SET \
              hf_repo = EXCLUDED.hf_repo, \
              category = EXCLUDED.category, \
-             gfx1151_class = EXCLUDED.gfx1151_class, \
-             size_b = EXCLUDED.size_b, \
-             vram_footprint_gb = EXCLUDED.vram_footprint_gb, \
              discovery_source = EXCLUDED.discovery_source, \
              discovery_score = EXCLUDED.discovery_score, \
              last_seen_at = now(), \
-             rationale = EXCLUDED.rationale",
+             rationale = EXCLUDED.rationale, \
+             gfx1151_class = CASE WHEN EXCLUDED.gfx1151_class = 'unknown' \
+                                  THEN model_discovery_candidate.gfx1151_class \
+                                  ELSE EXCLUDED.gfx1151_class END, \
+             size_b = COALESCE(EXCLUDED.size_b, model_discovery_candidate.size_b), \
+             vram_footprint_gb = COALESCE(EXCLUDED.vram_footprint_gb, \
+                                          model_discovery_candidate.vram_footprint_gb)",
     )
     .bind(&candidate.model_name)
     .bind(&candidate.hf_repo)
