@@ -1070,6 +1070,24 @@ impl RustTool for ModelIntakeFleet {
             out.push_str(&format!("{} {} [{}]: {}\n", mark, r.model, r.suites.join("+"), r.summary));
         }
         out.push_str("\nDaily driver restored. Results stored in Postgres (model_intake_compare / _status).\n");
+
+        // The Model Fleet Catalog is DERIVED and, unlike the CLI MINT harness, the
+        // MCP fleet path did not historically refresh it — so an MCP-driven sweep
+        // left `model_fleet_catalog` stale. Refresh best-effort here (same posture
+        // as `MintHarness::refresh_catalog_best_effort`): a DB hiccup / un-migrated
+        // host is LOGGED and swallowed, never turning an otherwise-successful sweep
+        // into a failure (the catalog is fully re-derivable and also reachable via
+        // the `model_fleet_catalog_refresh` tool).
+        match storage::get_pool().await {
+            Ok(pool) => match catalog::refresh_fleet_catalog(&pool).await {
+                Ok(n) => out.push_str(&format!("Fleet catalog refreshed: {n} model card(s).\n")),
+                Err(e) => out.push_str(&format!(
+                    "(fleet catalog refresh skipped — derived, recomputes next run: {e})\n"
+                )),
+            },
+            Err(e) => out.push_str(&format!("(fleet catalog refresh skipped — no DB pool: {e})\n")),
+        }
+
         Ok(out)
     }
 }
