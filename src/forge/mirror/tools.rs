@@ -2138,7 +2138,18 @@ pub(crate) fn bootstrap_first_push(args: &Value) -> Result<Value, ToolError> {
             // exist without --force, so the safety property holds even if
             // the remote_main_tip() check above raced with an external
             // change between the check and this push.
-            run_git(&hwd, &["push", &remote, &format!("{tip}:refs/heads/main")])?;
+            //
+            // MIRR-BOOTSTRAP-AUTH: use `perform_ff_push` (the same credential-
+            // injecting push `history_sync` uses) rather than a bare `run_git`
+            // push. A plain `run_git` push carries NO GIT_ASKPASS/token, so on a
+            // real https remote git prompts for a username and fails closed with
+            // "could not read Username" — meaning auto-baseline could NEVER
+            // bootstrap any first-time remote. `perform_ff_push` pushes the
+            // identical `<sha>:refs/heads/main` refspec (no `+`, `assert_never_force`
+            // guarded — so the "never overwrites an existing ref" safety above is
+            // preserved) while supplying the resolved provider token via askpass.
+            let token = mirror_provider_token(&mirror_provider(args))?;
+            perform_ff_push(&hwd, &remote, &tip, &token)?;
             set_pushed_sha(&hwd, &tip)?;
             tracing::warn!(
                 target: "mirror_audit",
@@ -3258,6 +3269,67 @@ mod tests {
         }
 
         cleanup(&[&src, &root, &bare]);
+    }
+
+    // MIRR-BOOTSTRAP-AUTH regression: the auto-baseline first-push must resolve the
+    // provider credential (via `perform_ff_push`) exactly as `history_sync` does — a
+    // bare `run_git` push carries NO GIT_ASKPASS/token and, on a real https remote,
+    // fails with "could not read Username", so auto-baseline could never bootstrap a
+    // first-time remote. Proven here by the observable behavioural change: with a
+    // gate-clean backfill + an empty remote but NO credential configured, bootstrap
+    // now FAIL-CLOSES on credential resolution BEFORE pushing (the old credential-less
+    // `run_git` push would instead attempt the push). A local `file://` remote can't
+    // exercise the auth path itself (askpass is never invoked), so this credential-
+    // resolution gate is the test-observable proxy for the real fix.
+    #[tokio::test]
+    #[serial]
+    async fn auto_baseline_bootstrap_resolves_provider_credential() {
+        clear_env();
+        std::env::set_var(AUTO_BASELINE_ENV, "true");
+        // Deliberately NO GITHUB_PAT_MOOSE / GITHUB_TOKEN set.
+        let src = init_source(&[("a.txt", "clean content\n")]);
+        let root = unique("root");
+        set_root(&root);
+        let bare = init_bare(); // empty — no main branch yet
+        // A backfill fail-closes without an author map (identity remap is mandatory);
+        // supply one, exactly as `baselined_history` does.
+        let map_path = unique("bootstrap-author-map.toml");
+        std::fs::write(
+            &map_path,
+            "default_name = \"MoosenetBot\"\ndefault_email = \"<email>\"\n", // pii-test-fixture
+        )
+        .unwrap();
+        std::env::set_var("TERMINUS_MIRROR_AUTHOR_MAP", &map_path);
+        // Establish local lineage (gate-clean full-history backfill; never pushes).
+        GitPublicHistoryBackfill
+            .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
+            .await
+            .unwrap();
+        // With lineage + an empty remote, bootstrap reaches the push — and must now
+        // fail closed on the ABSENT credential rather than attempting a tokenless push.
+        let res = bootstrap_first_push(&json!({
+            "repo": "Terminus",
+            "source": src.display().to_string(),
+            "github_remote": bare.display().to_string(),
+        }));
+        match res {
+            Err(ToolError::NotConfigured(m)) => assert!(
+                m.to_lowercase().contains("github") || m.to_lowercase().contains("credential") || m.to_lowercase().contains("token"),
+                "must fail-close on the missing provider credential, got: {m}"
+            ),
+            other => panic!(
+                "bootstrap must resolve (and here fail-close on) the provider credential \
+                 before pushing — proving it no longer uses a credential-less run_git push; got {other:?}"
+            ),
+        }
+        // The empty remote must remain untouched (nothing pushed).
+        assert!(
+            run_git(&bare, &["rev-parse", "main"]).is_err(),
+            "no ref may be created when the credential is unresolved"
+        );
+        clear_env();
+        cleanup(&[&src, &root, &bare]);
+        let _ = std::fs::remove_file(&map_path);
     }
 
     #[tokio::test]
