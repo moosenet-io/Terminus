@@ -57,17 +57,16 @@ fn discovery_score(m: &HfModelSummary) -> f64 {
     (trend + downloads + likes).clamp(0.0, 100.0)
 }
 
-/// Derive a short display `model_name` from an HF repo id
-/// (`"Qwen/Qwen3-8B-Instruct"` → `"Qwen3-8B-Instruct"`). Falls back to the whole
-/// repo id if there is no `/`.
-fn model_name_from_repo(repo: &str) -> String {
-    repo.rsplit('/').next().unwrap_or(repo).to_string()
-}
-
 /// Build the `Discovered`-status candidate for one listed HF model.
 fn candidate_from(summary: &HfModelSummary, cat: HfCategory, now: chrono::DateTime<chrono::Utc>) -> DiscoveryCandidate {
     DiscoveryCandidate {
-        model_name: model_name_from_repo(&summary.hf_repo),
+        // `model_name` is the brochure PRIMARY KEY, so it must be globally
+        // unique. Use the FULL HF repo id ("Qwen/Qwen3-8B"), never the leaf
+        // ("Qwen3-8B") — two orgs publishing the same leaf (e.g. Qwen/… and
+        // unsloth/…) would otherwise collide on the PK and clobber each other's
+        // row on upsert. HF repo ids are globally unique and still readable.
+        // (The ollama-style fleet name is assigned later, at fetch/sweep time.)
+        model_name: summary.hf_repo.clone(),
         hf_repo: summary.hf_repo.clone(),
         category: fleet_category(cat),
         status: CandidateStatus::Discovered,
@@ -303,16 +302,22 @@ mod tests {
     }
 
     #[test]
-    fn model_name_is_the_repo_leaf() {
-        assert_eq!(model_name_from_repo("Qwen/Qwen3-8B-Instruct"), "Qwen3-8B-Instruct");
-        assert_eq!(model_name_from_repo("no-slash"), "no-slash");
+    fn candidate_model_name_is_the_full_repo_id_so_it_never_collides() {
+        // Two orgs, same leaf → DISTINCT model_name (the PK), so upsert can't
+        // clobber one with the other. Using the leaf would collide.
+        let now = chrono::Utc::now();
+        let a = candidate_from(&summary("Qwen/Qwen3-8B", 1, 1, 1.0), HfCategory::Assistant, now);
+        let b = candidate_from(&summary("unsloth/Qwen3-8B", 1, 1, 1.0), HfCategory::Assistant, now);
+        assert_eq!(a.model_name, "Qwen/Qwen3-8B");
+        assert_eq!(b.model_name, "unsloth/Qwen3-8B");
+        assert_ne!(a.model_name, b.model_name, "same-leaf models from different orgs must NOT share a PK");
     }
 
     #[test]
     fn candidate_from_sets_discovered_status_and_unknown_fit() {
         let now = chrono::Utc::now();
         let c = candidate_from(&summary("Org/Cool-Coder-7B", 5000, 40, 12.0), HfCategory::Coder, now);
-        assert_eq!(c.model_name, "Cool-Coder-7B");
+        assert_eq!(c.model_name, "Org/Cool-Coder-7B");
         assert_eq!(c.hf_repo, "Org/Cool-Coder-7B");
         assert!(matches!(c.category, FleetCategory::Coder));
         assert!(matches!(c.status, CandidateStatus::Discovered), "new candidate starts Discovered");
