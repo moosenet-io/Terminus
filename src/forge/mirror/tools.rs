@@ -3291,6 +3291,15 @@ mod tests {
         let root = unique("root");
         set_root(&root);
         let bare = init_bare(); // empty — no main branch yet
+        // A backfill fail-closes without an author map (identity remap is mandatory);
+        // supply one, exactly as `baselined_history` does.
+        let map_path = unique("bootstrap-author-map.toml");
+        std::fs::write(
+            &map_path,
+            "default_name = \"MoosenetBot\"\ndefault_email = \"<email>\"\n", // pii-test-fixture
+        )
+        .unwrap();
+        std::env::set_var("TERMINUS_MIRROR_AUTHOR_MAP", &map_path);
         // Establish local lineage (gate-clean full-history backfill; never pushes).
         GitPublicHistoryBackfill
             .execute(json!({ "repo": "Terminus", "source": src.display().to_string() }))
@@ -3320,6 +3329,7 @@ mod tests {
         );
         clear_env();
         cleanup(&[&src, &root, &bare]);
+        let _ = std::fs::remove_file(&map_path);
     }
 
     #[tokio::test]
