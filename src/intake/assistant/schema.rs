@@ -160,6 +160,123 @@ pub async fn migrate(pool: &PgPool) -> Result<(), ToolError> {
 /// around every early return — behavior is unchanged from the previous
 /// single-function `migrate()`.
 async fn migrate_locked(conn: &mut PgConnection) -> Result<(), ToolError> {
+    // 0. BASE profiling schema (MINT-INTAKE-SCHEMA fix, 2026-07-16).
+    //
+    // `model_profiles` + the per-suite run tables (`context_profile_runs`,
+    // `code_profile_runs`, `agent_profile_runs`) are the ORIGINAL intake schema.
+    // Their CREATE statements were absent from this repo (only the S112 ALTERs
+    // that ASSUME they exist remained), so an intake DB provisioned from the
+    // current tree had `model_discovery_candidate` (its own migration ran) but
+    // NONE of the profiling tables — every profile write failed with
+    // "relation ... does not exist" and the sweep persisted zero rows. These
+    // idempotent CREATEs restore the base schema; the ALTER ... ADD COLUMN IF
+    // NOT EXISTS statements further down are no-ops once the full column set is
+    // present here. Column sets/types are taken verbatim from `storage.rs`'s
+    // INSERT sites (`insert_model_profile`, `insert_context_run`,
+    // `insert_code_run*`, the agent insert) so a row the code writes matches.
+    // `model_operational_profiles` keeps its own `ensure_operational_profile`.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS model_profiles ( \
+            id UUID PRIMARY KEY, \
+            model_name TEXT NOT NULL, \
+            provider TEXT, \
+            vram_gb DOUBLE PRECISION, \
+            reported_context_window INTEGER, \
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now() \
+         )",
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| ToolError::Database(format!("create model_profiles: {e}")))?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS context_profile_runs ( \
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+            profile_id UUID NOT NULL REFERENCES model_profiles(id) ON DELETE CASCADE, \
+            context_tokens INTEGER NOT NULL, \
+            throughput_tok_per_sec DOUBLE PRECISION, \
+            ttft_ms INTEGER, \
+            total_time_ms INTEGER, \
+            recall_score INTEGER, \
+            coherence_score DOUBLE PRECISION, \
+            memory_usage_mb INTEGER, \
+            oom BOOLEAN NOT NULL DEFAULT false, \
+            error TEXT, \
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now() \
+         )",
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| ToolError::Database(format!("create context_profile_runs: {e}")))?;
+
+    // Union of the base insert (storage.rs:198) + the V2 insert
+    // (`INSERT_CODE_RUN_V2_SQL`) + every column the S112 ALTERs add, so both
+    // insert paths and the ALTERs (below, now no-ops) are satisfied.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS code_profile_runs ( \
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+            profile_id UUID NOT NULL REFERENCES model_profiles(id) ON DELETE CASCADE, \
+            language TEXT, \
+            task_type TEXT, \
+            harness_version TEXT, \
+            first_pass_score INTEGER, \
+            retry_score INTEGER, \
+            compiles BOOLEAN, \
+            tests_pass BOOLEAN, \
+            change_correct BOOLEAN, \
+            planted_bug_found BOOLEAN, \
+            code_quality_score DOUBLE PRECISION, \
+            context_tokens INTEGER, \
+            response_tokens INTEGER, \
+            file_count INTEGER, \
+            total_lines INTEGER, \
+            throughput_tok_per_sec DOUBLE PRECISION, \
+            total_time_ms INTEGER, \
+            memory_usage_mb INTEGER, \
+            oom BOOLEAN, \
+            error TEXT, \
+            backend_tag TEXT, \
+            mem_config TEXT, \
+            case_id TEXT, \
+            well_formed BOOLEAN, \
+            sample_index SMALLINT NOT NULL DEFAULT 0, \
+            vuln_finding_count INTEGER, \
+            quant TEXT, \
+            reasoning_enabled BOOLEAN, \
+            context_window_launched INTEGER, \
+            temperature DOUBLE PRECISION, \
+            top_p DOUBLE PRECISION, \
+            task_category TEXT, \
+            failure_class TEXT, \
+            finalized BOOLEAN NOT NULL DEFAULT true, \
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now() \
+         )",
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| ToolError::Database(format!("create code_profile_runs: {e}")))?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS agent_profile_runs ( \
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+            profile_id UUID NOT NULL REFERENCES model_profiles(id) ON DELETE CASCADE, \
+            test_name TEXT, \
+            tool_count_available INTEGER, \
+            correct_tool_selected BOOLEAN, \
+            tool_params_valid BOOLEAN, \
+            multi_step_completed BOOLEAN, \
+            instruction_followed BOOLEAN, \
+            hallucination_detected BOOLEAN, \
+            response_quality_score DOUBLE PRECISION, \
+            total_time_ms INTEGER, \
+            error TEXT, \
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now() \
+         )",
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| ToolError::Database(format!("create agent_profile_runs: {e}")))?;
+
     // 1. Runs.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS assistant_profile_run ( \

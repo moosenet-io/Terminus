@@ -315,6 +315,12 @@ pub struct ContextSuiteOutcome {
 /// suite (e.g. a code-only or agent-only run). Returns the new profile id.
 pub async fn create_profile_row(model_name: &str) -> Result<uuid::Uuid, ToolError> {
     let pool = storage::get_pool().await?;
+    // MINT-INTAKE-SCHEMA: ensure the base profiling schema exists before writing.
+    // The MCP intake tools reach the profile tables through here / run_context_suite
+    // WITHOUT going through the sweep's own migrate() call, so an intake DB that
+    // only ran the discovery migration would 500 on every write. migrate() is
+    // idempotent + advisory-locked (same call the sweep already makes).
+    crate::intake::assistant::schema::migrate(&pool).await?;
     storage::insert_model_profile(&pool, model_name, "ollama", None, None).await
 }
 
@@ -347,6 +353,11 @@ pub async fn run_context_suite(
     };
 
     let pool = storage::get_pool().await?;
+    // MINT-INTAKE-SCHEMA: ensure the base profiling schema exists (see
+    // create_profile_row) — the MCP context suite writes model_profiles +
+    // context_profile_runs + model_operational_profiles and must not 500 on a
+    // DB where only the discovery migration ran.
+    crate::intake::assistant::schema::migrate(&pool).await?;
     let vram_now = model_vram_mb(&client, model_name).await;
     let vram_gb = vram_now.map(|mb| mb as f64 / 1024.0);
     let profile_id =
