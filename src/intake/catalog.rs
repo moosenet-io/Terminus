@@ -1047,11 +1047,56 @@ impl RustTool for ModelFleetCatalog {
     }
 }
 
-/// Register the read-only `model_fleet_catalog` tool on the CORE registry
-/// (called from `crate::intake::register`, itself wired into `register_all` —
-/// the same Chord-served core surface as `plane`/`gitea`). No personal registry.
+/// The `model_fleet_catalog_refresh` core tool: on-demand (re)derivation of the
+/// persisted Model Fleet Catalog from the raw intake profile tables.
+///
+/// The catalog is a DERIVED registry. It is otherwise refreshed only at the tail
+/// of a CLI MINT harness run or a coder/assistant sweep (see
+/// `MintHarness::refresh_catalog_best_effort`) — the `model_intake` (single) and
+/// `model_intake_fleet` MCP tool paths historically did NOT refresh it, so a
+/// profiling run driven purely through the MCP surface left `model_fleet_catalog`
+/// stale/empty even though the raw `model_profiles`/`*_profile_runs` tables held
+/// the data. This tool closes that gap for on-demand reconciliation; the fleet
+/// tool now also refreshes on its tail.
+pub struct ModelFleetCatalogRefresh;
+
+#[async_trait]
+impl RustTool for ModelFleetCatalogRefresh {
+    fn name(&self) -> &str {
+        "model_fleet_catalog_refresh"
+    }
+
+    fn description(&self) -> &str {
+        "(Re)derive and persist the Model Fleet Catalog from the raw intake profile tables, then \
+         report how many model cards were written. The catalog is a DERIVED registry, normally \
+         refreshed only at the end of a CLI MINT harness or coder/assistant sweep — so profiling \
+         driven purely through the `model_intake`/`model_intake_fleet` MCP tools can leave it \
+         stale. Call this (no args) to reconcile the catalog with the latest profile data so \
+         `model_fleet_catalog` reflects it. Idempotent and safe to call anytime: it only rewrites \
+         a fully re-derivable table."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+
+    async fn execute(&self, _args: Value) -> Result<String, ToolError> {
+        let pool = storage::get_pool().await?;
+        let n = refresh_fleet_catalog(&pool).await?;
+        Ok(format!(
+            "Model Fleet Catalog refreshed: {n} model card(s) persisted from the current profile \
+             data. View with `model_fleet_catalog`."
+        ))
+    }
+}
+
+/// Register the read-only `model_fleet_catalog` tool + the on-demand
+/// `model_fleet_catalog_refresh` tool on the CORE registry (called from
+/// `crate::intake::register`, itself wired into `register_all` — the same
+/// Chord-served core surface as `plane`/`gitea`). No personal registry.
 pub fn register(registry: &mut ToolRegistry) {
     registry.register_or_replace(Box::new(ModelFleetCatalog));
+    registry.register_or_replace(Box::new(ModelFleetCatalogRefresh));
 }
 
 #[cfg(test)]
