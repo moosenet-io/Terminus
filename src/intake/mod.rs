@@ -746,6 +746,24 @@ impl RustTool for ModelIntake {
                 }
                 out.push('\n');
             }
+
+            // MINT-CODE-AGG: the `model_intake` code path persists raw
+            // `code_profile_runs`, but the catalog reads the DERIVED
+            // `code_run_aggregates` TABLE — so without recomputing it here the
+            // coder cells stay `not_run` even though the runs landed. Refresh
+            // this epoch's aggregates now, exactly as the CLI coder sweep does
+            // (see `aggregate::recompute_and_persist_current_epoch`). Best-effort:
+            // a DB hiccup / un-migrated host is logged, never fails the sweep
+            // (the aggregate is fully re-derivable next run).
+            match storage::get_pool().await {
+                Ok(pool) => match crate::intake::aggregate::recompute_and_persist_current_epoch(&pool).await {
+                    Ok(n) => out.push_str(&format!("Code-run aggregates refreshed: {n} cell(s).\n\n")),
+                    Err(e) => {
+                        out.push_str(&format!("(code-run aggregate refresh skipped — recomputes next run: {e})\n\n"))
+                    }
+                },
+                Err(e) => out.push_str(&format!("(code-run aggregate refresh skipped — no DB pool: {e})\n\n")),
+            }
         }
 
         if suites.iter().any(|s| s == "agent") {
@@ -1079,12 +1097,24 @@ impl RustTool for ModelIntakeFleet {
         // into a failure (the catalog is fully re-derivable and also reachable via
         // the `model_fleet_catalog_refresh` tool).
         match storage::get_pool().await {
-            Ok(pool) => match catalog::refresh_fleet_catalog(&pool).await {
-                Ok(n) => out.push_str(&format!("Fleet catalog refreshed: {n} model card(s).\n")),
-                Err(e) => out.push_str(&format!(
-                    "(fleet catalog refresh skipped — derived, recomputes next run: {e})\n"
-                )),
-            },
+            Ok(pool) => {
+                // MINT-CODE-AGG: recompute this epoch's `code_run_aggregates`
+                // BEFORE refreshing the catalog — the catalog's coder cells read
+                // the derived aggregate TABLE, not the raw `code_profile_runs`, so
+                // skipping this leaves coder coverage `not_run` despite real runs.
+                match crate::intake::aggregate::recompute_and_persist_current_epoch(&pool).await {
+                    Ok(n) => out.push_str(&format!("Code-run aggregates refreshed: {n} cell(s).\n")),
+                    Err(e) => out.push_str(&format!(
+                        "(code-run aggregate refresh skipped — recomputes next run: {e})\n"
+                    )),
+                }
+                match catalog::refresh_fleet_catalog(&pool).await {
+                    Ok(n) => out.push_str(&format!("Fleet catalog refreshed: {n} model card(s).\n")),
+                    Err(e) => out.push_str(&format!(
+                        "(fleet catalog refresh skipped — derived, recomputes next run: {e})\n"
+                    )),
+                }
+            }
             Err(e) => out.push_str(&format!("(fleet catalog refresh skipped — no DB pool: {e})\n")),
         }
 
