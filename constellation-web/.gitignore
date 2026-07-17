@@ -1,4 +1,8 @@
 node_modules/
-dist/
 *.local
 .DS_Store
+
+# CONST-15: dist/ is deliberately COMMITTED (not ignored) -- it is the
+# production build embedded into terminus_primary via rust-embed at
+# cargo-build time, so the cargo-only build-on-dest needs no npm/node
+# toolchain at all. See constellation-web/README.md "Embedded build (CONST-15)".
