@@ -201,6 +201,14 @@ pub struct JobRequest {
     /// from the module name (e.g. module `terminus` → bin `terminus_primary`), so
     /// the AUTOMATED queue path can build such modules without an inline override.
     pub bin: Option<String>,
+    /// Disrupt-on-demand override (BLD-DISPATCH-01): when `true`, a HEAVY job
+    /// dispatches even outside a configured window and without a fleet-quiet
+    /// signal — it still goes through the normal module lock / host cap claim and
+    /// the idle-mode lease, only the window/quiet GATE is bypassed. Orthogonal to
+    /// `priority` (which only orders the queue). Monotonic like `heavy`: a later
+    /// coalescing request with `force=true` upgrades the job; it is never
+    /// downgraded back to `force=false`.
+    pub force: bool,
 }
 
 /// Outcome of an [`QueueStore::enqueue`].
@@ -225,6 +233,9 @@ pub struct QueuedJob {
     /// The cargo `--bin` target carried from the enqueue request (BLD/TERM #360).
     /// `None` ⇒ the executor defaults `--bin <module>`.
     pub bin: Option<String>,
+    /// Disrupt-on-demand override carried from the enqueue request
+    /// (BLD-DISPATCH-01). See [`JobRequest::force`].
+    pub force: bool,
 }
 
 /// Why a [`QueueStore::claim`] did not take the job.
@@ -538,7 +549,7 @@ fn host_set_key(host: HostRole) -> String {
 /// Enqueue with dedupe/coalesce/promote. Returns `{job_id, created(0/1)}`.
 /// KEYS: 1=dedupe 2=zset 3=seq
 /// ARGV: 1=candidate_id 2=prank 3=now 4=job_prefix 5=module 6=ref 7=prio_label
-///       8=heavy 9=ready 10=held_ttl 11=bin(''=none)
+///       8=heavy 9=ready 10=held_ttl 11=bin(''=none) 12=force(0/1)
 ///       8=heavy(0/1) 9=ready(0/1) 10=held_ttl_secs
 const ENQUEUE_LUA: &str = r#"
 local dedupe=KEYS[1]
@@ -552,6 +563,7 @@ local heavy=ARGV[8]
 local ready=ARGV[9]
 local held_ttl=tonumber(ARGV[10])
 local bin=ARGV[11]
+local force=ARGV[12]
 local existing=redis.call('GET', dedupe)
 if existing then
   local jk=jp..existing
@@ -570,6 +582,11 @@ if existing then
     -- to heavy so it respects the heavy-build window; never downgrade heavy→small.
     if heavy=='1' then
       redis.call('HSET', jk, 'heavy', '1')
+    end
+    -- BLD-DISPATCH-01: monotonic force upgrade — a later force=true request
+    -- disrupts the window/quiet gate for this job; never downgrade force→false.
+    if force=='1' then
+      redis.call('HSET', jk, 'force', '1')
     end
     local newst=st
     if ready=='1' and st=='held' then
@@ -609,6 +626,9 @@ if existing then
     if heavy=='1' then
       redis.call('HSET', jk, 'heavy', '1')
     end
+    if force=='1' then
+      redis.call('HSET', jk, 'force', '1')
+    end
     return {existing, 0}
   end
 end
@@ -618,7 +638,7 @@ local state='held'
 if ready=='1' then state='queued' end
 redis.call('HSET', jk, 'module', ARGV[5], 'ref', ARGV[6], 'prank', prank,
   'priority', ARGV[7], 'heavy', heavy, 'seq', seq, 'requested_at', now,
-  'coalesced', 1, 'state', state, 'bin', ARGV[11])
+  'coalesced', 1, 'state', state, 'bin', ARGV[11], 'force', force)
 redis.call('SET', dedupe, id)
 if ready=='1' then
   local score=seq-(prank*1000000000000)
@@ -705,12 +725,13 @@ if rerun=='1' then
   local prio=redis.call('HGET', jobkey, 'priority') or 'normal'
   local heavy=redis.call('HGET', jobkey, 'heavy') or '0'
   local bin=redis.call('HGET', jobkey, 'bin') or ''
+  local force=redis.call('HGET', jobkey, 'force') or '0'
   local seq=redis.call('INCR', seqkey)
   rr_id=rerun_id
   local njk=jobprefix..rr_id
   redis.call('HSET', njk, 'module', module, 'ref', ref, 'prank', prank,
     'priority', prio, 'heavy', heavy, 'seq', seq, 'requested_at', nowv,
-    'coalesced', 1, 'state', 'queued', 'bin', bin)
+    'coalesced', 1, 'state', 'queued', 'bin', bin, 'force', force)
   if dedupe then redis.call('SET', dedupe, rr_id) end
   local score=seq-(prank*1000000000000)
   redis.call('ZADD', zsetkey, score, rr_id)
@@ -755,8 +776,8 @@ return {{rr_flag, rr_id}}
     )
 }
 
-/// Peek the top-N dispatchable jobs, flattened as 6 fields each:
-/// `id, module, ref, prank, heavy, bin`.
+/// Peek the top-N dispatchable jobs, flattened as 7 fields each:
+/// `id, module, ref, prank, heavy, bin, force`.
 /// KEYS: 1=zset  ARGV: 1=limit 2=job_prefix
 const PEEK_LUA: &str = r#"
 local ids=redis.call('ZRANGE', KEYS[1], 0, tonumber(ARGV[1])-1)
@@ -769,6 +790,7 @@ for _, id in ipairs(ids) do
   out[#out+1]=redis.call('HGET', jk, 'prank') or '0'
   out[#out+1]=redis.call('HGET', jk, 'heavy') or '0'
   out[#out+1]=redis.call('HGET', jk, 'bin') or ''
+  out[#out+1]=redis.call('HGET', jk, 'force') or '0'
 end
 return out
 "#;
@@ -959,6 +981,8 @@ impl QueueStore for RedisQueue {
         let held_ttl = held_intent_ttl_secs();
         // BLD/TERM #360: carry the optional cargo bin (''=none) as ARGV[11].
         let bin = req.bin.clone().unwrap_or_default();
+        // BLD-DISPATCH-01: carry the disrupt-on-demand force flag as ARGV[12].
+        let force = req.force as i64;
         let script = redis::Script::new(ENQUEUE_LUA);
         let out: Result<(String, i64), ()> = self
             .backend
@@ -978,6 +1002,7 @@ impl QueueStore for RedisQueue {
                     .arg(ready)
                     .arg(held_ttl)
                     .arg(bin)
+                    .arg(force)
                     .invoke_async::<_, (String, i64)>(&mut conn)
                     .await
             })
@@ -1007,7 +1032,7 @@ impl QueueStore for RedisQueue {
             .await;
         match out {
             Ok(flat) => Ok(flat
-                .chunks_exact(6)
+                .chunks_exact(7)
                 .map(|c| QueuedJob {
                     job_id: c[0].clone(),
                     module: c[1].clone(),
@@ -1015,6 +1040,7 @@ impl QueueStore for RedisQueue {
                     priority: priority_from_rank(c[3].parse().unwrap_or(1)),
                     heavy: c[4] == "1",
                     bin: Some(c[5].clone()).filter(|s| !s.is_empty()),
+                    force: c[6] == "1",
                 })
                 .collect()),
             Err(()) => Err(QueueError::Unavailable),
@@ -1300,6 +1326,7 @@ pub(crate) mod fake {
         prank: i64,
         heavy: bool,
         bin: Option<String>,
+        force: bool,
         seq: i64,
         coalesced: i64,
         state: String, // held | queued | building | done | failed
@@ -1463,10 +1490,11 @@ pub(crate) mod fake {
                 j.heavy,
                 j.rerun,
                 j.bin.clone(),
+                j.force,
             ),
             None => return,
         };
-        let (dmod, dref, dhost, dprank, dheavy, rerun, dbin) = done;
+        let (dmod, dref, dhost, dprank, dheavy, rerun, dbin, dforce) = done;
         // Derive the module lock + host slot from the STORED fields.
         if s.module_lock.get(&dmod).map(String::as_str) == Some(job_id) {
             s.module_lock.remove(&dmod);
@@ -1494,6 +1522,7 @@ pub(crate) mod fake {
                     prank: dprank,
                     heavy: dheavy,
                     bin: dbin,
+                    force: dforce,
                     seq,
                     coalesced: 1,
                     state: "queued".into(),
@@ -1540,6 +1569,10 @@ pub(crate) mod fake {
                         if req.bin.is_some() {
                             j.bin = req.bin.clone();
                         }
+                        // BLD-DISPATCH-01: monotonic force upgrade (mirrors ENQUEUE_LUA).
+                        if req.force {
+                            j.force = true;
+                        }
                         if req.ready && j.state == "held" {
                             j.state = "queued".into();
                         }
@@ -1568,6 +1601,10 @@ pub(crate) mod fake {
                         if req.bin.is_some() {
                             j.bin = req.bin.clone();
                         }
+                        // BLD-DISPATCH-01: monotonic force upgrade (mirrors ENQUEUE_LUA).
+                        if req.force {
+                            j.force = true;
+                        }
                         return Ok(Enqueued {
                             job_id: existing,
                             created: false,
@@ -1588,6 +1625,7 @@ pub(crate) mod fake {
                     prank: req.priority.rank(),
                     heavy: req.heavy,
                     bin: req.bin.clone(),
+                    force: req.force,
                     seq,
                     coalesced: 1,
                     state: if req.ready { "queued".into() } else { "held".into() },
@@ -1625,6 +1663,7 @@ pub(crate) mod fake {
                     priority: priority_from_rank(j.prank),
                     heavy: j.heavy,
                     bin: j.bin.clone(),
+                    force: j.force,
                 })
                 .collect())
         }
@@ -1871,6 +1910,7 @@ mod tests {
             priority: prio,
             heavy,
             ready: true,
+            force: false,
         }
     }
 
@@ -2617,6 +2657,7 @@ mod tests {
             heavy,
             ready,
             bin: None,
+            force: false,
         };
 
         // 1) Dedupe/coalesce + monotonic priority bump (real ENQUEUE_LUA).
@@ -2748,6 +2789,7 @@ mod tests {
             heavy: false,
             ready: true,
             bin: None,
+            force: false,
         };
         let j1 = q.enqueue(&mk("r1")).await.unwrap();
         let j2 = q.enqueue(&mk("r2")).await.unwrap();
