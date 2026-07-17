@@ -57,6 +57,10 @@ pub mod media;
 /// Standalone streamable-HTTP MCP server (backs the `terminus_personal` bin).
 pub mod mcp_server;
 pub mod meridian;
+/// PROMEX-01: process-global Prometheus application-metrics registry
+/// (`terminus_tool_calls_total`, `terminus_tool_duration_seconds`) plus the
+/// `GET /metrics` text-exposition encoder. See `crate::metrics`'s module doc.
+pub mod metrics;
 /// Upstream Terminus mesh registry (MESH-01) — config-driven federation
 /// targets, replacing the two hard-coded backends.
 pub mod mesh;

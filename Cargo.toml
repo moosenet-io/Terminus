@@ -118,6 +118,13 @@ tree-sitter-lua = "0.2"
 petgraph = "0.6"
 # model_advisor bundled presets/matrix + council custom-preset overlay (constellation.yaml)
 serde_yaml = "0.9"
+# PROMEX-01: process-global application-metrics registry + Prometheus text
+# exposition encoder for the `GET /metrics` endpoint (`crate::metrics`).
+# Deliberately the standalone `prometheus` crate (registry + CounterVec +
+# HistogramVec + TextEncoder), not a re-use of `crate::prometheus` (that
+# module is an unrelated PromQL *client* for querying an external Prometheus
+# server, not an exporter).
+prometheus = "0.13"
 # S101 (TERM): parse the git-versioned prefix-registry baseline
 # (data/prefix_registry.toml), compiled into the binary via include_str!.
 # Parse-only at runtime (overlay claims are JSON in Redis via serde_json).
