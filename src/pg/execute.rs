@@ -244,7 +244,7 @@ impl RustTool for PgExecute {
     }
 
     fn parameters(&self) -> Value {
-        json!({
+        conn::with_database_param(json!({
             "type": "object",
             "properties": {
                 "sql": {
@@ -270,7 +270,7 @@ impl RustTool for PgExecute {
                 }
             },
             "required": ["sql"]
-        })
+        }))
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
@@ -320,7 +320,7 @@ impl RustTool for PgExecute {
             Gate::Pending(msg) | Gate::Denied(msg) => return Ok(ToolOutput::text_only(msg)),
         }
 
-        let pool = conn::resolve_connection(&identity).await?;
+        let pool = conn::resolve_connection_for(&identity, conn::resolve_database_name(&args).as_deref()).await?;
 
         let normalized = normalize(&sql);
         let returning = contains_word(&normalized, "RETURNING");

@@ -344,7 +344,7 @@ impl RustTool for PgAdmin {
     }
 
     fn parameters(&self) -> Value {
-        conn::with_identity_param(json!({
+        conn::with_conn_params(json!({
             "type": "object",
             "properties": {
                 "sql": {
@@ -440,7 +440,7 @@ impl RustTool for PgAdmin {
             Gate::Pending(msg) | Gate::Denied(msg) => return Ok(ToolOutput::text_only(msg)),
         }
 
-        let pool = conn::resolve_connection(&identity).await?;
+        let pool = conn::resolve_connection_for(&identity, conn::resolve_database_name(&args).as_deref()).await?;
         sqlx::query(&sql)
             .execute(&pool)
             .await
