@@ -208,7 +208,7 @@ tower-http = { version = "0.5", features = ["trace", "fs"] }
 # npm/node toolchain to ship the UI. Content-Type is resolved by a small in-crate
 # Content-Type per embedded asset extension for `src/constellation/mod.rs`'s
 # embedded-asset serving path.
-rust-embed = { version = "8", default-features = false }
+include_dir = "0.7"
 # S100 (TERM): distributed Redis-backed Plane GET cache + rate limiter.
 # connection-manager gives a multiplexed, auto-reconnecting async connection;
 # `script` powers the atomic distributed rate-limiter Lua reservation.

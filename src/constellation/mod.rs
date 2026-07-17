@@ -16,7 +16,7 @@
 //!   `/api/terminus/config`, the three namespaced backend proxies
 //!   (`crate::constellation::proxy`), a `/ws` scaffold, and a static-asset
 //!   fallback serving the built `constellation-web` SPA — by default from
-//!   the [`assets::WebAssets`] embedded into the binary (CONST-15), or from
+//!   the [`assets::WEB_ASSETS`] embedded into the binary (CONST-15), or from
 //!   a `ServeDir` over `CONSTELLATION_WEB_DIST_DIR` when that env var is set
 //!   (a filesystem override for local dev against a live-reloading build).
 //! - [`mask`] — secret-masking applied to every `/api/*` response body
@@ -49,7 +49,6 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 
-use self::assets::WebAssets;
 
 use crate::config;
 use crate::mcp_server::McpServerState;
@@ -125,7 +124,7 @@ pub fn constellation_router(state: Arc<McpServerState>) -> Router {
         }
         // CONST-15 default: no filesystem override configured -- serve the
         // `constellation-web` SPA straight out of the binary via
-        // `assets::WebAssets`. Same `fallback_service` placement/reasoning
+        // `assets::WEB_ASSETS`. Same `fallback_service` placement/reasoning
         // as the dev-override arm above (never shadows `/api/*`/`/mcp`/
         // `/healthz`). This is unconditional: even a build with an empty
         // embed (dist never rebuilt/committed) still yields a valid router
@@ -138,15 +137,15 @@ pub fn constellation_router(state: Arc<McpServerState>) -> Router {
 }
 
 /// The embedded-assets equivalent of `ServeDir::not_found_service(index)`:
-/// look the request path up in [`WebAssets`]; on a hit, serve that file's
+/// look the request path up in [`WEB_ASSETS`]; on a hit, serve that file's
 /// embedded bytes with a Content-Type resolved from its extension (via
-/// `mime_guess`, matching what a real static file server would send); on a
+/// `content_type_for`, matching what a static file server would send); on a
 /// miss, SPA-fall-back to the embedded `index.html` (so client-side routes
 /// like `/harmony/status` resolve to the app shell, exactly like the
 /// filesystem `ServeDir` arm's `not_found_service` does) -- UNLESS the path
 /// looks like it was meant to be a real static asset (`assets/...`), in
 /// which case a miss is a genuine `404` rather than silently serving HTML
-/// for a broken asset reference. When [`WebAssets`] has nothing embedded at
+/// for a broken asset reference. When [`WEB_ASSETS`] has nothing embedded at
 /// all (dist never built/committed), `index.html` itself is also absent, so
 /// this degrades to `404` on every path -- never a panic, matching the
 /// "router still builds without a UI" contract `constellation_router`
@@ -156,7 +155,7 @@ async fn embedded_asset_fallback(
 ) -> Result<Response, std::convert::Infallible> {
     let path = req.uri().path().trim_start_matches('/');
 
-    if let Some(file) = WebAssets::get(path) {
+    if let Some(file) = assets::WEB_ASSETS.get_file(path) {
         return Ok(embedded_file_response(path, file));
     }
 
@@ -169,7 +168,7 @@ async fn embedded_asset_fallback(
 
     // Everything else (an empty path, or a client-side route like
     // `harmony/status`) SPA-falls-back to the embedded index.html.
-    match WebAssets::get("index.html") {
+    match assets::WEB_ASSETS.get_file("index.html") {
         Some(index) => Ok(embedded_file_response("index.html", index)),
         // No dist embedded at all -- degrade to a plain 404 rather than
         // panicking (mirrors the filesystem arm's behavior when the
@@ -210,8 +209,8 @@ fn content_type_for(path: &str) -> &'static str {
 
 /// Build the `Response` for one embedded file: its raw bytes plus a Content-Type
 /// resolved from the path's extension (see [`content_type_for`]).
-fn embedded_file_response(path: &str, file: rust_embed::EmbeddedFile) -> Response {
-    let mut resp = Response::new(axum::body::Body::from(file.data.into_owned()));
+fn embedded_file_response(path: &str, file: &include_dir::File) -> Response {
+    let mut resp = Response::new(axum::body::Body::from(file.contents().to_vec()));
     resp.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
         HeaderValue::from_static(content_type_for(path)),
@@ -514,7 +513,7 @@ mod tests {
         std::env::remove_var("CONSTELLATION_WEB_DIST_DIR");
         // Must not panic building the router with no filesystem override
         // configured -- CONST-15 changed what this path serves (the
-        // embedded `WebAssets` instead of nothing), but building the
+        // embedded `WEB_ASSETS` instead of nothing), but building the
         // router itself must still never panic even in a hypothetical
         // build with an empty embed (see `embedded_asset_fallback`'s doc).
         let _router = constellation_router(test_state());
@@ -534,7 +533,7 @@ mod tests {
         let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap().to_string();
         assert!(content_type.contains("html"), "expected an html content-type, got {content_type}");
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let expected = assets::WebAssets::get("index.html").unwrap().data.into_owned();
+        let expected = assets::WEB_ASSETS.get_file("index.html").unwrap().contents().to_vec();
         assert_eq!(bytes.as_ref(), expected.as_slice());
     }
 
@@ -556,7 +555,7 @@ mod tests {
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let expected = assets::WebAssets::get("index.html").unwrap().data.into_owned();
+        let expected = assets::WEB_ASSETS.get_file("index.html").unwrap().contents().to_vec();
         assert_eq!(bytes.as_ref(), expected.as_slice());
     }
 
@@ -567,8 +566,12 @@ mod tests {
     #[serial]
     async fn a_real_embedded_asset_path_resolves_with_its_own_content_type() {
         std::env::remove_var("CONSTELLATION_WEB_DIST_DIR");
-        let asset_path = assets::WebAssets::iter()
-            .find(|p| p.starts_with("assets/") && p.ends_with(".js"))
+        let asset_path = assets::WEB_ASSETS
+            .get_dir("assets")
+            .expect("the committed dist must embed an assets/ dir")
+            .files()
+            .map(|f| f.path().to_string_lossy().to_string())
+            .find(|p| p.ends_with(".js"))
             .expect("the committed dist must embed at least one assets/*.js file");
         let router = constellation_router(test_state());
         let req = Request::builder()
