@@ -1041,15 +1041,14 @@ async fn handle_mcp(
                 },
             };
 
-            // PROMEX-01: record against the BARE tool name (stripping any
-            // `<mesh-namespace>__` prefix, same split `audit_upstream_ns`
-            // above already computed) so a mesh-federated call and the
-            // "same" tool called locally aggregate under one label value,
-            // matching this metric's documented bounded-cardinality
-            // contract (see `crate::metrics`'s module doc).
-            let metric_tool_name =
-                crate::mesh::split_namespaced(name).map(|(_, bare)| bare).unwrap_or(name);
-            crate::metrics::record_tool_call(metric_tool_name, success, dispatch_started.elapsed());
+            // PROMEX-01: record the tool call under a BOUNDED label. The raw
+            // `name` is caller-supplied and `resolve_call_route` routes a mesh
+            // call by NAMESPACE ONLY (never validating the bare tool name), so
+            // neither the raw nor the split bare name is bounded on its own.
+            // `bounded_tool_label` caps the label to {known local tool names} ∪
+            // {upstream namespaces as `<mesh:ns>`} ∪ {`<unknown>`}.
+            let metric_tool_name = crate::metrics::bounded_tool_label(name, reg.contains(name));
+            crate::metrics::record_tool_call(&metric_tool_name, success, dispatch_started.elapsed());
 
             if let Some(ctx) = gate_ctx {
                 if is_transport_failure {
