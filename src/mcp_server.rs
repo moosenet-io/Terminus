@@ -681,6 +681,20 @@ async fn handle_mcp(
                 }
                 _ => gate_ctx,
             };
+
+            // PROMEX-01: capture the CONFIGURED upstream namespace (if any)
+            // from the RESOLVED route — `Some` only for a real Upstream/
+            // Unavailable route (a configured, bounded namespace), so an
+            // unknown `foo__bar` name (which resolves to `Local`) yields
+            // `None` and can never smuggle an arbitrary or secret-shaped
+            // prefix into the `tool` metric label. Borrow only — the owning
+            // `mesh_route` is still consumed by the dispatch match below.
+            let metric_ns: Option<String> = match &mesh_route {
+                Some(CallRoute::Upstream { client, .. }) => Some(client.namespace().to_string()),
+                Some(CallRoute::Unavailable { namespace }) => Some(namespace.clone()),
+                _ => None,
+            };
+
             // MESH-10: set when dispatch couldn't even reach an upstream at
             // the transport level (unhealthy/unregistered mesh upstream, or
             // a network-level failure calling one that IS registered) --
@@ -1042,12 +1056,13 @@ async fn handle_mcp(
             };
 
             // PROMEX-01: record the tool call under a BOUNDED label. The raw
-            // `name` is caller-supplied and `resolve_call_route` routes a mesh
-            // call by NAMESPACE ONLY (never validating the bare tool name), so
-            // neither the raw nor the split bare name is bounded on its own.
-            // `bounded_tool_label` caps the label to {known local tool names} ∪
-            // {upstream namespaces as `<mesh:ns>`} ∪ {`<unknown>`}.
-            let metric_tool_name = crate::metrics::bounded_tool_label(name, reg.contains(name));
+            // `name` is caller-supplied, so the label is derived only from
+            // VALIDATED state: `reg.contains(name)` (a known local tool) and
+            // `metric_ns` (a configured upstream namespace from the resolved
+            // route). `bounded_tool_label` caps the label to {known local tool
+            // names} ∪ {`<mesh:ns>` for configured ns} ∪ {`<unknown>`}.
+            let metric_tool_name =
+                crate::metrics::bounded_tool_label(name, reg.contains(name), metric_ns.as_deref());
             crate::metrics::record_tool_call(&metric_tool_name, success, dispatch_started.elapsed());
 
             if let Some(ctx) = gate_ctx {

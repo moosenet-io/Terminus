@@ -114,21 +114,28 @@ pub fn record_tool_call(tool: &str, is_ok: bool, duration: Duration) {
 /// Map a caller-supplied `tools/call` name onto a BOUNDED metric label value,
 /// so the `tool` label can never be inflated by an arbitrary or unknown name.
 ///
-/// `is_known_local` is whether the current registry snapshot contains `name`
-/// as a local tool (`ToolRegistry::contains`) — the caller passes
-/// `reg.contains(name)` so this fn stays pure/testable without a registry.
+/// The two bounding facts come from the CALLER (kept out of this fn so it stays
+/// pure/testable), and BOTH are derived from validated state, never from the
+/// raw request string:
+/// * `is_known_local` — whether the active registry snapshot contains `name`
+///   as a local tool (`reg.contains(name)`).
+/// * `configured_mesh_ns` — `Some(ns)` ONLY when `resolve_call_route` resolved
+///   the call to a genuinely CONFIGURED upstream (an `Upstream`/`Unavailable`
+///   route), i.e. `ns` is a real, bounded upstream namespace — NOT merely a
+///   `foo__bar`-shaped string (an unknown prefix resolves to `Local`, giving
+///   `None` here, so a caller cannot smuggle an arbitrary/secret-shaped prefix
+///   into the label).
 ///
-/// Mapping:
-/// * a known local tool → its own (bounded, developer-controlled) name;
-/// * any `<ns>__…` mesh-shaped name → `<mesh:ns>` — the namespace set is
-///   bounded by configured upstreams, while the bare part is caller-controlled
-///   (mesh routing is by namespace only, never validated against the upstream
-///   catalog), so the bare part is deliberately dropped;
-/// * anything else → the fixed sentinel `<unknown>`.
-pub fn bounded_tool_label(name: &str, is_known_local: bool) -> Cow<'_, str> {
+/// Mapping → bounded set {known local names} ∪ {`<mesh:ns>` for configured ns}
+/// ∪ {`<unknown>`}:
+pub fn bounded_tool_label<'a>(
+    name: &'a str,
+    is_known_local: bool,
+    configured_mesh_ns: Option<&str>,
+) -> Cow<'a, str> {
     if is_known_local {
         Cow::Borrowed(name)
-    } else if let Some((ns, _bare)) = crate::mesh::split_namespaced(name) {
+    } else if let Some(ns) = configured_mesh_ns {
         Cow::Owned(format!("<mesh:{ns}>"))
     } else {
         Cow::Borrowed("<unknown>")
@@ -175,26 +182,27 @@ mod tests {
 
     #[test]
     fn bounded_tool_label_known_local_passes_through() {
-        assert_eq!(bounded_tool_label("pg_query", true), "pg_query");
+        assert_eq!(bounded_tool_label("pg_query", true, None), "pg_query");
     }
 
     #[test]
-    fn bounded_tool_label_unknown_nonnamespaced_is_sentinel() {
-        // An arbitrary caller-supplied name that isn't a known local tool and
-        // isn't mesh-shaped must collapse to the fixed sentinel.
-        assert_eq!(bounded_tool_label("totally_made_up_xyz", false), "<unknown>");
-        assert_eq!(bounded_tool_label("also-not-real", false), "<unknown>");
+    fn bounded_tool_label_unknown_is_sentinel_even_when_underscore_shaped() {
+        // A name that isn't a known local tool and has NO configured upstream
+        // namespace collapses to the fixed sentinel — including a `foo__bar`
+        // shaped name whose prefix is NOT a real upstream (resolve_call_route
+        // gives it a Local route, so the caller passes configured_mesh_ns=None).
+        // This is the key guard: an arbitrary/secret-shaped prefix cannot reach
+        // the label.
+        assert_eq!(bounded_tool_label("totally_made_up_xyz", false, None), "<unknown>");
+        assert_eq!(bounded_tool_label("customer_secret__anything", false, None), "<unknown>");
     }
 
     #[test]
-    fn bounded_tool_label_mesh_shaped_buckets_by_namespace_not_bare_name() {
-        // A mesh `<ns>__<tool>` name (not a known local tool) labels by
-        // NAMESPACE only — the bare part is caller-controlled and unbounded
-        // (mesh routing never validates it against the upstream catalog), so
-        // two different bare names under one namespace collapse to one label.
-        assert_eq!(bounded_tool_label("pve__vm_list", false), "<mesh:<host>>");
-        assert_eq!(bounded_tool_label("pve__anything_goes", false), "<mesh:<host>>");
-        assert_eq!(bounded_tool_label("pve__vm_list", false), bounded_tool_label("pve__other", false));
+    fn bounded_tool_label_configured_mesh_ns_buckets_by_namespace() {
+        // Only when the caller confirms a CONFIGURED upstream namespace do we
+        // bucket by `<mesh:ns>` — bounded by the configured upstream set.
+        assert_eq!(bounded_tool_label("pve__vm_list", false, Some("<host>")), "<mesh:<host>>");
+        assert_eq!(bounded_tool_label("pve__anything", false, Some("<host>")), "<mesh:<host>>");
     }
 
     #[test]
