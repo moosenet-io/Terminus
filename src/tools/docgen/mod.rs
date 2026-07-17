@@ -49,6 +49,7 @@ pub mod drift;
 pub mod generate;
 pub mod mismatch;
 pub mod pii_gate;
+pub mod preserve;
 pub mod quality;
 pub mod readme_layers;
 pub mod render;
@@ -72,6 +73,11 @@ pub use generate::{
     SweptFeatContext,
 };
 pub use pii_gate::{sweep_input, sweep_input_for_routing, PiiGateOutcome, RoutingDestination};
+pub use preserve::{check_preservation, PreservationReport, Section as PreservationSection};
+// `Section` is re-exported under a `Preservation`-prefixed alias above to
+// avoid ambiguity with any future generic `Section` type this module might
+// re-export from elsewhere; `docgen::preserve::Section` remains the
+// canonical unqualified name.
 pub use quality::{
     lint_prose, run_quality_gate, JudgeScores, LintResult, ProseLintConfig, QualityScore,
     QualityScoreStore, QualityVerdict, DEFAULT_QUALITY_THRESHOLD,
