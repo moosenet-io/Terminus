@@ -78,6 +78,187 @@ const BUILD_ALLOWED_SOURCE_ROOTS: &str = "BUILD_ALLOWED_SOURCE_ROOTS";
 /// pruning after a bless/promote. The store floors this at 2 regardless.
 const BUILD_RETAIN_PER_CHANNEL: &str = "BUILD_RETAIN_PER_CHANNEL";
 
+// ── BLD-GATE-FIX: Gitea Cargo-registry creds for a registry-consuming build ──
+//
+// harmony and chord depend on `terminus-rs` via the Gitea Cargo registry
+// (`[registries.gitea]` in their `.cargo/config.toml`), so their build scope
+// needs the sparse INDEX + credential-provider list (non-secret config) PLUS
+// the registry auth TOKEN (secret — a Gitea PAT). Without these, cargo's
+// dependency resolution against the `gitea` registry fails inside the
+// systemd-run scope even though sccache/toolchain env is otherwise fine.
+
+/// Env var: the Gitea Cargo sparse-registry INDEX URL. Non-secret (a plain
+/// endpoint, not a credential) — always read from the environment FIRST so
+/// the host stays authoritative; see [`cargo_registry_gitea_index`] for the
+/// (non-hardcoded) fallback derivation from `GITEA_URL` when unset.
+const CARGO_REGISTRIES_GITEA_INDEX: &str = "CARGO_REGISTRIES_GITEA_INDEX";
+/// Env var: Cargo's global credential-provider list (non-secret — a config
+/// string cargo itself defines). `cargo:token` is cargo's built-in provider
+/// that sends a `CARGO_REGISTRIES_<NAME>_TOKEN` value verbatim; required for
+/// cargo's credential-provider model (>=1.74) to use the token env at all.
+const CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS: &str =
+    "CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS";
+/// Env var (SECRET — name ends in `_TOKEN`, so `scope::is_secret_env_key`
+/// already routes it to the inherited-env-only side of `scope::partition_env`,
+/// never `--setenv` argv): matches cargo's own `CARGO_REGISTRIES_<NAME>_TOKEN`
+/// convention for a registry named `gitea`. If the operator did not
+/// provision one specifically for the registry, [`cargo_registry_gitea_token`]
+/// falls back to the same `GITEA_PAT_<identity>` this crate already uses for
+/// the Gitea REST API (see `crate::gitea`).
+const CARGO_REGISTRIES_GITEA_TOKEN: &str = "CARGO_REGISTRIES_GITEA_TOKEN";
+/// Default value for `CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS` when unset —
+/// cargo's built-in token provider, the only one needed for a PAT-shaped
+/// `CARGO_REGISTRIES_GITEA_TOKEN`.
+const DEFAULT_CARGO_CREDENTIAL_PROVIDERS: &str = "cargo:token";
+/// Env var naming the active-default Gitea identity (mirrors
+/// `crate::gitea`'s private `GITEA_IDENTITY_NAME`/`DEFAULT_GITEA_IDENTITY` —
+/// duplicated as a plain string here rather than making those `pub`, since
+/// this is a read-only fallback lookup, not a Gitea API client).
+const GITEA_IDENTITY_NAME_ENV: &str = "GITEA_IDENTITY_NAME";
+const DEFAULT_GITEA_IDENTITY_FOR_REGISTRY: &str = "moose";
+
+/// Resolve the Gitea Cargo-registry auth token (SECRET). Per this crate's
+/// established secret convention (see `crate::gitea`'s module doc and
+/// `crate::config`'s CONST-02/03 sections: there is no separate
+/// `SecretManager`/`vault::manager()` API in terminus-rs — a plain env read of
+/// a runtime-materialized value IS the vault read here), this reads directly
+/// at the point of use, exactly like `CONSTELLATION_OPERATOR_SECRET`, rather
+/// than through a shared `crate::config` helper.
+///
+/// Resolution order:
+///   1. `CARGO_REGISTRIES_GITEA_TOKEN` — a PAT provisioned specifically for
+///      the Cargo registry.
+///   2. The active-default Gitea identity's `GITEA_PAT_<NAME>` (same
+///      identity `crate::gitea::GiteaClient::from_env` would pick —
+///      `GITEA_IDENTITY_NAME`, default `moose`), since Gitea's Cargo registry
+///      accepts the same PAT as its REST API and every environment that
+///      talks to Gitea already provisions one.
+///   3. `GITEA_PAT_MOOSE` as an explicit FINAL fallback — the `moose` identity's
+///      PAT is the one provisioned with `moosenet`-org read access (the access a
+///      registry-consuming build actually needs). If step 2 picked a NON-moose
+///      identity (an operator set `GITEA_IDENTITY_NAME` to something else) whose
+///      `GITEA_PAT_<that>` is unset, we must still fall back to the org-readable
+///      moose PAT rather than degrading — otherwise a harmony/chord build would
+///      fail to resolve terminus-rs purely because the active identity changed.
+///      This step is a no-op when step 2 already resolved moose's PAT.
+///
+/// Returns `None` (never a stopgap literal) when none are configured; the
+/// caller must DEGRADE (log + continue), never hardcode a token.
+fn cargo_registry_gitea_token() -> Option<String> {
+    if let Some(t) = env_nonempty(CARGO_REGISTRIES_GITEA_TOKEN) {
+        return Some(t);
+    }
+    // PREFER the org-readable moose PAT for REGISTRY reads: fetching the
+    // terminus-rs crate from the Gitea Cargo registry only needs org read
+    // access, which GITEA_PAT_MOOSE is guaranteed to have. The gateway's active
+    // identity (GITEA_IDENTITY_NAME) is only a SECONDARY fallback — its PAT may
+    // be scoped to a different area and lack registry read (review finding).
+    if let Some(t) = env_nonempty(&format!(
+        "GITEA_PAT_{}",
+        DEFAULT_GITEA_IDENTITY_FOR_REGISTRY.to_uppercase()
+    )) {
+        return Some(t);
+    }
+    // Last-ditch: the active identity's PAT, if moose is unprovisioned.
+    let identity = env_nonempty(GITEA_IDENTITY_NAME_ENV)
+        .map(|v| v.to_lowercase())
+        .unwrap_or_else(|| DEFAULT_GITEA_IDENTITY_FOR_REGISTRY.to_string());
+    env_nonempty(&format!("GITEA_PAT_{}", identity.to_uppercase()))
+}
+
+/// Resolve the Gitea Cargo sparse-registry INDEX URL. Deliberately has NO
+/// hardcoded infra literal (S1) — an explicit `CARGO_REGISTRIES_GITEA_INDEX`
+/// always wins; failing that, it's DERIVED from the same `GITEA_URL` +
+/// `GITEA_OWNER` config `crate::gitea::GiteaClient::from_env` already uses for
+/// the Gitea REST API (Gitea's Cargo registry lives at a fixed, well-known
+/// path under the same base URL:
+/// `{GITEA_URL}/api/packages/{GITEA_OWNER}/cargo/`), so a box that already
+/// talks to Gitea doesn't need a second URL provisioned. `None` when neither
+/// is configured — the caller must not fabricate one.
+fn cargo_registry_gitea_index() -> Option<String> {
+    if let Some(v) = env_nonempty(CARGO_REGISTRIES_GITEA_INDEX) {
+        return Some(v);
+    }
+    let base = env_nonempty("GITEA_URL")?;
+    let owner = env_nonempty("GITEA_OWNER").unwrap_or_else(|| "moosenet".to_string());
+    Some(format!(
+        "sparse+{}/api/packages/{owner}/cargo/",
+        base.trim_end_matches('/')
+    ))
+}
+
+/// Populate `build_env` with the Gitea Cargo-registry config a module that
+/// depends on `terminus-rs` via that registry (harmony, chord) needs to
+/// resolve it: the sparse INDEX + credential-provider list (non-secret,
+/// `--setenv`-safe) plus the registry auth TOKEN (secret — name ends in
+/// `_TOKEN`, so `scope::is_secret_env_key`/`partition_env` already route it to
+/// the inherited-env-only side, never argv). The formatted `Bearer <token>`
+/// value is also appended to `redact` (S7) so a build script that echoes its
+/// env can never leak it into captured stdout/stderr or a `ToolError`.
+///
+/// Best-effort/DEGRADE: if the INDEX can't be resolved (neither
+/// `CARGO_REGISTRIES_GITEA_INDEX` nor `GITEA_URL` configured) or no token is
+/// configured anywhere, this logs a clear warning and continues rather than
+/// failing the whole build — a module that doesn't touch the registry is
+/// unaffected, and a registry-consuming build gets cargo's own "no
+/// index/token configured" resolve error instead of the misleading
+/// `systemd-run: No such file` a missing-staged-source used to produce (see
+/// [`validate_local_source_dir`]).
+fn inject_gitea_registry_env(build_env: &mut BTreeMap<String, String>, redact: &mut Vec<String>) {
+    match cargo_registry_gitea_index() {
+        Some(index) => {
+            build_env.insert(CARGO_REGISTRIES_GITEA_INDEX.to_string(), index);
+            let providers = env_nonempty(CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS)
+                .unwrap_or_else(|| DEFAULT_CARGO_CREDENTIAL_PROVIDERS.to_string());
+            build_env.insert(
+                CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS.to_string(),
+                providers,
+            );
+        }
+        None => {
+            tracing::warn!(
+                "compiler: Gitea Cargo-registry index unconfigured \
+                 ({CARGO_REGISTRIES_GITEA_INDEX} and GITEA_URL both unset) — \
+                 registry-consuming builds (harmony, chord) will fail to \
+                 resolve terminus-rs from the Gitea Cargo registry"
+            );
+        }
+    }
+    match cargo_registry_gitea_token() {
+        Some(token) => {
+            // The `Bearer ` PREFIX IS REQUIRED, not a bug: cargo sends the value
+            // of `CARGO_REGISTRIES_<NAME>_TOKEN` VERBATIM as the HTTP
+            // `Authorization:` header, and Gitea's Cargo registry only accepts the
+            // `Bearer <PAT>` scheme (a raw PAT → 401). This matches the working
+            // format the constellation-updater sources from
+            // `/etc/constellation/secrets` to build chord
+            // (`CARGO_REGISTRIES_GITEA_TOKEN="<REDACTED-SECRET>"`), also documented in
+            // project memory. NOTE: an operator who ever needs a raw token can
+            // set `CARGO_REGISTRIES_GITEA_TOKEN` explicitly — that value WINS
+            // (it's returned as-is by `cargo_registry_gitea_token` step 1, so it
+            // is inserted verbatim without a synthesized `Bearer ` prefix); we
+            // only synthesize `Bearer <pat>` when falling back to a bare
+            // `GITEA_PAT_*`, which is always a raw PAT.
+            let bearer = if token.starts_with("Bearer ") {
+                token.clone()
+            } else {
+                format!("Bearer {token}")
+            };
+            redact.push(token);
+            redact.push(bearer.clone());
+            build_env.insert(CARGO_REGISTRIES_GITEA_TOKEN.to_string(), bearer);
+        }
+        None => {
+            tracing::warn!(
+                "compiler: Gitea registry token unavailable from vault \
+                 ({CARGO_REGISTRIES_GITEA_TOKEN} and GITEA_PAT_<identity> both \
+                 unset) — registry-consuming builds (harmony, chord) will fail \
+                 to resolve terminus-rs from the Gitea Cargo registry"
+            );
+        }
+    }
+}
+
 const DEFAULT_TARGET_TRIPLE: &str = "x86_64-unknown-linux-musl";
 
 /// The longest a single `compiler_build` may run (the local/primary cargo build
@@ -278,6 +459,34 @@ fn cargo_test_argv(profile: &str, triple: &str, jobs: u32, manifest_path: &str) 
     argv
 }
 
+/// Build the `cargo generate-lockfile` argv (pure — testable; GAP 5, TERM #418).
+/// terminus/harmony/chord all `.gitignore` `Cargo.lock`, so a freshly-staged
+/// feature-branch source tree has NO lock at all — `--locked` (required on
+/// both [`cargo_build_argv`] and [`cargo_test_argv`] for reproducibility)
+/// then fails cargo's dependency-resolution step in well under a second,
+/// before a single crate compiles (`process_exit_success:false`, 0 passed /
+/// 0 failed). Only `main` used to build, because its persisted
+/// build-dataset directory happened to retain an old cargo-generated lock
+/// from a prior run — every feature branch hit this instantly.
+///
+/// `cargo generate-lockfile` resolves the dependency graph and WRITES a
+/// matching `Cargo.lock` WITHOUT compiling anything — cheap (seconds, low
+/// RAM/CPU), safe to run inside the same capped scope as the build/test
+/// step. It needs registry access (crates.io for terminus, the Gitea Cargo
+/// registry for harmony/chord's `terminus-rs` path-dep — GAP 2's creds), so
+/// it deliberately carries NO `--locked` (that would defeat its purpose: it
+/// is the step that CREATES the lock `--locked` subsequently enforces).
+/// Always safe to run before the `--locked` build/test: if a lock already
+/// exists and matches (e.g. `main`), this is a fast no-op.
+fn cargo_generate_lockfile_argv(manifest_path: &str) -> Vec<String> {
+    vec![
+        "cargo".to_string(),
+        "generate-lockfile".to_string(),
+        "--manifest-path".to_string(),
+        manifest_path.to_string(),
+    ]
+}
+
 /// Force cargo to render its `N/M` progress bar EVEN on the piped (non-TTY)
 /// stdio the build runs under, so the live `{step,total}` progress the tap parses
 /// is actually emitted. `CARGO_TERM_PROGRESS_WHEN=always` renders the bar
@@ -288,6 +497,21 @@ fn cargo_test_argv(profile: &str, triple: &str, jobs: u32, manifest_path: &str) 
 fn inject_cargo_progress_env(build_env: &mut BTreeMap<String, String>) {
     build_env.insert("CARGO_TERM_PROGRESS_WHEN".to_string(), "always".to_string());
     build_env.insert("CARGO_TERM_PROGRESS_WIDTH".to_string(), "100".to_string());
+}
+
+/// GAP 4: sccache CANNOT cache Rust compilation units while cargo's
+/// incremental compilation is on — incremental and sccache are mutually
+/// exclusive caching strategies for rustc, and `cargo build`/`cargo test`'s
+/// dev profile defaults `CARGO_INCREMENTAL=1`. Left unset, every build was a
+/// 0%-hit-rate cold build against the shared Redis sccache (observed: 0.00%
+/// Rust hit rate, 368 misses, vs 100% for C/C++) even though sccache itself
+/// was correctly wired. `CARGO_INCREMENTAL=0` is NON-SECRET (a plain cargo
+/// build-behavior flag) — it goes via `--setenv`, never the secret env-file —
+/// inserted into the build child's env for BOTH the local and remote (heavy)
+/// build paths, and for both `build` and `test` mode (the flag governs
+/// compilation, not which cargo subcommand runs).
+fn inject_cargo_incremental_off(build_env: &mut BTreeMap<String, String>) {
+    build_env.insert("CARGO_INCREMENTAL".to_string(), "0".to_string());
 }
 
 /// The path (relative to CARGO_TARGET_DIR) where the built binary lands:
@@ -1283,7 +1507,7 @@ impl CompilerBuild {
         // build (a build script printing its env, etc.) and must be scrubbed from
         // ANY captured stdout/stderr before it reaches an error/log. Shared with
         // the failed-event redaction on the wrapper's error path.
-        let redact = redaction_set(&root_str);
+        let mut redact = redaction_set(&root_str);
 
         // The local source stage (staged on the shared NFS share is fine — it's a
         // source stage, not the live target). Also the rsync source for a remote
@@ -1301,6 +1525,14 @@ impl CompilerBuild {
             }
             None => root.join("src").join(&module).join(&git_ref),
         };
+        // GAP 1: fail loudly HERE, with the actual cause, if the source was
+        // never staged — otherwise `local_source_dir` reaches `current_dir(...)`
+        // on a spawn whose PROGRAM path (`/usr/bin/systemd-run`) is perfectly
+        // valid, and a missing `current_dir` makes `Command::spawn` report
+        // ENOENT against argv[0] instead — a red herring ("No such file or
+        // directory" pointing at systemd-run) that cost real debugging time
+        // before this check existed.
+        validate_local_source_dir(&local_source_dir, &module, &git_ref)?;
 
         // Pinned toolchain channel to ensure (idempotent; never `rustup update`).
         let pinned = env_nonempty(RUST_TOOLCHAIN_PINNED);
@@ -1329,6 +1561,12 @@ impl CompilerBuild {
             // Force cargo's N/M progress bar on the piped (non-TTY) stdio so the
             // tap gets live {step,total} updates (BLD-19).
             inject_cargo_progress_env(&mut build_env);
+            // GAP 4: incremental compilation defeats sccache's Rust caching.
+            inject_cargo_incremental_off(&mut build_env);
+            // GAP 2: Gitea Cargo-registry config + vault-sourced auth token, so a
+            // module that depends on terminus-rs via the Gitea Cargo registry
+            // (harmony, chord) can resolve it inside the build scope.
+            inject_gitea_registry_env(&mut build_env, &mut redact);
             // S7: non-secret vars → `--setenv` (argv); secret vars → the INHERITED
             // process environment of systemd-run (which `--scope` passes to the
             // cargo child) — never argv.
@@ -1353,21 +1591,35 @@ impl CompilerBuild {
             }
 
             let manifest = local_source_dir.join("Cargo.toml");
+            let manifest_str = manifest.to_string_lossy().to_string();
+
+            // GAP 5 (TERM #418): generate a matching Cargo.lock BEFORE the
+            // `--locked` build/test below, in the SAME capped scope and with
+            // the SAME env (sccache + CARGO_TARGET_DIR + GAP 2's Gitea
+            // registry creds + GAP 4's CARGO_INCREMENTAL=0) as the real
+            // build — a distinct `-lockgen` unit keeps its transient scope
+            // from colliding with the main build's. See
+            // `cargo_generate_lockfile_argv`'s doc for why this is
+            // necessary (terminus/harmony/chord gitignore Cargo.lock).
+            let lockgen_argv = cargo_generate_lockfile_argv(&manifest_str);
+            let lockgen_unit = format!("{unit}-lockgen");
+            let lockgen_scope_argv =
+                scope::render_scope_argv(&lockgen_unit, &resolved.caps, &setenv, &lockgen_argv);
+            run(
+                &lockgen_scope_argv,
+                Some(&local_source_dir),
+                &secret_env,
+                Duration::from_secs(180),
+                &redact,
+                None,
+                None,
+            )
+            .await?;
+
             let cargo_argv = if is_test_mode {
-                cargo_test_argv(
-                    &profile,
-                    &triple,
-                    resolved.caps.jobs,
-                    &manifest.to_string_lossy(),
-                )
+                cargo_test_argv(&profile, &triple, resolved.caps.jobs, &manifest_str)
             } else {
-                cargo_build_argv(
-                    &profile,
-                    &triple,
-                    resolved.caps.jobs,
-                    &bin,
-                    &manifest.to_string_lossy(),
-                )
+                cargo_build_argv(&profile, &triple, resolved.caps.jobs, &bin, &manifest_str)
             };
             let scope_argv = scope::render_scope_argv(&unit, &resolved.caps, &setenv, &cargo_argv);
             // Compilation (or the test run) starts → `building`; the tap streams
@@ -1475,7 +1727,29 @@ impl CompilerBuild {
             // Force cargo's N/M progress bar on the piped (non-TTY, over-ssh) stdio
             // so the tap gets live {step,total} updates (BLD-19).
             inject_cargo_progress_env(&mut build_env);
+            // GAP 4: incremental compilation defeats sccache's Rust caching.
+            inject_cargo_incremental_off(&mut build_env);
+            // GAP 2: Gitea Cargo-registry config + vault-sourced auth token (see
+            // the local-build call site above for the full rationale).
+            inject_gitea_registry_env(&mut build_env, &mut redact);
             let (setenv, secret_env) = scope::partition_env(&build_env);
+
+            // GAP 5 (TERM #418): same rationale as the local path above — a
+            // freshly-staged feature-branch checkout has no Cargo.lock
+            // (terminus/harmony/chord gitignore it), so the `--locked`
+            // build/test below would fail its dependency-resolution step
+            // instantly. Render a `cargo generate-lockfile` scope now (same
+            // caps/env, distinct `-lockgen` unit); it is chained into the
+            // SAME ssh session as the real build below (via `&&`, sharing
+            // the one sourced secret-env file) rather than exec'd
+            // separately, so it never disturbs the single-shot `rm -f` on
+            // the remote secret file.
+            let remote_manifest = format!("{remote_source}/Cargo.toml");
+            let lockgen_argv = cargo_generate_lockfile_argv(&remote_manifest);
+            let lockgen_unit = format!("{unit}-lockgen");
+            let lockgen_scope_argv =
+                scope::render_scope_argv(&lockgen_unit, &resolved.caps, &setenv, &lockgen_argv);
+            let lockgen_cmd = shell_join(&lockgen_scope_argv);
 
             // Secret env (if any) → a 0600 file ON THE REMOTE, `source`d inside the
             // ssh wrapper before `exec systemd-run` so it reaches the scoped build's
@@ -1555,23 +1829,27 @@ impl CompilerBuild {
                 .await?;
             }
 
-            let manifest = format!("{remote_source}/Cargo.toml");
             let cargo_argv = if is_test_mode {
-                cargo_test_argv(&profile, &triple, resolved.caps.jobs, &manifest)
+                cargo_test_argv(&profile, &triple, resolved.caps.jobs, &remote_manifest)
             } else {
-                cargo_build_argv(&profile, &triple, resolved.caps.jobs, &bin, &manifest)
+                cargo_build_argv(&profile, &triple, resolved.caps.jobs, &bin, &remote_manifest)
             };
             let scope_argv = scope::render_scope_argv(&unit, &resolved.caps, &setenv, &cargo_argv);
-            // Remote wrapper: source the secret env file (if any), delete it, then
-            // exec the scoped build. The secret lives only in the 0600 file, never argv.
+            // Remote wrapper: source the secret env file (if any) so BOTH the
+            // GAP 5 lockgen scope and the real build/test scope see it, delete
+            // the file (one-shot — only after it's been sourced for both), run
+            // lockgen to completion (`&&`, not `exec`, since a following
+            // command still needs to run), then `exec` the scoped build/test
+            // so it replaces this shell as the final process. The secret lives
+            // only in the 0600 file, never argv.
             let scope_cmd = shell_join(&scope_argv);
             let remote_cmd = if have_secret {
                 format!(
-                    "set -a; . {f}; rm -f {f}; set +a; exec {scope_cmd}",
+                    "set -a; . {f}; rm -f {f}; set +a; {lockgen_cmd} && exec {scope_cmd}",
                     f = shell_quote(&remote_env_path)
                 )
             } else {
-                format!("exec {scope_cmd}")
+                format!("{lockgen_cmd} && exec {scope_cmd}")
             };
             // On timeout, tear down the REMOTE scope by its unit name too — the
             // local ssh process-group kill can't reach the remote build tree.
@@ -2162,6 +2440,37 @@ fn validate_source_dir(
             .collect::<Vec<_>>()
             .join(", ")
     )))
+}
+
+/// GAP 1: validate that a module@ref's source has actually been staged into
+/// `local_source_dir` (and looks like a cargo crate — has a `Cargo.toml`)
+/// BEFORE it is used as `current_dir(...)` for `rustup`/`cargo`, or as the
+/// rsync source for a remote build. Without this check a missing staged dir
+/// surfaces as `Command::spawn` reporting ENOENT against argv[0]
+/// (`/usr/bin/systemd-run: No such file or directory`) — a correct-looking
+/// but completely misleading error, since the program itself is fine and the
+/// real problem is the `current_dir` that doesn't exist.
+fn validate_local_source_dir(
+    local_source_dir: &std::path::Path,
+    module: &str,
+    git_ref: &str,
+) -> Result<(), ToolError> {
+    if !local_source_dir.is_dir() {
+        return Err(ToolError::NotFound(format!(
+            "source not staged for {module}@{git_ref} at {} — stage it into \
+             ${{{BUILD_DATASET_ROOT}}}/src/<module>/<ref> or pass source_dir",
+            local_source_dir.display()
+        )));
+    }
+    if !local_source_dir.join("Cargo.toml").is_file() {
+        return Err(ToolError::NotFound(format!(
+            "source not staged for {module}@{git_ref} at {} — directory exists \
+             but has no Cargo.toml (stage a complete checkout into \
+             ${{{BUILD_DATASET_ROOT}}}/src/<module>/<ref> or pass source_dir)",
+            local_source_dir.display()
+        )));
+    }
+    Ok(())
 }
 
 /// The `compiler_progress` tool (BLD-19): a live progress/events surface keyed by
@@ -2784,6 +3093,125 @@ mod tests {
         );
     }
 
+    // ── GAP 5 (TERM #418): cargo_generate_lockfile_argv ───────────────────
+    // terminus/harmony/chord gitignore Cargo.lock, so `--locked` (on both
+    // cargo_build_argv and cargo_test_argv) fails instantly on a freshly
+    // staged feature branch unless a matching lock is generated first.
+
+    #[test]
+    fn cargo_generate_lockfile_argv_shape() {
+        let argv = cargo_generate_lockfile_argv("/s/Cargo.toml");
+        assert_eq!(
+            argv,
+            vec![
+                "cargo",
+                "generate-lockfile",
+                "--manifest-path",
+                "/s/Cargo.toml",
+            ]
+        );
+    }
+
+    #[test]
+    fn cargo_generate_lockfile_argv_never_locked() {
+        // The whole point of this step is to CREATE a lock — `--locked` would
+        // make cargo refuse to write one, defeating the pre-step entirely.
+        let argv = cargo_generate_lockfile_argv("/s/Cargo.toml");
+        assert!(
+            !argv.iter().any(|a| a == "--locked"),
+            "generate-lockfile argv must never carry --locked: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn cargo_generate_lockfile_argv_is_not_a_build_or_test_subcommand() {
+        // Distinguishes it from cargo_build_argv/cargo_test_argv (GAP 5 is a
+        // resolve-only step, not a compile/test step).
+        let argv = cargo_generate_lockfile_argv("/s/Cargo.toml");
+        assert_eq!(argv[0], "cargo");
+        assert_eq!(argv[1], "generate-lockfile");
+    }
+
+    #[test]
+    fn local_build_sequence_renders_lockgen_before_the_locked_test_scope() {
+        // Mirrors what build_inner does on the LOCAL path: a lockgen scope
+        // (no --locked) rendered under a `-lockgen` unit, followed by the
+        // real --locked test/build scope under the base unit. Asserts the
+        // ORDER + that only the second argv carries --locked.
+        let caps = crate::compiler::scope::ScopeCaps {
+            memory_max: "4G".to_string(),
+            cpu_quota: "200%".to_string(),
+            io_weight: "50".to_string(),
+            jobs: 4,
+        };
+        let setenv: BTreeMap<String, String> = BTreeMap::new();
+        let unit = "terminus-build-terminus-abc123-uuid".to_string();
+
+        let lockgen_argv = cargo_generate_lockfile_argv("/s/Cargo.toml");
+        let lockgen_unit = format!("{unit}-lockgen");
+        let lockgen_scope =
+            crate::compiler::scope::render_scope_argv(&lockgen_unit, &caps, &setenv, &lockgen_argv);
+
+        let test_argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml");
+        let test_scope = crate::compiler::scope::render_scope_argv(&unit, &caps, &setenv, &test_argv);
+
+        // Both are systemd-run scopes on DISTINCT unit names (never collide).
+        assert!(lockgen_scope.iter().any(|a| a == &format!("--unit={lockgen_unit}")));
+        assert!(test_scope.iter().any(|a| a == &format!("--unit={unit}")));
+        assert_ne!(lockgen_scope, test_scope);
+
+        // The lockgen scope's cargo argv never carries --locked; the real
+        // test/build scope always does.
+        assert!(!lockgen_scope.contains(&"--locked".to_string()));
+        assert!(test_scope.contains(&"--locked".to_string()));
+
+        // The sequence a caller must run: lockgen THEN the --locked step —
+        // encoded here as "lockgen has no --locked, the following step
+        // does," which is the precondition the GAP 5 fix relies on.
+        let lockgen_then_locked = [lockgen_scope, test_scope];
+        assert!(!lockgen_then_locked[0].contains(&"--locked".to_string()));
+        assert!(lockgen_then_locked[1].contains(&"--locked".to_string()));
+    }
+
+    #[test]
+    fn remote_command_chains_lockgen_before_exec_of_the_locked_scope() {
+        // Mirrors the REMOTE path's `remote_cmd` construction: lockgen runs
+        // to completion (`&&`, not `exec`, since a following command must
+        // still run), then the real --locked scope is `exec`'d so it
+        // replaces the wrapper shell as the final process. Both `have_secret`
+        // branches must preserve this "lockgen && exec build" shape.
+        let lockgen_cmd = "/usr/bin/systemd-run --scope --unit=u-lockgen -- cargo generate-lockfile --manifest-path /s/Cargo.toml".to_string();
+        let scope_cmd = "/usr/bin/systemd-run --scope --unit=u -- cargo test --locked --manifest-path /s/Cargo.toml".to_string();
+
+        let remote_env_path = "/tmp/.terminus-build-u-abc.env".to_string();
+        let with_secret = format!(
+            "set -a; . {f}; rm -f {f}; set +a; {lockgen_cmd} && exec {scope_cmd}",
+            f = remote_env_path
+        );
+        let without_secret = format!("{lockgen_cmd} && exec {scope_cmd}");
+
+        for cmd in [&with_secret, &without_secret] {
+            // lockgen must appear, run to completion (`&&`), BEFORE `exec` of
+            // the real (--locked) build/test scope.
+            let lockgen_pos = cmd.find("generate-lockfile").expect("lockgen present");
+            let exec_pos = cmd.find("exec ").expect("exec present");
+            assert!(
+                lockgen_pos < exec_pos,
+                "lockgen must run before exec of the locked scope: {cmd}"
+            );
+            assert!(cmd.contains("&& exec"), "lockgen must gate exec via &&: {cmd}");
+            // The --locked flag belongs to the exec'd (real) scope only.
+            let locked_pos = cmd.find("--locked").expect("--locked present");
+            assert!(
+                locked_pos > exec_pos,
+                "--locked must belong to the exec'd scope, not lockgen: {cmd}"
+            );
+        }
+        // The one-shot secret file `rm` happens exactly once, before either
+        // scope runs — not split across two ssh commands.
+        assert_eq!(with_secret.matches("rm -f").count(), 1);
+    }
+
     // ── BLD-COMPTEST: parse_cargo_test_output ─────────────────────────
 
     #[test]
@@ -3131,6 +3559,264 @@ mod tests {
         );
         // A sibling sharing a string prefix but not the path → rejected.
         assert!(validate_source_dir(std::path::Path::new("/data/build/src-evil/x"), root).is_err());
+    }
+
+    // ── GAP 1: missing-staged-source gives a clear error, not a red herring ──
+
+    #[test]
+    fn missing_source_dir_gives_clear_not_found_error_not_a_spawn_enoent() {
+        let dir = tempfile::tempdir().unwrap();
+        // Never created: <tmp>/src/terminus/abc123 does not exist at all.
+        let missing = dir.path().join("src").join("terminus").join("abc123");
+        let err = validate_local_source_dir(&missing, "terminus", "abc123").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("source not staged for terminus@abc123"),
+            "error must name the module@ref: {msg}"
+        );
+        assert!(
+            msg.contains(&missing.display().to_string()),
+            "error must name the missing path: {msg}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("systemd-run"),
+            "must never surface the misleading spawn-ENOENT red herring: {msg}"
+        );
+    }
+
+    #[test]
+    fn staged_dir_without_cargo_toml_is_also_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("src").join("chord").join("main");
+        std::fs::create_dir_all(&staged).unwrap();
+        // Directory exists but is empty — no Cargo.toml staged into it.
+        let err = validate_local_source_dir(&staged, "chord", "main").unwrap_err();
+        assert!(err.to_string().contains("Cargo.toml"));
+    }
+
+    #[test]
+    fn properly_staged_source_dir_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("src").join("chord").join("main");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        assert!(validate_local_source_dir(&staged, "chord", "main").is_ok());
+    }
+
+    // ── GAP 2: Gitea Cargo-registry creds land on the SECRET partition ───────
+
+    #[test]
+    fn registry_token_from_dedicated_env_lands_on_secret_partition_not_argv() {
+        let _env = ScopedEnv::new()
+            .unset("GITEA_IDENTITY_NAME")
+            .unset("GITEA_PAT_MOOSE")
+            .set("GITEA_URL", "http://gitea.example.internal:3000")
+            .set("CARGO_REGISTRIES_GITEA_TOKEN", "gpat-dedicated-abc123");
+
+        let mut build_env: BTreeMap<String, String> = BTreeMap::new();
+        let mut redact: Vec<String> = Vec::new();
+        inject_gitea_registry_env(&mut build_env, &mut redact);
+
+        // The secret landed in build_env under the expected key...
+        assert_eq!(
+            build_env.get("CARGO_REGISTRIES_GITEA_TOKEN").map(String::as_str),
+            Some("Bearer gpat-dedicated-abc123")
+        );
+        // ...and the raw token value is in the redaction set.
+        assert!(redact.iter().any(|s| s == "gpat-dedicated-abc123"));
+
+        // partition_env (the actual argv/secret split `mod.rs` uses) MUST put it
+        // on the secret side, never `--setenv` argv.
+        let (non_secret, secret) = scope::partition_env(&build_env);
+        assert!(!non_secret.contains_key("CARGO_REGISTRIES_GITEA_TOKEN"));
+        assert_eq!(
+            secret.get("CARGO_REGISTRIES_GITEA_TOKEN").map(String::as_str),
+            Some("Bearer gpat-dedicated-abc123")
+        );
+
+        // The rendered systemd-run argv must never contain the token value.
+        let argv = scope::render_scope_argv(
+            "u",
+            &scope::ScopeCaps {
+                memory_max: "1G".into(),
+                cpu_quota: "100%".into(),
+                io_weight: "50".into(),
+                jobs: 1,
+            },
+            &non_secret,
+            &["cargo".into(), "build".into()],
+        );
+        assert!(!argv.join(" ").contains("gpat-dedicated-abc123"));
+
+        // The INDEX + credential-providers config ARE non-secret and go via
+        // --setenv.
+        assert!(non_secret.contains_key("CARGO_REGISTRIES_GITEA_INDEX"));
+        assert!(non_secret.contains_key("CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS"));
+    }
+
+    #[test]
+    fn registry_token_falls_back_to_default_identity_gitea_pat() {
+        let _env = ScopedEnv::new()
+            .unset("CARGO_REGISTRIES_GITEA_TOKEN")
+            .unset("GITEA_IDENTITY_NAME")
+            .unset("GITEA_URL")
+            .set("GITEA_PAT_MOOSE", "moose-pat-xyz");
+
+        let mut build_env: BTreeMap<String, String> = BTreeMap::new();
+        let mut redact: Vec<String> = Vec::new();
+        inject_gitea_registry_env(&mut build_env, &mut redact);
+
+        assert_eq!(
+            build_env.get("CARGO_REGISTRIES_GITEA_TOKEN").map(String::as_str),
+            Some("Bearer moose-pat-xyz")
+        );
+    }
+
+    #[test]
+    fn registry_token_falls_back_to_moose_when_active_identity_pat_is_unset() {
+        // FINDING 2 (review): an operator set a NON-moose active identity, but
+        // that identity's PAT is unprovisioned. The org-readable moose PAT is the
+        // explicit FINAL fallback so a harmony/chord build still resolves
+        // terminus-rs, rather than degrading purely because the identity changed.
+        let _env = ScopedEnv::new()
+            .unset("CARGO_REGISTRIES_GITEA_TOKEN")
+            .unset("GITEA_URL")
+            .set("GITEA_IDENTITY_NAME", "alice")
+            .unset("GITEA_PAT_ALICE")
+            .set("GITEA_PAT_MOOSE", "moose-org-pat");
+
+        assert_eq!(
+            cargo_registry_gitea_token().as_deref(),
+            Some("moose-org-pat"),
+            "must fall back to the org-readable moose PAT when the active \
+             (non-moose) identity's PAT is unset"
+        );
+
+        // And it wires through inject as the Bearer-wrapped secret.
+        let mut build_env: BTreeMap<String, String> = BTreeMap::new();
+        let mut redact: Vec<String> = Vec::new();
+        inject_gitea_registry_env(&mut build_env, &mut redact);
+        assert_eq!(
+            build_env.get("CARGO_REGISTRIES_GITEA_TOKEN").map(String::as_str),
+            Some("Bearer moose-org-pat")
+        );
+    }
+
+    #[test]
+    fn registry_token_prefers_moose_over_active_identity_pat() {
+        // For REGISTRY reads the org-readable moose PAT is preferred over the
+        // gateway's active identity PAT (review finding): even with a non-moose
+        // identity whose PAT IS provisioned, moose wins for registry access.
+        let _env = ScopedEnv::new()
+            .unset("CARGO_REGISTRIES_GITEA_TOKEN")
+            .unset("GITEA_URL")
+            .set("GITEA_IDENTITY_NAME", "alice")
+            .set("GITEA_PAT_ALICE", "alice-pat")
+            .set("GITEA_PAT_MOOSE", "moose-org-pat");
+        assert_eq!(cargo_registry_gitea_token().as_deref(), Some("moose-org-pat"));
+    }
+
+    #[test]
+    fn registry_explicit_bearer_token_env_is_not_double_wrapped() {
+        // FINDING 1 (review): the DEPLOYED /etc/constellation/secrets format is
+        // `CARGO_REGISTRIES_GITEA_TOKEN="<REDACTED-SECRET>"`. An explicit env in that
+        // (canonical) format must WIN verbatim — never become `Bearer Bearer …`.
+        let _env = ScopedEnv::new()
+            .unset("GITEA_IDENTITY_NAME")
+            .unset("GITEA_PAT_MOOSE")
+            .set("GITEA_URL", "http://gitea.example.internal:3000")
+            .set("CARGO_REGISTRIES_GITEA_TOKEN", "Bearer gpat-explicit-xyz");
+
+        let mut build_env: BTreeMap<String, String> = BTreeMap::new();
+        let mut redact: Vec<String> = Vec::new();
+        inject_gitea_registry_env(&mut build_env, &mut redact);
+        assert_eq!(
+            build_env.get("CARGO_REGISTRIES_GITEA_TOKEN").map(String::as_str),
+            Some("Bearer gpat-explicit-xyz"),
+            "an explicit `Bearer <pat>` env must pass through verbatim, not double-wrap"
+        );
+    }
+
+    #[test]
+    fn registry_env_degrades_cleanly_when_no_token_or_index_is_configured() {
+        let _env = ScopedEnv::new()
+            .unset("CARGO_REGISTRIES_GITEA_TOKEN")
+            .unset("GITEA_IDENTITY_NAME")
+            .unset("GITEA_PAT_MOOSE")
+            .unset("CARGO_REGISTRIES_GITEA_INDEX")
+            .unset("GITEA_URL")
+            .unset("GITEA_OWNER");
+
+        let mut build_env: BTreeMap<String, String> = BTreeMap::new();
+        let mut redact: Vec<String> = Vec::new();
+        // Must not panic; nothing to derive an index from, so no fabricated
+        // literal is inserted either (S1 — never hardcode an infra default).
+        inject_gitea_registry_env(&mut build_env, &mut redact);
+        assert!(!build_env.contains_key("CARGO_REGISTRIES_GITEA_TOKEN"));
+        assert!(!build_env.contains_key("CARGO_REGISTRIES_GITEA_INDEX"));
+        assert!(!build_env.contains_key("CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS"));
+    }
+
+    #[test]
+    fn registry_index_derives_from_gitea_url_but_an_explicit_index_wins() {
+        {
+            // GITEA_URL configured (the box already talks to Gitea's REST API)
+            // → the index is DERIVED, no separate URL needed.
+            let _env = ScopedEnv::new()
+                .unset("CARGO_REGISTRIES_GITEA_INDEX")
+                .set("GITEA_URL", "http://gitea.example.internal:3000")
+                .unset("GITEA_OWNER");
+            let mut build_env: BTreeMap<String, String> = BTreeMap::new();
+            let mut redact: Vec<String> = Vec::new();
+            inject_gitea_registry_env(&mut build_env, &mut redact);
+            assert_eq!(
+                build_env.get("CARGO_REGISTRIES_GITEA_INDEX").map(String::as_str),
+                Some("sparse+http://gitea.example.internal:3000/api/packages/moosenet/cargo/")
+            );
+            assert!(build_env.contains_key("CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS"));
+        }
+        {
+            // An explicit CARGO_REGISTRIES_GITEA_INDEX always wins over the
+            // GITEA_URL derivation.
+            let _env = ScopedEnv::new()
+                .set("GITEA_URL", "http://gitea.example.internal:3000")
+                .set("CARGO_REGISTRIES_GITEA_INDEX", "sparse+http://override.example/cargo/");
+            let mut build_env: BTreeMap<String, String> = BTreeMap::new();
+            let mut redact: Vec<String> = Vec::new();
+            inject_gitea_registry_env(&mut build_env, &mut redact);
+            assert_eq!(
+                build_env.get("CARGO_REGISTRIES_GITEA_INDEX").map(String::as_str),
+                Some("sparse+http://override.example/cargo/")
+            );
+        }
+    }
+
+    // ── GAP 4: CARGO_INCREMENTAL=0 so sccache can actually cache Rust ────────
+
+    #[test]
+    fn cargo_incremental_is_forced_off_for_sccache_rust_caching() {
+        let mut build_env: BTreeMap<String, String> = BTreeMap::new();
+        inject_cargo_incremental_off(&mut build_env);
+        assert_eq!(
+            build_env.get("CARGO_INCREMENTAL").map(String::as_str),
+            Some("0")
+        );
+        // Non-secret — must survive partition_env onto the --setenv side and
+        // appear in the rendered systemd-run argv.
+        let (non_secret, secret) = scope::partition_env(&build_env);
+        assert!(!secret.contains_key("CARGO_INCREMENTAL"));
+        let argv = scope::render_scope_argv(
+            "u",
+            &scope::ScopeCaps {
+                memory_max: "1G".into(),
+                cpu_quota: "100%".into(),
+                io_weight: "50".into(),
+                jobs: 1,
+            },
+            &non_secret,
+            &["cargo".into(), "build".into()],
+        );
+        assert!(argv.contains(&"--setenv=CARGO_INCREMENTAL=0".to_string()));
     }
 
     #[tokio::test]
