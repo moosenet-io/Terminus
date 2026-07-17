@@ -95,8 +95,8 @@ of the mock adapter.
 ## Embedded build (CONST-15)
 
 `dist/` is **committed** into the repo (not gitignored) and embedded directly into the
-`terminus_primary` binary via `rust-embed` (`src/constellation/assets.rs`, `#[folder =
-"constellation-web/dist"]`). This is deliberate: the fleet's build-on-dest pipeline
+`terminus_primary` binary via `include_dir` (`src/constellation/assets.rs`,
+`include_dir!("$CARGO_MANIFEST_DIR/constellation-web/dist")`). This is deliberate: the fleet's build-on-dest pipeline
 (`constellation-updater`, moosenet-spec v3.23) runs a **cargo-only** build on the deploy
 host with no npm/node toolchain — the committed dist is what makes that possible. The
 embedded UI is always served same-origin by the binary in production, so it is always
