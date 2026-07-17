@@ -258,7 +258,7 @@ impl RustTool for PgQuery {
     }
 
     fn parameters(&self) -> Value {
-        conn::with_identity_param(json!({
+        conn::with_conn_params(json!({
             "type": "object",
             "properties": {
                 "sql": {
@@ -309,7 +309,7 @@ impl RustTool for PgQuery {
             .clamp(1, HARD_MAX_ROWS);
 
         let identity = conn::resolve_identity_name(&args);
-        let pool = conn::resolve_connection(&identity).await?;
+        let pool = conn::resolve_connection_for(&identity, conn::resolve_database_name(&args).as_deref()).await?;
 
         let mut query = sqlx::query(sql);
         for p in &params {
@@ -375,7 +375,7 @@ impl RustTool for PgListTables {
     }
 
     fn parameters(&self) -> Value {
-        conn::with_identity_param(json!({
+        conn::with_conn_params(json!({
             "type": "object",
             "properties": {
                 "schema": {
@@ -407,7 +407,7 @@ impl RustTool for PgListTables {
         };
 
         let identity = conn::resolve_identity_name(&args);
-        let pool = conn::resolve_connection(&identity).await?;
+        let pool = conn::resolve_connection_for(&identity, conn::resolve_database_name(&args).as_deref()).await?;
 
         let sql = "SELECT table_schema, table_name, table_type \
                     FROM information_schema.tables \
@@ -456,7 +456,7 @@ impl RustTool for PgDescribeTable {
     }
 
     fn parameters(&self) -> Value {
-        conn::with_identity_param(json!({
+        conn::with_conn_params(json!({
             "type": "object",
             "properties": {
                 "table": {
@@ -502,7 +502,7 @@ impl RustTool for PgDescribeTable {
         }
 
         let identity = conn::resolve_identity_name(&args);
-        let pool = conn::resolve_connection(&identity).await?;
+        let pool = conn::resolve_connection_for(&identity, conn::resolve_database_name(&args).as_deref()).await?;
 
         // Existence check first, so an unknown table is a clean NotFound
         // rather than an empty-columns describe.

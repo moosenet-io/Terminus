@@ -30,11 +30,12 @@
 //! [`configured_identities`] and `crate::pg::identities`).
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 
 use crate::config::pg_connection_secret_name;
@@ -136,6 +137,53 @@ pub fn with_identity_param(mut schema: Value) -> Value {
     schema
 }
 
+/// Shared JSON Schema fragment for the optional `database` argument every
+/// `pg_*` tool accepts (PGT-ALLDB). Lets a caller target ANY database on the
+/// identity's Postgres server — current OR future — without a per-database
+/// connection identity: the chosen identity's credentials/role are reused and
+/// only the connected database NAME is overridden. A superuser `admin` identity
+/// can thus reach every database on the cluster; a scoped role reaches a given
+/// database only where that role's grants allow (the DB ROLE remains the real
+/// privilege boundary — switching database never escalates privilege).
+pub fn database_param_schema() -> Value {
+    json!({
+        "type": "string",
+        "description": "Optional target database NAME on the identity's Postgres server. \
+                        Omit to use the database in the identity's own connection string. \
+                        Only the connected database is switched — the identity's role and \
+                        credentials are unchanged — so reaching a database still depends on \
+                        that role's grants (a superuser 'admin' identity can reach any \
+                        database on the server, current or future)."
+    })
+}
+
+/// Add the shared optional `database` property to a tool's parameter schema.
+/// Idempotent; mirrors [`with_identity_param`].
+pub fn with_database_param(mut schema: Value) -> Value {
+    if let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) {
+        props.insert("database".to_string(), database_param_schema());
+    }
+    schema
+}
+
+/// Add BOTH the `identity` and `database` connection params to a tool schema
+/// (the standard pg-tool connection surface). Idempotent.
+pub fn with_conn_params(schema: Value) -> Value {
+    with_database_param(with_identity_param(schema))
+}
+
+/// Resolve the optional target `database` NAME from a tool's raw args: a
+/// non-empty `database` string (trimmed) selects it; otherwise `None` (use the
+/// identity DSN's own database). NOT lowercased — Postgres database names are
+/// case-sensitive, unlike the identity name.
+pub fn resolve_database_name(args: &Value) -> Option<String> {
+    args.get("database")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Resolve the effective connection identity NAME for a tool invocation from
 /// its raw args: a non-empty `identity` string argument selects that name
 /// (lowercased, trimmed); otherwise [`DEFAULT_IDENTITY`].
@@ -182,27 +230,69 @@ fn pool_cache() -> &'static Mutex<HashMap<String, PgPool>> {
 /// [`ToolError::Database`] that does NOT echo the connection string (sqlx's
 /// own error text does not include the DSN it was given).
 pub async fn resolve_connection(identity: &str) -> Result<PgPool, ToolError> {
+    resolve_connection_for(identity, None).await
+}
+
+/// Resolve a `PgPool` for the given connection identity, optionally overriding
+/// the connected DATABASE (PGT-ALLDB). When `database` is `Some`, the identity's
+/// configured `POSTGRES_URL_<NAME>` DSN is parsed and its database name replaced
+/// with the target — the role/credentials/host/port are untouched — so a single
+/// identity reaches ANY database on its server (current or future). The dbname
+/// swap uses `PgConnectOptions` (sqlx-native), never string surgery on the DSN,
+/// so it can't corrupt the userinfo/host the way a naive replace would. Pools
+/// are cached per (identity, database) pair. Privilege is still the DB ROLE's:
+/// switching database never grants access the role doesn't already have.
+pub async fn resolve_connection_for(
+    identity: &str,
+    database: Option<&str>,
+) -> Result<PgPool, ToolError> {
     let identity = identity.trim().to_lowercase();
     let identity = if identity.is_empty() { DEFAULT_IDENTITY.to_string() } else { identity };
+    let database = database.map(str::trim).filter(|s| !s.is_empty());
 
-    if let Some(pool) = pool_cache().lock().expect("pg pool cache mutex poisoned").get(&identity) {
+    // Cache key is (identity, database) — the ASCII Unit Separator can't appear
+    // in an identity name or a Postgres database name, so it's an unambiguous
+    // join. Never a URL, so nothing loggable holds a connection string.
+    let cache_key = match database {
+        Some(db) => format!("{identity}\u{1f}{db}"),
+        None => identity.clone(),
+    };
+
+    if let Some(pool) = pool_cache().lock().expect("pg pool cache mutex poisoned").get(&cache_key) {
         return Ok(pool.clone());
     }
 
     let connections = scan_named_connections();
     let url = connections.get(&identity).ok_or_else(|| not_configured(&identity))?;
 
+    // Parse via PgConnectOptions (never echo the URL on a parse failure — it
+    // may contain the password) and override only the database when requested.
+    let mut opts = PgConnectOptions::from_str(url).map_err(|_| {
+        ToolError::Database(format!(
+            "connection string for identity '{identity}' could not be parsed"
+        ))
+    })?;
+    if let Some(db) = database {
+        opts = opts.database(db);
+    }
+
     let pool = PgPoolOptions::new()
         .max_connections(3)
         .acquire_timeout(Duration::from_secs(5))
-        .connect(url)
+        .connect_with(opts)
         .await
-        .map_err(|e| ToolError::Database(format!("Cannot connect Postgres identity '{identity}': {e}")))?;
+        .map_err(|e| {
+            // `database` is caller-supplied (safe to echo); the DSN never is.
+            let where_db = database.map(|d| format!(" (database '{d}')")).unwrap_or_default();
+            ToolError::Database(format!(
+                "Cannot connect Postgres identity '{identity}'{where_db}: {e}"
+            ))
+        })?;
 
     pool_cache()
         .lock()
         .expect("pg pool cache mutex poisoned")
-        .insert(identity, pool.clone());
+        .insert(cache_key, pool.clone());
     Ok(pool)
 }
 
@@ -317,6 +407,41 @@ mod tests {
         assert!(schema["properties"]["sql"].is_object());
         assert!(schema["properties"]["identity"].is_object());
         assert_eq!(schema["required"], json!(["sql"]));
+    }
+
+    #[test]
+    fn with_conn_params_adds_both_identity_and_database_without_requiring_them() {
+        let base = json!({
+            "type": "object",
+            "properties": { "sql": { "type": "string" } },
+            "required": ["sql"]
+        });
+        let schema = with_conn_params(base);
+        assert!(schema["properties"]["sql"].is_object());
+        assert!(schema["properties"]["identity"].is_object());
+        assert!(schema["properties"]["database"].is_object());
+        // Neither connection param is ever forced into `required`.
+        assert_eq!(schema["required"], json!(["sql"]));
+    }
+
+    #[test]
+    fn resolve_database_name_trims_and_preserves_case_or_returns_none() {
+        // Present + trimmed, case PRESERVED (Postgres db names are case-sensitive).
+        assert_eq!(
+            resolve_database_name(&json!({"database": "  Lumina_Intake  "})),
+            Some("Lumina_Intake".to_string())
+        );
+        // Absent / blank -> None (use the identity DSN's own database).
+        assert_eq!(resolve_database_name(&json!({})), None);
+        assert_eq!(resolve_database_name(&json!({"database": "   "})), None);
+        assert_eq!(resolve_database_name(&json!({"database": ""})), None);
+    }
+
+    #[test]
+    fn database_param_schema_never_contains_a_url_or_secret_shaped_value() {
+        let s = database_param_schema().to_string();
+        assert!(!s.contains("postgres://"));
+        assert!(!s.to_lowercase().contains("password"));
     }
 
     #[test]
