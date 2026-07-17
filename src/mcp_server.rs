@@ -215,6 +215,10 @@ pub fn build_router(state: Arc<McpServerState>) -> Router {
     Router::new()
         .route("/mcp", post(handle_mcp))
         .route("/healthz", get(handle_healthz))
+        // PROMEX-01: Prometheus application-metrics scrape endpoint. Same
+        // unauthenticated, always-on posture as `/healthz` above -- see
+        // `crate::metrics`'s module doc for why no env-gate is needed.
+        .route("/metrics", get(handle_metrics))
         // TGW-03: inference-proxy routes forwarded to Chord — mounted
         // unconditionally; `handle_inference_proxy` itself returns a clean
         // 503 when `state.inference_proxy` is `None` (e.g. on
@@ -379,6 +383,19 @@ async fn handle_healthz(State(state): State<Arc<McpServerState>>) -> impl IntoRe
     (
         StatusCode::OK,
         format!("{} {} ok\n", state.server_name, state.server_version),
+    )
+}
+
+/// PROMEX-01: `GET /metrics` — encodes the process-global
+/// `crate::metrics` registry (tool-call counts + latency histogram) in the
+/// standard Prometheus text exposition format. Takes no `State` — the
+/// registry is process-global, not per-server-instance — so this route
+/// works unmodified on every binary that mounts `build_router`.
+async fn handle_metrics() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        crate::metrics::gather_text(),
     )
 }
 
@@ -664,6 +681,20 @@ async fn handle_mcp(
                 }
                 _ => gate_ctx,
             };
+
+            // PROMEX-01: capture the CONFIGURED upstream namespace (if any)
+            // from the RESOLVED route — `Some` only for a real Upstream/
+            // Unavailable route (a configured, bounded namespace), so an
+            // unknown `foo__bar` name (which resolves to `Local`) yields
+            // `None` and can never smuggle an arbitrary or secret-shaped
+            // prefix into the `tool` metric label. Borrow only — the owning
+            // `mesh_route` is still consumed by the dispatch match below.
+            let metric_ns: Option<String> = match &mesh_route {
+                Some(CallRoute::Upstream { client, .. }) => Some(client.namespace().to_string()),
+                Some(CallRoute::Unavailable { namespace }) => Some(namespace.clone()),
+                _ => None,
+            };
+
             // MESH-10: set when dispatch couldn't even reach an upstream at
             // the transport level (unhealthy/unregistered mesh upstream, or
             // a network-level failure calling one that IS registered) --
@@ -672,6 +703,16 @@ async fn handle_mcp(
             // application-level tool error (`success: false` with the
             // default `Allow` decision).
             let mut is_transport_failure = false;
+
+            // PROMEX-01: time the ENTIRE dispatch below (mesh upstream, the
+            // local core registry, a broker worker route, personal
+            // federation, or "unknown tool") in one central place, rather
+            // than instrumenting each branch separately -- this is the
+            // single point every `tools/call` outcome (`response`,
+            // `success`, `detail`) already funnels through for the audit
+            // log just below, so it is the natural place to also record
+            // `terminus_tool_calls_total`/`terminus_tool_duration_seconds`.
+            let dispatch_started = std::time::Instant::now();
 
             let (response, success, detail) = match mesh_route {
                 Some(CallRoute::Upstream { client, bare_name }) => {
@@ -1013,6 +1054,16 @@ async fn handle_mcp(
                 },
                 },
             };
+
+            // PROMEX-01: record the tool call under a BOUNDED label. The raw
+            // `name` is caller-supplied, so the label is derived only from
+            // VALIDATED state: `reg.contains(name)` (a known local tool) and
+            // `metric_ns` (a configured upstream namespace from the resolved
+            // route). `bounded_tool_label` caps the label to {known local tool
+            // names} ∪ {`<mesh:ns>` for configured ns} ∪ {`<unknown>`}.
+            let metric_tool_name =
+                crate::metrics::bounded_tool_label(name, reg.contains(name), metric_ns.as_deref());
+            crate::metrics::record_tool_call(&metric_tool_name, success, dispatch_started.elapsed());
 
             if let Some(ctx) = gate_ctx {
                 if is_transport_failure {
