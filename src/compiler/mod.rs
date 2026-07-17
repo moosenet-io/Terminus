@@ -2434,6 +2434,11 @@ impl RustTool for CompilerRequest {
                 "bin": {
                     "type": "string",
                     "description": "Optional cargo --bin target. Defaults to the module name; set it when the deployable binary's name differs from the module (e.g. module 'terminus' → bin 'terminus_primary')."
+                },
+                "force": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Disrupt-on-demand: a heavy job dispatches even outside a configured build window and without a fleet-quiet signal. Still goes through the normal module lock / host cap claim and idle-mode lease — only the window/quiet gate is bypassed. Orthogonal to priority."
                 }
             },
             "required": ["module", "ref"]
@@ -2469,6 +2474,11 @@ impl RustTool for CompilerRequest {
             }
             None => None,
         };
+        // BLD-DISPATCH-01: disrupt-on-demand override. Orthogonal to `priority`
+        // (which only orders the queue) — a `force`d HEAVY job bypasses the
+        // scheduler's window/quiet gate but still goes through the normal module
+        // lock / host cap claim and idle-mode lease (see scheduler::tick_once).
+        let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
 
         let store = RedisQueue::from_env().ok_or_else(|| {
             ToolError::NotConfigured(
@@ -2485,16 +2495,18 @@ impl RustTool for CompilerRequest {
                 heavy,
                 ready,
                 bin,
+                force,
             })
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
 
         let text = format!(
-            "{verb} {module}@{git_ref} ({prio}, {host}){ready}; job {id}",
+            "{verb} {module}@{git_ref} ({prio}, {host}){ready}{force}; job {id}",
             verb = if enq.created { "Queued" } else { "Coalesced onto existing" },
             prio = priority.as_str(),
             host = if heavy { "heavy" } else { "primary" },
             ready = if ready { "" } else { " [held]" },
+            force = if force { " [forced]" } else { "" },
             id = enq.job_id,
         );
         let structured = json!({
@@ -2506,6 +2518,7 @@ impl RustTool for CompilerRequest {
             "priority": priority.as_str(),
             "heavy": heavy,
             "ready": ready,
+            "force": force,
         });
         Ok(ToolOutput::with_structured(text, structured))
     }
@@ -2529,6 +2542,7 @@ pub fn render_queue_status(snapshot: &queue::QueueSnapshot) -> Value {
                 "ref": j.git_ref,
                 "priority": j.priority.as_str(),
                 "heavy": j.heavy,
+                "force": j.force,
             })
         })
         .collect();

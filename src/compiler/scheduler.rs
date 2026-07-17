@@ -60,6 +60,15 @@ const WINDOW_ENV: &str = "BUILD_WINDOW_HOURS";
 /// real fleet-quiet detector; when set, heavy builds may dispatch regardless of
 /// the window.
 const FLEET_QUIET_ENV: &str = "BUILD_FLEET_QUIET";
+/// Threshold (secs) of Chord `idle_secs` that counts as "fleet quiet" for
+/// [`fleet_quiet_from_chord`] (CHORD-ACT-01 / BLD-DISPATCH-01). Default 5min —
+/// long enough that a momentary lull between requests never flaps a heavy build
+/// into dispatching mid-traffic.
+const FLEET_QUIET_IDLE_SECS_ENV: &str = "BUILD_FLEET_QUIET_IDLE_SECS";
+const DEFAULT_FLEET_QUIET_IDLE_SECS: u64 = 300;
+/// Per-request timeout (secs) for the `GET {CHORD_CONTROL_URL}/admin/activity`
+/// poll — short, since this runs on every scheduler tick and must never stall it.
+const ACTIVITY_POLL_TIMEOUT_SECS: u64 = 5;
 /// Scheduler poll interval (secs). Default modest so the queue drains promptly.
 const INTERVAL_ENV: &str = "BUILD_SCHED_INTERVAL_SECS";
 /// How many queued jobs to consider per tick.
@@ -121,6 +130,69 @@ pub fn fleet_quiet_from_env() -> bool {
             .as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+/// Read `BUILD_FLEET_QUIET_IDLE_SECS`, falling back to
+/// [`DEFAULT_FLEET_QUIET_IDLE_SECS`] when unset or unparsable (never a panic).
+fn fleet_quiet_idle_threshold() -> u64 {
+    std::env::var(FLEET_QUIET_IDLE_SECS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_FLEET_QUIET_IDLE_SECS)
+}
+
+/// The pure fleet-quiet decision: quiet iff Chord's reported `idle_secs` has
+/// reached `threshold_secs`. Factored out of [`fleet_quiet_from_chord`] so the
+/// threshold logic is unit-testable without any HTTP.
+pub fn is_quiet(idle_secs: u64, threshold_secs: u64) -> bool {
+    idle_secs >= threshold_secs
+}
+
+/// Real fleet-quiet signal (CHORD-ACT-01 / BLD-DISPATCH-01): poll Chord's
+/// `GET {CHORD_CONTROL_URL}/admin/activity` (merged to Chord `main`, returns
+/// `{"serving":bool,"inflight":usize,"idle_secs":u64,"last_request_unix":i64}`)
+/// and treat the fleet as quiet once `idle_secs` reaches
+/// [`fleet_quiet_idle_threshold`] (`BUILD_FLEET_QUIET_IDLE_SECS`, default 300s).
+///
+/// Auth REUSES the exact pattern [`crate::compiler::idle_lease::ProdIdleBackend`]
+/// already uses for `/admin/idle`: a freshly-minted Chord service JWT from
+/// [`crate::federation::mint_service_jwt`] (signed with
+/// `TERMINUS_PRIMARY_CHORD_JWT_SECRET`, never a literal), sent as
+/// `Authorization: Bearer <jwt>` — Chord's `auth_check` guards `/admin/activity`
+/// the same way it guards `/admin/idle`.
+///
+/// SAFE FALLBACK (never assume quiet on error, per S1): if `CHORD_CONTROL_URL`
+/// is unset, the JWT cannot be minted, the request fails/times out, the status
+/// is non-2xx, or the body doesn't parse a numeric `idle_secs`, this falls back
+/// to [`fleet_quiet_from_env`] — the existing env override still forces quiet,
+/// but an UNREACHABLE Chord is treated as NOT quiet unless that override says
+/// otherwise. No panics on this path.
+pub async fn fleet_quiet_from_chord() -> bool {
+    let Some(base) = crate::config::chord_control_url() else {
+        return fleet_quiet_from_env();
+    };
+    let Ok(jwt) = crate::federation::mint_service_jwt() else {
+        return fleet_quiet_from_env();
+    };
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(ACTIVITY_POLL_TIMEOUT_SECS))
+        .build()
+    else {
+        return fleet_quiet_from_env();
+    };
+    let url = format!("{}/admin/activity", base.trim_end_matches('/'));
+    let resp = match client.get(&url).bearer_auth(jwt).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return fleet_quiet_from_env(),
+    };
+    let body: serde_json::Value = match resp.json().await {
+        Ok(b) => b,
+        Err(_) => return fleet_quiet_from_env(),
+    };
+    match body.get("idle_secs").and_then(serde_json::Value::as_u64) {
+        Some(idle_secs) => is_quiet(idle_secs, fleet_quiet_idle_threshold()),
+        None => fleet_quiet_from_env(),
+    }
 }
 
 /// A single heavy-build window as an hour range `[start, end)` on a 0..=24 clock.
@@ -423,8 +495,12 @@ impl Scheduler {
                 HostRole::Primary
             };
             // Heavy builds are window/quiet gated; small builds go straight to
-            // the claim (which enforces the host cap + module lock).
-            if job.heavy && !heavy_dispatch_allowed(hour, &self.config.windows, fleet_quiet) {
+            // the claim (which enforces the host cap + module lock). A `force`d
+            // heavy job (BLD-DISPATCH-01 disrupt-on-demand) bypasses ONLY this
+            // window/quiet GATE — it still goes through the normal claim (host
+            // cap + module lock) and, once dispatched, the idle-mode lease below
+            // (no bypass of idle-mode drain, only of the window/quiet decision).
+            if job.heavy && !job.force && !heavy_dispatch_allowed(hour, &self.config.windows, fleet_quiet) {
                 report.held_window.push(job.job_id.clone());
                 continue;
             }
@@ -640,7 +716,7 @@ impl Scheduler {
         let interval = self.config.interval;
         loop {
             let hour = chrono::Local::now().hour() as u8;
-            let report = self.tick_once(hour, fleet_quiet_from_env()).await;
+            let report = self.tick_once(hour, fleet_quiet_from_chord().await).await;
             // Detach the build tasks; they self-release the queue slot.
             drop(report.handles);
             tokio::time::sleep(interval).await;
@@ -739,6 +815,7 @@ mod tests {
             heavy,
             ready: true,
             bin: None,
+            force: false,
         }
     }
 
@@ -827,6 +904,64 @@ mod tests {
         assert!(!heavy_dispatch_allowed(12, &windows, false)); // outside, not quiet
         assert!(heavy_dispatch_allowed(12, &windows, true)); // fleet-quiet override
         assert!(!heavy_dispatch_allowed(12, &[], false)); // no window, not quiet → wait
+    }
+
+    // CHORD-ACT-01 / BLD-DISPATCH-01: the pure idle_secs>=threshold decision, no HTTP.
+    #[test]
+    fn is_quiet_threshold() {
+        assert!(is_quiet(300, 300), "exactly at the threshold counts as quiet");
+        assert!(is_quiet(301, 300));
+        assert!(!is_quiet(299, 300));
+        assert!(is_quiet(u64::MAX, 300));
+        assert!(!is_quiet(0, 300));
+    }
+
+    // BLD-DISPATCH-01: `fleet_quiet_from_chord` must fall back to the env override
+    // (never assume quiet) when Chord is unreachable — here, CHORD_CONTROL_URL is
+    // simply unset. #[serial]-free because this test only READS an unset var and
+    // never mutates process env (unlike the idle_lease Chord-URL tests).
+    #[tokio::test]
+    async fn fleet_quiet_from_chord_falls_back_when_unconfigured() {
+        std::env::remove_var("CHORD_CONTROL_URL");
+        std::env::remove_var("BUILD_FLEET_QUIET");
+        assert!(
+            !fleet_quiet_from_chord().await,
+            "no CHORD_CONTROL_URL and no env override ⇒ NOT quiet (never assume quiet on error)"
+        );
+        std::env::set_var("BUILD_FLEET_QUIET", "1");
+        assert!(
+            fleet_quiet_from_chord().await,
+            "env override still forces quiet even when Chord is unreachable"
+        );
+        std::env::remove_var("BUILD_FLEET_QUIET");
+    }
+
+    // BLD-DISPATCH-01: a `force`d heavy job dispatches even outside any window and
+    // with fleet_quiet=false; a non-forced one is still held.
+    #[tokio::test]
+    async fn forced_heavy_job_bypasses_the_window_gate() {
+        let q = Arc::new(InMemoryQueue::new());
+        q.enqueue(&req("harmony", "normal", true)).await.unwrap();
+        let forced = JobRequest {
+            force: true,
+            ..req("harmony", "forced", true)
+        };
+        q.enqueue(&forced).await.unwrap();
+        let ex = RecordingExecutor::new(false);
+        let idle = Arc::new(CountingIdle::new(false));
+        let s = sched(q.clone(), ex.clone(), idle.clone(), cfg(2, 2, vec![]));
+        // No window configured, fleet not quiet: the non-forced job is held, the
+        // forced job dispatches anyway.
+        let r = s.tick_once(12, false).await;
+        assert_eq!(r.held_window, vec!["job-1".to_string()], "non-forced heavy job held");
+        assert_eq!(r.dispatched, vec!["job-2".to_string()], "forced heavy job dispatched");
+        for h in r.handles {
+            h.await.unwrap();
+        }
+        // Forced dispatch still goes through the normal idle-mode lease (only the
+        // window/quiet GATE is bypassed, not idle-mode coordination).
+        assert_eq!(idle.acquires.load(Ordering::SeqCst), 1);
+        assert_eq!(idle.releases.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
