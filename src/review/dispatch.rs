@@ -59,6 +59,35 @@ fn openrouter_chat_url() -> String {
         .unwrap_or_else(|| DEFAULT_OPENROUTER_URL.to_string())
 }
 
+/// TERM-DIFF-01: the `diffusion` provider's default model tag -- Chord's
+/// DiffusionGemma serve. Overridable via `DIFFUSION_REVIEW_MODEL` (mirrors
+/// `MERIDIAN_LLM_MODEL`'s override pattern in `src/meridian/tools.rs`).
+const DEFAULT_DIFFUSION_REVIEW_MODEL: &str = "diffusion-gemma";
+
+/// The `diffusion` provider's model tag: `DIFFUSION_REVIEW_MODEL` if set, else
+/// [`DEFAULT_DIFFUSION_REVIEW_MODEL`].
+fn diffusion_review_model() -> String {
+    std::env::var("DIFFUSION_REVIEW_MODEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_DIFFUSION_REVIEW_MODEL.to_string())
+}
+
+/// Chord's OpenAI-compatible chat-completions endpoint (mirrors
+/// `src/meridian/tools.rs::synthesize_via_llm`'s `CHORD_LLM_URL` convention).
+/// Returns a clean "unavailable: ..." reason rather than `Option`/panic when
+/// `CHORD_LLM_URL` isn't configured, so callers can `?`-propagate it straight
+/// into a provider degrade.
+fn chord_chat_url() -> Result<String, String> {
+    let base = std::env::var("CHORD_LLM_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "unavailable: CHORD_LLM_URL unset".to_string())?;
+    Ok(format!("{}/v1/chat/completions", base.trim_end_matches('/')))
+}
+
 /// REVCAP-01 PART B: the effort level sent for an INTENSIVE-SUBSTITUTE review
 /// (a substitute standing in for a down frontier provider must review HARDER,
 /// not at parity -- see `DaemonOpts::intensive`). Value convention mirrors
@@ -271,6 +300,51 @@ impl ReviewConfig {
         let text = body["choices"][0]["message"]["content"].as_str().unwrap_or("").trim().to_string();
         if text.is_empty() {
             Err("unavailable: openrouter returned empty content".to_string())
+        } else {
+            Ok(text)
+        }
+    }
+
+    /// TERM-DIFF-01: dispatch the `diffusion` provider -- a LOCAL, offline,
+    /// zero-cost review lens served by Chord's DiffusionGemma model at
+    /// `CHORD_LLM_URL` (OpenAI-compatible chat-completions; see
+    /// `src/meridian/tools.rs::synthesize_via_llm` for the exact call shape
+    /// this mirrors). Unlike `dispatch_openrouter`, there is NO bearer auth
+    /// (Chord's local endpoint is unauthenticated) and NO `guard_paid_model`
+    /// call (this lens costs nothing -- it's local inference, not a metered
+    /// API). Degrades cleanly on any failure, never panics.
+    pub async fn dispatch_diffusion(&self, prompt: &str) -> Result<String, String> {
+        let url = chord_chat_url()?;
+        let client = Self::client().map_err(|e| format!("unavailable: {e}"))?;
+        let resp = client
+            .post(&url)
+            .json(&json!({
+                "model": diffusion_review_model(),
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": false,
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("unavailable: chord unreachable: {e}"))?;
+
+        let status = resp.status();
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("unavailable: malformed chord response: {e}"))?;
+
+        if !status.is_success() {
+            let msg = body
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("chord error");
+            return Err(format!("unavailable: chord http {status}: {msg}"));
+        }
+
+        let text = body["choices"][0]["message"]["content"].as_str().unwrap_or("").trim().to_string();
+        if text.is_empty() {
+            Err("unavailable: chord diffusion returned empty content".to_string())
         } else {
             Ok(text)
         }
@@ -563,6 +637,61 @@ mod tests {
         };
         let err = cfg.dispatch_openrouter(NEMOTRON_MODEL, "x").await.unwrap_err();
         assert!(err.contains("OPENROUTER_API_KEY"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dispatch_diffusion_missing_url_never_calls_network() {
+        let prev = std::env::var("CHORD_LLM_URL").ok();
+        std::env::remove_var("CHORD_LLM_URL");
+        let cfg = ReviewConfig {
+            daemon_url: DEFAULT_DAEMON_URL.to_string(),
+            daemon_token: None,
+            openrouter_key: None,
+        };
+        let err = cfg.dispatch_diffusion("x").await.unwrap_err();
+        assert!(err.contains("CHORD_LLM_URL"));
+        if let Some(v) = prev {
+            std::env::set_var("CHORD_LLM_URL", v);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dispatch_diffusion_returns_text_on_success() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(json!({
+                "choices": [{"message": {"content": "Looks fine.\nVERDICT: APPROVE"}}]
+            }));
+        });
+        let prev = std::env::var("CHORD_LLM_URL").ok();
+        std::env::set_var("CHORD_LLM_URL", server.base_url());
+        let cfg = ReviewConfig {
+            daemon_url: DEFAULT_DAEMON_URL.to_string(),
+            daemon_token: None,
+            openrouter_key: None,
+        };
+        let result = cfg.dispatch_diffusion("review this").await.unwrap();
+        assert_eq!(result, "Looks fine.\nVERDICT: APPROVE");
+        mock.assert();
+        match prev {
+            Some(v) => std::env::set_var("CHORD_LLM_URL", v),
+            None => std::env::remove_var("CHORD_LLM_URL"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn chord_chat_url_trims_trailing_slash() {
+        let prev = std::env::var("CHORD_LLM_URL").ok();
+        std::env::set_var("CHORD_LLM_URL", "http://127.0.0.1:9009/");
+        assert_eq!(chord_chat_url().unwrap(), "http://127.0.0.1:9009/v1/chat/completions");
+        match prev {
+            Some(v) => std::env::set_var("CHORD_LLM_URL", v),
+            None => std::env::remove_var("CHORD_LLM_URL"),
+        }
     }
 
     #[test]
