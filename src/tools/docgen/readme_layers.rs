@@ -90,10 +90,13 @@
 //! entirely the calling harness's decision, exactly like every other
 //! renderer in `render/`.
 
+use std::collections::HashSet;
+
 use crate::scribe::vault::{render_note, NoteFrontmatter, NoteType};
 
 use super::config::DocTargetType;
 use super::diagram::default_architecture_mermaid_source;
+use super::render::docs_tree::DocsTreeFile;
 use super::render::{RenderContext, RenderedArtifact};
 
 /// Build the architecture slot's embed markdown for the hero layer.
@@ -394,6 +397,68 @@ ceiling (spec §D1) -- move deep content into the docs/ tree instead of inlining
         ))
     } else {
         Ok(())
+    }
+}
+
+/// Extract every markdown inline-link target (`[text](target)`) from
+/// `content`, in order of appearance, including duplicates. A tiny hand-rolled
+/// scanner rather than a regex dependency (matching this crate's existing
+/// posture of avoiding new heavyweight deps for simple string work, per this
+/// file's "Templating choice" doc comment) -- link targets in generated
+/// landings are always plain paths/URLs with no embedded parentheses, so a
+/// naive "find the next `](`, then the matching `)`" scan is sufficient.
+fn extract_link_targets(content: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(rel) = content[search_from..].find("](") {
+        let start = search_from + rel + 2;
+        match content[start..].find(')') {
+            Some(rel_end) => {
+                let end = start + rel_end;
+                targets.push(content[start..end].to_string());
+                search_from = end + 1;
+            }
+            None => break,
+        }
+    }
+    targets
+}
+
+/// Lint: does every LOCAL `docs/`-rooted link target in `landing` resolve to
+/// a file that was actually generated in `docs_tree`? External `http(s)://`
+/// links and pure `#anchor` links are ignored entirely (they are not this
+/// module's docs/ tree to validate). A link target may carry a `#fragment`
+/// suffix (e.g. `docs/index.md#section`) -- only the path portion before the
+/// `#` is checked against `docs_tree`.
+///
+/// Pure and reusable, matching this file's existing lint posture
+/// ([`check_landing_length`]): returns `Ok(())` when every local doc link
+/// resolves, or `Err(dangling_targets)` (deduplicated, in first-seen order)
+/// naming each target that has no matching [`DocsTreeFile::path`].
+pub fn check_landing_links(landing: &str, docs_tree: &[DocsTreeFile]) -> Result<(), Vec<String>> {
+    let known: HashSet<&str> = docs_tree.iter().map(|f| f.path.as_str()).collect();
+    let mut dangling = Vec::new();
+    let mut seen = HashSet::new();
+    for target in extract_link_targets(landing) {
+        let target = target.trim();
+        if target.is_empty()
+            || target.starts_with('#')
+            || target.starts_with("http://")
+            || target.starts_with("https://")
+        {
+            continue;
+        }
+        let path_part = target.split('#').next().unwrap_or(target);
+        if path_part.starts_with("docs/") && !known.contains(path_part) {
+            if seen.insert(target.to_string()) {
+                dangling.push(target.to_string());
+            }
+        }
+    }
+    if dangling.is_empty() {
+        Ok(())
+    } else {
+        Err(dangling)
     }
 }
 
@@ -739,6 +804,75 @@ mod tests {
     fn check_landing_length_accepts_a_landing_at_exactly_the_ceiling() {
         let exact = "line\n".repeat(LANDING_MAX_LINES);
         assert!(check_landing_length(&exact).is_ok());
+    }
+
+    // ── DLAND-03: link-resolution lint ───────────────────────────────────
+
+    fn sample_docs_tree_files() -> Vec<DocsTreeFile> {
+        vec![
+            DocsTreeFile { path: DOCS_INDEX_PATH.to_string(), content: String::new() },
+            DocsTreeFile { path: DOCS_GETTING_STARTED_PATH.to_string(), content: String::new() },
+            DocsTreeFile { path: DOCS_REFERENCE_INDEX_PATH.to_string(), content: String::new() },
+        ]
+    }
+
+    #[test]
+    fn check_landing_links_passes_when_every_local_doc_link_resolves() {
+        let landing = format!(
+            "[Docs]({DOCS_INDEX_PATH}) and [Quickstart]({DOCS_GETTING_STARTED_PATH})"
+        );
+        assert!(check_landing_links(&landing, &sample_docs_tree_files()).is_ok());
+    }
+
+    #[test]
+    fn check_landing_links_flags_a_dangling_local_doc_link() {
+        let landing = "See [Missing](docs/missing.md) for details.";
+        let err = check_landing_links(landing, &sample_docs_tree_files()).unwrap_err();
+        assert_eq!(err, vec!["docs/missing.md".to_string()]);
+    }
+
+    #[test]
+    fn check_landing_links_ignores_external_and_anchor_only_links() {
+        let landing = "[External](https://example.com/docs/foo.md) and [Anchor](#section) and \
+[Secure](http://example.com/docs/bar.md)";
+        assert!(check_landing_links(landing, &sample_docs_tree_files()).is_ok());
+    }
+
+    #[test]
+    fn check_landing_links_ignores_non_docs_local_links_like_changelog_and_license() {
+        let landing = format!("[Changelog]({CHANGELOG_PATH}) and [License]({LICENSE_PATH})");
+        assert!(check_landing_links(&landing, &sample_docs_tree_files()).is_ok());
+    }
+
+    #[test]
+    fn check_landing_links_strips_anchor_fragment_before_checking_the_path() {
+        let landing = format!("[Section]({DOCS_INDEX_PATH}#some-section)");
+        assert!(check_landing_links(&landing, &sample_docs_tree_files()).is_ok());
+    }
+
+    #[test]
+    fn check_landing_links_dedupes_repeated_dangling_targets() {
+        let landing = "[A](docs/missing.md) and again [B](docs/missing.md)";
+        let err = check_landing_links(landing, &sample_docs_tree_files()).unwrap_err();
+        assert_eq!(err, vec!["docs/missing.md".to_string()]);
+    }
+
+    #[test]
+    fn check_landing_links_passes_trivially_on_a_landing_with_no_links() {
+        assert!(check_landing_links("Just plain text, no links here.", &[]).is_ok());
+    }
+
+    #[test]
+    fn a_full_rendered_landing_passes_the_link_gate_against_its_matching_docs_tree() {
+        use super::super::render::docs_tree::build_docs_tree;
+        let artifacts = render_diataxis_set(&ctx(SAMPLE), None);
+        let tree = build_docs_tree(&ctx(SAMPLE), &artifacts);
+        let artifact = render_layered_readme(&ctx(SAMPLE), None);
+        let content = artifact.content.unwrap();
+        assert!(
+            check_landing_links(&content, &tree).is_ok(),
+            "a real rendered landing must resolve against its own matching docs tree"
+        );
     }
 
     // ── shields.io badges present ────────────────────────────────────────

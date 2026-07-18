@@ -37,6 +37,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use super::readme_layers::{check_landing_length, check_landing_links};
 use super::render::docs_tree::DocsTreeFile;
 
 /// Repo-relative path the rendered landing README is always placed at.
@@ -62,6 +63,12 @@ pub struct PlacementReport {
     /// error), each with a reason. Never a panic -- every failure mode this
     /// module can hit lands here instead.
     pub skipped: Vec<SkippedEntry>,
+    /// DLAND-03: landing lint-gate failures (concise-length cap and/or
+    /// dangling `docs/` link targets). Non-empty iff [`place_docs`] refused
+    /// to write ANYTHING this call -- the gate runs fail-closed, before any
+    /// file (README or docs/**) is touched, so a bad landing never lands
+    /// over a good one.
+    pub gate_failures: Vec<String>,
 }
 
 impl PlacementReport {
@@ -268,8 +275,28 @@ fn place_one(target_root: &Path, canonical_root: &Path, relative_path: &str, con
 ///
 /// Touches no git and no network -- working-tree writes only, atomic and
 /// idempotent per file. Never panics.
+///
+/// ## DLAND-03: fail-closed landing lint gate
+/// Before anything is written, `landing` must pass BOTH
+/// [`super::readme_layers::check_landing_length`] (the concise-line cap) AND
+/// [`super::readme_layers::check_landing_links`] (every local `docs/` link
+/// target actually exists in `docs_tree`). If either check fails, this
+/// function writes NOTHING at all -- no README, no docs/** file -- and
+/// returns the failure reason(s) in [`PlacementReport::gate_failures`]
+/// instead. A landing failing either check is not a valid placement, so a
+/// bad landing can never overwrite a good, previously-placed README.
 pub fn place_docs(target_root: &Path, landing: &str, docs_tree: &[DocsTreeFile]) -> PlacementReport {
     let mut report = PlacementReport::default();
+
+    if let Err(e) = check_landing_length(landing) {
+        report.gate_failures.push(e);
+    }
+    if let Err(dangling) = check_landing_links(landing, docs_tree) {
+        report.gate_failures.extend(dangling);
+    }
+    if !report.gate_failures.is_empty() {
+        return report;
+    }
 
     if !target_root.exists() {
         report.skip(".", format!("target_root '{}' does not exist", target_root.display()));
@@ -306,6 +333,7 @@ pub fn place_docs(target_root: &Path, landing: &str, docs_tree: &[DocsTreeFile])
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::readme_layers::LANDING_MAX_LINES;
 
     fn unique_tmp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir()
@@ -697,5 +725,75 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&container).ok();
+    }
+
+    // ── DLAND-03: fail-closed landing lint gate ─────────────────────────
+
+    #[test]
+    fn place_docs_writes_nothing_when_landing_exceeds_the_line_cap() {
+        let root = unique_tmp_dir("gate-oversized-landing");
+        let oversized = "line\n".repeat(LANDING_MAX_LINES + 1);
+
+        let report = place_docs(&root, &oversized, &sample_docs_tree());
+
+        assert!(report.written.is_empty(), "an oversized landing must write nothing: {report:?}");
+        assert!(report.unchanged.is_empty());
+        assert!(report.skipped.is_empty(), "gate failures are reported via gate_failures, not skipped");
+        assert_eq!(report.gate_failures.len(), 1);
+        assert!(report.gate_failures[0].contains("exceeds"), "{:?}", report.gate_failures);
+        assert!(!root.join("README.md").exists());
+        assert!(!root.join("docs/index.md").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn place_docs_writes_when_landing_is_exactly_at_the_line_cap() {
+        let root = unique_tmp_dir("gate-exact-cap");
+        let exact = "line\n".repeat(LANDING_MAX_LINES);
+
+        let report = place_docs(&root, &exact, &[]);
+
+        assert!(report.gate_failures.is_empty(), "{:?}", report.gate_failures);
+        assert_eq!(report.written, vec![README_PATH.to_string()]);
+        assert!(root.join("README.md").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn place_docs_writes_nothing_when_landing_links_a_doc_not_in_the_tree() {
+        let root = unique_tmp_dir("gate-dangling-link");
+        let landing = "# Hello\n\nSee [Missing](docs/missing.md) for details.\n";
+
+        let report = place_docs(&root, landing, &sample_docs_tree());
+
+        assert!(report.written.is_empty(), "a dangling doc link must write nothing: {report:?}");
+        assert!(report.unchanged.is_empty());
+        assert!(report.skipped.is_empty());
+        assert_eq!(report.gate_failures, vec!["docs/missing.md".to_string()]);
+        assert!(!root.join("README.md").exists());
+        assert!(!root.join("docs/index.md").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn place_docs_writes_everything_when_landing_is_concise_and_every_doc_link_resolves() {
+        let root = unique_tmp_dir("gate-valid-landing");
+        let landing = "# Hello\n\nSee [Index](docs/index.md) and [Guides](docs/guides/index.md).\n";
+
+        let report = place_docs(&root, landing, &sample_docs_tree());
+
+        assert!(report.gate_failures.is_empty(), "{:?}", report.gate_failures);
+        assert_eq!(
+            report.written,
+            vec![README_PATH.to_string(), "docs/index.md".to_string(), "docs/guides/index.md".to_string()]
+        );
+        assert!(root.join("README.md").exists());
+        assert!(root.join("docs/index.md").exists());
+        assert!(root.join("docs/guides/index.md").exists());
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
