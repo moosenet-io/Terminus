@@ -35,7 +35,7 @@ use crate::tool::{RustTool, ToolOutput};
 
 use types::{
     GiteaBranchInfo, GiteaCreatePrRequest, GiteaDeleteFileRequest, GiteaFileContent,
-    GiteaFileRequest, GiteaFileResponse, GiteaPullRequest, GiteaRepo,
+    GiteaFileRequest, GiteaFileResponse, GiteaMergeOutcome, GiteaPullRequest, GiteaRepo,
 };
 
 // ─── PII gate ────────────────────────────────────────────────────────────────
@@ -628,6 +628,82 @@ impl GiteaClient {
 
         let endpoint = format!("/repos/{}/{}/pulls", owner, repo);
         client.post(&endpoint, &body).await
+    }
+
+    /// Merge a pull request via `POST /repos/{owner}/{repo}/pulls/{pr}/merge`.
+    ///
+    /// This is the single merge code path — GMQ-01 extracted it out of the
+    /// `gitea_merge_pr` tool's `execute` (which previously inlined the POST)
+    /// so a future queue worker (GMQ-02+, `MergeQueue::with_merge_slot`) can
+    /// call the exact same path the synchronous tool does, rather than a
+    /// second hand-rolled implementation drifting from this one.
+    ///
+    /// Unlike [`GiteaClient::create_pull`], this does NOT resolve `identity`/
+    /// `owner` from a raw `Value` args map — callers (the tool today, a queue
+    /// worker tomorrow) already have a `GiteaClient` scoped to the right
+    /// identity via [`GiteaClient::resolve_identity`] and already resolved
+    /// `owner`; call this method on that resolved client with plain values.
+    ///
+    /// `style` is the Gitea merge strategy (`merge`/`rebase`/`squash`,
+    /// forwarded verbatim as the `Do` field); `message` is an optional merge
+    /// commit message (`MergeMessageField`).
+    ///
+    /// Fetches the PR first (`GET /repos/{owner}/{repo}/pulls/{pr}`) to learn
+    /// its REAL base (and head) branch before merging — the merge endpoint
+    /// itself returns `200` with no useful body on success, so this is the
+    /// only source for the real base string. This fixes the pre-GMQ-01 bug
+    /// where the tool's success message reported the merge `style` in the
+    /// base branch's place. (GMQ-03 will extend this same fetch to also
+    /// gate on `mergeable`/`merged` for the stale-base guard, reusing this
+    /// call rather than fetching the PR twice.)
+    pub async fn merge_pull(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr: u64,
+        style: &str,
+        message: Option<&str>,
+    ) -> Result<GiteaMergeOutcome, ToolError> {
+        let pr_endpoint = format!("/repos/{owner}/{repo}/pulls/{pr}");
+        let pr_info: GiteaPullRequest = self.get(&pr_endpoint).await.map_err(|e| match e {
+            ToolError::NotFound(_) => {
+                ToolError::NotFound(format!("Pull request #{pr} not found in {owner}/{repo}"))
+            }
+            other => other,
+        })?;
+        let base = pr_info.base.ref_name.clone();
+        let head = pr_info.head.ref_name.clone();
+
+        let mut body = json!({ "Do": style });
+        if let Some(msg) = message {
+            body["MergeMessageField"] = json!(msg);
+        }
+
+        let merge_endpoint = format!("/repos/{owner}/{repo}/pulls/{pr}/merge");
+        // Merge endpoint returns 200 with no body on success.
+        let url = self.api(&merge_endpoint);
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", self.auth_header())
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ToolError::Http(format!("Request failed: {e}")))?;
+
+        let status = resp.status();
+        if status == StatusCode::NOT_FOUND {
+            return Err(ToolError::NotFound(format!(
+                "Pull request #{pr} not found in {owner}/{repo}"
+            )));
+        }
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(ToolError::Http(format!("Merge failed: {status}: {body_text}")));
+        }
+
+        Ok(GiteaMergeOutcome { merged: true, base, head })
     }
 
     // ── Accessors + generic transport for the forge adapter (GITX-02) ──────────
@@ -1591,36 +1667,15 @@ impl RustTool for MergePr {
         let pr_num = args["pr"].as_u64()
             .ok_or_else(|| ToolError::InvalidArgument("'pr' must be an integer".to_string()))?;
         let style = args["style"].as_str().unwrap_or("merge");
+        let message = args["message"].as_str();
         let owner = client.resolve_owner(args["owner"].as_str());
 
-        let mut body = json!({ "Do": style });
-        if let Some(msg) = args["message"].as_str() {
-            body["MergeMessageField"] = json!(msg);
-        }
-
-        let endpoint = format!("/repos/{}/{}/pulls/{}/merge", owner, repo, pr_num);
-        // Merge endpoint returns 200 with no body on success
-        let url = client.api(&endpoint);
-        let resp = client
-            .http
-            .post(&url)
-            .header("Authorization", client.auth_header())
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ToolError::Http(format!("Request failed: {e}")))?;
-
-        let status = resp.status();
-        if status == StatusCode::NOT_FOUND {
-            return Err(ToolError::NotFound(format!(
-                "Pull request #{pr_num} not found in {owner}/{repo}"
-            )));
-        }
-        if !status.is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(ToolError::Http(format!("Merge failed: {status}: {body_text}")));
-        }
+        // GMQ-01: the POST + response handling now live in the single shared
+        // `GiteaClient::merge_pull` path (next to `create_pull`), which also
+        // fetches the PR's real base branch (the merge endpoint's own 200
+        // response carries no body) — this is what the success string below
+        // reports, fixing the pre-GMQ-01 bug where it echoed `style` instead.
+        let outcome = client.merge_pull(owner, repo, pr_num, style, message).await?;
 
         // S111E/MIRR-04: this is the single clean "a gated merge to internal
         // main just completed" call site the build pipeline's Stage 6 (merge)
@@ -1634,6 +1689,16 @@ impl RustTool for MergePr {
         // is logged and swallowed — the mirror runner self-heals by re-syncing
         // on its next scheduled tick, exactly like a missed mirror push does
         // (see git_public_mirror_push's failure protocol).
+        //
+        // GMQ-01 design note: this hook stays at the TOOL layer (not inside
+        // `GiteaClient::merge_pull`) deliberately — `merge_pull` is a plain
+        // Gitea API wrapper with no knowledge of the mirror engine, and a
+        // future queue worker (GMQ-02+) that calls `merge_pull` directly
+        // still goes through `MergePr::execute` (or an equivalent tool-layer
+        // caller) to actually fire it, keeping "gated merge just completed"
+        // as a single, tool-level concern rather than duplicated into every
+        // `merge_pull` call site (e.g. any internal helper caller that isn't
+        // a user-facing gated merge).
         if let Err(e) = crate::forge::mirror::tools::dispatch_mirror_action(
             "sync-source",
             json!({ "repo": repo }),
@@ -1651,7 +1716,10 @@ impl RustTool for MergePr {
             );
         }
 
-        Ok(format!("Pull request #{pr_num} merged into {base} in {owner}/{repo}.", base = style))
+        Ok(format!(
+            "Pull request #{pr_num} merged into {base} in {owner}/{repo}.",
+            base = outcome.base
+        ))
     }
 }
 
@@ -5042,6 +5110,10 @@ mod tests {
         std::env::remove_var("TERMINUS_MIRROR_SOURCE_ROOT");
 
         let server = MockServer::start();
+        let get_mock = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/7");
+            then.status(200).json_body(sample_pr_json(7, "feature/x", "main"));
+        });
         let mock = server.mock(|when, then| {
             when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/7/merge");
             then.status(200);
@@ -5052,8 +5124,72 @@ mod tests {
         if let Some(v) = url_backup { std::env::set_var("GITEA_URL", v); } else { std::env::remove_var("GITEA_URL"); }
         if let Some(v) = root_backup { std::env::set_var("TERMINUS_MIRROR_SOURCE_ROOT", v); } else { std::env::remove_var("TERMINUS_MIRROR_SOURCE_ROOT"); }
 
+        get_mock.assert();
         mock.assert();
         let result = result.expect("merge must succeed even though sync-source is unconfigured");
         assert!(result.contains("merged into"), "unexpected result: {result}");
+    }
+
+    /// Minimal `GiteaPullRequest`-shaped JSON body for merge-related mocks:
+    /// the `GET /pulls/{pr}` fetch `GiteaClient::merge_pull` does to learn
+    /// the real base branch before merging (GMQ-01).
+    fn sample_pr_json(pr: u64, head: &str, base: &str) -> Value {
+        json!({
+            "id": pr,
+            "number": pr,
+            "state": "open",
+            "title": "test pr",
+            "body": null,
+            "html_url": format!("http://example.com/testorg/myrepo/pulls/{pr}"),
+            "user": { "login": "moose", "full_name": null },
+            "head": { "label": head, "ref": head, "sha": "deadbeef", "repo": null },
+            "base": { "label": base, "ref": base, "sha": "cafebabe", "repo": null },
+            "mergeable": true,
+            "merged": false,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        })
+    }
+
+    // ── GMQ-01: regression test for the base=style success-string bug ───────
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn merge_pr_success_string_reports_real_base_not_style() {
+        // Pre-GMQ-01, the success string reported the merge `style`
+        // ("squash"/"rebase"/"merge") in the base branch's place — e.g.
+        // "merged into squash in testorg/myrepo" for a squash merge into
+        // `main`. This asserts the real base branch ("main") is reported,
+        // and that the (misleading) style string is NOT substituted for it.
+        let url_backup = std::env::var("GITEA_URL").ok();
+        let root_backup = std::env::var("TERMINUS_MIRROR_SOURCE_ROOT").ok();
+        std::env::remove_var("GITEA_URL");
+        std::env::remove_var("TERMINUS_MIRROR_SOURCE_ROOT");
+
+        let server = MockServer::start();
+        let get_mock = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/42");
+            then.status(200).json_body(sample_pr_json(42, "feature/y", "main"));
+        });
+        let merge_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/42/merge");
+            then.status(200);
+        });
+        let tool = MergePr { client: mock_client(&server) };
+        let result = tool
+            .execute(serde_json::json!({"repo": "myrepo", "pr": 42, "style": "squash"}))
+            .await;
+
+        if let Some(v) = url_backup { std::env::set_var("GITEA_URL", v); } else { std::env::remove_var("GITEA_URL"); }
+        if let Some(v) = root_backup { std::env::set_var("TERMINUS_MIRROR_SOURCE_ROOT", v); } else { std::env::remove_var("TERMINUS_MIRROR_SOURCE_ROOT"); }
+
+        get_mock.assert();
+        merge_mock.assert();
+        let result = result.expect("squash merge must succeed");
+        assert_eq!(
+            result, "Pull request #42 merged into main in testorg/myrepo.",
+            "success string must report the real base branch ('main'), not the merge style"
+        );
+        assert!(!result.contains("squash"), "success string must not leak the merge style as the base: {result}");
     }
 }
