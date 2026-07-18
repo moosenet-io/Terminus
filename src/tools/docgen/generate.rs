@@ -452,6 +452,56 @@ mod tests {
         }
     }
 
+    // ── DLAND-02: cutover generation threads the OLD README through ────
+
+    /// DLAND-02 acceptance criterion: when a cutover generation runs (i.e.
+    /// this is a project's existing, hand-grown README being deepened
+    /// rather than a first-ever doc), the OLD README's full content reaches
+    /// the generator as `existing_docs` -- the same threading
+    /// `generate_docs_for_module` already does via
+    /// `bundle.existing_readme.as_deref()`
+    /// (`generate_docs_for_module_reuses_module_bundle_existing_readme`
+    /// above exercises the same call path against a small fixture; this
+    /// test uses a larger, more "hand-grown README"-shaped fixture with
+    /// multiple `## ` sections, standing in for a real cutover candidate,
+    /// so the preservation guard in `super::preserve::check_preservation`
+    /// has something realistic to have checked upstream of this call).
+    #[tokio::test]
+    async fn cutover_generation_receives_old_readme_as_existing_docs() {
+        let old_readme = "# Widget\n\n\
+## Install\n\nRun `cargo install widget_cli`.\n\n\
+## Configuration\n\nSet `WIDGET_PORT=8080`.\n\n\
+## API\n\nCall `WidgetClient::connect()`.\n";
+
+        let wt = InspectionWorktree {
+            path: std::path::PathBuf::from("/tmp/does-not-matter"),
+            repo_path: std::path::PathBuf::from("/tmp/does-not-matter-repo"),
+            git_ref: "cutover1".to_string(),
+        };
+        let bundle = ModuleBundle {
+            module_path: "src/widget".to_string(),
+            git_ref: "cutover1".to_string(),
+            files: vec![],
+            existing_readme: Some(old_readme.to_string()),
+        };
+        let feat_context = swept("+ cutover to the docgen-generated landing + docs tree");
+        let mock = MockDocGenerator::new(
+            "# Widget\n\nDocgen-generated landing content.\n".to_string(),
+        );
+
+        let outcome = generate_docs_for_module(&mock, &wt, &bundle, &feat_context).await.unwrap();
+
+        // The OLD README's actual sections reached the generator as
+        // existing_docs -- not just "has_existing_docs: true", but the real
+        // content a real model needs to be able to preserve/deepen from.
+        let captured = mock.captured_prompt();
+        assert!(captured.contains("## Install"), "cutover prompt must carry the old README's sections");
+        assert!(captured.contains("WIDGET_PORT=8080"));
+        assert!(captured.contains("WidgetClient::connect()"));
+
+        assert!(matches!(outcome, GenerationOutcome::Generated { .. }));
+    }
+
     // ── No-op change ──────────────────────────────────────────────────
 
     /// Spec EDGE CASE: feat with no doc-relevant change -> minimal/no
