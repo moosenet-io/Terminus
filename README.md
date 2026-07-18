@@ -110,6 +110,21 @@ compiler_build(module, ref, host="auto", profile="release", fast=false, bin?, so
   host (`BUILD_HOST_HEAVY`). `host="primary"|"heavy"` forces a role. `BUILD_HEAVY_THRESHOLD_MB`
   has **no baked-in default** (S1) — it is required only when it would actually change the
   decision (an `auto`, non-`fast` build of a module with a known peak), else `NotConfigured`.
+- **Web-build (SPA/npm) pre-step** (BLD-444) — opt-in per module via
+  `BUILD_MODULE_WEB_DIR_<MODULE>` (same upper-cased/`_`-replaced key convention as
+  `BUILD_MODULE_PEAK_MB_<MODULE>`), a RELATIVE directory under the staged source root (e.g.
+  `BUILD_MODULE_WEB_DIR_HARMONY=harmony-web`). When set, `npm ci` then `npm run build` run in
+  that directory, in the same capped scope as the cargo steps, BEFORE `cargo
+  generate-lockfile`/`cargo build`|`test` — for a module (e.g. `harmony`) whose binary embeds a
+  React SPA via `rust-embed` from a gitignored `dist/` at COMPILE time, so a freshly-staged
+  checkout otherwise has no built SPA and the binary embeds only a tiny fallback shell (a blank
+  dashboard). **Requires `node`/`npm` on the build host** for any module that sets this var —
+  no other module is affected, and unset (the default) is a complete no-op: no npm invocation,
+  no new host requirement. **Fails closed**: `npm` missing, or either `npm ci`/`npm run build`
+  exiting non-zero, aborts the whole `compiler_build`/`compiler_test` call — it is never
+  swallowed to fall through to cargo (which would silently embed the blank shell). The
+  configured value is validated as a safe relative path (no `..`, no absolute, no traversal)
+  before use, same discipline as every other path input below.
 - **Resource caps — Plex protection** (`compiler/scope.rs`) — the build runs under
   `systemd-run --scope` with `MemoryMax` + **`MemorySwapMax=0`** + `CPUQuota` + `IOWeight`.
   The swap-off is load-bearing: an over-budget build is OOM-killed inside its own cgroup

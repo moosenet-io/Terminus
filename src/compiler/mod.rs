@@ -715,6 +715,13 @@ const DEFAULT_TARGET_TRIPLE: &str = "x86_64-unknown-linux-musl";
 /// lease floor is derived from this so a genuinely-live build is never reconciled.
 pub const MAX_BUILD_TIMEOUT_SECS: u64 = 3600;
 
+/// BLD-444: the longest a single web-build pre-step command (`npm ci` or
+/// `npm run build`) may run, capped shorter than the cargo build/test timeout
+/// above — an SPA build is a small fraction of a Rust workspace build, and a
+/// short bound keeps a hung/misconfigured npm from silently eating the whole
+/// build's timeout budget before cargo ever starts.
+const WEB_BUILD_TIMEOUT_SECS: u64 = 900;
+
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
@@ -2069,6 +2076,21 @@ impl CompilerBuild {
         validate_segment("profile", &profile)?;
         validate_git_ref(&git_ref)?;
 
+        // BLD-444: a module may configure a web-build (SPA/npm) subdirectory
+        // via `BUILD_MODULE_WEB_DIR_<MODULE>` (e.g. harmony's `harmony-web`,
+        // which `harmony-server` embeds via rust-embed at COMPILE time — a
+        // gitignored `dist/` that must exist BEFORE cargo runs, or the binary
+        // embeds only the tiny fallback shell: a blank dashboard). Unset ⇒
+        // `None` ⇒ zero behavior change (no npm step, no new host
+        // requirement) for every module without one. Validated ONCE, here,
+        // as a safe relative path — same discipline as every other
+        // user/config path input — before it is ever joined under the staged
+        // source root in either the local or remote build path below.
+        let web_dir = host::module_web_dir(&module);
+        if let Some(w) = &web_dir {
+            validate_relative_dir("web dir", w)?;
+        }
+
         // BLD-19: the request is accepted → `queued`. A per-build tap streams the
         // cargo `{step,total}` into the bus during the build (progress bar). The
         // stream was already ROTATED to a fresh, non-terminal track by the wrapper
@@ -2220,6 +2242,54 @@ impl CompilerBuild {
                     None,
                 )
                 .await?;
+            }
+
+            // BLD-444: the web-build (SPA/npm) pre-step, LOCAL path. Runs
+            // BEFORE lockgen/cargo, in the SAME capped systemd scope as the
+            // cargo steps (`resolved.caps`, the same non-secret `setenv`) so
+            // it never gets an uncapped RAM/CPU allowance. `npm ci` then
+            // `npm run build`, in `<staged_source_root>/<web_dir>`. FAIL
+            // CLOSED: `npm` missing on this build host, or either command
+            // exiting non-zero (via `run`'s existing non-zero-exit ⇒ `Err`
+            // behavior), aborts the WHOLE build here — it is never swallowed
+            // to fall through to cargo, which would embed the tiny fallback
+            // shell (a blank dashboard) instead of a real SPA: the exact bug
+            // this closes. Zero-cost when `web_dir` is `None` (the default
+            // for every module without a `BUILD_MODULE_WEB_DIR_<MODULE>`).
+            if let Some(w) = &web_dir {
+                let web_path = local_source_dir.join(w);
+                bus.emit(
+                    request_id,
+                    events::Emit::stage(events::Stage::Building).message(format!("web-build: {w}")),
+                );
+                for (label, npm_argv) in [
+                    ("npm ci", vec!["npm".to_string(), "ci".to_string()]),
+                    (
+                        "npm run build",
+                        vec!["npm".to_string(), "run".to_string(), "build".to_string()],
+                    ),
+                ] {
+                    let web_unit =
+                        format!("{unit}-web-{}", label.replace(' ', "_").replace('-', "_"));
+                    let web_scope_argv =
+                        scope::render_scope_argv(&web_unit, &resolved.caps, &setenv, &npm_argv);
+                    run(
+                        &web_scope_argv,
+                        Some(&web_path),
+                        &secret_env,
+                        Duration::from_secs(WEB_BUILD_TIMEOUT_SECS),
+                        &redact,
+                        None,
+                        None,
+                    )
+                    .await
+                    .map_err(|e| {
+                        ToolError::Execution(format!(
+                            "web-build pre-step failed for module {module:?} in {w:?} \
+                             ({label}): {e} — refusing to embed a blank SPA"
+                        ))
+                    })?;
+                }
             }
 
             let manifest = local_source_dir.join("Cargo.toml");
@@ -2475,13 +2545,58 @@ impl CompilerBuild {
             // so it replaces this shell as the final process. The secret lives
             // only in the 0600 file, never argv.
             let scope_cmd = shell_join(&scope_argv);
+
+            // BLD-444: the web-build (SPA/npm) pre-step, REMOTE path. Same
+            // rationale/fail-closed contract as the local path above — see
+            // that block's comment. Rendered as a capped `systemd-run --scope`
+            // (same `resolved.caps`/`setenv` as the cargo steps) `cd`'d into
+            // the remote web dir, chained via shell `&&` in front of the
+            // lockgen step: any web-build failure (npm missing, `npm ci`/`npm
+            // run build` non-zero) short-circuits the `&&` chain so lockgen
+            // and `exec <cargo>` never run — it can never fall through to a
+            // cargo build that would embed a blank SPA. `cd`s back to
+            // `remote_source` afterward purely so a reader can reason about
+            // cwd at each `&&` step; lockgen/cargo below use `--manifest-path`
+            // so they don't actually depend on it. Empty string (a no-op
+            // prefix) when `web_dir` is `None` — zero behavior change.
+            let web_prefix = match &web_dir {
+                Some(w) => {
+                    bus.emit(
+                        request_id,
+                        events::Emit::stage(events::Stage::Building)
+                            .message(format!("web-build: {w}")),
+                    );
+                    let remote_web_dir = format!("{remote_source}/{w}");
+                    let web_ci_argv = scope::render_scope_argv(
+                        &format!("{unit}-web-ci"),
+                        &resolved.caps,
+                        &setenv,
+                        &["npm".to_string(), "ci".to_string()],
+                    );
+                    let web_build_argv = scope::render_scope_argv(
+                        &format!("{unit}-web-build"),
+                        &resolved.caps,
+                        &setenv,
+                        &["npm".to_string(), "run".to_string(), "build".to_string()],
+                    );
+                    format!(
+                        "cd {wd} && {ci} && {bld} && cd {back} && ",
+                        wd = shell_quote(&remote_web_dir),
+                        ci = shell_join(&web_ci_argv),
+                        bld = shell_join(&web_build_argv),
+                        back = shell_quote(&remote_source),
+                    )
+                }
+                None => String::new(),
+            };
+
             let remote_cmd = if have_secret {
                 format!(
-                    "set -a; . {f}; rm -f {f}; set +a; {lockgen_cmd} && exec {scope_cmd}",
+                    "set -a; . {f}; rm -f {f}; set +a; {web_prefix}{lockgen_cmd} && exec {scope_cmd}",
                     f = shell_quote(&remote_env_path)
                 )
             } else {
-                format!("{lockgen_cmd} && exec {scope_cmd}")
+                format!("{web_prefix}{lockgen_cmd} && exec {scope_cmd}")
             };
             // On timeout, tear down the REMOTE scope by its unit name too — the
             // local ssh process-group kill can't reach the remote build tree.
@@ -3028,6 +3143,35 @@ fn validate_git_ref(value: &str) -> Result<(), ToolError> {
     }
     for comp in value.split('/') {
         validate_segment("ref component", comp)?;
+    }
+    Ok(())
+}
+
+/// Validate a config-supplied relative directory (BLD-444's
+/// `BUILD_MODULE_WEB_DIR_<MODULE>`) as a SAFE path UNDER the staged source
+/// root, BEFORE it is ever joined into a filesystem path or interpolated into
+/// an ssh/shell command. Mirrors [`validate_git_ref`]'s shape (each
+/// `/`-separated component validated by [`validate_segment`], no absolute
+/// path, no traversal) but is named/documented for this distinct use — a
+/// config value, not a git ref — so an error message never conflates the two.
+fn validate_relative_dir(kind: &str, value: &str) -> Result<(), ToolError> {
+    if value.is_empty() {
+        return Err(ToolError::InvalidArgument(format!(
+            "{kind} must not be empty"
+        )));
+    }
+    if value.starts_with('/') || value.ends_with('/') {
+        return Err(ToolError::InvalidArgument(format!(
+            "{kind} {value:?} must not start or end with '/'"
+        )));
+    }
+    if value.contains('\\') {
+        return Err(ToolError::InvalidArgument(format!(
+            "{kind} {value:?} must not contain '\\'"
+        )));
+    }
+    for comp in value.split('/') {
+        validate_segment(&format!("{kind} component"), comp)?;
     }
     Ok(())
 }
@@ -4216,6 +4360,36 @@ mod tests {
             "a;b",      // shell metachar
         ] {
             assert!(validate_git_ref(bad).is_err(), "should REJECT ref {bad:?}");
+        }
+    }
+
+    #[test]
+    fn web_dir_validation_allows_simple_relative_dirs_but_not_traversal() {
+        // BLD-444: `BUILD_MODULE_WEB_DIR_<MODULE>` — a single segment or a
+        // simple nested relative dir, same shape as `validate_git_ref`.
+        for ok in ["harmony-web", "web", "apps/dashboard", "v1.2.3"] {
+            assert!(
+                validate_relative_dir("web dir", ok).is_ok(),
+                "should accept {ok:?}"
+            );
+        }
+        for bad in [
+            "",             // empty
+            "/etc",         // absolute
+            "harmony-web/", // trailing slash
+            "../..",        // traversal
+            "..",           // parent alone
+            "a/../b",       // embedded traversal
+            "a//b",         // empty component
+            "a\\b",         // backslash
+            "a b",          // whitespace
+            "$(touch x)",   // injection
+            "a;rm -rf /",   // shell metachar
+        ] {
+            assert!(
+                validate_relative_dir("web dir", bad).is_err(),
+                "should REJECT {bad:?}"
+            );
         }
     }
 

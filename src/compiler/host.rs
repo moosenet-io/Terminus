@@ -156,6 +156,27 @@ fn env_key_fragment(s: &str) -> String {
         .collect()
 }
 
+/// BLD-444: a module's configured web-build (SPA/npm) subdirectory, from
+/// `BUILD_MODULE_WEB_DIR_<MODULE>` (module upper-cased, non-alphanumerics →
+/// `_` — the same [`env_key_fragment`] convention as
+/// `BUILD_MODULE_PEAK_MB_<MODULE>`). `None` when unset — the default, and the
+/// ONLY value for a module with no SPA to build (terminus/chord/lumina): no
+/// npm step runs, no new host requirement (node/npm) is imposed, so this is a
+/// zero-behavior-change opt-in.
+///
+/// The returned string is a RAW config value — it is NOT validated here (this
+/// module has no opinion on path safety, same as the rest of `host.rs`'s
+/// config readers). The caller (`compiler/mod.rs`, `build_inner`) MUST run it
+/// through the same relative-path validation as every other user/config path
+/// input (no `..`, no absolute, no traversal) before joining it under the
+/// staged source root — see `validate_relative_dir`.
+pub fn module_web_dir(module: &str) -> Option<String> {
+    env_nonempty(&format!(
+        "BUILD_MODULE_WEB_DIR_{}",
+        env_key_fragment(module)
+    ))
+}
+
 /// A fully-resolved build host: its role, its address (for relay/ssh), and its
 /// resource caps.
 #[derive(Debug, Clone)]
@@ -383,6 +404,27 @@ mod tests {
             module_peak_mb("a-module-with-no-configured-peak-xyz").unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn module_web_dir_absent_is_none() {
+        // BLD-444: a module with no configured web-build dir yields None (⇒ no
+        // npm pre-step, zero behavior change) — deliberately unlikely to be set
+        // in the test environment.
+        assert_eq!(
+            module_web_dir("a-module-with-no-configured-web-dir-xyz"),
+            None
+        );
+    }
+
+    #[test]
+    fn module_web_dir_env_key_matches_peak_mb_convention() {
+        // BLD-444: same per-module env-key derivation as
+        // `BUILD_MODULE_PEAK_MB_<MODULE>` — upper-cased, non-alphanumerics → `_`.
+        let key = format!("BUILD_MODULE_WEB_DIR_{}", env_key_fragment("harmony"));
+        assert_eq!(key, "BUILD_MODULE_WEB_DIR_HARMONY");
+        let key2 = format!("BUILD_MODULE_WEB_DIR_{}", env_key_fragment("lumina-core"));
+        assert_eq!(key2, "BUILD_MODULE_WEB_DIR_LUMINA_CORE");
     }
 
     #[test]
