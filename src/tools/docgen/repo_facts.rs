@@ -110,8 +110,13 @@ impl GraphSource for AtlasGraphSource {
 }
 
 /// A canned graph for tests — never used outside `#[cfg(test)]` call sites.
-pub struct FixtureGraphSource(pub KnowledgeGraph);
+/// Test-only: not compiled into (nor re-exported for) production, so there is
+/// exactly ONE non-test graph source ([`AtlasGraphSource`]) and no alternate
+/// production path can inject an arbitrary graph or force `kg_grounded:false`.
+#[cfg(test)]
+pub(crate) struct FixtureGraphSource(pub KnowledgeGraph);
 
+#[cfg(test)]
 impl GraphSource for FixtureGraphSource {
     fn load_graph(&self, _project_id: &str) -> Result<Option<KnowledgeGraph>, ToolError> {
         Ok(Some(self.0.clone()))
@@ -120,9 +125,11 @@ impl GraphSource for FixtureGraphSource {
 
 /// A [`GraphSource`] that always reports "no graph for this project" — the
 /// `kg_grounded: false` degradation path, exercised without needing a real
-/// missing-store lookup.
-pub struct NoGraphSource;
+/// missing-store lookup. Test-only (see [`FixtureGraphSource`]).
+#[cfg(test)]
+pub(crate) struct NoGraphSource;
 
+#[cfg(test)]
 impl GraphSource for NoGraphSource {
     fn load_graph(&self, _project_id: &str) -> Result<Option<KnowledgeGraph>, ToolError> {
         Ok(None)
@@ -688,6 +695,36 @@ fn read_optional(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+/// True iff `rel` (a graph-derived, untrusted relative module path) resolves to
+/// a location INSIDE `checkout_path`. Rejects absolute paths, any `..`/root/prefix
+/// component (the syntactic traversal guard, which holds even when the target
+/// doesn't exist), and — when both paths canonicalize — confirms containment on
+/// the real filesystem (defeats symlink escapes). Used to gate every read of a
+/// graph-derived path so a corrupt node path can never read outside the checkout.
+fn path_within_checkout(checkout_path: &Path, rel: &str) -> bool {
+    use std::path::Component;
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() {
+        return false;
+    }
+    if rel_path.components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return false;
+    }
+    // Filesystem-level containment check (best-effort; symlink defense). If the
+    // joined path can't be canonicalized yet (e.g. doesn't exist), the syntactic
+    // guard above already established it can't escape, so allow it through.
+    let joined = checkout_path.join(rel_path);
+    match (joined.canonicalize(), checkout_path.canonicalize()) {
+        (Ok(real), Ok(root)) => real.starts_with(&root),
+        _ => true,
+    }
+}
+
 /// Parse `[[bin]] name = "..." path = "..."` tables out of a Cargo.toml's
 /// raw text. A line-oriented scan (this repo's Cargo.toml -- and every
 /// Cargo.toml this builder will ever see -- writes `[[bin]]` tables as
@@ -909,6 +946,14 @@ fn build_subsystem_docs(checkout_path: &Path, subsystems: &[Subsystem]) -> BTree
     let mut out = BTreeMap::new();
     for s in subsystems {
         if s.is_misc || s.source_dir.is_empty() {
+            continue;
+        }
+        // `source_dir` is derived from graph node paths (untrusted input). Refuse
+        // to read anything that could escape the checkout — a malformed/corrupt
+        // graph path such as `../../etc` or an absolute path must never turn into
+        // a filesystem read outside `checkout_path`. This runs BEFORE inspect_module
+        // touches disk, closing the graph-path -> local-read boundary.
+        if !path_within_checkout(checkout_path, &s.source_dir) {
             continue;
         }
         if let Ok(bundle) = inspect::inspect_module(&wt, &s.source_dir) {
@@ -1199,5 +1244,19 @@ pub fn redis() -> String { std::env::var(\"REDIS_URL\").unwrap() }\n",
 
         let err = facts.subsystem_slice("does-not-exist").unwrap_err();
         assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[test]
+    fn graph_derived_paths_cannot_escape_the_checkout() {
+        let root = Path::new("/some/checkout");
+        // Legitimate in-tree module paths are allowed (syntactic guard passes;
+        // canonicalize falls through to `true` for a non-existent fixture root).
+        assert!(path_within_checkout(root, "src/mesh"));
+        assert!(path_within_checkout(root, "src/tools/docgen"));
+        // Traversal / absolute / prefix escapes are refused BEFORE any read.
+        assert!(!path_within_checkout(root, "../etc/passwd"));
+        assert!(!path_within_checkout(root, "src/../../etc"));
+        assert!(!path_within_checkout(root, "/etc/passwd"));
+        assert!(!path_within_checkout(root, "src/mesh/../../.."));
     }
 }
