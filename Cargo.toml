@@ -188,7 +188,20 @@ lettre = { version = "0.11", default-features = false, features = ["tokio1", "to
 # The standalone personal MCP server (src/bin/terminus_personal.rs): a
 # streamable-HTTP MCP server exposing the personal-utility tool subset.
 # Same axum/tower versions Chord (moosenet/Chord) pins, for convention parity.
-axum = { version = "0.7", features = ["json", "macros"] }
+# CONST-18: "ws" adds `axum::extract::ws::{WebSocketUpgrade, WebSocket, Message}`,
+# used by `crate::constellation::ws`'s session-authenticated `/ws` relay
+# handler (the downstream/browser leg of the relay).
+axum = { version = "0.7", features = ["json", "macros", "ws"] }
+# CONST-18: the upstream leg of the `/ws` relay dials Harmony's own event
+# socket as a plain WS client -- axum's "ws" feature only provides the
+# SERVER-side upgrade extractor, so this crate is the minimal addition for
+# the client-side connect. Default features (no extra TLS backend) are
+# enough today: `CONSTELLATION_HARMONY_WS_URL` is a same-LAN `ws://` URL,
+# matching every other constellation backend URL's plain-HTTP posture
+# (`crate::config::constellation_{harmony,chord,lumina}_url`); an operator
+# who fronts Harmony with `wss://` can add a TLS feature later without an
+# API change at this call site.
+tokio-tungstenite = { version = "0.24" }
 # TCLI-03: "util" adds `tower::ServiceExt::oneshot`, used by
 # `src/pki/mtls.rs`'s per-connection hyper service to dispatch each request
 # into the shared `axum::Router` (see that module's "why hyper directly"
