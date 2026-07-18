@@ -67,7 +67,7 @@ export function getVizTheme(): VizTheme {
       },
       legend: { text: { fontSize: 11, fill: textBody, fontFamily: fontMono } },
     },
-    grid: { line: { stroke: chartGrid, strokeWidth: 1, strokeDasharray: 'none' } },
+    grid: { line: { stroke: chartGrid, strokeWidth: 1 } },
     tooltip: {
       container: {
         background: bgElevated,
@@ -80,7 +80,7 @@ export function getVizTheme(): VizTheme {
     },
     labels: { text: { fontSize: 11, fill: textBody, fontFamily: fontMono } },
     legends: { text: { fontSize: 11, fill: textBody, fontFamily: fontMono } },
-    crosshair: { line: { stroke: chartAxis, strokeWidth: 1, strokeDasharray: 'none' } },
+    crosshair: { line: { stroke: chartAxis, strokeWidth: 1 } },
   };
 
   cached = {
@@ -103,10 +103,13 @@ export function resetVizTheme(): void {
 }
 
 /** Recharts shared style constants — the solid-gridline replacement for harmony-web's
- *  GRID_PROPS = {strokeDasharray:'3 3', ...}. Import these instead of redefining per-chart. */
+ *  GRID_PROPS = {strokeDasharray:'3 3', ...}. Import these instead of redefining per-chart.
+ *  `strokeDasharray` is deliberately OMITTED (not set to 'none') — Recharts' default is
+ *  already a solid line, and an explicit 'none' string is a no-op that reads like a residual
+ *  of the anti-pattern it's replacing. */
 export function rechartsGridProps() {
   const t = getVizTheme();
-  return { stroke: t.gridLine, strokeDasharray: 'none' } as const;
+  return { stroke: t.gridLine } as const;
 }
 
 export function rechartsTickStyle() {

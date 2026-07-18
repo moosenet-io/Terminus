@@ -1,11 +1,13 @@
 // TRIAGE-09: Enrichment quality analytics charts.
 // CONST-17 re-skin (§5.1/§10 CONST-17): removed raw-hex per-tier/failure/enrichment fill
 // maps (was Tailwind-palette hexes outside the token system); pass-rate donut replaced with
-// a horizontal stacked bar (close-value comparison — donut is the documented anti-pattern,
-// audit §1.4). Tier/failure-mode identities are nominal -> categorical slots (SlotAssigner,
-// first-seen order, stable across filtering). Enrichment quality is a tri-state health
-// signal -> semantic tokens (§2.4). Solid hairline grid via viz theme (no more
-// strokeDasharray). Every chart lives in a ChartCard with a table-view twin.
+// independent horizontal bars, one per tier, each on its OWN 0-100 scale (review fix: this is
+// NOT a stacked part-of-whole bar — each tier's pass rate is an independent percentage, so
+// normalizing by the sum of all tiers' rates would misrepresent every tier whenever rates
+// don't happen to sum to 100). Tier/failure-mode identities are nominal -> categorical slots
+// (SlotAssigner, first-seen order, stable across filtering). Enrichment quality is a
+// tri-state health signal -> semantic tokens (§2.4). Solid hairline grid via viz theme (no
+// strokeDasharray anywhere). Every chart lives in a ChartCard with a TableViewToggle twin.
 import { useMemo } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from '../viz/recharts';
 import type { EscalationAnalytics } from '../hooks/useEscalationData';
@@ -35,7 +37,6 @@ export function EnrichmentAnalytics({ analytics }: Props) {
     value: Math.round(value * 10) / 10,
     fill: tierSlots.colorFor(name),
   }));
-  const tierTotal = tierData.reduce((sum, t) => sum + t.value, 0) || 1;
 
   const failureData = Object.entries(analytics.failure_mode_counts)
     .sort(([, a], [, b]) => Number(b) - Number(a))
@@ -76,26 +77,38 @@ export function EnrichmentAnalytics({ analytics }: Props) {
         {analytics.total_tasks} tasks analyzed
       </div>
 
-      {/* Pass rate — horizontal stacked bar (donut anti-pattern replaced, audit §1.4) */}
+      {/* Pass rate — independent horizontal bars, one per tier, each 0-100 (donut
+          anti-pattern replaced, audit §1.4; review fix: NOT stacked/part-of-whole) */}
       <ChartCard
         title="Pass Rate by Tier"
-        height={72}
+        height={tierData.length * 28 + 8}
         empty={tierData.length === 0}
-        footer={<ChartLegend entries={tierData.map(t => ({ id: t.key, label: `${t.name} · ${t.value}%`, color: t.fill }))} />}
+        footer={<ChartLegend entries={tierData.map(t => ({ id: t.key, label: t.name, color: t.fill }))} />}
       >
-        <div
-          role="img"
-          aria-label="Pass rate by tier, stacked bar"
-          style={{ display: 'flex', height: 28, borderRadius: 'var(--radius-sm)', overflow: 'hidden', marginTop: 'var(--space-3)' }}
+        <TableViewToggle
+          columns={[
+            { key: 'name', header: 'Tier', render: (r: typeof tierData[number]) => r.name },
+            { key: 'value', header: 'Pass rate', align: 'right', render: (r: typeof tierData[number]) => `${r.value}%` },
+          ]}
+          rows={tierData}
+          rowKey={r => r.key}
         >
-          {tierData.map(t => (
-            <div
-              key={t.key}
-              title={`${t.name}: ${t.value}%`}
-              style={{ width: `${(t.value / tierTotal) * 100}%`, background: t.fill, minWidth: t.value > 0 ? 2 : 0 }}
-            />
-          ))}
-        </div>
+          <div role="img" aria-label="Pass rate by tier, one independent 0-100 bar per tier" style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {tierData.map(t => (
+              <div key={t.key} style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+                <span style={{ width: 120, fontSize: 'var(--fs-xs)', color: 'var(--text-muted)', flexShrink: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {t.name}
+                </span>
+                <div style={{ flex: 1, height: 16, borderRadius: 'var(--radius-sm)', background: 'var(--space-800)', overflow: 'hidden' }}>
+                  <div style={{ width: `${Math.min(100, Math.max(0, t.value))}%`, height: '100%', background: t.fill, minWidth: t.value > 0 ? 2 : 0 }} />
+                </div>
+                <span style={{ width: 44, textAlign: 'right', fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-xs)', color: 'var(--text-body)', flexShrink: 0 }}>
+                  {t.value}%
+                </span>
+              </div>
+            ))}
+          </div>
+        </TableViewToggle>
       </ChartCard>
 
       {/* Failure mode distribution */}
@@ -127,15 +140,24 @@ export function EnrichmentAnalytics({ analytics }: Props) {
       {/* Complexity distribution */}
       {complexityData.length > 0 && (
         <ChartCard title="Complexity Distribution" height={120}>
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={complexityData}>
-              <CartesianGrid {...grid} />
-              <XAxis dataKey="name" tick={tick} />
-              <YAxis tick={tick} />
-              <Tooltip contentStyle={tooltipStyle} />
-              <Bar dataKey="count" fill="var(--series-1)" />
-            </BarChart>
-          </ResponsiveContainer>
+          <TableViewToggle
+            columns={[
+              { key: 'name', header: 'Complexity', render: (r: typeof complexityData[number]) => r.name },
+              { key: 'count', header: 'Count', align: 'right', render: (r: typeof complexityData[number]) => String(r.count) },
+            ]}
+            rows={complexityData}
+            rowKey={r => r.name}
+          >
+            <ResponsiveContainer width="100%" height={120}>
+              <BarChart data={complexityData}>
+                <CartesianGrid {...grid} />
+                <XAxis dataKey="name" tick={tick} />
+                <YAxis tick={tick} />
+                <Tooltip contentStyle={tooltipStyle} />
+                <Bar dataKey="count" fill="var(--series-1)" />
+              </BarChart>
+            </ResponsiveContainer>
+          </TableViewToggle>
         </ChartCard>
       )}
 
@@ -146,17 +168,26 @@ export function EnrichmentAnalytics({ analytics }: Props) {
           height={100}
           footer={<ChartLegend entries={enrichmentData.map(e => ({ id: e.name, label: e.name, color: e.fill }))} />}
         >
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={enrichmentData}>
-              <CartesianGrid {...grid} />
-              <XAxis dataKey="name" tick={tick} />
-              <YAxis tick={tick} />
-              <Tooltip contentStyle={tooltipStyle} />
-              <Bar dataKey="count">
-                {enrichmentData.map((entry) => <Cell key={entry.name} fill={entry.fill} />)}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
+          <TableViewToggle
+            columns={[
+              { key: 'name', header: 'Quality', render: (r: typeof enrichmentData[number]) => r.name },
+              { key: 'count', header: 'Count', align: 'right', render: (r: typeof enrichmentData[number]) => String(r.count) },
+            ]}
+            rows={enrichmentData}
+            rowKey={r => r.name}
+          >
+            <ResponsiveContainer width="100%" height={100}>
+              <BarChart data={enrichmentData}>
+                <CartesianGrid {...grid} />
+                <XAxis dataKey="name" tick={tick} />
+                <YAxis tick={tick} />
+                <Tooltip contentStyle={tooltipStyle} />
+                <Bar dataKey="count">
+                  {enrichmentData.map((entry) => <Cell key={entry.name} fill={entry.fill} />)}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </TableViewToggle>
         </ChartCard>
       )}
 
