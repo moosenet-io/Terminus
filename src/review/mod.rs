@@ -193,6 +193,21 @@ async fn maybe_rebuild(run_hooks: bool, context: &Value) -> Value {
 /// docgen error (the review already passed; a doc-gen failure is reported,
 /// not fatal). Most reviews won't supply doc params at all; this wire only
 /// fires for real merge-time reviews that do (S9: no ad-hoc doc path).
+///
+/// ## DLAND-04: capstone-APPROVE places the generated docs
+/// When `context` also carries a `repo_path` (the merged feat's working
+/// copy -- the same field [`maybe_rebuild`] already reads), this hook asks
+/// `docgen_run` to PLACE its output (`place: true`, `target_root:
+/// repo_path`) as well as generate it, so a passing epic capstone lands the
+/// concise README + `docs/` tree directly into the working tree as a
+/// normal working-tree change the pipeline's own git stages carry (DLAND-01,
+/// gated fail-closed by DLAND-03) -- no new forge/git door is added here,
+/// this is still the same in-process `docgen_run` call, just with two more
+/// fields in its args. When `repo_path` is absent, placement is skipped
+/// exactly like before this item (generation-only). Non-blocking either
+/// way: a placement failure surfaces inside the returned `docgen`/`outcome`
+/// JSON like any other docgen-internal failure -- it never changes this
+/// hook's own non-fatal contract.
 async fn maybe_scribe_docs(run_hooks: bool, context: &Value) -> Value {
     if !run_hooks {
         return json!({"ran": false, "reason": "not an approved pass"});
@@ -222,6 +237,15 @@ async fn maybe_scribe_docs(run_hooks: bool, context: &Value) -> Value {
     });
     if let Some(project_config) = context.get("project_config") {
         docgen_args["project_config"] = project_config.clone();
+    }
+    // DLAND-04: this hook only fires on a passing epic capstone
+    // (`should_run_docgen`) -- when the review context also names a
+    // `repo_path`, land the generated docs into that working tree too, not
+    // just generate+version them. Absent `repo_path` -> generation-only,
+    // exactly the pre-DLAND-04 behavior.
+    if let Some(repo_path) = context.get("repo_path").and_then(|v| v.as_str()) {
+        docgen_args["place"] = json!(true);
+        docgen_args["target_root"] = json!(repo_path);
     }
 
     // The ONLY doc-generation door: the existing `docgen_run` tool, called
