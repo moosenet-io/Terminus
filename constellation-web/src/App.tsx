@@ -15,8 +15,10 @@ import type { HealthStatus } from './lib/aggregationClient';
 import { getAvailableModules, getAvailablePanels } from './lib/moduleRegistry';
 import { OverviewPanel } from './panels/overview/OverviewPanel';
 
-/** A system stays reported `available` for this many consecutive failed polls before the shell
- *  actually hides its module/nav entry (§1.3 rule 2 / §10 CONST-16 "stale-while-degrading"). */
+/** A system stays reported `available` (degraded) through this many consecutive misses —
+ *  whether an explicit `available:false`, disappearing from the health payload entirely, or a
+ *  total poll failure — before the shell actually hides its module/nav entry on the NEXT
+ *  (GRACE_CYCLES + 1-th) miss (§1.3 rule 2 / §10 CONST-16 "stale-while-degrading"). */
 const GRACE_CYCLES = 2;
 
 /** Responsive rail breakpoints (§3.1): icon rail below 1100px, drawer overlay below 760px. */
@@ -56,26 +58,97 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
   const everAvailable = useRef<Set<string>>(new Set());
   const missCounts = useRef<Map<string, number>>(new Map());
 
+  /** Ages one system's grace window by one miss. Returns 'still-graced' while `misses <=
+   *  GRACE_CYCLES` (caller should keep reporting it available), or 'expired' once the window
+   *  has run out (caller should let it actually go unavailable). */
+  const ageMiss = useCallback((system: string): 'still-graced' | 'expired' => {
+    const misses = (missCounts.current.get(system) ?? 0) + 1;
+    missCounts.current.set(system, misses);
+    return misses <= GRACE_CYCLES ? 'still-graced' : 'expired';
+  }, []);
+
   const applyGrace = useCallback((raw: HealthStatus[]): HealthStatus[] => {
     const degraded = new Set<string>();
+    const seen = new Set<string>();
     const out = raw.map(h => {
+      seen.add(h.system);
       if (h.available) {
         everAvailable.current.add(h.system);
         missCounts.current.set(h.system, 0);
         return h;
       }
       if (!everAvailable.current.has(h.system)) return h; // never confirmed up — no grace to extend
-      const misses = (missCounts.current.get(h.system) ?? 0) + 1;
-      missCounts.current.set(h.system, misses);
-      if (misses <= GRACE_CYCLES) {
+      if (ageMiss(h.system) === 'still-graced') {
         degraded.add(h.system);
         return { ...h, available: true };
       }
       return h;
     });
+
+    // A previously-available system can also vanish from the payload ENTIRELY (not just flip
+    // to available:false) — e.g. the backend drops its health-probe entry outright. Treat that
+    // the same as an explicit miss: hold it through the grace window (synthesizing its entry)
+    // before letting its module actually go unavailable (review finding: "absent from payload").
+    for (const system of everAvailable.current) {
+      if (seen.has(system)) continue;
+      if (ageMiss(system) === 'still-graced') {
+        degraded.add(system);
+        out.push({
+          system: system as HealthStatus['system'],
+          available: true,
+          detail: 'degraded (missing from health payload)',
+        });
+      }
+      // else: past grace — leave it out of `out` entirely; its module naturally reports unavailable.
+    }
+
     setDegradedSystems(degraded);
     return out;
-  }, []);
+  }, [ageMiss]);
+
+  /** A TOTAL health-poll failure (the request itself threw) still has to age the grace clock —
+   *  otherwise a system that was available before the backend went dark stays reported
+   *  available forever, since no explicit available:false ever arrives to increment its miss
+   *  count. Each failed poll counts as one miss cycle for every currently-tracked system, so
+   *  after GRACE_CYCLES consecutive failures a stale module ages out exactly like an explicit
+   *  per-system miss would (review finding: "poll failure never ages grace state"). */
+  const ageOnPollFailure = useCallback(
+    (prevHealth: HealthStatus[]): HealthStatus[] => {
+      const degraded = new Set<string>();
+      const seen = new Set<string>(prevHealth.map(h => h.system));
+      const out: HealthStatus[] = [];
+
+      for (const h of prevHealth) {
+        if (!everAvailable.current.has(h.system)) {
+          out.push(h); // never confirmed up — nothing to age, already unavailable
+          continue;
+        }
+        if (ageMiss(h.system) === 'still-graced') {
+          degraded.add(h.system);
+          out.push({ ...h, available: true });
+        }
+        // else: past grace — drop it, its module goes unavailable.
+      }
+
+      // Defensive: age any tracked system that wasn't even in the last snapshot (shouldn't
+      // normally happen, since applyGrace already folds vanished-but-graced systems in).
+      for (const system of everAvailable.current) {
+        if (seen.has(system)) continue;
+        if (ageMiss(system) === 'still-graced') {
+          degraded.add(system);
+          out.push({
+            system: system as HealthStatus['system'],
+            available: true,
+            detail: 'degraded (health poll unreachable)',
+          });
+        }
+      }
+
+      setDegradedSystems(degraded);
+      return out;
+    },
+    [ageMiss],
+  );
 
   const fetchHealth = useCallback(() => {
     getAggregationClient()
@@ -85,12 +158,14 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
         setPollDegraded(false);
       })
       .catch(() => {
-        // Health poll failed entirely: keep the last known health/availability, just mark the
-        // bar degraded (§10 CONST-16 edge case) rather than wiping the shell blank.
+        // Health poll failed entirely: age the grace clock for every tracked system (see
+        // ageOnPollFailure) and mark the bar degraded (§10 CONST-16 edge case) rather than
+        // wiping the shell blank OR pinning everything available forever.
         setPollDegraded(true);
+        setHealth(prev => ageOnPollFailure(prev));
       })
       .finally(() => setHealthLoaded(true));
-  }, [applyGrace]);
+  }, [applyGrace, ageOnPollFailure]);
 
   useEffect(() => {
     fetchHealth();

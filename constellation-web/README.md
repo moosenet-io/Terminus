@@ -66,9 +66,11 @@ registerModule({
 
 A module is available to `getAvailableModules(health)` iff it's registered AND its
 `healthSystem` entry in the given health snapshot reports `available: true`. `App.tsx` applies
-a 2-cycle stale-while-degrading grace to the raw `/api/health` poll before calling this — one
-flaky poll never yanks a module's tab out from under the operator; only `GRACE_CYCLES`
-consecutive misses does.
+a 2-cycle stale-while-degrading grace to the raw `/api/health` poll before calling this — a
+system stays reported available through `GRACE_CYCLES` consecutive misses (an explicit
+`available: false`, vanishing from the payload entirely, or a wholesale poll failure all count
+as a miss); only the miss *after* that — the `GRACE_CYCLES + 1`-th in a row — actually hides
+its module's tab. One flaky poll never yanks a module out from under the operator.
 
 **Panels** are unchanged in contract from CONST-04 — only the `system` field's type changed,
 from the old capitalized `SystemGroup` ('Harmony' | 'Chord' | ... | 'Providers' | 'Status') to
