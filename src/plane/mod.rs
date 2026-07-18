@@ -1412,6 +1412,7 @@ impl RustTool for PlaneCreateWorkItem {
                 "due_date": { "type": "string", "description": "Due date (YYYY-MM-DD)" },
                 "parent": { "type": "string", "description": "Parent issue UUID (for sub-issues)" },
                 "label_ids": { "type": "array", "items": { "type": "string" }, "description": "Label UUIDs to attach" },
+                "assignees": { "type": "array", "items": { "type": "string" }, "description": "TERM-PREREQ-PLANE-ASSIGNEES: member user UUIDs to assign the issue to (forwarded to Plane's issue-create endpoint)" },
                 "module_id": { "type": "string", "description": "Optional module UUID to add the new issue to (linked via the module-issues endpoint after creation)" }
             },
             "required": ["project_id", "name"]
@@ -1456,6 +1457,12 @@ impl PlaneCreateWorkItem {
         }
         if let Some(v) = args.get("label_ids").and_then(|v| v.as_array()) {
             body["label_ids"] = json!(v);
+        }
+        // TERM-PREREQ-PLANE-ASSIGNEES (unblocks HCAT-35): forward member user
+        // UUIDs to Plane's issue-create endpoint so harmony's spec-ingest
+        // create path no longer needs a direct-REST assignees fallback.
+        if let Some(v) = args.get("assignees").and_then(|v| v.as_array()) {
+            body["assignees"] = json!(v);
         }
         let url = format!(
             "{}projects/{project_id}/issues/",
@@ -3659,6 +3666,35 @@ mod tests {
         assert!(result.contains("Fix login bug"), "{result}");
         assert!(result.contains("99"), "{result}");
         mock.assert();
+    }
+
+    // TERM-PREREQ-PLANE-ASSIGNEES: the assignees param is forwarded into the
+    // issue-create POST body (unblocks HCAT-35's egress assignee path).
+    #[tokio::test]
+    async fn test_create_work_item_forwards_assignees() {
+        let server = MockServer::start();
+        mock_projects(&server, "proj-1");
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/v1/workspaces/testws/projects/proj-1/issues/")
+                .body_contains("\"assignees\"")
+                .body_contains("user-a")
+                .body_contains("user-b");
+            then.status(201).json_body(json!({
+                "id": "issue-7", "name": "Assigned task",
+                "project": "proj-1", "workspace": "testws", "sequence_id": 7
+            }));
+        });
+        let client = mock_client(&server);
+        let tool = PlaneCreateWorkItem { client };
+        let result = tool.execute(json!({
+            "project_id": "proj-1",
+            "name": "Assigned task",
+            "assignees": ["user-a", "user-b"]
+        })).await.unwrap();
+        // The mock only matches when the request body carries the assignees array.
+        mock.assert();
+        assert!(result.contains("Assigned task"), "{result}");
     }
 
     #[tokio::test]
