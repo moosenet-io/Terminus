@@ -205,6 +205,13 @@ fn is_camel_case(token: &str) -> bool {
 /// spans into individual identifier-shaped tokens.
 fn split_identifier_like(text: &str) -> Vec<&str> {
     text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '-'))
+        // `.` and `-` are kept as INTERNAL identifier characters (version
+        // numbers like `v1.2.3`, hyphenated names) but must not be allowed to
+        // stick to a fragment's edges -- otherwise ordinary sentence
+        // punctuation (a trailing "." ending a sentence, a leading "-" from
+        // a list marker) gets baked into the token and breaks exact-value
+        // membership checks (e.g. "8080." instead of "8080").
+        .map(|s| s.trim_matches(|c: char| c == '.' || c == '-'))
         .filter(|s| !s.is_empty())
         .collect()
 }
@@ -261,6 +268,36 @@ fn significant_tokens(text: &str) -> BTreeSet<String> {
 // ---------------------------------------------------------------------------
 // New-corpus assembly
 // ---------------------------------------------------------------------------
+
+/// Whether `needle` occurs in `haystack` bounded by non-alphanumeric
+/// characters (or start/end of string) on both sides -- i.e. as a whole
+/// word/phrase, not merely as a run of characters embedded inside a larger
+/// word. Plain [`str::contains`] would let a heading like "Telemetry" match
+/// against unrelated incidental prose that merely contains it as a
+/// substring (e.g. "telemetry-related"), wrongly marking a genuinely
+/// dropped section as covered.
+fn contains_as_whole_phrase(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while start < haystack.len() {
+        let Some(rel) = haystack[start..].find(needle) else { break };
+        let idx = start + rel;
+        let before_ok = haystack[..idx].chars().next_back().map(|c| !c.is_alphanumeric()).unwrap_or(true);
+        let end = idx + needle.len();
+        let after_ok = haystack[end..].chars().next().map(|c| !c.is_alphanumeric()).unwrap_or(true);
+        if before_ok && after_ok {
+            return true;
+        }
+        // Advance past the first char of this (rejected or accepted) match
+        // to keep scanning for a later occurrence, staying on a char
+        // boundary regardless of the needle's/haystack's byte widths.
+        let advance = haystack[idx..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        start = idx + advance;
+    }
+    false
+}
 
 /// Concatenate the new landing README plus every `docs/` tree page into one
 /// corpus string, and its lowercased form for substring heading checks.
@@ -329,7 +366,7 @@ pub fn check_preservation(
         };
 
         let heading_covered = !section.heading.trim().is_empty()
-            && corpus_lower.contains(&section.heading.trim().to_lowercase());
+            && contains_as_whole_phrase(&corpus_lower, &section.heading.trim().to_lowercase());
 
         let section_tokens = significant_tokens(&section.body);
         let (token_covered, ratio) = if section_tokens.is_empty() {
