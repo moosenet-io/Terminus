@@ -38,6 +38,12 @@ function useWindowWidth(): number {
 
 function Shell({ username, onLogout }: { username: string | null; onLogout: () => void }) {
   const [health, setHealth] = useState<HealthStatus[]>([]);
+  // Has the first /api/health poll settled (success OR failure) yet? Until it has, `modules`/
+  // `panels` are necessarily empty (health starts as []) — routing on that empty snapshot would
+  // treat every deep link as "module unavailable" and redirect it to /overview, losing it on
+  // reload (review finding). So the Routes below don't mount at all until this is true; the
+  // requested path sits untouched in the meantime.
+  const [healthLoaded, setHealthLoaded] = useState(false);
   const [pollDegraded, setPollDegraded] = useState(false);
   const [degradedSystems, setDegradedSystems] = useState<Set<string>>(new Set());
   const [density, setDensity] = useState<Density>(
@@ -82,7 +88,8 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
         // Health poll failed entirely: keep the last known health/availability, just mark the
         // bar degraded (§10 CONST-16 edge case) rather than wiping the shell blank.
         setPollDegraded(true);
-      });
+      })
+      .finally(() => setHealthLoaded(true));
   }, [applyGrace]);
 
   useEffect(() => {
@@ -139,6 +146,7 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
         onLogout={onLogout}
         pollDegraded={pollDegraded}
         onOpenMenu={railVariant === 'drawer' ? () => setDrawerOpen(true) : undefined}
+        panels={panels}
       />
 
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
@@ -152,23 +160,49 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
         )}
 
         <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-          <Routes>
-            <Route
-              path="/overview"
-              element={
-                <OverviewPanel modules={modules} health={health} degradedSystems={degradedSystems} density={density} />
-              }
-            />
-            {panels.map(panel => {
-              const Component = panel.component;
-              return <Route key={panel.id} path={panel.path} element={<Component />} />;
-            })}
-            <Route path="/" element={<Navigate to="/overview" replace />} />
-            {/* Open route of a hidden/unavailable module's panel → redirect to Overview
-                (§10 CONST-16 edge case) — its Route above simply isn't registered, so any
-                other path falls through to this wildcard. */}
-            <Route path="*" element={<Navigate to="/overview" replace />} />
-          </Routes>
+          {!healthLoaded ? (
+            // First health poll hasn't settled yet — `modules`/`panels` are necessarily empty
+            // right now (health starts as []). Render a loading placeholder WITHOUT mounting
+            // any route (in particular no wildcard redirect), so a deep link / reload of a real
+            // panel path (e.g. /harmony/dashboard) sits untouched until we actually know whether
+            // its module is available (review finding: first-render route loss).
+            <div
+              style={{
+                flex: 1,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                color: 'var(--text-tertiary)',
+                fontSize: 'var(--text-base)',
+              }}
+            >
+              Loading…
+            </div>
+          ) : (
+            <Routes>
+              <Route
+                path="/overview"
+                element={
+                  <OverviewPanel modules={modules} health={health} degradedSystems={degradedSystems} density={density} />
+                }
+              />
+              {panels.map(panel => {
+                const Component = panel.component;
+                return <Route key={panel.id} path={panel.path} element={<Component />} />;
+              })}
+              {/* Backward-compat: the pre-CONST-16 'Status' panels lived at /status/*; keep old
+                  bookmarks/links working by redirecting to their re-homed harmony.* paths. */}
+              <Route path="/status/analytics" element={<Navigate to="/harmony/analytics" replace />} />
+              <Route path="/status/engine-diagram" element={<Navigate to="/harmony/engine" replace />} />
+              <Route path="/" element={<Navigate to="/overview" replace />} />
+              {/* Open route of a hidden/unavailable module's panel → redirect to Overview
+                  (§10 CONST-16 edge case) — its Route above simply isn't registered, so any
+                  other path falls through to this wildcard. Only reachable once health has
+                  loaded (see the !healthLoaded branch above), so this never fires against a
+                  still-unknown module. */}
+              <Route path="*" element={<Navigate to="/overview" replace />} />
+            </Routes>
+          )}
         </div>
       </div>
     </div>

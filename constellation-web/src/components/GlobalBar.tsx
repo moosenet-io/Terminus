@@ -3,8 +3,7 @@
 // wordmark, a ⌘K search/palette trigger, the density toggle, and the account chip.
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import type { ModuleDescriptor } from '../lib/moduleRegistry';
-import { getAvailablePanels } from '../lib/moduleRegistry';
+import type { ModuleDescriptor, PanelDescriptor } from '../lib/moduleRegistry';
 import type { HealthStatus } from '../lib/aggregationClient';
 import { Wordmark } from './Wordmark';
 
@@ -27,6 +26,10 @@ interface GlobalBarProps {
   /** Present only in the <760px "drawer" rail variant — renders a menu trigger before the
    *  wordmark that opens the ModuleRail drawer. */
   onOpenMenu?: () => void;
+  /** The SAME health-filtered panel set the Shell routes — i.e. only panels belonging to a
+   *  currently-available module. The ⌘K "go to" trigger must source from this, not the raw
+   *  registry, so it never offers a path the router would reject (CONST-16 review finding). */
+  panels: PanelDescriptor[];
 }
 
 export function GlobalBar({
@@ -41,6 +44,7 @@ export function GlobalBar({
   onLogout,
   pollDegraded,
   onOpenMenu,
+  panels,
 }: GlobalBarProps) {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const navigate = useNavigate();
@@ -238,6 +242,7 @@ export function GlobalBar({
 
       {paletteOpen && (
         <MiniPalette
+          panels={panels}
           onClose={() => setPaletteOpen(false)}
           onNavigate={path => {
             navigate(path);
@@ -253,9 +258,20 @@ export function GlobalBar({
  * Minimal in-shell "go to panel" overlay behind the ⌘K trigger — CONST-25 replaces this with
  * the full `CommandPalette` (actions, entity search, `registerCommand`). Deliberately named
  * differently (`MiniPalette`, local to `GlobalBar`) so it doesn't collide with that future file.
+ *
+ * Takes its entries from the caller's health-filtered `panels` (NOT `getAvailablePanels()`
+ * directly) — otherwise it would list panels of modules that are currently unavailable, and
+ * navigating to one would fall through the router's wildcard route (review finding).
  */
-function MiniPalette({ onClose, onNavigate }: { onClose: () => void; onNavigate: (path: string) => void }) {
-  const panels = getAvailablePanels();
+function MiniPalette({
+  panels,
+  onClose,
+  onNavigate,
+}: {
+  panels: PanelDescriptor[];
+  onClose: () => void;
+  onNavigate: (path: string) => void;
+}) {
   return (
     <div
       role="dialog"
