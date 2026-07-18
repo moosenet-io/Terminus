@@ -1185,6 +1185,14 @@ pub fn constellation_lumina_url() -> Option<String> {
     env_nonempty("CONSTELLATION_LUMINA_URL")
 }
 
+/// Base URL of the Muse backend the aggregation layer proxies
+/// `/api/muse/*path` to (the fourth namespaced proxy arm, CONST-19). From
+/// `CONSTELLATION_MUSE_URL`; `None` ⇒ `available:false` for that system,
+/// same convention as the other three backend URLs above.
+pub fn constellation_muse_url() -> Option<String> {
+    env_nonempty("CONSTELLATION_MUSE_URL")
+}
+
 /// Filesystem directory holding the built `constellation-web` static
 /// assets (its `dist/` output) that this layer serves as a SPA, with
 /// `index.html` as the not-found fallback. From
@@ -1936,9 +1944,11 @@ mod tests {
         std::env::remove_var("CONSTELLATION_HARMONY_URL");
         std::env::remove_var("CONSTELLATION_CHORD_URL");
         std::env::remove_var("CONSTELLATION_LUMINA_URL");
+        std::env::remove_var("CONSTELLATION_MUSE_URL");
         assert_eq!(constellation_harmony_url(), None);
         assert_eq!(constellation_chord_url(), None);
         assert_eq!(constellation_lumina_url(), None);
+        assert_eq!(constellation_muse_url(), None);
     }
 
     #[test]

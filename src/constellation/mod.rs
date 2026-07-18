@@ -13,7 +13,7 @@
 //! ## What lives here
 //! - [`constellation_router`] — the `Router` this module contributes:
 //!   `/api/auth/*` (`crate::constellation::auth`), `/api/health`,
-//!   `/api/terminus/config`, the three namespaced backend proxies
+//!   `/api/terminus/config`, the four namespaced backend proxies
 //!   (`crate::constellation::proxy`), a `/ws` scaffold, and a static-asset
 //!   fallback serving the built `constellation-web` SPA — by default from
 //!   the [`assets::WEB_ASSETS`] embedded into the binary (CONST-15), or from
@@ -93,6 +93,7 @@ fn protected_router(state: Arc<McpServerState>) -> Router {
         .route("/api/harmony/*path", any(proxy::proxy_harmony))
         .route("/api/chord/*path", any(proxy::proxy_chord))
         .route("/api/lumina/*path", any(proxy::proxy_lumina))
+        .route("/api/muse/*path", any(proxy::proxy_muse))
         .with_state(state)
         // Applied AFTER `with_state` (matching `crate::mcp_server::build_router`'s own
         // `.with_state(..).layer(TraceLayer::..)` ordering) -- `require_session` needs no
@@ -232,15 +233,16 @@ async fn handle_ws_stub() -> Response {
 }
 
 /// `GET /api/health` — one entry per known system
-/// (`harmony`/`chord`/`lumina`/`terminus`), matching
+/// (`harmony`/`chord`/`lumina`/`muse`/`terminus`), matching
 /// `aggregationClient.ts`'s `HealthStatus[]` shape exactly. `terminus` is
-/// this process itself, so it is always `available: true`; the other three
+/// this process itself, so it is always `available: true`; the other four
 /// are cheap-probed against their configured base URL.
 async fn handle_health(State(state): State<Arc<McpServerState>>) -> Response {
     let entries = json!([
         probe_system("harmony", config::constellation_harmony_url()).await,
         probe_system("chord", config::constellation_chord_url()).await,
         probe_system("lumina", config::constellation_lumina_url()).await,
+        probe_system("muse", config::constellation_muse_url()).await,
         terminus_self_health(&state),
     ]);
     let masked = mask::mask_response(entries);
@@ -389,10 +391,11 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn health_reports_all_four_systems() {
+    async fn health_reports_all_five_systems() {
         std::env::remove_var("CONSTELLATION_HARMONY_URL");
         std::env::remove_var("CONSTELLATION_CHORD_URL");
         std::env::remove_var("CONSTELLATION_LUMINA_URL");
+        std::env::remove_var("CONSTELLATION_MUSE_URL");
         let router = constellation_router(test_state());
         let (status, body) = get_json(router, "/api/health").await;
         assert_eq!(status, StatusCode::OK);
@@ -405,9 +408,13 @@ mod tests {
         assert!(systems.contains(&"harmony".to_string()));
         assert!(systems.contains(&"chord".to_string()));
         assert!(systems.contains(&"lumina".to_string()));
+        assert!(systems.contains(&"muse".to_string()));
         assert!(systems.contains(&"terminus".to_string()));
         let terminus = body.as_array().unwrap().iter().find(|v| v["system"] == "terminus").unwrap();
         assert_eq!(terminus["available"], true);
+        let muse = body.as_array().unwrap().iter().find(|v| v["system"] == "muse").unwrap();
+        assert_eq!(muse["available"], false);
+        assert!(muse["detail"].as_str().unwrap().contains("not configured"));
     }
 
     #[tokio::test]
@@ -464,6 +471,57 @@ mod tests {
         // (200 + available:false), never a 401.
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["available"], false);
+        std::env::remove_var("TERMINUS_JWT_SIGNING_KEY");
+    }
+
+    // ── CONST-19: /api/muse/* route wiring ───────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn unauthenticated_request_to_the_muse_proxy_route_is_rejected_401() {
+        std::env::remove_var("TERMINUS_JWT_SIGNING_KEY");
+        std::env::remove_var("CONSTELLATION_MUSE_URL");
+        let router = constellation_router(test_state());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/muse/on_deck")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn authenticated_request_to_the_muse_proxy_route_reaches_the_proxy_handler() {
+        std::env::set_var("TERMINUS_JWT_SIGNING_KEY", "test-signing-key-mod-tests");
+        std::env::remove_var("CONSTELLATION_MUSE_URL");
+        let router = constellation_router(test_state());
+        let (status, body) = get_json_authenticated(router, "/api/muse/on_deck").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["system"], "muse");
+        assert_eq!(body["available"], false);
+        std::env::remove_var("TERMINUS_JWT_SIGNING_KEY");
+    }
+
+    /// The query string (e.g. Muse's `/api/graph/taste-clusters?epoch=...`)
+    /// must survive routing through `/api/muse/*path` the same way it does
+    /// for the other three arms (`build_target_preserves_query_string` in
+    /// `proxy.rs` covers the forwarding logic itself; this covers that the
+    /// route wiring here actually reaches it with the query intact).
+    #[tokio::test]
+    #[serial]
+    async fn muse_proxy_route_preserves_query_string_through_routing() {
+        std::env::set_var("TERMINUS_JWT_SIGNING_KEY", "test-signing-key-mod-tests");
+        std::env::remove_var("CONSTELLATION_MUSE_URL");
+        let router = constellation_router(test_state());
+        // Unconfigured -- degrades before ever building an upstream URL, but
+        // this still proves the route matches and dispatches with the query
+        // string attached rather than 404ing on the extra segment.
+        let (status, body) =
+            get_json_authenticated(router, "/api/muse/api/graph/taste-clusters?epoch=current").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["system"], "muse");
         std::env::remove_var("TERMINUS_JWT_SIGNING_KEY");
     }
 
