@@ -377,7 +377,19 @@ pub fn check_preservation(
             (ratio >= TOKEN_COVERAGE_THRESHOLD, ratio)
         };
 
-        if heading_covered || token_covered {
+        // Coverage is keyed on STABLE significant tokens (the spec's guarantee):
+        // a section that HAS such tokens is covered only if enough of them
+        // reappear in the new corpus. A bare heading word surfacing inside
+        // unrelated prose (e.g. "Telemetry" within "nothing telemetry-related")
+        // must NOT rescue a genuinely dropped feature. Heading presence is only
+        // a fallback signal for sections that have no significant tokens to key
+        // on at all.
+        let section_covered = if section_tokens.is_empty() {
+            heading_covered
+        } else {
+            token_covered
+        };
+        if section_covered {
             covered.push(label);
         } else {
             let excerpt = excerpt_of(&section.body, 120);
