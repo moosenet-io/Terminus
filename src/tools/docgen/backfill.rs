@@ -100,7 +100,7 @@ use crate::tool::RustTool;
 use super::config::DocTargetType;
 use super::generate::{ChordDocGenerator, DocGenerator, GenerationOutcome};
 use super::place::{place_docs, README_PATH};
-use super::preserve::{check_preservation, extract_preamble, split_old_sections, Section};
+use super::preserve::{check_preservation, Section};
 use super::readme_layers::{
     check_landing_length, check_landing_links, landing_line_count, DOCS_INDEX_PATH, LANDING_MAX_LINES,
 };
@@ -150,17 +150,50 @@ fn slugify(heading: &str) -> String {
 /// section" edge case) -- labeled "Overview" here since that section's
 /// `heading` field is empty in that case -- so nothing is ever silently
 /// dropped for lack of section structure.
+/// Split the OLD README into (verbatim preamble, [(heading, VERBATIM source
+/// slice)]) using EXACT byte offsets. Each section's slice is the original
+/// source from its `## ` line through just before the next `## ` line (or EOF),
+/// copied byte-for-byte -- so a relocated docs page contains the section's exact
+/// authored heading, blank lines, and body, not a reconstruction from parsed
+/// fields (which would normalise whitespace / heading formatting). This is what
+/// makes the relocation truly loss-free.
+fn old_readme_parts(old: &str) -> (String, Vec<(String, String)>) {
+    let mut starts: Vec<(usize, String)> = Vec::new();
+    let mut offset = 0usize;
+    for line in old.split_inclusive('\n') {
+        if let Some(rest) = line.trim_start().strip_prefix("## ") {
+            starts.push((offset, rest.trim().to_string()));
+        }
+        offset += line.len();
+    }
+    if starts.is_empty() {
+        // No `## ` headings anywhere: the whole document is one verbatim
+        // section (no separate preamble).
+        if old.trim().is_empty() {
+            return (String::new(), Vec::new());
+        }
+        return (String::new(), vec![(String::new(), old.to_string())]);
+    }
+    let preamble = old[..starts[0].0].trim().to_string();
+    let mut sections = Vec::with_capacity(starts.len());
+    for i in 0..starts.len() {
+        let start = starts[i].0;
+        let end = if i + 1 < starts.len() { starts[i + 1].0 } else { old.len() };
+        sections.push((starts[i].1.clone(), old[start..end].to_string()));
+    }
+    (preamble, sections)
+}
+
 fn build_docs_tree_from_old_readme(old_readme: &str) -> Vec<DocsTreeFile> {
-    let preamble = extract_preamble(old_readme);
-    let sections = split_old_sections(old_readme);
+    let (preamble, sections) = old_readme_parts(old_readme);
 
     let mut slug_counts: HashMap<String, usize> = HashMap::new();
-    // (slug, heading label for the index link list, page content)
+    // (slug, heading label for the index link list, VERBATIM page content)
     let mut pages: Vec<(String, String, String)> = Vec::with_capacity(sections.len());
 
-    for section in &sections {
+    for (heading, slice) in &sections {
         let heading_label =
-            if section.heading.trim().is_empty() { "Overview".to_string() } else { section.heading.clone() };
+            if heading.trim().is_empty() { "Overview".to_string() } else { heading.clone() };
         let base_slug = {
             let s = slugify(&heading_label);
             if s.is_empty() { "section".to_string() } else { s }
@@ -169,12 +202,12 @@ fn build_docs_tree_from_old_readme(old_readme: &str) -> Vec<DocsTreeFile> {
         *count += 1;
         let slug = if *count == 1 { base_slug } else { format!("{base_slug}-{count}") };
 
-        let heading_line = format!("## {heading_label}");
-        let content = if section.body.trim().is_empty() {
-            format!("{heading_line}\n")
-        } else {
-            format!("{heading_line}\n\n{}\n", section.body)
-        };
+        // The page IS the exact original source slice (only guaranteeing a
+        // trailing newline) -- verbatim, never reconstructed.
+        let mut content = slice.clone();
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
         pages.push((slug, heading_label, content));
     }
 
@@ -978,6 +1011,28 @@ mod tests {
         assert!(new_readme.contains(DOCS_INDEX_PATH));
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn relocated_pages_are_byte_exact_slices_of_the_old_readme_source() {
+        // A relocated docs page must contain the section's ORIGINAL source
+        // bytes (sub-headings, code fences, exact spacing), not a reconstruction
+        // from parsed heading/body fields.
+        let old = "# Title\n\nIntro.\n\n## Config\n\nSet it up:\n\n### Advanced\n\n```toml\nport = 8080\n```\n\nDone.\n\n## Next\n\nMore.\n";
+        let tree = build_docs_tree_from_old_readme(old);
+        let config_page = tree
+            .iter()
+            .find(|f| f.path == "docs/reference/config.md")
+            .expect("config page");
+        // The exact source slice for the ## Config section (heading through just
+        // before ## Next), verbatim -- sub-heading, fenced code, and blank lines
+        // all preserved byte-for-byte.
+        let expected = "## Config\n\nSet it up:\n\n### Advanced\n\n```toml\nport = 8080\n```\n\nDone.\n\n";
+        assert!(
+            config_page.content.contains(expected),
+            "page is not the verbatim source slice:\n{}",
+            config_page.content
+        );
     }
 
     // ── Edge: README with no `##` sections -> one whole-document page ────
