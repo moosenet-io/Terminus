@@ -734,6 +734,44 @@ Respond again, only naming real binaries/tools from ENTRY POINTS."
             .filter(|(path, _)| !path.to_string_lossy().ends_with("getting-started.md"))
             .collect();
 
+        // A non-empty `=== FILE:` response is NOT automatically a success: the
+        // Pass-3 contract is getting-started.md PLUS one guide per guide_topic.
+        // Collect the concrete gaps so an incomplete response is retried once and,
+        // if still incomplete, recorded as a flagged pass (added to `missing` by the
+        // caller) — while STILL returning whatever real files we did get (partial
+        // success), never silently reporting ok:true with an empty getting_started.
+        let mut gaps: Vec<String> = Vec::new();
+        if getting_started.trim().is_empty() {
+            gaps.push("getting-started.md".to_string());
+        }
+        let expected_guides = identity.guide_topics.len();
+        if guides.len() < expected_guides {
+            gaps.push(format!(
+                "{} of {} guide topic page(s) missing",
+                expected_guides - guides.len(),
+                expected_guides
+            ));
+        }
+
+        if !gaps.is_empty() {
+            if attempt == 0 {
+                prompt = format!(
+                    "{prompt}\n\nYour previous response was incomplete — {}. Every guides \
+response MUST include `=== FILE: docs/getting-started.md ===` and one \
+`=== FILE: docs/guides/<slug>.md ===` per guide topic in REPO IDENTITY. Respond \
+again with ALL required files.",
+                    gaps.join("; ")
+                );
+                continue;
+            }
+            // Final attempt still incomplete: keep the partial output, flag the gap.
+            return (
+                guides,
+                getting_started,
+                PassRecord::flagged("guides", format!("incomplete guides output: {}", gaps.join("; "))),
+            );
+        }
+
         return (guides, getting_started, PassRecord::ok("guides"));
     }
 
@@ -1253,6 +1291,15 @@ Clone with `git clone <repo>` then build with `cargo build`.
 2. Verify it worked.
 ";
 
+        // A non-empty response that OMITS getting-started.md — must NOT count as
+        // a clean guides pass (codex review finding: empty getting_started slipped
+        // through as ok:true).
+        const GUIDES_MISSING_GETTING_STARTED: &str = "\
+=== FILE: docs/guides/run-the-fixture.md ===
+# Run the fixture
+1. Build it with `cargo build`.
+";
+
         // ── full success ─────────────────────────────────────────────
 
         #[tokio::test]
@@ -1333,6 +1380,30 @@ Clone with `git clone <repo>` then build with `cargo build`.
             let beta_record = outcome.pass_ledger.iter().find(|r| r.pass == "subsystem:beta").unwrap();
             assert!(!beta_record.ok);
             assert!(beta_record.detail.as_deref().unwrap_or_default().contains("PhantomThing"));
+        }
+
+        // ── guides missing getting-started -> flagged, partial still returned ──
+
+        #[tokio::test]
+        async fn guides_without_getting_started_are_flagged_but_partial_is_kept() {
+            let facts = fixture_facts();
+            let kept: Vec<&str> = facts.subsystems.iter().map(|s| s.name.as_str()).collect();
+
+            // Same incomplete response on both attempts (no getting-started.md).
+            let generator =
+                ScriptedGenerator::new(valid_identity_json(&kept), GUIDES_MISSING_GETTING_STARTED);
+            let outcome = generate_repo_docs(&generator, &facts, "FixtureRepo", "abc123").await;
+
+            // The gap is surfaced, not silently accepted as ok:true.
+            assert!(outcome.missing.contains(&"guides".to_string()));
+            assert!(outcome.getting_started.is_empty());
+            let guides_record = outcome.pass_ledger.iter().find(|r| r.pass == "guides").unwrap();
+            assert!(!guides_record.ok);
+            assert!(guides_record.detail.as_deref().unwrap_or_default().contains("getting-started.md"));
+
+            // ...but the real guide file we DID get is still returned (partial success).
+            assert_eq!(outcome.guides.len(), 1);
+            assert_eq!(outcome.guides[0].0, PathBuf::from("docs/guides/run-the-fixture.md"));
         }
     }
 }
