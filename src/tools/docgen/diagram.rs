@@ -685,8 +685,17 @@ fn build_subsystem_mermaid(facts: &RepoFacts, max_nodes: usize) -> Result<SweptD
     let mut used_ids: BTreeSet<String> = BTreeSet::new();
     for s in &kept {
         let normalized = boundary_normalize_for_pii_detection(&s.name);
-        let outcome = sweep_input(&normalized)?;
-        let label = outcome.sanitized_content().to_string();
+        // A subsystem NAME is a short token, so if it is PII-dominated (e.g. an
+        // adversarial `svc_<private-ip>`) `sweep_input`'s meaning-preservation
+        // guard would BLOCK it (`Err`), which the `?` would propagate and turn a
+        // whole-diagram render into a hard failure. For a node label we always
+        // want the redacted form, never a block, so redact directly here (the
+        // fully-composed diagram is still run through `sweep_input` below as the
+        // belt-and-suspenders second pass).
+        let label = match sweep_input(&normalized) {
+            Ok(outcome) => outcome.sanitized_content().to_string(),
+            Err(_) => crate::github::pii::scan_and_redact(&normalized).0,
+        };
         let base_id = mermaid_safe_id(&label);
         // Disambiguate a rare id collision (two distinct subsystem names
         // that flatten to the same mermaid-safe id) with a numeric suffix
