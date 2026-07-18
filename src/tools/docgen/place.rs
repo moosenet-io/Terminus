@@ -75,6 +75,20 @@ impl PlacementReport {
     fn skip(&mut self, path: impl Into<String>, reason: impl Into<String>) {
         self.skipped.push(SkippedEntry { path: path.into(), reason: reason.into() });
     }
+
+    /// A report for a placement that was REFUSED as a whole before any file was
+    /// written -- e.g. the DLAND-CAP-01 no-loss guard withholding a cutover that
+    /// would drop content. Nothing written/unchanged; `reason` lands in
+    /// `gate_failures` (which by contract is non-empty iff the whole placement
+    /// was refused fail-closed).
+    pub fn withheld(reason: impl Into<String>) -> Self {
+        Self {
+            written: Vec::new(),
+            unchanged: Vec::new(),
+            skipped: Vec::new(),
+            gate_failures: vec![reason.into()],
+        }
+    }
 }
 
 /// Is `path` safe to join onto a `target_root` without ever escaping it? A
