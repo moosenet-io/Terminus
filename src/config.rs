@@ -1283,6 +1283,46 @@ pub fn constellation_cookie_secure() -> bool {
         .unwrap_or(false)
 }
 
+// ── GMQ-02: Gitea merge-queue config (per-base merge lock + FIFO ordering) ──
+//
+// `crate::gitea::merge_queue::MergeQueue` serializes merges to the same base
+// branch (see `docs/specs/S120-gitea-merge-queue.md`). It degrades open when
+// Redis is absent/unreachable, so these knobs only matter once Redis is
+// configured; all three are optional with safe defaults.
+
+/// Whether the merge-queue path is enabled. From `GITEA_MERGE_QUEUE_ENABLED`
+/// (`"true"`/`"1"` ⇒ true, anything else ⇒ false); defaults to `true` — once
+/// Redis is present the queue should protect concurrent merges by default,
+/// but an operator can flip this off (e.g. to rule it out while debugging)
+/// without unsetting `REDIS_URL` for every other Redis-backed feature.
+pub fn gitea_merge_queue_enabled() -> bool {
+    env_nonempty("GITEA_MERGE_QUEUE_ENABLED")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1"))
+        .unwrap_or(true)
+}
+
+/// Merge-lock TTL (seconds): the crash backstop that frees a holder's lock if
+/// it never releases (a crashed worker, a hung Gitea request). From
+/// `GITEA_MERGE_QUEUE_LOCK_TTL_SECS`; defaults to 120s. Must exceed a
+/// realistic merge time — a merge that runs longer than this can have its
+/// lock reclaimed by the next waiter while still in flight.
+pub fn gitea_merge_queue_lock_ttl_secs() -> u64 {
+    env_nonempty("GITEA_MERGE_QUEUE_LOCK_TTL_SECS")
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &u64| *n > 0)
+        .unwrap_or(120)
+}
+
+/// Max time (seconds) a waiter polls for its turn before giving up with a
+/// clear "queue busy, retry" instead of hanging indefinitely. From
+/// `GITEA_MERGE_QUEUE_MAX_WAIT_SECS`; defaults to 300s.
+pub fn gitea_merge_queue_max_wait_secs() -> u64 {
+    env_nonempty("GITEA_MERGE_QUEUE_MAX_WAIT_SECS")
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &u64| *n > 0)
+        .unwrap_or(300)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
