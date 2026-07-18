@@ -305,19 +305,29 @@ impl ReviewConfig {
         }
     }
 
-    /// TERM-DIFF-01: dispatch the `diffusion` provider -- a LOCAL, offline,
-    /// zero-cost review lens served by Chord's DiffusionGemma model at
+    /// TERM-DIFF-01/TERM-DIFF-AUTH: dispatch the `diffusion` provider -- a LOCAL,
+    /// offline, zero-cost review lens served by Chord's DiffusionGemma model at
     /// `CHORD_LLM_URL` (OpenAI-compatible chat-completions; see
     /// `src/meridian/tools.rs::synthesize_via_llm` for the exact call shape
-    /// this mirrors). Unlike `dispatch_openrouter`, there is NO bearer auth
-    /// (Chord's local endpoint is unauthenticated) and NO `guard_paid_model`
-    /// call (this lens costs nothing -- it's local inference, not a metered
-    /// API). Degrades cleanly on any failure, never panics.
+    /// this mirrors). Unlike `dispatch_openrouter`, there is NO `guard_paid_model`
+    /// call (this lens costs nothing -- it's local inference, not a metered API),
+    /// but Chord's proxy DOES require the same short-lived service JWT every
+    /// other authenticated hop to Chord uses -- minted here via
+    /// `crate::federation::mint_service_jwt`, the SAME helper
+    /// `compiler::idle_lease`'s Chord control calls and `inference_proxy`'s
+    /// `/v1/chat/completions` hop already use, signed with
+    /// `TERMINUS_PRIMARY_CHORD_JWT_SECRET` (never a literal; see the
+    /// `federation` module doc for why the secret/claims must match what
+    /// Chord's `auth_check`/`validate_jwt` expects). If that secret is unset,
+    /// this degrades cleanly (`"unavailable: ..."`) with NO network call,
+    /// mirroring the `CHORD_LLM_URL`-unset path -- never panics.
     pub async fn dispatch_diffusion(&self, prompt: &str) -> Result<String, String> {
         let url = chord_chat_url()?;
+        let jwt = crate::federation::mint_service_jwt().map_err(|e| format!("unavailable: {e}"))?;
         let client = Self::client().map_err(|e| format!("unavailable: {e}"))?;
         let resp = client
             .post(&url)
+            .bearer_auth(jwt)
             .json(&json!({
                 "model": diffusion_review_model(),
                 "messages": [{"role": "user", "content": prompt}],
@@ -661,13 +671,17 @@ mod tests {
     async fn dispatch_diffusion_returns_text_on_success() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
-            when.method(POST).path("/v1/chat/completions");
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .header_exists("Authorization");
             then.status(200).json_body(json!({
                 "choices": [{"message": {"content": "Looks fine.\nVERDICT: APPROVE"}}]
             }));
         });
         let prev = std::env::var("CHORD_LLM_URL").ok();
         std::env::set_var("CHORD_LLM_URL", server.base_url());
+        let prev_secret = std::env::var("TERMINUS_PRIMARY_CHORD_JWT_SECRET").ok();
+        std::env::set_var("TERMINUS_PRIMARY_CHORD_JWT_SECRET", "test-chord-shared-secret");
         let cfg = ReviewConfig {
             daemon_url: DEFAULT_DAEMON_URL.to_string(),
             daemon_token: None,
@@ -679,6 +693,89 @@ mod tests {
         match prev {
             Some(v) => std::env::set_var("CHORD_LLM_URL", v),
             None => std::env::remove_var("CHORD_LLM_URL"),
+        }
+        match prev_secret {
+            Some(v) => std::env::set_var("TERMINUS_PRIMARY_CHORD_JWT_SECRET", v),
+            None => std::env::remove_var("TERMINUS_PRIMARY_CHORD_JWT_SECRET"),
+        }
+    }
+
+    /// TERM-DIFF-AUTH: the diffusion dispatch must carry a `Bearer` JWT --
+    /// assert the mock server actually received an `Authorization: Bearer
+    /// <token>` header (not just "some header exists"), and that the token
+    /// is a well-formed 3-part JWT signed by the same shared secret Chord
+    /// would validate against.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dispatch_diffusion_sends_bearer_jwt() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                req.headers
+                    .as_ref()
+                    .and_then(|hs| hs.iter().find(|(k, _)| k.eq_ignore_ascii_case("authorization")))
+                    .map(|(_, v)| {
+                        let re = regex::Regex::new(
+                            r"^Bearer [A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$",
+                        )
+                        .unwrap();
+                        re.is_match(v)
+                    })
+                    .unwrap_or(false)
+            });
+            then.status(200).json_body(json!({
+                "choices": [{"message": {"content": "ok\nVERDICT: APPROVE"}}]
+            }));
+        });
+        let prev = std::env::var("CHORD_LLM_URL").ok();
+        std::env::set_var("CHORD_LLM_URL", server.base_url());
+        let prev_secret = std::env::var("TERMINUS_PRIMARY_CHORD_JWT_SECRET").ok();
+        std::env::set_var("TERMINUS_PRIMARY_CHORD_JWT_SECRET", "test-chord-shared-secret");
+        let cfg = ReviewConfig {
+            daemon_url: DEFAULT_DAEMON_URL.to_string(),
+            daemon_token: None,
+            openrouter_key: None,
+        };
+        let result = cfg.dispatch_diffusion("review this").await.unwrap();
+        assert_eq!(result, "ok\nVERDICT: APPROVE");
+        mock.assert();
+        match prev {
+            Some(v) => std::env::set_var("CHORD_LLM_URL", v),
+            None => std::env::remove_var("CHORD_LLM_URL"),
+        }
+        match prev_secret {
+            Some(v) => std::env::set_var("TERMINUS_PRIMARY_CHORD_JWT_SECRET", v),
+            None => std::env::remove_var("TERMINUS_PRIMARY_CHORD_JWT_SECRET"),
+        }
+    }
+
+    /// TERM-DIFF-AUTH: with `CHORD_LLM_URL` configured but
+    /// `TERMINUS_PRIMARY_CHORD_JWT_SECRET` unset, dispatch must degrade
+    /// cleanly (no JWT to sign with) WITHOUT making any network call --
+    /// point the URL at an unroutable address so a stray request would hang
+    /// rather than silently succeed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dispatch_diffusion_missing_secret_never_calls_network() {
+        let prev = std::env::var("CHORD_LLM_URL").ok();
+        std::env::set_var("CHORD_LLM_URL", "http://127.0.0.1:1"); // unroutable if actually dialed
+        let prev_secret = std::env::var("TERMINUS_PRIMARY_CHORD_JWT_SECRET").ok();
+        std::env::remove_var("TERMINUS_PRIMARY_CHORD_JWT_SECRET");
+        let cfg = ReviewConfig {
+            daemon_url: DEFAULT_DAEMON_URL.to_string(),
+            daemon_token: None,
+            openrouter_key: None,
+        };
+        let err = cfg.dispatch_diffusion("x").await.unwrap_err();
+        assert!(err.contains("unavailable"));
+        assert!(err.contains("TERMINUS_PRIMARY_CHORD_JWT_SECRET"));
+        match prev {
+            Some(v) => std::env::set_var("CHORD_LLM_URL", v),
+            None => std::env::remove_var("CHORD_LLM_URL"),
+        }
+        match prev_secret {
+            Some(v) => std::env::set_var("TERMINUS_PRIMARY_CHORD_JWT_SECRET", v),
+            None => std::env::remove_var("TERMINUS_PRIMARY_CHORD_JWT_SECRET"),
         }
     }
 
