@@ -1274,6 +1274,17 @@ failure, an I/O error) is recorded in `placement` (`gate_failures`/`skipped`),
 never turned into an `Err` or a panic, and never reverts a merge or fails the
 build.
 
+**No-loss guard on the placement path (DLAND-CAP-01).** Because this automatic
+door overwrites a real `README.md`, it enforces the same DLAND-02 no-loss
+guarantee as `docgen_backfill`: before placing, `run_docgen_trigger` reads the
+target's current `README.md` (using it both to *deepen* generation and to
+check preservation), runs `check_preservation`, and **withholds the whole
+cutover** — writing nothing and recording the dropped sections in
+`placement.gate_failures` — if any old section's substance would be lost. An
+absent README is a safe first-doc (placed normally); a present-but-unreadable
+README is never overwritten. So a passing capstone can never silently drop
+content from a not-yet-migrated bloated README.
+
 `review_run`'s post-capstone doc hook (KGREV-03, above) is the first caller
 of this opt-in path: when a passing epic capstone's context carries
 `repo_path`, it passes `place: true` + `target_root: repo_path` through to

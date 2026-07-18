@@ -93,7 +93,8 @@ use crate::tool::RustTool;
 use super::config::{DocTargetType, ProjectDocConfig};
 use super::generate::{generate_docs, ChordDocGenerator, DocGenerator, GenerationOutcome, SweptFeatContext};
 use super::pii_gate::sweep_input;
-use super::place::{place_docs, PlacementReport};
+use super::place::{place_docs, PlacementReport, README_PATH};
+use super::preserve::check_preservation;
 use super::render::{render_all, RenderContext, RenderOutcome};
 use super::versioning::{ArtifactKey, ArtifactVersion, VersionStore};
 
@@ -319,8 +320,26 @@ not invoked"
     };
     let feat_context = SweptFeatContext::from_gate_outcome(&gate_outcome);
 
+    // DLAND-CAP-01: when we will PLACE into a working tree, read the current
+    // README up front -- it feeds BOTH generation (deepen, not regenerate) and
+    // the no-loss preservation check below, before any overwrite. Distinguish
+    // ABSENT (first-ever doc, nothing to lose -> `None`) from PRESENT-BUT-
+    // UNREADABLE (`Some(Err)` -> never overwrite it).
+    let place_readme: Option<Result<String, std::io::Error>> = match (place, target_root) {
+        (true, Some(root)) => match std::fs::read_to_string(std::path::Path::new(root).join(README_PATH)) {
+            Ok(s) => Some(Ok(s)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => Some(Err(e)),
+        },
+        _ => None,
+    };
+    // Prefer a caller-supplied existing_docs; otherwise deepen from the README
+    // we just read for the placement path (never regenerate from scratch).
+    let effective_existing_docs = existing_docs
+        .or_else(|| place_readme.as_ref().and_then(|r| r.as_ref().ok()).map(String::as_str));
+
     // DOCGEN-05: generate (deepen) docs via Chord.
-    let generation = match generate_docs(generator, module_path, git_ref, existing_docs, &feat_context).await {
+    let generation = match generate_docs(generator, module_path, git_ref, effective_existing_docs, &feat_context).await {
         Ok(outcome) => outcome,
         Err(e) => {
             return TriggerOutcome::Failed {
@@ -372,11 +391,49 @@ not invoked"
     // `PlacementReport`, never turned into an `Err`/panic, and never changes
     // the fact that generation+rendering already completed successfully.
     let placement = match (place, target_root) {
-        (true, Some(root)) => render
-            .rendered()
-            .find(|a| a.target_type == DocTargetType::Readme)
-            .and_then(|a| a.content.clone())
-            .map(|landing| place_docs(std::path::Path::new(root), &landing, &render.docs_tree)),
+        (true, Some(root)) => {
+            let landing = render
+                .rendered()
+                .find(|a| a.target_type == DocTargetType::Readme)
+                .and_then(|a| a.content.clone());
+            match landing {
+                // No readme target rendered -> nothing to place.
+                None => None,
+                Some(landing) => {
+                    let root_path = std::path::Path::new(root);
+                    // DLAND-CAP-01: the automatic capstone placement door must
+                    // enforce the DLAND-02 no-loss guarantee, exactly like
+                    // docgen_backfill -- it must never silently overwrite a
+                    // bloated README and drop content that isn't preserved.
+                    match &place_readme {
+                        // First-ever doc: nothing to lose, place normally.
+                        None => Some(place_docs(root_path, &landing, &render.docs_tree)),
+                        // Existing README unreadable: never overwrite it.
+                        Some(Err(e)) => Some(PlacementReport::withheld(format!(
+                            "no-loss guard: the existing README at the target could not be read ({e}); \
+refusing to overwrite unreadable content -- an operator must inspect it"
+                        ))),
+                        // Existing README present: run the no-loss guard and
+                        // WITHHOLD the cutover if any section would be dropped.
+                        Some(Ok(old_readme)) => {
+                            let pres = check_preservation(old_readme, &landing, &render.docs_tree);
+                            if pres.missing.is_empty() {
+                                Some(place_docs(root_path, &landing, &render.docs_tree))
+                            } else {
+                                let heads: Vec<String> =
+                                    pres.missing.iter().map(|s| s.heading.clone()).collect();
+                                Some(PlacementReport::withheld(format!(
+                                    "no-loss guard withheld the cutover: {} old README section(s) would be \
+dropped ({}); not overwriting -- migrate via docgen_backfill under operator review",
+                                    heads.len(),
+                                    heads.join(", ")
+                                )))
+                            }
+                        }
+                    }
+                }
+            }
+        }
         _ => None,
     };
 
@@ -939,6 +996,108 @@ duration of a real end-to-end run.",
         assert!(root.join("README.md").exists());
         assert!(root.join("docs/index.md").exists());
         assert!(root.join("docs/getting-started.md").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── DLAND-CAP-01: the capstone placement door enforces the no-loss guard ──
+
+    #[tokio::test]
+    async fn place_withholds_the_cutover_when_the_no_loss_guard_flags_a_dropped_section() {
+        // An EXISTING README whose feature tokens are NOT preserved in the
+        // generated landing/docs must NOT be overwritten -- the automatic
+        // placement door enforces the same DLAND-02 no-loss guard as backfill.
+        let root = unique_tmp_dir("cap01-withhold");
+        let old = "# App\n\n## Telemetry\n\nSet `WIDGET_TELEMETRY_ENDPOINT` to enable `submit_metrics()`.\n";
+        std::fs::write(root.join("README.md"), old).unwrap();
+
+        // Generated content never mentions the Telemetry tokens.
+        let generator = MockDocGenerator::ok(
+            "# App\n\nA tidy app.\n\n## Quickstart\n\nRun `app run` to start.\n\n## Deep Dive\n\nInternals.\n",
+        );
+        let store = VersionStore::new();
+        let outcome = run_docgen_trigger(
+            &generator, &store, "TERM", "src/tools/docgen", "cap01a", None,
+            "feat", Some(&readme_config()), &BTreeSet::new(), "2026-07-11T00:00:00Z",
+            true, Some(root.to_str().unwrap()),
+        ).await;
+
+        match outcome {
+            TriggerOutcome::Completed { placement, .. } => {
+                let p = placement.expect("place=true must produce a PlacementReport");
+                assert!(p.written.is_empty(), "nothing should be written: {:?}", p.written);
+                assert_eq!(p.gate_failures.len(), 1, "{:?}", p.gate_failures);
+                assert!(p.gate_failures[0].contains("no-loss guard withheld"), "{}", p.gate_failures[0]);
+                assert!(p.gate_failures[0].contains("Telemetry"), "{}", p.gate_failures[0]);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        // The old README is byte-for-byte intact -- nothing dropped.
+        assert_eq!(std::fs::read_to_string(root.join("README.md")).unwrap(), old);
+        assert!(!root.join("docs").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn place_proceeds_when_the_no_loss_guard_is_satisfied() {
+        // An existing README whose stable token DOES resurface in the new
+        // hierarchy is safely migrated (placed).
+        let root = unique_tmp_dir("cap01-place");
+        std::fs::write(root.join("README.md"), "# App\n\n## Auth\n\nUse `FLUX_TOKEN` to authenticate.\n").unwrap();
+
+        // Generated content preserves FLUX_TOKEN (in the quickstart layer).
+        let generator = MockDocGenerator::ok(
+            "# App\n\nAn app.\n\n## Quickstart\n\nSet `FLUX_TOKEN`, then run `app`.\n\n## Deep Dive\n\nMore on `FLUX_TOKEN`.\n",
+        );
+        let store = VersionStore::new();
+        let outcome = run_docgen_trigger(
+            &generator, &store, "TERM", "src/tools/docgen", "cap01b", None,
+            "feat", Some(&readme_config()), &BTreeSet::new(), "2026-07-11T00:00:00Z",
+            true, Some(root.to_str().unwrap()),
+        ).await;
+
+        match outcome {
+            TriggerOutcome::Completed { placement, .. } => {
+                let p = placement.expect("place=true must produce a PlacementReport");
+                assert!(p.gate_failures.is_empty(), "should NOT withhold when preserved: {:?}", p.gate_failures);
+                assert!(p.written.contains(&"README.md".to_string()), "{:?}", p.written);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert!(root.join("README.md").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn place_withholds_when_the_existing_readme_is_unreadable() {
+        // A present-but-unreadable (invalid UTF-8) README must never be
+        // overwritten -- content we could not even read must not be lost.
+        let root = unique_tmp_dir("cap01-unreadable");
+        std::fs::write(root.join("README.md"), [0xff, 0xfe, 0x00, 0x9f]).unwrap();
+        let before = std::fs::read(root.join("README.md")).unwrap();
+
+        let generator = MockDocGenerator::ok(
+            "# App\n\nApp.\n\n## Quickstart\n\nRun `app`.\n\n## Deep Dive\n\nInternals.\n",
+        );
+        let store = VersionStore::new();
+        let outcome = run_docgen_trigger(
+            &generator, &store, "TERM", "src/tools/docgen", "cap01c", None,
+            "feat", Some(&readme_config()), &BTreeSet::new(), "2026-07-11T00:00:00Z",
+            true, Some(root.to_str().unwrap()),
+        ).await;
+
+        match outcome {
+            TriggerOutcome::Completed { placement, .. } => {
+                let p = placement.expect("place=true must produce a PlacementReport");
+                assert!(p.written.is_empty());
+                assert_eq!(p.gate_failures.len(), 1);
+                assert!(p.gate_failures[0].contains("could not be read"), "{}", p.gate_failures[0]);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(root.join("README.md")).unwrap(), before);
 
         std::fs::remove_dir_all(&root).ok();
     }
