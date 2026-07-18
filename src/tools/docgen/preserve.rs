@@ -75,7 +75,7 @@ pub struct Section {
 /// covered, which were not, and the overall ratio. This is DATA the caller
 /// surfaces to an operator before a cutover ships -- this module never acts
 /// on it (no auto-fail, no auto-block) beyond producing it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PreservationReport {
     /// Labels of every old section whose substance was found in the new
     /// corpus (by heading match or token-signature match).
