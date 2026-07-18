@@ -41,6 +41,7 @@
 //! to the generation/render items that actually call out to Chord or a
 //! target's API.
 
+pub mod backfill;
 pub mod changelog;
 pub mod config;
 pub mod crate_graph;
@@ -93,6 +94,7 @@ pub use readme_layers::{
 pub use render::docs_tree::{build_docs_tree, DocsTreeFile};
 pub use render::{render_all, RenderContext, RenderOutcome, RenderedArtifact};
 pub use trigger::{run_docgen_trigger, DocgenRun, TriggerOutcome};
+pub use backfill::{backfill_readme, BackfillReport, DocgenBackfill};
 
 /// `docgen_status` -- report how the doc engine would interpret a project's
 /// declared (or absent) doc-target config: which targets it declares (or
@@ -192,6 +194,7 @@ pub fn register(registry: &mut ToolRegistry) {
     changelog::register(registry);
     drift::register(registry);
     trigger::register(registry);
+    backfill::register(registry);
 }
 
 #[cfg(test)]
@@ -204,6 +207,7 @@ mod tests {
         "docgen_generate_changelog",
         "docgen_drift_check",
         "docgen_run",
+        "docgen_backfill",
     ];
 
     #[test]
