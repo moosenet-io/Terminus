@@ -762,6 +762,16 @@ pub async fn mint_runs(Query(q): Query<RunsQuery>) -> Response {
     let (limit, offset) = paginate(q.limit, q.offset);
     let suite = q.suite.as_deref().unwrap_or("code");
 
+    // Validate the suite enum BEFORE the DB check so an unrecognized suite is a
+    // 400 even when no DB is configured (otherwise it would silently degrade to
+    // an empty 200 — see mint_runs_rejects_unknown_suite_with_400).
+    if !matches!(suite, "code" | "context" | "agent") {
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            json!({"error": format!("unrecognized suite '{suite}' (expected one of: code, context, agent)")}),
+        );
+    }
+
     let Some(pool) = pool_or_none().await else {
         return json_ok(json!({"total": 0, "runs": []}));
     };
