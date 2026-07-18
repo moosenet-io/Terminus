@@ -174,7 +174,32 @@ pub async fn backfill_readme(
     generated_at: &str,
     target_root: &Path,
 ) -> BackfillReport {
-    let old_readme = std::fs::read_to_string(target_root.join(README_PATH)).ok();
+    let old_readme = match std::fs::read_to_string(target_root.join(README_PATH)) {
+        Ok(s) => Some(s),
+        // Genuinely absent -> a first-ever doc, nothing to preserve, safe to place.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        // The README EXISTS but could not be read (non-UTF8, permissions, I/O
+        // error). Treating this as "no old README" would let the backfill
+        // OVERWRITE content it never got to preserve -- the exact no-loss
+        // violation this tool exists to prevent. Refuse to place and hand it to
+        // the operator to inspect, rather than silently clobbering it.
+        Err(e) => {
+            return BackfillReport {
+                old_readme_existed: true,
+                old_readme_lines: 0,
+                new_landing_lines: None,
+                coverage_ratio: 0.0,
+                missing: Vec::new(),
+                docs_files_created: Vec::new(),
+                placed: false,
+                gate_failures: Vec::new(),
+                summary: format!(
+                    "refused: the existing README.md at the target could not be read ({e}); \
+not overwriting unreadable content -- an operator must inspect it before backfilling"
+                ),
+            };
+        }
+    };
     let old_readme_existed = old_readme.is_some();
     let old_readme_lines = old_readme.as_deref().map(landing_line_count).unwrap_or(0);
 
@@ -676,6 +701,47 @@ mod tests {
         let on_disk = std::fs::read_to_string(root.join("README.md")).unwrap();
         assert_eq!(on_disk, old_readme, "a dropped section must never overwrite the old README");
         assert!(!root.join("docs").exists(), "no docs/ tree should have been written either");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── An EXISTING but unreadable README is never overwritten ──────────
+
+    #[tokio::test]
+    async fn backfill_refuses_to_place_when_the_existing_readme_is_unreadable() {
+        // codex review: a present-but-unreadable README (here: invalid UTF-8)
+        // must NOT be treated like an absent one -- overwriting it would lose
+        // content the no-loss guard never got to inspect.
+        let root = unique_tmp_dir("unreadable-readme");
+        // Invalid UTF-8 bytes: read_to_string fails with InvalidData, not NotFound.
+        std::fs::write(root.join("README.md"), [0xff, 0xfe, 0x00, 0x9f, 0x28]).unwrap();
+        let before = std::fs::read(root.join("README.md")).unwrap();
+
+        let generator = MockDocGenerator::new(
+            "# Widget\n\n## Quickstart\n\nRun `cargo install widget_cli`.\n",
+        );
+        let store = VersionStore::new();
+
+        let report = backfill_readme(
+            &generator,
+            &store,
+            "TERM",
+            ".",
+            "backfill-unreadable",
+            "one-shot backfill against an unreadable README",
+            Some(&readme_config()),
+            &BTreeSet::new(),
+            "2026-07-18T00:00:00Z",
+            &root,
+        )
+        .await;
+
+        assert!(!report.placed, "must never place over an unreadable README: {}", report.summary);
+        assert!(report.old_readme_existed);
+        assert!(report.summary.contains("refused"), "summary: {}", report.summary);
+        // The original bytes are byte-for-byte untouched; no docs/ tree written.
+        assert_eq!(std::fs::read(root.join("README.md")).unwrap(), before);
+        assert!(!root.join("docs").exists());
 
         std::fs::remove_dir_all(&root).ok();
     }
