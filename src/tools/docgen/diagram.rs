@@ -665,11 +665,21 @@ fn build_subsystem_mermaid(facts: &RepoFacts, max_nodes: usize) -> Result<SweptD
     // PII pattern before the sweep ever runs) -- the exact bypass
     // `default_architecture_mermaid_source`'s own doc comment warns about,
     // and the one DGRICH-04's TEST PLAN item 3 exists to catch.
+    //
+    // The name is boundary-normalized (see
+    // `boundary_normalize_for_pii_detection`) BEFORE it is swept: an
+    // identifier-glued IP (`svc_` immediately followed by a dotted-quad
+    // private address) has no regex word boundary
+    // between the `_` and the leading digit, so the raw name would sail
+    // through `sweep_input` untouched -- normalizing `_`/`-` to a space
+    // first gives the `\b`-anchored patterns a real boundary to match
+    // against without disturbing the dots the IP pattern itself needs.
     let mut sanitized_label: BTreeMap<String, String> = BTreeMap::new();
     let mut sanitized_id: BTreeMap<String, String> = BTreeMap::new();
     let mut used_ids: BTreeSet<String> = BTreeSet::new();
     for s in &kept {
-        let outcome = sweep_input(&s.name)?;
+        let normalized = boundary_normalize_for_pii_detection(&s.name);
+        let outcome = sweep_input(&normalized)?;
         let label = outcome.sanitized_content().to_string();
         let base_id = mermaid_safe_id(&label);
         // Disambiguate a rare id collision (two distinct subsystem names
@@ -731,6 +741,31 @@ pub fn subsystem_architecture_mermaid_source(facts: &RepoFacts) -> Result<SweptD
 /// node budget only.
 pub fn full_subsystem_architecture_mermaid_source(facts: &RepoFacts) -> Result<SweptDiagramSource, ToolError> {
     build_subsystem_mermaid(facts, ARCHITECTURE_MAX_DIAGRAM_NODES)
+}
+
+/// Replace `_`/`-` glue characters in `raw` with a plain space, leaving
+/// every other character (including `.`) untouched.
+///
+/// Review finding (DGRICH-04 gate): the canonical `private_ip` pattern (and
+/// every other `\b`-anchored built-in PII pattern) requires a real regex
+/// word boundary at both ends of the match. A subsystem name is a
+/// `crate::<mod>`-derived identifier, so an adversarial or coincidental
+/// name (e.g. `svc_` immediately followed by a dotted-quad private
+/// address) glues the IP directly onto a preceding identifier segment with
+/// an underscore -- and `_` is itself a word character, so there is NO
+/// boundary between the identifier and the digits that follow it, and
+/// `sweep_input`/`scan_and_redact` silently pass the IP through unchanged.
+/// Swapping `_`/`-` for a space restores a real boundary at every such
+/// glue point WITHOUT touching the dots inside the IP itself (which the
+/// pattern still needs intact to match `NNN.NNN.NNN.NNN`), so this is
+/// belt-and-suspenders normalization applied before every sweep in this
+/// function, not a new detection mechanism of its own. Real subsystem
+/// names are dot-free identifiers, so in the common case this is a no-op
+/// beyond turning `_`/`-` into a space in the printed label -- cosmetically
+/// harmless, and `mermaid_safe_id` flattens that space right back to `_`
+/// when deriving the node id, so a clean name's id is unchanged either way.
+fn boundary_normalize_for_pii_detection(raw: &str) -> String {
+    raw.chars().map(|c| if c == '_' || c == '-' { ' ' } else { c }).collect()
 }
 
 /// `\(\d+ symbols\)` -- matches this module's `name (n symbols)` real-node
