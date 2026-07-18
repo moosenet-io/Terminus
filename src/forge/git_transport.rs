@@ -116,8 +116,14 @@ impl GitPrivatePush {
         let remote = format!("{base}/{owner}/{repo}.git");
 
         // ── Push the imported ref ──
-        let local_ref = format!("refs/heads/{ref_name}");
-        let remote_ref = format!("refs/heads/{ref_name}");
+        // codex (git_private_push review): `import_bundle_ref` normalises a
+        // fully-qualified `refs/heads/<b>` down to the bare `<b>` local branch,
+        // so the push refspec MUST use that same normalised name — building it
+        // from the raw `ref_name` double-prefixed (`refs/heads/refs/heads/<b>`)
+        // when the caller passed a fully-qualified ref.
+        let short_ref = ref_name.strip_prefix("refs/heads/").unwrap_or(&ref_name);
+        let local_ref = format!("refs/heads/{short_ref}");
+        let remote_ref = format!("refs/heads/{short_ref}");
         push_ref(tmp.path(), &remote, &local_ref, &remote_ref, &token, force)?;
 
         Ok(json!({
@@ -280,19 +286,21 @@ fn find_bundle_ref(list_heads_output: &str, short_ref: &str) -> Option<String> {
         .lines()
         .filter_map(|l| l.split_whitespace().nth(1))
         .collect();
+    // codex (git_private_push review): match EXACTLY — a privileged push tool
+    // must never guess which source ref the caller meant. Only an exact
+    // `refs/heads/<ref>` or a bare `<ref>` full-ref name is accepted; the old
+    // "any ref ending in /<ref>" fallback could silently select the wrong ref
+    // (e.g. `refs/heads/team/topic` for `topic`, or an ambiguous suffix match),
+    // so it is removed. Not found exactly → None (caller fails cleanly).
     // 1. exact refs/heads/<ref>
     if let Some(r) = refs.iter().find(|r| **r == target_full) {
         return Some((*r).to_string());
     }
-    // 2. bare <ref>
+    // 2. bare <ref> (a bundle that stored the ref unqualified)
     if let Some(r) = refs.iter().find(|r| **r == short_ref) {
         return Some((*r).to_string());
     }
-    // 3. anything ending in /<ref>
-    let suffix = format!("/{short_ref}");
-    refs.iter()
-        .find(|r| r.ends_with(&suffix))
-        .map(|r| (*r).to_string())
+    None
 }
 
 // ── Push (credential injected via GIT_ASKPASS) ──────────────────────────────

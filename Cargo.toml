@@ -52,6 +52,7 @@ default = []
 tsnet = ["dep:tsnet"]
 
 [dependencies]
+tempfile = "3"
 # MESH-04: optional, feature-gated in-process Tailscale embedding
 # (`crate::mesh::tailnet`, compiled ONLY under the `tsnet` feature above).
 # Binding chosen (per that module's "decide and record" doc section): the
