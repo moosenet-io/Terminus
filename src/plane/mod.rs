@@ -1181,22 +1181,41 @@ impl RustTool for PlaneListProjects {
         }))
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    // TERM-PREREQ-PLANE-LISTPROJECTS (unblocks HCAT-34 / HCAT-32): expose a
+    // typed structured response so egress callers (harmony `PlaneClient::
+    // list_projects`) recover a `Vec<Project>` without text-scraping. Shape
+    // mirrors `plane_list_work_items`: `{ total, shown, items: [Project…] }`.
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl PlaneListProjects {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let url = format!("{}projects/", client.workspace_url());
         debug!("plane_list_projects GET {url}");
         let body = client.get_json_cached(&url).await?;
         let list: ApiList<Project> = serde_json::from_str(&body)
             .map_err(|e| ToolError::Http(format!("Failed to parse projects: {e}")))?;
+        let total = list.total_count();
         let items = list.into_items();
+        // `Project` is `Serialize`; the structured payload is the same typed
+        // objects harmony deserializes back into `Vec<Project>`. Projects are
+        // not paginated/limited here, so `shown == items.len()`.
+        let structured = json!({ "total": total, "shown": items.len(), "items": items });
         if items.is_empty() {
-            return Ok("No projects found in workspace".into());
+            return Ok(("No projects found in workspace".into(), structured));
         }
         let mut out = format!("Found {} project(s):\n", items.len());
         for p in &items {
             out.push_str(&format!("  [{id}] {name} ({identifier})\n",
                 id = p.id, name = p.name, identifier = p.identifier));
         }
-        Ok(out)
+        Ok((out, structured))
     }
 }
 
@@ -3533,6 +3552,33 @@ mod tests {
         let tool = PlaneListProjects { client };
         let _ = tool.execute(json!({})).await;
         mock.assert();
+    }
+
+    // TERM-PREREQ-PLANE-LISTPROJECTS: execute_structured returns a typed
+    // { total, shown, items:[Project] } payload egress callers can deserialize.
+    #[tokio::test]
+    async fn test_list_projects_execute_structured_returns_typed_items() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/workspaces/testws/projects/");
+            then.status(200).json_body(json!([
+                {"id": "uuid-lm", "name": "Lumina Core", "identifier": "LM", "network": 0},
+                {"id": "uuid-tm", "name": "Terminus", "identifier": "TERM", "network": 0}
+            ]));
+        });
+        let client = mock_client(&server);
+        let tool = PlaneListProjects { client };
+        let out = tool.execute_structured(json!({})).await.unwrap();
+        mock.assert();
+        assert!(out.text.contains("Lumina Core"), "text: {}", out.text);
+        let s = out.structured.expect("structured payload present");
+        assert_eq!(s["total"], 2);
+        assert_eq!(s["shown"], 2);
+        let items = s["items"].as_array().expect("items array");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["identifier"], "LM");
+        assert_eq!(items[0]["id"], "uuid-lm");
+        assert_eq!(items[1]["identifier"], "TERM");
     }
 
     #[tokio::test]
