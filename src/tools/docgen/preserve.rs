@@ -107,10 +107,13 @@ impl PreservationReport {
 
 /// One raw section parsed out of the OLD README: its heading text (empty
 /// for the "no `##` headings at all" edge case, see [`split_old_sections`])
-/// and its body. Internal to the no-loss guard's token comparison.
-struct RawSection {
-    heading: String,
-    body: String,
+/// and its body. `pub(crate)` (DGRICH-01): [`super::repo_facts`] reuses this
+/// same splitter for `RepoFacts::old_readme_sections` rather than adding a
+/// second old-README parser -- this module's own no-loss token comparison
+/// remains the only thing that constructs a [`PreservationReport`] from it.
+pub(crate) struct RawSection {
+    pub(crate) heading: String,
+    pub(crate) body: String,
 }
 
 /// Split the OLD README into its top-level (`## `) sections. Per the spec's
@@ -128,7 +131,7 @@ struct RawSection {
 /// (`backfill.rs`) deliberately uses a separate byte-offset slicer instead,
 /// because relocating a section verbatim needs its exact source bytes, not a
 /// whitespace-trimmed heading+body.
-fn split_old_sections(content: &str) -> Vec<RawSection> {
+pub(crate) fn split_old_sections(content: &str) -> Vec<RawSection> {
     let mut sections = Vec::new();
     let mut current_heading: Option<String> = None;
     let mut current_body = String::new();
