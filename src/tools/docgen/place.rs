@@ -416,40 +416,30 @@ mod tests {
 
     // ── Read-only target: per-file I/O error surfaced in skipped, no panic ──
 
-    #[cfg(unix)]
     #[test]
-    fn place_docs_surfaces_io_error_for_readonly_target_without_panicking() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = unique_tmp_dir("readonly");
-        let mut perms = std::fs::metadata(&root).unwrap().permissions();
-        perms.set_mode(0o555); // read+execute, no write
-        std::fs::set_permissions(&root, perms).unwrap();
-
-        // Root bypasses the read-only mode bit entirely (as in CI/build hosts
-        // that run tests as root), so the write would succeed and there would
-        // be no io error to surface. This test only means anything when the
-        // filesystem actually enforces the permission — probe for that and
-        // skip cleanly otherwise rather than asserting a denial the OS won't
-        // produce.
-        let enforces_readonly = std::fs::File::create(root.join(".write-probe")).is_err();
-        if !enforces_readonly {
-            let mut restore = std::fs::metadata(&root).unwrap().permissions();
-            restore.set_mode(0o755);
-            std::fs::set_permissions(&root, restore).unwrap();
-            std::fs::remove_dir_all(&root).ok();
-            return;
-        }
+    fn place_docs_surfaces_io_error_when_readme_path_is_blocked_by_a_directory() {
+        // Force a write failure that is deterministic across every uid and
+        // filesystem — including a build host that runs tests as root, where a
+        // read-only *mode bit* would simply be bypassed. Pre-create README.md
+        // AS A NON-EMPTY DIRECTORY: renaming the freshly-written temp file onto
+        // that path then fails (IsADirectory / DirectoryNotEmpty) for root too.
+        // place_docs must surface this as a skipped entry, never a panic.
+        let root = unique_tmp_dir("readme-blocked");
+        std::fs::create_dir_all(root.join(README_PATH).join("occupied")).unwrap();
 
         let report = place_docs(&root, "# Hello\n", &[]);
 
-        // Restore write permission before cleanup, regardless of outcome.
-        let mut restore = std::fs::metadata(&root).unwrap().permissions();
-        restore.set_mode(0o755);
-        std::fs::set_permissions(&root, restore).unwrap();
-
-        assert!(report.written.is_empty());
-        assert_eq!(report.skipped.len(), 1);
+        assert!(
+            report.written.is_empty(),
+            "nothing should be written when the README path is blocked: {:?}",
+            report.written
+        );
+        assert_eq!(
+            report.skipped.len(),
+            1,
+            "the blocked README should be the single skipped entry: {:?}",
+            report.skipped
+        );
         assert_eq!(report.skipped[0].path, README_PATH);
 
         std::fs::remove_dir_all(&root).ok();
