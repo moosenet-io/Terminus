@@ -32,10 +32,32 @@
 //! from CONST-02 — `crate::constellation::proxy`'s audit-attribution call
 //! site and `constellation-web`'s `aggregationClient.ts` contract needed no
 //! changes for this item.
+//!
+//! ## CONST-27: viewer role
+//!
+//! Extends the above with a **`role` claim** in the same session JWT (§3.4)
+//! rather than a new auth system:
+//! - [`auth_login`] checks the submitted password against
+//!   `CONSTELLATION_OPERATOR_SECRET` first (role [`Role::Operator`] on
+//!   match), then `CONSTELLATION_VIEWER_SECRET` (role [`Role::Viewer`] on
+//!   match) — both constant-time, both fail-closed when their respective
+//!   secret is unset (an unconfigured viewer secret simply disables that
+//!   tier; it never falls back to a default-allow).
+//! - [`Role::from_claim`] treats a claim-ABSENT token as [`Role::Operator`]
+//!   — backward compatible with sessions minted before this item shipped, so
+//!   a live session survives the deploy instead of being silently
+//!   downgraded.
+//! - [`enforce_viewer_role_gate`] is the ONE server-side enforcement point
+//!   (structural, not cosmetic): a viewer session gets `403
+//!   {"error":"forbidden","required_role":"operator"}` on every mutating
+//!   method (`POST`/`PUT`/`PATCH`/`DELETE`) reaching a route wrapped by it —
+//!   see `crate::constellation::mod::protected_router`'s layering. The UI's
+//!   `RoleGate` (`constellation-web/src/components/RoleGate.tsx`) is a
+//!   courtesy layer only; this is what actually enforces it.
 
 use axum::body::Bytes;
 use axum::extract::Request;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -43,12 +65,52 @@ use serde_json::json;
 
 const SESSION_COOKIE: &str = "constellation_session";
 
+/// A session's access tier (CONST-27, §3.4). No third role, no per-module
+/// ACLs (YAGNI — single-operator fleet, per the spec).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// Full read/write access — every protected route.
+    Operator,
+    /// Read-only: mutating methods are rejected server-side by
+    /// [`enforce_viewer_role_gate`] regardless of what the UI shows.
+    Viewer,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Operator => "operator",
+            Role::Viewer => "viewer",
+        }
+    }
+
+    /// Resolve a decoded JWT's `role` claim into a [`Role`]. A claim-absent
+    /// token (`None` — every session minted before CONST-27, and every
+    /// enrollment JWT that happens to share this signing key) resolves to
+    /// [`Role::Operator`]: that is the ONLY tier that existed before this
+    /// item, so treating "no claim" as anything else would silently log out
+    /// (downgrade) every live operator session on deploy. Any unrecognized
+    /// string value (defensive — should never happen for a token this
+    /// crate minted) also resolves to [`Role::Operator`] for the same
+    /// backward-compatibility reason; only an explicit `"viewer"` claim ever
+    /// narrows access.
+    pub fn from_claim(claim: Option<&str>) -> Role {
+        match claim {
+            Some("viewer") => Role::Viewer,
+            _ => Role::Operator,
+        }
+    }
+}
+
 /// The resolved, VERIFIED session identity for one request — populated only
 /// from a signature+expiry-checked JWT (see [`session_from_cookie`]), never
 /// from an unsigned cookie value.
 #[derive(Debug, Clone)]
 pub struct SessionSeam {
     pub username: String,
+    /// CONST-27: the session's access tier, from the JWT's `role` claim
+    /// (absent ⇒ [`Role::Operator`], see [`Role::from_claim`]).
+    pub role: Role,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,14 +123,25 @@ struct LoginRequest {
 
 fn auth_me_body(seam: Option<&SessionSeam>) -> serde_json::Value {
     match seam {
-        Some(s) => json!({"authenticated": true, "username": s.username}),
-        None => json!({"authenticated": false, "username": null}),
+        // CONST-27: `role` lets the shell gate at render time (§3.4) — this is the
+        // cosmetic/UI signal only, never the enforcement (see `enforce_viewer_role_gate`).
+        Some(s) => json!({"authenticated": true, "username": s.username, "role": s.role.as_str()}),
+        None => json!({"authenticated": false, "username": null, "role": null}),
     }
 }
 
 fn unauthorized_response() -> Response {
     let masked = crate::constellation::mask::mask_response(json!({"error": "unauthorized"}));
     (StatusCode::UNAUTHORIZED, [("content-type", "application/json")], masked.to_string()).into_response()
+}
+
+/// CONST-27: the structural 403 a viewer session gets on a mutating request
+/// to a protected route — see [`enforce_viewer_role_gate`].
+fn forbidden_response() -> Response {
+    let masked = crate::constellation::mask::mask_response(
+        json!({"error": "forbidden", "required_role": "operator"}),
+    );
+    (StatusCode::FORBIDDEN, [("content-type", "application/json")], masked.to_string()).into_response()
 }
 
 /// Extract a [`SessionSeam`] from the request's `Cookie` header, when
@@ -104,7 +177,13 @@ fn session_from_cookie(headers: &HeaderMap) -> Option<SessionSeam> {
 /// token itself) and resolves to `None` — no partial trust.
 fn verify_session_token(token: &str) -> Option<SessionSeam> {
     match crate::pki::enroll::verify_jwt(token) {
-        Ok(claims) => Some(SessionSeam { username: claims.sub }),
+        Ok(claims) => Some(SessionSeam {
+            username: claims.sub,
+            // CONST-27: claim-absent (`None`) resolves to `Role::Operator` —
+            // see `Role::from_claim`'s doc for why that's the correct
+            // backward-compatible default.
+            role: Role::from_claim(claims.role.as_deref()),
+        }),
         Err(e) => {
             tracing::warn!("constellation::auth: rejected session token: {e}");
             None
@@ -162,30 +241,59 @@ pub async fn auth_login(headers: HeaderMap, body: Bytes) -> Response {
         return unauthorized_response();
     }
 
-    // Fail-closed: no configured operator secret means NO login can ever
-    // succeed, never a default-allow. This is deliberately checked before
-    // touching the submitted password so an unconfigured deployment always
-    // takes the same code path regardless of what's submitted.
-    let Some(operator_secret) = crate::config::constellation_operator_secret() else {
+    // CONST-27 (§3.4): check the operator secret first, then the viewer
+    // secret. Both are read fresh per-login (not cached) so an operator can
+    // provision/rotate either one live. Neither being configured is the
+    // pre-CONST-27 fail-closed posture generalized to two tiers -- an unset
+    // tier's secret can never match ANY submitted password, so that tier
+    // simply never succeeds a login, never a default-allow.
+    let operator_secret = crate::config::constellation_operator_secret();
+    let viewer_secret = crate::config::constellation_viewer_secret();
+
+    // Edge case (spec §10 CONST-27): an operator who configures the SAME
+    // value for both secrets doesn't get a viewer session ever -- the
+    // operator check below runs first and wins on any match. Surfaced as a
+    // warning (never blocks the login) so a misconfiguration is visible in
+    // logs rather than silently doing something unexpected.
+    if let (Some(op), Some(vw)) = (&operator_secret, &viewer_secret) {
+        if op == vw {
+            tracing::warn!(
+                "constellation::auth: CONSTELLATION_OPERATOR_SECRET and CONSTELLATION_VIEWER_SECRET \
+                 are configured to the same value -- the operator tier always wins on a match, so \
+                 the viewer tier is effectively unreachable; provision a distinct viewer secret"
+            );
+        }
+    }
+
+    // Constant-time comparison (reusing `crate::pki::enroll`'s comparator --
+    // the same one TCLI-02's enrollment shared-secret check uses) so a
+    // timing side channel can't be used to guess either secret byte by byte.
+    let role = if operator_secret
+        .as_deref()
+        .is_some_and(|s| crate::pki::enroll::constant_time_eq(parsed.password.as_bytes(), s.as_bytes()))
+    {
+        Some(Role::Operator)
+    } else if viewer_secret
+        .as_deref()
+        .is_some_and(|s| crate::pki::enroll::constant_time_eq(parsed.password.as_bytes(), s.as_bytes()))
+    {
+        Some(Role::Viewer)
+    } else {
+        None
+    };
+
+    let Some(role) = role else {
         tracing::warn!(
-            "constellation::auth: login rejected -- CONSTELLATION_OPERATOR_SECRET is unset \
-             (fail-closed, not default-allow)"
+            username = %parsed.username.trim(),
+            "constellation::auth: login rejected -- invalid credential (or the matching tier's \
+             secret is unset, fail-closed, not default-allow)"
         );
         return unauthorized_response();
     };
 
-    // Constant-time comparison (reusing `crate::pki::enroll`'s comparator --
-    // the same one TCLI-02's enrollment shared-secret check uses) so a
-    // timing side channel can't be used to guess the operator secret byte
-    // by byte.
-    if !crate::pki::enroll::constant_time_eq(parsed.password.as_bytes(), operator_secret.as_bytes()) {
-        tracing::warn!(username = %parsed.username.trim(), "constellation::auth: login rejected -- invalid credential");
-        return unauthorized_response();
-    }
-
     let username = parsed.username.trim().to_string();
     let ttl = crate::config::constellation_session_ttl_seconds();
-    let token = match crate::pki::enroll::mint_jwt_with_ttl(&username, ttl) {
+    let token = match crate::pki::enroll::mint_jwt_with_role(&username, ttl, Some(role.as_str())) {
         Ok((jwt, _exp)) => jwt,
         Err(e) => {
             tracing::warn!("constellation::auth: failed to mint session token: {e}");
@@ -199,9 +307,9 @@ pub async fn auth_login(headers: HeaderMap, body: Bytes) -> Response {
         }
     };
 
-    tracing::info!(username = %username, "constellation::auth: login succeeded");
+    tracing::info!(username = %username, role = %role.as_str(), "constellation::auth: login succeeded");
 
-    let seam = SessionSeam { username };
+    let seam = SessionSeam { username, role };
     let masked = crate::constellation::mask::mask_response(auth_me_body(Some(&seam)));
     let mut resp = (StatusCode::OK, [("content-type", "application/json")], masked.to_string())
         .into_response();
@@ -242,6 +350,44 @@ pub async fn require_session(headers: HeaderMap, request: Request, next: Next) -
     }
 }
 
+/// CONST-27 (§3.4): the ONE server-side enforcement point for the viewer
+/// role. `axum` middleware layered (see
+/// `crate::constellation::mod::protected_router`) INSIDE [`require_session`]
+/// -- so an unauthenticated request is already rejected `401` by the time
+/// this runs, and this only ever has to decide "operator vs. viewer", never
+/// "no session at all" (though it degrades safely to that case too: a
+/// request with no/invalid session simply isn't gated here at all and falls
+/// through to `next`, where it either hits `require_session`'s `401` or, if
+/// this is somehow layered without that guard, the real handler -- this
+/// function's OWN contract is narrowly "deny a viewer's mutation", not
+/// "enforce authentication", so it never invents a stricter response for an
+/// absent session than whatever the rest of the stack already provides).
+///
+/// A viewer session making a mutating request (`POST`/`PUT`/`PATCH`/
+/// `DELETE`) to anything this middleware wraps gets `403
+/// {"error":"forbidden","required_role":"operator"}` -- the mutating
+/// method never reaches the proxy/config handler, exactly like
+/// `require_session` denies an unauthenticated request before any backend
+/// dispatch. `GET`/`HEAD`/`OPTIONS` (and any other non-mutating method) pass
+/// through regardless of role -- the viewer tier is read-only, not
+/// no-access.
+pub async fn enforce_viewer_role_gate(headers: HeaderMap, request: Request, next: Next) -> Response {
+    let is_mutating = matches!(
+        *request.method(),
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
+
+    if is_mutating {
+        if let Some(seam) = session_from_cookie(&headers) {
+            if seam.role == Role::Viewer {
+                return forbidden_response();
+            }
+        }
+    }
+
+    next.run(request).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +412,7 @@ mod tests {
     fn clear_env() {
         std::env::remove_var("TERMINUS_JWT_SIGNING_KEY");
         std::env::remove_var("CONSTELLATION_OPERATOR_SECRET");
+        std::env::remove_var("CONSTELLATION_VIEWER_SECRET");
         std::env::remove_var("CONSTELLATION_SESSION_TTL_SECONDS");
     }
 
@@ -499,6 +646,221 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = guarded_test_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        clear_env();
+    }
+
+    // ── CONST-27: viewer role ───────────────────────────────────────────────
+
+    fn login_body(username: &str, password: &str) -> Bytes {
+        Bytes::from(serde_json::to_vec(&json!({"username": username, "password": password})).unwrap())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn login_with_operator_secret_yields_operator_role() {
+        clear_env();
+        set_jwt_key("test-signing-key-const27");
+        std::env::set_var("CONSTELLATION_OPERATOR_SECRET", "op-secret"); // pii-test-fixture
+        std::env::set_var("CONSTELLATION_VIEWER_SECRET", "view-secret"); // pii-test-fixture
+        let resp = auth_login(HeaderMap::new(), login_body("carol", "op-secret")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["role"], "operator");
+        clear_env();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn login_with_viewer_secret_yields_viewer_role() {
+        clear_env();
+        set_jwt_key("test-signing-key-const27");
+        std::env::set_var("CONSTELLATION_OPERATOR_SECRET", "op-secret"); // pii-test-fixture
+        std::env::set_var("CONSTELLATION_VIEWER_SECRET", "view-secret"); // pii-test-fixture
+        let resp = auth_login(HeaderMap::new(), login_body("dave", "view-secret")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["role"], "viewer");
+        clear_env();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn login_with_unset_viewer_secret_rejects_any_viewer_attempt() {
+        clear_env();
+        set_jwt_key("test-signing-key-const27");
+        std::env::set_var("CONSTELLATION_OPERATOR_SECRET", "op-secret"); // pii-test-fixture
+        // CONSTELLATION_VIEWER_SECRET deliberately left unset -- the viewer
+        // tier must be fully disabled, not default-allow for any password.
+        let resp = auth_login(HeaderMap::new(), login_body("erin", "anything-at-all")).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        clear_env();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn login_rejects_a_password_matching_neither_secret() {
+        clear_env();
+        set_jwt_key("test-signing-key-const27");
+        std::env::set_var("CONSTELLATION_OPERATOR_SECRET", "op-secret"); // pii-test-fixture
+        std::env::set_var("CONSTELLATION_VIEWER_SECRET", "view-secret"); // pii-test-fixture
+        let resp = auth_login(HeaderMap::new(), login_body("frank", "neither-of-these")).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        clear_env();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn login_with_same_value_for_both_secrets_resolves_to_operator() {
+        // Edge case (§10 CONST-27): operator and viewer secrets configured identically --
+        // the operator check runs first and wins on any match, so the submitted password
+        // that equals both never yields a viewer session.
+        clear_env();
+        set_jwt_key("test-signing-key-const27");
+        std::env::set_var("CONSTELLATION_OPERATOR_SECRET", "shared-secret"); // pii-test-fixture
+        std::env::set_var("CONSTELLATION_VIEWER_SECRET", "shared-secret"); // pii-test-fixture
+        let resp = auth_login(HeaderMap::new(), login_body("grace", "shared-secret")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["role"], "operator");
+        clear_env();
+    }
+
+    #[test]
+    #[serial]
+    fn a_role_claim_absent_token_resolves_to_operator() {
+        // Backward compat: a session token minted before CONST-27 (or any other caller of
+        // `mint_jwt_with_ttl`, which always passes `role: None`) has no `role` claim at all --
+        // it must decode as `Role::Operator`, not lock a live session out on deploy.
+        clear_env();
+        set_jwt_key("test-signing-key-const27");
+        let (token, _exp) = crate::pki::enroll::mint_jwt_with_ttl("legacy-operator", 300).unwrap();
+        let headers = headers_with_cookie(&format!("constellation_session={token}"));
+        let seam = session_from_cookie(&headers).unwrap();
+        assert_eq!(seam.role, Role::Operator);
+        clear_env();
+    }
+
+    #[test]
+    #[serial]
+    fn an_explicit_viewer_role_claim_round_trips() {
+        clear_env();
+        set_jwt_key("test-signing-key-const27");
+        let (token, _exp) =
+            crate::pki::enroll::mint_jwt_with_role("viewer-user", 300, Some("viewer")).unwrap();
+        let headers = headers_with_cookie(&format!("constellation_session={token}"));
+        let seam = session_from_cookie(&headers).unwrap();
+        assert_eq!(seam.role, Role::Viewer);
+        assert_eq!(seam.username, "viewer-user");
+        clear_env();
+    }
+
+    #[test]
+    #[serial]
+    fn a_role_claim_tampered_by_resigning_with_a_different_key_is_rejected() {
+        // The JWT signature covers the WHOLE claim set, including `role` -- resigning a
+        // viewer token with a different key (simulating an attempt to forge/elevate a role
+        // without the real signing key) must fail verification entirely, not silently
+        // decode with the tampered role.
+        clear_env();
+        set_jwt_key("key-one-const27");
+        let (token, _exp) =
+            crate::pki::enroll::mint_jwt_with_role("someone", 300, Some("viewer")).unwrap();
+        set_jwt_key("key-two-const27");
+        let headers = headers_with_cookie(&format!("constellation_session={token}"));
+        assert!(session_from_cookie(&headers).is_none());
+        clear_env();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn auth_me_reports_role_for_an_authenticated_viewer_session() {
+        clear_env();
+        set_jwt_key("test-signing-key-const27");
+        let (token, _exp) =
+            crate::pki::enroll::mint_jwt_with_role("viewer-user", 300, Some("viewer")).unwrap();
+        let headers = headers_with_cookie(&format!("constellation_session={token}"));
+        let resp = auth_me(headers).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["authenticated"], true);
+        assert_eq!(parsed["role"], "viewer");
+        clear_env();
+    }
+
+    /// The load-bearing CONST-27 property: a viewer session's mutating request is rejected
+    /// `403` with the documented shape, structurally (never reaches the wrapped handler).
+    #[tokio::test]
+    #[serial]
+    async fn viewer_role_gate_denies_a_mutating_request() {
+        use tower::ServiceExt;
+        clear_env();
+        set_jwt_key("test-signing-key-const27");
+        let router = axum::Router::new()
+            .route("/protected", axum::routing::post(|| async { "mutated" }))
+            .layer(axum::middleware::from_fn(enforce_viewer_role_gate));
+        let (token, _exp) =
+            crate::pki::enroll::mint_jwt_with_role("viewer-user", 300, Some("viewer")).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/protected")
+            .header("cookie", format!("constellation_session={token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["error"], "forbidden");
+        assert_eq!(parsed["required_role"], "operator");
+        clear_env();
+    }
+
+    /// Complements the denial test above: the SAME viewer session's `GET` passes through --
+    /// the viewer tier is read-only, not no-access.
+    #[tokio::test]
+    #[serial]
+    async fn viewer_role_gate_allows_a_get_request() {
+        use tower::ServiceExt;
+        clear_env();
+        set_jwt_key("test-signing-key-const27");
+        let router = axum::Router::new()
+            .route("/protected", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(enforce_viewer_role_gate));
+        let (token, _exp) =
+            crate::pki::enroll::mint_jwt_with_role("viewer-user", 300, Some("viewer")).unwrap();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/protected")
+            .header("cookie", format!("constellation_session={token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        clear_env();
+    }
+
+    /// And an operator session's mutating request is never blocked by the gate.
+    #[tokio::test]
+    #[serial]
+    async fn viewer_role_gate_allows_an_operator_mutating_request() {
+        use tower::ServiceExt;
+        clear_env();
+        set_jwt_key("test-signing-key-const27");
+        let router = axum::Router::new()
+            .route("/protected", axum::routing::post(|| async { "mutated" }))
+            .layer(axum::middleware::from_fn(enforce_viewer_role_gate));
+        let (token, _exp) = crate::pki::enroll::mint_jwt_with_ttl("operator-user", 300).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/protected")
+            .header("cookie", format!("constellation_session={token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         clear_env();
     }

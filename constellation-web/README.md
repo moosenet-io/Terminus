@@ -135,6 +135,33 @@ door — it's structurally incapable of storing a credential shape). Vault-refer
 (provider API keys, etc., landing in CONST-08+) must be surfaced as a vault key *name* with a
 set/rotate affordance, never a round-tripped value.
 
+## Roles (CONST-27)
+
+There are exactly two session tiers, both minted onto the same signed JWT from CONST-03 (no
+new auth system, no per-module ACLs — YAGNI for a single-operator fleet):
+
+- **operator** — full read/write. Also the default for a session token with no `role` claim
+  at all (every session minted before CONST-27 shipped), so a live login survives the deploy.
+- **viewer** — read-only. Logs in against `CONSTELLATION_VIEWER_SECRET` (a *second*,
+  distinct <secret-manager>-provisioned secret checked after the operator secret) and gets a
+  structural `403 {"error":"forbidden","required_role":"operator"}` from the server on every
+  mutating method (`POST`/`PUT`/`PATCH`/`DELETE`) — see
+  `src/constellation/auth.rs::enforce_viewer_role_gate` and its `.env.example` entry.
+
+**The enforcement is server-side, not this app.** `getAggregationClient().auth.me()` returns
+a `role` field (`'operator' | 'viewer' | null`), republished app-wide via
+`AuthRoleContext`/`useAuthRole()` (`src/hooks/AuthRoleContext.tsx`) so `RoleGate`
+(`src/components/RoleGate.tsx`) can wrap a mutating control and render it disabled with an
+"operator role required" tooltip for a viewer session. That's a courtesy only — proven by the
+Rust test suite issuing a direct `POST` as a viewer and asserting `403`, independent of
+whatever this UI renders. Currently gated: the harmony dashboard's engine/build/mode/
+inference-mix/compression/command controls (`EngineControls`, `BuildControls`,
+`ModeSelector`, `InferenceMixSlider`, `ConversationBar`). Chord and Muse have no mutating
+panels yet in this checkout (tracked separately under CONST-05..14/CONST-28 and the Muse
+sprints) — gate their write controls with the same `RoleGate` when those panels land, and
+the palette's *action* commands (not yet built — today's `MiniPalette` in `GlobalBar.tsx` is
+navigation-only) the same way once CONST-25 adds them.
+
 ## Dev / build
 
 ```sh

@@ -95,10 +95,18 @@ fn protected_router(state: Arc<McpServerState>) -> Router {
         .route("/api/lumina/*path", any(proxy::proxy_lumina))
         .with_state(state)
         // Applied AFTER `with_state` (matching `crate::mcp_server::build_router`'s own
-        // `.with_state(..).layer(TraceLayer::..)` ordering) -- `require_session` needs no
-        // router state itself (it only reads `HeaderMap`), so it layers cleanly over the
-        // already-stateless `Router` exactly like every other route-independent middleware
-        // in this crate.
+        // `.with_state(..).layer(TraceLayer::..)` ordering) -- neither `require_session` nor
+        // `enforce_viewer_role_gate` needs router state itself (both only read `HeaderMap`),
+        // so they layer cleanly over the already-stateless `Router` exactly like every other
+        // route-independent middleware in this crate.
+        //
+        // Layer ORDER matters: `axum`'s last-added `.layer()` is OUTERMOST (runs first for an
+        // incoming request). `enforce_viewer_role_gate` (CONST-27) is added first here, so
+        // `require_session` (added second, outermost) runs BEFORE it -- an unauthenticated
+        // request is rejected `401` before the role gate ever sees it, and the role gate only
+        // ever has to decide operator-vs-viewer for an already-authenticated caller. See each
+        // middleware's own doc for what happens if this ordering assumption doesn't hold.
+        .layer(axum::middleware::from_fn(auth::enforce_viewer_role_gate))
         .layer(axum::middleware::from_fn(auth::require_session))
 }
 
@@ -387,6 +395,25 @@ mod tests {
         (status, value)
     }
 
+    /// CONST-27: same as [`get_json_authenticated`], but with a viewer-role session cookie,
+    /// and issuing `method` instead of always `GET` -- used to exercise the viewer-role gate
+    /// (`auth::enforce_viewer_role_gate`) across every namespaced route.
+    async fn request_as_viewer(router: Router, method: &str, path: &str) -> (StatusCode, Value) {
+        let (token, _exp) =
+            crate::pki::enroll::mint_jwt_with_role("test-viewer", 300, Some("viewer")).unwrap();
+        let req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("cookie", format!("constellation_session={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, value)
+    }
+
     #[tokio::test]
     #[serial]
     async fn health_reports_all_four_systems() {
@@ -604,5 +631,98 @@ mod tests {
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── CONST-27: viewer role gate, exercised across every protected namespace ──────────────
+
+    /// A viewer session's `GET` reaches the real handler (200) on every protected namespace --
+    /// the viewer tier is read-only, not no-access.
+    #[tokio::test]
+    #[serial]
+    async fn viewer_session_gets_200_on_every_namespace() {
+        std::env::set_var("TERMINUS_JWT_SIGNING_KEY", "test-signing-key-const27-mod");
+        std::env::remove_var("CONSTELLATION_HARMONY_URL");
+        std::env::remove_var("CONSTELLATION_CHORD_URL");
+        std::env::remove_var("CONSTELLATION_LUMINA_URL");
+        for path in ["/api/terminus/config", "/api/harmony/status", "/api/chord/health", "/api/lumina/status"] {
+            let router = constellation_router(test_state());
+            let (status, _body) = request_as_viewer(router, "GET", path).await;
+            assert_eq!(status, StatusCode::OK, "expected 200 for viewer GET {path}");
+        }
+        std::env::remove_var("TERMINUS_JWT_SIGNING_KEY");
+    }
+
+    /// The load-bearing CONST-27 property, exercised at the full-router level (not just the
+    /// isolated middleware unit tests in `auth`): a viewer session's mutating request to every
+    /// protected namespace is rejected `403` with the documented shape, BEFORE any backend
+    /// dispatch -- proven by direct POST as viewer per the spec's acceptance criterion.
+    #[tokio::test]
+    #[serial]
+    async fn viewer_session_gets_403_on_mutating_methods_for_every_namespace() {
+        std::env::set_var("TERMINUS_JWT_SIGNING_KEY", "test-signing-key-const27-mod");
+        std::env::remove_var("CONSTELLATION_HARMONY_URL");
+        std::env::remove_var("CONSTELLATION_CHORD_URL");
+        std::env::remove_var("CONSTELLATION_LUMINA_URL");
+        for path in ["/api/harmony/engine/stop", "/api/chord/playground/run", "/api/lumina/some/write"] {
+            for method in ["POST", "PUT", "PATCH", "DELETE"] {
+                let router = constellation_router(test_state());
+                let (status, body) = request_as_viewer(router, method, path).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "expected 403 for viewer {method} {path}");
+                assert_eq!(body["error"], "forbidden");
+                assert_eq!(body["required_role"], "operator");
+            }
+        }
+        std::env::remove_var("TERMINUS_JWT_SIGNING_KEY");
+    }
+
+    /// An operator session's mutating request is never blocked by the gate, exercised at the
+    /// full-router level.
+    #[tokio::test]
+    #[serial]
+    async fn operator_session_gets_200_on_a_mutating_request() {
+        std::env::set_var("TERMINUS_JWT_SIGNING_KEY", "test-signing-key-const27-mod");
+        std::env::remove_var("CONSTELLATION_HARMONY_URL");
+        let router = constellation_router(test_state());
+        let (token, _exp) = crate::pki::enroll::mint_jwt_with_ttl("test-operator", 300).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/harmony/engine/stop")
+            .header("cookie", format!("constellation_session={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        // No backend configured -- the gate let the operator through, and it reached the
+        // proxy handler's own graceful-degradation path, never a 403.
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+        std::env::remove_var("TERMINUS_JWT_SIGNING_KEY");
+    }
+
+    /// `GET /api/auth/me` gains a `role` field (§3.4), reachable pre-session (`null`) and for
+    /// an authenticated viewer session.
+    #[tokio::test]
+    #[serial]
+    async fn auth_me_role_field_is_present_for_unauthenticated_and_viewer_sessions() {
+        std::env::remove_var("TERMINUS_JWT_SIGNING_KEY");
+        let router = constellation_router(test_state());
+        let (status, body) = get_json(router, "/api/auth/me").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["role"], Value::Null);
+
+        std::env::set_var("TERMINUS_JWT_SIGNING_KEY", "test-signing-key-const27-mod");
+        let (token, _exp) =
+            crate::pki::enroll::mint_jwt_with_role("test-viewer", 300, Some("viewer")).unwrap();
+        let router = constellation_router(test_state());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/auth/me")
+            .header("cookie", format!("constellation_session={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["role"], "viewer");
+        std::env::remove_var("TERMINUS_JWT_SIGNING_KEY");
     }
 }

@@ -17,9 +17,15 @@
 /** The systems the control plane aggregates. Mirrors CONST-01's nav grouping. */
 export type SystemId = 'harmony' | 'chord' | 'lumina' | 'terminus';
 
+/** CONST-27 (§3.4): a session's access tier. `null` when unauthenticated. The UI's `RoleGate`
+ *  reads this to disable mutating controls for a viewer — cosmetic only; the server enforces
+ *  the same rule structurally (`enforce_viewer_role_gate` — 403 on every mutating method). */
+export type AuthRole = 'operator' | 'viewer' | null;
+
 export interface AuthMeResponse {
   authenticated: boolean;
   username: string | null;
+  role: AuthRole;
 }
 
 export interface HealthStatus {
@@ -310,10 +316,12 @@ function mockWsConnect(handlers: WsHandlers): WsConnection {
 const mockAdapter: AggregationClient = {
   auth: {
     async me() {
-      return delay({ authenticated: true, username: 'mock-user' });
+      // Mock mode is always an operator session — no real login flow to distinguish tiers
+      // (CONST-27's viewer tier is exercised via the http adapter against a real backend).
+      return delay({ authenticated: true, username: 'mock-user', role: 'operator' });
     },
     async login(username: string) {
-      return delay({ authenticated: true, username });
+      return delay({ authenticated: true, username, role: 'operator' });
     },
     async logout() {
       await delay(undefined, 40);
@@ -411,7 +419,7 @@ const httpAdapter: AggregationClient = {
       try {
         return await httpJson<AuthMeResponse>('/api/auth/me');
       } catch {
-        return { authenticated: false, username: null };
+        return { authenticated: false, username: null, role: null };
       }
     },
     async login(username: string, password: string) {

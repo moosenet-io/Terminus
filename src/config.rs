@@ -1244,6 +1244,21 @@ pub fn constellation_operator_secret() -> Option<String> {
     env_nonempty("CONSTELLATION_OPERATOR_SECRET")
 }
 
+/// Viewer shared secret (CONST-27, §3.4) compared (constant-time) against the
+/// submitted login password AFTER the operator secret has already been
+/// checked and didn't match. From `CONSTELLATION_VIEWER_SECRET`
+/// (operator-provisioned in <secret-manager> — never hardcoded). `None` when unset
+/// — callers MUST fail-closed (every viewer-tier login attempt rejected,
+/// same posture as an unset `CONSTELLATION_OPERATOR_SECRET`): an operator who
+/// hasn't provisioned this secret simply hasn't enabled the viewer tier yet,
+/// never a default-allow. Same "no separate secret-store API in this crate"
+/// rationale as [`constellation_operator_secret`] above; the only caller is
+/// `crate::constellation::auth::auth_login`, which never logs the returned
+/// value.
+pub fn constellation_viewer_secret() -> Option<String> {
+    env_nonempty("CONSTELLATION_VIEWER_SECRET")
+}
+
 /// Constellation session token TTL, in seconds. Independent of
 /// `TERMINUS_ENROLLMENT_JWT_TTL_SECONDS` (a different credential with a
 /// different lifecycle: an operator's browser session vs. a paired
@@ -1984,6 +1999,16 @@ mod tests {
         std::env::set_var("CONSTELLATION_OPERATOR_SECRET", "op-secret"); // pii-test-fixture
         assert_eq!(constellation_operator_secret(), Some("op-secret".to_string()));
         std::env::remove_var("CONSTELLATION_OPERATOR_SECRET");
+    }
+
+    #[test]
+    #[serial]
+    fn constellation_viewer_secret_unset_is_none() {
+        std::env::remove_var("CONSTELLATION_VIEWER_SECRET");
+        assert_eq!(constellation_viewer_secret(), None);
+        std::env::set_var("CONSTELLATION_VIEWER_SECRET", "view-secret"); // pii-test-fixture
+        assert_eq!(constellation_viewer_secret(), Some("view-secret".to_string()));
+        std::env::remove_var("CONSTELLATION_VIEWER_SECRET");
     }
 
     #[test]

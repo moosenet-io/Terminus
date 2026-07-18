@@ -2,6 +2,7 @@
 // SGUI-02: Collapsible conversation bar
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { getAggregationClient } from '../lib/aggregationClient';
+import { RoleGate } from './RoleGate';
 
 interface LogEntry { id: number; text: string; timestamp: string; }
 interface Props { log: LogEntry[]; engineState: string; onAddLog?: (text: string) => void; }
@@ -158,44 +159,47 @@ export function ConversationBar({ log, engineState, onAddLog }: Props) {
             })}
           </div>
 
-          {/* Command input row */}
-          <div style={{
-            display: 'flex',
-            gap: 'var(--space-2)',
-            padding: 'var(--space-2) var(--space-4)',
-            borderTop: '1px solid var(--border-subtle)',
-          }}>
-            <input
-              type="text"
-              value={input}
-              onChange={e => setInput(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter') sendCommand(); }}
-              onFocus={() => setFocused(true)}
-              onBlur={() => setFocused(false)}
-              placeholder="Type a command or ask a question…"
-              autoFocus
-              style={{
-                flex: 1,
-                background: 'var(--bg-surface-raised)',
-                border: `1px solid ${focused ? 'var(--accent-primary)' : 'var(--border-default)'}`,
-                borderRadius: 'var(--radius-md)',
-                color: 'var(--text-primary)',
-                padding: 'var(--space-1) var(--space-3)',
-                fontSize: 'var(--text-sm)',
-                fontFamily: 'var(--font-mono)',
-                outline: 'none',
-                transition: `border-color var(--transition-fast)`,
-              }}
-            />
-            <button
-              className="h-btn h-btn-teal"
-              onClick={sendCommand}
-              disabled={sending || !input.trim()}
-              style={{ padding: 'var(--space-1) var(--space-3)', fontSize: 'var(--text-xs)' }}
-            >
-              {sending ? '…' : 'Send'}
-            </button>
-          </div>
+          {/* Command input row — CONST-27: POST /command mutates, gated as one group (a
+              viewer can still read the log above; they just can't issue commands). */}
+          <RoleGate display="block">
+            <div style={{
+              display: 'flex',
+              gap: 'var(--space-2)',
+              padding: 'var(--space-2) var(--space-4)',
+              borderTop: '1px solid var(--border-subtle)',
+            }}>
+              <input
+                type="text"
+                value={input}
+                onChange={e => setInput(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') sendCommand(); }}
+                onFocus={() => setFocused(true)}
+                onBlur={() => setFocused(false)}
+                placeholder="Type a command or ask a question…"
+                autoFocus
+                style={{
+                  flex: 1,
+                  background: 'var(--bg-surface-raised)',
+                  border: `1px solid ${focused ? 'var(--accent-primary)' : 'var(--border-default)'}`,
+                  borderRadius: 'var(--radius-md)',
+                  color: 'var(--text-primary)',
+                  padding: 'var(--space-1) var(--space-3)',
+                  fontSize: 'var(--text-sm)',
+                  fontFamily: 'var(--font-mono)',
+                  outline: 'none',
+                  transition: `border-color var(--transition-fast)`,
+                }}
+              />
+              <button
+                className="h-btn h-btn-teal"
+                onClick={sendCommand}
+                disabled={sending || !input.trim()}
+                style={{ padding: 'var(--space-1) var(--space-3)', fontSize: 'var(--text-xs)' }}
+              >
+                {sending ? '…' : 'Send'}
+              </button>
+            </div>
+          </RoleGate>
         </div>
       )}
     </div>
