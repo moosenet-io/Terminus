@@ -14,8 +14,9 @@
 //!   `place=false`, but its (necessarily empty, since it never saw the old
 //!   README's sections rendered as its own docs) `docs_tree` is IGNORED.
 //! - The `docs/` tree is instead built MECHANICALLY, directly from the OLD
-//!   README: [`super::preserve::split_old_sections`] (the same parser the
-//!   no-loss guard itself uses -- reused, not reimplemented) splits it into a
+//!   README: [`old_readme_parts`] (a byte-offset slicer -- see its doc for why
+//!   this is deliberately distinct from the no-loss guard's line-based
+//!   `split_old_sections`) splits it into a
 //!   preamble plus one entry per top-level `## ` section, and each section's
 //!   heading + body is copied VERBATIM into its own `docs/reference/<slug>.md`
 //!   page (see [`build_docs_tree_from_old_readme`]). Verbatim copying makes
@@ -135,21 +136,22 @@ fn slugify(heading: &str) -> String {
 
 /// Mechanically build the `docs/` tree from the OLD README: a preamble (if
 /// any, verbatim) plus one `docs/reference/<slug>.md` page per top-level
-/// `## ` section, each holding that section's EXACT heading + body --  no
-/// paraphrasing, no summarizing. Reuses [`split_old_sections`]/
-/// [`extract_preamble`] (the SAME parser [`check_preservation`] uses
-/// internally) rather than a second markdown-section splitter. Slugs are
-/// de-duplicated with a numeric suffix on collision (`install`,
-/// `install-2`, ...). Returns `docs/index.md` (a hub page: short title +
-/// verbatim preamble + a link list to every reference page, by its
-/// original heading text) first, followed by the reference pages in
-/// original section order.
+/// `## ` section, each holding that section's EXACT ORIGINAL SOURCE BYTES --
+/// no paraphrasing, no summarizing, not even an appended newline. Section
+/// boundaries come from [`old_readme_parts`], a purpose-built BYTE-OFFSET
+/// slicer: it deliberately differs from [`super::preserve::split_old_sections`]
+/// (the line-based, whitespace-trimming parser the no-loss guard uses to
+/// COMPARE tokens) precisely because relocation needs byte-exact source spans,
+/// not parsed/normalised heading+body fields. Both agree on where `## `
+/// sections begin. Slugs are de-duplicated with a numeric suffix on collision
+/// (`install`, `install-2`, ...). Returns `docs/index.md` (a hub page: short
+/// title + verbatim preamble + a link list to every reference page, by its
+/// original heading text) first, followed by the reference pages in original
+/// section order.
 ///
 /// An old README with NO `## ` headings at all still produces exactly one
-/// reference page (per [`split_old_sections`]'s own "whole document is one
-/// section" edge case) -- labeled "Overview" here since that section's
-/// `heading` field is empty in that case -- so nothing is ever silently
-/// dropped for lack of section structure.
+/// reference page (the whole document, verbatim, labeled "Overview") -- so
+/// nothing is ever silently dropped for lack of section structure.
 /// Split the OLD README into (verbatim preamble, [(heading, VERBATIM source
 /// slice)]) using EXACT byte offsets. Each section's slice is the original
 /// source from its `## ` line through just before the next `## ` line (or EOF),
@@ -202,13 +204,10 @@ fn build_docs_tree_from_old_readme(old_readme: &str) -> Vec<DocsTreeFile> {
         *count += 1;
         let slug = if *count == 1 { base_slug } else { format!("{base_slug}-{count}") };
 
-        // The page IS the exact original source slice (only guaranteeing a
-        // trailing newline) -- verbatim, never reconstructed.
-        let mut content = slice.clone();
-        if !content.ends_with('\n') {
-            content.push('\n');
-        }
-        pages.push((slug, heading_label, content));
+        // The page IS the exact original source slice -- byte-for-byte, no
+        // trailing newline appended, no reconstruction. Whatever bytes the
+        // author wrote for this section are exactly what the docs page holds.
+        pages.push((slug, heading_label, slice.clone()));
     }
 
     let mut docs_tree = Vec::with_capacity(pages.len() + 1);
@@ -1028,10 +1027,11 @@ mod tests {
         // before ## Next), verbatim -- sub-heading, fenced code, and blank lines
         // all preserved byte-for-byte.
         let expected = "## Config\n\nSet it up:\n\n### Advanced\n\n```toml\nport = 8080\n```\n\nDone.\n\n";
-        assert!(
-            config_page.content.contains(expected),
-            "page is not the verbatim source slice:\n{}",
-            config_page.content
+        // EQUALITY, not `contains`: the page is EXACTLY the source slice, with
+        // no bytes added around it (no appended trailing newline, no wrapper).
+        assert_eq!(
+            config_page.content, expected,
+            "page is not the byte-exact verbatim source slice"
         );
     }
 

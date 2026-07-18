@@ -1313,18 +1313,20 @@ its own, so the DLAND-02 no-loss guard correctly withheld every cutover.
    `docs_tree` is **ignored** (it never saw the old README's sections
    rendered as its own docs, so it's necessarily empty for this flow).
 2. Builds the `docs/` tree **mechanically**, directly from the OLD README:
-   `preserve::split_old_sections`/`preserve::extract_preamble` (the SAME
-   parser the no-loss guard itself uses internally, `pub(crate)` and reused
-   here rather than re-implemented) split it into a preamble plus one entry
-   per top-level `## ` section, and each section's heading + body is copied
-   **VERBATIM** into its own `docs/reference/<slug>.md` page — no
-   paraphrasing, no summarizing. `docs/index.md` is a hub page: a short
-   title, the verbatim preamble (if any), and a link list to every
-   relocated page. Slugs are de-duplicated with a numeric suffix on
-   collision; a README with no `##` headings at all still relocates as one
-   `docs/reference/overview.md` page (`split_old_sections`'s own "whole
-   document is one section" edge case), so section-less READMEs are never
-   silently dropped either.
+   a purpose-built **byte-offset slicer** (`old_readme_parts`) splits it into
+   a preamble plus one entry per top-level `## ` section, and each section's
+   **EXACT ORIGINAL SOURCE BYTES** (from its `## ` line through just before
+   the next `## `/EOF — sub-headings, code fences, and spacing preserved
+   byte-for-byte) are copied **VERBATIM** into its own
+   `docs/reference/<slug>.md` page — no paraphrasing, no summarizing, not even
+   an appended newline. This slicer is deliberately distinct from the no-loss
+   guard's line-based `preserve::split_old_sections` (which normalises
+   whitespace to COMPARE tokens); both agree on where `## ` sections begin.
+   `docs/index.md` is a hub page: a short title, the verbatim preamble (if
+   any), and a link list to every relocated page. Slugs are de-duplicated with
+   a numeric suffix on collision; a README with no `##` headings at all still
+   relocates as one `docs/reference/overview.md` page (the whole document
+   verbatim), so section-less READMEs are never silently dropped either.
 3. Assembles the final landing: the LLM's hero/quick-start text with any
    LLM-authored `## Documentation` section and any `docs/…` links stripped
    (they would dangle against the mechanical tree — a leftover of the LLM
