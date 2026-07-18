@@ -35,17 +35,19 @@
 //! the name is unknown everywhere").
 //!
 //! ## Contracts-to-confirm (spec §8 / audit §5) — resolved for THIS build
-//! 1. `model_profiles.profile_date`: this checkout's `CREATE TABLE
-//!    model_profiles`/`model_operational_profiles` (`src/intake/assistant/
-//!    schema.rs`) has NO `profile_date` column, only `created_at`. The
-//!    sanctioned read-only `pg_*` tool was tried against the live intake DB for
-//!    this item's build session and connected to a database reporting ZERO
-//!    tables — it could not confirm or deny the audit's "exists live" claim.
-//!    Ordering here therefore uses `created_at` alone (see
-//!    `storage::read_latest_operational_profile_for_model`'s doc) rather than a
-//!    `COALESCE(profile_date, created_at)` that would hard-error against this
-//!    checkout's actual schema. Flagged for the next build/deploy to confirm
-//!    against a truly live host.
+//! 1. `model_profiles.profile_date`: per the audit's pinned finding, the live
+//!    intake DB carries this column out-of-band (this checkout's own `CREATE
+//!    TABLE model_profiles` in `src/intake/assistant/schema.rs` has no such
+//!    column, only `created_at`). `storage::read_latest_operational_profile_
+//!    for_model` orders by `COALESCE(mp.profile_date, mp.created_at) DESC`
+//!    per that finding. The sanctioned read-only `pg_*` tool was tried
+//!    against the live intake DB this build session and connected to a
+//!    database reporting ZERO tables, so this could not be independently
+//!    re-confirmed this session — implemented per the audit's finding
+//!    regardless, and SAFE either way: a host whose `model_profiles` truly
+//!    lacks `profile_date` gets a missing-column error, which that
+//!    function's read degrades to `None` for (never a hard failure), rather
+//!    than falling back to silently wrong ordering.
 //! 2. `quant` is treated as `Option<String>` everywhere in this module (list,
 //!    detail, matrix) — never unwrapped.
 //! 3. Code/agent catalog cells legitimately read `not_run` until
@@ -90,6 +92,54 @@ const ASSISTANT_DIMENSIONS: [&str; 8] = [
     "yarn_context_depth",
     "fleet_membership",
 ];
+
+/// Min–max normalize `v` into `lo..=hi` → `0.0..=1.0` (spec §7.2-C1: the
+/// capability radar's fleet-wide per-dimension normalization). A degenerate
+/// range (`lo == hi`, e.g. a dimension with only one distinct fleet value)
+/// normalizes to the midpoint `0.5` rather than dividing by zero — there is
+/// no meaningful "where in the range" answer when there IS no range. Pure —
+/// unit-tested directly (`mint_dimensions` calls this via its `normalize`
+/// closure, which only adds the fleet-wide range lookup).
+fn normalize_min_max(lo: f64, hi: f64, v: f64) -> f64 {
+    if (hi - lo).abs() > f64::EPSILON {
+        (v - lo) / (hi - lo)
+    } else {
+        0.5
+    }
+}
+
+/// √-scale `vram_gb` into an 8–24px point-size for the C4 Pareto scatter
+/// (spec §7.2-C4: "point size = vram_gb (√-scaled, 8–24px)") — computed
+/// server-side (over the fleet-wide min/max of the RETURNED rows) so the
+/// browser never re-derives the pixel encoding from a raw GB figure itself.
+/// `None`/non-positive `vram_gb` floors to `8.0` (the smallest mark, "unknown
+/// footprint" reads as "small" rather than crashing or omitting the point).
+/// A degenerate fleet-wide range (every row the same VRAM, or only one row)
+/// maps to the midpoint `16.0`. Pure — unit-tested on fixtures.
+fn pareto_point_size_px(vram_gb: Option<f64>, min_vram_gb: f64, max_vram_gb: f64) -> f64 {
+    const FLOOR_PX: f64 = 8.0;
+    const CEIL_PX: f64 = 24.0;
+    let Some(v) = vram_gb.filter(|v| *v > 0.0) else {
+        return FLOOR_PX;
+    };
+    if min_vram_gb <= 0.0 || (max_vram_gb.sqrt() - min_vram_gb.sqrt()).abs() < f64::EPSILON {
+        return (FLOOR_PX + CEIL_PX) / 2.0;
+    }
+    let t = ((v.sqrt() - min_vram_gb.sqrt()) / (max_vram_gb.sqrt() - min_vram_gb.sqrt())).clamp(0.0, 1.0);
+    FLOOR_PX + t * (CEIL_PX - FLOOR_PX)
+}
+
+/// Fold a fleet-wide (class, total-count) ranking down to the top `n` class
+/// names plus everything else — spec §7.2-C6 / §8's "top5 + other" contract
+/// (13 known `failure_class` values exceeds both the class ceiling and the
+/// 6-slot brand palette). Ties break by class name for determinism. Pure —
+/// unit-tested on fixtures (`mint_failures` calls this over the live
+/// per-class totals it computes from `read_failure_class_counts`).
+fn top_n_classes<'a>(class_totals: &BTreeMap<&'a str, i64>, n: usize) -> BTreeSet<&'a str> {
+    let mut ranked: Vec<(&str, i64)> = class_totals.iter().map(|(c, n)| (*c, *n)).collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    ranked.into_iter().take(n).map(|(c, _)| c).collect()
+}
 
 /// Connect the shared intake pool, degrading to `None` on ANY failure
 /// (unconfigured, unreachable, auth failure, …) — every caller in this module
@@ -607,8 +657,8 @@ pub async fn mint_dimensions(Query(q): Query<DimensionsQuery>) -> Response {
     }
     let normalize = |dim: &str, v: f64| -> f64 {
         match ranges.get(dim) {
-            Some((lo, hi)) if (hi - lo).abs() > f64::EPSILON => (v - lo) / (hi - lo),
-            _ => 0.5, // a single-value or absent range normalizes to the midpoint
+            Some((lo, hi)) => normalize_min_max(*lo, *hi, v),
+            None => 0.5, // no fleet-wide range at all for this dimension (no data)
         }
     };
 
@@ -828,23 +878,38 @@ pub struct BoxQuery {
 /// 5 samples reports `n < 5` (the caller — `mint_box` — flags it so a
 /// consumer can render the documented beeswarm-strip fallback instead of a
 /// 3-point box that would lie).
-fn quartiles(mut values: Vec<f64>) -> (f64, f64, f64, f64, f64, Vec<usize>) {
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n = values.len();
+///
+/// Takes a plain `&[f64]` slice (the caller's original, UNSORTED order —
+/// e.g. `model_rows` in `mint_box`, which parallels `run_id`/`case_id`/
+/// `failure_class` by position) and returns outlier indices into THAT SAME
+/// original order — never into an internally-sorted copy. (Fixed a real bug,
+/// caught in review: an earlier version sorted `values` in place and returned
+/// indices into the sorted array, which `mint_box` then used to index into
+/// the still-unsorted `model_rows`, silently attaching the wrong run's
+/// `run_id`/`case_id`/`failure_class` to each reported outlier. This version
+/// sorts a separate `(original_index, value)` pairing and maps every output
+/// — quartiles AND outlier indices — back through that pairing, so the
+/// function's `usize` outputs are always safe to index the caller's original
+/// slice with directly; see `quartiles_outlier_indices_map_back_to_original_order`.)
+fn quartiles(values: &[f64]) -> (f64, f64, f64, f64, f64, Vec<usize>) {
+    let mut indexed: Vec<(usize, f64)> = values.iter().copied().enumerate().collect();
+    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let sorted: Vec<f64> = indexed.iter().map(|(_, v)| *v).collect();
+    let n = sorted.len();
     let percentile = |p: f64| -> f64 {
         if n == 0 {
             return 0.0;
         }
         if n == 1 {
-            return values[0];
+            return sorted[0];
         }
         let rank = p * (n as f64 - 1.0);
         let lo = rank.floor() as usize;
         let hi = rank.ceil() as usize;
         if lo == hi {
-            values[lo]
+            sorted[lo]
         } else {
-            values[lo] + (values[hi] - values[lo]) * (rank - lo as f64)
+            sorted[lo] + (sorted[hi] - sorted[lo]) * (rank - lo as f64)
         }
     };
     let q1 = percentile(0.25);
@@ -852,14 +917,16 @@ fn quartiles(mut values: Vec<f64>) -> (f64, f64, f64, f64, f64, Vec<usize>) {
     let q3 = percentile(0.75);
     let iqr = q3 - q1;
     let (lo_fence, hi_fence) = (q1 - 1.5 * iqr, q3 + 1.5 * iqr);
-    let outlier_idx: Vec<usize> = values
+    // `orig_idx` here is the position in the CALLER'S original (unsorted)
+    // slice — this is the whole point of carrying `indexed` through instead
+    // of filtering over `sorted` directly.
+    let outlier_idx: Vec<usize> = indexed
         .iter()
-        .enumerate()
-        .filter(|(_, v)| **v < lo_fence || **v > hi_fence)
-        .map(|(i, _)| i)
+        .filter(|(_, v)| *v < lo_fence || *v > hi_fence)
+        .map(|(orig_idx, _)| *orig_idx)
         .collect();
-    let min = values.first().copied().unwrap_or(0.0);
-    let max = values.last().copied().unwrap_or(0.0);
+    let min = sorted.first().copied().unwrap_or(0.0);
+    let max = sorted.last().copied().unwrap_or(0.0);
     (min, q1, median, q3, max, outlier_idx)
 }
 
@@ -903,7 +970,7 @@ pub async fn mint_box(Query(q): Query<BoxQuery>) -> Response {
         .map(|(model, model_rows)| {
             let values: Vec<f64> = model_rows.iter().map(|r| r.value).collect();
             let n = values.len();
-            let (min, q1, median, q3, max, outlier_idx) = quartiles(values);
+            let (min, q1, median, q3, max, outlier_idx) = quartiles(&values);
             let outliers: Vec<Value> = outlier_idx
                 .into_iter()
                 .filter_map(|i| model_rows.get(i))
@@ -936,18 +1003,47 @@ pub async fn mint_box(Query(q): Query<BoxQuery>) -> Response {
 #[derive(Debug, Deserialize, Default)]
 pub struct LanguageStatsQuery {
     language: Option<String>,
-    #[allow(dead_code)] // accepted for §8 contract uniformity; see storage::read_language_stats doc
     epoch: Option<String>,
 }
 
 /// `GET /api/terminus/mint/language-stats?language=&epoch=` — the C4 Pareto
-/// scatter's rows (spec §7.2-C4 / §8).
+/// scatter's rows (spec §7.2-C4 / §8). `epoch` is honored (review fix — see
+/// `storage::read_language_stats`'s doc for why the earlier version silently
+/// ignored it: it read a pre-aggregated, non-epoch-partitioned matview
+/// directly; this now recomputes the same rollup live, epoch-scoped). Each
+/// row additionally carries a server-computed `point_size_px`
+/// ([`pareto_point_size_px`]) — the C4 scatter's √-scaled 8–24px point-size
+/// encoding of `vram_gb`, computed over the fleet-wide min/max of THIS
+/// response's own rows (spec §8: "5,721 rows never ship raw to the browser"
+/// — the same "compute the derived chart encoding server-side" principle
+/// `mint_box`'s quartiles already follow).
 pub async fn mint_language_stats(Query(q): Query<LanguageStatsQuery>) -> Response {
+    let epoch = epoch_selector_from_query(q.epoch.as_deref());
+
     let Some(pool) = pool_or_none().await else {
         return json_ok(json!({"rows": []}));
     };
-    let rows = storage::read_language_stats(&pool, q.language.as_deref()).await.unwrap_or_default();
-    json_ok(json!({"rows": rows}))
+    let rows = storage::read_language_stats(&pool, q.language.as_deref(), &epoch).await.unwrap_or_default();
+
+    let vram_values: Vec<f64> = rows.iter().filter_map(|r| r.vram_gb).filter(|v| *v > 0.0).collect();
+    let min_vram = vram_values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_vram = vram_values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+    let rows_json: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            let mut v = serde_json::to_value(r).unwrap_or(Value::Null);
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "point_size_px".to_string(),
+                    json!(pareto_point_size_px(r.vram_gb, min_vram, max_vram)),
+                );
+            }
+            v
+        })
+        .collect();
+
+    json_ok(json!({"rows": rows_json}))
 }
 
 // ---------------------------------------------------------------------------
@@ -978,10 +1074,13 @@ pub async fn mint_failures(Query(q): Query<FailuresQuery>) -> Response {
     for (_, class, n) in &rows {
         *class_totals.entry(class.as_str()).or_insert(0) += n;
     }
-    let mut ranked: Vec<(&str, i64)> = class_totals.into_iter().collect();
+    let top5 = top_n_classes(&class_totals, 5);
+    // Preserve rank order (highest total first) for the `classes` list the
+    // chart's legend/series order follows; `top5` above is just the
+    // membership test used per-row below.
+    let mut ranked: Vec<(&str, i64)> = class_totals.into_iter().filter(|(c, _)| top5.contains(c)).collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-    let top5: BTreeSet<&str> = ranked.iter().take(5).map(|(c, _)| *c).collect();
-    let classes: Vec<&str> = ranked.iter().take(5).map(|(c, _)| *c).chain(std::iter::once("other")).collect();
+    let classes: Vec<&str> = ranked.into_iter().map(|(c, _)| c).chain(std::iter::once("other")).collect();
 
     let mut by_model: BTreeMap<&str, BTreeMap<&str, i64>> = BTreeMap::new();
     let mut total_by_model: BTreeMap<&str, i64> = BTreeMap::new();
@@ -1290,7 +1389,7 @@ mod tests {
         // 1..=9: Q1=3, median=5, Q3=7 (linear-interpolation method, matches
         // the common "R-7"/numpy-default convention).
         let values: Vec<f64> = (1..=9).map(|n| n as f64).collect();
-        let (min, q1, median, q3, max, outliers) = quartiles(values);
+        let (min, q1, median, q3, max, outliers) = quartiles(&values);
         assert_eq!(min, 1.0);
         assert_eq!(q1, 3.0);
         assert_eq!(median, 5.0);
@@ -1303,8 +1402,72 @@ mod tests {
     fn quartiles_flags_a_far_outlier() {
         let mut values: Vec<f64> = (1..=9).map(|n| n as f64).collect();
         values.push(1000.0);
-        let (_, _, _, _, _, outliers) = quartiles(values);
+        let (_, _, _, _, _, outliers) = quartiles(&values);
         assert_eq!(outliers.len(), 1);
+        // The far outlier is the LAST element of this particular input, so a
+        // regression to the old (broken) "index into the sorted copy" behavior
+        // would happen to still pass this assertion by coincidence — see the
+        // dedicated `_maps_back_to_original_order` test below for the case
+        // that actually catches that class of bug.
+        assert_eq!(outliers[0], values.len() - 1);
+    }
+
+    /// Regression test for the review-caught bug: `quartiles`'s returned
+    /// outlier indices MUST index into the CALLER's original (unsorted)
+    /// order, not into an internally-sorted copy. Uses an input that is
+    /// deliberately NOT already sorted and NOT outlier-last, so a
+    /// reintroduced "index into the sorted array" bug fails this test even
+    /// though it might pass a sorted-input fixture by coincidence.
+    #[test]
+    fn quartiles_outlier_indices_map_back_to_original_order() {
+        // Unsorted; the outlier (1000.0) sits at original index 2, nowhere
+        // near where it would land after sorting (index 9, the max).
+        let values = vec![5.0, 3.0, 1000.0, 7.0, 2.0, 4.0, 6.0, 1.0, 8.0, 9.0];
+        let (_, _, _, _, _, outliers) = quartiles(&values);
+        assert_eq!(outliers, vec![2], "outlier index must point at the original position of 1000.0");
+        assert_eq!(values[outliers[0]], 1000.0);
+    }
+
+    /// End-to-end fixture proving `mint_box`'s outlier objects carry the
+    /// RIGHT run's `run_id`/`case_id`/`failure_class` — the exact property
+    /// the review finding was about (indices were previously computed
+    /// against a sorted copy of `values` but used to index the still-
+    /// unsorted `model_rows`, silently swapping which run's metadata each
+    /// outlier reported).
+    #[test]
+    fn mint_box_outlier_metadata_matches_its_own_value_not_a_swapped_run() {
+        use uuid::Uuid;
+
+        let rows: Vec<storage::BoxMetricRow> = vec![
+            (5.0, "case-a"),
+            (3.0, "case-b"),
+            (1000.0, "case-outlier"), // the far outlier, deliberately NOT last/first
+            (7.0, "case-c"),
+            (2.0, "case-d"),
+            (4.0, "case-e"),
+            (6.0, "case-f"),
+            (1.0, "case-g"),
+            (8.0, "case-h"),
+            (9.0, "case-i"),
+        ]
+        .into_iter()
+        .map(|(value, case_id)| storage::BoxMetricRow {
+            model: "test-model".to_string(),
+            value,
+            run_id: Uuid::new_v4(),
+            case_id: Some(case_id.to_string()),
+            failure_class: None,
+        })
+        .collect();
+
+        let model_rows: Vec<&storage::BoxMetricRow> = rows.iter().collect();
+        let values: Vec<f64> = model_rows.iter().map(|r| r.value).collect();
+        let (_, _, _, _, _, outlier_idx) = quartiles(&values);
+
+        assert_eq!(outlier_idx.len(), 1);
+        let outlier_row = model_rows[outlier_idx[0]];
+        assert_eq!(outlier_row.value, 1000.0);
+        assert_eq!(outlier_row.case_id.as_deref(), Some("case-outlier"));
     }
 
     #[test]
@@ -1328,4 +1491,109 @@ mod tests {
         assert_eq!(split_models(None), Vec::<String>::new());
         assert_eq!(split_models(Some("")), Vec::<String>::new());
     }
+
+    // ---- normalization (C1 capability radar) ----
+
+    #[test]
+    fn normalize_min_max_scales_into_zero_one() {
+        assert_eq!(normalize_min_max(0.0, 10.0, 0.0), 0.0);
+        assert_eq!(normalize_min_max(0.0, 10.0, 10.0), 1.0);
+        assert_eq!(normalize_min_max(0.0, 10.0, 5.0), 0.5);
+        assert_eq!(normalize_min_max(2.0, 8.0, 5.0), 0.5);
+    }
+
+    #[test]
+    fn normalize_min_max_degenerate_range_is_the_midpoint() {
+        // lo == hi (every fleet value identical, or a single sample) must not
+        // divide by zero / produce NaN or infinity.
+        assert_eq!(normalize_min_max(4.0, 4.0, 4.0), 0.5);
+    }
+
+    // ---- Pareto-input point-size encoding (C4 scatter) ----
+
+    #[test]
+    fn pareto_point_size_floors_and_ceils_at_the_fleet_extremes() {
+        assert_eq!(pareto_point_size_px(Some(4.0), 4.0, 96.0), 8.0);
+        assert_eq!(pareto_point_size_px(Some(96.0), 4.0, 96.0), 24.0);
+    }
+
+    #[test]
+    fn pareto_point_size_is_monotonic_in_vram() {
+        let small = pareto_point_size_px(Some(8.0), 4.0, 96.0);
+        let mid = pareto_point_size_px(Some(24.0), 4.0, 96.0);
+        let large = pareto_point_size_px(Some(64.0), 4.0, 96.0);
+        assert!(small < mid, "{small} should be < {mid}");
+        assert!(mid < large, "{mid} should be < {large}");
+        assert!((8.0..=24.0).contains(&small));
+        assert!((8.0..=24.0).contains(&large));
+    }
+
+    #[test]
+    fn pareto_point_size_missing_or_non_positive_vram_floors_to_8px() {
+        assert_eq!(pareto_point_size_px(None, 4.0, 96.0), 8.0);
+        assert_eq!(pareto_point_size_px(Some(0.0), 4.0, 96.0), 8.0);
+        assert_eq!(pareto_point_size_px(Some(-1.0), 4.0, 96.0), 8.0);
+    }
+
+    #[test]
+    fn pareto_point_size_degenerate_fleet_range_is_the_midpoint() {
+        assert_eq!(pareto_point_size_px(Some(32.0), 32.0, 32.0), 16.0);
+    }
+
+    // ---- top-5 + "other" folding (C6 failure-class bars) ----
+
+    #[test]
+    fn top_n_classes_keeps_the_highest_totals() {
+        let mut totals: BTreeMap<&str, i64> = BTreeMap::new();
+        totals.insert("timeout", 50);
+        totals.insert("compilation_error", 40);
+        totals.insert("test_failure", 30);
+        totals.insert("truncation", 20);
+        totals.insert("empty_diff", 10);
+        totals.insert("provider_error", 5); // 6th — must be folded to "other"
+        totals.insert("phase_stall", 1); // 7th — also folded
+
+        let top = top_n_classes(&totals, 5);
+        assert_eq!(top.len(), 5);
+        assert!(top.contains("timeout"));
+        assert!(top.contains("compilation_error"));
+        assert!(top.contains("test_failure"));
+        assert!(top.contains("truncation"));
+        assert!(top.contains("empty_diff"));
+        assert!(!top.contains("provider_error"), "6th-highest class must NOT survive the top-5 fold");
+        assert!(!top.contains("phase_stall"));
+    }
+
+    #[test]
+    fn top_n_classes_ties_break_by_name_for_determinism() {
+        let mut totals: BTreeMap<&str, i64> = BTreeMap::new();
+        totals.insert("b", 10);
+        totals.insert("a", 10);
+        totals.insert("c", 10);
+        let top = top_n_classes(&totals, 2);
+        // Same input must always fold the same way — alphabetically-first
+        // wins a tie, deterministically (never "whatever HashMap order gave
+        // us today").
+        assert!(top.contains("a"));
+        assert!(top.contains("b"));
+        assert!(!top.contains("c"));
+    }
+
+    #[test]
+    fn top_n_classes_fewer_than_n_keeps_everything() {
+        let mut totals: BTreeMap<&str, i64> = BTreeMap::new();
+        totals.insert("x", 3);
+        totals.insert("y", 1);
+        let top = top_n_classes(&totals, 5);
+        assert_eq!(top.len(), 2);
+    }
+
+    // NOTE: the representative auth-401 / viewer-200 / masking spot-checks
+    // across EVERY route this module registers live in
+    // `crate::constellation::tests` (`every_models_api_route_rejects_
+    // unauthenticated_requests` / `every_models_api_route_is_reachable_with_
+    // a_valid_session`) — that module owns the real `protected_router`/
+    // `auth::require_session` wiring this module's own local `test_router()`
+    // (used only for the shape/degradation tests above) deliberately does
+    // NOT include, so an auth-boundary assertion belongs there, not here.
 }

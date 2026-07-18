@@ -2004,20 +2004,21 @@ pub async fn read_keep_warm_model_ids(
     }
 }
 
-/// The latest `model_operational_profiles` row for one model (by
-/// `created_at` — see the module-level CONST-21 note on `profile_date`: this
-/// checkout's `model_operational_profiles`/`model_profiles` CREATE statements
-/// have no `profile_date` column, only `created_at`; a live host reported to
-/// carry an out-of-band `profile_date` column per the CONST-GUI audit's
-/// contracts-to-confirm #1, but that could not be verified against a reachable
-/// live schema in this item's build session (the sanctioned read-only pg_*
-/// tool connected to a DB with zero tables). Ordering by `created_at` alone is
-/// therefore the defensively-correct choice here: a query that references a
-/// column absent from this checkout's schema would hard-error (not degrade)
-/// on any host that matches this checkout. If a future build confirms
-/// `profile_date` live, switch to `ORDER BY COALESCE(profile_date, created_at)
-/// DESC` and note the change in that item's PR.). Tolerates the table being
-/// absent → `None`.
+/// The latest `model_operational_profiles` row for one model, ordered by
+/// `COALESCE(mp.profile_date, mp.created_at) DESC` per the CONST-GUI audit's
+/// contracts-to-confirm #1: the live intake DB carries a `model_profiles.
+/// profile_date` column this checkout's own `CREATE TABLE` doesn't (an
+/// out-of-band live migration) — `COALESCE` prefers it when present and
+/// falls back to `created_at` otherwise, so a row profiled and explicitly
+/// (re-)dated via `profile_date` sorts correctly ahead of `created_at`-only
+/// rows. Review note (build session): the sanctioned read-only `pg_*` tool
+/// connected to a DB reporting zero tables, so this could not be directly
+/// re-confirmed against a live schema this session — implemented per the
+/// audit's pinned finding. SAFE either way: if some environment's
+/// `model_profiles` truly lacks `profile_date` (matching this checkout's own
+/// `CREATE TABLE`), Postgres reports a missing-column error, which this
+/// function's `Err` arm already degrades to `Ok(None)` via
+/// [`is_missing_column_error`] — never a hard failure.
 pub async fn read_latest_operational_profile_for_model(
     pool: &PgPool,
     model_name: &str,
@@ -2029,7 +2030,7 @@ pub async fn read_latest_operational_profile_for_model(
                FROM model_operational_profiles op \
                JOIN model_profiles mp ON mp.id = op.profile_id \
                WHERE mp.model_name = $1 \
-               ORDER BY mp.created_at DESC LIMIT 1";
+               ORDER BY COALESCE(mp.profile_date, mp.created_at) DESC LIMIT 1";
     type Row = (
         Option<i32>,
         Option<i32>,
@@ -2373,12 +2374,10 @@ pub async fn read_code_run_values_for_box(
     }
 }
 
-/// One `model_language_stats` matview row joined to its model's name, for
-/// `GET /api/terminus/mint/language-stats`. The view is NOT epoch-partitioned
-/// (no `harness_version` column — it is scoped to `mem_config = 'dynamic_gtt'`
-/// at CREATE time, see `assistant/schema.rs`), so `epoch` is accepted by the
-/// handler for contract-uniformity with the other MINT endpoints but does not
-/// filter this read (documented limitation, not silently ignored).
+/// One per-(model, language) rollup row for `GET
+/// /api/terminus/mint/language-stats` — same shape/formulas as the
+/// `model_language_stats` matview (`assistant/schema.rs`), joined to
+/// `model_profiles.vram_gb` for the Pareto scatter's point-size dimension.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LanguageStatsRow {
     pub model: String,
@@ -2396,21 +2395,81 @@ pub struct LanguageStatsRow {
     pub vram_gb: Option<f64>,
 }
 
-/// Read `model_language_stats` (optionally scoped to one `language`), joined to
-/// `model_profiles` for the display name and `model_profiles.vram_gb` for the
-/// Pareto scatter's point-size dimension. Tolerates the matview being absent
-/// (never refreshed / un-migrated host) → empty vec.
+/// Read per-(model, language) coder-sweep rollups (optionally scoped to one
+/// `language`), properly [`EpochSelector`]-scoped by `harness_version`
+/// (review fix: the earlier version read the pre-aggregated
+/// `model_language_stats` MATERIALIZED VIEW directly, which has no
+/// `harness_version` column at all — it is scoped only to `mem_config =
+/// 'dynamic_gtt'` at CREATE time — so an `epoch=v2` or `epoch=<current>`
+/// request silently returned the SAME all-epochs-blended numbers regardless
+/// of the requested epoch). This version recomputes the matview's own
+/// formulas (verbatim: same `case_counts`/`pass_k` CTEs for `pass_hat_3`,
+/// same `mean_score`/`stddev_score`/`retry_lift`/`mean_throughput`/
+/// `mean_latency_ms`/`p95_latency_ms`/`total_gpu_seconds`/
+/// `quality_per_gpu_second` expressions) directly over `code_profile_runs`
+/// with an added `harness_version` filter, so it is ALWAYS epoch-correct and
+/// never depends on the matview having been refreshed. Still scoped to
+/// `mem_config = 'dynamic_gtt'`, matching the matview's own scoping decision
+/// (see that migration's comment for why). Tolerates absent tables → empty
+/// vec.
 pub async fn read_language_stats(
     pool: &PgPool,
     language: Option<&str>,
+    epoch: &EpochSelector,
 ) -> Result<Vec<LanguageStatsRow>, ToolError> {
-    let where_sql = if language.is_some() { "WHERE mls.language = $1" } else { "" };
+    // Bind order: epoch first (if scoped), then language (if given) — both
+    // fragments below reference the SAME placeholder index for a given bind,
+    // just qualified differently per-CTE (`case_counts`'s bare
+    // `code_profile_runs` vs. the outer query's `r` alias).
+    let mut idx = 1usize;
+    let epoch_bare = crate::intake::epoch_where_fragment(epoch, idx);
+    let epoch_aliased = epoch_bare.replace("harness_version", "r.harness_version");
+    if epoch.epoch().is_some() {
+        idx += 1;
+    }
+    let (lang_bare, lang_aliased) = if language.is_some() {
+        (format!("AND language = ${idx}"), format!("AND r.language = ${idx}"))
+    } else {
+        (String::new(), String::new())
+    };
+
     let sql = format!(
-        "SELECT mp.model_name, mls.language, mls.n_scored, mls.mean_score, mls.stddev_score, \
-         mls.retry_lift, mls.mean_throughput, mls.mean_latency_ms, mls.p95_latency_ms, \
-         mls.total_gpu_seconds, mls.quality_per_gpu_second, mls.pass_hat_3, mp.vram_gb \
-         FROM model_language_stats mls JOIN model_profiles mp ON mp.id = mls.profile_id {where_sql} \
-         ORDER BY mp.model_name, mls.language"
+        "WITH case_counts AS ( \
+             SELECT profile_id, language, case_id, \
+                 count(*) AS n_samples, \
+                 count(*) FILTER (WHERE error IS NULL AND first_pass_score >= 3) AS c_success \
+             FROM code_profile_runs \
+             WHERE mem_config = 'dynamic_gtt' AND {epoch_bare} {lang_bare} \
+             GROUP BY profile_id, language, case_id \
+         ), \
+         pass_k AS ( \
+             SELECT profile_id, language, \
+                 avg(CASE WHEN n_samples < 3 THEN NULL ELSE \
+                     power(c_success::float / greatest(n_samples, 1)::float, 3) END) AS pass_hat_3 \
+             FROM case_counts GROUP BY profile_id, language \
+         ) \
+         SELECT mp.model_name, r.language, \
+             count(*) FILTER (WHERE r.error IS NULL) AS n_scored, \
+             avg(r.first_pass_score) FILTER (WHERE r.error IS NULL) AS mean_score, \
+             stddev(r.first_pass_score) FILTER (WHERE r.error IS NULL) AS stddev_score, \
+             avg(r.retry_score - r.first_pass_score) FILTER (WHERE r.retry_score IS NOT NULL) AS retry_lift, \
+             avg(r.throughput_tok_per_sec) AS mean_throughput, \
+             avg(r.total_time_ms) AS mean_latency_ms, \
+             percentile_cont(0.95) WITHIN GROUP (ORDER BY r.total_time_ms) AS p95_latency_ms, \
+             sum(r.total_time_ms)::float / 1000.0 AS total_gpu_seconds, \
+             avg(r.first_pass_score) FILTER (WHERE r.error IS NULL) \
+                 / NULLIF( \
+                     (sum(r.total_time_ms)::float / 1000.0) \
+                         / NULLIF(count(*) FILTER (WHERE r.error IS NULL), 0)::float, \
+                     0) AS quality_per_gpu_second, \
+             pk.pass_hat_3, \
+             mp.vram_gb \
+         FROM code_profile_runs r \
+         JOIN model_profiles mp ON mp.id = r.profile_id \
+         LEFT JOIN pass_k pk ON pk.profile_id = r.profile_id AND pk.language = r.language \
+         WHERE r.mem_config = 'dynamic_gtt' AND {epoch_aliased} {lang_aliased} \
+         GROUP BY mp.model_name, r.language, pk.pass_hat_3, mp.vram_gb \
+         ORDER BY mp.model_name, r.language"
     );
     type Row = (
         String,
@@ -2428,6 +2487,9 @@ pub async fn read_language_stats(
         Option<f64>,
     );
     let mut query = sqlx::query_as::<_, Row>(&sql);
+    if let Some(e) = epoch.epoch() {
+        query = query.bind(e.to_string());
+    }
     if let Some(l) = language {
         query = query.bind(l);
     }
@@ -2472,7 +2534,7 @@ pub async fn read_language_stats(
                 Ok(Vec::new())
             } else {
                 Err(ToolError::Database(format!(
-                    "Failed to read model_language_stats: {msg}"
+                    "Failed to read per-language coder rollups: {msg}"
                 )))
             }
         }
@@ -2812,11 +2874,20 @@ pub async fn read_gpu_hours(pool: &PgPool, epoch: &EpochSelector) -> Result<f64,
 }
 
 /// Run counts (code + context + agent) for the C0 overview tile, scoped by
-/// [`EpochSelector`] where the underlying table supports it. `context`/`agent`
-/// are NOT epoch-partitioned (no `harness_version` column on those tables —
-/// see the module-level note on [`read_language_stats`]), so those two counts
-/// are reported over ALL rows regardless of `epoch`; only `code` honors the
-/// filter. Tolerates absent tables → `0` for that suite.
+/// [`EpochSelector`] on ALL THREE suites (review fix: an earlier version only
+/// scoped `code`, since `context_profile_runs`/`agent_profile_runs` have no
+/// `harness_version` column — see the module-level note on
+/// [`read_language_stats`] — and silently counted every row regardless of
+/// `epoch`, overcounting the summary tile for any non-`All` epoch). `code` is
+/// scoped exactly via `harness_version`, its real epoch-partition key.
+/// `context`/`agent` are scoped by TIME instead, via
+/// [`epoch_time_window`]'s `[became_current_at, next_epoch's
+/// became_current_at)` window over `intake_epoch_marker` — a best-effort
+/// proxy (these suites don't carry their own epoch key) that is nonetheless
+/// exact for the common case (`Current`/no marker gaps) and never worse than
+/// the old "count everything" behavior. `epoch=all` (no marker lookup) counts
+/// every row for every suite, same as before. Tolerates absent tables → `0`
+/// for that suite.
 pub async fn read_run_counts(pool: &PgPool, epoch: &EpochSelector) -> Result<(i64, i64, i64), ToolError> {
     let where_frag = crate::intake::epoch_where_fragment(epoch, 1);
     let code_sql = format!("SELECT count(*)::bigint FROM code_profile_runs WHERE {where_frag}");
@@ -2835,17 +2906,75 @@ pub async fn read_run_counts(pool: &PgPool, epoch: &EpochSelector) -> Result<(i6
             }
         }
     };
-    let context = count_all_rows(pool, "context_profile_runs").await?;
-    let agent = count_all_rows(pool, "agent_profile_runs").await?;
+
+    let window = match epoch.epoch() {
+        None => None, // `All` — unscoped, matches `code`'s own `TRUE` fragment.
+        Some(e) => epoch_time_window(pool, e).await?,
+    };
+    let context = count_rows_in_window(pool, "context_profile_runs", window).await?;
+    let agent = count_rows_in_window(pool, "agent_profile_runs", window).await?;
     Ok((code, context, agent))
 }
 
-/// Unscoped `count(*)` over `table`, tolerating the relation being absent →
-/// `0`. Shared by [`read_run_counts`]'s `context`/`agent` suites (neither is
-/// epoch-partitioned — see that function's doc).
-async fn count_all_rows(pool: &PgPool, table: &str) -> Result<i64, ToolError> {
-    let sql = format!("SELECT count(*)::bigint FROM {table}");
-    match sqlx::query_as::<_, (i64,)>(&sql).fetch_one(pool).await {
+/// The `[start, end)` time window a suite lacking its own epoch column should
+/// count rows within, for `epoch`'s marker: `start` = that epoch's
+/// `became_current_at`; `end` = the NEXT-recorded epoch's `became_current_at`
+/// (`None` when `epoch` is still the newest marker — i.e. an open-ended
+/// window). Returns `None` (⇒ caller counts unscoped) when `epoch` has no
+/// recorded marker at all — this is the honest degrade: without a marker
+/// there is no time boundary to scope by, so counting everything is more
+/// truthful than fabricating a boundary.
+async fn epoch_time_window(
+    pool: &PgPool,
+    epoch: &str,
+) -> Result<Option<(chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>)>, ToolError> {
+    let Some(marker) = read_epoch_marker(pool, epoch).await? else {
+        return Ok(None);
+    };
+    let next_sql = "SELECT min(became_current_at) FROM intake_epoch_marker WHERE became_current_at > $1";
+    let next: Option<chrono::DateTime<chrono::Utc>> =
+        match sqlx::query_as::<_, (Option<chrono::DateTime<chrono::Utc>>,)>(next_sql)
+            .bind(marker.became_current_at)
+            .fetch_one(pool)
+            .await
+        {
+            Ok((n,)) => n,
+            Err(e) => {
+                let msg = e.to_string();
+                if is_missing_relation_error(&msg) {
+                    None
+                } else {
+                    return Err(ToolError::Database(format!(
+                        "Failed to read next epoch marker after {epoch}: {msg}"
+                    )));
+                }
+            }
+        };
+    Ok(Some((marker.became_current_at, next)))
+}
+
+/// `count(*)` over `table`, optionally scoped to a `[start, end)` `created_at`
+/// window (see [`epoch_time_window`]) — `None` ⇒ unscoped (every row).
+/// Tolerates the relation being absent → `0`.
+async fn count_rows_in_window(
+    pool: &PgPool,
+    table: &str,
+    window: Option<(chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>)>,
+) -> Result<i64, ToolError> {
+    let (where_sql, has_end) = match window {
+        None => (String::new(), false),
+        Some((_, Some(_))) => ("WHERE created_at >= $1 AND created_at < $2".to_string(), true),
+        Some((_, None)) => ("WHERE created_at >= $1".to_string(), false),
+    };
+    let sql = format!("SELECT count(*)::bigint FROM {table} {where_sql}");
+    let mut query = sqlx::query_as::<_, (i64,)>(&sql);
+    if let Some((start, end)) = window {
+        query = query.bind(start);
+        if has_end {
+            query = query.bind(end.unwrap());
+        }
+    }
+    match query.fetch_one(pool).await {
         Ok((n,)) => Ok(n),
         Err(e) => {
             let msg = e.to_string();
