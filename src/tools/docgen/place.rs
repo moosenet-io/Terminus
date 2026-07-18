@@ -150,6 +150,26 @@ fn place_one(target_root: &Path, relative_path: &str, content: &str, report: &mu
         );
         return;
     }
+    if relative_path.trim().is_empty() {
+        // `target_root.join("")` == `target_root`; the temp name would then be
+        // appended to the directory path itself, landing a temp file as a
+        // SIBLING outside target_root. Refuse before any path is built.
+        report.skip(relative_path, "empty path -- refused (resolves to target_root itself)");
+        return;
+    }
+    // Placement policy: this writer only ever lands the landing at README.md and
+    // rendered sub-pages under docs/. A docs-tree entry with any other in-root
+    // path (e.g. "Cargo.toml", "src/lib.rs") must never overwrite a repo file
+    // outside the docs area, even though it is technically inside target_root.
+    let in_placement_area = relative_path == README_PATH
+        || matches!(relative_path.strip_prefix("docs/"), Some(rest) if !rest.is_empty());
+    if !in_placement_area {
+        report.skip(
+            relative_path,
+            "path is outside the placement area (only README.md and docs/** are written) -- refused",
+        );
+        return;
+    }
     let final_path = target_root.join(relative_path);
 
     if let Ok(existing) = std::fs::read(&final_path) {
@@ -337,6 +357,50 @@ mod tests {
         // Nothing was written above target_root either.
         if let Some(parent) = root.parent() {
             assert!(!parent.join("escape.md").exists());
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn place_docs_refuses_entries_outside_the_readme_and_docs_placement_area() {
+        // In-root but out-of-area paths must never overwrite arbitrary repo
+        // files, and an empty path must never resolve to target_root itself
+        // (which would land a temp file as a sibling outside target_root).
+        let root = unique_tmp_dir("placement-area");
+        // A pre-existing repo file the writer must NOT clobber.
+        std::fs::write(root.join("Cargo.toml"), b"[package]\nname=\"real\"\n").unwrap();
+
+        let rogue = vec![
+            DocsTreeFile { path: "Cargo.toml".to_string(), content: "CLOBBERED".to_string() },
+            DocsTreeFile { path: "src/lib.rs".to_string(), content: "fn evil() {}".to_string() },
+            DocsTreeFile { path: "".to_string(), content: "empty path".to_string() },
+            DocsTreeFile { path: "docs/".to_string(), content: "bare docs dir".to_string() },
+            DocsTreeFile { path: "docs/ok.md".to_string(), content: "# Ok\n".to_string() },
+        ];
+
+        let report = place_docs(&root, "# Hello\n", &rogue);
+
+        // Only README.md and the legitimate docs/ file were written.
+        assert_eq!(report.written, vec![README_PATH.to_string(), "docs/ok.md".to_string()]);
+        // The four rogue entries were all refused with a reason.
+        assert_eq!(report.skipped.len(), 4, "skipped: {:?}", report.skipped);
+        for want in ["Cargo.toml", "src/lib.rs", "", "docs/"] {
+            assert!(report.skipped.iter().any(|s| s.path == want), "missing skip for {want:?}");
+        }
+        // The real Cargo.toml is untouched, src/lib.rs never created, and no
+        // stray temp file leaked outside target_root.
+        assert_eq!(std::fs::read(root.join("Cargo.toml")).unwrap(), b"[package]\nname=\"real\"\n");
+        assert!(!root.join("src/lib.rs").exists());
+        if let Some(parent) = root.parent() {
+            let leaked: Vec<_> = std::fs::read_dir(parent)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with(
+                    root.file_name().unwrap().to_string_lossy().as_ref()))
+                .filter(|e| e.file_name() != root.file_name().unwrap())
+                .collect();
+            assert!(leaked.is_empty(), "temp leaked outside target_root: {leaked:?}");
         }
 
         std::fs::remove_dir_all(&root).ok();
