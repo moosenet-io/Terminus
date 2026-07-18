@@ -13,10 +13,11 @@
 //! a single flat body -- it delegates to
 //! [`crate::tools::docgen::readme_layers::render_layered_readme`], which
 //! splits the generated content into hero/quickstart/deep-dive layers,
-//! follows the standard-readme section order, adds shields.io badges and a
-//! DOCGEN-11 architecture-SVG placeholder slot, and still goes through this
-//! same `render_note`/`NoteFrontmatter` pure primitive for its frontmatter
-//! block. `render()` here has no access to a project's PRIOR rendered
+//! follows the standard-readme section order, embeds a real architecture
+//! mermaid diagram (DOCGEN-22), and still goes through this same
+//! `render_note`/`NoteFrontmatter` pure primitive for its frontmatter
+//! block. (DGRICH-05, S119: the shields.io badge row this comment used to
+//! mention is deleted -- see `readme_layers`'s own module doc comment.) `render()` here has no access to a project's PRIOR rendered
 //! README (this function's signature, shared with every other renderer in
 //! this module via `render_all`, carries only the current `RenderContext`),
 //! so it always renders as a project's first layered README
