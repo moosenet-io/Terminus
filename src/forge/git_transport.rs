@@ -664,11 +664,13 @@ mod tests {
             find_bundle_ref("aaa HCAT-7\n", "HCAT-7").as_deref(),
             Some("HCAT-7")
         );
-        // suffix fallback
-        assert_eq!(
-            find_bundle_ref("aaa refs/remotes/origin/topic\n", "topic").as_deref(),
-            Some("refs/remotes/origin/topic")
-        );
+        // codex fix: a loose suffix match is NO LONGER accepted — a privileged
+        // push must not guess which source ref the caller meant. Only an exact
+        // `refs/heads/<ref>` or a bare `<ref>` matches; a `refs/remotes/origin/topic`
+        // for `topic` now returns None (fail cleanly) rather than mis-selecting it.
+        assert_eq!(find_bundle_ref("aaa refs/remotes/origin/topic\n", "topic"), None);
+        // ...and an ambiguous team-prefixed head is not silently chosen either.
+        assert_eq!(find_bundle_ref("aaa refs/heads/team/topic\n", "topic"), None);
         assert_eq!(find_bundle_ref("aaa refs/heads/main\n", "nope"), None);
     }
 
