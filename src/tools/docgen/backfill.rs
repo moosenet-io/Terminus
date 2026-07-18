@@ -39,10 +39,10 @@
 //! - [`super::trigger::run_docgen_trigger`] is the sole generation
 //!   orchestration (PII sweep, Chord call, per-target render) -- called with
 //!   `place=false` so this module decides placement itself.
-//! - [`super::preserve::split_old_sections`] / [`super::preserve::extract_preamble`]
-//!   are the SOLE old-README markdown-section parsers -- the same ones the
-//!   no-loss guard uses internally, now made `pub(crate)` for this module to
-//!   share rather than re-parsing headings a second way.
+//! - [`old_readme_parts`] is this module's own byte-offset section slicer for
+//!   VERBATIM relocation -- deliberately separate from the no-loss guard's
+//!   line-based `split_old_sections` (which normalises whitespace to compare
+//!   tokens); see [`old_readme_parts`] for why byte-exact slices are required.
 //! - [`super::preserve::check_preservation`] (DLAND-02) is the sole no-loss
 //!   guard -- no second coverage check.
 //! - [`super::readme_layers::check_landing_length`] /
