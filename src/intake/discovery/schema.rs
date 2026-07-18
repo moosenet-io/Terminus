@@ -35,13 +35,17 @@ pub enum FleetCategory {
     Embedding,
     Visual,
     Voice,
+    /// MINT-DIFF-01: diffusion language models (DiffusionGemma/dgem-shaped) —
+    /// generate via a fixed-canvas-block daemon, not Ollama's token-stream
+    /// wire protocol. See `crate::intake::newcats::diffusion`.
+    Diffusion,
 }
 
 impl FleetCategory {
     /// All variants, in the spec's documented order — used by tests and by any
     /// caller that needs to enumerate every category (e.g. DISC-06's per-
     /// category refresh loop).
-    pub const ALL: [FleetCategory; 7] = [
+    pub const ALL: [FleetCategory; 8] = [
         FleetCategory::ToolRouter,
         FleetCategory::WriterSlm,
         FleetCategory::Assistant,
@@ -49,6 +53,7 @@ impl FleetCategory {
         FleetCategory::Embedding,
         FleetCategory::Visual,
         FleetCategory::Voice,
+        FleetCategory::Diffusion,
     ];
 
     /// The stable snake_case key persisted to `model_discovery_candidate.category`.
@@ -61,6 +66,7 @@ impl FleetCategory {
             FleetCategory::Embedding => "embedding",
             FleetCategory::Visual => "visual",
             FleetCategory::Voice => "voice",
+            FleetCategory::Diffusion => "diffusion",
         }
     }
 
@@ -77,9 +83,10 @@ impl FleetCategory {
             "embedding" => Ok(FleetCategory::Embedding),
             "visual" => Ok(FleetCategory::Visual),
             "voice" => Ok(FleetCategory::Voice),
+            "diffusion" => Ok(FleetCategory::Diffusion),
             other => Err(ToolError::InvalidArgument(format!(
                 "unrecognized fleet category '{other}' (expected one of: tool_router, \
-                 writer_slm, assistant, coder, embedding, visual, voice)"
+                 writer_slm, assistant, coder, embedding, visual, voice, diffusion)"
             ))),
         }
     }

@@ -21,6 +21,15 @@
 //!     scoring/write path is exercised (against a mock result).
 //!   - [`voice_transcription`] — `task_category = "voice_transcription"`: ASR
 //!     transcript vs reference, scored by word-error-rate (WER).
+//!   - [`diffusion`]           — `task_category = "diffusion"` (MINT-DIFF-01):
+//!     diffusion-language-model (DiffusionGemma/dgem) probe. Unlike the other
+//!     four, emits TWO dimensions per use-case: use-case QUALITY
+//!     (`diffusion_use_case`/`use_case_success`, word-overlap vs a reference
+//!     answer) AND PERFORMANCE (`diffusion_performance`: `time_to_output_ms`,
+//!     `vram_peak_mb`, `blocks_per_sec` — never a token/sec number, since
+//!     diffusion generates in fixed canvas blocks, not a token stream). The
+//!     live backend call goes through `intake::infer::infer_with_metrics`'s
+//!     `kind == "daemon"` arm; this module's tests exercise scoring only.
 //!
 //! ## Shared scoring primitives
 //! [`text_similarity`] holds the small, dependency-free string-similarity
@@ -36,6 +45,7 @@
 //! tonight with synthetic data, independent of whether any real vision/ASR/
 //! image-gen backend is reachable from this box.
 
+pub mod diffusion;
 pub mod document_parsing;
 pub mod image_generation;
 pub mod image_parsing;

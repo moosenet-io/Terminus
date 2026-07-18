@@ -468,21 +468,22 @@ fn parse_suites(args: &Value, model_name: &str) -> Vec<String> {
 ///   - "coder"                  → [context, code]
 ///   - "gpt-oss"                → [context, agent]
 ///   - "qwen3:8b" / "harness"   → [context, code, agent]
-///   - "diffusiongemma"/"dgem"  → [context, code]  (note: non-Ollama daemon —
-///                                the Ollama suites can't load it; callers skip
-///                                it in the Ollama fleet)
+///   - "diffusiongemma"/"dgem"  → [diffusion]  (MINT-DIFF-01: a non-Ollama
+///                                daemon model — the Ollama-based suites
+///                                can't load it, so its default is the
+///                                diffusion suite, not `context`/`code`)
 ///   - default                  → [context]
 /// Pure.
 pub fn default_suites_for(model_name: &str) -> Vec<String> {
     let n = model_name.to_lowercase();
-    let v = if n.contains("coder") {
+    let v = if n.contains("diffusiongemma") || n.contains("dgem") {
+        vec!["diffusion"]
+    } else if n.contains("coder") {
         vec!["context", "code"]
     } else if n.contains("gpt-oss") {
         vec!["context", "agent"]
     } else if n.contains("qwen3:8b") || n.contains("harness") {
         vec!["context", "code", "agent"]
-    } else if n.contains("diffusiongemma") || n.contains("dgem") {
-        vec!["context", "code"]
     } else {
         vec!["context"]
     };
@@ -551,9 +552,12 @@ impl RustTool for ModelIntake {
          'context' (graduated context stress: throughput, TTFT, planted-fact recall, VRAM, OOM), \
          'code' (per-language code generation against the intake corpus → language whitelist), \
          'agent' (tool selection, multi-step, instruction following, hallucination, personality). \
-         If 'suites' is omitted it is inferred from the model name (coder→context+code, \
-         gpt-oss→context+agent, qwen3:8b/harness→all three, default→context). DiffusionGemma/dgem \
-         is a non-Ollama daemon model and is skipped by these Ollama-based suites."
+         'diffusion' (MINT-DIFF-01: DiffusionGemma/dgem use-case QUALITY + PERFORMANCE probe, run \
+         over the dgem daemon, not Ollama). If 'suites' is omitted it is inferred from the model \
+         name (coder→context+code, gpt-oss→context+agent, qwen3:8b/harness→all three, \
+         diffusiongemma/dgem→diffusion, default→context). DiffusionGemma/dgem is a non-Ollama \
+         daemon model: the context/code/agent suites cannot load it (skipped), but 'diffusion' runs \
+         via its own daemon path."
     }
 
     fn parameters(&self) -> Value {
@@ -563,8 +567,8 @@ impl RustTool for ModelIntake {
                 "model_name": { "type": "string", "description": "Ollama model name, e.g. 'gpt-oss:20b'" },
                 "suites": {
                     "type": "array",
-                    "items": { "type": "string", "enum": ["context", "code", "agent"] },
-                    "description": "Which suites to run. Default: inferred from the model name (per-model purpose routing)."
+                    "items": { "type": "string", "enum": ["context", "code", "agent", "diffusion"] },
+                    "description": "Which suites to run. Default: inferred from the model name (per-model purpose routing). 'diffusion' profiles a non-Ollama daemon model (DiffusionGemma/dgem) via its own daemon path — the other three suites don't apply to it."
                 },
                 "tiers": {
                     "type": "array",
@@ -621,12 +625,34 @@ impl RustTool for ModelIntake {
         out.push_str(&format!("Suites requested: {}\n\n", suites.join(", ")));
 
         // Daemon-model guard: DiffusionGemma/dgem can't be loaded by the
-        // Ollama-based suites. Note it and run nothing.
+        // Ollama-based suites (context/code/agent). MINT-DIFF-01: the guard is
+        // now RELAXED for the "diffusion" suite specifically — a daemon model
+        // requesting "diffusion" runs that suite via its own daemon path below;
+        // any Ollama-based suites also requested alongside it are still not
+        // applicable and are skipped with a note, never silently dropped.
         if is_non_ollama_daemon(model_name) {
+            if suites.iter().any(|s| s == "diffusion") {
+                let res = runner::run_diffusion_suite(model_name).await?;
+                out.push_str("=== Diffusion suite ===\n");
+                out.push_str(&format!(
+                    "use cases run: {}\navg use_case_success: {:.2}\navg time_to_output_ms: {:.0}\n",
+                    res.use_cases_run, res.avg_use_case_success, res.avg_time_to_output_ms,
+                ));
+                for line in &res.per_use_case {
+                    out.push_str(&format!("  {line}\n"));
+                }
+                if suites.iter().any(|s| s != "diffusion") {
+                    out.push_str(
+                        "Note: Ollama-based suites (context/code/agent) are not applicable to this \
+                         non-Ollama daemon model and were skipped.\n",
+                    );
+                }
+                return Ok(out);
+            }
             out.push_str(
                 "Note: this is a non-Ollama daemon model (DiffusionGemma/dgem). \
-                 The Ollama-based intake suites cannot load it — skipped. Profile it \
-                 via its own daemon harness.\n",
+                 The Ollama-based intake suites cannot load it — skipped. Request the \
+                 'diffusion' suite to profile it via its own daemon harness.\n",
             );
             return Ok(out);
         }
@@ -1177,7 +1203,8 @@ mod tests {
         assert_eq!(default_suites_for("qwen3-coder:30b"), vec!["context", "code"]);
         assert_eq!(default_suites_for("gpt-oss:20b"), vec!["context", "agent"]);
         assert_eq!(default_suites_for("harness-1"), vec!["context", "code", "agent"]);
-        assert_eq!(default_suites_for("diffusiongemma-26b-a4b"), vec!["context", "code"]);
+        assert_eq!(default_suites_for("diffusiongemma-26b-a4b"), vec!["diffusion"]);
+        assert_eq!(default_suites_for("dgem-secondary"), vec!["diffusion"]);
         assert_eq!(default_suites_for("llama3:8b"), vec!["context"]);
     }
 

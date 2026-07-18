@@ -314,6 +314,13 @@ pub struct ContextSuiteOutcome {
 /// Create a fresh `model_profiles` row for a model not going through the context
 /// suite (e.g. a code-only or agent-only run). Returns the new profile id.
 pub async fn create_profile_row(model_name: &str) -> Result<uuid::Uuid, ToolError> {
+    create_profile_row_for_provider(model_name, "ollama").await
+}
+
+/// [`create_profile_row`], but with an explicit `provider` tag rather than the
+/// hardcoded `"ollama"` — MINT-DIFF-01's diffusion suite runs models on the
+/// dgem daemon, not Ollama, so its profile rows should say so.
+pub async fn create_profile_row_for_provider(model_name: &str, provider: &str) -> Result<uuid::Uuid, ToolError> {
     let pool = storage::get_pool().await?;
     // MINT-INTAKE-SCHEMA: ensure the base profiling schema exists before writing.
     // The MCP intake tools reach the profile tables through here / run_context_suite
@@ -321,7 +328,7 @@ pub async fn create_profile_row(model_name: &str) -> Result<uuid::Uuid, ToolErro
     // only ran the discovery migration would 500 on every write. migrate() is
     // idempotent + advisory-locked (same call the sweep already makes).
     crate::intake::assistant::schema::migrate(&pool).await?;
-    storage::insert_model_profile(&pool, model_name, "ollama", None, None).await
+    storage::insert_model_profile(&pool, model_name, provider, None, None).await
 }
 
 /// Run the context suite end-to-end against `model_name` for the given `tiers`.
@@ -544,6 +551,90 @@ pub struct FleetSuiteResult {
     pub suites: Vec<String>,
     pub summary: String,
     pub skipped: bool,
+}
+
+/// Outcome of the diffusion suite (MINT-DIFF-01) for the tool return summary.
+pub struct DiffusionSuiteOutcome {
+    pub profile_id: uuid::Uuid,
+    pub use_cases_run: usize,
+    pub avg_use_case_success: f64,
+    pub avg_time_to_output_ms: f64,
+    /// One-line-per-use-case summary, in [`crate::intake::newcats::diffusion::USE_CASES`] order.
+    pub per_use_case: Vec<String>,
+}
+
+/// Run the diffusion suite (MINT-DIFF-01) end-to-end against `model_name`: for
+/// each entry in [`crate::intake::newcats::diffusion::USE_CASES`], run one
+/// generation through [`crate::intake::infer::infer_with_metrics`] (which
+/// routes a `kind == "daemon"`-tagged model onto the dgem daemon path, see
+/// `infer::diffusion_infer`), derive a [`crate::intake::newcats::diffusion::DiffusionOutcome`]
+/// from the normalized [`crate::intake::infer::InferMetrics`], and write both
+/// the use-case QUALITY and PERFORMANCE rows via
+/// [`crate::intake::newcats::diffusion::score_and_write`].
+///
+/// Creates its own `model_profiles` row (provider `"daemon"`, distinct from
+/// the Ollama suites' `"ollama"`) since a diffusion model never goes through
+/// [`run_context_suite`]. A per-use-case generation error is recorded (quality
+/// `0.0`, performance rows from whatever timing is available) rather than
+/// aborting the whole suite — matches every other `newcats` category's
+/// "failure is still useful signal" convention.
+pub async fn run_diffusion_suite(model_name: &str) -> Result<DiffusionSuiteOutcome, ToolError> {
+    use crate::intake::assistant::{BackendTag, ModelId};
+    use crate::intake::infer::infer_with_metrics;
+    use crate::intake::newcats::diffusion::{self, DiffusionOutcome};
+
+    let profile_id = create_profile_row_for_provider(model_name, "daemon").await?;
+    let pool = storage::get_pool().await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(900))
+        .build()
+        .map_err(|e| ToolError::Http(e.to_string()))?;
+    let model_id = ModelId::from(model_name);
+
+    let mut per_use_case = Vec::with_capacity(diffusion::USE_CASES.len());
+    let mut quality_sum = 0.0;
+    let mut time_sum = 0.0;
+    let mut n = 0usize;
+
+    for use_case in diffusion::USE_CASES {
+        let metrics = infer_with_metrics(&client, model_name, use_case.prompt, Duration::from_secs(600)).await;
+        let backend_tag = metrics
+            .hardware
+            .as_deref()
+            .and_then(BackendTag::parse)
+            .unwrap_or(BackendTag::Gpu);
+        let outcome = DiffusionOutcome {
+            output: metrics.response.clone(),
+            time_to_output_ms: metrics.total_time_ms.unwrap_or(0) as i64,
+            vram_peak_mb: metrics.vram_mb,
+            blocks: metrics.blocks,
+        };
+        let quality = diffusion::quality_score(&outcome.output, use_case.reference);
+        quality_sum += quality;
+        time_sum += outcome.time_to_output_ms as f64;
+        n += 1;
+
+        diffusion::score_and_write(&pool, profile_id, model_id.clone(), backend_tag, use_case, &outcome).await?;
+
+        per_use_case.push(if let Some(err) = &metrics.error {
+            format!("{}: error ({err})", use_case.label)
+        } else {
+            format!(
+                "{}: quality={quality:.2} time_ms={} vram_mb={}",
+                use_case.label,
+                outcome.time_to_output_ms,
+                outcome.vram_peak_mb.map(|v| v.to_string()).unwrap_or_else(|| "n/a".into()),
+            )
+        });
+    }
+
+    Ok(DiffusionSuiteOutcome {
+        profile_id,
+        use_cases_run: n,
+        avg_use_case_success: if n > 0 { quality_sum / n as f64 } else { 0.0 },
+        avg_time_to_output_ms: if n > 0 { time_sum / n as f64 } else { 0.0 },
+        per_use_case,
+    })
 }
 
 /// Disk-usage percentage for a mount via `df`, or None if it can't be read.

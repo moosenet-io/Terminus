@@ -39,6 +39,12 @@ pub struct InferMetrics {
     pub backend: Option<String>,
     /// Hardware the backend runs on (`"gpu"` | `"cpu"`).
     pub hardware: Option<String>,
+    /// MINT-DIFF-01: fixed canvas blocks generated, `kind == "daemon"`
+    /// (diffusion) backends only. Deliberately a SEPARATE field from
+    /// `response_tokens` — a diffusion model's "block" is not a token, and
+    /// conflating them would let a block-count silently masquerade as a
+    /// token-throughput number downstream. `None` for every other backend kind.
+    pub blocks: Option<i64>,
 }
 
 /// How to spawn a unit-less on-demand backend (the generic `llama-gpu`).
@@ -370,12 +376,63 @@ pub async fn infer_with_metrics(
             }
         }
         "llama-server" => llama_server_infer(client, &backend.url, prompt, timeout, &mut m).await,
+        "daemon" => diffusion_infer(prompt, timeout, &mut m).await,
         other => {
             m.error = Some(format!("backend '{}' has unsupported kind '{other}'", backend.name));
         }
     }
     m.vram_mb = vram_used_mb();
     m
+}
+
+/// MINT-DIFF-01: the `kind == "daemon"` arm of [`infer_with_metrics`] —
+/// diffusion models (DiffusionGemma / dgem) run as a persistent C++ daemon,
+/// not an Ollama/llama-server wire protocol. Mirrors [`llama_server_infer`]'s
+/// shape (fill `m` in place, never panic, every failure lands in `m.error`)
+/// but dispatches through [`crate::dgem::diffusion_generate`] — the SAME
+/// client/config/VRAM-coordination/error-mapping every other dgem tool uses,
+/// so this doesn't open a second, divergent HTTP path to the daemon.
+///
+/// `backend.url` is intentionally NOT used here: the dgem client resolves its
+/// own base URL from `DGEM_BASE_URL`/`DGEM_BIND`/`DGEM_HTTP_PORT` (env, sane
+/// defaults, never a literal — see `dgem::mod`'s config doc). A future
+/// registry entry's `url` field is not required to reach the daemon.
+///
+/// Diffusion generates in fixed canvas blocks, not a token stream — there is
+/// no meaningful `throughput_tok_per_sec` here, so it is deliberately left
+/// `None` (`ttft_ms` likewise: the daemon has no separate prefill phase to
+/// report). `total_time_ms` is the daemon's own wall-clock `time_ms`
+/// (generation only; `model_load_ms` is reported separately and NOT folded
+/// in, so a cold-load run doesn't look like a slow generation).
+async fn diffusion_infer(prompt: &str, timeout: Duration, m: &mut InferMetrics) {
+    // Matches dgem's own DEFAULT_MAX_TOKENS (see `dgem::mod` config doc); kept
+    // as a local literal rather than importing dgem's private default const so
+    // this arm doesn't reach into dgem's module-private config internals.
+    const DIFFUSION_INFER_MAX_TOKENS: u32 = 1024;
+    let fut = crate::dgem::diffusion_generate("", prompt, DIFFUSION_INFER_MAX_TOKENS);
+    let result = match tokio::time::timeout(timeout, fut).await {
+        Ok(r) => r,
+        Err(_) => {
+            m.error = Some(format!("diffusion daemon timed out after {timeout:?}"));
+            return;
+        }
+    };
+    match result {
+        Ok(resp) => {
+            m.response = resp.text;
+            m.total_time_ms = Some(resp.time_ms as i32);
+            m.response_tokens = if resp.tokens > 0 { Some(resp.tokens as i32) } else { None };
+            m.blocks = if resp.blocks > 0 { Some(resp.blocks) } else { None };
+            // No token-stream throughput for a block-diffusion model — see doc above.
+            m.throughput_tok_per_sec = None;
+            m.ttft_ms = None;
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            m.oom = msg.to_lowercase().contains("memory") || msg.to_lowercase().contains("oom");
+            m.error = Some(msg);
+        }
+    }
 }
 
 /// Normalized result of a single embedding request via the unified path.
