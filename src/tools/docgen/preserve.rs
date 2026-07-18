@@ -108,9 +108,14 @@ impl PreservationReport {
 /// One raw section parsed out of the OLD README: its heading text (empty
 /// for the "no `##` headings at all" edge case, see [`split_old_sections`])
 /// and its body.
-struct RawSection {
-    heading: String,
-    body: String,
+///
+/// `pub(crate)`: DLAND-RELOC reuses this SAME parse (never a second
+/// markdown-section splitter) to mechanically relocate each old section's
+/// VERBATIM heading + body into its own `docs/reference/<slug>.md` page --
+/// see `backfill.rs`'s `build_docs_tree_from_old_readme`.
+pub(crate) struct RawSection {
+    pub(crate) heading: String,
+    pub(crate) body: String,
 }
 
 /// Split the OLD README into its top-level (`## `) sections. Per the spec's
@@ -122,7 +127,12 @@ struct RawSection {
 ///
 /// Single linear pass over `content.lines()` -- no re-scanning, so this
 /// stays `O(n)` even for a several-thousand-line README.
-fn split_old_sections(content: &str) -> Vec<RawSection> {
+///
+/// `pub(crate)`: DLAND-RELOC (`backfill.rs`) reuses this exact split to
+/// mechanically relocate old sections verbatim into `docs/reference/*.md`
+/// pages -- the sole markdown-section parser for old-README content,
+/// shared by the no-loss guard and the mechanical relocation path.
+pub(crate) fn split_old_sections(content: &str) -> Vec<RawSection> {
     let mut sections = Vec::new();
     let mut current_heading: Option<String> = None;
     let mut current_body = String::new();
@@ -163,6 +173,27 @@ fn split_old_sections(content: &str) -> Vec<RawSection> {
     }
 
     sections
+}
+
+/// Everything before the first top-level (`## `) heading in the OLD README,
+/// trimmed -- the preamble text `split_old_sections` deliberately does NOT
+/// track as a section (see its doc comment). `pub(crate)`: DLAND-RELOC's
+/// mechanical relocation still wants this text (verbatim) for `docs/index.md`'s
+/// hub page, even though it is not itself a `##` section the no-loss guard
+/// tracks. Same single linear pass as `split_old_sections`'s own preamble
+/// handling, kept as its own tiny function rather than threading it back out
+/// of `split_old_sections` (which has no reason to change its own return
+/// shape for a caller-specific need).
+pub(crate) fn extract_preamble(content: &str) -> String {
+    let mut out = String::new();
+    for line in content.lines() {
+        if line.trim_start().starts_with("## ") {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.trim().to_string()
 }
 
 // ---------------------------------------------------------------------------
