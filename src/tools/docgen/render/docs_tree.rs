@@ -443,8 +443,11 @@ pub fn build_repo_docs_tree(
                 reference_files.push(DocsTreeFile { path, content: wrap_body(1, content) });
                 let one_liner = identity_one_liner(&subsystem.name)
                     .unwrap_or_else(|| first_paragraph(content));
+                // reference/index.md lives IN docs/reference/, so a subsystem
+                // page is a SIBLING: link `<name>.md`, not `reference/<name>.md`
+                // (which would resolve to docs/reference/reference/<name>.md).
                 reference_rows.push(format!(
-                    "| [{}](reference/{}.md) | {} |",
+                    "| [{}]({}.md) | {} |",
                     subsystem.name, subsystem.name, one_liner
                 ));
             }
@@ -463,7 +466,10 @@ pub fn build_repo_docs_tree(
     for (slug, content) in legacy_pages {
         let path = format!("docs/legacy/{slug}.md");
         legacy_files.push(DocsTreeFile { path: path.clone(), content: wrap_body(1, content) });
-        legacy_links.push(format!("- [{slug}](legacy/{slug}.md)"));
+        // Linked from docs/reference/index.md, so step up out of reference/ to
+        // reach docs/legacy/<slug>.md (a bare legacy/<slug>.md would resolve to
+        // docs/reference/legacy/<slug>.md).
+        legacy_links.push(format!("- [{slug}](../legacy/{slug}.md)"));
     }
 
     // ── docs/getting-started.md ──────────────────────────────────────────
@@ -1116,7 +1122,12 @@ mod tests {
         let files = build_repo_docs_tree("widget-factory", &fixture_facts(), &fixture_outcome_full(), &legacy);
         assert!(find(&files, "docs/legacy/old-notes.md").content.contains("Some verbatim legacy content."));
         let reference_index = &find(&files, "docs/reference/index.md").content;
-        assert!(reference_index.contains("legacy/old-notes.md"));
+        // The link must step UP out of reference/ to reach docs/legacy/, not
+        // resolve to the non-existent docs/reference/legacy/.
+        assert!(reference_index.contains("(../legacy/old-notes.md)"), "legacy link must be ../legacy/: {reference_index}");
+        assert!(!reference_index.contains("(legacy/old-notes.md)"), "must not use a same-dir legacy/ link: {reference_index}");
+        // Subsystem rows link to sibling pages, not reference/reference/<name>.md.
+        assert!(!reference_index.contains("(reference/"), "subsystem rows must be sibling links, not reference/<name>.md: {reference_index}");
     }
 
     #[test]
