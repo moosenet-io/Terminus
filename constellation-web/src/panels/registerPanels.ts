@@ -2,14 +2,23 @@
 // Imported once, for side effects only, from src/main.tsx before the app renders. Each future
 // panel adds one line here — the shell never needs to change.
 //
-// This now includes the full ported harmony-web surface (pages ported under src/pages/,
-// registered here as panels, grouped by system per CONST-04 §3):
-//   Harmony:  Dashboard, Projects, Tasks, Agents, PRs, Prompts, Sessions, AuditLog
+// CONST-16: also registers the ModuleDescriptor for every module that has a real presence
+// today (harmony/chord/lumina/terminus). `muse`/`models`/`mint` are valid `ModuleId`s (see
+// moduleRegistry.ts) but are NOT registered here yet — their modules/panels land with
+// CONST-19..24; until then they simply don't exist in the registry, so they never show up
+// as a global-bar tab (no module descriptor to match `getAvailableModules` against).
+//
+// Panel `system` values are now lowercase ModuleIds (not the old capitalized SystemGroup) —
+// the legacy Status/Providers groups have dissolved: Analytics/Engine Diagram re-home under
+// `harmony` (spec §5.1 — "'Status' as a top-level group dissolves into Overview"); Chord's
+// Providers panel stays under `chord` per §5.2 (only the *legacy label* 'Providers' remaps to
+// `terminus`, via legacySystemGroupToModuleId — no current panel used that label).
+//   Harmony:  Dashboard, Projects, Tasks, Agents, PRs, Prompts, Sessions, AuditLog,
+//             Analytics (was status.analytics), Engine Diagram (was status.engine-diagram)
 //   Chord:    Inference, Providers, Playground
-//   Status:   Analytics, Engine Diagram (dashboard/EnginePanel)
 //   Terminus: existing example TerminusPanel
 //   Lumina:   stub (config surface TBD in CONST-07)
-import { registerPanel } from '../lib/moduleRegistry';
+import { registerPanel, registerModule } from '../lib/moduleRegistry';
 import { TerminusPanel } from './terminus/TerminusPanel';
 import { LuminaStubPanel } from './lumina/LuminaStubPanel';
 import { EngineDiagramPanel } from './status/EngineDiagramPanel';
@@ -26,11 +35,20 @@ import { Providers } from '../pages/Providers';
 import { Playground } from '../pages/Playground';
 import { Analytics } from '../pages/Analytics';
 
+// ── Modules (CONST-16, §1.4 order: Overview · Harmony · Chord · Lumina · Muse · Models ·
+// MINT · Terminus — Overview has no descriptor, it's the always-available default route;
+// order 4/5/6 are reserved for muse/models/mint when their own items register them) ────────
+
+registerModule({ id: 'harmony', title: 'Harmony', icon: '⌂', healthSystem: 'harmony', order: 1 });
+registerModule({ id: 'chord', title: 'Chord', icon: '⚡', healthSystem: 'chord', order: 2 });
+registerModule({ id: 'lumina', title: 'Lumina', icon: '✦', healthSystem: 'lumina', order: 3 });
+registerModule({ id: 'terminus', title: 'Terminus', icon: '⚙', healthSystem: 'terminus', order: 7 });
+
 // ── Harmony ──────────────────────────────────────────────────────────────────
 
 registerPanel({
   id: 'harmony.dashboard',
-  system: 'Harmony',
+  system: 'harmony',
   title: 'Dashboard',
   path: '/harmony/dashboard',
   icon: '⌂',
@@ -40,7 +58,7 @@ registerPanel({
 
 registerPanel({
   id: 'harmony.projects',
-  system: 'Harmony',
+  system: 'harmony',
   title: 'Projects',
   path: '/harmony/projects',
   icon: '📁',
@@ -50,7 +68,7 @@ registerPanel({
 
 registerPanel({
   id: 'harmony.tasks',
-  system: 'Harmony',
+  system: 'harmony',
   title: 'Tasks',
   path: '/harmony/tasks',
   icon: '✓',
@@ -60,7 +78,7 @@ registerPanel({
 
 registerPanel({
   id: 'harmony.agents',
-  system: 'Harmony',
+  system: 'harmony',
   title: 'Agents',
   path: '/harmony/agents',
   icon: '🤖',
@@ -70,7 +88,7 @@ registerPanel({
 
 registerPanel({
   id: 'harmony.prs',
-  system: 'Harmony',
+  system: 'harmony',
   title: 'PRs',
   path: '/harmony/prs',
   icon: '⎇',
@@ -80,7 +98,7 @@ registerPanel({
 
 registerPanel({
   id: 'harmony.prompts',
-  system: 'Harmony',
+  system: 'harmony',
   title: 'Prompts',
   path: '/harmony/prompts',
   icon: '📝',
@@ -90,7 +108,7 @@ registerPanel({
 
 registerPanel({
   id: 'harmony.sessions',
-  system: 'Harmony',
+  system: 'harmony',
   title: 'Sessions',
   path: '/harmony/sessions',
   icon: '⏱',
@@ -100,7 +118,7 @@ registerPanel({
 
 registerPanel({
   id: 'harmony.audit',
-  system: 'Harmony',
+  system: 'harmony',
   title: 'Audit Log',
   path: '/harmony/audit',
   icon: '📋',
@@ -108,11 +126,32 @@ registerPanel({
   component: AuditLog,
 });
 
+// Re-homed from the legacy 'Status' group (spec §5.1/§10 CONST-16).
+registerPanel({
+  id: 'harmony.analytics',
+  system: 'harmony',
+  title: 'Analytics',
+  path: '/harmony/analytics',
+  icon: '📊',
+  available: true,
+  component: Analytics,
+});
+
+registerPanel({
+  id: 'harmony.engine',
+  system: 'harmony',
+  title: 'Engine Diagram',
+  path: '/harmony/engine',
+  icon: '⚙',
+  available: true,
+  component: EngineDiagramPanel,
+});
+
 // ── Chord ────────────────────────────────────────────────────────────────────
 
 registerPanel({
   id: 'chord.inference',
-  system: 'Chord',
+  system: 'chord',
   title: 'Inference',
   path: '/chord/inference',
   icon: '⚡',
@@ -122,7 +161,7 @@ registerPanel({
 
 registerPanel({
   id: 'chord.providers',
-  system: 'Chord',
+  system: 'chord',
   title: 'Providers',
   path: '/chord/providers',
   icon: '🔌',
@@ -132,7 +171,7 @@ registerPanel({
 
 registerPanel({
   id: 'chord.playground',
-  system: 'Chord',
+  system: 'chord',
   title: 'Playground',
   path: '/chord/playground',
   icon: '▶',
@@ -140,33 +179,11 @@ registerPanel({
   component: Playground,
 });
 
-// ── Status ───────────────────────────────────────────────────────────────────
-
-registerPanel({
-  id: 'status.analytics',
-  system: 'Status',
-  title: 'Analytics',
-  path: '/status/analytics',
-  icon: '📊',
-  available: true,
-  component: Analytics,
-});
-
-registerPanel({
-  id: 'status.engine-diagram',
-  system: 'Status',
-  title: 'Engine Diagram',
-  path: '/status/engine-diagram',
-  icon: '⚙',
-  available: true,
-  component: EngineDiagramPanel,
-});
-
 // ── Terminus ─────────────────────────────────────────────────────────────────
 
 registerPanel({
   id: 'terminus.config',
-  system: 'Terminus',
+  system: 'terminus',
   title: 'Config',
   path: '/terminus/config',
   icon: '⚙',
@@ -179,7 +196,7 @@ registerPanel({
 
 registerPanel({
   id: 'lumina.config',
-  system: 'Lumina',
+  system: 'lumina',
   title: 'Lumina',
   path: '/lumina/config',
   icon: '✦',
