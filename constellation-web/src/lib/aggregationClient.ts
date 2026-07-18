@@ -71,6 +71,9 @@ export interface AggregationClient {
   ws: {
     connect(handlers: WsHandlers): WsConnection;
   };
+  /** Allowlisted, non-secret localStorage seam — see `PrefsClient` above. Shared by both
+   *  adapters: prefs are always browser-local, they never depend on mock vs. http mode. */
+  prefs: PrefsClient;
 }
 
 export interface WsHandlers {
@@ -83,6 +86,60 @@ export interface WsConnection {
   send(data: unknown): void;
   close(): void;
 }
+
+// ── Prefs seam (CONST-16, §3.1) ──────────────────────────────────────────────
+// The one and only place browser storage may appear in this app (grep-gated). Backs the
+// Overview card canvas' persisted layout/density — deliberately NOT a general key-value store:
+// only the two allowlisted, non-secret keys below may ever be read or written. Any other key
+// (including via a loosely-typed caller) throws rather than silently writing an unreviewed key.
+
+/** The only two keys the prefs seam will ever store — both non-secret UI state. */
+export type PrefsKey = 'layout' | 'density';
+
+export interface PrefsClient {
+  /** Returns the stored value for an allowlisted key, or `null` if unset/unparsable. */
+  get<T>(key: PrefsKey): T | null;
+  /** Stores a value for an allowlisted key. Silently no-ops if storage is unavailable
+   *  (private-mode/quota) — prefs are a convenience, never load-bearing for correctness. */
+  set<T>(key: PrefsKey, value: T): void;
+}
+
+// ── Prefs seam implementation ────────────────────────────────────────────────
+// Defined here (ahead of both adapters) since each adapter's object literal references
+// `prefsClient` directly.
+
+const PREFS_ALLOWLIST: readonly PrefsKey[] = ['layout', 'density'];
+const PREFS_STORAGE_PREFIX = 'constellation.prefs.';
+
+function assertAllowedPrefsKey(key: string): asserts key is PrefsKey {
+  if (!(PREFS_ALLOWLIST as readonly string[]).includes(key)) {
+    throw new Error(
+      `prefs: key "${key}" is not allowlisted — only ${PREFS_ALLOWLIST.join(', ')} may be stored`,
+    );
+  }
+}
+
+/** The one `PrefsClient` implementation — shared by mock and http adapters (see the seam
+ *  doc comment above). `localStorage` appears nowhere else in this file or the app. */
+const prefsClient: PrefsClient = {
+  get<T>(key: PrefsKey): T | null {
+    assertAllowedPrefsKey(key);
+    try {
+      const raw = window.localStorage.getItem(`${PREFS_STORAGE_PREFIX}${key}`);
+      return raw === null ? null : (JSON.parse(raw) as T);
+    } catch {
+      return null;
+    }
+  },
+  set<T>(key: PrefsKey, value: T): void {
+    assertAllowedPrefsKey(key);
+    try {
+      window.localStorage.setItem(`${PREFS_STORAGE_PREFIX}${key}`, JSON.stringify(value));
+    } catch {
+      // Storage unavailable (private mode / quota) — prefs just don't persist this time.
+    }
+  },
+};
 
 // ── Mock adapter ─────────────────────────────────────────────────────────────
 // Canned data so the shell builds, runs, and is reviewable with zero backend.
@@ -278,6 +335,7 @@ const mockAdapter: AggregationClient = {
   ws: {
     connect: mockWsConnect,
   },
+  prefs: prefsClient,
 };
 
 // ── HTTP adapter ─────────────────────────────────────────────────────────────
@@ -421,6 +479,7 @@ const httpAdapter: AggregationClient = {
       };
     },
   },
+  prefs: prefsClient,
 };
 
 // ── Selection ─────────────────────────────────────────────────────────────
