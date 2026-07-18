@@ -74,6 +74,21 @@ impl PlacementReport {
 /// path is safe iff it is relative and contains no `..`/root/prefix
 /// component -- the only ways a nominally repo-relative string could
 /// otherwise land outside `target_root`.
+/// The deepest ancestor of `p` (including `p` itself) that already exists on
+/// disk, or `None` if not even the root component exists. Used to check
+/// symlink containment of the parts of a path that are ALREADY present before
+/// any directory is created.
+fn deepest_existing_ancestor(p: &Path) -> Option<PathBuf> {
+    let mut cur: Option<&Path> = Some(p);
+    while let Some(c) = cur {
+        if c.exists() {
+            return Some(c.to_path_buf());
+        }
+        cur = c.parent();
+    }
+    None
+}
+
 fn is_safe_relative_path(path: &str) -> bool {
     let p = Path::new(path);
     if p.is_absolute() {
@@ -180,15 +195,36 @@ fn place_one(target_root: &Path, canonical_root: &Path, relative_path: &str, con
     }
 
     if let Some(parent) = final_path.parent() {
+        // Defence against a SYMLINKED intermediate directory (e.g. a planted
+        // `docs -> /elsewhere`) that the lexical guards cannot see. We must
+        // detect the escape BEFORE creating anything: `create_dir_all` follows
+        // an existing symlinked component and would create directories OUTSIDE
+        // target_root (a nested path like docs/nested/x.md -> outside/nested)
+        // before any later check. So first resolve the deepest ALREADY-EXISTING
+        // ancestor of `parent` and refuse if it escapes the canonical root.
+        if let Some(anchor) = deepest_existing_ancestor(parent) {
+            match anchor.canonicalize() {
+                Ok(real) if real.starts_with(canonical_root) => {}
+                Ok(_) => {
+                    report.skip(
+                        relative_path,
+                        "an existing ancestor directory resolves outside target_root (symlinked intermediate) -- refused",
+                    );
+                    return;
+                }
+                Err(e) => {
+                    report.skip(relative_path, format!("cannot resolve ancestor directory: {e}"));
+                    return;
+                }
+            }
+        }
         if let Err(e) = std::fs::create_dir_all(parent) {
             report.skip(relative_path, format!("failed to create parent directory: {e}"));
             return;
         }
-        // Defence against a SYMLINKED intermediate directory (e.g. a planted
-        // `docs -> /elsewhere`): the lexical guards above cannot see it, so
-        // resolve the real parent and refuse if it escapes the canonical root.
-        // No artifact is ever written outside target_root even if such a
-        // symlink exists.
+        // Defence in depth: re-verify the now-existing parent stays inside the
+        // canonical root (any freshly created components are real dirs, never
+        // symlinks, so this holds unless something raced).
         match parent.canonicalize() {
             Ok(real_parent) if real_parent.starts_with(canonical_root) => {}
             Ok(_) => {
@@ -461,6 +497,35 @@ mod tests {
         assert!(!report.written.contains(&"docs/leak.md".to_string()));
         // Nothing leaked into the outside target.
         assert!(!outside.join("leak.md").exists());
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none(), "outside dir must stay empty");
+
+        std::fs::remove_dir_all(&container).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn place_docs_creates_no_directories_outside_root_via_a_symlinked_intermediate() {
+        use std::os::unix::fs::symlink;
+        // A NESTED docs path through a symlinked `docs` must not even create
+        // intermediate directories in the outside target (create_dir_all would
+        // otherwise follow the symlink before the escape is detected).
+        let container = unique_tmp_dir("symlink-nested");
+        let root = container.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = container.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("docs")).unwrap(); // root/docs -> ../outside
+
+        let tree = vec![DocsTreeFile {
+            path: "docs/nested/leak.md".to_string(),
+            content: "must not create outside/nested".to_string(),
+        }];
+        let report = place_docs(&root, "# Hello\n", &tree);
+
+        assert!(report.skipped.iter().any(|s| s.path == "docs/nested/leak.md"), "skipped: {:?}", report.skipped);
+        assert!(!report.written.contains(&"docs/nested/leak.md".to_string()));
+        // No directory or file was created inside the outside target.
+        assert!(!outside.join("nested").exists(), "a directory leaked outside target_root");
         assert!(std::fs::read_dir(&outside).unwrap().next().is_none(), "outside dir must stay empty");
 
         std::fs::remove_dir_all(&container).ok();
