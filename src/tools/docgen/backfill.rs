@@ -188,7 +188,11 @@ fn old_readme_parts(old: &str) -> (String, Vec<(String, String)>) {
     let mut fence: Option<(char, usize)> = None;
     for line in old.split_inclusive('\n') {
         let trimmed = line.trim_start();
-        if let Some((ch, len)) = fence_marker(trimmed) {
+        // CommonMark: a code fence may be indented at most 3 spaces; 4+ spaces
+        // of indentation is an indented code block, not a fence marker.
+        let indent = line.len() - trimmed.len();
+        let marker = if indent <= 3 { fence_marker(trimmed) } else { None };
+        if let Some((ch, len)) = marker {
             match fence {
                 None => fence = Some((ch, len)),
                 Some((open_ch, open_len)) => {
