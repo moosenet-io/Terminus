@@ -41,6 +41,28 @@ this is the contract the httpAdapter already assumes:
 | GET | `/api/terminus/config` | `{ modules: { name: string; enabled: boolean; version?: string }[]; workerCount: number }` |
 | any | `/api/{system}/{path}` | generic passthrough used by `client.request<T>()` for panel-specific reads that don't have a typed method yet |
 
+**CONST-21 — the Models/MINT read API** (`src/constellation/models_api.rs`, spec
+`docs/constellation/CONST-GUI-SPEC.md` §8). Feeds the Model Library (CONST-22) and MINT
+(CONST-23/24) modules. Every endpoint is protected (session cookie, same guard as everything
+above), masked, read-only `GET`, and reuses the existing `src/intake/{storage,catalog,
+discovery}` read layer — no second database pool, no MCP self-calls. List endpoints take
+`limit` (default 50, max 500) + `offset` and report a `total`. `epoch` follows
+`EpochSelector`: absent ⇒ current epoch, `epoch=all` ⇒ every epoch, else ⇒ that one epoch.
+
+| Method | Path | What it returns |
+|---|---|---|
+| GET | `/api/terminus/models?scope=&q=&category=&status=&serving=&limit=&offset=` | paged, joined fleet-catalog ⋈ discovery-brochure ⋈ advisor-matrix ⋈ serving keep-warm view |
+| GET | `/api/terminus/models/{name}` | one model's identity/brochure/serving/operational/catalog sections (each independently `null` when that source has nothing; `404` only when the name is unknown to every source) |
+| GET | `/api/terminus/mint/summary?epoch=` | the Overview stat-tile payload (models profiled, run counts, fleet-best model, GPU-hours, current epoch) |
+| GET | `/api/terminus/mint/dimensions?models=&epoch=` | the capability-radar payload (8 assistant dimensions, fleet-wide normalized, + fleet median) |
+| GET | `/api/terminus/mint/matrix?epoch=` | the coverage heatmap (fleet-catalog cells) |
+| GET | `/api/terminus/mint/runs?suite=code\|context\|agent&…&limit=&offset=` | paged raw run rows (table-view / drill-down source) |
+| GET | `/api/terminus/mint/box?metric=total_time_ms\|code_quality_score&…` | server-side quartiles + outliers per model (raw rows never reach the browser) |
+| GET | `/api/terminus/mint/language-stats?language=&epoch=` | per-model/language rollup (the Pareto-scatter source) |
+| GET | `/api/terminus/mint/failures?epoch=&task_category=` | per-model failure-class counts, top-5 + "other" fold |
+| GET | `/api/terminus/mint/context-profiles?models=` | per-model context-tier arrays + `max_context_safe` |
+| GET | `/api/terminus/mint/activity?range=` | runs/day by suite + the current epoch marker |
+
 ### 2. The module registry (`src/lib/moduleRegistry.ts`)
 
 Panels register a descriptor instead of the shell hardcoding a route table:

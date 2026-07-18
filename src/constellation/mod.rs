@@ -38,6 +38,7 @@ pub mod assets;
 pub mod audit;
 pub mod auth;
 pub mod mask;
+pub mod models_api;
 pub mod proxy;
 
 use axum::extract::{Request, State};
@@ -93,6 +94,21 @@ fn protected_router(state: Arc<McpServerState>) -> Router {
         .route("/api/harmony/*path", any(proxy::proxy_harmony))
         .route("/api/chord/*path", any(proxy::proxy_chord))
         .route("/api/lumina/*path", any(proxy::proxy_lumina))
+        // CONST-21: the Models/MINT read API (`models_api.rs`) — read-only
+        // GETs over the intake Postgres read layer, session-protected +
+        // masked exactly like every other route in this router (see that
+        // module's doc for the full endpoint list / spec §8).
+        .route("/api/terminus/models", get(models_api::list_models))
+        .route("/api/terminus/models/:name", get(models_api::model_detail))
+        .route("/api/terminus/mint/summary", get(models_api::mint_summary))
+        .route("/api/terminus/mint/dimensions", get(models_api::mint_dimensions))
+        .route("/api/terminus/mint/matrix", get(models_api::mint_matrix))
+        .route("/api/terminus/mint/runs", get(models_api::mint_runs))
+        .route("/api/terminus/mint/box", get(models_api::mint_box))
+        .route("/api/terminus/mint/language-stats", get(models_api::mint_language_stats))
+        .route("/api/terminus/mint/failures", get(models_api::mint_failures))
+        .route("/api/terminus/mint/context-profiles", get(models_api::mint_context_profiles))
+        .route("/api/terminus/mint/activity", get(models_api::mint_activity))
         .with_state(state)
         // Applied AFTER `with_state` (matching `crate::mcp_server::build_router`'s own
         // `.with_state(..).layer(TraceLayer::..)` ordering) -- `require_session` needs no
@@ -470,6 +486,36 @@ mod tests {
     /// Auth routes themselves must stay reachable unauthenticated -- a
     /// caller can't log in through a route that itself requires being
     /// logged in.
+    /// CONST-21: the new Models/MINT read API sits behind the SAME
+    /// `protected_router` guard as every other `/api/terminus/*` route —
+    /// unauthenticated is rejected 401 before `models_api::list_models` ever
+    /// runs (mirrors `unauthenticated_request_to_protected_route_is_rejected_401`
+    /// above, for this item's new routes specifically).
+    #[tokio::test]
+    #[serial]
+    async fn models_api_route_is_rejected_401_without_a_session() {
+        std::env::remove_var("TERMINUS_JWT_SIGNING_KEY");
+        let router = constellation_router(test_state());
+        let (status, _body) = get_json(router, "/api/terminus/models").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// A valid session reaches the handler (viewer-role-readable per spec §8 —
+    /// there is only one role, `operator`, until CONST-27 lands the `role`
+    /// claim, so any valid session today IS the "viewer can read" case).
+    #[tokio::test]
+    #[serial]
+    async fn models_api_route_reachable_with_a_valid_session() {
+        std::env::set_var("TERMINUS_JWT_SIGNING_KEY", "test-signing-key-mod-tests");
+        std::env::remove_var("INTAKE_DATABASE_URL");
+        std::env::remove_var("DATABASE_URL");
+        let router = constellation_router(test_state());
+        let (status, body) = get_json_authenticated(router, "/api/terminus/models").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 0);
+        std::env::remove_var("TERMINUS_JWT_SIGNING_KEY");
+    }
+
     #[tokio::test]
     #[serial]
     async fn auth_login_route_is_reachable_without_a_session() {

@@ -1875,6 +1875,1264 @@ pub async fn read_fleet_catalog(
     Ok(cards)
 }
 
+// ===========================================================================
+// CONST-21: additive read functions backing the Constellation web GUI's
+// `/api/terminus/models*` + `/api/terminus/mint/*` endpoints
+// (`src/constellation/models_api.rs`). These are READ-ONLY over the SAME
+// tables the rest of this module writes — no new pool, no new schema, no
+// change to any existing write path. Every function follows this file's
+// established absence-tolerance convention ([`is_missing_relation_error`] /
+// [`is_missing_column_error`] → empty result, not a panic or 500) so the web
+// API degrades to empty arrays on an un-migrated or freshly-provisioned host
+// exactly like the MCP tools already do.
+// ===========================================================================
+
+/// One raw `serving_profile` row, read back for the Model Library detail
+/// panel's "Deployment" section (spec §6.1.3 / §8
+/// `GET /api/terminus/models/{name}` `serving[]`). Deliberately a plain,
+/// stringly-typed row (not `crate::intake::serving::ServingProfile`, whose
+/// enums are validated at WRITE time) — a read path has no business rejecting
+/// a persisted row for failing a write-side enum parse; the web API surfaces
+/// whatever is stored, verbatim.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServingProfileRow {
+    pub backend_tag: String,
+    pub best_runtime: String,
+    pub tok_s: Option<f64>,
+    pub vram_or_ram_peak_gb: Option<f64>,
+    pub cold_load_s: Option<f64>,
+    pub keep_warm: bool,
+    pub fallback_runtime: Option<String>,
+    pub exclusion_reason: String,
+    pub recheck_trigger: String,
+    pub provenance: Option<String>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Every `serving_profile` row for one model (one per `backend_tag`).
+/// Tolerates the `serving_profile` table being absent (un-migrated host) →
+/// empty vec, never an error — the Deployment section just degrades to "no
+/// serving data yet".
+pub async fn read_serving_profiles_for_model(
+    pool: &PgPool,
+    model_name: &str,
+) -> Result<Vec<ServingProfileRow>, ToolError> {
+    let sql = "SELECT backend_tag, best_runtime, tok_s, vram_or_ram_peak_gb, cold_load_s, \
+               keep_warm, fallback_runtime, exclusion_reason, recheck_trigger, provenance, updated_at \
+               FROM serving_profile WHERE model_id = $1 ORDER BY backend_tag";
+    type Row = (
+        String,
+        String,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        bool,
+        Option<String>,
+        String,
+        String,
+        Option<String>,
+        chrono::DateTime<chrono::Utc>,
+    );
+    match sqlx::query_as::<_, Row>(sql)
+        .bind(model_name)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    backend_tag,
+                    best_runtime,
+                    tok_s,
+                    vram_or_ram_peak_gb,
+                    cold_load_s,
+                    keep_warm,
+                    fallback_runtime,
+                    exclusion_reason,
+                    recheck_trigger,
+                    provenance,
+                    updated_at,
+                )| ServingProfileRow {
+                    backend_tag,
+                    best_runtime,
+                    tok_s,
+                    vram_or_ram_peak_gb,
+                    cold_load_s,
+                    keep_warm,
+                    fallback_runtime,
+                    exclusion_reason,
+                    recheck_trigger,
+                    provenance,
+                    updated_at,
+                },
+            )
+            .collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                Ok(Vec::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read serving_profile rows for {model_name}: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// The set of model ids currently `keep_warm = true` on ANY backend — the
+/// Model Library's "serving now" signal (§6.1 header stat row + `serving_now`
+/// field, §8 models-list `coverage`). Tolerates an absent `serving_profile`
+/// table → empty set (nothing reports as serving).
+pub async fn read_keep_warm_model_ids(
+    pool: &PgPool,
+) -> Result<std::collections::BTreeSet<String>, ToolError> {
+    let sql = "SELECT DISTINCT model_id FROM serving_profile WHERE keep_warm = true";
+    match sqlx::query_as::<_, (String,)>(sql).fetch_all(pool).await {
+        Ok(rows) => Ok(rows.into_iter().map(|(m,)| m).collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                Ok(std::collections::BTreeSet::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read keep_warm serving_profile rows: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// The latest `model_operational_profiles` row for one model (by
+/// `created_at` — see the module-level CONST-21 note on `profile_date`: this
+/// checkout's `model_operational_profiles`/`model_profiles` CREATE statements
+/// have no `profile_date` column, only `created_at`; a live host reported to
+/// carry an out-of-band `profile_date` column per the CONST-GUI audit's
+/// contracts-to-confirm #1, but that could not be verified against a reachable
+/// live schema in this item's build session (the sanctioned read-only pg_*
+/// tool connected to a DB with zero tables). Ordering by `created_at` alone is
+/// therefore the defensively-correct choice here: a query that references a
+/// column absent from this checkout's schema would hard-error (not degrade)
+/// on any host that matches this checkout. If a future build confirms
+/// `profile_date` live, switch to `ORDER BY COALESCE(profile_date, created_at)
+/// DESC` and note the change in that item's PR.). Tolerates the table being
+/// absent → `None`.
+pub async fn read_latest_operational_profile_for_model(
+    pool: &PgPool,
+    model_name: &str,
+) -> Result<Option<OperationalProfileRow>, ToolError> {
+    let sql = "SELECT op.max_context_safe, op.max_context_absolute, op.quality_degradation_point, \
+               op.throughput_at_2k, op.throughput_at_8k, op.throughput_at_16k, op.throughput_at_32k, \
+               op.throughput_at_64k, op.recommended_timeout_chat_sec, op.recommended_timeout_build_sec, \
+               op.recommended_timeout_deep_sec, op.overall_tier \
+               FROM model_operational_profiles op \
+               JOIN model_profiles mp ON mp.id = op.profile_id \
+               WHERE mp.model_name = $1 \
+               ORDER BY mp.created_at DESC LIMIT 1";
+    type Row = (
+        Option<i32>,
+        Option<i32>,
+        Option<i32>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<i32>,
+        Option<i32>,
+        Option<i32>,
+        Option<String>,
+    );
+    match sqlx::query_as::<_, Row>(sql)
+        .bind(model_name)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(Some((
+            max_context_safe,
+            max_context_absolute,
+            quality_degradation_point,
+            throughput_at_2k,
+            throughput_at_8k,
+            throughput_at_16k,
+            throughput_at_32k,
+            throughput_at_64k,
+            recommended_timeout_chat_sec,
+            recommended_timeout_build_sec,
+            recommended_timeout_deep_sec,
+            overall_tier,
+        ))) => Ok(Some(OperationalProfileRow {
+            max_context_safe,
+            max_context_absolute,
+            quality_degradation_point,
+            throughput_at_2k,
+            throughput_at_8k,
+            throughput_at_16k,
+            throughput_at_64k,
+            throughput_at_32k,
+            recommended_timeout_chat_sec,
+            recommended_timeout_build_sec,
+            recommended_timeout_deep_sec,
+            overall_tier,
+        })),
+        Ok(None) => Ok(None),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                Ok(None)
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read operational profile for {model_name}: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// One raw run row for the MINT "runs" table view (`GET
+/// /api/terminus/mint/runs?suite=code`), field list per the CONST-GUI audit
+/// §5 `code_profile_runs` list verbatim (the columns a table-view drill-down
+/// needs — not every column on the table, but every column the spec's C3/C5
+/// drill-downs and the raw table view bind to).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct CodeRunListRow {
+    pub run_id: uuid::Uuid,
+    pub model: String,
+    pub language: Option<String>,
+    pub task_category: Option<String>,
+    pub backend_tag: Option<String>,
+    pub case_id: Option<String>,
+    pub first_pass_score: Option<i32>,
+    pub code_quality_score: Option<f64>,
+    pub total_time_ms: Option<i32>,
+    pub throughput_tok_per_sec: Option<f64>,
+    pub memory_usage_mb: Option<i32>,
+    pub oom: Option<bool>,
+    pub failure_class: Option<String>,
+    pub error: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Filters shared by [`read_code_runs_page`] and [`read_code_run_values_for_box`]
+/// — the `code` suite's slice of `GET /api/terminus/mint/runs`/`.../box`'s query
+/// params (model/task_category/language/failure_class/epoch).
+#[derive(Debug, Clone, Default)]
+pub struct CodeRunFilter {
+    pub model: Option<String>,
+    pub task_category: Option<String>,
+    pub language: Option<String>,
+    pub failure_class: Option<String>,
+    pub epoch: EpochSelector,
+}
+
+impl CodeRunFilter {
+    /// Build the `WHERE` fragment + positional binds (starting at `$1`) common
+    /// to every `code_profile_runs` read this item adds. `epoch` binds LAST via
+    /// [`crate::intake::epoch_where_fragment`] (`All` consumes no bind), so the
+    /// caller knows exactly which `$n` is the epoch bind (or none) without
+    /// re-deriving the count. Returns `(where_sql, next_free_idx)`.
+    fn where_sql(&self) -> (String, usize) {
+        let mut clauses: Vec<String> = vec!["r.finalized = true".to_string()];
+        let mut idx = 1usize;
+        if self.model.is_some() {
+            clauses.push(format!("mp.model_name = ${idx}"));
+            idx += 1;
+        }
+        if self.task_category.is_some() {
+            clauses.push(format!("r.task_category = ${idx}"));
+            idx += 1;
+        }
+        if self.language.is_some() {
+            clauses.push(format!("r.language = ${idx}"));
+            idx += 1;
+        }
+        if self.failure_class.is_some() {
+            clauses.push(format!("r.failure_class = ${idx}"));
+            idx += 1;
+        }
+        clauses.push(crate::intake::epoch_where_fragment(&self.epoch, idx).replace(
+            "harness_version",
+            "r.harness_version",
+        ));
+        if self.epoch.epoch().is_some() {
+            idx += 1;
+        }
+        (format!("WHERE {}", clauses.join(" AND ")), idx)
+    }
+}
+
+/// Page through `code_profile_runs` (joined to `model_profiles` for the
+/// display name) under `filter`, newest first, with the SAME `total` +
+/// `limit`/`offset` contract as `GET /api/terminus/models` (§8: "All list
+/// endpoints: `limit` … + `offset`, … a `total` field"). Tolerates the tables
+/// being absent → `(vec![], 0)`.
+pub async fn read_code_runs_page(
+    pool: &PgPool,
+    filter: &CodeRunFilter,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<CodeRunListRow>, i64), ToolError> {
+    let (where_sql, next_idx) = filter.where_sql();
+    let count_sql = format!(
+        "SELECT count(*)::bigint FROM code_profile_runs r \
+         JOIN model_profiles mp ON mp.id = r.profile_id {where_sql}"
+    );
+    let page_sql = format!(
+        "SELECT r.id, mp.model_name, r.language, r.task_category, r.backend_tag, r.case_id, \
+         r.first_pass_score, r.code_quality_score, r.total_time_ms, r.throughput_tok_per_sec, \
+         r.memory_usage_mb, r.oom, r.failure_class, r.error, r.created_at \
+         FROM code_profile_runs r JOIN model_profiles mp ON mp.id = r.profile_id {where_sql} \
+         ORDER BY r.created_at DESC LIMIT ${next_idx} OFFSET ${}",
+        next_idx + 1
+    );
+
+    let mut count_query = sqlx::query(&count_sql);
+    if let Some(m) = &filter.model {
+        count_query = count_query.bind(m.clone());
+    }
+    if let Some(t) = &filter.task_category {
+        count_query = count_query.bind(t.clone());
+    }
+    if let Some(l) = &filter.language {
+        count_query = count_query.bind(l.clone());
+    }
+    if let Some(f) = &filter.failure_class {
+        count_query = count_query.bind(f.clone());
+    }
+    if let Some(e) = filter.epoch.epoch() {
+        count_query = count_query.bind(e.to_string());
+    }
+    let total: i64 = match count_query.fetch_one(pool).await {
+        Ok(row) => {
+            use sqlx::Row as _;
+            row.try_get::<i64, _>(0).unwrap_or(0)
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                return Ok((Vec::new(), 0));
+            }
+            return Err(ToolError::Database(format!("Failed to count code runs: {msg}")));
+        }
+    };
+
+    type Row = (
+        uuid::Uuid,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i32>,
+        Option<f64>,
+        Option<i32>,
+        Option<f64>,
+        Option<i32>,
+        Option<bool>,
+        Option<String>,
+        Option<String>,
+        chrono::DateTime<chrono::Utc>,
+    );
+    let mut page_query = sqlx::query_as::<_, Row>(&page_sql);
+    if let Some(m) = &filter.model {
+        page_query = page_query.bind(m.clone());
+    }
+    if let Some(t) = &filter.task_category {
+        page_query = page_query.bind(t.clone());
+    }
+    if let Some(l) = &filter.language {
+        page_query = page_query.bind(l.clone());
+    }
+    if let Some(f) = &filter.failure_class {
+        page_query = page_query.bind(f.clone());
+    }
+    if let Some(e) = filter.epoch.epoch() {
+        page_query = page_query.bind(e.to_string());
+    }
+    page_query = page_query.bind(limit).bind(offset);
+
+    match page_query.fetch_all(pool).await {
+        Ok(rows) => Ok((
+            rows.into_iter()
+                .map(
+                    |(
+                        run_id,
+                        model,
+                        language,
+                        task_category,
+                        backend_tag,
+                        case_id,
+                        first_pass_score,
+                        code_quality_score,
+                        total_time_ms,
+                        throughput_tok_per_sec,
+                        memory_usage_mb,
+                        oom,
+                        failure_class,
+                        error,
+                        created_at,
+                    )| CodeRunListRow {
+                        run_id,
+                        model,
+                        language,
+                        task_category,
+                        backend_tag,
+                        case_id,
+                        first_pass_score,
+                        code_quality_score,
+                        total_time_ms,
+                        throughput_tok_per_sec,
+                        memory_usage_mb,
+                        oom,
+                        failure_class,
+                        error,
+                        created_at,
+                    },
+                )
+                .collect(),
+            total,
+        )),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                Ok((Vec::new(), 0))
+            } else {
+                Err(ToolError::Database(format!("Failed to read code runs: {msg}")))
+            }
+        }
+    }
+}
+
+/// One (model, value, case_id, failure_class) tuple for [`crate::constellation::models_api`]'s
+/// server-side quartile computation (`GET /api/terminus/mint/box`) — the raw
+/// values per model for whichever `metric` was requested
+/// (`total_time_ms`/`code_quality_score`), never shipped to the browser
+/// unaggregated (the handler reduces these to quartiles before responding).
+#[derive(Debug, Clone)]
+pub struct BoxMetricRow {
+    pub model: String,
+    pub value: f64,
+    pub run_id: uuid::Uuid,
+    pub case_id: Option<String>,
+    pub failure_class: Option<String>,
+}
+
+/// Read the raw per-run values of `metric` (`total_time_ms` or
+/// `code_quality_score` — validated by the caller before this is reached, so
+/// this function trusts its column-name argument) under `filter`, for
+/// server-side quartile computation. Tolerates absent tables → empty vec.
+pub async fn read_code_run_values_for_box(
+    pool: &PgPool,
+    metric_column: &str,
+    filter: &CodeRunFilter,
+) -> Result<Vec<BoxMetricRow>, ToolError> {
+    let (where_sql, _next_idx) = filter.where_sql();
+    let sql = format!(
+        "SELECT mp.model_name, r.{metric_column}::double precision, r.id, r.case_id, r.failure_class \
+         FROM code_profile_runs r JOIN model_profiles mp ON mp.id = r.profile_id {where_sql} \
+         AND r.{metric_column} IS NOT NULL"
+    );
+    let mut query = sqlx::query_as::<_, (String, f64, uuid::Uuid, Option<String>, Option<String>)>(&sql);
+    if let Some(m) = &filter.model {
+        query = query.bind(m.clone());
+    }
+    if let Some(t) = &filter.task_category {
+        query = query.bind(t.clone());
+    }
+    if let Some(l) = &filter.language {
+        query = query.bind(l.clone());
+    }
+    if let Some(f) = &filter.failure_class {
+        query = query.bind(f.clone());
+    }
+    if let Some(e) = filter.epoch.epoch() {
+        query = query.bind(e.to_string());
+    }
+    match query.fetch_all(pool).await {
+        Ok(rows) => Ok(rows
+            .into_iter()
+            .map(|(model, value, run_id, case_id, failure_class)| BoxMetricRow {
+                model,
+                value,
+                run_id,
+                case_id,
+                failure_class,
+            })
+            .collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                Ok(Vec::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read {metric_column} values for box plot: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// One `model_language_stats` matview row joined to its model's name, for
+/// `GET /api/terminus/mint/language-stats`. The view is NOT epoch-partitioned
+/// (no `harness_version` column — it is scoped to `mem_config = 'dynamic_gtt'`
+/// at CREATE time, see `assistant/schema.rs`), so `epoch` is accepted by the
+/// handler for contract-uniformity with the other MINT endpoints but does not
+/// filter this read (documented limitation, not silently ignored).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LanguageStatsRow {
+    pub model: String,
+    pub language: String,
+    pub n_scored: Option<i64>,
+    pub mean_score: Option<f64>,
+    pub stddev_score: Option<f64>,
+    pub retry_lift: Option<f64>,
+    pub mean_throughput: Option<f64>,
+    pub mean_latency_ms: Option<f64>,
+    pub p95_latency_ms: Option<f64>,
+    pub total_gpu_seconds: Option<f64>,
+    pub quality_per_gpu_second: Option<f64>,
+    pub pass_hat_3: Option<f64>,
+    pub vram_gb: Option<f64>,
+}
+
+/// Read `model_language_stats` (optionally scoped to one `language`), joined to
+/// `model_profiles` for the display name and `model_profiles.vram_gb` for the
+/// Pareto scatter's point-size dimension. Tolerates the matview being absent
+/// (never refreshed / un-migrated host) → empty vec.
+pub async fn read_language_stats(
+    pool: &PgPool,
+    language: Option<&str>,
+) -> Result<Vec<LanguageStatsRow>, ToolError> {
+    let where_sql = if language.is_some() { "WHERE mls.language = $1" } else { "" };
+    let sql = format!(
+        "SELECT mp.model_name, mls.language, mls.n_scored, mls.mean_score, mls.stddev_score, \
+         mls.retry_lift, mls.mean_throughput, mls.mean_latency_ms, mls.p95_latency_ms, \
+         mls.total_gpu_seconds, mls.quality_per_gpu_second, mls.pass_hat_3, mp.vram_gb \
+         FROM model_language_stats mls JOIN model_profiles mp ON mp.id = mls.profile_id {where_sql} \
+         ORDER BY mp.model_name, mls.language"
+    );
+    type Row = (
+        String,
+        String,
+        Option<i64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+    );
+    let mut query = sqlx::query_as::<_, Row>(&sql);
+    if let Some(l) = language {
+        query = query.bind(l);
+    }
+    match query.fetch_all(pool).await {
+        Ok(rows) => Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    model,
+                    language,
+                    n_scored,
+                    mean_score,
+                    stddev_score,
+                    retry_lift,
+                    mean_throughput,
+                    mean_latency_ms,
+                    p95_latency_ms,
+                    total_gpu_seconds,
+                    quality_per_gpu_second,
+                    pass_hat_3,
+                    vram_gb,
+                )| LanguageStatsRow {
+                    model,
+                    language,
+                    n_scored,
+                    mean_score,
+                    stddev_score,
+                    retry_lift,
+                    mean_throughput,
+                    mean_latency_ms,
+                    p95_latency_ms,
+                    total_gpu_seconds,
+                    quality_per_gpu_second,
+                    pass_hat_3,
+                    vram_gb,
+                },
+            )
+            .collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                Ok(Vec::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read model_language_stats: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// Per-(model, failure_class) run counts for `GET /api/terminus/mint/failures`,
+/// excluding `failure_class = 'none'` (a "failures" view is about failures) and
+/// scoped by [`EpochSelector`] + an optional `task_category`. Tolerates the
+/// table being absent → empty vec.
+pub async fn read_failure_class_counts(
+    pool: &PgPool,
+    epoch: &EpochSelector,
+    task_category: Option<&str>,
+) -> Result<Vec<(String, String, i64)>, ToolError> {
+    let mut idx = 1usize;
+    let mut clauses = vec![
+        "r.failure_class IS NOT NULL".to_string(),
+        "r.failure_class <> 'none'".to_string(),
+    ];
+    if task_category.is_some() {
+        clauses.push(format!("r.task_category = ${idx}"));
+        idx += 1;
+    }
+    clauses.push(crate::intake::epoch_where_fragment(epoch, idx).replace(
+        "harness_version",
+        "r.harness_version",
+    ));
+    let sql = format!(
+        "SELECT mp.model_name, r.failure_class, count(*)::bigint \
+         FROM code_profile_runs r JOIN model_profiles mp ON mp.id = r.profile_id \
+         WHERE {} GROUP BY mp.model_name, r.failure_class",
+        clauses.join(" AND ")
+    );
+    let mut query = sqlx::query_as::<_, (String, String, i64)>(&sql);
+    if let Some(t) = task_category {
+        query = query.bind(t);
+    }
+    if let Some(e) = epoch.epoch() {
+        query = query.bind(e.to_string());
+    }
+    match query.fetch_all(pool).await {
+        Ok(rows) => Ok(rows),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                Ok(Vec::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read failure-class counts: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// One `context_profile_runs` tier row for `GET
+/// /api/terminus/mint/context-profiles`, joined to its model's name and
+/// (best-effort) `max_context_safe`/`max_context_absolute` from the latest
+/// operational profile.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ContextProfileTierRow {
+    pub model: String,
+    pub context_tokens: i32,
+    pub throughput_tok_per_sec: Option<f64>,
+    pub ttft_ms: Option<i32>,
+    pub recall_score: Option<i32>,
+    pub memory_usage_mb: Option<i32>,
+    pub oom: bool,
+    pub max_context_safe: Option<i32>,
+}
+
+/// Read every `context_profile_runs` tier for the requested `models` (empty
+/// slice ⇒ every model), joined to `model_profiles` + the latest
+/// `model_operational_profiles.max_context_safe`. Tolerates absent tables →
+/// empty vec.
+pub async fn read_context_profiles(
+    pool: &PgPool,
+    models: &[String],
+) -> Result<Vec<ContextProfileTierRow>, ToolError> {
+    let where_sql = if models.is_empty() {
+        ""
+    } else {
+        "WHERE mp.model_name = ANY($1)"
+    };
+    let sql = format!(
+        "SELECT mp.model_name, cr.context_tokens, cr.throughput_tok_per_sec, cr.ttft_ms, \
+         cr.recall_score, cr.memory_usage_mb, cr.oom, \
+         (SELECT op.max_context_safe FROM model_operational_profiles op \
+          WHERE op.profile_id = mp.id ORDER BY op.created_at DESC LIMIT 1) AS max_context_safe \
+         FROM context_profile_runs cr JOIN model_profiles mp ON mp.id = cr.profile_id {where_sql} \
+         ORDER BY mp.model_name, cr.context_tokens"
+    );
+    type Row = (
+        String,
+        i32,
+        Option<f64>,
+        Option<i32>,
+        Option<i32>,
+        Option<i32>,
+        bool,
+        Option<i32>,
+    );
+    let mut query = sqlx::query_as::<_, Row>(&sql);
+    if !models.is_empty() {
+        query = query.bind(models.to_vec());
+    }
+    match query.fetch_all(pool).await {
+        Ok(rows) => Ok(rows
+            .into_iter()
+            .map(
+                |(model, context_tokens, throughput_tok_per_sec, ttft_ms, recall_score, memory_usage_mb, oom, max_context_safe)| {
+                    ContextProfileTierRow {
+                        model,
+                        context_tokens,
+                        throughput_tok_per_sec,
+                        ttft_ms,
+                        recall_score,
+                        memory_usage_mb,
+                        oom,
+                        max_context_safe,
+                    }
+                },
+            )
+            .collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                Ok(Vec::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read context profiles: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// One (dimension, model_id, mean value, mean std_dev, n, any-low-confidence)
+/// rollup row for `GET /api/terminus/mint/dimensions` (the C1 capability
+/// radar). Scoped by an [`EpochSelector`] against `assistant_profile_run.
+/// harness_version` (mirrors [`read_assistant_dimension_counts`]'s join, but
+/// rolled up to mean/std_dev/n instead of a bare count, and over EVERY
+/// dimension rather than counts-only).
+#[derive(Debug, Clone)]
+pub struct DimensionRollupRow {
+    pub model_id: String,
+    pub dimension: String,
+    pub mean_value: f64,
+    pub mean_std_dev: Option<f64>,
+    pub n: i64,
+    pub any_low_confidence: bool,
+}
+
+/// Read the per-(model, dimension) rollup (mean `value`, mean `std_dev`,
+/// sample count, whether any contributing row was `low_confidence`) scoped by
+/// `epoch`, preferring `judge = 'panel'` rows when any exist for a given
+/// (model, dimension) — falling back to every judge's rows otherwise (a
+/// `panel`-only filter would silently blank a model that was only ever judged
+/// by a single-judge pipeline). Tolerates absent tables → empty vec.
+pub async fn read_assistant_dimension_rollup(
+    pool: &PgPool,
+    epoch: &EpochSelector,
+) -> Result<Vec<DimensionRollupRow>, ToolError> {
+    let where_frag = crate::intake::epoch_where_fragment(epoch, 1).replace(
+        "harness_version",
+        "run.harness_version",
+    );
+    let sql = format!(
+        "WITH scoped AS ( \
+             SELECT s.* FROM assistant_dimension_score s \
+             JOIN assistant_profile_run run ON run.id = s.run_id \
+             WHERE {where_frag} \
+         ), \
+         preferred AS ( \
+             SELECT * FROM scoped WHERE judge = 'panel' \
+         ) \
+         SELECT model_id, dimension, avg(value), avg(std_dev), count(*)::bigint, bool_or(low_confidence) \
+         FROM (SELECT * FROM preferred \
+               UNION ALL \
+               SELECT s.* FROM scoped s \
+               WHERE NOT EXISTS ( \
+                   SELECT 1 FROM preferred p \
+                   WHERE p.model_id = s.model_id AND p.dimension = s.dimension \
+               )) merged \
+         GROUP BY model_id, dimension"
+    );
+    let mut query = sqlx::query_as::<
+        _,
+        (String, String, Option<f64>, Option<f64>, i64, Option<bool>),
+    >(&sql);
+    if let Some(e) = epoch.epoch() {
+        query = query.bind(e.to_string());
+    }
+    match query.fetch_all(pool).await {
+        Ok(rows) => Ok(rows
+            .into_iter()
+            .filter_map(|(model_id, dimension, mean_value, mean_std_dev, n, low_conf)| {
+                mean_value.map(|v| DimensionRollupRow {
+                    model_id,
+                    dimension,
+                    mean_value: v,
+                    mean_std_dev,
+                    n,
+                    any_low_confidence: low_conf.unwrap_or(false),
+                })
+            })
+            .collect()),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                Ok(Vec::new())
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read assistant dimension rollup: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// Activity-histogram day bucket: run counts by suite for `GET
+/// /api/terminus/mint/activity`.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ActivityDayCounts {
+    pub date: chrono::NaiveDate,
+    pub code: i64,
+    pub context: i64,
+    pub agent: i64,
+}
+
+/// Read per-day run counts across all three suites (`code_profile_runs`,
+/// `context_profile_runs`, `agent_profile_runs`) for the last `range_days`
+/// days, merged into one `{date, code, context, agent}` series. Each suite's
+/// count is read independently and tolerated missing (an absent suite table
+/// contributes zero counts, never fails the whole endpoint).
+pub async fn read_activity_histogram(
+    pool: &PgPool,
+    range_days: i64,
+) -> Result<Vec<ActivityDayCounts>, ToolError> {
+    use std::collections::BTreeMap;
+
+    async fn day_counts(
+        pool: &PgPool,
+        table: &str,
+        range_days: i64,
+    ) -> Result<Vec<(chrono::NaiveDate, i64)>, ToolError> {
+        let sql = format!(
+            "SELECT date(created_at), count(*)::bigint FROM {table} \
+             WHERE created_at >= now() - make_interval(days => $1) \
+             GROUP BY date(created_at)"
+        );
+        match sqlx::query_as::<_, (chrono::NaiveDate, i64)>(&sql)
+            .bind(range_days as i32)
+            .fetch_all(pool)
+            .await
+        {
+            Ok(rows) => Ok(rows),
+            Err(e) => {
+                let msg = e.to_string();
+                if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                    Ok(Vec::new())
+                } else {
+                    Err(ToolError::Database(format!("Failed to read {table} activity: {msg}")))
+                }
+            }
+        }
+    }
+
+    let code = day_counts(pool, "code_profile_runs", range_days).await?;
+    let context = day_counts(pool, "context_profile_runs", range_days).await?;
+    let agent = day_counts(pool, "agent_profile_runs", range_days).await?;
+
+    let mut by_day: BTreeMap<chrono::NaiveDate, ActivityDayCounts> = BTreeMap::new();
+    for (date, n) in code {
+        by_day.entry(date).or_insert_with(|| ActivityDayCounts { date, ..Default::default() }).code = n;
+    }
+    for (date, n) in context {
+        by_day.entry(date).or_insert_with(|| ActivityDayCounts { date, ..Default::default() }).context = n;
+    }
+    for (date, n) in agent {
+        by_day.entry(date).or_insert_with(|| ActivityDayCounts { date, ..Default::default() }).agent = n;
+    }
+    Ok(by_day.into_values().collect())
+}
+
+/// The fleet's best model by `model_language_stats.pass_hat_3` (the C0
+/// overview tile's "fleet-best model" figure) — the single highest
+/// `pass_hat_3` across every (model, language) row. Tolerates the matview
+/// being absent → `None`.
+pub async fn read_best_model_by_pass_hat_3(
+    pool: &PgPool,
+) -> Result<Option<(String, f64)>, ToolError> {
+    let sql = "SELECT mp.model_name, mls.pass_hat_3 FROM model_language_stats mls \
+               JOIN model_profiles mp ON mp.id = mls.profile_id \
+               WHERE mls.pass_hat_3 IS NOT NULL \
+               ORDER BY mls.pass_hat_3 DESC LIMIT 1";
+    match sqlx::query_as::<_, (String, f64)>(sql).fetch_optional(pool).await {
+        Ok(row) => Ok(row),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                Ok(None)
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to read fleet-best model: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// GPU-hours (`Σ total_time_ms / 3_600_000`) across `code_profile_runs` for
+/// the given [`EpochSelector`] — the C0 overview tile. Tolerates the table
+/// being absent → `0.0`.
+pub async fn read_gpu_hours(pool: &PgPool, epoch: &EpochSelector) -> Result<f64, ToolError> {
+    let where_frag = crate::intake::epoch_where_fragment(epoch, 1);
+    let sql = format!(
+        "SELECT COALESCE(sum(total_time_ms), 0)::double precision / 3600000.0 \
+         FROM code_profile_runs WHERE {where_frag}"
+    );
+    let mut query = sqlx::query_as::<_, (f64,)>(&sql);
+    if let Some(e) = epoch.epoch() {
+        query = query.bind(e.to_string());
+    }
+    match query.fetch_one(pool).await {
+        Ok((v,)) => Ok(v),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                Ok(0.0)
+            } else {
+                Err(ToolError::Database(format!("Failed to read GPU-hours: {msg}")))
+            }
+        }
+    }
+}
+
+/// Run counts (code + context + agent) for the C0 overview tile, scoped by
+/// [`EpochSelector`] where the underlying table supports it. `context`/`agent`
+/// are NOT epoch-partitioned (no `harness_version` column on those tables —
+/// see the module-level note on [`read_language_stats`]), so those two counts
+/// are reported over ALL rows regardless of `epoch`; only `code` honors the
+/// filter. Tolerates absent tables → `0` for that suite.
+pub async fn read_run_counts(pool: &PgPool, epoch: &EpochSelector) -> Result<(i64, i64, i64), ToolError> {
+    let where_frag = crate::intake::epoch_where_fragment(epoch, 1);
+    let code_sql = format!("SELECT count(*)::bigint FROM code_profile_runs WHERE {where_frag}");
+    let mut code_query = sqlx::query_as::<_, (i64,)>(&code_sql);
+    if let Some(e) = epoch.epoch() {
+        code_query = code_query.bind(e.to_string());
+    }
+    let code = match code_query.fetch_one(pool).await {
+        Ok((n,)) => n,
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                0
+            } else {
+                return Err(ToolError::Database(format!("Failed to count code runs: {msg}")));
+            }
+        }
+    };
+    let context = count_all_rows(pool, "context_profile_runs").await?;
+    let agent = count_all_rows(pool, "agent_profile_runs").await?;
+    Ok((code, context, agent))
+}
+
+/// Unscoped `count(*)` over `table`, tolerating the relation being absent →
+/// `0`. Shared by [`read_run_counts`]'s `context`/`agent` suites (neither is
+/// epoch-partitioned — see that function's doc).
+async fn count_all_rows(pool: &PgPool, table: &str) -> Result<i64, ToolError> {
+    let sql = format!("SELECT count(*)::bigint FROM {table}");
+    match sqlx::query_as::<_, (i64,)>(&sql).fetch_one(pool).await {
+        Ok((n,)) => Ok(n),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) {
+                Ok(0)
+            } else {
+                Err(ToolError::Database(format!("Failed to count {table}: {msg}")))
+            }
+        }
+    }
+}
+
+/// Count distinct models profiled at all (`model_profiles`) — the C0 overview
+/// tile's "models profiled" figure. Tolerates the table being absent → `0`
+/// (should not happen in practice — `model_profiles` is this module's own
+/// root table — but kept consistent with every other CONST-21 read here).
+pub async fn read_models_profiled_count(pool: &PgPool) -> Result<i64, ToolError> {
+    let sql = "SELECT count(DISTINCT model_name)::bigint FROM model_profiles";
+    match sqlx::query_as::<_, (i64,)>(sql).fetch_one(pool).await {
+        Ok((n,)) => Ok(n),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) {
+                Ok(0)
+            } else {
+                Err(ToolError::Database(format!(
+                    "Failed to count profiled models: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// One `context_profile_runs` row for the MINT "runs" table view
+/// (`GET /api/terminus/mint/runs?suite=context`) — `context_profile_runs` has
+/// no `task_category`/`failure_class`/`language` columns (unlike the coder
+/// suite), so this suite's page only accepts a `model` filter; the handler
+/// documents that narrower contract rather than silently accepting and
+/// ignoring the coder-suite params.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ContextRunListRow {
+    pub run_id: uuid::Uuid,
+    pub model: String,
+    pub context_tokens: i32,
+    pub throughput_tok_per_sec: Option<f64>,
+    pub ttft_ms: Option<i32>,
+    pub total_time_ms: Option<i32>,
+    pub recall_score: Option<i32>,
+    pub coherence_score: Option<f64>,
+    pub memory_usage_mb: Option<i32>,
+    pub oom: bool,
+    pub error: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Page through `context_profile_runs` (optionally scoped to one `model`),
+/// newest first, with the same `(rows, total)` contract as
+/// [`read_code_runs_page`]. Tolerates absent tables → `(vec![], 0)`.
+pub async fn read_context_runs_page(
+    pool: &PgPool,
+    model: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<ContextRunListRow>, i64), ToolError> {
+    let where_sql = if model.is_some() { "WHERE mp.model_name = $1" } else { "" };
+    let count_sql = format!(
+        "SELECT count(*)::bigint FROM context_profile_runs r \
+         JOIN model_profiles mp ON mp.id = r.profile_id {where_sql}"
+    );
+    let mut count_query = sqlx::query(&count_sql);
+    if let Some(m) = model {
+        count_query = count_query.bind(m);
+    }
+    let total: i64 = match count_query.fetch_one(pool).await {
+        Ok(row) => {
+            use sqlx::Row as _;
+            row.try_get::<i64, _>(0).unwrap_or(0)
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                return Ok((Vec::new(), 0));
+            }
+            return Err(ToolError::Database(format!("Failed to count context runs: {msg}")));
+        }
+    };
+
+    let (limit_idx, offset_idx) = if model.is_some() { (2, 3) } else { (1, 2) };
+    let page_sql = format!(
+        "SELECT r.id, mp.model_name, r.context_tokens, r.throughput_tok_per_sec, r.ttft_ms, \
+         r.total_time_ms, r.recall_score, r.coherence_score, r.memory_usage_mb, r.oom, r.error, \
+         r.created_at \
+         FROM context_profile_runs r JOIN model_profiles mp ON mp.id = r.profile_id {where_sql} \
+         ORDER BY r.created_at DESC LIMIT ${limit_idx} OFFSET ${offset_idx}"
+    );
+    type Row = (
+        uuid::Uuid,
+        String,
+        i32,
+        Option<f64>,
+        Option<i32>,
+        Option<i32>,
+        Option<i32>,
+        Option<f64>,
+        Option<i32>,
+        bool,
+        Option<String>,
+        chrono::DateTime<chrono::Utc>,
+    );
+    let mut page_query = sqlx::query_as::<_, Row>(&page_sql);
+    if let Some(m) = model {
+        page_query = page_query.bind(m);
+    }
+    page_query = page_query.bind(limit).bind(offset);
+    match page_query.fetch_all(pool).await {
+        Ok(rows) => Ok((
+            rows.into_iter()
+                .map(
+                    |(
+                        run_id,
+                        model,
+                        context_tokens,
+                        throughput_tok_per_sec,
+                        ttft_ms,
+                        total_time_ms,
+                        recall_score,
+                        coherence_score,
+                        memory_usage_mb,
+                        oom,
+                        error,
+                        created_at,
+                    )| ContextRunListRow {
+                        run_id,
+                        model,
+                        context_tokens,
+                        throughput_tok_per_sec,
+                        ttft_ms,
+                        total_time_ms,
+                        recall_score,
+                        coherence_score,
+                        memory_usage_mb,
+                        oom,
+                        error,
+                        created_at,
+                    },
+                )
+                .collect(),
+            total,
+        )),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                Ok((Vec::new(), 0))
+            } else {
+                Err(ToolError::Database(format!("Failed to read context runs: {msg}")))
+            }
+        }
+    }
+}
+
+/// One `agent_profile_runs` row for `GET /api/terminus/mint/runs?suite=agent`.
+/// Same narrower-contract note as [`read_context_runs_page`]: only a `model`
+/// filter (this table has no `task_category`/`language`/`failure_class`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AgentRunListRow {
+    pub run_id: uuid::Uuid,
+    pub model: String,
+    pub test_name: Option<String>,
+    pub tool_count_available: Option<i32>,
+    pub correct_tool_selected: Option<bool>,
+    pub tool_params_valid: Option<bool>,
+    pub multi_step_completed: Option<bool>,
+    pub instruction_followed: Option<bool>,
+    pub hallucination_detected: Option<bool>,
+    pub response_quality_score: Option<f64>,
+    pub total_time_ms: Option<i32>,
+    pub error: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Page through `agent_profile_runs` (optionally scoped to one `model`),
+/// newest first. Tolerates absent tables → `(vec![], 0)`.
+pub async fn read_agent_runs_page(
+    pool: &PgPool,
+    model: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<AgentRunListRow>, i64), ToolError> {
+    let where_sql = if model.is_some() { "WHERE mp.model_name = $1" } else { "" };
+    let count_sql = format!(
+        "SELECT count(*)::bigint FROM agent_profile_runs r \
+         JOIN model_profiles mp ON mp.id = r.profile_id {where_sql}"
+    );
+    let mut count_query = sqlx::query(&count_sql);
+    if let Some(m) = model {
+        count_query = count_query.bind(m);
+    }
+    let total: i64 = match count_query.fetch_one(pool).await {
+        Ok(row) => {
+            use sqlx::Row as _;
+            row.try_get::<i64, _>(0).unwrap_or(0)
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                return Ok((Vec::new(), 0));
+            }
+            return Err(ToolError::Database(format!("Failed to count agent runs: {msg}")));
+        }
+    };
+
+    let (limit_idx, offset_idx) = if model.is_some() { (2, 3) } else { (1, 2) };
+    let page_sql = format!(
+        "SELECT r.id, mp.model_name, r.test_name, r.tool_count_available, r.correct_tool_selected, \
+         r.tool_params_valid, r.multi_step_completed, r.instruction_followed, r.hallucination_detected, \
+         r.response_quality_score, r.total_time_ms, r.error, r.created_at \
+         FROM agent_profile_runs r JOIN model_profiles mp ON mp.id = r.profile_id {where_sql} \
+         ORDER BY r.created_at DESC LIMIT ${limit_idx} OFFSET ${offset_idx}"
+    );
+    type Row = (
+        uuid::Uuid,
+        String,
+        Option<String>,
+        Option<i32>,
+        Option<bool>,
+        Option<bool>,
+        Option<bool>,
+        Option<bool>,
+        Option<bool>,
+        Option<f64>,
+        Option<i32>,
+        Option<String>,
+        chrono::DateTime<chrono::Utc>,
+    );
+    let mut page_query = sqlx::query_as::<_, Row>(&page_sql);
+    if let Some(m) = model {
+        page_query = page_query.bind(m);
+    }
+    page_query = page_query.bind(limit).bind(offset);
+    match page_query.fetch_all(pool).await {
+        Ok(rows) => Ok((
+            rows.into_iter()
+                .map(
+                    |(
+                        run_id,
+                        model,
+                        test_name,
+                        tool_count_available,
+                        correct_tool_selected,
+                        tool_params_valid,
+                        multi_step_completed,
+                        instruction_followed,
+                        hallucination_detected,
+                        response_quality_score,
+                        total_time_ms,
+                        error,
+                        created_at,
+                    )| AgentRunListRow {
+                        run_id,
+                        model,
+                        test_name,
+                        tool_count_available,
+                        correct_tool_selected,
+                        tool_params_valid,
+                        multi_step_completed,
+                        instruction_followed,
+                        hallucination_detected,
+                        response_quality_score,
+                        total_time_ms,
+                        error,
+                        created_at,
+                    },
+                )
+                .collect(),
+            total,
+        )),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_missing_relation_error(&msg) || is_missing_column_error(&msg) {
+                Ok((Vec::new(), 0))
+            } else {
+                Err(ToolError::Database(format!("Failed to read agent runs: {msg}")))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
