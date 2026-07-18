@@ -598,7 +598,14 @@ script -- it takes care of the upload for you.\n",
     fn old_readme_with_no_headings_is_checked_as_a_single_whole_document_section() {
         let old_readme = "Just a flat README with a `WIDGET_TOKEN` reference and nothing else, \
 no markdown sections at all.";
-        let new_docs = vec![docs_file("docs/index.md", "The `WIDGET_TOKEN` value is documented here.")];
+        // The new hierarchy preserves this heading-less doc's substance -- both
+        // of its stable tokens (`WIDGET_TOKEN` and the ALL-CAPS word README)
+        // resurface, so under the strict no-loss rule the single whole-document
+        // section is covered.
+        let new_docs = vec![docs_file(
+            "docs/index.md",
+            "The `WIDGET_TOKEN` value is documented here in the README.",
+        )];
 
         let report = check_preservation(old_readme, "landing", &new_docs);
         assert_eq!(report.covered, vec!["(whole document)".to_string()]);
