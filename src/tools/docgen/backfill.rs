@@ -162,9 +162,19 @@ fn slugify(heading: &str) -> String {
 fn old_readme_parts(old: &str) -> (String, Vec<(String, String)>) {
     let mut starts: Vec<(usize, String)> = Vec::new();
     let mut offset = 0usize;
+    // Track fenced code blocks so a literal `## ` line INSIDE a ``` / ~~~ fence
+    // (e.g. a shell/markdown example) is never mistaken for a real section
+    // boundary -- otherwise a code example would be split across pages, breaking
+    // its fence and inventing a bogus reference page.
+    let mut in_fence = false;
     for line in old.split_inclusive('\n') {
-        if let Some(rest) = line.trim_start().strip_prefix("## ") {
-            starts.push((offset, rest.trim().to_string()));
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+        } else if !in_fence {
+            if let Some(rest) = trimmed.strip_prefix("## ") {
+                starts.push((offset, rest.trim().to_string()));
+            }
         }
         offset += line.len();
     }
@@ -1033,6 +1043,25 @@ mod tests {
             config_page.content, expected,
             "page is not the byte-exact verbatim source slice"
         );
+    }
+
+    #[test]
+    fn a_heading_inside_a_code_fence_does_not_split_a_section() {
+        // A `## ` line inside a ``` fence is part of a code EXAMPLE, not a real
+        // section -- it must not split the enclosing section or invent a page,
+        // and the fence must stay intact in the relocated page.
+        let old = "# T\n\n## Usage\n\nExample:\n\n```md\n## Not A Real Section\nstill inside the fence\n```\n\nDone.\n\n## Config\n\nSet up `WIDGET_PORT`.\n";
+        let tree = build_docs_tree_from_old_readme(old);
+        // Exactly two reference pages (Usage, Config) + the index -> 3 files.
+        let ref_pages: Vec<_> = tree.iter().filter(|f| f.path.starts_with("docs/reference/")).collect();
+        assert_eq!(ref_pages.len(), 2, "fenced ## must not create a third page: {:?}",
+            ref_pages.iter().map(|f| &f.path).collect::<Vec<_>>());
+        let usage = tree.iter().find(|f| f.path == "docs/reference/usage.md").expect("usage page");
+        // The fenced heading + its fence live verbatim inside the Usage page.
+        assert!(usage.content.contains("```md\n## Not A Real Section\nstill inside the fence\n```"),
+            "fence not preserved intact: {}", usage.content);
+        assert!(tree.iter().any(|f| f.path == "docs/reference/config.md"));
+        assert!(!tree.iter().any(|f| f.path == "docs/reference/not-a-real-section.md"));
     }
 
     // ── Edge: README with no `##` sections -> one whole-document page ────
