@@ -855,6 +855,21 @@ impl RustTool for ListRepos {
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    // TERM-PREREQ-GITEA-LISTREPOS (unblocks HCAT-25): expose a typed structured
+    // response so egress callers (harmony `GiteaClient::list_repos`) recover a
+    // `Vec<GiteaRepo>` without text-scraping — the last GiteaClient method still
+    // on direct REST. Shape mirrors the plane/gitea siblings:
+    // `{ owner, page, shown, items:[GiteaRepo] }`.
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl ListRepos {
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let limit = args["limit"].as_u64().unwrap_or(50).min(50);
         let page = args["page"].as_u64().unwrap_or(1).max(1);
@@ -870,8 +885,17 @@ impl RustTool for ListRepos {
         )
         .map_err(|e| ToolError::Http(format!("Failed to parse repo list: {e}")))?;
 
+        // `GiteaRepo` is `Serialize`; the structured payload is the same typed
+        // objects harmony deserializes back into `Vec<Repo>`.
+        let structured = json!({
+            "owner": client.owner,
+            "page": page,
+            "shown": repos.len(),
+            "items": repos,
+        });
+
         if repos.is_empty() {
-            return Ok(format!("No repositories found for '{}'.", client.owner));
+            return Ok((format!("No repositories found for '{}'.", client.owner), structured));
         }
 
         let mut out = format!(
@@ -889,7 +913,7 @@ impl RustTool for ListRepos {
                 r.default_branch,
             ));
         }
-        Ok(out)
+        Ok((out, structured))
     }
 }
 
@@ -3043,6 +3067,41 @@ mod tests {
         mock.assert();
         assert!(result.contains("testorg/lumina"));
         assert!(result.contains("Project docs"));
+    }
+
+    // TERM-PREREQ-GITEA-LISTREPOS: execute_structured returns a typed
+    // { owner, page, shown, items:[GiteaRepo] } payload egress callers deserialize.
+    #[tokio::test]
+    async fn test_list_repos_execute_structured_returns_typed_items() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/repos/search")
+                .query_param("owner", "testorg");
+            then.status(200).json_body(serde_json::json!({
+                "data": [
+                    {"id": 1, "name": "lumina", "full_name": "testorg/lumina",
+                     "description": "Project docs", "private": false,
+                     "html_url": "http://example.com/testorg/lumina",
+                     "clone_url": "http://example.com/testorg/lumina.git",
+                     "default_branch": "main", "stars_count": 0, "forks_count": 0,
+                     "open_issues_count": 0, "updated": null}
+                ],
+                "ok": true
+            }));
+        });
+        let tool = ListRepos { client: mock_client(&server) };
+        let out = tool.execute_structured(serde_json::json!({})).await.unwrap();
+        mock.assert();
+        assert!(out.text.contains("testorg/lumina"), "text: {}", out.text);
+        let s = out.structured.expect("structured payload present");
+        assert_eq!(s["shown"], 1);
+        assert_eq!(s["owner"], "testorg");
+        let items = s["items"].as_array().expect("items array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["full_name"], "testorg/lumina");
+        assert_eq!(items[0]["clone_url"], "http://example.com/testorg/lumina.git");
+        assert_eq!(items[0]["default_branch"], "main");
     }
 
     // ── get_repo ──────────────────────────────────────────────────────────
