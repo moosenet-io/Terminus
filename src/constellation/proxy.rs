@@ -567,4 +567,107 @@ mod tests {
         assert!(!"api/graph/taste-clusters".starts_with("art/"));
         assert!(!"on_deck".starts_with("art/"));
     }
+
+    /// POSITIVE binary passthrough (review follow-up on the CONST-19 PR):
+    /// the earlier art tests only covered unconfigured/unreachable
+    /// degradation, never a successful byte-for-byte forward. This spins up
+    /// a real ephemeral HTTP server (same pattern as
+    /// `pki::server::build_gateway_router_merges_mcp_and_enroll_routes`)
+    /// that answers with fixed non-JSON bytes (a PNG magic-number prefix
+    /// plus a JSON-secret-shaped byte sequence embedded in the "body", to
+    /// prove masking never touches it) and an `image/png` content-type, then
+    /// asserts `proxy_muse_art` forwards the bytes EXACTLY and preserves the
+    /// upstream's own content-type rather than the JSON arm's hardcoded
+    /// `application/json`.
+    #[tokio::test]
+    #[serial]
+    async fn muse_art_success_forwards_bytes_and_content_type_without_masking() {
+        // A byte sequence that is (a) not valid UTF-8/JSON at all (the PNG
+        // magic number) and (b) contains a secret-shaped substring
+        // (`"api_key":"should-never-be-redacted"`) that mask_response WOULD
+        // alter if this path ever ran the body through JSON parse + masking.
+        let mut art_bytes: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        art_bytes.extend_from_slice(br#"{"api_key":"should-never-be-redacted"}"#);
+        let expected_bytes = art_bytes.clone();
+
+        async fn serve_art(bytes: Vec<u8>) -> Response {
+            (StatusCode::OK, [("content-type", "image/png")], bytes).into_response()
+        }
+        let art_bytes_for_handler = art_bytes.clone();
+        let app = axum::Router::new().route(
+            "/art/poster/123",
+            axum::routing::get(move || serve_art(art_bytes_for_handler.clone())),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback"); // pii-test-fixture
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        std::env::set_var("CONSTELLATION_MUSE_URL", format!("http://{addr}")); // pii-test-fixture
+
+        let resp = proxy_muse_art(
+            "art/poster/123",
+            None,
+            Method::GET,
+            &HeaderMap::new(),
+            Bytes::new(),
+            None,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap().to_string();
+        assert_eq!(content_type, "image/png", "upstream content-type must be preserved verbatim");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            body.as_ref(),
+            expected_bytes.as_slice(),
+            "art bytes must be forwarded byte-for-byte, unmodified by masking"
+        );
+
+        std::env::remove_var("CONSTELLATION_MUSE_URL");
+    }
+
+    /// Muse-specific mutating-POST audit test (review follow-up), mirroring
+    /// `audit::record_mutating_request_appends_a_jsonl_line`'s pattern but
+    /// exercised through this module's own `proxy()` call for the `muse`
+    /// namespace — proving `proxy_muse`'s audit call site (not just the
+    /// generic `audit` module in isolation) actually fires for a mutating
+    /// request under `/api/muse/*`.
+    #[tokio::test]
+    #[serial]
+    async fn muse_mutating_post_is_audited() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        std::env::set_var("CONSTELLATION_AUDIT_LOG_PATH", &path);
+
+        // No backend configured -- the request still degrades cleanly (200
+        // available:false), but the audit call happens BEFORE the backend
+        // dispatch (see `proxy()`'s doc), so it must be recorded regardless.
+        let resp = proxy(
+            "muse",
+            None,
+            "api/channels",
+            None,
+            Method::POST,
+            &HeaderMap::new(),
+            Bytes::from_static(br#"{"name":"new channel"}"#),
+            Some("test-operator"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let line = contents.lines().next().expect("expected an audit line to be written");
+        let parsed: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(parsed["system"], "muse");
+        assert_eq!(parsed["method"], "POST");
+        assert_eq!(parsed["path"], "/api/muse/api/channels");
+        assert_eq!(parsed["principal"], "test-operator");
+
+        std::env::remove_var("CONSTELLATION_AUDIT_LOG_PATH");
+    }
 }
