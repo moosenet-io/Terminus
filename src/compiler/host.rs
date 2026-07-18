@@ -177,6 +177,30 @@ pub fn module_web_dir(module: &str) -> Option<String> {
     ))
 }
 
+/// BLD-444 (glibc-portability follow-up): a module's configured target-triple
+/// OVERRIDE, from `BUILD_MODULE_TARGET_<MODULE>` (same [`env_key_fragment`]
+/// convention as [`module_web_dir`] / `BUILD_MODULE_PEAK_MB_<MODULE>`). `None`
+/// when unset — the default, and the ONLY value for a module that should
+/// build against the fleet-wide `BUILD_TARGET_TRIPLE` (terminus, chord):
+/// zero-behavior-change.
+///
+/// Exists because a build host (<host>, glibc 2.41) can be newer than a deploy
+/// host (<host>, glibc 2.36) — a `gnu` binary built on the former won't start
+/// on the latter. A module whose deps allow it (no glibc-only C deps — e.g.
+/// harmony's rustls/ring, no openssl) can opt into a musl-static build for a
+/// portable artifact via `BUILD_MODULE_TARGET_HARMONY=x86_64-unknown-linux-musl`,
+/// independent of the global gnu default other modules keep using.
+///
+/// The returned string is a RAW config value — it is NOT validated here (same
+/// discipline as [`module_web_dir`]). The caller (`compiler/mod.rs`) validates
+/// it via the SAME `validate_segment("target", …)` check already applied to
+/// the non-overridden `target_triple()` result, so an override can never
+/// smuggle a path separator or shell metacharacter into a `--target`/path
+/// segment.
+pub fn module_target(module: &str) -> Option<String> {
+    env_nonempty(&format!("BUILD_MODULE_TARGET_{}", env_key_fragment(module)))
+}
+
 /// A fully-resolved build host: its role, its address (for relay/ssh), and its
 /// resource caps.
 #[derive(Debug, Clone)]
@@ -425,6 +449,28 @@ mod tests {
         assert_eq!(key, "BUILD_MODULE_WEB_DIR_HARMONY");
         let key2 = format!("BUILD_MODULE_WEB_DIR_{}", env_key_fragment("lumina-core"));
         assert_eq!(key2, "BUILD_MODULE_WEB_DIR_LUMINA_CORE");
+    }
+
+    #[test]
+    fn module_target_absent_is_none() {
+        // BLD-444 (glibc-portability follow-up): a module with no configured
+        // target override yields None (⇒ the global `BUILD_TARGET_TRIPLE`
+        // default is used, zero behavior change) — deliberately unlikely to
+        // be set in the test environment.
+        assert_eq!(
+            module_target("a-module-with-no-configured-target-xyz"),
+            None
+        );
+    }
+
+    #[test]
+    fn module_target_env_key_matches_web_dir_convention() {
+        // Same per-module env-key derivation as `BUILD_MODULE_WEB_DIR_<MODULE>`
+        // / `BUILD_MODULE_PEAK_MB_<MODULE>` — upper-cased, non-alphanumerics → `_`.
+        let key = format!("BUILD_MODULE_TARGET_{}", env_key_fragment("harmony"));
+        assert_eq!(key, "BUILD_MODULE_TARGET_HARMONY");
+        let key2 = format!("BUILD_MODULE_TARGET_{}", env_key_fragment("lumina-core"));
+        assert_eq!(key2, "BUILD_MODULE_TARGET_LUMINA_CORE");
     }
 
     #[test]

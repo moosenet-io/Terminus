@@ -125,6 +125,23 @@ compiler_build(module, ref, host="auto", profile="release", fast=false, bin?, so
   swallowed to fall through to cargo (which would silently embed the blank shell). The
   configured value is validated as a safe relative path (no `..`, no absolute, no traversal)
   before use, same discipline as every other path input below.
+- **Per-module target-triple override** (BLD-444) — opt-in per module via
+  `BUILD_MODULE_TARGET_<MODULE>` (same key convention as the web-build var above), overriding
+  the fleet-wide `BUILD_TARGET_TRIPLE` default for just that module (e.g.
+  `BUILD_MODULE_TARGET_HARMONY=x86_64-unknown-linux-musl`). Exists because a build host can run
+  a newer glibc than a deploy host (e.g. builder <host> = glibc 2.41 vs. deploy host <host> = glibc
+  2.36) — a `gnu` binary built on the former won't start on the latter. A module whose deps
+  allow a static build (no glibc-only C deps — e.g. harmony's rustls/ring, no openssl) can build
+  `musl` for a portable artifact while other modules (terminus, chord) keep the global `gnu`
+  default untouched. This is the SAME effective triple both `compiler_build` (build/test) and
+  `compiler_release` (promote/rollback/current) default to for a given module, so a module built
+  with an override is also verified/promoted against that override by default — an explicit
+  `target` argument on either tool still wins. Requires the target actually installed on the
+  build host for that toolchain; for a module whose own `rust-toolchain.toml` already lists the
+  target (harmony's does, for `x86_64-unknown-linux-musl`), rustup auto-installs it the first
+  time it's needed — no separate `rustup target add` step. Unset (the default) is a complete
+  no-op for every other module. The override is validated as a safe path/`--target` segment
+  (`validate_segment`) before use, same as the non-overridden default.
 - **Resource caps — Plex protection** (`compiler/scope.rs`) — the build runs under
   `systemd-run --scope` with `MemoryMax` + **`MemorySwapMax=0`** + `CPUQuota` + `IOWeight`.
   The swap-off is load-bearing: an over-budget build is OOM-killed inside its own cgroup

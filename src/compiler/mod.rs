@@ -749,6 +749,27 @@ fn target_triple() -> String {
     env_nonempty(BUILD_TARGET_TRIPLE).unwrap_or_else(|| DEFAULT_TARGET_TRIPLE.to_string())
 }
 
+/// BLD-444 (glibc-portability follow-up): the EFFECTIVE target triple for
+/// `module` — its per-module override (`BUILD_MODULE_TARGET_<MODULE>`,
+/// `host::module_target`) if configured, else the fleet-wide
+/// [`target_triple`]. The SINGLE resolution point for both places that need
+/// "what target does this module build/verify against" — [`CompilerBuild::build_inner`]
+/// (build/test) and `CompilerRelease`'s promote/rollback/current (verifying an
+/// already-published artifact under `<sha>/<target>/<bin>`) — so a module
+/// built with an override (e.g. harmony → musl, for a portable artifact on an
+/// older-glibc deploy host) is ALSO the default `compiler_release` verifies/
+/// promotes against; the artifact path, the `--target` flag, and the release
+/// pointer flip can never disagree on which target a module's default build
+/// used. An explicit caller-supplied `target` argument (either tool) still
+/// wins over both — this is only the fallback default.
+///
+/// Not validated here (same discipline as `target_triple`/`module_target`):
+/// every call site runs the result through `validate_segment("target", …)`
+/// before it is ever used as a path segment or `--target` value.
+fn effective_triple(module: &str) -> String {
+    host::module_target(module).unwrap_or_else(target_triple)
+}
+
 /// The per-channel retention count for the artifact store's pruning (BLD-07).
 /// Config-driven and floored at 2 — the store never keeps fewer than 2 shas nor
 /// prunes the current/previous pointer targets.
@@ -2114,8 +2135,13 @@ impl CompilerBuild {
             events::Emit::stage(events::Stage::Scheduled)
                 .message(resolved.role.as_str().to_string()),
         );
-        let triple = target_triple();
-        // `target` (the triple) comes from config but is used as a path segment.
+        // BLD-444: a per-module override (`BUILD_MODULE_TARGET_<MODULE>`) wins
+        // over the fleet-wide `BUILD_TARGET_TRIPLE` — see `effective_triple`'s
+        // doc for why harmony needs this (musl-static, for a portable artifact
+        // on an older-glibc deploy host than the builder).
+        let triple = effective_triple(&module);
+        // `target` (the triple, override or default) comes from config but is
+        // used as a path segment.
         validate_segment("target", &triple)?;
         // A DETERMINISTIC, UNIQUE transient-scope unit name: `<module>-<ref>` plus
         // a per-invocation uuid so it can never collide with a concurrent build of
@@ -2189,6 +2215,18 @@ impl CompilerBuild {
         })?;
 
         // Pinned toolchain channel to ensure (idempotent; never `rustup update`).
+        // BLD-444: this installs the CHANNEL only — it does not itself add the
+        // musl/etc. target a `BUILD_MODULE_TARGET_<MODULE>` override may need.
+        // That's handled implicitly: `run()` below sets `current_dir` to the
+        // staged source dir (`local_source_dir`/`remote_source`) BEFORE
+        // spawning cargo, and rustup auto-installs any target listed in that
+        // directory's `rust-toolchain.toml` `[toolchain] targets = […]` the
+        // first time it's needed — harmony's `rust-toolchain.toml` already
+        // lists `x86_64-unknown-linux-musl`, so no separate `rustup target
+        // add` is required here. A module whose toolchain file does NOT list
+        // its override target would need that added to the file (not this
+        // compiler) — the override only picks *which* target cargo builds
+        // for, it doesn't grant it.
         let pinned = env_nonempty(RUST_TOOLCHAIN_PINNED);
 
         // The build produces a LOCALLY-readable binary at `built_bin` in BOTH the
@@ -2966,11 +3004,18 @@ impl RustTool for CompilerRelease {
             .map(str::to_string)
             .unwrap_or_else(|| module.clone());
         validate_segment("bin", &bin)?;
+        // BLD-444: default to the SAME effective triple `compiler_build` would
+        // have used for this module (its `BUILD_MODULE_TARGET_<MODULE>`
+        // override if configured, else the fleet-wide default) — so promoting/
+        // rolling-back/querying a module built with an override (e.g. harmony
+        // → musl) looks under the artifact path its own default build actually
+        // published to, rather than the global default. An explicit `target`
+        // arg still overrides both.
         let target = args
             .get("target")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_else(target_triple);
+            .unwrap_or_else(|| effective_triple(&module));
         validate_segment("target", &target)?;
 
         let root = dataset_root()?;
@@ -4391,6 +4436,51 @@ mod tests {
                 "should REJECT {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn module_target_absent_falls_back_to_global_default() {
+        // BLD-444 (glibc-portability follow-up): a module with no
+        // `BUILD_MODULE_TARGET_<MODULE>` override gets the SAME triple
+        // `target_triple()` returns — zero behavior change for terminus/chord.
+        let _env = ScopedEnv::new().unset("BUILD_MODULE_TARGET_EFFTRIPLENOOVERRIDE");
+        assert_eq!(
+            effective_triple("efftriplenooverride"),
+            target_triple(),
+            "no override configured ⇒ falls back to the global default"
+        );
+    }
+
+    #[test]
+    fn module_target_override_wins_over_global_default() {
+        // BLD-444: a configured per-module override (e.g. harmony → musl for a
+        // portable artifact on an older-glibc deploy host) wins over the
+        // fleet-wide `BUILD_TARGET_TRIPLE`.
+        let _env = ScopedEnv::new().set(
+            "BUILD_MODULE_TARGET_EFFTRIPLEOVERRIDE",
+            "x86_64-unknown-linux-musl",
+        );
+        assert_eq!(
+            effective_triple("efftripleoverride"),
+            "x86_64-unknown-linux-musl"
+        );
+    }
+
+    #[test]
+    fn unsafe_module_target_override_is_rejected_by_validate_segment() {
+        // BLD-444: `effective_triple` itself doesn't validate (same discipline
+        // as `target_triple`/`host::module_target`) — every call site runs its
+        // result through `validate_segment("target", …)` before use. An
+        // injection/traversal-shaped override must be caught there.
+        let _env = ScopedEnv::new().set(
+            "BUILD_MODULE_TARGET_EFFTRIPLEBADOVERRIDE",
+            "x86_64-unknown-linux-gnu;rm -rf /",
+        );
+        let triple = effective_triple("efftriplebadoverride");
+        assert!(
+            validate_segment("target", &triple).is_err(),
+            "an injection-shaped override must be rejected"
+        );
     }
 
     #[test]
