@@ -107,7 +107,7 @@ impl PreservationReport {
 
 /// One raw section parsed out of the OLD README: its heading text (empty
 /// for the "no `##` headings at all" edge case, see [`split_old_sections`])
-/// and its body.
+/// and its body. Internal to the no-loss guard's token comparison.
 struct RawSection {
     heading: String,
     body: String,
@@ -122,6 +122,12 @@ struct RawSection {
 ///
 /// Single linear pass over `content.lines()` -- no re-scanning, so this
 /// stays `O(n)` even for a several-thousand-line README.
+///
+/// This is the no-loss guard's own line-based parser (it normalises
+/// whitespace to COMPARE tokens). The mechanical relocation path
+/// (`backfill.rs`) deliberately uses a separate byte-offset slicer instead,
+/// because relocating a section verbatim needs its exact source bytes, not a
+/// whitespace-trimmed heading+body.
 fn split_old_sections(content: &str) -> Vec<RawSection> {
     let mut sections = Vec::new();
     let mut current_heading: Option<String> = None;

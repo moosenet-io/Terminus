@@ -1292,26 +1292,63 @@ of this opt-in path: when a passing epic capstone's context carries
 into the working tree, riding the same once-per-build capstone path as
 generation (never per-merge).
 
-### One-shot backfill — migrating an already-bloated README (DLAND-05)
+### One-shot backfill — migrating an already-bloated README (DLAND-05, mechanically relocated per DLAND-RELOC)
 
 `docgen_backfill` (`crate::tools::docgen::backfill::DocgenBackfill`, function
 `backfill_readme`) is the tool for a repo's *first* cutover — migrating a
 hand-grown mega-README (Terminus, Chord, Muse, lumina-constellation, ...)
-into the concise landing + `docs/` hierarchy in one guarded pass. It reuses
-every existing engine piece rather than reimplementing any of them:
+into a concise landing + `docs/` hierarchy in one guarded pass.
+
+**Why mechanical relocation, not LLM regeneration.** A live run proved the
+original DLAND-05 flow (ask the LLM to regenerate the whole README) is lossy
+BY CONSTRUCTION: an LLM asked for a concise landing naturally *summarizes* (a
+2285-line README became a 61-line landing) and produces no `docs/` tree of
+its own, so the DLAND-02 no-loss guard correctly withheld every cutover.
+`backfill_readme` now splits the two jobs the old flow conflated:
 
 1. Reads `target_root`'s current `README.md` (if any) and passes it as
    `existing_docs` into `run_docgen_trigger`'s own sweep → generate → render
-   flow (called with `place: false` — this tool decides placement itself,
-   only after the checks below clear).
-2. Runs the DLAND-02 no-loss guard (`check_preservation`) against the OLD
-   README vs. the new landing + `docs/` tree. **If any old section is
-   flagged missing, nothing is placed at all** — not `README.md`, not a
-   single `docs/**` file — and the flagged sections are returned in
-   `BackfillReport::missing` for an operator to confirm before re-running.
-3. Runs the DLAND-03 landing gates (length + link-resolution) and surfaces
+   flow (called with `place: false`), but uses the result **ONLY** for its
+   concise top-page landing text (hero + quick start) — the LLM's own
+   `docs_tree` is **ignored** (it never saw the old README's sections
+   rendered as its own docs, so it's necessarily empty for this flow).
+2. Builds the `docs/` tree **mechanically**, directly from the OLD README:
+   a purpose-built **byte-offset slicer** (`old_readme_parts`) splits it into
+   a preamble plus one entry per top-level `## ` section, and each section's
+   **EXACT ORIGINAL SOURCE BYTES** (from its `## ` line through just before
+   the next `## `/EOF — sub-headings, code fences, and spacing preserved
+   byte-for-byte) are copied **VERBATIM** into its own
+   `docs/reference/<slug>.md` page — no paraphrasing, no summarizing, not even
+   an appended newline. This slicer is deliberately distinct from the no-loss
+   guard's line-based `preserve::split_old_sections` (which normalises
+   whitespace to COMPARE tokens); both agree on where `## ` sections begin.
+   `docs/index.md` is a hub page: a short title, the verbatim preamble (if
+   any), and a link list to every relocated page. Slugs are de-duplicated with
+   a numeric suffix on collision; a README with no `##` headings at all still
+   relocates as one `docs/reference/overview.md` page (the whole document
+   verbatim), so section-less READMEs are never silently dropped either.
+3. Assembles the final landing: the LLM's hero/quick-start text with any
+   LLM-authored `## Documentation` section and any `docs/…` links stripped
+   (they would dangle against the mechanical tree — a leftover of the LLM
+   inventing paths that were never actually rendered), followed by a
+   mechanically-built `## Documentation` section linking to the real
+   `docs/index.md` hub (and up to 3 of its reference pages) — every `docs/`
+   link this step emits comes directly from the mechanical `docs_tree`, so
+   `check_landing_links` always resolves against it. An oversized LLM
+   hero/quick-start is **trimmed** to fit the `LANDING_MAX_LINES` budget
+   (trailing prose cut, the Documentation link never dropped) rather than
+   refused.
+4. Runs the DLAND-02 no-loss guard (`check_preservation`) against the OLD
+   README vs. the assembled landing + mechanical `docs/` tree as a
+   **backstop** — verbatim relocation makes `missing` empty / coverage
+   `1.0` true *by construction*, but the check stays wired in rather than
+   trusted blindly. If it ever did flag a drop, nothing is placed at all —
+   not `README.md`, not a single `docs/**` file — and the flagged sections
+   are returned in `BackfillReport::missing` for an operator to confirm
+   before re-running.
+5. Runs the DLAND-03 landing gates (length + link-resolution) and surfaces
    the outcome even though `place_docs` also enforces them fail-closed.
-4. Only when both checks clear does it call `place_docs(target_root,
+6. Only when both checks clear does it call `place_docs(target_root,
    landing, docs_tree)` — the same DLAND-01 writer every other placement
    path uses.
 
