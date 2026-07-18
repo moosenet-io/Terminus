@@ -159,19 +159,46 @@ fn slugify(heading: &str) -> String {
 /// authored heading, blank lines, and body, not a reconstruction from parsed
 /// fields (which would normalise whitespace / heading formatting). This is what
 /// makes the relocation truly loss-free.
+/// If `trimmed` (a line with leading whitespace already removed) opens or closes
+/// a code fence, return its marker `(char, run_length)` -- a run of at least 3
+/// backticks or tildes. Otherwise `None`.
+fn fence_marker(trimmed: &str) -> Option<(char, usize)> {
+    let ch = trimmed.chars().next()?;
+    if ch != '`' && ch != '~' {
+        return None;
+    }
+    let len = trimmed.chars().take_while(|&c| c == ch).count();
+    if len >= 3 {
+        Some((ch, len))
+    } else {
+        None
+    }
+}
+
 fn old_readme_parts(old: &str) -> (String, Vec<(String, String)>) {
     let mut starts: Vec<(usize, String)> = Vec::new();
     let mut offset = 0usize;
-    // Track fenced code blocks so a literal `## ` line INSIDE a ``` / ~~~ fence
-    // (e.g. a shell/markdown example) is never mistaken for a real section
-    // boundary -- otherwise a code example would be split across pages, breaking
-    // its fence and inventing a bogus reference page.
-    let mut in_fence = false;
+    // Track fenced code blocks (CommonMark-style) so a literal `## ` line INSIDE
+    // a fence (e.g. a shell/markdown example) is never mistaken for a real
+    // section boundary -- otherwise a code example would be split across pages,
+    // breaking its fence and inventing a bogus reference page. A fence remembers
+    // its marker char AND length: it closes ONLY on a same-char fence of at
+    // least the opening length, so a `~~~` inside a ``` fence (or vice versa)
+    // does not spuriously close it.
+    let mut fence: Option<(char, usize)> = None;
     for line in old.split_inclusive('\n') {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-        } else if !in_fence {
+        if let Some((ch, len)) = fence_marker(trimmed) {
+            match fence {
+                None => fence = Some((ch, len)),
+                Some((open_ch, open_len)) => {
+                    if ch == open_ch && len >= open_len {
+                        fence = None;
+                    }
+                    // else: a different/short marker line -- still inside the fence.
+                }
+            }
+        } else if fence.is_none() {
             if let Some(rest) = trimmed.strip_prefix("## ") {
                 starts.push((offset, rest.trim().to_string()));
             }
@@ -1062,6 +1089,20 @@ mod tests {
             "fence not preserved intact: {}", usage.content);
         assert!(tree.iter().any(|f| f.path == "docs/reference/config.md"));
         assert!(!tree.iter().any(|f| f.path == "docs/reference/not-a-real-section.md"));
+    }
+
+    #[test]
+    fn a_mismatched_inner_fence_marker_does_not_prematurely_close_the_fence() {
+        // A ``` fence is NOT closed by a `~~~` line inside it (different marker),
+        // so a `## ` after that inner line is still inside the code block.
+        let old = "# T\n\n## Usage\n\n```text\n~~~ not a close for this fence\n## Still inside the code fence\n```\n\n## Config\n\nSet up.\n";
+        let tree = build_docs_tree_from_old_readme(old);
+        let ref_pages: Vec<_> = tree.iter().filter(|f| f.path.starts_with("docs/reference/")).collect();
+        assert_eq!(ref_pages.len(), 2, "mixed fence markers must not split: {:?}",
+            ref_pages.iter().map(|f| &f.path).collect::<Vec<_>>());
+        assert!(!tree.iter().any(|f| f.path == "docs/reference/still-inside-the-code-fence.md"));
+        let usage = tree.iter().find(|f| f.path == "docs/reference/usage.md").expect("usage page");
+        assert!(usage.content.contains("## Still inside the code fence"), "fenced heading not preserved: {}", usage.content);
     }
 
     // ── Edge: README with no `##` sections -> one whole-document page ────
