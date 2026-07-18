@@ -15,6 +15,18 @@ export default defineConfig({
       output: {
         manualChunks: {
           vendor: ['react', 'react-dom', 'react-router-dom'],
+          // CONST-17: nivo (radar/boxplot/heatmap/parallel-coords/swarm/scatter) is only
+          // needed by the MINT/Models charts routes (lazy-loaded) — keep it out of the
+          // shell/panels' initial bundle (§9 budget: initial <=350KB gz, viz chunk <=250KB gz).
+          viz: [
+            '@nivo/core',
+            '@nivo/boxplot',
+            '@nivo/heatmap',
+            '@nivo/parallel-coordinates',
+            '@nivo/radar',
+            '@nivo/scatterplot',
+            '@nivo/swarmplot',
+          ],
         },
       },
     },

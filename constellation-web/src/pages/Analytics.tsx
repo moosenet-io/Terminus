@@ -13,7 +13,10 @@ import { ProviderPerformance } from '../components/analytics/ProviderPerformance
 import {
   LineChart, Line, BarChart, Bar,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
-} from 'recharts';
+} from '../viz/recharts';
+// CONST-17: solid hairline grid + brand tick style from the viz kit — retires the dashed
+// GRID_PROPS anti-pattern (audit §1.4).
+import { rechartsGridProps, rechartsTickStyle } from '../viz/theme';
 
 type Period = '24h' | '7d' | '30d';
 
@@ -23,9 +26,9 @@ interface CostBucket { date: string; cost_usd: number; provider: string; }
 interface DurationBucket { range: string; count: number; tier: string; }
 interface QualityPoint { provider: string; score: number; task_id: string; }
 
-// ── Shared chart theme ────────────────────────────────────────────────────────
-const CHART_STYLE = { fontSize: 11, fill: 'var(--h-text-dim)' } as const;
-const GRID_PROPS = { strokeDasharray: '3 3', stroke: 'rgba(255,255,255,0.06)' } as const;
+// ── Shared chart theme (CONST-17: brand-derived, no dashed grid) ──────────────
+const CHART_STYLE = rechartsTickStyle();
+const GRID_PROPS = rechartsGridProps();
 
 function EmptyState({ message }: { message: string }) {
   return (

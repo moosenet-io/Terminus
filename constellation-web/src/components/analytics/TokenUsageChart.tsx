@@ -1,6 +1,10 @@
-// WIRE-06: Stacked bar chart of local vs cloud token usage over time
-import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from 'recharts';
+// WIRE-06: Stacked bar chart of local vs cloud token usage over time.
+// CONST-17 re-skin: raw hex fills removed — local/cloud is the same cost-free/cost-paid
+// semantic pair as CostChart (§2.4), solid hairline grid + brand chrome.
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from '../../viz/recharts';
 import type { CostData } from '../../hooks/useChordAnalytics';
+import { rechartsGridProps, rechartsTickStyle, rechartsTooltipStyle } from '../../viz/theme';
+import { SEMANTIC_SERIES_HEX } from '../../viz/palette';
 
 interface Props { data: CostData[]; }
 
@@ -12,15 +16,17 @@ export function TokenUsageChart({ data }: Props) {
       </div>
     );
   }
+  const tick = rechartsTickStyle();
   return (
     <ResponsiveContainer width="100%" height={200}>
       <BarChart data={data}>
-        <XAxis dataKey="date" tick={{ fontSize: 10 }} />
-        <YAxis tick={{ fontSize: 10 }} />
-        <Tooltip />
-        <Legend />
-        <Bar dataKey="tokens_local" name="Local" fill="#3b82f6" stackId="a" />
-        <Bar dataKey="tokens_cloud" name="Cloud" fill="#f97316" stackId="a" />
+        <CartesianGrid {...rechartsGridProps()} />
+        <XAxis dataKey="date" tick={tick} />
+        <YAxis tick={tick} />
+        <Tooltip contentStyle={rechartsTooltipStyle()} />
+        <Legend wrapperStyle={{ fontSize: 11 }} />
+        <Bar dataKey="tokens_local" name="Local" fill={SEMANTIC_SERIES_HEX['cost-free']} stackId="a" />
+        <Bar dataKey="tokens_cloud" name="Cloud" fill={SEMANTIC_SERIES_HEX['cost-paid']} stackId="a" />
       </BarChart>
     </ResponsiveContainer>
   );
