@@ -1006,7 +1006,12 @@ fn perform_ff_push(
 
 /// Write a minimal GIT_ASKPASS helper that echoes `$GIT_MIRROR_TOKEN`. The script
 /// body carries NO secret; the token lives only in the child process environment.
-fn write_askpass_script() -> Result<AskpassScript, ToolError> {
+///
+/// `pub(crate)` so the git-private transport tool
+/// ([`crate::forge::git_transport`]) can reuse the exact same credential-injection
+/// mechanism (token via `GIT_MIRROR_TOKEN` env → askpass echo, never in argv / URL
+/// / on disk) rather than reinventing it.
+pub(crate) fn write_askpass_script() -> Result<AskpassScript, ToolError> {
     let dir = std::env::temp_dir();
     let path = dir.join(format!(
         "ghmr04-askpass-{}-{}.sh",
@@ -1033,12 +1038,12 @@ fn write_askpass_script() -> Result<AskpassScript, ToolError> {
 }
 
 /// RAII wrapper that removes the askpass script when dropped.
-struct AskpassScript {
+pub(crate) struct AskpassScript {
     path: std::path::PathBuf,
 }
 
 impl AskpassScript {
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 }

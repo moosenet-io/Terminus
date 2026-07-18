@@ -46,6 +46,7 @@
 pub mod capability;
 pub mod git_private;
 pub mod git_public;
+pub mod git_transport;
 pub mod gitea_family;
 pub mod gitlab;
 pub mod mirror;
@@ -68,6 +69,10 @@ pub use stubs::StubForge;
 /// build-pipeline surface. Called from `crate::registry::register_personal`.
 pub fn register_private(registry: &mut crate::registry::ToolRegistry) {
     git_private::register(registry);
+    // TERM-git-transport (HCAT-29 prereq): the git-PROTOCOL push transport for
+    // the git-private domain — a branch (shipped as a git bundle) is pushed to
+    // Gitea with Terminus's own credential, so the caller holds no token.
+    git_transport::register(registry);
 }
 
 /// Register the git-public tool (PII-gated, first-publish-gated, egress-
