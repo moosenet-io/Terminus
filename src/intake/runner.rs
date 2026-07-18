@@ -679,6 +679,7 @@ pub async fn run_fleet_suites(
     is_daemon: impl Fn(&str) -> bool,
     run_code: impl Fn(String, Vec<String>, uuid::Uuid) -> futures_box::CodeFut,
     run_agent: impl Fn(String, uuid::Uuid) -> futures_box::AgentFut,
+    mut on_progress: impl FnMut(usize, usize, &str, &str),
 ) -> Vec<FleetSuiteResult> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(900))
@@ -686,9 +687,16 @@ pub async fn run_fleet_suites(
         .expect("client");
     let prior_hot = current_hot_model(&client).await;
     let mut out = Vec::new();
+    let total = models.len();
 
-    for model in models {
+    for (i, model) in models.iter().enumerate() {
         let suites = resolve_suites(model);
+        // BLD-ASYNC: report per-model progress BEFORE starting this model, so a
+        // poller sees "which model is in flight" rather than only completed
+        // counts. `on_progress` is caller-supplied (a no-op for the synchronous
+        // path, a job-registry update for the async path) — never touches I/O
+        // itself, so it can't turn a fast/pure sweep into a slow one.
+        on_progress(i, total, model, &suites.join("+"));
         // Self-heal: skip a model rather than fail the run on a full disk.
         if let Some(reason) = disk_pressure() {
             out.push(FleetSuiteResult {
@@ -770,6 +778,8 @@ pub async fn run_fleet_suites(
     if let Some(prior) = &prior_hot {
         let _ = load_model(&client, prior).await;
     }
+    // Final progress tick: everything done, no model currently in flight.
+    on_progress(total, total, "", "");
     out
 }
 
