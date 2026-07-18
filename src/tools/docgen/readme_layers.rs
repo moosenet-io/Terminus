@@ -435,8 +435,21 @@ fn extract_link_targets(content: &str) -> Vec<String> {
 /// ([`check_landing_length`]): returns `Ok(())` when every local doc link
 /// resolves, or `Err(dangling_targets)` (deduplicated, in first-seen order)
 /// naming each target that has no matching [`DocsTreeFile::path`].
+/// The docs-tree root prefix (e.g. `"docs/"`), DERIVED from the shared
+/// `DOCS_*_PATH` constants rather than hardcoded, so if the sub-page tree is
+/// ever rooted elsewhere the link gate follows automatically and never silently
+/// stops validating local doc links. All `DOCS_*_PATH` constants share this
+/// first path component (asserted by a unit test).
+pub fn docs_root_prefix() -> &'static str {
+    match DOCS_INDEX_PATH.find('/') {
+        Some(i) => &DOCS_INDEX_PATH[..=i],
+        None => DOCS_INDEX_PATH,
+    }
+}
+
 pub fn check_landing_links(landing: &str, docs_tree: &[DocsTreeFile]) -> Result<(), Vec<String>> {
     let known: HashSet<&str> = docs_tree.iter().map(|f| f.path.as_str()).collect();
+    let root = docs_root_prefix();
     let mut dangling = Vec::new();
     let mut seen = HashSet::new();
     for target in extract_link_targets(landing) {
@@ -449,7 +462,7 @@ pub fn check_landing_links(landing: &str, docs_tree: &[DocsTreeFile]) -> Result<
             continue;
         }
         let path_part = target.split('#').next().unwrap_or(target);
-        if path_part.starts_with("docs/") && !known.contains(path_part) {
+        if path_part.starts_with(root) && !known.contains(path_part) {
             if seen.insert(target.to_string()) {
                 dangling.push(target.to_string());
             }
@@ -814,6 +827,24 @@ mod tests {
             DocsTreeFile { path: DOCS_GETTING_STARTED_PATH.to_string(), content: String::new() },
             DocsTreeFile { path: DOCS_REFERENCE_INDEX_PATH.to_string(), content: String::new() },
         ]
+    }
+
+    #[test]
+    fn docs_root_prefix_is_derived_and_matches_every_docs_path_constant() {
+        // The link gate keys off this prefix; it must stay in lockstep with the
+        // actual DOCS_*_PATH constants (derived, never hardcoded), or the gate
+        // could silently stop validating real doc links.
+        let root = docs_root_prefix();
+        assert!(root.ends_with('/'), "docs root prefix should end with '/': {root:?}");
+        for p in [
+            DOCS_INDEX_PATH,
+            DOCS_GETTING_STARTED_PATH,
+            DOCS_GUIDES_INDEX_PATH,
+            DOCS_REFERENCE_INDEX_PATH,
+            DOCS_ARCHITECTURE_PATH,
+        ] {
+            assert!(p.starts_with(root), "{p} does not start with derived docs root {root:?}");
+        }
     }
 
     #[test]
