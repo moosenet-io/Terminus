@@ -426,6 +426,21 @@ mod tests {
         perms.set_mode(0o555); // read+execute, no write
         std::fs::set_permissions(&root, perms).unwrap();
 
+        // Root bypasses the read-only mode bit entirely (as in CI/build hosts
+        // that run tests as root), so the write would succeed and there would
+        // be no io error to surface. This test only means anything when the
+        // filesystem actually enforces the permission — probe for that and
+        // skip cleanly otherwise rather than asserting a denial the OS won't
+        // produce.
+        let enforces_readonly = std::fs::File::create(root.join(".write-probe")).is_err();
+        if !enforces_readonly {
+            let mut restore = std::fs::metadata(&root).unwrap().permissions();
+            restore.set_mode(0o755);
+            std::fs::set_permissions(&root, restore).unwrap();
+            std::fs::remove_dir_all(&root).ok();
+            return;
+        }
+
         let report = place_docs(&root, "# Hello\n", &[]);
 
         // Restore write permission before cleanup, regardless of outcome.
