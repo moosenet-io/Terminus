@@ -715,6 +715,13 @@ const DEFAULT_TARGET_TRIPLE: &str = "x86_64-unknown-linux-musl";
 /// lease floor is derived from this so a genuinely-live build is never reconciled.
 pub const MAX_BUILD_TIMEOUT_SECS: u64 = 3600;
 
+/// BLD-444: the longest a single web-build pre-step command (`npm ci` or
+/// `npm run build`) may run, capped shorter than the cargo build/test timeout
+/// above — an SPA build is a small fraction of a Rust workspace build, and a
+/// short bound keeps a hung/misconfigured npm from silently eating the whole
+/// build's timeout budget before cargo ever starts.
+const WEB_BUILD_TIMEOUT_SECS: u64 = 900;
+
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
@@ -740,6 +747,27 @@ fn local_target_dir() -> PathBuf {
 
 fn target_triple() -> String {
     env_nonempty(BUILD_TARGET_TRIPLE).unwrap_or_else(|| DEFAULT_TARGET_TRIPLE.to_string())
+}
+
+/// BLD-444 (glibc-portability follow-up): the EFFECTIVE target triple for
+/// `module` — its per-module override (`BUILD_MODULE_TARGET_<MODULE>`,
+/// `host::module_target`) if configured, else the fleet-wide
+/// [`target_triple`]. The SINGLE resolution point for both places that need
+/// "what target does this module build/verify against" — [`CompilerBuild::build_inner`]
+/// (build/test) and `CompilerRelease`'s promote/rollback/current (verifying an
+/// already-published artifact under `<sha>/<target>/<bin>`) — so a module
+/// built with an override (e.g. harmony → musl, for a portable artifact on an
+/// older-glibc deploy host) is ALSO the default `compiler_release` verifies/
+/// promotes against; the artifact path, the `--target` flag, and the release
+/// pointer flip can never disagree on which target a module's default build
+/// used. An explicit caller-supplied `target` argument (either tool) still
+/// wins over both — this is only the fallback default.
+///
+/// Not validated here (same discipline as `target_triple`/`module_target`):
+/// every call site runs the result through `validate_segment("target", …)`
+/// before it is ever used as a path segment or `--target` value.
+fn effective_triple(module: &str) -> String {
+    host::module_target(module).unwrap_or_else(target_triple)
 }
 
 /// The per-channel retention count for the artifact store's pruning (BLD-07).
@@ -2069,6 +2097,21 @@ impl CompilerBuild {
         validate_segment("profile", &profile)?;
         validate_git_ref(&git_ref)?;
 
+        // BLD-444: a module may configure a web-build (SPA/npm) subdirectory
+        // via `BUILD_MODULE_WEB_DIR_<MODULE>` (e.g. harmony's `harmony-web`,
+        // which `harmony-server` embeds via rust-embed at COMPILE time — a
+        // gitignored `dist/` that must exist BEFORE cargo runs, or the binary
+        // embeds only the tiny fallback shell: a blank dashboard). Unset ⇒
+        // `None` ⇒ zero behavior change (no npm step, no new host
+        // requirement) for every module without one. Validated ONCE, here,
+        // as a safe relative path — same discipline as every other
+        // user/config path input — before it is ever joined under the staged
+        // source root in either the local or remote build path below.
+        let web_dir = host::module_web_dir(&module);
+        if let Some(w) = &web_dir {
+            validate_relative_dir("web dir", w)?;
+        }
+
         // BLD-19: the request is accepted → `queued`. A per-build tap streams the
         // cargo `{step,total}` into the bus during the build (progress bar). The
         // stream was already ROTATED to a fresh, non-terminal track by the wrapper
@@ -2092,8 +2135,13 @@ impl CompilerBuild {
             events::Emit::stage(events::Stage::Scheduled)
                 .message(resolved.role.as_str().to_string()),
         );
-        let triple = target_triple();
-        // `target` (the triple) comes from config but is used as a path segment.
+        // BLD-444: a per-module override (`BUILD_MODULE_TARGET_<MODULE>`) wins
+        // over the fleet-wide `BUILD_TARGET_TRIPLE` — see `effective_triple`'s
+        // doc for why harmony needs this (musl-static, for a portable artifact
+        // on an older-glibc deploy host than the builder).
+        let triple = effective_triple(&module);
+        // `target` (the triple, override or default) comes from config but is
+        // used as a path segment.
         validate_segment("target", &triple)?;
         // A DETERMINISTIC, UNIQUE transient-scope unit name: `<module>-<ref>` plus
         // a per-invocation uuid so it can never collide with a concurrent build of
@@ -2167,6 +2215,18 @@ impl CompilerBuild {
         })?;
 
         // Pinned toolchain channel to ensure (idempotent; never `rustup update`).
+        // BLD-444: this installs the CHANNEL only — it does not itself add the
+        // musl/etc. target a `BUILD_MODULE_TARGET_<MODULE>` override may need.
+        // That's handled implicitly: `run()` below sets `current_dir` to the
+        // staged source dir (`local_source_dir`/`remote_source`) BEFORE
+        // spawning cargo, and rustup auto-installs any target listed in that
+        // directory's `rust-toolchain.toml` `[toolchain] targets = […]` the
+        // first time it's needed — harmony's `rust-toolchain.toml` already
+        // lists `x86_64-unknown-linux-musl`, so no separate `rustup target
+        // add` is required here. A module whose toolchain file does NOT list
+        // its override target would need that added to the file (not this
+        // compiler) — the override only picks *which* target cargo builds
+        // for, it doesn't grant it.
         let pinned = env_nonempty(RUST_TOOLCHAIN_PINNED);
 
         // The build produces a LOCALLY-readable binary at `built_bin` in BOTH the
@@ -2220,6 +2280,54 @@ impl CompilerBuild {
                     None,
                 )
                 .await?;
+            }
+
+            // BLD-444: the web-build (SPA/npm) pre-step, LOCAL path. Runs
+            // BEFORE lockgen/cargo, in the SAME capped systemd scope as the
+            // cargo steps (`resolved.caps`, the same non-secret `setenv`) so
+            // it never gets an uncapped RAM/CPU allowance. `npm ci` then
+            // `npm run build`, in `<staged_source_root>/<web_dir>`. FAIL
+            // CLOSED: `npm` missing on this build host, or either command
+            // exiting non-zero (via `run`'s existing non-zero-exit ⇒ `Err`
+            // behavior), aborts the WHOLE build here — it is never swallowed
+            // to fall through to cargo, which would embed the tiny fallback
+            // shell (a blank dashboard) instead of a real SPA: the exact bug
+            // this closes. Zero-cost when `web_dir` is `None` (the default
+            // for every module without a `BUILD_MODULE_WEB_DIR_<MODULE>`).
+            if let Some(w) = &web_dir {
+                let web_path = local_source_dir.join(w);
+                bus.emit(
+                    request_id,
+                    events::Emit::stage(events::Stage::Building).message(format!("web-build: {w}")),
+                );
+                for (label, npm_argv) in [
+                    ("npm ci", vec!["npm".to_string(), "ci".to_string()]),
+                    (
+                        "npm run build",
+                        vec!["npm".to_string(), "run".to_string(), "build".to_string()],
+                    ),
+                ] {
+                    let web_unit =
+                        format!("{unit}-web-{}", label.replace(' ', "_").replace('-', "_"));
+                    let web_scope_argv =
+                        scope::render_scope_argv(&web_unit, &resolved.caps, &setenv, &npm_argv);
+                    run(
+                        &web_scope_argv,
+                        Some(&web_path),
+                        &secret_env,
+                        Duration::from_secs(WEB_BUILD_TIMEOUT_SECS),
+                        &redact,
+                        None,
+                        None,
+                    )
+                    .await
+                    .map_err(|e| {
+                        ToolError::Execution(format!(
+                            "web-build pre-step failed for module {module:?} in {w:?} \
+                             ({label}): {e} — refusing to embed a blank SPA"
+                        ))
+                    })?;
+                }
             }
 
             let manifest = local_source_dir.join("Cargo.toml");
@@ -2475,13 +2583,58 @@ impl CompilerBuild {
             // so it replaces this shell as the final process. The secret lives
             // only in the 0600 file, never argv.
             let scope_cmd = shell_join(&scope_argv);
+
+            // BLD-444: the web-build (SPA/npm) pre-step, REMOTE path. Same
+            // rationale/fail-closed contract as the local path above — see
+            // that block's comment. Rendered as a capped `systemd-run --scope`
+            // (same `resolved.caps`/`setenv` as the cargo steps) `cd`'d into
+            // the remote web dir, chained via shell `&&` in front of the
+            // lockgen step: any web-build failure (npm missing, `npm ci`/`npm
+            // run build` non-zero) short-circuits the `&&` chain so lockgen
+            // and `exec <cargo>` never run — it can never fall through to a
+            // cargo build that would embed a blank SPA. `cd`s back to
+            // `remote_source` afterward purely so a reader can reason about
+            // cwd at each `&&` step; lockgen/cargo below use `--manifest-path`
+            // so they don't actually depend on it. Empty string (a no-op
+            // prefix) when `web_dir` is `None` — zero behavior change.
+            let web_prefix = match &web_dir {
+                Some(w) => {
+                    bus.emit(
+                        request_id,
+                        events::Emit::stage(events::Stage::Building)
+                            .message(format!("web-build: {w}")),
+                    );
+                    let remote_web_dir = format!("{remote_source}/{w}");
+                    let web_ci_argv = scope::render_scope_argv(
+                        &format!("{unit}-web-ci"),
+                        &resolved.caps,
+                        &setenv,
+                        &["npm".to_string(), "ci".to_string()],
+                    );
+                    let web_build_argv = scope::render_scope_argv(
+                        &format!("{unit}-web-build"),
+                        &resolved.caps,
+                        &setenv,
+                        &["npm".to_string(), "run".to_string(), "build".to_string()],
+                    );
+                    format!(
+                        "cd {wd} && {ci} && {bld} && cd {back} && ",
+                        wd = shell_quote(&remote_web_dir),
+                        ci = shell_join(&web_ci_argv),
+                        bld = shell_join(&web_build_argv),
+                        back = shell_quote(&remote_source),
+                    )
+                }
+                None => String::new(),
+            };
+
             let remote_cmd = if have_secret {
                 format!(
-                    "set -a; . {f}; rm -f {f}; set +a; {lockgen_cmd} && exec {scope_cmd}",
+                    "set -a; . {f}; rm -f {f}; set +a; {web_prefix}{lockgen_cmd} && exec {scope_cmd}",
                     f = shell_quote(&remote_env_path)
                 )
             } else {
-                format!("{lockgen_cmd} && exec {scope_cmd}")
+                format!("{web_prefix}{lockgen_cmd} && exec {scope_cmd}")
             };
             // On timeout, tear down the REMOTE scope by its unit name too — the
             // local ssh process-group kill can't reach the remote build tree.
@@ -2851,11 +3004,18 @@ impl RustTool for CompilerRelease {
             .map(str::to_string)
             .unwrap_or_else(|| module.clone());
         validate_segment("bin", &bin)?;
+        // BLD-444: default to the SAME effective triple `compiler_build` would
+        // have used for this module (its `BUILD_MODULE_TARGET_<MODULE>`
+        // override if configured, else the fleet-wide default) — so promoting/
+        // rolling-back/querying a module built with an override (e.g. harmony
+        // → musl) looks under the artifact path its own default build actually
+        // published to, rather than the global default. An explicit `target`
+        // arg still overrides both.
         let target = args
             .get("target")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_else(target_triple);
+            .unwrap_or_else(|| effective_triple(&module));
         validate_segment("target", &target)?;
 
         let root = dataset_root()?;
@@ -3028,6 +3188,35 @@ fn validate_git_ref(value: &str) -> Result<(), ToolError> {
     }
     for comp in value.split('/') {
         validate_segment("ref component", comp)?;
+    }
+    Ok(())
+}
+
+/// Validate a config-supplied relative directory (BLD-444's
+/// `BUILD_MODULE_WEB_DIR_<MODULE>`) as a SAFE path UNDER the staged source
+/// root, BEFORE it is ever joined into a filesystem path or interpolated into
+/// an ssh/shell command. Mirrors [`validate_git_ref`]'s shape (each
+/// `/`-separated component validated by [`validate_segment`], no absolute
+/// path, no traversal) but is named/documented for this distinct use — a
+/// config value, not a git ref — so an error message never conflates the two.
+fn validate_relative_dir(kind: &str, value: &str) -> Result<(), ToolError> {
+    if value.is_empty() {
+        return Err(ToolError::InvalidArgument(format!(
+            "{kind} must not be empty"
+        )));
+    }
+    if value.starts_with('/') || value.ends_with('/') {
+        return Err(ToolError::InvalidArgument(format!(
+            "{kind} {value:?} must not start or end with '/'"
+        )));
+    }
+    if value.contains('\\') {
+        return Err(ToolError::InvalidArgument(format!(
+            "{kind} {value:?} must not contain '\\'"
+        )));
+    }
+    for comp in value.split('/') {
+        validate_segment(&format!("{kind} component"), comp)?;
     }
     Ok(())
 }
@@ -4217,6 +4406,81 @@ mod tests {
         ] {
             assert!(validate_git_ref(bad).is_err(), "should REJECT ref {bad:?}");
         }
+    }
+
+    #[test]
+    fn web_dir_validation_allows_simple_relative_dirs_but_not_traversal() {
+        // BLD-444: `BUILD_MODULE_WEB_DIR_<MODULE>` — a single segment or a
+        // simple nested relative dir, same shape as `validate_git_ref`.
+        for ok in ["harmony-web", "web", "apps/dashboard", "v1.2.3"] {
+            assert!(
+                validate_relative_dir("web dir", ok).is_ok(),
+                "should accept {ok:?}"
+            );
+        }
+        for bad in [
+            "",             // empty
+            "/etc",         // absolute
+            "harmony-web/", // trailing slash
+            "../..",        // traversal
+            "..",           // parent alone
+            "a/../b",       // embedded traversal
+            "a//b",         // empty component
+            "a\\b",         // backslash
+            "a b",          // whitespace
+            "$(touch x)",   // injection
+            "a;rm -rf /",   // shell metachar
+        ] {
+            assert!(
+                validate_relative_dir("web dir", bad).is_err(),
+                "should REJECT {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn module_target_absent_falls_back_to_global_default() {
+        // BLD-444 (glibc-portability follow-up): a module with no
+        // `BUILD_MODULE_TARGET_<MODULE>` override gets the SAME triple
+        // `target_triple()` returns — zero behavior change for terminus/chord.
+        let _env = ScopedEnv::new().unset("BUILD_MODULE_TARGET_EFFTRIPLENOOVERRIDE");
+        assert_eq!(
+            effective_triple("efftriplenooverride"),
+            target_triple(),
+            "no override configured ⇒ falls back to the global default"
+        );
+    }
+
+    #[test]
+    fn module_target_override_wins_over_global_default() {
+        // BLD-444: a configured per-module override (e.g. harmony → musl for a
+        // portable artifact on an older-glibc deploy host) wins over the
+        // fleet-wide `BUILD_TARGET_TRIPLE`.
+        let _env = ScopedEnv::new().set(
+            "BUILD_MODULE_TARGET_EFFTRIPLEOVERRIDE",
+            "x86_64-unknown-linux-musl",
+        );
+        assert_eq!(
+            effective_triple("efftripleoverride"),
+            "x86_64-unknown-linux-musl"
+        );
+    }
+
+    #[test]
+    fn unsafe_module_target_override_is_rejected_by_validate_segment() {
+        // BLD-444: `effective_triple` itself doesn't validate (same discipline
+        // as `target_triple`/`host::module_target`) — every call site runs its
+        // result through `validate_segment("target", …)` before use. An
+        // injection/traversal-shaped override must be caught there.
+        let _env = ScopedEnv::new().set(
+            "BUILD_MODULE_TARGET_EFFTRIPLEBADOVERRIDE",
+            "x86_64-unknown-linux-gnu;rm -rf /",
+        );
+        let triple = effective_triple("efftriplebadoverride");
+        assert!(
+            validate_segment("target", &triple).is_err(),
+            "an injection-shaped override must be rejected"
+        );
     }
 
     #[test]

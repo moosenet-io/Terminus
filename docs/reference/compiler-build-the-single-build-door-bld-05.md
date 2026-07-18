@@ -16,6 +16,38 @@ compiler_build(module, ref, host="auto", profile="release", fast=false, bin?, so
   host (`BUILD_HOST_HEAVY`). `host="primary"|"heavy"` forces a role. `BUILD_HEAVY_THRESHOLD_MB`
   has **no baked-in default** (S1) — it is required only when it would actually change the
   decision (an `auto`, non-`fast` build of a module with a known peak), else `NotConfigured`.
+- **Web-build (SPA/npm) pre-step** (BLD-444) — opt-in per module via
+  `BUILD_MODULE_WEB_DIR_<MODULE>` (same upper-cased/`_`-replaced key convention as
+  `BUILD_MODULE_PEAK_MB_<MODULE>`), a RELATIVE directory under the staged source root (e.g.
+  `BUILD_MODULE_WEB_DIR_HARMONY=harmony-web`). When set, `npm ci` then `npm run build` run in
+  that directory, in the same capped scope as the cargo steps, BEFORE `cargo
+  generate-lockfile`/`cargo build`|`test` — for a module (e.g. `harmony`) whose binary embeds a
+  React SPA via `rust-embed` from a gitignored `dist/` at COMPILE time, so a freshly-staged
+  checkout otherwise has no built SPA and the binary embeds only a tiny fallback shell (a blank
+  dashboard). **Requires `node`/`npm` on the build host** for any module that sets this var —
+  no other module is affected, and unset (the default) is a complete no-op: no npm invocation,
+  no new host requirement. **Fails closed**: `npm` missing, or either `npm ci`/`npm run build`
+  exiting non-zero, aborts the whole `compiler_build`/`compiler_test` call — it is never
+  swallowed to fall through to cargo (which would silently embed the blank shell). The
+  configured value is validated as a safe relative path (no `..`, no absolute, no traversal)
+  before use, same discipline as every other path input.
+- **Per-module target-triple override** (BLD-444) — opt-in per module via
+  `BUILD_MODULE_TARGET_<MODULE>` (same key convention as the web-build var above), overriding
+  the fleet-wide `BUILD_TARGET_TRIPLE` default for just that module (e.g.
+  `BUILD_MODULE_TARGET_HARMONY=x86_64-unknown-linux-musl`). Exists because a build host can run
+  a newer glibc than a deploy host (e.g. builder <host> = glibc 2.41 vs. deploy host <host> = glibc
+  2.36) — a `gnu` binary built on the former won't start on the latter. A module whose deps
+  allow a static build (no glibc-only C deps — e.g. harmony's rustls/ring, no openssl) can build
+  `musl` for a portable artifact while other modules (terminus, chord) keep the global `gnu`
+  default untouched. This is the SAME effective triple both `compiler_build` (build/test) and
+  `compiler_release` (promote/rollback/current) default to for a given module, so a module built
+  with an override is also verified/promoted against that override by default — an explicit
+  `target` argument on either tool still wins. Requires the target actually installed on the
+  build host for that toolchain; for a module whose own `rust-toolchain.toml` already lists the
+  target (harmony's does, for `x86_64-unknown-linux-musl`), rustup auto-installs it the first
+  time it's needed — no separate `rustup target add` step. Unset (the default) is a complete
+  no-op for every other module. The override is validated as a safe path/`--target` segment
+  (`validate_segment`) before use, same as the non-overridden default.
 - **Resource caps — Plex protection** (`compiler/scope.rs`) — the build runs under
   `systemd-run --scope` with `MemoryMax` + **`MemorySwapMax=0`** + `CPUQuota` + `IOWeight`.
   The swap-off is load-bearing: an over-budget build is OOM-killed inside its own cgroup
