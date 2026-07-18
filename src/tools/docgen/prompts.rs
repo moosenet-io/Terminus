@@ -59,6 +59,7 @@ use serde_json::Value;
 
 /// One kept subsystem's identity-pass brief.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubsystemBrief {
     pub name: String,
     pub one_liner: String,
@@ -72,6 +73,7 @@ pub struct SubsystemBrief {
 
 /// One row of the repo-level feature inventory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FeatureRow {
     pub feature: String,
     pub description: String,
@@ -81,6 +83,7 @@ pub struct FeatureRow {
 /// One candidate operator guide topic, naming the entry point it should be
 /// grounded in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GuideTopic {
     pub title: String,
     pub grounding: String,
@@ -89,6 +92,7 @@ pub struct GuideTopic {
 /// The strict-JSON output of the Pass 1 identity prompt
 /// ([`build_repo_identity_prompt`]). Parsed by [`parse_repo_identity`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepoIdentity {
     pub tagline: String,
     pub what_is: String,
@@ -230,8 +234,9 @@ troubleshooting note).\n\n\
 HARD RULES: no invented commands, flags you cannot evidence, or \
 placeholder URLs. If the facts don't show how to do a step, write \
 \"(operator-specific: <what's needed>)\" rather than guessing. Secrets \
-are never inlined: reference key names and state that values come from \
-the vault at runtime.\n"
+are never inlined: reference key names and state that values are \
+provided by the repo's configured secret source at runtime (do not name \
+a specific secret backend unless ENTRY POINTS establishes one).\n"
     )
 }
 
@@ -289,7 +294,13 @@ pub fn parse_file_blocks(raw: &str) -> Vec<(PathBuf, String)> {
             if let Some(path) = current_path.take() {
                 blocks.push((path, current_body.trim().to_string()));
             }
-            current_path = Some(PathBuf::from(path_str.trim()));
+            // The path comes straight from model output and is handed to a
+            // downstream writer, so a `=== FILE: ../../x ===` or absolute path
+            // would be a write-outside-the-docs-tree primitive. Only accept a
+            // safe, relative, in-`docs/` path; drop the block otherwise (its body
+            // is still consumed so it never bleeds into the next accepted file).
+            let candidate = PathBuf::from(path_str.trim());
+            current_path = is_safe_docs_path(&candidate).then_some(candidate);
             current_body.clear();
         } else if current_path.is_some() {
             current_body.push_str(line);
@@ -300,6 +311,27 @@ pub fn parse_file_blocks(raw: &str) -> Vec<(PathBuf, String)> {
         blocks.push((path, current_body.trim().to_string()));
     }
     blocks
+}
+
+/// A model-supplied `=== FILE: … ===` path is only accepted if it is a
+/// relative path, under `docs/`, with no `..`/root/prefix component. This is the
+/// parser-level guard against a generated file block becoming a write primitive
+/// outside the docs tree (defense in depth — `place_docs` is the sole writer and
+/// enforces its own placement-area fence too).
+fn is_safe_docs_path(path: &std::path::Path) -> bool {
+    use std::path::Component;
+    if path.is_absolute() {
+        return false;
+    }
+    if path.components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return false;
+    }
+    path.starts_with("docs")
 }
 
 // ---------------------------------------------------------------------------
@@ -643,6 +675,20 @@ Clone the repo and build it.
         let blocks = parse_file_blocks(raw);
         assert_eq!(blocks.len(), 1);
         assert!(!blocks[0].1.contains("preamble"));
+    }
+
+    #[test]
+    fn unsafe_or_out_of_tree_file_paths_are_dropped() {
+        let raw = "\
+=== FILE: ../../etc/cron.d/evil ===\nrm -rf /\n\
+=== FILE: /etc/passwd ===\nroot:x:0:0\n\
+=== FILE: src/main.rs ===\nfn main(){}\n\
+=== FILE: docs/guides/ok.md ===\nreal guide\n";
+        let blocks = parse_file_blocks(raw);
+        // only the docs/ path survives; the traversal/absolute/out-of-docs ones are dropped
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0, PathBuf::from("docs/guides/ok.md"));
+        assert_eq!(blocks[0].1, "real guide");
     }
 
     // --- anti_latch_lint ----------------------------------------------------
