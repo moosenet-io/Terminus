@@ -142,7 +142,7 @@ fn write_atomic(final_path: &Path, content: &str) -> std::io::Result<()> {
 /// rename), skipping the write entirely when the file already holds
 /// byte-identical content. Records the outcome (written/unchanged/skipped)
 /// on `report`. Never panics -- every I/O failure is caught and recorded.
-fn place_one(target_root: &Path, relative_path: &str, content: &str, report: &mut PlacementReport) {
+fn place_one(target_root: &Path, canonical_root: &Path, relative_path: &str, content: &str, report: &mut PlacementReport) {
     if !is_safe_relative_path(relative_path) {
         report.skip(
             relative_path,
@@ -183,6 +183,25 @@ fn place_one(target_root: &Path, relative_path: &str, content: &str, report: &mu
         if let Err(e) = std::fs::create_dir_all(parent) {
             report.skip(relative_path, format!("failed to create parent directory: {e}"));
             return;
+        }
+        // Defence against a SYMLINKED intermediate directory (e.g. a planted
+        // `docs -> /elsewhere`): the lexical guards above cannot see it, so
+        // resolve the real parent and refuse if it escapes the canonical root.
+        // No artifact is ever written outside target_root even if such a
+        // symlink exists.
+        match parent.canonicalize() {
+            Ok(real_parent) if real_parent.starts_with(canonical_root) => {}
+            Ok(_) => {
+                report.skip(
+                    relative_path,
+                    "resolved parent directory escapes target_root (symlinked intermediate) -- refused",
+                );
+                return;
+            }
+            Err(e) => {
+                report.skip(relative_path, format!("cannot resolve parent directory: {e}"));
+                return;
+            }
         }
     }
 
@@ -225,14 +244,24 @@ pub fn place_docs(target_root: &Path, landing: &str, docs_tree: &[DocsTreeFile])
         return report;
     }
 
+    // Resolve the real target_root once so every placement can verify it stays
+    // inside it even through a symlinked intermediate directory.
+    let canonical_root = match target_root.canonicalize() {
+        Ok(c) => c,
+        Err(e) => {
+            report.skip(".", format!("cannot canonicalize target_root '{}': {e}", target_root.display()));
+            return report;
+        }
+    };
+
     if landing.trim().is_empty() {
         report.skip(README_PATH, "landing content is empty -- refusing to write or overwrite README.md");
     } else {
-        place_one(target_root, README_PATH, landing, &mut report);
+        place_one(target_root, &canonical_root, README_PATH, landing, &mut report);
     }
 
     for file in docs_tree {
-        place_one(target_root, &file.path, &file.content, &mut report);
+        place_one(target_root, &canonical_root, &file.path, &file.content, &mut report);
     }
 
     report
@@ -404,6 +433,37 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn place_docs_refuses_a_docs_entry_through_a_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+        // A docs/** path is lexically allowed, but if `docs` itself is a symlink
+        // pointing outside target_root, writing through it would land the
+        // artifact outside. The canonical-parent check must catch this.
+        let container = unique_tmp_dir("symlink-parent");
+        let root = container.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = container.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("docs")).unwrap(); // root/docs -> ../outside
+
+        let tree = vec![DocsTreeFile {
+            path: "docs/leak.md".to_string(),
+            content: "must not land outside target_root".to_string(),
+        }];
+        let report = place_docs(&root, "# Hello\n", &tree);
+
+        // README.md still landed inside root; the symlinked docs entry was refused.
+        assert!(report.written.contains(&README_PATH.to_string()));
+        assert!(report.skipped.iter().any(|s| s.path == "docs/leak.md"), "skipped: {:?}", report.skipped);
+        assert!(!report.written.contains(&"docs/leak.md".to_string()));
+        // Nothing leaked into the outside target.
+        assert!(!outside.join("leak.md").exists());
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none(), "outside dir must stay empty");
+
+        std::fs::remove_dir_all(&container).ok();
     }
 
     // ── An existing hand-written README.md is replaced atomically ──────────
