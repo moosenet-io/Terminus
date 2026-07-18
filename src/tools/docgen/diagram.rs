@@ -574,10 +574,16 @@ fn order_kept_for_layout<'a>(
 /// `max_nodes = 16`) -- both are thin wrappers over this so the two diagrams
 /// can never drift in derivation rule, only in node budget.
 fn build_subsystem_mermaid(facts: &RepoFacts, max_nodes: usize) -> Result<SweptDiagramSource, ToolError> {
-    // Edge case: a single-subsystem (or zero-subsystem, e.g. ungrounded)
-    // repo has no meaningful cross-subsystem call graph to derive an
-    // architecture diagram from -- fall back to the generic default,
-    // exactly as `is_generic_placeholder` expects to flag it.
+    // Without KG grounding there is no real call graph, so a "derived" diagram
+    // would be synthetic — never emit one that could be mistaken for
+    // KG-derived. The generic default is the documented no-KG fallback (and
+    // `is_generic_placeholder` flags it so the landing gate can catch it).
+    if !facts.kg_grounded {
+        return default_architecture_mermaid_source(&facts.project_id);
+    }
+    // Edge case: a single-subsystem (or zero-subsystem) repo has no meaningful
+    // cross-subsystem call graph to derive an architecture diagram from -- same
+    // generic-default fallback.
     let real: Vec<&Subsystem> = facts.subsystems.iter().filter(|s| !s.is_misc).collect();
     if real.len() < 2 {
         return default_architecture_mermaid_source(&facts.project_id);
@@ -1568,6 +1574,25 @@ mod tests {
         let facts = fixture_facts(vec![], vec![], &[]);
         let source = subsystem_architecture_mermaid_source(&facts).unwrap();
         assert!(is_generic_placeholder(source.as_str()));
+    }
+
+    /// Ungrounded facts (`kg_grounded == false`) MUST fall back to the generic
+    /// default even with 2+ subsystems present, so a synthetic/ungrounded
+    /// architecture can never ship looking KG-derived (codex review finding).
+    #[test]
+    fn ungrounded_facts_fall_back_to_default_even_with_multiple_subsystems() {
+        let mut facts = fixture_facts(
+            vec![fixture_subsystem("core", 40), fixture_subsystem("svc", 30)],
+            vec![fixture_edge("core", "svc", 6)],
+            &[],
+        );
+        facts.kg_grounded = false;
+        let source = subsystem_architecture_mermaid_source(&facts).unwrap();
+        assert!(
+            is_generic_placeholder(source.as_str()),
+            "ungrounded facts must yield the flagged generic default, not a derived-looking diagram: {}",
+            source.as_str()
+        );
     }
 
     /// >16 subsystems -- folded into a single `…` node, node cap respected
