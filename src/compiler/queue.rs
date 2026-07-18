@@ -209,6 +209,13 @@ pub struct JobRequest {
     /// coalescing request with `force=true` upgrades the job; it is never
     /// downgraded back to `force=false`.
     pub force: bool,
+    /// `"build"` (default) or `"test"` (BLD-ASYNC, TERM #421): which
+    /// `compiler_build` mode the scheduler runs this job as. Carried durably so
+    /// an async `compiler_build(wait=false, mode=test)` submission — or a
+    /// `compiler_request(mode=test)` — dispatches as a test-gate, not a
+    /// publish-and-flip build. `""`/anything other than `"test"` behaves as
+    /// `"build"` (unchanged default behavior).
+    pub mode: String,
 }
 
 /// Outcome of an [`QueueStore::enqueue`].
@@ -236,6 +243,8 @@ pub struct QueuedJob {
     /// Disrupt-on-demand override carried from the enqueue request
     /// (BLD-DISPATCH-01). See [`JobRequest::force`].
     pub force: bool,
+    /// `"build"` or `"test"` (BLD-ASYNC, TERM #421). See [`JobRequest::mode`].
+    pub mode: String,
 }
 
 /// Why a [`QueueStore::claim`] did not take the job.
@@ -499,18 +508,35 @@ fn seq_key() -> String {
 fn dedupe_prefix() -> String {
     Namespace::Queue.key("dedupe:")
 }
-/// A COLLISION-FREE identity for a `(module, ref)` pair: `"{len(module)}:{module}:{ref}"`.
-/// The decimal length prefix marks exactly where `module` ends, so the encoding
-/// is injective even when either component contains `:` or `@` — distinct pairs
-/// never alias (e.g. `("a","b@c")` ≠ `("a@b","c")`). The IDENTICAL construction
-/// is used in the release/reconcile Lua (`#module..':'..module..':'..ref`), so
-/// Rust-built and Lua-derived dedupe keys always agree. Encode-only (never decoded).
-fn dedupe_id(module: &str, git_ref: &str) -> String {
-    format!("{}:{module}:{git_ref}", module.len())
+/// Normalize a raw `mode` arg to its canonical dedupe token: `"test"` iff the
+/// input is exactly `"test"`, else `"build"` (covers `"build"`, `""`, and any
+/// stale/unknown value). The SAME normalization runs in the release/reconcile
+/// Lua (`if mode~='test' then mode='build' end`) so Rust-built and Lua-derived
+/// dedupe keys always agree on the mode component.
+fn dedupe_mode(mode: &str) -> &'static str {
+    if mode == "test" {
+        "test"
+    } else {
+        "build"
+    }
 }
-/// Per-`(module, ref)` dedupe pointer → the owning job id.
-fn dedupe_key(module: &str, git_ref: &str) -> String {
-    format!("{}{}", dedupe_prefix(), dedupe_id(module, git_ref))
+/// A COLLISION-FREE identity for a `(mode, module, ref)` triple:
+/// `"{mode}:{len(module)}:{module}:{ref}"`. `mode` (BLD-ASYNC, TERM #421) is a
+/// canonical `build`/`test` token — neither contains `:`, so it is exactly the
+/// text before the FIRST `:` and the encoding stays injective; the decimal
+/// length prefix then marks where `module` ends, so distinct triples never
+/// alias even when a component contains `:`/`@` (e.g. `("a","b@c")` ≠
+/// `("a@b","c")`, and `(build,m,r)` ≠ `(test,m,r)`). Keying `mode` in here — not
+/// as an adopt-on-coalesce field — is what keeps a `mode=test` submit from
+/// coalescing onto (or flipping) a pending `mode=build` job: they are genuinely
+/// different work. The IDENTICAL construction is used in the release/reconcile
+/// Lua, so Rust-built and Lua-derived dedupe keys always agree. Encode-only.
+fn dedupe_id(module: &str, git_ref: &str, mode: &str) -> String {
+    format!("{}:{}:{module}:{git_ref}", dedupe_mode(mode), module.len())
+}
+/// Per-`(mode, module, ref)` dedupe pointer → the owning job id.
+fn dedupe_key(module: &str, git_ref: &str, mode: &str) -> String {
+    format!("{}{}", dedupe_prefix(), dedupe_id(module, git_ref, mode))
 }
 /// The per-job hash prefix (the Lua scripts append the id).
 fn job_prefix() -> String {
@@ -564,6 +590,7 @@ local ready=ARGV[9]
 local held_ttl=tonumber(ARGV[10])
 local bin=ARGV[11]
 local force=ARGV[12]
+local mode=ARGV[13]
 local existing=redis.call('GET', dedupe)
 if existing then
   local jk=jp..existing
@@ -574,6 +601,9 @@ if existing then
     -- (or correct it). bin is a deterministic property of module@ref, so adopt any
     -- non-empty incoming value; the scheduler then builds the right binary.
     if bin~='' then redis.call('HSET', jk, 'bin', bin) end
+    -- BLD-ASYNC (TERM #421): mode is NOT adopted on coalesce — it is part of the
+    -- dedupe KEY, so any job we coalesce onto necessarily already has this exact
+    -- mode (a differing mode resolves to a different dedupe pointer / job).
     local cur=tonumber(redis.call('HGET', jk, 'prank') or '0')
     if prank>cur then
       redis.call('HSET', jk, 'prank', prank, 'priority', ARGV[7])
@@ -619,6 +649,7 @@ if existing then
     -- rerun that `release` clones from it carries the correct (possibly newly
     -- supplied) cargo bin, not a stale/absent one.
     if bin~='' then redis.call('HSET', jk, 'bin', bin) end
+    -- mode is keyed (see above); never adopted on coalesce.
     local cur=tonumber(redis.call('HGET', jk, 'prank') or '0')
     if prank>cur then
       redis.call('HSET', jk, 'prank', prank, 'priority', ARGV[7])
@@ -638,7 +669,7 @@ local state='held'
 if ready=='1' then state='queued' end
 redis.call('HSET', jk, 'module', ARGV[5], 'ref', ARGV[6], 'prank', prank,
   'priority', ARGV[7], 'heavy', heavy, 'seq', seq, 'requested_at', now,
-  'coalesced', 1, 'state', state, 'bin', ARGV[11], 'force', force)
+  'coalesced', 1, 'state', state, 'bin', ARGV[11], 'force', force, 'mode', mode)
 redis.call('SET', dedupe, id)
 if ready=='1' then
   local score=seq-(prank*1000000000000)
@@ -707,6 +738,11 @@ const RELEASE_BODY: &str = r#"
 local module=redis.call('HGET', jobkey, 'module')
 local ref=redis.call('HGET', jobkey, 'ref')
 local host=redis.call('HGET', jobkey, 'host')
+-- BLD-ASYNC (TERM #421): mode is part of the dedupe KEY, so it is re-derived
+-- here (canonicalized identically to Rust's dedupe_mode) and folded into the
+-- dedupe pointer, so a rerun/clear targets the mode-specific entry.
+local mode=redis.call('HGET', jobkey, 'mode') or 'build'
+if mode~='test' then mode='build' end
 if module then
   local lockkey=lockprefix..module
   if redis.call('GET', lockkey)==jobid then redis.call('DEL', lockkey) end
@@ -716,7 +752,7 @@ if host then
 end
 redis.call('HDEL', jobkey, 'claim_token')
 local dedupe=false
-if module and ref then dedupe=dedupeprefix..string.len(module)..':'..module..':'..ref end
+if module and ref then dedupe=dedupeprefix..mode..':'..string.len(module)..':'..module..':'..ref end
 local rerun=redis.call('HGET', jobkey, 'rerun')
 local rr_flag=0
 local rr_id=''
@@ -731,7 +767,7 @@ if rerun=='1' then
   local njk=jobprefix..rr_id
   redis.call('HSET', njk, 'module', module, 'ref', ref, 'prank', prank,
     'priority', prio, 'heavy', heavy, 'seq', seq, 'requested_at', nowv,
-    'coalesced', 1, 'state', 'queued', 'bin', bin, 'force', force)
+    'coalesced', 1, 'state', 'queued', 'bin', bin, 'force', force, 'mode', mode)
   if dedupe then redis.call('SET', dedupe, rr_id) end
   local score=seq-(prank*1000000000000)
   redis.call('ZADD', zsetkey, score, rr_id)
@@ -776,8 +812,8 @@ return {{rr_flag, rr_id}}
     )
 }
 
-/// Peek the top-N dispatchable jobs, flattened as 7 fields each:
-/// `id, module, ref, prank, heavy, bin, force`.
+/// Peek the top-N dispatchable jobs, flattened as 8 fields each:
+/// `id, module, ref, prank, heavy, bin, force, mode`.
 /// KEYS: 1=zset  ARGV: 1=limit 2=job_prefix
 const PEEK_LUA: &str = r#"
 local ids=redis.call('ZRANGE', KEYS[1], 0, tonumber(ARGV[1])-1)
@@ -791,6 +827,7 @@ for _, id in ipairs(ids) do
   out[#out+1]=redis.call('HGET', jk, 'heavy') or '0'
   out[#out+1]=redis.call('HGET', jk, 'bin') or ''
   out[#out+1]=redis.call('HGET', jk, 'force') or '0'
+  out[#out+1]=redis.call('HGET', jk, 'mode') or ''
 end
 return out
 "#;
@@ -973,7 +1010,14 @@ impl RedisQueue {
 impl QueueStore for RedisQueue {
     async fn enqueue(&self, req: &JobRequest) -> Result<Enqueued, QueueError> {
         let id = uuid::Uuid::new_v4().simple().to_string();
-        let (dedupe, zset, seq) = (dedupe_key(&req.module, &req.git_ref), zset_key(), seq_key());
+        // BLD-ASYNC (TERM #421): the dedupe key now includes the canonical mode,
+        // so a mode=test submit gets its OWN queue entry and can never coalesce
+        // onto (or flip) a pending mode=build job of the same module@ref.
+        let (dedupe, zset, seq) = (
+            dedupe_key(&req.module, &req.git_ref, &req.mode),
+            zset_key(),
+            seq_key(),
+        );
         let (prank, now, jp) = (req.priority.rank(), now_ms(), job_prefix());
         let (module, git_ref, label) =
             (req.module.clone(), req.git_ref.clone(), req.priority.as_str());
@@ -983,6 +1027,10 @@ impl QueueStore for RedisQueue {
         let bin = req.bin.clone().unwrap_or_default();
         // BLD-DISPATCH-01: carry the disrupt-on-demand force flag as ARGV[12].
         let force = req.force as i64;
+        // BLD-ASYNC (TERM #421): carry the CANONICAL build-vs-test mode as
+        // ARGV[13], stored on the job hash so the release/reconcile Lua can
+        // re-derive the same mode-keyed dedupe key from the hash's own fields.
+        let mode = dedupe_mode(&req.mode);
         let script = redis::Script::new(ENQUEUE_LUA);
         let out: Result<(String, i64), ()> = self
             .backend
@@ -1003,6 +1051,7 @@ impl QueueStore for RedisQueue {
                     .arg(held_ttl)
                     .arg(bin)
                     .arg(force)
+                    .arg(mode)
                     .invoke_async::<_, (String, i64)>(&mut conn)
                     .await
             })
@@ -1032,7 +1081,7 @@ impl QueueStore for RedisQueue {
             .await;
         match out {
             Ok(flat) => Ok(flat
-                .chunks_exact(7)
+                .chunks_exact(8)
                 .map(|c| QueuedJob {
                     job_id: c[0].clone(),
                     module: c[1].clone(),
@@ -1041,6 +1090,11 @@ impl QueueStore for RedisQueue {
                     heavy: c[4] == "1",
                     bin: Some(c[5].clone()).filter(|s| !s.is_empty()),
                     force: c[6] == "1",
+                    mode: if c[7] == "test" {
+                        "test".to_string()
+                    } else {
+                        "build".to_string()
+                    },
                 })
                 .collect()),
             Err(()) => Err(QueueError::Unavailable),
@@ -1327,6 +1381,7 @@ pub(crate) mod fake {
         heavy: bool,
         bin: Option<String>,
         force: bool,
+        mode: String,
         seq: i64,
         coalesced: i64,
         state: String, // held | queued | building | done | failed
@@ -1460,10 +1515,10 @@ pub(crate) mod fake {
             self.state.lock().unwrap().jobs.len()
         }
 
-        /// How many times `module@ref` coalesced (test assertion helper).
-        pub(crate) fn coalesced(&self, module: &str, git_ref: &str) -> i64 {
+        /// How many times `(module, ref, mode)` coalesced (test assertion helper).
+        pub(crate) fn coalesced(&self, module: &str, git_ref: &str, mode: &str) -> i64 {
             let s = self.state.lock().unwrap();
-            let dk = dedupe_id(module, git_ref);
+            let dk = dedupe_id(module, git_ref, mode);
             s.dedupe
                 .get(&dk)
                 .and_then(|id| s.jobs.get(id))
@@ -1491,10 +1546,11 @@ pub(crate) mod fake {
                 j.rerun,
                 j.bin.clone(),
                 j.force,
+                j.mode.clone(),
             ),
             None => return,
         };
-        let (dmod, dref, dhost, dprank, dheavy, rerun, dbin, dforce) = done;
+        let (dmod, dref, dhost, dprank, dheavy, rerun, dbin, dforce, dmode) = done;
         // Derive the module lock + host slot from the STORED fields.
         if s.module_lock.get(&dmod).map(String::as_str) == Some(job_id) {
             s.module_lock.remove(&dmod);
@@ -1507,7 +1563,8 @@ pub(crate) mod fake {
         if let Some(j) = s.jobs.get_mut(job_id) {
             j.claim_token = None;
         }
-        let dk = dedupe_id(&dmod, &dref);
+        // BLD-ASYNC (TERM #421): the dedupe key is mode-scoped (mirrors RELEASE_BODY).
+        let dk = dedupe_id(&dmod, &dref, &dmode);
         if rerun {
             // Re-enqueue EXACTLY one follow-up job for the same module@ref.
             s.seq += 1;
@@ -1523,6 +1580,7 @@ pub(crate) mod fake {
                     heavy: dheavy,
                     bin: dbin,
                     force: dforce,
+                    mode: dmode,
                     seq,
                     coalesced: 1,
                     state: "queued".into(),
@@ -1551,7 +1609,9 @@ pub(crate) mod fake {
             if s.down {
                 return Err(QueueError::Unavailable);
             }
-            let dk = dedupe_id(&req.module, &req.git_ref);
+            // BLD-ASYNC (TERM #421): mode-scoped dedupe key — a mode=test submit
+            // gets its own entry and never coalesces onto a pending mode=build job.
+            let dk = dedupe_id(&req.module, &req.git_ref, &req.mode);
             if let Some(existing) = s.dedupe.get(&dk).cloned() {
                 let st = s.jobs.get(&existing).map(|j| j.state.clone());
                 match st.as_deref() {
@@ -1573,6 +1633,9 @@ pub(crate) mod fake {
                         if req.force {
                             j.force = true;
                         }
+                        // BLD-ASYNC (TERM #421): mode is keyed into the dedupe id,
+                        // so a coalescing request always shares this job's mode —
+                        // never adopted/flipped here (mirrors ENQUEUE_LUA).
                         if req.ready && j.state == "held" {
                             j.state = "queued".into();
                         }
@@ -1605,6 +1668,7 @@ pub(crate) mod fake {
                         if req.force {
                             j.force = true;
                         }
+                        // BLD-ASYNC (TERM #421): mode is keyed, never adopted here.
                         return Ok(Enqueued {
                             job_id: existing,
                             created: false,
@@ -1626,6 +1690,7 @@ pub(crate) mod fake {
                     heavy: req.heavy,
                     bin: req.bin.clone(),
                     force: req.force,
+                    mode: req.mode.clone(),
                     seq,
                     coalesced: 1,
                     state: if req.ready { "queued".into() } else { "held".into() },
@@ -1664,6 +1729,11 @@ pub(crate) mod fake {
                     heavy: j.heavy,
                     bin: j.bin.clone(),
                     force: j.force,
+                    mode: if j.mode == "test" {
+                        "test".to_string()
+                    } else {
+                        "build".to_string()
+                    },
                 })
                 .collect())
         }
@@ -1911,6 +1981,7 @@ mod tests {
             heavy,
             ready: true,
             force: false,
+            mode: "build".to_string(),
         }
     }
 
@@ -1931,19 +2002,25 @@ mod tests {
         assert!(!b.created, "second readiness must coalesce, not create");
         assert_eq!(a.job_id, b.job_id);
         assert_eq!(q.peek(10).await.unwrap().len(), 1, "one coalesced job queued");
-        assert_eq!(q.coalesced("chord", "abc"), 2, "both readiness signals counted");
+        assert_eq!(q.coalesced("chord", "abc", "build"), 2, "both readiness signals counted");
     }
 
     #[test]
     fn dedupe_identity_is_collision_free_across_at_signs() {
         // Fix 1: raw `{module}@{ref}` aliased distinct pairs. The length-prefixed
         // identity keeps them distinct.
-        assert_ne!(dedupe_id("a", "b@c"), dedupe_id("a@b", "c"));
-        assert_ne!(dedupe_key("a", "b@c"), dedupe_key("a@b", "c"));
-        // Same pair → identical (coalescing still works).
-        assert_eq!(dedupe_id("chord", "abc"), dedupe_id("chord", "abc"));
+        assert_ne!(dedupe_id("a", "b@c", "build"), dedupe_id("a@b", "c", "build"));
+        assert_ne!(dedupe_key("a", "b@c", "build"), dedupe_key("a@b", "c", "build"));
+        // Same triple → identical (coalescing still works).
+        assert_eq!(dedupe_id("chord", "abc", "build"), dedupe_id("chord", "abc", "build"));
         // A `:` in a component can't alias either (length prefix disambiguates).
-        assert_ne!(dedupe_id("a", "b:c"), dedupe_id("a:b", "c"));
+        assert_ne!(dedupe_id("a", "b:c", "build"), dedupe_id("a:b", "c", "build"));
+        // BLD-ASYNC (TERM #421): mode is part of the identity — build vs test of
+        // the SAME module@ref are DISTINCT (and canonicalized: "", "build", and
+        // any unknown value all fold to the build token).
+        assert_ne!(dedupe_id("m", "r", "build"), dedupe_id("m", "r", "test"));
+        assert_eq!(dedupe_id("m", "r", "build"), dedupe_id("m", "r", ""));
+        assert_eq!(dedupe_id("m", "r", "build"), dedupe_id("m", "r", "bogus"));
     }
 
     #[tokio::test]
@@ -1960,6 +2037,42 @@ mod tests {
         let z = q.enqueue(&req("a", "b@c", Priority::Normal, false)).await.unwrap();
         assert!(!z.created && z.job_id == x.job_id);
         assert_eq!(q.peek(10).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn build_and_test_of_the_same_module_ref_are_distinct_never_coalesce() {
+        // BLD-ASYNC (TERM #421): mode is part of the dedupe identity. A mode=test
+        // submit must get its OWN queue entry, never coalescing onto (or flipping)
+        // a pending mode=build job of the same module@ref — otherwise an async
+        // test-gate would silently run the wrong work.
+        let test_req = |m: &str, r: &str| JobRequest {
+            mode: "test".to_string(),
+            ..req(m, r, Priority::Normal, false)
+        };
+        let q = InMemoryQueue::new();
+
+        // A build is pending; a test submit of the SAME module@ref is a NEW job.
+        let b = q.enqueue(&req("terminus", "abc", Priority::Normal, false)).await.unwrap();
+        let t = q.enqueue(&test_req("terminus", "abc")).await.unwrap();
+        assert!(b.created && t.created, "build and test are distinct jobs");
+        assert_ne!(b.job_id, t.job_id);
+        assert_eq!(q.peek(10).await.unwrap().len(), 2, "both jobs queued (test did not coalesce)");
+
+        // Each mode coalesces only onto its OWN entry.
+        let b2 = q.enqueue(&req("terminus", "abc", Priority::Normal, false)).await.unwrap();
+        let t2 = q.enqueue(&test_req("terminus", "abc")).await.unwrap();
+        assert!(!b2.created && b2.job_id == b.job_id, "a build coalesces onto the build job");
+        assert!(!t2.created && t2.job_id == t.job_id, "a test coalesces onto the test job");
+        assert_eq!(q.peek(10).await.unwrap().len(), 2, "still exactly the two mode-distinct jobs");
+
+        // The pending build job's mode was never flipped to test.
+        let jobs = q.peek(10).await.unwrap();
+        let build_job = jobs.iter().find(|j| j.job_id == b.job_id).unwrap();
+        let test_job = jobs.iter().find(|j| j.job_id == t.job_id).unwrap();
+        assert_eq!(build_job.mode, "build", "build job's mode is intact");
+        assert_eq!(test_job.mode, "test", "test job's mode is intact");
+        assert_eq!(q.coalesced("terminus", "abc", "build"), 2);
+        assert_eq!(q.coalesced("terminus", "abc", "test"), 2);
     }
 
     #[tokio::test]
@@ -2658,6 +2771,7 @@ mod tests {
             ready,
             bin: None,
             force: false,
+            mode: "build".to_string(),
         };
 
         // 1) Dedupe/coalesce + monotonic priority bump (real ENQUEUE_LUA).
@@ -2758,7 +2872,7 @@ mod tests {
         //    ready=true promotion PERSISTs both (durable).
         let held = q.enqueue(&mk("harmony", "h1", Priority::Normal, false, false)).await.unwrap();
         let held_key = Namespace::Queue.key(&format!("job:{}", held.job_id));
-        let dedupe_key = super::dedupe_key("harmony", "h1");
+        let dedupe_key = super::dedupe_key("harmony", "h1", "build");
         let ttl_job: i64 = raw(&backend, "TTL", &[held_key.clone()]).await;
         let ttl_dedupe: i64 = raw(&backend, "TTL", &[dedupe_key.clone()]).await;
         assert!(ttl_job > 0 && ttl_dedupe > 0, "held intent + dedupe must have a TTL");
@@ -2790,6 +2904,7 @@ mod tests {
             ready: true,
             bin: None,
             force: false,
+            mode: "build".to_string(),
         };
         let j1 = q.enqueue(&mk("r1")).await.unwrap();
         let j2 = q.enqueue(&mk("r2")).await.unwrap();
@@ -2845,7 +2960,7 @@ mod tests {
         for k in [
             zset_key(),
             seq_key(),
-            dedupe_key("chord", "abc"),
+            dedupe_key("chord", "abc", "build"),
             job_key("id"),
             module_lock_key("chord"),
             host_set_key(HostRole::Heavy),

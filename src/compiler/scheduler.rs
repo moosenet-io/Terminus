@@ -387,9 +387,20 @@ pub struct CompilerBuildExecutor;
 #[async_trait]
 impl BuildExecutor for CompilerBuildExecutor {
     async fn build(&self, job: &QueuedJob) -> Result<(), String> {
-        super::invoke_build(&job.module, &job.git_ref, job.heavy, job.bin.as_deref())
-            .await
-            .map_err(|e| e.to_string())
+        // BLD-ASYNC (TERM #421): forward the job's mode + its own job_id as the
+        // request_id, so a caller polling compiler_progress(job_id) after an
+        // async compiler_request/compiler_build(wait=false) submission observes
+        // THIS dispatched build's events, not an unrelated freshly-minted id.
+        super::invoke_build(
+            &job.module,
+            &job.git_ref,
+            job.heavy,
+            job.bin.as_deref(),
+            &job.mode,
+            Some(&job.job_id),
+        )
+        .await
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -816,6 +827,7 @@ mod tests {
             ready: true,
             bin: None,
             force: false,
+            mode: "build".to_string(),
         }
     }
 
