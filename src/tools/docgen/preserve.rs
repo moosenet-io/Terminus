@@ -44,12 +44,16 @@ use super::render::docs_tree::DocsTreeFile;
 
 /// Minimum fraction of an old section's stable tokens that must reappear in
 /// the new corpus for that section to be considered covered by content
-/// signature alone (signal 2). Deliberately not 100%: real paraphrasing can
-/// legitimately drop a redundant token or two while preserving the section's
-/// substance; deliberately well above 0% so a handful of incidental shared
-/// words (e.g. common tool names reused across unrelated sections) cannot
-/// mark a genuinely dropped section as covered.
-const TOKEN_COVERAGE_THRESHOLD: f32 = 0.5;
+/// signature (signal 2). This is a NO-LOSS safety check whose whole point is to
+/// flag anything the cutover dropped, so it is deliberately STRICT: EVERY stable
+/// token (env var, symbol, code span, number) must resurface SOMEWHERE in the
+/// new hierarchy (landing + all docs pages). Tokens relocated from the bloated
+/// README into a docs/ sub-page still count (the corpus spans every docs file),
+/// so legitimate paraphrase-and-relocate stays covered — but a genuinely dropped
+/// value (e.g. `WIDGET_PORT=8080` becoming `WIDGET_PORT=9090`, losing `8080`) is
+/// correctly flagged for operator review rather than silently passed. Erring
+/// toward over-flagging is the safe direction for a "no information lost" gate.
+const TOKEN_COVERAGE_THRESHOLD: f32 = 1.0;
 
 /// A minimum token length to consider -- filters out short incidental
 /// fragments (`"a"`, `"an"`, `"of"`) that are never a meaningful stable
@@ -567,6 +571,25 @@ script -- it takes care of the upload for you.\n",
         let report = check_preservation(old_readme, "# Widget landing, unrelated content.", &new_docs);
         assert!(report.missing.is_empty(), "paraphrase must not be reported as loss: {:?}", report.missing);
         assert_eq!(report.covered, vec!["Deployment".to_string()]);
+    }
+
+    #[test]
+    fn a_section_whose_value_token_was_dropped_is_flagged_not_silently_passed() {
+        // codex review (DLAND-02 r1): a partial token match must not pass a
+        // lossy cutover. Here the env-var NAME survives but its value 8080 is
+        // dropped (changed to 9090); the strict all-tokens rule flags it.
+        let old_readme = "# Widget\n\n## Configuration\n\nSet `WIDGET_PORT=8080` in your environment.\n";
+        let docs = vec![docs_file(
+            "docs/reference/configuration.md",
+            "# Configuration\n\nSet `WIDGET_PORT=9090` in your environment.\n",
+        )];
+
+        let report = check_preservation(old_readme, "# Widget landing", &docs);
+
+        assert_eq!(report.missing.len(), 1, "a dropped value must be flagged; covered={:?}", report.covered);
+        assert_eq!(report.missing[0].heading, "Configuration");
+        assert!(report.covered.is_empty(), "the section must not be marked covered: {:?}", report.covered);
+        assert!(report.coverage_ratio < 1.0);
     }
 
     // ── EDGE CASE: no `##` headings -> whole body is one section ────────
