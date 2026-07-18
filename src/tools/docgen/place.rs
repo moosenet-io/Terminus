@@ -87,10 +87,55 @@ fn is_safe_relative_path(path: &str) -> bool {
 /// Build the atomic-write temp path for `final_path`: the same path with a
 /// `.tmp-<pid>` suffix appended (never replacing an existing extension, so
 /// `docs/index.md` becomes `docs/index.md.tmp-1234`, not `docs/index.tmp-1234`).
-fn tmp_path_for(final_path: &Path) -> PathBuf {
+/// Per-process monotonic nonce so concurrent placements never contend on the
+/// same temp name (pid alone is not enough within one process).
+static TMP_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn tmp_path_for(final_path: &Path, nonce: u64) -> PathBuf {
     let mut os = final_path.as_os_str().to_os_string();
-    os.push(format!(".tmp-{}", std::process::id()));
+    os.push(format!(".tmp-{}-{}", std::process::id(), nonce));
     PathBuf::from(os)
+}
+
+/// Write `content` to `final_path` atomically via an EXCLUSIVELY-created sibling
+/// temp file (`create_new` = `O_CREAT|O_EXCL`) then `rename`. `O_EXCL` refuses
+/// to open a path that already exists — crucially it will NOT follow a
+/// pre-existing symlink at the temp path (which `std::fs::write` would, letting
+/// a write escape `target_root`), and it can never clobber a stale/concurrent
+/// temp. On the rare name collision we retry with a fresh nonce. Returns the io
+/// error to surface (as a skip) on failure, or `Ok(())` on success.
+fn write_atomic(final_path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut last_err: Option<std::io::Error> = None;
+    for _ in 0..16 {
+        let nonce = TMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = tmp_path_for(final_path, nonce);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp_path) {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(content.as_bytes()) {
+                    drop(f);
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(e);
+                }
+                drop(f);
+                if let Err(e) = std::fs::rename(&tmp_path, final_path) {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(e);
+                }
+                return Ok(());
+            }
+            // The temp name is taken (stale temp or a planted symlink/file):
+            // never write through it — pick a new nonce and try again.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_err = Some(e);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::AlreadyExists, "could not create a unique temp file after retries")
+    }))
 }
 
 /// Write `content` to `target_root/relative_path` atomically (tempfile +
@@ -121,15 +166,8 @@ fn place_one(target_root: &Path, relative_path: &str, content: &str, report: &mu
         }
     }
 
-    let tmp_path = tmp_path_for(&final_path);
-    if let Err(e) = std::fs::write(&tmp_path, content.as_bytes()) {
-        report.skip(relative_path, format!("failed to write: {e}"));
-        let _ = std::fs::remove_file(&tmp_path);
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
-        report.skip(relative_path, format!("failed to finalize (rename): {e}"));
-        let _ = std::fs::remove_file(&tmp_path);
+    if let Err(e) = write_atomic(&final_path, content) {
+        report.skip(relative_path, format!("failed to write atomically: {e}"));
         return;
     }
 
