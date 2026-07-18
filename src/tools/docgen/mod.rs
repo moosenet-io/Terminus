@@ -55,6 +55,7 @@ pub mod place;
 pub mod quality;
 pub mod readme_layers;
 pub mod render;
+pub mod repo_facts;
 pub mod search_index;
 pub mod svg_assets;
 pub mod trigger;
@@ -93,6 +94,11 @@ pub use readme_layers::{
 };
 pub use render::docs_tree::{build_docs_tree, DocsTreeFile};
 pub use render::{render_all, RenderContext, RenderOutcome, RenderedArtifact};
+pub use repo_facts::{
+    build_repo_facts, AtlasGraphSource, BinTarget, ConfigSurface, EntryPoints, FixtureGraphSource,
+    GraphSource, LegacySection, NoGraphSource, ProseAnchors, RepoFacts, RepoScale, Subsystem,
+    SubsystemEdge, SubsystemGraph, SymbolRef,
+};
 pub use trigger::{run_docgen_trigger, DocgenRun, TriggerOutcome};
 pub use backfill::{backfill_readme, BackfillReport, DocgenBackfill};
 
