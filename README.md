@@ -1281,6 +1281,42 @@ of this opt-in path: when a passing epic capstone's context carries
 into the working tree, riding the same once-per-build capstone path as
 generation (never per-merge).
 
+### One-shot backfill — migrating an already-bloated README (DLAND-05)
+
+`docgen_backfill` (`crate::tools::docgen::backfill::DocgenBackfill`, function
+`backfill_readme`) is the tool for a repo's *first* cutover — migrating a
+hand-grown mega-README (Terminus, Chord, Muse, lumina-constellation, ...)
+into the concise landing + `docs/` hierarchy in one guarded pass. It reuses
+every existing engine piece rather than reimplementing any of them:
+
+1. Reads `target_root`'s current `README.md` (if any) and passes it as
+   `existing_docs` into `run_docgen_trigger`'s own sweep → generate → render
+   flow (called with `place: false` — this tool decides placement itself,
+   only after the checks below clear).
+2. Runs the DLAND-02 no-loss guard (`check_preservation`) against the OLD
+   README vs. the new landing + `docs/` tree. **If any old section is
+   flagged missing, nothing is placed at all** — not `README.md`, not a
+   single `docs/**` file — and the flagged sections are returned in
+   `BackfillReport::missing` for an operator to confirm before re-running.
+3. Runs the DLAND-03 landing gates (length + link-resolution) and surfaces
+   the outcome even though `place_docs` also enforces them fail-closed.
+4. Only when both checks clear does it call `place_docs(target_root,
+   landing, docs_tree)` — the same DLAND-01 writer every other placement
+   path uses.
+
+`BackfillReport` carries the old/new README line counts, the no-loss
+coverage ratio, any missing sections, which `docs/**` files were created,
+and whether placement actually happened, plus a human-readable `summary`.
+Like every other step in this engine, `docgen_backfill` **never runs git**
+(no add/commit/push) and makes **no Plane/Gitea/GitHub call of any kind** —
+working-copy write only. The resulting working-tree diff is handed to the
+normal build pipeline (review → merge) for an operator to bless, exactly
+like any other change to a tracked repo: a first cutover is always
+operator-reviewed, never auto-committed. Idempotent — re-running against an
+already-migrated repo either reports `GenerationOutcome::NoChange` or a
+placement whose `written` list is empty (byte-identical content already on
+disk).
+
 ### Atlas vector store (KGEMB-01)
 
 Phase 1 of KG-as-behavioral-correction adds semantic (meaning-based) retrieval
