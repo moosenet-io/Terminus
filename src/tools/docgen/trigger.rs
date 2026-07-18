@@ -53,8 +53,33 @@
 //!
 //! ## Placement is the harness's job (load-bearing, inherited from DOCGEN-06)
 //! Exactly like [`super::render::render_all`], this module RETURNS versioned
-//! artifacts and touches no filesystem, git, or hosting surface itself. See
-//! `run_never_touches_filesystem_or_repo` below for the negative test.
+//! artifacts and touches no filesystem, git, or hosting surface itself BY
+//! DEFAULT. See `run_never_touches_filesystem_or_repo` below for the negative
+//! test asserting this holds when placement is not requested.
+//!
+//! ## DLAND-04: opt-in placement (S119, Plane TERM)
+//! [`run_docgen_trigger`] and the `docgen_run` tool now accept two
+//! ADDITIONAL, OPTIONAL parameters: `place` (bool, default `false`) and
+//! `target_root` (`Option<&str>`/`Option<String>`, a repo-relative-root
+//! filesystem path -- typically a worktree root). When `place` is `false`
+//! (or `target_root` is absent), behavior is byte-for-byte unchanged from
+//! before this item: no filesystem is ever touched. Only when BOTH `place`
+//! is `true` AND `target_root` is supplied AND generation actually produced
+//! content (`GenerationOutcome::Generated`) does this module obtain the
+//! concise landing README (the rendered `readme` target's content, from
+//! [`super::render::render_all`]'s own `readme_layers::render_layered_readme`
+//! call) and the `docs/` tree ([`RenderOutcome::docs_tree`], which
+//! `render_all` already builds from the SAME generated content whenever the
+//! readme target rendered -- reused, never re-derived here) and hands both to
+//! [`super::place::place_docs`] (DLAND-01, fail-closed gated by DLAND-03).
+//! The resulting [`super::place::PlacementReport`] is folded into
+//! [`TriggerOutcome::Completed`]'s new `placement` field. This is still a
+//! LOCAL working-tree write only -- no git add/commit/push, no forge call --
+//! and it is non-blocking exactly like every other step in this module: a
+//! placement failure (bad `target_root`, a DLAND-03 gate failure, an I/O
+//! error) is recorded in `placement`/`gate_failures`/`skipped`, never turned
+//! into an `Err` or a panic, and never changes the fact that generation
+//! completed successfully.
 
 use std::collections::BTreeSet;
 
@@ -65,9 +90,10 @@ use crate::error::ToolError;
 use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
-use super::config::ProjectDocConfig;
+use super::config::{DocTargetType, ProjectDocConfig};
 use super::generate::{generate_docs, ChordDocGenerator, DocGenerator, GenerationOutcome, SweptFeatContext};
 use super::pii_gate::sweep_input;
+use super::place::{place_docs, PlacementReport};
 use super::render::{render_all, RenderContext, RenderOutcome};
 use super::versioning::{ArtifactKey, ArtifactVersion, VersionStore};
 
@@ -93,7 +119,20 @@ pub enum TriggerOutcome {
     /// generation completes the stage cleanly with nothing to render or
     /// version (spec EDGE CASE: "don't fabricate" / "don't write an
     /// empty/junk version").
-    Completed { generation: GenerationOutcome, render: Option<RenderOutcome>, versions: Vec<ArtifactVersion> },
+    Completed {
+        generation: GenerationOutcome,
+        render: Option<RenderOutcome>,
+        versions: Vec<ArtifactVersion>,
+        /// DLAND-04: the result of an opt-in placement into a real working
+        /// tree, when `place=true` and `target_root` was supplied AND
+        /// generation actually produced content. `None` whenever placement
+        /// wasn't requested, wasn't applicable (no readme target rendered),
+        /// or generation produced `NoChange`/`Flagged` (nothing to place).
+        /// Non-blocking: a placement FAILURE still shows up here as a
+        /// populated `PlacementReport` with `gate_failures`/`skipped`
+        /// entries, never as a reason this variant itself isn't `Completed`.
+        placement: Option<PlacementReport>,
+    },
     /// Something inside the flow (config parse, PII sweep, or generation)
     /// failed. `reason` is a human-readable summary for logging/flagging.
     /// This is NOT propagated as an `Err` to this function's caller -- see
@@ -117,7 +156,7 @@ impl TriggerOutcome {
                 "outcome": "skipped",
                 "reason": reason,
             }),
-            TriggerOutcome::Completed { generation, render, versions } => {
+            TriggerOutcome::Completed { generation, render, versions, placement } => {
                 let generation_json = match generation {
                     GenerationOutcome::Generated { content, source_commit } => json!({
                         "kind": "generated",
@@ -150,11 +189,23 @@ impl TriggerOutcome {
                         })
                     })
                     .collect();
+                let placement_json = placement.as_ref().map(|p| {
+                    json!({
+                        "written": p.written,
+                        "unchanged": p.unchanged,
+                        "skipped": p.skipped.iter().map(|s| json!({
+                            "path": s.path,
+                            "reason": s.reason,
+                        })).collect::<Vec<_>>(),
+                        "gate_failures": p.gate_failures,
+                    })
+                });
                 json!({
                     "outcome": "completed",
                     "generation": generation_json,
                     "render": render_json,
                     "versions": versions_json,
+                    "placement": placement_json,
                 })
             }
             TriggerOutcome::Failed { reason } => json!({
@@ -204,6 +255,11 @@ fn declares_no_targets(project_config_raw: Option<&Value>) -> bool {
 /// - `generated_at` is an RFC3339 timestamp supplied by the caller -- this
 ///   function, like `versioning.rs` and every renderer, never reads the
 ///   system clock itself.
+/// - `place` / `target_root` (DLAND-04): opt-in placement into a real
+///   working tree. Both default-shaped to a no-op (`place=false`,
+///   `target_root=None`) -- when either is absent, this function's
+///   filesystem behavior is byte-for-byte identical to before DLAND-04. See
+///   the module doc comment's "DLAND-04: opt-in placement" section.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_docgen_trigger(
     generator: &dyn DocGenerator,
@@ -216,6 +272,8 @@ pub async fn run_docgen_trigger(
     project_config_raw: Option<&Value>,
     available_credential_keys: &BTreeSet<String>,
     generated_at: &str,
+    place: bool,
+    target_root: Option<&str>,
 ) -> TriggerOutcome {
     // Opt-in gate (BEFORE the engine is invoked at all): no declared
     // doc-target config -> skip cleanly, matching the mirror_ready pattern.
@@ -266,7 +324,7 @@ not invoked"
         // Nothing to render or version -- the stage still completes
         // cleanly (spec EDGE CASE: "don't fabricate" a version).
         GenerationOutcome::NoChange | GenerationOutcome::Flagged { .. } => {
-            return TriggerOutcome::Completed { generation, render: None, versions: Vec::new() };
+            return TriggerOutcome::Completed { generation, render: None, versions: Vec::new(), placement: None };
         }
     };
 
@@ -294,7 +352,25 @@ not invoked"
         }
     }
 
-    TriggerOutcome::Completed { generation, render: Some(render), versions }
+    // DLAND-04: opt-in placement into a real working tree. Only when the
+    // caller asked for it (`place=true` + `target_root` supplied) AND the
+    // readme target actually rendered (so there's a landing to place, and
+    // `render.docs_tree` -- built by `render_all` from the SAME generated
+    // content -- is non-empty) do we call `place_docs`. Everything here is
+    // non-blocking: any placement failure (bad `target_root`, a DLAND-03
+    // gate failure, an I/O error) is captured in the returned
+    // `PlacementReport`, never turned into an `Err`/panic, and never changes
+    // the fact that generation+rendering already completed successfully.
+    let placement = match (place, target_root) {
+        (true, Some(root)) => render
+            .rendered()
+            .find(|a| a.target_type == DocTargetType::Readme)
+            .and_then(|a| a.content.clone())
+            .map(|landing| place_docs(std::path::Path::new(root), &landing, &render.docs_tree)),
+        _ => None,
+    };
+
+    TriggerOutcome::Completed { generation, render: Some(render), versions, placement }
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +457,14 @@ or hosting surface; placing a returned artifact is the calling harness's job."
                 "generated_at": {
                     "type": "string",
                     "description": "RFC3339 timestamp for this generation. Defaults to the current time if omitted."
+                },
+                "place": {
+                    "type": "boolean",
+                    "description": "DLAND-04: opt-in. When true (and `target_root` is also given), a successful generation's concise landing README and docs/ tree are written into `target_root` via the DLAND-01 placement writer (fail-closed gated by DLAND-03). Defaults to false -- no filesystem is touched unless explicitly requested."
+                },
+                "target_root": {
+                    "type": "string",
+                    "description": "DLAND-04: the working-tree root (e.g. a repo checkout or worktree path) to place the rendered README.md and docs/** into. Required for `place` to have any effect; ignored otherwise."
                 }
             },
             "required": ["spec_id", "project", "module_path", "git_ref", "feat_context"]
@@ -431,6 +515,11 @@ or hosting surface; placing a returned artifact is the calling harness's job."
                 &generated_at_owned
             }
         };
+        // DLAND-04: opt-in placement. `place` defaults to `false` and
+        // `target_root` to absent -- when either is missing this call's
+        // filesystem behavior is unchanged from before DLAND-04.
+        let place = args.get("place").and_then(Value::as_bool).unwrap_or(false);
+        let target_root = args.get("target_root").and_then(Value::as_str);
 
         let generator = ChordDocGenerator::from_env();
         let outcome = run_docgen_trigger(
@@ -444,6 +533,8 @@ or hosting surface; placing a returned artifact is the calling harness's job."
             project_config,
             &available_credential_keys,
             generated_at,
+            place,
+            target_root,
         )
         .await;
 
@@ -521,11 +612,13 @@ mod tests {
             Some(&readme_config()),
             &BTreeSet::new(),
             "2026-07-11T00:00:00Z",
+            false,
+            None,
         )
         .await;
 
         match outcome {
-            TriggerOutcome::Completed { generation: GenerationOutcome::Generated { source_commit, .. }, render, versions } => {
+            TriggerOutcome::Completed { generation: GenerationOutcome::Generated { source_commit, .. }, render, versions, .. } => {
                 assert_eq!(source_commit, "abc1234");
                 let render = render.expect("readme target should have rendered");
                 assert_eq!(render.rendered().count(), 1);
@@ -566,6 +659,8 @@ mod tests {
             Some(&readme_config()),
             &BTreeSet::new(),
             "2026-07-11T00:00:00Z",
+            false,
+            None,
         )
         .await;
 
@@ -599,6 +694,8 @@ mod tests {
             None, // no project config at all -- not opted in
             &BTreeSet::new(),
             "2026-07-11T00:00:00Z",
+            false,
+            None,
         )
         .await;
 
@@ -630,6 +727,8 @@ mod tests {
             Some(&empty_cfg),
             &BTreeSet::new(),
             "2026-07-11T00:00:00Z",
+            false,
+            None,
         )
         .await;
 
@@ -662,6 +761,8 @@ duration of a real end-to-end run.",
             Some(&readme_config()),
             &BTreeSet::new(),
             "2026-07-11T00:00:00Z",
+            false,
+            None,
         )
         .await;
 
@@ -695,11 +796,13 @@ duration of a real end-to-end run.",
             Some(&readme_config()),
             &BTreeSet::new(),
             "2026-07-11T00:00:00Z",
+            false,
+            None,
         )
         .await;
 
         match outcome {
-            TriggerOutcome::Completed { generation: GenerationOutcome::NoChange, render, versions } => {
+            TriggerOutcome::Completed { generation: GenerationOutcome::NoChange, render, versions, .. } => {
                 assert!(render.is_none());
                 assert!(versions.is_empty());
             }
@@ -725,11 +828,13 @@ duration of a real end-to-end run.",
             Some(&readme_config()),
             &BTreeSet::new(),
             "2026-07-11T00:00:00Z",
+            false,
+            None,
         )
         .await;
 
         match outcome {
-            TriggerOutcome::Completed { generation: GenerationOutcome::Flagged { .. }, render, versions } => {
+            TriggerOutcome::Completed { generation: GenerationOutcome::Flagged { .. }, render, versions, .. } => {
                 assert!(render.is_none());
                 assert!(versions.is_empty());
             }
@@ -755,6 +860,8 @@ duration of a real end-to-end run.",
             Some(&bad_cfg),
             &BTreeSet::new(),
             "2026-07-11T00:00:00Z",
+            false,
+            None,
         )
         .await;
 
@@ -762,6 +869,152 @@ duration of a real end-to-end run.",
             TriggerOutcome::Failed { reason } => assert!(reason.to_lowercase().contains("sharepoint") || reason.to_lowercase().contains("target")),
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    // -- DLAND-04: opt-in placement into a real working tree. ---------------
+
+    /// Per-call unique temp dir (pid + nanosecond timestamp), matching
+    /// `place.rs`'s own test helper -- several tests in this module run
+    /// concurrently within the same process, so pid alone isn't enough.
+    fn unique_tmp_dir(label: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("docgen-trigger-place-{label}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn place_true_with_target_root_lands_readme_and_docs_tree_on_disk() {
+        let root = unique_tmp_dir("happy-path");
+        let generator = MockDocGenerator::ok(
+            "# terminus-rs docgen module\n\nThis module renders declared doc targets from a swept feat context.\n\n\
+## Quickstart\n\nRun `docgen_run` to produce your first set of docs.\n\n\
+## Deep Dive\n\nThe engine sweeps, generates, renders, and versions.\n",
+        );
+        let store = VersionStore::new();
+        let root_str = root.to_str().unwrap();
+
+        let outcome = run_docgen_trigger(
+            &generator,
+            &store,
+            "TERM",
+            "src/tools/docgen",
+            "place1234",
+            None,
+            "the feat wired placement into the trigger",
+            Some(&readme_config()),
+            &BTreeSet::new(),
+            "2026-07-11T00:00:00Z",
+            true,
+            Some(root_str),
+        )
+        .await;
+
+        match outcome {
+            TriggerOutcome::Completed { generation: GenerationOutcome::Generated { .. }, placement, .. } => {
+                let placement = placement.expect("place=true + target_root must produce a PlacementReport");
+                assert!(placement.gate_failures.is_empty(), "{:?}", placement.gate_failures);
+                assert!(placement.written.contains(&"README.md".to_string()), "{:?}", placement.written);
+                assert!(
+                    placement.written.iter().any(|p| p.starts_with("docs/")),
+                    "expected at least one docs/** file written: {:?}",
+                    placement.written
+                );
+            }
+            other => panic!("expected Completed/Generated with a placement, got {other:?}"),
+        }
+
+        // The files really landed on disk, not just reported as written.
+        assert!(root.join("README.md").exists());
+        assert!(root.join("docs/index.md").exists());
+        assert!(root.join("docs/getting-started.md").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn place_false_never_touches_the_target_root_even_if_supplied() {
+        // Passing a target_root without place=true must still be a pure,
+        // filesystem-free call -- `place` is the sole opt-in switch.
+        let root = unique_tmp_dir("place-false-ignored");
+        let generator = MockDocGenerator::ok(
+            "# terminus-rs docgen module\n\nThis module renders declared doc targets from a swept feat context.",
+        );
+        let store = VersionStore::new();
+        let root_str = root.to_str().unwrap();
+
+        let outcome = run_docgen_trigger(
+            &generator,
+            &store,
+            "TERM",
+            "src/tools/docgen",
+            "place5678",
+            None,
+            "a feat where placement was not requested",
+            Some(&readme_config()),
+            &BTreeSet::new(),
+            "2026-07-11T00:00:00Z",
+            false,
+            Some(root_str),
+        )
+        .await;
+
+        match outcome {
+            TriggerOutcome::Completed { placement, .. } => assert!(placement.is_none()),
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert!(!root.join("README.md").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn placement_failure_is_reported_non_blocking_never_fails_the_feat() {
+        // A target_root that doesn't exist makes `place_docs` refuse to write
+        // anything -- this must show up as a populated (but empty-written)
+        // PlacementReport inside a normal `Completed` outcome, never as a
+        // `Failed` outcome or a panic. Generation/rendering/versioning still
+        // succeeded; only placement itself is flagged.
+        let missing_root = std::env::temp_dir().join(format!(
+            "docgen-trigger-place-does-not-exist-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        assert!(!missing_root.exists());
+        let generator = MockDocGenerator::ok(
+            "# terminus-rs docgen module\n\nThis module renders declared doc targets from a swept feat context.",
+        );
+        let store = VersionStore::new();
+        let root_str = missing_root.to_str().unwrap();
+
+        let outcome = run_docgen_trigger(
+            &generator,
+            &store,
+            "TERM",
+            "src/tools/docgen",
+            "place9012",
+            None,
+            "a feat whose target_root does not exist",
+            Some(&readme_config()),
+            &BTreeSet::new(),
+            "2026-07-11T00:00:00Z",
+            true,
+            Some(root_str),
+        )
+        .await;
+
+        match outcome {
+            TriggerOutcome::Completed { generation: GenerationOutcome::Generated { .. }, versions, placement, .. } => {
+                // Generation/rendering/versioning were unaffected.
+                assert_eq!(versions.len(), 1, "a placement failure must not affect versioning");
+                let placement = placement.expect("a placement attempt was made and must be reported");
+                assert!(placement.written.is_empty());
+                assert_eq!(placement.skipped.len(), 1, "{:?}", placement.skipped);
+            }
+            other => panic!("expected Completed/Generated (placement failure is non-blocking), got {other:?}"),
+        }
+        assert!(!missing_root.exists(), "place_docs must never create target_root itself");
     }
 
     // -- Tool-level smoke test: registration + schema shape. ----------------
@@ -782,5 +1035,31 @@ duration of a real end-to-end run.",
         let tool = DocgenRun::new();
         let result = tool.execute(json!({})).await;
         assert!(matches!(result, Err(ToolError::InvalidArgument(_))));
+    }
+
+    /// DLAND-04: `place`/`target_root` are declared, optional schema params
+    /// -- not required, so a caller that never mentions them (the pre-DLAND-04
+    /// shape) still validates against this schema unchanged. `execute()`
+    /// itself defaults `place` to `false` and `target_root` to absent when
+    /// missing (see the `unwrap_or(false)`/`and_then` parsing above), which
+    /// is what actually keeps a default call's behavior byte-for-byte
+    /// unchanged -- this test asserts the schema-level contract those
+    /// defaults rely on.
+    #[test]
+    fn docgen_run_schema_declares_place_and_target_root_as_optional() {
+        let tool = DocgenRun::new();
+        let schema = tool.parameters();
+        let props = schema.get("properties").and_then(Value::as_object).expect("object schema");
+        assert!(props.contains_key("place"), "schema missing DLAND-04 `place` param");
+        assert!(props.contains_key("target_root"), "schema missing DLAND-04 `target_root` param");
+        let required: Vec<&str> = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("required array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(!required.contains(&"place"), "`place` must stay optional");
+        assert!(!required.contains(&"target_root"), "`target_root` must stay optional");
     }
 }

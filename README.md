@@ -1206,6 +1206,7 @@ sees the just-refreshed Atlas graph.
 | `module_path` | string, optional | Passed through to `docgen_run` as `module_path`. Defaults to `"."` if omitted. |
 | `project_config` | object, optional | Passed through to `docgen_run` as `project_config` (the project's doc-target config). Omitting it means `docgen_run`'s own opt-in gate skips cleanly — no doc-target config declared. |
 | `diff` | string, optional | Passed through to `docgen_run` as the unswept `feat_context` (`docgen_run` runs its own PII sweep before anything else touches it). |
+| `repo_path` | string, optional | (DLAND-04) When present, also passed through to `docgen_run` as `place: true` + `target_root: repo_path` — a passing epic capstone doesn't just generate docs, it lands them (`README.md` + `docs/**`) directly into that working tree. Absent → generation-only, exactly the pre-DLAND-04 behavior. |
 
 If `project`/`spec_id` are absent, this is a no-op — most reviews won't supply
 doc params; the wire only fires for real merge-time reviews that do. The doc
@@ -1213,8 +1214,12 @@ refresh is entirely non-blocking to the review result: `docgen_run` is
 already structurally non-blocking (an internal doc-gen failure surfaces as
 `outcome: "failed"`, never a tool error), and any unexpected error calling it
 is caught, logged, and reported rather than propagated — it never turns an
-`APPROVE` into a tool error or changes the aggregate verdict. Every
-`review_run` result now includes `scribe_docs`:
+`APPROVE` into a tool error or changes the aggregate verdict. This includes
+the DLAND-04 placement step itself: a placement failure (bad `target_root`, a
+DLAND-03 landing-lint gate failure, an I/O error) shows up nested inside the
+returned `docgen`/`outcome` JSON exactly like any other docgen-internal
+failure — it is never fatal to the review. Every `review_run` result now
+includes `scribe_docs`:
 
 | Shape | Meaning |
 | --- | --- |
@@ -1229,9 +1234,9 @@ doc path is the existing `docgen_run` tool (S9 single door).
 ### Doc engine placement — writing the artifacts to disk (DLAND-01)
 
 Every doc-engine renderer (`readme_layers::render_layered_readme`,
-`render::docs_tree::build_docs_tree`, `render::render_all`,
-`trigger::run_docgen_trigger`) is pure: it *returns* the rendered concise
-README and `docs/` tree and never touches a filesystem, git, or network.
+`render::docs_tree::build_docs_tree`, `render::render_all`) is pure: it
+*returns* the rendered concise README and `docs/` tree and never touches a
+filesystem, git, or network.
 `crate::tools::docgen::place::place_docs(target_root, landing, docs_tree)` is
 the one placement step that actually writes those artifacts into a real
 working tree — `README.md` plus every `docs/**` file, at their exact
@@ -1241,6 +1246,40 @@ no-op run produces an empty diff); any path that is absolute or escapes
 `target_root` via `..` is refused and reported rather than written. It
 touches no git and no network — placement only, same as every other step in
 this engine keeps those concerns separate.
+
+### Wiring placement into the pipeline (DLAND-04) — capstone-APPROVE places the docs
+
+`trigger::run_docgen_trigger` and the `docgen_run` tool are the one place
+DLAND-01's placement primitive is actually wired in. Both now accept two
+additional, OPTIONAL parameters:
+
+| Param | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `place` | bool | `false` | Opt-in switch. When `false` (the default), behavior is byte-for-byte unchanged from before DLAND-04 — no filesystem is ever touched. |
+| `target_root` | string, optional | absent | A working-tree root (e.g. a repo checkout or worktree path) to place `README.md`/`docs/**` into. Only has an effect when `place: true` is also given. |
+
+When `place: true` and `target_root` are both given AND generation actually
+produced content, `run_docgen_trigger` takes the concise landing README that
+`render_all` already rendered (the `readme` target) and the `docs/` tree
+`render_all` already built from that SAME generated content
+(`RenderOutcome::docs_tree`) — reusing both, never re-deriving them — and
+calls `place_docs(target_root, landing, docs_tree)`. The result is folded
+into a new `placement: Option<PlacementReport>` field on
+`TriggerOutcome::Completed`. This is still a **local working-tree write
+only** — no git add/commit/push, no forge call, no new Plane/Gitea/GitHub
+door — the pipeline's own existing git stages are what carry the resulting
+working-tree change forward. Non-blocking, matching every other step in this
+engine: a placement failure (bad `target_root`, a DLAND-03 landing-lint gate
+failure, an I/O error) is recorded in `placement` (`gate_failures`/`skipped`),
+never turned into an `Err` or a panic, and never reverts a merge or fails the
+build.
+
+`review_run`'s post-capstone doc hook (KGREV-03, above) is the first caller
+of this opt-in path: when a passing epic capstone's context carries
+`repo_path`, it passes `place: true` + `target_root: repo_path` through to
+`docgen_run`, so an `APPROVE` epic capstone lands its generated docs directly
+into the working tree, riding the same once-per-build capstone path as
+generation (never per-merge).
 
 ### Atlas vector store (KGEMB-01)
 
