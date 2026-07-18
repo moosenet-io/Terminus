@@ -189,24 +189,34 @@ impl TriggerOutcome {
                         })
                     })
                     .collect();
-                let placement_json = placement.as_ref().map(|p| {
-                    json!({
-                        "written": p.written,
-                        "unchanged": p.unchanged,
-                        "skipped": p.skipped.iter().map(|s| json!({
-                            "path": s.path,
-                            "reason": s.reason,
-                        })).collect::<Vec<_>>(),
-                        "gate_failures": p.gate_failures,
-                    })
-                });
-                json!({
+                let mut obj = json!({
                     "outcome": "completed",
                     "generation": generation_json,
                     "render": render_json,
                     "versions": versions_json,
-                    "placement": placement_json,
-                })
+                });
+                // DLAND-04: only surface the `placement` key when a placement
+                // was actually attempted. A default (no-placement) call must
+                // produce JSON byte-for-byte identical to the pre-DLAND-04
+                // output for existing docgen_run callers -- no `"placement":
+                // null` noise.
+                if let Some(p) = placement.as_ref() {
+                    if let Value::Object(ref mut map) = obj {
+                        map.insert(
+                            "placement".to_string(),
+                            json!({
+                                "written": p.written,
+                                "unchanged": p.unchanged,
+                                "skipped": p.skipped.iter().map(|s| json!({
+                                    "path": s.path,
+                                    "reason": s.reason,
+                                })).collect::<Vec<_>>(),
+                                "gate_failures": p.gate_failures,
+                            }),
+                        );
+                    }
+                }
+                obj
             }
             TriggerOutcome::Failed { reason } => json!({
                 "outcome": "failed",
@@ -959,6 +969,15 @@ duration of a real end-to-end run.",
             Some(root_str),
         )
         .await;
+
+        // The serialized JSON of a no-placement completed outcome must NOT
+        // carry a `placement` key at all (byte-for-byte-compatible with the
+        // pre-DLAND-04 output for existing docgen_run callers).
+        let json = outcome.to_json();
+        assert!(
+            json.get("placement").is_none(),
+            "default (no-placement) JSON must not contain a placement key: {json}"
+        );
 
         match outcome {
             TriggerOutcome::Completed { placement, .. } => assert!(placement.is_none()),
