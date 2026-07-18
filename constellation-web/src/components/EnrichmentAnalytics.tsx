@@ -1,19 +1,28 @@
 // TRIAGE-09: Enrichment quality analytics charts.
 // CONST-17 re-skin (§5.1/§10 CONST-17): removed raw-hex per-tier/failure/enrichment fill
 // maps (was Tailwind-palette hexes outside the token system); pass-rate donut replaced with
-// independent horizontal bars, one per tier, each on its OWN 0-100 scale (review fix: this is
-// NOT a stacked part-of-whole bar — each tier's pass rate is an independent percentage, so
-// normalizing by the sum of all tiers' rates would misrepresent every tier whenever rates
-// don't happen to sum to 100). Tier/failure-mode identities are nominal -> categorical slots
-// (SlotAssigner, first-seen order, stable across filtering). Enrichment quality is a
-// tri-state health signal -> semantic tokens (§2.4). Solid hairline grid via viz theme (no
-// strokeDasharray anywhere). Every chart lives in a ChartCard with a TableViewToggle twin.
+// independent horizontal bars, one per tier, each on its OWN 0-100 scale. This is a
+// DELIBERATE, correct deviation from a literal "stacked bar": pass rates are independent
+// proportions, not components of a total, so a part-of-whole stack would misrepresent every
+// tier whenever the rates don't happen to sum to 100 (e.g. three tiers all at 80% would each
+// render as a ~33% segment in a stack, instead of each reading as 80% — this was the round-1
+// review finding that killed the original stacked-bar version; keep this independent-bars
+// form, do not revert to a literal stack). Tier/failure-mode identities are nominal ->
+// categorical slots (SlotAssigner, first-seen order, stable across filtering). Enrichment
+// quality is a tri-state health signal -> semantic tokens (§2.4). Solid hairline grid via viz
+// theme (no strokeDasharray anywhere).
+//
+// Every chart lives in a ChartCard with a table-view twin (§4.4). r2 review fix: the toggle
+// buttons render via ChartCard's `controls` header slot (useTableView + TableViewControls),
+// never inside the fixed-height chart body — putting them inside it (the original
+// TableViewToggle v1 shape) let the toggle row's own height eat into the chart's declared
+// height, clipping/overflowing the axis band. See viz/TableViewToggle.tsx.
 import { useMemo } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from '../viz/recharts';
 import type { EscalationAnalytics } from '../hooks/useEscalationData';
 import { ChartCard } from '../viz/ChartCard';
 import { ChartLegend } from '../viz/ChartLegend';
-import { TableViewToggle } from '../viz/TableViewToggle';
+import { TableView, TableViewControls, useTableView } from '../viz/TableViewToggle';
 import { rechartsGridProps, rechartsTickStyle, rechartsTooltipStyle } from '../viz/theme';
 import { SlotAssigner, SEMANTIC_SERIES_HEX } from '../viz/palette';
 
@@ -30,6 +39,13 @@ interface Props {
 export function EnrichmentAnalytics({ analytics }: Props) {
   const tierSlots = useMemo(() => new SlotAssigner(), []);
   const failureSlots = useMemo(() => new SlotAssigner(), []);
+
+  // One toggle per chart — called unconditionally (rules of hooks) even though some
+  // sections below only render when their data is non-empty.
+  const passRateView = useTableView();
+  const failureView = useTableView();
+  const complexityView = useTableView();
+  const enrichmentView = useTableView();
 
   const tierData = Object.entries(analytics.pass_rate_by_tier).map(([name, value]) => ({
     name: name.replace(/_/g, ' '),
@@ -78,14 +94,17 @@ export function EnrichmentAnalytics({ analytics }: Props) {
       </div>
 
       {/* Pass rate — independent horizontal bars, one per tier, each 0-100 (donut
-          anti-pattern replaced, audit §1.4; review fix: NOT stacked/part-of-whole) */}
+          anti-pattern replaced, audit §1.4; NOT a stacked/part-of-whole bar — see the file
+          header comment for why). */}
       <ChartCard
         title="Pass Rate by Tier"
         height={tierData.length * 28 + 8}
         empty={tierData.length === 0}
+        controls={<TableViewControls view={passRateView.view} onChange={passRateView.setView} />}
         footer={<ChartLegend entries={tierData.map(t => ({ id: t.key, label: t.name, color: t.fill }))} />}
       >
-        <TableViewToggle
+        <TableView
+          view={passRateView.view}
           columns={[
             { key: 'name', header: 'Tier', render: (r: typeof tierData[number]) => r.name },
             { key: 'value', header: 'Pass rate', align: 'right', render: (r: typeof tierData[number]) => `${r.value}%` },
@@ -108,13 +127,18 @@ export function EnrichmentAnalytics({ analytics }: Props) {
               </div>
             ))}
           </div>
-        </TableViewToggle>
+        </TableView>
       </ChartCard>
 
       {/* Failure mode distribution */}
       {failureData.length > 0 && (
-        <ChartCard title="Failure Mode Distribution" height={150}>
-          <TableViewToggle
+        <ChartCard
+          title="Failure Mode Distribution"
+          height={150}
+          controls={<TableViewControls view={failureView.view} onChange={failureView.setView} />}
+        >
+          <TableView
+            view={failureView.view}
             columns={[
               { key: 'name', header: 'Failure mode', render: (r: typeof failureData[number]) => r.name },
               { key: 'count', header: 'Count', align: 'right', render: (r: typeof failureData[number]) => String(r.count) },
@@ -133,14 +157,19 @@ export function EnrichmentAnalytics({ analytics }: Props) {
                 </Bar>
               </BarChart>
             </ResponsiveContainer>
-          </TableViewToggle>
+          </TableView>
         </ChartCard>
       )}
 
       {/* Complexity distribution */}
       {complexityData.length > 0 && (
-        <ChartCard title="Complexity Distribution" height={120}>
-          <TableViewToggle
+        <ChartCard
+          title="Complexity Distribution"
+          height={120}
+          controls={<TableViewControls view={complexityView.view} onChange={complexityView.setView} />}
+        >
+          <TableView
+            view={complexityView.view}
             columns={[
               { key: 'name', header: 'Complexity', render: (r: typeof complexityData[number]) => r.name },
               { key: 'count', header: 'Count', align: 'right', render: (r: typeof complexityData[number]) => String(r.count) },
@@ -157,7 +186,7 @@ export function EnrichmentAnalytics({ analytics }: Props) {
                 <Bar dataKey="count" fill="var(--series-1)" />
               </BarChart>
             </ResponsiveContainer>
-          </TableViewToggle>
+          </TableView>
         </ChartCard>
       )}
 
@@ -166,9 +195,11 @@ export function EnrichmentAnalytics({ analytics }: Props) {
         <ChartCard
           title="Enrichment Quality"
           height={100}
+          controls={<TableViewControls view={enrichmentView.view} onChange={enrichmentView.setView} />}
           footer={<ChartLegend entries={enrichmentData.map(e => ({ id: e.name, label: e.name, color: e.fill }))} />}
         >
-          <TableViewToggle
+          <TableView
+            view={enrichmentView.view}
             columns={[
               { key: 'name', header: 'Quality', render: (r: typeof enrichmentData[number]) => r.name },
               { key: 'count', header: 'Count', align: 'right', render: (r: typeof enrichmentData[number]) => String(r.count) },
@@ -187,7 +218,7 @@ export function EnrichmentAnalytics({ analytics }: Props) {
                 </Bar>
               </BarChart>
             </ResponsiveContainer>
-          </TableViewToggle>
+          </TableView>
         </ChartCard>
       )}
 

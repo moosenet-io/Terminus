@@ -23,7 +23,8 @@ interface ChartCardProps {
   /** Degraded backend ({available:false, detail}) — render the module-standard degraded
    *  card instead of chart content. */
   degraded?: { detail?: string } | false;
-  /** Footer slot: TableViewToggle lives here, plus any caveats. */
+  /** Footer slot: a ChartLegend and/or caveats live here. The table/chart toggle buttons go
+   *  in `controls` (above), not here — see viz/TableViewToggle.tsx. */
   footer?: React.ReactNode;
   children: React.ReactNode;
 }
@@ -52,7 +53,12 @@ export function ChartCard({
         {controls && <div>{controls}</div>}
       </div>
 
-      <div style={{ height, opacity: isRefetching ? 0.6 : 1, transition: 'opacity var(--dur-base) var(--ease-out)' }}>
+      {/* review fix (r2): this box is ALWAYS 100% chart (or 100% table) — the table-view
+          toggle row lives in the `controls` header slot above, never in here, so it can
+          never eat into the declared chart height and clip the axis band. `overflowY:auto`
+          is a safety net for the table view when a slice has more rows than the chart's
+          height accommodates (never clipped silently by the Card's own overflow:hidden). */}
+      <div style={{ height, opacity: isRefetching ? 0.6 : 1, transition: 'opacity var(--dur-base) var(--ease-out)', overflowY: 'auto' }}>
         {degraded ? (
           <ChartEmpty height={height} message="Module unavailable" hint={degraded.detail ?? 'backend not reachable'} />
         ) : loading ? (
