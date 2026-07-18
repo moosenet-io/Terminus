@@ -52,6 +52,7 @@ pub mod mismatch;
 pub mod pii_gate;
 pub mod preserve;
 pub mod place;
+pub mod prompts;
 pub mod quality;
 pub mod readme_layers;
 pub mod render;
@@ -76,6 +77,11 @@ pub use generate::{
     SweptFeatContext,
 };
 pub use pii_gate::{sweep_input, sweep_input_for_routing, PiiGateOutcome, RoutingDestination};
+pub use prompts::{
+    anti_latch_lint, build_guides_prompt, build_repo_identity_prompt, build_subsystem_page_prompt,
+    honest_command_lint, parse_file_blocks, parse_repo_identity, symbol_existence_lint,
+    FeatureRow, GuideTopic, PromptParseError, RepoIdentity, SubsystemBrief,
+};
 pub use preserve::{check_preservation, PreservationReport, Section as PreservationSection};
 // `Section` is re-exported under a `Preservation`-prefixed alias above to
 // avoid ambiguity with any future generic `Section` type this module might
