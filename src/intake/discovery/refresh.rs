@@ -40,6 +40,7 @@ fn fleet_category(c: HfCategory) -> FleetCategory {
         HfCategory::Embedding => FleetCategory::Embedding,
         HfCategory::Visual => FleetCategory::Visual,
         HfCategory::Voice => FleetCategory::Voice,
+        HfCategory::Diffusion => FleetCategory::Diffusion,
     }
 }
 
@@ -145,7 +146,7 @@ pub async fn refresh(
 }
 
 /// Parse the optional `categories` arg (array of category strings) → the HF
-/// categories to scan; absent/empty means all seven.
+/// categories to scan; absent/empty means all eight.
 fn parse_categories(args: &Value) -> Result<Vec<HfCategory>, ToolError> {
     let Some(v) = args.get("categories") else {
         return Ok(HfCategory::all().to_vec());
@@ -215,9 +216,9 @@ impl RustTool for ModelDiscoveryRefresh {
          and never demotes one already being fetched/swept. Does NOT download models (that is a \
          separate fetch step); size/VRAM/gfx1151-fit are left 'unknown' until a model is fetched. \
          Args (all optional): 'categories' (array subset of tool_router|writer_slm|assistant|coder| \
-         embedding|visual|voice; default all seven), 'dry_run' (bool; list+score but write nothing). \
-         Returns per-pass counts + any per-category listing errors (a rate-limited category is \
-         skipped, never fatal)."
+         embedding|visual|voice|diffusion; default all eight), 'dry_run' (bool; list+score but write \
+         nothing). Returns per-pass counts + any per-category listing errors (a rate-limited category \
+         is skipped, never fatal)."
     }
 
     fn parameters(&self) -> Value {
@@ -228,9 +229,9 @@ impl RustTool for ModelDiscoveryRefresh {
                     "type": "array",
                     "items": {
                         "type": "string",
-                        "enum": ["tool_router", "writer_slm", "assistant", "coder", "embedding", "visual", "voice"]
+                        "enum": ["tool_router", "writer_slm", "assistant", "coder", "embedding", "visual", "voice", "diffusion"]
                     },
-                    "description": "Subset of fleet categories to refresh. Omit or empty = all seven."
+                    "description": "Subset of fleet categories to refresh. Omit or empty = all eight."
                 },
                 "dry_run": {
                     "type": "boolean",
@@ -329,8 +330,8 @@ mod tests {
 
     #[test]
     fn parse_categories_defaults_to_all_and_rejects_unknown() {
-        assert_eq!(parse_categories(&json!({})).unwrap().len(), 7);
-        assert_eq!(parse_categories(&json!({"categories": []})).unwrap().len(), 7);
+        assert_eq!(parse_categories(&json!({})).unwrap().len(), 8);
+        assert_eq!(parse_categories(&json!({"categories": []})).unwrap().len(), 8);
         let one = parse_categories(&json!({"categories": ["coder"]})).unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].as_str(), "coder");

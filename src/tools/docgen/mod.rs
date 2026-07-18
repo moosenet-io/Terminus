@@ -50,6 +50,7 @@ pub mod generate;
 pub mod mismatch;
 pub mod pii_gate;
 pub mod preserve;
+pub mod place;
 pub mod quality;
 pub mod readme_layers;
 pub mod render;
@@ -78,6 +79,7 @@ pub use preserve::{check_preservation, PreservationReport, Section as Preservati
 // avoid ambiguity with any future generic `Section` type this module might
 // re-export from elsewhere; `docgen::preserve::Section` remains the
 // canonical unqualified name.
+pub use place::{place_docs, PlacementReport, SkippedEntry, README_PATH};
 pub use quality::{
     lint_prose, run_quality_gate, JudgeScores, LintResult, ProseLintConfig, QualityScore,
     QualityScoreStore, QualityVerdict, DEFAULT_QUALITY_THRESHOLD,

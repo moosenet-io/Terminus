@@ -60,6 +60,10 @@ pub enum HfCategory {
     Embedding,
     Visual,
     Voice,
+    /// MINT-DIFF-01: diffusion language models on HF Hub (LLaDA/Dream/
+    /// DiffusionGemma-shaped repos) — still tagged `text-generation` by HF,
+    /// distinguished only by search terms (see [`CATEGORY_MAPPINGS`]).
+    Diffusion,
 }
 
 impl HfCategory {
@@ -74,12 +78,13 @@ impl HfCategory {
             HfCategory::Embedding => "embedding",
             HfCategory::Visual => "visual",
             HfCategory::Voice => "voice",
+            HfCategory::Diffusion => "diffusion",
         }
     }
 
-    /// All seven categories, in a stable order — what DISC-06's daily refresh
+    /// All eight categories, in a stable order — what DISC-06's daily refresh
     /// iterates to cover the whole fleet catalog surface.
-    pub fn all() -> [HfCategory; 7] {
+    pub fn all() -> [HfCategory; 8] {
         [
             HfCategory::ToolRouter,
             HfCategory::WriterSlm,
@@ -88,6 +93,7 @@ impl HfCategory {
             HfCategory::Embedding,
             HfCategory::Visual,
             HfCategory::Voice,
+            HfCategory::Diffusion,
         ]
     }
 }
@@ -143,6 +149,15 @@ pub const CATEGORY_MAPPINGS: &[HfCategoryMapping] = &[
         category: HfCategory::Voice,
         pipeline_tag: "automatic-speech-recognition",
         search_terms: &[],
+    },
+    HfCategoryMapping {
+        category: HfCategory::Diffusion,
+        // Diffusion LANGUAGE models are still tagged `text-generation` on HF
+        // Hub (there is no dedicated `pipeline_tag` for a diffusion LLM, as
+        // opposed to image diffusion's `text-to-image`) — narrowed by the
+        // search terms instead, matching known diffusion-LLM families/naming.
+        pipeline_tag: "text-generation",
+        search_terms: &["diffusion", "llada", "dream", "dllm"],
     },
 ];
 

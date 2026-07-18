@@ -70,6 +70,9 @@ pub const TEST_TYPE_CODER: &str = "coder";
 pub const TEST_TYPE_ASSISTANT: &str = "assistant";
 pub const TEST_TYPE_SERVING: &str = "serving";
 pub const TEST_TYPE_AGENT: &str = "agent";
+/// MINT-DIFF-01: the diffusion suite's test-family tag (use-case quality +
+/// performance, distinct from `coder`/`assistant`/`serving`/`agent`).
+pub const TEST_TYPE_DIFFUSION: &str = "diffusion";
 
 /// The single serving/context-profile leaf category.
 pub const SERVING_CATEGORY: &str = "context_profile";

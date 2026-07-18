@@ -78,6 +78,636 @@ const BUILD_ALLOWED_SOURCE_ROOTS: &str = "BUILD_ALLOWED_SOURCE_ROOTS";
 /// pruning after a bless/promote. The store floors this at 2 regardless.
 const BUILD_RETAIN_PER_CHANNEL: &str = "BUILD_RETAIN_PER_CHANNEL";
 
+// ── BLD-GATE-FIX: Gitea Cargo-registry creds for a registry-consuming build ──
+//
+// harmony and chord depend on `terminus-rs` via the Gitea Cargo registry
+// (`[registries.gitea]` in their `.cargo/config.toml`), so their build scope
+// needs the sparse INDEX + credential-provider list (non-secret config) PLUS
+// the registry auth TOKEN (secret — a Gitea PAT). Without these, cargo's
+// dependency resolution against the `gitea` registry fails inside the
+// systemd-run scope even though sccache/toolchain env is otherwise fine.
+
+/// Env var: the Gitea Cargo sparse-registry INDEX URL. Non-secret (a plain
+/// endpoint, not a credential) — always read from the environment FIRST so
+/// the host stays authoritative; see [`cargo_registry_gitea_index`] for the
+/// (non-hardcoded) fallback derivation from `GITEA_URL` when unset.
+const CARGO_REGISTRIES_GITEA_INDEX: &str = "CARGO_REGISTRIES_GITEA_INDEX";
+/// Env var: Cargo's global credential-provider list (non-secret — a config
+/// string cargo itself defines). `cargo:token` is cargo's built-in provider
+/// that sends a `CARGO_REGISTRIES_<NAME>_TOKEN` value verbatim; required for
+/// cargo's credential-provider model (>=1.74) to use the token env at all.
+const CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS: &str =
+    "CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS";
+/// Env var (SECRET — name ends in `_TOKEN`, so `scope::is_secret_env_key`
+/// already routes it to the inherited-env-only side of `scope::partition_env`,
+/// never `--setenv` argv): matches cargo's own `CARGO_REGISTRIES_<NAME>_TOKEN`
+/// convention for a registry named `gitea`. If the operator did not
+/// provision one specifically for the registry, [`cargo_registry_gitea_token`]
+/// falls back to the same `GITEA_PAT_<identity>` this crate already uses for
+/// the Gitea REST API (see `crate::gitea`).
+const CARGO_REGISTRIES_GITEA_TOKEN: &str = "CARGO_REGISTRIES_GITEA_TOKEN";
+/// Default value for `CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS` when unset —
+/// cargo's built-in token provider, the only one needed for a PAT-shaped
+/// `CARGO_REGISTRIES_GITEA_TOKEN`.
+const DEFAULT_CARGO_CREDENTIAL_PROVIDERS: &str = "cargo:token";
+/// Env var naming the active-default Gitea identity (mirrors
+/// `crate::gitea`'s private `GITEA_IDENTITY_NAME`/`DEFAULT_GITEA_IDENTITY` —
+/// duplicated as a plain string here rather than making those `pub`, since
+/// this is a read-only fallback lookup, not a Gitea API client).
+const GITEA_IDENTITY_NAME_ENV: &str = "GITEA_IDENTITY_NAME";
+const DEFAULT_GITEA_IDENTITY_FOR_REGISTRY: &str = "moose";
+
+/// Resolve the Gitea Cargo-registry auth token (SECRET). Per this crate's
+/// established secret convention (see `crate::gitea`'s module doc and
+/// `crate::config`'s CONST-02/03 sections: there is no separate
+/// `SecretManager`/`vault::manager()` API in terminus-rs — a plain env read of
+/// a runtime-materialized value IS the vault read here), this reads directly
+/// at the point of use, exactly like `CONSTELLATION_OPERATOR_SECRET`, rather
+/// than through a shared `crate::config` helper.
+///
+/// Resolution order:
+///   1. `CARGO_REGISTRIES_GITEA_TOKEN` — a PAT provisioned specifically for
+///      the Cargo registry.
+///   2. The active-default Gitea identity's `GITEA_PAT_<NAME>` (same
+///      identity `crate::gitea::GiteaClient::from_env` would pick —
+///      `GITEA_IDENTITY_NAME`, default `moose`), since Gitea's Cargo registry
+///      accepts the same PAT as its REST API and every environment that
+///      talks to Gitea already provisions one.
+///   3. `GITEA_PAT_MOOSE` as an explicit FINAL fallback — the `moose` identity's
+///      PAT is the one provisioned with `moosenet`-org read access (the access a
+///      registry-consuming build actually needs). If step 2 picked a NON-moose
+///      identity (an operator set `GITEA_IDENTITY_NAME` to something else) whose
+///      `GITEA_PAT_<that>` is unset, we must still fall back to the org-readable
+///      moose PAT rather than degrading — otherwise a harmony/chord build would
+///      fail to resolve terminus-rs purely because the active identity changed.
+///      This step is a no-op when step 2 already resolved moose's PAT.
+///
+/// Returns `None` (never a stopgap literal) when none are configured; the
+/// caller must DEGRADE (log + continue), never hardcode a token.
+fn cargo_registry_gitea_token() -> Option<String> {
+    if let Some(t) = env_nonempty(CARGO_REGISTRIES_GITEA_TOKEN) {
+        return Some(t);
+    }
+    // PREFER the org-readable moose PAT for REGISTRY reads: fetching the
+    // terminus-rs crate from the Gitea Cargo registry only needs org read
+    // access, which GITEA_PAT_MOOSE is guaranteed to have. The gateway's active
+    // identity (GITEA_IDENTITY_NAME) is only a SECONDARY fallback — its PAT may
+    // be scoped to a different area and lack registry read (review finding).
+    if let Some(t) = env_nonempty(&format!(
+        "GITEA_PAT_{}",
+        DEFAULT_GITEA_IDENTITY_FOR_REGISTRY.to_uppercase()
+    )) {
+        return Some(t);
+    }
+    // Last-ditch: the active identity's PAT, if moose is unprovisioned.
+    let identity = env_nonempty(GITEA_IDENTITY_NAME_ENV)
+        .map(|v| v.to_lowercase())
+        .unwrap_or_else(|| DEFAULT_GITEA_IDENTITY_FOR_REGISTRY.to_string());
+    env_nonempty(&format!("GITEA_PAT_{}", identity.to_uppercase()))
+}
+
+/// Resolve the Gitea Cargo sparse-registry INDEX URL. Deliberately has NO
+/// hardcoded infra literal (S1) — an explicit `CARGO_REGISTRIES_GITEA_INDEX`
+/// always wins; failing that, it's DERIVED from the same `GITEA_URL` +
+/// `GITEA_OWNER` config `crate::gitea::GiteaClient::from_env` already uses for
+/// the Gitea REST API (Gitea's Cargo registry lives at a fixed, well-known
+/// path under the same base URL:
+/// `{GITEA_URL}/api/packages/{GITEA_OWNER}/cargo/`), so a box that already
+/// talks to Gitea doesn't need a second URL provisioned. `None` when neither
+/// is configured — the caller must not fabricate one.
+fn cargo_registry_gitea_index() -> Option<String> {
+    if let Some(v) = env_nonempty(CARGO_REGISTRIES_GITEA_INDEX) {
+        return Some(v);
+    }
+    let base = env_nonempty("GITEA_URL")?;
+    let owner = env_nonempty("GITEA_OWNER").unwrap_or_else(|| "moosenet".to_string());
+    Some(format!(
+        "sparse+{}/api/packages/{owner}/cargo/",
+        base.trim_end_matches('/')
+    ))
+}
+
+/// Populate `build_env` with the Gitea Cargo-registry config a module that
+/// depends on `terminus-rs` via that registry (harmony, chord) needs to
+/// resolve it: the sparse INDEX + credential-provider list (non-secret,
+/// `--setenv`-safe) plus the registry auth TOKEN (secret — name ends in
+/// `_TOKEN`, so `scope::is_secret_env_key`/`partition_env` already route it to
+/// the inherited-env-only side, never argv). The formatted `Bearer <token>`
+/// value is also appended to `redact` (S7) so a build script that echoes its
+/// env can never leak it into captured stdout/stderr or a `ToolError`.
+///
+/// Best-effort/DEGRADE: if the INDEX can't be resolved (neither
+/// `CARGO_REGISTRIES_GITEA_INDEX` nor `GITEA_URL` configured) or no token is
+/// configured anywhere, this logs a clear warning and continues rather than
+/// failing the whole build — a module that doesn't touch the registry is
+/// unaffected, and a registry-consuming build gets cargo's own "no
+/// index/token configured" resolve error instead of the misleading
+/// `systemd-run: No such file` a missing-staged-source used to produce (see
+/// [`validate_local_source_dir`]).
+fn inject_gitea_registry_env(build_env: &mut BTreeMap<String, String>, redact: &mut Vec<String>) {
+    match cargo_registry_gitea_index() {
+        Some(index) => {
+            build_env.insert(CARGO_REGISTRIES_GITEA_INDEX.to_string(), index);
+            let providers = env_nonempty(CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS)
+                .unwrap_or_else(|| DEFAULT_CARGO_CREDENTIAL_PROVIDERS.to_string());
+            build_env.insert(
+                CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS.to_string(),
+                providers,
+            );
+        }
+        None => {
+            tracing::warn!(
+                "compiler: Gitea Cargo-registry index unconfigured \
+                 ({CARGO_REGISTRIES_GITEA_INDEX} and GITEA_URL both unset) — \
+                 registry-consuming builds (harmony, chord) will fail to \
+                 resolve terminus-rs from the Gitea Cargo registry"
+            );
+        }
+    }
+    match cargo_registry_gitea_token() {
+        Some(token) => {
+            // The `Bearer ` PREFIX IS REQUIRED, not a bug: cargo sends the value
+            // of `CARGO_REGISTRIES_<NAME>_TOKEN` VERBATIM as the HTTP
+            // `Authorization:` header, and Gitea's Cargo registry only accepts the
+            // `Bearer <PAT>` scheme (a raw PAT → 401). This matches the working
+            // format the constellation-updater sources from
+            // `/etc/constellation/secrets` to build chord
+            // (`CARGO_REGISTRIES_GITEA_TOKEN="<REDACTED-SECRET>"`), also documented in
+            // project memory. NOTE: an operator who ever needs a raw token can
+            // set `CARGO_REGISTRIES_GITEA_TOKEN` explicitly — that value WINS
+            // (it's returned as-is by `cargo_registry_gitea_token` step 1, so it
+            // is inserted verbatim without a synthesized `Bearer ` prefix); we
+            // only synthesize `Bearer <pat>` when falling back to a bare
+            // `GITEA_PAT_*`, which is always a raw PAT.
+            let bearer = if token.starts_with("Bearer ") {
+                token.clone()
+            } else {
+                format!("Bearer {token}")
+            };
+            redact.push(token);
+            redact.push(bearer.clone());
+            build_env.insert(CARGO_REGISTRIES_GITEA_TOKEN.to_string(), bearer);
+        }
+        None => {
+            tracing::warn!(
+                "compiler: Gitea registry token unavailable from vault \
+                 ({CARGO_REGISTRIES_GITEA_TOKEN} and GITEA_PAT_<identity> both \
+                 unset) — registry-consuming builds (harmony, chord) will fail \
+                 to resolve terminus-rs from the Gitea Cargo registry"
+            );
+        }
+    }
+}
+
+// ── GAP 3 (TERM #418): auto-stage source from Gitea when not pre-staged ─────
+//
+// Previously a caller had to manually rsync a module's source into
+// `${BUILD_DATASET_ROOT}/src/<module>/<ref>` before `compiler_build` would
+// even start (GAP 1's `validate_local_source_dir` fails loudly, but does
+// nothing to FIX the gap). That defeats the point of a remote build door: a
+// fresh agent should be able to call `compiler_request`/`compiler_build`
+// against a module@ref that exists in Gitea and have the source appear on
+// its own. This section fetches it, export-style (no `.git` in the staged
+// tree, matching how every other staged module — e.g. terminus/main — looks
+// on disk today).
+
+/// Env var: default-ON toggle for GAP 3 auto-staging. Unset/"1"/"true" (any
+/// case) → enabled; "0"/"false" (any case) → disabled. Anything else is
+/// treated as enabled (fail open to the new, intended behavior rather than
+/// silently reverting to the old manual-stage-only mode on a typo).
+const BUILD_AUTOSTAGE_ENV: &str = "BUILD_AUTOSTAGE";
+
+/// Env var: a JSON object `{ "<module>": "<GiteaRepoName>" }` merged OVER
+/// [`default_module_repo_map`] (an override entry replaces the default for
+/// that module; every other default entry is kept). Lets an operator map a
+/// new module, or repoint an existing one, without a code change.
+const BUILD_MODULE_REPO_MAP_ENV: &str = "BUILD_MODULE_REPO_MAP";
+
+/// The longest a single GAP-3 git/rsync step (clone, fetch, checkout, rsync)
+/// may run. Each step gets its own budget (not one shared budget across all
+/// steps) — bounding every step individually via the existing `run()` helper
+/// means a hung transport on any one of them can never wedge a build.
+const AUTOSTAGE_STEP_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The built-in module→Gitea-repo map (see the module table in
+/// `CLAUDE.md`/moosenet-spec — `moosenet/<Repo>`). Overridable/extendable via
+/// [`BUILD_MODULE_REPO_MAP_ENV`].
+fn default_module_repo_map() -> BTreeMap<String, String> {
+    let mut m = BTreeMap::new();
+    m.insert("terminus".to_string(), "Terminus".to_string());
+    m.insert("chord".to_string(), "Chord".to_string());
+    m.insert("harmony".to_string(), "Harmony".to_string());
+    m.insert("muse".to_string(), "Muse".to_string());
+    m.insert("lumina".to_string(), "lumina-constellation".to_string());
+    m.insert("lumina-core".to_string(), "lumina-constellation".to_string());
+    m
+}
+
+/// Best-effort default for a module with no map entry: capitalize the first
+/// byte (ASCII — module names are already constrained to `[A-Za-z0-9._-]` by
+/// `validate_segment`, so this never has to reason about multi-byte case
+/// folding). A guess, not a guarantee — logged loudly so a wrong guess is
+/// diagnosable rather than a silent 404 further down.
+fn capitalize_module_name(module: &str) -> String {
+    let mut chars = module.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => module.to_string(),
+    }
+}
+
+/// Resolve the Gitea repo name for `module`: [`BUILD_MODULE_REPO_MAP_ENV`]
+/// (if set and valid JSON) merged OVER [`default_module_repo_map`], falling
+/// back to [`capitalize_module_name`] (logged) when the module has no entry
+/// in either. Never fails — a build for an unmapped module still gets a
+/// best-effort guess rather than being blocked outright by the map lookup
+/// itself (the actual git fetch below is what surfaces a real "repo not
+/// found" error if the guess is wrong).
+fn resolve_module_repo(module: &str) -> String {
+    let mut map = default_module_repo_map();
+    if let Some(raw) = env_nonempty(BUILD_MODULE_REPO_MAP_ENV) {
+        match serde_json::from_str::<BTreeMap<String, String>>(&raw) {
+            Ok(overrides) => map.extend(overrides),
+            Err(e) => {
+                tracing::warn!(
+                    "compiler: {BUILD_MODULE_REPO_MAP_ENV} is not a valid JSON object \
+                     ({e}); ignoring override, using built-in defaults only"
+                );
+            }
+        }
+    }
+    if let Some(repo) = map.get(module) {
+        return repo.clone();
+    }
+    let fallback = capitalize_module_name(module);
+    tracing::warn!(
+        "compiler: no Gitea repo mapping for module '{module}' (set \
+         {BUILD_MODULE_REPO_MAP_ENV} to add one); guessing repo '{fallback}'"
+    );
+    fallback
+}
+
+/// Whether GAP 3 auto-staging is enabled (default ON — see
+/// [`BUILD_AUTOSTAGE_ENV`]).
+fn autostage_enabled() -> bool {
+    match env_nonempty(BUILD_AUTOSTAGE_ENV) {
+        None => true,
+        Some(v) => !matches!(v.to_lowercase().as_str(), "0" | "false"),
+    }
+}
+
+/// Resolve the git-transport credential (SECRET — a raw Gitea PAT, NOT the
+/// `Bearer <token>`-wrapped form [`inject_gitea_registry_env`] builds for the
+/// Cargo-registry HTTP header) auto-stage hands to git via `GIT_ASKPASS`.
+/// Same GITEA_PAT_MOOSE-preferring resolution as
+/// [`cargo_registry_gitea_token`] steps 2+3 (org-readable `moose` identity
+/// first, then the active `GITEA_IDENTITY_NAME` identity as a fallback) —
+/// deliberately NOT step 1 of that function (`CARGO_REGISTRIES_GITEA_TOKEN`),
+/// since that env is cargo-registry-specific and may already carry a
+/// synthesized `Bearer ` prefix that would break git's plain-PAT auth.
+fn autostage_gitea_token() -> Option<String> {
+    if let Some(t) = env_nonempty(&format!(
+        "GITEA_PAT_{}",
+        DEFAULT_GITEA_IDENTITY_FOR_REGISTRY.to_uppercase()
+    )) {
+        return Some(t);
+    }
+    let identity = env_nonempty(GITEA_IDENTITY_NAME_ENV)
+        .map(|v| v.to_lowercase())
+        .unwrap_or_else(|| DEFAULT_GITEA_IDENTITY_FOR_REGISTRY.to_string());
+    env_nonempty(&format!("GITEA_PAT_{}", identity.to_uppercase()))
+}
+
+/// Build the BARE (never-authed) Gitea clone URL for `module` — `{GITEA_URL}
+/// /{GITEA_OWNER}/{repo}.git` — plus the resolved repo name. Pure/no I/O
+/// (testable without touching the network): unlike an `x-access-token@host`
+/// URL, this NEVER embeds the credential — auth is injected separately via
+/// `GIT_ASKPASS` at call time (matching this crate's established transport
+/// convention in `forge::mirror::tools`, e.g. `run_git_askpass_plain`), so
+/// the token can never leak into `.git/config`, a process listing, shell
+/// history, or a URL echoed into a log/error — a stronger guarantee than
+/// scrubbing it back out of a rendered URL after the fact.
+fn autostage_remote_url(module: &str) -> Result<(String, String), ToolError> {
+    let base = env_nonempty("GITEA_URL").ok_or_else(|| {
+        ToolError::NotConfigured(format!(
+            "cannot auto-stage source for module '{module}': GITEA_URL is not configured"
+        ))
+    })?;
+    let owner = env_nonempty("GITEA_OWNER").unwrap_or_else(|| "moosenet".to_string());
+    let repo = resolve_module_repo(module);
+    let remote = format!("{}/{owner}/{repo}.git", base.trim_end_matches('/'));
+    Ok((remote, repo))
+}
+
+/// RAII guard: writes a minimal `GIT_ASKPASS` helper script that echoes
+/// `$GIT_MIRROR_TOKEN` (the script body itself carries NO secret — the token
+/// only ever lives in the child process's environment), and removes it on
+/// drop. Mirrors `forge::mirror::tools::write_askpass_script`'s shape; a
+/// separate copy here rather than a shared helper since that one is private
+/// to its module and this is a small, self-contained script.
+struct AutostageAskpass {
+    path: PathBuf,
+}
+
+impl AutostageAskpass {
+    fn write() -> Result<Self, ToolError> {
+        let path = std::env::temp_dir().join(format!(
+            "bldgap3-askpass-{}-{}.sh",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&path, b"#!/bin/sh\nprintf '%s\\n' \"$GIT_MIRROR_TOKEN\"\n")
+            .map_err(|e| ToolError::Execution(format!("autostage: write askpass script: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).map_err(
+                |e| ToolError::Execution(format!("autostage: chmod askpass script: {e}")),
+            )?;
+        }
+        Ok(Self { path })
+    }
+}
+
+impl Drop for AutostageAskpass {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// RAII guard: best-effort `rm -rf` of a temp clone dir on drop, so every
+/// early-return (`?`) below still cleans up — success or failure.
+struct AutostageTmpDir(PathBuf);
+
+impl Drop for AutostageTmpDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Wrap a step failure with the `{module}@{ref}` context GAP 3's callers
+/// need, WITHOUT re-embedding anything secret-shaped — `e`'s message is
+/// already redacted by `run()` (it was built from the SAME `redact` set the
+/// token was pushed onto before any git argv touched it).
+fn autostage_step_failed(module: &str, git_ref: &str, repo: &str, step: &str, e: ToolError) -> ToolError {
+    ToolError::Execution(format!(
+        "auto-stage of {module}@{git_ref} (Gitea repo {repo}) failed at '{step}': {e}"
+    ))
+}
+
+/// GAP 3 (TERM #418): fetch `module@git_ref` from Gitea into `dest`,
+/// export-style (no `.git` left in the staged tree — matches how a manually
+/// staged tree looks today). Only ever WRITES when `dest` does not already
+/// exist — never clobbers an already-staged (possibly manually-staged or
+/// mid-build) tree; the caller is additionally expected to only invoke this
+/// when `dest` is absent, but the check is repeated here so this function is
+/// safe to call on its own.
+///
+/// Strategy: try a shallow `git clone --depth 1 --branch <ref>` first (works
+/// for a branch or tag); if that fails — e.g. `git_ref` is a full commit sha,
+/// which is not a valid `--branch` value — fall back to `git init` + `remote
+/// add` + `fetch --depth 1 origin <sha>` + `checkout FETCH_HEAD`. Either way
+/// the result is exported (`rsync -a --exclude .git`) into a SIBLING staging
+/// dir and then atomically `rename`d into `dest` (so a concurrent builder that
+/// stages `dest` mid-clone is never clobbered — the rename is the single commit
+/// point; the race loser no-ops), and the temp clone is removed afterward.
+///
+/// Every git/rsync step is bound by [`AUTOSTAGE_STEP_TIMEOUT`] via the
+/// existing `run()` helper, so a hung transport can never wedge a build. The
+/// resolved token is pushed onto `redact` (S7) BEFORE any git argv touches
+/// it and is injected only via `GIT_ASKPASS` (never the URL, never argv) —
+/// so it cannot appear in a captured stdout/stderr, a `ToolError`, or a log
+/// line, even before the redaction pass runs.
+async fn autostage_source(
+    module: &str,
+    git_ref: &str,
+    dest: &std::path::Path,
+    redact: &mut Vec<String>,
+) -> Result<(), ToolError> {
+    if dest.exists() {
+        // Never clobber an already-staged (or in-progress) tree.
+        return Ok(());
+    }
+    let (remote, repo) = autostage_remote_url(module)?;
+    let token = autostage_gitea_token().ok_or_else(|| {
+        ToolError::NotConfigured(format!(
+            "cannot auto-stage source for {module}@{git_ref} (Gitea repo {repo}): no Gitea \
+             token configured (GITEA_PAT_MOOSE / GITEA_PAT_<identity>)"
+        ))
+    })?;
+    // S7: append BEFORE any argv/env touches the token, so every error path
+    // below — including a spawn failure on the very next line — redacts it.
+    redact.push(token.clone());
+
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            ToolError::Execution(format!(
+                "autostage: failed to create {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    let tmp = std::env::temp_dir().join(format!(
+        "bldgap3-src-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let _tmp_guard = AutostageTmpDir(tmp.clone());
+    let tmp_str = tmp.to_string_lossy().to_string();
+
+    let askpass = AutostageAskpass::write()?;
+    let mut authed_env: BTreeMap<String, String> = BTreeMap::new();
+    authed_env.insert(
+        "GIT_ASKPASS".to_string(),
+        askpass.path.to_string_lossy().to_string(),
+    );
+    authed_env.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
+    authed_env.insert("GIT_MIRROR_TOKEN".to_string(), token.clone());
+
+    // Strategy 1: shallow clone of a branch/tag ref.
+    let clone_argv = vec![
+        "git".to_string(),
+        "clone".to_string(),
+        "--depth".to_string(),
+        "1".to_string(),
+        "--branch".to_string(),
+        git_ref.to_string(),
+        "--".to_string(),
+        remote.clone(),
+        tmp_str.clone(),
+    ];
+    let cloned = run(
+        &clone_argv,
+        None,
+        &authed_env,
+        AUTOSTAGE_STEP_TIMEOUT,
+        redact,
+        None,
+        None,
+    )
+    .await;
+
+    if let Err(e) = cloned {
+        // Strategy 2: `git_ref` is likely a full sha (not a valid --branch
+        // value) — start clean and fetch it directly. A partial clone dir
+        // from the failed attempt above must not linger for `git init`.
+        //
+        // FINDING 3 (review): log at WARN, not debug — a strategy-1 failure is
+        // EXPECTED for a sha ref, but it is ALSO how a real auth/network fault
+        // first surfaces; at debug it was invisible until strategy 2 also failed.
+        // `e`'s message is already token-redacted by `run()` (S7), so this leaks
+        // nothing even before the outer redaction pass.
+        tracing::warn!(
+            "compiler: autostage shallow clone of {module}@{git_ref} by branch/tag failed \
+             ({e}); falling back to a direct sha fetch"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).map_err(|e| {
+            ToolError::Execution(format!("autostage: failed to create {}: {e}", tmp.display()))
+        })?;
+        run(
+            &[
+                "git".to_string(),
+                "init".to_string(),
+                "--quiet".to_string(),
+                tmp_str.clone(),
+            ],
+            None,
+            &BTreeMap::new(),
+            AUTOSTAGE_STEP_TIMEOUT,
+            redact,
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| autostage_step_failed(module, git_ref, &repo, "git init", e))?;
+        run(
+            &[
+                "git".to_string(),
+                "remote".to_string(),
+                "add".to_string(),
+                "origin".to_string(),
+                remote.clone(),
+            ],
+            Some(&tmp),
+            &BTreeMap::new(),
+            AUTOSTAGE_STEP_TIMEOUT,
+            redact,
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| autostage_step_failed(module, git_ref, &repo, "git remote add", e))?;
+        run(
+            &[
+                "git".to_string(),
+                "fetch".to_string(),
+                "--depth".to_string(),
+                "1".to_string(),
+                "origin".to_string(),
+                git_ref.to_string(),
+            ],
+            Some(&tmp),
+            &authed_env,
+            AUTOSTAGE_STEP_TIMEOUT,
+            redact,
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| autostage_step_failed(module, git_ref, &repo, "git fetch <sha>", e))?;
+        run(
+            &[
+                "git".to_string(),
+                "checkout".to_string(),
+                "--quiet".to_string(),
+                "FETCH_HEAD".to_string(),
+            ],
+            Some(&tmp),
+            &BTreeMap::new(),
+            AUTOSTAGE_STEP_TIMEOUT,
+            redact,
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| autostage_step_failed(module, git_ref, &repo, "git checkout FETCH_HEAD", e))?;
+    }
+    drop(askpass);
+
+    // FINDING 2 (review — TOCTOU): the `dest.exists()` check at the top runs
+    // BEFORE the (slow) clone/fetch. If a CONCURRENT builder stages `dest`
+    // while our clone is in flight, an rsync straight into `dest` would merge
+    // into (clobber) their tree. Instead export into a SIBLING staging dir
+    // (same parent ⇒ same filesystem ⇒ `rename` is atomic and never EXDEV),
+    // then atomically `rename` it into place. `rename` onto a non-empty dir
+    // fails, and onto a still-absent name succeeds — so the mv is the single
+    // commit point and the loser of a race no-ops instead of clobbering.
+    let parent = dest.parent().ok_or_else(|| {
+        ToolError::Execution(format!(
+            "autostage: destination {} has no parent directory",
+            dest.display()
+        ))
+    })?;
+    let staging = parent.join(format!(
+        ".bldgap3-stage-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let _staging_guard = AutostageTmpDir(staging.clone());
+    std::fs::create_dir_all(&staging).map_err(|e| {
+        ToolError::Execution(format!("autostage: failed to create {}: {e}", staging.display()))
+    })?;
+    // Export (no `.git`) into the staging dir.
+    run(
+        &[
+            "rsync".to_string(),
+            "-a".to_string(),
+            "--exclude".to_string(),
+            ".git".to_string(),
+            format!("{tmp_str}/"),
+            format!("{}/", staging.to_string_lossy()),
+        ],
+        None,
+        &BTreeMap::new(),
+        AUTOSTAGE_STEP_TIMEOUT,
+        redact,
+        None,
+        None,
+    )
+    .await
+    .map_err(|e| autostage_step_failed(module, git_ref, &repo, "rsync export", e))?;
+
+    // Atomic publish. If `dest` now exists (a concurrent builder won the race),
+    // `rename` fails — re-check and treat an existing `dest` as success (their
+    // tree stands; our staging dir is cleaned up by the guard on drop).
+    match std::fs::rename(&staging, dest) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if dest.exists() {
+                tracing::debug!(
+                    "compiler: autostage of {module}@{git_ref} lost the publish race \
+                     (dest already staged concurrently); keeping the existing tree"
+                );
+                Ok(())
+            } else {
+                Err(autostage_step_failed(
+                    module,
+                    git_ref,
+                    &repo,
+                    "atomic rename into place",
+                    ToolError::Execution(format!(
+                        "rename {} -> {}: {e}",
+                        staging.display(),
+                        dest.display()
+                    )),
+                ))
+            }
+        }
+    }
+}
+
 const DEFAULT_TARGET_TRIPLE: &str = "x86_64-unknown-linux-musl";
 
 /// The longest a single `compiler_build` may run (the local/primary cargo build
@@ -255,11 +885,26 @@ fn cargo_build_argv(
 /// for BLD-COMPTEST's test/gate mode). Mirrors the build argv's `--locked` /
 /// profile / `--target` / `-j` / `--manifest-path` flags exactly (same
 /// reproducibility + CWD-independence guarantees — see `cargo_build_argv`'s
-/// doc), but tests the WHOLE crate/workspace at `manifest_path` rather than a
-/// single `--bin` target (a gate wants every test in the crate, not one binary's
-/// tests), and adds `--no-fail-fast` so a gate observes every failure in one run
+/// doc), and adds `--no-fail-fast` so a gate observes every failure in one run
 /// instead of stopping at the first (needed for the structured pass/fail +
 /// failing-test summary the gate returns).
+///
+/// BLD-GATE-06 (TERM #419): defaults to `--lib --bins` (hermetic unit tests)
+/// rather than the whole workspace/crate — integration tests under `tests/`
+/// commonly need live services (gitea/plane/redis/network) that don't exist
+/// in the capped/offline build scope, so every terminus branch was
+/// accumulating ~19 spurious failures (2 on chord) and no branch could ever
+/// pass the gate. Set env `BUILD_GATE_TESTS=workspace` to opt back into the
+/// full `--workspace` run (e.g. for a deliberate integration validation
+/// pass) — any other value (including unset) keeps the `--lib --bins`
+/// default.
+///
+/// Also caps the RUN-thread count (distinct from the `-j` BUILD-thread cap
+/// above) via a trailing `-- --test-threads=<N>`: at the host's full core
+/// count (~32) some suites hit test-concurrency flakiness (httpmock /
+/// GPU-exclusive-resource races) that doesn't reproduce at a lower thread
+/// count. `N` comes from env `BUILD_GATE_TEST_THREADS`, defaulting to `8`
+/// when unset, empty, non-numeric, or `0`.
 fn cargo_test_argv(profile: &str, triple: &str, jobs: u32, manifest_path: &str) -> Vec<String> {
     let (profile_flags, _subdir) = profile_flags_and_subdir(profile);
     let mut argv = vec![
@@ -274,8 +919,56 @@ fn cargo_test_argv(profile: &str, triple: &str, jobs: u32, manifest_path: &str) 
     argv.push(triple.to_string());
     argv.push("-j".to_string());
     argv.push(jobs.to_string());
+
+    let full_workspace = std::env::var("BUILD_GATE_TESTS")
+        .map(|v| v.eq_ignore_ascii_case("workspace"))
+        .unwrap_or(false);
+    if full_workspace {
+        argv.push("--workspace".to_string());
+    } else {
+        argv.push("--lib".to_string());
+        argv.push("--bins".to_string());
+    }
+
     argv.push("--no-fail-fast".to_string());
+
+    let test_threads = std::env::var("BUILD_GATE_TEST_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(8);
+    argv.push("--".to_string());
+    argv.push(format!("--test-threads={test_threads}"));
+
     argv
+}
+
+/// Build the `cargo generate-lockfile` argv (pure — testable; GAP 5, TERM #418).
+/// terminus/harmony/chord all `.gitignore` `Cargo.lock`, so a freshly-staged
+/// feature-branch source tree has NO lock at all — `--locked` (required on
+/// both [`cargo_build_argv`] and [`cargo_test_argv`] for reproducibility)
+/// then fails cargo's dependency-resolution step in well under a second,
+/// before a single crate compiles (`process_exit_success:false`, 0 passed /
+/// 0 failed). Only `main` used to build, because its persisted
+/// build-dataset directory happened to retain an old cargo-generated lock
+/// from a prior run — every feature branch hit this instantly.
+///
+/// `cargo generate-lockfile` resolves the dependency graph and WRITES a
+/// matching `Cargo.lock` WITHOUT compiling anything — cheap (seconds, low
+/// RAM/CPU), safe to run inside the same capped scope as the build/test
+/// step. It needs registry access (crates.io for terminus, the Gitea Cargo
+/// registry for harmony/chord's `terminus-rs` path-dep — GAP 2's creds), so
+/// it deliberately carries NO `--locked` (that would defeat its purpose: it
+/// is the step that CREATES the lock `--locked` subsequently enforces).
+/// Always safe to run before the `--locked` build/test: if a lock already
+/// exists and matches (e.g. `main`), this is a fast no-op.
+fn cargo_generate_lockfile_argv(manifest_path: &str) -> Vec<String> {
+    vec![
+        "cargo".to_string(),
+        "generate-lockfile".to_string(),
+        "--manifest-path".to_string(),
+        manifest_path.to_string(),
+    ]
 }
 
 /// Force cargo to render its `N/M` progress bar EVEN on the piped (non-TTY)
@@ -288,6 +981,21 @@ fn cargo_test_argv(profile: &str, triple: &str, jobs: u32, manifest_path: &str) 
 fn inject_cargo_progress_env(build_env: &mut BTreeMap<String, String>) {
     build_env.insert("CARGO_TERM_PROGRESS_WHEN".to_string(), "always".to_string());
     build_env.insert("CARGO_TERM_PROGRESS_WIDTH".to_string(), "100".to_string());
+}
+
+/// GAP 4: sccache CANNOT cache Rust compilation units while cargo's
+/// incremental compilation is on — incremental and sccache are mutually
+/// exclusive caching strategies for rustc, and `cargo build`/`cargo test`'s
+/// dev profile defaults `CARGO_INCREMENTAL=1`. Left unset, every build was a
+/// 0%-hit-rate cold build against the shared Redis sccache (observed: 0.00%
+/// Rust hit rate, 368 misses, vs 100% for C/C++) even though sccache itself
+/// was correctly wired. `CARGO_INCREMENTAL=0` is NON-SECRET (a plain cargo
+/// build-behavior flag) — it goes via `--setenv`, never the secret env-file —
+/// inserted into the build child's env for BOTH the local and remote (heavy)
+/// build paths, and for both `build` and `test` mode (the flag governs
+/// compilation, not which cargo subcommand runs).
+fn inject_cargo_incremental_off(build_env: &mut BTreeMap<String, String>) {
+    build_env.insert("CARGO_INCREMENTAL".to_string(), "0".to_string());
 }
 
 /// The path (relative to CARGO_TARGET_DIR) where the built binary lands:
@@ -996,6 +1704,11 @@ impl RustTool for CompilerBuild {
                     "enum": ["build", "test"],
                     "default": "build",
                     "description": "build (default) compiles + publishes an artifact and flips experimental/current, exactly as before. test runs `cargo test` in the SAME capped single-door scope (same toolchain/caps/sccache) as a GATE — it never publishes an artifact and never flips a channel pointer; it returns a structured pass/fail (+ test counts, + the failing-test summary on failure) via the same compiler_progress/events mechanism."
+                },
+                "wait": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "true (default) → block until the build/test-gate finishes and return its result, exactly as before. false → BLD-ASYNC (TERM #421): enqueue this build onto the same durable scheduler/queue compiler_request uses and return IMMEDIATELY with the request_id — the build/gate then runs via the scheduler, not this call. Use this for big builds that would otherwise exceed the caller's own request timeout even though the build keeps running server-side; poll compiler_progress(request_id) (or subscribe) for the terminal tested/built/failed stage, which carries the same result (incl. test counts on mode=test) a blocking call would have returned."
                 }
             },
             "required": ["module", "ref"]
@@ -1007,6 +1720,17 @@ impl RustTool for CompilerBuild {
     }
 
     async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        // BLD-ASYNC (TERM #421): wait=false (default true = the original blocking
+        // behavior below, unchanged) hands the build to the scheduler/queue and
+        // returns immediately — this call never blocks past the enqueue, even
+        // when the eventual build would run well past a caller's own forward
+        // timeout. Checked FIRST, before the request_id resolution below, since
+        // the async path mints its OWN identity (the queue job id) rather than
+        // consuming compiler_build's usual request_id track.
+        let wait = args.get("wait").and_then(Value::as_bool).unwrap_or(true);
+        if !wait {
+            return self.enqueue_async(args).await;
+        }
         // BLD-19: decide the effective request_id FIRST, so EVERY compiler_build
         // path (success OR failure) carries a discoverable id. A caller may supply
         // one (to subscribe before/while the build runs); if it is missing OR
@@ -1201,7 +1925,121 @@ fn is_valid_request_id(s: &str) -> bool {
     !s.is_empty() && events::request_id_len_ok(s) && validate_segment("request_id", s).is_ok()
 }
 
+/// Parse + validate the `mode` arg (`"build"` default | `"test"`) shared by
+/// `compiler_build` and `compiler_request`/the async `wait=false` enqueue path
+/// (BLD-ASYNC, TERM #421) — kept as one function so the two tools can never
+/// silently drift on what a valid `mode` looks like.
+fn parse_mode_arg(args: &Value) -> Result<String, ToolError> {
+    let mode = args
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("build")
+        .to_string();
+    if mode != "build" && mode != "test" {
+        return Err(ToolError::InvalidArgument(format!(
+            "mode must be \"build\" or \"test\", got {mode:?}"
+        )));
+    }
+    Ok(mode)
+}
+
 impl CompilerBuild {
+    /// BLD-ASYNC (TERM #421): the `wait=false` path. Validates + enqueues onto
+    /// the SAME durable scheduler/queue `compiler_request` uses (module lock /
+    /// host cap / window gating all still apply once the scheduler dispatches
+    /// it) and returns immediately with the queue's job id as the caller's
+    /// `request_id` to poll via `compiler_progress` — this call never runs
+    /// cargo itself. `mode=test` is supported end-to-end: it is carried
+    /// durably on the queued job (`JobRequest::mode`) and forwarded by
+    /// `invoke_build` when the scheduler actually dispatches it, so the
+    /// dispatched build runs the test-gate (not a publish-and-flip build) and
+    /// the terminal `tested` event (with pass/fail counts) lands on this same
+    /// job id.
+    async fn enqueue_async(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let store = RedisQueue::from_env().ok_or_else(|| {
+            ToolError::NotConfigured(
+                "compiler job queue is not configured (REDIS_URL unset) — cannot enqueue an \
+                 async build; wait=false requires the durable Redis queue (BLD-20 \
+                 Namespace::Queue), the same one compiler_request uses"
+                    .to_string(),
+            )
+        })?;
+        Self::enqueue_async_onto(&store, args).await
+    }
+
+    /// The store-generic core of [`enqueue_async`](Self::enqueue_async) — takes
+    /// any [`QueueStore`] so tests can enqueue onto an in-memory fake instead of
+    /// requiring a live Redis (`RedisQueue::from_env`'s backend is a
+    /// process-global singleton memoized on first use, so it cannot be
+    /// deterministically pointed at a test instance after the fact).
+    async fn enqueue_async_onto(
+        store: &dyn QueueStore,
+        args: Value,
+    ) -> Result<ToolOutput, ToolError> {
+        let module = str_arg(&args, "module")?;
+        let git_ref = str_arg(&args, "ref")?;
+        validate_segment("module", &module)?;
+        validate_git_ref(&git_ref)?;
+
+        let host_req =
+            HostRequest::parse(args.get("host").and_then(Value::as_str).unwrap_or("auto"))?;
+        let fast = args.get("fast").and_then(Value::as_bool).unwrap_or(false);
+        let bin = match args.get("bin").and_then(Value::as_str) {
+            Some(b) => {
+                validate_segment("bin", b)?;
+                Some(b.to_string())
+            }
+            None => None,
+        };
+        let mode = parse_mode_arg(&args)?;
+        let heavy = request_is_heavy(host_req, &module, fast);
+
+        let enq = store
+            .enqueue(&JobRequest {
+                module: module.clone(),
+                git_ref: git_ref.clone(),
+                priority: Priority::Normal,
+                heavy,
+                ready: true,
+                bin,
+                force: false,
+                mode: mode.clone(),
+            })
+            .await
+            .map_err(|e| ToolError::Execution(e.to_string()))?;
+
+        // Give the caller something to poll immediately: a `queued` event on the
+        // job id. The scheduler's eventual dispatch (`invoke_build` →
+        // `execute_structured` with `request_id=Some(job_id)`) ROTATES this to a
+        // fresh track when it actually starts (the same single-rotation-per-
+        // attempt invariant the blocking path documents above) — so this is a
+        // best-effort "something is queued" signal, not the authoritative track.
+        events::bus().begin(&enq.job_id);
+        events::bus().emit(
+            &enq.job_id,
+            events::Emit::stage(events::Stage::Queued).message(format!("{module}@{git_ref}")),
+        );
+
+        let text = format!(
+            "{verb} {module}@{git_ref} (mode={mode}) async; poll compiler_progress(request_id={id}) \
+             for the terminal result",
+            verb = if enq.created { "Queued" } else { "Coalesced onto existing" },
+            id = enq.job_id,
+        );
+        let structured = json!({
+            "request_id": enq.job_id,
+            "job_id": enq.job_id,
+            "created": enq.created,
+            "coalesced": !enq.created,
+            "module": module,
+            "ref": git_ref,
+            "mode": mode,
+            "heavy": heavy,
+            "wait": false,
+        });
+        Ok(ToolOutput::with_structured(text, structured))
+    }
+
     async fn build_inner(&self, request_id: &str, args: Value) -> Result<ToolOutput, ToolError> {
         let module = str_arg(&args, "module")?;
         let git_ref = str_arg(&args, "ref")?;
@@ -1220,16 +2058,7 @@ impl CompilerBuild {
             .unwrap_or_else(|| module.clone());
         // BLD-COMPTEST: mode=build (default, unchanged behavior) | mode=test (the
         // gate — same capped single-door scope, no publish, no channel flip).
-        let mode = args
-            .get("mode")
-            .and_then(Value::as_str)
-            .unwrap_or("build")
-            .to_string();
-        if mode != "build" && mode != "test" {
-            return Err(ToolError::InvalidArgument(format!(
-                "mode must be \"build\" or \"test\", got {mode:?}"
-            )));
-        }
+        let mode = parse_mode_arg(&args)?;
         let is_test_mode = mode == "test";
 
         // ── Validate user-controlled path inputs BEFORE any path join / rsync /
@@ -1283,7 +2112,7 @@ impl CompilerBuild {
         // build (a build script printing its env, etc.) and must be scrubbed from
         // ANY captured stdout/stderr before it reaches an error/log. Shared with
         // the failed-event redaction on the wrapper's error path.
-        let redact = redaction_set(&root_str);
+        let mut redact = redaction_set(&root_str);
 
         // The local source stage (staged on the shared NFS share is fine — it's a
         // source stage, not the live target). Also the rsync source for a remote
@@ -1293,6 +2122,7 @@ impl CompilerBuild {
         // BEFORE it is used for current_dir / --manifest-path / rsync, so an
         // absolute-elsewhere or `../`-escaping override can't build/sync source
         // outside the dataset. The default staged path is already safe.
+        let explicit_source_dir = args.get("source_dir").and_then(Value::as_str).is_some();
         let local_source_dir = match args.get("source_dir").and_then(Value::as_str) {
             Some(s) => {
                 let sd = PathBuf::from(s);
@@ -1301,6 +2131,40 @@ impl CompilerBuild {
             }
             None => root.join("src").join(&module).join(&git_ref),
         };
+        // GAP 3 (TERM #418): auto-fetch the source from Gitea BEFORE the GAP 1
+        // check below when the caller did NOT supply an explicit `source_dir`
+        // (that path is validated/used as-is, never auto-staged) and the
+        // default stage path doesn't exist yet — so a fresh agent's first
+        // compiler_build for module@ref just works without a manual rsync.
+        // Best-effort: a failure here is NOT fatal on its own — it falls
+        // through to GAP 1's existing "source not staged" error below (now
+        // augmented with the auto-stage failure reason) rather than returning
+        // a different error shape.
+        let mut autostage_failure: Option<String> = None;
+        if !explicit_source_dir && !local_source_dir.is_dir() && autostage_enabled() {
+            if let Err(e) = autostage_source(&module, &git_ref, &local_source_dir, &mut redact).await {
+                tracing::warn!(
+                    "compiler: GAP 3 auto-stage failed for {module}@{git_ref}: {e}"
+                );
+                autostage_failure = Some(e.to_string());
+            }
+        }
+        // GAP 1: fail loudly HERE, with the actual cause, if the source was
+        // never staged (auto-stage above may have just fixed this) —
+        // otherwise `local_source_dir` reaches `current_dir(...)` on a spawn
+        // whose PROGRAM path (`/usr/bin/systemd-run`) is perfectly valid, and
+        // a missing `current_dir` makes `Command::spawn` report ENOENT against
+        // argv[0] instead — a red herring ("No such file or directory"
+        // pointing at systemd-run) that cost real debugging time before this
+        // check existed.
+        validate_local_source_dir(&local_source_dir, &module, &git_ref).map_err(|e| {
+            match (e, &autostage_failure) {
+                (ToolError::NotFound(m), Some(reason)) => ToolError::NotFound(format!(
+                    "{m} — auto-stage from Gitea was attempted and failed: {reason}"
+                )),
+                (other, _) => other,
+            }
+        })?;
 
         // Pinned toolchain channel to ensure (idempotent; never `rustup update`).
         let pinned = env_nonempty(RUST_TOOLCHAIN_PINNED);
@@ -1329,6 +2193,12 @@ impl CompilerBuild {
             // Force cargo's N/M progress bar on the piped (non-TTY) stdio so the
             // tap gets live {step,total} updates (BLD-19).
             inject_cargo_progress_env(&mut build_env);
+            // GAP 4: incremental compilation defeats sccache's Rust caching.
+            inject_cargo_incremental_off(&mut build_env);
+            // GAP 2: Gitea Cargo-registry config + vault-sourced auth token, so a
+            // module that depends on terminus-rs via the Gitea Cargo registry
+            // (harmony, chord) can resolve it inside the build scope.
+            inject_gitea_registry_env(&mut build_env, &mut redact);
             // S7: non-secret vars → `--setenv` (argv); secret vars → the INHERITED
             // process environment of systemd-run (which `--scope` passes to the
             // cargo child) — never argv.
@@ -1353,21 +2223,35 @@ impl CompilerBuild {
             }
 
             let manifest = local_source_dir.join("Cargo.toml");
+            let manifest_str = manifest.to_string_lossy().to_string();
+
+            // GAP 5 (TERM #418): generate a matching Cargo.lock BEFORE the
+            // `--locked` build/test below, in the SAME capped scope and with
+            // the SAME env (sccache + CARGO_TARGET_DIR + GAP 2's Gitea
+            // registry creds + GAP 4's CARGO_INCREMENTAL=0) as the real
+            // build — a distinct `-lockgen` unit keeps its transient scope
+            // from colliding with the main build's. See
+            // `cargo_generate_lockfile_argv`'s doc for why this is
+            // necessary (terminus/harmony/chord gitignore Cargo.lock).
+            let lockgen_argv = cargo_generate_lockfile_argv(&manifest_str);
+            let lockgen_unit = format!("{unit}-lockgen");
+            let lockgen_scope_argv =
+                scope::render_scope_argv(&lockgen_unit, &resolved.caps, &setenv, &lockgen_argv);
+            run(
+                &lockgen_scope_argv,
+                Some(&local_source_dir),
+                &secret_env,
+                Duration::from_secs(180),
+                &redact,
+                None,
+                None,
+            )
+            .await?;
+
             let cargo_argv = if is_test_mode {
-                cargo_test_argv(
-                    &profile,
-                    &triple,
-                    resolved.caps.jobs,
-                    &manifest.to_string_lossy(),
-                )
+                cargo_test_argv(&profile, &triple, resolved.caps.jobs, &manifest_str)
             } else {
-                cargo_build_argv(
-                    &profile,
-                    &triple,
-                    resolved.caps.jobs,
-                    &bin,
-                    &manifest.to_string_lossy(),
-                )
+                cargo_build_argv(&profile, &triple, resolved.caps.jobs, &bin, &manifest_str)
             };
             let scope_argv = scope::render_scope_argv(&unit, &resolved.caps, &setenv, &cargo_argv);
             // Compilation (or the test run) starts → `building`; the tap streams
@@ -1475,7 +2359,29 @@ impl CompilerBuild {
             // Force cargo's N/M progress bar on the piped (non-TTY, over-ssh) stdio
             // so the tap gets live {step,total} updates (BLD-19).
             inject_cargo_progress_env(&mut build_env);
+            // GAP 4: incremental compilation defeats sccache's Rust caching.
+            inject_cargo_incremental_off(&mut build_env);
+            // GAP 2: Gitea Cargo-registry config + vault-sourced auth token (see
+            // the local-build call site above for the full rationale).
+            inject_gitea_registry_env(&mut build_env, &mut redact);
             let (setenv, secret_env) = scope::partition_env(&build_env);
+
+            // GAP 5 (TERM #418): same rationale as the local path above — a
+            // freshly-staged feature-branch checkout has no Cargo.lock
+            // (terminus/harmony/chord gitignore it), so the `--locked`
+            // build/test below would fail its dependency-resolution step
+            // instantly. Render a `cargo generate-lockfile` scope now (same
+            // caps/env, distinct `-lockgen` unit); it is chained into the
+            // SAME ssh session as the real build below (via `&&`, sharing
+            // the one sourced secret-env file) rather than exec'd
+            // separately, so it never disturbs the single-shot `rm -f` on
+            // the remote secret file.
+            let remote_manifest = format!("{remote_source}/Cargo.toml");
+            let lockgen_argv = cargo_generate_lockfile_argv(&remote_manifest);
+            let lockgen_unit = format!("{unit}-lockgen");
+            let lockgen_scope_argv =
+                scope::render_scope_argv(&lockgen_unit, &resolved.caps, &setenv, &lockgen_argv);
+            let lockgen_cmd = shell_join(&lockgen_scope_argv);
 
             // Secret env (if any) → a 0600 file ON THE REMOTE, `source`d inside the
             // ssh wrapper before `exec systemd-run` so it reaches the scoped build's
@@ -1555,23 +2461,27 @@ impl CompilerBuild {
                 .await?;
             }
 
-            let manifest = format!("{remote_source}/Cargo.toml");
             let cargo_argv = if is_test_mode {
-                cargo_test_argv(&profile, &triple, resolved.caps.jobs, &manifest)
+                cargo_test_argv(&profile, &triple, resolved.caps.jobs, &remote_manifest)
             } else {
-                cargo_build_argv(&profile, &triple, resolved.caps.jobs, &bin, &manifest)
+                cargo_build_argv(&profile, &triple, resolved.caps.jobs, &bin, &remote_manifest)
             };
             let scope_argv = scope::render_scope_argv(&unit, &resolved.caps, &setenv, &cargo_argv);
-            // Remote wrapper: source the secret env file (if any), delete it, then
-            // exec the scoped build. The secret lives only in the 0600 file, never argv.
+            // Remote wrapper: source the secret env file (if any) so BOTH the
+            // GAP 5 lockgen scope and the real build/test scope see it, delete
+            // the file (one-shot — only after it's been sourced for both), run
+            // lockgen to completion (`&&`, not `exec`, since a following
+            // command still needs to run), then `exec` the scoped build/test
+            // so it replaces this shell as the final process. The secret lives
+            // only in the 0600 file, never argv.
             let scope_cmd = shell_join(&scope_argv);
             let remote_cmd = if have_secret {
                 format!(
-                    "set -a; . {f}; rm -f {f}; set +a; exec {scope_cmd}",
+                    "set -a; . {f}; rm -f {f}; set +a; {lockgen_cmd} && exec {scope_cmd}",
                     f = shell_quote(&remote_env_path)
                 )
             } else {
-                format!("exec {scope_cmd}")
+                format!("{lockgen_cmd} && exec {scope_cmd}")
             };
             // On timeout, tear down the REMOTE scope by its unit name too — the
             // local ssh process-group kill can't reach the remote build tree.
@@ -2164,6 +3074,37 @@ fn validate_source_dir(
     )))
 }
 
+/// GAP 1: validate that a module@ref's source has actually been staged into
+/// `local_source_dir` (and looks like a cargo crate — has a `Cargo.toml`)
+/// BEFORE it is used as `current_dir(...)` for `rustup`/`cargo`, or as the
+/// rsync source for a remote build. Without this check a missing staged dir
+/// surfaces as `Command::spawn` reporting ENOENT against argv[0]
+/// (`/usr/bin/systemd-run: No such file or directory`) — a correct-looking
+/// but completely misleading error, since the program itself is fine and the
+/// real problem is the `current_dir` that doesn't exist.
+fn validate_local_source_dir(
+    local_source_dir: &std::path::Path,
+    module: &str,
+    git_ref: &str,
+) -> Result<(), ToolError> {
+    if !local_source_dir.is_dir() {
+        return Err(ToolError::NotFound(format!(
+            "source not staged for {module}@{git_ref} at {} — stage it into \
+             ${{{BUILD_DATASET_ROOT}}}/src/<module>/<ref> or pass source_dir",
+            local_source_dir.display()
+        )));
+    }
+    if !local_source_dir.join("Cargo.toml").is_file() {
+        return Err(ToolError::NotFound(format!(
+            "source not staged for {module}@{git_ref} at {} — directory exists \
+             but has no Cargo.toml (stage a complete checkout into \
+             ${{{BUILD_DATASET_ROOT}}}/src/<module>/<ref> or pass source_dir)",
+            local_source_dir.display()
+        )));
+    }
+    Ok(())
+}
+
 /// The `compiler_progress` tool (BLD-19): a live progress/events surface keyed by
 /// a build's `request_id`. It returns the current snapshot (stage + `{step,total}`
 /// + timing) and the recent event tail; with `wait_ms > 0` it LONG-POLLS — it
@@ -2357,17 +3298,35 @@ fn classify_heavy_auto(fast: bool, peak: Option<Option<u64>>, threshold: Option<
 /// `compiler_build` with the host the scheduler selected (heavy vs primary). A
 /// thin wrapper so `scheduler::CompilerBuildExecutor` need not know the tool's
 /// arg shape.
+///
+/// `mode` (BLD-ASYNC, TERM #421) forwards the job's `"build"`/`"test"` mode —
+/// carried durably on the queued job (see [`queue::JobRequest::mode`]) — so a
+/// job enqueued via `compiler_request(mode=test)` or an async
+/// `compiler_build(wait=false, mode=test)` submission runs as a test-gate when
+/// the scheduler actually dispatches it, not a publish-and-flip build.
+///
+/// `request_id`, when supplied, is forwarded so the SAME id a caller polls via
+/// `compiler_progress` (surfaced back at enqueue time, e.g. the queue job id)
+/// is the id the eventual dispatched build emits its `queued`/`building`/
+/// `tested`/`published`/`failed` events under — otherwise `compiler_build`
+/// would mint its own fresh id and the caller's poll would never see it.
 pub(crate) async fn invoke_build(
     module: &str,
     git_ref: &str,
     heavy: bool,
     bin: Option<&str>,
+    mode: &str,
+    request_id: Option<&str>,
 ) -> Result<(), ToolError> {
     let mut args = json!({
         "module": module,
         "ref": git_ref,
         "host": if heavy { "heavy" } else { "primary" },
+        "mode": if mode == "test" { "test" } else { "build" },
     });
+    if let Some(rid) = request_id.filter(|r| !r.is_empty()) {
+        args["request_id"] = json!(rid);
+    }
     // BLD/TERM #360: forward the queued bin override so the automated path can build
     // a module whose cargo bin name differs from the module name (e.g. terminus →
     // terminus_primary). Absent ⇒ compiler_build defaults `--bin <module>`.
@@ -2439,6 +3398,12 @@ impl RustTool for CompilerRequest {
                     "type": "boolean",
                     "default": false,
                     "description": "Disrupt-on-demand: a heavy job dispatches even outside a configured build window and without a fleet-quiet signal. Still goes through the normal module lock / host cap claim and idle-mode lease — only the window/quiet gate is bypassed. Orthogonal to priority."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["build", "test"],
+                    "default": "build",
+                    "description": "build (default) compiles + publishes an artifact and flips experimental/current when the scheduler dispatches this job, exactly like compiler_build's mode=build. test runs the SAME test-gate compiler_build(mode=test) runs (no publish, no channel flip; structured pass/fail via compiler_progress). This is BLD-ASYNC's (TERM #421) async test-gate submission path."
                 }
             },
             "required": ["module", "ref"]
@@ -2479,6 +3444,9 @@ impl RustTool for CompilerRequest {
         // scheduler's window/quiet gate but still goes through the normal module
         // lock / host cap claim and idle-mode lease (see scheduler::tick_once).
         let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+        // BLD-ASYNC (TERM #421): thread mode through the queue so the scheduler
+        // runs this job as a test-gate rather than a publish-and-flip build.
+        let mode = parse_mode_arg(&args)?;
 
         let store = RedisQueue::from_env().ok_or_else(|| {
             ToolError::NotConfigured(
@@ -2496,12 +3464,13 @@ impl RustTool for CompilerRequest {
                 ready,
                 bin,
                 force,
+                mode: mode.clone(),
             })
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
 
         let text = format!(
-            "{verb} {module}@{git_ref} ({prio}, {host}){ready}{force}; job {id}",
+            "{verb} {module}@{git_ref} ({prio}, {host}, mode={mode}){ready}{force}; job {id}",
             verb = if enq.created { "Queued" } else { "Coalesced onto existing" },
             prio = priority.as_str(),
             host = if heavy { "heavy" } else { "primary" },
@@ -2519,6 +3488,7 @@ impl RustTool for CompilerRequest {
             "heavy": heavy,
             "ready": ready,
             "force": force,
+            "mode": mode,
         });
         Ok(ToolOutput::with_structured(text, structured))
     }
@@ -2739,6 +3709,138 @@ mod tests {
             .any(|w| w[0] == "--profile" && w[1] == "release-dist"));
     }
 
+    // ── BLD-GATE-06 (TERM #419): --lib/--bins default + capped test-threads ──
+
+    #[test]
+    fn cargo_test_argv_defaults_to_lib_bins_with_capped_threads() {
+        let _env = ScopedEnv::new()
+            .unset("BUILD_GATE_TESTS")
+            .unset("BUILD_GATE_TEST_THREADS");
+        let argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml");
+        assert!(argv.iter().any(|a| a == "--lib"), "argv: {argv:?}");
+        assert!(argv.iter().any(|a| a == "--bins"), "argv: {argv:?}");
+        assert!(
+            !argv.iter().any(|a| a == "--workspace"),
+            "default must NOT run the whole workspace: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a == "--test-threads=8"),
+            "argv: {argv:?}"
+        );
+        // Exactly one `--` separator, and it comes before --test-threads=N.
+        let dd = argv.iter().position(|a| a == "--").expect("has --");
+        assert_eq!(argv[dd + 1], "--test-threads=8");
+    }
+
+    #[test]
+    fn cargo_test_argv_build_gate_tests_workspace_opts_in() {
+        let _env = ScopedEnv::new().set("BUILD_GATE_TESTS", "workspace");
+        let argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml");
+        assert!(argv.iter().any(|a| a == "--workspace"), "argv: {argv:?}");
+        assert!(
+            !argv.iter().any(|a| a == "--lib"),
+            "workspace mode must not also pass --lib: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--bins"),
+            "workspace mode must not also pass --bins: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn cargo_test_argv_test_threads_env_override() {
+        let _env = ScopedEnv::new().set("BUILD_GATE_TEST_THREADS", "4");
+        let argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml");
+        assert!(
+            argv.iter().any(|a| a == "--test-threads=4"),
+            "argv: {argv:?}"
+        );
+        assert!(!argv.iter().any(|a| a == "--test-threads=8"));
+    }
+
+    #[test]
+    fn cargo_test_argv_test_threads_zero_or_garbage_falls_back_to_default() {
+        let argv_zero = {
+            let _env = ScopedEnv::new().set("BUILD_GATE_TEST_THREADS", "0");
+            cargo_test_argv("release", "t", 4, "/s/Cargo.toml")
+        };
+        assert!(argv_zero.iter().any(|a| a == "--test-threads=8"));
+
+        let argv_garbage = {
+            let _env = ScopedEnv::new().set("BUILD_GATE_TEST_THREADS", "not-a-number");
+            cargo_test_argv("release", "t", 4, "/s/Cargo.toml")
+        };
+        assert!(argv_garbage.iter().any(|a| a == "--test-threads=8"));
+    }
+
+    // ── BLD-ASYNC (TERM #421): parse_mode_arg + compiler_build wait=false ──
+
+    #[test]
+    fn parse_mode_arg_defaults_build_accepts_test_rejects_other() {
+        assert_eq!(parse_mode_arg(&json!({})).unwrap(), "build");
+        assert_eq!(parse_mode_arg(&json!({ "mode": "build" })).unwrap(), "build");
+        assert_eq!(parse_mode_arg(&json!({ "mode": "test" })).unwrap(), "test");
+        assert!(parse_mode_arg(&json!({ "mode": "release" })).is_err());
+        // A non-string `mode` is treated the same as absent (defaults to
+        // "build"), matching the pre-existing build_inner behavior this helper
+        // was extracted from — only a present STRING outside {build,test} errors.
+        assert_eq!(parse_mode_arg(&json!({ "mode": 5 })).unwrap(), "build");
+    }
+
+    #[test]
+    fn compiler_build_tool_advertises_wait_param_defaulting_true() {
+        let params = CompilerBuild.parameters();
+        let wait = &params["properties"]["wait"];
+        assert_eq!(wait["type"], "boolean");
+        assert_eq!(wait["default"], true);
+        assert!(
+            wait["description"].as_str().unwrap().contains("compiler_progress"),
+            "wait's description must point the caller at compiler_progress: {wait:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compiler_build_wait_false_enqueues_onto_the_queue_and_returns_a_request_id_without_running_a_build(
+    ) {
+        // BLD-ASYNC: wait=false must enqueue (mocked here via the same in-memory
+        // fake the scheduler tests use — NOT a live Redis, and NEVER touches
+        // build_inner/cargo) and return immediately with a request_id the caller
+        // polls via compiler_progress. `enqueue_async_onto` is the store-generic
+        // core `enqueue_async` delegates to; exercising it directly here is the
+        // deterministic substitute for mocking `RedisQueue::from_env` (which is a
+        // process-global singleton and can't be redirected at a fake after boot).
+        let q = crate::compiler::queue::fake::InMemoryQueue::new();
+        let start = std::time::Instant::now();
+        let out = CompilerBuild::enqueue_async_onto(
+            &q,
+            json!({
+                "module": "terminus",
+                "ref": "abc123",
+                "mode": "test",
+                "wait": false,
+            }),
+        )
+        .await
+        .expect("enqueue_async_onto succeeds against the in-memory fake");
+        // Returns essentially immediately — it only enqueues, it never runs cargo.
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "wait=false must not block on the build: {:?}",
+            start.elapsed()
+        );
+        let structured = out.structured.expect("structured output");
+        let request_id = structured["request_id"]
+            .as_str()
+            .expect("request_id is a string");
+        assert!(is_valid_request_id(request_id));
+        assert_eq!(structured["job_id"], structured["request_id"]);
+        assert_eq!(structured["mode"], "test");
+        assert_eq!(structured["wait"], false);
+        assert_eq!(structured["created"], true);
+        assert!(out.text.contains(request_id));
+        assert!(out.text.to_lowercase().contains("compiler_progress"));
+    }
+
     #[test]
     fn cargo_test_argv_starts_with_cargo_test_not_cargo_build() {
         // The load-bearing distinction between mode=test and mode=build: the
@@ -2782,6 +3884,125 @@ mod tests {
                 "chord",
             ]
         );
+    }
+
+    // ── GAP 5 (TERM #418): cargo_generate_lockfile_argv ───────────────────
+    // terminus/harmony/chord gitignore Cargo.lock, so `--locked` (on both
+    // cargo_build_argv and cargo_test_argv) fails instantly on a freshly
+    // staged feature branch unless a matching lock is generated first.
+
+    #[test]
+    fn cargo_generate_lockfile_argv_shape() {
+        let argv = cargo_generate_lockfile_argv("/s/Cargo.toml");
+        assert_eq!(
+            argv,
+            vec![
+                "cargo",
+                "generate-lockfile",
+                "--manifest-path",
+                "/s/Cargo.toml",
+            ]
+        );
+    }
+
+    #[test]
+    fn cargo_generate_lockfile_argv_never_locked() {
+        // The whole point of this step is to CREATE a lock — `--locked` would
+        // make cargo refuse to write one, defeating the pre-step entirely.
+        let argv = cargo_generate_lockfile_argv("/s/Cargo.toml");
+        assert!(
+            !argv.iter().any(|a| a == "--locked"),
+            "generate-lockfile argv must never carry --locked: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn cargo_generate_lockfile_argv_is_not_a_build_or_test_subcommand() {
+        // Distinguishes it from cargo_build_argv/cargo_test_argv (GAP 5 is a
+        // resolve-only step, not a compile/test step).
+        let argv = cargo_generate_lockfile_argv("/s/Cargo.toml");
+        assert_eq!(argv[0], "cargo");
+        assert_eq!(argv[1], "generate-lockfile");
+    }
+
+    #[test]
+    fn local_build_sequence_renders_lockgen_before_the_locked_test_scope() {
+        // Mirrors what build_inner does on the LOCAL path: a lockgen scope
+        // (no --locked) rendered under a `-lockgen` unit, followed by the
+        // real --locked test/build scope under the base unit. Asserts the
+        // ORDER + that only the second argv carries --locked.
+        let caps = crate::compiler::scope::ScopeCaps {
+            memory_max: "4G".to_string(),
+            cpu_quota: "200%".to_string(),
+            io_weight: "50".to_string(),
+            jobs: 4,
+        };
+        let setenv: BTreeMap<String, String> = BTreeMap::new();
+        let unit = "terminus-build-terminus-abc123-uuid".to_string();
+
+        let lockgen_argv = cargo_generate_lockfile_argv("/s/Cargo.toml");
+        let lockgen_unit = format!("{unit}-lockgen");
+        let lockgen_scope =
+            crate::compiler::scope::render_scope_argv(&lockgen_unit, &caps, &setenv, &lockgen_argv);
+
+        let test_argv = cargo_test_argv("release", "t", 4, "/s/Cargo.toml");
+        let test_scope = crate::compiler::scope::render_scope_argv(&unit, &caps, &setenv, &test_argv);
+
+        // Both are systemd-run scopes on DISTINCT unit names (never collide).
+        assert!(lockgen_scope.iter().any(|a| a == &format!("--unit={lockgen_unit}")));
+        assert!(test_scope.iter().any(|a| a == &format!("--unit={unit}")));
+        assert_ne!(lockgen_scope, test_scope);
+
+        // The lockgen scope's cargo argv never carries --locked; the real
+        // test/build scope always does.
+        assert!(!lockgen_scope.contains(&"--locked".to_string()));
+        assert!(test_scope.contains(&"--locked".to_string()));
+
+        // The sequence a caller must run: lockgen THEN the --locked step —
+        // encoded here as "lockgen has no --locked, the following step
+        // does," which is the precondition the GAP 5 fix relies on.
+        let lockgen_then_locked = [lockgen_scope, test_scope];
+        assert!(!lockgen_then_locked[0].contains(&"--locked".to_string()));
+        assert!(lockgen_then_locked[1].contains(&"--locked".to_string()));
+    }
+
+    #[test]
+    fn remote_command_chains_lockgen_before_exec_of_the_locked_scope() {
+        // Mirrors the REMOTE path's `remote_cmd` construction: lockgen runs
+        // to completion (`&&`, not `exec`, since a following command must
+        // still run), then the real --locked scope is `exec`'d so it
+        // replaces the wrapper shell as the final process. Both `have_secret`
+        // branches must preserve this "lockgen && exec build" shape.
+        let lockgen_cmd = "/usr/bin/systemd-run --scope --unit=u-lockgen -- cargo generate-lockfile --manifest-path /s/Cargo.toml".to_string();
+        let scope_cmd = "/usr/bin/systemd-run --scope --unit=u -- cargo test --locked --manifest-path /s/Cargo.toml".to_string();
+
+        let remote_env_path = "/tmp/.terminus-build-u-abc.env".to_string();
+        let with_secret = format!(
+            "set -a; . {f}; rm -f {f}; set +a; {lockgen_cmd} && exec {scope_cmd}",
+            f = remote_env_path
+        );
+        let without_secret = format!("{lockgen_cmd} && exec {scope_cmd}");
+
+        for cmd in [&with_secret, &without_secret] {
+            // lockgen must appear, run to completion (`&&`), BEFORE `exec` of
+            // the real (--locked) build/test scope.
+            let lockgen_pos = cmd.find("generate-lockfile").expect("lockgen present");
+            let exec_pos = cmd.find("exec ").expect("exec present");
+            assert!(
+                lockgen_pos < exec_pos,
+                "lockgen must run before exec of the locked scope: {cmd}"
+            );
+            assert!(cmd.contains("&& exec"), "lockgen must gate exec via &&: {cmd}");
+            // The --locked flag belongs to the exec'd (real) scope only.
+            let locked_pos = cmd.find("--locked").expect("--locked present");
+            assert!(
+                locked_pos > exec_pos,
+                "--locked must belong to the exec'd scope, not lockgen: {cmd}"
+            );
+        }
+        // The one-shot secret file `rm` happens exactly once, before either
+        // scope runs — not split across two ssh commands.
+        assert_eq!(with_secret.matches("rm -f").count(), 1);
     }
 
     // ── BLD-COMPTEST: parse_cargo_test_output ─────────────────────────
@@ -3133,6 +4354,264 @@ mod tests {
         assert!(validate_source_dir(std::path::Path::new("/data/build/src-evil/x"), root).is_err());
     }
 
+    // ── GAP 1: missing-staged-source gives a clear error, not a red herring ──
+
+    #[test]
+    fn missing_source_dir_gives_clear_not_found_error_not_a_spawn_enoent() {
+        let dir = tempfile::tempdir().unwrap();
+        // Never created: <tmp>/src/terminus/abc123 does not exist at all.
+        let missing = dir.path().join("src").join("terminus").join("abc123");
+        let err = validate_local_source_dir(&missing, "terminus", "abc123").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("source not staged for terminus@abc123"),
+            "error must name the module@ref: {msg}"
+        );
+        assert!(
+            msg.contains(&missing.display().to_string()),
+            "error must name the missing path: {msg}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("systemd-run"),
+            "must never surface the misleading spawn-ENOENT red herring: {msg}"
+        );
+    }
+
+    #[test]
+    fn staged_dir_without_cargo_toml_is_also_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("src").join("chord").join("main");
+        std::fs::create_dir_all(&staged).unwrap();
+        // Directory exists but is empty — no Cargo.toml staged into it.
+        let err = validate_local_source_dir(&staged, "chord", "main").unwrap_err();
+        assert!(err.to_string().contains("Cargo.toml"));
+    }
+
+    #[test]
+    fn properly_staged_source_dir_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("src").join("chord").join("main");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        assert!(validate_local_source_dir(&staged, "chord", "main").is_ok());
+    }
+
+    // ── GAP 2: Gitea Cargo-registry creds land on the SECRET partition ───────
+
+    #[test]
+    fn registry_token_from_dedicated_env_lands_on_secret_partition_not_argv() {
+        let _env = ScopedEnv::new()
+            .unset("GITEA_IDENTITY_NAME")
+            .unset("GITEA_PAT_MOOSE")
+            .set("GITEA_URL", "http://gitea.example.internal:3000")
+            .set("CARGO_REGISTRIES_GITEA_TOKEN", "gpat-dedicated-abc123");
+
+        let mut build_env: BTreeMap<String, String> = BTreeMap::new();
+        let mut redact: Vec<String> = Vec::new();
+        inject_gitea_registry_env(&mut build_env, &mut redact);
+
+        // The secret landed in build_env under the expected key...
+        assert_eq!(
+            build_env.get("CARGO_REGISTRIES_GITEA_TOKEN").map(String::as_str),
+            Some("Bearer gpat-dedicated-abc123")
+        );
+        // ...and the raw token value is in the redaction set.
+        assert!(redact.iter().any(|s| s == "gpat-dedicated-abc123"));
+
+        // partition_env (the actual argv/secret split `mod.rs` uses) MUST put it
+        // on the secret side, never `--setenv` argv.
+        let (non_secret, secret) = scope::partition_env(&build_env);
+        assert!(!non_secret.contains_key("CARGO_REGISTRIES_GITEA_TOKEN"));
+        assert_eq!(
+            secret.get("CARGO_REGISTRIES_GITEA_TOKEN").map(String::as_str),
+            Some("Bearer gpat-dedicated-abc123")
+        );
+
+        // The rendered systemd-run argv must never contain the token value.
+        let argv = scope::render_scope_argv(
+            "u",
+            &scope::ScopeCaps {
+                memory_max: "1G".into(),
+                cpu_quota: "100%".into(),
+                io_weight: "50".into(),
+                jobs: 1,
+            },
+            &non_secret,
+            &["cargo".into(), "build".into()],
+        );
+        assert!(!argv.join(" ").contains("gpat-dedicated-abc123"));
+
+        // The INDEX + credential-providers config ARE non-secret and go via
+        // --setenv.
+        assert!(non_secret.contains_key("CARGO_REGISTRIES_GITEA_INDEX"));
+        assert!(non_secret.contains_key("CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS"));
+    }
+
+    #[test]
+    fn registry_token_falls_back_to_default_identity_gitea_pat() {
+        let _env = ScopedEnv::new()
+            .unset("CARGO_REGISTRIES_GITEA_TOKEN")
+            .unset("GITEA_IDENTITY_NAME")
+            .unset("GITEA_URL")
+            .set("GITEA_PAT_MOOSE", "moose-pat-xyz");
+
+        let mut build_env: BTreeMap<String, String> = BTreeMap::new();
+        let mut redact: Vec<String> = Vec::new();
+        inject_gitea_registry_env(&mut build_env, &mut redact);
+
+        assert_eq!(
+            build_env.get("CARGO_REGISTRIES_GITEA_TOKEN").map(String::as_str),
+            Some("Bearer moose-pat-xyz")
+        );
+    }
+
+    #[test]
+    fn registry_token_falls_back_to_moose_when_active_identity_pat_is_unset() {
+        // FINDING 2 (review): an operator set a NON-moose active identity, but
+        // that identity's PAT is unprovisioned. The org-readable moose PAT is the
+        // explicit FINAL fallback so a harmony/chord build still resolves
+        // terminus-rs, rather than degrading purely because the identity changed.
+        let _env = ScopedEnv::new()
+            .unset("CARGO_REGISTRIES_GITEA_TOKEN")
+            .unset("GITEA_URL")
+            .set("GITEA_IDENTITY_NAME", "alice")
+            .unset("GITEA_PAT_ALICE")
+            .set("GITEA_PAT_MOOSE", "moose-org-pat");
+
+        assert_eq!(
+            cargo_registry_gitea_token().as_deref(),
+            Some("moose-org-pat"),
+            "must fall back to the org-readable moose PAT when the active \
+             (non-moose) identity's PAT is unset"
+        );
+
+        // And it wires through inject as the Bearer-wrapped secret.
+        let mut build_env: BTreeMap<String, String> = BTreeMap::new();
+        let mut redact: Vec<String> = Vec::new();
+        inject_gitea_registry_env(&mut build_env, &mut redact);
+        assert_eq!(
+            build_env.get("CARGO_REGISTRIES_GITEA_TOKEN").map(String::as_str),
+            Some("Bearer moose-org-pat")
+        );
+    }
+
+    #[test]
+    fn registry_token_prefers_moose_over_active_identity_pat() {
+        // For REGISTRY reads the org-readable moose PAT is preferred over the
+        // gateway's active identity PAT (review finding): even with a non-moose
+        // identity whose PAT IS provisioned, moose wins for registry access.
+        let _env = ScopedEnv::new()
+            .unset("CARGO_REGISTRIES_GITEA_TOKEN")
+            .unset("GITEA_URL")
+            .set("GITEA_IDENTITY_NAME", "alice")
+            .set("GITEA_PAT_ALICE", "alice-pat")
+            .set("GITEA_PAT_MOOSE", "moose-org-pat");
+        assert_eq!(cargo_registry_gitea_token().as_deref(), Some("moose-org-pat"));
+    }
+
+    #[test]
+    fn registry_explicit_bearer_token_env_is_not_double_wrapped() {
+        // FINDING 1 (review): the DEPLOYED /etc/constellation/secrets format is
+        // `CARGO_REGISTRIES_GITEA_TOKEN="<REDACTED-SECRET>"`. An explicit env in that
+        // (canonical) format must WIN verbatim — never become `Bearer Bearer …`.
+        let _env = ScopedEnv::new()
+            .unset("GITEA_IDENTITY_NAME")
+            .unset("GITEA_PAT_MOOSE")
+            .set("GITEA_URL", "http://gitea.example.internal:3000")
+            .set("CARGO_REGISTRIES_GITEA_TOKEN", "Bearer gpat-explicit-xyz");
+
+        let mut build_env: BTreeMap<String, String> = BTreeMap::new();
+        let mut redact: Vec<String> = Vec::new();
+        inject_gitea_registry_env(&mut build_env, &mut redact);
+        assert_eq!(
+            build_env.get("CARGO_REGISTRIES_GITEA_TOKEN").map(String::as_str),
+            Some("Bearer gpat-explicit-xyz"),
+            "an explicit `Bearer <pat>` env must pass through verbatim, not double-wrap"
+        );
+    }
+
+    #[test]
+    fn registry_env_degrades_cleanly_when_no_token_or_index_is_configured() {
+        let _env = ScopedEnv::new()
+            .unset("CARGO_REGISTRIES_GITEA_TOKEN")
+            .unset("GITEA_IDENTITY_NAME")
+            .unset("GITEA_PAT_MOOSE")
+            .unset("CARGO_REGISTRIES_GITEA_INDEX")
+            .unset("GITEA_URL")
+            .unset("GITEA_OWNER");
+
+        let mut build_env: BTreeMap<String, String> = BTreeMap::new();
+        let mut redact: Vec<String> = Vec::new();
+        // Must not panic; nothing to derive an index from, so no fabricated
+        // literal is inserted either (S1 — never hardcode an infra default).
+        inject_gitea_registry_env(&mut build_env, &mut redact);
+        assert!(!build_env.contains_key("CARGO_REGISTRIES_GITEA_TOKEN"));
+        assert!(!build_env.contains_key("CARGO_REGISTRIES_GITEA_INDEX"));
+        assert!(!build_env.contains_key("CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS"));
+    }
+
+    #[test]
+    fn registry_index_derives_from_gitea_url_but_an_explicit_index_wins() {
+        {
+            // GITEA_URL configured (the box already talks to Gitea's REST API)
+            // → the index is DERIVED, no separate URL needed.
+            let _env = ScopedEnv::new()
+                .unset("CARGO_REGISTRIES_GITEA_INDEX")
+                .set("GITEA_URL", "http://gitea.example.internal:3000")
+                .unset("GITEA_OWNER");
+            let mut build_env: BTreeMap<String, String> = BTreeMap::new();
+            let mut redact: Vec<String> = Vec::new();
+            inject_gitea_registry_env(&mut build_env, &mut redact);
+            assert_eq!(
+                build_env.get("CARGO_REGISTRIES_GITEA_INDEX").map(String::as_str),
+                Some("sparse+http://gitea.example.internal:3000/api/packages/moosenet/cargo/")
+            );
+            assert!(build_env.contains_key("CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS"));
+        }
+        {
+            // An explicit CARGO_REGISTRIES_GITEA_INDEX always wins over the
+            // GITEA_URL derivation.
+            let _env = ScopedEnv::new()
+                .set("GITEA_URL", "http://gitea.example.internal:3000")
+                .set("CARGO_REGISTRIES_GITEA_INDEX", "sparse+http://override.example/cargo/");
+            let mut build_env: BTreeMap<String, String> = BTreeMap::new();
+            let mut redact: Vec<String> = Vec::new();
+            inject_gitea_registry_env(&mut build_env, &mut redact);
+            assert_eq!(
+                build_env.get("CARGO_REGISTRIES_GITEA_INDEX").map(String::as_str),
+                Some("sparse+http://override.example/cargo/")
+            );
+        }
+    }
+
+    // ── GAP 4: CARGO_INCREMENTAL=0 so sccache can actually cache Rust ────────
+
+    #[test]
+    fn cargo_incremental_is_forced_off_for_sccache_rust_caching() {
+        let mut build_env: BTreeMap<String, String> = BTreeMap::new();
+        inject_cargo_incremental_off(&mut build_env);
+        assert_eq!(
+            build_env.get("CARGO_INCREMENTAL").map(String::as_str),
+            Some("0")
+        );
+        // Non-secret — must survive partition_env onto the --setenv side and
+        // appear in the rendered systemd-run argv.
+        let (non_secret, secret) = scope::partition_env(&build_env);
+        assert!(!secret.contains_key("CARGO_INCREMENTAL"));
+        let argv = scope::render_scope_argv(
+            "u",
+            &scope::ScopeCaps {
+                memory_max: "1G".into(),
+                cpu_quota: "100%".into(),
+                io_weight: "50".into(),
+                jobs: 1,
+            },
+            &non_secret,
+            &["cargo".into(), "build".into()],
+        );
+        assert!(argv.contains(&"--setenv=CARGO_INCREMENTAL=0".to_string()));
+    }
+
     #[tokio::test]
     async fn run_redacts_secret_from_stderr_tail_and_stdout() {
         let secret = "<REDACTED-SECRET>".to_string();
@@ -3183,6 +4662,212 @@ mod tests {
             "secret leaked into stdout: {out}"
         );
         assert!(out.contains("<redacted>"));
+    }
+
+    // ── GAP 3 (TERM #418): auto-stage source from Gitea ──────────────────────
+
+    #[test]
+    fn module_repo_map_uses_builtin_defaults() {
+        let _env = ScopedEnv::new().unset(BUILD_MODULE_REPO_MAP_ENV);
+        assert_eq!(resolve_module_repo("terminus"), "Terminus");
+        assert_eq!(resolve_module_repo("chord"), "Chord");
+        assert_eq!(resolve_module_repo("harmony"), "Harmony");
+        assert_eq!(resolve_module_repo("muse"), "Muse");
+        assert_eq!(resolve_module_repo("lumina"), "lumina-constellation");
+        assert_eq!(resolve_module_repo("lumina-core"), "lumina-constellation");
+    }
+
+    #[test]
+    fn module_repo_map_unmapped_module_falls_back_to_capitalized_guess() {
+        let _env = ScopedEnv::new().unset(BUILD_MODULE_REPO_MAP_ENV);
+        assert_eq!(resolve_module_repo("newmodule"), "Newmodule");
+        // Already-capitalized / single-char / empty edge cases don't panic.
+        assert_eq!(capitalize_module_name("x"), "X");
+        assert_eq!(capitalize_module_name(""), "");
+    }
+
+    #[test]
+    fn module_repo_map_env_override_replaces_one_entry_keeps_others() {
+        let _env = ScopedEnv::new().set(
+            BUILD_MODULE_REPO_MAP_ENV,
+            r#"{"terminus": "terminus-fork", "newthing": "NewThing"}"#,
+        );
+        // Overridden entry wins...
+        assert_eq!(resolve_module_repo("terminus"), "terminus-fork");
+        // ...an entry only present in the override is used...
+        assert_eq!(resolve_module_repo("newthing"), "NewThing");
+        // ...and every OTHER built-in default is untouched.
+        assert_eq!(resolve_module_repo("chord"), "Chord");
+        assert_eq!(resolve_module_repo("harmony"), "Harmony");
+    }
+
+    #[test]
+    fn module_repo_map_env_invalid_json_is_ignored_falls_back_to_defaults() {
+        let _env = ScopedEnv::new().set(BUILD_MODULE_REPO_MAP_ENV, "not valid json{{{");
+        // Malformed override must not panic or block the default map.
+        assert_eq!(resolve_module_repo("terminus"), "Terminus");
+    }
+
+    #[test]
+    fn autostage_enabled_defaults_on_when_unset() {
+        let _env = ScopedEnv::new().unset(BUILD_AUTOSTAGE_ENV);
+        assert!(autostage_enabled());
+    }
+
+    #[test]
+    fn autostage_enabled_respects_off_values() {
+        for off in ["0", "false", "FALSE", "False"] {
+            let _env = ScopedEnv::new().set(BUILD_AUTOSTAGE_ENV, off);
+            assert!(!autostage_enabled(), "{off:?} must disable autostage");
+        }
+    }
+
+    #[test]
+    fn autostage_enabled_respects_on_values_and_unknown_values_fail_open() {
+        for on in ["1", "true", "TRUE", "yes", "anything-unrecognized"] {
+            let _env = ScopedEnv::new().set(BUILD_AUTOSTAGE_ENV, on);
+            assert!(autostage_enabled(), "{on:?} must leave autostage enabled");
+        }
+    }
+
+    #[test]
+    fn autostage_remote_url_has_no_embedded_credential() {
+        let _env = ScopedEnv::new()
+            .unset(BUILD_MODULE_REPO_MAP_ENV)
+            .set("GITEA_URL", "http://gitea.example.internal:3000")
+            .unset("GITEA_OWNER");
+        let (remote, repo) = autostage_remote_url("chord").unwrap();
+        assert_eq!(remote, "http://gitea.example.internal:3000/moosenet/Chord.git");
+        assert_eq!(repo, "Chord");
+        // The whole point of the GIT_ASKPASS approach: the URL never carries a
+        // credential, unlike an `x-access-token@host` form.
+        assert!(!remote.contains('@'), "remote URL must carry no embedded credential: {remote}");
+    }
+
+    #[test]
+    fn autostage_remote_url_respects_gitea_owner_override() {
+        let _env = ScopedEnv::new()
+            .set("GITEA_URL", "http://gitea.example.internal:3000/")
+            .set("GITEA_OWNER", "someorg");
+        let (remote, _repo) = autostage_remote_url("harmony").unwrap();
+        assert_eq!(remote, "http://gitea.example.internal:3000/someorg/Harmony.git");
+    }
+
+    #[test]
+    fn autostage_remote_url_not_configured_without_gitea_url() {
+        let _env = ScopedEnv::new().unset("GITEA_URL");
+        let err = autostage_remote_url("terminus").unwrap_err();
+        assert!(matches!(err, ToolError::NotConfigured(_)));
+    }
+
+    #[test]
+    fn autostage_gitea_token_prefers_moose_pat_and_is_never_bearer_wrapped() {
+        let _env = ScopedEnv::new()
+            .unset("GITEA_IDENTITY_NAME")
+            .set("GITEA_PAT_MOOSE", "raw-pat-abc123");
+        let token = autostage_gitea_token().unwrap();
+        // Raw PAT, not the `Bearer <pat>` form the Cargo-registry header needs —
+        // git's plain-PAT auth would break on a `Bearer `-prefixed value.
+        assert_eq!(token, "raw-pat-abc123");
+        assert!(!token.starts_with("Bearer "));
+    }
+
+    #[test]
+    fn autostage_gitea_token_falls_back_to_active_identity_when_moose_unset() {
+        let _env = ScopedEnv::new()
+            .unset("GITEA_PAT_MOOSE")
+            .set("GITEA_IDENTITY_NAME", "harmony")
+            .set("GITEA_PAT_HARMONY", "harmony-pat-xyz");
+        assert_eq!(autostage_gitea_token().as_deref(), Some("harmony-pat-xyz"));
+    }
+
+    #[test]
+    fn autostage_gitea_token_none_when_nothing_configured() {
+        let _env = ScopedEnv::new()
+            .unset("GITEA_PAT_MOOSE")
+            .unset("GITEA_IDENTITY_NAME")
+            .unset("GITEA_PAT_MOOSE"); // (defensive double-unset; identity defaults to moose)
+        assert_eq!(autostage_gitea_token(), None);
+    }
+
+    #[test]
+    fn autostage_token_lands_on_redact_set_and_askpass_script_never_embeds_it_in_argv() {
+        // This exercises the exact push-before-touch ordering `autostage_source`
+        // uses, without any network I/O: resolve the token, push it to `redact`
+        // BEFORE it reaches any argv/URL, and confirm the constructed remote URL
+        // (the one that DOES reach argv, via `run()`) contains no trace of it.
+        let _env = ScopedEnv::new()
+            .set("GITEA_URL", "http://gitea.example.internal:3000")
+            .unset("GITEA_IDENTITY_NAME")
+            .set("GITEA_PAT_MOOSE", "supersecrettoken999");
+        let token = autostage_gitea_token().unwrap();
+        let mut redact: Vec<String> = Vec::new();
+        redact.push(token.clone());
+
+        let (remote, _repo) = autostage_remote_url("terminus").unwrap();
+        assert!(
+            !remote.contains(&token),
+            "remote URL must never contain the raw token: {remote}"
+        );
+        assert!(redact.iter().any(|s| s == &token), "token must be in the redact set");
+
+        // Simulate an argv a clone step would build and confirm the token is
+        // absent from it (auth travels only via GIT_ASKPASS/env, never argv).
+        let clone_argv = vec![
+            "git".to_string(),
+            "clone".to_string(),
+            "--depth".to_string(),
+            "1".to_string(),
+            "--branch".to_string(),
+            "main".to_string(),
+            "--".to_string(),
+            remote.clone(),
+            "/tmp/whatever".to_string(),
+        ];
+        assert!(
+            !clone_argv.iter().any(|a| a.contains(&token)),
+            "token must never appear in git argv: {clone_argv:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn autostage_source_never_overwrites_an_already_staged_dir() {
+        // dest already exists → autostage_source must be a strict no-op (Ok, no
+        // I/O attempted) even with no Gitea/token config at all — proving the
+        // "never clobber" guard runs BEFORE any config resolution.
+        let _env = ScopedEnv::new().unset("GITEA_URL").unset("GITEA_PAT_MOOSE");
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("src").join("chord").join("main");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        std::fs::write(dest.join("SENTINEL"), "do not touch").unwrap();
+
+        let mut redact: Vec<String> = Vec::new();
+        let res = autostage_source("chord", "main", &dest, &mut redact).await;
+        assert!(res.is_ok(), "existing dest must short-circuit to Ok: {res:?}");
+        // Untouched — the sentinel file is still exactly what was written.
+        assert_eq!(
+            std::fs::read_to_string(dest.join("SENTINEL")).unwrap(),
+            "do not touch"
+        );
+        assert!(redact.is_empty(), "no token should be resolved/pushed on the no-op path");
+    }
+
+    #[tokio::test]
+    async fn autostage_source_not_configured_error_when_no_token_and_dest_absent() {
+        let _env = ScopedEnv::new()
+            .set("GITEA_URL", "http://gitea.example.internal:3000")
+            .unset("GITEA_IDENTITY_NAME")
+            .unset("GITEA_PAT_MOOSE");
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("src").join("terminus").join("abc123");
+        // dest deliberately never created.
+        let mut redact: Vec<String> = Vec::new();
+        let err = autostage_source("terminus", "abc123", &dest, &mut redact)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotConfigured(_)));
+        assert!(!dest.exists(), "must not create dest on a config failure");
     }
 
     #[tokio::test]

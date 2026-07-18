@@ -88,7 +88,7 @@ pub use prompt::{build_docs_prompt, build_prompt, parse_findings, parse_verdict,
 pub use consistency::{ConsistencyFinding, ConsistencyRun};
 
 const ALLOWED_PROVIDERS: &[&str] =
-    &["opus", "codex", "agy", "nemotron", "qwen_coder", "free", "claude-fable-5", "gpt56"];
+    &["opus", "codex", "agy", "nemotron", "qwen_coder", "free", "claude-fable-5", "gpt56", "diffusion"];
 /// Routine review panel cap (per one `review_run` call).
 const MAX_PROVIDERS: usize = 5;
 /// The Epic capstone runs the widest possible panel once per build, so it may
@@ -784,6 +784,12 @@ async fn dispatch_provider_raw(
         // with 429 failover (see free_pool). Used as the tail of a 3-5 provider
         // panel, after the sub/OAuth providers.
         cfg.dispatch_free_pool(prompt_text).await
+    } else if provider == "diffusion" {
+        // TERM-DIFF-01: LOCAL, offline, zero-cost lens -- routed to Chord's
+        // DiffusionGemma serve, not OpenRouter/daemon, so it gets its own arm
+        // ahead of the `openrouter_model_for` check rather than being folded
+        // into that table.
+        cfg.dispatch_diffusion(prompt_text).await
     } else if let Some(model) = dispatch::openrouter_model_for(provider) {
         // Credit guard: refuse a PAID model (e.g. gpt56 = gpt-5.6-luna) when the
         // OpenRouter balance is below the floor, so a paid lens can never bottom
@@ -879,7 +885,9 @@ entire codebase against the contracts and emits findings — ADVISORY (never gat
 merge), and a COMPLETED epic audit drives the KG refresh + doc engine (docgen) at \
 its end regardless of findings. 'providers' (1-5) picks from \
 opus, codex, agy (CLI-backed via review-daemon), nemotron, qwen_coder (OpenRouter, \
-frontier-class free-tier models). 'criteria' is the acceptance criteria text; \
+frontier-class free-tier models), diffusion (LOCAL, offline, zero-cost -- routed \
+through Chord's DiffusionGemma model, no external API/credits involved). \
+'criteria' is the acceptance criteria text; \
 'context' is a free-form JSON object (diff/files/description). Providers are \
 dispatched concurrently; a single provider's failure degrades that entry rather \
 than failing the whole call."
@@ -1267,8 +1275,11 @@ impl RustTool for OpenRouterCredits {
 /// The providers `review_provider_status` reports on -- every provider name
 /// `review_run` itself accepts EXCEPT the two capstone-only lenses
 /// (`claude-fable-5`, `gpt56`), which aren't part of the routine
-/// panel/capacity-gate story this tool exists for.
-const STATUS_PROVIDERS: &[&str] = &["opus", "codex", "agy", "free", "nemotron", "qwen_coder"];
+/// panel/capacity-gate story this tool exists for. `diffusion` (local,
+/// zero-cost, Chord-routed) IS part of the routine panel story, so it's
+/// included here like the other non-capstone-only providers.
+const STATUS_PROVIDERS: &[&str] =
+    &["opus", "codex", "agy", "free", "nemotron", "qwen_coder", "diffusion"];
 
 /// `review_provider_status` — REVCAP-01 PART A: report the reviewer-provider
 /// capacity registry's current state per provider (cached, zero extra

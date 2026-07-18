@@ -35,6 +35,7 @@ mod context;
 pub mod discovery;
 pub mod gpu_authority;
 pub mod infer;
+pub mod jobs;
 pub mod lifecycle;
 pub mod newcats;
 mod runner;
@@ -468,21 +469,22 @@ fn parse_suites(args: &Value, model_name: &str) -> Vec<String> {
 ///   - "coder"                  → [context, code]
 ///   - "gpt-oss"                → [context, agent]
 ///   - "qwen3:8b" / "harness"   → [context, code, agent]
-///   - "diffusiongemma"/"dgem"  → [context, code]  (note: non-Ollama daemon —
-///                                the Ollama suites can't load it; callers skip
-///                                it in the Ollama fleet)
+///   - "diffusiongemma"/"dgem"  → [diffusion]  (MINT-DIFF-01: a non-Ollama
+///                                daemon model — the Ollama-based suites
+///                                can't load it, so its default is the
+///                                diffusion suite, not `context`/`code`)
 ///   - default                  → [context]
 /// Pure.
 pub fn default_suites_for(model_name: &str) -> Vec<String> {
     let n = model_name.to_lowercase();
-    let v = if n.contains("coder") {
+    let v = if n.contains("diffusiongemma") || n.contains("dgem") {
+        vec!["diffusion"]
+    } else if n.contains("coder") {
         vec!["context", "code"]
     } else if n.contains("gpt-oss") {
         vec!["context", "agent"]
     } else if n.contains("qwen3:8b") || n.contains("harness") {
         vec!["context", "code", "agent"]
-    } else if n.contains("diffusiongemma") || n.contains("dgem") {
-        vec!["context", "code"]
     } else {
         vec!["context"]
     };
@@ -551,9 +553,12 @@ impl RustTool for ModelIntake {
          'context' (graduated context stress: throughput, TTFT, planted-fact recall, VRAM, OOM), \
          'code' (per-language code generation against the intake corpus → language whitelist), \
          'agent' (tool selection, multi-step, instruction following, hallucination, personality). \
-         If 'suites' is omitted it is inferred from the model name (coder→context+code, \
-         gpt-oss→context+agent, qwen3:8b/harness→all three, default→context). DiffusionGemma/dgem \
-         is a non-Ollama daemon model and is skipped by these Ollama-based suites."
+         'diffusion' (MINT-DIFF-01: DiffusionGemma/dgem use-case QUALITY + PERFORMANCE probe, run \
+         over the dgem daemon, not Ollama). If 'suites' is omitted it is inferred from the model \
+         name (coder→context+code, gpt-oss→context+agent, qwen3:8b/harness→all three, \
+         diffusiongemma/dgem→diffusion, default→context). DiffusionGemma/dgem is a non-Ollama \
+         daemon model: the context/code/agent suites cannot load it (skipped), but 'diffusion' runs \
+         via its own daemon path."
     }
 
     fn parameters(&self) -> Value {
@@ -563,8 +568,8 @@ impl RustTool for ModelIntake {
                 "model_name": { "type": "string", "description": "Ollama model name, e.g. 'gpt-oss:20b'" },
                 "suites": {
                     "type": "array",
-                    "items": { "type": "string", "enum": ["context", "code", "agent"] },
-                    "description": "Which suites to run. Default: inferred from the model name (per-model purpose routing)."
+                    "items": { "type": "string", "enum": ["context", "code", "agent", "diffusion"] },
+                    "description": "Which suites to run. Default: inferred from the model name (per-model purpose routing). 'diffusion' profiles a non-Ollama daemon model (DiffusionGemma/dgem) via its own daemon path — the other three suites don't apply to it."
                 },
                 "tiers": {
                     "type": "array",
@@ -621,12 +626,34 @@ impl RustTool for ModelIntake {
         out.push_str(&format!("Suites requested: {}\n\n", suites.join(", ")));
 
         // Daemon-model guard: DiffusionGemma/dgem can't be loaded by the
-        // Ollama-based suites. Note it and run nothing.
+        // Ollama-based suites (context/code/agent). MINT-DIFF-01: the guard is
+        // now RELAXED for the "diffusion" suite specifically — a daemon model
+        // requesting "diffusion" runs that suite via its own daemon path below;
+        // any Ollama-based suites also requested alongside it are still not
+        // applicable and are skipped with a note, never silently dropped.
         if is_non_ollama_daemon(model_name) {
+            if suites.iter().any(|s| s == "diffusion") {
+                let res = runner::run_diffusion_suite(model_name).await?;
+                out.push_str("=== Diffusion suite ===\n");
+                out.push_str(&format!(
+                    "use cases run: {}\navg use_case_success: {:.2}\navg time_to_output_ms: {:.0}\n",
+                    res.use_cases_run, res.avg_use_case_success, res.avg_time_to_output_ms,
+                ));
+                for line in &res.per_use_case {
+                    out.push_str(&format!("  {line}\n"));
+                }
+                if suites.iter().any(|s| s != "diffusion") {
+                    out.push_str(
+                        "Note: Ollama-based suites (context/code/agent) are not applicable to this \
+                         non-Ollama daemon model and were skipped.\n",
+                    );
+                }
+                return Ok(out);
+            }
             out.push_str(
                 "Note: this is a non-Ollama daemon model (DiffusionGemma/dgem). \
-                 The Ollama-based intake suites cannot load it — skipped. Profile it \
-                 via its own daemon harness.\n",
+                 The Ollama-based intake suites cannot load it — skipped. Request the \
+                 'diffusion' suite to profile it via its own daemon harness.\n",
             );
             return Ok(out);
         }
@@ -995,6 +1022,123 @@ pub fn format_compare(metric: &str, rows: &[(String, Option<f64>)]) -> String {
 /// to run when nobody is talking to Lumina; the agent is offline during it.
 pub struct ModelIntakeFleet;
 
+/// The actual fleet sweep, shared by the synchronous and async `model_intake_fleet`
+/// paths. `job_id` is `Some` for the async path, so per-model progress is mirrored
+/// into the [`jobs`] registry as the sweep runs; the synchronous path passes `None`
+/// and pays no registry overhead beyond a no-op closure call per model.
+///
+/// Extracted from the old inline `execute` body so it can run either inline
+/// (blocking, `async=false`, current behavior) or inside a `tokio::spawn`ed
+/// background task (`async=true`) without duplicating the sweep logic.
+async fn run_fleet_sweep(args: &Value, job_id: Option<&str>) -> Result<String, ToolError> {
+    let tiers = parse_tiers(args);
+    // Explicit model list, or auto-enumerate the catalog.
+    let mut models: Vec<String> = args
+        .get("models")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    if models.is_empty() {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| ToolError::Http(e.to_string()))?;
+        models = runner::list_chat_models(&client).await;
+    }
+    if models.is_empty() {
+        return Err(ToolError::NotConfigured("no models to profile (catalog empty)".into()));
+    }
+
+    // Per-model suite override map.
+    let overrides = args.get("model_suites").cloned().unwrap_or(Value::Null);
+
+    let resolve_suites = move |m: &str| -> Vec<String> {
+        if let Some(arr) = overrides.get(m).and_then(|v| v.as_array()) {
+            let v: Vec<String> = arr
+                .iter()
+                .filter_map(|x| x.as_str().map(|s| s.trim().to_lowercase()))
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !v.is_empty() {
+                return v;
+            }
+        }
+        default_suites_for(m)
+    };
+
+    let results = runner::run_fleet_suites(
+        &models,
+        &tiers,
+        resolve_suites,
+        |m: &str| code_languages_for(m),
+        |m: &str| is_non_ollama_daemon(m),
+        |model, langs, pid| {
+            Box::pin(async move {
+                code::run_code_suite(&model, &langs, pid)
+                    .await
+                    .map(|r| format!("{} cases, {} approved", r.cases_run, r.approved.len()))
+            })
+        },
+        |model, pid| {
+            Box::pin(async move {
+                agent::run_agent_suite(&model, pid, None)
+                    .await
+                    .map(|r| format!("{} scenarios, role={}", r.scenarios_run, r.aggregate.recommended_role))
+            })
+        },
+        |done, total, model, suites| {
+            if let Some(jid) = job_id {
+                let m = if model.is_empty() { None } else { Some(model) };
+                let s = if suites.is_empty() { None } else { Some(suites) };
+                jobs::update_progress(jid, done, total, m, s);
+            }
+        },
+    )
+    .await;
+
+    let mut out = format!(
+        "Fleet intake complete: {} model(s), tiers {:?}\n\n",
+        results.len(),
+        tiers
+    );
+    for r in &results {
+        let mark = if r.skipped { "⏭" } else { "✅" };
+        out.push_str(&format!("{} {} [{}]: {}\n", mark, r.model, r.suites.join("+"), r.summary));
+    }
+    out.push_str("\nDaily driver restored. Results stored in Postgres (model_intake_compare / _status).\n");
+
+    // The Model Fleet Catalog is DERIVED and, unlike the CLI MINT harness, the
+    // MCP fleet path did not historically refresh it — so an MCP-driven sweep
+    // left `model_fleet_catalog` stale. Refresh best-effort here (same posture
+    // as `MintHarness::refresh_catalog_best_effort`): a DB hiccup / un-migrated
+    // host is LOGGED and swallowed, never turning an otherwise-successful sweep
+    // into a failure (the catalog is fully re-derivable and also reachable via
+    // the `model_fleet_catalog_refresh` tool).
+    match storage::get_pool().await {
+        Ok(pool) => {
+            // MINT-CODE-AGG: recompute this epoch's `code_run_aggregates`
+            // BEFORE refreshing the catalog — the catalog's coder cells read
+            // the derived aggregate TABLE, not the raw `code_profile_runs`, so
+            // skipping this leaves coder coverage `not_run` despite real runs.
+            match crate::intake::aggregate::recompute_and_persist_current_epoch(&pool).await {
+                Ok(n) => out.push_str(&format!("Code-run aggregates refreshed: {n} cell(s).\n")),
+                Err(e) => out.push_str(&format!(
+                    "(code-run aggregate refresh skipped — recomputes next run: {e})\n"
+                )),
+            }
+            match catalog::refresh_fleet_catalog(&pool).await {
+                Ok(n) => out.push_str(&format!("Fleet catalog refreshed: {n} model card(s).\n")),
+                Err(e) => out.push_str(&format!(
+                    "(fleet catalog refresh skipped — derived, recomputes next run: {e})\n"
+                )),
+            }
+        }
+        Err(e) => out.push_str(&format!("(fleet catalog refresh skipped — no DB pool: {e})\n")),
+    }
+
+    Ok(out)
+}
+
 #[async_trait]
 impl RustTool for ModelIntakeFleet {
     fn name(&self) -> &str { "model_intake_fleet" }
@@ -1004,7 +1148,11 @@ impl RustTool for ModelIntakeFleet {
          DiffusionGemma/dgem is skipped (non-Ollama daemon). Loads, profiles, and unloads each \
          model in turn, restoring the daily-driver only at the very end — the agent is unavailable \
          during the run. Optional 'models' (default: all Ollama chat models), 'tiers', and \
-         'model_suites' (explicit per-model override, e.g. {\"qwen3:8b\":[\"context\",\"agent\"]})."
+         'model_suites' (explicit per-model override, e.g. {\"qwen3:8b\":[\"context\",\"agent\"]}). \
+         BLD-ASYNC: pass 'async'=true to avoid blocking the whole sweep behind the loopback MCP's \
+         900s forward timeout — the sweep runs in the background and this call returns a job_id \
+         immediately; poll it with `model_intake_job_status`. Default 'async'=false keeps the prior \
+         blocking behavior (fine for scoped/short runs that fit under 900s)."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -1015,111 +1163,137 @@ impl RustTool for ModelIntakeFleet {
                 "tiers": { "type": "array", "items": {"type": "integer"},
                     "description": "Context-token tiers (default full 2K..128K ladder)." },
                 "model_suites": { "type": "object",
-                    "description": "Explicit per-model suite override: {model: [suites]}. Overrides purpose inference for that model." }
+                    "description": "Explicit per-model suite override: {model: [suites]}. Overrides purpose inference for that model." },
+                "async": { "type": "boolean",
+                    "description": "Run the sweep as a non-blocking background job (default false = blocking, current behavior). When true, returns a job_id immediately — poll with model_intake_job_status." }
             }
         })
     }
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        let tiers = parse_tiers(&args);
-        // Explicit model list, or auto-enumerate the catalog.
-        let mut models: Vec<String> = args
-            .get("models")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-            .unwrap_or_default();
-        if models.is_empty() {
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .map_err(|e| ToolError::Http(e.to_string()))?;
-            models = runner::list_chat_models(&client).await;
-        }
-        if models.is_empty() {
-            return Err(ToolError::NotConfigured("no models to profile (catalog empty)".into()));
+        let is_async = args.get("async").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        if !is_async {
+            return run_fleet_sweep(&args, None).await;
         }
 
-        // Per-model suite override map.
-        let overrides = args.get("model_suites").cloned().unwrap_or(Value::Null);
-
-        let resolve_suites = move |m: &str| -> Vec<String> {
-            if let Some(arr) = overrides.get(m).and_then(|v| v.as_array()) {
-                let v: Vec<String> = arr
-                    .iter()
-                    .filter_map(|x| x.as_str().map(|s| s.trim().to_lowercase()))
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if !v.is_empty() {
-                    return v;
-                }
+        // Async path: register the job, hand its id back immediately, and let
+        // the sweep run to completion in the background — this is exactly the
+        // shape BLD-ASYNC exists for: the sweep can run well past the loopback
+        // MCP's 900s forward timeout without the CALL itself timing out.
+        //
+        // Concurrency guard (opus review, MEDIUM): only ONE fleet sweep may be
+        // in flight at a time — two overlapping sweeps would contend for the
+        // single GPU. `try_start_job` atomically claims the slot; if a sweep is
+        // already queued/running it returns that job's id and we reject with a
+        // clear "already running, poll <id>" message rather than spawning a
+        // second, GPU-contending sweep.
+        let job_id = match jobs::try_start_job() {
+            Ok(id) => id,
+            Err(active_id) => {
+                return Ok(format!(
+                    "A fleet intake sweep is already in progress (job {active_id}). Only one runs \
+                     at a time (they would contend for the GPU). Poll `model_intake_job_status` \
+                     with job_id=\"{active_id}\", or wait for it to finish before starting another."
+                ));
             }
-            default_suites_for(m)
         };
-
-        let results = runner::run_fleet_suites(
-            &models,
-            &tiers,
-            resolve_suites,
-            |m: &str| code_languages_for(m),
-            |m: &str| is_non_ollama_daemon(m),
-            |model, langs, pid| {
-                Box::pin(async move {
-                    code::run_code_suite(&model, &langs, pid)
-                        .await
-                        .map(|r| format!("{} cases, {} approved", r.cases_run, r.approved.len()))
-                })
-            },
-            |model, pid| {
-                Box::pin(async move {
-                    agent::run_agent_suite(&model, pid, None)
-                        .await
-                        .map(|r| format!("{} scenarios, role={}", r.scenarios_run, r.aggregate.recommended_role))
-                })
-            },
-        )
-        .await;
-
-        let mut out = format!(
-            "Fleet intake complete: {} model(s), tiers {:?}\n\n",
-            results.len(),
-            tiers
-        );
-        for r in &results {
-            let mark = if r.skipped { "⏭" } else { "✅" };
-            out.push_str(&format!("{} {} [{}]: {}\n", mark, r.model, r.suites.join("+"), r.summary));
-        }
-        out.push_str("\nDaily driver restored. Results stored in Postgres (model_intake_compare / _status).\n");
-
-        // The Model Fleet Catalog is DERIVED and, unlike the CLI MINT harness, the
-        // MCP fleet path did not historically refresh it — so an MCP-driven sweep
-        // left `model_fleet_catalog` stale. Refresh best-effort here (same posture
-        // as `MintHarness::refresh_catalog_best_effort`): a DB hiccup / un-migrated
-        // host is LOGGED and swallowed, never turning an otherwise-successful sweep
-        // into a failure (the catalog is fully re-derivable and also reachable via
-        // the `model_fleet_catalog_refresh` tool).
-        match storage::get_pool().await {
-            Ok(pool) => {
-                // MINT-CODE-AGG: recompute this epoch's `code_run_aggregates`
-                // BEFORE refreshing the catalog — the catalog's coder cells read
-                // the derived aggregate TABLE, not the raw `code_profile_runs`, so
-                // skipping this leaves coder coverage `not_run` despite real runs.
-                match crate::intake::aggregate::recompute_and_persist_current_epoch(&pool).await {
-                    Ok(n) => out.push_str(&format!("Code-run aggregates refreshed: {n} cell(s).\n")),
-                    Err(e) => out.push_str(&format!(
-                        "(code-run aggregate refresh skipped — recomputes next run: {e})\n"
-                    )),
-                }
-                match catalog::refresh_fleet_catalog(&pool).await {
-                    Ok(n) => out.push_str(&format!("Fleet catalog refreshed: {n} model card(s).\n")),
-                    Err(e) => out.push_str(&format!(
-                        "(fleet catalog refresh skipped — derived, recomputes next run: {e})\n"
-                    )),
-                }
+        let spawned_id = job_id.clone();
+        let spawned_args = args.clone();
+        tokio::spawn(async move {
+            jobs::mark_running(&spawned_id);
+            match run_fleet_sweep(&spawned_args, Some(&spawned_id)).await {
+                Ok(summary) => jobs::mark_completed(&spawned_id, summary),
+                Err(e) => jobs::mark_failed(&spawned_id, e.to_string()),
             }
-            Err(e) => out.push_str(&format!("(fleet catalog refresh skipped — no DB pool: {e})\n")),
+        });
+
+        Ok(format!(
+            "Started async fleet intake job {job_id} (running in the background — this call did \
+             NOT block on the sweep). Poll `model_intake_job_status` with job_id=\"{job_id}\" for \
+             progress and the final summary."
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// model_intake_job_status (BLD-ASYNC poll surface)
+// ---------------------------------------------------------------------------
+
+/// Poll surface for an async `model_intake_fleet` run. Named `_job_status`
+/// (not `_status`) to avoid colliding with the pre-existing `model_intake_status`
+/// tool, which looks up a model's stored PROFILE (a different concept — a
+/// per-model DB row, not a job's in-flight run state).
+pub struct ModelIntakeJobStatus;
+
+#[async_trait]
+impl RustTool for ModelIntakeJobStatus {
+    fn name(&self) -> &str { "model_intake_job_status" }
+
+    fn description(&self) -> &str {
+        "Poll an async model_intake_fleet job (BLD-ASYNC). Pass 'job_id' to get that job's status \
+         (queued/running/completed/failed), per-model progress, and — once completed/failed — the \
+         final summary or error. Omit 'job_id' to list recent jobs (most recent first)."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "job_id": { "type": "string", "description": "Job id returned by model_intake_fleet(async=true). Omit to list recent jobs." },
+                "limit": { "type": "integer", "description": "Max jobs to list when 'job_id' is omitted (default 10)." }
+            }
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        if let Some(job_id) = args.get("job_id").and_then(|v| v.as_str()) {
+            let job_id = job_id.trim();
+            if job_id.is_empty() {
+                return Err(ToolError::InvalidArgument("'job_id' must not be empty".into()));
+            }
+            return match jobs::get_job(job_id) {
+                Some(s) => Ok(format_job_state(&s)),
+                None => Ok(format!("job {job_id}: not found (unknown id, or the process restarted since it ran)")),
+            };
         }
 
+        let limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize).unwrap_or(10);
+        let recent = jobs::list_jobs(limit);
+        if recent.is_empty() {
+            return Ok("No intake jobs recorded (nothing has run async since this process started).".to_string());
+        }
+        let mut out = format!("Recent intake jobs ({}):\n\n", recent.len());
+        for s in &recent {
+            out.push_str(&format_job_state(&s));
+            out.push('\n');
+        }
         Ok(out)
     }
+}
+
+/// Render one [`jobs::JobState`] as a readable text block.
+fn format_job_state(s: &jobs::JobState) -> String {
+    let mut out = format!(
+        "job {}: {} | progress {}/{}",
+        s.job_id,
+        s.status.as_str(),
+        s.progress.models_done,
+        s.progress.models_total,
+    );
+    if let Some(m) = &s.progress.current_model {
+        out.push_str(&format!(" | current: {m} [{}]", s.progress.current_suites.as_deref().unwrap_or("")));
+    }
+    out.push_str(&format!(" | started {}\n", s.started_at.to_rfc3339()));
+    if let Some(summary) = &s.summary {
+        out.push_str(summary);
+        if !summary.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if let Some(err) = &s.error {
+        out.push_str(&format!("error: {err}\n"));
+    }
+    out
 }
 
 pub fn register(registry: &mut ToolRegistry) {
@@ -1127,6 +1301,8 @@ pub fn register(registry: &mut ToolRegistry) {
     registry.register_or_replace(Box::new(ModelIntakeStatus));
     registry.register_or_replace(Box::new(ModelIntakeCompare));
     registry.register_or_replace(Box::new(ModelIntakeFleet));
+    // BLD-ASYNC: poll surface for an async model_intake_fleet job.
+    registry.register_or_replace(Box::new(ModelIntakeJobStatus));
     // MINT2-08: the read-only `model_fleet_catalog` core tool (its own register()
     // in `catalog.rs`, mirroring how plane/gitea keep registration next to the
     // tool). Core registry only — no personal registry.
@@ -1177,7 +1353,8 @@ mod tests {
         assert_eq!(default_suites_for("qwen3-coder:30b"), vec!["context", "code"]);
         assert_eq!(default_suites_for("gpt-oss:20b"), vec!["context", "agent"]);
         assert_eq!(default_suites_for("harness-1"), vec!["context", "code", "agent"]);
-        assert_eq!(default_suites_for("diffusiongemma-26b-a4b"), vec!["context", "code"]);
+        assert_eq!(default_suites_for("diffusiongemma-26b-a4b"), vec!["diffusion"]);
+        assert_eq!(default_suites_for("dgem-secondary"), vec!["diffusion"]);
         assert_eq!(default_suites_for("llama3:8b"), vec!["context"]);
     }
 
@@ -1441,8 +1618,147 @@ mod tests {
         assert!(reg.contains("model_intake_status"));
         assert!(reg.contains("model_intake_compare"));
         assert!(reg.contains("model_intake_fleet"));
+        // BLD-ASYNC: the async poll surface registers alongside the intake tools.
+        assert!(reg.contains("model_intake_job_status"));
         // MINT2-08: the read-only fleet-catalog tool registers on the same core
         // path as the rest of the intake module (→ register_all → Chord).
         assert!(reg.contains("model_fleet_catalog"));
+    }
+
+    // ---- BLD-ASYNC: async model_intake_fleet + model_intake_job_status ----
+
+    /// Drain (complete) every active job so a slot-sensitive async test starts
+    /// from a free sweep slot despite the shared global registry.
+    fn drain_active_jobs() {
+        for j in jobs::list_jobs(usize::MAX) {
+            if matches!(j.status, jobs::JobStatus::Queued | jobs::JobStatus::Running) {
+                jobs::mark_completed(&j.job_id, "test-drain".into());
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn intake_fleet_async_returns_job_id_without_blocking_on_the_sweep() {
+        // A synchronous sweep needs a live Ollama host + Postgres and can run for
+        // minutes — neither is available in a unit test. `async=true` must return
+        // a job_id immediately (the whole point of BLD-ASYNC: the CALL itself
+        // never blocks on the sweep), well under any reasonable test timeout,
+        // even though the spawned background task will itself fail fast (no
+        // reachable host) rather than actually profiling anything.
+        // Free the single sweep slot first (the concurrency guard would otherwise
+        // reject this submit if a parallel test held it).
+        drain_active_jobs();
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ModelIntakeFleet.execute(json!({
+                "async": true,
+                "models": ["unit-test-placeholder-model"]
+            })),
+        )
+        .await
+        .expect("execute(async=true) must return well within 5s — it must not block on the sweep");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+
+        let out = result.expect("async=true path returns Ok with a job_id, never runs the sweep inline");
+        assert!(out.contains("Started async fleet intake job"));
+        assert!(out.contains("model_intake_job_status"));
+
+        // Extract the job id backed into the registry and confirm it is actually
+        // tracked (queued/running — the background task may or may not have
+        // gotten its first poll in yet, but the id must be a live job).
+        let job_id = out
+            .split("job ")
+            .nth(1)
+            .and_then(|s| s.split(' ').next())
+            .expect("response embeds the job id");
+        assert!(jobs::get_job(job_id).is_some(), "job id from the response must be a real, tracked job");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn intake_fleet_async_rejects_a_second_concurrent_sweep() {
+        // Concurrency guard (opus review): with one fleet sweep already in
+        // flight, a second async submit must be REJECTED (clear message naming
+        // the active job) rather than spawn a second, GPU-contending sweep.
+        drain_active_jobs();
+        // Claim + hold the single slot to simulate an in-flight sweep.
+        let held = {
+            let mut got = None;
+            for _ in 0..100 {
+                match jobs::try_start_job() {
+                    Ok(id) => {
+                        got = Some(id);
+                        break;
+                    }
+                    Err(a) => jobs::mark_completed(&a, "test-drain".into()),
+                }
+            }
+            got.expect("claimed the sweep slot")
+        };
+        jobs::mark_running(&held);
+
+        let out = ModelIntakeFleet
+            .execute(json!({"async": true, "models": ["x"]}))
+            .await
+            .expect("a rejected concurrent submit is a normal Ok(message), not an error");
+        assert!(out.contains("already in progress"), "response signals the guard rejected it");
+        assert!(out.contains(&held), "response names the in-flight job to poll");
+        // Must NOT have spawned a second job.
+        assert!(!out.contains("Started async fleet intake job"));
+
+        jobs::mark_completed(&held, "cleanup".into());
+    }
+
+    #[tokio::test]
+    async fn intake_fleet_sync_default_does_not_create_a_job() {
+        // async defaults to false — must keep exactly the prior blocking-path
+        // behavior (empty catalog + no reachable Ollama → NotConfigured) and
+        // must never mention a job id, since it never spawns one. (Doesn't
+        // assert on the global job registry's SIZE — this suite runs tests in
+        // parallel and other tests legitimately create jobs concurrently, so a
+        // before/after count would be racy; the job-id-shaped response text is
+        // the real, non-racy signature of "did this path go async".)
+        let r = ModelIntakeFleet.execute(json!({"models": []})).await;
+        // With models=[] and (in this sandboxed test env) no reachable Ollama to
+        // auto-enumerate from, this resolves to the pre-existing "no models to
+        // profile" error path — proving the sync path still runs INLINE (it
+        // returns an error synchronously) rather than spawning a job.
+        match r {
+            Err(e) => assert!(!e.to_string().contains("Started async fleet intake job")),
+            Ok(out) => assert!(!out.contains("Started async fleet intake job")),
+        }
+    }
+
+    #[test]
+    fn job_status_tool_lists_recent_jobs_and_looks_up_by_id() {
+        let id = jobs::create_job();
+        jobs::mark_running(&id);
+        jobs::update_progress(&id, 1, 4, Some("gpt-oss:20b"), Some("context"));
+        jobs::mark_completed(&id, "Fleet intake complete: 4 model(s)".to_string());
+
+        let s = jobs::get_job(&id).expect("job present");
+        let rendered = format_job_state(&s);
+        assert!(rendered.contains(&id));
+        assert!(rendered.contains("completed"));
+        assert!(rendered.contains("1/4"));
+        assert!(rendered.contains("gpt-oss:20b"));
+        assert!(rendered.contains("Fleet intake complete"));
+    }
+
+    #[tokio::test]
+    async fn job_status_tool_unknown_id_reports_not_found_not_error() {
+        let out = ModelIntakeJobStatus
+            .execute(json!({"job_id": "totally-unknown-id"}))
+            .await
+            .expect("unknown id is a normal Ok(\"not found\") response, not an error");
+        assert!(out.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn job_status_tool_rejects_empty_job_id() {
+        let r = ModelIntakeJobStatus.execute(json!({"job_id": "   "})).await;
+        assert!(matches!(r, Err(ToolError::InvalidArgument(_))));
     }
 }

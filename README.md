@@ -1226,6 +1226,22 @@ is caught, logged, and reported rather than propagated — it never turns an
 No direct doc-generation HTTP/Chord call is made from `review_run` — the only
 doc path is the existing `docgen_run` tool (S9 single door).
 
+### Doc engine placement — writing the artifacts to disk (DLAND-01)
+
+Every doc-engine renderer (`readme_layers::render_layered_readme`,
+`render::docs_tree::build_docs_tree`, `render::render_all`,
+`trigger::run_docgen_trigger`) is pure: it *returns* the rendered concise
+README and `docs/` tree and never touches a filesystem, git, or network.
+`crate::tools::docgen::place::place_docs(target_root, landing, docs_tree)` is
+the one placement step that actually writes those artifacts into a real
+working tree — `README.md` plus every `docs/**` file, at their exact
+repo-relative paths. Writes are atomic (tempfile + `rename`) and idempotent
+(a file whose on-disk content already matches is left untouched, so a
+no-op run produces an empty diff); any path that is absolute or escapes
+`target_root` via `..` is refused and reported rather than written. It
+touches no git and no network — placement only, same as every other step in
+this engine keeps those concerns separate.
+
 ### Atlas vector store (KGEMB-01)
 
 Phase 1 of KG-as-behavioral-correction adds semantic (meaning-based) retrieval

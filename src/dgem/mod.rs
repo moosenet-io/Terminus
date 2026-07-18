@@ -277,6 +277,23 @@ pub(crate) fn estimate_tokens(text: &str) -> usize {
     text.chars().count() / 4
 }
 
+/// MINT-DIFF-01: thin crate-visible entry point onto the daemon's `/generate`,
+/// for the diffusion intake suite (`intake::infer::diffusion_infer`) to reuse
+/// the SAME client/config/VRAM-coordination/error-mapping logic every other
+/// dgem tool goes through, rather than opening a second HTTP client against
+/// this daemon. Builds config from env on every call (cheap: a few env reads,
+/// no I/O) so the intake harness doesn't need to thread a `DgemConfig` through
+/// its own call chain.
+pub(crate) async fn diffusion_generate(
+    system: &str,
+    prompt: &str,
+    max_tokens: u32,
+) -> Result<GenerateResponse, ToolError> {
+    let cfg = DgemConfig::from_env();
+    cfg.check_input_size(&format!("{system}{prompt}"))?;
+    cfg.generate(system, prompt, max_tokens).await
+}
+
 /// Map a reqwest send error into an actionable ToolError, distinguishing "daemon not running"
 /// (connection refused) from other transport failures.
 fn map_connect_err(e: reqwest::Error, base_url: &str) -> ToolError {
