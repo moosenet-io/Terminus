@@ -744,11 +744,20 @@ Respond again, only naming real binaries/tools from ENTRY POINTS."
         if getting_started.trim().is_empty() {
             gaps.push("getting-started.md".to_string());
         }
+        // Only count DISTINCT files actually under `docs/guides/` toward the
+        // one-guide-per-topic requirement — otherwise a wrong path
+        // (`docs/reference/foo.md`) or a duplicate could satisfy the count while
+        // a real guide topic has no page (codex review finding).
+        let distinct_guide_pages: std::collections::HashSet<&std::path::Path> = guides
+            .iter()
+            .map(|(p, _)| p.as_path())
+            .filter(|p| p.starts_with("docs/guides/") && p.extension().map(|e| e == "md").unwrap_or(false))
+            .collect();
         let expected_guides = identity.guide_topics.len();
-        if guides.len() < expected_guides {
+        if distinct_guide_pages.len() < expected_guides {
             gaps.push(format!(
-                "{} of {} guide topic page(s) missing",
-                expected_guides - guides.len(),
+                "{} of {} guide topic page(s) missing under docs/guides/",
+                expected_guides - distinct_guide_pages.len(),
                 expected_guides
             ));
         }
