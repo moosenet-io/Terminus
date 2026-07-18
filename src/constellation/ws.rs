@@ -26,6 +26,14 @@
 //! - **Single-door property preserved**: like `crate::constellation::proxy`,
 //!   this module is the ONLY place in the crate that dials Harmony's event
 //!   socket -- no other module should grow a second ad hoc WS client for it.
+//! - **Reconnect is doubly bounded**: `connect_upstream_with_backoff` bounds
+//!   the retries/backoff of ONE dial attempt; `reconnect_upstream` (used by
+//!   every reconnect call site in `pipe`, symmetrically on both the
+//!   upstream-read AND upstream-write failure paths) additionally caps the
+//!   total number of reconnects across one browser connection's lifetime
+//!   and floors the gap between cycles -- guarding against a fast-closing
+//!   upstream (accept, then immediately close) busy-looping the pipe with
+//!   no effective backoff.
 //!
 //! ## What is deliberately NOT here (v1, per §3.5/CONST-18 scope)
 //! - No fan-in of Chord/Muse events yet (the envelope's `source` field is
@@ -66,6 +74,19 @@ const MAX_FRAME_BYTES: usize = 1024 * 1024; // 1MB
 const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 const RECONNECT_BASE_BACKOFF: Duration = Duration::from_millis(250);
 const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// A SECOND, independent bound on top of [`MAX_RECONNECT_ATTEMPTS`]: the
+/// total number of successful reconnects allowed within the lifetime of
+/// ONE browser connection (`pipe`'s `reconnect_count`). Without this, an
+/// upstream that ACCEPTS the dial and then immediately closes would make
+/// every individual [`connect_upstream_with_backoff`] call succeed on its
+/// very first attempt -- no backoff ever kicks in, and `pipe`'s reconnect
+/// branch would busy-loop the accept-then-close cycle indefinitely (opus
+/// review finding, CONST-18). [`RECONNECT_MIN_CYCLE_GAP`] additionally
+/// floors the time between cycles even while this budget isn't yet
+/// exhausted, so the loop can't spin hot even during its first few cycles.
+const MAX_RECONNECTS_PER_CONNECTION: u32 = 5;
+const RECONNECT_MIN_CYCLE_GAP: Duration = Duration::from_millis(250);
 
 /// Close codes in the IANA-reserved "private use" range (4000-4999) --
 /// distinct, machine-checkable reasons `constellation-web`'s
@@ -188,14 +209,46 @@ async fn connect_upstream_with_backoff(url: &str) -> Option<UpstreamStream> {
     None
 }
 
+/// Attempt a bounded reconnect to the upstream leg, enforcing BOTH bounds:
+/// [`connect_upstream_with_backoff`]'s per-attempt retry/backoff, AND the
+/// per-connection-lifetime cap ([`MAX_RECONNECTS_PER_CONNECTION`] against
+/// `*reconnect_count`) that guards against a fast-closing/flapping upstream
+/// (accept-then-immediately-close) busy-looping `pipe` with no effective
+/// delay between cycles. A successful reconnect always sleeps
+/// [`RECONNECT_MIN_CYCLE_GAP`] before returning -- this floors the time
+/// between cycles even on a dial that succeeds instantly, which is exactly
+/// the busy-loop case (`connect_upstream_with_backoff`'s own backoff never
+/// engages when every attempt succeeds on try 1). Returns `None` once
+/// either bound is exhausted; callers treat that identically to "upstream
+/// unreachable."
+async fn reconnect_upstream(upstream_url: &str, reconnect_count: &mut u32) -> Option<UpstreamStream> {
+    if *reconnect_count >= MAX_RECONNECTS_PER_CONNECTION {
+        tracing::warn!(
+            upstream = %upstream_url,
+            reconnect_count = *reconnect_count,
+            max = MAX_RECONNECTS_PER_CONNECTION,
+            "constellation::ws: exceeded the per-connection reconnect budget -- refusing further reconnects"
+        );
+        return None;
+    }
+    let stream = connect_upstream_with_backoff(upstream_url).await?;
+    *reconnect_count += 1;
+    tokio::time::sleep(RECONNECT_MIN_CYCLE_GAP).await;
+    Some(stream)
+}
+
 /// The bidirectional pipe: client <-> upstream, for the lifetime of one
 /// browser connection. Reconnects the upstream leg (bounded, per
-/// [`connect_upstream_with_backoff`]) if it drops mid-session; gives up and
-/// sends [`CLOSE_CODE_UPSTREAM_LOST`] to the browser only once reconnect
-/// attempts are exhausted.
+/// [`reconnect_upstream`]) if it drops OR fails to accept a forwarded
+/// client frame; gives up and sends [`CLOSE_CODE_UPSTREAM_LOST`] to the
+/// browser only once reconnect attempts are exhausted -- symmetric
+/// handling on both the upstream-read and the upstream-write side (CONST-18
+/// review finding: the write side used to just drop the connection with no
+/// reconnect attempt and no typed close frame).
 async fn pipe(socket: WebSocket, upstream: UpstreamStream, upstream_url: &str) {
     let (mut client_tx, mut client_rx) = socket.split();
     let (mut upstream_tx, mut upstream_rx) = upstream.split();
+    let mut reconnect_count: u32 = 0;
 
     loop {
         tokio::select! {
@@ -210,8 +263,26 @@ async fn pipe(socket: WebSocket, upstream: UpstreamStream, upstream_url: &str) {
                             Some(forwarded) => {
                                 let is_close = matches!(forwarded, UpstreamMessage::Close(_));
                                 if upstream_tx.send(forwarded).await.is_err() {
-                                    tracing::warn!("constellation::ws: failed forwarding client frame upstream");
-                                    break;
+                                    tracing::warn!("constellation::ws: failed forwarding client frame upstream, attempting reconnect");
+                                    match reconnect_upstream(upstream_url, &mut reconnect_count).await {
+                                        Some(reconnected) => {
+                                            let (new_tx, new_rx) = reconnected.split();
+                                            upstream_tx = new_tx;
+                                            upstream_rx = new_rx;
+                                            // The dropped client frame is not replayed (Sink::send
+                                            // already consumed it on the failed attempt) -- the
+                                            // pipe itself survives via the freshly reconnected
+                                            // upstream leg, matching the read-side reconnect's own
+                                            // "the pipe survives, at most one event is lost" contract.
+                                            continue;
+                                        }
+                                        None => {
+                                            let _ = client_tx
+                                                .send(close_message(CLOSE_CODE_UPSTREAM_LOST, "upstream unreachable"))
+                                                .await;
+                                            break;
+                                        }
+                                    }
                                 }
                                 if is_close {
                                     // Client-initiated close -- end the relay; the
@@ -250,7 +321,7 @@ async fn pipe(socket: WebSocket, upstream: UpstreamStream, upstream_url: &str) {
                     Some(Ok(UpstreamMessage::Close(_))) | None => {
                         // Upstream dropped -- bounded reconnect before giving up.
                         tracing::info!(upstream = %upstream_url, "constellation::ws: upstream connection lost, attempting reconnect");
-                        match connect_upstream_with_backoff(upstream_url).await {
+                        match reconnect_upstream(upstream_url, &mut reconnect_count).await {
                             Some(reconnected) => {
                                 let (new_tx, new_rx) = reconnected.split();
                                 upstream_tx = new_tx;
@@ -274,7 +345,7 @@ async fn pipe(socket: WebSocket, upstream: UpstreamStream, upstream_url: &str) {
                     }
                     Some(Err(e)) => {
                         tracing::warn!(upstream = %upstream_url, "constellation::ws: upstream socket error: {e}, attempting reconnect");
-                        match connect_upstream_with_backoff(upstream_url).await {
+                        match reconnect_upstream(upstream_url, &mut reconnect_count).await {
                             Some(reconnected) => {
                                 let (new_tx, new_rx) = reconnected.split();
                                 upstream_tx = new_tx;
@@ -478,5 +549,56 @@ mod tests {
         ));
         assert!(to_upstream_message(Message::Ping(vec![])).is_none());
         assert!(to_upstream_message(Message::Pong(vec![])).is_none());
+    }
+
+    /// The behavioral counterpart to
+    /// `no_upstream_close_frame_carries_the_documented_code` (which only
+    /// unit-tests `close_message`'s construction): this drives an ACTUAL
+    /// authenticated WebSocket upgrade against a real `TcpListener` +
+    /// `axum::serve`, with `CONSTELLATION_HARMONY_WS_URL` unset, and asserts
+    /// the relay accepts the upgrade (auth already passed) and then emits
+    /// the real `CLOSE_CODE_NO_UPSTREAM` typed close frame over the wire --
+    /// exercising `handle_ws` -> `relay` end to end, not just the frame
+    /// constructor (CONST-18 review finding).
+    #[tokio::test]
+    #[serial]
+    async fn unconfigured_upstream_relay_sends_no_upstream_close_over_a_real_socket() {
+        std::env::set_var("TERMINUS_JWT_SIGNING_KEY", "test-signing-key-const18-e2e");
+        std::env::remove_var("CONSTELLATION_HARMONY_WS_URL");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router().into_make_service()).await;
+        });
+
+        let (token, _exp) = crate::pki::enroll::mint_jwt_with_ttl("alice", 300).unwrap();
+        let uri: axum::http::Uri = format!("ws://{addr}/ws").parse().unwrap();
+        let request = tokio_tungstenite::tungstenite::ClientRequestBuilder::new(uri)
+            .with_header("Cookie", format!("constellation_session={token}"));
+
+        let (mut ws_stream, _resp) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio_tungstenite::connect_async(request),
+        )
+        .await
+        .expect("upgrade timed out")
+        .expect("upgrade should succeed -- the session cookie is valid, and the relay accepts \
+                 the upgrade before it ever looks at CONSTELLATION_HARMONY_WS_URL");
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws_stream.next())
+            .await
+            .expect("timed out waiting for the relay's close frame")
+            .expect("stream ended with no message at all")
+            .expect("frame-level error reading the close message");
+
+        match msg {
+            UpstreamMessage::Close(Some(frame)) => {
+                assert_eq!(u16::from(frame.code), CLOSE_CODE_NO_UPSTREAM);
+            }
+            other => panic!("expected the relay's typed no-upstream close frame, got {other:?}"),
+        }
+
+        std::env::remove_var("TERMINUS_JWT_SIGNING_KEY");
     }
 }

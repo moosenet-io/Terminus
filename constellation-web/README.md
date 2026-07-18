@@ -80,6 +80,26 @@ fallback was deliberately dropped, not ported). Vault-referenced secrets (provid
 etc., landing in CONST-08+) must be surfaced as a vault key *name* with a set/rotate
 affordance, never a round-tripped value.
 
+## Real-time relay (`/ws`, CONST-18)
+
+`GET /ws` (`src/constellation/ws.rs` on the Terminus side, not in this package) is a
+session-authenticated, masked WebSocket relay -- the same cookie-JWT check
+`require_session` uses is verified BEFORE the upgrade is ever accepted, so an
+unauthenticated caller gets a `401`, never a half-open socket. Once accepted, it dials
+Harmony's own event socket (`CONSTELLATION_HARMONY_WS_URL`, a Terminus-side env var --
+see `.env.example`) and pipes events to the browser, each wrapped as `{source:'harmony',
+event:...}` and passed through the SAME `mask_response` masking every `/api/*` response
+gets. If `CONSTELLATION_HARMONY_WS_URL` is unset, the relay still accepts the upgrade
+(auth already passed) but immediately sends a typed WebSocket close frame (code `4000`,
+"no upstream configured") and the app falls back to 30s polling -- this is expected,
+degraded-but-functional behavior, not an error to chase down. A typed close of `4001`
+("upstream unreachable") means the relay dialed Harmony's socket and lost/never got it
+after its bounded reconnect budget was exhausted -- same polling fallback applies.
+`ws.connect()` (`src/lib/aggregationClient.ts`) already treats every close uniformly
+(reconnect/backoff, then fall back to polling) -- no client-side branch on the close code
+is required for this item; a future item MAY use the code to distinguish "no backend
+configured" from "backend flapped" in the UI if that becomes useful.
+
 ## Dev / build
 
 ```sh
