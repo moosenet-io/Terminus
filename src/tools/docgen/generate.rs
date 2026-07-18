@@ -726,12 +726,12 @@ Respond again, only naming real binaries/tools from ENTRY POINTS."
 
         let getting_started = blocks
             .iter()
-            .find(|(path, _)| path.to_string_lossy().ends_with("getting-started.md"))
+            .find(|(path, _)| path.as_path() == std::path::Path::new("docs/getting-started.md"))
             .map(|(_, body)| body.clone())
             .unwrap_or_default();
         let guides: Vec<(PathBuf, String)> = blocks
             .into_iter()
-            .filter(|(path, _)| !path.to_string_lossy().ends_with("getting-started.md"))
+            .filter(|(path, _)| path.as_path() != std::path::Path::new("docs/getting-started.md"))
             .collect();
 
         // A non-empty `=== FILE:` response is NOT automatically a success: the
