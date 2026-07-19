@@ -40,6 +40,11 @@ export interface TerminusModuleInfo {
   name: string;
   enabled: boolean;
   version?: string;
+  /** CONST-28: additive — count of registered tool names under this module's
+   *  `{module}_` prefix. Absent only if talking to a pre-CONST-28 backend. */
+  toolCount?: number;
+  /** CONST-28: additive — the module's full, sorted tool names. */
+  tools?: string[];
 }
 
 export interface TerminusConfigSummary {
@@ -121,7 +126,21 @@ async function withMutationResultEvent<T>(
     emitMutationResult({ system, method, path, ok: false, error: e instanceof Error ? e.message : String(e) });
     throw e;
   }
+
 }
+
+// ── CONST-28 compat layer over the CONST-26 activity contract ───────────────
+/** Alias — CONST-28's panels were built against this name; the canonical entry shape is
+ *  CONST-26's [`ActivityEntry`]. */
+export type TerminusActivityEntry = ActivityEntry;
+/** CONST-28: degrade-aware response — `available:false` (never a throw) when the endpoint
+ *  404/501s or the request fails, so ActivityPanel renders a "not live" empty state. A
+ *  superset of [`ActivityFeedResponse`]; CONST-26 consumers keep reading `.entries`. */
+export interface TerminusActivityResponse extends ActivityFeedResponse {
+  available: boolean;
+  detail?: string;
+}
+
 
 /**
  * The single typed entry point for `/api/{harmony,chord,lumina,muse,terminus}/*`.
@@ -139,9 +158,10 @@ export interface AggregationClient {
   };
   terminus: {
     configSummary(): Promise<TerminusConfigSummary>;
-    /** CONST-26: the last `limit` (default server-side cap when omitted) mutating-request
-     *  activity entries — feeds the Overview activity feed / notification bell (§3.3). */
-    activity(limit?: number): Promise<ActivityFeedResponse>;
+    /** CONST-26 contract (`GET /api/terminus/activity?limit=`), CONST-28 degrade semantics:
+     *  never throws — `available:false` signals the endpoint is unreachable/not live, and the
+     *  Overview feed/bell + ActivityPanel each render their own empty/degraded state. */
+    activity(limit?: number): Promise<TerminusActivityResponse>;
   };
   /**
    * Generic escape hatch for panel-specific reads that don't yet have a typed method above.
@@ -242,27 +262,62 @@ const MOCK_HEALTH: HealthStatus[] = [
   { system: 'terminus', available: true, detail: 'mock: reachable' },
 ];
 
-/** CONST-26: canned activity entries so the Overview feed/bell are reviewable with zero
- *  backend — a small, fixed, already-ordered (oldest first, matching the real endpoint's
- *  file-order contract) sample. */
-const MOCK_ACTIVITY: ActivityFeedResponse = {
-  entries: [
-    { ts: new Date(Date.now() - 5 * 60_000).toISOString(), method: 'POST', path: '/api/harmony/engine/restart', principal: 'mock-user', system: 'harmony' },
-    { ts: new Date(Date.now() - 2 * 60_000).toISOString(), method: 'PUT', path: '/api/harmony/mode', principal: 'mock-user', system: 'harmony' },
-    { ts: new Date(Date.now() - 30_000).toISOString(), method: 'POST', path: '/api/auth/login', principal: 'mock-user', system: 'auth' },
-  ],
+/** Mock tool catalog per module — `plane` is padded out to 34 tools so ToolsPanel's DataTable
+ *  paging has something real to page through (§ edge case: huge tool catalog). */
+function toolNames(prefix: string, actions: string[]): string[] {
+  return actions.map(a => `${prefix}_${a}`).sort();
+}
+
+const PLANE_ACTIONS = [
+  'create_work_item', 'update_work_item', 'delete_work_item', 'list_work_items', 'get_work_item',
+  'create_comment', 'list_comments', 'update_comment', 'delete_comment', 'list_states',
+  'create_state', 'update_state', 'list_projects', 'get_project', 'create_project',
+  'update_project', 'list_cycles', 'create_cycle', 'update_cycle', 'list_modules',
+  'create_module', 'update_module', 'list_labels', 'create_label', 'assign_label',
+  'list_members', 'add_member', 'remove_member', 'search_work_items', 'bulk_update',
+  'list_attachments', 'add_attachment', 'get_activity', 'export_project',
+];
+
+const MOCK_TERMINUS_MODULE_TOOLS: Record<string, string[]> = {
+  gitea: toolNames('gitea', ['list_repos', 'create_repo', 'get_file', 'create_pr', 'merge_pr']),
+  plane: toolNames('plane', PLANE_ACTIONS),
+  github: toolNames('github', ['list_repos', 'create_issue', 'list_issues']),
+  nexus: [],
+  commute: [],
 };
 
 const MOCK_TERMINUS_CONFIG: TerminusConfigSummary = {
   modules: [
-    { name: 'gitea', enabled: true, version: '0.4.0' },
-    { name: 'plane', enabled: true, version: '0.4.0' },
-    { name: 'github', enabled: true, version: '0.4.0' },
-    { name: 'nexus', enabled: false },
-    { name: 'commute', enabled: false },
+    { name: 'gitea', enabled: true, version: '0.4.0', toolCount: MOCK_TERMINUS_MODULE_TOOLS.gitea.length, tools: MOCK_TERMINUS_MODULE_TOOLS.gitea },
+    { name: 'plane', enabled: true, version: '0.4.0', toolCount: MOCK_TERMINUS_MODULE_TOOLS.plane.length, tools: MOCK_TERMINUS_MODULE_TOOLS.plane },
+    { name: 'github', enabled: true, version: '0.4.0', toolCount: MOCK_TERMINUS_MODULE_TOOLS.github.length, tools: MOCK_TERMINUS_MODULE_TOOLS.github },
+    { name: 'nexus', enabled: false, toolCount: 0, tools: [] },
+    { name: 'commute', enabled: false, toolCount: 0, tools: [] },
   ],
   workerCount: 3,
 };
+
+// CONST-28: mock activity fixture, per the §8 contract shape. Real data lands with CONST-26's
+// endpoint — this is a canned fixture only, timestamps relative to "now" so it always reads
+// as recent in a live demo.
+// OLDEST-FIRST, matching the real endpoint's file-order contract (CONST-26): index 0 is the
+// oldest entry, the last element is the most recent — so `slice(-limit)` in the mock
+// `activity()` returns the most-recent TAIL exactly like the server does (review fix: the
+// previous newest-first generation inverted the shared contract for every consumer).
+const MOCK_ACTIVITY_ENTRIES: TerminusActivityEntry[] = Array.from({ length: 24 }, (_, i) => {
+  const systems: SystemId[] = ['harmony', 'chord', 'lumina', 'terminus'];
+  const methods = ['GET', 'POST', 'PUT'];
+  const paths = ['/status', '/agents/activity', '/models', '/config', '/health', '/mode'];
+  const principals = ['operator', 'mock-user', 'ci-bot'];
+  const age = 23 - i; // i=23 -> now (most recent, last); i=0 -> oldest
+  return {
+    ts: new Date(Date.now() - age * 45_000).toISOString(),
+    method: methods[i % methods.length],
+    path: paths[i % paths.length],
+    principal: principals[i % principals.length],
+    system: systems[i % systems.length],
+  };
+});
 
 // ── Mock data for the ported harmony-web / Chord surface (CONST-04) ──────────
 // Keyed by `${system} ${METHOD} ${pathname}` (query string stripped, dynamic
@@ -335,13 +390,37 @@ const MOCK_MUSE_ON_DECK = {
   ],
 };
 
+// CONST-20: past-dated entry included deliberately -- spec §5.4/edge cases requires the
+// Premieres list to sort by release_date and render past-dated entries dimmed, not hidden.
 const MOCK_MUSE_PREMIERE = {
   items: [
-    { id: 'md-3', title: 'Example Upcoming Release', release_date: new Date().toISOString(), rsvp_count: 0 },
+    { id: 'md-3', title: 'Example Upcoming Release', release_date: new Date(Date.now() + 5 * 86400000).toISOString(), rsvp_count: 0 },
+    { id: 'md-4', title: 'Example Recent Premiere', release_date: new Date(Date.now() - 3 * 86400000).toISOString(), rsvp_count: 4 },
+    { id: 'md-5', title: 'Example Far-Out Release', release_date: new Date(Date.now() + 30 * 86400000).toISOString(), rsvp_count: 1 },
   ],
 };
 
-const MOCK_MUSE_GAPS = { gaps: [], total: 0 };
+const MOCK_MUSE_GAPS = {
+  gaps: [
+    { id: 'gap-1', title: 'Example Series — missing S2', kind: 'series', detail: 'season 2 not in library' },
+    { id: 'gap-2', title: 'Example Collection — missing entry 3', kind: 'collection', detail: 'entry 3 of 5 missing' },
+  ],
+  total: 2,
+};
+
+// CONST-20: dashboard MetricCards row (library size, active channels, pending items, last
+// ingest) has no dedicated endpoint in the §5.4 route list as written -- this mock/`GET
+// /stats` extends the mock adapter (per this item's own instructions: "extend the mocks if
+// the panels need shapes the canned data lacks, keep shapes consistent with the §5.4 endpoint
+// list"). It's a plain GET like every other muse route, so it degrades through the exact same
+// 404/501-to-ChartEmpty path if the real muse backend hasn't wired it -- see the DashboardPanel
+// deviation note.
+const MOCK_MUSE_STATS = {
+  library_size: 1842,
+  active_channels: 2,
+  pending_items: 2,
+  last_ingest_at: new Date(Date.now() - 45 * 60000).toISOString(),
+};
 
 const MOCK_MUSE_CHANNELS = {
   channels: [
@@ -350,10 +429,55 @@ const MOCK_MUSE_CHANNELS = {
   ],
 };
 
+const MOCK_MUSE_LINEUP: Record<string, { channel_id: string; lineup: Array<{ id: string; title: string; position: number }> }> = {
+  'ch-1': {
+    channel_id: 'ch-1',
+    lineup: [
+      { id: 'md-1', title: 'Example Feature Film', position: 1 },
+      { id: 'md-2', title: 'Example Series S1E4', position: 2 },
+    ],
+  },
+  'ch-2': {
+    channel_id: 'ch-2',
+    lineup: [
+      { id: 'md-3', title: 'Example Upcoming Release', position: 1 },
+    ],
+  },
+};
+
+const MOCK_MUSE_GUIDE = {
+  entries: [
+    { channel_id: 'ch-1', title: 'Example Feature Film', start: new Date().toISOString(), end: new Date(Date.now() + 2 * 3600000).toISOString() },
+    { channel_id: 'ch-1', title: 'Example Series S1E4', start: new Date(Date.now() + 2 * 3600000).toISOString(), end: new Date(Date.now() + 3 * 3600000).toISOString() },
+    { channel_id: 'ch-2', title: 'Example Upcoming Release', start: new Date().toISOString(), end: new Date(Date.now() + 90 * 60000).toISOString() },
+  ],
+};
+
+// CONST-20: 5 clusters deliberately -- exercises the ">4 clusters fold to Other" rule (spec
+// §5.4/§4.2 ALL_PAIRS_CEILING) with real mock data instead of only being provable by editing
+// the mock in a manual check.
 const MOCK_MUSE_TASTE_CLUSTERS = {
   clusters: [
-    { cluster_id: 0, label: 'mock-cluster-a', points: [{ x: 0.1, y: 0.2, model: 'md-1' }] },
-    { cluster_id: 1, label: 'mock-cluster-b', points: [{ x: 0.6, y: 0.4, model: 'md-2' }] },
+    { cluster_id: 0, label: 'prestige-drama', points: [{ x: 0.12, y: 0.22, model: 'md-1' }, { x: 0.18, y: 0.30, model: 'md-6' }] },
+    { cluster_id: 1, label: 'action-blockbuster', points: [{ x: 0.62, y: 0.41, model: 'md-2' }, { x: 0.58, y: 0.48, model: 'md-7' }] },
+    { cluster_id: 2, label: 'animated-family', points: [{ x: 0.35, y: 0.75, model: 'md-8' }] },
+    { cluster_id: 3, label: 'documentary', points: [{ x: 0.80, y: 0.20, model: 'md-9' }] },
+    { cluster_id: 4, label: 'indie-comedy', points: [{ x: 0.50, y: 0.55, model: 'md-10' }] },
+  ],
+};
+
+const MOCK_MUSE_WATCH_HISTORY = {
+  series: [
+    { date: '2026-07-01', 'prestige-drama': 3, 'action-blockbuster': 1, 'animated-family': 0 },
+    { date: '2026-07-08', 'prestige-drama': 2, 'action-blockbuster': 2, 'animated-family': 1 },
+    { date: '2026-07-15', 'prestige-drama': 4, 'action-blockbuster': 1, 'animated-family': 2 },
+  ],
+};
+
+const MOCK_MUSE_GROUP_DYNAMICS = {
+  rows: [
+    { participant: 'household-a', watched_together_pct: 62, favorite_genre: 'prestige-drama', sessions: 14 },
+    { participant: 'household-b', watched_together_pct: 38, favorite_genre: 'action-blockbuster', sessions: 9 },
   ],
 };
 
@@ -382,11 +506,15 @@ const MOCK_GET: Record<string, unknown> = {
   'muse /on_deck': MOCK_MUSE_ON_DECK,
   'muse /premiere': MOCK_MUSE_PREMIERE,
   'muse /gaps': MOCK_MUSE_GAPS,
+  // CONST-20: not in the §5.4 route list as written -- see the MOCK_MUSE_STATS comment above
+  // for why the dashboard MetricCards row calls this anyway (mock-adapter extension, same
+  // GET-and-degrade shape as every other muse route).
+  'muse /stats': MOCK_MUSE_STATS,
   'muse /api/channels': MOCK_MUSE_CHANNELS,
   'muse /api/graph/taste-clusters': MOCK_MUSE_TASTE_CLUSTERS,
-  'muse /api/graph/watch-history': { series: [] },
-  'muse /api/graph/group-dynamics': { rows: [] },
-  'muse /guide': { entries: [] },
+  'muse /api/graph/watch-history': MOCK_MUSE_WATCH_HISTORY,
+  'muse /api/graph/group-dynamics': MOCK_MUSE_GROUP_DYNAMICS,
+  'muse /guide': MOCK_MUSE_GUIDE,
 };
 
 function mockGetFor(system: SystemId, pathname: string): unknown {
@@ -396,7 +524,8 @@ function mockGetFor(system: SystemId, pathname: string): unknown {
     return { ...MOCK_TREE, project: decodeURIComponent(pathname.slice('/tree/'.length)) };
   }
   if (system === 'muse' && pathname.startsWith('/api/channels/') && pathname.endsWith('/lineup')) {
-    return { channel_id: pathname.split('/')[3], lineup: [] };
+    const channelId = pathname.split('/')[3];
+    return MOCK_MUSE_LINEUP[channelId] ?? { channel_id: channelId, lineup: [] };
   }
   return null;
 }
@@ -426,6 +555,19 @@ function mockWriteFor(system: SystemId, pathname: string): unknown {
       response: '(mock adapter — no live model backend) This is a canned playground response.',
       tokens_in: 12, tokens_out: 18, latency_ms: 120, cost: 0, model: 'mock',
     };
+  }
+  // CONST-20: Muse channel compose/maintenance actions -- not in the §5.4 route list as
+  // written (only the read routes are spec'd), inferred from the spec's own description of
+  // these as "compose/maintenance actions" gated behind RoleGate+ConfirmDialog (§5.4). Kept
+  // to the same REST shape as the read routes (`/api/channels/{id}/...`) pending the real
+  // muse backend confirming its exact mutation contract.
+  const composeMatch = system === 'muse' && /^\/api\/channels\/([^/]+)\/compose$/.exec(pathname);
+  if (composeMatch) {
+    return { ok: true, channel_id: composeMatch[1], status: 'queued' };
+  }
+  const maintenanceMatch = system === 'muse' && /^\/api\/channels\/([^/]+)\/maintenance$/.exec(pathname);
+  if (maintenanceMatch) {
+    return { ok: true, channel_id: maintenanceMatch[1], status: 'queued' };
   }
   return { ok: true };
 }
@@ -472,8 +614,8 @@ const mockAdapter: AggregationClient = {
       return delay(MOCK_TERMINUS_CONFIG);
     },
     async activity(limit?: number) {
-      const entries = limit != null ? MOCK_ACTIVITY.entries.slice(-limit) : MOCK_ACTIVITY.entries;
-      return delay({ entries });
+      const entries = limit != null ? MOCK_ACTIVITY_ENTRIES.slice(-limit) : MOCK_ACTIVITY_ENTRIES;
+      return delay({ entries, available: true });
     },
   },
   async request<T>(system: SystemId, path: string, init?: RequestInit): Promise<T> {
@@ -491,8 +633,9 @@ const mockAdapter: AggregationClient = {
 //   POST /api/auth/login         -> AuthMeResponse   (body: { username, password })
 //   POST /api/auth/logout        -> 204/200
 //   GET  /api/health             -> HealthStatus[]
-//   GET  /api/terminus/config    -> TerminusConfigSummary
-//   GET  /api/terminus/activity?limit=N -> ActivityFeedResponse (CONST-26; never body content)
+//   GET  /api/terminus/config    -> TerminusConfigSummary (CONST-28: modules[].toolCount/tools additive)
+//   GET  /api/terminus/activity?limit=N -> ActivityFeedResponse (CONST-26; never body content;
+//                                    CONST-28 client degrades to {available:false} on 404/501/error)
 //   *    /api/{system}/{path}    -> generic passthrough for `request<T>()`
 //   WS   /ws                     -> same-origin, session-cookie-authenticated event stream
 //                                    (engine/ralph-loop/log/tree_update events); see ws.connect()
@@ -514,6 +657,13 @@ const mockAdapter: AggregationClient = {
 //            (binary passthrough -- see crate::constellation::proxy's module doc; this generic
 //            request<T>() path is JSON-typed, art responses should be fetched by <img src> URL,
 //            not through this method)
+//            CONST-20 additions (not in the original §5.4 route list -- see aggregationClient's
+//            MOCK_MUSE_STATS/compose/maintenance comments for why): GET /stats (dashboard
+//            MetricCards row), POST /api/channels/{id}/compose, POST /api/channels/{id}/
+//            maintenance (both operator-gated + confirmed client-side, §5.4). All three are
+//            plain passthrough paths under the existing `proxy_muse` arm -- no proxy.rs change
+//            needed, they degrade exactly like every other unwired muse route (404/501 ->
+//            ChartEmpty "not yet wired") until the real muse backend implements them.
 
 function baseUrl(): string {
   // Same-origin only — never a hardcoded host/port. This is the one place in the app
@@ -597,8 +747,18 @@ const httpAdapter: AggregationClient = {
       return httpJson<TerminusConfigSummary>('/api/terminus/config');
     },
     async activity(limit?: number) {
-      const query = limit != null ? `?limit=${encodeURIComponent(String(limit))}` : '';
-      return httpJson<ActivityFeedResponse>(`/api/terminus/activity${query}`);
+      // CONST-28/§8: degrade gracefully (available:false) rather than throw — 404/501 on a
+      // deploy without the endpoint, or any transient failure. Both the Overview feed/bell
+      // (CONST-26) and ActivityPanel read `.entries`; the flag is additive. `limit` stays
+      // OPTIONAL (review fix): omitted ⇒ no query param ⇒ the server's own configured cap
+      // applies, exactly as the CONST-26 contract documents.
+      try {
+        const query = limit != null ? `?limit=${encodeURIComponent(String(limit))}` : '';
+        const res = await httpJson<ActivityFeedResponse>(`/api/terminus/activity${query}`);
+        return { entries: res.entries, available: true };
+      } catch (e) {
+        return { entries: [], available: false, detail: e instanceof Error ? e.message : 'unavailable' };
+      }
     },
   },
   async request<T>(system: SystemId, path: string, init?: RequestInit): Promise<T> {

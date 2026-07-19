@@ -35,8 +35,8 @@ this is the contract the httpAdapter already assumes:
 | POST | `/api/auth/login` (body `{username,password}`) | same as above |
 | POST | `/api/auth/logout` | 200/204 |
 | GET | `/api/health` | `{ system: 'harmony'\|'chord'\|'lumina'\|'muse'\|'terminus'; available: boolean; detail?: string }[]` |
-| GET | `/api/terminus/config` | `{ modules: { name: string; enabled: boolean; version?: string }[]; workerCount: number }` |
-| GET | `/api/terminus/activity?limit=N` | `{ entries: { ts: string; method: string; path: string; principal: string \| null; system: string }[] }` — tail of the CONST-02 mutating-request audit log; **never body content**. `limit` asks for fewer entries, never more than the server's own `CONSTELLATION_ACTIVITY_TAIL_LIMIT` cap (default 200). A missing/empty audit log yields `{entries: []}`, `200 OK` — never an error. |
+| GET | `/api/terminus/config` | `{ modules: { name: string; enabled: boolean; version?: string; toolCount?: number; tools?: string[] }[]; workerCount: number }` (`toolCount`/`tools` are CONST-28, additive — a pre-CONST-28 backend response is still valid, just without them) |
+| GET | `/api/terminus/activity?limit=N` | `{ entries: { ts: string; method: string; path: string; principal: string \| null; system: string }[] }` — tail of the CONST-02 mutating-request audit log; **never body content**. `limit` asks for fewer entries, never more than the server's own `CONSTELLATION_ACTIVITY_TAIL_LIMIT` cap (default 200). A missing/empty audit log yields `{entries: []}`, `200 OK` — never an error. CONST-28's client additionally degrades to `{available:false}` on 404/501/error (see Terminus module panels below). |
 | any | `/api/{system}/{path}` | generic passthrough used by `client.request<T>()` for panel-specific reads that don't have a typed method yet |
 
 **CONST-21 — the Models/MINT read API** (`src/constellation/models_api.rs`, spec
@@ -143,8 +143,8 @@ never reporting healthy; either way it silently doesn't render. No crash, no pla
 
 - **`GlobalBar`** (top, `src/components/GlobalBar.tsx`) is the module switcher — replaces the
   old single `Sidebar`. Renders the wordmark (`Wordmark.tsx`), one tab per available module
-  (health dot + degraded indicator), a `⌘/Ctrl+K` "go to panel" trigger, the density toggle,
-  and the account chip.
+  (health dot + degraded indicator), a `⌘/Ctrl+K` command palette trigger (see §4 below), the
+  density toggle, and the account chip.
 - **`ModuleRail`** (left, `src/components/ModuleRail.tsx`) renders the *active* module's
   panels (`getPanelsByModule`). Responsive: icon-only rail below 1100px width, a drawer
   overlay (triggered from `GlobalBar`'s hamburger) below 760px.
@@ -193,6 +193,63 @@ app root) fire for exactly two things, per spec — never anything else:
 Toasts auto-dismiss after 6s and render in a fixed `aria-live="polite"` region so a screen
 reader announces one without interrupting the current task.
 
+### 4. The command palette (`src/components/CommandPalette.tsx`, CONST-25, §3.2 of the spec)
+
+`⌘/Ctrl+K` anywhere in the shell opens the palette (`App.tsx`'s `Shell` owns the open state and
+the global keydown listener — not `GlobalBar`, so the shortcut works regardless of what has DOM
+focus). Zero new dependencies: its own subsequence fuzzy-matcher
+(`src/lib/commandMatch.ts`), its own `role="dialog"`/`listbox` markup, CSS tokens only.
+
+Three sources, always shown in this order, each degrading independently:
+
+1. **Navigation** — every panel in the same health-filtered set `App.tsx` routes (never the raw
+   registry), ranked by `src/lib/commandMatch.ts#fuzzyMatch` against the query.
+2. **Actions** — `src/lib/commandRegistry.ts#registerCommand()`, a sibling of `registerPanel`/
+   `registerModule` (same "register once, at import time" convention). Register a command
+   anywhere a panel is registered:
+
+   ```ts
+   registerCommand({
+     id: 'shell.refresh-health',       // must be globally unique — duplicates THROW at
+     title: 'Refresh health',          // registration time (not silently overwritten, unlike
+     subtitle: 'Re-poll /api/health',  // registerPanel/registerModule — see the file's doc
+     icon: '⟳',                        // comment for why)
+     minRole: 'viewer',                // default; 'operator' hides the command entirely for
+     run: () => requestHealthRefresh(),// a viewer session (not merely disabled)
+   });
+   ```
+
+   **Role gating (CONST-27, merged):** `App.tsx`'s Shell reads the real session role via
+   `useAuthRole()` (from CONST-27's `AuthRoleProvider`) and passes it into `CommandPalette`;
+   `getAvailableCommands(role)` HIDES operator-only commands from a `'viewer'` session. A
+   `null` role (unauthenticated edge — the palette normally never renders there) resolves to
+   `'operator'` purely as the documented backward-compat fallback, mirroring the server's own
+   claim-absent-token rule; the UI gate remains cosmetic — the server's
+   `enforce_viewer_role_gate` 403 is the real enforcement.
+
+3. **Entity search** — `src/lib/entitySearch.ts#searchEntities()`, debounced 150ms, fans the
+   query out (`Promise.allSettled`, never `Promise.all`) to a handful of cheap existing list
+   reads (sessions, agent activity, providers, models, terminus modules), grouped by source. A
+   dead/erroring backend shows one greyed-out "`<Group>` unavailable" row for its own group and
+   changes nothing else — it can never suppress navigation, actions, or another source's hits.
+
+**Keyboard contract:** `↑`/`↓` move the selection; `Tab`/`Shift+Tab` jump to the first row of
+the next/previous non-empty group; `Enter` runs the selected row; `Esc` closes. The text input
+keeps DOM focus for the palette's entire lifetime — the "selection" is virtual
+(`aria-activedescendant` into a `role="listbox"`/`role="option"` tree), which both implements
+the focus trap (nothing else on the page can steal focus while it's open) and keeps screen
+readers on the standard combobox-listbox pattern.
+
+**Adding an entity source:** add one entry to the `SOURCES` array in `entitySearch.ts` — a
+`group` label and a `load(client)` function that calls `client.request(...)` (or a typed
+aggregation-client method) and maps the response to `EntityHit[]`. It degrades automatically;
+no palette code changes.
+
+**Testing:** `src/lib/commandMatch.test.ts` is a small dependency-free assertion file
+(`runCommandMatchTests()`) covering the fuzzy matcher and `rankItems` — this repo has no JS test
+runner wired up yet (no vitest/jest in `package.json`), so it isn't invoked by any script today;
+wire it into `npm test` the moment one is added.
+
 ## Adding a panel
 
 1. Create `src/panels/<module>/<Name>Panel.tsx`. Read data via
@@ -213,6 +270,50 @@ fallback was deliberately dropped, not ported, and CONST-16's prefs seam does no
 door — it's structurally incapable of storing a credential shape). Vault-referenced secrets
 (provider API keys, etc., landing in CONST-08+) must be surfaced as a vault key *name* with a
 set/rotate affordance, never a round-tripped value.
+
+## Muse module (CONST-19 backend, CONST-20 UI)
+
+`muse` is the fourth namespaced proxy arm (`/api/muse/*path` in `src/constellation/proxy.rs`,
+CONST-19) with three panels (CONST-20, `src/panels/muse/`) against it:
+
+- **`muse.dashboard`** — a Library Overview MetricCards row (library size, active channels,
+  pending items, last ingest) plus On Deck (poster rail), Premieres (sorted, past-dated
+  entries dimmed not hidden), and Gaps summary.
+- **`muse.taste`** — a taste-cluster scatter (first 4 clusters keep a categorical slot, the
+  rest fold into one "Other" series — the §4.2 all-pairs cap), a watch-history stacked area,
+  and a group-dynamics table. All read-only.
+- **`muse.channels`** — channels list, per-channel lineup, and a guide grid rendered as a
+  `DataTable` timeline (deliberately **not** an EPG widget, per spec §5.4). Compose/maintenance
+  actions are operator-gated and confirmed.
+
+All data comes from `src/hooks/useMuse.ts`, which wraps every Muse read in its own
+`useMuseSection` call — this is the mechanism behind the module's **per-endpoint degradation**
+requirement: a single unwired/erroring route (the MUSEX-WIRE reality — most Muse features
+exist unwired in production) collapses only its own `ChartCard` to `ChartEmpty("not yet
+wired")`, never the whole panel. Degradation is keyed on two equivalent signals: the
+httpAdapter throwing `HTTP 404`/`HTTP 501`, or the mockAdapter resolving `null` for a pathname
+with no `MOCK_GET` entry (aggregationClient.ts's own "not mocked" sentinel). Manually verified
+by deleting a `MOCK_GET` key and confirming only that section degrades (see `useMuse.ts`'s and
+`DashboardPanel.tsx`'s top comments for how).
+
+Role gating comes from **merged CONST-27**: Muse's compose/maintenance controls are wrapped in
+main's canonical `components/RoleGate.tsx` (a viewer session sees them disabled with an
+"operator role required" tooltip; the real session role flows via `AuthRoleContext`'s
+`useAuthRole()`), and enforcement is always server-side regardless (spec §3.4 —
+`enforce_viewer_role_gate` 403s a viewer's mutating request). This build's earlier pre-merge
+role seam (a local `hooks/useAuthRole.ts` + its own RoleGate variant) was DELETED when the
+branch reconciled onto merged main. One local stand-in remains, clearly marked in its file
+header for its real item to replace without touching call sites:
+
+- **`components/ConfirmDialog.tsx`** — no shared modal/dialog kit on main yet (CONST-25's is
+  unmerged). Minimal, brand-token, `role="dialog"` + Esc-to-cancel stand-in for Muse's
+  compose/maintenance confirmations.
+
+Two mock/route additions beyond the original §5.4 endpoint list (both plain GET/POST passthrough
+under the existing `proxy_muse` arm, no `proxy.rs` change needed, both degrade the same way as
+every spec'd route): `GET /stats` (the dashboard's MetricCards row has no dedicated endpoint in
+the original list) and `POST /api/channels/{id}/{compose,maintenance}` (the channel mutation
+routes spec §5.4 names but doesn't give an exact path for).
 
 ## Roles (CONST-27)
 
@@ -338,12 +439,45 @@ after its bounded reconnect budget was exhausted -- same polling fallback applie
 is required for this item; a future item MAY use the code to distinguish "no backend
 configured" from "backend flapped" in the UI if that becomes useful.
 
+## Terminus module panels (CONST-28)
+
+The `terminus` module's own self-observability surface, built on the CONST-04 `Config` panel's
+pattern, in `src/panels/terminus/`:
+
+- **`FleetPanel.tsx`** ("Fleet") — a health board with one card per fleet system
+  (harmony/chord/lumina/terminus). Each card polls `client.health.list()` on its own 5s
+  interval and accumulates into a **client-held ring buffer of the last 120 polls per system**
+  (`fleetRingBuffer.ts` — pure, framework-free, unit-tested in `fleetRingBuffer.test.ts` via
+  `npm run test`: capacity cap, transition/flap detection, uptime ratio). Each card renders an
+  uptime `Sparkline` (`src/viz/Sparkline.tsx`, the viz kit's minimal chrome-free line chart) plus
+  the mesh/broker summary (module/worker counts) from `/api/terminus/config`. Edge cases: an
+  empty broker-routes table reads as "0 (in-process)", not an error; a failing health poll
+  leaves every system's ring buffer at its last-known content (see the pure function's own
+  "leaves a system untouched" test) rather than clearing it.
+- **`ToolsPanel.tsx`** ("Tools") — the full tool catalog, grouped by module prefix, from the
+  CONST-28-extended `/api/terminus/config` (`modules[].tools`/`toolCount`). Searchable (text +
+  per-module filter chips) and paged (`DataTable`, 25 rows/page) — the mock fixture pads `plane`
+  out to 34 tools specifically to exercise paging. A `TODO(CONST-25 seam)` comment marks where
+  the command-palette entity-source registration wires in once that item lands (CONST-25 isn't
+  on this branch's base yet — deliberately not imported ahead of time so this typechecks/builds
+  clean against `origin/main`).
+- **`ActivityPanel.tsx`** ("Activity") — a paged, filterable (system/method/principal) view
+  against the §8 contract `GET /api/terminus/activity?limit=` → `{entries:[{ts,method,path,
+  principal,system}]}`. That Rust endpoint is CONST-26's, landing in parallel with this item —
+  this panel only *consumes* `client.terminus.activity()` (`aggregationClient.ts`), which
+  already degrades to `{available:false}` on a 404/501/any failure; the panel then renders an
+  explanatory "not live yet" empty state instead of an error.
+
+All three are registered under the existing `terminus` module in `registerPanels.ts` alongside
+the pre-existing `Config` panel (`terminus.fleet` / `terminus.tools` / `terminus.activity`).
+
 ## Dev / build
 
 ```sh
 npm install
 npm run dev        # vite dev server, :5174, proxies /api and /ws to :3100 by default
 npm run typecheck  # tsc --noEmit
+npm run test       # vitest run — currently: fleetRingBuffer.test.ts (CONST-28)
 npm run build       # tsc --noEmit && vite build -> dist/
 ```
 

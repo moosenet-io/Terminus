@@ -314,19 +314,43 @@ async fn probe_system(system: &'static str, base_url: Option<String>) -> Value {
 /// number of tool NAMES currently routed to an out-of-process worker, per
 /// `crate::broker::routes::RouteTable` -- zero until a domain is extracted,
 /// matching that module's "empty table is behavior-preserving" contract).
+///
+/// CONST-28: extended, ADDITIVELY, with per-module tool introspection --
+/// `toolCount` (the number of registered tool names under that module
+/// prefix) and `tools` (their full, sorted names) -- read-only over data
+/// this handler already loads (`registry.list()`), no new state/dependency.
+/// The three pre-existing fields on each module entry (`name`, `enabled`,
+/// `version`) and the two top-level fields (`modules`, `workerCount`) are
+/// byte-stable -- see the `terminus_config_extension_is_additive_const28`
+/// test below, which pins exactly that contract so a future change can't
+/// silently break the CONST-04 `TerminusConfigSummary` consumers ahead of
+/// their own migration.
 async fn handle_terminus_config(State(state): State<Arc<McpServerState>>) -> Response {
     let registry = state.registry.load();
-    let mut module_names: Vec<String> = registry
-        .list()
-        .into_iter()
-        .filter_map(|t| t.name.split('_').next().map(str::to_string))
-        .collect();
-    module_names.sort();
-    module_names.dedup();
+    let tool_names: Vec<String> = registry.list().into_iter().map(|t| t.name.to_string()).collect();
 
-    let modules: Vec<Value> = module_names
+    // Group tool names by their `{module}_` prefix (same convention the
+    // pre-CONST-28 module-name derivation used) -- a BTreeMap gives us the
+    // module names in sorted order for free, matching the previous
+    // `sort()+dedup()` behavior.
+    let mut by_module: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    for name in tool_names {
+        let module = name.split('_').next().unwrap_or(&name).to_string();
+        by_module.entry(module).or_default().push(name);
+    }
+
+    let modules: Vec<Value> = by_module
         .into_iter()
-        .map(|name| json!({"name": name, "enabled": true, "version": Value::Null}))
+        .map(|(name, mut tools)| {
+            tools.sort();
+            json!({
+                "name": name,
+                "enabled": true,
+                "version": Value::Null,
+                "toolCount": tools.len(),
+                "tools": tools,
+            })
+        })
         .collect();
 
     let worker_count = state.broker_routes.load().len();
@@ -462,6 +486,59 @@ mod tests {
         let modules = body["modules"].as_array().unwrap();
         assert!(modules.iter().any(|m| m["name"] == "gitea"));
         assert_eq!(body["workerCount"], 0);
+        std::env::remove_var("TERMINUS_JWT_SIGNING_KEY");
+    }
+
+    /// CONST-28: the config-endpoint extension (per-module `toolCount`/`tools`)
+    /// must be ADDITIVE -- every field the CONST-04 `TerminusConfigSummary`
+    /// contract already relies on (`modules[].name`, `modules[].enabled`,
+    /// `modules[].version`, top-level `workerCount`) stays byte-stable, with
+    /// the two new fields present alongside them.
+    #[tokio::test]
+    #[serial]
+    async fn terminus_config_extension_is_additive_const28() {
+        std::env::set_var("TERMINUS_JWT_SIGNING_KEY", "test-signing-key-const28");
+        let router = constellation_router(test_state());
+        let (status, body) = get_json_authenticated(router, "/api/terminus/config").await;
+        assert_eq!(status, StatusCode::OK);
+
+        // WHOLE-RESPONSE legacy projection check (review-cycle-3 fix — a single-module
+        // spot check could miss module ordering/omission/top-level drift): strip ONLY the
+        // two documented additive fields from every module and require the remainder to
+        // equal the exact pre-CONST-28 response for this registry, byte-for-byte as JSON.
+        let mut legacy = body.clone();
+        {
+            let modules = legacy["modules"].as_array_mut().unwrap();
+            for m in modules.iter_mut() {
+                let obj = m.as_object_mut().unwrap();
+                assert!(obj.remove("toolCount").is_some(), "toolCount present on every module");
+                assert!(obj.remove("tools").is_some(), "tools present on every module");
+            }
+        }
+        let expected_legacy = json!({
+            "modules": [
+                {"name": "gitea", "enabled": true, "version": Value::Null},
+            ],
+            "workerCount": 0,
+        });
+        assert_eq!(
+            legacy, expected_legacy,
+            "legacy projection (additive fields removed) must equal the exact pre-CONST-28 shape"
+        );
+        // Top-level key set is exactly the legacy pair — no drift.
+        let top: Vec<&String> = body.as_object().unwrap().keys().collect();
+        assert_eq!(top, vec!["modules", "workerCount"]);
+
+        // New CONST-28 fields: additive, derived from the one registered
+        // `gitea_list_repos` dummy tool in `test_state()`.
+        let modules = body["modules"].as_array().unwrap();
+        let gitea = modules.iter().find(|m| m["name"] == "gitea").unwrap();
+        assert_eq!(gitea["toolCount"], 1);
+        assert_eq!(
+            gitea["tools"].as_array().unwrap(),
+            &vec![Value::String("gitea_list_repos".to_string())],
+        );
+
         std::env::remove_var("TERMINUS_JWT_SIGNING_KEY");
     }
 
