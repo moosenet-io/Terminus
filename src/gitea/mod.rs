@@ -1774,14 +1774,19 @@ impl MergePr {
         let outcome = match active_queue {
             None => client.merge_pull(owner, repo, pr_num, style, message).await?,
             Some(queue) => {
-                // Fetch the PR ONCE: reused both to derive the default queue
-                // key (`{owner}/{repo}/{base}`) and, inside the critical
-                // section below, for GMQ-03's stale-base guard — avoiding a
-                // second Gitea round-trip for the same PR.
-                let pr_info = client.fetch_pr(owner, repo, pr_num).await?;
+                // Fetch the PR to derive the default queue key
+                // (`{owner}/{repo}/{base}`) ONLY — the base branch NAME is
+                // stable across the wait, so this pre-slot snapshot is fine
+                // for keying. It must NOT be reused for the stale-base guard
+                // below: `mergeable`/`merged` can change while this merge
+                // waits its turn (another same-base merge can land during
+                // the queue wait or the GMQ-03 min-delay spacing), so the
+                // guard is evaluated against a FRESH fetch taken inside the
+                // critical section instead (see the re-fetch below).
+                let pr_info_for_key = client.fetch_pr(owner, repo, pr_num).await?;
                 let key = queue_key_override
                     .map(str::to_string)
-                    .unwrap_or_else(|| format!("{owner}/{repo}/{}", pr_info.base.ref_name));
+                    .unwrap_or_else(|| format!("{owner}/{repo}/{}", pr_info_for_key.base.ref_name));
 
                 let slot_result: Result<Result<GiteaMergeOutcome, ToolError>, MergeQueueError> =
                     queue
@@ -1795,15 +1800,25 @@ impl MergePr {
                                 return Err(ToolError::from(e));
                             }
 
-                            match merge_queue::evaluate_merge_guard(&pr_info) {
+                            // Re-fetch the PR HERE, now that the slot is held
+                            // and spacing has been enforced, so the stale-base
+                            // guard reflects ACQUIRE-TIME state rather than
+                            // the pre-wait snapshot taken before entering the
+                            // queue. Without this, a base that goes stale
+                            // DURING the wait would slip past the guard and
+                            // hit a raw 409 from Gitea's merge endpoint
+                            // instead of a clean `NotMergeable`.
+                            let fresh_pr = client.fetch_pr(owner, repo, pr_num).await?;
+
+                            match merge_queue::evaluate_merge_guard(&fresh_pr) {
                                 merge_queue::MergeGuardDecision::AlreadyMerged => {
                                     // Idempotent: some earlier attempt (or
                                     // another process) already merged this PR
                                     // — report success, do NOT POST again.
                                     Ok(GiteaMergeOutcome {
                                         merged: true,
-                                        base: pr_info.base.ref_name.clone(),
-                                        head: pr_info.head.ref_name.clone(),
+                                        base: fresh_pr.base.ref_name.clone(),
+                                        head: fresh_pr.head.ref_name.clone(),
                                     })
                                 }
                                 merge_queue::MergeGuardDecision::NotMergeable => {
@@ -1817,8 +1832,8 @@ impl MergePr {
                                             pr_num,
                                             style,
                                             message,
-                                            &pr_info.base.ref_name,
-                                            &pr_info.head.ref_name,
+                                            &fresh_pr.base.ref_name,
+                                            &fresh_pr.head.ref_name,
                                         )
                                         .await?;
                                     // Stamp the spacing marker AFTER a real
@@ -5436,7 +5451,10 @@ mod tests {
             .execute_with_queue(serde_json::json!({"repo": "myrepo", "pr": 11}), Some(queue))
             .await;
 
-        get_mock.assert();
+        // GMQ-04 refinement: 2 GETs — one pre-slot (to derive the queue key)
+        // and one re-fetched INSIDE the slot (acquire-time snapshot for the
+        // stale-base guard) — not 1.
+        get_mock.assert_hits(2);
         merge_mock.assert();
         let result = result.expect("queue-active merge of a mergeable PR must succeed");
         assert_eq!(result, "Pull request #11 merged into main in testorg/myrepo.");
@@ -5469,7 +5487,8 @@ mod tests {
             .execute_with_queue(serde_json::json!({"repo": "myrepo", "pr": 21}), Some(queue))
             .await;
 
-        get_mock.assert();
+        // 2 GETs — pre-slot (key derivation) + in-slot (guard snapshot).
+        get_mock.assert_hits(2);
         merge_mock.assert_hits(0);
         let err = result.expect_err("a non-mergeable PR must not merge");
         assert!(
@@ -5506,7 +5525,8 @@ mod tests {
             .execute_with_queue(serde_json::json!({"repo": "myrepo", "pr": 33}), Some(queue))
             .await;
 
-        get_mock.assert();
+        // 2 GETs — pre-slot (key derivation) + in-slot (guard snapshot).
+        get_mock.assert_hits(2);
         merge_mock.assert_hits(0);
         let result = result.expect("an already-merged PR must be reported as an idempotent success");
         assert_eq!(result, "Pull request #33 merged into main in testorg/myrepo.");
@@ -5545,6 +5565,73 @@ mod tests {
         assert!(
             !store.is_locked("testorg/myrepo/main"),
             "the default key must never have been touched when queue_key overrides it"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_pr_queue_active_guard_reflects_acquire_time_not_enqueue_time_snapshot() {
+        // The refinement under test: the stale-base guard must be evaluated
+        // against a FRESH, in-slot fetch — not the pre-slot snapshot taken
+        // before entering the queue. Simulate "the base went stale WHILE
+        // this merge waited its turn" by forcing a real GMQ-03 min-delay
+        // spacing wait (seeding a prior `record_merge`) and swapping the
+        // PR's `mergeable` state from `true` to `false` partway through that
+        // wait — before the in-slot re-fetch happens. If the guard reused
+        // the pre-wait (`mergeable: true`) snapshot, this merge would wrongly
+        // proceed to POST; the acquire-time re-fetch must catch it instead.
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let queue = queue_over(Arc::clone(&store));
+        let key = "testorg/myrepo/main";
+        // Seed "a merge just happened" so `enforce_spacing` (min_delay_secs:
+        // 2 below) actually blocks for ~2s, giving the test a window to swap
+        // the mock before the in-slot re-fetch runs.
+        queue.record_merge(key, 2).await;
+
+        let server = MockServer::start();
+        let mut mergeable_mock = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/55");
+            then.status(200)
+                .json_body(sample_pr_json_guard(55, "feature/e", "main", Some(true), false));
+        });
+        let merge_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/55/merge");
+            then.status(200);
+        });
+
+        let tool = MergePr { client: mock_client(&server) };
+        let handle = tokio::spawn(async move {
+            tool.execute_with_queue(
+                serde_json::json!({"repo": "myrepo", "pr": 55, "min_delay_secs": 2}),
+                Some(queue),
+            )
+            .await
+        });
+
+        // Give the pre-slot fetch + slot acquisition + spacing-wait entry
+        // time to run (all fast/near-instant), then flip the PR to "stale"
+        // while the merge task is still asleep inside `enforce_spacing`
+        // (~2s), well before its in-slot re-fetch fires.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        mergeable_mock.assert_hits(1);
+        mergeable_mock.delete();
+        let stale_mock = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/55");
+            then.status(200)
+                .json_body(sample_pr_json_guard(55, "feature/e", "main", Some(false), false));
+        });
+
+        let result = handle.await.expect("merge task must not panic");
+
+        merge_mock.assert_hits(0);
+        stale_mock.assert_hits(1);
+        let err = result.expect_err("a base that went stale DURING the wait must be rejected");
+        assert!(
+            matches!(err, ToolError::Conflict(_)),
+            "expected a Conflict/NotMergeable error, got {err:?}"
+        );
+        assert!(
+            format!("{err}").to_lowercase().contains("not mergeable"),
+            "error must clearly state the PR is not mergeable: {err}"
         );
     }
 }
