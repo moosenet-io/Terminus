@@ -523,6 +523,15 @@ function baseUrl(): string {
 
 // The single-auth invariant, enforced structurally: Content-Type is always JSON and
 // authoritative; no caller-supplied auth-bearing header is ever forwarded to the backend.
+//
+// LGUI-05: `x-lumina-user` joins this strip list -- it's not itself a credential, but it's an
+// identity-spoofing vector for Lumina's admin-gated routes (spec §7 C-1), and the browser has
+// no business setting it either way: `crate::constellation::proxy::proxy_lumina` derives it
+// server-side from the VERIFIED session cookie, never from a request header. This is a
+// defense-in-depth door only -- the Rust proxy independently never reads ANY inbound header
+// but `content-type` to build its own outbound `Authorization`/`X-Lumina-User` (see that
+// module's doc), so a caller-supplied value here couldn't reach Lumina even if this stripped
+// nothing at all.
 function enforceHeaders(callerHeaders?: HeadersInit): Record<string, string> {
   const out: Record<string, string> = {};
   if (callerHeaders) {
@@ -533,7 +542,7 @@ function enforceHeaders(callerHeaders?: HeadersInit): Record<string, string> {
         : Object.entries(callerHeaders);
     for (const [k, v] of entries) {
       const lk = k.toLowerCase();
-      if (lk === 'authorization' || lk === 'cookie' || lk === 'content-type') continue;
+      if (lk === 'authorization' || lk === 'cookie' || lk === 'content-type' || lk === 'x-lumina-user') continue;
       out[k] = v as string;
     }
   }

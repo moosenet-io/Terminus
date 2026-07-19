@@ -54,6 +54,26 @@
 //! mutating request (`POST`/`PUT`/`PATCH`/`DELETE`) is recorded via
 //! [`crate::constellation::audit::record_mutating_request`] before the
 //! backend call is attempted.
+//!
+//! ## LGUI-05: Lumina bearer injection (spec §6, decision D2)
+//! [`proxy_lumina`] is the one namespaced arm that authenticates itself to
+//! its backend. It attaches two headers the shared [`proxy`] helper doesn't
+//! otherwise send: `Authorization: Bearer <CONSTELLATION_LUMINA_TOKEN>`
+//! (point-of-use env read via [`config::constellation_lumina_token`]; absent
+//! → forward unauthenticated exactly as every other arm always has — a
+//! token-less dev Lumina instance keeps working) and `X-Lumina-User: <the
+//! VERIFIED session principal>` (never a browser-supplied value — see
+//! [`principal_from_headers`]'s doc). Neither header is ever derived from,
+//! or copied out of, the caller's own request: [`proxy`] never forwards any
+//! inbound header except `content-type` in the first place, so a
+//! browser-supplied `Authorization`/`X-Lumina-User` is structurally
+//! impossible to smuggle through this door — `constellation-web`'s
+//! `enforceHeaders` (`aggregationClient.ts`) strips the same two client-side
+//! as a second, defense-in-depth door. A 401 from Lumina (token
+//! misconfigured/rejected) degrades to the same `{"available":false,
+//! "detail":"lumina auth failed"}` shape every other degraded case uses,
+//! rather than forwarding a raw 401 the browser has no session to react to
+//! (see [`proxy`]'s `auth_failure_detail` parameter).
 
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
@@ -118,6 +138,24 @@ async fn proxy(
     headers: &HeaderMap,
     body: Bytes,
     principal: Option<&str>,
+    // LGUI-05: additional headers to set on the OUTBOUND upstream request,
+    // beyond the `content-type` every arm already sends -- e.g.
+    // `proxy_lumina`'s bearer + `X-Lumina-User` (see the module doc). Empty
+    // for `proxy_harmony`/`proxy_chord`/`proxy_muse`, which authenticate no
+    // backend. Deliberately NOT derived from `headers` (the caller's inbound
+    // request) anywhere in this function -- the only inbound header this
+    // function ever reads is `content-type`, so a caller-supplied
+    // `Authorization`/`X-Lumina-User` can never ride along regardless of
+    // what a future caller passes here.
+    extra_upstream_headers: &[(&str, String)],
+    // LGUI-05: when `Some(detail)`, a `401` from the upstream backend is
+    // reported as the standard degraded-backend shape
+    // (`unavailable_body(system, detail)`, `200 OK`) instead of being
+    // forwarded to the browser verbatim -- an unauthenticated Constellation
+    // session has no way to react to a raw 401 from a DIFFERENT backend's
+    // auth layer (see the module doc's "never a raw 401 loop" note).
+    // `None` for arms that don't authenticate to their backend at all.
+    auth_failure_detail: Option<&'static str>,
 ) -> Response {
     // Audit path deliberately excludes the query string: query params can
     // themselves carry secret-shaped values, and unlike the body they are not
@@ -151,17 +189,24 @@ async fn proxy(
         .unwrap_or("application/json")
         .to_string();
 
-    let result = http_client()
+    let mut request = http_client()
         .request(method.clone(), &target)
         .timeout(timeout)
-        .header("content-type", content_type)
-        .body(body.to_vec())
-        .send()
-        .await;
+        .header("content-type", content_type);
+    for (name, value) in extra_upstream_headers {
+        request = request.header(*name, value.as_str());
+    }
+
+    let result = request.body(body.to_vec()).send().await;
 
     match result {
         Ok(upstream_resp) => {
             let status = upstream_resp.status();
+            if status == StatusCode::UNAUTHORIZED {
+                if let Some(detail) = auth_failure_detail {
+                    return respond(StatusCode::OK, unavailable_body(system, detail));
+                }
+            }
             let bytes = match upstream_resp.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
@@ -231,6 +276,8 @@ pub async fn proxy_harmony(
         &headers,
         body,
         principal.as_deref(),
+        &[],
+        None,
     )
     .await
 }
@@ -253,10 +300,34 @@ pub async fn proxy_chord(
         &headers,
         body,
         principal.as_deref(),
+        &[],
+        None,
     )
     .await
 }
 
+/// The `extra_upstream_headers` [`proxy_lumina`] passes to [`proxy`] — a
+/// small pure function pulled out of the handler body so it's directly
+/// unit-testable without an `axum` `State`/`Path`/request round-trip (see
+/// the `lumina_upstream_headers_*` tests below). `token` is the
+/// point-of-use `CONSTELLATION_LUMINA_TOKEN` read (`None` ⇒ no
+/// `Authorization` header at all — unauthenticated passthrough); `principal`
+/// is the caller's VERIFIED session identity, never a raw header value.
+fn lumina_upstream_headers(token: Option<String>, principal: Option<&str>) -> Vec<(&'static str, String)> {
+    let mut headers = Vec::new();
+    if let Some(token) = token {
+        headers.push(("authorization", format!("Bearer {token}")));
+    }
+    if let Some(user) = principal {
+        headers.push(("x-lumina-user", user.to_string()));
+    }
+    headers
+}
+
+/// LGUI-05 (spec §6, D2): the one namespaced arm that authenticates itself
+/// to its backend — see the module doc's "LGUI-05: Lumina bearer injection"
+/// section for the full design and why the two headers built here can never
+/// carry a browser-supplied value through.
 pub async fn proxy_lumina(
     State(_state): State<Arc<McpServerState>>,
     Path(path): Path<String>,
@@ -266,6 +337,12 @@ pub async fn proxy_lumina(
     body: Bytes,
 ) -> Response {
     let principal = principal_from_headers(&headers);
+    // Point-of-use env read (see `config::constellation_lumina_token`'s doc)
+    // and the VERIFIED session principal (from the signed session cookie,
+    // never any inbound header) -- resolves Lumina's `X-Lumina-User`
+    // convention (spec §7 C-1) for its admin-gated routes.
+    let extra_headers = lumina_upstream_headers(config::constellation_lumina_token(), principal.as_deref());
+
     proxy(
         "lumina",
         config::constellation_lumina_url(),
@@ -275,6 +352,8 @@ pub async fn proxy_lumina(
         &headers,
         body,
         principal.as_deref(),
+        &extra_headers,
+        Some("lumina auth failed"),
     )
     .await
 }
@@ -306,6 +385,8 @@ pub async fn proxy_muse(
         &headers,
         body,
         principal.as_deref(),
+        &[],
+        None,
     )
     .await
 }
@@ -397,7 +478,7 @@ async fn proxy_muse_art(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderMap;
+    use axum::http::{HeaderMap, HeaderValue};
     use serial_test::serial;
 
     #[tokio::test]
@@ -411,6 +492,8 @@ mod tests {
             Method::GET,
             &HeaderMap::new(),
             Bytes::new(),
+            None,
+            &[],
             None,
         )
         .await;
@@ -435,6 +518,8 @@ mod tests {
             Method::GET,
             &HeaderMap::new(),
             Bytes::new(),
+            None,
+            &[],
             None,
         )
         .await;
@@ -483,6 +568,8 @@ mod tests {
             &HeaderMap::new(),
             Bytes::new(),
             None,
+            &[],
+            None,
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -504,6 +591,8 @@ mod tests {
             Method::GET,
             &HeaderMap::new(),
             Bytes::new(),
+            None,
+            &[],
             None,
         )
         .await;
@@ -659,6 +748,8 @@ mod tests {
             &HeaderMap::new(),
             Bytes::from_static(br#"{"name":"new channel"}"#),
             Some("test-operator"),
+            &[],
+            None,
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -672,5 +763,216 @@ mod tests {
         assert_eq!(parsed["principal"], "test-operator");
 
         std::env::remove_var("CONSTELLATION_AUDIT_LOG_PATH");
+    }
+
+    // ── LGUI-05: Lumina bearer injection (spec §6, D2) ──────────────────────
+
+    #[test]
+    fn lumina_upstream_headers_attaches_bearer_and_x_lumina_user_when_both_present() {
+        let headers = lumina_upstream_headers(Some("secret-token".to_string()), Some("alice"));
+        assert_eq!(
+            headers,
+            vec![("authorization", "Bearer secret-token".to_string()), ("x-lumina-user", "alice".to_string())]
+        );
+    }
+
+    #[test]
+    fn lumina_upstream_headers_omits_bearer_when_token_absent() {
+        // Absent token -> unauthenticated passthrough exactly as before this item -- no
+        // `Authorization` header at all, never an empty-string one.
+        let headers = lumina_upstream_headers(None, Some("alice"));
+        assert_eq!(headers, vec![("x-lumina-user", "alice".to_string())]);
+    }
+
+    #[test]
+    fn lumina_upstream_headers_omits_x_lumina_user_when_no_principal() {
+        let headers = lumina_upstream_headers(Some("secret-token".to_string()), None);
+        assert_eq!(headers, vec![("authorization", "Bearer secret-token".to_string())]);
+    }
+
+    #[test]
+    fn lumina_upstream_headers_empty_when_both_absent() {
+        assert!(lumina_upstream_headers(None, None).is_empty());
+    }
+
+    /// Mock-upstream, wire-level test: spins up a real ephemeral HTTP server that echoes back
+    /// whatever `authorization`/`x-lumina-user` headers it actually received, then drives a
+    /// request through `proxy()` exactly as `proxy_lumina` wires it (built-with
+    /// `lumina_upstream_headers`) while ALSO setting bogus/spoofed `Authorization`/
+    /// `X-Lumina-User` headers on the INBOUND (browser-simulated) request. Asserts the upstream
+    /// sees only the server-side token + the verified principal -- never the browser-supplied
+    /// values -- proving `proxy()`'s "only `content-type` is ever read from the caller's
+    /// inbound headers" property (see the module doc) holds for the Lumina arm specifically.
+    #[tokio::test]
+    #[serial]
+    async fn lumina_proxy_attaches_server_side_bearer_and_never_forwards_browser_supplied_headers() {
+        async fn capture(headers: HeaderMap) -> Response {
+            let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+            let user = headers.get("x-lumina-user").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+            (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                json!({"auth": auth, "user": user}).to_string(),
+            )
+                .into_response()
+        }
+        let app = axum::Router::new().route("/status", axum::routing::get(capture));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind loopback"); // pii-test-fixture
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        std::env::set_var("CONSTELLATION_LUMINA_TOKEN", "server-side-secret"); // pii-test-fixture
+
+        // Simulate a browser that tried to smuggle its own Authorization/X-Lumina-User --
+        // these must never reach the upstream.
+        let mut inbound = HeaderMap::new();
+        inbound.insert("authorization", HeaderValue::from_static("Bearer browser-supplied-token"));
+        inbound.insert("x-lumina-user", HeaderValue::from_static("spoofed-user"));
+
+        let extra_headers =
+            lumina_upstream_headers(config::constellation_lumina_token(), Some("verified-operator"));
+
+        let resp = proxy(
+            "lumina",
+            Some(format!("http://{addr}")), // pii-test-fixture
+            "status",
+            None,
+            Method::GET,
+            &inbound,
+            Bytes::new(),
+            Some("verified-operator"),
+            &extra_headers,
+            Some("lumina auth failed"),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed["auth"], "Bearer server-side-secret",
+            "upstream must see the SERVER-SIDE token, never the browser-supplied Authorization header"
+        );
+        assert_eq!(
+            parsed["user"], "verified-operator",
+            "upstream must see the VERIFIED principal, never the browser-supplied X-Lumina-User header"
+        );
+
+        std::env::remove_var("CONSTELLATION_LUMINA_TOKEN");
+    }
+
+    /// Complements the test above: an ABSENT `CONSTELLATION_LUMINA_TOKEN` forwards
+    /// unauthenticated exactly as every proxy arm always has -- no `Authorization` header
+    /// reaches the upstream at all (a token-less dev Lumina instance keeps working).
+    #[tokio::test]
+    #[serial]
+    async fn lumina_proxy_forwards_unauthenticated_when_token_unset() {
+        async fn capture(headers: HeaderMap) -> Response {
+            let has_auth = headers.contains_key("authorization");
+            (StatusCode::OK, [("content-type", "application/json")], json!({"has_auth": has_auth}).to_string())
+                .into_response()
+        }
+        let app = axum::Router::new().route("/status", axum::routing::get(capture));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind loopback"); // pii-test-fixture
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        std::env::remove_var("CONSTELLATION_LUMINA_TOKEN");
+        let extra_headers = lumina_upstream_headers(config::constellation_lumina_token(), None);
+
+        let resp = proxy(
+            "lumina",
+            Some(format!("http://{addr}")), // pii-test-fixture
+            "status",
+            None,
+            Method::GET,
+            &HeaderMap::new(),
+            Bytes::new(),
+            None,
+            &extra_headers,
+            Some("lumina auth failed"),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["has_auth"], false);
+    }
+
+    /// EDGE CASE (spec §9 LGUI-05): a `401` from Lumina (token misconfigured/rejected upstream)
+    /// must degrade to the standard `{"available":false,"detail":"lumina auth failed"}` shape,
+    /// never a raw `401` forwarded to a browser that has no way to react to it (the operator's
+    /// Constellation session and the Lumina bearer are two independent credentials).
+    #[tokio::test]
+    #[serial]
+    async fn lumina_proxy_401_from_upstream_degrades_to_auth_failed_detail_not_a_raw_401() {
+        async fn unauthorized() -> Response {
+            (StatusCode::UNAUTHORIZED, "nope").into_response()
+        }
+        let app = axum::Router::new().route("/status", axum::routing::get(unauthorized));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind loopback"); // pii-test-fixture
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let resp = proxy(
+            "lumina",
+            Some(format!("http://{addr}")), // pii-test-fixture
+            "status",
+            None,
+            Method::GET,
+            &HeaderMap::new(),
+            Bytes::new(),
+            None,
+            &[],
+            Some("lumina auth failed"),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK, "never a raw 401 -- must degrade like every other backend failure");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["system"], "lumina");
+        assert_eq!(parsed["available"], false);
+        assert_eq!(parsed["detail"], "lumina auth failed");
+    }
+
+    /// Regression: `auth_failure_detail: None` (every non-Lumina arm) leaves a `401` from the
+    /// upstream forwarded VERBATIM -- the LGUI-05 degrade-on-401 behavior is Lumina-specific,
+    /// not a change to `harmony`/`chord`/`muse`'s existing pass-through semantics.
+    #[tokio::test]
+    #[serial]
+    async fn non_lumina_arms_forward_a_401_verbatim_unaffected_by_lgui_05() {
+        async fn unauthorized() -> Response {
+            (StatusCode::UNAUTHORIZED, "nope").into_response()
+        }
+        let app = axum::Router::new().route("/status", axum::routing::get(unauthorized));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind loopback"); // pii-test-fixture
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let resp = proxy(
+            "harmony",
+            Some(format!("http://{addr}")), // pii-test-fixture
+            "status",
+            None,
+            Method::GET,
+            &HeaderMap::new(),
+            Bytes::new(),
+            None,
+            &[],
+            None,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }
