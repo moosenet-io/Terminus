@@ -310,6 +310,53 @@ pub struct LegacySection {
     pub body: String,
 }
 
+/// DGDG-02: the existing, already-checked-out `docs/` tree at `checkout_path`
+/// (when a repo already has one, e.g. a one-time hand/Fable-written rewrite)
+/// -- the "deepen, not regenerate" baseline for a repo-level generation.
+/// Every field is `None`/empty exactly when nothing was found on disk, which
+/// is also the correct state for a project's first-ever repo-level run: the
+/// baseline is purely additive grounding, never required for
+/// `build_repo_facts` or any downstream pass to succeed.
+///
+/// This is read the SAME way every other checkout-scan source in this module
+/// is (`read_optional`, degrade-on-absent, no error) -- it adds no second
+/// filesystem-reading path. Content here is untrusted, model-facing input
+/// exactly like every other `RepoFacts` field: it only ever leaves this
+/// module through `RepoFacts::identity_slice` / `RepoFacts::subsystem_slice`
+/// (both of which run the WHOLE slice, existing-docs content included,
+/// through `sweep_slice`) or, for guides, through the repo-level generator's
+/// own whole-prompt sweep before every send (`generate.rs::run_guides_pass`)
+/// -- never sent to a generator raw.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ExistingDocs {
+    /// The current `README.md` content in full -- the Pass 1 identity
+    /// baseline (current tagline/what_is to refine). `None` when no README
+    /// exists yet at `checkout_path` (a genuine first-ever run).
+    pub landing: Option<String>,
+    /// `docs/reference/<subsystem>.md` content, keyed by subsystem name --
+    /// only for subsystems this `RepoFacts` actually kept (never `misc`,
+    /// which has no single reference page to deepen). A subsystem with no
+    /// entry here has no existing page and Pass 2 must write it fresh.
+    pub subsystem_pages: BTreeMap<String, String>,
+    /// `docs/getting-started.md` content, if present.
+    pub getting_started: Option<String>,
+    /// `docs/guides/<slug>.md` content, keyed by file stem (e.g.
+    /// `"run-the-fixture"` for `docs/guides/run-the-fixture.md`).
+    pub guides: BTreeMap<String, String>,
+}
+
+impl ExistingDocs {
+    /// `true` when nothing at all was found on disk -- the first-run case,
+    /// where every later pass must behave exactly as it did before this item
+    /// (no baseline to deepen from).
+    pub fn is_empty(&self) -> bool {
+        self.landing.is_none()
+            && self.subsystem_pages.is_empty()
+            && self.getting_started.is_none()
+            && self.guides.is_empty()
+    }
+}
+
 /// The full deterministic grounding for one repo at one ref. Built by
 /// [`build_repo_facts`]; never constructed with fabricated/guessed content
 /// by any other path in this crate.
@@ -328,6 +375,10 @@ pub struct RepoFacts {
     pub config_surface: ConfigSurface,
     pub prose_anchors: ProseAnchors,
     pub old_readme_sections: Vec<LegacySection>,
+    /// DGDG-02: the existing `docs/` tree at this checkout, if any -- the
+    /// "deepen, not regenerate" baseline. Empty/absent on a first-ever run;
+    /// additive only, never required for any pass to succeed.
+    pub existing_docs: ExistingDocs,
 }
 
 impl RepoFacts {
@@ -337,7 +388,7 @@ impl RepoFacts {
     /// Swept through [`sweep_input`] before it is returned; this is the
     /// ONLY way any `RepoFacts` content leaves this module for a prompt.
     pub fn identity_slice(&self) -> Result<String, ToolError> {
-        let value = json!({
+        let mut value = json!({
             "project_id": self.project_id,
             "git_ref": self.git_ref,
             "kg_grounded": self.kg_grounded,
@@ -362,6 +413,17 @@ impl RepoFacts {
             },
             "legacy_headings": self.old_readme_sections.iter().map(|s| &s.heading).collect::<Vec<_>>(),
         });
+        // DGDG-02: the current README (if this repo already has one) is the
+        // Pass 1 "deepen, don't regenerate" baseline. Inserted ONLY when it
+        // exists, so a first-ever run produces byte-identical slice JSON to
+        // before this field existed (`build_repo_identity_prompt` keys its
+        // deepen rule off the field's PRESENCE, and treats absence as "write
+        // fresh," exactly as before).
+        if let Some(landing) = &self.existing_docs.landing {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("existing_landing".to_string(), json!(landing));
+            }
+        }
         sweep_slice(&value)
     }
 
@@ -386,7 +448,7 @@ impl RepoFacts {
             .iter()
             .find(|s| !s.heading.is_empty() && s.heading.to_lowercase().contains(&name.to_lowercase()));
 
-        let value = json!({
+        let mut value = json!({
             "project_id": self.project_id,
             "subsystem": {
                 "name": subsystem.name,
@@ -402,6 +464,17 @@ impl RepoFacts {
             "config_surface": self.config_surface,
             "legacy_section": legacy_section,
         });
+        // DGDG-02: this subsystem's CURRENT `docs/reference/<name>.md` content
+        // (the Pass 2 "deepen, don't regenerate" baseline) is inserted ONLY
+        // when such a page exists, so a first-ever page produces byte-identical
+        // slice JSON to before this field existed. `build_subsystem_page_prompt`
+        // keys its deepen rule off the field's PRESENCE and treats absence as
+        // "write fresh," exactly as before.
+        if let Some(page) = self.existing_docs.subsystem_pages.get(name) {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("existing_page".to_string(), json!(page));
+            }
+        }
         sweep_slice(&value)
     }
 }
@@ -476,14 +549,21 @@ pub fn build_repo_facts(
     let subsystem_docs = build_subsystem_docs(checkout_path, &subsystems);
     let prose_anchors = ProseAnchors { crate_description, crate_root_docs, subsystem_docs };
 
-    let old_readme_sections = read_optional(&checkout_path.join("README.md"))
+    // Read the README's raw content ONCE and reuse it both for the legacy
+    // per-section split below and as DGDG-02's identity-pass baseline
+    // (`ExistingDocs::landing`) -- no second README read.
+    let readme_raw = read_optional(&checkout_path.join("README.md"));
+    let old_readme_sections = readme_raw
+        .as_deref()
         .map(|s| {
-            split_old_sections(&s)
+            split_old_sections(s)
                 .into_iter()
                 .map(|raw| LegacySection { heading: raw.heading, body: raw.body })
                 .collect()
         })
         .unwrap_or_default();
+
+    let existing_docs = scan_existing_docs(checkout_path, &subsystems, readme_raw.as_deref());
 
     Ok(RepoFacts {
         project_id: project_id.to_string(),
@@ -496,7 +576,67 @@ pub fn build_repo_facts(
         config_surface,
         prose_anchors,
         old_readme_sections,
+        existing_docs,
     })
+}
+
+/// DGDG-02: read whatever `docs/` tree already exists at `checkout_path`
+/// (`docs/reference/<subsystem>.md` for every KEPT (non-`misc`) subsystem,
+/// `docs/getting-started.md`, and every `docs/guides/*.md`) as the "deepen,
+/// not regenerate" baseline for a repo-level generation. `readme` is the
+/// README content the caller already read (never re-read here). Every read
+/// is best-effort via `read_optional` -- an absent file/tree degrades to
+/// `None`/empty, exactly like every other checkout-scan source in this
+/// module, and is the correct, additive-only state for a project's
+/// first-ever repo-level run.
+fn scan_existing_docs(checkout_path: &Path, subsystems: &[Subsystem], readme: Option<&str>) -> ExistingDocs {
+    let mut subsystem_pages = BTreeMap::new();
+    for s in subsystems {
+        if s.is_misc {
+            continue;
+        }
+        let rel = format!("docs/reference/{}.md", s.name);
+        // `s.name` is graph-derived (untrusted, same category as
+        // `Subsystem::source_dir` above) -- gate it through the same
+        // containment guard before ever joining it onto `checkout_path`.
+        if !path_within_checkout(checkout_path, &rel) {
+            continue;
+        }
+        if let Some(body) = read_optional(&checkout_path.join(&rel)) {
+            subsystem_pages.insert(s.name.clone(), body);
+        }
+    }
+
+    let getting_started = read_optional(&checkout_path.join("docs/getting-started.md"));
+
+    let mut guides = BTreeMap::new();
+    if let Ok(entries) = std::fs::read_dir(checkout_path.join("docs/guides")) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else { continue };
+            if !name.ends_with(".md") {
+                continue;
+            }
+            // Containment guard: build the repo-relative path and verify it
+            // resolves inside the checkout BEFORE reading — a symlinked
+            // `docs/guides/` dir or a symlinked `<name>.md` entry must not let
+            // this read outside `checkout_path` (same guard as the reference
+            // pages above).
+            let rel = format!("docs/guides/{name}");
+            if !path_within_checkout(checkout_path, &rel) {
+                continue;
+            }
+            let stem = name.trim_end_matches(".md");
+            if stem.is_empty() {
+                continue;
+            }
+            if let Some(body) = read_optional(&checkout_path.join(&rel)) {
+                guides.insert(stem.to_string(), body);
+            }
+        }
+    }
+
+    ExistingDocs { landing: readme.map(str::to_string), subsystem_pages, getting_started, guides }
 }
 
 // ---------------------------------------------------------------------------
@@ -1244,6 +1384,147 @@ pub fn redis() -> String { std::env::var(\"REDIS_URL\").unwrap() }\n",
 
         let err = facts.subsystem_slice("does-not-exist").unwrap_err();
         assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    // ── DGDG-02: existing-docs baseline ingestion ───────────────────────
+
+    /// Acceptance criterion 1: when a repo already has a
+    /// `docs/reference/<subsystem>.md` page, `subsystem_slice` for that
+    /// subsystem carries its content under `existing_page` as a refine
+    /// baseline; a sibling subsystem with no such page on disk gets no
+    /// fabricated one (first-run behavior for that subsystem, unaffected by
+    /// the sibling's baseline).
+    #[test]
+    fn subsystem_slice_carries_existing_reference_page_when_present_not_when_absent() {
+        let dir = tmp_checkout("existing-docs");
+        std::fs::create_dir_all(dir.join("docs/reference")).unwrap();
+        std::fs::write(
+            dir.join("docs/reference/alpha.md"),
+            "# alpha\n\nAlpha already handles routing reliably; this is the baseline to deepen.\n",
+        )
+        .unwrap();
+
+        let g = three_group_graph();
+        let facts = build_repo_facts(&FixtureGraphSource(g), &dir, "FIX", "abc").unwrap();
+
+        assert_eq!(
+            facts.existing_docs.subsystem_pages.get("alpha").map(String::as_str),
+            Some("# alpha\n\nAlpha already handles routing reliably; this is the baseline to deepen.\n")
+        );
+        assert!(facts.existing_docs.subsystem_pages.get("beta").is_none());
+
+        let alpha_slice = facts.subsystem_slice("alpha").unwrap();
+        assert!(alpha_slice.contains("existing_page"));
+        assert!(alpha_slice.contains("Alpha already handles routing reliably"));
+
+        // beta has no existing page on disk -- must not fabricate one, and
+        // must not leak alpha's baseline into beta's slice.
+        let beta_slice = facts.subsystem_slice("beta").unwrap();
+        assert!(!beta_slice.contains("Alpha already handles routing reliably"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Acceptance criterion 4: no existing docs tree at all (a genuine
+    /// first-ever run) -- `ExistingDocs` is entirely empty and every slice
+    /// behaves exactly as it did before this field existed (no fabricated
+    /// baseline anywhere).
+    #[test]
+    fn no_existing_docs_tree_yields_empty_existing_docs_first_run_case() {
+        let g = three_group_graph();
+        let facts = build_repo_facts(&FixtureGraphSource(g), Path::new("/nonexistent-dgdg02-fixture"), "FIX", "abc")
+            .unwrap();
+
+        assert!(facts.existing_docs.is_empty());
+        assert!(facts.existing_docs.landing.is_none());
+        assert!(facts.existing_docs.getting_started.is_none());
+        assert!(facts.existing_docs.guides.is_empty());
+
+        let alpha_slice = facts.subsystem_slice("alpha").unwrap();
+        assert!(!alpha_slice.contains("Alpha already"));
+    }
+
+    /// Acceptance criterion 1 (identity pass): the current README content is
+    /// carried as `existing_landing` when present; absent when there is no
+    /// README yet.
+    #[test]
+    fn identity_slice_carries_existing_landing_when_readme_present_not_when_absent() {
+        let dir = tmp_checkout("existing-landing");
+        std::fs::write(
+            dir.join("README.md"),
+            "# Demo\n\nDemo is already a solid fleet hub connecting three subsystems.\n",
+        )
+        .unwrap();
+        let facts = build_repo_facts(&NoGraphSource, &dir, "DEMO", "abc").unwrap();
+        let slice = facts.identity_slice().unwrap();
+        assert!(slice.contains("existing_landing"));
+        assert!(slice.contains("Demo is already a solid fleet hub"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let no_readme_dir = tmp_checkout("no-existing-landing");
+        let facts2 = build_repo_facts(&NoGraphSource, &no_readme_dir, "DEMO", "abc").unwrap();
+        assert!(facts2.existing_docs.landing.is_none());
+        let _ = std::fs::remove_dir_all(&no_readme_dir);
+    }
+
+    /// Acceptance criterion 3 (PII sweep): existing-doc content is untrusted
+    /// input like every other `RepoFacts` field -- a private IP embedded in
+    /// an existing `docs/reference/<subsystem>.md` page must be redacted by
+    /// the same `subsystem_slice` sweep before it could ever reach a prompt,
+    /// exactly like `identity_slice_placeholders_a_private_ip_in_a_prose_anchor`
+    /// above proves for prose anchors.
+    #[test]
+    fn subsystem_slice_sweeps_pii_in_existing_page_content() {
+        let dir = tmp_checkout("existing-docs-pii");
+        std::fs::create_dir_all(dir.join("docs/reference")).unwrap();
+        std::fs::write(
+            dir.join("docs/reference/alpha.md"),
+            "# alpha\n\nConnects to <internal-ip> for status.\n", // pii-test-fixture
+        )
+        .unwrap();
+
+        let g = three_group_graph();
+        let facts = build_repo_facts(&FixtureGraphSource(g), &dir, "FIX", "abc").unwrap();
+
+        assert!(
+            facts
+                .existing_docs
+                .subsystem_pages
+                .get("alpha")
+                .unwrap()
+                .contains("<internal-ip>"), // pii-test-fixture
+            "sanity: the raw fact carries the literal before the sweep"
+        );
+
+        let slice = facts.subsystem_slice("alpha").unwrap();
+        assert!(!slice.contains("<internal-ip>"), "the SWEPT slice must not carry the raw private IP"); // pii-test-fixture
+        assert!(slice.contains("[REDACTED:"), "a redaction marker must be present instead");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Getting-started and guides on disk are read into `ExistingDocs` for
+    /// Pass 3's baseline (threaded into the guides prompt by
+    /// `generate::run_guides_pass`, not by a `RepoFacts` slice method, since
+    /// Pass 3 already sweeps its whole assembled prompt before every send).
+    #[test]
+    fn scans_existing_getting_started_and_guides_from_disk() {
+        let dir = tmp_checkout("existing-guides");
+        std::fs::create_dir_all(dir.join("docs/guides")).unwrap();
+        std::fs::write(dir.join("docs/getting-started.md"), "Clone with `git clone <repo>`.\n").unwrap();
+        std::fs::write(dir.join("docs/guides/run-the-fixture.md"), "1. Build it.\n2. Run it.\n").unwrap();
+
+        let facts = build_repo_facts(&NoGraphSource, &dir, "DEMO", "abc").unwrap();
+        assert_eq!(
+            facts.existing_docs.getting_started.as_deref(),
+            Some("Clone with `git clone <repo>`.\n")
+        );
+        assert_eq!(
+            facts.existing_docs.guides.get("run-the-fixture").map(String::as_str),
+            Some("1. Build it.\n2. Run it.\n")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

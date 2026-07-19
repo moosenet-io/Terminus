@@ -1550,6 +1550,7 @@ It runs intake, forge, and mesh behind one gateway.".to_string(),
                 subsystem_docs: BTreeMap::new(),
             },
             old_readme_sections: vec![],
+            existing_docs: Default::default(),
         }
     }
 

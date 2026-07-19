@@ -556,7 +556,8 @@ fix/mirror-remote → main
 
 ### `gitea_merge_pr`
 
-**Purpose:** merge an existing pull request (`src/gitea/mod.rs:1330-1396`).
+**Purpose:** merge an existing pull request (`src/gitea/mod.rs`, `MergePr`) — the single
+git-merge door every build agent goes through.
 
 | Field | Type | Required | Default |
 | --- | --- | --- | --- |
@@ -566,33 +567,52 @@ fix/mirror-remote → main
 | `message` | string | no | omitted if not given |
 | `owner` | string | no | configured `GITEA_OWNER` |
 | `identity` | string | no | active-default identity |
+| `queue_key` | string | no | default `{owner}/{repo}/{base}` |
+| `min_delay_secs` | integer | no | `GITEA_MERGE_QUEUE_MIN_DELAY_SECS` (default 8) |
+| `priority` | integer | no | `0` |
+| `no_queue` | boolean | no | `false` |
 
-**Behavior:** builds `{ "Do": style }` (Gitea's merge-endpoint field name for the merge
-style) and, if `message` is present, adds `"MergeMessageField": message`. Like
-`gitea_create_repo`, this makes a **direct** `reqwest` call rather than going through
-`GiteaClient::post()` — the merge endpoint returns `200` with **no response body** on
-success, which the generic JSON-deserializing `post()` helper can't handle
-(`mod.rs:1371-1381`). A `404` is remapped to `"Pull request #{pr_num} not found in
-{owner}/{repo}"`; any other non-2xx surfaces as `ToolError::Http("Merge failed: {status}:
-{body}")`.
+**Behavior:** fetches the PR (`GET /pulls/{pr}`) to learn its real `base`/`head` (the merge
+endpoint itself returns `200` with no useful body), then `POST`s `{ "Do": style,
+"MergeMessageField": message? }` to `/pulls/{pr}/merge`. A `404` is remapped to `"Pull
+request #{pr_num} not found in {owner}/{repo}"`; any other non-2xx surfaces as
+`ToolError::Http("Merge failed: {status}: {body}")`.
 
-**Output shape:** plain text, built from a `format!` whose named argument is worth reading
-literally (`mod.rs:1394`):
+**Merge ordering + delay (GMQ-01..04, `docs/specs/S120-gitea-merge-queue.md`).** When
+`REDIS_URL` is configured (see the top of `.env.example`) and
+`GITEA_MERGE_QUEUE_ENABLED` isn't explicitly disabled, every call to this tool routes
+through a per-base **merge queue** before the merge POST:
+- **Ordering** — concurrent merges to the *same* `queue_key` (default
+  `{owner}/{repo}/{base}`) are serialized and served FIFO, priority-weighted by the
+  `priority` argument (higher runs earlier; ties broken by enqueue order). A waiter that
+  can't get its turn within `GITEA_MERGE_QUEUE_MAX_WAIT_SECS` gets a clear "queue busy,
+  retry" error instead of hanging.
+- **Min-delay spacing** — successive merges to the same key are spaced at least
+  `min_delay_secs` (default `GITEA_MERGE_QUEUE_MIN_DELAY_SECS`, `8`s) apart, so `main` can
+  settle and CI/the mirror runner can react before the next merge lands.
+- **Stale-base guard** — immediately before the POST, the fetched PR is re-checked:
+  `merged == true` returns an idempotent success (no second POST); `mergeable ==
+  Some(false)` is rejected with a "not mergeable (stale base or conflict) — rebase and
+  retry" error instead of racing a doomed merge.
+- **`no_queue: true`** bypasses all of the above for a single call (e.g. an emergency
+  merge) — it POSTs immediately, unordered and unspaced.
+
+**Degrade-open, back-compatible:** with no `REDIS_URL` configured, `GITEA_MERGE_QUEUE_ENABLED`
+set false, or `no_queue: true`, this tool behaves **exactly** as it did before GMQ-04 — a
+single fetch, a single POST, no ordering/spacing/guard. All four new arguments are optional;
+an existing caller passing only `{repo, pr}` is unaffected either way.
+
+**Output shape:** plain text reporting the PR's real base branch (fixed in GMQ-01; a
+pre-GMQ-01 bug reported the merge `style` in that position instead):
 ```rust
-Ok(format!("Pull request #{pr_num} merged into {base} in {owner}/{repo}.", base = style))
+Ok(format!("Pull request #{pr_num} merged into {base} in {owner}/{repo}.", base = <real base>))
 ```
-The `{base}` placeholder is bound to the **`style`** variable, not the PR's actual target
-branch — so the success message reports the merge *style* (`merge`/`rebase`/`squash`) in the
-position a reader would expect the target branch name. This is what the code does today; if
-you need to know the actual base branch a PR merged into, call `gitea_list_prs` (which
-reports the real `base.ref_name`) rather than trusting this message's wording.
 
 **Worked example**
 
 Request: `{ "repo": "Chord", "pr": 42, "style": "squash" }`
 
-Response (text): `Pull request #42 merged into squash in moosenet/Chord.` (see the caveat
-above — this repo's actual base branch, e.g. `main`, is not what's printed here).
+Response (text): `Pull request #42 merged into main in moosenet/Chord.`
 
 ---
 
