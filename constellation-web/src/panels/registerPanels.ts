@@ -20,10 +20,13 @@
 //   Harmony:  Dashboard, Projects, Tasks, Agents, PRs, Prompts, Sessions, AuditLog,
 //             Analytics (was status.analytics), Engine Diagram (was status.engine-diagram)
 //   Chord:    Inference, Providers, Playground
+//   Muse:     Dashboard, Taste, Channels (CONST-20)
 //   Terminus: Config (existing example TerminusPanel), plus CONST-28's module-self build:
 //             Fleet, Tools, Activity
 //   Lumina:   stub (config surface TBD in CONST-07)
 import { registerPanel, registerModule } from '../lib/moduleRegistry';
+import { registerCommand } from '../lib/commandRegistry';
+import { getCurrentPath, requestHealthRefresh } from '../lib/shellBridge';
 import { TerminusPanel } from './terminus/TerminusPanel';
 import { FleetPanel } from './terminus/FleetPanel';
 import { ToolsPanel } from './terminus/ToolsPanel';
@@ -32,6 +35,9 @@ import { LuminaStubPanel } from './lumina/LuminaStubPanel';
 import { EngineDiagramPanel } from './status/EngineDiagramPanel';
 import { DashboardPanel } from './harmony/DashboardPanel';
 import { ProjectsPanel } from './harmony/ProjectsPanel';
+import { DashboardPanel as MuseDashboardPanel } from './muse/DashboardPanel';
+import { TastePanel as MuseTastePanel } from './muse/TastePanel';
+import { ChannelsPanel as MuseChannelsPanel } from './muse/ChannelsPanel';
 import { Tasks } from '../pages/Tasks';
 import { Agents } from '../pages/Agents';
 import { PRs } from '../pages/PRs';
@@ -50,8 +56,7 @@ import { Analytics } from '../pages/Analytics';
 registerModule({ id: 'harmony', title: 'Harmony', icon: '⌂', healthSystem: 'harmony', order: 1 });
 registerModule({ id: 'chord', title: 'Chord', icon: '⚡', healthSystem: 'chord', order: 2 });
 registerModule({ id: 'lumina', title: 'Lumina', icon: '✦', healthSystem: 'lumina', order: 3 });
-// CONST-19: module registration only -- no panels yet (CONST-20 adds
-// muse.dashboard/muse.taste/muse.channels).
+// CONST-19 registered the module; CONST-20 adds its three panels below.
 registerModule({ id: 'muse', title: 'Muse', icon: '🎬', healthSystem: 'muse', order: 4 });
 registerModule({ id: 'terminus', title: 'Terminus', icon: '⚙', healthSystem: 'terminus', order: 7 });
 
@@ -190,6 +195,38 @@ registerPanel({
   component: Playground,
 });
 
+// ── Muse (CONST-20) ──────────────────────────────────────────────────────────
+
+registerPanel({
+  id: 'muse.dashboard',
+  system: 'muse',
+  title: 'Dashboard',
+  path: '/muse/dashboard',
+  icon: '🎬',
+  available: true,
+  component: MuseDashboardPanel,
+});
+
+registerPanel({
+  id: 'muse.taste',
+  system: 'muse',
+  title: 'Taste',
+  path: '/muse/taste',
+  icon: '📈',
+  available: true,
+  component: MuseTastePanel,
+});
+
+registerPanel({
+  id: 'muse.channels',
+  system: 'muse',
+  title: 'Channels',
+  path: '/muse/channels',
+  icon: '📺',
+  available: true,
+  component: MuseChannelsPanel,
+});
+
 // ── Terminus ─────────────────────────────────────────────────────────────────
 
 registerPanel({
@@ -245,4 +282,29 @@ registerPanel({
   icon: '✦',
   available: false,
   component: LuminaStubPanel,
+});
+
+// ── Palette commands (CONST-25) ────────────────────────────────────────────────
+// A couple of sensible starter actions, registered the same way panels are — one line each,
+// no shell change needed. Every other panel adds its own `registerCommand` calls the same way.
+
+registerCommand({
+  id: 'shell.refresh-health',
+  title: 'Refresh health',
+  subtitle: 'Re-poll /api/health for every module now',
+  icon: '⟳',
+  run: () => requestHealthRefresh(),
+});
+
+registerCommand({
+  id: 'shell.copy-current-path',
+  title: 'Copy current path',
+  subtitle: 'Copies the current route to the clipboard',
+  icon: '⧉',
+  run: () => {
+    navigator.clipboard?.writeText(getCurrentPath()).catch(() => {
+      // Clipboard permission denied/unavailable — the command just silently no-ops, same
+      // convention as the rest of the shell's non-critical UI actions.
+    });
+  },
 });
