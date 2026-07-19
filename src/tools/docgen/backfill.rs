@@ -1,92 +1,84 @@
-//! DLAND-05 / DLAND-RELOC: one-shot backfill -- migrate an already-bloated
-//! repo README, operator-reviewed (S119, spec `S119-docgen-landing-hierarchy`,
-//! Plane project TERM).
+//! DGRICH-08: invert backfill -- the rich, KG-grounded pipeline is now the
+//! PRIMARY product; verbatim relocation of the old README is a no-loss
+//! BACKSTOP only (S119, spec `S119-dgrich-rich-doc-generator`, design
+//! `fable-docgen-redesign.md` §5, Plane project TERM).
 //!
-//! ## DLAND-RELOC (mechanical relocation, supersedes DLAND-05's LLM-only flow)
-//! A live run proved the original DLAND-05 flow (LLM-regenerate the whole
-//! README) is lossy BY CONSTRUCTION: an LLM asked to write a concise landing
-//! naturally SUMMARIZES (a 2285-line README became a 61-line landing) and
-//! produces no `docs/` tree of its own, so [`super::preserve::check_preservation`]
-//! correctly withheld every cutover. [`backfill_readme`] now separates the two
-//! jobs the old flow conflated:
-//! - The LLM is used ONLY to produce the concise top-page landing (hero +
-//!   quick start) -- still via [`super::trigger::run_docgen_trigger`] with
-//!   `place=false`, but its (necessarily empty, since it never saw the old
-//!   README's sections rendered as its own docs) `docs_tree` is IGNORED.
-//! - The `docs/` tree is instead built MECHANICALLY, directly from the OLD
-//!   README: [`old_readme_parts`] (a byte-offset slicer -- see its doc for why
-//!   this is deliberately distinct from the no-loss guard's line-based
-//!   `split_old_sections`) splits it into a
-//!   preamble plus one entry per top-level `## ` section, and each section's
-//!   heading + body is copied VERBATIM into its own `docs/reference/<slug>.md`
-//!   page (see [`build_docs_tree_from_old_readme`]). Verbatim copying makes
-//!   the no-loss guarantee true BY CONSTRUCTION, not by hoping an LLM's
-//!   paraphrase happens to keep every stable token.
-//! - The final landing is the LLM's hero/quick-start text with any
-//!   LLM-authored `## Documentation`-shaped section and any `docs/…` links
-//!   stripped (they would dangle against the mechanical tree), followed by a
-//!   mechanically-built `## Documentation` section linking to the mechanical
-//!   `docs/index.md` hub -- see [`assemble_final_landing`].
+//! ## History: DLAND-05 -> DLAND-RELOC -> DGRICH-08
+//! [`backfill_readme`] originally (DLAND-05) asked an LLM to rewrite the
+//! whole README, which was lossy by construction (an LLM asked for a concise
+//! landing summarizes). DLAND-RELOC fixed the loss by giving up on
+//! generation for the `docs/` tree entirely: the LLM produced only the
+//! landing's hero/quick-start, and EVERY old `## ` section was copied
+//! verbatim into its own `docs/reference/<slug>.md` page. That guaranteed
+//! no-loss, but it also guaranteed every sub-page was exactly as good as the
+//! old bloated README's section -- unorganized, unexplained, not
+//! reference-shaped -- because generation was never really in the loop for
+//! the `docs/` tree at all.
 //!
-//! [`super::preserve::check_preservation`] (DLAND-02) and the DLAND-03 landing
-//! gates ([`super::readme_layers::check_landing_length`]/
-//! [`super::readme_layers::check_landing_links`]) still run exactly as
-//! before, and [`super::place::place_docs`] (DLAND-01) is still the sole
-//! placement writer -- this item changes WHAT is checked/placed, not the
-//! guard/gate/writer machinery itself.
+//! DGRICH-08 inverts this again, all the way this time: [`backfill_readme`]
+//! now runs the SAME rich, KG-grounded pipeline DGRICH-07's repo-level
+//! trigger mode runs (`RepoFacts` -> `generate_repo_docs` -> `build_landing_body`
+//! -> `build_repo_docs_tree`) as the PRIMARY product. The old README is fed
+//! in as `RepoFacts`' own Pass-0 input #7 (`old_readme_sections`, "legacy
+//! claims to verify") -- it is grounding material for the generator, not the
+//! output. Verbatim relocation survives, but ONLY as the no-loss BACKSTOP:
+//! after generation, [`super::preserve::check_preservation`] runs against
+//! the generated landing + docs tree, and any old section whose substance
+//! generation did NOT cover is relocated VERBATIM (byte-exact, via the same
+//! [`old_readme_parts`] byte-offset slicer DLAND-RELOC introduced) to
+//! `docs/legacy/<slug>.md`, linked from `reference/index.md`
+//! ([`super::render::docs_tree::build_repo_docs_tree`]'s `legacy_pages`
+//! parameter). No-loss stays true by construction -- coverage is always
+//! 1.0 -- but now by EXCEPTION, not as the whole output.
 //!
-//! ## Nothing reimplemented
-//! - [`super::trigger::run_docgen_trigger`] is the sole generation
-//!   orchestration (PII sweep, Chord call, per-target render) -- called with
-//!   `place=false` so this module decides placement itself.
-//! - [`old_readme_parts`] is this module's own byte-offset section slicer for
-//!   VERBATIM relocation -- deliberately separate from the no-loss guard's
-//!   line-based `split_old_sections` (which normalises whitespace to compare
-//!   tokens); see [`old_readme_parts`] for why byte-exact slices are required.
-//! - [`super::preserve::check_preservation`] (DLAND-02) is the sole no-loss
-//!   guard -- no second coverage check.
-//! - [`super::readme_layers::check_landing_length`] /
-//!   [`super::readme_layers::check_landing_links`] (DLAND-03) are the sole
-//!   landing lints -- surfaced here for the summary, and re-enforced
-//!   fail-closed inside [`super::place::place_docs`] regardless.
-//! - [`super::place::place_docs`] (DLAND-01) is the sole placement writer --
-//!   atomic, idempotent, working-tree-only, no git/network.
+//! ## Reuse plan (nothing reimplemented)
+//! - [`super::repo_facts::build_repo_facts`] (DGRICH-01) -- the sole
+//!   deterministic grounding-layer builder; the old README already reaches it
+//!   as `old_readme_sections` via [`super::preserve::split_old_sections`].
+//! - [`super::generate::generate_repo_docs`] (DGRICH-03) -- the sole
+//!   Passes-1-3 orchestrator over the unchanged `DocGenerator` seam.
+//! - [`super::readme_layers::build_landing_body`] (DGRICH-05) -- the sole
+//!   rich-landing assembler.
+//! - [`super::render::docs_tree::build_repo_docs_tree`] (DGRICH-06) -- the
+//!   sole rich docs-tree renderer; its `legacy_pages` parameter is exactly
+//!   what this module populates.
+//! - [`super::preserve::check_preservation`] (DLAND-02) -- the sole no-loss
+//!   guard, run TWICE here: once to find generation's coverage gap, once
+//!   (backstop-verified, never just trusted) after legacy relocation closes
+//!   it.
+//! - [`old_readme_parts`]/[`slugify`] -- this module's own byte-offset
+//!   slicer, kept EXACTLY as DLAND-RELOC built it (byte-exact verbatim
+//!   slices are still what a legacy page needs), now invoked only for the
+//!   sections the no-loss guard actually flags, not every section.
+//! - [`super::place::place_docs`] (DLAND-01) -- the sole placement writer.
 //!
 //! ## First cutover is operator-reviewed, never auto-committed
-//! This module NEVER runs git (no add/commit/push) and makes NO forge
-//! (Plane/Gitea/GitHub) call of any kind -- it only reads `target_root`'s
-//! current `README.md` (if any) and writes a working copy via `place_docs`.
-//! The result is handed to the normal build pipeline (worktree diff -> review
-//! -> merge) for an operator to bless, exactly like every other change to a
-//! tracked repo.
+//! Unchanged: this module never runs git and makes no Plane/Gitea/GitHub
+//! call -- it only reads `target_root`'s current `README.md` (if any) and
+//! writes a working copy via `place_docs`, for the normal build pipeline
+//! (worktree diff -> review -> merge) to carry from there.
 //!
-//! ## No-loss is now true by construction, the guard stays as a backstop
-//! Because every old `##` section is copied VERBATIM into
-//! `docs/reference/*.md`, [`super::preserve::check_preservation`] should
-//! always report `missing` empty / `coverage_ratio` `1.0` for this flow. The
-//! "refuse to place if `missing` is non-empty" check is KEPT regardless --
-//! never trust a guarantee is self-enforcing when a cheap, already-existing
-//! check can verify it for free; see `mechanical_relocation_preserves_every_old_section`
-//! below for the positive proof and the module's negative safety net.
+//! ## Safe fallback when generation is flagged/degraded
+//! When the identity pass never succeeds (Chord unreachable, a parse/lint
+//! violation surviving retry), [`super::generate::generate_repo_docs`]
+//! returns `identity: None` and this module assembles a minimal, honest
+//! landing rather than fabricating one. Because that minimal landing covers
+//! almost nothing, essentially every old section is uncovered by generation
+//! and therefore relocates to the legacy backstop -- exactly today's
+//! (DLAND-RELOC) all-verbatim behavior, reached here as an emergent
+//! consequence of the SAME coverage check, not a special case.
+//!
+//! ## No-loss is proven, never merely trusted
+//! Even though legacy relocation makes coverage 1.0 by construction, the
+//! no-loss guard is re-run against the FINAL landing + docs tree (including
+//! the legacy pages) before placement -- "never trust a guarantee is
+//! self-enforcing when a cheap, already-existing check can verify it for
+//! free" (the same posture DLAND-RELOC's own module doc comment stated).
 //!
 //! ## Idempotent, re-runnable
 //! Like [`super::place::place_docs`] itself, re-running this against an
-//! already-migrated repo either produces `GenerationOutcome::NoChange` (the
-//! generator has nothing new to say) or a placement whose `written` list is
-//! empty (byte-identical content already on disk) -- never a spurious diff.
-//!
-//! ## Edge cases (spec)
-//! - A repo already concise (`GenerationOutcome::NoChange`) -> no-op,
-//!   `summary` says so, `placed = false`.
-//! - A repo with no `README.md` at `target_root` -> treated as first-doc
-//!   generation (`existing_docs = None`); there is nothing to preserve, so
-//!   the no-loss guard trivially passes (nothing to lose), and the
-//!   mechanical `docs/` tree built from an empty old README is just an
-//!   (empty-contents) index page.
-//! - An old README with NO `## ` headings at all -> [`super::preserve::split_old_sections`]'s
-//!   own EDGE CASE applies: the whole body becomes ONE section (labeled
-//!   "Overview" for its `docs/reference/overview.md` page here), so it is
-//!   still relocated, never dropped.
+//! already-migrated repo produces a placement whose `written` list is empty
+//! (byte-identical content already on disk) -- never a spurious diff.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -98,19 +90,19 @@ use crate::error::ToolError;
 use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
-use super::config::DocTargetType;
-use super::generate::{ChordDocGenerator, DocGenerator, GenerationOutcome};
+use super::diagram::{is_generic_placeholder, subsystem_architecture_mermaid_source};
+use super::generate::{generate_repo_docs, ChordDocGenerator, DocGenerator};
+use super::pii_gate::sweep_input;
 use super::place::{place_docs, README_PATH};
 use super::preserve::{check_preservation, Section};
-use super::readme_layers::{
-    check_landing_length, check_landing_links, landing_line_count, DOCS_INDEX_PATH, LANDING_MAX_LINES,
-};
-use super::render::docs_tree::DocsTreeFile;
-use super::trigger::{run_docgen_trigger, TriggerOutcome};
-use super::versioning::VersionStore;
+use super::readme_layers::{build_landing_body, check_landing_substance, fact_row, landing_line_count};
+use super::render::docs_tree::{build_repo_docs_tree, DocsTreeFile};
+use super::repo_facts::{build_repo_facts, AtlasGraphSource, GraphSource, RepoFacts};
+use super::trigger::declares_no_targets;
+use super::versioning::{ArtifactKey, VersionStore};
 
 // ---------------------------------------------------------------------------
-// Mechanical relocation (DLAND-RELOC): old README sections -> docs/ verbatim
+// No-loss backstop: byte-offset slicer (DLAND-RELOC, unchanged) + labeling
 // ---------------------------------------------------------------------------
 
 /// Turn a heading (or the "no headings" fallback label) into a filesystem-
@@ -134,31 +126,6 @@ fn slugify(heading: &str) -> String {
     slug.trim_end_matches('-').to_string()
 }
 
-/// Mechanically build the `docs/` tree from the OLD README: a preamble (if
-/// any, verbatim) plus one `docs/reference/<slug>.md` page per top-level
-/// `## ` section, each holding that section's EXACT ORIGINAL SOURCE BYTES --
-/// no paraphrasing, no summarizing, not even an appended newline. Section
-/// boundaries come from [`old_readme_parts`], a purpose-built BYTE-OFFSET
-/// slicer: it deliberately differs from [`super::preserve::split_old_sections`]
-/// (the line-based, whitespace-trimming parser the no-loss guard uses to
-/// COMPARE tokens) precisely because relocation needs byte-exact source spans,
-/// not parsed/normalised heading+body fields. Both agree on where `## `
-/// sections begin. Slugs are de-duplicated with a numeric suffix on collision
-/// (`install`, `install-2`, ...). Returns `docs/index.md` (a hub page: short
-/// title + verbatim preamble + a link list to every reference page, by its
-/// original heading text) first, followed by the reference pages in original
-/// section order.
-///
-/// An old README with NO `## ` headings at all still produces exactly one
-/// reference page (the whole document, verbatim, labeled "Overview") -- so
-/// nothing is ever silently dropped for lack of section structure.
-/// Split the OLD README into (verbatim preamble, [(heading, VERBATIM source
-/// slice)]) using EXACT byte offsets. Each section's slice is the original
-/// source from its `## ` line through just before the next `## ` line (or EOF),
-/// copied byte-for-byte -- so a relocated docs page contains the section's exact
-/// authored heading, blank lines, and body, not a reconstruction from parsed
-/// fields (which would normalise whitespace / heading formatting). This is what
-/// makes the relocation truly loss-free.
 /// If `trimmed` (a line with leading whitespace already removed) opens or closes
 /// a code fence, return its marker `(char, run_length)` -- a run of at least 3
 /// backticks or tildes. Otherwise `None`.
@@ -175,16 +142,21 @@ fn fence_marker(trimmed: &str) -> Option<(char, usize)> {
     }
 }
 
+/// Split the OLD README into (verbatim preamble, [(heading, VERBATIM source
+/// slice)]) using EXACT byte offsets. Each section's slice is the original
+/// source from its `## ` line through just before the next `## ` line (or
+/// EOF), copied byte-for-byte -- so a relocated legacy page contains the
+/// section's exact authored heading, blank lines, and body, not a
+/// reconstruction from parsed fields (which would normalise whitespace /
+/// heading formatting). Deliberately distinct from
+/// [`super::preserve::split_old_sections`] (the line-based, whitespace-
+/// trimming parser the no-loss guard uses to COMPARE tokens) precisely
+/// because relocation needs byte-exact source spans; both agree on where
+/// `## ` sections begin, tracking fenced code blocks so a literal `## `
+/// line inside a fence is never mistaken for a real section boundary.
 fn old_readme_parts(old: &str) -> (String, Vec<(String, String)>) {
     let mut starts: Vec<(usize, String)> = Vec::new();
     let mut offset = 0usize;
-    // Track fenced code blocks (CommonMark-style) so a literal `## ` line INSIDE
-    // a fence (e.g. a shell/markdown example) is never mistaken for a real
-    // section boundary -- otherwise a code example would be split across pages,
-    // breaking its fence and inventing a bogus reference page. A fence remembers
-    // its marker char AND length: it closes ONLY on a same-char fence of at
-    // least the opening length, so a `~~~` inside a ``` fence (or vice versa)
-    // does not spuriously close it.
     let mut fence: Option<(char, usize)> = None;
     for line in old.split_inclusive('\n') {
         let trimmed = line.trim_start();
@@ -227,186 +199,84 @@ fn old_readme_parts(old: &str) -> (String, Vec<(String, String)>) {
     (preamble, sections)
 }
 
-fn build_docs_tree_from_old_readme(old_readme: &str) -> Vec<DocsTreeFile> {
-    let (preamble, sections) = old_readme_parts(old_readme);
+/// Every OLD-README section, labeled EXACTLY the way
+/// [`check_preservation`] labels its `missing`/`covered` entries (same
+/// duplicate-heading disambiguation, same order), paired with the
+/// filesystem-safe slug [`old_readme_parts`]' sections get assigned in
+/// original document order and each section's byte-exact verbatim content.
+/// Building this labeling in lockstep with `check_preservation`'s own is
+/// what lets a [`Section::heading`] reported as `missing` be matched back to
+/// its verbatim source unambiguously -- see [`backfill_readme_with_graph_source`]
+/// for the filter that does that matching.
+fn label_and_slug_old_sections(old_readme: &str) -> Vec<(String, String, String)> {
+    let (_preamble, sections) = old_readme_parts(old_readme);
 
+    let mut total_counts: HashMap<&str, usize> = HashMap::new();
+    for (heading, _) in &sections {
+        *total_counts.entry(heading.as_str()).or_insert(0) += 1;
+    }
+
+    let mut seen_counts: HashMap<&str, usize> = HashMap::new();
     let mut slug_counts: HashMap<String, usize> = HashMap::new();
-    // (slug, heading label for the index link list, VERBATIM page content)
-    let mut pages: Vec<(String, String, String)> = Vec::with_capacity(sections.len());
+    let mut out = Vec::with_capacity(sections.len());
 
-    for (heading, slice) in &sections {
-        let heading_label =
-            if heading.trim().is_empty() { "Overview".to_string() } else { heading.clone() };
+    for (heading, content) in &sections {
+        let occurrence = {
+            let c = seen_counts.entry(heading.as_str()).or_insert(0);
+            *c += 1;
+            *c
+        };
+        let is_duplicate = total_counts.get(heading.as_str()).copied().unwrap_or(0) > 1;
+
+        let label = if heading.trim().is_empty() {
+            "(whole document)".to_string()
+        } else if is_duplicate {
+            format!("{heading} (#{occurrence})")
+        } else {
+            heading.clone()
+        };
+
+        let heading_label_for_slug = if heading.trim().is_empty() { "Overview".to_string() } else { heading.clone() };
         let base_slug = {
-            let s = slugify(&heading_label);
+            let s = slugify(&heading_label_for_slug);
             if s.is_empty() { "section".to_string() } else { s }
         };
-        let count = slug_counts.entry(base_slug.clone()).or_insert(0);
-        *count += 1;
-        let slug = if *count == 1 { base_slug } else { format!("{base_slug}-{count}") };
+        let slug_count = slug_counts.entry(base_slug.clone()).or_insert(0);
+        *slug_count += 1;
+        let slug = if *slug_count == 1 { base_slug } else { format!("{base_slug}-{slug_count}") };
 
-        // The page IS the exact original source slice -- byte-for-byte, no
-        // trailing newline appended, no reconstruction. Whatever bytes the
-        // author wrote for this section are exactly what the docs page holds.
-        pages.push((slug, heading_label, slice.clone()));
+        out.push((label, slug, content.clone()));
     }
 
-    let mut docs_tree = Vec::with_capacity(pages.len() + 1);
+    out
+}
 
-    let mut index = String::from("# Documentation Index\n\n");
-    if !preamble.is_empty() {
-        index.push_str(&preamble);
-        index.push_str("\n\n");
-    }
-    if pages.is_empty() {
-        index.push_str("_Nothing was relocated from the old README -- it had no content to preserve._\n");
+/// A safe, honest landing for when the identity pass (Pass 1) never
+/// succeeds -- own copy of the same fallback
+/// [`super::trigger`]'s repo-level trigger uses (that module keeps its copy
+/// private; duplicated here rather than exposed cross-module for a ~15-line
+/// helper). Never fabricates a `RepoIdentity`, never unwraps/panics.
+fn minimal_landing(facts: &RepoFacts, docs_tree: &[DocsTreeFile]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("<h1 align=\"center\">{}</h1>\n\n", facts.project_id));
+    out.push_str(
+        "<p align=\"center\"><em>Documentation generation did not complete this round -- see \
+the pass ledger for details.</em></p>\n\n",
+    );
+    out.push_str(&format!("<p align=\"center\">{}</p>\n\n", fact_row(facts)));
+    out.push_str("---\n\n");
+    out.push_str("## Documentation\n\n");
+    if docs_tree.is_empty() {
+        out.push_str("_No documentation pages were generated this round._\n");
     } else {
-        index.push_str("## Contents\n\n");
-        for (slug, heading_label, _) in &pages {
-            index.push_str(&format!("- [{heading_label}](reference/{slug}.md)\n"));
+        out.push_str("| Page |\n|---|\n");
+        for f in docs_tree {
+            out.push_str(&format!("| {} |\n", f.path));
         }
     }
-    docs_tree.push(DocsTreeFile { path: DOCS_INDEX_PATH.to_string(), content: index });
-
-    for (slug, _heading_label, content) in pages {
-        docs_tree.push(DocsTreeFile { path: format!("docs/reference/{slug}.md"), content });
-    }
-
-    docs_tree
-}
-
-/// Remove a top-level `## Documentation`-named section (heading text through
-/// the next `## ` heading or end of content) from `landing`, if present.
-/// The LLM's own landing may have authored a Documentation section pointing
-/// at docs paths it invented (and never actually rendered anywhere, per the
-/// module doc comment) -- those links would dangle against the mechanical
-/// `docs/` tree, so this strips the whole section rather than leaving a
-/// broken link behind. A single linear pass over `landing.lines()`.
-fn strip_documentation_section(landing: &str) -> String {
-    let mut out = String::with_capacity(landing.len());
-    let mut skipping = false;
-    for line in landing.lines() {
-        let trimmed = line.trim_start();
-        if let Some(title) = trimmed.strip_prefix("## ") {
-            skipping = title.trim().eq_ignore_ascii_case("documentation");
-            if skipping {
-                continue;
-            }
-        }
-        if skipping {
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
+    out.push_str("\n## Contributing\n\nSee the project's build pipeline docs for the contribution process.\n\n");
+    out.push_str("## License\n\nSee LICENSE.\n");
     out
-}
-
-/// Strip any remaining markdown link whose target starts with `docs/`,
-/// keeping the link's LABEL text (so the surrounding prose still reads
-/// sensibly) but dropping the `(docs/...)` target -- any such link would
-/// dangle against the mechanically-built `docs/` tree, which never contains
-/// whatever path the LLM invented. Char-boundary-safe single forward scan
-/// (matching this crate's existing link-scanning style in
-/// `readme_layers::extract_link_targets`), never a regex dependency.
-fn strip_dangling_docs_links(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0usize;
-    while i < text.len() {
-        if text.as_bytes()[i] == b'[' {
-            if let Some(rel_close_bracket) = text[i + 1..].find(']') {
-                let close_bracket = i + 1 + rel_close_bracket;
-                if text[close_bracket + 1..].starts_with('(') {
-                    let paren_start = close_bracket + 1;
-                    if let Some(rel_close_paren) = text[paren_start + 1..].find(')') {
-                        let close_paren = paren_start + 1 + rel_close_paren;
-                        let target = &text[paren_start + 1..close_paren];
-                        if target.starts_with("docs/") {
-                            out.push_str(&text[i + 1..close_bracket]);
-                            i = close_paren + 1;
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
-        let ch = text[i..].chars().next().expect("i < text.len() guarantees a char at i");
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    out
-}
-
-/// Collapse runs of 2+ consecutive blank lines down to a single blank line.
-/// Stripping a whole `## Documentation` section (or several dangling links)
-/// out of the middle of a document tends to leave extra blank lines behind;
-/// left alone they'd eat into the [`LANDING_MAX_LINES`] budget for nothing.
-fn collapse_blank_lines(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut blank_run = 0usize;
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            blank_run += 1;
-            if blank_run <= 1 {
-                out.push('\n');
-            }
-        } else {
-            blank_run = 0;
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out
-}
-
-/// Trim `body`'s TAIL (never the supplied `doc_section`) so that
-/// `body` + a blank-line separator + `doc_section` fits within
-/// [`LANDING_MAX_LINES`] lines total. The Documentation section (the one
-/// piece of content that makes the mechanical `docs/` tree reachable at all)
-/// is never dropped, even from a very long LLM hero/quick-start -- only
-/// trailing prose above it is cut.
-fn enforce_landing_length(body: &str, doc_section: &str) -> String {
-    // `body` (trimmed) + one blank separator line + `doc_section` (trimmed) + a
-    // trailing newline -- account for the separator explicitly in the budget.
-    let doc_lines = doc_section.trim_end().lines().count();
-    let budget = LANDING_MAX_LINES.saturating_sub(doc_lines + 1);
-    let body_trimmed = body.trim_end();
-    let body_lines: Vec<&str> = body_trimmed.lines().collect();
-    let final_body = if body_lines.len() > budget {
-        body_lines[..budget].join("\n")
-    } else {
-        body_trimmed.to_string()
-    };
-    format!("{}\n\n{}\n", final_body.trim_end(), doc_section.trim_end())
-}
-
-/// Assemble the FINAL landing: the LLM's concise hero/quick-start content,
-/// with any LLM-authored `## Documentation` section and any dangling
-/// `docs/...` links stripped (see [`strip_documentation_section`]/
-/// [`strip_dangling_docs_links`]), followed by a mechanically-built
-/// `## Documentation` section linking to the mechanical `docs/index.md` hub
-/// plus up to 3 of its reference pages -- every `docs/` link this function
-/// emits is a path taken DIRECTLY from `docs_tree`, so [`check_landing_links`]
-/// always passes against it. Stays within [`LANDING_MAX_LINES`] via
-/// [`enforce_landing_length`].
-fn assemble_final_landing(llm_landing: &str, docs_tree: &[DocsTreeFile]) -> String {
-    let stripped = collapse_blank_lines(&strip_dangling_docs_links(&strip_documentation_section(llm_landing)));
-
-    let mut doc_section = String::from("## Documentation\n\n");
-    doc_section
-        .push_str(&format!("See [the documentation index]({DOCS_INDEX_PATH}) for the full reference.\n"));
-    let top_pages: Vec<&DocsTreeFile> =
-        docs_tree.iter().filter(|f| f.path.starts_with("docs/reference/")).take(3).collect();
-    if !top_pages.is_empty() {
-        doc_section.push('\n');
-        for f in top_pages {
-            let heading = f.content.lines().next().unwrap_or("").trim_start_matches('#').trim();
-            let label = if heading.is_empty() { f.path.as_str() } else { heading };
-            doc_section.push_str(&format!("- [{label}]({})\n", f.path));
-        }
-    }
-
-    enforce_landing_length(&stripped, &doc_section)
 }
 
 // ---------------------------------------------------------------------------
@@ -414,44 +284,61 @@ fn assemble_final_landing(llm_landing: &str, docs_tree: &[DocsTreeFile]) -> Stri
 // ---------------------------------------------------------------------------
 
 /// The result of one [`backfill_readme`] call: what the OLD README looked
-/// like, what the migration would produce (or did produce), and whether it
-/// was actually placed into the working copy. This is DATA for an operator
-/// to review before the normal build pipeline carries the working-copy
-/// change through review/merge -- this module never commits/pushes/acts on
-/// its own beyond writing the working copy itself.
+/// like, what the rich pipeline produced, how much of that the model itself
+/// covered vs. how much fell back to the verbatim legacy backstop, and
+/// whether it was actually placed into the working copy. This is DATA for an
+/// operator to review before the normal build pipeline carries the
+/// working-copy change through review/merge -- this module never
+/// commits/pushes/acts on its own beyond writing the working copy itself.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BackfillReport {
     /// Whether `target_root/README.md` existed before this call.
     pub old_readme_existed: bool,
     /// Line count of the OLD `README.md`, or `0` if none existed.
     pub old_readme_lines: usize,
-    /// Line count of the NEW concise landing README, if generation actually
-    /// produced one (`None` for `NoChange`/`Flagged`/`Skipped`/`Failed`, or
-    /// when no `readme` target rendered at all).
+    /// Line count of the NEW rich landing README, when the pipeline actually
+    /// assembled one (always, once the opt-in gate and the initial reads
+    /// pass -- even a fully flagged generation still assembles a
+    /// [`minimal_landing`]). `None` only for skip/refusal outcomes that never
+    /// reached generation at all.
     pub new_landing_lines: Option<usize>,
-    /// [`super::preserve::PreservationReport::coverage_ratio`] -- `1.0` when
-    /// there was nothing to lose (no old README, or generation didn't run).
+    /// [`super::preserve::PreservationReport::coverage_ratio`] of the FINAL
+    /// landing + docs tree (i.e. AFTER the legacy backstop closed any
+    /// generation gap) -- `1.0` whenever nothing was lost, which is the
+    /// no-loss guarantee this tool exists to prove by construction.
     pub coverage_ratio: f32,
     /// Every OLD section the no-loss guard could not find the substance of
-    /// in the new landing/docs. NON-EMPTY here means [`Self::placed`] is
-    /// `false` -- see the module doc comment's "Never place when the
-    /// no-loss guard flags a drop" section.
+    /// even AFTER legacy relocation. Should be empty in practice (relocation
+    /// makes coverage 1.0 by construction) -- kept as the negative-safety-net
+    /// report, never silently dropped. Non-empty here means [`Self::placed`]
+    /// is `false`.
     pub missing: Vec<Section>,
     /// Repo-relative `docs/**` paths actually written this call (excludes
-    /// `README.md` itself -- see [`Self::new_landing_lines`] for the
-    /// README's own before/after). Empty whenever [`Self::placed`] is
-    /// `false`, or when placement was a byte-identical no-op re-run.
+    /// `README.md` itself). Empty whenever [`Self::placed`] is `false`, or
+    /// when placement was a byte-identical no-op re-run.
     pub docs_files_created: Vec<String>,
-    /// `true` iff the concise landing + docs tree were actually written (or
-    /// already matched byte-for-byte) into `target_root`. `false` whenever
-    /// the no-loss guard flagged a drop, a landing gate failed, generation
-    /// produced nothing new, or the stage didn't run at all.
+    /// `true` iff the rich landing + docs tree were actually written (or
+    /// already matched byte-for-byte) into `target_root`. `false` whenever a
+    /// no-loss/landing/placement gate withheld the cutover, or the stage
+    /// didn't run at all (skip/refusal).
     pub placed: bool,
-    /// DLAND-03 landing lint failures (over-length and/or dangling `docs/`
-    /// link targets), surfaced here even though [`super::place::place_docs`]
-    /// enforces the same gate fail-closed on its own. Non-empty only when
-    /// [`Self::placed`] is `false` for this reason specifically.
+    /// Landing-gate failures (substance floor, generic-diagram lint, or the
+    /// DLAND-03 length/link gates `place_docs` itself enforces) that
+    /// withheld placement. Non-empty only when [`Self::placed`] is `false`
+    /// for this reason specifically.
     pub gate_failures: Vec<String>,
+    /// DGRICH-08: how many OLD README sections the rich pipeline's OWN
+    /// generated landing + docs tree covered, with no legacy backstop
+    /// needed. The ideal/ordinary case approaches "every section" as the
+    /// generator gets better grounded.
+    pub covered_by_generation: usize,
+    /// DGRICH-08: how many OLD README sections fell back to a verbatim
+    /// `docs/legacy/<slug>.md` page because generation did not cover them.
+    /// `0` is the ideal case. A fully flagged/degraded generation round
+    /// relocates every section -- the safe fallback to the pre-DGRICH-08
+    /// (DLAND-RELOC) all-verbatim behavior, reached here as an emergent
+    /// consequence of the same coverage check rather than a special case.
+    pub relocated_to_legacy: usize,
     /// A short, human-readable summary of what happened -- for logging and
     /// for an operator deciding whether to carry the resulting working-copy
     /// diff through the normal review/merge pipeline.
@@ -469,6 +356,8 @@ impl BackfillReport {
             docs_files_created: Vec::new(),
             placed: false,
             gate_failures: Vec::new(),
+            covered_by_generation: 0,
+            relocated_to_legacy: 0,
             summary,
         }
     }
@@ -478,18 +367,31 @@ impl BackfillReport {
 // backfill_readme
 // ---------------------------------------------------------------------------
 
-/// Migrate `target_root`'s current `README.md` (if any) into a concise
-/// landing + `docs/` tree, in one guarded pass. See the module doc comment
-/// for the full flow and the "never place on a dropped section" guarantee.
+/// Migrate `target_root`'s current `README.md` (if any) by running the FULL
+/// rich, KG-grounded doc-generation pipeline against `target_root` as the
+/// PRIMARY product, with the old README relocated verbatim to
+/// `docs/legacy/<slug>.md` ONLY for sections generation didn't cover. See the
+/// module doc comment for the full flow and the no-loss guarantee.
 ///
 /// - `target_root`: the working-copy root (typically a worktree) whose
-///   `README.md` is read as `existing_docs`/no-loss-guard input, and where a
-///   successful migration is placed. The ONLY filesystem access this
-///   function performs directly is that one read; everything else (the
-///   actual placement) goes through [`super::place::place_docs`].
-/// - Every other parameter mirrors [`super::trigger::run_docgen_trigger`]'s
-///   own (this function calls it with `place=false`, deciding placement
-///   itself only after the no-loss guard clears).
+///   `README.md` is read as no-loss-guard input (and, via
+///   [`super::repo_facts::build_repo_facts`], as `RepoFacts`' Pass-0 legacy
+///   input) and where a successful migration is placed. `target_root` is
+///   also the checkout `RepoFacts` scans for entry points/config
+///   surface/prose anchors -- unlike DGRICH-07's repo-level trigger mode,
+///   this function does NOT gate on "looks like a full checkout"
+///   ([`super::repo_facts::build_repo_facts`] degrades every checkout-scan
+///   source gracefully when it isn't one): backfill always runs the rich
+///   pipeline, never a legacy per-module fallback.
+/// - `module_path`/`available_credential_keys` are accepted for call-site
+///   compatibility with the existing `docgen_backfill` tool schema but are
+///   not consumed by the rich pipeline (no per-target multi-format
+///   rendering happens here, only the landing + docs tree `place_docs`
+///   writes).
+/// - `raw_feat_context` is still swept unconditionally
+///   ([`super::pii_gate::sweep_input`]) even though the rich pipeline's
+///   identity pass never sees a diff by design (the anti-latch rule,
+///   DGRICH-02) -- the tool's contract promises the sweep runs regardless.
 #[allow(clippy::too_many_arguments)]
 pub async fn backfill_readme(
     generator: &dyn DocGenerator,
@@ -500,6 +402,43 @@ pub async fn backfill_readme(
     raw_feat_context: &str,
     project_config_raw: Option<&Value>,
     available_credential_keys: &BTreeSet<String>,
+    generated_at: &str,
+    target_root: &Path,
+) -> BackfillReport {
+    let graph_source = AtlasGraphSource::from_env();
+    backfill_readme_with_graph_source(
+        generator,
+        &graph_source,
+        version_store,
+        project,
+        module_path,
+        git_ref,
+        raw_feat_context,
+        project_config_raw,
+        available_credential_keys,
+        generated_at,
+        target_root,
+    )
+    .await
+}
+
+/// The real body of [`backfill_readme`], parameterized over a
+/// [`GraphSource`] so tests can inject a fixture graph -- exactly the same
+/// seam shape [`super::trigger::run_docgen_trigger`]'s own
+/// `run_docgen_trigger_with_graph_source` uses. Not `pub`: the public,
+/// signature-frozen entry point is [`backfill_readme`] above, which always
+/// supplies the real [`AtlasGraphSource`].
+#[allow(clippy::too_many_arguments)]
+async fn backfill_readme_with_graph_source(
+    generator: &dyn DocGenerator,
+    graph_source: &dyn GraphSource,
+    version_store: &VersionStore,
+    project: &str,
+    _module_path: &str,
+    git_ref: &str,
+    raw_feat_context: &str,
+    project_config_raw: Option<&Value>,
+    _available_credential_keys: &BTreeSet<String>,
     generated_at: &str,
     target_root: &Path,
 ) -> BackfillReport {
@@ -522,6 +461,8 @@ pub async fn backfill_readme(
                 docs_files_created: Vec::new(),
                 placed: false,
                 gate_failures: Vec::new(),
+                covered_by_generation: 0,
+                relocated_to_legacy: 0,
                 summary: format!(
                     "refused: the existing README.md at the target could not be read ({e}); \
 not overwriting unreadable content -- an operator must inspect it before backfilling"
@@ -530,204 +471,219 @@ not overwriting unreadable content -- an operator must inspect it before backfil
         }
     };
     let old_readme_existed = old_readme.is_some();
+    let old_readme_str = old_readme.clone().unwrap_or_default();
     let old_readme_lines = old_readme.as_deref().map(landing_line_count).unwrap_or(0);
 
-    let outcome = run_docgen_trigger(
-        generator,
-        version_store,
-        project,
-        module_path,
-        git_ref,
-        old_readme.as_deref(),
-        raw_feat_context,
-        project_config_raw,
-        available_credential_keys,
-        generated_at,
-        false,
-        None,
-    )
-    .await;
-
-    match outcome {
-        TriggerOutcome::Skipped { reason } => {
-            BackfillReport::no_op(old_readme_existed, old_readme_lines, format!("backfill skipped: {reason}"))
-        }
-        TriggerOutcome::Failed { reason } => BackfillReport::no_op(
+    // Opt-in gate: a project with no doc-target config at all has not opted
+    // in to the backfill stage either -- same "declares nothing" test the
+    // post-feat trigger stage uses, reused (not re-implemented) so the two
+    // gates can never disagree.
+    if declares_no_targets(project_config_raw) {
+        return BackfillReport::no_op(
             old_readme_existed,
             old_readme_lines,
-            format!("backfill failed before any placement was attempted: {reason}"),
-        ),
-        TriggerOutcome::Completed { generation, render, .. } => match generation {
-            GenerationOutcome::NoChange => BackfillReport::no_op(
+            format!(
+                "backfill skipped: project '{project}' has no doc-target config declared -- the \
+backfill stage is opt-in (like mirror_ready) and this project has not opted in"
+            ),
+        );
+    }
+
+    // DOCGEN-02: unconditional PII sweep of the caller-supplied feat context.
+    // The rich pipeline's identity pass never looks at a diff by design (the
+    // anti-latch rule, DGRICH-02), so this result is not threaded any
+    // further -- but the tool's contract promises the sweep always runs, and
+    // an unsweepable context is still a real failure to surface.
+    if let Err(e) = sweep_input(raw_feat_context) {
+        return BackfillReport::no_op(
+            old_readme_existed,
+            old_readme_lines,
+            format!("backfill failed before any placement was attempted: PII sweep of feat context failed: {e}"),
+        );
+    }
+
+    let facts = match build_repo_facts(graph_source, target_root, project, git_ref) {
+        Ok(f) => f,
+        Err(e) => {
+            return BackfillReport::no_op(
                 old_readme_existed,
                 old_readme_lines,
-                "repo is already concise -- generation produced no doc-relevant change vs the \
-current README; nothing to migrate"
-                    .to_string(),
-            ),
-            GenerationOutcome::Flagged { reason } => BackfillReport::no_op(
-                old_readme_existed,
-                old_readme_lines,
-                format!("generation was flagged, nothing to migrate: {reason}"),
-            ),
-            GenerationOutcome::Generated { .. } => {
-                let render = match render {
-                    Some(r) => r,
-                    None => {
-                        return BackfillReport::no_op(
-                            old_readme_existed,
-                            old_readme_lines,
-                            "generation completed but no render was produced -- nothing to migrate"
-                                .to_string(),
-                        )
-                    }
-                };
+                format!("backfill failed before any placement was attempted: could not build RepoFacts: {e}"),
+            );
+        }
+    };
 
-                // The LLM's landing is used ONLY for its hero/quick-start text --
-                // its own (necessarily empty here, since it never rendered the old
-                // README's sections as its own docs) `docs_tree` is IGNORED below;
-                // see the module doc comment's "DLAND-RELOC" section.
-                let llm_landing = render
-                    .rendered()
-                    .find(|a| a.target_type == DocTargetType::Readme)
-                    .and_then(|a| a.content.clone());
+    // Passes 1-3: the rich pipeline, run as the PRIMARY product. The old
+    // README already reached `facts.old_readme_sections` as Pass-0 input #7
+    // ("legacy claims to verify") via `build_repo_facts` -- grounding, not
+    // the output.
+    let outcome = generate_repo_docs(generator, &facts, project, git_ref).await;
+    let docs_tree_no_legacy = build_repo_docs_tree(project, &facts, &outcome, &[]);
 
-                let llm_landing = match llm_landing {
-                    Some(l) => l,
-                    None => {
-                        return BackfillReport::no_op(
-                            old_readme_existed,
-                            old_readme_lines,
-                            "no readme target rendered for this project's doc-target config -- \
-nothing to migrate"
-                                .to_string(),
-                        )
-                    }
-                };
+    let landing = match &outcome.identity {
+        Some(identity) => build_landing_body(identity, &facts, &docs_tree_no_legacy),
+        None => minimal_landing(&facts, &docs_tree_no_legacy),
+    };
 
-                let old_readme_str = old_readme.clone().unwrap_or_default();
+    // No-loss guard, pass 1: what did the rich generation ITSELF cover,
+    // before any backstop relocation?
+    let pres_gen = check_preservation(&old_readme_str, &landing, &docs_tree_no_legacy);
+    let missing_labels: BTreeSet<&str> = pres_gen.missing.iter().map(|s| s.heading.as_str()).collect();
 
-                // Mechanical relocation: the docs/ tree is built DIRECTLY from the
-                // OLD README's sections (verbatim), never from the LLM's own
-                // (empty) docs_tree -- see `build_docs_tree_from_old_readme`.
-                let docs_tree = build_docs_tree_from_old_readme(&old_readme_str);
-                let landing = assemble_final_landing(&llm_landing, &docs_tree);
+    // DGRICH-08 backstop: every OLD section generation did NOT cover is
+    // relocated VERBATIM to docs/legacy/<slug>.md, reusing the exact same
+    // byte-offset slicer + slugging DLAND-RELOC always used -- now invoked
+    // only for the gap, not the whole document.
+    let legacy_pages: Vec<(String, String)> = label_and_slug_old_sections(&old_readme_str)
+        .into_iter()
+        .filter(|(label, _, _)| missing_labels.contains(label.as_str()))
+        .map(|(_, slug, content)| (slug, content))
+        .collect();
 
-                // No-loss guard (DLAND-02): kept as a backstop even though
-                // verbatim relocation makes coverage 1.0 BY CONSTRUCTION -- see
-                // the module doc comment's "No-loss is now true by construction"
-                // section.
-                let preservation = check_preservation(&old_readme_str, &landing, &docs_tree);
+    let docs_tree = if legacy_pages.is_empty() {
+        docs_tree_no_legacy
+    } else {
+        build_repo_docs_tree(project, &facts, &outcome, &legacy_pages)
+    };
 
-                if !preservation.missing.is_empty() {
-                    let count = preservation.missing.len();
-                    return BackfillReport {
-                        old_readme_existed,
-                        old_readme_lines,
-                        new_landing_lines: Some(landing_line_count(&landing)),
-                        coverage_ratio: preservation.coverage_ratio,
-                        missing: preservation.missing,
-                        docs_files_created: Vec::new(),
-                        placed: false,
-                        gate_failures: Vec::new(),
-                        summary: format!(
-                            "no-loss guard flagged {count} section(s) whose substance was not found \
-in the mechanically-relocated landing/docs -- placement refused; this should be unreachable for a \
+    // No-loss guard, pass 2: the backstop must make coverage 1.0 BY
+    // CONSTRUCTION (every relocated section's exact original bytes are now
+    // part of the corpus) -- re-verified here rather than merely trusted.
+    let preservation = check_preservation(&old_readme_str, &landing, &docs_tree);
+
+    if !preservation.missing.is_empty() {
+        let count = preservation.missing.len();
+        return BackfillReport {
+            old_readme_existed,
+            old_readme_lines,
+            new_landing_lines: Some(landing_line_count(&landing)),
+            coverage_ratio: preservation.coverage_ratio,
+            missing: preservation.missing,
+            docs_files_created: Vec::new(),
+            placed: false,
+            gate_failures: Vec::new(),
+            covered_by_generation: pres_gen.covered.len(),
+            relocated_to_legacy: legacy_pages.len(),
+            summary: format!(
+                "no-loss guard flagged {count} section(s) whose substance was not found even \
+after verbatim legacy relocation -- placement refused; this should be unreachable given \
 verbatim relocation, an operator must inspect this repo's old README before retrying"
-                        ),
-                    };
-                }
+            ),
+        };
+    }
 
-                // Surface the DLAND-03 landing gates in the summary -- these are
-                // ALSO enforced fail-closed inside `place_docs` below regardless
-                // of whether we check them here first. `assemble_final_landing`
-                // is built to satisfy both already (every docs/ link it emits
-                // comes straight from `docs_tree`, and it trims to
-                // `LANDING_MAX_LINES`), so these should not fire in practice.
-                let mut gate_failures = Vec::new();
-                if let Err(e) = check_landing_length(&landing) {
-                    gate_failures.push(e);
-                }
-                if let Err(dangling) = check_landing_links(&landing, &docs_tree) {
-                    gate_failures.extend(dangling);
-                }
-                if !gate_failures.is_empty() {
-                    return BackfillReport {
-                        old_readme_existed,
-                        old_readme_lines,
-                        new_landing_lines: Some(landing_line_count(&landing)),
-                        coverage_ratio: preservation.coverage_ratio,
-                        missing: Vec::new(),
-                        docs_files_created: Vec::new(),
-                        placed: false,
-                        gate_failures,
-                        summary: "assembled landing failed a DLAND-03 landing lint gate -- placement \
-refused, nothing written"
-                            .to_string(),
-                    };
-                }
-
-                let placement = place_docs(target_root, &landing, &docs_tree);
-
-                if !placement.gate_failures.is_empty() {
-                    // Should not normally diverge from the pre-check above, but
-                    // `place_docs` is the source of truth -- surface whatever it
-                    // reports rather than assuming agreement.
-                    return BackfillReport {
-                        old_readme_existed,
-                        old_readme_lines,
-                        new_landing_lines: Some(landing_line_count(&landing)),
-                        coverage_ratio: preservation.coverage_ratio,
-                        missing: Vec::new(),
-                        docs_files_created: Vec::new(),
-                        placed: false,
-                        gate_failures: placement.gate_failures,
-                        summary: "assembled landing failed the DLAND-03 placement gate -- nothing \
-written"
-                            .to_string(),
-                    };
-                }
-
-                let placed = !placement.written.is_empty() || !placement.unchanged.is_empty();
-                let docs_files_created: Vec<String> = placement
-                    .written
-                    .iter()
-                    .filter(|p| p.as_str() != README_PATH)
-                    .cloned()
-                    .collect();
-
-                let summary = if !placement.skipped.is_empty() {
-                    format!(
-                        "placement partially refused ({} entr(y/ies) skipped): {:?}",
-                        placement.skipped.len(),
-                        placement.skipped
-                    )
-                } else if placed {
-                    format!(
-                        "mechanically relocated README.md from {} line(s) to a {} line concise \
-landing plus {} docs/** page(s) (every old section copied verbatim); no-loss coverage {:.0}%",
-                        old_readme_lines,
-                        landing_line_count(&landing),
-                        docs_files_created.len(),
-                        preservation.coverage_ratio * 100.0
-                    )
-                } else {
-                    "placement attempted but nothing was written or changed".to_string()
-                };
-
-                BackfillReport {
-                    old_readme_existed,
-                    old_readme_lines,
-                    new_landing_lines: Some(landing_line_count(&landing)),
-                    coverage_ratio: preservation.coverage_ratio,
-                    missing: Vec::new(),
-                    docs_files_created,
-                    placed,
-                    gate_failures: Vec::new(),
-                    summary,
-                }
+    // Extra Pass-5 gates ahead of DGRICH-09 (mirrors DGRICH-07's repo-level
+    // trigger door): the substance floor and the generic-diagram lint aren't
+    // folded into `place_docs`'s own fail-closed set yet, so this door runs
+    // them itself rather than shipping a latch-prone/near-empty landing.
+    //
+    // CRITICAL: these gates apply ONLY to a RICH landing (identity present). A
+    // DEGRADED run (identity == None) uses the deliberately-sparse
+    // `minimal_landing` AND has relocated ALL old content verbatim to legacy
+    // (no-loss holds) -- that is the safe fallback to pre-DGRICH-08 behavior and
+    // MUST still place. Gating it on the substance floor would refuse placement
+    // exactly when the fallback is supposed to guarantee it (codex review
+    // finding: "generation-flagged -> all relocate" must not be blocked).
+    let mut gate_failures: Vec<String> = Vec::new();
+    if outcome.identity.is_some() {
+        if let Err(e) = check_landing_substance(&landing) {
+            gate_failures.push(e);
+        }
+        if facts.kg_grounded {
+            let generic = subsystem_architecture_mermaid_source(&facts)
+                .map(|s| is_generic_placeholder(s.as_str()))
+                .unwrap_or(true);
+            if generic {
+                gate_failures.push(
+                    "architecture diagram lint (DGRICH-04 is_generic_placeholder): the derived \
+diagram is the generic template or has fewer than 5 real subsystem nodes -- withholding the \
+cutover rather than shipping a latch-prone landing"
+                        .to_string(),
+                );
             }
-        },
+        }
+    }
+
+    if !gate_failures.is_empty() {
+        return BackfillReport {
+            old_readme_existed,
+            old_readme_lines,
+            new_landing_lines: Some(landing_line_count(&landing)),
+            coverage_ratio: preservation.coverage_ratio,
+            missing: Vec::new(),
+            docs_files_created: Vec::new(),
+            placed: false,
+            gate_failures,
+            covered_by_generation: pres_gen.covered.len(),
+            relocated_to_legacy: legacy_pages.len(),
+            summary: "assembled landing failed a Pass-5 landing gate -- placement refused, \
+nothing written"
+                .to_string(),
+        };
+    }
+
+    let placement = place_docs(target_root, &landing, &docs_tree);
+
+    if !placement.gate_failures.is_empty() {
+        // Should not normally diverge from the pre-check above, but
+        // `place_docs` is the source of truth -- surface whatever it
+        // reports rather than assuming agreement.
+        return BackfillReport {
+            old_readme_existed,
+            old_readme_lines,
+            new_landing_lines: Some(landing_line_count(&landing)),
+            coverage_ratio: preservation.coverage_ratio,
+            missing: Vec::new(),
+            docs_files_created: Vec::new(),
+            placed: false,
+            gate_failures: placement.gate_failures,
+            covered_by_generation: pres_gen.covered.len(),
+            relocated_to_legacy: legacy_pages.len(),
+            summary: "assembled landing failed the DLAND-03 placement gate -- nothing written"
+                .to_string(),
+        };
+    }
+
+    let placed = !placement.written.is_empty() || !placement.unchanged.is_empty();
+    let docs_files_created: Vec<String> =
+        placement.written.iter().filter(|p| p.as_str() != README_PATH).cloned().collect();
+
+    if placed {
+        let key = ArtifactKey::new(project.to_string(), "readme".to_string());
+        let _ = version_store.store_version(key, landing.clone(), git_ref.to_string(), generated_at.to_string());
+    }
+
+    let summary = if !placement.skipped.is_empty() {
+        format!(
+            "placement partially refused ({} entr(y/ies) skipped): {:?}",
+            placement.skipped.len(),
+            placement.skipped
+        )
+    } else if placed {
+        format!(
+            "rich pipeline generated the landing + docs/ tree ({} old README section(s) covered \
+by generation, {} relocated verbatim to docs/legacy/ as the no-loss backstop); no-loss coverage \
+{:.0}%",
+            pres_gen.covered.len(),
+            legacy_pages.len(),
+            preservation.coverage_ratio * 100.0
+        )
+    } else {
+        "placement attempted but nothing was written or changed".to_string()
+    };
+
+    BackfillReport {
+        old_readme_existed,
+        old_readme_lines,
+        new_landing_lines: Some(landing_line_count(&landing)),
+        coverage_ratio: preservation.coverage_ratio,
+        missing: Vec::new(),
+        docs_files_created,
+        placed,
+        gate_failures: Vec::new(),
+        covered_by_generation: pres_gen.covered.len(),
+        relocated_to_legacy: legacy_pages.len(),
+        summary,
     }
 }
 
@@ -736,9 +692,10 @@ landing plus {} docs/** page(s) (every old section copied verbatim); no-loss cov
 // ---------------------------------------------------------------------------
 
 /// `docgen_backfill` -- the MCP-tool surface for a one-shot, operator-blessed
-/// README-to-hierarchy migration (DLAND-05). Holds its own [`VersionStore`],
-/// matching [`super::trigger::DocgenRun`]'s posture (version history
-/// accumulates across calls for the lifetime of this tool instance).
+/// README-to-hierarchy migration (DLAND-05, inverted by DGRICH-08). Holds its
+/// own [`VersionStore`], matching [`super::trigger::DocgenRun`]'s posture
+/// (version history accumulates across calls for the lifetime of this tool
+/// instance).
 pub struct DocgenBackfill {
     store: VersionStore,
 }
@@ -762,19 +719,21 @@ impl RustTool for DocgenBackfill {
     }
 
     fn description(&self) -> &str {
-        "One-shot backfill (DLAND-05, mechanically relocated per DLAND-RELOC): migrate an \
-already-bloated repo README (Terminus, Chord, Muse, lumina-constellation, ...) into a concise \
-landing + docs/ hierarchy in ONE guarded pass. The LLM is used ONLY to produce the concise \
-top-page landing (hero + quick start); the docs/ tree is built MECHANICALLY by copying every \
-old top-level (##) section's heading + body VERBATIM into its own docs/reference/<slug>.md \
-page (no paraphrasing, no summarizing), so no information is lost by construction. Still runs \
-the no-loss guard (DLAND-02) and the landing gates (DLAND-03) as a backstop, and places into a \
-WORKING COPY at target_root for operator review. Refuses to place anything (README.md and every \
-docs/** file, together) if the no-loss guard flags any dropped section (should not be reachable \
-given verbatim relocation), or if the assembled landing fails a landing lint gate -- an operator \
-must confirm before a real cutover lands. NEVER commits, pushes, or makes any Plane/Gitea/GitHub \
-call -- working-copy write only; the normal build pipeline (review, merge) carries the result \
-from there."
+        "One-shot backfill (DLAND-05, inverted by DGRICH-08): migrate an already-bloated repo \
+README (Terminus, Chord, Muse, lumina-constellation, ...) by running the FULL rich, \
+KG-grounded doc-generation pipeline (RepoFacts -> identity -> per-subsystem reference pages -> \
+guides -> derived architecture diagram -> assembled landing) against the repo as the PRIMARY \
+product -- the old README is fed in as grounding (Pass-0 legacy input), not the output. Any old \
+section the rich pipeline's own landing/docs did not cover is relocated VERBATIM (byte-exact) to \
+docs/legacy/<slug>.md and linked from the reference index, as a no-loss BACKSTOP only -- so no \
+information is lost by construction, but the docs are no longer just a mechanical copy of the old \
+README's sections. Still runs the no-loss guard (DLAND-02, re-verified after the backstop) and \
+the landing gates as a fail-closed set, and places into a WORKING COPY at target_root for \
+operator review. Refuses to place anything (README.md and every docs/** file, together) if the \
+no-loss guard flags any dropped section even after legacy relocation (should not be reachable), \
+or if the assembled landing fails a landing gate -- an operator must confirm before a real \
+cutover lands. NEVER commits, pushes, or makes any Plane/Gitea/GitHub call -- working-copy write \
+only; the normal build pipeline (review, merge) carries the result from there."
     }
 
     fn parameters(&self) -> Value {
@@ -783,7 +742,7 @@ from there."
             "properties": {
                 "spec_id": {
                     "type": "string",
-                    "description": "The spec identifier this backfill belongs to (e.g. \"S119-docgen-landing-hierarchy\"), carried through for logging/observability."
+                    "description": "The spec identifier this backfill belongs to (e.g. \"S119-dgrich-rich-doc-generator\"), carried through for logging/observability."
                 },
                 "project": {
                     "type": "string",
@@ -803,12 +762,12 @@ from there."
                 },
                 "project_config": {
                     "type": "object",
-                    "description": "The project's raw doc-target config, e.g. {\"targets\": [{\"type\": \"readme\"}]}. Must declare a \"readme\" target for a backfill to have anything to place."
+                    "description": "The project's raw doc-target config, e.g. {\"targets\": [{\"type\": \"readme\"}]}. Must declare at least one target for a backfill to have anything to place."
                 },
                 "available_credential_keys": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Runtime secret-store KEY NAMES (never values) currently available, for target credential resolution."
+                    "description": "Runtime secret-store KEY NAMES (never values) currently available. Accepted for call-site compatibility; not consumed by the rich pipeline."
                 },
                 "generated_at": {
                     "type": "string",
@@ -894,6 +853,8 @@ from there."
             "old_readme_lines": report.old_readme_lines,
             "new_landing_lines": report.new_landing_lines,
             "coverage_ratio": report.coverage_ratio,
+            "covered_by_generation": report.covered_by_generation,
+            "relocated_to_legacy": report.relocated_to_legacy,
             "missing": report.missing.iter().map(|s| json!({
                 "heading": s.heading,
                 "reason": s.reason,
@@ -918,24 +879,137 @@ pub fn register(registry: &mut ToolRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    struct MockDocGenerator {
-        response: String,
-        captured_prompt: Mutex<Option<String>>,
+    use crate::scribe::graph::{Confidence, EdgeKind, KgEdge, KgNode, KnowledgeGraph, NodeKind};
+    use super::super::repo_facts::{FixtureGraphSource, NoGraphSource};
+
+    fn node(id: &str, kind: NodeKind, path: &str) -> KgNode {
+        let name = id.rsplit("::").next().unwrap_or(id).to_string();
+        KgNode::new(id, kind, name, path)
     }
 
-    impl MockDocGenerator {
-        fn new(response: impl Into<String>) -> Self {
-            Self { response: response.into(), captured_prompt: Mutex::new(None) }
+    /// Five subsystems (`a`..`e`), each a 30-node hub-and-leaves group (the
+    /// same proven shape `repo_facts.rs`'s/`generate.rs`'s own fixtures use)
+    /// -- enough real subsystems that DGRICH-04's derived architecture
+    /// diagram is never the generic fallback (`is_generic_placeholder`
+    /// requires >=5 real subsystem nodes), so a happy-path backfill's
+    /// Pass-5 gates can actually clear and placement can be observed
+    /// end-to-end on disk.
+    fn five_subsystem_graph() -> KnowledgeGraph {
+        let mut g = KnowledgeGraph::new("BF");
+        for name in ["a", "b", "c", "d", "e"] {
+            let hub = format!("crate::{name}::Hub::run");
+            g.insert_node(node(&hub, NodeKind::Function, &format!("src/{name}/hub.rs")));
+            for i in 0..29 {
+                let leaf = format!("crate::{name}::f{i}");
+                g.insert_node(node(&leaf, NodeKind::Function, &format!("src/{name}/f{i}.rs")));
+                g.insert_edge(KgEdge::new(&leaf, &hub, EdgeKind::Calls, Confidence::Extracted)).unwrap();
+            }
+        }
+        g
+    }
+
+    /// A deliberately long, 3-paragraph `what_is` (16 lines per paragraph) --
+    /// real generated prose would never be this repetitive, but the
+    /// DGRICH-05 substance floor (`check_landing_substance`,
+    /// `LANDING_MIN_SUBSTANTIVE_LINES = 80`) is orthogonal to what DGRICH-08
+    /// itself needs to prove; padding it out here deterministically clears
+    /// that floor so the coverage/relocation assertions below can also
+    /// assert on the REAL on-disk placement, rather than leaving placement
+    /// success to chance on exact line-count arithmetic.
+    fn verbose_what_is() -> String {
+        let mut paragraphs = Vec::new();
+        for p in 0..3 {
+            let lines: Vec<String> = (0..16)
+                .map(|i| format!("Fixture filler sentence {p}-{i} describing the widget factory in more detail."))
+                .collect();
+            paragraphs.push(lines.join("\n"));
+        }
+        paragraphs.join("\n\n")
+    }
+
+    fn valid_identity_json() -> String {
+        let names = ["a", "b", "c", "d", "e"];
+        let subsystems: Vec<Value> = names
+            .iter()
+            .map(|n| json!({"name": n, "one_liner": format!("Subsystem {n} handles its part."), "role": "core"}))
+            .collect();
+        let feature_rows: Vec<Value> = names
+            .iter()
+            .map(|n| json!({"feature": format!("{n} processing"), "description": format!("Processes work via subsystem {n}."), "subsystem": n}))
+            .collect();
+        json!({
+            "tagline": "Widget Factory is a hub combining five subsystems.",
+            "what_is": verbose_what_is(),
+            "audience": "Fixture test operators.",
+            "subsystems": subsystems,
+            "feature_rows": feature_rows,
+            "guide_topics": [{"title": "Run the fixture", "grounding": "crate::a::Hub::run"}]
+        })
+        .to_string()
+    }
+
+    const GOOD_GUIDES: &str = "\
+=== FILE: docs/getting-started.md ===
+Clone the repo, then run `crate::a::Hub::run`.
+
+=== FILE: docs/guides/run-the-fixture.md ===
+# Run the fixture
+1. Build the fixture.
+2. Call `crate::a::Hub::run`.
+";
+
+    /// Scripted, prompt-dispatching `DocGenerator` -- mirrors `generate.rs`'s
+    /// own `ScriptedGenerator` test seam (private there, so a small
+    /// equivalent is duplicated here rather than exposed cross-module for a
+    /// test-only type).
+    struct ScriptedGenerator {
+        identity_response: String,
+        guides_response: String,
+    }
+
+    impl ScriptedGenerator {
+        fn new(identity_response: impl Into<String>, guides_response: impl Into<String>) -> Self {
+            Self { identity_response: identity_response.into(), guides_response: guides_response.into() }
         }
     }
 
     #[async_trait]
-    impl DocGenerator for MockDocGenerator {
+    impl DocGenerator for ScriptedGenerator {
         async fn generate(&self, prompt: &str) -> Result<String, ToolError> {
-            *self.captured_prompt.lock().unwrap() = Some(prompt.to_string());
-            Ok(self.response.clone())
+            if prompt.contains("Write a JSON object with EXACTLY these keys") {
+                return Ok(self.identity_response.clone());
+            }
+            if prompt.contains("You are writing the operator guides") {
+                return Ok(self.guides_response.clone());
+            }
+            const MARKER: &str = "reference page for the `";
+            if let Some(idx) = prompt.find(MARKER) {
+                let rest = &prompt[idx + MARKER.len()..];
+                if let Some(end) = rest.find('`') {
+                    let name = &rest[..end];
+                    return Ok(format!(
+                        "# {name}\n\n## Key types and functions\n\
+`crate::{name}::Hub::run` is the entry point.\n\n\
+## How it connects\nCalled by its own leaves.\n\n\
+## Notes and gaps\nNothing else to cover here.\n"
+                    ));
+                }
+            }
+            Ok(String::new())
+        }
+    }
+
+    /// A generator that always fails -- forces `generate_repo_docs`'s
+    /// identity pass to `Flagged`/`None` (both attempts error out),
+    /// exercising DGRICH-08's "generation flagged -> all sections relocate"
+    /// edge case.
+    struct FailingGenerator;
+
+    #[async_trait]
+    impl DocGenerator for FailingGenerator {
+        async fn generate(&self, _prompt: &str) -> Result<String, ToolError> {
+            Err(ToolError::Http("backend unreachable".to_string()))
         }
     }
 
@@ -954,48 +1028,30 @@ mod tests {
         dir
     }
 
-    // ── Happy path: bloated multi-section README -> mechanically relocated ──
-    //
-    // DLAND-RELOC: this replaces the old DLAND-05
-    // `backfill_migrates_a_preserved_multi_section_readme_and_places_it` test.
-    // That test relied on the MOCK LLM output happening to also carry every
-    // old section's stable tokens under its own headings -- i.e. it tested
-    // that a paraphrase-preserving LLM output passes the no-loss guard, not
-    // that the tool itself guarantees no loss. Under mechanical relocation the
-    // guarantee no longer depends on what the LLM says at all: every old
-    // section is copied VERBATIM into its own `docs/reference/*.md` page
-    // regardless of what the mock LLM landing contains. This test proves
-    // exactly that -- four sections, each with a distinctive token the mock
-    // LLM landing never mentions.
+    // ── TEST PLAN: old README fully covered by generation -> nothing
+    // relocated, coverage 1.0, no legacy pages ──────────────────────────
+
     #[tokio::test]
-    async fn backfill_mechanically_relocates_every_old_section_verbatim_no_loss() {
-        let root = unique_tmp_dir("happy-path");
-        let old_readme = "# Widget\n\nA widget factory, in prose the LLM never sees again.\n\n\
-## Install\n\nRun `cargo install widget_cli`. Requires `WIDGET_TOOLCHAIN_V3`.\n\n\
-## Configuration\n\nSet `WIDGET_PORT=8080` in your environment.\n\n\
-## Telemetry\n\nSet `WIDGET_TELEMETRY_ENDPOINT` to opt in to the `submit_metrics()` reporter.\n\n\
-## Troubleshooting\n\nIf `widget_diagnose()` reports `ERR_WIDGET_JAMMED`, reset the feed tray.\n";
+    async fn old_readme_fully_covered_by_generation_relocates_nothing() {
+        let root = unique_tmp_dir("fully-covered");
+        // This section's only stable tokens (`crate`, `Hub`, `run`) are
+        // exactly what subsystem `a`'s generated reference page also states
+        // verbatim -- generation covers it with no legacy backstop needed.
+        let old_readme = "# Widget\n\n## Alpha\n\nSee `crate::a::Hub::run` for details.\n";
         std::fs::write(root.join("README.md"), old_readme).unwrap();
 
-        // The mock LLM landing carries NONE of the four sections' distinctive
-        // tokens -- if this tool still depended on the LLM's paraphrase to
-        // preserve substance (the old DLAND-05 behavior), this would be
-        // exactly the scenario that gets withheld as a drop. Mechanical
-        // relocation must place it anyway, because the docs/ tree comes from
-        // the OLD README directly, not from this text.
-        let generator = MockDocGenerator::new(
-            "# Widget\n\nA friendly widget factory that just works.\n\n\
-## Quickstart\n\nGrab the CLI and build your first widget in minutes.\n",
-        );
+        let graph_source = FixtureGraphSource(five_subsystem_graph());
+        let generator = ScriptedGenerator::new(valid_identity_json(), GOOD_GUIDES);
         let store = VersionStore::new();
 
-        let report = backfill_readme(
+        let report = backfill_readme_with_graph_source(
             &generator,
+            &graph_source,
             &store,
-            "TERM",
+            "BF",
             ".",
-            "backfill1",
-            "one-shot backfill of the bloated README",
+            "abc123",
+            "one-shot backfill of an already-covered README",
             Some(&readme_config()),
             &BTreeSet::new(),
             "2026-07-18T00:00:00Z",
@@ -1003,131 +1059,40 @@ mod tests {
         )
         .await;
 
-        assert!(report.old_readme_existed);
-        assert!(report.old_readme_lines > 0);
-        assert!(report.missing.is_empty(), "expected nothing missing: {:?}", report.missing);
-        assert_eq!(report.coverage_ratio, 1.0);
         assert!(report.gate_failures.is_empty(), "{:?}", report.gate_failures);
-        assert!(report.placed, "expected placement to happen: {}", report.summary);
-        let new_lines = report.new_landing_lines.expect("a landing was generated");
-        assert!(new_lines <= LANDING_MAX_LINES);
-        assert_eq!(report.docs_files_created.len(), 5, "{:?}", report.docs_files_created); // index + 4 sections
-
-        // Really landed on disk, not just reported -- one reference page per
-        // old section, each named from its own heading.
-        assert!(root.join("README.md").exists());
-        assert!(root.join("docs/index.md").exists());
-        assert!(root.join("docs/reference/install.md").exists());
-        assert!(root.join("docs/reference/configuration.md").exists());
-        assert!(root.join("docs/reference/telemetry.md").exists());
-        assert!(root.join("docs/reference/troubleshooting.md").exists());
-
-        // No-loss end to end: EVERY old section's distinctive token survives
-        // verbatim in its placed page -- nothing was dropped or paraphrased.
-        let install = std::fs::read_to_string(root.join("docs/reference/install.md")).unwrap();
-        assert!(install.contains("WIDGET_TOOLCHAIN_V3"), "{install}");
-        let config = std::fs::read_to_string(root.join("docs/reference/configuration.md")).unwrap();
-        assert!(config.contains("WIDGET_PORT=8080"), "{config}");
-        let telemetry = std::fs::read_to_string(root.join("docs/reference/telemetry.md")).unwrap();
-        assert!(telemetry.contains("WIDGET_TELEMETRY_ENDPOINT") && telemetry.contains("submit_metrics()"), "{telemetry}");
-        let troubleshooting = std::fs::read_to_string(root.join("docs/reference/troubleshooting.md")).unwrap();
-        assert!(
-            troubleshooting.contains("widget_diagnose()") && troubleshooting.contains("ERR_WIDGET_JAMMED"),
-            "{troubleshooting}"
-        );
-
-        // The index hub links to every relocated page.
-        let index = std::fs::read_to_string(root.join("docs/index.md")).unwrap();
-        for heading in ["Install", "Configuration", "Telemetry", "Troubleshooting"] {
-            assert!(index.contains(heading), "index missing a link for {heading}: {index}");
-        }
-
-        // The final landing every docs/ link resolves against the placed tree.
-        let new_readme = std::fs::read_to_string(root.join("README.md")).unwrap();
-        assert_ne!(new_readme, old_readme, "README.md should have been replaced with the concise landing");
-        let docs_tree_on_disk = build_docs_tree_from_old_readme(old_readme);
-        assert!(check_landing_links(&new_readme, &docs_tree_on_disk).is_ok(), "{new_readme}");
-        assert!(new_readme.contains("## Documentation"));
-        assert!(new_readme.contains(DOCS_INDEX_PATH));
+        assert!(report.placed, "{}", report.summary);
+        assert!(report.missing.is_empty(), "{:?}", report.missing);
+        assert_eq!(report.coverage_ratio, 1.0);
+        assert_eq!(report.relocated_to_legacy, 0, "{}", report.summary);
+        assert_eq!(report.covered_by_generation, 1);
+        assert!(!root.join("docs/legacy").exists(), "no legacy backstop should be needed");
 
         std::fs::remove_dir_all(&root).ok();
     }
 
-    #[test]
-    fn relocated_pages_are_byte_exact_slices_of_the_old_readme_source() {
-        // A relocated docs page must contain the section's ORIGINAL source
-        // bytes (sub-headings, code fences, exact spacing), not a reconstruction
-        // from parsed heading/body fields.
-        let old = "# Title\n\nIntro.\n\n## Config\n\nSet it up:\n\n### Advanced\n\n```toml\nport = 8080\n```\n\nDone.\n\n## Next\n\nMore.\n";
-        let tree = build_docs_tree_from_old_readme(old);
-        let config_page = tree
-            .iter()
-            .find(|f| f.path == "docs/reference/config.md")
-            .expect("config page");
-        // The exact source slice for the ## Config section (heading through just
-        // before ## Next), verbatim -- sub-heading, fenced code, and blank lines
-        // all preserved byte-for-byte.
-        let expected = "## Config\n\nSet it up:\n\n### Advanced\n\n```toml\nport = 8080\n```\n\nDone.\n\n";
-        // EQUALITY, not `contains`: the page is EXACTLY the source slice, with
-        // no bytes added around it (no appended trailing newline, no wrapper).
-        assert_eq!(
-            config_page.content, expected,
-            "page is not the byte-exact verbatim source slice"
-        );
-    }
-
-    #[test]
-    fn a_heading_inside_a_code_fence_does_not_split_a_section() {
-        // A `## ` line inside a ``` fence is part of a code EXAMPLE, not a real
-        // section -- it must not split the enclosing section or invent a page,
-        // and the fence must stay intact in the relocated page.
-        let old = "# T\n\n## Usage\n\nExample:\n\n```md\n## Not A Real Section\nstill inside the fence\n```\n\nDone.\n\n## Config\n\nSet up `WIDGET_PORT`.\n";
-        let tree = build_docs_tree_from_old_readme(old);
-        // Exactly two reference pages (Usage, Config) + the index -> 3 files.
-        let ref_pages: Vec<_> = tree.iter().filter(|f| f.path.starts_with("docs/reference/")).collect();
-        assert_eq!(ref_pages.len(), 2, "fenced ## must not create a third page: {:?}",
-            ref_pages.iter().map(|f| &f.path).collect::<Vec<_>>());
-        let usage = tree.iter().find(|f| f.path == "docs/reference/usage.md").expect("usage page");
-        // The fenced heading + its fence live verbatim inside the Usage page.
-        assert!(usage.content.contains("```md\n## Not A Real Section\nstill inside the fence\n```"),
-            "fence not preserved intact: {}", usage.content);
-        assert!(tree.iter().any(|f| f.path == "docs/reference/config.md"));
-        assert!(!tree.iter().any(|f| f.path == "docs/reference/not-a-real-section.md"));
-    }
-
-    #[test]
-    fn a_mismatched_inner_fence_marker_does_not_prematurely_close_the_fence() {
-        // A ``` fence is NOT closed by a `~~~` line inside it (different marker),
-        // so a `## ` after that inner line is still inside the code block.
-        let old = "# T\n\n## Usage\n\n```text\n~~~ not a close for this fence\n## Still inside the code fence\n```\n\n## Config\n\nSet up.\n";
-        let tree = build_docs_tree_from_old_readme(old);
-        let ref_pages: Vec<_> = tree.iter().filter(|f| f.path.starts_with("docs/reference/")).collect();
-        assert_eq!(ref_pages.len(), 2, "mixed fence markers must not split: {:?}",
-            ref_pages.iter().map(|f| &f.path).collect::<Vec<_>>());
-        assert!(!tree.iter().any(|f| f.path == "docs/reference/still-inside-the-code-fence.md"));
-        let usage = tree.iter().find(|f| f.path == "docs/reference/usage.md").expect("usage page");
-        assert!(usage.content.contains("## Still inside the code fence"), "fenced heading not preserved: {}", usage.content);
-    }
-
-    // ── Edge: README with no `##` sections -> one whole-document page ────
+    // ── TEST PLAN: a section with unique substance not regenerated ->
+    // relocated verbatim to legacy/<slug>.md, linked, coverage stays 1.0 ──
 
     #[tokio::test]
-    async fn backfill_relocates_a_single_prose_blob_with_no_headings_into_one_page() {
-        let root = unique_tmp_dir("no-headings");
-        let old_readme =
-            "Just a flat README with a `WIDGET_LEGACY_FLAG` reference and no markdown sections at all.";
+    async fn a_section_not_covered_by_generation_is_relocated_verbatim_to_legacy() {
+        let root = unique_tmp_dir("partial-cover");
+        let old_readme = "# Widget\n\n\
+## Alpha\n\nSee `crate::a::Hub::run` for details.\n\n\
+## Legacy Notes\n\nSet `WIDGET_LEGACY_FLAG_XYZ` to enable legacy mode.\n";
         std::fs::write(root.join("README.md"), old_readme).unwrap();
 
-        let generator = MockDocGenerator::new("# Widget\n\nA tidy widget factory.\n");
+        let graph_source = FixtureGraphSource(five_subsystem_graph());
+        let generator = ScriptedGenerator::new(valid_identity_json(), GOOD_GUIDES);
         let store = VersionStore::new();
 
-        let report = backfill_readme(
+        let report = backfill_readme_with_graph_source(
             &generator,
+            &graph_source,
             &store,
-            "TERM",
+            "BF",
             ".",
-            "backfill-no-headings",
-            "backfill against a README with no ## sections",
+            "abc123",
+            "one-shot backfill with one uncovered legacy section",
             Some(&readme_config()),
             &BTreeSet::new(),
             "2026-07-18T00:00:00Z",
@@ -1135,13 +1100,111 @@ mod tests {
         )
         .await;
 
-        assert!(report.missing.is_empty(), "{:?}", report.missing);
+        assert!(report.gate_failures.is_empty(), "{:?}", report.gate_failures);
         assert!(report.placed, "{}", report.summary);
-        assert_eq!(report.docs_files_created.len(), 2, "{:?}", report.docs_files_created); // index + overview
+        assert!(report.missing.is_empty(), "no-loss guard must be satisfied after the backstop: {:?}", report.missing);
+        assert_eq!(report.coverage_ratio, 1.0);
+        // Both counts surfaced (TEST PLAN item 3): one section covered by
+        // generation, one relocated to the legacy backstop.
+        assert_eq!(report.covered_by_generation, 1, "{}", report.summary);
+        assert_eq!(report.relocated_to_legacy, 1, "{}", report.summary);
 
-        assert!(root.join("docs/reference/overview.md").exists());
-        let overview = std::fs::read_to_string(root.join("docs/reference/overview.md")).unwrap();
-        assert!(overview.contains("WIDGET_LEGACY_FLAG"), "{overview}");
+        // The legacy page really landed, verbatim, and is linked.
+        let legacy_path = root.join("docs/legacy/legacy-notes.md");
+        assert!(legacy_path.exists(), "expected a legacy backstop page on disk");
+        let legacy_content = std::fs::read_to_string(&legacy_path).unwrap();
+        assert!(legacy_content.contains("WIDGET_LEGACY_FLAG_XYZ"), "{legacy_content}");
+        let reference_index = std::fs::read_to_string(root.join("docs/reference/index.md")).unwrap();
+        assert!(reference_index.contains("legacy-notes"), "{reference_index}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── TEST PLAN: empty old README -> no legacy, coverage 1.0 ──────────
+
+    #[tokio::test]
+    async fn empty_old_readme_has_no_legacy_pages_and_trivial_full_coverage() {
+        let root = unique_tmp_dir("no-old-readme");
+        // Deliberately no README.md written at target_root at all.
+
+        let graph_source = FixtureGraphSource(five_subsystem_graph());
+        let generator = ScriptedGenerator::new(valid_identity_json(), GOOD_GUIDES);
+        let store = VersionStore::new();
+
+        let report = backfill_readme_with_graph_source(
+            &generator,
+            &graph_source,
+            &store,
+            "BF",
+            ".",
+            "abc123",
+            "backfill against a repo with no old README at all",
+            Some(&readme_config()),
+            &BTreeSet::new(),
+            "2026-07-18T00:00:00Z",
+            &root,
+        )
+        .await;
+
+        assert!(!report.old_readme_existed);
+        assert_eq!(report.old_readme_lines, 0);
+        assert_eq!(report.coverage_ratio, 1.0);
+        assert!(report.missing.is_empty());
+        assert_eq!(report.relocated_to_legacy, 0);
+        assert_eq!(report.covered_by_generation, 0);
+        assert!(report.gate_failures.is_empty(), "{:?}", report.gate_failures);
+        assert!(report.placed, "{}", report.summary);
+        assert!(!root.join("docs/legacy").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── TEST PLAN: generation flagged -> all sections relocate ─────────
+
+    #[tokio::test]
+    async fn generation_flagged_relocates_every_old_section_to_legacy() {
+        let root = unique_tmp_dir("generation-flagged");
+        let old_readme = "# Widget\n\n\
+## Alpha\n\nSee `crate::a::Hub::run` for details.\n\n\
+## Legacy Notes\n\nSet `WIDGET_LEGACY_FLAG_XYZ` to enable legacy mode.\n";
+        std::fs::write(root.join("README.md"), old_readme).unwrap();
+
+        // The graph is still grounded (facts.kg_grounded stays true), but
+        // EVERY generator call fails, so the identity pass never succeeds
+        // and Passes 2/3 are skipped entirely -- `outcome.identity` is
+        // `None`, forcing the `minimal_landing` fallback, which covers
+        // essentially nothing.
+        let graph_source = FixtureGraphSource(five_subsystem_graph());
+        let generator = FailingGenerator;
+        let store = VersionStore::new();
+
+        let report = backfill_readme_with_graph_source(
+            &generator,
+            &graph_source,
+            &store,
+            "BF",
+            ".",
+            "abc123",
+            "backfill whose generation is entirely flagged",
+            Some(&readme_config()),
+            &BTreeSet::new(),
+            "2026-07-18T00:00:00Z",
+            &root,
+        )
+        .await;
+
+        // The safe fallback: nothing covered by generation, everything
+        // relocated verbatim to the backstop, coverage 1.0.
+        assert_eq!(report.covered_by_generation, 0, "{}", report.summary);
+        assert_eq!(report.relocated_to_legacy, 2, "{}", report.summary);
+        assert_eq!(report.coverage_ratio, 1.0, "the backstop must still make coverage 1.0");
+        assert!(report.missing.is_empty(), "{:?}", report.missing);
+        // A DEGRADED run (identity == None) MUST still place: the substance /
+        // generic-diagram gates are RICH-landing-only, so the deliberately-sparse
+        // minimal_landing + full verbatim relocation is never gate-withheld
+        // (codex review finding: "generation-flagged -> all relocate" must place).
+        assert!(report.placed, "degraded fallback must place, not be gate-withheld: {}", report.summary);
+        assert!(report.gate_failures.is_empty(), "no gate should fire on the degraded path: {:?}", report.gate_failures);
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1150,25 +1213,21 @@ mod tests {
 
     #[tokio::test]
     async fn backfill_refuses_to_place_when_the_existing_readme_is_unreadable() {
-        // codex review: a present-but-unreadable README (here: invalid UTF-8)
-        // must NOT be treated like an absent one -- overwriting it would lose
-        // content the no-loss guard never got to inspect.
         let root = unique_tmp_dir("unreadable-readme");
         // Invalid UTF-8 bytes: read_to_string fails with InvalidData, not NotFound.
         std::fs::write(root.join("README.md"), [0xff, 0xfe, 0x00, 0x9f, 0x28]).unwrap();
         let before = std::fs::read(root.join("README.md")).unwrap();
 
-        let generator = MockDocGenerator::new(
-            "# Widget\n\n## Quickstart\n\nRun `cargo install widget_cli`.\n",
-        );
+        let generator = FailingGenerator;
         let store = VersionStore::new();
 
-        let report = backfill_readme(
+        let report = backfill_readme_with_graph_source(
             &generator,
+            &NoGraphSource,
             &store,
-            "TERM",
+            "BF",
             ".",
-            "backfill-unreadable",
+            "abc123",
             "one-shot backfill against an unreadable README",
             Some(&readme_config()),
             &BTreeSet::new(),
@@ -1187,148 +1246,21 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    // ── An oversized LLM landing is TRIMMED, not refused ─────────────────
-    //
-    // DLAND-RELOC: this replaces the old DLAND-05
-    // `backfill_refuses_to_place_on_a_landing_gate_failure` test. That test
-    // asserted a landing lint failure REFUSED placement -- but
-    // `assemble_final_landing`/`enforce_landing_length` now trim an
-    // oversized LLM hero/quick-start down to the concise-landing budget
-    // (never dropping the Documentation link), so this scenario should
-    // succeed rather than get withheld. The DLAND-03 gates remain enforced
-    // as a fail-closed backstop inside `place_docs` regardless (see
-    // `assemble_final_landing`'s own doc comment).
-    #[tokio::test]
-    async fn backfill_trims_an_oversized_llm_landing_instead_of_refusing_it() {
-        let root = unique_tmp_dir("gate-failure");
-        // No README.md at target_root -- first-doc case, nothing to lose.
-        let oversized_quickstart = "line\n".repeat(220);
-        let generator = MockDocGenerator::new(format!(
-            "# Widget\n\nA widget factory.\n\n## Quickstart\n\n{oversized_quickstart}"
-        ));
-        let store = VersionStore::new();
-
-        let report = backfill_readme(
-            &generator,
-            &store,
-            "TERM",
-            ".",
-            "backfill3",
-            "one-shot backfill whose generation is oversized",
-            Some(&readme_config()),
-            &BTreeSet::new(),
-            "2026-07-18T00:00:00Z",
-            &root,
-        )
-        .await;
-
-        assert!(!report.old_readme_existed);
-        assert!(report.missing.is_empty(), "nothing to lose with no old README: {:?}", report.missing);
-        assert!(report.gate_failures.is_empty(), "{:?}", report.gate_failures);
-        assert!(report.placed, "an oversized LLM landing should be trimmed and placed: {}", report.summary);
-        let new_lines = report.new_landing_lines.expect("a landing was generated");
-        assert!(new_lines <= LANDING_MAX_LINES, "landing was not trimmed: {new_lines} lines");
-        assert!(root.join("README.md").exists());
-        let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
-        assert!(readme.contains("## Documentation"), "the Documentation link must survive trimming");
-
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    // ── Link-integrity: every docs/ link in the final landing resolves ───
-
-    #[tokio::test]
-    async fn final_landing_docs_links_always_resolve_against_the_docs_tree() {
-        let root = unique_tmp_dir("link-integrity");
-        let old_readme = "# Widget\n\n## Install\n\nRun `widget_setup()`.\n\n## Usage\n\nCall `widget_run()`.\n";
-        std::fs::write(root.join("README.md"), old_readme).unwrap();
-
-        // The mock LLM even tries to link to a `docs/` path of its own
-        // invention -- `assemble_final_landing` must strip it (it would
-        // dangle) rather than let it leak into the placed landing.
-        let generator = MockDocGenerator::new(
-            "# Widget\n\nA widget factory.\n\n## Quickstart\n\nSee [Setup](docs/made-up-by-llm.md) first.\n\n\
-## Documentation\n\nSee [Fake Docs](docs/also-made-up.md).\n",
-        );
-        let store = VersionStore::new();
-
-        let report = backfill_readme(
-            &generator,
-            &store,
-            "TERM",
-            ".",
-            "backfill-link-integrity",
-            "backfill whose LLM landing invents dangling docs/ links",
-            Some(&readme_config()),
-            &BTreeSet::new(),
-            "2026-07-18T00:00:00Z",
-            &root,
-        )
-        .await;
-
-        assert!(report.placed, "{}", report.summary);
-        let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
-        assert!(!readme.contains("made-up-by-llm"), "{readme}");
-        assert!(!readme.contains("also-made-up"), "{readme}");
-
-        let docs_tree = build_docs_tree_from_old_readme(old_readme);
-        assert!(check_landing_links(&readme, &docs_tree).is_ok(), "{readme}");
-
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    // ── Edge: already-concise repo (NoChange) is a clean no-op ───────────
-
-    #[tokio::test]
-    async fn backfill_is_a_noop_when_the_repo_is_already_concise() {
-        let root = unique_tmp_dir("already-concise");
-        let existing = "# Widget\n\nAlready fully migrated and concise.";
-        std::fs::write(root.join("README.md"), existing).unwrap();
-
-        // Generator echoes the existing content back verbatim -> NoChange.
-        let generator = MockDocGenerator::new(existing.to_string());
-        let store = VersionStore::new();
-
-        let report = backfill_readme(
-            &generator,
-            &store,
-            "TERM",
-            ".",
-            "backfill4",
-            "backfill against an already-concise repo",
-            Some(&readme_config()),
-            &BTreeSet::new(),
-            "2026-07-18T00:00:00Z",
-            &root,
-        )
-        .await;
-
-        assert!(!report.placed);
-        assert!(report.new_landing_lines.is_none());
-        assert!(report.missing.is_empty());
-        assert!(report.summary.to_lowercase().contains("already concise") || report.summary.to_lowercase().contains("no doc-relevant change"));
-
-        // Untouched on disk.
-        let on_disk = std::fs::read_to_string(root.join("README.md")).unwrap();
-        assert_eq!(on_disk, existing);
-
-        std::fs::remove_dir_all(&root).ok();
-    }
-
     // ── Edge: no doc-target config declared -> skip cleanly ──────────────
 
     #[tokio::test]
     async fn backfill_skips_cleanly_when_project_has_not_opted_in() {
         let root = unique_tmp_dir("no-config");
-        let generator = MockDocGenerator::new("should never be produced".to_string());
+        let generator = FailingGenerator;
         let store = VersionStore::new();
 
-        let report = backfill_readme(
+        let report = backfill_readme_with_graph_source(
             &generator,
+            &NoGraphSource,
             &store,
-            "TERM",
+            "BF",
             ".",
-            "backfill5",
+            "abc123",
             "backfill against a project with no doc-target config",
             None,
             &BTreeSet::new(),
@@ -1371,8 +1303,8 @@ mod tests {
         let tool = DocgenBackfill::new();
         let result = tool
             .execute(json!({
-                "spec_id": "S119-docgen-landing-hierarchy",
-                "project": "TERM",
+                "spec_id": "S119-dgrich-rich-doc-generator",
+                "project": "BF",
                 "module_path": ".",
                 "git_ref": "abc123",
                 "feat_context": "some context"

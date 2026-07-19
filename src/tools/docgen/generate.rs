@@ -64,7 +64,7 @@ use serde_json::{json, Value};
 use crate::error::ToolError;
 use crate::scribe::inspect::{InspectionWorktree, ModuleBundle};
 
-use super::pii_gate::PiiGateOutcome;
+use super::pii_gate::{sweep_input, PiiGateOutcome};
 use super::prompts::{
     anti_latch_lint, build_guides_prompt, build_repo_identity_prompt, build_subsystem_page_prompt,
     honest_command_lint, parse_file_blocks, parse_repo_identity, symbol_existence_lint, RepoIdentity,
@@ -687,7 +687,23 @@ async fn run_guides_pass(
     let mut prompt = build_guides_prompt(repo_name, identity_value, &entrypoints_value, &legacy_usage);
 
     for attempt in 0..2 {
-        let raw = match generator.generate(&prompt).await {
+        // PII gate (DOCGEN-02 / S1): unlike Passes 1-2, which build their prompt
+        // from RepoFacts' already-swept SLICES, Pass 3 assembles `legacy_usage`
+        // (verbatim OLD-README install/usage sections) and the entry-point/config
+        // surface directly from RepoFacts' RAW stored fields. Those must not reach
+        // the inference request unswept — sweep the fully-assembled prompt before
+        // every send (idempotent on the redacted retry prompt).
+        let prompt_for_send = match sweep_input(&prompt) {
+            Ok(o) => o.sanitized_content().to_string(),
+            Err(e) => {
+                return (
+                    Vec::new(),
+                    String::new(),
+                    PassRecord::flagged("guides", format!("PII sweep of guides prompt failed: {e}")),
+                )
+            }
+        };
+        let raw = match generator.generate(&prompt_for_send).await {
             Ok(r) => r,
             Err(e) => {
                 if attempt == 0 {
