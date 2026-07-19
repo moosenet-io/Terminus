@@ -13,7 +13,7 @@
 // buttons (CONST-26's Toast infra is on main now, but wiring these mutations onto it is left
 // to the CONST-29 polish pass rather than partially adopted here) -- deliberate, not an
 // oversight; see the README's Muse section.
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ChartCard } from '../../viz/ChartCard';
 import { DataTable } from '../../components/DataTable';
 import type { DataTableColumn } from '../../components/DataTable';
@@ -45,6 +45,17 @@ function ChannelsListSection({
   const { data, loading, degraded } = useMuseChannels();
   const channels = data?.channels ?? [];
   const empty = !loading && !degraded && channels.length === 0;
+
+  // Auto-select the first channel once the list resolves (review fix): the spec requires
+  // channels + LINEUP + guide to render on mocks — without this, the lineup section idled
+  // at "No channel selected" until a manual click. Selecting only when nothing is selected
+  // keeps a user's own selection stable across refetches.
+  useEffect(() => {
+    if (selectedId == null && channels.length > 0) {
+      onSelect(channels[0]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId, channels.length === 0 ? 0 : channels[0].id]);
 
   const columns: DataTableColumn<MuseChannel>[] = [
     {
