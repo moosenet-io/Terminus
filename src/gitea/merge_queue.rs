@@ -261,9 +261,36 @@ trait MergeLockStore: Send + Sync {
     /// GMQ-03 spacing: stamp `key`'s last-merge time as `now_ms` (called by
     /// [`MergeQueue::record_merge`] after a successful merge), so the NEXT
     /// same-key merge's [`MergeQueue::enforce_spacing`] call measures the gap
-    /// from this point.
-    async fn record_merge_ms(&self, key: &str, now_ms: i64) -> Result<(), ()>;
+    /// from this point. `ttl_secs` is the marker's own expiry, DERIVED from
+    /// the configured spacing window (see [`derive_last_merge_ttl_secs`]) —
+    /// never a bare hardcoded value — so the marker can never expire while a
+    /// same-key spacing wait could still legitimately depend on it.
+    async fn record_merge_ms(&self, key: &str, now_ms: i64, ttl_secs: u64) -> Result<(), ()>;
 }
+
+/// GMQ-03 review finding: derive the `queue:merge:last:{key}` marker's TTL
+/// from the configured spacing window instead of a bare hardcoded literal.
+/// If `GITEA_MERGE_QUEUE_MIN_DELAY_SECS` (or a `max_wait_secs`-bounded wait)
+/// exceeded a fixed 24h TTL, the marker would expire before the spacing
+/// window ends and [`MergeQueue::enforce_spacing`] would then treat the base
+/// as never-merged and proceed immediately — silently violating the "same-base
+/// merges are spaced ≥ min_delay" contract. Taking `max(min_delay_secs,
+/// LAST_MERGE_TTL_FLOOR_SECS) + LAST_MERGE_TTL_MARGIN_SECS` keeps the normal
+/// small-delay case at the same generous 24h-plus retention floor as before,
+/// while guaranteeing the marker always outlives any legitimately-configured
+/// spacing window.
+fn derive_last_merge_ttl_secs(min_delay_secs: u64) -> u64 {
+    min_delay_secs
+        .max(LAST_MERGE_TTL_FLOOR_SECS)
+        .saturating_add(LAST_MERGE_TTL_MARGIN_SECS)
+}
+
+/// Retention floor for the last-merge marker when `min_delay_secs` is small:
+/// self-cleans an abandoned base after ~24h rather than accumulating forever.
+const LAST_MERGE_TTL_FLOOR_SECS: u64 = 86_400;
+/// Safety margin added atop `min_delay_secs`/the floor so the marker never
+/// expires exactly as the spacing window ends.
+const LAST_MERGE_TTL_MARGIN_SECS: u64 = 60;
 
 /// Redis-backed [`MergeLockStore`]. Keys live under `Namespace::Queue`:
 /// `queue:merge:seq:{key}` (ticket counter), `queue:merge:wait:{key}` (FIFO/
@@ -487,10 +514,13 @@ impl MergeLockStore for RedisMergeLockStore {
         Ok(val)
     }
 
-    async fn record_merge_ms(&self, key: &str, now_ms: i64) -> Result<(), ()> {
+    async fn record_merge_ms(&self, key: &str, now_ms: i64, ttl_secs: u64) -> Result<(), ()> {
         let lastk = last_key(key);
-        // A generous TTL (24h) so the key self-cleans if this base is never
-        // merged to again, rather than accumulating forever.
+        // TTL is caller-derived from the configured spacing window (see
+        // `derive_last_merge_ttl_secs`) — NOT a bare hardcoded value — so the
+        // marker always outlives any legitimately-configured min-delay,
+        // while still self-cleaning if this base is never merged to again.
+        let ttl_secs = ttl_secs as i64;
         let _: () = self
             .backend
             .with_conn(Namespace::Queue, |mut conn| async move {
@@ -498,7 +528,7 @@ impl MergeLockStore for RedisMergeLockStore {
                     .arg(&lastk)
                     .arg(now_ms)
                     .arg("EX")
-                    .arg(86_400_i64)
+                    .arg(ttl_secs)
                     .query_async::<_, ()>(&mut conn)
                     .await
             })
@@ -711,13 +741,19 @@ impl MergeQueue {
     /// GMQ-03 spacing: stamp `key`'s last-merge time as "now" — call this
     /// AFTER a successful merge (still inside the critical section) so the
     /// NEXT same-key merge's [`Self::enforce_spacing`] call measures the gap
-    /// from this point. Best-effort: a store failure here only means the
-    /// NEXT merge's spacing check degrades open (treats it as "never merged
-    /// before"), which is the same safe direction every other degrade-open
-    /// path in this module takes — it never blocks a merge that already
-    /// succeeded.
-    pub async fn record_merge(&self, key: &str) {
-        if self.store.record_merge_ms(key, now_ms()).await.is_err() {
+    /// from this point. `min_delay_secs` is the same value the caller passes
+    /// to [`Self::enforce_spacing`] (from `cfg`/`GITEA_MERGE_QUEUE_MIN_DELAY_SECS`)
+    /// — it is used ONLY to derive the marker's own TTL
+    /// ([`derive_last_merge_ttl_secs`]), so the marker can never expire
+    /// before a same-key spacing wait bounded by that delay could still
+    /// legitimately depend on it. Best-effort: a store failure here only
+    /// means the NEXT merge's spacing check degrades open (treats it as
+    /// "never merged before"), which is the same safe direction every other
+    /// degrade-open path in this module takes — it never blocks a merge that
+    /// already succeeded.
+    pub async fn record_merge(&self, key: &str, min_delay_secs: u64) {
+        let ttl_secs = derive_last_merge_ttl_secs(min_delay_secs);
+        if self.store.record_merge_ms(key, now_ms(), ttl_secs).await.is_err() {
             log_degrade_once("recording last-merge time failed (Redis unreachable)");
         }
     }
@@ -783,6 +819,10 @@ mod tests {
         /// key -> last-merge epoch-ms (GMQ-03 spacing), mirroring
         /// `queue:merge:last:{key}`.
         last: HashMap<String, i64>,
+        /// key -> the TTL (seconds) `record_merge_ms` was last called with,
+        /// so tests can assert the derived TTL without needing a real
+        /// expiring store.
+        last_ttl_secs: HashMap<String, u64>,
         /// When true, every op behaves as an unreachable backend.
         down: bool,
     }
@@ -838,6 +878,13 @@ mod tests {
                 Some((_, exp)) => *exp > StdInstant::now(),
                 None => false,
             }
+        }
+
+        /// The TTL (seconds) `record_merge_ms` was last called with for
+        /// `key`, or `None` if it was never recorded.
+        fn last_ttl_secs(&self, key: &str) -> Option<u64> {
+            let s = self.state.lock().unwrap();
+            s.last_ttl_secs.get(key).copied()
         }
     }
 
@@ -930,12 +977,13 @@ mod tests {
             Ok(s.last.get(key).copied())
         }
 
-        async fn record_merge_ms(&self, key: &str, now_ms: i64) -> Result<(), ()> {
+        async fn record_merge_ms(&self, key: &str, now_ms: i64, ttl_secs: u64) -> Result<(), ()> {
             let mut s = self.state.lock().unwrap();
             if s.down {
                 return Err(());
             }
             s.last.insert(key.to_string(), now_ms);
+            s.last_ttl_secs.insert(key.to_string(), ttl_secs);
             Ok(())
         }
     }
@@ -1390,8 +1438,8 @@ mod tests {
         async fn last_merge_ms(&self, key: &str) -> Result<Option<i64>, ()> {
             self.inner.last_merge_ms(key).await
         }
-        async fn record_merge_ms(&self, key: &str, now_ms: i64) -> Result<(), ()> {
-            self.inner.record_merge_ms(key, now_ms).await
+        async fn record_merge_ms(&self, key: &str, now_ms: i64, ttl_secs: u64) -> Result<(), ()> {
+            self.inner.record_merge_ms(key, now_ms, ttl_secs).await
         }
     }
 
@@ -1462,7 +1510,7 @@ mod tests {
             began.elapsed() < Duration::from_millis(50),
             "the first merge to a key must never wait on spacing (nothing recorded yet)"
         );
-        q.record_merge("owner/repo/main").await;
+        q.record_merge("owner/repo/main", 5).await;
 
         // Second merge to the SAME key, immediately after: must wait roughly
         // the configured min_delay (use a small delay so the test stays fast
@@ -1481,7 +1529,7 @@ mod tests {
         let store = Arc::new(InMemoryMergeLockStore::new());
         let q = queue_over(Arc::clone(&store));
 
-        q.record_merge("owner/repo/main").await;
+        q.record_merge("owner/repo/main", 0).await;
 
         let began = StdInstant::now();
         q.enforce_spacing("owner/repo/main", 0, 300).await.unwrap();
@@ -1499,7 +1547,7 @@ mod tests {
         // Record a merge "now"; a subsequent enforce_spacing with a large
         // min_delay but a tiny max_wait ceiling must return Busy immediately
         // rather than sleeping past that ceiling.
-        q.record_merge("owner/repo/main").await;
+        q.record_merge("owner/repo/main", 600).await;
         let began = StdInstant::now();
         let result = q.enforce_spacing("owner/repo/main", 600, 1).await;
         assert_eq!(result, Err(MergeQueueError::Busy));
@@ -1521,6 +1569,51 @@ mod tests {
         assert!(
             began.elapsed() < Duration::from_millis(50),
             "an unreachable store must degrade open (proceed immediately), not block on spacing"
+        );
+    }
+
+    // ── GMQ-03 review: last-merge marker TTL must be derived, never a bare
+    // hardcoded 86_400 that could expire before a large min_delay's spacing
+    // window ends ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn last_merge_ttl_is_derived_from_min_delay_not_a_bare_constant() {
+        // A tiny min_delay stays at the generous 24h-plus-margin retention
+        // floor (unchanged behavior for the common case).
+        assert_eq!(derive_last_merge_ttl_secs(5), 86_400 + 60);
+        assert_eq!(derive_last_merge_ttl_secs(0), 86_400 + 60);
+
+        // A min_delay LARGER than the old bare 86_400 constant must push the
+        // derived TTL past it (with margin) — this is exactly the finding:
+        // the marker must always outlive the configured spacing window.
+        let large_min_delay = 200_000_u64; // > 86_400
+        let ttl = derive_last_merge_ttl_secs(large_min_delay);
+        assert!(
+            ttl >= large_min_delay + 60,
+            "derived TTL {ttl} must be >= min_delay_secs ({large_min_delay}) + margin, \
+             otherwise the marker expires before the spacing window it's supposed to protect"
+        );
+        assert_eq!(ttl, large_min_delay + 60);
+    }
+
+    #[tokio::test]
+    async fn record_merge_passes_a_ttl_derived_from_min_delay_to_the_store() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let q = queue_over(Arc::clone(&store));
+
+        // A min_delay far exceeding the old hardcoded 86_400s literal: if the
+        // TTL were still a bare 86_400, it would be LESS than min_delay_secs
+        // here, reproducing the finding (marker expires mid-spacing-window).
+        let large_min_delay = 200_000_u64;
+        q.record_merge("owner/repo/main", large_min_delay).await;
+
+        let ttl = store
+            .last_ttl_secs("owner/repo/main")
+            .expect("record_merge must record a TTL");
+        assert!(
+            ttl >= large_min_delay + 60,
+            "the marker TTL ({ttl}) must be derived to outlive the configured min_delay \
+             ({large_min_delay}) plus a safety margin, never a bare hardcoded 86_400"
         );
     }
 
