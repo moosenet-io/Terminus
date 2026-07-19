@@ -31,8 +31,10 @@ interface DurationBucket { range: string; count: number; tier: string; }
 interface QualityPoint { provider: string; score: number; task_id: string; }
 
 // ── Shared chart theme (CONST-17: brand-derived, no dashed grid) ──────────────
-const CHART_STYLE = rechartsTickStyle();
-const GRID_PROPS = rechartsGridProps();
+// r4 review fix: read at render scope, never module scope — module-eval can precede the
+// token sheet's application and getVizTheme() memoizes its first read (fallback hexes would
+// be cached for the whole session). The reads are memoized, so per-render calls are free.
+const chartTheme = () => ({ CHART_STYLE: rechartsTickStyle(), GRID_PROPS: rechartsGridProps() });
 
 /** CONST-17 r3: shared chart/table twin wrapper for the inline SRPT charts — toggle row
  *  sits ABOVE the chart box (never inside a fixed-height body, per the r2 clipping fix). */
@@ -65,6 +67,7 @@ function EmptyState({ message }: { message: string }) {
 
 // ── SRPT-01: Task Completion Rate ─────────────────────────────────────────────
 function TaskCompletionChart({ period, project }: { period: Period; project: string }) {
+  const { CHART_STYLE, GRID_PROPS } = chartTheme();
   const [data, setData] = useState<CompletionBucket[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -105,6 +108,7 @@ function TaskCompletionChart({ period, project }: { period: Period; project: str
 
 // ── SRPT-02: Provider Performance ─────────────────────────────────────────────
 function ProviderComparisonChart({ period }: { period: Period }) {
+  const { CHART_STYLE, GRID_PROPS } = chartTheme();
   const [data, setData] = useState<ProviderStat[]>([]);
   const [metric, setMetric] = useState<'avg_latency_ms' | 'success_rate' | 'avg_cost' | 'avg_quality'>('success_rate');
   const [loading, setLoading] = useState(true);
@@ -157,6 +161,7 @@ function ProviderComparisonChart({ period }: { period: Period }) {
 
 // ── SRPT-03: Cost Tracking ────────────────────────────────────────────────────
 function CostTrackingChart({ period }: { period: Period }) {
+  const { CHART_STYLE, GRID_PROPS } = chartTheme();
   const [data, setData] = useState<CostBucket[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -192,6 +197,7 @@ function CostTrackingChart({ period }: { period: Period }) {
 
 // ── SRPT-04: Build Duration Histogram ─────────────────────────────────────────
 function BuildDurationChart({ period }: { period: Period }) {
+  const { CHART_STYLE, GRID_PROPS } = chartTheme();
   const [data, setData] = useState<DurationBucket[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -228,6 +234,7 @@ function BuildDurationChart({ period }: { period: Period }) {
 
 // ── SRPT-05: Quality Score Distribution ──────────────────────────────────────
 function QualityScoreChart({ period }: { period: Period }) {
+  const { CHART_STYLE, GRID_PROPS } = chartTheme();
   const [data, setData] = useState<QualityPoint[]>([]);
   const [loading, setLoading] = useState(true);
 
