@@ -12,6 +12,7 @@ import { Login } from './components/Login';
 import { ToastProvider, useToastContext } from './components/Toast';
 import { useAuth } from './hooks/useAuth';
 import { useActivityFeed } from './hooks/useActivityFeed';
+import { AuthRoleProvider } from './hooks/AuthRoleContext';
 import { getAggregationClient } from './lib/aggregationClient';
 import type { HealthStatus } from './lib/aggregationClient';
 import type { FeedItem } from './lib/activityFeed';
@@ -309,7 +310,7 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
 }
 
 export default function App() {
-  const { authenticated, username, loading: authLoading, login, logout } = useAuth();
+  const { authenticated, username, role, loading: authLoading, login, logout } = useAuth();
 
   // ToastProvider wraps every branch (not just the authenticated Shell) so its mounted state
   // never resets across an auth transition — harmless for the pre-auth branches below, which
@@ -323,7 +324,11 @@ export default function App() {
         <Login onLogin={login} />
       ) : (
         <BrowserRouter basename="/">
-          <Shell username={username} onLogout={logout} />
+          {/* CONST-27: republish `role` via context so `RoleGate` — used deep inside panels the
+              router mounts with no props — can read it without prop-drilling. */}
+          <AuthRoleProvider role={role}>
+            <Shell username={username} onLogout={logout} />
+          </AuthRoleProvider>
         </BrowserRouter>
       )}
     </ToastProvider>
