@@ -1330,6 +1330,26 @@ pub fn constellation_viewer_secret() -> Option<String> {
     env_nonempty("CONSTELLATION_VIEWER_SECRET")
 }
 
+/// LGUI-05 (LUMINA-GUI-SPEC.md §6 decision D2): the bearer credential
+/// `crate::constellation::proxy::proxy_lumina` attaches as
+/// `Authorization: Bearer <token>` on every proxied `/api/lumina/*path`
+/// request to the Lumina backend, so the browser never holds -- and can
+/// never supply -- a Lumina credential; the operator's Constellation session
+/// cookie only ever authenticates the *browser* to Terminus, this token is
+/// what separately authenticates *Terminus to Lumina* server-side. From
+/// `CONSTELLATION_LUMINA_TOKEN` (<secret-manager>-provisioned; same value as
+/// Lumina's own `LUMINA_HTTP_TOKEN` -- two consumers, one secret, per the
+/// spec's Pre-flight section). `None` when unset -- `proxy_lumina` forwards
+/// unauthenticated in that case, exactly as it did before this item (a
+/// token-less dev Lumina instance keeps working), never a hard failure.
+/// Same "no separate secret-store API in this crate" rationale as
+/// [`constellation_operator_secret`] above; the only caller is
+/// `crate::constellation::proxy::proxy_lumina`, which never logs the
+/// returned value.
+pub fn constellation_lumina_token() -> Option<String> {
+    env_nonempty("CONSTELLATION_LUMINA_TOKEN")
+}
+
 /// Constellation session token TTL, in seconds. Independent of
 /// `TERMINUS_ENROLLMENT_JWT_TTL_SECONDS` (a different credential with a
 /// different lifecycle: an operator's browser session vs. a paired
@@ -2222,6 +2242,16 @@ mod tests {
         std::env::set_var("CONSTELLATION_VIEWER_SECRET", "view-secret"); // pii-test-fixture
         assert_eq!(constellation_viewer_secret(), Some("view-secret".to_string()));
         std::env::remove_var("CONSTELLATION_VIEWER_SECRET");
+    }
+
+    #[test]
+    #[serial]
+    fn constellation_lumina_token_unset_is_none() {
+        std::env::remove_var("CONSTELLATION_LUMINA_TOKEN");
+        assert_eq!(constellation_lumina_token(), None);
+        std::env::set_var("CONSTELLATION_LUMINA_TOKEN", "lumina-secret"); // pii-test-fixture
+        assert_eq!(constellation_lumina_token(), Some("lumina-secret".to_string()));
+        std::env::remove_var("CONSTELLATION_LUMINA_TOKEN");
     }
 
     #[test]
