@@ -952,11 +952,20 @@ mod tests {
     #[test]
     fn check_landing_identity_fails_an_invented_symbol() {
         let mut facts = sample_facts_with_subsystems(&["intake", "scribe"]);
-        facts.subsystems[0].top_symbols =
-            vec![super::super::repo_facts::SymbolRef { id: "crate::intake::Discover".to_string(), kind: "fn", path: "src/intake/mod.rs".to_string(), rank: 0.5 }];
+        // Use a REAL symbol whose path segments are NOT kept-subsystem names
+        // ("intake"/"scribe"): otherwise `crate::intake::…` would put the token
+        // "intake" in the text and the anti-latch lint (which runs BEFORE the
+        // symbol-existence check) would fire first, so this test would never
+        // exercise the symbol-existence path it exists to cover.
+        facts.subsystems[0].top_symbols = vec![super::super::repo_facts::SymbolRef {
+            id: "crate::registry::ToolRegistry".to_string(),
+            kind: "struct",
+            path: "src/registry.rs".to_string(),
+            rank: 0.5,
+        }];
         let identity = sample_identity(
-            "The fleet's tool hub.",
-            "Powered by `crate::intake::Discover` and the entirely invented `crate::ghost::Phantom`.",
+            "The fleet's MCP tool hub.",
+            "Dispatches fleet tools over MCP via `crate::registry::ToolRegistry`; the entirely invented `crate::ghost::Phantom` does not exist.",
         );
         let err = check_landing_identity(&identity, &facts).unwrap_err();
         assert!(err.contains("symbol-existence"), "{err}");
