@@ -2661,6 +2661,17 @@ pub async fn read_context_profiles(
              ORDER BY mp.model_name, cr.context_tokens"
         )
     };
+    // Third fallback (cycle-3 review fix): `model_operational_profiles` is
+    // ANCILLARY data here — if that table alone is absent, the subselect must
+    // not erase the primary `context_profile_runs` rows; retry without the
+    // subselect (max_context_safe := NULL) instead.
+    let sql_no_subselect = format!(
+        "SELECT mp.model_name, cr.context_tokens, cr.throughput_tok_per_sec, cr.ttft_ms, \
+         cr.recall_score, cr.memory_usage_mb, cr.oom, \
+         NULL::integer AS max_context_safe \
+         FROM context_profile_runs cr JOIN model_profiles mp ON mp.id = cr.profile_id {where_sql} \
+         ORDER BY mp.model_name, cr.context_tokens"
+    );
     let sql = sql_for("COALESCE(mp2.profile_date, mp2.created_at)");
     type Row = (
         String,
@@ -2683,6 +2694,15 @@ pub async fn read_context_profiles(
     let attempt = match primary {
         Err(e) if is_missing_column_error(&e.to_string()) => {
             run(sql_for("mp2.created_at"), models.to_vec()).await
+        }
+        // The operational-profiles table alone missing must not drop primary
+        // context rows (cycle-3 fix) — the error names the missing relation,
+        // so only retry subselect-free when it is the ANCILLARY table.
+        Err(e)
+            if is_missing_relation_error(&e.to_string())
+                && e.to_string().contains("model_operational_profiles") =>
+        {
+            run(sql_no_subselect, models.to_vec()).await
         }
         other => other,
     };
