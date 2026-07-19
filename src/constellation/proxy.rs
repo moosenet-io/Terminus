@@ -2,13 +2,29 @@
 //! aggregation layer.
 //!
 //! `constellation-web`'s `aggregationClient.ts` httpAdapter talks to exactly
-//! three namespaced passthrough routes — `/api/harmony/*path`,
-//! `/api/chord/*path`, `/api/lumina/*path` — plus its own typed
-//! `/api/auth/*`, `/api/health`, `/api/terminus/config` endpoints (handled
-//! in `crate::constellation` directly, not here). Each namespaced route
-//! forwards method + sub-path + body to that backend's configured base URL
-//! (`crate::config::constellation_{harmony,chord,lumina}_url`) via
+//! four namespaced passthrough routes — `/api/harmony/*path`,
+//! `/api/chord/*path`, `/api/lumina/*path`, `/api/muse/*path` (CONST-19) —
+//! plus its own typed `/api/auth/*`, `/api/health`, `/api/terminus/config`
+//! endpoints (handled in `crate::constellation` directly, not here). Each
+//! namespaced route forwards method + sub-path + body to that backend's
+//! configured base URL
+//! (`crate::config::constellation_{harmony,chord,lumina,muse}_url`) via
 //! `reqwest`.
+//!
+//! ## Muse `/art/...` binary passthrough (CONST-19)
+//! Muse's `/art/:kind/:id` routes serve poster/art images, not JSON — the
+//! generic `proxy()` implementation below always attempts a JSON parse of
+//! the upstream body (falling back to a `{"raw": ...}` text wrapper), which
+//! would corrupt binary bytes and lose the real image content-type.
+//! [`proxy_muse`] special-cases any sub-path starting with `art/` and routes
+//! it to [`proxy_muse_art`] instead: the upstream body is forwarded
+//! byte-for-byte with the upstream's own `content-type`, skipping both the
+//! JSON parse and [`mask::mask_response`] (masking only ever walks JSON
+//! values — running it over an arbitrary binary blob is a no-op at best and
+//! a correctness risk at worst, so binary bodies deliberately never enter
+//! that path). Degraded/unconfigured/unreachable cases still return the
+//! standard JSON `{"system","available":false,"detail"}` shape (there's no
+//! image to serve to corrupt in those cases anyway).
 //!
 //! ## The single-door property
 //! This module is deliberately the ONLY place in this crate (and, per the
@@ -87,8 +103,9 @@ fn build_target(base: &str, sub_path: &str, query: Option<&str>) -> String {
     }
 }
 
-/// Shared implementation for all three namespaced proxy routes. `system` is
-/// the fixed literal namespace (`"harmony"`/`"chord"`/`"lumina"`);
+/// Shared implementation for all four namespaced proxy routes (the three
+/// JSON-oriented arms plus `proxy_muse`'s non-`art/` sub-paths). `system` is
+/// the fixed literal namespace (`"harmony"`/`"chord"`/`"lumina"`/`"muse"`);
 /// `base_url` is that system's configured backend base URL (`None` ⇒
 /// unconfigured); `sub_path` is everything after `/api/{system}/` (no
 /// leading slash, per axum's `*path` wildcard extraction).
@@ -262,6 +279,121 @@ pub async fn proxy_lumina(
     .await
 }
 
+/// `/api/muse/*path` (CONST-19) — the fourth namespaced proxy arm, otherwise
+/// identical single-door/masking/audit/degradation semantics to
+/// [`proxy_harmony`]/[`proxy_chord`]/[`proxy_lumina`] above. The one
+/// deliberate difference: a sub-path under `art/` (Muse's poster/art image
+/// routes) is routed to [`proxy_muse_art`] for raw binary passthrough
+/// instead of the JSON-oriented [`proxy`] — see this module's doc.
+pub async fn proxy_muse(
+    State(_state): State<Arc<McpServerState>>,
+    Path(path): Path<String>,
+    RawQuery(query): RawQuery,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let principal = principal_from_headers(&headers);
+    if path.starts_with("art/") {
+        return proxy_muse_art(&path, query.as_deref(), method, &headers, body, principal.as_deref()).await;
+    }
+    proxy(
+        "muse",
+        config::constellation_muse_url(),
+        &path,
+        query.as_deref(),
+        method,
+        &headers,
+        body,
+        principal.as_deref(),
+    )
+    .await
+}
+
+/// Raw binary passthrough for Muse's `/art/:kind/:id` poster/art routes (see
+/// this module's doc). Same audit + degradation semantics as [`proxy`], but
+/// on a successful upstream response the body is forwarded byte-for-byte
+/// with the UPSTREAM's own content-type — no JSON parse attempt, no
+/// [`mask::mask_response`] pass (see the module doc for why skipping masking
+/// here is correct, not a gap).
+async fn proxy_muse_art(
+    sub_path: &str,
+    query: Option<&str>,
+    method: Method,
+    headers: &HeaderMap,
+    body: Bytes,
+    principal: Option<&str>,
+) -> Response {
+    const SYSTEM: &str = "muse";
+    let request_path = format!("/api/{SYSTEM}/{sub_path}");
+
+    if audit::is_mutating_method(method.as_str()) {
+        audit::record_mutating_request(
+            SYSTEM,
+            method.as_str(),
+            &request_path,
+            principal,
+            &audit::body_text(&body),
+        );
+    }
+
+    let Some(base) = config::constellation_muse_url() else {
+        return respond(
+            StatusCode::OK,
+            unavailable_body(SYSTEM, format!("{SYSTEM} backend not configured")),
+        );
+    };
+
+    let target = build_target(&base, sub_path, query);
+    let timeout = Duration::from_millis(config::constellation_backend_timeout_ms());
+
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    let result = http_client()
+        .request(method.clone(), &target)
+        .timeout(timeout)
+        .header("content-type", content_type)
+        .body(body.to_vec())
+        .send()
+        .await;
+
+    match result {
+        Ok(upstream_resp) => {
+            let status = StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::OK);
+            // Forward the UPSTREAM content-type verbatim (defaulting only if
+            // the upstream itself omitted one) -- this is the whole point of
+            // this arm: an art response's real image content-type must
+            // survive, not be overwritten with "application/json" like the
+            // generic `respond()` helper does.
+            let resp_content_type = upstream_resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            match upstream_resp.bytes().await {
+                Ok(bytes) => (status, [("content-type", resp_content_type)], bytes.to_vec()).into_response(),
+                Err(e) => respond(
+                    StatusCode::OK,
+                    unavailable_body(SYSTEM, format!("error reading {SYSTEM} art response: {e}")),
+                ),
+            }
+        }
+        Err(e) if e.is_timeout() => respond(
+            StatusCode::OK,
+            unavailable_body(SYSTEM, format!("{SYSTEM} backend timed out")),
+        ),
+        Err(e) => respond(
+            StatusCode::OK,
+            unavailable_body(SYSTEM, format!("{SYSTEM} backend unreachable: {e}")),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,6 +401,7 @@ mod tests {
     use serial_test::serial;
 
     #[tokio::test]
+    #[serial]
     async fn unconfigured_backend_returns_structured_unavailable_not_5xx() {
         let resp = proxy(
             "harmony",
@@ -331,5 +464,213 @@ mod tests {
         assert_eq!(v["system"], "lumina");
         assert_eq!(v["available"], false);
         assert_eq!(v["detail"], "test reason");
+    }
+
+    // ── CONST-19: Muse proxy arm ─────────────────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn muse_unconfigured_backend_returns_structured_unavailable_not_5xx() {
+        // Mirrors `unconfigured_backend_returns_structured_unavailable_not_5xx`
+        // above, exercised through the shared `proxy()` fn with "muse" as the
+        // system literal (same as `proxy_muse` does for non-`art/` sub-paths).
+        let resp = proxy(
+            "muse",
+            None,
+            "on_deck",
+            None,
+            Method::GET,
+            &HeaderMap::new(),
+            Bytes::new(),
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["system"], "muse");
+        assert_eq!(parsed["available"], false);
+        assert!(parsed["detail"].as_str().unwrap().contains("not configured"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn muse_unreachable_backend_degrades_cleanly() {
+        let resp = proxy(
+            "muse",
+            Some("http://127.0.0.1:1".to_string()), // pii-test-fixture
+            "on_deck",
+            None,
+            Method::GET,
+            &HeaderMap::new(),
+            Bytes::new(),
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["system"], "muse");
+        assert_eq!(parsed["available"], false);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn muse_art_unconfigured_backend_returns_structured_unavailable() {
+        // `proxy_muse_art` (the raw-passthrough arm) has its own unconfigured
+        // path -- must degrade the same way as the JSON arm, not panic or
+        // 5xx just because there's no image to serve.
+        let resp = proxy_muse_art(
+            "art/poster/123",
+            None,
+            Method::GET,
+            &HeaderMap::new(),
+            Bytes::new(),
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap().to_string();
+        assert!(content_type.contains("json"));
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["system"], "muse");
+        assert_eq!(parsed["available"], false);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn muse_art_unreachable_backend_degrades_cleanly_not_a_panic() {
+        // Regression for the CONST-19 edge case: a non-JSON (or, here,
+        // unreachable-so-no-body-at-all) response through the art passthrough
+        // arm must never panic -- it degrades exactly like the JSON arm when
+        // there's no upstream to read bytes from at all.
+        let resp = proxy_muse_art(
+            "art/poster/123",
+            None,
+            Method::GET,
+            &HeaderMap::new(),
+            Bytes::new(),
+            Some("test-operator"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["system"], "muse");
+        assert_eq!(parsed["available"], false);
+    }
+
+    #[test]
+    fn proxy_muse_routes_art_subpaths_to_the_binary_passthrough_arm() {
+        // A structural check that the dispatch rule in `proxy_muse` (this
+        // module's doc) is what it claims: any sub-path prefixed `art/` is
+        // treated as a binary-art request, everything else is not.
+        assert!("art/poster/abc123".starts_with("art/"));
+        assert!(!"api/graph/taste-clusters".starts_with("art/"));
+        assert!(!"on_deck".starts_with("art/"));
+    }
+
+    /// POSITIVE binary passthrough (review follow-up on the CONST-19 PR):
+    /// the earlier art tests only covered unconfigured/unreachable
+    /// degradation, never a successful byte-for-byte forward. This spins up
+    /// a real ephemeral HTTP server (same pattern as
+    /// `pki::server::build_gateway_router_merges_mcp_and_enroll_routes`)
+    /// that answers with fixed non-JSON bytes (a PNG magic-number prefix
+    /// plus a JSON-secret-shaped byte sequence embedded in the "body", to
+    /// prove masking never touches it) and an `image/png` content-type, then
+    /// asserts `proxy_muse_art` forwards the bytes EXACTLY and preserves the
+    /// upstream's own content-type rather than the JSON arm's hardcoded
+    /// `application/json`.
+    #[tokio::test]
+    #[serial]
+    async fn muse_art_success_forwards_bytes_and_content_type_without_masking() {
+        // A byte sequence that is (a) not valid UTF-8/JSON at all (the PNG
+        // magic number) and (b) contains a secret-shaped substring
+        // (`"api_key":"should-never-be-redacted"`) that mask_response WOULD
+        // alter if this path ever ran the body through JSON parse + masking.
+        let mut art_bytes: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        art_bytes.extend_from_slice(br#"{"api_key":"should-never-be-redacted"}"#);
+        let expected_bytes = art_bytes.clone();
+
+        async fn serve_art(bytes: Vec<u8>) -> Response {
+            (StatusCode::OK, [("content-type", "image/png")], bytes).into_response()
+        }
+        let art_bytes_for_handler = art_bytes.clone();
+        let app = axum::Router::new().route(
+            "/art/poster/123",
+            axum::routing::get(move || serve_art(art_bytes_for_handler.clone())),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback"); // pii-test-fixture
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        std::env::set_var("CONSTELLATION_MUSE_URL", format!("http://{addr}")); // pii-test-fixture
+
+        let resp = proxy_muse_art(
+            "art/poster/123",
+            None,
+            Method::GET,
+            &HeaderMap::new(),
+            Bytes::new(),
+            None,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap().to_string();
+        assert_eq!(content_type, "image/png", "upstream content-type must be preserved verbatim");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            body.as_ref(),
+            expected_bytes.as_slice(),
+            "art bytes must be forwarded byte-for-byte, unmodified by masking"
+        );
+
+        std::env::remove_var("CONSTELLATION_MUSE_URL");
+    }
+
+    /// Muse-specific mutating-POST audit test (review follow-up), mirroring
+    /// `audit::record_mutating_request_appends_a_jsonl_line`'s pattern but
+    /// exercised through this module's own `proxy()` call for the `muse`
+    /// namespace — proving `proxy_muse`'s audit call site (not just the
+    /// generic `audit` module in isolation) actually fires for a mutating
+    /// request under `/api/muse/*`.
+    #[tokio::test]
+    #[serial]
+    async fn muse_mutating_post_is_audited() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        std::env::set_var("CONSTELLATION_AUDIT_LOG_PATH", &path);
+
+        // No backend configured -- the request still degrades cleanly (200
+        // available:false), but the audit call happens BEFORE the backend
+        // dispatch (see `proxy()`'s doc), so it must be recorded regardless.
+        let resp = proxy(
+            "muse",
+            None,
+            "api/channels",
+            None,
+            Method::POST,
+            &HeaderMap::new(),
+            Bytes::from_static(br#"{"name":"new channel"}"#),
+            Some("test-operator"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let line = contents.lines().next().expect("expected an audit line to be written");
+        let parsed: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(parsed["system"], "muse");
+        assert_eq!(parsed["method"], "POST");
+        assert_eq!(parsed["path"], "/api/muse/api/channels");
+        assert_eq!(parsed["principal"], "test-operator");
+
+        std::env::remove_var("CONSTELLATION_AUDIT_LOG_PATH");
     }
 }

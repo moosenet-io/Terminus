@@ -14,7 +14,7 @@ This is the **only** module in the app allowed to call `fetch`, read `window.loc
 touch `localStorage` (the last one only via the `prefs` seam below). Every hook, panel, or
 component that needs backend data goes through the exported `getAggregationClient()`
 singleton — never `fetch` directly. This keeps the browser's only network surface to
-same-origin `/api/{harmony,chord,lumina,terminus}/*` calls, cookie-based
+same-origin `/api/{harmony,chord,lumina,muse,terminus}/*` calls, cookie-based
 (`credentials: 'include'`), no hardcoded hosts.
 
 It has two implementations of the same `AggregationClient` interface:
@@ -34,7 +34,7 @@ this is the contract the httpAdapter already assumes:
 | GET | `/api/auth/me` | `{ authenticated: boolean; username: string \| null }` |
 | POST | `/api/auth/login` (body `{username,password}`) | same as above |
 | POST | `/api/auth/logout` | 200/204 |
-| GET | `/api/health` | `{ system: 'harmony'\|'chord'\|'lumina'\|'terminus'; available: boolean; detail?: string }[]` |
+| GET | `/api/health` | `{ system: 'harmony'\|'chord'\|'lumina'\|'muse'\|'terminus'; available: boolean; detail?: string }[]` |
 | GET | `/api/terminus/config` | `{ modules: { name: string; enabled: boolean; version?: string }[]; workerCount: number }` |
 | any | `/api/{system}/{path}` | generic passthrough used by `client.request<T>()` for panel-specific reads that don't have a typed method yet |
 
@@ -59,6 +59,11 @@ discovery}` read layer — no second database pool, no MCP self-calls. List endp
 | GET | `/api/terminus/mint/failures?epoch=&task_category=` | per-model failure-class counts, top-5 + "other" fold |
 | GET | `/api/terminus/mint/context-profiles?models=` | per-model context-tier arrays + `max_context_safe` |
 | GET | `/api/terminus/mint/activity?range=` | runs/day by suite + the current epoch marker |
+
+CONST-19 adds the fourth namespace, `/api/muse/*path` — identical single-door/masking/audit/
+degradation semantics to the other three, with one difference: `/api/muse/art/*` (poster/art
+images) passes through as raw bytes with the upstream's own content-type rather than JSON —
+fetch those by URL (e.g. an `<img src>`), not through `client.request<T>()`.
 
 #### The `prefs` seam (CONST-16)
 
