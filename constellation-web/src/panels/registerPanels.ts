@@ -20,6 +20,7 @@
 //   Harmony:  Dashboard, Projects, Tasks, Agents, PRs, Prompts, Sessions, AuditLog,
 //             Analytics (was status.analytics), Engine Diagram (was status.engine-diagram)
 //   Chord:    Inference, Providers, Playground
+//   Muse:     Dashboard, Taste, Channels (CONST-20)
 //   Terminus: existing example TerminusPanel
 //   Lumina:   stub (config surface TBD in CONST-07)
 import { registerPanel, registerModule } from '../lib/moduleRegistry';
@@ -28,6 +29,9 @@ import { LuminaStubPanel } from './lumina/LuminaStubPanel';
 import { EngineDiagramPanel } from './status/EngineDiagramPanel';
 import { DashboardPanel } from './harmony/DashboardPanel';
 import { ProjectsPanel } from './harmony/ProjectsPanel';
+import { DashboardPanel as MuseDashboardPanel } from './muse/DashboardPanel';
+import { TastePanel as MuseTastePanel } from './muse/TastePanel';
+import { ChannelsPanel as MuseChannelsPanel } from './muse/ChannelsPanel';
 import { Tasks } from '../pages/Tasks';
 import { Agents } from '../pages/Agents';
 import { PRs } from '../pages/PRs';
@@ -46,8 +50,7 @@ import { Analytics } from '../pages/Analytics';
 registerModule({ id: 'harmony', title: 'Harmony', icon: '⌂', healthSystem: 'harmony', order: 1 });
 registerModule({ id: 'chord', title: 'Chord', icon: '⚡', healthSystem: 'chord', order: 2 });
 registerModule({ id: 'lumina', title: 'Lumina', icon: '✦', healthSystem: 'lumina', order: 3 });
-// CONST-19: module registration only -- no panels yet (CONST-20 adds
-// muse.dashboard/muse.taste/muse.channels).
+// CONST-19 registered the module; CONST-20 adds its three panels below.
 registerModule({ id: 'muse', title: 'Muse', icon: '🎬', healthSystem: 'muse', order: 4 });
 registerModule({ id: 'terminus', title: 'Terminus', icon: '⚙', healthSystem: 'terminus', order: 7 });
 
@@ -184,6 +187,38 @@ registerPanel({
   icon: '▶',
   available: true,
   component: Playground,
+});
+
+// ── Muse (CONST-20) ──────────────────────────────────────────────────────────
+
+registerPanel({
+  id: 'muse.dashboard',
+  system: 'muse',
+  title: 'Dashboard',
+  path: '/muse/dashboard',
+  icon: '🎬',
+  available: true,
+  component: MuseDashboardPanel,
+});
+
+registerPanel({
+  id: 'muse.taste',
+  system: 'muse',
+  title: 'Taste',
+  path: '/muse/taste',
+  icon: '📈',
+  available: true,
+  component: MuseTastePanel,
+});
+
+registerPanel({
+  id: 'muse.channels',
+  system: 'muse',
+  title: 'Channels',
+  path: '/muse/channels',
+  icon: '📺',
+  available: true,
+  component: MuseChannelsPanel,
 });
 
 // ── Terminus ─────────────────────────────────────────────────────────────────
