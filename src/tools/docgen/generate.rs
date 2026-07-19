@@ -395,7 +395,14 @@ pub struct RepoDocsOutcome {
 /// symbols named that are NOT in this set, so including more real symbols
 /// only makes the lint more permissive of genuinely real names, never less
 /// strict against invented ones).
-fn all_symbol_names(facts: &RepoFacts) -> Vec<String> {
+/// Every real symbol name (repo-scale hotspots + every kept subsystem's top
+/// symbols) `RepoFacts` knows about, deduped and stably ordered. `pub` (not
+/// just crate-private) so [`super::quality::check_landing_identity`]
+/// (DGRICH-09) can re-run the SAME [`symbol_existence_lint`] this module's
+/// own [`run_identity_pass`] already gates Pass 1 with, as a placement-time
+/// backstop against the same real-symbol set -- one derivation, reused, not
+/// a second copy that could drift.
+pub fn all_symbol_names(facts: &RepoFacts) -> Vec<String> {
     let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for s in &facts.scale.hotspots {
         set.insert(s.id.clone());
