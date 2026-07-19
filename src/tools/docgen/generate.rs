@@ -1534,10 +1534,16 @@ Clone with `git clone <repo>` then build with `cargo build`.
                 !beta_prompt.contains("Alpha ALREADY documents the hub reliably"),
                 "beta must not see alpha's baseline"
             );
+            // beta has no existing page on disk -> its slice OMITS the key entirely
+            // (not `null`), and its prompt carries no deepen rule -- byte-identical
+            // to the pre-DGDG-02 first-run shape for that subsystem.
             assert!(
-                beta_prompt.contains("\"existing_page\": null"),
-                "beta has no existing page on disk -- its slice must report existing_page as null, \
-not a fabricated baseline: {beta_prompt}"
+                !beta_prompt.contains("existing_page"),
+                "beta (no existing page) must not mention existing_page at all: {beta_prompt}"
+            );
+            assert!(
+                !beta_prompt.contains("DEEPEN AND REFINE"),
+                "beta (no existing page) must not carry the deepen rule: {beta_prompt}"
             );
             drop(page_prompts);
 
@@ -1569,9 +1575,16 @@ not a fabricated baseline: {beta_prompt}"
 
             let page_prompts = generator.captured_page_prompts.lock().unwrap();
             for (name, prompt) in page_prompts.iter() {
+                // First run (no docs/ tree): the slice OMITS existing_page entirely
+                // and the prompt carries no deepen rule -- byte-identical to the
+                // pre-DGDG-02 first-run prompt (codex review requirement).
                 assert!(
-                    prompt.contains("\"existing_page\": null"),
-                    "'{name}' must report existing_page as null (no fabricated baseline) on a first run: {prompt}"
+                    !prompt.contains("existing_page"),
+                    "'{name}' first-run prompt must not mention existing_page at all: {prompt}"
+                );
+                assert!(
+                    !prompt.contains("DEEPEN AND REFINE"),
+                    "'{name}' first-run prompt must not carry the deepen rule: {prompt}"
                 );
             }
         }
