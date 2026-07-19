@@ -48,11 +48,16 @@
 //! append-only, diffable, rollback-able store DOCGEN-07 already ships. This
 //! module adds no second version-storage mechanism.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+
+use regex::Regex;
 
 use super::generate::{DocGenerator, SweptFeatContext};
 use super::pii_gate::{sweep_input, PiiGateOutcome};
+use super::repo_facts::{RepoFacts, Subsystem, SubsystemEdge};
 use super::versioning::{ArtifactKey, ArtifactVersion, VersionStore};
 use crate::error::ToolError;
 
@@ -422,6 +427,20 @@ fn mermaid_safe_id(label: &str) -> String {
 /// ([`sweep_input`]) as any other diagram source before being wrapped in a
 /// [`SweptDiagramSource`] -- even this generic template never embeds an
 /// unswept label (spec AC: "diagram source PII-swept before embed").
+///
+/// ## DGRICH-04: demoted to the `kg_grounded:false` last resort
+/// This is now the FALLBACK ONLY, used when [`RepoFacts::kg_grounded`] is
+/// `false` or a repo has fewer than two real subsystems (there is no
+/// meaningful cross-subsystem call graph to derive an architecture diagram
+/// from in either case) -- see
+/// [`subsystem_architecture_mermaid_source`]/[`full_subsystem_architecture_mermaid_source`]
+/// for the derived diagram every other repo gets. Every source this
+/// function emits is, by construction, exactly the generic
+/// `Client -> Core -> Output` template
+/// [`is_generic_placeholder`] is built to detect -- so a generic diagram
+/// can never ship silently on the landing/`docs/architecture.md` again;
+/// callers must check the lint and surface the degradation rather than
+/// treat this as an equally-good diagram.
 pub fn default_architecture_mermaid_source(module: &str) -> Result<SweptDiagramSource, ToolError> {
     // Sweep the RAW label first, then derive the mermaid-safe id from the
     // already-sanitized text -- not the other way around. Deriving the id
@@ -443,6 +462,348 @@ pub fn default_architecture_mermaid_source(module: &str) -> Result<SweptDiagramS
     // this module's existing "two independent sweep points" posture.
     let outcome = sweep_input(&raw)?;
     Ok(SweptDiagramSource::from_gate_outcome(&outcome, DiagramFormat::Mermaid))
+}
+
+// ---------------------------------------------------------------------------
+// DGRICH-04: derived subsystem architecture diagram (Pass 4, deterministic,
+// no LLM) -- design doc `fable-docgen-redesign.md` §2 Pass 4.
+// ---------------------------------------------------------------------------
+//
+// `subsystem_architecture_mermaid_source`/`full_subsystem_architecture_mermaid_source`
+// take a `&RepoFacts`, not a bare `&SubsystemGraph` (the design doc's
+// shorthand signature) -- `RepoFacts::edge_matrix` (a `SubsystemGraph`) is
+// exactly the weighted cross-subsystem call data the design describes, but
+// on its own it carries no node/symbol counts and no way to identify
+// entry-point subsystems, both of which the same §2 Pass 4 paragraph
+// requires for node labels (`name (n symbols)`) and left-to-right ordering
+// (entry points leftmost). `RepoFacts` is the one type that already has all
+// three (`edge_matrix`, `subsystems` for counts, `entry_points` for the
+// bin/serve/register_all-shaped symbols) without threading two/three
+// separate parameters through every call site -- documented here as the
+// deliberate, load-bearing deviation from the design doc's literal
+// signature.
+
+/// Top-≤10-subsystems node cap for the landing's compact diagram (design §2
+/// Pass 4: "nodes = top <=10 subsystems by weight").
+const LANDING_MAX_DIAGRAM_NODES: usize = 10;
+
+/// Fuller ≤16-node cap for `docs/architecture.md` (design §2 Pass 4: "a
+/// fuller one (<=16 nodes)") -- matches `repo_facts`'s own `MAX_SUBSYSTEMS`
+/// rollup cap, so the full diagram can show every subsystem RepoFacts ever
+/// kept a page for.
+const ARCHITECTURE_MAX_DIAGRAM_NODES: usize = 16;
+
+/// Edges below this floor are dropped from the diagram (design §2 Pass 4:
+/// "edges where cross-call weight >= max(5, p75 of nonzero weights)").
+const MIN_EDGE_WEIGHT_FLOOR: u32 = 5;
+
+/// Stable mermaid node id for the folded "everything else" node. The label
+/// is the design's literal `…` marker; the id must be ASCII-identifier-safe
+/// (mermaid ids can't contain `…`), so it is kept distinct from
+/// [`mermaid_safe_id`]'s derivation of real subsystem ids.
+const FOLD_NODE_ID: &str = "dgrich_fold";
+
+/// The nearest-rank p-th percentile of an already-sorted-ascending slice.
+/// Empty input -> `0` (callers combine this with [`MIN_EDGE_WEIGHT_FLOOR`]
+/// via `max`, so an empty/absent p75 never lowers the effective threshold).
+fn percentile_of_sorted(sorted: &[u32], p: f64) -> u32 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = (((sorted.len() - 1) as f64) * p).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+/// Total cross-subsystem call weight touching `name` (as either endpoint) --
+/// the "top subsystems by weight (participation)" ranking signal design §2
+/// Pass 4 calls for. A subsystem absent from every edge (e.g. a leaf with no
+/// cross-subsystem calls recorded) scores `0`, not an error.
+fn participation_weight(edges: &[SubsystemEdge], name: &str) -> u64 {
+    edges
+        .iter()
+        .filter(|e| e.from == name || e.to == name)
+        .map(|e| e.weight as u64)
+        .sum()
+}
+
+/// Subsystem names reached from a `bin`/server main, per the `entry_points`
+/// surface RepoFacts already derives (design §2 source 4): the first path
+/// segment of each entry-point symbol id, after stripping a leading
+/// `crate::` -- mirrors `repo_facts::subsystem_prefix`'s Rust-shaped rule
+/// without re-exporting that private helper (this module only needs the
+/// simple prefix case; entry points are never TS-tree symbols).
+fn entrypoint_subsystem_names(facts: &RepoFacts) -> BTreeSet<String> {
+    facts
+        .entry_points
+        .entrypoint_symbols
+        .iter()
+        .filter_map(|sym| {
+            let rest = sym.strip_prefix("crate::").unwrap_or(sym.as_str());
+            rest.split("::").next().map(|s| s.to_string())
+        })
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// Order kept subsystems for node-declaration (and therefore left-to-right
+/// layout) purposes: entry-point subsystems first (design §2 Pass 4: "entry
+/// point subsystems ... leftmost"), each group ordered by descending
+/// participation weight, ties broken by name for determinism.
+fn order_kept_for_layout<'a>(
+    kept: &[&'a Subsystem],
+    edges: &[SubsystemEdge],
+    entrypoints: &BTreeSet<String>,
+) -> Vec<&'a Subsystem> {
+    let mut ordered: Vec<&Subsystem> = kept.to_vec();
+    ordered.sort_by(|a, b| {
+        let a_entry = entrypoints.contains(&a.name);
+        let b_entry = entrypoints.contains(&b.name);
+        // Entry-point subsystems sort first (false < true, so invert).
+        b_entry.cmp(&a_entry).then_with(|| {
+            let wa = participation_weight(edges, &a.name);
+            let wb = participation_weight(edges, &b.name);
+            wb.cmp(&wa).then_with(|| a.name.cmp(&b.name))
+        })
+    });
+    ordered
+}
+
+/// Shared implementation behind [`subsystem_architecture_mermaid_source`]
+/// (landing, `max_nodes = 10`) and
+/// [`full_subsystem_architecture_mermaid_source`] (`docs/architecture.md`,
+/// `max_nodes = 16`) -- both are thin wrappers over this so the two diagrams
+/// can never drift in derivation rule, only in node budget.
+fn build_subsystem_mermaid(facts: &RepoFacts, max_nodes: usize) -> Result<SweptDiagramSource, ToolError> {
+    // Without KG grounding there is no real call graph, so a "derived" diagram
+    // would be synthetic — never emit one that could be mistaken for
+    // KG-derived. The generic default is the documented no-KG fallback (and
+    // `is_generic_placeholder` flags it so the landing gate can catch it).
+    if !facts.kg_grounded {
+        return default_architecture_mermaid_source(&facts.project_id);
+    }
+    // Edge case: a single-subsystem (or zero-subsystem) repo has no meaningful
+    // cross-subsystem call graph to derive an architecture diagram from -- same
+    // generic-default fallback.
+    let real: Vec<&Subsystem> = facts.subsystems.iter().filter(|s| !s.is_misc).collect();
+    if real.len() < 2 {
+        return default_architecture_mermaid_source(&facts.project_id);
+    }
+
+    let edges = &facts.edge_matrix.edges;
+    let entrypoints = entrypoint_subsystem_names(facts);
+
+    // Rank ALL subsystems (real + the existing `misc` rollup, if present) by
+    // participation weight; ties broken by node_count then name so the
+    // ranking never depends on map/graph iteration order.
+    let mut ranked: Vec<&Subsystem> = facts.subsystems.iter().collect();
+    ranked.sort_by(|a, b| {
+        let wa = participation_weight(edges, &a.name);
+        let wb = participation_weight(edges, &b.name);
+        wb.cmp(&wa)
+            .then_with(|| b.node_count.cmp(&a.node_count))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    let kept: Vec<&Subsystem> = ranked.iter().take(max_nodes).copied().collect();
+    let folded: Vec<&Subsystem> = ranked.iter().skip(max_nodes).copied().collect();
+    let kept_names: BTreeSet<&str> = kept.iter().map(|s| s.name.as_str()).collect();
+    let need_fold_node = !folded.is_empty();
+    let folded_node_count: usize = folded.iter().map(|s| s.node_count).sum();
+
+    // Edge weight threshold: max(5, p75 of nonzero weights) (design §2 Pass
+    // 4), computed over the FULL edge matrix so the threshold reflects the
+    // repo's real call-weight distribution, not just the kept subset.
+    let mut nonzero: Vec<u32> = edges.iter().map(|e| e.weight).filter(|w| *w > 0).collect();
+    nonzero.sort_unstable();
+    let threshold = MIN_EDGE_WEIGHT_FLOOR.max(percentile_of_sorted(&nonzero, 0.75));
+
+    // Re-key every edge onto a kept node (or the fold node); drop edges with
+    // neither endpoint represented at all (can't happen given `kept` is the
+    // full ranked list truncated, but defensive rather than panicking).
+    let key_of = |name: &str| -> Option<String> {
+        if kept_names.contains(name) {
+            Some(name.to_string())
+        } else if need_fold_node {
+            Some(FOLD_NODE_ID.to_string())
+        } else {
+            None
+        }
+    };
+
+    let mut folded_weights: BTreeMap<(String, String), u32> = BTreeMap::new();
+    for e in edges {
+        if e.weight == 0 {
+            continue;
+        }
+        let (Some(from), Some(to)) = (key_of(&e.from), key_of(&e.to)) else { continue };
+        if from == to {
+            // A fold-node self-loop (two folded subsystems calling each
+            // other) is not an architecture edge worth drawing.
+            continue;
+        }
+        *folded_weights.entry((from, to)).or_insert(0) += e.weight;
+    }
+
+    let mut kept_edges: Vec<((String, String), u32)> =
+        folded_weights.iter().map(|(k, w)| (k.clone(), *w)).collect();
+    kept_edges.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut selected: Vec<&((String, String), u32)> =
+        kept_edges.iter().filter(|(_, w)| *w >= threshold).collect();
+
+    // Edge case: every edge is below threshold -- the diagram must never be
+    // empty (design EDGE CASES), so keep the top edges by weight instead.
+    if selected.is_empty() && !kept_edges.is_empty() {
+        let mut by_weight: Vec<&((String, String), u32)> = kept_edges.iter().collect();
+        by_weight.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let top_weight = by_weight.first().map(|(_, w)| *w).unwrap_or(0);
+        selected = by_weight.into_iter().filter(|(_, w)| *w == top_weight).collect();
+    }
+
+    let ordered_kept = order_kept_for_layout(&kept, edges, &entrypoints);
+
+    // Sweep each kept subsystem's name INDIVIDUALLY, then derive its mermaid
+    // id from the already-sanitized text -- not the other way around.
+    // Composing the raw (dotted) name into an id first and sweeping the
+    // assembled diagram text afterward would let a private IP survive as a
+    // flattened, still human-readable digit run (`mermaid_safe_id` turns
+    // `.`/`-` into `_`, so an address would stop matching the dotted-quad
+    // PII pattern before the sweep ever runs) -- the exact bypass
+    // `default_architecture_mermaid_source`'s own doc comment warns about,
+    // and the one DGRICH-04's TEST PLAN item 3 exists to catch.
+    //
+    // The name is boundary-normalized (see
+    // `boundary_normalize_for_pii_detection`) BEFORE it is swept: an
+    // identifier-glued IP (`svc_` immediately followed by a dotted-quad
+    // private address) has no regex word boundary
+    // between the `_` and the leading digit, so the raw name would sail
+    // through `sweep_input` untouched -- normalizing `_`/`-` to a space
+    // first gives the `\b`-anchored patterns a real boundary to match
+    // against without disturbing the dots the IP pattern itself needs.
+    let mut sanitized_label: BTreeMap<String, String> = BTreeMap::new();
+    let mut sanitized_id: BTreeMap<String, String> = BTreeMap::new();
+    let mut used_ids: BTreeSet<String> = BTreeSet::new();
+    for s in &kept {
+        let normalized = boundary_normalize_for_pii_detection(&s.name);
+        // A subsystem NAME is a short token, so if it is PII-dominated (e.g. an
+        // adversarial `svc_<private-ip>`) `sweep_input`'s meaning-preservation
+        // guard would BLOCK it (`Err`), which the `?` would propagate and turn a
+        // whole-diagram render into a hard failure. For a node label we always
+        // want the redacted form, never a block, so redact directly here (the
+        // fully-composed diagram is still run through `sweep_input` below as the
+        // belt-and-suspenders second pass).
+        let label = match sweep_input(&normalized) {
+            Ok(outcome) => outcome.sanitized_content().to_string(),
+            Err(_) => crate::github::pii::scan_and_redact(&normalized).0,
+        };
+        let base_id = mermaid_safe_id(&label);
+        // Disambiguate a rare id collision (two distinct subsystem names
+        // that flatten to the same mermaid-safe id) with a numeric suffix
+        // rather than silently declaring the same node id twice.
+        let mut id = base_id.clone();
+        let mut suffix = 2;
+        while used_ids.contains(&id) {
+            id = format!("{base_id}_{suffix}");
+            suffix += 1;
+        }
+        used_ids.insert(id.clone());
+        sanitized_label.insert(s.name.clone(), label);
+        sanitized_id.insert(s.name.clone(), id);
+    }
+
+    let mut lines = vec!["flowchart LR".to_string()];
+    for s in &ordered_kept {
+        let id = &sanitized_id[&s.name];
+        let label = &sanitized_label[&s.name];
+        lines.push(format!("    {id}[\"{label} ({} symbols)\"]", s.node_count));
+    }
+    if need_fold_node {
+        lines.push(format!("    {FOLD_NODE_ID}[\"… ({folded_node_count} more)\"]"));
+    }
+    for ((from, to), weight) in &selected {
+        let from_id = if from == FOLD_NODE_ID { from.clone() } else { sanitized_id[from].clone() };
+        let to_id = if to == FOLD_NODE_ID { to.clone() } else { sanitized_id[to].clone() };
+        lines.push(format!("    {from_id} -->|{weight}| {to_id}"));
+    }
+
+    // Belt-and-suspenders: sweep the fully composed diagram text too,
+    // matching this module's existing "two independent sweep points"
+    // posture (see `default_architecture_mermaid_source`).
+    let raw = lines.join("\n") + "\n";
+    let outcome = sweep_input(&raw)?;
+    Ok(SweptDiagramSource::from_gate_outcome(&outcome, DiagramFormat::Mermaid))
+}
+
+/// The compact (top ≤10 subsystem) derived architecture diagram for a
+/// repo's landing page -- design §2 Pass 4. Deterministic, no LLM call.
+/// Nodes are the repo's top subsystems by cross-subsystem call weight
+/// (participation), the rest folded into a single `…` node; edges are kept
+/// where cross-call weight clears `max(5, p75 of nonzero weights)`; each
+/// node is labeled `name (n symbols)`; entry-point subsystems (reached from
+/// a `bin`/server main, per [`RepoFacts::entry_points`]) are ordered
+/// leftmost. Falls back to [`default_architecture_mermaid_source`] when
+/// `facts` has fewer than two real subsystems (nothing to derive an
+/// architecture edge from) -- that fallback is exactly what
+/// [`is_generic_placeholder`] flags so it can never ship silently.
+pub fn subsystem_architecture_mermaid_source(facts: &RepoFacts) -> Result<SweptDiagramSource, ToolError> {
+    build_subsystem_mermaid(facts, LANDING_MAX_DIAGRAM_NODES)
+}
+
+/// The fuller (≤16 subsystem) variant for `docs/architecture.md`, meant to
+/// be paired with Pass 1's per-subsystem narrative there (design §2 Pass 4:
+/// "`docs/architecture.md` embeds a fuller one (<=16 nodes)"). Same
+/// derivation rule as [`subsystem_architecture_mermaid_source`], larger
+/// node budget only.
+pub fn full_subsystem_architecture_mermaid_source(facts: &RepoFacts) -> Result<SweptDiagramSource, ToolError> {
+    build_subsystem_mermaid(facts, ARCHITECTURE_MAX_DIAGRAM_NODES)
+}
+
+/// Replace `_`/`-` glue characters in `raw` with a plain space, leaving
+/// every other character (including `.`) untouched.
+///
+/// Review finding (DGRICH-04 gate): the canonical `private_ip` pattern (and
+/// every other `\b`-anchored built-in PII pattern) requires a real regex
+/// word boundary at both ends of the match. A subsystem name is a
+/// `crate::<mod>`-derived identifier, so an adversarial or coincidental
+/// name (e.g. `svc_` immediately followed by a dotted-quad private
+/// address) glues the IP directly onto a preceding identifier segment with
+/// an underscore -- and `_` is itself a word character, so there is NO
+/// boundary between the identifier and the digits that follow it, and
+/// `sweep_input`/`scan_and_redact` silently pass the IP through unchanged.
+/// Swapping `_`/`-` for a space restores a real boundary at every such
+/// glue point WITHOUT touching the dots inside the IP itself (which the
+/// pattern still needs intact to match `NNN.NNN.NNN.NNN`), so this is
+/// belt-and-suspenders normalization applied before every sweep in this
+/// function, not a new detection mechanism of its own. Real subsystem
+/// names are dot-free identifiers, so in the common case this is a no-op
+/// beyond turning `_`/`-` into a space in the printed label -- cosmetically
+/// harmless, and `mermaid_safe_id` flattens that space right back to `_`
+/// when deriving the node id, so a clean name's id is unchanged either way.
+fn boundary_normalize_for_pii_detection(raw: &str) -> String {
+    raw.chars().map(|c| if c == '_' || c == '-' { ' ' } else { c }).collect()
+}
+
+/// `\(\d+ symbols\)` -- matches this module's `name (n symbols)` real-node
+/// label exactly (and never the fold node's `… (n more)` label), so counting
+/// matches counts real derived subsystem nodes only.
+fn real_subsystem_node_label_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\(\d+ symbols\)").expect("static regex is valid"))
+}
+
+/// True when `source` is either (a) exactly the generic
+/// `Client -> Core -> Output` template [`default_architecture_mermaid_source`]
+/// emits, or (b) a diagram with fewer than 5 real (`name (n symbols)`-
+/// labeled) subsystem nodes -- the `…` fold node never counts as a real
+/// node. DGRICH-05/09's landing gate calls this so a generic or
+/// near-empty diagram can never ship silently.
+pub fn is_generic_placeholder(source: &str) -> bool {
+    let is_default_template =
+        source.contains("A[Client]") && source.contains("B[Core]") && source.contains("C[Output]");
+    if is_default_template {
+        return true;
+    }
+    real_subsystem_node_label_regex().find_iter(source).count() < 5
 }
 
 /// The final embed markdown for a README/docs architecture slot, deciding
@@ -1016,5 +1377,275 @@ mod tests {
 
         validate_mermaid_flowchart(mermaid_source)
             .expect("README's architecture mermaid block must be valid renderable mermaid");
+    }
+
+    // ── DGRICH-04: derived subsystem architecture diagram ───────────────
+
+    use super::super::repo_facts::{EntryPoints, SubsystemGraph};
+
+    fn fixture_subsystem(name: &str, node_count: usize) -> Subsystem {
+        Subsystem { name: name.to_string(), node_count, ..Default::default() }
+    }
+
+    fn fixture_edge(from: &str, to: &str, weight: u32) -> SubsystemEdge {
+        SubsystemEdge { from: from.to_string(), to: to.to_string(), weight }
+    }
+
+    fn fixture_facts(subsystems: Vec<Subsystem>, edges: Vec<SubsystemEdge>, entrypoints: &[&str]) -> RepoFacts {
+        RepoFacts {
+            project_id: "TERM".to_string(),
+            git_ref: "abc123".to_string(),
+            kg_grounded: true,
+            edge_matrix: SubsystemGraph { edges },
+            entry_points: EntryPoints {
+                entrypoint_symbols: entrypoints.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            },
+            subsystems,
+            ..Default::default()
+        }
+    }
+
+    /// TEST PLAN item 1: a TERM-shaped fixture (intake/forge/tools/scribe/
+    /// mesh) yields >=5 nodes with real names, weighted edges, and the
+    /// entry-point subsystem (`intake`, reached from a `main`) declared
+    /// leftmost.
+    #[test]
+    fn term_shaped_fixture_yields_real_nodes_weighted_edges_entrypoint_leftmost() {
+        let facts = fixture_facts(
+            vec![
+                fixture_subsystem("intake", 40),
+                fixture_subsystem("forge", 35),
+                fixture_subsystem("tools", 30),
+                fixture_subsystem("scribe", 25),
+                fixture_subsystem("mesh", 20),
+            ],
+            vec![
+                fixture_edge("intake", "forge", 6),
+                fixture_edge("forge", "tools", 6),
+                fixture_edge("tools", "scribe", 6),
+                fixture_edge("scribe", "mesh", 6),
+                fixture_edge("mesh", "intake", 6),
+            ],
+            &["crate::intake::main"],
+        );
+
+        let source = subsystem_architecture_mermaid_source(&facts).unwrap();
+        let text = source.as_str();
+
+        assert!(text.starts_with("flowchart LR"));
+        for (name, count) in
+            [("intake", 40), ("forge", 35), ("tools", 30), ("scribe", 25), ("mesh", 20)]
+        {
+            assert!(
+                text.contains(&format!("{name} ({count} symbols)")),
+                "missing real node label for {name}: {text}"
+            );
+        }
+        // All five edges clear max(5, p75)=6 here (every weight is 6), so
+        // every weighted edge must appear.
+        assert_eq!(text.matches("-->|6|").count(), 5, "all five weighted edges must survive: {text}");
+
+        // `intake` is the only entry-point subsystem -> declared leftmost,
+        // i.e. its node line appears before every other subsystem's.
+        let intake_pos = text.find("intake[").unwrap();
+        for name in ["forge[", "tools[", "scribe[", "mesh["] {
+            let pos = text.find(name).unwrap_or_else(|| panic!("missing node line for {name}"));
+            assert!(intake_pos < pos, "entry-point subsystem `intake` must be declared leftmost: {text}");
+        }
+
+        assert!(!is_generic_placeholder(text), "a real 5-node diagram must not be flagged generic");
+    }
+
+    // ── is_generic_placeholder ───────────────────────────────────────────
+
+    #[test]
+    fn is_generic_placeholder_true_for_the_default_template() {
+        let source = default_architecture_mermaid_source("some-repo").unwrap();
+        assert!(is_generic_placeholder(source.as_str()));
+    }
+
+    #[test]
+    fn is_generic_placeholder_true_for_a_sub_five_node_diagram() {
+        let facts = fixture_facts(
+            vec![fixture_subsystem("a", 40), fixture_subsystem("b", 35), fixture_subsystem("c", 30)],
+            vec![fixture_edge("a", "b", 6), fixture_edge("b", "c", 6)],
+            &[],
+        );
+        let source = subsystem_architecture_mermaid_source(&facts).unwrap();
+        assert!(
+            is_generic_placeholder(source.as_str()),
+            "a 3-node diagram is below the 5-node substance floor: {}",
+            source.as_str()
+        );
+    }
+
+    #[test]
+    fn is_generic_placeholder_false_for_a_real_six_node_diagram() {
+        let facts = fixture_facts(
+            vec![
+                fixture_subsystem("a", 40),
+                fixture_subsystem("b", 35),
+                fixture_subsystem("c", 30),
+                fixture_subsystem("d", 28),
+                fixture_subsystem("e", 26),
+                fixture_subsystem("f", 24),
+            ],
+            vec![
+                fixture_edge("a", "b", 6),
+                fixture_edge("b", "c", 6),
+                fixture_edge("c", "d", 6),
+                fixture_edge("d", "e", 6),
+                fixture_edge("e", "f", 6),
+                fixture_edge("f", "a", 6),
+            ],
+            &[],
+        );
+        let source = subsystem_architecture_mermaid_source(&facts).unwrap();
+        assert!(!is_generic_placeholder(source.as_str()), "a real 6-node diagram must not be flagged generic");
+    }
+
+    // ── TEST PLAN item 3: emitted source is swept ───────────────────────
+
+    #[test]
+    fn emitted_diagram_source_is_swept_private_ip_in_node_label_is_placeholdered() {
+        // NOTE: `<internal-ip>` below is a deliberately fake private-IP // pii-test-fixture
+        // literal for this fixture only, tagged per this repo's push-gate
+        // whitelist convention so the source-scan exempts this line without
+        // exempting the runtime PII gate under test.
+        let facts = fixture_facts(
+            vec![fixture_subsystem("core", 40), fixture_subsystem("svc_<internal-ip>", 30)], // pii-test-fixture
+            vec![fixture_edge("core", "svc_<internal-ip>", 6)], // pii-test-fixture
+            &[],
+        );
+
+        let source = subsystem_architecture_mermaid_source(&facts).unwrap();
+        let text = source.as_str();
+
+        assert!(!text.contains("<internal-ip>"), "the swept diagram must not carry the raw private IP: {text}"); // pii-test-fixture
+        assert!(!text.contains("192_168_0_104"), "the id derived from the label must not leak it flattened either: {text}"); // pii-test-fixture
+        assert!(text.contains("[REDACTED:"), "a redaction marker must be present instead: {text}");
+        assert!(
+            crate::github::pii::scan_for_pii(text).is_empty(),
+            "diagram source must be clean per the canonical scanner: {text:?}"
+        );
+    }
+
+    // ── EDGE CASES ───────────────────────────────────────────────────────
+
+    /// All edge weights below threshold -- the diagram must never be empty;
+    /// the top edges by weight are kept instead of nothing at all.
+    #[test]
+    fn all_edges_below_threshold_keeps_top_edges_diagram_never_empty() {
+        let facts = fixture_facts(
+            vec![
+                fixture_subsystem("a", 40),
+                fixture_subsystem("b", 35),
+                fixture_subsystem("c", 30),
+                fixture_subsystem("d", 28),
+                fixture_subsystem("e", 26),
+            ],
+            vec![
+                fixture_edge("a", "b", 1),
+                fixture_edge("b", "c", 2),
+                fixture_edge("c", "d", 1),
+                fixture_edge("d", "e", 1),
+            ],
+            &[],
+        );
+
+        // p75 of [1,1,1,2] is 1, so max(5,1)=5 -- every edge above is below
+        // the floor. The diagram must still carry at least one edge (the
+        // single highest-weight one, `b->c` at weight 2) rather than none.
+        let source = subsystem_architecture_mermaid_source(&facts).unwrap();
+        let text = source.as_str();
+        assert!(text.contains("-->|2|"), "the single highest-weight edge must survive: {text}");
+        assert_eq!(text.matches("-->|").count(), 1, "exactly the top edge survives, diagram is never empty: {text}");
+    }
+
+    /// Single-subsystem repo -- falls back to the generic default source,
+    /// which `is_generic_placeholder` flags.
+    #[test]
+    fn single_subsystem_repo_falls_back_to_default_and_is_flagged() {
+        let facts = fixture_facts(vec![fixture_subsystem("only", 100)], vec![], &[]);
+        let source = subsystem_architecture_mermaid_source(&facts).unwrap();
+        assert!(
+            is_generic_placeholder(source.as_str()),
+            "single-subsystem fallback must be the flagged generic template: {}",
+            source.as_str()
+        );
+    }
+
+    /// Zero-subsystem (e.g. fully ungrounded) repo -- same fallback, no
+    /// panic.
+    #[test]
+    fn zero_subsystem_repo_falls_back_to_default_without_panicking() {
+        let facts = fixture_facts(vec![], vec![], &[]);
+        let source = subsystem_architecture_mermaid_source(&facts).unwrap();
+        assert!(is_generic_placeholder(source.as_str()));
+    }
+
+    /// Ungrounded facts (`kg_grounded == false`) MUST fall back to the generic
+    /// default even with 2+ subsystems present, so a synthetic/ungrounded
+    /// architecture can never ship looking KG-derived (codex review finding).
+    #[test]
+    fn ungrounded_facts_fall_back_to_default_even_with_multiple_subsystems() {
+        let mut facts = fixture_facts(
+            vec![fixture_subsystem("core", 40), fixture_subsystem("svc", 30)],
+            vec![fixture_edge("core", "svc", 6)],
+            &[],
+        );
+        facts.kg_grounded = false;
+        let source = subsystem_architecture_mermaid_source(&facts).unwrap();
+        assert!(
+            is_generic_placeholder(source.as_str()),
+            "ungrounded facts must yield the flagged generic default, not a derived-looking diagram: {}",
+            source.as_str()
+        );
+    }
+
+    /// >16 subsystems -- folded into a single `…` node, node cap respected
+    /// (checked against the fuller, 16-node `docs/architecture.md` variant).
+    #[test]
+    fn more_than_sixteen_subsystems_fold_into_ellipsis_node_cap_respected() {
+        let mut subsystems = Vec::new();
+        let mut edges = Vec::new();
+        for i in 0..20 {
+            subsystems.push(fixture_subsystem(&format!("sub{i:02}"), 30 + i));
+            if i > 0 {
+                edges.push(fixture_edge(&format!("sub{:02}", i - 1), &format!("sub{i:02}"), 6));
+            }
+        }
+        let facts = fixture_facts(subsystems, edges, &[]);
+
+        let source = full_subsystem_architecture_mermaid_source(&facts).unwrap();
+        let text = source.as_str();
+
+        let real_node_count = text.matches(" symbols)").count();
+        assert_eq!(real_node_count, 16, "the 16-node cap must be respected even with 20 candidates: {text}");
+        assert!(text.contains("more)\"]"), "the folded remainder must appear as a single `…` node: {text}");
+        assert_eq!(text.matches("more)\"]").count(), 1, "exactly one fold node, not one per folded subsystem");
+    }
+
+    /// The landing (10-node) and full (16-node) variants share derivation
+    /// but differ in node budget -- a 20-subsystem repo's landing diagram
+    /// keeps only 10, its full `docs/architecture.md` diagram keeps 16.
+    #[test]
+    fn landing_variant_caps_at_ten_full_variant_caps_at_sixteen() {
+        let mut subsystems = Vec::new();
+        let mut edges = Vec::new();
+        for i in 0..20 {
+            subsystems.push(fixture_subsystem(&format!("sub{i:02}"), 30 + i));
+            if i > 0 {
+                edges.push(fixture_edge(&format!("sub{:02}", i - 1), &format!("sub{i:02}"), 6));
+            }
+        }
+        let facts = fixture_facts(subsystems, edges, &[]);
+
+        let landing = subsystem_architecture_mermaid_source(&facts).unwrap();
+        let full = full_subsystem_architecture_mermaid_source(&facts).unwrap();
+
+        assert_eq!(landing.as_str().matches(" symbols)").count(), 10);
+        assert_eq!(full.as_str().matches(" symbols)").count(), 16);
     }
 }
