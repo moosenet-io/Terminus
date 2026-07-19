@@ -2473,14 +2473,14 @@ pub async fn read_language_stats(
          ) \
          SELECT mp.model_name, r.language, \
              count(*) FILTER (WHERE r.error IS NULL) AS n_scored, \
-             avg(r.first_pass_score) FILTER (WHERE r.error IS NULL) AS mean_score, \
-             stddev(r.first_pass_score) FILTER (WHERE r.error IS NULL) AS stddev_score, \
-             avg(r.retry_score - r.first_pass_score) FILTER (WHERE r.retry_score IS NOT NULL) AS retry_lift, \
+             avg(r.first_pass_score::double precision) FILTER (WHERE r.error IS NULL) AS mean_score, \
+             stddev(r.first_pass_score::double precision) FILTER (WHERE r.error IS NULL) AS stddev_score, \
+             avg((r.retry_score - r.first_pass_score)::double precision) FILTER (WHERE r.retry_score IS NOT NULL) AS retry_lift, \
              avg(r.throughput_tok_per_sec) AS mean_throughput, \
-             avg(r.total_time_ms) AS mean_latency_ms, \
+             avg(r.total_time_ms::double precision) AS mean_latency_ms, \
              percentile_cont(0.95) WITHIN GROUP (ORDER BY r.total_time_ms) AS p95_latency_ms, \
              sum(r.total_time_ms)::float / 1000.0 AS total_gpu_seconds, \
-             avg(r.first_pass_score) FILTER (WHERE r.error IS NULL) \
+             avg(r.first_pass_score::double precision) FILTER (WHERE r.error IS NULL) \
                  / NULLIF( \
                      (sum(r.total_time_ms)::float / 1000.0) \
                          / NULLIF(count(*) FILTER (WHERE r.error IS NULL), 0)::float, \
@@ -3077,6 +3077,12 @@ pub struct ContextRunListRow {
 /// Page through `context_profile_runs` (optionally scoped to one `model`),
 /// newest first, with the same `(rows, total)` contract as
 /// [`read_code_runs_page`]. Tolerates absent tables → `(vec![], 0)`.
+///
+/// NOTE on pagination bounds: `limit`/`offset` arrive PRE-CLAMPED — the HTTP
+/// layer's `paginate()` (`crate::constellation::models_api`) enforces the
+/// spec's default-50/max-500 clamp before any storage read; these fns bind
+/// whatever they are given (single enforcement point, deliberately not
+/// duplicated here).
 pub async fn read_context_runs_page(
     pool: &PgPool,
     model: Option<&str>,

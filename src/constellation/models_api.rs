@@ -833,18 +833,20 @@ pub async fn mint_runs(Query(q): Query<RunsQuery>) -> Response {
 
     // Explicit specific-epoch filter on an epoch-less suite: honest 400, never
     // a silently-unfiltered page (validated pre-DB for the same reason as the
-    // suite check above).
+    // suite check above). Parsed through `epoch_selector_from_query` so the
+    // selector contract (case-insensitive `all`, absent = Current) is resolved
+    // in exactly one place — only a concrete `Only(_)` epoch is rejected
+    // (cycle-2 review fix: a literal `e != "all"` check wrongly 400'd
+    // `epoch=ALL`, contradicting the tested selector semantics).
     if matches!(suite, "context" | "agent") {
-        if let Some(e) = q.epoch.as_deref() {
-            if e != "all" {
-                return json_status(
-                    StatusCode::BAD_REQUEST,
-                    json!({"error": format!(
-                        "suite '{suite}' is not epoch-partitioned (its runs table has no epoch column); \
-                         omit `epoch` or pass `epoch=all`"
-                    )}),
-                );
-            }
+        if let EpochSelector::Only(_) = epoch_selector_from_query(q.epoch.as_deref()) {
+            return json_status(
+                StatusCode::BAD_REQUEST,
+                json!({"error": format!(
+                    "suite '{suite}' is not epoch-partitioned (its runs table has no epoch column); \
+                     omit `epoch` or pass `epoch=all`"
+                )}),
+            );
         }
     }
 
@@ -1358,6 +1360,11 @@ mod tests {
             let (status, _body) =
                 get_json(test_router(), &format!("/api/terminus/mint/runs?suite={suite}&epoch=all")).await;
             assert_eq!(status, StatusCode::OK, "epoch=all proceeds for {suite}");
+            // Case-insensitive per the EpochSelector contract (cycle-2 fix: a literal
+            // string compare wrongly 400'd the uppercase form).
+            let (status, _body) =
+                get_json(test_router(), &format!("/api/terminus/mint/runs?suite={suite}&epoch=ALL")).await;
+            assert_eq!(status, StatusCode::OK, "epoch=ALL proceeds for {suite}");
             let (status, _body) =
                 get_json(test_router(), &format!("/api/terminus/mint/runs?suite={suite}")).await;
             assert_eq!(status, StatusCode::OK, "absent epoch proceeds for {suite}");
