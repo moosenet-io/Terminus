@@ -619,11 +619,16 @@ async fn run_subsystem_pass(
     identity_value: &Value,
     symbol_names: &[String],
 ) -> (Vec<(String, String)>, Vec<PassRecord>) {
-    let kept: Vec<&str> = facts.subsystems.iter().filter(|s| !s.is_misc).map(|s| s.name.as_str()).collect();
+    // Owned names (not `&str`): a borrowed stream item makes the per-page async
+    // closure higher-ranked over the item lifetime, which — once `GraphSource` is
+    // `Send + Sync` and the future must be `Send` — trips "implementation of
+    // `FnOnce` is not general enough". Cloning the subsystem names sidesteps the
+    // HRTB with no behavior change (names are short and the set is small).
+    let kept: Vec<String> = facts.subsystems.iter().filter(|s| !s.is_misc).map(|s| s.name.clone()).collect();
 
     let results: Vec<(String, Result<String, String>)> = stream::iter(kept.into_iter())
         .map(|name| async move {
-            generate_subsystem_page(generator, facts, repo_name, name, identity_value, symbol_names).await
+            generate_subsystem_page(generator, facts, repo_name, &name, identity_value, symbol_names).await
         })
         .buffer_unordered(SUBSYSTEM_PASS_CONCURRENCY)
         .collect()
