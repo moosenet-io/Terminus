@@ -115,17 +115,22 @@
 //!   `RepoIdentity` -- it assembles a safe, honest `minimal_landing` instead
 //!   (project id + fact row + whatever docs pages did succeed), and records
 //!   the gap as a `Flagged` `GenerationOutcome`.
-//! - **Extra Pass-5 gates ahead of DGRICH-09.** [`place_docs`] (DLAND-03)
-//!   today only enforces `check_landing_length` + `check_landing_links`.
-//!   DGRICH-09 is the item that folds the substance floor
-//!   ([`super::readme_layers::check_landing_substance`]) and the
-//!   generic-diagram lint ([`super::diagram::is_generic_placeholder`]) into
-//!   `place_docs`'s own fail-closed set for every caller; until then, this
-//!   repo-level door runs both checks itself (plus the same DLAND-CAP-01
-//!   no-loss guard the legacy path already enforces) BEFORE calling
-//!   `place_docs`, folding any failure into a withheld
-//!   [`super::place::PlacementReport`] exactly like an existing gate
-//!   failure -- never a silent ship of an ungated landing.
+//! - **Pass-5 gates via `place_repo_docs` (DGRICH-09).** [`place_docs`]
+//!   (DLAND-03) enforces `check_landing_length` + `check_landing_links` for
+//!   every caller. The repo-level door here calls
+//!   [`super::place::place_repo_docs`] instead, which layers the substance
+//!   floor ([`super::readme_layers::check_landing_substance`]), the
+//!   generic-diagram lint ([`super::quality::check_landing_diagram`], DGRICH-04),
+//!   and the identity-lint backstop ([`super::quality::check_landing_identity`],
+//!   DGRICH-02) in front of the SAME `place_docs` write path -- DGRICH-09
+//!   folded these into that one shared, fail-closed gate set rather than
+//!   this module re-checking them ad hoc (the DGRICH-07 stopgap this
+//!   superseded). This module still owns the DLAND-CAP-01 no-loss guard
+//!   and its own `landing_budget` (DGRICH-09) check directly, since both
+//!   need this call's own `place_readme`/`config` state; either failure
+//!   short-circuits to a withheld [`super::place::PlacementReport`] before
+//!   `place_repo_docs` is even called -- never a silent ship of an ungated
+//!   landing.
 //! - **Pass ledger.** [`TriggerOutcome::Completed`] gains a `pass_ledger`
 //!   field (`Vec<PassRecord>`, empty for the legacy path) so an operator can
 //!   see exactly which of Passes 1-3 succeeded. The repo-level path
@@ -152,15 +157,15 @@ use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
 use super::config::{DocTargetType, ProjectDocConfig};
-use super::diagram::{is_generic_placeholder, subsystem_architecture_mermaid_source};
 use super::generate::{
     generate_docs, generate_repo_docs, ChordDocGenerator, DocGenerator, GenerationOutcome, PassRecord,
     SweptFeatContext,
 };
 use super::pii_gate::sweep_input;
-use super::place::{place_docs, PlacementReport, README_PATH};
+use super::place::{place_docs, place_repo_docs, PlacementReport, README_PATH};
 use super::preserve::check_preservation;
-use super::readme_layers::{build_landing_body, check_landing_substance, fact_row};
+use super::prompts::RepoIdentity;
+use super::readme_layers::{self, build_landing_body, fact_row};
 use super::render::docs_tree::{build_repo_docs_tree, DocsTreeFile};
 use super::render::{render_all, RenderContext, RenderOutcome};
 use super::repo_facts::{build_repo_facts, AtlasGraphSource, GraphSource, RepoFacts};
@@ -326,8 +331,11 @@ impl TriggerOutcome {
 /// Detect the same "project declared nothing at all" condition
 /// [`super::DocgenStatus`] already uses for its `is_default_readme_only`
 /// field, so this module's opt-in gate and the config-inspection tool never
-/// disagree about what counts as "no config."
-fn declares_no_targets(project_config_raw: Option<&Value>) -> bool {
+/// disagree about what counts as "no config." `pub(super)` (DGRICH-08):
+/// [`super::backfill`] reuses this exact gate for its own opt-in check
+/// rather than a second "declares nothing" test that could drift from this
+/// one.
+pub(super) fn declares_no_targets(project_config_raw: Option<&Value>) -> bool {
     project_config_raw
         .and_then(Value::as_object)
         .and_then(|o| o.get("targets"))
@@ -513,6 +521,7 @@ not invoked"
                         root_path,
                         &place_readme,
                         facts,
+                        &config,
                     )
                     .await;
                 }
@@ -697,12 +706,49 @@ async fn run_repo_level_trigger(
     generated_at: &str,
     root_path: &std::path::Path,
     place_readme: &Option<Result<String, std::io::Error>>,
-    facts: RepoFacts,
+    mut facts: RepoFacts,
+    config: &ProjectDocConfig,
 ) -> TriggerOutcome {
+    // DGRICH-09: `subsystem_page_cap` trims how many per-subsystem reference
+    // pages Pass 2 actually generates for THIS project, even when
+    // `RepoFacts`'s own rollup (DGRICH-01, capped at 16) kept more. Real
+    // (non-`misc`) subsystems are already in stable rank order (node count *
+    // aggregate PageRank, per `repo_facts`'s own selection rule), so keeping
+    // the FIRST `subsystem_page_cap` of them keeps the most significant
+    // ones; the synthetic `misc` rollup (if present) is never counted
+    // against the cap or dropped by it. A cap at/above the current count is
+    // a no-op -- this only ever trims, never pads or reorders.
+    if facts.subsystems.iter().filter(|s| !s.is_misc).count() > config.subsystem_page_cap {
+        let mut kept = 0usize;
+        facts.subsystems.retain(|s| {
+            if s.is_misc {
+                return true;
+            }
+            if kept < config.subsystem_page_cap {
+                kept += 1;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
     let outcome = generate_repo_docs(generator, &facts, project, git_ref).await;
     let docs_tree = build_repo_docs_tree(project, &facts, &outcome, &[]);
+    // DGRICH-09: apply an operator-supplied `identity_hint` (wins over Pass
+    // 1's own generated tagline) ONCE, up front -- both the landing
+    // assembly below AND the identity-lint backstop
+    // (`place::place_repo_docs` -> `quality::check_landing_identity`) then
+    // see the SAME (possibly hinted) identity, so a hint can never cause
+    // the landing and the gate to disagree about what was actually shipped.
+    let identity_for_gate: Option<RepoIdentity> = outcome.identity.clone().map(|mut identity| {
+        if let Some(hint) = &config.identity_hint {
+            identity.tagline = hint.clone();
+        }
+        identity
+    });
 
-    let (landing, generation) = match &outcome.identity {
+    let (landing, generation) = match &identity_for_gate {
         Some(identity) => {
             let landing = build_landing_body(identity, &facts, &docs_tree);
             (
@@ -727,31 +773,20 @@ non-fabricated landing was assembled instead of the full identity-grounded one; 
         }
     };
 
-    // Pass 5 gates (design §2 Pass 5) beyond what `place_docs` (DLAND-03)
-    // already enforces (length + dangling links): the substance floor and
-    // the generic-diagram lint. DGRICH-09 is the item that folds these into
-    // `place_docs`'s own fail-closed set for EVERY caller; this is the
-    // minimum needed so this repo-level door can never ship an ungated
-    // landing in the meantime.
+    // DGRICH-09: `landing_budget` is this project's OWN, optionally
+    // tighter, concise-landing ceiling -- checked in ADDITION to (never
+    // instead of) the engine-wide `LANDING_MAX_LINES` cap `place_repo_docs`
+    // -> `place_docs` already enforces fail-closed below. A project that
+    // never configured this defaults to `LANDING_MAX_LINES` itself (a
+    // no-op here).
     let mut extra_gate_failures: Vec<String> = Vec::new();
-    if let Err(e) = check_landing_substance(&landing) {
-        extra_gate_failures.push(e);
-    }
-    // Only meaningful when a KG-derived diagram was actually expected -- an
-    // ungrounded repo's default-template fallback is a documented, expected
-    // degradation (DGRICH-04), not a gate failure.
-    if facts.kg_grounded {
-        let generic = subsystem_architecture_mermaid_source(&facts)
-            .map(|s| is_generic_placeholder(s.as_str()))
-            .unwrap_or(true);
-        if generic {
-            extra_gate_failures.push(
-                "architecture diagram lint (DGRICH-04 is_generic_placeholder): the derived \
-diagram is the generic template or has fewer than 5 real subsystem nodes -- withholding the \
-cutover rather than shipping a latch-prone landing"
-                    .to_string(),
-            );
-        }
+    let landing_lines = readme_layers::landing_line_count(&landing);
+    if landing_lines > config.landing_budget {
+        extra_gate_failures.push(format!(
+            "project landing_budget exceeded: landing is {landing_lines} lines, over this \
+project's configured {}-line budget (DGRICH-09)",
+            config.landing_budget
+        ));
     }
 
     // DLAND-CAP-01: the SAME no-loss guard the legacy placement path
@@ -779,10 +814,15 @@ dropped ({}); not overwriting -- migrate via docgen_backfill under operator revi
         }
     }
 
+    // DGRICH-09: the substance floor (DGRICH-05), the generic-diagram lint
+    // (DGRICH-04), and the identity-lint backstop (DGRICH-02) are now
+    // enforced fail-closed by `place::place_repo_docs` itself -- no longer
+    // duplicated here ad hoc, superseding the DGRICH-07 stopgap that ran
+    // (a subset of) them inline before calling `place_docs` directly.
     let placement = if !extra_gate_failures.is_empty() {
         PlacementReport::withheld(extra_gate_failures.join("; "))
     } else {
-        place_docs(root_path, &landing, &docs_tree)
+        place_repo_docs(root_path, &landing, &docs_tree, &facts, identity_for_gate.as_ref())
     };
 
     let mut versions = Vec::new();
@@ -876,7 +916,7 @@ or hosting surface; placing a returned artifact is the calling harness's job."
                 },
                 "project_config": {
                     "type": "object",
-                    "description": "The project's raw doc-target config, e.g. {\"targets\": [{\"type\": \"readme\"}]}. Omit (or pass no `targets` key) for a project that has not opted in to this stage -- it will be skipped cleanly."
+                    "description": "The project's raw doc-target config, e.g. {\"targets\": [{\"type\": \"readme\"}]}. Omit (or pass no `targets` key) for a project that has not opted in to this stage -- it will be skipped cleanly. DGRICH-09: for the repo-level rich pipeline (a real checkout target_root), this object also accepts optional tuning knobs -- \"subsystem_page_cap\" (int, default 16: max per-subsystem reference pages generated), \"landing_budget\" (int, default 300: this project's own concise-landing line ceiling, enforced in addition to the engine-wide 300-line cap), and \"identity_hint\" (string: an operator-authored tagline that wins over the Pass 1 generated one when present). All three default cleanly when omitted."
                 },
                 "available_credential_keys": {
                     "type": "array",
