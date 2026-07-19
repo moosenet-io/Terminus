@@ -23,7 +23,13 @@
 //   Muse:     Dashboard, Taste, Channels (CONST-20)
 //   Terminus: Config (existing example TerminusPanel), plus CONST-28's module-self build:
 //             Fleet, Tools, Activity
-//   Lumina:   stub (config surface TBD in CONST-07)
+//   Lumina:   module registered, no panels yet (LGUI-05) -- LUMINA-GUI-SPEC.md supersedes the
+//             old CONST-07 config-surface placeholder; the CONST-04 stub (`available: false`,
+//             a "not yet available" placeholder card) is removed here. Real panels land
+//             LGUI-06..12 (overview/chat/memory/persona/routing/tools/access/setup); until the
+//             first one registers, `lumina` is a module with zero panels -- same pattern
+//             CONST-19 established for `muse` (a module tab can exist before it has any
+//             panels, per `getPanelsByModule`'s doc in moduleRegistry.ts).
 import { registerPanel, registerModule } from '../lib/moduleRegistry';
 import { registerCommand } from '../lib/commandRegistry';
 import { getCurrentPath, requestHealthRefresh } from '../lib/shellBridge';
@@ -31,7 +37,6 @@ import { TerminusPanel } from './terminus/TerminusPanel';
 import { FleetPanel } from './terminus/FleetPanel';
 import { ToolsPanel } from './terminus/ToolsPanel';
 import { ActivityPanel } from './terminus/ActivityPanel';
-import { LuminaStubPanel } from './lumina/LuminaStubPanel';
 import { EngineDiagramPanel } from './status/EngineDiagramPanel';
 import { DashboardPanel } from './harmony/DashboardPanel';
 import { ProjectsPanel } from './harmony/ProjectsPanel';
@@ -49,15 +54,19 @@ import { Providers } from '../pages/Providers';
 import { Playground } from '../pages/Playground';
 import { Analytics } from '../pages/Analytics';
 
-// ── Modules (CONST-16, §1.4 order: Overview · Harmony · Chord · Lumina · Muse · Models ·
-// MINT · Terminus — Overview has no descriptor, it's the always-available default route;
-// order 4/5/6 are reserved for muse/models/mint when their own items register them) ────────
+// ── Modules (order per LUMINA-GUI-SPEC §2: Overview · Harmony · Chord · Muse · Lumina ·
+// Models · MINT · Terminus — Overview has no descriptor, it's the always-available default
+// route. LGUI-05 review decision: the spec's "lumina orders after Muse" IS the directive
+// (CONST-GUI-SPEC §1.4's earlier listing predates the Lumina spec superseding §5.3), so
+// muse takes CONST-16's old lumina slot and lumina follows it.) ──────────────────────────
 
 registerModule({ id: 'harmony', title: 'Harmony', icon: '⌂', healthSystem: 'harmony', order: 1 });
 registerModule({ id: 'chord', title: 'Chord', icon: '⚡', healthSystem: 'chord', order: 2 });
-registerModule({ id: 'lumina', title: 'Lumina', icon: '✦', healthSystem: 'lumina', order: 3 });
-// CONST-19 registered the module; CONST-20 adds its three panels below.
-registerModule({ id: 'muse', title: 'Muse', icon: '🎬', healthSystem: 'muse', order: 4 });
+// CONST-19 registered the muse module; CONST-20 adds its three panels below.
+registerModule({ id: 'muse', title: 'Muse', icon: '🎬', healthSystem: 'muse', order: 3 });
+// LGUI-05: lumina module registration only -- no panels yet (LGUI-06 adds lumina.overview
+// first). Ordered AFTER Muse per LUMINA-GUI-SPEC §2.
+registerModule({ id: 'lumina', title: 'Lumina', icon: '✦', healthSystem: 'lumina', order: 4 });
 registerModule({ id: 'terminus', title: 'Terminus', icon: '⚙', healthSystem: 'terminus', order: 7 });
 
 // ── Harmony ──────────────────────────────────────────────────────────────────
@@ -272,39 +281,6 @@ registerPanel({
 });
 
 // ── Lumina ───────────────────────────────────────────────────────────────────
-// Stub only — Lumina's own config surface is CONST-07's job, not this port.
-
-registerPanel({
-  id: 'lumina.config',
-  system: 'lumina',
-  title: 'Lumina',
-  path: '/lumina/config',
-  icon: '✦',
-  available: false,
-  component: LuminaStubPanel,
-});
-
-// ── Palette commands (CONST-25) ────────────────────────────────────────────────
-// A couple of sensible starter actions, registered the same way panels are — one line each,
-// no shell change needed. Every other panel adds its own `registerCommand` calls the same way.
-
-registerCommand({
-  id: 'shell.refresh-health',
-  title: 'Refresh health',
-  subtitle: 'Re-poll /api/health for every module now',
-  icon: '⟳',
-  run: () => requestHealthRefresh(),
-});
-
-registerCommand({
-  id: 'shell.copy-current-path',
-  title: 'Copy current path',
-  subtitle: 'Copies the current route to the clipboard',
-  icon: '⧉',
-  run: () => {
-    navigator.clipboard?.writeText(getCurrentPath()).catch(() => {
-      // Clipboard permission denied/unavailable — the command just silently no-ops, same
-      // convention as the rest of the shell's non-critical UI actions.
-    });
-  },
-});
+// No panels registered yet -- see the module-registration comment above (LGUI-05); the
+// CONST-04 stub (`lumina.config`, `available: false`) is removed. LGUI-06 registers the
+// first real panel (`lumina.overview`).

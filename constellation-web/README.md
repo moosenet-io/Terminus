@@ -66,6 +66,18 @@ degradation semantics to the other three, with one difference: `/api/muse/art/*`
 images) passes through as raw bytes with the upstream's own content-type rather than JSON —
 fetch those by URL (e.g. an `<img src>`), not through `client.request<T>()`.
 
+**LGUI-05 — Lumina proxy authentication.** `/api/lumina/*path` is the one namespace that
+authenticates itself to its backend server-side: `proxy_lumina`
+(`src/constellation/proxy.rs`) attaches `Authorization: Bearer <CONSTELLATION_LUMINA_TOKEN>`
+(unset ⇒ unauthenticated passthrough, unchanged from before this item) and `X-Lumina-User:
+<verified session principal>` on every outbound call. The browser never holds, sets, or reads
+either header — `enforceHeaders` (above) strips a caller-supplied `Authorization`/
+`X-Lumina-User` client-side as a defense-in-depth door, and the Rust proxy independently never
+reads any inbound header but `content-type` to build its own outbound ones. A `401` from
+Lumina (misconfigured/rejected token) degrades to the same `{available:false,
+detail:"lumina auth failed"}` shape every other backend failure uses, never a raw `401`
+forwarded to a browser session that has no way to react to it.
+
 #### The `prefs` seam (CONST-16)
 
 `client.prefs.get<T>(key)` / `client.prefs.set<T>(key, value)` is the **only** place
