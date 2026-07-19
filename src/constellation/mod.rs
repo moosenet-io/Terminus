@@ -742,7 +742,14 @@ mod tests {
         std::env::remove_var("CONSTELLATION_HARMONY_URL");
         std::env::remove_var("CONSTELLATION_CHORD_URL");
         std::env::remove_var("CONSTELLATION_LUMINA_URL");
-        for path in ["/api/terminus/config", "/api/harmony/status", "/api/chord/health", "/api/lumina/status"] {
+        std::env::remove_var("CONSTELLATION_MUSE_URL");
+        for path in [
+            "/api/terminus/config",
+            "/api/harmony/status",
+            "/api/chord/health",
+            "/api/lumina/status",
+            "/api/muse/status",
+        ] {
             let router = constellation_router(test_state());
             let (status, _body) = request_as_viewer(router, "GET", path).await;
             assert_eq!(status, StatusCode::OK, "expected 200 for viewer GET {path}");
@@ -761,7 +768,20 @@ mod tests {
         std::env::remove_var("CONSTELLATION_HARMONY_URL");
         std::env::remove_var("CONSTELLATION_CHORD_URL");
         std::env::remove_var("CONSTELLATION_LUMINA_URL");
-        for path in ["/api/harmony/engine/stop", "/api/chord/playground/run", "/api/lumina/some/write"] {
+        std::env::remove_var("CONSTELLATION_MUSE_URL");
+        // Every protected namespace, including the CONST-19 muse proxy AND the terminus
+        // namespace itself: the gate is a middleware layer over the WHOLE protected router,
+        // so a mutating method 403s for a viewer even where no mutating route is (yet)
+        // registered (e.g. POST /api/terminus/config would otherwise be a 405) -- this is
+        // exactly the "operator-only terminus endpoints" blast radius the spec names, proven
+        // structurally rather than per-route.
+        for path in [
+            "/api/harmony/engine/stop",
+            "/api/chord/playground/run",
+            "/api/lumina/some/write",
+            "/api/muse/compose",
+            "/api/terminus/config",
+        ] {
             for method in ["POST", "PUT", "PATCH", "DELETE"] {
                 let router = constellation_router(test_state());
                 let (status, body) = request_as_viewer(router, method, path).await;
