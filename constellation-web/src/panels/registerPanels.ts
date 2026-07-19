@@ -24,6 +24,8 @@
 //   Terminus: existing example TerminusPanel
 //   Lumina:   stub (config surface TBD in CONST-07)
 import { registerPanel, registerModule } from '../lib/moduleRegistry';
+import { registerCommand } from '../lib/commandRegistry';
+import { getCurrentPath, requestHealthRefresh } from '../lib/shellBridge';
 import { TerminusPanel } from './terminus/TerminusPanel';
 import { LuminaStubPanel } from './lumina/LuminaStubPanel';
 import { EngineDiagramPanel } from './status/EngineDiagramPanel';
@@ -244,4 +246,29 @@ registerPanel({
   icon: '✦',
   available: false,
   component: LuminaStubPanel,
+});
+
+// ── Palette commands (CONST-25) ────────────────────────────────────────────────
+// A couple of sensible starter actions, registered the same way panels are — one line each,
+// no shell change needed. Every other panel adds its own `registerCommand` calls the same way.
+
+registerCommand({
+  id: 'shell.refresh-health',
+  title: 'Refresh health',
+  subtitle: 'Re-poll /api/health for every module now',
+  icon: '⟳',
+  run: () => requestHealthRefresh(),
+});
+
+registerCommand({
+  id: 'shell.copy-current-path',
+  title: 'Copy current path',
+  subtitle: 'Copies the current route to the clipboard',
+  icon: '⧉',
+  run: () => {
+    navigator.clipboard?.writeText(getCurrentPath()).catch(() => {
+      // Clipboard permission denied/unavailable — the command just silently no-ops, same
+      // convention as the rest of the shell's non-critical UI actions.
+    });
+  },
 });
