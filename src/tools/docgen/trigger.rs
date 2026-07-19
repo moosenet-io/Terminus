@@ -326,8 +326,11 @@ impl TriggerOutcome {
 /// Detect the same "project declared nothing at all" condition
 /// [`super::DocgenStatus`] already uses for its `is_default_readme_only`
 /// field, so this module's opt-in gate and the config-inspection tool never
-/// disagree about what counts as "no config."
-fn declares_no_targets(project_config_raw: Option<&Value>) -> bool {
+/// disagree about what counts as "no config." `pub(super)` (DGRICH-08):
+/// [`super::backfill`] reuses this exact gate for its own opt-in check
+/// rather than a second "declares nothing" test that could drift from this
+/// one.
+pub(super) fn declares_no_targets(project_config_raw: Option<&Value>) -> bool {
     project_config_raw
         .and_then(Value::as_object)
         .and_then(|o| o.get("targets"))
