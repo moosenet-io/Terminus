@@ -9,7 +9,9 @@
 import { useNavigate } from 'react-router-dom';
 import type { ModuleDescriptor } from '../lib/moduleRegistry';
 import type { HealthStatus } from '../lib/aggregationClient';
+import type { FeedItem } from '../lib/activityFeed';
 import { Wordmark } from './Wordmark';
+import { NotificationBell } from './NotificationBell';
 
 export type Density = 'comfortable' | 'compact';
 
@@ -32,6 +34,10 @@ interface GlobalBarProps {
   onOpenMenu?: () => void;
   /** CONST-25: opens the full CommandPalette (owned by App.tsx's Shell). */
   onOpenPalette: () => void;
+  /** CONST-26 (§3.3): the shell's merged activity feed — backs the bell menu here. Optional so
+   *  every existing caller of `GlobalBar` keeps compiling untouched; the bell simply doesn't
+   *  render when omitted. */
+  feedItems?: FeedItem[];
 }
 
 export function GlobalBar({
@@ -47,6 +53,7 @@ export function GlobalBar({
   pollDegraded,
   onOpenMenu,
   onOpenPalette,
+  feedItems,
 }: GlobalBarProps) {
   const navigate = useNavigate();
 
@@ -190,6 +197,7 @@ export function GlobalBar({
       </div>
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', flexShrink: 0 }}>
+        {feedItems && <NotificationBell items={feedItems} />}
         {pollDegraded && (
           <span
             title="Health poll degraded — showing last known status"

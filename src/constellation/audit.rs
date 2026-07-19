@@ -23,14 +23,17 @@
 //! underlying request, mirroring `AuditEntry::log`'s own "fire-and-forget,
 //! a subscriber-side failure is that subscriber's concern" contract.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io::Write;
 
 use crate::gateway_framework::audit::sanitize;
 
 /// One line of the constellation aggregation layer's mutating-request audit
-/// log.
-#[derive(Debug, Clone, Serialize)]
+/// log. `Deserialize` is derived alongside `Serialize` so
+/// `crate::constellation::activity` (CONST-26) can parse lines back out of
+/// the JSONL sink it reads — this struct is the read/write contract for
+/// that file, not just a write-only log shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConstellationAuditEntry {
     /// RFC 3339 UTC timestamp of the request.
     pub timestamp: String,

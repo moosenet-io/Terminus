@@ -47,6 +47,82 @@ export interface TerminusConfigSummary {
   workerCount: number;
 }
 
+/** CONST-26: one line of the constellation aggregation layer's mutating-request audit trail,
+ *  as surfaced by `GET /api/terminus/activity` — never body content, see that endpoint's doc. */
+export interface ActivityEntry {
+  /** RFC 3339 UTC timestamp. */
+  ts: string;
+  method: string;
+  path: string;
+  principal: string | null;
+  system: SystemId | 'auth';
+}
+
+export interface ActivityFeedResponse {
+  entries: ActivityEntry[];
+}
+
+// ── Mutation-result event seam (CONST-26, §3.3) ──────────────────────────────
+// `request<T>()` is the ONE call-site every panel/hook already routes a mutating
+// (POST/PUT/PATCH/DELETE) backend call through (see the doc comment on `AggregationClient`
+// above + this file's grep-gated "single path to the backend" rule) — so this is where the
+// activity-feed/toast layer observes "a mutation happened and here's whether it succeeded"
+// WITHOUT every existing call site needing to change. Fired by both adapters below, after the
+// underlying request settles either way.
+
+export interface MutationResultEvent {
+  system: SystemId;
+  method: string;
+  path: string;
+  ok: boolean;
+  /** Present only when `ok` is false — a short message suitable for a toast, never a raw
+   *  response body (this seam only ever sees success/failure, not payloads). */
+  error?: string;
+}
+
+type MutationResultListener = (event: MutationResultEvent) => void;
+
+const mutationResultListeners = new Set<MutationResultListener>();
+
+/** Subscribe to every mutating `request<T>()` call's outcome, across BOTH adapters. Returns an
+ *  unsubscribe function. Intended for exactly one caller: the toast layer
+ *  (`components/Toast.tsx`) — but deliberately a plain subscribe seam (not hardwired to that
+ *  module) so this file stays free of a UI-layer import. */
+export function onMutationResult(listener: MutationResultListener): () => void {
+  mutationResultListeners.add(listener);
+  return () => mutationResultListeners.delete(listener);
+}
+
+function emitMutationResult(event: MutationResultEvent): void {
+  mutationResultListeners.forEach(listener => listener(event));
+}
+
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+/** Wraps a `request<T>()` implementation so every mutating call emits a
+ *  [`MutationResultEvent`] on completion (success or failure), regardless of which adapter
+ *  (mock/http) is active. Non-mutating (`GET`, default) calls pass through untouched — the
+ *  activity feed cares about "what changed", not every read. */
+async function withMutationResultEvent<T>(
+  system: SystemId,
+  path: string,
+  init: RequestInit | undefined,
+  run: () => Promise<T>,
+): Promise<T> {
+  const method = (init?.method ?? 'GET').toUpperCase();
+  if (!MUTATING_METHODS.has(method)) {
+    return run();
+  }
+  try {
+    const result = await run();
+    emitMutationResult({ system, method, path, ok: true });
+    return result;
+  } catch (e) {
+    emitMutationResult({ system, method, path, ok: false, error: e instanceof Error ? e.message : String(e) });
+    throw e;
+  }
+}
+
 /**
  * The single typed entry point for `/api/{harmony,chord,lumina,muse,terminus}/*`.
  * All request/response shapes an adapter must implement.
@@ -63,6 +139,9 @@ export interface AggregationClient {
   };
   terminus: {
     configSummary(): Promise<TerminusConfigSummary>;
+    /** CONST-26: the last `limit` (default server-side cap when omitted) mutating-request
+     *  activity entries — feeds the Overview activity feed / notification bell (§3.3). */
+    activity(limit?: number): Promise<ActivityFeedResponse>;
   };
   /**
    * Generic escape hatch for panel-specific reads that don't yet have a typed method above.
@@ -162,6 +241,17 @@ const MOCK_HEALTH: HealthStatus[] = [
   { system: 'muse', available: true, detail: 'mock: reachable' },
   { system: 'terminus', available: true, detail: 'mock: reachable' },
 ];
+
+/** CONST-26: canned activity entries so the Overview feed/bell are reviewable with zero
+ *  backend — a small, fixed, already-ordered (oldest first, matching the real endpoint's
+ *  file-order contract) sample. */
+const MOCK_ACTIVITY: ActivityFeedResponse = {
+  entries: [
+    { ts: new Date(Date.now() - 5 * 60_000).toISOString(), method: 'POST', path: '/api/harmony/engine/restart', principal: 'mock-user', system: 'harmony' },
+    { ts: new Date(Date.now() - 2 * 60_000).toISOString(), method: 'PUT', path: '/api/harmony/mode', principal: 'mock-user', system: 'harmony' },
+    { ts: new Date(Date.now() - 30_000).toISOString(), method: 'POST', path: '/api/auth/login', principal: 'mock-user', system: 'auth' },
+  ],
+};
 
 const MOCK_TERMINUS_CONFIG: TerminusConfigSummary = {
   modules: [
@@ -381,9 +471,13 @@ const mockAdapter: AggregationClient = {
     async configSummary() {
       return delay(MOCK_TERMINUS_CONFIG);
     },
+    async activity(limit?: number) {
+      const entries = limit != null ? MOCK_ACTIVITY.entries.slice(-limit) : MOCK_ACTIVITY.entries;
+      return delay({ entries });
+    },
   },
   async request<T>(system: SystemId, path: string, init?: RequestInit): Promise<T> {
-    return mockRequest<T>(system, path, init);
+    return withMutationResultEvent(system, path, init, () => mockRequest<T>(system, path, init));
   },
   ws: {
     connect: mockWsConnect,
@@ -398,6 +492,7 @@ const mockAdapter: AggregationClient = {
 //   POST /api/auth/logout        -> 204/200
 //   GET  /api/health             -> HealthStatus[]
 //   GET  /api/terminus/config    -> TerminusConfigSummary
+//   GET  /api/terminus/activity?limit=N -> ActivityFeedResponse (CONST-26; never body content)
 //   *    /api/{system}/{path}    -> generic passthrough for `request<T>()`
 //   WS   /ws                     -> same-origin, session-cookie-authenticated event stream
 //                                    (engine/ralph-loop/log/tree_update events); see ws.connect()
@@ -492,10 +587,14 @@ const httpAdapter: AggregationClient = {
     async configSummary() {
       return httpJson<TerminusConfigSummary>('/api/terminus/config');
     },
+    async activity(limit?: number) {
+      const query = limit != null ? `?limit=${encodeURIComponent(String(limit))}` : '';
+      return httpJson<ActivityFeedResponse>(`/api/terminus/activity${query}`);
+    },
   },
   async request<T>(system: SystemId, path: string, init?: RequestInit): Promise<T> {
     const normalized = path.startsWith('/') ? path : `/${path}`;
-    return httpJson<T>(`/api/${system}${normalized}`, init);
+    return withMutationResultEvent(system, path, init, () => httpJson<T>(`/api/${system}${normalized}`, init));
   },
   ws: {
     connect(handlers: WsHandlers): WsConnection {

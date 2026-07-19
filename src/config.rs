@@ -1274,6 +1274,21 @@ pub fn constellation_audit_log_path() -> String {
         .unwrap_or_else(|| "constellation-audit.jsonl".to_string())
 }
 
+/// CONST-26: max number of entries `GET /api/terminus/activity` will ever
+/// tail-read from the constellation audit JSONL ([`constellation_audit_log_path`])
+/// and return in one response, regardless of a caller-supplied `?limit=`
+/// query value (a caller may ask for FEWER, never more — see
+/// `crate::constellation::activity`'s module doc). From
+/// `CONSTELLATION_ACTIVITY_TAIL_LIMIT`; defaults to 200 — enough for a
+/// useful operator-facing feed without ever reading the whole (potentially
+/// large, long-lived) audit log into memory.
+pub fn constellation_activity_tail_limit() -> usize {
+    env_nonempty("CONSTELLATION_ACTIVITY_TAIL_LIMIT")
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(200)
+}
+
 // ── CONST-03: constellation control-plane auth ─────────────────────────────
 //
 // The session token itself is signed with `TERMINUS_JWT_SIGNING_KEY` (the
@@ -2164,6 +2179,22 @@ mod tests {
         std::env::set_var("CONSTELLATION_BACKEND_TIMEOUT_MS", "1500");
         assert_eq!(constellation_backend_timeout_ms(), 1_500);
         std::env::remove_var("CONSTELLATION_BACKEND_TIMEOUT_MS");
+    }
+
+    #[test]
+    #[serial]
+    fn constellation_activity_tail_limit_default_and_override() {
+        std::env::remove_var("CONSTELLATION_ACTIVITY_TAIL_LIMIT");
+        assert_eq!(constellation_activity_tail_limit(), 200);
+        std::env::set_var("CONSTELLATION_ACTIVITY_TAIL_LIMIT", "50");
+        assert_eq!(constellation_activity_tail_limit(), 50);
+        // Zero/invalid falls back to the default rather than yielding a
+        // degenerate always-empty feed.
+        std::env::set_var("CONSTELLATION_ACTIVITY_TAIL_LIMIT", "0");
+        assert_eq!(constellation_activity_tail_limit(), 200);
+        std::env::set_var("CONSTELLATION_ACTIVITY_TAIL_LIMIT", "not-a-number");
+        assert_eq!(constellation_activity_tail_limit(), 200);
+        std::env::remove_var("CONSTELLATION_ACTIVITY_TAIL_LIMIT");
     }
 
     #[test]
