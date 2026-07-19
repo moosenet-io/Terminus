@@ -28,7 +28,7 @@ export function Login({ onLogin }: LoginProps) {
   return (
     <div style={{
       height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
-      background: 'var(--bg-base, #0f1117)',
+      background: 'var(--bg-base)',
     }}>
       <form onSubmit={handleSubmit} style={{
         width: 320, padding: 'var(--space-6)', background: 'var(--bg-surface)',

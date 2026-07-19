@@ -80,6 +80,72 @@
 //! error) is recorded in `placement`/`gate_failures`/`skipped`, never turned
 //! into an `Err` or a panic, and never changes the fact that generation
 //! completed successfully.
+//!
+//! ## DGRICH-07: repo-level mode (S119, `fable-docgen-redesign.md` §2/§5)
+//! [`run_docgen_trigger`]'s PUBLIC signature is unchanged by this item (the
+//! `docgen_run` tool + the v4.1 capstone hook call it exactly as before).
+//! Internally it now delegates to `run_docgen_trigger_with_graph_source`,
+//! which gains a repo-level branch alongside the legacy per-module flow
+//! above:
+//!
+//! - **Detection.** Repo-level mode is only even attempted when a caller
+//!   asked for placement (`place=true` AND `target_root` supplied) --
+//!   without a real checkout path there is nothing for
+//!   [`super::repo_facts::build_repo_facts`] to scan, and `place=false` must
+//!   remain a filesystem-free call exactly as DLAND-04 already guarantees
+//!   (see `run_never_touches_filesystem_or_repo` /
+//!   `place_false_never_touches_the_target_root_even_if_supplied`). Given
+//!   both, the mode is selected when `target_root` looks like a full checkout
+//!   (`Cargo.toml` at its root -- `looks_like_full_checkout`), which is
+//!   deterministic and env-independent. `facts.kg_grounded` is NOT part of the
+//!   gate (it reflects the ambient `SCRIBE_KG_STORE_DIR` store, so keying off
+//!   it would divert existing legacy callers whose project id happens to be in
+//!   that store); it only decides how RICH the built facts are. Not a checkout
+//!   -> the legacy per-module flow below runs completely unchanged.
+//! - **Flow.** [`super::repo_facts::build_repo_facts`] (DGRICH-01) ->
+//!   [`super::generate::generate_repo_docs`] (DGRICH-03, Passes 1-3) ->
+//!   [`super::readme_layers::build_landing_body`] (DGRICH-05) ->
+//!   [`super::render::docs_tree::build_repo_docs_tree`] (DGRICH-06, no
+//!   legacy pages yet -- DGRICH-08 feeds those) -> the SAME
+//!   [`super::place::place_docs`] (sole writer), no-loss guard, and
+//!   [`super::versioning::VersionStore`] this module already used for the
+//!   legacy path.
+//! - **Never fabricates an identity.** When `RepoDocsOutcome::identity` is
+//!   `None` (Pass 1 flagged twice), this module does NOT unwrap or invent a
+//!   `RepoIdentity` -- it assembles a safe, honest `minimal_landing` instead
+//!   (project id + fact row + whatever docs pages did succeed), and records
+//!   the gap as a `Flagged` `GenerationOutcome`.
+//! - **Pass-5 gates via `place_repo_docs` (DGRICH-09).** [`place_docs`]
+//!   (DLAND-03) enforces `check_landing_length` + `check_landing_links` for
+//!   every caller. The repo-level door here calls
+//!   [`super::place::place_repo_docs`] instead, which layers the substance
+//!   floor ([`super::readme_layers::check_landing_substance`]), the
+//!   generic-diagram lint ([`super::quality::check_landing_diagram`], DGRICH-04),
+//!   and the identity-lint backstop ([`super::quality::check_landing_identity`],
+//!   DGRICH-02) in front of the SAME `place_docs` write path -- DGRICH-09
+//!   folded these into that one shared, fail-closed gate set rather than
+//!   this module re-checking them ad hoc (the DGRICH-07 stopgap this
+//!   superseded). This module still owns the DLAND-CAP-01 no-loss guard
+//!   and its own `landing_budget` (DGRICH-09) check directly, since both
+//!   need this call's own `place_readme`/`config` state; either failure
+//!   short-circuits to a withheld [`super::place::PlacementReport`] before
+//!   `place_repo_docs` is even called -- never a silent ship of an ungated
+//!   landing.
+//! - **Pass ledger.** [`TriggerOutcome::Completed`] gains a `pass_ledger`
+//!   field (`Vec<PassRecord>`, empty for the legacy path) so an operator can
+//!   see exactly which of Passes 1-3 succeeded. The repo-level path
+//!   prepends a synthetic `{"pass": "repo_level_mode", "ok": true}` record
+//!   so callers/tests can tell which branch ran without inspecting private
+//!   internals.
+//! - **Still infallible.** [`super::generate::generate_repo_docs`] itself
+//!   never returns an `Err` -- every internal failure (Chord unreachable, a
+//!   lint/parse violation surviving one retry) folds into a `Flagged`
+//!   `PassRecord` and is recorded in `RepoDocsOutcome::missing`. This
+//!   module's repo-level branch therefore always returns
+//!   `TriggerOutcome::Completed` (never `Failed`, never a panic) once
+//!   repo-level mode is selected -- see
+//!   `repo_level_mode_forced_generator_failure_yields_completed_never_failed`
+//!   below.
 
 use std::collections::BTreeSet;
 
@@ -91,11 +157,18 @@ use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
 use super::config::{DocTargetType, ProjectDocConfig};
-use super::generate::{generate_docs, ChordDocGenerator, DocGenerator, GenerationOutcome, SweptFeatContext};
+use super::generate::{
+    generate_docs, generate_repo_docs, ChordDocGenerator, DocGenerator, GenerationOutcome, PassRecord,
+    SweptFeatContext,
+};
 use super::pii_gate::sweep_input;
-use super::place::{place_docs, PlacementReport, README_PATH};
+use super::place::{place_docs, place_repo_docs, PlacementReport, README_PATH};
 use super::preserve::check_preservation;
+use super::prompts::RepoIdentity;
+use super::readme_layers::{self, build_landing_body, fact_row};
+use super::render::docs_tree::{build_repo_docs_tree, DocsTreeFile};
 use super::render::{render_all, RenderContext, RenderOutcome};
+use super::repo_facts::{build_repo_facts, AtlasGraphSource, GraphSource, RepoFacts};
 use super::versioning::{ArtifactKey, ArtifactVersion, VersionStore};
 
 // ---------------------------------------------------------------------------
@@ -133,6 +206,14 @@ pub enum TriggerOutcome {
         /// populated `PlacementReport` with `gate_failures`/`skipped`
         /// entries, never as a reason this variant itself isn't `Completed`.
         placement: Option<PlacementReport>,
+        /// DGRICH-07: per-pass outcomes for operator visibility. Empty for
+        /// the legacy per-module path (unchanged behavior); when the
+        /// repo-level flow ran, this starts with a synthetic
+        /// `{"pass": "repo_level_mode", "ok": true}` marker followed by
+        /// [`super::generate::RepoDocsOutcome::pass_ledger`] verbatim, so a
+        /// caller can see exactly which of Passes 1-3 succeeded without
+        /// unwrapping `generation`/`identity`.
+        pass_ledger: Vec<PassRecord>,
     },
     /// Something inside the flow (config parse, PII sweep, or generation)
     /// failed. `reason` is a human-readable summary for logging/flagging.
@@ -157,7 +238,7 @@ impl TriggerOutcome {
                 "outcome": "skipped",
                 "reason": reason,
             }),
-            TriggerOutcome::Completed { generation, render, versions, placement } => {
+            TriggerOutcome::Completed { generation, render, versions, placement, pass_ledger } => {
                 let generation_json = match generation {
                     GenerationOutcome::Generated { content, source_commit } => json!({
                         "kind": "generated",
@@ -217,6 +298,21 @@ impl TriggerOutcome {
                         );
                     }
                 }
+                // DGRICH-07: only surface `pass_ledger` when it is non-empty
+                // (the repo-level path ran) -- a legacy-path completion's
+                // JSON stays byte-for-byte identical to before this item,
+                // same precedent as `placement` above.
+                if !pass_ledger.is_empty() {
+                    if let Value::Object(ref mut map) = obj {
+                        map.insert(
+                            "pass_ledger".to_string(),
+                            json!(pass_ledger
+                                .iter()
+                                .map(|p| json!({"pass": p.pass, "ok": p.ok, "detail": p.detail}))
+                                .collect::<Vec<_>>()),
+                        );
+                    }
+                }
                 obj
             }
             TriggerOutcome::Failed { reason } => json!({
@@ -235,8 +331,11 @@ impl TriggerOutcome {
 /// Detect the same "project declared nothing at all" condition
 /// [`super::DocgenStatus`] already uses for its `is_default_readme_only`
 /// field, so this module's opt-in gate and the config-inspection tool never
-/// disagree about what counts as "no config."
-fn declares_no_targets(project_config_raw: Option<&Value>) -> bool {
+/// disagree about what counts as "no config." `pub(super)` (DGRICH-08):
+/// [`super::backfill`] reuses this exact gate for its own opt-in check
+/// rather than a second "declares nothing" test that could drift from this
+/// one.
+pub(super) fn declares_no_targets(project_config_raw: Option<&Value>) -> bool {
     project_config_raw
         .and_then(Value::as_object)
         .and_then(|o| o.get("targets"))
@@ -274,6 +373,54 @@ fn declares_no_targets(project_config_raw: Option<&Value>) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_docgen_trigger(
     generator: &dyn DocGenerator,
+    version_store: &VersionStore,
+    project: &str,
+    module_path: &str,
+    git_ref: &str,
+    existing_docs: Option<&str>,
+    raw_feat_context: &str,
+    project_config_raw: Option<&Value>,
+    available_credential_keys: &BTreeSet<String>,
+    generated_at: &str,
+    place: bool,
+    target_root: Option<&str>,
+) -> TriggerOutcome {
+    // DGRICH-07: the production graph source is always the real, native
+    // Atlas-backed one -- see `run_docgen_trigger_with_graph_source`'s doc
+    // comment for why this indirection exists (a test-only seam, mirroring
+    // how `DocGenerator` is already injected here).
+    let graph_source = AtlasGraphSource::from_env();
+    run_docgen_trigger_with_graph_source(
+        generator,
+        &graph_source,
+        version_store,
+        project,
+        module_path,
+        git_ref,
+        existing_docs,
+        raw_feat_context,
+        project_config_raw,
+        available_credential_keys,
+        generated_at,
+        place,
+        target_root,
+    )
+    .await
+}
+
+/// The real body of [`run_docgen_trigger`], parameterized over a
+/// [`GraphSource`] so tests can inject a fixture graph (or "no graph at
+/// all") without a real `SCRIBE_KG_STORE_DIR`-backed store -- exactly the
+/// same seam shape as this function's own `generator: &dyn DocGenerator`
+/// parameter. Not `pub`: the public, signature-frozen entry point is
+/// [`run_docgen_trigger`] above, which always supplies the real
+/// [`AtlasGraphSource`]. See the module doc comment's "DGRICH-07:
+/// repo-level mode" section for the full flow this function now
+/// implements.
+#[allow(clippy::too_many_arguments)]
+async fn run_docgen_trigger_with_graph_source(
+    generator: &dyn DocGenerator,
+    graph_source: &dyn GraphSource,
     version_store: &VersionStore,
     project: &str,
     module_path: &str,
@@ -338,6 +485,50 @@ not invoked"
     let effective_existing_docs = existing_docs
         .or_else(|| place_readme.as_ref().and_then(|r| r.as_ref().ok()).map(String::as_str));
 
+    // DGRICH-07: repo-level mode. Only even attempted when placement was
+    // requested (`place=true` + `target_root` supplied) -- without a real
+    // checkout path there is nothing for `build_repo_facts` to scan, and
+    // `place=false` must stay a filesystem-free call exactly as DLAND-04
+    // already guarantees (see the module doc comment's "DGRICH-07:
+    // repo-level mode" section for why this mirrors that gate).
+    //
+    // Detection is `looks_like_full_checkout(target_root)` -- a REAL checkout
+    // on disk -- and NOT `facts.kg_grounded`. This is deliberate and
+    // env-independent: `build_repo_facts` marks `kg_grounded` from the ambient
+    // Atlas store (`SCRIBE_KG_STORE_DIR`) regardless of what `target_root`
+    // points at, so keying mode selection off it would let any existing legacy
+    // test that happens to use a real project id (e.g. "TERM") plus
+    // `place=true` slip into repo-level mode purely because the build host's KG
+    // store has that project -- breaking test isolation and the "legacy path
+    // otherwise unchanged" guarantee (codex review finding). The rich pipeline
+    // needs the source tree anyway (entry points / config / prose all come from
+    // the checkout), so a real checkout is the correct, deterministic gate;
+    // `facts.kg_grounded` then only decides how RICH the facts are (grounded vs
+    // degraded), not WHETHER repo-level mode runs. A temp/non-checkout
+    // `target_root` -- or a hard error building `RepoFacts` -- falls through to
+    // the legacy per-module flow below, completely unchanged.
+    if place {
+        if let Some(root) = target_root {
+            let root_path = std::path::Path::new(root);
+            if looks_like_full_checkout(root_path) {
+                if let Ok(facts) = build_repo_facts(graph_source, root_path, project, git_ref) {
+                    return run_repo_level_trigger(
+                        generator,
+                        version_store,
+                        project,
+                        git_ref,
+                        generated_at,
+                        root_path,
+                        &place_readme,
+                        facts,
+                        &config,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
     // DOCGEN-05: generate (deepen) docs via Chord.
     let generation = match generate_docs(generator, module_path, git_ref, effective_existing_docs, &feat_context).await {
         Ok(outcome) => outcome,
@@ -353,7 +544,13 @@ not invoked"
         // Nothing to render or version -- the stage still completes
         // cleanly (spec EDGE CASE: "don't fabricate" a version).
         GenerationOutcome::NoChange | GenerationOutcome::Flagged { .. } => {
-            return TriggerOutcome::Completed { generation, render: None, versions: Vec::new(), placement: None };
+            return TriggerOutcome::Completed {
+                generation,
+                render: None,
+                versions: Vec::new(),
+                placement: None,
+                pass_ledger: Vec::new(),
+            };
         }
     };
 
@@ -437,7 +634,212 @@ dropped ({}); not overwriting -- migrate via docgen_backfill under operator revi
         _ => None,
     };
 
-    TriggerOutcome::Completed { generation, render: Some(render), versions, placement }
+    TriggerOutcome::Completed {
+        generation,
+        render: Some(render),
+        versions,
+        placement,
+        pass_ledger: Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DGRICH-07: repo-level flow
+// ---------------------------------------------------------------------------
+
+/// Heuristic for "target_root is a full repo checkout" (design APPROACH
+/// step 1's alternate detection signal alongside `kg_grounded`): a real
+/// Rust checkout has a `Cargo.toml` at its root. Advisory only --
+/// `RepoFacts` already degrades every checkout-scan source gracefully when
+/// this is wrong, so a false positive here costs nothing but an attempted
+/// (and safely degraded) repo-level pass; a false negative just falls
+/// through to the legacy path, which is always safe.
+fn looks_like_full_checkout(root: &std::path::Path) -> bool {
+    root.join("Cargo.toml").is_file()
+}
+
+/// DGRICH-07 EDGE CASE / APPROACH step 2: a safe, honest landing for when
+/// the identity pass (Pass 1) never succeeded. Never fabricates a
+/// `RepoIdentity`, never unwraps/panics -- lists whatever `docs_tree` pages
+/// DID get produced (getting-started/guides can still succeed even when
+/// identity didn't, per [`build_repo_docs_tree`]'s own degradation notes)
+/// so the landing is at least honestly navigable, not empty chrome.
+fn minimal_landing(facts: &RepoFacts, docs_tree: &[DocsTreeFile]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("<h1 align=\"center\">{}</h1>\n\n", facts.project_id));
+    out.push_str(
+        "<p align=\"center\"><em>Documentation generation did not complete this round -- see \
+the pass ledger for details.</em></p>\n\n",
+    );
+    out.push_str(&format!("<p align=\"center\">{}</p>\n\n", fact_row(facts)));
+    out.push_str("---\n\n");
+    out.push_str("## Documentation\n\n");
+    if docs_tree.is_empty() {
+        out.push_str("_No documentation pages were generated this round._\n");
+    } else {
+        out.push_str("| Page |\n|---|\n");
+        for f in docs_tree {
+            out.push_str(&format!("| {} |\n", f.path));
+        }
+    }
+    out.push_str("\n## Contributing\n\nSee the project's build pipeline docs for the contribution process.\n\n");
+    out.push_str("## License\n\nSee LICENSE.\n");
+    out
+}
+
+/// DGRICH-07 repo-level flow: `RepoFacts` (already built by the caller) ->
+/// [`generate_repo_docs`] (Passes 1-3) -> assemble the landing (DGRICH-05)
+/// -> build the docs tree (DGRICH-06) -> the SAME no-loss guard,
+/// [`place_docs`], and [`VersionStore`] machinery the legacy path above
+/// already uses. Always returns `TriggerOutcome::Completed` --
+/// `generate_repo_docs` itself never returns an `Err` (every internal
+/// failure folds into a `Flagged` `PassRecord` inside `RepoDocsOutcome`),
+/// so there is no failure mode here that needs a `Failed` outcome; a
+/// totally-failed generation still assembles a safe `minimal_landing`
+/// rather than panicking or fabricating a `RepoIdentity`.
+#[allow(clippy::too_many_arguments)]
+async fn run_repo_level_trigger(
+    generator: &dyn DocGenerator,
+    version_store: &VersionStore,
+    project: &str,
+    git_ref: &str,
+    generated_at: &str,
+    root_path: &std::path::Path,
+    place_readme: &Option<Result<String, std::io::Error>>,
+    mut facts: RepoFacts,
+    config: &ProjectDocConfig,
+) -> TriggerOutcome {
+    // DGRICH-09: `subsystem_page_cap` trims how many per-subsystem reference
+    // pages Pass 2 actually generates for THIS project, even when
+    // `RepoFacts`'s own rollup (DGRICH-01, capped at 16) kept more. Real
+    // (non-`misc`) subsystems are already in stable rank order (node count *
+    // aggregate PageRank, per `repo_facts`'s own selection rule), so keeping
+    // the FIRST `subsystem_page_cap` of them keeps the most significant
+    // ones; the synthetic `misc` rollup (if present) is never counted
+    // against the cap or dropped by it. A cap at/above the current count is
+    // a no-op -- this only ever trims, never pads or reorders.
+    if facts.subsystems.iter().filter(|s| !s.is_misc).count() > config.subsystem_page_cap {
+        let mut kept = 0usize;
+        facts.subsystems.retain(|s| {
+            if s.is_misc {
+                return true;
+            }
+            if kept < config.subsystem_page_cap {
+                kept += 1;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    let outcome = generate_repo_docs(generator, &facts, project, git_ref).await;
+    let docs_tree = build_repo_docs_tree(project, &facts, &outcome, &[]);
+    // DGRICH-09: apply an operator-supplied `identity_hint` (wins over Pass
+    // 1's own generated tagline) ONCE, up front -- both the landing
+    // assembly below AND the identity-lint backstop
+    // (`place::place_repo_docs` -> `quality::check_landing_identity`) then
+    // see the SAME (possibly hinted) identity, so a hint can never cause
+    // the landing and the gate to disagree about what was actually shipped.
+    let identity_for_gate: Option<RepoIdentity> = outcome.identity.clone().map(|mut identity| {
+        if let Some(hint) = &config.identity_hint {
+            identity.tagline = hint.clone();
+        }
+        identity
+    });
+
+    let (landing, generation) = match &identity_for_gate {
+        Some(identity) => {
+            let landing = build_landing_body(identity, &facts, &docs_tree);
+            (
+                landing.clone(),
+                GenerationOutcome::Generated { content: landing, source_commit: git_ref.to_string() },
+            )
+        }
+        None => {
+            // DGRICH-07 EDGE CASE / APPROACH step 2: identity flagged --
+            // never unwrap/panic. `build_repo_docs_tree` already degrades
+            // gracefully with `outcome.identity: None`, so `docs_tree` may
+            // still carry getting-started/guides content even here.
+            let landing = minimal_landing(&facts, &docs_tree);
+            (
+                landing.clone(),
+                GenerationOutcome::Flagged {
+                    reason: "repo-level identity pass (Pass 1) did not succeed -- a minimal, \
+non-fabricated landing was assembled instead of the full identity-grounded one; see pass_ledger"
+                        .to_string(),
+                },
+            )
+        }
+    };
+
+    // DGRICH-09: `landing_budget` is this project's OWN, optionally
+    // tighter, concise-landing ceiling -- checked in ADDITION to (never
+    // instead of) the engine-wide `LANDING_MAX_LINES` cap `place_repo_docs`
+    // -> `place_docs` already enforces fail-closed below. A project that
+    // never configured this defaults to `LANDING_MAX_LINES` itself (a
+    // no-op here).
+    let mut extra_gate_failures: Vec<String> = Vec::new();
+    let landing_lines = readme_layers::landing_line_count(&landing);
+    if landing_lines > config.landing_budget {
+        extra_gate_failures.push(format!(
+            "project landing_budget exceeded: landing is {landing_lines} lines, over this \
+project's configured {}-line budget (DGRICH-09)",
+            config.landing_budget
+        ));
+    }
+
+    // DLAND-CAP-01: the SAME no-loss guard the legacy placement path
+    // enforces above, reused verbatim for the repo-level landing + docs
+    // tree.
+    if extra_gate_failures.is_empty() {
+        match place_readme {
+            None => {}
+            Some(Err(e)) => extra_gate_failures.push(format!(
+                "no-loss guard: the existing README at the target could not be read ({e}); \
+refusing to overwrite unreadable content -- an operator must inspect it"
+            )),
+            Some(Ok(old_readme)) => {
+                let pres = check_preservation(old_readme, &landing, &docs_tree);
+                if !pres.missing.is_empty() {
+                    let heads: Vec<String> = pres.missing.iter().map(|s| s.heading.clone()).collect();
+                    extra_gate_failures.push(format!(
+                        "no-loss guard withheld the cutover: {} old README section(s) would be \
+dropped ({}); not overwriting -- migrate via docgen_backfill under operator review",
+                        heads.len(),
+                        heads.join(", ")
+                    ));
+                }
+            }
+        }
+    }
+
+    // DGRICH-09: the substance floor (DGRICH-05), the generic-diagram lint
+    // (DGRICH-04), and the identity-lint backstop (DGRICH-02) are now
+    // enforced fail-closed by `place::place_repo_docs` itself -- no longer
+    // duplicated here ad hoc, superseding the DGRICH-07 stopgap that ran
+    // (a subset of) them inline before calling `place_docs` directly.
+    let placement = if !extra_gate_failures.is_empty() {
+        PlacementReport::withheld(extra_gate_failures.join("; "))
+    } else {
+        place_repo_docs(root_path, &landing, &docs_tree, &facts, identity_for_gate.as_ref())
+    };
+
+    let mut versions = Vec::new();
+    if let GenerationOutcome::Generated { .. } = &generation {
+        let key = ArtifactKey::new(project.to_string(), "readme".to_string());
+        let version =
+            version_store.store_version(key, landing.clone(), git_ref.to_string(), generated_at.to_string());
+        versions.push(version);
+    }
+
+    // Synthetic marker first so a caller/test can tell repo-level mode ran
+    // without inspecting any private internals, followed by every real Pass
+    // 1-3 record for operator visibility.
+    let mut pass_ledger = vec![PassRecord { pass: "repo_level_mode".to_string(), ok: true, detail: None }];
+    pass_ledger.extend(outcome.pass_ledger);
+
+    TriggerOutcome::Completed { generation, render: None, versions, placement: Some(placement), pass_ledger }
 }
 
 // ---------------------------------------------------------------------------
@@ -514,7 +916,7 @@ or hosting surface; placing a returned artifact is the calling harness's job."
                 },
                 "project_config": {
                     "type": "object",
-                    "description": "The project's raw doc-target config, e.g. {\"targets\": [{\"type\": \"readme\"}]}. Omit (or pass no `targets` key) for a project that has not opted in to this stage -- it will be skipped cleanly."
+                    "description": "The project's raw doc-target config, e.g. {\"targets\": [{\"type\": \"readme\"}]}. Omit (or pass no `targets` key) for a project that has not opted in to this stage -- it will be skipped cleanly. DGRICH-09: for the repo-level rich pipeline (a real checkout target_root), this object also accepts optional tuning knobs -- \"subsystem_page_cap\" (int, default 16: max per-subsystem reference pages generated), \"landing_budget\" (int, default 300: this project's own concise-landing line ceiling, enforced in addition to the engine-wide 300-line cap), and \"identity_hint\" (string: an operator-authored tagline that wins over the Pass 1 generated one when present). All three default cleanly when omitted."
                 },
                 "available_credential_keys": {
                     "type": "array",
@@ -1239,5 +1641,296 @@ duration of a real end-to-end run.",
             .collect();
         assert!(!required.contains(&"place"), "`place` must stay optional");
         assert!(!required.contains(&"target_root"), "`target_root` must stay optional");
+    }
+
+    // ── DGRICH-07: repo-level trigger mode ──────────────────────────────
+
+    use crate::scribe::graph::KnowledgeGraph;
+    use crate::tools::docgen::repo_facts::{FixtureGraphSource, NoGraphSource};
+
+    /// A scripted, call-order `DocGenerator` -- mirrors `generate.rs`'s own
+    /// test seam for `generate_repo_docs`, one response per call in order.
+    /// Used instead of `MockDocGenerator` (which always returns the SAME
+    /// response) because the repo-level flow makes multiple, differently
+    /// shaped calls (identity JSON, then guides `=== FILE: ... ===` blocks).
+    struct SequencedGenerator {
+        responses: Mutex<std::collections::VecDeque<String>>,
+    }
+
+    impl SequencedGenerator {
+        fn new(responses: Vec<&str>) -> Self {
+            Self { responses: Mutex::new(responses.into_iter().map(str::to_string).collect()) }
+        }
+    }
+
+    #[async_trait]
+    impl DocGenerator for SequencedGenerator {
+        async fn generate(&self, _prompt: &str) -> Result<String, ToolError> {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| ToolError::Http("SequencedGenerator: no more scripted responses".to_string()))
+        }
+    }
+
+    /// TEST PLAN: "repo-level mode selected when a fixture KG is present."
+    /// Also covers TEST PLAN item 2 directly: a generator that always
+    /// errors must still yield `Completed` (never `Failed`/a panic), because
+    /// `generate_repo_docs` absorbs every per-pass failure into a `Flagged`
+    /// `PassRecord` rather than propagating an `Err`.
+    #[tokio::test]
+    async fn repo_level_mode_forced_generator_failure_yields_completed_never_failed() {
+        let root = unique_tmp_dir("dgrich07-repo-level-forced-failure");
+        // Repo-level mode is gated on a REAL checkout (a Cargo.toml on disk),
+        // env-independently -- NOT on ambient `kg_grounded` (codex review).
+        // Mark this temp root as a checkout so repo-level mode is selected here.
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+        // The empty graph still reports `kg_grounded: true` -- so the facts are
+        // grounded; combined with the checkout marker, repo-level mode runs.
+        let graph_source = FixtureGraphSource(KnowledgeGraph::new("TERM"));
+        let generator = MockDocGenerator::failing("chord backend unreachable");
+        let store = VersionStore::new();
+
+        let outcome = run_docgen_trigger_with_graph_source(
+            &generator,
+            &graph_source,
+            &store,
+            "TERM",
+            "src/tools/docgen",
+            "dgrich07a",
+            None,
+            "feat context -- the repo-level identity pass must never see this",
+            Some(&readme_config()),
+            &BTreeSet::new(),
+            "2026-07-18T00:00:00Z",
+            true,
+            Some(root.to_str().unwrap()),
+        )
+        .await;
+
+        match outcome {
+            TriggerOutcome::Completed {
+                generation: GenerationOutcome::Flagged { .. },
+                pass_ledger,
+                placement,
+                ..
+            } => {
+                assert!(!pass_ledger.is_empty(), "repo-level pass ledger must be surfaced");
+                assert_eq!(
+                    pass_ledger[0].pass, "repo_level_mode",
+                    "repo-level mode marker must be first: {pass_ledger:?}"
+                );
+                assert!(pass_ledger[0].ok);
+                assert!(
+                    pass_ledger.iter().any(|p| p.pass == "identity" && !p.ok),
+                    "identity pass must be recorded as failed: {pass_ledger:?}"
+                );
+                // A placement attempt is always made in repo-level mode when
+                // place=true+target_root -- it's fine if the gates withheld
+                // it (a minimal_landing over an all-failed generation is
+                // very likely below the substance floor); the point is this
+                // is a normal `Completed` value, never `Failed`/a panic.
+                assert!(placement.is_some());
+            }
+            other => panic!("expected Completed/Flagged (never Failed/panic), got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// TEST PLAN: "legacy mode otherwise" -- no KG entry AND `target_root`
+    /// doesn't look like a full checkout (no `Cargo.toml`) must run the
+    /// legacy per-module flow completely unchanged, with an EMPTY
+    /// `pass_ledger` (the repo-level marker only ever appears when that
+    /// branch actually ran).
+    #[tokio::test]
+    async fn legacy_mode_used_when_no_kg_and_no_checkout() {
+        let root = unique_tmp_dir("dgrich07-legacy-fallback");
+        let generator = MockDocGenerator::ok(
+            "# terminus-rs docgen module\n\nThis module renders declared doc targets from a swept feat context.\n\n\
+## Quickstart\n\nRun `docgen_run` to produce your first set of docs.\n\n\
+## Deep Dive\n\nThe engine sweeps, generates, renders, and versions.\n",
+        );
+        let store = VersionStore::new();
+
+        let outcome = run_docgen_trigger_with_graph_source(
+            &generator,
+            &NoGraphSource,
+            &store,
+            "TERM",
+            "src/tools/docgen",
+            "dgrich07b",
+            None,
+            "a feat with no KG and no checkout",
+            Some(&readme_config()),
+            &BTreeSet::new(),
+            "2026-07-18T00:00:00Z",
+            true,
+            Some(root.to_str().unwrap()),
+        )
+        .await;
+
+        match outcome {
+            TriggerOutcome::Completed {
+                generation: GenerationOutcome::Generated { .. },
+                pass_ledger,
+                placement,
+                ..
+            } => {
+                assert!(pass_ledger.is_empty(), "legacy path must not carry a repo-level pass ledger");
+                let placement = placement.expect("legacy placement must still be attempted");
+                assert!(placement.gate_failures.is_empty(), "{:?}", placement.gate_failures);
+                assert!(placement.written.contains(&"README.md".to_string()));
+            }
+            other => panic!("expected Completed/Generated via the legacy path, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// codex review regression: a GROUNDED graph source (kg_grounded=true) must
+    /// NOT be enough to enter repo-level mode when `target_root` is not a real
+    /// checkout -- otherwise an ambient `SCRIBE_KG_STORE_DIR` entry for the
+    /// project id would silently divert existing legacy callers. With no
+    /// Cargo.toml on disk, the legacy path must run regardless of the grounded
+    /// graph (empty pass ledger == legacy).
+    #[tokio::test]
+    async fn grounded_graph_without_a_checkout_stays_on_the_legacy_path() {
+        let root = unique_tmp_dir("dgrich07-grounded-no-checkout");
+        // NOTE: deliberately NO Cargo.toml written -> not a checkout.
+        let graph_source = FixtureGraphSource(KnowledgeGraph::new("TERM"));
+        let generator = MockDocGenerator::ok(
+            "# terminus-rs docgen module\n\nLegacy render path.\n\n## Quickstart\n\nRun it.\n\n## Deep Dive\n\nDetails.\n",
+        );
+        let store = VersionStore::new();
+
+        let outcome = run_docgen_trigger_with_graph_source(
+            &generator,
+            &graph_source,
+            &store,
+            "TERM",
+            "src/tools/docgen",
+            "dgrich07c",
+            None,
+            "grounded graph but no checkout on disk",
+            Some(&readme_config()),
+            &BTreeSet::new(),
+            "2026-07-18T00:00:00Z",
+            true,
+            Some(root.to_str().unwrap()),
+        )
+        .await;
+
+        match outcome {
+            TriggerOutcome::Completed { pass_ledger, .. } => {
+                assert!(
+                    pass_ledger.is_empty(),
+                    "a grounded graph without a checkout must NOT enter repo-level mode: {pass_ledger:?}"
+                );
+            }
+            other => panic!("expected legacy Completed, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// TEST PLAN: "pass ledger present on Completed" -- a repo-level run
+    /// whose identity + guides passes both succeed (zero subsystems in this
+    /// fixture, so Pass 2 makes zero calls) surfaces a populated
+    /// `pass_ledger` alongside a real `Generated` outcome.
+    #[tokio::test]
+    async fn repo_level_pass_ledger_present_on_completed_with_successful_generation() {
+        let root = unique_tmp_dir("dgrich07-pass-ledger");
+        // Mark as a real checkout so repo-level mode is selected (see the
+        // env-independent gate note in run_docgen_trigger_with_graph_source).
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+        let graph_source = FixtureGraphSource(KnowledgeGraph::new("TERM"));
+
+        let identity_json = r#"{
+            "tagline": "A demo repository hub for exercising the DGRICH-07 trigger path.",
+            "what_is": "This is a demo repository used only to exercise the repo-level docgen trigger in a unit test.\n\nIt intentionally has no real subsystems in this fixture.",
+            "audience": "Engineers testing the docgen trigger.",
+            "subsystems": [],
+            "feature_rows": [{"feature": "Trigger wiring", "description": "Exercises the repo-level trigger path end to end.", "subsystem": "misc"}],
+            "guide_topics": [{"title": "Getting Started", "grounding": "main"}]
+        }"#;
+        let guides_response = "=== FILE: docs/getting-started.md ===\n\
+# Getting Started\n\nClone the repository and run the demo entry point.\n\n\
+=== FILE: docs/guides/testing.md ===\n\
+# Testing\n\nRun the test suite to verify the setup.\n";
+
+        let generator = SequencedGenerator::new(vec![identity_json, guides_response]);
+        let store = VersionStore::new();
+
+        let outcome = run_docgen_trigger_with_graph_source(
+            &generator,
+            &graph_source,
+            &store,
+            "TERM",
+            "src/tools/docgen",
+            "dgrich07c",
+            None,
+            "feat context",
+            Some(&readme_config()),
+            &BTreeSet::new(),
+            "2026-07-18T00:00:00Z",
+            true,
+            Some(root.to_str().unwrap()),
+        )
+        .await;
+
+        match outcome {
+            TriggerOutcome::Completed { generation: GenerationOutcome::Generated { .. }, pass_ledger, .. } => {
+                assert!(!pass_ledger.is_empty(), "pass ledger must be present on a repo-level Completed outcome");
+                assert!(pass_ledger.iter().any(|p| p.pass == "identity" && p.ok), "{pass_ledger:?}");
+                assert!(pass_ledger.iter().any(|p| p.pass == "guides" && p.ok), "{pass_ledger:?}");
+            }
+            other => panic!("expected Completed/Generated with a populated pass ledger, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `place=false` must stay filesystem-scan-free for repo-level detection
+    /// too, matching `place_false_never_touches_the_target_root_even_if_supplied`
+    /// above: a target_root supplied WITHOUT `place=true` must run the
+    /// legacy flow (no `RepoFacts` scan attempted), never repo-level mode.
+    #[tokio::test]
+    async fn repo_level_mode_never_attempted_when_place_is_false() {
+        let root = unique_tmp_dir("dgrich07-place-false-no-repo-level");
+        let graph_source = FixtureGraphSource(KnowledgeGraph::new("TERM"));
+        let generator = MockDocGenerator::ok(
+            "# terminus-rs docgen module\n\nThis module renders declared doc targets from a swept feat context.",
+        );
+        let store = VersionStore::new();
+
+        let outcome = run_docgen_trigger_with_graph_source(
+            &generator,
+            &graph_source,
+            &store,
+            "TERM",
+            "src/tools/docgen",
+            "dgrich07d",
+            None,
+            "a feat where placement was not requested",
+            Some(&readme_config()),
+            &BTreeSet::new(),
+            "2026-07-18T00:00:00Z",
+            false,
+            Some(root.to_str().unwrap()),
+        )
+        .await;
+
+        match outcome {
+            TriggerOutcome::Completed { pass_ledger, placement, .. } => {
+                assert!(pass_ledger.is_empty(), "place=false must never select repo-level mode");
+                assert!(placement.is_none());
+            }
+            other => panic!("expected Completed via the legacy (no-placement) path, got {other:?}"),
+        }
+        assert!(!root.join("README.md").exists());
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

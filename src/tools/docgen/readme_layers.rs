@@ -95,9 +95,11 @@ use std::collections::HashSet;
 use crate::scribe::vault::{render_note, NoteFrontmatter, NoteType};
 
 use super::config::DocTargetType;
-use super::diagram::default_architecture_mermaid_source;
+use super::diagram::{default_architecture_mermaid_source, mermaid_fence, subsystem_architecture_mermaid_source};
+use super::prompts::RepoIdentity;
 use super::render::docs_tree::DocsTreeFile;
 use super::render::{RenderContext, RenderedArtifact};
+use super::repo_facts::RepoFacts;
 
 /// Build the architecture slot's embed markdown for the hero layer.
 /// DOCGEN-22 (revision) replaces the original DOCGEN-11 HTML-comment
@@ -316,20 +318,6 @@ pub fn deepen_layers(existing: Option<&ParsedLayers>, new: &ParsedLayers) -> Par
     }
 }
 
-/// shields.io badge row. Generic (build/version/license/docs) rather than
-/// project-specific CI wiring -- this module has no access to a project's
-/// actual CI status, so it renders informational badges naming the project,
-/// not a live-status integration (that would be a separate, later item).
-fn shields_badges(project: &str) -> String {
-    let encoded = project.replace(' ', "%20");
-    format!(
-        "![build](https://img.shields.io/badge/build-passing-brightgreen) \
-![version](https://img.shields.io/badge/version-auto-blue) \
-![license](https://img.shields.io/badge/license-MIT-lightgrey) \
-![docs](https://img.shields.io/badge/docs-{encoded}-informational)"
-    )
-}
-
 /// Split the hero layer into a one-liner (the first non-empty, non-heading
 /// line) and the full hero text (used to derive the "Why" bullets and the
 /// architecture-at-a-glance blurb).
@@ -373,10 +361,22 @@ pub const DOCS_ARCHITECTURE_PATH: &str = "docs/architecture.md";
 pub const CHANGELOG_PATH: &str = "CHANGELOG.md";
 pub const LICENSE_PATH: &str = "LICENSE";
 
-/// The landing README's target maximum length, in lines (spec §D1: "~130-
-/// 180 lines"). A concrete, testable ceiling rather than "keep it concise"
-/// left unchecked.
-pub const LANDING_MAX_LINES: usize = 180;
+/// The landing README's target maximum length, in lines. DGRICH-05 (S119,
+/// `fable-docgen-redesign.md` §1.1) raises this from 180 to 300: the
+/// rich, KG-grounded 8-section landing (real "What is"/architecture/
+/// subsystem-feature-table/documentation-index/at-a-glance content, see
+/// [`build_landing_body`]) genuinely needs 150-250 lines of real content,
+/// and 180 was clipping it. A concrete, testable ceiling rather than "keep
+/// it concise" left unchecked.
+pub const LANDING_MAX_LINES: usize = 300;
+
+/// DGRICH-05: the paired FLOOR to [`LANDING_MAX_LINES`] -- a landing must
+/// have at least this many non-blank, non-chrome lines (see
+/// [`check_landing_substance`]) or it is exactly as much a gate failure as
+/// one over the ceiling. This is what makes the pre-DGRICH-05 bare
+/// ~50-61-line all-chrome landing (`fable-docgen-redesign.md` §0) a
+/// structural impossibility rather than merely a discouraged outcome.
+pub const LANDING_MIN_SUBSTANTIVE_LINES: usize = 80;
 
 /// Lint: how many lines does a rendered landing README (frontmatter
 /// included) have?
@@ -393,7 +393,50 @@ pub fn check_landing_length(content: &str) -> Result<(), String> {
     if n > LANDING_MAX_LINES {
         Err(format!(
             "landing README is {n} lines, exceeds the {LANDING_MAX_LINES}-line concise-landing \
-ceiling (spec §D1) -- move deep content into the docs/ tree instead of inlining it"
+ceiling (fable-docgen-redesign.md §1.1) -- move deep content into the docs/ tree instead of \
+inlining it"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// True for a line [`check_landing_substance`] does NOT count towards the
+/// substance floor: blank lines, horizontal rules, and the hero's
+/// single-line HTML chrome (`<h1 align=...>`/`<p align=...>` and their
+/// closing tags). Everything else -- prose, headings, table rows, list
+/// items, mermaid fences, links -- counts as real content.
+fn is_substantive_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed == "---" {
+        return false;
+    }
+    if trimmed.starts_with("<h1") || trimmed.starts_with("</h1") {
+        return false;
+    }
+    if trimmed.starts_with("<p align") || trimmed == "</p>" {
+        return false;
+    }
+    true
+}
+
+/// How many non-blank, non-chrome lines a rendered landing has -- the
+/// counterpart to [`landing_line_count`] for the [`LANDING_MIN_SUBSTANTIVE_LINES`]
+/// floor.
+pub fn substantive_line_count(content: &str) -> usize {
+    content.lines().filter(|l| is_substantive_line(l)).count()
+}
+
+/// Lint: does `content` clear [`LANDING_MIN_SUBSTANTIVE_LINES`]? Fails
+/// exactly like [`check_landing_length`] fails above the cap -- a landing
+/// that is all chrome and no real content is a gate failure, not a warning.
+pub fn check_landing_substance(content: &str) -> Result<(), String> {
+    let n = substantive_line_count(content);
+    if n < LANDING_MIN_SUBSTANTIVE_LINES {
+        Err(format!(
+            "landing README has only {n} substantive lines, below the \
+{LANDING_MIN_SUBSTANTIVE_LINES}-line substance floor (fable-docgen-redesign.md §1.1) -- this \
+looks like all chrome and no real content"
         ))
     } else {
         Ok(())
@@ -499,29 +542,326 @@ fn documentation_nav_table() -> String {
     )
 }
 
-/// Turn the hero/background prose into 4-7 short benefit bullets for
-/// `## Why {project}` (spec §D1: "BENEFIT bullets, not capabilities"). A
-/// light heuristic (sentence splitting), not a re-generation -- this module
-/// has no model access (see the file doc comment's "Templating choice"), so
-/// a generator that already writes benefit-shaped prose renders well here,
-/// and a bare/near-empty hero gets an explicit placeholder rather than a
-/// fabricated bullet, matching this file's existing "no content yet"
-/// convention.
-fn why_bullets(background: &str, module: &str) -> String {
-    let sentences: Vec<String> = background
-        .split(|c| c == '.' || c == '\n')
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && s.len() > 3 && !s.starts_with('#'))
-        .take(7)
-        .map(|s| format!("- {}.", s.trim_end_matches('.')))
-        .collect();
-    if sentences.len() < 2 {
+// ---------------------------------------------------------------------------
+// DGRICH-05 (S119, `fable-docgen-redesign.md` §1.1/§4): the rich, repo-level
+// landing assembly -- deterministic, assembled from `RepoIdentity` (Pass 1),
+// `RepoFacts` (Pass 0), and the ACTUAL emitted docs tree (DGRICH-06's
+// `build_docs_tree` output), never a per-module `RenderContext`/content
+// blob. This is additive to, not a replacement of, the legacy per-module
+// `build_layered_body`/`render_layered_readme` path above (see that
+// function's own doc comment and this module's "Reuse plan" note) -- the
+// repo-level trigger path (DGRICH-07) wires `build_landing_body` in once it
+// lands; until then this is a standalone, independently-tested assembly
+// function.
+// ---------------------------------------------------------------------------
+
+/// A repo-relative reference-page path for `subsystem`, matching the exact
+/// path DGRICH-06's `build_docs_tree` emits one page at per kept subsystem
+/// (`docs/reference/<subsystem>.md`) -- centralized here (not a scattered
+/// string literal) so the landing's feature-table links and the real
+/// generated tree can never point at different paths.
+fn subsystem_reference_path(subsystem: &str) -> String {
+    format!("docs/reference/{subsystem}.md")
+}
+
+/// `n` formatted as a short "11.9k"-style count for `n >= 1000`, or the
+/// plain integer otherwise -- used by [`fact_row`] so a KG node count reads
+/// like "11.9k KG nodes" rather than "11905 KG nodes".
+fn format_count_k(n: usize) -> String {
+    if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// The first `n` characters of `git_ref` -- a short-sha-style truncation for
+/// the fact row's "analyzed <sha>" clause. `git_ref` is always an
+/// ASCII commit hash/ref name in practice, so a byte-index slice is safe;
+/// falls back to the whole string when it is already shorter than `n`.
+fn short_git_ref(git_ref: &str) -> &str {
+    let n = git_ref.len().min(7);
+    &git_ref[..n]
+}
+
+/// A deterministic, non-fabricated "primary language" label for the fact
+/// row. `RepoFacts` carries no explicit language field, so this is a small,
+/// honest heuristic over facts it DOES carry: a Cargo.toml description or
+/// any real `[[bin]]` target means Rust; a subsystem name carrying the
+/// `<pkg>::src` TS-tree shape (`repo_facts::subsystem_prefix`'s own
+/// TS-tree rule) means TypeScript; otherwise a neutral "Code" rather than
+/// guessing.
+fn primary_language(facts: &RepoFacts) -> &'static str {
+    if facts.prose_anchors.crate_description.is_some() || !facts.entry_points.bin_targets.is_empty() {
+        "Rust"
+    } else if facts.subsystems.iter().any(|s| s.name.ends_with("::src")) {
+        "TypeScript"
+    } else {
+        "Code"
+    }
+}
+
+/// DGRICH-05: the fact row that REPLACES the fake shields.io badge row
+/// (`fable-docgen-redesign.md` §1.1 row 1, §4) -- one plain, theme-safe
+/// line, e.g. `Rust · 410 modules · 53 MCP tools · 11.9k KG nodes ·
+/// analyzed a1b2c3d`. Every number is computed directly from `facts`; when
+/// `facts.kg_grounded` is `false`, the KG-derived clauses (module count, KG
+/// node count) are OMITTED rather than fabricated -- the registered-tool
+/// count is kept regardless, since it comes from a checkout scan
+/// (`registry.rs`'s `.register(` call-site count), not the graph.
+pub fn fact_row(facts: &RepoFacts) -> String {
+    let mut parts: Vec<String> = vec![primary_language(facts).to_string()];
+
+    if facts.kg_grounded {
+        if let Some(&modules) = facts.scale.by_kind.get("module") {
+            parts.push(format!("{modules} modules"));
+        }
+    }
+
+    if let Some(tools) = facts.entry_points.registered_tool_count {
+        parts.push(format!("{tools} MCP tools"));
+    }
+
+    if facts.kg_grounded && facts.scale.node_count > 0 {
+        parts.push(format!("{} KG nodes", format_count_k(facts.scale.node_count)));
+    }
+
+    parts.push(format!("analyzed {}", short_git_ref(&facts.git_ref)));
+
+    parts.join(" \u{b7} ")
+}
+
+/// The `## Architecture` embed for the rich landing: the real derived
+/// diagram (DGRICH-04's [`subsystem_architecture_mermaid_source`]), which
+/// itself already falls back to the generic default when `facts` has fewer
+/// than two real subsystems (the `kg_grounded: false` case included --
+/// see that function's own doc comment). Never panics: a hard `Err` from
+/// either the derivation or the mermaid-fence validation falls back to the
+/// same minimal static fence [`architecture_slot`] uses.
+fn architecture_section(facts: &RepoFacts) -> String {
+    const STATIC_FALLBACK: &str = "```mermaid\nflowchart LR\n    A[Client] --> B[Core]\n```";
+    match subsystem_architecture_mermaid_source(facts) {
+        Ok(source) => mermaid_fence(&source).unwrap_or_else(|_| STATIC_FALLBACK.to_string()),
+        Err(_) => STATIC_FALLBACK.to_string(),
+    }
+}
+
+/// The `## Subsystems and Features` table: one row per `identity`
+/// feature, each linking to its subsystem's real emitted reference page
+/// ([`subsystem_reference_path`]) -- row count tracks the repository's
+/// actual feature inventory (5-12 per the Pass 1 prompt), never a fixed
+/// count.
+fn feature_table(identity: &RepoIdentity) -> String {
+    if identity.feature_rows.is_empty() {
+        return "_No feature inventory generated yet._".to_string();
+    }
+    let mut out = String::from("| Feature | Description | Subsystem |\n|---|---|---|\n");
+    for row in &identity.feature_rows {
+        out.push_str(&format!(
+            "| {} | {} | [{}]({}) |\n",
+            row.feature,
+            row.description,
+            row.subsystem,
+            subsystem_reference_path(&row.subsystem)
+        ));
+    }
+    out
+}
+
+/// The first real descriptive line of a generated docs-tree page's content
+/// -- skips blank lines, `#`/`##` headings, the standard breadcrumb/
+/// cross-link lines (`render::docs_tree`'s own `breadcrumb`/`cross_links`
+/// shape), horizontal rules, and code-fence delimiters. Used by
+/// [`documentation_index_table`] so the `## Documentation` index's
+/// one-liners are the page's REAL first paragraph, never a fixed
+/// description string.
+fn first_paragraph(content: &str) -> String {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed == "---" {
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with("```") {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.contains("Docs Home") {
+            continue;
+        }
+        if trimmed.starts_with("**See also:**") {
+            continue;
+        }
+        return trimmed.to_string();
+    }
+    "_No description available._".to_string()
+}
+
+/// A docs-tree page's display title: its own `# Heading` line if present,
+/// else the file's stem (e.g. `docs/reference/mesh.md` -> `mesh`) -- never
+/// a fabricated label.
+fn page_title(file: &DocsTreeFile) -> String {
+    for line in file.content.lines() {
+        if let Some(title) = line.trim().strip_prefix("# ") {
+            return title.trim().to_string();
+        }
+    }
+    std::path::Path::new(&file.path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&file.path)
+        .to_string()
+}
+
+/// DGRICH-05: the `## Documentation` index for the rich landing, generated
+/// from the ACTUAL emitted `docs_tree` -- replaces the fixed 5-row
+/// [`documentation_nav_table`] the legacy per-module landing still uses.
+/// Row count and content both track what was really generated; a
+/// zero-page tree (e.g. a fully degraded generation round) renders an
+/// honest placeholder rather than an empty/broken table.
+fn documentation_index_table(docs_tree: &[DocsTreeFile]) -> String {
+    let pages: Vec<&DocsTreeFile> = docs_tree.iter().filter(|f| f.path != "_Sidebar.md").collect();
+    if pages.is_empty() {
+        return "_No documentation pages have been generated yet._".to_string();
+    }
+    let mut out = String::from("| Page | What's there |\n|---|---|\n");
+    for file in &pages {
+        out.push_str(&format!("| [{}]({}) | {} |\n", page_title(file), file.path, first_paragraph(&file.content)));
+    }
+    out
+}
+
+/// The `## At a Glance` section: computed counts only, straight from
+/// `facts` -- functions/structs/traits/modules (from `scale.by_kind`),
+/// workspace members, and real `[[bin]]` binaries. When `facts.kg_grounded`
+/// is `false` the code-scale counts are honestly reported as unavailable
+/// rather than fabricated; the checkout-derived facts (workspace members,
+/// binaries) are still shown either way.
+fn at_a_glance_section(facts: &RepoFacts) -> String {
+    const GLANCE_KINDS: [&str; 4] = ["function", "struct", "trait", "module"];
+
+    let mut lines: Vec<String> = Vec::new();
+    if facts.kg_grounded {
+        lines.push(format!(
+            "- **Nodes / edges:** {} / {}",
+            facts.scale.node_count, facts.scale.edge_count
+        ));
+        for kind in GLANCE_KINDS {
+            if let Some(count) = facts.scale.by_kind.get(kind) {
+                lines.push(format!("- **{kind}s:** {count}"));
+            }
+        }
+        if !facts.scale.hotspots.is_empty() {
+            let names: Vec<String> =
+                facts.scale.hotspots.iter().take(5).map(|s| format!("`{}`", s.id)).collect();
+            lines.push(format!("- **Top hotspots:** {}", names.join(", ")));
+        }
+    } else {
+        lines.push("- _Not yet KG-grounded -- code-scale counts are unavailable this round._".to_string());
+    }
+
+    if !facts.entry_points.workspace_members.is_empty() {
+        lines.push(format!("- **Workspace members:** {}", facts.entry_points.workspace_members.join(", ")));
+    }
+    if !facts.entry_points.bin_targets.is_empty() {
+        let names: Vec<&str> = facts.entry_points.bin_targets.iter().map(|b| b.name.as_str()).collect();
+        lines.push(format!("- **Binaries:** {}", names.join(", ")));
+    }
+    lines.join("\n")
+}
+
+/// Build the rich, repo-level landing README body (DGRICH-05,
+/// `fable-docgen-redesign.md` §1.1's 8-section skeleton), deterministically
+/// assembled from `identity` (Pass 1's [`RepoIdentity`]), `facts` (Pass 0's
+/// [`RepoFacts`] grounding), and `docs_tree` (the ACTUAL emitted docs
+/// tree -- DGRICH-06's `build_docs_tree` output). Every value is
+/// repo-derived by construction: there is no hardcoded chrome here for a
+/// latch or a generic diagram to hide behind. Section order, verbatim from
+/// the design table:
+///
+/// 1. Hero (`<h1>` + tagline + [`fact_row`])
+/// 2. What is `<name>` (`identity.what_is`)
+/// 3. Architecture ([`architecture_section`] -- real derived diagram)
+/// 4. Subsystems and Features ([`feature_table`] -- linked to real pages)
+/// 5. Quick Start (points at `docs/getting-started.md`, never inlined here)
+/// 6. Documentation index ([`documentation_index_table`] -- from the real tree)
+/// 7. At a Glance ([`at_a_glance_section`] -- computed counts only)
+/// 8. Contributing + License (static short pointers)
+///
+/// This is additive: it does not replace [`build_layered_body`]/
+/// [`render_layered_readme`] (the legacy per-module path other renderers in
+/// this crate still call) -- see this function's home section's doc
+/// comment. The paired [`check_landing_length`]/[`check_landing_substance`]
+/// gates apply to its output exactly as they do to the legacy landing.
+pub fn build_landing_body(identity: &RepoIdentity, facts: &RepoFacts, docs_tree: &[DocsTreeFile]) -> String {
+    let mut out = String::new();
+
+    // 1. Hero: centered name + tagline + fact row.
+    out.push_str(&format!("<h1 align=\"center\">{}</h1>\n\n", facts.project_id));
+    out.push_str(&format!("<p align=\"center\"><em>{}</em></p>\n\n", identity.tagline));
+    out.push_str(&format!("<p align=\"center\">{}</p>\n\n", fact_row(facts)));
+    out.push_str("---\n\n");
+
+    // 2. What is <name>.
+    out.push_str(&format!("## What is {}\n\n", facts.project_id));
+    out.push_str(identity.what_is.trim());
+    out.push_str("\n\n");
+
+    // 3. Architecture -- real derived diagram.
+    out.push_str("## Architecture\n\n");
+    out.push_str(&architecture_section(facts));
+    out.push_str("\n\n");
+
+    // 4. Subsystems / Features table -- every row links to its emitted page.
+    out.push_str("## Subsystems and Features\n\n");
+    out.push_str(&feature_table(identity));
+    out.push_str("\n\n");
+
+    // 5. Quick Start -- points at the real getting-started page; never
+    // inlines steps here (those belong to docs/getting-started.md, Pass
+    // 3's output).
+    out.push_str("## Quick Start\n\n");
+    out.push_str(&format!(
+        "See [Getting Started]({DOCS_GETTING_STARTED_PATH}) for a first working setup, \
+tutorial-style.\n"
+    ));
+    out.push('\n');
+
+    // 6. Documentation index -- generated from the ACTUAL emitted tree.
+    out.push_str("## Documentation\n\n");
+    out.push_str(&documentation_index_table(docs_tree));
+    out.push('\n');
+
+    // 7. At a glance -- computed counts only, never invented.
+    out.push_str("## At a Glance\n\n");
+    out.push_str(&at_a_glance_section(facts));
+    out.push_str("\n\n");
+
+    // 8. Contributing + License.
+    out.push_str("## Contributing\n\nSee the project's build pipeline docs for the contribution process.\n\n");
+    out.push_str(&format!("## License\n\nSee [LICENSE]({LICENSE_PATH}).\n"));
+
+    out
+}
+
+/// The `## Why {project}` body for the LEGACY per-module landing
+/// ([`build_layered_body`]): the hero/background prose as-is, or an
+/// explicit placeholder for a bare/near-empty hero. DGRICH-05 (S119)
+/// deletes this file's prior `why_bullets` -- a sentence-splitting
+/// heuristic that fabricated "benefit bullets" out of whatever prose
+/// happened to be in the hero layer (garbage in, template out, per
+/// `fable-docgen-redesign.md` §0 item 2). This replacement renders the real
+/// prose directly rather than re-shaping it into invented bullet points.
+fn why_section(background: &str, module: &str) -> String {
+    let trimmed = background.trim();
+    if trimmed.is_empty() {
         format!(
-            "- _No benefit summary generated yet for {module} -- see \
+            "_No background generated yet for {module} -- see \
 [Architecture at a glance](#architecture-at-a-glance) below._"
         )
     } else {
-        sentences.join("\n")
+        trimmed.to_string()
     }
 }
 
@@ -540,59 +880,68 @@ fn quick_start_section(quickstart: &str) -> String {
     }
 }
 
-/// The `## Architecture at a glance` body: a short (3-4 sentence) blurb
-/// plus a link to the full `docs/architecture.md` page -- never the full
-/// diagram breakdown itself (that lives only in the docs/ tree and the
-/// hero's diagram slot).
-fn architecture_glance(background: &str, module: &str) -> String {
-    let blurb = background
-        .split('.')
-        .map(str::trim)
-        .find(|s| !s.is_empty() && !s.starts_with('#'))
-        .map(|s| format!("{s}."))
-        .unwrap_or_else(|| format!("{module} is documented in depth on the architecture page."));
+/// The `## Architecture at a glance` body for the LEGACY per-module
+/// landing: a link to the full `docs/architecture.md` page -- never the
+/// full diagram breakdown itself (that lives only in the docs/ tree and the
+/// hero's diagram slot). DGRICH-05 deletes this file's prior
+/// `architecture_glance`, which mined the hero's first sentence for a
+/// "blurb" -- the same fabricate-a-summary-from-whatever-prose-is-lying-
+/// around pattern `why_bullets` had; this module has no per-call access to
+/// real architecture facts for the legacy per-module path (no `RepoFacts`
+/// is threaded through it), so it links out honestly instead of guessing.
+fn architecture_glance_section(module: &str) -> String {
     format!(
-        "{blurb} See [Architecture]({DOCS_ARCHITECTURE_PATH}) for the full component and \
+        "See [Architecture]({DOCS_ARCHITECTURE_PATH}) for {module}'s full component and \
 data-flow breakdown."
     )
 }
 
 /// Build the CONCISE landing README body (everything `render_note` wraps in
-/// frontmatter), per the revision spec's §D1 fixed section order: hero
-/// (centered name + tagline + badges + nav-link row) -> `---` ->
-/// architecture mermaid -> `## Why {project}` -> `## Quick Start` ->
-/// `## Documentation` (nav table) -> `## Architecture at a glance` ->
+/// frontmatter) for the LEGACY per-module path, per the revision spec's §D1
+/// fixed section order: hero (centered name + tagline + nav-link row) ->
+/// `---` -> architecture mermaid -> `## Why {project}` -> `## Quick Start`
+/// -> `## Documentation` (nav table) -> `## Architecture at a glance` ->
 /// `## Contributing` -> `## License`. This STOPS concatenating every
 /// layer/mode into one file (the pre-revision behavior) -- the deep-dive
 /// layer and the Diátaxis tutorial/how-to/reference/explanation bodies are
 /// NEVER inlined here; they live in `render::docs_tree`'s docs/ pages,
 /// which this landing only links to. See [`check_landing_length`] for the
-/// paired ≤180-line lint.
+/// paired line-count lint.
+///
+/// ## DGRICH-05 (S119): the fake shields.io badge row is GONE
+/// The pre-DGRICH-05 version of this function rendered an identical
+/// `build-passing / version-auto / license-MIT` badge row on every repo --
+/// the code comment for the deleted `shields_badges` helper even admitted
+/// it had no access to a project's actual CI status
+/// (`fable-docgen-redesign.md` §0 item 2, §4). It is deleted, not replaced:
+/// the hero now carries only real, repo-derived text (tagline + nav row).
+/// This function is NOT the rich repo-level landing DGRICH-05 adds
+/// ([`build_landing_body`]) -- it remains the legacy per-module assembly
+/// (see the module doc comment's "Reuse plan"), just with the fabricated
+/// chrome removed.
 fn build_layered_body(ctx: &RenderContext<'_>, layers: &ParsedLayers) -> String {
     let (mut one_liner, background) = split_hero(&layers.hero);
     if one_liner.is_empty() {
         one_liner = format!("{} -- documentation generated by the docgen engine.", ctx.module);
     }
-    let badges = shields_badges(ctx.project);
 
     let mut out = String::new();
-    // Hero: centered name + tagline + badges + nav-link row.
+    // Hero: centered name + tagline + nav-link row -- no badge row.
     out.push_str(&format!("<h1 align=\"center\">{}</h1>\n\n", ctx.module));
     out.push_str(&format!("<p align=\"center\"><em>{one_liner}</em></p>\n\n"));
-    out.push_str(&format!("<p align=\"center\">\n\n{badges}\n\n</p>\n\n"));
     out.push_str(&format!("<p align=\"center\">{}</p>\n\n", nav_link_row()));
     out.push_str("---\n\n");
     // Architecture mermaid (DOCGEN-22's slot -- reused, never reinvented).
     out.push_str(&architecture_slot(ctx.module));
     out.push_str("\n\n");
     out.push_str(&format!("## Why {}\n\n", ctx.project));
-    out.push_str(&why_bullets(&background, ctx.module));
+    out.push_str(&why_section(&background, ctx.module));
     out.push_str("\n\n## Quick Start\n\n");
     out.push_str(&quick_start_section(&layers.quickstart));
     out.push_str("\n\n## Documentation\n\n");
     out.push_str(&documentation_nav_table());
     out.push_str("\n## Architecture at a glance\n\n");
-    out.push_str(&architecture_glance(&background, ctx.module));
+    out.push_str(&architecture_glance_section(ctx.module));
     out.push_str("\n\n## Contributing\n\nSee the project's build pipeline docs for the contribution process.\n\n");
     out.push_str(&format!("## License\n\nSee [LICENSE]({LICENSE_PATH}).\n"));
     out
@@ -906,14 +1255,17 @@ mod tests {
         );
     }
 
-    // ── shields.io badges present ────────────────────────────────────────
+    // ── DGRICH-05: the fake shields.io badge row is GONE ─────────────────
 
     #[test]
-    fn layered_readme_includes_shields_io_badges() {
+    fn layered_readme_never_emits_a_shields_io_badge_row() {
         let artifact = render_layered_readme(&ctx(SAMPLE), None);
         let content = artifact.content.unwrap();
-        assert!(content.contains("https://img.shields.io/badge/"));
-        assert!(content.contains("build-passing"));
+        assert!(
+            !content.contains("shields.io"),
+            "the fake build/version/license/docs badge row must be deleted, not just hidden: {content}"
+        );
+        assert!(!content.contains("build-passing"));
     }
 
     // ── DOCGEN-22: architecture slot is a real rendering mermaid block ──
@@ -1087,5 +1439,257 @@ mod tests {
         let content = "intro\n\n## quickSTART\n\nCase-insensitive body.\n";
         let section = extract_section(content, "Quickstart");
         assert_eq!(section.as_deref(), Some("Case-insensitive body."));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // DGRICH-05: fact_row / build_landing_body / check_landing_substance
+    // ─────────────────────────────────────────────────────────────────────
+
+    use super::super::prompts::{FeatureRow, GuideTopic, SubsystemBrief};
+    use super::super::repo_facts::{
+        BinTarget, ConfigSurface, EntryPoints, ProseAnchors, RepoScale, Subsystem, SubsystemEdge,
+        SubsystemGraph, SymbolRef,
+    };
+    use std::collections::BTreeMap;
+
+    fn sample_identity() -> RepoIdentity {
+        RepoIdentity {
+            tagline: "The Lumina Constellation's tool hub, model intake, and code intelligence engines.".to_string(),
+            what_is: "Terminus is the tool plane of the Lumina Constellation fleet.\n\n\
+It runs intake, forge, and mesh behind one gateway.".to_string(),
+            audience: "Fleet operators and agents that need tool access.".to_string(),
+            subsystems: vec![
+                SubsystemBrief {
+                    name: "intake".to_string(),
+                    one_liner: "Model discovery and profiling.".to_string(),
+                    role: "core".to_string(),
+                },
+                SubsystemBrief {
+                    name: "forge".to_string(),
+                    one_liner: "Gitea/GitHub mirror integration.".to_string(),
+                    role: "integration".to_string(),
+                },
+            ],
+            feature_rows: vec![
+                FeatureRow {
+                    feature: "Tool registry".to_string(),
+                    description: "Dispatches MCP tool calls.".to_string(),
+                    subsystem: "intake".to_string(),
+                },
+                FeatureRow {
+                    feature: "PR replay".to_string(),
+                    description: "Replays merged PRs to mirrors.".to_string(),
+                    subsystem: "forge".to_string(),
+                },
+            ],
+            guide_topics: vec![GuideTopic {
+                title: "Run a fleet assessment".to_string(),
+                grounding: "intake::assessment::run".to_string(),
+            }],
+        }
+    }
+
+    fn grounded_facts() -> RepoFacts {
+        let mut by_kind = BTreeMap::new();
+        by_kind.insert("module".to_string(), 410);
+        by_kind.insert("function".to_string(), 10064);
+        by_kind.insert("struct".to_string(), 1108);
+        by_kind.insert("trait".to_string(), 161);
+
+        RepoFacts {
+            project_id: "TERM".to_string(),
+            git_ref: "a1b2c3d4e5f6".to_string(),
+            kg_grounded: true,
+            scale: RepoScale {
+                node_count: 11905,
+                edge_count: 27107,
+                by_kind,
+                hotspots: vec![SymbolRef {
+                    id: "crate::mesh::principal::PrincipalResolver::map".to_string(),
+                    kind: "function",
+                    path: "src/mesh/principal.rs".to_string(),
+                    rank: 0.9,
+                }],
+            },
+            subsystems: vec![
+                Subsystem {
+                    name: "intake".to_string(),
+                    source_dir: "src/intake".to_string(),
+                    node_count: 2059,
+                    kind_breakdown: BTreeMap::new(),
+                    top_symbols: vec![],
+                    aggregate_rank: 1.0,
+                    is_misc: false,
+                },
+                Subsystem {
+                    name: "forge".to_string(),
+                    source_dir: "src/forge".to_string(),
+                    node_count: 836,
+                    kind_breakdown: BTreeMap::new(),
+                    top_symbols: vec![],
+                    aggregate_rank: 1.0,
+                    is_misc: false,
+                },
+            ],
+            edge_matrix: SubsystemGraph {
+                edges: vec![SubsystemEdge { from: "intake".to_string(), to: "forge".to_string(), weight: 12 }],
+            },
+            entry_points: EntryPoints {
+                bin_targets: vec![BinTarget {
+                    name: "terminus_primary".to_string(),
+                    path: "src/bin/terminus_primary.rs".to_string(),
+                }],
+                workspace_members: vec!["crates/lumina-core".to_string()],
+                entrypoint_symbols: vec!["registry::register_all".to_string()],
+                registered_tool_count: Some(53),
+            },
+            config_surface: ConfigSurface::default(),
+            prose_anchors: ProseAnchors {
+                crate_description: Some("MCP tool hub".to_string()),
+                crate_root_docs: vec![],
+                subsystem_docs: BTreeMap::new(),
+            },
+            old_readme_sections: vec![],
+        }
+    }
+
+    fn ungrounded_facts() -> RepoFacts {
+        RepoFacts {
+            project_id: "GHOST".to_string(),
+            git_ref: "deadbeefcafe".to_string(),
+            kg_grounded: false,
+            entry_points: EntryPoints { registered_tool_count: Some(5), ..Default::default() },
+            ..Default::default()
+        }
+    }
+
+    fn sample_docs_tree() -> Vec<DocsTreeFile> {
+        vec![
+            DocsTreeFile {
+                path: "docs/reference/intake.md".to_string(),
+                content: "# intake\n\n[\u{2190} Docs Home](../index.md)\n\n---\n\n\
+Model discovery and profiling engine for the fleet.\n\nMore detail follows.\n".to_string(),
+            },
+            DocsTreeFile {
+                path: "docs/reference/forge.md".to_string(),
+                content: "# forge\n\nGitea/GitHub mirror integration layer.\n".to_string(),
+            },
+            DocsTreeFile {
+                path: "docs/getting-started.md".to_string(),
+                content: "# Getting Started\n\nClone the repo and build it.\n".to_string(),
+            },
+            DocsTreeFile {
+                path: "_Sidebar.md".to_string(),
+                content: "# TERM\n\n- [Docs Home](docs/index.md)\n".to_string(),
+            },
+        ]
+    }
+
+    // ── fact_row ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn fact_row_computes_counts_and_omits_kg_derived_numbers_when_ungrounded() {
+        let grounded = fact_row(&grounded_facts());
+        assert!(grounded.contains("Rust"), "{grounded}");
+        assert!(grounded.contains("410 modules"), "{grounded}");
+        assert!(grounded.contains("53 MCP tools"), "{grounded}");
+        assert!(grounded.contains("11.9k KG nodes"), "{grounded}");
+        assert!(grounded.contains("analyzed a1b2c3d"), "{grounded}");
+
+        let ungrounded = fact_row(&ungrounded_facts());
+        assert!(!ungrounded.contains("modules"), "KG-derived module count must be omitted: {ungrounded}");
+        assert!(!ungrounded.contains("KG nodes"), "KG node count must be omitted: {ungrounded}");
+        assert!(
+            ungrounded.contains("5 MCP tools"),
+            "checkout-derived tool count must survive ungrounded degradation: {ungrounded}"
+        );
+        assert!(ungrounded.contains("analyzed deadbee"));
+    }
+
+    // ── build_landing_body ───────────────────────────────────────────────
+
+    #[test]
+    fn build_landing_body_emits_all_eight_sections_and_links_feature_rows_to_real_pages() {
+        let identity = sample_identity();
+        let facts = grounded_facts();
+        let tree = sample_docs_tree();
+        let body = build_landing_body(&identity, &facts, &tree);
+
+        for heading in [
+            "## What is",
+            "## Architecture",
+            "## Subsystems and Features",
+            "## Quick Start",
+            "## Documentation",
+            "## At a Glance",
+            "## Contributing",
+            "## License",
+        ] {
+            assert!(body.contains(heading), "missing section {heading}: {body}");
+        }
+        assert!(body.contains("<h1"), "centered hero must be present: {body}");
+        assert!(body.contains(&identity.tagline), "hero must carry the real tagline: {body}");
+
+        // Every feature row links to a subsystem reference page that was
+        // actually emitted in the docs tree.
+        assert!(body.contains("docs/reference/intake.md"));
+        assert!(body.contains("docs/reference/forge.md"));
+
+        // The documentation index's rows match the emitted tree's REAL
+        // first-paragraph content, not a fixed description.
+        assert!(body.contains("Model discovery and profiling engine for the fleet."));
+        assert!(body.contains("Clone the repo and build it."));
+        // The sidebar file is nav chrome, not a documentation page itself.
+        assert!(!body.contains("| [TERM]"));
+    }
+
+    #[test]
+    fn build_landing_body_omits_kg_counts_and_still_renders_when_ungrounded() {
+        let identity = sample_identity();
+        let facts = ungrounded_facts();
+        let body = build_landing_body(&identity, &facts, &[]);
+        assert!(body.contains("Not yet KG-grounded"), "{body}");
+        assert!(body.contains("_No documentation pages have been generated yet._"), "{body}");
+        // Never silently fabricate a diagram either -- falls back to the
+        // generic default, which downstream lints (is_generic_placeholder)
+        // are responsible for flagging.
+        assert!(body.contains("```mermaid"));
+    }
+
+    // ── check_landing_substance ──────────────────────────────────────────
+
+    #[test]
+    fn check_landing_substance_fails_a_landing_below_the_floor() {
+        let sparse = "<h1 align=\"center\">X</h1>\n\n<p align=\"center\">tag</p>\n\n---\n\nOne real line.\n";
+        let err = check_landing_substance(sparse).unwrap_err();
+        assert!(err.contains("substance floor"), "{err}");
+    }
+
+    #[test]
+    fn check_landing_substance_passes_a_landing_around_the_target_length() {
+        let reasonable = "Real content line describing the repository.\n".repeat(180);
+        assert!(check_landing_substance(&reasonable).is_ok());
+        assert!(check_landing_length(&reasonable).is_ok());
+    }
+
+    #[test]
+    fn check_landing_length_and_substance_are_independent_gates() {
+        let oversized = "Real content line.\n".repeat(LANDING_MAX_LINES + 1);
+        assert!(check_landing_length(&oversized).is_err());
+        // An oversized-but-substantive landing still clears the FLOOR --
+        // the ceiling and floor are two independent checks, both required.
+        assert!(check_landing_substance(&oversized).is_ok());
+    }
+
+    #[test]
+    fn hero_html_and_horizontal_rules_never_count_towards_substance() {
+        let mut content = String::new();
+        content.push_str("<h1 align=\"center\">X</h1>\n\n");
+        content.push_str("<p align=\"center\">tag</p>\n\n");
+        content.push_str("---\n\n");
+        for _ in 0..5 {
+            content.push_str("Real line.\n");
+        }
+        assert_eq!(substantive_line_count(&content), 5);
     }
 }

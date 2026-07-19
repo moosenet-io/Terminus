@@ -85,7 +85,13 @@ pub fn principal_from_cookie(headers: &HeaderMap) -> Option<String> {
 /// `TERMINUS_JWT_SIGNING_KEY`). Anything that doesn't verify (absent
 /// cookie, malformed value, bad signature, expired) resolves to `None` —
 /// never a partial/best-effort session.
-fn session_from_cookie(headers: &HeaderMap) -> Option<SessionSeam> {
+///
+/// `pub(crate)` (not private): CONST-18's `crate::constellation::ws` relay
+/// needs this SAME verification during the WebSocket upgrade (before
+/// accepting it, per §3.5) — it deliberately reuses this function rather
+/// than growing a second cookie-parsing/JWT-verification path, matching
+/// [`require_session`]'s existing verification exactly.
+pub(crate) fn session_from_cookie(headers: &HeaderMap) -> Option<SessionSeam> {
     let raw = headers.get("cookie")?.to_str().ok()?;
     for pair in raw.split(';') {
         let pair = pair.trim();

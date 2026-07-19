@@ -28,9 +28,9 @@ interface ProfilesResponse {
 
 // Color-code a success rate: green > 60%, amber 30-60%, red < 30%.
 function rateColor(rate: number): string {
-  if (rate >= 0.6) return 'var(--h-green, #3fb950)';
-  if (rate >= 0.3) return 'var(--h-amber, #d29922)';
-  return 'var(--h-red, #f85149)';
+  if (rate >= 0.6) return 'var(--h-green)';
+  if (rate >= 0.3) return 'var(--h-amber)';
+  return 'var(--h-red)';
 }
 
 function pct(v: number): string {

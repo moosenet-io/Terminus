@@ -1,23 +1,20 @@
 # constellation-web
 
-The Lumina Constellation control-plane UI (spec `S97-constellation-gui`, item **CONST-04**).
-A React 18 / TypeScript 5 / Vite 5 single-page app, adapted from `harmony/harmony-web`
-(see `docs/constellation/CONST-01-adaptation.md` in the CONST-01 worktree for the full
-inventory + reuse map this was built from).
+The Lumina Constellation control-plane UI (spec `S119-constellation-gui-v2`, building on the
+CONST-04 foundation). A React 18 / TypeScript 5 / Vite 5 single-page app, adapted from
+`harmony/harmony-web` (see `docs/constellation/CONST-01-adaptation.md` in the CONST-01
+worktree for the full inventory + reuse map this was built from) and re-architected as a
+**module registry v2 + two-tier shell** by CONST-16 (`docs/constellation/CONST-GUI-SPEC.md`).
 
-This item ships the **shell only**: layout, auth, the aggregation client, and the module
-registry, plus one example panel (Terminus config). The other system panels (CONST-05..12)
-are separate build items that register into the same registry — the shell does not change
-when they land.
-
-## Two patterns everything else builds on
+## Three patterns everything else builds on
 
 ### 1. The aggregation client (`src/lib/aggregationClient.ts`)
 
-This is the **only** module in the app allowed to call `fetch` or read `window.location`.
-Every hook, panel, or component that needs backend data goes through the exported
-`getAggregationClient()` singleton — never `fetch` directly. This keeps the browser's only
-network surface to same-origin `/api/{harmony,chord,lumina,terminus}/*` calls, cookie-based
+This is the **only** module in the app allowed to call `fetch`, read `window.location`, or
+touch `localStorage` (the last one only via the `prefs` seam below). Every hook, panel, or
+component that needs backend data goes through the exported `getAggregationClient()`
+singleton — never `fetch` directly. This keeps the browser's only network surface to
+same-origin `/api/{harmony,chord,lumina,terminus}/*` calls, cookie-based
 (`credentials: 'include'`), no hardcoded hosts.
 
 It has two implementations of the same `AggregationClient` interface:
@@ -63,14 +60,48 @@ discovery}` read layer — no second database pool, no MCP self-calls. List endp
 | GET | `/api/terminus/mint/context-profiles?models=` | per-model context-tier arrays + `max_context_safe` |
 | GET | `/api/terminus/mint/activity?range=` | runs/day by suite + the current epoch marker |
 
+#### The `prefs` seam (CONST-16)
+
+`client.prefs.get<T>(key)` / `client.prefs.set<T>(key, value)` is the **only** place
+`localStorage` is allowed to appear anywhere in this app (grep-gated). It's an allowlisted,
+non-secret store for exactly two keys — `'layout'` (the Overview canvas' card order + hidden
+set) and `'density'` (Comfortable | Compact) — nothing else may ever be stored there; passing
+any other key throws. If you need to persist new UI state, either fold it into one of those
+two shapes or don't add it to this seam (open a spec item — this is deliberately not a
+general key-value store).
+
 ### 2. The module registry (`src/lib/moduleRegistry.ts`)
 
-Panels register a descriptor instead of the shell hardcoding a route table:
+**Modules** (CONST-16) sit above panels: a module is one fleet system's presence in the GUI —
+a global-bar tab, a health binding, and the group of panels underneath it. Register one at
+import time in `registerPanels.ts`:
+
+```ts
+registerModule({
+  id: 'chord',              // ModuleId: harmony | chord | lumina | muse | terminus | models | mint
+  title: 'Chord',
+  icon: '⚡',
+  healthSystem: 'chord',    // which /api/health entry gates this module's availability
+  order: 2,                 // fixed global-bar order — never reorders at runtime
+});
+```
+
+A module is available to `getAvailableModules(health)` iff it's registered AND its
+`healthSystem` entry in the given health snapshot reports `available: true`. `App.tsx` applies
+a 2-cycle stale-while-degrading grace to the raw `/api/health` poll before calling this — a
+system stays reported available through `GRACE_CYCLES` consecutive misses (an explicit
+`available: false`, vanishing from the payload entirely, or a wholesale poll failure all count
+as a miss); only the miss *after* that — the `GRACE_CYCLES + 1`-th in a row — actually hides
+its module's tab. One flaky poll never yanks a module out from under the operator.
+
+**Panels** are unchanged in contract from CONST-04 — only the `system` field's type changed,
+from the old capitalized `SystemGroup` ('Harmony' | 'Chord' | ... | 'Providers' | 'Status') to
+a lowercase `ModuleId` that matches a registered module directly:
 
 ```ts
 registerPanel({
   id: 'terminus.config',
-  system: 'Terminus',      // nav group: Harmony | Chord | Lumina | Terminus | Providers | Status
+  system: 'terminus',       // ModuleId, not the old SystemGroup label
   title: 'Config',
   path: '/terminus/config',
   icon: '⚙',
@@ -79,28 +110,148 @@ registerPanel({
 });
 ```
 
-`App.tsx`/`Sidebar.tsx` only ever call `getAvailablePanels()` / `getPanelsBySystem()` — a
-panel whose backend capability doesn't exist yet is either not registered at all, or
-registered with `available: false`; either way it silently doesn't render. No crash, no
-placeholder page.
+The legacy `SystemGroup` type and `legacySystemGroupToModuleId()` map are kept only so old
+code/tests referencing 'Status'/'Providers' have a defined mapping ('Status' → `harmony`,
+since the Analytics/Engine-Diagram panels render Harmony/Chord pipeline data and the
+top-level 'Status' group dissolves into Overview; 'Providers' → `terminus`) — no panel
+registration should use those labels going forward.
+
+`App.tsx`/`GlobalBar.tsx`/`ModuleRail.tsx` only ever call `getAvailableModules()` /
+`getAvailablePanels()` / `getPanelsByModule()` — a panel or module whose backend capability
+doesn't exist yet is either not registered at all, or registered with `available: false` /
+never reporting healthy; either way it silently doesn't render. No crash, no placeholder page.
+
+### 3. The shell: two-tier nav + card canvas (`src/App.tsx`, CONST-16, §3.1 of the spec)
+
+- **`GlobalBar`** (top, `src/components/GlobalBar.tsx`) is the module switcher — replaces the
+  old single `Sidebar`. Renders the wordmark (`Wordmark.tsx`), one tab per available module
+  (health dot + degraded indicator), a `⌘/Ctrl+K` "go to panel" trigger, the density toggle,
+  and the account chip.
+- **`ModuleRail`** (left, `src/components/ModuleRail.tsx`) renders the *active* module's
+  panels (`getPanelsByModule`). Responsive: icon-only rail below 1100px width, a drawer
+  overlay (triggered from `GlobalBar`'s hamburger) below 760px.
+- **The Overview card canvas** (`/overview`, the default route, `src/panels/overview/`) is one
+  seven-region `ModuleCard` per available module (drag handle, StatusPill, kind/role line,
+  metric row, last-activity line, Open/Configure + Hide, an expandable body). Operators can
+  drag-reorder, hide, and re-add cards ("+ Add widget"); a card focused with the keyboard
+  reorders via `⌘/Ctrl+arrow`. Layout + density persist **only** via `client.prefs`.
 
 ## Adding a panel
 
-1. Create `src/panels/<system>/<Name>Panel.tsx`. Read data via
+1. Create `src/panels/<module>/<Name>Panel.tsx`. Read data via
    `getAggregationClient().<namespace>.<method>()` — add a typed method to
    `AggregationClient` (and both adapters) if one doesn't exist yet, or use the generic
    `client.request<T>(system, path)` escape hatch in the meantime.
-2. Add a `registerPanel({...})` call in `src/panels/registerPanels.ts`.
+2. Add a `registerPanel({...})` call in `src/panels/registerPanels.ts`, with `system` set to
+   an existing (or newly `registerModule`d) `ModuleId`.
 3. Nothing else changes — the shell picks it up automatically.
 
 ## No-secrets-in-browser rule
 
 `useAuth`/`useApi` hold auth state in memory (React state) only, via session cookies
-(`/api/auth/*`). Nothing is ever written to `localStorage`/`sessionStorage` — this is a
+(`/api/auth/*`). The **only** browser storage anywhere in this app is the `client.prefs` seam
+above, and it may hold only the two non-secret, allowlisted keys described there — this is a
 hard rule for this app (harmony-web's `localStorage['harmony_soma_api_key']` + `prompt()`
-fallback was deliberately dropped, not ported). Vault-referenced secrets (provider API keys,
-etc., landing in CONST-08+) must be surfaced as a vault key *name* with a set/rotate
-affordance, never a round-tripped value.
+fallback was deliberately dropped, not ported, and CONST-16's prefs seam does not reopen that
+door — it's structurally incapable of storing a credential shape). Vault-referenced secrets
+(provider API keys, etc., landing in CONST-08+) must be surfaced as a vault key *name* with a
+set/rotate affordance, never a round-tripped value.
+
+## Brand system (CONST-17)
+
+The app renders the **Terminus GUI Brand Guide** ("deep space violet" portal, v1.0) — see
+`docs/constellation/CONST-GUI-SPEC.md` §2. `src/styles/globals.css` is the canonical token
+sheet (surfaces, violet accent ramp, semantic "flux" hues, type, spacing, radius, glow,
+motion). Two rules that are grep-enforced in review:
+
+- **No raw hex where a token exists.** New code reaches for a `--token`, never a literal
+  hex. The `StatusColor` union (`Card.tsx`) stays the only sanctioned status-color API.
+- **Color is always semantic (§2.4).** The five flux hues carry fixed meanings — violet =
+  core/brand; blue = inbound/source/cold; green = outbound/endpoint/free; amber =
+  cloud/gated/paid/warm; rose = alert/error/hot. A chart series that IS one of these
+  semantics wears that token; only nominal identity (models, languages, providers, tiers
+  without a fixed meaning) gets a categorical slot (`src/viz/palette.ts`).
+
+**Legacy aliases** (`--bg-surface`, `--accent-primary`, `--text-primary/secondary/tertiary`,
+the old `--text-xs..metric` scale, `--h-*`, …) are kept in `globals.css` for ONE release so
+the panels ported from harmony-web restyle without a full rename — every alias is dated
+"LEGACY (CONST-17)" and scheduled for removal at CONST-29. Do not add new call-sites against
+the legacy names.
+
+**Fonts** are self-hosted: Inter 400/500/600/700 + JetBrains Mono 400/500/700 (latin subset
+woff2, ~172KB total) live in `public/fonts/` and are declared in `src/styles/fonts.css`
+(`font-display: swap` + system fallbacks in `--font-sans`/`--font-mono`). The brand guide's
+hosted-fonts `@import` is NOT used — the built dist makes zero external requests (same-origin
+model, audit §3). If you ever need to re-fetch/update a font file, pull the real `.woff2`
+binary and commit it; never point `@font-face` at a remote URL.
+
+### Dataviz palette validation
+
+The 6 categorical slots (`--series-1..6`) were run through the dataviz skill's
+`validate_palette.js` against `--mode dark --surface "#161130"` (the card surface), plus
+`--pairs all` for slots 1-4 (the scatter/radar/swarm all-pairs cap). Three slots failed the
+brand-faithful starting point from spec §4.2 and were **snapped within their own brand ramp**
+(hue held, lightness moved only):
+
+| Slot | Role | Spec §4.2 value | Snapped value | Reason |
+|---|---|---|---|---|
+| `--series-2` | flux-green family | `#10B981` | `#059669` | outside the dark-mode lightness band |
+| `--series-3` | flux-amber family | `#F59E0B` | `#D97706` | outside the dark-mode lightness band |
+| `--series-4` | flux-blue family | `#3B82F6` | `#1D4ED8` | ΔE 0.9 vs violet-400 under deutan sim (all-pairs) |
+| `--series-6` | violet-200 family | `#DDC9FD` | `#9D6FE0` | outside lightness band + below chroma floor |
+| `--series-1` | violet-400 | `#A855F7` | unchanged | — |
+| `--series-5` | flux-rose | `#F43F5E` | unchanged | — |
+
+Final report (`node validate_palette.js "#A855F7,#059669,#D97706,#1D4ED8,#F43F5E,#9D6FE0"
+--mode dark --surface "#161130"`): **ALL CHECKS PASS** (lightness band, chroma floor, normal-
+vision floor, contrast vs surface all PASS; CVD separation reports a WARN in the 6-8 ΔE band
+on the adjacent amber/green pair and on the all-pairs violet/blue pair — legal per the skill's
+rule *"CVD in the 6-8 floor band is legal ONLY with secondary encoding: direct labels, gaps,
+or texture"*, satisfied here because every chart ships a `ChartLegend` + `TableViewToggle`,
+§4.2/§4.4). Status/semantic tokens (`--flux-*`, `--status-*`) were left at their spec values —
+only the categorical chart-slot copies were snapped, since those are the ones the validator
+scopes to.
+
+### The viz kit (`src/viz/`)
+
+**Panels never import `recharts`/`@nivo/*` directly — always import from `src/viz/`.**
+`theme.ts` bridges the CSS tokens into a nivo theme + Recharts style constants (memoized
+`getComputedStyle` read); `palette.ts` holds the categorical/sequential/diverging accessors
+plus `SlotAssigner` (first-seen-order categorical slot assignment, stable across filtering —
+instantiate one per chart instance, not per render). `ChartCard`/`ChartTooltip`/
+`ChartLegend`/`ChartEmpty`/`ChartSkeleton`/`TableViewToggle` are the shared chart chrome
+every chart composes (loading/refetch/empty/degraded states, table-view twin, textContent-
+only tooltip label insertion since series/point labels can be untrusted upstream data). For
+the advanced chart forms (radar/boxplot/heatmap/parallel-coordinates/swarmplot/scatterplot),
+CONST-17 ships the FOUNDATION only: pinned `@nivo/*` 0.99.0 packages, the shared nivo theme
+bridge (`theme.ts`), and a dedicated `viz` Vite chunk (`vite.config.ts` `manualChunks`) so
+the shell/panels' initial bundle doesn't pay for nivo. The chart-form wrapper components
+themselves land with the routes that use them (MINT/Models, CONST-22..24), which lazy-import
+their panels.
+
+Grid lines are **solid 1px hairlines** (`--chart-grid`/`--chart-axis`) — the dashed
+`strokeDasharray:'3 3'` pattern from harmony-web is retired everywhere (audit §1.4). Every
+chart ships a table-view twin (`TableViewToggle`) — this is both the WCAG relief channel for
+sub-3:1 fills and a hard rule (§4.4).
+## Real-time relay (`/ws`, CONST-18)
+
+`GET /ws` (`src/constellation/ws.rs` on the Terminus side, not in this package) is a
+session-authenticated, masked WebSocket relay -- the same cookie-JWT check
+`require_session` uses is verified BEFORE the upgrade is ever accepted, so an
+unauthenticated caller gets a `401`, never a half-open socket. Once accepted, it dials
+Harmony's own event socket (`CONSTELLATION_HARMONY_WS_URL`, a Terminus-side env var --
+see `.env.example`) and pipes events to the browser, each wrapped as `{source:'harmony',
+event:...}` and passed through the SAME `mask_response` masking every `/api/*` response
+gets. If `CONSTELLATION_HARMONY_WS_URL` is unset, the relay still accepts the upgrade
+(auth already passed) but immediately sends a typed WebSocket close frame (code `4000`,
+"no upstream configured") and the app falls back to 30s polling -- this is expected,
+degraded-but-functional behavior, not an error to chase down. A typed close of `4001`
+("upstream unreachable") means the relay dialed Harmony's socket and lost/never got it
+after its bounded reconnect budget was exhausted -- same polling fallback applies.
+`ws.connect()` (`src/lib/aggregationClient.ts`) already treats every close uniformly
+(reconnect/backoff, then fall back to polling) -- no client-side branch on the close code
+is required for this item; a future item MAY use the code to distinguish "no backend
+configured" from "backend flapped" in the UI if that becomes useful.
 
 ## Dev / build
 
