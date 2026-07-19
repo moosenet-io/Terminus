@@ -298,21 +298,43 @@ only tooltip label insertion since series/point labels can be untrusted upstream
 the advanced chart forms (radar/boxplot/heatmap/parallel-coordinates/swarmplot/scatterplot),
 CONST-17 shipped the FOUNDATION only: pinned `@nivo/*` 0.99.0 packages, the shared nivo theme
 bridge (`theme.ts`), and a dedicated `viz` Vite chunk (`vite.config.ts` `manualChunks`) so
-the shell/panels' initial bundle doesn't pay for nivo. CONST-23 lands the first three
+the shell/panels' initial bundle doesn't pay for nivo. CONST-23 landed the first three
 chart-form wrappers on top of that foundation: `RadarChart.tsx` (C1), `HeatmapChart.tsx` (C2),
-`ScatterChart.tsx` (C4) -- boxplot/parallel-coordinates/swarmplot wrappers are CONST-24's job
-(C3/C5/C9). NOTE: the `vite.config.ts` comment's "lazy-loaded" framing for MINT/Models routes
-is aspirational -- this app has no `React.lazy`/route-level code-splitting anywhere yet
+`ScatterChart.tsx` (C4). CONST-24 lands the remaining four: `BoxPlotChart.tsx` (C3),
+`SwarmPlotChart.tsx` (C5), `FailureBarsChart.tsx` (C6, Recharts), and
+`ParallelCoordinatesChart.tsx` (C9) -- all four chart forms in §4.1's decision are now real.
+NOTE: the `vite.config.ts` comment's "lazy-loaded" framing for MINT/Models routes is
+aspirational -- this app has no `React.lazy`/route-level code-splitting anywhere yet
 (`registerPanels.ts` imports every panel eagerly, MINT included); the `viz` manualChunks split
-alone keeps both the initial (~146 KB gz) and viz (~129 KB gz) bundles under the §9 budget
+alone keeps both the initial (~155 KB gz) and viz (~150 KB gz) bundles under the §9 budget
 (350/250 KB gz) even without it, but true lazy-loading is still a real gap if the bundle grows.
+
+**`@nivo/parallel-coordinates`'s shipped types are broken** (CONST-24 finding): the installed
+0.99.0 package declares `"types": "./dist/types/index.d.ts"` in its own `package.json` but does
+not ship that directory -- only the `.cjs.js`/`.mjs` runtime bundles are present. Every other
+pinned nivo package in this kit ships real types; this one doesn't. `viz/nivo-parallel-
+coordinates.d.ts` is an ambient module shim declaring just the runtime-verified export surface
+(`ResponsiveParallelCoordinates`, confirmed via `node -e "require('@nivo/parallel-coordinates')"`)
+so `ParallelCoordinatesChart.tsx` can typecheck -- the one sanctioned "the library's types are
+broken" escape hatch in this kit, not a precedent for under-typing wrappers in general.
+
+**The exact-quantile / exact-value tricks** (CONST-24): both `BoxPlotChart.tsx` (C3) and
+`ParallelCoordinatesChart.tsx` (C9) need nivo to reproduce SERVER-computed values (box
+quartiles; a fixed 0..1 domain per axis) rather than deriving statistics from raw per-point
+data itself, and neither chart form exposes a "the stats are already computed" mode or a scale
+accessor to custom layers. Both wrappers work around this by feeding nivo a small synthetic
+reference dataset whose exact values make nivo's OWN interpolation reproduce the desired
+result with zero error (5 sorted points for boxplot's [min,q1,median,q3,max]; two rows pinned
+to 0 and 1 on every axis for parallel-coordinates' pixel<->value mapping) -- see the file-header
+comments in each for the exact math. This is a deliberate, documented technique, not
+incidental test-fixture noise.
 
 Grid lines are **solid 1px hairlines** (`--chart-grid`/`--chart-axis`) — the dashed
 `strokeDasharray:'3 3'` pattern from harmony-web is retired everywhere (audit §1.4). Every
 chart ships a table-view twin (`TableViewToggle`) — this is both the WCAG relief channel for
 sub-3:1 fills and a hard rule (§4.4).
 
-## MINT module (`src/panels/mint/`, CONST-23 — phase 1)
+## MINT module (`src/panels/mint/`, CONST-23 phase 1 + CONST-24 phase 2)
 
 `/mint` (`mint.overview`) is ONE sectioned page (Overview, Coverage, Capability, Coder,
 Context), not one panel/route per section, per spec §7.1 -- `MintPage.tsx` owns a sticky
@@ -328,27 +350,49 @@ proxied fleet system.
 tweaks don't spam browser history). Reload/share a `/mint?epoch=S118&model=qwen3-coder:30b`
 URL and the exact view restores.
 
-**This item builds C0/C1/C2/C4/C7/C8** (stat tiles, capability radar, coverage heatmap, Pareto
-scatter, context degradation, sweep activity) -- **C3/C5/C6/C9** (box plots, beeswarm,
-failure-class bars, parallel-coordinates) are CONST-24 and render as labeled "phase 2" empty
-`ChartCard`s in `CoderSection.tsx`/`CapabilitySection.tsx` so the layout doesn't reshuffle when
-they land. The spec's §7.3 "Coder = C4+C3+C5+C6" section composition is honored even though
-only C4 is real yet, for the same reason.
+**CONST-23 built C0/C1/C2/C4/C7/C8** (stat tiles, capability radar, coverage heatmap, Pareto
+scatter, context degradation, sweep activity). **CONST-24 lands the remaining four** -- C3
+(`BoxPlotChart.tsx`, latency box plots), C5 (`SwarmPlotChart.tsx`, score beeswarm), C6
+(`FailureBarsChart.tsx`, failure-class bars), C9 (`ParallelCoordinatesChart.tsx`, trade-off
+parallel coordinates) -- plus the Coder section's language control (§7.1's one documented
+exception to the global filter row) and the cross-chart drill-downs §7 calls for:
+- Coverage's heatmap (C2) cell click adds that row's model to the global model filter and
+  scrolls to Coder -- since C3/C5 already read the same global filter, this re-scopes both
+  without `CoverageSection.tsx` importing anything from the Coder section.
+- Failure-class bars (C6) segment click filters the beeswarm (C5) to that failure class (a
+  section-local `failureClassFilter`, shown as a removable chip next to the language control).
+- Score beeswarm (C5) dot click switches C5 into table view and highlights the matching run
+  row (`DataTable`'s new optional `highlightRowKey` prop, CONST-24 addition; scrolls it into
+  view). C5 lane-header click adds that lane's model to the global model filter (routes to C6).
 
-Each of the five section endpoints (`useMint.ts`) degrades independently -- one dead endpoint
-collapses only its own `ChartCard` to the degraded state, never the whole page.
+`TradeoffsSection.tsx` (C9) is a separate file from `CapabilitySection.tsx` (C1) but renders
+inside the SAME `<section id="capability">` -- §7.3's "Capability = C1+C9" composition holds
+without a monolithic file.
+
+Each of the now nine section endpoints (`useMint.ts`) degrades independently -- one dead
+endpoint collapses only its own `ChartCard` to the degraded state, never the whole page.
 
 **Backend not merged yet:** CONST-21 (`models_api.rs`) owns the real `/api/terminus/mint/*`
-endpoints and hasn't landed -- this item builds entirely against `aggregationClient.ts` mock
-fixtures shaped exactly per §8, covering the required variants (full fleet, sparse/missing
-dimensions, not_run-only coverage, single-model selection). Two deviations from §8 worth
-flagging for CONST-21:
+endpoints and hasn't landed -- this item (like CONST-23 before it) builds entirely against
+`aggregationClient.ts` mock fixtures shaped exactly per §8, covering the required variants
+(full fleet, sparse/missing dimensions, not_run-only coverage, single-model selection, n<5
+groups, >400-run decimation, an all-`none`-failure epoch, and a <2-complete-model trade-off
+set). Deviations from §8 worth flagging for CONST-21 (CONST-23's two, plus CONST-24's three):
 - `GET /mint/pareto?models=&epoch=` is NOT in §8's endpoint table -- C4 needs per-model
   `{latency, score, vram}` that doesn't fit any other listed shape, so the mock adds this as
   an additive contract-to-confirm rather than overloading `/mint/runs` or `/models`.
 - The model multi-select's option list (`MINT_MODEL_CATALOG`) is hardcoded from the mock
   fixture's own model set, since `/api/terminus/models` (CONST-21/22) isn't built yet either --
   swap it for a real model list once CONST-22 lands.
+- `GET /mint/box` additionally returns an optional `raw_values: number[]` per group when
+  `n < 5` -- §8's quartile-only shape has no per-point data for the beeswarm-strip fallback
+  §7.2 requires for low-n groups; CONST-21 should populate it from the same raw run rows the
+  quartiles are computed from.
+- `GET /mint/tradeoffs?models=` (C9) is likewise NOT in §8's table -- same additive pattern as
+  `/mint/pareto`, since C9's 6-dim per-model shape (normalized + raw ranges) doesn't fit
+  `/mint/language-stats`, `/mint/context-profiles`, or `/models` cleanly on its own.
+- The Coder section's language catalog (`MINT_LANGUAGES`) is hardcoded from the mock run
+  fixture, same deviation/precedent as `MINT_MODEL_CATALOG` above.
 
 ## Real-time relay (`/ws`, CONST-18)
 

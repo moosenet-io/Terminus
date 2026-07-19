@@ -11,6 +11,10 @@ import type {
   MintContextProfilesResponse,
   MintActivityResponse,
   MintParetoResponse,
+  MintBoxResponse,
+  MintRunsResponse,
+  MintFailuresResponse,
+  MintTradeoffsResponse,
 } from '../lib/aggregationClient';
 
 export interface MintFilters {
@@ -106,6 +110,35 @@ export function useMintActivity(filters: MintFilters, range: '30d' | '90d' | 'al
   return useMintEndpoint<MintActivityResponse>('/mint/activity', filters, { range });
 }
 
-export function useMintPareto(filters: MintFilters) {
-  return useMintEndpoint<MintParetoResponse>('/mint/pareto', filters);
+export function useMintPareto(filters: MintFilters, language?: string) {
+  return useMintEndpoint<MintParetoResponse>('/mint/pareto', filters, mintLanguageExtra(language));
+}
+
+// ── CONST-24 additions (C3/C5/C6/C9) ─────────────────────────────────────────
+// The Coder section's language control is DELIBERATELY not part of the global `MintFilters`/
+// URL-deep-linked object (§7.1: "language (Coder section only -- the one documented scoping
+// exception)") -- it's threaded through as an extra query param instead, exactly like the
+// existing `range` param on useMintActivity above.
+
+function mintLanguageExtra(language?: string): Record<string, string> | undefined {
+  return language && language !== 'all' ? { language } : undefined;
+}
+
+export function useMintBox(filters: MintFilters, metric: 'total_time_ms' | 'code_quality_score', language?: string) {
+  return useMintEndpoint<MintBoxResponse>('/mint/box', filters, { metric, ...mintLanguageExtra(language) });
+}
+
+export function useMintRuns(filters: MintFilters, opts?: { language?: string; failureClass?: string }) {
+  const extra: Record<string, string> = {};
+  if (opts?.language && opts.language !== 'all') extra.language = opts.language;
+  if (opts?.failureClass && opts.failureClass !== 'all') extra.failure_class = opts.failureClass;
+  return useMintEndpoint<MintRunsResponse>('/mint/runs', filters, extra);
+}
+
+export function useMintFailures(filters: MintFilters) {
+  return useMintEndpoint<MintFailuresResponse>('/mint/failures', filters);
+}
+
+export function useMintTradeoffs(filters: MintFilters) {
+  return useMintEndpoint<MintTradeoffsResponse>('/mint/tradeoffs', filters);
 }

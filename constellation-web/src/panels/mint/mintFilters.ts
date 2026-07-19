@@ -11,6 +11,11 @@ const BACKEND_TAGS = new Set(['all', 'gpu', 'cpu']);
 /** Model multi-select ceiling (§7.1: "model multi-select (<=4)"). */
 export const MINT_MODEL_SELECT_CAP = 4;
 
+/** CONST-24: the Coder section's language control (§7.1's "one documented scoping exception").
+ *  Hardcoded from the CONST-24 mock fixture's own run data, same deviation/precedent as
+ *  `MINT_MODEL_CATALOG` -- swap for a real facet list once CONST-21 lands. */
+export const MINT_LANGUAGES: readonly string[] = ['python', 'rust', 'typescript', 'go'];
+
 export function parseMintFilters(params: URLSearchParams): MintFilters {
   const epoch = params.get('epoch') ?? DEFAULT_MINT_FILTERS.epoch;
   const taskCategoryRaw = params.get('task_category') ?? 'all';

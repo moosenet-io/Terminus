@@ -1,5 +1,9 @@
 // CONST-23 §7.3: Coverage = C2 (score/coverage heatmap), full-width per §7.3's grid rule.
-import { useMemo, useState } from 'react';
+// CONST-24: closes the drill-down seam CONST-23 left — a cell click adds that row's model to
+// the global model filter (the same filter C3/C5 in the Coder section already read), so
+// clicking a heatmap cell visibly re-scopes the Coder section without this file needing to
+// import anything from `CoderSection.tsx`.
+import { useMemo } from 'react';
 import { ChartCard } from '../../viz/ChartCard';
 import { HeatmapChart } from '../../viz/HeatmapChart';
 import type { HeatmapRow, HeatmapDatum } from '../../viz/HeatmapChart';
@@ -9,6 +13,7 @@ import type { DataTableColumn } from '../../components/DataTable';
 import { useMintMatrix } from '../../hooks/useMint';
 import type { MintFilters } from '../../hooks/useMint';
 import type { MintMatrixCell } from '../../lib/aggregationClient';
+import { MINT_MODEL_SELECT_CAP } from './mintFilters';
 import { mintSectionTitleStyle } from './mintShared';
 
 const CHART_HEIGHT = 420;
@@ -17,9 +22,25 @@ function statusGlyph(status: MintMatrixCell['status']): string {
   return status === 'not_run' ? '—' : status === 'stale' ? '🕐' : status === 'non_viable' ? '✕' : '';
 }
 
-export function CoverageSection({ filters }: { filters: MintFilters }) {
+interface CoverageSectionProps {
+  filters: MintFilters;
+  onFiltersChange: (next: MintFilters) => void;
+}
+
+export function CoverageSection({ filters, onFiltersChange }: CoverageSectionProps) {
   const matrix = useMintMatrix(filters);
   const { view, setView } = useTableView();
+
+  const handleCellClick = (model: string, _col: string) => {
+    void _col;
+    // §7.2/§10 CONST-24: "heatmap cell click -> C3/C5 filtered" — scope the global model
+    // filter to the clicked row's model (add it if there's room; a full filter is a no-op,
+    // same "no silent replace" convention as MintFilterBar's own model toggle).
+    if (filters.models.includes(model)) return;
+    if (filters.models.length >= MINT_MODEL_SELECT_CAP) return;
+    onFiltersChange({ ...filters, models: [...filters.models, model] });
+    document.getElementById('coder')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
 
   const rows: HeatmapRow[] = useMemo(() => {
     if (!matrix.data) return [];
@@ -102,7 +123,7 @@ export function CoverageSection({ filters }: { filters: MintFilters }) {
         }
       >
         <TableView view={view} columns={columns} rows={tableRows} rowKey={(r, i) => `${r.model}-${r.col}-${i}`}>
-          <HeatmapChart data={rows} height={CHART_HEIGHT - 40} />
+          <HeatmapChart data={rows} height={CHART_HEIGHT - 40} onCellClick={handleCellClick} />
         </TableView>
       </ChartCard>
     </section>

@@ -441,6 +441,93 @@ export interface MintParetoResponse {
   points: MintParetoPoint[];
 }
 
+// ── MINT module types (CONST-24; §7.2 C3/C5/C6/C9) ──────────────────────────
+
+export interface MintBoxOutlier {
+  run_id: string;
+  value: number;
+  case_id: string;
+  failure_class: string;
+}
+
+export interface MintBoxGroup {
+  model: string;
+  min: number;
+  q1: number;
+  median: number;
+  q3: number;
+  max: number;
+  n: number;
+  outliers: MintBoxOutlier[];
+  /** NOTE (deviation, see PR description): additive to §8's `/mint/box` shape — the
+   *  quartile-only contract has no per-point data for the n<5 case, but §7.2 requires C3 to
+   *  render those groups as a beeswarm strip instead of a box, which needs individual values.
+   *  Present (and non-empty) only when `n < 5`; CONST-21 should populate it from the same raw
+   *  run rows the quartiles are computed from. */
+  raw_values?: number[];
+}
+
+export interface MintBoxResponse {
+  metric: 'total_time_ms' | 'code_quality_score';
+  groups: MintBoxGroup[];
+}
+
+export interface MintRun {
+  run_id: string;
+  model: string;
+  case_id: string;
+  language: string;
+  task_category: string;
+  /** Discrete 1-5 judge score — never smoothed (§10 CONST-24 "discrete-score honesty"). */
+  score: number;
+  failure_class: string; // 'none' when the run succeeded
+  total_time_ms: number;
+}
+
+export interface MintRunsResponse {
+  runs: MintRun[];
+  total: number;
+}
+
+export interface MintFailureModelCounts {
+  model: string;
+  counts: Record<string, number>; // failure_class -> count, 'none' excluded
+  total_runs: number;
+}
+
+export interface MintFailuresResponse {
+  /** Top-4 fleet-wide classes (excludes 'none') plus a synthetic 'other' bucket. */
+  classes: string[];
+  models: MintFailureModelCounts[];
+}
+
+export type MintTradeoffDimKey =
+  | 'mean_score' | 'pass_hat_3' | 'mean_throughput' | 'p95_latency_ms' | 'vram_gb' | 'max_context_safe';
+
+export interface MintTradeoffDim {
+  key: MintTradeoffDimKey;
+  label: string;
+  unit: string;
+  min: number; // raw units, for tick formatting
+  max: number; // raw units, for tick formatting
+  /** True for dims where a LOWER raw value is better (latency, vram) — server normalizes so
+   *  norm=1 is always "best" regardless of direction (§7.2 "p95_latency_ms inv, vram_gb inv"). */
+  invert: boolean;
+}
+
+export interface MintTradeoffPoint {
+  model: string;
+  raw: Partial<Record<MintTradeoffDimKey, number>>;
+  /** 0..1, server-normalized, invert already applied so 1 always means "best". Missing key ->
+   *  dim not profiled for this model (contributes to the "partial model" exclusion count). */
+  norm: Partial<Record<MintTradeoffDimKey, number>>;
+}
+
+export interface MintTradeoffsResponse {
+  dims: MintTradeoffDim[];
+  points: MintTradeoffPoint[];
+}
+
 // ── Mock data for the MINT module (CONST-23) ────────────────────────────────
 // Fixture models deliberately cover the required variants (item brief): 'qwen3-coder:30b' is
 // the full-data/full-coverage reference model; 'llama3.1:70b' is sparse (< 8 assistant
@@ -687,6 +774,182 @@ const MOCK_MINT_PARETO_SOLO: MintParetoResponse = {
   points: [buildMintPareto().points.find(p => p.model === 'phi4:14b')!],
 };
 
+// ── Mock data for CONST-24 (C3/C5/C6/C9) ────────────────────────────────────
+// Fixture note: 'qwen3-coder:30b' carries a giant single outlier (proves the log-scale-default
+// toggle keeps the box readable) and >400 runs (proves swarm decimation); 'phi4:14b' and
+// 'gemma2:27b' are n<5 (< 5 samples) so C3 renders them as a beeswarm strip, not a box, per §7.2.
+
+function buildMintBox(): MintBoxResponse {
+  return {
+    metric: 'total_time_ms',
+    groups: [
+      {
+        model: 'qwen3-coder:30b', min: 310, q1: 520, median: 680, q3: 810, max: 3800, n: 42,
+        outliers: [{ run_id: 'run-qc-0091', value: 3800, case_id: 'blitz-77', failure_class: 'none' }],
+      },
+      {
+        model: 'llama3.1:70b', min: 640, q1: 1120, median: 1380, q3: 1690, max: 2450, n: 38,
+        outliers: [{ run_id: 'run-ll-0033', value: 2450, case_id: 'deep-12', failure_class: 'timeout' }],
+      },
+      {
+        model: 'mixtral:8x22b', min: 480, q1: 860, median: 1040, q3: 1260, max: 1900, n: 30,
+        outliers: [],
+      },
+      {
+        // n<5 -> §7.2 beeswarm-strip fallback + ⚠ low-n affordance
+        model: 'phi4:14b', min: 380, q1: 380, median: 410, q3: 460, max: 460, n: 3,
+        outliers: [],
+        raw_values: [380, 410, 460],
+      },
+      {
+        model: 'gemma2:27b', min: 590, q1: 590, median: 605, q3: 620, max: 620, n: 2,
+        outliers: [],
+        raw_values: [590, 620],
+      },
+    ],
+  };
+}
+
+const MOCK_MINT_BOX = buildMintBox();
+
+const FAILURE_CLASSES = ['none', 'timeout', 'syntax_error', 'incomplete', 'hallucination', 'test_failure'] as const;
+const MINT_LANGUAGES_FIXTURE = ['python', 'rust', 'typescript', 'go'] as const;
+
+function seededRand(seed: number): () => number {
+  let s = seed;
+  return () => {
+    s = (s * 1103515245 + 12345) & 0x7fffffff;
+    return s / 0x7fffffff;
+  };
+}
+
+function buildMintRuns(): MintRunsResponse {
+  const runs: MintRun[] = [];
+  const rand = seededRand(42);
+  const perModelCount: Record<string, number> = {
+    'qwen3-coder:30b': 420, // >400 -> proves swarm decimation
+    'llama3.1:70b': 120,
+    'mixtral:8x22b': 90,
+    'phi4:14b': 14,
+    'gemma2:27b': 60,
+  };
+  for (const model of MINT_MODEL_IDS) {
+    const count = perModelCount[model] ?? 40;
+    const baseScore = model === 'qwen3-coder:30b' ? 4.3 : model === 'phi4:14b' ? 3.0 : 3.7;
+    for (let i = 0; i < count; i++) {
+      const r = rand();
+      const failed = r < 0.12;
+      const failure_class = failed
+        ? FAILURE_CLASSES[1 + Math.floor(rand() * (FAILURE_CLASSES.length - 1))]
+        : 'none';
+      const score = failed ? Math.max(1, Math.round(baseScore - 1.5 - rand())) : Math.min(5, Math.round(baseScore + (rand() - 0.5)));
+      runs.push({
+        run_id: `run-${model.replace(/[^a-z0-9]/gi, '')}-${i}`,
+        model,
+        case_id: `case-${i % 30}`,
+        language: MINT_LANGUAGES_FIXTURE[i % MINT_LANGUAGES_FIXTURE.length],
+        task_category: i % 3 === 0 ? 'code' : i % 3 === 1 ? 'assistant' : 'agent',
+        score: Math.max(1, Math.min(5, score)),
+        failure_class,
+        total_time_ms: Math.round(400 + rand() * 1200),
+      });
+    }
+  }
+  return { runs, total: runs.length };
+}
+
+const MOCK_MINT_RUNS = buildMintRuns();
+
+/** Epoch 'S110' fixture: every run succeeded — proves C6's "no failures this epoch" empty state. */
+const MOCK_MINT_RUNS_ALL_NONE: MintRunsResponse = {
+  runs: MOCK_MINT_RUNS.runs.slice(0, 40).map(r => ({ ...r, failure_class: 'none', score: Math.max(3, r.score) })),
+  total: 40,
+};
+
+function buildMintFailures(runs: MintRun[]): MintFailuresResponse {
+  const byClass = new Map<string, number>();
+  for (const r of runs) {
+    if (r.failure_class === 'none') continue;
+    byClass.set(r.failure_class, (byClass.get(r.failure_class) ?? 0) + 1);
+  }
+  const sorted = [...byClass.entries()].sort((a, b) => b[1] - a[1]);
+  const top4 = sorted.slice(0, 4).map(([c]) => c);
+  const hasOther = sorted.length > 4;
+  const classes = hasOther ? [...top4, 'other'] : top4;
+
+  const models: MintFailureModelCounts[] = MINT_MODEL_IDS.map(model => {
+    const modelRuns = runs.filter(r => r.model === model);
+    const counts: Record<string, number> = {};
+    for (const c of classes) counts[c] = 0;
+    for (const r of modelRuns) {
+      if (r.failure_class === 'none') continue;
+      const key = classes.includes(r.failure_class) ? r.failure_class : 'other';
+      counts[key] = (counts[key] ?? 0) + 1;
+    }
+    return { model, counts, total_runs: modelRuns.length };
+  });
+
+  return { classes, models };
+}
+
+const MOCK_MINT_FAILURES = buildMintFailures(MOCK_MINT_RUNS.runs);
+const MOCK_MINT_FAILURES_ALL_NONE: MintFailuresResponse = { classes: [], models: [] };
+
+const MINT_TRADEOFF_DIMS: MintTradeoffDim[] = [
+  { key: 'mean_score', label: 'Mean score', unit: '/5', min: 2.5, max: 4.6, invert: false },
+  { key: 'pass_hat_3', label: 'pass^3', unit: '', min: 0.3, max: 0.95, invert: false },
+  { key: 'mean_throughput', label: 'Throughput', unit: 'tok/s', min: 18, max: 70, invert: false },
+  { key: 'p95_latency_ms', label: 'p95 latency', unit: 'ms', min: 480, max: 2100, invert: true },
+  { key: 'vram_gb', label: 'VRAM', unit: 'GB', min: 8, max: 40, invert: true },
+  { key: 'max_context_safe', label: 'Max safe context', unit: 'tok', min: 4096, max: 32768, invert: false },
+];
+
+function normalize(dim: MintTradeoffDim, raw: number): number {
+  const t = (raw - dim.min) / (dim.max - dim.min || 1);
+  const clamped = Math.max(0, Math.min(1, t));
+  return dim.invert ? 1 - clamped : clamped;
+}
+
+function buildMintTradeoffPoint(model: string, raw: Partial<Record<MintTradeoffDimKey, number>>): MintTradeoffPoint {
+  const norm: Partial<Record<MintTradeoffDimKey, number>> = {};
+  for (const dim of MINT_TRADEOFF_DIMS) {
+    const v = raw[dim.key];
+    if (v != null) norm[dim.key] = normalize(dim, v);
+  }
+  return { model, raw, norm };
+}
+
+function buildMintTradeoffs(): MintTradeoffsResponse {
+  const points: MintTradeoffPoint[] = [
+    buildMintTradeoffPoint('qwen3-coder:30b', {
+      mean_score: 4.4, pass_hat_3: 0.91, mean_throughput: 62, p95_latency_ms: 1150, vram_gb: 24, max_context_safe: 32768,
+    }),
+    buildMintTradeoffPoint('llama3.1:70b', {
+      mean_score: 3.9, pass_hat_3: 0.68, mean_throughput: 38, p95_latency_ms: 2030, vram_gb: 40, max_context_safe: 16384,
+    }),
+    buildMintTradeoffPoint('mixtral:8x22b', {
+      mean_score: 4.0, pass_hat_3: 0.74, mean_throughput: 45, p95_latency_ms: 1540, vram_gb: 34, max_context_safe: 8192,
+    }),
+    buildMintTradeoffPoint('phi4:14b', {
+      mean_score: 3.2, pass_hat_3: 0.41, mean_throughput: 70, p95_latency_ms: 574, vram_gb: 8, max_context_safe: 4096,
+    }),
+    // Partial model — missing max_context_safe (never profiled) -> excluded from the chart with
+    // a counted caveat (§10 CONST-24 edge case).
+    buildMintTradeoffPoint('gemma2:27b', {
+      mean_score: 3.6, pass_hat_3: 0.55, mean_throughput: 50, p95_latency_ms: 690, vram_gb: 16,
+    }),
+  ];
+  return { dims: MINT_TRADEOFF_DIMS, points };
+}
+
+const MOCK_MINT_TRADEOFFS = buildMintTradeoffs();
+
+/** <2 complete-model fixture — only 'phi4:14b' has all 6 dims -> C9 empty state. */
+const MOCK_MINT_TRADEOFFS_SOLO: MintTradeoffsResponse = {
+  dims: MINT_TRADEOFF_DIMS,
+  points: [MOCK_MINT_TRADEOFFS.points.find(p => p.model === 'phi4:14b')!],
+};
+
 // ── Mock data for the Muse module (CONST-19 backend; CONST-20 builds its UI
 // against these shapes -- verified routes per CONST-GUI-audit.md §4/spec §5.4) ─
 
@@ -785,6 +1048,30 @@ function mockMintGetFor(pathname: string, query: URLSearchParams): unknown {
     // CONST-21 rather than silently overloading `/mint/runs` or `/models`.
     if (solo) return MOCK_MINT_PARETO_SOLO;
     return MOCK_MINT_PARETO;
+  }
+  // CONST-24 additions (C3/C5/C6/C9) — same query-aware routing convention as above.
+  if (pathname === '/mint/box') {
+    return MOCK_MINT_BOX;
+  }
+  if (pathname === '/mint/runs') {
+    const language = query.get('language');
+    const failureClass = query.get('failure_class');
+    const base = epoch === 'S110' ? MOCK_MINT_RUNS_ALL_NONE : MOCK_MINT_RUNS;
+    let runs = base.runs;
+    if (models.length > 0) runs = runs.filter(r => models.includes(r.model));
+    if (language && language !== 'all') runs = runs.filter(r => r.language === language);
+    if (failureClass && failureClass !== 'all') runs = runs.filter(r => r.failure_class === failureClass);
+    return { runs, total: runs.length } satisfies MintRunsResponse;
+  }
+  if (pathname === '/mint/failures') {
+    return epoch === 'S110' ? MOCK_MINT_FAILURES_ALL_NONE : MOCK_MINT_FAILURES;
+  }
+  if (pathname === '/mint/tradeoffs') {
+    // NOTE (deviation, see PR description): not in §8's endpoint table — extends the
+    // language-stats + operational + catalog sources §7.2 C9 names as its raw material into one
+    // per-model 6-dim shape, the same additive pattern `/mint/pareto` established in CONST-23.
+    if (solo) return MOCK_MINT_TRADEOFFS_SOLO;
+    return MOCK_MINT_TRADEOFFS;
   }
   return undefined;
 }
@@ -924,7 +1211,11 @@ const mockAdapter: AggregationClient = {
 //            GET /mint/dimensions?models=&epoch=, GET /mint/matrix?epoch=,
 //            GET /mint/context-profiles?models=, GET /mint/activity?range=,
 //            GET /mint/pareto?models=&epoch= (additive — not in §8's table, see the mock
-//            routing comment in mockMintGetFor for why C4 needed it)
+//            routing comment in mockMintGetFor for why C4 needed it). CONST-24 additions:
+//            GET /mint/box?metric=&models=&language=, GET /mint/runs?models=&language=&
+//            failure_class=&epoch=, GET /mint/failures?epoch=&task_category=, and the
+//            additive GET /mint/tradeoffs?models= (same additive pattern as /mint/pareto,
+//            for C9 -- not in §8's table either).
 
 function baseUrl(): string {
   // Same-origin only — never a hardcoded host/port. This is the one place in the app

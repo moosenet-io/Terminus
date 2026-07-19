@@ -64,11 +64,13 @@ interface TableViewProps<T> {
   rows: T[];
   rowKey: (row: T, index: number) => string;
   children: React.ReactNode; // the chart, rendered when view === 'chart'
+  /** CONST-24: forwarded to DataTable for the run-drill-down click-through (§7.2 C5 -> table row). */
+  highlightRowKey?: string;
 }
 
 /** Renders the chart (children) when view === 'chart', else a DataTable of the same rows.
  *  Pure content switch — no toggle-row markup, so it's safe to use as ChartCard's entire
  *  fixed-height body (pair with `TableViewControls` in the `controls` header slot). */
-export function TableView<T>({ view, columns, rows, rowKey, children }: TableViewProps<T>) {
-  return view === 'chart' ? <>{children}</> : <DataTable columns={columns} rows={rows} rowKey={rowKey} />;
+export function TableView<T>({ view, columns, rows, rowKey, children, highlightRowKey }: TableViewProps<T>) {
+  return view === 'chart' ? <>{children}</> : <DataTable columns={columns} rows={rows} rowKey={rowKey} highlightRowKey={highlightRowKey} />;
 }

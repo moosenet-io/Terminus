@@ -1,6 +1,6 @@
-// CONST-23 §7.3: Capability = C1 (capability radar) + a reserved C9 slot ("phase 2" —
-// parallel-coordinates lands in CONST-24; the section is structured so it can slot in without
-// a layout change).
+// CONST-23/24 §7.3: Capability = C1 (capability radar) + C9 (trade-off parallel coordinates,
+// `TradeoffsSection.tsx` — CONST-24). Kept as two files (one per chart) inside this single
+// `<section id="capability">` so §7.3's section composition holds without a monolithic file.
 import { useMemo } from 'react';
 import { ChartCard } from '../../viz/ChartCard';
 import { RadarChart } from '../../viz/RadarChart';
@@ -12,6 +12,7 @@ import type { DataTableColumn } from '../../components/DataTable';
 import { useMintDimensions } from '../../hooks/useMint';
 import type { MintFilters } from '../../hooks/useMint';
 import { mintSectionTitleStyle } from './mintShared';
+import { TradeoffsSection } from './TradeoffsSection';
 
 const CHART_HEIGHT = 380;
 const FLEET_MEDIAN_ID = 'fleet_median';
@@ -109,13 +110,7 @@ export function CapabilitySection({ filters }: { filters: MintFilters }) {
         </TableView>
       </ChartCard>
 
-      {/* C9 (parallel coordinates) — CONST-24 slot. Reserved so the 2-col grid doesn't need to
-          change shape when it lands. */}
-      <div style={{ marginTop: 'var(--space-3)' }}>
-        <ChartCard title="Trade-off parallel coordinates" subtitle="phase 2 — CONST-24" height={120} empty emptyMessage="Coming in CONST-24" emptyHint="6-dim normalized trade-off view (score, pass_hat_3, throughput, latency, vram, max context)">
-          <div />
-        </ChartCard>
-      </div>
+      <TradeoffsSection filters={filters} />
     </section>
   );
 }

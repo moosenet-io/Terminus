@@ -66,7 +66,7 @@ export function MintPage() {
 
       <div style={{ padding: 'var(--space-4)', display: 'flex', flexDirection: 'column', gap: 'var(--space-6)' }}>
         <OverviewSection filters={filters} />
-        <CoverageSection filters={filters} />
+        <CoverageSection filters={filters} onFiltersChange={handleFiltersChange} />
         <CapabilitySection filters={filters} />
         <CoderSection filters={filters} onFiltersChange={handleFiltersChange} />
         <ContextSection filters={filters} />
