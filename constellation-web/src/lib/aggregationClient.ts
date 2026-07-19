@@ -12,6 +12,12 @@
 // This is deliberately the *only* seam CONST-02 (the real Terminus-side aggregation layer)
 // needs to fill in — the httpAdapter below defines exactly the endpoints/shapes it must serve.
 
+// LGUI-08 (§3.3): the Memory browser panel's search-param application lives in
+// `panels/lumina/memorySearch.ts` (pure, unit-tested) rather than inline here — this file just
+// wires it into the mock `/engram/search` route below.
+import { applyMemorySearchParams } from '../panels/lumina/memorySearch';
+import type { Memory, LuminaMemoryStats, MemoryType, SensitivityCategory } from '../types/luminaMemory';
+
 // ── Shared types ────────────────────────────────────────────────────────────
 
 /** The systems the control plane aggregates. Mirrors CONST-01's nav grouping.
@@ -481,6 +487,98 @@ const MOCK_MUSE_GROUP_DYNAMICS = {
   ],
 };
 
+// ── Mock data for the Lumina Memory (engram) browser panel (LGUI-08, §3.3) ──────────────────
+// Seeded for variety per the item's requirements: all 4 `MemoryType`s, several `sensitivity`
+// categories (incl. the always-private Health/Finance/Personal set), a superseded chain
+// (`mem-006` -> `mem-002`), and one huge-content record (`mem-014`) to exercise the 2-line
+// preview clamp (`clampPreview`, `memorySearch.ts`) against something CSS `line-clamp` alone
+// wouldn't catch in a naive render.
+const HUGE_CONTENT = `The operator mentioned, across several turns spanning roughly a week, a `
+  + `long-running preference for how status updates should be delivered: headline-first, no more `
+  + `than three bullet points, timestamps in the operator's local timezone rather than UTC, and a `
+  + `strong dispreference for being pinged about anything below "amber" severity outside of the `
+  + `configured working hours window (weekdays 08:00-19:00, per the location/timezone answers `
+  + `given during the naming ceremony). This preference was reinforced independently on at least `
+  + `two later occasions when a verbose update was given anyway and the operator asked for the `
+  + `short form instead, which is why confidence on this record is high despite it never having `
+  + `been stated as a single explicit rule.`;
+
+const MOCK_MEMORY_RECORDS: Memory[] = [
+  { id: 'mem-001', memory_type: 'Principle', sensitivity: 'None', visibility: 'System', content: 'Prefer headline-first responses; expand only on request.', confidence: 0.94, created_at: '2026-06-02T09:14:00Z', access_count: 41, user_id: 'admin', provenance: { conversation_id: 'conv-1001', turn_index: 3, source: 'chat' }, superseded_by: null },
+  { id: 'mem-002', memory_type: 'Preference', sensitivity: 'None', visibility: 'Shared', content: 'Likes weather briefings in Celsius, not Fahrenheit.', confidence: 0.81, created_at: '2026-06-04T11:02:00Z', access_count: 12, user_id: 'admin', provenance: { conversation_id: 'conv-1003', turn_index: 7, source: 'chat' }, superseded_by: null },
+  { id: 'mem-003', memory_type: 'Semantic', sensitivity: 'Work', visibility: 'Shared', content: 'Works as an infrastructure engineer, primarily on Rust services.', confidence: 0.88, created_at: '2026-06-05T15:40:00Z', access_count: 27, user_id: 'admin', provenance: { conversation_id: 'conv-1004', turn_index: 1, source: 'chat' }, superseded_by: null },
+  { id: 'mem-004', memory_type: 'Episodic', sensitivity: 'None', visibility: 'Private', content: 'Asked for a recap of the <host> disk-hygiene incident on 2026-07-16.', confidence: 0.76, created_at: '2026-07-16T18:22:00Z', access_count: 3, user_id: 'admin', provenance: { conversation_id: 'conv-1090', turn_index: 12, source: 'chat' }, superseded_by: null },
+  { id: 'mem-005', memory_type: 'Principle', sensitivity: 'None', visibility: 'System', content: 'Never hardcode secrets — always resolve via <secret-manager>/vault at runtime.', confidence: 0.99, created_at: '2026-05-20T08:00:00Z', access_count: 63, user_id: null, provenance: { conversation_id: null, turn_index: null, source: 'seed' }, superseded_by: null },
+  { id: 'mem-006', memory_type: 'Preference', sensitivity: 'None', visibility: 'Shared', content: 'Likes weather briefings with both C and F shown side by side.', confidence: 0.85, created_at: '2026-07-01T09:10:00Z', access_count: 6, user_id: 'admin', provenance: { conversation_id: 'conv-1050', turn_index: 4, source: 'chat' }, superseded_by: 'mem-002' },
+  { id: 'mem-007', memory_type: 'Semantic', sensitivity: 'Location', visibility: 'Private', content: 'Home timezone is America/Denver; travels to UTC+1 a few times a year.', confidence: 0.9, created_at: '2026-06-10T07:30:00Z', access_count: 19, user_id: 'admin', provenance: { conversation_id: 'conv-1010', turn_index: 2, source: 'onboarding' }, superseded_by: null },
+  { id: 'mem-008', memory_type: 'Episodic', sensitivity: 'Health', visibility: 'Private', content: 'Mentioned a follow-up physical-therapy appointment for a knee injury.', confidence: 0.71, created_at: '2026-07-08T14:05:00Z', access_count: 2, user_id: 'admin', provenance: { conversation_id: 'conv-1070', turn_index: 5, source: 'chat' }, superseded_by: null },
+  { id: 'mem-009', memory_type: 'Semantic', sensitivity: 'Finance', visibility: 'Private', content: 'Runs a monthly budget review on the first weekend of the month.', confidence: 0.79, created_at: '2026-06-14T10:00:00Z', access_count: 8, user_id: 'admin', provenance: { conversation_id: 'conv-1020', turn_index: 9, source: 'chat' }, superseded_by: null },
+  { id: 'mem-010', memory_type: 'Preference', sensitivity: 'Personal', visibility: 'Private', content: 'Prefers not to be asked about weekend plans before Friday afternoon.', confidence: 0.68, created_at: '2026-07-12T16:45:00Z', access_count: 4, user_id: 'admin', provenance: { conversation_id: 'conv-1080', turn_index: 6, source: 'chat' }, superseded_by: null },
+  { id: 'mem-011', memory_type: 'Episodic', sensitivity: 'None', visibility: 'Shared', content: 'Asked Lumina to summarize the S119 Muse sprint for a teammate.', confidence: 0.73, created_at: '2026-07-15T13:12:00Z', access_count: 5, user_id: 'member-1', provenance: { conversation_id: 'conv-1095', turn_index: 2, source: 'chat' }, superseded_by: null },
+  { id: 'mem-012', memory_type: 'Principle', sensitivity: 'None', visibility: 'System', content: 'Plane access has exactly one sanctioned door — the Terminus Plane tool.', confidence: 0.97, created_at: '2026-05-22T08:00:00Z', access_count: 34, user_id: null, provenance: { conversation_id: null, turn_index: null, source: 'seed' }, superseded_by: null },
+  { id: 'mem-013', memory_type: 'Semantic', sensitivity: 'Relationships', visibility: 'Private', content: "Has a standing weekly call with a project partner on Tuesdays.", confidence: 0.83, created_at: '2026-06-18T09:00:00Z', access_count: 11, user_id: 'admin', provenance: { conversation_id: 'conv-1030', turn_index: 3, source: 'chat' }, superseded_by: null },
+  { id: 'mem-014', memory_type: 'Preference', sensitivity: 'None', visibility: 'Shared', content: HUGE_CONTENT, confidence: 0.87, created_at: '2026-07-10T12:00:00Z', access_count: 9, user_id: 'admin', provenance: { conversation_id: 'conv-1075', turn_index: 14, source: 'chat' }, superseded_by: null },
+  { id: 'mem-015', memory_type: 'Episodic', sensitivity: 'Finance', visibility: 'Private', content: 'Asked about renewing a domain before the annual invoice arrived.', confidence: 0.64, created_at: '2026-07-17T10:30:00Z', access_count: 1, user_id: 'admin', provenance: { conversation_id: 'conv-1099', turn_index: 1, source: 'chat' }, superseded_by: null },
+  { id: 'mem-016', memory_type: 'Semantic', sensitivity: 'None', visibility: 'System', content: 'Fast model and deep model routing is threshold-based per router_rules.rs.', confidence: 0.92, created_at: '2026-06-25T11:11:00Z', access_count: 15, user_id: null, provenance: { conversation_id: null, turn_index: null, source: 'seed' }, superseded_by: null },
+  { id: 'mem-017', memory_type: 'Preference', sensitivity: 'Health', visibility: 'Private', content: 'Wants medication-reminder style nudges kept out of the daily briefing.', confidence: 0.7, created_at: '2026-07-05T08:20:00Z', access_count: 3, user_id: 'admin', provenance: { conversation_id: 'conv-1060', turn_index: 8, source: 'chat' }, superseded_by: null },
+  { id: 'mem-018', memory_type: 'Episodic', sensitivity: 'None', visibility: 'Shared', content: 'Ran the onboarding wizard preflight step twice before completing setup.', confidence: 0.6, created_at: '2026-05-25T09:00:00Z', access_count: 2, user_id: 'admin', provenance: { conversation_id: 'conv-1005', turn_index: 1, source: 'onboarding' }, superseded_by: null },
+];
+
+function countBy<K extends string>(records: Memory[], key: (m: Memory) => K, all: readonly K[]): Record<K, number> {
+  const out = Object.fromEntries(all.map(k => [k, 0])) as Record<K, number>;
+  for (const m of records) out[key(m)] = (out[key(m)] ?? 0) + 1;
+  return out;
+}
+
+const MEMORY_TYPES_ALL: MemoryType[] = ['Episodic', 'Semantic', 'Preference', 'Principle'];
+const SENSITIVITIES_ALL: SensitivityCategory[] = ['None', 'Personal', 'Health', 'Finance', 'Work', 'Relationships', 'Location'];
+
+/** `GET /api/engram/stats` (§7 + §3.3 stats strip). Totals reflect the FULL store, not just the
+ *  seeded records above (a real engram store holds far more than a browsable fixture set) — the
+ *  `by_type`/`by_sensitivity` breakdowns are scaled from the fixture's proportions so the stats
+ *  strip and the search results stay thematically consistent without literally being the same
+ *  18 rows times a multiplier. */
+const MOCK_LUMINA_MEMORY_STATS: LuminaMemoryStats = {
+  total: 1842,
+  by_type: (() => {
+    const seedCounts = countBy(MOCK_MEMORY_RECORDS, m => m.memory_type, MEMORY_TYPES_ALL);
+    const seedTotal = MOCK_MEMORY_RECORDS.length;
+    const scaled = Object.fromEntries(
+      MEMORY_TYPES_ALL.map(t => [t, Math.round((seedCounts[t] / seedTotal) * 1842)]),
+    ) as Record<MemoryType, number>;
+    return scaled;
+  })(),
+  by_sensitivity: (() => {
+    const seedCounts = countBy(MOCK_MEMORY_RECORDS, m => m.sensitivity, SENSITIVITIES_ALL);
+    const seedTotal = MOCK_MEMORY_RECORDS.length;
+    return Object.fromEntries(
+      SENSITIVITIES_ALL.map(s => [s, Math.round((seedCounts[s] / seedTotal) * 1842)]),
+    ) as Record<SensitivityCategory, number>;
+  })(),
+  db_bytes: 48_284_112,
+  embedded_pct: 97.4,
+  store_ok: true,
+};
+
+/** `GET /api/engram/search` (§7) — applies `applyMemorySearchParams` (the same helper the mock
+ *  adapter is required to use per §3.3) to the seeded fixture, keyed off the query string since
+ *  (unlike every other `MOCK_GET` entry) this route's response depends on params, not just the
+ *  pathname. */
+function mockEngramSearch(fullPath: string): { results: Memory[] } {
+  const query = fullPath.split('?')[1] ?? '';
+  const usp = new URLSearchParams(query);
+  const limitRaw = usp.get('limit');
+  const results = applyMemorySearchParams(MOCK_MEMORY_RECORDS, {
+    q: usp.get('q') ?? undefined,
+    type: (usp.get('type') as MemoryType | null) ?? undefined,
+    sensitivity: (usp.get('sensitivity') as SensitivityCategory | null) ?? undefined,
+    visibility: (usp.get('visibility') as Memory['visibility'] | null) ?? undefined,
+    user: usp.get('user') ?? undefined,
+    limit: limitRaw ? Number(limitRaw) : undefined,
+  });
+  return { results };
+}
+
 /** GET-style mock lookups, keyed by "{system} {pathname}" (pathname without query string). */
 const MOCK_GET: Record<string, unknown> = {
   'harmony /status': MOCK_STATUS,
@@ -515,9 +613,13 @@ const MOCK_GET: Record<string, unknown> = {
   'muse /api/graph/watch-history': MOCK_MUSE_WATCH_HISTORY,
   'muse /api/graph/group-dynamics': MOCK_MUSE_GROUP_DYNAMICS,
   'muse /guide': MOCK_MUSE_GUIDE,
+  // LGUI-08 (§3.3/§7): the stats route has no query-dependent shape, so it's a plain lookup;
+  // `/engram/search` DOES depend on the query string and is handled in `mockGetFor` below
+  // (same pattern as `lumina /analytics`'s `view` param elsewhere in this file's history).
+  'lumina /engram/stats': MOCK_LUMINA_MEMORY_STATS,
 };
 
-function mockGetFor(system: SystemId, pathname: string): unknown {
+function mockGetFor(system: SystemId, pathname: string, fullPath: string): unknown {
   const key = `${system} ${pathname}`;
   if (key in MOCK_GET) return MOCK_GET[key];
   if (system === 'harmony' && pathname.startsWith('/tree/')) {
@@ -526,6 +628,9 @@ function mockGetFor(system: SystemId, pathname: string): unknown {
   if (system === 'muse' && pathname.startsWith('/api/channels/') && pathname.endsWith('/lineup')) {
     const channelId = pathname.split('/')[3];
     return MOCK_MUSE_LINEUP[channelId] ?? { channel_id: channelId, lineup: [] };
+  }
+  if (system === 'lumina' && pathname === '/engram/search') {
+    return mockEngramSearch(fullPath);
   }
   return null;
 }
@@ -576,7 +681,7 @@ function mockRequest<T>(system: SystemId, path: string, init?: RequestInit): Pro
   const method = (init?.method ?? 'GET').toUpperCase();
   const pathname = path.split('?')[0];
   const value = method === 'GET'
-    ? mockGetFor(system, pathname)
+    ? mockGetFor(system, pathname, path)
     : mockWriteFor(system, pathname);
   return delay(value as T);
 }

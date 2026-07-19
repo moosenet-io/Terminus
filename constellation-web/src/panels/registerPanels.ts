@@ -32,6 +32,7 @@ import { FleetPanel } from './terminus/FleetPanel';
 import { ToolsPanel } from './terminus/ToolsPanel';
 import { ActivityPanel } from './terminus/ActivityPanel';
 import { LuminaStubPanel } from './lumina/LuminaStubPanel';
+import { MemoryPanel } from './lumina/MemoryPanel';
 import { EngineDiagramPanel } from './status/EngineDiagramPanel';
 import { DashboardPanel } from './harmony/DashboardPanel';
 import { ProjectsPanel } from './harmony/ProjectsPanel';
@@ -282,6 +283,19 @@ registerPanel({
   icon: '✦',
   available: false,
   component: LuminaStubPanel,
+});
+
+// LGUI-08 (§3.3): Memory (engram) browser — operator-gated in-component (RoleGate/useAuthRole
+// convention, see ChatPanel.tsx); `registerPanel`'s `PanelDescriptor` has no `minRole` field as
+// of this build, so the panel itself renders a viewer placeholder, same pattern as lumina.chat.
+registerPanel({
+  id: 'lumina.memory',
+  system: 'lumina',
+  title: 'Memory',
+  path: '/lumina/memory',
+  icon: '\u{1F9E0}',
+  available: true,
+  component: MemoryPanel,
 });
 
 // ── Palette commands (CONST-25) ────────────────────────────────────────────────
