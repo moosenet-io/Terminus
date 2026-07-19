@@ -14,8 +14,9 @@
 
 // ── Shared types ────────────────────────────────────────────────────────────
 
-/** The systems the control plane aggregates. Mirrors CONST-01's nav grouping. */
-export type SystemId = 'harmony' | 'chord' | 'lumina' | 'terminus';
+/** The systems the control plane aggregates. Mirrors CONST-01's nav grouping.
+ *  `muse` added by CONST-19 (the fourth namespaced proxy arm; UI panels land in CONST-20). */
+export type SystemId = 'harmony' | 'chord' | 'lumina' | 'muse' | 'terminus';
 
 export interface AuthMeResponse {
   authenticated: boolean;
@@ -67,7 +68,7 @@ export interface TerminusActivityResponse {
 }
 
 /**
- * The single typed entry point for `/api/{harmony,chord,lumina,terminus}/*`.
+ * The single typed entry point for `/api/{harmony,chord,lumina,muse,terminus}/*`.
  * All request/response shapes an adapter must implement.
  */
 export interface AggregationClient {
@@ -181,6 +182,7 @@ const MOCK_HEALTH: HealthStatus[] = [
   { system: 'harmony', available: true, detail: 'mock: reachable' },
   { system: 'chord', available: true, detail: 'mock: reachable' },
   { system: 'lumina', available: true, detail: 'mock: reachable' },
+  { system: 'muse', available: true, detail: 'mock: reachable' },
   { system: 'terminus', available: true, detail: 'mock: reachable' },
 ];
 
@@ -297,6 +299,38 @@ const MOCK_CHORD_HEALTH = {
 
 const MOCK_PROFILES = { profiles: {}, total_outcomes: 0, window_days: 30 };
 
+// ── Mock data for the Muse module (CONST-19 backend; CONST-20 builds its UI
+// against these shapes -- verified routes per CONST-GUI-audit.md §4/spec §5.4) ─
+
+const MOCK_MUSE_ON_DECK = {
+  items: [
+    { id: 'md-1', title: 'Example Feature Film', kind: 'movie', progress_pct: 40, poster_path: '/art/poster/md-1' },
+    { id: 'md-2', title: 'Example Series S1E4', kind: 'episode', progress_pct: 80, poster_path: '/art/poster/md-2' },
+  ],
+};
+
+const MOCK_MUSE_PREMIERE = {
+  items: [
+    { id: 'md-3', title: 'Example Upcoming Release', release_date: new Date().toISOString(), rsvp_count: 0 },
+  ],
+};
+
+const MOCK_MUSE_GAPS = { gaps: [], total: 0 };
+
+const MOCK_MUSE_CHANNELS = {
+  channels: [
+    { id: 'ch-1', name: 'Mock Channel One', item_count: 12 },
+    { id: 'ch-2', name: 'Mock Channel Two', item_count: 5 },
+  ],
+};
+
+const MOCK_MUSE_TASTE_CLUSTERS = {
+  clusters: [
+    { cluster_id: 0, label: 'mock-cluster-a', points: [{ x: 0.1, y: 0.2, model: 'md-1' }] },
+    { cluster_id: 1, label: 'mock-cluster-b', points: [{ x: 0.6, y: 0.4, model: 'md-2' }] },
+  ],
+};
+
 /** GET-style mock lookups, keyed by "{system} {pathname}" (pathname without query string). */
 const MOCK_GET: Record<string, unknown> = {
   'harmony /status': MOCK_STATUS,
@@ -319,6 +353,14 @@ const MOCK_GET: Record<string, unknown> = {
   'chord /analytics/cost': [],
   'chord /providers': [],
   'chord /providers/profiles': MOCK_PROFILES,
+  'muse /on_deck': MOCK_MUSE_ON_DECK,
+  'muse /premiere': MOCK_MUSE_PREMIERE,
+  'muse /gaps': MOCK_MUSE_GAPS,
+  'muse /api/channels': MOCK_MUSE_CHANNELS,
+  'muse /api/graph/taste-clusters': MOCK_MUSE_TASTE_CLUSTERS,
+  'muse /api/graph/watch-history': { series: [] },
+  'muse /api/graph/group-dynamics': { rows: [] },
+  'muse /guide': { entries: [] },
 };
 
 function mockGetFor(system: SystemId, pathname: string): unknown {
@@ -326,6 +368,9 @@ function mockGetFor(system: SystemId, pathname: string): unknown {
   if (key in MOCK_GET) return MOCK_GET[key];
   if (system === 'harmony' && pathname.startsWith('/tree/')) {
     return { ...MOCK_TREE, project: decodeURIComponent(pathname.slice('/tree/'.length)) };
+  }
+  if (system === 'muse' && pathname.startsWith('/api/channels/') && pathname.endsWith('/lineup')) {
+    return { channel_id: pathname.split('/')[3], lineup: [] };
   }
   return null;
 }
@@ -435,6 +480,12 @@ const mockAdapter: AggregationClient = {
 //   chord:   GET /health, GET /models, GET /models/aliases, GET /storage,
 //            GET /analytics/savings, GET /analytics/cost, GET /providers, GET /providers/profiles,
 //            POST /playground/run
+//   muse (CONST-19; CONST-20 builds its panels against these): GET /on_deck, GET /premiere,
+//            GET /gaps, GET /api/channels, GET /api/channels/{id}/lineup, GET /guide,
+//            GET /api/graph/{taste-clusters,watch-history,group-dynamics}, GET /art/{kind}/{id}
+//            (binary passthrough -- see crate::constellation::proxy's module doc; this generic
+//            request<T>() path is JSON-typed, art responses should be fetched by <img src> URL,
+//            not through this method)
 
 function baseUrl(): string {
   // Same-origin only — never a hardcoded host/port. This is the one place in the app
