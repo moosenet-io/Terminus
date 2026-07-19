@@ -35,7 +35,8 @@ this is the contract the httpAdapter already assumes:
 | POST | `/api/auth/login` (body `{username,password}`) | same as above |
 | POST | `/api/auth/logout` | 200/204 |
 | GET | `/api/health` | `{ system: 'harmony'\|'chord'\|'lumina'\|'terminus'; available: boolean; detail?: string }[]` |
-| GET | `/api/terminus/config` | `{ modules: { name: string; enabled: boolean; version?: string }[]; workerCount: number }` |
+| GET | `/api/terminus/config` | `{ modules: { name: string; enabled: boolean; version?: string; toolCount?: number; tools?: string[] }[]; workerCount: number }` (`toolCount`/`tools` are CONST-28, additive — a pre-CONST-28 backend response is still valid, just without them) |
+| GET | `/api/terminus/activity?limit=` | `{ entries: { ts: string; method: string; path: string; principal: string; system: SystemId }[] }` (CONST-26's endpoint; CONST-28's client degrades to `{available:false}` on 404/501/error — see Terminus module panels below) |
 | any | `/api/{system}/{path}` | generic passthrough used by `client.request<T>()` for panel-specific reads that don't have a typed method yet |
 
 #### The `prefs` seam (CONST-16)
@@ -231,12 +232,45 @@ after its bounded reconnect budget was exhausted -- same polling fallback applie
 is required for this item; a future item MAY use the code to distinguish "no backend
 configured" from "backend flapped" in the UI if that becomes useful.
 
+## Terminus module panels (CONST-28)
+
+The `terminus` module's own self-observability surface, built on the CONST-04 `Config` panel's
+pattern, in `src/panels/terminus/`:
+
+- **`FleetPanel.tsx`** ("Fleet") — a health board with one card per fleet system
+  (harmony/chord/lumina/terminus). Each card polls `client.health.list()` on its own 5s
+  interval and accumulates into a **client-held ring buffer of the last 120 polls per system**
+  (`fleetRingBuffer.ts` — pure, framework-free, unit-tested in `fleetRingBuffer.test.ts` via
+  `npm run test`: capacity cap, transition/flap detection, uptime ratio). Each card renders an
+  uptime `Sparkline` (`src/viz/Sparkline.tsx`, the viz kit's minimal chrome-free line chart) plus
+  the mesh/broker summary (module/worker counts) from `/api/terminus/config`. Edge cases: an
+  empty broker-routes table reads as "0 (in-process)", not an error; a failing health poll
+  leaves every system's ring buffer at its last-known content (see the pure function's own
+  "leaves a system untouched" test) rather than clearing it.
+- **`ToolsPanel.tsx`** ("Tools") — the full tool catalog, grouped by module prefix, from the
+  CONST-28-extended `/api/terminus/config` (`modules[].tools`/`toolCount`). Searchable (text +
+  per-module filter chips) and paged (`DataTable`, 25 rows/page) — the mock fixture pads `plane`
+  out to 34 tools specifically to exercise paging. A `TODO(CONST-25 seam)` comment marks where
+  the command-palette entity-source registration wires in once that item lands (CONST-25 isn't
+  on this branch's base yet — deliberately not imported ahead of time so this typechecks/builds
+  clean against `origin/main`).
+- **`ActivityPanel.tsx`** ("Activity") — a paged, filterable (system/method/principal) view
+  against the §8 contract `GET /api/terminus/activity?limit=` → `{entries:[{ts,method,path,
+  principal,system}]}`. That Rust endpoint is CONST-26's, landing in parallel with this item —
+  this panel only *consumes* `client.terminus.activity()` (`aggregationClient.ts`), which
+  already degrades to `{available:false}` on a 404/501/any failure; the panel then renders an
+  explanatory "not live yet" empty state instead of an error.
+
+All three are registered under the existing `terminus` module in `registerPanels.ts` alongside
+the pre-existing `Config` panel (`terminus.fleet` / `terminus.tools` / `terminus.activity`).
+
 ## Dev / build
 
 ```sh
 npm install
 npm run dev        # vite dev server, :5174, proxies /api and /ws to :3100 by default
 npm run typecheck  # tsc --noEmit
+npm run test       # vitest run — currently: fleetRingBuffer.test.ts (CONST-28)
 npm run build       # tsc --noEmit && vite build -> dist/
 ```
 

@@ -33,11 +33,37 @@ export interface TerminusModuleInfo {
   name: string;
   enabled: boolean;
   version?: string;
+  /** CONST-28: additive — count of registered tool names under this module's
+   *  `{module}_` prefix. Absent only if talking to a pre-CONST-28 backend. */
+  toolCount?: number;
+  /** CONST-28: additive — the module's full, sorted tool names. */
+  tools?: string[];
 }
 
 export interface TerminusConfigSummary {
   modules: TerminusModuleInfo[];
   workerCount: number;
+}
+
+// ── Activity (CONST-28, against the CONST-26 contract) ──────────────────────
+// `GET /api/terminus/activity?limit=` is owned/implemented by CONST-26, landing in parallel —
+// this client only codifies the §8 contract shape and degrades gracefully (available:false)
+// when the endpoint isn't live yet (404/501) or the module hasn't landed on a given backend.
+
+export interface TerminusActivityEntry {
+  ts: string;
+  method: string;
+  path: string;
+  principal: string;
+  system: SystemId;
+}
+
+export interface TerminusActivityResponse {
+  entries: TerminusActivityEntry[];
+  /** false when the request 404/501'd (endpoint not live) or otherwise failed — ActivityPanel
+   *  renders a "not live yet" empty state rather than an error in that case. */
+  available: boolean;
+  detail?: string;
 }
 
 /**
@@ -56,6 +82,9 @@ export interface AggregationClient {
   };
   terminus: {
     configSummary(): Promise<TerminusConfigSummary>;
+    /** CONST-28: per §8 contract `GET /api/terminus/activity?limit=`. Never throws — see
+     *  `TerminusActivityResponse.available` for the degrade signal. */
+    activity(limit?: number): Promise<TerminusActivityResponse>;
   };
   /**
    * Generic escape hatch for panel-specific reads that don't yet have a typed method above.
@@ -155,16 +184,57 @@ const MOCK_HEALTH: HealthStatus[] = [
   { system: 'terminus', available: true, detail: 'mock: reachable' },
 ];
 
+/** Mock tool catalog per module — `plane` is padded out to 34 tools so ToolsPanel's DataTable
+ *  paging has something real to page through (§ edge case: huge tool catalog). */
+function toolNames(prefix: string, actions: string[]): string[] {
+  return actions.map(a => `${prefix}_${a}`).sort();
+}
+
+const PLANE_ACTIONS = [
+  'create_work_item', 'update_work_item', 'delete_work_item', 'list_work_items', 'get_work_item',
+  'create_comment', 'list_comments', 'update_comment', 'delete_comment', 'list_states',
+  'create_state', 'update_state', 'list_projects', 'get_project', 'create_project',
+  'update_project', 'list_cycles', 'create_cycle', 'update_cycle', 'list_modules',
+  'create_module', 'update_module', 'list_labels', 'create_label', 'assign_label',
+  'list_members', 'add_member', 'remove_member', 'search_work_items', 'bulk_update',
+  'list_attachments', 'add_attachment', 'get_activity', 'export_project',
+];
+
+const MOCK_TERMINUS_MODULE_TOOLS: Record<string, string[]> = {
+  gitea: toolNames('gitea', ['list_repos', 'create_repo', 'get_file', 'create_pr', 'merge_pr']),
+  plane: toolNames('plane', PLANE_ACTIONS),
+  github: toolNames('github', ['list_repos', 'create_issue', 'list_issues']),
+  nexus: [],
+  commute: [],
+};
+
 const MOCK_TERMINUS_CONFIG: TerminusConfigSummary = {
   modules: [
-    { name: 'gitea', enabled: true, version: '0.4.0' },
-    { name: 'plane', enabled: true, version: '0.4.0' },
-    { name: 'github', enabled: true, version: '0.4.0' },
-    { name: 'nexus', enabled: false },
-    { name: 'commute', enabled: false },
+    { name: 'gitea', enabled: true, version: '0.4.0', toolCount: MOCK_TERMINUS_MODULE_TOOLS.gitea.length, tools: MOCK_TERMINUS_MODULE_TOOLS.gitea },
+    { name: 'plane', enabled: true, version: '0.4.0', toolCount: MOCK_TERMINUS_MODULE_TOOLS.plane.length, tools: MOCK_TERMINUS_MODULE_TOOLS.plane },
+    { name: 'github', enabled: true, version: '0.4.0', toolCount: MOCK_TERMINUS_MODULE_TOOLS.github.length, tools: MOCK_TERMINUS_MODULE_TOOLS.github },
+    { name: 'nexus', enabled: false, toolCount: 0, tools: [] },
+    { name: 'commute', enabled: false, toolCount: 0, tools: [] },
   ],
   workerCount: 3,
 };
+
+// CONST-28: mock activity fixture, per the §8 contract shape. Real data lands with CONST-26's
+// endpoint — this is a canned fixture only, timestamps relative to "now" so it always reads
+// as recent in a live demo.
+const MOCK_ACTIVITY_ENTRIES: TerminusActivityEntry[] = Array.from({ length: 24 }, (_, i) => {
+  const systems: SystemId[] = ['harmony', 'chord', 'lumina', 'terminus'];
+  const methods = ['GET', 'POST', 'PUT'];
+  const paths = ['/status', '/agents/activity', '/models', '/config', '/health', '/mode'];
+  const principals = ['operator', 'mock-user', 'ci-bot'];
+  return {
+    ts: new Date(Date.now() - i * 45_000).toISOString(),
+    method: methods[i % methods.length],
+    path: paths[i % paths.length],
+    principal: principals[i % principals.length],
+    system: systems[i % systems.length],
+  };
+});
 
 // ── Mock data for the ported harmony-web / Chord surface (CONST-04) ──────────
 // Keyed by `${system} ${METHOD} ${pathname}` (query string stripped, dynamic
@@ -328,6 +398,9 @@ const mockAdapter: AggregationClient = {
     async configSummary() {
       return delay(MOCK_TERMINUS_CONFIG);
     },
+    async activity(limit = 50) {
+      return delay({ entries: MOCK_ACTIVITY_ENTRIES.slice(0, limit), available: true });
+    },
   },
   async request<T>(system: SystemId, path: string, init?: RequestInit): Promise<T> {
     return mockRequest<T>(system, path, init);
@@ -344,7 +417,9 @@ const mockAdapter: AggregationClient = {
 //   POST /api/auth/login         -> AuthMeResponse   (body: { username, password })
 //   POST /api/auth/logout        -> 204/200
 //   GET  /api/health             -> HealthStatus[]
-//   GET  /api/terminus/config    -> TerminusConfigSummary
+//   GET  /api/terminus/config    -> TerminusConfigSummary (CONST-28: modules[].toolCount/tools additive)
+//   GET  /api/terminus/activity?limit= -> { entries: TerminusActivityEntry[] } (CONST-26; CONST-28
+//                                    degrades to {available:false} on 404/501/error)
 //   *    /api/{system}/{path}    -> generic passthrough for `request<T>()`
 //   WS   /ws                     -> same-origin, session-cookie-authenticated event stream
 //                                    (engine/ralph-loop/log/tree_update events); see ws.connect()
@@ -432,6 +507,19 @@ const httpAdapter: AggregationClient = {
   terminus: {
     async configSummary() {
       return httpJson<TerminusConfigSummary>('/api/terminus/config');
+    },
+    async activity(limit = 50) {
+      // CONST-28/§8: degrade gracefully (available:false) rather than throw — this endpoint
+      // is owned by CONST-26 and may not be live on a given deploy yet (404/501), or any other
+      // transient failure. ActivityPanel renders an explanatory empty state on `!available`.
+      try {
+        const res = await httpJson<{ entries: TerminusActivityEntry[] }>(
+          `/api/terminus/activity?limit=${encodeURIComponent(String(limit))}`,
+        );
+        return { entries: res.entries, available: true };
+      } catch (e) {
+        return { entries: [], available: false, detail: e instanceof Error ? e.message : 'unavailable' };
+      }
     },
   },
   async request<T>(system: SystemId, path: string, init?: RequestInit): Promise<T> {
