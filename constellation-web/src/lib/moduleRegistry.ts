@@ -129,6 +129,15 @@ export function getPanelsByModule(moduleId: ModuleId): PanelDescriptor[] {
   return getAvailablePanels().filter(p => p.system === moduleId);
 }
 
+/** Is a panel with this id both registered AND available right now? (LGUI-06 review fix:
+ *  panels must check this dynamically before redirecting to another panel's route — a
+ *  redirect to an unregistered route just bounces off the shell's wildcard Route, which is
+ *  worse than not redirecting at all. Self-activates the moment the target panel registers,
+ *  with zero change at the call site.) */
+export function isPanelAvailable(id: string): boolean {
+  return getAvailablePanels().some(p => p.id === id);
+}
+
 /** Test/dev helper — not used by the shell at runtime. */
 export function clearRegistry(): void {
   registry.clear();

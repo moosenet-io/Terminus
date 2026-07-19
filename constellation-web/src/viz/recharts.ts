@@ -20,8 +20,6 @@ export {
   Area,
   BarChart,
   Bar,
-  AreaChart,
-  Area,
   ScatterChart,
   Scatter,
   ZAxis,

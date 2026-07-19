@@ -1,14 +1,19 @@
 // LGUI-06: the Lumina module's Overview panel (`lumina.overview`, route `/lumina`, §3.1 of
 // LUMINA-GUI-SPEC.md). Identity card, metric tile row, three charts (memory growth / routing
-// mix / top tools), a log-line activity feed, first-run redirect to the onboarding wizard, and
-// a whole-panel degraded card when lumina's `/api/health` entry is down. All data comes from
-// `useLumina` (composes the §7 endpoints through the aggregation client, see that hook's doc).
+// mix / top tools), a log-line activity feed, first-run redirect (or fallback hero card) for
+// onboarding, and a whole-panel degraded card when lumina's `/api/health` entry is down. All
+// data comes from `useLumina` (composes the §7 endpoints through the aggregation client, see
+// that hook's doc).
 //
-// First-run (§2 of the spec): when `status.onboarding_complete === false`, this panel redirects
-// to `/lumina/setup` (LGUI-12's wizard route). LGUI-12 hasn't landed yet in this build, so that
-// route isn't registered -- App.tsx's wildcard Route (`<Route path="*" element={<Navigate to
-// "/overview" .../>} />`) is what actually handles the miss today; once LGUI-12 registers
-// `/lumina/setup` this Navigate starts landing on the real wizard with zero change here.
+// First-run (§2 of the spec): when `status.onboarding_complete === false`, the intent is to
+// land the admin on `/lumina/setup` (LGUI-12's wizard route). LGUI-12 hasn't merged in this
+// build, so that route ISN'T registered yet. Review fix: redirecting unconditionally to an
+// unregistered route just bounces off App.tsx's wildcard Route back to `/overview`, making the
+// "NEW · needs setup" card permanently unreachable dead code. Instead this panel checks the
+// panel registry dynamically (`isPanelAvailable('lumina.setup')`, moduleRegistry.ts) and only
+// redirects when the target route actually exists; otherwise it renders the needs-setup hero
+// card here on `/lumina` (reachable now) with its "Begin setup" action disabled + annotated.
+// The redirect self-activates the moment LGUI-12 registers `lumina.setup` -- zero code change.
 import { useMemo } from 'react';
 import { Navigate } from 'react-router-dom';
 import { Card } from '../../components/Card';
@@ -32,6 +37,7 @@ import {
   ResponsiveContainer,
 } from '../../viz/recharts';
 import { useLumina } from '../../hooks/useLumina';
+import { isPanelAvailable } from '../../lib/moduleRegistry';
 import { IdentityCard } from './IdentityCard';
 import type { LuminaAnalyticsEvent } from '../../types/lumina';
 
@@ -65,7 +71,7 @@ const CARD_STYLE: React.CSSProperties = {
 };
 
 export function OverviewPanel() {
-  const { status, engram, analytics, events, health, degraded, refetchAll } = useLumina();
+  const { status, engram, analyticsRouting, analyticsTools, events, health, degraded, refetchAll } = useLumina();
 
   // Table-view twin state (§4.4: "every chart has a table view") -- one per chart, hooks called
   // unconditionally ahead of the degraded/first-run early returns below.
@@ -73,16 +79,27 @@ export function OverviewPanel() {
   const routingMixTable = useTableView();
   const topToolsTable = useTableView();
 
-  const memoryGrowthData = engram.data?.growth_30d ?? [];
-  const dailyData = analytics.data?.daily ?? [];
+  // Chart-window review fix: `growth_30d` is OPTIONAL (types/lumina.ts) -- `undefined` (field
+  // absent, backend doesn't expose the series) and `[]` (field present, no history yet) are
+  // different states and get different ChartEmpty copy below. `.slice(-30)` is a defensive
+  // window clamp so this chart never renders more than its declared 30-day window even if a
+  // future backend over-sends (mirrors the same discipline applied to the 14d/7d analytics
+  // fetches, which are windowed server-side via the `days=` query param instead).
+  const memoryGrowthSeriesMissing = engram.data != null && engram.data.growth_30d === undefined;
+  const memoryGrowthData = (engram.data?.growth_30d ?? []).slice(-30);
+  // Routing mix (§3.1: 14-day) reads analyticsRouting (fetched with days=14) -- NOT
+  // analyticsTools (days=7). `.slice(-14)` defensively clamps in case a backend sends more.
+  const dailyData = (analyticsRouting.data?.daily ?? []).slice(-14);
+  // Top tools (§3.1: 7-day) reads analyticsTools (fetched with days=7) -- NOT analyticsRouting.
   const topToolsData = useMemo(
-    () => [...(analytics.data?.top_tools ?? [])].sort((a, b) => b.count - a.count).slice(0, 8),
-    [analytics.data],
+    () => [...(analyticsTools.data?.top_tools ?? [])].sort((a, b) => b.count - a.count).slice(0, 8),
+    [analyticsTools.data],
   );
   const eventList = events.data?.events ?? [];
 
   // Tile-row derived values -- degrade honestly (em-dash) rather than fabricating a number when
   // a section is still loading/errored or the source has nothing to derive it from (§3.1).
+  // "Today" reads the routing-mix (14d) window's last entry -- same window the chart shows.
   const memoriesDelta = memoryGrowthData.length >= 2
     ? memoryGrowthData[memoryGrowthData.length - 1].total - memoryGrowthData[memoryGrowthData.length - 2].total
     : null;
@@ -127,14 +144,18 @@ export function OverviewPanel() {
     );
   }
 
-  // First-run (§2): redirect the module landing to the onboarding wizard. Only fires once
-  // status has actually loaded (never on the still-null first render, matching App.tsx's
-  // healthLoaded convention -- an unloaded/unknown state must never look like "needs setup").
-  if (!status.loading && status.data && status.data.onboarding_complete === false) {
+  // First-run (§2): redirect the module landing to the onboarding wizard -- but ONLY when
+  // `lumina.setup` is actually registered (review fix). Checked dynamically against the panel
+  // registry rather than assumed; while LGUI-12 is unmerged this is always false, so control
+  // falls through to the needsSetup hero card below instead of an unconditional Navigate that
+  // just bounces off the shell's wildcard Route back to `/overview`. Only fires once status has
+  // actually loaded (never on the still-null first render, matching App.tsx's healthLoaded
+  // convention -- an unloaded/unknown state must never look like "needs setup").
+  const needsSetup = !status.loading && status.data?.onboarding_complete === false;
+  const setupRouteRegistered = isPanelAvailable('lumina.setup');
+  if (needsSetup && setupRouteRegistered) {
     return <Navigate to="/lumina/setup" replace />;
   }
-
-  const needsSetup = !status.loading && status.data?.onboarding_complete === false;
 
   return (
     <div style={{ padding: 'var(--space-5)', overflow: 'auto', flex: 1, display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
@@ -145,29 +166,55 @@ export function OverviewPanel() {
           (spec: "if not, add a clearly-marked seam note; do not refactor the canvas here"). The
           Badge/Button below is this panel's own equivalent, rendered on ITS OWN route (/lumina)
           rather than on the /overview canvas card. When ModuleCard grows a state-injection seam,
-          wire `needsSetup` through OverviewPanel(canvas) -> ModuleCard here instead. */}
+          wire `needsSetup` through OverviewPanel(canvas) -> ModuleCard here instead.
+          Review fix: this card is now REACHABLE whenever needsSetup is true (previously dead
+          code behind an unconditional redirect to an unregistered route). Its "Begin setup"
+          action is disabled + annotated until LGUI-12 actually registers `lumina.setup` --
+          `setupRouteRegistered` flips this the moment that lands, no code change needed. */}
       {needsSetup && (
         <Card variant="content" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 'var(--space-3)' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
             <Badge tone="amber" glowDot>NEW · needs setup</Badge>
             <span style={{ color: 'var(--text-muted)', fontSize: 'var(--fs-sm)' }}>
               This assistant hasn't completed onboarding yet.
+              {!setupRouteRegistered && ' The setup wizard lands with LGUI-12.'}
             </span>
           </div>
-          <a
-            href="/lumina/setup"
-            style={{
-              background: 'var(--grad-accent)',
-              color: 'var(--accent-on)',
-              borderRadius: 'var(--radius-md)',
-              padding: 'var(--space-1) var(--space-3)',
-              fontSize: 'var(--fs-sm)',
-              textDecoration: 'none',
-              fontWeight: 600,
-            }}
-          >
-            Begin setup
-          </a>
+          {setupRouteRegistered ? (
+            <a
+              href="/lumina/setup"
+              style={{
+                background: 'var(--grad-accent)',
+                color: 'var(--accent-on)',
+                borderRadius: 'var(--radius-md)',
+                padding: 'var(--space-1) var(--space-3)',
+                fontSize: 'var(--fs-sm)',
+                textDecoration: 'none',
+                fontWeight: 600,
+              }}
+            >
+              Begin setup
+            </a>
+          ) : (
+            <button
+              type="button"
+              disabled
+              title="setup wizard lands with LGUI-12"
+              aria-disabled="true"
+              style={{
+                background: 'var(--surface-2, var(--border))',
+                color: 'var(--text-muted)',
+                border: 'none',
+                borderRadius: 'var(--radius-md)',
+                padding: 'var(--space-1) var(--space-3)',
+                fontSize: 'var(--fs-sm)',
+                fontWeight: 600,
+                cursor: 'not-allowed',
+              }}
+            >
+              Begin setup
+            </button>
+          )}
         </Card>
       )}
 
@@ -179,8 +226,8 @@ export function OverviewPanel() {
           label="Memories"
           value={engram.loading ? '…' : engram.data ? `${engram.data.total}${memoriesDelta != null ? ` (+${memoriesDelta}/24h)` : ''}` : '—'}
         />
-        <MetricCard label="Turns today" value={analytics.loading ? '…' : todayTurns != null ? String(todayTurns) : '—'} />
-        <MetricCard label="Deep-turn share" value={analytics.loading ? '…' : deepShare} />
+        <MetricCard label="Turns today" value={analyticsRouting.loading ? '…' : todayTurns != null ? String(todayTurns) : '—'} />
+        <MetricCard label="Deep-turn share" value={analyticsRouting.loading ? '…' : deepShare} />
         <MetricCard label="Active users" value="—" />
         <MetricCard label="Reminders" value="—" />
       </div>
@@ -194,8 +241,8 @@ export function OverviewPanel() {
           loading={engram.loading}
           isRefetching={engram.isRefetching}
           empty={!engram.loading && memoryGrowthData.length === 0}
-          emptyMessage="No memories yet"
-          emptyHint="they'll appear as you talk"
+          emptyMessage={memoryGrowthSeriesMissing ? 'backend does not expose a memory-inserts series yet' : 'No memories yet'}
+          emptyHint={memoryGrowthSeriesMissing ? undefined : "they'll appear as you talk"}
           controls={<TableViewControls view={memoryGrowthTable.view} onChange={memoryGrowthTable.setView} />}
         >
           <TableView
@@ -230,9 +277,9 @@ export function OverviewPanel() {
           title="Routing mix"
           subtitle="14 days · fast vs deep"
           height={220}
-          loading={analytics.loading}
-          isRefetching={analytics.isRefetching}
-          empty={!analytics.loading && dailyData.length === 0}
+          loading={analyticsRouting.loading}
+          isRefetching={analyticsRouting.isRefetching}
+          empty={!analyticsRouting.loading && dailyData.length === 0}
           emptyMessage="No routing activity yet"
           controls={<TableViewControls view={routingMixTable.view} onChange={routingMixTable.setView} />}
           footer={
@@ -271,9 +318,9 @@ export function OverviewPanel() {
           title="Top tools"
           subtitle="7 days"
           height={220}
-          loading={analytics.loading}
-          isRefetching={analytics.isRefetching}
-          empty={!analytics.loading && topToolsData.length === 0}
+          loading={analyticsTools.loading}
+          isRefetching={analyticsTools.isRefetching}
+          empty={!analyticsTools.loading && topToolsData.length === 0}
           emptyMessage="No tool calls yet"
           controls={<TableViewControls view={topToolsTable.view} onChange={topToolsTable.setView} />}
         >

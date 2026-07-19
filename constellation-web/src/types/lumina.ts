@@ -22,9 +22,11 @@ export interface LuminaStatus {
   onboarding_complete: boolean;
   dynamic_prompt: boolean;
   chord_configured: boolean;
-  /** Not in the §7 sketch verbatim but needed for the Identity Card's display name — the
-   *  admin's chosen assistant name from the naming ceremony. Optional: an instance that hasn't
-   *  completed onboarding has no name yet, so the card falls back to "Lumina". */
+  /** OPTIONAL additive extension — not in the §7 sketch; absence is normal. Would carry the
+   *  admin's chosen assistant name from the naming ceremony for the Identity Card's display
+   *  name. The REQUIRED type surface is §7 exactly (`version, uptime_secs, state, channels,
+   *  onboarding_complete, dynamic_prompt, chord_configured`); `IdentityCard` degrades honestly
+   *  to "Lumina" + version/uptime when this is absent — see IdentityCard.tsx. */
   display_name?: string;
 }
 
@@ -68,7 +70,11 @@ export interface LuminaEngramStats {
   db_bytes: number;
   embedded_pct: number;
   store_ok: boolean;
-  /** Not in the §7 sketch verbatim — a 30-day daily total-count series for the memory-growth
-   *  area chart (§3.1/§8). Degrades honestly (empty array) when the store can't derive history. */
+  /** OPTIONAL additive extension — not in the §7 sketch; absence is normal. Would carry a
+   *  30-day daily total-count series for the memory-growth area chart (§3.1/§8). The REQUIRED
+   *  type surface is §7 exactly (`total, by_type, by_sensitivity, db_bytes, embedded_pct,
+   *  store_ok`). `undefined` (field absent — backend doesn't expose this series) and `[]`
+   *  (field present, store has no history yet) are DIFFERENT states and must render different
+   *  ChartEmpty copy — see OverviewPanel.tsx's memory-growth chart. */
   growth_30d?: { date: string; total: number }[];
 }

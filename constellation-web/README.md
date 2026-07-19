@@ -264,22 +264,40 @@ role viewer — `src/panels/lumina/OverviewPanel.tsx`), is the assistant dashboa
   when a section hasn't loaded or the source can't derive it.
 - **Charts** (viz kit only, per CONST-GUI-SPEC.md §4) — memory growth (30-day area, single
   series), routing mix (14-day stacked bars, fast vs deep), top tools (7-day horizontal bar).
+  Each chart is backed by its OWN windowed request/slice (review fix) — routing mix and top
+  tools are two SEPARATE `useLumina` sections (`analyticsRouting` at `days=14`, `analyticsTools`
+  at `days=7`), not one over-fetched request rendered into two differently-labeled charts,
+  because the backend's `top_tools` ranking is itself scoped by the `days` param it's asked
+  for. Memory growth's `growth_30d` is defensively `.slice(-30)`'d client-side.
 - **Activity feed** — last 20 events in the log-line voice (`[ok] tool searxng_search 412ms`).
-- **First-run**: when `GET /api/lumina/status` reports `onboarding_complete: false`, the panel
-  redirects to `/lumina/setup` (LGUI-12's wizard route — not registered yet in this build, so
-  App.tsx's catch-all Route currently sends that miss to `/overview`; once LGUI-12 lands its
-  route this Navigate starts landing on the real wizard with no change here).
+- **First-run**: when `GET /api/lumina/status` reports `onboarding_complete: false`, the intent
+  is `/lumina/setup` (LGUI-12's wizard route). Review fix: the panel checks the registry
+  dynamically (`isPanelAvailable('lumina.setup')`, `src/lib/moduleRegistry.ts`) before
+  redirecting — while LGUI-12 is unmerged that check is false, so instead of an unconditional
+  `Navigate` (which just bounces off App.tsx's wildcard Route back to `/overview`, making the
+  "NEW · needs setup" card permanently unreachable), the panel renders that hero card here on
+  `/lumina` with its "Begin setup" action disabled and annotated "setup wizard lands with
+  LGUI-12". The moment LGUI-12 registers `lumina.setup`, the redirect self-activates with zero
+  code change on either side.
 - **Degraded/empty states**: a whole-panel degraded card when `/api/health`'s `lumina` entry
   reports `available: false`; per-section `ChartEmpty` (e.g. "No memories yet — they'll appear
-  as you talk") when a store has no data yet. Each of the four backing reads (status, engram
-  stats, analytics summary, analytics events) is its own independent `useLumina` section state,
-  so a slow/failing one degrades on its own without blanking the rest of the panel.
+  as you talk") when a store has no data yet. `status.display_name` and `engram.growth_30d` are
+  OPTIONAL additive extensions not in the §7 sketch (`src/types/lumina.ts`) — `undefined`
+  (field absent) and empty-but-present are distinct states with distinct copy: the identity
+  card falls back to "Lumina" + version/uptime with no name, and the memory-growth chart shows
+  "backend does not expose a memory-inserts series yet" (field absent) vs "No memories yet"
+  (field present, store just has no history). Each of the five backing reads (status, engram
+  stats, analytics-routing, analytics-tools, analytics events) is its own independent
+  `useLumina` section state, so a slow/failing one degrades on its own without blanking the
+  rest of the panel.
 
 Data comes from `src/hooks/useLumina.ts`, which polls the §7 endpoints
-(`/api/lumina/status`, `/api/lumina/engram/stats`, `/api/lumina/analytics?view=summary|events`)
-through `client.request('lumina', ...)` — see `src/types/lumina.ts` for the exact response
-shapes and `lib/aggregationClient.ts`'s mock data for the canned fixtures those hooks build
-against with no backend present.
+(`/api/lumina/status`, `/api/lumina/engram/stats`,
+`/api/lumina/analytics?view=summary&days=14`, `/api/lumina/analytics?view=summary&days=7`,
+`/api/lumina/analytics?view=events&days=7`) through `client.request('lumina', ...)` — see
+`src/types/lumina.ts` for the exact response shapes (REQUIRED surface is §7 exactly, plus the
+two documented OPTIONAL additive fields above) and `lib/aggregationClient.ts`'s mock data for
+the canned fixtures those hooks build against with no backend present.
 
 **Seam note**: the shared Overview card canvas (`panels/overview/ModuleCard.tsx`) has a
 4-state `CardState` union (`online`/`idle`/`error`/`disabled`) with no per-module state-

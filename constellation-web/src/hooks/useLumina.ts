@@ -1,9 +1,17 @@
 // LGUI-06 (§3.1): data hook for the Lumina Overview panel. Mirrors useHarmonyStatus's shape
 // (poll + refetch, no props threaded — the panel is mounted standalone by the registry-driven
-// router, panels/registerPanels.ts) but composes FOUR independent §7 reads (status, engram
-// stats, analytics summary, analytics events) as separate section states, per this item's
-// "per-section degradation boundaries" requirement: a slow/failing engram store must not blank
-// the identity card or activity feed, and vice versa. Each section degrades honestly on its own.
+// router, panels/registerPanels.ts) but composes FIVE independent §7 reads (status, engram
+// stats, analytics-for-routing-mix, analytics-for-top-tools, analytics events) as separate
+// section states, per this item's "per-section degradation boundaries" requirement: a slow/
+// failing engram store must not blank the identity card or activity feed, and vice versa.
+// Each section degrades honestly on its own.
+//
+// Review fix (chart-window finding): §3.1/§8 gives each chart its OWN window — memory growth
+// is 30d (engram's own `growth_30d`, unrelated to this endpoint), routing mix is 14d, top
+// tools is 7d. The `/analytics?view=summary&days=` endpoint's `days` param scopes BOTH `daily`
+// and `top_tools` server-side, so one fetch can't correctly serve two different windows —
+// this hook issues two separate requests (`days=14` for routing mix, `days=7` for top tools)
+// rather than over-fetching once and rendering an unsliced 30d/14d series into a 14d/7d chart.
 import { useCallback, useEffect, useState } from 'react';
 import { getAggregationClient } from '../lib/aggregationClient';
 import type { HealthStatus } from '../lib/aggregationClient';
@@ -61,7 +69,15 @@ function useLuminaSection<T>(path: string): SectionState<T> & { refetch: () => v
 export interface UseLuminaResult {
   status: SectionState<LuminaStatus>;
   engram: SectionState<LuminaEngramStats>;
-  analytics: SectionState<LuminaAnalyticsSummary>;
+  /** `?days=14` — backs the Routing mix chart (§3.1: "14-day stacked bars fast vs deep") and
+   *  the tile row's "turns today"/"deep-turn share" (today = last entry of this window). Do
+   *  NOT source the routing-mix chart from `analyticsTools` below — that's a different window. */
+  analyticsRouting: SectionState<LuminaAnalyticsSummary>;
+  /** `?days=7` — backs the Top tools chart (§3.1: "Top tools (7d)"). Kept as its own request
+   *  (not a client-side slice of the 14-day fetch) because `top_tools` is server-ranked over
+   *  whatever `days` window was requested — a 14d-ranked top_tools list is not the same data
+   *  as a genuine 7d one. */
+  analyticsTools: SectionState<LuminaAnalyticsSummary>;
   events: SectionState<{ events: LuminaAnalyticsEvent[] }>;
   /** Whole-panel degraded state (§3.1: "whole-panel degraded card when the lumina health entry
    *  is down") -- reads the shared `/api/health` snapshot rather than opening its own poll,
@@ -77,7 +93,11 @@ export interface UseLuminaResult {
 export function useLumina(): UseLuminaResult {
   const status = useLuminaSection<LuminaStatus>('/status');
   const engram = useLuminaSection<LuminaEngramStats>('/engram/stats');
-  const analytics = useLuminaSection<LuminaAnalyticsSummary>('/analytics?view=summary&days=30');
+  // Two separate windowed requests -- see analyticsRouting/analyticsTools doc comments above
+  // (chart-window review finding: a single over-fetched request can't correctly back two
+  // charts with two different windows).
+  const analyticsRouting = useLuminaSection<LuminaAnalyticsSummary>('/analytics?view=summary&days=14');
+  const analyticsTools = useLuminaSection<LuminaAnalyticsSummary>('/analytics?view=summary&days=7');
   const events = useLuminaSection<{ events: LuminaAnalyticsEvent[] }>('/analytics?view=events&days=7');
 
   const [health, setHealth] = useState<SectionState<HealthStatus[]>>(() => initialSection<HealthStatus[]>());
@@ -108,11 +128,12 @@ export function useLumina(): UseLuminaResult {
   const refetchAll = useCallback(() => {
     status.refetch();
     engram.refetch();
-    analytics.refetch();
+    analyticsRouting.refetch();
+    analyticsTools.refetch();
     events.refetch();
     fetchHealth(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status.refetch, engram.refetch, analytics.refetch, events.refetch, fetchHealth]);
+  }, [status.refetch, engram.refetch, analyticsRouting.refetch, analyticsTools.refetch, events.refetch, fetchHealth]);
 
-  return { status, engram, analytics, events, health, degraded, refetchAll };
+  return { status, engram, analyticsRouting, analyticsTools, events, health, degraded, refetchAll };
 }
