@@ -20,7 +20,7 @@
 pub mod merge_queue;
 pub mod types;
 
-pub use merge_queue::{MergeQueue, MergeQueueConfig, MergeQueueError};
+pub use merge_queue::{MergeQueue, MergeQueueConfig, MergeQueueError, MergeQueueSnapshot};
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -1900,6 +1900,136 @@ impl MergePr {
     }
 }
 
+// GMQ-05: gitea_merge_queue_status (read-only)
+pub struct MergeQueueStatus {
+    client: GiteaClient,
+}
+
+#[async_trait]
+impl RustTool for MergeQueueStatus {
+    fn name(&self) -> &str { "gitea_merge_queue_status" }
+
+    fn description(&self) -> &str {
+        "Read-only inspection of the merge queue (GMQ-01..05, see docs) for a base branch: \
+         the current lock holder + its remaining TTL, the wait-queue depth + next ticket, and \
+         the last-merge time + the next-allowed-merge time under the configured min-delay \
+         spacing rule. NEVER mutates the queue. If the merge queue is not active (no Redis \
+         configured, or GITEA_MERGE_QUEUE_ENABLED=false), reports that plainly instead of an \
+         error. An unknown/never-used key reports an empty queue (no lock, zero wait depth), \
+         not an error."
+    }
+
+    fn parameters(&self) -> Value {
+        with_identity_param(json!({
+            "type": "object",
+            "properties": {
+                "repo":  { "type": "string", "description": "Repository name" },
+                "base":  { "type": "string", "description": "Base branch (e.g. main) whose merge-queue key to inspect" },
+                "owner": { "type": "string", "description": "Owner override (optional)" },
+                "min_delay_secs": { "type": "integer", "description": "Override GITEA_MERGE_QUEUE_MIN_DELAY_SECS for computing next_allowed_merge_ms (optional)" }
+            },
+            "required": ["repo", "base"]
+        }))
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl MergeQueueStatus {
+    /// The actual `gitea_merge_queue_status` logic, parameterized on an
+    /// already-resolved `queue` so tests can exercise the queue-active branch
+    /// with a `fake` (`crate::gitea::merge_queue::fake`) in-memory
+    /// `MergeQueue` — no live Redis, no dependency on the process-global
+    /// `MergeQueue::from_env()` singleton. The real `RustTool::execute`/
+    /// `execute_structured` (via `run`) resolve `queue` via `from_env()`.
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
+        self.run_with_queue(args, MergeQueue::from_env()).await
+    }
+
+    async fn run_with_queue(
+        &self,
+        args: Value,
+        queue: Option<MergeQueue>,
+    ) -> Result<(String, Value), ToolError> {
+        let client = self.client.resolve_identity(&args)?;
+        let repo = args["repo"].as_str()
+            .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
+        let base = args["base"].as_str()
+            .ok_or_else(|| ToolError::InvalidArgument("'base' is required".to_string()))?;
+        let owner = client.resolve_owner(args["owner"].as_str());
+        let min_delay_secs = args["min_delay_secs"]
+            .as_u64()
+            .unwrap_or_else(crate::config::gitea_merge_queue_min_delay_secs);
+
+        let key = format!("{owner}/{repo}/{base}");
+
+        // Same "queue not active" collapse `MergePr` uses: no `MergeQueue` to
+        // query (Redis unconfigured) or the operator kill switch is off both
+        // mean there is nothing to report — a clear, non-error status, not a
+        // failure.
+        let cfg = MergeQueueConfig::from_env();
+        let active_queue = queue.filter(|_| cfg.enabled);
+
+        let Some(queue) = active_queue else {
+            let text = format!(
+                "Merge queue not active for {key} (no Redis configured, or the merge queue is \
+                 disabled) — merges to this base run unqueued."
+            );
+            let structured = json!({
+                "key": key,
+                "active": false,
+            });
+            return Ok((text, structured));
+        };
+
+        let snapshot = queue.status(&key, min_delay_secs).await?;
+
+        let mut text = format!("Merge queue status for {key}:\n");
+        if snapshot.locked {
+            text.push_str(&format!(
+                "  Lock: HELD (fence {}, {} ms remaining)\n",
+                snapshot.lock_fence.as_deref().unwrap_or("?"),
+                snapshot.lock_ttl_ms.unwrap_or(0),
+            ));
+        } else {
+            text.push_str("  Lock: free\n");
+        }
+        text.push_str(&format!(
+            "  Wait queue: {} waiting{}\n",
+            snapshot.wait_depth,
+            snapshot
+                .next_ticket
+                .map(|t| format!(" (next ticket: {t})"))
+                .unwrap_or_default(),
+        ));
+        match (snapshot.last_merge_ms, snapshot.next_allowed_merge_ms) {
+            (Some(last), Some(next_allowed)) => {
+                text.push_str(&format!(
+                    "  Last merge: {last} (epoch ms); next allowed merge: {next_allowed} (epoch \
+                     ms, min_delay_secs={})\n",
+                    snapshot.min_delay_secs,
+                ));
+            }
+            _ => {
+                text.push_str("  No prior merge recorded for this key — next merge may proceed immediately.\n");
+            }
+        }
+
+        let structured = json!({
+            "key": key,
+            "active": true,
+            "snapshot": snapshot,
+        });
+        Ok((text, structured))
+    }
+}
+
 // 10. list_branches
 // ─── gitea_list_directory ─────────────────────────────────────────────────────
 
@@ -3044,6 +3174,7 @@ pub fn register(registry: &mut ToolRegistry) {
             let _ = registry.register(Box::new(ListPrs { client: client.clone() }));
             let _ = registry.register(Box::new(CreatePr { client: client.clone() }));
             let _ = registry.register(Box::new(MergePr { client: client.clone() }));
+            let _ = registry.register(Box::new(MergeQueueStatus { client: client.clone() }));
             let _ = registry.register(Box::new(ListBranches { client: client.clone() }));
             let _ = registry.register(Box::new(CargoPublish { client: client.clone() }));
             let _ = registry.register(Box::new(CargoYank { client: client.clone() }));
@@ -3078,6 +3209,7 @@ pub fn register(registry: &mut ToolRegistry) {
             stub!("gitea_list_prs", "List Gitea pull requests (not configured)");
             stub!("gitea_create_pr", "Create Gitea pull request (not configured)");
             stub!("gitea_merge_pr", "Merge Gitea pull request (not configured)");
+            stub!("gitea_merge_queue_status", "Inspect the Gitea merge queue (not configured)");
             stub!("gitea_list_branches", "List Gitea branches (not configured)");
             stub!("gitea_cargo_publish", "Publish a .crate to the Gitea Cargo registry (not configured)");
             stub!("gitea_cargo_yank", "Yank/unyank a crate version in the Gitea Cargo registry (not configured)");
@@ -5633,5 +5765,114 @@ mod tests {
             format!("{err}").to_lowercase().contains("not mergeable"),
             "error must clearly state the PR is not mergeable: {err}"
         );
+    }
+
+    // ── GMQ-05: gitea_merge_queue_status ────────────────────────────────
+
+    #[tokio::test]
+    async fn merge_queue_status_reports_not_active_when_queue_is_none() {
+        let server = MockServer::start();
+        let tool = MergeQueueStatus { client: mock_client(&server) };
+
+        let (text, structured) = tool
+            .run_with_queue(serde_json::json!({"repo": "myrepo", "base": "main"}), None)
+            .await
+            .expect("status must succeed even with no queue configured");
+
+        assert!(text.to_lowercase().contains("not active"));
+        assert_eq!(structured["active"], serde_json::json!(false));
+        assert_eq!(structured["key"], serde_json::json!("testorg/myrepo/main"));
+    }
+
+    #[tokio::test]
+    async fn merge_queue_status_reflects_a_held_lock() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let cfg = MergeQueueConfig {
+            enabled: true,
+            lock_ttl_secs: 60,
+            max_wait_secs: 5,
+            wait_ttl_secs: 65,
+        };
+
+        // Acquire the slot directly on the store (stands in for an in-flight
+        // merge holding it) so the status read observes a real held lock.
+        let held_queue = queue_over(Arc::clone(&store));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let s = Arc::clone(&started);
+        let holder = tokio::spawn(async move {
+            held_queue
+                .with_merge_slot("testorg/myrepo/main", 0, &cfg, || async move {
+                    s.notify_one();
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                })
+                .await
+        });
+        started.notified().await;
+
+        let server = MockServer::start();
+        let tool = MergeQueueStatus { client: mock_client(&server) };
+        let query_queue = queue_over(Arc::clone(&store));
+        let (text, structured) = tool
+            .run_with_queue(
+                serde_json::json!({"repo": "myrepo", "base": "main"}),
+                Some(query_queue),
+            )
+            .await
+            .expect("status read must succeed");
+
+        assert!(text.contains("HELD"), "text summary must report the held lock: {text}");
+        assert_eq!(structured["active"], serde_json::json!(true));
+        assert_eq!(structured["snapshot"]["locked"], serde_json::json!(true));
+        assert!(structured["snapshot"]["lock_fence"].is_string());
+        assert!(structured["snapshot"]["lock_ttl_ms"].as_i64().unwrap() > 0);
+
+        holder.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn merge_queue_status_reports_an_unknown_key_as_an_empty_queue_not_an_error() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let queue = queue_over(store);
+
+        let server = MockServer::start();
+        let tool = MergeQueueStatus { client: mock_client(&server) };
+        let (text, structured) = tool
+            .run_with_queue(
+                serde_json::json!({"repo": "myrepo", "base": "never-touched"}),
+                Some(queue),
+            )
+            .await
+            .expect("an unknown key must be a successful, empty status read");
+
+        assert!(text.contains("Lock: free"));
+        assert!(text.contains("0 waiting"));
+        assert_eq!(structured["snapshot"]["locked"], serde_json::json!(false));
+        assert_eq!(structured["snapshot"]["wait_depth"], serde_json::json!(0));
+        assert!(structured["snapshot"]["last_merge_ms"].is_null());
+    }
+
+    #[tokio::test]
+    async fn merge_queue_status_reports_next_allowed_merge_after_a_recorded_merge() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let queue = queue_over(Arc::clone(&store));
+        queue.record_merge("testorg/myrepo/main", 5).await;
+
+        let server = MockServer::start();
+        let tool = MergeQueueStatus { client: mock_client(&server) };
+        let (text, structured) = tool
+            .run_with_queue(
+                serde_json::json!({"repo": "myrepo", "base": "main", "min_delay_secs": 5}),
+                Some(queue),
+            )
+            .await
+            .expect("status read must succeed");
+
+        assert!(text.contains("Last merge:"));
+        assert!(text.contains("next allowed merge"));
+        let last = structured["snapshot"]["last_merge_ms"].as_i64().expect("last_merge_ms set");
+        let next_allowed = structured["snapshot"]["next_allowed_merge_ms"]
+            .as_i64()
+            .expect("next_allowed_merge_ms set");
+        assert_eq!(next_allowed, last + 5_000);
     }
 }

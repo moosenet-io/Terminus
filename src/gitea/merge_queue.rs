@@ -47,6 +47,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::Serialize;
 use tracing::warn;
 
 use crate::redis::{Namespace, RedisBackend};
@@ -284,6 +285,61 @@ pub(crate) trait MergeLockStore: Send + Sync {
     /// never a bare hardcoded value — so the marker can never expire while a
     /// same-key spacing wait could still legitimately depend on it.
     async fn record_merge_ms(&self, key: &str, now_ms: i64, ttl_secs: u64) -> Result<(), ()>;
+
+    /// GMQ-05 read-only status: the current lock holder's fence token plus its
+    /// remaining TTL in milliseconds (`PTTL queue:merge:lock:{key}`), or `None`
+    /// if the key is not currently locked (including "expired" — an expired
+    /// lock reads as free, same as [`Self::try_acquire`]). Pure read — NEVER
+    /// mutates the lock, the wait ordering, or anything else.
+    async fn lock_status(&self, key: &str) -> Result<Option<(String, i64)>, ()>;
+
+    /// GMQ-05 read-only status: the current wait-queue depth (`ZCARD
+    /// queue:merge:wait:{key}`) and the ticket currently at the front (`ZRANGE
+    /// queue:merge:wait:{key} 0 0`), or `(0, None)` if nothing is waiting.
+    /// Pure read — never prunes expired tickets or otherwise mutates the wait
+    /// ordering (unlike [`Self::try_acquire`], which prunes as a side effect
+    /// of acquiring).
+    async fn wait_status(&self, key: &str) -> Result<(u64, Option<u64>), ()>;
+}
+
+/// GMQ-05: a point-in-time, read-only snapshot of a merge-queue key's state —
+/// never mutates the lock, the wait ordering, or the last-merge marker. See
+/// [`MergeQueue::status`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MergeQueueSnapshot {
+    /// The queue key this snapshot describes (`{owner}/{repo}/{base}`
+    /// convention, or a caller's `queue_key` override).
+    pub key: String,
+    /// Whether the critical section is currently held (an expired lock reads
+    /// as free/`false`, same as [`MergeLockStore::try_acquire`]).
+    pub locked: bool,
+    /// The current holder's fence token, if locked. This is an opaque
+    /// per-acquire identifier (a random UUID), not a caller/agent identity —
+    /// the store never records who requested the lock, only the fence used to
+    /// guard its release.
+    pub lock_fence: Option<String>,
+    /// Remaining lease time in milliseconds, if locked (`PTTL` on the lock
+    /// key).
+    pub lock_ttl_ms: Option<i64>,
+    /// Number of waiters currently queued for this key (`ZCARD` on the wait
+    /// ZSET).
+    pub wait_depth: u64,
+    /// The ticket number currently at the front of the wait ordering (next to
+    /// be served), if any are waiting.
+    pub next_ticket: Option<u64>,
+    /// Epoch-ms timestamp of the last successful merge to this key, or `None`
+    /// if this key has never recorded one.
+    pub last_merge_ms: Option<i64>,
+    /// The epoch-ms timestamp at (or after) which the GMQ-03 spacing rule
+    /// allows the next merge to this key to proceed without waiting —
+    /// `last_merge_ms + min_delay_secs * 1000`. `None` when there is no
+    /// recorded last merge (nothing to space against — a merge could proceed
+    /// immediately).
+    pub next_allowed_merge_ms: Option<i64>,
+    /// The `min_delay_secs` this snapshot's `next_allowed_merge_ms` was
+    /// derived from (the caller's override, or
+    /// `GITEA_MERGE_QUEUE_MIN_DELAY_SECS`'s default).
+    pub min_delay_secs: u64,
 }
 
 /// GMQ-03 review finding: derive the `queue:merge:last:{key}` marker's TTL
@@ -553,6 +609,61 @@ impl MergeLockStore for RedisMergeLockStore {
             .await?;
         Ok(())
     }
+
+    async fn lock_status(&self, key: &str) -> Result<Option<(String, i64)>, ()> {
+        // Plain GET/PTTL — read-only, no Lua script, no mutation. A tiny
+        // (GET-then-PTTL) window exists where the lock could be released or
+        // expire between the two calls; that's acceptable for a best-effort
+        // observability snapshot (not a decision the merge path depends on).
+        let lockk = lock_key(key);
+        let fence: Option<String> = self
+            .backend
+            .with_conn(Namespace::Queue, |mut conn| async move {
+                ::redis::cmd("GET").arg(&lockk).query_async::<_, Option<String>>(&mut conn).await
+            })
+            .await?;
+        let Some(fence) = fence else {
+            return Ok(None);
+        };
+        let lockk = lock_key(key);
+        let ttl_ms: i64 = self
+            .backend
+            .with_conn(Namespace::Queue, |mut conn| async move {
+                ::redis::cmd("PTTL").arg(&lockk).query_async::<_, i64>(&mut conn).await
+            })
+            .await?;
+        // PTTL returns -2 (key gone, e.g. expired between the GET and here)
+        // or -1 (no TTL set, shouldn't happen for this key) — both read as
+        // "not meaningfully locked" rather than a negative TTL.
+        if ttl_ms < 0 {
+            return Ok(None);
+        }
+        Ok(Some((fence, ttl_ms)))
+    }
+
+    async fn wait_status(&self, key: &str) -> Result<(u64, Option<u64>), ()> {
+        let waitk = wait_key(key);
+        let waitk_front = waitk.clone();
+        let depth: i64 = self
+            .backend
+            .with_conn(Namespace::Queue, |mut conn| async move {
+                ::redis::cmd("ZCARD").arg(&waitk).query_async::<_, i64>(&mut conn).await
+            })
+            .await?;
+        let front: Vec<String> = self
+            .backend
+            .with_conn(Namespace::Queue, |mut conn| async move {
+                ::redis::cmd("ZRANGE")
+                    .arg(&waitk_front)
+                    .arg(0)
+                    .arg(0)
+                    .query_async::<_, Vec<String>>(&mut conn)
+                    .await
+            })
+            .await?;
+        let next_ticket = front.into_iter().next().and_then(|s| s.parse::<u64>().ok());
+        Ok((depth.max(0) as u64, next_ticket))
+    }
 }
 
 /// Best-effort "log once" guard so a Redis outage during `with_merge_slot`
@@ -778,6 +889,68 @@ impl MergeQueue {
         if self.store.record_merge_ms(key, now_ms(), ttl_secs).await.is_err() {
             log_degrade_once("recording last-merge time failed (Redis unreachable)");
         }
+    }
+
+    /// GMQ-05: read-only inspection of `key`'s current merge-queue state — the
+    /// lock holder + its remaining TTL, the wait-queue depth + next ticket,
+    /// and the last-merge time + the GMQ-03 spacing rule's next-allowed-merge
+    /// time. NEVER mutates the lock, the wait ordering, or the last-merge
+    /// marker — this is purely observational (unlike [`Self::with_merge_slot`]
+    /// / [`Self::enforce_spacing`] / [`Self::record_merge`], which drive the
+    /// actual merge path).
+    ///
+    /// An unknown/never-used `key` returns an empty-but-`Ok` snapshot (no
+    /// lock, zero wait depth, no last-merge record) — the same "nothing here
+    /// yet" posture every other read in this module takes, never an error.
+    /// A mid-op store error (Redis unreachable) degrades the SAME way: logs
+    /// once and folds into the empty snapshot for whichever field couldn't be
+    /// read, rather than failing the whole call — this is a status view, not
+    /// a decision the merge path depends on.
+    ///
+    /// `min_delay_secs` is the spacing window this snapshot's
+    /// `next_allowed_merge_ms` is computed against — pass the same value a
+    /// caller would pass to [`Self::enforce_spacing`] (a per-call override, or
+    /// `GITEA_MERGE_QUEUE_MIN_DELAY_SECS`'s default).
+    pub async fn status(
+        &self,
+        key: &str,
+        min_delay_secs: u64,
+    ) -> Result<MergeQueueSnapshot, MergeQueueError> {
+        let lock = match self.store.lock_status(key).await {
+            Ok(v) => v,
+            Err(()) => {
+                log_degrade_once("status: lock lookup failed (Redis unreachable)");
+                None
+            }
+        };
+        let (wait_depth, next_ticket) = match self.store.wait_status(key).await {
+            Ok(v) => v,
+            Err(()) => {
+                log_degrade_once("status: wait lookup failed (Redis unreachable)");
+                (0, None)
+            }
+        };
+        let last_merge_ms = match self.store.last_merge_ms(key).await {
+            Ok(v) => v,
+            Err(()) => {
+                log_degrade_once("status: last-merge lookup failed (Redis unreachable)");
+                None
+            }
+        };
+        let next_allowed_merge_ms =
+            last_merge_ms.map(|last| last.saturating_add((min_delay_secs as i64).saturating_mul(1000)));
+
+        Ok(MergeQueueSnapshot {
+            key: key.to_string(),
+            locked: lock.is_some(),
+            lock_fence: lock.as_ref().map(|(fence, _)| fence.clone()),
+            lock_ttl_ms: lock.map(|(_, ttl)| ttl),
+            wait_depth,
+            next_ticket,
+            last_merge_ms,
+            next_allowed_merge_ms,
+            min_delay_secs,
+        })
     }
 }
 
@@ -1013,6 +1186,37 @@ pub(crate) mod fake {
             s.last.insert(key.to_string(), now_ms);
             s.last_ttl_secs.insert(key.to_string(), ttl_secs);
             Ok(())
+        }
+
+        async fn lock_status(&self, key: &str) -> Result<Option<(String, i64)>, ()> {
+            let s = self.state.lock().unwrap();
+            if s.down {
+                return Err(());
+            }
+            match s.lock.get(key) {
+                Some((fence, exp)) => {
+                    let now = StdInstant::now();
+                    if *exp > now {
+                        Ok(Some((fence.clone(), exp.duration_since(now).as_millis() as i64)))
+                    } else {
+                        // Expired lock reads as free — same posture as
+                        // `try_acquire`'s own held-check.
+                        Ok(None)
+                    }
+                }
+                None => Ok(None),
+            }
+        }
+
+        async fn wait_status(&self, key: &str) -> Result<(u64, Option<u64>), ()> {
+            let s = self.state.lock().unwrap();
+            if s.down {
+                return Err(());
+            }
+            match s.wait.get(key) {
+                Some(bucket) => Ok((bucket.len() as u64, bucket.first().map(|(t, _, _)| *t))),
+                None => Ok((0, None)),
+            }
         }
     }
 
@@ -1481,6 +1685,12 @@ mod tests {
         async fn record_merge_ms(&self, key: &str, now_ms: i64, ttl_secs: u64) -> Result<(), ()> {
             self.inner.record_merge_ms(key, now_ms, ttl_secs).await
         }
+        async fn lock_status(&self, key: &str) -> Result<Option<(String, i64)>, ()> {
+            self.inner.lock_status(key).await
+        }
+        async fn wait_status(&self, key: &str) -> Result<(u64, Option<u64>), ()> {
+            self.inner.wait_status(key).await
+        }
     }
 
     #[tokio::test]
@@ -1708,5 +1918,118 @@ mod tests {
     fn mergeable_true_proceeds() {
         let pr = pr_fixture(false, Some(true));
         assert_eq!(evaluate_merge_guard(&pr), MergeGuardDecision::Proceed);
+    }
+
+    // ── GMQ-05: read-only status ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn status_reflects_a_held_lock_with_holder_and_positive_ttl() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let q = queue_over(Arc::clone(&store));
+        let cfg = fast_cfg();
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let s = Arc::clone(&started);
+        let holder = tokio::spawn(async move {
+            q.with_merge_slot("owner/repo/main", 0, &cfg, || async move {
+                s.notify_one();
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            })
+            .await
+        });
+        started.notified().await;
+
+        let q_status = queue_over(Arc::clone(&store));
+        let snap = q_status.status("owner/repo/main", 0).await.unwrap();
+        assert!(snap.locked, "a held lock must report locked == true");
+        assert!(snap.lock_fence.is_some(), "a held lock must report a holder fence");
+        let ttl = snap.lock_ttl_ms.expect("a held lock must report a TTL");
+        assert!(ttl > 0 && ttl <= 60_000, "TTL must be positive and within the configured lease, got {ttl}");
+
+        holder.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_reports_no_lock_for_a_free_key() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let q = queue_over(store);
+
+        let snap = q.status("owner/repo/never-locked", 0).await.unwrap();
+        assert!(!snap.locked);
+        assert!(snap.lock_fence.is_none());
+        assert!(snap.lock_ttl_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn status_reports_wait_depth_and_next_ticket() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let cfg = fast_cfg();
+
+        // Ticket 1 acquires and holds forever (stands in for a slow in-flight
+        // merge); tickets 2 and 3 pile up behind it in the wait ordering.
+        let t1 = store.enqueue("owner/repo/main", 0, Duration::from_secs(60)).await.unwrap();
+        let acquired = store
+            .try_acquire("owner/repo/main", t1, "fence-1", Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(matches!(acquired, AcquireAttempt::Acquired(_)));
+
+        let t2 = store.enqueue("owner/repo/main", 0, Duration::from_secs(60)).await.unwrap();
+        let t3 = store.enqueue("owner/repo/main", 0, Duration::from_secs(60)).await.unwrap();
+
+        let q = queue_over(Arc::clone(&store));
+        let snap = q.status("owner/repo/main", 0).await.unwrap();
+        assert_eq!(snap.wait_depth, 2, "two waiters (t2, t3) must be reflected in wait_depth");
+        assert_eq!(snap.next_ticket, Some(t2), "the front of the wait ordering must be t2");
+        let _ = (cfg, t3);
+    }
+
+    #[tokio::test]
+    async fn status_reports_next_allowed_merge_after_a_recorded_merge() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let q = queue_over(Arc::clone(&store));
+
+        let before = now_ms();
+        q.record_merge("owner/repo/main", 5).await;
+
+        let snap = q.status("owner/repo/main", 5).await.unwrap();
+        let last = snap.last_merge_ms.expect("a recorded merge must be reflected");
+        assert!(last >= before, "last_merge_ms must be at/after the recorded time");
+
+        let next_allowed = snap.next_allowed_merge_ms.expect("next_allowed_merge_ms must be set");
+        assert_eq!(
+            next_allowed,
+            last + 5_000,
+            "next_allowed_merge_ms must be last_merge_ms + min_delay_secs*1000"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_for_an_unknown_key_is_an_empty_ok_snapshot_not_an_error() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let q = queue_over(store);
+
+        let snap = q.status("owner/repo/totally-unused-base", 30).await.unwrap();
+        assert!(!snap.locked);
+        assert!(snap.lock_fence.is_none());
+        assert!(snap.lock_ttl_ms.is_none());
+        assert_eq!(snap.wait_depth, 0);
+        assert!(snap.next_ticket.is_none());
+        assert!(snap.last_merge_ms.is_none());
+        assert!(snap.next_allowed_merge_ms.is_none());
+        assert_eq!(snap.min_delay_secs, 30);
+    }
+
+    #[tokio::test]
+    async fn status_degrades_to_an_empty_snapshot_when_the_store_is_unreachable() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        store.set_down(true);
+        let q = queue_over(store);
+
+        let snap = q.status("owner/repo/main", 10).await.unwrap();
+        assert!(!snap.locked);
+        assert_eq!(snap.wait_depth, 0);
+        assert!(snap.last_merge_ms.is_none());
+        assert!(snap.next_allowed_merge_ms.is_none());
     }
 }
