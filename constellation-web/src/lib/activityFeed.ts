@@ -42,7 +42,10 @@ function line(level: FeedLevel, body: string): string {
 export function activityEntryToFeedItem(entry: ActivityEntry): FeedItem {
   const who = entry.principal ? ` — ${entry.principal}` : '';
   return {
-    id: `activity:${entry.ts}:${entry.method}:${entry.path}`,
+    // Dedupe id includes system + principal too (review fix): two operators or two
+    // systems hitting the same method+path in the same timestamp second are DISTINCT
+    // events and must not collapse into one feed item.
+    id: `activity:${entry.ts}:${entry.system}:${entry.principal ?? ''}:${entry.method}:${entry.path}`,
     ts: entry.ts,
     source: 'activity',
     level: 'ok',

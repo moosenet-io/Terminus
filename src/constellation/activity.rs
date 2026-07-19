@@ -71,15 +71,30 @@ pub async fn handle_activity(State(_state): State<Arc<McpServerState>>, RawQuery
     let limit = parse_limit(query.as_deref()).map(|n| n.min(cap)).unwrap_or(cap).max(1);
 
     let path = config::constellation_audit_log_path();
-    let entries = match tail_lines(&path, limit) {
-        Ok(lines) => parse_entries(lines, limit),
-        Err(e) => {
-            // Missing file, permission error, or any other I/O failure
-            // reading the audit log — degrade to an empty feed rather than
-            // failing the request (see this module's doc: "never an error
-            // status").
-            tracing::warn!("constellation: activity tail-read failed for {path}: {e}");
-            Vec::new()
+    // Corrupt-line resilience (review fix): a fixed `limit + 1` over-read could
+    // return FEWER than `limit` valid entries when several corrupt/truncated
+    // lines cluster at the tail even though older valid entries exist. Expand
+    // the line budget (doubling) until we have `limit` parsed-valid entries,
+    // the whole file has been consumed, or the hard budget cap is hit — still
+    // never an unbounded read.
+    let mut want = limit.saturating_add(1);
+    let entries = loop {
+        match tail_lines(&path, want) {
+            Ok((lines, reached_start)) => {
+                let entries = parse_entries(lines, limit);
+                if entries.len() >= limit || reached_start || want >= MAX_TAIL_LINE_BUDGET {
+                    break entries;
+                }
+                want = want.saturating_mul(2).min(MAX_TAIL_LINE_BUDGET);
+            }
+            Err(e) => {
+                // Missing file, permission error, or any other I/O failure
+                // reading the audit log — degrade to an empty feed rather than
+                // failing the request (see this module's doc: "never an error
+                // status").
+                tracing::warn!("constellation: activity tail-read failed for {path}: {e}");
+                break Vec::new();
+            }
         }
     };
 
@@ -106,32 +121,34 @@ fn parse_limit(query: Option<&str>) -> Option<usize> {
     None
 }
 
-/// Tail-read up to `limit + 1` non-empty lines from the end of the file at
+/// Tail-read up to `want` non-empty lines from the end of the file at
 /// `path`, without ever reading the whole file into memory (see this
 /// module's doc). Returns them in FILE ORDER (oldest of the collected batch
-/// first, most recent last) — the extra `+1` cushion means a caller that
-/// asks for `limit` entries still gets `limit` valid ones even if the very
-/// last physical line happens to be corrupt/truncated (e.g. a write in
-/// progress when this read raced it).
+/// first, most recent last) plus a flag: `true` when the returned lines
+/// represent the ENTIRE file (so a caller expanding its budget for
+/// corrupt-line resilience knows there is nothing older left to read).
 ///
 /// A missing file is reported as a plain `Ok(vec![])` (not an `Err`) — see
 /// [`handle_activity`]'s "missing file → empty 200" contract; this only
 /// returns `Err` for a genuine I/O failure on a file that DOES exist (e.g.
 /// a permission error), which the caller also degrades to an empty feed.
-fn tail_lines(path: &str, limit: usize) -> std::io::Result<Vec<String>> {
+/// Hard upper bound on the tail-read line budget (corrupt-line expansion can
+/// grow the budget toward this, never past it) — keeps the worst case bounded
+/// even against a pathologically corrupt log.
+const MAX_TAIL_LINE_BUDGET: usize = 65_536;
+
+fn tail_lines(path: &str, want: usize) -> std::io::Result<(Vec<String>, bool)> {
     let mut file = match std::fs::File::open(path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), true)),
         Err(e) => return Err(e),
     };
 
     let len = file.metadata()?.len();
     if len == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), true));
     }
 
-    // The "+1" cushion described in this function's doc.
-    let want = limit.saturating_add(1);
     let mut collected_newlines = 0usize;
     let mut pos = len;
     let mut buf: Vec<u8> = Vec::new();
@@ -147,16 +164,21 @@ fn tail_lines(path: &str, limit: usize) -> std::io::Result<Vec<String>> {
         buf = block;
     }
 
+    let reached_start = pos == 0;
     let text = String::from_utf8_lossy(&buf);
     let mut lines: Vec<String> = text.lines().map(str::to_string).filter(|l| !l.trim().is_empty()).collect();
     // We may have collected MORE than `want` complete lines once `pos` hit
     // 0 (the last block read can straddle well past the first newline we
-    // actually needed) — keep only the tail end.
+    // actually needed) — keep only the tail end. `reached_start` is only
+    // meaningful as "the WHOLE file is represented" when nothing was
+    // trimmed, so report false once we drop from the front.
+    let mut whole_file = reached_start;
     if lines.len() > want {
         let drop = lines.len() - want;
         lines.drain(0..drop);
+        whole_file = false;
     }
-    Ok(lines)
+    Ok((lines, whole_file))
 }
 
 /// Parse each raw JSONL line as an [`audit::ConstellationAuditEntry`],
@@ -453,7 +475,8 @@ mod tests {
         let total_len = std::fs::metadata(&path).unwrap().len();
         assert!(total_len > TAIL_BLOCK_SIZE * 4, "test fixture must span multiple tail blocks");
 
-        let tail = tail_lines(&path, 3).unwrap();
+        let (tail, whole_file) = tail_lines(&path, 3).unwrap();
+        assert!(!whole_file, "a 3-line tail of a 5000-line file must not claim to cover the whole file");
         // At least the requested count came back, and the LAST physical
         // line in the file is present at the end (file-order, most-recent-
         // last), proving this actually tailed rather than reading from the
@@ -466,6 +489,39 @@ mod tests {
         // ~5000 lines instead.
         assert!(tail.len() < 20, "tail_lines returned far more lines than a limit=3 request needs");
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Review fix: several corrupt lines clustered at the tail must not
+    /// shrink the returned page — the handler expands its line budget until
+    /// enough VALID entries are found (bounded), so older valid entries
+    /// before the corrupt cluster still surface.
+    #[tokio::test]
+    #[serial]
+    async fn corrupt_cluster_at_tail_still_yields_full_page() {
+        let path = std::env::temp_dir().join(format!("const26-corrupt-cluster-{}.jsonl", std::process::id()));
+        let path_str = path.to_string_lossy().to_string();
+        let mut lines: Vec<String> = (0..6)
+            .map(|i| format!(
+                r#"{{"timestamp":"2026-07-19T00:00:0{i}Z","method":"POST","path":"/api/x{i}","principal":"op","system":"terminus","body_summary":"s"}}"#
+            ))
+            .collect();
+        // Four corrupt/truncated lines AT THE TAIL — more than any fixed +1 cushion.
+        for _ in 0..4 {
+            lines.push("{\"truncated".to_string());
+        }
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        std::env::set_var("CONSTELLATION_AUDIT_LOG_PATH", &path_str);
+
+        let router = router_with_signing_key();
+        let (status, body) = get_activity(router, "/api/terminus/activity?limit=5").await;
+        assert_eq!(status, StatusCode::OK);
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 5, "expansion must recover 5 valid entries past the corrupt cluster");
+        assert_eq!(entries.last().unwrap()["path"], "/api/x5");
+
+        std::env::remove_var("CONSTELLATION_AUDIT_LOG_PATH");
+        std::env::remove_var("TERMINUS_JWT_SIGNING_KEY");
         std::fs::remove_file(&path).ok();
     }
 }
