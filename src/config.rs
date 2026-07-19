@@ -1323,6 +1323,20 @@ pub fn gitea_merge_queue_max_wait_secs() -> u64 {
         .unwrap_or(300)
 }
 
+/// TTL (seconds) for the wait ZSET's own `EXPIRE` backstop (`queue:merge:wait:{key}`,
+/// see `crate::gitea::merge_queue::RedisMergeLockStore::enqueue`) — bounds how long an
+/// abandoned waiter (e.g. a caller that crashed between enqueue and its first poll) can
+/// wedge a key. From `GITEA_MERGE_QUEUE_WAIT_TTL_SECS`; defaults to
+/// `gitea_merge_queue_max_wait_secs() + 60`, i.e. derived from the max-wait ceiling so it
+/// always outlives the longest a real waiter can legitimately be polling, rather than a
+/// bare hardcoded literal that could end up shorter than `max_wait_secs`.
+pub fn gitea_merge_queue_wait_ttl_secs() -> u64 {
+    env_nonempty("GITEA_MERGE_QUEUE_WAIT_TTL_SECS")
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &u64| *n > 0)
+        .unwrap_or_else(|| gitea_merge_queue_max_wait_secs().saturating_add(60))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -58,13 +58,29 @@ pub struct MergeQueueConfig {
     /// [`MergeQueue::with_merge_slot`] run `f` immediately, unqueued — the same
     /// as the Redis-absent degrade-open path, but operator-controlled.
     pub enabled: bool,
-    /// Lock TTL (seconds): the crash backstop. Must exceed a realistic merge
-    /// time — a merge that outlives this can have its lock stolen by the next
-    /// waiter while still in flight (see the spec's EDGE CASES).
+    /// Lock TTL (seconds): the crash backstop. **This is a lease, not a hard
+    /// mutex** — `lock_ttl_secs` MUST exceed the maximum realistic
+    /// critical-section (merge) duration. A holder whose critical section
+    /// runs longer than this WILL lose its lease: the lock key expires, the
+    /// next waiter's poll sees it as free, and the two holders' critical
+    /// sections then overlap. The fence token only guarantees
+    /// release-safety (a stale/expired holder can never free a re-taken
+    /// lock out from under its new holder) — it does NOT guarantee mutual
+    /// exclusion beyond the lease window. This is a known, accepted
+    /// tradeoff (see `docs/specs/S120-gitea-merge-queue.md` EDGE CASES); it
+    /// is intentionally NOT addressed with heartbeat/lease-renewal here —
+    /// callers must simply set a TTL comfortably above a merge's realistic
+    /// duration (GMQ-04 does this).
     pub lock_ttl_secs: u64,
     /// Max time (seconds) a waiter polls for its turn before giving up with
     /// [`MergeQueueError::Busy`], never blocking forever.
     pub max_wait_secs: u64,
+    /// TTL (seconds) for the wait ZSET's own `EXPIRE` backstop — bounds how
+    /// long an abandoned waiter (crashed between enqueue and its first poll)
+    /// can wedge a key. Must be bounded by (and is derived from, by default)
+    /// `max_wait_secs` — it must never be shorter than the longest a real,
+    /// still-polling waiter can legitimately outlive it.
+    pub wait_ttl_secs: u64,
 }
 
 impl Default for MergeQueueConfig {
@@ -73,6 +89,7 @@ impl Default for MergeQueueConfig {
             enabled: true,
             lock_ttl_secs: DEFAULT_LOCK_TTL_SECS,
             max_wait_secs: DEFAULT_MAX_WAIT_SECS,
+            wait_ttl_secs: DEFAULT_MAX_WAIT_SECS + 60,
         }
     }
 }
@@ -84,12 +101,14 @@ const POLL_MAX_MS: u64 = 250;
 
 impl MergeQueueConfig {
     /// Read from `GITEA_MERGE_QUEUE_ENABLED` / `GITEA_MERGE_QUEUE_LOCK_TTL_SECS`
-    /// / `GITEA_MERGE_QUEUE_MAX_WAIT_SECS` via `crate::config`'s accessors.
+    /// / `GITEA_MERGE_QUEUE_MAX_WAIT_SECS` / `GITEA_MERGE_QUEUE_WAIT_TTL_SECS`
+    /// via `crate::config`'s accessors.
     pub fn from_env() -> Self {
         Self {
             enabled: crate::config::gitea_merge_queue_enabled(),
             lock_ttl_secs: crate::config::gitea_merge_queue_lock_ttl_secs(),
             max_wait_secs: crate::config::gitea_merge_queue_max_wait_secs(),
+            wait_ttl_secs: crate::config::gitea_merge_queue_wait_ttl_secs(),
         }
     }
 }
@@ -134,7 +153,10 @@ enum AcquireAttempt {
 trait MergeLockStore: Send + Sync {
     /// Take a FIFO ticket for `key` and register it in the wait ordering with
     /// `priority` weighting. Returns the ticket id (unique per `key`).
-    async fn enqueue(&self, key: &str, priority: i64) -> Result<u64, ()>;
+    /// `wait_ttl` bounds the wait ordering's own self-healing `EXPIRE`
+    /// backstop (config-derived by the caller — see
+    /// [`MergeQueueConfig::wait_ttl_secs`] — never a bare hardcoded value).
+    async fn enqueue(&self, key: &str, priority: i64, wait_ttl: Duration) -> Result<u64, ()>;
 
     /// Attempt to acquire the critical section for `key` on behalf of
     /// `ticket`: succeeds only if `ticket` is at the front of the wait
@@ -222,7 +244,7 @@ impl RedisMergeLockStore {
 
 #[async_trait]
 impl MergeLockStore for RedisMergeLockStore {
-    async fn enqueue(&self, key: &str, priority: i64) -> Result<u64, ()> {
+    async fn enqueue(&self, key: &str, priority: i64, wait_ttl: Duration) -> Result<u64, ()> {
         let seqk = seq_key(key);
         let ticket: i64 = self
             .backend
@@ -234,6 +256,7 @@ impl MergeLockStore for RedisMergeLockStore {
         let waitk = wait_key(key);
         let score = ordering_score(ticket, priority);
         let member = ticket.to_string();
+        let wait_ttl_secs = wait_ttl.as_secs().max(1) as i64;
         let _: i64 = self
             .backend
             .with_conn(Namespace::Queue, |mut conn| async move {
@@ -245,11 +268,14 @@ impl MergeLockStore for RedisMergeLockStore {
                     .await?;
                 // Self-healing backstop for an abandoned waiter (e.g. the
                 // caller crashed between enqueue and its first poll): bound the
-                // whole wait ZSET's lifetime generously so it cannot wedge a
-                // key forever. Refreshed on every enqueue.
+                // whole wait ZSET's lifetime by the caller's config-derived
+                // `wait_ttl` (see `MergeQueueConfig::wait_ttl_secs`, default
+                // `max_wait_secs + 60`) so it cannot wedge a key forever, and
+                // so the backstop is never shorter than a legitimately
+                // still-polling waiter. Refreshed on every enqueue.
                 ::redis::cmd("EXPIRE")
                     .arg(&waitk)
-                    .arg(3600i64)
+                    .arg(wait_ttl_secs)
                     .query_async::<_, i64>(&mut conn)
                     .await
             })
@@ -364,6 +390,26 @@ impl MergeQueue {
     /// `{owner}/{repo}/{base}`); `priority` biases ordering like the compiler
     /// queue (higher runs earlier among concurrent waiters, FIFO within a
     /// priority); `cfg` supplies the lock TTL and the max-wait ceiling.
+    ///
+    /// ## Lease invariant (not a hard mutex)
+    /// `cfg.lock_ttl_secs` MUST exceed the maximum realistic duration of `f`
+    /// (the merge). The lock is a **lease**: if `f` runs longer than the
+    /// TTL, the lock key expires mid-flight and the next waiter's poll sees
+    /// it as free, so its critical section can start while THIS `f` is
+    /// still running (see [`MergeQueueConfig::lock_ttl_secs`]). The fence
+    /// token guarantees release-safety only — a stale/expired holder can
+    /// never free a lock a later holder has since acquired — it does NOT
+    /// extend mutual exclusion past the lease window. This is a documented,
+    /// accepted tradeoff (`docs/specs/S120-gitea-merge-queue.md` EDGE
+    /// CASES), not a bug; there is no heartbeat/renewal here, so set the TTL
+    /// comfortably above a merge's realistic duration.
+    ///
+    /// ## Release timing
+    /// On the normal (non-panic) return path, the lock is released
+    /// synchronously (awaited) before this function returns — so by the
+    /// time a caller observes the result, the next same-key waiter can
+    /// already acquire immediately. A panic unwinding through `f` instead
+    /// falls back to the `Drop` guard's best-effort spawned release.
     pub async fn with_merge_slot<F, Fut, T>(
         &self,
         key: &str,
@@ -379,7 +425,8 @@ impl MergeQueue {
             return Ok(f().await);
         }
 
-        let ticket = match self.store.enqueue(key, priority).await {
+        let wait_ttl = Duration::from_secs(cfg.wait_ttl_secs.max(1));
+        let ticket = match self.store.enqueue(key, priority, wait_ttl).await {
             Ok(t) => t,
             Err(()) => {
                 log_degrade_once("enqueue failed (Redis unreachable)");
@@ -396,15 +443,24 @@ impl MergeQueue {
         loop {
             match self.store.try_acquire(key, ticket, &fence, ttl).await {
                 Ok(AcquireAttempt::Acquired(granted_fence)) => {
-                    // Guard releases the lock on every exit path (normal
-                    // return OR a panic unwinding through `f`), so a slot can
-                    // never leak.
-                    let _guard = ReleaseGuard {
+                    // Guard is the PANIC/early-unwind backstop only: if `f`
+                    // panics, unwinding drops `guard` and its `Drop` spawns a
+                    // best-effort release. On the NORMAL path below we release
+                    // synchronously (awaited) BEFORE returning, then disarm
+                    // the guard so `Drop` does not also (redundantly) spawn a
+                    // release — this guarantees the lock is already free by
+                    // the time `with_merge_slot` returns to its caller, so the
+                    // next same-key waiter never sees it held past that point.
+                    let mut guard = ReleaseGuard {
                         store: Arc::clone(&self.store),
                         key: key.to_string(),
                         fence: granted_fence,
+                        armed: true,
                     };
-                    return Ok(f().await);
+                    let out = f().await;
+                    guard.armed = false;
+                    let _ = self.store.release(key, &guard.fence).await;
+                    return Ok(out);
                 }
                 Ok(AcquireAttempt::NotYet) => {}
                 Ok(AcquireAttempt::Unavailable) | Err(()) => {
@@ -428,16 +484,25 @@ impl MergeQueue {
     }
 }
 
-/// Releases the lock on drop (covers early return AND panic-unwind), fenced
-/// so it can only ever free the slot THIS acquire holds.
+/// PANIC/early-unwind backstop only: the normal (non-panic) path in
+/// `with_merge_slot` releases the lock synchronously and sets `armed = false`
+/// before returning, so `Drop` becomes a no-op on that path. If `f` panics,
+/// unwinding drops this guard while still armed, and `Drop` spawns a
+/// best-effort release so the lock can never leak — fenced so it can only
+/// ever free the slot THIS acquire holds.
 struct ReleaseGuard {
     store: Arc<dyn MergeLockStore>,
     key: String,
     fence: String,
+    armed: bool,
 }
 
 impl Drop for ReleaseGuard {
     fn drop(&mut self) {
+        if !self.armed {
+            // Normal path already released synchronously; nothing to do.
+            return;
+        }
         let store = Arc::clone(&self.store);
         let key = self.key.clone();
         let fence = self.fence.clone();
@@ -507,7 +572,7 @@ mod tests {
 
     #[async_trait]
     impl MergeLockStore for InMemoryMergeLockStore {
-        async fn enqueue(&self, key: &str, priority: i64) -> Result<u64, ()> {
+        async fn enqueue(&self, key: &str, priority: i64, _wait_ttl: Duration) -> Result<u64, ()> {
             let mut s = self.state.lock().unwrap();
             if s.down {
                 return Err(());
@@ -582,6 +647,7 @@ mod tests {
             enabled: true,
             lock_ttl_secs: 60,
             max_wait_secs: 5,
+            wait_ttl_secs: 65,
         }
     }
 
@@ -723,7 +789,7 @@ mod tests {
         // Directly exercise the store: acquire under ticket A's fence, then
         // simulate ticket A's lock expiring and ticket B re-acquiring with a
         // NEW fence; ticket A's late release (old fence) must be a no-op.
-        let t1 = store.enqueue("k", 0).await.unwrap();
+        let t1 = store.enqueue("k", 0, Duration::from_secs(60)).await.unwrap();
         let acquired = store
             .try_acquire("k", t1, "fence-A", Duration::from_secs(60))
             .await
@@ -733,7 +799,7 @@ mod tests {
 
         // Force expiry (crash) and let a new ticket take over with a new fence.
         store.expire_lock("k");
-        let t2 = store.enqueue("k", 0).await.unwrap();
+        let t2 = store.enqueue("k", 0, Duration::from_secs(60)).await.unwrap();
         let acquired2 = store
             .try_acquire("k", t2, "fence-B", Duration::from_secs(60))
             .await
@@ -795,6 +861,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normal_return_releases_the_lock_synchronously_before_returning() {
+        // Regression test for the review finding: `with_merge_slot` must NOT
+        // rely on the `Drop`-spawned release for the normal path — the lock
+        // must already be free by the time it returns, so the very next
+        // `with_merge_slot` call on the same key acquires immediately without
+        // waiting on a scheduled-but-not-yet-run spawned task.
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let q = queue_over(Arc::clone(&store));
+        let cfg = fast_cfg();
+
+        q.with_merge_slot("owner/repo/main", 0, &cfg, || async { "first" })
+            .await
+            .unwrap();
+
+        // If release were still only best-effort via `tokio::spawn` in
+        // `Drop`, this next acquire could race the not-yet-run spawned task
+        // and see the lock as still held (falling through to the poll loop
+        // instead of acquiring on the very first attempt). Assert it's
+        // immediate by bounding the whole thing tightly in real time.
+        let began = StdInstant::now();
+        let out = q
+            .with_merge_slot("owner/repo/main", 0, &cfg, || async { "second" })
+            .await
+            .unwrap();
+        assert_eq!(out, "second");
+        assert!(
+            began.elapsed() < Duration::from_millis(20),
+            "the lock must already be free immediately after the prior call returned normally, \
+             took {:?}",
+            began.elapsed()
+        );
+        assert!(!store.is_locked("owner/repo/main"), "lock must be free after a normal return");
+    }
+
+    #[tokio::test]
     async fn max_wait_exceeded_returns_busy() {
         let store = Arc::new(InMemoryMergeLockStore::new());
         let q1 = queue_over(Arc::clone(&store));
@@ -816,6 +917,7 @@ mod tests {
             enabled: true,
             lock_ttl_secs: 60,
             max_wait_secs: 0, // any positive wait exceeds this immediately after the first poll
+            wait_ttl_secs: 60,
         };
         let result = q2
             .with_merge_slot("owner/repo/main", 0, &waiter_cfg, || async { "should-not-run" })
