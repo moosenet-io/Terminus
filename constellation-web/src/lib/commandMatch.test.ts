@@ -91,3 +91,11 @@ export function runCommandMatchTests(): number {
 
   return passed;
 }
+
+// Self-run (review fix): executing this file directly (`npx tsx src/lib/commandMatch.test.ts`)
+// actually runs the suite — previously only the export existed, so a direct run silently did
+// nothing. Importing the module elsewhere still does NOT auto-run (nothing imports this file;
+// it exists to be executed).
+const results = runCommandMatchTests();
+// eslint-disable-next-line no-console
+console.log(`commandMatch self-check: ${results} assertions passed`);

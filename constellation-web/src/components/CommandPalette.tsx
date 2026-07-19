@@ -56,6 +56,13 @@ export function CommandPalette({ open, onClose, panels, onNavigate, role }: Comm
   const restoreFocusRef = useRef<HTMLElement | null>(null);
   const listboxId = 'command-palette-listbox';
 
+/** Row keys carry raw group labels / backend entity ids (spaces, arbitrary chars) — fine as
+ *  React keys, NOT as DOM ids (`aria-activedescendant` IDREFs must be space-free). Encode to
+ *  a safe charset for the DOM layer only (review fix — combobox a11y contract). */
+function domIdFor(key: string): string {
+  return 'cp-' + key.replace(/[^A-Za-z0-9_-]/g, c => '_' + c.charCodeAt(0).toString(16));
+}
+
   useEffect(() => {
     if (open) {
       restoreFocusRef.current =
@@ -199,7 +206,7 @@ export function CommandPalette({ open, onClose, panels, onNavigate, role }: Comm
           aria-expanded="true"
           aria-controls={listboxId}
           aria-autocomplete="list"
-          aria-activedescendant={activeKey ?? undefined}
+          aria-activedescendant={activeKey != null ? domIdFor(activeKey) : undefined}
           value={query}
           onChange={e => setQuery(e.target.value)}
           placeholder="Search panels, actions, sessions, agents, providers, models…"
@@ -226,7 +233,7 @@ export function CommandPalette({ open, onClose, panels, onNavigate, role }: Comm
                 {group.rows.map(row => (
                   <div
                     key={row.key}
-                    id={row.key}
+                    id={domIdFor(row.key)}
                     role="option"
                     aria-selected={row.key === activeKey}
                     aria-disabled={row.degraded || undefined}

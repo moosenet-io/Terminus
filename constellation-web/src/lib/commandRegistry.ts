@@ -51,17 +51,14 @@ export function getAllCommands(): CommandDescriptor[] {
 /**
  * Commands visible to a session with the given role.
  *
- * SEAM: CONST-27 (viewer role: `useAuthRole`/`RoleGate`) is not merged to main as of this item —
- * `useAuth()` on main has no `role` field at all. Rather than invent a role source here, the
- * caller (`CommandPalette.tsx`) passes `null` in that case, and `role: null` resolves to
- * **'operator'** — deliberately mirroring CONST-27's own server-side backward-compat rule ("a
- * claim-absent token resolves to operator", `src/constellation/auth.rs`), so this palette behaves
- * identically to every other pre-CONST-27 control in the app: no visible gating until the role
- * plumbing actually lands, at which point a real `'viewer'` role starts hiding operator-only
- * commands with no change needed here. When CONST-27 merges, replace the `null` passed in by the
- * caller with `useAuthRole()`'s real value — this function's contract does not need to change.
- * Operator-only commands are OMITTED entirely for a viewer session — not returned-but-disabled —
- * see the doc comment on `minRole` above.
+ * CONST-27 is MERGED: the caller (`App.tsx`'s Shell → `CommandPalette`) passes the REAL session
+ * role from `useAuthRole()`, so a `'viewer'` session hides operator-only commands here and now.
+ * `role: null` (unauthenticated edge — the palette normally never renders there) resolves to
+ * **'operator'** purely as the documented backward-compat fallback, deliberately mirroring
+ * CONST-27's own server-side rule ("a claim-absent token resolves to operator",
+ * `src/constellation/auth.rs`); this UI gate stays cosmetic — `enforce_viewer_role_gate`'s 403
+ * is the enforcement. Operator-only commands are OMITTED entirely for a viewer session — not
+ * returned-but-disabled — see the doc comment on `minRole` above.
  */
 export function getAvailableCommands(role: 'operator' | 'viewer' | null): CommandDescriptor[] {
   const effectiveRole = role ?? 'operator';

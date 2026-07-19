@@ -207,12 +207,13 @@ Three sources, always shown in this order, each degrading independently:
    });
    ```
 
-   **Role-gating seam:** CONST-27 (`useAuthRole`/`RoleGate`) is not merged to `main` as of this
-   item — `useAuth()` has no `role` field yet. `App.tsx` passes `role={null}` into
-   `<CommandPalette>`, and `commandRegistry.ts#getAvailableCommands` resolves `null` to
-   `'operator'` (mirroring CONST-27's own "claim-absent token resolves to operator" backward-compat
-   rule), so nothing is hidden until the role plumbing actually lands. Once CONST-27 merges,
-   change that one `role={null}` to `role={useAuthRole()}` — no other code needs to change.
+   **Role gating (CONST-27, merged):** `App.tsx`'s Shell reads the real session role via
+   `useAuthRole()` (from CONST-27's `AuthRoleProvider`) and passes it into `CommandPalette`;
+   `getAvailableCommands(role)` HIDES operator-only commands from a `'viewer'` session. A
+   `null` role (unauthenticated edge — the palette normally never renders there) resolves to
+   `'operator'` purely as the documented backward-compat fallback, mirroring the server's own
+   claim-absent-token rule; the UI gate remains cosmetic — the server's
+   `enforce_viewer_role_gate` 403 is the real enforcement.
 
 3. **Entity search** — `src/lib/entitySearch.ts#searchEntities()`, debounced 150ms, fans the
    query out (`Promise.allSettled`, never `Promise.all`) to a handful of cheap existing list
