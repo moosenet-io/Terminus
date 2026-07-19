@@ -64,7 +64,7 @@ use serde_json::{json, Value};
 use crate::error::ToolError;
 use crate::scribe::inspect::{InspectionWorktree, ModuleBundle};
 
-use super::pii_gate::PiiGateOutcome;
+use super::pii_gate::{sweep_input, PiiGateOutcome};
 use super::prompts::{
     anti_latch_lint, build_guides_prompt, build_repo_identity_prompt, build_subsystem_page_prompt,
     honest_command_lint, parse_file_blocks, parse_repo_identity, symbol_existence_lint, RepoIdentity,
@@ -619,11 +619,17 @@ async fn run_subsystem_pass(
     identity_value: &Value,
     symbol_names: &[String],
 ) -> (Vec<(String, String)>, Vec<PassRecord>) {
-    let kept: Vec<&str> = facts.subsystems.iter().filter(|s| !s.is_misc).map(|s| s.name.as_str()).collect();
+    // Own the names (String, not &str): a borrowed closure param makes the
+    // buffer_unordered future's closure fail the higher-ranked `FnOnce ... for
+    // any lifetime` bound once GraphSource is Send+Sync (the async block would
+    // tie `name`'s lifetime), which makes the calling tool's execute() future
+    // non-Send. Owned names captured by `async move` sidestep it.
+    let kept: Vec<String> =
+        facts.subsystems.iter().filter(|s| !s.is_misc).map(|s| s.name.clone()).collect();
 
     let results: Vec<(String, Result<String, String>)> = stream::iter(kept.into_iter())
         .map(|name| async move {
-            generate_subsystem_page(generator, facts, repo_name, name, identity_value, symbol_names).await
+            generate_subsystem_page(generator, facts, repo_name, &name, identity_value, symbol_names).await
         })
         .buffer_unordered(SUBSYSTEM_PASS_CONCURRENCY)
         .collect()
@@ -682,7 +688,23 @@ async fn run_guides_pass(
     let mut prompt = build_guides_prompt(repo_name, identity_value, &entrypoints_value, &legacy_usage);
 
     for attempt in 0..2 {
-        let raw = match generator.generate(&prompt).await {
+        // PII gate (DOCGEN-02 / S1): unlike Passes 1-2, which build their prompt
+        // from RepoFacts' already-swept SLICES, Pass 3 assembles `legacy_usage`
+        // (verbatim OLD-README install/usage sections) and the entry-point/config
+        // surface directly from RepoFacts' RAW stored fields. Those must not reach
+        // the inference request unswept — sweep the fully-assembled prompt before
+        // every send (idempotent on the redacted retry prompt).
+        let prompt_for_send = match sweep_input(&prompt) {
+            Ok(o) => o.sanitized_content().to_string(),
+            Err(e) => {
+                return (
+                    Vec::new(),
+                    String::new(),
+                    PassRecord::flagged("guides", format!("PII sweep of guides prompt failed: {e}")),
+                )
+            }
+        };
+        let raw = match generator.generate(&prompt_for_send).await {
             Ok(r) => r,
             Err(e) => {
                 if attempt == 0 {

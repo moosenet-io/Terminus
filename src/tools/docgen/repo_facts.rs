@@ -72,7 +72,7 @@ use super::preserve::split_old_sections;
 /// (`SCRIBE_KG_STORE_DIR`) that `crate::scribe::graph::tools`'s `kg_*` MCP
 /// tools read; this trait only exists so the deterministic builder below
 /// never has to spawn a real filesystem-backed store to be unit-tested.
-pub trait GraphSource {
+pub trait GraphSource: Send + Sync {
     /// Load `project_id`'s current graph, or `None` if the project has no
     /// entry in the store (the `kg_grounded: false` case). A store-level I/O
     /// failure is a real `Err`; a project simply never having been indexed

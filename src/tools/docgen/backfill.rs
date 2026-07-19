@@ -576,21 +576,31 @@ verbatim relocation, an operator must inspect this repo's old README before retr
     // trigger door): the substance floor and the generic-diagram lint aren't
     // folded into `place_docs`'s own fail-closed set yet, so this door runs
     // them itself rather than shipping a latch-prone/near-empty landing.
+    //
+    // CRITICAL: these gates apply ONLY to a RICH landing (identity present). A
+    // DEGRADED run (identity == None) uses the deliberately-sparse
+    // `minimal_landing` AND has relocated ALL old content verbatim to legacy
+    // (no-loss holds) -- that is the safe fallback to pre-DGRICH-08 behavior and
+    // MUST still place. Gating it on the substance floor would refuse placement
+    // exactly when the fallback is supposed to guarantee it (codex review
+    // finding: "generation-flagged -> all relocate" must not be blocked).
     let mut gate_failures: Vec<String> = Vec::new();
-    if let Err(e) = check_landing_substance(&landing) {
-        gate_failures.push(e);
-    }
-    if facts.kg_grounded {
-        let generic = subsystem_architecture_mermaid_source(&facts)
-            .map(|s| is_generic_placeholder(s.as_str()))
-            .unwrap_or(true);
-        if generic {
-            gate_failures.push(
-                "architecture diagram lint (DGRICH-04 is_generic_placeholder): the derived \
+    if outcome.identity.is_some() {
+        if let Err(e) = check_landing_substance(&landing) {
+            gate_failures.push(e);
+        }
+        if facts.kg_grounded {
+            let generic = subsystem_architecture_mermaid_source(&facts)
+                .map(|s| is_generic_placeholder(s.as_str()))
+                .unwrap_or(true);
+            if generic {
+                gate_failures.push(
+                    "architecture diagram lint (DGRICH-04 is_generic_placeholder): the derived \
 diagram is the generic template or has fewer than 5 real subsystem nodes -- withholding the \
 cutover rather than shipping a latch-prone landing"
-                    .to_string(),
-            );
+                        .to_string(),
+                );
+            }
         }
     }
 
@@ -1183,14 +1193,18 @@ Clone the repo, then run `crate::a::Hub::run`.
         )
         .await;
 
-        // Regardless of whether the OTHER Pass-5 gates (substance floor)
-        // happen to withhold this particular minimal landing, the no-loss
-        // guard's own accounting must show the safe fallback: nothing
-        // covered by generation, everything relocated to the backstop.
+        // The safe fallback: nothing covered by generation, everything
+        // relocated verbatim to the backstop, coverage 1.0.
         assert_eq!(report.covered_by_generation, 0, "{}", report.summary);
         assert_eq!(report.relocated_to_legacy, 2, "{}", report.summary);
         assert_eq!(report.coverage_ratio, 1.0, "the backstop must still make coverage 1.0");
         assert!(report.missing.is_empty(), "{:?}", report.missing);
+        // A DEGRADED run (identity == None) MUST still place: the substance /
+        // generic-diagram gates are RICH-landing-only, so the deliberately-sparse
+        // minimal_landing + full verbatim relocation is never gate-withheld
+        // (codex review finding: "generation-flagged -> all relocate" must place).
+        assert!(report.placed, "degraded fallback must place, not be gate-withheld: {}", report.summary);
+        assert!(report.gate_failures.is_empty(), "no gate should fire on the degraded path: {:?}", report.gate_failures);
 
         std::fs::remove_dir_all(&root).ok();
     }
