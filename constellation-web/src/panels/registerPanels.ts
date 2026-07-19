@@ -21,12 +21,16 @@
 //             Analytics (was status.analytics), Engine Diagram (was status.engine-diagram)
 //   Chord:    Inference, Providers, Playground
 //   Muse:     Dashboard, Taste, Channels (CONST-20)
-//   Terminus: existing example TerminusPanel
+//   Terminus: Config (existing example TerminusPanel), plus CONST-28's module-self build:
+//             Fleet, Tools, Activity
 //   Lumina:   stub (config surface TBD in CONST-07)
 import { registerPanel, registerModule } from '../lib/moduleRegistry';
 import { registerCommand } from '../lib/commandRegistry';
 import { getCurrentPath, requestHealthRefresh } from '../lib/shellBridge';
 import { TerminusPanel } from './terminus/TerminusPanel';
+import { FleetPanel } from './terminus/FleetPanel';
+import { ToolsPanel } from './terminus/ToolsPanel';
+import { ActivityPanel } from './terminus/ActivityPanel';
 import { LuminaStubPanel } from './lumina/LuminaStubPanel';
 import { EngineDiagramPanel } from './status/EngineDiagramPanel';
 import { DashboardPanel } from './harmony/DashboardPanel';
@@ -233,6 +237,38 @@ registerPanel({
   icon: '⚙',
   available: true,
   component: TerminusPanel,
+});
+
+// CONST-28: Terminus module self — fleet health board, tool catalog, activity feed.
+
+registerPanel({
+  id: 'terminus.fleet',
+  system: 'terminus',
+  title: 'Fleet',
+  path: '/terminus/fleet',
+  icon: '🛰',
+  available: true,
+  component: FleetPanel,
+});
+
+registerPanel({
+  id: 'terminus.tools',
+  system: 'terminus',
+  title: 'Tools',
+  path: '/terminus/tools',
+  icon: '🧰',
+  available: true,
+  component: ToolsPanel,
+});
+
+registerPanel({
+  id: 'terminus.activity',
+  system: 'terminus',
+  title: 'Activity',
+  path: '/terminus/activity',
+  icon: '📡',
+  available: true,
+  component: ActivityPanel,
 });
 
 // ── Lumina ───────────────────────────────────────────────────────────────────
