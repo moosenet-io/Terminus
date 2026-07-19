@@ -14,7 +14,8 @@
 //! - [`constellation_router`] — the `Router` this module contributes:
 //!   `/api/auth/*` (`crate::constellation::auth`), `/api/health`,
 //!   `/api/terminus/config`, the four namespaced backend proxies
-//!   (`crate::constellation::proxy`), a `/ws` scaffold, and a static-asset
+//!   (`crate::constellation::proxy`), the `/ws` real-time relay ([`ws`],
+//!   CONST-18), and a static-asset
 //!   fallback serving the built `constellation-web` SPA — by default from
 //!   the [`assets::WEB_ASSETS`] embedded into the binary (CONST-15), or from
 //!   a `ServeDir` over `CONSTELLATION_WEB_DIST_DIR` when that env var is set
@@ -27,6 +28,8 @@
 //!   cookie, operator-secret login, deny-unauthenticated guard) — see that
 //!   module's doc. [`public_router`]/[`protected_router`] below decide which
 //!   `/api/*` routes the guard actually wraps.
+//! - [`ws`] — CONST-18's session-authenticated, masked `/ws` event relay
+//!   (replaces the earlier `501` scaffold) — see that module's doc.
 //!
 //! ## Contract with `constellation-web`
 //! The endpoint shapes here are pinned to (and tested against)
@@ -39,6 +42,7 @@ pub mod audit;
 pub mod auth;
 pub mod mask;
 pub mod proxy;
+pub mod ws;
 
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode};
@@ -59,24 +63,21 @@ use crate::mcp_server::McpServerState;
 /// call, to learn whether it should show the login screen), `/api/auth/logout`
 /// (idempotent regardless of session state, no backend dispatch, no data
 /// exposure), and `/api/health` (read-only liveness, no backend data beyond
-/// per-system up/down). `/ws` is also unauthenticated for now (scaffold-only,
-/// see [`handle_ws_stub`]'s doc -- the real relay is a follow-up item that
-/// will need its own session check when it stops being a stub).
+/// per-system up/down). `/ws` is ALSO wired outside `protected_router`'s
+/// `require_session` middleware layer -- not because it is unauthenticated,
+/// but because [`ws::handle_ws`] (CONST-18) does its OWN session-cookie
+/// verification (the same `auth::session_from_cookie` check the middleware
+/// uses) BEFORE ever accepting the WebSocket upgrade, since a WebSocket
+/// upgrade handshake doesn't compose with ordinary HTTP middleware the same
+/// way a plain request/response route does. An unauthenticated `/ws` caller
+/// still gets rejected `401` -- see that module's doc.
 fn public_router(state: Arc<McpServerState>) -> Router {
     Router::new()
         .route("/api/auth/me", get(auth::auth_me))
         .route("/api/auth/login", post(auth::auth_login))
         .route("/api/auth/logout", post(auth::auth_logout))
         .route("/api/health", get(handle_health))
-        // CONST-04/CONST-*: `/ws` is scaffolded only -- it accepts the
-        // request and returns a clean, typed "not yet implemented" instead
-        // of a raw 404, so `constellation-web`'s `ws.connect()` fails
-        // predictably rather than silently. The full same-origin,
-        // session-cookie-authenticated WebSocket proxy (harmony-web's
-        // engine/ralph-loop/log event stream) is a follow-up item -- axum's
-        // `ws` extractor + a real upstream WS relay is out of this item's
-        // scope (CONST-02 is the HTTP aggregation surface).
-        .route("/ws", get(handle_ws_stub))
+        .route("/ws", get(ws::handle_ws))
         .with_state(state)
 }
 
@@ -217,19 +218,6 @@ fn embedded_file_response(path: &str, file: &include_dir::File) -> Response {
         HeaderValue::from_static(content_type_for(path)),
     );
     resp
-}
-
-async fn handle_ws_stub() -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        [("content-type", "application/json")],
-        json!({
-            "error": "constellation /ws event stream is not yet implemented",
-            "note": "CONST-02 ships the HTTP aggregation surface only; the WebSocket relay is a follow-up item"
-        })
-        .to_string(),
-    )
-        .into_response()
 }
 
 /// `GET /api/health` — one entry per known system
@@ -549,12 +537,20 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// CONST-18: `/ws` is wired to the real relay now -- an unauthenticated
+    /// caller (no session cookie) is rejected `401`, never the old `501`
+    /// stub. `ws.rs`'s own test module covers the relay's behavior in
+    /// depth (unconfigured-upstream typed close, masking, envelope shape);
+    /// this only asserts the route itself is reachable through the full
+    /// `constellation_router` wiring.
     #[tokio::test]
-    async fn ws_stub_returns_not_implemented_not_a_bare_404() {
+    #[serial]
+    async fn ws_route_rejects_an_unauthenticated_caller() {
+        std::env::remove_var("TERMINUS_JWT_SIGNING_KEY");
         let router = constellation_router(test_state());
         let req = Request::builder().method("GET").uri("/ws").body(Body::empty()).unwrap();
         let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

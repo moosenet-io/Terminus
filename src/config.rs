@@ -1193,6 +1193,19 @@ pub fn constellation_muse_url() -> Option<String> {
     env_nonempty("CONSTELLATION_MUSE_URL")
 }
 
+/// Base URL of Harmony's own event WebSocket the `/ws` relay
+/// (`crate::constellation::ws`, CONST-18) dials as its upstream leg. From
+/// `CONSTELLATION_HARMONY_WS_URL`; `None` ⇒ the relay accepts the
+/// browser's upgrade (session-cookie-verified first) and immediately sends
+/// a typed close frame rather than dialing a guessed host — the client
+/// stays on 30s polling in that case (§3.5). Same "infra config, not a
+/// credential" posture as the sibling `constellation_{harmony,chord,
+/// lumina}_url` helpers above — a bare `ws://`/`wss://` URL, no auth token
+/// embedded in it.
+pub fn constellation_harmony_ws_url() -> Option<String> {
+    env_nonempty("CONSTELLATION_HARMONY_WS_URL")
+}
+
 /// Filesystem directory holding the built `constellation-web` static
 /// assets (its `dist/` output) that this layer serves as a SPA, with
 /// `index.html` as the not-found fallback. From

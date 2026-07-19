@@ -140,6 +140,102 @@ door — it's structurally incapable of storing a credential shape). Vault-refer
 (provider API keys, etc., landing in CONST-08+) must be surfaced as a vault key *name* with a
 set/rotate affordance, never a round-tripped value.
 
+## Brand system (CONST-17)
+
+The app renders the **Terminus GUI Brand Guide** ("deep space violet" portal, v1.0) — see
+`docs/constellation/CONST-GUI-SPEC.md` §2. `src/styles/globals.css` is the canonical token
+sheet (surfaces, violet accent ramp, semantic "flux" hues, type, spacing, radius, glow,
+motion). Two rules that are grep-enforced in review:
+
+- **No raw hex where a token exists.** New code reaches for a `--token`, never a literal
+  hex. The `StatusColor` union (`Card.tsx`) stays the only sanctioned status-color API.
+- **Color is always semantic (§2.4).** The five flux hues carry fixed meanings — violet =
+  core/brand; blue = inbound/source/cold; green = outbound/endpoint/free; amber =
+  cloud/gated/paid/warm; rose = alert/error/hot. A chart series that IS one of these
+  semantics wears that token; only nominal identity (models, languages, providers, tiers
+  without a fixed meaning) gets a categorical slot (`src/viz/palette.ts`).
+
+**Legacy aliases** (`--bg-surface`, `--accent-primary`, `--text-primary/secondary/tertiary`,
+the old `--text-xs..metric` scale, `--h-*`, …) are kept in `globals.css` for ONE release so
+the panels ported from harmony-web restyle without a full rename — every alias is dated
+"LEGACY (CONST-17)" and scheduled for removal at CONST-29. Do not add new call-sites against
+the legacy names.
+
+**Fonts** are self-hosted: Inter 400/500/600/700 + JetBrains Mono 400/500/700 (latin subset
+woff2, ~172KB total) live in `public/fonts/` and are declared in `src/styles/fonts.css`
+(`font-display: swap` + system fallbacks in `--font-sans`/`--font-mono`). The brand guide's
+hosted-fonts `@import` is NOT used — the built dist makes zero external requests (same-origin
+model, audit §3). If you ever need to re-fetch/update a font file, pull the real `.woff2`
+binary and commit it; never point `@font-face` at a remote URL.
+
+### Dataviz palette validation
+
+The 6 categorical slots (`--series-1..6`) were run through the dataviz skill's
+`validate_palette.js` against `--mode dark --surface "#161130"` (the card surface), plus
+`--pairs all` for slots 1-4 (the scatter/radar/swarm all-pairs cap). Three slots failed the
+brand-faithful starting point from spec §4.2 and were **snapped within their own brand ramp**
+(hue held, lightness moved only):
+
+| Slot | Role | Spec §4.2 value | Snapped value | Reason |
+|---|---|---|---|---|
+| `--series-2` | flux-green family | `#10B981` | `#059669` | outside the dark-mode lightness band |
+| `--series-3` | flux-amber family | `#F59E0B` | `#D97706` | outside the dark-mode lightness band |
+| `--series-4` | flux-blue family | `#3B82F6` | `#1D4ED8` | ΔE 0.9 vs violet-400 under deutan sim (all-pairs) |
+| `--series-6` | violet-200 family | `#DDC9FD` | `#9D6FE0` | outside lightness band + below chroma floor |
+| `--series-1` | violet-400 | `#A855F7` | unchanged | — |
+| `--series-5` | flux-rose | `#F43F5E` | unchanged | — |
+
+Final report (`node validate_palette.js "#A855F7,#059669,#D97706,#1D4ED8,#F43F5E,#9D6FE0"
+--mode dark --surface "#161130"`): **ALL CHECKS PASS** (lightness band, chroma floor, normal-
+vision floor, contrast vs surface all PASS; CVD separation reports a WARN in the 6-8 ΔE band
+on the adjacent amber/green pair and on the all-pairs violet/blue pair — legal per the skill's
+rule *"CVD in the 6-8 floor band is legal ONLY with secondary encoding: direct labels, gaps,
+or texture"*, satisfied here because every chart ships a `ChartLegend` + `TableViewToggle`,
+§4.2/§4.4). Status/semantic tokens (`--flux-*`, `--status-*`) were left at their spec values —
+only the categorical chart-slot copies were snapped, since those are the ones the validator
+scopes to.
+
+### The viz kit (`src/viz/`)
+
+**Panels never import `recharts`/`@nivo/*` directly — always import from `src/viz/`.**
+`theme.ts` bridges the CSS tokens into a nivo theme + Recharts style constants (memoized
+`getComputedStyle` read); `palette.ts` holds the categorical/sequential/diverging accessors
+plus `SlotAssigner` (first-seen-order categorical slot assignment, stable across filtering —
+instantiate one per chart instance, not per render). `ChartCard`/`ChartTooltip`/
+`ChartLegend`/`ChartEmpty`/`ChartSkeleton`/`TableViewToggle` are the shared chart chrome
+every chart composes (loading/refetch/empty/degraded states, table-view twin, textContent-
+only tooltip label insertion since series/point labels can be untrusted upstream data). For
+the advanced chart forms (radar/boxplot/heatmap/parallel-coordinates/swarmplot/scatterplot),
+CONST-17 ships the FOUNDATION only: pinned `@nivo/*` 0.99.0 packages, the shared nivo theme
+bridge (`theme.ts`), and a dedicated `viz` Vite chunk (`vite.config.ts` `manualChunks`) so
+the shell/panels' initial bundle doesn't pay for nivo. The chart-form wrapper components
+themselves land with the routes that use them (MINT/Models, CONST-22..24), which lazy-import
+their panels.
+
+Grid lines are **solid 1px hairlines** (`--chart-grid`/`--chart-axis`) — the dashed
+`strokeDasharray:'3 3'` pattern from harmony-web is retired everywhere (audit §1.4). Every
+chart ships a table-view twin (`TableViewToggle`) — this is both the WCAG relief channel for
+sub-3:1 fills and a hard rule (§4.4).
+## Real-time relay (`/ws`, CONST-18)
+
+`GET /ws` (`src/constellation/ws.rs` on the Terminus side, not in this package) is a
+session-authenticated, masked WebSocket relay -- the same cookie-JWT check
+`require_session` uses is verified BEFORE the upgrade is ever accepted, so an
+unauthenticated caller gets a `401`, never a half-open socket. Once accepted, it dials
+Harmony's own event socket (`CONSTELLATION_HARMONY_WS_URL`, a Terminus-side env var --
+see `.env.example`) and pipes events to the browser, each wrapped as `{source:'harmony',
+event:...}` and passed through the SAME `mask_response` masking every `/api/*` response
+gets. If `CONSTELLATION_HARMONY_WS_URL` is unset, the relay still accepts the upgrade
+(auth already passed) but immediately sends a typed WebSocket close frame (code `4000`,
+"no upstream configured") and the app falls back to 30s polling -- this is expected,
+degraded-but-functional behavior, not an error to chase down. A typed close of `4001`
+("upstream unreachable") means the relay dialed Harmony's socket and lost/never got it
+after its bounded reconnect budget was exhausted -- same polling fallback applies.
+`ws.connect()` (`src/lib/aggregationClient.ts`) already treats every close uniformly
+(reconnect/backoff, then fall back to polling) -- no client-side branch on the close code
+is required for this item; a future item MAY use the code to distinguish "no backend
+configured" from "backend flapped" in the UI if that becomes useful.
+
 ## Dev / build
 
 ```sh

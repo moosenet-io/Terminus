@@ -18,7 +18,7 @@ export function SavingsHero({ data }: Props) {
       <div style={{ fontSize: 11, color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 4 }}>
         Saved this month by running locally
       </div>
-      <div style={{ fontSize: 48, fontWeight: 700, color: '#22c55e', marginBottom: 8 }}>
+      <div style={{ fontSize: 'var(--fs-h1)', fontWeight: 'var(--fw-bold)', fontFamily: 'var(--font-mono)', color: 'var(--flux-green)', marginBottom: 8 }}>
         ${data.savings_usd.toFixed(2)}
       </div>
       <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
