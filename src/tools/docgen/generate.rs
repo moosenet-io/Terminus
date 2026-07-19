@@ -53,6 +53,15 @@
 //! JWT `PersonalFederationClient`/`inference_proxy` already mint) against
 //! Chord's existing `POST /v1/infer` single-prompt route -- no new Chord-side
 //! endpoint is assumed. A `MockDocGenerator` (test-only) stands in for tests.
+//!
+//! ## DGDG-01: cloud-provider fallback
+//! [`FallbackDocGenerator`] wraps [`ChordDocGenerator`] with an optional
+//! [`OpenRouterDocGenerator`] cloud fallback, so doc generation can still
+//! run when local Chord/GPU inference is jammed (unreachable, timed out, or
+//! OOM'd -- the exact failure that blocked the DGRICH rollout) instead of
+//! failing the whole request. `FallbackDocGenerator::from_env` is the
+//! production call sites' (`trigger.rs`/`backfill.rs`) entry point; see its
+//! doc comment for the byte-for-byte-unchanged-when-unconfigured guarantee.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -206,6 +215,119 @@ impl DocGenerator for ChordDocGenerator {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DGDG-01: cloud-provider fallback when local Chord/GPU inference is jammed
+// ---------------------------------------------------------------------------
+//
+// The exact failure that blocked the DGRICH rollout: `ChordDocGenerator`
+// returns `Err` (unreachable/timeout/OOM) with no recovery path for that
+// generation. `OpenRouterDocGenerator` is a second, real `DocGenerator`
+// impl reusing `crate::review::ReviewConfig::dispatch_openrouter` -- the
+// SAME OpenRouter chat-completions client `review::dispatch`'s `nemotron`/
+// `qwen_coder`/`gpt56` providers already use (same URL resolution, same
+// `OPENROUTER_API_KEY` bearer-auth convention: a plain env read post-
+// materialization IS the vault read in this crate, per that module's doc
+// comment) -- this struct adds no second HTTP client, only names which
+// model tag to send. `FallbackDocGenerator` composes a primary
+// (`ChordDocGenerator`) with an optional cloud generator: it only ever
+// calls the cloud generator after the primary itself returns `Err`, and a
+// healthy primary's `Ok` is returned untouched (cloud is never consulted
+// when local inference is fine).
+
+/// Real `DocGenerator` cloud fallback: routes a doc-generation prompt to a
+/// configured OpenRouter model via [`crate::review::ReviewConfig::dispatch_openrouter`]
+/// rather than reimplementing that HTTP call. See the section doc comment
+/// above for why this reuses (not duplicates) `review::dispatch`'s client.
+#[derive(Debug, Clone)]
+pub struct OpenRouterDocGenerator {
+    model: String,
+    review_config: crate::review::ReviewConfig,
+}
+
+impl OpenRouterDocGenerator {
+    /// Build from an explicit model tag and `ReviewConfig` (letting
+    /// production callers share one `ReviewConfig::from_env()` read across
+    /// this and any other review-provider use, and letting tests supply a
+    /// config with a mocked `OPENROUTER_CHAT_URL`/key without touching real
+    /// env).
+    pub fn new(model: impl Into<String>, review_config: crate::review::ReviewConfig) -> Self {
+        Self { model: model.into(), review_config }
+    }
+}
+
+#[async_trait]
+impl DocGenerator for OpenRouterDocGenerator {
+    async fn generate(&self, prompt: &str) -> Result<String, ToolError> {
+        self.review_config
+            .dispatch_openrouter(&self.model, prompt)
+            .await
+            .map_err(ToolError::Http)
+    }
+}
+
+/// Composes a primary `DocGenerator` (production: [`ChordDocGenerator`],
+/// the local Chord/GPU path) with an optional cloud fallback (production:
+/// [`OpenRouterDocGenerator`]) for DGDG-01. `generate()`:
+/// - Tries `primary` first; a primary `Ok` is returned as-is (`cloud` is
+///   never called).
+/// - On a primary `Err`, if `cloud` is configured, logs a warning and tries
+///   it -- returning the cloud result on success, or a combined error
+///   naming both failures if the cloud attempt ALSO errors.
+/// - If `cloud` is `None` (the default when `DOCGEN_CLOUD_FALLBACK_MODEL`/
+///   an OpenRouter key aren't configured -- see [`Self::from_env`]), the
+///   primary's `Err` is returned unchanged: today's pre-DGDG-01 behavior,
+///   byte for byte.
+pub struct FallbackDocGenerator {
+    primary: Box<dyn DocGenerator>,
+    cloud: Option<Box<dyn DocGenerator>>,
+}
+
+impl FallbackDocGenerator {
+    /// Build directly from an already-constructed primary/cloud pair (the
+    /// seam the unit tests below use with stub generators).
+    pub fn new(primary: Box<dyn DocGenerator>, cloud: Option<Box<dyn DocGenerator>>) -> Self {
+        Self { primary, cloud }
+    }
+
+    /// Production wiring: [`ChordDocGenerator::from_env`] as primary, plus
+    /// an [`OpenRouterDocGenerator`] cloud fallback IFF BOTH
+    /// `crate::config::docgen_cloud_fallback_model()` and an OpenRouter key
+    /// (`ReviewConfig::from_env().openrouter_key`) are present; otherwise
+    /// `cloud` is `None` and this generator behaves exactly like a bare
+    /// `ChordDocGenerator::from_env()` did before DGDG-01.
+    pub fn from_env() -> Self {
+        let primary: Box<dyn DocGenerator> = Box::new(ChordDocGenerator::from_env());
+        let review_config = crate::review::ReviewConfig::from_env();
+        let cloud: Option<Box<dyn DocGenerator>> = match crate::config::docgen_cloud_fallback_model() {
+            Some(model) if review_config.openrouter_key.is_some() => {
+                Some(Box::new(OpenRouterDocGenerator::new(model, review_config)) as Box<dyn DocGenerator>)
+            }
+            _ => None,
+        };
+        Self { primary, cloud }
+    }
+}
+
+#[async_trait]
+impl DocGenerator for FallbackDocGenerator {
+    async fn generate(&self, prompt: &str) -> Result<String, ToolError> {
+        match self.primary.generate(prompt).await {
+            Ok(text) => Ok(text),
+            Err(primary_err) => {
+                let Some(cloud) = &self.cloud else {
+                    return Err(primary_err);
+                };
+                tracing::warn!("local docgen inference failed, falling back to cloud: {primary_err}");
+                cloud.generate(prompt).await.map_err(|cloud_err| {
+                    ToolError::Execution(format!(
+                        "docgen: both local and cloud generation failed -- local: {primary_err}; cloud: {cloud_err}"
+                    ))
+                })
+            }
+        }
     }
 }
 
@@ -938,6 +1060,114 @@ mod tests {
         async fn generate(&self, _prompt: &str) -> Result<String, ToolError> {
             Err(ToolError::Http("backend down".to_string()))
         }
+    }
+
+    // ── DGDG-01: FallbackDocGenerator ─────────────────────────────────
+
+    /// Test-only `DocGenerator` that always succeeds with a fixed response
+    /// and records how many times it was called -- used to assert a
+    /// healthy primary short-circuits (cloud never invoked) and, when used
+    /// as the cloud stub, that a failed primary's `Err` doesn't stop the
+    /// cloud attempt from running.
+    struct StubOkGenerator {
+        response: String,
+        calls: Mutex<u32>,
+    }
+
+    impl StubOkGenerator {
+        fn new(response: impl Into<String>) -> Self {
+            Self { response: response.into(), calls: Mutex::new(0) }
+        }
+
+        fn call_count(&self) -> u32 {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl DocGenerator for StubOkGenerator {
+        async fn generate(&self, _prompt: &str) -> Result<String, ToolError> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(self.response.clone())
+        }
+    }
+
+    /// Test-only `DocGenerator` that always fails with a distinctive,
+    /// caller-supplied reason -- used so assertions on a combined error can
+    /// check for both the primary's and the cloud's messages by name.
+    struct StubErrGenerator {
+        reason: String,
+    }
+
+    impl StubErrGenerator {
+        fn new(reason: impl Into<String>) -> Self {
+            Self { reason: reason.into() }
+        }
+    }
+
+    #[async_trait]
+    impl DocGenerator for StubErrGenerator {
+        async fn generate(&self, _prompt: &str) -> Result<String, ToolError> {
+            Err(ToolError::Http(self.reason.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_uses_cloud_when_primary_errors() {
+        let primary = Box::new(StubErrGenerator::new("local jammed"));
+        let cloud = Box::new(StubOkGenerator::new("cloud-generated content"));
+        let fallback = FallbackDocGenerator::new(primary, Some(cloud));
+
+        let result = fallback.generate("prompt").await.expect("cloud should succeed");
+        assert_eq!(result, "cloud-generated content");
+    }
+
+    #[tokio::test]
+    async fn fallback_short_circuits_cloud_never_invoked_when_primary_ok() {
+        use std::sync::Arc;
+
+        /// Shares one `StubOkGenerator` between the test assertion and the
+        /// `FallbackDocGenerator` (which needs to own a `Box<dyn
+        /// DocGenerator>`), so the test can check `call_count()` after the
+        /// fact.
+        struct ArcGenerator(Arc<StubOkGenerator>);
+
+        #[async_trait]
+        impl DocGenerator for ArcGenerator {
+            async fn generate(&self, prompt: &str) -> Result<String, ToolError> {
+                self.0.generate(prompt).await
+            }
+        }
+
+        let primary = Box::new(StubOkGenerator::new("local content"));
+        let cloud_inner = Arc::new(StubOkGenerator::new("cloud content"));
+        let cloud = Box::new(ArcGenerator(cloud_inner.clone()));
+        let fallback = FallbackDocGenerator::new(primary, Some(cloud));
+
+        let result = fallback.generate("prompt").await.expect("primary should succeed");
+        assert_eq!(result, "local content", "a healthy primary's result must win");
+        assert_eq!(cloud_inner.call_count(), 0, "cloud must never be called when primary succeeds");
+    }
+
+    #[tokio::test]
+    async fn fallback_both_fail_returns_combined_error() {
+        let primary = Box::new(StubErrGenerator::new("local jammed"));
+        let cloud = Box::new(StubErrGenerator::new("cloud also down"));
+        let fallback = FallbackDocGenerator::new(primary, Some(cloud));
+
+        let err = fallback.generate("prompt").await.expect_err("both failing must error");
+        let msg = err.to_string();
+        assert!(msg.contains("local jammed"), "combined error must name the local failure: {msg}");
+        assert!(msg.contains("cloud also down"), "combined error must name the cloud failure: {msg}");
+    }
+
+    #[tokio::test]
+    async fn fallback_no_cloud_configured_passes_through_primary_error_unchanged() {
+        let primary = Box::new(StubErrGenerator::new("local jammed, no fallback configured"));
+        let fallback = FallbackDocGenerator::new(primary, None);
+
+        let err = fallback.generate("prompt").await.expect_err("no cloud must propagate primary Err");
+        assert!(err.to_string().contains("local jammed, no fallback configured"));
     }
 
     fn swept(raw: &str) -> SweptFeatContext {
