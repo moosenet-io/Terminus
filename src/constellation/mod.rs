@@ -513,6 +513,50 @@ mod tests {
         std::env::remove_var("TERMINUS_JWT_SIGNING_KEY");
     }
 
+    /// CONST-19 review-strengthened audit test: unlike proxy.rs's
+    /// `muse_mutating_post_is_audited` (which exercises the shared `proxy()`
+    /// helper directly), this goes through the REAL routed handler —
+    /// session-cookie auth → `require_session` → `proxy_muse` — and asserts
+    /// the audit line carries the SESSION principal, proving the routed
+    /// arm's header/principal plumbing end-to-end, not just the helper.
+    #[tokio::test]
+    #[serial]
+    async fn routed_muse_mutating_post_audits_the_session_principal() {
+        std::env::set_var("TERMINUS_JWT_SIGNING_KEY", "test-signing-key-mod-tests");
+        std::env::remove_var("CONSTELLATION_MUSE_URL");
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let audit_path = tmp.path().to_str().unwrap().to_string();
+        std::env::set_var("CONSTELLATION_AUDIT_LOG_PATH", &audit_path);
+
+        let router = constellation_router(test_state());
+        let (token, _exp) = crate::pki::enroll::mint_jwt_with_ttl("test-operator", 300).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/muse/api/channels")
+            .header("cookie", format!("constellation_session={token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"test-channel"}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        // Unconfigured backend still degrades 200 available:false — but the
+        // audit record happens BEFORE backend dispatch, so it must exist.
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        let line = audit.lines().last().expect("an audit line must be written");
+        let entry: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(entry["system"], "muse");
+        assert_eq!(entry["method"], "POST");
+        assert_eq!(
+            entry["principal"], "test-operator",
+            "the routed handler must plumb the session principal into the audit record"
+        );
+        assert!(entry["path"].as_str().unwrap().contains("api/channels"));
+
+        std::env::remove_var("CONSTELLATION_AUDIT_LOG_PATH");
+        std::env::remove_var("TERMINUS_JWT_SIGNING_KEY");
+    }
+
     /// Auth routes themselves must stay reachable unauthenticated -- a
     /// caller can't log in through a route that itself requires being
     /// logged in.
