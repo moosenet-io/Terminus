@@ -199,11 +199,13 @@ plus `SlotAssigner` (first-seen-order categorical slot assignment, stable across
 instantiate one per chart instance, not per render). `ChartCard`/`ChartTooltip`/
 `ChartLegend`/`ChartEmpty`/`ChartSkeleton`/`TableViewToggle` are the shared chart chrome
 every chart composes (loading/refetch/empty/degraded states, table-view twin, textContent-
-only tooltip label insertion since series/point labels can be untrusted upstream data). The
-advanced chart forms (radar/boxplot/heatmap/parallel-coordinates/swarmplot/scatterplot) are
-built on pinned `@nivo/*` 0.99.0 packages, bundled into their own `viz` Vite chunk
-(`vite.config.ts` `manualChunks`) so the shell/panels' initial bundle doesn't pay for nivo —
-MINT/Models routes (CONST-21+) lazy-import their panels.
+only tooltip label insertion since series/point labels can be untrusted upstream data). For
+the advanced chart forms (radar/boxplot/heatmap/parallel-coordinates/swarmplot/scatterplot),
+CONST-17 ships the FOUNDATION only: pinned `@nivo/*` 0.99.0 packages, the shared nivo theme
+bridge (`theme.ts`), and a dedicated `viz` Vite chunk (`vite.config.ts` `manualChunks`) so
+the shell/panels' initial bundle doesn't pay for nivo. The chart-form wrapper components
+themselves land with the routes that use them (MINT/Models, CONST-22..24), which lazy-import
+their panels.
 
 Grid lines are **solid 1px hairlines** (`--chart-grid`/`--chart-axis`) — the dashed
 `strokeDasharray:'3 3'` pattern from harmony-web is retired everywhere (audit §1.4). Every
