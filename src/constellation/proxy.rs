@@ -401,6 +401,7 @@ mod tests {
     use serial_test::serial;
 
     #[tokio::test]
+    #[serial]
     async fn unconfigured_backend_returns_structured_unavailable_not_5xx() {
         let resp = proxy(
             "harmony",
@@ -468,6 +469,7 @@ mod tests {
     // ── CONST-19: Muse proxy arm ─────────────────────────────────────────
 
     #[tokio::test]
+    #[serial]
     async fn muse_unconfigured_backend_returns_structured_unavailable_not_5xx() {
         // Mirrors `unconfigured_backend_returns_structured_unavailable_not_5xx`
         // above, exercised through the shared `proxy()` fn with "muse" as the
@@ -513,6 +515,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn muse_art_unconfigured_backend_returns_structured_unavailable() {
         // `proxy_muse_art` (the raw-passthrough arm) has its own unconfigured
         // path -- must degrade the same way as the JSON arm, not panic or
