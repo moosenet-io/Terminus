@@ -54,8 +54,94 @@ use serde_json::Value;
 
 use crate::error::ToolError;
 
-use super::generate::DocGenerator;
+use super::diagram::is_generic_placeholder;
+use super::generate::{all_symbol_names, DocGenerator};
+use super::prompts::{anti_latch_lint, symbol_existence_lint, RepoIdentity};
+use super::repo_facts::RepoFacts;
 use super::versioning::ArtifactKey;
+
+// ---------------------------------------------------------------------------
+// DGRICH-09: repo-level landing gates (fail-closed, wired into place.rs's
+// `place_repo_docs` -- see its doc comment)
+// ---------------------------------------------------------------------------
+//
+// DGRICH-07 shipped these two checks (substance floor + generic-diagram
+// lint) as a STOPGAP running inline inside `trigger::run_repo_level_trigger`
+// before calling `place_docs`, with a note that DGRICH-09 was the item that
+// would fold them into the placement door's own fail-closed set "for EVERY
+// caller." This section is that consolidation: the checks themselves are
+// unchanged (this module doesn't reimplement `check_landing_substance` --
+// that stays in `readme_layers`, called directly by `place::place_repo_docs`
+// alongside these two), but the generic-diagram check moves here as a
+// LANDING-TEXT-level gate (extracting the embedded mermaid fence rather than
+// requiring a separate `RepoFacts`/diagram-source argument threaded through
+// `place_docs`), and the identity lint -- Pass 1's own anti-latch +
+// symbol-existence lints, already enforced once during generation
+// (`generate::run_identity_pass`) -- gets a second, independent enforcement
+// point at the placement door itself: the DSN-guard lesson (a lone
+// enforcement point is a single point of failure) applies here exactly as
+// it does to every other fail-closed gate in this engine.
+
+/// Extract the inner source of the FIRST ` ```mermaid ` fenced code block in
+/// `landing`, if any. A landing with no mermaid fence at all (e.g. the
+/// `trigger::minimal_landing` degraded fallback, which never claims a
+/// diagram it doesn't have) has nothing for [`check_landing_diagram`] to
+/// gate -- this is `None`, not an error.
+fn extract_mermaid_fence(landing: &str) -> Option<&str> {
+    const OPEN: &str = "```mermaid\n";
+    let start = landing.find(OPEN)? + OPEN.len();
+    let rest = &landing[start..];
+    let end = rest.find("\n```")?;
+    Some(&rest[..end])
+}
+
+/// DGRICH-04/DGRICH-09 fail-closed gate: a landing whose embedded
+/// architecture diagram is the generic `Client -> Core -> Output` template,
+/// or has fewer than 5 real subsystem nodes ([`is_generic_placeholder`]),
+/// must never ship. A landing with no embedded mermaid fence at all passes
+/// trivially -- there is nothing generic to catch (see
+/// [`extract_mermaid_fence`]'s doc comment).
+pub fn check_landing_diagram(landing: &str) -> Result<(), String> {
+    match extract_mermaid_fence(landing) {
+        None => Ok(()),
+        Some(source) if is_generic_placeholder(source) => Err(
+            "architecture diagram lint (DGRICH-04 is_generic_placeholder): the landing's \
+embedded diagram is the generic Client/Core/Output template, or has fewer than 5 real \
+subsystem nodes -- withholding the cutover rather than shipping a latch-prone landing"
+                .to_string(),
+        ),
+        Some(_) => Ok(()),
+    }
+}
+
+/// DGRICH-02/DGRICH-09 fail-closed backstop: re-run the SAME anti-latch and
+/// symbol-existence lints [`super::generate::run_identity_pass`] already
+/// enforces (with a retry) before generation, one more time against the
+/// FINAL `identity` + `facts` right at the placement door. This should be
+/// unreachable in ordinary operation -- Pass 1 already gated `identity` --
+/// but a future wiring change that skips or bypasses that gate can then
+/// never ship an invented-symbol or single-subsystem-latched identity past
+/// this door either, matching this engine's existing "never a single
+/// fallible enforcement point" posture (see [`run_quality_gate`]'s own doc
+/// comment for the same principle applied to the prose/judge pairing).
+pub fn check_landing_identity(identity: &RepoIdentity, facts: &RepoFacts) -> Result<(), String> {
+    let subsystem_names: Vec<String> = facts.subsystems.iter().map(|s| s.name.clone()).collect();
+    if let Some(violation) =
+        anti_latch_lint(&identity.tagline, &identity.what_is, &subsystem_names, "")
+    {
+        return Err(format!("identity anti-latch lint (DGRICH-02 backstop): {violation}"));
+    }
+
+    let feature_text: String =
+        identity.feature_rows.iter().map(|f| f.description.as_str()).collect::<Vec<_>>().join(" ");
+    let combined = format!("{} {} {}", identity.tagline, identity.what_is, feature_text);
+    let symbol_names = all_symbol_names(facts);
+    if let Some(violation) = symbol_existence_lint(&combined, &symbol_names) {
+        return Err(format!("identity symbol-existence lint (DGRICH-02 backstop): {violation}"));
+    }
+
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Deterministic prose linter
@@ -790,5 +876,90 @@ mod tests {
             QualityVerdict::Failed { reason: "too low".to_string() }
         );
         assert_eq!(store.get(&wiki_key, 1).unwrap().verdict, QualityVerdict::Passed);
+    }
+
+    // ── DGRICH-09: repo-level landing gates ───────────────────────────
+
+    fn sample_facts_with_subsystems(names: &[&str]) -> RepoFacts {
+        let mut facts = RepoFacts { project_id: "TERM".to_string(), git_ref: "abc123".to_string(), ..Default::default() };
+        facts.subsystems = names
+            .iter()
+            .map(|n| super::super::repo_facts::Subsystem { name: n.to_string(), ..Default::default() })
+            .collect();
+        facts
+    }
+
+    fn sample_identity(tagline: &str, what_is: &str) -> RepoIdentity {
+        RepoIdentity {
+            tagline: tagline.to_string(),
+            what_is: what_is.to_string(),
+            audience: "operators".to_string(),
+            subsystems: Vec::new(),
+            feature_rows: Vec::new(),
+            guide_topics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn check_landing_diagram_passes_a_landing_with_no_mermaid_fence_at_all() {
+        assert!(check_landing_diagram("# Hello\n\nJust prose, no diagram.\n").is_ok());
+    }
+
+    #[test]
+    fn check_landing_diagram_fails_the_generic_client_core_output_template() {
+        let landing = "# Hello\n\n```mermaid\nflowchart LR\n    A[Client] --> B[Core] --> C[Output]\n```\n";
+        let err = check_landing_diagram(landing).unwrap_err();
+        assert!(err.contains("generic"), "{err}");
+    }
+
+    #[test]
+    fn check_landing_diagram_fails_a_sub_five_node_diagram() {
+        let landing = "# Hello\n\n```mermaid\nflowchart LR\n    MESH[mesh (12 symbols)] --> REG[registry (34 symbols)]\n```\n";
+        assert!(check_landing_diagram(landing).is_err());
+    }
+
+    #[test]
+    fn check_landing_diagram_passes_a_real_diagram_with_at_least_five_nodes() {
+        let landing = "# Hello\n\n```mermaid\nflowchart LR\n    A[a (10 symbols)] --> B[b (9 symbols)]\n    B --> C[c (8 symbols)]\n    C --> D[d (7 symbols)]\n    D --> E[e (6 symbols)]\n```\n";
+        assert!(check_landing_diagram(landing).is_ok(), "{:?}", check_landing_diagram(landing));
+    }
+
+    #[test]
+    fn check_landing_identity_passes_a_balanced_hub_identity() {
+        let facts = sample_facts_with_subsystems(&["intake", "scribe", "cortex"]);
+        let identity = sample_identity(
+            "The fleet's MCP tool hub.",
+            "Exposes fleet tools over MCP behind an mTLS mesh gateway.",
+        );
+        assert!(check_landing_identity(&identity, &facts).is_ok());
+    }
+
+    /// Negative test: a tagline that only names one of several kept
+    /// subsystems is caught by the anti-latch backstop.
+    #[test]
+    fn check_landing_identity_fails_a_tagline_latched_onto_a_single_subsystem() {
+        let facts = sample_facts_with_subsystems(&["intake", "scribe", "cortex"]);
+        let identity = sample_identity(
+            "The intake model-discovery engine.",
+            "Built around intake, the model-discovery and profiling engine.",
+        );
+        let err = check_landing_identity(&identity, &facts).unwrap_err();
+        assert!(err.contains("anti-latch"), "{err}");
+    }
+
+    /// Negative test: an invented (never-real) symbol in the identity text
+    /// is caught by the symbol-existence backstop.
+    #[test]
+    fn check_landing_identity_fails_an_invented_symbol() {
+        let mut facts = sample_facts_with_subsystems(&["intake", "scribe"]);
+        facts.subsystems[0].top_symbols =
+            vec![super::super::repo_facts::SymbolRef { id: "crate::intake::Discover".to_string(), kind: "fn", path: "src/intake/mod.rs".to_string(), rank: 0.5 }];
+        let identity = sample_identity(
+            "The fleet's tool hub.",
+            "Powered by `crate::intake::Discover` and the entirely invented `crate::ghost::Phantom`.",
+        );
+        let err = check_landing_identity(&identity, &facts).unwrap_err();
+        assert!(err.contains("symbol-existence"), "{err}");
+        assert!(err.contains("crate::ghost::Phantom"), "{err}");
     }
 }

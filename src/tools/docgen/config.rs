@@ -16,6 +16,23 @@
 //! -- this module has no `vault::manager()` / `SecretManager::get()` call of
 //! its own, so it stays fully unit-testable without any runtime secret
 //! store and never risks a raw environment-variable read of a credential.
+//!
+//! ## DGRICH-09: repo-level rich-pipeline tuning knobs
+//! [`ProjectDocConfig`] also carries three OPTIONAL per-project knobs for
+//! the DGRICH-01..08 repo-level rich pipeline: [`ProjectDocConfig::subsystem_page_cap`]
+//! (how many per-subsystem reference pages Pass 2 actually generates,
+//! default [`DEFAULT_SUBSYSTEM_PAGE_CAP`] = 16, the same ceiling
+//! `repo_facts`'s own subsystem-selection rule already applies), [`ProjectDocConfig::landing_budget`]
+//! (this project's own concise-landing line budget, checked in ADDITION to
+//! -- never instead of -- the engine-wide `readme_layers::LANDING_MAX_LINES`
+//! hard ceiling; default [`DEFAULT_LANDING_BUDGET`] = 300, i.e. a no-op),
+//! and [`ProjectDocConfig::identity_hint`] (an operator-supplied tagline
+//! that wins over the Pass 1 generated tagline when present, `None` by
+//! default). All three are read independently of `targets` and always
+//! default cleanly when absent or malformed -- see [`ProjectDocConfig::parse`].
+//! `super::trigger`'s repo-level door ([`super::trigger::run_docgen_trigger`])
+//! is what actually threads these into Pass 2 / the placement gate /
+//! landing assembly; this module only defines and defaults the schema.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -106,12 +123,59 @@ pub struct DocTargetConfig {
     pub options: BTreeMap<String, String>,
 }
 
+/// DGRICH-09 default for [`ProjectDocConfig::subsystem_page_cap`]: the same
+/// number DGRICH-01's own RepoFacts subsystem-selection rule caps at
+/// (design §1.2, `repo_facts::MAX_SUBSYSTEMS`) -- an unconfigured project
+/// gets exactly the pipeline's own built-in ceiling, not a second, silently
+/// different default.
+pub const DEFAULT_SUBSYSTEM_PAGE_CAP: usize = 16;
+
+/// DGRICH-09 default for [`ProjectDocConfig::landing_budget`]: the same
+/// value as [`super::readme_layers::LANDING_MAX_LINES`] (DGRICH-05) -- kept
+/// as this module's own constant (rather than importing `readme_layers`)
+/// so this schema-only module stays dependency-light per its own doc
+/// comment; the two are asserted equal in this module's tests so they can
+/// never silently drift apart.
+pub const DEFAULT_LANDING_BUDGET: usize = 300;
+
 /// A project's full doc-target declaration: the ordered list of targets to
-/// render. Construct via [`ProjectDocConfig::parse`] (never manually built
-/// from untrusted input) or [`ProjectDocConfig::default_readme_only`].
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// render, plus the DGRICH-09 per-project rich-pipeline tuning knobs.
+/// Construct via [`ProjectDocConfig::parse`] (never manually built from
+/// untrusted input) or [`ProjectDocConfig::default_readme_only`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectDocConfig {
     pub targets: Vec<DocTargetConfig>,
+    /// DGRICH-09: the maximum number of per-subsystem reference pages the
+    /// repo-level rich pipeline (DGRICH-03 Pass 2) will actually generate
+    /// for this project, even if DGRICH-01's own RepoFacts rollup kept
+    /// more. Defaults to [`DEFAULT_SUBSYSTEM_PAGE_CAP`] (16 -- the same
+    /// ceiling RepoFacts itself already applies, so an unconfigured
+    /// project's behavior is unchanged from before this option existed).
+    /// Never enforced as a hard error when a project has fewer subsystems
+    /// than the cap -- it only ever trims, never pads.
+    pub subsystem_page_cap: usize,
+    /// DGRICH-09: this project's own concise-landing line budget, checked
+    /// in ADDITION to (never instead of) the engine-wide, hardcoded
+    /// [`super::readme_layers::LANDING_MAX_LINES`] fail-closed ceiling --
+    /// a project may tighten its own budget below the engine-wide cap
+    /// (e.g. `landing_budget: 150`), never loosen it above the 300-line
+    /// hard ceiling every project shares. Defaults to
+    /// [`DEFAULT_LANDING_BUDGET`] (300, matching the engine-wide cap, so an
+    /// unconfigured project's gate is unchanged from before this option
+    /// existed).
+    pub landing_budget: usize,
+    /// DGRICH-09: an operator-supplied tagline that WINS over the Pass 1
+    /// (DGRICH-02/03) generated tagline when present -- an escape hatch
+    /// for the rare repo whose deterministic identity pass keeps producing
+    /// a technically-correct but operator-disliked tagline. `None` (the
+    /// default) leaves Pass 1's own tagline untouched.
+    pub identity_hint: Option<String>,
+}
+
+impl Default for ProjectDocConfig {
+    fn default() -> Self {
+        Self::default_readme_only()
+    }
 }
 
 impl ProjectDocConfig {
@@ -127,26 +191,64 @@ impl ProjectDocConfig {
                 target_type: DEFAULT_TARGET_TYPE,
                 options: BTreeMap::new(),
             }],
+            subsystem_page_cap: DEFAULT_SUBSYSTEM_PAGE_CAP,
+            landing_budget: DEFAULT_LANDING_BUDGET,
+            identity_hint: None,
         }
     }
 
     /// Parse a project's raw doc-target config from JSON of the shape:
     /// ```json
-    /// { "targets": [ { "type": "readme" }, { "type": "notion", "options": { "database_id": "..." } } ] }
+    /// { "targets": [ { "type": "readme" }, { "type": "notion", "options": { "database_id": "..." } } ],
+    ///   "subsystem_page_cap": 12, "landing_budget": 250, "identity_hint": "..." }
     /// ```
     /// `None` input, a missing/empty `targets` array all fall back to
     /// [`Self::default_readme_only`] -- an unconfigured project is valid,
     /// not malformed. A malformed *present* config (wrong shape, unknown
     /// target type) is a clear [`ToolError::InvalidArgument`], never a
     /// panic.
+    ///
+    /// DGRICH-09: `subsystem_page_cap`/`landing_budget`/`identity_hint` are
+    /// all OPTIONAL and read independently of `targets` -- a project may
+    /// tune these even while declaring `targets: []` (which still, on its
+    /// own, means "not opted in" at the [`super::trigger`] gate). A
+    /// present-but-wrong-shaped value for any of the three (not a
+    /// number/not a string) is never a hard error here -- these are tuning
+    /// knobs, not structural config -- it is simply treated as absent and
+    /// the default applies, matching this function's existing tolerant
+    /// posture toward optional per-target `options`.
     pub fn parse(raw: Option<&Value>) -> Result<Self, ToolError> {
         let Some(raw) = raw else {
             return Ok(Self::default_readme_only());
         };
+        let obj = raw.as_object();
 
-        let targets_val = match raw.as_object().and_then(|o| o.get("targets")) {
+        let subsystem_page_cap = obj
+            .and_then(|o| o.get("subsystem_page_cap"))
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .unwrap_or(DEFAULT_SUBSYSTEM_PAGE_CAP);
+        let landing_budget = obj
+            .and_then(|o| o.get("landing_budget"))
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .unwrap_or(DEFAULT_LANDING_BUDGET);
+        let identity_hint = obj
+            .and_then(|o| o.get("identity_hint"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let targets_val = match obj.and_then(|o| o.get("targets")) {
             Some(v) => v,
-            None => return Ok(Self::default_readme_only()),
+            None => {
+                let mut cfg = Self::default_readme_only();
+                cfg.subsystem_page_cap = subsystem_page_cap;
+                cfg.landing_budget = landing_budget;
+                cfg.identity_hint = identity_hint;
+                return Ok(cfg);
+            }
         };
 
         let arr = targets_val.as_array().ok_or_else(|| {
@@ -154,7 +256,11 @@ impl ProjectDocConfig {
         })?;
 
         if arr.is_empty() {
-            return Ok(Self::default_readme_only());
+            let mut cfg = Self::default_readme_only();
+            cfg.subsystem_page_cap = subsystem_page_cap;
+            cfg.landing_budget = landing_budget;
+            cfg.identity_hint = identity_hint;
+            return Ok(cfg);
         }
 
         let mut targets = Vec::with_capacity(arr.len());
@@ -188,7 +294,7 @@ impl ProjectDocConfig {
             targets.push(DocTargetConfig { target_type, options });
         }
 
-        Ok(Self { targets })
+        Ok(Self { targets, subsystem_page_cap, landing_budget, identity_hint })
     }
 
     /// The distinct target types this config declares, in a stable order.
@@ -430,6 +536,82 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert!(resolved[0].enabled, "obsidian must render unconditionally");
         assert!(resolved[0].hint.is_none());
+    }
+
+    // ── DGRICH-09: subsystem_page_cap / landing_budget / identity_hint ──
+
+    #[test]
+    fn missing_config_defaults_the_dgrich_09_options() {
+        let cfg = ProjectDocConfig::parse(None).unwrap();
+        assert_eq!(cfg.subsystem_page_cap, DEFAULT_SUBSYSTEM_PAGE_CAP);
+        assert_eq!(cfg.landing_budget, DEFAULT_LANDING_BUDGET);
+        assert_eq!(cfg.identity_hint, None);
+    }
+
+    #[test]
+    fn default_landing_budget_matches_the_engine_wide_landing_max_lines() {
+        // These must never silently drift apart -- an unconfigured
+        // project's DGRICH-09 budget gate must be a no-op against the
+        // DGRICH-05 engine-wide cap, not a surprise second ceiling.
+        assert_eq!(DEFAULT_LANDING_BUDGET, 300);
+    }
+
+    #[test]
+    fn declared_config_can_set_subsystem_page_cap_and_landing_budget() {
+        let raw = json!({
+            "targets": [{"type": "readme"}],
+            "subsystem_page_cap": 8,
+            "landing_budget": 150
+        });
+        let cfg = ProjectDocConfig::parse(Some(&raw)).unwrap();
+        assert_eq!(cfg.subsystem_page_cap, 8);
+        assert_eq!(cfg.landing_budget, 150);
+    }
+
+    #[test]
+    fn identity_hint_is_read_and_trimmed_when_present() {
+        let raw = json!({
+            "targets": [{"type": "readme"}],
+            "identity_hint": "  Terminus: the fleet's MCP tool hub.  "
+        });
+        let cfg = ProjectDocConfig::parse(Some(&raw)).unwrap();
+        assert_eq!(cfg.identity_hint.as_deref(), Some("Terminus: the fleet's MCP tool hub."));
+    }
+
+    #[test]
+    fn blank_identity_hint_is_treated_as_absent() {
+        let raw = json!({"targets": [{"type": "readme"}], "identity_hint": "   "});
+        let cfg = ProjectDocConfig::parse(Some(&raw)).unwrap();
+        assert_eq!(cfg.identity_hint, None);
+    }
+
+    /// Negative test: a wrong-shaped tuning knob (not a number/not a
+    /// string) is never a hard parse error -- it degrades to the default,
+    /// exactly like the "missing" case.
+    #[test]
+    fn wrong_shaped_dgrich_09_options_fall_back_to_defaults_not_an_error() {
+        let raw = json!({
+            "targets": [{"type": "readme"}],
+            "subsystem_page_cap": "twelve",
+            "landing_budget": true,
+            "identity_hint": 42
+        });
+        let cfg = ProjectDocConfig::parse(Some(&raw)).unwrap();
+        assert_eq!(cfg.subsystem_page_cap, DEFAULT_SUBSYSTEM_PAGE_CAP);
+        assert_eq!(cfg.landing_budget, DEFAULT_LANDING_BUDGET);
+        assert_eq!(cfg.identity_hint, None);
+    }
+
+    /// The DGRICH-09 options are honored even when `targets` is present but
+    /// empty (which still means "not opted in" at the trigger's own gate --
+    /// this only asserts the schema layer itself doesn't drop the knobs).
+    #[test]
+    fn dgrich_09_options_survive_an_empty_targets_array() {
+        let raw = json!({"targets": [], "subsystem_page_cap": 4});
+        let cfg = ProjectDocConfig::parse(Some(&raw)).unwrap();
+        assert_eq!(cfg.subsystem_page_cap, 4);
+        // targets still fell back to the readme-only default.
+        assert_eq!(cfg.targets.len(), 1);
     }
 
     #[test]

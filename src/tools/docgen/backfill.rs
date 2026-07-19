@@ -803,7 +803,7 @@ from there."
                 },
                 "project_config": {
                     "type": "object",
-                    "description": "The project's raw doc-target config, e.g. {\"targets\": [{\"type\": \"readme\"}]}. Must declare a \"readme\" target for a backfill to have anything to place."
+                    "description": "The project's raw doc-target config, e.g. {\"targets\": [{\"type\": \"readme\"}]}. Must declare a \"readme\" target for a backfill to have anything to place. DGRICH-09: for the repo-level rich pipeline this object also accepts the same optional tuning knobs docgen_run does -- \"subsystem_page_cap\", \"landing_budget\", \"identity_hint\" -- see docgen_run's parameter description for details; all default cleanly when omitted."
                 },
                 "available_credential_keys": {
                     "type": "array",
