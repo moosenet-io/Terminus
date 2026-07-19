@@ -3,10 +3,14 @@
 // panel adds one line here — the shell never needs to change.
 //
 // CONST-16: also registers the ModuleDescriptor for every module that has a real presence
-// today (harmony/chord/lumina/terminus). `muse`/`models`/`mint` are valid `ModuleId`s (see
+// today (harmony/chord/lumina/muse/terminus). `models`/`mint` are valid `ModuleId`s (see
 // moduleRegistry.ts) but are NOT registered here yet — their modules/panels land with
-// CONST-19..24; until then they simply don't exist in the registry, so they never show up
+// CONST-21..24; until then they simply don't exist in the registry, so they never show up
 // as a global-bar tab (no module descriptor to match `getAvailableModules` against).
+//
+// CONST-19 registers the `muse` module descriptor only — no panels yet (CONST-20's job); a
+// module with zero registered panels is a valid, if empty, tab (`getPanelsByModule('muse')`
+// returns `[]` until CONST-20 lands `muse.dashboard`/`muse.taste`/`muse.channels`).
 //
 // Panel `system` values are now lowercase ModuleIds (not the old capitalized SystemGroup) —
 // the legacy Status/Providers groups have dissolved: Analytics/Engine Diagram re-home under
@@ -44,6 +48,9 @@ import { Analytics } from '../pages/Analytics';
 registerModule({ id: 'harmony', title: 'Harmony', icon: '⌂', healthSystem: 'harmony', order: 1 });
 registerModule({ id: 'chord', title: 'Chord', icon: '⚡', healthSystem: 'chord', order: 2 });
 registerModule({ id: 'lumina', title: 'Lumina', icon: '✦', healthSystem: 'lumina', order: 3 });
+// CONST-19: module registration only -- no panels yet (CONST-20 adds
+// muse.dashboard/muse.taste/muse.channels).
+registerModule({ id: 'muse', title: 'Muse', icon: '🎬', healthSystem: 'muse', order: 4 });
 registerModule({ id: 'terminus', title: 'Terminus', icon: '⚙', healthSystem: 'terminus', order: 7 });
 
 // ── Harmony ──────────────────────────────────────────────────────────────────
