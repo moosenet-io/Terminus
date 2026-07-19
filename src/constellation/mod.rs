@@ -13,7 +13,8 @@
 //! ## What lives here
 //! - [`constellation_router`] — the `Router` this module contributes:
 //!   `/api/auth/*` (`crate::constellation::auth`), `/api/health`,
-//!   `/api/terminus/config`, the four namespaced backend proxies
+//!   `/api/terminus/config`, `/api/terminus/activity` (CONST-26 — see
+//!   [`activity`]), the four namespaced backend proxies
 //!   (`crate::constellation::proxy`), the `/ws` real-time relay ([`ws`],
 //!   CONST-18), and a static-asset
 //!   fallback serving the built `constellation-web` SPA — by default from
@@ -37,6 +38,7 @@
 //! contract — see that file's own doc comment for the endpoint list this
 //! module must satisfy byte-for-byte.
 
+pub mod activity;
 pub mod assets;
 pub mod audit;
 pub mod auth;
@@ -84,7 +86,7 @@ fn public_router(state: Arc<McpServerState>) -> Router {
 
 /// The `/api/*` routes CONST-03's guard actually protects: every proxied
 /// backend passthrough plus the terminus config/registry introspection
-/// endpoint. `crate::constellation::auth::require_session` is layered over
+/// endpoint and the CONST-26 activity feed. `crate::constellation::auth::require_session` is layered over
 /// this router ONLY -- an unauthenticated request here is rejected `401`
 /// before the handler (and therefore before any backend dispatch) ever
 /// runs. See [`public_router`] for what deliberately stays outside this
@@ -92,6 +94,7 @@ fn public_router(state: Arc<McpServerState>) -> Router {
 fn protected_router(state: Arc<McpServerState>) -> Router {
     Router::new()
         .route("/api/terminus/config", get(handle_terminus_config))
+        .route("/api/terminus/activity", get(activity::handle_activity))
         .route("/api/harmony/*path", any(proxy::proxy_harmony))
         .route("/api/chord/*path", any(proxy::proxy_chord))
         .route("/api/lumina/*path", any(proxy::proxy_lumina))

@@ -9,10 +9,13 @@ import type { Density } from './components/GlobalBar';
 import { ModuleRail } from './components/ModuleRail';
 import type { RailVariant } from './components/ModuleRail';
 import { Login } from './components/Login';
+import { ToastProvider, useToastContext } from './components/Toast';
 import { useAuth } from './hooks/useAuth';
+import { useActivityFeed } from './hooks/useActivityFeed';
 import { AuthRoleProvider } from './hooks/AuthRoleContext';
 import { getAggregationClient } from './lib/aggregationClient';
 import type { HealthStatus } from './lib/aggregationClient';
+import type { FeedItem } from './lib/activityFeed';
 import { getAvailableModules, getAvailablePanels } from './lib/moduleRegistry';
 import { OverviewPanel } from './panels/overview/OverviewPanel';
 
@@ -53,6 +56,20 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
     () => getAggregationClient().prefs.get<Density>('density') ?? 'comfortable',
   );
   const [drawerOpen, setDrawerOpen] = useState(false);
+
+  // CONST-26 (§3.3): the shell's one merged activity feed, shared by the GlobalBar's
+  // notification bell and the Overview canvas' ActivityFeedCard — a detected health transition
+  // ALSO surfaces as a toast (via the ToastProvider mounted around this whole component in
+  // `App()` below), which is why the toast-push callback lives here rather than inside the hook
+  // itself (the hook stays toast-layer-agnostic).
+  const { push: pushToast } = useToastContext();
+  const feedItems = useActivityFeed(
+    health,
+    useCallback(
+      (item: FeedItem) => pushToast(item.text.replace(/^\[(ok|warn|error)\]\s*/, ''), item.level),
+      [pushToast],
+    ),
+  );
 
   // Grace bookkeeping: which systems have EVER been seen available (so a system that's never
   // come up doesn't get a fake grace window), and a per-system consecutive-miss counter.
@@ -223,6 +240,7 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
         pollDegraded={pollDegraded}
         onOpenMenu={railVariant === 'drawer' ? () => setDrawerOpen(true) : undefined}
         panels={panels}
+        feedItems={feedItems}
       />
 
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
@@ -259,7 +277,13 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
               <Route
                 path="/overview"
                 element={
-                  <OverviewPanel modules={modules} health={health} degradedSystems={degradedSystems} density={density} />
+                  <OverviewPanel
+                    modules={modules}
+                    health={health}
+                    degradedSystems={degradedSystems}
+                    density={density}
+                    feedItems={feedItems}
+                  />
                 }
               />
               {panels.map(panel => {
@@ -288,22 +312,25 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
 export default function App() {
   const { authenticated, username, role, loading: authLoading, login, logout } = useAuth();
 
-  // While checking auth, show blank page (avoids flash of login screen)
-  if (authLoading) {
-    return <div style={{ height: '100vh', background: 'var(--bg-base)' }} />;
-  }
-
-  if (!authenticated) {
-    return <Login onLogin={login} />;
-  }
-
+  // ToastProvider wraps every branch (not just the authenticated Shell) so its mounted state
+  // never resets across an auth transition — harmless for the pre-auth branches below, which
+  // simply never push a toast (only `Shell`, via `useActivityFeed`, does).
   return (
-    <BrowserRouter basename="/">
-      {/* CONST-27: republish `role` via context so `RoleGate` — used deep inside panels the
-          router mounts with no props — can read it without prop-drilling. */}
-      <AuthRoleProvider role={role}>
-        <Shell username={username} onLogout={logout} />
-      </AuthRoleProvider>
-    </BrowserRouter>
+    <ToastProvider>
+      {authLoading ? (
+        // While checking auth, show blank page (avoids flash of login screen)
+        <div style={{ height: '100vh', background: 'var(--bg-base)' }} />
+      ) : !authenticated ? (
+        <Login onLogin={login} />
+      ) : (
+        <BrowserRouter basename="/">
+          {/* CONST-27: republish `role` via context so `RoleGate` — used deep inside panels the
+              router mounts with no props — can read it without prop-drilling. */}
+          <AuthRoleProvider role={role}>
+            <Shell username={username} onLogout={logout} />
+          </AuthRoleProvider>
+        </BrowserRouter>
+      )}
+    </ToastProvider>
   );
 }
