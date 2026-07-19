@@ -1,29 +1,51 @@
-// CONST-20 SEAM (temporary, clearly marked per the spec item's own instruction): CONST-27 is
-// the item that builds the real, shell-level `RoleGate` (§2.3 lists it as a restyle target of
-// a component that doesn't exist in this repo yet). Muse's channel compose/maintenance
-// actions need role gating NOW (spec §5.4), so this is a minimal stand-in with the same
-// intended API (`minRole` + children + optional `fallback`) -- CONST-27 can drop this file in
-// favor of its own without touching any call site.
+// CONST-27 (§3.4): cosmetic-only client-side gate for mutating controls. Wraps a control
+// (button, toggle, slider, palette command, …) and, for a viewer session, renders it disabled
+// with an "operator role required" tooltip instead of removing it — the operator can still
+// see what exists, just not use it.
 //
-// Enforcement is ALWAYS server-side (spec §3.4: "UI RoleGate is a courtesy, never the
-// enforcement") -- this component only hides/shows UI affordances; a viewer session hitting a
-// mutating muse route still gets a structural 403 from the backend regardless of what this
-// renders.
+// This is DELIBERATELY not the enforcement: the server's `enforce_viewer_role_gate`
+// middleware (`src/constellation/auth.rs`) rejects a viewer's mutating request with
+// `403 {"error":"forbidden","required_role":"operator"}` regardless of whether a control is
+// wrapped in `RoleGate` at all — see that module's doc, and the acceptance criterion "proven
+// by direct POST as viewer". A caller with dev tools open (or curl) bypasses this gate
+// trivially; that's expected and fine, because it can never bypass the server-side one.
 import type { ReactNode } from 'react';
-import { useAuthRole, type AuthRole } from '../hooks/useAuthRole';
+import { useAuthRole } from '../hooks/AuthRoleContext';
 
-const ROLE_RANK: Record<AuthRole, number> = { viewer: 0, operator: 1 };
+const TOOLTIP = 'operator role required';
 
-interface RoleGateProps {
-  minRole: AuthRole;
+export interface RoleGateProps {
   children: ReactNode;
-  /** Rendered instead of children when the current role doesn't meet `minRole`. Defaults to
-   *  rendering nothing (the common case: hide the action entirely for a viewer). */
-  fallback?: ReactNode;
+  /** Wrapper display mode — 'inline-flex' (default) for a control sitting in a flex row of
+   *  buttons/toggles, 'block' for a standalone control (e.g. a full-width slider). */
+  display?: 'inline-flex' | 'block';
 }
 
-export function RoleGate({ minRole, children, fallback = null }: RoleGateProps) {
+/** Gates `children` to the operator role. A `null` role (unauthenticated — shouldn't normally
+ *  render here at all, see `App.tsx`) is treated the same as `'operator'`: this component
+ *  only ever narrows access for a CONFIRMED viewer session, never invents a stricter
+ *  cosmetic state than the server itself would apply. */
+export function RoleGate({ children, display = 'inline-flex' }: RoleGateProps) {
   const role = useAuthRole();
-  if (ROLE_RANK[role] < ROLE_RANK[minRole]) return <>{fallback}</>;
-  return <>{children}</>;
+
+  if (role !== 'viewer') {
+    return <>{children}</>;
+  }
+
+  return (
+    <span
+      title={TOOLTIP}
+      aria-disabled="true"
+      style={{
+        display,
+        opacity: 0.45,
+        cursor: 'not-allowed',
+        // Blocks all pointer interaction with the wrapped control(s) — the visual "disabled"
+        // state a viewer sees, backed by the real 403 if this were somehow bypassed.
+        pointerEvents: 'none',
+      }}
+    >
+      {children}
+    </span>
+  );
 }

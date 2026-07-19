@@ -6,8 +6,7 @@
 // deliberately NOT an EPG-widget layout -- spec §5.4 is explicit about this ("rendered as a
 // DataTable timeline, not an EPG widget").
 //
-// Compose/maintenance: CONST-27 (real role claims + a shared RoleGate/ConfirmDialog) hasn't
-// merged yet, so these use the CONST-20 seam components (`components/RoleGate.tsx`,
+// Compose/maintenance: gated by CONST-27's shared RoleGate (merged) + the local ConfirmDialog (`components/ConfirmDialog.tsx`,
 // `components/ConfirmDialog.tsx`, `hooks/useAuthRole.ts`) -- each clearly marked as a
 // stand-in in its own file. There is no Toast infra yet either (CONST-26, not merged) so the
 // mutation result renders as an inline status line next to the action buttons rather than a
@@ -73,7 +72,7 @@ function ChannelsListSection({
       header: 'Actions',
       align: 'right',
       render: c => (
-        <RoleGate minRole="operator" fallback={<Badge tone="neutral">viewer</Badge>}>
+        <RoleGate>
           <div style={{ display: 'flex', gap: 'var(--space-2)', justifyContent: 'flex-end' }}>
             <Button variant="secondary" size="sm" onClick={() => onRequestAction('compose', c)}>Compose</Button>
             <Button variant="ghost" size="sm" onClick={() => onRequestAction('maintenance', c)}>Maintenance</Button>
