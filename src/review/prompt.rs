@@ -373,6 +373,9 @@ pub fn parse_findings_with_marker(text: &str, marker: &str) -> Vec<Finding> {
 /// response can be used directly without further extraction (unlike
 /// `build_prompt`'s `VERDICT:` sentinel, there is no structured sentinel to
 /// parse out of a docs-generation response).
+///
+/// DEPRECATED: repo-level docgen uses `src/tools/docgen/prompts.rs`
+/// (DGRICH-02). Kept for the legacy per-module path.
 pub fn build_docs_prompt(module_path: &str, git_ref: &str, context: &Value) -> String {
     let context_str = serde_json::to_string_pretty(context).unwrap_or_else(|_| context.to_string());
     format!(

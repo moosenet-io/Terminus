@@ -13,7 +13,14 @@ import { ProviderPerformance } from '../components/analytics/ProviderPerformance
 import {
   LineChart, Line, BarChart, Bar,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
-} from 'recharts';
+} from '../viz/recharts';
+// CONST-17: solid hairline grid + brand tick style from the viz kit — retires the dashed
+// GRID_PROPS anti-pattern (audit §1.4).
+import { rechartsGridProps, rechartsTickStyle } from '../viz/theme';
+// CONST-17 r3: every chart ships its table-view twin (§4.4) — the inline SRPT charts below
+// were the last holdouts (EnrichmentAnalytics/CostChart/TokenUsageChart got theirs in r1).
+import { TableView, TableViewControls, useTableView } from '../viz/TableViewToggle';
+import type { DataTableColumn } from '../components/DataTable';
 
 type Period = '24h' | '7d' | '30d';
 
@@ -23,9 +30,32 @@ interface CostBucket { date: string; cost_usd: number; provider: string; }
 interface DurationBucket { range: string; count: number; tier: string; }
 interface QualityPoint { provider: string; score: number; task_id: string; }
 
-// ── Shared chart theme ────────────────────────────────────────────────────────
-const CHART_STYLE = { fontSize: 11, fill: 'var(--h-text-dim)' } as const;
-const GRID_PROPS = { strokeDasharray: '3 3', stroke: 'rgba(255,255,255,0.06)' } as const;
+// ── Shared chart theme (CONST-17: brand-derived, no dashed grid) ──────────────
+// r4 review fix: read at render scope, never module scope — module-eval can precede the
+// token sheet's application and getVizTheme() memoizes its first read (fallback hexes would
+// be cached for the whole session). The reads are memoized, so per-render calls are free.
+const chartTheme = () => ({ CHART_STYLE: rechartsTickStyle(), GRID_PROPS: rechartsGridProps() });
+
+/** CONST-17 r3: shared chart/table twin wrapper for the inline SRPT charts — toggle row
+ *  sits ABOVE the chart box (never inside a fixed-height body, per the r2 clipping fix). */
+function TwinChart<T>({ columns, rows, rowKey, children }: {
+  columns: DataTableColumn<T>[];
+  rows: T[];
+  rowKey: (row: T, index: number) => string;
+  children: React.ReactNode;
+}) {
+  const { view, setView } = useTableView();
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 6 }}>
+        <TableViewControls view={view} onChange={setView} />
+      </div>
+      <TableView view={view} columns={columns} rows={rows} rowKey={rowKey}>
+        {children}
+      </TableView>
+    </div>
+  );
+}
 
 function EmptyState({ message }: { message: string }) {
   return (
@@ -37,6 +67,7 @@ function EmptyState({ message }: { message: string }) {
 
 // ── SRPT-01: Task Completion Rate ─────────────────────────────────────────────
 function TaskCompletionChart({ period, project }: { period: Period; project: string }) {
+  const { CHART_STYLE, GRID_PROPS } = chartTheme();
   const [data, setData] = useState<CompletionBucket[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -52,23 +83,32 @@ function TaskCompletionChart({ period, project }: { period: Period; project: str
   if (loading) return <div className="h-skeleton" style={{ height: 200 }} />;
   if (!data.length) return <EmptyState message="No data for this period" />;
 
+  const columns: DataTableColumn<CompletionBucket>[] = [
+    { key: 'hour', header: 'Hour', render: r => r.hour },
+    { key: 'completed', header: 'Completed', align: 'right', render: r => r.completed },
+    { key: 'failed', header: 'Failed', align: 'right', render: r => r.failed },
+  ];
+
   return (
-    <ResponsiveContainer width="100%" height={200}>
-      <LineChart data={data} margin={{ top: 5, right: 20, bottom: 5, left: 0 }}>
-        <CartesianGrid {...GRID_PROPS} />
-        <XAxis dataKey="hour" tick={CHART_STYLE} tickFormatter={s => s.slice(11, 16)} />
-        <YAxis tick={CHART_STYLE} />
-        <Tooltip contentStyle={{ background: 'var(--h-bg-card)', border: '1px solid var(--h-border)', fontSize: 11 }} />
-        <Legend wrapperStyle={{ fontSize: 11 }} />
-        <Line type="monotone" dataKey="completed" stroke="var(--h-green)" strokeWidth={2} dot={false} name="Completed" />
-        <Line type="monotone" dataKey="failed" stroke="var(--h-red)" strokeWidth={1.5} dot={false} name="Failed" />
-      </LineChart>
-    </ResponsiveContainer>
+    <TwinChart columns={columns} rows={data} rowKey={r => r.hour}>
+      <ResponsiveContainer width="100%" height={200}>
+        <LineChart data={data} margin={{ top: 5, right: 20, bottom: 5, left: 0 }}>
+          <CartesianGrid {...GRID_PROPS} />
+          <XAxis dataKey="hour" tick={CHART_STYLE} tickFormatter={s => s.slice(11, 16)} />
+          <YAxis tick={CHART_STYLE} />
+          <Tooltip contentStyle={{ background: 'var(--h-bg-card)', border: '1px solid var(--h-border)', fontSize: 11 }} />
+          <Legend wrapperStyle={{ fontSize: 11 }} />
+          <Line type="monotone" dataKey="completed" stroke="var(--h-green)" strokeWidth={2} dot={false} name="Completed" />
+          <Line type="monotone" dataKey="failed" stroke="var(--h-red)" strokeWidth={1.5} dot={false} name="Failed" />
+        </LineChart>
+      </ResponsiveContainer>
+    </TwinChart>
   );
 }
 
 // ── SRPT-02: Provider Performance ─────────────────────────────────────────────
 function ProviderComparisonChart({ period }: { period: Period }) {
+  const { CHART_STYLE, GRID_PROPS } = chartTheme();
   const [data, setData] = useState<ProviderStat[]>([]);
   const [metric, setMetric] = useState<'avg_latency_ms' | 'success_rate' | 'avg_cost' | 'avg_quality'>('success_rate');
   const [loading, setLoading] = useState(true);
@@ -96,21 +136,32 @@ function ProviderComparisonChart({ period }: { period: Period }) {
           </button>
         ))}
       </div>
-      <ResponsiveContainer width="100%" height={180}>
-        <BarChart data={data} margin={{ top: 5, right: 20, bottom: 5, left: 0 }}>
-          <CartesianGrid {...GRID_PROPS} />
-          <XAxis dataKey="name" tick={CHART_STYLE} />
-          <YAxis tick={CHART_STYLE} />
-          <Tooltip contentStyle={{ background: 'var(--h-bg-card)', border: '1px solid var(--h-border)', fontSize: 11 }} />
-          <Bar dataKey={metric} fill={metricColors[metric]} name={metricLabels[metric]} />
-        </BarChart>
-      </ResponsiveContainer>
+      <TwinChart
+        columns={[
+          { key: 'name', header: 'Provider', render: r => r.name },
+          { key: 'metric', header: metricLabels[metric], align: 'right', render: r => String(r[metric]) },
+          { key: 'task_count', header: 'Tasks', align: 'right', render: r => r.task_count },
+        ] as DataTableColumn<ProviderStat>[]}
+        rows={data}
+        rowKey={r => r.name}
+      >
+        <ResponsiveContainer width="100%" height={180}>
+          <BarChart data={data} margin={{ top: 5, right: 20, bottom: 5, left: 0 }}>
+            <CartesianGrid {...GRID_PROPS} />
+            <XAxis dataKey="name" tick={CHART_STYLE} />
+            <YAxis tick={CHART_STYLE} />
+            <Tooltip contentStyle={{ background: 'var(--h-bg-card)', border: '1px solid var(--h-border)', fontSize: 11 }} />
+            <Bar dataKey={metric} fill={metricColors[metric]} name={metricLabels[metric]} />
+          </BarChart>
+        </ResponsiveContainer>
+      </TwinChart>
     </div>
   );
 }
 
 // ── SRPT-03: Cost Tracking ────────────────────────────────────────────────────
 function CostTrackingChart({ period }: { period: Period }) {
+  const { CHART_STYLE, GRID_PROPS } = chartTheme();
   const [data, setData] = useState<CostBucket[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -124,21 +175,29 @@ function CostTrackingChart({ period }: { period: Period }) {
   if (loading) return <div className="h-skeleton" style={{ height: 160 }} />;
   if (!data.length) return <EmptyState message="No cost data" />;
 
+  const columns: DataTableColumn<CostBucket>[] = [
+    { key: 'date', header: 'Date', render: r => r.date },
+    { key: 'cost_usd', header: 'Cost (USD)', align: 'right', render: r => `$${r.cost_usd.toFixed(4)}` },
+  ];
+
   return (
-    <ResponsiveContainer width="100%" height={160}>
-      <LineChart data={data} margin={{ top: 5, right: 20, bottom: 5, left: 0 }}>
-        <CartesianGrid {...GRID_PROPS} />
-        <XAxis dataKey="date" tick={CHART_STYLE} />
-        <YAxis tick={CHART_STYLE} tickFormatter={v => `$${v.toFixed(2)}`} />
-        <Tooltip contentStyle={{ background: 'var(--h-bg-card)', border: '1px solid var(--h-border)', fontSize: 11 }} formatter={(v) => [`$${Number(v).toFixed(4)}`, 'Cost']} />
-        <Line type="monotone" dataKey="cost_usd" stroke="var(--h-amber)" strokeWidth={2} dot={false} name="Daily Cost" />
-      </LineChart>
-    </ResponsiveContainer>
+    <TwinChart columns={columns} rows={data} rowKey={(r, i) => `${r.date}-${i}`}>
+      <ResponsiveContainer width="100%" height={160}>
+        <LineChart data={data} margin={{ top: 5, right: 20, bottom: 5, left: 0 }}>
+          <CartesianGrid {...GRID_PROPS} />
+          <XAxis dataKey="date" tick={CHART_STYLE} />
+          <YAxis tick={CHART_STYLE} tickFormatter={v => `$${v.toFixed(2)}`} />
+          <Tooltip contentStyle={{ background: 'var(--h-bg-card)', border: '1px solid var(--h-border)', fontSize: 11 }} formatter={(v) => [`$${Number(v).toFixed(4)}`, 'Cost']} />
+          <Line type="monotone" dataKey="cost_usd" stroke="var(--h-amber)" strokeWidth={2} dot={false} name="Daily Cost" />
+        </LineChart>
+      </ResponsiveContainer>
+    </TwinChart>
   );
 }
 
 // ── SRPT-04: Build Duration Histogram ─────────────────────────────────────────
 function BuildDurationChart({ period }: { period: Period }) {
+  const { CHART_STYLE, GRID_PROPS } = chartTheme();
   const [data, setData] = useState<DurationBucket[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -152,21 +211,30 @@ function BuildDurationChart({ period }: { period: Period }) {
   if (loading) return <div className="h-skeleton" style={{ height: 160 }} />;
   if (!data.length) return <EmptyState message="No build duration data" />;
 
+  const columns: DataTableColumn<DurationBucket>[] = [
+    { key: 'range', header: 'Duration', render: r => r.range },
+    { key: 'tier', header: 'Tier', render: r => r.tier },
+    { key: 'count', header: 'Tasks', align: 'right', render: r => r.count },
+  ];
+
   return (
-    <ResponsiveContainer width="100%" height={160}>
-      <BarChart data={data} margin={{ top: 5, right: 20, bottom: 5, left: 0 }}>
-        <CartesianGrid {...GRID_PROPS} />
-        <XAxis dataKey="range" tick={CHART_STYLE} />
-        <YAxis tick={CHART_STYLE} />
-        <Tooltip contentStyle={{ background: 'var(--h-bg-card)', border: '1px solid var(--h-border)', fontSize: 11 }} />
-        <Bar dataKey="count" fill="var(--h-blue)" name="Tasks" />
-      </BarChart>
-    </ResponsiveContainer>
+    <TwinChart columns={columns} rows={data} rowKey={(r, i) => `${r.range}-${r.tier}-${i}`}>
+      <ResponsiveContainer width="100%" height={160}>
+        <BarChart data={data} margin={{ top: 5, right: 20, bottom: 5, left: 0 }}>
+          <CartesianGrid {...GRID_PROPS} />
+          <XAxis dataKey="range" tick={CHART_STYLE} />
+          <YAxis tick={CHART_STYLE} />
+          <Tooltip contentStyle={{ background: 'var(--h-bg-card)', border: '1px solid var(--h-border)', fontSize: 11 }} />
+          <Bar dataKey="count" fill="var(--h-blue)" name="Tasks" />
+        </BarChart>
+      </ResponsiveContainer>
+    </TwinChart>
   );
 }
 
 // ── SRPT-05: Quality Score Distribution ──────────────────────────────────────
 function QualityScoreChart({ period }: { period: Period }) {
+  const { CHART_STYLE, GRID_PROPS } = chartTheme();
   const [data, setData] = useState<QualityPoint[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -191,16 +259,23 @@ function QualityScoreChart({ period }: { period: Period }) {
   if (loading) return <div className="h-skeleton" style={{ height: 160 }} />;
   if (!chartData.length) return <EmptyState message="No quality data" />;
 
+  const columns: DataTableColumn<{ name: string; avg_quality: number }>[] = [
+    { key: 'name', header: 'Provider', render: r => r.name },
+    { key: 'avg_quality', header: 'Avg Quality', align: 'right', render: r => r.avg_quality.toFixed(2) },
+  ];
+
   return (
-    <ResponsiveContainer width="100%" height={160}>
-      <BarChart data={chartData} margin={{ top: 5, right: 20, bottom: 5, left: 0 }}>
-        <CartesianGrid {...GRID_PROPS} />
-        <XAxis dataKey="name" tick={CHART_STYLE} />
-        <YAxis tick={CHART_STYLE} domain={[0, 1]} tickFormatter={v => v.toFixed(1)} />
-        <Tooltip contentStyle={{ background: 'var(--h-bg-card)', border: '1px solid var(--h-border)', fontSize: 11 }} formatter={(v) => [Number(v).toFixed(2), 'Avg Quality']} />
-        <Bar dataKey="avg_quality" fill="var(--h-teal)" name="Avg Quality" />
-      </BarChart>
-    </ResponsiveContainer>
+    <TwinChart columns={columns} rows={chartData} rowKey={r => r.name}>
+      <ResponsiveContainer width="100%" height={160}>
+        <BarChart data={chartData} margin={{ top: 5, right: 20, bottom: 5, left: 0 }}>
+          <CartesianGrid {...GRID_PROPS} />
+          <XAxis dataKey="name" tick={CHART_STYLE} />
+          <YAxis tick={CHART_STYLE} domain={[0, 1]} tickFormatter={v => v.toFixed(1)} />
+          <Tooltip contentStyle={{ background: 'var(--h-bg-card)', border: '1px solid var(--h-border)', fontSize: 11 }} formatter={(v) => [Number(v).toFixed(2), 'Avg Quality']} />
+          <Bar dataKey="avg_quality" fill="var(--h-teal)" name="Avg Quality" />
+        </BarChart>
+      </ResponsiveContainer>
+    </TwinChart>
   );
 }
 
