@@ -74,8 +74,13 @@ export function CommandPalette({ open, onClose, panels, onNavigate, role }: Comm
 
   // Entity search: debounced 150ms, degrades per-source (searchEntities never rejects as a
   // whole — see its doc comment). Skipped entirely for an empty query. Stale responses are
-  // dropped via searchSeqRef (freshness guard, review fix).
+  // dropped via searchSeqRef: the sequence advances on EVERY query change, clear, and
+  // close (cycle-2 review fix — bumping only when a request was issued let an in-flight
+  // older search apply results after the input was cleared or retyped), so an in-flight
+  // response is only applied when it still belongs to the CURRENT query state.
   useEffect(() => {
+    // Any query-state transition (including close + clear) invalidates whatever is in flight.
+    const seq = ++searchSeqRef.current;
     if (!open) return;
     if (debounceRef.current) clearTimeout(debounceRef.current);
     if (query.trim().length === 0) {
@@ -83,7 +88,6 @@ export function CommandPalette({ open, onClose, panels, onNavigate, role }: Comm
       return;
     }
     debounceRef.current = setTimeout(() => {
-      const seq = ++searchSeqRef.current;
       searchEntities(query, getAggregationClient()).then(results => {
         if (seq === searchSeqRef.current) setEntityResults(results);
       });
