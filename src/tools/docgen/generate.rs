@@ -798,6 +798,16 @@ async fn run_guides_pass(
         "registered_tool_count": facts.entry_points.registered_tool_count,
         "config_surface": facts.config_surface,
         "guide_topics": identity.guide_topics,
+        // DGDG-02: the current guides/getting-started (if this repo already
+        // has them) as the Pass 3 "deepen, don't regenerate" baseline. Both
+        // are `None`/empty on a first-ever run -- `build_guides_prompt`
+        // treats absence as "write fresh," exactly as before this field
+        // existed. Untrusted content like every other field embedded here --
+        // covered by the SAME whole-prompt PII sweep this pass already runs
+        // before every send (see the comment on `prompt_for_send` below),
+        // not a second sweep.
+        "existing_getting_started": facts.existing_docs.getting_started,
+        "existing_guides": facts.existing_docs.guides,
     });
 
     let legacy_usage: String = facts
@@ -1463,6 +1473,15 @@ mod tests {
                 .expect("fixture facts should build")
         }
 
+        /// DGDG-02: same fixture graph as [`fixture_facts`], but built against
+        /// a REAL on-disk checkout so `RepoFacts::existing_docs` can actually
+        /// pick up whatever `docs/` tree is present at `checkout_path`.
+        fn fixture_facts_at(checkout_path: &Path) -> RepoFacts {
+            let g = two_subsystem_graph();
+            build_repo_facts(&FixtureGraphSource(g), checkout_path, "FIXR", "abc123")
+                .expect("fixture facts should build")
+        }
+
         fn valid_identity_json(kept: &[&str]) -> String {
             let subsystems: Vec<Value> = kept
                 .iter()
@@ -1496,6 +1515,13 @@ mod tests {
             /// Optional per-subsystem canned good response override.
             page_responses: HashMap<String, String>,
             guides_response: String,
+            /// DGDG-02: every subsystem-page prompt actually sent, keyed by
+            /// subsystem name -- lets a test assert what baseline content
+            /// (or absence of one) reached a given subsystem's Pass 2 call
+            /// without re-deriving the prompt itself.
+            captured_page_prompts: Mutex<HashMap<String, String>>,
+            /// DGDG-02: the guides-pass prompt actually sent, if Pass 3 ran.
+            captured_guides_prompt: Mutex<Option<String>>,
         }
 
         impl ScriptedGenerator {
@@ -1505,6 +1531,8 @@ mod tests {
                     bad_subsystems: HashSet::new(),
                     page_responses: HashMap::new(),
                     guides_response: guides_response.into(),
+                    captured_page_prompts: Mutex::new(HashMap::new()),
+                    captured_guides_prompt: Mutex::new(None),
                 }
             }
 
@@ -1521,6 +1549,7 @@ mod tests {
                     return Ok(self.identity_response.clone());
                 }
                 if prompt.contains("You are writing the operator guides") {
+                    *self.captured_guides_prompt.lock().unwrap() = Some(prompt.to_string());
                     return Ok(self.guides_response.clone());
                 }
                 const MARKER: &str = "reference page for the `";
@@ -1528,6 +1557,10 @@ mod tests {
                     let rest = &prompt[idx + MARKER.len()..];
                     if let Some(end) = rest.find('`') {
                         let name = &rest[..end];
+                        self.captured_page_prompts
+                            .lock()
+                            .unwrap()
+                            .insert(name.to_string(), prompt.to_string());
                         if self.bad_subsystems.contains(name) {
                             return Ok(format!(
                                 "# {name}\n\nSee `crate::{name}::PhantomThing::not_real` for details.\n"
@@ -1671,6 +1704,119 @@ Clone with `git clone <repo>` then build with `cargo build`.
             // ...but the real guide file we DID get is still returned (partial success).
             assert_eq!(outcome.guides.len(), 1);
             assert_eq!(outcome.guides[0].0, PathBuf::from("docs/guides/run-the-fixture.md"));
+        }
+
+        // ── DGDG-02: repo-level generation deepens from an existing baseline ──
+
+        /// End-to-end across Passes 2 and 3: a real checkout already has
+        /// `docs/reference/alpha.md` (a "hand/Fable-written" baseline) but no
+        /// `beta` page, and already has `docs/getting-started.md` +
+        /// `docs/guides/run-the-fixture.md`. `generate_repo_docs` must hand
+        /// alpha's Pass 2 prompt the existing page as a refine baseline
+        /// (with the DEEPEN instruction), leave beta's prompt exactly as the
+        /// no-baseline case (first-run behavior for that subsystem), and
+        /// thread the existing guides content into the Pass 3 prompt too.
+        #[tokio::test]
+        async fn existing_docs_tree_reaches_subsystem_and_guides_prompts_as_refine_baseline() {
+            let dir = std::env::temp_dir()
+                .join(format!("dgdg02-repo-docs-baseline-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("docs/reference")).unwrap();
+            std::fs::create_dir_all(dir.join("docs/guides")).unwrap();
+            std::fs::write(
+                dir.join("docs/reference/alpha.md"),
+                "# alpha\n\nAlpha ALREADY documents the hub reliably -- this is the baseline.\n",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("docs/getting-started.md"),
+                "Clone with `git clone <repo>` then build with `cargo build` (EXISTING baseline).\n",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("docs/guides/run-the-fixture.md"),
+                "1. Build it with `cargo build` (EXISTING baseline step).\n",
+            )
+            .unwrap();
+
+            let facts = fixture_facts_at(&dir);
+            assert!(
+                facts.existing_docs.subsystem_pages.contains_key("alpha"),
+                "sanity: RepoFacts must have picked up alpha's existing page from disk"
+            );
+            assert!(!facts.existing_docs.subsystem_pages.contains_key("beta"));
+
+            let kept: Vec<&str> = facts.subsystems.iter().map(|s| s.name.as_str()).collect();
+            let generator = ScriptedGenerator::new(valid_identity_json(&kept), GOOD_GUIDES);
+            let outcome = generate_repo_docs(&generator, &facts, "FixtureRepo", "abc123").await;
+            assert!(outcome.missing.is_empty(), "missing: {:?}", outcome.missing);
+
+            let page_prompts = generator.captured_page_prompts.lock().unwrap();
+            let alpha_prompt = page_prompts.get("alpha").expect("alpha page must have been generated");
+            assert!(
+                alpha_prompt.contains("Alpha ALREADY documents the hub reliably"),
+                "alpha's existing page must reach its Pass 2 prompt as a refine baseline"
+            );
+            assert!(alpha_prompt.contains("DEEPEN AND REFINE"));
+
+            let beta_prompt = page_prompts.get("beta").expect("beta page must have been generated");
+            assert!(
+                !beta_prompt.contains("Alpha ALREADY documents the hub reliably"),
+                "beta must not see alpha's baseline"
+            );
+            // beta has no existing page on disk -> its slice OMITS the key entirely
+            // (not `null`), and its prompt carries no deepen rule -- byte-identical
+            // to the pre-DGDG-02 first-run shape for that subsystem.
+            assert!(
+                !beta_prompt.contains("existing_page"),
+                "beta (no existing page) must not mention existing_page at all: {beta_prompt}"
+            );
+            assert!(
+                !beta_prompt.contains("DEEPEN AND REFINE"),
+                "beta (no existing page) must not carry the deepen rule: {beta_prompt}"
+            );
+            drop(page_prompts);
+
+            let guides_prompt = generator
+                .captured_guides_prompt
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("guides pass must have run");
+            assert!(guides_prompt.contains("EXISTING baseline"));
+            assert!(guides_prompt.contains("EXISTING baseline step"));
+            assert!(guides_prompt.contains("DEEPEN AND REFINE"));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// First-run companion: no existing `docs/` tree at all -- every
+        /// prompt is exactly the no-baseline case, matching behavior before
+        /// this item.
+        #[tokio::test]
+        async fn no_existing_docs_tree_leaves_every_prompt_in_first_run_shape() {
+            let facts = fixture_facts(); // checkout path does not exist at all
+            assert!(facts.existing_docs.is_empty());
+
+            let kept: Vec<&str> = facts.subsystems.iter().map(|s| s.name.as_str()).collect();
+            let generator = ScriptedGenerator::new(valid_identity_json(&kept), GOOD_GUIDES);
+            let outcome = generate_repo_docs(&generator, &facts, "FixtureRepo", "abc123").await;
+            assert!(outcome.missing.is_empty(), "missing: {:?}", outcome.missing);
+
+            let page_prompts = generator.captured_page_prompts.lock().unwrap();
+            for (name, prompt) in page_prompts.iter() {
+                // First run (no docs/ tree): the slice OMITS existing_page entirely
+                // and the prompt carries no deepen rule -- byte-identical to the
+                // pre-DGDG-02 first-run prompt (codex review requirement).
+                assert!(
+                    !prompt.contains("existing_page"),
+                    "'{name}' first-run prompt must not mention existing_page at all: {prompt}"
+                );
+                assert!(
+                    !prompt.contains("DEEPEN AND REFINE"),
+                    "'{name}' first-run prompt must not carry the deepen rule: {prompt}"
+                );
+            }
         }
     }
 }

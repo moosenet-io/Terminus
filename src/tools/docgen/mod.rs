@@ -158,9 +158,9 @@ pub use readme_layers::{
 pub use render::docs_tree::{build_docs_tree, build_repo_docs_tree, first_paragraph, DocsTreeFile};
 pub use render::{render_all, RenderContext, RenderOutcome, RenderedArtifact};
 pub use repo_facts::{
-    build_repo_facts, AtlasGraphSource, BinTarget, ConfigSurface, EntryPoints, GraphSource,
-    LegacySection, ProseAnchors, RepoFacts, RepoScale, Subsystem, SubsystemEdge, SubsystemGraph,
-    SymbolRef,
+    build_repo_facts, AtlasGraphSource, BinTarget, ConfigSurface, EntryPoints, ExistingDocs,
+    GraphSource, LegacySection, ProseAnchors, RepoFacts, RepoScale, Subsystem, SubsystemEdge,
+    SubsystemGraph, SymbolRef,
 };
 pub use trigger::{run_docgen_trigger, DocgenRun, TriggerOutcome};
 pub use backfill::{backfill_readme, BackfillReport, DocgenBackfill};
