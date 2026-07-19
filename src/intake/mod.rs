@@ -40,7 +40,7 @@ pub mod lifecycle;
 pub mod newcats;
 mod runner;
 pub mod serving;
-mod storage;
+pub(crate) mod storage;
 pub mod supervisor;
 mod timeouts;
 pub mod vuln_scan;
