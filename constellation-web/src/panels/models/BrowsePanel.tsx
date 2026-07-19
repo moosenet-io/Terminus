@@ -327,8 +327,41 @@ export function BrowsePanel() {
                 <div style={{ fontSize: 'var(--fs-xs)', color: 'var(--text-muted)', marginTop: 4 }}>
                   {m.family ?? '—'}{m.params_b != null ? ` · ${m.params_b}B` : ''}{m.quant ? ` · ${m.quant}` : ''}
                 </div>
+                {m.category && (
+                  <div style={{ marginTop: 4 }}>
+                    <Badge tone="neutral">{m.category}</Badge>
+                  </div>
+                )}
                 <div style={{ marginTop: 'var(--space-2)' }}>
                   <CoverageStrip coverage={m.coverage} />
+                </div>
+                {/* Card-grid keeps the same core field set as the table (§6.1: "the alternate
+                    view keeps the core field set") — Best pass-rate/VRAM/Last run as compact
+                    mono lines, not the full DataTable columns. */}
+                <div
+                  style={{
+                    display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 'var(--space-2)',
+                    marginTop: 'var(--space-2)', fontSize: 'var(--fs-xs)', fontFamily: 'var(--font-mono)',
+                  }}
+                >
+                  <div>
+                    <div style={{ color: 'var(--text-faint)' }}>pass-rate</div>
+                    <div style={{ color: 'var(--text-body)', fontVariantNumeric: 'tabular-nums' }}>
+                      {m.best_pass_rate != null ? `${Math.round(m.best_pass_rate * 100)}%` : '—'}
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{ color: 'var(--text-faint)' }}>vram</div>
+                    <div style={{ color: 'var(--text-body)', fontVariantNumeric: 'tabular-nums' }}>
+                      {m.vram_gb != null ? `${m.vram_gb.toFixed(1)}G` : '—'}
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{ color: 'var(--text-faint)' }}>last run</div>
+                    <div style={{ color: 'var(--text-body)' }}>
+                      {m.last_run_at ? new Date(m.last_run_at).toLocaleDateString() : 'never'}
+                    </div>
+                  </div>
                 </div>
                 <div style={{ marginTop: 'var(--space-2)' }}>
                   <ScoreSparkbar score={m.discovery_score} />

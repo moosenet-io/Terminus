@@ -13,6 +13,7 @@ import { SkeletonList } from '../../components/Skeleton';
 import { RadarChart } from '../../viz/RadarChart';
 import { ChartEmpty } from '../../viz/ChartEmpty';
 import { CATEGORICAL_HEX, CHART_CHROME } from '../../viz/palette';
+import { isLowConfidenceScore, mintCaveatTooltip } from '../../lib/mintCaveat';
 import { useModelDetail, useMintDimensions } from '../../hooks/useModels';
 import type { BrochureStatus } from '../../types/models';
 
@@ -34,7 +35,7 @@ export function DetailPanel() {
   const { name: encoded } = useParams<{ name: string }>();
   const name = encoded ? decodeURIComponent(encoded) : undefined;
   const navigate = useNavigate();
-  const { data, loading, error, notFound } = useModelDetail(name);
+  const { data, loading, error, notFound, refetch } = useModelDetail(name);
   const { data: mint } = useMintDimensions(name ? [name] : []);
 
   const radarData = useMemo(() => {
@@ -47,6 +48,29 @@ export function DetailPanel() {
     }));
   }, [mint]);
 
+  // §6.2: "`low_confidence` and `n_samples <= 1` always render the ⚠ affordance + tooltip —
+  // never silently hidden," including in `models.detail` — the radar alone only carries `norm`,
+  // so this surfaces the per-dimension caveat the radar itself can't show.
+  const lowConfidenceDims = useMemo(() => {
+    if (!mint || mint.models.length === 0) return [];
+    return mint.models[0].scores.filter(isLowConfidenceScore);
+  }, [mint]);
+
+  // §2.6: "Error (non-degraded): inline `--status-error` + retry" — a fetch/network failure
+  // must render the error state, not "not found" (`error` and `notFound` are mutually
+  // exclusive per `useModelDetail`, but check order still matters: a stale `data`/`notFound`
+  // from a prior successful load must not mask a subsequent retry's failure).
+  if (error) {
+    return (
+      <div style={{ padding: 'var(--space-5)', textAlign: 'center', color: 'var(--status-error)' }}>
+        <div>Failed to load — {error}</div>
+        <Button variant="ghost" size="sm" onClick={refetch} style={{ marginTop: 'var(--space-3)' }}>
+          Retry
+        </Button>
+      </div>
+    );
+  }
+
   if (loading) {
     return <div style={{ padding: 'var(--space-5)' }}><SkeletonList rows={8} /></div>;
   }
@@ -58,10 +82,6 @@ export function DetailPanel() {
         <Link to="/models" style={{ color: 'var(--accent-bright)' }}>← Back to Model Library</Link>
       </div>
     );
-  }
-
-  if (error) {
-    return <div style={{ padding: 'var(--space-5)', color: 'var(--status-error)' }}>Failed to load — {error}</div>;
   }
 
   const { identity, brochure, serving, operational, catalog } = data;
@@ -215,6 +235,30 @@ export function DetailPanel() {
                 ]}
                 height={220}
               />
+              {lowConfidenceDims.length > 0 && mint && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  <div style={{ fontSize: 'var(--fs-xs)', color: 'var(--status-warning)' }}>
+                    ⚠ {lowConfidenceDims.length} of {mint.dimensions.length} dimension{lowConfidenceDims.length === 1 ? '' : 's'} low-confidence
+                    (small sample or high variance) — treat as indicative only.
+                  </div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                    {lowConfidenceDims.map(s => (
+                      <span
+                        key={s.dimension}
+                        title={mintCaveatTooltip(s)}
+                        style={{
+                          display: 'inline-flex', alignItems: 'center', gap: 4,
+                          fontSize: 'var(--fs-xs)', color: 'var(--status-warning)',
+                          border: '1px solid var(--status-warning)', borderRadius: 'var(--radius-sm)',
+                          padding: '2px 6px',
+                        }}
+                      >
+                        ⚠ {s.dimension}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
               {catalog?.card.best_pass_rate != null && (
                 <div style={{ fontSize: 'var(--fs-xs)', color: 'var(--text-muted)' }}>
                   Best pass-rate {Math.round(catalog.card.best_pass_rate * 100)}%

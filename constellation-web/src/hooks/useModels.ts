@@ -122,6 +122,8 @@ interface UseModelDetailResult {
   /** True only when the backend confirmed the model is unknown everywhere (§8: "404 only
    *  when unknown everywhere") — distinct from a plain fetch error. */
   notFound: boolean;
+  /** Re-runs the fetch without a full remount — backs the §2.6 inline-error retry affordance. */
+  refetch: () => void;
 }
 
 /** `models.detail` (`GET /api/terminus/models/{name}`, name pre-encoded by the caller). */
@@ -130,6 +132,7 @@ export function useModelDetail(name: string | undefined): UseModelDetailResult {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [notFound, setNotFound] = useState(false);
+  const [retryTick, setRetryTick] = useState(0);
 
   useEffect(() => {
     if (!name) {
@@ -139,6 +142,7 @@ export function useModelDetail(name: string | undefined): UseModelDetailResult {
     let cancelled = false;
     setLoading(true);
     setNotFound(false);
+    setError(null);
 
     async function load() {
       try {
@@ -163,9 +167,9 @@ export function useModelDetail(name: string | undefined): UseModelDetailResult {
 
     load();
     return () => { cancelled = true; };
-  }, [name]);
+  }, [name, retryTick]);
 
-  return { data, loading, error, notFound };
+  return { data, loading, error, notFound, refetch: () => setRetryTick(t => t + 1) };
 }
 
 /** MINT dimension scores for a set of models (radar overlays in `models.detail` and

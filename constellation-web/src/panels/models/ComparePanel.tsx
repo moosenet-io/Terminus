@@ -16,6 +16,7 @@ import {
 } from '../../viz/recharts';
 import { rechartsGridProps, rechartsTickStyle } from '../../viz/theme';
 import { SlotAssigner, CHART_CHROME } from '../../viz/palette';
+import { isLowConfidenceScore, mintCaveatTooltip } from '../../lib/mintCaveat';
 import { useModelsDetails, useMintDimensions, useModelsList, parseCompareModels } from '../../hooks/useModels';
 import type { ModelDetailResponse } from '../../types/models';
 
@@ -127,8 +128,8 @@ export function ComparePanel() {
               display: 'inline-flex', alignItems: 'center', gap: 4,
             }}>
               {row.format(score.norm)}
-              {(score.low_confidence || score.n <= 1) && (
-                <span title={`low confidence: n=${score.n}, stddev=${score.std_dev.toFixed(2)}`} style={{ color: 'var(--status-warning)' }}>⚠</span>
+              {isLowConfidenceScore(score) && (
+                <span title={mintCaveatTooltip(score)} style={{ color: 'var(--status-warning)' }}>⚠</span>
               )}
             </span>
           );
