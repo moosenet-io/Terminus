@@ -806,16 +806,27 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn lumina_proxy_attaches_server_side_bearer_and_never_forwards_browser_supplied_headers() {
-        async fn capture(headers: HeaderMap) -> Response {
-            let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-            let user = headers.get("x-lumina-user").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-            (
-                StatusCode::OK,
-                [("content-type", "application/json")],
-                json!({"auth": auth, "user": user}).to_string(),
-            )
-                .into_response()
-        }
+        // Captured SERVER-SIDE (shared state), NOT observed through the echoed response body:
+        // the proxy's egress masking correctly masks any bearer-shaped value an upstream
+        // echoes back (that masked echo is itself asserted below as a bonus property), so the
+        // response body is the WRONG observation channel for what the upstream received.
+        let seen: std::sync::Arc<std::sync::Mutex<Option<(String, String)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen_writer = seen.clone();
+        let capture = move |headers: HeaderMap| {
+            let seen_writer = seen_writer.clone();
+            async move {
+                let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                let user = headers.get("x-lumina-user").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                *seen_writer.lock().unwrap() = Some((auth.clone(), user.clone()));
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    json!({"auth": auth, "user": user}).to_string(),
+                )
+                    .into_response()
+            }
+        };
         let app = axum::Router::new().route("/status", axum::routing::get(capture));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind loopback"); // pii-test-fixture
         let addr = listener.local_addr().expect("local addr");
@@ -849,15 +860,22 @@ mod tests {
         .await;
 
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        let (seen_auth, seen_user) = seen.lock().unwrap().clone().expect("upstream was hit");
         assert_eq!(
-            parsed["auth"], "Bearer server-side-secret",
+            seen_auth, "Bearer server-side-secret", // pii-test-fixture
             "upstream must see the SERVER-SIDE token, never the browser-supplied Authorization header"
         );
         assert_eq!(
-            parsed["user"], "verified-operator",
+            seen_user, "verified-operator",
             "upstream must see the VERIFIED principal, never the browser-supplied X-Lumina-User header"
+        );
+        // Bonus masking property: the upstream ECHOED the bearer back in its JSON body, and
+        // the proxy's egress masking must have scrubbed it before it could reach a browser.
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_text = String::from_utf8_lossy(&body);
+        assert!(
+            !body_text.contains("server-side-secret"), // pii-test-fixture
+            "a token echoed by the upstream must never survive the proxy's egress masking"
         );
 
         std::env::remove_var("CONSTELLATION_LUMINA_TOKEN");
