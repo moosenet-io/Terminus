@@ -808,6 +808,15 @@ pub struct RunsQuery {
 /// `failure_class`/`harness_version` columns — see the doc on
 /// `storage::read_context_runs_page`/`read_agent_runs_page`); an unrecognized
 /// `suite` is a `400`.
+///
+/// `epoch` semantics per suite (review-cycle-2 fix — the cycle-1 panel caught
+/// `epoch` being silently ignored for `context`/`agent`): only
+/// `code_profile_runs` carries an epoch column (`harness_version`);
+/// `context_profile_runs`/`agent_profile_runs` are structurally epoch-less
+/// (see `src/intake/assistant/schema.rs`). Rather than silently ignore an
+/// explicit epoch filter on an epoch-less suite, the handler rejects it with
+/// a `400` naming the reason; `epoch` absent or `epoch=all` proceed (both are
+/// satisfiable — "no epoch constraint").
 pub async fn mint_runs(Query(q): Query<RunsQuery>) -> Response {
     let (limit, offset) = paginate(q.limit, q.offset);
     let suite = q.suite.as_deref().unwrap_or("code");
@@ -820,6 +829,23 @@ pub async fn mint_runs(Query(q): Query<RunsQuery>) -> Response {
             StatusCode::BAD_REQUEST,
             json!({"error": format!("unrecognized suite '{suite}' (expected one of: code, context, agent)")}),
         );
+    }
+
+    // Explicit specific-epoch filter on an epoch-less suite: honest 400, never
+    // a silently-unfiltered page (validated pre-DB for the same reason as the
+    // suite check above).
+    if matches!(suite, "context" | "agent") {
+        if let Some(e) = q.epoch.as_deref() {
+            if e != "all" {
+                return json_status(
+                    StatusCode::BAD_REQUEST,
+                    json!({"error": format!(
+                        "suite '{suite}' is not epoch-partitioned (its runs table has no epoch column); \
+                         omit `epoch` or pass `epoch=all`"
+                    )}),
+                );
+            }
+        }
     }
 
     let Some(pool) = pool_or_none().await else {
@@ -1312,6 +1338,55 @@ mod tests {
         clear_db_env();
         let (status, _body) = get_json(test_router(), "/api/terminus/mint/runs?suite=bogus").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Review-cycle-2 fix: `context`/`agent` runs tables are structurally
+    /// epoch-less, so an explicit specific-epoch filter is an honest `400`
+    /// (never a silently-unfiltered page), while absent / `epoch=all` proceed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mint_runs_rejects_specific_epoch_on_epochless_suites() {
+        clear_db_env();
+        for suite in ["context", "agent"] {
+            let (status, body) =
+                get_json(test_router(), &format!("/api/terminus/mint/runs?suite={suite}&epoch=v2")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400 for {suite}+epoch=v2");
+            assert!(
+                body["error"].as_str().unwrap_or_default().contains("not epoch-partitioned"),
+                "error names the reason for {suite}"
+            );
+            let (status, _body) =
+                get_json(test_router(), &format!("/api/terminus/mint/runs?suite={suite}&epoch=all")).await;
+            assert_eq!(status, StatusCode::OK, "epoch=all proceeds for {suite}");
+            let (status, _body) =
+                get_json(test_router(), &format!("/api/terminus/mint/runs?suite={suite}")).await;
+            assert_eq!(status, StatusCode::OK, "absent epoch proceeds for {suite}");
+        }
+        // The epoch-partitioned suite still accepts a specific epoch.
+        let (status, _body) =
+            get_json(test_router(), "/api/terminus/mint/runs?suite=code&epoch=v2").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// Review-cycle-2 fix: the masking property is now tested for REAL — a
+    /// planted secret-shaped value routed through this module's shared
+    /// response helpers (`json_ok`/`json_status`, the single egress every
+    /// handler returns through) must come out masked, mirroring the mask
+    /// module's own negative-property test. A vacuous content-type check
+    /// cannot regress silently anymore: if `json_ok` stops calling
+    /// `mask_response`, this fails.
+    #[tokio::test]
+    async fn json_helpers_mask_planted_secrets() {
+        let planted = "<REDACTED-SECRET>"; // pii-test-fixture
+        for resp in [
+            json_ok(json!({"models": [{"model_name": "m", "api_key": planted}]})),
+            json_status(StatusCode::BAD_REQUEST, json!({"error": "x", "openrouter_api_key": planted})),
+        ] {
+            let (_parts, body) = resp.into_parts();
+            let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+            let s = String::from_utf8_lossy(&bytes);
+            assert!(!s.contains(planted), "planted secret must never survive egress");
+        }
     }
 
     #[tokio::test]
