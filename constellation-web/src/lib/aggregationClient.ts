@@ -229,6 +229,368 @@ const MOCK_CHORD_HEALTH = {
 
 const MOCK_PROFILES = { profiles: {}, total_outcomes: 0, window_days: 30 };
 
+// ── MINT module types (CONST-23; §8 data contracts) ─────────────────────────
+// The real endpoints (`models_api.rs`) are CONST-21's job and not merged yet (per the item
+// brief) — these types + the MOCK_MINT_* fixtures below are the exact contract CONST-21 must
+// satisfy. All mint reads go through `client.request('terminus', '/mint/...')` (system stays
+// 'terminus' — 'mint' is a ModuleId, not a SystemId/proxy namespace: it has no independent
+// backend, it's server-side aggregation inside Terminus itself, same as 'models').
+
+export interface MintSummary {
+  models_profiled: number;
+  runs_this_epoch: number;
+  fleet_best: { model: string; pass_hat_3: number } | null;
+  gpu_hours: number;
+  epoch: string;
+}
+
+export interface MintDimensionScore {
+  dimension: string;
+  norm: number; // 0..1, normalized for radar plotting
+  raw: number;
+  metric: string;
+  std_dev: number;
+  n: number;
+  low_confidence: boolean;
+}
+
+export interface MintModelDimensions {
+  model_id: string;
+  scores: MintDimensionScore[]; // may be < dimensions.length -> missing dims render at 0, hollow vertex
+}
+
+export interface MintDimensionsResponse {
+  dimensions: string[]; // 8 fixed assistant dimensions
+  models: MintModelDimensions[];
+  fleet_median: MintDimensionScore[];
+}
+
+export interface MintMatrixColumn {
+  key: string; // `${test_type}:${task_category}`
+  test_type: string;
+  task_category: string;
+}
+
+export type MintCellStatus = 'ok' | 'not_run' | 'stale' | 'non_viable';
+
+export interface MintMatrixCell {
+  model: string;
+  col: string; // MintMatrixColumn.key
+  status: MintCellStatus;
+  pass_rate: number | null;
+  n_samples: number;
+  score_stddev: number | null;
+  low_confidence: boolean;
+  last_run_at: string | null;
+  harness_version: string | null;
+}
+
+export interface MintMatrixResponse {
+  models: string[]; // sorted by mean pass_rate desc
+  columns: MintMatrixColumn[];
+  cells: MintMatrixCell[];
+  /** CONST-23 edge case: code/agent columns are all not_run until INTAKE_CORPUS_V2_DIR is
+   *  provisioned — surfaced so the UI can render the truthful copy instead of implying a bug. */
+  corpus_dir_unset: boolean;
+}
+
+export interface MintContextTierPoint {
+  context_tokens: number;
+  throughput: number | null; // null once OOM
+  recall_score: number | null;
+  ttft_ms: number | null;
+  memory_usage_mb: number | null;
+  oom: boolean;
+}
+
+export interface MintContextProfile {
+  model: string;
+  tiers: MintContextTierPoint[];
+  max_context_safe: number;
+}
+
+export interface MintContextProfilesResponse {
+  profiles: MintContextProfile[];
+}
+
+export interface MintActivityDay {
+  date: string;
+  code: number;
+  context: number;
+  agent: number;
+}
+
+export interface MintEpochMarker {
+  epoch: string;
+  date: string;
+  label: string;
+}
+
+export interface MintActivityResponse {
+  days: MintActivityDay[];
+  epochs: MintEpochMarker[];
+}
+
+export interface MintParetoPoint {
+  model: string;
+  mean_latency_ms: number;
+  mean_score: number;
+  vram_gb: number;
+  p95_latency_ms: number;
+  score_stddev: number;
+  quality_per_gpu_second: number;
+}
+
+export interface MintParetoResponse {
+  points: MintParetoPoint[];
+}
+
+// ── Mock data for the MINT module (CONST-23) ────────────────────────────────
+// Fixture models deliberately cover the required variants (item brief): 'qwen3-coder:30b' is
+// the full-data/full-coverage reference model; 'llama3.1:70b' is sparse (< 8 assistant
+// dimensions -> missing-axis hollow-vertex case); 'mixtral:8x22b' carries stale + non_viable
+// matrix cells; 'phi4:14b' is the low-n/low-confidence case; 'gemma2:27b' exists only to prove
+// the categorical ceiling / "Other" fold and single-model selection.
+
+const MINT_MODEL_IDS = ['qwen3-coder:30b', 'llama3.1:70b', 'mixtral:8x22b', 'phi4:14b', 'gemma2:27b'] as const;
+
+/** Exposed for the MINT filter row's model multi-select. NOTE (deviation, see PR description):
+ *  CONST-21/22's `/api/terminus/models` list endpoint is the eventual source for this, but it
+ *  isn't built yet — this item hardcodes the mock fixture's own model set so the filter has
+ *  something to select from; swap for a `models.browse`-sourced list once CONST-22 lands. */
+export const MINT_MODEL_CATALOG: readonly string[] = MINT_MODEL_IDS;
+
+const MINT_DIMENSIONS = [
+  'reasoning', 'code_quality', 'instruction_following', 'tool_use',
+  'context_retention', 'safety', 'latency_efficiency', 'creativity',
+] as const;
+
+function buildMintDimensionScore(dimension: string, base: number, n: number, lowConf = false): MintDimensionScore {
+  return {
+    dimension,
+    norm: Math.max(0, Math.min(1, base)),
+    raw: Math.round(base * 5 * 100) / 100,
+    metric: 'mean_judge_score',
+    std_dev: Math.round((0.05 + (1 - base) * 0.15) * 100) / 100,
+    n,
+    low_confidence: lowConf || n <= 1,
+  };
+}
+
+const MOCK_MINT_SUMMARY: MintSummary = {
+  models_profiled: MINT_MODEL_IDS.length,
+  runs_this_epoch: 1842,
+  fleet_best: { model: 'qwen3-coder:30b', pass_hat_3: 0.91 },
+  gpu_hours: 214.6,
+  epoch: 'S119',
+};
+
+const MOCK_MINT_SUMMARY_SPARSE: MintSummary = {
+  models_profiled: 1,
+  runs_this_epoch: 12,
+  fleet_best: { model: 'phi4:14b', pass_hat_3: 0.42 },
+  gpu_hours: 1.1,
+  epoch: 'S110',
+};
+
+const MOCK_MINT_DIMENSIONS: MintDimensionsResponse = {
+  dimensions: [...MINT_DIMENSIONS],
+  models: [
+    {
+      model_id: 'qwen3-coder:30b',
+      scores: MINT_DIMENSIONS.map((d, i) => buildMintDimensionScore(d, 0.7 + i * 0.02, 40)),
+    },
+    {
+      // sparse: only 5 of 8 dimensions profiled -> the other 3 render at 0, hollow vertex + caveat
+      model_id: 'llama3.1:70b',
+      scores: MINT_DIMENSIONS.slice(0, 5).map((d, i) => buildMintDimensionScore(d, 0.55 + i * 0.03, 22)),
+    },
+    {
+      model_id: 'mixtral:8x22b',
+      scores: MINT_DIMENSIONS.map((d, i) => buildMintDimensionScore(d, 0.6 + (i % 3) * 0.05, 18)),
+    },
+    {
+      // low-n / low-confidence case
+      model_id: 'phi4:14b',
+      scores: MINT_DIMENSIONS.map(d => buildMintDimensionScore(d, 0.4, 1, true)),
+    },
+  ],
+  fleet_median: MINT_DIMENSIONS.map((d, i) => buildMintDimensionScore(d, 0.62 + i * 0.01, 120)),
+};
+
+const MOCK_MINT_DIMENSIONS_SOLO: MintDimensionsResponse = {
+  dimensions: [...MINT_DIMENSIONS],
+  models: [
+    {
+      model_id: 'phi4:14b',
+      scores: MINT_DIMENSIONS.map(d => buildMintDimensionScore(d, 0.4, 1, true)),
+    },
+  ],
+  fleet_median: MINT_DIMENSIONS.map((d, i) => buildMintDimensionScore(d, 0.62 + i * 0.01, 120)),
+};
+
+const MINT_TEST_TYPES = ['unit', 'integration', 'e2e'] as const;
+const MINT_TASK_CATEGORIES = ['code', 'assistant', 'agent'] as const;
+
+function mintMatrixColumns(): MintMatrixColumn[] {
+  const cols: MintMatrixColumn[] = [];
+  for (const tt of MINT_TEST_TYPES) {
+    for (const tc of MINT_TASK_CATEGORIES) {
+      cols.push({ key: `${tt}:${tc}`, test_type: tt, task_category: tc });
+    }
+  }
+  return cols;
+}
+
+function buildMintMatrix(): MintMatrixResponse {
+  const columns = mintMatrixColumns();
+  const cells: MintMatrixCell[] = [];
+  for (const model of MINT_MODEL_IDS) {
+    for (const col of columns) {
+      // Truthful edge case (contracts-to-confirm #3): 'agent' task_category cells are all
+      // not_run — INTAKE_CORPUS_V2_DIR isn't provisioned yet, this is not a data gap/bug.
+      if (col.task_category === 'agent') {
+        cells.push({
+          model, col: col.key, status: 'not_run', pass_rate: null, n_samples: 0,
+          score_stddev: null, low_confidence: false, last_run_at: null, harness_version: null,
+        });
+        continue;
+      }
+      if (model === 'gemma2:27b') {
+        // not yet profiled at all beyond one column -> mostly not_run
+        cells.push({
+          model, col: col.key, status: 'not_run', pass_rate: null, n_samples: 0,
+          score_stddev: null, low_confidence: false, last_run_at: null, harness_version: null,
+        });
+        continue;
+      }
+      if (model === 'mixtral:8x22b' && col.test_type === 'e2e') {
+        cells.push({
+          model, col: col.key, status: 'stale', pass_rate: 0.58, n_samples: 6,
+          score_stddev: 0.11, low_confidence: false,
+          last_run_at: '2026-06-02T10:00:00Z', harness_version: 'v3.4',
+        });
+        continue;
+      }
+      if (model === 'phi4:14b' && col.test_type === 'integration') {
+        cells.push({
+          model, col: col.key, status: 'non_viable', pass_rate: null, n_samples: 0,
+          score_stddev: null, low_confidence: false, last_run_at: null, harness_version: 'v3.4',
+        });
+        continue;
+      }
+      const base = model === 'qwen3-coder:30b' ? 0.86 : model === 'llama3.1:70b' ? 0.71 : 0.5;
+      const n = model === 'phi4:14b' ? 1 : 24;
+      cells.push({
+        model, col: col.key, status: 'ok',
+        pass_rate: Math.round((base + Math.random() * 0.06 - 0.03) * 100) / 100,
+        n_samples: n, score_stddev: 0.08, low_confidence: n <= 1,
+        last_run_at: '2026-07-15T08:00:00Z', harness_version: 'v3.5',
+      });
+    }
+  }
+  return { models: [...MINT_MODEL_IDS], columns, cells, corpus_dir_unset: true };
+}
+
+const MOCK_MINT_MATRIX = buildMintMatrix();
+
+const MOCK_MINT_MATRIX_NOT_RUN_ONLY: MintMatrixResponse = {
+  models: ['phi4:14b'],
+  columns: mintMatrixColumns(),
+  cells: mintMatrixColumns().map(col => ({
+    model: 'phi4:14b', col: col.key, status: 'not_run' as const, pass_rate: null, n_samples: 0,
+    score_stddev: null, low_confidence: false, last_run_at: null, harness_version: null,
+  })),
+  corpus_dir_unset: true,
+};
+
+function buildContextTiers(topThroughput: number, maxSafe: number): MintContextTierPoint[] {
+  const tiers = [2048, 4096, 8192, 16384, 32768, 65536];
+  return tiers.map(ctx => {
+    const oom = ctx > maxSafe;
+    const decay = Math.max(0.15, 1 - ctx / (maxSafe * 1.6));
+    return {
+      context_tokens: ctx,
+      throughput: oom ? null : Math.round(topThroughput * decay),
+      recall_score: oom ? null : Math.round((0.5 + decay * 0.45) * 100) / 100,
+      ttft_ms: oom ? null : Math.round(120 + ctx / 40),
+      memory_usage_mb: oom ? null : Math.round(4000 + ctx * 0.6),
+      oom,
+    };
+  });
+}
+
+const MOCK_MINT_CONTEXT: MintContextProfilesResponse = {
+  profiles: [
+    { model: 'qwen3-coder:30b', tiers: buildContextTiers(62, 32768), max_context_safe: 32768 },
+    { model: 'llama3.1:70b', tiers: buildContextTiers(38, 16384), max_context_safe: 16384 },
+    { model: 'mixtral:8x22b', tiers: buildContextTiers(45, 8192), max_context_safe: 8192 },
+    { model: 'phi4:14b', tiers: buildContextTiers(70, 4096), max_context_safe: 4096 },
+  ],
+};
+
+const MOCK_MINT_CONTEXT_SOLO: MintContextProfilesResponse = {
+  profiles: [
+    { model: 'phi4:14b', tiers: buildContextTiers(70, 4096), max_context_safe: 4096 },
+  ],
+};
+
+function buildMintActivityDays(n: number): MintActivityDay[] {
+  const days: MintActivityDay[] = [];
+  const now = Date.now();
+  for (let i = n - 1; i >= 0; i--) {
+    const d = new Date(now - i * 86400000);
+    days.push({
+      date: d.toISOString().slice(0, 10),
+      code: Math.max(0, Math.round(20 + 12 * Math.sin(i / 4))),
+      context: Math.max(0, Math.round(8 + 5 * Math.sin(i / 6 + 1))),
+      agent: Math.max(0, Math.round(3 + 2 * Math.sin(i / 3 + 2))),
+    });
+  }
+  return days;
+}
+
+const MOCK_MINT_ACTIVITY: MintActivityResponse = {
+  days: buildMintActivityDays(90),
+  epochs: [
+    { epoch: 'S117', date: buildMintActivityDays(90)[10].date, label: 'S117 compiler cutover' },
+    { epoch: 'S118', date: buildMintActivityDays(90)[45].date, label: 'S118 MUSE live-fire' },
+    { epoch: 'S119', date: buildMintActivityDays(90)[80].date, label: 'S119 current' },
+  ],
+};
+
+const MOCK_MINT_ACTIVITY_SPARSE: MintActivityResponse = {
+  days: buildMintActivityDays(30).map(d => ({ ...d, code: 0, context: 0, agent: d.agent > 3 ? 1 : 0 })),
+  epochs: [{ epoch: 'S119', date: buildMintActivityDays(30)[25].date, label: 'S119 current' }],
+};
+
+function buildMintPareto(): MintParetoResponse {
+  const raw: [string, number, number, number][] = [
+    ['qwen3-coder:30b', 820, 4.4, 24],
+    ['llama3.1:70b', 1450, 3.9, 40],
+    ['mixtral:8x22b', 1100, 4.0, 34],
+    ['phi4:14b', 410, 3.2, 8],
+    ['gemma2:27b', 690, 3.6, 16],
+  ];
+  return {
+    points: raw.map(([model, lat, score, vram]) => ({
+      model,
+      mean_latency_ms: lat,
+      mean_score: score,
+      vram_gb: vram,
+      p95_latency_ms: Math.round(lat * 1.4),
+      score_stddev: 0.2,
+      quality_per_gpu_second: Math.round((score / (lat / 1000) / vram) * 1000) / 1000,
+    })),
+  };
+}
+
+const MOCK_MINT_PARETO = buildMintPareto();
+
+const MOCK_MINT_PARETO_SOLO: MintParetoResponse = {
+  points: [buildMintPareto().points.find(p => p.model === 'phi4:14b')!],
+};
+
 // ── Mock data for the Muse module (CONST-19 backend; CONST-20 builds its UI
 // against these shapes -- verified routes per CONST-GUI-audit.md §4/spec §5.4) ─
 
@@ -293,7 +655,45 @@ const MOCK_GET: Record<string, unknown> = {
   'muse /guide': { entries: [] },
 };
 
-function mockGetFor(system: SystemId, pathname: string): unknown {
+/** MINT mock routing (CONST-23) — query-aware, unlike the plain pathname table above, since
+ *  every mint endpoint's mock *variant* (full/sparse/not_run-only/single-model) is selected by
+ *  the caller's filter params (§8; item brief "mock variants" requirement). Not merged into
+ *  MOCK_GET because that table is pathname-only. */
+function mockMintGetFor(pathname: string, query: URLSearchParams): unknown {
+  const models = query.getAll('models').flatMap(v => v.split(',')).filter(Boolean);
+  const epoch = query.get('epoch') ?? 'current';
+  const solo = models.length === 1;
+
+  if (pathname === '/mint/summary') {
+    return epoch === 'S110' ? MOCK_MINT_SUMMARY_SPARSE : MOCK_MINT_SUMMARY;
+  }
+  if (pathname === '/mint/dimensions') {
+    if (solo) return MOCK_MINT_DIMENSIONS_SOLO;
+    return MOCK_MINT_DIMENSIONS;
+  }
+  if (pathname === '/mint/matrix') {
+    if (solo && models[0] === 'phi4:14b') return MOCK_MINT_MATRIX_NOT_RUN_ONLY;
+    return MOCK_MINT_MATRIX;
+  }
+  if (pathname === '/mint/context-profiles') {
+    if (solo) return MOCK_MINT_CONTEXT_SOLO;
+    return MOCK_MINT_CONTEXT;
+  }
+  if (pathname === '/mint/activity') {
+    return epoch === 'S110' ? MOCK_MINT_ACTIVITY_SPARSE : MOCK_MINT_ACTIVITY;
+  }
+  if (pathname === '/mint/pareto') {
+    // NOTE (deviation, see PR description): §8's endpoint table doesn't enumerate a dedicated
+    // pareto endpoint; C4 needs per-model {latency, score, vram} that fits nowhere else, so this
+    // mock adds `GET /api/terminus/mint/pareto?models=` as an additive contract-to-confirm for
+    // CONST-21 rather than silently overloading `/mint/runs` or `/models`.
+    if (solo) return MOCK_MINT_PARETO_SOLO;
+    return MOCK_MINT_PARETO;
+  }
+  return undefined;
+}
+
+function mockGetFor(system: SystemId, pathname: string, query: URLSearchParams): unknown {
   const key = `${system} ${pathname}`;
   if (key in MOCK_GET) return MOCK_GET[key];
   if (system === 'harmony' && pathname.startsWith('/tree/')) {
@@ -301,6 +701,10 @@ function mockGetFor(system: SystemId, pathname: string): unknown {
   }
   if (system === 'muse' && pathname.startsWith('/api/channels/') && pathname.endsWith('/lineup')) {
     return { channel_id: pathname.split('/')[3], lineup: [] };
+  }
+  if (system === 'terminus' && pathname.startsWith('/mint/')) {
+    const mint = mockMintGetFor(pathname, query);
+    if (mint !== undefined) return mint;
   }
   return null;
 }
@@ -336,9 +740,10 @@ function mockWriteFor(system: SystemId, pathname: string): unknown {
 
 function mockRequest<T>(system: SystemId, path: string, init?: RequestInit): Promise<T> {
   const method = (init?.method ?? 'GET').toUpperCase();
-  const pathname = path.split('?')[0];
+  const [pathname, search] = path.split('?');
+  const query = new URLSearchParams(search ?? '');
   const value = method === 'GET'
-    ? mockGetFor(system, pathname)
+    ? mockGetFor(system, pathname, query)
     : mockWriteFor(system, pathname);
   return delay(value as T);
 }
@@ -411,6 +816,12 @@ const mockAdapter: AggregationClient = {
 //            (binary passthrough -- see crate::constellation::proxy's module doc; this generic
 //            request<T>() path is JSON-typed, art responses should be fetched by <img src> URL,
 //            not through this method)
+//   terminus/mint (CONST-21 backend not yet merged; CONST-23 builds its UI against these mock
+//            shapes -- §8 of CONST-GUI-SPEC.md): GET /mint/summary?epoch=,
+//            GET /mint/dimensions?models=&epoch=, GET /mint/matrix?epoch=,
+//            GET /mint/context-profiles?models=, GET /mint/activity?range=,
+//            GET /mint/pareto?models=&epoch= (additive — not in §8's table, see the mock
+//            routing comment in mockMintGetFor for why C4 needed it)
 
 function baseUrl(): string {
   // Same-origin only — never a hardcoded host/port. This is the one place in the app

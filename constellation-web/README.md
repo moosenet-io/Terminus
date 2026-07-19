@@ -206,16 +206,60 @@ instantiate one per chart instance, not per render). `ChartCard`/`ChartTooltip`/
 every chart composes (loading/refetch/empty/degraded states, table-view twin, textContent-
 only tooltip label insertion since series/point labels can be untrusted upstream data). For
 the advanced chart forms (radar/boxplot/heatmap/parallel-coordinates/swarmplot/scatterplot),
-CONST-17 ships the FOUNDATION only: pinned `@nivo/*` 0.99.0 packages, the shared nivo theme
+CONST-17 shipped the FOUNDATION only: pinned `@nivo/*` 0.99.0 packages, the shared nivo theme
 bridge (`theme.ts`), and a dedicated `viz` Vite chunk (`vite.config.ts` `manualChunks`) so
-the shell/panels' initial bundle doesn't pay for nivo. The chart-form wrapper components
-themselves land with the routes that use them (MINT/Models, CONST-22..24), which lazy-import
-their panels.
+the shell/panels' initial bundle doesn't pay for nivo. CONST-23 lands the first three
+chart-form wrappers on top of that foundation: `RadarChart.tsx` (C1), `HeatmapChart.tsx` (C2),
+`ScatterChart.tsx` (C4) -- boxplot/parallel-coordinates/swarmplot wrappers are CONST-24's job
+(C3/C5/C9). NOTE: the `vite.config.ts` comment's "lazy-loaded" framing for MINT/Models routes
+is aspirational -- this app has no `React.lazy`/route-level code-splitting anywhere yet
+(`registerPanels.ts` imports every panel eagerly, MINT included); the `viz` manualChunks split
+alone keeps both the initial (~146 KB gz) and viz (~129 KB gz) bundles under the §9 budget
+(350/250 KB gz) even without it, but true lazy-loading is still a real gap if the bundle grows.
 
 Grid lines are **solid 1px hairlines** (`--chart-grid`/`--chart-axis`) — the dashed
 `strokeDasharray:'3 3'` pattern from harmony-web is retired everywhere (audit §1.4). Every
 chart ships a table-view twin (`TableViewToggle`) — this is both the WCAG relief channel for
 sub-3:1 fills and a hard rule (§4.4).
+
+## MINT module (`src/panels/mint/`, CONST-23 — phase 1)
+
+`/mint` (`mint.overview`) is ONE sectioned page (Overview, Coverage, Capability, Coder,
+Context), not one panel/route per section, per spec §7.1 -- `MintPage.tsx` owns a sticky
+in-page section nav (anchor links + `scrollMarginTop`) and the single global filter row
+(`MintFilterBar.tsx`: epoch, task_category, backend_tag, model multi-select capped at 4) that
+scopes every section below it. `mint` registers as a `ModuleId` gated on the `terminus` health
+entry (`registerPanels.ts`) -- it has no independent proxy namespace; like `models`, its data
+is server-side aggregation inside Terminus itself (`GET /api/terminus/mint/*`, §8), not a
+proxied fleet system.
+
+**Deep links** (`mintFilters.ts`): filters round-trip through the query string --
+`parseMintFilters`/`mintFiltersToParams` -- via `useSearchParams` + `replace:true` (filter
+tweaks don't spam browser history). Reload/share a `/mint?epoch=S118&model=qwen3-coder:30b`
+URL and the exact view restores.
+
+**This item builds C0/C1/C2/C4/C7/C8** (stat tiles, capability radar, coverage heatmap, Pareto
+scatter, context degradation, sweep activity) -- **C3/C5/C6/C9** (box plots, beeswarm,
+failure-class bars, parallel-coordinates) are CONST-24 and render as labeled "phase 2" empty
+`ChartCard`s in `CoderSection.tsx`/`CapabilitySection.tsx` so the layout doesn't reshuffle when
+they land. The spec's §7.3 "Coder = C4+C3+C5+C6" section composition is honored even though
+only C4 is real yet, for the same reason.
+
+Each of the five section endpoints (`useMint.ts`) degrades independently -- one dead endpoint
+collapses only its own `ChartCard` to the degraded state, never the whole page.
+
+**Backend not merged yet:** CONST-21 (`models_api.rs`) owns the real `/api/terminus/mint/*`
+endpoints and hasn't landed -- this item builds entirely against `aggregationClient.ts` mock
+fixtures shaped exactly per §8, covering the required variants (full fleet, sparse/missing
+dimensions, not_run-only coverage, single-model selection). Two deviations from §8 worth
+flagging for CONST-21:
+- `GET /mint/pareto?models=&epoch=` is NOT in §8's endpoint table -- C4 needs per-model
+  `{latency, score, vram}` that doesn't fit any other listed shape, so the mock adds this as
+  an additive contract-to-confirm rather than overloading `/mint/runs` or `/models`.
+- The model multi-select's option list (`MINT_MODEL_CATALOG`) is hardcoded from the mock
+  fixture's own model set, since `/api/terminus/models` (CONST-21/22) isn't built yet either --
+  swap it for a real model list once CONST-22 lands.
+
 ## Real-time relay (`/ws`, CONST-18)
 
 `GET /ws` (`src/constellation/ws.rs` on the Terminus side, not in this package) is a

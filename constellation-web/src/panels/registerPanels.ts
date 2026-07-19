@@ -3,10 +3,13 @@
 // panel adds one line here — the shell never needs to change.
 //
 // CONST-16: also registers the ModuleDescriptor for every module that has a real presence
-// today (harmony/chord/lumina/muse/terminus). `models`/`mint` are valid `ModuleId`s (see
-// moduleRegistry.ts) but are NOT registered here yet — their modules/panels land with
-// CONST-21..24; until then they simply don't exist in the registry, so they never show up
-// as a global-bar tab (no module descriptor to match `getAvailableModules` against).
+// today (harmony/chord/lumina/muse/terminus). `models` is a valid `ModuleId` (see
+// moduleRegistry.ts) but is NOT registered here yet — it lands with CONST-22; until then it
+// simply doesn't exist in the registry, so it never shows up as a global-bar tab (no module
+// descriptor to match `getAvailableModules` against).
+//
+// CONST-23 registers `mint` (module + its one sectioned `/mint` panel, `mint.overview` —
+// see §7.1: "one page, sectioned... sticky in-page section nav", not one panel per section).
 //
 // CONST-19 registers the `muse` module descriptor only — no panels yet (CONST-20's job); a
 // module with zero registered panels is a valid, if empty, tab (`getPanelsByModule('muse')`
@@ -38,6 +41,7 @@ import { Inference } from '../pages/Inference';
 import { Providers } from '../pages/Providers';
 import { Playground } from '../pages/Playground';
 import { Analytics } from '../pages/Analytics';
+import { MintPage } from './mint/MintPage';
 
 // ── Modules (CONST-16, §1.4 order: Overview · Harmony · Chord · Lumina · Muse · Models ·
 // MINT · Terminus — Overview has no descriptor, it's the always-available default route;
@@ -50,6 +54,10 @@ registerModule({ id: 'lumina', title: 'Lumina', icon: '✦', healthSystem: 'lumi
 // muse.dashboard/muse.taste/muse.channels).
 registerModule({ id: 'muse', title: 'Muse', icon: '🎬', healthSystem: 'muse', order: 4 });
 registerModule({ id: 'terminus', title: 'Terminus', icon: '⚙', healthSystem: 'terminus', order: 7 });
+// CONST-23: MINT is a terminus-hosted module (no independent proxy namespace — its data is
+// server-side aggregation inside Terminus itself, same as 'models'), so it gates on the
+// always-available terminus health entry, same as the Terminus module above.
+registerModule({ id: 'mint', title: 'MINT', icon: '📈', healthSystem: 'terminus', order: 6 });
 
 // ── Harmony ──────────────────────────────────────────────────────────────────
 
@@ -184,6 +192,18 @@ registerPanel({
   icon: '▶',
   available: true,
   component: Playground,
+});
+
+// ── MINT (CONST-23; phase 1 — C0/C1/C2/C4/C7/C8. C3/C5/C6/C9 are CONST-24) ──────
+
+registerPanel({
+  id: 'mint.overview',
+  system: 'mint',
+  title: 'MINT',
+  path: '/mint',
+  icon: '📈',
+  available: true,
+  component: MintPage,
 });
 
 // ── Terminus ─────────────────────────────────────────────────────────────────
