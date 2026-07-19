@@ -11,6 +11,19 @@
 // Selection is via `import.meta.env.VITE_AGG_MODE` ('mock' | 'http'), default 'mock'.
 // This is deliberately the *only* seam CONST-02 (the real Terminus-side aggregation layer)
 // needs to fill in — the httpAdapter below defines exactly the endpoints/shapes it must serve.
+//
+// LGUI-09: persona mock data/types live in `../types/lumina` (shared Lumina domain-type file
+// sibling build items also land their own §7 types in) and are used only via the generic
+// `request<T>('lumina', path)` escape hatch below — no new typed `AggregationClient` method
+// needed for this item, same convention as the Muse module's read routes.
+import { PERSONA_DEFAULT_BOUNDS, LUMINA_PROMPT_LAYER_ORDER } from '../types/lumina';
+import type {
+  LuminaPersonaResponse,
+  LuminaPersonaTraitsWriteBody,
+  LuminaPersonaContextWriteBody,
+  LuminaPersonaStatusFlags,
+  LuminaTraitVector,
+} from '../types/lumina';
 
 // ── Shared types ────────────────────────────────────────────────────────────
 
@@ -481,6 +494,59 @@ const MOCK_MUSE_GROUP_DYNAMICS = {
   ],
 };
 
+// ── Mock data for the Lumina Persona & Behavior panel (LGUI-09, §7/§0.1.1) ───────────────
+// `MOCK_LUMINA_PERSONA` is intentionally `let` (not `const`) — unlike most mock fixtures, the
+// panel's PUT /persona/traits and /persona/context mutations update it in place below, so a
+// refetch after a save shows the just-saved values (proves the diff-preview save round-trips,
+// not just posts-and-forgets).
+
+function clampTrait(v: number): number {
+  return Math.min(PERSONA_DEFAULT_BOUNDS.max, Math.max(PERSONA_DEFAULT_BOUNDS.min, v));
+}
+
+function effectiveTraits(base: LuminaTraitVector, modifier: LuminaTraitVector): LuminaTraitVector {
+  return {
+    flair: clampTrait(base.flair + modifier.flair),
+    spontaneity: clampTrait(base.spontaneity + modifier.spontaneity),
+    humor: clampTrait(base.humor + modifier.humor),
+    focus: clampTrait(base.focus + modifier.focus),
+  };
+}
+
+const MOCK_LUMINA_PERSONA_STATUS: LuminaPersonaStatusFlags = {
+  onboarding_complete: true,
+  dynamic_prompt: true,
+};
+
+// Bytes are rough/plausible, largest for the layers most likely to carry live content
+// (personality/knowledge/context); `memory` disabled to exercise the Layer Inspector's
+// enabled/disabled rendering (§3.4) without needing a special-cased mock.
+const MOCK_LUMINA_PERSONA_LAYER_BYTES: Record<string, number> = {
+  identity: 412, rules: 1180, capabilities: 860, style: 240, personality: 96,
+  opinions: 512, knowledge: 2048, context: 640, memory: 0, proactive: 128, now: 48,
+};
+
+let MOCK_LUMINA_PERSONA: LuminaPersonaResponse = (() => {
+  const base: LuminaTraitVector = { flair: 0.70, spontaneity: 0.55, humor: 0.65, focus: 0.75 };
+  const modifier: LuminaTraitVector = { flair: 0.05, spontaneity: -0.10, humor: 0.00, focus: 0.02 };
+  return {
+    traits: { base, modifier, effective: effectiveTraits(base, modifier) },
+    bounds: { ...PERSONA_DEFAULT_BOUNDS },
+    knowledge_digest:
+      'Prefers concise, direct answers. Works primarily in Rust and TypeScript. Runs a small '
+      + 'self-hosted fleet (moosenet) across several hosts; cares about local-inference-first '
+      + 'design and avoiding hardcoded secrets.',
+    active_context:
+      'Currently heads-down on the Lumina GUI build (LGUI series) — persona/behavior panel, '
+      + 'onboarding wizard, and the rest of the module surface.',
+    layers: LUMINA_PROMPT_LAYER_ORDER.map(name => ({
+      name,
+      bytes: MOCK_LUMINA_PERSONA_LAYER_BYTES[name] ?? 0,
+      enabled: name !== 'memory',
+    })),
+  };
+})();
+
 /** GET-style mock lookups, keyed by "{system} {pathname}" (pathname without query string). */
 const MOCK_GET: Record<string, unknown> = {
   'harmony /status': MOCK_STATUS,
@@ -515,6 +581,8 @@ const MOCK_GET: Record<string, unknown> = {
   'muse /api/graph/watch-history': MOCK_MUSE_WATCH_HISTORY,
   'muse /api/graph/group-dynamics': MOCK_MUSE_GROUP_DYNAMICS,
   'muse /guide': MOCK_MUSE_GUIDE,
+  'lumina /status': MOCK_LUMINA_PERSONA_STATUS,
+  'lumina /persona': MOCK_LUMINA_PERSONA,
 };
 
 function mockGetFor(system: SystemId, pathname: string): unknown {
@@ -530,8 +598,30 @@ function mockGetFor(system: SystemId, pathname: string): unknown {
   return null;
 }
 
-/** POST/PUT-style mock acks — every write in the mock world just succeeds with a canned shape. */
-function mockWriteFor(system: SystemId, pathname: string): unknown {
+/** POST/PUT-style mock acks — every write in the mock world just succeeds with a canned shape.
+ *  `body` (parsed JSON, best-effort) is only consulted by the handful of writes that need to
+ *  echo/apply it (e.g. LGUI-09's persona traits/context saves) — everything else ignores it,
+ *  same as before this param was added. */
+function mockWriteFor(system: SystemId, pathname: string, body?: unknown): unknown {
+  // LGUI-09 (§7): PUT /persona/traits — applies whichever of base/modifier the diff-preview
+  // save sent, re-clamps, mutates the in-memory fixture so a refetch shows the saved values.
+  if (system === 'lumina' && pathname === '/persona/traits') {
+    const req = (body ?? {}) as LuminaPersonaTraitsWriteBody;
+    const base = req.base ?? MOCK_LUMINA_PERSONA.traits.base;
+    const modifier = req.modifier ?? MOCK_LUMINA_PERSONA.traits.modifier;
+    const effective = effectiveTraits(base, modifier);
+    MOCK_LUMINA_PERSONA = {
+      ...MOCK_LUMINA_PERSONA,
+      traits: { base, modifier, effective },
+    };
+    return { base, modifier, effective };
+  }
+  // LGUI-09 (§7): PUT /persona/context — active-context write.
+  if (system === 'lumina' && pathname === '/persona/context') {
+    const req = (body ?? {}) as LuminaPersonaContextWriteBody;
+    MOCK_LUMINA_PERSONA = { ...MOCK_LUMINA_PERSONA, active_context: req.active_context ?? '' };
+    return { active_context: MOCK_LUMINA_PERSONA.active_context };
+  }
   if (system === 'harmony' && pathname === '/engine/stop') {
     return { state: 'stopped', pid: null, active_count: 0, uptime_secs: 0, stop_reason: 'mock', executor_active: false };
   }
@@ -572,12 +662,25 @@ function mockWriteFor(system: SystemId, pathname: string): unknown {
   return { ok: true };
 }
 
+/** Best-effort JSON body parse — `init.body` is typed as `BodyInit` by `RequestInit`, but every
+ *  caller in this app only ever passes a `JSON.stringify(...)` string (see the http adapter's
+ *  own doc below); returns `undefined` for anything else (no body, non-string body, bad JSON)
+ *  rather than throwing, since a mock write's fallback-to-current-value handles that fine. */
+function parseMockBody(init?: RequestInit): unknown {
+  if (typeof init?.body !== 'string') return undefined;
+  try {
+    return JSON.parse(init.body);
+  } catch {
+    return undefined;
+  }
+}
+
 function mockRequest<T>(system: SystemId, path: string, init?: RequestInit): Promise<T> {
   const method = (init?.method ?? 'GET').toUpperCase();
   const pathname = path.split('?')[0];
   const value = method === 'GET'
     ? mockGetFor(system, pathname)
-    : mockWriteFor(system, pathname);
+    : mockWriteFor(system, pathname, parseMockBody(init));
   return delay(value as T);
 }
 

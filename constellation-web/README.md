@@ -259,6 +259,43 @@ door — it's structurally incapable of storing a credential shape). Vault-refer
 (provider API keys, etc., landing in CONST-08+) must be surfaced as a vault key *name* with a
 set/rotate affordance, never a round-tripped value.
 
+## Lumina module — Persona & Behavior panel (LGUI-09)
+
+`lumina.persona` (`/lumina/persona`, operator, `src/panels/lumina/PersonaPanel.tsx`) is the
+first real `lumina` panel wired against the `LUMINA-GUI-SPEC.md` §7 data contracts (LGUI-01..04,
+the API items, are `moosenet/lumina-constellation` PRs and may not be merged yet — this panel
+consumes `GET/PUT /api/persona*` and the `onboarding_complete`/`dynamic_prompt` slice of
+`GET /api/status` through the generic `client.request('lumina', path)` escape hatch, same
+convention as `useMuse.ts`; see `src/types/lumina.ts` for the exact §7-shaped types and
+`src/lib/aggregationClient.ts`'s `MOCK_LUMINA_PERSONA*` fixtures for the mock-mode contract a
+real backend must satisfy).
+
+- **Trait quartet** (`TraitSlider.tsx`) — one row per `TraitVector` axis (flair/spontaneity/
+  humor/focus, §0.1.1), each showing the shared base marker, the per-user modifier delta, and
+  the clamped effective value; rails render the soft bounds (0.15–0.85, client-side clamped via
+  `clampToPersonaBounds` in `useLuminaPersona.ts`, mirroring the server's own
+  `effective = clamp(base + modifier)`).
+- **Trait radar** — a 4-axis radar thumbnail (`src/viz/RadarChart.tsx`, this item's addition to
+  the viz kit — no radar wrapper existed on `main` yet; see that file's own doc for why it's
+  Recharts-based like the Muse scatter/area charts rather than nivo) mirroring the quartet. The
+  sliders and radar are fed from the exact same `useLuminaPersona`/`draftBase`/`draftModifier`
+  state in `PersonaPanel.tsx` — there is no second copy of the trait values anywhere, which is
+  what makes "radar and sliders never disagree" (the spec's explicit AC) structurally true
+  rather than merely tested.
+- **Knowledge digest** (read-only) + **active context** (editable textarea, `RoleGate`d,
+  `PUT /api/persona/context`) + **layer inspector** (the 11 `PromptAssembler` layers in their
+  fixed order, `LUMINA_PROMPT_LAYER_ORDER` in `src/types/lumina.ts`, with per-layer byte bars +
+  enabled state; a `LUMINA_DYNAMIC_PROMPT=false` status flag renders a "legacy prompt mode"
+  warning card).
+- **Trait save** — `PUT /api/persona/traits` behind a diff-preview `ConfirmDialog` (old→new per
+  changed trait); admin edits the shared base by default, with a "per-user modifier
+  (admin-on-behalf)" toggle for the v1 modifier-editing path (§3.4). Every mutating control is
+  wrapped in main's canonical `RoleGate` — cosmetic only, the server's `enforce_viewer_role_gate`
+  is the real enforcement (see "Roles" below).
+- **Ceremony card** — onboarding marker status (from the `/api/status` slice) plus a "Re-run
+  naming ceremony" button that navigates to `/lumina/setup` (the LGUI-12 wizard route; this
+  item only links to it, it does not implement the wizard).
+
 ## Muse module (CONST-19 backend, CONST-20 UI)
 
 `muse` is the fourth namespaced proxy arm (`/api/muse/*path` in `src/constellation/proxy.rs`,
