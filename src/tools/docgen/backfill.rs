@@ -91,7 +91,7 @@ use crate::registry::ToolRegistry;
 use crate::tool::RustTool;
 
 use super::diagram::{is_generic_placeholder, subsystem_architecture_mermaid_source};
-use super::generate::{generate_repo_docs, ChordDocGenerator, DocGenerator};
+use super::generate::{generate_repo_docs, DocGenerator, FallbackDocGenerator};
 use super::pii_gate::sweep_input;
 use super::place::{place_docs, README_PATH};
 use super::preserve::{check_preservation, Section};
@@ -832,7 +832,10 @@ only; the normal build pipeline (review, merge) carries the result from there."
             }
         };
 
-        let generator = ChordDocGenerator::from_env();
+        // DGDG-01: falls back to a configured OpenRouter model when local
+        // Chord/GPU inference is jammed; behaves exactly like a bare
+        // `ChordDocGenerator::from_env()` when no fallback is configured.
+        let generator = FallbackDocGenerator::from_env();
         let report = backfill_readme(
             &generator,
             &self.store,

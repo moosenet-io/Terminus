@@ -674,6 +674,28 @@ pub fn docgen_chord_model() -> String {
     env_nonempty("DOCGEN_CHORD_MODEL").unwrap_or_else(|| "auto".to_string())
 }
 
+// ── DGDG-01: cloud-provider fallback when local Chord/GPU inference is jammed ──
+// The exact failure that blocked the DGRICH rollout: `ChordDocGenerator` errors
+// (unreachable/timeout/OOM) with no way to recover for that generation. Rather
+// than a new secret/transport story, `crate::tools::docgen::generate::
+// OpenRouterDocGenerator` delegates to `crate::review::dispatch::ReviewConfig::
+// dispatch_openrouter` -- the SAME OpenRouter chat-completions client
+// `nemotron`/`qwen_coder`/`gpt56` already use (same URL resolution, same
+// `OPENROUTER_API_KEY` bearer-auth convention -- see that module's doc comment
+// for why a plain env read IS the vault read in this crate). This section only
+// resolves the ONE new, non-secret knob: which model tag the fallback sends.
+
+/// The OpenRouter model tag `FallbackDocGenerator`'s cloud fallback sends when
+/// local Chord/GPU doc-generation inference fails. From
+/// `DOCGEN_CLOUD_FALLBACK_MODEL`; `None` (unset or empty) disables the fallback
+/// entirely -- `FallbackDocGenerator::from_env` then wires ONLY the existing
+/// `ChordDocGenerator` path, byte-for-byte today's pre-DGDG-01 behavior. Never a
+/// literal model id: an operator picks whichever OpenRouter model they want
+/// doc-generation to fall back to.
+pub fn docgen_cloud_fallback_model() -> Option<String> {
+    env_nonempty("DOCGEN_CLOUD_FALLBACK_MODEL")
+}
+
 // ── TGW-03: inference proxy to Chord ──────────────────────────────────────
 // `terminus-primary` forwards `/v1/chat/completions`, `/v1/infer`,
 // `/v1/agent/execute`, and `/v1/coding/select` to the SAME co-located Chord
@@ -1469,6 +1491,26 @@ mod tests {
         std::env::set_var("DOCGEN_CHORD_MODEL", "docs-slm");
         assert_eq!(docgen_chord_model(), "docs-slm");
         std::env::remove_var("DOCGEN_CHORD_MODEL");
+    }
+
+    // ── DGDG-01: cloud-provider fallback model ──────────────────────────
+
+    #[test]
+    #[serial]
+    fn docgen_cloud_fallback_model_disabled_when_unset() {
+        std::env::remove_var("DOCGEN_CLOUD_FALLBACK_MODEL");
+        assert_eq!(docgen_cloud_fallback_model(), None);
+        std::env::set_var("DOCGEN_CLOUD_FALLBACK_MODEL", "  ");
+        assert_eq!(docgen_cloud_fallback_model(), None, "whitespace-only must also disable");
+        std::env::remove_var("DOCGEN_CLOUD_FALLBACK_MODEL");
+    }
+
+    #[test]
+    #[serial]
+    fn docgen_cloud_fallback_model_honors_override() {
+        std::env::set_var("DOCGEN_CLOUD_FALLBACK_MODEL", "qwen/qwen3-coder:free");
+        assert_eq!(docgen_cloud_fallback_model().as_deref(), Some("qwen/qwen3-coder:free"));
+        std::env::remove_var("DOCGEN_CLOUD_FALLBACK_MODEL");
     }
 
     #[test]
