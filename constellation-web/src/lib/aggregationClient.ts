@@ -335,13 +335,37 @@ const MOCK_MUSE_ON_DECK = {
   ],
 };
 
+// CONST-20: past-dated entry included deliberately -- spec §5.4/edge cases requires the
+// Premieres list to sort by release_date and render past-dated entries dimmed, not hidden.
 const MOCK_MUSE_PREMIERE = {
   items: [
-    { id: 'md-3', title: 'Example Upcoming Release', release_date: new Date().toISOString(), rsvp_count: 0 },
+    { id: 'md-3', title: 'Example Upcoming Release', release_date: new Date(Date.now() + 5 * 86400000).toISOString(), rsvp_count: 0 },
+    { id: 'md-4', title: 'Example Recent Premiere', release_date: new Date(Date.now() - 3 * 86400000).toISOString(), rsvp_count: 4 },
+    { id: 'md-5', title: 'Example Far-Out Release', release_date: new Date(Date.now() + 30 * 86400000).toISOString(), rsvp_count: 1 },
   ],
 };
 
-const MOCK_MUSE_GAPS = { gaps: [], total: 0 };
+const MOCK_MUSE_GAPS = {
+  gaps: [
+    { id: 'gap-1', title: 'Example Series — missing S2', kind: 'series', detail: 'season 2 not in library' },
+    { id: 'gap-2', title: 'Example Collection — missing entry 3', kind: 'collection', detail: 'entry 3 of 5 missing' },
+  ],
+  total: 2,
+};
+
+// CONST-20: dashboard MetricCards row (library size, active channels, pending items, last
+// ingest) has no dedicated endpoint in the §5.4 route list as written -- this mock/`GET
+// /stats` extends the mock adapter (per this item's own instructions: "extend the mocks if
+// the panels need shapes the canned data lacks, keep shapes consistent with the §5.4 endpoint
+// list"). It's a plain GET like every other muse route, so it degrades through the exact same
+// 404/501-to-ChartEmpty path if the real muse backend hasn't wired it -- see the DashboardPanel
+// deviation note.
+const MOCK_MUSE_STATS = {
+  library_size: 1842,
+  active_channels: 2,
+  pending_items: 2,
+  last_ingest_at: new Date(Date.now() - 45 * 60000).toISOString(),
+};
 
 const MOCK_MUSE_CHANNELS = {
   channels: [
@@ -350,10 +374,55 @@ const MOCK_MUSE_CHANNELS = {
   ],
 };
 
+const MOCK_MUSE_LINEUP: Record<string, { channel_id: string; lineup: Array<{ id: string; title: string; position: number }> }> = {
+  'ch-1': {
+    channel_id: 'ch-1',
+    lineup: [
+      { id: 'md-1', title: 'Example Feature Film', position: 1 },
+      { id: 'md-2', title: 'Example Series S1E4', position: 2 },
+    ],
+  },
+  'ch-2': {
+    channel_id: 'ch-2',
+    lineup: [
+      { id: 'md-3', title: 'Example Upcoming Release', position: 1 },
+    ],
+  },
+};
+
+const MOCK_MUSE_GUIDE = {
+  entries: [
+    { channel_id: 'ch-1', title: 'Example Feature Film', start: new Date().toISOString(), end: new Date(Date.now() + 2 * 3600000).toISOString() },
+    { channel_id: 'ch-1', title: 'Example Series S1E4', start: new Date(Date.now() + 2 * 3600000).toISOString(), end: new Date(Date.now() + 3 * 3600000).toISOString() },
+    { channel_id: 'ch-2', title: 'Example Upcoming Release', start: new Date().toISOString(), end: new Date(Date.now() + 90 * 60000).toISOString() },
+  ],
+};
+
+// CONST-20: 5 clusters deliberately -- exercises the ">4 clusters fold to Other" rule (spec
+// §5.4/§4.2 ALL_PAIRS_CEILING) with real mock data instead of only being provable by editing
+// the mock in a manual check.
 const MOCK_MUSE_TASTE_CLUSTERS = {
   clusters: [
-    { cluster_id: 0, label: 'mock-cluster-a', points: [{ x: 0.1, y: 0.2, model: 'md-1' }] },
-    { cluster_id: 1, label: 'mock-cluster-b', points: [{ x: 0.6, y: 0.4, model: 'md-2' }] },
+    { cluster_id: 0, label: 'prestige-drama', points: [{ x: 0.12, y: 0.22, model: 'md-1' }, { x: 0.18, y: 0.30, model: 'md-6' }] },
+    { cluster_id: 1, label: 'action-blockbuster', points: [{ x: 0.62, y: 0.41, model: 'md-2' }, { x: 0.58, y: 0.48, model: 'md-7' }] },
+    { cluster_id: 2, label: 'animated-family', points: [{ x: 0.35, y: 0.75, model: 'md-8' }] },
+    { cluster_id: 3, label: 'documentary', points: [{ x: 0.80, y: 0.20, model: 'md-9' }] },
+    { cluster_id: 4, label: 'indie-comedy', points: [{ x: 0.50, y: 0.55, model: 'md-10' }] },
+  ],
+};
+
+const MOCK_MUSE_WATCH_HISTORY = {
+  series: [
+    { date: '2026-07-01', 'prestige-drama': 3, 'action-blockbuster': 1, 'animated-family': 0 },
+    { date: '2026-07-08', 'prestige-drama': 2, 'action-blockbuster': 2, 'animated-family': 1 },
+    { date: '2026-07-15', 'prestige-drama': 4, 'action-blockbuster': 1, 'animated-family': 2 },
+  ],
+};
+
+const MOCK_MUSE_GROUP_DYNAMICS = {
+  rows: [
+    { participant: 'household-a', watched_together_pct: 62, favorite_genre: 'prestige-drama', sessions: 14 },
+    { participant: 'household-b', watched_together_pct: 38, favorite_genre: 'action-blockbuster', sessions: 9 },
   ],
 };
 
@@ -382,11 +451,15 @@ const MOCK_GET: Record<string, unknown> = {
   'muse /on_deck': MOCK_MUSE_ON_DECK,
   'muse /premiere': MOCK_MUSE_PREMIERE,
   'muse /gaps': MOCK_MUSE_GAPS,
+  // CONST-20: not in the §5.4 route list as written -- see the MOCK_MUSE_STATS comment above
+  // for why the dashboard MetricCards row calls this anyway (mock-adapter extension, same
+  // GET-and-degrade shape as every other muse route).
+  'muse /stats': MOCK_MUSE_STATS,
   'muse /api/channels': MOCK_MUSE_CHANNELS,
   'muse /api/graph/taste-clusters': MOCK_MUSE_TASTE_CLUSTERS,
-  'muse /api/graph/watch-history': { series: [] },
-  'muse /api/graph/group-dynamics': { rows: [] },
-  'muse /guide': { entries: [] },
+  'muse /api/graph/watch-history': MOCK_MUSE_WATCH_HISTORY,
+  'muse /api/graph/group-dynamics': MOCK_MUSE_GROUP_DYNAMICS,
+  'muse /guide': MOCK_MUSE_GUIDE,
 };
 
 function mockGetFor(system: SystemId, pathname: string): unknown {
@@ -396,7 +469,8 @@ function mockGetFor(system: SystemId, pathname: string): unknown {
     return { ...MOCK_TREE, project: decodeURIComponent(pathname.slice('/tree/'.length)) };
   }
   if (system === 'muse' && pathname.startsWith('/api/channels/') && pathname.endsWith('/lineup')) {
-    return { channel_id: pathname.split('/')[3], lineup: [] };
+    const channelId = pathname.split('/')[3];
+    return MOCK_MUSE_LINEUP[channelId] ?? { channel_id: channelId, lineup: [] };
   }
   return null;
 }
@@ -426,6 +500,19 @@ function mockWriteFor(system: SystemId, pathname: string): unknown {
       response: '(mock adapter — no live model backend) This is a canned playground response.',
       tokens_in: 12, tokens_out: 18, latency_ms: 120, cost: 0, model: 'mock',
     };
+  }
+  // CONST-20: Muse channel compose/maintenance actions -- not in the §5.4 route list as
+  // written (only the read routes are spec'd), inferred from the spec's own description of
+  // these as "compose/maintenance actions" gated behind RoleGate+ConfirmDialog (§5.4). Kept
+  // to the same REST shape as the read routes (`/api/channels/{id}/...`) pending the real
+  // muse backend confirming its exact mutation contract.
+  const composeMatch = system === 'muse' && /^\/api\/channels\/([^/]+)\/compose$/.exec(pathname);
+  if (composeMatch) {
+    return { ok: true, channel_id: composeMatch[1], status: 'queued' };
+  }
+  const maintenanceMatch = system === 'muse' && /^\/api\/channels\/([^/]+)\/maintenance$/.exec(pathname);
+  if (maintenanceMatch) {
+    return { ok: true, channel_id: maintenanceMatch[1], status: 'queued' };
   }
   return { ok: true };
 }
@@ -514,6 +601,13 @@ const mockAdapter: AggregationClient = {
 //            (binary passthrough -- see crate::constellation::proxy's module doc; this generic
 //            request<T>() path is JSON-typed, art responses should be fetched by <img src> URL,
 //            not through this method)
+//            CONST-20 additions (not in the original §5.4 route list -- see aggregationClient's
+//            MOCK_MUSE_STATS/compose/maintenance comments for why): GET /stats (dashboard
+//            MetricCards row), POST /api/channels/{id}/compose, POST /api/channels/{id}/
+//            maintenance (both operator-gated + confirmed client-side, §5.4). All three are
+//            plain passthrough paths under the existing `proxy_muse` arm -- no proxy.rs change
+//            needed, they degrade exactly like every other unwired muse route (404/501 ->
+//            ChartEmpty "not yet wired") until the real muse backend implements them.
 
 function baseUrl(): string {
   // Same-origin only — never a hardcoded host/port. This is the one place in the app

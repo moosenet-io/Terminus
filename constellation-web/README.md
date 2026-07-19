@@ -259,6 +259,50 @@ door — it's structurally incapable of storing a credential shape). Vault-refer
 (provider API keys, etc., landing in CONST-08+) must be surfaced as a vault key *name* with a
 set/rotate affordance, never a round-tripped value.
 
+## Muse module (CONST-19 backend, CONST-20 UI)
+
+`muse` is the fourth namespaced proxy arm (`/api/muse/*path` in `src/constellation/proxy.rs`,
+CONST-19) with three panels (CONST-20, `src/panels/muse/`) against it:
+
+- **`muse.dashboard`** — a Library Overview MetricCards row (library size, active channels,
+  pending items, last ingest) plus On Deck (poster rail), Premieres (sorted, past-dated
+  entries dimmed not hidden), and Gaps summary.
+- **`muse.taste`** — a taste-cluster scatter (first 4 clusters keep a categorical slot, the
+  rest fold into one "Other" series — the §4.2 all-pairs cap), a watch-history stacked area,
+  and a group-dynamics table. All read-only.
+- **`muse.channels`** — channels list, per-channel lineup, and a guide grid rendered as a
+  `DataTable` timeline (deliberately **not** an EPG widget, per spec §5.4). Compose/maintenance
+  actions are operator-gated and confirmed.
+
+All data comes from `src/hooks/useMuse.ts`, which wraps every Muse read in its own
+`useMuseSection` call — this is the mechanism behind the module's **per-endpoint degradation**
+requirement: a single unwired/erroring route (the MUSEX-WIRE reality — most Muse features
+exist unwired in production) collapses only its own `ChartCard` to `ChartEmpty("not yet
+wired")`, never the whole panel. Degradation is keyed on two equivalent signals: the
+httpAdapter throwing `HTTP 404`/`HTTP 501`, or the mockAdapter resolving `null` for a pathname
+with no `MOCK_GET` entry (aggregationClient.ts's own "not mocked" sentinel). Manually verified
+by deleting a `MOCK_GET` key and confirming only that section degrades (see `useMuse.ts`'s and
+`DashboardPanel.tsx`'s top comments for how).
+
+Role gating comes from **merged CONST-27**: Muse's compose/maintenance controls are wrapped in
+main's canonical `components/RoleGate.tsx` (a viewer session sees them disabled with an
+"operator role required" tooltip; the real session role flows via `AuthRoleContext`'s
+`useAuthRole()`), and enforcement is always server-side regardless (spec §3.4 —
+`enforce_viewer_role_gate` 403s a viewer's mutating request). This build's earlier pre-merge
+role seam (a local `hooks/useAuthRole.ts` + its own RoleGate variant) was DELETED when the
+branch reconciled onto merged main. One local stand-in remains, clearly marked in its file
+header for its real item to replace without touching call sites:
+
+- **`components/ConfirmDialog.tsx`** — no shared modal/dialog kit on main yet (CONST-25's is
+  unmerged). Minimal, brand-token, `role="dialog"` + Esc-to-cancel stand-in for Muse's
+  compose/maintenance confirmations.
+
+Two mock/route additions beyond the original §5.4 endpoint list (both plain GET/POST passthrough
+under the existing `proxy_muse` arm, no `proxy.rs` change needed, both degrade the same way as
+every spec'd route): `GET /stats` (the dashboard's MetricCards row has no dedicated endpoint in
+the original list) and `POST /api/channels/{id}/{compose,maintenance}` (the channel mutation
+routes spec §5.4 names but doesn't give an exact path for).
+
 ## Roles (CONST-27)
 
 There are exactly two session tiers, both minted onto the same signed JWT from CONST-03 (no
