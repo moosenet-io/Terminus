@@ -14,7 +14,7 @@ This is the **only** module in the app allowed to call `fetch`, read `window.loc
 touch `localStorage` (the last one only via the `prefs` seam below). Every hook, panel, or
 component that needs backend data goes through the exported `getAggregationClient()`
 singleton — never `fetch` directly. This keeps the browser's only network surface to
-same-origin `/api/{harmony,chord,lumina,terminus}/*` calls, cookie-based
+same-origin `/api/{harmony,chord,lumina,muse,terminus}/*` calls, cookie-based
 (`credentials: 'include'`), no hardcoded hosts.
 
 It has two implementations of the same `AggregationClient` interface:
@@ -34,10 +34,15 @@ this is the contract the httpAdapter already assumes:
 | GET | `/api/auth/me` | `{ authenticated: boolean; username: string \| null }` |
 | POST | `/api/auth/login` (body `{username,password}`) | same as above |
 | POST | `/api/auth/logout` | 200/204 |
-| GET | `/api/health` | `{ system: 'harmony'\|'chord'\|'lumina'\|'terminus'; available: boolean; detail?: string }[]` |
+| GET | `/api/health` | `{ system: 'harmony'\|'chord'\|'lumina'\|'muse'\|'terminus'; available: boolean; detail?: string }[]` |
 | GET | `/api/terminus/config` | `{ modules: { name: string; enabled: boolean; version?: string }[]; workerCount: number }` |
 | GET | `/api/terminus/activity?limit=N` | `{ entries: { ts: string; method: string; path: string; principal: string \| null; system: string }[] }` — tail of the CONST-02 mutating-request audit log; **never body content**. `limit` asks for fewer entries, never more than the server's own `CONSTELLATION_ACTIVITY_TAIL_LIMIT` cap (default 200). A missing/empty audit log yields `{entries: []}`, `200 OK` — never an error. |
 | any | `/api/{system}/{path}` | generic passthrough used by `client.request<T>()` for panel-specific reads that don't have a typed method yet |
+
+CONST-19 adds the fourth namespace, `/api/muse/*path` — identical single-door/masking/audit/
+degradation semantics to the other three, with one difference: `/api/muse/art/*` (poster/art
+images) passes through as raw bytes with the upstream's own content-type rather than JSON —
+fetch those by URL (e.g. an `<img src>`), not through `client.request<T>()`.
 
 #### The `prefs` seam (CONST-16)
 
