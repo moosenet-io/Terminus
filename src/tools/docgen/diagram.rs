@@ -1516,11 +1516,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn emitted_diagram_source_is_swept_private_ip_in_node_label_is_placeholdered() {
-        // Redaction detectors are env-configurable; ensure a clean, default
-        // config so a leftover value from another test can't disable private_ip
-        // detection under this test.
-        std::env::remove_var("TERMINUS_PII_CONFIG");
-        std::env::remove_var("GITHUB_ALLOWED_AUTHORS");
+        // (env is NOT mutated here — set_var/remove_var in a multithreaded test
+        // binary is UB; #[serial] above is the isolation mechanism instead.)
         // NOTE: `<internal-ip>` below is a deliberately fake private-IP // pii-test-fixture
         // literal for this fixture only, tagged per this repo's push-gate
         // whitelist convention so the source-scan exempts this line without
