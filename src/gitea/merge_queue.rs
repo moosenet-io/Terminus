@@ -200,6 +200,26 @@ fn wait_key(key: &str) -> String {
 fn lock_key(key: &str) -> String {
     Namespace::Queue.key(&format!("merge:lock:{key}"))
 }
+/// Companion ZSET to `wait_key`: member = ticket, score = the ticket's own
+/// enqueue-time deadline (epoch ms). This is the per-waiter age-prune
+/// mechanism (Finding A / GMQ-02 r2) — distinct from (and stronger than) the
+/// whole-ZSET `EXPIRE` backstop on `wait_key`, which only bounds the ENTIRE
+/// key's lifetime and gets pushed out on every unrelated enqueue. A ticket's
+/// individual deadline here is fixed at enqueue time and is never refreshed,
+/// so a caller that crashes while holding the front (or any) ticket ages out
+/// on its own, bounded by `wait_ttl`, regardless of how many later callers
+/// enqueue behind it.
+fn deadline_key(key: &str) -> String {
+    Namespace::Queue.key(&format!("merge:deadline:{key}"))
+}
+
+/// Current epoch time in milliseconds, for the deadline ZSET's score.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 /// FIFO/priority ordering score, mirroring the compiler queue's dispatch ZSET
 /// (`src/compiler/queue.rs`, `score = seq - prank*1e12`): a higher `priority`
@@ -209,12 +229,22 @@ fn ordering_score(ticket: u64, priority: i64) -> f64 {
     ticket as f64 - (priority as f64) * 1_000_000_000_000.0
 }
 
-/// Acquire: succeeds only if `ARGV[1]` (this ticket) is the ZSET front AND the
-/// lock key is not held. On success, removes the ticket from the wait ZSET and
-/// sets the lock (fence + TTL) atomically — no other poller can observe
-/// "front + free" and win the same race.
-/// KEYS: 1=wait_zset 2=lock  ARGV: 1=ticket_member 2=fence 3=ttl_ms
+/// Acquire: first PRUNES any waiter whose own enqueue-time deadline (recorded
+/// in the companion `deadline_zset`, see [`deadline_key`]) has passed — this
+/// is the age-based self-heal for an abandoned (e.g. hard-crashed) waiter, so
+/// a stale ticket can never wedge the front forever regardless of how many
+/// later callers enqueue behind it (Finding A / GMQ-02 r2). After pruning,
+/// succeeds only if `ARGV[1]` (this ticket) is the ZSET front AND the lock key
+/// is not held. On success, removes the ticket from both ZSETs and sets the
+/// lock (fence + TTL) atomically — no other poller can observe "front + free"
+/// and win the same race.
+/// KEYS: 1=wait_zset 2=lock 3=deadline_zset  ARGV: 1=ticket_member 2=fence 3=ttl_ms 4=now_ms
 const TRY_ACQUIRE_LUA: &str = r#"
+local expired = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', ARGV[4])
+for i = 1, #expired do
+  redis.call('ZREM', KEYS[1], expired[i])
+  redis.call('ZREM', KEYS[3], expired[i])
+end
 local front = redis.call('ZRANGE', KEYS[1], 0, 0)
 if #front == 0 or front[1] ~= ARGV[1] then
   return {0, 'not_front'}
@@ -223,6 +253,7 @@ if redis.call('EXISTS', KEYS[2]) == 1 then
   return {0, 'held'}
 end
 redis.call('ZREM', KEYS[1], ARGV[1])
+redis.call('ZREM', KEYS[3], ARGV[1])
 redis.call('SET', KEYS[2], ARGV[2], 'PX', ARGV[3])
 return {1, ARGV[2]}
 "#;
@@ -254,9 +285,11 @@ impl MergeLockStore for RedisMergeLockStore {
             .await?;
         let ticket = ticket.max(0) as u64;
         let waitk = wait_key(key);
+        let deadlinek = deadline_key(key);
         let score = ordering_score(ticket, priority);
         let member = ticket.to_string();
         let wait_ttl_secs = wait_ttl.as_secs().max(1) as i64;
+        let deadline_ms = now_ms() + wait_ttl.as_millis() as i64;
         let _: i64 = self
             .backend
             .with_conn(Namespace::Queue, |mut conn| async move {
@@ -266,15 +299,32 @@ impl MergeLockStore for RedisMergeLockStore {
                     .arg(&member)
                     .query_async::<_, i64>(&mut conn)
                     .await?;
-                // Self-healing backstop for an abandoned waiter (e.g. the
-                // caller crashed between enqueue and its first poll): bound the
-                // whole wait ZSET's lifetime by the caller's config-derived
-                // `wait_ttl` (see `MergeQueueConfig::wait_ttl_secs`, default
-                // `max_wait_secs + 60`) so it cannot wedge a key forever, and
-                // so the backstop is never shorter than a legitimately
-                // still-polling waiter. Refreshed on every enqueue.
+                // Per-ticket age-prune backstop (Finding A / GMQ-02 r2): record
+                // THIS ticket's own fixed enqueue-time deadline, never
+                // refreshed by later enqueues, so a caller that crashes
+                // between enqueue and its first poll ages out on its own —
+                // see `deadline_key` and `TRY_ACQUIRE_LUA`.
+                ::redis::cmd("ZADD")
+                    .arg(&deadlinek)
+                    .arg(deadline_ms)
+                    .arg(&member)
+                    .query_async::<_, i64>(&mut conn)
+                    .await?;
+                // Whole-ZSET EXPIRE backstop (belt-and-suspenders on top of the
+                // per-ticket deadline above): bounds both keys' lifetime by the
+                // caller's config-derived `wait_ttl` (see
+                // `MergeQueueConfig::wait_ttl_secs`, default `max_wait_secs +
+                // 60`) so an entirely idle key doesn't linger in Redis forever.
+                // Refreshed on every enqueue — this is NOT the mechanism that
+                // frees an abandoned waiter (that's the per-ticket deadline
+                // ZSET pruned in `TRY_ACQUIRE_LUA`), just general key hygiene.
                 ::redis::cmd("EXPIRE")
                     .arg(&waitk)
+                    .arg(wait_ttl_secs)
+                    .query_async::<_, i64>(&mut conn)
+                    .await?;
+                ::redis::cmd("EXPIRE")
+                    .arg(&deadlinek)
                     .arg(wait_ttl_secs)
                     .query_async::<_, i64>(&mut conn)
                     .await
@@ -290,10 +340,11 @@ impl MergeLockStore for RedisMergeLockStore {
         fence: &str,
         ttl: Duration,
     ) -> Result<AcquireAttempt, ()> {
-        let (waitk, lockk) = (wait_key(key), lock_key(key));
+        let (waitk, lockk, deadlinek) = (wait_key(key), lock_key(key), deadline_key(key));
         let member = ticket.to_string();
         let ttl_ms = ttl.as_millis().max(1) as i64;
         let fence = fence.to_string();
+        let now = now_ms();
         let script = ::redis::Script::new(TRY_ACQUIRE_LUA);
         let out: (i64, String) = self
             .backend
@@ -301,9 +352,11 @@ impl MergeLockStore for RedisMergeLockStore {
                 script
                     .key(waitk)
                     .key(lockk)
+                    .key(deadlinek)
                     .arg(member)
                     .arg(fence)
                     .arg(ttl_ms)
+                    .arg(now)
                     .invoke_async(&mut conn)
                     .await
             })
@@ -316,12 +369,18 @@ impl MergeLockStore for RedisMergeLockStore {
 
     async fn cancel(&self, key: &str, ticket: u64) -> Result<(), ()> {
         let waitk = wait_key(key);
+        let deadlinek = deadline_key(key);
         let member = ticket.to_string();
         let _: i64 = self
             .backend
             .with_conn(Namespace::Queue, |mut conn| async move {
                 ::redis::cmd("ZREM")
                     .arg(&waitk)
+                    .arg(&member)
+                    .query_async::<_, i64>(&mut conn)
+                    .await?;
+                ::redis::cmd("ZREM")
+                    .arg(&deadlinek)
                     .arg(&member)
                     .query_async::<_, i64>(&mut conn)
                     .await
@@ -533,8 +592,12 @@ mod tests {
     #[derive(Default)]
     struct State {
         seq: HashMap<String, u64>,
-        /// key -> Vec<(ticket, score)> kept sorted by score ascending (front = index 0).
-        wait: HashMap<String, Vec<(u64, f64)>>,
+        /// key -> Vec<(ticket, score, deadline)> kept sorted by score ascending
+        /// (front = index 0). `deadline` mirrors the Redis companion
+        /// `deadline_zset`: fixed at enqueue time, never refreshed by later
+        /// enqueues — a ticket past its own deadline is pruned in
+        /// `try_acquire`, exactly like `TRY_ACQUIRE_LUA`.
+        wait: HashMap<String, Vec<(u64, f64, StdInstant)>>,
         /// key -> (fence, expires_at)
         lock: HashMap<String, (String, StdInstant)>,
         /// When true, every op behaves as an unreachable backend.
@@ -561,6 +624,31 @@ mod tests {
             }
         }
 
+        /// Force a still-waiting ticket's own age-prune deadline into the past
+        /// (simulate a hard-crashed waiter whose `wait_ttl_secs` has elapsed)
+        /// without waiting in real time — the in-memory analog of forcing an
+        /// entry in Redis's `deadline_zset` below `now_ms()`.
+        fn expire_ticket(&self, key: &str, ticket: u64) {
+            let mut s = self.state.lock().unwrap();
+            if let Some(bucket) = s.wait.get_mut(key) {
+                for entry in bucket.iter_mut() {
+                    if entry.0 == ticket {
+                        entry.2 = StdInstant::now() - Duration::from_millis(1);
+                    }
+                }
+            }
+        }
+
+        /// Tickets currently still waiting (front-to-back order) for `key`,
+        /// for assertions that a ticket was (or was not) removed.
+        fn waiting_tickets(&self, key: &str) -> Vec<u64> {
+            let s = self.state.lock().unwrap();
+            s.wait
+                .get(key)
+                .map(|b| b.iter().map(|(t, _, _)| *t).collect())
+                .unwrap_or_default()
+        }
+
         fn is_locked(&self, key: &str) -> bool {
             let s = self.state.lock().unwrap();
             match s.lock.get(key) {
@@ -572,7 +660,7 @@ mod tests {
 
     #[async_trait]
     impl MergeLockStore for InMemoryMergeLockStore {
-        async fn enqueue(&self, key: &str, priority: i64, _wait_ttl: Duration) -> Result<u64, ()> {
+        async fn enqueue(&self, key: &str, priority: i64, wait_ttl: Duration) -> Result<u64, ()> {
             let mut s = self.state.lock().unwrap();
             if s.down {
                 return Err(());
@@ -581,8 +669,9 @@ mod tests {
             *counter += 1;
             let ticket = *counter;
             let score = ordering_score(ticket, priority);
+            let deadline = StdInstant::now() + wait_ttl;
             let bucket = s.wait.entry(key.to_string()).or_default();
-            bucket.push((ticket, score));
+            bucket.push((ticket, score, deadline));
             bucket.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
             Ok(ticket)
         }
@@ -598,8 +687,17 @@ mod tests {
             if s.down {
                 return Ok(AcquireAttempt::Unavailable);
             }
+            // Age-prune (Finding A / GMQ-02 r2): drop any ticket whose own
+            // enqueue-time deadline has passed, mirroring
+            // `TRY_ACQUIRE_LUA`'s `ZRANGEBYSCORE`+`ZREM` on `deadline_zset`.
+            // This runs BEFORE the front check so an abandoned front ticket
+            // cannot wedge a later, still-live ticket behind it.
+            let now = StdInstant::now();
+            if let Some(bucket) = s.wait.get_mut(key) {
+                bucket.retain(|(_, _, deadline)| *deadline > now);
+            }
             let front = s.wait.get(key).and_then(|b| b.first().copied());
-            if front.map(|(t, _)| t) != Some(ticket) {
+            if front.map(|(t, _, _)| t) != Some(ticket) {
                 return Ok(AcquireAttempt::NotYet);
             }
             let held = match s.lock.get(key) {
@@ -610,7 +708,7 @@ mod tests {
                 return Ok(AcquireAttempt::NotYet);
             }
             if let Some(bucket) = s.wait.get_mut(key) {
-                bucket.retain(|(t, _)| *t != ticket);
+                bucket.retain(|(t, _, _)| *t != ticket);
             }
             s.lock
                 .insert(key.to_string(), (fence.to_string(), StdInstant::now() + ttl));
@@ -623,7 +721,7 @@ mod tests {
                 return Err(());
             }
             if let Some(bucket) = s.wait.get_mut(key) {
-                bucket.retain(|(t, _)| *t != ticket);
+                bucket.retain(|(t, _, _)| *t != ticket);
             }
             Ok(())
         }
@@ -925,5 +1023,93 @@ mod tests {
         assert_eq!(result, Err(MergeQueueError::Busy));
 
         holder.await.unwrap().unwrap();
+    }
+
+    // ── GMQ-02 r2: Finding A — per-waiter self-heal ─────────────────────
+
+    #[tokio::test]
+    async fn a_crashed_front_waiters_ticket_is_age_pruned_and_does_not_wedge_the_queue() {
+        // Simulate a caller that enqueued and then hard-crashed (never polled,
+        // never called `cancel`) while its ticket sat at the FRONT. Unlike the
+        // whole-ZSET EXPIRE (which a later enqueue would keep refreshing
+        // forever), the per-ticket deadline is fixed at enqueue time, so once
+        // it's forced into the past (standing in for `wait_ttl_secs`
+        // elapsing), `try_acquire` prunes it and a later, live waiter is
+        // unwedged — even though a second ticket was enqueued AFTER the first
+        // one's deadline was set, which would have refreshed a whole-ZSET TTL.
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let cfg = fast_cfg();
+
+        let crashed_ticket = store.enqueue("owner/repo/main", 0, Duration::from_secs(60)).await.unwrap();
+        assert_eq!(store.waiting_tickets("owner/repo/main"), vec![crashed_ticket]);
+
+        // A later, live waiter enqueues behind the crashed ticket (this is the
+        // "refreshes the whole-ZSET TTL under retry/load" scenario from the
+        // finding) and would normally be wedged behind it forever.
+        let q2 = queue_over(Arc::clone(&store));
+        let live_cfg = cfg;
+        let waiter = tokio::spawn(async move {
+            q2.with_merge_slot("owner/repo/main", 0, &live_cfg, || async { "recovered" }).await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Force the crashed ticket's own deadline into the past — the
+        // in-memory analog of `wait_ttl_secs` having elapsed for JUST that
+        // ticket, independent of any later enqueue.
+        store.expire_ticket("owner/repo/main", crashed_ticket);
+
+        let result = waiter.await.unwrap();
+        assert_eq!(
+            result,
+            Ok("recovered"),
+            "a later waiter must proceed once the abandoned front ticket ages out, not wedge forever"
+        );
+        assert!(
+            !store.waiting_tickets("owner/repo/main").contains(&crashed_ticket),
+            "the pruned, abandoned ticket must be gone from the wait ordering"
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_waiter_removes_its_own_ticket_so_it_does_not_block_the_next_waiter() {
+        // Ticket 1 is enqueued directly (bypassing `with_merge_slot`) and never
+        // resolved — it sits at the front forever, standing in for some other
+        // in-flight (not crashed, just slow/stuck) waiter. Ticket 2 goes
+        // through `with_merge_slot`, never reaches the front, hits
+        // `max_wait_secs`, and must return `Busy` — the fix under test is that
+        // ticket 2 removes ITS OWN ticket on that exit path so it can never
+        // block whoever enqueues after it.
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let stuck_ticket = store.enqueue("owner/repo/main", 0, Duration::from_secs(600)).await.unwrap();
+
+        let q2 = queue_over(Arc::clone(&store));
+        let waiter_cfg = MergeQueueConfig {
+            enabled: true,
+            lock_ttl_secs: 60,
+            max_wait_secs: 0, // times out on the very first poll
+            wait_ttl_secs: 600,
+        };
+        let result = q2
+            .with_merge_slot("owner/repo/main", 0, &waiter_cfg, || async { "should-not-run" })
+            .await;
+        assert_eq!(result, Err(MergeQueueError::Busy));
+
+        // Ticket 2 must be gone; only the stuck front ticket remains.
+        assert_eq!(
+            store.waiting_tickets("owner/repo/main"),
+            vec![stuck_ticket],
+            "a Busy (max_wait-exceeded) waiter must remove its own ticket, not leave it behind"
+        );
+
+        // A third, subsequent waiter enqueues cleanly behind the (still
+        // legitimately stuck) front ticket, proving ticket 2 left no trace
+        // that would otherwise double up / corrupt the ordering.
+        let q3 = queue_over(Arc::clone(&store));
+        let third_ticket = q3
+            .store
+            .enqueue("owner/repo/main", 0, Duration::from_secs(600))
+            .await
+            .unwrap();
+        assert_eq!(store.waiting_tickets("owner/repo/main"), vec![stuck_ticket, third_ticket]);
     }
 }
