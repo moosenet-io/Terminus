@@ -53,6 +53,15 @@
 //! JWT `PersonalFederationClient`/`inference_proxy` already mint) against
 //! Chord's existing `POST /v1/infer` single-prompt route -- no new Chord-side
 //! endpoint is assumed. A `MockDocGenerator` (test-only) stands in for tests.
+//!
+//! ## DGDG-01: cloud-provider fallback
+//! [`FallbackDocGenerator`] wraps [`ChordDocGenerator`] with an optional
+//! [`OpenRouterDocGenerator`] cloud fallback, so doc generation can still
+//! run when local Chord/GPU inference is jammed (unreachable, timed out, or
+//! OOM'd -- the exact failure that blocked the DGRICH rollout) instead of
+//! failing the whole request. `FallbackDocGenerator::from_env` is the
+//! production call sites' (`trigger.rs`/`backfill.rs`) entry point; see its
+//! doc comment for the byte-for-byte-unchanged-when-unconfigured guarantee.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -206,6 +215,133 @@ impl DocGenerator for ChordDocGenerator {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DGDG-01: cloud-provider fallback when local Chord/GPU inference is jammed
+// ---------------------------------------------------------------------------
+//
+// The exact failure that blocked the DGRICH rollout: `ChordDocGenerator`
+// returns `Err` (unreachable/timeout/OOM) with no recovery path for that
+// generation. `OpenRouterDocGenerator` is a second, real `DocGenerator`
+// impl reusing `crate::review::ReviewConfig::dispatch_openrouter` -- the
+// SAME OpenRouter chat-completions client `review::dispatch`'s `nemotron`/
+// `qwen_coder`/`gpt56` providers already use (same URL resolution, same
+// `OPENROUTER_API_KEY` bearer-auth convention: a plain env read post-
+// materialization IS the vault read in this crate, per that module's doc
+// comment) -- this struct adds no second HTTP client, only names which
+// model tag to send. `FallbackDocGenerator` composes a primary
+// (`ChordDocGenerator`) with an optional cloud generator: it only ever
+// calls the cloud generator after the primary itself returns `Err`, and a
+// healthy primary's `Ok` is returned untouched (cloud is never consulted
+// when local inference is fine).
+
+/// Real `DocGenerator` cloud fallback: routes a doc-generation prompt to a
+/// configured OpenRouter model via [`crate::review::ReviewConfig::dispatch_openrouter`]
+/// rather than reimplementing that HTTP call. See the section doc comment
+/// above for why this reuses (not duplicates) `review::dispatch`'s client.
+#[derive(Debug, Clone)]
+pub struct OpenRouterDocGenerator {
+    model: String,
+    review_config: crate::review::ReviewConfig,
+}
+
+impl OpenRouterDocGenerator {
+    /// Build from an explicit model tag and `ReviewConfig` (letting
+    /// production callers share one `ReviewConfig::from_env()` read across
+    /// this and any other review-provider use, and letting tests supply a
+    /// config with a mocked `OPENROUTER_CHAT_URL`/key without touching real
+    /// env).
+    pub fn new(model: impl Into<String>, review_config: crate::review::ReviewConfig) -> Self {
+        Self { model: model.into(), review_config }
+    }
+}
+
+#[async_trait]
+impl DocGenerator for OpenRouterDocGenerator {
+    async fn generate(&self, prompt: &str) -> Result<String, ToolError> {
+        self.review_config
+            .dispatch_openrouter(&self.model, prompt)
+            .await
+            .map_err(ToolError::Http)
+    }
+}
+
+/// Composes a primary `DocGenerator` (production: [`ChordDocGenerator`],
+/// the local Chord/GPU path) with an optional cloud fallback (production:
+/// [`OpenRouterDocGenerator`]) for DGDG-01. `generate()`:
+/// - Tries `primary` first; a primary `Ok` is returned as-is (`cloud` is
+///   never called).
+/// - On a primary `Err`, if `cloud` is configured, logs a warning and tries
+///   it -- returning the cloud result on success, or a combined error
+///   naming both failures if the cloud attempt ALSO errors.
+/// - If `cloud` is `None` (the default when `DOCGEN_CLOUD_FALLBACK_MODEL`/
+///   an OpenRouter key aren't configured -- see [`Self::from_env`]), the
+///   primary's `Err` is returned unchanged: today's pre-DGDG-01 behavior,
+///   byte for byte.
+pub struct FallbackDocGenerator {
+    primary: Box<dyn DocGenerator>,
+    cloud: Option<Box<dyn DocGenerator>>,
+}
+
+impl FallbackDocGenerator {
+    /// Build directly from an already-constructed primary/cloud pair (the
+    /// seam the unit tests below use with stub generators).
+    pub fn new(primary: Box<dyn DocGenerator>, cloud: Option<Box<dyn DocGenerator>>) -> Self {
+        Self { primary, cloud }
+    }
+
+    /// Production wiring: [`ChordDocGenerator::from_env`] as primary, plus
+    /// an [`OpenRouterDocGenerator`] cloud fallback IFF BOTH
+    /// `crate::config::docgen_cloud_fallback_model()` and an OpenRouter key
+    /// (`ReviewConfig::from_env().openrouter_key`) are present; otherwise
+    /// `cloud` is `None` and this generator behaves exactly like a bare
+    /// `ChordDocGenerator::from_env()` did before DGDG-01.
+    pub fn from_env() -> Self {
+        let review_config = crate::review::ReviewConfig::from_env();
+        let cloud: Option<Box<dyn DocGenerator>> = match crate::config::docgen_cloud_fallback_model() {
+            Some(model) if review_config.openrouter_key.is_some() => {
+                Some(Box::new(OpenRouterDocGenerator::new(model, review_config)) as Box<dyn DocGenerator>)
+            }
+            _ => None,
+        };
+        // DGDG-03: when a cloud fallback exists, cap the LOCAL primary's timeout
+        // to a short fast-fail value (`DOCGEN_LOCAL_TIMEOUT_MS`, default 45s) so a
+        // JAMMED local backend (GPU held/evicted, cold reload, CPU-only fallback)
+        // errors quickly and the cloud fallback fires promptly — instead of the
+        // primary hanging for the full federation timeout (often minutes) before
+        // the fallback is even attempted. With NO cloud configured we keep the
+        // full federation timeout (a slow-but-eventually-fine local answer is
+        // strictly better than no answer when there is nothing to fall back to).
+        let chord = if cloud.is_some() {
+            ChordDocGenerator::from_env()
+                .with_timeout(std::time::Duration::from_millis(crate::config::docgen_local_timeout_ms()))
+        } else {
+            ChordDocGenerator::from_env()
+        };
+        let primary: Box<dyn DocGenerator> = Box::new(chord);
+        Self { primary, cloud }
+    }
+}
+
+#[async_trait]
+impl DocGenerator for FallbackDocGenerator {
+    async fn generate(&self, prompt: &str) -> Result<String, ToolError> {
+        match self.primary.generate(prompt).await {
+            Ok(text) => Ok(text),
+            Err(primary_err) => {
+                let Some(cloud) = &self.cloud else {
+                    return Err(primary_err);
+                };
+                tracing::warn!("local docgen inference failed, falling back to cloud: {primary_err}");
+                cloud.generate(prompt).await.map_err(|cloud_err| {
+                    ToolError::Execution(format!(
+                        "docgen: both local and cloud generation failed -- local: {primary_err}; cloud: {cloud_err}"
+                    ))
+                })
+            }
+        }
     }
 }
 
@@ -676,6 +812,16 @@ async fn run_guides_pass(
         "registered_tool_count": facts.entry_points.registered_tool_count,
         "config_surface": facts.config_surface,
         "guide_topics": identity.guide_topics,
+        // DGDG-02: the current guides/getting-started (if this repo already
+        // has them) as the Pass 3 "deepen, don't regenerate" baseline. Both
+        // are `None`/empty on a first-ever run -- `build_guides_prompt`
+        // treats absence as "write fresh," exactly as before this field
+        // existed. Untrusted content like every other field embedded here --
+        // covered by the SAME whole-prompt PII sweep this pass already runs
+        // before every send (see the comment on `prompt_for_send` below),
+        // not a second sweep.
+        "existing_getting_started": facts.existing_docs.getting_started,
+        "existing_guides": facts.existing_docs.guides,
     });
 
     let legacy_usage: String = facts
@@ -938,6 +1084,114 @@ mod tests {
         async fn generate(&self, _prompt: &str) -> Result<String, ToolError> {
             Err(ToolError::Http("backend down".to_string()))
         }
+    }
+
+    // ── DGDG-01: FallbackDocGenerator ─────────────────────────────────
+
+    /// Test-only `DocGenerator` that always succeeds with a fixed response
+    /// and records how many times it was called -- used to assert a
+    /// healthy primary short-circuits (cloud never invoked) and, when used
+    /// as the cloud stub, that a failed primary's `Err` doesn't stop the
+    /// cloud attempt from running.
+    struct StubOkGenerator {
+        response: String,
+        calls: Mutex<u32>,
+    }
+
+    impl StubOkGenerator {
+        fn new(response: impl Into<String>) -> Self {
+            Self { response: response.into(), calls: Mutex::new(0) }
+        }
+
+        fn call_count(&self) -> u32 {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl DocGenerator for StubOkGenerator {
+        async fn generate(&self, _prompt: &str) -> Result<String, ToolError> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(self.response.clone())
+        }
+    }
+
+    /// Test-only `DocGenerator` that always fails with a distinctive,
+    /// caller-supplied reason -- used so assertions on a combined error can
+    /// check for both the primary's and the cloud's messages by name.
+    struct StubErrGenerator {
+        reason: String,
+    }
+
+    impl StubErrGenerator {
+        fn new(reason: impl Into<String>) -> Self {
+            Self { reason: reason.into() }
+        }
+    }
+
+    #[async_trait]
+    impl DocGenerator for StubErrGenerator {
+        async fn generate(&self, _prompt: &str) -> Result<String, ToolError> {
+            Err(ToolError::Http(self.reason.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_uses_cloud_when_primary_errors() {
+        let primary = Box::new(StubErrGenerator::new("local jammed"));
+        let cloud = Box::new(StubOkGenerator::new("cloud-generated content"));
+        let fallback = FallbackDocGenerator::new(primary, Some(cloud));
+
+        let result = fallback.generate("prompt").await.expect("cloud should succeed");
+        assert_eq!(result, "cloud-generated content");
+    }
+
+    #[tokio::test]
+    async fn fallback_short_circuits_cloud_never_invoked_when_primary_ok() {
+        use std::sync::Arc;
+
+        /// Shares one `StubOkGenerator` between the test assertion and the
+        /// `FallbackDocGenerator` (which needs to own a `Box<dyn
+        /// DocGenerator>`), so the test can check `call_count()` after the
+        /// fact.
+        struct ArcGenerator(Arc<StubOkGenerator>);
+
+        #[async_trait]
+        impl DocGenerator for ArcGenerator {
+            async fn generate(&self, prompt: &str) -> Result<String, ToolError> {
+                self.0.generate(prompt).await
+            }
+        }
+
+        let primary = Box::new(StubOkGenerator::new("local content"));
+        let cloud_inner = Arc::new(StubOkGenerator::new("cloud content"));
+        let cloud = Box::new(ArcGenerator(cloud_inner.clone()));
+        let fallback = FallbackDocGenerator::new(primary, Some(cloud));
+
+        let result = fallback.generate("prompt").await.expect("primary should succeed");
+        assert_eq!(result, "local content", "a healthy primary's result must win");
+        assert_eq!(cloud_inner.call_count(), 0, "cloud must never be called when primary succeeds");
+    }
+
+    #[tokio::test]
+    async fn fallback_both_fail_returns_combined_error() {
+        let primary = Box::new(StubErrGenerator::new("local jammed"));
+        let cloud = Box::new(StubErrGenerator::new("cloud also down"));
+        let fallback = FallbackDocGenerator::new(primary, Some(cloud));
+
+        let err = fallback.generate("prompt").await.expect_err("both failing must error");
+        let msg = err.to_string();
+        assert!(msg.contains("local jammed"), "combined error must name the local failure: {msg}");
+        assert!(msg.contains("cloud also down"), "combined error must name the cloud failure: {msg}");
+    }
+
+    #[tokio::test]
+    async fn fallback_no_cloud_configured_passes_through_primary_error_unchanged() {
+        let primary = Box::new(StubErrGenerator::new("local jammed, no fallback configured"));
+        let fallback = FallbackDocGenerator::new(primary, None);
+
+        let err = fallback.generate("prompt").await.expect_err("no cloud must propagate primary Err");
+        assert!(err.to_string().contains("local jammed, no fallback configured"));
     }
 
     fn swept(raw: &str) -> SweptFeatContext {
@@ -1233,6 +1487,15 @@ mod tests {
                 .expect("fixture facts should build")
         }
 
+        /// DGDG-02: same fixture graph as [`fixture_facts`], but built against
+        /// a REAL on-disk checkout so `RepoFacts::existing_docs` can actually
+        /// pick up whatever `docs/` tree is present at `checkout_path`.
+        fn fixture_facts_at(checkout_path: &Path) -> RepoFacts {
+            let g = two_subsystem_graph();
+            build_repo_facts(&FixtureGraphSource(g), checkout_path, "FIXR", "abc123")
+                .expect("fixture facts should build")
+        }
+
         fn valid_identity_json(kept: &[&str]) -> String {
             let subsystems: Vec<Value> = kept
                 .iter()
@@ -1266,6 +1529,13 @@ mod tests {
             /// Optional per-subsystem canned good response override.
             page_responses: HashMap<String, String>,
             guides_response: String,
+            /// DGDG-02: every subsystem-page prompt actually sent, keyed by
+            /// subsystem name -- lets a test assert what baseline content
+            /// (or absence of one) reached a given subsystem's Pass 2 call
+            /// without re-deriving the prompt itself.
+            captured_page_prompts: Mutex<HashMap<String, String>>,
+            /// DGDG-02: the guides-pass prompt actually sent, if Pass 3 ran.
+            captured_guides_prompt: Mutex<Option<String>>,
         }
 
         impl ScriptedGenerator {
@@ -1275,6 +1545,8 @@ mod tests {
                     bad_subsystems: HashSet::new(),
                     page_responses: HashMap::new(),
                     guides_response: guides_response.into(),
+                    captured_page_prompts: Mutex::new(HashMap::new()),
+                    captured_guides_prompt: Mutex::new(None),
                 }
             }
 
@@ -1291,6 +1563,7 @@ mod tests {
                     return Ok(self.identity_response.clone());
                 }
                 if prompt.contains("You are writing the operator guides") {
+                    *self.captured_guides_prompt.lock().unwrap() = Some(prompt.to_string());
                     return Ok(self.guides_response.clone());
                 }
                 const MARKER: &str = "reference page for the `";
@@ -1298,6 +1571,10 @@ mod tests {
                     let rest = &prompt[idx + MARKER.len()..];
                     if let Some(end) = rest.find('`') {
                         let name = &rest[..end];
+                        self.captured_page_prompts
+                            .lock()
+                            .unwrap()
+                            .insert(name.to_string(), prompt.to_string());
                         if self.bad_subsystems.contains(name) {
                             return Ok(format!(
                                 "# {name}\n\nSee `crate::{name}::PhantomThing::not_real` for details.\n"
@@ -1441,6 +1718,119 @@ Clone with `git clone <repo>` then build with `cargo build`.
             // ...but the real guide file we DID get is still returned (partial success).
             assert_eq!(outcome.guides.len(), 1);
             assert_eq!(outcome.guides[0].0, PathBuf::from("docs/guides/run-the-fixture.md"));
+        }
+
+        // ── DGDG-02: repo-level generation deepens from an existing baseline ──
+
+        /// End-to-end across Passes 2 and 3: a real checkout already has
+        /// `docs/reference/alpha.md` (a "hand/Fable-written" baseline) but no
+        /// `beta` page, and already has `docs/getting-started.md` +
+        /// `docs/guides/run-the-fixture.md`. `generate_repo_docs` must hand
+        /// alpha's Pass 2 prompt the existing page as a refine baseline
+        /// (with the DEEPEN instruction), leave beta's prompt exactly as the
+        /// no-baseline case (first-run behavior for that subsystem), and
+        /// thread the existing guides content into the Pass 3 prompt too.
+        #[tokio::test]
+        async fn existing_docs_tree_reaches_subsystem_and_guides_prompts_as_refine_baseline() {
+            let dir = std::env::temp_dir()
+                .join(format!("dgdg02-repo-docs-baseline-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("docs/reference")).unwrap();
+            std::fs::create_dir_all(dir.join("docs/guides")).unwrap();
+            std::fs::write(
+                dir.join("docs/reference/alpha.md"),
+                "# alpha\n\nAlpha ALREADY documents the hub reliably -- this is the baseline.\n",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("docs/getting-started.md"),
+                "Clone with `git clone <repo>` then build with `cargo build` (EXISTING baseline).\n",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("docs/guides/run-the-fixture.md"),
+                "1. Build it with `cargo build` (EXISTING baseline step).\n",
+            )
+            .unwrap();
+
+            let facts = fixture_facts_at(&dir);
+            assert!(
+                facts.existing_docs.subsystem_pages.contains_key("alpha"),
+                "sanity: RepoFacts must have picked up alpha's existing page from disk"
+            );
+            assert!(!facts.existing_docs.subsystem_pages.contains_key("beta"));
+
+            let kept: Vec<&str> = facts.subsystems.iter().map(|s| s.name.as_str()).collect();
+            let generator = ScriptedGenerator::new(valid_identity_json(&kept), GOOD_GUIDES);
+            let outcome = generate_repo_docs(&generator, &facts, "FixtureRepo", "abc123").await;
+            assert!(outcome.missing.is_empty(), "missing: {:?}", outcome.missing);
+
+            let page_prompts = generator.captured_page_prompts.lock().unwrap();
+            let alpha_prompt = page_prompts.get("alpha").expect("alpha page must have been generated");
+            assert!(
+                alpha_prompt.contains("Alpha ALREADY documents the hub reliably"),
+                "alpha's existing page must reach its Pass 2 prompt as a refine baseline"
+            );
+            assert!(alpha_prompt.contains("DEEPEN AND REFINE"));
+
+            let beta_prompt = page_prompts.get("beta").expect("beta page must have been generated");
+            assert!(
+                !beta_prompt.contains("Alpha ALREADY documents the hub reliably"),
+                "beta must not see alpha's baseline"
+            );
+            // beta has no existing page on disk -> its slice OMITS the key entirely
+            // (not `null`), and its prompt carries no deepen rule -- byte-identical
+            // to the pre-DGDG-02 first-run shape for that subsystem.
+            assert!(
+                !beta_prompt.contains("existing_page"),
+                "beta (no existing page) must not mention existing_page at all: {beta_prompt}"
+            );
+            assert!(
+                !beta_prompt.contains("DEEPEN AND REFINE"),
+                "beta (no existing page) must not carry the deepen rule: {beta_prompt}"
+            );
+            drop(page_prompts);
+
+            let guides_prompt = generator
+                .captured_guides_prompt
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("guides pass must have run");
+            assert!(guides_prompt.contains("EXISTING baseline"));
+            assert!(guides_prompt.contains("EXISTING baseline step"));
+            assert!(guides_prompt.contains("DEEPEN AND REFINE"));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// First-run companion: no existing `docs/` tree at all -- every
+        /// prompt is exactly the no-baseline case, matching behavior before
+        /// this item.
+        #[tokio::test]
+        async fn no_existing_docs_tree_leaves_every_prompt_in_first_run_shape() {
+            let facts = fixture_facts(); // checkout path does not exist at all
+            assert!(facts.existing_docs.is_empty());
+
+            let kept: Vec<&str> = facts.subsystems.iter().map(|s| s.name.as_str()).collect();
+            let generator = ScriptedGenerator::new(valid_identity_json(&kept), GOOD_GUIDES);
+            let outcome = generate_repo_docs(&generator, &facts, "FixtureRepo", "abc123").await;
+            assert!(outcome.missing.is_empty(), "missing: {:?}", outcome.missing);
+
+            let page_prompts = generator.captured_page_prompts.lock().unwrap();
+            for (name, prompt) in page_prompts.iter() {
+                // First run (no docs/ tree): the slice OMITS existing_page entirely
+                // and the prompt carries no deepen rule -- byte-identical to the
+                // pre-DGDG-02 first-run prompt (codex review requirement).
+                assert!(
+                    !prompt.contains("existing_page"),
+                    "'{name}' first-run prompt must not mention existing_page at all: {prompt}"
+                );
+                assert!(
+                    !prompt.contains("DEEPEN AND REFINE"),
+                    "'{name}' first-run prompt must not carry the deepen rule: {prompt}"
+                );
+            }
         }
     }
 }

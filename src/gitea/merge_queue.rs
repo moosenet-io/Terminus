@@ -47,6 +47,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::Serialize;
 use tracing::warn;
 
 use crate::redis::{Namespace, RedisBackend};
@@ -119,8 +120,16 @@ impl MergeQueueConfig {
 pub enum MergeQueueError {
     /// `max_wait_secs` elapsed before this waiter reached the front of the
     /// queue AND found the lock free. Callers should surface a clear
-    /// "queue busy, retry" rather than hanging.
+    /// "queue busy, retry" rather than hanging. Also returned by
+    /// [`MergeQueue::enforce_spacing`] when the min-delay remainder would
+    /// exceed `max_wait_secs` (GMQ-03) — the caller should never sleep past
+    /// that ceiling either.
     Busy,
+    /// GMQ-03 stale-base guard: the PR is not currently mergeable (a stale
+    /// base or a real conflict) — do NOT merge. Callers should surface this
+    /// as "rebase current base and retry", never race a merge attempt
+    /// against Gitea's own `mergeable: Some(false)`.
+    NotMergeable,
 }
 
 impl std::fmt::Display for MergeQueueError {
@@ -129,11 +138,90 @@ impl std::fmt::Display for MergeQueueError {
             MergeQueueError::Busy => {
                 write!(f, "merge queue busy: timed out waiting for the merge slot, retry")
             }
+            MergeQueueError::NotMergeable => {
+                write!(
+                    f,
+                    "pull request not mergeable (stale base or conflict) — rebase current base and retry"
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for MergeQueueError {}
+
+/// GMQ-04: map a [`MergeQueueError`] to the [`crate::error::ToolError`] variant
+/// `MergePr::execute` surfaces to the caller. `Busy` (queue contention, either
+/// from [`MergeQueue::with_merge_slot`]'s own wait ceiling or from
+/// [`MergeQueue::enforce_spacing`]'s min-delay remainder exceeding it) is a
+/// transient "retry" condition, not a hard failure — mapped to `Execution` so
+/// it reads as "the operation didn't complete", distinct from a real conflict.
+/// `NotMergeable` (the GMQ-03 stale-base guard) IS a real conflict — mapped to
+/// `Conflict` so callers can distinguish "rebase and retry" from "try again
+/// shortly".
+impl From<MergeQueueError> for crate::error::ToolError {
+    fn from(e: MergeQueueError) -> Self {
+        match e {
+            MergeQueueError::Busy => crate::error::ToolError::Execution(e.to_string()),
+            MergeQueueError::NotMergeable => crate::error::ToolError::Conflict(e.to_string()),
+        }
+    }
+}
+
+/// GMQ-03 stale-base guard: the decision [`evaluate_merge_guard`] returns for
+/// an already-fetched [`GiteaPullRequest`] — evaluated INSIDE the merge
+/// queue's critical section, immediately before the merge POST, so a caller
+/// (GMQ-04's `MergePr::execute`) never races a merge against a base that has
+/// moved since the PR was opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeGuardDecision {
+    /// Safe to merge: either `mergeable == Some(true)`, or `mergeable ==
+    /// None` (Gitea is still computing it — see the variant's own doc for
+    /// why that is treated as Proceed, not blocked).
+    Proceed,
+    /// The PR is already merged (`merged == true`). Idempotent success: the
+    /// caller should report the merge as already done, NOT attempt another
+    /// merge POST (Gitea would 405/409 on an already-merged PR).
+    AlreadyMerged,
+    /// `mergeable == Some(false)` — Gitea has determined this PR cannot be
+    /// merged right now (stale base or a real conflict). The caller MUST NOT
+    /// POST a merge; surface [`MergeQueueError::NotMergeable`] instead.
+    NotMergeable,
+}
+
+/// GMQ-03 stale-base guard: decide whether an already-fetched PR is safe to
+/// merge right now. Pure/synchronous — the caller is responsible for the
+/// `GiteaClient::get` fetch itself (inside the critical section, so the read
+/// is current); this function only interprets the result.
+///
+/// Rules (checked in this order):
+/// 1. `merged == true` ⇒ [`MergeGuardDecision::AlreadyMerged`] — idempotent,
+///    not an error: some earlier attempt (or another process) already merged
+///    this PR, so there's nothing left to do.
+/// 2. `mergeable == Some(false)` ⇒ [`MergeGuardDecision::NotMergeable`] — a
+///    real, Gitea-confirmed reason the merge cannot proceed (stale base,
+///    unresolved conflict). Do NOT merge; the caller should return a clear
+///    "rebase current base and retry" error.
+/// 3. `mergeable == None` (Gitea has not finished computing mergeability
+///    yet — a known Gitea async-compute quirk) ⇒
+///    [`MergeGuardDecision::Proceed`]. This is deliberately NOT treated as
+///    "unknown, block" — the per-base [`MergeQueue`] critical section has
+///    already serialized every other merge to this base, so the fetched PR
+///    reflects the current, uncontested state of `base`; there is no
+///    concurrent merge that could still land underneath this one while we
+///    hold the slot. Blocking here would only punish every merge whose PR
+///    happens to have an unset `mergeable` at fetch time, for no safety gain.
+/// 4. Otherwise (`mergeable == Some(true)`) ⇒
+///    [`MergeGuardDecision::Proceed`].
+pub fn evaluate_merge_guard(pr: &crate::gitea::types::GiteaPullRequest) -> MergeGuardDecision {
+    if pr.merged {
+        return MergeGuardDecision::AlreadyMerged;
+    }
+    match pr.mergeable {
+        Some(false) => MergeGuardDecision::NotMergeable,
+        Some(true) | None => MergeGuardDecision::Proceed,
+    }
+}
 
 /// Outcome of one acquire attempt.
 enum AcquireAttempt {
@@ -150,7 +238,7 @@ enum AcquireAttempt {
 /// semantically-identical fake (`fake::InMemoryMergeLockStore`, test-only) so
 /// the ordering/lock/crash-backstop guarantees are unit-tested with NO Redis.
 #[async_trait]
-trait MergeLockStore: Send + Sync {
+pub(crate) trait MergeLockStore: Send + Sync {
     /// Take a FIFO ticket for `key` and register it in the wait ordering with
     /// `priority` weighting. Returns the ticket id (unique per `key`).
     /// `wait_ttl` bounds the wait ordering's own self-healing `EXPIRE`
@@ -182,7 +270,101 @@ trait MergeLockStore: Send + Sync {
     /// Best-effort / idempotent — a mismatch or an already-free lock is a
     /// safe no-op.
     async fn release(&self, key: &str, fence: &str) -> Result<(), ()>;
+
+    /// GMQ-03 spacing: the epoch-ms timestamp of the last successful merge to
+    /// `key`, or `None` if `key` has never recorded one. Used by
+    /// [`MergeQueue::enforce_spacing`] to compute how long (if at all) the
+    /// next merge to the same base must wait.
+    async fn last_merge_ms(&self, key: &str) -> Result<Option<i64>, ()>;
+
+    /// GMQ-03 spacing: stamp `key`'s last-merge time as `now_ms` (called by
+    /// [`MergeQueue::record_merge`] after a successful merge), so the NEXT
+    /// same-key merge's [`MergeQueue::enforce_spacing`] call measures the gap
+    /// from this point. `ttl_secs` is the marker's own expiry, DERIVED from
+    /// the configured spacing window (see [`derive_last_merge_ttl_secs`]) —
+    /// never a bare hardcoded value — so the marker can never expire while a
+    /// same-key spacing wait could still legitimately depend on it.
+    async fn record_merge_ms(&self, key: &str, now_ms: i64, ttl_secs: u64) -> Result<(), ()>;
+
+    /// GMQ-05 read-only status: the current lock holder's fence token plus its
+    /// remaining TTL in milliseconds (`PTTL queue:merge:lock:{key}`), or `None`
+    /// if the key is not currently locked (including "expired" — an expired
+    /// lock reads as free, same as [`Self::try_acquire`]). Pure read — NEVER
+    /// mutates the lock, the wait ordering, or anything else.
+    async fn lock_status(&self, key: &str) -> Result<Option<(String, i64)>, ()>;
+
+    /// GMQ-05 read-only status: the current wait-queue depth (`ZCARD
+    /// queue:merge:wait:{key}`) and the ticket currently at the front (`ZRANGE
+    /// queue:merge:wait:{key} 0 0`), or `(0, None)` if nothing is waiting.
+    /// Pure read — never prunes expired tickets or otherwise mutates the wait
+    /// ordering (unlike [`Self::try_acquire`], which prunes as a side effect
+    /// of acquiring).
+    async fn wait_status(&self, key: &str) -> Result<(u64, Option<u64>), ()>;
 }
+
+/// GMQ-05: a point-in-time, read-only snapshot of a merge-queue key's state —
+/// never mutates the lock, the wait ordering, or the last-merge marker. See
+/// [`MergeQueue::status`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MergeQueueSnapshot {
+    /// The queue key this snapshot describes (`{owner}/{repo}/{base}`
+    /// convention, or a caller's `queue_key` override).
+    pub key: String,
+    /// Whether the critical section is currently held (an expired lock reads
+    /// as free/`false`, same as [`MergeLockStore::try_acquire`]).
+    pub locked: bool,
+    /// The current holder's fence token, if locked. This is an opaque
+    /// per-acquire identifier (a random UUID), not a caller/agent identity —
+    /// the store never records who requested the lock, only the fence used to
+    /// guard its release.
+    pub lock_fence: Option<String>,
+    /// Remaining lease time in milliseconds, if locked (`PTTL` on the lock
+    /// key).
+    pub lock_ttl_ms: Option<i64>,
+    /// Number of waiters currently queued for this key (`ZCARD` on the wait
+    /// ZSET).
+    pub wait_depth: u64,
+    /// The ticket number currently at the front of the wait ordering (next to
+    /// be served), if any are waiting.
+    pub next_ticket: Option<u64>,
+    /// Epoch-ms timestamp of the last successful merge to this key, or `None`
+    /// if this key has never recorded one.
+    pub last_merge_ms: Option<i64>,
+    /// The epoch-ms timestamp at (or after) which the GMQ-03 spacing rule
+    /// allows the next merge to this key to proceed without waiting —
+    /// `last_merge_ms + min_delay_secs * 1000`. `None` when there is no
+    /// recorded last merge (nothing to space against — a merge could proceed
+    /// immediately).
+    pub next_allowed_merge_ms: Option<i64>,
+    /// The `min_delay_secs` this snapshot's `next_allowed_merge_ms` was
+    /// derived from (the caller's override, or
+    /// `GITEA_MERGE_QUEUE_MIN_DELAY_SECS`'s default).
+    pub min_delay_secs: u64,
+}
+
+/// GMQ-03 review finding: derive the `queue:merge:last:{key}` marker's TTL
+/// from the configured spacing window instead of a bare hardcoded literal.
+/// If `GITEA_MERGE_QUEUE_MIN_DELAY_SECS` (or a `max_wait_secs`-bounded wait)
+/// exceeded a fixed 24h TTL, the marker would expire before the spacing
+/// window ends and [`MergeQueue::enforce_spacing`] would then treat the base
+/// as never-merged and proceed immediately — silently violating the "same-base
+/// merges are spaced ≥ min_delay" contract. Taking `max(min_delay_secs,
+/// LAST_MERGE_TTL_FLOOR_SECS) + LAST_MERGE_TTL_MARGIN_SECS` keeps the normal
+/// small-delay case at the same generous 24h-plus retention floor as before,
+/// while guaranteeing the marker always outlives any legitimately-configured
+/// spacing window.
+fn derive_last_merge_ttl_secs(min_delay_secs: u64) -> u64 {
+    min_delay_secs
+        .max(LAST_MERGE_TTL_FLOOR_SECS)
+        .saturating_add(LAST_MERGE_TTL_MARGIN_SECS)
+}
+
+/// Retention floor for the last-merge marker when `min_delay_secs` is small:
+/// self-cleans an abandoned base after ~24h rather than accumulating forever.
+const LAST_MERGE_TTL_FLOOR_SECS: u64 = 86_400;
+/// Safety margin added atop `min_delay_secs`/the floor so the marker never
+/// expires exactly as the spacing window ends.
+const LAST_MERGE_TTL_MARGIN_SECS: u64 = 60;
 
 /// Redis-backed [`MergeLockStore`]. Keys live under `Namespace::Queue`:
 /// `queue:merge:seq:{key}` (ticket counter), `queue:merge:wait:{key}` (FIFO/
@@ -211,6 +393,12 @@ fn lock_key(key: &str) -> String {
 /// enqueue behind it.
 fn deadline_key(key: &str) -> String {
     Namespace::Queue.key(&format!("merge:deadline:{key}"))
+}
+/// GMQ-03 spacing: `queue:merge:last:{key}` holds the epoch-ms timestamp of
+/// the last successful merge to `key` — a plain `GET`/`SET`, not a ZSET (only
+/// ever one value per key).
+fn last_key(key: &str) -> String {
+    Namespace::Queue.key(&format!("merge:last:{key}"))
 }
 
 /// Current epoch time in milliseconds, for the deadline ZSET's score.
@@ -388,6 +576,94 @@ impl MergeLockStore for RedisMergeLockStore {
             .await?;
         Ok(())
     }
+
+    async fn last_merge_ms(&self, key: &str) -> Result<Option<i64>, ()> {
+        let lastk = last_key(key);
+        let val: Option<i64> = self
+            .backend
+            .with_conn(Namespace::Queue, |mut conn| async move {
+                ::redis::cmd("GET").arg(&lastk).query_async::<_, Option<i64>>(&mut conn).await
+            })
+            .await?;
+        Ok(val)
+    }
+
+    async fn record_merge_ms(&self, key: &str, now_ms: i64, ttl_secs: u64) -> Result<(), ()> {
+        let lastk = last_key(key);
+        // TTL is caller-derived from the configured spacing window (see
+        // `derive_last_merge_ttl_secs`) — NOT a bare hardcoded value — so the
+        // marker always outlives any legitimately-configured min-delay,
+        // while still self-cleaning if this base is never merged to again.
+        let ttl_secs = ttl_secs as i64;
+        let _: () = self
+            .backend
+            .with_conn(Namespace::Queue, |mut conn| async move {
+                ::redis::cmd("SET")
+                    .arg(&lastk)
+                    .arg(now_ms)
+                    .arg("EX")
+                    .arg(ttl_secs)
+                    .query_async::<_, ()>(&mut conn)
+                    .await
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn lock_status(&self, key: &str) -> Result<Option<(String, i64)>, ()> {
+        // Plain GET/PTTL — read-only, no Lua script, no mutation. A tiny
+        // (GET-then-PTTL) window exists where the lock could be released or
+        // expire between the two calls; that's acceptable for a best-effort
+        // observability snapshot (not a decision the merge path depends on).
+        let lockk = lock_key(key);
+        let fence: Option<String> = self
+            .backend
+            .with_conn(Namespace::Queue, |mut conn| async move {
+                ::redis::cmd("GET").arg(&lockk).query_async::<_, Option<String>>(&mut conn).await
+            })
+            .await?;
+        let Some(fence) = fence else {
+            return Ok(None);
+        };
+        let lockk = lock_key(key);
+        let ttl_ms: i64 = self
+            .backend
+            .with_conn(Namespace::Queue, |mut conn| async move {
+                ::redis::cmd("PTTL").arg(&lockk).query_async::<_, i64>(&mut conn).await
+            })
+            .await?;
+        // PTTL returns -2 (key gone, e.g. expired between the GET and here)
+        // or -1 (no TTL set, shouldn't happen for this key) — both read as
+        // "not meaningfully locked" rather than a negative TTL.
+        if ttl_ms < 0 {
+            return Ok(None);
+        }
+        Ok(Some((fence, ttl_ms)))
+    }
+
+    async fn wait_status(&self, key: &str) -> Result<(u64, Option<u64>), ()> {
+        let waitk = wait_key(key);
+        let waitk_front = waitk.clone();
+        let depth: i64 = self
+            .backend
+            .with_conn(Namespace::Queue, |mut conn| async move {
+                ::redis::cmd("ZCARD").arg(&waitk).query_async::<_, i64>(&mut conn).await
+            })
+            .await?;
+        let front: Vec<String> = self
+            .backend
+            .with_conn(Namespace::Queue, |mut conn| async move {
+                ::redis::cmd("ZRANGE")
+                    .arg(&waitk_front)
+                    .arg(0)
+                    .arg(0)
+                    .query_async::<_, Vec<String>>(&mut conn)
+                    .await
+            })
+            .await?;
+        let next_ticket = front.into_iter().next().and_then(|s| s.parse::<u64>().ok());
+        Ok((depth.max(0) as u64, next_ticket))
+    }
 }
 
 /// Best-effort "log once" guard so a Redis outage during `with_merge_slot`
@@ -423,8 +699,12 @@ impl MergeQueue {
         }
     }
 
+    /// Construct over an arbitrary [`MergeLockStore`] — `pub(crate)` (not just
+    /// module-private) so tests OUTSIDE this module (GMQ-04's `crate::gitea`
+    /// tool tests) can build a real `MergeQueue` over the `fake` module's
+    /// in-memory store without a live Redis.
     #[cfg(test)]
-    fn from_store(store: Arc<dyn MergeLockStore>) -> Self {
+    pub(crate) fn from_store(store: Arc<dyn MergeLockStore>) -> Self {
         Self { store }
     }
 
@@ -537,6 +817,141 @@ impl MergeQueue {
             backoff_ms = (backoff_ms * 2).min(POLL_MAX_MS);
         }
     }
+
+    /// GMQ-03 spacing: block (bounded) until at least `min_delay_secs` have
+    /// elapsed since the last recorded merge to `key` ([`Self::record_merge`]),
+    /// then return. Must be called AFTER acquiring the `key` critical section
+    /// (i.e. from inside the closure passed to [`Self::with_merge_slot`]) —
+    /// spacing is a per-base property of the merge sequence, not a
+    /// stand-alone gate a caller could correctly enforce outside the lock.
+    ///
+    /// - `min_delay_secs == 0` ⇒ returns immediately, no Redis round-trip at
+    ///   all — the explicit "spacing disabled" fast path.
+    /// - No prior recorded merge for `key` ⇒ returns immediately (nothing to
+    ///   space against).
+    /// - The store being unreachable degrades open (logs once, proceeds
+    ///   immediately) — same posture as the rest of the queue (availability
+    ///   over strictness for a short merge).
+    /// - If the remaining wait would exceed `max_wait_secs`, returns
+    ///   [`MergeQueueError::Busy`] rather than sleeping past the caller's own
+    ///   ceiling (the edge case the spec calls out explicitly).
+    pub async fn enforce_spacing(
+        &self,
+        key: &str,
+        min_delay_secs: u64,
+        max_wait_secs: u64,
+    ) -> Result<(), MergeQueueError> {
+        if min_delay_secs == 0 {
+            return Ok(());
+        }
+        let last_ms = match self.store.last_merge_ms(key).await {
+            Ok(v) => v,
+            Err(()) => {
+                log_degrade_once("spacing lookup failed (Redis unreachable)");
+                return Ok(());
+            }
+        };
+        let Some(last_ms) = last_ms else {
+            // Never merged before under this key — nothing to space against.
+            return Ok(());
+        };
+
+        let now = now_ms();
+        let min_delay_ms = (min_delay_secs as i64).saturating_mul(1000);
+        let elapsed_ms = now.saturating_sub(last_ms).max(0);
+        if elapsed_ms >= min_delay_ms {
+            return Ok(());
+        }
+        let remainder_ms = (min_delay_ms - elapsed_ms) as u64;
+        let max_wait_ms = max_wait_secs.saturating_mul(1000);
+        if remainder_ms > max_wait_ms {
+            return Err(MergeQueueError::Busy);
+        }
+        tokio::time::sleep(Duration::from_millis(remainder_ms)).await;
+        Ok(())
+    }
+
+    /// GMQ-03 spacing: stamp `key`'s last-merge time as "now" — call this
+    /// AFTER a successful merge (still inside the critical section) so the
+    /// NEXT same-key merge's [`Self::enforce_spacing`] call measures the gap
+    /// from this point. `min_delay_secs` is the same value the caller passes
+    /// to [`Self::enforce_spacing`] (from `cfg`/`GITEA_MERGE_QUEUE_MIN_DELAY_SECS`)
+    /// — it is used ONLY to derive the marker's own TTL
+    /// ([`derive_last_merge_ttl_secs`]), so the marker can never expire
+    /// before a same-key spacing wait bounded by that delay could still
+    /// legitimately depend on it. Best-effort: a store failure here only
+    /// means the NEXT merge's spacing check degrades open (treats it as
+    /// "never merged before"), which is the same safe direction every other
+    /// degrade-open path in this module takes — it never blocks a merge that
+    /// already succeeded.
+    pub async fn record_merge(&self, key: &str, min_delay_secs: u64) {
+        let ttl_secs = derive_last_merge_ttl_secs(min_delay_secs);
+        if self.store.record_merge_ms(key, now_ms(), ttl_secs).await.is_err() {
+            log_degrade_once("recording last-merge time failed (Redis unreachable)");
+        }
+    }
+
+    /// GMQ-05: read-only inspection of `key`'s current merge-queue state — the
+    /// lock holder + its remaining TTL, the wait-queue depth + next ticket,
+    /// and the last-merge time + the GMQ-03 spacing rule's next-allowed-merge
+    /// time. NEVER mutates the lock, the wait ordering, or the last-merge
+    /// marker — this is purely observational (unlike [`Self::with_merge_slot`]
+    /// / [`Self::enforce_spacing`] / [`Self::record_merge`], which drive the
+    /// actual merge path).
+    ///
+    /// An unknown/never-used `key` returns an empty-but-`Ok` snapshot (no
+    /// lock, zero wait depth, no last-merge record) — the same "nothing here
+    /// yet" posture every other read in this module takes, never an error.
+    /// A mid-op store error (Redis unreachable) degrades the SAME way: logs
+    /// once and folds into the empty snapshot for whichever field couldn't be
+    /// read, rather than failing the whole call — this is a status view, not
+    /// a decision the merge path depends on.
+    ///
+    /// `min_delay_secs` is the spacing window this snapshot's
+    /// `next_allowed_merge_ms` is computed against — pass the same value a
+    /// caller would pass to [`Self::enforce_spacing`] (a per-call override, or
+    /// `GITEA_MERGE_QUEUE_MIN_DELAY_SECS`'s default).
+    pub async fn status(
+        &self,
+        key: &str,
+        min_delay_secs: u64,
+    ) -> Result<MergeQueueSnapshot, MergeQueueError> {
+        let lock = match self.store.lock_status(key).await {
+            Ok(v) => v,
+            Err(()) => {
+                log_degrade_once("status: lock lookup failed (Redis unreachable)");
+                None
+            }
+        };
+        let (wait_depth, next_ticket) = match self.store.wait_status(key).await {
+            Ok(v) => v,
+            Err(()) => {
+                log_degrade_once("status: wait lookup failed (Redis unreachable)");
+                (0, None)
+            }
+        };
+        let last_merge_ms = match self.store.last_merge_ms(key).await {
+            Ok(v) => v,
+            Err(()) => {
+                log_degrade_once("status: last-merge lookup failed (Redis unreachable)");
+                None
+            }
+        };
+        let next_allowed_merge_ms =
+            last_merge_ms.map(|last| last.saturating_add((min_delay_secs as i64).saturating_mul(1000)));
+
+        Ok(MergeQueueSnapshot {
+            key: key.to_string(),
+            locked: lock.is_some(),
+            lock_fence: lock.as_ref().map(|(fence, _)| fence.clone()),
+            lock_ttl_ms: lock.map(|(_, ttl)| ttl),
+            wait_depth,
+            next_ticket,
+            last_merge_ms,
+            next_allowed_merge_ms,
+            min_delay_secs,
+        })
+    }
 }
 
 /// PANIC/early-unwind backstop only: the normal (non-panic) path in
@@ -572,8 +987,14 @@ impl Drop for ReleaseGuard {
     }
 }
 
+/// Offline `MergeLockStore` fake, exposed `pub(crate)` (mirrors
+/// `crate::compiler::queue`'s own `#[cfg(test)] pub(crate) mod fake` pattern)
+/// so tests OUTSIDE this module — specifically GMQ-04's `crate::gitea` tool
+/// tests — can build a real, fully-functional `MergeQueue` (ordering, the
+/// crash-backstop lock, spacing, everything) with NO live Redis, the exact
+/// same way this module's own `tests` below do.
 #[cfg(test)]
-mod tests {
+pub(crate) mod fake {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
@@ -581,7 +1002,7 @@ mod tests {
 
     /// An offline `MergeLockStore` mirroring the Lua semantics exactly, so the
     /// ordering/lock/crash-backstop guarantees are unit-tested with NO Redis.
-    struct InMemoryMergeLockStore {
+    pub(crate) struct InMemoryMergeLockStore {
         state: StdMutex<State>,
     }
 
@@ -596,24 +1017,31 @@ mod tests {
         wait: HashMap<String, Vec<(u64, f64, StdInstant)>>,
         /// key -> (fence, expires_at)
         lock: HashMap<String, (String, StdInstant)>,
+        /// key -> last-merge epoch-ms (GMQ-03 spacing), mirroring
+        /// `queue:merge:last:{key}`.
+        last: HashMap<String, i64>,
+        /// key -> the TTL (seconds) `record_merge_ms` was last called with,
+        /// so tests can assert the derived TTL without needing a real
+        /// expiring store.
+        last_ttl_secs: HashMap<String, u64>,
         /// When true, every op behaves as an unreachable backend.
         down: bool,
     }
 
     impl InMemoryMergeLockStore {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 state: StdMutex::new(State::default()),
             }
         }
 
-        fn set_down(&self, down: bool) {
+        pub(crate) fn set_down(&self, down: bool) {
             self.state.lock().unwrap().down = down;
         }
 
         /// Force-expire a held lock immediately (simulate a crashed holder
         /// whose TTL has elapsed) without waiting in real time.
-        fn expire_lock(&self, key: &str) {
+        pub(crate) fn expire_lock(&self, key: &str) {
             let mut s = self.state.lock().unwrap();
             if let Some((_, exp)) = s.lock.get_mut(key) {
                 *exp = StdInstant::now() - Duration::from_millis(1);
@@ -624,7 +1052,7 @@ mod tests {
         /// (simulate a hard-crashed waiter whose `wait_ttl_secs` has elapsed)
         /// without waiting in real time — the in-memory analog of forcing an
         /// entry in Redis's `deadline_zset` below `now_ms()`.
-        fn expire_ticket(&self, key: &str, ticket: u64) {
+        pub(crate) fn expire_ticket(&self, key: &str, ticket: u64) {
             let mut s = self.state.lock().unwrap();
             if let Some(bucket) = s.wait.get_mut(key) {
                 for entry in bucket.iter_mut() {
@@ -637,7 +1065,7 @@ mod tests {
 
         /// Tickets currently still waiting (front-to-back order) for `key`,
         /// for assertions that a ticket was (or was not) removed.
-        fn waiting_tickets(&self, key: &str) -> Vec<u64> {
+        pub(crate) fn waiting_tickets(&self, key: &str) -> Vec<u64> {
             let s = self.state.lock().unwrap();
             s.wait
                 .get(key)
@@ -645,12 +1073,19 @@ mod tests {
                 .unwrap_or_default()
         }
 
-        fn is_locked(&self, key: &str) -> bool {
+        pub(crate) fn is_locked(&self, key: &str) -> bool {
             let s = self.state.lock().unwrap();
             match s.lock.get(key) {
                 Some((_, exp)) => *exp > StdInstant::now(),
                 None => false,
             }
+        }
+
+        /// The TTL (seconds) `record_merge_ms` was last called with for
+        /// `key`, or `None` if it was never recorded.
+        pub(crate) fn last_ttl_secs(&self, key: &str) -> Option<u64> {
+            let s = self.state.lock().unwrap();
+            s.last_ttl_secs.get(key).copied()
         }
     }
 
@@ -734,7 +1169,72 @@ mod tests {
             }
             Ok(())
         }
+
+        async fn last_merge_ms(&self, key: &str) -> Result<Option<i64>, ()> {
+            let s = self.state.lock().unwrap();
+            if s.down {
+                return Err(());
+            }
+            Ok(s.last.get(key).copied())
+        }
+
+        async fn record_merge_ms(&self, key: &str, now_ms: i64, ttl_secs: u64) -> Result<(), ()> {
+            let mut s = self.state.lock().unwrap();
+            if s.down {
+                return Err(());
+            }
+            s.last.insert(key.to_string(), now_ms);
+            s.last_ttl_secs.insert(key.to_string(), ttl_secs);
+            Ok(())
+        }
+
+        async fn lock_status(&self, key: &str) -> Result<Option<(String, i64)>, ()> {
+            let s = self.state.lock().unwrap();
+            if s.down {
+                return Err(());
+            }
+            match s.lock.get(key) {
+                Some((fence, exp)) => {
+                    let now = StdInstant::now();
+                    if *exp > now {
+                        Ok(Some((fence.clone(), exp.duration_since(now).as_millis() as i64)))
+                    } else {
+                        // Expired lock reads as free — same posture as
+                        // `try_acquire`'s own held-check.
+                        Ok(None)
+                    }
+                }
+                None => Ok(None),
+            }
+        }
+
+        async fn wait_status(&self, key: &str) -> Result<(u64, Option<u64>), ()> {
+            let s = self.state.lock().unwrap();
+            if s.down {
+                return Err(());
+            }
+            match s.wait.get(key) {
+                Some(bucket) => Ok((bucket.len() as u64, bucket.first().map(|(t, _, _)| *t))),
+                None => Ok((0, None)),
+            }
+        }
     }
+
+    /// Build a real `MergeQueue` over a fresh in-memory fake store — the
+    /// crate-wide entry point other modules' tests use (GMQ-04's
+    /// `crate::gitea` tool tests included) to exercise `with_merge_slot`/
+    /// `enforce_spacing`/`record_merge` end-to-end with no live Redis.
+    pub(crate) fn queue_over(store: Arc<InMemoryMergeLockStore>) -> MergeQueue {
+        MergeQueue::from_store(store as Arc<dyn MergeLockStore>)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fake::{queue_over, InMemoryMergeLockStore};
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+    use std::time::Instant as StdInstant;
 
     fn fast_cfg() -> MergeQueueConfig {
         MergeQueueConfig {
@@ -743,10 +1243,6 @@ mod tests {
             max_wait_secs: 5,
             wait_ttl_secs: 65,
         }
-    }
-
-    fn queue_over(store: Arc<InMemoryMergeLockStore>) -> MergeQueue {
-        MergeQueue::from_store(store as Arc<dyn MergeLockStore>)
     }
 
     #[tokio::test]
@@ -1183,6 +1679,18 @@ mod tests {
             }
             self.inner.release(key, fence).await
         }
+        async fn last_merge_ms(&self, key: &str) -> Result<Option<i64>, ()> {
+            self.inner.last_merge_ms(key).await
+        }
+        async fn record_merge_ms(&self, key: &str, now_ms: i64, ttl_secs: u64) -> Result<(), ()> {
+            self.inner.record_merge_ms(key, now_ms, ttl_secs).await
+        }
+        async fn lock_status(&self, key: &str) -> Result<Option<(String, i64)>, ()> {
+            self.inner.lock_status(key).await
+        }
+        async fn wait_status(&self, key: &str) -> Result<(u64, Option<u64>), ()> {
+            self.inner.wait_status(key).await
+        }
     }
 
     #[tokio::test]
@@ -1236,5 +1744,292 @@ mod tests {
             2,
             "expected the stuck normal-path release call plus exactly one Drop-fallback release call"
         );
+    }
+
+    // ── GMQ-03: min-delay spacing ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn same_key_merges_are_spaced_at_least_min_delay_apart() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let q = queue_over(Arc::clone(&store));
+
+        // First merge: nothing recorded yet, so spacing must not wait at all.
+        let began = StdInstant::now();
+        q.enforce_spacing("owner/repo/main", 5, 300).await.unwrap();
+        assert!(
+            began.elapsed() < Duration::from_millis(50),
+            "the first merge to a key must never wait on spacing (nothing recorded yet)"
+        );
+        q.record_merge("owner/repo/main", 5).await;
+
+        // Second merge to the SAME key, immediately after: must wait roughly
+        // the configured min_delay (use a small delay so the test stays fast
+        // — the mechanism is what's under test, not the exact magnitude).
+        let began2 = StdInstant::now();
+        q.enforce_spacing("owner/repo/main", 1, 300).await.unwrap();
+        let waited = began2.elapsed();
+        assert!(
+            waited >= Duration::from_millis(900),
+            "a second same-key merge must wait close to the full min_delay_secs, waited {waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn min_delay_zero_never_waits() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let q = queue_over(Arc::clone(&store));
+
+        q.record_merge("owner/repo/main", 0).await;
+
+        let began = StdInstant::now();
+        q.enforce_spacing("owner/repo/main", 0, 300).await.unwrap();
+        assert!(
+            began.elapsed() < Duration::from_millis(20),
+            "min_delay_secs == 0 must disable spacing entirely, no artificial delay"
+        );
+    }
+
+    #[tokio::test]
+    async fn spacing_wait_exceeding_max_wait_returns_busy_instead_of_sleeping() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let q = queue_over(Arc::clone(&store));
+
+        // Record a merge "now"; a subsequent enforce_spacing with a large
+        // min_delay but a tiny max_wait ceiling must return Busy immediately
+        // rather than sleeping past that ceiling.
+        q.record_merge("owner/repo/main", 600).await;
+        let began = StdInstant::now();
+        let result = q.enforce_spacing("owner/repo/main", 600, 1).await;
+        assert_eq!(result, Err(MergeQueueError::Busy));
+        assert!(
+            began.elapsed() < Duration::from_millis(50),
+            "a spacing wait that would exceed max_wait_secs must return Busy immediately, not sleep"
+        );
+    }
+
+    #[tokio::test]
+    async fn spacing_degrades_open_when_store_is_unreachable() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let q = queue_over(Arc::clone(&store));
+        store.set_down(true);
+
+        let began = StdInstant::now();
+        let result = q.enforce_spacing("owner/repo/main", 30, 300).await;
+        assert_eq!(result, Ok(()));
+        assert!(
+            began.elapsed() < Duration::from_millis(50),
+            "an unreachable store must degrade open (proceed immediately), not block on spacing"
+        );
+    }
+
+    // ── GMQ-03 review: last-merge marker TTL must be derived, never a bare
+    // hardcoded 86_400 that could expire before a large min_delay's spacing
+    // window ends ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn last_merge_ttl_is_derived_from_min_delay_not_a_bare_constant() {
+        // A tiny min_delay stays at the generous 24h-plus-margin retention
+        // floor (unchanged behavior for the common case).
+        assert_eq!(derive_last_merge_ttl_secs(5), 86_400 + 60);
+        assert_eq!(derive_last_merge_ttl_secs(0), 86_400 + 60);
+
+        // A min_delay LARGER than the old bare 86_400 constant must push the
+        // derived TTL past it (with margin) — this is exactly the finding:
+        // the marker must always outlive the configured spacing window.
+        let large_min_delay = 200_000_u64; // > 86_400
+        let ttl = derive_last_merge_ttl_secs(large_min_delay);
+        assert!(
+            ttl >= large_min_delay + 60,
+            "derived TTL {ttl} must be >= min_delay_secs ({large_min_delay}) + margin, \
+             otherwise the marker expires before the spacing window it's supposed to protect"
+        );
+        assert_eq!(ttl, large_min_delay + 60);
+    }
+
+    #[tokio::test]
+    async fn record_merge_passes_a_ttl_derived_from_min_delay_to_the_store() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let q = queue_over(Arc::clone(&store));
+
+        // A min_delay far exceeding the old hardcoded 86_400s literal: if the
+        // TTL were still a bare 86_400, it would be LESS than min_delay_secs
+        // here, reproducing the finding (marker expires mid-spacing-window).
+        let large_min_delay = 200_000_u64;
+        q.record_merge("owner/repo/main", large_min_delay).await;
+
+        let ttl = store
+            .last_ttl_secs("owner/repo/main")
+            .expect("record_merge must record a TTL");
+        assert!(
+            ttl >= large_min_delay + 60,
+            "the marker TTL ({ttl}) must be derived to outlive the configured min_delay \
+             ({large_min_delay}) plus a safety margin, never a bare hardcoded 86_400"
+        );
+    }
+
+    // ── GMQ-03: stale-base mergeability guard ───────────────────────────
+
+    fn pr_fixture(merged: bool, mergeable: Option<bool>) -> crate::gitea::types::GiteaPullRequest {
+        serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "number": 42,
+            "state": "open",
+            "title": "test pr",
+            "body": null,
+            "html_url": "https://gitea.example/owner/repo/pulls/42",
+            "user": {"login": "agent", "full_name": null},
+            "head": {"label": "agent:feature", "ref": "feature", "sha": "abc123", "repo": null},
+            "base": {"label": "owner:main", "ref": "main", "sha": "def456", "repo": null},
+            "mergeable": mergeable,
+            "merged": merged,
+            "created_at": "2026-07-18T00:00:00Z",
+            "updated_at": "2026-07-18T00:00:00Z",
+        }))
+        .expect("valid GiteaPullRequest fixture")
+    }
+
+    #[test]
+    fn not_mergeable_pr_is_rejected() {
+        let pr = pr_fixture(false, Some(false));
+        assert_eq!(evaluate_merge_guard(&pr), MergeGuardDecision::NotMergeable);
+    }
+
+    #[test]
+    fn already_merged_pr_is_idempotent() {
+        let pr = pr_fixture(true, Some(true));
+        assert_eq!(evaluate_merge_guard(&pr), MergeGuardDecision::AlreadyMerged);
+    }
+
+    #[test]
+    fn merged_takes_priority_over_mergeable_field() {
+        // Even if `mergeable` happens to read false on an already-merged PR
+        // (a real Gitea quirk once `merged` flips), `merged` wins.
+        let pr = pr_fixture(true, Some(false));
+        assert_eq!(evaluate_merge_guard(&pr), MergeGuardDecision::AlreadyMerged);
+    }
+
+    #[test]
+    fn unknown_mergeability_proceeds() {
+        let pr = pr_fixture(false, None);
+        assert_eq!(evaluate_merge_guard(&pr), MergeGuardDecision::Proceed);
+    }
+
+    #[test]
+    fn mergeable_true_proceeds() {
+        let pr = pr_fixture(false, Some(true));
+        assert_eq!(evaluate_merge_guard(&pr), MergeGuardDecision::Proceed);
+    }
+
+    // ── GMQ-05: read-only status ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn status_reflects_a_held_lock_with_holder_and_positive_ttl() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let q = queue_over(Arc::clone(&store));
+        let cfg = fast_cfg();
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let s = Arc::clone(&started);
+        let holder = tokio::spawn(async move {
+            q.with_merge_slot("owner/repo/main", 0, &cfg, || async move {
+                s.notify_one();
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            })
+            .await
+        });
+        started.notified().await;
+
+        let q_status = queue_over(Arc::clone(&store));
+        let snap = q_status.status("owner/repo/main", 0).await.unwrap();
+        assert!(snap.locked, "a held lock must report locked == true");
+        assert!(snap.lock_fence.is_some(), "a held lock must report a holder fence");
+        let ttl = snap.lock_ttl_ms.expect("a held lock must report a TTL");
+        assert!(ttl > 0 && ttl <= 60_000, "TTL must be positive and within the configured lease, got {ttl}");
+
+        holder.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_reports_no_lock_for_a_free_key() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let q = queue_over(store);
+
+        let snap = q.status("owner/repo/never-locked", 0).await.unwrap();
+        assert!(!snap.locked);
+        assert!(snap.lock_fence.is_none());
+        assert!(snap.lock_ttl_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn status_reports_wait_depth_and_next_ticket() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let cfg = fast_cfg();
+
+        // Ticket 1 acquires and holds forever (stands in for a slow in-flight
+        // merge); tickets 2 and 3 pile up behind it in the wait ordering.
+        let t1 = store.enqueue("owner/repo/main", 0, Duration::from_secs(60)).await.unwrap();
+        let acquired = store
+            .try_acquire("owner/repo/main", t1, "fence-1", Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(matches!(acquired, AcquireAttempt::Acquired(_)));
+
+        let t2 = store.enqueue("owner/repo/main", 0, Duration::from_secs(60)).await.unwrap();
+        let t3 = store.enqueue("owner/repo/main", 0, Duration::from_secs(60)).await.unwrap();
+
+        let q = queue_over(Arc::clone(&store));
+        let snap = q.status("owner/repo/main", 0).await.unwrap();
+        assert_eq!(snap.wait_depth, 2, "two waiters (t2, t3) must be reflected in wait_depth");
+        assert_eq!(snap.next_ticket, Some(t2), "the front of the wait ordering must be t2");
+        let _ = (cfg, t3);
+    }
+
+    #[tokio::test]
+    async fn status_reports_next_allowed_merge_after_a_recorded_merge() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let q = queue_over(Arc::clone(&store));
+
+        let before = now_ms();
+        q.record_merge("owner/repo/main", 5).await;
+
+        let snap = q.status("owner/repo/main", 5).await.unwrap();
+        let last = snap.last_merge_ms.expect("a recorded merge must be reflected");
+        assert!(last >= before, "last_merge_ms must be at/after the recorded time");
+
+        let next_allowed = snap.next_allowed_merge_ms.expect("next_allowed_merge_ms must be set");
+        assert_eq!(
+            next_allowed,
+            last + 5_000,
+            "next_allowed_merge_ms must be last_merge_ms + min_delay_secs*1000"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_for_an_unknown_key_is_an_empty_ok_snapshot_not_an_error() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let q = queue_over(store);
+
+        let snap = q.status("owner/repo/totally-unused-base", 30).await.unwrap();
+        assert!(!snap.locked);
+        assert!(snap.lock_fence.is_none());
+        assert!(snap.lock_ttl_ms.is_none());
+        assert_eq!(snap.wait_depth, 0);
+        assert!(snap.next_ticket.is_none());
+        assert!(snap.last_merge_ms.is_none());
+        assert!(snap.next_allowed_merge_ms.is_none());
+        assert_eq!(snap.min_delay_secs, 30);
+    }
+
+    #[tokio::test]
+    async fn status_degrades_to_an_empty_snapshot_when_the_store_is_unreachable() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        store.set_down(true);
+        let q = queue_over(store);
+
+        let snap = q.status("owner/repo/main", 10).await.unwrap();
+        assert!(!snap.locked);
+        assert_eq!(snap.wait_depth, 0);
+        assert!(snap.last_merge_ms.is_none());
+        assert!(snap.next_allowed_merge_ms.is_none());
     }
 }
