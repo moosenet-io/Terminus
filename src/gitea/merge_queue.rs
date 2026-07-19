@@ -267,6 +267,28 @@ end
 return 1
 "#;
 
+/// Atomic enqueue (Finding A / GMQ-02 r3): allocates the ticket, adds it to
+/// BOTH the wait ZSET and the deadline ZSET, and sets both keys' `EXPIRE`
+/// backstop — all in ONE Lua script, so a mid-enqueue connection error can
+/// never leave a partial ticket (present in the wait ZSET but missing from
+/// the deadline ZSET, and therefore un-age-prunable — see the module doc's
+/// "orphan-ticket wedge" description). Either the ticket exists in both
+/// ZSETs, or nothing was written at all.
+/// KEYS: 1=seq 2=wait_zset 3=deadline_zset
+/// ARGV: 1=priority 2=wait_ttl_secs 3=now_ms 4=wait_ttl_ms
+const ENQUEUE_LUA: &str = r#"
+local ticket = redis.call('INCR', KEYS[1])
+local priority = tonumber(ARGV[1])
+local score = ticket - (priority * 1000000000000.0)
+local member = tostring(ticket)
+local deadline_ms = tonumber(ARGV[3]) + tonumber(ARGV[4])
+redis.call('ZADD', KEYS[2], score, member)
+redis.call('ZADD', KEYS[3], deadline_ms, member)
+redis.call('EXPIRE', KEYS[2], ARGV[2])
+redis.call('EXPIRE', KEYS[3], ARGV[2])
+return ticket
+"#;
+
 impl RedisMergeLockStore {
     fn new(backend: Arc<RedisBackend>) -> Self {
         Self { backend }
@@ -276,61 +298,27 @@ impl RedisMergeLockStore {
 #[async_trait]
 impl MergeLockStore for RedisMergeLockStore {
     async fn enqueue(&self, key: &str, priority: i64, wait_ttl: Duration) -> Result<u64, ()> {
-        let seqk = seq_key(key);
+        let (seqk, waitk, deadlinek) = (seq_key(key), wait_key(key), deadline_key(key));
+        let wait_ttl_secs = wait_ttl.as_secs().max(1) as i64;
+        let wait_ttl_ms = wait_ttl.as_millis() as i64;
+        let now = now_ms();
+        let script = ::redis::Script::new(ENQUEUE_LUA);
         let ticket: i64 = self
             .backend
             .with_conn(Namespace::Queue, |mut conn| async move {
-                ::redis::cmd("INCR").arg(&seqk).query_async::<_, i64>(&mut conn).await
-            })
-            .await?;
-        let ticket = ticket.max(0) as u64;
-        let waitk = wait_key(key);
-        let deadlinek = deadline_key(key);
-        let score = ordering_score(ticket, priority);
-        let member = ticket.to_string();
-        let wait_ttl_secs = wait_ttl.as_secs().max(1) as i64;
-        let deadline_ms = now_ms() + wait_ttl.as_millis() as i64;
-        let _: i64 = self
-            .backend
-            .with_conn(Namespace::Queue, |mut conn| async move {
-                ::redis::cmd("ZADD")
-                    .arg(&waitk)
-                    .arg(score)
-                    .arg(&member)
-                    .query_async::<_, i64>(&mut conn)
-                    .await?;
-                // Per-ticket age-prune backstop (Finding A / GMQ-02 r2): record
-                // THIS ticket's own fixed enqueue-time deadline, never
-                // refreshed by later enqueues, so a caller that crashes
-                // between enqueue and its first poll ages out on its own —
-                // see `deadline_key` and `TRY_ACQUIRE_LUA`.
-                ::redis::cmd("ZADD")
-                    .arg(&deadlinek)
-                    .arg(deadline_ms)
-                    .arg(&member)
-                    .query_async::<_, i64>(&mut conn)
-                    .await?;
-                // Whole-ZSET EXPIRE backstop (belt-and-suspenders on top of the
-                // per-ticket deadline above): bounds both keys' lifetime by the
-                // caller's config-derived `wait_ttl` (see
-                // `MergeQueueConfig::wait_ttl_secs`, default `max_wait_secs +
-                // 60`) so an entirely idle key doesn't linger in Redis forever.
-                // Refreshed on every enqueue — this is NOT the mechanism that
-                // frees an abandoned waiter (that's the per-ticket deadline
-                // ZSET pruned in `TRY_ACQUIRE_LUA`), just general key hygiene.
-                ::redis::cmd("EXPIRE")
-                    .arg(&waitk)
+                script
+                    .key(seqk)
+                    .key(waitk)
+                    .key(deadlinek)
+                    .arg(priority)
                     .arg(wait_ttl_secs)
-                    .query_async::<_, i64>(&mut conn)
-                    .await?;
-                ::redis::cmd("EXPIRE")
-                    .arg(&deadlinek)
-                    .arg(wait_ttl_secs)
-                    .query_async::<_, i64>(&mut conn)
+                    .arg(now)
+                    .arg(wait_ttl_ms)
+                    .invoke_async(&mut conn)
                     .await
             })
             .await?;
-        Ok(ticket)
+        Ok(ticket.max(0) as u64)
     }
 
     async fn try_acquire(
@@ -502,14 +490,22 @@ impl MergeQueue {
         loop {
             match self.store.try_acquire(key, ticket, &fence, ttl).await {
                 Ok(AcquireAttempt::Acquired(granted_fence)) => {
-                    // Guard is the PANIC/early-unwind backstop only: if `f`
-                    // panics, unwinding drops `guard` and its `Drop` spawns a
-                    // best-effort release. On the NORMAL path below we release
-                    // synchronously (awaited) BEFORE returning, then disarm
-                    // the guard so `Drop` does not also (redundantly) spawn a
-                    // release — this guarantees the lock is already free by
-                    // the time `with_merge_slot` returns to its caller, so the
-                    // next same-key waiter never sees it held past that point.
+                    // Guard is the PANIC/early-unwind/cancellation backstop:
+                    // if `f` panics, OR this `.await` is itself dropped
+                    // (cancelled) before completing, unwinding drops `guard`
+                    // and — as long as it is still armed — its `Drop` spawns
+                    // a best-effort release. On the NORMAL path below we must
+                    // NOT disarm the guard until AFTER the synchronous release
+                    // has actually completed (Finding B / GMQ-02 r3): disarming
+                    // first and awaiting the release second leaves a window
+                    // where a cancellation of THIS future (e.g. the caller's
+                    // own future being dropped mid-`release().await`) sees
+                    // `armed == false` and skips the fallback entirely, so the
+                    // lock would linger until its TTL. Awaiting the release
+                    // first, and disarming only once it has returned, ensures
+                    // a cancellation during the release attempt still leaves
+                    // `armed == true` and so still triggers the `Drop`
+                    // fallback.
                     let mut guard = ReleaseGuard {
                         store: Arc::clone(&self.store),
                         key: key.to_string(),
@@ -517,8 +513,8 @@ impl MergeQueue {
                         armed: true,
                     };
                     let out = f().await;
-                    guard.armed = false;
                     let _ = self.store.release(key, &guard.fence).await;
+                    guard.armed = false;
                     return Ok(out);
                 }
                 Ok(AcquireAttempt::NotYet) => {}
@@ -1111,5 +1107,134 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.waiting_tickets("owner/repo/main"), vec![stuck_ticket, third_ticket]);
+    }
+
+    // ── GMQ-02 r3: Finding A — atomic enqueue ───────────────────────────
+
+    #[tokio::test]
+    async fn a_simulated_enqueue_failure_leaves_no_partial_ticket() {
+        // The in-memory fake mirrors the Redis Lua script's all-or-nothing
+        // semantics: the `down` check happens BEFORE any mutation (ticket
+        // allocation, wait-ZSET insert, or deadline-ZSET insert), under the
+        // same mutex-held critical section, so a "failed" enqueue can never
+        // leave a ticket in one ZSET but not the other (the orphan-ticket
+        // wedge from Finding A). Assert directly: after a failed enqueue,
+        // there is NO ticket at all in the wait ordering for this key.
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        store.set_down(true);
+
+        let err = store.enqueue("owner/repo/main", 0, Duration::from_secs(60)).await;
+        assert_eq!(err, Err(()), "a down backend must fail the enqueue outright");
+        assert!(
+            store.waiting_tickets("owner/repo/main").is_empty(),
+            "a failed enqueue must leave NO partial ticket in the wait ordering"
+        );
+
+        // Recovery: once the backend is back up, enqueue must start clean —
+        // no residue from the failed attempt (e.g. no ticket-number gap that
+        // would itself indicate a partial write was rolled back rather than
+        // never having happened).
+        store.set_down(false);
+        let ticket = store.enqueue("owner/repo/main", 0, Duration::from_secs(60)).await.unwrap();
+        assert_eq!(ticket, 1, "the failed attempt must not have consumed a ticket number");
+        assert_eq!(store.waiting_tickets("owner/repo/main"), vec![ticket]);
+    }
+
+    // ── GMQ-02 r3: Finding B — disarm only after release completes ─────
+
+    /// Wraps an [`InMemoryMergeLockStore`] so the FIRST call to `release`
+    /// never completes (stands in for that `.await` being cancelled
+    /// mid-flight — e.g. the caller's own future dropped while awaiting
+    /// `with_merge_slot`), while every subsequent call (the `Drop` guard's
+    /// spawned fallback) behaves normally. Lets the test observe whether the
+    /// `Drop` fallback still fires when the *synchronous* release attempt in
+    /// the normal path never returns.
+    struct CancelDuringReleaseStore {
+        inner: Arc<InMemoryMergeLockStore>,
+        release_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl MergeLockStore for CancelDuringReleaseStore {
+        async fn enqueue(&self, key: &str, priority: i64, wait_ttl: Duration) -> Result<u64, ()> {
+            self.inner.enqueue(key, priority, wait_ttl).await
+        }
+        async fn try_acquire(
+            &self,
+            key: &str,
+            ticket: u64,
+            fence: &str,
+            ttl: Duration,
+        ) -> Result<AcquireAttempt, ()> {
+            self.inner.try_acquire(key, ticket, fence, ttl).await
+        }
+        async fn cancel(&self, key: &str, ticket: u64) -> Result<(), ()> {
+            self.inner.cancel(key, ticket).await
+        }
+        async fn release(&self, key: &str, fence: &str) -> Result<(), ()> {
+            let call_no = self.release_calls.fetch_add(1, Ordering::SeqCst);
+            if call_no == 0 {
+                // Simulate the normal path's `release(...).await` being
+                // cancelled mid-flight by never resolving. Whatever polls
+                // this future is expected to be dropped (aborted) rather than
+                // ever observe this return.
+                std::future::pending::<()>().await;
+                unreachable!("this future must be dropped (cancelled), never polled to completion");
+            }
+            self.inner.release(key, fence).await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_the_normal_paths_release_await_still_triggers_the_drop_fallback() {
+        // Regression test for Finding B: if `guard.armed` were set to `false`
+        // BEFORE awaiting `store.release(...)` (the pre-fix ordering), a
+        // cancellation of the `with_merge_slot` future while it's stuck
+        // inside that `release().await` would drop `guard` with
+        // `armed == false`, so `Drop` would skip the fallback release and the
+        // lock would linger until its TTL. With the fix, `armed` stays `true`
+        // until the release call actually returns, so `Drop` still spawns a
+        // fallback release when this in-flight call is aborted — and that
+        // fallback (the store's SECOND `release` call) is what actually frees
+        // the lock.
+        let inner = Arc::new(InMemoryMergeLockStore::new());
+        let store = Arc::new(CancelDuringReleaseStore {
+            inner: Arc::clone(&inner),
+            release_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let q = MergeQueue::from_store(Arc::clone(&store) as Arc<dyn MergeLockStore>);
+        let cfg = fast_cfg();
+
+        let task = tokio::spawn(async move {
+            q.with_merge_slot("owner/repo/main", 0, &cfg, || async { "done" }).await
+        });
+
+        // Give the task time to: enqueue, acquire, run `f`, and get stuck
+        // inside the first (never-resolving) `release(...).await`.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            inner.is_locked("owner/repo/main"),
+            "the lock must still be held while stuck inside the stuck release call"
+        );
+
+        // Simulate cancellation: abort the task while it is parked inside
+        // `release(...).await`, dropping `with_merge_slot`'s future (and, in
+        // it, the `ReleaseGuard`) without ever reaching the normal return.
+        task.abort();
+        let _ = task.await; // JoinError::is_cancelled(); result not needed
+
+        // Give the `Drop`-spawned fallback release a moment to run.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        assert!(
+            !inner.is_locked("owner/repo/main"),
+            "the Drop guard's fallback release must still free the lock when the normal path's \
+             own release call is cancelled mid-flight"
+        );
+        assert_eq!(
+            store.release_calls.load(Ordering::SeqCst),
+            2,
+            "expected the stuck normal-path release call plus exactly one Drop-fallback release call"
+        );
     }
 }
