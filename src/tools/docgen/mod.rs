@@ -33,6 +33,35 @@
 //! registration path every other core tool (`plane`/`gitea`/`github`/
 //! `scribe`) uses. There is no separate "personal-only" registry for it.
 //!
+//! ## The landing README's own output contract (DGRICH-05, S119)
+//! This engine's OWN generated landing page follows a fixed 8-section
+//! skeleton, deterministically assembled by [`readme_layers::build_landing_body`]
+//! from [`prompts::RepoIdentity`] (Pass 1) + [`repo_facts::RepoFacts`]
+//! (Pass 0) + the real emitted docs tree ([`render::docs_tree::DocsTreeFile`]):
+//! (1) hero (`<h1>` + tagline + [`readme_layers::fact_row`] -- a single
+//! computed line like `Rust · 410 modules · 53 MCP tools · 11.9k KG nodes ·
+//! analyzed a1b2c3d`, which REPLACES the old hardcoded shields.io badge
+//! row), (2) "What is `<name>`", (3) Architecture (the real derived
+//! diagram, `subsystem_architecture_mermaid_source`, never the generic
+//! `Client -> Core -> Output` template except as the explicit no-KG
+//! fallback), (4) Subsystems/Features table (every row links to its real
+//! `docs/reference/<subsystem>.md`), (5) Quick Start (points at
+//! `docs/getting-started.md`, never inlined), (6) Documentation index
+//! (generated from the ACTUAL emitted tree, one row per real page with its
+//! real first-paragraph one-liner), (7) At a Glance (computed
+//! function/struct/trait/module counts, workspace members, binaries --
+//! never invented), (8) Contributing + License. The landing is gated
+//! fail-closed by BOTH [`readme_layers::check_landing_length`]
+//! (`LANDING_MAX_LINES = 300`) and [`readme_layers::check_landing_substance`]
+//! (`LANDING_MIN_SUBSTANTIVE_LINES = 80`, counting non-blank/non-chrome
+//! lines) -- a landing that is all chrome (the pre-DGRICH-05 ~50-61 line
+//! bare failure mode) or that inlines everything (the pre-revision
+//! 2000+-line bloat failure mode) is a structural gate failure either way.
+//! This is additive to, and does not replace, the legacy per-module
+//! landing ([`readme_layers::render_layered_readme`]/`build_layered_body`)
+//! other renderers in this crate still call for projects with no
+//! repo-level KG grounding.
+//!
 //! ## Secrets (S95 Pre-flight: `OPENROUTER_API_KEY`, `NOTION_TOKEN`, etc.)
 //! This scaffold reads no secret VALUES at all -- see [`config`]'s module
 //! doc comment. Vault key NAMES a target may need are named by
@@ -93,10 +122,11 @@ pub use quality::{
     QualityScoreStore, QualityVerdict, DEFAULT_QUALITY_THRESHOLD,
 };
 pub use readme_layers::{
-    check_landing_length, deepen_layers, landing_line_count, parse_layers, render_diataxis_set,
-    render_layered_readme, DiataxisArtifact, DiataxisMode, ParsedLayers, CHANGELOG_PATH,
+    build_landing_body, check_landing_length, check_landing_substance, deepen_layers, fact_row,
+    landing_line_count, parse_layers, render_diataxis_set, render_layered_readme,
+    substantive_line_count, DiataxisArtifact, DiataxisMode, ParsedLayers, CHANGELOG_PATH,
     DOCS_ARCHITECTURE_PATH, DOCS_GETTING_STARTED_PATH, DOCS_GUIDES_INDEX_PATH, DOCS_INDEX_PATH,
-    DOCS_REFERENCE_INDEX_PATH, LANDING_MAX_LINES, LICENSE_PATH,
+    DOCS_REFERENCE_INDEX_PATH, LANDING_MAX_LINES, LANDING_MIN_SUBSTANTIVE_LINES, LICENSE_PATH,
 };
 pub use render::docs_tree::{build_docs_tree, DocsTreeFile};
 pub use render::{render_all, RenderContext, RenderOutcome, RenderedArtifact};
