@@ -17,7 +17,10 @@
 //!   operator's infra git storage; NOTE this differs from Plane's `lumina`).
 //! - `GITEA_OWNER` — default repo owner/organisation (default: `"moosenet"`)
 
+pub mod merge_queue;
 pub mod types;
+
+pub use merge_queue::{MergeQueue, MergeQueueConfig, MergeQueueError};
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};

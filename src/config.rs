@@ -1283,6 +1283,78 @@ pub fn constellation_cookie_secure() -> bool {
         .unwrap_or(false)
 }
 
+// ── GMQ-02: Gitea merge-queue config (per-base merge lock + FIFO ordering) ──
+//
+// `crate::gitea::merge_queue::MergeQueue` serializes merges to the same base
+// branch (see `docs/specs/S120-gitea-merge-queue.md`). It degrades open when
+// Redis is absent/unreachable, so these knobs only matter once Redis is
+// configured; all three are optional with safe defaults.
+
+/// Whether the merge-queue path is enabled. From `GITEA_MERGE_QUEUE_ENABLED`
+/// (`"true"`/`"1"` ⇒ true, anything else ⇒ false); defaults to `true` — once
+/// Redis is present the queue should protect concurrent merges by default,
+/// but an operator can flip this off (e.g. to rule it out while debugging)
+/// without unsetting `REDIS_URL` for every other Redis-backed feature.
+pub fn gitea_merge_queue_enabled() -> bool {
+    env_nonempty("GITEA_MERGE_QUEUE_ENABLED")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1"))
+        .unwrap_or(true)
+}
+
+/// Merge-lock TTL (seconds): the crash backstop that frees a holder's lock if
+/// it never releases (a crashed worker, a hung Gitea request). From
+/// `GITEA_MERGE_QUEUE_LOCK_TTL_SECS`; defaults to 120s. Must exceed a
+/// realistic merge time — a merge that runs longer than this can have its
+/// lock reclaimed by the next waiter while still in flight.
+pub fn gitea_merge_queue_lock_ttl_secs() -> u64 {
+    env_nonempty("GITEA_MERGE_QUEUE_LOCK_TTL_SECS")
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &u64| *n > 0)
+        .unwrap_or(120)
+}
+
+/// Max time (seconds) a waiter polls for its turn before giving up with a
+/// clear "queue busy, retry" instead of hanging indefinitely. From
+/// `GITEA_MERGE_QUEUE_MAX_WAIT_SECS`; defaults to 300s.
+pub fn gitea_merge_queue_max_wait_secs() -> u64 {
+    env_nonempty("GITEA_MERGE_QUEUE_MAX_WAIT_SECS")
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &u64| *n > 0)
+        .unwrap_or(300)
+}
+
+/// Margin (seconds) added above `max_wait_secs` when clamping an
+/// operator-configured `wait_ttl_secs` that would otherwise be too short (see
+/// [`gitea_merge_queue_wait_ttl_secs`]).
+const WAIT_TTL_MIN_MARGIN_SECS: u64 = 60;
+
+/// TTL (seconds) for the wait ZSET's own `EXPIRE` backstop (`queue:merge:wait:{key}`,
+/// see `crate::gitea::merge_queue::RedisMergeLockStore::enqueue`) — bounds how long an
+/// abandoned waiter (e.g. a caller that crashed between enqueue and its first poll) can
+/// wedge a key. From `GITEA_MERGE_QUEUE_WAIT_TTL_SECS`; defaults to
+/// `gitea_merge_queue_max_wait_secs() + 60`, i.e. derived from the max-wait ceiling so it
+/// always outlives the longest a real waiter can legitimately be polling, rather than a
+/// bare hardcoded literal that could end up shorter than `max_wait_secs`.
+///
+/// **Invariant, enforced here (not just documented):** the effective value can
+/// never be lower than `max_wait_secs + WAIT_TTL_MIN_MARGIN_SECS`, even when an
+/// operator explicitly configures a smaller `GITEA_MERGE_QUEUE_WAIT_TTL_SECS` —
+/// a shorter wait TTL would expire the wait ordering out from under a
+/// still-legitimately-polling waiter. A too-small configured value is clamped
+/// up (not rejected) so a misconfigured `.env` degrades to "safe but maybe
+/// slower to self-heal an abandoned ticket" rather than wedging the queue.
+pub fn gitea_merge_queue_wait_ttl_secs() -> u64 {
+    let max_wait = gitea_merge_queue_max_wait_secs();
+    let floor = max_wait.saturating_add(WAIT_TTL_MIN_MARGIN_SECS);
+    let configured = env_nonempty("GITEA_MERGE_QUEUE_WAIT_TTL_SECS")
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &u64| *n > 0);
+    match configured {
+        Some(v) => v.max(floor),
+        None => floor,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2017,5 +2089,46 @@ mod tests {
         std::env::set_var("CONSTELLATION_COOKIE_SECURE", "true");
         assert!(constellation_cookie_secure());
         std::env::remove_var("CONSTELLATION_COOKIE_SECURE");
+    }
+
+    // ── GMQ-02 r2: wait_ttl_secs must never be shorter than max_wait_secs ──
+
+    #[test]
+    #[serial]
+    fn gitea_merge_queue_wait_ttl_defaults_above_max_wait() {
+        std::env::remove_var("GITEA_MERGE_QUEUE_WAIT_TTL_SECS");
+        std::env::remove_var("GITEA_MERGE_QUEUE_MAX_WAIT_SECS");
+        assert_eq!(gitea_merge_queue_max_wait_secs(), 300);
+        assert_eq!(gitea_merge_queue_wait_ttl_secs(), 360);
+    }
+
+    #[test]
+    #[serial]
+    fn gitea_merge_queue_wait_ttl_below_max_wait_is_clamped_up() {
+        // A misconfigured `.env` (operator sets a wait TTL shorter than the
+        // max-wait ceiling) must never be honored literally — it would expire
+        // the wait ordering out from under a still-legitimately-polling
+        // waiter. The effective value must be clamped to
+        // `max_wait_secs + WAIT_TTL_MIN_MARGIN_SECS`.
+        std::env::set_var("GITEA_MERGE_QUEUE_MAX_WAIT_SECS", "300");
+        std::env::set_var("GITEA_MERGE_QUEUE_WAIT_TTL_SECS", "10"); // far too short
+        assert_eq!(gitea_merge_queue_max_wait_secs(), 300);
+        assert_eq!(
+            gitea_merge_queue_wait_ttl_secs(),
+            360,
+            "a too-short configured wait_ttl must be clamped up to max_wait + margin"
+        );
+        std::env::remove_var("GITEA_MERGE_QUEUE_MAX_WAIT_SECS");
+        std::env::remove_var("GITEA_MERGE_QUEUE_WAIT_TTL_SECS");
+    }
+
+    #[test]
+    #[serial]
+    fn gitea_merge_queue_wait_ttl_above_max_wait_is_honored() {
+        std::env::set_var("GITEA_MERGE_QUEUE_MAX_WAIT_SECS", "60");
+        std::env::set_var("GITEA_MERGE_QUEUE_WAIT_TTL_SECS", "500"); // already generous
+        assert_eq!(gitea_merge_queue_wait_ttl_secs(), 500);
+        std::env::remove_var("GITEA_MERGE_QUEUE_MAX_WAIT_SECS");
+        std::env::remove_var("GITEA_MERGE_QUEUE_WAIT_TTL_SECS");
     }
 }
