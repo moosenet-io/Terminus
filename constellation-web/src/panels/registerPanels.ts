@@ -27,6 +27,7 @@ import { registerCommand } from '../lib/commandRegistry';
 import { getCurrentPath, requestHealthRefresh } from '../lib/shellBridge';
 import { TerminusPanel } from './terminus/TerminusPanel';
 import { LuminaStubPanel } from './lumina/LuminaStubPanel';
+import { ChatPanel } from './lumina/ChatPanel';
 import { EngineDiagramPanel } from './status/EngineDiagramPanel';
 import { DashboardPanel } from './harmony/DashboardPanel';
 import { ProjectsPanel } from './harmony/ProjectsPanel';
@@ -201,7 +202,7 @@ registerPanel({
 });
 
 // ── Lumina ───────────────────────────────────────────────────────────────────
-// Stub only — Lumina's own config surface is CONST-07's job, not this port.
+// Config stub — Lumina's own config surface is CONST-07's job, not this port.
 
 registerPanel({
   id: 'lumina.config',
@@ -211,6 +212,21 @@ registerPanel({
   icon: '✦',
   available: false,
   component: LuminaStubPanel,
+});
+
+// LGUI-07: Conversations panel (LUMINA-GUI-SPEC.md §3.2/§9, route `/lumina/chat`, min role
+// operator per §2's panel table — enforced inside ChatPanel itself via useAuthRole, same
+// convention as RoleGate; PanelDescriptor has no per-panel role field). Works end-to-end on
+// the mock adapter today; the real `/api/lumina/v1/chat/completions` proxy route is LGUI-05's
+// job (also added by LGUI-05 — keep one on merge, if that lands a lumina.chat registration too).
+registerPanel({
+  id: 'lumina.chat',
+  system: 'lumina',
+  title: 'Conversations',
+  path: '/lumina/chat',
+  icon: '💬',
+  available: true,
+  component: ChatPanel,
 });
 
 // ── Palette commands (CONST-25) ────────────────────────────────────────────────
