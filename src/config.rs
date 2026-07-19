@@ -696,6 +696,19 @@ pub fn docgen_cloud_fallback_model() -> Option<String> {
     env_nonempty("DOCGEN_CLOUD_FALLBACK_MODEL")
 }
 
+/// Fast-fail timeout (ms) for the LOCAL docgen primary when a cloud fallback is
+/// configured (DGDG-03). A jammed local inference backend should error quickly
+/// so `FallbackDocGenerator` reaches the cloud promptly rather than hanging for
+/// the full federation timeout. `DOCGEN_LOCAL_TIMEOUT_MS`, default 45_000 (45s);
+/// a non-positive/unparseable value falls back to the default. Only applied when
+/// a cloud fallback exists — with none, the primary keeps the full timeout.
+pub fn docgen_local_timeout_ms() -> u64 {
+    env_nonempty("DOCGEN_LOCAL_TIMEOUT_MS")
+        .and_then(|v| v.parse().ok())
+        .filter(|ms: &u64| *ms > 0)
+        .unwrap_or(45_000)
+}
+
 // ── TGW-03: inference proxy to Chord ──────────────────────────────────────
 // `terminus-primary` forwards `/v1/chat/completions`, `/v1/infer`,
 // `/v1/agent/execute`, and `/v1/coding/select` to the SAME co-located Chord
@@ -1525,6 +1538,21 @@ mod tests {
         std::env::set_var("TERMINUS_PRIMARY_CHORD_FEDERATION_TIMEOUT_MS", "0");
         assert_eq!(chord_personal_federation_timeout_ms(), 30_000);
         std::env::remove_var("TERMINUS_PRIMARY_CHORD_FEDERATION_TIMEOUT_MS");
+    }
+
+    #[test]
+    #[serial]
+    fn docgen_local_timeout_ms_defaults_and_overrides() {
+        std::env::remove_var("DOCGEN_LOCAL_TIMEOUT_MS");
+        assert_eq!(docgen_local_timeout_ms(), 45_000);
+        std::env::set_var("DOCGEN_LOCAL_TIMEOUT_MS", "20000");
+        assert_eq!(docgen_local_timeout_ms(), 20_000);
+        // Non-positive / unparseable -> default (never a zero-duration primary).
+        std::env::set_var("DOCGEN_LOCAL_TIMEOUT_MS", "0");
+        assert_eq!(docgen_local_timeout_ms(), 45_000);
+        std::env::set_var("DOCGEN_LOCAL_TIMEOUT_MS", "nonsense");
+        assert_eq!(docgen_local_timeout_ms(), 45_000);
+        std::env::remove_var("DOCGEN_LOCAL_TIMEOUT_MS");
     }
 
     // ── TGW-03: inference-proxy config ──────────────────────────────────

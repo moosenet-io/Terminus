@@ -299,7 +299,6 @@ impl FallbackDocGenerator {
     /// `cloud` is `None` and this generator behaves exactly like a bare
     /// `ChordDocGenerator::from_env()` did before DGDG-01.
     pub fn from_env() -> Self {
-        let primary: Box<dyn DocGenerator> = Box::new(ChordDocGenerator::from_env());
         let review_config = crate::review::ReviewConfig::from_env();
         let cloud: Option<Box<dyn DocGenerator>> = match crate::config::docgen_cloud_fallback_model() {
             Some(model) if review_config.openrouter_key.is_some() => {
@@ -307,6 +306,21 @@ impl FallbackDocGenerator {
             }
             _ => None,
         };
+        // DGDG-03: when a cloud fallback exists, cap the LOCAL primary's timeout
+        // to a short fast-fail value (`DOCGEN_LOCAL_TIMEOUT_MS`, default 45s) so a
+        // JAMMED local backend (GPU held/evicted, cold reload, CPU-only fallback)
+        // errors quickly and the cloud fallback fires promptly — instead of the
+        // primary hanging for the full federation timeout (often minutes) before
+        // the fallback is even attempted. With NO cloud configured we keep the
+        // full federation timeout (a slow-but-eventually-fine local answer is
+        // strictly better than no answer when there is nothing to fall back to).
+        let chord = if cloud.is_some() {
+            ChordDocGenerator::from_env()
+                .with_timeout(std::time::Duration::from_millis(crate::config::docgen_local_timeout_ms()))
+        } else {
+            ChordDocGenerator::from_env()
+        };
+        let primary: Box<dyn DocGenerator> = Box::new(chord);
         Self { primary, cloud }
     }
 }
