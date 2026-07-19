@@ -1507,8 +1507,20 @@ mod tests {
 
     // ── TEST PLAN item 3: emitted source is swept ───────────────────────
 
+    // #[serial]: this test exercises the github::pii scan/redact path, whose
+    // detectors read process-global env (`TERMINUS_PII_CONFIG`,
+    // `GITHUB_ALLOWED_AUTHORS`). Other pii tests mutate those env vars and are
+    // themselves `#[serial]`; without this, a parallel (-j) run lets their env
+    // mutation race this test's redaction, so it passes in isolation but flakes
+    // in the full suite. Serialize it into the same global group.
     #[test]
+    #[serial_test::serial]
     fn emitted_diagram_source_is_swept_private_ip_in_node_label_is_placeholdered() {
+        // Redaction detectors are env-configurable; ensure a clean, default
+        // config so a leftover value from another test can't disable private_ip
+        // detection under this test.
+        std::env::remove_var("TERMINUS_PII_CONFIG");
+        std::env::remove_var("GITHUB_ALLOWED_AUTHORS");
         // NOTE: `<internal-ip>` below is a deliberately fake private-IP // pii-test-fixture
         // literal for this fixture only, tagged per this repo's push-gate
         // whitelist convention so the source-scan exempts this line without
