@@ -638,14 +638,15 @@ const httpAdapter: AggregationClient = {
     async configSummary() {
       return httpJson<TerminusConfigSummary>('/api/terminus/config');
     },
-    async activity(limit = 50) {
+    async activity(limit?: number) {
       // CONST-28/§8: degrade gracefully (available:false) rather than throw — 404/501 on a
       // deploy without the endpoint, or any transient failure. Both the Overview feed/bell
-      // (CONST-26) and ActivityPanel read `.entries`; the flag is additive.
+      // (CONST-26) and ActivityPanel read `.entries`; the flag is additive. `limit` stays
+      // OPTIONAL (review fix): omitted ⇒ no query param ⇒ the server's own configured cap
+      // applies, exactly as the CONST-26 contract documents.
       try {
-        const res = await httpJson<ActivityFeedResponse>(
-          `/api/terminus/activity?limit=${encodeURIComponent(String(limit))}`,
-        );
+        const query = limit != null ? `?limit=${encodeURIComponent(String(limit))}` : '';
+        const res = await httpJson<ActivityFeedResponse>(`/api/terminus/activity${query}`);
         return { entries: res.entries, available: true };
       } catch (e) {
         return { entries: [], available: false, detail: e instanceof Error ? e.message : 'unavailable' };

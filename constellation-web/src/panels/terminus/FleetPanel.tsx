@@ -18,7 +18,23 @@ import {
 } from './fleetRingBuffer';
 
 const POLL_INTERVAL_MS = 5000;
-const KNOWN_SYSTEMS: SystemId[] = ['harmony', 'chord', 'lumina', 'terminus'];
+/** Baseline card order for systems that haven't reported yet on a fresh mount. The rendered
+ *  set is DERIVED from the live /api/health payload (union with this list, review fix) — a
+ *  new system (e.g. muse, or any future namespace) gets a card automatically, never a code
+ *  change here. */
+const BASELINE_SYSTEMS: SystemId[] = ['harmony', 'chord', 'lumina', 'muse', 'terminus'];
+
+/** Every system to render: baseline order first, then any additional systems observed in the
+ *  ring buffers (i.e. present in /api/health) appended in first-seen order. */
+function systemsToRender(buffers: FleetRingBuffers): SystemId[] {
+  const seen = new Set<string>(BASELINE_SYSTEMS);
+  const extras = (Object.keys(buffers) as SystemId[]).filter(sys => {
+    if (seen.has(sys) || (buffers[sys] ?? []).length === 0) return false;
+    seen.add(sys);
+    return true;
+  });
+  return [...BASELINE_SYSTEMS, ...extras];
+}
 
 function systemCard(system: SystemId, buffers: FleetRingBuffers) {
   const arr = buffers[system] ?? [];
@@ -119,7 +135,7 @@ export function FleetPanel() {
       {/* Each card degrades on its own (StatusPill "no data" + Sparkline "collecting…") until
           its first poll lands — no separate page-level loading skeleton needed here. */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 'var(--space-3)' }}>
-        {KNOWN_SYSTEMS.map(s => systemCard(s, buffers))}
+        {systemsToRender(buffers).map(s => systemCard(s, buffers))}
       </div>
     </div>
   );
