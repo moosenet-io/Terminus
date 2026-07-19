@@ -54,15 +54,22 @@
 //! Chord's existing `POST /v1/infer` single-prompt route -- no new Chord-side
 //! endpoint is assumed. A `MockDocGenerator` (test-only) stands in for tests.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::{stream, StreamExt};
 use serde_json::{json, Value};
 
 use crate::error::ToolError;
 use crate::scribe::inspect::{InspectionWorktree, ModuleBundle};
 
 use super::pii_gate::PiiGateOutcome;
+use super::prompts::{
+    anti_latch_lint, build_guides_prompt, build_repo_identity_prompt, build_subsystem_page_prompt,
+    honest_command_lint, parse_file_blocks, parse_repo_identity, symbol_existence_lint, RepoIdentity,
+};
+use super::repo_facts::RepoFacts;
 
 /// The minimum length (trimmed, non-whitespace-inclusive) a generation must
 /// reach to be treated as real content rather than a poor/empty response
@@ -299,6 +306,563 @@ pub async fn generate_docs_for_module(
         feat_context,
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// DGRICH-03: generate_repo_docs -- Passes 1-3 orchestration over RepoFacts
+// ---------------------------------------------------------------------------
+//
+// This is the repo-level sibling of `generate_docs` above: instead of one
+// thin module-README prompt fed only a feat diff, it runs the three
+// KG-grounded prompts from `prompts.rs` (design `fable-docgen-redesign.md`
+// §2 Passes 1-3) over the SAME `DocGenerator` seam, grounded in a
+// `RepoFacts` (DGRICH-01) rather than a diff. `generate_docs`/
+// `generate_docs_for_module` above are the legacy per-module path and are
+// untouched by this addition.
+//
+// ## Retry-once-then-Flagged, partial success is usable
+// Every pass (identity, each subsystem page, guides) gets exactly one retry
+// with the lint/parse violation quoted back to the model; a second failure
+// records that pass as failed in `RepoDocsOutcome::missing` and
+// `pass_ledger`, but never aborts the rest of the pipeline and never
+// returns an `Err` -- `generate_repo_docs` cannot fail the triggering feat
+// (design §2 Pass 5 / DGRICH-07's infallibility requirement upstream of
+// this item).
+
+/// How many subsystem-page generation calls (Pass 2) run concurrently.
+/// Bounded (design §2 Pass 2: "parallelizable, N<=16") rather than
+/// unbounded so a repo with the max 16 kept subsystems doesn't fire 16
+/// simultaneous Chord requests.
+const SUBSYSTEM_PASS_CONCURRENCY: usize = 4;
+
+/// One pass's outcome, for operator visibility (`RepoDocsOutcome::pass_ledger`).
+/// `pass` is `"identity"`, `"guides"`, or `"subsystem:<name>"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassRecord {
+    pub pass: String,
+    pub ok: bool,
+    /// The lint/parse violation or generator error that caused a
+    /// non-`ok` outcome; `None` when `ok` is `true`.
+    pub detail: Option<String>,
+}
+
+impl PassRecord {
+    fn ok(pass: impl Into<String>) -> Self {
+        Self { pass: pass.into(), ok: true, detail: None }
+    }
+
+    fn flagged(pass: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self { pass: pass.into(), ok: false, detail: Some(detail.into()) }
+    }
+}
+
+/// The result of running Passes 1-3 over one repo's [`RepoFacts`].
+///
+/// `identity` is `None` exactly when the identity pass (Pass 1) was
+/// `Flagged` twice (parse/lint failure survived one retry) -- callers must
+/// treat that as "no identity", not synthesize a placeholder one. When
+/// `identity` is `None`, Passes 2 and 3 are skipped entirely (both need a
+/// `RepoIdentity` as grounding input per the design), and every kept
+/// subsystem plus `"guides"` are recorded in `missing`/`pass_ledger` as
+/// skipped rather than attempted. Partial success within Pass 2 alone
+/// (identity ok, some subsystem pages failed) is the common case this type
+/// is built to represent usably: `subsystem_pages` holds every page that
+/// succeeded, `missing` names exactly the ones that didn't.
+#[derive(Debug, Clone, Default)]
+pub struct RepoDocsOutcome {
+    pub identity: Option<RepoIdentity>,
+    /// `docs/reference/<subsystem>.md` content, one entry per subsystem
+    /// whose page generation succeeded (order not guaranteed -- Pass 2 runs
+    /// bounded-concurrent).
+    pub subsystem_pages: Vec<(String, String)>,
+    /// `docs/guides/<slug>.md` content (excludes getting-started, which has
+    /// its own field).
+    pub guides: Vec<(PathBuf, String)>,
+    /// `docs/getting-started.md` content, or empty when the guides pass
+    /// never succeeded (see `missing` for whether that happened).
+    pub getting_started: String,
+    /// Names of passes that did not produce usable output: `"identity"`,
+    /// `"guides"`, and/or `"subsystem:<name>"` for each subsystem whose page
+    /// failed (or was skipped because identity failed first).
+    pub missing: Vec<String>,
+    /// One record per pass attempted (or skipped), for operator visibility.
+    pub pass_ledger: Vec<PassRecord>,
+}
+
+/// Every real symbol id `RepoFacts` knows about, flattened for
+/// [`symbol_existence_lint`]: repo-scale hotspots plus every kept
+/// subsystem's top symbols (a superset is fine -- the lint only rejects
+/// symbols named that are NOT in this set, so including more real symbols
+/// only makes the lint more permissive of genuinely real names, never less
+/// strict against invented ones).
+fn all_symbol_names(facts: &RepoFacts) -> Vec<String> {
+    let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for s in &facts.scale.hotspots {
+        set.insert(s.id.clone());
+    }
+    for sub in &facts.subsystems {
+        for s in &sub.top_symbols {
+            set.insert(s.id.clone());
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// Every real `[[bin]]` target name `RepoFacts` knows about, for
+/// [`honest_command_lint`].
+fn all_bin_names(facts: &RepoFacts) -> Vec<String> {
+    facts.entry_points.bin_targets.iter().map(|b| b.name.clone()).collect()
+}
+
+/// Parse `raw` JSON text (already PII-swept by `RepoFacts::identity_slice`/
+/// `subsystem_slice`) into a `serde_json::Value` for the prompt builders,
+/// which take `&Value` rather than a pre-serialized string.
+fn parse_slice_json(raw: &str, what: &str) -> Result<Value, String> {
+    serde_json::from_str(raw).map_err(|e| format!("{what} slice was not valid JSON after sweep: {e}"))
+}
+
+/// Deterministic re-serialization of an already-parsed [`RepoIdentity`] back
+/// to `Value`, for embedding in the Pass 2/3 prompts (which take the
+/// identity as already-established JSON, per design §3.2/§3.3).
+fn identity_to_value(identity: &RepoIdentity) -> Value {
+    serde_json::to_value(identity).unwrap_or_else(|_| json!({}))
+}
+
+/// Pass 1: identity + outline. Builds the prompt from
+/// `facts.identity_slice()`, calls `generator`, parses + lints the result;
+/// on parse/lint failure retries ONCE with the violation quoted, then
+/// records a `Flagged` [`PassRecord`] and returns `None` (never aborts the
+/// caller).
+async fn run_identity_pass(
+    generator: &dyn DocGenerator,
+    facts: &RepoFacts,
+    repo_name: &str,
+    git_ref: &str,
+    symbol_names: &[String],
+) -> (Option<RepoIdentity>, PassRecord) {
+    let subsystem_names: Vec<String> = facts.subsystems.iter().map(|s| s.name.clone()).collect();
+
+    let facts_slice = match facts.identity_slice() {
+        Ok(s) => s,
+        Err(e) => {
+            return (None, PassRecord::flagged("identity", format!("failed to build identity slice: {e}")))
+        }
+    };
+    let facts_value = match parse_slice_json(&facts_slice, "identity") {
+        Ok(v) => v,
+        Err(reason) => return (None, PassRecord::flagged("identity", reason)),
+    };
+
+    let mut prompt = build_repo_identity_prompt(repo_name, git_ref, &facts_value);
+
+    for attempt in 0..2 {
+        let raw = match generator.generate(&prompt).await {
+            Ok(r) => r,
+            Err(e) => {
+                if attempt == 0 {
+                    prompt = format!(
+                        "{prompt}\n\nYour previous attempt failed: {e}\nPlease respond again, correctly."
+                    );
+                    continue;
+                }
+                return (None, PassRecord::flagged("identity", format!("generator error: {e}")));
+            }
+        };
+
+        match parse_repo_identity(&raw) {
+            Err(e) => {
+                if attempt == 0 {
+                    prompt = format!(
+                        "{prompt}\n\nYour previous response was rejected: {e}\n\
+Respond again with ONLY a corrected JSON object."
+                    );
+                    continue;
+                }
+                return (None, PassRecord::flagged("identity", format!("parse error: {e}")));
+            }
+            Ok(identity) => {
+                if identity.subsystems.len() < subsystem_names.len() {
+                    let violation = format!(
+                        "identity JSON names {} subsystem(s) but RepoFacts has {} kept subsystems -- \
+every kept subsystem must get a one-liner",
+                        identity.subsystems.len(),
+                        subsystem_names.len()
+                    );
+                    if attempt == 0 {
+                        prompt = format!(
+                            "{prompt}\n\nYour previous response was rejected: {violation}\n\
+Respond again, covering EVERY subsystem listed in REPO FACTS."
+                        );
+                        continue;
+                    }
+                    return (None, PassRecord::flagged("identity", violation));
+                }
+
+                if let Some(violation) =
+                    anti_latch_lint(&identity.tagline, &identity.what_is, &subsystem_names, "")
+                {
+                    if attempt == 0 {
+                        prompt = format!(
+                            "{prompt}\n\nYour previous response was rejected: {violation}\n\
+Respond again, describing the WHOLE repository, not one subsystem."
+                        );
+                        continue;
+                    }
+                    return (None, PassRecord::flagged("identity", violation));
+                }
+
+                let feature_text: String = identity
+                    .feature_rows
+                    .iter()
+                    .map(|f| f.description.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let combined = format!("{} {} {}", identity.tagline, identity.what_is, feature_text);
+                if let Some(violation) = symbol_existence_lint(&combined, symbol_names) {
+                    if attempt == 0 {
+                        prompt = format!(
+                            "{prompt}\n\nYour previous response was rejected: {violation}\n\
+Respond again, never inventing a symbol not present in REPO FACTS."
+                        );
+                        continue;
+                    }
+                    return (None, PassRecord::flagged("identity", violation));
+                }
+
+                return (Some(identity), PassRecord::ok("identity"));
+            }
+        }
+    }
+
+    unreachable!("loop always returns within its two iterations")
+}
+
+/// Pass 2, one subsystem: builds the page prompt from
+/// `facts.subsystem_slice(subsystem)` + the already-established identity,
+/// calls `generator`, validates (symbol-existence); retry-once-then-fail.
+/// Returns `(subsystem_name, Ok(markdown) | Err(reason))` rather than a
+/// `Result<_, ToolError>` so a failed page never aborts sibling pages
+/// running concurrently in [`run_subsystem_pass`].
+async fn generate_subsystem_page(
+    generator: &dyn DocGenerator,
+    facts: &RepoFacts,
+    repo_name: &str,
+    subsystem: &str,
+    identity_value: &Value,
+    symbol_names: &[String],
+) -> (String, Result<String, String>) {
+    let slice = match facts.subsystem_slice(subsystem) {
+        Ok(s) => s,
+        Err(e) => {
+            return (subsystem.to_string(), Err(format!("failed to build subsystem slice: {e}")))
+        }
+    };
+    let slice_value = match parse_slice_json(&slice, subsystem) {
+        Ok(v) => v,
+        Err(reason) => return (subsystem.to_string(), Err(reason)),
+    };
+
+    let mut prompt = build_subsystem_page_prompt(repo_name, subsystem, identity_value, &slice_value);
+
+    for attempt in 0..2 {
+        let raw = match generator.generate(&prompt).await {
+            Ok(r) => r,
+            Err(e) => {
+                if attempt == 0 {
+                    prompt = format!(
+                        "{prompt}\n\nYour previous attempt failed: {e}\nPlease respond again, correctly."
+                    );
+                    continue;
+                }
+                return (subsystem.to_string(), Err(format!("generator error: {e}")));
+            }
+        };
+
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            if attempt == 0 {
+                prompt = format!(
+                    "{prompt}\n\nYour previous response was empty. Write the reference page again."
+                );
+                continue;
+            }
+            return (subsystem.to_string(), Err("generation produced empty content".to_string()));
+        }
+
+        if let Some(violation) = symbol_existence_lint(trimmed, symbol_names) {
+            if attempt == 0 {
+                prompt = format!(
+                    "{prompt}\n\nYour previous response was rejected: {violation}\n\
+Respond again, never inventing a symbol not present in SUBSYSTEM FACTS."
+                );
+                continue;
+            }
+            return (subsystem.to_string(), Err(violation));
+        }
+
+        return (subsystem.to_string(), Ok(trimmed.to_string()));
+    }
+
+    unreachable!("loop always returns within its two iterations")
+}
+
+/// Pass 2: runs [`generate_subsystem_page`] for every kept (non-misc)
+/// subsystem in `facts`, bounded-concurrent
+/// ([`SUBSYSTEM_PASS_CONCURRENCY`]). Returns every page that succeeded plus
+/// one [`PassRecord`] per subsystem attempted -- a failing page never
+/// prevents the others from being returned (design §2 Pass 2 / DGRICH-03
+/// EDGE CASE: "identity ok + 12/15 pages = usable").
+async fn run_subsystem_pass(
+    generator: &dyn DocGenerator,
+    facts: &RepoFacts,
+    repo_name: &str,
+    identity_value: &Value,
+    symbol_names: &[String],
+) -> (Vec<(String, String)>, Vec<PassRecord>) {
+    let kept: Vec<&str> = facts.subsystems.iter().filter(|s| !s.is_misc).map(|s| s.name.as_str()).collect();
+
+    let results: Vec<(String, Result<String, String>)> = stream::iter(kept.into_iter())
+        .map(|name| async move {
+            generate_subsystem_page(generator, facts, repo_name, name, identity_value, symbol_names).await
+        })
+        .buffer_unordered(SUBSYSTEM_PASS_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut pages = Vec::new();
+    let mut records = Vec::new();
+    for (name, result) in results {
+        match result {
+            Ok(markdown) => {
+                records.push(PassRecord::ok(format!("subsystem:{name}")));
+                pages.push((name, markdown));
+            }
+            Err(reason) => {
+                records.push(PassRecord::flagged(format!("subsystem:{name}"), reason));
+            }
+        }
+    }
+    (pages, records)
+}
+
+/// Pass 3: guides + getting-started. Builds the prompt from the identity,
+/// `facts.entry_points`/`config_surface`, and the old README's install/
+/// usage sections (design §2 Pass 3: "legacy README's install/usage
+/// sections"); parses with `parse_file_blocks`; lints every command against
+/// `facts`'s real bin targets; retry-once-then-flag.
+async fn run_guides_pass(
+    generator: &dyn DocGenerator,
+    facts: &RepoFacts,
+    repo_name: &str,
+    identity: &RepoIdentity,
+    identity_value: &Value,
+) -> (Vec<(PathBuf, String)>, String, PassRecord) {
+    let entrypoints_value = json!({
+        "bin_targets": facts.entry_points.bin_targets,
+        "workspace_members": facts.entry_points.workspace_members,
+        "entrypoint_symbols": facts.entry_points.entrypoint_symbols,
+        "registered_tool_count": facts.entry_points.registered_tool_count,
+        "config_surface": facts.config_surface,
+        "guide_topics": identity.guide_topics,
+    });
+
+    let legacy_usage: String = facts
+        .old_readme_sections
+        .iter()
+        .filter(|s| {
+            let h = s.heading.to_lowercase();
+            h.contains("install") || h.contains("usage") || h.contains("quick start") || h.contains("getting started")
+        })
+        .map(|s| format!("LEGACY README SECTION \"{}\":\n{}", s.heading, s.body))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let bin_names = all_bin_names(facts);
+
+    let mut prompt = build_guides_prompt(repo_name, identity_value, &entrypoints_value, &legacy_usage);
+
+    for attempt in 0..2 {
+        let raw = match generator.generate(&prompt).await {
+            Ok(r) => r,
+            Err(e) => {
+                if attempt == 0 {
+                    prompt = format!(
+                        "{prompt}\n\nYour previous attempt failed: {e}\nPlease respond again, correctly."
+                    );
+                    continue;
+                }
+                return (Vec::new(), String::new(), PassRecord::flagged("guides", format!("generator error: {e}")));
+            }
+        };
+
+        let blocks = parse_file_blocks(&raw);
+        if blocks.is_empty() {
+            if attempt == 0 {
+                prompt = format!(
+                    "{prompt}\n\nYour previous response had no `=== FILE: <path> ===` marker lines. \
+Respond again using EXACTLY that marker format before each file's content."
+                );
+                continue;
+            }
+            return (
+                Vec::new(),
+                String::new(),
+                PassRecord::flagged("guides", "no `=== FILE: <path> ===` markers found in output".to_string()),
+            );
+        }
+
+        let combined: String =
+            blocks.iter().map(|(_, body)| body.as_str()).collect::<Vec<_>>().join("\n");
+        if let Some(violation) = honest_command_lint(&combined, &bin_names) {
+            if attempt == 0 {
+                prompt = format!(
+                    "{prompt}\n\nYour previous response was rejected: {violation}\n\
+Respond again, only naming real binaries/tools from ENTRY POINTS."
+                );
+                continue;
+            }
+            return (Vec::new(), String::new(), PassRecord::flagged("guides", violation));
+        }
+
+        let getting_started = blocks
+            .iter()
+            .find(|(path, _)| path.as_path() == std::path::Path::new("docs/getting-started.md"))
+            .map(|(_, body)| body.clone())
+            .unwrap_or_default();
+        let guides: Vec<(PathBuf, String)> = blocks
+            .into_iter()
+            .filter(|(path, _)| path.as_path() != std::path::Path::new("docs/getting-started.md"))
+            .collect();
+
+        // A non-empty `=== FILE:` response is NOT automatically a success: the
+        // Pass-3 contract is getting-started.md PLUS one guide per guide_topic.
+        // Collect the concrete gaps so an incomplete response is retried once and,
+        // if still incomplete, recorded as a flagged pass (added to `missing` by the
+        // caller) — while STILL returning whatever real files we did get (partial
+        // success), never silently reporting ok:true with an empty getting_started.
+        let mut gaps: Vec<String> = Vec::new();
+        if getting_started.trim().is_empty() {
+            gaps.push("getting-started.md".to_string());
+        }
+        // Only count DISTINCT files actually under `docs/guides/` toward the
+        // one-guide-per-topic requirement — otherwise a wrong path
+        // (`docs/reference/foo.md`) or a duplicate could satisfy the count while
+        // a real guide topic has no page (codex review finding).
+        let distinct_guide_pages: std::collections::HashSet<&std::path::Path> = guides
+            .iter()
+            .map(|(p, _)| p.as_path())
+            .filter(|p| p.starts_with("docs/guides/") && p.extension().map(|e| e == "md").unwrap_or(false))
+            .collect();
+        let expected_guides = identity.guide_topics.len();
+        if distinct_guide_pages.len() < expected_guides {
+            gaps.push(format!(
+                "{} of {} guide topic page(s) missing under docs/guides/",
+                expected_guides - distinct_guide_pages.len(),
+                expected_guides
+            ));
+        }
+
+        if !gaps.is_empty() {
+            if attempt == 0 {
+                prompt = format!(
+                    "{prompt}\n\nYour previous response was incomplete — {}. Every guides \
+response MUST include `=== FILE: docs/getting-started.md ===` and one \
+`=== FILE: docs/guides/<slug>.md ===` per guide topic in REPO IDENTITY. Respond \
+again with ALL required files.",
+                    gaps.join("; ")
+                );
+                continue;
+            }
+            // Final attempt still incomplete: keep the partial output, flag the gap.
+            return (
+                guides,
+                getting_started,
+                PassRecord::flagged("guides", format!("incomplete guides output: {}", gaps.join("; "))),
+            );
+        }
+
+        return (guides, getting_started, PassRecord::ok("guides"));
+    }
+
+    unreachable!("loop always returns within its two iterations")
+}
+
+/// Orchestrates Passes 1-3 of the rich, KG-grounded doc generator (design
+/// §2) over `facts` -- the repo-level sibling of [`generate_docs`]. Never
+/// returns an `Err`: every internal failure (generator unreachable, a
+/// parse/lint violation that survives one retry) becomes a `Flagged`
+/// [`PassRecord`] plus an entry in [`RepoDocsOutcome::missing`], so a
+/// partial result (e.g. identity ok, 12 of 15 subsystem pages) is always
+/// returned rather than discarded.
+///
+/// `repo_name`/`git_ref` are display-only (embedded in prompt text); the
+/// substantive grounding is entirely `facts`.
+pub async fn generate_repo_docs(
+    generator: &dyn DocGenerator,
+    facts: &RepoFacts,
+    repo_name: &str,
+    git_ref: &str,
+) -> RepoDocsOutcome {
+    let symbol_names = all_symbol_names(facts);
+    let mut missing = Vec::new();
+    let mut pass_ledger = Vec::new();
+
+    let (identity, identity_record) =
+        run_identity_pass(generator, facts, repo_name, git_ref, &symbol_names).await;
+    if !identity_record.ok {
+        missing.push("identity".to_string());
+    }
+    pass_ledger.push(identity_record);
+
+    let Some(identity) = identity else {
+        // Passes 2/3 both require the identity as grounding input (design
+        // §2 Pass 2/3) -- skip them explicitly rather than attempting a
+        // generation that would just fail the same way, but still record
+        // every subsystem as missing so the operator sees the full gap.
+        for s in facts.subsystems.iter().filter(|s| !s.is_misc) {
+            let pass = format!("subsystem:{}", s.name);
+            missing.push(pass.clone());
+            pass_ledger.push(PassRecord::flagged(pass, "skipped: identity pass did not succeed"));
+        }
+        missing.push("guides".to_string());
+        pass_ledger.push(PassRecord::flagged("guides", "skipped: identity pass did not succeed"));
+
+        return RepoDocsOutcome {
+            identity: None,
+            subsystem_pages: Vec::new(),
+            guides: Vec::new(),
+            getting_started: String::new(),
+            missing,
+            pass_ledger,
+        };
+    };
+
+    let identity_value = identity_to_value(&identity);
+
+    let (subsystem_pages, subsystem_records) =
+        run_subsystem_pass(generator, facts, repo_name, &identity_value, &symbol_names).await;
+    for r in &subsystem_records {
+        if !r.ok {
+            missing.push(r.pass.clone());
+        }
+    }
+    pass_ledger.extend(subsystem_records);
+
+    let (guides, getting_started, guides_record) =
+        run_guides_pass(generator, facts, repo_name, &identity, &identity_value).await;
+    if !guides_record.ok {
+        missing.push("guides".to_string());
+    }
+    pass_ledger.push(guides_record);
+
+    RepoDocsOutcome {
+        identity: Some(identity),
+        subsystem_pages,
+        guides,
+        getting_started,
+        missing,
+        pass_ledger,
+    }
 }
 
 #[cfg(test)]
@@ -593,6 +1157,262 @@ mod tests {
                 assert_eq!(source_commit, "n1");
             }
             other => panic!("expected Generated, got {other:?}"),
+        }
+    }
+
+    // ── DGRICH-03: generate_repo_docs orchestration ─────────────────────
+
+    mod repo_docs {
+        use super::*;
+        use crate::scribe::graph::{Confidence, EdgeKind, KgEdge, KgNode, KnowledgeGraph, NodeKind};
+        use crate::tools::docgen::repo_facts::{build_repo_facts, FixtureGraphSource};
+        use std::collections::{HashMap, HashSet};
+        use std::path::Path;
+
+        /// A two-subsystem fixture graph (`alpha`, `beta`), each with a
+        /// "hub" node that receives enough in-subsystem calls to rank
+        /// highest by PageRank -- so `hub` reliably lands in
+        /// `Subsystem::top_symbols` and can be named as a real symbol in
+        /// scripted page content below. Both subsystems clear the
+        /// `max(30, 1%)` selection threshold on their own (32 and 31
+        /// nodes), so there is no `misc` fold here.
+        fn two_subsystem_graph() -> KnowledgeGraph {
+            let mut g = KnowledgeGraph::new("FIXR");
+            let node = |id: &str, kind: NodeKind, path: &str| -> KgNode {
+                let name = id.rsplit("::").next().unwrap_or(id).to_string();
+                KgNode::new(id, kind, name, path)
+            };
+            g.insert_node(node("crate::alpha::Hub::run", NodeKind::Function, "src/alpha/hub.rs"));
+            for i in 0..31 {
+                let id = format!("crate::alpha::f{i}");
+                g.insert_node(node(&id, NodeKind::Function, &format!("src/alpha/f{i}.rs")));
+                g.insert_edge(KgEdge::new(&id, "crate::alpha::Hub::run", EdgeKind::Calls, Confidence::Extracted))
+                    .unwrap();
+            }
+            g.insert_node(node("crate::beta::Hub::run", NodeKind::Function, "src/beta/hub.rs"));
+            for i in 0..30 {
+                let id = format!("crate::beta::f{i}");
+                g.insert_node(node(&id, NodeKind::Function, &format!("src/beta/f{i}.rs")));
+                g.insert_edge(KgEdge::new(&id, "crate::beta::Hub::run", EdgeKind::Calls, Confidence::Extracted))
+                    .unwrap();
+            }
+            g
+        }
+
+        fn fixture_facts() -> RepoFacts {
+            let g = two_subsystem_graph();
+            build_repo_facts(&FixtureGraphSource(g), Path::new("/nonexistent-dgrich03-fixture"), "FIXR", "abc123")
+                .expect("fixture facts should build")
+        }
+
+        fn valid_identity_json(kept: &[&str]) -> String {
+            let subsystems: Vec<Value> = kept
+                .iter()
+                .map(|name| json!({"name": name, "one_liner": format!("{name} does its part."), "role": "core"}))
+                .collect();
+            json!({
+                "tagline": "A hub combining alpha and beta behind one gateway.",
+                "what_is": "This repo brings alpha and beta together for the fleet.\n\nTogether they form one system.",
+                "audience": "Operators of this fixture repo.",
+                "subsystems": subsystems,
+                "feature_rows": [
+                    {"feature": "Alpha processing", "description": "Handles alpha work.", "subsystem": "alpha"},
+                    {"feature": "Beta processing", "description": "Handles beta work.", "subsystem": "beta"}
+                ],
+                "guide_topics": [
+                    {"title": "Run the fixture", "grounding": "crate::alpha::Hub::run"}
+                ]
+            })
+            .to_string()
+        }
+
+        /// Scripted `DocGenerator`: dispatches on prompt content to return
+        /// canned identity / subsystem-page / guides responses, standing in
+        /// for a real model across all three passes in one test.
+        struct ScriptedGenerator {
+            identity_response: String,
+            /// Subsystem names whose page response deliberately names an
+            /// invented (`::`-qualified, backticked) symbol -- exercises
+            /// the symbol-existence lint failure path.
+            bad_subsystems: HashSet<String>,
+            /// Optional per-subsystem canned good response override.
+            page_responses: HashMap<String, String>,
+            guides_response: String,
+        }
+
+        impl ScriptedGenerator {
+            fn new(identity_response: impl Into<String>, guides_response: impl Into<String>) -> Self {
+                Self {
+                    identity_response: identity_response.into(),
+                    bad_subsystems: HashSet::new(),
+                    page_responses: HashMap::new(),
+                    guides_response: guides_response.into(),
+                }
+            }
+
+            fn with_bad_subsystem(mut self, name: &str) -> Self {
+                self.bad_subsystems.insert(name.to_string());
+                self
+            }
+        }
+
+        #[async_trait]
+        impl DocGenerator for ScriptedGenerator {
+            async fn generate(&self, prompt: &str) -> Result<String, ToolError> {
+                if prompt.contains("Write a JSON object with EXACTLY these keys") {
+                    return Ok(self.identity_response.clone());
+                }
+                if prompt.contains("You are writing the operator guides") {
+                    return Ok(self.guides_response.clone());
+                }
+                const MARKER: &str = "reference page for the `";
+                if let Some(idx) = prompt.find(MARKER) {
+                    let rest = &prompt[idx + MARKER.len()..];
+                    if let Some(end) = rest.find('`') {
+                        let name = &rest[..end];
+                        if self.bad_subsystems.contains(name) {
+                            return Ok(format!(
+                                "# {name}\n\nSee `crate::{name}::PhantomThing::not_real` for details.\n"
+                            ));
+                        }
+                        if let Some(resp) = self.page_responses.get(name) {
+                            return Ok(resp.clone());
+                        }
+                        return Ok(format!(
+                            "# {name}\n\n## Key types and functions\n\
+`crate::{name}::Hub::run` is the entry point.\n\n\
+## How it connects\nCalled by its own leaves.\n\n\
+## Notes and gaps\nNothing else to cover here.\n"
+                        ));
+                    }
+                }
+                Ok(String::new())
+            }
+        }
+
+        const GOOD_GUIDES: &str = "\
+=== FILE: docs/getting-started.md ===
+Clone with `git clone <repo>` then build with `cargo build`.
+
+=== FILE: docs/guides/run-the-fixture.md ===
+# Run the fixture
+1. Build it with `cargo build`.
+2. Verify it worked.
+";
+
+        // A non-empty response that OMITS getting-started.md — must NOT count as
+        // a clean guides pass (codex review finding: empty getting_started slipped
+        // through as ok:true).
+        const GUIDES_MISSING_GETTING_STARTED: &str = "\
+=== FILE: docs/guides/run-the-fixture.md ===
+# Run the fixture
+1. Build it with `cargo build`.
+";
+
+        // ── full success ─────────────────────────────────────────────
+
+        #[tokio::test]
+        async fn full_success_populates_identity_pages_and_guides_with_empty_missing() {
+            let facts = fixture_facts();
+            let kept: Vec<&str> = facts.subsystems.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(kept.len(), 2, "fixture should keep exactly alpha + beta, no misc fold");
+
+            let generator = ScriptedGenerator::new(valid_identity_json(&kept), GOOD_GUIDES);
+            let outcome = generate_repo_docs(&generator, &facts, "FixtureRepo", "abc123").await;
+
+            assert!(outcome.missing.is_empty(), "missing: {:?}", outcome.missing);
+            let identity = outcome.identity.expect("identity should be present on full success");
+            assert_eq!(identity.subsystems.len(), 2);
+
+            assert_eq!(outcome.subsystem_pages.len(), 2);
+            let page_names: HashSet<&str> =
+                outcome.subsystem_pages.iter().map(|(name, _)| name.as_str()).collect();
+            assert!(page_names.contains("alpha"));
+            assert!(page_names.contains("beta"));
+
+            assert!(outcome.getting_started.contains("Clone with"));
+            assert_eq!(outcome.guides.len(), 1);
+            assert_eq!(outcome.guides[0].0, PathBuf::from("docs/guides/run-the-fixture.md"));
+
+            assert!(outcome.pass_ledger.iter().all(|r| r.ok), "every pass should be ok: {:?}", outcome.pass_ledger);
+        }
+
+        // ── identity fails twice -> Flagged, no panic ───────────────────
+
+        #[tokio::test]
+        async fn invalid_identity_twice_yields_flagged_outcome_naming_the_pass() {
+            let facts = fixture_facts();
+            // Never valid JSON, on either attempt.
+            let generator = ScriptedGenerator::new("not json at all", GOOD_GUIDES);
+
+            let outcome = generate_repo_docs(&generator, &facts, "FixtureRepo", "abc123").await;
+
+            assert!(outcome.identity.is_none());
+            assert!(outcome.missing.contains(&"identity".to_string()));
+            // Passes 2/3 skipped entirely, but still explicitly recorded --
+            // not silently dropped.
+            assert!(outcome.missing.iter().any(|m| m == "subsystem:alpha"));
+            assert!(outcome.missing.iter().any(|m| m == "subsystem:beta"));
+            assert!(outcome.missing.contains(&"guides".to_string()));
+            assert!(outcome.subsystem_pages.is_empty());
+            assert!(outcome.guides.is_empty());
+            assert!(outcome.getting_started.is_empty());
+
+            let identity_record = outcome.pass_ledger.iter().find(|r| r.pass == "identity").unwrap();
+            assert!(!identity_record.ok);
+            assert!(identity_record.detail.is_some());
+        }
+
+        // ── one subsystem page fails twice -> in `missing`, others present ──
+
+        #[tokio::test]
+        async fn one_bad_subsystem_page_lands_in_missing_others_still_returned() {
+            let facts = fixture_facts();
+            let kept: Vec<&str> = facts.subsystems.iter().map(|s| s.name.as_str()).collect();
+
+            let generator =
+                ScriptedGenerator::new(valid_identity_json(&kept), GOOD_GUIDES).with_bad_subsystem("beta");
+            let outcome = generate_repo_docs(&generator, &facts, "FixtureRepo", "abc123").await;
+
+            assert!(outcome.identity.is_some(), "identity pass itself must still succeed");
+            assert!(outcome.missing.contains(&"subsystem:beta".to_string()));
+            assert!(!outcome.missing.contains(&"subsystem:alpha".to_string()));
+
+            assert_eq!(outcome.subsystem_pages.len(), 1, "alpha's page must still be returned");
+            assert_eq!(outcome.subsystem_pages[0].0, "alpha");
+
+            // guides pass is independent of the subsystem-page pass and
+            // must still have succeeded.
+            assert!(!outcome.missing.contains(&"guides".to_string()));
+            assert!(!outcome.getting_started.is_empty());
+
+            let beta_record = outcome.pass_ledger.iter().find(|r| r.pass == "subsystem:beta").unwrap();
+            assert!(!beta_record.ok);
+            assert!(beta_record.detail.as_deref().unwrap_or_default().contains("PhantomThing"));
+        }
+
+        // ── guides missing getting-started -> flagged, partial still returned ──
+
+        #[tokio::test]
+        async fn guides_without_getting_started_are_flagged_but_partial_is_kept() {
+            let facts = fixture_facts();
+            let kept: Vec<&str> = facts.subsystems.iter().map(|s| s.name.as_str()).collect();
+
+            // Same incomplete response on both attempts (no getting-started.md).
+            let generator =
+                ScriptedGenerator::new(valid_identity_json(&kept), GUIDES_MISSING_GETTING_STARTED);
+            let outcome = generate_repo_docs(&generator, &facts, "FixtureRepo", "abc123").await;
+
+            // The gap is surfaced, not silently accepted as ok:true.
+            assert!(outcome.missing.contains(&"guides".to_string()));
+            assert!(outcome.getting_started.is_empty());
+            let guides_record = outcome.pass_ledger.iter().find(|r| r.pass == "guides").unwrap();
+            assert!(!guides_record.ok);
+            assert!(guides_record.detail.as_deref().unwrap_or_default().contains("getting-started.md"));
+
+            // ...but the real guide file we DID get is still returned (partial success).
+            assert_eq!(outcome.guides.len(), 1);
+            assert_eq!(outcome.guides[0].0, PathBuf::from("docs/guides/run-the-fixture.md"));
         }
     }
 }
