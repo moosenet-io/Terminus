@@ -1,6 +1,7 @@
 // SGUI-07: Start/Stop build + enrichment controls (Projects page)
 import { useState } from 'react';
 import { getAggregationClient } from '../lib/aggregationClient';
+import { RoleGate } from './RoleGate';
 
 interface Props {
   engineState: string;
@@ -49,7 +50,7 @@ export function BuildControls({ engineState, isEnriching = false, focusedProject
         </select>
       </div>
 
-      {/* Build row */}
+      {/* Build row — CONST-27: /command mutates, gated for a viewer session */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
         <span className="h-badge" style={{
           minWidth: 64, textAlign: 'center',
@@ -58,23 +59,27 @@ export function BuildControls({ engineState, isEnriching = false, focusedProject
         }}>
           {buildState}
         </span>
-        <button
-          className="h-btn h-btn-green"
-          disabled={busy || isBuilding || isEnriching || !selectedProject}
-          onClick={() => sendCommand(`build ${selectedProject}`, setBuildLoading)}
-        >
-          {buildLoading ? '…' : `▶ Build`}
-        </button>
-        <button
-          className="h-btn h-btn-red"
-          disabled={busy || !isBuilding}
-          onClick={() => sendCommand(':stop', setBuildLoading)}
-        >
-          {buildLoading ? '…' : '■ Stop'}
-        </button>
+        <RoleGate>
+          <button
+            className="h-btn h-btn-green"
+            disabled={busy || isBuilding || isEnriching || !selectedProject}
+            onClick={() => sendCommand(`build ${selectedProject}`, setBuildLoading)}
+          >
+            {buildLoading ? '…' : `▶ Build`}
+          </button>
+        </RoleGate>
+        <RoleGate>
+          <button
+            className="h-btn h-btn-red"
+            disabled={busy || !isBuilding}
+            onClick={() => sendCommand(':stop', setBuildLoading)}
+          >
+            {buildLoading ? '…' : '■ Stop'}
+          </button>
+        </RoleGate>
       </div>
 
-      {/* Enrich row */}
+      {/* Enrich row — CONST-27: /command mutates, gated for a viewer session */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
         <span className="h-badge" style={{
           minWidth: 64, textAlign: 'center',
@@ -83,21 +88,25 @@ export function BuildControls({ engineState, isEnriching = false, focusedProject
         }}>
           {isEnriching ? 'ENRICHING' : 'IDLE'}
         </span>
-        <button
-          className="h-btn h-btn-teal"
-          disabled={busy || isEnriching || isBuilding || !selectedProject}
-          onClick={() => sendCommand(`enrich ${selectedProject}`, setEnrichLoading)}
-          title="Enriches task descriptions using the current inference notch setting"
-        >
-          {enrichLoading ? '…' : `⚡ Enrich`}
-        </button>
-        <button
-          className="h-btn h-btn-red"
-          disabled={busy || !isEnriching}
-          onClick={() => sendCommand('stop-enrich', setEnrichLoading)}
-        >
-          {enrichLoading ? '…' : '■ Stop'}
-        </button>
+        <RoleGate>
+          <button
+            className="h-btn h-btn-teal"
+            disabled={busy || isEnriching || isBuilding || !selectedProject}
+            onClick={() => sendCommand(`enrich ${selectedProject}`, setEnrichLoading)}
+            title="Enriches task descriptions using the current inference notch setting"
+          >
+            {enrichLoading ? '…' : `⚡ Enrich`}
+          </button>
+        </RoleGate>
+        <RoleGate>
+          <button
+            className="h-btn h-btn-red"
+            disabled={busy || !isEnriching}
+            onClick={() => sendCommand('stop-enrich', setEnrichLoading)}
+          >
+            {enrichLoading ? '…' : '■ Stop'}
+          </button>
+        </RoleGate>
       </div>
     </div>
   );

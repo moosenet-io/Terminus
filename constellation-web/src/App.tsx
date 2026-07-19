@@ -10,6 +10,7 @@ import { ModuleRail } from './components/ModuleRail';
 import type { RailVariant } from './components/ModuleRail';
 import { Login } from './components/Login';
 import { useAuth } from './hooks/useAuth';
+import { AuthRoleProvider } from './hooks/AuthRoleContext';
 import { getAggregationClient } from './lib/aggregationClient';
 import type { HealthStatus } from './lib/aggregationClient';
 import { getAvailableModules, getAvailablePanels } from './lib/moduleRegistry';
@@ -285,7 +286,7 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
 }
 
 export default function App() {
-  const { authenticated, username, loading: authLoading, login, logout } = useAuth();
+  const { authenticated, username, role, loading: authLoading, login, logout } = useAuth();
 
   // While checking auth, show blank page (avoids flash of login screen)
   if (authLoading) {
@@ -298,7 +299,11 @@ export default function App() {
 
   return (
     <BrowserRouter basename="/">
-      <Shell username={username} onLogout={logout} />
+      {/* CONST-27: republish `role` via context so `RoleGate` — used deep inside panels the
+          router mounts with no props — can read it without prop-drilling. */}
+      <AuthRoleProvider role={role}>
+        <Shell username={username} onLogout={logout} />
+      </AuthRoleProvider>
     </BrowserRouter>
   );
 }
