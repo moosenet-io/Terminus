@@ -300,13 +300,18 @@ const MOCK_TERMINUS_CONFIG: TerminusConfigSummary = {
 // CONST-28: mock activity fixture, per the §8 contract shape. Real data lands with CONST-26's
 // endpoint — this is a canned fixture only, timestamps relative to "now" so it always reads
 // as recent in a live demo.
+// OLDEST-FIRST, matching the real endpoint's file-order contract (CONST-26): index 0 is the
+// oldest entry, the last element is the most recent — so `slice(-limit)` in the mock
+// `activity()` returns the most-recent TAIL exactly like the server does (review fix: the
+// previous newest-first generation inverted the shared contract for every consumer).
 const MOCK_ACTIVITY_ENTRIES: TerminusActivityEntry[] = Array.from({ length: 24 }, (_, i) => {
   const systems: SystemId[] = ['harmony', 'chord', 'lumina', 'terminus'];
   const methods = ['GET', 'POST', 'PUT'];
   const paths = ['/status', '/agents/activity', '/models', '/config', '/health', '/mode'];
   const principals = ['operator', 'mock-user', 'ci-bot'];
+  const age = 23 - i; // i=23 -> now (most recent, last); i=0 -> oldest
   return {
-    ts: new Date(Date.now() - i * 45_000).toISOString(),
+    ts: new Date(Date.now() - age * 45_000).toISOString(),
     method: methods[i % methods.length],
     path: paths[i % paths.length],
     principal: principals[i % principals.length],
