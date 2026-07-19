@@ -27,6 +27,7 @@ import { registerCommand } from '../lib/commandRegistry';
 import { getCurrentPath, requestHealthRefresh } from '../lib/shellBridge';
 import { TerminusPanel } from './terminus/TerminusPanel';
 import { LuminaStubPanel } from './lumina/LuminaStubPanel';
+import { OverviewPanel as LuminaOverviewPanel } from './lumina/OverviewPanel';
 import { EngineDiagramPanel } from './status/EngineDiagramPanel';
 import { DashboardPanel } from './harmony/DashboardPanel';
 import { ProjectsPanel } from './harmony/ProjectsPanel';
@@ -201,8 +202,22 @@ registerPanel({
 });
 
 // ── Lumina ───────────────────────────────────────────────────────────────────
-// Stub only — Lumina's own config surface is CONST-07's job, not this port.
 
+// LGUI-06: the module's actual landing panel (§2 of LUMINA-GUI-SPEC.md — `lumina.overview`,
+// route `/lumina`, min role viewer). Registered first so it's the module's first panel (the
+// one `ModuleRail`/`ModuleCard`'s "Open" link points at, per moduleRegistry's registration-
+// order convention — see getPanelsByModule).
+registerPanel({
+  id: 'lumina.overview',
+  system: 'lumina',
+  title: 'Overview',
+  path: '/lumina',
+  icon: '✦',
+  available: true,
+  component: LuminaOverviewPanel,
+});
+
+// Stub only — Lumina's own config surface is CONST-07's job, not this port.
 registerPanel({
   id: 'lumina.config',
   system: 'lumina',

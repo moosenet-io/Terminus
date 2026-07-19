@@ -357,6 +357,71 @@ const MOCK_MUSE_TASTE_CLUSTERS = {
   ],
 };
 
+// ── Mock data for the Lumina module (LGUI-01/02 backend, LGUI-06 builds its Overview
+// panel against these shapes -- verified §7 response sketches, LUMINA-GUI-SPEC.md) ──────────
+
+const MOCK_LUMINA_STATUS = {
+  version: '0.4.2',
+  uptime_secs: 3 * 24 * 3600 + 6 * 3600 + 12 * 60,
+  state: 'online',
+  display_name: 'Lumina',
+  onboarding_complete: true,
+  dynamic_prompt: true,
+  chord_configured: true,
+  channels: [
+    { name: 'matrix', state: 'connected', configured: true },
+    { name: 'imap', state: 'connected', configured: true },
+    { name: 'caldav', state: 'configured-off', configured: false },
+    { name: 'sms', state: 'misconfigured', configured: true },
+  ],
+};
+
+const MOCK_LUMINA_ENGRAM_STATS = {
+  total: 1842,
+  by_type: { Episodic: 1201, Semantic: 402, Preference: 187, Principle: 52 },
+  by_sensitivity: { none: 1490, Personal: 240, Health: 62, Finance: 50 },
+  db_bytes: 48_284_112,
+  embedded_pct: 97.4,
+  store_ok: true,
+  growth_30d: Array.from({ length: 30 }, (_, i) => ({
+    date: new Date(Date.now() - (29 - i) * 86_400_000).toISOString().slice(0, 10),
+    total: 1200 + Math.round(i * 21.4 + (i % 5) * 6),
+  })),
+};
+
+const MOCK_LUMINA_ANALYTICS_SUMMARY = {
+  top_tools: [
+    { name: 'searxng_search', count: 214 },
+    { name: 'engram_search', count: 176 },
+    { name: 'gitea_create_issue', count: 58 },
+    { name: 'calendar_list', count: 41 },
+    { name: 'weather', count: 22 },
+  ],
+  failure_rate: 0.021,
+  escalation_rate: 0.183,
+  avg_duration_ms: 842,
+  daily: Array.from({ length: 14 }, (_, i) => {
+    const turns = 30 + ((i * 7) % 20);
+    const deep = Math.round(turns * (0.15 + (i % 4) * 0.05));
+    return {
+      date: new Date(Date.now() - (13 - i) * 86_400_000).toISOString().slice(0, 10),
+      turns,
+      deep,
+      tool_calls: turns * 2 + (i % 3),
+    };
+  }),
+};
+
+const MOCK_LUMINA_ANALYTICS_EVENTS = {
+  events: [
+    { ts: new Date(Date.now() - 8 * 60_000).toISOString(), level: 'ok', text: 'tool searxng_search 412ms' },
+    { ts: new Date(Date.now() - 6 * 60_000).toISOString(), level: 'ok', text: 'chat turn completed model=deep 1834ms' },
+    { ts: new Date(Date.now() - 5 * 60_000).toISOString(), level: 'warn', text: 'escalation fast→deep threshold=0.72' },
+    { ts: new Date(Date.now() - 3 * 60_000).toISOString(), level: 'ok', text: 'tool engram_search 88ms results=6' },
+    { ts: new Date(Date.now() - 60_000).toISOString(), level: 'error', text: 'tool calendar_list upstream_error timeout' },
+  ],
+};
+
 /** GET-style mock lookups, keyed by "{system} {pathname}" (pathname without query string). */
 const MOCK_GET: Record<string, unknown> = {
   'harmony /status': MOCK_STATUS,
@@ -387,9 +452,21 @@ const MOCK_GET: Record<string, unknown> = {
   'muse /api/graph/watch-history': { series: [] },
   'muse /api/graph/group-dynamics': { rows: [] },
   'muse /guide': { entries: [] },
+  'lumina /status': MOCK_LUMINA_STATUS,
+  'lumina /engram/stats': MOCK_LUMINA_ENGRAM_STATS,
 };
 
-function mockGetFor(system: SystemId, pathname: string): unknown {
+/** `GET /api/lumina/analytics?view=summary|events&days=` (§7) — `view` picks the response
+ *  shape, so (unlike every other mock lookup) this needs the query string, not just the
+ *  pathname. `view=summary` (or omitted) returns the daily/top-tools/rate shape;
+ *  `view=events` returns the last-N log-line events (§3.1's activity feed). */
+function mockLuminaAnalytics(fullPath: string): unknown {
+  const query = fullPath.split('?')[1] ?? '';
+  const view = new URLSearchParams(query).get('view') ?? 'summary';
+  return view === 'events' ? MOCK_LUMINA_ANALYTICS_EVENTS : MOCK_LUMINA_ANALYTICS_SUMMARY;
+}
+
+function mockGetFor(system: SystemId, pathname: string, fullPath: string): unknown {
   const key = `${system} ${pathname}`;
   if (key in MOCK_GET) return MOCK_GET[key];
   if (system === 'harmony' && pathname.startsWith('/tree/')) {
@@ -397,6 +474,9 @@ function mockGetFor(system: SystemId, pathname: string): unknown {
   }
   if (system === 'muse' && pathname.startsWith('/api/channels/') && pathname.endsWith('/lineup')) {
     return { channel_id: pathname.split('/')[3], lineup: [] };
+  }
+  if (system === 'lumina' && pathname === '/analytics') {
+    return mockLuminaAnalytics(fullPath);
   }
   return null;
 }
@@ -434,7 +514,7 @@ function mockRequest<T>(system: SystemId, path: string, init?: RequestInit): Pro
   const method = (init?.method ?? 'GET').toUpperCase();
   const pathname = path.split('?')[0];
   const value = method === 'GET'
-    ? mockGetFor(system, pathname)
+    ? mockGetFor(system, pathname, path)
     : mockWriteFor(system, pathname);
   return delay(value as T);
 }
@@ -514,6 +594,11 @@ const mockAdapter: AggregationClient = {
 //            (binary passthrough -- see crate::constellation::proxy's module doc; this generic
 //            request<T>() path is JSON-typed, art responses should be fetched by <img src> URL,
 //            not through this method)
+//   lumina (LGUI-01/02 backend; LGUI-06 builds the Overview panel against these -- see
+//            src/types/lumina.ts for the exact shapes, mirroring LUMINA-GUI-SPEC.md §7):
+//            GET /status, GET /engram/stats, GET /analytics?view=summary|events&days=
+//            (view picks the response shape -- see mockLuminaAnalytics above, the mock's
+//            documentation of that contract)
 
 function baseUrl(): string {
   // Same-origin only — never a hardcoded host/port. This is the one place in the app
