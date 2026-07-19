@@ -14,9 +14,13 @@ interface DataTableProps<T> {
   rowKey: (row: T, index: number) => string;
   emptyMessage?: string;
   style?: React.CSSProperties;
+  /** CONST-22: optional row-click handler (e.g. `models.browse` -> `models.detail`). Rows
+   *  stay plain, non-interactive `<tr>`s when omitted — every existing caller keeps working
+   *  unchanged. */
+  onRowClick?: (row: T) => void;
 }
 
-export function DataTable<T>({ columns, rows, rowKey, emptyMessage = 'No data', style }: DataTableProps<T>) {
+export function DataTable<T>({ columns, rows, rowKey, emptyMessage = 'No data', style, onRowClick }: DataTableProps<T>) {
   if (rows.length === 0) {
     return (
       <div style={{ padding: 'var(--space-5)', textAlign: 'center', color: 'var(--text-muted)', fontSize: 'var(--fs-sm)' }}>
@@ -35,7 +39,11 @@ export function DataTable<T>({ columns, rows, rowKey, emptyMessage = 'No data', 
       </thead>
       <tbody>
         {rows.map((row, i) => (
-          <tr key={rowKey(row, i)}>
+          <tr
+            key={rowKey(row, i)}
+            onClick={onRowClick ? () => onRowClick(row) : undefined}
+            style={onRowClick ? { cursor: 'pointer' } : undefined}
+          >
             {columns.map(col => (
               <td key={col.key} style={{ textAlign: col.align ?? 'left', fontVariantNumeric: 'tabular-nums' }}>
                 {col.render(row)}

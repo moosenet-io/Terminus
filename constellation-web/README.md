@@ -216,6 +216,48 @@ Grid lines are **solid 1px hairlines** (`--chart-grid`/`--chart-axis`) — the d
 `strokeDasharray:'3 3'` pattern from harmony-web is retired everywhere (audit §1.4). Every
 chart ships a table-view twin (`TableViewToggle`) — this is both the WCAG relief channel for
 sub-3:1 fills and a hard rule (§4.4).
+## Model Library module (`models`, CONST-21 API + CONST-22 UI, spec §6)
+
+`src/panels/models/{BrowsePanel,DetailPanel,ComparePanel}.tsx` + `src/hooks/useModels.ts` +
+`src/types/models.ts`. A `terminus`-backed module (its `ModuleDescriptor.healthSystem` is
+`'terminus'` — there's no separate `/api/health` entry for it, same convention as the
+`terminus` module itself) reading `GET /api/terminus/models*` and
+`GET /api/terminus/mint/dimensions` (CONST-21, not yet merged as of this item — built against
+mock fixtures in `aggregationClient.ts` whose shapes mirror `src/types/models.ts` EXACTLY, so
+binding to the live API is a no-op).
+
+- **`models.browse`** (`/models`) — header stat row (fleet/brochure/serving-now counts +
+  `refreshed_at`, amber past 7 days, from `useModelsSummary()`), one filter row (scope,
+  search, category, brochure status, size bucket, coverage, serving-now), a `DataTable`
+  (table/card-grid toggle) with server-side `limit`/`offset` pagination via `useModelsList()`.
+  Row click routes to `models.detail`; a per-row checkbox (max 4) feeds the Compare button —
+  a 5th attempt shows a local toast (no shared `Toast` primitive exists yet — that's CONST-25/
+  26 scope — so this is a self-contained banner, not a new shared component).
+- **`models.detail`** (`/models/:name`, URL-encoded registry key) — four sections
+  (Identity/Provenance/Deployment/MINT profile), each degrading independently when its source
+  is `null` per §8 ("absent sources null") — e.g. a brochure-only candidate renders
+  Identity+Provenance and shows the standard degraded card for Deployment+MINT. The MINT
+  section's radar-vs-fleet-median thumbnail uses the new `src/viz/RadarChart.tsx` — CONST-17
+  shipped only the pinned `@nivo/radar` package + shared theme bridge, no wrapper component
+  yet (README's "viz kit" section above), so this item adds the first one, keeping "panels
+  never import nivo directly" true.
+- **`models.compare`** (`/models/compare?m=a&m=b…`, 2–4 models) — URL state ONLY, no
+  `client.prefs` entry. Side-by-side `DataTable` (best value per row subtly outline-ringed,
+  never color-alone), a radar overlay (≤4 series via `SlotAssigner`), and a Pareto scatter
+  (VRAM vs. best pass-rate) with the compared models emphasized and the rest of the fleet
+  rendered in `--chart-deemphasis`. `low_confidence`/`n<=1` MINT scores always render the ⚠
+  affordance + a variance tooltip, in both `models.detail` and `models.compare` — never
+  silently hidden.
+
+Two small additive changes landed alongside this module (both backward-compatible, every
+existing caller unaffected): `DataTable` gained an optional `onRowClick` prop, and
+`PanelDescriptor` gained an optional `hideInRail` flag — set on `models.detail`/`models.compare`
+since they're only reachable via a dynamic route/URL state, never a bare rail link (`:name`
+isn't a real path), and `ModuleRail` now filters them out of the nav list.
+
+`src/viz/recharts.ts`'s barrel also gained `ScatterChart`/`Scatter`/`ZAxis` (for the Pareto
+chart) — same "panels never import recharts directly" rule as every other chart in this app.
+
 ## Real-time relay (`/ws`, CONST-18)
 
 `GET /ws` (`src/constellation/ws.rs` on the Terminus side, not in this package) is a

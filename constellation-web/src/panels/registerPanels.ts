@@ -38,6 +38,9 @@ import { Inference } from '../pages/Inference';
 import { Providers } from '../pages/Providers';
 import { Playground } from '../pages/Playground';
 import { Analytics } from '../pages/Analytics';
+import { BrowsePanel } from './models/BrowsePanel';
+import { DetailPanel } from './models/DetailPanel';
+import { ComparePanel } from './models/ComparePanel';
 
 // ── Modules (CONST-16, §1.4 order: Overview · Harmony · Chord · Lumina · Muse · Models ·
 // MINT · Terminus — Overview has no descriptor, it's the always-available default route;
@@ -49,6 +52,11 @@ registerModule({ id: 'lumina', title: 'Lumina', icon: '✦', healthSystem: 'lumi
 // CONST-19: module registration only -- no panels yet (CONST-20 adds
 // muse.dashboard/muse.taste/muse.channels).
 registerModule({ id: 'muse', title: 'Muse', icon: '🎬', healthSystem: 'muse', order: 4 });
+// CONST-22: models is a terminus-backed module (no separate `/api/health` entry of its own —
+// it reads through the same terminus namespace CONST-21's read API lands in) — gate its
+// availability on the always-present `terminus` health entry, same convention the spec calls
+// out for `models`/`mint`/`terminus` itself (§1.3).
+registerModule({ id: 'models', title: 'Model Library', icon: '🧠', healthSystem: 'terminus', order: 5 });
 registerModule({ id: 'terminus', title: 'Terminus', icon: '⚙', healthSystem: 'terminus', order: 7 });
 
 // ── Harmony ──────────────────────────────────────────────────────────────────
@@ -184,6 +192,40 @@ registerPanel({
   icon: '▶',
   available: true,
   component: Playground,
+});
+
+// ── Model Library (CONST-21 API + CONST-22 UI, §6) ──────────────────────────
+
+registerPanel({
+  id: 'models.browse',
+  system: 'models',
+  title: 'Browse',
+  path: '/models',
+  icon: '🧠',
+  available: true,
+  component: BrowsePanel,
+});
+
+registerPanel({
+  id: 'models.detail',
+  system: 'models',
+  title: 'Model Detail',
+  path: '/models/:name',
+  icon: '🧠',
+  available: true,
+  component: DetailPanel,
+  hideInRail: true, // dynamic route -- reached via row click, never a bare rail link
+});
+
+registerPanel({
+  id: 'models.compare',
+  system: 'models',
+  title: 'Compare',
+  path: '/models/compare',
+  icon: '⇄',
+  available: true,
+  component: ComparePanel,
+  hideInRail: true, // reached via the Compare button + its own URL-state selection
 });
 
 // ── Terminus ─────────────────────────────────────────────────────────────────

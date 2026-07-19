@@ -105,6 +105,12 @@ export interface PanelDescriptor {
    */
   available: boolean;
   component: ComponentType;
+  /** CONST-22: true for panels reachable only via a dynamic/parameterized route (e.g.
+   *  `models.detail` at `/models/:name`, `models.compare` at `/models/compare`) — they still
+   *  need a registry entry so `App.tsx`'s `<Routes>` picks them up, but `ModuleRail` must NOT
+   *  render them as a plain nav link (there is no bare `:name` to link to). Default false/
+   *  absent — every other panel keeps rendering in the rail exactly as before. */
+  hideInRail?: boolean;
 }
 
 const registry = new Map<string, PanelDescriptor>();
