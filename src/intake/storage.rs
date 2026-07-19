@@ -2023,14 +2023,27 @@ pub async fn read_latest_operational_profile_for_model(
     pool: &PgPool,
     model_name: &str,
 ) -> Result<Option<OperationalProfileRow>, ToolError> {
-    let sql = "SELECT op.max_context_safe, op.max_context_absolute, op.quality_degradation_point, \
-               op.throughput_at_2k, op.throughput_at_8k, op.throughput_at_16k, op.throughput_at_32k, \
-               op.throughput_at_64k, op.recommended_timeout_chat_sec, op.recommended_timeout_build_sec, \
-               op.recommended_timeout_deep_sec, op.overall_tier \
-               FROM model_operational_profiles op \
-               JOIN model_profiles mp ON mp.id = op.profile_id \
-               WHERE mp.model_name = $1 \
-               ORDER BY COALESCE(mp.profile_date, mp.created_at) DESC LIMIT 1";
+    // Two-attempt ordering (review-cycle-2 fix): the primary attempt honors the
+    // contracts-to-confirm #1 `COALESCE(profile_date, created_at)` ordering, but
+    // `model_profiles.profile_date` exists on the LIVE schema and NOT in this
+    // checkout's own `CREATE TABLE` — on a schema without the column the primary
+    // attempt fails with a missing-column error, and the old behavior silently
+    // returned `Ok(None)`, DROPPING a real profile. Now a missing-column error
+    // triggers a retry ordered by `mp.created_at` alone; only a missing RELATION
+    // degrades to `None`.
+    let sql_for = |order_expr: &str| {
+        format!(
+            "SELECT op.max_context_safe, op.max_context_absolute, op.quality_degradation_point, \
+             op.throughput_at_2k, op.throughput_at_8k, op.throughput_at_16k, op.throughput_at_32k, \
+             op.throughput_at_64k, op.recommended_timeout_chat_sec, op.recommended_timeout_build_sec, \
+             op.recommended_timeout_deep_sec, op.overall_tier \
+             FROM model_operational_profiles op \
+             JOIN model_profiles mp ON mp.id = op.profile_id \
+             WHERE mp.model_name = $1 \
+             ORDER BY {order_expr} DESC LIMIT 1"
+        )
+    };
+    let sql = sql_for("COALESCE(mp.profile_date, mp.created_at)");
     type Row = (
         Option<i32>,
         Option<i32>,
@@ -2045,11 +2058,21 @@ pub async fn read_latest_operational_profile_for_model(
         Option<i32>,
         Option<String>,
     );
-    match sqlx::query_as::<_, Row>(sql)
+    let primary = sqlx::query_as::<_, Row>(&sql)
         .bind(model_name)
         .fetch_optional(pool)
-        .await
-    {
+        .await;
+    let attempt = match primary {
+        Err(e) if is_missing_column_error(&e.to_string()) => {
+            let fallback_sql = sql_for("mp.created_at");
+            sqlx::query_as::<_, Row>(&fallback_sql)
+                .bind(model_name)
+                .fetch_optional(pool)
+                .await
+        }
+        other => other,
+    };
+    match attempt {
         Ok(Some((
             max_context_safe,
             max_context_absolute,
@@ -2620,14 +2643,25 @@ pub async fn read_context_profiles(
     } else {
         "WHERE mp.model_name = ANY($1)"
     };
-    let sql = format!(
-        "SELECT mp.model_name, cr.context_tokens, cr.throughput_tok_per_sec, cr.ttft_ms, \
-         cr.recall_score, cr.memory_usage_mb, cr.oom, \
-         (SELECT op.max_context_safe FROM model_operational_profiles op \
-          WHERE op.profile_id = mp.id ORDER BY op.created_at DESC LIMIT 1) AS max_context_safe \
-         FROM context_profile_runs cr JOIN model_profiles mp ON mp.id = cr.profile_id {where_sql} \
-         ORDER BY mp.model_name, cr.context_tokens"
-    );
+    // The `max_context_safe` subselect resolves the model's LATEST operational
+    // profile BY MODEL NAME (review-cycle-2 fix — the old subselect scoped to the
+    // run's own `mp.id`, so a run joined to an older `model_profiles` row carried
+    // that older profile's value instead of the model's latest). Two-attempt
+    // ordering for the same missing-`profile_date` reason as
+    // [`read_latest_operational_profile_for_model`].
+    let sql_for = |order_expr: &str| {
+        format!(
+            "SELECT mp.model_name, cr.context_tokens, cr.throughput_tok_per_sec, cr.ttft_ms, \
+             cr.recall_score, cr.memory_usage_mb, cr.oom, \
+             (SELECT op.max_context_safe FROM model_operational_profiles op \
+              JOIN model_profiles mp2 ON mp2.id = op.profile_id \
+              WHERE mp2.model_name = mp.model_name \
+              ORDER BY {order_expr} DESC, op.created_at DESC LIMIT 1) AS max_context_safe \
+             FROM context_profile_runs cr JOIN model_profiles mp ON mp.id = cr.profile_id {where_sql} \
+             ORDER BY mp.model_name, cr.context_tokens"
+        )
+    };
+    let sql = sql_for("COALESCE(mp2.profile_date, mp2.created_at)");
     type Row = (
         String,
         i32,
@@ -2638,11 +2672,21 @@ pub async fn read_context_profiles(
         bool,
         Option<i32>,
     );
-    let mut query = sqlx::query_as::<_, Row>(&sql);
-    if !models.is_empty() {
-        query = query.bind(models.to_vec());
-    }
-    match query.fetch_all(pool).await {
+    let run = |sql: String, models: Vec<String>| async move {
+        let mut query = sqlx::query_as::<_, Row>(&sql);
+        if !models.is_empty() {
+            query = query.bind(models);
+        }
+        query.fetch_all(pool).await
+    };
+    let primary = run(sql, models.to_vec()).await;
+    let attempt = match primary {
+        Err(e) if is_missing_column_error(&e.to_string()) => {
+            run(sql_for("mp2.created_at"), models.to_vec()).await
+        }
+        other => other,
+    };
+    match attempt {
         Ok(rows) => Ok(rows
             .into_iter()
             .map(
