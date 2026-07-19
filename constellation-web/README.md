@@ -103,8 +103,8 @@ never reporting healthy; either way it silently doesn't render. No crash, no pla
 
 - **`GlobalBar`** (top, `src/components/GlobalBar.tsx`) is the module switcher — replaces the
   old single `Sidebar`. Renders the wordmark (`Wordmark.tsx`), one tab per available module
-  (health dot + degraded indicator), a `⌘/Ctrl+K` "go to panel" trigger, the density toggle,
-  and the account chip.
+  (health dot + degraded indicator), a `⌘/Ctrl+K` command palette trigger (see §4 below), the
+  density toggle, and the account chip.
 - **`ModuleRail`** (left, `src/components/ModuleRail.tsx`) renders the *active* module's
   panels (`getPanelsByModule`). Responsive: icon-only rail below 1100px width, a drawer
   overlay (triggered from `GlobalBar`'s hamburger) below 760px.
@@ -113,6 +113,62 @@ never reporting healthy; either way it silently doesn't render. No crash, no pla
   metric row, last-activity line, Open/Configure + Hide, an expandable body). Operators can
   drag-reorder, hide, and re-add cards ("+ Add widget"); a card focused with the keyboard
   reorders via `⌘/Ctrl+arrow`. Layout + density persist **only** via `client.prefs`.
+
+### 4. The command palette (`src/components/CommandPalette.tsx`, CONST-25, §3.2 of the spec)
+
+`⌘/Ctrl+K` anywhere in the shell opens the palette (`App.tsx`'s `Shell` owns the open state and
+the global keydown listener — not `GlobalBar`, so the shortcut works regardless of what has DOM
+focus). Zero new dependencies: its own subsequence fuzzy-matcher
+(`src/lib/commandMatch.ts`), its own `role="dialog"`/`listbox` markup, CSS tokens only.
+
+Three sources, always shown in this order, each degrading independently:
+
+1. **Navigation** — every panel in the same health-filtered set `App.tsx` routes (never the raw
+   registry), ranked by `src/lib/commandMatch.ts#fuzzyMatch` against the query.
+2. **Actions** — `src/lib/commandRegistry.ts#registerCommand()`, a sibling of `registerPanel`/
+   `registerModule` (same "register once, at import time" convention). Register a command
+   anywhere a panel is registered:
+
+   ```ts
+   registerCommand({
+     id: 'shell.refresh-health',       // must be globally unique — duplicates THROW at
+     title: 'Refresh health',          // registration time (not silently overwritten, unlike
+     subtitle: 'Re-poll /api/health',  // registerPanel/registerModule — see the file's doc
+     icon: '⟳',                        // comment for why)
+     minRole: 'viewer',                // default; 'operator' hides the command entirely for
+     run: () => requestHealthRefresh(),// a viewer session (not merely disabled)
+   });
+   ```
+
+   **Role-gating seam:** CONST-27 (`useAuthRole`/`RoleGate`) is not merged to `main` as of this
+   item — `useAuth()` has no `role` field yet. `App.tsx` passes `role={null}` into
+   `<CommandPalette>`, and `commandRegistry.ts#getAvailableCommands` resolves `null` to
+   `'operator'` (mirroring CONST-27's own "claim-absent token resolves to operator" backward-compat
+   rule), so nothing is hidden until the role plumbing actually lands. Once CONST-27 merges,
+   change that one `role={null}` to `role={useAuthRole()}` — no other code needs to change.
+
+3. **Entity search** — `src/lib/entitySearch.ts#searchEntities()`, debounced 150ms, fans the
+   query out (`Promise.allSettled`, never `Promise.all`) to a handful of cheap existing list
+   reads (sessions, agent activity, providers, models, terminus modules), grouped by source. A
+   dead/erroring backend shows one greyed-out "`<Group>` unavailable" row for its own group and
+   changes nothing else — it can never suppress navigation, actions, or another source's hits.
+
+**Keyboard contract:** `↑`/`↓` move the selection; `Tab`/`Shift+Tab` jump to the first row of
+the next/previous non-empty group; `Enter` runs the selected row; `Esc` closes. The text input
+keeps DOM focus for the palette's entire lifetime — the "selection" is virtual
+(`aria-activedescendant` into a `role="listbox"`/`role="option"` tree), which both implements
+the focus trap (nothing else on the page can steal focus while it's open) and keeps screen
+readers on the standard combobox-listbox pattern.
+
+**Adding an entity source:** add one entry to the `SOURCES` array in `entitySearch.ts` — a
+`group` label and a `load(client)` function that calls `client.request(...)` (or a typed
+aggregation-client method) and maps the response to `EntityHit[]`. It degrades automatically;
+no palette code changes.
+
+**Testing:** `src/lib/commandMatch.test.ts` is a small dependency-free assertion file
+(`runCommandMatchTests()`) covering the fuzzy matcher and `rankItems` — this repo has no JS test
+runner wired up yet (no vitest/jest in `package.json`), so it isn't invoked by any script today;
+wire it into `npm test` the moment one is added.
 
 ## Adding a panel
 
