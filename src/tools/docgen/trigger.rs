@@ -158,7 +158,7 @@ use crate::tool::RustTool;
 
 use super::config::{DocTargetType, ProjectDocConfig};
 use super::generate::{
-    generate_docs, generate_repo_docs, ChordDocGenerator, DocGenerator, GenerationOutcome, PassRecord,
+    generate_docs, generate_repo_docs, DocGenerator, FallbackDocGenerator, GenerationOutcome, PassRecord,
     SweptFeatContext,
 };
 use super::pii_gate::sweep_input;
@@ -990,7 +990,10 @@ or hosting surface; placing a returned artifact is the calling harness's job."
         let place = args.get("place").and_then(Value::as_bool).unwrap_or(false);
         let target_root = args.get("target_root").and_then(Value::as_str);
 
-        let generator = ChordDocGenerator::from_env();
+        // DGDG-01: falls back to a configured OpenRouter model when local
+        // Chord/GPU inference is jammed; behaves exactly like a bare
+        // `ChordDocGenerator::from_env()` when no fallback is configured.
+        let generator = FallbackDocGenerator::from_env();
         let outcome = run_docgen_trigger(
             &generator,
             &self.store,

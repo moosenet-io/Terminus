@@ -20,7 +20,7 @@
 pub mod merge_queue;
 pub mod types;
 
-pub use merge_queue::{MergeQueue, MergeQueueConfig, MergeQueueError};
+pub use merge_queue::{MergeQueue, MergeQueueConfig, MergeQueueError, MergeQueueSnapshot};
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -667,16 +667,56 @@ impl GiteaClient {
         style: &str,
         message: Option<&str>,
     ) -> Result<GiteaMergeOutcome, ToolError> {
+        let pr_info = self.fetch_pr(owner, repo, pr).await?;
+        let base = pr_info.base.ref_name.clone();
+        let head = pr_info.head.ref_name.clone();
+        self.merge_pull_with_base(owner, repo, pr, style, message, &base, &head).await
+    }
+
+    /// Fetch a pull request via `GET /repos/{owner}/{repo}/pulls/{pr}`, mapping
+    /// a `404` to a clear "PR not found" message.
+    ///
+    /// GMQ-04: factored out of [`GiteaClient::merge_pull`] so `MergePr::execute`
+    /// can fetch the PR ONCE when the merge queue is active — reusing that
+    /// single fetch both to derive the default queue key (`{owner}/{repo}/{base}`)
+    /// and, inside the queue's critical section, for GMQ-03's
+    /// [`crate::gitea::merge_queue::evaluate_merge_guard`] — rather than
+    /// fetching it a second time here via [`GiteaClient::merge_pull_with_base`].
+    pub(crate) async fn fetch_pr(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr: u64,
+    ) -> Result<GiteaPullRequest, ToolError> {
         let pr_endpoint = format!("/repos/{owner}/{repo}/pulls/{pr}");
-        let pr_info: GiteaPullRequest = self.get(&pr_endpoint).await.map_err(|e| match e {
+        self.get(&pr_endpoint).await.map_err(|e| match e {
             ToolError::NotFound(_) => {
                 ToolError::NotFound(format!("Pull request #{pr} not found in {owner}/{repo}"))
             }
             other => other,
-        })?;
-        let base = pr_info.base.ref_name.clone();
-        let head = pr_info.head.ref_name.clone();
+        })
+    }
 
+    /// POST the actual merge (`/repos/{owner}/{repo}/pulls/{pr}/merge`), given
+    /// an already-known `base`/`head` (the caller already fetched the PR —
+    /// see [`GiteaClient::fetch_pr`] — so this does NOT re-fetch it).
+    ///
+    /// GMQ-04: split out of [`GiteaClient::merge_pull`] so the merge-queue
+    /// path (`MergePr::execute`, inside `MergeQueue::with_merge_slot`) can
+    /// perform the POST using the single PR fetch it already did for the
+    /// queue key + stale-base guard, instead of triggering a second `GET`.
+    /// [`GiteaClient::merge_pull`] itself still fetches internally and calls
+    /// this — its own signature/behavior is unchanged for existing callers.
+    pub(crate) async fn merge_pull_with_base(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr: u64,
+        style: &str,
+        message: Option<&str>,
+        base: &str,
+        head: &str,
+    ) -> Result<GiteaMergeOutcome, ToolError> {
         let mut body = json!({ "Do": style });
         if let Some(msg) = message {
             body["MergeMessageField"] = json!(msg);
@@ -706,7 +746,7 @@ impl GiteaClient {
             return Err(ToolError::Http(format!("Merge failed: {status}: {body_text}")));
         }
 
-        Ok(GiteaMergeOutcome { merged: true, base, head })
+        Ok(GiteaMergeOutcome { merged: true, base: base.to_string(), head: head.to_string() })
     }
 
     // ── Accessors + generic transport for the forge adapter (GITX-02) ──────────
@@ -1646,7 +1686,11 @@ impl RustTool for MergePr {
     fn name(&self) -> &str { "gitea_merge_pr" }
 
     fn description(&self) -> &str {
-        "Merge a pull request in a Gitea repository."
+        "Merge a pull request in a Gitea repository. Merges to the same base branch are \
+         ordered (FIFO, priority-weighted) and spaced by a configurable minimum delay via a \
+         merge queue whenever Redis is configured (GITEA_MERGE_QUEUE_* env, see .env.example); \
+         a stale-base/non-mergeable PR is rejected instead of racing a merge. With no Redis \
+         configured, or `no_queue: true`, this behaves exactly as an unqueued single merge."
     }
 
     fn parameters(&self) -> Value {
@@ -1657,13 +1701,47 @@ impl RustTool for MergePr {
                 "pr":     { "type": "integer", "description": "Pull request number" },
                 "style":  { "type": "string", "description": "Merge style: merge | rebase | squash (default: merge)", "enum": ["merge", "rebase", "squash"] },
                 "message": { "type": "string", "description": "Merge commit message (optional)" },
-                "owner":  { "type": "string", "description": "Owner override (optional)" }
+                "owner":  { "type": "string", "description": "Owner override (optional)" },
+                "queue_key": { "type": "string", "description": "Override the default merge-queue key ({owner}/{repo}/{base}) — merges sharing a key are serialized/ordered together (optional)" },
+                "min_delay_secs": { "type": "integer", "description": "Override GITEA_MERGE_QUEUE_MIN_DELAY_SECS for this call: minimum seconds since the last merge to this queue key before this one proceeds (optional)" },
+                "priority": { "type": "integer", "description": "Merge-queue ordering priority; higher runs earlier among concurrent waiters for the same key, FIFO within equal priorities (default 0, optional)" },
+                "no_queue": { "type": "boolean", "description": "Bypass the merge queue entirely for this call (e.g. an emergency merge) — merges immediately, unordered and unspaced (optional)" }
             },
             "required": ["repo", "pr"]
         }))
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        // Degrade-open: `MergeQueue::from_env()` is `None` whenever Redis isn't
+        // configured (the same process-global singleton every other
+        // Redis-backed feature uses), and `no_queue: true` opts a single call
+        // out explicitly — both collapse to `None`, so `execute_with_queue`'s
+        // bypass branch is byte-identical to the pre-GMQ-04 code path in
+        // either case. Resolved here (rather than inside
+        // `execute_with_queue`) so tests can instead inject a `fake`-backed
+        // `MergeQueue` directly, without touching the real `from_env()`
+        // singleton or requiring a live Redis (see `mod tests`).
+        let no_queue = args["no_queue"].as_bool().unwrap_or(false);
+        let queue = if no_queue { None } else { MergeQueue::from_env() };
+        self.execute_with_queue(args, queue).await
+    }
+}
+
+impl MergePr {
+    /// The actual `gitea_merge_pr` logic, parameterized on an already-resolved
+    /// `queue` so tests can exercise the queue-ACTIVE branch with a `fake`
+    /// (`crate::gitea::merge_queue::fake`) in-memory `MergeQueue` — no live
+    /// Redis, no dependency on the process-global `MergeQueue::from_env()`
+    /// `OnceLock` (which would otherwise make queue-active tests racy/order-
+    /// dependent against every other test in this binary). The real
+    /// `RustTool::execute` above resolves `queue` via `from_env()` (or `None`
+    /// for `no_queue`/no-Redis) and delegates here — this is the ONLY merge
+    /// logic; there is no second, drifting implementation.
+    async fn execute_with_queue(
+        &self,
+        args: Value,
+        queue: Option<MergeQueue>,
+    ) -> Result<String, ToolError> {
         let client = self.client.resolve_identity(&args)?;
         let repo = args["repo"].as_str()
             .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
@@ -1673,12 +1751,108 @@ impl RustTool for MergePr {
         let message = args["message"].as_str();
         let owner = client.resolve_owner(args["owner"].as_str());
 
-        // GMQ-01: the POST + response handling now live in the single shared
+        // GMQ-04: additive, optional queue controls — no `required` change, so
+        // an existing caller passing only `{repo, pr}` is unaffected.
+        let queue_key_override = args["queue_key"].as_str();
+        let priority = args["priority"].as_i64().unwrap_or(0);
+        let min_delay_secs = args["min_delay_secs"]
+            .as_u64()
+            .unwrap_or_else(crate::config::gitea_merge_queue_min_delay_secs);
+
+        let cfg = MergeQueueConfig::from_env();
+        // `cfg.enabled` is the operator-controlled kill switch (GMQ-02):
+        // `GITEA_MERGE_QUEUE_ENABLED=false` degrades open even with Redis
+        // present, without having to unset `REDIS_URL` for every other
+        // Redis-backed feature on the host.
+        let active_queue = queue.as_ref().filter(|_| cfg.enabled);
+
+        // GMQ-01: the POST + response handling live in the single shared
         // `GiteaClient::merge_pull` path (next to `create_pull`), which also
         // fetches the PR's real base branch (the merge endpoint's own 200
         // response carries no body) — this is what the success string below
         // reports, fixing the pre-GMQ-01 bug where it echoed `style` instead.
-        let outcome = client.merge_pull(owner, repo, pr_num, style, message).await?;
+        let outcome = match active_queue {
+            None => client.merge_pull(owner, repo, pr_num, style, message).await?,
+            Some(queue) => {
+                // Fetch the PR to derive the default queue key
+                // (`{owner}/{repo}/{base}`) ONLY — the base branch NAME is
+                // stable across the wait, so this pre-slot snapshot is fine
+                // for keying. It must NOT be reused for the stale-base guard
+                // below: `mergeable`/`merged` can change while this merge
+                // waits its turn (another same-base merge can land during
+                // the queue wait or the GMQ-03 min-delay spacing), so the
+                // guard is evaluated against a FRESH fetch taken inside the
+                // critical section instead (see the re-fetch below).
+                let pr_info_for_key = client.fetch_pr(owner, repo, pr_num).await?;
+                let key = queue_key_override
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("{owner}/{repo}/{}", pr_info_for_key.base.ref_name));
+
+                let slot_result: Result<Result<GiteaMergeOutcome, ToolError>, MergeQueueError> =
+                    queue
+                        .with_merge_slot(&key, priority, &cfg, || async {
+                            // GMQ-03 min-delay spacing, evaluated inside the
+                            // critical section (a per-base property of the
+                            // merge sequence, not a stand-alone gate).
+                            if let Err(e) =
+                                queue.enforce_spacing(&key, min_delay_secs, cfg.max_wait_secs).await
+                            {
+                                return Err(ToolError::from(e));
+                            }
+
+                            // Re-fetch the PR HERE, now that the slot is held
+                            // and spacing has been enforced, so the stale-base
+                            // guard reflects ACQUIRE-TIME state rather than
+                            // the pre-wait snapshot taken before entering the
+                            // queue. Without this, a base that goes stale
+                            // DURING the wait would slip past the guard and
+                            // hit a raw 409 from Gitea's merge endpoint
+                            // instead of a clean `NotMergeable`.
+                            let fresh_pr = client.fetch_pr(owner, repo, pr_num).await?;
+
+                            match merge_queue::evaluate_merge_guard(&fresh_pr) {
+                                merge_queue::MergeGuardDecision::AlreadyMerged => {
+                                    // Idempotent: some earlier attempt (or
+                                    // another process) already merged this PR
+                                    // — report success, do NOT POST again.
+                                    Ok(GiteaMergeOutcome {
+                                        merged: true,
+                                        base: fresh_pr.base.ref_name.clone(),
+                                        head: fresh_pr.head.ref_name.clone(),
+                                    })
+                                }
+                                merge_queue::MergeGuardDecision::NotMergeable => {
+                                    Err(ToolError::from(MergeQueueError::NotMergeable))
+                                }
+                                merge_queue::MergeGuardDecision::Proceed => {
+                                    let outcome = client
+                                        .merge_pull_with_base(
+                                            owner,
+                                            repo,
+                                            pr_num,
+                                            style,
+                                            message,
+                                            &fresh_pr.base.ref_name,
+                                            &fresh_pr.head.ref_name,
+                                        )
+                                        .await?;
+                                    // Stamp the spacing marker AFTER a real
+                                    // merge, still inside the critical
+                                    // section, so the NEXT same-key merge's
+                                    // `enforce_spacing` measures from here.
+                                    queue.record_merge(&key, min_delay_secs).await;
+                                    Ok(outcome)
+                                }
+                            }
+                        })
+                        .await;
+
+                match slot_result {
+                    Ok(inner) => inner?,
+                    Err(e) => return Err(ToolError::from(e)),
+                }
+            }
+        };
 
         // S111E/MIRR-04: this is the single clean "a gated merge to internal
         // main just completed" call site the build pipeline's Stage 6 (merge)
@@ -1723,6 +1897,136 @@ impl RustTool for MergePr {
             "Pull request #{pr_num} merged into {base} in {owner}/{repo}.",
             base = outcome.base
         ))
+    }
+}
+
+// GMQ-05: gitea_merge_queue_status (read-only)
+pub struct MergeQueueStatus {
+    client: GiteaClient,
+}
+
+#[async_trait]
+impl RustTool for MergeQueueStatus {
+    fn name(&self) -> &str { "gitea_merge_queue_status" }
+
+    fn description(&self) -> &str {
+        "Read-only inspection of the merge queue (GMQ-01..05, see docs) for a base branch: \
+         the current lock holder + its remaining TTL, the wait-queue depth + next ticket, and \
+         the last-merge time + the next-allowed-merge time under the configured min-delay \
+         spacing rule. NEVER mutates the queue. If the merge queue is not active (no Redis \
+         configured, or GITEA_MERGE_QUEUE_ENABLED=false), reports that plainly instead of an \
+         error. An unknown/never-used key reports an empty queue (no lock, zero wait depth), \
+         not an error."
+    }
+
+    fn parameters(&self) -> Value {
+        with_identity_param(json!({
+            "type": "object",
+            "properties": {
+                "repo":  { "type": "string", "description": "Repository name" },
+                "base":  { "type": "string", "description": "Base branch (e.g. main) whose merge-queue key to inspect" },
+                "owner": { "type": "string", "description": "Owner override (optional)" },
+                "min_delay_secs": { "type": "integer", "description": "Override GITEA_MERGE_QUEUE_MIN_DELAY_SECS for computing next_allowed_merge_ms (optional)" }
+            },
+            "required": ["repo", "base"]
+        }))
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        Ok(self.run(args).await?.0)
+    }
+    async fn execute_structured(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let (text, structured) = self.run(args).await?;
+        Ok(ToolOutput { text, structured: Some(structured) })
+    }
+}
+
+impl MergeQueueStatus {
+    /// The actual `gitea_merge_queue_status` logic, parameterized on an
+    /// already-resolved `queue` so tests can exercise the queue-active branch
+    /// with a `fake` (`crate::gitea::merge_queue::fake`) in-memory
+    /// `MergeQueue` — no live Redis, no dependency on the process-global
+    /// `MergeQueue::from_env()` singleton. The real `RustTool::execute`/
+    /// `execute_structured` (via `run`) resolve `queue` via `from_env()`.
+    async fn run(&self, args: Value) -> Result<(String, Value), ToolError> {
+        self.run_with_queue(args, MergeQueue::from_env()).await
+    }
+
+    async fn run_with_queue(
+        &self,
+        args: Value,
+        queue: Option<MergeQueue>,
+    ) -> Result<(String, Value), ToolError> {
+        let client = self.client.resolve_identity(&args)?;
+        let repo = args["repo"].as_str()
+            .ok_or_else(|| ToolError::InvalidArgument("'repo' is required".to_string()))?;
+        let base = args["base"].as_str()
+            .ok_or_else(|| ToolError::InvalidArgument("'base' is required".to_string()))?;
+        let owner = client.resolve_owner(args["owner"].as_str());
+        let min_delay_secs = args["min_delay_secs"]
+            .as_u64()
+            .unwrap_or_else(crate::config::gitea_merge_queue_min_delay_secs);
+
+        let key = format!("{owner}/{repo}/{base}");
+
+        // Same "queue not active" collapse `MergePr` uses: no `MergeQueue` to
+        // query (Redis unconfigured) or the operator kill switch is off both
+        // mean there is nothing to report — a clear, non-error status, not a
+        // failure.
+        let cfg = MergeQueueConfig::from_env();
+        let active_queue = queue.filter(|_| cfg.enabled);
+
+        let Some(queue) = active_queue else {
+            let text = format!(
+                "Merge queue not active for {key} (no Redis configured, or the merge queue is \
+                 disabled) — merges to this base run unqueued."
+            );
+            let structured = json!({
+                "key": key,
+                "active": false,
+            });
+            return Ok((text, structured));
+        };
+
+        let snapshot = queue.status(&key, min_delay_secs).await?;
+
+        let mut text = format!("Merge queue status for {key}:\n");
+        if snapshot.locked {
+            text.push_str(&format!(
+                "  Lock: HELD (fence {}, {} ms remaining)\n",
+                snapshot.lock_fence.as_deref().unwrap_or("?"),
+                snapshot.lock_ttl_ms.unwrap_or(0),
+            ));
+        } else {
+            text.push_str("  Lock: free\n");
+        }
+        text.push_str(&format!(
+            "  Wait queue: {} waiting{}\n",
+            snapshot.wait_depth,
+            snapshot
+                .next_ticket
+                .map(|t| format!(" (next ticket: {t})"))
+                .unwrap_or_default(),
+        ));
+        match (snapshot.last_merge_ms, snapshot.next_allowed_merge_ms) {
+            (Some(last), Some(next_allowed)) => {
+                text.push_str(&format!(
+                    "  Last merge: {last} (epoch ms); next allowed merge: {next_allowed} (epoch \
+                     ms, min_delay_secs={})\n",
+                    snapshot.min_delay_secs,
+                ));
+            }
+            _ => {
+                text.push_str("  No prior merge recorded for this key — next merge may proceed immediately.\n");
+            }
+        }
+
+        let structured = json!({
+            "key": key,
+            "active": true,
+            "snapshot": snapshot,
+        });
+        Ok((text, structured))
     }
 }
 
@@ -2870,6 +3174,7 @@ pub fn register(registry: &mut ToolRegistry) {
             let _ = registry.register(Box::new(ListPrs { client: client.clone() }));
             let _ = registry.register(Box::new(CreatePr { client: client.clone() }));
             let _ = registry.register(Box::new(MergePr { client: client.clone() }));
+            let _ = registry.register(Box::new(MergeQueueStatus { client: client.clone() }));
             let _ = registry.register(Box::new(ListBranches { client: client.clone() }));
             let _ = registry.register(Box::new(CargoPublish { client: client.clone() }));
             let _ = registry.register(Box::new(CargoYank { client: client.clone() }));
@@ -2904,6 +3209,7 @@ pub fn register(registry: &mut ToolRegistry) {
             stub!("gitea_list_prs", "List Gitea pull requests (not configured)");
             stub!("gitea_create_pr", "Create Gitea pull request (not configured)");
             stub!("gitea_merge_pr", "Merge Gitea pull request (not configured)");
+            stub!("gitea_merge_queue_status", "Inspect the Gitea merge queue (not configured)");
             stub!("gitea_list_branches", "List Gitea branches (not configured)");
             stub!("gitea_cargo_publish", "Publish a .crate to the Gitea Cargo registry (not configured)");
             stub!("gitea_cargo_yank", "Yank/unyank a crate version in the Gitea Cargo registry (not configured)");
@@ -2940,6 +3246,12 @@ impl RustTool for NotConfiguredStub {
 mod tests {
     use super::*;
     use httpmock::prelude::*;
+    // GMQ-04: build a real `MergeQueue` over the in-memory fake so
+    // queue-active `gitea_merge_pr` behavior (ordering/spacing/stale-base
+    // guard) is exercised end-to-end with no live Redis, without touching
+    // the process-global `MergeQueue::from_env()` singleton other tests rely
+    // on resolving to `None` (see `merge_queue::fake`'s own doc comment).
+    use merge_queue::fake::{queue_over, InMemoryMergeLockStore};
 
     fn mock_client(server: &MockServer) -> GiteaClient {
         GiteaClient {
@@ -5194,5 +5506,373 @@ mod tests {
             "success string must report the real base branch ('main'), not the merge style"
         );
         assert!(!result.contains("squash"), "success string must not leak the merge style as the base: {result}");
+    }
+
+    // ── GMQ-04: queue wiring into `gitea_merge_pr` ──────────────────────────
+
+    /// `sample_pr_json` variant with an explicit `mergeable`/`merged` pair, for
+    /// exercising GMQ-03's stale-base guard (via GMQ-04's wiring) from a
+    /// `gitea_merge_pr` call.
+    fn sample_pr_json_guard(
+        pr: u64,
+        head: &str,
+        base: &str,
+        mergeable: Option<bool>,
+        merged: bool,
+    ) -> Value {
+        let mut body = sample_pr_json(pr, head, base);
+        body["mergeable"] = json!(mergeable);
+        body["merged"] = json!(merged);
+        body
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn merge_pr_no_queue_true_bypasses_even_the_real_execute_path() {
+        // `no_queue: true` must resolve `execute()`'s own `queue` to `None`
+        // regardless of Redis, so this hits the exact same single GET + single
+        // POST path as the pre-GMQ-04 tests above — proving the new param is
+        // wired to the bypass, not just a documented no-op.
+        let url_backup = std::env::var("GITEA_URL").ok();
+        std::env::remove_var("GITEA_URL");
+
+        let server = MockServer::start();
+        let get_mock = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/9");
+            then.status(200).json_body(sample_pr_json(9, "feature/z", "main"));
+        });
+        let merge_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/9/merge");
+            then.status(200);
+        });
+        let tool = MergePr { client: mock_client(&server) };
+        let result = tool
+            .execute(serde_json::json!({"repo": "myrepo", "pr": 9, "no_queue": true}))
+            .await;
+
+        if let Some(v) = url_backup { std::env::set_var("GITEA_URL", v); } else { std::env::remove_var("GITEA_URL"); }
+
+        get_mock.assert();
+        merge_mock.assert();
+        let result = result.expect("no_queue:true merge must succeed via the bypass path");
+        assert_eq!(result, "Pull request #9 merged into main in testorg/myrepo.");
+    }
+
+    #[tokio::test]
+    async fn merge_pr_queue_active_acquires_and_releases_the_slot_around_the_post() {
+        // Queue ACTIVE (a real fake-backed MergeQueue injected via
+        // `execute_with_queue`, bypassing `from_env()`'s process-global
+        // singleton entirely): a mergeable PR still merges via a single GET +
+        // single POST, and the per-base lock is free again once the call
+        // returns (the slot was acquired and released around the POST, not
+        // leaked).
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let queue = queue_over(Arc::clone(&store));
+
+        let server = MockServer::start();
+        let get_mock = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/11");
+            then.status(200).json_body(sample_pr_json(11, "feature/a", "main"));
+        });
+        let merge_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/11/merge");
+            then.status(200);
+        });
+        let tool = MergePr { client: mock_client(&server) };
+        let result = tool
+            .execute_with_queue(serde_json::json!({"repo": "myrepo", "pr": 11}), Some(queue))
+            .await;
+
+        // GMQ-04 refinement: 2 GETs — one pre-slot (to derive the queue key)
+        // and one re-fetched INSIDE the slot (acquire-time snapshot for the
+        // stale-base guard) — not 1.
+        get_mock.assert_hits(2);
+        merge_mock.assert();
+        let result = result.expect("queue-active merge of a mergeable PR must succeed");
+        assert_eq!(result, "Pull request #11 merged into main in testorg/myrepo.");
+        assert!(
+            !store.is_locked("testorg/myrepo/main"),
+            "the merge-queue slot must be released once the merge completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_pr_queue_active_not_mergeable_rejects_without_posting() {
+        // GMQ-03's stale-base guard, exercised through the GMQ-04 wiring: a
+        // PR Gitea reports as `mergeable: false` must be rejected with a clear
+        // error and MUST NOT reach the merge POST at all.
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let queue = queue_over(store);
+
+        let server = MockServer::start();
+        let get_mock = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/21");
+            then.status(200)
+                .json_body(sample_pr_json_guard(21, "feature/b", "main", Some(false), false));
+        });
+        let merge_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/21/merge");
+            then.status(200);
+        });
+        let tool = MergePr { client: mock_client(&server) };
+        let result = tool
+            .execute_with_queue(serde_json::json!({"repo": "myrepo", "pr": 21}), Some(queue))
+            .await;
+
+        // 2 GETs — pre-slot (key derivation) + in-slot (guard snapshot).
+        get_mock.assert_hits(2);
+        merge_mock.assert_hits(0);
+        let err = result.expect_err("a non-mergeable PR must not merge");
+        assert!(
+            matches!(err, ToolError::Conflict(_)),
+            "expected a Conflict error for a not-mergeable PR, got {err:?}"
+        );
+        assert!(
+            format!("{err}").to_lowercase().contains("not mergeable"),
+            "error must clearly state the PR is not mergeable: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_pr_queue_active_already_merged_is_idempotent_no_second_post() {
+        // GMQ-03's stale-base guard also covers the idempotent case: a PR
+        // Gitea already reports as `merged: true` (e.g. a retried call, or
+        // another process merged it first) must report success WITHOUT a
+        // second merge POST (which Gitea would reject anyway).
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let queue = queue_over(store);
+
+        let server = MockServer::start();
+        let get_mock = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/33");
+            then.status(200)
+                .json_body(sample_pr_json_guard(33, "feature/c", "main", Some(true), true));
+        });
+        let merge_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/33/merge");
+            then.status(200);
+        });
+        let tool = MergePr { client: mock_client(&server) };
+        let result = tool
+            .execute_with_queue(serde_json::json!({"repo": "myrepo", "pr": 33}), Some(queue))
+            .await;
+
+        // 2 GETs — pre-slot (key derivation) + in-slot (guard snapshot).
+        get_mock.assert_hits(2);
+        merge_mock.assert_hits(0);
+        let result = result.expect("an already-merged PR must be reported as an idempotent success");
+        assert_eq!(result, "Pull request #33 merged into main in testorg/myrepo.");
+    }
+
+    #[tokio::test]
+    async fn merge_pr_queue_key_override_is_used_instead_of_the_default() {
+        // An explicit `queue_key` groups this merge under a caller-chosen
+        // critical section instead of the default `{owner}/{repo}/{base}` —
+        // assert the lock actually lands under the override, not the default.
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let queue = queue_over(Arc::clone(&store));
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/44");
+            then.status(200).json_body(sample_pr_json(44, "feature/d", "main"));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/44/merge");
+            then.status(200);
+        });
+        let tool = MergePr { client: mock_client(&server) };
+        let result = tool
+            .execute_with_queue(
+                serde_json::json!({"repo": "myrepo", "pr": 44, "queue_key": "custom/shared-key"}),
+                Some(queue),
+            )
+            .await;
+
+        assert!(result.is_ok(), "merge with a queue_key override must still succeed: {result:?}");
+        assert!(
+            !store.is_locked("custom/shared-key"),
+            "the override key's slot must have been acquired and released"
+        );
+        assert!(
+            !store.is_locked("testorg/myrepo/main"),
+            "the default key must never have been touched when queue_key overrides it"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_pr_queue_active_guard_reflects_acquire_time_not_enqueue_time_snapshot() {
+        // The refinement under test: the stale-base guard must be evaluated
+        // against a FRESH, in-slot fetch — not the pre-slot snapshot taken
+        // before entering the queue. Simulate "the base went stale WHILE
+        // this merge waited its turn" by forcing a real GMQ-03 min-delay
+        // spacing wait (seeding a prior `record_merge`) and swapping the
+        // PR's `mergeable` state from `true` to `false` partway through that
+        // wait — before the in-slot re-fetch happens. If the guard reused
+        // the pre-wait (`mergeable: true`) snapshot, this merge would wrongly
+        // proceed to POST; the acquire-time re-fetch must catch it instead.
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let queue = queue_over(Arc::clone(&store));
+        let key = "testorg/myrepo/main";
+        // Seed "a merge just happened" so `enforce_spacing` (min_delay_secs:
+        // 2 below) actually blocks for ~2s, giving the test a window to swap
+        // the mock before the in-slot re-fetch runs.
+        queue.record_merge(key, 2).await;
+
+        let server = MockServer::start();
+        let mut mergeable_mock = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/55");
+            then.status(200)
+                .json_body(sample_pr_json_guard(55, "feature/e", "main", Some(true), false));
+        });
+        let merge_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/repos/testorg/myrepo/pulls/55/merge");
+            then.status(200);
+        });
+
+        let tool = MergePr { client: mock_client(&server) };
+        let handle = tokio::spawn(async move {
+            tool.execute_with_queue(
+                serde_json::json!({"repo": "myrepo", "pr": 55, "min_delay_secs": 2}),
+                Some(queue),
+            )
+            .await
+        });
+
+        // Give the pre-slot fetch + slot acquisition + spacing-wait entry
+        // time to run (all fast/near-instant), then flip the PR to "stale"
+        // while the merge task is still asleep inside `enforce_spacing`
+        // (~2s), well before its in-slot re-fetch fires.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        mergeable_mock.assert_hits(1);
+        mergeable_mock.delete();
+        let stale_mock = server.mock(|when, then| {
+            when.method(GET).path("/api/v1/repos/testorg/myrepo/pulls/55");
+            then.status(200)
+                .json_body(sample_pr_json_guard(55, "feature/e", "main", Some(false), false));
+        });
+
+        let result = handle.await.expect("merge task must not panic");
+
+        merge_mock.assert_hits(0);
+        stale_mock.assert_hits(1);
+        let err = result.expect_err("a base that went stale DURING the wait must be rejected");
+        assert!(
+            matches!(err, ToolError::Conflict(_)),
+            "expected a Conflict/NotMergeable error, got {err:?}"
+        );
+        assert!(
+            format!("{err}").to_lowercase().contains("not mergeable"),
+            "error must clearly state the PR is not mergeable: {err}"
+        );
+    }
+
+    // ── GMQ-05: gitea_merge_queue_status ────────────────────────────────
+
+    #[tokio::test]
+    async fn merge_queue_status_reports_not_active_when_queue_is_none() {
+        let server = MockServer::start();
+        let tool = MergeQueueStatus { client: mock_client(&server) };
+
+        let (text, structured) = tool
+            .run_with_queue(serde_json::json!({"repo": "myrepo", "base": "main"}), None)
+            .await
+            .expect("status must succeed even with no queue configured");
+
+        assert!(text.to_lowercase().contains("not active"));
+        assert_eq!(structured["active"], serde_json::json!(false));
+        assert_eq!(structured["key"], serde_json::json!("testorg/myrepo/main"));
+    }
+
+    #[tokio::test]
+    async fn merge_queue_status_reflects_a_held_lock() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let cfg = MergeQueueConfig {
+            enabled: true,
+            lock_ttl_secs: 60,
+            max_wait_secs: 5,
+            wait_ttl_secs: 65,
+        };
+
+        // Acquire the slot directly on the store (stands in for an in-flight
+        // merge holding it) so the status read observes a real held lock.
+        let held_queue = queue_over(Arc::clone(&store));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let s = Arc::clone(&started);
+        let holder = tokio::spawn(async move {
+            held_queue
+                .with_merge_slot("testorg/myrepo/main", 0, &cfg, || async move {
+                    s.notify_one();
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                })
+                .await
+        });
+        started.notified().await;
+
+        let server = MockServer::start();
+        let tool = MergeQueueStatus { client: mock_client(&server) };
+        let query_queue = queue_over(Arc::clone(&store));
+        let (text, structured) = tool
+            .run_with_queue(
+                serde_json::json!({"repo": "myrepo", "base": "main"}),
+                Some(query_queue),
+            )
+            .await
+            .expect("status read must succeed");
+
+        assert!(text.contains("HELD"), "text summary must report the held lock: {text}");
+        assert_eq!(structured["active"], serde_json::json!(true));
+        assert_eq!(structured["snapshot"]["locked"], serde_json::json!(true));
+        assert!(structured["snapshot"]["lock_fence"].is_string());
+        assert!(structured["snapshot"]["lock_ttl_ms"].as_i64().unwrap() > 0);
+
+        holder.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn merge_queue_status_reports_an_unknown_key_as_an_empty_queue_not_an_error() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let queue = queue_over(store);
+
+        let server = MockServer::start();
+        let tool = MergeQueueStatus { client: mock_client(&server) };
+        let (text, structured) = tool
+            .run_with_queue(
+                serde_json::json!({"repo": "myrepo", "base": "never-touched"}),
+                Some(queue),
+            )
+            .await
+            .expect("an unknown key must be a successful, empty status read");
+
+        assert!(text.contains("Lock: free"));
+        assert!(text.contains("0 waiting"));
+        assert_eq!(structured["snapshot"]["locked"], serde_json::json!(false));
+        assert_eq!(structured["snapshot"]["wait_depth"], serde_json::json!(0));
+        assert!(structured["snapshot"]["last_merge_ms"].is_null());
+    }
+
+    #[tokio::test]
+    async fn merge_queue_status_reports_next_allowed_merge_after_a_recorded_merge() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let queue = queue_over(Arc::clone(&store));
+        queue.record_merge("testorg/myrepo/main", 5).await;
+
+        let server = MockServer::start();
+        let tool = MergeQueueStatus { client: mock_client(&server) };
+        let (text, structured) = tool
+            .run_with_queue(
+                serde_json::json!({"repo": "myrepo", "base": "main", "min_delay_secs": 5}),
+                Some(queue),
+            )
+            .await
+            .expect("status read must succeed");
+
+        assert!(text.contains("Last merge:"));
+        assert!(text.contains("next allowed merge"));
+        let last = structured["snapshot"]["last_merge_ms"].as_i64().expect("last_merge_ms set");
+        let next_allowed = structured["snapshot"]["next_allowed_merge_ms"]
+            .as_i64()
+            .expect("next_allowed_merge_ms set");
+        assert_eq!(next_allowed, last + 5_000);
     }
 }

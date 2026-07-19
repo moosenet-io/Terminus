@@ -674,6 +674,41 @@ pub fn docgen_chord_model() -> String {
     env_nonempty("DOCGEN_CHORD_MODEL").unwrap_or_else(|| "auto".to_string())
 }
 
+// ── DGDG-01: cloud-provider fallback when local Chord/GPU inference is jammed ──
+// The exact failure that blocked the DGRICH rollout: `ChordDocGenerator` errors
+// (unreachable/timeout/OOM) with no way to recover for that generation. Rather
+// than a new secret/transport story, `crate::tools::docgen::generate::
+// OpenRouterDocGenerator` delegates to `crate::review::dispatch::ReviewConfig::
+// dispatch_openrouter` -- the SAME OpenRouter chat-completions client
+// `nemotron`/`qwen_coder`/`gpt56` already use (same URL resolution, same
+// `OPENROUTER_API_KEY` bearer-auth convention -- see that module's doc comment
+// for why a plain env read IS the vault read in this crate). This section only
+// resolves the ONE new, non-secret knob: which model tag the fallback sends.
+
+/// The OpenRouter model tag `FallbackDocGenerator`'s cloud fallback sends when
+/// local Chord/GPU doc-generation inference fails. From
+/// `DOCGEN_CLOUD_FALLBACK_MODEL`; `None` (unset or empty) disables the fallback
+/// entirely -- `FallbackDocGenerator::from_env` then wires ONLY the existing
+/// `ChordDocGenerator` path, byte-for-byte today's pre-DGDG-01 behavior. Never a
+/// literal model id: an operator picks whichever OpenRouter model they want
+/// doc-generation to fall back to.
+pub fn docgen_cloud_fallback_model() -> Option<String> {
+    env_nonempty("DOCGEN_CLOUD_FALLBACK_MODEL")
+}
+
+/// Fast-fail timeout (ms) for the LOCAL docgen primary when a cloud fallback is
+/// configured (DGDG-03). A jammed local inference backend should error quickly
+/// so `FallbackDocGenerator` reaches the cloud promptly rather than hanging for
+/// the full federation timeout. `DOCGEN_LOCAL_TIMEOUT_MS`, default 45_000 (45s);
+/// a non-positive/unparseable value falls back to the default. Only applied when
+/// a cloud fallback exists — with none, the primary keeps the full timeout.
+pub fn docgen_local_timeout_ms() -> u64 {
+    env_nonempty("DOCGEN_LOCAL_TIMEOUT_MS")
+        .and_then(|v| v.parse().ok())
+        .filter(|ms: &u64| *ms > 0)
+        .unwrap_or(45_000)
+}
+
 // ── TGW-03: inference proxy to Chord ──────────────────────────────────────
 // `terminus-primary` forwards `/v1/chat/completions`, `/v1/infer`,
 // `/v1/agent/execute`, and `/v1/coding/select` to the SAME co-located Chord
@@ -1363,6 +1398,23 @@ pub fn gitea_merge_queue_wait_ttl_secs() -> u64 {
     }
 }
 
+// ── GMQ-03: Gitea merge-queue min-delay spacing ─────────────────────────────
+//
+// `crate::gitea::merge_queue::MergeQueue::enforce_spacing` enforces a minimum
+// gap between successive merges to the same base branch (see
+// `docs/specs/S120-gitea-merge-queue.md`, GMQ-03) — lets `main` settle /
+// mirror+CI react before the next merge lands. `0` disables spacing entirely
+// (no artificial delay), matching the item's stated contract.
+
+/// Minimum seconds required between two merges to the same base key. From
+/// `GITEA_MERGE_QUEUE_MIN_DELAY_SECS`; defaults to 8. `0` means no spacing
+/// delay is enforced.
+pub fn gitea_merge_queue_min_delay_secs() -> u64 {
+    env_nonempty("GITEA_MERGE_QUEUE_MIN_DELAY_SECS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1462,6 +1514,26 @@ mod tests {
         std::env::remove_var("DOCGEN_CHORD_MODEL");
     }
 
+    // ── DGDG-01: cloud-provider fallback model ──────────────────────────
+
+    #[test]
+    #[serial]
+    fn docgen_cloud_fallback_model_disabled_when_unset() {
+        std::env::remove_var("DOCGEN_CLOUD_FALLBACK_MODEL");
+        assert_eq!(docgen_cloud_fallback_model(), None);
+        std::env::set_var("DOCGEN_CLOUD_FALLBACK_MODEL", "  ");
+        assert_eq!(docgen_cloud_fallback_model(), None, "whitespace-only must also disable");
+        std::env::remove_var("DOCGEN_CLOUD_FALLBACK_MODEL");
+    }
+
+    #[test]
+    #[serial]
+    fn docgen_cloud_fallback_model_honors_override() {
+        std::env::set_var("DOCGEN_CLOUD_FALLBACK_MODEL", "qwen/qwen3-coder:free");
+        assert_eq!(docgen_cloud_fallback_model().as_deref(), Some("qwen/qwen3-coder:free"));
+        std::env::remove_var("DOCGEN_CLOUD_FALLBACK_MODEL");
+    }
+
     #[test]
     #[serial]
     fn chord_personal_federation_timeout_ms_defaults_and_overrides() {
@@ -1474,6 +1546,21 @@ mod tests {
         std::env::set_var("TERMINUS_PRIMARY_CHORD_FEDERATION_TIMEOUT_MS", "0");
         assert_eq!(chord_personal_federation_timeout_ms(), 30_000);
         std::env::remove_var("TERMINUS_PRIMARY_CHORD_FEDERATION_TIMEOUT_MS");
+    }
+
+    #[test]
+    #[serial]
+    fn docgen_local_timeout_ms_defaults_and_overrides() {
+        std::env::remove_var("DOCGEN_LOCAL_TIMEOUT_MS");
+        assert_eq!(docgen_local_timeout_ms(), 45_000);
+        std::env::set_var("DOCGEN_LOCAL_TIMEOUT_MS", "20000");
+        assert_eq!(docgen_local_timeout_ms(), 20_000);
+        // Non-positive / unparseable -> default (never a zero-duration primary).
+        std::env::set_var("DOCGEN_LOCAL_TIMEOUT_MS", "0");
+        assert_eq!(docgen_local_timeout_ms(), 45_000);
+        std::env::set_var("DOCGEN_LOCAL_TIMEOUT_MS", "nonsense");
+        assert_eq!(docgen_local_timeout_ms(), 45_000);
+        std::env::remove_var("DOCGEN_LOCAL_TIMEOUT_MS");
     }
 
     // ── TGW-03: inference-proxy config ──────────────────────────────────
