@@ -3,6 +3,7 @@
 // Uses POST /api/engine/stop and /api/engine/restart from VLLM-06.
 import { useState, useCallback } from 'react';
 import { getAggregationClient } from '../lib/aggregationClient';
+import { RoleGate } from './RoleGate';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -163,46 +164,51 @@ export function EngineControls({ engineState, activeWorkers = 0 }: EngineControl
           )}
         </div>
 
-        {/* Right: context-sensitive buttons */}
+        {/* Right: context-sensitive buttons — CONST-27: all mutate (/engine/stop,restart),
+            so all gated for a viewer session (cosmetic; the server enforces this for real). */}
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           {(derivedState === 'executing') && (
-            <>
-              <button
-                className="h-btn"
-                style={{ background: 'var(--status-warning)', color: '#fff', fontSize: 12, padding: '4px 10px' }}
-                onClick={() => setModal('graceful-stop')}
-                disabled={loading}
-              >
-                Graceful Stop
-              </button>
+            <RoleGate>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <button
+                  className="h-btn"
+                  style={{ background: 'var(--status-warning)', color: '#fff', fontSize: 12, padding: '4px 10px' }}
+                  onClick={() => setModal('graceful-stop')}
+                  disabled={loading}
+                >
+                  Graceful Stop
+                </button>
+                <button
+                  className="h-btn"
+                  style={{ background: 'var(--status-error)', color: '#fff', fontSize: 12, padding: '4px 10px' }}
+                  onClick={() => setModal('hard-stop')}
+                  disabled={loading}
+                >
+                  Hard Stop
+                </button>
+                <button
+                  className="h-btn h-btn-ghost"
+                  style={{ fontSize: 12, padding: '4px 10px' }}
+                  onClick={() => setModal('restart')}
+                  disabled={loading}
+                  title="Restart engine"
+                >
+                  ↺ Restart
+                </button>
+              </div>
+            </RoleGate>
+          )}
+          {derivedState === 'stopping' && (
+            <RoleGate>
               <button
                 className="h-btn"
                 style={{ background: 'var(--status-error)', color: '#fff', fontSize: 12, padding: '4px 10px' }}
-                onClick={() => setModal('hard-stop')}
+                onClick={handleHardStop}
                 disabled={loading}
               >
-                Hard Stop
+                Force Stop Now
               </button>
-              <button
-                className="h-btn h-btn-ghost"
-                style={{ fontSize: 12, padding: '4px 10px' }}
-                onClick={() => setModal('restart')}
-                disabled={loading}
-                title="Restart engine"
-              >
-                ↺ Restart
-              </button>
-            </>
-          )}
-          {derivedState === 'stopping' && (
-            <button
-              className="h-btn"
-              style={{ background: 'var(--status-error)', color: '#fff', fontSize: 12, padding: '4px 10px' }}
-              onClick={handleHardStop}
-              disabled={loading}
-            >
-              Force Stop Now
-            </button>
+            </RoleGate>
           )}
           {(derivedState === 'stopped' || derivedState === 'idle') && (
             <span style={{ color: 'var(--text-secondary)', fontSize: 12 }}>

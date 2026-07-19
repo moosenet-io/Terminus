@@ -150,6 +150,19 @@ pub struct EnrollmentClaims {
     pub exp: i64,
     /// Standard JWT issued-at (Unix seconds).
     pub iat: i64,
+    /// CONST-27: optional role claim, used only by
+    /// `crate::constellation::auth`'s session tokens (`"operator"` /
+    /// `"viewer"`) — enrollment JWTs never set this (`mint_jwt`/
+    /// `mint_jwt_with_ttl` both go through [`mint_jwt_with_role`] with
+    /// `role: None`). `#[serde(default)]` means a token encoded before this
+    /// field existed (or any non-CONST-27 caller) still decodes fine with
+    /// `role: None`; `skip_serializing_if` keeps such tokens byte-for-byte
+    /// unchanged rather than growing a `"role":null` field. A verified
+    /// session token with this claim absent is treated as `operator` by
+    /// `crate::constellation::auth::Role::from_claim` — backward
+    /// compatibility for sessions minted just before this field shipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 /// Errors from an enrollment attempt. Every variant's `Display` is safe to
@@ -420,7 +433,26 @@ fn mint_jwt(identity: &str) -> Result<(String, i64), EnrollError> {
 /// (`crate::config::constellation_session_ttl_seconds`) rather than the
 /// enrollment JWT TTL — same signing key, same claim shape
 /// ([`EnrollmentClaims`]), different TTL policy owned by the caller.
+///
+/// Thin wrapper over [`mint_jwt_with_role`] with `role: None` — every
+/// existing caller (TCLI-02 enrollment, and CONST-03 sessions minted before
+/// CONST-27) keeps minting a claim-less token exactly as before.
 pub fn mint_jwt_with_ttl(sub: &str, ttl_seconds: i64) -> Result<(String, i64), EnrollError> {
+    mint_jwt_with_role(sub, ttl_seconds, None)
+}
+
+/// Same as [`mint_jwt_with_ttl`], additionally embedding an optional `role`
+/// claim (CONST-27, `crate::constellation::auth`'s viewer-role session
+/// tokens — `Some("operator")`/`Some("viewer")`). `None` omits the claim
+/// from the encoded token entirely (`EnrollmentClaims::role`'s
+/// `skip_serializing_if`), so a `None` caller's token is byte-for-byte
+/// identical to what [`mint_jwt_with_ttl`] produced before this function
+/// existed.
+pub fn mint_jwt_with_role(
+    sub: &str,
+    ttl_seconds: i64,
+    role: Option<&str>,
+) -> Result<(String, i64), EnrollError> {
     let signing_key = env_nonempty("TERMINUS_JWT_SIGNING_KEY")
         .ok_or_else(|| EnrollError::JwtSigning("TERMINUS_JWT_SIGNING_KEY is unset".to_string()))?;
 
@@ -434,6 +466,7 @@ pub fn mint_jwt_with_ttl(sub: &str, ttl_seconds: i64) -> Result<(String, i64), E
         sub: sub.to_string(),
         exp,
         iat: now,
+        role: role.map(str::to_string),
     };
 
     let jwt = encode(

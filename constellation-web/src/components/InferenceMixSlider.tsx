@@ -2,6 +2,7 @@
 import { useState, useCallback, useEffect } from 'react';
 import { getAggregationClient } from '../lib/aggregationClient';
 import { PRESETS } from '../types/presets';
+import { RoleGate } from './RoleGate';
 
 type CompressionLevel = 'off' | 'light' | 'moderate';
 
@@ -60,22 +61,25 @@ export function InferenceMixSlider({ initialValue = 1 }: Props) {
           <span style={{ fontWeight: 600, fontSize: 'var(--text-md)' }}>Inference Routing</span>
           <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6 }}>
             <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-secondary)' }}>Limited (GPU only)</span>
-            <button
-              onClick={handleLimitedToggle}
-              disabled={saving}
-              style={{
-                width: 36, height: 20, borderRadius: 10, border: 'none', cursor: 'pointer',
-                background: limited ? 'var(--h-amber)' : 'var(--h-bg-hover)',
-                position: 'relative', transition: 'background 0.2s',
-              }}
-              title={limited ? 'Limited mode active — GPU only' : 'Enable limited mode (GPU only)'}
-            >
-              <span style={{
-                position: 'absolute', top: 2, width: 16, height: 16, borderRadius: '50%',
-                background: 'white', transition: 'left 0.2s',
-                left: limited ? 18 : 2,
-              }} />
-            </button>
+            {/* CONST-27: POST /commands/inference-mix mutates, gated for a viewer session. */}
+            <RoleGate>
+              <button
+                onClick={handleLimitedToggle}
+                disabled={saving}
+                style={{
+                  width: 36, height: 20, borderRadius: 10, border: 'none', cursor: 'pointer',
+                  background: limited ? 'var(--h-amber)' : 'var(--h-bg-hover)',
+                  position: 'relative', transition: 'background 0.2s',
+                }}
+                title={limited ? 'Limited mode active — GPU only' : 'Enable limited mode (GPU only)'}
+              >
+                <span style={{
+                  position: 'absolute', top: 2, width: 16, height: 16, borderRadius: '50%',
+                  background: 'white', transition: 'left 0.2s',
+                  left: limited ? 18 : 2,
+                }} />
+              </button>
+            </RoleGate>
           </div>
         </div>
 
@@ -93,8 +97,10 @@ export function InferenceMixSlider({ initialValue = 1 }: Props) {
       </div>
 
       <div className="h-card-body">
-        {/* Notch track — SPOL-09: refined with token sizing/transitions */}
+        {/* Notch track — SPOL-09: refined with token sizing/transitions. CONST-27: each notch
+            click POSTs /commands/inference-mix, so the whole track is gated as one group. */}
         <div style={{ position: 'relative', padding: 'var(--space-2) 0 var(--space-1)' }}>
+          <RoleGate display="block">
           <div style={{
             position: 'relative', height: 4, borderRadius: 'var(--radius-sm)',
             background: 'var(--border-subtle)', marginBottom: 'var(--space-6)',
@@ -137,6 +143,7 @@ export function InferenceMixSlider({ initialValue = 1 }: Props) {
               );
             })}
           </div>
+          </RoleGate>
 
           {/* Endpoint labels */}
           <div style={{
@@ -176,36 +183,39 @@ export function InferenceMixSlider({ initialValue = 1 }: Props) {
           }}>
             Context Compression
           </div>
-          <div style={{ display: 'flex', gap: 'var(--space-1)', borderRadius: 'var(--radius-md)', overflow: 'hidden', border: '1px solid var(--border-subtle)' }}>
-            {(['off', 'light', 'moderate'] as CompressionLevel[]).map(level => (
-              <button
-                key={level}
-                onClick={() => {
-                  setCompression(level);
-                  getAggregationClient().request('harmony', '/commands/compression-level', {
-                    method: 'POST',
-                    body: JSON.stringify({ level }),
-                  }).catch(() => {});
-                }}
-                style={{
-                  flex: 1,
-                  padding: 'var(--space-1) 0',
-                  fontSize: 'var(--text-xs)',
-                  fontWeight: compression === level ? 500 : 400,
-                  border: 'none',
-                  borderRight: level !== 'moderate' ? '1px solid var(--border-subtle)' : 'none',
-                  borderRadius: 0,
-                  background: compression === level ? 'var(--accent-primary-subtle)' : 'transparent',
-                  color: compression === level ? 'var(--accent-primary)' : 'var(--text-secondary)',
-                  cursor: 'pointer',
-                  transition: `background var(--transition-fast), color var(--transition-fast)`,
-                  textTransform: 'capitalize',
-                }}
-              >
-                {level}
-              </button>
-            ))}
-          </div>
+          {/* CONST-27: POST /commands/compression-level mutates, gated as one group. */}
+          <RoleGate display="block">
+            <div style={{ display: 'flex', gap: 'var(--space-1)', borderRadius: 'var(--radius-md)', overflow: 'hidden', border: '1px solid var(--border-subtle)' }}>
+              {(['off', 'light', 'moderate'] as CompressionLevel[]).map(level => (
+                <button
+                  key={level}
+                  onClick={() => {
+                    setCompression(level);
+                    getAggregationClient().request('harmony', '/commands/compression-level', {
+                      method: 'POST',
+                      body: JSON.stringify({ level }),
+                    }).catch(() => {});
+                  }}
+                  style={{
+                    flex: 1,
+                    padding: 'var(--space-1) 0',
+                    fontSize: 'var(--text-xs)',
+                    fontWeight: compression === level ? 500 : 400,
+                    border: 'none',
+                    borderRight: level !== 'moderate' ? '1px solid var(--border-subtle)' : 'none',
+                    borderRadius: 0,
+                    background: compression === level ? 'var(--accent-primary-subtle)' : 'transparent',
+                    color: compression === level ? 'var(--accent-primary)' : 'var(--text-secondary)',
+                    cursor: 'pointer',
+                    transition: `background var(--transition-fast), color var(--transition-fast)`,
+                    textTransform: 'capitalize',
+                  }}
+                >
+                  {level}
+                </button>
+              ))}
+            </div>
+          </RoleGate>
         </div>
 
         {saving && (

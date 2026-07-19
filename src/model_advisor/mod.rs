@@ -84,7 +84,6 @@ pub struct QuantInfo {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MatrixEntry {
     #[serde(default)]
-    #[allow(dead_code)]
     pub family: String,
     #[serde(default)]
     pub quants: HashMap<String, QuantInfo>,
@@ -94,10 +93,25 @@ pub struct MatrixEntry {
     pub best_for: Vec<String>,
     #[serde(default)]
     pub ollama_name: Option<String>,
+    // CONST-21 additions (Model Library identity section, spec §6.1/§8): these
+    // fields were always present in `data/model_matrix.yaml` (see its header
+    // comment) but never deserialized because nothing read them until now.
+    // Purely additive `#[serde(default)]` fields — every existing caller of
+    // this struct/`load_matrix()` is unaffected.
+    #[serde(default)]
+    pub params_b: Option<f64>,
+    #[serde(default)]
+    pub active_b: Option<f64>,
+    #[serde(default)]
+    pub architecture: Option<String>,
+    #[serde(default)]
+    pub avoid_for: Vec<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
 }
 
 type PresetMap = HashMap<String, ModelPreset>;
-type MatrixMap = HashMap<String, MatrixEntry>;
+pub(crate) type MatrixMap = HashMap<String, MatrixEntry>;
 
 /// Load presets: from `MODEL_PRESETS_PATH` if set (empty map on read/parse
 /// failure), otherwise the bundled default.
@@ -113,7 +127,12 @@ fn load_presets() -> PresetMap {
 
 /// Load the model matrix: from `MODEL_MATRIX_PATH` if set (empty map on
 /// read/parse failure), otherwise the bundled default.
-fn load_matrix() -> MatrixMap {
+///
+/// `pub(crate)` (CONST-21): the Constellation Model Library identity section
+/// (`src/constellation/models_api.rs`) reads the SAME bundled/overridden
+/// matrix this module's own tools already use — no second YAML load path, no
+/// duplicated env-var handling.
+pub(crate) fn load_matrix() -> MatrixMap {
     match env::var("MODEL_MATRIX_PATH").ok().filter(|s| !s.is_empty()) {
         Some(path) => std::fs::read_to_string(&path)
             .ok()
