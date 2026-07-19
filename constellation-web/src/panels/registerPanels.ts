@@ -44,21 +44,19 @@ import { Providers } from '../pages/Providers';
 import { Playground } from '../pages/Playground';
 import { Analytics } from '../pages/Analytics';
 
-// ── Modules (CONST-16, §1.4 order: Overview · Harmony · Chord · Lumina · Muse · Models ·
-// MINT · Terminus — Overview has no descriptor, it's the always-available default route;
-// order 4/5/6 are reserved for muse/models/mint when their own items register them) ────────
+// ── Modules (order per LUMINA-GUI-SPEC §2: Overview · Harmony · Chord · Muse · Lumina ·
+// Models · MINT · Terminus — Overview has no descriptor, it's the always-available default
+// route. LGUI-05 review decision: the spec's "lumina orders after Muse" IS the directive
+// (CONST-GUI-SPEC §1.4's earlier listing predates the Lumina spec superseding §5.3), so
+// muse takes CONST-16's old lumina slot and lumina follows it.) ──────────────────────────
 
 registerModule({ id: 'harmony', title: 'Harmony', icon: '⌂', healthSystem: 'harmony', order: 1 });
 registerModule({ id: 'chord', title: 'Chord', icon: '⚡', healthSystem: 'chord', order: 2 });
-// LGUI-05: module registration only -- no panels yet (LGUI-06 adds lumina.overview first).
-// Order left at 3 (CONST-16's original placement, before Muse) -- LUMINA-GUI-SPEC.md §2's
-// header note ("order after Muse") describes that spec's own panel-IA table, not a directive
-// to renumber CONST-16's already-established, health-flap-stable global-bar order; flagged
-// for the reviewer rather than silently reordered.
-registerModule({ id: 'lumina', title: 'Lumina', icon: '✦', healthSystem: 'lumina', order: 3 });
-// CONST-19: module registration only -- no panels yet (CONST-20 adds
-// muse.dashboard/muse.taste/muse.channels).
-registerModule({ id: 'muse', title: 'Muse', icon: '🎬', healthSystem: 'muse', order: 4 });
+// CONST-19: muse module (panels land with CONST-20).
+registerModule({ id: 'muse', title: 'Muse', icon: '🎬', healthSystem: 'muse', order: 3 });
+// LGUI-05: lumina module registration only -- no panels yet (LGUI-06 adds lumina.overview
+// first). Ordered AFTER Muse per LUMINA-GUI-SPEC §2.
+registerModule({ id: 'lumina', title: 'Lumina', icon: '✦', healthSystem: 'lumina', order: 4 });
 registerModule({ id: 'terminus', title: 'Terminus', icon: '⚙', healthSystem: 'terminus', order: 7 });
 
 // ── Harmony ──────────────────────────────────────────────────────────────────
