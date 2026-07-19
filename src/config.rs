@@ -1355,6 +1355,23 @@ pub fn gitea_merge_queue_wait_ttl_secs() -> u64 {
     }
 }
 
+// ── GMQ-03: Gitea merge-queue min-delay spacing ─────────────────────────────
+//
+// `crate::gitea::merge_queue::MergeQueue::enforce_spacing` enforces a minimum
+// gap between successive merges to the same base branch (see
+// `docs/specs/S120-gitea-merge-queue.md`, GMQ-03) — lets `main` settle /
+// mirror+CI react before the next merge lands. `0` disables spacing entirely
+// (no artificial delay), matching the item's stated contract.
+
+/// Minimum seconds required between two merges to the same base key. From
+/// `GITEA_MERGE_QUEUE_MIN_DELAY_SECS`; defaults to 8. `0` means no spacing
+/// delay is enforced.
+pub fn gitea_merge_queue_min_delay_secs() -> u64 {
+    env_nonempty("GITEA_MERGE_QUEUE_MIN_DELAY_SECS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

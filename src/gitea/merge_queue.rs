@@ -119,8 +119,16 @@ impl MergeQueueConfig {
 pub enum MergeQueueError {
     /// `max_wait_secs` elapsed before this waiter reached the front of the
     /// queue AND found the lock free. Callers should surface a clear
-    /// "queue busy, retry" rather than hanging.
+    /// "queue busy, retry" rather than hanging. Also returned by
+    /// [`MergeQueue::enforce_spacing`] when the min-delay remainder would
+    /// exceed `max_wait_secs` (GMQ-03) — the caller should never sleep past
+    /// that ceiling either.
     Busy,
+    /// GMQ-03 stale-base guard: the PR is not currently mergeable (a stale
+    /// base or a real conflict) — do NOT merge. Callers should surface this
+    /// as "rebase current base and retry", never race a merge attempt
+    /// against Gitea's own `mergeable: Some(false)`.
+    NotMergeable,
 }
 
 impl std::fmt::Display for MergeQueueError {
@@ -129,11 +137,72 @@ impl std::fmt::Display for MergeQueueError {
             MergeQueueError::Busy => {
                 write!(f, "merge queue busy: timed out waiting for the merge slot, retry")
             }
+            MergeQueueError::NotMergeable => {
+                write!(
+                    f,
+                    "pull request not mergeable (stale base or conflict) — rebase current base and retry"
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for MergeQueueError {}
+
+/// GMQ-03 stale-base guard: the decision [`evaluate_merge_guard`] returns for
+/// an already-fetched [`GiteaPullRequest`] — evaluated INSIDE the merge
+/// queue's critical section, immediately before the merge POST, so a caller
+/// (GMQ-04's `MergePr::execute`) never races a merge against a base that has
+/// moved since the PR was opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeGuardDecision {
+    /// Safe to merge: either `mergeable == Some(true)`, or `mergeable ==
+    /// None` (Gitea is still computing it — see the variant's own doc for
+    /// why that is treated as Proceed, not blocked).
+    Proceed,
+    /// The PR is already merged (`merged == true`). Idempotent success: the
+    /// caller should report the merge as already done, NOT attempt another
+    /// merge POST (Gitea would 405/409 on an already-merged PR).
+    AlreadyMerged,
+    /// `mergeable == Some(false)` — Gitea has determined this PR cannot be
+    /// merged right now (stale base or a real conflict). The caller MUST NOT
+    /// POST a merge; surface [`MergeQueueError::NotMergeable`] instead.
+    NotMergeable,
+}
+
+/// GMQ-03 stale-base guard: decide whether an already-fetched PR is safe to
+/// merge right now. Pure/synchronous — the caller is responsible for the
+/// `GiteaClient::get` fetch itself (inside the critical section, so the read
+/// is current); this function only interprets the result.
+///
+/// Rules (checked in this order):
+/// 1. `merged == true` ⇒ [`MergeGuardDecision::AlreadyMerged`] — idempotent,
+///    not an error: some earlier attempt (or another process) already merged
+///    this PR, so there's nothing left to do.
+/// 2. `mergeable == Some(false)` ⇒ [`MergeGuardDecision::NotMergeable`] — a
+///    real, Gitea-confirmed reason the merge cannot proceed (stale base,
+///    unresolved conflict). Do NOT merge; the caller should return a clear
+///    "rebase current base and retry" error.
+/// 3. `mergeable == None` (Gitea has not finished computing mergeability
+///    yet — a known Gitea async-compute quirk) ⇒
+///    [`MergeGuardDecision::Proceed`]. This is deliberately NOT treated as
+///    "unknown, block" — the per-base [`MergeQueue`] critical section has
+///    already serialized every other merge to this base, so the fetched PR
+///    reflects the current, uncontested state of `base`; there is no
+///    concurrent merge that could still land underneath this one while we
+///    hold the slot. Blocking here would only punish every merge whose PR
+///    happens to have an unset `mergeable` at fetch time, for no safety gain.
+/// 4. Otherwise (`mergeable == Some(true)`) ⇒
+///    [`MergeGuardDecision::Proceed`].
+pub fn evaluate_merge_guard(pr: &crate::gitea::types::GiteaPullRequest) -> MergeGuardDecision {
+    if pr.merged {
+        return MergeGuardDecision::AlreadyMerged;
+    }
+    match pr.mergeable {
+        Some(false) => MergeGuardDecision::NotMergeable,
+        Some(true) | None => MergeGuardDecision::Proceed,
+    }
+}
 
 /// Outcome of one acquire attempt.
 enum AcquireAttempt {
@@ -182,6 +251,18 @@ trait MergeLockStore: Send + Sync {
     /// Best-effort / idempotent — a mismatch or an already-free lock is a
     /// safe no-op.
     async fn release(&self, key: &str, fence: &str) -> Result<(), ()>;
+
+    /// GMQ-03 spacing: the epoch-ms timestamp of the last successful merge to
+    /// `key`, or `None` if `key` has never recorded one. Used by
+    /// [`MergeQueue::enforce_spacing`] to compute how long (if at all) the
+    /// next merge to the same base must wait.
+    async fn last_merge_ms(&self, key: &str) -> Result<Option<i64>, ()>;
+
+    /// GMQ-03 spacing: stamp `key`'s last-merge time as `now_ms` (called by
+    /// [`MergeQueue::record_merge`] after a successful merge), so the NEXT
+    /// same-key merge's [`MergeQueue::enforce_spacing`] call measures the gap
+    /// from this point.
+    async fn record_merge_ms(&self, key: &str, now_ms: i64) -> Result<(), ()>;
 }
 
 /// Redis-backed [`MergeLockStore`]. Keys live under `Namespace::Queue`:
@@ -211,6 +292,12 @@ fn lock_key(key: &str) -> String {
 /// enqueue behind it.
 fn deadline_key(key: &str) -> String {
     Namespace::Queue.key(&format!("merge:deadline:{key}"))
+}
+/// GMQ-03 spacing: `queue:merge:last:{key}` holds the epoch-ms timestamp of
+/// the last successful merge to `key` — a plain `GET`/`SET`, not a ZSET (only
+/// ever one value per key).
+fn last_key(key: &str) -> String {
+    Namespace::Queue.key(&format!("merge:last:{key}"))
 }
 
 /// Current epoch time in milliseconds, for the deadline ZSET's score.
@@ -388,6 +475,36 @@ impl MergeLockStore for RedisMergeLockStore {
             .await?;
         Ok(())
     }
+
+    async fn last_merge_ms(&self, key: &str) -> Result<Option<i64>, ()> {
+        let lastk = last_key(key);
+        let val: Option<i64> = self
+            .backend
+            .with_conn(Namespace::Queue, |mut conn| async move {
+                ::redis::cmd("GET").arg(&lastk).query_async::<_, Option<i64>>(&mut conn).await
+            })
+            .await?;
+        Ok(val)
+    }
+
+    async fn record_merge_ms(&self, key: &str, now_ms: i64) -> Result<(), ()> {
+        let lastk = last_key(key);
+        // A generous TTL (24h) so the key self-cleans if this base is never
+        // merged to again, rather than accumulating forever.
+        let _: () = self
+            .backend
+            .with_conn(Namespace::Queue, |mut conn| async move {
+                ::redis::cmd("SET")
+                    .arg(&lastk)
+                    .arg(now_ms)
+                    .arg("EX")
+                    .arg(86_400_i64)
+                    .query_async::<_, ()>(&mut conn)
+                    .await
+            })
+            .await?;
+        Ok(())
+    }
 }
 
 /// Best-effort "log once" guard so a Redis outage during `with_merge_slot`
@@ -537,6 +654,73 @@ impl MergeQueue {
             backoff_ms = (backoff_ms * 2).min(POLL_MAX_MS);
         }
     }
+
+    /// GMQ-03 spacing: block (bounded) until at least `min_delay_secs` have
+    /// elapsed since the last recorded merge to `key` ([`Self::record_merge`]),
+    /// then return. Must be called AFTER acquiring the `key` critical section
+    /// (i.e. from inside the closure passed to [`Self::with_merge_slot`]) —
+    /// spacing is a per-base property of the merge sequence, not a
+    /// stand-alone gate a caller could correctly enforce outside the lock.
+    ///
+    /// - `min_delay_secs == 0` ⇒ returns immediately, no Redis round-trip at
+    ///   all — the explicit "spacing disabled" fast path.
+    /// - No prior recorded merge for `key` ⇒ returns immediately (nothing to
+    ///   space against).
+    /// - The store being unreachable degrades open (logs once, proceeds
+    ///   immediately) — same posture as the rest of the queue (availability
+    ///   over strictness for a short merge).
+    /// - If the remaining wait would exceed `max_wait_secs`, returns
+    ///   [`MergeQueueError::Busy`] rather than sleeping past the caller's own
+    ///   ceiling (the edge case the spec calls out explicitly).
+    pub async fn enforce_spacing(
+        &self,
+        key: &str,
+        min_delay_secs: u64,
+        max_wait_secs: u64,
+    ) -> Result<(), MergeQueueError> {
+        if min_delay_secs == 0 {
+            return Ok(());
+        }
+        let last_ms = match self.store.last_merge_ms(key).await {
+            Ok(v) => v,
+            Err(()) => {
+                log_degrade_once("spacing lookup failed (Redis unreachable)");
+                return Ok(());
+            }
+        };
+        let Some(last_ms) = last_ms else {
+            // Never merged before under this key — nothing to space against.
+            return Ok(());
+        };
+
+        let now = now_ms();
+        let min_delay_ms = (min_delay_secs as i64).saturating_mul(1000);
+        let elapsed_ms = now.saturating_sub(last_ms).max(0);
+        if elapsed_ms >= min_delay_ms {
+            return Ok(());
+        }
+        let remainder_ms = (min_delay_ms - elapsed_ms) as u64;
+        let max_wait_ms = max_wait_secs.saturating_mul(1000);
+        if remainder_ms > max_wait_ms {
+            return Err(MergeQueueError::Busy);
+        }
+        tokio::time::sleep(Duration::from_millis(remainder_ms)).await;
+        Ok(())
+    }
+
+    /// GMQ-03 spacing: stamp `key`'s last-merge time as "now" — call this
+    /// AFTER a successful merge (still inside the critical section) so the
+    /// NEXT same-key merge's [`Self::enforce_spacing`] call measures the gap
+    /// from this point. Best-effort: a store failure here only means the
+    /// NEXT merge's spacing check degrades open (treats it as "never merged
+    /// before"), which is the same safe direction every other degrade-open
+    /// path in this module takes — it never blocks a merge that already
+    /// succeeded.
+    pub async fn record_merge(&self, key: &str) {
+        if self.store.record_merge_ms(key, now_ms()).await.is_err() {
+            log_degrade_once("recording last-merge time failed (Redis unreachable)");
+        }
+    }
 }
 
 /// PANIC/early-unwind backstop only: the normal (non-panic) path in
@@ -596,6 +780,9 @@ mod tests {
         wait: HashMap<String, Vec<(u64, f64, StdInstant)>>,
         /// key -> (fence, expires_at)
         lock: HashMap<String, (String, StdInstant)>,
+        /// key -> last-merge epoch-ms (GMQ-03 spacing), mirroring
+        /// `queue:merge:last:{key}`.
+        last: HashMap<String, i64>,
         /// When true, every op behaves as an unreachable backend.
         down: bool,
     }
@@ -732,6 +919,23 @@ mod tests {
                     s.lock.remove(key);
                 }
             }
+            Ok(())
+        }
+
+        async fn last_merge_ms(&self, key: &str) -> Result<Option<i64>, ()> {
+            let s = self.state.lock().unwrap();
+            if s.down {
+                return Err(());
+            }
+            Ok(s.last.get(key).copied())
+        }
+
+        async fn record_merge_ms(&self, key: &str, now_ms: i64) -> Result<(), ()> {
+            let mut s = self.state.lock().unwrap();
+            if s.down {
+                return Err(());
+            }
+            s.last.insert(key.to_string(), now_ms);
             Ok(())
         }
     }
@@ -1183,6 +1387,12 @@ mod tests {
             }
             self.inner.release(key, fence).await
         }
+        async fn last_merge_ms(&self, key: &str) -> Result<Option<i64>, ()> {
+            self.inner.last_merge_ms(key).await
+        }
+        async fn record_merge_ms(&self, key: &str, now_ms: i64) -> Result<(), ()> {
+            self.inner.record_merge_ms(key, now_ms).await
+        }
     }
 
     #[tokio::test]
@@ -1236,5 +1446,134 @@ mod tests {
             2,
             "expected the stuck normal-path release call plus exactly one Drop-fallback release call"
         );
+    }
+
+    // ── GMQ-03: min-delay spacing ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn same_key_merges_are_spaced_at_least_min_delay_apart() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let q = queue_over(Arc::clone(&store));
+
+        // First merge: nothing recorded yet, so spacing must not wait at all.
+        let began = StdInstant::now();
+        q.enforce_spacing("owner/repo/main", 5, 300).await.unwrap();
+        assert!(
+            began.elapsed() < Duration::from_millis(50),
+            "the first merge to a key must never wait on spacing (nothing recorded yet)"
+        );
+        q.record_merge("owner/repo/main").await;
+
+        // Second merge to the SAME key, immediately after: must wait roughly
+        // the configured min_delay (use a small delay so the test stays fast
+        // — the mechanism is what's under test, not the exact magnitude).
+        let began2 = StdInstant::now();
+        q.enforce_spacing("owner/repo/main", 1, 300).await.unwrap();
+        let waited = began2.elapsed();
+        assert!(
+            waited >= Duration::from_millis(900),
+            "a second same-key merge must wait close to the full min_delay_secs, waited {waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn min_delay_zero_never_waits() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let q = queue_over(Arc::clone(&store));
+
+        q.record_merge("owner/repo/main").await;
+
+        let began = StdInstant::now();
+        q.enforce_spacing("owner/repo/main", 0, 300).await.unwrap();
+        assert!(
+            began.elapsed() < Duration::from_millis(20),
+            "min_delay_secs == 0 must disable spacing entirely, no artificial delay"
+        );
+    }
+
+    #[tokio::test]
+    async fn spacing_wait_exceeding_max_wait_returns_busy_instead_of_sleeping() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let q = queue_over(Arc::clone(&store));
+
+        // Record a merge "now"; a subsequent enforce_spacing with a large
+        // min_delay but a tiny max_wait ceiling must return Busy immediately
+        // rather than sleeping past that ceiling.
+        q.record_merge("owner/repo/main").await;
+        let began = StdInstant::now();
+        let result = q.enforce_spacing("owner/repo/main", 600, 1).await;
+        assert_eq!(result, Err(MergeQueueError::Busy));
+        assert!(
+            began.elapsed() < Duration::from_millis(50),
+            "a spacing wait that would exceed max_wait_secs must return Busy immediately, not sleep"
+        );
+    }
+
+    #[tokio::test]
+    async fn spacing_degrades_open_when_store_is_unreachable() {
+        let store = Arc::new(InMemoryMergeLockStore::new());
+        let q = queue_over(Arc::clone(&store));
+        store.set_down(true);
+
+        let began = StdInstant::now();
+        let result = q.enforce_spacing("owner/repo/main", 30, 300).await;
+        assert_eq!(result, Ok(()));
+        assert!(
+            began.elapsed() < Duration::from_millis(50),
+            "an unreachable store must degrade open (proceed immediately), not block on spacing"
+        );
+    }
+
+    // ── GMQ-03: stale-base mergeability guard ───────────────────────────
+
+    fn pr_fixture(merged: bool, mergeable: Option<bool>) -> crate::gitea::types::GiteaPullRequest {
+        serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "number": 42,
+            "state": "open",
+            "title": "test pr",
+            "body": null,
+            "html_url": "https://gitea.example/owner/repo/pulls/42",
+            "user": {"login": "agent", "full_name": null},
+            "head": {"label": "agent:feature", "ref": "feature", "sha": "abc123", "repo": null},
+            "base": {"label": "owner:main", "ref": "main", "sha": "def456", "repo": null},
+            "mergeable": mergeable,
+            "merged": merged,
+            "created_at": "2026-07-18T00:00:00Z",
+            "updated_at": "2026-07-18T00:00:00Z",
+        }))
+        .expect("valid GiteaPullRequest fixture")
+    }
+
+    #[test]
+    fn not_mergeable_pr_is_rejected() {
+        let pr = pr_fixture(false, Some(false));
+        assert_eq!(evaluate_merge_guard(&pr), MergeGuardDecision::NotMergeable);
+    }
+
+    #[test]
+    fn already_merged_pr_is_idempotent() {
+        let pr = pr_fixture(true, Some(true));
+        assert_eq!(evaluate_merge_guard(&pr), MergeGuardDecision::AlreadyMerged);
+    }
+
+    #[test]
+    fn merged_takes_priority_over_mergeable_field() {
+        // Even if `mergeable` happens to read false on an already-merged PR
+        // (a real Gitea quirk once `merged` flips), `merged` wins.
+        let pr = pr_fixture(true, Some(false));
+        assert_eq!(evaluate_merge_guard(&pr), MergeGuardDecision::AlreadyMerged);
+    }
+
+    #[test]
+    fn unknown_mergeability_proceeds() {
+        let pr = pr_fixture(false, None);
+        assert_eq!(evaluate_merge_guard(&pr), MergeGuardDecision::Proceed);
+    }
+
+    #[test]
+    fn mergeable_true_proceeds() {
+        let pr = pr_fixture(false, Some(true));
+        assert_eq!(evaluate_merge_guard(&pr), MergeGuardDecision::Proceed);
     }
 }
