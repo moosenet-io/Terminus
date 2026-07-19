@@ -1,9 +1,13 @@
 // CONST-16: the two-tier shell's top bar (§3.1). Replaces Sidebar as the module switcher —
 // module tabs (from `getAvailableModules(health)`, in `order`) carry a health dot; plus the
 // wordmark, a ⌘K search/palette trigger, the density toggle, and the account chip.
-import { useEffect, useState } from 'react';
+//
+// CONST-25: the ⌘K trigger button here just calls `onOpenPalette` — the palette's own open
+// state, keyboard shortcut, and markup live in App.tsx's Shell + `CommandPalette.tsx` now (so
+// Ctrl/Cmd+K works everywhere the shell is mounted, not only while this bar has focus). This
+// file no longer owns any palette state itself.
 import { useNavigate } from 'react-router-dom';
-import type { ModuleDescriptor, PanelDescriptor } from '../lib/moduleRegistry';
+import type { ModuleDescriptor } from '../lib/moduleRegistry';
 import type { HealthStatus } from '../lib/aggregationClient';
 import { Wordmark } from './Wordmark';
 
@@ -26,10 +30,8 @@ interface GlobalBarProps {
   /** Present only in the <760px "drawer" rail variant — renders a menu trigger before the
    *  wordmark that opens the ModuleRail drawer. */
   onOpenMenu?: () => void;
-  /** The SAME health-filtered panel set the Shell routes — i.e. only panels belonging to a
-   *  currently-available module. The ⌘K "go to" trigger must source from this, not the raw
-   *  registry, so it never offers a path the router would reject (CONST-16 review finding). */
-  panels: PanelDescriptor[];
+  /** CONST-25: opens the full CommandPalette (owned by App.tsx's Shell). */
+  onOpenPalette: () => void;
 }
 
 export function GlobalBar({
@@ -44,22 +46,9 @@ export function GlobalBar({
   onLogout,
   pollDegraded,
   onOpenMenu,
-  panels,
+  onOpenPalette,
 }: GlobalBarProps) {
-  const [paletteOpen, setPaletteOpen] = useState(false);
   const navigate = useNavigate();
-
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
-        e.preventDefault();
-        setPaletteOpen(o => !o);
-      }
-      if (e.key === 'Escape') setPaletteOpen(false);
-    };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, []);
 
   const healthFor = (systemId: string) => health.find(h => h.system === systemId);
 
@@ -153,7 +142,8 @@ export function GlobalBar({
       </nav>
 
       <button
-        onClick={() => setPaletteOpen(true)}
+        onClick={onOpenPalette}
+        aria-label="Open command palette"
         style={{
           background: 'var(--bg-surface)',
           border: '1px solid var(--border-default)',
@@ -238,106 +228,6 @@ export function GlobalBar({
             Sign out
           </button>
         )}
-      </div>
-
-      {paletteOpen && (
-        <MiniPalette
-          panels={panels}
-          onClose={() => setPaletteOpen(false)}
-          onNavigate={path => {
-            navigate(path);
-            setPaletteOpen(false);
-          }}
-        />
-      )}
-    </div>
-  );
-}
-
-/**
- * Minimal in-shell "go to panel" overlay behind the ⌘K trigger — CONST-25 replaces this with
- * the full `CommandPalette` (actions, entity search, `registerCommand`). Deliberately named
- * differently (`MiniPalette`, local to `GlobalBar`) so it doesn't collide with that future file.
- *
- * Takes its entries from the caller's health-filtered `panels` (NOT `getAvailablePanels()`
- * directly) — otherwise it would list panels of modules that are currently unavailable, and
- * navigating to one would fall through the router's wildcard route (review finding).
- */
-function MiniPalette({
-  panels,
-  onClose,
-  onNavigate,
-}: {
-  panels: PanelDescriptor[];
-  onClose: () => void;
-  onNavigate: (path: string) => void;
-}) {
-  return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-label="Command palette"
-      onClick={onClose}
-      style={{
-        position: 'fixed',
-        inset: 0,
-        background: 'rgba(0,0,0,0.5)',
-        display: 'flex',
-        alignItems: 'flex-start',
-        justifyContent: 'center',
-        paddingTop: '10vh',
-        zIndex: 1000,
-      }}
-    >
-      <div
-        onClick={e => e.stopPropagation()}
-        style={{
-          width: 480,
-          maxWidth: '90vw',
-          maxHeight: '60vh',
-          overflow: 'auto',
-          background: 'var(--bg-surface)',
-          border: '1px solid var(--border-default)',
-          borderRadius: 'var(--radius-lg)',
-          boxShadow: 'var(--shadow-card-elevated)',
-        }}
-      >
-        <div
-          style={{
-            padding: 'var(--space-3)',
-            borderBottom: '1px solid var(--border-subtle)',
-            color: 'var(--text-tertiary)',
-            fontSize: 'var(--text-xs)',
-            textTransform: 'uppercase',
-            letterSpacing: '0.08em',
-          }}
-        >
-          Go to
-        </div>
-        {panels.length === 0 && (
-          <div style={{ padding: 'var(--space-3)', color: 'var(--text-tertiary)' }}>No panels available.</div>
-        )}
-        {panels.map(p => (
-          <button
-            key={p.id}
-            onClick={() => onNavigate(p.path)}
-            style={{
-              display: 'flex',
-              width: '100%',
-              textAlign: 'left',
-              gap: 'var(--space-2)',
-              background: 'none',
-              border: 'none',
-              padding: 'var(--space-2) var(--space-3)',
-              color: 'var(--text-primary)',
-              cursor: 'pointer',
-              fontSize: 'var(--text-base)',
-            }}
-          >
-            <span aria-hidden>{p.icon ?? '•'}</span>
-            {p.title}
-          </button>
-        ))}
       </div>
     </div>
   );
