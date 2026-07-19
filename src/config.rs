@@ -1274,6 +1274,21 @@ pub fn constellation_audit_log_path() -> String {
         .unwrap_or_else(|| "constellation-audit.jsonl".to_string())
 }
 
+/// CONST-26: max number of entries `GET /api/terminus/activity` will ever
+/// tail-read from the constellation audit JSONL ([`constellation_audit_log_path`])
+/// and return in one response, regardless of a caller-supplied `?limit=`
+/// query value (a caller may ask for FEWER, never more — see
+/// `crate::constellation::activity`'s module doc). From
+/// `CONSTELLATION_ACTIVITY_TAIL_LIMIT`; defaults to 200 — enough for a
+/// useful operator-facing feed without ever reading the whole (potentially
+/// large, long-lived) audit log into memory.
+pub fn constellation_activity_tail_limit() -> usize {
+    env_nonempty("CONSTELLATION_ACTIVITY_TAIL_LIMIT")
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(200)
+}
+
 // ── CONST-03: constellation control-plane auth ─────────────────────────────
 //
 // The session token itself is signed with `TERMINUS_JWT_SIGNING_KEY` (the
@@ -1298,6 +1313,21 @@ pub fn constellation_audit_log_path() -> String {
 /// caller and never logs the returned value.
 pub fn constellation_operator_secret() -> Option<String> {
     env_nonempty("CONSTELLATION_OPERATOR_SECRET")
+}
+
+/// Viewer shared secret (CONST-27, §3.4) compared (constant-time) against the
+/// submitted login password AFTER the operator secret has already been
+/// checked and didn't match. From `CONSTELLATION_VIEWER_SECRET`
+/// (operator-provisioned in <secret-manager> — never hardcoded). `None` when unset
+/// — callers MUST fail-closed (every viewer-tier login attempt rejected,
+/// same posture as an unset `CONSTELLATION_OPERATOR_SECRET`): an operator who
+/// hasn't provisioned this secret simply hasn't enabled the viewer tier yet,
+/// never a default-allow. Same "no separate secret-store API in this crate"
+/// rationale as [`constellation_operator_secret`] above; the only caller is
+/// `crate::constellation::auth::auth_login`, which never logs the returned
+/// value.
+pub fn constellation_viewer_secret() -> Option<String> {
+    env_nonempty("CONSTELLATION_VIEWER_SECRET")
 }
 
 /// Constellation session token TTL, in seconds. Independent of
@@ -2153,6 +2183,22 @@ mod tests {
 
     #[test]
     #[serial]
+    fn constellation_activity_tail_limit_default_and_override() {
+        std::env::remove_var("CONSTELLATION_ACTIVITY_TAIL_LIMIT");
+        assert_eq!(constellation_activity_tail_limit(), 200);
+        std::env::set_var("CONSTELLATION_ACTIVITY_TAIL_LIMIT", "50");
+        assert_eq!(constellation_activity_tail_limit(), 50);
+        // Zero/invalid falls back to the default rather than yielding a
+        // degenerate always-empty feed.
+        std::env::set_var("CONSTELLATION_ACTIVITY_TAIL_LIMIT", "0");
+        assert_eq!(constellation_activity_tail_limit(), 200);
+        std::env::set_var("CONSTELLATION_ACTIVITY_TAIL_LIMIT", "not-a-number");
+        assert_eq!(constellation_activity_tail_limit(), 200);
+        std::env::remove_var("CONSTELLATION_ACTIVITY_TAIL_LIMIT");
+    }
+
+    #[test]
+    #[serial]
     fn constellation_audit_log_path_has_sane_default() {
         std::env::remove_var("CONSTELLATION_AUDIT_LOG_PATH");
         assert_eq!(constellation_audit_log_path(), "constellation-audit.jsonl");
@@ -2166,6 +2212,16 @@ mod tests {
         std::env::set_var("CONSTELLATION_OPERATOR_SECRET", "op-secret"); // pii-test-fixture
         assert_eq!(constellation_operator_secret(), Some("op-secret".to_string()));
         std::env::remove_var("CONSTELLATION_OPERATOR_SECRET");
+    }
+
+    #[test]
+    #[serial]
+    fn constellation_viewer_secret_unset_is_none() {
+        std::env::remove_var("CONSTELLATION_VIEWER_SECRET");
+        assert_eq!(constellation_viewer_secret(), None);
+        std::env::set_var("CONSTELLATION_VIEWER_SECRET", "view-secret"); // pii-test-fixture
+        assert_eq!(constellation_viewer_secret(), Some("view-secret".to_string()));
+        std::env::remove_var("CONSTELLATION_VIEWER_SECRET");
     }
 
     #[test]

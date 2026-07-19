@@ -7,6 +7,7 @@ import { MODES } from '../types/presets';
 import type { ModeId } from '../types/presets';
 import { ModeDetail } from './ModeDetail';
 import type { ModeRouting } from './ModeDetail';
+import { RoleGate } from './RoleGate';
 
 interface ApiModeResponse {
   mode: string;
@@ -84,46 +85,49 @@ export function ModeSelector({ initialMode = 'local' }: Props) {
       </div>
 
       <div className="h-card-body">
-        {/* Mode buttons — segmented control */}
-        <div style={{
-          display: 'flex',
-          gap: 4,
-          marginBottom: 10,
-          padding: 3,
-          background: 'var(--bg-surface-raised)',
-          borderRadius: 'var(--radius-lg)',
-          border: '1px solid var(--border-default)',
-          flexWrap: 'wrap',
-        }}>
-          {MODES.map(m => {
-            const isActive = mode === m.id;
-            return (
-              <button
-                key={m.id}
-                onClick={() => setModeApi(m.id)}
-                disabled={saving}
-                title={`${m.label} — ${m.desc} (${m.cost})`}
-                style={{
-                  flex: '1 1 auto',
-                  minWidth: 58,
-                  padding: '5px 4px',
-                  fontSize: 'var(--text-xs)',
-                  fontWeight: isActive ? 600 : 400,
-                  border: 'none',
-                  borderRadius: 'var(--radius-md)',
-                  background: isActive ? 'var(--accent-primary)' : 'transparent',
-                  color: isActive ? '#0a0a0a' : 'var(--text-secondary)',
-                  cursor: saving ? 'wait' : 'pointer',
-                  transition: `background var(--transition-fast), color var(--transition-fast)`,
-                  lineHeight: 1.2,
-                  whiteSpace: 'nowrap',
-                }}
-              >
-                {m.label}
-              </button>
-            );
-          })}
-        </div>
+        {/* Mode buttons — segmented control. CONST-27: PUT /mode mutates, gated as a whole
+            group (single RoleGate, not per-button) since a viewer never gets to change mode. */}
+        <RoleGate display="block">
+          <div style={{
+            display: 'flex',
+            gap: 4,
+            marginBottom: 10,
+            padding: 3,
+            background: 'var(--bg-surface-raised)',
+            borderRadius: 'var(--radius-lg)',
+            border: '1px solid var(--border-default)',
+            flexWrap: 'wrap',
+          }}>
+            {MODES.map(m => {
+              const isActive = mode === m.id;
+              return (
+                <button
+                  key={m.id}
+                  onClick={() => setModeApi(m.id)}
+                  disabled={saving}
+                  title={`${m.label} — ${m.desc} (${m.cost})`}
+                  style={{
+                    flex: '1 1 auto',
+                    minWidth: 58,
+                    padding: '5px 4px',
+                    fontSize: 'var(--text-xs)',
+                    fontWeight: isActive ? 600 : 400,
+                    border: 'none',
+                    borderRadius: 'var(--radius-md)',
+                    background: isActive ? 'var(--accent-primary)' : 'transparent',
+                    color: isActive ? '#0a0a0a' : 'var(--text-secondary)',
+                    cursor: saving ? 'wait' : 'pointer',
+                    transition: `background var(--transition-fast), color var(--transition-fast)`,
+                    lineHeight: 1.2,
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {m.label}
+                </button>
+              );
+            })}
+          </div>
+        </RoleGate>
 
         {/* Active mode summary row with detail toggle */}
         <div style={{
