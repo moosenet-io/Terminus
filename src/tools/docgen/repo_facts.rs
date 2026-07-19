@@ -388,7 +388,7 @@ impl RepoFacts {
     /// Swept through [`sweep_input`] before it is returned; this is the
     /// ONLY way any `RepoFacts` content leaves this module for a prompt.
     pub fn identity_slice(&self) -> Result<String, ToolError> {
-        let value = json!({
+        let mut value = json!({
             "project_id": self.project_id,
             "git_ref": self.git_ref,
             "kg_grounded": self.kg_grounded,
@@ -412,12 +412,18 @@ impl RepoFacts {
                 "crate_root_docs": self.prose_anchors.crate_root_docs,
             },
             "legacy_headings": self.old_readme_sections.iter().map(|s| &s.heading).collect::<Vec<_>>(),
-            // DGDG-02: the current README (if this repo already has one) as
-            // the Pass 1 "deepen, don't regenerate" baseline. `None` on a
-            // first-ever run -- `build_repo_identity_prompt` treats absence
-            // as "write fresh," exactly as before this field existed.
-            "existing_landing": self.existing_docs.landing,
         });
+        // DGDG-02: the current README (if this repo already has one) is the
+        // Pass 1 "deepen, don't regenerate" baseline. Inserted ONLY when it
+        // exists, so a first-ever run produces byte-identical slice JSON to
+        // before this field existed (`build_repo_identity_prompt` keys its
+        // deepen rule off the field's PRESENCE, and treats absence as "write
+        // fresh," exactly as before).
+        if let Some(landing) = &self.existing_docs.landing {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("existing_landing".to_string(), json!(landing));
+            }
+        }
         sweep_slice(&value)
     }
 
@@ -442,7 +448,7 @@ impl RepoFacts {
             .iter()
             .find(|s| !s.heading.is_empty() && s.heading.to_lowercase().contains(&name.to_lowercase()));
 
-        let value = json!({
+        let mut value = json!({
             "project_id": self.project_id,
             "subsystem": {
                 "name": subsystem.name,
@@ -457,14 +463,18 @@ impl RepoFacts {
             "module_docs": self.prose_anchors.subsystem_docs.get(name).cloned().unwrap_or_default(),
             "config_surface": self.config_surface,
             "legacy_section": legacy_section,
-            // DGDG-02: this subsystem's CURRENT `docs/reference/<name>.md`
-            // content, if this repo already has one -- the Pass 2 "deepen,
-            // don't regenerate" baseline. `None` when no such page exists yet
-            // (first-ever page for this subsystem) -- `build_subsystem_page_prompt`
-            // treats absence as "write fresh," exactly as before this field
-            // existed.
-            "existing_page": self.existing_docs.subsystem_pages.get(name),
         });
+        // DGDG-02: this subsystem's CURRENT `docs/reference/<name>.md` content
+        // (the Pass 2 "deepen, don't regenerate" baseline) is inserted ONLY
+        // when such a page exists, so a first-ever page produces byte-identical
+        // slice JSON to before this field existed. `build_subsystem_page_prompt`
+        // keys its deepen rule off the field's PRESENCE and treats absence as
+        // "write fresh," exactly as before.
+        if let Some(page) = self.existing_docs.subsystem_pages.get(name) {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("existing_page".to_string(), json!(page));
+            }
+        }
         sweep_slice(&value)
     }
 }
@@ -602,12 +612,25 @@ fn scan_existing_docs(checkout_path: &Path, subsystems: &[Subsystem], readme: Op
     let mut guides = BTreeMap::new();
     if let Ok(entries) = std::fs::read_dir(checkout_path.join("docs/guides")) {
         for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else { continue };
+            if !name.ends_with(".md") {
                 continue;
             }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-            if let Some(body) = read_optional(&path) {
+            // Containment guard: build the repo-relative path and verify it
+            // resolves inside the checkout BEFORE reading — a symlinked
+            // `docs/guides/` dir or a symlinked `<name>.md` entry must not let
+            // this read outside `checkout_path` (same guard as the reference
+            // pages above).
+            let rel = format!("docs/guides/{name}");
+            if !path_within_checkout(checkout_path, &rel) {
+                continue;
+            }
+            let stem = name.trim_end_matches(".md");
+            if stem.is_empty() {
+                continue;
+            }
+            if let Some(body) = read_optional(&checkout_path.join(&rel)) {
                 guides.insert(stem.to_string(), body);
             }
         }

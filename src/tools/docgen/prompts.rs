@@ -125,15 +125,32 @@ fn pretty(value: &Value) -> String {
 /// mistake reintroducing).
 pub fn build_repo_identity_prompt(repo_name: &str, git_ref: &str, facts_json: &Value) -> String {
     let facts_str = pretty(facts_json);
+    // DGDG-02: the deepen-baseline note + HARD RULE 5 are included ONLY when the
+    // slice actually carries an `existing_landing` (the slice omits the key on a
+    // first-ever run), so a first-run prompt is byte-identical to the pre-DGDG-02
+    // prompt — the model gets no baseline instruction it can't act on.
+    let has_existing = facts_json.get("existing_landing").map_or(false, |v| !v.is_null());
+    let existing_intro = if has_existing {
+        " REPO FACTS may also include an `existing_landing` field: the CURRENT \
+README content already in place for this repository."
+    } else {
+        ""
+    };
+    let deepen_rule = if has_existing {
+        "5. DEEPEN, DON'T REGENERATE: REPO FACTS' `existing_landing` is present \
+-- treat its current tagline/what-is prose as your baseline. Preserve what is \
+still accurate, refine what has drifted, and correct only what the code now \
+contradicts -- do not discard good existing writing just to sound different.\n"
+    } else {
+        ""
+    };
     format!(
         "You are a senior technical writer producing the identity brief for the \
 repository `{repo_name}` (analyzed at {git_ref}). You will be shown \
 REPO FACTS extracted from the repository's code knowledge graph and \
 source tree: subsystem inventory with symbol counts and top-ranked \
 symbols, entry points (binaries, registered tools), crate/module doc \
-comments, and headings from the previous README. REPO FACTS may also \
-include an `existing_landing` field: the CURRENT README content already \
-in place for this repository, when one exists.\n\n\
+comments, and headings from the previous README.{existing_intro}\n\n\
 REPO FACTS:\n{facts_str}\n\n\
 Write a JSON object with EXACTLY these keys:\n\
 - \"tagline\": one sentence, <= 120 chars, stating what the WHOLE \
@@ -162,13 +179,7 @@ present in REPO FACTS. If you are unsure a capability exists, omit it.\n\
 4. Concrete beats generic: \"MCP tool hub exposing N tools over mTLS\" \
 is right; \"a powerful, flexible platform\" is wrong. Never use the \
 words \"powerful\", \"seamless\", \"comprehensive\", or \"cutting-edge\".\n\
-5. DEEPEN, DON'T REGENERATE: when REPO FACTS' `existing_landing` is \
-present and non-empty, treat its current tagline/what-is prose as your \
-baseline. Preserve what is still accurate, refine what has drifted, and \
-correct only what the code now contradicts -- do not discard good \
-existing writing just to sound different. When `existing_landing` is \
-absent or empty, there is no baseline: write it fresh from REPO FACTS \
-alone, exactly as you would for a project's first-ever identity brief.\n\
+{deepen_rule}\
 Respond with ONLY the JSON object. No preamble, no code fence.\n"
     )
 }
@@ -185,6 +196,24 @@ pub fn build_subsystem_page_prompt(
 ) -> String {
     let identity_str = pretty(identity_json);
     let slice_str = pretty(slice_json);
+    // DGDG-02: mention `existing_page` + its deepen rule ONLY when the slice
+    // carries one (omitted for a subsystem's first-ever page), so a first-run
+    // prompt is byte-identical to the pre-DGDG-02 prompt.
+    let has_existing = slice_json.get("existing_page").map_or(false, |v| !v.is_null());
+    let existing_intro = if has_existing {
+        ", and -- when this subsystem already has a generated reference page -- \
+its CURRENT content under `existing_page`"
+    } else {
+        ""
+    };
+    let deepen_clause = if has_existing {
+        " When SUBSYSTEM FACTS includes `existing_page`, treat it as your \
+baseline: DEEPEN AND REFINE it -- keep sections that are still accurate, \
+correct anything the code now contradicts, and extend real gaps in coverage; \
+do not discard accurate existing content just to produce something different."
+    } else {
+        ""
+    };
     format!(
         "You are writing the reference page for the `{subsystem}` subsystem of \
 `{repo_name}`. REPO IDENTITY (already established -- stay consistent \
@@ -192,9 +221,7 @@ with it, do not restate it):\n{identity_str}\n\n\
 SUBSYSTEM FACTS (top-ranked symbols with kinds and file paths, real \
 source signatures and doc comments for the key files, caller/callee \
 relationships into other subsystems, env/config keys it reads, -- \
-clearly labeled -- any section of the OLD README that described it, and \
--- when this subsystem already has a generated reference page -- its \
-CURRENT content under `existing_page`):\n{slice_str}\n\n\
+clearly labeled -- any section of the OLD README that described it{existing_intro}):\n{slice_str}\n\n\
 Write `docs/reference/{subsystem}.md` in markdown, 60-200 lines:\n\
 1. `# {subsystem}` + one-paragraph purpose (what it does FOR the \
 repository -- consistent with REPO IDENTITY).\n\
@@ -212,13 +239,7 @@ cover. Honest and short.\n\n\
 HARD RULES: every symbol, path, and config key must appear in SUBSYSTEM \
 FACTS -- never invent or \"round up\". Where the OLD README section \
 conflicts with the code facts, follow the code and add one line noting \
-the discrepancy. When SUBSYSTEM FACTS includes `existing_page`, treat it \
-as your baseline: DEEPEN AND REFINE it -- keep sections that are still \
-accurate, correct anything the code now contradicts, and extend real \
-gaps in coverage; do not discard accurate existing content just to \
-produce something different. When `existing_page` is absent, write this \
-page fresh, exactly as you would for a subsystem's first-ever reference \
-page. Plain markdown only, no wrapping code fence, no preamble.\n"
+the discrepancy.{deepen_clause} Plain markdown only, no wrapping code fence, no preamble.\n"
     )
 }
 
@@ -234,13 +255,34 @@ pub fn build_guides_prompt(
 ) -> String {
     let identity_str = pretty(identity_json);
     let entrypoints_str = pretty(entrypoints_json);
+    // DGDG-02: mention `existing_getting_started`/`existing_guides` + their
+    // deepen rule ONLY when actually present, so a first-run guides prompt is
+    // byte-identical to the pre-DGDG-02 prompt.
+    let has_existing = entrypoints_json
+        .get("existing_getting_started")
+        .map_or(false, |v| !v.is_null())
+        || entrypoints_json
+            .get("existing_guides")
+            .and_then(|v| v.as_object())
+            .map_or(false, |m| !m.is_empty());
+    let existing_intro = if has_existing {
+        ", and -- when this repository already has generated guides -- their \
+CURRENT content under `existing_getting_started`/`existing_guides`"
+    } else {
+        ""
+    };
+    let deepen_clause = if has_existing {
+        " When `existing_getting_started`/`existing_guides` are present, DEEPEN \
+AND REFINE them -- preserve steps that are still accurate, correct anything the \
+code now contradicts, and extend real gaps; do not regenerate from a blank page."
+    } else {
+        ""
+    };
     format!(
         "You are writing the operator guides for `{repo_name}`. REPO IDENTITY:\n{identity_str}\n\n\
 ENTRY POINTS AND CONFIGURATION (real binaries, registered tools, env \
 keys, service endpoints -- extracted from the code) plus, clearly \
-labeled, the OLD README's install/usage material, and -- when this \
-repository already has generated guides -- their CURRENT content under \
-`existing_getting_started`/`existing_guides`:\n{entrypoints_str}\n{legacy_usage}\n\n\
+labeled, the OLD README's install/usage material{existing_intro}:\n{entrypoints_str}\n{legacy_usage}\n\n\
 Produce, separated by lines reading exactly `=== FILE: <path> ===`:\n\
 1. `docs/getting-started.md`: a tutorial from clone to first success -- \
 prerequisites, build, minimal configuration (key names only), \
@@ -254,12 +296,7 @@ placeholder URLs. If the facts don't show how to do a step, write \
 \"(operator-specific: <what's needed>)\" rather than guessing. Secrets \
 are never inlined: reference key names and state that values are \
 provided by the repo's configured secret source at runtime (do not name \
-a specific secret backend unless ENTRY POINTS establishes one). When \
-`existing_getting_started`/`existing_guides` are present, DEEPEN AND \
-REFINE them -- preserve steps that are still accurate, correct anything \
-the code now contradicts, and extend real gaps; do not regenerate from \
-a blank page. When absent, write these guides fresh, exactly as you \
-would for a repository's first-ever guides.\n"
+a specific secret backend unless ENTRY POINTS establishes one).{deepen_clause}\n"
     )
 }
 
@@ -621,31 +658,45 @@ mod tests {
     // --- DGDG-02: deepen-from-baseline wording ---------------------------
 
     #[test]
-    fn identity_prompt_instructs_deepening_the_existing_landing_baseline() {
-        let facts = json!({"subsystems": ["intake", "forge"]});
-        let prompt = build_repo_identity_prompt("Terminus", "abc123", &facts);
-        assert!(prompt.contains("existing_landing"));
-        assert!(prompt.contains("DEEPEN"));
-        assert!(prompt.to_lowercase().contains("no baseline"));
+    fn identity_prompt_instructs_deepening_when_existing_landing_present() {
+        // Present -> the deepen rule + field mention appear.
+        let with = json!({"subsystems": ["intake", "forge"], "existing_landing": "# Terminus\n\ncurrent readme"});
+        let p = build_repo_identity_prompt("Terminus", "abc123", &with);
+        assert!(p.contains("existing_landing"));
+        assert!(p.contains("DEEPEN"));
+        // Absent -> byte-identical to the pre-DGDG-02 prompt: NO deepen rule,
+        // NO existing_landing mention (first-run behavior unchanged).
+        let without = json!({"subsystems": ["intake", "forge"]});
+        let p0 = build_repo_identity_prompt("Terminus", "abc123", &without);
+        assert!(!p0.contains("existing_landing"), "first-run prompt must not mention existing_landing");
+        assert!(!p0.contains("DEEPEN"), "first-run prompt must not carry the deepen rule");
     }
 
     #[test]
-    fn subsystem_page_prompt_instructs_deepening_the_existing_page_baseline() {
+    fn subsystem_page_prompt_instructs_deepening_when_existing_page_present() {
         let identity = sample_identity_json();
-        let slice = json!({"top_symbols": []});
-        let prompt = build_subsystem_page_prompt("Terminus", "mesh", &identity, &slice);
-        assert!(prompt.contains("existing_page"));
-        assert!(prompt.contains("DEEPEN AND REFINE"));
+        let with = json!({"top_symbols": [], "existing_page": "# mesh\n\ncurrent page"});
+        let p = build_subsystem_page_prompt("Terminus", "mesh", &identity, &with);
+        assert!(p.contains("existing_page"));
+        assert!(p.contains("DEEPEN AND REFINE"));
+        let without = json!({"top_symbols": []});
+        let p0 = build_subsystem_page_prompt("Terminus", "mesh", &identity, &without);
+        assert!(!p0.contains("existing_page"), "first-run page prompt must not mention existing_page");
+        assert!(!p0.contains("DEEPEN AND REFINE"));
     }
 
     #[test]
-    fn guides_prompt_instructs_deepening_existing_guides_baseline() {
+    fn guides_prompt_instructs_deepening_when_existing_guides_present() {
         let identity = sample_identity_json();
-        let entrypoints = json!({"bins": ["terminus_primary"]});
-        let prompt = build_guides_prompt("Terminus", &identity, &entrypoints, "");
-        assert!(prompt.contains("existing_getting_started"));
-        assert!(prompt.contains("existing_guides"));
-        assert!(prompt.contains("DEEPEN AND REFINE"));
+        let with = json!({"bins": ["terminus_primary"], "existing_getting_started": "clone and build", "existing_guides": {"run-a-sweep": "steps"}});
+        let p = build_guides_prompt("Terminus", &identity, &with, "");
+        assert!(p.contains("existing_getting_started"));
+        assert!(p.contains("existing_guides"));
+        assert!(p.contains("DEEPEN AND REFINE"));
+        let without = json!({"bins": ["terminus_primary"]});
+        let p0 = build_guides_prompt("Terminus", &identity, &without, "");
+        assert!(!p0.contains("existing_getting_started"), "first-run guides prompt must not mention existing content");
+        assert!(!p0.contains("DEEPEN AND REFINE"));
     }
 
     // --- parse_repo_identity ---------------------------------------------
