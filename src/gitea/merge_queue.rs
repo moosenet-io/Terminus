@@ -149,6 +149,24 @@ impl std::fmt::Display for MergeQueueError {
 
 impl std::error::Error for MergeQueueError {}
 
+/// GMQ-04: map a [`MergeQueueError`] to the [`crate::error::ToolError`] variant
+/// `MergePr::execute` surfaces to the caller. `Busy` (queue contention, either
+/// from [`MergeQueue::with_merge_slot`]'s own wait ceiling or from
+/// [`MergeQueue::enforce_spacing`]'s min-delay remainder exceeding it) is a
+/// transient "retry" condition, not a hard failure — mapped to `Execution` so
+/// it reads as "the operation didn't complete", distinct from a real conflict.
+/// `NotMergeable` (the GMQ-03 stale-base guard) IS a real conflict — mapped to
+/// `Conflict` so callers can distinguish "rebase and retry" from "try again
+/// shortly".
+impl From<MergeQueueError> for crate::error::ToolError {
+    fn from(e: MergeQueueError) -> Self {
+        match e {
+            MergeQueueError::Busy => crate::error::ToolError::Execution(e.to_string()),
+            MergeQueueError::NotMergeable => crate::error::ToolError::Conflict(e.to_string()),
+        }
+    }
+}
+
 /// GMQ-03 stale-base guard: the decision [`evaluate_merge_guard`] returns for
 /// an already-fetched [`GiteaPullRequest`] — evaluated INSIDE the merge
 /// queue's critical section, immediately before the merge POST, so a caller
@@ -219,7 +237,7 @@ enum AcquireAttempt {
 /// semantically-identical fake (`fake::InMemoryMergeLockStore`, test-only) so
 /// the ordering/lock/crash-backstop guarantees are unit-tested with NO Redis.
 #[async_trait]
-trait MergeLockStore: Send + Sync {
+pub(crate) trait MergeLockStore: Send + Sync {
     /// Take a FIFO ticket for `key` and register it in the wait ordering with
     /// `priority` weighting. Returns the ticket id (unique per `key`).
     /// `wait_ttl` bounds the wait ordering's own self-healing `EXPIRE`
@@ -570,8 +588,12 @@ impl MergeQueue {
         }
     }
 
+    /// Construct over an arbitrary [`MergeLockStore`] — `pub(crate)` (not just
+    /// module-private) so tests OUTSIDE this module (GMQ-04's `crate::gitea`
+    /// tool tests) can build a real `MergeQueue` over the `fake` module's
+    /// in-memory store without a live Redis.
     #[cfg(test)]
-    fn from_store(store: Arc<dyn MergeLockStore>) -> Self {
+    pub(crate) fn from_store(store: Arc<dyn MergeLockStore>) -> Self {
         Self { store }
     }
 
@@ -792,8 +814,14 @@ impl Drop for ReleaseGuard {
     }
 }
 
+/// Offline `MergeLockStore` fake, exposed `pub(crate)` (mirrors
+/// `crate::compiler::queue`'s own `#[cfg(test)] pub(crate) mod fake` pattern)
+/// so tests OUTSIDE this module — specifically GMQ-04's `crate::gitea` tool
+/// tests — can build a real, fully-functional `MergeQueue` (ordering, the
+/// crash-backstop lock, spacing, everything) with NO live Redis, the exact
+/// same way this module's own `tests` below do.
 #[cfg(test)]
-mod tests {
+pub(crate) mod fake {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
@@ -801,7 +829,7 @@ mod tests {
 
     /// An offline `MergeLockStore` mirroring the Lua semantics exactly, so the
     /// ordering/lock/crash-backstop guarantees are unit-tested with NO Redis.
-    struct InMemoryMergeLockStore {
+    pub(crate) struct InMemoryMergeLockStore {
         state: StdMutex<State>,
     }
 
@@ -828,19 +856,19 @@ mod tests {
     }
 
     impl InMemoryMergeLockStore {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 state: StdMutex::new(State::default()),
             }
         }
 
-        fn set_down(&self, down: bool) {
+        pub(crate) fn set_down(&self, down: bool) {
             self.state.lock().unwrap().down = down;
         }
 
         /// Force-expire a held lock immediately (simulate a crashed holder
         /// whose TTL has elapsed) without waiting in real time.
-        fn expire_lock(&self, key: &str) {
+        pub(crate) fn expire_lock(&self, key: &str) {
             let mut s = self.state.lock().unwrap();
             if let Some((_, exp)) = s.lock.get_mut(key) {
                 *exp = StdInstant::now() - Duration::from_millis(1);
@@ -851,7 +879,7 @@ mod tests {
         /// (simulate a hard-crashed waiter whose `wait_ttl_secs` has elapsed)
         /// without waiting in real time — the in-memory analog of forcing an
         /// entry in Redis's `deadline_zset` below `now_ms()`.
-        fn expire_ticket(&self, key: &str, ticket: u64) {
+        pub(crate) fn expire_ticket(&self, key: &str, ticket: u64) {
             let mut s = self.state.lock().unwrap();
             if let Some(bucket) = s.wait.get_mut(key) {
                 for entry in bucket.iter_mut() {
@@ -864,7 +892,7 @@ mod tests {
 
         /// Tickets currently still waiting (front-to-back order) for `key`,
         /// for assertions that a ticket was (or was not) removed.
-        fn waiting_tickets(&self, key: &str) -> Vec<u64> {
+        pub(crate) fn waiting_tickets(&self, key: &str) -> Vec<u64> {
             let s = self.state.lock().unwrap();
             s.wait
                 .get(key)
@@ -872,7 +900,7 @@ mod tests {
                 .unwrap_or_default()
         }
 
-        fn is_locked(&self, key: &str) -> bool {
+        pub(crate) fn is_locked(&self, key: &str) -> bool {
             let s = self.state.lock().unwrap();
             match s.lock.get(key) {
                 Some((_, exp)) => *exp > StdInstant::now(),
@@ -882,7 +910,7 @@ mod tests {
 
         /// The TTL (seconds) `record_merge_ms` was last called with for
         /// `key`, or `None` if it was never recorded.
-        fn last_ttl_secs(&self, key: &str) -> Option<u64> {
+        pub(crate) fn last_ttl_secs(&self, key: &str) -> Option<u64> {
             let s = self.state.lock().unwrap();
             s.last_ttl_secs.get(key).copied()
         }
@@ -988,6 +1016,22 @@ mod tests {
         }
     }
 
+    /// Build a real `MergeQueue` over a fresh in-memory fake store — the
+    /// crate-wide entry point other modules' tests use (GMQ-04's
+    /// `crate::gitea` tool tests included) to exercise `with_merge_slot`/
+    /// `enforce_spacing`/`record_merge` end-to-end with no live Redis.
+    pub(crate) fn queue_over(store: Arc<InMemoryMergeLockStore>) -> MergeQueue {
+        MergeQueue::from_store(store as Arc<dyn MergeLockStore>)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fake::{queue_over, InMemoryMergeLockStore};
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+    use std::time::Instant as StdInstant;
+
     fn fast_cfg() -> MergeQueueConfig {
         MergeQueueConfig {
             enabled: true,
@@ -995,10 +1039,6 @@ mod tests {
             max_wait_secs: 5,
             wait_ttl_secs: 65,
         }
-    }
-
-    fn queue_over(store: Arc<InMemoryMergeLockStore>) -> MergeQueue {
-        MergeQueue::from_store(store as Arc<dyn MergeLockStore>)
     }
 
     #[tokio::test]
