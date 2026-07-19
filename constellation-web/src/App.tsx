@@ -9,14 +9,16 @@ import type { Density } from './components/GlobalBar';
 import { ModuleRail } from './components/ModuleRail';
 import type { RailVariant } from './components/ModuleRail';
 import { Login } from './components/Login';
+import { CommandPalette } from './components/CommandPalette';
 import { ToastProvider, useToastContext } from './components/Toast';
 import { useAuth } from './hooks/useAuth';
 import { useActivityFeed } from './hooks/useActivityFeed';
-import { AuthRoleProvider } from './hooks/AuthRoleContext';
+import { AuthRoleProvider, useAuthRole } from './hooks/AuthRoleContext';
 import { getAggregationClient } from './lib/aggregationClient';
 import type { HealthStatus } from './lib/aggregationClient';
 import type { FeedItem } from './lib/activityFeed';
 import { getAvailableModules, getAvailablePanels } from './lib/moduleRegistry';
+import { setCurrentPath, REFRESH_HEALTH_EVENT } from './lib/shellBridge';
 import { OverviewPanel } from './panels/overview/OverviewPanel';
 
 /** A system stays reported `available` (degraded) through this many consecutive misses —
@@ -43,6 +45,8 @@ function useWindowWidth(): number {
 }
 
 function Shell({ username, onLogout }: { username: string | null; onLogout: () => void }) {
+  // CONST-27's session role (from AuthRoleProvider above) — gates operator-only palette commands.
+  const sessionRole = useAuthRole();
   const [health, setHealth] = useState<HealthStatus[]>([]);
   // Has the first /api/health poll settled (success OR failure) yet? Until it has, `modules`/
   // `panels` are necessarily empty (health starts as []) — routing on that empty snapshot would
@@ -56,6 +60,9 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
     () => getAggregationClient().prefs.get<Density>('density') ?? 'comfortable',
   );
   const [drawerOpen, setDrawerOpen] = useState(false);
+  // CONST-25: the command palette's open state lives here (not in GlobalBar) so Ctrl/Cmd+K
+  // works everywhere the shell is mounted, not just while the bar has DOM focus.
+  const [paletteOpen, setPaletteOpen] = useState(false);
 
   // CONST-26 (§3.3): the shell's one merged activity feed, shared by the GlobalBar's
   // notification bell and the Overview canvas' ActivityFeedCard — a detected health transition
@@ -189,10 +196,35 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
     fetchHealth();
   }, [fetchHealth]);
 
+  // CONST-25: the "Refresh health" palette command (registered at import time in
+  // registerPanels.ts, well before this component exists) asks for a refresh via a plain
+  // window CustomEvent — see lib/shellBridge.ts's doc comment for why.
+  useEffect(() => {
+    const handler = () => fetchHealth();
+    window.addEventListener(REFRESH_HEALTH_EVENT, handler);
+    return () => window.removeEventListener(REFRESH_HEALTH_EVENT, handler);
+  }, [fetchHealth]);
+
   useEffect(() => {
     const id = setInterval(fetchHealth, 30000);
     return () => clearInterval(id);
   }, [fetchHealth]);
+
+  // CONST-25: Ctrl/Cmd+K opens the palette from anywhere in the shell; Escape closes it here too
+  // (in addition to the palette's own input-level Escape handler, so it also closes if focus is
+  // somehow outside the input).
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setPaletteOpen(o => !o);
+      } else if (e.key === 'Escape') {
+        setPaletteOpen(false);
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, []);
 
   const width = useWindowWidth();
   const railVariant = railVariantFor(width);
@@ -206,6 +238,13 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
 
   const location = useLocation();
   const navigate = useNavigate();
+
+  // CONST-25: publish the current path for the "Copy current path" command (see
+  // lib/shellBridge.ts — deliberately routed through react-router's location, never
+  // `window.location`, to keep that read confined to aggregationClient.ts).
+  useEffect(() => {
+    setCurrentPath(location.pathname);
+  }, [location.pathname]);
 
   // Panel paths are all `/${moduleId}/...` by convention, so the first segment is the module id.
   const activeModuleId = useMemo(() => {
@@ -239,8 +278,18 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
         onLogout={onLogout}
         pollDegraded={pollDegraded}
         onOpenMenu={railVariant === 'drawer' ? () => setDrawerOpen(true) : undefined}
-        panels={panels}
+        onOpenPalette={() => setPaletteOpen(true)}
         feedItems={feedItems}
+      />
+
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        panels={panels}
+        onNavigate={navigate}
+        // CONST-27 merged: the real session role now gates operator-only commands (a
+        // viewer session hides/disables them; server-side 403 remains the enforcement).
+        role={sessionRole}
       />
 
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
