@@ -131,7 +131,9 @@ repository `{repo_name}` (analyzed at {git_ref}). You will be shown \
 REPO FACTS extracted from the repository's code knowledge graph and \
 source tree: subsystem inventory with symbol counts and top-ranked \
 symbols, entry points (binaries, registered tools), crate/module doc \
-comments, and headings from the previous README.\n\n\
+comments, and headings from the previous README. REPO FACTS may also \
+include an `existing_landing` field: the CURRENT README content already \
+in place for this repository, when one exists.\n\n\
 REPO FACTS:\n{facts_str}\n\n\
 Write a JSON object with EXACTLY these keys:\n\
 - \"tagline\": one sentence, <= 120 chars, stating what the WHOLE \
@@ -160,6 +162,13 @@ present in REPO FACTS. If you are unsure a capability exists, omit it.\n\
 4. Concrete beats generic: \"MCP tool hub exposing N tools over mTLS\" \
 is right; \"a powerful, flexible platform\" is wrong. Never use the \
 words \"powerful\", \"seamless\", \"comprehensive\", or \"cutting-edge\".\n\
+5. DEEPEN, DON'T REGENERATE: when REPO FACTS' `existing_landing` is \
+present and non-empty, treat its current tagline/what-is prose as your \
+baseline. Preserve what is still accurate, refine what has drifted, and \
+correct only what the code now contradicts -- do not discard good \
+existing writing just to sound different. When `existing_landing` is \
+absent or empty, there is no baseline: write it fresh from REPO FACTS \
+alone, exactly as you would for a project's first-ever identity brief.\n\
 Respond with ONLY the JSON object. No preamble, no code fence.\n"
     )
 }
@@ -182,8 +191,10 @@ pub fn build_subsystem_page_prompt(
 with it, do not restate it):\n{identity_str}\n\n\
 SUBSYSTEM FACTS (top-ranked symbols with kinds and file paths, real \
 source signatures and doc comments for the key files, caller/callee \
-relationships into other subsystems, env/config keys it reads, and -- \
-clearly labeled -- any section of the OLD README that described it):\n{slice_str}\n\n\
+relationships into other subsystems, env/config keys it reads, -- \
+clearly labeled -- any section of the OLD README that described it, and \
+-- when this subsystem already has a generated reference page -- its \
+CURRENT content under `existing_page`):\n{slice_str}\n\n\
 Write `docs/reference/{subsystem}.md` in markdown, 60-200 lines:\n\
 1. `# {subsystem}` + one-paragraph purpose (what it does FOR the \
 repository -- consistent with REPO IDENTITY).\n\
@@ -201,8 +212,13 @@ cover. Honest and short.\n\n\
 HARD RULES: every symbol, path, and config key must appear in SUBSYSTEM \
 FACTS -- never invent or \"round up\". Where the OLD README section \
 conflicts with the code facts, follow the code and add one line noting \
-the discrepancy. Plain markdown only, no wrapping code fence, no \
-preamble.\n"
+the discrepancy. When SUBSYSTEM FACTS includes `existing_page`, treat it \
+as your baseline: DEEPEN AND REFINE it -- keep sections that are still \
+accurate, correct anything the code now contradicts, and extend real \
+gaps in coverage; do not discard accurate existing content just to \
+produce something different. When `existing_page` is absent, write this \
+page fresh, exactly as you would for a subsystem's first-ever reference \
+page. Plain markdown only, no wrapping code fence, no preamble.\n"
     )
 }
 
@@ -222,7 +238,9 @@ pub fn build_guides_prompt(
         "You are writing the operator guides for `{repo_name}`. REPO IDENTITY:\n{identity_str}\n\n\
 ENTRY POINTS AND CONFIGURATION (real binaries, registered tools, env \
 keys, service endpoints -- extracted from the code) plus, clearly \
-labeled, the OLD README's install/usage material:\n{entrypoints_str}\n{legacy_usage}\n\n\
+labeled, the OLD README's install/usage material, and -- when this \
+repository already has generated guides -- their CURRENT content under \
+`existing_getting_started`/`existing_guides`:\n{entrypoints_str}\n{legacy_usage}\n\n\
 Produce, separated by lines reading exactly `=== FILE: <path> ===`:\n\
 1. `docs/getting-started.md`: a tutorial from clone to first success -- \
 prerequisites, build, minimal configuration (key names only), \
@@ -236,7 +254,12 @@ placeholder URLs. If the facts don't show how to do a step, write \
 \"(operator-specific: <what's needed>)\" rather than guessing. Secrets \
 are never inlined: reference key names and state that values are \
 provided by the repo's configured secret source at runtime (do not name \
-a specific secret backend unless ENTRY POINTS establishes one).\n"
+a specific secret backend unless ENTRY POINTS establishes one). When \
+`existing_getting_started`/`existing_guides` are present, DEEPEN AND \
+REFINE them -- preserve steps that are still accurate, correct anything \
+the code now contradicts, and extend real gaps; do not regenerate from \
+a blank page. When absent, write these guides fresh, exactly as you \
+would for a repository's first-ever guides.\n"
     )
 }
 
@@ -593,6 +616,36 @@ mod tests {
         assert!(prompt.contains("=== FILE: <path> ==="));
         assert!(prompt.contains("getting-started.md"));
         assert!(prompt.contains("operator-specific"));
+    }
+
+    // --- DGDG-02: deepen-from-baseline wording ---------------------------
+
+    #[test]
+    fn identity_prompt_instructs_deepening_the_existing_landing_baseline() {
+        let facts = json!({"subsystems": ["intake", "forge"]});
+        let prompt = build_repo_identity_prompt("Terminus", "abc123", &facts);
+        assert!(prompt.contains("existing_landing"));
+        assert!(prompt.contains("DEEPEN"));
+        assert!(prompt.to_lowercase().contains("no baseline"));
+    }
+
+    #[test]
+    fn subsystem_page_prompt_instructs_deepening_the_existing_page_baseline() {
+        let identity = sample_identity_json();
+        let slice = json!({"top_symbols": []});
+        let prompt = build_subsystem_page_prompt("Terminus", "mesh", &identity, &slice);
+        assert!(prompt.contains("existing_page"));
+        assert!(prompt.contains("DEEPEN AND REFINE"));
+    }
+
+    #[test]
+    fn guides_prompt_instructs_deepening_existing_guides_baseline() {
+        let identity = sample_identity_json();
+        let entrypoints = json!({"bins": ["terminus_primary"]});
+        let prompt = build_guides_prompt("Terminus", &identity, &entrypoints, "");
+        assert!(prompt.contains("existing_getting_started"));
+        assert!(prompt.contains("existing_guides"));
+        assert!(prompt.contains("DEEPEN AND REFINE"));
     }
 
     // --- parse_repo_identity ---------------------------------------------
