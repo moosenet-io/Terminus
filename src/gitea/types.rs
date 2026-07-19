@@ -147,3 +147,26 @@ pub struct GiteaMergeResponse {
     pub merged: Option<bool>,
     pub message: Option<String>,
 }
+
+/// Outcome of a successful pull-request merge via
+/// [`crate::gitea::GiteaClient::merge_pull`] — the single merge code path
+/// shared by the `gitea_merge_pr` tool and any future queue worker (GMQ-02+).
+///
+/// `base` is the pull request's REAL base branch, fetched from Gitea via
+/// `GET /repos/{owner}/{repo}/pulls/{pr}` before the merge POST (Gitea's merge
+/// endpoint itself returns `200` with no useful body on success, per
+/// [`GiteaMergeResponse`]'s doc comment — there is no other source for it).
+/// This replaces the pre-GMQ-01 bug where the tool's success string reported
+/// the merge `style` (`merge`/`rebase`/`squash`) in the base branch's place.
+#[derive(Debug, Clone, Serialize)]
+pub struct GiteaMergeOutcome {
+    /// Always `true` when this value exists (an `Err` is returned instead of
+    /// a "not merged" outcome) — kept explicit for forward-compat with the
+    /// stale-base guard's idempotent "already merged" success (GMQ-03).
+    pub merged: bool,
+    /// The pull request's real base branch (e.g. `"main"`).
+    pub base: String,
+    /// The pull request's head branch (e.g. `"feature/x"`), for callers that
+    /// want to log/report the full `head -> base` picture.
+    pub head: String,
+}
