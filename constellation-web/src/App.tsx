@@ -11,7 +11,7 @@ import type { RailVariant } from './components/ModuleRail';
 import { Login } from './components/Login';
 import { CommandPalette } from './components/CommandPalette';
 import { useAuth } from './hooks/useAuth';
-import { AuthRoleProvider } from './hooks/AuthRoleContext';
+import { AuthRoleProvider, useAuthRole } from './hooks/AuthRoleContext';
 import { getAggregationClient } from './lib/aggregationClient';
 import type { HealthStatus } from './lib/aggregationClient';
 import { getAvailableModules, getAvailablePanels } from './lib/moduleRegistry';
@@ -42,6 +42,8 @@ function useWindowWidth(): number {
 }
 
 function Shell({ username, onLogout }: { username: string | null; onLogout: () => void }) {
+  // CONST-27's session role (from AuthRoleProvider above) — gates operator-only palette commands.
+  const sessionRole = useAuthRole();
   const [health, setHealth] = useState<HealthStatus[]>([]);
   // Has the first /api/health poll settled (success OR failure) yet? Until it has, `modules`/
   // `panels` are necessarily empty (health starts as []) — routing on that empty snapshot would
@@ -267,10 +269,9 @@ function Shell({ username, onLogout }: { username: string | null; onLogout: () =
         onClose={() => setPaletteOpen(false)}
         panels={panels}
         onNavigate={navigate}
-        // SEAM: CONST-27 (useAuthRole) isn't merged to main yet — see commandRegistry.ts's
-        // getAvailableCommands doc. Swap this for useAuthRole() the moment it lands; nothing
-        // else here needs to change.
-        role={null}
+        // CONST-27 merged: the real session role now gates operator-only commands (a
+        // viewer session hides/disables them; server-side 403 remains the enforcement).
+        role={sessionRole}
       />
 
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>

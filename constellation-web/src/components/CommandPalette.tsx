@@ -47,20 +47,34 @@ export function CommandPalette({ open, onClose, panels, onNavigate, role }: Comm
   const [entityResults, setEntityResults] = useState<EntitySourceResult[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Monotonic id per issued entity search — only the LATEST request may apply its
+   *  results (review fix: a slower older request must never overwrite a newer query's
+   *  hits; the debounce bounds request VOLUME, not result freshness). */
+  const searchSeqRef = useRef(0);
+  /** The element focused when the palette opened — focus returns there on close
+   *  (review fix: keyboard users must resume where they were, per the dialog pattern). */
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
   const listboxId = 'command-palette-listbox';
 
   useEffect(() => {
     if (open) {
+      restoreFocusRef.current =
+        document.activeElement instanceof HTMLElement ? document.activeElement : null;
       setQuery('');
       setEntityResults([]);
       // Focus after the dialog paints so the browser doesn't fight an in-flight blur.
       const id = setTimeout(() => inputRef.current?.focus(), 0);
       return () => clearTimeout(id);
     }
+    // Closed: hand focus back to wherever the user was.
+    const prev = restoreFocusRef.current;
+    restoreFocusRef.current = null;
+    if (prev && document.contains(prev)) prev.focus();
   }, [open]);
 
   // Entity search: debounced 150ms, degrades per-source (searchEntities never rejects as a
-  // whole — see its doc comment). Skipped entirely for an empty query.
+  // whole — see its doc comment). Skipped entirely for an empty query. Stale responses are
+  // dropped via searchSeqRef (freshness guard, review fix).
   useEffect(() => {
     if (!open) return;
     if (debounceRef.current) clearTimeout(debounceRef.current);
@@ -69,7 +83,10 @@ export function CommandPalette({ open, onClose, panels, onNavigate, role }: Comm
       return;
     }
     debounceRef.current = setTimeout(() => {
-      searchEntities(query, getAggregationClient()).then(setEntityResults);
+      const seq = ++searchSeqRef.current;
+      searchEntities(query, getAggregationClient()).then(results => {
+        if (seq === searchSeqRef.current) setEntityResults(results);
+      });
     }, ENTITY_DEBOUNCE_MS);
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
