@@ -5,7 +5,9 @@ import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { ModuleDescriptor, PanelDescriptor } from '../lib/moduleRegistry';
 import type { HealthStatus } from '../lib/aggregationClient';
+import type { FeedItem } from '../lib/activityFeed';
 import { Wordmark } from './Wordmark';
+import { NotificationBell } from './NotificationBell';
 
 export type Density = 'comfortable' | 'compact';
 
@@ -30,6 +32,10 @@ interface GlobalBarProps {
    *  currently-available module. The ⌘K "go to" trigger must source from this, not the raw
    *  registry, so it never offers a path the router would reject (CONST-16 review finding). */
   panels: PanelDescriptor[];
+  /** CONST-26 (§3.3): the shell's merged activity feed — backs the bell menu here. Optional so
+   *  every existing caller of `GlobalBar` keeps compiling untouched; the bell simply doesn't
+   *  render when omitted. */
+  feedItems?: FeedItem[];
 }
 
 export function GlobalBar({
@@ -45,6 +51,7 @@ export function GlobalBar({
   pollDegraded,
   onOpenMenu,
   panels,
+  feedItems,
 }: GlobalBarProps) {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const navigate = useNavigate();
@@ -200,6 +207,7 @@ export function GlobalBar({
       </div>
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', flexShrink: 0 }}>
+        {feedItems && <NotificationBell items={feedItems} />}
         {pollDegraded && (
           <span
             title="Health poll degraded — showing last known status"

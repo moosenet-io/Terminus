@@ -36,6 +36,7 @@ this is the contract the httpAdapter already assumes:
 | POST | `/api/auth/logout` | 200/204 |
 | GET | `/api/health` | `{ system: 'harmony'\|'chord'\|'lumina'\|'terminus'; available: boolean; detail?: string }[]` |
 | GET | `/api/terminus/config` | `{ modules: { name: string; enabled: boolean; version?: string }[]; workerCount: number }` |
+| GET | `/api/terminus/activity?limit=N` | `{ entries: { ts: string; method: string; path: string; principal: string \| null; system: string }[] }` — tail of the CONST-02 mutating-request audit log; **never body content**. `limit` asks for fewer entries, never more than the server's own `CONSTELLATION_ACTIVITY_TAIL_LIMIT` cap (default 200). A missing/empty audit log yields `{entries: []}`, `200 OK` — never an error. |
 | any | `/api/{system}/{path}` | generic passthrough used by `client.request<T>()` for panel-specific reads that don't have a typed method yet |
 
 #### The `prefs` seam (CONST-16)
@@ -110,9 +111,48 @@ never reporting healthy; either way it silently doesn't render. No crash, no pla
   overlay (triggered from `GlobalBar`'s hamburger) below 760px.
 - **The Overview card canvas** (`/overview`, the default route, `src/panels/overview/`) is one
   seven-region `ModuleCard` per available module (drag handle, StatusPill, kind/role line,
-  metric row, last-activity line, Open/Configure + Hide, an expandable body). Operators can
-  drag-reorder, hide, and re-add cards ("+ Add widget"); a card focused with the keyboard
-  reorders via `⌘/Ctrl+arrow`. Layout + density persist **only** via `client.prefs`.
+  metric row, last-activity line, Open/Configure + Hide, an expandable body), plus a fixed
+  **`ActivityFeedCard`** (see below) that is not part of the drag/hide layout system. Operators
+  can drag-reorder, hide, and re-add module cards ("+ Add widget"); a card focused with the
+  keyboard reorders via `⌘/Ctrl+arrow`. Layout + density persist **only** via `client.prefs`.
+
+## Notifications & activity feed (CONST-26, §3.3)
+
+One shell-level hook, `useActivityFeed` (`src/hooks/useActivityFeed.ts`), merges three sources
+into a single, deduplicated, most-recent-first `FeedItem[]` — the pure merge/dedupe/severity
+logic lives in `src/lib/activityFeed.ts` (unit-testable independent of React/network):
+
+1. **Activity** — polls `GET /api/terminus/activity` every 30s (same cadence as the health
+   poll).
+2. **Health transitions** — diffs consecutive `/api/health` snapshots (e.g. `chord ->
+   unavailable`); `App.tsx`'s `Shell` is the one place already doing this diffing, so the hook
+   takes the shell's health state as input rather than polling a second time.
+3. **`/ws` events** — subscribes via `client.ws.connect()` (CONST-18); when no live event
+   stream is configured this contributes nothing, silently — no special-casing needed by
+   callers.
+
+This one feed backs two surfaces, both pure renderers with no polling/subscriptions of their
+own:
+
+- **`ActivityFeedCard`** (`src/panels/overview/ActivityFeedCard.tsx`) — an Overview canvas
+  widget rendering the feed in the brand's log-line voice (§2.2, `[ok] ...` / `[warn] ...` /
+  `[error] ...`).
+- **`NotificationBell`** (`src/components/NotificationBell.tsx`) — a bell menu in `GlobalBar`
+  retaining the **last 50 items, in memory only** — never `localStorage`/`sessionStorage` (the
+  CONST-16 `prefs` seam is layout/density state, not a notification history; this is
+  deliberately NOT routed through it).
+
+**Toasts** (`src/components/Toast.tsx`, `ToastProvider`/`useToastContext`, mounted once at the
+app root) fire for exactly two things, per spec — never anything else:
+
+- **Mutation results** — observed centrally via `aggregationClient`'s `onMutationResult`
+  seam, which every mutating (`POST`/`PUT`/`PATCH`/`DELETE`) `client.request<T>()` call already
+  emits on completion. No individual panel needs to opt in.
+- **Health transitions** — `App.tsx`'s `Shell` passes a callback into `useActivityFeed` that
+  also pushes a toast for each detected transition.
+
+Toasts auto-dismiss after 6s and render in a fixed `aria-live="polite"` region so a screen
+reader announces one without interrupting the current task.
 
 ## Adding a panel
 
