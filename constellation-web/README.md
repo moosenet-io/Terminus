@@ -227,18 +227,18 @@ with no `MOCK_GET` entry (aggregationClient.ts's own "not mocked" sentinel). Man
 by deleting a `MOCK_GET` key and confirming only that section degrades (see `useMuse.ts`'s and
 `DashboardPanel.tsx`'s top comments for how).
 
-Two things this build added ahead of their own spec items, both clearly marked as seams in
-their own file headers so the real item can drop in a replacement without touching call
-sites:
+Role gating comes from **merged CONST-27**: Muse's compose/maintenance controls are wrapped in
+main's canonical `components/RoleGate.tsx` (a viewer session sees them disabled with an
+"operator role required" tooltip; the real session role flows via `AuthRoleContext`'s
+`useAuthRole()`), and enforcement is always server-side regardless (spec §3.4 —
+`enforce_viewer_role_gate` 403s a viewer's mutating request). This build's earlier pre-merge
+role seam (a local `hooks/useAuthRole.ts` + its own RoleGate variant) was DELETED when the
+branch reconciled onto merged main. One local stand-in remains, clearly marked in its file
+header for its real item to replace without touching call sites:
 
-- **`components/RoleGate.tsx` + `hooks/useAuthRole.ts`** — CONST-27 (the real `role` JWT claim)
-  hasn't merged yet. `AuthMeResponse` gained an optional `role` field and `useAuthRole()`
-  defaults to `'operator'` once authenticated and the field is absent (enabled-for-operator-
-  by-default, matching this item's own instructions) — enforcement is always server-side
-  regardless (spec §3.4), this is a UI courtesy only.
-- **`components/ConfirmDialog.tsx`** — no shared modal/dialog kit exists yet (CONST-25/26/27).
-  Minimal, brand-token, `role="dialog"` + Esc-to-cancel stand-in for Muse's compose/maintenance
-  confirmations.
+- **`components/ConfirmDialog.tsx`** — no shared modal/dialog kit on main yet (CONST-25's is
+  unmerged). Minimal, brand-token, `role="dialog"` + Esc-to-cancel stand-in for Muse's
+  compose/maintenance confirmations.
 
 Two mock/route additions beyond the original §5.4 endpoint list (both plain GET/POST passthrough
 under the existing `proxy_muse` arm, no `proxy.rs` change needed, both degrade the same way as

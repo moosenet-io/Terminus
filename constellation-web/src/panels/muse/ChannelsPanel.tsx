@@ -6,11 +6,13 @@
 // deliberately NOT an EPG-widget layout -- spec §5.4 is explicit about this ("rendered as a
 // DataTable timeline, not an EPG widget").
 //
-// Compose/maintenance: gated by CONST-27's shared RoleGate (merged) + the local ConfirmDialog (`components/ConfirmDialog.tsx`,
-// `components/ConfirmDialog.tsx`, `hooks/useAuthRole.ts`) -- each clearly marked as a
-// stand-in in its own file. There is no Toast infra yet either (CONST-26, not merged) so the
-// mutation result renders as an inline status line next to the action buttons rather than a
-// toast; that's a deliberate scope cut, not an oversight -- see the README's Muse section.
+// Compose/maintenance: gated by merged CONST-27's canonical RoleGate (disabled + tooltip for
+// a viewer session; server-side 403 is the enforcement) + the local ConfirmDialog stand-in
+// (`components/ConfirmDialog.tsx`, clearly marked in its file header for CONST-25's shared
+// dialog kit to replace). Mutation results render as an inline status line next to the action
+// buttons (CONST-26's Toast infra is on main now, but wiring these mutations onto it is left
+// to the CONST-29 polish pass rather than partially adopted here) -- deliberate, not an
+// oversight; see the README's Muse section.
 import { useState } from 'react';
 import { ChartCard } from '../../viz/ChartCard';
 import { DataTable } from '../../components/DataTable';
