@@ -11,6 +11,8 @@ import { getAggregationClient } from '../../lib/aggregationClient';
 import type { Density } from '../../components/GlobalBar';
 import { ModuleCard } from './ModuleCard';
 import type { CardState } from './ModuleCard';
+import { ActivityFeedCard } from './ActivityFeedCard';
+import type { FeedItem } from '../../lib/activityFeed';
 
 /** The `client.prefs` `'layout'` shape — a display order plus a hidden set, both keyed by
  *  ModuleId. Never holds anything else (no widget config, no per-card settings). */
@@ -39,9 +41,13 @@ interface OverviewPanelProps {
   health: HealthStatus[];
   degradedSystems: Set<string>;
   density: Density;
+  /** CONST-26 (§3.3): the shell's merged activity feed — renders as a fixed extra card in this
+   *  canvas (see `ActivityFeedCard`'s doc for why it's not a reorderable `ModuleCard`). Optional
+   *  so this panel keeps working for any test/story that doesn't pass one. */
+  feedItems?: FeedItem[];
 }
 
-export function OverviewPanel({ modules, health, degradedSystems, density }: OverviewPanelProps) {
+export function OverviewPanel({ modules, health, degradedSystems, density, feedItems }: OverviewPanelProps) {
   const client = useMemo(() => getAggregationClient(), []);
   const [layout, setLayout] = useState<LayoutPrefs>(
     () => client.prefs.get<LayoutPrefs>('layout') ?? DEFAULT_LAYOUT,
@@ -138,6 +144,7 @@ export function OverviewPanel({ modules, health, degradedSystems, density }: Ove
             />
           );
         })}
+        {feedItems && <ActivityFeedCard items={feedItems} />}
       </div>
 
       {hiddenIds.length > 0 && (

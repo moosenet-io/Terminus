@@ -19,7 +19,9 @@ const FETCH_LIMIT = 200;
 type FilterKey = 'system' | 'method' | 'principal';
 
 function distinctValues(entries: TerminusActivityEntry[], key: FilterKey): string[] {
-  return Array.from(new Set(entries.map(e => e[key]))).sort();
+  // `principal` is nullable in the canonical CONST-26 entry shape — filter the nulls out
+  // (an entry with no principal simply doesn't contribute a filter option).
+  return Array.from(new Set(entries.map(e => e[key]).filter((v): v is string => v != null))).sort();
 }
 
 export function ActivityPanel() {

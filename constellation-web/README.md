@@ -36,8 +36,30 @@ this is the contract the httpAdapter already assumes:
 | POST | `/api/auth/logout` | 200/204 |
 | GET | `/api/health` | `{ system: 'harmony'\|'chord'\|'lumina'\|'muse'\|'terminus'; available: boolean; detail?: string }[]` |
 | GET | `/api/terminus/config` | `{ modules: { name: string; enabled: boolean; version?: string; toolCount?: number; tools?: string[] }[]; workerCount: number }` (`toolCount`/`tools` are CONST-28, additive — a pre-CONST-28 backend response is still valid, just without them) |
-| GET | `/api/terminus/activity?limit=` | `{ entries: { ts: string; method: string; path: string; principal: string; system: SystemId }[] }` (CONST-26's endpoint; CONST-28's client degrades to `{available:false}` on 404/501/error — see Terminus module panels below) |
+| GET | `/api/terminus/activity?limit=N` | `{ entries: { ts: string; method: string; path: string; principal: string \| null; system: string }[] }` — tail of the CONST-02 mutating-request audit log; **never body content**. `limit` asks for fewer entries, never more than the server's own `CONSTELLATION_ACTIVITY_TAIL_LIMIT` cap (default 200). A missing/empty audit log yields `{entries: []}`, `200 OK` — never an error. CONST-28's client additionally degrades to `{available:false}` on 404/501/error (see Terminus module panels below). |
 | any | `/api/{system}/{path}` | generic passthrough used by `client.request<T>()` for panel-specific reads that don't have a typed method yet |
+
+**CONST-21 — the Models/MINT read API** (`src/constellation/models_api.rs`, spec
+`docs/constellation/CONST-GUI-SPEC.md` §8). Feeds the Model Library (CONST-22) and MINT
+(CONST-23/24) modules. Every endpoint is protected (session cookie, same guard as everything
+above), masked, read-only `GET`, and reuses the existing `src/intake/{storage,catalog,
+discovery}` read layer — no second database pool, no MCP self-calls. List endpoints take
+`limit` (default 50, max 500) + `offset` and report a `total`. `epoch` follows
+`EpochSelector`: absent ⇒ current epoch, `epoch=all` ⇒ every epoch, else ⇒ that one epoch.
+
+| Method | Path | What it returns |
+|---|---|---|
+| GET | `/api/terminus/models?scope=&q=&category=&status=&serving=&limit=&offset=` | paged, joined fleet-catalog ⋈ discovery-brochure ⋈ advisor-matrix ⋈ serving keep-warm view |
+| GET | `/api/terminus/models/{name}` | one model's identity/brochure/serving/operational/catalog sections (each independently `null` when that source has nothing; `404` only when the name is unknown to every source) |
+| GET | `/api/terminus/mint/summary?epoch=` | the Overview stat-tile payload (models profiled, run counts, fleet-best model, GPU-hours, current epoch) |
+| GET | `/api/terminus/mint/dimensions?models=&epoch=` | the capability-radar payload (8 assistant dimensions, fleet-wide normalized, + fleet median) |
+| GET | `/api/terminus/mint/matrix?epoch=` | the coverage heatmap (fleet-catalog cells) |
+| GET | `/api/terminus/mint/runs?suite=code\|context\|agent&…&limit=&offset=` | paged raw run rows (table-view / drill-down source). `epoch` applies to `suite=code` only — `context`/`agent` runs tables are epoch-less, so an explicit specific epoch there is a `400` (absent / `epoch=all` proceed) |
+| GET | `/api/terminus/mint/box?metric=total_time_ms\|code_quality_score&…` | server-side quartiles + outliers per model (raw rows never reach the browser) |
+| GET | `/api/terminus/mint/language-stats?language=&epoch=` | per-model/language rollup (the Pareto-scatter source) |
+| GET | `/api/terminus/mint/failures?epoch=&task_category=` | per-model failure-class counts, top-5 + "other" fold |
+| GET | `/api/terminus/mint/context-profiles?models=` | per-model context-tier arrays + `max_context_safe` |
+| GET | `/api/terminus/mint/activity?range=` | runs/day by suite + the current epoch marker |
 
 CONST-19 adds the fourth namespace, `/api/muse/*path` — identical single-door/masking/audit/
 degradation semantics to the other three, with one difference: `/api/muse/art/*` (poster/art
@@ -116,9 +138,48 @@ never reporting healthy; either way it silently doesn't render. No crash, no pla
   overlay (triggered from `GlobalBar`'s hamburger) below 760px.
 - **The Overview card canvas** (`/overview`, the default route, `src/panels/overview/`) is one
   seven-region `ModuleCard` per available module (drag handle, StatusPill, kind/role line,
-  metric row, last-activity line, Open/Configure + Hide, an expandable body). Operators can
-  drag-reorder, hide, and re-add cards ("+ Add widget"); a card focused with the keyboard
-  reorders via `⌘/Ctrl+arrow`. Layout + density persist **only** via `client.prefs`.
+  metric row, last-activity line, Open/Configure + Hide, an expandable body), plus a fixed
+  **`ActivityFeedCard`** (see below) that is not part of the drag/hide layout system. Operators
+  can drag-reorder, hide, and re-add module cards ("+ Add widget"); a card focused with the
+  keyboard reorders via `⌘/Ctrl+arrow`. Layout + density persist **only** via `client.prefs`.
+
+## Notifications & activity feed (CONST-26, §3.3)
+
+One shell-level hook, `useActivityFeed` (`src/hooks/useActivityFeed.ts`), merges three sources
+into a single, deduplicated, most-recent-first `FeedItem[]` — the pure merge/dedupe/severity
+logic lives in `src/lib/activityFeed.ts` (unit-testable independent of React/network):
+
+1. **Activity** — polls `GET /api/terminus/activity` every 30s (same cadence as the health
+   poll).
+2. **Health transitions** — diffs consecutive `/api/health` snapshots (e.g. `chord ->
+   unavailable`); `App.tsx`'s `Shell` is the one place already doing this diffing, so the hook
+   takes the shell's health state as input rather than polling a second time.
+3. **`/ws` events** — subscribes via `client.ws.connect()` (CONST-18); when no live event
+   stream is configured this contributes nothing, silently — no special-casing needed by
+   callers.
+
+This one feed backs two surfaces, both pure renderers with no polling/subscriptions of their
+own:
+
+- **`ActivityFeedCard`** (`src/panels/overview/ActivityFeedCard.tsx`) — an Overview canvas
+  widget rendering the feed in the brand's log-line voice (§2.2, `[ok] ...` / `[warn] ...` /
+  `[error] ...`).
+- **`NotificationBell`** (`src/components/NotificationBell.tsx`) — a bell menu in `GlobalBar`
+  retaining the **last 50 items, in memory only** — never `localStorage`/`sessionStorage` (the
+  CONST-16 `prefs` seam is layout/density state, not a notification history; this is
+  deliberately NOT routed through it).
+
+**Toasts** (`src/components/Toast.tsx`, `ToastProvider`/`useToastContext`, mounted once at the
+app root) fire for exactly two things, per spec — never anything else:
+
+- **Mutation results** — observed centrally via `aggregationClient`'s `onMutationResult`
+  seam, which every mutating (`POST`/`PUT`/`PATCH`/`DELETE`) `client.request<T>()` call already
+  emits on completion. No individual panel needs to opt in.
+- **Health transitions** — `App.tsx`'s `Shell` passes a callback into `useActivityFeed` that
+  also pushes a toast for each detected transition.
+
+Toasts auto-dismiss after 6s and render in a fixed `aria-live="polite"` region so a screen
+reader announces one without interrupting the current task.
 
 ## Adding a panel
 
@@ -140,6 +201,34 @@ fallback was deliberately dropped, not ported, and CONST-16's prefs seam does no
 door — it's structurally incapable of storing a credential shape). Vault-referenced secrets
 (provider API keys, etc., landing in CONST-08+) must be surfaced as a vault key *name* with a
 set/rotate affordance, never a round-tripped value.
+
+## Roles (CONST-27)
+
+There are exactly two session tiers, both minted onto the same signed JWT from CONST-03 (no
+new auth system, no per-module ACLs — YAGNI for a single-operator fleet):
+
+- **operator** — full read/write. Also the default for a session token with no `role` claim
+  at all (every session minted before CONST-27 shipped), so a live login survives the deploy.
+- **viewer** — read-only. Logs in against `CONSTELLATION_VIEWER_SECRET` (a *second*,
+  distinct <secret-manager>-provisioned secret checked after the operator secret) and gets a
+  structural `403 {"error":"forbidden","required_role":"operator"}` from the server on every
+  mutating method (`POST`/`PUT`/`PATCH`/`DELETE`) — see
+  `src/constellation/auth.rs::enforce_viewer_role_gate` and its `.env.example` entry.
+
+**The enforcement is server-side, not this app.** `getAggregationClient().auth.me()` returns
+a `role` field (`'operator' | 'viewer' | null`), republished app-wide via
+`AuthRoleContext`/`useAuthRole()` (`src/hooks/AuthRoleContext.tsx`) so `RoleGate`
+(`src/components/RoleGate.tsx`) can wrap a mutating control and render it disabled with an
+"operator role required" tooltip for a viewer session. That's a courtesy only — proven by the
+Rust test suite issuing a direct `POST` as a viewer and asserting `403`, independent of
+whatever this UI renders. Currently gated: the harmony dashboard's engine/build/mode/
+inference-mix/compression/command controls (`EngineControls`, `BuildControls`,
+`ModeSelector`, `InferenceMixSlider`, `ConversationBar`). Chord and Muse have no mutating
+panels yet in this checkout (tracked separately under CONST-05..14/CONST-28 and the Muse
+sprints) — gate their write controls with the same `RoleGate` when those panels land, and
+the palette's *action* commands (not yet built — today's `MiniPalette` in `GlobalBar.tsx` is
+navigation-only) the same way once CONST-25 adds them.
+
 
 ## Brand system (CONST-17)
 

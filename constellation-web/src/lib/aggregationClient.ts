@@ -18,9 +18,15 @@
  *  `muse` added by CONST-19 (the fourth namespaced proxy arm; UI panels land in CONST-20). */
 export type SystemId = 'harmony' | 'chord' | 'lumina' | 'muse' | 'terminus';
 
+/** CONST-27 (§3.4): a session's access tier. `null` when unauthenticated. The UI's `RoleGate`
+ *  reads this to disable mutating controls for a viewer — cosmetic only; the server enforces
+ *  the same rule structurally (`enforce_viewer_role_gate` — 403 on every mutating method). */
+export type AuthRole = 'operator' | 'viewer' | null;
+
 export interface AuthMeResponse {
   authenticated: boolean;
   username: string | null;
+  role: AuthRole;
 }
 
 export interface HealthStatus {
@@ -46,26 +52,95 @@ export interface TerminusConfigSummary {
   workerCount: number;
 }
 
-// ── Activity (CONST-28, against the CONST-26 contract) ──────────────────────
-// `GET /api/terminus/activity?limit=` is owned/implemented by CONST-26, landing in parallel —
-// this client only codifies the §8 contract shape and degrades gracefully (available:false)
-// when the endpoint isn't live yet (404/501) or the module hasn't landed on a given backend.
-
-export interface TerminusActivityEntry {
+/** CONST-26: one line of the constellation aggregation layer's mutating-request audit trail,
+ *  as surfaced by `GET /api/terminus/activity` — never body content, see that endpoint's doc. */
+export interface ActivityEntry {
+  /** RFC 3339 UTC timestamp. */
   ts: string;
   method: string;
   path: string;
-  principal: string;
-  system: SystemId;
+  principal: string | null;
+  system: SystemId | 'auth';
 }
 
-export interface TerminusActivityResponse {
-  entries: TerminusActivityEntry[];
-  /** false when the request 404/501'd (endpoint not live) or otherwise failed — ActivityPanel
-   *  renders a "not live yet" empty state rather than an error in that case. */
+export interface ActivityFeedResponse {
+  entries: ActivityEntry[];
+}
+
+// ── Mutation-result event seam (CONST-26, §3.3) ──────────────────────────────
+// `request<T>()` is the ONE call-site every panel/hook already routes a mutating
+// (POST/PUT/PATCH/DELETE) backend call through (see the doc comment on `AggregationClient`
+// above + this file's grep-gated "single path to the backend" rule) — so this is where the
+// activity-feed/toast layer observes "a mutation happened and here's whether it succeeded"
+// WITHOUT every existing call site needing to change. Fired by both adapters below, after the
+// underlying request settles either way.
+
+export interface MutationResultEvent {
+  system: SystemId;
+  method: string;
+  path: string;
+  ok: boolean;
+  /** Present only when `ok` is false — a short message suitable for a toast, never a raw
+   *  response body (this seam only ever sees success/failure, not payloads). */
+  error?: string;
+}
+
+type MutationResultListener = (event: MutationResultEvent) => void;
+
+const mutationResultListeners = new Set<MutationResultListener>();
+
+/** Subscribe to every mutating `request<T>()` call's outcome, across BOTH adapters. Returns an
+ *  unsubscribe function. Intended for exactly one caller: the toast layer
+ *  (`components/Toast.tsx`) — but deliberately a plain subscribe seam (not hardwired to that
+ *  module) so this file stays free of a UI-layer import. */
+export function onMutationResult(listener: MutationResultListener): () => void {
+  mutationResultListeners.add(listener);
+  return () => mutationResultListeners.delete(listener);
+}
+
+function emitMutationResult(event: MutationResultEvent): void {
+  mutationResultListeners.forEach(listener => listener(event));
+}
+
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+/** Wraps a `request<T>()` implementation so every mutating call emits a
+ *  [`MutationResultEvent`] on completion (success or failure), regardless of which adapter
+ *  (mock/http) is active. Non-mutating (`GET`, default) calls pass through untouched — the
+ *  activity feed cares about "what changed", not every read. */
+async function withMutationResultEvent<T>(
+  system: SystemId,
+  path: string,
+  init: RequestInit | undefined,
+  run: () => Promise<T>,
+): Promise<T> {
+  const method = (init?.method ?? 'GET').toUpperCase();
+  if (!MUTATING_METHODS.has(method)) {
+    return run();
+  }
+  try {
+    const result = await run();
+    emitMutationResult({ system, method, path, ok: true });
+    return result;
+  } catch (e) {
+    emitMutationResult({ system, method, path, ok: false, error: e instanceof Error ? e.message : String(e) });
+    throw e;
+  }
+
+}
+
+// ── CONST-28 compat layer over the CONST-26 activity contract ───────────────
+/** Alias — CONST-28's panels were built against this name; the canonical entry shape is
+ *  CONST-26's [`ActivityEntry`]. */
+export type TerminusActivityEntry = ActivityEntry;
+/** CONST-28: degrade-aware response — `available:false` (never a throw) when the endpoint
+ *  404/501s or the request fails, so ActivityPanel renders a "not live" empty state. A
+ *  superset of [`ActivityFeedResponse`]; CONST-26 consumers keep reading `.entries`. */
+export interface TerminusActivityResponse extends ActivityFeedResponse {
   available: boolean;
   detail?: string;
 }
+
 
 /**
  * The single typed entry point for `/api/{harmony,chord,lumina,muse,terminus}/*`.
@@ -83,8 +158,9 @@ export interface AggregationClient {
   };
   terminus: {
     configSummary(): Promise<TerminusConfigSummary>;
-    /** CONST-28: per §8 contract `GET /api/terminus/activity?limit=`. Never throws — see
-     *  `TerminusActivityResponse.available` for the degrade signal. */
+    /** CONST-26 contract (`GET /api/terminus/activity?limit=`), CONST-28 degrade semantics:
+     *  never throws — `available:false` signals the endpoint is unreachable/not live, and the
+     *  Overview feed/bell + ActivityPanel each render their own empty/degraded state. */
     activity(limit?: number): Promise<TerminusActivityResponse>;
   };
   /**
@@ -425,10 +501,12 @@ function mockWsConnect(handlers: WsHandlers): WsConnection {
 const mockAdapter: AggregationClient = {
   auth: {
     async me() {
-      return delay({ authenticated: true, username: 'mock-user' });
+      // Mock mode is always an operator session — no real login flow to distinguish tiers
+      // (CONST-27's viewer tier is exercised via the http adapter against a real backend).
+      return delay({ authenticated: true, username: 'mock-user', role: 'operator' });
     },
     async login(username: string) {
-      return delay({ authenticated: true, username });
+      return delay({ authenticated: true, username, role: 'operator' });
     },
     async logout() {
       await delay(undefined, 40);
@@ -443,12 +521,13 @@ const mockAdapter: AggregationClient = {
     async configSummary() {
       return delay(MOCK_TERMINUS_CONFIG);
     },
-    async activity(limit = 50) {
-      return delay({ entries: MOCK_ACTIVITY_ENTRIES.slice(0, limit), available: true });
+    async activity(limit?: number) {
+      const entries = limit != null ? MOCK_ACTIVITY_ENTRIES.slice(-limit) : MOCK_ACTIVITY_ENTRIES;
+      return delay({ entries, available: true });
     },
   },
   async request<T>(system: SystemId, path: string, init?: RequestInit): Promise<T> {
-    return mockRequest<T>(system, path, init);
+    return withMutationResultEvent(system, path, init, () => mockRequest<T>(system, path, init));
   },
   ws: {
     connect: mockWsConnect,
@@ -463,8 +542,8 @@ const mockAdapter: AggregationClient = {
 //   POST /api/auth/logout        -> 204/200
 //   GET  /api/health             -> HealthStatus[]
 //   GET  /api/terminus/config    -> TerminusConfigSummary (CONST-28: modules[].toolCount/tools additive)
-//   GET  /api/terminus/activity?limit= -> { entries: TerminusActivityEntry[] } (CONST-26; CONST-28
-//                                    degrades to {available:false} on 404/501/error)
+//   GET  /api/terminus/activity?limit=N -> ActivityFeedResponse (CONST-26; never body content;
+//                                    CONST-28 client degrades to {available:false} on 404/501/error)
 //   *    /api/{system}/{path}    -> generic passthrough for `request<T>()`
 //   WS   /ws                     -> same-origin, session-cookie-authenticated event stream
 //                                    (engine/ralph-loop/log/tree_update events); see ws.connect()
@@ -537,7 +616,7 @@ const httpAdapter: AggregationClient = {
       try {
         return await httpJson<AuthMeResponse>('/api/auth/me');
       } catch {
-        return { authenticated: false, username: null };
+        return { authenticated: false, username: null, role: null };
       }
     },
     async login(username: string, password: string) {
@@ -560,11 +639,11 @@ const httpAdapter: AggregationClient = {
       return httpJson<TerminusConfigSummary>('/api/terminus/config');
     },
     async activity(limit = 50) {
-      // CONST-28/§8: degrade gracefully (available:false) rather than throw — this endpoint
-      // is owned by CONST-26 and may not be live on a given deploy yet (404/501), or any other
-      // transient failure. ActivityPanel renders an explanatory empty state on `!available`.
+      // CONST-28/§8: degrade gracefully (available:false) rather than throw — 404/501 on a
+      // deploy without the endpoint, or any transient failure. Both the Overview feed/bell
+      // (CONST-26) and ActivityPanel read `.entries`; the flag is additive.
       try {
-        const res = await httpJson<{ entries: TerminusActivityEntry[] }>(
+        const res = await httpJson<ActivityFeedResponse>(
           `/api/terminus/activity?limit=${encodeURIComponent(String(limit))}`,
         );
         return { entries: res.entries, available: true };
@@ -575,7 +654,7 @@ const httpAdapter: AggregationClient = {
   },
   async request<T>(system: SystemId, path: string, init?: RequestInit): Promise<T> {
     const normalized = path.startsWith('/') ? path : `/${path}`;
-    return httpJson<T>(`/api/${system}${normalized}`, init);
+    return withMutationResultEvent(system, path, init, () => httpJson<T>(`/api/${system}${normalized}`, init));
   },
   ws: {
     connect(handlers: WsHandlers): WsConnection {
