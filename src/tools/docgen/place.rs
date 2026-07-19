@@ -37,8 +37,11 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use super::readme_layers::{check_landing_length, check_landing_links};
+use super::prompts::RepoIdentity;
+use super::quality::{check_landing_diagram, check_landing_identity};
+use super::readme_layers::{check_landing_length, check_landing_links, check_landing_substance};
 use super::render::docs_tree::DocsTreeFile;
+use super::repo_facts::RepoFacts;
 
 /// Repo-relative path the rendered landing README is always placed at.
 pub const README_PATH: &str = "README.md";
@@ -342,6 +345,64 @@ pub fn place_docs(target_root: &Path, landing: &str, docs_tree: &[DocsTreeFile])
     }
 
     report
+}
+
+/// DGRICH-09: the repo-level rich-pipeline door onto [`place_docs`].
+///
+/// DGRICH-07 shipped the substance floor
+/// ([`super::readme_layers::check_landing_substance`]) and the
+/// generic-diagram lint ([`super::diagram::is_generic_placeholder`], via
+/// [`super::quality::check_landing_diagram`]) as a STOPGAP running inline
+/// inside `trigger::run_repo_level_trigger`, ahead of a plain `place_docs`
+/// call -- its own doc comment named DGRICH-09 as "the item that folds
+/// these into `place_docs`'s own fail-closed set for EVERY caller." This
+/// function is that consolidation: it runs the substance floor, the
+/// generic-diagram lint, and (DGRICH-02 backstop)
+/// [`super::quality::check_landing_identity`] -- fail-closed, before
+/// anything is written -- and only then delegates to [`place_docs`], which
+/// still independently enforces its own length/dangling-link gate exactly
+/// as before. `trigger::run_repo_level_trigger` now calls this instead of
+/// re-implementing the same checks ad hoc, so there is exactly one place
+/// a repo-level landing's full DGRICH gate set is enforced.
+///
+/// - `facts`: the same `RepoFacts` the repo-level pipeline built `landing`
+///   from -- used by [`super::quality::check_landing_identity`]'s subsystem
+///   name list.
+/// - `identity`: `None` when Pass 1 never succeeded (the
+///   `trigger::minimal_landing` case) -- the identity-lint backstop is then
+///   a no-op (nothing generated to re-check); the substance floor and
+///   diagram lint still apply unconditionally to whatever landing text was
+///   assembled.
+///
+/// A failure of ANY of these three gates writes NOTHING (same fail-closed
+/// contract as [`place_docs`] itself) and is reported via
+/// [`PlacementReport::withheld`].
+pub fn place_repo_docs(
+    target_root: &Path,
+    landing: &str,
+    docs_tree: &[DocsTreeFile],
+    facts: &RepoFacts,
+    identity: Option<&RepoIdentity>,
+) -> PlacementReport {
+    let mut gate_failures = Vec::new();
+
+    if let Err(e) = check_landing_substance(landing) {
+        gate_failures.push(e);
+    }
+    if let Err(e) = check_landing_diagram(landing) {
+        gate_failures.push(e);
+    }
+    if let Some(identity) = identity {
+        if let Err(e) = check_landing_identity(identity, facts) {
+            gate_failures.push(e);
+        }
+    }
+
+    if !gate_failures.is_empty() {
+        return PlacementReport::withheld(gate_failures.join("; "));
+    }
+
+    place_docs(target_root, landing, docs_tree)
 }
 
 #[cfg(test)]
@@ -807,6 +868,140 @@ mod tests {
         assert!(root.join("README.md").exists());
         assert!(root.join("docs/index.md").exists());
         assert!(root.join("docs/guides/index.md").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── DGRICH-09: place_repo_docs ──────────────────────────────────────
+
+    fn sample_facts() -> RepoFacts {
+        RepoFacts { project_id: "TERM".to_string(), git_ref: "abc123".to_string(), ..Default::default() }
+    }
+
+    fn sample_identity() -> RepoIdentity {
+        RepoIdentity {
+            tagline: "The fleet's MCP tool hub.".to_string(),
+            what_is: "Exposes fleet tools over MCP behind an mTLS mesh gateway.".to_string(),
+            audience: "operators".to_string(),
+            subsystems: Vec::new(),
+            feature_rows: Vec::new(),
+            guide_topics: Vec::new(),
+        }
+    }
+
+    /// A real landing (>=80 substantive lines, a real >=5-node diagram, a
+    /// clean identity) places successfully through the repo-level door,
+    /// exactly like a plain `place_docs` call would.
+    #[test]
+    fn place_repo_docs_writes_a_landing_that_clears_every_gate() {
+        let root = unique_tmp_dir("repo-docs-happy");
+        let mut body = String::from("# Terminus\n\n");
+        body.push_str("```mermaid\nflowchart LR\n    A[a (10 symbols)] --> B[b (9 symbols)]\n    B --> C[c (8 symbols)]\n    C --> D[d (7 symbols)]\n    D --> E[e (6 symbols)]\n```\n\n");
+        for i in 0..90 {
+            body.push_str(&format!("Line {i} of real substantive content describing the repository.\n"));
+        }
+        let facts = sample_facts();
+        let identity = sample_identity();
+
+        let report = place_repo_docs(&root, &body, &[], &facts, Some(&identity));
+
+        assert!(report.gate_failures.is_empty(), "{:?}", report.gate_failures);
+        assert!(report.written.contains(&README_PATH.to_string()));
+        assert!(root.join("README.md").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Negative test: a sub-floor landing (well under
+    /// `LANDING_MIN_SUBSTANTIVE_LINES`) is withheld -- nothing written.
+    #[test]
+    fn place_repo_docs_withholds_a_sub_floor_landing() {
+        let root = unique_tmp_dir("repo-docs-sub-floor");
+        let sparse = "# Terminus\n\nA short landing.\n";
+        let facts = sample_facts();
+
+        let report = place_repo_docs(&root, sparse, &[], &facts, None);
+
+        assert!(report.written.is_empty());
+        assert_eq!(report.gate_failures.len(), 1);
+        assert!(report.gate_failures[0].contains("substance"), "{:?}", report.gate_failures);
+        assert!(!root.join("README.md").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Negative test: a generic (Client/Core/Output) diagram is withheld
+    /// even when the rest of the landing clears the substance floor.
+    #[test]
+    fn place_repo_docs_withholds_a_generic_diagram() {
+        let root = unique_tmp_dir("repo-docs-generic-diagram");
+        let mut body = String::from("# Terminus\n\n");
+        body.push_str("```mermaid\nflowchart LR\n    A[Client] --> B[Core] --> C[Output]\n```\n\n");
+        for i in 0..90 {
+            body.push_str(&format!("Line {i} of real substantive content describing the repository.\n"));
+        }
+        let facts = sample_facts();
+
+        let report = place_repo_docs(&root, &body, &[], &facts, None);
+
+        assert!(report.written.is_empty());
+        assert!(report.gate_failures.iter().any(|f| f.contains("generic")), "{:?}", report.gate_failures);
+        assert!(!root.join("README.md").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Negative test: an identity latched onto a single subsystem is
+    /// withheld by the identity-lint backstop even when substance/diagram
+    /// both clear.
+    #[test]
+    fn place_repo_docs_withholds_a_latched_identity() {
+        let root = unique_tmp_dir("repo-docs-latched-identity");
+        let mut body = String::from("# Terminus\n\n");
+        body.push_str("```mermaid\nflowchart LR\n    A[a (10 symbols)] --> B[b (9 symbols)]\n    B --> C[c (8 symbols)]\n    C --> D[d (7 symbols)]\n    D --> E[e (6 symbols)]\n```\n\n");
+        for i in 0..90 {
+            body.push_str(&format!("Line {i} of real substantive content describing the repository.\n"));
+        }
+        let mut facts = sample_facts();
+        facts.subsystems = vec![
+            super::super::repo_facts::Subsystem { name: "intake".to_string(), ..Default::default() },
+            super::super::repo_facts::Subsystem { name: "scribe".to_string(), ..Default::default() },
+            super::super::repo_facts::Subsystem { name: "cortex".to_string(), ..Default::default() },
+        ];
+        let identity = RepoIdentity {
+            tagline: "The intake model-discovery engine.".to_string(),
+            what_is: "Built around intake, the model-discovery and profiling engine.".to_string(),
+            audience: "operators".to_string(),
+            subsystems: Vec::new(),
+            feature_rows: Vec::new(),
+            guide_topics: Vec::new(),
+        };
+
+        let report = place_repo_docs(&root, &body, &[], &facts, Some(&identity));
+
+        assert!(report.written.is_empty());
+        assert!(report.gate_failures.iter().any(|f| f.contains("anti-latch")), "{:?}", report.gate_failures);
+        assert!(!root.join("README.md").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `identity: None` (Pass 1 never succeeded) skips the identity-lint
+    /// backstop entirely rather than treating absence as a failure.
+    #[test]
+    fn place_repo_docs_with_no_identity_skips_the_identity_backstop() {
+        let root = unique_tmp_dir("repo-docs-no-identity");
+        let mut body = String::from("# Terminus\n\n");
+        body.push_str("```mermaid\nflowchart LR\n    A[a (10 symbols)] --> B[b (9 symbols)]\n    B --> C[c (8 symbols)]\n    C --> D[d (7 symbols)]\n    D --> E[e (6 symbols)]\n```\n\n");
+        for i in 0..90 {
+            body.push_str(&format!("Line {i} of real substantive content describing the repository.\n"));
+        }
+        let facts = sample_facts();
+
+        let report = place_repo_docs(&root, &body, &[], &facts, None);
+
+        assert!(report.gate_failures.is_empty(), "{:?}", report.gate_failures);
+        assert!(report.written.contains(&README_PATH.to_string()));
 
         std::fs::remove_dir_all(&root).ok();
     }
