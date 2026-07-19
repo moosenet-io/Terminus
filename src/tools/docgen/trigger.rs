@@ -95,11 +95,13 @@
 //!   remain a filesystem-free call exactly as DLAND-04 already guarantees
 //!   (see `run_never_touches_filesystem_or_repo` /
 //!   `place_false_never_touches_the_target_root_even_if_supplied`). Given
-//!   both, `RepoFacts` is built against `target_root` as the checkout path;
-//!   the mode is then selected when EITHER `facts.kg_grounded` is true OR
-//!   `target_root` looks like a full checkout (`Cargo.toml` at its root --
-//!   `looks_like_full_checkout`). Neither signal -> the legacy per-module
-//!   flow below runs completely unchanged.
+//!   both, the mode is selected when `target_root` looks like a full checkout
+//!   (`Cargo.toml` at its root -- `looks_like_full_checkout`), which is
+//!   deterministic and env-independent. `facts.kg_grounded` is NOT part of the
+//!   gate (it reflects the ambient `SCRIBE_KG_STORE_DIR` store, so keying off
+//!   it would divert existing legacy callers whose project id happens to be in
+//!   that store); it only decides how RICH the built facts are. Not a checkout
+//!   -> the legacy per-module flow below runs completely unchanged.
 //! - **Flow.** [`super::repo_facts::build_repo_facts`] (DGRICH-01) ->
 //!   [`super::generate::generate_repo_docs`] (DGRICH-03, Passes 1-3) ->
 //!   [`super::readme_layers::build_landing_body`] (DGRICH-05) ->
@@ -480,17 +482,28 @@ not invoked"
     // checkout path there is nothing for `build_repo_facts` to scan, and
     // `place=false` must stay a filesystem-free call exactly as DLAND-04
     // already guarantees (see the module doc comment's "DGRICH-07:
-    // repo-level mode" section for why this mirrors that gate). Detection:
-    // `RepoFacts` is built against `target_root`; the mode is selected when
-    // EITHER the project has a KG (`facts.kg_grounded`) OR `target_root`
-    // looks like a full checkout (`looks_like_full_checkout`). Neither
-    // signal -- or a hard error building `RepoFacts` at all -- falls through
-    // to the legacy per-module flow below, completely unchanged.
+    // repo-level mode" section for why this mirrors that gate).
+    //
+    // Detection is `looks_like_full_checkout(target_root)` -- a REAL checkout
+    // on disk -- and NOT `facts.kg_grounded`. This is deliberate and
+    // env-independent: `build_repo_facts` marks `kg_grounded` from the ambient
+    // Atlas store (`SCRIBE_KG_STORE_DIR`) regardless of what `target_root`
+    // points at, so keying mode selection off it would let any existing legacy
+    // test that happens to use a real project id (e.g. "TERM") plus
+    // `place=true` slip into repo-level mode purely because the build host's KG
+    // store has that project -- breaking test isolation and the "legacy path
+    // otherwise unchanged" guarantee (codex review finding). The rich pipeline
+    // needs the source tree anyway (entry points / config / prose all come from
+    // the checkout), so a real checkout is the correct, deterministic gate;
+    // `facts.kg_grounded` then only decides how RICH the facts are (grounded vs
+    // degraded), not WHETHER repo-level mode runs. A temp/non-checkout
+    // `target_root` -- or a hard error building `RepoFacts` -- falls through to
+    // the legacy per-module flow below, completely unchanged.
     if place {
         if let Some(root) = target_root {
             let root_path = std::path::Path::new(root);
-            if let Ok(facts) = build_repo_facts(graph_source, root_path, project, git_ref) {
-                if facts.kg_grounded || looks_like_full_checkout(root_path) {
+            if looks_like_full_checkout(root_path) {
+                if let Ok(facts) = build_repo_facts(graph_source, root_path, project, git_ref) {
                     return run_repo_level_trigger(
                         generator,
                         version_store,
@@ -1629,10 +1642,12 @@ duration of a real end-to-end run.",
     #[tokio::test]
     async fn repo_level_mode_forced_generator_failure_yields_completed_never_failed() {
         let root = unique_tmp_dir("dgrich07-repo-level-forced-failure");
-        // Even an EMPTY graph still reports `kg_grounded: true` -- any
-        // `Some(graph)` from the `GraphSource` does (see
-        // `repo_facts::build_repo_facts`) -- which is exactly the detection
-        // signal DGRICH-07's APPROACH step 1 calls for.
+        // Repo-level mode is gated on a REAL checkout (a Cargo.toml on disk),
+        // env-independently -- NOT on ambient `kg_grounded` (codex review).
+        // Mark this temp root as a checkout so repo-level mode is selected here.
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+        // The empty graph still reports `kg_grounded: true` -- so the facts are
+        // grounded; combined with the checkout marker, repo-level mode runs.
         let graph_source = FixtureGraphSource(KnowledgeGraph::new("TERM"));
         let generator = MockDocGenerator::failing("chord backend unreachable");
         let store = VersionStore::new();
@@ -1734,6 +1749,52 @@ duration of a real end-to-end run.",
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// codex review regression: a GROUNDED graph source (kg_grounded=true) must
+    /// NOT be enough to enter repo-level mode when `target_root` is not a real
+    /// checkout -- otherwise an ambient `SCRIBE_KG_STORE_DIR` entry for the
+    /// project id would silently divert existing legacy callers. With no
+    /// Cargo.toml on disk, the legacy path must run regardless of the grounded
+    /// graph (empty pass ledger == legacy).
+    #[tokio::test]
+    async fn grounded_graph_without_a_checkout_stays_on_the_legacy_path() {
+        let root = unique_tmp_dir("dgrich07-grounded-no-checkout");
+        // NOTE: deliberately NO Cargo.toml written -> not a checkout.
+        let graph_source = FixtureGraphSource(KnowledgeGraph::new("TERM"));
+        let generator = MockDocGenerator::ok(
+            "# terminus-rs docgen module\n\nLegacy render path.\n\n## Quickstart\n\nRun it.\n\n## Deep Dive\n\nDetails.\n",
+        );
+        let store = VersionStore::new();
+
+        let outcome = run_docgen_trigger_with_graph_source(
+            &generator,
+            &graph_source,
+            &store,
+            "TERM",
+            "src/tools/docgen",
+            "dgrich07c",
+            None,
+            "grounded graph but no checkout on disk",
+            Some(&readme_config()),
+            &BTreeSet::new(),
+            "2026-07-18T00:00:00Z",
+            true,
+            Some(root.to_str().unwrap()),
+        )
+        .await;
+
+        match outcome {
+            TriggerOutcome::Completed { pass_ledger, .. } => {
+                assert!(
+                    pass_ledger.is_empty(),
+                    "a grounded graph without a checkout must NOT enter repo-level mode: {pass_ledger:?}"
+                );
+            }
+            other => panic!("expected legacy Completed, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// TEST PLAN: "pass ledger present on Completed" -- a repo-level run
     /// whose identity + guides passes both succeed (zero subsystems in this
     /// fixture, so Pass 2 makes zero calls) surfaces a populated
@@ -1741,6 +1802,9 @@ duration of a real end-to-end run.",
     #[tokio::test]
     async fn repo_level_pass_ledger_present_on_completed_with_successful_generation() {
         let root = unique_tmp_dir("dgrich07-pass-ledger");
+        // Mark as a real checkout so repo-level mode is selected (see the
+        // env-independent gate note in run_docgen_trigger_with_graph_source).
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
         let graph_source = FixtureGraphSource(KnowledgeGraph::new("TERM"));
 
         let identity_json = r#"{
