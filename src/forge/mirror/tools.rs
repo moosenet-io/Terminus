@@ -67,7 +67,6 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -85,7 +84,9 @@ use super::history::{
 };
 use super::pr_replay::{replay_pr, PrReplayConfig};
 use crate::forge::registry::{ForgePool, ForgeRegistry};
-use super::workdir::{assert_never_force, run_git, MirrorWorkDir, WORKDIR_ROOT_ENV};
+use super::workdir::{
+    assert_never_force, mirror_git, mirror_git_plain, run_git, MirrorWorkDir, WORKDIR_ROOT_ENV,
+};
 
 /// Environment variable holding the target GitHub mirror remote URL when a call
 /// does not pass one explicitly. Checked per-repo first
@@ -963,10 +964,12 @@ fn perform_ff_push(
     // Refspec `<sha>:refs/heads/main` with NO leading `+` — git refuses a
     // non-fast-forward update, a second safety net beneath our ff pre-check.
     let refspec = format!("{approved_commit}:refs/heads/main");
-    // `-c core.hooksPath=/dev/null` disables hooks (e.g. a planted pre-push) for the
-    // same reason GHMR-03's run_git does: the work dir is cleaner-writable and must
-    // never execute a hook under the parent's environment during transport.
-    let argv = ["-c", "core.hooksPath=/dev/null", "-c", "protocol.file.allow=always", "push", "--", remote, &refspec];
+    // The push subcommand argv itself (force-guarded below); [`mirror_git`] layers
+    // on the shared base `-c` config (hooks off, gpgsign off, local `file://`
+    // transport allowed for the headless test-gate) the same way GHMR-03's
+    // run_git does: the work dir is cleaner-writable and must never execute a
+    // hook under the parent's environment during transport.
+    let argv = ["push", "--", remote, &refspec];
     assert_never_force(&argv);
 
     // GIT_ASKPASS script reads the token from a private env var passed only to
@@ -975,8 +978,7 @@ fn perform_ff_push(
     // test remote git never invokes askpass, so the token is simply unused there.
     let askpass = write_askpass_script()?;
     let result = (|| {
-        let output = Command::new("git")
-            .current_dir(work_dir)
+        let output = mirror_git(work_dir)
             .args(argv)
             .env("GIT_ASKPASS", askpass.path())
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -1051,7 +1053,7 @@ impl Drop for AskpassScript {
 /// stdout on success. Force-guarded like every other git argv in the engine.
 fn run_git_plain(args: &[&str]) -> Result<String, ToolError> {
     assert_never_force(args);
-    let output = Command::new("git")
+    let output = mirror_git_plain()
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()
@@ -1073,8 +1075,7 @@ fn run_git_plain(args: &[&str]) -> Result<String, ToolError> {
 /// no-op-on-error shape; force-guarded.
 fn git_exit_ok(work_dir: &Path, args: &[&str]) -> bool {
     assert_never_force(args);
-    Command::new("git")
-        .current_dir(work_dir)
+    mirror_git(work_dir)
         .args(args)
         .output()
         .map(|o| o.status.success())
@@ -1175,9 +1176,7 @@ fn assert_source_sync_safe(argv: &[&str]) {
 /// tolerates the one sanctioned `reset --hard origin/<branch>` shape.
 fn run_source_git(cwd: &Path, args: &[&str]) -> Result<String, ToolError> {
     assert_source_sync_safe(args);
-    let output = Command::new("git")
-        .current_dir(cwd)
-        .args(["-c", "core.hooksPath=/dev/null", "-c", "protocol.file.allow=always"])
+    let output = mirror_git(cwd)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()
@@ -1201,7 +1200,7 @@ fn run_source_git(cwd: &Path, args: &[&str]) -> Result<String, ToolError> {
 fn run_git_askpass_plain(args: &[&str], token: &str) -> Result<String, ToolError> {
     assert_source_sync_safe(args);
     let askpass = write_askpass_script()?;
-    let output = Command::new("git")
+    let output = mirror_git_plain()
         .args(args)
         .env("GIT_ASKPASS", askpass.path())
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -1227,9 +1226,7 @@ fn run_git_askpass_plain(args: &[&str], token: &str) -> Result<String, ToolError
 fn run_git_askpass_in(cwd: &Path, args: &[&str], token: &str) -> Result<String, ToolError> {
     assert_source_sync_safe(args);
     let askpass = write_askpass_script()?;
-    let output = Command::new("git")
-        .current_dir(cwd)
-        .args(["-c", "core.hooksPath=/dev/null", "-c", "protocol.file.allow=always"])
+    let output = mirror_git(cwd)
         .args(args)
         .env("GIT_ASKPASS", askpass.path())
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -2376,8 +2373,11 @@ mod tests {
     /// Raw git that BYPASSES the mirror force-guard — for test *setup* only (e.g.
     /// force-diverging the stand-in remote). Never used by production code paths.
     fn raw_git(dir: &Path, args: &[&str]) {
-        let ok = std::process::Command::new("git")
-            .current_dir(dir)
+        // Deliberately bypasses assert_never_force (that's the point — see doc
+        // above), but still needs the shared base config's
+        // `protocol.file.allow=always` to push/fetch against a local bare-repo
+        // path under the headless test-gate's restrictive ambient git config.
+        let ok = mirror_git(dir)
             .args(args)
             .status()
             .unwrap()

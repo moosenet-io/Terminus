@@ -602,8 +602,7 @@ fn clear_tree_except_git(dir: &Path) -> Result<(), ToolError> {
 /// entries). Both `git` and `tar` are present on the dev box, the sanctioned
 /// git-transport host where this runs.
 fn export_tree(src: &Path, dst: &Path, sha: &str) -> Result<(), ToolError> {
-    let mut archive = Command::new("git")
-        .current_dir(src)
+    let mut archive = mirror_git(src)
         .args(["archive", "--format=tar", sha])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -690,15 +689,65 @@ pub(crate) fn assert_never_force(argv: &[&str]) {
 /// `git commit` would hang or fail entirely. Overriding it on the command
 /// line (like `core.hooksPath` above) always wins over repo/global/system
 /// config, keeping every commit this engine makes fully self-contained.
-const HOOKS_OFF: &[&str] = &["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "-c", "protocol.file.allow=always"];
+/// Canonical base `-c` config injected into EVERY git invocation anywhere in the
+/// `forge::mirror` module (all of `tools.rs`, `history.rs`, `workdir.rs`,
+/// `pr_replay.rs`, `run_git`, and every test-fixture helper). This is the single
+/// place that config is defined — other modules reference this constant (or, for
+/// call sites that build a `Command` directly, the [`mirror_git`] /
+/// [`mirror_git_plain`] helpers below) rather than keeping their own divergent
+/// copies.
+///
+///   * `core.hooksPath=/dev/null` — disables repo hooks (see the long rationale
+///     this constant used to carry, preserved on [`assert_never_force`]'s
+///     neighbor doc above): the work dir is populated/edited by
+///     not-fully-sandboxed code and could contain a hostile
+///     `.git/hooks/pre-commit`; overriding `core.hooksPath` on the command line
+///     always wins over repo config, so no hook ever runs.
+///   * `commit.gpgsign=false` — every commit this engine makes is authored as
+///     the bot identity, never the deploying operator's; it must never silently
+///     pick up an ambient personal GPG signing key (which could also hang/fail
+///     in a headless build/test sandbox with no agent/passphrase reachable).
+///   * `protocol.file.allow=always` — modern git (CVE-2022-39253 hardening)
+///     refuses the `file://`/local-path transport whenever the ambient git
+///     config sets `protocol.file.allow=never` (as the compiler test-gate's
+///     restrictive root config does). Every mirror git op that ever touches a
+///     LOCAL bare repo (`ls-remote`, `fetch`, `clone`, `push`, `remote update`)
+///     needs this override on the command line to keep working headlessly; it
+///     is a no-op for the real `https://`/`ssh://` mirror remotes used in
+///     production, so this is safe to apply unconditionally, everywhere.
+pub(crate) const GIT_BASE_CFG: &[&str] = &[
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "commit.gpgsign=false",
+    "-c",
+    "protocol.file.allow=always",
+];
+
+/// Build a `git` [`Command`] scoped to `cwd`, pre-loaded with [`GIT_BASE_CFG`].
+/// This is the chokepoint every cwd-scoped git spawn in the mirror module
+/// should route through (append any extra `-c`/subcommand args after calling
+/// this — they layer on top, never replacing the base config).
+pub(crate) fn mirror_git(cwd: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(cwd).args(GIT_BASE_CFG);
+    cmd
+}
+
+/// Build a `git` [`Command`] with NO cwd (for subcommands like `ls-remote` or
+/// `clone` that need none / create their own target dir), pre-loaded with
+/// [`GIT_BASE_CFG`]. The plain-git counterpart to [`mirror_git`].
+pub(crate) fn mirror_git_plain() -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(GIT_BASE_CFG);
+    cmd
+}
 
 /// Run a git command in `cwd`, returning stdout on success or an `Execution`
-/// error carrying stderr on failure. Hooks are disabled (see [`HOOKS_OFF`]).
+/// error carrying stderr on failure. Hooks are disabled (see [`GIT_BASE_CFG`]).
 pub(crate) fn run_git(cwd: &Path, args: &[&str]) -> Result<String, ToolError> {
     assert_never_force(args);
-    let output = Command::new("git")
-        .current_dir(cwd)
-        .args(HOOKS_OFF)
+    let output = mirror_git(cwd)
         .args(args)
         .output()
         .map_err(|e| ToolError::Execution(format!("failed to spawn git {}: {e}", args.join(" "))))?;
@@ -719,8 +768,7 @@ pub(crate) fn run_git(cwd: &Path, args: &[&str]) -> Result<String, ToolError> {
 /// not a failure). Returns `true` iff git exited 0.
 pub(crate) fn git_ok(cwd: &Path, args: &[&str]) -> bool {
     assert_never_force(args);
-    Command::new("git")
-        .current_dir(cwd)
+    mirror_git(cwd)
         .args(args)
         .output()
         .map(|o| o.status.success())

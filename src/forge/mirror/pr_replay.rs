@@ -29,7 +29,6 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde_json::{json, Value};
 
@@ -43,21 +42,14 @@ use super::history::{
     IdentityMap, ReplayOpts,
 };
 use super::native_clean::DeterministicCleaner;
+use super::workdir::mirror_git;
 
-const HOOKS_OFF: &[&str] = &["-c", "core.hooksPath=/dev/null", "-c", "protocol.file.allow=always"];
-
-/// Args for TOKENED transport (fetch/push/ls-remote): hooks off AND all ambient
-/// credential helpers disabled, so the token is supplied ONLY via GIT_ASKPASS and a
-/// global/system credential.helper can neither inject nor persist a credential from
-/// disk. (`credential.helper=` with an empty value resets the helper list to empty.)
-const TRANSPORT_ARGS: &[&str] = &[
-    "-c",
-    "core.hooksPath=/dev/null",
-    "-c",
-    "protocol.file.allow=always",
-    "-c",
-    "credential.helper=",
-];
+/// Extra `-c` args layered on top of [`GIT_BASE_CFG`] (via [`mirror_git`]) for
+/// TOKENED transport (fetch/push/ls-remote): all ambient credential helpers
+/// disabled, so the token is supplied ONLY via GIT_ASKPASS and a global/system
+/// credential.helper can neither inject nor persist a credential from disk.
+/// (`credential.helper=` with an empty value resets the helper list to empty.)
+const TRANSPORT_EXTRA: &[&str] = &["-c", "credential.helper="];
 
 /// Inputs for one PR replay.
 pub struct PrReplayConfig {
@@ -107,10 +99,7 @@ pub struct PrReplayOutcome {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Result<String, ToolError> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(HOOKS_OFF)
+    let out = mirror_git(cwd)
         .args(args)
         .output()
         .map_err(|e| ToolError::Execution(format!("git {args:?}: {e}")))?;
@@ -163,10 +152,8 @@ impl Drop for AskpassGuard {
 /// GIT_ASKPASS only — never in argv, the URL, or on disk.
 fn git_transport(work_dir: &Path, args: &[&str], token: &str) -> Result<(), ToolError> {
     let (askpass, _guard) = write_askpass()?;
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(work_dir)
-        .args(TRANSPORT_ARGS)
+    let out = mirror_git(work_dir)
+        .args(TRANSPORT_EXTRA)
         .args(args)
         .env("GIT_ASKPASS", &askpass)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -199,10 +186,8 @@ fn fetch_public_main(work_dir: &Path, remote: &str, token: &str) -> Result<Strin
 /// than create a duplicate. ls-remote reads the public repo (no write).
 fn remote_branch_exists(work_dir: &Path, remote: &str, branch: &str, token: &str) -> Result<bool, ToolError> {
     let (askpass, _guard) = write_askpass()?;
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(work_dir)
-        .args(TRANSPORT_ARGS)
+    let out = mirror_git(work_dir)
+        .args(TRANSPORT_EXTRA)
         .args(["ls-remote", "--heads", "--", remote, &format!("refs/heads/{branch}")])
         .env("GIT_ASKPASS", &askpass)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -842,10 +827,7 @@ mod tests {
         std::fs::write(wd.join("a.txt"), b"x\n").unwrap();
         git(&wd, &["add", "-A"]).unwrap();
         // A commit (needs an identity) then a mirror-pr tag on it.
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&wd)
-            .args(HOOKS_OFF)
+        let out = mirror_git(&wd)
             .args(["-c", "user.name=T", "-c", "user.email=<email>", // pii-test-fixture
                    "commit", "-q", "-m", "seed"])
             .output()
