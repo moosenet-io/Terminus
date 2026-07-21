@@ -1147,6 +1147,341 @@ impl Drop for ReleaseGuard {
     }
 }
 
+// ── PCON-07: speculative merge batching (GitHub-merge-queue model) ──────────
+//
+// A THROUGHPUT layer on top of PCON-06's serialized rebase-and-re-gate. Instead
+// of gating one PR at a time, stack the front N same-base PRs of a base's queue
+// into ONE speculative rebased batch, gate the batch ONCE, and merge all N if
+// green; on a RED batch, BISECT (binary-split, re-gate halves, eject the
+// offender, merge the green remainder, requeue the offender with its reason).
+//
+// See `docs/specs/S122-pcon07-speculative-batching.md` for the full design note
+// (batch formation, single-gate, bisect-on-red algorithm, N-cap, and failure
+// semantics).
+//
+// ## Where this composes with PCON-06 (and why it preserves every guarantee)
+// The batch still runs INSIDE one `with_merge_slot` acquisition for the base key
+// (the slot still serializes; batching only changes what ONE slot processes).
+// The algorithm here is a PURE orchestration over an abstract
+// [`SpeculativeBatchOps`] — exactly mirroring how PCON-06 abstracts its
+// [`ReGate`] + [`MergeLockStore`] so the delicate correctness is unit-tested
+// deterministically with fakes (no live Redis / forge). Production wires
+// [`SpeculativeBatchOps`] to the SAME sanctioned PCON-06 helpers
+// (`update_pull_branch` for the stack rebase, `ReGate`/`compiler_build` for the
+// gate, `merge_pull_with_base` bound to each gated SHA for the land) — no raw
+// API calls, single door, S9.
+//
+// ## Correctness invariant (what lands is what was gated)
+// The bisection is constructed so the FINAL surviving set it returns was gated
+// GREEN as one unit at some step of the search — never an ad-hoc union of PRs
+// that were only ever gated apart. Each individual land then goes through the
+// PCON-06 SHA-bound merge (`head_commit_id` + base recheck), so a PR that
+// drifted between the batch gate and its land is requeued rather than merged
+// untested. Every ejected PR bounces with a clear, distinct reason and is
+// requeued. `BUILD_MERGE_BATCH_MAX=1` (the default) never enters this layer at
+// all — the merge takes the exact PCON-06 single-PR path, byte-for-byte.
+
+/// PCON-07: the reason a PR was EJECTED from a speculative batch (and requeued
+/// so it is retried on its own next round). Each variant is a DISTINCT,
+/// author-facing bounce — a *rebase conflict* (the PR genuinely conflicts with
+/// the current base during the speculative stack, ejected BEFORE the gate) is
+/// clearly separable from a *red-gate offender* (bisection isolated this PR as
+/// the one that turned the batch red).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BatchEjectReason {
+    /// The PR conflicted while stacking the speculative batch — it could not be
+    /// rebased onto the current base cleanly, so it was ejected before any gate
+    /// ran and the batch reformed without it.
+    RebaseConflict(String),
+    /// Bisection isolated this PR as the offender: gating it on top of the
+    /// confirmed-green prefix came back RED. The green remainder merged; this
+    /// PR is requeued with the gate's failure reason.
+    RedGate(String),
+    /// A fail-safe eject: the gate was unavailable (timed out / door
+    /// unreachable) for the sub-batch this PR was in during bisection, so it
+    /// could not be proven green and is requeued rather than merged blind.
+    GateUnavailable(String),
+}
+
+impl std::fmt::Display for BatchEjectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BatchEjectReason::RebaseConflict(d) => write!(
+                f,
+                "batch: rebase conflict while stacking the speculative batch ({d}) — ejected \
+                 pre-gate and requeued; resolve the conflict on the branch and re-open"
+            ),
+            BatchEjectReason::RedGate(d) => write!(
+                f,
+                "batch: isolated by bisection as the red-gate offender ({d}) — the green \
+                 remainder merged; this PR is requeued, fix the failure and retry"
+            ),
+            BatchEjectReason::GateUnavailable(d) => write!(
+                f,
+                "batch: gate unavailable for this PR's sub-batch during bisection ({d}) — \
+                 requeued (never merged unproven); retry"
+            ),
+        }
+    }
+}
+
+/// PCON-07: the abstract forge/gate operations the speculative-batch algorithm
+/// drives. Abstracted as a trait so [`run_speculative_batch`] — the delicate
+/// formation/single-gate/bisect logic — is unit-tested with a deterministic
+/// fake (no cargo spawn, no live forge), exactly as PCON-06's [`ReGate`] is.
+/// Production implements it over the sanctioned PCON-06 helpers (single door,
+/// S9): `update_pull_branch` (stack rebase), `ReGate` (gate), and
+/// `merge_pull_with_base` bound to each gated SHA (land).
+#[async_trait]
+pub(crate) trait SpeculativeBatchOps: Send + Sync {
+    /// Speculatively rebase/stack `prs` (in queue order) onto the current base.
+    /// A PR that CONFLICTS during the rebase is reported in
+    /// [`BatchStack::conflicted`] (ejected before the gate); the rest are
+    /// [`BatchStack::stacked`], ready to gate as one unit.
+    async fn stack(&self, prs: &[u64]) -> BatchStack;
+
+    /// Gate the already-stacked `prs` as ONE unit (the speculative batch gate)
+    /// — the SAME PCON-06 test-gate, on the stacked result. Honors `budget`
+    /// (returns [`GateVerdict::TimedOut`] rather than blocking the slot forever).
+    async fn gate(&self, prs: &[u64], budget: Duration) -> GateVerdict;
+
+    /// Land ONE PR of a green batch, bound to its gated state (the PCON-06
+    /// per-PR `head_commit_id` + base recheck invariant). `Ok(())` on a landed
+    /// merge; `Err(reason)` if the PR drifted (head/base moved) and must be
+    /// requeued instead of merged untested.
+    async fn merge(&self, pr: u64) -> Result<(), String>;
+}
+
+/// PCON-07: the result of [`SpeculativeBatchOps::stack`] — which PRs stacked
+/// cleanly (ready to gate) and which conflicted (ejected before the gate).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct BatchStack {
+    /// PRs that rebased cleanly onto the current base, in queue order — the set
+    /// the batch gate runs on.
+    pub stacked: Vec<u64>,
+    /// PRs that conflicted during the stack rebase, each with the conflict
+    /// detail — ejected pre-gate and requeued (the batch reforms without them).
+    pub conflicted: Vec<(u64, String)>,
+}
+
+/// PCON-07: the outcome of a speculative batch run.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct BatchOutcome {
+    /// PRs that LANDED, in merge order. Every one was part of the exact set that
+    /// was gated GREEN as a unit (see the correctness invariant above).
+    pub merged: Vec<u64>,
+    /// PRs ejected + the distinct reason each was requeued with (rebase
+    /// conflict, red-gate offender, or a fail-safe gate-unavailable eject).
+    pub ejected: Vec<(u64, BatchEjectReason)>,
+    /// `Some(front)` when the batch could not be gated as a unit (top-level gate
+    /// timed out or the door was unreachable) and the caller must instead run
+    /// the PCON-06 single-PR path for the front PR (spec: "batch gate times out
+    /// → fall back to N=1 for the front PR"). `None` when the batch ran.
+    pub fell_back_to_single: Option<u64>,
+    /// Number of gate invocations — one for an all-green batch; more when
+    /// bisection re-gates sub-batches. For observability + test assertions.
+    pub gate_calls: usize,
+    /// PRs from a GREEN batch whose SHA-bound land failed (drifted head/base):
+    /// requeued (not a red offender, not merged untested). The first failure
+    /// stops the land phase — every survivor after it is requeued too (it was
+    /// stacked on the one that failed).
+    pub merge_failures: Vec<(u64, String)>,
+}
+
+/// PCON-07: run a speculative merge batch over `prs` (already capped to
+/// `BUILD_MERGE_BATCH_MAX` and with the front PR first). Pure orchestration over
+/// `ops`; see the module-level design note and
+/// `docs/specs/S122-pcon07-speculative-batching.md`.
+///
+/// Flow:
+/// 1. **Stack** the batch; PRs that conflict are ejected pre-gate
+///    ([`BatchEjectReason::RebaseConflict`]) and the batch reforms without them.
+/// 2. If nothing stacked cleanly, return (everything was ejected).
+/// 3. **Gate once** on the stacked set:
+///    - **Green** → land all in order (SHA-bound); a land that drifts is
+///      requeued into `merge_failures` and stops the phase.
+///    - **TimedOut / Unreachable** → `fell_back_to_single = Some(front)`: the
+///      caller runs the PCON-06 single-PR path for the front PR (fail-safe).
+///    - **Red** → **bisect**: binary-split, re-gate halves, isolate + eject the
+///      offender(s), and land the green remainder — which was gated green as one
+///      unit at the isolating step (correctness invariant).
+pub(crate) async fn run_speculative_batch(
+    ops: &dyn SpeculativeBatchOps,
+    prs: &[u64],
+    budget: Duration,
+) -> BatchOutcome {
+    let mut outcome = BatchOutcome::default();
+    let Some(&front) = prs.first() else {
+        // Empty input — nothing to do (the caller guarantees a non-empty batch
+        // in practice; this is a defensive no-op, never a fall-back).
+        return outcome;
+    };
+
+    // (1) Stack the batch; eject pre-gate conflicts, reform without them.
+    let BatchStack { stacked, conflicted } = ops.stack(prs).await;
+    for (pr, reason) in conflicted {
+        outcome.ejected.push((pr, BatchEjectReason::RebaseConflict(reason)));
+    }
+    // (2) Nothing stacked cleanly ⇒ the whole batch conflicted; done.
+    if stacked.is_empty() {
+        return outcome;
+    }
+
+    // (3) Gate the stacked set ONCE.
+    outcome.gate_calls += 1;
+    match ops.gate(&stacked, budget).await {
+        GateVerdict::Green => {
+            land_in_order(ops, &stacked, &mut outcome).await;
+        }
+        GateVerdict::TimedOut | GateVerdict::Unreachable(_) => {
+            // Fail-safe: the batch could not be gated as a unit. Fall back to
+            // N=1 for the FRONT PR — the caller runs the PCON-06 single path,
+            // which re-gates that one PR against its exact landing state. The
+            // rest of the batch is simply left in the queue for the next round.
+            outcome.fell_back_to_single = Some(front);
+        }
+        GateVerdict::Red(top_reason) => {
+            // (4) Bisect to isolate + eject the offender(s); the survivors it
+            // returns were gated GREEN as one unit at the isolating step.
+            let (survivors, red_ejected, sub_gate_calls) = bisect_red(
+                ops,
+                Vec::new(),
+                stacked,
+                budget,
+                Some(GateVerdict::Red(top_reason)),
+            )
+            .await;
+            outcome.gate_calls += sub_gate_calls;
+            for (pr, reason) in red_ejected {
+                outcome.ejected.push((pr, reason));
+            }
+            land_in_order(ops, &survivors, &mut outcome).await;
+        }
+    }
+    outcome
+}
+
+/// PCON-07: land the confirmed-green `survivors` in order (SHA-bound). The first
+/// land that drifts (`Err`) is requeued into `merge_failures` AND every survivor
+/// after it too — each later PR was stacked on the one that failed, so it can no
+/// longer land against the state it was gated in.
+async fn land_in_order(
+    ops: &dyn SpeculativeBatchOps,
+    survivors: &[u64],
+    outcome: &mut BatchOutcome,
+) {
+    let mut failed_from: Option<usize> = None;
+    for (i, &pr) in survivors.iter().enumerate() {
+        match ops.merge(pr).await {
+            Ok(()) => outcome.merged.push(pr),
+            Err(reason) => {
+                outcome.merge_failures.push((pr, reason));
+                failed_from = Some(i + 1);
+                break;
+            }
+        }
+    }
+    if let Some(from) = failed_from {
+        for &pr in &survivors[from..] {
+            outcome.merge_failures.push((
+                pr,
+                "a prior member of this green batch failed to land, so this PR's gated \
+                 landing state no longer holds — requeued"
+                    .to_string(),
+            ));
+        }
+    }
+}
+
+/// PCON-07: the bisection core. Contract: gate `prefix + batch` (skipping the
+/// gate when `known` supplies the verdict for exactly that set), then:
+/// - **Green** → the whole `prefix + batch` survives (it was just gated green).
+/// - **TimedOut / Unreachable** → fail-safe: eject ALL of `batch`
+///   ([`BatchEjectReason::GateUnavailable`]); `prefix` (already green) survives.
+/// - **Red**, `batch.len() == 1` → the single PR IS the offender; eject it
+///   ([`BatchEjectReason::RedGate`]); `prefix` survives.
+/// - **Red**, `batch.len() > 1` → split, recurse left (on `prefix`), then right
+///   (on the left's survivors) so each half is gated stacked on the confirmed
+///   prefix. The returned survivor set was gated green as one unit at the
+///   deepest establishing step.
+///
+/// Returns `(survivors = prefix + kept, ejected, gate_calls)`.
+fn bisect_red<'a>(
+    ops: &'a dyn SpeculativeBatchOps,
+    prefix: Vec<u64>,
+    batch: Vec<u64>,
+    budget: Duration,
+    known: Option<GateVerdict>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = (Vec<u64>, Vec<(u64, BatchEjectReason)>, usize)> + Send + 'a>,
+> {
+    Box::pin(async move {
+        // Gate `prefix + batch` unless the verdict for exactly that set is
+        // already known (the top-level red, threaded in to avoid re-gating it).
+        let (verdict, mut gate_calls) = match known {
+            Some(v) => (v, 0usize),
+            None => {
+                let set: Vec<u64> = prefix.iter().copied().chain(batch.iter().copied()).collect();
+                (ops.gate(&set, budget).await, 1usize)
+            }
+        };
+
+        match verdict {
+            GateVerdict::Green => {
+                let survivors: Vec<u64> =
+                    prefix.iter().copied().chain(batch.iter().copied()).collect();
+                (survivors, Vec::new(), gate_calls)
+            }
+            GateVerdict::TimedOut | GateVerdict::Unreachable(_) => {
+                // Fail-safe: cannot prove this sub-batch green — requeue all of
+                // it rather than merge unproven. `prefix` is already green.
+                let ejected = batch
+                    .into_iter()
+                    .map(|pr| {
+                        (
+                            pr,
+                            BatchEjectReason::GateUnavailable(
+                                "gate unavailable during bisection".to_string(),
+                            ),
+                        )
+                    })
+                    .collect();
+                (prefix, ejected, gate_calls)
+            }
+            GateVerdict::Red(msg) => {
+                if batch.len() == 1 {
+                    // Isolated: this lone PR turned the (already-green) prefix
+                    // red — it IS the offender. Eject it; the prefix survives.
+                    let offender = batch[0];
+                    (
+                        prefix,
+                        vec![(offender, BatchEjectReason::RedGate(msg))],
+                        gate_calls,
+                    )
+                } else {
+                    let k = batch.len() / 2;
+                    let left: Vec<u64> = batch[..k].to_vec();
+                    let right: Vec<u64> = batch[k..].to_vec();
+
+                    // Left half stacked on the confirmed prefix.
+                    let (merged_left, mut ejected, gl) =
+                        bisect_red(ops, prefix, left, budget, None).await;
+                    gate_calls += gl;
+
+                    // Right half stacked on the left's survivors, so the final
+                    // surviving set is gated as a coherent stack.
+                    let (merged_all, ejected_right, gr) =
+                        bisect_red(ops, merged_left, right, budget, None).await;
+                    gate_calls += gr;
+                    ejected.extend(ejected_right);
+
+                    (merged_all, ejected, gate_calls)
+                }
+            }
+        }
+    })
+}
+
 /// Offline `MergeLockStore` fake, exposed `pub(crate)` (mirrors
 /// `crate::compiler::queue`'s own `#[cfg(test)] pub(crate) mod fake` pattern)
 /// so tests OUTSIDE this module — specifically GMQ-04's `crate::gitea` tool
@@ -2216,5 +2551,248 @@ mod tests {
         assert_eq!(snap.wait_depth, 0);
         assert!(snap.last_merge_ms.is_none());
         assert!(snap.next_allowed_merge_ms.is_none());
+    }
+
+    // ── PCON-07: speculative merge batching (formation / single-gate / bisect)
+
+    /// A deterministic [`SpeculativeBatchOps`] fake: no cargo spawn, no forge —
+    /// a gate goes RED whenever the stacked set contains ANY PR in `bad`; a PR
+    /// in `conflict` is ejected during the stack; `force_gate` overrides EVERY
+    /// gate verdict (e.g. to force a top-level `TimedOut`/`Unreachable`); a PR
+    /// in `merge_fail` fails its bound land. Records every gated set and every
+    /// landed PR so tests can assert the single-gate / bisect / land invariants.
+    struct FakeBatchOps {
+        bad: std::collections::HashSet<u64>,
+        conflict: std::collections::HashSet<u64>,
+        merge_fail: std::collections::HashSet<u64>,
+        force_gate: Option<GateVerdict>,
+        gate_sets: StdMutex<Vec<Vec<u64>>>,
+        landed: StdMutex<Vec<u64>>,
+    }
+
+    impl FakeBatchOps {
+        fn new() -> Self {
+            Self {
+                bad: Default::default(),
+                conflict: Default::default(),
+                merge_fail: Default::default(),
+                force_gate: None,
+                gate_sets: StdMutex::new(Vec::new()),
+                landed: StdMutex::new(Vec::new()),
+            }
+        }
+        fn bad(mut self, prs: &[u64]) -> Self {
+            self.bad = prs.iter().copied().collect();
+            self
+        }
+        fn conflict(mut self, prs: &[u64]) -> Self {
+            self.conflict = prs.iter().copied().collect();
+            self
+        }
+        fn merge_fail(mut self, prs: &[u64]) -> Self {
+            self.merge_fail = prs.iter().copied().collect();
+            self
+        }
+        fn force_gate(mut self, v: GateVerdict) -> Self {
+            self.force_gate = Some(v);
+            self
+        }
+        fn gated_sets(&self) -> Vec<Vec<u64>> {
+            self.gate_sets.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl SpeculativeBatchOps for FakeBatchOps {
+        async fn stack(&self, prs: &[u64]) -> BatchStack {
+            let mut stacked = Vec::new();
+            let mut conflicted = Vec::new();
+            for &pr in prs {
+                if self.conflict.contains(&pr) {
+                    conflicted.push((pr, format!("conflict on #{pr}")));
+                } else {
+                    stacked.push(pr);
+                }
+            }
+            BatchStack { stacked, conflicted }
+        }
+        async fn gate(&self, prs: &[u64], _budget: Duration) -> GateVerdict {
+            self.gate_sets.lock().unwrap().push(prs.to_vec());
+            if let Some(v) = &self.force_gate {
+                return v.clone();
+            }
+            let offenders: Vec<u64> = prs.iter().copied().filter(|p| self.bad.contains(p)).collect();
+            if offenders.is_empty() {
+                GateVerdict::Green
+            } else {
+                GateVerdict::Red(format!("red on {offenders:?}"))
+            }
+        }
+        async fn merge(&self, pr: u64) -> Result<(), String> {
+            if self.merge_fail.contains(&pr) {
+                return Err(format!("drift on #{pr}"));
+            }
+            self.landed.lock().unwrap().push(pr);
+            Ok(())
+        }
+    }
+
+    fn budget() -> Duration {
+        Duration::from_secs(30)
+    }
+
+    #[tokio::test]
+    async fn batch_all_green_gates_once_and_merges_all_in_order() {
+        // The happy path: N same-base PRs, all green → exactly ONE gate on the
+        // whole stacked set, and all N land in order.
+        let ops = FakeBatchOps::new();
+        let out = run_speculative_batch(&ops, &[1, 2, 3], budget()).await;
+
+        assert_eq!(out.gate_calls, 1, "an all-green batch must gate exactly ONCE");
+        assert_eq!(out.merged, vec![1, 2, 3], "all N must land in order");
+        assert!(out.ejected.is_empty(), "no ejections on an all-green batch");
+        assert!(out.fell_back_to_single.is_none());
+        assert_eq!(ops.gated_sets(), vec![vec![1, 2, 3]], "the single gate ran on the full stack");
+    }
+
+    #[tokio::test]
+    async fn batch_one_red_bisects_ejects_exactly_the_offender_and_merges_remainder() {
+        // One offender (#2) in a batch of three → bisection isolates and ejects
+        // EXACTLY #2 with a red-gate reason; the green remainder [1,3] merges;
+        // and [1,3] was gated GREEN as one unit (the correctness invariant).
+        let ops = FakeBatchOps::new().bad(&[2]);
+        let out = run_speculative_batch(&ops, &[1, 2, 3], budget()).await;
+
+        assert_eq!(out.merged, vec![1, 3], "the green remainder must merge, in order");
+        assert_eq!(out.ejected.len(), 1, "exactly one PR ejected");
+        let (ejected_pr, reason) = &out.ejected[0];
+        assert_eq!(*ejected_pr, 2, "the ejected PR must be EXACTLY the offender");
+        assert!(
+            matches!(reason, BatchEjectReason::RedGate(_)),
+            "the offender must be ejected with a red-gate reason, got {reason:?}"
+        );
+        assert!(out.gate_calls > 1, "a red batch must bisect (more than one gate)");
+        assert!(out.fell_back_to_single.is_none());
+        // The exact surviving set [1,3] was gated GREEN as one unit.
+        assert!(
+            ops.gated_sets().iter().any(|s| s == &vec![1, 3]),
+            "the survivor set [1,3] must have been gated as a unit: {:?}",
+            ops.gated_sets()
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_multiple_offenders_are_all_ejected_and_the_clean_remainder_merges() {
+        // Robustness beyond the single-offender case: #2 and #4 bad in [1,2,3,4]
+        // → both ejected, [1,3] merges, and [1,3] was gated green as a unit.
+        let ops = FakeBatchOps::new().bad(&[2, 4]);
+        let out = run_speculative_batch(&ops, &[1, 2, 3, 4], budget()).await;
+
+        assert_eq!(out.merged, vec![1, 3], "only the clean PRs land, in order");
+        let mut ejected: Vec<u64> = out.ejected.iter().map(|(p, _)| *p).collect();
+        ejected.sort_unstable();
+        assert_eq!(ejected, vec![2, 4], "both offenders must be ejected");
+        assert!(out
+            .ejected
+            .iter()
+            .all(|(_, r)| matches!(r, BatchEjectReason::RedGate(_))));
+        assert!(
+            ops.gated_sets().iter().any(|s| s == &vec![1, 3]),
+            "the survivor set must have been gated green as a unit: {:?}",
+            ops.gated_sets()
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_rebase_conflict_ejects_pre_gate_and_reforms_without_the_pr() {
+        // #2 conflicts during the speculative stack → ejected BEFORE the gate;
+        // the batch reforms as [1,3], gates ONCE (the gate never sees #2), and
+        // merges [1,3].
+        let ops = FakeBatchOps::new().conflict(&[2]);
+        let out = run_speculative_batch(&ops, &[1, 2, 3], budget()).await;
+
+        assert_eq!(out.merged, vec![1, 3], "the reformed batch merges without the conflicter");
+        assert_eq!(out.gate_calls, 1, "a clean reformed batch gates exactly once");
+        assert_eq!(out.ejected.len(), 1);
+        let (ejected_pr, reason) = &out.ejected[0];
+        assert_eq!(*ejected_pr, 2);
+        assert!(
+            matches!(reason, BatchEjectReason::RebaseConflict(_)),
+            "a stack conflict must be a pre-gate rebase-conflict eject, got {reason:?}"
+        );
+        // The gate must NEVER have seen the conflicting PR.
+        assert_eq!(ops.gated_sets(), vec![vec![1, 3]]);
+        assert!(
+            !ops.gated_sets().iter().flatten().any(|&p| p == 2),
+            "the conflicting PR must never have been gated"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_gate_timeout_falls_back_to_single_front_pr() {
+        // The top-level batch gate times out → the whole batch is NOT bisected;
+        // instead fall back to N=1 for the FRONT PR (the caller then runs the
+        // PCON-06 single-PR path for it). Nothing is merged or ejected here.
+        let ops = FakeBatchOps::new().force_gate(GateVerdict::TimedOut);
+        let out = run_speculative_batch(&ops, &[7, 8, 9], budget()).await;
+
+        assert_eq!(
+            out.fell_back_to_single,
+            Some(7),
+            "a batch gate timeout must fall back to N=1 for the FRONT PR"
+        );
+        assert!(out.merged.is_empty(), "nothing lands on a fall-back");
+        assert!(out.ejected.is_empty(), "a fall-back ejects nothing (the batch stays queued)");
+        assert_eq!(out.gate_calls, 1, "only the single top-level gate ran before falling back");
+    }
+
+    #[tokio::test]
+    async fn batch_gate_door_unreachable_also_falls_back_to_single_front_pr() {
+        // The compiler door is unreachable at batch-gate time (not a red
+        // verdict) → same fail-safe fall-back to N=1 for the front PR.
+        let ops = FakeBatchOps::new().force_gate(GateVerdict::Unreachable("door down".into()));
+        let out = run_speculative_batch(&ops, &[7, 8], budget()).await;
+        assert_eq!(out.fell_back_to_single, Some(7));
+        assert!(out.merged.is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_of_one_green_gates_once_and_merges() {
+        // A batch of exactly one (batch_max effectively 1, or only one PR
+        // available) still gates once and merges — the degenerate case that
+        // matches the PCON-06 single-PR shape.
+        let ops = FakeBatchOps::new();
+        let out = run_speculative_batch(&ops, &[42], budget()).await;
+        assert_eq!(out.merged, vec![42]);
+        assert_eq!(out.gate_calls, 1);
+        assert!(out.ejected.is_empty());
+        assert!(out.fell_back_to_single.is_none());
+    }
+
+    #[tokio::test]
+    async fn batch_all_conflict_ejects_everything_and_never_gates() {
+        // Every PR conflicts during the stack → all ejected pre-gate, nothing
+        // stacked, so the gate never runs and nothing merges.
+        let ops = FakeBatchOps::new().conflict(&[1, 2]);
+        let out = run_speculative_batch(&ops, &[1, 2], budget()).await;
+        assert!(out.merged.is_empty());
+        assert_eq!(out.ejected.len(), 2);
+        assert_eq!(out.gate_calls, 0, "an all-conflict batch must never gate");
+        assert!(out.fell_back_to_single.is_none());
+    }
+
+    #[tokio::test]
+    async fn batch_green_but_a_bound_land_drifts_requeues_it_and_every_later_member() {
+        // A green batch whose member #2 drifts (head/base moved between gate and
+        // land): #1 lands, #2 is requeued as a merge failure, and #3 — stacked
+        // on #2 — is requeued too rather than landed against a state that no
+        // longer holds.
+        let ops = FakeBatchOps::new().merge_fail(&[2]);
+        let out = run_speculative_batch(&ops, &[1, 2, 3], budget()).await;
+
+        assert_eq!(out.merged, vec![1], "only the pre-drift prefix lands");
+        let failed: Vec<u64> = out.merge_failures.iter().map(|(p, _)| *p).collect();
+        assert_eq!(failed, vec![2, 3], "the drifter and every later member are requeued");
+        assert!(out.ejected.is_empty(), "a land drift is a merge_failure, not a red/conflict eject");
     }
 }
