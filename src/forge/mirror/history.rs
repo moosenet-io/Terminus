@@ -38,7 +38,7 @@ use super::workdir::run_git;
 /// consult it) so any porcelain `git commit` built on top of this constant — as the
 /// test fixtures below do — never depends on the host's ambient GPG signing config.
 /// See the matching constant in `workdir.rs` for the full rationale.
-const HOOKS_OFF: &[&str] = &["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"];
+const HOOKS_OFF: &[&str] = &["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "-c", "protocol.file.allow=always"];
 
 /// Outcome of a full-history replay (metrics only — no PII, no shas).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

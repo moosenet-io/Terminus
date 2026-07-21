@@ -966,7 +966,7 @@ fn perform_ff_push(
     // `-c core.hooksPath=/dev/null` disables hooks (e.g. a planted pre-push) for the
     // same reason GHMR-03's run_git does: the work dir is cleaner-writable and must
     // never execute a hook under the parent's environment during transport.
-    let argv = ["-c", "core.hooksPath=/dev/null", "push", "--", remote, &refspec];
+    let argv = ["-c", "core.hooksPath=/dev/null", "-c", "protocol.file.allow=always", "push", "--", remote, &refspec];
     assert_never_force(&argv);
 
     // GIT_ASKPASS script reads the token from a private env var passed only to
@@ -1177,7 +1177,7 @@ fn run_source_git(cwd: &Path, args: &[&str]) -> Result<String, ToolError> {
     assert_source_sync_safe(args);
     let output = Command::new("git")
         .current_dir(cwd)
-        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(["-c", "core.hooksPath=/dev/null", "-c", "protocol.file.allow=always"])
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()
@@ -1229,7 +1229,7 @@ fn run_git_askpass_in(cwd: &Path, args: &[&str], token: &str) -> Result<String, 
     let askpass = write_askpass_script()?;
     let output = Command::new("git")
         .current_dir(cwd)
-        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(["-c", "core.hooksPath=/dev/null", "-c", "protocol.file.allow=always"])
         .args(args)
         .env("GIT_ASKPASS", askpass.path())
         .env("GIT_TERMINAL_PROMPT", "0")

@@ -44,7 +44,7 @@ use super::history::{
 };
 use super::native_clean::DeterministicCleaner;
 
-const HOOKS_OFF: &[&str] = &["-c", "core.hooksPath=/dev/null"];
+const HOOKS_OFF: &[&str] = &["-c", "core.hooksPath=/dev/null", "-c", "protocol.file.allow=always"];
 
 /// Args for TOKENED transport (fetch/push/ls-remote): hooks off AND all ambient
 /// credential helpers disabled, so the token is supplied ONLY via GIT_ASKPASS and a
@@ -53,6 +53,8 @@ const HOOKS_OFF: &[&str] = &["-c", "core.hooksPath=/dev/null"];
 const TRANSPORT_ARGS: &[&str] = &[
     "-c",
     "core.hooksPath=/dev/null",
+    "-c",
+    "protocol.file.allow=always",
     "-c",
     "credential.helper=",
 ];

@@ -690,7 +690,7 @@ pub(crate) fn assert_never_force(argv: &[&str]) {
 /// `git commit` would hang or fail entirely. Overriding it on the command
 /// line (like `core.hooksPath` above) always wins over repo/global/system
 /// config, keeping every commit this engine makes fully self-contained.
-const HOOKS_OFF: &[&str] = &["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"];
+const HOOKS_OFF: &[&str] = &["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "-c", "protocol.file.allow=always"];
 
 /// Run a git command in `cwd`, returning stdout on success or an `Execution`
 /// error carrying stderr on failure. Hooks are disabled (see [`HOOKS_OFF`]).
