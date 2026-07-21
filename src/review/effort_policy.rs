@@ -401,7 +401,11 @@ pub fn base_tier(signals: &DiffSignals, cfg: &EffortPolicyConfig) -> (EffortTier
     let has_any_signal = signals.loc_changed.is_some()
         || signals.files_touched.is_some()
         || signals.cross_module.is_some()
-        || signals.risk_class.is_some();
+        || signals.risk_class.is_some()
+        // new-logic-without-tests is a standalone signal: a diff whose ONLY
+        // signal is untested new logic must still get its escalation, not fall
+        // through to baseline here (codex review).
+        || signals.new_logic_without_tests;
     if !has_any_signal {
         reasons.push("no diff signals: baseline tier".to_string());
         return (tier, reasons);
@@ -756,7 +760,10 @@ fn policy_tier_for_provider(
         // "Mid" seat): a FIXED Medium tier, never escalated by risk_class.
         // A HIGH-risk run must not push an unrecognized provider above its
         // safe default -- only Capstone seats are trusted with that.
-        ProviderRole::Mid => run_tier.cap_at(EffortTier::Medium),
+        // Unknown/mid-tier seats get a FIXED sane default of Medium — not
+        // `cap_at` (which would allow Low/Minimal on a low-risk run) and never
+        // escalated above by risk (codex review: fixed Medium, both floor and cap).
+        ProviderRole::Mid => EffortTier::Medium,
     };
 
     // Token-budget awareness: bias non-capstone seats down one more step on
